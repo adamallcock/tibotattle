@@ -217,6 +217,15 @@ export function analyticsV2BundledPricer(): AnalyticsV2Pricer | null {
  * the cards whose set digest is `cardsSha256` (price-attribution.ts
  * analyticsV2PriceCardSetSha256). Equal classes price every stored input
  * identically; the class names no kernel.
+ *
+ * "Identically" is per pricer ARGUMENT: a stored price input of the
+ * projection, or exactly the (record text, observedAt) pair
+ * priceChunkUsageRecord was called with. The code that derives those
+ * arguments from a stored row (the daily projection's canonical record and
+ * ISO time, the v1.1 readers' row fields) is outside the pricer, so its edit
+ * keeps the class. A price cached under a class (Wave 3b) must therefore be
+ * keyed by the class AND a digest of the exact arguments priced, never by the
+ * raw stored row alone.
  */
 export async function analyticsV2PricingClass(input: {
   readonly pricer: AnalyticsV2Pricer; readonly projectionVersion: string; readonly cardsSha256: string;

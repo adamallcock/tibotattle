@@ -47,10 +47,22 @@
  *    owner-day that does not price exactly as stored is a pricing class that
  *    under-covers its pricer: ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH ends
  *    the run and nothing is written.
- * Either method yields the same verdict, counts and stale set for the same
- * stored state, so the recorded transition is the same; only the work and
+ * For well-formed stored state either method yields the same verdict, counts
+ * and stale set, so the recorded transition is the same; only the work and
  * the analytics_v2_transition_proofs row differ. A bundle stating no pricer
  * records no pricing class and no proof-method row.
+ *
+ * Method 2 narrows the stored inputs' integrity checks to its sample. On
+ * every priced owner-day it still checks, from the row alone, what
+ * decodeAnalyticsV2PriceInputs checks before it inflates (the projection,
+ * the codec, the digest's form, the event count and its bound, non-empty
+ * bytes), failing the run with the same ANALYTICS_V2_PRICE_INPUTS_CORRUPT as
+ * method 1. The body (inflation, the canonical text's sha256, the closed
+ * document and its event count against input_events) is checked only on the
+ * sampled owner-days: a body corrupted under a sound header fails method 1
+ * and passes method 2 unless sampled, and method 2 counts the stored
+ * input_events. The integrity of an unsampled body is owed to whatever reads
+ * it next (a reprice, or Wave 3b's reuse, which decodes it).
  *
  * Integer ids (card_ref, price_basis_id, transition_id) are assigned here as
  * the stored maximum plus a rank in a fixed order (card id and content,
@@ -74,7 +86,10 @@ import {
   type AnalyticsV2RunStamp,
 } from "./kernel";
 import {
+  ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS,
+  ANALYTICS_V2_PRICE_INPUTS_CODEC,
   ANALYTICS_V2_PRICE_PROJECTION_VERSION,
+  AnalyticsV2PriceError,
   analyticsV2KernelPriceCards,
   analyticsV2PriceCardSetSha256,
   decodeAnalyticsV2PriceInputs,
@@ -464,6 +479,22 @@ async function proveStoredDay(row: Record<string, unknown>, diff: AnalyticsV2Ker
   return proveAnalyticsV2DayPrices(decoded.events, diff, price);
 }
 
+/**
+ * What decodeAnalyticsV2PriceInputs checks of a stored owner-day's inputs
+ * before it inflates them, from the row alone (method 2's per-row integrity
+ * check; see the module comment): anything else is the same
+ * ANALYTICS_V2_PRICE_INPUTS_CORRUPT. `has_inputs` is the row's non-empty bytes.
+ */
+function soundStoredInputsHeader(row: Record<string, unknown>): void {
+  const events = row.input_events;
+  if (row.projection_version !== ANALYTICS_V2_PRICE_PROJECTION_VERSION || row.codec !== ANALYTICS_V2_PRICE_INPUTS_CODEC
+      || typeof row.inputs_sha256 !== "string" || !SHA256.test(row.inputs_sha256)
+      || typeof events !== "number" || !Number.isSafeInteger(events) || events < 0
+      || events > ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS || row.has_inputs !== true) {
+    throw new AnalyticsV2PriceError("ANALYTICS_V2_PRICE_INPUTS_CORRUPT");
+  }
+}
+
 /** Method 1 (K-PERCARD): reprice every stored event of `fromKernel`. */
 async function proveByReprice(client: PostgresClient, schema: string, input: {
   readonly fromKernel: number; readonly diff: AnalyticsV2KernelCardDiff | null;
@@ -509,10 +540,11 @@ async function proveByReprice(client: PostgresClient, schema: string, input: {
 /**
  * Method 2 (W1E): both kernels are in the same pricing class, so every stored
  * input prices as stored. Every owner-day's metadata is read and checked as
- * method 1 checks it, its event count is the stored one (the codec holds
- * input_events to the document whenever it is decoded), and only the
- * sampled owner-days' inputs are fetched, decoded and repriced; any of them
- * that does not price exactly as stored is ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH.
+ * method 1 checks it, with its stored inputs' header (soundStoredInputsHeader),
+ * its event count is the stored one (the codec holds input_events to the
+ * document whenever it is decoded), and only the sampled owner-days' inputs
+ * are fetched, decoded and repriced; any of them that does not price exactly
+ * as stored is ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH.
  */
 async function proveByPricingClass(client: PostgresClient, schema: string, input: {
   readonly fromKernel: number; readonly toKernel: number; readonly diff: AnalyticsV2KernelCardDiff;
@@ -526,7 +558,8 @@ async function proveByPricingClass(client: PostgresClient, schema: string, input
   for (;;) {
     const page = rowsOf<Record<string, unknown>>(await client.query(
       `SELECT d.owner_digest, d.day::text AS day, (d.daily IS NOT NULL) AS has_daily,
-              p.kernel_id::integer AS price_kernel, p.projection_version, p.input_events
+              p.kernel_id::integer AS price_kernel, p.projection_version, p.codec, p.inputs_sha256, p.input_events,
+              (octet_length(p.inputs) > 0) AS has_inputs
          FROM ${relation(schema, TABLES.ownerDay)} d
          LEFT JOIN ${relation(schema, TABLES.ownerDayPrice)} p ON p.owner_digest = d.owner_digest AND p.day = d.day
         WHERE d.kernel_id = $1::smallint
@@ -545,7 +578,8 @@ async function proveByPricingClass(client: PostgresClient, schema: string, input
         stale.push({ ...key, cause: ANALYTICS_V2_STALE_CAUSE.priceUnknown });
         continue;
       }
-      events += countOf(row.input_events, "ownerDayPrice.inputEvents");
+      soundStoredInputsHeader(row);
+      events += row.input_events as number;
       // The first priced owner-day is always sampled, so a non-empty transition is never proven by identity alone.
       if (priced++ === 0 || await analyticsV2PricingClassSampled({ classSha256, fromKernel, toKernel, ...key })) {
         sampled.push(key);

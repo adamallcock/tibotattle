@@ -5,15 +5,20 @@
  * consistency triggers, the store's class registration, and the kernel
  * transition proof established by pricing-class identity with a sampled
  * reprice instead of a full reprice: the same verdict, counts and stale set,
- * fail closed when either class is unknown or differs, and a failed sample
- * ends the run.
+ * fail closed when either class is unknown or differs, a failed sample ends
+ * the run, and the integrity checks method 2 keeps on every row (the stored
+ * inputs' header) and narrows to its sample (their body).
  *
  * The sources run through Vite with the build's pricer defines set to a
  * synthetic pricer (PRICER_A), so writeRunOutputs registers and proves as a
  * bundle built with a pricer would; a spec states another pricer (or none)
- * to the store functions directly. Each case applies the stock primary chain
- * and the pricing-classes file (staged, or stock once promoted) into a fresh
- * random schema, dropped afterwards. Synthetic, content-free values only.
+ * to the store functions directly. One case builds the refresh Job as
+ * cloud-run/build.mjs does instead (the real pricer digest, the registry's
+ * last kernel and a next kernel whose only change is non-pricing code) and
+ * runs the bundles under Node v22.16.0 over the synthetic direct-seed
+ * fixture. Each case applies the stock primary chain and the pricing-classes
+ * file (staged, or stock once promoted) into a fresh random schema, dropped
+ * afterwards. Synthetic, content-free values only.
  *
  * Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-fanout-20260926/socket \
  *      PG_TEST_PORT=55433 node --test postgres-test/analytics-v2-pricing-classes.spec.mjs
@@ -24,9 +29,12 @@
 
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { access, copyFile, mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { homedir, tmpdir } from "node:os";
+import { promisify } from "node:util";
+import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import pg from "pg";
@@ -37,9 +45,21 @@ import {
   postgresTestEndpoint,
 } from "./staged-migrations-harness.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
+import {
+  analyticsKernelDefines,
+  computeAnalyticsKernelIdentity,
+  resolveAnalyticsKernelRegistryEntry,
+} from "../cloud-run/analytics-kernel-closure.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
+import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const CLOUD_RUN_ROOT = join(WORKER_ROOT, "cloud-run");
+const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
+const NODE_22 = join(homedir(), ".nvm/versions/node/v22.16.0/bin/node");
+const NODE_22_SKIP = await access(NODE_22).then(() => false,
+  () => "the built Job runs under Node v22.16.0 (the image runtime), which is not installed");
+const execFileAsync = promisify(execFile);
 const PRIMARY_MIGRATIONS_DIRECTORY = join(WORKER_ROOT, "postgres", "migrations", "primary");
 const STAGED_DIRECTORY = join(WORKER_ROOT, "postgres", "staged-migrations", "primary");
 /** Found by its name suffix: staged under a placeholder number until the integrator promotes it. */
@@ -70,6 +90,7 @@ let kernelModule;
 let registry;
 let bundleCards;
 let classFile;
+let seedModules;
 
 before(async () => {
   vite = await createServer({ root: WORKER_ROOT, configFile: false, plugins: analyticsV2Config.plugins,
@@ -84,6 +105,12 @@ before(async () => {
   kernelModule = await load("/src/analytics-v2/kernel.ts");
   registry = store.analyticsV2KernelRegistry();
   bundleCards = await prices.analyticsV2KernelPriceCards();
+  seedModules = {
+    codec: await load("/src/typed-telemetry-codec.ts"),
+    v12codec: await load("/src/telemetry-v12-typed-codec.ts"),
+    reconciliation: await load("/src/telemetry-usage-reconciliation.ts"),
+    sha256Hex: (await load("/src/crypto.ts")).sha256Hex,
+  };
   assert.deepEqual({ ...kernelModule.analyticsV2BundledPricer() }, PRICER_A, "the sources run with the build's pricer");
   const staged = (await readdir(STAGED_DIRECTORY).catch(() => [])).find((name) => CLASS_FILE.test(name));
   const promoted = (await readdir(PRIMARY_MIGRATIONS_DIRECTORY)).find((name) => CLASS_FILE.test(name));
@@ -425,6 +452,11 @@ test("PG17: a kernel's pricing class is registered once, shared by an equal clas
     assert.deepEqual(await registerClass(pool, schema, 3, PRICER_B), { pricingClassId: 2,
       classSha256: (await kernelModule.analyticsV2PricingClass({ pricer: PRICER_B,
         projectionVersion: prices.ANALYTICS_V2_PRICE_PROJECTION_VERSION, cardsSha256: bundleCards.cardsSha256 })).classSha256 });
+    // A run whose bundle states another class than its kernel registered ends with that closed code, writing nothing.
+    const runs = await count(pool, schema, "analytics_v2_runs");
+    await assert.rejects(write(pool, schema, stamp(3)), { code: "ANALYTICS_V2_PRICING_CLASS_CONFLICT" });
+    assert.equal(await count(pool, schema, "analytics_v2_runs"), runs);
+    assert.equal(await count(pool, schema, tables.kernelPricingClasses), 3);
   });
 });
 
@@ -539,12 +571,11 @@ test("PG17: an identity proof recorded where the kernels are not in one class is
       { code: "ANALYTICS_V2_WRITE_FAILED", sqlState: "P1005" });
     assert.deepEqual(await snapshot(pool, schema, Object.values(contract.ANALYTICS_V2_TABLES)), before);
     assert.equal(await count(pool, schema, storePrice.ANALYTICS_V2_PRICING_CLASS_TABLES.transitionProofs), 0);
-    // A malformed establishment is refused by the store itself, before its row (store.ts reports the store
-    // module's own closed codes only for its own error classes; this one ends the write as ANALYTICS_V2_WRITE_FAILED).
+    // A malformed establishment is refused by the store itself, before its row, with its closed code.
     const bad = { ...forged, transitions: [{ ...forged.transitions[0], establishment: { ...forged.transitions[0].establishment,
       sampleDivisor: 7 } }] };
-    await assert.rejects(write(pool, schema, stamp(2), { priceTransitions: bad }), (error) =>
-      error?.code === "ANALYTICS_V2_WRITE_FAILED" && error?.sqlState === undefined);
+    await assert.rejects(write(pool, schema, stamp(2), { priceTransitions: bad }),
+      { code: "ANALYTICS_V2_PRICING_CLASS_STATE_INVALID" });
     assert.deepEqual(await snapshot(pool, schema, Object.values(contract.ANALYTICS_V2_TABLES)), before);
     const client = await pool.connect();
     try {
@@ -556,6 +587,256 @@ test("PG17: an identity proof recorded where the kernels are not in one class is
       client.release();
     }
   });
+});
+
+/** `days`' priced owner-days in proof order, each with whether a 1 -> 2 identity proof under PRICER_A samples it. */
+async function proofOrder(days) {
+  const { classSha256 } = await kernelModule.analyticsV2PricingClass({ pricer: PRICER_A,
+    projectionVersion: prices.ANALYTICS_V2_PRICE_PROJECTION_VERSION, cardsSha256: bundleCards.cardsSha256 });
+  const ordered = days.filter(([, , events]) => Array.isArray(events)).map(([ownerDigest, day]) => ({ ownerDigest, day }))
+    .sort((left, right) => (left.ownerDigest + left.day < right.ownerDigest + right.day ? -1 : 1));
+  const order = [];
+  for (const [index, key] of ordered.entries()) {
+    order.push({ ...key, sampled: index === 0
+      || await storePrice.analyticsV2PricingClassSampled({ classSha256, fromKernel: 1, toKernel: 2, ...key }) });
+  }
+  return order;
+}
+
+/** Replace one stored price row's codec or inputs bytes (a price row is never updated: deleted and reinserted). */
+async function replaceStoredInputs(pool, schema, { ownerDigest, day }, { codec = null, inputs = null }) {
+  const table = quoted(schema, "analytics_v2_owner_day_price");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const columns = ["owner_digest", "day", "price_basis_id", "usage_events", "unpriced_events",
+      "partially_priced_events", "projection_version", "codec", "inputs", "inputs_sha256", "input_events", "run_id",
+      "kernel_id", "manifest_version"];
+    const { rows } = await client.query(`DELETE FROM ${table} WHERE owner_digest = $1 AND day = $2::date
+      RETURNING ${columns.map((column) => (column === "day" || column === "run_id" ? `${column}::text` : column)).join(", ")}`,
+    [ownerDigest, day]);
+    assert.equal(rows.length, 1);
+    const row = { ...rows[0], ...(codec === null ? {} : { codec }), ...(inputs === null ? {} : { inputs }) };
+    await client.query(`INSERT INTO ${table} (${columns.join(", ")})
+      VALUES (${columns.map((column, index) => `$${index + 1}${column === "day" ? "::date" : column === "run_id" ? "::uuid" : ""}`)
+        .join(", ")})`, columns.map((column) => row[column]));
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+test("PG17: method 2 checks every stored row's inputs header and narrows the body checks to its sample", {
+  skip: PG_SKIP, timeout: 300_000,
+}, async () => {
+  const days = corpus(60);
+  const order = await proofOrder(days);
+  const unsampled = order.find((entry) => !entry.sampled);
+  const sampled = order.find((entry, index) => index > 0 && entry.sampled) ?? order[0];
+  assert.ok(unsampled !== undefined && sampled !== undefined);
+  const corrupt = { code: "ANALYTICS_V2_PRICE_INPUTS_CORRUPT" };
+  const garbage = Buffer.from([0x00, 0xff, 0x13]);
+  await withSchema("corrupt-body", async ({ pool, schema }) => {
+    await seedOlderKernel(pool, schema, { kernelId: 1, days });
+    await registerClass(pool, schema, 1, PRICER_A);
+    const clean = await prove(pool, schema, 2);
+    assert.equal(clean.transitions[0].establishment.method, 2);
+    // A body corrupted under a sound header, outside the sample: a full reprice decodes it and fails the run;
+    // the identity proof does not fetch it and proves exactly what it proves on the clean state (the narrowing).
+    await replaceStoredInputs(pool, schema, unsampled, { inputs: garbage });
+    await assert.rejects(prove(pool, schema, 2, { pricer: PRICER_B }), corrupt);
+    await assert.rejects(prove(pool, schema, 2, { pricer: null }), corrupt);
+    assert.deepEqual(await prove(pool, schema, 2), clean);
+    // In the sample, it fails the identity proof too.
+    await replaceStoredInputs(pool, schema, sampled, { inputs: garbage });
+    await assert.rejects(prove(pool, schema, 2), corrupt);
+  });
+  await withSchema("corrupt-header", async ({ pool, schema }) => {
+    await seedOlderKernel(pool, schema, { kernelId: 1, days });
+    await registerClass(pool, schema, 1, PRICER_A);
+    // The migration's constraint already refuses another codec; without it, the store still does, on every row.
+    await pool.query(`ALTER TABLE ${quoted(schema, "analytics_v2_owner_day_price")}
+      DROP CONSTRAINT analytics_v2_owner_day_price_codec_check`);
+    await replaceStoredInputs(pool, schema, unsampled, { codec: "deflate-raw-canonical-json-v0" });
+    for (const pricer of [undefined, PRICER_B, null]) {
+      await assert.rejects(prove(pool, schema, 2, pricer === undefined ? {} : { pricer }), corrupt, String(pricer));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End to end: built bundles
+// ---------------------------------------------------------------------------
+
+const cloudRunRequire = createRequire(join(CLOUD_RUN_ROOT, "package.json"));
+const LOADERS = Object.freeze({ ".ts": "ts", ".mjs": "js", ".js": "js", ".json": "json" });
+
+/** cloud-run/build.mjs's options for the refresh Job and its compute Worker. */
+function jobBuildOptions(outdir, plugins) {
+  return { entryPoints: { "analytics-refresh": join(CLOUD_RUN_ROOT, "analytics-refresh.mjs"),
+    "analytics-refresh-worker": join(CLOUD_RUN_ROOT, "analytics-refresh-worker.mjs") },
+  bundle: true, platform: "node", format: "esm", target: "node22", outdir, entryNames: "[name]",
+  outExtension: { ".js": ".mjs" }, sourcemap: false,
+  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent",
+  metafile: true, plugins };
+}
+
+/**
+ * Build the refresh Job into `outdir` as cloud-run/build.mjs does (the kernel
+ * identity with its pricer, the registry entry it resolves, the defines),
+ * from the sources with `edits` (absolute path -> text edit) applied. `next`
+ * appends a registry entry for the edited closure (the next id, the last
+ * entry's other values); `pricer` stamps another pricer than the one the
+ * build computed (a bundle in another pricing class).
+ */
+async function buildRefreshJob({ outdir, edits = new Map(), next = false, pricer = null }) {
+  const esbuild = cloudRunRequire("esbuild");
+  const registryFile = join(WORKER_ROOT, "src", "analytics-v2", "kernel-registry.json");
+  const all = new Map(edits);
+  const plugin = { name: "analytics-v2-pricing-classes-spec-edits", setup(pass) {
+    pass.onLoad({ filter: /.*/ }, async (args) => {
+      const edit = all.get(args.path);
+      if (edit === undefined) return undefined;
+      return { contents: edit(await readFile(args.path, "utf8")), loader: LOADERS[extname(args.path)] };
+    });
+  } };
+  const read = async (path, ...rest) => {
+    const bytes = await readFile(path, ...rest);
+    const edit = all.get(path);
+    return edit === undefined ? bytes : Buffer.from(edit(Buffer.from(bytes).toString("utf8")), "utf8");
+  };
+  const options = jobBuildOptions(outdir, [plugin]);
+  const identityOf = () => computeAnalyticsKernelIdentity({ build: esbuild.build, options, vendorRoot: VENDOR_ROOT,
+    cwd: CLOUD_RUN_ROOT, read });
+  const identity = await identityOf();
+  if (next) {
+    all.set(registryFile, (text) => {
+      const registry = JSON.parse(text);
+      const last = registry.kernels.at(-1);
+      registry.kernels.push({ ...last, kernelId: last.kernelId + 1, computeClosureSha256: identity.computeClosureSha256 });
+      return JSON.stringify(registry);
+    });
+    // The registry is not a closure input: registering the kernel moves neither digest.
+    const registered = await identityOf();
+    assert.equal(registered.computeClosureSha256, identity.computeClosureSha256);
+    assert.equal(registered.pricerSha256, identity.pricerSha256);
+  }
+  const { kernelId } = await resolveAnalyticsKernelRegistryEntry({ build: esbuild.build, options, identity,
+    cwd: CLOUD_RUN_ROOT });
+  await esbuild.build({ ...options, absWorkingDir: CLOUD_RUN_ROOT,
+    define: analyticsKernelDefines(pricer === null ? identity : { ...identity, ...pricer }) });
+  return { identity, kernelId, job: join(outdir, "analytics-refresh.mjs") };
+}
+
+/** Run a built Job (Node v22.16.0, the image runtime) once, in full mode at the fixture's clock; its receipt. */
+async function runBuiltJob(bundle, schema) {
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1" };
+  for (const name of ["PG_TEST_SOCKET", "PG_TEST_HOST", "PG_TEST_PORT", "PG_TEST_USER", "PG_TEST_DATABASE",
+    "PG_TEST_PASSWORD"]) {
+    if (process.env[name]) env[name] = process.env[name];
+  }
+  try {
+    const { stdout } = await execFileAsync(NODE_22, ["--max-old-space-size=6144", bundle.job, "--mode=full",
+      `--schema=${schema}`, `--now=${new Date(seedFixture.NOW_MS).toISOString()}`], {
+      cwd: CLOUD_RUN_ROOT, env, maxBuffer: 64 * 1024 * 1024, timeout: 600_000 });
+    return JSON.parse(stdout.trim().split("\n").at(-1));
+  } catch (error) {
+    assert.fail(`the built Job failed: ${String(error?.stderr ?? error).trim().split("\n").at(-1)}`);
+  }
+}
+
+/** Every row of `tables` without its run identity or wall-clock columns (uuid, timestamptz, timings), canonicalized. */
+async function stableSnapshot(pool, schema, tables) {
+  const rows = {};
+  for (const table of tables) {
+    const volatile = (await pool.query(`SELECT coalesce(array_agg(column_name::text), '{}') AS names
+      FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2
+        AND (data_type IN ('uuid', 'timestamp with time zone') OR column_name = 'timings')`, [schema, table])).rows[0].names;
+    rows[table] = (await pool.query(`SELECT coalesce(jsonb_agg(r ORDER BY r::text), '[]'::jsonb)::text AS rows
+      FROM (SELECT to_jsonb(t) - $1::text[] AS r FROM ${quoted(schema, table)} t) s`, [volatile])).rows[0].rows;
+  }
+  return rows;
+}
+
+test("PG17 built bundles: a kernel bump within one pricing class writes every analytics_v2 table a full reprice writes", {
+  skip: PG_SKIP || NODE_22_SKIP, timeout: 1_800_000,
+}, async (context) => {
+  const cache = join(CLOUD_RUN_ROOT, "node_modules", ".cache");
+  await mkdir(cache, { recursive: true });
+  const directory = await mkdtemp(join(cache, "analytics-v2-pricing-classes-spec-"));
+  try {
+    const current = await buildRefreshJob({ outdir: join(directory, "current") });
+    // The next kernel changes only non-pricing code; built with its own pricer, or stamped with another one.
+    const nonPricing = new Map([[join(WORKER_ROOT, "src", "analytics-v2", "compute-owner.ts"),
+      (text) => `${text}\n// A non-pricing kernel bump.\n`]]);
+    const next = await buildRefreshJob({ outdir: join(directory, "next"), edits: nonPricing, next: true });
+    const nextOther = await buildRefreshJob({ outdir: join(directory, "next-other-class"), edits: nonPricing, next: true,
+      pricer: { pricerSha256: digest("pricer-other") } });
+    assert.equal(next.kernelId, current.kernelId + 1);
+    assert.equal(nextOther.kernelId, next.kernelId);
+    assert.notEqual(next.identity.computeClosureSha256, current.identity.computeClosureSha256);
+    assert.equal(next.identity.pricerSha256, current.identity.pricerSha256, "a non-pricing bump keeps the pricer");
+    const classTables = storePrice.ANALYTICS_V2_PRICING_CLASS_TABLES;
+    const outcomes = {};
+    for (const [label, bundle] of [["identity", next], ["reprice", nextOther]]) {
+      await withSchema(`built-${label}`, async ({ pool, schema }) => {
+        const t = (table) => quoted(schema, table);
+        // The fixture's owners, and kilo's legacy days for a few dozen priced owner-days.
+        await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active",
+          denseLegacy: { days: 30, usagePerDay: 20 } });
+        assert.equal((await runBuiltJob(current, schema)).state, "complete");
+        // Stored state the transition finds stale: one priced owner-day loses its price row (price unknown).
+        const lost = (await pool.query(`DELETE FROM ${t("analytics_v2_owner_day_price")} WHERE (owner_digest, day) =
+            (SELECT owner_digest, day FROM ${t("analytics_v2_owner_day_price")} ORDER BY owner_digest DESC, day DESC LIMIT 1)
+          RETURNING owner_digest, day::text AS day`)).rows;
+        assert.equal(lost.length, 1);
+        const stored = (await pool.query(`SELECT count(*)::integer AS days, coalesce(sum(input_events), 0)::integer AS events
+          FROM ${t("analytics_v2_owner_day_price")}`)).rows[0];
+        assert.ok(stored.days > 20, `the fixture holds priced owner-days (${stored.days})`);
+        assert.equal((await runBuiltJob(bundle, schema)).state, "complete");
+        outcomes[label] = {
+          lost: lost[0],
+          stored,
+          tables: await stableSnapshot(pool, schema, Object.values(contract.ANALYTICS_V2_TABLES)),
+          proofs: (await pool.query(`SELECT method, pricing_class_id, sample_divisor, repriced_owner_days,
+            repriced_events::integer AS repriced_events FROM ${t(classTables.transitionProofs)}`)).rows,
+          linked: (await pool.query(`SELECT kernel_id, pricing_class_id FROM ${t(classTables.kernelPricingClasses)}
+            ORDER BY kernel_id`)).rows,
+          pricers: (await pool.query(`SELECT pricer_sha256 FROM ${t(classTables.pricingClasses)}
+            ORDER BY pricing_class_id`)).rows.map((row) => row.pricer_sha256),
+          stale: (await pool.query(`SELECT owner_digest, day::text AS day, cause FROM ${t("analytics_v2_transition_stale")}`)).rows,
+        };
+      });
+    }
+    const { identity, reprice } = outcomes;
+    assert.deepEqual(identity.lost, reprice.lost);
+    assert.deepEqual(identity.stored, reprice.stored);
+    assert.ok(identity.stale.some((entry) => entry.owner_digest === identity.lost.owner_digest
+      && entry.day === identity.lost.day && entry.cause === 3), "the price-unknown owner-day is stale");
+    assert.deepEqual(identity.tables, reprice.tables, "every analytics_v2 table is the same either way");
+    // The real pricer was stamped and registered; the bump was proven by identity, or in full for another class.
+    assert.deepEqual(identity.pricers, [current.identity.pricerSha256]);
+    assert.deepEqual(reprice.pricers, [current.identity.pricerSha256, digest("pricer-other")]);
+    assert.deepEqual(identity.linked, [{ kernel_id: current.kernelId, pricing_class_id: 1 },
+      { kernel_id: next.kernelId, pricing_class_id: 1 }]);
+    assert.deepEqual(reprice.linked, [{ kernel_id: current.kernelId, pricing_class_id: 1 },
+      { kernel_id: next.kernelId, pricing_class_id: 2 }]);
+    assert.equal(identity.proofs.length, 1);
+    assert.equal(identity.proofs[0].method, 2);
+    assert.equal(identity.proofs[0].pricing_class_id, 1);
+    assert.ok(identity.proofs[0].repriced_owner_days >= 1
+      && identity.proofs[0].repriced_owner_days <= identity.stored.days);
+    assert.deepEqual(reprice.proofs, [{ method: 1, pricing_class_id: null, sample_divisor: null,
+      repriced_owner_days: reprice.stored.days, repriced_events: reprice.stored.events }]);
+    context.diagnostic(JSON.stringify({ kernels: [current.kernelId, next.kernelId], storedOwnerDays: identity.stored.days,
+      storedEvents: identity.stored.events, stale: identity.stale.length, identity: identity.proofs[0],
+      tables: Object.keys(identity.tables).length }));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

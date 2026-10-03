@@ -11,14 +11,20 @@
  * - the pricer is computed by the build, is a subset of the compute closure,
  *   and is stamped into a bundle (kernel.ts analyticsV2BundledPricer);
  * - its inputs are exactly PRICER_INPUTS: a change to the pricer's module
- *   set (the pure pass's metafile) fails here until reviewed (the digest
- *   moves with it either way; the class is never hand-listed);
- * - an edit of any pricing input, or of an unbundled file of a third-party
- *   pricing package, changes the class (negative tests against the metafile);
+ *   set (the pure pass's output inputs, re-export barrels included) fails
+ *   here until reviewed (the digest moves with it either way; the class is
+ *   never hand-listed);
+ * - an edit of any pricing input changes the class, the barrels included:
+ *   an export-alias swap in the facade or in a vendored package's index.js
+ *   changes which function the pricer calls, and the class with it
+ *   (negative tests against the metafile);
+ * - the pricer is a function of the compute closure: a third-party package
+ *   file the bundle does not use moves neither;
  * - an edit of non-pricing kernel code (the compute core, the reader, the
  *   d1/d5 SOURCE_PATCH targets, the hashing helpers) changes the compute
  *   closure but not the class, and so does a re-vendor that moves only the
- *   facade's provenance commit;
+ *   facade's provenance commit; any other facade edit is a new class
+ *   (over-inclusion, a full reprice);
  * - nothing the pure (side-effect-free) pass drops can affect a price: every
  *   module it drops runs, at the top level, only declarations whose
  *   initializers call builtins or reviewed calls (REVIEWED_FOREIGN_CALLS)
@@ -26,13 +32,15 @@
  *   synthetic battery exactly as the full module graph does, the battery
  *   selecting every card the projection can select;
  * - the pass refuses a pricer that reaches a dynamic import or an input
- *   outside the closure.
+ *   outside the closure, and a loaded module that could decide a binding or
+ *   a value without being listed (a star re-export or a TypeScript enum).
  *
  * Synthetic inputs only; the bundles are written under
  * node_modules/.cache (ignored) so their externals resolve, and removed.
  */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -56,9 +64,9 @@ const VENDORED = "apps/worker/vendor/analytics-d43c8f92";
 const BUILD_OPTIONS = Object.freeze({ bundle: true, platform: "node", format: "esm", target: "node22",
   external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent" });
 /**
- * The pricer's inputs (closure names; a third-party package by name and
- * version). A change needs review here: name what the new input prices, or
- * why an input left. The digest itself is never pinned.
+ * The pricer's inputs (closure names). A change needs review here: name what
+ * the new input prices, or why an input left. The digest itself is never
+ * pinned.
  */
 const PRICER_INPUTS = Object.freeze([
   "apps/worker/src/analytics-v2/price-attribution.ts",
@@ -68,16 +76,23 @@ const PRICER_INPUTS = Object.freeze([
   `${VENDORED}/apps/worker/src/server-pricing.ts`,
   `${VENDORED}/apps/worker/src/stored-record.ts`,
   `${VENDORED}/apps/worker/src/telemetry-v1-source-selection.ts`,
+  `${VENDORED}/entry.ts`,
+  `${VENDORED}/packages/accounting/index.js`,
   `${VENDORED}/packages/accounting/src/cost-ledger.js`,
   `${VENDORED}/packages/accounting/src/price-registry.js`,
   `${VENDORED}/packages/accounting/src/subscription-speed.js`,
+  `${VENDORED}/packages/quota-analysis/index.js`,
   `${VENDORED}/packages/quota-analysis/src/plan-attribution.js`,
   `${VENDORED}/packages/quota-analysis/src/quota-calibration.js`,
   `${VENDORED}/packages/quota-analysis/src/quota-windows.js`,
+  `${VENDORED}/packages/telemetry-contract/index.js`,
   `${VENDORED}/packages/telemetry-contract/src/constants.js`,
   `${VENDORED}/packages/telemetry-contract/src/model-catalog.js`,
-  "npm:runcost@0.2.1",
+  "npm:runcost@0.2.1/browser.js",
 ]);
+/** The re-export barrels among them: no bytes in the pricer bundle, but they decide what a pricing import binds. */
+const PRICER_BARRELS = Object.freeze([`${VENDORED}/entry.ts`, `${VENDORED}/packages/accounting/index.js`,
+  `${VENDORED}/packages/quota-analysis/index.js`, `${VENDORED}/packages/telemetry-contract/index.js`]);
 /**
  * Global callees a dropped module's top-level code may call: constructors
  * and functions that read their arguments and return a new value.
@@ -108,12 +123,29 @@ async function identityWith(read, build = esbuild().build) {
     ...(read === undefined ? {} : { read }) });
 }
 
-/** The identity with one comment line appended to `target` (an absolute path). */
-function mutatedAt(target) {
+/** The identity with `target`'s text (an absolute path) replaced by `edit(text)`. */
+function editedAt(target, edit) {
   return identityWith(async (path, ...rest) => {
     const bytes = await readFile(path, ...rest);
-    return path === target ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// mutation\n")]) : bytes;
+    return path === target ? Buffer.from(edit(Buffer.from(bytes).toString("utf8")), "utf8") : bytes;
   });
+}
+
+/** The identity with one comment line appended to `target` (an absolute path). */
+function mutatedAt(target) {
+  return editedAt(target, (text) => `${text}\n// mutation\n`);
+}
+
+/** `text` with the export specifiers `left` and `right` (each named once in an export clause) swapped by alias. */
+function swapExportAliases(text, left, right) {
+  const names = new RegExp(`\\b(${left}|${right})\\b`, "gu");
+  const swapped = [];
+  const result = text.replace(/export\s*\{[^}]*\}/gu, (clause) => clause.replace(names, (name) => {
+    swapped.push(name);
+    return `${name} as ${name === left ? right : left}`;
+  }));
+  assert.deepEqual(swapped.toSorted(), [left, right].toSorted(), "each export is named once in an export clause");
+  return result;
 }
 
 const baseline = await identityWith();
@@ -130,15 +162,14 @@ test("the build computes the pricer from a pure pass, inside the compute closure
     assert.fail(`the pricer's inputs changed: review them and update PRICER_INPUTS.\n${baseline.pricerNames.join("\n")}`);
   }
   assert.equal(baseline.pricerInputs, PRICER_INPUTS.length);
-  // Every pricer input is a closure input (a package by each bundled file), so the registry entry pins the class.
+  // The barrels are inputs without code.
+  assert.equal(baseline.pricerCodeInputs, PRICER_INPUTS.length - PRICER_BARRELS.length);
+  // Every pricer input is a closure input, hashed by its closure digest, so the registry entry pins the class.
   const closure = new Set(baseline.names);
-  for (const name of baseline.pricerNames) {
-    if (name.startsWith("npm:")) assert.ok(baseline.names.some((input) => input.startsWith(`${name}/`)), name);
-    else assert.ok(closure.has(name), name);
-  }
+  for (const name of baseline.pricerNames) assert.ok(closure.has(name), name);
   // Non-pricing kernel code and the hashing helpers stay out.
   for (const outside of ["apps/worker/src/analytics-v2/compute-owner.ts", "apps/worker/src/crypto.ts",
-    "apps/worker/src/canonical-json.ts", `${VENDORED}/entry.ts`, `${VENDORED}/apps/worker/src/quota-analysis-v11.ts`,
+    "apps/worker/src/canonical-json.ts", `${VENDORED}/apps/worker/src/quota-analysis-v11.ts`,
     `${VENDORED}/apps/worker/src/v11-daily-projection-values.ts`]) {
     assert.equal(baseline.pricerNames.includes(outside), false, outside);
     assert.ok(closure.has(outside), `${outside} is a closure input`);
@@ -168,8 +199,8 @@ test("an edit of any pricing input changes the pricing class (negative tests aga
   const runcost = join(WORKER_ROOT, "node_modules", "runcost");
   const targets = [
     ...PRICER_INPUTS.filter((name) => !name.startsWith("npm:")).map((name) => join(REPOSITORY_ROOT, ...name.split("/"))),
-    // The bundled file of the third-party pricer package, and one it installs but the bundle does not use.
-    join(runcost, "browser.js"), join(runcost, "README.md"),
+    // The bundled file of the third-party pricer package.
+    join(runcost, "browser.js"),
   ];
   for (const target of targets) {
     const mutated = await mutatedAt(target);
@@ -186,6 +217,42 @@ test("an edit of any pricing input changes the pricing class (negative tests aga
   assert.notEqual(renamed.pricerSha256, baseline.pricerSha256);
 });
 
+test("an export-alias swap in a re-export barrel changes the pricer's code, and the class with it", async () => {
+  const pureText = async (target, edit) => {
+    const plugin = { name: "analytics-v2-pricing-class-check-edit", setup(pass) {
+      pass.onLoad({ filter: /.*/ }, async (args) => (args.path !== target ? undefined : {
+        contents: edit(await readFile(target, "utf8")), loader: target.endsWith(".ts") ? "ts" : "js" }));
+    } };
+    const result = await esbuild().build(analyticsPricerBundleOptions({ options: { ...BUILD_OPTIONS,
+      plugins: target === null ? [] : [plugin] }, vendorRoot: VENDOR_ROOT, cwd: CLOUD_RUN }));
+    return createHash("sha256").update(result.outputFiles[0].text).digest("hex");
+  };
+  const before = await pureText(null);
+  for (const [target, left, right] of [
+    // server-pricing.ts imports these through the accounting barrel.
+    [join(VENDOR_ROOT, "packages", "accounting", "index.js"), "fastModeModelFamilyKey", "fastModeQuotaMultiplier"],
+    // price-attribution.ts imports both pricing functions through the facade.
+    [join(VENDOR_ROOT, "entry.ts"), "buildPricingEvent", "priceTelemetryUsageEvent"],
+  ]) {
+    const edit = (text) => swapExportAliases(text, left, right);
+    // A real pricing change: the pure pricer's code is different.
+    assert.notEqual(await pureText(target, edit), before, target);
+    const swapped = await editedAt(target, edit);
+    assert.notEqual(swapped.computeClosureSha256, baseline.computeClosureSha256, target);
+    assert.notEqual(swapped.pricerSha256, baseline.pricerSha256, target);
+  }
+});
+
+test("the pricer is a function of the compute closure: a package file the bundle does not use moves neither", async () => {
+  const runcost = join(WORKER_ROOT, "node_modules", "runcost");
+  for (const target of [join(runcost, "README.md"), join(runcost, "package.json"), join(runcost, "index.js")]) {
+    // The manifest stays JSON (its name and version name the closure inputs): one more newline.
+    const mutated = target.endsWith(".json") ? await editedAt(target, (text) => `${text}\n`) : await mutatedAt(target);
+    assert.equal(mutated.computeClosureSha256, baseline.computeClosureSha256, target);
+    assert.equal(mutated.pricerSha256, baseline.pricerSha256, target);
+  }
+});
+
 test("a non-pricing kernel edit keeps the pricing class and moves the compute closure", async () => {
   for (const target of [
     join(WORKER_ROOT, "src", "analytics-v2", "compute-owner.ts"),
@@ -196,7 +263,6 @@ test("a non-pricing kernel edit keeps the pricing class and moves the compute cl
     join(VENDOR_ROOT, "apps", "worker", "src", "quota-analysis-v11.ts"),
     join(VENDOR_ROOT, "apps", "worker", "src", "v11-daily-projection-values.ts"),
     join(VENDOR_ROOT, "apps", "worker", "src", "effective-usage-day.ts"),
-    join(VENDOR_ROOT, "entry.ts"),
   ]) {
     const mutated = await mutatedAt(target);
     assert.notEqual(mutated.computeClosureSha256, baseline.computeClosureSha256, target);
@@ -218,6 +284,8 @@ test("a non-pricing kernel edit keeps the pricing class and moves the compute cl
   });
   assert.notEqual(moved.computeClosureSha256, baseline.computeClosureSha256);
   assert.equal(moved.pricerSha256, baseline.pricerSha256);
+  // Any other facade edit is a new class (the facade decides what price-attribution.ts binds): over-inclusion.
+  assert.notEqual((await mutatedAt(join(VENDOR_ROOT, "entry.ts"))).pricerSha256, baseline.pricerSha256);
 });
 
 /** The pricer bundle under the build's options: `pure` (the class's pass) or the module graph's real semantics. */
@@ -453,6 +521,12 @@ test("the pricer pass refuses a dynamic import it reaches and an input outside t
     output.inputs[join("..", "src", "analytics-v2", "kernel.ts")] = { bytesInOutput: 10 };
     return result;
   }), { code: "ANALYTICS_PRICER_OUTSIDE_CLOSURE" });
+  // A module the pass loads but does not list, which could decide a binding or a value unhashed.
+  const unlisted = join(VENDOR_ROOT, "apps", "worker", "src", "quota-analysis-v11.ts");
+  for (const declaration of ["export * from \"./crypto\";", "export enum PricingProbe { A = 1 }"]) {
+    await assert.rejects(editedAt(unlisted, (text) => `${text}\n${declaration}\n`),
+      { code: "ANALYTICS_PRICER_UNTRACKED_BINDING", name: `${VENDORED}/apps/worker/src/quota-analysis-v11.ts` }, declaration);
+  }
   // The pricing method version must come from a pricer input.
   await assert.rejects(identityWith(undefined, async (options) => {
     const result = await esbuild().build(options);

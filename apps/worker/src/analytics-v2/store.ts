@@ -64,6 +64,7 @@ import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
 import { AnalyticsV2PriceError, analyticsV2KernelPriceCards } from "./price-attribution";
 import { AnalyticsV2TransitionError } from "./price-transition";
 import {
+  AnalyticsV2PricingClassError,
   proveAnalyticsV2PriceTransitions,
   recordAnalyticsV2PriceTransitions,
   registerAnalyticsV2KernelPrices,
@@ -258,8 +259,10 @@ export async function writeRunOutputs(
       }
     }
     if (error instanceof AnalyticsV2StoreError) throw error;
-    // K-PERCARD's closed, content-free codes (corrupt stored inputs, an invalid transition) pass through.
-    if (error instanceof AnalyticsV2PriceError || error instanceof AnalyticsV2TransitionError) throw error;
+    // K-PERCARD's closed, content-free codes (corrupt stored inputs, an invalid transition) pass through, and
+    // W1E's (a kernel stating another pricing class than it registered, a failed sample, an invalid class state).
+    if (error instanceof AnalyticsV2PriceError || error instanceof AnalyticsV2TransitionError
+        || error instanceof AnalyticsV2PricingClassError) throw error;
     const sqlState = sqlStateOf(error);
     throw new AnalyticsV2StoreError("ANALYTICS_V2_WRITE_FAILED", sqlState === undefined ? {} : { sqlState });
   }

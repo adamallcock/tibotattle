@@ -61,25 +61,39 @@
  *   is deliberately narrower than the compute class, so a kernel bump that
  *   changes no pricing code keeps every stored price. It is computed from a
  *   second, tree-shaken esbuild pass (analyticsPricerBundleOptions) whose
- *   entry exports only the pricing functions (ANALYTICS_PRICER_ENTRY): an
- *   input is in the pricer when it contributes bytes to that bundle
- *   (bytesInOutput > 0). The pass marks every module side-effect free, so a
- *   module is in only when a pricing function reaches its code; the
- *   pricing-class check (scripts/analytics-v2-pricing-class.check.mjs) proves
- *   that nothing the pass leaves out can affect a price: no module it drops
- *   runs a top-level statement that writes or calls into another module
- *   outside a reviewed allowlist, and the pure bundle prices a synthetic
- *   battery that selects every card exactly as the full module graph does.
- *   Dynamic imports are left external, and a pricer that still reaches one is
- *   refused (ANALYTICS_PRICER_DYNAMIC_IMPORT_REACHED). Inputs are hashed by
- *   their closure name and digest (the facade with its provenance commit
- *   masked; the price registry included), except a third-party package,
- *   which is hashed whole by its package digest (every file it installs), so
- *   a package edit outside the bundled file still moves the class. Every
- *   pricer input must be a closure input (ANALYTICS_PRICER_OUTSIDE_CLOSURE),
- *   so a registry entry, which pins the closure, pins its pricing class too.
- *   It is never hand-listed. The pricing method version is the vendored
- *   SERVER_PRICING_METHOD_VERSION, read from the pricer's own source.
+ *   entry exports only the pricing functions (ANALYTICS_PRICER_ENTRY): the
+ *   pricer is every input that pass's output lists, the modules contributing
+ *   code AND the re-export barrels that contribute none but decide which
+ *   declaration a pricing import binds (the facade entry.ts and the vendored
+ *   packages' index.js files). The pass marks every module side-effect free,
+ *   so a module is in only when a pricing function reaches its code or its
+ *   re-exports; the pricing-class check
+ *   (scripts/analytics-v2-pricing-class.check.mjs) proves that nothing the
+ *   pass leaves out can affect a price: no module it drops runs a top-level
+ *   statement that writes or calls into another module outside a reviewed
+ *   allowlist, and the pure bundle prices a synthetic battery that selects
+ *   every card exactly as the full module graph does. A module the pass loads
+ *   but its output does not list could still decide a binding through a star
+ *   re-export or a value through a TypeScript enum (which esbuild inlines
+ *   across modules), so the pass refuses either
+ *   (ANALYTICS_PRICER_UNTRACKED_BINDING). Dynamic imports are left external,
+ *   and a pricer that still reaches one is refused
+ *   (ANALYTICS_PRICER_DYNAMIC_IMPORT_REACHED). Every pricer input must be a
+ *   closure input (ANALYTICS_PRICER_OUTSIDE_CLOSURE) and is hashed by its
+ *   closure name and the digest the compute class hashes it by (the facade
+ *   with its provenance commit masked; the price registry included; a
+ *   third-party package by each bundled file, as the closure names it), so
+ *   the pricer digest is a function of the compute closure's digests and the
+ *   module set the pure pass selects from them (esbuild's tree shaking, under
+ *   the lockfile's esbuild): no file outside the closure moves it, and two
+ *   builds of one kernel-registry entry state one pricing class. A build
+ *   that still states another class for a registered kernel is refused at
+ *   its first write (ANALYTICS_V2_PRICING_CLASS_CONFLICT, store-price.ts),
+ *   never trusted. It is never hand-listed.
+ *   The pricing method version is the vendored SERVER_PRICING_METHOD_VERSION,
+ *   read from the pricer's own source. Over-inclusion only costs a full
+ *   reprice on a kernel bump: an edit of the facade, which REFRESH-OPT d1 and
+ *   d5 both made, is a new pricing class even when no pricing export moves.
  *
  * The build refuses an identity no kernel-registry.json entry names
  * (resolveAnalyticsKernelRegistryEntry, CLOUD_RUN_BUILD_KERNEL_UNREGISTERED),
@@ -90,7 +104,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Script } from "node:vm";
@@ -163,8 +177,8 @@ export const ANALYTICS_KERNEL_DEFINES = Object.freeze({
   pricerSha256: "__ANALYTICS_V2_PRICER_SHA256__",
   pricingMethodVersion: "__ANALYTICS_V2_PRICING_METHOD_VERSION__",
 });
-/** The pricer digest's method (pricerSha256). */
-export const ANALYTICS_PRICER_CLASS_VERSION = "analytics-v2-pricer-v1";
+/** The pricer digest's method (pricerSha256). v2 hashes every input of the pure pass by its closure digest. */
+export const ANALYTICS_PRICER_CLASS_VERSION = "analytics-v2-pricer-v2";
 /**
  * The pricer: the functions that price one stored usage row, by module
  * (repository paths; `vendor:` paths are relative to the vendored kernel
@@ -185,6 +199,8 @@ export const ANALYTICS_PRICER_METHOD_INPUT = "apps/worker/src/server-pricing.ts"
 const PRICING_METHOD_VERSION = /^export const SERVER_PRICING_METHOD_VERSION = "([A-Za-z0-9._:-]{1,64})";$/mu;
 /** The pricer pass's stdin entry (not a file; never an input). */
 const PRICER_ENTRY_NAME = "<analytics-v2-pricer-entry>";
+/** A star re-export or a TypeScript enum declaration, at the start of a line (see pricerIdentity). */
+const UNTRACKED_BINDING = /^[ \t]*(?:export[ \t]*\*|(?:export[ \t]+)?(?:declare[ \t]+)?(?:const[ \t]+)?enum[ \t]+[A-Za-z_$][\w$]*[ \t]*\{)/mu;
 /** What a dynamic import becomes in the pricer pass: external, and refused if the pricer still reaches it. */
 const PRICER_DYNAMIC_IMPORT = "analytics-v2-pricer-dynamic-import:";
 const WORKSPACE_SCOPE = "@app-usagemonitor";
@@ -316,35 +332,10 @@ export function analyticsPricerBundleOptions({ options, vendorRoot, cwd = proces
 }
 
 /**
- * The digest of an installed third-party package: every regular file under
- * its root but nested node_modules, as (path inside the package, sha256),
- * sorted by path. A link or another file kind is refused.
- */
-async function packageDigest(root, read) {
-  let entries;
-  try {
-    entries = await readdir(root, { withFileTypes: true, recursive: true });
-  } catch {
-    fail("ANALYTICS_PRICER_PACKAGE_INVALID");
-  }
-  const files = [];
-  for (const entry of entries) {
-    const absolute = resolve(entry.parentPath ?? entry.path, entry.name);
-    const inside = relative(root, absolute).split(sep);
-    if (inside.includes("node_modules")) continue;
-    if (entry.isDirectory()) continue;
-    if (!entry.isFile()) fail("ANALYTICS_PRICER_PACKAGE_INVALID", { path: inside.join("/") });
-    files.push([inside.join("/"), sha256(await read(absolute))]);
-  }
-  if (files.length === 0) fail("ANALYTICS_PRICER_PACKAGE_INVALID");
-  files.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-  return sha256(JSON.stringify(files));
-}
-
-/**
  * The pricer's identity (see the module comment), from the pure pricer pass.
  * `closure` maps each closure input name to the digest the compute class
- * hashes it by (the facade masked); a pricer input must be one of them.
+ * hashes it by (the facade masked); every input the pass lists, with or
+ * without bytes in its output, must be one of them and is hashed by it.
  */
 async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }) {
   const result = await build(analyticsPricerBundleOptions({ options, vendorRoot, cwd }));
@@ -354,20 +345,26 @@ async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }
   }
   if (result.outputFiles[0].text.includes(PRICER_DYNAMIC_IMPORT)) fail("ANALYTICS_PRICER_DYNAMIC_IMPORT_REACHED");
   const inputs = new Map();
-  for (const [path, input] of Object.entries(outputs[0].inputs ?? {})) {
-    if (path === PRICER_ENTRY_NAME || !(input?.bytesInOutput > 0)) continue;
+  let codeInputs = 0;
+  const entry = resolve(REPOSITORY_ROOT, PRICER_ENTRY_NAME);
+  // The output's input list names every module whose code or re-exports a pricing function reaches. A module the
+  // pass loads but leaves out of it could still decide a binding through a star re-export, or a value through a
+  // TypeScript enum (inlined across modules): the pass refuses both rather than let such a module stay unhashed.
+  for (const path of Object.keys(result.metafile.inputs ?? {})) {
     const absolute = resolve(cwd, path);
+    if (absolute === entry) continue;
+    if (UNTRACKED_BINDING.test(Buffer.from(await read(absolute)).toString("utf8"))) {
+      fail("ANALYTICS_PRICER_UNTRACKED_BINDING", { name: (await closureEntry(absolute, read))[0] });
+    }
+  }
+  for (const [path, input] of Object.entries(outputs[0].inputs ?? {})) {
+    const absolute = resolve(cwd, path);
+    if (absolute === entry) continue;
+    // A re-export barrel adds no bytes but decides which declaration an import binds: it is hashed like the rest.
     const [name] = await closureEntry(absolute, read);
     if (!closure.has(name)) fail("ANALYTICS_PRICER_OUTSIDE_CLOSURE", { name });
-    const parts = absolute.split(sep);
-    const { nameParts, root } = parts.includes("node_modules") ? packageOf(absolute) : { nameParts: null, root: null };
-    if (nameParts === null || nameParts[0] === WORKSPACE_SCOPE) {
-      inputs.set(name, closure.get(name));
-      continue;
-    }
-    // A third-party package is one input: the whole package by its digest.
-    const packageName = name.slice(0, name.indexOf("/", `npm:${nameParts.join("/")}@`.length));
-    if (!inputs.has(packageName)) inputs.set(packageName, await packageDigest(root, read));
+    inputs.set(name, closure.get(name));
+    if (input?.bytesInOutput > 0) codeInputs += 1;
   }
   const methodInput = relative(REPOSITORY_ROOT, resolve(vendorRoot, ...ANALYTICS_PRICER_METHOD_INPUT.split("/")))
     .split(sep).join("/");
@@ -380,6 +377,7 @@ async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }
     pricerSha256: sha256(JSON.stringify([ANALYTICS_PRICER_CLASS_VERSION, ANALYTICS_PRICER_ENTRY, sorted])),
     pricingMethodVersion,
     pricerInputs: sorted.length,
+    pricerCodeInputs: codeInputs,
     pricerNames: Object.freeze(sorted.map(([name]) => name)),
   });
 }
