@@ -11,6 +11,7 @@ import {
   resolveAnalyticsKernelRegistryEntry,
 } from "./analytics-kernel-closure.mjs";
 import { assertNodeHostAlias, cloudRunBuildPlugins } from "./node-host-build.mjs";
+import { assertTelemetryByteBoundsBinding } from "./telemetry-byte-bounds-binding.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const ENTRY = resolve(ROOT, "server.mjs");
@@ -133,6 +134,8 @@ if (kernelClosureOnly) {
   const result = await build({ ...options, write: false });
   assertVendoredPackageResolution(result.metafile);
   assertNodeHostAlias(result.metafile, { workerRoot: WORKER_ROOT, requiredEntries: NODE_HOST_REQUIRED_ENTRIES });
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT,
+    requiredEntries: [ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
@@ -144,6 +147,8 @@ if (kernelClosureOnly) {
   const result = await build(options);
   assertVendoredPackageResolution(result.metafile);
   assertNodeHostAlias(result.metafile, { workerRoot: WORKER_ROOT, requiredEntries: NODE_HOST_REQUIRED_ENTRIES });
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT,
+    requiredEntries: [ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",

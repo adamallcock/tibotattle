@@ -141,7 +141,7 @@ describe("Node host primitives (Cloud Run)", () => {
       "src/host-primitives.ts", VENDORED_CRYPTO]);
     expect(relative(WORKER_ROOT, hostBuild.nodeHostPrimitivesModule(WORKER_ROOT))).toBe(PRIMITIVES);
     expect(() => hostBuild.nodeHostAliasPlugin("")).toThrow("NODE_HOST_ALIAS_ROOT_INVALID");
-    expect(hostBuild.cloudRunBuildPlugins(WORKER_ROOT).map((plugin) => plugin.name)).toEqual(["analytics-v2-fast-pricer", "node-host-primitives"]);
+    expect(hostBuild.cloudRunBuildPlugins(WORKER_ROOT).map((plugin) => plugin.name)).toEqual(["analytics-v2-fast-pricer", "node-host-primitives", "node-telemetry-byte-bounds"]);
   });
 
   describe("assertNodeHostAlias refuses a bundle that would fall back to WebCrypto", () => {

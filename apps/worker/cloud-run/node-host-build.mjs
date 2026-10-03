@@ -1,4 +1,5 @@
 import { analyticsFastPricerPlugin } from "./analytics-fast-pricer-binding.mjs";
+import { telemetryByteBoundsPlugin } from "./telemetry-byte-bounds-binding.mjs";
 import { relative, resolve } from "node:path";
 
 // Build-time composition of the Cloud Run Node host primitives (Wave 1A).
@@ -7,7 +8,8 @@ import { relative, resolve } from "node:path";
 // it so that every in-repo esbuild of the Cloud Run entries sees the import
 // graph that ships. It is outside the analytics kernel compute closure, so an
 // edit here does not change the compute class; what it resolves to
-// (node-host-primitives.mjs) is inside it.
+// (node-host-primitives.mjs) is inside it. The telemetry byte-bound transform
+// policy is also explicitly hashed by analytics-kernel-closure.mjs.
 
 /** The files nodeHostAliasPlugin resolves to node-host-primitives.mjs (a build asserts neither remains in a bundle). */
 export function nodeHostAliasedFiles(workerRoot) {
@@ -55,8 +57,8 @@ export function nodeHostAliasPlugin(workerRoot) {
 }
 
 /** The plugins of cloud-run/build.mjs, for every in-repo esbuild of the Cloud Run entries. */
-export function cloudRunBuildPlugins(workerRoot) {
-  return [analyticsFastPricerPlugin(), nodeHostAliasPlugin(workerRoot)];
+export function cloudRunBuildPlugins(workerRoot, sourceOptions = {}) {
+  return [analyticsFastPricerPlugin(), nodeHostAliasPlugin(workerRoot), telemetryByteBoundsPlugin(workerRoot, sourceOptions)];
 }
 
 function refuse(code, detail) {

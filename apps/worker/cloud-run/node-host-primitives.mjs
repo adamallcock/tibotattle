@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 // The Cloud Run Node host primitives (Wave 1A): node:crypto's synchronous
-// SHA-256 and Buffer's hex encoder. The Cloud Run build resolves
+// SHA-256 and Buffer's hex encoder. Node telemetry bounds additionally use
+// hostUtf8Length, composed by telemetry-byte-bounds-binding.mjs only after
+// the original descriptor walk and JSON.stringify. The Cloud Run build resolves
 // src/host-primitives.ts and the vendored d43c8f92 crypto.ts to this module
 // (nodeHostAliasPlugin in node-host-build.mjs), so both sha256Hex
 // implementations hash here instead of awaiting WebCrypto through libuv's
@@ -34,6 +36,11 @@ export function hostSha256Hex(value) {
 /** host-primitives.ts hostBytesHex: lowercase hex of bytes[start, end), read in place. */
 export function hostBytesHex(bytes, start, end) {
   return Buffer.from(bytes.buffer, bytes.byteOffset + start, end - start).toString("hex");
+}
+
+/** Exact UTF-8 length of an already serialized string; no encoding buffer. */
+export function hostUtf8Length(serialized) {
+  return Buffer.byteLength(serialized, "utf8");
 }
 
 /**

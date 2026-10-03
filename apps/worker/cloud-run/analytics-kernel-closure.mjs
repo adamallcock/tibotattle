@@ -109,6 +109,7 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Script } from "node:vm";
 import { assertAnalyticsFastPricerBinding, FAST_PRICER_BINDING_POLICY } from "./analytics-fast-pricer-binding.mjs";
+import { assertTelemetryByteBoundsBinding, TELEMETRY_BYTE_BOUNDS_POLICY, telemetryByteBoundsSource } from "./telemetry-byte-bounds-binding.mjs";
 
 export const ANALYTICS_KERNEL_CLOSURE_VERSION = "analytics-v2-compute-closure-v2";
 /** The compute class's digest method (computeSha256). v2 masks the facade's provenance commit. */
@@ -367,6 +368,14 @@ async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }
     inputs.set(name, closure.get(name));
     if (input?.bytesInOutput > 0) codeInputs += 1;
   }
+  // This source transformation decides accepted pricing inputs only when the
+  // transformed module contributes to pricing. Hash its exact policy then.
+  const [boundsSourceName] = await closureEntry(telemetryByteBoundsSource(WORKER_ROOT), read);
+  if (inputs.has(boundsSourceName)) {
+    const [policyName] = await closureEntry(TELEMETRY_BYTE_BOUNDS_POLICY, read);
+    if (!closure.has(policyName)) fail("ANALYTICS_PRICER_OUTSIDE_CLOSURE", { name: policyName });
+    inputs.set(policyName, closure.get(policyName));
+  }
   const methodInput = relative(REPOSITORY_ROOT, resolve(vendorRoot, ...ANALYTICS_PRICER_METHOD_INPUT.split("/")))
     .split(sep).join("/");
   if (!inputs.has(methodInput)) fail("ANALYTICS_PRICER_METHOD_VERSION_MISSING");
@@ -403,6 +412,8 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
     entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY], write: false, metafile: true,
     outdir: resolve(CLOUD_RUN_ROOT, "dist") });
   assertAnalyticsFastPricerBinding(result.metafile, cwd);
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT, cwd,
+    requiredEntries: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
   const graph = new Map();
   for (const [path, input] of Object.entries(result.metafile.inputs)) {
     graph.set(resolve(cwd, path), (input.imports ?? []).filter((imported) => !imported.external)
@@ -442,6 +453,8 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
   // closure executes. Hash it even though runtime code never imports tooling.
   const [policyName, policyDigest] = await closureEntry(FAST_PRICER_BINDING_POLICY, read);
   byName.set(policyName, policyDigest);
+  const [boundsPolicyName, boundsPolicyDigest] = await closureEntry(TELEMETRY_BYTE_BOUNDS_POLICY, read);
+  byName.set(boundsPolicyName, boundsPolicyDigest);
   const inputs = [...byName].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
   // The compute class: every input but the vendored price registry, which
   // must be one, with the facade (which must be one too) hashed with its

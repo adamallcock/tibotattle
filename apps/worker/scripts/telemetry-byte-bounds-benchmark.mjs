@@ -39,7 +39,7 @@ export function descriptorJsonBytes(value) {
   const entries=Object.entries(value);
   return 2+Math.max(0,entries.length-1)+entries.reduce((sum,[key,item])=>sum+utf8Bytes(JSON.stringify(key))+1+descriptorJsonBytes(item),0);
 }
-export async function loadBoundsHarness() {
+export async function loadBoundsHarness({ bufferFactory } = {}) {
   const sourceFile=join(root,'packages/telemetry-contract/src/primitives.js'),source=await readFile(sourceFile,'utf8');
   const needle='new TextEncoder().encode(serialized).byteLength';
   assert.equal(source.split(needle).length-1,1);
@@ -47,6 +47,7 @@ export async function loadBoundsHarness() {
   const variants={};
   try {
     for(const name of ['oracle','scan','buffer','descriptor']) {
+      if(name==='buffer' && bufferFactory) {variants[name]=await bufferFactory(directory);continue;}
       let contents=source;
       if(name==='scan') contents=source.replace(needle,'utf8Bytes(serialized)')+'\n'+utf8Bytes.toString();
       if(name==='buffer') contents='import { Buffer } from "node:buffer";\n'+source.replace(needle,'Buffer.byteLength(serialized,"utf8")');

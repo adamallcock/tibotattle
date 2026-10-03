@@ -106,6 +106,7 @@ const BASE_ALLOWLIST = Object.freeze([
   // through, and the build-only alias that composes them (build.mjs).
   Object.freeze({ source: "cloud-run/node-host-primitives.mjs", destination: "apps/worker/cloud-run/node-host-primitives.mjs" }),
   Object.freeze({ source: "cloud-run/node-host-build.mjs", destination: "apps/worker/cloud-run/node-host-build.mjs" }),
+  Object.freeze({ source: "cloud-run/telemetry-byte-bounds-binding.mjs", destination: "apps/worker/cloud-run/telemetry-byte-bounds-binding.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),

@@ -8,6 +8,7 @@ import { build as esbuild } from 'esbuild';
 import { analyticsPricerBundleOptions } from '../cloud-run/analytics-kernel-closure.mjs';
 import { cloudRunBuildPlugins } from '../cloud-run/node-host-build.mjs';
 import { assertAnalyticsFastPricerBinding, FAST_PRICER_BINDING_POLICY } from '../cloud-run/analytics-fast-pricer-binding.mjs';
+import { assertTelemetryByteBoundsBinding, TELEMETRY_BYTE_BOUNDS_POLICY, telemetryByteBoundsSource } from '../cloud-run/telemetry-byte-bounds-binding.mjs';
 
 const WORKER = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT = resolve(WORKER, '../..');
@@ -37,7 +38,7 @@ const builtins = new Set(builtinModules.map((name) => name.replace(/^node:/u, ''
 export async function deriveAnalyticsV2PreparedDayClass({ build = esbuild, read = readFile } = {}) {
   const options = analyticsPricerBundleOptions({ vendorRoot: VENDOR, cwd: WORKER, pure: false,
     options: { platform: 'node', target: 'node22', mainFields: ['module', 'main'], logLevel: 'silent',
-      plugins: cloudRunBuildPlugins(WORKER) } });
+      plugins: cloudRunBuildPlugins(WORKER, { read }) } });
   options.stdin = { contents: ENTRY_TEXT, sourcefile: ENTRY, resolveDir: WORKER, loader: 'js' };
   options.plugins.push({ name: 'offline-producer-source', setup(pass) {
     pass.onLoad({ filter: /\.(?:[cm]?js|ts|json)$/ }, async ({ path }) => ({
@@ -48,6 +49,7 @@ export async function deriveAnalyticsV2PreparedDayClass({ build = esbuild, read 
   const result = await build(options);
   if (result.outputFiles?.length !== 1 || Object.keys(result.metafile?.outputs ?? {}).length !== 1) fail('PREPARED_DAY_CLASS_OUTPUT_INVALID');
   assertAnalyticsFastPricerBinding(result.metafile, WORKER);
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER, cwd: WORKER });
   const output = Object.values(result.metafile.outputs)[0];
   for (const item of output.imports ?? []) {
     if (!item.external || !builtins.has(item.path.replace(/^node:/u, ''))) {
@@ -55,6 +57,7 @@ export async function deriveAnalyticsV2PreparedDayClass({ build = esbuild, read 
     }
   }
   const reached = new Set(Object.keys(output.inputs).map((name) => resolve(WORKER, name)));
+  if (reached.has(telemetryByteBoundsSource(WORKER))) reached.add(TELEMETRY_BYTE_BOUNDS_POLICY);
   // Composition policy is not an emitted module, but controls actual bindings.
   reached.add(FAST_PRICER_BINDING_POLICY);
   reached.add(resolve(WORKER, 'cloud-run/node-host-build.mjs'));

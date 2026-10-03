@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { loadBoundsHarness, utf8Bytes, descriptorJsonBytes } from '../apps/worker/scripts/telemetry-byte-bounds-benchmark.mjs';
+import { loadComposedBounds } from '../apps/worker/cloud-run/telemetry-byte-bounds.check.mjs';
 const encoder=new TextEncoder();
 function capture(operation) {
   try {return {ok:true,value:operation()};}
@@ -23,7 +24,7 @@ test('platform-neutral UTF8 count matches encoder across all UTF16 units, pairs 
   }
 });
 test('stringify-preserving variants retain exact thresholds, validation failures and serialization effects',async()=> {
-  const h=await loadBoundsHarness();let comparisons=0;
+  const h=await loadBoundsHarness({bufferFactory: async directory => (await loadComposedBounds({directory})).module.assertTelemetryClientBounds});let comparisons=0;
   try {
     const factories=[()=>null,()=>-0,()=>true,()=>1e21,()=>1e-7,()=>Number.MAX_VALUE,
       ()=>({control:'\u0000\b\t\n\f\r"\\\u2028\u2029',unicode:'\u00e9\u4e2d\ud83d\ude00\ud800\udfff'}),
