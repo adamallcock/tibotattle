@@ -35,7 +35,11 @@
  *     Re-reads, re-plans, and runs only the create, update and bind
  *     operations of a plan whose digest equals --authorize. It never deletes,
  *     never changes a running image or source commit, never edits bucket
- *     metadata or bucket IAM, and refuses the synthetic fixture.
+ *     metadata, and refuses the synthetic fixture. The only bucket IAM it
+ *     changes is the builder's roles/storage.objectViewer binding on the
+ *     project's default Cloud Build bucket, <project>_cloudbuild, which it
+ *     creates (uniform bucket-level access, public access prevention
+ *     enforced) when absent and binds on in the next pass (BUILD-SOURCE).
  *   pause-all    --environment=<env> [--apply --authorize=<planDigest> --receipt-out=<abs path>]
  *     OPS-3. Dry run by default: one read of the region's scheduler jobs and
  *     the plan (every plane trigger, its action, co-tenant triggers that keep
@@ -76,6 +80,8 @@ import {
   JOB_NAMES,
   SCHEDULED_JOB_NAMES,
   bucketInsertBody,
+  buildSourceBucketCreateArgs,
+  buildSourceReaderBinding,
   cloudSqlCreateArgs,
   databaseFlags,
   desiredProjectBindings,
@@ -240,6 +246,14 @@ export function renderInfrastructure(desired, { bootstrap = null } = {}) {
     projectBindings: desiredProjectBindings(desired),
     cloudSql: { createArgs: cloudSqlCreateArgs(desired), databaseFlags: databaseFlags(desired) },
     bucket: bucketInsertBody(desired),
+    // BUILD-SOURCE: the bucket builds stage their source in, its create when
+    // absent, and the builder's one role on it.
+    buildSource: {
+      bucket: desired.buildSource.bucket,
+      sourceDir: desired.buildSource.sourceDir,
+      createArgs: buildSourceBucketCreateArgs(desired),
+      readerBinding: buildSourceReaderBinding(desired),
+    },
     serviceIam: renderEdgeIamPolicy(desired),
     verifierIam: desired.serviceAccounts.verifier === null ? null
       : desired.serviceAccounts.verifier.tokenCreators === null ? { unavailable: "VERIFIER_TOKEN_CREATOR_UNASSIGNED" }

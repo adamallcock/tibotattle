@@ -17,7 +17,8 @@ import * as maintenanceJob from "../cloud-run/postgres-maintenance-job-contract.
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import { CLEAN_DEFERRALS } from "./gcp-ops-infra-operations.mjs";
-import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter, withSecretValues } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter, withCloudBuildBucket, withSecretValues }
+  from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { generateStagingSecretValues, STAGING_SECRET_KINDS } from "./gcp-staging-secrets.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -469,8 +470,12 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     generation: PROOF.bucketGeneration, extra: { projectNumber: staging.projectNumber } }));
   // A co-tenant of the shared test project, never read into the plan or touched.
   world.services.push({ metadata: { name: "tibotattle-test-app" }, spec: { template: { spec: { containers: [{}] } } } });
+  // BUILD-SOURCE: the shared project's default Cloud Build bucket exists (the
+  // test estate's builds made it), with no grant for the staging builder.
+  withCloudBuildBucket(world, { project: staging.project, projectNumber: staging.projectNumber });
   const writer = memoryWriter();
-  const gcloud = createFakeGcloud(world, { files: writer.files, project: staging.project, region: staging.region });
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: staging.project, region: staging.region,
+    projectNumber: staging.projectNumber });
   const plan = (options = {}) => operations.planInfrastructure(staging,
     operations.readbackInfrastructure(staging, { runner: gcloud.runner }), options);
   const deferred = (result) => result.operations.filter((entry) => entry.deferred !== undefined)
@@ -482,8 +487,15 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   // named 2026-10-02), and the maintenance trigger's create and pause: the
   // staging maintenance job waits only for the bootstrap image now
   // (STAGING-MAINT-RENDER), so its trigger is made and paused as production's
-  // is, its grant withheld.
-  assert.equal(first.summary.executable, 27);
+  // is, its grant withheld. BUILD-SOURCE adds the staging builder's bucket-level
+  // read on tibotattle_cloudbuild, the bucket its bootstrap-image build stages into.
+  assert.equal(first.summary.executable, 28);
+  assert.deepEqual(first.operations.filter((entry) => entry.id.startsWith("build-source-bucket"))
+    .map((entry) => [entry.id, entry.argv, entry.deferred]), [[
+    "build-source-bucket-iam:bind:roles/storage.objectViewer|serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com|",
+    ["storage", "buckets", "add-iam-policy-binding", "gs://tibotattle_cloudbuild", "--project=tibotattle",
+      "--member=serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com",
+      "--role=roles/storage.objectViewer"], undefined]]);
   assert.ok(deferred(first).includes("run-job:create:maintenance:BOOTSTRAP_IMAGE_REQUIRED"));
   assert.deepEqual(first.operations.filter((entry) => entry.deferred === undefined && entry.id.startsWith("scheduler:"))
     .map((entry) => entry.id), ["scheduler:create:maintenance", "scheduler:pause:maintenance"]);
@@ -492,6 +504,11 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
+  // After pass 1 the staging builder can read its build sources, and nothing else changed on that bucket.
+  assert.deepEqual(world.bucketPolicies.tibotattle_cloudbuild.bindings.filter((binding) =>
+    binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
+    members: ["serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com"] }]);
+  assert.equal(world.buckets.filter((bucket) => bucket.name === "tibotattle_cloudbuild").length, 1);
   const second = plan({ bootstrap: IMAGE });
   // Staging commits no refresh cadence, so no trigger is created and the scheduler's executor grant
   // is withheld with it (SCHEDULER_CADENCE_UNSET): the account cannot run a job nothing triggers.

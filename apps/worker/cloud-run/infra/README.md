@@ -52,6 +52,10 @@ production estate reads unclean until that instance is deleted.
   token and never reuses a test-estate name.
 - In a shared project, OPS-2 never plans co-tenant resources and never reads
   or changes the project-wide logging and Data Access audit settings.
+- `buildSource.bucket` is the project's default Cloud Build bucket,
+  `<project>_cloudbuild`, and nothing else (`BUILD_SOURCE_BUCKET_NAME_INVALID`;
+  see [Build-source bucket](#build-source-bucket-build-source)). It is the one
+  bucket a plane names that is not plane-named: it belongs to the project.
 
 ## Maintenance job and its trigger (D-OPS4)
 
@@ -121,6 +125,75 @@ audit needs a Google Cloud account of its own (`opsBackupAudit`, with exactly
 `cloudsql.instances.get` and `cloudsql.backupRuns.list`), and the session
 signals need a role decision, both for the owner. `OPS_PROBE_JOBS` is the job
 contract a registration would render.
+
+## Build-source bucket (BUILD-SOURCE)
+
+Owner decision round 19 (2026-10-03), "grant on default bucket". OPS-10's
+`build` uploads the source archive with the operator's credentials and the
+build runs as the plane's builder account, which must read it. The builder
+holds only `roles/logging.logWriter` on the project, so a submit staged in
+the default bucket failed with a 403 on `storage.objects.get` (staging,
+2026-10-03). The shared definition is `scripts/gcp-build-source-bucket.mjs`.
+
+- `buildSource.bucket` is `tibotattle_cloudbuild` (staging) and
+  `tibotattle-prod_cloudbuild` (production). The validator holds it to
+  `<project>_cloudbuild`; the JSON Schema holds its form.
+- OPS-2 manages one binding on that bucket's own policy:
+  `roles/storage.objectViewer` for the plane's builder account. It is
+  bucket-level only; the builder never gets a project storage role.
+- Readback lists the bucket and keeps its policy's builder, reader-role and
+  public bindings. Its `drift` names `READER_BINDING_MISSING` (the plan binds
+  it), `BUILDER_ROLE_BROADER` (any other role for the builder),
+  `READER_BINDING_CONDITIONAL` and `READER_EXTRA_MEMBER` (any other member on
+  the reader role). The last three are the finding
+  `BUILD_SOURCE_BUCKET_IAM_DRIFT` and a refused delete, so apply refuses the
+  plan until the owner removes them. A public member is the finding and blocker
+  `BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER`. A listed bucket with another
+  project number is `BUILD_SOURCE_BUCKET_FOREIGN`, and nothing binds on it.
+  Cloud Storage's project convenience members (`projectOwner:`,
+  `projectEditor:`, `projectViewer:`) on the legacy roles are not drift.
+- When the bucket is absent (the production project before its first
+  submit), readback reports `BUILD_SOURCE_BUCKET_ABSENT` and the plan:
+  - creates the bucket with `gcloud storage buckets create
+    gs://<project>_cloudbuild --location=<region>
+    --uniform-bucket-level-access --public-access-prevention`
+    (`buildSourceBucketCreateArgs`);
+  - defers the binding with the same code.
+
+  The next plan reads the bucket back as the project's own and binds. The
+  guard admits that create and that binding only in apply, and only for
+  `gs://<project>_cloudbuild`. Any other bucket mutation refuses
+  (`GCLOUD_COMMAND_FORBIDDEN`, `PLAN_BUCKET_MUTATION_UNSCOPED`). An existing
+  bucket's metadata is reported, never changed.
+- OPS-10's `build` passes
+  `--gcs-source-staging-dir=gs://<project>_cloudbuild/source`, so the bucket
+  it stages into is the bucket granted. With an explicit staging directory,
+  gcloud skips its check that the bucket belongs to the project, and it
+  creates an absent bucket with its own defaults (Google Cloud SDK 569.0.0,
+  `submit_util.py`). So before the lock, `build` reads the bucket and its
+  policy. It refuses with `ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE` (absent),
+  `ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN` (another project number) or
+  `ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED` (no unconditional builder read,
+  or a public member). It qualifies the build's storage source against that
+  bucket and the `source/` prefix.
+
+Why OPS-2 creates an absent bucket instead of using a first-submit sequence:
+
+- A first submit would create the bucket with gcloud's defaults: the `US`
+  multi-region, no public access prevention, and uniform access left to
+  organization policy. The build would then fail on the missing grant, and
+  OPS-2 would have to bind on a bucket it never chose.
+- Creating it in apply puts the create under the plan digest and the command
+  guard. Uniform bucket-level access makes bucket IAM the only access path,
+  so no object ACL can widen the builder's read or add a reader. Public
+  access prevention means no public member can ever be bound. The plane's
+  region keeps source archives beside the plane.
+- The binding is still deferred to the next pass, so it binds only on a
+  bucket that readback has shown to be in the project.
+
+In the shared test project the bucket also holds the test estate's source
+archives, so the staging builder can read those too. The owner accepted this
+in round 19.
 
 ## Values that wait for the owner
 

@@ -26,6 +26,7 @@ import {
   createFakeGcloud,
   emptyWorld,
   memoryWriter,
+  withCloudBuildBucket,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { unfilledProductionText, unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
@@ -54,10 +55,12 @@ function reader(committed = UNMARKED_TEXT) {
   };
 }
 
-function world(project) {
+/** The born quarantine bucket, the owner's secrets and (unless `cloudBuild` is false) <project>_cloudbuild. */
+function world(project, { cloudBuild = true } = {}) {
   const value = withSecretValues(emptyWorld(), { project, region: "us-east1",
     names: ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"] });
   value.buckets.push(bornBucket({ name: "synthetic-ops-quarantine", location: "US-EAST1" }));
+  if (cloudBuild) withCloudBuildBucket(value, { project });
   return value;
 }
 
@@ -182,6 +185,16 @@ test("render makes no call and shows the estate", async () => {
   assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual(rendered.verifierIam, { account: "synthetic-verifier@synthetic-ops-project.iam.gserviceaccount.com",
     role: "roles/iam.serviceAccountTokenCreator", members: ["group:synthetic-operators@example.com"] });
+  // BUILD-SOURCE: the project's default Cloud Build bucket, its create when absent and the builder's one role on it.
+  assert.deepEqual(rendered.buildSource, {
+    bucket: "synthetic-ops-project_cloudbuild",
+    sourceDir: "gs://synthetic-ops-project_cloudbuild/source",
+    createArgs: ["storage", "buckets", "create", "gs://synthetic-ops-project_cloudbuild",
+      "--project=synthetic-ops-project", "--location=us-east1", "--uniform-bucket-level-access",
+      "--public-access-prevention"],
+    readerBinding: { role: "roles/storage.objectViewer",
+      member: "serviceAccount:synthetic-builder@synthetic-ops-project.iam.gserviceaccount.com", condition: null },
+  });
   const withImage = JSON.parse((await run(["render", `--desired-state=${FIXTURE_PATH}`, ...IMAGE])).out);
   assert.equal(withImage.service.kind, "Service");
   assert.equal(withImage.jobs["production-migrate"].kind, "Job");
@@ -325,6 +338,48 @@ test("readback --require-clean --environment is OPS-10's preflight: exit 0 only 
     assert.deepEqual(JSON.parse(refused.err), { status: "error", code }, code);
     assert.equal(refused.out, "", code);
   }
+});
+
+test("BUILD-SOURCE: an absent <project>_cloudbuild is reported, created by pass 1 and bound by pass 2", async () => {
+  const project = "example-ops-prod1";
+  const bucket = `${project}_cloudbuild`;
+  const builder = `serviceAccount:synthetic-builder@${project}.iam.gserviceaccount.com`;
+  const readerId = `build-source-bucket-iam:bind:roles/storage.objectViewer|${builder}|`;
+  const writer = memoryWriter();
+  const gcloud = createFakeGcloud(world(project, { cloudBuild: false }), { files: writer.files, project,
+    region: "us-east1" });
+  const preflight = ["readback", "--require-clean", "--environment=production"];
+  // Readback reports the absent bucket (exit 2), and the preflight is not clean.
+  const readback = await run(["readback", "--environment=production"], { gcloud });
+  assert.equal(readback.code, 2);
+  assert.deepEqual(JSON.parse(readback.out).findings, ["BUILD_SOURCE_BUCKET_ABSENT"]);
+  assert.equal(JSON.parse(readback.out).observed.buildSource, null);
+  // Pass 1 creates the bucket and defers the binding with the closed code.
+  const first = JSON.parse((await run(["plan", "--environment=production", ...IMAGE], { gcloud })).out);
+  const create = first.operations.find((entry) => entry.id === "build-source-bucket:create");
+  assert.deepEqual(create.argv, ["storage", "buckets", "create", `gs://${bucket}`, `--project=${project}`,
+    "--location=us-east1", "--uniform-bucket-level-access", "--public-access-prevention"]);
+  assert.equal(create.deferred, undefined);
+  assert.equal(first.operations.find((entry) => entry.id === readerId).deferred, "BUILD_SOURCE_BUCKET_ABSENT");
+  assert.equal((await run(["apply", "--environment=production", `--authorize=${first.planDigest}`, ...IMAGE],
+    { gcloud, writer })).code, 0);
+  const created = gcloud.world.buckets.find((entry) => entry.name === bucket);
+  assert.deepEqual([created.location, created.iamConfiguration], ["US-EAST1",
+    { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced" }]);
+  assert.equal(JSON.stringify(gcloud.world.bucketPolicies[bucket]).includes(builder), false);
+  // Between the passes the preflight names the one remaining step.
+  const between = JSON.parse((await run(preflight, { gcloud })).out);
+  assert.deepEqual(between.reasons, [`EXECUTABLE:${readerId}`]);
+  // Pass 2 binds on the bucket readback now lists as the project's own; then it is clean.
+  const second = JSON.parse((await run(["plan", "--environment=production"], { gcloud })).out);
+  assert.deepEqual(second.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id),
+    [readerId]);
+  assert.equal((await run(["apply", "--environment=production", `--authorize=${second.planDigest}`],
+    { gcloud, writer })).code, 0);
+  assert.ok(gcloud.world.bucketPolicies[bucket].bindings.some((binding) => binding.role === "roles/storage.objectViewer"
+    && binding.members.length === 1 && binding.members[0] === builder));
+  const clean = await run(preflight, { gcloud });
+  assert.equal(clean.code, 0, clean.out);
 });
 
 test("bucket birth is a dry run by default and refuses the synthetic fixture", async () => {
@@ -528,7 +583,7 @@ test("no OPS-2 module uses a shell, and the package runs exactly these checks", 
   for (const name of ["gcp-infra.mjs", "gcp-ops-infra-manifest.mjs", "gcp-ops-infra-operations.mjs",
     "gcp-ops-bucket-birth.mjs", "gcp-staging-desired-state.mjs", "gcp-staging-secrets.mjs", "gcp-staging-bucket-birth.mjs",
     "gcp-scheduler-run-target.mjs", "gcp-ops-monitoring-policies.mjs", "gcp-monitoring.mjs",
-    "gcp-identity-link-pin-check.mjs"]) {
+    "gcp-identity-link-pin-check.mjs", "gcp-build-source-bucket.mjs"]) {
     const source = readFileSync(join(SCRIPTS_ROOT, name), "utf8");
     // A regular expression's .exec() is not a process call.
     assert.doesNotMatch(source, /\bexecSync\b|(?<![.\w])exec\(|\bexecFile|shell:\s*true|["'`](?:sh|bash|zsh)["'`]/u, name);
@@ -543,4 +598,7 @@ test("no OPS-2 module uses a shell, and the package runs exactly these checks", 
     assert.ok(gate.includes(`./scripts/${check}`), check);
   }
   assert.doesNotMatch(gate, /gcloud|wrangler|--apply|apply /u);
+  // BUILD-SOURCE: the shared leaf is syntax-checked by the gate and imports nothing.
+  assert.ok(gate.includes("node --check ./scripts/gcp-build-source-bucket.mjs"));
+  assert.doesNotMatch(readFileSync(join(SCRIPTS_ROOT, "gcp-build-source-bucket.mjs"), "utf8"), /^import /mu);
 });

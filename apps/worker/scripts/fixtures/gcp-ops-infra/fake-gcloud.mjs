@@ -47,6 +47,31 @@ export function bornBucket({ name, location, generation = "1700000000000001", me
   };
 }
 
+/**
+ * BUILD-SOURCE: a project's default Cloud Build bucket as a first `gcloud
+ * builds submit` leaves it (US multi-region, Cloud Storage's project
+ * convenience bindings on its policy and nothing else), plus any `extraBindings`.
+ */
+export function withCloudBuildBucket(world, { project, projectNumber = "100000000001", extraBindings = [] }) {
+  const name = `${project}_cloudbuild`;
+  world.buckets.push({
+    kind: "storage#bucket",
+    name,
+    location: "US",
+    projectNumber,
+    storageClass: "STANDARD",
+    generation: "1700000000000090",
+    metageneration: "1",
+    iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "inherited" },
+  });
+  world.bucketPolicies[name] = { bindings: [
+    { role: "roles/storage.legacyBucketOwner", members: [`projectEditor:${project}`, `projectOwner:${project}`] },
+    { role: "roles/storage.legacyBucketReader", members: [`projectViewer:${project}`] },
+    ...extraBindings,
+  ] };
+  return world;
+}
+
 /** An empty project: only Google's default logging resources exist. */
 export function emptyWorld() {
   return {
@@ -154,9 +179,10 @@ function applySqlFlags(instance, argv) {
  * text (the in-memory writer the check gives apply). `failWhen(argv)` makes a
  * call exit non-zero with a marker on stderr. `clock()` stamps a trigger's
  * userUpdateTime on create, update and pause, as Cloud Scheduler does.
+ * `projectNumber` is the number a bucket created here carries (BUILD-SOURCE).
  */
 export function createFakeGcloud(world, { files = new Map(), failWhen = () => false, project, region,
-  clock = () => "2026-10-02T00:00:00Z" } = {}) {
+  projectNumber = "100000000001", clock = () => "2026-10-02T00:00:00Z" } = {}) {
   const calls = [];
   const json = (value) => ({ status: 0, stdout: JSON.stringify(value), stderr: "" });
   const done = () => ({ status: 0, stdout: "", stderr: "Updated." });
@@ -259,6 +285,39 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
         return done();
       case path === "storage buckets list": return json(world.buckets);
       case path === "storage buckets get-iam-policy": return json(world.bucketPolicies[name(3).slice(5)] ?? { bindings: [] });
+      case path === "storage buckets create": {
+        // The JSON API bucket `gcloud storage buckets create` makes from these
+        // flags, with Cloud Storage's project convenience bindings on its policy.
+        const bucketName = name(3).slice("gs://".length);
+        if (world.buckets.some((bucket) => bucket.name === bucketName)) {
+          return { status: 1, stdout: "", stderr: "synthetic: HTTPError 409: bucket exists" };
+        }
+        world.buckets.push({
+          kind: "storage#bucket",
+          name: bucketName,
+          location: (flag(argv, "--location") ?? "us").toUpperCase(),
+          projectNumber,
+          storageClass: "STANDARD",
+          generation: "1700000000000100",
+          metageneration: "1",
+          iamConfiguration: {
+            uniformBucketLevelAccess: { enabled: has(argv, "--uniform-bucket-level-access") },
+            publicAccessPrevention: has(argv, "--public-access-prevention") ? "enforced" : "inherited",
+          },
+        });
+        world.bucketPolicies[bucketName] = { bindings: [
+          { role: "roles/storage.legacyBucketOwner", members: [`projectEditor:${project}`, `projectOwner:${project}`] },
+          { role: "roles/storage.legacyBucketReader", members: [`projectViewer:${project}`] },
+        ] };
+        return done();
+      }
+      case path === "storage buckets add-iam-policy-binding": {
+        const bucketName = name(3).slice("gs://".length);
+        world.bucketPolicies[bucketName] ??= { bindings: [] };
+        addBinding(world.bucketPolicies[bucketName], { role: flag(argv, "--role"), member: flag(argv, "--member"),
+          condition: null });
+        return done();
+      }
       case path === "logging sinks describe": return json(world.sink);
       case path === "logging sinks update": {
         if (flag(argv, "--add-exclusion")) {

@@ -20,7 +20,8 @@
  * permission set, a shorter retention, a policy replacement) and any bucket
  * metadata update. A plan that holds any of them refuses as a whole
  * (APPLY_DELETE_REFUSED, APPLY_DESTRUCTIVE_CHANGE_REFUSED,
- * BUCKET_METADATA_UPDATE_REFUSED). No operation edits bucket IAM. An operation
+ * BUCKET_METADATA_UPDATE_REFUSED). The only bucket operations apply may run
+ * are the build-source bucket's (BUILD-SOURCE, below). An operation
  * whose inputs are not yet available (an image for a first create, a pinned
  * secret version, an owner-supplied scheduler cadence, a job DEFERRED_JOBS
  * names) is listed as deferred and skipped.
@@ -81,7 +82,30 @@
  * measured; `--require-cadence` (requireCadence) is the cutover's stricter
  * form, which refuses it.
  *
- * The bucket is born only by gcp-ops-bucket-birth.mjs. Apply refuses until the
+ * BUILD-SOURCE (gcp-build-source-bucket.mjs): the project's default Cloud
+ * Build bucket, `<project>_cloudbuild` (desired.buildSource.bucket), holds one
+ * managed binding, roles/storage.objectViewer for the plane's builder, on the
+ * bucket's own policy (never a project role). Readback reads it from the same
+ * bucket listing and keeps the policy's builder, objectViewer and public
+ * bindings; its drift list names a missing reader binding, any other role for
+ * the builder (BUILDER_ROLE_BROADER), a conditional reader binding and
+ * another member on the reader role (READER_EXTRA_MEMBER). The plan binds a
+ * missing reader binding and refuses (delete) every other builder, reader or
+ * public binding; drift other than a missing binding is also the finding
+ * BUILD_SOURCE_BUCKET_IAM_DRIFT, and a public member the finding and blocker
+ * BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER. A listed bucket of another
+ * project number is BUILD_SOURCE_BUCKET_FOREIGN and is never bound on. An
+ * absent bucket is the finding BUILD_SOURCE_BUCKET_ABSENT: the plan creates it
+ * (buildSourceBucketCreateArgs: the plane's region, uniform bucket-level
+ * access, public access prevention enforced) and defers the binding with that
+ * code, so the next pass binds only on a bucket readback has shown to be the
+ * project's own. The guard admits `storage buckets create` and `storage
+ * buckets add-iam-policy-binding` (BUILD_SOURCE_BUCKET_COMMANDS) only in apply
+ * mode and only for gs://<that bucket>, and a plan that would mutate any other
+ * bucket refuses (PLAN_BUCKET_MUTATION_UNSCOPED). An existing build-source
+ * bucket's metadata is reported, never planned or changed.
+ *
+ * The quarantine bucket is born only by gcp-ops-bucket-birth.mjs. Apply refuses until the
  * desired state pins that birth proof (APPLY_BUCKET_PROOF_UNPINNED), and
  * readback reports BUCKET_PROOF_STALE when the live generation or
  * metageneration has moved from it.
@@ -118,6 +142,8 @@ import {
   SERVICE_ACCOUNT_ROLES,
   TOKEN_CREATOR_ROLE,
   backupConfiguration,
+  buildSourceBucketCreateArgs,
+  buildSourceReaderBinding,
   cloudSqlCreateArgs,
   databaseFlags,
   databaseFlagsArgument,
@@ -137,6 +163,7 @@ import {
   sha256Hex,
 } from "./gcp-ops-infra-manifest.mjs";
 import { scheduledRunJob } from "./gcp-scheduler-run-target.mjs";
+import { BUILD_SOURCE_BUCKET_ABSENT, BUILD_SOURCE_READER_ROLE } from "./gcp-build-source-bucket.mjs";
 
 export const GCP_OPS_INFRA_READBACK_SCHEMA = "tibotattle-gcp-ops-infra-readback-v1";
 export const GCP_OPS_INFRA_PLAN_SCHEMA = "tibotattle-gcp-ops-infra-plan-v1";
@@ -194,6 +221,18 @@ export const MUTATING_COMMANDS = Object.freeze([
   "logging buckets update",
 ]);
 /**
+ * The build-source bucket's create and the builder's read binding on it
+ * (BUILD-SOURCE). They classify as "mutate", but the guard admits them only
+ * in apply mode, only with the plane's build-source bucket named to it, and
+ * only when the command's one positional URL is exactly gs://<that bucket>
+ * (GCLOUD_COMMAND_FORBIDDEN otherwise), so no apply can create or bind on any
+ * other bucket, the quarantine bucket included.
+ */
+export const BUILD_SOURCE_BUCKET_COMMANDS = Object.freeze([
+  "storage buckets create",
+  "storage buckets add-iam-policy-binding",
+]);
+/**
  * The one gcloud shape OPS-3's resume-all may issue, and only in "resume"
  * mode: apply and pause-all never know it (GCLOUD_COMMAND_FORBIDDEN).
  */
@@ -238,6 +277,7 @@ const GCLOUD_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const IMAGE_DIGEST = /^[a-f0-9]{64}$/u;
 const SOURCE_COMMIT = /^[a-f0-9]{40}$/u;
+const BUILD_SOURCE_BUCKET = /^[a-z][a-z0-9-]{4,28}[a-z0-9]_cloudbuild$/u;
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -256,14 +296,29 @@ function matchesShape(path, shape) {
   return path === shape || path.startsWith(`${shape} `);
 }
 
-/** "read", "mutate", "resume" or null for one argv (without the gcloud binary). */
+/**
+ * "read", "mutate", "resume" or null for one argv (without the gcloud binary).
+ * A build-source bucket shape classifies as "mutate"; the guard scopes it.
+ */
 export function classifyGcloudCommand(argv) {
   if (!Array.isArray(argv) || argv.some((arg) => typeof arg !== "string")) return null;
   const path = positionalPath(argv);
   if (MUTATING_COMMANDS.some((shape) => matchesShape(path, shape))) return "mutate";
+  if (BUILD_SOURCE_BUCKET_COMMANDS.some((shape) => matchesShape(path, shape))) return "mutate";
   if (READ_COMMANDS.some((shape) => matchesShape(path, shape))) return "read";
   if (RESUME_COMMANDS.some((shape) => matchesShape(path, shape))) return "resume";
   return null;
+}
+
+function isBuildSourceCommand(argv) {
+  return BUILD_SOURCE_BUCKET_COMMANDS.some((shape) => matchesShape(positionalPath(argv), shape));
+}
+
+/** True when a build-source shape names exactly gs://<bucket> as its one positional URL. */
+function scopedToBuildSource(argv, bucket) {
+  const positional = positionalPath(argv).split(" ");
+  return typeof bucket === "string" && BUILD_SOURCE_BUCKET.test(bucket) && isBuildSourceCommand(argv)
+    && positional.length === 4 && positional[3] === `gs://${bucket}`;
 }
 
 /** The default runner: spawnSync with an argv array and no shell. */
@@ -282,15 +337,22 @@ export function defaultGcloudRunner(argv) {
  * or "resume": mutating shapes are refused unless the mode is "apply", except
  * that "pause" (OPS-3 pause-all) may issue exactly PAUSE_COMMAND; the resume
  * shape exists only in "resume" mode (OPS-3 resume-all), which issues nothing
- * else that mutates. Unknown shapes are always refused. Failures never echo
- * gcloud output.
+ * else that mutates. A build-source bucket shape (BUILD_SOURCE_BUCKET_COMMANDS)
+ * exists only in "apply" mode with `buildSourceBucket` named (the project's
+ * own <project>_cloudbuild), and only for gs://<buildSourceBucket>. Unknown
+ * shapes are always refused. Failures never echo gcloud output.
  */
-export function guardedGcloud(runner, { mode, project }) {
+export function guardedGcloud(runner, { mode, project, buildSourceBucket = null }) {
   if (typeof runner !== "function") fail("GCLOUD_RUNNER_INVALID");
   if (!["read", "apply", "pause", "resume"].includes(mode)) fail("GCLOUD_GUARD_MODE_INVALID");
+  if (buildSourceBucket !== null && (mode !== "apply" || typeof buildSourceBucket !== "string"
+      || buildSourceBucket !== `${project}_cloudbuild` || !BUILD_SOURCE_BUCKET.test(buildSourceBucket))) {
+    fail("GCLOUD_GUARD_BUCKET_INVALID");
+  }
   return function call(argv) {
     const kind = classifyGcloudCommand(argv);
     if (kind === null || (kind === "resume" && mode !== "resume")) fail("GCLOUD_COMMAND_FORBIDDEN");
+    if (isBuildSourceCommand(argv) && !scopedToBuildSource(argv, buildSourceBucket)) fail("GCLOUD_COMMAND_FORBIDDEN");
     if (kind === "mutate" && !(mode === "apply"
       || (mode === "pause" && matchesShape(positionalPath(argv), PAUSE_COMMAND)))) {
       fail("GCLOUD_MUTATION_UNAUTHORIZED");
@@ -383,6 +445,29 @@ function envMap(env) {
       ? { name: entry.name, secret: { name: secret.name ?? null, key: String(secret.key ?? "") } }
       : { name: entry.name, value: entry.value ?? "" };
   }).sort((left, right) => String(left.name).localeCompare(String(right.name)));
+}
+
+/**
+ * BUILD-SOURCE drift of the build-source bucket's builder, reader and public
+ * bindings against the one desired binding, sorted and de-duplicated:
+ * READER_BINDING_MISSING (no unconditional reader binding for the builder),
+ * READER_BINDING_CONDITIONAL (a conditional one), BUILDER_ROLE_BROADER (the
+ * builder holds any other role on the bucket), READER_EXTRA_MEMBER (any other
+ * member holds the reader role; a public member is reported separately).
+ */
+function buildSourceDrift(desired, bindings) {
+  const builder = desired.serviceAccounts.builder.member;
+  const drift = new Set();
+  if (!bindings.some((binding) => binding.member === builder && binding.role === BUILD_SOURCE_READER_ROLE
+      && binding.condition === null)) {
+    drift.add("READER_BINDING_MISSING");
+  }
+  for (const binding of bindings) {
+    if (binding.member === builder && binding.role !== BUILD_SOURCE_READER_ROLE) drift.add("BUILDER_ROLE_BROADER");
+    else if (binding.member === builder && binding.condition !== null) drift.add("READER_BINDING_CONDITIONAL");
+    else if (binding.member !== builder && !isPublicMember(binding.member)) drift.add("READER_EXTRA_MEMBER");
+  }
+  return [...drift].sort();
 }
 
 /** The managed fields of a Knative Service, live or rendered. */
@@ -660,6 +745,31 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     };
   }
 
+  // BUILD-SOURCE: the project's default Cloud Build bucket, from the same listing.
+  const buildSourceEntry = buckets.find((entry) => isRecord(entry) && entry.name === desired.buildSource.bucket);
+  let buildSource = null;
+  if (buildSourceEntry !== undefined) {
+    const owned = String(buildSourceEntry.projectNumber ?? "") === desired.projectNumber;
+    buildSource = {
+      owned,
+      location: buildSourceEntry.location ?? null,
+      uniformBucketLevelAccess: buildSourceEntry.iamConfiguration?.uniformBucketLevelAccess?.enabled === true,
+      publicAccessPrevention: buildSourceEntry.iamConfiguration?.publicAccessPrevention ?? null,
+      bindings: null,
+      publicMember: null,
+      drift: null,
+    };
+    // Another project's bucket is never read further or bound on.
+    if (owned) {
+      const all = policyBindings(call(["storage", "buckets", "get-iam-policy", `gs://${desired.buildSource.bucket}`,
+        project, json]), "build-source-bucket-policy");
+      buildSource.bindings = all.filter((binding) => binding.member === desired.serviceAccounts.builder.member
+        || binding.role === BUILD_SOURCE_READER_ROLE || isPublicMember(binding.member));
+      buildSource.publicMember = all.some((binding) => isPublicMember(binding.member));
+      buildSource.drift = buildSourceDrift(desired, buildSource.bindings);
+    }
+  }
+
   let logging = null;
   if (dedicated) {
     const sink = call(["logging", "sinks", "describe", "_Default", project, json]);
@@ -729,6 +839,10 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
     findings.push("BUCKET_PROOF_STALE");
   }
   if (bucket?.publicMember === true) findings.push("BUCKET_POLICY_PUBLIC_MEMBER");
+  if (buildSource === null) findings.push(BUILD_SOURCE_BUCKET_ABSENT);
+  else if (!buildSource.owned) findings.push("BUILD_SOURCE_BUCKET_FOREIGN");
+  if (buildSource?.publicMember === true) findings.push("BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER");
+  if (buildSource?.drift?.some((entry) => entry !== "READER_BINDING_MISSING")) findings.push("BUILD_SOURCE_BUCKET_IAM_DRIFT");
   if (customRole?.deleted === true) findings.push("CUSTOM_ROLE_DELETED");
   if (customRole !== null && customRole.deleted !== true && customRole.stage !== "GA") {
     findings.push(customRole.stage === "DISABLED" ? "CUSTOM_ROLE_DISABLED" : "CUSTOM_ROLE_STAGE_NOT_GA");
@@ -764,6 +878,7 @@ export function readbackInfrastructure(desired, { runner = defaultGcloudRunner }
       secrets,
       cloudSql: { instanceNames, managed: cloudSql },
       bucket,
+      buildSource,
       logging,
       service: { names: serviceNames, managed: service },
       jobs: { names: jobNames, managed: jobs },
@@ -1137,6 +1252,55 @@ function bucketOperations(desired, observed, blockers) {
   return [operation("bucket:bucket-update", "bucket-update", [
     "storage", "buckets", "update", `gs://${desired.bucket.name}`, `--project=${desired.project}`,
   ], { reason: drift.join(",") })];
+}
+
+/**
+ * BUILD-SOURCE: the builder's roles/storage.objectViewer binding on the
+ * project's default Cloud Build bucket. An absent bucket is created
+ * (buildSourceBucketCreateArgs) and its binding deferred
+ * (BUILD_SOURCE_BUCKET_ABSENT) until a readback has listed it as the
+ * project's own; another project's bucket blocks and is never bound on. On a
+ * live bucket a missing binding is bound, and every other builder, reader or
+ * public binding is a refused delete; a public member also blocks. The
+ * bucket's metadata is never planned.
+ */
+function buildSourceOperations(desired, observed, blockers) {
+  const url = `gs://${desired.buildSource.bucket}`;
+  const project = `--project=${desired.project}`;
+  const reader = buildSourceReaderBinding(desired);
+  const add = (binding) => ["storage", "buckets", "add-iam-policy-binding", url, project,
+    `--member=${binding.member}`, `--role=${binding.role}`];
+  const remove = (binding) => ["storage", "buckets", "remove-iam-policy-binding", url, project,
+    `--member=${binding.member}`, `--role=${binding.role}`];
+  const live = observed.buildSource;
+  if (live === null) {
+    return [
+      operation("build-source-bucket:create", "create", buildSourceBucketCreateArgs(desired)),
+      operation(`build-source-bucket-iam:bind:${bindingId(reader)}`, "bind", add(reader),
+        { deferred: BUILD_SOURCE_BUCKET_ABSENT }),
+    ];
+  }
+  if (!live.owned) {
+    blockers.push("BUILD_SOURCE_BUCKET_FOREIGN");
+    return [];
+  }
+  if (live.publicMember) blockers.push("BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER");
+  return bindingOperations("build-source-bucket-iam", [reader], live.bindings, add, remove);
+}
+
+/**
+ * Refuses a plan whose executable operations would mutate a bucket other than
+ * the build-source bucket, or that bucket through any shape but its create
+ * and its binding (PLAN_BUCKET_MUTATION_UNSCOPED). The guard holds the same
+ * scope again on every call apply makes.
+ */
+export function assertBucketMutationsScoped(desired, operations) {
+  for (const entry of operations) {
+    if (entry.deferred !== undefined || !EXECUTABLE_ACTIONS.includes(entry.action)) continue;
+    if (!positionalPath(entry.argv).startsWith("storage ")) continue;
+    if (!scopedToBuildSource(entry.argv, desired.buildSource.bucket)) fail("PLAN_BUCKET_MUTATION_UNSCOPED");
+  }
+  return operations;
 }
 
 function loggingOperations(desired, observed) {
@@ -1533,12 +1697,14 @@ export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap,
     ...secretOperations(desired, observed),
     ...cloudSqlOperations(desired, observed),
     ...bucketOperations(desired, observed, blockers),
+    ...buildSourceOperations(desired, observed, blockers),
     ...loggingOperations(desired, observed),
     ...serviceOperations(desired, observed, bootstrap, usage),
     ...jobOperations(desired, observed, bootstrap, usage, jobDeferrals, executorBinds),
     ...schedulerOperations(desired, observed, blockers, triggerHolds(desired, observed, jobDeferrals), executorBinds),
   ];
   assertTriggersCreatedPaused(operations);
+  assertBucketMutationsScoped(desired, operations);
   if (bootstrap !== null && !usage.bootstrap) fail("BOOTSTRAP_IMAGE_UNUSED");
   if (desired.bucket.proof === null) blockers.push("BUCKET_PROOF_UNPINNED");
   const ids = operations.map((entry) => entry.id);
@@ -1612,7 +1778,8 @@ export function applyInfrastructure(desired, {
   if (plan.operations.some((entry) => entry.action === "bucket-update")) fail("BUCKET_METADATA_UPDATE_REFUSED");
   if (plan.blockers.length > 0) fail("APPLY_BLOCKED");
 
-  const call = guardedGcloud(runner, { mode: "apply", project: desired.project });
+  const call = guardedGcloud(runner, { mode: "apply", project: desired.project,
+    buildSourceBucket: desired.buildSource.bucket });
   const outcomes = [];
   const writer = createSpecWriter();
   try {

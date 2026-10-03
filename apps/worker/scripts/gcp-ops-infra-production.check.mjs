@@ -45,6 +45,10 @@ function production(pin = () => {}) {
 const deferred = (plan) => plan.operations.filter((entry) => entry.deferred !== undefined)
   .map((entry) => `${entry.id}:${entry.deferred}`);
 const executable = (plan) => plan.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id);
+// BUILD-SOURCE: the production builder's bucket-level read on the project's default Cloud Build bucket.
+const BUILD_SOURCE_BUCKET = "tibotattle-prod_cloudbuild";
+const BUILD_SOURCE_READER = "build-source-bucket-iam:bind:roles/storage.objectViewer|serviceAccount:"
+  + "tibotattle-builder@tibotattle-prod.iam.gserviceaccount.com|";
 
 test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2 converge with no left-out secret", () => {
   let desired = production();
@@ -53,14 +57,18 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   assert.deepEqual(Object.keys(desired.secrets), [...KEPT_SECRETS]);
   const world = emptyWorld();
   const writer = memoryWriter();
-  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region });
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region,
+    projectNumber: desired.projectNumber });
   const plan = (options = {}) => operations.planInfrastructure(desired,
     operations.readbackInfrastructure(desired, { runner: gcloud.runner }), options);
 
-  // Before the birth: the only blockers are the bucket's, and nothing is refused.
+  // Before the birth: the only blockers are the bucket's, and nothing is refused. The project has
+  // had no `gcloud builds submit` yet, so its default Cloud Build bucket is absent too (BUILD-SOURCE):
+  // a finding, not a blocker.
   const before = plan();
   assert.deepEqual([before.summary.refused, before.findings, before.blockers],
-    [0, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"], ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]]);
+    [0, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED", "BUILD_SOURCE_BUCKET_ABSENT"],
+      ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]]);
   assert.throws(() => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: before.planDigest }),
     { code: "APPLY_BUCKET_PROOF_UNPINNED" });
 
@@ -69,7 +77,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     generation: PROOF.bucketGeneration, extra: { projectNumber: desired.projectNumber } }));
   desired = production((value) => { value.bucket.proof = { ...PROOF }; });
   const first = plan();
-  assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
+  assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, ["BUILD_SOURCE_BUCKET_ABSENT"], []]);
   const ids = executable(first);
   // Six accounts, the verifier grant, the custom role, six project bindings,
   // the repository and its writer binding, four secrets and their accessor
@@ -78,8 +86,13 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   // cadence to the production-scale measurement, so the committed schedule is
   // null and its create is deferred (SCHEDULER_CADENCE_UNSET), with no pause.
   // D-OPS4's maintenance job, trigger and grant wait for the telemetry
-  // storage namespace the job reads.
-  assert.equal(ids.length, 29, ids.join("\n"));
+  // storage namespace the job reads. BUILD-SOURCE: pass 1 creates the absent
+  // <project>_cloudbuild (uniform bucket-level access, public access
+  // prevention enforced) and defers the builder's read binding to pass 2.
+  assert.equal(ids.length, 30, ids.join("\n"));
+  assert.deepEqual(first.operations.find((entry) => entry.id === "build-source-bucket:create").argv, ["storage",
+    "buckets", "create", `gs://${BUILD_SOURCE_BUCKET}`, "--project=tibotattle-prod", "--location=us-east1",
+    "--uniform-bucket-level-access", "--public-access-prevention"]);
   for (const id of ["custom-role:create", "artifact-registry:create", "cloud-sql:create", "cloud-sql-database:create",
     "cloud-sql-user:create:runtime", "cloud-sql-user:create:migrator", "logging-exclusion:create",
     "verifier-iam:bind:roles/iam.serviceAccountTokenCreator|user:adamallcock@gmail.com|"]) {
@@ -87,8 +100,9 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   }
   assert.deepEqual(ids.filter((id) => id.startsWith("scheduler:")), []);
   for (const name of KEPT_SECRETS) assert.ok(ids.includes(`secret:create:${name}`), name);
-  assert.equal(deferred(first).length, 10);
+  assert.equal(deferred(first).length, 11);
   assert.deepEqual(deferred(first), [
+    `${BUILD_SOURCE_READER}:BUILD_SOURCE_BUCKET_ABSENT`,
     "run-service:create:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
@@ -115,7 +129,11 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
 
   const applied = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
-  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 0, deferred: 10, refused: 0 });
+  // The bucket now exists, so the re-plan apply reports holds its binding as executable.
+  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 1, deferred: 10, refused: 0 });
+  const sourceBucket = world.buckets.find((bucket) => bucket.name === BUILD_SOURCE_BUCKET);
+  assert.deepEqual([sourceBucket.location, sourceBucket.projectNumber, sourceBucket.iamConfiguration], ["US-EAST1",
+    "874229235044", { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced" }]);
   // No trigger exists, so none can run anything; the scheduler account cannot run any job yet either.
   assert.deepEqual(world.schedulerJobs, []);
   assert.deepEqual(world.secrets.map((secret) => secret.name.split("/").at(-1)).sort(), [...KEPT_SECRETS].sort());
@@ -136,6 +154,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   // that creates and pauses one (SCHEDULER_CADENCE_UNSET). The maintenance job's trigger has its
   // pinned cadence (D-OPS4), so it is created, paused at once, and only then granted.
   assert.deepEqual(executable(second), [
+    BUILD_SOURCE_READER,
     "run-service:create",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|",
@@ -147,6 +166,11 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     createSpecWriter: () => writer.create() });
   // Nothing waits any more: the service composed with the committed secrets.
   assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], []);
+  // The builder reads its sources through that one bucket-level binding, and holds no project storage role.
+  assert.deepEqual(world.bucketPolicies[BUILD_SOURCE_BUCKET].bindings.filter((binding) =>
+    binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
+    members: ["serviceAccount:tibotattle-builder@tibotattle-prod.iam.gserviceaccount.com"] }]);
+  assert.equal(JSON.stringify(world.projectPolicy).includes("roles/storage."), false);
   // The rendered service mounts exactly the four kept secrets, none of them a retired sign-in one.
   assert.equal(world.services.length, 1);
   assert.deepEqual(world.services[0].spec.template.spec.containers[0].env
@@ -187,7 +211,8 @@ test("a cadence the owner commits later (synthetic here) is created paused after
   let desired = production((value) => { value.bucket.proof = { ...PROOF }; });
   const world = emptyWorld();
   const writer = memoryWriter();
-  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region });
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region,
+    projectNumber: desired.projectNumber });
   world.buckets.push(bornBucket({ name: desired.bucket.name, location: desired.bucket.location,
     generation: PROOF.bucketGeneration, extra: { projectNumber: desired.projectNumber } }));
   const plan = (options = {}) => operations.planInfrastructure(desired,
@@ -199,7 +224,7 @@ test("a cadence the owner commits later (synthetic here) is created paused after
 
   // Pass 1 with no cadence creates no trigger (the production-scale measurement comes first).
   const first = plan();
-  assert.deepEqual([executable(first).length, deferred(first).length], [29, 10]);
+  assert.deepEqual([executable(first).length, deferred(first).length], [30, 11]);
   apply(first.planDigest);
   assert.deepEqual(world.schedulerJobs, []);
 

@@ -66,6 +66,9 @@
     "location": "US-EAST1",
     "proof": { "bucketGeneration": "1790991062981114944", "bucketMetageneration": "1" }
   },
+  "buildSource": {
+    "bucket": "tibotattle-prod_cloudbuild"
+  },
   "service": {
     "name": "tibotattle-origin",
     "maxInstances": 4,

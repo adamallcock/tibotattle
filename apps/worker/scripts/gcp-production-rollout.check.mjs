@@ -27,6 +27,7 @@ import {
   runtimeGrantPolicyDigest,
 } from "../cloud-run/postgres-runtime-grants.mjs";
 import { applyEdgeModeSnapshotDelta, liveEdgeMode } from "./edge-mode-configuration.mjs";
+import { buildSourcePolicyProblems } from "./gcp-build-source-bucket.mjs";
 import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
 import {
   createEnvironmentDeploymentLock,
@@ -63,6 +64,7 @@ const ORIGIN_AUDIENCE = "https://synthetic-origin-audience.example";
 const TARGET = Object.freeze({
   environment: "production",
   project: PROJECT,
+  projectNumber: "123456789012",
   region: "us-east1",
   service: "tibotattle-origin",
   migrationJob: "tibotattle-production-migrate",
@@ -81,6 +83,7 @@ const STAGING_PROJECT = "w2-opsdb-staging-synth";
 const STAGING_TARGET = Object.freeze({
   environment: "staging",
   project: STAGING_PROJECT,
+  projectNumber: "210987654321",
   region: "us-east1",
   service: "tibotattle-staging-origin",
   migrationJob: "tibotattle-staging-migrate",
@@ -214,6 +217,10 @@ function fakeEstate({
   schedulers = [trigger(target.jobNames[1], "PAUSED", target)],
   executions = (job) => [completed(job)],
   servedCommit = null,
+  // BUILD-SOURCE: <project>_cloudbuild as OPS-2 leaves it, with the builder's read binding.
+  sourceBucket = { name: `${target.project}_cloudbuild`, projectNumber: target.projectNumber, location: "US-EAST1" },
+  sourcePolicy = { bindings: [{ role: "roles/storage.objectViewer",
+    members: [`serviceAccount:${target.builderServiceAccount}`] }] },
 } = {}) {
   const calls = [];
   const requests = [];
@@ -252,6 +259,11 @@ function fakeEstate({
         return ok(JSON.stringify(executions(job, scheduledReads)));
       }
       if (args.slice(0, 2).join(" ") === "auth print-identity-token") return ok(`${TOKEN}\n`);
+      if (step === "storage buckets describe") {
+        return sourceBucket === null || args[3] !== `gs://${target.project}_cloudbuild` ? { status: 1, stdout: "" }
+          : ok(JSON.stringify(sourceBucket));
+      }
+      if (step === "storage buckets get-iam-policy") return ok(JSON.stringify(sourcePolicy));
       if (step === "sql backups list") return ok(JSON.stringify(state.backups));
       if (step === "sql backups create") {
         const description = args.find((arg) => arg.startsWith("--description=")).slice("--description=".length);
@@ -491,6 +503,10 @@ test("the target is closed and never a test, rehearsal or other-plane resource",
   for (const [overrides, code] of [
     [{ extra: "x" }, "ROLLOUT_TARGET_INVALID"],
     [{ environment: "staging" }, "ROLLOUT_TARGET_INVALID"],
+    // BUILD-SOURCE: build holds the source bucket's owner to this number.
+    [{ projectNumber: undefined }, "ROLLOUT_TARGET_INVALID"],
+    [{ projectNumber: 123456789012 }, "ROLLOUT_TARGET_INVALID"],
+    [{ projectNumber: "0123" }, "ROLLOUT_TARGET_INVALID"],
     [{ jobNames: ["tibotattle-maintenance"] }, "ROLLOUT_TARGET_INVALID"],
     [{ jobNames: [...TARGET.jobNames, TARGET.migrationJob] }, "ROLLOUT_TARGET_INVALID"],
     [{ imageRepository: `us-west1-docker.pkg.dev/${PROJECT}/tibotattle/origin` }, "ROLLOUT_TARGET_INVALID"],
@@ -560,10 +576,27 @@ test("a dry run validates and prints argv only: no gcloud, no node, no request, 
     assert.equal(argv.some((part) => /^(?:delete|rm|sh|bash|-c)$/u.test(part)), false, argv.join(" "));
   }
   const build = await runRollout(["build", "--environment=production", `--commit=${COMMIT}`], dependencies(estate, lock));
-  assert.deepEqual(build.steps.map(({ argv }) => argv.slice(0, 3)), [["git", "status", "--porcelain=v1"],
-    ["git", "rev-parse", "--verify"], ["node", "scripts/cloud-run-build-archive.mjs", "--output=<build-dir>/source.tar.gz"],
-    ["gcloud", "builds", "submit"]]);
+  // BUILD-SOURCE: the read-only source-bucket checks precede the archive, and the
+  // submit stages explicitly in <project>_cloudbuild/source, the bucket OPS-2 grants.
+  assert.deepEqual(build.steps.map(({ argv }) => argv), [ROLLOUT_ARGV.gitStatus(), ROLLOUT_ARGV.gitHead(),
+    ["gcloud", "storage", "buckets", "describe", `gs://${PROJECT}_cloudbuild`, `--project=${PROJECT}`, "--raw",
+      "--format=json"],
+    ["gcloud", "storage", "buckets", "get-iam-policy", `gs://${PROJECT}_cloudbuild`, `--project=${PROJECT}`,
+      "--format=json"],
+    ["node", "scripts/cloud-run-build-archive.mjs", "--output=<build-dir>/source.tar.gz"],
+    ["gcloud", "builds", "submit", "<build-dir>/source.tar.gz",
+      "--config=<build-dir>/cloudbuild.production.rendered.yaml",
+      `--gcs-source-staging-dir=gs://${PROJECT}_cloudbuild/source`, `--project=${PROJECT}`, "--region=us-east1",
+      "--format=json"]]);
+  assert.deepEqual(build.buildSource, { bucket: `${PROJECT}_cloudbuild`, sourceDir: `gs://${PROJECT}_cloudbuild/source` });
   assert.equal(build.steps.at(-1).argv[3], "<build-dir>/source.tar.gz", "the archive file itself is submitted");
+  // Staging is symmetric: its own project's default bucket, never production's.
+  const stagingBuild = await runRollout(["build", "--environment=staging", `--commit=${COMMIT}`],
+    dependencies(estate, lock));
+  assert.deepEqual(stagingBuild.buildSource, { bucket: `${STAGING_PROJECT}_cloudbuild`,
+    sourceDir: `gs://${STAGING_PROJECT}_cloudbuild/source` });
+  assert.ok(stagingBuild.steps.at(-1).argv.includes(`--gcs-source-staging-dir=gs://${STAGING_PROJECT}_cloudbuild/source`));
+  assert.doesNotMatch(JSON.stringify(stagingBuild.steps), new RegExp(PROJECT, "u"));
   assert.deepEqual(estate.calls, []);
   const preflight = await runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
     `--backup-audit=${paths.audit}`], dependencies(estate, lock));
@@ -1160,6 +1193,22 @@ test("build writes the audited archive, submits that file and qualifies the buil
       (build) => { build.sourceProvenance.fileHashes[`${sourceUri}x`] = build.sourceProvenance.fileHashes[sourceUri]; },
       (build) => { build.sourceProvenance.fileHashes[sourceUri].fileHash = [{ type: "MD5", value: "AAAAAAAAAAAAAAAAAAAAAA==" }]; },
       (build) => { delete build.sourceProvenance; },
+      // BUILD-SOURCE: the source must be staged in <project>_cloudbuild, under source/.
+      (build) => {
+        for (const source of [build.source.storageSource, build.sourceProvenance.resolvedStorageSource]) {
+          source.bucket = `${PROJECT}-other-bucket`;
+        }
+        build.sourceProvenance.fileHashes = { [`gs://${PROJECT}-other-bucket/${SOURCE.object}#${SOURCE.generation}`]:
+          build.sourceProvenance.fileHashes[sourceUri] };
+      },
+      (build) => {
+        const object = "elsewhere/1759406400.000000-0a1b2c3d.gz";
+        for (const source of [build.source.storageSource, build.sourceProvenance.resolvedStorageSource]) {
+          source.object = object;
+        }
+        build.sourceProvenance.fileHashes = { [`gs://${SOURCE.bucket}/${object}#${SOURCE.generation}`]:
+          build.sourceProvenance.fileHashes[sourceUri] };
+      },
     ];
     for (const edit of edits) {
       const bad = structuredClone(cloudBuild());
@@ -1180,6 +1229,45 @@ test("build writes the audited archive, submits that file and qualifies the buil
     urlSafe.sourceProvenance.fileHashes[sourceUri].fileHash[0].value = Buffer.from(ARCHIVE_SHA256, "hex").toString("base64url");
     assert.equal(assessProductionBuild(urlSafe, { target: TARGET, commit: COMMIT, builderImage: BUILDER_IMAGE,
       archiveSha256: ARCHIVE_SHA256 }).digest, DIGEST);
+  });
+
+test("BUILD-SOURCE: build refuses an absent, foreign, public or unreadable source bucket before the lock, uploading nothing",
+  async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), "w2-opsdb-build-source-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const buildArgv = ["build", "--environment=production", `--commit=${COMMIT}`, `--authorize=build:production:${COMMIT}`,
+      "--execute"];
+    const builder = `serviceAccount:${TARGET.builderServiceAccount}`;
+    const viewer = (members, extra = {}) => ({ role: "roles/storage.objectViewer", members, ...extra });
+    for (const [options, code] of [
+      // Absent: with an explicit staging dir gcloud would create it with its own defaults.
+      [{ sourceBucket: null }, "ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE"],
+      // Another project's bucket of that name: gcloud skips its own owner check for an explicit dir.
+      [{ sourceBucket: { name: `${PROJECT}_cloudbuild`, projectNumber: "999999999999" } },
+        "ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN"],
+      // OPS-2's binding not applied yet (the live 403 on storage.objects.get).
+      [{ sourcePolicy: { bindings: [{ role: "roles/storage.legacyBucketReader", members: [`projectViewer:${PROJECT}`] }] } },
+        "ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED"],
+      [{ sourcePolicy: { bindings: [viewer([builder], { condition: { title: "t", expression: "true" } })] } },
+        "ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED"],
+      [{ sourcePolicy: { bindings: [viewer([builder]), viewer(["allUsers"])] } }, "ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED"],
+      [{ sourcePolicy: "not a policy" }, "ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED"],
+    ]) {
+      const estate = fakeEstate(options);
+      const lock = fakeLock();
+      await assert.rejects(runRollout(buildArgv, dependencies(estate, lock, { tmpdir: () => directory })), isCode(code),
+        JSON.stringify(options));
+      assert.deepEqual(lock.events, [], "refused before the lock");
+      assert.equal(estate.calls.some((argv) => argv.join(" ").includes("builds submit")
+        || argv[1] === "scripts/cloud-run-build-archive.mjs"), false, "nothing archived or uploaded");
+      assert.ok(estate.calls.every((argv) => argv[0] === "git" || ["describe", "get-iam-policy"].includes(argv[3])));
+    }
+    // The shared check: only an unconditional builder read and no public member qualify.
+    assert.deepEqual(buildSourcePolicyProblems({ bindings: [viewer([builder])] }, builder), []);
+    assert.deepEqual(buildSourcePolicyProblems({ bindings: [] }, builder), ["READER_BINDING_MISSING"]);
+    assert.deepEqual(buildSourcePolicyProblems({ bindings: [viewer([builder, "allAuthenticatedUsers"])] }, builder),
+      ["PUBLIC_MEMBER"]);
+    assert.deepEqual(buildSourcePolicyProblems([], builder), ["POLICY_INVALID"]);
   });
 
 test("an incomplete committed desired state fails every verb closed, a complete one dry-runs without a call, and error codes stay content-free",
