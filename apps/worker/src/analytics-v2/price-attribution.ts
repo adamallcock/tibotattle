@@ -10,7 +10,7 @@
  * vendored buildPricingEvent reads (provider, modelId, billingSurface,
  * speedMode, apiServiceTier, reasoningEffort, the six token components,
  * totalInputContextTokens and the event time), and prices THAT projection
- * through the vendored buildPricingEvent and priceTelemetryUsageEvent: the
+ * through the vendored buildPricingEvent and byte-identical GCP fast pricer: the
  * same path the kernel's daily fold takes (priceChunkUsageRecord ->
  * buildPricingEvent -> priceTelemetryUsageEvent, v11-daily-projection-values
  * .ts). So the stored projection is proven sufficient on every run.
@@ -45,11 +45,11 @@
  * Pure apart from WebCrypto hashing and the Web Compression Streams; no I/O.
  */
 import { canonicalJson } from "../canonical-json";
+import { fastPriceTelemetryUsageEvent as priceTelemetryUsageEvent } from "./fast-pricer";
 import { sha256Hex } from "../crypto";
 import {
   APP_OFFICIAL_PRICE_CARDS,
   buildPricingEvent,
-  priceTelemetryUsageEvent,
   type EffectiveTelemetryOccurrence,
 } from "../../vendor/analytics-d43c8f92/entry";
 

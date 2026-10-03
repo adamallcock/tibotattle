@@ -111,6 +111,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/analytics-refresh-pool.mjs", destination: "apps/worker/cloud-run/analytics-refresh-pool.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh-worker.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-kernel-closure.mjs", destination: "apps/worker/cloud-run/analytics-kernel-closure.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-fast-pricer-binding.mjs", destination: "apps/worker/cloud-run/analytics-fast-pricer-binding.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-job-contract.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job-contract.mjs" }),
