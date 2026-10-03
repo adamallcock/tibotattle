@@ -7,6 +7,8 @@
 //     apps/worker/scripts/gcp-fastpath-prod-shape/measure-local.mjs \
 //       --corpus <seed-source.mjs work dir> --out <report.json> [--keep-database] [--reuse-database <name>]
 //       [--clone-from <name>] [--import-only] [--profile dense|dense-workers] [--guard-probe] [--node22 <path>]
+//       [--workers <2..16>] [--model-block-size <1..70>] [--model-fanout auto|all|off]
+//       Matrix overrides require dense-workers. Use dense without overrides for INLINE W1.
 //       [--pgstat-interval <10..1800 seconds>]
 //       [--cpu-profile <sample interval, us>] [--cpu-profile-summary <seconds>] [--cpu-profile-dir <absolute dir>]
 //
@@ -109,9 +111,10 @@ function fail(code, detail) {
   throw Object.assign(new Error(detail === undefined ? code : `${code}: ${detail}`), { code });
 }
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
     cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
+    matrixRequested: { workers: null, modelBlockSize: null, modelFanOut: null },
     cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null, workerProfileDir: null, workerProfileSource: null, allocationProfile: false, memoryProfile: false };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
@@ -123,6 +126,21 @@ function parseArguments(argv) {
     else if (argument === "--clone-from") options.cloneFrom = next();
     else if (argument === "--import-only") options.importOnly = true;
     else if (argument === "--profile") options.profile = next();
+    else if (["--workers", "--model-block-size", "--model-fanout"].includes(argument)) {
+      const key = { "--workers": "workers", "--model-block-size": "modelBlockSize", "--model-fanout": "modelFanOut" }[argument];
+      if (options.matrixRequested[key] !== null) fail("MEAS_SYNTH_ARGUMENT_INVALID", `${argument} must occur once`);
+      const value = next();
+      if (key === "modelFanOut") {
+        if (!["auto", "all", "off"].includes(value)) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--model-fanout takes auto, all or off");
+        options.matrixRequested[key] = value;
+      } else {
+        const maximum = key === "workers" ? 16 : 70;
+        if (!/^[0-9]+$/u.test(value ?? "") || Number(value) < 1 || Number(value) > maximum) {
+          fail("MEAS_SYNTH_ARGUMENT_INVALID", `${argument} takes 1..${maximum}`);
+        }
+        options.matrixRequested[key] = Number(value);
+      }
+    }
     else if (argument === "--node22") options.node22 = next();
     else if (argument === "--pgstat-interval") {
       const value = next();
@@ -160,6 +178,17 @@ function parseArguments(argv) {
   }
   if ((options.allocationProfile || options.memoryProfile) && options.cpuProfileUs !== null) fail("MEAS_SYNTH_ARGUMENT_INVALID", "Allocation/memory capture uses unified 10ms main CPU sampling; omit --cpu-profile");
   options.profile = measureProfile(options.profile);
+  const hasMatrix = Object.values(options.matrixRequested).some((value) => value !== null);
+  if (hasMatrix && (options.profile.name !== "dense-workers" || options.importOnly)) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "Matrix overrides require --profile dense-workers and a refresh");
+  }
+  if (options.matrixRequested.workers === 1) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "For INLINE W1 use --profile dense without matrix overrides");
+  }
+  options.matrixRequested = Object.freeze(options.matrixRequested);
+  if (options.matrixRequested.workers !== null) {
+    options.profile = Object.freeze({ ...options.profile, workers: options.matrixRequested.workers });
+  }
   workerProfileEnv(options);
   if (options.workerProfileDir !== null && ((options.profile.workers < 2 && !options.allocationProfile && !options.memoryProfile) || options.importOnly || options.guardProbe)) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "Worker profiling requires one local parallel refresh");
@@ -234,10 +263,27 @@ export function profileLines(text) {
 }
 
 /** The job's arguments under a profile (the wrapper's refreshJobCommand order). */
-export function refreshArguments(profile, schema) {
+export function refreshArguments(profile, schema, matrixRequested = {}) {
   return [...(profile.heapMiB === null ? [] : [`--max-old-space-size=${profile.heapMiB}`]),
     ...(profile.semiSpaceMiB === null ? [] : [`--max-semi-space-size=${profile.semiSpaceMiB}`]), DIST_REFRESH, "--mode=full", `--now=${PROD_SHAPE_REFRESH_NOW}`,
-    `--schema=${schema}`, ...(profile.workers > 1 ? [`--workers=${profile.workers}`] : [])];
+    `--schema=${schema}`, ...(profile.workers > 1 ? [`--workers=${profile.workers}`] : []),
+    ...(matrixRequested.modelBlockSize == null ? [] : [`--model-block-size=${matrixRequested.modelBlockSize}`]),
+    ...(matrixRequested.modelFanOut == null ? [] : [`--model-fanout=${matrixRequested.modelFanOut}`])];
+}
+
+/** Explicit local matrix identity; the wrapper resource profile remains authoritative. */
+export function refreshMeasurementIdentity(profile, matrixRequested = {}) {
+  return { baseProfile: measureProfile(profile.name), profile,
+    requested: { workers: matrixRequested.workers ?? null, modelBlockSize: matrixRequested.modelBlockSize ?? null,
+      modelFanOut: matrixRequested.modelFanOut ?? null },
+    effective: { workers: profile.workers, modelBlockSize: matrixRequested.modelBlockSize ?? 10,
+      modelFanOut: matrixRequested.modelFanOut ?? "auto", execution: profile.workers === 1 ? "inline" : "workers" } };
+}
+
+/** Retain every actual Node argument, with the workspace bundle path made relative. */
+export function refreshReportArguments(profile, schema, matrixRequested = {}) {
+  return refreshArguments(profile, schema, matrixRequested)
+    .map((argument) => argument === DIST_REFRESH ? "dist/analytics-refresh.mjs" : argument);
 }
 
 /** "[[dd-]hh:]mm:ss[.ff]" (ps time) in seconds, or null. */
@@ -321,11 +367,11 @@ export function workerProfileEnv({ workerProfileDir = null, workerProfileSource 
 }
 
 /** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
-async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
+export async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, matrixRequested = {}, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
   let started, sampler = null, stdout = "", stderr = "";
   const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
     started = performance.now();
-    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
+    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema, matrixRequested)], {
       cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile) }),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -356,6 +402,7 @@ async function runRefresh({ node22, endpoint, database, schema, outDir, label, p
   const samples = sampler?.samples ?? [];
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
+    measurementIdentity: refreshMeasurementIdentity(profile, matrixRequested),
     time: parseTimeL(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
@@ -368,9 +415,9 @@ async function runRefresh({ node22, endpoint, database, schema, outDir, label, p
  * plan-checkpoint marker, so "stopped-unrefused" does not show that the plan
  * checkpoint was reached.
  */
-async function guardProbe({ node22, endpoint, database, schema, profile, waitMs = 600_000 }) {
+export async function guardProbe({ node22, endpoint, database, schema, profile, matrixRequested = {}, waitMs = 600_000 }) {
   return new Promise((resolveProbe) => {
-    const child = spawn(node22, refreshArguments(profile, schema), {
+    const child = spawn(node22, refreshArguments(profile, schema, matrixRequested), {
       cwd: CLOUD_RUN_ROOT, stdio: ["ignore", "pipe", "pipe"],
       env: refreshEnv(endpoint, database, profile, {
         ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: String(profile.taskTimeoutSeconds) }),
@@ -385,6 +432,8 @@ async function guardProbe({ node22, endpoint, database, schema, profile, waitMs 
       const error = lastJson(stderr);
       const refused = /^ANALYTICS_V2_REFRESH_DEADLINE_/u.test(error?.code ?? "");
       resolveProbe({ taskTimeoutSeconds: profile.taskTimeoutSeconds, waitMs, exitCode: code, signal,
+        measurementIdentity: refreshMeasurementIdentity(profile, matrixRequested),
+        refreshArguments: refreshReportArguments(profile, schema, matrixRequested),
         elapsedMs: Math.round(performance.now() - started),
         outcome: refused ? "refused" : code === null && signal === "SIGTERM" ? "stopped-unrefused" : "exited",
         refusalCode: refused ? error.code : null,
@@ -474,8 +523,8 @@ async function main() {
     startedAt: new Date().toISOString(),
     node: { driver: process.version, analyticsRefresh: node22Version },
     database, schema, reusedDatabase: options.reuseDatabase !== null, clonedFrom: options.cloneFrom,
-    profile: options.profile, refreshArguments: refreshArguments(options.profile, schema).slice(1)
-      .map((argument) => (argument === DIST_REFRESH ? "dist/analytics-refresh.mjs" : argument)),
+    profile: options.profile, measurementIdentity: refreshMeasurementIdentity(options.profile, options.matrixRequested),
+    refreshArguments: refreshReportArguments(options.profile, schema, options.matrixRequested),
     refreshNow: PROD_SHAPE_REFRESH_NOW,
     corpus: { sealedSha256: corpus.manifest.sealed.sha256, scale: corpus.manifest.corpus.scale,
       owners: corpus.manifest.owners.length, totals: corpus.manifest.totals, own3: corpus.manifest.own3 },
@@ -539,13 +588,14 @@ async function main() {
     }
     console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
     const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
-      profile: options.profile, workerProfile: options, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
+      profile: options.profile, matrixRequested: options.matrixRequested, workerProfile: options, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
         cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, cpuProfileDir: options.cpuProfileDir },
       pgStat: options.pgStatIntervalSeconds === null ? null : { intervalMs: options.pgStatIntervalSeconds * 1000, snapshot: (label) => capturePgStat(pool, label) } });
     if (run.pgStat !== null) report.steps.refreshPgStat = run.pgStat;
     if (options.workerProfileDir !== null) report.steps.workerProfileCapture = { directory: options.workerProfileDir,
       declaredSource: options.workerProfileSource, modes: { cpu: true, allocation: options.allocationProfile, memory: options.memoryProfile }, scope: "local synthetic isolate diagnostics; inspect manifest coverage" };
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
+      measurementIdentity: run.measurementIdentity,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,
       owners: run.receipt?.owners ?? null, ownerDays: run.receipt?.ownerDays ?? null,
@@ -562,9 +612,9 @@ async function main() {
     report.steps.run = await runRecord(pool, schema);
     await save();
     if (options.guardProbe) {
-      console.error(`# guard probe (task timeout ${measureProfile(options.profile).taskTimeoutSeconds} s)`);
+      console.error(`# guard probe (task timeout ${options.profile.taskTimeoutSeconds} s)`);
       report.steps.guardProbe = await guardProbe({ node22: options.node22, endpoint, database, schema,
-        profile: options.profile });
+        profile: options.profile, matrixRequested: options.matrixRequested });
       await save();
     }
     report.finishedAt = new Date().toISOString();

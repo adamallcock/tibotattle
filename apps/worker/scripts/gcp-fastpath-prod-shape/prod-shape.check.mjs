@@ -484,6 +484,131 @@ test("the local measurement runs the wrapper's dense profiles and summarises bus
   assert.deepEqual(OUTPUT_DIGEST_POLICY.analytics_v2_transition_proofs, []);
 });
 
+test("matrix adapter preserves default INLINE and W4 launch arguments and reports every argument", async () => {
+  const { parseArguments, measureProfile, refreshArguments, refreshReportArguments, refreshMeasurementIdentity } = await import("./measure-local.mjs");
+  const inputs = ["--corpus", "/private/tmp/synthetic-corpus", "--out", "/private/tmp/synthetic-report.json"];
+  for (const name of ["dense", "dense-workers"]) {
+    const options = parseArguments([...inputs, "--profile", name]);
+    assert.deepEqual(options.profile, measureProfile(name));
+    const actual = refreshArguments(options.profile, "s", options.matrixRequested);
+    const bundle = actual.find((value) => value.endsWith("/dist/analytics-refresh.mjs"));
+    assert.ok(bundle);
+    assert.deepEqual(actual, [
+      ...(name === "dense" ? ["--max-old-space-size=12288", "--max-semi-space-size=64"] : []),
+      bundle, "--mode=full", "--now=2026-10-01T12:46:00.000Z", "--schema=s",
+      ...(name === "dense-workers" ? ["--workers=4"] : []),
+    ]);
+    assert.deepEqual(refreshReportArguments(options.profile, "s", options.matrixRequested),
+      actual.map((value) => value === bundle ? "dist/analytics-refresh.mjs" : value));
+    const identity = refreshMeasurementIdentity(options.profile, options.matrixRequested);
+    assert.deepEqual(identity.requested, { workers: null, modelBlockSize: null, modelFanOut: null });
+    assert.deepEqual(identity.effective, { workers: name === "dense" ? 1 : 4,
+      modelBlockSize: 10, modelFanOut: "auto", execution: name === "dense" ? "inline" : "workers" });
+    assert.deepEqual(identity.baseProfile, identity.profile);
+  }
+});
+
+test("matrix adapter settings round trip through the real refresh parser without resource drift", async () => {
+  const { parseArguments, measureProfile, refreshArguments, refreshReportArguments, refreshMeasurementIdentity, refreshEnv } = await import("./measure-local.mjs");
+  const { parseAnalyticsRefreshArguments } = await import("../../cloud-run/analytics-refresh.mjs");
+  const inputs = ["--corpus", "/private/tmp/synthetic-corpus", "--out", "/private/tmp/synthetic-report.json", "--profile", "dense-workers"];
+  const base = measureProfile("dense-workers");
+  for (const workers of [2, 4, 7, 8, 16]) for (const size of [1, 5, 10, 14, 70]) for (const fanout of ["auto", "all", "off"]) {
+    const options = parseArguments([...inputs, "--workers", String(workers), "--model-block-size", String(size), "--model-fanout", fanout]);
+    assert.deepEqual(options.profile, { ...base, workers });
+    const args = refreshArguments(options.profile, "s", options.matrixRequested);
+    assert.equal(args.some((value) => /^--max-(?:old|semi)-space-size=/u.test(value)), false);
+    for (const key of ["workers", "model-block-size", "model-fanout"]) {
+      assert.equal(args.filter((value) => value.startsWith(`--${key}=`)).length, 1);
+    }
+    const env = refreshEnv({ host: "/private/tmp/tibotattle-pg-synthetic/socket", port: 55544 }, "meas_synth_12345678", options.profile);
+    assert.equal(env.ANALYTICS_V2_MEMORY_BUDGET_MIB, "10752");
+    assert.equal(env.ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS, "86400");
+    assert.equal(Object.hasOwn(env, "NODE_OPTIONS"), false);
+    const bundle = args.find((value) => value.endsWith("/dist/analytics-refresh.mjs"));
+    const parsed = parseAnalyticsRefreshArguments(args.slice(args.indexOf(bundle) + 1), env);
+    const identity = refreshMeasurementIdentity(options.profile, options.matrixRequested);
+    assert.deepEqual(identity.baseProfile, base);
+    assert.deepEqual(identity.profile, options.profile);
+    assert.deepEqual(identity.requested, { workers, modelBlockSize: size, modelFanOut: fanout });
+    assert.deepEqual(identity.effective, { workers: parsed.workers, modelBlockSize: parsed.modelBlockSize,
+      modelFanOut: parsed.modelFanOut, execution: "workers" });
+    assert.deepEqual(refreshReportArguments(options.profile, "s", options.matrixRequested),
+      args.map((value) => value === bundle ? "dist/analytics-refresh.mjs" : value));
+  }
+});
+
+test("matrix adapter rejects invalid, missing, duplicate and incompatible overrides before execution", async () => {
+  const { parseArguments } = await import("./measure-local.mjs");
+  const inputs = ["--corpus", "/private/tmp/synthetic-corpus", "--out", "/private/tmp/synthetic-report.json"];
+  const parallel = [...inputs, "--profile", "dense-workers"];
+  for (const [flag, invalid] of [["--workers", ["0", "17", "-1", "2.5", "2e0", "", "NaN"]],
+    ["--model-block-size", ["0", "71", "-1", "1.5", "1e1", "", "NaN"]],
+    ["--model-fanout", ["AUTO", "on", "", "2"]]]) {
+    for (const value of invalid) assert.throws(() => parseArguments([...parallel, flag, value]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+    assert.throws(() => parseArguments([...parallel, flag]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+    assert.throws(() => parseArguments([...parallel, flag, "--keep-database"]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+    const valid = flag === "--workers" ? "7" : flag === "--model-block-size" ? "14" : "auto";
+    assert.throws(() => parseArguments([...parallel, flag, valid, flag, valid]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+    assert.throws(() => parseArguments([...inputs, flag, valid]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+    assert.throws(() => parseArguments([...parallel, "--import-only", flag, valid]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+  }
+  assert.throws(() => parseArguments([...parallel, "--workers", "1"]),
+    (error) => error.code === "MEAS_SYNTH_ARGUMENT_INVALID" && error.message.includes("--profile dense"));
+});
+
+test("matrix adapter shares effective settings with guard and all profiler projections", async () => {
+  const { parseArguments, refreshArguments, refreshMeasurementIdentity, workerProfileEnv } = await import("./measure-local.mjs");
+  const inputs = ["--corpus", "/private/tmp/synthetic-corpus", "--out", "/private/tmp/synthetic-report.json", "--profile", "dense-workers"];
+  const matrix = ["--workers", "7", "--model-block-size", "14", "--model-fanout", "off"];
+  for (const extra of [["--guard-probe"], [], ["--worker-profile-dir", "/private/tmp/synthetic-profile", "--worker-profile-source", "a".repeat(40)],
+    ["--worker-profile-dir", "/private/tmp/synthetic-profile", "--worker-profile-source", "a".repeat(40), "--allocation-profile", "--memory-profile"]]) {
+    const options = parseArguments([...inputs, ...matrix, ...extra]);
+    const identity = refreshMeasurementIdentity(options.profile, options.matrixRequested);
+    assert.deepEqual(identity.effective, { workers: 7, modelBlockSize: 14, modelFanOut: "off", execution: "workers" });
+    assert.ok(refreshArguments(options.profile, "s", options.matrixRequested).includes("--workers=7"));
+    const profileEnv = workerProfileEnv(options);
+    assert.equal(Object.hasOwn(profileEnv, "NODE_OPTIONS"), false);
+    if (extra.includes("--allocation-profile")) assert.equal(profileEnv.ANALYTICS_V2_LOCAL_WORKER_PROFILE_ALLOCATION, "1");
+    if (extra.includes("--memory-profile")) assert.equal(profileEnv.ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY, "1");
+  }
+  assert.throws(() => parseArguments([...inputs, ...matrix, "--guard-probe", "--worker-profile-dir", "/private/tmp/synthetic-profile",
+    "--worker-profile-source", "a".repeat(40)]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+});
+
+test("matrix adapter actual refresh and guard children receive identical matrix settings and resource env", async () => {
+  const { parseArguments, runRefresh, guardProbe, refreshMeasurementIdentity } = await import("./measure-local.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "matrix-launch-test-"));
+  try {
+    // A content-free child protocol probe, not an analytics run. It opens no
+    // socket/database and performs no compute; the real adapters launch it.
+    const probe = join(dir, "node-probe.mjs");
+    writeFileSync(probe, `#!/usr/bin/env node
+console.log(JSON.stringify({state:"complete",testArguments:process.argv.slice(2).filter(arg=>arg.startsWith("--")),
+budget:process.env.ANALYTICS_V2_MEMORY_BUDGET_MIB,timeout:process.env.ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS,
+nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
+    const options = parseArguments(["--corpus", "/private/tmp/synthetic-corpus", "--out", join(dir, "report.json"),
+      "--profile", "dense-workers", "--workers", "7", "--model-block-size", "14", "--model-fanout", "off"]);
+    const common = { node22: probe, endpoint: { host: "/private/tmp/tibotattle-pg-synthetic/socket", port: 55544 },
+      database: "meas_synth_12345678", schema: "s", profile: options.profile, matrixRequested: options.matrixRequested };
+    const refresh = await runRefresh({ ...common, outDir: dir, label: "synthetic-refresh" });
+    const guard = await guardProbe({ ...common, waitMs: 5_000 });
+    assert.equal(refresh.exitCode, 0, readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"));
+    assert.equal(guard.exitCode, 0);
+    assert.equal(guard.outcome, "exited");
+    assert.deepEqual(refresh.receipt, guard.receipt);
+    assert.deepEqual(refresh.receipt.testArguments, ["--mode=full", "--now=2026-10-01T12:46:00.000Z", "--schema=s",
+      "--workers=7", "--model-block-size=14", "--model-fanout=off"]);
+    assert.equal(refresh.receipt.budget, "10752");
+    assert.equal(refresh.receipt.timeout, "86400");
+    assert.equal(refresh.receipt.nodeOptions, null);
+    const identity = refreshMeasurementIdentity(options.profile, options.matrixRequested);
+    assert.deepEqual(refresh.measurementIdentity, identity);
+    assert.deepEqual(guard.measurementIdentity, identity);
+    assert.deepEqual(guard.refreshArguments, ["dist/analytics-refresh.mjs", ...refresh.receipt.testArguments]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 // MEAS-SYNTH profiling: the local run's profiler options, the database delta
 // and the run's summary over a partial receipt directory.
 test("the local measurement passes the profiler's env and keeps only its summary lines", async () => {
