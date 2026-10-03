@@ -16,8 +16,11 @@ import {
   PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
   PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
 } from "../cloud-run/postgres-production-configuration.mjs";
+import { IDENTITY_LINK_CONSUMER_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
 import * as check from "./gcp-identity-link-pin-check.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
+import { buildIdentityLinkRotation } from "./postgres-identity-link-pin.mjs";
+import { PRODUCTION_IDENTITY_LINK_ROTATION_LABELS } from "./postgres-production-transfer.mjs";
 import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -77,13 +80,13 @@ function fakeGcloud(value, { status = 0, name, encode = (bytes) => bytes.toStrin
 }
 
 async function run(argv, { value = SECRET, pin = d1Output({ key_version: CURRENT_LABEL,
-  secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }), desiredState = desired(), gcloud } = {}) {
+  secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }), rotation, desiredState = desired(), gcloud } = {}) {
   const fake = gcloud ?? fakeGcloud(value);
   const out = [];
   const err = [];
   const code = await check.main(argv, {
     spawn: fake.spawn,
-    readPin: () => pin,
+    readPin: (path) => (path === "rotation.json" ? rotation : pin),
     loadDesiredState: () => desiredState,
     stdout: (text) => out.push(text),
     stderr: (text) => err.push(text),
@@ -226,4 +229,108 @@ test("the CLI entry runs as a subprocess and refuses a non-production environmen
   assert.equal(result.status, 1, result.stderr);
   assert.deepEqual(JSON.parse(result.stderr), { status: "error", code: "PIN_CHECK_ENVIRONMENT_INVALID" });
   assert.equal(result.stdout, "");
+});
+
+/**
+ * Round 16's rotation document, as `identity-rotate-pin` builds it: from
+ * Cloudflare's D1 pin (the retired label and the lost secret, OTHER here) to
+ * the newly generated secret mounted under the label the origin runs.
+ */
+function rotationFor({ secret = SECRET, lost = OTHER, secretName = "IDENTITY_LINK_SECRET", secretVersion = "1" } = {}) {
+  return buildIdentityLinkRotation({
+    secret,
+    sealedPin: { keyVersion: RETIRED_LABEL, secretFingerprint: check.identityLinkSecretFingerprint(lost) },
+    fromKeyVersion: RETIRED_LABEL,
+    toKeyVersion: CURRENT_LABEL,
+    secretName,
+    secretVersion,
+    consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
+    computedAt: "2026-10-03T00:00:00.000Z",
+    labels: PRODUCTION_IDENTITY_LINK_ROTATION_LABELS,
+  }).rotation;
+}
+
+const ROTATED_ARGV = Object.freeze(["--environment=production", "--pin-file=pin.json", "--rotation-file=rotation.json"]);
+/** Cloudflare's D1 pin: the retired label and the lost secret's fingerprint. */
+const D1_PIN = d1Output({ key_version: RETIRED_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(OTHER) });
+
+test("rotated mode: a newly generated mount passes against the D1 pin only through the rotation document", async () => {
+  assert.deepEqual({ ...PRODUCTION_IDENTITY_LINK_ROTATION_LABELS, retiredKeyVersions: [...PRODUCTION_IDENTITY_LINK_ROTATION_LABELS.retiredKeyVersions] },
+    { currentKeyVersion: "production-v2", retiredKeyVersions: ["production-v1"] });
+  assert.equal(CURRENT_LABEL, "production-v2");
+  const rotation = JSON.stringify(rotationFor());
+  const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.calls.length, 1, "one read-only access, as in continuity mode");
+  assert.deepEqual(JSON.parse(result.stdout), { schema: check.IDENTITY_LINK_PIN_CHECK_SCHEMA, environment: "production",
+    project: "tibotattle-prod", secret: "IDENTITY_LINK_SECRET", version: "1", versionPinned: true,
+    expectedKeyVersion: "production-v2", rotation: { fromKeyVersion: "production-v1", toKeyVersion: "production-v2" },
+    outcome: "match", reasons: [] });
+  assertContentFree(result.stdout);
+  assertContentFree(result.stdout, OTHER);
+  // The same mount and D1 pin without the flag still exit 2: continuity mode never passes a rotated mount.
+  const plain = await run(["--environment=production", "--pin-file=pin.json"], { pin: D1_PIN });
+  assert.equal(plain.code, 2);
+  assert.deepEqual(JSON.parse(plain.stdout).reasons, ["KEY_VERSION_MISMATCH", "FINGERPRINT_MISMATCH"]);
+  assert.equal(Object.hasOwn(JSON.parse(plain.stdout), "rotation"), false);
+});
+
+test("rotated mode: each binding that fails is a named, content-free mismatch", async () => {
+  const cases = [
+    // The mount is not the rotation's target, or carries the usual custody slip.
+    [{ value: OTHER }, ["FINGERPRINT_MISMATCH"]],
+    [{ value: `${SECRET}\n` }, ["FINGERPRINT_MISMATCH", "MATCHES_WITHOUT_TRAILING_NEWLINE"]],
+    [{ value: "short-synthetic" }, ["SECRET_TOO_SHORT", "FINGERPRINT_MISMATCH"]],
+    // The D1 pin is not the rotation's source (another fingerprint, or already the rotated label).
+    [{ pin: d1Output({ key_version: RETIRED_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }) },
+      ["ROTATION_SOURCE_MISMATCH"]],
+    [{ pin: d1Output({ key_version: CURRENT_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(OTHER) }) },
+      ["ROTATION_SOURCE_MISMATCH"]],
+    // The rotation names another secret id or version than the one mounted.
+    [{ rotation: JSON.stringify(rotationFor({ secretVersion: "2" })) }, ["ROTATION_SECRET_VERSION_MISMATCH"]],
+    [{ rotation: JSON.stringify(rotationFor({ secretName: "OTHER_SECRET" })) }, ["ROTATION_SECRET_NAME_MISMATCH"]],
+  ];
+  for (const [options, reasons] of cases) {
+    const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation: JSON.stringify(rotationFor()), ...options });
+    assert.equal(result.code, 2, reasons.join());
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.outcome, "mismatch");
+    assert.deepEqual(report.reasons, reasons);
+    assertContentFree(result.stdout, options.value ?? SECRET);
+  }
+  // The comparison alone, with the label rule's last guard: a rotation that does not land on the running label.
+  const rotation = rotationFor();
+  const target = { secretName: "IDENTITY_LINK_SECRET", version: "1" };
+  const pin = { keyVersion: RETIRED_LABEL, secretFingerprint: check.identityLinkSecretFingerprint(OTHER) };
+  assert.deepEqual([...check.checkRotatedIdentityLinkPin(SECRET, pin, rotation, target,
+    { expectedKeyVersion: "production-v3" }).reasons], ["KEY_VERSION_MISMATCH"]);
+});
+
+test("rotated mode: an invalid rotation document or label pair is refused before any gcloud call", async () => {
+  const valid = rotationFor();
+  const mutated = (mutate) => {
+    const value = structuredClone(valid);
+    mutate(value);
+    return JSON.stringify(value);
+  };
+  const cases = [
+    ["not json", "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.extra = 1; }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.reason = "routine"; }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.retiredConsumerRoutes = value.retiredConsumerRoutes.slice(1); }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.to.secretFingerprint = value.from.secretFingerprint; }), "PIN_CHECK_ROTATION_INVALID"],
+    // Well-formed, but not production's labels: another plane's, the wrong direction, or an unknown retired label.
+    [mutated((value) => { value.to.keyVersion = "staging-gcp-v1"; }), "PIN_CHECK_ROTATION_LABELS_INVALID"],
+    [mutated((value) => { value.from.keyVersion = "production-v2"; value.to.keyVersion = "production-v1"; }),
+      "PIN_CHECK_ROTATION_LABELS_INVALID"],
+    [mutated((value) => { value.from.keyVersion = "production-v0"; }), "PIN_CHECK_ROTATION_LABELS_INVALID"],
+  ];
+  for (const [rotation, code] of cases) {
+    const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation });
+    assert.deepEqual([result.code, result.calls.length, JSON.parse(result.stderr)], [1, 0, { status: "error", code }], code);
+    assert.equal(result.stdout, "");
+  }
+  assert.throws(() => check.parsePinCheckArgs(["--environment=production", "--pin-file=x", "--rotation-file="]),
+    { code: "PIN_CHECK_ARGUMENT_INVALID" });
+  assert.equal(check.parsePinCheckArgs(["--environment=production", "--pin-file=x"]).rotationFile, null);
 });

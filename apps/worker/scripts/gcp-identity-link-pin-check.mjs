@@ -1,29 +1,45 @@
 #!/usr/bin/env node
 
 /**
- * Identity-link continuity check for the production origin (PROD-PREP). It
- * is a gate before PROD-3's migrate and roll.
+ * Identity-link pin check for the production origin (PROD-PREP). It is a
+ * gate before PROD-3's migrate and roll.
  *
  *   node scripts/gcp-identity-link-pin-check.mjs --environment=production
- *        --pin-file=<path> [--version=<n>]
+ *        --pin-file=<path> [--rotation-file=<path>] [--version=<n>]
  *
  * The production primary imports Cloudflare's identity-link pin: the
  * key-version label and the keyed fingerprint of IDENTITY_LINK_SECRET, in
- * identity_link_secret_configuration. The origin never re-pins
- * (assertExistingPostgresIdentityLinkPin), so the Secret Manager version the
- * service mounts must be Cloudflare's value byte for byte. Any other value, a
- * trailing newline included, would only show after the roll, as 503
- * IDENTITY_CONFIGURATION_INVALID on the session ports, and it would silently
- * change the edge admission's replay keys. This check finds it first.
+ * identity_link_secret_configuration. The origin never re-pins it
+ * (assertExistingPostgresIdentityLinkPin).
  *
  * Round 16 (2026-10-02): Cloudflare's value is lost, so the cutover rotates
- * it. The origin runs the rotated label (PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
- * 'production-v2') with a newly generated version, and the E-PT8 orchestrator
- * moves the imported pin to it under its own token and receipt. Against a pin
- * read from production's D1 (the retired label and the lost secret's
- * fingerprint) this check therefore reports KEY_VERSION_MISMATCH and
- * FINGERPRINT_MISMATCH and exits 2. It has no rotated mode yet; until it does,
- * it is not a passable gate for the rotated secret.
+ * it. Secret Manager holds a NEWLY GENERATED version, the origin runs the
+ * rotated label (PRODUCTION_IDENTITY_LINK_SECRET_VERSION, 'production-v2'),
+ * and the E-PT8 orchestrator moves the imported pin to it under its own token
+ * and receipt. Only the retired routes read the pin (round 12;
+ * IDENTITY_LINK_CONSUMER_ROUTE_IDS: the social chain, legacy enroll, security
+ * reset and export), and the host refuses to compose under the rotated label
+ * if it would serve one, so no kept route answers differently for a wrong
+ * value. What this check guards is that the rotation moves the pin to the
+ * bytes the service actually mounts.
+ *
+ * Modes:
+ *   - Continuity (no --rotation-file): the mounted version must be the pin's
+ *     value under the label the origin runs. Against a pin read from
+ *     production's D1 (the retired label and the lost secret's fingerprint)
+ *     a rotated mount therefore reports KEY_VERSION_MISMATCH and
+ *     FINGERPRINT_MISMATCH and exits 2: without the flag it never passes.
+ *   - Rotated (--rotation-file, the owner's identity-rotation.json from
+ *     `postgres-production-transfer.mjs identity-rotate-pin`): the document
+ *     must pass validateIdentityLinkRotation and its labels
+ *     assertRotationLabels under PRODUCTION_IDENTITY_LINK_ROTATION_LABELS
+ *     (from 'production-v1' to 'production-v2'; anything else is an error).
+ *     Then the D1 pin must be the rotation's `from` (ROTATION_SOURCE_MISMATCH
+ *     otherwise), the label must be 'production-v2' (KEY_VERSION_MISMATCH),
+ *     the mounted value's fingerprint must be the rotation's `to`
+ *     (FINGERPRINT_MISMATCH, with the trailing-newline hints), and the
+ *     rotation's `to` must name the secret id and version this check reads
+ *     (ROTATION_SECRET_NAME_MISMATCH, ROTATION_SECRET_VERSION_MISMATCH).
  *
  * Secret: the IDENTITY_LINK_SECRET version that the committed production
  * desired state pins. Before that pin is committed, --version names it; when
@@ -39,7 +55,10 @@
  * of a read-only `wrangler d1 execute ... --json` SELECT of key_version and
  * secret_fingerprint from production's identity_link_secret_configuration,
  * or PT-3's identityLinkPin object {keyVersion, secretFingerprint}. It must
- * hold exactly one row. The file is read before any gcloud call.
+ * hold exactly one row. In the rotated mode it is the D1 pin, the rotation's
+ * source. The rotation file (closed JSON, at most 64 KiB, keyed digests and
+ * labels only) is the owner's; keep it in the owner directory. Both files
+ * are read and validated before any gcloud call.
  *
  * The fingerprint is the Worker's identityLinkSecretFingerprint
  * (src/identity-link-configuration.ts): HMAC-SHA-256 keyed by the secret's
@@ -47,8 +66,9 @@
  * implementations equal.
  *
  * Output: one content-free JSON document on stdout. It names the secret id,
- * the version, the outcome ('match' or 'mismatch') and content-free reasons,
- * and never a value or a fingerprint. On a fingerprint mismatch it also says
+ * the version, in the rotated mode the rotation's two labels, the outcome
+ * ('match' or 'mismatch') and content-free reasons, and never a value or a
+ * fingerprint. On a fingerprint mismatch it also says
  * whether the value would match without, or with, one trailing newline. Exit
  * 0 on match, 2 on mismatch, and 1 on error, with {"status":"error","code":...}
  * on stderr.
@@ -61,7 +81,10 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { PRODUCTION_RESOURCE_FINGERPRINT } from "../cloud-run/postgres-production-configuration.mjs";
+import { IDENTITY_LINK_CONSUMER_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
 import { loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
+import { assertRotationLabels, validateIdentityLinkRotation } from "./postgres-identity-link-pin.mjs";
+import { PRODUCTION_IDENTITY_LINK_ROTATION_LABELS } from "./postgres-production-transfer.mjs";
 
 export const IDENTITY_LINK_PIN_CHECK_SCHEMA = "tibotattle-identity-link-pin-check-v1";
 /** src/identity-link-configuration.ts IDENTITY_LINK_SECRET_FINGERPRINT_DOMAIN; the check pins equality. */
@@ -113,6 +136,7 @@ export function parsePinCheckArgs(argv) {
       options: {
         environment: { type: "string" },
         "pin-file": { type: "string" },
+        "rotation-file": { type: "string" },
         version: { type: "string" },
       },
       strict: true,
@@ -121,12 +145,63 @@ export function parsePinCheckArgs(argv) {
   } catch {
     fail("PIN_CHECK_ARGUMENT_INVALID");
   }
-  const { environment, "pin-file": pinFile, version } = parsed.values;
+  const { environment, "pin-file": pinFile, "rotation-file": rotationFile, version } = parsed.values;
   // Only production imports a Cloudflare pin; staging's is its own (round 9).
   if (environment !== "production") fail("PIN_CHECK_ENVIRONMENT_INVALID");
   if (typeof pinFile !== "string" || pinFile.length === 0) fail("PIN_CHECK_ARGUMENT_INVALID");
+  if (rotationFile !== undefined && rotationFile.length === 0) fail("PIN_CHECK_ARGUMENT_INVALID");
   if (version !== undefined && !SECRET_VERSION.test(version)) fail("PIN_CHECK_ARGUMENT_INVALID");
-  return Object.freeze({ environment, pinFile, version });
+  return Object.freeze({ environment, pinFile, rotationFile: rotationFile ?? null, version });
+}
+
+/**
+ * The round-16 rotation document (identity-rotation.json): the closed schema
+ * naming exactly the registry's identity-link consumer routes
+ * (validateIdentityLinkRotation; PIN_CHECK_ROTATION_INVALID otherwise), whose
+ * labels move from a label production retired to the one the origin runs
+ * (assertRotationLabels under PRODUCTION_IDENTITY_LINK_ROTATION_LABELS;
+ * PIN_CHECK_ROTATION_LABELS_INVALID otherwise).
+ */
+export function parseIdentityLinkRotation(text) {
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    fail("PIN_CHECK_ROTATION_INVALID");
+  }
+  let rotation;
+  try {
+    rotation = validateIdentityLinkRotation(value, { consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS });
+  } catch {
+    fail("PIN_CHECK_ROTATION_INVALID");
+  }
+  try {
+    assertRotationLabels({ fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion },
+      PRODUCTION_IDENTITY_LINK_ROTATION_LABELS);
+  } catch {
+    fail("PIN_CHECK_ROTATION_LABELS_INVALID");
+  }
+  return rotation;
+}
+
+/**
+ * The rotated mode's comparison: the D1 pin is the rotation's source, the
+ * rotation lands on the label the origin runs, names the secret version read,
+ * and the mounted value is the rotation's target. Content-free reasons only.
+ */
+export function checkRotatedIdentityLinkPin(secret, pin, rotation, target, { expectedKeyVersion }) {
+  const reasons = [];
+  if (pin.keyVersion !== rotation.from.keyVersion || pin.secretFingerprint !== rotation.from.secretFingerprint) {
+    reasons.push("ROTATION_SOURCE_MISMATCH");
+  }
+  if (rotation.to.secretName !== target.secretName) reasons.push("ROTATION_SECRET_NAME_MISMATCH");
+  if (rotation.to.secretVersion !== target.version) reasons.push("ROTATION_SECRET_VERSION_MISMATCH");
+  const mounted = checkIdentityLinkPin(secret, {
+    keyVersion: rotation.to.keyVersion,
+    secretFingerprint: rotation.to.secretFingerprint,
+  }, { expectedKeyVersion });
+  reasons.push(...mounted.reasons);
+  return Object.freeze({ outcome: reasons.length === 0 ? "match" : "mismatch", reasons: Object.freeze(reasons) });
 }
 
 /** The secret id, project and version to read, from a validated desired state. */
@@ -291,9 +366,14 @@ export async function main(argv = process.argv.slice(2), {
   try {
     const args = parsePinCheckArgs(argv);
     const target = pinCheckTarget(loadDesiredState(), args.version);
+    // Both files are read and validated before any gcloud call.
     const pin = parseIdentityLinkPin(readPin(args.pinFile));
+    const rotation = args.rotationFile === null ? null : parseIdentityLinkRotation(readPin(args.rotationFile));
     const expectedKeyVersion = PRODUCTION_RESOURCE_FINGERPRINT.identityLinkSecretVersion;
-    const result = checkIdentityLinkPin(readIdentityLinkSecretVersion(target, { spawn }), pin, { expectedKeyVersion });
+    const secret = readIdentityLinkSecretVersion(target, { spawn });
+    const result = rotation === null
+      ? checkIdentityLinkPin(secret, pin, { expectedKeyVersion })
+      : checkRotatedIdentityLinkPin(secret, pin, rotation, target, { expectedKeyVersion });
     stdout(`${JSON.stringify({
       schema: IDENTITY_LINK_PIN_CHECK_SCHEMA,
       environment: args.environment,
@@ -302,6 +382,9 @@ export async function main(argv = process.argv.slice(2), {
       version: target.version,
       versionPinned: target.versionPinned,
       expectedKeyVersion,
+      ...(rotation === null ? {} : {
+        rotation: { fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion },
+      }),
       outcome: result.outcome,
       reasons: result.reasons,
     }, null, 2)}\n`);

@@ -23,7 +23,7 @@ status: draft
 In order: read-only checks, API enablement, the bucket birth and its pinned
 proof, OPS-2 pass 1 (accounts, grants, custom role, registry, secret
 containers, Cloud SQL with its IAM users and the logging exclusion), readback,
-the secrets, the pins, the identity-link continuity check and the production
+the secrets, the pins, the identity-link rotation check and the production
 alert channel. Pass 1 creates no scheduler trigger: the refresh cadence is
 decided after the production-scale measurement (round 15, C3), so its create
 is deferred until the owner commits one.
@@ -37,8 +37,9 @@ validates as a dedicated production plane; against the synthetic gcloud, the
 birth, pass 1, the pins and pass 2 converge; no operation names a left-out
 secret (the Google and Apple secrets round 12 retired, or the unread GitHub
 token), a staging resource or a test-estate resource; the Cloud SQL IAM users
-go by their PostgreSQL names; the continuity check computes the Worker's
-identity-link fingerprint and prints no content. They do not prove that live
+go by their PostgreSQL names; the pin check computes the Worker's
+identity-link fingerprint, holds a rotated mount to the round-16 rotation
+document, and prints no content. They do not prove that live
 gcloud output parses as the fake does, that the APIs below are the complete
 set, or that the builder can read Cloud Build's source bucket.
 
@@ -78,9 +79,10 @@ after a clear yes:
 | 4 | 7 | Generates `POSTGRES_RATE_LIMIT_SECRET` version 1 straight into Secret Manager |
 | 5 | 11 | Creates the production alert channel (`--authorize=<planDigest>`) |
 
-The owner adds the owner-held secret versions in step 7 themselves. Step 10
-writes nothing, but it reads an owner-held secret's value into a local
-process, so it also needs the owner's OK (or the owner runs it).
+The owner-held secret versions are added in step 7 (round 16: the owner
+asked Claude to run those commands). Step 10 writes nothing, but it reads
+the identity-link secret's value into a local process, so it also needs the
+owner's OK (or the owner runs it).
 
 ## Before you start
 
@@ -243,25 +245,31 @@ exclusion. Keep the files; they are content-free.
 
 OPS-2 made the four containers in step 5. Versions come from two places.
 
-**Owner-held, carried over from Cloudflare, byte for byte (the owner runs
-these).** `IDENTITY_LINK_SECRET` must be the production Worker's exact value:
-the imported primary pins its keyed fingerprint under `production-v1`, and
-the origin never re-pins (`assertExistingPostgresIdentityLinkPin`), so any
-other value, a trailing newline included, fails the session ports with
-`IDENTITY_CONFIGURATION_INVALID`. Step 10 checks it. `ENVELOPE_PUBLIC_JWK` and
-`ENVELOPE_PRIVATE_JWK` are one pair with the same `kid`. Do not add a
-`DISTRIBUTION_GITHUB_API_TOKEN`: production has no container for it, and
-nothing on the production estate would read it.
+**Owner-held, carried over from Cloudflare, byte for byte.**
+`ENVELOPE_PUBLIC_JWK` and `ENVELOPE_PRIVATE_JWK` are one pair with the same
+`kid`. Do not add a `DISTRIBUTION_GITHUB_API_TOKEN`: production has no
+container for it, and nothing on the production estate would read it.
 
 ```bash
-<custody command that prints the exact value> | gcloud secrets versions add IDENTITY_LINK_SECRET --project=tibotattle-prod --data-file=- --no-log-http
+<custody command that prints the exact value> | gcloud secrets versions add ENVELOPE_PUBLIC_JWK --project=tibotattle-prod --data-file=- --no-log-http
 ```
 
-The same for each name. The owner reports only the version numbers.
+The same for the private half. Only the version numbers are reported.
 
 **New random, generated straight into Secret Manager (approval 4; the main
-session runs this, and nobody sees the value).** `POSTGRES_RATE_LIMIT_SECRET`
-is origin-only and new; CR-3 needs at least 32 bytes. The add is not
+session runs this, and nobody sees the value).** `IDENTITY_LINK_SECRET` is
+newly generated (round 16): Cloudflare's value is lost, so it is not carried
+over. The origin mounts it under the rotated label `production-v2`, and the
+cutover moves the imported pin from `production-v1` to it under its own
+token and receipt
+([cutover window](./gcp-cutover-window.md#identity-link-rotation-round-16)).
+That is safe because no kept route reads the pin: round 12 retires every
+reader (`IDENTITY_LINK_CONSUMER_ROUTE_IDS`), and the host refuses to compose
+under the rotated label if it would serve one. Step 10 checks that the
+mounted version is the rotation's target. Its version 1 (32 random bytes,
+base64url, no trailing newline) was generated on 2026-10-02 (round 16);
+never add another to retry. `POSTGRES_RATE_LIMIT_SECRET` is
+origin-only and new; CR-3 needs at least 32 bytes. The add is not
 idempotent: a second run adds version 2. So first confirm that the secret
 has no version yet:
 
@@ -316,62 +324,70 @@ Expect exit 0 with 0 executable. The service and its bindings now wait on
 `SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET`, and the jobs
 on the bootstrap image.
 
-## 10. Identity-link continuity (read-only; a gate before PROD-3)
+## 10. Identity-link rotation check (read-only; a gate before PROD-3)
 
 This proves, before any migrate or roll, that the Secret Manager
-`IDENTITY_LINK_SECRET` version the service will mount is Cloudflare's value.
-Without it, a wrong byte would show only after the roll, as 503
-`IDENTITY_CONFIGURATION_INVALID`, and would silently change the edge
-admission's replay keys. Nothing here writes anything.
+`IDENTITY_LINK_SECRET` version the service will mount is the target of the
+round-16 rotation: Cloudflare's D1 pin (label `production-v1`, the lost
+secret's fingerprint) is the rotation's source, and the newly generated
+mounted value is its target under `production-v2`. No kept route reads the
+pin, so a wrong value would not show as a route error; this check is what
+stops the cutover from moving the pin to bytes the service does not mount.
+Nothing here writes anything.
 
-**Round 16 changes this step.** Cloudflare's `IDENTITY_LINK_SECRET` is lost,
-so the cutover rotates it: Secret Manager holds a newly generated version, the
-origin runs the label `production-v2`, and the cutover orchestrator moves the
-imported pin to it under its own token and receipt
-([cutover window](./gcp-cutover-window.md#identity-link-rotation-round-16)).
-Against the D1 pin below (label `production-v1`, the lost secret's
-fingerprint), the check now reads `mismatch` with `KEY_VERSION_MISMATCH` and
-`FINGERPRINT_MISMATCH` and exits 2. That is expected, and it does not clear
-this gate: the check has no rotated mode yet, so it cannot yet prove the
-mounted version's bytes. Until it gains one, this gate is open; record it as
-open rather than passing it.
+First the two owner documents, which are not secret but are keyed digests,
+so they stay in the owner directory:
 
-First the expected pin, which is not secret, from production's D1 through
-the owner's Wrangler login (a read-only `SELECT`; the pin never changes once
-set, so any time before the seal reads the value the seal carries):
-
-```bash
-npx wrangler d1 execute app-usagemonitor-production --env production --remote --json \
-  --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration WHERE singleton = 1" \
-  > "$SCRATCH/identity-link-pin.json"; echo "exit=$?"
-```
+1. The D1 pin, read-only through the owner's Wrangler login, into
+   `<dir>/sealed-pin.json` (the pin never changes once set, so any time
+   before the seal reads the value the seal carries). Use the cutover
+   window's command
+   ([identity-link rotation](./gcp-cutover-window.md#identity-link-rotation-round-16),
+   step 1), which keeps the file private.
+2. The rotation document `<dir>/identity-rotation.json`, which the owner's
+   `identity-rotate-pin` writes from the mounted version and that pin (the
+   same section, step 2).
 
 Then the check (with the owner's OK, because it reads the value into a local
 process, or the owner runs it):
 
 ```bash
-node scripts/gcp-identity-link-pin-check.mjs --environment=production --pin-file="$SCRATCH/identity-link-pin.json"; echo "exit=$?"
+node scripts/gcp-identity-link-pin-check.mjs --environment=production \
+  --pin-file=<dir>/sealed-pin.json --rotation-file=<dir>/identity-rotation.json; echo "exit=$?"
 ```
 
 It reads the version that step 9 pinned. To check a version before its pin
-is committed, add `--version=<n>`. It makes one read-only
+is committed, add `--version=<n>`. Both files are validated before any
+gcloud call: the rotation must be the closed `tibotattle-identity-link-rotation-v1`
+document naming exactly the retired consumer routes
+(`PIN_CHECK_ROTATION_INVALID`), and its labels must move from
+`production-v1` to `production-v2`
+(`PRODUCTION_IDENTITY_LINK_ROTATION_LABELS`; `PIN_CHECK_ROTATION_LABELS_INVALID`).
+It then makes one read-only
 `gcloud secrets versions access ... --format=json --no-log-http` call and
-prints only the secret id, the version, `match` or `mismatch`, and
-content-free reasons, never the value or a fingerprint. Expect exit 0 and
-`"outcome": "match"`. Exit 2 is a mismatch:
+prints only the secret id, the version, the rotation's two labels, `match`
+or `mismatch`, and content-free reasons, never the value or a fingerprint.
+Expect exit 0 and `"outcome": "match"`. Exit 2 is a mismatch:
 
 | Reason | Meaning |
 |---|---|
-| `FINGERPRINT_MISMATCH` with `MATCHES_WITHOUT_TRAILING_NEWLINE` | The custody command added a newline. The owner adds a new version without it (with `tr -d '\n'`), and the pin moves to it |
-| `FINGERPRINT_MISMATCH` with `MATCHES_WITH_TRAILING_NEWLINE` | The original value ends in a newline that was stripped. Add a new version with it |
-| `FINGERPRINT_MISMATCH` alone | Not Cloudflare's value. Stop and ask the owner |
-| `KEY_VERSION_MISMATCH` | The pin's label is not `production-v2`, the label the origin runs (`PRODUCTION_IDENTITY_LINK_SECRET_VERSION`). With `FINGERPRINT_MISMATCH`, against the D1 pin, this is the round-16 rotation (above), not a custody slip. Otherwise stop and ask |
+| `ROTATION_SOURCE_MISMATCH` | The D1 pin is not the rotation's `from`. Re-read the pin, recompute the rotation with `identity-rotate-pin`, and rerun |
+| `ROTATION_SECRET_NAME_MISMATCH`, `ROTATION_SECRET_VERSION_MISMATCH` | The rotation's `to` names another secret id or version than the one the desired state mounts. Recompute it for the pinned version |
+| `FINGERPRINT_MISMATCH` with `MATCHES_WITHOUT_TRAILING_NEWLINE` | The mounted version carries a trailing newline the rotation's `to` does not. Add a clean version, pin it, and recompute the rotation |
+| `FINGERPRINT_MISMATCH` with `MATCHES_WITH_TRAILING_NEWLINE` | The other way round. Recompute the rotation from the mounted version |
+| `FINGERPRINT_MISMATCH` alone | The mounted value is not the rotation's target. Stop and ask the owner |
+| `KEY_VERSION_MISMATCH` | The rotation does not land on `production-v2`, the label the origin runs (`PRODUCTION_IDENTITY_LINK_SECRET_VERSION`). Stop and ask |
 | `SECRET_TOO_SHORT` | Under 32 characters; the origin refuses it. Stop and ask |
 
-The superseded version stays (never destroy it to retry); only the pinned
-version is mounted. Keep the pin file for PT-3, whose `identityLinkPin` is
-the same `{keyVersion, secretFingerprint}`. Rerun this check before PROD-3's
-migrate and roll whenever the pinned version changes.
+Without `--rotation-file` the check compares the mount with the pin
+directly, as it did for a carried-over value. Against the D1 pin a rotated
+mount always reads `mismatch` with `KEY_VERSION_MISMATCH` and
+`FINGERPRINT_MISMATCH` and exits 2, so that run never clears this gate.
+
+Never destroy a superseded version to retry; only the pinned version is
+mounted. Keep both files for PT-8 (`identity-pin.json` and the rotation's
+`rotationSha256` go into `pt8-inputs.json`). Rerun this check before
+PROD-3's migrate and roll whenever the pinned version changes.
 
 ## 11. The production alert channel (approval 5; OWN-5c)
 
