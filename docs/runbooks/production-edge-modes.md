@@ -44,7 +44,11 @@ Authority:
 - No guard-only Worker. The Sparkle appcast guard stays in the production
   Worker.
 - No deploy from the checked-in `env.production`, and no raw `wrangler deploy`.
-  Every edge deploy goes through the typed path.
+  Every edge deploy goes through the typed path. The commands enforce this:
+  `production:deploy` without `--inventory`, and `product:web-release:deploy`
+  without its inventory and live-site pins, are refused before anything runs
+  (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`). So is the release publication's
+  website step, which passes no pins.
 - No gradual deployment and no version split on this Worker. Exactly one version
   serves 100%.
 - No edge deploy from the GCP line.
@@ -92,14 +96,26 @@ Authority:
 
 Start from the guarded typed deployment in
 [Production service operations](./production-operations.md#guarded-deployment-wrapper):
-the live inventory, its pinned sha256 and the reviewed previous source. E10 adds
-these flags to that command:
+the live inventory, its pinned sha256, the reviewed previous source, and either
+the retained public source with the live manifest sha256 or, for a changed
+site, the candidate flags in [Changing the public site](#changing-the-public-site).
+E10 adds these flags to that command:
 
 | Mode | Added flags | Typical use |
 |---|---|---|
-| `worker` | `--edge-mode=worker`; after a fence, also `--fence-receipt=<verified fence receipt> --fence-receipt-sha256=<its sha256>` | P1, the first edge-entry deploy; any later worker-mode redeploy; the abort |
+| `worker` | `--edge-mode=worker`; after a fence, also `--fence-receipt=<verified fence receipt> --fence-receipt-sha256=<its sha256>` | P1, the first edge-entry deploy; any later worker-mode redeploy, including web-only releases before the fence; the abort |
 | `fenced` | `--edge-mode=fenced` | Starting the fence; the brake from gcp |
-| `gcp` | `--edge-mode=gcp --edge-plan=<private gcp plan> --origin-commit=<origin commit> --origin-verifier-account=<verifier account>` | The switch; gcp redeploys, including web-only releases |
+| `gcp` | `--edge-mode=gcp --edge-plan=<private gcp plan> --origin-commit=<origin commit> --origin-verifier-account=<verifier account>` | The switch, with the privacy-marker candidate site; gcp redeploys, including web-only releases and website rollbacks |
+
+**Without `--edge-mode`.** Once the live version carries an
+`EDGE_UPSTREAM_MODE` binding (from P1 on), a typed deploy without
+`--edge-mode` is refused before any snapshot or journal
+(`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE`). Its plain render would install the
+checked-in entry in place of the edge entry and skip every edge gate,
+including the privacy-page rule. `product:web-release:deploy` has no edge
+mode, so from P1 on it is refused in both forms: with its typed pins by this
+rule, and without them always (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`). See
+[Changing the public site](#changing-the-public-site).
 
 The gcp plan is EP-9's closed plan: the Cloud Run origin URL, the audience, the
 edge-invoker account, an optional headers timeout, and the release-guard D1's id
@@ -141,6 +157,134 @@ pinned mode and plan. E10 refuses `EDGE_MODE_PLAN_REQUIRED` when a pinned gcp
 mode has no plan and `EDGE_MODE_PLAN_MISMATCH` when the plan differs. In gcp
 mode no typed role is bound, so the typed schema inspection is skipped
 (`EDGE_MODE_GCP_TYPED_ROLES_UNBOUND`).
+
+### Changing the public site
+
+A typed deploy pins the public site in one of two closed ways. They never mix.
+
+| Site | Flags | Before the upload | After the upload |
+|---|---|---|---|
+| Kept | `--retained-public-source <live site's source sha> --expected-live-manifest-sha256 <live manifest sha256>` | The live manifest is the pinned one. The staged site is exactly that manifest, built from the retained source | The live manifest is still the pinned one |
+| Changed | `--candidate-public-manifest-sha256 <candidate sha256>`; one of `--web-release-receipt <receipt>`, or `--rollback-web-release-receipt <receipt>` with `--rollback-release-operation <that release's archived journal>`; and `--replaced-public-source <live site's source sha> --replaced-live-manifest-sha256 <live manifest sha256>` | The live manifest is the replaced one, and its source provenance matches the replaced source commit. The staged site is exactly the candidate manifest, built from the receipt's source commit | The live manifest is the candidate |
+
+**Prepare on the edge-port line.** These deploys run from the edge-port line,
+and both rows stage the site with that line's `stage-production-assets.mjs`;
+a changed site's receipt is re-verified by that line's web-only lane. Both
+allowlists differ from this line's: the edge-port line stages
+`feature-value.png` where this line stages `feature-value.jpg`, and only the
+edge-port line's lane admits the cache-reuse matrix, feature insights,
+feature-value image and model performance files. So build P1's retained tree
+and prepare every receipt and generated site (the switch's, each web-only
+release's, each rollback's) on the edge-port line. One prepared on this line
+can fail there.
+
+A changed site needs `--edge-mode worker` or `--edge-mode gcp`, so the
+privacy-page rule always runs. The receipt is the one
+`product:web-release:prepare` writes
+([web-only release lane](./2026-08-17-web-only-release.md)); its path must be
+absolute, under the checkout's `.release-build`, and outside the generated
+site. Before the inventory is read or anything remote runs, the deploy
+re-verifies the receipt with the lane's own checks (scope, catalogue proofs,
+and the generated site in `.release-build/public-release-site`), then:
+
+- **A release (`--web-release-receipt`).** The receipt must be fresh: its
+  source is the checked-out commit, which becomes the deploy source, and its
+  base is `--expected-previous-source`, the live commit the shared lock
+  rechecks.
+- **A rollback (`--rollback-web-release-receipt`).** The receipt is a
+  previously released site, with that release's generated site restored into
+  `.release-build/public-release-site`. Its source must be the live commit or
+  an ancestor of it. The deploy source stays the checked-out commit, and the
+  staged site is pinned to the receipt's source commit, which must also be an
+  ancestor of the deploy source. A receipt proves a site's bytes and scope,
+  not that the site was ever live, so `--rollback-release-operation` names
+  the operation journal of the typed production deploy that left the site
+  live: the `journal/` of that release's
+  [archive entry](./2026-08-17-web-only-release.md#5-archive-the-release),
+  used in place. The journal must be a verified typed production
+  deploy whose state still matches its binding digest. The site it left live
+  (the candidate it shipped, or the retained site it kept) must be the
+  receipt's manifest built from the receipt's source commit, and its deploy
+  commit must be on the live line.
+- **Either way** the receipt's manifest must be the candidate, and the
+  operation journal records the candidate (and, for a rollback, its source
+  commit) so typed recovery rechecks the right site.
+- **The replaced pair is proven, not trusted.** Before the upload the live
+  manifest must be `--replaced-live-manifest-sha256`, `--replaced-public-source`
+  must be the live commit or one of its ancestors, and the live manifest's
+  source provenance must match that commit's public source files, read from
+  Git. The journal therefore records a replaced source that produced the live
+  site.
+
+Refusals, all before any upload:
+
+| Code | Cause |
+|---|---|
+| `PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED` | A candidate without `--edge-mode` |
+| `PRODUCTION_CANDIDATE_SITE_FENCED` | A candidate with `--edge-mode fenced`. Releases pause while fenced; the brake keeps the live site |
+| `PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT` | A candidate with `--retained-public-source` or `--expected-live-manifest-sha256` |
+| `PRODUCTION_CANDIDATE_SITE_UNCHANGED` | The candidate equals the replaced live manifest. A deploy that keeps the site uses the retained pair |
+| `PRODUCTION_ARGUMENTS_INVALID` | No receipt, both receipts, a relative receipt path, a rollback without an absolute `--rollback-release-operation` or that flag on a release, a missing replaced pin, no inventory, `--confirm-migrations`, or a malformed value |
+| `PRODUCTION_CANDIDATE_RECEIPT_INVALID` | The lane refuses the receipt: wrong shape, scope or catalogue proof, or the generated site no longer matches it |
+| `PRODUCTION_CANDIDATE_RECEIPT_MISMATCH` | The receipt's manifest is not the candidate |
+| `PRODUCTION_CANDIDATE_RECEIPT_STALE` | A release receipt whose source is not the checked-out commit, or whose base is not the live commit |
+| `PRODUCTION_ROLLBACK_RECEIPT_NOT_ON_LIVE_LINE` | A rollback receipt whose source is not the live commit or one of its ancestors |
+| `PRODUCTION_ROLLBACK_OPERATION_INVALID` | The rollback's journal is missing or unreadable, is not a verified typed production deploy, or its state no longer matches its binding digest |
+| `PRODUCTION_ROLLBACK_SITE_NOT_RELEASED` | The journal's deploy did not leave this site live: another manifest, another source commit, or a deploy commit off the live line. A receipt prepared after the fact for a site no deploy shipped ends here |
+| `PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE` | `--replaced-public-source` is not the live commit or one of its ancestors |
+| `PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN` | The live manifest matched its sha256, but its source provenance does not match `--replaced-public-source` (or that commit cannot be read) |
+| `PRODUCTION_CANDIDATE_PUBLIC_SOURCE_NOT_ANCESTOR` | A rollback site's source commit is not in the deploy source |
+| `PRODUCTION_PUBLIC_ASSETS_INVALID` | The staged site is not exactly the candidate manifest from its pinned commit |
+| `PRODUCTION_TYPED_PUBLIC_RELEASE_MANIFEST_INVALID` | The live manifest is not the replaced one before the upload, or not the candidate after it |
+
+The privacy-page rule then applies to the candidate as to any site:
+`EDGE_PRIVACY_PAGE_PREMATURE` for a marked candidate in worker mode or before
+the switch, and `EDGE_PRIVACY_PAGE_NOT_CUTOVER` for an unmarked candidate in
+gcp mode, including a rollback to a site from before the switch.
+
+The gcp plan is EP-9's closed plan. It holds:
+
+- the Cloud Run origin URL;
+- the audience;
+- the edge-invoker account;
+- an optional headers timeout;
+- the release-guard D1's id and name.
+
+It holds identifiers, so keep it owner-private and outside the repository.
+
+**Refusals before any upload.** The deploy refuses:
+
+- `--edge-mode` outside the typed path (`EDGE_MODE_REQUIRES_TYPED`).
+- A transition outside EP-9's matrix (`EDGE_MODE_TRANSITION_FORBIDDEN`). The
+  allowed transitions are:
+  - none → worker
+  - worker → worker
+  - worker → fenced
+  - fenced → fenced
+  - fenced → gcp
+  - fenced → worker
+  - gcp → gcp
+  - gcp → fenced
+
+  For fenced → worker, E10 walks the deployment history back to the fenced
+  deployment that the verified EP-8 fence receipt names. When it cannot, it
+  refuses with `EDGE_MODE_FENCE_HISTORY_INCOMPLETE`.
+- A source that does not descend from the live commit
+  (`EDGE_MODE_SOURCE_NOT_DESCENDANT`).
+- A source without the edge entry (`EDGE_MODE_ENTRY_UNAVAILABLE`).
+- For gcp:
+  - a missing edge-tier binding (`EDGE_MODE_ADMISSION_BINDING_MISSING`);
+  - a missing edge secret (`EDGE_MODE_SECRET_MISSING`);
+  - a pending release-guard migration
+    (`EDGE_MODE_RELEASE_GUARD_MIGRATIONS_PENDING`);
+  - a pre-gcp verifier answer that names another origin commit
+    (`EDGE_ORIGIN_COMMIT_MISMATCH`);
+  - a contract blob that differs between the edge commit and the origin
+    commit (`EDGE_CONTRACT_DRIFT`);
+  - a candidate site without the privacy marker
+    (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`).
+- For worker, fenced and pre-gcp deploys: a candidate site that carries the
+  privacy marker (`EDGE_PRIVACY_PAGE_PREMATURE`).
 
 ## 3. Edge secrets
 
@@ -301,20 +445,117 @@ verifier is limited at the origin to plain `GET /api/health` and
 
 ## 6. Releases and deploys in gcp mode
 
+### The switch's site
+
+The switch (EP-10) is the first changed-site deploy in gcp mode: the
+privacy-marker site ships in the same deploy as the mode. Build it as a
+web-only candidate of the fenced commit:
+
+1. The switch commit differs from the live fenced commit only inside the
+   [web-only closure](./2026-08-17-web-only-release.md#1-establish-the-source-boundary):
+   the privacy page, the browser localization, the paired i18n catalogue and
+   mirror, and their focused tests. Every other change, including edge code
+   and repository documentation, lands before P1 or after the switch.
+2. Prepare it with `product:web-release:prepare --base <live fenced commit>`,
+   on the edge-port line: a receipt or generated site prepared on this line
+   can fail there (see [Changing the public site](#changing-the-public-site)).
+3. Deploy, from `apps/worker` on the switch commit:
+
+   ```bash
+   npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+     --expected-previous-source <live fenced commit> \
+     --inventory <fresh-private-inventory.json> \
+     --inventory-sha256 <fresh-inventory-sha256> \
+     --candidate-public-manifest-sha256 <the receipt's site.manifestSha256> \
+     --web-release-receipt <absolute path of .release-build/web-release-receipt.json> \
+     --replaced-public-source <live site's source sha> \
+     --replaced-live-manifest-sha256 <live manifest sha256> \
+     --edge-mode gcp \
+     --edge-plan <private gcp plan> \
+     --origin-commit <origin commit> \
+     --origin-verifier-account <verifier account>
+   ```
+
+`--replaced-public-source` is the source of the site PROD-5 kept: the commit
+it pinned with `--retained-public-source`. Without the candidate the switch is
+refused `EDGE_PRIVACY_PAGE_NOT_CUTOVER`; with the retained pair added it is
+refused `PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT`.
+
+Once the switch is verified, archive it from `apps/worker` on the switch
+checkout with `npm run production:release-archive` ([Archive the
+release](./2026-08-17-web-only-release.md#5-archive-the-release)): its
+journal, receipt and privacy-marker site are the rollback point for the
+switch's site.
+
 ### Web-only releases
 
-Web-only releases in gcp mode use the existing
-[web-only release lane](./2026-08-17-web-only-release.md) on the edge-port line.
-They need no Cloud Run redeploy. The deploy keeps the pinned gcp mode and plan,
-and E10 applies the gcp rules:
+From P1 on, a web-only release is a changed-site deploy through
+`production:deploy` with the live mode (`--edge-mode worker` before the
+fence, `--edge-mode gcp` after the switch; the owner's round 12 decision).
+`product:web-release:deploy` is refused: with its typed pins
+`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE` (it has no edge mode), and without them
+`PRODUCTION_UNTYPED_DEPLOY_REFUSED`, which also applies before P1.
 
-- the predecessor and post-deploy identity come from the Cloudflare bindings;
-- the contract blob at the release commit must equal the blob at the live
-  origin commit;
-- the candidate's privacy page must carry the marker.
+1. Prepare the candidate with the
+   [web-only release lane](./2026-08-17-web-only-release.md) on the edge-port
+   line, with the live commit as `--base`.
+2. Deploy it as in [the switch's site](#the-switchs-site), with the live
+   commit as `--expected-previous-source`. In gcp mode keep the gcp plan,
+   `--origin-commit` (the live origin commit) and the verifier account; in
+   worker mode use `--edge-mode worker` alone.
+3. Once it is verified, archive it with `npm run production:release-archive`
+   ([Archive the release](./2026-08-17-web-only-release.md#5-archive-the-release)).
 
-Before the switch, a web-only release must not carry the marker. While fenced,
+E10 applies the mode's rules. In gcp mode no Cloud Run redeploy is needed;
+the predecessor and post-deploy identity come from the Cloudflare bindings,
+the contract blob at the release commit must equal the blob at the live
+origin commit, and the candidate's privacy page must carry the marker. Before
+the switch, a candidate must not carry the marker. While the fence is up,
 web-only releases pause.
+
+### Website rollback
+
+Roll the site back by re-deploying a previously released site by its
+receipt, not by deploying an old checkout. Only a site that a verified typed
+production deploy left live can come back; a receipt prepared later for
+another commit is refused (`PRODUCTION_ROLLBACK_SITE_NOT_RELEASED`).
+
+1. Archive every release after it is verified ([Archive the
+   release](./2026-08-17-web-only-release.md#5-archive-the-release)): the
+   switch, each web-only release and each rollback. The entry keeps the
+   deploy's operation journal, private and as the deploy left it, with the
+   release's receipt and generated site. Prepare them on the edge-port line: a
+   receipt or site prepared on this line can fail there. Never edit an entry.
+2. On a clean checkout of the live commit, or a descendant of it, restore the
+   entry's `public-release-site` into `.release-build/public-release-site` and
+   its `web-release-receipt.json` anywhere under `.release-build` outside that
+   directory.
+3. Deploy as in [the switch's site](#the-switchs-site), with
+   `--rollback-web-release-receipt <restored receipt>` in place of
+   `--web-release-receipt`, plus
+   `--rollback-release-operation <the entry's journal directory>` (the
+   archived journal, used in place), the entry index's `manifestSha256` as
+   the candidate, and the live site as the replaced pair. On a checkout of
+   the live commit itself, also pass a fresh, absolute private `--operation`
+   directory: the default one for that commit holds the earlier deploy's
+   journal (`RELEASE_OPERATION_EXISTS_USE_RESUME`).
+
+The site PROD-5 kept has PROD-5's journal as its evidence; archive that
+journal with the kept site's web-release receipt and generated site in the
+same way. That needs a receipt whose source is the retained source and whose
+manifest is the live one, which the edge-port line's lane still accepts; find
+it before PROD-5. Without one, or if the archive refuses it
+(`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_INVALID`,
+`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), the kept site is not a
+rollback target: keep and record the journal, and restore that site, if
+needed, with a revert commit
+([A deploy that kept the site](./2026-08-17-web-only-release.md#5-archive-the-release)).
+A site live only before the typed journals, with no verified typed journal,
+cannot be a rollback target either.
+
+In gcp mode a rollback past the switch is refused
+(`EDGE_PRIVACY_PAGE_NOT_CUTOVER`): the restored site must carry the marker.
+Rolling the edge back is the brake, not a site rollback.
 
 ### Cloud Run deploys
 

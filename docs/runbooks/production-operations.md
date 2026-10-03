@@ -855,11 +855,15 @@ its fixed slice.
 
 ### Guarded deployment wrapper
 
-Without inventory flags, the routine wrapper below uses the checked-in JSON
-database layout. For typed storage, a different primary database, or a separate
-`ANALYTICS_DB`, use the pinned typed path below. It reconstructs the live
-configuration inside a disposable source snapshot and qualifies each database
-role. A migration confirmation cannot repair a binding mismatch.
+Every production deploy uses the pinned typed path below. It reconstructs the
+live configuration inside a disposable source snapshot and qualifies each
+database role. Without inventory flags the wrapper would render the checked-in
+`env.production`: the JSON database layout without the edge entry, which would
+replace typed production and, from P1 on, the live edge. So
+`production:deploy` without `--inventory` is refused before anything runs
+(`PRODUCTION_UNTYPED_DEPLOY_REFUSED`), and so is `product:web-release:deploy`
+without its typed pins. A migration confirmation cannot repair a binding
+mismatch.
 
 The read-only reconciliation command accepts an owner-private Cloudflare
 inventory containing account/Worker identity, active version, settings,
@@ -900,6 +904,12 @@ npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
   --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
 ```
 
+A typed deployment that changes the public site instead pins a candidate
+manifest proven by its web-release receipt, never the retained pair; see
+[Changing the public site](production-edge-modes.md#changing-the-public-site).
+Once the live Worker runs the edge entry, every typed deployment names its
+`--edge-mode` (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE` otherwise).
+
 The typed path preserves the live bindings, settings and ingress, and rechecks
 all three database contracts at the deployment boundary. It refuses migration
 confirmations and never applies database migrations. Schema differences require
@@ -911,22 +921,12 @@ restore metadata group; arbitrary SQL normalization is not accepted.
 `production-trigger-repair-rehearsal.mjs` locally exercises migration-order guard
 preservation; it is not a remote repair command.
 
-Only after explicit authorization and green preflight, use the wrapper from
-`apps/worker`:
-
-```bash
-npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
-  --expected-previous-source <reviewed-full-deployed-source-sha>
-```
-
-If and only if the wrapper reports a reviewed pending set and the separate
-migration operation has been handled, append its exact comma-separated tokens:
-
-```bash
-npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
-  --expected-previous-source <reviewed-full-deployed-source-sha> \
-  --confirm-migrations BINDING:0000_name.sql
-```
+Only after explicit authorization and green preflight, use the typed command
+above from `apps/worker`. `--expected-previous-source` without the inventory,
+alone or with `--confirm-migrations`, is the untyped form and is refused
+(`PRODUCTION_UNTYPED_DEPLOY_REFUSED`). The typed path never applies or confirms
+a database migration; apply a reviewed migration through its own procedure
+first.
 
 Capture the structured result. Success means the wrapper observed its named
 pre/post conditions; it is not a release, appcast publication, identity-flow,

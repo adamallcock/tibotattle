@@ -268,55 +268,114 @@ test("web-only prepare parsing reserves source selection for the guarded command
   );
 });
 
-test("web-only deployment delegates the receipt-pinned SHA to the production guard", async () => {
-  const repositoryRoot = "/tmp/web-release-candidate";
-  const sourceCommit = "a".repeat(40);
-  const baseCommit = "b".repeat(40);
+test("web-only deployment refuses the untyped form before reading the receipt", async () => {
+  // Untyped, the guard would render the checked-in env.production: the JSON
+  // layout without the edge entry, over typed production or a live edge.
   const receiptPath = "/tmp/web-release-candidate/.release-build/web-release-receipt.json";
-  const calls = [];
-  const result = await deployWebRelease({
-    repositoryRoot,
-    receiptPath,
-    confirmation: "DEPLOY_PRODUCTION",
-    verifyReceipt: async (value) => {
-      assert.deepEqual(value, { repositoryRoot, receiptPath });
-      return {
-        receipt: { sourceCommit },
-        scope: { sourceCommit, baseCommit },
-      };
-    },
-    runProduction: async (value) => {
-      calls.push(value);
-      return { ok: true, code: "PRODUCTION_DEPLOYED" };
-    },
-  });
-
-  assert.equal(result.sourceCommit, sourceCommit);
-  assert.deepEqual(calls, [{
-    confirmation: "DEPLOY_PRODUCTION",
-    confirmedMigrations: null,
-    expectedSourceCommit: sourceCommit,
-    expectedPreviousSourceCommit: baseCommit,
-    workerDirectory: "/tmp/web-release-candidate/apps/worker",
-    wrangler: "/tmp/web-release-candidate/apps/worker/node_modules/.bin/wrangler",
-  }]);
-  assert.deepEqual(
-    parseDeployWebReleaseArgs([
-      "--receipt",
+  for (const typedProduction of [undefined, null, false]) {
+    await assert.rejects(deployWebRelease({
+      repositoryRoot: "/tmp/web-release-candidate",
       receiptPath,
-      "--confirm",
-      "DEPLOY_PRODUCTION",
-    ]),
-    {
       confirmation: "DEPLOY_PRODUCTION",
-      confirmedMigrations: null,
-      receiptPath,
-    },
-  );
+      ...(typedProduction === undefined ? {} : { typedProduction }),
+      verifyReceipt: async () => assert.fail("an untyped deploy never reads the receipt"),
+      runProduction: async () => assert.fail("an untyped deploy never reaches the production guard"),
+    }), { code: "PRODUCTION_UNTYPED_DEPLOY_REFUSED" });
+  }
+  for (const argv of [
+    ["--receipt", receiptPath, "--confirm", "DEPLOY_PRODUCTION"],
+    ["--receipt", receiptPath, "--confirm", "DEPLOY_PRODUCTION", "--confirm-migrations", "USAGE_MONITOR_DB:0001_schema.sql"],
+    ["--receipt", receiptPath, "--confirm", "DEPLOY_PRODUCTION", "--operation", "/tmp/web-release-candidate/fresh"],
+  ]) {
+    assert.throws(() => parseDeployWebReleaseArgs(argv), { code: "PRODUCTION_UNTYPED_DEPLOY_REFUSED" }, argv.join(" "));
+  }
   assert.throws(
     () => parseDeployWebReleaseArgs(["--receipt", receiptPath]),
     /receipt and explicit confirmation/u,
   );
+});
+
+test("web-only typed deployment pins the candidate manifest from the verified receipt", async () => {
+  const sourceCommit = "a".repeat(40);
+  const baseCommit = "b".repeat(40);
+  const candidateManifest = "c".repeat(64);
+  const liveManifest = "d".repeat(64);
+  const typedProduction = { inventory: {}, provider: {} };
+  let passed;
+  await deployWebRelease({
+    repositoryRoot: "/tmp/web-release-candidate",
+    receiptPath: "/tmp/web-release-candidate/.release-build/web-release-receipt.json",
+    confirmation: "DEPLOY_PRODUCTION",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    typedProduction,
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+    verifyReceipt: async () => ({
+      receipt: { site: { manifestSha256: candidateManifest } },
+      scope: { sourceCommit, baseCommit },
+    }),
+    runProduction: async (options) => {
+      passed = options;
+      return { ok: true };
+    },
+  });
+  assert.equal(passed.operationDirectory, "/tmp/web-release-candidate/.release-build/production-operations/fresh");
+  assert.equal(passed.typedProduction, typedProduction);
+  assert.equal(passed.retainedPublicSourceCommit, baseCommit);
+  assert.equal(passed.expectedLiveManifestSha256, liveManifest);
+  assert.equal(passed.candidatePublicManifestSha256, candidateManifest);
+  assert.equal(passed.expectedSourceCommit, sourceCommit);
+  assert.equal(passed.expectedPreviousSourceCommit, baseCommit);
+  assert.equal(passed.confirmation, "DEPLOY_PRODUCTION");
+  assert.equal(passed.confirmedMigrations, null);
+  assert.equal(passed.workerDirectory, "/tmp/web-release-candidate/apps/worker");
+  assert.equal(passed.wrangler, "/tmp/web-release-candidate/apps/worker/node_modules/.bin/wrangler");
+
+  assert.deepEqual(parseDeployWebReleaseArgs([
+    "--receipt", "/tmp/receipt.json",
+    "--confirm", "DEPLOY_PRODUCTION",
+    "--operation", "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    "--inventory", "/tmp/inventory.json",
+    "--inventory-sha256", "1".repeat(64),
+    "--retained-public-source", baseCommit,
+    "--expected-live-manifest-sha256", liveManifest,
+  ]), {
+    confirmation: "DEPLOY_PRODUCTION",
+    confirmedMigrations: null,
+    receiptPath: "/tmp/receipt.json",
+    operationDirectory: "/tmp/web-release-candidate/.release-build/production-operations/fresh",
+    inventoryPath: "/tmp/inventory.json",
+    inventorySha256: "1".repeat(64),
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+  });
+  for (const extra of [
+    ["--operation", "relative/operation"],
+    ["--operation", "/tmp/bad\noperation"],
+    ["--inventory", "/tmp/inventory.json"],
+    ["--inventory", "/tmp/inventory.json", "--inventory-sha256", "1".repeat(64),
+      "--retained-public-source", baseCommit, "--expected-live-manifest-sha256", liveManifest,
+      "--confirm-migrations", "USAGE_MONITOR_DB:0001_schema.sql"],
+    ["--inventory", "/tmp/inventory.json", "--inventory-sha256", "not-a-digest",
+      "--retained-public-source", baseCommit, "--expected-live-manifest-sha256", liveManifest],
+  ]) {
+    assert.throws(() => parseDeployWebReleaseArgs([
+      "--receipt", "/tmp/receipt.json", "--confirm", "DEPLOY_PRODUCTION", ...extra,
+    ]), TypeError);
+  }
+  await assert.rejects(deployWebRelease({
+    repositoryRoot: "/tmp/web-release-candidate",
+    receiptPath: "/tmp/web-release-candidate/.release-build/web-release-receipt.json",
+    confirmation: "DEPLOY_PRODUCTION",
+    typedProduction,
+    retainedPublicSourceCommit: baseCommit,
+    expectedLiveManifestSha256: liveManifest,
+    verifyReceipt: async () => ({
+      receipt: { site: { manifestSha256: "bad" } },
+      scope: { sourceCommit, baseCommit },
+    }),
+    runProduction: async () => assert.fail("Invalid candidate must not deploy"),
+  }), /verified candidate manifest/u);
 });
 
 test("web-only preparation refuses a receipt path redirected through a symlink", async (t) => {

@@ -105,11 +105,18 @@ npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
   --expected-previous-source <reviewed-full-deployed-source-sha> \
   --inventory <fresh-private-inventory.json> \
   --inventory-sha256 <fresh-inventory-sha256> \
+  --retained-public-source <live site's source sha> \
+  --expected-live-manifest-sha256 <live manifest sha256> \
   --edge-mode=fenced
 ```
 
 `built`. Capture a fresh private inventory first and pin its sha256; the edge
-version in gcp mode is the predecessor, read from the Cloudflare bindings.
+version in gcp mode is the predecessor, read from the Cloudflare bindings. The
+brake keeps the live, marked site (the retained pair); a changed site is
+refused while fenced (`PRODUCTION_CANDIDATE_SITE_FENCED`). A broken site is
+fixed with a gcp deploy of a candidate or rollback site
+([Production edge modes](./production-edge-modes.md#website-rollback)), not
+with the brake.
 
 Verify as in [Production edge modes, section 2](./production-edge-modes.md#2-typed-deploys-per-mode):
 one version at 100% whose `DEPLOYMENT_SOURCE_COMMIT` and `EDGE_UPSTREAM_MODE`

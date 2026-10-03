@@ -187,8 +187,10 @@ npm run product:web-release:prepare -- \
 ```
 
 The command writes the generated site and local receipt but makes no network
-mutation. Keep both until post-deployment verification is complete. The
-candidate must remain clean and at the same commit between preparation and
+mutation. Keep both in place until the deploy is verified and
+[archived](#5-archive-the-release) with its operation journal: that archive
+entry is this release's rollback point. The receipt carries private Git SHAs.
+The candidate must remain clean and at the same commit between preparation and
 deployment.
 
 ## 3. Validate before asking for deployment authority
@@ -217,10 +219,10 @@ checkout or a previously built directory as evidence for this candidate.
 
 ## 4. Deploy only after explicit production authorization
 
-This is the only web-only deploy entry point. It validates the receipt, repeat
-checks the candidate scope, and invokes the production immutable-snapshot and
-migration safeguards. It is still a Worker deployment, so it requires the
-normal production credentials and explicit authorization.
+Before P1 this is the only web-only deploy entry point. It validates the
+receipt, repeat checks the candidate scope, and invokes the typed production
+immutable-snapshot safeguards. It is still a Worker deployment, so it requires
+the normal production credentials and explicit authorization.
 
 The receipt's exact `baseCommit` is forwarded as the reviewed production
 predecessor. Under the shared deployment lock, live health must still name that
@@ -228,26 +230,207 @@ base before Wrangler starts. A newer deployment makes this receipt stale: merge
 the intended changes onto the new base and requalify, never auto-adopt live
 source or bypass the guard. Interrupted outcomes use the production operation
 journal and [explicit recovery procedure](production-operations.md#guarded-deployment-wrapper).
+A proven pre-mutation refusal with no retained lock may use the same valid
+receipt and a fresh, absolute private `--operation` directory after its cause
+is fixed. Preserve the first journal. An uncertain or attempted deployment
+must be reconciled, never retried with a fresh directory.
+
+Production uses typed storage, so the entry point accepts only its typed form,
+with an owner-private live inventory. Without the inventory and live-site pins
+it is refused before the receipt is read
+(`PRODUCTION_UNTYPED_DEPLOY_REFUSED`): on this line the untyped form would
+render the checked-in `env.production`, the JSON storage layout without the
+edge entry. First run the read-only `production:reconcile`
+procedure in [Production operations](production-operations.md#guarded-deployment-wrapper)
+against this clean candidate and require all database roles to qualify. Pin the
+current public manifest bytes and the full deployed source commit that produced
+them. The receipt supplies the candidate manifest SHA-256; the command verifies
+the live preimage and candidate postimage separately and preserves the live
+bindings, schedules, ingress, and secrets. Before the upload it also proves the
+pinned public source: it must be the live commit or one of its ancestors
+(`PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE`), and the live
+manifest's source provenance must match its public source files
+(`PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN`). Typed website publication never
+accepts `--confirm-migrations` and never applies a database migration.
 
 ```bash
 npm run product:web-release:deploy -- \
   --receipt "$PWD/.release-build/web-release-receipt.json" \
-  --confirm DEPLOY_PRODUCTION
+  --confirm DEPLOY_PRODUCTION \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --retained-public-source <full-deployed-public-source-sha> \
+  --expected-live-manifest-sha256 <reviewed-live-manifest-sha256>
 ```
+
+If the candidate source changes after preparation, prepare a new receipt before
+deployment. A source whose typed schema differs from production cannot use this
+website-only lane; build a clean candidate from the live source and carry only
+the reviewed public-site closure.
 
 Never substitute a raw `wrangler deploy` command: it would bypass the
 web-only receipt and source-scope checks. Record the successful source commit,
 receipt digest, deploy time, and live smoke-check result as the next deployed
-baseline.
+baseline, then [archive the release](#5-archive-the-release).
+
+### Once production runs the edge entry
+
+From the first typed worker-mode edge deploy (P1 in
+[Production edge modes](production-edge-modes.md)), `product:web-release:deploy`
+with its typed pins is refused (`EDGE_MODE_REQUIRED_FOR_EDGE_LIVE`): it has no
+edge mode, and a typed deploy without one would replace the edge entry.
+Without the pins it is always refused (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`).
+Preparation is unchanged. Deploy the same fresh receipt through the typed
+production command, from `apps/worker` on the candidate commit, with the live
+mode (the owner's 2026-10-02 decision for releases after the switch):
+
+```bash
+npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source "$DEPLOYED_SOURCE_COMMIT" \
+  --inventory /absolute/private/live-inventory.json \
+  --inventory-sha256 <reviewed-inventory-sha256> \
+  --candidate-public-manifest-sha256 <the receipt's site.manifestSha256> \
+  --web-release-receipt /absolute/candidate-checkout/.release-build/web-release-receipt.json \
+  --replaced-public-source <full-deployed-public-source-sha> \
+  --replaced-live-manifest-sha256 <reviewed-live-manifest-sha256> \
+  --edge-mode gcp --edge-plan <private gcp plan> \
+  --origin-commit <live origin commit> --origin-verifier-account <verifier account>
+```
+
+Before the fence use `--edge-mode worker` with no gcp flags; while the edge is
+fenced, web-only releases pause. The command re-verifies the receipt with this
+lane's checks and requires it to be fresh: its source must be the checked-out
+commit and its base the live commit. It refuses the retained pair
+(`--retained-public-source`, `--expected-live-manifest-sha256`) alongside a
+candidate, a candidate equal to the live manifest, and a candidate without an
+edge mode; [Production edge modes](production-edge-modes.md#changing-the-public-site)
+lists every refusal. Once it is verified,
+[archive the release](#5-archive-the-release).
+
+## 5. Archive the release
+
+Every production deploy is typed, so a verified deploy leaves an operation
+journal, and a website rollback needs that journal together with the
+release's receipt and generated site. Archive the three after every verified
+typed production deploy that ships a site: each web-only release in either
+form above, the gcp switch, and each website rollback. Do it right after the
+deploy reports `verified`, before the checkout is cleaned or reused. From
+`apps/worker` on the checkout that deployed:
+
+```bash
+npm run production:release-archive -- \
+  --operation <absolute operation directory of the deploy> \
+  --web-release-receipt <absolute path of that checkout's .release-build/web-release-receipt.json> \
+  --archive /absolute/owner-private/release-archive
+```
+
+The operation directory is the deploy's `--operation`, or by default
+`.release-build/production-operations/<deploy commit>` in the checkout. The
+archive directory belongs to the owner, outside every Git checkout: it must be
+`0700`, owned by the caller and named by its real path, with no `.git` in it or
+any parent, and it must not be inside the operation directory or contain it
+(`PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID`). A missing last component is
+created `0700`, but only after the journal, receipt and site have verified:
+a refused run writes nothing. The script:
+
+- archives only a verified typed production deploy whose state still matches
+  its binding digest, the rollback's own rule
+  (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED`), and refuses a journal
+  whose lock a running process holds (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY`).
+  It probes that SQLite lock read-only, so a `mutex.sqlite-journal` left by a
+  run that was killed is not busy: it is never removed, and is archived as
+  found;
+- re-verifies the receipt with this lane's checks against the checkout's
+  generated site, requires its manifest and source commit to be the site the
+  journal left live (`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), archives
+  only bytes that parse to exactly the receipt the lane verified, and
+  requires the generated site to be exactly its manifest
+  (`PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID`);
+- assembles a private staging copy, proves it (the journal did not move, the
+  copied journal is the same verified release, the copied receipt is still the
+  verified receipt, the copied site passes the same site check), and renames
+  it to `<archive>/<journal identityDigest>/`:
+  `journal/` (private, as the deploy left it), `web-release-receipt.json`,
+  `public-release-site/` and a content-free `index.json` holding only the
+  manifest sha256, the site's source commit, the deploy commit, the journal
+  identityDigest and the receipt's sha256;
+- never overwrites. A rerun for the same release prints
+  `PRODUCTION_RELEASE_ALREADY_ARCHIVED`; a different entry under that digest
+  is refused (`PRODUCTION_RELEASE_ARCHIVE_CONFLICT`) and left as it is.
+
+It prints codes, commits and digests only, never deploys, and does not change
+its inputs. Record the printed `journalIdentityDigest` with the deployed
+baseline. An archive failure does not undo the deploy: keep the journal,
+receipt and site in place, fix the cause and rerun until it prints
+`PRODUCTION_RELEASE_ARCHIVED` or `PRODUCTION_RELEASE_ALREADY_ARCHIVED`. A
+`.staging-*` directory an interrupted run leaves in the archive is not an
+entry. Never edit an entry: a rollback reads its journal as archived.
+
+**A deploy that kept the site** (the retained pair, as at P1 or PROD-5 in
+[Production edge modes](production-edge-modes.md#website-rollback)) left the
+retained site live, so its archive needs that site's web-release receipt: its
+`sourceCommit` is the retained source, its `site.manifestSha256` is the live
+manifest, and the lane of the checkout that deployed still accepts it there
+(base an ancestor of the source, a non-empty diff of allowed paths only, its
+catalogue proofs, and the restored generated site). One exists when that
+site was itself prepared through that lane and its receipt was kept; one
+prepared later must rebuild the live manifest byte for byte. Find it before
+the deploy. If there is none, or the archive refuses it
+(`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_INVALID` or
+`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), rerunning cannot help: the
+kept site is not a rollback target. Keep the journal as it is, record that
+with the deployed baseline, and if that site is ever needed again restore it
+with a revert commit ([Rollback](#rollback)). The deploy does not depend on
+the archive.
 
 ## Rollback
 
 Do not deploy an old checkout directly: the scope gate deliberately requires
-the candidate to descend from the current deployed base. Instead, make a new,
-clean revert commit on top of the current deployed web-only source that changes
-only allowed public files. Prepare and authorize it through the same lane,
-reusing the same released installer evidence unless an approved client release
-also changes it.
+the candidate to descend from the current deployed base.
+
+**Once production runs the edge entry,** roll back by re-deploying a
+previously released site from its [archive entry](#5-archive-the-release). Its
+receipt and site were prepared on the edge-port line, which runs these deploys
+(a receipt or site prepared on this line can fail there):
+
+1. Pick the entry whose `index.json` names the site to restore (its
+   `manifestSha256` and `sourceCommit`). In a clean checkout of the live
+   commit (or a descendant of it) with no `.release-build/public-release-site`,
+   restore the entry's site and receipt:
+
+   ```bash
+   ENTRY=/absolute/owner-private/release-archive/<journal identityDigest>
+   mkdir -p .release-build
+   cp -R "$ENTRY/public-release-site" .release-build/public-release-site
+   cp "$ENTRY/web-release-receipt.json" .release-build/web-release-receipt.json
+   ```
+
+2. Run the typed command above with
+   `--rollback-web-release-receipt <absolute restored receipt>` in place of
+   `--web-release-receipt`, plus
+   `--rollback-release-operation "$ENTRY/journal"`, the archived journal used
+   in place (never copied out or edited), the index's `manifestSha256` as the
+   candidate, and the live site as the replaced pair. On a checkout of the
+   live commit itself, add a fresh, absolute private `--operation` directory;
+   the default one for that commit holds the earlier deploy's journal.
+3. Once the rollback is verified, archive it like any release: its journal,
+   the restored receipt and site become the rollback point for this site.
+
+The receipt's source must be the live commit or one of its ancestors, the
+restored site must still match the receipt byte for byte, and the staged site
+is pinned to the receipt's source commit. The journal must be a verified typed
+production deploy, on the live line, that left exactly this site live from
+the receipt's source commit (`PRODUCTION_ROLLBACK_OPERATION_INVALID`,
+`PRODUCTION_ROLLBACK_SITE_NOT_RELEASED`): a receipt alone never proves that a
+site was released. After the switch the restored site must carry the privacy
+marker, so the site cannot roll back past the switch.
+
+**Before the edge entry,** or when no archive entry of the earlier site
+exists (a kept site with no receipt, or an entry that was lost), make a new,
+clean revert commit on top of the current deployed web-only source that
+changes only allowed public files. Prepare and authorize it through the same
+lane, reusing the same released installer evidence unless an approved client
+release also changes it.
 
 This makes each web release and rollback a short, independently reviewable
 commit. Other agents can prepare their own candidates in separate worktrees;

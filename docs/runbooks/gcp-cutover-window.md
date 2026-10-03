@@ -249,8 +249,15 @@ Authorizations: the typed fenced deploy, and the EP-8 apply. `owner`.
      --expected-previous-source <reviewed-full-deployed-source-sha> \
      --inventory <private-inventory.json> \
      --inventory-sha256 <reviewed-inventory-sha256> \
+     --retained-public-source <live site's source sha> \
+     --expected-live-manifest-sha256 <live manifest sha256> \
      --edge-mode=fenced
    ```
+
+   The fence keeps the live site: the retained pair pins the live manifest
+   before and after the upload. A typed deploy with an inventory and no site
+   pins is refused `PRODUCTION_ARGUMENTS_INVALID`, and a changed site is
+   refused while fenced (`PRODUCTION_CANDIDATE_SITE_FENCED`).
 
    Verify as in [Production edge modes, section 2](./production-edge-modes.md#2-typed-deploys-per-mode):
    one version at 100% whose `DEPLOYMENT_SOURCE_COMMIT` and
@@ -552,9 +559,28 @@ Authorization: the edge switch (EP-10). `owner`.
 Preconditions, all of them:
 
 - H.5 passed within the readiness window.
-- The privacy-marker site built from the edge-port line is the candidate site
-  for this deploy, so the page changes in the same deploy as the switch. The
-  deploy refuses `EDGE_PRIVACY_PAGE_NOT_CUTOVER` without it.
+- The privacy-marker site is the candidate site for this deploy, so the page
+  changes in the same deploy as the switch. The deploy refuses
+  `EDGE_PRIVACY_PAGE_NOT_CUTOVER` without it. The switch commit is on the
+  edge-port line and differs from the live fenced commit only inside the
+  [web-only closure](./2026-08-17-web-only-release.md#1-establish-the-source-boundary)
+  (the privacy page, the browser localization, the paired i18n catalogue and
+  mirror, and their focused tests). Edge code and repository documentation
+  land before P1 or after the switch.
+- A fresh web-release receipt for the switch commit:
+  `product:web-release:prepare --base <live fenced commit>` from a clean
+  checkout of the switch commit, which writes the generated site and
+  `.release-build/web-release-receipt.json`. Record the receipt's
+  `site.manifestSha256`; it is the candidate manifest. Prepare it on the
+  edge-port line that deploys it: the lane's allowlist and the staged asset
+  set differ from this line's, so a receipt or generated site prepared here
+  can fail there.
+- The live site's pins from H.2 (its source sha and the live manifest
+  sha256); they become the replaced pair. The source sha is the commit PROD-5
+  pinned with `--retained-public-source`: the deploy proves it is on the live
+  line and produced the live manifest
+  (`PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE`,
+  `PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN`).
 - The gcp plan and both edge secrets are present, the release-guard D1 has no
   pending migration, and all six edge-tier rate-limit bindings are live.
 - The contract blob is identical at the edge commit and the origin commit
@@ -570,14 +596,30 @@ npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
   --expected-previous-source <reviewed-full-deployed-source-sha> \
   --inventory <fresh-private-inventory.json> \
   --inventory-sha256 <fresh-inventory-sha256> \
+  --candidate-public-manifest-sha256 <the receipt's site.manifestSha256> \
+  --web-release-receipt <absolute path of the switch checkout's .release-build/web-release-receipt.json> \
+  --replaced-public-source <live site's source sha> \
+  --replaced-live-manifest-sha256 <live manifest sha256> \
   --edge-mode=gcp \
   --edge-plan=<private gcp plan> \
   --origin-commit=<origin commit from H.5> \
   --origin-verifier-account=<verifier account>
 ```
 
-`built`. Add any further flags the typed path requires for the candidate site,
-from the deploy line. After the deploy:
+`built`. Run it from `apps/worker` on the switch commit. Before the inventory
+is read, the deploy re-verifies the receipt with the web-only lane's checks and
+requires it to be fresh (its source is the checked-out commit, its base the
+live fenced commit) and its manifest to be the candidate. It then rechecks the
+live manifest against the replaced pin before the upload, proves the replaced
+source produced it, stages exactly the candidate manifest built from the
+switch commit, and requires the candidate live after it. Leave this deploy's
+operation journal, receipt and generated site in place until they are
+archived (below): the archived journal is the evidence a later website
+rollback to the switch's site names. The retained pair (`--retained-public-source`,
+`--expected-live-manifest-sha256`) is refused alongside a candidate
+(`PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT`). Every refusal is in
+[Production edge modes](./production-edge-modes.md#changing-the-public-site).
+After the deploy:
 
 - One version at 100% with matching `DEPLOYMENT_SOURCE_COMMIT` and
   `EDGE_UPSTREAM_MODE` bindings, read from Cloudflare.
@@ -586,6 +628,25 @@ from the deploy line. After the deploy:
   secrets are deleted in a later, separately authorized step.
 - Every per-address rate-limit window resets once at the switch, because the
   keys are re-derived under the edge secret.
+- Archive the switch release, once the deploy reports `verified`, from
+  `apps/worker` on the switch checkout. The tool is on the edge-port and
+  fast-path lines since round 15, tested locally with synthetic data and never
+  run against a live release. It writes nothing remote:
+
+  ```bash
+  npm run production:release-archive -- \
+    --operation <absolute operation directory of the H.6 deploy> \
+    --web-release-receipt <absolute path of the switch checkout's .release-build/web-release-receipt.json> \
+    --archive /absolute/owner-private/release-archive
+  ```
+
+  It refuses a journal that is not a verified typed production deploy, and a
+  receipt or site that is not the one the journal left live. It writes
+  `<archive>/<journal identityDigest>/` with the journal, receipt, site and a
+  content-free index, and never overwrites; a rerun prints
+  `PRODUCTION_RELEASE_ALREADY_ARCHIVED`. Record the printed
+  `journalIdentityDigest`. See
+  [Archive the release](./2026-08-17-web-only-release.md#5-archive-the-release).
 
 If the deploy refuses before upload, the edge is still `fenced`: fix the
 cause and retry, or use Abort A. **If the outcome is uncertain, treat the
@@ -667,9 +728,13 @@ the verified EP-8 fence receipt.
      --expected-previous-source <reviewed-full-deployed-source-sha> \
      --inventory <private-inventory.json> \
      --inventory-sha256 <reviewed-inventory-sha256> \
+     --retained-public-source <live site's source sha> \
+     --expected-live-manifest-sha256 <live manifest sha256> \
      --edge-mode=worker \
      --fence-receipt=<verified fence receipt> --fence-receipt-sha256=<its sha256>
    ```
+
+   The abort keeps the live, unmarked site (the retained pair).
 
 2. Release the fence:
 
@@ -692,6 +757,17 @@ stranding risk in [H.2](#h2-fence)).
 
 Each item is its own authorized operation. Order is flexible except where
 noted.
+
+- Web-only releases resume through `production:deploy --edge-mode=gcp` with a
+  fresh web-release receipt, and each is archived once verified
+  (`production:release-archive`). A website rollback re-deploys a previously
+  released site from its archive entry: the restored receipt
+  (`--rollback-web-release-receipt`) and the entry's archived journal of the
+  verified deploy that released it (`--rollback-release-operation`); see
+  [Production edge modes](./production-edge-modes.md#website-rollback).
+  Prepare receipts and generated sites on the edge-port line. A rollback past
+  the switch is refused (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`): it is not an edge
+  rollback, which stays the brake.
 
 - Copy the frozen R2 objects to Google Cloud Storage (PT-7, reduced). `not built`.
   The maintenance pass's reconciliation guard against objects still in R2 is
@@ -724,6 +800,12 @@ noted.
 | `EDGE_MODE_ADMISSION_BINDING_MISSING`, `EDGE_MODE_SECRET_MISSING`, `EDGE_MODE_RELEASE_GUARD_MIGRATIONS_PENDING` | gcp deploy | A precondition of H.6 is missing |
 | `EDGE_ORIGIN_COMMIT_MISMATCH`, `EDGE_CONTRACT_DRIFT` | gcp deploy | The origin answered with another commit, or the contract blob differs between edge and origin commits |
 | `EDGE_PRIVACY_PAGE_NOT_CUTOVER`, `EDGE_PRIVACY_PAGE_PREMATURE` | Typed deploy | The marker is missing in gcp mode, or present before it |
+| `PRODUCTION_CANDIDATE_RECEIPT_STALE`, `PRODUCTION_CANDIDATE_RECEIPT_MISMATCH`, `PRODUCTION_CANDIDATE_RECEIPT_INVALID` | H.6 | The web-release receipt is not for the checked-out switch commit and the live fenced commit, names another manifest, or no longer passes the lane's checks. Prepare a fresh receipt |
+| `PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT`, `PRODUCTION_CANDIDATE_SITE_EDGE_MODE_REQUIRED`, `PRODUCTION_CANDIDATE_SITE_FENCED`, `PRODUCTION_CANDIDATE_SITE_UNCHANGED` | Typed deploy | The site flags are mixed or incomplete. Nothing ran |
+| `EDGE_MODE_REQUIRED_FOR_EDGE_LIVE` | Typed deploy | A typed deploy without `--edge-mode` over a live edge, including `product:web-release:deploy` with its typed pins. Name the live mode |
+| `PRODUCTION_UNTYPED_DEPLOY_REFUSED` | Any deploy | `production:deploy` without `--inventory`, or `product:web-release:deploy` without its typed pins. Nothing ran. Use the typed command |
+| `PRODUCTION_REPLACED_PUBLIC_SOURCE_NOT_ON_LIVE_LINE`, `PRODUCTION_REPLACED_PUBLIC_SOURCE_UNPROVEN` | H.6, web-only releases | `--replaced-public-source` is off the live line, or did not produce the live manifest. Nothing was uploaded. Use the source PROD-5 pinned |
+| `PRODUCTION_ROLLBACK_OPERATION_INVALID`, `PRODUCTION_ROLLBACK_SITE_NOT_RELEASED` | Website rollback | The named journal is not an intact, verified typed production deploy, or it did not leave this site live from the receipt's commit. Nothing ran |
 | `WRITER_UNACCOUNTED`, `SCHEDULE_DRIFT` | EP-8 inventory, plan, apply | A script outside the plan binds a listed database or bucket, or a fenced script's crons differ from the plan. At H.1 this is free; at `apply` the edge is already fenced |
 | `FENCE_INVENTORY_CHANGED` | EP-8 apply, verify | The fenced surface differs from the plan receipt's fingerprint. Rerun inventory and plan, then use the new receipt |
 | `FENCE_WINDOW_TOO_SHORT`, `FENCE_WINDOW_TOO_EARLY` | EP-8 verify | Run too soon: wait until `appliedAt` + 2 x the quiet window + 5 minutes (35 minutes at the minimum), or fix the `--window-start` |

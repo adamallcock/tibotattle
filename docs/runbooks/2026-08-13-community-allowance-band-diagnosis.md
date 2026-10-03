@@ -220,8 +220,10 @@ The band fix lives in Worker code and D1 state. Follow the
   --json --command "SELECT …"` — and should use it to read the fit cache and
   aggregate state against real data.
 - Production writes require explicit owner authorization for the exact
-  outcome. Use `npm run production:deploy -- --confirm DEPLOY_PRODUCTION`,
-  never raw deployment or a health-check bypass for normal resumption.
+  outcome. Use `npm run production:deploy -- --confirm DEPLOY_PRODUCTION`
+  with the typed flags in the production operations runbook (an untyped
+  deploy is refused, `PRODUCTION_UNTYPED_DEPLOY_REFUSED`), never raw
+  deployment or a health-check bypass for normal resumption.
 - **`wrangler deploy` does NOT apply D1 migrations.** Run
   `wrangler d1 migrations apply` separately. A code change that depends on a new
   migration must remain paused until the reviewed migration is applied and
