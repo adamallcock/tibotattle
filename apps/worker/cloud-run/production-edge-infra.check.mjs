@@ -32,7 +32,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { isDeepStrictEqual } from "node:util";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import * as infrastructure from "../scripts/gcp-ops-infra-manifest.mjs";
 
 const SERVICE_TEMPLATE_URL = new URL("./production-service.template.yaml", import.meta.url);

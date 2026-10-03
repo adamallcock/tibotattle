@@ -478,9 +478,8 @@ test("labels: routes, closed error codes and transport kinds; never other body c
     "POSTGRES_ROUTE_NOT_PORTED");
   assert.equal(errorCodeOf(Buffer.from('{"error":{"code":"lowercase secret value"}}')), null);
   assert.equal(errorCodeOf(Buffer.from("<html>")), null);
-  // The flat shape the current origin gives an unported route
-  // (cloud-run/origin-edge-test-mode.mjs EDGE_TEST_UNPORTED_BODY and
-  // postgres-test-dispatch.mjs json(503, ...)): a top-level closed code.
+  // The flat shape the loopback fallback gives an unsupported request
+  // (postgres-test-dispatch.mjs json(503, ...)): a top-level closed code.
   assert.equal(errorCodeOf(Buffer.from('{"status":"not_ready","error":"POSTGRES_TEST_ROUTE_UNSUPPORTED"}')),
     "POSTGRES_TEST_ROUTE_UNSUPPORTED");
   assert.equal(errorCodeOf(Buffer.from('{"error":"a free-text message"}')), null);

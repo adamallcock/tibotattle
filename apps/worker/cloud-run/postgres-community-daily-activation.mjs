@@ -11,9 +11,7 @@ import {
   normalizeIamUser,
 } from "./cloud-sql.mjs";
 import { readPostgresMigrations } from "./postgres-migrations.mjs";
-import {
-  CLOUD_RUN_IAM_TEST_TARGET,
-} from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   readPostgresCommunityDailyDaySourceEligibility,
 } from "../src/postgres-community-daily-publisher.ts";

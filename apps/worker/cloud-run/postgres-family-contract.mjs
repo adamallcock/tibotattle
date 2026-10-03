@@ -66,6 +66,7 @@ import { readBoundedRequestBody } from "../src/bounded-body.ts";
 import { JSON_HEADERS, MAX_REQUEST_BYTES } from "../src/constants.ts";
 import { ApiError, errorResponse, jsonResponse } from "../src/errors.ts";
 import { parseStrictJson } from "../src/strict-json.ts";
+import { requestIdFrom } from "./postgres-request-context.mjs";
 
 /**
  * @typedef {Readonly<{
@@ -287,10 +288,8 @@ function contextFor(deps, request) {
  * harness) receives a freshly minted id.
  */
 export function requestIdFor(deps, request) {
-  const requestId = contextFor(deps, request)?.requestId;
-  return typeof requestId === "string" && REQUEST_ID.test(requestId)
-    ? requestId
-    : crypto.randomUUID();
+  const accessor = deps === null || typeof deps !== "object" ? undefined : Reflect.get(deps, "requestContext");
+  return requestIdFrom(accessor, request);
 }
 
 /** The Access-verified, owner-pinned admin identity, or null. */

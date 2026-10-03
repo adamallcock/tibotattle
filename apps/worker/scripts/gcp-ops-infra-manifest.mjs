@@ -64,7 +64,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../src/canonical-json.ts";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
 import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
 import {
   EDGE_ONLY_SECRET_NAMES,
@@ -1845,8 +1845,20 @@ export function deployedJobNames(desired = null) {
 /** The keys of OPS-10's closed RolloutTarget (scripts/gcp-production-rollout.mjs). */
 export const ROLLOUT_TARGET_KEYS = Object.freeze([
   "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
-  "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience",
+  "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience", "maintenanceJob",
 ]);
+
+/**
+ * The JOB_NAMES key of the MP-2-lite maintenance Job (C-MAINT's
+ * dist/postgres-maintenance-job.mjs, added to JOB_NAMES by D-OPS4). A
+ * RolloutTarget names it only when the environment deploys it
+ * (deployedJobNames(desired)): staging cannot have it yet
+ * (JOB_ENVIRONMENT_UNAVAILABLE), so a staging target's maintenanceJob is
+ * null and OPS-10's roll refuses the origin-verifier path there
+ * (ROLLOUT_MAINTENANCE_JOB_REQUIRED), because only a lifecycle pass makes a
+ * new origin's /api/ready read ready (D-CRB).
+ */
+export const MAINTENANCE_JOB_KEY = "maintenance";
 
 /**
  * OPS-10's RolloutTarget for a validated desired state: the service, the
@@ -1862,18 +1874,22 @@ export function rolloutTargetFromDesiredState(desired) {
   if (desired.synthetic) fail("ROLLOUT_TARGET_SYNTHETIC_REFUSED");
   if (desired.serviceAccounts.verifier === null) fail("ROLLOUT_TARGET_VERIFIER_REQUIRED");
   if (desired.serviceAccounts.verifier.tokenCreators === null) fail("ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED");
+  // One list for both keys: the maintenance Job is the target's only when
+  // this environment deploys it, so it is always one of jobNames.
+  const deployed = deployedJobNames(desired);
   return deepFreeze({
     environment: desired.environment,
     project: desired.project,
     region: desired.region,
     service: desired.service.name,
     migrationJob: desired.jobs["production-migrate"].name,
-    jobNames: deployedJobNames(desired).map((job) => desired.jobs[job].name),
+    jobNames: deployed.map((job) => desired.jobs[job].name),
     primaryInstance: desired.cloudSql.instance,
     imageRepository: desired.artifactRegistry.imageRepository,
     builderServiceAccount: desired.serviceAccounts.builder.email,
     verifierServiceAccount: desired.serviceAccounts.verifier.email,
     originAudience: desired.service.audience,
+    maintenanceJob: deployed.includes(MAINTENANCE_JOB_KEY) ? desired.jobs[MAINTENANCE_JOB_KEY].name : null,
   });
 }
 

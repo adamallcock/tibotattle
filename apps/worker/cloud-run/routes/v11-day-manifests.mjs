@@ -26,6 +26,7 @@ import {
   routeFailure,
   routeConfigurationError,
   validateDeviceRouteDependencies,
+  routeRequestId,
 } from "./v11-route-support.mjs";
 
 export const TELEMETRY_V11_DAY_MANIFESTS_PATH = "/api/v1/device/telemetry/v1.1/day-manifests";
@@ -59,7 +60,7 @@ export function createTelemetryV11DayManifestRouteModules(dependencies) {
         fromDay: query.get("fromDay"), toDay: query.get("toDay"),
       }, options));
     } catch (error) {
-      return routeErrorResponse(error);
+      return routeErrorResponse(error, routeRequestId(deps, request));
     }
   }
 

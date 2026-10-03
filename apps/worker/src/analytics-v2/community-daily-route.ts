@@ -122,6 +122,8 @@ export const ANALYTICS_V2_DAILY_REVISION_FIELDS: readonly string[] = Object.free
 ]);
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+/** The root request context's id form (cloud-run/postgres-request-context.mjs). */
+const ROOT_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const DECIMAL_REVISION = /^[1-9][0-9]{0,15}$/u;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -580,8 +582,13 @@ export function createAnalyticsV2CommunityDailyRoute(
     );
   }
 
-  async function handler(request: Request): Promise<Response> {
-    const requestId = crypto.randomUUID();
+  async function handler(request: Request, context?: unknown): Promise<Response> {
+    // OD-CR-6 (i): the root's request id (the route-module context carries
+    // it per request), so the error body matches the origin's log line.
+    const rootRequestId: unknown = context !== null && typeof context === "object"
+      ? Reflect.get(context, "requestId") : undefined;
+    const requestId = typeof rootRequestId === "string" && ROOT_REQUEST_ID.test(rootRequestId)
+      ? rootRequestId : crypto.randomUUID();
     try {
       return await serve(request);
     } catch (error) {
