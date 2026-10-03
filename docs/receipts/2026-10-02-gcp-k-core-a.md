@@ -603,3 +603,29 @@ Kernel 1's closure is re-derived in place again (`71ac8d24…`, pin
   first test-project image build records it.
 - The staged migration is numbered 0911 as a placeholder; the integrator
   numbers it.
+
+## Integration (2026-10-03)
+
+The integrator merged `f9ecb36b` into `claude/gcp-fastpath-final` as
+`75ec7f94` (pre-merge `f98e5e5a`; no text conflict). Kernel 1's closure on
+the merged tree is still `71ac8d24…` (160 inputs).
+
+- **Migration.** The staged `0911_analytics_v2_run_stamps.sql` is primary
+  `0069_analytics_v2_run_stamps.sql` (`f6cbab90`). Unlike 0065-0068 it is a
+  contract migration under `classifyContractOperations`: its seven
+  `DROP DEFAULT`s of the transitional `manifest_version` defaults classify as
+  `drop`. It is reviewed in `CONTRACT_MIGRATIONS` with its sha256 and a
+  reason: the refresh Job's single write transaction is the only writer of
+  the stamped tables, so a previous image's refresh run between migrate and
+  roll is refused and rolls back with nothing written, and every other caller
+  only reads them.
+- **Integration fix.** D-OPS4's `ops-runtime-probe.spec.mjs` writes
+  `analytics_v2_runs` and `analytics_v2_published_daily` rows by hand, and
+  failed with 23502 once 0069 was in the chain. It now calls
+  `defaultAnalyticsV2FixtureStamps` (`01661029`).
+- **Stale comments in closure inputs.** `src/analytics-v2/contract.ts` and
+  `src/analytics-v2/kernel.ts` still call the migration "staged". They are
+  closure inputs, so the wording is left for the next registry change.
+
+The section "Not covered" above still holds, except its last item: the
+migration is numbered.
