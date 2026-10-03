@@ -1975,7 +1975,7 @@ test("PG17: the store replaces computed owners' rows only inside the run horizon
       const state0 = await store.readAnalyticsV2RefreshState(client, { schema });
       assert.deepEqual({ ...state0 }, { cursor: null, carriedBlockedDays: [], cacheFloorDay: null,
         appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [],
-        revisionFloor: { present: false, dayCount: 0, maxRevision: 0 } });
+        revisionFloor: { present: false, dayCount: 0, maxRevision: 0 }, firstRun: true, frozenInterimRead: false });
 
       await write({
         ownerDays: [ownerDay("2026-03-01", 1), ownerDay("2026-09-28", 2)],
@@ -3882,9 +3882,9 @@ test("PG17: the production target path runs a full refresh on the real clock and
     const databases = [];
     const env = productionEnvironment("production", { PRIMARY_SCHEMA: schema, ANALYTICS_V2_MEMORY_BUDGET_MIB: "1024" });
     let computed = 0;
-    const productionRun = () => job.runAnalyticsRefresh({
+    const productionRun = (runEnv = env) => job.runAnalyticsRefresh({
       argv: ["--mode=full"],
-      env,
+      env: runEnv,
       dependencies: {
         modules: { store, pipeline: createSpecPipeline({ beforeCompute: () => { computed += 1; } }) },
         kernelIdentity,
@@ -3897,22 +3897,73 @@ test("PG17: the production target path runs a full refresh on the real clock and
         closeResources: async ({ pools }) => { for (const value of pools) await value.end(); },
       },
     });
-    // REV-SEED: without the cutover's revision floor a production run refuses
-    // in the read snapshot, before compute, and writes nothing (no run row).
+    // R19 (d): a production FIRST run with neither the frozen interim read nor
+    // the revision floor refuses in the read snapshot, before compute, and
+    // writes nothing (no run row); this precedes REV-SEED's floor refusal.
     const untouched = await analyticsSnapshot(pool, schema);
     await assert.rejects(productionRun(), (error) => {
-      assert.equal(error.code, "ANALYTICS_V2_REVISION_FLOOR_ABSENT");
+      assert.equal(error.code, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT");
+      assert.equal(error.code, job.ANALYTICS_REFRESH_FIRST_RUN_REFUSAL);
       assert.equal(error.phase, "read");
       return true;
     });
     assert.equal(computed, 0, "nothing was computed");
     assert.deepEqual(await analyticsSnapshot(pool, schema), untouched);
     assert.equal((await runRows(pool, schema)).length, 0);
+    // With the frozen interim read loaded but no floor, REV-SEED's refusal
+    // still holds (another schema: the frozen row is immutable).
+    const interimOnly = (await createSchema()).schema;
+    await seedBaseCorpus(pool, interimOnly);
+    const input = exportInput(denseGoldenExportBody());
+    const { prepared } = await checkInterimPublicRead({ exportBytes: input.exportBytes, sha256: input.expectedSha256,
+      capturedAt: input.capturedAt, sourceCommit: input.sourceCommit, evidenceDate: input.evidenceDate });
+    await loadInterimPublicRead({ pool, schema: interimOnly, prepared });
+    const interimClient = await pool.connect();
+    try {
+      const state = await store.readAnalyticsV2RefreshState(interimClient, { schema: interimOnly });
+      assert.equal(state.firstRun, true);
+      assert.equal(state.frozenInterimRead, true);
+      assert.equal(state.revisionFloor.present, false);
+    } finally {
+      interimClient.release();
+    }
+    const interimUntouched = await analyticsSnapshot(pool, interimOnly);
+    await assert.rejects(productionRun({ ...env, PRIMARY_SCHEMA: interimOnly }), (error) => {
+      assert.equal(error.code, "ANALYTICS_V2_REVISION_FLOOR_ABSENT");
+      assert.equal(error.phase, "read");
+      return true;
+    });
+    assert.equal(computed, 0, "nothing was computed");
+    assert.deepEqual(await analyticsSnapshot(pool, interimOnly), interimUntouched);
+    assert.equal((await runRows(pool, interimOnly)).length, 0);
+    // A staging target is not gated: its first run publishes with neither.
+    const stagingOnly = (await createSchema()).schema;
+    await seedBaseCorpus(pool, stagingOnly);
+    const staged = await productionRun(productionEnvironment("staging", { PRIMARY_SCHEMA: stagingOnly,
+      ANALYTICS_V2_MEMORY_BUDGET_MIB: "1024" }));
+    assert.equal(staged.state, "complete");
+    assert.equal(staged.target, "staging");
+    assert.deepEqual(staged.baseline, { firstRun: true, frozenInterimRead: false });
+    assert.deepEqual(staged.revisionFloor, { present: false, dayCount: 0, maxRevision: 0 });
+    computed = 0;
+    // A floor alone cannot replace the frozen interim read on a first production run.
     await loadSpecFloor(pool, schema, { [DAY_2]: 3 });
+    const floorOnlyUntouched = await analyticsSnapshot(pool, schema);
+    await assert.rejects(productionRun(), (error) => {
+      assert.equal(error.code, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT");
+      assert.equal(error.phase, "read");
+      return true;
+    });
+    assert.equal(computed, 0, "floor-only first run computed nothing");
+    assert.deepEqual(await analyticsSnapshot(pool, schema), floorOnlyUntouched);
+    assert.equal((await runRows(pool, schema)).length, 0);
+    // Both baselines are required; with the frozen read loaded, production publishes above the floor.
+    await loadInterimPublicRead({ pool, schema, prepared });
     databases.length = 0;
     const before = Date.now();
     const run = await productionRun();
     assert.equal(run.state, "complete");
+    assert.deepEqual(run.baseline, { firstRun: true, frozenInterimRead: true });
     assert.deepEqual(run.revisionFloor, { present: true, dayCount: 1, maxRevision: 3 });
     assert.equal((await publishedRows(pool, schema)).get(DAY_2).revision, 4);
     assert.equal(run.target, "production");
@@ -3926,6 +3977,39 @@ test("PG17: the production target path runs a full refresh on the real clock and
     assert.deepEqual(run.timeGuard, { taskTimeoutSeconds: 14_400, plannedSeconds: null });
     assert.equal((await runRows(pool, schema)).length, 1);
   });
+});
+
+test("R19 (d): the production baseline gates are closed and fail closed on a malformed state", () => {
+  const floor = { present: true, dayCount: 1, maxRevision: 3 };
+  const noFloor = { present: false, dayCount: 0, maxRevision: 0 };
+  const cases = [
+    // [target, firstRun, frozenInterimRead, floor, refusal]
+    ["production", true, false, noFloor, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT"],
+    ["production", true, true, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
+    ["production", true, false, floor, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT"],
+    ["production", true, true, floor, null],
+    // A later run is gated by the floor only.
+    ["production", false, false, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
+    ["production", false, false, floor, null],
+    ["production", false, true, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
+    ["production", false, true, floor, null],
+    // Staging and test targets (null) are never gated here.
+    ["staging", true, false, noFloor, null],
+    [undefined, true, false, noFloor, null],
+    [null, true, false, noFloor, null],
+  ];
+  for (const [target, firstRun, frozenInterimRead, revisionFloor, refusal] of cases) {
+    assert.equal(job.analyticsRefreshBaselineRefusal({ target, baseline: { firstRun, frozenInterimRead }, revisionFloor }),
+      refusal, JSON.stringify({ target, firstRun, frozenInterimRead, revisionFloor }));
+  }
+  assert.deepEqual(job.analyticsRefreshBaseline({ firstRun: false, frozenInterimRead: true }),
+    { firstRun: false, frozenInterimRead: true });
+  // Anything but the store's booleans reads as a first run without the frozen read.
+  for (const state of [undefined, null, {}, { firstRun: 0, frozenInterimRead: 1 }, { firstRun: "false", frozenInterimRead: "true" }]) {
+    assert.deepEqual(job.analyticsRefreshBaseline(state), { firstRun: true, frozenInterimRead: false }, JSON.stringify(state));
+    assert.equal(job.analyticsRefreshBaselineRefusal({ target: "production", baseline: job.analyticsRefreshBaseline(state),
+      revisionFloor: noFloor }), "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT");
+  }
 });
 
 test("PG17: the time guard refuses with a receipt before the deadline and writes nothing", {

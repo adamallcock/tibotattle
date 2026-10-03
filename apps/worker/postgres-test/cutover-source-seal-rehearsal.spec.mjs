@@ -12,6 +12,7 @@ import {
   readDeletionDigestProjection,
 } from "../scripts/cutover-source-projections.mjs";
 import {
+  CUTOVER_ANALYTICS_BOOKMARK_ROLE,
   CutoverSourceError,
   openSealedSourceFromSeal,
   readCutoverInventory,
@@ -26,7 +27,13 @@ import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { advanceRun, assertStageComplete, beginRun } from "../scripts/postgres-transfer-target.mjs";
 import { SYNTHETIC_BOOKMARKS } from "./fixtures/w2-seal/fence-fixtures.mjs";
 import { createW2SealCluster } from "./fixtures/w2-seal/pg-target.mjs";
-import { headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
+import {
+  SYNTHETIC_UNCHANGED_BOOKMARKS,
+  headCommit,
+  outputPathsOf,
+  prepareSealWorld,
+  sealWorld,
+} from "./fixtures/w2-seal/seal-harness.mjs";
 import {
   SYNTHETIC_IDENTITY_LINK_SECRET,
   SYNTHETIC_IDENTITY_LINK_VERSION,
@@ -158,17 +165,25 @@ describe.skipIf(!PG_TEST_SOCKET)("W2-SEAL cutover source rehearsal on PostgreSQL
     // Unchanged sources: flip evidence; a moved bookmark refuses.
     const flipDirectory = await privateDirectory("w2-seal-flip-");
     outputs.push(flipDirectory);
-    const transport = createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_BOOKMARKS });
+    const transport = createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_UNCHANGED_BOOKMARKS });
+    const analyticsInputs = { analyticsSourcePath: world.analyticsSource, fenceReceiptPath: world.fence.path };
     const flip = await verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath,
-      sealId: seal.manifest.sealId, ownerDirectory: flipDirectory, execute: true, remote: true, ownerReadOnly: true,
-      transport });
+      sealId: seal.manifest.sealId, ...analyticsInputs, ownerDirectory: flipDirectory, execute: true, remote: true,
+      ownerReadOnly: true, transport });
     expect(flip.flipEvidenceSha256).toMatch(/^[0-9a-f]{64}$/u);
     const drifted = createFakeCutoverTransport({ sources: world.remotePaths,
-      bookmarks: { ...SYNTHETIC_BOOKMARKS, ingestion: "00000001-11111111-00000099" } });
+      bookmarks: { ...SYNTHETIC_UNCHANGED_BOOKMARKS, ingestion: "00000001-11111111-00000099" } });
     await expect(verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath, sealId: seal.manifest.sealId,
-      ownerDirectory: await privateDirectory("w2-seal-flip-drift-"), execute: true, remote: true, ownerReadOnly: true,
-      transport: drifted })).rejects.toSatisfy(error => error instanceof CutoverSourceError
+      ...analyticsInputs, ownerDirectory: await privateDirectory("w2-seal-flip-drift-"), execute: true, remote: true,
+      ownerReadOnly: true, transport: drifted })).rejects.toSatisfy(error => error instanceof CutoverSourceError
       && error.code === "CUTOVER_SOURCE_CHANGED_AFTER_SEAL");
+    // R19 (c): a Cloudflare publication after the fence moves the analytics bookmark.
+    const published = createFakeCutoverTransport({ sources: world.remotePaths,
+      bookmarks: { ...SYNTHETIC_UNCHANGED_BOOKMARKS, [CUTOVER_ANALYTICS_BOOKMARK_ROLE]: "00000001-22222222-00000099" } });
+    await expect(verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath, sealId: seal.manifest.sealId,
+      ...analyticsInputs, ownerDirectory: await privateDirectory("w2-seal-flip-analytics-"), execute: true, remote: true,
+      ownerReadOnly: true, transport: published })).rejects.toSatisfy(error => error instanceof CutoverSourceError
+      && error.code === "CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE");
 
     // Content-free outputs: no participant id, no signed URL, in any kept file
     // or the receipt (sealed SQLite files hold the data by design).

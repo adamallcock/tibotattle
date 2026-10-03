@@ -109,6 +109,7 @@ import {
   writePrivateFileOnce,
 } from "./cutover-source-seal.mjs";
 import { CUTOVER_FLIP_EVIDENCE_SCHEMA } from "./cutover-source-fence.mjs";
+import { fencedAnalyticsEntry } from "./cutover-admin-history-export.mjs";
 import {
   countSealedParticipantDeletionMatches,
   participantDeletionDigest,
@@ -1830,13 +1831,20 @@ export async function runImport(context, { execute = false, confirm = undefined,
 
 /**
  * Validate a PT-2 verify-unchanged flip evidence file against the seal:
- * schema, seal id, inventory and fence digests, and per source the bookmark,
- * schema and aggregate digests and the sealed file digest. `after` is the
+ * schema, seal id, inventory and fence digests, per source the bookmark,
+ * schema and aggregate digests and the sealed file digest, and (R19
+ * hardening (c), schema v2) the analytics D1's re-read bookmark, which must be
+ * the fence receipt's analytics entry (`fencedAnalytics`, read at the seal's
+ * pin from the inputs' fence receipt; check 'analytics'). `after` is the
  * instant its verifiedAt must follow (CUTOVER_FLIP_EVIDENCE_STALE).
  */
-export async function validateFlipEvidence(path, seal, { afterMs }) {
+export async function validateFlipEvidence(path, seal, { afterMs, fencedAnalytics }) {
+  if (!record(fencedAnalytics) || typeof fencedAnalytics.idSha256 !== "string" || !SHA256.test(fencedAnalytics.idSha256)
+      || typeof fencedAnalytics.bookmark !== "string" || fencedAnalytics.bookmark.length === 0) {
+    fail("CUTOVER_ARGUMENT_INVALID");
+  }
   const { value, sha256 } = await readOwnerJson(absolutePath(path, "CUTOVER_FLIP_EVIDENCE_INVALID"), "CUTOVER_FLIP_EVIDENCE_INVALID");
-  exactKeys(value, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "verifiedAt", "sources"],
+  exactKeys(value, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "verifiedAt", "sources", "analytics"],
     "CUTOVER_FLIP_EVIDENCE_INVALID");
   const manifest = seal.manifest;
   if (value.schema !== CUTOVER_FLIP_EVIDENCE_SCHEMA || value.sealId !== manifest.sealId
@@ -1855,10 +1863,19 @@ export async function validateFlipEvidence(path, seal, { afterMs }) {
       fail("CUTOVER_FLIP_EVIDENCE_INVALID", { role });
     }
   });
+  exactKeys(value.analytics, ["databaseIdSha256", "bookmark"], "CUTOVER_FLIP_EVIDENCE_INVALID", { check: "analytics" });
+  if (value.analytics.databaseIdSha256 !== fencedAnalytics.idSha256 || value.analytics.bookmark !== fencedAnalytics.bookmark) {
+    fail("CUTOVER_FLIP_EVIDENCE_INVALID", { check: "analytics" });
+  }
   const verifiedMs = instantMs(value.verifiedAt);
   if (verifiedMs === null) fail("CUTOVER_FLIP_EVIDENCE_INVALID");
   if (!Number.isFinite(afterMs) || verifiedMs <= afterMs) fail("CUTOVER_FLIP_EVIDENCE_STALE");
   return Object.freeze({ sha256, verifiedAt: value.verifiedAt });
+}
+
+/** The fence receipt's analytics entry, read at the seal's pin (the flip evidence's analytics anchor). */
+async function flipFencedAnalytics(context, seal) {
+  return fencedAnalyticsEntry(context.inputs.fenceReceiptPath, seal.manifest.fence?.fenceReceiptSha256);
 }
 
 async function finalizeFacts(context) {
@@ -1890,7 +1907,8 @@ export async function releaseControls(context, { flipEvidencePath, execute = fal
   const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
   const { handle, run, released, flipGate } = await finalizeFacts(context);
   assertStepOrder("release-controls", { runState: run?.state ?? null, released, flipGate });
-  const evidence = await validateFlipEvidence(flipEvidencePath, seal, { afterMs: Date.parse(run.verifiedAt) });
+  const evidence = await validateFlipEvidence(flipEvidencePath, seal, { afterMs: Date.parse(run.verifiedAt),
+    fencedAnalytics: await flipFencedAnalytics(context, seal) });
   // A rerun must name the same flip-1 evidence; it then restores the same
   // values again and keeps the first release instant, so the receipt is equal.
   const prior = released ? (await readRelease(context, run)).release : null;
@@ -1929,7 +1947,8 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
   // E2 must be fresh evidence taken after the release (F2): later than the
   // recorded release instant (and so than E1), and never E1 again.
   const evidence = await validateFlipEvidence(flipEvidencePath, seal,
-    { afterMs: Math.max(instantMs(release.releasedAt), instantMs(release.flipEvidenceVerifiedAt)) });
+    { afterMs: Math.max(instantMs(release.releasedAt), instantMs(release.flipEvidenceVerifiedAt)),
+      fencedAnalytics: await flipFencedAnalytics(context, seal) });
   if (evidence.sha256 === release.flipEvidenceSha256) fail("CUTOVER_FLIP_EVIDENCE_STALE");
   // The frozen read must be the export post-import loaded (post-import.json,
   // bound to the committed stage receipt), not merely some row with id = 1.

@@ -69,7 +69,14 @@ import {
   writeAnalyticsSourceFixture,
 } from "./fixtures/w2-seal/admin-history-fixtures.mjs";
 import { createW2SealCluster, PRIMARY_SCHEMA, TRANSFER_ROLE, localSocket } from "./fixtures/w2-seal/pg-target.mjs";
-import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
+import {
+  SYNTHETIC_UNCHANGED_BOOKMARKS,
+  forgeVariantSeal,
+  headCommit,
+  outputPathsOf,
+  prepareSealWorld,
+  sealWorld,
+} from "./fixtures/w2-seal/seal-harness.mjs";
 import {
   SYNTHETIC_BOOKMARKS,
   SYNTHETIC_D1,
@@ -283,8 +290,9 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
   async function flipEvidence(directoryName, { manifest = manifestPath, sealId = seal.manifest.sealId } = {}) {
     const out = await privateDirectory(`ept8-${directoryName}-`);
     const result = await verifyCutoverUnchanged({ inventoryPath: world.inventory.path, manifestPath: manifest, sealId,
+      analyticsSourcePath: world.analyticsSource, fenceReceiptPath: world.fence.path,
       ownerDirectory: out, execute: true, remote: true, ownerReadOnly: true,
-      transport: createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_BOOKMARKS }) });
+      transport: createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_UNCHANGED_BOOKMARKS }) });
     return { path: result.path, sha256: result.flipEvidenceSha256 };
   }
 
@@ -987,6 +995,22 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     await writePrivateFileOnce(tamperedPath, `${JSON.stringify(tampered)}\n`, 0o400);
     expect(await codeOf(releaseControls(await context(target, directory), { flipEvidencePath: tamperedPath })))
       .toBe("CUTOVER_FLIP_EVIDENCE_INVALID");
+    // R19 (c): the analytics D1's re-read bookmark must be the fence receipt's
+    // analytics pin, and v2 evidence must carry it.
+    for (const [label, mutate] of [
+      ["another analytics bookmark", value => { value.analytics.bookmark = "00000001-22222222-00000008"; }],
+      ["another analytics D1", value => { value.analytics.databaseIdSha256 = "e".repeat(64); }],
+      ["no analytics entry", value => { delete value.analytics; }],
+      ["an extra analytics key", value => { value.analytics.at = "x"; }],
+      ["the v1 schema", value => { value.schema = "tibotattle-cutover-flip-evidence-v1"; delete value.analytics; }],
+    ]) {
+      const value = JSON.parse(await readFile(fresh.path, "utf8"));
+      mutate(value);
+      const mutatedPath = join(await privateDirectory("ept8-analytics-tamper-"), "flip-evidence.json");
+      await writePrivateFileOnce(mutatedPath, `${JSON.stringify(value)}\n`, 0o400);
+      expect(await codeOf(releaseControls(await context(target, directory), { flipEvidencePath: mutatedPath })), label)
+        .toBe("CUTOVER_FLIP_EVIDENCE_INVALID");
+    }
     // Abandon (pre-live): dry run, token, then the target is spent for any later run.
     const abandonDry = await abandon(await context(target, directory));
     expect(await codeOf(abandon(await context(target, directory), { execute: true, confirm: preflight.runAuthorizationToken })))

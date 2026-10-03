@@ -41,6 +41,7 @@ import {
   type AnalyticsV2RunResources,
 } from "./contract";
 import { ANALYTICS_V2_NO_EXCLUSIONS_SHA256 } from "./exclusions";
+import { INTERIM_PUBLIC_READ_ROW_ID, INTERIM_PUBLIC_READ_TABLE } from "./interim-public-read";
 import { validAnalyticsV2KernelEntry, type AnalyticsV2RunStamp } from "./kernel";
 import {
   ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS,
@@ -1119,6 +1120,18 @@ export interface AnalyticsV2RefreshState {
    * day rows whatever the target.
    */
   readonly revisionFloor: AnalyticsV2RevisionFloorSummary;
+  /**
+   * R19 hardening (d): true when this is a first run, that is no completed
+   * run row exists or no journal cursor is recorded (the frontier a run
+   * advances from).
+   */
+  readonly firstRun: boolean;
+  /**
+   * R19 hardening (d): whether the frozen interim public read (C-IPR's single
+   * community_daily_frozen_export row) is loaded; false when the table is
+   * absent. Presence only: the route and the owner-set reader verify it.
+   */
+  readonly frozenInterimRead: boolean;
 }
 
 /** The content-free summary of the revision floor a run reads (REV-SEED). */
@@ -1130,7 +1143,8 @@ export interface AnalyticsV2RevisionFloorSummary {
 
 /**
  * Read the cursor, the carried blocked days, the cache floor, the applied
- * exclusions digest, the published days and the revision floor's summary.
+ * exclusions digest, the published days, the revision floor's summary, and
+ * whether this is a first run and the frozen interim read is loaded.
  * Runs in the caller's transaction
  * (the Job's read snapshot).
  */
@@ -1148,6 +1162,7 @@ export async function readAnalyticsV2RefreshState(
   let floorRows: { day: unknown }[];
   let publishedRows: { day: unknown }[];
   let revisionFloorRows: { day_count: unknown; max_revision: unknown }[];
+  let interimRows: { loaded: unknown }[];
   try {
     cursorRows = rowsOf(await client.query(
       `SELECT last_sequence::text AS last_sequence
@@ -1171,6 +1186,17 @@ export async function readAnalyticsV2RefreshState(
       `SELECT day_count, max_revision FROM ${relation(schema, ANALYTICS_V2_REVISION_FLOOR_TABLES.revisionFloorSource)} WHERE id=$1`,
       [ANALYTICS_V2_SINGLETON_ID],
     ), "ANALYTICS_V2_READ_FAILED");
+    // The frozen interim read: an absent table reads as no row (it is never
+    // created by this code, and the route treats it the same way).
+    const interimRelation = relation(schema, INTERIM_PUBLIC_READ_TABLE);
+    const interimTable = rowsOf<{ present: unknown }>(await client.query(
+      "SELECT to_regclass($1) IS NOT NULL AS present", [interimRelation],
+    ), "ANALYTICS_V2_READ_FAILED");
+    interimRows = interimTable[0]?.present === true
+      ? rowsOf(await client.query(
+        `SELECT EXISTS (SELECT 1 FROM ${interimRelation} WHERE id=$1) AS loaded`, [INTERIM_PUBLIC_READ_ROW_ID],
+      ), "ANALYTICS_V2_READ_FAILED")
+      : [{ loaded: false }];
   } catch (error) {
     if (error instanceof AnalyticsV2StoreError) throw error;
     const sqlState = sqlStateOf(error);
@@ -1208,6 +1234,8 @@ export async function readAnalyticsV2RefreshState(
     ? Object.freeze({ present: false, dayCount: 0, maxRevision: 0 })
     : Object.freeze({ present: true, dayCount: floorRow.day_count as number,
       maxRevision: floorRow.max_revision as number });
+  const frozenInterimRead = interimRows[0]?.loaded;
+  if (interimRows.length !== 1 || typeof frozenInterimRead !== "boolean") fail("ANALYTICS_V2_STATE_INVALID", "interimRead");
   return Object.freeze({
     cursor,
     carriedBlockedDays: Object.freeze(sortedDays(blocked as AnalyticsV2Day[])),
@@ -1215,5 +1243,7 @@ export async function readAnalyticsV2RefreshState(
     appliedExclusionsSha256: (applied as string | null) ?? ANALYTICS_V2_NO_EXCLUSIONS_SHA256,
     publishedDays: Object.freeze(publishedDays as AnalyticsV2Day[]),
     revisionFloor,
+    firstRun: runRows.length === 0 || cursor === null,
+    frozenInterimRead,
   });
 }

@@ -157,7 +157,7 @@ prove them.
 |---|---|
 | EP-8 quiet window | `verify` succeeds only when now is at least `appliedAt` + 2 x the plan's quiet window + 5 minutes of analytics lag: 35 minutes after `apply` at the 15-minute minimum. `appliedAt` is when `apply` finished, not when the fenced deploy ran |
 | Seal bookmarks | The bookmark before the export equals the fence receipt's, and the one after equals the one before |
-| Flip evidence | Re-read just before the flip. Any drift fails `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` |
+| Flip evidence | Re-read just before the flip. Any drift fails `CUTOVER_SOURCE_CHANGED_AFTER_SEAL`; the analytics D1's bookmark, read before and after the sealed sources, must equal the fence receipt's analytics pin, else `CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE` |
 | Origin readiness | Goes stale 2 hours after the last maintenance pass |
 | Backup audit (rollout) | At most 6 hours old |
 | Edge live capture (rollout) | At most 15 minutes old |
@@ -456,10 +456,24 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    id, the fence receipt's sha256, the source commit and the sha256 of the
    bookmark) and prints the file's sha256 (the `floorSha256` the inputs pin),
    the day count, the largest revision and the first and last day; never the
-   bookmark, a database id or a source id. `node scripts/cutover-revision-floor.mjs
-   check --floor <file> --sha256 <hex> --seal <manifest> --seal-id <sealId>`
-   re-validates it offline. `built` (REV-SEED); the provider has never been
-   contacted. The dress rehearsal does not capture: it loads a synthetic floor
+   bookmark, a database id or a source id. Re-validate it offline, as P16
+   will:
+
+   ```bash
+   node scripts/cutover-revision-floor.mjs check --floor <file> --sha256 <hex> \
+     --seal <manifest> --seal-id <sealId> --fence-receipt <EP-8 verify receipt>
+   ```
+
+   The check reads the fence receipt at the digest the seal pins (a released
+   fence is `CUTOVER_FENCE_RECEIPT_INVALID`) and refuses a captured floor
+   whose capture block names another analytics D1 or bookmark with P16's
+   code, `REVISION_FLOOR_CAPTURE_FENCE_MISMATCH`, and a synthetic floor with
+   `REVISION_FLOOR_PROVENANCE_REFUSED` unless the dress rehearsal adds
+   `--dress-rehearsal-synthetic-revision-floor` (which in turn refuses a
+   captured floor). It prints `fenceBound: true` for a captured floor. It does
+   not compare the floor with the frozen export; P16 still does
+   (`REVISION_FLOOR_BELOW_FROZEN_EXPORT`). `built` (REV-SEED, R19 hardening
+   (b)); the provider has never been contacted. The dress rehearsal does not capture: it loads a synthetic floor
    (round 14), written by `cutover-revision-floor.mjs synthetic` from its seal
    and its frozen export (each frozen day at its frozen revision), and its
    `pt8-inputs.json` declares the owner flag
@@ -568,13 +582,31 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
 
      ```bash
      node scripts/cutover-source-fence.mjs verify-unchanged --inventory <private seal inventory> \
-       --seal <seal manifest> --seal-id <sealId> --out <owner dir>/flip-1 --execute --remote --owner-read-only
+       --seal <seal manifest> --seal-id <sealId> --analytics-source <private analytics source file> \
+       --fence-receipt <EP-8 verify receipt> --out <owner dir>/flip-1 --execute --remote --owner-read-only
      ```
 
-     It writes `flip-evidence.json` (`0400`, never overwritten) or fails
-     `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` (a fence breach: abort).
+     The analytics source file is H.3 step 6's (the same file the floor
+     capture read); it must name the D1 the fence receipt records (read at the
+     seal's pin) and no sealed D1 (`CUTOVER_FENCE_SOURCE_MISMATCH`,
+     `CUTOVER_SOURCE_NOT_ALLOWED`, before any remote read). Read-only and
+     bookmark-bracketed like the capture: through the non-sealable role
+     `analytics-bookmark`, which admits no statement at all
+     (`CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED`), it reads the analytics D1's
+     bookmark before the first sealed read and again after the last, and both
+     must equal the fence receipt's analytics pin, the bookmark the revision
+     floor's capture started from. It writes `flip-evidence.json` (`0400`,
+     never overwritten; schema `tibotattle-cutover-flip-evidence-v2`, which
+     adds the analytics D1's id digest and re-read bookmark) or fails
+     `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` (a sealed source moved) or
+     `CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE` (Cloudflare published after the
+     floor was captured, so the floor may be below its last revision). Either
+     is a fence breach: abort. R19 hardening (c), REV-SEED design step 4.
    - `node $S release-controls --flip-evidence <flip-1>/flip-evidence.json`
-     (protected) restores the sealed collection controls exactly. Without
+     (protected) checks the evidence against the seal and its analytics entry
+     against the fence receipt at `fenceReceiptPath`
+     (`CUTOVER_FLIP_EVIDENCE_INVALID [check=analytics]`; `flip-gate` checks
+     flip-2 the same way), then restores the sealed collection controls exactly. Without
      it, enrollment and publication stay disabled after the switch. It then
      reads the database clock once, after the restore commits, and records it
      as `releasedAt` in `release-controls.json`. A rerun keeps that instant.
@@ -811,7 +843,9 @@ link is not `active`; D-PT5A refuses it before the stage touches the target),
 `CUTOVER_RUNTIME_RESET_NOT_AT_SEED`, `CUTOVER_BOOTSTRAP_TARGET_INVALID`,
 `CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID`, `CUTOVER_COVERAGE_RECEIPT_MISSING`,
 `CUTOVER_COVERAGE_RECEIPT_MISMATCH`, `CUTOVER_COVERAGE_RECEIPT_UNEXPECTED`,
-`CUTOVER_PARITY_SAMPLE_MISMATCH` (with the class), `CUTOVER_FLIP_EVIDENCE_INVALID`,
+`CUTOVER_PARITY_SAMPLE_MISMATCH` (with the class), `CUTOVER_FLIP_EVIDENCE_INVALID`
+(with `check=analytics` when the evidence is v1 or its analytics entry is not
+the fence receipt's analytics D1 and bookmark),
 `CUTOVER_FLIP_EVIDENCE_STALE`, `CUTOVER_INTERIM_READ_NOT_LOADED` (the frozen
 read is absent, or is not the export post-import loaded),
 `CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `REVISION_FLOOR_CONFLICT` and
@@ -1108,7 +1142,18 @@ resume. `owner`.
    production run with no floor loaded refuses
    `ANALYTICS_V2_REVISION_FLOOR_ABSENT` before reading anything and writes
    nothing (the H.4 import has not run its `analytics-community-history`
-   stage); staging and test targets publish from r1 without one. The production contract of the
+   stage); staging and test targets publish from r1 without one. Before that
+   check, a production FIRST run (no completed run row, or no recorded
+   journal cursor) without the frozen interim read loaded, even when the floor
+   is loaded,
+   refuses `ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT`, also before any read and
+   writing nothing: it would otherwise record every day's first owner set
+   without the frozen record of Cloudflare's published history (R19 hardening (d),
+   in addition to the flip gate's `CUTOVER_INTERIM_READ_NOT_LOADED`). The
+   receipt's `baseline` reads `{firstRun, frozenInterimRead}`; this first
+   manual run must show `firstRun: true` and `frozenInterimRead: true`.
+   Staging and test targets, with or without a synthetic floor, are not
+   gated. The production contract of the
    job (bounded history loading, output accounting, a time guard) is `built`
    (C-REFRESH); the measured dense run took 66 minutes on a test seed, and the
    production figure is unmeasured.
@@ -1251,7 +1296,10 @@ noted.
 | `FENCE_WINDOW_TOO_SHORT`, `FENCE_WINDOW_TOO_EARLY` | EP-8 verify | Run too soon: wait until `appliedAt` + 2 x the quiet window + 5 minutes (35 minutes at the minimum), or fix the `--window-start` |
 | `FENCE_NOT_QUIESCENT` | EP-8 verify | A D1 bookmark or the quarantine digest moved inside the window: something wrote after the fence. Find the writer; do not shorten the window |
 | `CUTOVER_SOURCE_BOOKMARK_DRIFT`, `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` | Seal, revision floor, flip evidence | A source changed after the fence. The seal (or the floor) is void |
+| `CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE` | Flip evidence | The analytics D1's bookmark moved after the fence: Cloudflare published after the revision floor's capture. The floor is void; abort, fence and seal again |
+| `CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED` | Flip evidence | A statement was sent through the bookmark-only role `analytics-bookmark`. A tooling defect: stop |
 | `ANALYTICS_V2_REVISION_FLOOR_ABSENT` | H.8 | A production refresh found no revision floor. The import's `analytics-community-history` stage has not loaded it; never run the production refresh before it has |
+| `ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT` | H.8 | A production first run found no frozen interim read, even if the revision floor is loaded: the H.4 import has not run (or ran against another schema). Nothing was written; never run the production refresh before H.4 is live |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PARTICIPANT_ERASURE_PENDING` | Seal, PT-3 | An erased or mid-erasure participant is in the sealed set. Finish the erasure on Cloudflare and re-seal |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH` | PT-3 | The configured pin, or under round 16 the rotation's `from`, does not match the sealed pin. Rotate only through the recorded [identity-link rotation](#identity-link-rotation-round-16) |
 | `CUTOVER_IDENTITY_ROTATION_STATE_INVALID` | Run, post-import, flip gate, post-live | The target pin is neither the rotation's `from` nor its completed `to` for this run, or (without a rotation) differs from the pin. Something wrote the pin row outside the orchestrator: diagnose, never bypass |
@@ -1276,7 +1324,7 @@ line at `2b5c90cd`.
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | `built` (C-ADMIN, ADMIN-R12): the production and staging composition opens the admin host behind the Access chokepoint (round 12). The overview is `admin-overview-v0.6`: the synthetic-contribution counts, historical publication and deletion-ledger blocks answer `{"status":"unavailable"}` until their sources exist (E-ADMIN); database health is `admin-database-health-v0.2`, the removed ledger `not_applicable`. The admin UI that reads both versions ships with the edge Worker; local proof only |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
-| Revision floor: capture, load, refresh refusal | H.3, H.4, H.8 | `built` (REV-SEED) on synthetic data and a local PostgreSQL 17 target only; its migration is promoted as primary `0071`; the capture has never contacted the provider |
+| Revision floor: capture, load, refresh refusal | H.3, H.4, H.8 | `built` (REV-SEED) on synthetic data and a local PostgreSQL 17 target only; its migration is promoted as primary `0071`; the capture has never contacted the provider. R19 hardenings `built` the same way: the offline check binds the fence (b), verify-unchanged re-reads the analytics bookmark (c), a production first run requires the frozen read and every production run requires the floor (d) |
 | Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |

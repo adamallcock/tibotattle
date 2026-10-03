@@ -13,7 +13,14 @@
 //                     through the injected read-only transport and re-hash the
 //                     sealed files; emit flip-evidence.json (0400)
 //                     with its sha256 only when everything equals the seal,
-//                     else CUTOVER_SOURCE_CHANGED_AFTER_SEAL.
+//                     else CUTOVER_SOURCE_CHANGED_AFTER_SEAL. The analytics
+//                     D1 (never sealed) is bracketed around those reads: its
+//                     bookmark, read before and after through the bookmark-only
+//                     role 'analytics-bookmark', must both equal the fence
+//                     receipt's analytics pin (the bookmark the revision
+//                     floor's capture also started from), else
+//                     CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE (R19 hardening (c),
+//                     REV-SEED design step 4).
 //
 // Every output is content-free: digests, bookmarks (opaque provider tokens
 // the fence receipt already pins), counts, roles and table names.
@@ -22,7 +29,9 @@ import { resolve, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import { readCloudflareWriterFenceReceipt } from "./cloudflare-writer-fence.mjs";
+import { fencedAnalyticsEntry, readCutoverAnalyticsSource } from "./cutover-admin-history-export.mjs";
 import {
+  CUTOVER_ANALYTICS_BOOKMARK_ROLE,
   CUTOVER_SEALABLE_SOURCES,
   CUTOVER_SOURCE_ROLES,
   CutoverSourceError,
@@ -43,7 +52,8 @@ import {
 
 export const CUTOVER_BARRIER_PROOF_SCHEMA = "tibotattle-cutover-barrier-proof-v1";
 export const CUTOVER_FENCE_VERIFICATION_SCHEMA = "tibotattle-cutover-fence-verification-v1";
-export const CUTOVER_FLIP_EVIDENCE_SCHEMA = "tibotattle-cutover-flip-evidence-v1";
+/** v2 (R19 hardening (c)): the evidence also carries the analytics D1's fenced bookmark, re-read. */
+export const CUTOVER_FLIP_EVIDENCE_SCHEMA = "tibotattle-cutover-flip-evidence-v2";
 export const CUTOVER_BARRIER_RETRY_AFTER = "300";
 export const CUTOVER_BARRIER_ERROR_CODE = "MUTATION_BARRIER_ACTIVE";
 
@@ -210,19 +220,43 @@ export async function verifyCutoverFence({
 }
 
 /**
+ * The analytics D1 verify-unchanged brackets (R19 hardening (c)): the owner's
+ * 0600 analytics source file, which must name the D1 the fence receipt (read
+ * at the digest the seal pins, by the EP-8 consumer-side reader, which also
+ * refuses a released fence) records, and never a sealed D1. Local files only.
+ */
+async function fencedAnalyticsSource({ inventory, seal, analyticsSourcePath, fenceReceiptPath }) {
+  if (typeof analyticsSourcePath !== "string" || typeof fenceReceiptPath !== "string") fail("CUTOVER_ARGUMENT_INVALID");
+  const analytics = await readCutoverAnalyticsSource(analyticsSourcePath);
+  if (Object.values(inventory.sources).some(source => source.databaseIdSha256 === analytics.databaseIdSha256)) {
+    fail("CUTOVER_SOURCE_NOT_ALLOWED");
+  }
+  const fenced = await fencedAnalyticsEntry(fenceReceiptPath, seal.manifest.fence.fenceReceiptSha256);
+  if (fenced.idSha256 !== analytics.databaseIdSha256) fail("CUTOVER_FENCE_SOURCE_MISMATCH");
+  return Object.freeze({ source: Object.freeze({ ...analytics, role: CUTOVER_ANALYTICS_BOOKMARK_ROLE }), fenced });
+}
+
+/**
  * verify-unchanged --seal: every bookmark, schema digest and aggregate digest
  * read now through the read-only transport must equal the seal, and every
- * sealed file must still hash to its manifest digest. Only then is the
- * flip evidence written (0400) and its sha256 returned. Without an injected
- * transport the default Wrangler transport runs with the given spawn, CLI
- * path and environment (their defaults when omitted); its pinned configs are
- * removed on success and on failure, so the owner directory then holds only
- * flip-evidence.json, or nothing.
+ * sealed file must still hash to its manifest digest. The analytics D1's
+ * bookmark is read before the first and after the last sealed read, through
+ * the bookmark-only role (no statement is admitted on it), and both reads
+ * must equal the fence receipt's analytics pin
+ * (CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE): the revision floor's capture
+ * started from that bookmark, so Cloudflare published nothing after it. Only
+ * then is the flip evidence written (0400) and its sha256 returned. Without
+ * an injected transport the default Wrangler transport runs with the given
+ * spawn, CLI path and environment (their defaults when omitted); its pinned
+ * configs are removed on success and on failure, so the owner directory then
+ * holds only flip-evidence.json, or nothing.
  */
 export async function verifyCutoverUnchanged({
   inventoryPath,
   manifestPath,
   sealId,
+  analyticsSourcePath,
+  fenceReceiptPath,
   ownerDirectory,
   execute = false,
   remote = false,
@@ -238,6 +272,7 @@ export async function verifyCutoverUnchanged({
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
   const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
   if (seal.manifest.inventorySha256 !== inventory.inventorySha256) fail("CUTOVER_SEAL_MANIFEST_INVALID");
+  const analytics = await fencedAnalyticsSource({ inventory, seal, analyticsSourcePath, fenceReceiptPath });
   for (const role of CUTOVER_SOURCE_ROLES) {
     const sealed = await openSealedSourceFromSeal(seal, role);
     try {
@@ -250,12 +285,17 @@ export async function verifyCutoverUnchanged({
     return Object.freeze({ mode: "dry-run", sealId, sources: CUTOVER_SOURCE_ROLES.length });
   }
   if (remote !== true || ownerReadOnly !== true) fail("CUTOVER_REMOTE_NOT_AUTHORIZED");
+  // The transport sees the sealed sources and, as the bookmark-only role, the analytics D1.
+  const scope = Object.freeze({ ...inventory,
+    sources: Object.freeze({ ...inventory.sources, [CUTOVER_ANALYTICS_BOOKMARK_ROLE]: analytics.source }) });
   let ownedTransport = null;
   try {
     ownedTransport = transport === undefined ? createWranglerCutoverTransport({
-      inventory, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
+      inventory: scope, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
     }) : null;
-    const guarded = guardCutoverTransport(transport ?? ownedTransport, inventory);
+    const guarded = guardCutoverTransport(transport ?? ownedTransport, scope);
+    const analyticsBefore = await guarded.bookmark(analytics.source);
+    if (analyticsBefore !== analytics.fenced.bookmark) fail("CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE");
     const sources = [];
     for (const role of CUTOVER_SOURCE_ROLES) {
       const sealedSource = seal.sources[role];
@@ -278,6 +318,8 @@ export async function verifyCutoverUnchanged({
         sealedSha256: sealedSource.sealedSha256,
       }));
     }
+    const analyticsAfter = await guarded.bookmark(analytics.source);
+    if (analyticsAfter !== analyticsBefore) fail("CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE");
     await ownedTransport?.dispose();
     const verifiedAt = now().toISOString();
     const evidence = {
@@ -287,6 +329,7 @@ export async function verifyCutoverUnchanged({
       fenceReceiptSha256: seal.manifest.fence.fenceReceiptSha256,
       verifiedAt,
       sources,
+      analytics: Object.freeze({ databaseIdSha256: analytics.fenced.idSha256, bookmark: analyticsAfter }),
     };
     const text = `${canonicalJson(evidence)}\n`;
     if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
@@ -309,7 +352,7 @@ function parseArguments(argv) {
   if (!["verify-fence", "verify-unchanged"].includes(command)) fail("CUTOVER_ARGUMENT_INVALID");
   const values = { "--inventory": "inventoryPath", "--fence-receipt": "fenceReceiptPath",
     "--fence-sha256": "fenceReceiptSha256", "--barrier-proof": "barrierProofPath", "--seal": "manifestPath",
-    "--seal-id": "sealId", "--out": "ownerDirectory" };
+    "--seal-id": "sealId", "--analytics-source": "analyticsSourcePath", "--out": "ownerDirectory" };
   const switches = { "--remote": "remote", "--owner-read-only": "ownerReadOnly", "--execute": "execute" };
   const options = { command };
   for (let index = 0; index < rest.length; index += 1) {
@@ -345,6 +388,8 @@ async function main(argv) {
     inventoryPath: resolve(options.inventoryPath),
     manifestPath: options.manifestPath === undefined ? undefined : resolve(options.manifestPath),
     sealId: options.sealId,
+    analyticsSourcePath: options.analyticsSourcePath === undefined ? undefined : resolve(options.analyticsSourcePath),
+    fenceReceiptPath: options.fenceReceiptPath === undefined ? undefined : resolve(options.fenceReceiptPath),
     ownerDirectory: options.ownerDirectory === undefined ? undefined : resolve(options.ownerDirectory),
     execute: options.execute === true,
     remote: options.remote === true,
