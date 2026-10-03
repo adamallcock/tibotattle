@@ -126,6 +126,8 @@ export const REFUSAL_SITES = Object.freeze({
   "scripts/cloud-run-production-configuration.check.mjs": { "LEDGER_*": 3 },
   "scripts/gcp-backup-horizon.check.mjs": { "role:'ledger'": 1 },
   "scripts/gcp-ops-infra-manifest.check.mjs": { "LEDGER_*": 6 },
+  // The staging service template refuses an injected LEDGER_SCHEMA (STG-PREP).
+  "scripts/gcp-ops-infra-staging-service.check.mjs": { "LEDGER_*": 1 },
   "scripts/gcp-test-database.check.mjs": { "role:'ledger'": 2, "LEDGER_*": 4 },
   "scripts/postgres-migrations.check.mjs": { "role:'ledger'": 2 },
   "scripts/postgres-transfer-target.check.mjs": { ledgerPool: 1 },
