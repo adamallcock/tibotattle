@@ -1123,8 +1123,11 @@ export function runV12EventSourcesProduction(options) {
 // PostgreSQL's runtime is operationally staged and records D1's state in
 // source_state (primary 0034): importing a sealed 'active' runtime enables
 // nothing. The evidence tables are imported verbatim when present (the
-// PT-8-lite correction gate decides whether a populated seal may proceed),
-// and the transient cas guard must be empty.
+// PT-8-lite correction gate decides whether a populated seal may proceed)
+// for active owners only: history of a withdrawn owner is refused in the
+// sealed-side preflight (CUTOVER_CORRECTION_OWNER_NOT_ACTIVE) because
+// PostgreSQL's insert guards would refuse it mid-stage. The transient cas
+// guard must be empty.
 
 const CORRECTION = "usage-correction";
 const CORRECTION_IMPORTED = `imported:${CORRECTION}`;
@@ -1148,12 +1151,16 @@ const CORRECTION_HISTORY_COLUMNS = Object.freeze([
 const CORRECTION_HISTORY = defineTable({
   name: "telemetry_usage_correction_history", key: ["id"], token: CORRECTION_IMPORTED,
   columns: CORRECTION_HISTORY_COLUMNS.map(([name, make]) => make(name)),
-  fire: { telemetry_usage_correction_history_guard: "Insert guard: the participant must be active and its owner link active; it holds for the sealed rows." },
+  fire: {
+    telemetry_usage_correction_history_guard: "Insert guard: the participant and its owner link must be active; the sealed-side preflight refuses any history whose participant or link is not (CUTOVER_CORRECTION_OWNER_NOT_ACTIVE), so it holds for the sealed rows.",
+  },
 });
 const CORRECTION_FACTS = defineTable({
   name: "telemetry_usage_correction_facts", key: ["id"], token: CORRECTION_IMPORTED,
   columns: [i64("id"), i64("history_id"), i16("method_version"), i64("captured_at_ms")],
-  fire: { telemetry_usage_correction_fact_guard: "Insert guard: the fact must name its history row; it holds for the sealed rows." },
+  fire: {
+    telemetry_usage_correction_fact_guard: "Insert guard: the fact must name its history row, whose participant and owner link must be active; the sealed-side preflight proves both, so it holds for the sealed rows.",
+  },
 });
 const CORRECTION_ITEMS = Object.freeze([CORRECTION_RUNTIME, CORRECTION_HISTORY, CORRECTION_FACTS]
   .map(spec => Object.freeze({ kind: "table", spec })));
@@ -1164,7 +1171,7 @@ const CORRECTION_DEFINITION = Object.freeze({
   schemaTag: SCHEMA_TAG(CORRECTION),
   prerequisites: Object.freeze(["identity-authority", "typed-legacy", "legacy-admission"]),
   items: CORRECTION_ITEMS,
-  extraSealed: Object.freeze([...CORRECTION_MUST_BE_EMPTY]),
+  extraSealed: Object.freeze([...CORRECTION_MUST_BE_EMPTY, "participants", "storage_v11_owner_links"]),
   policySha256: stagePolicySha256(CORRECTION, CORRECTION_ITEMS, [CORRECTION_MUST_BE_EMPTY]),
   sourcePreflight({ database, facts }) {
     if (facts.get("telemetry_usage_correction_runtime").rows !== 1) {
@@ -1182,6 +1189,17 @@ const CORRECTION_DEFINITION = Object.freeze({
       LEFT JOIN telemetry_usage_correction_facts fact ON fact.history_id = history.id AND fact.method_version = 1
       WHERE fact.id IS NULL`, [], "telemetry_usage_correction_history");
     if (orphan !== 0 || missing !== 0) fail("CUTOVER_SOURCE_LINEAGE_INVALID", { table: "telemetry_usage_correction_facts" });
+    // D1 keeps correction history when an owner withdraws and deletes it only on erasure, so a sealed state can hold history
+    // for a withdrawn owner. PostgreSQL's insert guards (primary 0034) admit history and facts only for an active participant
+    // with an active owner link, so such a page would refuse mid-stage, after the runtime page had committed. Refuse it here,
+    // before the target is touched. Carrying that history needs an owner decision and a recorded guard suppression, as for
+    // the typed memberships; until then the PT-8-lite correction gate (history and facts empty) holds the same line.
+    const inactive = sourceCount(database, `SELECT count(*) AS n FROM telemetry_usage_correction_history history
+      LEFT JOIN participants participant ON participant.id = history.participant_id
+      LEFT JOIN storage_v11_owner_links owner_link ON owner_link.participant_id = history.participant_id
+        AND owner_link.owner_digest = lower(hex(history.owner_digest))
+      WHERE participant.state IS NOT 'active' OR owner_link.state IS NOT 'active'`, [], "telemetry_usage_correction_history");
+    if (inactive !== 0) fail("CUTOVER_CORRECTION_OWNER_NOT_ACTIVE", { table: "telemetry_usage_correction_history" });
     const [runtime] = sourceAll(database, "SELECT state FROM telemetry_usage_correction_runtime WHERE id = 1", [],
       "telemetry_usage_correction_runtime");
     return Object.freeze({ runtimeSourceState: runtime.state, history: facts.get("telemetry_usage_correction_history").rows,

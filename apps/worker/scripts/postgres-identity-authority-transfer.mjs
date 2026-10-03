@@ -784,50 +784,48 @@ async function targetCount(client, schema, table) {
   return Number(rows[0].n);
 }
 
-const TARGET_KEY_CASTS = Object.freeze({ text: "text", int: "bigint", instant: "timestamptz", day: "date" });
+// Key column types whose PostgreSQL order equals the sealed (SQLite) order: text under COLLATE "C", integers, instants, days.
+const ORDERED_KEY_TYPES = Object.freeze(["text", "int", "instant", "day"]);
 const TARGET_PAGE_ROWS = 2000;
+let scanCounter = 0;
 
 /**
  * Digest of the target rows (restricted to the sealed keys for merged
- * seeds), read in keyset pages in the sealed key order: text keys compare
- * under COLLATE "C", which is SQLite's BINARY order for UTF-8.
+ * seeds) in the sealed key order: text keys compare under COLLATE "C", which
+ * is SQLite's BINARY order for UTF-8. The rows come from one server-side
+ * cursor, so the table is ordered once. Keyset pages cannot use a primary-key
+ * index under an explicit COLLATE "C" (the planner matches the index's
+ * collation by identity, on any database), so each page would re-scan and
+ * re-sort the rest of the table. Callers run inside a transaction.
  */
 async function targetTableFacts(client, schema, item, keys = null) {
   const spec = item.spec;
   const keyColumns = spec.key.map(key => spec.columns.find(candidate => candidate.target === key));
-  if (keyColumns.some(column => !Object.hasOwn(TARGET_KEY_CASTS, column.type))) fail("CUTOVER_IDENTITY_ARGUMENT_INVALID");
+  if (keyColumns.some(column => !ORDERED_KEY_TYPES.includes(column.type))) fail("CUTOVER_IDENTITY_ARGUMENT_INVALID");
   const collate = column => (column.type === "text" ? ` COLLATE "C"` : "");
-  const list = [
-    ...spec.columns.map(column => `${fastpathIdentityTargetExpression(column)} AS ${quote(column.target)}`),
-    ...keyColumns.map((column, index) => `${quote(column.target)} AS "__key_${index}"`),
-  ].join(", ");
+  const list = spec.columns.map(column => `${fastpathIdentityTargetExpression(column)} AS ${quote(column.target)}`).join(", ");
   // Qualified by the row alias: an unqualified ORDER BY name would match the
   // output alias first (a text projection), sorting integer keys as text.
   const order = keyColumns.map(column => `target_row.${quote(column.target)}${collate(column)}`).join(", ");
-  const restrictionValues = keys === null ? [] : [keys];
-  const restriction = keys === null ? [] : [`${quote(spec.key[0])} = ANY($1::text[])`];
+  const where = keys === null ? "" : ` WHERE ${quote(spec.key[0])} = ANY($1::text[])`;
+  const cursor = `identity_digest_scan_${scanCounter}`;
+  scanCounter = (scanCounter + 1) % 1_000_000;
   const digest = createRowsDigest();
   let rows = 0;
-  let after = null;
-  for (;;) {
-    const conditions = [...restriction];
-    const values = [...restrictionValues];
-    if (after !== null) {
-      const placeholders = keyColumns.map((column, index) =>
-        `$${values.length + index + 1}::${TARGET_KEY_CASTS[column.type]}${collate(column)}`);
-      conditions.push(`(${keyColumns.map(column => `${quote(column.target)}${collate(column)}`).join(", ")}) > (${placeholders.join(", ")})`);
-      values.push(...after);
+  await q(client, `DECLARE ${cursor} NO SCROLL CURSOR FOR SELECT ${list} FROM ${quote(schema)}.${quote(spec.name)} target_row${where}
+    ORDER BY ${order}`, keys === null ? [] : [keys], spec.name);
+  try {
+    for (;;) {
+      const result = await q(client, `FETCH FORWARD ${TARGET_PAGE_ROWS} FROM ${cursor}`, [], spec.name);
+      for (const row of result.rows) {
+        digest.update(spec.columns.map(column => fastpathIdentityTargetValue(column.type, row[column.target], spec.name, column.target)));
+        rows += 1;
+      }
+      if (result.rows.length < TARGET_PAGE_ROWS) break;
     }
-    const where = conditions.length === 0 ? "" : ` WHERE ${conditions.join(" AND ")}`;
-    const result = await q(client, `SELECT ${list} FROM ${quote(schema)}.${quote(spec.name)} target_row${where}
-      ORDER BY ${order} LIMIT ${TARGET_PAGE_ROWS}`, values, spec.name);
-    for (const row of result.rows) {
-      digest.update(spec.columns.map(column => fastpathIdentityTargetValue(column.type, row[column.target], spec.name, column.target)));
-      rows += 1;
-    }
-    if (result.rows.length < TARGET_PAGE_ROWS) break;
-    const last = result.rows.at(-1);
-    after = keyColumns.map((_, index) => last[`__key_${index}`]);
+  } finally {
+    // After a failure the transaction is already aborted and the cursor with it.
+    await client.query(`CLOSE ${cursor}`).catch(() => {});
   }
   return { rows, sha256: digest.digest() };
 }

@@ -39,6 +39,7 @@ import { IDENTITY_AUTHORITY_FROZEN_ORDER } from "./postgres-identity-authority-t
 import { PostgresTransferTargetError, TRANSFER_STAGES } from "./postgres-transfer-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import { Q1_INGESTION_DUMP } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
+import { correctionHistorySql } from "../postgres-test/fixtures/w2-seal/correction-history.mjs";
 
 // D-PT5A contract checks without a database: the frozen stage plan, the
 // dispositions the PT-8-lite coverage module consumes, the specs' closure over
@@ -52,7 +53,7 @@ import { Q1_INGESTION_DUMP } from "../postgres-test/fixtures/w2-seal/synthetic-s
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // A reviewed change to any stage's tables, columns, closure, trigger policy or
 // dispositions must update this pin.
-const POLICY_SHA256 = "82998111387fa2df72b8615f1285590a9d4d8ae0056b054469d0ce025417632f";
+const POLICY_SHA256 = "b8fbb1bf19c101253f760d85e6e382d30a61afc0b3a5b060ae852b73c2fb8c93";
 const EXPECTED_STAGE_TABLES = Object.freeze({
   "telemetry-v1-v11": ["telemetry_v1_chunks", "telemetry_v1_records", "telemetry_v11_day_manifests", "telemetry_v11_chunks",
     "telemetry_v11_records", "telemetry_v11_domain_predecessors", "telemetry_v11_domains", "telemetry_v11_domain_days",
@@ -396,7 +397,25 @@ test("arguments are closed for every stage: pages at most 256 rows and 4 MiB, a 
   }
 });
 
+/**
+ * A synthetic correction history row and fact for one active typed owner, plus the statements that drop the D1 triggers
+ * that would refuse the forgery. D1 keeps correction history when an owner withdraws, so each variant below is a state D1
+ * can legitimately hold and PostgreSQL's insert guards (primary 0034) would refuse mid-stage.
+ */
+function correctionOwnerFixture() {
+  const owner = sealed(`SELECT membership.participant_id AS participant_id, membership.typed_owner_id AS owner, link.owner_digest AS digest
+    FROM typed_v1_owner_memberships membership JOIN storage_v11_owner_links link ON link.participant_id = membership.participant_id
+    WHERE link.state = 'active' ORDER BY membership.participant_id LIMIT 1`);
+  return {
+    participantId: owner.participant_id,
+    triggers: dropTriggers("telemetry_usage_correction_history", "telemetry_usage_correction_facts", "storage_v11_owner_links", "participants"),
+    history: (overrides = {}) => correctionHistorySql({ participantId: owner.participant_id, ownerDigestHex: owner.digest,
+      ownerId: Number(owner.owner), ...overrides }),
+  };
+}
+
 test("every sealed-source refusal fires before the target is touched", async () => {
+  const correction = correctionOwnerFixture();
   const cases = [
     // telemetry-v1-v11
     ["telemetry-v1-v11", "ALTER TABLE telemetry_v1_chunks ADD COLUMN synthetic_extra TEXT", "CUTOVER_COLUMN_UNMAPPED"],
@@ -474,6 +493,15 @@ test("every sealed-source refusal fires before the target is touched", async () 
     ["usage-correction", `${dropTriggers("telemetry_usage_correction_facts")}
       INSERT INTO telemetry_usage_correction_facts(id, history_id, method_version, captured_at_ms) VALUES (1, 1, 1, 1)`,
     "CUTOVER_SOURCE_LINEAGE_INVALID"],
+    // A withdrawn owner's history, a participant that is not active and a history row whose digest names no owner link.
+    ["usage-correction", `${correction.triggers}
+      UPDATE storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = '${correction.participantId}';
+      ${correction.history()}`, "CUTOVER_CORRECTION_OWNER_NOT_ACTIVE"],
+    ["usage-correction", `${correction.triggers}
+      UPDATE participants SET state = 'deleting' WHERE id = '${correction.participantId}';
+      ${correction.history()}`, "CUTOVER_CORRECTION_OWNER_NOT_ACTIVE"],
+    ["usage-correction", `${correction.triggers}
+      ${correction.history({ ownerDigestHex: "ab".repeat(32) })}`, "CUTOVER_CORRECTION_OWNER_NOT_ACTIVE"],
     // ingestion-journal
     ["ingestion-journal", `${dropTriggers("storage_ingestion_changes")}
       DELETE FROM storage_ingestion_changes WHERE sequence = 3`, "CUTOVER_JOURNAL_SOURCE_INVALID"],
@@ -491,6 +519,14 @@ test("every sealed-source refusal fires before the target is touched", async () 
       return true;
     }, `${stage} ${code}`);
   }
+});
+
+test("correction history of an active owner passes every sealed-source check, so only the owner's state refused above", async () => {
+  const correction = correctionOwnerFixture();
+  const forged = await forgeVariantSeal(seal, `${PREFIX}\n${correction.triggers}\n${correction.history()}`);
+  // The sealed side holds: only the unregistered handle is left to refuse (PT-1 checks it after every sealed-source check).
+  await assert.rejects(TELEMETRY_PRODUCTION_RUNNERS["usage-correction"]({ handle: { sealManifestSha256: forged.sealId },
+    sealManifestPath: forged.manifestPath }), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
 });
 
 test("a sealed file changed after the seal refuses before the target is touched, in every stage", async () => {
