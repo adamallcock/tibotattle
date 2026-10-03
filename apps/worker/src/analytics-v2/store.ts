@@ -104,13 +104,17 @@ export {
   ANALYTICS_V2_METHOD_VERSION,
   analyticsV2BaselineRunStamp,
   analyticsV2BundledKernelIdentity,
+  analyticsV2BundledPricer,
+  analyticsV2PricingClass,
   analyticsV2KernelRegistry,
   resolveAnalyticsV2Kernel,
 } from "./kernel";
-export type { AnalyticsV2KernelEntry, AnalyticsV2KernelIdentity, AnalyticsV2RunStamp } from "./kernel";
+export type { AnalyticsV2KernelEntry, AnalyticsV2KernelIdentity, AnalyticsV2RunStamp, AnalyticsV2Pricer, AnalyticsV2PricingClass } from "./kernel";
 // K-PERCARD: the transition proof the Job runs in its read snapshot, and the
 // derived-regime dirtiness an incremental planner reads.
-export { proveAnalyticsV2PriceTransitions, readAnalyticsV2PriceDirtyOwnerDays } from "./store-price";
+export { ANALYTICS_V2_PRICING_CLASS_TABLES, ANALYTICS_V2_PRICING_CLASS_COLUMNS,
+  ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS, AnalyticsV2PricingClassError, analyticsV2PricingClassSampled,
+  proveAnalyticsV2PriceTransitions, readAnalyticsV2PriceDirtyOwnerDays } from "./store-price";
 export type { AnalyticsV2PriceTransitions, AnalyticsV2PriceWriteSummary } from "./store-run";
 // E-OWNERSET: the contribution digests (the published revision is nextPublishedRevision above).
 export { analyticsV2ContributionDigests } from "./owner-sets";

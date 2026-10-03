@@ -1,3 +1,4 @@
+import { analyticsFastPricerPlugin } from "./analytics-fast-pricer-binding.mjs";
 import { relative, resolve } from "node:path";
 
 // Build-time composition of the Cloud Run Node host primitives (Wave 1A).
@@ -55,7 +56,7 @@ export function nodeHostAliasPlugin(workerRoot) {
 
 /** The plugins of cloud-run/build.mjs, for every in-repo esbuild of the Cloud Run entries. */
 export function cloudRunBuildPlugins(workerRoot) {
-  return [nodeHostAliasPlugin(workerRoot)];
+  return [analyticsFastPricerPlugin(), nodeHostAliasPlugin(workerRoot)];
 }
 
 function refuse(code, detail) {

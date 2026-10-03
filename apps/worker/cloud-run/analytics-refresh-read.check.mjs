@@ -184,6 +184,7 @@ function stubPipeline(log) {
   };
   return createAnalyticsV2Pipeline({
     owners: {
+      analyticsV2ExcludedOn: () => false,
       async listAnalyticsV2Owners() {
         return { owners: OWNERS.map((ownerDigest, index) => ({ ownerDigest, participantId: `p${index}`, source: "effective",
           hasV1: false, hasV11: true, hasV12: false, hasLegacy: false, hasEffective: true })), unlinked: [] };
@@ -191,6 +192,12 @@ function stubPipeline(log) {
       async readAnalyticsV2Exclusions() {
         return { rows: 0, active: 0, sha256: "0".repeat(64), activeByParticipant: new Map() };
       },
+    },
+    ownerSets: {
+      async readAnalyticsV2OwnerSetState(_context, { days }) {
+        return { days: new Map(days.map((day) => [day, { members: new Map() }])), frozen: null };
+      },
+      async readAnalyticsV2SavedContributionValues() { return new Map(); },
     },
     occurrences,
     devices: { async countContributingDevices() { return new Map(); } },

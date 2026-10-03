@@ -97,7 +97,6 @@ import { GCP_FASTPATH_SEED } from "./gcp-fastpath-seed.mjs";
 import {
   ANALYTICS_REFRESH_PRODUCTION_JOB,
   ANALYTICS_REFRESH_TASK_MEMORY_CHECK,
-  ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
   readAnalyticsRefreshProductionTarget,
@@ -251,8 +250,8 @@ test("refresh profiles: the standard Job stays the default; the dense Jobs are 4
   for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=86400s", "--max-retries=0"]) {
     assert.equal(dense.includes(flag), true, flag);
   }
-  // The dense profile is the production profile: inline (no --workers), with
-  // the production job's 64 MiB semi-space (owner decisions round 19, SEMI).
+  // The dense profile is the inline fallback (no --workers), with
+  // the approved 64 MiB semi-space (owner decisions round 19, SEMI).
   assert.equal(dense.some((arg) => arg.startsWith(
     "--args=--max-old-space-size=12288,--max-semi-space-size=64,dist/analytics-refresh.mjs,")
     && !arg.includes("--workers")), true);
@@ -962,11 +961,11 @@ test("running executions, task read-backs and uncapped outcomes are classified f
 
   // The read-back equals what refreshJobCommand deploys, in both shapes.
   const expected = denseTask();
-  assert.deepEqual(expected.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full",
+  assert.deepEqual(expected.args, ["--max-old-space-size=12288", "--max-semi-space-size=64", "dist/analytics-refresh.mjs", "--mode=full",
     `--schema=${SEEDED}`, `--now=${MEAS_NOW}`]);
   assert.equal(expected.env[REFRESH_TASK_TIMEOUT_ENV], "14400");
   assert.equal(expected.env.PRIMARY_SCHEMA, SEEDED);
-  assert.deepEqual([expected.cpu, expected.memory, expected.timeoutSeconds], ["4", "16Gi", 14_400]);
+  assert.deepEqual([expected.cpu, expected.memory, expected.timeoutSeconds], ["4", "16Gi", 86_400]);
   const job = taskResource("Job", expected);
   assert.deepEqual(jobTaskSpec(job), expected);
   assert.deepEqual(refreshTaskMismatches(jobTaskSpec(job), expected), []);

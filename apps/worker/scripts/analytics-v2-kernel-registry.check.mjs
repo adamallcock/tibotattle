@@ -45,6 +45,8 @@ import {
 } from "../cloud-run/analytics-kernel-closure.mjs";
 
 const execFileAsync = promisify(execFile);
+import { cloudRunBuildPlugins } from "../cloud-run/node-host-build.mjs";
+
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REGISTRY_PATH = join(WORKER_ROOT, "src", "analytics-v2", "kernel-registry.json");
 const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
@@ -70,7 +72,7 @@ const REGISTRY_PINS = Object.freeze([
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
 /** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph. */
-const BUILD_OPTIONS = Object.freeze({ bundle: true, platform: "node", format: "esm", target: "node22",
+const BUILD_OPTIONS = Object.freeze({ plugins: cloudRunBuildPlugins(WORKER_ROOT), bundle: true, platform: "node", format: "esm", target: "node22",
   external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent" });
 
 const canonical = (entry) => JSON.stringify(Object.fromEntries(ENTRY_KEYS.map((key) => [key, entry[key]])));

@@ -2,9 +2,7 @@
 -- section 3.2.1; owner decision round 18: price each row once per pricing
 -- version, cached forever).
 --
--- NUMBER. Staged under the placeholder 0961 until the integrator promotes it
--- into postgres/migrations/primary/ with the next primary number; specs and
--- checks find it by its name suffix (analytics_v2_pricing_classes). Purely
+-- Promoted as primary 0074 by the Wave25 integration. Purely
 -- additive: no CONTRACT_MIGRATIONS entry. It needs K-PERCARD's price cards
 -- (primary 0072): every table below names analytics_v2_kernel_prices or
 -- analytics_v2_kernel_transitions and uses its append-only trigger function,
