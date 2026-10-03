@@ -156,6 +156,36 @@ and print the argv; they run no `gcloud` and make no request.
    the image digest. Record the digest. The production Cloud Build is a
    protected operation. `owner`, `built`.
 
+   The source is staged explicitly in the project's default Cloud Build
+   bucket (BUILD-SOURCE, owner decision round 19), with
+   `--gcs-source-staging-dir=gs://<project>_cloudbuild/source`. That is
+   `tibotattle_cloudbuild` for staging and `tibotattle-prod_cloudbuild` for
+   production, and the dry run prints it as `buildSource`. The builder reads
+   the source through the one OPS-2 binding on that bucket,
+   `roles/storage.objectViewer`; it holds no project storage role. Before the
+   lock, `build` reads the bucket and its policy. It refuses with:
+
+   - `ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE` when the bucket is absent;
+   - `ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN` when the bucket's project number is
+     not the target's;
+   - `ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED` when there is no unconditional
+     builder read or there is a public member.
+
+   gcloud does not make these checks for an explicit staging directory. What
+   to do depends on the refusal:
+
+   - `UNAVAILABLE`, or `UNQUALIFIED` because the builder's binding is
+     missing: plan and apply OPS-2 (it creates an absent bucket, then binds in
+     the next pass), then retry. If OPS-2's `build-source-bucket:create` then
+     fails, another project holds the name: stop and escalate to the owner.
+   - `FOREIGN`, or `UNQUALIFIED` because the bucket has a public member: stop
+     and escalate to the owner. OPS-2 cannot clear either: it binds nothing on
+     a foreign bucket, and a public member blocks its apply
+     (`BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER`).
+
+   The build is qualified only if its storage source is in that bucket under
+   `source/`.
+
    ```bash
    node scripts/gcp-production-rollout.mjs build --environment=<env> --commit=<commit> \
      --authorize=build:<env>:<commit> --execute

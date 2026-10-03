@@ -18,6 +18,7 @@
     "secrets",
     "cloudSql",
     "bucket",
+    "buildSource",
     "service",
     "jobs",
     "scheduler",
@@ -516,6 +517,21 @@
           "description": "The bucket-birth receipt's proof; null until the bucket is born"
         }
       }
+    },
+    "buildSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bucket"
+      ],
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]_cloudbuild$",
+          "description": "BUILD-SOURCE: the project's default Cloud Build bucket, always <project>_cloudbuild (the validator refuses any other name: BUILD_SOURCE_BUCKET_NAME_INVALID). OPS-2 binds roles/storage.objectViewer on it for the builder alone (bucket-level, never a project role) and creates it, with uniform bucket-level access and public access prevention enforced, when it is absent; OPS-10's build verb stages its source archive in gs://<bucket>/source"
+        }
+      },
+      "description": "BUILD-SOURCE (scripts/gcp-build-source-bucket.mjs): the bucket only; the builder's role on it is not the desired state's to choose"
     },
     "service": {
       "type": "object",

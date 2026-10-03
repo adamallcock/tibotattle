@@ -1114,6 +1114,8 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
   assert.deepEqual({ ...target, jobNames: [...target.jobNames] }, {
     environment: "production",
     project: UNMARKED_PROJECT,
+    // BUILD-SOURCE: build holds the project's default Cloud Build bucket to this owner.
+    projectNumber: "100000000001",
     region: "us-east1",
     service: "synthetic-origin",
     migrationJob: "synthetic-production-migrate",
@@ -1299,6 +1301,8 @@ function filledProduction(mutate = () => {}) {
   return committed("production", (value) => {
     Object.assign(value, OWN5_FILL);
     value.bucket.location = "US-EAST1";
+    // BUILD-SOURCE: the filled project's default Cloud Build bucket.
+    value.buildSource.bucket = `${OWN5_FILL.project}_cloudbuild`;
     mutate(value);
   });
 }
@@ -1647,6 +1651,8 @@ test("the committed JSON Schema has exactly the validator's closed key sets", ()
   for (const secret of Object.values(schema.properties.secrets.properties)) closed(secret, shape.secret, "secret");
   closed(schema.properties.cloudSql, shape.cloudSql, "cloudSql");
   closed(schema.properties.bucket, shape.bucket, "bucket");
+  closed(schema.properties.buildSource, shape.buildSource, "buildSource");
+  assert.equal(schema.properties.buildSource.properties.bucket.pattern, "^[a-z][a-z0-9-]{4,28}[a-z0-9]_cloudbuild$");
   closed(variant(schema.properties.bucket.properties.proof), shape.bucketProof, "bucket.proof");
   closed(schema.properties.service, shape.service, "service");
   closed(schema.properties.jobs, manifest.JOB_NAMES, "jobs");
@@ -1692,4 +1698,33 @@ test("the service render names each secret by its Secret Manager id and waits fo
   const staging = manifest.validateDesiredState(unmarked(stagingNames));
   assert.throws(() => manifest.renderService(staging, IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED" });
   assert.deepEqual({ ...manifest.SERVICE_TEMPLATE_UNAVAILABLE }, {});
+});
+
+test("BUILD-SOURCE: the build-source bucket is the project's own <project>_cloudbuild and nothing else", () => {
+  const valid = manifest.validateDesiredState(fixture());
+  assert.deepEqual(valid.buildSource, { bucket: "synthetic-ops-project_cloudbuild", location: "us-east1",
+    sourceDir: "gs://synthetic-ops-project_cloudbuild/source" });
+  for (const [mutate, code] of [
+    [(value) => { value.buildSource.bucket = "other-project-x_cloudbuild"; }, "BUILD_SOURCE_BUCKET_NAME_INVALID"],
+    [(value) => { value.buildSource.bucket = "synthetic-ops-quarantine"; }, "DESIRED_STATE_VALUE_INVALID:buildSource.bucket"],
+    [(value) => { value.buildSource.bucket = "synthetic-ops-project_us-east1_cloudbuild"; },
+      "DESIRED_STATE_VALUE_INVALID:buildSource.bucket"],
+    [(value) => { value.buildSource.bucket = null; }, "DESIRED_STATE_VALUE_INVALID:buildSource.bucket"],
+    [(value) => { value.buildSource.role = "roles/storage.objectAdmin"; }, "DESIRED_STATE_KEY_UNKNOWN:buildSource.role"],
+    [(value) => { delete value.buildSource.bucket; }, "DESIRED_STATE_KEY_MISSING:buildSource.bucket"],
+    [(value) => { delete value.buildSource; }, "DESIRED_STATE_KEY_MISSING:desiredState.buildSource"],
+  ]) {
+    refused(mutate, code);
+  }
+  // Each committed plane names its own project's bucket; OPS-10's target carries the project number build checks.
+  const staging = manifest.loadCommittedDesiredState("staging");
+  const production = manifest.loadCommittedDesiredState("production");
+  assert.deepEqual([staging.buildSource.bucket, production.buildSource.bucket],
+    ["tibotattle_cloudbuild", "tibotattle-prod_cloudbuild"]);
+  assert.deepEqual([manifest.rolloutTarget("staging").projectNumber, manifest.rolloutTarget("production").projectNumber],
+    [staging.projectNumber, production.projectNumber]);
+  // A plane's file carrying the other plane's bucket is refused.
+  assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => {
+    value.buildSource.bucket = "tibotattle-prod_cloudbuild";
+  })), { code: "BUILD_SOURCE_BUCKET_NAME_INVALID" });
 });

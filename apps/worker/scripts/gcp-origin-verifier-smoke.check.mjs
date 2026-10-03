@@ -39,6 +39,7 @@ const PUBLIC_ORIGIN = "https://tibotattle.test";
 const TARGET = Object.freeze({
   environment: "production",
   project: PROJECT,
+  projectNumber: "123456789012",
   region: "us-east1",
   service: "tibotattle-origin",
   migrationJob: "tibotattle-production-migrate",

@@ -10,12 +10,18 @@
  *              scheduled-jobs readback: every Cloud Scheduler trigger of a
  *              Cloud Run job in the region and every execution of a manifest
  *              Job, reported as quiescent or not.
- *   build      --authorize=build:<env>:<commit>. Renders
- *              cloud-run/cloudbuild.production.yaml, writes the audited source
- *              archive (scripts/cloud-run-build-archive.mjs, the archive the
- *              test builds use) and submits that file; the build is qualified
- *              against the archive's own sha256 (sourceProvenance.fileHashes),
- *              its identity, step, step image and image digest.
+ *   build      --authorize=build:<env>:<commit>. Reads the project's default
+ *              Cloud Build bucket, <project>_cloudbuild (BUILD-SOURCE), and
+ *              refuses unless it is the project's own, names no public member
+ *              and gives the builder roles/storage.objectViewer (the OPS-2
+ *              binding); renders cloud-run/cloudbuild.production.yaml, writes
+ *              the audited source archive (scripts/cloud-run-build-archive.mjs,
+ *              the archive the test builds use) and submits that file staged
+ *              in that bucket with an explicit
+ *              --gcs-source-staging-dir=gs://<project>_cloudbuild/source; the
+ *              build is qualified against the archive's own sha256
+ *              (sourceProvenance.fileHashes), that bucket and prefix, its
+ *              identity, step, step image and image digest.
  *   migrate    --authorize=migrate:<env>:<digest>. Preflight; the jobs must be
  *              quiescent (OPS-3 pause-all done, nothing running); one labelled
  *              pre-migration on-demand backup of the primary instance (with
@@ -103,6 +109,12 @@ import {
 } from "./edge-mode-configuration.mjs";
 import { createOnDemandBackup } from "./gcp-backup-horizon.mjs";
 import { scheduledRunJob } from "./gcp-scheduler-run-target.mjs";
+import {
+  BUILD_SOURCE_OBJECT_PREFIX,
+  buildSourceBucketName,
+  buildSourcePolicyProblems,
+  buildSourceStagingDir,
+} from "./gcp-build-source-bucket.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import {
   createGcloudIdentityTokenSource,
@@ -168,7 +180,7 @@ export const BUILD_CONFIG_PATH = "cloud-run/cloudbuild.production.yaml";
 export const BUILD_ARCHIVE_NAME = "source.tar.gz";
 export const INFRA_READBACK_ARGV = Object.freeze(["node", "scripts/gcp-infra.mjs", "readback", "--require-clean"]);
 export const ROLLOUT_TARGET_KEYS = Object.freeze([
-  "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
+  "environment", "project", "projectNumber", "region", "service", "migrationJob", "jobNames", "primaryInstance",
   "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience", "maintenanceJob",
 ]);
 /** The health body the public path and the EP-6 verifier path both read. */
@@ -188,6 +200,7 @@ const GENERATION = /^[1-9][0-9]{0,19}$/u;
 const BUCKET = /^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$/u;
 const OBJECT_NAME = /^[A-Za-z0-9._/-]{1,1024}$/u;
 const PROJECT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u;
+const PROJECT_NUMBER = /^[1-9][0-9]{5,19}$/u;
 const REGION = /^[a-z]+-[a-z]+[0-9]{1,2}$/u;
 const CLOUD_RUN_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const INSTANCE_ID = /^[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$/u;
@@ -342,11 +355,13 @@ const TEST_TARGET_VALUES = testTargetValues();
  * /api/health through while the edge is not in gcp mode. maintenanceJob is
  * the MP-2-lite maintenance Job among jobNames (D-OPS4), or null while the
  * desired state has none: roll runs it before that verification (the
- * first-roll ready path, D-CRB).
+ * first-roll ready path, D-CRB). projectNumber is the number build holds the
+ * build-source bucket's owner to (BUILD-SOURCE).
  */
 export function validateRolloutTarget(target, environment) {
   if (!hasExactKeys(target, ROLLOUT_TARGET_KEYS) || target.environment !== environment
       || !PROJECT.test(target.project ?? "") || !REGION.test(target.region ?? "")
+      || typeof target.projectNumber !== "string" || !PROJECT_NUMBER.test(target.projectNumber)
       || !CLOUD_RUN_NAME.test(target.service ?? "") || !CLOUD_RUN_NAME.test(target.migrationJob ?? "")
       || !Array.isArray(target.jobNames) || target.jobNames.length === 0
       || target.jobNames.some((name) => typeof name !== "string" || !CLOUD_RUN_NAME.test(name))
@@ -403,8 +418,18 @@ export const ROLLOUT_ARGV = Object.freeze({
   infraReadback: (environment) => [...INFRA_READBACK_ARGV, `--environment=${environment}`],
   /** The audited context as the test builds archive it (cloud-run-build-archive.mjs). */
   buildArchive: (output) => ["node", "scripts/cloud-run-build-archive.mjs", `--output=${output}`],
+  /**
+   * Staged explicitly in the project's default Cloud Build bucket, the one
+   * bucket OPS-2 grants the builder read on (BUILD-SOURCE).
+   */
   buildSubmit: (target, archive, config) => ["gcloud", "builds", "submit", archive, `--config=${config}`,
-    ...scope(target), "--format=json"],
+    `--gcs-source-staging-dir=${buildSourceStagingDir(target.project)}`, ...scope(target), "--format=json"],
+  /** The build-source bucket as the JSON API reports it (read-only). */
+  buildSourceDescribe: (target) => ["gcloud", "storage", "buckets", "describe",
+    `gs://${buildSourceBucketName(target.project)}`, `--project=${target.project}`, "--raw", "--format=json"],
+  /** The build-source bucket's own IAM policy (read-only). */
+  buildSourcePolicy: (target) => ["gcloud", "storage", "buckets", "get-iam-policy",
+    `gs://${buildSourceBucketName(target.project)}`, `--project=${target.project}`, "--format=json"],
   schedulerList: (target) => ["gcloud", "scheduler", "jobs", "list", `--project=${target.project}`,
     `--location=${target.region}`, "--format=json"],
   executionsList: (target, job) => ["gcloud", "run", "jobs", "executions", "list", `--job=${job}`, ...scope(target),
@@ -1388,7 +1413,8 @@ function archiveHashValues(archiveSha256) {
  * SUCCESS under the builder service account, the reviewed options
  * (CLOUD_LOGGING_ONLY, sourceProvenanceHash [SHA256], VERIFIED), the single
  * pinned docker step with its exact arguments and the step image's resolved
- * digest, a storage source whose resolved generation equals it, and
+ * digest, a storage source in the project's default Cloud Build bucket under
+ * its source/ prefix (BUILD-SOURCE) whose resolved generation equals it, and
  * sourceProvenance.fileHashes holding exactly that object's SHA256, which must
  * equal archiveSha256 (the archive this rollout wrote and submitted). Then the
  * one pushed image's tag and digest.
@@ -1428,7 +1454,9 @@ export function assessProductionBuild(build, { target, commit, builderImage, arc
   const resolved = build.sourceProvenance?.resolvedStorageSource;
   if (!hasExactKeys(build.source, ["storageSource"]) || !hasExactKeys(source, ["bucket", "object", "generation"])
       || typeof source.bucket !== "string" || !BUCKET.test(source.bucket)
+      || source.bucket !== buildSourceBucketName(target.project)
       || typeof source.object !== "string" || !OBJECT_NAME.test(source.object)
+      || !source.object.startsWith(BUILD_SOURCE_OBJECT_PREFIX)
       || !GENERATION.test(String(source.generation))
       || !hasExactKeys(build.sourceProvenance, ["resolvedStorageSource", "fileHashes"])
       || !hasExactKeys(resolved, ["bucket", "object", "generation"])
@@ -1464,6 +1492,31 @@ async function archiveSha256Of(path) {
   return sha256(await readFile(path));
 }
 
+/**
+ * BUILD-SOURCE: with an explicit --gcs-source-staging-dir gcloud neither
+ * checks that the bucket is the project's own nor refuses an absent one (it
+ * creates it with its own defaults), so build reads it first, read-only: it
+ * must exist (ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE: run the OPS-2 apply that
+ * creates it; an unreadable bucket another project holds also lands here, and
+ * then OPS-2's create fails), carry the target's project number
+ * (ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN: an owner decision, OPS-2 cannot clear
+ * it), and its policy must give the builder roles/storage.objectViewer
+ * unconditionally and name no public member
+ * (ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED: OPS-2 binds a missing binding, but a
+ * public member blocks OPS-2 and needs the owner). Broader roles and extra members are OPS-2 readback's
+ * drift. Nothing is printed but the code.
+ */
+function checkBuildSource(context, target) {
+  const unavailable = "ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE";
+  const bucket = parseJson(runChecked(context, ROLLOUT_ARGV.buildSourceDescribe(target), unavailable), unavailable);
+  if (!isRecord(bucket) || bucket.name !== buildSourceBucketName(target.project)) fail(unavailable);
+  if (String(bucket.projectNumber ?? "") !== target.projectNumber) fail("ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN");
+  const policy = parseJson(runChecked(context, ROLLOUT_ARGV.buildSourcePolicy(target), unavailable), unavailable);
+  if (buildSourcePolicyProblems(policy, `serviceAccount:${target.builderServiceAccount}`).length > 0) {
+    fail("ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED");
+  }
+}
+
 async function build(context, args, target) {
   const configText = await readFile(join(WORKER_ROOT, BUILD_CONFIG_PATH), "utf8");
   const rendered = renderBuildConfig(configText, target, args.commit);
@@ -1472,12 +1525,17 @@ async function build(context, args, target) {
     return dryRunResult(args, target, [
       ROLLOUT_ARGV.gitStatus(),
       ROLLOUT_ARGV.gitHead(),
+      ROLLOUT_ARGV.buildSourceDescribe(target),
+      ROLLOUT_ARGV.buildSourcePolicy(target),
       ROLLOUT_ARGV.buildArchive(`<build-dir>/${BUILD_ARCHIVE_NAME}`),
       ROLLOUT_ARGV.buildSubmit(target, `<build-dir>/${BUILD_ARCHIVE_NAME}`,
         "<build-dir>/cloudbuild.production.rendered.yaml"),
-    ]);
+    ], { buildSource: { bucket: buildSourceBucketName(target.project),
+      sourceDir: buildSourceStagingDir(target.project) } });
   }
   checkCheckout(context, args.commit);
+  // Before the lock: an unusable source bucket stops the build with nothing uploaded or pushed.
+  checkBuildSource(context, target);
   // A build replaces nothing that is deployed; its lock record names the commit it builds.
   return underLock(context, args.environment, { sourceCommit: args.commit, previousSourceCommit: args.commit }, async (assertOwned) => {
     const directory = await mkdtemp(join(context.tmpdir(), "tibotattle-production-build-"));

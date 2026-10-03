@@ -25,6 +25,7 @@ import {
   emptyWorld,
   INJECTED_SCHEDULER_HEADERS,
   memoryWriter,
+  withCloudBuildBucket,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { unpinnedStagingText } from "./fixtures/gcp-ops-infra/staging-unpinned.mjs";
@@ -52,8 +53,11 @@ function desiredState({ synthetic = true, mutate = () => {} } = {}) {
   return manifest.validateDesiredState(value);
 }
 
-/** A project with only the born bucket and the owner's secret values. */
-function bornWorld(desired, { secrets = true } = {}) {
+/**
+ * A project with only the born bucket, the owner's secret values and the
+ * default Cloud Build bucket a first `gcloud builds submit` left (BUILD-SOURCE).
+ */
+function bornWorld(desired, { secrets = true, cloudBuild = true } = {}) {
   const world = emptyWorld();
   if (secrets) {
     withSecretValues(world, {
@@ -63,12 +67,14 @@ function bornWorld(desired, { secrets = true } = {}) {
     });
   }
   world.buckets.push(bornBucket({ name: desired.bucket.name, location: desired.bucket.location }));
+  if (cloudBuild) withCloudBuildBucket(world, { project: desired.project, projectNumber: desired.projectNumber });
   return world;
 }
 
 function fake(desired, world, options = {}) {
   const writer = memoryWriter();
-  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region, ...options });
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region,
+    projectNumber: desired.projectNumber, ...options });
   return { ...gcloud, writer };
 }
 
@@ -203,7 +209,8 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   // granted) add four; the refresh trigger's create and the scheduler's
   // executor grant on the refresh job wait for the owner's cadence.
   // Round 12 retired the two sign-in secrets, so the fixture holds five containers.
-  assert.deepEqual(result.summary, { executable: 36, deferred: 2, refused: 0 });
+  // BUILD-SOURCE adds the builder's read binding on the project's default Cloud Build bucket.
+  assert.deepEqual(result.summary, { executable: 37, deferred: 2, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -268,8 +275,20 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     ["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"],
     [EXECUTOR(desired), "SCHEDULER_CADENCE_UNSET"],
   ]);
-  // No bucket update, no bucket IAM operation, no delete.
-  for (const entry of result.operations) {
+  // BUILD-SOURCE: the one bucket operation is the builder's bucket-level read on
+  // <project>_cloudbuild, after the builder account's create; the builder's
+  // project roles stay roles/logging.logWriter alone.
+  const readerId = `build-source-bucket-iam:bind:roles/storage.objectViewer|${desired.serviceAccounts.builder.member}|`;
+  assert.deepEqual(byId.get(readerId).argv, ["storage", "buckets", "add-iam-policy-binding",
+    "gs://synthetic-ops-project_cloudbuild", "--project=synthetic-ops-project",
+    `--member=${desired.serviceAccounts.builder.member}`, "--role=roles/storage.objectViewer"]);
+  assert.ok(result.operations.findIndex((entry) => entry.id === readerId)
+    > result.operations.findIndex((entry) => entry.id === "service-account:create:builder"));
+  assert.deepEqual(ops(result, (entry) => entry.id.startsWith("project-iam:")
+    && entry.argv.includes(`--member=${desired.serviceAccounts.builder.member}`)).map((entry) => entry.argv.at(-2)),
+  ["--role=roles/logging.logWriter"]);
+  // No other bucket operation, no bucket update, no delete.
+  for (const entry of result.operations.filter((operation) => operation.id !== readerId)) {
     assert.equal(entry.argv.includes("buckets") && entry.argv[0] === "storage", false, entry.id);
     assert.doesNotMatch(entry.argv.join(" "), /gs:\/\//u, entry.id);
     assert.ok(operations.EXECUTABLE_ACTIONS.includes(entry.action), entry.id);
@@ -411,7 +430,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
-  assert.deepEqual(result.summary, { executable: 39, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 40, deferred: 0, refused: 0 });
   gcloud.calls.length = 0;
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
@@ -424,7 +443,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const firstMutation = sequence.indexOf("mutate");
   const lastMutation = sequence.lastIndexOf("mutate");
   assert.ok(firstMutation > 0 && sequence.slice(0, firstMutation).every((kind) => kind === "read"));
-  assert.equal(sequence.filter((kind) => kind === "mutate").length, 39);
+  assert.equal(sequence.filter((kind) => kind === "mutate").length, 40);
   assert.ok(sequence.slice(lastMutation + 1).every((kind) => kind === "read"));
   // Both triggers were created and then paused; apply never resumes either.
   assert.equal(trigger(world).state, "PAUSED");
@@ -446,7 +465,7 @@ test("by default the analytics-refresh job deploys, and its trigger is created a
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
-  assert.deepEqual(result.summary, { executable: 39, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 40, deferred: 0, refused: 0 });
   // Create, then pause at once, then (only then) the scheduler's run.jobsExecutor, for each trigger in turn.
   const executor = `run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
   const maintenanceExecutor = `run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
@@ -1059,10 +1078,16 @@ test("the committed staging desired state plans only its own new resources in th
   // The committed file as it reads before its pins (STG-PREP): the first plan.
   manifest.loadCommittedDesiredState("staging");
   const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(JSON.parse(unpinnedStagingText())));
-  const world = withCoTenants(emptyWorld(), desired);
+  // The shared test project's default Cloud Build bucket exists (BUILD-SOURCE).
+  const world = withCloudBuildBucket(withCoTenants(emptyWorld(), desired),
+    { project: desired.project, projectNumber: desired.projectNumber });
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
   assert.equal(result.environment, "staging");
+  assert.deepEqual(ops(result, (entry) => entry.id.startsWith("build-source-bucket")).map((entry) => entry.argv), [[
+    "storage", "buckets", "add-iam-policy-binding", "gs://tibotattle_cloudbuild", "--project=tibotattle",
+    "--member=serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com",
+    "--role=roles/storage.objectViewer"]]);
   assert.equal(result.summary.refused, 0);
   assert.deepEqual(result.findings, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
   assert.deepEqual(result.blockers, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
@@ -1804,4 +1829,232 @@ test("the pause and resume guards issue only their own shape, and apply and read
   assert.equal(calls.length, 2);
   assert.deepEqual(operations.RESUME_COMMANDS, ["scheduler jobs resume"]);
   assert.equal(operations.MUTATING_COMMANDS.includes(operations.PAUSE_COMMAND), true);
+});
+
+// ---------------------------------------------------------------------------
+// BUILD-SOURCE: the builder's read on the project's default Cloud Build bucket
+
+const SOURCE_READER = (desired) =>
+  `build-source-bucket-iam:bind:roles/storage.objectViewer|${desired.serviceAccounts.builder.member}|`;
+
+test("BUILD-SOURCE: the guard admits the source bucket's create and bind only in apply and only for gs://<project>_cloudbuild", () => {
+  const calls = [];
+  const runner = (argv) => { calls.push(argv); return { status: 0, stdout: "" }; };
+  const project = "example-ops-prod1";
+  const bucket = `${project}_cloudbuild`;
+  const apply = operations.guardedGcloud(runner, { mode: "apply", project, buildSourceBucket: bucket });
+  const create = ["storage", "buckets", "create", `gs://${bucket}`, `--project=${project}`, "--location=us-east1",
+    "--uniform-bucket-level-access", "--public-access-prevention"];
+  const bind = ["storage", "buckets", "add-iam-policy-binding", `gs://${bucket}`, `--project=${project}`,
+    "--member=serviceAccount:synthetic-builder@example-ops-prod1.iam.gserviceaccount.com",
+    "--role=roles/storage.objectViewer"];
+  assert.equal(apply(create), null);
+  assert.equal(apply(bind), null);
+  assert.equal(calls.length, 2);
+  for (const argv of [
+    // Another bucket: the quarantine bucket, another project's default bucket, a prefix or a path.
+    ["storage", "buckets", "add-iam-policy-binding", "gs://synthetic-ops-quarantine", `--project=${project}`],
+    ["storage", "buckets", "create", "gs://other-project-x_cloudbuild", `--project=${project}`],
+    ["storage", "buckets", "add-iam-policy-binding", `gs://${bucket}x`, `--project=${project}`],
+    ["storage", "buckets", "add-iam-policy-binding", `gs://${bucket}/source`, `--project=${project}`],
+    ["storage", "buckets", "add-iam-policy-binding", `gs://${bucket}`, "gs://synthetic-ops-quarantine",
+      `--project=${project}`],
+    // Never an update, a policy replacement or a removal, even on that bucket.
+    ["storage", "buckets", "update", `gs://${bucket}`, `--project=${project}`],
+    ["storage", "buckets", "set-iam-policy", `gs://${bucket}`, "/x", `--project=${project}`],
+    ["storage", "buckets", "remove-iam-policy-binding", `gs://${bucket}`, `--project=${project}`],
+  ]) {
+    assert.throws(() => apply(argv), { code: "GCLOUD_COMMAND_FORBIDDEN" }, argv.join(" "));
+  }
+  // Read, pause and resume never know the shapes, and only <project>_cloudbuild may be named to apply.
+  for (const mode of ["read", "pause", "resume"]) {
+    assert.throws(() => operations.guardedGcloud(runner, { mode, project, buildSourceBucket: bucket }),
+      { code: "GCLOUD_GUARD_BUCKET_INVALID" }, mode);
+    assert.throws(() => operations.guardedGcloud(runner, { mode, project })(create), (error) =>
+      ["GCLOUD_COMMAND_FORBIDDEN", "GCLOUD_MUTATION_UNAUTHORIZED"].includes(error.code), mode);
+  }
+  for (const other of ["synthetic-ops-quarantine", "other-project-x_cloudbuild", `${project}_cloudbuild_x`, 1]) {
+    assert.throws(() => operations.guardedGcloud(runner, { mode: "apply", project, buildSourceBucket: other }),
+      { code: "GCLOUD_GUARD_BUCKET_INVALID" }, String(other));
+  }
+  assert.equal(calls.length, 2);
+  assert.deepEqual(operations.BUILD_SOURCE_BUCKET_COMMANDS, ["storage buckets create", "storage buckets add-iam-policy-binding"]);
+  assert.deepEqual(operations.BUILD_SOURCE_BUCKET_COMMANDS.map((shape) => operations.classifyGcloudCommand(shape.split(" "))),
+    ["mutate", "mutate"]);
+});
+
+test("BUILD-SOURCE: an absent bucket is reported, created by apply with its posture, and bound only by the next pass", () => {
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired);
+  // The bound bucket goes away (a project with no build yet): readback reports it.
+  world.buckets = world.buckets.filter((bucket) => bucket.name !== desired.buildSource.bucket);
+  delete world.bucketPolicies[desired.buildSource.bucket];
+  const gcloud = fake(desired, world);
+  const readback = operations.readbackInfrastructure(desired, { runner: gcloud.runner });
+  assert.deepEqual([readback.findings, readback.observed.buildSource], [["BUILD_SOURCE_BUCKET_ABSENT"], null]);
+  const first = operations.planInfrastructure(desired, readback);
+  assert.deepEqual(first.blockers, []);
+  assert.deepEqual(ops(first, (entry) => entry.id.startsWith("build-source-bucket")).map((entry) =>
+    [entry.id, entry.action, entry.deferred ?? null]), [
+    ["build-source-bucket:create", "create", null],
+    [SOURCE_READER(desired), "bind", "BUILD_SOURCE_BUCKET_ABSENT"],
+  ]);
+  assert.deepEqual(ops(first, (entry) => entry.id === "build-source-bucket:create")[0].argv,
+    [...manifest.buildSourceBucketCreateArgs(desired)]);
+  // Not clean for OPS-10: the finding, the create and the deferral are all reasons.
+  assert.deepEqual(operations.infrastructureCleanliness(first).reasons, ["FINDING:BUILD_SOURCE_BUCKET_ABSENT",
+    "EXECUTABLE:build-source-bucket:create", `DEFERRED:${SOURCE_READER(desired)}:BUILD_SOURCE_BUCKET_ABSENT`]);
+  gcloud.calls.length = 0;
+  const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
+    createSpecWriter: () => gcloud.writer.create() });
+  // Pass 1 ran the create alone; no bucket IAM call went out.
+  const mutations = gcloud.calls.filter((argv) => operations.classifyGcloudCommand(argv) === "mutate");
+  assert.deepEqual(mutations, [[...manifest.buildSourceBucketCreateArgs(desired)]]);
+  const created = world.buckets.find((bucket) => bucket.name === desired.buildSource.bucket);
+  assert.deepEqual([created.location, created.projectNumber, created.iamConfiguration], ["US-EAST1",
+    desired.projectNumber, { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced" }]);
+  assert.deepEqual({ ...receipt.remaining, planDigest: null }, { planDigest: null, executable: 1, deferred: 2, refused: 0 });
+  // Pass 2 reads it back as the project's own and binds; then the estate converges.
+  const second = plan(desired, gcloud.runner);
+  assert.deepEqual(second.findings, []);
+  assert.deepEqual(ops(second, (entry) => entry.deferred === undefined).map((entry) => entry.id), [SOURCE_READER(desired)]);
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: second.planDigest,
+    createSpecWriter: () => gcloud.writer.create() });
+  const settled = plan(desired, gcloud.runner);
+  assert.deepEqual(operations.infrastructureCleanliness(settled), { clean: true, reasons: [] });
+  assert.deepEqual(settled.findings, []);
+  assert.deepEqual(world.bucketPolicies[desired.buildSource.bucket].bindings.filter((binding) =>
+    binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
+    members: [desired.serviceAccounts.builder.member] }]);
+});
+
+test("BUILD-SOURCE: readback detects a missing binding, a broader role, an extra member, a public member and a foreign bucket", () => {
+  const desired = desiredState({ synthetic: false });
+  const bucket = desired.buildSource.bucket;
+  const builder = desired.serviceAccounts.builder.member;
+  const policy = (world) => world.bucketPolicies[bucket];
+  const withoutReader = (world) => {
+    policy(world).bindings = policy(world).bindings.filter((binding) => binding.role !== "roles/storage.objectViewer");
+  };
+  const observe = (mutate) => {
+    const world = convergedWorld(desired);
+    mutate(world);
+    const gcloud = fake(desired, world);
+    return plan(desired, gcloud.runner);
+  };
+  // Converged: the builder's one binding, nothing else of interest.
+  const clean = observe(() => {});
+  assert.deepEqual(clean.findings, []);
+  // The binding missing (someone removed it): readback names it, the plan binds it again, apply may run that.
+  const missing = observe(withoutReader);
+  assert.deepEqual([missing.findings, missing.blockers], [[], []]);
+  assert.deepEqual(ops(missing, (entry) => entry.id.startsWith("build-source-bucket")).map((entry) => entry.id),
+    [SOURCE_READER(desired)]);
+  assert.deepEqual(operations.infrastructureCleanliness(missing).reasons, [`EXECUTABLE:${SOURCE_READER(desired)}`]);
+  // Each case: the readback drift, then the refused delete apply will not run.
+  for (const [mutate, drift, refusedId] of [
+    // A broader role for the builder, as well as or instead of the reader role.
+    [(world) => { policy(world).bindings.push({ role: "roles/storage.objectAdmin", members: [builder] }); },
+      ["BUILDER_ROLE_BROADER"], `build-source-bucket-iam:delete:roles/storage.objectAdmin|${builder}|`],
+    [(world) => { withoutReader(world); policy(world).bindings.push({ role: "roles/storage.admin", members: [builder] }); },
+      ["BUILDER_ROLE_BROADER", "READER_BINDING_MISSING"], `build-source-bucket-iam:delete:roles/storage.admin|${builder}|`],
+    // An extra member on the reader role.
+    [(world) => { policy(world).bindings.find((binding) => binding.role === "roles/storage.objectViewer").members
+      .push("serviceAccount:someone-else@example-ops-prod1.iam.gserviceaccount.com"); },
+    ["READER_EXTRA_MEMBER"],
+    "build-source-bucket-iam:delete:roles/storage.objectViewer|serviceAccount:someone-else@example-ops-prod1.iam.gserviceaccount.com|"],
+    // A conditional reader binding instead of the unconditional one.
+    [(world) => { withoutReader(world); policy(world).bindings.push({ role: "roles/storage.objectViewer",
+      members: [builder], condition: { title: "narrow", expression: "true" } }); },
+    ["READER_BINDING_CONDITIONAL", "READER_BINDING_MISSING"],
+    `build-source-bucket-iam:delete:roles/storage.objectViewer|${builder}|narrow`],
+  ]) {
+    const result = observe(mutate);
+    const readback = operations.readbackInfrastructure(desired, { runner: fake(desired, (() => {
+      const world = convergedWorld(desired);
+      mutate(world);
+      return world;
+    })()).runner });
+    assert.deepEqual(readback.observed.buildSource.drift, drift, refusedId);
+    assert.deepEqual(result.findings, ["BUILD_SOURCE_BUCKET_IAM_DRIFT"], refusedId);
+    const refused = ops(result, (entry) => entry.id === refusedId);
+    assert.equal(refused.length, 1, refusedId);
+    assert.equal(refused[0].action, "delete");
+    assert.equal(drift.includes("READER_BINDING_MISSING"),
+      ops(result, (entry) => entry.id === SOURCE_READER(desired)).length === 1, refusedId);
+    refusedApply(mutate, "APPLY_DELETE_REFUSED");
+  }
+  // A public member blocks, is a finding, and its removal is refused.
+  const exposed = refusedApply((world) => { policy(world).bindings.push({ role: "roles/storage.objectViewer",
+    members: ["allUsers"] }); }, "APPLY_DELETE_REFUSED");
+  assert.deepEqual(exposed.findings, ["BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER"]);
+  assert.equal(ops(exposed, (entry) => entry.id === "build-source-bucket-iam:delete:roles/storage.objectViewer|allUsers|")
+    [0].action, "delete");
+  assert.deepEqual(exposed.blockers, ["BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER"]);
+  // Project convenience members and other roles on that bucket are Cloud Storage's, not drift.
+  const convenience = observe((world) => { policy(world).bindings.push({ role: "roles/storage.legacyObjectReader",
+    members: [`projectViewer:${desired.project}`] }); });
+  assert.deepEqual([convenience.findings, convenience.summary.refused], [[], 0]);
+  // A listed bucket of another project number is never read further or bound on. Live
+  // `storage buckets list --project` lists only the project's own buckets, so this is a
+  // defensive check; a name held elsewhere reads back ABSENT (the next test).
+  const foreign = refusedApply((world) => {
+    world.buckets.find((entry) => entry.name === bucket).projectNumber = "999999999999";
+    withoutReader(world);
+  }, "APPLY_BLOCKED");
+  assert.deepEqual([foreign.findings, foreign.blockers], [["BUILD_SOURCE_BUCKET_FOREIGN"], ["BUILD_SOURCE_BUCKET_FOREIGN"]]);
+  assert.equal(ops(foreign, (entry) => entry.id.startsWith("build-source-bucket")).length, 0);
+  // Drift is scoped to the managed binding: another member reading through a different role is
+  // outside it (round-19 reading of "an extra member"; widening it is an owner decision).
+  for (const role of ["roles/storage.legacyObjectReader", "roles/storage.admin"]) {
+    const other = observe((world) => { policy(world).bindings.push({ role, members: ["user:reader@example.com"] }); });
+    assert.deepEqual([other.findings, other.summary.refused], [[], 0], role);
+  }
+});
+
+test("BUILD-SOURCE: a name another project holds is invisible to the project listing, so pass 1 stops at its create", () => {
+  // `storage buckets list --project=<project>` returns only that project's buckets, so a
+  // <project>_cloudbuild held elsewhere reads back ABSENT (never FOREIGN), the plan creates
+  // it, and the live create's 409 stops apply at that operation. Every rerun plans it again;
+  // the owner decides. OPS-10's describe precheck is the check that can see such a bucket.
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired);
+  world.buckets = world.buckets.filter((bucket) => bucket.name !== desired.buildSource.bucket);
+  delete world.bucketPolicies[desired.buildSource.bucket];
+  const isCreate = (argv) => argv.slice(0, 3).join(" ") === "storage buckets create";
+  const gcloud = fake(desired, world, { failWhen: isCreate });
+  const first = plan(desired, gcloud.runner);
+  assert.deepEqual([first.findings, first.blockers], [["BUILD_SOURCE_BUCKET_ABSENT"], []]);
+  gcloud.calls.length = 0;
+  assert.throws(() => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
+    createSpecWriter: () => gcloud.writer.create() }),
+  (error) => error.code === "APPLY_OPERATION_FAILED" && error.operation === "build-source-bucket:create");
+  assert.deepEqual(gcloud.calls.filter((argv) => operations.classifyGcloudCommand(argv) === "mutate"),
+    [[...manifest.buildSourceBucketCreateArgs(desired)]]);
+  assert.deepEqual(ops(plan(desired, gcloud.runner), (entry) => entry.deferred === undefined).map((entry) => entry.id),
+    ["build-source-bucket:create"]);
+});
+
+test("BUILD-SOURCE: a plan never mutates another bucket, and the builder holds no project storage role", () => {
+  const desired = desiredState({ synthetic: false });
+  const forged = [{ id: "x", action: "bind", argv: ["storage", "buckets", "add-iam-policy-binding",
+    `gs://${desired.bucket.name}`, `--project=${desired.project}`] }];
+  assert.throws(() => operations.assertBucketMutationsScoped(desired, forged), { code: "PLAN_BUCKET_MUTATION_UNSCOPED" });
+  // Refused and deferred entries are not run, so they are not held to the scope.
+  assert.doesNotThrow(() => operations.assertBucketMutationsScoped(desired, [{ ...forged[0], action: "bucket-update" }]));
+  assert.doesNotThrow(() => operations.assertBucketMutationsScoped(desired, [{ ...forged[0], deferred: "X" }]));
+  assert.deepEqual(manifest.PROJECT_ROLE_POLICY.builder, ["roles/logging.logWriter"]);
+  assert.deepEqual(manifest.buildSourceReaderBinding(desired), { role: "roles/storage.objectViewer",
+    member: desired.serviceAccounts.builder.member, condition: null });
+  // Staging and production name their own project's default bucket, with the same posture and role.
+  for (const environment of ["staging", "production"]) {
+    const committed = manifest.loadCommittedDesiredState(environment);
+    assert.equal(committed.buildSource.bucket, `${committed.project}_cloudbuild`, environment);
+    assert.equal(committed.buildSource.sourceDir, `gs://${committed.project}_cloudbuild/source`, environment);
+    assert.deepEqual(manifest.buildSourceBucketCreateArgs(committed).slice(4), [`--project=${committed.project}`,
+      `--location=${committed.region}`, "--uniform-bucket-level-access", "--public-access-prevention"], environment);
+    assert.deepEqual(manifest.buildSourceReaderBinding(committed).member, committed.serviceAccounts.builder.member);
+  }
+  assert.deepEqual(["staging", "production"].map((environment) => manifest.loadCommittedDesiredState(environment)
+    .buildSource.bucket), ["tibotattle_cloudbuild", "tibotattle-prod_cloudbuild"]);
 });

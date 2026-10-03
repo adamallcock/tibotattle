@@ -12,7 +12,12 @@
  * state: readback reads it with describe, get-iam-policy and list calls, the
  * plan is a canonical, digest-bound list of create and update commands, and
  * apply runs only that list under --authorize=<planDigest>. Nothing in this
- * tooling deletes, replaces a policy or edits bucket metadata or bucket IAM.
+ * tooling deletes, replaces a policy or edits bucket metadata. The one bucket
+ * IAM it changes is the builder's roles/storage.objectViewer binding on the
+ * project's default Cloud Build bucket, `<project>_cloudbuild`, which it
+ * also creates when absent (BUILD-SOURCE, gcp-build-source-bucket.mjs); the
+ * quarantine bucket is born only by gcp-ops-bucket-birth.mjs, and no apply
+ * touches its IAM.
  *
  * The desired state is COMMITTED to the repository (owner decision
  * 2026-10-02): one file per environment under cloud-run/infra/
@@ -103,6 +108,11 @@ import {
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import { GCP_TEST_BUCKET_HISTORY_TARGET } from "./gcp-test-bucket-history.mjs";
 import { FASTPATH_TEST } from "./gcp-fastpath-test-deploy.mjs";
+import {
+  BUILD_SOURCE_READER_ROLE,
+  buildSourceBucketName,
+  buildSourceStagingDir,
+} from "./gcp-build-source-bucket.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -245,7 +255,9 @@ export const SERVICE_ACCOUNT_ROLES = Object.freeze([
 /**
  * The project roles each account holds, exactly. The runtime and migrator
  * connect to Cloud SQL as IAM database users; the builder writes Cloud Build
- * logs (CLOUD_LOGGING_ONLY). The scheduler holds only roles/run.jobsExecutor on
+ * logs (CLOUD_LOGGING_ONLY) and reads its source through a bucket-level
+ * roles/storage.objectViewer on <project>_cloudbuild alone (BUILD-SOURCE),
+ * never a project storage role. The scheduler holds only roles/run.jobsExecutor on
  * the analytics-refresh job, and the edge invoker and verifier hold only
  * roles/run.invoker on the service (EP-7's IAM template): no project role.
  * Resource-level grants are rendered separately (RESOURCE_GRANTS below).
@@ -528,6 +540,8 @@ const CLOUD_SQL_INSTANCE_ID = /^[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$/u;
 const DATABASE_NAME = /^[a-z_][a-z0-9_]{0,62}$/u;
 const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/u;
 const BUCKET_NAME = /^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$/u;
+/** A project's default Cloud Build bucket name (BUILD-SOURCE). */
+const BUILD_SOURCE_BUCKET = /^[a-z][a-z0-9-]{4,28}[a-z0-9]_cloudbuild$/u;
 const REPOSITORY_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const IMAGE_NAME = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/u;
 const CUSTOM_TIER = /^db-custom-([1-9][0-9]?)-([1-9][0-9]{2,6})$/u;
@@ -809,7 +823,7 @@ export function analyticsRefreshPoolMax({ readSource = defaultReadSource } = {})
 export const DESIRED_STATE_SHAPE = Object.freeze({
   desiredState: Object.freeze([
     "schemaVersion", "environment", "projectTenancy", "project", "projectNumber", "region", "artifactRegistry",
-    "serviceAccounts", "customRole", "secrets", "cloudSql", "bucket", "service", "jobs", "scheduler",
+    "serviceAccounts", "customRole", "secrets", "cloudSql", "bucket", "buildSource", "service", "jobs", "scheduler",
     "stagingOrigin",
   ]),
   artifactRegistry: Object.freeze(["repository", "imageName"]),
@@ -821,6 +835,8 @@ export const DESIRED_STATE_SHAPE = Object.freeze({
     "schema"]),
   bucket: Object.freeze(["name", "location", "proof"]),
   bucketProof: Object.freeze(["bucketGeneration", "bucketMetageneration"]),
+  // BUILD-SOURCE: the project's default Cloud Build bucket; the builder's role on it is fixed here.
+  buildSource: Object.freeze(["bucket"]),
   service: Object.freeze(["name", "maxInstances", "rolloutOverlapInstances", "audience", "telemetryStorageNamespace"]),
   job: Object.freeze(["name", "maxConnections"]),
   trigger: Object.freeze(["name", "schedule", "state"]),
@@ -1295,6 +1311,20 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const resourceNames = [service.name, ...JOB_NAMES.map((job) => jobs[job].name)];
   if (new Set(resourceNames).size !== resourceNames.length) fail("CLOUD_RUN_NAMES_NOT_DISTINCT");
+
+  // BUILD-SOURCE (after the project's own name checks): the bucket the
+  // plane's builds stage their source in is the project's default Cloud
+  // Build bucket, and no other.
+  closedKeys(input.buildSource, DESIRED_STATE_SHAPE.buildSource, "buildSource");
+  const buildSourceBucket = text(input.buildSource.bucket, BUILD_SOURCE_BUCKET, "buildSource.bucket");
+  if (buildSourceBucket !== buildSourceBucketName(project)) fail("BUILD_SOURCE_BUCKET_NAME_INVALID");
+  if (buildSourceBucket === bucket.name) fail("BUILD_SOURCE_BUCKET_NOT_DISTINCT");
+  const buildSource = {
+    bucket: buildSourceBucket,
+    location: region,
+    sourceDir: buildSourceStagingDir(project),
+  };
+
   // STG-PREP: the staging service's settings (null in production).
   const stagingOrigin = validateStagingOrigin(input.stagingOrigin, environment);
 
@@ -1312,6 +1342,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     secrets,
     cloudSql: { ...cloudSql, runtimeIamUser, migratorIamUser },
     bucket,
+    buildSource,
     service,
     jobs,
     scheduler,
@@ -1930,6 +1961,28 @@ export function bucketInsertBody(desired) {
   });
 }
 
+/**
+ * BUILD-SOURCE: the builder's one binding on the build-source bucket's own
+ * policy. Bucket-level only: the builder holds no storage role on the project.
+ */
+export function buildSourceReaderBinding(desired) {
+  return deepFreeze({ role: BUILD_SOURCE_READER_ROLE, member: desired.serviceAccounts.builder.member, condition: null });
+}
+
+/**
+ * BUILD-SOURCE: `gcloud storage buckets create` argv for an absent
+ * build-source bucket: the plane's region, uniform bucket-level access (bucket
+ * IAM is the only access path, so no object ACL can widen the builder's
+ * grant or add a reader) and public access prevention enforced (no public
+ * member can ever be bound). Nothing else is set; an existing bucket is never
+ * edited.
+ */
+export function buildSourceBucketCreateArgs(desired) {
+  return Object.freeze(["storage", "buckets", "create", `gs://${desired.buildSource.bucket}`,
+    `--project=${desired.project}`, `--location=${desired.buildSource.location}`,
+    "--uniform-bucket-level-access", "--public-access-prevention"]);
+}
+
 /** Reads and validates a desired-state JSON file. */
 export function readDesiredStateFile(path, { readFile = (target) => readFileSync(target, "utf8"), readSource } = {}) {
   let parsed;
@@ -1986,7 +2039,7 @@ export function deployedJobNames(desired = null) {
 
 /** The keys of OPS-10's closed RolloutTarget (scripts/gcp-production-rollout.mjs). */
 export const ROLLOUT_TARGET_KEYS = Object.freeze([
-  "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
+  "environment", "project", "projectNumber", "region", "service", "migrationJob", "jobNames", "primaryInstance",
   "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience", "maintenanceJob",
 ]);
 
@@ -2006,7 +2059,9 @@ export const MAINTENANCE_JOB_KEY = "maintenance";
 /**
  * OPS-10's RolloutTarget for a validated desired state: the service, the
  * deployed jobs (a deferred job does not exist, so the rollout never moves
- * it), the one primary instance, the image repository, the builder, and the
+ * it), the one primary instance, the image repository, the builder, the
+ * project number its build verb holds the build-source bucket's owner to
+ * (BUILD-SOURCE: gcloud skips that check for an explicit staging dir), and the
  * EP-6 verifier path roll reads /api/health through while the edge is not in
  * gcp mode: the verifier account and the origin's ID-token audience. A
  * rollout needs the verifier and the operator's token-creator grant on it, so
@@ -2023,6 +2078,7 @@ export function rolloutTargetFromDesiredState(desired) {
   return deepFreeze({
     environment: desired.environment,
     project: desired.project,
+    projectNumber: desired.projectNumber,
     region: desired.region,
     service: desired.service.name,
     migrationJob: desired.jobs["production-migrate"].name,
