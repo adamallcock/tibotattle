@@ -52,6 +52,10 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 2: K-VENDOR2's export patch of buildPricingEvent and the entry
   // facade's pricing re-exports, met with K-CORE-A at the PROD-PREP merge.
   "f45bc8e89f659bcecfab40c37b81ae130de36ceff7831f0cc0b057328421daef",
+  // Kernel 3: REFRESH-OPT's two vendored source patches (usage-row-evidence-
+  // memo, daily-fold-trusted-state) and its read and native-path changes; the
+  // same outputs, digest for digest, as kernel 2.
+  "712f8bd8d777ac04077c6c76ad1dd4aa012f576c279974c0304ccf302bfc6773",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
