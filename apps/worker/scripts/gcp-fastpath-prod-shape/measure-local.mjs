@@ -491,12 +491,13 @@ async function main() {
         ms: Math.round(performance.now() - migrateStarted) };
       await save();
       const workDirectory = await realpath(await mkdtemp(join(tmpdir(), "meas-synth-import-")));
-      if (options.pgStatIntervalSeconds !== null) {
-        report.steps.importWorkDirectory = workDirectory;
-        await save();
-      }
-      const importBefore = options.pgStatIntervalSeconds === null ? null : await capturePgStat(pool, "import-before");
+      let importBefore = null;
       try {
+        if (options.pgStatIntervalSeconds !== null) {
+          report.steps.importWorkDirectory = workDirectory;
+          await save();
+          importBefore = await capturePgStat(pool, "import-before");
+        }
         report.steps.import = await importProdShapeCorpus({ pool, suffix, corpus, workDirectory,
           log: (line) => console.error(line) });
       } finally {
