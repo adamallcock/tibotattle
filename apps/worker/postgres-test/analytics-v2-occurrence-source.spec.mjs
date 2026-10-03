@@ -707,33 +707,84 @@ test("K-READ: W(o) is stable, local to the owner, and moves with the owner's jou
       (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
   });
 
-test("N-EXCL: exclusion scopes are counted, never applied, and an undefined scope is refused",
-  { skip: SKIP, timeout: 120_000 }, async () => {
+test("N-EXCL: the exclusions are read whole and fail closed; F(o,d) and W(o) move with an exclusion of the owner",
+  { skip: SKIP, timeout: 300_000 }, async () => {
     const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
     await pool.query(`CREATE SCHEMA "${schema}"`);
     schemas.push(schema);
     await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active" });
     const scoped = { pool, schema, nowMs: NOW_MS };
-    const absent = await modules.owners.readAnalyticsV2ExclusionScopes(scoped);
-    assert.deepEqual({ ...absent, scopes: { ...absent.scopes } }, { table: "absent", scopes: {} });
-    // The D-PT4X table's declared contract (D1 0023's columns); created here
-    // only when this line does not have it yet.
-    await pool.query(`CREATE TABLE IF NOT EXISTS "${schema}".community_aggregate_exclusions (
-      exclusion_id text PRIMARY KEY, participant_id text NOT NULL, scope text NOT NULL, reason_code text NOT NULL,
-      state text NOT NULL, effective_at text NOT NULL, expires_at text, created_at text NOT NULL,
-      created_by_digest text NOT NULL, revoked_at text, revoked_by_digest text)`);
-    const row = (id, scope, state) => pool.query(`INSERT INTO "${schema}".community_aggregate_exclusions
-      (exclusion_id, participant_id, scope, reason_code, state, effective_at, created_at, created_by_digest,
-       revoked_at, revoked_by_digest)
-      VALUES ($1, 'participant:synthetic-excluded', $2, 'manual_review', $3, '2026-09-01T00:00:00.000Z',
-       '2026-09-01T00:00:00.000Z', $4, $5, $6)`, [id, scope, state, "c".repeat(64),
-      state === "revoked" ? "2026-09-02T00:00:00.000Z" : null, state === "revoked" ? "d".repeat(64) : null]);
-    await row("x1", "community_weekly", "active");
-    await row("x2", "community_weekly", "revoked");
-    const present = await modules.owners.readAnalyticsV2ExclusionScopes(scoped);
-    assert.deepEqual(JSON.parse(JSON.stringify(present)),
-      { table: "present", scopes: { community_weekly: { rows: 2, active: 1 } } });
-    await row("x3", "community_daily", "active");
-    await assert.rejects(modules.owners.readAnalyticsV2ExclusionScopes(scoped),
-      (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT", "a scope production does not define");
+    const table = `"${schema}".community_aggregate_exclusions`;
+    const exclusions = await load("/src/analytics-v2/exclusions.ts");
+    const read = () => modules.owners.readAnalyticsV2Exclusions(scoped);
+    const summary = (value) => ({ rows: value.rows, active: value.active,
+      participants: [...value.activeByParticipant.keys()].sort() });
+    const insert = (id, participantId, state, effectiveAt, expiresAt) => pool.query(`INSERT INTO ${table}
+        (exclusion_id, participant_id, scope, reason_code, state, effective_at, expires_at, created_at, created_by_digest,
+         revoked_at, revoked_by_digest)
+      VALUES ($1, $2, 'community_weekly', 'manual_review', $3, $4, $5, $4, $6, $7, $8)`, [id, participantId, state,
+      effectiveAt, expiresAt, "c".repeat(64), state === "revoked" ? effectiveAt : null, state === "revoked" ? "d".repeat(64) : null]);
+    const alpha = fixture.owners.alpha;
+    const bravo = fixture.owners.bravo;
+    const owners = [alpha.ownerDigest, bravo.ownerDigest];
+    const fingerprints = (ownerDigest) => modules.occurrences.readOwnerDayFingerprints(scoped,
+      { ownerDigest, fromDay: shift(D3, -30), throughDay: D3 });
+
+    // The primary table (0066) with no rows.
+    const empty = await read();
+    assert.deepEqual(summary(empty), { rows: 0, active: 0, participants: [] });
+    assert.equal(empty.sha256, exclusions.ANALYTICS_V2_NO_EXCLUSIONS_SHA256);
+    const alphaBefore = await fingerprints(alpha.ownerDigest);
+    const bravoBefore = await fingerprints(bravo.ownerDigest);
+    assert.ok(alphaBefore.has(D2), "alpha has evidence on D2");
+    const watermarksBefore = await modules.occurrences.readOwnerWatermarks(scoped, owners);
+
+    // An active exclusion of alpha covering D2 exactly, at microsecond resolution.
+    await insert("x1", alpha.participantId, "active", `${D2}T00:00:00.000000Z`, `${shift(D2, 1)}T00:00:00.000000Z`);
+    const one = await read();
+    assert.deepEqual(summary(one), { rows: 1, active: 1, participants: [alpha.participantId] });
+    const dayUs = Date.parse(`${D2}T00:00:00.000Z`) * 1_000;
+    assert.deepEqual(one.activeByParticipant.get(alpha.participantId),
+      [{ effectiveAtUs: dayUs, expiresAtUs: dayUs + 86_400_000_000 }]);
+    assert.notEqual(one.sha256, empty.sha256);
+    // F(o,d) moves for alpha's covered day only; another owner's does not.
+    const alphaAfter = await fingerprints(alpha.ownerDigest);
+    assert.deepEqual([...alphaAfter.keys()], [...alphaBefore.keys()]);
+    for (const [day, fingerprint] of alphaAfter) {
+      assert.equal(fingerprint !== alphaBefore.get(day), day === D2, day);
+    }
+    assert.deepEqual([...await fingerprints(bravo.ownerDigest)], [...bravoBefore]);
+    const watermarksOne = await modules.occurrences.readOwnerWatermarks(scoped, owners);
+    assert.notEqual(watermarksOne.get(alpha.ownerDigest), watermarksBefore.get(alpha.ownerDigest));
+    assert.equal(watermarksOne.get(bravo.ownerDigest), watermarksBefore.get(bravo.ownerDigest));
+
+    // A revoked row is history: it applies to no day and moves no fingerprint,
+    // but it is in the table's digest and the owner's watermark.
+    await insert("x2", bravo.participantId, "revoked", `${D1}T00:00:00.000000Z`, null);
+    const two = await read();
+    assert.deepEqual(summary(two), { rows: 2, active: 1, participants: [alpha.participantId] });
+    assert.notEqual(two.sha256, one.sha256);
+    assert.deepEqual([...await fingerprints(bravo.ownerDigest)], [...bravoBefore]);
+    const watermarksTwo = await modules.occurrences.readOwnerWatermarks(scoped, owners);
+    assert.notEqual(watermarksTwo.get(bravo.ownerDigest), watermarksOne.get(bravo.ownerDigest));
+    assert.equal(watermarksTwo.get(alpha.ownerDigest), watermarksOne.get(alpha.ownerDigest));
+    // Sub-millisecond instants are kept exactly (PostgreSQL's own resolution).
+    await insert("x3", alpha.participantId, "active", `${D3}T23:59:59.999999Z`, null);
+    assert.deepEqual((await read()).activeByParticipant.get(alpha.participantId)[1],
+      { effectiveAtUs: Date.parse(`${D3}T23:59:59.999Z`) * 1_000 + 999, expiresAtUs: null });
+
+    // A scope the contract does not define is refused, not ignored (the
+    // table's CHECK is dropped here only to plant one).
+    const check = await pool.query(`SELECT conname FROM pg_constraint WHERE conrelid = $1::regclass
+      AND pg_get_constraintdef(oid) LIKE '%community_weekly%'`, [table]);
+    assert.equal(check.rows.length, 1);
+    await pool.query(`ALTER TABLE ${table} DROP CONSTRAINT "${check.rows[0].conname}"`);
+    await pool.query(`INSERT INTO ${table} (exclusion_id, participant_id, scope, reason_code, state, effective_at,
+        created_at, created_by_digest) VALUES ('x4', 'participant:synthetic', 'community_daily', 'other', 'active',
+        now(), now(), $1)`, ["c".repeat(64)]);
+    await assert.rejects(read(), (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT", "an undefined scope");
+    // The table is required: its absence is never "no exclusions".
+    await pool.query(`ALTER TABLE ${table} RENAME TO community_aggregate_exclusions_hidden`);
+    await assert.rejects(read(), (error) => error?.code === "ANALYTICS_V2_SOURCE_UNAVAILABLE", "an absent table");
   });

@@ -39,8 +39,8 @@
  *
  * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
  * reviewed target path. The invocation is exactly
- *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full --workers=<n>
- * (ANALYTICS_REFRESH_PRODUCTION_JOB), with no --schema, --now or
+ *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full
+ * (ANALYTICS_REFRESH_PRODUCTION_JOB: inline, no --workers), with no --schema, --now or
  * --revision-seed, on the real clock. The environment is closed
  * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
  * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
@@ -135,8 +135,11 @@
  * statement ledger (K-PGSTAT `reads`: calls, client wall time, rows and bytes
  * per statement family, the read phase's unattributed remainder, and the
  * server's execution and planning time per family when pg_stat_statements is
- * readable), and the community aggregate exclusions it found (N-EXCL; as in
- * d43c8f92 they apply to no analytics_v2 output).
+ * readable), and content-free counts of the community aggregate exclusions
+ * it applied (N-EXCL, src/analytics-v2/exclusions.ts: an owner excluded on a
+ * day is left out of that day's public daily and allowance preview; the run
+ * row records the digest of the exclusions applied, and a run that finds
+ * them changed republishes every published day).
  *
  * The TypeScript store and the A-1/A-2 modules are loaded through literal
  * dynamic imports, so esbuild bundles them into the dist entry while the
@@ -240,45 +243,46 @@ export const ANALYTICS_REFRESH_RUNTIME_FORBIDDEN = Object.freeze(["NODE_OPTIONS"
 /**
  * The production refresh Job as C-INFRA renders it (gcp-ops-infra-manifest.mjs
  * renderJob; its check pins the render to this object). The task profile is
- * the dense one (4 vCPU, 16 GiB, a 10,752 MiB per-owner budget, 4 h) until
- * MEAS-3 measures the largest real owner on Cloud Run (dense-owner parity
- * receipt). The budget admits that owner at the high end of its estimate
- * (about 10 GiB when its records fall in the 170 analysis days, which memory
- * model v2 still charges whole; cap-raise receipt).
+ * the dense one (4 vCPU, 16 GiB, a 12,288 MiB heap, a 10,752 MiB per-owner
+ * budget, 4 h) until MEAS-3 measures the largest real owner on Cloud Run
+ * (dense-owner parity receipt). The budget admits that owner at the high end
+ * of its estimate (about 10 GiB when its records fall in the 170 analysis
+ * days, which memory model v2 still charges whole; cap-raise receipt). A run
+ * reclaims the part of it that its largest admitted owner leaves for the
+ * output account (compute reclaimUnusedOwnerBudget).
  *
- * K-PAR: owners are computed by four compute Workers (--workers=4, one per
- * vCPU). The per-owner budget is then the Workers' (owners running at once
- * keep their estimates within it, so the largest owner runs alone), and the
- * main heap (--max-old-space-size=3072) holds the runtime, one read chunk and
- * the output account, which takes the rest of it (no reclaim: the owners'
- * heaps are not the main heap's). Task memory: main heap 3,072 MiB + budget
- * 10,752 MiB + one Worker heap reserve of 1,024 MiB (the pool keeps the
- * Workers' heap limits together within the budget plus one reserve) =
- * 14,848 MiB of 16 GiB, leaving 1,536 MiB for native memory (pinned by
- * ANALYTICS_REFRESH_TASK_MEMORY_CHECK).
- * One task, no retries: a run either writes everything in one transaction or
- * nothing, and the time guard refuses it before taskTimeoutSeconds. `args`
- * follows `node`.
+ * Inline (workers 1, K-CORE-A review): compute Workers (K-PAR, --workers=<n>)
+ * stay out of the production profile until MEAS-3 measures a Worker's heap
+ * peak on real owners. A Worker's heap limit is its owner's estimate plus a
+ * fixed reserve, and the estimate is not a heap bound (the K-CORE-A receipt
+ * sampled 2,275 MiB of used heap for a 1,517 MiB estimate), so an owner that
+ * outgrows its Worker would fail the whole run where inline it computes in
+ * the 12,288 MiB heap. The test-deploy profile `dense-workers` runs the
+ * Workers for that measurement. One task, no retries: a run either writes
+ * everything in one transaction or nothing, and the time guard refuses it
+ * before taskTimeoutSeconds. `args` follows `node`.
  */
 export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
   entry: "dist/analytics-refresh.mjs",
   profile: "dense",
   cpu: "4",
   memory: "16Gi",
-  heapMiB: 3_072,
+  heapMiB: 12_288,
   memoryBudgetMiB: 10_752,
-  workers: 4,
+  workers: 1,
   taskTimeoutSeconds: 14_400,
   tasks: 1,
   parallelism: 1,
   maxRetries: 0,
-  args: Object.freeze(["--max-old-space-size=3072", "dist/analytics-refresh.mjs", "--mode=full", "--workers=4"]),
+  args: Object.freeze(["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]),
   env: ANALYTICS_REFRESH_PRODUCTION_ENV,
 });
 /**
- * The task-memory relation the production profile must keep (K-PAR): the main
- * heap, the Workers' per-owner budget and one heap reserve per Worker, with at
- * least nativeReserveMiB of the task's memory left for native allocations.
+ * The task-memory relation a refresh profile must keep (K-PAR): the main heap
+ * and, with compute Workers, the Workers' per-owner budget and one heap
+ * reserve (the pool keeps the Workers' heap limits together within the budget
+ * plus one reserve; inline the budget is inside the main heap), with at least
+ * nativeReserveMiB of the task's memory left for native allocations.
  */
 export const ANALYTICS_REFRESH_TASK_MEMORY_CHECK = Object.freeze({ taskMemoryMiB: 16_384, nativeReserveMiB: 1_024 });
 const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed", "workers"]);
@@ -394,8 +398,8 @@ refusal) or 1 (failure).
 Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
 exactly PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
 POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
---revision-seed; run as node --max-old-space-size=3072 dist/analytics-refresh.mjs
---mode=full --workers=4 (the dense profile, 4 h task timeout).
+--revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
+--mode=full (the dense profile, inline, 4 h task timeout).
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
@@ -1032,17 +1036,20 @@ export function analyticsRefreshRunStamp(store, identity) {
   return store.analyticsV2BaselineRunStamp(kernel);
 }
 
-/** The receipt's content-free exclusion counts (N-EXCL), or null when the pipeline did not read them. */
+/**
+ * The receipt's content-free exclusion counts (N-EXCL, the pipeline's closed
+ * summary), or null when an injected pipeline reported none.
+ */
 function exclusionSummary(value) {
-  if (value === null || typeof value !== "object" || !["present", "absent"].includes(value.table)) return null;
-  const scopes = {};
-  for (const [scope, counts] of Object.entries(value.scopes ?? {})) {
-    if (!/^[a-z_]{1,32}$/u.test(scope) || !Number.isSafeInteger(counts?.rows) || !Number.isSafeInteger(counts?.active)) {
-      return null;
-    }
-    scopes[scope] = Object.freeze({ rows: counts.rows, active: counts.active });
+  if (value === null || typeof value !== "object"
+      || Object.keys(value).sort().join(",") !== "active,changed,excludedOwners,republishedDays,rows"
+      || ![value.rows, value.active, value.excludedOwners, value.republishedDays]
+        .every((count) => Number.isSafeInteger(count) && count >= 0)
+      || typeof value.changed !== "boolean") {
+    return null;
   }
-  return Object.freeze({ table: value.table, scopes: Object.freeze(scopes), applied: false });
+  return Object.freeze({ rows: value.rows, active: value.active, excludedOwners: value.excludedOwners,
+    changed: value.changed, republishedDays: value.republishedDays });
 }
 
 function safeCode(error, fallback) {
@@ -1276,6 +1283,8 @@ export async function runAnalyticsRefresh({
         timings: { read: readMs + (Number.isFinite(outputs.timings?.read) ? outputs.timings.read : 0) },
         wallClock,
         stamp,
+        // N-EXCL: the exclusions this run applied (the store refuses a run without them).
+        exclusionsSha256: outputs.exclusionsSha256,
       });
       // Content-free read counts the default pipeline reports (closed keys).
       const readSummary = Object.fromEntries(READ_SUMMARY_KEYS

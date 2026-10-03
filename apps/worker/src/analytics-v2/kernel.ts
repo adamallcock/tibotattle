@@ -21,7 +21,7 @@
  *   stored result was computed under different resources.
  *
  * Every analytics_v2 row a run writes carries its kernel_id and
- * manifest_version (staged migration analytics_v2_kernel_stamps; the store
+ * manifest_version (staged migration analytics_v2_run_stamps; the store
  * refuses ANALYTICS_V2_KERNEL_CONFLICT for a registry entry that disagrees
  * with the stored kernel row and ANALYTICS_V2_KERNEL_REGRESSION when a newer
  * kernel already wrote, so an older reader never mutates newer state).

@@ -344,10 +344,24 @@ function daySpan(fromDay, throughDay) {
  * The days a full run publishes (production's queue): the days named by
  * journal events after the cursor plus the days the last run left blocked (a
  * blocked day is not consumed). Published heads that are neither are never
- * recomputed.
+ * recomputed, except when the community aggregate exclusions changed since
+ * the last completed run (N-EXCL, `exclusionsChanged`): every published day
+ * is then queued too, so a new, revoked or edited exclusion reaches each day
+ * it covers or covered (a day whose content is unchanged keeps its revision).
  */
-export function analyticsRefreshPublicationDays(journalDays, state) {
-  return [...new Set([...journalDays, ...state.carriedBlockedDays])].sort();
+export function analyticsRefreshPublicationDays(journalDays, state, { exclusionsChanged = false } = {}) {
+  return [...new Set([...journalDays, ...state.carriedBlockedDays,
+    ...(exclusionsChanged ? state.publishedDays : [])])].sort();
+}
+
+/**
+ * The content-free summary of one run's community aggregate exclusions
+ * (N-EXCL): rows of every state, active rows, owners of the run that have an
+ * active exclusion, whether the table changed since the last completed run,
+ * and the published days that change queued. Counts only; never an id.
+ */
+function exclusionsSummary(exclusions, excludedOwners, changed, republishedDays) {
+  return Object.freeze({ rows: exclusions.rows, active: exclusions.active, excludedOwners, changed, republishedDays });
 }
 
 /**
@@ -504,6 +518,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const countOccurrences = requireFunction(occurrences, "countOwnerOccurrences");
   const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
   const countDevices = requireFunction(devices, "countContributingDevices");
+  const readExclusions = requireFunction(owners, "readAnalyticsV2Exclusions");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
   const requiredRange = requireFunction(compute, "analyticsV2RequiredOccurrenceRange");
   const analysisDays = requirePositiveInteger(compute?.ANALYTICS_V2_ANALYSIS_DAYS, "ANALYTICS_V2_ANALYSIS_DAYS");
@@ -608,14 +623,32 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           || !listing.unlinked.every((owner) => owner !== null && typeof owner === "object")) {
         fail("ANALYTICS_V2_REFRESH_OWNERS_INVALID");
       }
-      // N-EXCL: the exclusions that exist, read in the run's snapshot. As in
-      // d43c8f92 they remove no owner from any analytics_v2 output (owners.ts
-      // ANALYTICS_V2_EXCLUSION_SCOPES); a scope production does not define is
-      // refused. A module without the reader (a spec stub) reports null.
-      const exclusions = typeof owners?.readAnalyticsV2ExclusionScopes === "function"
-        ? await owners.readAnalyticsV2ExclusionScopes(context) : null;
+      // N-EXCL (src/analytics-v2/exclusions.ts): the community aggregate
+      // exclusions, read in the run's snapshot. A linked owner's active rows
+      // go to A-2, which leaves the owner out of each covered day's community
+      // aggregates; an unlinked participant is in no aggregate. When the
+      // table changed since the last completed run, every published day is
+      // republished.
+      const exclusions = await readExclusions(context);
+      if (exclusions === null || typeof exclusions !== "object" || !Number.isSafeInteger(exclusions.rows)
+          || !Number.isSafeInteger(exclusions.active) || exclusions.active < 0 || exclusions.active > exclusions.rows
+          || typeof exclusions.sha256 !== "string"
+          || !OWNER_DIGEST.test(exclusions.sha256) || !(exclusions.activeByParticipant instanceof Map)) {
+        fail("ANALYTICS_V2_REFRESH_EXCLUSIONS_INVALID");
+      }
+      if (typeof state.appliedExclusionsSha256 !== "string" || !OWNER_DIGEST.test(state.appliedExclusionsSha256)
+          || !Array.isArray(state.publishedDays) || !state.publishedDays.every(isDay)) {
+        fail("ANALYTICS_V2_REFRESH_STATE_INVALID");
+      }
+      const exclusionsByOwner = new Map();
+      for (const owner of listing.owners) {
+        const intervals = exclusions.activeByParticipant.get(owner.participantId);
+        if (intervals !== undefined) exclusionsByOwner.set(owner.ownerDigest, intervals);
+      }
+      const exclusionsChanged = exclusions.sha256 !== state.appliedExclusionsSha256;
       const journal = await readJournal(context, state.cursor);
-      const days = analyticsRefreshPublicationDays(journal.days, state);
+      const unchangedDays = analyticsRefreshPublicationDays(journal.days, state);
+      const days = analyticsRefreshPublicationDays(journal.days, state, { exclusionsChanged });
       if (days.length > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
       const today = utcDay(nowMs);
       const ownerList = [...listing.owners].sort(compareOwners);
@@ -722,7 +755,10 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         lastSequence: journal.lastSequence,
         terminalOwners: journal.terminalOwners,
         nonEffectiveUnread,
-        exclusions,
+        exclusionsByOwner,
+        exclusionsSha256: exclusions.sha256,
+        exclusions: exclusionsSummary(exclusions, exclusionsByOwner.size, exclusionsChanged,
+          days.length - unchangedDays.length),
         ...(resources?.compute === undefined ? {} : { resources: resources.compute }),
       };
     },
@@ -738,6 +774,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         revisionSeed,
         loadOwnerOccurrences: inputs.loadOwnerOccurrences,
         ownerEvidence: inputs.ownerEvidence,
+        exclusions: inputs.exclusionsByOwner,
         // Inline, the Job's resources partition one heap (analyticsRefreshResources),
         // so the run may reclaim the per-owner budget its largest owner leaves.
         // With compute workers (K-PAR) the owners' heaps are the Workers', and
@@ -776,7 +813,9 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           terminalOwners: inputs.terminalOwners,
           nonEffectiveUnread: inputs.nonEffectiveUnread,
         },
-        exclusions: inputs.exclusions ?? null,
+        // N-EXCL: what the run applied, for the run row and the receipt.
+        exclusionsSha256: inputs.exclusionsSha256,
+        exclusions: inputs.exclusions,
       };
     },
   });

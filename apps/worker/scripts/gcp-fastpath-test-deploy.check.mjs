@@ -129,16 +129,27 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
   expectCode(() => refreshJobCommand({ image: IMAGE, extraEnv: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
 });
 
-test("refresh profiles: the standard Job stays the default; the dense Job is 4 vCPU, 16 GiB with a fitting budget", () => {
+test("refresh profiles: the standard Job stays the default; the dense Jobs are 4 vCPU, 16 GiB with a fitting budget", () => {
   assert.equal(REFRESH_JOB_RESOURCES, REFRESH_JOB_PROFILES.standard);
-  assert.deepEqual(Object.keys(REFRESH_JOB_PROFILES), ["standard", "dense"]);
+  assert.deepEqual(Object.keys(REFRESH_JOB_PROFILES), ["standard", "dense", "dense-workers"]);
   assert.deepEqual(refreshJobCommand({ image: IMAGE }), refreshJobCommand({ image: IMAGE, profile: "standard" }));
   const dense = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense" });
   for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
     assert.equal(dense.includes(flag), true, flag);
   }
-  assert.equal(dense.some((arg) => arg.startsWith("--args=--max-old-space-size=3072,dist/analytics-refresh.mjs,")
+  // The dense profile is the production profile: inline (no --workers).
+  assert.equal(dense.some((arg) => arg.startsWith("--args=--max-old-space-size=12288,dist/analytics-refresh.mjs,")
+    && !arg.includes("--workers")), true);
+  // dense-workers is the MEAS-3 measurement of the compute Workers (K-PAR):
+  // the same task and budget, a 3,072 MiB main heap and four Workers.
+  const workers = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense-workers" });
+  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
+    assert.equal(workers.includes(flag), true, flag);
+  }
+  assert.equal(workers.some((arg) => arg.startsWith("--args=--max-old-space-size=3072,dist/analytics-refresh.mjs,")
     && arg.endsWith(",--workers=4")), true);
+  assert.equal(workers.some((arg) => arg.startsWith("--set-env-vars=")
+    && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")), true);
   assert.equal(dense.some((arg) => arg.startsWith("--set-env-vars=") && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")
     && arg.includes("ANALYTICS_V2_TEST_CLOCK=1")), true);
   // An explicit --refresh-env still overrides the profile's budget.

@@ -445,22 +445,36 @@ export async function postgresTestEndpoint(env = process.env) {
 
 /**
  * Spec fixtures that write analytics_v2 rows by hand (not through the
- * refresh store) write them as kernel 1 on the compiled baseline manifest.
- * Once K-STAMP's migration (analytics_v2_kernel_stamps) is in a schema, its
- * stamp columns have no default; this gives them a schema-local default of
- * 1 so such fixtures need not name the stamp. A no-op on a schema without
- * the migration. Test-only, like the rest of this module.
+ * refresh store) write them as kernel 1 on the compiled baseline manifest,
+ * having applied no exclusion. Once the run-stamps migration
+ * (analytics_v2_run_stamps) is in a schema, a row must name its kernel (a
+ * registered one) and a run row its applied exclusions; this registers
+ * kernel-registry.json's entry 1 (the migration seeds none: a run registers
+ * its own kernel) and gives the stamp columns schema-local defaults of 1 and
+ * the digest of no exclusions, so such fixtures need not name them. A no-op
+ * on a schema without the migration. Test-only, like the rest of this module.
  */
+export const NO_ANALYTICS_V2_EXCLUSIONS_SHA256 = "881387e9ebd61f0993e6e10b6c5cdb6f8fd807432640bbfeca0c0fe15e460118";
+
 export async function defaultAnalyticsV2FixtureStamps(pool, schema) {
   const present = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present",
     [`${renderQuotedSchema(schema)}.analytics_v2_kernels`]);
   if (present.rows[0]?.present !== true) return false;
+  const registry = JSON.parse(await readFile(join(WORKER_ROOT, "src", "analytics-v2", "kernel-registry.json"), "utf8"));
+  const kernel = registry.kernels[0];
+  await pool.query(`INSERT INTO ${renderQuotedSchema(schema)}.analytics_v2_kernels (kernel_id, production_commit,
+      vendor_manifest_sha256, compute_closure_sha256, price_registry_sha256, price_registry_version, method_version,
+      registered_at) VALUES ($1, $2, $3, $4, $5, $6, $7, '2026-10-02T00:00:00Z') ON CONFLICT DO NOTHING`,
+  [kernel.kernelId, kernel.productionCommit, kernel.vendorManifestSha256, kernel.computeClosureSha256,
+    kernel.priceRegistrySha256, kernel.priceRegistryVersion, kernel.methodVersion]);
   for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_cache_bands",
     "analytics_v2_owner_fits", "analytics_v2_owner_model_dates", "analytics_v2_published_daily",
     "analytics_v2_preview"]) {
     await pool.query(`ALTER TABLE ${renderQuotedSchema(schema)}.${table}
       ALTER COLUMN kernel_id SET DEFAULT 1, ALTER COLUMN manifest_version SET DEFAULT 1`);
   }
+  await pool.query(`ALTER TABLE ${renderQuotedSchema(schema)}.analytics_v2_runs
+    ALTER COLUMN exclusions_sha256 SET DEFAULT '${NO_ANALYTICS_V2_EXCLUSIONS_SHA256}'`);
   return true;
 }
 

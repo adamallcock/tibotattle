@@ -78,8 +78,10 @@ import {
   dayNumber,
   nowTimestamp,
   onReadSnapshot,
+  participantExclusionsWatermarkSql,
   queryPrepared,
   quotedSchema,
+  readParticipantActiveExclusions,
   safeInteger,
   sourceFail,
   typedIdTextSql,
@@ -88,6 +90,7 @@ import {
   type AnalyticsV2PreparedStatement,
   type AnalyticsV2SnapshotContext,
 } from "./owners";
+import { analyticsV2ExclusionsOn } from "./exclusions";
 
 export type { EffectiveTelemetryOccurrence, EffectiveTelemetryStream };
 
@@ -1297,8 +1300,11 @@ export async function readOwnerFirstEvidenceDay(
 // Evidence identity (K-READ): the owner watermark W(o) and the day fingerprint F(o,d)
 // ---------------------------------------------------------------------------
 
-/** Version of the fingerprint and watermark constructions below. */
-export const ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD = "analytics-v2-evidence-identity-v1" as const;
+/**
+ * Version of the fingerprint and watermark constructions below (v2: both
+ * carry the community aggregate exclusions, N-EXCL).
+ */
+export const ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD = "analytics-v2-evidence-identity-v2" as const;
 
 /** A driver row as canonical data: bytea as hex, every column by name. */
 function canonicalRow(row: Record<string, unknown>): Array<[string, unknown]> {
@@ -1315,12 +1321,15 @@ function canonicalRow(row: Record<string, unknown>): Array<[string, unknown]> {
  * (occurrence id and candidate time, in reader order) and, for each of them,
  * every source row the reader's expansion selects for that occurrence on any
  * day (all columns of the legacy, v1.2 and correction rows, in physical
- * order), with the owner scope that decides which families are read. It runs
- * exactly the reader's statements (the same candidate SQL and the same
- * prepared expansion statements) and skips decoding and reconciliation, so
- * an unchanged F(o,d) means readOwnerOccurrences returns the same occurrences
- * for (o, d), and so the same analyticsV2DayDigest: the reader's output is a
- * pure function of the scope, the candidates and those rows. A day absent
+ * order), with the owner scope that decides which families are read, and the
+ * participant's active community aggregate exclusions that cover d (N-EXCL:
+ * id and interval, exclusions.ts), which decide whether the owner's d enters
+ * the community aggregates. It runs exactly the reader's statements (the same
+ * candidate SQL and the same prepared expansion statements) and skips
+ * decoding and reconciliation, so an unchanged F(o,d) means
+ * readOwnerOccurrences returns the same occurrences for (o, d), and so the
+ * same analyticsV2DayDigest, and the same exclusion of (o, d): the reader's
+ * output is a pure function of the scope, the candidates and those rows. A day absent
  * from the map has no candidate (known empty); the reader's refusals
  * (ANALYTICS_V2_SOURCE_*) are the reader's here too. Content-free: the
  * fingerprint is a digest of rows the snapshot already holds, never stored
@@ -1337,6 +1346,7 @@ export async function readOwnerDayFingerprints(
     const scope = await readOwnerScope(client, s, base.ownerDigest);
     const scopeKey = [scope.participantId, scope.v1Namespace, scope.v11Namespace, scope.correctionActive,
       scope.v12RuntimeActive, scope.v12HeadActive];
+    const exclusions = await readParticipantActiveExclusions(client, s, scope.participantId);
     const statements = await readerStatements(s);
     const byDay = new Map<number, Record<EffectiveTelemetryStream, string | null>>();
     for (const stream of ["usage", "quota", "session"] as const) {
@@ -1388,8 +1398,10 @@ export async function readOwnerDayFingerprints(
     const output = new Map<AnalyticsV2Day, string>();
     for (const day of [...byDay.keys()].sort((left, right) => left - right)) {
       const entry = byDay.get(day)!;
+      const covering = analyticsV2ExclusionsOn(exclusions, dayFromNumber(day))
+        .map((exclusion) => [exclusion.exclusionId, exclusion.effectiveAtUs, exclusion.expiresAtUs]);
       output.set(dayFromNumber(day), await sha256Hex(canonicalJson([ANALYTICS_V2_EVIDENCE_IDENTITY_METHOD,
-        dayFromNumber(day), entry.usage, entry.quota, entry.session])));
+        dayFromNumber(day), entry.usage, entry.quota, entry.session, covering])));
     }
     return output;
   });
@@ -1403,9 +1415,10 @@ export const MAX_ANALYTICS_V2_WATERMARK_OWNERS = 1_000;
  * journal head (storage_owner_revisions: revision, authority epoch, state,
  * last sequence, content digest), its active owner link and participant
  * state, the reader's retained v1.2 authorization scope rows for the
- * participant at the pinned clock, the participant's v1.2 domain head, and
- * the runtime and admission states that decide which source families the
- * reader reads. One statement covers every requested owner. An owner without
+ * participant at the pinned clock, the participant's v1.2 domain head, its
+ * community aggregate exclusion rows of any state (N-EXCL), and the runtime
+ * and admission states that decide which source families the reader reads.
+ * One statement covers every requested owner. An owner without
  * an active link or journal head gets the digest of its absence, never an
  * inferred value.
  *
@@ -1444,6 +1457,7 @@ export async function readOwnerWatermarks(context: AnalyticsV2SnapshotContext,
                  FROM retained WHERE retained.participant_id = link.participant_id) AS retained_devices,
               (SELECT head.generation_id FROM ${s}.telemetry_v12_domain_heads head
                 WHERE head.participant_id = link.participant_id) AS v12_generation_id,
+              ${participantExclusionsWatermarkSql(s, "link.participant_id")} AS exclusions,
               (SELECT state FROM ${s}.telemetry_v12_runtime WHERE id = 1) AS v12_state,
               ${correctionRuntimeActiveSql(s)} AS correction_active,
               (SELECT namespace_id::text || ':' || source_namespace FROM ${s}.typed_v1_admission_state

@@ -243,7 +243,7 @@ test("the analytics-refresh job renders the production refresh-job contract in t
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
   assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense", cpu: "4", memory: "16Gi",
-    heapMiB: 3_072, memoryBudgetMiB: 10_752, workers: 4, timeoutSeconds: 14_400 });
+    heapMiB: 12_288, memoryBudgetMiB: 10_752, workers: 1, timeoutSeconds: 14_400 });
   // It is the dense measurement profile (MEAS-3 runs it), field for field,
   // including the budget that profile sets, so the two cannot drift.
   const dense = REFRESH_JOB_PROFILES.dense;
@@ -258,10 +258,10 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
     const task = job.spec.template.spec.template.spec;
     const container = task.containers[0];
-    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full --workers=4, nothing else.
+    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else: owners are
+    // computed inline until MEAS-3 measures the compute Workers (K-CORE-A review).
     assert.deepEqual(container.command, ["node"]);
-    assert.deepEqual(container.args, ["--max-old-space-size=3072", "dist/analytics-refresh.mjs", "--mode=full",
-      "--workers=4"]);
+    assert.deepEqual(container.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
     assert.deepEqual(container.resources, { limits: { cpu: "4", memory: "16Gi" } });
     assert.equal(task.timeoutSeconds, "14400");
     assert.equal(task.serviceAccountName, desired.serviceAccounts.runtime.email);
@@ -288,10 +288,10 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.equal(parsed.mode, "full");
     assert.equal(parsed.schema, desired.cloudSql.schema);
     assert.equal(parsed.nowMs, null);
-    assert.equal(parsed.workers, 4);
+    assert.equal(parsed.workers, 1);
     // Its resource gate admits the rendered budget under the profile's heap
-    // with four compute Workers, and refuses it under a heap one MiB short
-    // of its reserves (and, inline, a budget that no longer fits the heap).
+    // (inline: the budget is inside the heap), and refuses it under a heap
+    // one MiB short of budget plus reserve.
     const MIB = 1024 * 1024;
     const heap = manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB * MIB;
     const resources = analyticsRefreshResources(env, heap, { workers: parsed.workers });
@@ -299,14 +299,14 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.ok(resources.requiredHeapBytes <= heap);
     assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB, { workers: parsed.workers }),
       { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
-    assert.throws(() => analyticsRefreshResources(env, heap), { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
-    // The task memory holds the main heap, the Workers' budget and their
-    // heap reserves, with the native reserve left over.
+    // The task memory holds the heap (and, inline, no Worker heaps), with the
+    // native reserve left over.
     const memory = ANALYTICS_REFRESH_TASK_MEMORY_CHECK;
     assert.equal(memory.taskMemoryMiB, Number.parseInt(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory, 10) * 1024);
-    // (The pool holds the Workers' heap limits together within the budget plus one reserve.)
-    assert.ok(manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB + manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB
-      + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB <= memory.taskMemoryMiB - memory.nativeReserveMiB);
+    const workerMiB = manifest.ANALYTICS_REFRESH_TASK_PROFILE.workers > 1
+      ? manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB : 0;
+    assert.ok(manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB + workerMiB
+      <= memory.taskMemoryMiB - memory.nativeReserveMiB);
 
     // The render IS the entry's production job (C-REFRESH), field for field.
     await assertRefreshRenderIsProductionJob(job, desired);
@@ -321,8 +321,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
       ["8Gi", (value) => { containerOf(value).resources.limits.memory = "8Gi"; }],
       ["2 vCPU", (value) => { containerOf(value).resources.limits.cpu = "2"; }],
       ["heap 6144", (value) => { containerOf(value).args[0] = "--max-old-space-size=6144"; }],
-      ["inline", (value) => { containerOf(value).args.pop(); }],
-      ["eight workers", (value) => { containerOf(value).args[3] = "--workers=8"; }],
+      ["four workers", (value) => { containerOf(value).args.push("--workers=4"); }],
+      ["one worker flag", (value) => { containerOf(value).args.push("--workers=1"); }],
       ["retries", (value) => { value.spec.template.spec.template.spec.maxRetries = 3; }],
       ["two tasks", (value) => { value.spec.template.spec.taskCount = 2; }],
       ["budget", (value) => { containerOf(value).env.find((entry) => entry.name === "ANALYTICS_V2_MEMORY_BUDGET_MIB")
@@ -1022,8 +1022,8 @@ test("the two jobs render with their accounts, entries and bounds, the analytics
     assert.doesNotMatch(JSON.stringify(job), /LEDGER|HISTORY_PROOF/u);
   }
   assert.equal(task(migrate).timeoutSeconds, "1800");
-  assert.deepEqual(task(refresh).containers[0].args, ["--max-old-space-size=3072", "dist/analytics-refresh.mjs",
-    "--mode=full", "--workers=4"]);
+  assert.deepEqual(task(refresh).containers[0].args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs",
+    "--mode=full"]);
   // OPS-10's PRODUCTION_MIGRATION_JOB entry (its build output) and exactly
   // the env its validateProductionMigrationEnvironment reads.
   assert.deepEqual(task(migrate).containers[0].args, ["dist/production-migrations.mjs"]);

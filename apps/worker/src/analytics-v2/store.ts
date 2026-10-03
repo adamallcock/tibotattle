@@ -24,8 +24,9 @@
  *     blocked day is never written, so it keeps its prior row (or stays
  *     absent);
  *  4. it upserts the preview, advances the journal cursor (never backwards),
- *     and inserts the run row with the refusal list and the publication
- *     summary.
+ *     and inserts the run row with the refusal list, the publication
+ *     summary, the kernel stamp and the digest of the community aggregate
+ *     exclusions the run applied (N-EXCL).
  *
  * Any failure rolls the whole transaction back: no analytics_v2 row changes.
  *
@@ -47,7 +48,7 @@
  */
 
 import type { PostgresClient } from "../postgres-client";
-import type { AnalyticsV2PublicationSummary, AnalyticsV2RunOutputs } from "./contract";
+import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2PublicationSummary, type AnalyticsV2RunOutputs } from "./contract";
 import { analyticsV2CompatibilitySha256 } from "./kernel";
 import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
 import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily } from "./store-publication";
@@ -131,6 +132,9 @@ export async function writeRunOutputs(
       && (typeof options.expectedCursor !== "string" || !DECIMAL.test(options.expectedCursor))) {
     fail("ANALYTICS_V2_RUN_INVALID", "expectedCursor");
   }
+  if (typeof options.exclusionsSha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(options.exclusionsSha256)) {
+    fail("ANALYTICS_V2_RUN_INVALID", "exclusionsSha256");
+  }
   const callerTimings = options.timings === undefined ? {} : validTimings(options.timings, "options.timings");
   const horizon = validHorizon(options.horizon);
   const stamp = validRunStamp(options.stamp);
@@ -184,7 +188,8 @@ export async function writeRunOutputs(
         account: prepared.resources.account };
     await insertAnalyticsV2RunRow(client, schema, { runId, startedAtMs: options.startedAtMs, finishedAtMs,
       mode: prepared.mode, owners: ownerDigests.length, ownerDays: outputs.ownerDays.length,
-      refusals: prepared.refusals, publication, timings: recorded, stamp, compatibilitySha256 });
+      refusals: prepared.refusals, publication, timings: recorded, stamp, compatibilitySha256,
+      exclusionsSha256: options.exclusionsSha256 });
     await client.query("COMMIT");
     transactionStarted = false;
     return Object.freeze({

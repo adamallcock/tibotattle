@@ -64,7 +64,7 @@ export const ANALYTICS_V2_TABLES = Object.freeze({
   publishedDaily: "analytics_v2_published_daily",
   preview: "analytics_v2_preview",
   journalCursor: "analytics_v2_journal_cursor",
-  // K-STAMP (staged migration analytics_v2_kernel_stamps): kernel-registry.json's copy.
+  // K-STAMP (staged migration analytics_v2_run_stamps): kernel-registry.json's copy.
   kernels: "analytics_v2_kernels",
 } as const);
 export type AnalyticsV2TableKey = keyof typeof ANALYTICS_V2_TABLES;
@@ -90,6 +90,7 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
   runs: Object.freeze([
     "run_id", "started_at", "finished_at", "mode", "state", "owners", "owner_days",
     "refusals", "publication", "timings", "kernel_id", "manifest_version", "compatibility_sha256",
+    "exclusions_sha256",
   ] as const),
   ownerDay: Object.freeze(["owner_digest", "day", "daily", "refusal", "run_id", "kernel_id", "manifest_version"] as const),
   cacheBands: Object.freeze([

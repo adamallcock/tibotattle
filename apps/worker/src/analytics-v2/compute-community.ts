@@ -9,6 +9,12 @@
  * CONTENT: it is the sha256 of the canonical payload without its revision
  * stamp (aggregateId, revision, releasedAt), so an unchanged day keeps its
  * revision. A-3 restamps a changed day with stampAnalyticsV2DailyPayload.
+ *
+ * Community aggregate exclusions (N-EXCL, exclusions.ts): an owner excluded on
+ * day D is left out of D's daily fold (values and devices) and out of the
+ * preview's day D (its fits in the band, its model result for date D, refused
+ * or evaluated); the preview's coverage counts are those of today. With no
+ * exclusion the outputs are exactly the fold without them.
  */
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
@@ -33,6 +39,7 @@ import type {
   AnalyticsV2Owner,
   AnalyticsV2OwnerDigest,
 } from "./contract";
+import { analyticsV2ExcludedOn, type AnalyticsV2ExclusionInterval } from "./exclusions";
 
 /**
  * Model history dates, newest last: today and the 69 days before it. This is
@@ -99,11 +106,13 @@ export interface AnalyticsV2CommunityInput {
   readonly compositionsByDate: ReadonlyMap<AnalyticsV2Day,
     ReadonlyArray<{ readonly ownerDigest: string; readonly result: V1ModelCompositionResult }>>;
   /**
-   * model date -> effective owners whose evaluation the kernels refused. (A
-   * memory-refused owner has no fit, so the preview that carries the model
-   * dates is withheld for the run; it is never counted here.)
+   * model date -> effective owners whose evaluation the kernels refused, in
+   * digest order. (A memory-refused owner has no fit, so the preview that
+   * carries the model dates is withheld for the run; it is never listed here.)
    */
-  readonly modelRefusedByDate: ReadonlyMap<AnalyticsV2Day, number>;
+  readonly modelRefusedByDate: ReadonlyMap<AnalyticsV2Day, readonly AnalyticsV2OwnerDigest[]>;
+  /** computed owner -> its active community aggregate exclusions (N-EXCL; absent: none). */
+  readonly exclusions: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
 }
 
 /** The queued days' daily candidates and the preview (or null when it is withheld). */
@@ -113,19 +122,23 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
 }> {
   const nowIso = new Date(input.nowMs).toISOString();
   const computedOwners = input.computedOwners;
+  const excluded = (ownerDigest: AnalyticsV2OwnerDigest, day: AnalyticsV2Day): boolean =>
+    analyticsV2ExcludedOn(input.exclusions.get(ownerDigest), day);
   const dailyCandidates: AnalyticsV2ComputedDailyCandidate[] = [];
   for (const day of input.queued) {
     if (input.blocked.has(day)) continue;
     const byOwner = input.dailyValues.get(day)!;
     // A memory-refused owner blocks every queued day it has evidence on, so
     // on an unblocked day it has none: its values would be all zero, and
-    // publicInputs adds nothing for an owner without records.
-    const values = computedOwners.map((owner) => byOwner.get(owner.ownerDigest)!);
+    // publicInputs adds nothing for an owner without records. An owner
+    // excluded on the day (N-EXCL) is left out of its fold.
+    const included = computedOwners.filter((owner) => !excluded(owner.ownerDigest, day));
+    const values = included.map((owner) => byOwner.get(owner.ownerDigest)!);
     const counted = input.devicesByDay.get(day);
     const devices = values.map((value, index) => {
       if (value.counts.usage + value.counts.quota + value.counts.session === 0) return 0;
       if (counted === undefined) return invalid("devicesByDay.missingDay");
-      return counted.get(computedOwners[index]!.ownerDigest) ?? 1;
+      return counted.get(included[index]!.ownerDigest) ?? 1;
     });
     const inputs = publicInputs(values, devices);
     const payload = buildCommunityDailyPayload({ day, revision: input.revisionSeed + 1, releasedAt: nowIso, ...inputs });
@@ -141,16 +154,16 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
   if (input.effectiveDigests.some((ownerDigest) => !input.fitsByOwner.has(ownerDigest))) {
     return { dailyCandidates, preview: null };
   }
-  const fits = computedOwners.flatMap((owner) => input.fitsByOwner.get(owner.ownerDigest)!);
-  const cohort = computedOwners.map((owner) => owner.ownerDigest);
   const modelDays: AdminCommunityModelCompositionDay[] = [];
   for (const day of input.modelDates) {
-    const evaluated = input.compositionsByDate.get(day)!;
+    // An owner excluded on this date (N-EXCL) is outside its composition,
+    // evaluated or refused.
+    const evaluated = input.compositionsByDate.get(day)!.filter(({ ownerDigest }) => !excluded(ownerDigest, day));
     // An effective owner the kernels refused for this date is still a member
     // of its cohort: it is counted as refused, never dropped, even when no
     // owner could be evaluated (owner decision 2026-10-01, D7). A date with
     // no effective member at all is not published.
-    const refused = input.modelRefusedByDate.get(day)!;
+    const refused = input.modelRefusedByDate.get(day)!.filter((ownerDigest) => !excluded(ownerDigest, day)).length;
     if (evaluated.length === 0 && refused === 0) continue;
     const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: refused,
       unsupportedSourceParticipantCount: 0, refusedParticipantCount: refused, storeAvailable: true };
@@ -161,10 +174,39 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
     }
     modelDays.push(buildCommunityModelCompositionDay(collection, day));
   }
-  const built = buildAdminCommunityAllowancePreview(fits, input.nowMs, cohort, {
+  const models: Parameters<typeof buildAdminCommunityAllowancePreview>[3] = {
     modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
-    gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, days: modelDays });
-  if (built.days.length !== ANALYTICS_V2_MODEL_DATES) throw new Error("ANALYTICS_V2_PREVIEW_DAYS_DRIFT");
+    gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, days: modelDays };
+  // The preview over the owners not excluded on `day`: its coverage and every
+  // band day are computed from that cohort's fits.
+  const excludedKey = (day: AnalyticsV2Day): string => computedOwners
+    .filter((owner) => excluded(owner.ownerDigest, day)).map((owner) => owner.ownerDigest).join(",");
+  const builds = new Map<string, ReturnType<typeof buildAdminCommunityAllowancePreview>>();
+  const buildFor = (key: string) => {
+    let built = builds.get(key);
+    if (built === undefined) {
+      const left = new Set(key === "" ? [] : key.split(","));
+      const cohortOwners = computedOwners.filter((owner) => !left.has(owner.ownerDigest));
+      built = buildAdminCommunityAllowancePreview(
+        cohortOwners.flatMap((owner) => input.fitsByOwner.get(owner.ownerDigest)!), input.nowMs,
+        cohortOwners.map((owner) => owner.ownerDigest), models);
+      if (built.days.length !== ANALYTICS_V2_MODEL_DATES) throw new Error("ANALYTICS_V2_PREVIEW_DAYS_DRIFT");
+      builds.set(key, built);
+    }
+    return built;
+  };
+  // The coverage is today's (the preview's last day), as d43c8f92 counts it.
+  const base = buildFor(excludedKey(new Date(input.nowMs).toISOString().slice(0, 10)));
+  // Each band day is its own day's aggregate: an owner excluded on that day
+  // only is left out of that day's band. Without exclusions every day comes
+  // from the one build, exactly as before.
+  const days = base.days.map((previewDay, index) => {
+    const own = buildFor(excludedKey(previewDay.day)).days[index]!;
+    if (own.day !== previewDay.day) throw new Error("ANALYTICS_V2_PREVIEW_DAYS_DRIFT");
+    return own;
+  });
+  const built = days.every((day, index) => day === base.days[index]) ? base
+    : Object.freeze({ ...base, days: Object.freeze(days) });
   const preview = validCachedAdminCommunityAllowancePreview(built, built.generatedAt, input.nowMs) ? built : null;
   return { dailyCandidates, preview };
 }

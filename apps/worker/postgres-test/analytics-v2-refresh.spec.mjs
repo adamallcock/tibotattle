@@ -33,6 +33,7 @@ import { after, before, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
 import {
+  NO_ANALYTICS_V2_EXCLUSIONS_SHA256,
   applyStockAndStagedMigrations,
   postgresTestEndpoint,
 } from "./staged-migrations-harness.mjs";
@@ -49,11 +50,21 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const JOB_PATH = join(WORKER_ROOT, "cloud-run", "analytics-refresh.mjs");
 const STAGED_FILE = "0059_analytics_v2.sql";
 // K-STAMP's staged migration (the integrator renumbers it at promotion).
-const KERNEL_STAGED_FILE = "0066_analytics_v2_kernel_stamps.sql";
+const KERNEL_STAGED_FILE = "0911_analytics_v2_run_stamps.sql";
 const ENDPOINT = await postgresTestEndpoint();
 const PG_SKIP = ENDPOINT === null
   ? "set PG_TEST_SOCKET (or PG_TEST_HOST) and PG_TEST_PORT for the local PostgreSQL 17 cluster"
   : false;
+/** The digest of no community aggregate exclusions (N-EXCL; exclusions.ts pins the same literal). */
+const NO_EXCLUSIONS = NO_ANALYTICS_V2_EXCLUSIONS_SHA256;
+/** An A-1 owners-module stand-in for a table with no exclusions (N-EXCL). */
+const NO_EXCLUSION_READER = Object.freeze({
+  async readAnalyticsV2Exclusions() {
+    return { rows: 0, active: 0, sha256: NO_EXCLUSIONS, activeByParticipant: new Map() };
+  },
+});
+/** A prior refresh state as readAnalyticsV2RefreshState returns it, with no exclusions applied. */
+const specState = (state) => Object.freeze({ appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [], ...state });
 const NOW_1 = "2026-10-01T12:00:00.000Z";
 const NOW_2 = "2026-10-01T18:30:00.000Z";
 const NOW_3 = "2026-10-02T06:00:00.000Z";
@@ -102,6 +113,8 @@ before(async () => {
   kernelIdentity = Object.freeze({ vendorManifestSha256: kernel.vendorManifestSha256,
     computeClosureSha256: kernel.computeClosureSha256, methodVersion: kernel.methodVersion });
   specStamp = store.analyticsV2BaselineRunStamp(kernel);
+  // The harness's literal is the module's digest of no exclusions.
+  assert.equal((await load("/src/analytics-v2/exclusions.ts")).ANALYTICS_V2_NO_EXCLUSIONS_SHA256, NO_EXCLUSIONS);
   resources = await load("/src/analytics-v2/resources.ts");
   a1 = {
     owners: await load("/src/analytics-v2/owners.ts"),
@@ -403,6 +416,8 @@ function createSpecPipeline(hooks = {}) {
         journal: { lastSequence: inputs.lastSequence },
         horizon: STAND_IN_HORIZON,
         timings: { prepare: 1, community: 1 },
+        // The stand-in reads no exclusions table.
+        exclusionsSha256: NO_EXCLUSIONS,
       };
     },
   };
@@ -510,18 +525,22 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
   // largest, about 9.4 GiB of output budget instead of 351 MiB.
   assert.equal(resources.analyticsV2OutputBudget(denseResources.compute, 1_517 * MIB, true),
     denseResources.compute.outputBudgetBytes + (dense.memoryBudgetMiB - 1_517) * MIB);
-  // K-PAR: the production profile computes owners in four Workers, so the
-  // budget is not in its 3,072 MiB main heap, which holds the reserves and
-  // the output account (no reclaim).
+  // The production profile is inline (K-CORE-A review: no compute Workers
+  // before MEAS-3 measures their heap peaks on real owners).
+  assert.equal(dense.workers, 1);
+  assert.equal(dense.heapMiB, inlineHeapMiB);
+  // K-PAR (the test-deploy profile dense-workers, for MEAS-3): with four
+  // Workers the budget is not in the 3,072 MiB main heap, which holds the
+  // reserves and the output account (no reclaim).
+  const parallelHeapMiB = 3_072;
   const parallel = job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (dense.heapMiB + 48) * MIB,
-    { workers: dense.workers });
-  assert.equal(dense.workers, 4);
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (parallelHeapMiB + 48) * MIB,
+    { workers: 4 });
   assert.equal(parallel.workers, 4);
   assert.equal(parallel.compute.memoryBudgetBytes, dense.memoryBudgetMiB * MIB);
-  assert.equal(parallel.compute.outputBudgetBytes, (dense.heapMiB + 48 - 256) * MIB - 250_000 * 4_096);
+  assert.equal(parallel.compute.outputBudgetBytes, (parallelHeapMiB + 48 - 256) * MIB - 250_000 * 4_096);
   assert.throws(() => job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (dense.heapMiB + 48) * MIB),
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (parallelHeapMiB + 48) * MIB),
   { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" }, "inline, the budget does not fit the parallel heap");
   for (const workers of [0, 17, 1.5]) {
     assert.throws(() => job.analyticsRefreshResources({}, 64 * 1_024 * MIB, { workers }),
@@ -577,19 +596,24 @@ test("the production profile's output budget holds the stated roster and history
   const partition = job.analyticsRefreshResources(
     { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, profile.heapMiB * MIB,
     { workers: profile.workers }).compute;
+  assert.equal(profile.workers, 1, "the production profile is inline");
   assert.ok(projection.largestOwnerEstimateMiB * MIB <= partition.memoryBudgetBytes, "the largest owner is admitted");
-  // K-PAR: the owners' heaps are the Workers', so the main heap's output
-  // budget is its own and does not depend on the largest owner (no reclaim).
-  const outputBudget = partition.outputBudgetBytes;
+  const outputBudget = resources.analyticsV2OutputBudget(partition, projection.largestOwnerEstimateMiB * MIB, true);
   const perDay = projection.denseOwners * projection.denseBytesPerOwnerDay
     + projection.lightOwners * projection.lightBytesPerOwnerDay;
   const projected = perDay * projection.historyDays;
   assert.ok(projected <= outputBudget,
     `projected ${Math.ceil(projected / MIB)} MiB over an output budget of ${Math.floor(outputBudget / MIB)} MiB`);
   // The horizon the profile holds for this roster, recorded in the receipt:
-  // 1,447 days whatever the largest owner's estimate (the inline 12,288 MiB
-  // profile held 641 at the high-end estimate and 238 without the reclaim).
-  assert.equal(Math.floor(outputBudget / perDay), 1_447);
+  // 641 days at the high-end estimate, against 238 without the reclaim.
+  assert.equal(Math.floor(outputBudget / perDay), 641);
+  assert.equal(Math.floor(partition.outputBudgetBytes / perDay), 238);
+  // K-PAR's dense-workers profile (3,072 MiB main heap, four Workers; MEAS-3
+  // only): the owners' heaps are the Workers', so the main heap's output
+  // budget does not depend on the largest owner (no reclaim): 1,447 days.
+  const parallel = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, 3_072 * MIB, { workers: 4 }).compute;
+  assert.equal(Math.floor(parallel.outputBudgetBytes / perDay), 1_447);
 });
 
 test("read spans: contiguous, at most the day bound, and about the read chunk by the exact counts", () => {
@@ -667,7 +691,7 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
   });
 });
 
-test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts and regressions, and backfills kernel 1", {
+test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts and regressions, and leaves earlier rows unattributed", {
   skip: PG_SKIP,
   timeout: 240_000,
 }, async () => {
@@ -688,30 +712,39 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         compute_closure_sha256, price_registry_sha256, price_registry_version, method_version
        FROM ${quoted(schema, "analytics_v2_kernels")} ORDER BY kernel_id`)).rows;
     try {
-      // The migration seeds registry entry 1 exactly.
+      // The migration seeds no kernel: the first run that stamps registers its own.
+      assert.deepEqual(await kernels(), []);
+      const payload = { day: DAY_1, value: 1 };
+      // A third argument, even undefined, replaces the recorded exclusions digest.
+      const write = (stamp, options = {}, ...digest) => store.writeRunOutputs(client,
+        minimalOutputs({
+          ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: { counts: 1 }, refusal: null }],
+          ownerFits: [{ ownerDigest: OWNER_A, asOfDay: DAY_1, fits: [] }],
+          ownerModelDates: [{ ownerDigest: OWNER_A, day: DAY_1, result: { status: "ready" } }],
+          ...options,
+        }), { schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null,
+          horizon: STAND_IN_HORIZON, stamp, exclusionsSha256: digest.length === 0 ? NO_EXCLUSIONS : digest[0] });
+      await write(specStamp, { dailyCandidates: [{ day: DAY_1, payload,
+        payloadSha256: await store.analyticsV2DailyContentSha256(payload) }] });
       assert.deepEqual(await kernels(), [{ kernel_id: 1, production_commit: registry[0].productionCommit,
         vendor_manifest_sha256: registry[0].vendorManifestSha256, compute_closure_sha256: registry[0].computeClosureSha256,
         price_registry_sha256: registry[0].priceRegistrySha256, price_registry_version: registry[0].priceRegistryVersion,
         method_version: registry[0].methodVersion }]);
-      const payload = { day: DAY_1, value: 1 };
-      const write = (stamp, options = {}) => store.writeRunOutputs(client, minimalOutputs({
-        ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: { counts: 1 }, refusal: null }],
-        ownerFits: [{ ownerDigest: OWNER_A, asOfDay: DAY_1, fits: [] }],
-        ownerModelDates: [{ ownerDigest: OWNER_A, day: DAY_1, result: { status: "ready" } }],
-        ...options,
-      }), { schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null,
-        horizon: STAND_IN_HORIZON, stamp });
-      await write(specStamp, { dailyCandidates: [{ day: DAY_1, payload,
-        payloadSha256: await store.analyticsV2DailyContentSha256(payload) }] });
       for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_owner_fits",
         "analytics_v2_owner_model_dates", "analytics_v2_published_daily", "analytics_v2_preview"]) {
         const stamps = await pool.query(`SELECT DISTINCT kernel_id, manifest_version FROM ${quoted(schema, table)}`);
         assert.deepEqual(stamps.rows, [{ kernel_id: 1, manifest_version: 1 }], table);
       }
+      await write(specStamp);
       assert.equal(await count(pool, schema, "analytics_v2_kernels"), 1, "the registered kernel is not duplicated");
-      // A run without a resource record has no compatibility class: null, never inferred.
-      assert.deepEqual((await pool.query(`SELECT compatibility_sha256 FROM ${quoted(schema, "analytics_v2_runs")}`)).rows,
-        [{ compatibility_sha256: null }]);
+      // A run without a resource record has no compatibility class: null, never
+      // inferred. Every run records the exclusions it applied (N-EXCL).
+      assert.deepEqual((await pool.query(`SELECT DISTINCT compatibility_sha256, exclusions_sha256
+        FROM ${quoted(schema, "analytics_v2_runs")}`)).rows, [{ compatibility_sha256: null, exclusions_sha256: NO_EXCLUSIONS }]);
+      for (const exclusionsSha256 of [undefined, null, "F".repeat(64), "f".repeat(63)]) {
+        await assert.rejects(write(specStamp, {}, exclusionsSha256), { code: "ANALYTICS_V2_RUN_INVALID",
+          field: "exclusionsSha256" });
+      }
 
       // A registry entry that disagrees with the stored kernel row is refused, atomically.
       const before = await analyticsSnapshot(pool, schema);
@@ -743,21 +776,32 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
       await assert.rejects(pool.query(`DELETE FROM ${quoted(schema, "analytics_v2_kernels")} WHERE kernel_id = 2`),
         { code: "P1005" });
       await assert.rejects(pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")}
-        (owner_digest, day, daily, refusal, run_id) VALUES ($1, $2, '{}', NULL, $3)`, [OWNER_B, DAY_2, randomUUID()]),
-      { code: "23502" }, "no default kernel: a row must name its kernel");
+        (owner_digest, day, daily, refusal, run_id, manifest_version) VALUES ($1, $2, '{}', NULL, $3, 1)`,
+      [OWNER_B, DAY_2, randomUUID()]), { code: "23514" }, "no default kernel: a new row must name its kernel");
+      await assert.rejects(pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")}
+        (owner_digest, day, daily, refusal, run_id, kernel_id) VALUES ($1, $2, '{}', NULL, $3, 1)`,
+      [OWNER_B, DAY_2, randomUUID()]), { code: "23502" }, "no default manifest: a new row must name its manifest");
       await assert.rejects(pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")}
         (owner_digest, day, daily, refusal, run_id, kernel_id, manifest_version) VALUES ($1, $2, '{}', NULL, $3, 1, 0)`,
       [OWNER_B, DAY_2, randomUUID()]), { code: "23514" }, "manifest version 0 does not exist");
       await assert.rejects(pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")}
         (owner_digest, day, daily, refusal, run_id, kernel_id, manifest_version) VALUES ($1, $2, '{}', NULL, $3, 9, 1)`,
       [OWNER_B, DAY_2, randomUUID()]), { code: "23503" }, "a kernel id the registry copy does not hold");
+      await assert.rejects(pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_runs")} (run_id, started_at,
+        finished_at, mode, state, owners, owner_days, refusals, publication, timings, kernel_id, manifest_version)
+        VALUES ($1, $2, $2, 'full', 'complete', 0, 0, '[]', '{"published":[],"unchanged":[],"blocked":[]}', '{}', 1, 1)`,
+      [randomUUID(), NOW_1]), { code: "23514" }, "a new run row must record the exclusions it applied");
     } finally {
       client.release();
     }
   });
 
-  // Backfill: rows written before the migration become kernel 1, manifest 1,
-  // without an UPDATE (0059's forward-only trigger never fires).
+  // Rows written before the migration (K-CORE-A review): their kernel is
+  // unattributed (NULL), never inferred; their manifest is the compiled
+  // baseline (the only configuration there was); their run rows record no
+  // compatibility class and no exclusions digest, which reads as "no
+  // exclusions applied". All without an UPDATE (0059's forward-only trigger
+  // never fires). A later run stamps what it rewrites and leaves the rest.
   await withDatabase("kernel-backfill", async ({ pool }) => {
     const schema = `analytics_v2_refresh_${randomBytes(5).toString("hex")}`;
     await pool.query(`CREATE SCHEMA "${schema}"`);
@@ -768,7 +812,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         owners, owner_days, refusals, publication, timings) VALUES ($1, $2, $2, 'full', 'complete', 1, 1, '[]',
         '{"published":[],"unchanged":[],"blocked":[]}', '{}')`, [runId, NOW_1]);
       await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")} (owner_digest, day, daily, refusal, run_id)
-        VALUES ($1, $2, '{}', NULL, $3)`, [OWNER_A, DAY_1, runId]);
+        VALUES ($1, $2, '{}', NULL, $3), ($4, $2, '{}', NULL, $3)`, [OWNER_A, DAY_1, runId, OWNER_B]);
       const payload = { aggregateId: `community-daily:${DAY_1}:r1`, day: DAY_1, revision: 1 };
       await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_published_daily")} (day, revision, released_at,
         payload, payload_sha256, run_id) VALUES ($1, 1, $2, $3::jsonb, $4, $5)`,
@@ -780,15 +824,33 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         await client.query(`SET LOCAL search_path TO "${schema}"`);
         await client.query(sql);
         await client.query("COMMIT");
+        assert.equal(await count(pool, schema, "analytics_v2_kernels"), 0, "no kernel is seeded");
+        for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_published_daily"]) {
+          assert.deepEqual((await pool.query(`SELECT DISTINCT kernel_id, manifest_version FROM ${quoted(schema, table)}`)).rows,
+            [{ kernel_id: null, manifest_version: 1 }], table);
+        }
+        assert.deepEqual((await pool.query(`SELECT revision, compatibility_sha256, exclusions_sha256
+          FROM ${quoted(schema, "analytics_v2_runs")} r CROSS JOIN ${quoted(schema, "analytics_v2_published_daily")} p`)).rows,
+        [{ revision: 1, compatibility_sha256: null, exclusions_sha256: null }]);
+        // The constraints were added NOT VALID, so the unattributed rows stay as they are.
+        assert.deepEqual((await pool.query(`SELECT conname, convalidated FROM pg_constraint
+          WHERE connamespace = $1::regnamespace AND conname LIKE '%_kernel_stamped' ORDER BY conname`,
+        [`"${schema}"`])).rows.map((row) => row.convalidated), Array(7).fill(false));
+        // The state reads the pre-migration run as having applied no exclusions.
+        const state = await store.readAnalyticsV2RefreshState(client, { schema });
+        assert.equal(state.appliedExclusionsSha256, NO_EXCLUSIONS);
+        assert.deepEqual(state.publishedDays, [DAY_1]);
+        // A later run stamps the rows it rewrites; the owner it does not compute keeps its unattributed rows.
+        await store.writeRunOutputs(client, minimalOutputs({
+          ownerDays: [{ ownerDigest: OWNER_A, day: DAY_1, daily: { counts: 2 }, refusal: null }],
+        }), { schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_2), expectedCursor: null,
+          horizon: STAND_IN_HORIZON, stamp: specStamp, exclusionsSha256: NO_EXCLUSIONS });
+        assert.deepEqual((await pool.query(`SELECT owner_digest, kernel_id FROM ${quoted(schema, "analytics_v2_owner_day")}
+          ORDER BY owner_digest`)).rows, [{ owner_digest: OWNER_A, kernel_id: 1 }, { owner_digest: OWNER_B, kernel_id: null }]
+          .sort((left, right) => (left.owner_digest < right.owner_digest ? -1 : 1)));
       } finally {
         client.release();
       }
-      for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_published_daily"]) {
-        assert.deepEqual((await pool.query(`SELECT kernel_id, manifest_version FROM ${quoted(schema, table)}`)).rows,
-          [{ kernel_id: 1, manifest_version: 1 }], table);
-      }
-      assert.deepEqual((await pool.query(`SELECT revision, compatibility_sha256 FROM ${quoted(schema, "analytics_v2_runs")}
-        r CROSS JOIN ${quoted(schema, "analytics_v2_published_daily")} p`)).rows, [{ revision: 1, compatibility_sha256: null }]);
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     }
@@ -818,15 +880,23 @@ test("PG17: 0059 constraints refuse malformed digests, bands, counters, reasons 
     };
     try {
       await client.query("BEGIN");
-      // 0059's own constraints: the kernel stamps (a later migration, with no
-      // defaults) are given transaction-local defaults here; the stamp
-      // constraints have their own case.
+      // 0059's own constraints: the run stamps (a later migration, with no
+      // defaults and no seeded kernel) are given transaction-local defaults
+      // and kernel 1 here; the stamp constraints have their own case.
+      const kernel = specStamp.kernel;
+      await client.query(`INSERT INTO ${quoted(schema, "analytics_v2_kernels")} (kernel_id, production_commit,
+          vendor_manifest_sha256, compute_closure_sha256, price_registry_sha256, price_registry_version, method_version,
+          registered_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [kernel.kernelId, kernel.productionCommit,
+        kernel.vendorManifestSha256, kernel.computeClosureSha256, kernel.priceRegistrySha256, kernel.priceRegistryVersion,
+        kernel.methodVersion, NOW_1]);
       for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_cache_bands",
         "analytics_v2_owner_fits", "analytics_v2_owner_model_dates", "analytics_v2_published_daily",
         "analytics_v2_preview"]) {
         await client.query(`ALTER TABLE ${quoted(schema, table)} ALTER COLUMN kernel_id SET DEFAULT 1,
           ALTER COLUMN manifest_version SET DEFAULT 1`);
       }
+      await client.query(`ALTER TABLE ${quoted(schema, "analytics_v2_runs")}
+        ALTER COLUMN exclusions_sha256 SET DEFAULT '${NO_EXCLUSIONS}'`);
       const ownerDay = `INSERT INTO ${quoted(schema, "analytics_v2_owner_day")} (owner_digest, day, daily, refusal, run_id)
                         VALUES ($1, $2, $3::jsonb, $4, $5)`;
       await expectRefusal(ownerDay, [OWNER_A.toUpperCase(), DAY_1, "{}", null, runId], "23514");
@@ -1112,6 +1182,7 @@ test("PG17: the store refuses to write without the refresh lock when another ses
       const before = await analyticsSnapshot(pool, schema);
       await assert.rejects(store.writeRunOutputs(writer, minimalOutputs(), {
         schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
+        exclusionsSha256: NO_EXCLUSIONS,
       }), { code: "ANALYTICS_V2_REFRESH_LOCK_NOT_HELD" });
       assert.deepEqual(await analyticsSnapshot(pool, schema), before);
     } finally {
@@ -1215,6 +1286,7 @@ test("PG17: the store refuses invalid outputs before writing", {
       const good = await store.analyticsV2DailyContentSha256(payload);
       const write = (outputs, options = {}) => store.writeRunOutputs(client, outputs, {
         schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
+        exclusionsSha256: NO_EXCLUSIONS,
         ...options,
       });
       await assert.rejects(write(minimalOutputs({
@@ -1383,6 +1455,7 @@ test("PG17: bulk owner families are written in bounded chunks with exact row cou
       };
       const receipt = await store.writeRunOutputs(counting, minimalOutputs({ cacheBands }), {
         schema, runId: randomUUID(), startedAtMs: Date.now(), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
+        exclusionsSha256: NO_EXCLUSIONS,
       });
       assert.equal(receipt.state, "complete");
       assert.equal(await count(pool, schema, "analytics_v2_cache_bands"), 6_000);
@@ -1638,9 +1711,11 @@ test("PG17: the store replaces computed owners' rows only inside the run horizon
       const ownerDay = (day, usageEvents) => ({ ownerDigest: OWNER_A, day, daily: { usageEvents }, refusal: null });
       const write = (outputs, horizon) => store.writeRunOutputs(client, minimalOutputs(outputs), {
         schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon, stamp: specStamp,
+        exclusionsSha256: NO_EXCLUSIONS,
       });
       const state0 = await store.readAnalyticsV2RefreshState(client, { schema });
-      assert.deepEqual({ ...state0 }, { cursor: null, carriedBlockedDays: [], cacheFloorDay: null });
+      assert.deepEqual({ ...state0 }, { cursor: null, carriedBlockedDays: [], cacheFloorDay: null,
+        appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [] });
 
       await write({
         ownerDays: [ownerDay("2026-03-01", 1), ownerDay("2026-09-28", 2)],
@@ -1710,6 +1785,7 @@ test("PG17: a payload over the cap in its jsonb text form is refused with its ow
         dailyCandidates: [{ day: DAY_1, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload) }],
       }), {
         schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
+        exclusionsSha256: NO_EXCLUSIONS,
       }), { code: "ANALYTICS_V2_DAILY_PAYLOAD_TOO_LARGE", field: "dailyCandidates.payload" });
       assert.deepEqual(await analyticsSnapshot(pool, schema), before);
       assert.equal((await client.query("SELECT 1 AS ok")).rows[0].ok, 1, "the client left no open transaction");
@@ -1805,9 +1881,10 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * around a recording computeAnalyticsV2. Evidence: OWNER_A (effective) on
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
-function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"] } = {}) {
+function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"],
+  exclusionRead = undefined } = {}) {
   const calls = { owners: 0, queued: [], occurrences: [], counts: [], firstEvidence: [], devices: [], compute: null,
-    loaded: new Map() };
+    loaded: new Map(), exclusions: 0 };
   const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
   const pages = new Map([
     [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
@@ -1823,6 +1900,12 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
           calls.owners += 1;
           return { owners: [contractOwner(OWNER_LEGACY, "v0.2"), WIRING_OWNER_B, contractOwner(OWNER_A, "effective")],
             unlinked, correctionRuntimeActive: false };
+        },
+        async readAnalyticsV2Exclusions(context) {
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.exclusions += 1;
+          // Not given: the empty table. An explicit value, null included, is returned as is.
+          return exclusionRead === undefined ? NO_EXCLUSION_READER.readAnalyticsV2Exclusions() : exclusionRead;
         },
       },
       queuedDays: {
@@ -1901,7 +1984,7 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
   };
 }
 
-const WIRING_STATE = Object.freeze({ cursor: null, carriedBlockedDays: ["2026-04-10"], cacheFloorDay: "2026-02-20" });
+const WIRING_STATE = specState({ cursor: null, carriedBlockedDays: ["2026-04-10"], cacheFloorDay: "2026-02-20" });
 
 function spannedDays(ranges) {
   const days = [];
@@ -1993,6 +2076,52 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, terminalOwners: 1, nonEffectiveUnread: 0 });
   assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
+  // N-EXCL: read once, unchanged and empty: nothing reaches A-2 and nothing extra is queued.
+  assert.equal(calls.exclusions, 1);
+  assert.deepEqual([...calls.compute.exclusions], []);
+  assert.equal(outputs.exclusionsSha256, NO_EXCLUSIONS);
+  assert.deepEqual(outputs.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
+});
+
+test("default wiring: a linked owner's active exclusions reach A-2, and a changed table queues every published day", async () => {
+  const interval = Object.freeze({ effectiveAtUs: Date.parse("2026-09-29T00:00:00.000Z") * 1_000, expiresAtUs: null });
+  const exclusionRead = { rows: 3, active: 2, sha256: "1".repeat(64), activeByParticipant: new Map([
+    [contractOwner(OWNER_A, "effective").participantId, [interval]],
+    ["participant-outside-the-roster", [interval]],
+  ]) };
+  const { calls, modules } = wiringModules({ exclusionRead });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const state = specState({ cursor: null, carriedBlockedDays: ["2026-04-10"], cacheFloorDay: "2026-02-20",
+    publishedDays: ["2026-01-05", "2026-09-29"] });
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state });
+  // Every published head is queued again (2026-09-29 was queued by the journal already).
+  assert.deepEqual(inputs.queuedDays, ["2026-01-05", "2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  // Only the roster's owner, by its digest; an unlisted participant is in no aggregate.
+  assert.deepEqual([...calls.compute.exclusions], [[OWNER_A, [interval]]]);
+  assert.equal(outputs.exclusionsSha256, "1".repeat(64));
+  assert.deepEqual(outputs.exclusions, { rows: 3, active: 2, excludedOwners: 1, changed: true, republishedDays: 1 });
+  // The same table as the last run applied: nothing is requeued.
+  const again = await job.createAnalyticsV2Pipeline(wiringModules({ exclusionRead }).modules).read({ pool: {}, schema: "s",
+    nowMs: WIRING_NOW_MS, state: { ...state, appliedExclusionsSha256: "1".repeat(64) } });
+  assert.deepEqual(again.queuedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
+  assert.equal(again.exclusions.changed, false);
+
+  // A malformed read or prior state is refused, never read as "no exclusions".
+  for (const malformed of [null, { ...exclusionRead, sha256: "x" }, { ...exclusionRead, rows: -1 },
+    { ...exclusionRead, active: -1 }, { ...exclusionRead, active: 4 }, { ...exclusionRead, activeByParticipant: {} }]) {
+    await assert.rejects(job.createAnalyticsV2Pipeline(wiringModules({ exclusionRead: malformed }).modules)
+      .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state }), { code: "ANALYTICS_V2_REFRESH_EXCLUSIONS_INVALID" });
+  }
+  for (const malformed of [{ ...state, appliedExclusionsSha256: undefined }, { ...state, publishedDays: ["2026-02-30"] },
+    { ...state, publishedDays: undefined }]) {
+    await assert.rejects(job.createAnalyticsV2Pipeline(wiringModules().modules)
+      .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: malformed }), { code: "ANALYTICS_V2_REFRESH_STATE_INVALID" });
+  }
+  // A pipeline without the exclusion reader cannot be built.
+  const { owners: { readAnalyticsV2Exclusions: _read, ...ownersWithout }, ...rest } = wiringModules().modules;
+  assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, owners: ownersWithout }),
+    { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
 });
 
 test("default wiring: cache history starts at the first evidence day, older than any window, queue or floor", async () => {
@@ -2001,7 +2130,7 @@ test("default wiring: cache history starts at the first evidence day, older than
   const { calls, modules } = wiringModules({ ownerAEvidence: ["2024-11-03", "2026-09-29"] });
   const pipeline = job.createAnalyticsV2Pipeline(modules);
   const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS,
-    state: { cursor: null, carriedBlockedDays: [], cacheFloorDay: null } });
+    state: specState({ cursor: null, carriedBlockedDays: [], cacheFloorDay: null }) });
   assert.equal(inputs.firstEvidenceDay, "2024-11-03");
   assert.equal(inputs.cacheFromDay, "2024-11-03");
   assert.deepEqual({ ...inputs.occurrenceRange }, { fromDay: "2024-10-27", throughDay: "2026-10-01" });
@@ -2107,6 +2236,11 @@ test("cache horizon and day spans: history is retained back to the floor; reads 
   ]);
   assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30", "2026-09-28"],
     { carriedBlockedDays: ["2026-09-28", "2026-09-01"] }), ["2026-09-01", "2026-09-28", "2026-09-30"]);
+  // N-EXCL: changed exclusions also queue every published day; unchanged ones queue none.
+  const published = { carriedBlockedDays: ["2026-09-01"], publishedDays: ["2026-08-01", "2026-09-28"] };
+  assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published), ["2026-09-01", "2026-09-30"]);
+  assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published, { exclusionsChanged: true }),
+    ["2026-08-01", "2026-09-01", "2026-09-28", "2026-09-30"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -2196,6 +2330,94 @@ for (const correctionRuntime of ["active", "staged"]) {
   });
 }
 
+// N-EXCL (round 5: "their use in GCP analytics"; D-PT4X's read contract): an
+// active community_weekly exclusion leaves its owner out of each covered day's
+// public daily, a change republishes every published day, an unchanged table
+// republishes nothing, and the owner's own rows never move.
+test("PG17 N-EXCL: an exclusion leaves its owner out of the days it covers, republishes on change and never otherwise", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("exclusions", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules,
+      correctionRuntime: "active", legacyScope: true });
+    const lima = fixture.owners.lima;
+    const pipeline = realPipeline();
+    const now = new Date(seedFixture.NOW_MS).toISOString();
+    const exclusions = quoted(schema, "community_aggregate_exclusions");
+    const D3 = seedFixture.D3;
+    const runExclusions = async () => (await pool.query(`SELECT exclusions_sha256 FROM ${quoted(schema, "analytics_v2_runs")}
+      ORDER BY finished_at DESC, started_at DESC LIMIT 1`)).rows[0].exclusions_sha256;
+    const participants = (head) => head.payload.totals.contributingParticipants;
+    const limaRows = async () => {
+      const rows = {};
+      for (const table of ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_model_dates"]) {
+        rows[table] = (await pool.query(`SELECT COALESCE(jsonb_agg(to_jsonb(t) - 'run_id' - 'kernel_id'
+            ORDER BY (to_jsonb(t) - 'run_id')::text), '[]'::jsonb)::text AS rows
+           FROM ${quoted(schema, table)} t WHERE owner_digest = $1`, [lima.ownerDigest])).rows[0].rows;
+      }
+      return rows;
+    };
+
+    const first = await runJob({ schema, now, pipeline });
+    assert.deepEqual(first.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
+    assert.ok(first.published.includes(D3));
+    assert.equal(await runExclusions(), NO_EXCLUSIONS);
+    const before = (await publishedRows(pool, schema)).get(D3);
+    assert.ok(participants(before) >= 1, "lima contributes on D3");
+    const ownRows = await limaRows();
+
+    // An active exclusion covering D3 only.
+    await pool.query(`INSERT INTO ${exclusions} (exclusion_id, participant_id, scope, reason_code, state, effective_at,
+        expires_at, created_at, created_by_digest) VALUES ('synthetic-exclusion-1', $1, 'community_weekly', 'data_quality',
+        'active', $2, $3, $2, $4)`, [lima.participantId, `${D3}T00:00:00.000Z`, `${D3}T23:59:59.999999Z`, "e".repeat(64)]);
+    const excluded = await runJob({ schema, now, pipeline });
+    assert.deepEqual(excluded.exclusions, { rows: 1, active: 1, excludedOwners: 1, changed: true,
+      republishedDays: excluded.exclusions.republishedDays });
+    assert.ok(excluded.exclusions.republishedDays >= 1, "the published days are queued again");
+    assert.deepEqual(excluded.published, [D3], "only the covered day changes");
+    const during = (await publishedRows(pool, schema)).get(D3);
+    assert.equal(during.revision, before.revision + 1);
+    assert.equal(participants(during), participants(before) - 1);
+    assert.notEqual(await runExclusions(), NO_EXCLUSIONS);
+    assert.deepEqual(await limaRows(), ownRows, "the owner's own rows are unchanged");
+
+    // An unchanged table queues nothing again.
+    const unchanged = await runJob({ schema, now, pipeline });
+    assert.deepEqual(unchanged.exclusions, { rows: 1, active: 1, excludedOwners: 1, changed: false, republishedDays: 0 });
+    assert.deepEqual(unchanged.published, []);
+
+    // A row for a participant outside the roster changes the table but no aggregate.
+    await pool.query(`INSERT INTO ${exclusions} (exclusion_id, participant_id, scope, reason_code, state, effective_at,
+        expires_at, created_at, created_by_digest) VALUES ('synthetic-exclusion-2', 'synthetic-unknown-participant',
+        'community_weekly', 'abuse_signal', 'active', $1, NULL, $1, $2)`, [`${D3}T00:00:00.000Z`, "e".repeat(64)]);
+    const outside = await runJob({ schema, now, pipeline });
+    assert.equal(outside.exclusions.changed, true);
+    assert.equal(outside.exclusions.excludedOwners, 1);
+    assert.deepEqual(outside.published, [], "republished days with unchanged content keep their revisions");
+
+    // Revocation (an UPDATE, as D1 revokes) restores the day's content under a new revision.
+    await pool.query(`UPDATE ${exclusions} SET state = 'revoked', revoked_at = $1, revoked_by_digest = $2
+      WHERE exclusion_id = 'synthetic-exclusion-1'`, [now, "f".repeat(64)]);
+    const revoked = await runJob({ schema, now, pipeline });
+    assert.deepEqual([revoked.exclusions.active, revoked.exclusions.excludedOwners, revoked.exclusions.changed], [1, 0, true]);
+    assert.deepEqual(revoked.published, [D3]);
+    const after = (await publishedRows(pool, schema)).get(D3);
+    assert.equal(after.revision, during.revision + 1);
+    assert.equal(after.payload_sha256, before.payload_sha256, "the excluded owner is back in the day it covered");
+    assert.deepEqual(await limaRows(), ownRows);
+
+    // The table is required: without it the run fails closed and writes nothing.
+    await pool.query(`ALTER TABLE ${exclusions} RENAME TO community_aggregate_exclusions_hidden`);
+    const runsBefore = await count(pool, schema, "analytics_v2_runs");
+    await assert.rejects(runJob({ schema, now, pipeline }), { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+    assert.equal(await count(pool, schema, "analytics_v2_runs"), runsBefore);
+    await pool.query(`ALTER TABLE ${quoted(schema, "community_aggregate_exclusions_hidden")}
+      RENAME TO community_aggregate_exclusions`);
+  });
+});
+
 // K-PAR: owners computed by compute Workers merge to exactly the inline rows.
 test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes exactly the inline run's rows", {
   skip: PG_SKIP,
@@ -2239,8 +2461,8 @@ test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes e
       assert.ok(run.reads.statements.families["snapshot.control"].calls > 0);
       assert.equal(run.reads.statements.families.untagged, undefined, "every reader statement carries its family");
       assert.ok(run.reads.phaseWallMs >= 0 && run.reads.unattributedMs >= 0);
-      // N-EXCL: the table is not on this line yet; its absence is explicit and nothing is applied.
-      assert.deepEqual(run.exclusions, { table: "absent", scopes: {}, applied: false });
+      // N-EXCL: the table (primary 0066) is empty, unchanged since no run: nothing is applied or republished.
+      assert.deepEqual(run.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
       dumps.set(workers, await dump(pool, schema));
       // A second run over the same snapshot state publishes nothing, as inline.
       const second = await job.runAnalyticsRefresh({
@@ -2294,7 +2516,8 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
   // The compose-proof corpus behind stub A-1 readers with the landed shapes;
   // the compute core is the real A-2 module.
   const pipeline = job.createAnalyticsV2Pipeline({
-    owners: { listAnalyticsV2Owners: async () => ({ owners: corpus.owners, unlinked: [], correctionRuntimeActive: true }) },
+    owners: { listAnalyticsV2Owners: async () => ({ owners: corpus.owners, unlinked: [], correctionRuntimeActive: true }),
+      ...NO_EXCLUSION_READER },
     queuedDays: {
       readQueuedDays: async (context, { afterSequence }) => (afterSequence === 0
         ? { days: corpus.publishedDays, lastSequence: 7, terminalOwners: [], events: 7, complete: true }
@@ -2358,7 +2581,8 @@ function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream,
   const daysOf = (ownerDigest, stream, fromDay, throughDay) => [...(facts.get(ownerDigest) ?? new Map())]
     .filter(([day, streams]) => day >= fromDay && day <= throughDay && streams[stream].length > 0);
   return job.createAnalyticsV2Pipeline({
-    owners: { listAnalyticsV2Owners: async () => ({ owners, unlinked: [], correctionRuntimeActive: true }) },
+    owners: { listAnalyticsV2Owners: async () => ({ owners, unlinked: [], correctionRuntimeActive: true }),
+      ...NO_EXCLUSION_READER },
     queuedDays: {
       readQueuedDays: async (context, { afterSequence }) => {
         const events = journal.filter((event) => event.sequence > afterSequence);
@@ -2654,23 +2878,21 @@ test("production target: the closed contract reads the six variables and the den
   const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
   assert.deepEqual({ cpu: profile.cpu, memory: profile.memory, heapMiB: profile.heapMiB,
     memoryBudgetMiB: profile.memoryBudgetMiB, taskTimeoutSeconds: profile.taskTimeoutSeconds, tasks: profile.tasks,
-    maxRetries: profile.maxRetries, workers: profile.workers }, { cpu: "4", memory: "16Gi", heapMiB: 3_072,
-    memoryBudgetMiB: 10_752, taskTimeoutSeconds: 14_400, tasks: 1, maxRetries: 0, workers: 4 });
-  assert.deepEqual([...profile.args], ["--max-old-space-size=3072", "dist/analytics-refresh.mjs", "--mode=full",
-    "--workers=4"]);
+    maxRetries: profile.maxRetries, workers: profile.workers }, { cpu: "4", memory: "16Gi", heapMiB: 12_288,
+    memoryBudgetMiB: 10_752, taskTimeoutSeconds: 14_400, tasks: 1, maxRetries: 0, workers: 1 });
+  // Inline until MEAS-3 measures the compute Workers on real owners (K-CORE-A review).
+  assert.deepEqual([...profile.args], ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
   // The rendered invocation parses to the real clock and PRIMARY_SCHEMA.
   const parsed = job.parseAnalyticsRefreshArguments(profile.args.slice(2), productionEnvironment());
   assert.deepEqual({ ...parsed }, { help: false, mode: "full", schema: "tibotattle_runtime", nowMs: null,
-    revisionSeed: 0, workers: 4 });
-  // The profile's heap holds the reserves and the minimum output budget, its
-  // Workers the budget, and the task memory all of it with room for native memory.
+    revisionSeed: 0, workers: 1 });
+  // The profile's heap holds the budget, the reserves and the minimum output
+  // budget, and the task memory all of it with room for native memory.
   const MIB = 1_048_576;
   assert.ok(job.analyticsRefreshResources(productionEnvironment(), profile.heapMiB * MIB,
     { workers: profile.workers }).requiredHeapBytes <= profile.heapMiB * MIB);
   const memory = job.ANALYTICS_REFRESH_TASK_MEMORY_CHECK;
-  // The pool holds the Workers' heap limits together within the budget plus one reserve.
-  assert.ok(profile.heapMiB + profile.memoryBudgetMiB + job.ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB
-    <= memory.taskMemoryMiB - memory.nativeReserveMiB);
+  assert.ok(profile.heapMiB <= memory.taskMemoryMiB - memory.nativeReserveMiB);
 });
 
 test("production target: the plane, the shared values and the patterns agree with CR-3's reader", async () => {
@@ -2974,7 +3196,7 @@ test("default wiring: A-2 segment loads read only their days, in spans of the re
   const { calls, modules } = wiringModules({ ownerAEvidence: ["2024-11-03", "2026-09-29"] });
   const pipeline = job.createAnalyticsV2Pipeline(modules);
   const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS,
-    state: { cursor: null, carriedBlockedDays: [], cacheFloorDay: null } });
+    state: specState({ cursor: null, carriedBlockedDays: [], cacheFloorDay: null }) });
   const range = inputs.occurrenceRange;
   const segment = { fromDay: "2024-11-01", throughDay: "2024-12-30" };
   calls.occurrences.length = 0;

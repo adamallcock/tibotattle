@@ -36,6 +36,7 @@ import {
   type AnalyticsV2RunOutputs,
   type AnalyticsV2RunResources,
 } from "./contract";
+import { ANALYTICS_V2_NO_EXCLUSIONS_SHA256 } from "./exclusions";
 import { validAnalyticsV2KernelEntry, type AnalyticsV2RunStamp } from "./kernel";
 
 /** The ten closed cache-continuity bands (d43c8f92 CACHE_RETENTION_BAND_IDS). */
@@ -614,6 +615,12 @@ export interface WriteAnalyticsV2RunOptions {
   readonly wallClock?: () => number;
   /** The kernel and manifest every row of this run is stamped with (K-STAMP, kernel.ts). */
   readonly stamp: AnalyticsV2RunStamp;
+  /**
+   * The digest of the community aggregate exclusions the run read and
+   * applied (N-EXCL, owners.ts readAnalyticsV2Exclusions().sha256), recorded
+   * on the run row so the next run can tell when they changed.
+   */
+  readonly exclusionsSha256: string;
 }
 
 export interface AnalyticsV2WriteReceipt {
@@ -750,13 +757,14 @@ export async function insertAnalyticsV2RunRow(client: PostgresClient, schema: st
   readonly refusals: readonly AnalyticsV2Refusal[]; readonly publication: AnalyticsV2PublicationSummary;
   readonly timings: Readonly<Record<string, unknown>>;
   readonly stamp: AnalyticsV2RunStamp; readonly compatibilitySha256: string | null;
+  readonly exclusionsSha256: string;
 }): Promise<void> {
   await client.query(
     `INSERT INTO ${relation(schema, ANALYTICS_V2_TABLES.runs)}
        (run_id, started_at, finished_at, mode, state, owners, owner_days, refusals, publication, timings,
-        kernel_id, manifest_version, compatibility_sha256)
+        kernel_id, manifest_version, compatibility_sha256, exclusions_sha256)
      VALUES ($1::uuid, $2::timestamptz, $3::timestamptz, $4, 'complete', $5, $6,
-             $7::jsonb, $8::jsonb, $9::jsonb, $10::smallint, $11::integer, $12)`,
+             $7::jsonb, $8::jsonb, $9::jsonb, $10::smallint, $11::integer, $12, $13)`,
     [
       row.runId,
       new Date(row.startedAtMs).toISOString(),
@@ -770,6 +778,7 @@ export async function insertAnalyticsV2RunRow(client: PostgresClient, schema: st
       row.stamp.kernel.kernelId,
       row.stamp.manifestVersion,
       row.compatibilitySha256,
+      row.exclusionsSha256,
     ],
   );
 }
@@ -847,11 +856,20 @@ export interface AnalyticsV2RefreshState {
    * recomputed rather than dropped.
    */
   readonly cacheFloorDay: AnalyticsV2Day | null;
+  /**
+   * The exclusions digest the latest completed run applied (N-EXCL). A run
+   * written before the run-stamps migration applied none: its NULL reads as
+   * ANALYTICS_V2_NO_EXCLUSIONS_SHA256, the digest of no rows.
+   */
+  readonly appliedExclusionsSha256: string;
+  /** Every day with a published head, ascending (republished when the exclusions change). */
+  readonly publishedDays: readonly AnalyticsV2Day[];
 }
 
 /**
- * Read the cursor, the carried blocked days and the cache floor. Runs in the
- * caller's transaction (the Job's read snapshot).
+ * Read the cursor, the carried blocked days, the cache floor, the applied
+ * exclusions digest and the published days. Runs in the caller's transaction
+ * (the Job's read snapshot).
  */
 export async function readAnalyticsV2RefreshState(
   client: PostgresClient,
@@ -863,8 +881,9 @@ export async function readAnalyticsV2RefreshState(
   }
   const schema = quoteSchema(options.schema);
   let cursorRows: { last_sequence: unknown }[];
-  let runRows: { blocked: unknown }[];
+  let runRows: { blocked: unknown; exclusions_sha256: unknown }[];
   let floorRows: { day: unknown }[];
+  let publishedRows: { day: unknown }[];
   try {
     cursorRows = rowsOf(await client.query(
       `SELECT last_sequence::text AS last_sequence
@@ -872,13 +891,17 @@ export async function readAnalyticsV2RefreshState(
       [ANALYTICS_V2_SINGLETON_ID],
     ), "ANALYTICS_V2_READ_FAILED");
     runRows = rowsOf(await client.query(
-      `SELECT publication -> 'blocked' AS blocked
+      `SELECT publication -> 'blocked' AS blocked, exclusions_sha256
          FROM ${relation(schema, ANALYTICS_V2_TABLES.runs)}
         WHERE state = 'complete'
         ORDER BY finished_at DESC, started_at DESC, run_id DESC LIMIT 1`,
     ), "ANALYTICS_V2_READ_FAILED");
     floorRows = rowsOf(await client.query(
       `SELECT to_char(min(day), 'YYYY-MM-DD') AS day FROM ${relation(schema, ANALYTICS_V2_TABLES.cacheBands)}`,
+    ), "ANALYTICS_V2_READ_FAILED");
+    publishedRows = rowsOf(await client.query(
+      `SELECT to_char(day, 'YYYY-MM-DD') AS day FROM ${relation(schema, ANALYTICS_V2_TABLES.publishedDaily)}
+        ORDER BY day LIMIT $1`, [ANALYTICS_V2_OUTPUT_LIMITS.days + 1],
     ), "ANALYTICS_V2_READ_FAILED");
   } catch (error) {
     if (error instanceof AnalyticsV2StoreError) throw error;
@@ -898,9 +921,19 @@ export async function readAnalyticsV2RefreshState(
   if (floorRows.length > 1 || (cacheFloorDay !== null && !isAnalyticsV2Day(cacheFloorDay))) {
     fail("ANALYTICS_V2_STATE_INVALID", "cacheBands");
   }
+  const applied = runRows.length === 0 ? null : runRows[0]?.exclusions_sha256 ?? null;
+  if (applied !== null && (typeof applied !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(applied))) {
+    fail("ANALYTICS_V2_STATE_INVALID", "runs.exclusions");
+  }
+  const publishedDays = publishedRows.map((row) => row.day);
+  if (publishedDays.length > ANALYTICS_V2_OUTPUT_LIMITS.days || !publishedDays.every(isAnalyticsV2Day)) {
+    fail("ANALYTICS_V2_STATE_INVALID", "publishedDaily");
+  }
   return Object.freeze({
     cursor,
     carriedBlockedDays: Object.freeze(sortedDays(blocked as AnalyticsV2Day[])),
     cacheFloorDay: cacheFloorDay as AnalyticsV2Day | null,
+    appliedExclusionsSha256: (applied as string | null) ?? ANALYTICS_V2_NO_EXCLUSIONS_SHA256,
+    publishedDays: Object.freeze(publishedDays as AnalyticsV2Day[]),
   });
 }

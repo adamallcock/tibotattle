@@ -167,6 +167,7 @@ import {
   type AnalyticsV2OwnerProgress,
   type AnalyticsV2OwnerRunContext,
 } from "./compute-owner";
+import { validAnalyticsV2ExclusionIntervals, type AnalyticsV2ExclusionInterval } from "./exclusions";
 import type { AnalyticsV2DayOccurrences } from "./pin";
 import { analyticsV2Refusal, compareAnalyticsV2Refusals } from "./refusals";
 import {
@@ -289,6 +290,13 @@ export interface ComputeAnalyticsV2Input {
    * model date, and before the community fold. Anything it throws ends the run.
    */
   readonly checkpoint?: (event: AnalyticsV2Checkpoint) => void;
+  /**
+   * N-EXCL (exclusions.ts): owner -> its active community aggregate
+   * exclusions. An owner excluded on day D is left out of D's daily fold and
+   * the preview's day D; its own rows are computed as before. Every key must
+   * be an owner of the run. Defaults to none.
+   */
+  readonly exclusions?: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
   /**
    * K-PAR: computes admitted effective owners outside the main thread (the
    * Job's compute workers). Requires `loadOwnerOccurrences`; the pool asks it
@@ -531,6 +539,14 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const checkpoint = input.checkpoint ?? ((): void => {});
   const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
   const effectiveDigests = owners.filter((owner) => owner.source === "effective").map((owner) => owner.ownerDigest);
+  const exclusions = new Map<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>();
+  if (input.exclusions !== undefined) {
+    if (!(input.exclusions instanceof Map)) invalid("exclusions");
+    for (const [ownerDigest, intervals] of input.exclusions) {
+      if (!ownerSet.has(ownerDigest)) invalid("exclusions.owner");
+      exclusions.set(ownerDigest, validAnalyticsV2ExclusionIntervals(intervals));
+    }
+  }
   for (const [ownerDigest, days] of input.occurrencesByOwner) {
     if (!ownerSet.has(ownerDigest) || !(days instanceof Map)) invalid("occurrencesByOwner");
     for (const [day, value] of days) {
@@ -608,11 +624,11 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: V1ModelCompositionResult }>>(
     modelDates.map((day) => [day, []]));
   /**
-   * model date -> effective owners whose evaluation the kernels refused. (A
-   * memory-refused owner has no fit, so the preview that carries the model
-   * dates is withheld for the run; it is never counted here.)
+   * model date -> effective owners whose evaluation the kernels refused, in
+   * digest order. (A memory-refused owner has no fit, so the preview that
+   * carries the model dates is withheld for the run; it is never listed here.)
    */
-  const modelRefusedByDate = new Map<AnalyticsV2Day, number>(modelDates.map((day) => [day, 0]));
+  const modelRefusedByDate = new Map<AnalyticsV2Day, AnalyticsV2OwnerDigest[]>(modelDates.map((day) => [day, []]));
   /** Effective owners that were computed (admitted by the memory budget). */
   const computedOwners: AnalyticsV2Owner[] = [];
   // Every day a window, the cache horizon or the queue needs. Empty days are
@@ -816,7 +832,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     for (const day of computation.blockedDays) blocked.add(day);
     if (computation.fits !== null) fitsByOwner.set(ownerDigest, computation.fits);
     for (const [day, result] of computation.compositions) compositionsByDate.get(day)!.push({ ownerDigest, result });
-    for (const day of computation.modelRefused) modelRefusedByDate.set(day, modelRefusedByDate.get(day)! + 1);
+    for (const day of computation.modelRefused) modelRefusedByDate.get(day)!.push(ownerDigest);
     ownerResources.push(Object.freeze({ ...resource, admitted: true, heapPeakBytes: computation.heapPeakBytes,
       outputBytes: ownerOutputBytes }));
     checkpoint(Object.freeze({ kind: "ownerDone", index, accountBytes }));
@@ -826,7 +842,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   checkpoint(Object.freeze({ kind: "community", accountBytes }));
   const community = await timed("community", () => buildAnalyticsV2Community({ nowMs,
     revisionSeed: input.revisionSeed, queued, blocked, dailyValues, computedOwners, effectiveDigests,
-    devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate }));
+    devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions }));
 
   return {
     contractVersion: ANALYTICS_V2_CONTRACT_VERSION,

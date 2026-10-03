@@ -108,7 +108,10 @@ const kernelIdentity = await computeAnalyticsKernelIdentity({ build, options, ve
 options.define = { ...(options.define ?? {}), ...analyticsKernelDefines(kernelIdentity) };
 const kernel = { computeClosureSha256: kernelIdentity.computeClosureSha256,
   vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs };
-if (process.argv.includes("--check")) {
+if (process.argv.includes("--kernel-closure")) {
+  // Every input of the compute class, by the name it is hashed under (K-STAMP).
+  console.log(JSON.stringify({ status: "ok", mode: "kernel-closure", kernel, names: kernelIdentity.names }));
+} else if (process.argv.includes("--check")) {
   const result = await build({ ...options, write: false });
   assertVendoredPackageResolution(result.metafile);
   console.log(JSON.stringify({
