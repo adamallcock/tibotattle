@@ -511,6 +511,75 @@ test("the legacy expansion and candidates exclude superseded, incomplete and for
       eventTime: `${D1}T11:00:00.000Z` });
   });
 
+test("a v1.1 chunk whose proofs do not cover its record count is excluded from candidates, counts, first evidence and expansion",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    // REFRESH-OPT d3 moved the v1.1 completeness count out of the per-record
+    // LATERAL into one count per chunk; the predicate on each row is unchanged.
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      legacyScope: true });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const observe = async (name) => {
+      const ownerDigest = fixture.owners[name].ownerDigest;
+      const rows = await modules.occurrences.readOwnerOccurrences(scoped,
+        { ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+      return {
+        read: [...rows].map(([day, values]) => [day,
+          values.map((row) => [row.occurrenceId, row.sourceFormats.join()]).sort()]),
+        counts: [...await modules.occurrences.countOwnerOccurrences(scoped,
+          { ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 })],
+        first: await modules.occurrences.readOwnerFirstEvidenceDay(scoped, { ownerDigest, throughDay: D3 }),
+      };
+    };
+    // The v1.1 chunks holding the participant's D1 records.
+    const d1Chunks = async (name) => (await pool.query(`SELECT DISTINCT chunk.id
+        FROM "${schema}".telemetry_v11_chunks chunk
+        JOIN "${schema}".typed_v11_chunk_allocations allocation ON allocation.chunk_id=chunk.id
+        JOIN "${schema}".typed_telemetry_chunks physical ON physical.namespace_id=allocation.namespace_id
+         AND physical.format=11 AND physical.original_id=allocation.chunk_original
+        JOIN "${schema}".typed_v11_record_proofs proof ON proof.chunk_key=physical.id
+        JOIN "${schema}".typed_telemetry_records record ON record.id=proof.typed_record_id
+       WHERE chunk.participant_id=$1 AND record.observed_day=$2::integer ORDER BY chunk.id`,
+    [fixture.owners[name].participantId, Date.parse(`${D1}T00:00:00.000Z`) / 86_400_000])).rows.map((row) => row.id);
+    // A chunk admitted with fewer proofs than its record count. Published
+    // chunks are immutable (telemetry_source_immutable), so the synthetic
+    // fixture's count is shifted with triggers off for this one statement.
+    const shiftRecordCount = async (ids, delta) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL session_replication_role = replica");
+        await client.query(`UPDATE "${schema}".telemetry_v11_chunks SET record_count=record_count+$2
+          WHERE id=ANY($1::text[])`, [ids, delta]);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+    const before = { lima: await observe("lima"), mike: await observe("mike") };
+    assert.deepEqual(before.mike.read, [[D1, [[OCCURRENCES.legacyScoped, "v11"]]]]);
+    assert.ok(before.lima.read.find(([day]) => day === D1)[1].some(([id]) => id === OCCURRENCES.legacyFirst));
+    const incomplete = [...await d1Chunks("mike"), ...await d1Chunks("lima")];
+    assert.equal(incomplete.length, 2);
+    await shiftRecordCount(incomplete, 1);
+    // mike's only record and lima's D1 v1.1 record leave every reader; lima's
+    // v1 records and her D3 v1.1 record (another chunk) stay.
+    assert.deepEqual(await observe("mike"), { read: [], counts: [], first: null });
+    const lima = await observe("lima");
+    assert.deepEqual(lima.read, before.lima.read.map(([day, values]) => [day,
+      values.filter(([id]) => id !== OCCURRENCES.legacyFirst)]));
+    assert.deepEqual(lima.counts, before.lima.counts.map(([day, count]) => [day, day === D1 ? count - 1 : count]));
+    assert.equal(lima.first, D1);
+    await shiftRecordCount(incomplete, -1);
+    assert.deepEqual({ lima: await observe("lima"), mike: await observe("mike") }, before);
+  });
+
 // ---------------------------------------------------------------------------
 // K-READ: prepared statements, generic plans, F(o,d) and W(o); N-EXCL
 // ---------------------------------------------------------------------------

@@ -122,7 +122,14 @@ export function createV11DailyProjectionValues(day: string): V11DailyProjectionV
 /** Merge only source-proven disjoint pages from the SAME immutable generation.
  * Bounded state intentionally does not retain a day-sized occurrence-ID set. */
 export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues): V11DailyProjectionValues {
-  a=normalizeV11DailyProjectionValues(a);b=normalizeV11DailyProjectionValues(b);if(a.day!==b.day)fail();
+  return mergeDailyProjectionValues(a,b,false);
+}
+/** GCP source patch daily-fold-trusted-state (not in d43c8f92): the merge
+ * above, unchanged, except that a trusted a (a state this module built) is
+ * neither normalized nor validated again and the result is left for the
+ * caller's one validation. b is always normalized and validated. */
+function mergeDailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues,trustedA: boolean): V11DailyProjectionValues {
+  a=trustedA?a:normalizeV11DailyProjectionValues(a);b=normalizeV11DailyProjectionValues(b);if(a.day!==b.day)fail();
   const result=createV11DailyProjectionValues(a.day);
   result.counts={usage:a.counts.usage+b.counts.usage,quota:a.counts.quota+b.counts.quota,session:a.counts.session+b.counts.session};
   result.tokens=addTokens(a.tokens,b.tokens);result.pricing=addPricing(a.pricing,b.pricing);
@@ -142,15 +149,15 @@ export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11
     result.omitted.tokens=addTokens(result.omitted.tokens,cell.tokens);
     result.omitted.pricing=addPricing(result.omitted.pricing,cell.pricing);
   }
-  result.cells=sorted.slice(0,MAX_V11_DAILY_MODEL_CELLS);validateV11DailyProjectionValues(result);return result;
+  result.cells=sorted.slice(0,MAX_V11_DAILY_MODEL_CELLS);if(!trustedA)validateV11DailyProjectionValues(result);return result;
 }
 function sumKnown(values: readonly (number|null)[]): ExactTokenSum {
   return {knownSum:values.reduce<bigint>((sum,value)=>sum+BigInt(value??0),0n).toString(),unavailable:values.some(v=>v===null)?1:0};
 }
 /** All three streams are validated; only usage contributes tokens and spend.
  * No DB/network writes, raw persistence, quota fit or source selection occurs. */
-function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[]): V11DailyProjectionValues {
-  state=normalizeV11DailyProjectionValues(state);
+function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[], trustedState = false): V11DailyProjectionValues {
+  state=trustedState?state:normalizeV11DailyProjectionValues(state);
   if(!Array.isArray(records)||records.length>MAX_V11_DAILY_FOLD_RECORDS)fail();
   const page=createV11DailyProjectionValues(state.day), cells=new Map<string,V11DailyModelCell>();const identities=new Set<string>();
   for(const value of records) {
@@ -180,7 +187,7 @@ function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionVa
     if(cells.size>MAX_V11_DAILY_MODEL_CELLS)fail();
   }
   page.cells=[...cells.values()].sort(compare);
-  return mergeV11DailyProjectionValues(state,page);
+  return mergeDailyProjectionValues(state,page,trustedState);
 }
 /** Final arithmetic output only. The caller retains existing daily capacity,
  * suppression and source/authority/completion gates before public publication. */
@@ -196,6 +203,20 @@ export function finalizeV11DailyProjectionValues(state: V11DailyProjectionValues
 /** Format-specific validation shares exact arithmetic without translating wire records. */
 export function foldV11DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
  return foldDailyProjectionValues('v11',state,records);
+}
+/** GCP source patch daily-fold-trusted-state (not in d43c8f92). The same fold
+ * as foldV11DailyProjectionValues, page for page, for a caller that folds one
+ * owner-day from createV11DailyProjectionValues one record at a time and then
+ * calls validateV11DailyProjectionValues once on the result: the state passed in must be
+ * createV11DailyProjectionValues's or this function's own output. The page is
+ * validated on every call as before; only the re-validation of the
+ * accumulated state is skipped. That validation cannot fail here: each check
+ * on a merge of two valid values is additive or holds by construction, and the
+ * only bounds a sum could cross (MAX_V11_DAILY_VALUES_RECORDS, 25 decimal
+ * digits) are out of reach for a day of at most 250,000 records, so every
+ * returned state, and the result, is exactly what the checked fold returns. */
+export function foldV11DailyProjectionValuesTrusted(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v11',state,records,true);
 }
 export function foldV1DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
  return foldDailyProjectionValues('v1',state,records);
