@@ -11,7 +11,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
-import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import {
+  bornBucket,
+  createFakeGcloud,
+  emptyWorld,
+  INJECTED_SCHEDULER_HEADERS,
+  memoryWriter,
+} from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -154,8 +160,8 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   // Pass 2 still creates no refresh trigger: the cadence is the owner's, and the clean reasons above
   // omit it. Nor does the scheduler account hold run.jobsExecutor on the refresh job: both wait for
   // the cadence. The only trigger is the maintenance job's, PAUSED, with its grant.
-  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state]),
-    [[MAINTENANCE_TRIGGER, "PAUSED"]]);
+  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state, job.httpTarget.headers]),
+    [[MAINTENANCE_TRIGGER, "PAUSED", INJECTED_SCHEDULER_HEADERS]]);
   assert.deepEqual([executorOn(world, "tibotattle-analytics-refresh"), executorOn(world, "tibotattle-maintenance"),
     executorOn(world, "tibotattle-migrate")], [false, true, false]);
   // The maintenance job reads the identity-link secret only; the unread GitHub token is left out.
@@ -242,8 +248,10 @@ test("a cadence the owner commits later (synthetic here) is created paused after
   const repair = plan();
   assert.deepEqual(executable(repair), ["scheduler:pause:analytics-refresh", EXECUTOR]);
   apply(repair.planDigest);
-  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state]),
-    [[MAINTENANCE_TRIGGER, "PAUSED"], ["tibotattle-analytics-refresh-trigger", "PAUSED"]]);
+  // Both carry the header Cloud Scheduler injects, which readback accepts, so the plan is clean.
+  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state, job.httpTarget.headers]),
+    [[MAINTENANCE_TRIGGER, "PAUSED", INJECTED_SCHEDULER_HEADERS],
+      ["tibotattle-analytics-refresh-trigger", "PAUSED", INJECTED_SCHEDULER_HEADERS]]);
   assert.equal(granted(), true);
   assert.deepEqual(executable(plan()), []);
   assert.equal(deferred(plan()).some((entry) => entry.startsWith("scheduler:")), false);

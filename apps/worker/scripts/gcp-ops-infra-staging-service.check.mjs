@@ -17,7 +17,14 @@ import * as maintenanceJob from "../cloud-run/postgres-maintenance-job-contract.
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import { CLEAN_DEFERRALS } from "./gcp-ops-infra-operations.mjs";
-import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter, withSecretValues } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import {
+  bornBucket,
+  createFakeGcloud,
+  emptyWorld,
+  INJECTED_SCHEDULER_HEADERS,
+  memoryWriter,
+  withSecretValues,
+} from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { generateStagingSecretValues, STAGING_SECRET_KINDS } from "./gcp-staging-secrets.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -508,6 +515,10 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
+  // Cloud Scheduler stored its User-Agent header on the created trigger (live staging pass 2,
+  // 2026-10-03); readback accepts exactly that header, so it is not an override to update.
+  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state, job.httpTarget.headers]),
+    [["tibotattle-staging-maintenance-trigger", "PAUSED", INJECTED_SCHEDULER_HEADERS]]);
   // The plane is clean: only the refresh trigger and its grant wait, for the owner's cadence
   // (SCHEDULER_CADENCE_UNSET, a clean deferral), so a staging readback --require-clean passes.
   const settled = plan();

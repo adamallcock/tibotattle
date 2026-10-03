@@ -23,6 +23,7 @@ import {
   bornBucket,
   createFakeGcloud,
   emptyWorld,
+  INJECTED_SCHEDULER_HEADERS,
   memoryWriter,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
@@ -1212,6 +1213,47 @@ test("the maintenance job and its trigger wait for what only the desired state a
   // The other two jobs never read these inputs, so they are never deferred by them.
   for (const job of ["production-migrate", "analytics-refresh"]) {
     assert.equal(ops(result, (entry) => entry.id === `run-job:create:${job}`)[0].deferred, undefined, job);
+  }
+});
+
+test("readback accepts exactly the User-Agent header Cloud Scheduler injects, and any other header or a body is an override", () => {
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired, UNDEFERRED);
+  // The fake stores the header live Cloud Scheduler stored on a created trigger (staging, 2026-10-03).
+  assert.deepEqual(maintenanceTrigger(world).httpTarget.headers, { "User-Agent": "Google-Cloud-Scheduler" });
+  assert.deepEqual(operations.SCHEDULER_INJECTED_HEADERS, INJECTED_SCHEDULER_HEADERS);
+  const maintenanceIds = (target) => plan(desired, fake(desired, target).runner, UNDEFERRED).operations
+    .filter((entry) => entry.deferred === undefined && entry.id.startsWith("scheduler:")).map((entry) => entry.id);
+  // Injected only, or no headers at all: nothing to update, and the plan is clean.
+  assert.deepEqual(maintenanceIds(world), []);
+  assert.deepEqual(operations.infrastructureCleanliness(plan(desired, fake(desired, world).runner, UNDEFERRED)),
+    { clean: true, reasons: [] });
+  const absent = structuredClone(world);
+  delete maintenanceTrigger(absent).httpTarget.headers;
+  assert.deepEqual(maintenanceIds(absent), []);
+  // Anything else is an override: another value, another casing, an extra or a different
+  // header, an empty or malformed map, or a body (with or without the injected header).
+  const variants = {
+    "another value": (target) => { target.headers = { "User-Agent": "Google-Cloud-Scheduler/2" }; },
+    "the documented App Engine default": (target) => {
+      target.headers = { "User-Agent": "AppEngine-Google; (+http://code.google.com/appengine)" };
+    },
+    "a lower-case name": (target) => { target.headers = { "user-agent": "Google-Cloud-Scheduler" }; },
+    "an upper-case name": (target) => { target.headers = { "USER-AGENT": "Google-Cloud-Scheduler" }; },
+    "an extra header": (target) => { target.headers = { ...INJECTED_SCHEDULER_HEADERS, Accept: "text/plain" }; },
+    "a different header": (target) => { target.headers = { "X-Synthetic": "1" }; },
+    "an empty map": (target) => { target.headers = {}; },
+    "a null map": (target) => { target.headers = null; },
+    "a non-string value": (target) => { target.headers = { "User-Agent": ["Google-Cloud-Scheduler"] }; },
+    "a body": (target) => { target.body = "e30="; },
+    "a body without headers": (target) => { delete target.headers; target.body = "e30="; },
+  };
+  for (const [label, mutate] of Object.entries(variants)) {
+    const drifted = structuredClone(world);
+    mutate(maintenanceTrigger(drifted).httpTarget);
+    assert.deepEqual(maintenanceIds(drifted), ["scheduler:update:maintenance"], label);
+    assert.deepEqual(operations.infrastructureCleanliness(plan(desired, fake(desired, drifted).runner, UNDEFERRED))
+      .reasons, ["EXECUTABLE:scheduler:update:maintenance"], label);
   }
 });
 

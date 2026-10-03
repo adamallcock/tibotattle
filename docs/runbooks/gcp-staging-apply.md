@@ -339,6 +339,16 @@ executor-binding deferrals listed in step 7. After pass 2 (the gated tail)
 it exits 0 with `"clean": true`: the refresh trigger's and its grant's
 `SCHEDULER_CADENCE_UNSET` is a clean deferral (`CLEAN_DEFERRALS`), so it is
 not a reason.
+Cloud Scheduler stores `httpTarget.headers = {"User-Agent":
+"Google-Cloud-Scheduler"}` on every trigger apply creates, although apply
+never passes `--headers` (observed on the staging maintenance trigger at pass
+2, 2026-10-03). Readback accepts exactly that map as no override: one key,
+that case-exact name and that exact value. Any other header, value or name
+casing, an extra header, or a body is still an override, so the plan
+proposes `scheduler:update:<job>` and `--require-clean` reports
+`EXECUTABLE:scheduler:update:<job>`. Do not apply such an update to clear a
+header: the update passes no header or body flag, so it does not remove one;
+remove it by hand and re-read.
 This is the first owner-run readback of the test project (OPS2-READ): check
 that the service-account policy, the scheduler listing and the custom role
 parsed, and keep the files as evidence (they are content-free).

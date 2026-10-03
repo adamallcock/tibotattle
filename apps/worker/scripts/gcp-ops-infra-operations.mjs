@@ -205,6 +205,14 @@ export const EXECUTABLE_ACTIONS = Object.freeze(["create", "update", "bind"]);
 export const REFUSED_ACTIONS = Object.freeze(["delete", "destructive", "bucket-update"]);
 /** Cloud Scheduler job states readback reports; anything else is UNRECOGNIZED. */
 export const SCHEDULER_LIVE_STATES = Object.freeze(["ENABLED", "PAUSED", "DISABLED", "UPDATE_FAILED"]);
+/**
+ * The one header map Cloud Scheduler stores on an HTTP trigger the planner
+ * created without --headers, as read back live from staging on 2026-10-03.
+ * Readback accepts exactly this map (one key, case-exact name, exact value)
+ * as no override; any other key, value or casing, an extra header or a body
+ * is still an override the plan updates.
+ */
+export const SCHEDULER_INJECTED_HEADERS = Object.freeze({ "User-Agent": "Google-Cloud-Scheduler" });
 /** IAM custom role stages readback reports; anything else is UNRECOGNIZED. */
 export const CUSTOM_ROLE_STAGES = Object.freeze(["ALPHA", "BETA", "GA", "DEPRECATED", "DISABLED", "EAP"]);
 /** The deferred resume of a paused trigger whose desired state is ENABLED (OPS-3 resumes). */
@@ -517,8 +525,15 @@ function schedulerView(job) {
     serviceAccountEmail: target.oauthToken?.serviceAccountEmail ?? null,
     scope: target.oauthToken?.scope ?? null,
     retryCount: Number(job?.retryConfig?.retryCount ?? 0),
-    overrides: target.body !== undefined || target.headers !== undefined,
+    overrides: target.body !== undefined || !schedulerHeadersInjectedOnly(target.headers),
   };
+}
+
+/** True when headers are absent or exactly SCHEDULER_INJECTED_HEADERS. */
+function schedulerHeadersInjectedOnly(headers) {
+  if (headers === undefined) return true;
+  if (headers === null || typeof headers !== "object" || Array.isArray(headers)) return false;
+  return canonicalJson(headers) === canonicalJson(SCHEDULER_INJECTED_HEADERS);
 }
 
 /**
