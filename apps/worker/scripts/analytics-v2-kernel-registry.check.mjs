@@ -61,6 +61,11 @@ const REGISTRY_PINS = Object.freeze([
   // K-PERCARD branch before any merge or durable stamped run, when its review
   // fixes changed price-transition.ts.)
   "c18c6dd6017885fcfaddf7df87ce6c80162737039f00dd208c4e83f4fed66f6f",
+  // Kernel 4: the fast-path final line's merged closure. K-PERCARD's price
+  // inputs (kernel 3) met E-OWNERSET's owner-set reader (owner-sets.ts, a
+  // closure root) and its orchestration method analytics-v2-method-v2 at the
+  // 733e143c merge.
+  "5140704aab3e55affbbb63da08a043615f119936c093cae25afc4b7d6e9c53c6",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
