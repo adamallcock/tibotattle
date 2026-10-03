@@ -369,7 +369,12 @@ function normalizeSettings(settings, runtime, versionBindings) {
 
 const OBSERVABILITY_KEYS = Object.freeze(["enabled", "head_sampling_rate"]);
 const OBSERVABILITY_SECTIONS = Object.freeze(["logs", "traces"]);
-const OBSERVABILITY_SECTION_KEYS = Object.freeze(["enabled", "head_sampling_rate", "invocation_logs", "persist", "destinations"]);
+// Each section's closed key set, as Wrangler's config schema declares it:
+// `invocation_logs` exists only for logs.
+const OBSERVABILITY_SECTION_KEYS = Object.freeze({
+  logs: Object.freeze(["enabled", "head_sampling_rate", "invocation_logs", "persist", "destinations"]),
+  traces: Object.freeze(["enabled", "head_sampling_rate", "persist", "destinations"]),
+});
 // The Workers settings API reports `redact_query_string` beside the
 // observability payload; Wrangler's declarative config cannot set it.
 const OBSERVABILITY_API_ONLY_KEY = "redact_query_string";
@@ -412,9 +417,10 @@ function normalizeObservability(value, { code = "SETTINGS_INVALID", apiOnly = tr
   for (const section of OBSERVABILITY_SECTIONS) {
     if (value[section] === undefined) continue;
     const source = requiredObject(value[section], code);
-    if (Object.keys(source).some((key) => !OBSERVABILITY_SECTION_KEYS.includes(key))) fail(code);
+    const sectionKeys = OBSERVABILITY_SECTION_KEYS[section];
+    if (Object.keys(source).some((key) => !sectionKeys.includes(key))) fail(code);
     const target = {};
-    for (const key of OBSERVABILITY_SECTION_KEYS) {
+    for (const key of sectionKeys) {
       if (source[key] === undefined) continue;
       if (key === "enabled" || key === "invocation_logs" || key === "persist") {
         target[key] = requiredBoolean(source[key], code);
@@ -441,7 +447,7 @@ function normalizeObservability(value, { code = "SETTINGS_INVALID", apiOnly = tr
  * when that value is exactly the pinned default. Declared fields, non-default
  * values and unlisted keys are left alone, so they still compare exactly.
  */
-function observabilityWithPinnedDefaults(declared, live) {
+function observabilityWithPinnedDefaults(declared, live, { apiOnly = false } = {}) {
   if (declared.enabled !== true || declared.head_sampling_rate !== 1 || !object(live)) return declared;
   const result = { ...declared };
   for (const section of OBSERVABILITY_SECTIONS) {
@@ -453,7 +459,30 @@ function observabilityWithPinnedDefaults(declared, live) {
     }
     if (declared[section] !== undefined || Object.keys(target).length > 0) result[section] = target;
   }
-  return normalizeObservability(result, { code: "CONFIG_SETTINGS_INVALID", apiOnly: false });
+  return normalizeObservability(result, { code: "CONFIG_SETTINGS_INVALID", apiOnly });
+}
+
+/**
+ * Whether a Wrangler config's declared observability reproduces a live
+ * settings observability object, under the same closed rule the live config
+ * verifier applies: declared fields compare exactly, an undeclared field
+ * compares equal only at its pinned Cloudflare default, and unknown keys on
+ * either side throw (SETTINGS_INVALID live, CONFIG_SETTINGS_INVALID declared).
+ * For configs copied verbatim from a settings capture, the declared side may
+ * carry the API-only `redact_query_string`; it then compares like any other
+ * declared field. Both absent is equal; exactly one absent is drift.
+ */
+export function productionObservabilityMatchesLive(declared, live) {
+  if (declared === undefined || declared === null || live === undefined || live === null) {
+    return (declared === undefined || declared === null) && (live === undefined || live === null);
+  }
+  const actual = normalizeObservability(live);
+  const candidate = observabilityWithPinnedDefaults(
+    normalizeObservability(declared, { code: "CONFIG_SETTINGS_INVALID" }),
+    actual,
+    { apiOnly: true },
+  );
+  return digest(candidate) === digest(actual);
 }
 
 /** The live observability rendered as Wrangler config, which cannot carry the API-only key. */

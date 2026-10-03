@@ -4,6 +4,7 @@ import {
   PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS,
   createProductionLiveConfigSnapshot,
   productionLiveConfigFingerprint,
+  productionObservabilityMatchesLive,
   renderProductionLiveConfig,
   verifyProductionLiveConfig,
 } from "./production-live-config.mjs";
@@ -364,7 +365,6 @@ test("a live observability value other than the pinned default is drift for an u
     ["logs.head_sampling_rate", (value) => { value.logs.head_sampling_rate = 0.25; }],
     ["logs.destinations", (value) => { value.logs.destinations = ["synthetic-destination"]; }],
     ["traces.destinations", (value) => { value.traces.destinations = []; }],
-    ["traces.invocation_logs", (value) => { value.traces.invocation_logs = true; }],
     ["redact_query_string", (value) => { value.redact_query_string = true; }],
   ];
   for (const [name, mutate] of mutations) {
@@ -396,6 +396,8 @@ test("unknown observability keys fail closed in the live inventory and the candi
     (value) => { value.unexpected = true; },
     (value) => { value.logs.unexpected = true; },
     (value) => { value.traces.unexpected = true; },
+    // Wrangler's schema gives traces no invocation_logs; only logs carries it.
+    (value) => { value.traces.invocation_logs = true; },
     (value) => { value.redact_query_string = "false"; },
   ]) {
     const observability = structuredClone(LIVE_OBSERVABILITY.production);
@@ -407,8 +409,50 @@ test("unknown observability keys fail closed in the live inventory and the candi
     { ...DECLARED_OBSERVABILITY, unexpected: true },
     { ...DECLARED_OBSERVABILITY, redact_query_string: false },
     { ...DECLARED_OBSERVABILITY, logs: { unexpected: true } },
+    { ...DECLARED_OBSERVABILITY, traces: { invocation_logs: true } },
   ]) {
     assert.equal(verifyDeclared(snapshot, declaration).code, "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_INVALID");
+  }
+});
+
+test("the exported observability comparator applies the same closed pinned-defaults rule", () => {
+  const match = productionObservabilityMatchesLive;
+  for (const [name, live] of Object.entries(LIVE_OBSERVABILITY)) {
+    assert.equal(match(DECLARED_OBSERVABILITY, live), true, name);
+    // A config copied verbatim from the capture compares exactly, API-only key included.
+    assert.equal(match(structuredClone(live), live), true, name);
+  }
+  assert.equal(match(undefined, undefined), true);
+  assert.equal(match(null, undefined), true);
+  assert.equal(match(undefined, LIVE_OBSERVABILITY.production), false);
+  assert.equal(match(DECLARED_OBSERVABILITY, undefined), false);
+  assert.equal(match({ enabled: true }, { enabled: true }), true);
+  for (const mutate of [
+    (value) => { value.traces.enabled = true; },
+    (value) => { value.logs.persist = false; },
+    (value) => { value.logs.destinations = []; },
+    (value) => { value.redact_query_string = true; },
+    (value) => { value.enabled = false; },
+  ]) {
+    const live = structuredClone(LIVE_OBSERVABILITY.production);
+    mutate(live);
+    assert.equal(match(DECLARED_OBSERVABILITY, live), false, JSON.stringify(live));
+  }
+  // Defaults apply only to the observed declaration.
+  assert.equal(match({ enabled: true }, { ...LIVE_OBSERVABILITY.production, head_sampling_rate: undefined }), false);
+  // A declared redact_query_string other than the live value is drift both ways.
+  assert.equal(match({ ...DECLARED_OBSERVABILITY, redact_query_string: true }, LIVE_OBSERVABILITY.production), false);
+  assert.equal(match(DECLARED_OBSERVABILITY, { ...LIVE_OBSERVABILITY.production, redact_query_string: true }), false);
+  assert.equal(match({ ...LIVE_OBSERVABILITY.production, redact_query_string: true },
+    { ...LIVE_OBSERVABILITY.production, redact_query_string: true }), true);
+  for (const live of [
+    { ...LIVE_OBSERVABILITY.production, unexpected: true },
+    { ...LIVE_OBSERVABILITY.production, traces: { ...LIVE_OBSERVABILITY.production.traces, invocation_logs: true } },
+  ]) {
+    assert.throws(() => match(DECLARED_OBSERVABILITY, live), { code: "PRODUCTION_LIVE_CONFIG_SETTINGS_INVALID" });
+  }
+  for (const declared of [{ ...DECLARED_OBSERVABILITY, unexpected: true }, { ...DECLARED_OBSERVABILITY, traces: { invocation_logs: true } }]) {
+    assert.throws(() => match(declared, LIVE_OBSERVABILITY.production), { code: "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_INVALID" });
   }
 });
 
