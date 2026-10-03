@@ -86,3 +86,16 @@ Root admitted CPU-profiler own commits 8eb30005a3587ed9d264a05f37415c33460beb28 
 Composed Node checks initially passed 52/53; the sole failure is the separately known SIGTERM sampler race (`no orphaned sampler`) in prod-shape.check.mjs. This is not a green full wrapper. Corrected owning scope `node --test --test-concurrency=1 cloud-run/analytics-refresh-worker-profile.check.mjs cloud-run/analytics-refresh-pool.check.mjs scripts/gcp-worker-profile-capture.check.mjs` passed 39/39, zero skips, including real bundled owner/model-block CPU capture parity. Narrow explicit timeout/profiler option contracts passed 2/2. Worker TypeScript and prospective closure derivation passed. Logs preserve the initial failure and narrow qualifications separately.
 
 The K6 output-digest-policy draft adds only explicit kernel6 admission and mandatory three pricing-class tables, with strict stamps/schema/linkage/proof and raw/semantic projections preserved. Its boundary tests pass 8/8; independent review is pending. No registry entry/pin has been added. User steering requests additional opt-in allocation/memory profiling; coordinator explicitly holds K6 registration/capture until that extension is scoped, implemented and independently reviewed. FINAL remains separate at registered kernel4. No real capture/corpus/provider operation ran here beyond synthetic owning tests.
+
+## Sampler lifecycle repair and composed wrapper qualification
+
+Independent semantics review accepted minimal K6 output-policy support at exact 551ba102cf5eeead9a5b64f78aace660a68fcd25: only kernels4/5/6 accepted, kernel4 requires zero class tables and5/6 require all three; schema, links, proofs, completed-run stamps and raw/semantic projection contracts remain strict. This acceptance does not admit a registry entry or capture.
+
+Root admitted sampler own commits 7b45338861aace2c991b051d1839873f8c32f6aa, 12c3aabff0f95aa20f9363b87d8f1f0c8fb707b0 and 7ad7970e3e971b9c1855785d76e52378ffbf672a after exact independent review. Wave26 folds d2648d30, 2c91cafd and d6e460e3 retain the scoped source receipt. The last commit's tail-test conflict was reconciled by retaining both the profiler projection test and actual guarded/uncapped caller regression; no assertions were removed or weakened.
+
+At frozen d6e460e359d202d4f3b8314e50faea1e64533f33, Node.js26.2.0 with local process visibility needed by synthetic regressions:
+
+- Serial complete composed prod-shape, profiler, pool, real synthetic capture and digest-policy files: 62/62 passed, zero skips, 10.43 s. The earlier SIGTERM `no orphaned sampler` failure is now covered and passes; historical failed logs remain.
+- Exact `npm run gcp:fastpath:prod-shape:check` from apps/worker, including all maintained syntax checks plus prod-shape, output-digest-policy and refresh-pgstat-lifecycle tests: 29/29 passed, zero skips, 9.32 s.
+
+Logs: `sampler-profiler-composed.log` and `sampler-final-prodshape-wrapper.log`. No corpus import, real provider capture or cloud operation ran. Registry/pins and kernels1–5 remain unchanged; FINAL is untouched at da02e21f/kernel4. K6 registration and capture remain held pending independently reviewed allocation/memory extension.
