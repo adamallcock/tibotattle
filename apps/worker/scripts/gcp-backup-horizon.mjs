@@ -56,6 +56,7 @@ import {
   onDemandExpiresOn,
   verifyBackupHorizonReceipt,
 } from "../cloud-run/ops-backup-horizon.mjs";
+import STAGING_DESIRED_STATE from "../cloud-run/infra/staging.desired-state.json" with { type: "json" };
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 
 export const BACKUP_ON_DEMAND_RECEIPT_SCHEMA = "tibotattle-backup-on-demand-v1";
@@ -123,7 +124,7 @@ const TEST_TARGET_VALUES = collectTestTargetValues();
 
 /** True when a project or instance value names the private test estate. */
 export function isTestTargetValue(value) {
-  return TEST_TARGET_VALUES.has(value);
+  return TEST_TARGET_VALUES.has(value) || (typeof value === "string" && value.startsWith("tibotattle-test-"));
 }
 
 function validateEnvironment(value) {
@@ -131,8 +132,9 @@ function validateEnvironment(value) {
   return value;
 }
 
-function validateProject(value) {
-  if (typeof value !== "string" || isTestTargetValue(value)) fail("BACKUP_HORIZON_TEST_TARGET_REFUSED");
+function validateProject(value, exactStagingTarget = false) {
+  if (typeof value !== "string" || (isTestTargetValue(value)
+      && !(exactStagingTarget && value === STAGING_DESIRED_STATE.project))) fail("BACKUP_HORIZON_TEST_TARGET_REFUSED");
   if (!GCP_PROJECT_ID_PATTERN.test(value)) fail("BACKUP_HORIZON_PROJECT_INVALID");
   return value;
 }
@@ -143,6 +145,22 @@ function validateInstance(value) {
     fail("BACKUP_HORIZON_INSTANCE_INVALID");
   }
   return value;
+}
+
+// The staging/test project is shared; only the committed staging primary is
+// admitted in that project. Check the whole tuple at every exported boundary.
+function validateTargetIdentity(environment, project, instance) {
+  environment = validateEnvironment(environment);
+  const exactStagingTarget = environment === "staging"
+    && project === STAGING_DESIRED_STATE.project
+    && instance === STAGING_DESIRED_STATE.cloudSql.instance;
+  project = validateProject(project, exactStagingTarget);
+  instance = validateInstance(instance);
+  if ((environment === "staging" && !exactStagingTarget)
+      || (environment === "production" && instance.split("-").includes("staging"))) {
+    fail("BACKUP_HORIZON_TARGET_MISMATCH");
+  }
+  return { environment, project, instance };
 }
 
 function validateRegion(value) {
@@ -196,9 +214,7 @@ function readFlags(argv, { required, optional }) {
  */
 export function validateCreateOnDemandRequest(request = {}) {
   return Object.freeze({
-    environment: validateEnvironment(request.environment),
-    project: validateProject(request.project),
-    instance: validateInstance(request.instance),
+    ...validateTargetIdentity(request.environment, request.project, request.instance),
     instanceRole: validateRole(request.instanceRole),
     purpose: validatePurpose(request.purpose),
     expiresInDays: validateExpiresInDays(request.expiresInDays),
@@ -212,11 +228,12 @@ export function parseBackupHorizonArgs(argv) {
   const values = readFlags(argv.slice(1), COMMANDS[command]);
   const environment = validateEnvironment(values.get("--environment"));
   if (command === "audit") {
+    const target = validateTargetIdentity(environment, values.get("--project"), values.get("--primary-instance"));
     return Object.freeze({
       command,
       environment,
-      project: validateProject(values.get("--project")),
-      primaryInstance: validateInstance(values.get("--primary-instance")),
+      project: target.project,
+      primaryInstance: target.instance,
       region: validateRegion(values.get("--region") ?? null),
     });
   }
@@ -288,6 +305,9 @@ function listBackupRuns(spawn, project, instance) {
 
 /** Read-only audit of the one instance; returns the frozen receipt. */
 export function runBackupHorizonAudit(config, { spawn = spawnSync, now = Date.now } = {}) {
+  const target = validateTargetIdentity(config.environment, config.project, config.primaryInstance);
+  config = { ...config, environment: target.environment, project: target.project,
+    primaryInstance: target.instance, region: validateRegion(config.region ?? null) };
   const instances = [];
   for (const [role, instance] of [["primary", config.primaryInstance]]) {
     const settings = gcloudJson(spawn, describeInstanceArgs(config.project, instance),
@@ -415,7 +435,8 @@ export async function pruneOnDemandBackups(config, {
   if (!(nowMs - generatedMs < PRUNE_RECEIPT_MAX_AGE_MS) || generatedMs - nowMs > FUTURE_RECEIPT_TOLERANCE_MS) {
     fail("PRUNE_RECEIPT_STALE");
   }
-  const project = validateProject(receipt.project);
+  const target = validateTargetIdentity(receipt.environment, receipt.project, receipt.roles.primary.instance);
+  const project = target.project;
   const candidates = [];
   for (const role of BACKUP_HORIZON_ROLES) {
     const instance = validateInstance(receipt.roles[role].instance);

@@ -22,9 +22,15 @@ import {
   isTestTargetValue,
   main,
   parseBackupHorizonArgs,
+  runBackupHorizonAudit,
+  validateCreateOnDemandRequest,
+  pruneOnDemandBackups,
   readBackupHorizonReceiptFile,
 } from "./gcp-backup-horizon.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
+
+import STAGING_DESIRED_STATE from "../cloud-run/infra/staging.desired-state.json" with { type: "json" };
+import PRODUCTION_DESIRED_STATE from "../cloud-run/infra/production.desired-state.json" with { type: "json" };
 
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -478,11 +484,11 @@ test("create-on-demand labels synchronously and reads the new backup back", asyn
     outcome: "created",
   });
 
-  const STAGING_PRIMARY = "synthetic-staging-primary-a";
+  const STAGING_PRIMARY = STAGING_DESIRED_STATE.cloudSql.instance;
   const located = fakeGcloud({ lists: { [STAGING_PRIMARY]: [] } });
   const stagingReceipt = createOnDemandBackup({ spawn: located.spawn, now: () => NOW }, {
     environment: "staging",
-    project: PROJECT,
+    project: STAGING_DESIRED_STATE.project,
     instance: STAGING_PRIMARY,
     instanceRole: "primary",
     purpose: "pre-restore",
@@ -492,7 +498,7 @@ test("create-on-demand labels synchronously and reads the new backup back", asyn
   assert.equal(stagingReceipt.expiresOn, "2026-10-03");
   assert.equal(stagingReceipt.role, "primary");
   assert.deepEqual(located.calls[1].args, [
-    "sql", "backups", "create", `--instance=${STAGING_PRIMARY}`, `--project=${PROJECT}`,
+    "sql", "backups", "create", `--instance=${STAGING_PRIMARY}`, `--project=${STAGING_DESIRED_STATE.project}`,
     "--description=tibotattle-expires-on=2026-10-03;purpose=pre-restore", `--location=${REGION}`,
   ]);
   assert.equal(Object.isFrozen(stagingReceipt), true);
@@ -910,4 +916,68 @@ test("no gcloud argv is built through a shell", async () => {
   assert.doesNotMatch(source, /\bexecSync\b|\bexec\(|\bexecFile|shell:\s*true|["'`](?:sh|bash|zsh)["'`]|\bspawn\(\s*["'`]gcloud ["'`]/u);
   assert.match(source, /spawn\("gcloud", args, \{/u);
   assert.doesNotMatch(source, /["'`]--async/u);
+});
+
+test("configured staging and production backup identities admit through CLI and direct audit", async () => {
+  for (const desired of [STAGING_DESIRED_STATE, PRODUCTION_DESIRED_STATE]) {
+    const environment = desired.environment, project = desired.project, instance = desired.cloudSql.instance;
+    const argv = ["audit", `--environment=${environment}`, `--project=${project}`, `--primary-instance=${instance}`, `--region=${REGION}`];
+    const config = parseBackupHorizonArgs(argv);
+    const gcloud = fakeGcloud({ describes: { [instance]: { ...describeInstance(instance), project } }, lists: { [instance]: automatedSeries(instance) } });
+    const receipt = runBackupHorizonAudit(config, { spawn: gcloud.spawn, now: () => NOW });
+    assert.equal(receipt.project, project);
+    assert.equal(receipt.roles.primary.instance, instance);
+    assert.equal(gcloud.calls.length, 2);
+    assert.equal(gcloud.calls.every(({ args }) => args.includes(`--project=${project}`)), true);
+    assert.deepEqual(validateCreateOnDemandRequest(createRequest({ environment, project, instance })).instance, instance);
+    // A valid empty-candidate receipt must remain admissible without provider calls.
+    const empty = redigest({ ...auditReceipt({ primaryRuns: [] }), environment, project,
+      roles: { primary: { ...auditReceipt({ primaryRuns: [] }).roles.primary, instance } } });
+    const prune = fakeGcloud();
+    await pruneOnDemandBackups({ environment, receiptPath: "/synthetic/receipt.json", authorize: empty.digest },
+      { spawn: prune.spawn, now: () => NOW, readReceipt: async () => empty });
+    assert.equal(prune.calls.length, 0);
+  }
+});
+
+test("whole backup target identity refuses cross-plane and test-estate combinations at every boundary", async () => {
+  const stageProject = STAGING_DESIRED_STATE.project, stageInstance = STAGING_DESIRED_STATE.cloudSql.instance;
+  const prodProject = PRODUCTION_DESIRED_STATE.project, prodInstance = PRODUCTION_DESIRED_STATE.cloudSql.instance;
+  const cases = [
+    ["production", stageProject, stageInstance, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    ["production", stageProject, prodInstance, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    ["production", prodProject, stageInstance, "BACKUP_HORIZON_TARGET_MISMATCH"],
+    ["staging", prodProject, prodInstance, "BACKUP_HORIZON_TARGET_MISMATCH"],
+    ["staging", prodProject, stageInstance, "BACKUP_HORIZON_TARGET_MISMATCH"],
+    ["staging", PROJECT, stageInstance, "BACKUP_HORIZON_TARGET_MISMATCH"],
+    ["staging", stageProject, prodInstance, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    ["staging", stageProject, "unlisted-primary", "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    ...["production", "staging"].flatMap(environment => [
+      [environment, prodProject, TEST_PRIMARY, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+      [environment, prodProject, TEST_LEDGER, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+      [environment, prodProject, "tibotattle-test-primary-future", "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+      [environment, "tibotattle-test-project-future", prodInstance, "BACKUP_HORIZON_TEST_TARGET_REFUSED"],
+    ]),
+  ];
+  for (const [environment, project, instance, code] of cases) {
+    const label = `${environment}/${project}/${instance}`;
+    const gcloud = fakeGcloud();
+    const config = { environment, project, primaryInstance: instance, region: REGION };
+    const argv = ["audit", `--environment=${environment}`, `--project=${project}`, `--primary-instance=${instance}`];
+    assert.throws(() => parseBackupHorizonArgs(argv), { code }, label);
+    const createArgs = ["create-on-demand", `--environment=${environment}`, `--project=${project}`,
+      `--instance=${instance}`, "--instance-role=primary", "--purpose=pre-migration",
+      "--expires-in-days=7", `--region=${REGION}`, `--authorize=create-on-demand:${environment}:primary`];
+    assert.throws(() => parseBackupHorizonArgs(createArgs), { code }, label);
+    assert.throws(() => runBackupHorizonAudit(config, { spawn: gcloud.spawn, now: () => NOW }), { code }, label);
+    const request = createRequest({ environment, project, instance });
+    assert.throws(() => validateCreateOnDemandRequest(request), { code }, label);
+    assert.throws(() => createOnDemandBackup({ spawn: gcloud.spawn, now: () => NOW }, request), { code }, label);
+    const empty = auditReceipt({ primaryRuns: [] });
+    const receipt = redigest({ ...empty, environment, project,
+      roles: { primary: { ...empty.roles.primary, instance } } });
+    await assert.rejects(pruneOnDemandBackups({ environment, receiptPath: "/synthetic/receipt.json", authorize: receipt.digest },
+      { spawn: gcloud.spawn, now: () => NOW, readReceipt: async () => receipt }), { code }, label);
+    assert.equal(gcloud.calls.length, 0, label);
+  }
 });

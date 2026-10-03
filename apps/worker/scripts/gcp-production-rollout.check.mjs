@@ -89,7 +89,9 @@ const TARGET = Object.freeze({
   originAudience: ORIGIN_AUDIENCE,
   maintenanceJob: "tibotattle-maintenance",
 });
-const STAGING_PROJECT = "w2-opsdb-staging-synth";
+// Backup creation admits only the configured shared-project staging primary.
+// Every provider and lock interaction in this fixture remains fake.
+const STAGING_PROJECT = JSON.parse(await readFile(new URL("../cloud-run/infra/staging.desired-state.json", import.meta.url), "utf8")).project;
 // The staging target as OPS-2 derives it (rolloutTargetFromDesiredState):
 // staging deploys its maintenance Job from its stagingOrigin block
 // (STAGING-MAINT-RENDER), so the Job is in jobNames and is maintenanceJob.
