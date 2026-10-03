@@ -10,11 +10,13 @@
 //     the sealed file. Every spec names its sealed table, its PostgreSQL
 //     target, its key, every mapped column with a closed type, the reviewed
 //     omissions, the reviewed trigger policy and its PT-1 disposition token.
-//   * Every check that can refuse runs before the first write and before the
-//     target is touched: the seal and the sealed file's sha256 (before,
-//     during and after), column closure over the sealed schema, every sealed
-//     value canonicalized (so an invalid value refuses before page one), the
-//     stage's own sealed-source lineage checks. Only then is the target read
+//   * Every check that can refuse on the sealed side runs before the first
+//     write and before the target is touched: the seal and the sealed file's
+//     sha256 (before, during and after), column closure over the sealed
+//     schema, every sealed value canonicalized (so an invalid value, a JSON
+//     text a jsonb column cannot hold, or an inserted row larger than one page
+//     refuses before page one), the stage's own sealed-source lineage checks.
+//     Only then is the target read
 //     (stage prerequisites through PT-1's ledger, trigger-policy coverage,
 //     target column layout, foreign-key order).
 //   * Rows import in pages of at most 256 rows and 4 MiB. A page is one PT-1
@@ -186,6 +188,25 @@ function jsonCanonical(value) {
   return value;
 }
 
+/**
+ * JSON text can spell what a jsonb value cannot hold: U+0000 and an unpaired
+ * surrogate, in a string or a key (PostgreSQL refuses them with 22P05 and
+ * 22P02). Refusing them here keeps the failure in the sealed-side preflight
+ * instead of mid-stage on a page.
+ */
+function assertJsonStorable(value, table, column) {
+  if (typeof value === "string") {
+    if (value.includes("\0") || !value.isWellFormed()) fail("CUTOVER_SOURCE_VALUE_INVALID", { table, column });
+  } else if (Array.isArray(value)) {
+    for (const item of value) assertJsonStorable(item, table, column);
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      assertJsonStorable(key, table, column);
+      assertJsonStorable(item, table, column);
+    }
+  }
+}
+
 /** Returns [canonical, parameter] for one sealed cell. */
 export function canonicalSourceValue(type, value, table, column) {
   if (value === null || value === undefined) return [null, null];
@@ -216,6 +237,7 @@ export function canonicalSourceValue(type, value, table, column) {
         } catch {
           return fail("CUTOVER_SOURCE_VALUE_INVALID", { table, column });
         }
+        assertJsonStorable(parsed, table, column);
         return [JSON.stringify(jsonCanonical(parsed)), value];
       }
       default:
@@ -424,8 +446,13 @@ function pageOf(database, spec, after, maxRows, maxBytes) {
   return { rows: page, bytes: bytesTotal };
 }
 
-/** Stream the whole sealed spec once: count, bytes, digest and final prefix chain. */
-export function sourceTableFacts(database, spec, maxRows) {
+/**
+ * Stream the whole sealed spec once: count, bytes, digest and final prefix
+ * chain. With `maxBytes`, an inserted row that cannot fit one page refuses
+ * here, in the preflight, with the same code pageOf uses (a seeded-row rewrite
+ * does not page by bytes).
+ */
+export function sourceTableFacts(database, spec, maxRows, maxBytes = null) {
   const pageRows = sourcePageRows(spec, maxRows);
   const digest = createRowsDigest();
   let chain = EMPTY_PREFIX_CHAIN;
@@ -436,6 +463,9 @@ export function sourceTableFacts(database, spec, maxRows) {
     const page = readSourcePage(database, spec, after, pageRows);
     for (const { row, key } of page) {
       const canonical = canonicalRow(spec, row);
+      if (maxBytes !== null && spec.mode === "insert" && canonical.size > maxBytes) {
+        fail("CUTOVER_PAGE_ROW_TOO_LARGE", { table: spec.sealedTable });
+      }
       digest.update(canonical.values);
       chain = advancePrefixChain(chain, canonical.values);
       rows += 1;
@@ -883,7 +913,7 @@ export async function runTelemetryStage(definition, {
     for (const table of definition.extraSealed ?? []) {
       if (!sourceTablePresent(database, table)) fail("CUTOVER_SOURCE_TABLE_MISSING", { table });
     }
-    const sourceFacts = new Map(specs.map(spec => [spec.name, sourceTableFacts(database, spec, pageRows)]));
+    const sourceFacts = new Map(specs.map(spec => [spec.name, sourceTableFacts(database, spec, pageRows, pageBytes)]));
     const sourceChecks = definition.sourcePreflight === undefined ? {}
       : await definition.sourcePreflight({ database, seal, sealed, facts: sourceFacts, pageRows });
 

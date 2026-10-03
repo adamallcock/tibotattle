@@ -9,8 +9,10 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
 // EDGE_ORIGIN_MODE=edge-test (EORIGIN) without PostgreSQL: the configuration
-// refusals, the Cloud Run listen rule, the composition around a spy inner,
-// the raw Node request path through the real serve(), the pins this mode
+// refusals, the Cloud Run listen rule, the composition around a spy inner
+// (nothing between EP-6 and inner: D-CRB made edge-test a rehearsal of the
+// production handler), the raw Node request path through the real serve()
+// and the one Node adapter (origin-node-request.mjs), the pins this mode
 // shares with postgres-test-dispatch.mjs and the deploy script, and the
 // direct deploy variant's rendered env. Every token, account and key is
 // synthetic; nothing listens beyond 127.0.0.1 and nothing reaches Google.
@@ -21,8 +23,8 @@ const INVOKER = "edge-invoker@synthetic-edge-0.iam.gserviceaccount.com";
 const VERIFIER = "origin-verifier@synthetic-edge-0.iam.gserviceaccount.com";
 const AUDIENCE = "https://edge-test-origin.synthetic.example";
 const REQUEST_ID = "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b";
-// Request headers inner must never see. cf-access-jwt-assertion is forwarded
-// by EP-6 only on the admin host, whose requests never reach inner here.
+// Request headers inner must never see on the apex. cf-access-jwt-assertion is
+// forwarded by EP-6 only on the admin host.
 const FORBIDDEN_INNER_HEADERS = Object.freeze([
   ["cf-access-jwt-assertion", "synthetic.access.jwt"],
   ["cf-connecting-ip", "203.0.113.7"],
@@ -36,6 +38,8 @@ const FORBIDDEN_INNER_HEADERS = Object.freeze([
 
 let vite;
 let mode;
+let node;
+let composition;
 let edgeDispatch;
 let limiters;
 let contract;
@@ -56,7 +60,8 @@ before(async () => {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  [mode, edgeDispatch, limiters, contract, constants, registry, runtimeSchema, server] = await Promise.all([
+  [mode, edgeDispatch, limiters, contract, constants, registry, runtimeSchema, server, node, composition] =
+    await Promise.all([
     load("/cloud-run/origin-edge-test-mode.mjs"),
     load("/cloud-run/postgres-edge-origin-dispatch.mjs"),
     load("/cloud-run/postgres-edge-admission-limiters.mjs"),
@@ -65,6 +70,8 @@ before(async () => {
     load("/src/route-registry.ts"),
     load("/src/postgres-runtime-schema.ts"),
     load("/cloud-run/server.mjs"),
+    load("/cloud-run/origin-node-request.mjs"),
+    load("/src/backend-composition.ts"),
   ]);
   testDispatch = await import("./postgres-test-dispatch.mjs");
   fastpathMode = await import("./origin-fastpath-mode.mjs");
@@ -165,23 +172,29 @@ async function freePort() {
 // ---------------------------------------------------------------------------
 // Constants and pins
 
-test("constants: mode, origins, unported body and the served route ids", () => {
+test("constants: mode and origins; the served set is the production list, with no copy here", () => {
   assert.equal(mode.EDGE_TEST_ORIGIN_MODE, "edge-test");
   assert.equal(mode.EDGE_TEST_PUBLIC_ORIGIN, "https://tibotattle.test");
   assert.equal(mode.EDGE_TEST_CLOUD_ORIGIN, deploy.FASTPATH_TEST.originUrl,
     "the cloud origin is the deploy script's origin URL");
   assert.equal(contract.canonicalRunAppOrigin(mode.EDGE_TEST_CLOUD_ORIGIN), mode.EDGE_TEST_CLOUD_ORIGIN);
-  assert.equal(mode.EDGE_TEST_UNPORTED_BODY,
-    JSON.stringify({ status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" }));
-  const ids = mode.EDGE_TEST_SERVED_ROUTE_IDS;
-  assert.ok(Object.isFrozen(ids));
-  assert.equal(ids.length, 29);
-  assert.equal(new Set(ids).size, ids.length);
+  // D-CRB: edge-test serves the production ported list through the one
+  // registry; the second list and the old unported body are gone, and so is
+  // the Node adapter copy (origin-node-request.mjs is the one adapter).
+  for (const retired of ["EDGE_TEST_SERVED_ROUTE_IDS", "EDGE_TEST_UNPORTED_BODY", "edgeTestRequestFromNode",
+    "EdgeTestBoundaryRefusal", "logEdgeTestBoundaryRefusal", "edgeTestBoundaryRefusalLogLine",
+    "lingerAfterEarlyEdgeTestAnswer", "writeEdgeTestBoundaryRefusal", "isEdgeOriginBoundaryRefusal",
+    "EDGE_TEST_REQUEST_REFUSAL_REASONS", "EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT", "EDGE_TEST_LINGER_MAX_MILLISECONDS"]) {
+    assert.equal(mode[retired], undefined, retired);
+  }
+  const ids = composition.POSTGRES_PORTED_WORKER_ROUTE_IDS;
+  assert.equal(ids.length, 30);
   const registryIds = new Set(registry.WORKER_ROUTE_POLICY.map((route) => route.id));
   for (const id of ids) assert.ok(registryIds.has(id), `${id} is a WORKER_ROUTE_POLICY id`);
-  for (const id of ["apple_domain_association", "sparkle_appcast_guard", "ready", "admin_overview",
+  assert.ok(ids.includes("ready"), "edge-test serves RD-2 /api/ready, as production does");
+  for (const id of ["apple_domain_association", "sparkle_appcast_guard", "admin_overview",
     "admin_action", "enroll", "identity_google_start", "participant_export"]) {
-    assert.ok(!ids.includes(id), `${id} is not served`);
+    assert.ok(!ids.includes(id), `${id} is not served on the apex`);
   }
 });
 
@@ -434,7 +447,7 @@ function edgeRequest({ method = "GET", path = "/api/health", hostKind = "apex", 
   return new Request(`http://127.0.0.1:43010${path}`, { method, headers: list });
 }
 
-test("composeEdgeTestOrigin: issued configuration only; admin host answers the unported 503 without inner", () => withCapturedLog(async (lines) => {
+test("composeEdgeTestOrigin: issued configuration only; EP-6 then inner, the admin host included", () => withCapturedLog(async (lines) => {
   const configuration = read(localEnv(43010, { EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: VERIFIER }));
   const admission = limiters.createEdgeAdmissionLimiters();
   assertRefused(() => mode.composeEdgeTestOrigin({ configuration: { ...configuration }, admission, inner: async () => {} }),
@@ -452,39 +465,38 @@ test("composeEdgeTestOrigin: issued configuration only; admin host answers the u
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     },
   });
-  for (const path of ["/api/v1/admin/overview", "/api/v1/community/daily", "/admin", "/api/health"]) {
+  // The admin host reaches inner, rebuilt on the admin origin with the edge's
+  // host kind: the production handler behind it applies OD-CR-3 (refuse, or
+  // the Access chokepoint), exactly as in production.
+  const adminPaths = ["/api/v1/admin/overview", "/api/v1/community/daily", "/admin", "/api/health"];
+  for (const path of adminPaths) {
     const response = await dispatch(edgeRequest({ path, hostKind: "admin",
       headers: [["cf-access-jwt-assertion", "synthetic.access.jwt"], ["x-usage-monitor-admin", "1"]] }));
-    assert.equal(response.status, 503, path);
-    assert.equal(await response.text(), mode.EDGE_TEST_UNPORTED_BODY, path);
-    assert.deepEqual([...response.headers].sort(), [
-      ["cache-control", "no-store"],
-      ["content-type", "application/json; charset=utf-8"],
-      ["referrer-policy", "no-referrer"],
-      ["x-content-type-options", "nosniff"],
-      ["x-tibotattle-origin", "1"],
-    ], path);
+    assert.equal(response.status, 200, path);
+    assert.equal(response.headers.get("x-tibotattle-origin"), "1", path);
+    assert.equal(seen.at(-1).url, `https://admin.tibotattle.test${path}`, path);
+    assert.equal(edgeDispatch.edgeRequestContext(seen.at(-1))?.hostKind, "admin", path);
   }
-  assert.equal(seen.length, 0, "no admin-host request reaches inner");
+  assert.equal(seen.length, adminPaths.length);
   const apex = await dispatch(edgeRequest({ path: "/api/v1/community/daily" }));
   assert.equal(apex.status, 200);
   assert.equal(apex.headers.get("x-tibotattle-origin"), "1");
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0].url, "https://tibotattle.test/api/v1/community/daily");
+  assert.equal(seen.length, adminPaths.length + 1);
+  assert.equal(seen.at(-1).url, "https://tibotattle.test/api/v1/community/daily");
   // A verifier reads health on the apex; its request carries no edge context.
   const verifier = await dispatch(new Request("http://127.0.0.1:43010/api/health", {
     headers: { "x-serverless-authorization": token({ email: VERIFIER }) },
   }));
   assert.equal(verifier.status, 200);
-  assert.equal(seen.length, 2);
-  assert.equal(seen[1].url, "https://tibotattle.test/api/health");
+  assert.equal(seen.length, adminPaths.length + 2);
+  assert.equal(seen.at(-1).url, "https://tibotattle.test/api/health");
   // EP-6 refusals stay unmarked 421s, and each logs its one reason line.
-  assert.deepEqual(lines, [], "admitted and unported requests log nothing");
+  assert.deepEqual(lines, [], "admitted requests log nothing");
   const refused = await dispatch(edgeRequest({ auth: null }));
   assert.equal(refused.status, 421);
-  assert.equal(mode.isEdgeOriginBoundaryRefusal(refused), true);
-  assert.equal(mode.isEdgeOriginBoundaryRefusal(apex), false);
-  assert.equal(seen.length, 2);
+  assert.equal(node.isEdgeOriginBoundaryRefusal(refused), true);
+  assert.equal(node.isEdgeOriginBoundaryRefusal(apex), false);
+  assert.equal(seen.length, adminPaths.length + 2);
   assert.deepEqual(lines, ["{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"invoker_header_missing\"}"]);
 }));
 
@@ -562,7 +574,7 @@ async function withServedRuntime(dispatchFactory, work) {
   const hostOrigin = configuration.listen.hostOrigin;
   const runtime = {
     edgeTestOrigin: configuration,
-    edgeTestRequestFromNode: (req, res) => mode.edgeTestRequestFromNode(req, res, { hostOrigin }),
+    edgeTestRequestFromNode: (req, res) => node.originRequestFromNode(req, res, { hostOrigin }),
     postgresTestDispatch: mode.composeEdgeTestOrigin({ configuration, admission, inner: dispatchFactory() }),
     listenHost: configuration.listen.host,
     listenPort: configuration.listen.port,
@@ -594,7 +606,7 @@ function assertBoundaryRefusal(response, label) {
   assert.equal(response.headers.has("x-tibotattle-origin"), false, label);
 }
 
-test("edgeTestRequestFromNode: the URL is HOST_ORIGIN plus the raw target, at most 16384 characters", () => {
+test("originRequestFromNode (edge-test): the URL is HOST_ORIGIN plus the raw target, at most 16384 characters", () => {
   // Node's own header limit (16 KiB, request line included) refuses most
   // long targets with 431 before serve() runs, so the bound is driven here.
   const hostOrigin = "http://127.0.0.1:43020";
@@ -607,9 +619,9 @@ test("edgeTestRequestFromNode: the URL is HOST_ORIGIN plus the raw target, at mo
   });
   const res = { once() {}, writableEnded: false };
   const longest = `/${"q".repeat(16_384 - hostOrigin.length - 1)}`;
-  assert.equal(mode.edgeTestRequestFromNode(fake(longest), res, { hostOrigin }).url, hostOrigin + longest);
+  assert.equal(node.originRequestFromNode(fake(longest), res, { hostOrigin }).url, hostOrigin + longest);
   // A '//host' target stays a path on HOST_ORIGIN.
-  assert.equal(mode.edgeTestRequestFromNode(fake("//evil.example/x"), res, { hostOrigin }).url,
+  assert.equal(node.originRequestFromNode(fake("//evil.example/x"), res, { hostOrigin }).url,
     `${hostOrigin}//evil.example/x`);
   const observed = new Set();
   for (const [label, request, options, reason] of [
@@ -624,9 +636,9 @@ test("edgeTestRequestFromNode: the URL is HOST_ORIGIN plus the raw target, at mo
       { hostOrigin }, "raw_headers_invalid"],
     ["a method Request refuses", { ...fake("/api/health"), method: "TRACE" }, { hostOrigin }, "node_request_invalid"],
   ]) {
-    assert.throws(() => mode.edgeTestRequestFromNode(request, res, options), (error) => {
-      assert.ok(error instanceof mode.EdgeTestBoundaryRefusal, label);
-      assert.equal(error.code, "EDGE_TEST_ORIGIN_BOUNDARY_REFUSED", label);
+    assert.throws(() => node.originRequestFromNode(request, res, options), (error) => {
+      assert.ok(error instanceof node.OriginBoundaryRefusal, label);
+      assert.equal(error.code, "ORIGIN_REQUEST_BOUNDARY_REFUSED", label);
       assert.equal(error.reason, reason, label);
       return true;
     }, label);
@@ -634,11 +646,11 @@ test("edgeTestRequestFromNode: the URL is HOST_ORIGIN plus the raw target, at mo
   }
   // request_target_unparseable and request_target_origin guard what the URL
   // parser already ensures for a target that starts with '/'.
-  assert.deepEqual([...observed].sort(), mode.EDGE_TEST_REQUEST_REFUSAL_REASONS
+  assert.deepEqual([...observed].sort(), node.ORIGIN_REQUEST_REFUSAL_REASONS
     .filter((reason) => !["request_target_unparseable", "request_target_origin"].includes(reason)).sort());
   // The Host comparison is case-insensitive, as HTTP hosts are.
   const named = "http://localhost:43020";
-  assert.equal(mode.edgeTestRequestFromNode(fake("/api/health", "LocalHost:43020"), res, { hostOrigin: named }).url,
+  assert.equal(node.originRequestFromNode(fake("/api/health", "LocalHost:43020"), res, { hostOrigin: named }).url,
     `${named}/api/health`);
 });
 
@@ -698,13 +710,13 @@ test("serve(): EP-6 refusals are written with connection: close while the body i
 }));
 
 test("the refusal log line is closed: event, a listed reason and, for a token refusal, its shape", () => {
-  const requestReasons = mode.EDGE_TEST_REQUEST_REFUSAL_REASONS;
+  const requestReasons = node.ORIGIN_REQUEST_REFUSAL_REASONS;
   const boundaryReasons = edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS;
   assert.ok(Object.isFrozen(requestReasons));
   assert.equal(new Set(requestReasons).size, requestReasons.length);
   assert.deepEqual(requestReasons.filter((reason) => boundaryReasons.includes(reason)), [],
     "no reason names two sites");
-  assert.equal(mode.EDGE_ORIGIN_BOUNDARY_REFUSAL_EVENT, "edge_origin_boundary_refusal");
+  assert.equal(node.ORIGIN_BOUNDARY_REFUSAL_EVENT, "edge_origin_boundary_refusal");
   const shape = Object.freeze({
     bearerPrefix: true,
     scheme: "Bearer",
@@ -714,8 +726,8 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
     segmentBase64url: Object.freeze([true, true, true]),
     signatureRemovedByGoogle: true,
   });
-  const line = mode.edgeTestBoundaryRefusalLogLine;
-  assert.equal(line(new mode.EdgeTestBoundaryRefusal("host_mismatch")),
+  const line = node.originBoundaryRefusalLogLine;
+  assert.equal(line(new node.OriginBoundaryRefusal("host_mismatch")),
     "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"host_mismatch\"}");
   assert.equal(line({ reason: "audience_mismatch", invokerShape: shape }),
     "{\"event\":\"edge_origin_boundary_refusal\",\"reason\":\"audience_mismatch\",\"invokerShape\":"
@@ -758,11 +770,11 @@ test("the refusal log line is closed: event, a listed reason and, for a token re
       assert.equal(parsed.invokerShape.separatorSpaces, spaces);
     }
   }
-  // logEdgeTestBoundaryRefusal writes exactly that line once and never throws.
+  // logOriginBoundaryRefusal writes exactly that line once and never throws.
   const written = [];
-  mode.logEdgeTestBoundaryRefusal({ reason: "audience_count", invokerShape: shape }, (value) => written.push(value));
+  node.logOriginBoundaryRefusal({ reason: "audience_count", invokerShape: shape }, (value) => written.push(value));
   assert.deepEqual(written, [line({ reason: "audience_count", invokerShape: shape })]);
-  assert.doesNotThrow(() => mode.logEdgeTestBoundaryRefusal({ reason: "host_mismatch" }, () => {
+  assert.doesNotThrow(() => node.logOriginBoundaryRefusal({ reason: "host_mismatch" }, () => {
     throw new Error("synthetic log failure");
   }));
 });
@@ -850,7 +862,7 @@ test("serve(): one content-free reason line per refusal; the 421 bytes never cha
   }
   // A scheme kind is a closed constant, not the header's text.
   const logged = lines.join("\n").replaceAll(/"scheme":"[a-zA-Z-]+"/gu, "");
-  const reasons = [...mode.EDGE_TEST_REQUEST_REFUSAL_REASONS, ...edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS];
+  const reasons = [...node.ORIGIN_REQUEST_REFUSAL_REASONS, ...edgeDispatch.EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS];
   for (const needle of needles) {
     if (needle.length < 4 && needle !== "@") continue;
     // A reason code is itself never a needle (a 'bearer' fragment is in one).
@@ -894,15 +906,23 @@ test("serve(): inner never sees cf-*, x-forwarded-*, the token or x-tibotattle-*
       headers: [["host", host], ["x-serverless-authorization", token()], ["x-tibotattle-edge-host", "admin"],
         ["x-tibotattle-edge-request-id", REQUEST_ID], ...FORBIDDEN_INNER_HEADERS],
     });
-    assert.equal(admin.status, 503);
-    assert.equal(admin.text, mode.EDGE_TEST_UNPORTED_BODY);
+    // The admin host reaches inner (the production handler applies OD-CR-3).
+    assert.equal(admin.status, 201);
+    assert.equal(admin.headers.get("x-tibotattle-origin"), "1");
   });
-  assert.equal(seen.length, 2, "the admin-host request never reached inner");
-  const [upload, disconnect] = seen;
+  assert.equal(seen.length, 3);
+  const [upload, disconnect, adminSeen] = seen;
+  assert.equal(adminSeen.url, "https://admin.tibotattle.test/api/v1/admin/overview");
+  // On the admin host EP-6 forwards the Access assertion (and only there); the
+  // other edge-only headers never reach inner.
+  for (const [name] of adminSeen.headers) {
+    assert.ok(!name.startsWith("x-forwarded-") && !name.startsWith("x-tibotattle-")
+      && name !== "x-serverless-authorization" && name !== "cf-connecting-ip", `${name} reached inner (admin)`);
+  }
   assert.equal(upload.url, "https://tibotattle.test/api/v1/contributions");
   assert.equal(upload.body, "{\"a\":1}", "a chunked body is streamed through");
   assert.equal(disconnect.body, null, "a zero-length POST has no body, as in the Worker");
-  for (const observed of seen) {
+  for (const observed of [upload, disconnect]) {
     for (const [name] of observed.headers) {
       assert.ok(!name.startsWith("cf-"), `${name} reached inner`);
       assert.ok(!name.startsWith("x-forwarded-"), `${name} reached inner`);
@@ -979,17 +999,17 @@ test("serve(): an answer to a chunked body inner stops reading reaches the calle
   });
 });
 
-test("edgeTestRequestFromNode keeps every raw header for EP-6, joined as Headers joins them", async () => {
+test("originRequestFromNode keeps every raw header for EP-6, joined as Headers joins them", async () => {
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
   const built = [];
   const probe = http.createServer((req, res) => {
     try {
-      built.push(mode.edgeTestRequestFromNode(req, res, { hostOrigin }));
+      built.push(node.originRequestFromNode(req, res, { hostOrigin }));
       res.writeHead(204).end();
     } catch (error) {
       built.push(error);
-      mode.writeEdgeTestBoundaryRefusal(res);
+      node.writeOriginBoundaryRefusal(res);
     }
   });
   probe.listen(port, "127.0.0.1");
@@ -1015,8 +1035,8 @@ test("edgeTestRequestFromNode keeps every raw header for EP-6, joined as Headers
   assert.equal(request.headers.get("x-tibotattle-edge-host"), "apex, admin");
   assert.equal(request.headers.get("x-tibotattle-edge-client-key"), "k");
   assert.equal(request.headers.get("cf-connecting-ip"), "203.0.113.9");
-  assert.ok(refusal instanceof mode.EdgeTestBoundaryRefusal);
-  assert.equal(refusal.code, "EDGE_TEST_ORIGIN_BOUNDARY_REFUSED");
+  assert.ok(refusal instanceof node.OriginBoundaryRefusal);
+  assert.equal(refusal.code, "ORIGIN_REQUEST_BOUNDARY_REFUSED");
 });
 
 // ---------------------------------------------------------------------------

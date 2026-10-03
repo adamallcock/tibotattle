@@ -92,11 +92,11 @@ const RESPONSE_HEADER_READS: Readonly<Record<string, readonly string[]>> = Objec
   "cache-control": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
   "referrer-policy": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
   "x-content-type-options": ["../cloud-run/postgres-community-daily-live-smoke.mjs"],
-  // The edge checks the origin marker on the upstream response; the
-  // edge-test origin's isEdgeOriginBoundaryRefusal checks that EP-6's 421
-  // Response carries none.
+  // The edge checks the origin marker on the upstream response; the origin's
+  // Node adapter (isEdgeOriginBoundaryRefusal, production and edge-test)
+  // checks that EP-6's 421 Response carries none.
   [EDGE_HEADERS.originMarker]: [
-    "../cloud-run/origin-edge-test-mode.mjs",
+    "../cloud-run/origin-node-request.mjs",
     "../src/edge-origin-proxy.ts",
   ],
 });

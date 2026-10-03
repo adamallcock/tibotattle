@@ -85,6 +85,7 @@ export const ORIGIN_OVERRIDABLE_BUILT_INS = Object.freeze([
 const ROUTE_METHODS = Object.freeze(["GET", "POST", "DELETE"]);
 const MODULE_KEYS = Object.freeze(["handler", "method", "overridesBuiltIn", "pathname"]);
 const DEFINED_MODULES = new WeakSet();
+const ISSUED_REGISTRIES = new WeakSet();
 
 // The code lets server.mjs stop the origin with a named startup reason.
 function seamError(message) {
@@ -203,7 +204,7 @@ export function createOriginRouteModuleRegistry({ modules, routePolicy } = {}) {
     byRoute.set(key, routeModule);
   }
   const pathnames = Object.freeze([...new Set([...byRoute.values()].map((entry) => entry.pathname))]);
-  return Object.freeze({
+  const registry = Object.freeze({
     pathnames,
     size: byRoute.size,
     resolve(method, pathname) {
@@ -211,4 +212,16 @@ export function createOriginRouteModuleRegistry({ modules, routePolicy } = {}) {
       return byRoute.get(method + " " + pathname) ?? null;
     },
   });
+  ISSUED_REGISTRIES.add(registry);
+  return registry;
+}
+
+/**
+ * True only for a registry createOriginRouteModuleRegistry() built. The CR-6
+ * production route registry folds such a registry into its own handlers at
+ * startup (postgres-production-registry.mjs), so the origin consults one
+ * registry per request, never this one beside it.
+ */
+export function isOriginRouteModuleRegistry(value) {
+  return value !== null && typeof value === "object" && ISSUED_REGISTRIES.has(value);
 }

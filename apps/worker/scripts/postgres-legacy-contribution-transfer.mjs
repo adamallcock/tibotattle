@@ -16,7 +16,11 @@
 //     single owner of D1 pending_quarantine_objects: every sealed row lands
 //     exactly once in pending_objects (object_key = r2_key; contribution id,
 //     kind, registered_at, state and lease verbatim; registration_token is the
-//     column DEFAULT). A row a telemetry stage (D-PT5A) already mapped must be
+//     column DEFAULT), except that a chunk-owned registration (contribution id
+//     a sealed chunk's id, r2_key that chunk's key) takes its family's
+//     PostgreSQL kind (telemetry_v1, telemetry_v11 or telemetry_v12), the
+//     reviewed T-0 mapping the telemetry stages (D-PT5A) apply through
+//     CHUNK_REGISTRATION_FAMILIES. A row a telemetry stage already mapped must be
 //     equal, field by field; any other row, a missing one or an extra one
 //     refuses CUTOVER_PENDING_OBJECT_CONFLICT. PostgreSQL
 //     pending_quarantine_objects stays empty. With every registration it
@@ -62,6 +66,7 @@ import {
   fastpathIdentityTargetExpression,
   fastpathIdentityTargetValue,
 } from "./postgres-fastpath-identity-copy.mjs";
+import { CHUNK_REGISTRATION_FAMILIES } from "./postgres-production-telemetry-modes.mjs";
 import {
   EMPTY_PREFIX_CHAIN,
   PostgresTransferTargetError,
@@ -457,7 +462,7 @@ export const LEGACY_TRANSFER_COLUMN_MAP = Object.freeze(Object.fromEntries([
 export function legacyContributionPolicySha256() {
   return HASH(JSON.stringify([LEGACY_CONTRIBUTION_TRANSFER_SCHEMA, LEGACY_CONTRIBUTIONS_ORDER, LEGACY_TRANSFER_COLUMN_MAP,
     LEGACY_TRIGGER_POLICY, LEGACY_TRANSFER_DISPOSITIONS, PENDING_REGISTRATIONS_PREREQUISITE_STAGES,
-    LEGACY_MUST_BE_EMPTY, EXCLUSIONS.where]));
+    LEGACY_MUST_BE_EMPTY, EXCLUSIONS.where, CHUNK_REGISTRATION_FAMILIES]));
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +999,34 @@ function assertPendingRow(row) {
   }
 }
 
+const SEALED_TELEMETRY_KIND = "telemetry";
+
+/**
+ * The family of each chunk-owned registration on a page: contribution id ->
+ * { key, kind } for every sealed 'telemetry' registration whose contribution
+ * id is a sealed chunk's id (CHUNK_REGISTRATION_FAMILIES, shared with D-PT5A).
+ */
+function chunkFamilies(database, page) {
+  const ids = page.filter(row => row.values[2] === SEALED_TELEMETRY_KIND).map(row => row.values[1]);
+  const families = new Map();
+  if (ids.length === 0) return families;
+  const marks = ids.map(() => "?").join(", ");
+  for (const [chunkTable, kind] of CHUNK_REGISTRATION_FAMILIES) {
+    for (const chunk of sourceAll(database, `SELECT id, r2_key FROM ${quote(chunkTable)} WHERE id IN (${marks})`, ids, chunkTable)) {
+      if (families.has(chunk.id)) fail("CUTOVER_SOURCE_VALUE_INVALID", { table: PENDING_SOURCE.name });
+      families.set(chunk.id, { key: chunk.r2_key, kind });
+    }
+  }
+  return families;
+}
+
+/**
+ * The sealed registrations, each re-asserted against D1's CHECKs and mapped:
+ * verbatim, except that a chunk-owned one takes its family's PostgreSQL kind
+ * (the reviewed T-0 mapping D-PT5A's chunk stages applied to the rows they
+ * wrote). A chunk-owned registration under another object key refuses; the
+ * telemetry stages, which are prerequisites, already refuse it.
+ */
 function pendingSource(database) {
   const base = tableSource(database, PENDING_SOURCE);
   return Object.freeze({
@@ -1001,7 +1034,18 @@ function pendingSource(database) {
     page(after, limit) {
       const page = base.page(after, limit);
       for (const row of page) assertPendingRow(row);
-      return page;
+      const families = chunkFamilies(database, page);
+      return page.map(row => {
+        const family = families.get(row.values[1]);
+        if (family === undefined) return row;
+        if (family.key !== row.values[0]) fail("CUTOVER_SOURCE_VALUE_INVALID", { table: PENDING_SOURCE.name });
+        const values = [...row.values];
+        const parameters = [...row.parameters];
+        values[2] = family.kind;
+        parameters[2] = family.kind;
+        return { ...row, values, parameters,
+          size: row.size - Buffer.byteLength(SEALED_TELEMETRY_KIND) + Buffer.byteLength(family.kind) };
+      });
     },
   });
 }

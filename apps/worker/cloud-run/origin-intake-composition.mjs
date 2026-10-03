@@ -51,6 +51,7 @@ import { legacyUploadAuthorizationFormatEntries } from "./upload-authorization-f
 import { createUploadAuthorizationRouteModule } from "./routes/upload-authorizations.mjs";
 import { createTelemetryV11OriginIntake } from "./routes/v11-composition.mjs";
 import { methodNotAllowed, routeErrorResponse } from "./routes/v11-route-support.mjs";
+import { requestIdFrom } from "./postgres-request-context.mjs";
 
 const V12_UPLOAD_AUTHORIZATION_SCHEMA_VERSION = "telemetry-contribution-v1.2";
 
@@ -153,8 +154,11 @@ export function createOriginIntakeComposition(options) {
     throw compositionError("schemaOptions must carry exactly primarySchema");
   }
   const {
-    primaryPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent,
+    primaryPool, schemaOptions, admissionEnv, maxRequestBytes, assertStorageCurrent, requestContext,
   } = options;
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    throw compositionError("requestContext must be a function");
+  }
   const {
     legacyAdmission, transportWriteAuthority, transport, uploadAuthorization, controls, boundedBody,
   } = adapters;
@@ -175,6 +179,7 @@ export function createOriginIntakeComposition(options) {
     assertAdmissionBindings: options.assertAdmissionBindings,
     assertAttemptAllowed: options.assertAttemptAllowed,
     maxRequestBytes,
+    requestContext,
     socialConsentVersion: options.socialConsentVersion,
     sourceNamespace: options.sourceNamespace,
     envelopePublicJwk: options.envelopePublicJwk,
@@ -200,6 +205,7 @@ export function createOriginIntakeComposition(options) {
     schema: schemaOptions,
     maxRequestBytes,
     admissionEnv,
+    requestContext,
     // The module's table is the origin's whole table, v1.2 included, with
     // the same v1.2 entry the dispatch registers.
     formats: createUploadAuthorizationFormats(new Map([
@@ -239,14 +245,16 @@ export function createOriginIntakeComposition(options) {
     if (methods === undefined) return null;
     const allowed = methods === "all" || methods.includes(request.method);
     // A shared legacy route: the registry's 405 here, the built-in otherwise.
-    if (sharedPathnames.has(pathname)) return allowed ? null : routeErrorResponse(methodNotAllowed(methods));
+    if (sharedPathnames.has(pathname)) {
+      return allowed ? null : routeErrorResponse(methodNotAllowed(methods), requestIdFrom(requestContext, request));
+    }
     // A wrong method keeps the route's own 405; an allowed one is served
     // only against current migration receipts, like every built-in route.
     if (allowed) {
       try {
         await assertStorageCurrent();
       } catch (error) {
-        return routeErrorResponse(error);
+        return routeErrorResponse(error, requestIdFrom(requestContext, request));
       }
     }
     return v11.dispatch(request);

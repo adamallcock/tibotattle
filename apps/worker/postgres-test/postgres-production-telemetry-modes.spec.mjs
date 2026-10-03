@@ -17,6 +17,10 @@ import {
 } from "../scripts/postgres-production-telemetry-modes.mjs";
 import { TelemetryProductionError } from "../scripts/postgres-production-telemetry-engine.mjs";
 import {
+  runLegacyContributionsProduction,
+  runPendingRegistrationsProduction,
+} from "../scripts/postgres-legacy-contribution-transfer.mjs";
+import {
   PostgresTransferTargetError,
   TRANSFER_STAGES,
   abandonRun,
@@ -66,6 +70,46 @@ const OWNED_TARGETS = Object.freeze(Object.keys(TELEMETRY_PRODUCTION_TRIGGER_POL
 const isCode = code => error => (error instanceof TelemetryProductionError || error instanceof PostgresTransferTargetError
   || error instanceof CutoverSourceError) && error.code === code;
 
+/** A refusal of one closed code, optionally with the content-free details the error carries. */
+const refusal = (code, details = {}) => error => isCode(code)(error)
+  && Object.entries(details).every(([key, value]) => error[key] === value);
+
+/**
+ * Change committed target state the way a drifted or tampered database would: as the cluster superuser, with triggers
+ * off for this one transaction only (the session setting is local, so no pooled connection keeps it).
+ */
+async function tamper(pool, sql, values = []) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    const result = await client.query(sql, values);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function stageState(pool, stage) {
+  const { rows } = await pool.query("SELECT state FROM tibotattle_transfer.transfer_stage_receipts WHERE stage = $1", [stage]);
+  return rows.length === 0 ? null : rows[0].state;
+}
+
+async function tableReceiptState(pool, sourceTable) {
+  const { rows } = await pool.query("SELECT state FROM tibotattle_transfer.transfer_table_receipts WHERE source_table = $1", [sourceTable]);
+  return rows.length === 0 ? null : rows[0].state;
+}
+
+async function checkpointOf(pool, name) {
+  const { rows } = await pool.query(`SELECT state, row_count::int AS rows, prefix_chain_sha256 AS chain
+    FROM tibotattle_transfer.transfer_checkpoints WHERE checkpoint_name = $1`, [name]);
+  return rows[0] ?? null;
+}
+
 async function count(pool, name, where = "") {
   return Number((await pool.query(`SELECT count(*)::int AS n FROM ${table(name)} ${where}`)).rows[0].n);
 }
@@ -114,7 +158,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages on PostgreS
     seal = await readCutoverSeal({ manifestPath, expectedSealId: result.sealId });
     sealedDb = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
-      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 6, label: "ptfive" });
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 7, label: "ptfive" });
     targets = cluster.targets;
   }, 900_000);
 
@@ -407,6 +451,11 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages on PostgreS
     await expect(TELEMETRY_PRODUCTION_RUNNERS["telemetry-v1-v11"]({ handle, sealManifestPath: manifestPath }))
       .rejects.toSatisfy(isCode("CUTOVER_TARGET_COLUMN_MISMATCH"));
     await admin.query(`ALTER TABLE ${table("telemetry_v11_day_manifests")} ALTER COLUMN parser_version TYPE text`);
+    // A foreign key from an earlier table of the stage to a later one: the frozen import order cannot satisfy it.
+    await admin.query(`ALTER TABLE ${table("telemetry_v1_chunks")} ADD COLUMN synthetic_ref bigint REFERENCES ${table("telemetry_v1_records")}(id)`);
+    await expect(TELEMETRY_PRODUCTION_RUNNERS["telemetry-v1-v11"]({ handle, sealManifestPath: manifestPath }))
+      .rejects.toSatisfy(refusal("CUTOVER_IMPORT_ORDER_INVALID", { table: "telemetry_v1_chunks" }));
+    await admin.query(`ALTER TABLE ${table("telemetry_v1_chunks")} DROP COLUMN synthetic_ref`);
     // A trigger the policy does not name, and a named trigger that is gone.
     await admin.query(`CREATE FUNCTION ${table("synthetic_noop")}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`);
     await admin.query(`CREATE TRIGGER synthetic_extra_guard BEFORE INSERT ON ${table("telemetry_v1_chunks")}
@@ -445,6 +494,121 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages on PostgreS
     await abandonRun(resumed);
     expect(await count(targets[4].ownerPrimary, "typed_telemetry_records")).toBe(0);
   }, 600_000);
+
+  it("checks every table against the sealed digest at completion and again in header promotion: a changed value with the count kept refuses and the stage stays incomplete", async () => {
+    const admin = targets[5].adminPrimary;
+    const owner = targets[5].ownerPrimary;
+    const run = (stage, options = {}) => TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: manifestPath, ...options });
+    let handle = await beginImporting(targets[5], seal.manifest.sealId, seal.manifest.createdAt);
+    await identityStage(handle);
+    // Every row of telemetry_v1_chunks commits, then the run dies before any table completes.
+    await killAt("telemetry-v1-v11", handle, {}, { onPage: ({ table: name, page }) => {
+      if (name === "telemetry_v1_chunks" && page === 1) throw new Error("synthetic kill after the last page");
+    } });
+    const sealedRows = Number(sealedDb.prepare("SELECT count(*) AS n FROM telemetry_v1_chunks").get().n);
+    expect(await count(owner, "telemetry_v1_chunks")).toBe(sealedRows);
+    const touch = (name, delta) => tamper(admin, `UPDATE ${table(name)} SET record_count = record_count + (${delta})
+      WHERE id = (SELECT min(id) FROM ${table(name)})`);
+    await touch("telemetry_v1_chunks", 1);
+    handle = await targets[5].open(seal.manifest.sealId);
+    await expect(run("telemetry-v1-v11")).rejects.toSatisfy(refusal("CUTOVER_TELEMETRY_TABLE_DIGEST_MISMATCH", { table: "telemetry_v1_chunks" }));
+    expect(await count(owner, "telemetry_v1_chunks")).toBe(sealedRows);
+    expect(await stageState(owner, "telemetry-v1-v11")).toBe("started");
+    expect(await tableReceiptState(owner, "telemetry_v1_chunks")).toBe("started");
+    expect(await checkpointOf(owner, "table:telemetry_v1_chunks")).toMatchObject({ state: "pending", rows: sealedRows });
+    // Restoring the value lets the same run complete: the refusal was the digest, not a stuck state.
+    await touch("telemetry_v1_chunks", -1);
+    await run("telemetry-v1-v11");
+    expect(await stageState(owner, "telemetry-v1-v11")).toBe("complete");
+    for (const stage of ["typed-legacy", "legacy-admission"]) await run(stage);
+
+    // Header promotion recomputes the live headers' digests against the seal and the telemetry-v1-v11 receipts.
+    await touch("telemetry_v11_chunks", 1);
+    await expect(run("header-promotion")).rejects.toSatisfy(refusal("CUTOVER_TELEMETRY_TABLE_DIGEST_MISMATCH",
+      { table: "telemetry_v11_chunks", stage: "header-promotion" }));
+    expect(await stageState(owner, "header-promotion")).toBe("started");
+    await touch("telemetry_v11_chunks", -1);
+    await run("header-promotion");
+    expect(await stageState(owner, "header-promotion")).toBe("complete");
+
+    // A parent receipt that no longer equals the sealed count refuses in the read-only preflight, before the stage starts.
+    const receipt = `UPDATE tibotattle_transfer.transfer_table_receipts SET target_row_count = target_row_count + ($1)::int
+      WHERE source_table = 'participants' AND stage = 'identity-authority'`;
+    await tamper(admin, receipt, [1]);
+    await expect(run("telemetry-v12")).rejects.toSatisfy(refusal("CUTOVER_PARENT_RECEIPT_MISMATCH",
+      { table: "participants", stage: "identity-authority" }));
+    expect(await stageState(owner, "telemetry-v12")).toBeNull();
+    await tamper(admin, receipt, [-1]);
+
+    // A seeded row the sealed row should rewrite is gone: the page transaction rolls back whole.
+    const seed = (await admin.query(`SELECT to_jsonb(runtime) AS row FROM ${table("telemetry_v12_typed_runtime")} runtime`)).rows;
+    expect(seed).toHaveLength(1);
+    await tamper(admin, `DELETE FROM ${table("telemetry_v12_typed_runtime")}`);
+    await expect(run("telemetry-v12")).rejects.toSatisfy(refusal("CUTOVER_SEEDED_ROW_UNMATCHED", { table: "telemetry_v12_typed_runtime" }));
+    expect(await stageState(owner, "telemetry-v12")).toBe("started");
+    expect(await checkpointOf(owner, "table:telemetry_v12_runtime")).toBeNull();
+    expect(await tableReceiptState(owner, "telemetry_v12_runtime")).toBeNull();
+    expect(await count(owner, "telemetry_v12_day_manifests")).toBe(0);
+    await tamper(admin, `INSERT INTO ${table("telemetry_v12_typed_runtime")}
+      SELECT * FROM jsonb_populate_record(NULL::${table("telemetry_v12_typed_runtime")}, $1::jsonb)`, [seed[0].row]);
+    await run("telemetry-v12");
+    expect(await stageState(owner, "telemetry-v12")).toBe("complete");
+    await abandonRun(handle);
+  }, 600_000);
+
+  it("refuses a forged checkpoint, a page budget below a sealed row and a guard that refuses a page, each leaving the committed pages and the stage incomplete", async () => {
+    const admin = targets[6].adminPrimary;
+    const owner = targets[6].ownerPrimary;
+    const run = (stage, options = {}) => TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: manifestPath, ...options });
+    let handle = await beginImporting(targets[6], seal.manifest.sealId, seal.manifest.createdAt);
+    await identityStage(handle);
+    await killAt("telemetry-v1-v11", handle, {}, { onPage: ({ table: name, page }) => {
+      if (name === "telemetry_v11_chunks" && page === 3) throw new Error("synthetic kill at a page boundary");
+    } });
+    handle = await targets[6].open(seal.manifest.sealId);
+    const checkpointName = "table:telemetry_v11_chunks";
+    const committed = await checkpointOf(owner, checkpointName);
+    expect(committed).toMatchObject({ state: "pending", rows: 768 });
+    const snapshot = async () => ({ chunks: await count(owner, "telemetry_v11_chunks"), domains: await count(owner, "telemetry_v11_domains"),
+      checkpoint: await checkpointOf(owner, checkpointName), stage: await stageState(owner, "telemetry-v1-v11") });
+    const before = await snapshot();
+
+    // A resume whose page budget is below a sealed row refuses before it writes a page, so the committed pages stay as they were.
+    await expect(run("telemetry-v1-v11", { pageBytes: 1024 })).rejects.toSatisfy(refusal("CUTOVER_PAGE_ROW_TOO_LARGE",
+      { table: "telemetry_v11_day_manifests" }));
+    expect(await snapshot()).toEqual(before);
+
+    // A pending checkpoint whose prefix chain no longer matches the sealed prefix (the row count still equals the target's).
+    const forge = chain => tamper(admin, `UPDATE tibotattle_transfer.transfer_checkpoints SET prefix_chain_sha256 = $1
+      WHERE checkpoint_name = $2`, [chain, checkpointName]);
+    await forge("0".repeat(64));
+    await expect(run("telemetry-v1-v11")).rejects.toSatisfy(refusal("CUTOVER_CHECKPOINT_DIVERGED", { table: "telemetry_v11_chunks" }));
+    await forge(committed.chain);
+    expect(await snapshot()).toEqual(before);
+    await run("telemetry-v1-v11");
+    expect(await stageState(owner, "telemetry-v1-v11")).toBe("complete");
+
+    // A reviewed guard that fires on a page refuses it: the page rolls back, the error names only the SQLSTATE and the constant guard.
+    await killAt("typed-legacy", handle, {}, { onPage: ({ table: name, page }) => {
+      if (name === "typed_telemetry_manifests" && page === 2) throw new Error("synthetic kill after the last manifest page");
+    } });
+    handle = await targets[6].open(seal.manifest.sealId);
+    expect(await count(owner, "typed_telemetry_manifests")).toBe(510);
+    const shiftDays = delta => tamper(admin, `UPDATE ${table("typed_telemetry_manifests")} SET chunk_day = chunk_day + (${delta})`);
+    await shiftDays(1);
+    await expect(run("typed-legacy")).rejects.toSatisfy(error => {
+      expect(error.message).toBe("CUTOVER_TARGET_WRITE_REFUSED [table=typed_telemetry_chunks sqlState=23514 guard=typed_telemetry_membership_conflict]");
+      return refusal("CUTOVER_TARGET_WRITE_REFUSED", { table: "typed_telemetry_chunks", sqlState: "23514",
+        guard: "typed_telemetry_membership_conflict" })(error);
+    });
+    expect(await count(owner, "typed_telemetry_chunks")).toBe(0);
+    expect(await checkpointOf(owner, "table:typed_telemetry_chunks")).toBeNull();
+    expect(await stageState(owner, "typed-legacy")).toBe("started");
+    await shiftDays(-1);
+    await run("typed-legacy");
+    expect(await stageState(owner, "typed-legacy")).toBe("complete");
+    await abandonRun(handle);
+  }, 600_000);
 });
 
 /** SQL that augments the synthetic seal with the rows the Q-1 corpus leaves empty (all synthetic and content-free). */
@@ -462,11 +626,18 @@ function augmentationSql(database) {
     WHERE link.state = 'active' AND membership.participant_id <> ? ORDER BY membership.participant_id LIMIT 1`.replace("?", `'${withdrawn.participant_id}'`));
   const hex = Buffer.from(correction.digest, "hex");
   const zero = "zeroblob(32)";
+  // The registered chunks take D1-shaped object keys (telemetry/v1-, v11- and v12-), so each registration
+  // also satisfies D1's own CHECK, which the pending-registrations stage (D-PT4X) re-asserts.
+  const keys = { v1: "telemetry/v1-00000000-0000-4000-8000-000000000001", v11: "telemetry/v11-00000000-0000-4000-8000-000000000002",
+    v12: "telemetry/v12-00000000-0000-4000-8000-000000000003" };
   return `PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;
+    UPDATE telemetry_v1_chunks SET r2_key = '${keys.v1}' WHERE id = '${v1Chunk.id}';
+    UPDATE telemetry_v11_chunks SET r2_key = '${keys.v11}' WHERE id = '${v11Chunk.id}';
+    UPDATE telemetry_v12_chunks SET r2_key = '${keys.v12}' WHERE id = '${v12Chunk.id}';
     INSERT INTO pending_quarantine_objects(r2_key, contribution_id, object_kind, registered_at, reconciliation_state, reconciliation_lease_id)
-      VALUES ('${v1Chunk.r2_key}', '${v1Chunk.id}', 'telemetry', '2026-10-01T10:00:00.000Z', 'registered', NULL),
-             ('${v11Chunk.r2_key}', '${v11Chunk.id}', 'telemetry', '2026-10-01T11:00:00.123Z', 'registered', NULL),
-             ('${v12Chunk.r2_key}', '${v12Chunk.id}', 'telemetry', '2026-10-01T12:00:00.000Z', 'deleting', 'lease-synthetic-0001');
+      VALUES ('${keys.v1}', '${v1Chunk.id}', 'telemetry', '2026-10-01T10:00:00.000Z', 'registered', NULL),
+             ('${keys.v11}', '${v11Chunk.id}', 'telemetry', '2026-10-01T11:00:00.123Z', 'registered', NULL),
+             ('${keys.v12}', '${v12Chunk.id}', 'telemetry', '2026-10-01T12:00:00.000Z', 'deleting', 'lease-synthetic-0001');
     INSERT INTO telemetry_v1_records(chunk_row_id, participant_id, device_id, stream, occurrence_id, observed_at, observed_day,
         provider, model_id, session_uuid, plan_type, plan_variant, limit_id, slot, used_percent, window_duration_minutes, resets_at,
         input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens, output_text_tokens, output_reasoning_tokens,
@@ -502,7 +673,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages over an aug
   function dropAllTriggers(path) {
     const database = new DatabaseSync(path, { readOnly: true });
     try {
-      return database.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('pending_quarantine_objects', 'telemetry_v1_records', 'storage_v11_append_transitions', 'storage_v11_owner_links', 'telemetry_usage_correction_history', 'telemetry_usage_correction_facts', 'telemetry_usage_correction_runtime')")
+      return database.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN ('pending_quarantine_objects', 'telemetry_v1_chunks', 'telemetry_v11_chunks', 'telemetry_v12_chunks', 'telemetry_v1_records', 'storage_v11_append_transitions', 'storage_v11_owner_links', 'telemetry_usage_correction_history', 'telemetry_usage_correction_facts', 'telemetry_usage_correction_runtime')")
         .all().map(row => `DROP TRIGGER IF EXISTS "${row.name}";`).join("\n");
     } finally {
       database.close();
@@ -597,6 +768,59 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages over an aug
       for (const facts of Object.values(results[stage].tables)) expect(facts.targetRows).toBe(facts.sourceRows);
     }
   });
+
+  it("re-proves the chunk-owned registrations when a finished stage replays and refuses a changed or a missing one", async () => {
+    const admin = target.adminPrimary;
+    const replay = stage => TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: forged.manifestPath });
+    const original = (await admin.query(`SELECT to_jsonb(registration) AS row FROM ${table("pending_objects")} registration
+      ORDER BY object_kind`)).rows.map(row => row.row);
+    expect(original).toHaveLength(3);
+    try {
+      // Same count, one registration whose time differs from the sealed one.
+      await tamper(admin, `UPDATE ${table("pending_objects")} SET registered_at = registered_at + interval '1 second'
+        WHERE object_kind = 'telemetry_v11'`);
+      await expect(replay("telemetry-v1-v11")).rejects.toSatisfy(refusal("CUTOVER_CHUNK_REGISTRATION_MISMATCH",
+        { table: "pending_objects", stage: "telemetry-v1-v11" }));
+      // A registration missing from the family it belongs to.
+      await tamper(admin, `DELETE FROM ${table("pending_objects")} WHERE object_kind = 'telemetry_v12'`);
+      await expect(replay("telemetry-v12")).rejects.toSatisfy(refusal("CUTOVER_CHUNK_REGISTRATION_MISMATCH",
+        { table: "pending_objects", stage: "telemetry-v12" }));
+    } finally {
+      await tamper(admin, `DELETE FROM ${table("pending_objects")}`);
+      await tamper(admin, `INSERT INTO ${table("pending_objects")}
+        SELECT * FROM jsonb_populate_recordset(NULL::${table("pending_objects")}, $1::jsonb)`, [JSON.stringify(original)]);
+    }
+    // Restored, both stages replay to the receipts of the first run.
+    for (const stage of ["telemetry-v1-v11", "telemetry-v12"]) expect((await replay(stage)).receiptSha256, stage).toBe(results[stage].receiptSha256);
+  }, 600_000);
+
+  // Integration with D-PT4X: 'pending-registrations' owns every sealed
+  // registration and must accept the chunk-owned rows these stages already
+  // mapped (family kind) without rewriting them, then hold every object.
+  it("hands the chunk-owned registrations to the pending-registrations stage, which accepts the family kind and holds every object", async () => {
+    const pool = target.ownerPrimary;
+    const snapshot = async () => (await pool.query(`SELECT to_jsonb(registration) AS row FROM ${table("pending_objects")} registration
+      ORDER BY contribution_id COLLATE "C"`)).rows.map(row => row.row);
+    const before = await snapshot();
+    const sealed = Number(forgedDb.prepare("SELECT count(*) AS n FROM pending_quarantine_objects").get().n);
+    expect(before).toHaveLength(3);
+    expect(sealed).toBe(3);
+    await runLegacyContributionsProduction({ handle, sealManifestPath: forged.manifestPath });
+    const pending = await runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath });
+    expect(pending.registrations.rows).toBe(sealed);
+    expect([pending.premapped, pending.inserted]).toEqual([3, 0]);
+    // The rows these stages wrote are untouched: family kind, registration token and all.
+    expect(await snapshot()).toEqual(before);
+    expect(await count(pool, "pending_object_transfer_holds")).toBe(sealed);
+    // The telemetry stages still re-prove their registrations, and a replay of the pending stage writes nothing.
+    for (const stage of ["telemetry-v1-v11", "telemetry-v12"]) {
+      const replayed = await TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: forged.manifestPath });
+      expect(replayed.receiptSha256, stage).toBe(results[stage].receiptSha256);
+    }
+    const again = await runPendingRegistrationsProduction({ handle, sealManifestPath: forged.manifestPath });
+    expect(again.receiptSha256).toBe(pending.receiptSha256);
+    expect([again.premapped, again.inserted]).toEqual([0, 0]);
+  }, 600_000);
 });
 
 describe.skipIf(!PG_TEST_SOCKET)("D-PT5A production stages equal the reviewed rehearsal importers over the same sealed corpus", () => {

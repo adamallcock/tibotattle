@@ -127,7 +127,7 @@ export const BUILD_ARCHIVE_NAME = "source.tar.gz";
 export const INFRA_READBACK_ARGV = Object.freeze(["node", "scripts/gcp-infra.mjs", "readback", "--require-clean"]);
 export const ROLLOUT_TARGET_KEYS = Object.freeze([
   "environment", "project", "region", "service", "migrationJob", "jobNames", "primaryInstance",
-  "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience",
+  "imageRepository", "builderServiceAccount", "verifierServiceAccount", "originAudience", "maintenanceJob",
 ]);
 /** The health body the public path and the EP-6 verifier path both read. */
 export const HEALTH_PATH = "/api/health";
@@ -292,7 +292,10 @@ const TEST_TARGET_VALUES = testTargetValues();
  * test-deployment or rehearsal resource. verifierServiceAccount is an EP-6
  * verifier the operator can impersonate and originAudience the origin's
  * Google ID token audience; together they are the verifier path roll reads
- * /api/health through while the edge is not in gcp mode.
+ * /api/health through while the edge is not in gcp mode. maintenanceJob is
+ * the MP-2-lite maintenance Job among jobNames (D-OPS4), or null while the
+ * desired state has none: roll runs it before that verification (the
+ * first-roll ready path, D-CRB).
  */
 export function validateRolloutTarget(target, environment) {
   if (!hasExactKeys(target, ROLLOUT_TARGET_KEYS) || target.environment !== environment
@@ -306,7 +309,9 @@ export function validateRolloutTarget(target, environment) {
       || !SERVICE_ACCOUNT.test(target.builderServiceAccount ?? "")
       || !isEdgeServiceAccountEmail(target.verifierServiceAccount)
       || target.verifierServiceAccount === target.builderServiceAccount
-      || !isEdgeOriginAudience(target.originAudience)) {
+      || !isEdgeOriginAudience(target.originAudience)
+      || (target.maintenanceJob !== null && (typeof target.maintenanceJob !== "string"
+        || !target.jobNames.includes(target.maintenanceJob) || target.maintenanceJob === target.migrationJob))) {
     fail("ROLLOUT_TARGET_INVALID");
   }
   const repository = REPOSITORY.exec(target.imageRepository ?? "");
@@ -585,18 +590,36 @@ function serviceOrigins(resource) {
 }
 
 /**
- * The live service before a migrate or roll: its DEPLOYMENT_SOURCE_COMMIT and
- * run.app origins. An absent, duplicated or malformed commit is refused
- * (ROLLOUT_LIVE_COMMIT_UNKNOWN) rather than replaced by --commit: OPS-2 apply
- * always renders the service with its bootstrap commit, so a readable
- * predecessor exists from the first rollout on.
+ * The service's HOST_ORIGIN: the one origin the CR-7 host accepts requests
+ * for (its Node adapter answers any other Host with EP-6's 421). It must be
+ * exactly one canonical run.app origin, and one of the service's own run.app
+ * origins, else ROLLOUT_SERVICE_HOST_ORIGIN_INVALID: Cloud Run serves two URL
+ * forms, and an edge or verifier aimed at the other one would only ever be
+ * refused.
+ */
+function hostOriginOf(resource) {
+  const env = container(resource, "service")?.env;
+  const matches = (Array.isArray(env) ? env : []).filter((variable) => variable?.name === "HOST_ORIGIN");
+  const value = matches.length === 1 && typeof matches[0].value === "string" ? matches[0].value : null;
+  if (value === null || canonicalRunAppOrigin(value) !== value || !serviceOrigins(resource).includes(value)) {
+    fail("ROLLOUT_SERVICE_HOST_ORIGIN_INVALID");
+  }
+  return value;
+}
+
+/**
+ * The live service before a migrate or roll: its DEPLOYMENT_SOURCE_COMMIT,
+ * run.app origins and HOST_ORIGIN. An absent, duplicated or malformed commit
+ * is refused (ROLLOUT_LIVE_COMMIT_UNKNOWN) rather than replaced by --commit:
+ * OPS-2 apply always renders the service with its bootstrap commit, so a
+ * readable predecessor exists from the first rollout on.
  */
 function liveService(context, target) {
   const stdout = runChecked(context, ROLLOUT_ARGV.serviceDescribe(target), "ROLLOUT_SERVICE_DESCRIBE_FAILED");
   const resource = parseJson(stdout, "ROLLOUT_SERVICE_DESCRIBE_FAILED");
   const commit = sourceCommitOf(container(resource, "service"));
   if (commit === null || !COMMIT.test(commit)) fail("ROLLOUT_LIVE_COMMIT_UNKNOWN");
-  return Object.freeze({ commit, origins: Object.freeze(serviceOrigins(resource)) });
+  return Object.freeze({ commit, origins: Object.freeze(serviceOrigins(resource)), hostOrigin: hostOriginOf(resource) });
 }
 
 // ---------------------------------------------------------------------------
@@ -815,13 +838,38 @@ async function checkEdgeContract(context, args) {
   });
 }
 
-/** In gcp mode the live edge must forward to this service, with the target's audience. */
+/**
+ * In gcp mode the live edge must forward to this service, with the target's
+ * audience, on exactly the service's HOST_ORIGIN: the edge's
+ * EDGE_UPSTREAM_ORIGIN and the origin's HOST_ORIGIN must be byte-equal, or
+ * every forward is a 421 (wave-3 host brief B7).
+ */
 function assertEdgeTargetsService(edge, service, target) {
   if (edge.mode !== "gcp") return;
   if (edge.upstreamOrigin === null || !service.origins.includes(edge.upstreamOrigin)
+      || edge.upstreamOrigin !== service.hostOrigin
       || edge.originAudience !== target.originAudience) {
     fail("ROLLOUT_EDGE_ORIGIN_MISMATCH");
   }
+}
+
+/**
+ * The first-roll ready path (D-CRB): the origin's /api/ready is Worker-exact
+ * (OD-CR-4), so a database no MP-2-lite lifecycle pass has run against reads
+ * not_ready, and the EP-6 verifier refuses it. Roll therefore runs one
+ * maintenance Job execution, the pass itself, after the new image is rolled
+ * and before it verifies. Exactly one succeeded execution of that job.
+ */
+function runMaintenancePass(context, target) {
+  const execution = parseJson(runChecked(context, ROLLOUT_ARGV.jobExecute(target, target.maintenanceJob),
+    "ROLLOUT_MAINTENANCE_PASS_FAILED"), "ROLLOUT_MAINTENANCE_PASS_FAILED");
+  const executionName = execution?.metadata?.name;
+  if (typeof executionName !== "string" || !EXECUTION.test(executionName)
+      || !executionName.startsWith(`${target.maintenanceJob}-`)
+      || execution?.status?.succeededCount !== 1 || (execution?.status?.failedCount ?? 0) !== 0) {
+    fail("ROLLOUT_MAINTENANCE_PASS_FAILED");
+  }
+  return executionName;
 }
 
 async function boundedHealth(response) {
@@ -865,7 +913,8 @@ async function verifyServedCommit(context, args, target, edge, service) {
     if (body.deployment?.sourceCommit !== args.commit) fail("ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH");
     return Object.freeze({ path: "public-health", origin: edge.publicOrigin, sourceCommit: args.commit });
   }
-  const upstreamOrigin = service.origins[0] ?? null;
+  // The verifier reads the origin on its HOST_ORIGIN, the only Host it serves.
+  const upstreamOrigin = service.hostOrigin ?? null;
   if (upstreamOrigin === null) fail("ROLLOUT_ORIGIN_URL_UNAVAILABLE");
   const obtainToken = createGcloudIdentityTokenSource({
     verifierAccount: target.verifierServiceAccount,
@@ -1235,15 +1284,23 @@ async function roll(context, args, target) {
       ROLLOUT_ARGV.serviceDescribe(target),
       ...target.jobNames.map((job) => ROLLOUT_ARGV.jobDescribe(target, job)),
       ROLLOUT_ARGV.infraReadback(args.environment),
+      ...(target.maintenanceJob === null ? [] : [ROLLOUT_ARGV.jobExecute(target, target.maintenanceJob)]),
       ...(edge.mode === "gcp" ? [] : [ROLLOUT_ARGV.identityToken(target)]),
     ], {
       edge: { mode: edge.mode, edgeCommit: edge.edgeCommit, capturedAt: edge.capturedAt },
+      maintenancePass: target.maintenanceJob === null
+        ? (edge.mode === "gcp" ? "unavailable" : "required-unavailable")
+        : "before-verification",
       servedCommitCheck: edge.mode === "gcp"
         ? { path: "public-health", url: new URL(HEALTH_PATH, edge.publicOrigin).href }
         : { path: "origin-verifier", paths: ["/api/health", "/api/ready"] },
     });
   }
   checkCheckout(context, args.commit);
+  // The origin-verifier path needs /api/ready to read ready, which only a
+  // lifecycle pass makes true: without a maintenance Job, refuse before any
+  // write rather than roll an origin no verification can pass.
+  if (edge.mode !== "gcp" && target.maintenanceJob === null) fail("ROLLOUT_MAINTENANCE_JOB_REQUIRED");
   const live = liveService(context, target);
   assertEdgeTargetsService(edge, live, target);
   return underLock(context, { sourceCommit: args.commit, previousSourceCommit: live.commit }, async (assertOwned) => {
@@ -1263,7 +1320,10 @@ async function roll(context, args, target) {
         "ROLLOUT_READBACK_FAILED"), "job", image, args.commit);
     }
     const readback = checkInfraReadback(context, args.environment);
-    const served = await verifyServedCommit(context, args, target, edge, { origins: serviceOrigins(service) });
+    const rolledService = { origins: serviceOrigins(service), hostOrigin: hostOriginOf(service) };
+    assertEdgeTargetsService(edge, rolledService, target);
+    if (target.maintenanceJob !== null) runMaintenancePass(context, target);
+    const served = await verifyServedCommit(context, args, target, edge, rolledService);
     const rolledAt = context.now();
     const body = {
       schema: ROLLOUT_ROLL_RECEIPT_SCHEMA,

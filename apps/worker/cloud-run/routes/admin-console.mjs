@@ -1,10 +1,11 @@
 /**
  * The six admin console routes on the PostgreSQL origin (GCP, C-ADMIN), as
- * one family for the composition root to register (D-CRB). Nothing here is
- * registered in the host. OD-CR-3 keeps the admin host refused until the
- * admin routes are ported; whether this family, with the overview at 503
- * until its unsourced blocks have sources, counts as ported is an open owner
- * question, so registering it is not a decision this module takes.
+ * one family for the composition root to register (D-CRB). The production
+ * host registers it only when its admin-host policy is 'chokepoint'
+ * (OD-CR-3); it ships 'refuse'. The owner answered OWN-17 in round 12 (open
+ * with what is ported; sections without a GCP source say "unavailable"),
+ * and the checklist schedules the flip as ADMIN-R12, after D-CRB, so
+ * registering it is not a decision this module takes.
  *
  * Root contract (d43c8f92 handleRequest, admin-hostname branch):
  * 1. A request on the admin host first passes the chokepoint

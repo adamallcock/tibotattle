@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   createPostgresWorkerBackend,
+  POSTGRES_ADMIN_HOST_ROUTE_IDS,
+  POSTGRES_PORTED_WORKER_ROUTE_IDS,
   POSTGRES_UNSUPPORTED_CURRENT_MAIN_CONTRACTS,
 } from "../src/backend-composition";
+import { WORKER_ROUTE_POLICY } from "../src/route-registry";
 import {
   handleRequest,
   isPostgresWorkerRequestPathSupported,
@@ -79,6 +82,38 @@ describe("PostgreSQL migration foundation", () => {
     expect(await response.json()).toMatchObject({
       error: { code: "POSTGRES_REQUEST_PATH_UNSUPPORTED" },
     });
+  });
+
+  it("names the origin's ported pathnames and keeps the zero-argument call false", () => {
+    // OD-CR-1: the 21 scope routes plus all nine contested ones; OD-CR-2: the
+    // six admin routes are admin-host only and the other 13 stay unported.
+    expect(POSTGRES_PORTED_WORKER_ROUTE_IDS).toHaveLength(30);
+    expect(Object.isFrozen(POSTGRES_PORTED_WORKER_ROUTE_IDS)).toBe(true);
+    expect(POSTGRES_ADMIN_HOST_ROUTE_IDS).toEqual([
+      "admin_overview", "admin_metrics_history", "admin_community_allowance_preview",
+      "admin_database_health", "admin_reconstruction_progress", "admin_action",
+    ]);
+    const policyOrder = WORKER_ROUTE_POLICY.map((route) => route.id)
+      .filter((id) => (POSTGRES_PORTED_WORKER_ROUTE_IDS as readonly string[]).includes(id));
+    expect(policyOrder).toEqual([...POSTGRES_PORTED_WORKER_ROUTE_IDS]);
+    expect(isPostgresWorkerRequestPathSupported("/api/v1/contributions")).toBe(true);
+    expect(isPostgresWorkerRequestPathSupported("/api/ready")).toBe(true);
+    expect(isPostgresWorkerRequestPathSupported("/api/v1/device/credential/renew")).toBe(true);
+    for (const pathname of [
+      "/api/v1/me/export",
+      "/api/v1/admin/overview",
+      "/.well-known/apple-developer-domain-association.txt",
+      "/api/v1/me/telemetry-v12/effective-page",
+      "/api/v1/enroll",
+      "/api/v1/identity/google/start",
+      "/api/v1/contributions/",
+      "/api/v1/nope",
+    ]) {
+      expect(isPostgresWorkerRequestPathSupported(pathname)).toBe(false);
+    }
+    expect(isPostgresWorkerRequestPathSupported(undefined)).toBe(false);
+    expect(isPostgresWorkerRequestPathSupported(["/api/ready"])).toBe(false);
+    expect(isPostgresWorkerRequestPathSupported()).toBe(false);
   });
 
   it("lets a host install native timing-safe comparison without changing mismatch behavior", () => {

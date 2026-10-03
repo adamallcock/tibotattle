@@ -4,115 +4,18 @@ import http from "node:http";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { createPostgresWorkerBackend } from "../src/backend-composition.ts";
-import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 import {
-  assertPostgresPersonalSessionCsrf,
-  authenticatePostgresPersonalSession,
-  listPostgresParticipantDevices,
-  revokePostgresParticipantDevice,
-} from "../src/postgres-personal-devices.ts";
-import {
-  authenticatePostgresPersonalSessionForRead,
-  revokePostgresPersonalSession,
-} from "../src/postgres-personal-session.ts";
-import { clearedSessionCookie } from "../src/session.ts";
-import {
-  handleRequest,
+  createPostgresWorkerBackend,
   isPostgresWorkerRequestPathSupported,
-} from "../src/index.ts";
+  POSTGRES_PORTED_WORKER_ROUTE_IDS,
+} from "../src/backend-composition.ts";
 import { runPostgresScheduledMaintenance } from "../src/postgres-maintenance.ts";
-import { assertAccountScopedLocalPreview } from "../src/account-scoped-ingest.ts";
-import { createPostgresDevicePairing } from "../src/postgres-device-pairing.ts";
-import { claimPostgresDevicePairing } from "../src/postgres-device-pairing-claim.ts";
-import { grantPostgresTelemetryV12Consent } from "../src/postgres-telemetry-v12-consent.ts";
-import {
-  assertAdmissionBindings,
-  assertAttemptAllowed,
-  assertPublicAggregateReadAllowed,
-  assertUploadAuthorizationAllowed,
-  assertUploadAuthorizationBindings,
-  assertUploadIngressRequestAllowed,
-} from "../src/admission.ts";
-import { MAX_REQUEST_BYTES, TELEMETRY_CONSENT_VERSION } from "../src/constants.ts";
-import { readBoundedRequestBody } from "../src/bounded-body.ts";
-import {
-  createGcsQuarantineObjectStore,
-  GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING,
-  parseGcsQuarantineBucketHistoryProof,
-} from "../src/gcs-quarantine-object-store.ts";
-import { createFilesystemAssets } from "./assets.mjs";
+import { assertPublicAggregateReadAllowed } from "../src/admission.ts";
+import { createGcsQuarantineObjectStore } from "../src/gcs-quarantine-object-store.ts";
 import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenance-gate.mjs";
 import { createPostgresUploadIngressBudget } from "../src/postgres-ingress-budget.ts";
 import { createPostgresRateLimiter } from "../src/postgres-rate-limiter.ts";
-import {
-  ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
-  parseAccountlessEnrollmentJson,
-} from "../src/accountless-enrollment.ts";
-import {
-  ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
-  parseAccountlessOwnershipJson,
-} from "../src/accountless-ownership.ts";
-import { parseTelemetryV12AccountlessAuthorizationJson } from "../src/telemetry-transport-policy.ts";
-import {
-  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
-  parseAccountlessRenewalJson,
-} from "../src/accountless-renewal.ts";
-import {
-  authenticatePostgresAccountlessOwnerForV12Grant,
-  createPostgresAccountlessUploadOwner,
-  enrollPostgresAccountlessDevice,
-  grantPostgresTelemetryV12AccountlessAuthorization,
-} from "../src/postgres-accountless-enrollment.ts";
-import { renewPostgresAccountlessUploadOwner } from "../src/postgres-accountless-renewal.ts";
-import {
-  POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
-  parsePostgresDeviceCredentialRenewalJson,
-  renewPostgresDeviceCredential,
-} from "../src/postgres-device-credential-renewal.ts";
-import {
-  readPostgresDeviceSyncCapabilities,
-  readPostgresDeviceSyncV12Capabilities,
-} from "../src/postgres-device-sync.ts";
-import {
-  readPostgresDeviceSyncState,
-  readPostgresDeviceSyncManifest,
-} from "../src/postgres-device-sync-reads.ts";
-import { disconnectPostgresAuthenticatedDevice } from "../src/postgres-device-disconnect.ts";
-import { readPostgresV12DayCandidates } from "../src/postgres-v12-manifest-candidates.ts";
-import {
-  abandonPostgresDeviceUploadAuthorization,
-  authenticatePostgresDevice,
-  claimPostgresDeviceUploadAuthorization,
-} from "../src/postgres-typed-v12-transport.ts";
-import {
-  persistPostgresTypedV12StagedChunk,
-  registerPostgresTypedV12DayManifest,
-} from "../src/postgres-typed-v12-admission.ts";
-import { createPostgresDeviceUploadAuthorization } from "../src/postgres-upload-authorization.ts";
-import { createPostgresTypedV12Domain } from "../src/postgres-typed-v12-domain.ts";
-import { readPostgresTelemetryV12EffectivePage } from "../src/postgres-typed-v12-effective-reader.ts";
-import {
-  decryptSyntheticEnvelope,
-  publicEnvelopeKey,
-  sha256Hex,
-} from "../src/crypto.ts";
-import { validateTelemetryV12StagedChunk } from "../src/telemetry-v12-repository.ts";
-import { validateTelemetryV12Envelope } from "@app-usagemonitor/telemetry-contract";
-import { assertPostgresTelemetryTransportWriteAllowed } from "../src/postgres-telemetry-format-authority.ts";
-import { TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
-// Legacy intake adapters (IN-2 v1.1, IN-3 v1.0/v0.1), composed by
-// ./origin-intake-composition.mjs beside the v1.2 routes.
-import * as postgresTelemetryV11Live from "../src/postgres-telemetry-v11-live-admission.ts";
-import * as postgresDeviceBearerAuth from "../src/postgres-device-bearer-auth.ts";
-import * as postgresTypedV12Transport from "../src/postgres-typed-v12-transport.ts";
-import * as postgresPersonalDevices from "../src/postgres-personal-devices.ts";
-import * as postgresCollectionControls from "../src/postgres-collection-controls.ts";
-import * as workerCrypto from "../src/crypto.ts";
-import * as boundedBody from "../src/bounded-body.ts";
-import * as postgresLegacyContributionAdmission from "../src/postgres-legacy-contribution-admission.ts";
-import * as postgresTransportWriteAuthority from "../src/postgres-transport-write-authority.ts";
-import * as postgresUploadAuthorization from "../src/postgres-upload-authorization.ts";
+import { recordPostgresDiagnosticError } from "../src/postgres-host-diagnostics.ts";
 import { setTimingSafeEqualImplementation } from "../src/crypto.ts";
 import { createIamPool, createGoogleAccessTokenProvider, closeCloudSqlResources, normalizeIamUser } from "./cloud-sql.mjs";
 import {
@@ -122,26 +25,14 @@ import {
 } from "./owner-bootstrap.mjs";
 import { installNodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
 import {
-  createPostgresTestCommunityDailyDispatch,
-  createPostgresTestDevicePairingDispatch,
-  createPostgresTestDevicePairingClaimDispatch,
-  createPostgresTestParticipantDevicesDispatch,
-  createPostgresTestPersonalSessionDispatch,
-  createPostgresTestTelemetryV12ConsentDispatch,
-  createPostgresTestV12DayManifestDispatch,
+  createPostgresStorageGate,
   createPostgresTestHealthDispatch,
-  createPostgresTestStorageReceiptCheck,
   dispatchCloudRunHostRequest,
   isPrivatePostgresTestHost,
 } from "./postgres-test-dispatch.mjs";
-import { createOriginIntakeComposition, originIntakeServedInMode } from "./origin-intake-composition.mjs";
+import { originIntakeServedInMode } from "./origin-intake-composition.mjs";
 import { Connector } from "@google-cloud/cloud-sql-connector";
 import { POSTGRES_RUNTIME_MIGRATIONS } from "../src/postgres-runtime-schema.ts";
-import { WORKER_ROUTE_POLICY } from "../src/route-registry.ts";
-import {
-  createOriginRouteModuleRegistry,
-  ORIGIN_OVERRIDABLE_BUILT_INS,
-} from "./origin-route-modules.mjs";
 import {
   analyticsV2TestClock,
   FASTPATH_TEST_MODE,
@@ -150,19 +41,39 @@ import {
 } from "./origin-fastpath-mode.mjs";
 import { createAnalyticsV2CommunityDailyRoute } from "../src/analytics-v2/community-daily-route.ts";
 import { createEdgeAdmissionLimiters } from "./postgres-edge-admission-limiters.mjs";
+import { edgeRequestContext } from "./postgres-edge-origin-dispatch.mjs";
 import {
   EDGE_TEST_PUBLIC_ORIGIN,
-  EdgeTestBoundaryRefusal,
   composeEdgeTestOrigin,
   edgeTestAdmissionEnv,
-  edgeTestRequestFromNode,
-  isEdgeOriginBoundaryRefusal,
   isEdgeTestCloudListen,
-  lingerAfterEarlyEdgeTestAnswer,
-  logEdgeTestBoundaryRefusal,
   readEdgeTestOriginConfiguration,
-  writeEdgeTestBoundaryRefusal,
 } from "./origin-edge-test-mode.mjs";
+import {
+  OriginBoundaryRefusal,
+  isEdgeOriginBoundaryRefusal,
+  lingerAfterEarlyAnswer,
+  logOriginBoundaryRefusal,
+  originRequestFromNode,
+  writeOriginBoundaryRefusal,
+} from "./origin-node-request.mjs";
+import { createRequestContextStore, requestIdFrom } from "./postgres-request-context.mjs";
+import { createPrivateTestRequestHandler, createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
+import {
+  PRODUCTION_ADMIN_HOST_POLICY,
+  PRODUCTION_HOST_MODES,
+  PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS,
+  composeOriginFamilies,
+  createOriginRouteRegistry,
+  createPostgresProductionRuntime,
+  createUploadIngressAuthority,
+} from "./postgres-production-host.mjs";
+import { createPostgresHealthDispatch, healthCapabilityFlags } from "./postgres-health-dispatch.mjs";
+import { createPostgresReadinessDispatch } from "./postgres-readiness-dispatch.mjs";
+import {
+  QUARANTINE_BUCKET_HISTORY_PROOF_SETTING,
+  parseQuarantineBucketHistoryProof,
+} from "./postgres-production-configuration.mjs";
 import {
   buildPublicGoogleRequestUrl,
   buildRequestUrl,
@@ -184,7 +95,6 @@ const RATE_LIMIT_BINDINGS = Object.freeze([
   ["UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT", 1_000, 60],
 ]);
 const RATE_LIMIT_INTEGER = /^\d+$/u;
-const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
 
 function configurationError(code) { throw Object.assign(new Error(code), { code }); }
 function optional(name, fallback = undefined) {
@@ -205,15 +115,30 @@ function integer(name, fallback, minimum, maximum) {
   }
   return parsed;
 }
-function sourceDigest() {
-  const value = optional("SOURCE_CONTENT_DIGEST");
-  if (value === undefined || !DIGEST_PATTERN.test(value)) configurationError("SOURCE_CONTENT_DIGEST_INVALID");
+/**
+ * HOST_MODE (CR-7, D-CRB): unset or empty for the test and command modes;
+ * 'production' or 'staging' (OD-CR-8) composes the production host from the
+ * CR-3 profile of the same name. Anything else is HOST_MODE_INVALID, and a
+ * non-empty POSTGRES_TEST_HTTP_MODE beside it is HOST_MODE_CONFLICT (an empty
+ * one reaches CR-3, which refuses it as POSTGRES_TEST_HTTP_MODE_FORBIDDEN).
+ */
+function hostMode(env = process.env) {
+  const value = env.HOST_MODE;
+  if (value === undefined || value === "") return null;
+  if (typeof value !== "string" || !Object.hasOwn(PRODUCTION_HOST_MODES, value)) {
+    configurationError("HOST_MODE_INVALID");
+  }
+  if (typeof env.POSTGRES_TEST_HTTP_MODE === "string" && env.POSTGRES_TEST_HTTP_MODE !== "") {
+    configurationError("HOST_MODE_CONFLICT");
+  }
   return value;
 }
 /**
  * Owner decision OD-2 (2026-10-02): the quarantine bucket's birth proof,
  * GCS_QUARANTINE_BUCKET_HISTORY_PROOF, as the OPS-2 bucket-birth receipt's
- * proof record for exactly `bucket`. The retired
+ * proof record for exactly `bucket`, parsed by CR-3's one grammar
+ * (parseQuarantineBucketHistoryProof; the production profiles read the same
+ * parse as resources.bucketHistoryProof). The retired
  * GCS_ERASURE_BUCKET_HISTORY_PROOF is refused even when empty, so a stale
  * deployment fails closed instead of starting without the proof it expected.
  */
@@ -221,12 +146,7 @@ function quarantineBucketHistoryProof(bucket) {
   if (Object.hasOwn(process.env, "GCS_ERASURE_BUCKET_HISTORY_PROOF")) {
     configurationError("GCS_ERASURE_BUCKET_HISTORY_PROOF_RETIRED");
   }
-  const raw = required(GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
-  try {
-    return parseGcsQuarantineBucketHistoryProof(raw, bucket);
-  } catch {
-    configurationError("GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID");
-  }
+  return parseQuarantineBucketHistoryProof(required(QUARANTINE_BUCKET_HISTORY_PROOF_SETTING), bucket);
 }
 function parseOrigin(value, name) {
   let url;
@@ -296,12 +216,6 @@ function privatePostgresTestHostConfiguration(mode, edgeTestOrigin = null) {
     requestOriginAllowlist: createRequestOriginAllowlist({ publicHostOrigin: hostOrigin }),
   });
 }
-function throwingD1(name) {
-  return new Proxy(Object.create(null), {
-    get() { throw new Error(`${name}_D1_DISABLED`); },
-    has() { return false; },
-  });
-}
 export {
   buildPublicGoogleRequestUrl,
   buildRequestUrl,
@@ -346,77 +260,19 @@ function rateLimitBinding(pool, schemaOptions, keyHashSecret, [binding, name, de
   });
 }
 
-function configurationEnv({
-  backend,
-  objectStore,
-  ingressBudget,
-  primaryPool,
-  schemaOptions,
-  hostOrigin,
-  publicOrigin,
-  assets,
-  rateLimitSecret,
-  digest,
-}) {
-  const environment = optional("ENVIRONMENT", "synthetic-development");
-  const enrollmentMode = optional("ENROLLMENT_MODE", environment === "synthetic-development" ? "local_open" : "disabled");
-  const identitySecret = optional("IDENTITY_LINK_SECRET");
-  const identityVersion = optional("IDENTITY_LINK_SECRET_VERSION");
-  if (identitySecret !== undefined && identityVersion === undefined) configurationError("IDENTITY_LINK_SECRET_VERSION_MISSING");
-  const envelopePublic = required("ENVELOPE_PUBLIC_JWK");
-  const envelopePrivate = required("ENVELOPE_PRIVATE_JWK");
-  const env = {
-    ENVIRONMENT: environment,
-    ENROLLMENT_MODE: enrollmentMode,
-    ACCOUNTLESS_ENROLLMENT_MODE: optional("ACCOUNTLESS_ENROLLMENT_MODE", "disabled"),
-    ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
-    ACCOUNT_SCOPED_INGEST_MODE: "disabled",
-    TELEMETRY_STORAGE_MODE: optional("TELEMETRY_STORAGE_MODE", "json"),
-    TELEMETRY_STORAGE_NAMESPACE: optional("TELEMETRY_STORAGE_NAMESPACE", ""),
-    UPLOAD_INGRESS_QUEUE_MODE: "disabled",
-    UPLOAD_INGRESS_MAX_CONCURRENT: optional("UPLOAD_INGRESS_MAX_CONCURRENT", "8"),
-    UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: optional("UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "120"),
-    UPLOAD_INGRESS_BURST: optional("UPLOAD_INGRESS_BURST", "16"),
-    UPLOAD_INGRESS_LEASE_SECONDS: optional("UPLOAD_INGRESS_LEASE_SECONDS", "90"),
-    UPLOAD_INGRESS_BODY_TOTAL_SECONDS: optional("UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "60"),
-    UPLOAD_INGRESS_BODY_IDLE_SECONDS: optional("UPLOAD_INGRESS_BODY_IDLE_SECONDS", "15"),
-    SIGN_IN_START_MAX_PER_MINUTE: optional("SIGN_IN_START_MAX_PER_MINUTE", "5"),
-    PUBLIC_ANALYTICS_MODE: optional("PUBLIC_ANALYTICS_MODE", "enabled"),
-    ALLOWANCE_RECONSTRUCTION_MODE: optional("ALLOWANCE_RECONSTRUCTION_MODE", "resumable"),
-    INCREMENTAL_EXTERNAL_PARTICIPANTS: optional("INCREMENTAL_EXTERNAL_PARTICIPANTS", "authorized"),
-    PUBLIC_ORIGIN: publicOrigin,
-    ENVELOPE_PUBLIC_JWK: envelopePublic,
-    ENVELOPE_PRIVATE_JWK: envelopePrivate,
-    IDENTITY_LINK_SECRET: identitySecret,
-    IDENTITY_LINK_SECRET_VERSION: identityVersion,
-    ADMIN_IDENTITY_LINK_KEY: optional("ADMIN_IDENTITY_LINK_KEY"),
-    GOOGLE_OIDC_CLIENT_ID: optional("GOOGLE_OIDC_CLIENT_ID"),
-    GOOGLE_OIDC_CLIENT_SECRET: optional("GOOGLE_OIDC_CLIENT_SECRET"),
-    APPLE_SERVICES_ID: optional("APPLE_SERVICES_ID"),
-    APPLE_KEY_ID: optional("APPLE_KEY_ID"),
-    APPLE_TEAM_ID: optional("APPLE_TEAM_ID"),
-    APPLE_PRIVATE_KEY: optional("APPLE_PRIVATE_KEY"),
-    ACCESS_TEAM_DOMAIN: optional("ACCESS_TEAM_DOMAIN"),
-    ACCESS_AUD: optional("ACCESS_AUD"),
-    ACCESS_ADMIN_EMAIL: optional("ACCESS_ADMIN_EMAIL"),
-    DISTRIBUTION_ANALYTICS_ZONE_ID: optional("DISTRIBUTION_ANALYTICS_ZONE_ID"),
-    SOURCE_CONTENT_DIGEST: digest,
-    POSTGRES_WORKER_BACKEND: backend,
-    POSTGRES_OBJECT_STORE: objectStore,
-    UPLOAD_INGRESS_BUDGET: Object.freeze({ getByName: () => ingressBudget }),
-    USAGE_MONITOR_DB: throwingD1("USAGE_MONITOR_DB"),
-    DELETION_LEDGER: throwingD1("DELETION_LEDGER"),
-    QUARANTINE: undefined,
-    SPARKLE_RELEASES: undefined,
-    ASSETS: assets,
-  };
-  for (const definition of RATE_LIMIT_BINDINGS) {
-    env[definition[0]] = rateLimitBinding(primaryPool, schemaOptions, rateLimitSecret, definition);
-  }
-  return Object.freeze(env);
-}
-
 export async function createRuntime({ databaseOnly = false, dependencies = {} } = {}) {
+  // HOST_MODE first: production and staging are configured by CR-3 alone,
+  // whose own codes refuse a test mode, a LEDGER_ setting or a test seam.
+  const mode = hostMode();
+  if (mode !== null) {
+    if (databaseOnly) configurationError("HOST_MODE_COMMAND_UNSUPPORTED");
+    return createPostgresProductionRuntime({
+      processEnv: process.env,
+      hostMode: mode,
+      adminHostPolicy: PRODUCTION_ADMIN_HOST_POLICY,
+      dependencies,
+    });
+  }
   assertNoLedgerConfiguration();
   const postgresTestMode = databaseOnly ? null : postgresTestHttpMode();
   const postgresTestHttpEnabled = postgresTestMode !== null;
@@ -435,7 +291,6 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
   const requestOriginAllowlist = databaseOnly
     ? null
     : privateHost?.requestOriginAllowlist ?? configuredRequestOrigins(hostOrigin, publicOrigin);
-  const digest = databaseOnly || postgresTestHttpEnabled ? undefined : sourceDigest();
   // fastpath-test serves a rehearsal schema only; refuse any other schema
   // before a connector or pool exists.
   const database = postgresTestMode === FASTPATH_TEST_MODE
@@ -496,338 +351,188 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
         }),
       };
     }
-    if (postgresTestMode === "health-and-v12-day-manifest"
-        || postgresTestMode === FASTPATH_TEST_MODE) {
-      const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
-      if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
-        configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
-      }
-      const envelopePublicJwk = required("ENVELOPE_PUBLIC_JWK");
-      const envelopePrivateJwk = required("ENVELOPE_PRIVATE_JWK");
-      const accessToken = await (dependencies.createGoogleAccessTokenProvider
-        ?? createGoogleAccessTokenProvider)();
-      const objectStore = (dependencies.createGcsQuarantineObjectStore
-        ?? createGcsQuarantineObjectStore)(
-        quarantineBucket, accessToken, undefined, undefined, quarantineHistoryProof,
-      );
-      // In edge-test the six edge-tier bindings replay the edge's outcome
-      // (EP-6) and every privateOrigin is the public origin EP-6 rebuilds on.
-      const edgeAdmission = edgeTestOrigin === null ? null : createEdgeAdmissionLimiters();
-      const dispatchOrigin = edgeTestOrigin === null ? hostOrigin : EDGE_TEST_PUBLIC_ORIGIN;
-      const originAdmissionEnv = {
-        ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
-        ENROLLMENT_MODE: optional("ENROLLMENT_MODE", "disabled"),
-        IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
-        IDENTITY_LINK_SECRET_VERSION: optional("IDENTITY_LINK_SECRET_VERSION"),
-        GOOGLE_OIDC_CLIENT_ID: optional("GOOGLE_OIDC_CLIENT_ID"),
-        GOOGLE_OIDC_CLIENT_SECRET: optional("GOOGLE_OIDC_CLIENT_SECRET"),
-        SIGN_IN_START_MAX_PER_MINUTE: optional("SIGN_IN_START_MAX_PER_MINUTE", "120"),
-        ACCOUNTLESS_ENROLLMENT_MODE: optional("ACCOUNTLESS_ENROLLMENT_MODE", "disabled"),
-        ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
-      };
-      for (const definition of RATE_LIMIT_BINDINGS) {
-        originAdmissionEnv[definition[0]] = rateLimitBinding(
-          primaryPool, schemaOptions, rateLimitSecret, definition,
-        );
-      }
-      const admissionEnv = edgeAdmission === null
-        ? originAdmissionEnv
-        : edgeTestAdmissionEnv(originAdmissionEnv, edgeAdmission);
-      const healthDispatch = createPostgresTestHealthDispatch({
-        primaryPool,
-        schemaOptions,
-        expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
-        privateOrigin: dispatchOrigin,
-      });
-      const communityDailyDispatch = createPostgresTestCommunityDailyDispatch({
-        primaryPool,
-        schemaOptions,
-        sourceIdentity: backend.sourceIdentity,
-        readPostgresPublishedCommunityDaily,
-        healthDispatch,
-        privateOrigin: dispatchOrigin,
-      });
-      const participantDevicesDispatch = createPostgresTestParticipantDevicesDispatch({
-        primaryPool,
-        schemaOptions,
-        authenticatePostgresPersonalSession,
-        assertPostgresPersonalSessionCsrf,
-        listPostgresParticipantDevices,
-        revokePostgresParticipantDevice,
-        readBoundedRequestBody,
-        maxRequestBytes: MAX_REQUEST_BYTES,
-        healthDispatch,
-        privateOrigin: dispatchOrigin,
-      });
-      const personalSessionDispatch = createPostgresTestPersonalSessionDispatch({
-        primaryPool,
-        schemaOptions,
-        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
-        assertPostgresPersonalSessionCsrf,
-        revokePostgresPersonalSession,
-        healthDispatch,
-        clearSessionCookie: clearedSessionCookie(),
-        privateOrigin: dispatchOrigin,
-      });
-      const devicePairingDispatch = createPostgresTestDevicePairingDispatch({
-        primaryPool,
-        schemaOptions,
-        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
-        assertPostgresPersonalSessionCsrf,
-        assertAccountScopedLocalPreview,
-        createPostgresDevicePairing,
-        healthDispatch,
-        readBoundedRequestBody,
-        maxRequestBytes: MAX_REQUEST_BYTES,
-        admissionEnv,
-        privateOrigin: dispatchOrigin,
-      });
-      const devicePairingClaimDispatch = createPostgresTestDevicePairingClaimDispatch({
-        primaryPool,
-        schemaOptions,
-        claimPostgresDevicePairing,
-        healthDispatch,
-        readBoundedRequestBody,
-        maxRequestBytes: MAX_REQUEST_BYTES,
-        privateOrigin: dispatchOrigin,
-      });
-      const telemetryV12ConsentDispatch = createPostgresTestTelemetryV12ConsentDispatch({
-        primaryPool,
-        schemaOptions,
-        authenticatePostgresPersonalSession: authenticatePostgresPersonalSessionForRead,
-        assertPostgresPersonalSessionCsrf,
-        grantPostgresTelemetryV12Consent,
-        healthDispatch,
-        readBoundedRequestBody,
-        maxRequestBytes: MAX_REQUEST_BYTES,
-        privateOrigin: dispatchOrigin,
-      });
-      Object.freeze(admissionEnv);
-      const assertPostgresV12UploadAllowed = (pool, device, nowEpoch, { schema }) =>
-        assertPostgresTelemetryTransportWriteAllowed(
-          pool,
-          device,
-          TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
-          { nowEpoch, schema },
-        );
-      // Legacy intake beside the v1.2 routes (IN-2 and IN-3 hand-offs): the
-      // v1.1, v1.0 and v0.1 envelopes with their upload-authorization
-      // formats, the upload-authorization route module and the v1.1 routes,
-      // all gated on the same migration receipts as the built-in routes.
-      // Only the modes whose clients reach those routes compose it
-      // (ORIGIN_INTAKE_HOST_MODES).
-      const intake = originIntakeServedInMode(postgresTestMode) ? createOriginIntakeComposition({
-        adapters: {
-          live: postgresTelemetryV11Live,
-          bearer: postgresDeviceBearerAuth,
-          transport: postgresTypedV12Transport,
-          personalDevices: postgresPersonalDevices,
-          controls: postgresCollectionControls,
-          crypto: workerCrypto,
-          boundedBody,
-          legacyAdmission: postgresLegacyContributionAdmission,
-          transportWriteAuthority: postgresTransportWriteAuthority,
-          uploadAuthorization: postgresUploadAuthorization,
-        },
-        primaryPool,
-        schemaOptions,
-        admissionEnv,
-        assertAdmissionBindings,
-        assertAttemptAllowed,
-        assertUploadAuthorizationBindings,
-        assertUploadAuthorizationAllowed,
-        assertV12UploadAllowed: assertPostgresV12UploadAllowed,
-        assertStorageCurrent: createPostgresTestStorageReceiptCheck({
-          primaryPool,
-          schemaOptions,
-          expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
-        }),
-        routePolicy: WORKER_ROUTE_POLICY,
-        maxRequestBytes: MAX_REQUEST_BYTES,
-        socialConsentVersion: TELEMETRY_CONSENT_VERSION,
-        sourceNamespace: backend.sourceIdentity.sourceNamespace,
-        envelopePublicJwk,
-        envelopePrivateJwk,
-      }) : null;
-      // Route modules may replace only the overridable built-ins. A mode
-      // that composes the intake mounts its upload-authorization module; only
-      // a fastpath-test origin adds the analytics-v2 module.
-      const routeModules = createOriginRouteModuleRegistry({
-        modules: [
-          ...(intake?.routeModules ?? []),
-          ...(postgresTestMode === FASTPATH_TEST_MODE
-            ? fastpathTestRouteModules({
-              env: process.env,
-              primaryPool,
-              primarySchema: database.primary.schema,
-              createAnalyticsV2CommunityDailyRoute:
-                dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
-              clock: dependencies.analyticsV2Clock ?? null,
-              // d43c8f92 index.ts:3979 handleCommunityDaily: the public-read
-              // limiter (PostgreSQL, or the edge's replayed outcome).
-              assertPublicReadAllowed: (request) => assertPublicAggregateReadAllowed(
-                admissionEnv.PUBLIC_READ_RATE_LIMIT, request, admissionEnv,
-              ),
-            })
-            : []),
-        ],
-        routePolicy: WORKER_ROUTE_POLICY,
-      });
-      const routeModuleContext = Object.freeze({ origin: dispatchOrigin, hostMode: privateHost.mode });
-      const edgeTestDispatch = (inner) => (edgeTestOrigin === null ? inner : composeEdgeTestOrigin({
-        configuration: edgeTestOrigin,
-        admission: edgeAdmission,
-        inner,
-      }));
-      return {
-        pools,
-        connector,
-        backend,
-        primaryPool,
-        schemaOptions,
-        hostOrigin,
-        publicOrigin,
-        requestOriginAllowlist,
-        listenHost: privateHost.listenHost,
-        listenPort: privateHost.port,
-        postgresTestHostMode: privateHost.mode,
-        ...(edgeTestOrigin === null ? {} : {
-          edgeTestOrigin,
-          edgeTestRequestFromNode: (req, res) => edgeTestRequestFromNode(req, res, { hostOrigin }),
-        }),
-        postgresTestDispatch: edgeTestDispatch(((v12Dispatch) => async (request) => {
-          let pathname;
-          let origin;
-          try { ({ pathname, origin } = new URL(request.url)); } catch { /* V12 dispatch returns a safe 503. */ }
-          // Non-overridable paths never reach a module. On an overridable
-          // path a module registered for the exact method and private origin
-          // answers first; otherwise the built-in below serves it unchanged.
-          if (origin === dispatchOrigin && ORIGIN_OVERRIDABLE_BUILT_INS.includes(pathname)) {
-            const routeModule = routeModules.resolve(request.method, pathname);
-            if (routeModule !== null) return routeModule.handler(request, routeModuleContext);
-          }
-          // The intake answers every method of the v1.1 routes, and a wrong
-          // method on the shared legacy routes, on the private origin (the
-          // Worker's 405); it answers null for what the routes below serve.
-          if (intake !== null && origin === dispatchOrigin && intake.pathnames.includes(pathname)) {
-            const response = await intake.dispatch(request);
-            if (response !== null) return response;
-          }
-          if (pathname === "/api/v1/community/daily") return communityDailyDispatch(request);
-          if (pathname === "/api/v1/me/devices"
-              || pathname === "/api/v1/me/devices/revoke") {
-            return participantDevicesDispatch(request);
-          }
-          if (pathname === "/api/v1/session" || pathname === "/api/v1/logout") {
-            return personalSessionDispatch(request);
-          }
-          if (pathname === "/api/v1/me/device-pairings") {
-            return devicePairingDispatch(request);
-          }
-          if (pathname === "/api/v1/device-pairings/claim") {
-            return devicePairingClaimDispatch(request);
-          }
-          if (pathname === "/api/v1/me/device-telemetry-v12-consents") {
-            return telemetryV12ConsentDispatch(request);
-          }
-          return v12Dispatch(request);
-        })(createPostgresTestV12DayManifestDispatch({
-          primaryPool,
-          schemaOptions,
-          accountlessAuthority: Object.freeze({
-            authenticateV12Grant: authenticatePostgresAccountlessOwnerForV12Grant,
-            enroll: enrollPostgresAccountlessDevice,
-            createOwner: createPostgresAccountlessUploadOwner,
-            grantV12: grantPostgresTelemetryV12AccountlessAuthorization,
-            renew: renewPostgresAccountlessUploadOwner,
-            parseEnrollmentJson: parseAccountlessEnrollmentJson,
-            parseOwnershipJson: parseAccountlessOwnershipJson,
-            parseV12AuthorizationJson: parseTelemetryV12AccountlessAuthorizationJson,
-            parseRenewalJson: parseAccountlessRenewalJson,
-            maxEnrollmentBytes: ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
-            maxOwnershipBytes: ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
-            maxRenewalBytes: ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
-          }),
-          deviceCredentialRenewalAuthority: Object.freeze({
-            renew: renewPostgresDeviceCredential,
-            parseRequest: parsePostgresDeviceCredentialRenewalJson,
-            maxRequestBytes: POSTGRES_DEVICE_CREDENTIAL_RENEWAL_MAX_REQUEST_BYTES,
-          }),
-          expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
-          privateOrigin: dispatchOrigin,
-          healthDispatch,
-          admissionEnv,
-          assertAdmissionBindings,
-          assertAttemptAllowed,
-          assertUploadAuthorizationBindings,
-          assertUploadAuthorizationAllowed,
-          assertUploadIngressRequestAllowed,
-          assertPostgresV12UploadAllowed,
-          createPostgresDeviceUploadAuthorization,
-          authenticatePostgresDevice,
-          disconnectPostgresAuthenticatedDevice,
-          readPostgresDeviceSyncState,
-          readPostgresDeviceSyncManifest,
-          readPostgresDeviceSyncCapabilities,
-          readPostgresDeviceSyncV12Capabilities,
-          readPostgresV12DayCandidates,
-          publicEnvelopeKey,
-          sourceNamespace: backend.sourceIdentity.sourceNamespace,
-          createPostgresTypedV12Domain,
-          readPostgresTelemetryV12EffectivePage,
-          registerPostgresTypedV12DayManifest,
-          claimPostgresDeviceUploadAuthorization,
-          abandonPostgresDeviceUploadAuthorization,
-          persistPostgresTypedV12StagedChunk,
-          decryptSyntheticEnvelope,
-          validateTelemetryV12Envelope,
-          validateTelemetryV12StagedChunk,
-          sha256Hex,
-          objectStore,
-          envelopePublicJwk,
-          envelopePrivateJwk,
-          readBoundedRequestBody,
-          maxRequestBytes: MAX_REQUEST_BYTES,
-          contributionEnvelopes: intake?.contributionEnvelopes,
-          uploadAuthorizationFormats: intake?.uploadAuthorizationFormats,
-          recordPostgresDeviceUploadReceipt: intake?.recordPostgresDeviceUploadReceipt,
-        }))),
-      };
-    }
-    const ingressBudget = createPostgresUploadIngressBudget(primaryPool, schemaOptions);
+    // health-and-v12-day-manifest and fastpath-test (with or without
+    // EDGE_ORIGIN_MODE=edge-test): the one family composition
+    // (postgres-production-host.mjs composeOriginFamilies) the production
+    // host uses.
     const rateLimitSecret = required("POSTGRES_RATE_LIMIT_SECRET");
-    if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
+    if (new TextEncoder().encode(rateLimitSecret).byteLength < 32) {
+      configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
+    }
+    const envelopePublicJwk = required("ENVELOPE_PUBLIC_JWK");
+    const envelopePrivateJwk = required("ENVELOPE_PRIVATE_JWK");
     const accessToken = await (dependencies.createGoogleAccessTokenProvider
       ?? createGoogleAccessTokenProvider)();
     const objectStore = (dependencies.createGcsQuarantineObjectStore
       ?? createGcsQuarantineObjectStore)(
       quarantineBucket, accessToken, undefined, undefined, quarantineHistoryProof,
     );
-    const assets = await createFilesystemAssets(
-      optional("ASSET_ROOT", "/app/apps/worker/cloud-run/assets"),
-    );
-    const env = configurationEnv({
-      backend,
-      objectStore,
-      ingressBudget,
+    // In edge-test the six edge-tier bindings replay the edge's outcome
+    // (EP-6) and every family's origin is the public origin EP-6 rebuilds on.
+    const edgeAdmission = edgeTestOrigin === null ? null : createEdgeAdmissionLimiters();
+    const dispatchOrigin = edgeTestOrigin === null ? hostOrigin : EDGE_TEST_PUBLIC_ORIGIN;
+    const ingressBudget = createPostgresUploadIngressBudget(primaryPool, schemaOptions);
+    const originAdmissionEnv = {
+      ENVIRONMENT: optional("ENVIRONMENT", "synthetic-development"),
+      ENROLLMENT_MODE: optional("ENROLLMENT_MODE", "disabled"),
+      IDENTITY_LINK_SECRET: optional("IDENTITY_LINK_SECRET"),
+      IDENTITY_LINK_SECRET_VERSION: optional("IDENTITY_LINK_SECRET_VERSION"),
+      GOOGLE_OIDC_CLIENT_ID: optional("GOOGLE_OIDC_CLIENT_ID"),
+      GOOGLE_OIDC_CLIENT_SECRET: optional("GOOGLE_OIDC_CLIENT_SECRET"),
+      SIGN_IN_START_MAX_PER_MINUTE: optional("SIGN_IN_START_MAX_PER_MINUTE", "120"),
+      ACCOUNTLESS_ENROLLMENT_MODE: optional("ACCOUNTLESS_ENROLLMENT_MODE", "disabled"),
+      ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
+      ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+      PUBLIC_ANALYTICS_MODE: optional("PUBLIC_ANALYTICS_MODE", "enabled"),
+      // The Worker's upload-ingress policy (the shared lease and the 60 s /
+      // 15 s body read) over the PostgreSQL budget, as production composes it.
+      UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+      UPLOAD_INGRESS_MAX_CONCURRENT: optional("UPLOAD_INGRESS_MAX_CONCURRENT", "8"),
+      UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: optional("UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "120"),
+      UPLOAD_INGRESS_BURST: optional("UPLOAD_INGRESS_BURST", "16"),
+      UPLOAD_INGRESS_LEASE_SECONDS: optional("UPLOAD_INGRESS_LEASE_SECONDS", "90"),
+      UPLOAD_INGRESS_BODY_TOTAL_SECONDS: optional("UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "60"),
+      UPLOAD_INGRESS_BODY_IDLE_SECONDS: optional("UPLOAD_INGRESS_BODY_IDLE_SECONDS", "15"),
+      UPLOAD_INGRESS_BUDGET: Object.freeze({ getByName: () => ingressBudget }),
+      // RD-3's deployment.sourceCommit; absent unless the deploy sets it.
+      ...Object.fromEntries([["DEPLOYMENT_SOURCE_COMMIT", optional("DEPLOYMENT_SOURCE_COMMIT")]]
+        .filter(([, value]) => value !== undefined)),
+      ...(edgeTestOrigin === null ? {} : { PUBLIC_ORIGIN: EDGE_TEST_PUBLIC_ORIGIN }),
+    };
+    for (const definition of RATE_LIMIT_BINDINGS) {
+      originAdmissionEnv[definition[0]] = rateLimitBinding(
+        primaryPool, schemaOptions, rateLimitSecret, definition,
+      );
+    }
+    const admissionEnv = edgeAdmission === null
+      ? Object.freeze(originAdmissionEnv)
+      : edgeTestAdmissionEnv(originAdmissionEnv, edgeAdmission);
+    // The test modes reuse a positive receipt for no time at all, so a test
+    // sees drift (or a newer schema) on the very next request.
+    const storageGate = createPostgresStorageGate({
       primaryPool,
       schemaOptions,
-      hostOrigin,
-      publicOrigin,
-      assets,
-      rateLimitSecret,
-      digest,
+      expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
+      positiveTtlMilliseconds: 0,
     });
-    return {
-      env,
+    const requestContextStore = createRequestContextStore();
+    const requestContext = requestContextStore.accessor;
+    const hostModeLabel = privateHost.mode;
+    const legacyChain = postgresTestMode === "health-and-v12-day-manifest";
+    const sourceIdentity = backend.sourceIdentity;
+    const statusDispatchers = legacyChain
+      ? Object.freeze({
+        health: createPostgresTestHealthDispatch({
+          primaryPool,
+          schemaOptions,
+          expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
+          privateOrigin: dispatchOrigin,
+        }),
+        ready: null,
+      })
+      : Object.freeze({
+        health: createPostgresHealthDispatch({
+          requestContext,
+          env: admissionEnv,
+          readinessPool: primaryPool,
+          primarySchema: schemaOptions.primarySchema,
+          objectStore,
+          capabilityFlags: healthCapabilityFlags((id) => POSTGRES_PORTED_WORKER_ROUTE_IDS.includes(id)),
+        }),
+        ready: createPostgresReadinessDispatch({
+          requestContext,
+          env: admissionEnv,
+          readinessPool: primaryPool,
+          primarySchema: schemaOptions.primarySchema,
+          sourceNamespace: sourceIdentity.sourceNamespace,
+          expectedPrimaryMigrations: POSTGRES_RUNTIME_MIGRATIONS.primary,
+        }),
+      });
+    const families = composeOriginFamilies({
+      dataPool: primaryPool,
+      primarySchema: schemaOptions.primarySchema,
+      sourceIdentity,
+      admissionEnv,
+      storageGate,
+      dispatchOrigin,
+      productionConfiguration: null,
+      objectStore,
+      envelopePublicJwk,
+      envelopePrivateJwk,
+      requestContext,
+      uploadIngress: createUploadIngressAuthority(),
+      statusDispatchers,
+      composeIntake: originIntakeServedInMode(postgresTestMode),
+      // Only a fastpath-test origin adds the analytics-v2 module.
+      routeModules: postgresTestMode === FASTPATH_TEST_MODE
+        ? fastpathTestRouteModules({
+          env: process.env,
+          primaryPool,
+          primarySchema: database.primary.schema,
+          createAnalyticsV2CommunityDailyRoute: dependencies.createAnalyticsV2CommunityDailyRoute ?? null,
+          clock: dependencies.analyticsV2Clock ?? null,
+          // d43c8f92 index.ts:3979 handleCommunityDaily: the public-read
+          // limiter (PostgreSQL, or the edge's replayed outcome).
+          assertPublicReadAllowed: (request) => assertPublicAggregateReadAllowed(
+            admissionEnv.PUBLIC_READ_RATE_LIMIT, request, admissionEnv,
+          ),
+        })
+        : [],
+      routeModuleContext: (request) => Object.freeze({
+        origin: dispatchOrigin,
+        hostMode: hostModeLabel,
+        requestId: requestIdFrom(requestContext, request),
+      }),
+    });
+    const base = {
       pools,
       connector,
       backend,
       primaryPool,
       schemaOptions,
-      objectStore,
       hostOrigin,
+      publicOrigin,
       requestOriginAllowlist,
+      listenHost: privateHost.listenHost,
+      listenPort: privateHost.port,
+      postgresTestHostMode: privateHost.mode,
+    };
+    // Every test mode serves exactly the production route list, through the
+    // one registry (the route modules folded in).
+    const registry = createOriginRouteRegistry(families, POSTGRES_PORTED_WORKER_ROUTE_IDS);
+    if (edgeTestOrigin === null) {
+      return {
+        ...base,
+        registry,
+        postgresTestDispatch: createPrivateTestRequestHandler({
+          registry,
+          dispatchOrigin: hostOrigin,
+          fallback: families.dispatchers.v12Dispatch,
+        }),
+      };
+    }
+    // edge-test: the production request handler behind EP-6, byte for byte
+    // the production pipeline (E12 proves it end to end).
+    const handler = createProductionRequestHandler({
+      registry,
+      env: admissionEnv,
+      requestContextStore,
+      requestContext: edgeRequestContext,
+      storageGate,
+      recordDiagnostic: (event) => recordPostgresDiagnosticError(primaryPool, schemaOptions, event),
+      adminHostPolicy: PRODUCTION_ADMIN_HOST_POLICY,
+      unportedRetryAfterSeconds: PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS,
+    });
+    return {
+      ...base,
+      registry,
+      edgeTestOrigin,
+      edgeTestRequestFromNode: (req, res) => originRequestFromNode(req, res, { hostOrigin }),
+      postgresTestDispatch: composeEdgeTestOrigin({
+        configuration: edgeTestOrigin,
+        admission: edgeAdmission,
+        inner: handler,
+      }),
     };
   } catch (error) {
     await closeCloudSqlResources({ pools, connector }).catch(() => undefined);
@@ -934,45 +639,72 @@ async function writeResponse(res, response) {
   await pipeline(Readable.fromWeb(response.body), res);
 }
 
+/** The production host's Node request timeouts (CR-7). */
+export const PRODUCTION_SERVER_TIMEOUTS = Object.freeze({
+  requestTimeoutMilliseconds: 300_000,
+  headersTimeoutMilliseconds: 60_000,
+});
+
 /**
- * Listen for one runtime on HOST:PORT (or the runtime's listen pair) and
- * return its close function. Exported for local rehearsals that compose a
- * runtime with injected local pools; the entry point calls it from main().
+ * One request through the EP-6 boundary (HOST_MODE production or staging,
+ * and edge-test): the Node request keeps its raw headers for EP-6
+ * (originRequestFromNode); a refusal here, and EP-6's unmarked 421, end the
+ * socket without reading the body, each logging its one content-free reason
+ * line; any other answer lingers for an unread body, then is written.
+ */
+async function serveBehindBoundary(req, res, runtime, requestFromNode) {
+  let request;
+  try {
+    request = requestFromNode(req, res);
+  } catch (error) {
+    if (!(error instanceof OriginBoundaryRefusal)) throw error;
+    logOriginBoundaryRefusal(error);
+    writeOriginBoundaryRefusal(res);
+    return;
+  }
+  const response = await dispatchCloudRunHostRequest(request, runtime);
+  if (isEdgeOriginBoundaryRefusal(response)) {
+    await response.body?.cancel().catch(() => undefined);
+    writeOriginBoundaryRefusal(res);
+    return;
+  }
+  lingerAfterEarlyAnswer(req);
+  await writeResponse(res, response);
+}
+
+/**
+ * Listen for one runtime on its validated listen pair and return its close
+ * function. Exported for local rehearsals that compose a runtime with
+ * injected local pools; the entry point calls it from main().
+ *
+ * - The production host (runtime.productionDispatch) listens where its
+ *   composition decided (productionListenHost: 0.0.0.0 only for a Cloud Run
+ *   service CR-3 validated, else 127.0.0.1) and accepts its HOST_ORIGIN's
+ *   host or a Cloud Run revision tag of it.
+ * - Every test runtime listens on 127.0.0.1, except the pinned edge-test
+ *   Cloud Run pair.
  */
 export async function serve(runtime) {
+  const production = typeof runtime.productionDispatch === "function";
   const edgeTest = typeof runtime.edgeTestRequestFromNode === "function";
   const server = http.createServer(async (req, res) => {
     try {
-      let request;
-      if (edgeTest) {
-        // edge-test keeps the raw headers for EP-6; a refusal here, and EP-6's
-        // unmarked 421 below, end the socket without reading the body. Each
-        // logs its one content-free reason line: this one here, EP-6's inside
-        // the composition (composeEdgeTestOrigin).
-        try {
-          request = runtime.edgeTestRequestFromNode(req, res);
-        } catch (error) {
-          if (!(error instanceof EdgeTestBoundaryRefusal)) throw error;
-          logEdgeTestBoundaryRefusal(error);
-          writeEdgeTestBoundaryRefusal(res);
-          return;
-        }
-      } else {
-        request = await requestFromNode(
-          req,
-          runtime.requestOriginAllowlist,
-          res,
-          runtime.publicOrigin,
-        );
-      }
-      const response = await dispatchCloudRunHostRequest(request, runtime, handleRequest);
-      if (edgeTest && isEdgeOriginBoundaryRefusal(response)) {
-        await response.body?.cancel().catch(() => undefined);
-        writeEdgeTestBoundaryRefusal(res);
+      if (production) {
+        await serveBehindBoundary(req, res, runtime, (nodeRequest, nodeResponse) =>
+          originRequestFromNode(nodeRequest, nodeResponse, { hostOrigin: runtime.hostOrigin, acceptRevisionTags: true }));
         return;
       }
-      if (edgeTest) lingerAfterEarlyEdgeTestAnswer(req);
-      await writeResponse(res, response);
+      if (edgeTest) {
+        await serveBehindBoundary(req, res, runtime, runtime.edgeTestRequestFromNode);
+        return;
+      }
+      const request = await requestFromNode(
+        req,
+        runtime.requestOriginAllowlist,
+        res,
+        runtime.publicOrigin,
+      );
+      await writeResponse(res, await dispatchCloudRunHostRequest(request, runtime));
     } catch (error) {
       if (res.headersSent) {
         res.destroy();
@@ -983,11 +715,15 @@ export async function serve(runtime) {
       res.end(JSON.stringify({ error: "HOST_REQUEST_UNAVAILABLE" }));
     }
   });
-  const port = runtime.listenPort ?? integer("PORT", 8080, 1, 65_535);
-  const host = runtime.listenHost ?? optional("HOST", "127.0.0.1");
+  if (production) {
+    server.requestTimeout = PRODUCTION_SERVER_TIMEOUTS.requestTimeoutMilliseconds;
+    server.headersTimeout = PRODUCTION_SERVER_TIMEOUTS.headersTimeoutMilliseconds;
+  }
+  const port = runtime.listenPort;
+  const host = runtime.listenHost;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) configurationError("PORT_INVALID");
   if (host !== "127.0.0.1" && host !== "0.0.0.0") configurationError("HOST_INVALID");
-  const postgresTestDispatch = runtime.postgresTestHealthDispatch || runtime.postgresTestDispatch;
-  if (postgresTestDispatch && host !== "127.0.0.1"
+  if (!production && host !== "127.0.0.1"
       && !isEdgeTestCloudListen(runtime.edgeTestOrigin, host, port, process.env)) {
     configurationError("POSTGRES_TEST_PRIVATE_HOST_REQUIRED");
   }
@@ -1043,6 +779,16 @@ export function originCompositionDependencies(env = process.env) {
 }
 
 async function main() {
+  // HOST_MODE composes only the request-serving origin: the maintenance Job
+  // is its own workload (dist/postgres-maintenance-job.mjs, CR-3 profile
+  // maintenance-job, no HOST_MODE), and the owner fixture commands belong to
+  // the test estate.
+  if (hostMode() !== null) {
+    if (process.argv.includes("--scheduled")) configurationError("POSTGRES_SCHEDULED_HOST_MODE_FORBIDDEN");
+    if (["--refresh-owner-session", "--bootstrap-owner"].some((flag) => process.argv.includes(flag))) {
+      configurationError("HOST_MODE_COMMAND_UNSUPPORTED");
+    }
+  }
   const postgresTestMode = postgresTestHttpMode();
   if (postgresTestMode
       && ["--refresh-owner-session", "--bootstrap-owner", "--scheduled"].some((flag) => process.argv.includes(flag))) {

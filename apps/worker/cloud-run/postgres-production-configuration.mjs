@@ -43,9 +43,10 @@
  * that names GCS_BUCKET_NAME requires it, as the OPS-2 bucket-birth receipt's
  * proof record for exactly that bucket (closed keys, decimal generations,
  * soft delete "0"), and returns it as resources.bucketHistoryProof. The
- * quarantine store needs it on a bucket with soft delete disabled; the
- * validator mirrors parseGcsQuarantineBucketHistoryProof in
- * src/gcs-quarantine-object-store.ts. The Cloudflare
+ * quarantine store needs it on a bucket with soft delete disabled. This
+ * validator (parseQuarantineBucketHistoryProof) is the one OD-2 grammar: the
+ * test host and the maintenance Job read the proof through it, and the
+ * store's own parser was removed (D-CRB). The Cloudflare
  * DELETION_LEDGER binding and the production deletion-ledger D1 name stay in
  * the absent-key and fingerprint lists: that is cutover hygiene, not a GCP
  * resource.
@@ -95,7 +96,7 @@ import {
   isEdgeServiceAccountEmail,
 } from "../src/edge-origin-contract.ts";
 import { assertPostgresScheduledMaintenanceEnabled } from "./postgres-maintenance-gate.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 // ---------------------------------------------------------------------------
 // Frozen production constants
@@ -112,6 +113,19 @@ export const PRODUCTION_POOL_SIZES = Object.freeze({
   data: 3,
   admission: 4,
   readiness: 1,
+});
+
+/**
+ * The PostgreSQL application_name each service pool sets (the production
+ * host's createIamPool calls). The OPS-4 runtime probe classifies sessions by
+ * these names (cloud-run/ops-probe-contract.mjs OPS_APPLICATION_CLASSES maps
+ * each to "origin"), so a renamed pool must change both; the probe check pins
+ * them equal.
+ */
+export const PRODUCTION_POOL_APPLICATION_NAMES = Object.freeze({
+  data: "tibotattle-origin-data",
+  admission: "tibotattle-origin-admission",
+  readiness: "tibotattle-origin-readiness",
 });
 
 /** The Cloud SQL instance each service pool opens: always the one primary. */
@@ -529,8 +543,10 @@ const IAM_ROLE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9@_.-]{0,62}$/u;
 // Mirrors bucketName in src/gcs-erasure-object-store.ts, without dots (a
 // dotted name is a domain-verified bucket, which this service never uses).
 const BUCKET_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{1,61}[a-z0-9])$/u;
-// OD-2: mirrors parseGcsQuarantineBucketHistoryProof
-// (src/gcs-quarantine-object-store.ts) and createGcsErasureBucketHistoryProof.
+// OD-2: the one grammar of the quarantine bucket's birth proof (D-CRB removed
+// the second copy from src/gcs-quarantine-object-store.ts). Its values are
+// the ones createGcsErasureBucketHistoryProof accepts, which the store
+// re-validates; the configuration check pins the two equal.
 export const QUARANTINE_BUCKET_HISTORY_PROOF_SETTING = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
 const BUCKET_HISTORY_PROOF_KEYS = Object.freeze([
   "bucket", "bucketGeneration", "bucketMetageneration", "softDeleteRetentionDurationSeconds",
@@ -609,9 +625,24 @@ function assertNoForbiddenVariables(environment) {
  * The value never reaches an error.
  */
 function quarantineBucketHistoryProof(environment, bucket) {
+  return parseQuarantineBucketHistoryProof(environment.required(QUARANTINE_BUCKET_HISTORY_PROOF_SETTING), bucket);
+}
+
+/**
+ * OD-2: parse one GCS_QUARANTINE_BUCKET_HISTORY_PROOF value for exactly
+ * `bucket`: the OPS-2 bucket-birth receipt's closed four-key proof record
+ * (decimal generations from 1, soft delete "0"), at most 1 KiB of JSON. The
+ * production profiles read it through resources.bucketHistoryProof, and the
+ * private test host (server.mjs) parses its own setting here, so the origin
+ * has one proof grammar. Throws GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID
+ * for anything else; the value never reaches the error.
+ */
+export function parseQuarantineBucketHistoryProof(raw, bucket) {
   const code = `${QUARANTINE_BUCKET_HISTORY_PROOF_SETTING}_INVALID`;
-  const raw = environment.required(QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
-  if (new TextEncoder().encode(raw).byteLength > BUCKET_HISTORY_PROOF_MAX_BYTES) configurationError(code);
+  if (typeof raw !== "string" || raw === "" || typeof bucket !== "string" || !BUCKET_PATTERN.test(bucket)
+      || new TextEncoder().encode(raw).byteLength > BUCKET_HISTORY_PROOF_MAX_BYTES) {
+    configurationError(code);
+  }
   let value;
   try { value = JSON.parse(raw); } catch { configurationError(code); }
   if (value === null || typeof value !== "object" || Array.isArray(value)
@@ -1123,6 +1154,16 @@ export function readProductionConfiguration(processEnv, profile) {
   });
   CONFIGURATIONS.add(configuration);
   return configuration;
+}
+
+/**
+ * True only for a configuration readProductionConfiguration issued. A frozen
+ * copy, a lookalike with the same keys and values, or any other value is
+ * false: the PostgreSQL route families admit the production origins only on
+ * this provenance (D-CRB, wave-3 host brief B2(a)).
+ */
+export function isProductionConfiguration(value) {
+  return value !== null && typeof value === "object" && CONFIGURATIONS.has(value);
 }
 
 /** Returns a secret's value from a handle this module issued. */

@@ -26,9 +26,11 @@ import {
   TELEMETRY_PRODUCTION_MAX_PAGE_ROWS,
   TelemetryProductionError,
   assertSealedClosure,
+  canonicalRow,
   canonicalSourceValue,
   col,
   defineTable,
+  readSourcePage,
   specTriggerPolicy,
 } from "./postgres-production-telemetry-engine.mjs";
 import { POSTGRES_TYPED_LEGACY_TRANSFER_LAYOUT } from "./postgres-typed-legacy-transfer.mjs";
@@ -314,6 +316,13 @@ test("the value codec: closed vocabulary, ranges, canonical JSON and content-fre
   assert.deepEqual(canonicalSourceValue("json", "{\"b\": 1, \"a\": [2, {\"z\": 1, \"y\": 2}]}", "t", "c"),
     ["{\"a\":[2,{\"y\":2,\"z\":1}],\"b\":1}", "{\"b\": 1, \"a\": [2, {\"z\": 1, \"y\": 2}]}"]);
   assert.throws(() => canonicalSourceValue("json", "{not json", "t", "c"), isCode("CUTOVER_SOURCE_VALUE_INVALID"));
+  // JSON text can spell what a jsonb column cannot hold (PostgreSQL: 22P05 for U+0000, 22P02 for an unpaired surrogate).
+  for (const text of ['{"a":"\\u0000"}', '{"\\u0000":1}', '["x",{"y":["\\u0000"]}]', '"\\u0000"', '{"a":"\\ud800"}', '{"a":"\\udc00x"}',
+    '{"a":"\\ud83d"}', '{"a":"\\ude00\\ud83d"}', '{"\\udfff":1}', '[["\\ud800"]]']) {
+    assert.throws(() => canonicalSourceValue("json", text, "t", "c"), isCode("CUTOVER_SOURCE_VALUE_INVALID"), text);
+  }
+  assert.deepEqual(canonicalSourceValue("json", '{"a":"\\ud83d\\ude00"}', "t", "c")[0], '{"a":"\u{1F600}"}');
+  assert.deepEqual(canonicalSourceValue("json", '{"a":"\\u0001"}', "t", "c")[0], '{"a":"\\u0001"}');
   assert.deepEqual(canonicalSourceValue("instant", "2026-04-17T10:00:00Z", "t", "c"), ["2026-04-17T10:00:00.000Z", "2026-04-17T10:00:00.000Z"]);
   assert.throws(() => canonicalSourceValue("instant", "2026-04-17 10:00:00", "t", "c"), isCode("CUTOVER_SOURCE_VALUE_INVALID"));
   assert.throws(() => canonicalSourceValue("day", "2026-02-30", "t", "c"), isCode("CUTOVER_SOURCE_VALUE_INVALID"));
@@ -360,6 +369,15 @@ test("every closed error code is declared, used and the only ones the modules th
   assert.equal(new TelemetryProductionError("CUTOVER_SOURCE_VALUE_INVALID", { table: "bad table", column: "ok_col", sqlState: "23505",
     guard: "telemetry_domain_immutable", stage: "typed-legacy" }).message,
   "CUTOVER_SOURCE_VALUE_INVALID [column=ok_col stage=typed-legacy sqlState=23505 guard=telemetry_domain_immutable]");
+});
+
+// A closed refusal nobody asserts is a refusal nobody notices losing: every declared code must be named by this check or by
+// the PostgreSQL acceptance spec (which needs the cluster, so the ratchet lives here, where it always runs).
+test("every closed error code is named by a negative test", async () => {
+  const tests = await Promise.all(["scripts/postgres-production-telemetry-modes.check.mjs", "postgres-test/postgres-production-telemetry-modes.spec.mjs"]
+    .map(file => readFile(resolve(WORKER_ROOT, file), "utf8")));
+  const unasserted = TELEMETRY_PRODUCTION_ERROR_CODES.filter(code => !tests.some(source => source.includes(`"${code}"`)));
+  assert.deepEqual(unasserted, [], "closed codes with no negative test");
 });
 
 test("arguments are closed for every stage: pages at most 256 rows and 4 MiB, a handle and hook functions", async () => {
@@ -485,6 +503,79 @@ test("a sealed file changed after the seal refuses before the target is touched,
     await assert.rejects(TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle: { sealManifestSha256: forged.sealId },
       sealManifestPath: forged.manifestPath }), isCode("CUTOVER_SEALED_SOURCE_CHANGED"), stage);
   }
+});
+
+/** One synthetic raw v1 record on the first chunk (the Q-1 corpus holds none), with the given record_json text. */
+function v1RecordSql(recordJson) {
+  return `${dropTriggers("telemetry_v1_records")}
+    INSERT INTO telemetry_v1_records(chunk_row_id, participant_id, device_id, stream, occurrence_id, observed_at, observed_day,
+        provider, model_id, session_uuid, plan_type, plan_variant, limit_id, slot, used_percent, window_duration_minutes, resets_at,
+        input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens, output_text_tokens, output_reasoning_tokens,
+        output_combined_tokens, record_json)
+      SELECT id, participant_id, device_id, stream, 'occurrence-synthetic-0001', created_at, chunk_day, 'openai', 'model-synthetic',
+        'session-synthetic', 'pro', NULL, 'limit-synthetic', 'primary', 12.5, 300, '2026-10-02T00:00:00Z', 10, 20, 30, 40, 50, 90,
+        '${recordJson}' FROM telemetry_v1_chunks ORDER BY id LIMIT 1`;
+}
+
+test("a JSON text that jsonb cannot hold refuses in the sealed-side preflight, before any page", async () => {
+  const handleFor = forged => ({ sealManifestSha256: forged.sealId });
+  // Control: the same forged record with storable JSON passes every sealed-source check and only then meets the target.
+  const control = await forgeVariantSeal(seal, `${PREFIX}\n${v1RecordSql('{"b":2,"a":[1,{"d":4,"c":3}]}')}`);
+  await assert.rejects(TELEMETRY_PRODUCTION_RUNNERS["telemetry-v1-v11"]({ handle: handleFor(control), sealManifestPath: control.manifestPath }),
+    isCode("CUTOVER_TARGET_HANDLE_INVALID"));
+  for (const record of ['{"a":"\\u0000"}', '{"a":"\\ud800"}', '{"\\udc00":1}']) {
+    const forged = await forgeVariantSeal(seal, `${PREFIX}\n${v1RecordSql(record)}`);
+    await assert.rejects(TELEMETRY_PRODUCTION_RUNNERS["telemetry-v1-v11"]({ handle: handleFor(forged), sealManifestPath: forged.manifestPath }),
+      error => {
+        assert.ok(error instanceof TelemetryProductionError, record);
+        assert.equal(error.message, "CUTOVER_SOURCE_VALUE_INVALID [table=telemetry_v1_records column=record_json]", record);
+        return true;
+      }, record);
+  }
+});
+
+/** The first-largest inserted row of a stage's specs, by the engine's own size measure. */
+function largestRow(stage) {
+  const database = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
+  try {
+    let best = { size: 0, table: null };
+    for (const item of TELEMETRY_PRODUCTION_DEFINITIONS[stage].items) {
+      if (item.kind !== "table" || item.spec.mode !== "insert") continue;
+      let after = null;
+      for (;;) {
+        const page = readSourcePage(database, item.spec, after, 256);
+        for (const { row, key } of page) {
+          const size = canonicalRow(item.spec, row).size;
+          if (size > best.size) best = { size, table: item.spec.sealedTable };
+          after = key;
+        }
+        if (page.length < 256) break;
+      }
+    }
+    return best;
+  } finally {
+    database.close();
+  }
+}
+
+test("an inserted row larger than one page refuses in the sealed-side preflight, before the target is touched", async () => {
+  const handle = { sealManifestSha256: seal.manifest.sealId };
+  const run = (stage, pageBytes) => TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: manifestPath, pageBytes });
+  for (const stage of ["telemetry-v1-v11", "telemetry-v12"]) {
+    const largest = largestRow(stage);
+    assert.ok(largest.size > 1024 && largest.size < TELEMETRY_PRODUCTION_MAX_PAGE_BYTES, `${stage} holds a row between 1 KiB and a page`);
+    // The boundary is exact: a budget equal to the largest row passes every sealed-source check and meets the target.
+    await assert.rejects(run(stage, largest.size), isCode("CUTOVER_TARGET_HANDLE_INVALID"), `${stage} at the largest row`);
+    await assert.rejects(run(stage, largest.size - 1), error => {
+      assert.ok(error instanceof TelemetryProductionError);
+      assert.equal(error.code, "CUTOVER_PAGE_ROW_TOO_LARGE");
+      assert.equal(error.message, `CUTOVER_PAGE_ROW_TOO_LARGE [table=${largest.table}]`);
+      return true;
+    }, `${stage} one byte under the largest row`);
+  }
+  // A stage whose rows are all small is not refused by the smallest legal budget.
+  assert.ok(largestRow("typed-legacy").size < 1024);
+  await assert.rejects(run("typed-legacy", 1024), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
 });
 
 test("a refusal is content-free: no sealed value reaches the error", async () => {

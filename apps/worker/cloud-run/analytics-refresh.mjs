@@ -143,7 +143,7 @@ import {
   FASTPATH_TEST_SCHEMA_PREFIXES,
   isFastpathTestSchema,
 } from "./origin-fastpath-mode.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 /** Mirrors contract.ts ANALYTICS_V2_REFRESH_ENTRY; the spec pins the equality. */
 export const ANALYTICS_REFRESH_ENTRY = "analytics-refresh";

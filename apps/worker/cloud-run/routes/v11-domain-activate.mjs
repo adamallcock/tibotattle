@@ -22,6 +22,7 @@ import {
   routeConfigurationError,
   routeErrorResponse,
   validateDeviceRouteDependencies,
+  routeRequestId,
 } from "./v11-route-support.mjs";
 
 export const TELEMETRY_V11_DOMAIN_ACTIVATE_PATH = "/api/v1/me/telemetry-v11/domain-activate";
@@ -41,7 +42,7 @@ export function createTelemetryV11DomainActivateRouteModule(dependencies) {
         { participantId: device.participantId, deviceId: device.deviceId }, body.value, Date.now(),
       ));
     } catch (error) {
-      return routeErrorResponse(error);
+      return routeErrorResponse(error, routeRequestId(deps, request));
     }
   }
 
