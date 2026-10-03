@@ -9,6 +9,7 @@
 // found by scanning the GCP code (see COPY_ROOTS): a read schema version, a
 // band list or a counter list there must hold the whole kernel vocabulary, so
 // a copy added later, or one that arrives with another branch, is checked too.
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +42,19 @@ import { ANALYTICS_V2_CACHE_BANDS } from "../src/analytics-v2/store";
 const WORKER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MIGRATION = "0059_analytics_v2.sql";
 const MIGRATION_DIRECTORIES = ["postgres/migrations/primary", "postgres/staged-migrations/primary"];
+
+/**
+ * Later primary migrations that name an analytics_v2 table the closed sets live
+ * on without restating a set, reviewed and pinned by the sha256 of their bytes
+ * (an edit re-arms the guard). K-CORE-A's run stamps (0069) add the kernel_id
+ * and manifest_version stamp columns and their NOT VALID checks to the seven
+ * analytics_v2 tables, analytics_v2_cache_bands and analytics_v2_owner_day
+ * among them; it adds no counter, band or refusal column and no CHECK on one.
+ * Reviewed where K-VENDOR2's spec met it, at the PROD-PREP merge.
+ */
+const REVIEWED_LATER_MIGRATIONS: Readonly<Record<string, string>> = {
+  "0069_analytics_v2_run_stamps.sql": "97d4ef47627dec182f61eb5f94478e5cd2e5f87d6044d891f4d756155170e59d",
+};
 
 /**
  * Refusal reasons that are the fast path's own, raised by GCP code and by no
@@ -165,7 +179,24 @@ describe("GCP-only vocabularies equal the vendored kernels'", () => {
     // set or the counter columns makes 0059 no longer the whole authority this
     // spec reads: point the spec at that migration.
     for (const path of later) {
-      expect(touchesClosedSet(readFileSync(path, "utf8")), `${path} touches a closed analytics_v2 set; repoint this spec at it`).toBe(false);
+      const text = readFileSync(path, "utf8");
+      const reviewed = REVIEWED_LATER_MIGRATIONS[path.split(sep).at(-1)!];
+      if (reviewed !== undefined) {
+        expect(createHash("sha256").update(text).digest("hex"), `${path} changed since its review`).toBe(reviewed);
+        continue;
+      }
+      expect(touchesClosedSet(text), `${path} touches a closed analytics_v2 set; repoint this spec at it`).toBe(false);
+    }
+  });
+
+  it("a reviewed later migration restates no closed set: no band, refusal or counter column", () => {
+    for (const name of Object.keys(REVIEWED_LATER_MIGRATIONS)) {
+      const text = readFileSync(join(WORKER_ROOT, "postgres/migrations/primary", name), "utf8");
+      const code = text.split("\n").filter((line) => !line.trimStart().startsWith("--")).join("\n");
+      expect(named(code, "band"), `${name} names the band column`).toBe(-1);
+      expect(named(code, "refusal"), `${name} names the refusal column`).toBe(-1);
+      for (const counter of KERNEL_CACHE_BAND_COUNTERS) expect(named(code, counter), `${name} names ${counter}`).toBe(-1);
+      expect(/\bbigint\b/i.test(code), `${name} adds a bigint column`).toBe(false);
     }
   });
 
