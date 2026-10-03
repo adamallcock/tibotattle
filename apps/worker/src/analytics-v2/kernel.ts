@@ -31,6 +31,20 @@
  *   kernel that states another one. A bundle that states none (a spec
  *   running the sources unbundled) records null: no compatibility claim.
  *
+ * - The pricing class (W1E, refresh optimization program section 3.2.1;
+ *   owner decision round 18: a row is priced once per pricing version) is
+ *   (pricer_sha256, the pricing method version, the price-input projection
+ *   version, cards_sha256). The pricer digest and method version are
+ *   computed at build time from a tree-shaken pass over the pricing
+ *   functions alone (cloud-run/analytics-kernel-closure.mjs) and stamped
+ *   through two more defines; every pricer input is a closure input, so a
+ *   registry entry pins its pricing class. It is narrower than the compute
+ *   class: a kernel bump that changes no pricing code keeps the class, and
+ *   its transition is proven by that identity with a sampled reprice
+ *   (store-price.ts) instead of a full reprice. A bundle that states no
+ *   pricer (a spec running the sources unbundled) has an unknown class,
+ *   which is never equal to another: every transition then reprices in full.
+ *
  * Every analytics_v2 row a run writes carries its kernel_id and
  * manifest_version (staged migration analytics_v2_run_stamps; the store
  * refuses ANALYTICS_V2_KERNEL_CONFLICT for a registry entry that disagrees
@@ -46,6 +60,8 @@ import registryJson from "./kernel-registry.json";
 declare const __ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__: string | undefined;
 declare const __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__: string | undefined;
 declare const __ANALYTICS_V2_COMPUTE_SHA256__: string | undefined;
+declare const __ANALYTICS_V2_PRICER_SHA256__: string | undefined;
+declare const __ANALYTICS_V2_PRICING_METHOD_VERSION__: string | undefined;
 
 /**
  * The GCP orchestration method (pin, digests, memo and owner-set rules). A
@@ -59,6 +75,8 @@ export const ANALYTICS_V2_KERNEL_REGISTRY_VERSION = "analytics-v2-kernel-registr
 export const ANALYTICS_V2_COMPATIBILITY_METHOD = "analytics-v2-compatibility-v1" as const;
 /** PostgreSQL smallint: the kernel id column's range. */
 export const ANALYTICS_V2_MAX_KERNEL_ID = 32_767;
+/** W1E: the pricing class's digest method (analyticsV2PricingClass). */
+export const ANALYTICS_V2_PRICING_CLASS_METHOD = "analytics-v2-pricing-class-v1" as const;
 
 export type AnalyticsV2KernelErrorCode =
   | "ANALYTICS_V2_KERNEL_REGISTRY_INVALID"
@@ -89,6 +107,25 @@ export interface AnalyticsV2KernelIdentity {
   readonly methodVersion: string;
   /** The compute class (the closure without the vendored price registry); absent when unknown. */
   readonly computeSha256?: string;
+  /** W1E: the pricer digest and the pricing method version it was built with; absent when unknown. */
+  readonly pricerSha256?: string;
+  readonly pricingMethodVersion?: string;
+}
+
+/** W1E: the pricing code a bundle prices with (see the module comment). */
+export interface AnalyticsV2Pricer {
+  readonly pricerSha256: string;
+  readonly pricingMethodVersion: string;
+}
+
+/** W1E: the version key a row's price is cached under. */
+export interface AnalyticsV2PricingClass {
+  /** sha256 over the method and the four components. */
+  readonly classSha256: string;
+  readonly pricerSha256: string;
+  readonly pricingMethodVersion: string;
+  readonly projectionVersion: string;
+  readonly cardsSha256: string;
 }
 
 /** The stamp one run writes on every row (kernel and manifest) and on its run row (compatibility). */
@@ -103,6 +140,7 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
 const METHOD = /^analytics-v2-method-v[1-9][0-9]{0,5}$/u;
+const PROJECTION = /^analytics-v2-price-input-v[1-9][0-9]{0,5}$/u;
 const ENTRY_KEYS = "computeClosureSha256,kernelId,methodVersion,priceRegistrySha256,priceRegistryVersion,productionCommit,vendorManifestSha256";
 
 function registryFail(): never {
@@ -152,6 +190,49 @@ export function analyticsV2KernelRegistry(value: unknown = registryJson): readon
   return Object.freeze(entries);
 }
 
+/** A pricer with a well-formed digest and method version; ANALYTICS_V2_KERNEL_REGISTRY_INVALID otherwise. */
+export function validAnalyticsV2Pricer(value: unknown): AnalyticsV2Pricer {
+  const pricer = value as Record<string, unknown> | null;
+  if (pricer === null || typeof pricer !== "object" || Array.isArray(pricer)
+      || Object.keys(pricer).sort().join(",") !== "pricerSha256,pricingMethodVersion"
+      || typeof pricer.pricerSha256 !== "string" || !SHA256.test(pricer.pricerSha256)
+      || typeof pricer.pricingMethodVersion !== "string" || !TOKEN.test(pricer.pricingMethodVersion)) {
+    registryFail();
+  }
+  return Object.freeze({ pricerSha256: pricer!.pricerSha256 as string,
+    pricingMethodVersion: pricer!.pricingMethodVersion as string });
+}
+
+/** The pricer a bundle was built with, or null when it stated none (sources run unbundled): an unknown class. */
+export function analyticsV2BundledPricer(): AnalyticsV2Pricer | null {
+  const pricer = typeof __ANALYTICS_V2_PRICER_SHA256__ === "string" ? __ANALYTICS_V2_PRICER_SHA256__ : null;
+  const method = typeof __ANALYTICS_V2_PRICING_METHOD_VERSION__ === "string"
+    ? __ANALYTICS_V2_PRICING_METHOD_VERSION__ : null;
+  if (pricer === null || method === null || !SHA256.test(pricer) || !TOKEN.test(method)) return null;
+  return Object.freeze({ pricerSha256: pricer, pricingMethodVersion: method });
+}
+
+/**
+ * The pricing class of `pricer` pricing projection `projectionVersion` with
+ * the cards whose set digest is `cardsSha256` (price-attribution.ts
+ * analyticsV2PriceCardSetSha256). Equal classes price every stored input
+ * identically; the class names no kernel.
+ */
+export async function analyticsV2PricingClass(input: {
+  readonly pricer: AnalyticsV2Pricer; readonly projectionVersion: string; readonly cardsSha256: string;
+}): Promise<AnalyticsV2PricingClass> {
+  const pricer = validAnalyticsV2Pricer(input?.pricer);
+  if (typeof input.projectionVersion !== "string" || !PROJECTION.test(input.projectionVersion)
+      || typeof input.cardsSha256 !== "string" || !SHA256.test(input.cardsSha256)) {
+    registryFail();
+  }
+  const classSha256 = await sha256Hex(canonicalJson([ANALYTICS_V2_PRICING_CLASS_METHOD, pricer.pricerSha256,
+    pricer.pricingMethodVersion, input.projectionVersion, input.cardsSha256]));
+  return Object.freeze({ classSha256, pricerSha256: pricer.pricerSha256,
+    pricingMethodVersion: pricer.pricingMethodVersion, projectionVersion: input.projectionVersion,
+    cardsSha256: input.cardsSha256 });
+}
+
 /** The identity a bundle was built with, or null outside a build (sources run unbundled). */
 export function analyticsV2BundledKernelIdentity(): AnalyticsV2KernelIdentity | null {
   const closure = typeof __ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__ === "string"
@@ -161,8 +242,10 @@ export function analyticsV2BundledKernelIdentity(): AnalyticsV2KernelIdentity | 
   if (closure === null || manifest === null) return null;
   const compute = typeof __ANALYTICS_V2_COMPUTE_SHA256__ === "string" && SHA256.test(__ANALYTICS_V2_COMPUTE_SHA256__)
     ? __ANALYTICS_V2_COMPUTE_SHA256__ : null;
+  const pricer = analyticsV2BundledPricer();
   return Object.freeze({ vendorManifestSha256: manifest, computeClosureSha256: closure,
-    methodVersion: ANALYTICS_V2_METHOD_VERSION, ...(compute === null ? {} : { computeSha256: compute }) });
+    methodVersion: ANALYTICS_V2_METHOD_VERSION, ...(compute === null ? {} : { computeSha256: compute }),
+    ...(pricer === null ? {} : pricer) });
 }
 
 /** The registry entry naming `identity`; ANALYTICS_V2_KERNEL_UNREGISTERED when none does. */
