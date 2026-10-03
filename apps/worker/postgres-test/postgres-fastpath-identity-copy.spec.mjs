@@ -17,6 +17,8 @@ import {
   fastpathTransportAllowlistSha256,
   openSealedFastpathIdentitySource,
   POSTGRES_FASTPATH_IDENTITY_ALLOWLIST,
+  POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS,
+  POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING,
   POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT,
   POSTGRES_FASTPATH_IDENTITY_TARGET_SCHEMA_PREFIX,
   POSTGRES_FASTPATH_TRANSPORT_ALLOWLIST,
@@ -828,6 +830,35 @@ test("the rehearsal transport parts copy the checkout's D1 layout, refuse unknow
     await client.query("RESET session_replication_role").catch(() => {});
     client.release();
   }
+});
+
+test("T-1 and the transport parts bound every source table: 1,000,000 rows by default, an explicit bound only up to the ceiling", {
+  skip: !PG_TEST_SOCKET,
+}, async () => {
+  // The default is unchanged; only the production-shaped measurement
+  // (scripts/gcp-fastpath-prod-shape) raises it, explicitly.
+  assert.equal(POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS, 1_000_000);
+  assert.equal(POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING, 20_000_000);
+  const fixture = await sealedFixture();
+  const database = await pool();
+  const schema = await rehearsalSchema();
+  for (const maxTableRows of [0, -1, 1.5, "100", null, POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING + 1]) {
+    await assert.rejects(runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: schema,
+      maxTableRows }), { code: "FASTPATH_IDENTITY_MAX_TABLE_ROWS_INVALID" }, String(maxTableRows));
+    await assert.rejects(runPostgresFastpathTransportCopy({ source: fixture.source, pool: database, targetSchema: schema,
+      part: "legacy-transport", maxTableRows }), { code: "FASTPATH_IDENTITY_MAX_TABLE_ROWS_INVALID" }, String(maxTableRows));
+  }
+  // A bound below a source table's selected rows refuses before any write.
+  await assert.rejects(runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: schema,
+    maxTableRows: 1 }), { code: "FASTPATH_IDENTITY_SOURCE_TOO_LARGE" });
+  assert.deepEqual(Object.values(await tableCounts(schema, ["participants"])), [0]);
+  // The ceiling itself is accepted and copies exactly what the default copies.
+  const receipt = await runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: schema,
+    maxTableRows: POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING });
+  assert.equal(receipt.status, "rehearsal_identity_copy_complete");
+  const reference = await rehearsalSchema();
+  const defaults = await runPostgresFastpathIdentityCopy({ source: fixture.source, pool: database, targetSchema: reference });
+  assert.deepEqual(receipt.tables, defaults.tables);
 });
 
 test("T-1 refuses an unknown NOT NULL source or target column", { skip: !PG_TEST_SOCKET }, async () => {

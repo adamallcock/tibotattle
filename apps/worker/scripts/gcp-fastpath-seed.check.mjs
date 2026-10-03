@@ -102,6 +102,39 @@ test("seed runs only from a checkout equal to the commit in stages, migrations a
   assert.equal(goldenPath(), GOLDEN);
 });
 
+test("a --sealed-corpus seed has no golden: its importer files must exist at the commit and equal the checkout", () => {
+  const corpusPaths = [...GCP_FASTPATH_SEED.sealedCorpusPaths];
+  assert.deepEqual(corpusPaths, ["apps/worker/scripts/gcp-fastpath-prod-shape/import-corpus.mjs",
+    "apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape-corpus.mjs",
+    "apps/worker/scripts/postgres-fastpath-identity-copy.mjs"]);
+  const present = [...ALL_STAGES, ...corpusPaths];
+  const plan = planSeed(COMMIT, { spawn: fakeGit({ present }), sealedCorpus: true });
+  assert.equal(plan.decision, "run");
+  assert.equal(plan.golden, null);
+  // A golden-mode plan of the same commit still needs its golden.
+  assert.equal(planSeed(COMMIT, { spawn: fakeGit({ present }) }).decision, "skip");
+  const missing = planSeed(COMMIT, { spawn: fakeGit({ present: present.filter((path) => path !== corpusPaths[0]) }),
+    sealedCorpus: true });
+  assert.equal(missing.decision, "skip");
+  assert.match(missing.reason, /sealed-corpus importer \(apps\/worker\/scripts\/gcp-fastpath-prod-shape\/import-corpus\.mjs\)/u);
+  for (const dirty of [...corpusPaths, stagePath("v12"), "apps/worker/postgres/migrations"]) {
+    const refused = planSeed(COMMIT, { spawn: fakeGit({ present, dirty: [dirty] }), sealedCorpus: true });
+    assert.equal(refused.decision, "refuse", dirty);
+  }
+});
+
+test("--sealed-corpus excludes --corpus, --golden and --dump", async () => {
+  await assert.rejects(runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: "/nonexistent", dump: "/nonexistent.json",
+    log: () => {} }), (error) => error?.code === "GCP_FASTPATH_SEED_ARGUMENT_INVALID");
+  const script = fileURLToPath(new URL("./gcp-fastpath-seed.mjs", import.meta.url));
+  for (const other of ["--corpus=dense", "--golden=apps/worker/analytics-v2-test/golden", "--dump=/nonexistent.json"]) {
+    const run = spawnSync(process.execPath, [script, "seed", "--target=gcp-fastpath", "--commit=HEAD",
+      "--sealed-corpus=/nonexistent", other], { encoding: "utf8" });
+    assert.equal(run.status, 1, other);
+    assert.match(run.stderr, /GCP_FASTPATH_SEED_ARGUMENT_INVALID/u, other);
+  }
+});
+
 test("--corpus selects a committed golden; the dense golden's dump must match its pinned digest", async () => {
   assert.equal(corpusGolden("q1"), GCP_FASTPATH_SEED.defaultGolden);
   assert.equal(corpusGolden("dense"), "apps/worker/analytics-v2-test/golden-dense");
@@ -561,3 +594,38 @@ test("PG17 over TCP: the seed's chain passes the cloud-target exception as a non
       }
     });
 });
+
+test("PG17: a --sealed-corpus seed imports a production-shaped corpus through the same chain, idempotently",
+  { skip: LOCAL_SKIP || (!process.env.MEAS_SYNTH_CORPUS
+    && "needs MEAS_SYNTH_CORPUS (a scripts/gcp-fastpath-prod-shape/seed-source.mjs work directory)"),
+  timeout: 3_600_000 }, async () => {
+    const options = await localPoolOptions();
+    const admin = new pg.Pool({ ...options, max: 1 });
+    admin.on("error", () => {});
+    const database = `meas_synth_seedcheck_${randomBytes(4).toString("hex")}`;
+    let pool = null;
+    try {
+      await admin.query(`CREATE DATABASE "${database}"`);
+      pool = new pg.Pool({ ...options, database, max: 4 });
+      pool.on("error", () => {});
+      const dependencies = { spawn: cleanCheckoutGit, createPool: async () => ({ pool, identity: options.user,
+        close: async () => {} }), expectedOwner: null, grantRuntime: async () => {}, readBack: async (schema) => ({ schema }) };
+      const first = await runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: process.env.MEAS_SYNTH_CORPUS,
+        dependencies, log: () => {} });
+      assert.equal(first.status, "seeded");
+      assert.equal(first.nowIso, "2026-10-01T12:46:00.000Z");
+      assert.equal(first.sealedCorpus.sealedSha256, first.dumpSha256);
+      assert.deepEqual({ ...first.sourceIdentity }, { sourceId: "gcp-fastpath-oracle", sourceNamespace: "gcp-fastpath-oracle" });
+      for (const [name, entry] of Object.entries(first.steps.importVerification)) assert.equal(entry.equal, true, name);
+      assert.ok(first.steps.analyze.tables > 0);
+      assert.equal(first.steps.maxSourceTableRows, 20_000_000);
+      const again = await runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: process.env.MEAS_SYNTH_CORPUS,
+        dependencies, log: () => {} });
+      assert.equal(again.status, "already-seeded");
+      assert.equal(again.schema, first.schema);
+    } finally {
+      await pool?.end().catch(() => {});
+      await admin.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`).catch(() => {});
+      await admin.end().catch(() => {});
+    }
+  });

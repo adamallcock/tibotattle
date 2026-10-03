@@ -88,6 +88,14 @@ export const POSTGRES_FASTPATH_IDENTITY_COPY_SCHEMA = "postgres-fastpath-identit
 export const POSTGRES_FASTPATH_IDENTITY_SOURCE_COMMIT = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
 export const POSTGRES_FASTPATH_IDENTITY_TARGET_SCHEMA_PREFIX = POSTGRES_TYPED_LEGACY_TARGET_SCHEMA_PREFIX;
 export const POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS = 1_000_000;
+/**
+ * The largest per-table bound a caller may pass as `maxTableRows`. Each copy
+ * holds a whole table in memory, so the default stays 1,000,000 rows; only a
+ * measurement that loads a production-scale synthetic corpus (MEAS-SYNTH,
+ * scripts/gcp-fastpath-prod-shape) raises it explicitly, and runs with a heap
+ * sized for it.
+ */
+export const POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING = 20_000_000;
 
 const HISTORY_TABLE = "_tibotattle_migration_history";
 const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -782,11 +790,21 @@ function assertSourceLayout(database, spec) {
   return unknownNullable.sort();
 }
 
-function readSourceTable(database, spec) {
+/** The per-table row bound of one copy: the default, or an explicit value up to the ceiling. */
+function tableRowBound(maxTableRows) {
+  if (maxTableRows === undefined) return POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS;
+  if (!Number.isSafeInteger(maxTableRows) || maxTableRows < 1
+      || maxTableRows > POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS_CEILING) {
+    fail("FASTPATH_IDENTITY_MAX_TABLE_ROWS_INVALID");
+  }
+  return maxTableRows;
+}
+
+function readSourceTable(database, spec, maxTableRows = POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS) {
   const where = spec.selection.where === null ? "" : ` WHERE ${spec.selection.where}`;
   const [{ total }] = sourceAll(database, `SELECT count(*) AS total FROM ${quote(spec.name)}`, spec.name);
   const [{ selected }] = sourceAll(database, `SELECT count(*) AS selected FROM ${quote(spec.name)}${where}`, spec.name);
-  if (BigInt(selected) > BigInt(POSTGRES_FASTPATH_IDENTITY_MAX_TABLE_ROWS)) fail("FASTPATH_IDENTITY_SOURCE_TOO_LARGE", { table: spec.name });
+  if (BigInt(selected) > BigInt(maxTableRows)) fail("FASTPATH_IDENTITY_SOURCE_TOO_LARGE", { table: spec.name });
   for (const [column, expected] of Object.entries(spec.verifiedConstants)) {
     const rows = sourceAll(database, `SELECT count(*) AS n FROM ${quote(spec.name)} WHERE ${quote(column)} IS NOT ?`,
       spec.name, [expected]);
@@ -1116,6 +1134,7 @@ export async function runPostgresFastpathIdentityCopy({
   omitFamilies = [],
   publicSourceOwnerParity = "require",
   migrationsRoot = undefined,
+  maxTableRows = undefined,
 } = {}) {
   const schema = validateTargetSchema(targetSchema);
   const trusted = trustedSource(source);
@@ -1123,6 +1142,7 @@ export async function runPostgresFastpathIdentityCopy({
   if (publicSourceOwnerParity !== "require" && publicSourceOwnerParity !== "defer") {
     fail("FASTPATH_IDENTITY_PARITY_MODE_INVALID");
   }
+  const rowBound = tableRowBound(maxTableRows);
   const tables = selectedTables(omitFamilies);
   await trusted.verifySnapshot();
   const database = trusted.database();
@@ -1131,7 +1151,7 @@ export async function runPostgresFastpathIdentityCopy({
     const unknown = assertSourceLayout(database, spec);
     if (unknown.length > 0) unknownNullableColumns[spec.name] = unknown;
   }
-  const sourceTables = new Map(tables.map(spec => [spec.name, readSourceTable(database, spec)]));
+  const sourceTables = new Map(tables.map(spec => [spec.name, readSourceTable(database, spec, rowBound)]));
   const sourcePublicOwners = readSourcePublicOwners(database);
   await trusted.verifySnapshot();
 
@@ -1276,11 +1296,13 @@ export async function runPostgresFastpathTransportCopy({
   targetSchema,
   part,
   migrationsRoot = undefined,
+  maxTableRows = undefined,
 } = {}) {
   const schema = validateTargetSchema(targetSchema);
   const trusted = trustedSource(source);
   if (!pool || typeof pool.connect !== "function") fail("FASTPATH_IDENTITY_TARGET_POOL_REQUIRED");
   if (typeof part !== "string" || !Object.hasOwn(TRANSPORT_PARTS, part)) fail("FASTPATH_TRANSPORT_PART_INVALID");
+  const rowBound = tableRowBound(maxTableRows);
   const tables = TRANSPORT_PARTS[part];
   await trusted.verifySnapshot();
   const database = trusted.database();
@@ -1289,7 +1311,7 @@ export async function runPostgresFastpathTransportCopy({
     const unknown = assertSourceLayout(database, spec);
     if (unknown.length > 0) unknownNullableColumns[spec.name] = unknown;
   }
-  const sourceTables = new Map(tables.map(spec => [spec.name, readSourceTable(database, spec)]));
+  const sourceTables = new Map(tables.map(spec => [spec.name, readSourceTable(database, spec, rowBound)]));
   await trusted.verifySnapshot();
   const copied = await copyTablesInOneTransaction({
     trusted, pool, schema, tables, layoutTables: tables, sourceTables, migrationsRoot,
