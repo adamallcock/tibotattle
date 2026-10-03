@@ -167,3 +167,49 @@ on this branch:
   up there.
 - Not proven: any live seal, export or ledger read. The provider has never
   been contacted by the seal.
+
+## Integration into the fast-path final line (2026-10-03)
+
+`claude/gcp-fastpath-final` at `1e65504c` merged this branch at `62a438c5`
+with `git merge --no-ff` (merge commit `d83a12fa`). Local and synthetic only:
+macOS arm64, Node 26.2.0, the fan-out PostgreSQL 17 cluster on port 55433.
+Nothing was pushed or deployed and no provider was contacted.
+
+Conflicts and their resolution:
+
+- `postgres-test/gcp-load-test.spec.mjs`, `scripts/gcp-load-test.mjs` and
+  `scripts/gcp-load-test.check.mjs`: deleted here, edited on the final line
+  (the C-SIMP integrator's `092dff19` spec repair and a D-CRB comment
+  refresh). Those edits only kept the retired harness working, so the files
+  are removed, as LOADTEST-RETIRE intends.
+- `apps/worker/package.json`: `gcp:load-test`, `:check` and `:local` and the
+  trailing `npm run gcp:load-test:check` in `edge:e2e:check` are gone; the
+  final line's `gcp:origin-smoke:check` is kept.
+- `apps/worker/cloud-run/infra/README.md`: this branch's staging row (the
+  staging migrate-and-roll proof, no load test) with the final line's
+  PROD-PREP production row, schema row and `monitoring.md` row.
+
+Integration fix, committed separately as `573a4a74`: STG-PREP's
+`cloud-run/staging-service.template.yaml`, which reached the final line after
+this branch was cut, still said the staging load test (OPS-11) measures the
+production shape. The comment now names the staging proof that replaced it.
+No other tracked file outside dated receipts names the harness or its scripts.
+
+No migration is added by this branch and none is staged on the final line, so
+nothing was promoted; the primary chain still ends at `0070`.
+
+| Command (merged tree, `573a4a74`) | Result |
+|---|---|
+| `npm run scripts:check` (apps/worker) | pass, 1,069/1,069 (includes `edge:e2e:check` without the load-test check) |
+| `npm run gcp:ops:infra:check` (apps/worker) | pass, 335/335 |
+| `npm run postgres:cutover-seal:check` (apps/worker) | pass, 104/104, 0 skipped; `cutover-source-seal.check.mjs` alone 19/19, 0 skipped (pinned commits present) |
+| `npm run catalog:manifest:check` (apps/worker) | pass, 9/9, manifest check `ok` |
+| `node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs` | pass, 71/71 |
+| `node apps/worker/scripts/ci-postgres-suite.mjs --plan` | no failures |
+| `vitest run --config vitest.postgres.config.ts` on `cutover-source-seal-rehearsal`, `postgres-identity-authority-transfer`, `postgres-legacy-contribution-transfer` and `postgres-production-telemetry-modes` (the specs that use the changed W2-SEAL fixture), fan-out PG17 | 4 files, 42/42; no `w2_seal` database or role left behind |
+| `npm run test:preflight` (root) | pass |
+| `npm run architecture:check` (root) | pass: 965 production files, 4,129 imports, 0 approved debt edges |
+
+No pre-existing failure was met. Still not proven: a hosted GitHub Actions run
+of `cloud-run-check` with full history, and the owner command pack correction
+listed under Open items.
