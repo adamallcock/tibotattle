@@ -16,6 +16,10 @@ import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfi
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
+// Round 15 (C3): the committed file carries no refresh cadence. A test that needs a set one
+// uses this synthetic value, which lives in the test only.
+const SYNTHETIC_CADENCE = "40 6 * * 2";
+
 const IMAGE = Object.freeze({ imageDigest: "c".repeat(64), sourceCommit: "d".repeat(40) });
 const PROOF = Object.freeze({ bucketGeneration: "1790000000000001", bucketMetageneration: "1" });
 const KEPT_SECRETS = Object.freeze(["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK",
@@ -61,23 +65,26 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   const ids = executable(first);
   // Six accounts, the verifier grant, the custom role, six project bindings,
   // the repository and its writer binding, four secrets and their accessor
-  // bindings, Cloud SQL with its database and two IAM users, the logging
-  // exclusion, and the trigger created and paused at once.
-  assert.equal(ids.length, 31, ids.join("\n"));
+  // bindings, Cloud SQL with its database and two IAM users, and the logging
+  // exclusion. The trigger is not among them: round 15 (C3) leaves the refresh
+  // cadence to the production-scale measurement, so the committed schedule is
+  // null and its create is deferred (SCHEDULER_CADENCE_UNSET), with no pause.
+  assert.equal(ids.length, 29, ids.join("\n"));
   for (const id of ["custom-role:create", "artifact-registry:create", "cloud-sql:create", "cloud-sql-database:create",
     "cloud-sql-user:create:runtime", "cloud-sql-user:create:migrator", "logging-exclusion:create",
-    "scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh",
     "verifier-iam:bind:roles/iam.serviceAccountTokenCreator|user:adamallcock@gmail.com|"]) {
     assert.ok(ids.includes(id), id);
   }
-  assert.ok(ids.indexOf("scheduler:create:analytics-refresh") + 1 === ids.indexOf("scheduler:pause:analytics-refresh"));
+  assert.deepEqual(ids.filter((id) => id.startsWith("scheduler:")), []);
   for (const name of KEPT_SECRETS) assert.ok(ids.includes(`secret:create:${name}`), name);
+  assert.equal(deferred(first).length, 7);
   assert.deepEqual(deferred(first), [
     "run-service:create:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
     "run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED",
     "run-job:create:analytics-refresh:BOOTSTRAP_IMAGE_REQUIRED",
+    "scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|:BOOTSTRAP_IMAGE_REQUIRED",
   ]);
   const argv = first.operations.map((entry) => entry.argv.join(" ")).join("\n");
@@ -88,15 +95,16 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   const users = first.operations.filter((entry) => entry.id.startsWith("cloud-sql-user:create:"));
   assert.deepEqual(users.map((entry) => entry.argv[3]),
     ["tibotattle-runtime@tibotattle-prod.iam", "tibotattle-migrator@tibotattle-prod.iam"]);
-  assert.ok(first.operations.find((entry) => entry.id === "scheduler:create:analytics-refresh").argv
-    .includes("--schedule=15 2 * * *"));
+  // The deferred trigger create carries no schedule flag: it cannot be applied as it stands.
+  const trigger = first.operations.find((entry) => entry.id === "scheduler:create:analytics-refresh");
+  assert.equal(trigger.deferred, "SCHEDULER_CADENCE_UNSET");
+  assert.equal(trigger.argv.some((argument) => argument.startsWith("--schedule=")), false);
 
   const applied = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
-  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 0, deferred: 6, refused: 0 });
-  // The trigger exists and is paused; the scheduler account cannot run any job yet.
-  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state]),
-    [["tibotattle-analytics-refresh-trigger", "PAUSED"]]);
+  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 0, deferred: 7, refused: 0 });
+  // No trigger exists, so none can run anything; the scheduler account cannot run any job yet either.
+  assert.deepEqual(world.schedulerJobs, []);
   assert.deepEqual(world.secrets.map((secret) => secret.name.split("/").at(-1)).sort(), [...KEPT_SECRETS].sort());
 
   // The owner adds the owner-held versions and the main session the new random one; then the pins.
@@ -121,7 +129,8 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|:SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET",
     "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|:SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET",
   ]);
-  assert.deepEqual(world.schedulerJobs.map((job) => job.state), ["PAUSED"]);
+  // Pass 2 still creates no trigger: the cadence is the owner's, and the clean reasons above omit it.
+  assert.deepEqual(world.schedulerJobs, []);
   assert.deepEqual(world.services, []);
   // Every mutation named the production project and nothing else.
   const mutations = gcloud.calls.filter((call) => operations.classifyGcloudCommand(call) === "mutate");
@@ -131,4 +140,44 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     assert.doesNotMatch(call.join(" "), LEFT_OUT);
     assert.doesNotMatch(call.join(" "), /tibotattle-test|staging/u);
   }
+});
+
+test("a cadence the owner commits later (synthetic here) is created paused by a later digest, with its schedule flag", () => {
+  const pinned = (cadence) => (value) => {
+    value.bucket.proof = { ...PROOF };
+    value.scheduler["analytics-refresh"].schedule = cadence;
+  };
+  let desired = production(pinned(null));
+  const world = emptyWorld();
+  const writer = memoryWriter();
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region });
+  world.buckets.push(bornBucket({ name: desired.bucket.name, location: desired.bucket.location,
+    generation: PROOF.bucketGeneration, extra: { projectNumber: desired.projectNumber } }));
+  const plan = () => operations.planInfrastructure(desired, operations.readbackInfrastructure(desired, { runner: gcloud.runner }));
+  const apply = (digest) => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: digest,
+    createSpecWriter: () => writer.create() });
+
+  // Pass 1 with no cadence creates no trigger (the production-scale measurement comes first).
+  const first = plan();
+  assert.deepEqual([executable(first).length, deferred(first).length], [29, 7]);
+  apply(first.planDigest);
+  assert.deepEqual(world.schedulerJobs, []);
+
+  // After the measurement the owner commits a cadence. A later plan has a new digest and one new
+  // pair of operations: the trigger is created and paused at once, with the committed schedule.
+  desired = production(pinned(SYNTHETIC_CADENCE));
+  const later = plan();
+  assert.notEqual(later.planDigest, first.planDigest);
+  assert.deepEqual(executable(later), ["scheduler:create:analytics-refresh", "scheduler:pause:analytics-refresh"]);
+  const create = later.operations.find((entry) => entry.id === "scheduler:create:analytics-refresh");
+  assert.ok(create.argv.includes(`--schedule=${SYNTHETIC_CADENCE}`));
+  assert.ok(create.argv.includes("--time-zone=Etc/UTC"));
+  assert.ok(create.argv.includes("--max-retry-attempts=0"));
+  // The old digest no longer authorizes the changed estate.
+  assert.throws(() => apply(first.planDigest), { code: "APPLY_PLAN_DIGEST_MISMATCH" });
+  apply(later.planDigest);
+  assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state]),
+    [["tibotattle-analytics-refresh-trigger", "PAUSED"]]);
+  assert.deepEqual(executable(plan()), []);
+  assert.equal(deferred(plan()).some((entry) => entry.startsWith("scheduler:")), false);
 });

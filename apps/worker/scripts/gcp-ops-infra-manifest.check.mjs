@@ -1028,17 +1028,26 @@ test("the committed production desired state: OWN-5 filled by PROD-PREP, and ref
   assert.deepEqual(Object.keys(raw.secrets), ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET",
     "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"]);
   for (const name of Object.keys(raw.secrets)) assert.equal(raw.secrets[name].secretName, name, name);
-  // The proposed full-recompute cadence: daily, created and kept PAUSED until OPS-3.
+  // Round 15 (C3): the owner decides the refresh cadence after the production-scale
+  // measurement, so none is committed. The trigger is not created (SCHEDULER_CADENCE_UNSET),
+  // and a null schedule is valid only with state PAUSED.
   assert.deepEqual(raw.scheduler["analytics-refresh"], {
-    name: "tibotattle-analytics-refresh-trigger", schedule: "15 2 * * *", state: "PAUSED" });
+    name: "tibotattle-analytics-refresh-trigger", schedule: null, state: "PAUSED" });
+  assert.throws(() => manifest.schedulerFlags(manifest.validateDesiredState(raw), "analytics-refresh"),
+    { code: "SCHEDULER_CADENCE_UNSET" });
   // Before the main session pins them, the only nulls are the values it pins
-  // after the apply; a pinned file keeps a subset of them.
+  // after the apply and the cadence the owner has yet to decide; a pinned file
+  // keeps a subset of the pinnable ones, and the cadence stays null until the
+  // owner decides it.
   const pinnable = [
     "bucket.proof", ...Object.keys(raw.secrets).map((name) => `secrets.${name}.version`),
     "service.telemetryStorageNamespace", "stagingOrigin",
   ].sort();
-  assert.deepEqual(nullPaths(JSON.parse(unpinnedProductionText(COMMITTED.production))).sort(), pinnable);
-  assert.ok(nullPaths(raw).every((path) => pinnable.includes(path)), nullPaths(raw).join());
+  const ownerDecides = ["scheduler.analytics-refresh.schedule"];
+  assert.deepEqual(nullPaths(JSON.parse(unpinnedProductionText(COMMITTED.production))).sort(),
+    [...pinnable, ...ownerDecides].sort());
+  assert.ok(nullPaths(raw).every((path) => pinnable.includes(path) || ownerDecides.includes(path)), nullPaths(raw).join());
+  assert.ok(ownerDecides.every((path) => nullPaths(raw).includes(path)), "the cadence is committed null");
   assert.equal(manifest.loadCommittedDesiredState("production").project, "tibotattle-prod");
   // A file whose placeholders are unfilled is refused, the first one named.
   assert.throws(() => manifest.validateDesiredState(JSON.parse(unfilledProductionText(COMMITTED.production))),

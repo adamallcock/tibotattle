@@ -22,9 +22,11 @@ status: draft
 
 In order: read-only checks, API enablement, the bucket birth and its pinned
 proof, OPS-2 pass 1 (accounts, grants, custom role, registry, secret
-containers, Cloud SQL with its IAM users, the logging exclusion, and the
-analytics-refresh trigger created and paused), readback, the secrets, the
-pins, the identity-link continuity check and the production alert channel.
+containers, Cloud SQL with its IAM users and the logging exclusion), readback,
+the secrets, the pins, the identity-link continuity check and the production
+alert channel. Pass 1 creates no scheduler trigger: the refresh cadence is
+decided after the production-scale measurement (round 15, C3), so its create
+is deferred until the owner commits one.
 The gated tail (the bootstrap image, the jobs, the service, migrate and roll)
 is listed with its gate and is not part of this approval.
 
@@ -42,33 +44,28 @@ set, or that the builder can read Cloud Build's source bucket.
 
 ## Approvals
 
-**Granularity is not yet agreed.** Round 13 asks for "per-operation owner
-approval". OPS-2 cannot approve inside a pass: `apply` runs every executable
-operation of an authorized plan under one `planDigest` (31 operations in pass
-1), and a changed estate changes the digest (`APPLY_PLAN_DIGEST_MISMATCH`).
-Approving one digest over a listed set of operations is pass-level approval,
-which is coarser than round 13's wording, and the owner has not agreed to it.
-Step 5 therefore waits for the confirmations below. If the owner declines
-pass-level approval, step 5 does not run until a scoped apply exists (for
-example an `--only=<id,...>` set folded into the digest, so that IAM, Cloud
-SQL and the scheduler can be approved separately). That tooling is not built.
+**Granularity (round 15, C1).** The owner approved one approval per pass: one
+`planDigest` over the listed operations (29 in pass 1). `apply` runs every
+executable operation of an authorized plan under that digest, and a changed
+estate changes the digest (`APPLY_PLAN_DIGEST_MISMATCH`). API enablement, the
+bucket birth, the rate-limit secret and the alert channel are still approved
+separately. A later pass (the bootstrap image, or the trigger once its cadence
+is committed) is a new plan with a new digest and a new approval.
 
-**Owner confirmations before step 5.** Ask for each by name and record the
-answers as a round-13 follow-up in the owner decisions:
+**Round 15 answers that shape step 5.**
 
-1. Pass-level approval for OPS-2: one `planDigest` over the operation list
-   shown, in place of round 13's per-operation wording.
-2. The production verifier grant, `roles/iam.serviceAccountTokenCreator` for
-   `user:adamallcock@gmail.com` on `tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com`
-   (operation `verifier-iam:bind:roles/iam.serviceAccountTokenCreator|user:adamallcock@gmail.com|`).
-   This is a new production grant. Round 9 approved the same grant on the
-   staging verifier only, and no decision names it for production. The
-   verifier account's only other grant is `run.invoker` on the service.
-3. The refresh cadence `15 2 * * *` (UTC), which PROD-PREP proposed (D3 and
-   MEAS-3 say the owner supplies it). If the owner does not confirm it, set
-   `scheduler.analytics-refresh.schedule` to `null`, commit, and re-plan
-   before step 5: the trigger is then deferred (`SCHEDULER_CADENCE_UNSET`)
-   and created paused by a later digest once the cadence is decided.
+1. Production verifier grant (C2): approved.
+   `roles/iam.serviceAccountTokenCreator` for `user:adamallcock@gmail.com` on
+   `tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com` (operation
+   `verifier-iam:bind:roles/iam.serviceAccountTokenCreator|user:adamallcock@gmail.com|`).
+   The verifier account's only other grant is `run.invoker` on the service.
+2. Refresh cadence (C3): decided after the production-scale measurement.
+   `scheduler.analytics-refresh.schedule` is committed `null` (state
+   `PAUSED`), so pass 1 skips the scheduler operations: the trigger create is
+   deferred (`SCHEDULER_CADENCE_UNSET`) and no pause is planned. When the owner
+   supplies the cadence, it is committed and a later plan creates the trigger
+   and pauses it at once under its own digest and approval. There is no
+   default cadence.
 
 **The approvals, in order.** Each is asked for in chat, and each runs only
 after a clear yes:
@@ -77,7 +74,7 @@ after a clear yes:
 |---|---|---|
 | 1 | 2 | Enables the APIs (one `gcloud services enable` call; there is no authorization token) |
 | 2 | 4 | Creates the bucket (`--authorize=bucket-birth:tibotattle-prod:tibotattle-quarantine`) |
-| 3 | 5 | OPS-2 pass 1 (`--authorize=<planDigest>`), after the three confirmations above |
+| 3 | 5 | OPS-2 pass 1 (`--authorize=<planDigest>`): one approval over the 29 listed operations |
 | 4 | 7 | Generates `POSTGRES_RATE_LIMIT_SECRET` version 1 straight into Secret Manager |
 | 5 | 11 | Creates the production alert channel (`--authorize=<planDigest>`) |
 
@@ -129,7 +126,7 @@ node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-0
 ```
 
 Expect `exit=2`, `summary.refused` 0, `findings` and `blockers` both exactly
-`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 31 executable and 6 deferred
+`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 29 executable and 7 deferred
 operations. Stop on a refused operation, any other finding, or any live
 plane resource you did not expect.
 
@@ -177,18 +174,19 @@ pass: the next plan reads it as `BUCKET_PROOF_STALE`, and apply refuses.
 
 ## 5. Apply, pass 1 (approval 3)
 
-Only after the three owner confirmations in [Approvals](#approvals).
+Only after the owner approves the operation list below (approval 3 in
+[Approvals](#approvals)).
 
 ```bash
 node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-1.json"; echo "exit=$?"
 node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringify(p.summary), JSON.stringify(p.findings), JSON.stringify(p.blockers));for(const o of p.operations)console.log(o.deferred?"DEFERRED":"RUN", o.id, o.deferred??"")' "$SCRATCH/prod-plan-1.json"
 ```
 
-Expect exit 0, no findings or blockers, 31 executable, 6 deferred, 0 refused.
+Expect exit 0, no findings or blockers, 29 executable, 7 deferred, 0 refused.
 The owner approves this list and its `planDigest`:
 
 - executable: six service accounts; the verifier's token-creator grant for
-  the owner's account (confirmation 2: a new production grant); the custom
+  the owner's account (C2); the custom
   role `tibotattleQuarantineStore`; six project bindings (Cloud SQL client
   and instance user for runtime and migrator, the builder's log writer, and
   the runtime's bucket-scoped custom role); the `tibotattle-images`
@@ -198,12 +196,13 @@ The owner approves this list and its `planDigest`:
   binding on each; the `tibotattle-primary` instance, its database and its
   two IAM users (`tibotattle-runtime@tibotattle-prod.iam`,
   `tibotattle-migrator@tibotattle-prod.iam`); the `_Default` sink's
-  request-log exclusion; and the trigger
-  `tibotattle-analytics-refresh-trigger` at `15 2 * * *` (confirmation 3),
-  created and paused at once;
+  request-log exclusion;
 - deferred: the service and its two invoker bindings
   (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), both jobs and the scheduler's
-  executor binding (`BOOTSTRAP_IMAGE_REQUIRED`).
+  executor binding (`BOOTSTRAP_IMAGE_REQUIRED`), and the trigger
+  `tibotattle-analytics-refresh-trigger` (`SCHEDULER_CADENCE_UNSET`, C3). The
+  trigger deferral is not a readiness reason: `--require-clean` treats it as
+  clean.
 
 There is no container for `DISTRIBUTION_GITHUB_API_TOKEN`: nothing on the
 production estate reads it (`UNREAD_PRODUCTION_SECRET_NAMES`), and the
@@ -213,9 +212,9 @@ service renders without it.
 node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDigest> > "$SCRATCH/prod-apply-1.json"; echo "exit=$?"
 ```
 
-Expect exit 0 and `remaining` with 0 executable and 6 deferred. Cloud SQL
-takes several minutes. The trigger cannot start anything: no job exists and
-the scheduler account has no executor grant. Stop on the staging runbook's
+Expect exit 0 and `remaining` with 0 executable and 7 deferred. Cloud SQL
+takes several minutes. No trigger exists, and the scheduler account has no
+executor grant, so nothing can start a job. Stop on the staging runbook's
 step 7 conditions.
 
 ## 6. Readback (read-only)
@@ -223,12 +222,14 @@ step 7 conditions.
 ```bash
 node scripts/gcp-infra.mjs readback --environment=production > "$SCRATCH/prod-readback-1.json"; echo "exit=$?"
 node scripts/gcp-infra.mjs readback --environment=production --require-clean > "$SCRATCH/prod-clean-1.json"; echo "exit=$?"
-gcloud scheduler jobs describe tibotattle-analytics-refresh-trigger --location=us-east1 --project=tibotattle-prod --format="value(state)"
+gcloud scheduler jobs list --location=us-east1 --project=tibotattle-prod --format="value(name)"
 ```
 
 Expect exit 0 with no finding, then exit 2 whose reasons are the six
-deferrals of step 5, and `PAUSED`. The readback is the post-apply proof of
-the logging exclusion. Keep the files; they are content-free.
+non-clean deferrals of step 5 (the service, its two invoker bindings, both
+jobs and the executor binding), and an empty scheduler list (the trigger waits
+for the cadence). The readback is the post-apply proof of the logging
+exclusion. Keep the files; they are content-free.
 
 ## 7. Secrets
 
@@ -369,9 +370,10 @@ Applying the alert policies is a later, separately authorized step.
 | Step | Gate |
 |---|---|
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
-| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs and the scheduler's executor binding; the trigger stays paused. Under the same pass-level approval as step 5, if the owner accepted it |
+| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs and the scheduler's executor binding; no trigger exists yet. A new plan digest, so a new per-pass approval (C1) |
 | The service and its invoker bindings | ROUTES-R12 drops `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template; the deferral then clears itself. Also the namespace pin (step 8) |
 | Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |
+| Create the trigger | After the production-scale measurement the owner supplies the refresh cadence (C3). Commit it as `scheduler.analytics-refresh.schedule`, then `plan` and `apply` under a new digest and a new per-pass approval: the trigger is created and paused at once |
 | Resume the trigger | OPS-3 only, at cutover (`docs/runbooks/gcp-scheduler-resume.md`) |
 
 ## If something must be undone

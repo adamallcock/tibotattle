@@ -9,7 +9,7 @@ a rollout reads.
 | File | Plane |
 |---|---|
 | `staging.desired-state.json` | Staging, in the shared GCP test project `tibotattle` (`projectTenancy: "shared"`), with new, staging-marked resources only. It is the synthetic plane for the staging load test (OPS-11), the staging edge's origin (OWN-7b) and migrate and roll drills. Production data and production secrets never enter it. |
-| `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps, their approvals and the owner confirmations they wait for are in `docs/runbooks/gcp-production-apply.md`. |
+| `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps, their approvals and the round 15 answers that shape them are in `docs/runbooks/gcp-production-apply.md`. |
 | `desired-state.schema.json` | JSON Schema for editors and review, including which secrets staging must name. `scripts/gcp-ops-infra-manifest.mjs` `validateDesiredState` is authoritative. |
 | `monitoring.md` | The runbook that the OPS-5 alert policies link to, one anchor per policy. The policies are derived from these desired states by `scripts/gcp-ops-monitoring-policies.mjs`. |
 
@@ -66,7 +66,7 @@ created.
 | `secrets.*.version` | The service is not rendered (`SECRET_VERSION_UNPINNED`) |
 | `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
 | `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries. Staging's value was chosen by Claude (see below) |
-| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence). Production carries PROD-PREP's proposal, below |
+| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence). Production stays `null` until the owner decides the cadence after the production-scale measurement (round 15, C3); pass 1 then defers the create as `SCHEDULER_CADENCE_UNSET` and plans no pause |
 | `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
 
 ### Production values PROD-PREP filled (owner decisions round 13)
@@ -74,9 +74,15 @@ created.
 | Setting | Committed value | Source |
 |---|---|---|
 | `project`, `projectNumber`, `region`, `bucket.location` | `tibotattle-prod`, `874229235044`, `us-east1`, `US-EAST1` | OWN-5 and round 13; the project number was read back by the main session |
-| `serviceAccounts.verifier.tokenCreators` | the owner's Google account | Claude's proposal, mirroring staging. No owner decision names this grant for production: round 9 approved it on the staging verifier only, and round 12 covers the address in tracked files, not IAM. It is a new production grant that the owner confirms by name before the pass-1 apply (the runbook's owner confirmations) |
+| `serviceAccounts.verifier.tokenCreators` | the owner's Google account | Claude's proposal, mirroring staging, approved by the owner as a production grant in round 15 (C2; round 9 had approved it on the staging verifier only) |
 | `secrets` | the four CR-3 secrets the production estate reads, named by their variable names | Round 12 retired Google and Apple sign-in, so their two secrets are left out, and nothing on the production estate reads `DISTRIBUTION_GITHUB_API_TOKEN`. `IDENTITY_LINK_SECRET` stays: the edge-admission replay keys its subjects with it, and the session ports, credential renew and the maintenance profile check the imported identity-link pin. `scripts/gcp-identity-link-pin-check.mjs` checks the version against that pin before PROD-3 |
-| `scheduler.analytics-refresh.schedule` | `15 2 * * *` (UTC), state `PAUSED` | Claude's proposal for the full-recompute engine (about 50 min per dense run, 14,400 s timeout): one run a day, after the UTC day closes, done before the 07:00 backup; the advisory lock refuses an overlapping run. D3 and MEAS-3 say the owner supplies the cadence, so the owner confirms it before the pass-1 apply, or it goes back to `null` and the trigger waits for a later apply. The trigger stays paused until OPS-3 resumes it |
+
+`scheduler.analytics-refresh.schedule` stays `null` (round 15, C3): the owner
+decides the refresh cadence after the production-scale measurement, so pass 1
+defers the trigger create (`SCHEDULER_CADENCE_UNSET`) and plans no pause. When
+the cadence is committed, a later plan creates the trigger and pauses it at
+once. A full-recompute run is about 50 min against a 14,400 s timeout, and the
+advisory lock refuses an overlapping run.
 
 `service.telemetryStorageNamespace` stays `null`. Continuity requires the
 production Worker's own `TELEMETRY_STORAGE_NAMESPACE` (legacy and v1.1

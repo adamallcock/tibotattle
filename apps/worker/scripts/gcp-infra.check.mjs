@@ -40,6 +40,8 @@ const UNMARKED_PATH = "/synthetic-desired/example-ops-prod1.json";
 const UNMARKED_TEXT = FIXTURE_TEXT.replaceAll("synthetic-ops-project", "example-ops-prod1");
 const IMAGE = ["--bootstrap-image-digest=" + "c".repeat(64), "--bootstrap-source-commit=" + "d".repeat(40)];
 const COMMITTED_PRODUCTION = committedDesiredStatePath("production");
+// A cadence for tests that need a set one: the committed production file carries none (round 15, C3).
+const SYNTHETIC_CADENCE = "40 6 * * 2";
 const COMMITTED_STAGING = committedDesiredStatePath("staging");
 
 /** Reads synthetic files; the committed production path is a synthetic stand-in unless `committed` says otherwise. */
@@ -325,7 +327,16 @@ test("the committed desired states render offline: staging's and production's wa
   assert.deepEqual(prod.service, { unavailable: "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED" });
   assert.equal(prod.bucket.location, "US-EAST1");
   assert.equal(prod.jobs["analytics-refresh"].metadata.name, "tibotattle-analytics-refresh");
-  assert.ok(prod.scheduler["analytics-refresh"].includes("--schedule=15 2 * * *"));
+  // Round 15 (C3): the owner decides the refresh cadence after the production-scale
+  // measurement, so the committed schedule is null and the trigger is not rendered.
+  assert.deepEqual(prod.scheduler, { "analytics-refresh": { unavailable: "SCHEDULER_CADENCE_UNSET" } });
+  // A set cadence still renders its flags. The value is synthetic and lives in this test only.
+  const cadenced = JSON.parse(unpinnedProductionText());
+  cadenced.scheduler["analytics-refresh"].schedule = SYNTHETIC_CADENCE;
+  const scheduled = JSON.parse((await run(["render", "--environment=production", ...IMAGE],
+    { readFile: reader(`${JSON.stringify(cadenced, null, 2)}\n`) })).out);
+  assert.ok(scheduled.scheduler["analytics-refresh"].includes(`--schedule=${SYNTHETIC_CADENCE}`));
+  assert.ok(scheduled.scheduler["analytics-refresh"].includes("--time-zone=Etc/UTC"));
   // Round 12 retired Google and Apple sign-in: no production secret, container or reference names them.
   assert.doesNotMatch(production.out, /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|tibotattle-test|staging|BEGIN PRIVATE KEY/u);
   // With the namespace pinned, the service still waits for ROUTES-R12 to narrow CR-3.

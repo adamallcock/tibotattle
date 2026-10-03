@@ -212,8 +212,17 @@ test("production renders from its committed file (PROD-PREP) and refuses one wit
   const rendered = JSON.parse(result.out);
   assert.deepEqual([rendered.environment, rendered.project, rendered.notificationChannel],
     ["production", "tibotattle-prod", "unassigned"]);
-  // The trigger is committed PAUSED, so its policies wait for OPS-3.
-  assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
+  // Round 15 (C3): the refresh cadence waits for the production-scale measurement, so the
+  // committed schedule is null and the trigger's policies wait for the owner's cadence.
+  assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "SCHEDULER_CADENCE_UNSET");
+  // Once a cadence is committed, the trigger is still committed PAUSED, so the policies then wait for OPS-3.
+  // The cadence is synthetic and lives in this test only.
+  const cadenced = JSON.parse(readFileSync(committedDesiredStatePath("production"), "utf8"));
+  cadenced.scheduler["analytics-refresh"].schedule = "40 6 * * 2";
+  const cadencedText = `${JSON.stringify(cadenced, null, 2)}\n`;
+  const scheduled = JSON.parse((await run(["render", "--environment=production"], {
+    readFile: (path) => (path === committedDesiredStatePath("production") ? cadencedText : readFileSync(path, "utf8")) })).out);
+  assert.deepEqual(scheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
   const unfilledText = unfilledProductionText();
   const unfilled = await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unfilledText : readFileSync(path, "utf8")) });
