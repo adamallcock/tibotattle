@@ -162,7 +162,11 @@ import { createEdgeAdmissionLimiters, EDGE_ADMISSION_REPLAY_BINDINGS } from "./p
 import { createEdgeOriginDispatch, edgeRequestContext } from "./postgres-edge-origin-dispatch.mjs";
 import { requestIdFrom, createRequestContextStore } from "./postgres-request-context.mjs";
 import { createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
-import { ADMIN_HOST_ROUTE_IDS, createProductionRouteRegistry } from "./postgres-production-registry.mjs";
+import {
+  ADMIN_HOST_ROUTE_IDS,
+  assertIdentityLinkConsumersRetired,
+  createProductionRouteRegistry,
+} from "./postgres-production-registry.mjs";
 import { createPostgresReadinessDispatch } from "./postgres-readiness-dispatch.mjs";
 import { createPostgresHealthDispatch, healthCapabilityFlags, registryPorted } from "./postgres-health-dispatch.mjs";
 import {
@@ -171,6 +175,7 @@ import {
   PRODUCTION_ADMISSION_TIMEOUTS,
   PRODUCTION_POOL_APPLICATION_NAMES,
   createProductionWorkerEnv,
+  isRotatedIdentityLinkVersion,
   readProductionConfiguration,
   revealProductionSecret,
 } from "./postgres-production-configuration.mjs";
@@ -245,6 +250,23 @@ function compositionError(code) {
 
 function refuse(code) {
   throw compositionError(code);
+}
+
+/**
+ * Defence in depth for round 16's identity-link rotation: under a rotated
+ * label (production-v2), the host refuses to compose
+ * (IDENTITY_LINK_ROTATION_CONSUMER_PORTED) if its ported set would serve a
+ * route that consumes the identity-link pin, link keys or cooldown digests
+ * (IDENTITY_LINK_CONSUMER_ROUTE_IDS). Returns whether the label is rotated.
+ */
+export function assertIdentityLinkRotationComposable(identityLinkSecretVersion, portedRouteIds) {
+  if (!isRotatedIdentityLinkVersion(identityLinkSecretVersion)) return false;
+  try {
+    assertIdentityLinkConsumersRetired(portedRouteIds);
+  } catch {
+    refuse("IDENTITY_LINK_ROTATION_CONSUMER_PORTED");
+  }
+  return true;
 }
 
 /**
@@ -737,6 +759,9 @@ export async function createPostgresProductionRuntime({
   if (adminHostPolicy !== "refuse" && adminHostPolicy !== "chokepoint") refuse("ADMIN_HOST_POLICY_INVALID");
   const configuration = readProductionConfiguration(processEnv, PRODUCTION_HOST_MODES[hostMode]);
   if (configuration.edge?.mode !== EDGE_ORIGIN_MODE) refuse("EDGE_ORIGIN_MODE_INVALID");
+  const adminOpen = adminHostPolicy === "chokepoint";
+  const portedRouteIds = [...POSTGRES_PORTED_WORKER_ROUTE_IDS, ...(adminOpen ? ADMIN_HOST_ROUTE_IDS : [])];
+  assertIdentityLinkRotationComposable(configuration.vars.IDENTITY_LINK_SECRET_VERSION, portedRouteIds);
   assertEdgeTierBindings();
   const listenHost = productionListenHost(processEnv, configuration);
   const port = listenPort(processEnv);
@@ -812,8 +837,6 @@ export async function createPostgresProductionRuntime({
     });
     const requestContextStore = createRequestContextStore();
     const requestContext = requestContextStore.accessor;
-    const adminOpen = adminHostPolicy === "chokepoint";
-    const portedRouteIds = [...POSTGRES_PORTED_WORKER_ROUTE_IDS, ...(adminOpen ? ADMIN_HOST_ROUTE_IDS : [])];
     const capabilityFlags = healthCapabilityFlags((id) => portedRouteIds.includes(id));
     const statusDispatchers = Object.freeze({
       health: createPostgresHealthDispatch({

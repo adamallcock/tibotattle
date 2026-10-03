@@ -175,6 +175,33 @@ test("arguments are closed: pages at most 256 rows and 4 MiB, a handle and a hoo
     sealManifestPath: manifestPath, identityLinkPin: PIN }), error => error?.code === "CUTOVER_SEAL_MANIFEST_INVALID");
 });
 
+test("round 16's rotate mode is closed: the sealed row must equal the rotation's from, and nothing else passes", async () => {
+  const handle = { sealManifestSha256: seal.manifest.sealId };
+  const rotate = (overrides = {}) => ({ mode: "rotate", sealedPin: { ...PIN }, rotationSha256: "c".repeat(64),
+    ...overrides });
+  // The sealed row equals `from`: every source check passes and only the
+  // unregistered handle meets PT-1 (no database was reached).
+  await assert.rejects(runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath, identityLinkPin: rotate() }),
+    isCode("CUTOVER_TARGET_HANDLE_INVALID"));
+  // `from` is not the sealed row: refused before the target.
+  await assert.rejects(runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath,
+    identityLinkPin: rotate({ sealedPin: { ...PIN,
+      secretFingerprint: identityLinkFingerprint("w2-seal-fixture-wrong-secret-000000003") } }) }),
+  isCode("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH"));
+  await assert.rejects(runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath,
+    identityLinkPin: rotate({ sealedPin: { ...PIN, keyVersion: "production-v2" } }) }),
+  isCode("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH"));
+  // Closed shapes: no skip mode, no extra key, no missing receipt digest.
+  for (const pin of [
+    rotate({ mode: "skip" }), rotate({ rotationSha256: "not-a-digest" }), rotate({ extra: true }),
+    { mode: "rotate", sealedPin: { ...PIN } }, rotate({ sealedPin: { ...PIN, extra: 1 } }),
+    { ...PIN, extra: 1 }, { ...PIN, mode: "rotate" }, null,
+  ]) {
+    await assert.rejects(runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath, identityLinkPin: pin }),
+      isCode("CUTOVER_IDENTITY_ARGUMENT_INVALID"), JSON.stringify(pin));
+  }
+});
+
 test("every sealed-source refusal fires before the target is touched", async () => {
   // A clean seal passes every source check and only then meets the target:
   // the unregistered handle is refused by PT-1 (no database was reached).

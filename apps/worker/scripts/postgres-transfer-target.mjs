@@ -26,6 +26,7 @@ export const TRANSFER_CONTROL_SCHEMA = "tibotattle_transfer";
 export const TRANSFER_STAGES = Object.freeze([
   "analytics-expectation",
   "identity-authority",
+  "identity-link-rotation",
   "legacy-contributions",
   "telemetry-v1-v11",
   "typed-legacy",
@@ -1861,7 +1862,13 @@ async function assertRoleMembers(client, handle, allowedRoleMembers, schema) {
   if (databaseCount(granted?.n) !== 0n) fail("CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED");
 }
 
-async function assertNoRuntimePrivilege(client) {
+/**
+ * No role but each object's owner holds a privilege on the transfer control
+ * schema or anything in it (PUBLIC, grantee 0, included; a function's default
+ * PUBLIC EXECUTE excepted). Part of assertFlipReady, and exported so that
+ * PT-8-lite's preflight P10 refuses the same grants before the import.
+ */
+export async function assertNoRuntimePrivilege(client) {
   const [granted] = rows(await q(client, `WITH grants AS (
         SELECT (aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner)))).grantee AS grantee,
                n.nspowner AS owner, 'schema' AS kind

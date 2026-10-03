@@ -174,8 +174,32 @@ export const RETIRED_ONLINE_ERASURE_SURFACES = Object.freeze([
   }),
 ]);
 
+/**
+ * The routes that consume IDENTITY_LINK_SECRET-derived state at the d43c8f92
+ * parity basis: the pin (identity_link_secret_configuration), a provider
+ * subject's link key (participants.identity_link_key and the hand-off rows)
+ * or a re-enrolment cooldown digest. Round 12 retires every one of them at
+ * the switch, and round 16 rotates the lost secret on that basis alone
+ * (scripts/postgres-identity-link-pin.mjs). Under a rotated label none may
+ * be ported: a ported sign-in would answer 503 against an unrotated pin, or
+ * silently mint a new participant for an existing social account against a
+ * rotated one. The registry check pins this list.
+ */
+export const IDENTITY_LINK_CONSUMER_ROUTE_IDS = Object.freeze([
+  "enroll",
+  "identity_google_start",
+  "identity_google_callback",
+  "identity_google_result",
+  "identity_apple_start",
+  "identity_apple_callback",
+  "identity_apple_result",
+  "security_reset",
+  "participant_export",
+]);
+
 /** Every code this module throws. */
 export const PRODUCTION_ROUTE_REGISTRY_CODES = Object.freeze([
+  "IDENTITY_LINK_ROTATION_CONSUMER_PORTED",
   "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE",
   "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT",
   "PRODUCTION_ROUTE_PORTED_SET_INVALID",
@@ -198,6 +222,26 @@ const issuedRegistries = new WeakSet();
 
 function refuse(code) {
   throw Object.assign(new TypeError(code), { code });
+}
+
+/**
+ * Refuses IDENTITY_LINK_ROTATION_CONSUMER_PORTED unless every identity-link
+ * consumer is od-cr-2 (unported) in PRODUCTION_ROUTE_TABLE and absent from
+ * the given ported set. Returns the number of consumers checked. The
+ * cutover preflight (P8-R) and the production host (under a rotated label)
+ * both call it.
+ */
+export function assertIdentityLinkConsumersRetired(portedRouteIds) {
+  if (!Array.isArray(portedRouteIds) || portedRouteIds.some((id) => typeof id !== "string")) {
+    refuse("IDENTITY_LINK_ROTATION_CONSUMER_PORTED");
+  }
+  const ported = new Set(portedRouteIds);
+  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) {
+    if (TABLE_BY_ID.get(id)?.routeClass !== PRODUCTION_ROUTE_CLASSES.OD_CR_2 || ported.has(id)) {
+      refuse("IDENTITY_LINK_ROTATION_CONSUMER_PORTED");
+    }
+  }
+  return IDENTITY_LINK_CONSUMER_ROUTE_IDS.length;
 }
 
 function validPolicyEntry(entry) {

@@ -237,9 +237,12 @@ const NO_SECRETS = Object.freeze({ required: Object.freeze([]), optional: Object
 /**
  * The secrets each profile consumes; any other REQUIRED/OPTIONAL secret
  * present in a profile's environment is refused. The service reads all of
- * them. Scheduled maintenance reads IDENTITY_LINK_SECRET (backend lifecycle
- * and restore replay) and, in production only, the GitHub distribution sync
- * token. The analytics lanes read none.
+ * them. The maintenance profiles require IDENTITY_LINK_SECRET to be present
+ * (at least 32 characters) but the PostgreSQL lifecycle pass reads no
+ * identity secret: identity hand-off and sign-in purges are absent and the
+ * cooldown items are constant (the D1 Worker's backend lifecycle and restore
+ * replay were its readers). Production maintenance may also read the GitHub
+ * distribution sync token. The analytics lanes read none.
  */
 export const PRODUCTION_PROFILE_SECRET_NAMES = Object.freeze({
   production: SERVICE_SECRETS,
@@ -300,9 +303,29 @@ export const DEPLOYMENT_PROVIDED_VAR_NAMES = Object.freeze([
 export const EDGE_ORIGIN_MODE = "cloudflare-worker-iam";
 
 /**
+ * The production IDENTITY_LINK_SECRET key-version label. Round 16
+ * (2026-10-02) rotates the lost Cloudflare secret at the cutover: the origin
+ * mounts a newly generated Secret Manager version under 'production-v2',
+ * and the imported pin moves from the retired label to this one only under
+ * the cutover's identity-rotation token and receipt
+ * (scripts/postgres-production-transfer.mjs). wrangler.jsonc env.production
+ * keeps 'production-v1', which names the Cloudflare Worker secret until its
+ * deletion (the drift check's rotated-var category holds both values).
+ */
+export const PRODUCTION_IDENTITY_LINK_SECRET_VERSION = "production-v2";
+/** Labels production used before; a staging plane may carry none of them either. */
+export const PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS = Object.freeze(["production-v1"]);
+
+/** True when `label` is production's label and it replaced a retired one (round 16). */
+export function isRotatedIdentityLinkVersion(label) {
+  return label === PRODUCTION_IDENTITY_LINK_SECRET_VERSION && PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS.length > 0;
+}
+
+/**
  * wrangler.jsonc env.production vars, minus the edge-only ones, plus the
  * origin-only switches. TELEMETRY_STORAGE_MODE is the live 'typed' setting
- * (see the header and production-live-settings.receipt.json).
+ * (see the header and production-live-settings.receipt.json);
+ * IDENTITY_LINK_SECRET_VERSION is the rotated label above.
  */
 export const PRODUCTION_VARS = Object.freeze({
   PUBLIC_ANALYTICS_MODE: "enabled",
@@ -323,7 +346,7 @@ export const PRODUCTION_VARS = Object.freeze({
   UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
   SIGN_IN_START_MAX_PER_MINUTE: "300",
   INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized",
-  IDENTITY_LINK_SECRET_VERSION: "production-v1",
+  IDENTITY_LINK_SECRET_VERSION: PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
   GOOGLE_OIDC_CLIENT_ID: "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
   APPLE_SERVICES_ID: "com.usagemonitor.web",
   APPLE_KEY_ID: "L58X7J2J7A",
@@ -353,6 +376,7 @@ export const PRODUCTION_RESOURCE_FINGERPRINT = Object.freeze({
   ]),
   accessAud: PRODUCTION_VARS.ACCESS_AUD,
   identityLinkSecretVersion: PRODUCTION_VARS.IDENTITY_LINK_SECRET_VERSION,
+  retiredIdentityLinkSecretVersions: PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
   // Both OAuth clients: each is the audience its id_tokens are verified against.
   googleOidcClientId: PRODUCTION_VARS.GOOGLE_OIDC_CLIENT_ID,
   appleServicesId: PRODUCTION_VARS.APPLE_SERVICES_ID,

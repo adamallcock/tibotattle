@@ -547,7 +547,9 @@ export const ANALYTICS_REFRESH_CR3_POLICY = Object.freeze({
   fingerprint: Object.freeze([
     "https://tibotattle.com", "https://admin.tibotattle.com", "https://www.tibotattle.com",
     "tibotattle.com", "admin.tibotattle.com", "www.tibotattle.com",
-    "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c", "production-v1",
+    // Both identity-link labels: production-v2 (round 16's rotated label) and
+    // the retired production-v1; a staging plane may carry neither.
+    "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c", "production-v2", "production-v1",
     "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com", "com.usagemonitor.web", "L58X7J2J7A",
     "app-usagemonitor", "app-usagemonitor-production", "app-usagemonitor-production-deletion-ledger",
     "app-usagemonitor-production-quarantine", "tibotattle-updates",

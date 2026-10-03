@@ -154,16 +154,18 @@ export function writeExpectedLedgers(database, {
 /**
  * Plant the identity rows the Q-1 corpus leaves empty, through the D1
  * triggers. Returns the fixture handles (ids and fixture secrets) the specs
- * authenticate with; none of them is ever written to a receipt.
+ * authenticate with; none of them is ever written to a receipt. The pin row
+ * carries `identityLinkVersion` (a spec of the production rotation seals the
+ * retired production label; the secret is always the synthetic one).
  */
-function plantIdentityRows(database, nowMs) {
+function plantIdentityRows(database, nowMs, identityLinkVersion) {
   const now = iso(nowMs);
   const ids = {};
   const secrets = {};
   const run = (sql, ...values) => database.prepare(sql).run(...values);
 
   run(`INSERT INTO identity_link_secret_configuration(singleton, key_version, secret_fingerprint, recorded_at)
-    VALUES (1, ?, ?, ?)`, SYNTHETIC_IDENTITY_LINK_VERSION, identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET), now);
+    VALUES (1, ?, ?, ?)`, identityLinkVersion, identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET), now);
 
   // A social participant whose session, pairings and device authenticate
   // with fixture secrets after the import.
@@ -358,6 +360,7 @@ function plantIdentityRows(database, nowMs) {
  */
 export async function buildSyntheticIngestionD1({
   directory, commit, ledgers = DEFAULT_INGESTION_LEDGERS, ledgerNames = "bare", plant = true, nowMs = Date.now(),
+  identityLinkVersion = SYNTHETIC_IDENTITY_LINK_VERSION,
 } = {}) {
   const work = join(directory, "q1-oracle.sqlite");
   rebuildOracleSqlite(Q1_INGESTION_DUMP, work, { seal: false });
@@ -367,7 +370,7 @@ export async function buildSyntheticIngestionD1({
     database.exec("PRAGMA foreign_keys=ON");
     database.exec("BEGIN");
     writeExpectedLedgers(database, { role: "ingestion", ledgers, commit, nameStyle: ledgerNames });
-    if (plant) fixture = plantIdentityRows(database, nowMs);
+    if (plant) fixture = plantIdentityRows(database, nowMs, identityLinkVersion);
     database.exec("COMMIT");
     const violations = database.prepare("PRAGMA foreign_key_check").all();
     if (violations.length !== 0) throw new Error("W2_SEAL_FIXTURE_FOREIGN_KEYS");

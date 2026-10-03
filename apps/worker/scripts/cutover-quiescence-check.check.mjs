@@ -450,7 +450,7 @@ test("an owner link already marked erased blocks, with a reference", async () =>
   assert.equal(item.status, "blocked");
   assert.deepEqual(item.counts, { ownerLinks: 4, erased: 1, withdrawn: 0 });
   assert.deepEqual(item.refs, [opaqueRef("participant", linkedParticipantId())]);
-  assert.equal(item.refusals[0].implemented, false, "PT-8's refusal is specified, not yet in code");
+  assert.deepEqual(item.refusals[0], { stage: "PT-8 preflight P5", code: "CUTOVER_OWNER_LINK_ERASED", implemented: true });
 });
 
 test("pending quarantine registrations block, split by state, with the oldest timestamp and references", async () => {
@@ -464,6 +464,9 @@ test("pending quarantine registrations block, split by state, with the oldest ti
   const item = checkOf(report, "pending-quarantine-registrations");
   assert.equal(item.status, "blocked");
   assert.deepEqual(item.counts, { registrations: 2, registered: 1, deleting: 1, oldestRegisteredAt: "2026-10-02T10:00:00.000Z" });
+  // PT-4 maps the sealed registrations and E-PT8's post-import refuses a mapping mismatch.
+  assert.deepEqual(item.refusals, [{ stage: "PT-4 pending-registrations, E-PT8 post-import",
+    code: "CUTOVER_PENDING_OBJECT_CONFLICT", implemented: true }]);
   assert.deepEqual(item.refs, [opaqueRef("quarantine-registration", "synthetic-contribution-a"),
     opaqueRef("quarantine-registration", "synthetic-contribution-b")]);
   assert.equal(report.verdict, "blocked");
@@ -475,6 +478,7 @@ test("the correction runtime blocks unless it is the one staged row with no corr
   assert.deepEqual(checkOf(active, "correction-runtime").counts, { runtimeRows: 1, runtimeState: "active", facts: 0, history: 0 });
   assert.equal(checkOf(active, "correction-runtime").status, "blocked");
   assert.equal(checkOf(active, "correction-runtime").refusals[0].code, "CUTOVER_CORRECTION_RUNTIME_ACTIVE");
+  assert.equal(checkOf(active, "correction-runtime").refusals[0].implemented, true, "E-PT8 preflight P4 refuses it");
 
   // Staged, with one archived correction (the history trigger adds its fact).
   const history = `INSERT INTO telemetry_usage_correction_history(id, participant_id, owner_digest, owner_revision,
