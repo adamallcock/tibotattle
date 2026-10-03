@@ -525,13 +525,14 @@ test("the scheduler's executor grant follows its trigger: withheld while the cad
   const create = "scheduler:create:analytics-refresh";
   const pause = "scheduler:pause:analytics-refresh";
 
-  // No cadence: the jobs are created, but no trigger and no grant, so nothing can start the job.
+  // No cadence: the jobs are created, but no refresh trigger and no grant, so nothing can start the
+  // job. The maintenance job's pinned trigger (D-OPS4) is the only trigger created.
   const gcloud = fake(unset, world);
   const first = plan(unset, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
   assert.deepEqual(ops(first, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]),
     [[create, "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unset), "SCHEDULER_CADENCE_UNSET"]]);
   apply(unset, gcloud, first, { bootstrap: BOOTSTRAP });
-  assert.deepEqual([granted(world), world.schedulerJobs.length, world.jobs.length], [false, 0, 2]);
+  assert.deepEqual([granted(world), trigger(world), world.schedulerJobs.length, world.jobs.length], [false, undefined, 1, 3]);
   assert.equal(operations.infrastructureCleanliness(plan(unset, gcloud.runner, UNDEFERRED)).clean, true);
 
   // The owner commits a cadence: the next plan creates, pauses, and only then grants.
@@ -553,7 +554,7 @@ test("the scheduler's executor grant follows its trigger: withheld while the cad
   // A grant that is already live when a create is planned (the trigger was removed by hand, or the
   // estate was bound before it) would let the ENABLED trigger start the job before its pause: the
   // plan blocks, and apply, which never removes a grant, refuses it without a single mutation.
-  world.schedulerJobs = [];
+  world.schedulerJobs = world.schedulerJobs.filter((job) => job !== trigger(world));
   const blockedGcloud = fake(scheduled, world);
   const blocked = plan(scheduled, blockedGcloud.runner, UNDEFERRED);
   assert.deepEqual(blocked.blockers, ["SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh"]);
@@ -563,7 +564,7 @@ test("the scheduler's executor grant follows its trigger: withheld while the cad
   blockedGcloud.calls.length = 0;
   assert.throws(() => apply(scheduled, blockedGcloud, blocked), { code: "APPLY_BLOCKED" });
   assert.equal(kinds(blockedGcloud.calls).includes("mutate"), false);
-  assert.equal(world.schedulerJobs.length, 0);
+  assert.equal(trigger(world), undefined);
   // The owner removes the grant by hand; the next plan clears the block and restores the order.
   world.jobPolicies[JOB_POLICY] = {};
   const cleared = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
@@ -1126,11 +1127,14 @@ test("the maintenance job is created from the contract, its trigger is created p
   // The committed ENABLED state waits for OPS-3's resume and stays clean, like the refresh trigger's.
   const resumed = desiredState({ synthetic: false, mutate: (value) => { value.scheduler.maintenance.state = "ENABLED"; } });
   const waiting = plan(resumed, fake(resumed, world).runner);
+  // The refresh trigger and its executor grant still wait for the owner's cadence (PROD-PREP).
   assert.deepEqual(waiting.operations.map((entry) => [entry.id, entry.deferred]),
-    [["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"], ["scheduler:resume:maintenance", "SCHEDULER_TRIGGER_RESUME_PENDING"]]);
+    [["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(desired), "SCHEDULER_CADENCE_UNSET"],
+      ["scheduler:resume:maintenance", "SCHEDULER_TRIGGER_RESUME_PENDING"]]);
   assert.equal(operations.infrastructureCleanliness(waiting).clean, true);
   maintenanceTrigger(world).state = "ENABLED";
-  assert.deepEqual(plan(resumed, fake(resumed, world).runner).operations.map((entry) => entry.id), ["scheduler:create:analytics-refresh"]);
+  assert.deepEqual(plan(resumed, fake(resumed, world).runner).operations.map((entry) => entry.id),
+    ["scheduler:create:analytics-refresh", EXECUTOR(desired)]);
 });
 
 test("a maintenance trigger whose pause failed is paused by the next plan, and could not have started the job meanwhile", () => {
@@ -1412,6 +1416,8 @@ test("pause-all is a read-only dry run whose plan pauses every plane trigger and
     [TRIGGER, "pause", "synthetic-analytics-refresh"],
     ["synthetic-deliberately-paused", "none", "synthetic-analytics-refresh"],
     ["synthetic-hand-made-trigger", "pause", "synthetic-production-migrate"],
+    // D-OPS4's maintenance trigger is committed and live PAUSED: nothing to pause.
+    [MAINTENANCE_TRIGGER, "none", "synthetic-maintenance"],
     ["synthetic-webhook-trigger", "pause", null],
   ]);
   assert.deepEqual([first.blockers, first.foreignBlocking, first.rolloutGateAfter.satisfied], [[], [], true]);
@@ -1451,7 +1457,7 @@ test("pause-all applies only under its digest, pauses only, writes the receipt, 
     assert.equal(await rolloutGateHolds(world), true, "ROLLOUT_JOBS_NOT_PAUSED is now satisfiable");
     assert.deepEqual([receipt.status, receipt.paused, receipt.alreadyPaused, receipt.failed, receipt.rolloutGate.satisfied],
       ["complete", [TRIGGER, "synthetic-hand-made-trigger", "synthetic-webhook-trigger"],
-        ["synthetic-deliberately-paused"], null, true]);
+        ["synthetic-deliberately-paused", MAINTENANCE_TRIGGER], null, true]);
     assert.equal(receipt.pausedAt, "2026-10-02T12:00:00.000Z");
     const written = JSON.parse(readFileSync(receiptPath, "utf8"));
     assert.deepEqual(written, JSON.parse(JSON.stringify(receipt)));
@@ -1511,8 +1517,10 @@ test("resume-all resumes only committed-ENABLED managed triggers that pause-all 
   const plan = operations.planResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now });
   assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "the resume plan is a dry run");
   assert.deepEqual(plan.resume, [TRIGGER], "hand-made triggers are never resumed");
+  // D-OPS4's maintenance trigger is committed PAUSED, so it is never resumed.
   assert.deepEqual(plan.triggers, [{ job: "analytics-refresh", name: TRIGGER, committedState: "ENABLED",
-    liveState: "PAUSED", action: "resume" }]);
+    liveState: "PAUSED", action: "resume" }, { job: "maintenance", name: MAINTENANCE_TRIGGER, committedState: "PAUSED",
+    liveState: "PAUSED", action: "none", reason: "COMMITTED_STATE_PAUSED" }]);
   for (const [options, code] of [
     [{ authorize: undefined }, "RESUME_ALL_AUTHORIZATION_REQUIRED"],
     [{ authorize: "0".repeat(64) }, "RESUME_ALL_PLAN_DIGEST_MISMATCH"],
@@ -1560,7 +1568,7 @@ test("resume-all never resumes a trigger committed PAUSED, or one paused by some
     return operations.applyPauseAll(resumed, { runner: quiet, authorize: plan.planDigest,
       receiptPath: join(directory, "pause-again.json") });
   })();
-  assert.deepEqual([emptyReceipt.paused, emptyReceipt.alreadyPaused], [[], [TRIGGER]]);
+  assert.deepEqual([emptyReceipt.paused, emptyReceipt.alreadyPaused], [[], [TRIGGER, MAINTENANCE_TRIGGER]]);
   const deliberate = operations.planResumeAll(resumed, { runner: quiet, pauseReceipt: emptyReceipt });
   assert.deepEqual([deliberate.resume, deliberate.triggers[0].reason], [[], "NOT_PAUSED_BY_PAUSE_ALL"]);
   // The operator may name it: --only asserts they paused it.

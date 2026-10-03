@@ -255,8 +255,9 @@ test("the scheduler paused-too-long alert waits max(6 h, cadence plus slack) per
     assert.match(query(rendered, "scheduler-quiet"),
       new RegExp(`job_id="tibotattle-staging-analytics-refresh-trigger"\\}\\[${window}\\]\\)$`, "u"), schedule);
   }
+  // Every committed trigger's attempts are counted, D-OPS4's maintenance trigger included.
   assert.match(monitoring.renderMonitoring(STAGING).metrics[2].body.filter,
-    /resource\.labels\.job_id=\("tibotattle-staging-analytics-refresh-trigger"\)/u);
+    /resource\.labels\.job_id=\("tibotattle-staging-analytics-refresh-trigger" OR "tibotattle-staging-maintenance-trigger"\)/u);
   assert.equal(policy(monitoring.renderMonitoring(STAGING), "scheduler-quiet").deferred, "SCHEDULER_CADENCE_UNSET");
 });
 
@@ -272,11 +273,14 @@ test("scheduler-quiet defers per trigger: one deferred trigger never silences an
   assert.deepEqual(monitoring.schedulerQuietConditions([unset, paused]), { conditions: [unset, paused],
     deferred: "SCHEDULER_CADENCE_UNSET", deferredConditions: [] });
   assert.throws(() => monitoring.schedulerQuietConditions([]), { code: "MONITORING_POLICY_INVALID" });
-  // The committed plane: one trigger, no cadence yet, so the whole policy waits.
+  // The committed plane: the refresh trigger has no cadence yet and D-OPS4's maintenance trigger is
+  // committed PAUSED, so the whole policy waits, with the first trigger's reason.
   const rendered = monitoring.renderMonitoring(STAGING);
   assert.deepEqual([policy(rendered, "scheduler-quiet").deferred, "deferredConditions" in policy(rendered, "scheduler-quiet")],
     ["SCHEDULER_CADENCE_UNSET", false]);
-  assert.equal(policy(monitoring.renderMonitoring(resumed("15 3 * * *")), "scheduler-quiet").deferredConditions, undefined);
+  // A resumed refresh trigger alerts on its own; the paused maintenance trigger drops only its condition.
+  assert.deepEqual(policy(monitoring.renderMonitoring(resumed("15 3 * * *")), "scheduler-quiet").deferredConditions,
+    [{ job: "maintenance", deferred: "TRIGGER_COMMITTED_PAUSED" }]);
 });
 
 test("cron gaps follow the validator's grammar in UTC", () => {
@@ -371,15 +375,20 @@ test("every policy links to its own anchor in the maintained runbook", () => {
   assert.match(source, /DECIDED: the owner accepted\s+\*\s+that delay for a daily trigger/u);
 });
 
-test("the origin request contract mirrors the origin's own log line where that module exists", async (t) => {
-  let host;
-  try {
-    host = await import("../cloud-run/postgres-host-dispatch.mjs");
-  } catch {
-    t.skip("cloud-run/postgres-host-dispatch.mjs (W3-CRA, D-CRB) is not on this line yet");
-    return;
-  }
-  assert.deepEqual([...host.ORIGIN_REQUEST_LOG_FIELDS], [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.fields]);
-  assert.deepEqual([...host.ORIGIN_REQUEST_LOG_EVENTS], [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.events]);
-  assert.deepEqual({ ...host.ORIGIN_ROUTE_NOT_PORTED }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
+test("the origin request contract mirrors the origin's own log line (cloud-run/postgres-host-dispatch.mjs)", () => {
+  // D-CRB put the module on this line. Its import graph reaches extensionless
+  // TypeScript imports that plain node cannot load, so the constants are read
+  // from its source, which declares each one as a literal.
+  const source = readFileSync(join(WORKER_ROOT, "cloud-run/postgres-host-dispatch.mjs"), "utf8");
+  const list = (name) => {
+    const match = new RegExp(`export const ${name} = Object\\.freeze\\(\\[([^\\]]*)\\]\\);`, "u").exec(source);
+    assert.ok(match, name);
+    return [...match[1].matchAll(/"([^"]+)"/gu)].map((entry) => entry[1]);
+  };
+  assert.deepEqual(list("ORIGIN_REQUEST_LOG_FIELDS"), [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.fields]);
+  assert.deepEqual(list("ORIGIN_REQUEST_LOG_EVENTS"), [...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.events]);
+  const notPorted = /export const ORIGIN_ROUTE_NOT_PORTED = Object\.freeze\(\{\s*status: (\d+),\s*code: "([A-Z_]+)",\s*\}\);/u
+    .exec(source);
+  assert.ok(notPorted, "ORIGIN_ROUTE_NOT_PORTED");
+  assert.deepEqual({ status: Number(notPorted[1]), code: notPorted[2] }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
 });

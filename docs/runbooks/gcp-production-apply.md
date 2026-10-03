@@ -126,7 +126,7 @@ node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-0
 ```
 
 Expect `exit=2`, `summary.refused` 0, `findings` and `blockers` both exactly
-`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 29 executable and 7 deferred
+`["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, 29 executable and 10 deferred
 operations. Stop on a refused operation, any other finding, or any live
 plane resource you did not expect.
 
@@ -182,7 +182,7 @@ node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-1
 node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringify(p.summary), JSON.stringify(p.findings), JSON.stringify(p.blockers));for(const o of p.operations)console.log(o.deferred?"DEFERRED":"RUN", o.id, o.deferred??"")' "$SCRATCH/prod-plan-1.json"
 ```
 
-Expect exit 0, no findings or blockers, 29 executable, 7 deferred, 0 refused.
+Expect exit 0, no findings or blockers, 29 executable, 10 deferred, 0 refused.
 The owner approves this list and its `planDigest`:
 
 - executable: six service accounts; the verifier's token-creator grant for
@@ -198,8 +198,12 @@ The owner approves this list and its `planDigest`:
   `tibotattle-migrator@tibotattle-prod.iam`); the `_Default` sink's
   request-log exclusion;
 - deferred: the service and its two invoker bindings
-  (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), both jobs and the scheduler's
-  executor binding (`BOOTSTRAP_IMAGE_REQUIRED`), and the trigger
+  (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), the migration and refresh jobs
+  and the scheduler's executor binding on the refresh job
+  (`BOOTSTRAP_IMAGE_REQUIRED`), D-OPS4's maintenance job, its every-minute
+  trigger `tibotattle-maintenance-trigger` and the scheduler's executor
+  binding on it (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`: the job reads the
+  namespace), and the trigger
   `tibotattle-analytics-refresh-trigger` (`SCHEDULER_CADENCE_UNSET`, C3). The
   trigger deferral is not a readiness reason for the rollout: `--require-clean`
   treats it as clean, because the measurement that decides the cadence needs
@@ -216,7 +220,7 @@ service renders without it.
 node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDigest> > "$SCRATCH/prod-apply-1.json"; echo "exit=$?"
 ```
 
-Expect exit 0 and `remaining` with 0 executable and 7 deferred. Cloud SQL
+Expect exit 0 and `remaining` with 0 executable and 10 deferred. Cloud SQL
 takes several minutes. No trigger exists, and the scheduler account has no
 executor grant, so nothing can start a job. Stop on the staging runbook's
 step 7 conditions.
@@ -374,7 +378,7 @@ Applying the alert policies is a later, separately authorized step.
 | Step | Gate |
 |---|---|
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
-| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs. It does not grant the scheduler account `roles/run.jobsExecutor`: the grant waits with the trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start either job. A new plan digest, so a new per-pass approval (C1) |
+| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image and the namespace pin (step 8). Creates the migration, refresh and maintenance jobs, then D-OPS4's maintenance trigger at its pinned `* * * * *` cadence: the trigger create, its pause, and only then the scheduler's executor grant on `tibotattle-maintenance`, the order the refresh trigger follows below. The trigger stays `PAUSED` until OPS-3 resumes it at cutover. It does not grant the scheduler account `roles/run.jobsExecutor` on the refresh job: that grant waits with the refresh trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start the refresh or migration job. A new plan digest, so a new per-pass approval (C1) |
 | The service and its invoker bindings | ROUTES-R12 drops `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template; the deferral then clears itself. Also the namespace pin (step 8) |
 | Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |
 | Create the trigger | After the production-scale measurement the owner supplies the refresh cadence (C3). Commit it as `scheduler.analytics-refresh.schedule`, then `plan` and `apply` under a new digest and a new per-pass approval. The plan is three operations in this order: the trigger create, its pause, and then the scheduler's executor grant. Cloud Scheduler creates the trigger `ENABLED`, but the account holds no grant until the pause has succeeded, and apply stops at a failed operation, so nothing can start the job in between. Check the result with `gcloud scheduler jobs describe tibotattle-analytics-refresh-trigger --location=us-east1 --project=tibotattle-prod --format="value(state)"`, which must read `PAUSED`. If the pause fails the trigger is `ENABLED` but the account holds no grant, so it cannot run the job; re-plan, and the repair plan pauses it and then grants. If the plan blocks on `SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh`, the account already holds a grant on the job (an earlier pass 2 that bound it, or a trigger removed by hand), and an `ENABLED` trigger created now could start the job before its pause: stop, and the owner removes `roles/run.jobsExecutor` for the scheduler account on `tibotattle-analytics-refresh` with an exact-target `gcloud run jobs remove-iam-policy-binding`, then re-plans. Apply never removes a grant |

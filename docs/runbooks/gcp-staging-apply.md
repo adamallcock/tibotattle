@@ -48,8 +48,8 @@ What the tooling guarantees, from code and offline checks
 
 What it does not prove: that gcloud's live output parses as the fake does
 (OPS2-READ), that the shared project has no co-tenant using a staging name
-or the project-wide custom role id, or that a staging service starts (it
-cannot until D-CRB). The `--no-log-http` behaviour was read from the local
+or the project-wide custom role id, or that a staging service starts (D-CRB
+composes `HOST_MODE=staging`, but no staging revision has run). The `--no-log-http` behaviour was read from the local
 Google Cloud SDK 569.0.0 source, not observed in a live run.
 
 ## Before you start
@@ -291,18 +291,21 @@ only non-staging-named entry is `custom-role:create` for
 
 Expected plan: exit 0, no findings or blockers, `summary.refused` 0. With
 the secrets and bucket already made, the first plan has 27 executable
-operations and 7 deferred.
+operations and 10 deferred.
 
 - Executable: the accounts, roles, repository, accessor bindings, Cloud SQL,
   and the verifier grant from step 1.
 - Deferred: the service and its two invoker bindings on
   `STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`, both jobs and the
-  scheduler's executor binding on `BOOTSTRAP_IMAGE_REQUIRED`, and the
-  trigger on `SCHEDULER_CADENCE_UNSET`.
+  scheduler's executor binding on `BOOTSTRAP_IMAGE_REQUIRED`, the
+  trigger on `SCHEDULER_CADENCE_UNSET`, and D-OPS4's maintenance job, its
+  trigger and the scheduler's executor binding on it on
+  `STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`.
 
 The in-memory rehearsal of this pass is the last test of
 `scripts/gcp-ops-infra-staging-service.check.mjs`. It uses a synthetic
-Access AUD, so its service deferral reads `STAGING_HOST_COMPOSITION_PENDING`.
+Access AUD, so its service deferral reads `BOOTSTRAP_IMAGE_REQUIRED`, and
+its pass 2 creates the service and its two invoker bindings.
 
 A rerun after a partial pass 1 plans only what is still missing. Cloud SQL
 IAM users are created under their PostgreSQL user names, for example
@@ -345,10 +348,11 @@ at STG-PREP's base; take exact flags from the line you run.
 | Done: name the verifier's operator in `serviceAccounts.verifier.tokenCreators` | Cleared. The owner named the operator in round 9 ("Staging verifier operator"), and `d86f9155` committed it to the staging file. The grant is now an executable operation in steps 1 and 7, not a deferral. With the operator named, OPS-10 accepts the committed staging rollout target, so `ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED` no longer applies (`17f3a78e`) |
 | Set `stagingOrigin.accessAud` to the staging admin Access application's AUD tag, commit | The owner creates that Access application (staging edge plan, phase C). Until then the service stays deferred |
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=staging --commit=<commit> --authorize=build:staging:<commit> --execute` | The verifier grant applied in pass 1 (step 7), and the staging lock. Every OPS-10 mutating verb (`build`, `migrate`, `roll`) for staging takes the staging coordination lock by pushing `refs/heads/codex/staging-deployment-lock` to GitHub, and never takes or reads the production lock `refs/heads/codex/production-deployment-lock` (`scripts/production-deployment-lock.mjs`, closed mapping `DEPLOYMENT_LOCK_REFS`). The owner authorized pushes of that one staging ref on 2026-10-02 (round 9, "Deploy lock"); no other push is authorized. First run the same command without `--authorize` and `--execute`: stop unless its `lockRef` reads exactly `refs/heads/codex/staging-deployment-lock`. A dry run with no `lockRef` comes from a checkout without STG-LOCK, which would take the production lock: stop. A held or uncertain staging lock (`STAGING_COORDINATION_*`) is a stop; so is `ROLLOUT_LOCK_REF_MISMATCH` or `DEPLOYMENT_COORDINATION_*` |
-| Apply, pass 2: `plan --environment=staging --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>`, then `apply` with the same bootstrap flags and the new plan digest. Creates both jobs | The image. The scheduler trigger stays absent until the owner sets the cadence (D3), and the scheduler account's `roles/run.jobsExecutor` grant waits with it (`SCHEDULER_CADENCE_UNSET`), so nothing can start either job |
-| The service | D-CRB must land the staging host composition: the server reads no `HOST_MODE` yet, so OPS-2 defers the service (`STAGING_HOST_COMPOSITION_PENDING`). The D-CRB merge removes that entry from `SERVICE_COMPOSITION_PENDING` together with its check; then pass 2 also creates the service |
+| Apply, pass 2: `plan --environment=staging --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>`, then `apply` with the same bootstrap flags and the new plan digest. Creates the migration and refresh jobs, and the service once the Access AUD is committed | The image. The scheduler trigger stays absent until the owner sets the cadence (D3), and the scheduler account's `roles/run.jobsExecutor` grant waits with it (`SCHEDULER_CADENCE_UNSET`), so nothing can start either job |
+| The service | Cleared for its composition: D-CRB composes `HOST_MODE=staging`, and the `STAGING_HOST_COMPOSITION_PENDING` gate was removed with its check when D-CRB and STG-PREP met on the fast-path final line. The service waits only for the Access AUD and the image |
+| The staging maintenance job | Not built. D-OPS4 defers the staging maintenance job, its trigger and the scheduler's grant (`STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`), which is not a clean deferral, so `readback --require-clean` stays unclean for staging, and OPS-10 refuses a staging roll through the origin verifier without a maintenance job (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). Rendering the staging maintenance job from the `stagingOrigin` block is open |
 | Backup audit: `node scripts/gcp-backup-horizon.mjs audit --environment=staging --project=tibotattle --primary-instance=tibotattle-staging-primary --region=us-east1` | Read-only; exit 0 or 2 is usable, 3 is a breach |
-| Migrate: `node scripts/gcp-production-rollout.mjs migrate --environment=staging --commit=<commit> --digest=<digest> --backup-audit=<file> --migrate-receipt=<new file> --authorize=migrate:staging:<digest> --execute` | A clean readback (needs the service, so D-CRB, and the verifier grant), the staging lock as for the bootstrap image (the dry run's `lockRef` is `refs/heads/codex/staging-deployment-lock`), and quiescence: OPS-10 counts every Cloud Run job trigger in `us-east1`, so a running test-estate trigger refuses it |
+| Migrate: `node scripts/gcp-production-rollout.mjs migrate --environment=staging --commit=<commit> --digest=<digest> --backup-audit=<file> --migrate-receipt=<new file> --authorize=migrate:staging:<digest> --execute` | A clean readback (needs the service, the verifier grant and the staging maintenance job row above), the staging lock as for the bootstrap image (the dry run's `lockRef` is `refs/heads/codex/staging-deployment-lock`), and quiescence: OPS-10 counts every Cloud Run job trigger in `us-east1`, so a running test-estate trigger refuses it |
 | Roll: `gcp-production-rollout.mjs roll ... --edge-live=<capture>` | A migrate receipt and a fresh `tibotattle-edge-live-capture-v1` capture of the tracked `env.staging` Worker. No repository command writes that capture yet, and the tracked staging Worker is the old workers.dev one, not the planned staging edge |
 
 ## Backup-restore rehearsal (E-OPS7)

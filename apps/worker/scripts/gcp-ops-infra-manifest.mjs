@@ -231,10 +231,12 @@ export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIEN
  * the stored GitHub snapshot through a fetcher that refuses every request
  * (src/postgres-admin-distribution.ts), the service's Worker env never
  * carries the token (cloud-run/server.mjs), and no production job syncs
- * GitHub (D-OPS4 is not built). Leaving the container out keeps the
- * credential out of one more store. The service renders without the entry,
- * as for an unpinned optional version. A later reader adds the container
- * back with a desired-state change.
+ * GitHub: the D-OPS4 maintenance job's profile accepts the token as optional,
+ * but its lifecycle pass (src/postgres-lifecycle-pass.ts) never reads it.
+ * Leaving the container out keeps the credential out of one more store. The
+ * service and the maintenance job render without the entry, as for an
+ * unpinned optional version. A later reader adds the container back with a
+ * desired-state change.
  */
 export const UNREAD_PRODUCTION_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
 
@@ -1704,14 +1706,29 @@ function jobEnv(desired, job, sourceCommit) {
 }
 
 /**
+ * The secrets a job reads that the desired state carries: the job definition's
+ * list, less an unread optional secret a production file leaves out
+ * (UNREAD_PRODUCTION_SECRET_NAMES; the maintenance job's
+ * DISTRIBUTION_GITHUB_API_TOKEN). Any other absent name is refused
+ * (JOB_RENDER_SECRET_UNKNOWN).
+ */
+export function jobSecretNames(desired, job) {
+  return (JOB_DEFINITIONS[job].secrets ?? []).filter((name) => {
+    if (Object.hasOwn(desired.secrets, name)) return true;
+    if (desired.environment === "production" && UNREAD_PRODUCTION_SECRET_NAMES.includes(name)) return false;
+    return fail(`JOB_RENDER_SECRET_UNKNOWN:${name}`);
+  });
+}
+
+/**
  * One job's secret env: each secret by Secret Manager reference at its pinned
  * version, as the service renders them. A required secret with no pinned
- * version cannot be rendered; an optional one is omitted.
+ * version cannot be rendered; an optional one is omitted, as is an unread one
+ * a production file leaves out (jobSecretNames).
  */
 function jobSecretEnv(desired, job) {
-  return (JOB_DEFINITIONS[job].secrets ?? []).flatMap((name) => {
+  return jobSecretNames(desired, job).flatMap((name) => {
     const secret = desired.secrets[name];
-    if (secret === undefined) fail(`JOB_RENDER_SECRET_UNKNOWN:${name}`);
     if (secret.version === null) {
       if (secret.required) fail(`SECRET_VERSION_UNPINNED:${name}`);
       return [];
@@ -2000,13 +2017,13 @@ export function rolloutTarget(environment, { readFile, readSource } = {}) {
  * environment's composition yet, by environment, with the reason. OPS-2
  * defers their create and update (serviceRenderBlocker), so an apply never
  * replaces a service with a revision that cannot start; renderService still
- * renders them for review. The server reads no HOST_MODE until D-CRB lands
- * the production and staging composition (CR-6/CR-7 phase B): the D-CRB
- * merge removes the staging entry, with its check.
+ * renders them for review. None today: D-CRB (CR-6/CR-7 phase B) composes
+ * HOST_MODE production and staging in cloud-run/server.mjs, so the staging
+ * entry (STAGING_HOST_COMPOSITION_PENDING) was removed when D-CRB and
+ * STG-PREP met on the fast-path final line. The mechanism stays for a plane
+ * whose composition is withdrawn.
  */
-export const SERVICE_COMPOSITION_PENDING = Object.freeze({
-  staging: "STAGING_HOST_COMPOSITION_PENDING",
-});
+export const SERVICE_COMPOSITION_PENDING = Object.freeze({});
 
 /**
  * The inert synthetic identity-provider identifiers the staging template

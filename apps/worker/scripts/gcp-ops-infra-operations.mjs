@@ -128,6 +128,7 @@ import {
   fail,
   jobRenderBlocker,
   jobRunUri,
+  jobSecretNames,
   renderEdgeIamPolicy,
   renderJob,
   renderService,
@@ -1196,7 +1197,7 @@ function jobInputDeferral(desired, observed, job) {
   if (definition.env.includes("GCS_QUARANTINE_BUCKET_HISTORY_PROOF") && desired.bucket.proof === null) {
     return "BUCKET_PROOF_UNPINNED";
   }
-  for (const name of definition.secrets ?? []) {
+  for (const name of jobSecretNames(desired, job)) {
     const secret = desired.secrets[name];
     if (secret.version === null) {
       if (secret.required) return `SECRET_VERSION_UNPINNED:${name}`;

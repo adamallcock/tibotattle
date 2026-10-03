@@ -100,11 +100,12 @@ schedule, and `null`, as `SCHEDULER_CADENCE_MISMATCH:maintenance`.
   enabled version (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`,
   `BUCKET_PROOF_UNPINNED`, `SECRET_VERSION_UNPINNED:<name>`,
   `SECRET_VERSION_UNAVAILABLE:<name>`). None of these is a clean deferral.
-- **Staging waits for its template.** The staging profile
+- **Staging waits for its environment.** The staging profile
   (`staging-maintenance-job`) also reads the staging plane's own origins and
-  identity values, which the desired state does not carry; they arrive with
-  the staging service template (STG-PREP, D-CRB). Until then the staging job
-  and trigger are never created
+  identity values. STG-PREP's `stagingOrigin` block and staging service
+  template now carry them for the service, but the job render does not read
+  them from there yet. Until it does, the staging job and trigger are never
+  created
   (`STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`, `JOB_ENVIRONMENT_UNAVAILABLE`)
   and the staging rollout target does not move the job.
 - **The rollout moves it.** The production target lists the maintenance job,
@@ -189,9 +190,14 @@ domain, AUD and admin email, the staging identity-link label and the
 staging admission mode (`closed` or `synthetic-rehearsal`, as CR-3 defines
 them).
 
-OPS-2 still defers creating it (`STAGING_HOST_COMPOSITION_PENDING`) until
-D-CRB lands the staging host composition: the server reads no `HOST_MODE`
-yet. The D-CRB merge removes that gate together with its check.
+D-CRB composes `HOST_MODE=staging` in `cloud-run/server.mjs`, so OPS-2 no
+longer holds the service for its composition: the `STAGING_HOST_COMPOSITION_PENDING`
+gate was removed, with its check, when D-CRB and STG-PREP met on the
+fast-path final line. The staging service still waits for the owner's Access
+AUD (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`). The staging
+maintenance job (D-OPS4) stays deferred
+(`STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`): its render does not
+yet read the staging plane's own origins and identity values.
 
 The staging secrets, bucket birth and apply follow
 `docs/runbooks/gcp-staging-apply.md`, with

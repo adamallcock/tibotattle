@@ -847,7 +847,7 @@ test("a staging target has no maintenance Job (D-OPS4), so its origin-verifier r
     const paths = await migrated(t, { target: STAGING_TARGET, edge: stagingGcpLive });
     await writeFile(paths.edgeLive, capture(stagingWorkerLive));
     const lock = fakeLock();
-    const estate = fakeEstate({ blobs: {}, target: STAGING_TARGET });
+    const estate = fakeEstate({ target: STAGING_TARGET });
     await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(estate, lock)),
       isCode("ROLLOUT_MAINTENANCE_JOB_REQUIRED"));
     assert.deepEqual(lock.events, []);
@@ -1021,10 +1021,11 @@ test("the service's HOST_ORIGIN is its one run.app origin, and a gcp edge must f
 test("first roll: the maintenance pass runs before verification, and the verifier path needs a maintenance Job", async (t) => {
   // Outside gcp mode the EP-6 verifier needs /api/ready to read ready, which
   // only a lifecycle pass makes true: the pass runs between the readback and
-  // the verifier's token.
+  // the verifier's token. The estates carry matching contract blobs, which
+  // D-BLOB requires in every edge mode.
   const paths = await migrated(t);
   await writeFile(paths.edgeLive, capture(workerLive));
-  const estate = fakeEstate({ blobs: {} });
+  const estate = fakeEstate({});
   await runRollout(executeRoll(paths), dependencies(estate, fakeLock()));
   const joined = estate.calls.map((argv) => argv.join(" "));
   const pass = joined.indexOf(ROLLOUT_ARGV.jobExecute(TARGET, TARGET.maintenanceJob).join(" "));
@@ -1035,18 +1036,18 @@ test("first roll: the maintenance pass runs before verification, and the verifie
   // Without a maintenance Job the origin-verifier path is refused before any command or lock.
   const noJob = { ...TARGET, maintenanceJob: null };
   const lock = fakeLock();
-  const bare = fakeEstate({ blobs: {}, target: noJob });
+  const bare = fakeEstate({ target: noJob });
   await assert.rejects(runRollout(executeRoll(paths), dependencies(bare, lock, { loadTarget: async () => noJob })),
     isCode("ROLLOUT_MAINTENANCE_JOB_REQUIRED"));
   assert.deepEqual(lock.events, []);
   assert.equal(bare.calls.some((argv) => argv[0] === "gcloud" && argv[3] !== "describe"), false);
   // A failed pass fails the roll closed and releases the lock.
-  const failed = fakeEstate({ blobs: {}, fail: `run jobs execute ${TARGET.maintenanceJob}` });
+  const failed = fakeEstate({ fail: `run jobs execute ${TARGET.maintenanceJob}` });
   const failedLock = fakeLock();
   await assert.rejects(runRollout(executeRoll(paths), dependencies(failed, failedLock)),
     isCode("ROLLOUT_MAINTENANCE_PASS_FAILED"));
   assert.deepEqual(failedLock.events.filter((event) => event !== "assert"), ["acquire", "release"]);
-  const unsucceeded = fakeEstate({ blobs: {}, executionStatus: { succeededCount: 0, failedCount: 1 } });
+  const unsucceeded = fakeEstate({ executionStatus: { succeededCount: 0, failedCount: 1 } });
   await assert.rejects(runRollout(executeRoll(paths), dependencies(unsucceeded, fakeLock())),
     isCode("ROLLOUT_MAINTENANCE_PASS_FAILED"));
   // In gcp mode the public health path needs no readiness, so a missing job

@@ -148,6 +148,8 @@ test("the rendered staging env, with provisioner-made secrets, is a staging conf
       schema: "tibotattle_staging" },
     iamUser: "tibotattle-staging-runtime@tibotattle.iam",
     bucket: "tibotattle-staging-quarantine",
+    // OD-2 (C-SIMP): CR-3 parses the rendered birth proof into its resources.
+    bucketHistoryProof: { bucket: "tibotattle-staging-quarantine", ...PROOF, softDeleteRetentionDurationSeconds: "0" },
   });
   assert.equal(config.edge.invokerServiceAccount, staging.serviceAccounts.edgeInvoker.email);
   // The synthetic-rehearsal admission mode opens accountless admission only.
@@ -159,16 +161,20 @@ test("the rendered staging env, with provisioner-made secrets, is a staging conf
   assert.throws(() => configuration.readProductionConfiguration(env, "production"), (error) => typeof error.code === "string");
 });
 
-test("OPS-2 defers the staging service until D-CRB lands the staging composition, and never calls that clean", () => {
+test("D-CRB composes HOST_MODE staging, so OPS-2 no longer defers the staging service for its composition", () => {
   const staging = desired();
   assert.equal(manifest.serviceTemplateBlocker(staging), null);
-  assert.equal(manifest.serviceRenderBlocker(staging), "STAGING_HOST_COMPOSITION_PENDING");
-  assert.deepEqual({ ...manifest.SERVICE_COMPOSITION_PENDING }, { staging: "STAGING_HOST_COMPOSITION_PENDING" });
+  assert.equal(manifest.serviceRenderBlocker(staging), null);
+  assert.deepEqual({ ...manifest.SERVICE_COMPOSITION_PENDING }, {});
   assert.equal(CLEAN_DEFERRALS.includes("STAGING_HOST_COMPOSITION_PENDING"), false);
-  // The server reads no HOST_MODE yet; when D-CRB adds it, its merge removes this gate with this assertion.
+  // The server reads HOST_MODE and composes the staging plane (D-CRB); this
+  // assertion replaced STG-PREP's "reads no HOST_MODE" guard when the two met.
   const server = readFileSync(join(WORKER_ROOT, "cloud-run/server.mjs"), "utf8");
-  assert.doesNotMatch(server, /\bHOST_MODE\b/u);
-  // Production has no composition gate here (it waits for OWN-5's placeholders).
+  assert.match(server, /\bHOST_MODE\b/u);
+  assert.match(server, /\bPRODUCTION_HOST_MODES\b/u);
+  const host = readFileSync(join(WORKER_ROOT, "cloud-run/postgres-production-host.mjs"), "utf8");
+  assert.match(host, /export const PRODUCTION_HOST_MODES = Object\.freeze\(\{\s*production: "production",\s*staging: "staging",\s*\}\);/u);
+  // Production has no composition gate either.
   assert.equal(Object.hasOwn(manifest.SERVICE_COMPOSITION_PENDING, "production"), false);
 });
 
@@ -349,7 +355,7 @@ test("the committed JSON Schema closes stagingOrigin to the validator's keys and
   assert.deepEqual(object.properties.accessAud.type, ["string", "null"]);
 });
 
-test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 the jobs, and the service waits for D-CRB", () => {
+test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 the service and the jobs", () => {
   const staging = desired();
   const world = emptyWorld();
   withSecretValues(world, { project: staging.project, region: staging.region,
@@ -368,27 +374,34 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
   // 26 plane operations plus the verifier token-creator grant (operator named 2026-10-02).
   assert.equal(first.summary.executable, 27);
-  assert.ok(deferred(first).includes("run-service:create:STAGING_HOST_COMPOSITION_PENDING"));
+  // D-CRB composes HOST_MODE staging, so the service waits only for the bootstrap image.
+  assert.ok(deferred(first).includes("run-service:create:BOOTSTRAP_IMAGE_REQUIRED"));
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
   const second = plan({ bootstrap: IMAGE });
   // Staging commits no refresh cadence, so no trigger is created and the scheduler's executor grant
   // is withheld with it (SCHEDULER_CADENCE_UNSET): the account cannot run a job nothing triggers.
+  // The staging maintenance job, its trigger and grant wait (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE).
   assert.deepEqual(second.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id), [
+    "run-service:create",
+    "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-invoker@tibotattle.iam.gserviceaccount.com|",
+    "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com|",
     "run-job:create:production-migrate", "run-job:create:analytics-refresh",
   ]);
   assert.ok(deferred(second).includes(
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
+  // Only the staging maintenance job, its trigger and the scheduler's grant on it keep the plane unclean.
   assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], [
-    "DEFERRED:run-service:create:STAGING_HOST_COMPOSITION_PENDING",
-    "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-invoker@tibotattle.iam.gserviceaccount.com|:STAGING_HOST_COMPOSITION_PENDING",
-    "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com|:STAGING_HOST_COMPOSITION_PENDING",
+    "DEFERRED:run-job:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+    "DEFERRED:scheduler:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+    "DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
   ]);
   // Nothing touched the co-tenant, and every mutation named the staging plane.
-  assert.deepEqual(world.services.map((service) => service.metadata.name), ["tibotattle-test-app"]);
+  assert.deepEqual(world.services.map((service) => service.metadata.name).sort(),
+    ["tibotattle-staging-origin", "tibotattle-test-app"]);
   for (const argv of gcloud.calls.filter((call) => operations.classifyGcloudCommand(call) === "mutate")) {
     assert.doesNotMatch(argv.join(" "), /tibotattle-test/u);
   }
