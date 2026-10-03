@@ -158,6 +158,9 @@ function outputs({ owners = [OWNER_A], ownerDays = [], ownerDayPrices = [] } = {
     owners: owners.map((ownerDigest) => ({ participantId: `participant-${ownerDigest.slice(0, 12)}`, ownerDigest,
       hasV1: false, hasV11: false, hasV12: true, hasLegacy: false, hasEffective: true, source: "effective" })),
     ownerDays, ownerDayPrices, cacheBands: [], ownerFits: [], ownerModelDates: [], dailyCandidates: [], blockedDays: [],
+    // E-OWNERSET: no published day, so no saved owner set is folded or recorded.
+    ownerSets: { contributionRetainedEvidenceAbsent: 0, savedMembersFolded: 0, memberContributionUnavailableDays: [],
+      memberLinkUnavailableDays: [] },
     preview: null, refusals: [], journal: { lastSequence: null }, timings: {},
   };
 }

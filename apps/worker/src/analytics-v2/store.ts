@@ -26,7 +26,11 @@
  *     revisionSeed) + 1 (store-publication.ts nextPublishedRevision; REV-SEED)
  *     and releasedAt = nowMs. An unchanged digest keeps the row untouched, and a
  *     blocked day is never written, so it keeps its prior row (or stays
- *     absent);
+ *     absent). Each published day records its saved owner set and member
+ *     contributions at that revision (store-owner-sets.ts, E-OWNERSET), after
+ *     checking that the set the fold used is still the stored one; an
+ *     unchanged head whose set was never recorded is adopted at its own
+ *     revision;
  *  4. it upserts the preview, advances the journal cursor (never backwards),
  *     and inserts the run row with the refusal list, the publication
  *     summary, the kernel stamp and the digest of the community aggregate
@@ -49,7 +53,8 @@
  * Layout (K-SPLIT): this module is the transaction and the public facade;
  * store-run.ts holds the output validation, the lock and cursor, the run row
  * and the prior-state read; store-derived.ts the owner-scoped families;
- * store-publication.ts the published heads and the preview.
+ * store-publication.ts the published heads and the preview;
+ * store-owner-sets.ts the saved owner sets and contributions.
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -64,6 +69,7 @@ import {
   registerAnalyticsV2KernelPrices,
   writeAnalyticsV2OwnerDayPrices,
 } from "./store-price";
+import { writeAnalyticsV2OwnerSets } from "./store-owner-sets";
 import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily } from "./store-publication";
 // REV-SEED: the one published-revision computation, for every publishing path.
 export { nextPublishedRevision } from "./store-publication";
@@ -105,6 +111,8 @@ export type { AnalyticsV2KernelEntry, AnalyticsV2KernelIdentity, AnalyticsV2RunS
 // derived-regime dirtiness an incremental planner reads.
 export { proveAnalyticsV2PriceTransitions, readAnalyticsV2PriceDirtyOwnerDays } from "./store-price";
 export type { AnalyticsV2PriceTransitions, AnalyticsV2PriceWriteSummary } from "./store-run";
+// E-OWNERSET: the contribution digests (the published revision is nextPublishedRevision above).
+export { analyticsV2ContributionDigests } from "./owner-sets";
 export {
   ANALYTICS_V2_CACHE_BANDS,
   ANALYTICS_V2_DAILY_REVISION_FIELDS,
@@ -191,8 +199,10 @@ export async function writeRunOutputs(
       prepared.computedOwnerDigests, horizon, runId, stamp);
     const basesRegistered = await writeAnalyticsV2OwnerDayPrices(client, schema, outputs.ownerDayPrices,
       kernelPrices.refs, runId, stamp);
-    const { published, unchanged } = await writeAnalyticsV2PublishedDaily(client, schema, prepared, runId,
-      releasedAt, stamp);
+    const { published, unchanged, revisions, priorRevisions } = await writeAnalyticsV2PublishedDaily(client, schema,
+      prepared, runId, releasedAt, stamp);
+    const ownerSets = await writeAnalyticsV2OwnerSets(client, schema, prepared.dailyCandidates,
+      { revisions, priorRevisions }, prepared.ownerSets, runId, stamp);
     await writeAnalyticsV2Preview(client, schema, outputs.preview, releasedAt, runId, stamp);
     const cursor = await advanceAnalyticsV2Cursor(client, schema, storedCursor, prepared.lastSequence, runId);
 
@@ -200,6 +210,7 @@ export async function writeRunOutputs(
       published: sortedDays(published),
       unchanged: sortedDays(unchanged),
       blocked: prepared.blockedDays,
+      ownerSets,
     };
     const clockMs = wallClock();
     if (!Number.isSafeInteger(clockMs) || !Number.isSafeInteger(writeStartedMs)) {

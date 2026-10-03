@@ -17,11 +17,20 @@
  * participant (owner decision on the SIMP-1 order, 2026-10-02); it is owner
  * tooling, not a module of the running service. The A2 synthetic cleanup
  * that deleted participants online is retired (owner decision OD-6).
+ *
+ * The saved owner sets (E-OWNERSET, the owner-sets migration) are deleted
+ * only by that purge: their trigger allows a DELETE when the transaction
+ * names the owner in the offline-purge session setting, and the runtime role
+ * holds DELETE on every table, so the trigger is the only barrier. This check
+ * therefore also fails when any production module of the running service
+ * (every module under src and cloud-run except checks and specs) names that
+ * setting, or deletes in a module that names a saved-set table, its contract
+ * key or the purge inventory. Each is pinned at zero.
  */
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -29,6 +38,26 @@ import { fileURLToPath } from "node:url";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCANNED = /^(?:src\/postgres-[^/]+\.ts|cloud-run\/.+\.(?:[cm]?js|ts))$/u;
+/** The running service's production modules (the saved-set purge rule). */
+const SERVICE_MODULE = /^(?:src\/.+\.ts|cloud-run\/.+\.(?:[cm]?js|ts))$/u;
+const NOT_PRODUCTION = /(?:\.(?:check|spec|test)\.[cm]?[jt]s|\.d\.ts)$/u;
+
+/** The offline-purge session setting the owner-sets migration's trigger reads. */
+export const OFFLINE_PURGE_SETTING = "analytics_v2_offline_purge";
+/**
+ * The tables only the offline purge deletes from, with their contract.ts
+ * ANALYTICS_V2_TABLES keys: the saved owner sets and contributions (the
+ * setting's trigger) and the per-day receipt (never deleted).
+ */
+export const PURGE_ONLY_TABLES = Object.freeze({
+  dailyOwnerSets: "analytics_v2_daily_owner_sets",
+  dailyContributions: "analytics_v2_daily_contributions",
+  ownerSetBootstrap: "analytics_v2_daily_owner_set_bootstrap",
+});
+const PURGE_INVENTORY = "ANALYTICS_V2_OWNER_SCOPED_TABLES";
+const SQL_DELETE = /\bDELETE\s+FROM\b/iu;
+const PURGE_ONLY_NAME = new RegExp(String.raw`\b(?:${[...Object.keys(PURGE_ONLY_TABLES),
+  ...Object.values(PURGE_ONLY_TABLES), PURGE_INVENTORY].join("|")})\b`, "u");
 
 /** The five deleted online-erasure modules. */
 export const DELETED_MODULES = Object.freeze([
@@ -70,6 +99,24 @@ export function inScope(path) {
   return SCANNED.test(path);
 }
 
+/** A production module of the running service (the saved-set purge rule's scope). */
+export function inServiceScope(path) {
+  return SERVICE_MODULE.test(path) && !NOT_PRODUCTION.test(path);
+}
+
+/**
+ * The saved-set purge rule's counts for one service module: each naming of
+ * the offline-purge setting, and a SQL delete in a module that names a
+ * purge-only table, its contract key or the purge inventory.
+ */
+export function scanPurgeText(text) {
+  const counts = {};
+  const settings = text.split(OFFLINE_PURGE_SETTING).length - 1;
+  if (settings > 0) counts["offline-purge setting"] = settings;
+  if (SQL_DELETE.test(text) && PURGE_ONLY_NAME.test(text)) counts["saved-set delete"] = 1;
+  return counts;
+}
+
 /** Retired-symbol and deleted-import counts of one module's text. */
 export function scanText(path, text, allowedSymbols = ALLOWED_SYMBOLS) {
   const counts = {};
@@ -105,7 +152,7 @@ async function modules(root) {
   const output = execFileSync("git", [
     "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "src", "cloud-run",
   ], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  return output.split("\0").filter((path) => path.length > 0 && inScope(path));
+  return output.split("\0").filter((path) => path.length > 0 && (inScope(path) || inServiceScope(path)));
 }
 
 export async function scanTree(root = WORKER_ROOT, paths = undefined) {
@@ -118,7 +165,8 @@ export async function scanTree(root = WORKER_ROOT, paths = undefined) {
       if (error?.code === "ENOENT") continue;
       throw error;
     }
-    const counts = scanText(path, text);
+    const counts = { ...(inScope(path) ? scanText(path, text) : {}),
+      ...(inServiceScope(path) ? scanPurgeText(text) : {}) };
     if (Object.keys(counts).length > 0) scanned[path] = counts;
   }
   return scanned;
@@ -202,6 +250,82 @@ if (process.argv.includes("--print")) {
     assert.equal(inScope("scripts/online-erasure-absence.check.mjs"), false);
     assert.deepEqual(violations({}, { "cloud-run/synthetic.mjs": { OWNER_DIGEST_TABLES: 1 } }),
       ["cloud-run/synthetic.mjs: OWNER_DIGEST_TABLES pinned at 1 but found 0; shrink the pin"]);
+  });
+
+  test("no service module names the offline-purge setting or deletes from a saved-set table", async () => {
+    const scanned = await scanTree();
+    for (const [file, counts] of Object.entries(scanned)) {
+      assert.deepEqual(Object.keys(counts).filter((key) => key === "offline-purge setting" || key === "saved-set delete"),
+        [], file);
+    }
+  });
+
+  test("the setting and each saved-set delete shape fail in a service module, and only there", () => {
+    const purge = (path, text) => ({ [path]: { ...(inScope(path) ? scanText(path, text) : {}),
+      ...(inServiceScope(path) ? scanPurgeText(text) : {}) } });
+    for (const [path, text] of [
+      ["src/analytics-v2/store-owner-sets.ts", "await client.query(\"SELECT set_config('tibotattle.analytics_v2_offline_purge', $1, true)\");"],
+      ["cloud-run/purge-job.mjs", "SET LOCAL tibotattle.analytics_v2_offline_purge = 'x'"],
+      ["src/postgres-maintenance.ts", "// names tibotattle.analytics_v2_offline_purge in a comment"],
+    ]) {
+      assert.deepEqual(purge(path, text)[path], { "offline-purge setting": 1 }, path);
+      assert.equal(violations(purge(path, text), {}).length, 1, path);
+    }
+    for (const text of [
+      "await client.query(`DELETE FROM ${relation(schema, tables.dailyContributions)} WHERE owner_digest = $1`);",
+      'await client.query(`DELETE FROM "s".analytics_v2_daily_owner_sets WHERE day = $1`);',
+      "for (const key of ANALYTICS_V2_OWNER_SCOPED_TABLES) await client.query(`delete from ${relation(schema, key)}`);",
+      "const table = tables.ownerSetBootstrap; await client.query(`DELETE FROM ${table}`);",
+    ]) {
+      const path = "src/analytics-v2/retire.ts";
+      assert.deepEqual(purge(path, text)[path], { "saved-set delete": 1 }, text);
+      assert.equal(violations(purge(path, text), {}).length, 1, text);
+    }
+    // The derived families a run replaces, a route's DELETE method, and a
+    // saved-set table named without a delete are not the rule's.
+    for (const text of [
+      "await client.query(`DELETE FROM ${relation(schema, tables.ownerDay)} WHERE owner_digest = ANY($1)`);",
+      'const methods = ["GET", "POST", "DELETE"]; const key = "dailyContributions";',
+      "await client.query(`INSERT INTO ${relation(schema, tables.dailyOwnerSets)} SELECT 1`);",
+    ]) {
+      assert.deepEqual(scanPurgeText(text), {}, text);
+    }
+    // Checks, specs and type declarations are not service modules; the rule
+    // covers every other module under src and cloud-run.
+    for (const path of ["cloud-run/host.check.mjs", "src/analytics-v2/owner-sets.spec.ts", "src/env.d.ts",
+      "scripts/purge.mjs", "postgres-test/analytics-v2-owner-sets.spec.mjs"]) {
+      assert.equal(inServiceScope(path), false, path);
+    }
+    for (const path of ["src/analytics-v2/store-owner-sets.ts", "src/participant-erasure.ts", "cloud-run/server.mjs",
+      "cloud-run/routes/v11-composition.mjs"]) {
+      assert.equal(inServiceScope(path), true, path);
+    }
+  });
+
+  test("the purge-only tables are the owner-sets migration's, with the setting its trigger reads", async () => {
+    const directories = [join(WORKER_ROOT, "postgres", "migrations", "primary"),
+      join(WORKER_ROOT, "postgres", "staged-migrations", "primary")];
+    const found = [];
+    for (const directory of directories) {
+      for (const name of await readdir(directory)) {
+        if (name.endsWith("_analytics_v2_owner_sets.sql")) found.push(join(directory, name));
+      }
+    }
+    assert.equal(found.length, 1, "exactly one owner-sets migration, staged or promoted");
+    const sql = await readFile(found[0], "utf8");
+    assert.match(sql, new RegExp(String.raw`current_setting\('tibotattle\.${OFFLINE_PURGE_SETTING}', true\)`, "u"));
+    const guarded = [...sql.matchAll(/BEFORE UPDATE OR DELETE ON (\w+)\s+FOR EACH ROW EXECUTE FUNCTION (\w+)\(\)/gu)]
+      .map(([, table, fn]) => [table, fn]).sort();
+    assert.deepEqual(guarded, [
+      [PURGE_ONLY_TABLES.dailyContributions, "analytics_v2_owner_sets_append_only"],
+      [PURGE_ONLY_TABLES.ownerSetBootstrap, "analytics_v2_owner_set_bootstrap_immutable"],
+      [PURGE_ONLY_TABLES.dailyOwnerSets, "analytics_v2_owner_sets_append_only"],
+    ].sort());
+    // contract.ts names each table under the same key.
+    const contract = await readFile(join(WORKER_ROOT, "src", "analytics-v2", "contract.ts"), "utf8");
+    for (const [key, table] of Object.entries(PURGE_ONLY_TABLES)) {
+      assert.match(contract, new RegExp(String.raw`\b${key}: "${table}"`, "u"), key);
+    }
   });
 
   test("the scan reads a temporary copy", async () => {

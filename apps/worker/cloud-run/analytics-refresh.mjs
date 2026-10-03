@@ -39,7 +39,13 @@
  * run left blocked. Untouched heads are never recomputed, so a change to the
  * eligible roster (opt-out, disconnect, expiry) is not applied retroactively
  * to published history; terminal journal events stop future uploads only and
- * re-queue nothing (2026-09-26 owner decisions).
+ * re-queue nothing (2026-09-26 owner decisions). A queued day is recomputed
+ * over its saved owner set (E-OWNERSET, owner decision round 2): a member
+ * that left the roster, or whose read for the day is empty, keeps its stored
+ * contribution (and a member that left keeps its exclusions), and the
+ * publication records the day's set and contributions (the receipt's
+ * `ownerSets` counts them and names blocked, verified, disclosed and adopted
+ * days; content-free).
  *
  * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
  * reviewed target path. The invocation is exactly
@@ -884,17 +890,18 @@ async function defaultCreatePool(database, { connector }) {
 
 /** Load the store and the default pipeline (bundled by esbuild from these literals). */
 export async function loadAnalyticsV2Modules() {
-  const [store, owners, occurrences, devices, queuedDays, compute] = await Promise.all([
+  const [store, owners, occurrences, devices, queuedDays, compute, ownerSets] = await Promise.all([
     import("../src/analytics-v2/store.ts"),
     import("../src/analytics-v2/owners.ts"),
     import("../src/analytics-v2/occurrence-source.ts"),
     import("../src/analytics-v2/devices.ts"),
     import("../src/analytics-v2/queued-days.ts"),
     import("../src/analytics-v2/compute.ts"),
+    import("../src/analytics-v2/owner-sets.ts"),
   ]);
   return Object.freeze({
     store,
-    pipeline: createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute }),
+    pipeline: createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets }),
   });
 }
 
@@ -1379,6 +1386,8 @@ export async function runAnalyticsRefresh({
         published: written.publication.published,
         unchanged: written.publication.unchanged.length,
         blocked: written.publication.blocked,
+        // E-OWNERSET: counts and days only (never an owner).
+        ownerSets: written.publication.ownerSets,
         cursor: written.cursor,
         timings: written.timings,
         memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)()),

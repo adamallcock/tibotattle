@@ -40,8 +40,8 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 72;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0072_analytics_v2_price_cards.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 73;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0073_analytics_v2_owner_sets.sql";
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
   ".wrangler",

@@ -502,9 +502,13 @@ function compareOwners(left, right) {
  * - readOwnerFirstEvidenceDay(context, {ownerDigest, throughDay}) -> the
  *   owner's first evidence day or null (the cache horizon's lower end);
  * - countContributingDevices(context, {days: Map(day -> effective owners)});
+ * - readAnalyticsV2OwnerSetState(context, {days}) -> every queued day's saved
+ *   owner set and, when needed, the frozen export's counts (E-OWNERSET), and
+ *   readAnalyticsV2SavedContributionValues(context, keys) -> the stored values
+ *   the fold asks for, loaded in the same snapshot during compute;
  * - computeAnalyticsV2({..., occurrenceRange, cacheFromDay,
- *   loadOwnerOccurrences, ownerEvidence, resources}) over ONE contiguous range
- *   that covers analyticsV2RequiredOccurrenceRange.
+ *   loadOwnerOccurrences, ownerEvidence, resources, ownerSets}) over ONE
+ *   contiguous range that covers analyticsV2RequiredOccurrenceRange.
  *
  * Effective owners are counted over the whole range during read and loaded,
  * one at a time and one A-2 segment at a time, during compute: every stream
@@ -521,7 +525,7 @@ function compareOwners(left, right) {
  * carried. Legacy-only (v0.2) owners are not daily-cohort members and are not
  * read.
  */
-export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute }) {
+export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets }) {
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
   const readQueued = requireFunction(queuedDays, "readQueuedDays");
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
@@ -529,6 +533,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
   const countDevices = requireFunction(devices, "countContributingDevices");
   const readExclusions = requireFunction(owners, "readAnalyticsV2Exclusions");
+  const readOwnerSets = requireFunction(ownerSets, "readAnalyticsV2OwnerSetState");
+  const readSavedValues = requireFunction(ownerSets, "readAnalyticsV2SavedContributionValues");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
   const requiredRange = requireFunction(compute, "analyticsV2RequiredOccurrenceRange");
   const analysisDays = requirePositiveInteger(compute?.ANALYTICS_V2_ANALYSIS_DAYS, "ANALYTICS_V2_ANALYSIS_DAYS");
@@ -636,9 +642,14 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // N-EXCL (src/analytics-v2/exclusions.ts): the community aggregate
       // exclusions, read in the run's snapshot. A linked owner's active rows
       // go to A-2, which leaves the owner out of each covered day's community
-      // aggregates; an unlinked participant is in no aggregate. When the
-      // table changed since the last completed run, every published day is
-      // republished.
+      // aggregates. So do those of a queued day's saved member that is not on
+      // the roster (E-OWNERSET: a departed member folds its stored
+      // contribution), mapped below through its owner link in any state; a
+      // saved member whose link is gone blocks its days in A-2
+      // (member_link_unavailable). An eligible participant without an active
+      // link computes nothing; while it has typed evidence nothing publishes.
+      // When the table changed since the last completed run, every published
+      // day is republished.
       const exclusions = await readExclusions(context);
       if (exclusions === null || typeof exclusions !== "object" || !Number.isSafeInteger(exclusions.rows)
           || !Number.isSafeInteger(exclusions.active) || exclusions.active < 0 || exclusions.active > exclusions.rows
@@ -721,6 +732,33 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const devicesByDay = await countDevices(context, { days: contributing });
       if (!(devicesByDay instanceof Map)) fail("ANALYTICS_V2_REFRESH_DEVICES_INVALID");
 
+      // E-OWNERSET: the queued days' saved owner sets (and the frozen counts a
+      // first recording of a frozen-window day compares with), in this snapshot.
+      const ownerSetState = await readOwnerSets(context, { days });
+      if (ownerSetState === null || typeof ownerSetState !== "object" || !(ownerSetState.days instanceof Map)
+          || ownerSetState.days.size !== days.length || !days.every((day) => ownerSetState.days.has(day))
+          || (ownerSetState.frozen !== null && typeof ownerSetState.frozen !== "object")
+          || ![...ownerSetState.days.values()].every((saved) => saved !== null && typeof saved === "object"
+            && saved.members instanceof Map)) {
+        fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+      }
+      // A saved member off the roster keeps its exclusions: they are mapped
+      // through the participant its owner link names (any link state).
+      const rosterDigests = new Set(listing.owners.map((owner) => owner.ownerDigest));
+      for (const saved of ownerSetState.days.values()) {
+        for (const [ownerDigest, member] of saved.members) {
+          if (rosterDigests.has(ownerDigest) || exclusionsByOwner.has(ownerDigest)) continue;
+          if (member === null || typeof member !== "object") fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+          if (member.participantId === null) continue;
+          if (typeof member.participantId !== "string") fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+          const intervals = exclusions.activeByParticipant.get(member.participantId);
+          if (intervals !== undefined) exclusionsByOwner.set(ownerDigest, intervals);
+        }
+      }
+      // The stored values a fold needs, read during compute while the
+      // snapshot is open (as the owner loads are).
+      const loadSavedContributions = (keys) => readSavedValues(context, keys);
+
       // One effective owner's occurrences over one A-2 segment (the whole
       // range when none is named), in spans of about the read chunk by its
       // exact counts. Called by A-2 only while the run's read snapshot is open
@@ -761,6 +799,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         cacheFromDay,
         devicesByDay,
         queuedDays: days,
+        ownerSetState,
+        loadSavedContributions,
         firstEvidenceDay,
         lastSequence: journal.lastSequence,
         terminalOwners: journal.terminalOwners,
@@ -785,6 +825,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         loadOwnerOccurrences: inputs.loadOwnerOccurrences,
         ownerEvidence: inputs.ownerEvidence,
         exclusions: inputs.exclusionsByOwner,
+        ownerSets: { state: inputs.ownerSetState, loadValues: inputs.loadSavedContributions },
         // Inline, the Job's resources partition one heap (analyticsRefreshResources),
         // so the run may reclaim the per-owner budget its largest owner leaves.
         // With compute workers (K-PAR) the owners' heaps are the Workers', and
@@ -796,7 +837,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         ...(checkpoint === undefined ? {} : { checkpoint }),
       });
       if (outputs === null || typeof outputs !== "object" || !Array.isArray(outputs.dailyCandidates)
-          || !Array.isArray(outputs.blockedDays)) {
+          || !Array.isArray(outputs.blockedDays) || outputs.ownerSets === null
+          || typeof outputs.ownerSets !== "object") {
         fail("ANALYTICS_V2_REFRESH_OUTPUTS_INVALID");
       }
       let publication = {};

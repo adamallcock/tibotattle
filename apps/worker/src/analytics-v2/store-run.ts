@@ -16,6 +16,7 @@ import type { PostgresClient } from "../postgres-client";
 import {
   ANALYTICS_V2_CACHE_BAND_COUNTERS,
   ANALYTICS_V2_CONTRACT_VERSION,
+  ANALYTICS_V2_DAILY_MEMBER_ORIGINS,
   ANALYTICS_V2_MODES,
   ANALYTICS_V2_OWNER_DAY_REFUSAL_REASONS,
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
@@ -27,8 +28,11 @@ import {
   ANALYTICS_V2_SHA256_PATTERN,
   ANALYTICS_V2_SINGLETON_ID,
   ANALYTICS_V2_TABLES,
+  type AnalyticsV2DailyMember,
   type AnalyticsV2Day,
   type AnalyticsV2Mode,
+  type AnalyticsV2OwnerSetBootstrap,
+  type AnalyticsV2OwnerSetSummary,
   type AnalyticsV2OwnerResources,
   type AnalyticsV2Phase,
   type AnalyticsV2PublicationSummary,
@@ -152,7 +156,9 @@ export type AnalyticsV2StoreErrorCode =
   | "ANALYTICS_V2_PRICE_CARD_UNREGISTERED"
   | "ANALYTICS_V2_PRICE_BASIS_CONFLICT"
   | "ANALYTICS_V2_PRICE_TRANSITION_STALE"
-  | "ANALYTICS_V2_PRICE_STATE_INVALID";
+  | "ANALYTICS_V2_PRICE_STATE_INVALID"
+  // E-OWNERSET (store-owner-sets.ts).
+  | "ANALYTICS_V2_OWNER_SET_CHANGED";
 
 /** Safe store failure: a closed code, an optional field path and SQLSTATE. */
 export class AnalyticsV2StoreError extends Error {
@@ -320,6 +326,9 @@ export interface PreparedDailyCandidate {
   readonly day: AnalyticsV2Day;
   readonly payload: Record<string, unknown>;
   readonly payloadSha256: string;
+  /** The day's owner set after this publication, in owner-digest order (E-OWNERSET). */
+  readonly members: readonly AnalyticsV2DailyMember[];
+  readonly bootstrap: AnalyticsV2OwnerSetBootstrap | null;
 }
 
 export interface PreparedOutputs {
@@ -331,6 +340,7 @@ export interface PreparedOutputs {
   readonly computedOwnerDigests: readonly string[];
   readonly dailyCandidates: readonly PreparedDailyCandidate[];
   readonly blockedDays: readonly AnalyticsV2Day[];
+  readonly ownerSets: AnalyticsV2OwnerSetSummary;
   readonly refusals: readonly AnalyticsV2Refusal[];
   readonly lastSequence: number | null;
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
@@ -622,9 +632,12 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     }
     const digest = await analyticsV2DailyContentSha256(candidate.payload);
     if (digest !== candidate.payloadSha256) fail("ANALYTICS_V2_DAILY_DIGEST_MISMATCH", "dailyCandidates.payloadSha256");
-    dailyCandidates.push({ day, payload: candidate.payload, payloadSha256: digest });
+    const members = validMembers(candidate.members, computed, candidate.payload);
+    dailyCandidates.push({ day, payload: candidate.payload, payloadSha256: digest, members,
+      bootstrap: validBootstrap(candidate.bootstrap, members, day) });
   }
   dailyCandidates.sort((left, right) => compareText(left.day, right.day));
+  const ownerSets = validOwnerSetSummary(outputs.ownerSets, blocked);
 
   if (outputs.preview !== null) {
     if (outputs.preview === undefined) invalid("preview");
@@ -662,11 +675,134 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     computedOwnerDigests: [...computed].sort(compareText),
     dailyCandidates,
     blockedDays: sortedDays(blocked),
+    ownerSets,
     refusals,
     lastSequence,
     timings: validTimings(outputs.timings, "timings"),
     resources: validResources(outputs.resources, effective, refusedOwners),
   };
+}
+
+const MEMBER_KEYS = "devices,origin,ownerDigest,savedVersion,values";
+const BOOTSTRAP_KEYS = "frozenExportSha256,frozenFromDay,frozenParticipants,frozenThroughDay,provenance";
+const OWNER_SET_SUMMARY_KEYS =
+  "contributionRetainedEvidenceAbsent,memberContributionUnavailableDays,memberLinkUnavailableDays,savedMembersFolded";
+const VALUES_SCHEMA = /^[A-Za-z0-9._:-]{1,64}$/u;
+const POSITIVE_INTEGER_LIMIT = 2_147_483_647;
+
+function positiveInteger(value: unknown, field: string): number {
+  if (assertNonNegativeSafeInteger(value, field) < 1 || (value as number) > POSITIVE_INTEGER_LIMIT) invalid(field);
+  return value as number;
+}
+
+/**
+ * A candidate's owner set (contract AnalyticsV2DailyMember): closed members in
+ * strictly ascending owner-digest order; a computed member is an owner this
+ * run computed, with its values (a JSON object naming its schemaVersion) and
+ * device count; a retained member is a computed owner folding the saved
+ * version it names; a saved member is an owner this run did not compute,
+ * folding the saved version it names; an excluded member folds nothing. The
+ * payload's contributingParticipants is the number of members folded (every
+ * stored contribution has a record, and so does every computed member's).
+ */
+function validMembers(value: unknown, computed: ReadonlySet<string>,
+  payload: Record<string, unknown>): AnalyticsV2DailyMember[] {
+  assertArray(value, "dailyCandidates.members");
+  assertCapacity(value.length, ANALYTICS_V2_OUTPUT_LIMITS.owners, "dailyCandidates.members");
+  const members: AnalyticsV2DailyMember[] = [];
+  let previous = "";
+  for (const member of value) {
+    if (!plainObject(member) || Object.keys(member).sort().join(",") !== MEMBER_KEYS
+        || typeof member.ownerDigest !== "string" || !ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(member.ownerDigest)
+        || member.ownerDigest <= previous
+        || !(ANALYTICS_V2_DAILY_MEMBER_ORIGINS as readonly unknown[]).includes(member.origin)) {
+      invalid("dailyCandidates.members");
+    }
+    previous = member.ownerDigest as string;
+    const origin = member.origin as AnalyticsV2DailyMember["origin"];
+    if (origin === "computed") {
+      if (!computed.has(member.ownerDigest as string) || member.savedVersion !== null
+          || !plainObject(member.values) || typeof member.values.schemaVersion !== "string"
+          || !VALUES_SCHEMA.test(member.values.schemaVersion)) {
+        invalid("dailyCandidates.members.computed");
+      }
+      assertJsonValue(member.values, "dailyCandidates.members.values");
+      positiveInteger(member.devices, "dailyCandidates.members.devices");
+    } else {
+      if (member.values !== null || member.devices !== null) invalid("dailyCandidates.members.values");
+      if (origin === "excluded") {
+        if (member.savedVersion !== null) invalid("dailyCandidates.members.savedVersion");
+      } else {
+        positiveInteger(member.savedVersion, "dailyCandidates.members.savedVersion");
+        if ((origin === "retained") !== computed.has(member.ownerDigest as string)) {
+          invalid("dailyCandidates.members.origin");
+        }
+      }
+    }
+    members.push(Object.freeze({ ownerDigest: member.ownerDigest as string, origin, values: member.values ?? null,
+      devices: (member.devices ?? null) as number | null, savedVersion: (member.savedVersion ?? null) as number | null }));
+  }
+  const totals = payload.totals;
+  if (!plainObject(totals)
+      || totals.contributingParticipants !== members.filter((member) => member.origin !== "excluded").length) {
+    invalid("dailyCandidates.members.contributingParticipants");
+  }
+  return members;
+}
+
+/**
+ * A day's first set recording (its receipt): every member is new (no saved,
+ * retained or excluded member). Provenance 2 or 3 names the frozen export
+ * and a window that holds the day, and is verified (2) exactly when
+ * Cloudflare's count equals the set's size; 1 and 4 name no frozen export.
+ */
+function validBootstrap(value: unknown, members: readonly AnalyticsV2DailyMember[],
+  day: AnalyticsV2Day): AnalyticsV2OwnerSetBootstrap | null {
+  if (value === null) return null;
+  if (!plainObject(value) || Object.keys(value).sort().join(",") !== BOOTSTRAP_KEYS
+      || ![1, 2, 3, 4].includes(value.provenance as number)
+      || members.some((member) => member.origin !== "computed")) {
+    invalid("dailyCandidates.bootstrap");
+  }
+  const provenance = value.provenance as AnalyticsV2OwnerSetBootstrap["provenance"];
+  if (provenance === 2 || provenance === 3) {
+    if (typeof value.frozenExportSha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(value.frozenExportSha256)
+        || (value.frozenParticipants !== null
+          && assertNonNegativeSafeInteger(value.frozenParticipants, "dailyCandidates.bootstrap") > POSITIVE_INTEGER_LIMIT)
+        || assertDay(value.frozenFromDay, "dailyCandidates.bootstrap") > day
+        || assertDay(value.frozenThroughDay, "dailyCandidates.bootstrap") < day
+        || (provenance === 2) !== (value.frozenParticipants === members.length)) {
+      invalid("dailyCandidates.bootstrap");
+    }
+  } else if (value.frozenExportSha256 !== null || value.frozenParticipants !== null || value.frozenFromDay !== null
+      || value.frozenThroughDay !== null) {
+    invalid("dailyCandidates.bootstrap");
+  }
+  return Object.freeze({ provenance, frozenParticipants: value.frozenParticipants as number | null,
+    frozenExportSha256: value.frozenExportSha256 as string | null,
+    frozenFromDay: value.frozenFromDay as AnalyticsV2Day | null,
+    frozenThroughDay: value.frozenThroughDay as AnalyticsV2Day | null });
+}
+
+/** Strictly ascending days of the summary, each a blocked day. */
+function blockedSummaryDays(value: unknown, field: string, blocked: ReadonlySet<string>): readonly AnalyticsV2Day[] {
+  assertArray(value, field);
+  const days = value.map((day) => assertDay(day, field));
+  if (days.some((day, index) => !blocked.has(day) || (index > 0 && days[index - 1]! >= day))) invalid(field);
+  return Object.freeze(days);
+}
+
+/** The fold's owner-set summary: closed counts, and unavailable days that are blocked days. */
+function validOwnerSetSummary(value: unknown, blocked: ReadonlySet<string>): AnalyticsV2OwnerSetSummary {
+  if (!plainObject(value) || Object.keys(value).sort().join(",") !== OWNER_SET_SUMMARY_KEYS) invalid("ownerSets");
+  const retained = assertNonNegativeSafeInteger(value.contributionRetainedEvidenceAbsent, "ownerSets.retained");
+  const saved = assertNonNegativeSafeInteger(value.savedMembersFolded, "ownerSets.saved");
+  const contribution = blockedSummaryDays(value.memberContributionUnavailableDays,
+    "ownerSets.memberContributionUnavailableDays", blocked);
+  const link = blockedSummaryDays(value.memberLinkUnavailableDays, "ownerSets.memberLinkUnavailableDays", blocked);
+  if (link.some((day) => contribution.includes(day))) invalid("ownerSets.memberLinkUnavailableDays");
+  return Object.freeze({ contributionRetainedEvidenceAbsent: retained, savedMembersFolded: saved,
+    memberContributionUnavailableDays: contribution, memberLinkUnavailableDays: link });
 }
 
 /** Options for one run's write. The client must not be inside a transaction. */

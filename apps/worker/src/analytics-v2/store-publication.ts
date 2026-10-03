@@ -22,6 +22,12 @@
  * non-test Worker source but this one writes the published heads. A table
  * name assembled at run time escapes them; the database refuses a head at
  * or below its floor regardless (analytics_v2_published_daily_above_floor).
+ *
+ * Every record of a publication's revision takes the value
+ * nextPublishedRevision returns: the head here, and the owner-set rows and
+ * contribution versions the same publication appends (store-owner-sets.ts,
+ * first_revision, E-OWNERSET), so the floor and the seed reach all of them
+ * at once.
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -61,10 +67,17 @@ export function nextPublishedRevision(input: {
   return Math.max(...parts) + 1;
 }
 
-/** Publish the changed daily candidates; returns the published and unchanged days, in candidate order. */
+/**
+ * Publish the changed daily candidates; returns the published and unchanged
+ * days, in candidate order, the revision each published day took, and the
+ * revision of every candidate day's head before this run (row-locked here;
+ * absent when the day had no head).
+ */
 export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, schema: string,
   prepared: PreparedOutputs, runId: string, releasedAt: string, stamp: AnalyticsV2RunStamp): Promise<{
     readonly published: AnalyticsV2Day[]; readonly unchanged: AnalyticsV2Day[];
+    readonly revisions: ReadonlyMap<AnalyticsV2Day, number>;
+    readonly priorRevisions: ReadonlyMap<AnalyticsV2Day, number>;
   }> {
   const tables = ANALYTICS_V2_TABLES;
   // Published heads: write only days whose content digest changed. Blocked
@@ -106,6 +119,7 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
   }
   const published: AnalyticsV2Day[] = [];
   const unchanged: AnalyticsV2Day[] = [];
+  const revisions = new Map<AnalyticsV2Day, number>();
   const publishRows: unknown[] = [];
   for (const candidate of prepared.dailyCandidates) {
     const head = heads.get(candidate.day);
@@ -115,6 +129,7 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
     }
     const revision = nextPublishedRevision({ head: head?.revision, floor: floors.get(candidate.day),
       seed: prepared.revisionSeed });
+    revisions.set(candidate.day, revision);
     const payload = stampAnalyticsV2DailyPayload(candidate.payload, {
       day: candidate.day,
       revision,
@@ -164,7 +179,8 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
     publishRows,
     "dailyCandidates",
     "ANALYTICS_V2_PUBLICATION_CONFLICT");
-  return { published, unchanged };
+  const priorRevisions = new Map<AnalyticsV2Day, number>([...heads].map(([day, head]) => [day, head.revision]));
+  return { published, unchanged, revisions, priorRevisions };
 }
 
 /** Upsert the preview singleton (null when the run withheld it). */

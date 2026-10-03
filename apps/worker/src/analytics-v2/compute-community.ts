@@ -21,6 +21,28 @@
  * carries (today's cohort for the coverage, each day's cohort for its band
  * and model date). The owner's own rows and refusals are unchanged. With no
  * exclusion the outputs are exactly the fold without them.
+ *
+ * Saved owner sets (E-OWNERSET, engine v2 design section 6.2; owner decision
+ * round 2: past contributions are kept): a queued, unblocked day d folds its
+ * saved set S(d) plus every computed owner with non-empty values on d. The
+ * computed owners fold exactly as before, in owner-digest order; a member of
+ * S(d) this run did not compute, or a computed member whose read for d is
+ * empty, folds its current stored contribution in its digest position
+ * instead of nothing; a member excluded on d folds nothing, on or off the
+ * roster (the reader maps a member's exclusions through its owner link in any
+ * state). A member whose contribution the run's kernel cannot fold (its
+ * values schema or price identity is not current) blocks d
+ * (member_contribution_unavailable), and so does a member the run did not
+ * compute whose owner link is gone, since its exclusions cannot be read
+ * (member_link_unavailable); either keeps d's prior head: never a zero, never
+ * a dropped member, never a fold that skips an exclusion. With no saved set
+ * the fold is byte-for-byte the computed-owners fold. Each candidate carries
+ * the day's members after its publication and, when the day's set is not
+ * recorded yet, how it begins (`bootstrap`, the day's receipt): provenance 4
+ * for a day that already has a published head (adopted); for a first
+ * publication inside the frozen window, 2 or 3 (owner decision round 7: the
+ * participants at GCP's first publication, compared with the frozen export's
+ * contributingParticipants); otherwise 1.
  */
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
@@ -33,17 +55,24 @@ import {
   buildCommunityModelCompositionDay,
   publicInputs,
   validCachedAdminCommunityAllowancePreview,
+  validateV11DailyProjectionValues,
   type AdminCommunityModelCompositionDay,
   type CachedCommunityModelCompositions,
   type CommunityAllowanceFit,
   type V11DailyProjectionValues,
   type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
-import type {
-  AnalyticsV2DailyCandidate,
-  AnalyticsV2Day,
-  AnalyticsV2Owner,
-  AnalyticsV2OwnerDigest,
+import {
+  ANALYTICS_V2_OWNER_SET_PROVENANCE,
+  type AnalyticsV2DailyCandidate,
+  type AnalyticsV2DailyMember,
+  type AnalyticsV2Day,
+  type AnalyticsV2Owner,
+  type AnalyticsV2OwnerDigest,
+  type AnalyticsV2OwnerSetBootstrap,
+  type AnalyticsV2OwnerSetState,
+  type AnalyticsV2OwnerSetSummary,
+  type AnalyticsV2SavedDay,
 } from "./contract";
 import { analyticsV2ExcludedOn, type AnalyticsV2ExclusionInterval } from "./exclusions";
 
@@ -109,6 +138,11 @@ export interface AnalyticsV2CommunityInput {
   readonly dailyValues: ReadonlyMap<AnalyticsV2Day, ReadonlyMap<AnalyticsV2OwnerDigest, V11DailyProjectionValues>>;
   /** Effective owners that were computed (admitted by the memory budget), in digest order. */
   readonly computedOwners: readonly AnalyticsV2Owner[];
+  /**
+   * Every owner of the run (any source, computed or refused): the roster,
+   * whose exclusions the run read through its active links.
+   */
+  readonly rosterDigests: ReadonlySet<AnalyticsV2OwnerDigest>;
   readonly effectiveDigests: readonly AnalyticsV2OwnerDigest[];
   readonly devicesByDay: ReadonlyMap<AnalyticsV2Day, ReadonlyMap<AnalyticsV2OwnerDigest, number>>;
   readonly fitsByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>;
@@ -121,8 +155,99 @@ export interface AnalyticsV2CommunityInput {
    * carries the model dates is withheld for the run; it is never listed here.)
    */
   readonly modelRefusedByDate: ReadonlyMap<AnalyticsV2Day, readonly AnalyticsV2OwnerDigest[]>;
-  /** computed owner -> its active community aggregate exclusions (N-EXCL; absent: none). */
+  /**
+   * computed owner or saved member -> its active community aggregate
+   * exclusions (N-EXCL; absent: none).
+   */
   readonly exclusions: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
+  /**
+   * E-OWNERSET: every queued day's saved set and the frozen counts
+   * (owner-sets.ts), and the stored values of the contributions this fold
+   * needs, keyed by analyticsV2ContributionKey (a needed key that is absent
+   * makes its day unavailable).
+   */
+  readonly ownerSets: AnalyticsV2OwnerSetState;
+  readonly savedValues: ReadonlyMap<string, unknown>;
+}
+
+/**
+ * Saved contributions the compute core asks the reader for at once. Each
+ * chunk is charged to the run's output account before the next is read, so
+ * the output budget, not a count, bounds what a run holds.
+ */
+export const ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK = 1_000;
+
+/** analyticsV2ContributionKey without the I/O module (owner-sets.ts holds the same construction). */
+export function analyticsV2SavedValueKey(day: AnalyticsV2Day, ownerDigest: AnalyticsV2OwnerDigest,
+  version: number): string {
+  return `${day}\u0001${ownerDigest}\u0001${version}`;
+}
+
+/** True when the values carry at least one record (publicInputs counts the owner as a participant). */
+export function analyticsV2ValuesNonEmpty(value: V11DailyProjectionValues): boolean {
+  return value.counts.usage + value.counts.quota + value.counts.session > 0;
+}
+
+/**
+ * A stored contribution the run's kernel can fold for `day`: the current
+ * daily-values contract (schema, pricing method and price registry, which
+ * validateV11DailyProjectionValues pins), the same day, and at least one
+ * record. Anything else is unavailable (K-REPRICE reprices it after cutover).
+ */
+function foldableContribution(value: unknown, day: AnalyticsV2Day): V11DailyProjectionValues | null {
+  try {
+    validateV11DailyProjectionValues(value);
+  } catch {
+    return null;
+  }
+  const values = value as V11DailyProjectionValues;
+  return values.day === day && analyticsV2ValuesNonEmpty(values) ? values : null;
+}
+
+/**
+ * True when a member of `saved` that is not on the run's roster has no owner
+ * link row (participantId null): its exclusions cannot be read, so the day
+ * cannot be folded (member_link_unavailable). A roster owner's exclusions are
+ * read through the roster's own links, in the same snapshot.
+ */
+function memberLinkUnavailable(saved: AnalyticsV2SavedDay | undefined,
+  roster: ReadonlySet<AnalyticsV2OwnerDigest>): boolean {
+  if (saved === undefined) return false;
+  for (const [ownerDigest, member] of saved.members) {
+    if (member.participantId === null && !roster.has(ownerDigest)) return true;
+  }
+  return false;
+}
+
+/**
+ * The saved contributions a fold of `queued` needs: per day whose
+ * off-roster members all have their links, every member of S(d) not excluded
+ * on d that this run did not compute, or computed with empty values on d.
+ * Shared by computeAnalyticsV2 (to load them) and the fold.
+ */
+export function analyticsV2NeededContributions(input: {
+  readonly queued: readonly AnalyticsV2Day[];
+  readonly ownerSets: AnalyticsV2OwnerSetState;
+  readonly computedOwners: readonly AnalyticsV2Owner[];
+  readonly rosterDigests: ReadonlySet<AnalyticsV2OwnerDigest>;
+  readonly dailyValues: ReadonlyMap<AnalyticsV2Day, ReadonlyMap<AnalyticsV2OwnerDigest, V11DailyProjectionValues>>;
+  readonly exclusions: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
+}): Array<{ readonly day: AnalyticsV2Day; readonly ownerDigest: AnalyticsV2OwnerDigest; readonly version: number }> {
+  const computed = new Set(input.computedOwners.map((owner) => owner.ownerDigest));
+  const needed: Array<{ day: AnalyticsV2Day; ownerDigest: AnalyticsV2OwnerDigest; version: number }> = [];
+  for (const day of input.queued) {
+    const saved = input.ownerSets.days.get(day);
+    if (saved === undefined || memberLinkUnavailable(saved, input.rosterDigests)) continue;
+    for (const [ownerDigest, member] of [...saved.members].sort(([left], [right]) => (left < right ? -1 : 1))) {
+      if (analyticsV2ExcludedOn(input.exclusions.get(ownerDigest), day)) continue;
+      if (computed.has(ownerDigest)) {
+        const fresh = input.dailyValues.get(day)?.get(ownerDigest);
+        if (fresh !== undefined && analyticsV2ValuesNonEmpty(fresh)) continue;
+      }
+      needed.push({ day, ownerDigest, version: member.version });
+    }
+  }
+  return needed;
 }
 
 /**
@@ -133,6 +258,7 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
   readonly dailyCandidates: AnalyticsV2ComputedDailyCandidate[];
   readonly blockedDays: AnalyticsV2Day[];
   readonly preview: unknown;
+  readonly ownerSets: AnalyticsV2OwnerSetSummary;
 }> {
   const nowIso = new Date(input.nowMs).toISOString();
   const computedOwners = input.computedOwners;
@@ -144,27 +270,117 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
     [...input.blockers.get(day) ?? []].some((ownerDigest) => !excluded(ownerDigest, day)));
   const blocked = new Set(blockedDays);
   const dailyCandidates: AnalyticsV2ComputedDailyCandidate[] = [];
+  const computedDigests = new Set(computedOwners.map((owner) => owner.ownerDigest));
+  const memberContributionUnavailableDays: AnalyticsV2Day[] = [];
+  const memberLinkUnavailableDays: AnalyticsV2Day[] = [];
+  let contributionRetainedEvidenceAbsent = 0;
+  let savedMembersFolded = 0;
   for (const day of input.queued) {
     if (blocked.has(day)) continue;
+    const savedDay = input.ownerSets.days.get(day);
+    if (memberLinkUnavailable(savedDay, input.rosterDigests)) {
+      memberLinkUnavailableDays.push(day);
+      continue;
+    }
     const byOwner = input.dailyValues.get(day)!;
+    const saved = savedDay?.members ?? new Map();
     // A memory-refused owner blocks every queued day it has evidence on, so
     // on an unblocked day it has none or is excluded: either way it adds
-    // nothing (publicInputs adds nothing for an owner without records). An
-    // owner excluded on the day (N-EXCL) is left out of its fold, so an
-    // excluded owner that blocked it, and so has no values, is never read.
-    const included = computedOwners.filter((owner) => !excluded(owner.ownerDigest, day));
-    const values = included.map((owner) => byOwner.get(owner.ownerDigest)!);
+    // nothing (publicInputs adds nothing for an owner without records), and
+    // if it is a member of S(d) it folds its saved contribution. An owner
+    // excluded on the day (N-EXCL) is left out of its fold, so an excluded
+    // owner that blocked it, and so has no values, is never read.
+    const digests = [...new Set([...computedDigests, ...saved.keys()])].sort();
     const counted = input.devicesByDay.get(day);
-    const devices = values.map((value, index) => {
-      if (value.counts.usage + value.counts.quota + value.counts.session === 0) return 0;
-      if (counted === undefined) return invalid("devicesByDay.missingDay");
-      return counted.get(included[index]!.ownerDigest) ?? 1;
-    });
+    const values: V11DailyProjectionValues[] = [];
+    const devices: number[] = [];
+    const members: AnalyticsV2DailyMember[] = [];
+    let unavailable = false;
+    let retained = 0, folded = 0;
+    const foldSaved = (ownerDigest: AnalyticsV2OwnerDigest): boolean => {
+      const member = saved.get(ownerDigest)!;
+      const stored = foldableContribution(
+        input.savedValues.get(analyticsV2SavedValueKey(day, ownerDigest, member.version)), day);
+      if (stored === null) return false;
+      values.push(stored);
+      devices.push(member.devices);
+      return true;
+    };
+    for (const ownerDigest of digests) {
+      const member = saved.get(ownerDigest);
+      if (excluded(ownerDigest, day)) {
+        if (member !== undefined) {
+          members.push(Object.freeze({ ownerDigest, origin: "excluded", values: null, devices: null, savedVersion: null }));
+        }
+        continue;
+      }
+      if (computedDigests.has(ownerDigest)) {
+        const value = byOwner.get(ownerDigest)!;
+        if (analyticsV2ValuesNonEmpty(value)) {
+          if (counted === undefined) return invalid("devicesByDay.missingDay");
+          const owned = counted.get(ownerDigest) ?? 1;
+          values.push(value);
+          devices.push(owned);
+          members.push(Object.freeze({ ownerDigest, origin: "computed", values: value, devices: owned, savedVersion: null }));
+        } else if (member !== undefined) {
+          // Its read for d is empty: its last contribution is kept, never a zero.
+          if (!foldSaved(ownerDigest)) { unavailable = true; break; }
+          retained++;
+          members.push(Object.freeze({ ownerDigest, origin: "retained", values: null, devices: null,
+            savedVersion: member.version }));
+        } else {
+          // Not a member and nothing on d: folded as before (adds nothing).
+          values.push(value);
+          devices.push(0);
+        }
+        continue;
+      }
+      // A member this run did not compute: its current contribution.
+      if (!foldSaved(ownerDigest)) { unavailable = true; break; }
+      folded++;
+      members.push(Object.freeze({ ownerDigest, origin: "saved", values: null, devices: null,
+        savedVersion: member!.version }));
+    }
+    if (unavailable) {
+      memberContributionUnavailableDays.push(day);
+      continue;
+    }
+    contributionRetainedEvidenceAbsent += retained;
+    savedMembersFolded += folded;
     const inputs = publicInputs(values, devices);
     const payload = buildCommunityDailyPayload({ day, revision: input.revisionSeed + 1, releasedAt: nowIso, ...inputs });
+    // A day whose set is not recorded yet: its first recording, every member
+    // new. An unrecorded head is adopted (4); a first publication inside the
+    // frozen window is compared with Cloudflare's count (round 7: 2 or 3);
+    // any other first publication is 1.
+    let bootstrap: AnalyticsV2OwnerSetBootstrap | null = null;
+    const frozen = input.ownerSets.frozen;
+    if (savedDay?.recorded !== true) {
+      const none = { frozenParticipants: null, frozenExportSha256: null, frozenFromDay: null, frozenThroughDay: null };
+      if (savedDay?.headPublished === true) {
+        bootstrap = Object.freeze({ provenance: ANALYTICS_V2_OWNER_SET_PROVENANCE.adopted, ...none });
+      } else if (frozen !== null && day >= frozen.fromDay && day <= frozen.throughDay) {
+        const frozenParticipants = frozen.participants.get(day) ?? null;
+        bootstrap = Object.freeze({
+          provenance: frozenParticipants === members.length ? ANALYTICS_V2_OWNER_SET_PROVENANCE.cutoverVerified
+            : ANALYTICS_V2_OWNER_SET_PROVENANCE.cutoverDisclosed,
+          frozenParticipants,
+          frozenExportSha256: frozen.exportSha256,
+          frozenFromDay: frozen.fromDay,
+          frozenThroughDay: frozen.throughDay,
+        });
+      } else {
+        bootstrap = Object.freeze({ provenance: ANALYTICS_V2_OWNER_SET_PROVENANCE.published, ...none });
+      }
+    }
     dailyCandidates.push(Object.freeze({ day, payload, payloadSha256: await analyticsV2DailyContentSha256(payload),
-      inputs }));
+      inputs, members: Object.freeze(members), bootstrap }));
   }
+  const ownerSets: AnalyticsV2OwnerSetSummary = Object.freeze({ contributionRetainedEvidenceAbsent, savedMembersFolded,
+    memberContributionUnavailableDays: Object.freeze(memberContributionUnavailableDays),
+    memberLinkUnavailableDays: Object.freeze(memberLinkUnavailableDays) });
+  const ownerSetBlocked = [...memberContributionUnavailableDays, ...memberLinkUnavailableDays];
+  const allBlockedDays = ownerSetBlocked.length === 0 ? blockedDays : [...blockedDays, ...ownerSetBlocked].sort();
 
   // d43c8f92 publishStorageCommunityGraphPreview defers (cache_pending)
   // unless every member has a current fits result. An effective owner
@@ -178,7 +394,7 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
     withoutFits.some((ownerDigest) => !excluded(ownerDigest, day));
   const today = nowIso.slice(0, 10);
   if (memberWithoutFits(today) || input.modelDates.some(memberWithoutFits)) {
-    return { dailyCandidates, blockedDays, preview: null };
+    return { dailyCandidates, blockedDays: allBlockedDays, preview: null, ownerSets };
   }
   const modelDays: AdminCommunityModelCompositionDay[] = [];
   for (const day of input.modelDates) {
@@ -225,7 +441,7 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
   const base = buildFor(excludedKey(today));
   // Every band day's cohort has its fits (checked before any of them is built).
   if (base.days.some((previewDay) => memberWithoutFits(previewDay.day))) {
-    return { dailyCandidates, blockedDays, preview: null };
+    return { dailyCandidates, blockedDays: allBlockedDays, preview: null, ownerSets };
   }
   // Each band day is its own day's aggregate: an owner excluded on that day
   // only is left out of that day's band. Without exclusions every day comes
@@ -238,5 +454,5 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
   const built = days.every((day, index) => day === base.days[index]) ? base
     : Object.freeze({ ...base, days: Object.freeze(days) });
   const preview = validCachedAdminCommunityAllowancePreview(built, built.generatedAt, input.nowMs) ? built : null;
-  return { dailyCandidates, blockedDays, preview };
+  return { dailyCandidates, blockedDays: allBlockedDays, preview, ownerSets };
 }
