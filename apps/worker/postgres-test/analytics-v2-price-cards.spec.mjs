@@ -60,6 +60,8 @@ let store;
 let prices;
 let contract;
 let registry;
+/** The vendored kernels (their daily-value validator and registry identity). */
+let kernels;
 let priceFileName;
 /** The bundle's own kernel cards. */
 let bundleCards;
@@ -72,6 +74,7 @@ before(async () => {
   store = await load("/src/analytics-v2/store.ts");
   prices = await load("/src/analytics-v2/price-attribution.ts");
   contract = await load("/src/analytics-v2/contract.ts");
+  kernels = await load("/vendor/analytics-d43c8f92/entry.ts");
   registry = store.analyticsV2KernelRegistry();
   bundleCards = await prices.analyticsV2KernelPriceCards();
   const staged = (await readdir(STAGED_DIRECTORY).catch(() => [])).find((name) => PRICE_FILE.test(name));
@@ -181,21 +184,26 @@ const count = async (pool, schema, table) =>
   (await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, table)}`)).rows[0].n;
 
 /**
- * Write an older kernel's stored state by hand: its kernel row, its price
+ * Write an older kernel's stored state by hand: its kernel row (priced under
+ * `registrySha256`, by default this bundle's registry), its price
  * registration (this bundle's cards with `changed` card ids given other
- * content; omitted when `cards` is false), owner-day rows and their price rows.
+ * content and `omitted` card ids left out; no registration when `cards` is
+ * false), owner-day rows and their price rows. A day is [owner, day, events]
+ * with events an array, "no-price" or "refused", and an optional fourth
+ * element: its stored daily value (by default a synthetic placeholder).
  */
-async function seedOlderKernel(pool, schema, { kernelId, computeSha256, changed = [], cards = true, days }) {
+async function seedOlderKernel(pool, schema, { kernelId, computeSha256, changed = [], omitted = [], cards = true, days,
+  registrySha256 = null }) {
   const kernel = stamp(kernelId).kernel;
   const runId = randomUUID();
   await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_kernels")} (kernel_id, production_commit,
       vendor_manifest_sha256, compute_closure_sha256, price_registry_sha256, price_registry_version, method_version,
       registered_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-  [kernelId, kernel.productionCommit, kernel.vendorManifestSha256, kernel.computeClosureSha256, kernel.priceRegistrySha256,
-    kernel.priceRegistryVersion, kernel.methodVersion, NOW]);
+  [kernelId, kernel.productionCommit, kernel.vendorManifestSha256, kernel.computeClosureSha256,
+    registrySha256 ?? kernel.priceRegistrySha256, kernel.priceRegistryVersion, kernel.methodVersion, NOW]);
   const refs = new Map();
   if (cards) {
-    const own = bundleCards.cards.map((card) => changed.includes(card.cardId)
+    const own = bundleCards.cards.filter((card) => !omitted.includes(card.cardId)).map((card) => changed.includes(card.cardId)
       ? { cardId: card.cardId, contentSha256: digest(`changed-${card.cardId}`) } : card);
     await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_kernel_prices")} (kernel_id, compute_sha256, cards_sha256,
         cards, projection_version, registered_at) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -211,10 +219,10 @@ async function seedOlderKernel(pool, schema, { kernelId, computeSha256, changed 
         VALUES ($1, $2, $3)`, [kernelId, top + index + 1, card.cardId]);
     }
   }
-  for (const [ownerDigest, day, events] of days) {
+  for (const [ownerDigest, day, events, daily = { synthetic: true }] of days) {
     await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_owner_day")} (owner_digest, day, daily, refusal, run_id,
         kernel_id, manifest_version) VALUES ($1, $2, $3, $4, $5, $6, 1)`,
-    [ownerDigest, day, events === "refused" ? null : JSON.stringify({ synthetic: true }),
+    [ownerDigest, day, events === "refused" ? null : JSON.stringify(daily),
       events === "refused" ? "source_conflict_or_order" : null, runId, kernelId]);
     if (!Array.isArray(events)) continue;
     const row = await priceRow(ownerDigest, day, events);
@@ -487,7 +495,8 @@ test("PG17: a compatible transition records exactly the stale owner-days, once, 
       ].sort((left, right) => (left.owner_digest < right.owner_digest ? -1 : left.owner_digest > right.owner_digest ? 1
         : left.day < right.day ? -1 : 1)));
       // The computed owner's rows are kernel 2 now; B's rows stay kernel 1.
-      // Under kernel 2 only B's unpriced-cause owner-day is price-dirty.
+      // Under kernel 2 only B's unpriced-cause owner-day is price-dirty: both
+      // kernels price under the same registry, so B/D1 needs no restamp.
       assert.deepEqual(await store.readAnalyticsV2PriceDirtyOwnerDays(client, { schema, kernelId: 2,
         ownerDigests: [OWNER_A, OWNER_B] }), [{ ownerDigest: OWNER_B, day: D2, cause: "stale" }]);
       // The transition is recorded once: a later run on the same kernel adds none.
@@ -498,6 +507,60 @@ test("PG17: a compatible transition records exactly the stale owner-days, once, 
       const third = await write(client, schema, stamp(3, CLASS_X), run);
       assert.deepEqual(third.prices.transitions.map((entry) => [entry.fromKernel, entry.toKernel, entry.compatible]),
         [[1, 3, true], [2, 3, true]]);
+    } finally {
+      client.release();
+    }
+  });
+});
+
+test("PG17: a compatible transition that adds a card under a new registry leaves every daily-valued owner-day to restamp", {
+  skip: PG_SKIP, timeout: 240_000,
+}, async () => {
+  const sol = priced("gpt-5.6-sol", D1);
+  const other = priced("gpt-5.5", D2);
+  const added = other.priced.cardIds[0];
+  assert.equal(other.priced.status, prices.ANALYTICS_V2_PRICE_STATUS.fullyPriced);
+  assert.ok(!sol.priced.cardIds.includes(added), "the card kernel 2 adds does not price the kept event");
+  const OLD_REGISTRY = digest("price-registry-of-kernel-1");
+  assert.notEqual(OLD_REGISTRY, kernels.APP_PRICE_REGISTRY_MANIFEST.sha256);
+  // What kernel 1 stored: daily values stamped with its own registry identity.
+  const storedDaily = (day) => ({ ...kernels.createV11DailyProjectionValues(day), registrySha256: OLD_REGISTRY });
+  await withSchema("registry", async ({ pool, schema }) => {
+    // Kernel 1 (same compute class, an older registry without one card that
+    // kernel 2 adds): B/D1 prices exactly as stored (not stale); B/D2 stored
+    // an event as unpriced that the added card now prices (cause 2); B/D3
+    // was refused (no daily values).
+    await seedOlderKernel(pool, schema, { kernelId: 1, computeSha256: CLASS_X, omitted: [added],
+      registrySha256: OLD_REGISTRY, days: [
+        [OWNER_B, D1, [sol], storedDaily(D1)],
+        [OWNER_B, D2, [{ input: other.input, priced: { costNanousd: 0, status: prices.ANALYTICS_V2_PRICE_STATUS.unpriced,
+          cardIds: [] } }], storedDaily(D2)],
+        [OWNER_B, D3, "refused"],
+      ] });
+    const client = await pool.connect();
+    try {
+      const a1 = await computedDay(OWNER_A, D1, [sol]);
+      await write(client, schema, stamp(2, CLASS_X), outputs({ ownerDays: [a1.ownerDay], ownerDayPrices: [a1.price] }));
+      assert.deepEqual(await transitions(pool, schema), [{ from_kernel: 1, to_kernel: 2, compute_equal: true,
+        proof_holds: true, compatible: true, cards_added: 1, cards_removed: 0, cards_changed: 0, owner_days: 3, events: 2,
+        stale_owner_days: 1 }]);
+      assert.deepEqual((await staleRows(pool, schema)).map((row) => [row.owner_digest, row.day, row.cause]),
+        [[OWNER_B, D2, 2]]);
+      // The stale set is the price staleness only; every other daily-valued
+      // owner-day of kernel 1 is still dirty, to restamp: its prices are
+      // proven unchanged, but its daily values carry the older registry.
+      assert.deepEqual(await store.readAnalyticsV2PriceDirtyOwnerDays(client, { schema, kernelId: 2,
+        ownerDigests: [OWNER_A, OWNER_B] }), [{ ownerDigest: OWNER_B, day: D1, cause: "registry" },
+        { ownerDigest: OWNER_B, day: D2, cause: "stale" }]);
+      // Kept as stored, B/D1's daily values fail the new kernel's own
+      // validator (and so its merge and fold); restamped, they pass.
+      const kept = (await pool.query(`SELECT daily FROM ${quoted(schema, "analytics_v2_owner_day")}
+        WHERE owner_digest = $1 AND day = $2`, [OWNER_B, D1])).rows[0].daily;
+      assert.equal(kept.registrySha256, OLD_REGISTRY);
+      assert.throws(() => kernels.validateV11DailyProjectionValues(kept), /V11_DAILY_PROJECTION_VALUES_INVALID/u);
+      assert.throws(() => kernels.mergeV11DailyProjectionValues(kept, kernels.createV11DailyProjectionValues(D1)),
+        /V11_DAILY_PROJECTION_VALUES_INVALID/u);
+      kernels.validateV11DailyProjectionValues({ ...kept, registrySha256: kernels.APP_PRICE_REGISTRY_MANIFEST.sha256 });
     } finally {
       client.release();
     }
@@ -580,5 +643,145 @@ test("PG17: corrupt stored inputs and a proof that no longer matches the stored 
     } finally {
       client.release();
     }
+  });
+});
+
+test("PG17: a price row of another kernel, a malformed kernel registration and a conflicting stored basis fail the run atomically", {
+  skip: PG_SKIP, timeout: 240_000,
+}, async () => {
+  const sol = priced("gpt-5.6-sol", D1);
+  const other = priced("gpt-5.5", D2);
+  // A stored price row must belong to its owner-day's kernel: one moved to
+  // another registered kernel (the trigger that ties them disabled in the
+  // fixture) is refused by the proof, not repriced.
+  await withSchema("state-kernel", async ({ pool, schema }) => {
+    await seedOlderKernel(pool, schema, { kernelId: 1, computeSha256: CLASS_X, days: [[OWNER_B, D1, [other]]] });
+    const t = (table) => quoted(schema, table);
+    await pool.query(`INSERT INTO ${t("analytics_v2_kernels")} SELECT 2, production_commit, vendor_manifest_sha256, $1,
+      price_registry_sha256, price_registry_version, method_version, registered_at
+      FROM ${t("analytics_v2_kernels")} WHERE kernel_id = 1`, [stamp(2).kernel.computeClosureSha256]);
+    await pool.query(`INSERT INTO ${t("analytics_v2_kernel_prices")} SELECT 2, compute_sha256, cards_sha256, cards,
+      projection_version, registered_at FROM ${t("analytics_v2_kernel_prices")} WHERE kernel_id = 1`);
+    await pool.query(`ALTER TABLE ${t("analytics_v2_owner_day_price")} DISABLE TRIGGER analytics_v2_owner_day_price_matches_owner_day`);
+    await pool.query(`UPDATE ${t("analytics_v2_owner_day_price")} SET kernel_id = 2`);
+    await pool.query(`ALTER TABLE ${t("analytics_v2_owner_day_price")} ENABLE TRIGGER analytics_v2_owner_day_price_matches_owner_day`);
+    const client = await pool.connect();
+    try {
+      const a1 = await computedDay(OWNER_A, D1, [sol]);
+      const before = await snapshot(pool, schema);
+      await assert.rejects(store.proveAnalyticsV2PriceTransitions(client, { schema, stamp: stamp(3, CLASS_X) }),
+        { code: "ANALYTICS_V2_PRICE_STATE_INVALID", field: "ownerDayPrice" });
+      await assert.rejects(write(client, schema, stamp(3, CLASS_X), outputs({ ownerDays: [a1.ownerDay],
+        ownerDayPrices: [a1.price] })), { code: "ANALYTICS_V2_PRICE_STATE_INVALID", field: "ownerDayPrice" });
+      assert.deepEqual(await snapshot(pool, schema), before);
+    } finally {
+      client.release();
+    }
+  });
+  // A stored kernel registration the schema should never hold (its CHECK
+  // dropped in the fixture) is refused when it is read, never trusted.
+  await withSchema("state-registration", async ({ pool, schema }) => {
+    const table = quoted(schema, "analytics_v2_kernel_prices");
+    const check = (await pool.query(`SELECT conname FROM pg_constraint WHERE conrelid = $1::regclass AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%compute_sha256%'`, [table])).rows;
+    assert.equal(check.length, 1, "one CHECK guards the compute class");
+    await pool.query(`ALTER TABLE ${table} DROP CONSTRAINT "${check[0].conname}"`);
+    await seedOlderKernel(pool, schema, { kernelId: 1, computeSha256: "A".repeat(64), days: [[OWNER_B, D1, [other]]] });
+    const client = await pool.connect();
+    try {
+      const a1 = await computedDay(OWNER_A, D1, [sol]);
+      const before = await snapshot(pool, schema);
+      await assert.rejects(write(client, schema, stamp(2, CLASS_X), outputs({ ownerDays: [a1.ownerDay],
+        ownerDayPrices: [a1.price] })), { code: "ANALYTICS_V2_PRICE_STATE_INVALID", field: "kernelPrices" });
+      assert.deepEqual(await snapshot(pool, schema), before);
+    } finally {
+      client.release();
+    }
+  });
+  // A stored basis whose digest names this card set but whose refs are
+  // other cards is refused, not reused.
+  await withSchema("basis-conflict", async ({ pool, schema }) => {
+    const client = await pool.connect();
+    try {
+      const a1 = await computedDay(OWNER_A, D1, [sol]);
+      const a2 = await computedDay(OWNER_A, D2, [other]);
+      await write(client, schema, stamp(1, CLASS_X), outputs({ ownerDays: [a1.ownerDay], ownerDayPrices: [a1.price] }));
+      const basisSha256 = await prices.analyticsV2PriceCardSetSha256(bundleCards.cards
+        .filter((card) => a2.price.cardIds.includes(card.cardId)));
+      const t = (table) => quoted(schema, table);
+      const own = (await pool.query(`SELECT card_ref FROM ${t("analytics_v2_price_cards")} WHERE card_id = ANY($1::text[])`,
+        [a2.price.cardIds])).rows.map((row) => row.card_ref);
+      const foreign = (await pool.query(`SELECT min(card_ref)::integer AS ref FROM ${t("analytics_v2_price_cards")}
+        WHERE NOT (card_ref = ANY($1::integer[]))`, [own])).rows[0].ref;
+      await pool.query(`INSERT INTO ${t("analytics_v2_price_bases")} (price_basis_id, basis_sha256, card_refs)
+        SELECT max(price_basis_id) + 1, $1, ARRAY[$2::integer] FROM ${t("analytics_v2_price_bases")}`, [basisSha256, foreign]);
+      const before = await snapshot(pool, schema);
+      await assert.rejects(write(client, schema, stamp(1, CLASS_X), outputs({ ownerDays: [a1.ownerDay, a2.ownerDay],
+        ownerDayPrices: [a1.price, a2.price] })), { code: "ANALYTICS_V2_PRICE_BASIS_CONFLICT" });
+      assert.deepEqual(await snapshot(pool, schema), before);
+    } finally {
+      client.release();
+    }
+  });
+});
+
+test("PG17: the offline purge removes one owner's stale rows only through the documented trigger bypass", {
+  skip: PG_SKIP, timeout: 240_000,
+}, async () => {
+  const other = priced("gpt-5.5", D1);
+  await withSchema("purge", async ({ pool, schema }) => {
+    // Two owners stale under one recorded transition (no price inputs: cause 3).
+    await seedOlderKernel(pool, schema, { kernelId: 1, computeSha256: null, cards: false, days: [
+      [OWNER_A, D1, "no-price"], [OWNER_A, D2, "no-price"], [OWNER_B, D1, "no-price"]] });
+    const client = await pool.connect();
+    try {
+      const b1 = await computedDay(OWNER_B, D2, [other]);
+      await write(client, schema, stamp(2, CLASS_X), outputs({ owners: [OWNER_B], ownerDays: [b1.ownerDay],
+        ownerDayPrices: [b1.price] }));
+    } finally {
+      client.release();
+    }
+    const table = quoted(schema, "analytics_v2_transition_stale");
+    const stale = async () => (await pool.query(`SELECT owner_digest, day::text AS day FROM ${table}
+      ORDER BY owner_digest, day`)).rows.map((row) => [row.owner_digest, row.day]);
+    const enabled = async () => (await pool.query(`SELECT tgname, tgenabled FROM pg_trigger
+      WHERE tgrelid = $1::regclass AND NOT tgisinternal ORDER BY tgname`, [table])).rows
+      .map((row) => [row.tgname, row.tgenabled]);
+    const triggers = [["analytics_v2_transition_stale_append_only", "O"], ["analytics_v2_transition_stale_no_truncate", "O"]];
+    const all = [[OWNER_A, D1], [OWNER_A, D2], [OWNER_B, D1]].sort((left, right) =>
+      left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : left[1] < right[1] ? -1 : 1);
+    assert.deepEqual(await stale(), all);
+    assert.deepEqual(await enabled(), triggers);
+    // The running service has no way to remove them: the table is append-only.
+    await assert.rejects(pool.query(`DELETE FROM ${table} WHERE owner_digest = $1`, [OWNER_A]), { code: "P1005" });
+    await assert.rejects(pool.query(`TRUNCATE ${table}`), { code: "P1005" });
+    // The offline purge (PURGE-1), as the table owner and inside its one
+    // purge transaction, disables only the row trigger, deletes the erased
+    // owner's rows and re-enables it before COMMIT (the staged migration's
+    // header records these three statements).
+    const purge = async (ownerDigest, finish) => {
+      const owner = await pool.connect();
+      try {
+        await owner.query("BEGIN");
+        await owner.query(`ALTER TABLE ${table} DISABLE TRIGGER analytics_v2_transition_stale_append_only`);
+        const deleted = await owner.query(`DELETE FROM ${table} WHERE owner_digest = $1`, [ownerDigest]);
+        await owner.query(`ALTER TABLE ${table} ENABLE TRIGGER analytics_v2_transition_stale_append_only`);
+        await owner.query(finish);
+        return deleted.rowCount;
+      } finally {
+        owner.release();
+      }
+    };
+    // A purge that does not commit changes nothing, the trigger included.
+    assert.equal(await purge(OWNER_A, "ROLLBACK"), 2);
+    assert.deepEqual(await stale(), all);
+    assert.deepEqual(await enabled(), triggers);
+    assert.equal(await purge(OWNER_A, "COMMIT"), 2);
+    assert.deepEqual(await stale(), [[OWNER_B, D1]]);
+    // The table is append-only again for everyone after it.
+    assert.deepEqual(await enabled(), triggers);
+    await assert.rejects(pool.query(`DELETE FROM ${table}`), { code: "P1005" });
+    // The transition keeps its content-free counts.
+    assert.deepEqual((await transitions(pool, schema)).map((row) => [row.owner_days, row.stale_owner_days]), [[3, 3]]);
   });
 });

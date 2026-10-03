@@ -38,6 +38,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   ANALYTICS_KERNEL_CLOSURE_PLUMBING,
+  ANALYTICS_KERNEL_FACADE_COMMIT_MASK,
+  analyticsKernelFacadeComputeText,
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
 } from "../cloud-run/analytics-kernel-closure.mjs";
@@ -55,8 +57,10 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 3: K-PERCARD's prepared-day price observer (price-attribution.ts in
   // compute-owner.ts, the ownerDayPrices output) and the transition proof
   // (price-transition.ts, a closure root). Daily, fit and model values are
-  // unchanged; the price rows are new stored values.
-  "a4b4dc2a1755ab15cd02c59189055fe1c38e3185d3ac0a19665de697ce85d273",
+  // unchanged; the price rows are new stored values. (Re-derived on the
+  // K-PERCARD branch before any merge or durable stamped run, when its review
+  // fixes changed price-transition.ts.)
+  "c18c6dd6017885fcfaddf7df87ce6c80162737039f00dd208c4e83f4fed66f6f",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -199,30 +203,131 @@ test("a change to the community fold or the occurrence reader is a closure no en
   }), { code: "ANALYTICS_KERNEL_CLOSURE_WORKSPACE_COPY_STALE" });
 });
 
-test("the compute class is the closure without the vendored price registry, and nothing else (K-PERCARD)", async () => {
+const MANIFEST_FILE = join(VENDOR_ROOT, "MANIFEST.json");
+const FACADE_FILE = join(VENDOR_ROOT, "entry.ts");
+const PRICE_REGISTRY_FILE = join(VENDOR_ROOT, "packages", "accounting", "src", "price-registry.js");
+/** A synthetic next production commit (40 hex digits), for re-vendor-shaped fixtures. */
+const NEXT_COMMIT = createHash("sha1").update("analytics-v2-kernel-registry-check:next-commit").digest("hex");
+
+/**
+ * The identity of a re-vendor-shaped fixture, as scripts/vendor-analytics-kernels.mjs
+ * would leave the vendored directory for `commit`: MANIFEST.json names it,
+ * the reviewed facade's provenance text names it (the workflow refuses a
+ * facade that names another), and `files` rewrites other vendored files'
+ * text (path to function). `facade` edits the facade after that.
+ */
+async function revendoredIdentity({ commit, facade = (text) => text, files = {} }) {
+  const current = JSON.parse(await readFile(MANIFEST_FILE, "utf8")).sourceCommit;
+  return identityWith(async (path, ...rest) => {
+    const bytes = await readFile(path, ...rest);
+    const text = () => Buffer.from(bytes).toString("utf8");
+    if (path === MANIFEST_FILE) {
+      return Buffer.from(`${JSON.stringify({ ...JSON.parse(text()), sourceCommit: commit }, null, 2)}\n`, "utf8");
+    }
+    if (path === FACADE_FILE) {
+      assert.ok(text().includes(current.slice(0, 8)), "the facade names its vendored commit");
+      return Buffer.from(facade(text().replaceAll(current.slice(0, 8), commit.slice(0, 8))), "utf8");
+    }
+    return Object.hasOwn(files, path) ? Buffer.from(files[path](text()), "utf8") : bytes;
+  });
+}
+
+test("the compute class is the closure without the vendored price registry and the facade's provenance commit (K-PERCARD)", async () => {
   const identity = await identityWith();
   const report = await buildReport("--kernel-closure");
   assert.match(identity.computeSha256, /^[0-9a-f]{64}$/u);
   assert.notEqual(identity.computeSha256, identity.computeClosureSha256);
   // The build stamps the same class it reports.
   assert.equal(report.kernel.computeSha256, identity.computeSha256);
-  const registryFile = join(VENDOR_ROOT, "packages", "accounting", "src", "price-registry.js");
+  const prices = await import(pathToFileURL(PRICE_REGISTRY_FILE).href);
+  const current = JSON.parse(await readFile(MANIFEST_FILE, "utf8")).sourceCommit;
+  // A price change arrives only by re-vendoring a new production commit: a
+  // new manifest, a facade whose provenance names the new commit, and here
+  // only the price registry's content changed (its cards and digest). It is
+  // a new kernel (closure and manifest move) with the same compute class, so
+  // its transition can be compatible once the proof over the stored price
+  // inputs holds.
+  const repriced = await revendoredIdentity({ commit: NEXT_COMMIT, files: { [PRICE_REGISTRY_FILE]: (text) =>
+    text.replace(prices.APP_PRICE_REGISTRY_SHA256, sha256("analytics-v2-kernel-registry-check:next-registry")) } });
+  assert.notEqual(repriced.computeClosureSha256, identity.computeClosureSha256);
+  assert.notEqual(repriced.vendorManifestSha256, identity.vendorManifestSha256);
+  assert.equal(repriced.computeSha256, identity.computeSha256);
+  // Re-vendoring alone (the same files from another commit) keeps the class too.
+  const moved = await revendoredIdentity({ commit: NEXT_COMMIT });
+  assert.notEqual(moved.computeClosureSha256, identity.computeClosureSha256);
+  assert.equal(moved.computeSha256, identity.computeSha256);
+  // Only the manifest's commit, named in a facade comment, is masked:
+  // - a facade that still names the old commit (the workflow refuses it) is another class;
+  const unreviewed = await revendoredIdentity({ commit: NEXT_COMMIT,
+    facade: (text) => text.replaceAll(NEXT_COMMIT.slice(0, 8), current.slice(0, 8)) });
+  assert.notEqual(unreviewed.computeSha256, identity.computeSha256);
+  // - any other edit of the facade's text, comments included, is another class;
+  const reworded = await revendoredIdentity({ commit: NEXT_COMMIT,
+    facade: (text) => text.replace("The one import surface", "The single import surface") });
+  assert.notEqual(reworded.computeSha256, identity.computeSha256);
+  // - the commit named in code is not masked.
+  const inCode = (commit) => revendoredIdentity({ commit,
+    facade: (text) => `${text}export const VENDORED_SOURCE_COMMIT = "${commit.slice(0, 8)}";\n` });
+  assert.notEqual((await inCode(NEXT_COMMIT)).computeSha256, (await inCode(current)).computeSha256);
+  // Any other change to the closure (the pricer, the attribution, the compute core) moves the class too.
   const mutatedAt = (target) => identityWith(async (path, ...rest) => {
     const bytes = await readFile(path, ...rest);
     return path === target ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// mutation\n")]) : bytes;
   });
-  // A price-registry change is a new kernel (closure and manifest move) with the same compute class:
-  // its transition can be compatible once the proof over the stored price inputs holds.
-  const repriced = await mutatedAt(registryFile);
-  assert.notEqual(repriced.computeClosureSha256, identity.computeClosureSha256);
-  assert.equal(repriced.computeSha256, identity.computeSha256);
-  // Any other change to the closure (the pricer, the attribution, the compute core) moves the class too.
   for (const target of [join(VENDOR_ROOT, "apps", "worker", "src", "server-pricing.ts"),
     join(WORKER_ROOT, "src", "analytics-v2", "price-attribution.ts"), join(WORKER_ROOT, "src", "analytics-v2", "compute-owner.ts")]) {
     const mutated = await mutatedAt(target);
     assert.notEqual(mutated.computeClosureSha256, identity.computeClosureSha256, target);
     assert.notEqual(mutated.computeSha256, identity.computeSha256, target);
   }
+});
+
+test("the facade's compute text masks only the vendored commit, only in line comments", () => {
+  const commit = NEXT_COMMIT;
+  const text = [
+    `// a byte copy of commit ${commit.slice(0, 8)} (${commit.slice(0, 12).toUpperCase()}, ${commit})`,
+    `  // indented: ${commit.slice(0, 7)}; too short: ${commit.slice(0, 6)}; another: ${"f".repeat(8)}`,
+    `export const SOURCE = "${commit.slice(0, 8)}"; // ${commit.slice(0, 8)}`,
+  ].join("\n");
+  const mask = ANALYTICS_KERNEL_FACADE_COMMIT_MASK;
+  assert.equal(analyticsKernelFacadeComputeText(text, commit), [
+    `// a byte copy of commit ${mask} (${mask}, ${mask})`,
+    `  // indented: ${mask}; too short: ${commit.slice(0, 6)}; another: ${"f".repeat(8)}`,
+    `export const SOURCE = "${commit.slice(0, 8)}"; // ${commit.slice(0, 8)}`,
+  ].join("\n"));
+  for (const invalid of [commit.slice(0, 39), commit.toUpperCase(), null]) {
+    assert.throws(() => analyticsKernelFacadeComputeText(text, invalid), { code: "ANALYTICS_KERNEL_CLOSURE_FACADE_INVALID" });
+  }
+});
+
+test("the closure refuses a kernel set without its price registry, or with an unreadable manifest or facade", async () => {
+  // esbuild's own graph, with one vendored module taken out of it.
+  const without = (target) => async (options) => {
+    const result = await esbuild().build(options);
+    const cwd = options.absWorkingDir;
+    for (const [path, input] of Object.entries(result.metafile.inputs)) {
+      if (resolve(cwd, path) === target) delete result.metafile.inputs[path];
+      else input.imports = (input.imports ?? []).filter((imported) => imported.external || resolve(cwd, imported.path) !== target);
+    }
+    return result;
+  };
+  const identity = (build, read) => computeAnalyticsKernelIdentity({ build, options: BUILD_OPTIONS, vendorRoot: VENDOR_ROOT,
+    cwd: join(WORKER_ROOT, "cloud-run"), ...(read === undefined ? {} : { read }) });
+  // The price registry outside the closure would put the cards into the compute class.
+  await assert.rejects(identity(without(PRICE_REGISTRY_FILE)), { code: "ANALYTICS_KERNEL_CLOSURE_PRICE_REGISTRY_MISSING" });
+  // Every vendored module is reached through the facade, so a closure
+  // without it has no kernels at all (ANALYTICS_KERNEL_CLOSURE_FACADE_MISSING
+  // guards a graph that reaches them some other way).
+  await assert.rejects(identity(without(FACADE_FILE)), { code: "ANALYTICS_KERNEL_CLOSURE_KERNELS_MISSING" });
+  // The facade's provenance commit comes from the manifest: no commit, no class.
+  for (const manifest of ["{", JSON.stringify({ sourceCommit: NEXT_COMMIT.slice(0, 12) }), JSON.stringify({})]) {
+    await assert.rejects(identity(esbuild().build, async (path, ...rest) => (path === MANIFEST_FILE
+      ? Buffer.from(manifest, "utf8") : readFile(path, ...rest))), { code: "ANALYTICS_KERNEL_CLOSURE_MANIFEST_INVALID" });
+  }
+  // A facade that is not text the mask can see in full is refused, not masked.
+  await assert.rejects(identity(esbuild().build, async (path, ...rest) => (path === FACADE_FILE
+    ? Buffer.concat([await readFile(path), Buffer.from([0xff, 0x0a])]) : readFile(path, ...rest))),
+  { code: "ANALYTICS_KERNEL_CLOSURE_FACADE_INVALID" });
 });
 
 test("the run-stamps migration seeds no kernel and leaves earlier rows unattributed", async () => {

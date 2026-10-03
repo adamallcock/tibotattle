@@ -35,6 +35,17 @@
  * The stale set is computed whatever the verdict, because the publication
  * regime (K-REPRICE) reprices stale heads either way.
  *
+ * Registry identity is not a price staleness. Stored daily values carry the
+ * price registry identity of the kernel that wrote them (registrySha256; the
+ * vendored validateV11DailyProjectionValues refuses any other than its own,
+ * and the merge and fold validate both inputs). A transition between kernels
+ * whose registries differ (analytics_v2_kernels.price_registry_sha256)
+ * therefore leaves every daily-valued owner-day of the older kernel needing
+ * at least a restamp, even when the transition is compatible and the
+ * owner-day is not stale. The dirtiness below derives that from the
+ * immutable kernel rows ("registry"), so the recorded stale set stays the
+ * price staleness only.
+ *
  * Pure apart from what priceAnalyticsV2Input calls; no I/O.
  */
 import { canonicalJson } from "../canonical-json";
@@ -217,7 +228,7 @@ export function repriceableAnalyticsV2Projection(version: unknown): boolean {
 // Derived-regime dirtiness
 // ---------------------------------------------------------------------------
 
-/** Why a stored owner-day must be recomputed under the current kernel (price staleness). */
+/** Why a stored owner-day must be recomputed, or at least restamped, under the current kernel. */
 export type AnalyticsV2PriceDirtyCause =
   /** Written before K-STAMP: no kernel, never inferred. */
   | "unattributed"
@@ -226,7 +237,16 @@ export type AnalyticsV2PriceDirtyCause =
   /** Its kernel's transition to the current one is incompatible: the derived regime is cold. */
   | "incompatible"
   /** Its kernel's transition is compatible but listed it stale. */
-  | "stale";
+  | "stale"
+  /**
+   * Its kernel's transition is compatible and does not list it stale (its
+   * prices are proven unchanged), but its kernel priced under another price
+   * registry: its stored daily values carry that registry's identity, which
+   * the current kernel's daily-value validator refuses. It must be restamped
+   * with the current registry identity (or recomputed) before it is kept or
+   * folded. A refused owner-day has no daily values and is never this.
+   */
+  | "registry";
 
 export interface AnalyticsV2PriceDirtyOwnerDay {
   readonly ownerDigest: string;
@@ -235,32 +255,38 @@ export interface AnalyticsV2PriceDirtyOwnerDay {
 }
 
 /**
- * The stored owner-days a run on `currentKernelId` must recompute because of
- * a kernel transition (engine v2 section 5.3): every row whose kernel is not
- * the current one, unless the recorded transition from its kernel is
- * compatible and does not list it stale. A row on the current kernel is not
- * price-dirty. Evidence changes are the planner's concern, not this one.
- * Rows are returned in input order.
+ * The stored owner-days a run on `currentKernelId` must recompute, or at
+ * least restamp, because of a kernel transition (engine v2 section 5.3):
+ * every row whose kernel is not the current one, unless the recorded
+ * transition from its kernel is compatible, does not list it stale, and
+ * either crosses no price-registry change (`registryEqual`: both kernels'
+ * analytics_v2_kernels.price_registry_sha256 are equal) or the row has no
+ * daily values. A row on the current kernel is not price-dirty. Evidence
+ * changes are the planner's concern, not this one. Rows are returned in
+ * input order.
  */
 export function analyticsV2PriceDirtyOwnerDays(input: {
   readonly currentKernelId: number;
   readonly transitions: readonly { readonly transitionId: number; readonly fromKernel: number; readonly toKernel: number;
-    readonly compatible: boolean }[];
+    readonly compatible: boolean; readonly registryEqual: boolean }[];
   readonly stale: readonly { readonly transitionId: number; readonly ownerDigest: string; readonly day: string }[];
-  readonly rows: readonly { readonly ownerDigest: string; readonly day: string; readonly kernelId: number | null }[];
+  readonly rows: readonly { readonly ownerDigest: string; readonly day: string; readonly kernelId: number | null;
+    readonly hasDaily: boolean }[];
 }): readonly AnalyticsV2PriceDirtyOwnerDay[] {
   if (!Number.isSafeInteger(input.currentKernelId) || input.currentKernelId < 1 || !Array.isArray(input.transitions)
       || !Array.isArray(input.stale) || !Array.isArray(input.rows)) invalid();
-  const toCurrent = new Map<number, { transitionId: number; compatible: boolean }>();
+  const toCurrent = new Map<number, { transitionId: number; compatible: boolean; registryEqual: boolean }>();
   for (const transition of input.transitions) {
     if (transition.toKernel !== input.currentKernelId) continue;
-    if (toCurrent.has(transition.fromKernel) || typeof transition.compatible !== "boolean") invalid();
-    toCurrent.set(transition.fromKernel, { transitionId: transition.transitionId, compatible: transition.compatible });
+    if (toCurrent.has(transition.fromKernel) || typeof transition.compatible !== "boolean"
+        || typeof transition.registryEqual !== "boolean") invalid();
+    toCurrent.set(transition.fromKernel, { transitionId: transition.transitionId, compatible: transition.compatible,
+      registryEqual: transition.registryEqual });
   }
   const stale = new Set(input.stale.map((entry) => `${entry.transitionId}:${entry.ownerDigest}:${entry.day}`));
   const dirty: AnalyticsV2PriceDirtyOwnerDay[] = [];
   for (const row of input.rows) {
-    if (!OWNER_DIGEST.test(row.ownerDigest) || !DAY.test(row.day)) invalid();
+    if (!OWNER_DIGEST.test(row.ownerDigest) || !DAY.test(row.day) || typeof row.hasDaily !== "boolean") invalid();
     if (row.kernelId === input.currentKernelId) continue;
     let cause: AnalyticsV2PriceDirtyCause | null;
     if (row.kernelId === null) cause = "unattributed";
@@ -268,7 +294,8 @@ export function analyticsV2PriceDirtyOwnerDays(input: {
     else {
       const transition = toCurrent.get(row.kernelId);
       cause = transition === undefined ? "unproven" : !transition.compatible ? "incompatible"
-        : stale.has(`${transition.transitionId}:${row.ownerDigest}:${row.day}`) ? "stale" : null;
+        : stale.has(`${transition.transitionId}:${row.ownerDigest}:${row.day}`) ? "stale"
+          : !transition.registryEqual && row.hasDaily ? "registry" : null;
     }
     if (cause !== null) dirty.push(Object.freeze({ ownerDigest: row.ownerDigest, day: row.day, cause }));
   }

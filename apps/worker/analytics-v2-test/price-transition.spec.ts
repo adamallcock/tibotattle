@@ -4,9 +4,15 @@
 // older kernel fully priced with unchanged cards prices exactly as before;
 // the stale set (a removed or changed card, a repriced event, an unknown
 // price) is recorded either way. The derived regime recomputes exactly the
-// owner-days a transition leaves unproven, incompatible or stale.
-// Synthetic, content-free inputs only.
+// owner-days a transition leaves unproven, incompatible or stale, and
+// restamps the daily-valued ones a compatible transition across a
+// price-registry change leaves behind. Synthetic, content-free inputs only.
 import { describe, expect, it } from "vitest";
+import {
+  APP_PRICE_REGISTRY_MANIFEST,
+  createV11DailyProjectionValues,
+  validateV11DailyProjectionValues,
+} from "../vendor/analytics-d43c8f92/entry";
 import {
   ANALYTICS_V2_PRICE_STATUS,
   analyticsV2KernelPriceCards,
@@ -149,21 +155,21 @@ describe("the transition verdict", () => {
 
 describe("derived-regime dirtiness", () => {
   const transitions = [
-    { transitionId: 1, fromKernel: 1, toKernel: 3, compatible: false },
-    { transitionId: 2, fromKernel: 2, toKernel: 3, compatible: true },
+    { transitionId: 1, fromKernel: 1, toKernel: 3, compatible: false, registryEqual: true },
+    { transitionId: 2, fromKernel: 2, toKernel: 3, compatible: true, registryEqual: true },
     // A transition to another kernel says nothing about this one.
-    { transitionId: 3, fromKernel: 1, toKernel: 2, compatible: true },
+    { transitionId: 3, fromKernel: 1, toKernel: 2, compatible: true, registryEqual: true },
   ];
   const stale = [{ transitionId: 2, ownerDigest: OWNER, day: "2026-09-02" },
     { transitionId: 3, ownerDigest: OWNER, day: "2026-09-04" }];
 
   it("recomputes exactly the owner-days a transition leaves unproven, incompatible or stale", () => {
     const rows = [
-      { ownerDigest: OWNER, day: "2026-09-01", kernelId: 3 },
-      { ownerDigest: OWNER, day: "2026-09-02", kernelId: 2 },
-      { ownerDigest: OWNER, day: "2026-09-03", kernelId: 2 },
-      { ownerDigest: OWNER, day: "2026-09-04", kernelId: 1 },
-      { ownerDigest: OTHER, day: "2026-09-01", kernelId: null },
+      { ownerDigest: OWNER, day: "2026-09-01", kernelId: 3, hasDaily: true },
+      { ownerDigest: OWNER, day: "2026-09-02", kernelId: 2, hasDaily: true },
+      { ownerDigest: OWNER, day: "2026-09-03", kernelId: 2, hasDaily: true },
+      { ownerDigest: OWNER, day: "2026-09-04", kernelId: 1, hasDaily: true },
+      { ownerDigest: OTHER, day: "2026-09-01", kernelId: null, hasDaily: true },
     ];
     expect(analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, transitions, stale, rows })).toEqual([
       { ownerDigest: OWNER, day: "2026-09-02", cause: "stale" },
@@ -172,15 +178,54 @@ describe("derived-regime dirtiness", () => {
     ]);
     // No recorded transition: nothing proves the row, so it is dirty.
     expect(analyticsV2PriceDirtyOwnerDays({ currentKernelId: 4, transitions, stale,
-      rows: [{ ownerDigest: OWNER, day: "2026-09-03", kernelId: 2 }] }))
+      rows: [{ ownerDigest: OWNER, day: "2026-09-03", kernelId: 2, hasDaily: true }] }))
       .toEqual([{ ownerDigest: OWNER, day: "2026-09-03", cause: "unproven" }]);
   });
 
-  it("refuses a row from a newer kernel and a duplicated transition", () => {
+  it("a compatible transition across a price-registry change leaves every daily-valued row at least to restamp", () => {
+    // Kernel 2 to 3 is compatible and lists 09-02 stale, but kernel 3 prices
+    // under another registry: the other daily-valued rows of kernel 2 carry
+    // the old registry identity in their daily values.
+    const crossing = transitions.map((entry) => entry.transitionId === 2 ? { ...entry, registryEqual: false } : entry);
+    const rows = [
+      { ownerDigest: OWNER, day: "2026-09-02", kernelId: 2, hasDaily: true },
+      { ownerDigest: OWNER, day: "2026-09-03", kernelId: 2, hasDaily: true },
+      // A refused owner-day has no daily values, so nothing to restamp.
+      { ownerDigest: OWNER, day: "2026-09-05", kernelId: 2, hasDaily: false },
+      { ownerDigest: OWNER, day: "2026-09-06", kernelId: 3, hasDaily: true },
+    ];
+    expect(analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, transitions: crossing, stale, rows })).toEqual([
+      { ownerDigest: OWNER, day: "2026-09-02", cause: "stale" },
+      { ownerDigest: OWNER, day: "2026-09-03", cause: "registry" },
+    ]);
+    // With the registry unchanged the same rows are clean.
+    expect(analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, transitions, stale, rows }))
+      .toEqual([{ ownerDigest: OWNER, day: "2026-09-02", cause: "stale" }]);
+  });
+
+  it("the stored daily values of another registry fail the current kernel's validator until restamped", () => {
+    // Why "registry" is dirty: the kernel's validator (and so its merge and
+    // fold) refuses daily values that carry another registry identity.
+    const daily = createV11DailyProjectionValues("2026-09-03");
+    expect(daily.registrySha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
+    const older = { ...daily, registrySha256: hex("e") };
+    expect(() => validateV11DailyProjectionValues(older)).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
+    expect(() => validateV11DailyProjectionValues({ ...older, registrySha256: APP_PRICE_REGISTRY_MANIFEST.sha256 }))
+      .not.toThrow();
+  });
+
+  it("refuses a row from a newer kernel, a duplicated transition and an unstated registry or daily flag", () => {
     expect(() => analyticsV2PriceDirtyOwnerDays({ currentKernelId: 2, transitions: [], stale: [],
-      rows: [{ ownerDigest: OWNER, day: "2026-09-01", kernelId: 3 }] })).toThrow("ANALYTICS_V2_PRICE_TRANSITION_INVALID");
+      rows: [{ ownerDigest: OWNER, day: "2026-09-01", kernelId: 3, hasDaily: true }] }))
+      .toThrow("ANALYTICS_V2_PRICE_TRANSITION_INVALID");
     expect(() => analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, transitions: [transitions[0]!, transitions[0]!],
       stale: [], rows: [] })).toThrow("ANALYTICS_V2_PRICE_TRANSITION_INVALID");
+    expect(() => analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, stale: [], rows: [],
+      transitions: [{ ...transitions[1]!, registryEqual: undefined as unknown as boolean }] }))
+      .toThrow("ANALYTICS_V2_PRICE_TRANSITION_INVALID");
+    expect(() => analyticsV2PriceDirtyOwnerDays({ currentKernelId: 3, transitions, stale: [],
+      rows: [{ ownerDigest: OWNER, day: "2026-09-03", kernelId: 2, hasDaily: null as unknown as boolean }] }))
+      .toThrow("ANALYTICS_V2_PRICE_TRANSITION_INVALID");
   });
 
   it("a window's price-basis digest moves with exactly the days whose basis changed", async () => {

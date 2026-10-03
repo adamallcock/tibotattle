@@ -44,6 +44,35 @@
 -- histories. Every table but the price rows is append-only: UPDATE, DELETE
 -- and TRUNCATE are refused. Owner-scoped rows (price rows, stale rows) hold
 -- the opaque owner digest only, like analytics_v2_owner_day.
+--
+-- The stale set is price staleness only. A transition across a
+-- price-registry change (analytics_v2_kernels.price_registry_sha256) also
+-- leaves every daily-valued owner-day of the older kernel to restamp, since
+-- its daily values carry the older registry identity; the store derives that
+-- from the immutable kernel rows when it reports dirtiness, and records
+-- nothing for it here.
+--
+-- ERASURE (owner decision D2, Variant B; round 7 "delete and republish").
+-- analytics_v2_owner_day_price leaves with its owner-day rows (ON DELETE
+-- CASCADE). analytics_v2_transition_stale is owner-keyed and append-only,
+-- and it cannot cascade from analytics_v2_owner_day: every refresh replaces
+-- the owner-day rows it recomputes, so a cascade would erase the stale set in
+-- the run that records it. The offline purge (PURGE-1), connected as the
+-- schema owner and inside its one purge transaction, removes an erased
+-- owner's stale rows with exactly these three statements, so the row
+-- trigger is disabled only inside that uncommitted transaction (ALTER TABLE
+-- is transactional and holds the table lock until COMMIT; a rollback
+-- restores it):
+--   ALTER TABLE analytics_v2_transition_stale
+--     DISABLE TRIGGER analytics_v2_transition_stale_append_only;
+--   DELETE FROM analytics_v2_transition_stale WHERE owner_digest = $1;
+--   ALTER TABLE analytics_v2_transition_stale
+--     ENABLE TRIGGER analytics_v2_transition_stale_append_only;
+-- It never uses session_replication_role (that disables every trigger,
+-- foreign keys included) and never truncates. The transition rows keep their
+-- content-free counts (owner_days, stale_owner_days). The runtime role holds
+-- DML grants only, not ownership, so the running service cannot do this.
+-- postgres-test/analytics-v2-price-cards.spec.mjs rehearses it.
 
 CREATE TABLE analytics_v2_kernel_prices (
   kernel_id smallint PRIMARY KEY REFERENCES analytics_v2_kernels(kernel_id),

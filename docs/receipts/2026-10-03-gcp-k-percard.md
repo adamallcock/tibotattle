@@ -64,19 +64,28 @@ databases.
   longer matches (`ANALYTICS_V2_PRICE_TRANSITION_STALE`); corrupt stored
   inputs fail the run (`ANALYTICS_V2_PRICE_INPUTS_CORRUPT`). A transition is
   recorded once.
-- **The compute class** (`compute_sha256`): the compute closure without the
-  vendored `packages/accounting/src/price-registry.js`, computed by
-  `cloud-run/analytics-kernel-closure.mjs` and stamped through a third
-  esbuild define. It is not a registry key (the closure digest pins it); the
-  store records it per kernel and refuses a kernel that states another one
-  (`ANALYTICS_V2_KERNEL_PRICES_CONFLICT`). Kernels 1 and 2 never recorded one,
-  so a transition from them is never compatible.
+- **The compute class** (`compute_sha256`, method
+  `analytics-v2-compute-class-v2`): the compute closure without the vendored
+  `packages/accounting/src/price-registry.js`, and with the vendored source
+  commit masked where the authored facade (`entry.ts`) names it in a `//`
+  line comment. It is computed by `cloud-run/analytics-kernel-closure.mjs`
+  and stamped through a third esbuild define. It is not a registry key (the
+  closure digest pins it); the store records it per kernel and refuses a
+  kernel that states another one (`ANALYTICS_V2_KERNEL_PRICES_CONFLICT`).
+  A price change reaches this line only by re-vendoring a new production
+  commit, and the vendoring workflow makes the facade's provenance text name
+  that commit, so without the mask no re-vendored kernel could ever be
+  compatible. With it, a re-vendor that changes only the price registry
+  keeps the class. Kernels 1 and 2 never recorded a class, so a transition
+  from them is never compatible.
 - **Derived-regime dirtiness** for the later incremental planner:
-  `analyticsV2PriceDirtyOwnerDays` (unattributed, unproven, incompatible or
-  stale rows) with the store reader `readAnalyticsV2PriceDirtyOwnerDays`, and
+  `analyticsV2PriceDirtyOwnerDays` (unattributed, unproven, incompatible,
+  stale, or `registry`: a compatible, non-stale owner-day with daily values
+  whose kernel priced under another registry, to restamp) with the store
+  reader `readAnalyticsV2PriceDirtyOwnerDays`, and
   `analyticsV2WindowPriceBasisSha256` for window memo keys.
-- **Kernel 3** appended to `kernel-registry.json` (closure `54f0f84f...`,
-  162 inputs; compute class `a94b1a0d...`; vendor manifest and price registry
+- **Kernel 3** appended to `kernel-registry.json` (closure `f8a1d5eb...`,
+  162 inputs; compute class `fafffba4...`; vendor manifest and price registry
   unchanged). Contract `analytics-v2-contract-v0.6` (the `ownerDayPrices`
   output and the seven tables).
 
@@ -85,6 +94,9 @@ owner results, the price registry identity appears only in daily values
 (`registrySha256`), never in fits or model-date results.
 
 ## Evidence
+
+For the first commit, `d83b364e`; the review fixes below re-ran the gates
+they touch.
 
 | Gate | Result |
 |---|---|
@@ -125,6 +137,83 @@ against the base line (`c2726984`, a `git archive` copy, kernel 2):
   with cause 3 (the two refused owner-days have no price); every owner-day
   then stamps kernel 3.
 
+## Review fixes (second commit)
+
+A review of `d83b364e` raised four findings. All four were confirmed against
+the code and fixed:
+
+1. **Registry identity after a compatible transition (medium).** Daily values
+   carry `registrySha256`, and the vendored
+   `validateV11DailyProjectionValues` (and so the merge and fold) refuses any
+   other registry than its own. A compatible transition between kernels whose
+   registries differ reported the older kernel's non-stale daily-valued
+   owner-days as clean, even though they could be neither kept nor folded
+   under the new kernel. The dirtiness now reports them with the cause
+   `registry` (restamp, or recompute). It derives this from the two kernels'
+   immutable `analytics_v2_kernels.price_registry_sha256`, so the
+   append-only stale set records price staleness only and needs no
+   correction. A refused owner-day has no daily values and is not reported.
+   A new PG17 case has kernel 2 add one card under a new registry. It asserts
+   that the non-stale owner-day is reported `registry`, and that its stored
+   daily fails the new kernel's validator and merge until it is restamped.
+2. **Compatible transitions were unreachable (medium).** `entry.ts` is a
+   closure input, and the vendoring workflow requires its provenance text to
+   name the new commit. So every re-vendor changed the compute class, and the
+   old check proved equality only by editing the vendored price registry in
+   place, which the vendoring workflow forbids. The class now masks that
+   commit in the facade's line comments (see above). The in-place test is
+   replaced with re-vendor-shaped fixtures (a new commit, the facade naming
+   it, a new manifest, only the registry's content changed): those keep the
+   class. A facade that names another commit, any other facade edit, the
+   commit named in code, and every other closure change still move it.
+3. **Untested refusals (low).** These now have tests:
+   - `ANALYTICS_V2_PRICE_STATE_INVALID`: a price row moved to another
+     registered kernel than its owner-day's, and a kernel registration whose
+     CHECK the fixture dropped. Both are refused by the proof and by the run,
+     atomically.
+   - `ANALYTICS_V2_PRICE_BASIS_CONFLICT`: a stored basis with the right
+     digest but other refs. Refused atomically.
+   - `ANALYTICS_KERNEL_CLOSURE_PRICE_REGISTRY_MISSING`: the registry taken out
+     of esbuild's graph.
+   - The new closure refusals: `_MANIFEST_INVALID` and `_FACADE_INVALID`. A
+     closure without the facade has no kernels (`_KERNELS_MISSING`).
+4. **Stale rows and the offline purge (low).** `analytics_v2_transition_stale`
+   cannot cascade from `analytics_v2_owner_day`, because every refresh
+   replaces the owner-day rows it recomputes, which would erase the stale set
+   in the run that records it. So the migration header now records the exact
+   PURGE-1 statements. As the schema owner, inside the one purge transaction:
+   disable only the row trigger `analytics_v2_transition_stale_append_only`,
+   delete the owner's rows, and re-enable the trigger before COMMIT. It never
+   uses `session_replication_role`. A PG17 case rehearses this. Plain DELETE
+   and TRUNCATE stay refused. A rolled-back purge changes nothing, the
+   trigger included. A committed purge removes exactly that owner's rows,
+   leaves the table append-only, and keeps the transition's content-free
+   counts.
+
+Kernel 3's entry was re-derived (closure `54f0f84f...` to `f8a1d5eb...`,
+pin updated), because `price-transition.ts` is a closure root. Kernel 3 had
+stamped only dropped local scratch databases, and the branch is unmerged.
+The compute class moved from `a94b1a0d...` (method v1) to `fafffba4...`
+(method v2).
+
+Gates for the fixes, on the fan-out cluster (55433) in database
+`kpercard_fix_ae7fbd`, created for this run and dropped afterwards:
+
+| Gate | Result |
+|---|---|
+| `npx tsc --noEmit` (apps/worker) | rc 0 |
+| `analytics-v2:check`, Node 26.2.0 | 19 files, 209/209 |
+| `analytics-v2-price-cards.spec.mjs` | 9/9 |
+| `analytics-v2-refresh.spec.mjs` (dist rebuilt) | 51/51 |
+| kernel-registry check | 8/8 |
+| `gcp:fastpath:scripts-check` | 93/93 |
+| `postgres:migrations:check`, `append-only:absence:check`, `v0x:admission:check`, `postgres:retired-readers:check` | rc 0 (11/11 and 2/2), 19/19, 25/25, 4/4 |
+| cloud-run `npm run check` | rc 0 (415 pass, 4 skip) |
+| `postgres:domain:check` | rc 0: vitest 101 pass, 1 skip; node 455 pass, 1 skip, 0 fail |
+| `scripts:check`, `gcp:production-tooling:local-check` | rc 0: 1,110/1,110; 527 pass, 5 skip |
+| Q-1 rehearsal with the staged migration | `status: pass`, all 7 gates true, parity 0 unexpected, per-date equal; 678 price rows, 178 cards, 67 bases, no transition on a fresh schema |
+| root `test:preflight`, `architecture:check` | rc 0; passed (0 approved debt edges) |
+
 ## Open items
 
 - The integrator assigns the primary number and adds the
@@ -135,5 +224,10 @@ against the base line (`c2726984`, a `git archive` copy, kernel 2):
 - The output account and prepare phase grow with the stored inputs (about
   +15% prepare on Q-1); measure on the dense corpus before the production
   task profile is fixed (MEAS-3, K-MEAS-INCR).
-- `analytics_v2_transition_stale` is append-only and holds owner digests;
-  the offline purge (OA-9) decides how an erased owner's rows leave it.
+- `analytics_v2_transition_stale` is append-only and holds owner digests.
+  Its removal path for PURGE-1 is recorded in the migration header and
+  rehearsed. PURGE-1 (not built; OA-9 open) must include that table, in that
+  way, when it is built.
+- Compatible transitions now depend on the facade mask. A future facade that
+  must name its commit somewhere other than a `//` line comment makes every
+  re-vendor incompatible again (safe, but cold).

@@ -401,8 +401,10 @@ export async function writeAnalyticsV2OwnerDayPrices(client: PostgresClient, sch
 /**
  * The derived-regime dirtiness (engine v2 section 5.3) of the stored
  * owner-days of `ownerDigests` under the run kernel `kernelId`: the rows a
- * kernel transition makes the incremental planner recompute
- * (price-transition.ts analyticsV2PriceDirtyOwnerDays). Reads only.
+ * kernel transition makes the incremental planner recompute, or at least
+ * restamp (price-transition.ts analyticsV2PriceDirtyOwnerDays). Whether a
+ * transition crosses a price-registry change is read from the two kernels'
+ * immutable rows (analytics_v2_kernels.price_registry_sha256). Reads only.
  */
 export async function readAnalyticsV2PriceDirtyOwnerDays(client: PostgresClient, options: {
   readonly schema: string; readonly kernelId: number; readonly ownerDigests: readonly string[];
@@ -413,8 +415,12 @@ export async function readAnalyticsV2PriceDirtyOwnerDays(client: PostgresClient,
     fail("ANALYTICS_V2_RUN_INVALID", "priceDirtiness");
   }
   const transitions = rowsOf<Record<string, unknown>>(await client.query(
-    `SELECT transition_id, from_kernel::integer AS from_kernel, to_kernel::integer AS to_kernel, compatible
-       FROM ${relation(schema, TABLES.kernelTransitions)} WHERE to_kernel = $1::smallint ORDER BY transition_id`,
+    `SELECT t.transition_id, t.from_kernel::integer AS from_kernel, t.to_kernel::integer AS to_kernel, t.compatible,
+            (f.price_registry_sha256 = c.price_registry_sha256) AS registry_equal
+       FROM ${relation(schema, TABLES.kernelTransitions)} t
+       JOIN ${relation(schema, TABLES.kernels)} f ON f.kernel_id = t.from_kernel
+       JOIN ${relation(schema, TABLES.kernels)} c ON c.kernel_id = t.to_kernel
+      WHERE t.to_kernel = $1::smallint ORDER BY t.transition_id`,
     [kernelId]), "ANALYTICS_V2_READ_FAILED");
   const stale = rowsOf<Record<string, unknown>>(await client.query(
     `SELECT s.transition_id, s.owner_digest, s.day::text AS day
@@ -423,17 +429,23 @@ export async function readAnalyticsV2PriceDirtyOwnerDays(client: PostgresClient,
       WHERE t.to_kernel = $1::smallint AND s.owner_digest = ANY($2::text[])`, [kernelId, ownerDigests]),
   "ANALYTICS_V2_READ_FAILED");
   const rows = rowsOf<Record<string, unknown>>(await client.query(
-    `SELECT owner_digest, day::text AS day, kernel_id::integer AS kernel_id
+    `SELECT owner_digest, day::text AS day, kernel_id::integer AS kernel_id, (daily IS NOT NULL) AS has_daily
        FROM ${relation(schema, TABLES.ownerDay)} WHERE owner_digest = ANY($1::text[])
       ORDER BY owner_digest, day`, [ownerDigests]), "ANALYTICS_V2_READ_FAILED");
+  const flag = (value: unknown, field: string): boolean => {
+    if (typeof value !== "boolean") fail("ANALYTICS_V2_PRICE_STATE_INVALID", field);
+    return value as boolean;
+  };
   return analyticsV2PriceDirtyOwnerDays({
     currentKernelId: kernelId,
     transitions: transitions.map((row) => ({ transitionId: countOf(row.transition_id, "transitions.id"),
       fromKernel: countOf(row.from_kernel, "transitions.from"), toKernel: countOf(row.to_kernel, "transitions.to"),
-      compatible: row.compatible === true })),
+      compatible: flag(row.compatible, "transitions.compatible"),
+      registryEqual: flag(row.registry_equal, "transitions.registryEqual") })),
     stale: stale.map((row) => ({ transitionId: countOf(row.transition_id, "stale.id"), ownerDigest: row.owner_digest as string,
       day: row.day as string })),
     rows: rows.map((row) => ({ ownerDigest: row.owner_digest as string, day: row.day as string,
-      kernelId: row.kernel_id === null ? null : countOf(row.kernel_id, "ownerDay.kernelId") })),
+      kernelId: row.kernel_id === null ? null : countOf(row.kernel_id, "ownerDay.kernelId"),
+      hasDaily: flag(row.has_daily, "ownerDay.hasDaily") })),
   });
 }
