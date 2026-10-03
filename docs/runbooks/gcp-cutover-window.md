@@ -1011,24 +1011,44 @@ resume. `owner`.
    (C-REFRESH); the measured dense run took 66 minutes on a test seed, and the
    production figure is unmeasured.
 2. Confirm the first Google Cloud publication: `GET /api/v1/community/daily`
-   serves origin-computed days.
+   serves origin-computed days. In the receipt line, `ownerSets` must show
+   `bootstrapAdoptedDays: []`: every day's saved owner set was recorded at its
+   first publication, never adopted from an earlier head (see below).
 3. Retire the frozen interim read. `built` (C-IPR): the route stops reading
    the frozen export as soon as any day is published and cannot return to it.
-   Dropping the stored row is a later migration, `not built`, pending the
-   owner's reading of the 90-day rule for frozen copies.
+   The stored row is kept, inert (owner decision round 12, OWN-18); only the
+   OWN-4 export file is deleted, 90 days after the seal. The refresh job still
+   reads the row to compare a frozen-window day's first recorded owner set
+   with Cloudflare's count (E-OWNERSET). Once a receipt has recorded the
+   window, a run that would first record a day inside it without the row
+   refuses with `ANALYTICS_V2_SOURCE_UNAVAILABLE` instead of recording the day
+   as outside the window.
 4. Resume the analytics-refresh trigger under
    [GCP scheduler resume](./gcp-scheduler-resume.md), at the cadence set from
    the measurements. Then set its committed state to `ENABLED`. Tooling:
    explicit pause-all and resume-all are `not built` (D-OPS3).
 
-Recomputed history can differ from what Cloudflare published, published
-revisions restart, and past contributions stay in recomputed history. These
-are accepted differences and are disclosed on the privacy page (E-OPS9); they
-are not defects of the cold build. Each frozen-window day's saved owner set is
-the participants at GCP's first publication of it (owner decision round 7);
-`analytics_v2_daily_owner_set_bootstrap` lists every such day with the set's
-size and Cloudflare's `contributingParticipants`, verified (provenance 2) when
-they agree and disclosed (provenance 3) when they differ (E-OWNERSET).
+Recomputed history can differ from what Cloudflare published, and past
+contributions stay in recomputed history. These are accepted differences and
+are disclosed on the privacy page (E-OPS9); they are not defects of the cold
+build. Published revisions do not restart: each republished day continues
+above Cloudflare's last revision (round 12, REV-SEED), so an aggregate
+identifier the frozen read served is never reused for other content.
+
+Each frozen-window day's saved owner set is the participants at GCP's first
+publication of it (owner decision round 7, E-OWNERSET).
+`analytics_v2_daily_owner_set_bootstrap` holds one receipt for every day
+whose set is recorded, with the set's size and how it began: for a
+frozen-window day, Cloudflare's `contributingParticipants` and the export's
+window, verified (provenance 2) when the counts agree and disclosed
+(provenance 3) when they differ; otherwise provenance 1. The cold build must
+run an image that records owner sets, on a database where the owner-sets
+migration precedes the first publication: such an image refuses to run
+without the migration's tables, and P10 proves that no published day exists
+before H.8. A head published without a recorded set (possible on staging or
+test databases only) is adopted the first time a run queues it (provenance
+4, listed in `bootstrapAdoptedDays`), is never compared with Cloudflare's
+count, and lacks any owner that left before that run.
 
 ## Abort A, before any gcp-mode version
 

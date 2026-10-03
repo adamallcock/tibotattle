@@ -2,16 +2,21 @@
 // and the compute core's owner-set input (compute.ts). A published day folds
 // its saved set S(d) plus every computed owner with non-empty values on d; a
 // departed or empty-read member folds its stored contribution, never a zero;
-// an unfoldable contribution blocks the day; with no saved set the fold is the
-// computed-owners fold byte for byte. Synthetic, content-free values only.
+// an excluded member folds nothing, on or off the roster; an unfoldable
+// contribution, or a departed member without an owner link, blocks the day;
+// an unrecorded day names how its set begins; with no saved set the fold is
+// the computed-owners fold byte for byte. Synthetic, content-free values only.
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK,
   buildAnalyticsV2Community,
   analyticsV2NeededContributions,
   analyticsV2SavedValueKey,
   type AnalyticsV2CommunityInput,
 } from "../src/analytics-v2/compute-community";
 import { computeAnalyticsV2 } from "../src/analytics-v2/compute";
+import { ANALYTICS_V2_DEFAULT_RESOURCES } from "../src/analytics-v2/resources";
 import type { AnalyticsV2Owner, AnalyticsV2OwnerSetState, AnalyticsV2SavedDay } from "../src/analytics-v2/contract";
 import {
   analyticsV2ContributionDigests,
@@ -43,10 +48,19 @@ function values(day: string, quota: number, session = 0): V11DailyProjectionValu
   return value;
 }
 
-function savedDay(members: Record<string, { version: number; devices: number }>, bootstrapped = false): AnalyticsV2SavedDay {
+/**
+ * A recorded day's saved set. Each member's owner link names a synthetic
+ * participant unless `participantId` is given (null: no link row remains).
+ */
+function savedDay(members: Record<string, { version: number; devices: number; participantId?: string | null }>,
+  { recorded = true, headPublished = true } = {}): AnalyticsV2SavedDay {
   return { members: new Map(Object.entries(members).map(([ownerDigest, member]) =>
-    [ownerDigest, { ...member, valuesSha256: "a".repeat(64) }])), bootstrapped };
+    [ownerDigest, { version: member.version, devices: member.devices, valuesSha256: "a".repeat(64),
+      participantId: member.participantId === undefined ? `participant-${ownerDigest.slice(0, 8)}` : member.participantId }])),
+  recorded, headPublished };
 }
+
+const NO_FROZEN = { frozenParticipants: null, frozenExportSha256: null, frozenFromDay: null, frozenThroughDay: null };
 
 function communityInput(overrides: {
   computed: string[];
@@ -70,6 +84,7 @@ function communityInput(overrides: {
     blockers: overrides.blockers ?? new Map(),
     dailyValues,
     computedOwners,
+    rosterDigests: new Set(computedOwners.map((each) => each.ownerDigest)),
     // No fits: the preview is withheld, which keeps these cases to the daily fold.
     effectiveDigests: computedOwners.map((each) => each.ownerDigest),
     devicesByDay: new Map(queued.map((day) => [day, new Map(Object.entries(overrides.devices ?? {}))])),
@@ -100,9 +115,10 @@ describe("saved owner sets in the community fold (E-OWNERSET)", () => {
       { ownerDigest: A, origin: "computed", values: a, devices: 2, savedVersion: null },
       { ownerDigest: C, origin: "computed", values: c, devices: 1, savedVersion: null },
     ]);
-    expect(candidate!.bootstrap).toBeNull();
+    // No state for the day: its first recording, outside any frozen window.
+    expect(candidate!.bootstrap).toEqual({ provenance: 1, ...NO_FROZEN });
     expect(result.ownerSets).toEqual({ contributionRetainedEvidenceAbsent: 0, savedMembersFolded: 0,
-      memberContributionUnavailableDays: [] });
+      memberContributionUnavailableDays: [], memberLinkUnavailableDays: [] });
     expect(result.preview).toBeNull();
   });
 
@@ -143,6 +159,41 @@ describe("saved owner sets in the community fold (E-OWNERSET)", () => {
       .toEqual([["computed", values(DAY, 3), null], ["excluded", null, null]]);
   });
 
+  it("keeps a departed member excluded: its stored contribution is neither loaded nor folded", async () => {
+    const day = Date.parse(`${DAY}T00:00:00.000Z`) * 1_000;
+    const input = communityInput({ computed: [A], fresh: { [A]: values(DAY, 3) },
+      saved: new Map([[DAY, savedDay({ [A]: { version: 1, devices: 1 }, [X]: { version: 2, devices: 1 } })]]),
+      // X left the roster; its exclusion still reaches the fold through its owner link.
+      exclusions: new Map([[X, [{ effectiveAtUs: day, expiresAtUs: null }]]]),
+      savedValues: new Map([[analyticsV2SavedValueKey(DAY, X, 2), values(DAY, 9)]]) });
+    expect(analyticsV2NeededContributions(input)).toEqual([]);
+    const result = await buildAnalyticsV2Community(input);
+    const [candidate] = result.dailyCandidates;
+    expect(candidate!.payload).toEqual(await referencePayload(DAY, [[values(DAY, 3), 1]]));
+    expect(candidate!.members.map((member) => [member.ownerDigest, member.origin]))
+      .toEqual([[A, "computed"], [X, "excluded"]]);
+    expect(result.ownerSets.savedMembersFolded).toBe(0);
+  });
+
+  it("blocks a day whose departed member has no owner link, so its exclusions cannot be read", async () => {
+    const saved = new Map([[DAY, savedDay({ [A]: { version: 1, devices: 1, participantId: null },
+      [X]: { version: 1, devices: 1, participantId: null } })]]);
+    const input = communityInput({ computed: [A], fresh: { [A]: values(DAY, 1) }, queued: [DAY, OTHER_DAY], saved,
+      savedValues: new Map([[analyticsV2SavedValueKey(DAY, X, 1), values(DAY, 2)]]) });
+    // Nothing is loaded for the blocked day.
+    expect(analyticsV2NeededContributions(input)).toEqual([]);
+    const result = await buildAnalyticsV2Community(input);
+    expect(result.dailyCandidates.map((candidate) => candidate.day)).toEqual([OTHER_DAY]);
+    expect(result.blockedDays).toEqual([DAY]);
+    expect(result.ownerSets.memberLinkUnavailableDays).toEqual([DAY]);
+    expect(result.ownerSets.memberContributionUnavailableDays).toEqual([]);
+    // A roster owner's exclusions are the roster's: only a member off the roster blocks.
+    const computedOnly = await buildAnalyticsV2Community(communityInput({ computed: [A], fresh: { [A]: values(DAY, 1) },
+      saved: new Map([[DAY, savedDay({ [A]: { version: 1, devices: 1, participantId: null } })]]) }));
+    expect(computedOnly.ownerSets.memberLinkUnavailableDays).toEqual([]);
+    expect(computedOnly.dailyCandidates.map((candidate) => candidate.day)).toEqual([DAY]);
+  });
+
   it("blocks a day whose member contribution cannot be folded under the run's kernel", async () => {
     const saved = new Map([[DAY, savedDay({ [X]: { version: 1, devices: 1 } })]]);
     for (const stored of [
@@ -158,6 +209,7 @@ describe("saved owner sets in the community fold (E-OWNERSET)", () => {
       expect(result.dailyCandidates.map((candidate) => candidate.day)).toEqual([OTHER_DAY]);
       expect(result.blockedDays).toEqual([DAY]);
       expect(result.ownerSets.memberContributionUnavailableDays).toEqual([DAY]);
+      expect(result.ownerSets.memberLinkUnavailableDays).toEqual([]);
     }
   });
 
@@ -170,22 +222,26 @@ describe("saved owner sets in the community fold (E-OWNERSET)", () => {
     expect(analyticsV2SavedValueKey(DAY, A, 2)).toBe(analyticsV2ContributionKey({ day: DAY, ownerDigest: A, version: 2 }));
   });
 
-  it("records the first frozen-window recording as verified only when Cloudflare's count matches (round 7)", async () => {
+  it("names how an unrecorded day's set begins: 2 or 3 in the frozen window (round 7), 4 for a head, else 1", async () => {
     const frozen = { exportSha256: "e".repeat(64), fromDay: "2025-10-01", throughDay: DAY,
       participants: new Map([[DAY, 2]]) };
+    const window = { frozenExportSha256: "e".repeat(64), frozenFromDay: "2025-10-01", frozenThroughDay: DAY };
     const fresh = { [A]: values(DAY, 1), [B]: values(DAY, 2) };
+    const unrecorded = (headPublished: boolean) => new Map([[DAY, savedDay({}, { recorded: false, headPublished })]]);
     const run = async (extra: Partial<Parameters<typeof communityInput>[0]>) =>
-      (await buildAnalyticsV2Community(communityInput({ computed: [A, B], fresh, frozen, ...extra })))
+      (await buildAnalyticsV2Community(communityInput({ computed: [A, B], fresh, frozen, saved: unrecorded(false), ...extra })))
         .dailyCandidates.find((candidate) => candidate.day === DAY)!.bootstrap;
-    expect(await run({})).toEqual({ provenance: 2, frozenParticipants: 2, frozenExportSha256: "e".repeat(64) });
-    expect(await run({ fresh: { [A]: values(DAY, 1) } }))
-      .toEqual({ provenance: 3, frozenParticipants: 2, frozenExportSha256: "e".repeat(64) });
+    expect(await run({})).toEqual({ provenance: 2, frozenParticipants: 2, ...window });
+    expect(await run({ fresh: { [A]: values(DAY, 1) } })).toEqual({ provenance: 3, frozenParticipants: 2, ...window });
     expect(await run({ frozen: { ...frozen, participants: new Map() } }))
-      .toEqual({ provenance: 3, frozenParticipants: null, frozenExportSha256: "e".repeat(64) });
-    // Outside the window, after the first recording, or onto an existing set: provenance 1 (no bootstrap).
-    expect(await run({ frozen: { ...frozen, throughDay: "2026-09-27" } })).toBeNull();
-    expect(await run({ saved: new Map([[DAY, savedDay({}, true)]]) })).toBeNull();
-    expect(await run({ frozen: null })).toBeNull();
+      .toEqual({ provenance: 3, frozenParticipants: null, ...window });
+    // A head published before the day's set was recorded is adopted, never compared.
+    expect(await run({ saved: unrecorded(true) })).toEqual({ provenance: 4, ...NO_FROZEN });
+    // Outside the window, or with no frozen export: provenance 1.
+    expect(await run({ frozen: { ...frozen, throughDay: "2026-09-27" } })).toEqual({ provenance: 1, ...NO_FROZEN });
+    expect(await run({ frozen: null })).toEqual({ provenance: 1, ...NO_FROZEN });
+    // A recorded day, with or without members: no first recording.
+    expect(await run({ saved: new Map([[DAY, savedDay({})]]) })).toBeNull();
   });
 
   it("digests a contribution with and without its price identity", async () => {
@@ -239,7 +295,52 @@ describe("the compute core's owner-set input (E-OWNERSET)", () => {
     const bare = await computeAnalyticsV2(base);
     expect(bare.dailyCandidates[0]!.members).toEqual([]);
     expect(bare.ownerSets).toEqual({ contributionRetainedEvidenceAbsent: 0, savedMembersFolded: 0,
-      memberContributionUnavailableDays: [] });
+      memberContributionUnavailableDays: [], memberLinkUnavailableDays: [] });
+  });
+
+  it("accepts exclusions for a saved member off the roster and refuses them for anyone else", async () => {
+    const stored = values(DAY, 6, 1);
+    const state = { days: new Map([[DAY, savedDay({ [X]: { version: 2, devices: 4 } })]]), frozen: null };
+    const requested: unknown[] = [];
+    const loadValues = async (keys: ReadonlyArray<{ day: string; ownerDigest: string; version: number }>) => {
+      requested.push(...keys);
+      return new Map(keys.map((key) => [analyticsV2ContributionKey(key), stored]));
+    };
+    const at = Date.parse(`${DAY}T00:00:00.000Z`) * 1_000;
+    const excluded = await computeAnalyticsV2({ ...base, ownerSets: { state, loadValues },
+      exclusions: new Map([[X, [{ effectiveAtUs: at, expiresAtUs: null }]]]) });
+    expect(requested).toEqual([]);
+    expect(excluded.dailyCandidates[0]!.members).toEqual([{ ownerDigest: X, origin: "excluded", values: null,
+      devices: null, savedVersion: null }]);
+    expect((excluded.dailyCandidates[0]!.payload as { totals: { contributingParticipants: number } })
+      .totals.contributingParticipants).toBe(0);
+    await expect(computeAnalyticsV2({ ...base, ownerSets: { state, loadValues },
+      exclusions: new Map([[C, [{ effectiveAtUs: at, expiresAtUs: null }]]]) }))
+      .rejects.toThrow("ANALYTICS_V2_INPUT_INVALID:exclusions.owner");
+  });
+
+  it("loads saved contributions a chunk at a time, each chunk held to the output budget", async () => {
+    const many = Array.from({ length: 2 * ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK + 500 },
+      (_, index) => createHash("sha256").update(`owner-sets-spec:${index}`).digest("hex")).sort();
+    const state = { days: new Map([[DAY, savedDay(Object.fromEntries(many.map((ownerDigest) =>
+      [ownerDigest, { version: 1, devices: 1 }])))]]), frozen: null };
+    const calls: number[] = [];
+    const loadValues = async (keys: ReadonlyArray<{ day: string; ownerDigest: string; version: number }>) => {
+      calls.push(keys.length);
+      return new Map(keys.map((key) => [analyticsV2ContributionKey(key), values(DAY, 1)]));
+    };
+    // Above the old fixed cap of a single load, nothing refuses: the chunks
+    // are each one load, and the fold folds every member.
+    const outputs = await computeAnalyticsV2({ ...base, ownerSets: { state, loadValues } });
+    expect(calls).toEqual([ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK, ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK, 500]);
+    expect(outputs.ownerSets.savedMembersFolded).toBe(many.length);
+    // The output budget is the bound: a run that cannot hold them is refused
+    // before the last chunk is read.
+    calls.length = 0;
+    await expect(computeAnalyticsV2({ ...base, ownerSets: { state, loadValues },
+      resources: { ...ANALYTICS_V2_DEFAULT_RESOURCES, outputBudgetBytes: 1_048_576 } }))
+      .rejects.toMatchObject({ code: "ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED", outputBudgetBytes: 1_048_576 });
+    expect(calls.length).toBeLessThan(3);
   });
 
   it("refuses a malformed owner-set input before any kernel runs", async () => {
@@ -247,7 +348,13 @@ describe("the compute core's owner-set input (E-OWNERSET)", () => {
     const good: AnalyticsV2SavedDay = savedDay({ [X]: { version: 1, devices: 1 } });
     for (const [ownerSets, what] of [
       [{ state: { days: new Map([[OTHER_DAY, good]]), frozen: null }, loadValues }, "ownerSets.days"],
-      [{ state: { days: new Map([[DAY, { ...good, bootstrapped: "no" }]]), frozen: null }, loadValues }, "ownerSets.days"],
+      [{ state: { days: new Map([[DAY, { ...good, recorded: "no" }]]), frozen: null }, loadValues }, "ownerSets.days"],
+      [{ state: { days: new Map([[DAY, { ...good, headPublished: undefined }]]), frozen: null }, loadValues },
+        "ownerSets.days"],
+      // A member is never saved on a day whose set is not recorded.
+      [{ state: { days: new Map([[DAY, { ...good, recorded: false }]]), frozen: null }, loadValues }, "ownerSets.days"],
+      [{ state: { days: new Map([[DAY, savedDay({ [X]: { version: 1, devices: 1, participantId: "" } })]]),
+        frozen: null }, loadValues }, "ownerSets.members"],
       [{ state: { days: new Map([[DAY, savedDay({ [X]: { version: 0, devices: 1 } })]]), frozen: null }, loadValues },
         "ownerSets.members"],
       [{ state: { days: new Map([[DAY, savedDay({ [X]: { version: 1, devices: 0 } })]]), frozen: null }, loadValues },

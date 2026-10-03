@@ -123,8 +123,8 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
     "kernel_id", "manifest_version",
   ] as const),
   ownerSetBootstrap: Object.freeze([
-    "day", "provenance", "set_size", "frozen_participants", "frozen_export_sha256", "first_revision", "run_id",
-    "kernel_id", "manifest_version",
+    "day", "provenance", "set_size", "frozen_participants", "frozen_export_sha256", "frozen_from_day",
+    "frozen_through_day", "first_revision", "run_id", "kernel_id", "manifest_version",
   ] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
@@ -148,12 +148,16 @@ export const ANALYTICS_V2_PRIMARY_KEYS = Object.freeze({
  * The offline owner purge's analytics_v2 inventory: every table that holds
  * an owner's rows, keyed by its owner_digest column, in the order the purge
  * deletes them (a contribution before its set row, which it references). The
- * running service never deletes from them (owner decision D2, Variant B); the
- * purge (PURGE-1, owner tooling) names the owner in
- * tibotattle.analytics_v2_offline_purge for the saved-set tables, then
- * republishes the affected days over the smaller set (owner decision round
- * 7). A spec compares this list with the migrated catalog: an analytics_v2
- * table with an owner_digest column that is not listed fails it.
+ * running service never removes an owner (owner decision D2, Variant B): it
+ * replaces only a computed owner's derived rows inside the run's horizon
+ * (store-derived.ts), and never deletes a saved set or contribution. The
+ * purge (PURGE-1, owner tooling) names the owner in the offline-purge session
+ * setting the owner-sets migration's trigger reads, for the saved-set tables,
+ * then republishes the affected days over the smaller set (owner decision
+ * round 7). The online-erasure absence gate fails when a running service
+ * module names that setting or deletes from a saved-set table. A spec
+ * compares this list with the migrated catalog: an analytics_v2 table with an
+ * owner_digest column that is not listed fails it.
  */
 export const ANALYTICS_V2_OWNER_SCOPED_TABLES = Object.freeze([
   "ownerDay",
@@ -344,11 +348,16 @@ export interface AnalyticsV2OwnerModelDateRow {
  *   out, not ported, refused by the memory budget): it folds its current
  *   contribution;
  * - "excluded": a member of S(d) with an active community aggregate exclusion
- *   on d (N-EXCL): it stays in S(d) and folds nothing.
+ *   on d (N-EXCL): it stays in S(d) and folds nothing. A member that left the
+ *   roster is excluded through its owner link in any state (the reader maps
+ *   it), so leaving never undoes an exclusion.
  * A member whose current contribution cannot be folded under the run's
  * kernel (its values schema or price identity is not current; K-REPRICE
  * reprices them after cutover) blocks the day instead
- * (memberContributionUnavailableDays): never a zero, never dropped.
+ * (memberContributionUnavailableDays), and so does a member the run did not
+ * compute whose owner link no longer exists, since its exclusions cannot be
+ * read (memberLinkUnavailableDays): never a zero, never dropped, never
+ * folded without its exclusions.
  */
 export const ANALYTICS_V2_DAILY_MEMBER_ORIGINS = Object.freeze(["computed", "retained", "saved", "excluded"] as const);
 export type AnalyticsV2DailyMemberOrigin = (typeof ANALYTICS_V2_DAILY_MEMBER_ORIGINS)[number];
@@ -369,28 +378,43 @@ export interface AnalyticsV2DailyMember {
   readonly savedVersion: number | null;
 }
 
-/** analytics_v2_daily_owner_sets.provenance (see the staged owner-sets migration). */
+/**
+ * analytics_v2_daily_owner_sets.provenance and the day receipt's (see the
+ * staged owner-sets migration).
+ */
 export const ANALYTICS_V2_OWNER_SET_PROVENANCE = Object.freeze({
-  /** Recorded at a GCP publication outside the frozen window, or added to an existing set. */
+  /** Recorded at GCP's first publication of a day outside the frozen window, or added to an existing set. */
   published: 1,
   /** The participants at GCP's first publication of a frozen-window day, counted equal to Cloudflare's. */
   cutoverVerified: 2,
   /** The same, with a different count or no Cloudflare publication of the day (disclosed). */
   cutoverDisclosed: 3,
+  /**
+   * Adopted: first recorded while the day already had a published head (an
+   * unrecorded head, published by an image without saved owner sets). Owners
+   * that left before the recording are not in it; no frozen comparison.
+   */
+  adopted: 4,
 } as const);
+export type AnalyticsV2OwnerSetProvenance =
+  (typeof ANALYTICS_V2_OWNER_SET_PROVENANCE)[keyof typeof ANALYTICS_V2_OWNER_SET_PROVENANCE];
 
 /**
- * The first recording of a frozen-window day's set (owner decision round 7:
- * the participants at GCP's first publication, compared with the frozen
- * Cloudflare export's contributingParticipants and disclosed when they
- * differ). Null for every other publication: its new members take
- * provenance 1.
+ * How a day's set begins: the first recording of a day without a receipt,
+ * and the receipt row it writes. Provenance 2 or 3 (owner decision round 7:
+ * the participants at GCP's first publication of a frozen-window day,
+ * compared with the frozen Cloudflare export's contributingParticipants and
+ * disclosed when they differ) carries the export's digest and window, so a
+ * later run knows the window without the export; 1 and 4 carry none.
  */
 export interface AnalyticsV2OwnerSetBootstrap {
-  readonly provenance: 2 | 3;
-  /** The frozen export's contributingParticipants for the day; null when it did not publish it. */
+  readonly provenance: AnalyticsV2OwnerSetProvenance;
+  /** 2 and 3: the frozen export's contributingParticipants for the day (null when it did not publish it). */
   readonly frozenParticipants: number | null;
-  readonly frozenExportSha256: string;
+  /** 2 and 3: the frozen export's digest and window; null for 1 and 4. */
+  readonly frozenExportSha256: string | null;
+  readonly frozenFromDay: AnalyticsV2Day | null;
+  readonly frozenThroughDay: AnalyticsV2Day | null;
 }
 
 /**
@@ -398,7 +422,10 @@ export interface AnalyticsV2OwnerSetBootstrap {
  * when payloadSha256 differs from the stored row: revision =
  * max(previous, revisionSeed) + 1 and released_at = nowMs. A publication
  * also records the day's owner set (`members`, in owner-digest order) and
- * its contributions; an unchanged candidate records nothing.
+ * its contributions. `bootstrap` is non-null exactly when the day has no
+ * recorded set (no receipt): it is the first recording. An unchanged
+ * candidate records nothing, except an unrecorded head's adoption
+ * (provenance 4), which records its set at the head's revision.
  */
 export interface AnalyticsV2DailyCandidate {
   readonly day: AnalyticsV2Day;
@@ -411,19 +438,28 @@ export interface AnalyticsV2DailyCandidate {
 /**
  * A member of a day's saved set as the read snapshot holds it (A-1
  * owner-sets.ts readAnalyticsV2OwnerSetState): its current contribution's
- * version, device count and values digest. The values themselves are loaded
- * only for the members a fold needs them for.
+ * version, device count and values digest, and the participant its owner
+ * link names in any state (the run maps the member's community aggregate
+ * exclusions through it, on or off the roster); null when no owner link row
+ * remains. The values themselves are loaded only for the members a fold
+ * needs them for.
  */
 export interface AnalyticsV2SavedMember {
   readonly version: number;
   readonly devices: number;
   readonly valuesSha256: string;
+  readonly participantId: string | null;
 }
 
-/** One queued day's saved set, and whether its frozen-window bootstrap receipt exists. */
+/**
+ * One queued day's saved set; whether the day's set is recorded (its receipt
+ * exists); and whether the day has a published head (a head without a
+ * receipt is unrecorded, and its first recording is an adoption).
+ */
 export interface AnalyticsV2SavedDay {
   readonly members: ReadonlyMap<AnalyticsV2OwnerDigest, AnalyticsV2SavedMember>;
-  readonly bootstrapped: boolean;
+  readonly recorded: boolean;
+  readonly headPublished: boolean;
 }
 
 /**
@@ -440,8 +476,9 @@ export interface AnalyticsV2FrozenParticipants {
 
 /**
  * The owner-set state a run folds with: every queued day's saved set (a day
- * without one maps to an empty set) and, when some queued day without a set
- * lies inside the frozen window, the frozen counts (otherwise null).
+ * without one maps to an empty set) and, when some unrecorded queued day
+ * without a head lies inside the frozen window, the frozen counts (otherwise
+ * null).
  */
 export interface AnalyticsV2OwnerSetState {
   readonly days: ReadonlyMap<AnalyticsV2Day, AnalyticsV2SavedDay>;
@@ -466,6 +503,11 @@ export interface AnalyticsV2OwnerSetSummary {
   readonly savedMembersFolded: number;
   /** Queued days blocked because a member's contribution could not be folded (member_contribution_unavailable). */
   readonly memberContributionUnavailableDays: readonly AnalyticsV2Day[];
+  /**
+   * Queued days blocked because a member the run did not compute has no owner
+   * link row, so its exclusions cannot be read (member_link_unavailable).
+   */
+  readonly memberLinkUnavailableDays: readonly AnalyticsV2Day[];
 }
 
 /** analytics_v2_published_daily as stored and served. */
@@ -491,9 +533,13 @@ export interface AnalyticsV2PublicationSummary {
 export interface AnalyticsV2OwnerSetWriteSummary extends AnalyticsV2OwnerSetSummary {
   readonly membersAdded: number;
   readonly contributionVersions: number;
-  /** Frozen-window days whose set this run recorded first, by provenance. */
+  /** Days whose set this run recorded first (a receipt each), of any provenance. */
+  readonly daysRecorded: number;
+  /** Frozen-window days whose set this run recorded first, by provenance (2, 3). */
   readonly bootstrapVerifiedDays: readonly AnalyticsV2Day[];
   readonly bootstrapDisclosedDays: readonly AnalyticsV2Day[];
+  /** Unrecorded heads this run adopted (provenance 4), unchanged or republished. */
+  readonly bootstrapAdoptedDays: readonly AnalyticsV2Day[];
 }
 
 /** Wall-time phases recorded per run (milliseconds). */

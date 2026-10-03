@@ -289,7 +289,13 @@ function contractOwner(ownerDigest, source) {
 
 /** The fold's owner-set summary of a run that folded no saved contribution (E-OWNERSET). */
 const NO_OWNER_SETS = Object.freeze({ contributionRetainedEvidenceAbsent: 0, savedMembersFolded: 0,
-  memberContributionUnavailableDays: [] });
+  memberContributionUnavailableDays: [], memberLinkUnavailableDays: [] });
+
+/** A day's first set recording outside the frozen window (provenance 1), and an adoption (4). */
+const NO_FROZEN = Object.freeze({ frozenParticipants: null, frozenExportSha256: null, frozenFromDay: null,
+  frozenThroughDay: null });
+const FIRST_RECORDING = Object.freeze({ provenance: 1, ...NO_FROZEN });
+const ADOPTION = Object.freeze({ provenance: 4, ...NO_FROZEN });
 
 /**
  * The stand-in's owner set of one day (E-OWNERSET): every owner with a row on
@@ -318,8 +324,8 @@ function standInDeparted(inputs, day, rows) {
 }
 
 /** A run row's owner-set summary with these writes and nothing folded from storage. */
-const ownerSetWrites = (membersAdded, contributionVersions) => ({ ...NO_OWNER_SETS, membersAdded, contributionVersions,
-  bootstrapVerifiedDays: [], bootstrapDisclosedDays: [] });
+const ownerSetWrites = (membersAdded, contributionVersions, daysRecorded = 0) => ({ ...NO_OWNER_SETS, membersAdded,
+  contributionVersions, daysRecorded, bootstrapVerifiedDays: [], bootstrapDisclosedDays: [], bootstrapAdoptedDays: [] });
 
 /**
  * Reads go through the Job's snapshot pool on two separate connections, so
@@ -457,9 +463,13 @@ function createSpecPipeline(hooks = {}) {
         const departed = standInDeparted(inputs, day, rows);
         payload.totals.contributingParticipants += departed.length;
         payload.totals.usageEvents += departed.reduce((sum, member) => sum + member.usageEvents, 0);
+        // A day without a recorded set records it first: adopted when it
+        // already has a head, else outside any frozen window (none is loaded).
+        const saved = inputs.ownerSetState.days.get(day);
         dailyCandidates.push({ day, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload),
           members: [...standInMembers(rows), ...departed.map((member) => member.member)]
-            .sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1)), bootstrap: null });
+            .sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1)),
+          bootstrap: saved.recorded ? null : saved.headPublished ? ADOPTION : FIRST_RECORDING });
       }
       return {
         contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION,
@@ -789,7 +799,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         }), { schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null,
           horizon: STAND_IN_HORIZON, stamp, exclusionsSha256: digest.length === 0 ? NO_EXCLUSIONS : digest[0] });
       await write(specStamp, { dailyCandidates: [{ day: DAY_1, payload,
-        payloadSha256: await store.analyticsV2DailyContentSha256(payload), members: [], bootstrap: null }] });
+        payloadSha256: await store.analyticsV2DailyContentSha256(payload), members: [], bootstrap: FIRST_RECORDING }] });
       assert.deepEqual(await kernels(), [{ kernel_id: 1, production_commit: registry[0].productionCommit,
         vendor_manifest_sha256: registry[0].vendorManifestSha256, compute_closure_sha256: registry[0].computeClosureSha256,
         price_registry_sha256: registry[0].priceRegistrySha256, price_registry_version: registry[0].priceRegistryVersion,
@@ -1097,7 +1107,7 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
       { ownerDigest: OWNER_LEGACY, day: null, family: "owner", reason: "non_effective_source_unported" },
     ]);
     assert.deepEqual(runs1[0].publication, { published: [DAY_1, DAY_2, DAY_3], unchanged: [], blocked: [],
-      ownerSets: ownerSetWrites(4, 4) });
+      ownerSets: ownerSetWrites(4, 4, 3) });
     assert.ok(Number.isFinite(runs1[0].timings.read) && Number.isFinite(runs1[0].timings.write));
     const heads1 = await publishedRows(pool, schema);
     for (const day of [DAY_1, DAY_2, DAY_3]) {
@@ -1870,7 +1880,7 @@ test("PG17: a payload over the cap in its jsonb text form is refused with its ow
       const before = await analyticsSnapshot(pool, schema);
       await assert.rejects(store.writeRunOutputs(client, minimalOutputs({
         dailyCandidates: [{ day: DAY_1, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload),
-          members: [], bootstrap: null }],
+          members: [], bootstrap: FIRST_RECORDING }],
       }), {
         schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
         exclusionsSha256: NO_EXCLUSIONS,
@@ -1970,7 +1980,7 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
 function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"],
-  exclusionRead = undefined } = {}) {
+  exclusionRead = undefined, ownerSetRead = undefined, outputsOverride = undefined } = {}) {
   const calls = { owners: 0, queued: [], occurrences: [], counts: [], firstEvidence: [], devices: [], compute: null,
     loaded: new Map(), exclusions: 0 };
   const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
@@ -2051,8 +2061,10 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
         async readAnalyticsV2OwnerSetState(context, options) {
           assert.equal(context.nowMs, WIRING_NOW_MS);
           calls.ownerSets = [...options.days];
-          return { days: new Map(options.days.map((day) => [day, { members: new Map(), bootstrapped: false }])),
-            frozen: null };
+          // Given: that state (a function of the queued days), as is.
+          if (ownerSetRead !== undefined) return ownerSetRead(options.days);
+          return { days: new Map(options.days.map((day) => [day, { members: new Map(), recorded: false,
+            headPublished: false }])), frozen: null };
         },
         async readAnalyticsV2SavedContributionValues() {
           throw new Error("no saved contribution is needed");
@@ -2069,16 +2081,18 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
               calls.loaded.set(owner.ownerDigest, await input.loadOwnerOccurrences(owner.ownerDigest));
             }
           }
-          return {
+          const outputs = {
             contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION, mode: "full", nowMs: input.nowMs,
             today: utcDay(input.nowMs), revisionSeed: input.revisionSeed, owners: input.owners, ownerDays: [],
             cacheBands: [], ownerFits: [], ownerModelDates: [], preview: null, refusals: [], timings: {},
             dailyCandidates: input.queuedDays.filter((day) => day !== "2026-04-10")
-              .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64), members: [], bootstrap: null })),
+              .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64), members: [],
+                bootstrap: FIRST_RECORDING })),
             blockedDays: ["2026-04-10"],
             ownerSets: NO_OWNER_SETS,
             journal: { lastSequence: null },
           };
+          return outputsOverride === undefined ? outputs : outputsOverride(outputs);
         },
       },
     },
@@ -2223,6 +2237,65 @@ test("default wiring: a linked owner's active exclusions reach A-2, and a change
   const { owners: { readAnalyticsV2Exclusions: _read, ...ownersWithout }, ...rest } = wiringModules().modules;
   assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, owners: ownersWithout }),
     { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+});
+
+// E-OWNERSET (review): a saved member off the roster keeps its exclusions,
+// mapped through its owner link in any state; a member without a link maps
+// nothing (A-2 blocks its days); a malformed owner-set read or outputs without
+// the owner-set summary are refused, never read as "no saved set".
+test("default wiring: a saved member off the roster keeps its exclusions; malformed owner-set reads and outputs are refused", async () => {
+  const interval = Object.freeze({ effectiveAtUs: Date.parse("2026-09-29T00:00:00.000Z") * 1_000, expiresAtUs: null });
+  const departed = digest("departed"), vanished = digest("vanished");
+  const exclusionRead = { rows: 3, active: 3, sha256: NO_EXCLUSIONS, activeByParticipant: new Map([
+    [contractOwner(OWNER_A, "effective").participantId, [interval]],
+    ["participant-departed", [interval]],
+    ["participant-not-a-member", [interval]],
+  ]) };
+  const member = (participantId) => ({ version: 1, devices: 1, valuesSha256: "a".repeat(64), participantId });
+  const ownerSetRead = (days) => ({ frozen: null, days: new Map(days.map((day) => [day, day !== "2026-09-29"
+    ? { members: new Map(), recorded: false, headPublished: false }
+    : { recorded: true, headPublished: true, members: new Map([[OWNER_A, member("ignored-roster-link")],
+      [departed, member("participant-departed")], [vanished, member(null)]]) }])) });
+  const { calls, modules } = wiringModules({ exclusionRead, ownerSetRead });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  // The roster's owner by its roster link; the departed member by its own
+  // link; the member without a link, and the participant in no set, map nothing.
+  assert.deepEqual([...calls.compute.exclusions].sort(([left], [right]) => (left < right ? -1 : 1)),
+    [[OWNER_A, [interval]], [departed, [interval]]].sort(([left], [right]) => (left < right ? -1 : 1)));
+  assert.equal(inputs.exclusions.excludedOwners, 2);
+  assert.equal(calls.compute.ownerSets.state, inputs.ownerSetState);
+
+  // A malformed owner-set read is refused before compute.
+  for (const malformed of [
+    () => null,
+    () => ({ days: {}, frozen: null }),
+    (days) => ({ days: new Map(days.slice(1).map((day) => [day, { members: new Map() }])), frozen: null }),
+    (days) => ({ days: new Map(days.map((day) => [day, { members: new Map() }])), frozen: "no" }),
+    (days) => ({ days: new Map(days.map((day) => [day, null])), frozen: null }),
+    (days) => ({ days: new Map(days.map((day) => [day, { members: {} }])), frozen: null }),
+    (days) => ({ days: new Map(days.map((day) => [day, { members: new Map([[digest("x"), { participantId: 7 }]]) }])),
+      frozen: null }),
+  ]) {
+    await assert.rejects(job.createAnalyticsV2Pipeline(wiringModules({ ownerSetRead: malformed }).modules)
+      .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }),
+    { code: "ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID" });
+  }
+  // Outputs without the owner-set summary are refused after compute.
+  for (const outputsOverride of [({ ownerSets: _omitted, ...rest }) => rest, (outputs) => ({ ...outputs, ownerSets: null }),
+    (outputs) => ({ ...outputs, ownerSets: "none" })]) {
+    const wired = job.createAnalyticsV2Pipeline(wiringModules({ outputsOverride }).modules);
+    const read = await wired.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+    await assert.rejects(wired.compute(read, { nowMs: WIRING_NOW_MS, revisionSeed: 0 }),
+      { code: "ANALYTICS_V2_REFRESH_OUTPUTS_INVALID" });
+  }
+  // A pipeline without the owner-set readers cannot be built.
+  for (const name of ["readAnalyticsV2OwnerSetState", "readAnalyticsV2SavedContributionValues"]) {
+    const { ownerSets: { [name]: _reader, ...without }, ...rest } = wiringModules().modules;
+    assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, ownerSets: without }),
+      { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+  }
 });
 
 test("default wiring: cache history starts at the first evidence day, older than any window, queue or floor", async () => {
@@ -2978,6 +3051,21 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
 // whose read went empty (never a zero, no new revision), an unfoldable
 // contribution blocks its day, and GCP's first publication of a frozen-window
 // day records the participants at cutover against Cloudflare's frozen count.
+/**
+ * Synthetic owner links (E-OWNERSET): a participant row and an active
+ * storage owner link for each owner, as the roster's owners have. The owner-set
+ * reader maps a saved member's exclusions through its link; a member without
+ * one cannot be folded once it leaves the roster.
+ */
+async function linkOwners(pool, schema, owners) {
+  for (const owner of owners) {
+    await pool.query(`INSERT INTO ${quoted(schema, "participants")} (id, created_at) VALUES ($1, $2)`,
+      [owner.participantId, "2026-01-01T00:00:00.000Z"]);
+    await pool.query(`INSERT INTO ${quoted(schema, "storage_v11_owner_links")} (participant_id, owner_digest, state)
+      VALUES ($1, $2, 'active')`, [owner.participantId, owner.ownerDigest]);
+  }
+}
+
 test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable ones and bootstrap from the frozen window", {
   skip: PG_SKIP,
   timeout: 600_000,
@@ -3001,6 +3089,8 @@ test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable 
   await withDatabase("owner-sets", async ({ pool, createSchema }) => {
     const { schema } = await createSchema();
     await loadInterimPublicRead({ pool, schema, prepared });
+    // The third owner's link is added only later (below).
+    await linkOwners(pool, schema, [first, second]);
     const now = new Date(synthetic.NOW_MS).toISOString();
     const sets = quoted(schema, "analytics_v2_daily_owner_sets");
     const contributions = quoted(schema, "analytics_v2_daily_contributions");
@@ -3008,13 +3098,17 @@ test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable 
     const run1 = await runJob({ schema, now, pipeline });
     assert.deepEqual(run1.published, corpus.publishedDays);
     assert.deepEqual(run1.ownerSets, { ...NO_OWNER_SETS, membersAdded: 3 * corpus.publishedDays.length,
-      contributionVersions: 3 * corpus.publishedDays.length, bootstrapVerifiedDays: [today],
-      bootstrapDisclosedDays: corpus.publishedDays.filter((day) => day !== today) });
+      contributionVersions: 3 * corpus.publishedDays.length, daysRecorded: corpus.publishedDays.length,
+      bootstrapVerifiedDays: [today], bootstrapDisclosedDays: corpus.publishedDays.filter((day) => day !== today),
+      bootstrapAdoptedDays: [] });
     assert.deepEqual((await pool.query(`SELECT provenance, count(*)::int AS n FROM ${sets} GROUP BY provenance
         ORDER BY provenance`)).rows, [{ provenance: 2, n: 3 }, { provenance: 3, n: 3 * (corpus.publishedDays.length - 1) }]);
     assert.deepEqual((await pool.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, provenance, set_size, frozen_participants,
-        frozen_export_sha256 FROM ${quoted(schema, "analytics_v2_daily_owner_set_bootstrap")} WHERE day = $1`, [today])).rows,
-    [{ day: today, provenance: 2, set_size: 3, frozen_participants: 3, frozen_export_sha256: input.expectedSha256 }]);
+        frozen_export_sha256, to_char(frozen_from_day, 'YYYY-MM-DD') AS from_day,
+        to_char(frozen_through_day, 'YYYY-MM-DD') AS through_day
+        FROM ${quoted(schema, "analytics_v2_daily_owner_set_bootstrap")} WHERE day = $1`, [today])).rows,
+    [{ day: today, provenance: 2, set_size: 3, frozen_participants: 3, frozen_export_sha256: input.expectedSha256,
+      from_day: body.from, through_day: body.to }]);
     const heads1 = await publishedRows(pool, schema);
     // Every stored contribution is the computed owner's daily values, as folded.
     const stored = (await pool.query(`SELECT owner_digest, daily_values, devices, version FROM ${contributions}
@@ -3024,12 +3118,22 @@ test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable 
     assert.equal(stored[0].daily_values.day, today);
     assert.equal(stored[0].daily_values.schemaVersion, "v11-daily-projection-values-v2");
 
-    // The third owner departs (opt-out, disconnect): a re-queued today folds its
-    // saved contribution, so the content and the revision are unchanged.
+    // The third owner departs (opt-out, disconnect) while it has no owner link
+    // row: its exclusions cannot be read, so a re-queued today is blocked
+    // (member_link_unavailable) and keeps its head; it is never folded blind.
     owners.splice(owners.indexOf(third), 1);
     journal.push({ sequence: journal.length + 1, day: today });
+    const unlinked = await runJob({ schema, now, pipeline });
+    assert.deepEqual([unlinked.published, unlinked.blocked], [[], [today]]);
+    assert.deepEqual(unlinked.ownerSets.memberLinkUnavailableDays, [today]);
+    assert.equal(unlinked.ownerSets.savedMembersFolded, 0);
+    assert.deepEqual(await publishedRows(pool, schema), heads1);
+
+    // With its link, the carried day folds its saved contribution: the content
+    // and the revision are unchanged.
+    await linkOwners(pool, schema, [third]);
     const run2 = await runJob({ schema, now, pipeline });
-    assert.deepEqual([run2.published, run2.unchanged], [[], 1]);
+    assert.deepEqual([run2.published, run2.unchanged, run2.blocked], [[], 1, []]);
     assert.equal(run2.ownerSets.savedMembersFolded, 1);
     assert.deepEqual(await publishedRows(pool, schema), heads1);
 
@@ -3056,6 +3160,74 @@ test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable 
     assert.deepEqual(run4.ownerSets.memberContributionUnavailableDays, [today]);
     assert.deepEqual(await publishedRows(pool, schema), heads1);
     assert.deepEqual((await runRows(pool, schema)).at(-1).publication.blocked, [today]);
+  });
+});
+
+// Finding (E-OWNERSET review): leaving the roster must not undo an exclusion.
+// An excluded member that then withdraws stays excluded on the days its
+// exclusion covers, through its owner link in any state; revoking the
+// exclusion folds its saved contribution back (round 2).
+test("PG17 E-OWNERSET: a member excluded and then departed stays excluded; revoking folds its contribution back", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  const corpus = synthetic.composeProofCorpus();
+  const owners = [...corpus.owners];
+  const facts = new Map(synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]));
+  const journal = journalOf(corpus.publishedDays);
+  let exclusionRead = NO_EXCLUSION_READER.readAnalyticsV2Exclusions();
+  const pipeline = syntheticPipeline({ owners, facts, journal, exclusionRead: () => exclusionRead });
+  const today = synthetic.TODAY;
+  const third = [...owners].sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1))[2];
+  const startUs = Date.parse(`${today}T00:00:00.000Z`) * 1_000;
+  await withDatabase("owner-sets-exclusion", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await linkOwners(pool, schema, owners);
+    const now = new Date(synthetic.NOW_MS).toISOString();
+    const participants = (head) => head.payload.totals.contributingParticipants;
+    const run1 = await runJob({ schema, now, pipeline });
+    assert.deepEqual(run1.published, corpus.publishedDays);
+    const heads1 = await publishedRows(pool, schema);
+    assert.equal(participants(heads1.get(today)), 3);
+
+    // The third owner is excluded on today only: today is republished without it.
+    exclusionRead = { rows: 1, active: 1, sha256: "1".repeat(64), activeByParticipant: new Map([[third.participantId,
+      [{ effectiveAtUs: startUs, expiresAtUs: startUs + 86_400_000_000 }]]]) };
+    const excluded = await runJob({ schema, now, pipeline });
+    assert.deepEqual(excluded.published, [today]);
+    const heads2 = await publishedRows(pool, schema);
+    assert.equal(participants(heads2.get(today)), 2);
+    assert.equal(heads2.get(today).revision, heads1.get(today).revision + 1);
+
+    // It then withdraws: its link leaves 'active' and it leaves the roster.
+    // A re-queued today still leaves it out: unchanged content and revision.
+    await pool.query(`UPDATE ${quoted(schema, "storage_v11_owner_links")} SET state = 'withdrawn'
+      WHERE participant_id = $1`, [third.participantId]);
+    owners.splice(owners.indexOf(third), 1);
+    journal.push({ sequence: journal.length + 1, day: today });
+    const departed = await runJob({ schema, now, pipeline });
+    assert.deepEqual([departed.published, departed.unchanged, departed.blocked], [[], 1, []]);
+    assert.equal(departed.exclusions.excludedOwners, 1, "the departed member's exclusion is applied");
+    assert.equal(departed.ownerSets.savedMembersFolded, 0);
+    assert.deepEqual(await publishedRows(pool, schema), heads2);
+    // Every published day is queued again when the table changes; still no change.
+    exclusionRead = { ...exclusionRead, rows: 2, sha256: "2".repeat(64) };
+    const requeued = await runJob({ schema, now, pipeline });
+    assert.deepEqual(requeued.published, []);
+    assert.deepEqual(await publishedRows(pool, schema), heads2);
+
+    // Revoking the exclusion folds the departed member's saved contribution
+    // back: today returns to its first content, under a new revision.
+    exclusionRead = { rows: 2, active: 0, sha256: "3".repeat(64), activeByParticipant: new Map() };
+    const revoked = await runJob({ schema, now, pipeline });
+    assert.deepEqual(revoked.published, [today]);
+    const thirdDays = (await pool.query(`SELECT count(*)::int AS n FROM ${quoted(schema, "analytics_v2_daily_owner_sets")}
+      WHERE owner_digest = $1`, [third.ownerDigest])).rows[0].n;
+    assert.ok(thirdDays >= 1);
+    assert.equal(revoked.ownerSets.savedMembersFolded, thirdDays, "every day it is a member of folds it back");
+    const heads3 = await publishedRows(pool, schema);
+    assert.equal(heads3.get(today).payload_sha256, heads1.get(today).payload_sha256);
+    assert.equal(heads3.get(today).revision, heads2.get(today).revision + 1);
   });
 });
 

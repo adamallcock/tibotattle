@@ -3,26 +3,32 @@
  * 6.1-6.3, staged migration analytics_v2_owner_sets).
  *
  * Inside the run's write transaction (store.ts writeRunOutputs), after the
- * heads are published, each PUBLISHED candidate records its owner set:
+ * heads are published, each PUBLISHED candidate records its owner set, and
+ * so does an UNCHANGED candidate whose day has no recorded set (an
+ * unrecorded head, published by an image without saved owner sets: it is
+ * adopted at its current revision, provenance 4):
  *
  *  1. the day's stored set and each member's current contribution are read
- *     FOR UPDATE, with the day's bootstrap receipt. The fold must have used
- *     exactly that set: every stored member appears among the candidate's
- *     members (a set only grows), a retained or saved member names its
- *     current version, an excluded member is stored, and a bootstrap is the
- *     day's first recording. Anything else refuses the whole run with
- *     ANALYTICS_V2_OWNER_SET_CHANGED (nothing is written);
+ *     FOR UPDATE, with the day's receipt. The fold must have used exactly
+ *     that set: every stored member appears among the candidate's members (a
+ *     set only grows), a retained or saved member names its current version,
+ *     an excluded member is stored, a candidate names its first recording
+ *     (`bootstrap`) exactly when the day has no receipt, and an adoption (4)
+ *     exactly when the day had a head before this run. Anything else refuses
+ *     the whole run with ANALYTICS_V2_OWNER_SET_CHANGED (nothing is written);
  *  2. a computed member not yet in the set is added (first_revision = the
- *     publication's revision; provenance 1, or the bootstrap's 2 or 3) with
- *     its contribution version 1;
+ *     publication's revision; the first recording's provenance, or 1 when it
+ *     joins a recorded set) with its contribution version 1;
  *  3. a computed member already in the set appends version n + 1 when its
  *     values or devices differ from version n, and nothing otherwise;
- *  4. a frozen-window first recording writes its bootstrap receipt.
- * An unchanged or blocked day records nothing: the stored contributions are
- * always the ones its head was folded from.
+ *  4. a first recording writes the day's receipt (its provenance, size and,
+ *     for 2 or 3, the frozen export's count, digest and window).
+ * Any other unchanged day, and a blocked day, records nothing: the stored
+ * contributions are always the ones its head was folded from.
  *
  * first_revision is the revision writeAnalyticsV2PublishedDaily assigned
- * through nextPublishedRevision, the single publication helper.
+ * through nextPublishedRevision, the single publication helper, or for an
+ * adoption the head's own revision (no new revision is minted).
  *
  * Errors carry closed codes and a field path at most; never a value.
  */
@@ -69,11 +75,15 @@ function changed(field: string): never {
  * the module comment); returns the run's owner-set write summary.
  */
 export async function writeAnalyticsV2OwnerSets(client: PostgresClient, schema: string,
-  candidates: readonly PreparedDailyCandidate[], revisions: ReadonlyMap<AnalyticsV2Day, number>,
-  fold: AnalyticsV2OwnerSetSummary, runId: string, stamp: AnalyticsV2RunStamp): Promise<AnalyticsV2OwnerSetWriteSummary> {
+  candidates: readonly PreparedDailyCandidate[], publication: {
+    readonly revisions: ReadonlyMap<AnalyticsV2Day, number>;
+    readonly priorRevisions: ReadonlyMap<AnalyticsV2Day, number>;
+  }, fold: AnalyticsV2OwnerSetSummary, runId: string, stamp: AnalyticsV2RunStamp): Promise<AnalyticsV2OwnerSetWriteSummary> {
   const tables = ANALYTICS_V2_TABLES;
-  const published = candidates.filter((candidate) => revisions.has(candidate.day));
-  const days = published.map((candidate) => candidate.day);
+  const { revisions, priorRevisions } = publication;
+  // Published days, and unchanged days whose set is first recorded (adopted).
+  const recording = candidates.filter((candidate) => revisions.has(candidate.day) || candidate.bootstrap !== null);
+  const days = recording.map((candidate) => candidate.day);
   const stored = new Map<AnalyticsV2Day, Map<string, StoredMember>>(days.map((day) => [day, new Map()]));
   const bootstrapped = new Set<AnalyticsV2Day>();
   if (days.length > 0) {
@@ -117,14 +127,23 @@ export async function writeAnalyticsV2OwnerSets(client: PostgresClient, schema: 
   const bootstrapRows: unknown[] = [];
   const verifiedDays: AnalyticsV2Day[] = [];
   const disclosedDays: AnalyticsV2Day[] = [];
-  for (const candidate of published) {
+  const adoptedDays: AnalyticsV2Day[] = [];
+  for (const candidate of recording) {
     const day = candidate.day;
-    const revision = revisions.get(day)!;
+    // An adoption keeps the head's revision; a publication takes its new one.
+    const revision = revisions.get(day) ?? priorRevisions.get(day);
+    if (revision === undefined) changed("dailyCandidates.bootstrap");
     const members = stored.get(day)!;
     const named = new Set(candidate.members.map((member) => member.ownerDigest));
     // A set only grows: the fold must have read every stored member.
     for (const ownerDigest of members.keys()) if (!named.has(ownerDigest)) changed("dailyCandidates.members");
-    if (candidate.bootstrap !== null && (members.size > 0 || bootstrapped.has(day))) changed("dailyCandidates.bootstrap");
+    // A first recording exactly when the day has no receipt (then it has no
+    // member either), and an adoption exactly when it had a head.
+    if ((candidate.bootstrap !== null) === (members.size > 0 || bootstrapped.has(day))
+        || (candidate.bootstrap !== null && (candidate.bootstrap.provenance === ANALYTICS_V2_OWNER_SET_PROVENANCE.adopted)
+          !== priorRevisions.has(day))) {
+      changed("dailyCandidates.bootstrap");
+    }
     const provenance = candidate.bootstrap?.provenance ?? ANALYTICS_V2_OWNER_SET_PROVENANCE.published;
     for (const member of candidate.members) {
       const current = members.get(member.ownerDigest);
@@ -163,15 +182,29 @@ export async function writeAnalyticsV2OwnerSets(client: PostgresClient, schema: 
       });
     }
     if (candidate.bootstrap !== null) {
-      bootstrapRows.push({ day, provenance: candidate.bootstrap.provenance, set_size: candidate.members.length,
-        frozen_participants: candidate.bootstrap.frozenParticipants,
-        frozen_export_sha256: candidate.bootstrap.frozenExportSha256, first_revision: revision, run_id: runId,
-        kernel_id: kernelId, manifest_version: manifestVersion });
-      (candidate.bootstrap.provenance === ANALYTICS_V2_OWNER_SET_PROVENANCE.cutoverVerified
-        ? verifiedDays : disclosedDays).push(day);
+      const bootstrap = candidate.bootstrap;
+      bootstrapRows.push({ day, provenance: bootstrap.provenance, set_size: candidate.members.length,
+        frozen_participants: bootstrap.frozenParticipants, frozen_export_sha256: bootstrap.frozenExportSha256,
+        frozen_from_day: bootstrap.frozenFromDay, frozen_through_day: bootstrap.frozenThroughDay,
+        first_revision: revision, run_id: runId, kernel_id: kernelId, manifest_version: manifestVersion });
+      if (bootstrap.provenance === ANALYTICS_V2_OWNER_SET_PROVENANCE.cutoverVerified) verifiedDays.push(day);
+      else if (bootstrap.provenance === ANALYTICS_V2_OWNER_SET_PROVENANCE.cutoverDisclosed) disclosedDays.push(day);
+      else if (bootstrap.provenance === ANALYTICS_V2_OWNER_SET_PROVENANCE.adopted) adoptedDays.push(day);
     }
   }
 
+  // The receipts first: a set row's day must have one (checked at commit).
+  await insertRecordset(client,
+    `INSERT INTO ${relation(schema, tables.ownerSetBootstrap)}
+       (day, provenance, set_size, frozen_participants, frozen_export_sha256, frozen_from_day, frozen_through_day,
+        first_revision, run_id, kernel_id, manifest_version)
+     SELECT day, provenance, set_size, frozen_participants, frozen_export_sha256, frozen_from_day, frozen_through_day,
+            first_revision, run_id, kernel_id, manifest_version
+       FROM jsonb_to_recordset($1::jsonb)
+         AS row(day date, provenance smallint, set_size integer, frozen_participants integer,
+                frozen_export_sha256 text, frozen_from_day date, frozen_through_day date, first_revision integer,
+                run_id uuid, kernel_id smallint, manifest_version integer)`,
+    bootstrapRows, "ownerSetBootstrap");
   await insertRecordset(client,
     `INSERT INTO ${relation(schema, tables.dailyOwnerSets)}
        (day, owner_digest, first_revision, provenance, run_id, kernel_id, manifest_version)
@@ -192,22 +225,13 @@ export async function writeAnalyticsV2OwnerSets(client: PostgresClient, schema: 
                 price_basis_id integer, price_kernel_id smallint, first_revision integer, run_id uuid,
                 kernel_id smallint, manifest_version integer)`,
     contributionRows, "dailyContributions");
-  await insertRecordset(client,
-    `INSERT INTO ${relation(schema, tables.ownerSetBootstrap)}
-       (day, provenance, set_size, frozen_participants, frozen_export_sha256, first_revision, run_id, kernel_id,
-        manifest_version)
-     SELECT day, provenance, set_size, frozen_participants, frozen_export_sha256, first_revision, run_id, kernel_id,
-            manifest_version
-       FROM jsonb_to_recordset($1::jsonb)
-         AS row(day date, provenance smallint, set_size integer, frozen_participants integer,
-                frozen_export_sha256 text, first_revision integer, run_id uuid, kernel_id smallint,
-                manifest_version integer)`,
-    bootstrapRows, "ownerSetBootstrap");
   return Object.freeze({
     ...fold,
     membersAdded: setRows.length,
     contributionVersions: contributionRows.length,
+    daysRecorded: bootstrapRows.length,
     bootstrapVerifiedDays: Object.freeze(sortedDays(verifiedDays)),
     bootstrapDisclosedDays: Object.freeze(sortedDays(disclosedDays)),
+    bootstrapAdoptedDays: Object.freeze(sortedDays(adoptedDays)),
   });
 }

@@ -52,12 +52,15 @@ export function nextPublishedRevision(input: {
 
 /**
  * Publish the changed daily candidates; returns the published and unchanged
- * days, in candidate order, and the revision each published day took.
+ * days, in candidate order, the revision each published day took, and the
+ * revision of every candidate day's head before this run (row-locked here;
+ * absent when the day had no head).
  */
 export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, schema: string,
   prepared: PreparedOutputs, runId: string, releasedAt: string, stamp: AnalyticsV2RunStamp): Promise<{
     readonly published: AnalyticsV2Day[]; readonly unchanged: AnalyticsV2Day[];
     readonly revisions: ReadonlyMap<AnalyticsV2Day, number>;
+    readonly priorRevisions: ReadonlyMap<AnalyticsV2Day, number>;
   }> {
   const tables = ANALYTICS_V2_TABLES;
   // Published heads: write only days whose content digest changed. Blocked
@@ -141,7 +144,8 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
     publishRows,
     "dailyCandidates",
     "ANALYTICS_V2_PUBLICATION_CONFLICT");
-  return { published, unchanged, revisions };
+  const priorRevisions = new Map<AnalyticsV2Day, number>([...heads].map(([day, head]) => [day, head.revision]));
+  return { published, unchanged, revisions, priorRevisions };
 }
 
 /** Upsert the preview singleton (null when the run withheld it). */

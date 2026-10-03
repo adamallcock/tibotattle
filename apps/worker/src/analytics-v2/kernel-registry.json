@@ -24,7 +24,7 @@
       "kernelId": 3,
       "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
       "vendorManifestSha256": "b40d075f06380d6a83ac0dbf77183c90ce7e522e6613048c966860394ef6eb6e",
-      "computeClosureSha256": "a2db78fb8008c949670e47c5ce528f319cc8f3fbe6173819f62b7d6663075d23",
+      "computeClosureSha256": "d22c5c4a5ea5437f689ae021e34e6e6a48b8847124824fc3d879736b0059c622",
       "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
       "priceRegistryVersion": "app-official-api-prices-v0.8",
       "methodVersion": "analytics-v2-method-v2"

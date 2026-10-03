@@ -38,8 +38,10 @@
  * re-queue nothing (2026-09-26 owner decisions). A queued day is recomputed
  * over its saved owner set (E-OWNERSET, owner decision round 2): a member
  * that left the roster, or whose read for the day is empty, keeps its stored
- * contribution, and the publication records the day's set and contributions
- * (the receipt's `ownerSets` counts them; content-free).
+ * contribution (and a member that left keeps its exclusions), and the
+ * publication records the day's set and contributions (the receipt's
+ * `ownerSets` counts them and names blocked, verified, disclosed and adopted
+ * days; content-free).
  *
  * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
  * reviewed target path. The invocation is exactly

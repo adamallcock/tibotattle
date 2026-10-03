@@ -27,20 +27,35 @@
 --                                       is the current one;
 --   analytics_v2_daily_owner_set_bootstrap
 --                                       one content-free receipt per day
---                                       whose set was first recorded inside
---                                       the frozen Cloudflare window (C-IPR):
---                                       the set's size against the frozen
---                                       export's contributingParticipants.
+--                                       whose set has been recorded: how and
+--                                       at which revision it began, its size,
+--                                       and, inside the frozen Cloudflare
+--                                       window (C-IPR), the frozen export's
+--                                       contributingParticipants and window.
+--                                       A day without a receipt has no
+--                                       recorded set.
 -- The refresh store (src/analytics-v2/store-owner-sets.ts) is the only
 -- writer, inside the run's one write transaction, with the published head.
 --
--- Provenance (the day's set, owner decision round 7, which replaces the
--- design's archival reconstruction): 1 = recorded at a GCP publication
--- outside the frozen window, or added to a day whose set already exists;
+-- Provenance (owner decision round 7, which replaces the design's archival
+-- reconstruction). A day's receipt records how its set began, and the
+-- members recorded with it take the same value; a member added to a day
+-- whose set already exists takes 1:
+-- 1 = recorded at GCP's first publication of a day outside the frozen window;
 -- 2 = the participants at GCP's first publication of a frozen-window day,
--- whose count equals the frozen export's contributingParticipants for it;
+--     whose count equals the frozen export's contributingParticipants for it;
 -- 3 = the same, when the count differs or Cloudflare did not publish the day
--- (disclosed; the bootstrap receipt names the day and both counts).
+--     (disclosed; the receipt names the day and both counts);
+-- 4 = adopted: the day already had a published head when its set was first
+--     recorded (a head an image without saved owner sets published, on a
+--     database that held heads before this migration). The set is the one
+--     the recording run folded, at the head's revision when its content was
+--     unchanged; owners that left before that run are not in it, and the
+--     frozen counts are not compared (engine v2 design section 6.3, last
+--     bullet: such heads are "unrecorded" until a run records them).
+-- A 2 or 3 receipt keeps the frozen export's digest and window, so a later
+-- run knows the window when it can no longer read the export: it then
+-- refuses a first recording inside the window rather than record it as 1.
 --
 -- Privacy: identity columns hold opaque 64-hex owner digests only. The
 -- daily values are the d43c8f92 v1.1 daily projection values the community
@@ -52,10 +67,14 @@
 -- in tibotattle.analytics_v2_offline_purge (SET LOCAL), which only the
 -- offline owner purge does (owner decision round 7: the purge deletes an
 -- erased owner's saved contributions and set rows, and the affected days are
--- republished over the smaller set). The bootstrap receipt is never deleted.
+-- republished over the smaller set). The receipt is never deleted, so a
+-- purged day keeps the record of how its set began.
 -- Both owner-scoped tables are listed in contract.ts
 -- ANALYTICS_V2_OWNER_SCOPED_TABLES, the offline purge's analytics_v2
--- inventory, contributions before sets.
+-- inventory, contributions before sets. The runtime role holds DELETE on
+-- every table, so the trigger is the barrier: the online-erasure absence
+-- gate (scripts/online-erasure-absence.check.mjs) fails when any running
+-- service module names the purge setting or deletes from these three tables.
 --
 -- Every row records the kernel and manifest of the run that wrote it, and a
 -- contribution also the kernel that priced its values (price_kernel_id).
@@ -70,7 +89,7 @@ CREATE TABLE analytics_v2_daily_owner_sets (
   day date NOT NULL,
   owner_digest text NOT NULL CHECK (owner_digest ~ '^[0-9a-f]{64}$'),
   first_revision integer NOT NULL CHECK (first_revision >= 1),
-  provenance smallint NOT NULL CHECK (provenance IN (1, 2, 3)),
+  provenance smallint NOT NULL CHECK (provenance IN (1, 2, 3, 4)),
   run_id uuid NOT NULL,
   kernel_id smallint NOT NULL REFERENCES analytics_v2_kernels(kernel_id),
   manifest_version integer NOT NULL CHECK (manifest_version >= 1),
@@ -110,15 +129,24 @@ CREATE TABLE analytics_v2_daily_contributions (
 
 CREATE TABLE analytics_v2_daily_owner_set_bootstrap (
   day date PRIMARY KEY,
-  provenance smallint NOT NULL CHECK (provenance IN (2, 3)),
+  provenance smallint NOT NULL CHECK (provenance IN (1, 2, 3, 4)),
   set_size integer NOT NULL CHECK (set_size >= 0),
-  -- NULL: the frozen export carries no publication of the day.
+  -- 2 and 3 only (NULL otherwise): the frozen export the set was compared
+  -- with, its window, and its contributingParticipants for the day (NULL
+  -- when the export carries no publication of the day).
   frozen_participants integer CHECK (frozen_participants >= 0),
-  frozen_export_sha256 char(64) NOT NULL CHECK (frozen_export_sha256 ~ '^[0-9a-f]{64}$'),
+  frozen_export_sha256 char(64) CHECK (frozen_export_sha256 ~ '^[0-9a-f]{64}$'),
+  frozen_from_day date,
+  frozen_through_day date,
   first_revision integer NOT NULL CHECK (first_revision >= 1),
   run_id uuid NOT NULL,
   kernel_id smallint NOT NULL REFERENCES analytics_v2_kernels(kernel_id),
   manifest_version integer NOT NULL CHECK (manifest_version >= 1),
+  CHECK ((provenance IN (2, 3)) = (frozen_export_sha256 IS NOT NULL)),
+  CHECK ((frozen_export_sha256 IS NULL) = (frozen_from_day IS NULL)
+     AND (frozen_export_sha256 IS NULL) = (frozen_through_day IS NULL)),
+  CHECK (frozen_from_day IS NULL OR (frozen_from_day <= day AND day <= frozen_through_day)),
+  CHECK (provenance IN (2, 3) OR frozen_participants IS NULL),
   -- Verified (2) exactly when the counts agree.
   CHECK ((provenance = 2) = (frozen_participants IS NOT NULL AND frozen_participants = set_size))
 );
@@ -197,9 +225,10 @@ CREATE TRIGGER analytics_v2_daily_contributions_next_version
 BEFORE INSERT ON analytics_v2_daily_contributions
 FOR EACH ROW EXECUTE FUNCTION analytics_v2_daily_contributions_next_version();
 
--- A member always has a contribution: checked at commit, so a set row and
--- its first contribution are written together, and a purge that removes a
--- member's contributions removes its set row too.
+-- A member always has a contribution, and its day a receipt: checked at
+-- commit, so a set row, its first contribution and (for a day's first
+-- recording) the day's receipt are written together, and a purge that
+-- removes a member's contributions removes its set row too.
 CREATE FUNCTION analytics_v2_owner_set_member_contributed()
 RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -219,6 +248,10 @@ BEGIN
      AND NOT EXISTS (SELECT 1 FROM analytics_v2_daily_contributions
                       WHERE day = checked_day AND owner_digest = checked_owner) THEN
     RAISE EXCEPTION 'analytics_v2_owner_set_member_without_contribution' USING ERRCODE = 'P1005';
+  END IF;
+  IF TG_OP = 'INSERT'
+     AND NOT EXISTS (SELECT 1 FROM analytics_v2_daily_owner_set_bootstrap WHERE day = checked_day) THEN
+    RAISE EXCEPTION 'analytics_v2_owner_set_member_without_receipt' USING ERRCODE = 'P1005';
   END IF;
   RETURN NULL;
 END;

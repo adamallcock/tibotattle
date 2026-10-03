@@ -8,22 +8,29 @@
  * in the run's read snapshot:
  * - readAnalyticsV2OwnerSetState: each queued day's S(d), every member with
  *   its current contribution's version, device count and values digest (not
- *   the values), and whether the day's frozen-window bootstrap receipt
- *   exists; and, only when some queued day without a recorded set lies in the
- *   frozen Cloudflare export's window (C-IPR, interim-public-read.ts), that
- *   export's per-day contributingParticipants, verified exactly as the route
- *   verifies the row before serving it;
+ *   the values) and the participant its owner link names in any state (the
+ *   run maps the member's exclusions through it); whether the day's set is
+ *   recorded (its receipt exists) and whether it has a published head; and,
+ *   only when some queued day that is neither recorded nor published lies in
+ *   the frozen Cloudflare export's window (C-IPR, interim-public-read.ts),
+ *   that export's per-day contributingParticipants, verified exactly as the
+ *   route verifies the row before serving it. The window is also kept in the
+ *   receipts of the days compared with it, so a run that can no longer read
+ *   the export still knows it, and refuses such a first recording instead of
+ *   recording it outside the window;
  * - readAnalyticsV2SavedContributionValues: the stored values of exactly the
  *   contributions a fold needs (a member this run did not compute, or a
  *   computed member whose read for the day is empty), each checked against
- *   its stored digest.
+ *   its stored digest. The compute core asks for them in chunks and charges
+ *   each chunk to the run's output account, so no fixed count bounds a run.
  * The store (store-owner-sets.ts) is the only writer, and re-checks in its
  * write transaction that the sets it extends are the ones read here.
  *
  * Content-free: owner digests, days, versions, counts and digests only; the
  * values are the content-free daily projection values (the class of
- * analytics_v2_owner_day.daily). Failures are closed AnalyticsV2SourceError
- * codes (owners.ts), never a value.
+ * analytics_v2_owner_day.daily), and participant ids stay in the run's memory
+ * (as the roster's do), never in a receipt. Failures are closed
+ * AnalyticsV2SourceError codes (owners.ts), never a value.
  */
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
@@ -60,14 +67,13 @@ export const ANALYTICS_V2_OWNER_SET_METHOD = "analytics-v2-owner-sets-v1" as con
 export const MAX_ANALYTICS_V2_OWNER_SET_DAYS = 4_096;
 /** Saved members one read returns at most (the store's owner-day bound). */
 export const MAX_ANALYTICS_V2_SAVED_MEMBERS = 4_000_000;
-/** Contributions one values load accepts. */
-export const MAX_ANALYTICS_V2_CONTRIBUTION_LOAD = 100_000;
 /** The price identity a stable digest leaves out (V11DailyProjectionValues). */
 export const ANALYTICS_V2_PRICE_IDENTITY_FIELDS = Object.freeze(["registrySha256", "pricingMethodVersion"] as const);
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const DAY_MS = 86_400_000;
 const LOAD_CHUNK = 1_000;
+const PROVENANCES = new Set([1, 2, 3, 4]);
 
 function isDay(value: unknown): value is AnalyticsV2Day {
   if (typeof value !== "string" || !DAY.test(value)) return false;
@@ -143,13 +149,32 @@ function validDays(days: unknown): AnalyticsV2Day[] {
   return [...days].sort();
 }
 
+/** A participant id as an owner link stores it (participants.id). */
+function participantIdOf(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length < 1 || value.length > 256) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+  return value;
+}
+
+interface FrozenWindow {
+  readonly exportSha256: string;
+  readonly fromDay: AnalyticsV2Day;
+  readonly throughDay: AnalyticsV2Day;
+}
+
 /**
- * Every queued day's saved set and bootstrap state, and the frozen counts
- * when a queued day without a recorded set lies in the frozen window (see
- * the module comment). A set row without a contribution is refused
- * (ANALYTICS_V2_SOURCE_CONFLICT): the migration's commit-time check makes it
- * impossible. Missing tables refuse (ANALYTICS_V2_SOURCE_UNAVAILABLE): a run
- * never folds as if no day had a set.
+ * Every queued day's saved set and recording state, and the frozen counts
+ * when a queued day that is neither recorded nor published lies in the
+ * frozen window (see the module comment). Refusals, never a default:
+ * - a schema without the owner-set tables or the interim table:
+ *   ANALYTICS_V2_SOURCE_UNAVAILABLE (a run never folds as if no day had a
+ *   set, nor as if no Cloudflare window existed);
+ * - a set row without a contribution or without its day's receipt, receipts
+ *   naming more than one frozen export, or a frozen row that disagrees with
+ *   them or cannot be verified: ANALYTICS_V2_SOURCE_CONFLICT;
+ * - a first recording inside the recorded window while the frozen row is
+ *   gone: ANALYTICS_V2_SOURCE_UNAVAILABLE (its counts cannot be compared, and
+ *   it is never recorded as if it lay outside the window).
  */
 export async function readAnalyticsV2OwnerSetState(context: AnalyticsV2SnapshotContext,
   options: { readonly days: readonly AnalyticsV2Day[] }): Promise<AnalyticsV2OwnerSetState> {
@@ -158,27 +183,30 @@ export async function readAnalyticsV2OwnerSetState(context: AnalyticsV2SnapshotC
   const sets = `${s}."${ANALYTICS_V2_TABLES.dailyOwnerSets}"`;
   const contributions = `${s}."${ANALYTICS_V2_TABLES.dailyContributions}"`;
   const bootstrap = `${s}."${ANALYTICS_V2_TABLES.ownerSetBootstrap}"`;
+  const heads = `${s}."${ANALYTICS_V2_TABLES.publishedDaily}"`;
+  const interim = `${s}."${INTERIM_PUBLIC_READ_TABLE}"`;
   return onReadSnapshot(context, async (client) => {
-    const present = await client.query<{ sets: unknown; frozen: unknown }>(analyticsV2Statement("owner_sets.read",
-      `SELECT to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL AND to_regclass($3) IS NOT NULL AS sets,
-              to_regclass($4) IS NOT NULL AS frozen`),
-    [sets, contributions, bootstrap, `${s}."${INTERIM_PUBLIC_READ_TABLE}"`]);
-    if (present.rows.length !== 1 || present.rows[0]?.sets !== true || typeof present.rows[0]?.frozen !== "boolean") {
-      sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
-    }
+    const present = await client.query<{ present: unknown }>(analyticsV2Statement("owner_sets.read",
+      `SELECT to_regclass($1) IS NOT NULL AND to_regclass($2) IS NOT NULL AND to_regclass($3) IS NOT NULL
+              AND to_regclass($4) IS NOT NULL AS present`),
+    [sets, contributions, bootstrap, interim]);
+    if (present.rows.length !== 1 || present.rows[0]?.present !== true) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
     const byDay = new Map<AnalyticsV2Day, Map<AnalyticsV2OwnerDigest, AnalyticsV2SavedMember>>(
       days.map((day) => [day, new Map()]));
-    const bootstrapped = new Set<AnalyticsV2Day>();
+    const recorded = new Set<AnalyticsV2Day>();
+    const published = new Set<AnalyticsV2Day>();
     if (days.length > 0) {
       const members = await client.query<Record<string, unknown>>(analyticsV2Statement("owner_sets.read",
         `SELECT to_char(member.day, 'YYYY-MM-DD') AS day, member.owner_digest,
-                current.version, current.devices, current.values_sha256::text AS values_sha256
+                current.version, current.devices, current.values_sha256::text AS values_sha256,
+                link.participant_id
            FROM ${sets} member
            LEFT JOIN LATERAL (
              SELECT contribution.version, contribution.devices, contribution.values_sha256
                FROM ${contributions} contribution
               WHERE contribution.day = member.day AND contribution.owner_digest = member.owner_digest
               ORDER BY contribution.version DESC LIMIT 1) current ON true
+           LEFT JOIN ${s}.storage_v11_owner_links link ON link.owner_digest = member.owner_digest
           WHERE member.day = ANY($1::date[])
           ORDER BY member.day, member.owner_digest COLLATE "C"
           LIMIT $2`), [days, MAX_ANALYTICS_V2_SAVED_MEMBERS + 1]);
@@ -193,52 +221,90 @@ export async function readAnalyticsV2OwnerSetState(context: AnalyticsV2SnapshotC
           sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
         }
         saved.set(ownerDigest, Object.freeze({ version: positiveInteger(row.version),
-          devices: positiveInteger(row.devices), valuesSha256: row.values_sha256 as string }));
+          devices: positiveInteger(row.devices), valuesSha256: row.values_sha256 as string,
+          participantId: participantIdOf(row.participant_id) }));
       }
-      const receipts = await client.query<{ day: unknown }>(analyticsV2Statement("owner_sets.read",
-        `SELECT to_char(day, 'YYYY-MM-DD') AS day FROM ${bootstrap} WHERE day = ANY($1::date[]) ORDER BY day`), [days]);
+      const receipts = await client.query<{ day: unknown; provenance: unknown }>(analyticsV2Statement("owner_sets.read",
+        `SELECT to_char(day, 'YYYY-MM-DD') AS day, provenance FROM ${bootstrap}
+          WHERE day = ANY($1::date[]) ORDER BY day`), [days]);
       for (const row of receipts.rows) {
-        if (!isDay(row.day) || !byDay.has(row.day) || bootstrapped.has(row.day)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-        bootstrapped.add(row.day);
+        if (!isDay(row.day) || !byDay.has(row.day) || recorded.has(row.day) || !PROVENANCES.has(row.provenance as number)) {
+          sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+        }
+        recorded.add(row.day);
+      }
+      const headRows = await client.query<{ day: unknown }>(analyticsV2Statement("owner_sets.read",
+        `SELECT to_char(day, 'YYYY-MM-DD') AS day FROM ${heads} WHERE day = ANY($1::date[]) ORDER BY day`), [days]);
+      for (const row of headRows.rows) {
+        if (!isDay(row.day) || !byDay.has(row.day) || published.has(row.day)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+        published.add(row.day);
       }
     }
     const state = new Map<AnalyticsV2Day, AnalyticsV2SavedDay>();
     for (const [day, members] of byDay) {
-      state.set(day, Object.freeze({ members, bootstrapped: bootstrapped.has(day) }));
+      // A member is always recorded with (or after) its day's receipt.
+      if (members.size > 0 && !recorded.has(day)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      state.set(day, Object.freeze({ members, recorded: recorded.has(day), headPublished: published.has(day) }));
     }
-    // A day is first recorded when it has no member and no receipt; the
-    // frozen counts matter only for such a day inside the frozen window.
-    const unrecorded = days.filter((day) => byDay.get(day)!.size === 0 && !bootstrapped.has(day));
+
+    // The frozen window the receipts recorded (every 2 or 3 receipt names
+    // the same export), whatever the queued days.
+    const windows = await client.query<Record<string, unknown>>(analyticsV2Statement("owner_sets.frozen",
+      `SELECT frozen_export_sha256::text AS export_sha256, to_char(frozen_from_day, 'YYYY-MM-DD') AS from_day,
+              to_char(frozen_through_day, 'YYYY-MM-DD') AS through_day
+         FROM ${bootstrap} WHERE frozen_export_sha256 IS NOT NULL
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3 LIMIT 2`));
+    if (windows.rows.length > 1) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    let recordedWindow: FrozenWindow | null = null;
+    if (windows.rows.length === 1) {
+      const row = windows.rows[0]!;
+      if (typeof row.export_sha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(row.export_sha256)
+          || !isDay(row.from_day) || !isDay(row.through_day) || row.from_day > row.through_day) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      recordedWindow = { exportSha256: row.export_sha256, fromDay: row.from_day, throughDay: row.through_day };
+    }
+
+    // A first publication (no receipt and no head) inside the frozen window
+    // compares its set with Cloudflare's count; an unrecorded head is adopted
+    // (provenance 4) without a comparison.
+    const firstPublications = days.filter((day) => !recorded.has(day) && !published.has(day));
+    const evidence = await client.query<{ evidence_date: unknown }>(analyticsV2Statement("owner_sets.frozen",
+      `SELECT to_char(evidence_date, 'YYYY-MM-DD') AS evidence_date FROM ${interim} WHERE id = $1`),
+    [INTERIM_PUBLIC_READ_ROW_ID]);
+    if (evidence.rows.length > 1) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
     let frozen: AnalyticsV2FrozenParticipants | null = null;
-    if (unrecorded.length > 0 && present.rows[0]!.frozen === true) {
-      const table = `${s}."${INTERIM_PUBLIC_READ_TABLE}"`;
-      const evidence = await client.query<{ evidence_date: unknown }>(analyticsV2Statement("owner_sets.frozen",
-        `SELECT to_char(evidence_date, 'YYYY-MM-DD') AS evidence_date FROM ${table} WHERE id = $1`),
-      [INTERIM_PUBLIC_READ_ROW_ID]);
-      if (evidence.rows.length > 1) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-      const evidenceDate = evidence.rows[0]?.evidence_date;
-      if (evidence.rows.length === 1) {
-        if (!isDay(evidenceDate)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-        const fromDay = addDays(evidenceDate, -(INTERIM_PUBLIC_READ_WINDOW_DAYS - 1));
-        if (unrecorded.some((day) => day >= fromDay && day <= evidenceDate)) {
-          const row = await client.query<Record<string, unknown>>(analyticsV2Statement("owner_sets.frozen",
-            `SELECT payload_text::text AS payload_text, payload_sha256::text AS payload_sha256,
-                    to_char(captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS captured_at,
-                    source_commit::text AS source_commit, to_char(evidence_date, 'YYYY-MM-DD') AS evidence_date
-               FROM ${table} WHERE id = $1`), [INTERIM_PUBLIC_READ_ROW_ID]);
-          if (row.rows.length !== 1) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-          try {
-            const verified = await verifyInterimPublicReadRow(row.rows[0]);
-            if (verified.frozen.to !== evidenceDate || verified.frozen.from !== fromDay) {
-              sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-            }
-            frozen = analyticsV2FrozenParticipants(verified.frozen, verified.record.payloadSha256);
-          } catch (error) {
-            if ((error as { name?: unknown })?.name === "AnalyticsV2SourceError") throw error;
-            // An unverifiable frozen copy is never read as "no export": the
-            // bootstrap would otherwise record unverified sets as published.
+    if (evidence.rows.length === 0) {
+      if (recordedWindow !== null
+          && firstPublications.some((day) => day >= recordedWindow!.fromDay && day <= recordedWindow!.throughDay)) {
+        sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+      }
+    } else {
+      const evidenceDate = evidence.rows[0]!.evidence_date;
+      if (!isDay(evidenceDate)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      const fromDay = addDays(evidenceDate, -(INTERIM_PUBLIC_READ_WINDOW_DAYS - 1));
+      if (recordedWindow !== null && (recordedWindow.fromDay !== fromDay || recordedWindow.throughDay !== evidenceDate)) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      if (firstPublications.some((day) => day >= fromDay && day <= evidenceDate)) {
+        const row = await client.query<Record<string, unknown>>(analyticsV2Statement("owner_sets.frozen",
+          `SELECT payload_text::text AS payload_text, payload_sha256::text AS payload_sha256,
+                  to_char(captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS captured_at,
+                  source_commit::text AS source_commit, to_char(evidence_date, 'YYYY-MM-DD') AS evidence_date
+             FROM ${interim} WHERE id = $1`), [INTERIM_PUBLIC_READ_ROW_ID]);
+        if (row.rows.length !== 1) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+        try {
+          const verified = await verifyInterimPublicReadRow(row.rows[0]);
+          if (verified.frozen.to !== evidenceDate || verified.frozen.from !== fromDay
+              || (recordedWindow !== null && recordedWindow.exportSha256 !== verified.record.payloadSha256)) {
             sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
           }
+          frozen = analyticsV2FrozenParticipants(verified.frozen, verified.record.payloadSha256);
+        } catch (error) {
+          if ((error as { name?: unknown })?.name === "AnalyticsV2SourceError") throw error;
+          // An unverifiable frozen copy is never read as "no export": the
+          // bootstrap would otherwise record unverified sets as published.
+          sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
         }
       }
     }
@@ -250,12 +316,15 @@ export async function readAnalyticsV2OwnerSetState(context: AnalyticsV2SnapshotC
  * The stored values of `keys`, keyed by analyticsV2ContributionKey. Each must
  * exist and match its stored values digest, or the read refuses
  * (ANALYTICS_V2_SOURCE_CONFLICT): a fold never runs on a value it cannot
- * account for.
+ * account for. No fixed count bounds the keys: they are read in chunks, and
+ * the compute core asks for them a chunk at a time
+ * (ANALYTICS_V2_SAVED_VALUES_LOAD_CHUNK) and charges each value to the run's
+ * output account, whose budget is the bound.
  */
 export async function readAnalyticsV2SavedContributionValues(context: AnalyticsV2SnapshotContext,
   keys: readonly AnalyticsV2ContributionKey[]): Promise<Map<string, unknown>> {
   const s = quotedSchema(context.schema);
-  if (!Array.isArray(keys) || keys.length > MAX_ANALYTICS_V2_CONTRIBUTION_LOAD) sourceFail("ANALYTICS_V2_SOURCE_INVALID");
+  if (!Array.isArray(keys)) sourceFail("ANALYTICS_V2_SOURCE_INVALID");
   const wanted = new Map<string, AnalyticsV2ContributionKey>();
   for (const key of keys) {
     if (key === null || typeof key !== "object" || !isDay(key.day) || typeof key.ownerDigest !== "string"

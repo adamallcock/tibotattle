@@ -642,9 +642,14 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // N-EXCL (src/analytics-v2/exclusions.ts): the community aggregate
       // exclusions, read in the run's snapshot. A linked owner's active rows
       // go to A-2, which leaves the owner out of each covered day's community
-      // aggregates; an unlinked participant is in no aggregate. When the
-      // table changed since the last completed run, every published day is
-      // republished.
+      // aggregates. So do those of a queued day's saved member that is not on
+      // the roster (E-OWNERSET: a departed member folds its stored
+      // contribution), mapped below through its owner link in any state; a
+      // saved member whose link is gone blocks its days in A-2
+      // (member_link_unavailable). An eligible participant without an active
+      // link computes nothing; while it has typed evidence nothing publishes.
+      // When the table changed since the last completed run, every published
+      // day is republished.
       const exclusions = await readExclusions(context);
       if (exclusions === null || typeof exclusions !== "object" || !Number.isSafeInteger(exclusions.rows)
           || !Number.isSafeInteger(exclusions.active) || exclusions.active < 0 || exclusions.active > exclusions.rows
@@ -732,8 +737,23 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const ownerSetState = await readOwnerSets(context, { days });
       if (ownerSetState === null || typeof ownerSetState !== "object" || !(ownerSetState.days instanceof Map)
           || ownerSetState.days.size !== days.length || !days.every((day) => ownerSetState.days.has(day))
-          || (ownerSetState.frozen !== null && typeof ownerSetState.frozen !== "object")) {
+          || (ownerSetState.frozen !== null && typeof ownerSetState.frozen !== "object")
+          || ![...ownerSetState.days.values()].every((saved) => saved !== null && typeof saved === "object"
+            && saved.members instanceof Map)) {
         fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+      }
+      // A saved member off the roster keeps its exclusions: they are mapped
+      // through the participant its owner link names (any link state).
+      const rosterDigests = new Set(listing.owners.map((owner) => owner.ownerDigest));
+      for (const saved of ownerSetState.days.values()) {
+        for (const [ownerDigest, member] of saved.members) {
+          if (rosterDigests.has(ownerDigest) || exclusionsByOwner.has(ownerDigest)) continue;
+          if (member === null || typeof member !== "object") fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+          if (member.participantId === null) continue;
+          if (typeof member.participantId !== "string") fail("ANALYTICS_V2_REFRESH_OWNER_SETS_INVALID");
+          const intervals = exclusions.activeByParticipant.get(member.participantId);
+          if (intervals !== undefined) exclusionsByOwner.set(ownerDigest, intervals);
+        }
       }
       // The stored values a fold needs, read during compute while the
       // snapshot is open (as the owner loads are).

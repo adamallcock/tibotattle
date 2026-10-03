@@ -25,7 +25,9 @@
  *     blocked day is never written, so it keeps its prior row (or stays
  *     absent). Each published day records its saved owner set and member
  *     contributions at that revision (store-owner-sets.ts, E-OWNERSET), after
- *     checking that the set the fold used is still the stored one;
+ *     checking that the set the fold used is still the stored one; an
+ *     unchanged head whose set was never recorded is adopted at its own
+ *     revision;
  *  4. it upserts the preview, advances the journal cursor (never backwards),
  *     and inserts the run row with the refusal list, the publication
  *     summary, the kernel stamp and the digest of the community aggregate
@@ -167,10 +169,10 @@ export async function writeRunOutputs(
     await registerAnalyticsV2RunKernel(client, schema, stamp, releasedAt);
     const retainedOwners = await writeAnalyticsV2DerivedFamilies(client, schema, outputs,
       prepared.computedOwnerDigests, horizon, runId, stamp);
-    const { published, unchanged, revisions } = await writeAnalyticsV2PublishedDaily(client, schema, prepared, runId,
-      releasedAt, stamp);
-    const ownerSets = await writeAnalyticsV2OwnerSets(client, schema, prepared.dailyCandidates, revisions,
-      prepared.ownerSets, runId, stamp);
+    const { published, unchanged, revisions, priorRevisions } = await writeAnalyticsV2PublishedDaily(client, schema,
+      prepared, runId, releasedAt, stamp);
+    const ownerSets = await writeAnalyticsV2OwnerSets(client, schema, prepared.dailyCandidates,
+      { revisions, priorRevisions }, prepared.ownerSets, runId, stamp);
     await writeAnalyticsV2Preview(client, schema, outputs.preview, releasedAt, runId, stamp);
     const cursor = await advanceAnalyticsV2Cursor(client, schema, storedCursor, prepared.lastSequence, runId);
 

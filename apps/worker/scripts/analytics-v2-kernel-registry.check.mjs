@@ -54,7 +54,7 @@ const REGISTRY_PINS = Object.freeze([
   "f45bc8e89f659bcecfab40c37b81ae130de36ceff7831f0cc0b057328421daef",
   // Kernel 3: E-OWNERSET's saved owner sets (method v2, owner-sets.ts in the
   // closure). The integrator renumbers it if another stream registers 3 first.
-  "38860cb120575aeaac42a43a8f6397e19d3db232dc8f53d644a4c8cbd174d7c8",
+  "eae1dd226f2120c56b4b3aa0d047bc04e32e3e43f6ae05bf664d59b8c9726c70",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
