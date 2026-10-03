@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { deserialize, serialize } from "node:v8";
 import { describe, expect, it, vi } from "vitest";
 import { canonicalJson } from "../src/canonical-json";
 import { computeAnalyticsV2Owner, analyticsV2EvidenceOf, analyticsV2EmissionBytes,
@@ -93,6 +94,9 @@ describe("MODEL-BLOCKS inline stage proof", () => {
         const cloned = structuredClone(payload);
         expect(isDeepStrictEqual(cloned, payload)).toBe(true);
         expect(Object.keys(cloned)).toEqual(Object.keys(payload));
+        const transferred = deserialize(serialize(payload));
+        expect(isDeepStrictEqual(transferred, payload)).toBe(true);
+        expect(Object.keys(transferred)).toEqual(Object.keys(payload));
         blocks.push(cloned);
       }
       const completed = await Promise.all([...blocks].reverse().map(async (block, i) => {
@@ -132,5 +136,30 @@ it("MODEL-BLOCKS replays earlier refusal/emissions before the first date-ordered
     expect(after.emissions).toEqual(before.emissions);
     expect(after.account).toBe(before.account);
     expect(after.emissions.some((emission) => emission.kind === "refusal" && emission.refusal.day === dates[2])).toBe(true);
+    // Force the date-3 emission to cross budget before the date-5 terminal
+    // that speculative block evaluation has already encountered.
+    const crossing = before.emissions.findIndex((emission) => (emission.kind === "modelDate" && emission.row.day === dates[3])
+      || (emission.kind === "refusal" && emission.refusal.family === "model" && emission.refusal.day === dates[3]));
+    expect(crossing).toBeGreaterThan(0);
+    const budget = before.emissions.slice(0, crossing + 1).reduce((bytes, emission) => bytes + analyticsV2EmissionBytes(emission), 0) - 1;
+    const left = capture(budget), right = capture(budget);
+    const failures = await Promise.allSettled([
+      reference({ ...input, hooks: left.hooks }),
+      computeAnalyticsV2Owner({ ...input, hooks: { ...right.hooks, modelBlocks: { size: 5, fanOut: "all",
+        run: async (input) => {
+          const blocks = partitionModelDates(input.dates, 5);
+          const completed = await Promise.all([...blocks].reverse().map((dates) => evaluateModelBlock({ ...input, dates })));
+          return { dates: completed.reverse().flat(), heapPeakBytes: null };
+        } } } }),
+    ]);
+    expect(failures.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    for (const result of failures) if (result.status === "rejected") {
+      expect(result.reason.code).toBe("ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED");
+      expect(result.reason.accountBytes).toBe(left.account);
+    }
+    expect(right.account).toBe(left.account);
+    expect(right.emissions).toEqual(left.emissions);
+    expect(left.emissions).toEqual(before.emissions.slice(0, crossing + 1));
+
   } finally { spy.mockRestore(); }
 });

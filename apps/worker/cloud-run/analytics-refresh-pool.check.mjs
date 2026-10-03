@@ -604,3 +604,28 @@ for (const failureCase of ["child-oom-repeat", "child-failed", "oversized-done",
     assert.equal(pool.stats().retriedAlone, failureCase === "child-oom-repeat" ? 1 : 0);
   });
 }
+
+for (const consumeFirst of [false, true]) test(`MODEL-BLOCKS rejected child termination fails closed (consumed first=${consumeFirst})`, { timeout: 2000 }, async () => {
+  let parent, child;
+  const { createWorker } = scriptedWorkers((worker, data) => {
+    if (data.block) {
+      child = worker;
+      worker.terminate = async () => { data.port.close(); throw new Error("synthetic termination rejection"); };
+    } else {
+      parent = worker;
+      worker.on("_posted", (message) => { if (message.type === "blockGrants") message.grants[0].port?.close(); });
+      requestBlocks(worker);
+    }
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+  const computed = pool.compute(task(0, 10), {}, io());
+  const rejected = assert.rejects(computed, { code: "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const consumed = () => parent.emit("message", { type: "blockConsumed", id: 0 });
+  const done = () => child.emit("message", { type: "blockDone", serializedBytes: 1, cloneMs: 0, evaluationMs: 0, heapPeakBytes: null });
+  if (consumeFirst) { consumed(); done(); } else { done(); consumed(); }
+  await rejected;
+  await assert.rejects(pool.abort(), { code: "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED" });
+  assert.equal(pool.running, 1, "unconfirmed isolate remains charged; no successful result escapes");
+});

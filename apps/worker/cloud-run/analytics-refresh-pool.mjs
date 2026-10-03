@@ -379,7 +379,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
           stats.blockMeasurements.push({ ownerIndex: parent.task.index, blockIndex: child.blockId,
             serializedBytes: event.serializedBytes, cloneMs: event.cloneMs, evaluationMs: event.evaluationMs,
             heapPeakBytes: event.heapPeakBytes ?? null, memoRebuildMs: null });
-          if (child.consumed) release(child);
+          if (child.consumed) void release(child).catch(() => fail(parent, "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED"));
         } else if (event?.type === "failed") {
           fail(parent, typeof event.code === "string" && SAFE_CODE.test(event.code)
             ? event.code : "ANALYTICS_V2_REFRESH_WORKER_FAILED");
@@ -447,7 +447,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
           const child = [...entry.children].find((value) => value.blockId === message.id);
           if (child === undefined || child.consumed) { fail(entry, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); break; }
           child.consumed = true;
-          if (child.resultSent) release(child);
+          if (child.resultSent) void release(child).catch(() => fail(entry, "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED"));
           break;
         }
         case "load": {
