@@ -2,7 +2,9 @@
 # MEAS-SYNTH cloud measurement: the full-recompute analytics refresh over the
 # PRODUCTION-SHAPED synthetic corpus, in the TEST project `tibotattle` only
 # (the fast-path test database tibotattle_fastpath on the test primary).
-# Never production or staging. Modelled on the parity home's
+# Never production or staging. It measures the SHARED-CORE test instance;
+# for production's instance shape use run-prodtier-measurement.sh (receipt
+# second round). Modelled on the parity home's
 # receipts/run-dense-deploy.sh. This script issues no gcloud command itself:
 # every remote call goes through scripts/gcp-fastpath-test-deploy.mjs (D),
 # whose command builders pin the project, region and fast-path names.

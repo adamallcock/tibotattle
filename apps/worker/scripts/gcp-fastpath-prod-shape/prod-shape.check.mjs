@@ -260,3 +260,60 @@ test("the cloud measurement script reaches the cloud only through the deploy wra
   const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
   if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
 });
+
+// The production-tier measurement (MEAS-SYNTH, K-CORE-A round): its own
+// disposable instance and Job, every remote call through the wrapper's
+// checked steps, and the instance deleted on every exit.
+test("the production-tier script reaches only its measurement instance, through the wrapper, and always tears down", () => {
+  const path = join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh");
+  const code = readFileSync(path, "utf8").split("\n").filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n").replaceAll("\\\n", " ");
+  assert.doesNotMatch(code, /(?:^|[\s;|&(`$])gcloud(?:\s|$)/mu, "no direct gcloud command");
+  const steps = new Set([...code.matchAll(/(?:^|[\s;{])D ([a-z-]+)/gmu)].map(([, step]) => step));
+  assert.deepEqual([...steps].sort(), ["build", "meas-create", "meas-teardown", "refresh", "refresh-uncapped"]);
+  const lines = code.split("\n");
+  const calls = (step) => lines.filter((line) => line.trimStart().startsWith(`D ${step} `));
+  for (const step of ["meas-create", "meas-teardown", "refresh", "refresh-uncapped"]) {
+    assert.ok(calls(step).length > 0, step);
+    for (const line of calls(step)) assert.equal(line.includes('--meas-instance="$INSTANCE"'), true, `${step} names the instance`);
+  }
+  for (const step of ["refresh", "refresh-uncapped"]) {
+    for (const flag of ['--image="$IMG"', '--schema="$SCHEMA"', '--now="$NOW"', '--refresh-profile="$PROFILE"', '"${GUARD[@]}"']) {
+      assert.equal(calls(step)[0].includes(flag), true, `${step} ${flag}`);
+    }
+  }
+  const seed = lines.find((line) => line.includes("gcp-fastpath-seed.mjs seed"));
+  assert.equal(seed.includes('--meas-instance="$INSTANCE"'), true, "the seed dials the measurement instance only");
+  // The teardown trap is set before the instance can exist, and runs on every exit.
+  const trap = lines.findIndex((line) => line.trim() === "trap teardown EXIT");
+  const create = lines.findIndex((line) => line.trimStart().startsWith("D meas-create "));
+  assert.ok(trap > 0 && trap < create, "trap before meas-create");
+  assert.match(code, /trap 'exit 130' INT TERM/u);
+  assert.match(code, /if \[\[ ! -f "\$RUN\/refresh\/refresh\.json" \]\]; then/u);
+  assert.match(code, /if \[\[ "\$OUTCOME" == "LOCK_HELD" \]\]; then/u);
+  const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
+  if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
+});
+
+test("the local measurement runs the wrapper's dense profiles and summarises busy cores from ps samples", async () => {
+  const { measureProfile, psSeconds, refreshArguments, utilisationSummary, OUTPUT_DIGEST_VOLATILE_KEYS } =
+    await import("./measure-local.mjs");
+  assert.deepEqual({ ...measureProfile("dense") }, { name: "dense", cpu: 4, memoryGiB: 16, heapMiB: 12_288,
+    budgetMiB: 10_752, workers: 1, taskTimeoutSeconds: 14_400 });
+  assert.deepEqual({ ...measureProfile("dense-workers") }, { name: "dense-workers", cpu: 4, memoryGiB: 16, heapMiB: 3_072,
+    budgetMiB: 10_752, workers: 4, taskTimeoutSeconds: 14_400 });
+  assert.throws(() => measureProfile("standard"), (error) => error?.code === "MEAS_SYNTH_PROFILE_INVALID");
+  assert.deepEqual(refreshArguments(measureProfile("dense-workers"), "s").filter((arg) => !arg.includes("/")),
+    ["--max-old-space-size=3072", "--mode=full", "--now=2026-10-01T12:46:00.000Z", "--schema=s", "--workers=4"]);
+  assert.equal(refreshArguments(measureProfile("dense"), "s").some((arg) => arg.startsWith("--workers")), false);
+  assert.deepEqual([psSeconds("0:01.50"), psSeconds("12:03.25"), psSeconds("1:02:03.50"), psSeconds("2-00:00:01"),
+    psSeconds("x")], [1.5, 723.25, 3_723.5, 172_801, null]);
+  const summary = utilisationSummary([{ atS: 0, cpuS: 0, rssKiB: 1024 }, { atS: 10, cpuS: 40, rssKiB: 4096 },
+    { atS: 20, cpuS: 50, rssKiB: 2048 }, { atS: 30, cpuS: 50, rssKiB: 2048 }], { cores: 4 });
+  assert.deepEqual(summary, { sampledWallS: 30, meanBusyCores: 1.67, utilisationOfCores: 0.417, cores: 4,
+    wallShareByBusyCores: { 0: 0.333, 1: 0.333, 4: 0.333 }, peakRssMiB: 4 });
+  assert.equal(utilisationSummary([{ atS: 0, cpuS: 0, rssKiB: 1 }], { cores: 4 }), null);
+  // Run identity, stamps and instants only: every stored value is compared.
+  assert.deepEqual([...OUTPUT_DIGEST_VOLATILE_KEYS].sort(), ["compatibility_sha256", "computed_at", "finished_at",
+    "kernel_id", "manifest_version", "registered_at", "released_at", "run_id", "started_at", "timings"]);
+});

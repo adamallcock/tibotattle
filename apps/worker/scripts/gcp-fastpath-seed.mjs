@@ -32,6 +32,11 @@
  *   node scripts/gcp-fastpath-seed.mjs plan [--commit=<ref>] [--corpus=q1|dense | --golden=<dir>]
  *   node scripts/gcp-fastpath-seed.mjs readback --target=gcp-fastpath --schema=<seeded schema>
  *
+ * --meas-instance=tibotattle-meas-prodtier-<YYYYMMDD> (seed and readback)
+ * seeds the same database on a disposable production-tier measurement
+ * instance instead of the test primary (scripts/gcp-fastpath-connection.mjs
+ * names no other instance).
+ *
  * --corpus selects a committed golden: q1 (the default, four owners, its dump
  * committed) or dense (golden-dense: the four Q-1 owners plus the dense owner
  * whose windows production computes natively). The dense golden commits only
@@ -62,7 +67,12 @@ import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createGcpFastpathPool, GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
+import {
+  createGcpFastpathPool,
+  fastpathInstanceConnectionName,
+  GCP_FASTPATH_CONNECTION,
+  validateTarget,
+} from "./gcp-fastpath-connection.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -354,8 +364,9 @@ const READBACK_TABLES = Object.freeze([
 ]);
 
 /** Read-only counts as the runtime IAM user: proves its grants, not the migrator's. */
-export async function readBackAsRuntime(schema, { createPool = createGcpFastpathPool } = {}) {
-  const runtime = await createPool({ as: "runtime", max: 1, applicationName: "tibotattle-fastpath-readback" });
+export async function readBackAsRuntime(schema, { createPool = createGcpFastpathPool, measInstance } = {}) {
+  const runtime = await createPool({ as: "runtime", max: 1, applicationName: "tibotattle-fastpath-readback",
+    ...(measInstance === undefined ? {} : { measInstance }) });
   const client = await runtime.pool.connect();
   try {
     await client.query("BEGIN READ ONLY");
@@ -413,6 +424,7 @@ export async function runGcpFastpathSeed({
   sealedCorpus,
   schemaSuffix,
   replace = false,
+  measInstance,
   log = (line) => console.error(line),
   dependencies = {},
 } = {}) {
@@ -445,7 +457,7 @@ export async function runGcpFastpathSeed({
   }
   const marker = seedMarker(commit, dumpSha256);
   const createPool = dependencies.createPool ?? createGcpFastpathPool;
-  const migrator = await createPool({ as: "migrator", max: 4 });
+  const migrator = await createPool({ as: "migrator", max: 4, ...(measInstance === undefined ? {} : { measInstance }) });
   const owner = dependencies.expectedOwner === undefined
     ? GCP_FASTPATH_CONNECTION.identities.migrator.iamUser : dependencies.expectedOwner;
   const started = Date.now();
@@ -501,8 +513,10 @@ export async function runGcpFastpathSeed({
       await migrator.pool.query(`COMMENT ON SCHEMA "${schemas.target}" IS '${marker}'`);
     }
     await (dependencies.grantRuntime ?? grantRuntime)(migrator.pool, schemas.target);
-    const readback = await (dependencies.readBack ?? readBackAsRuntime)(schemas.target);
+    const readback = await (dependencies.readBack ?? readBackAsRuntime)(schemas.target,
+      measInstance === undefined ? {} : { measInstance });
     return Object.freeze({ step: "seed", status, commit, golden: plan.golden,
+      instanceConnectionName: migrator.instanceConnectionName ?? null,
       ...(corpus === null ? {} : { sealedCorpus: { sealedSha256: corpus.sealedSha256,
         scale: corpus.manifest.corpus.scale, owners: corpus.roster.length, totals: corpus.manifest.totals } }),
       dumpSha256,
@@ -532,6 +546,10 @@ function parseArgs(argv) {
     else if (key === "sealed-corpus") options.sealedCorpus = value;
     else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "schema") options.schema = value;
+    else if (key === "meas-instance") {
+      fastpathInstanceConnectionName(value);
+      options.measInstance = value;
+    }
     else fail("GCP_FASTPATH_SEED_ARGUMENT_INVALID", argument);
   }
   if (command !== "plan" && options.target === undefined) fail("GCP_FASTPATH_SEED_TARGET_REQUIRED", "--target=gcp-fastpath");
@@ -554,7 +572,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         sealedCorpus: options.sealedCorpus !== undefined });
     } else if (options.command === "readback") {
       if (!options.schema?.startsWith(GCP_FASTPATH_SEED.targetPrefix)) fail("GCP_FASTPATH_SEED_SCHEMA_INVALID");
-      result = await readBackAsRuntime(seededSchemas(options.schema.slice(GCP_FASTPATH_SEED.targetPrefix.length)).target);
+      result = await readBackAsRuntime(seededSchemas(options.schema.slice(GCP_FASTPATH_SEED.targetPrefix.length)).target,
+        options.measInstance === undefined ? {} : { measInstance: options.measInstance });
     } else {
       result = await runGcpFastpathSeed(options);
     }

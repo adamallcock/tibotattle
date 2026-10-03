@@ -18,8 +18,11 @@
  *   node scripts/gcp-fastpath-test-deploy.mjs <step> [options]
  *
  * Steps: build, database, migrate, verify-database, seed, refresh,
- * refresh-idle, refresh-uncapped, origin, verify, protected, all. Run with
- * --help for options.
+ * refresh-idle, refresh-uncapped, origin, verify, protected, all, and the
+ * disposable production-tier measurement estate's meas-create and
+ * meas-teardown (--meas-instance=tibotattle-meas-prodtier-<YYYYMMDD>, which
+ * also points refresh, refresh-idle and refresh-uncapped at its own Job and
+ * instance). Run with --help for options.
  */
 
 import { createHash } from "node:crypto";
@@ -32,7 +35,11 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 
-import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+import {
+  FASTPATH_MEASUREMENT_CLOUD_TARGET,
+  FASTPATH_TEST_CLOUD_TARGET,
+  fastpathMeasurementInstance,
+} from "../cloud-run/origin-fastpath-mode.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -95,6 +102,54 @@ export const ORIGIN_BUCKET_RUNTIME_BINDING = Object.freeze({
   }),
 });
 
+/**
+ * The disposable production-tier measurement estate (MEAS-SYNTH), in the
+ * test project: one Cloud SQL instance per measurement
+ * (tibotattle-meas-prodtier-<YYYYMMDD>, FASTPATH_MEASUREMENT_CLOUD_TARGET)
+ * with production's instance shape and its own refresh Job. The shape mirrors
+ * the production desired state (cloud-run/infra/production.desired-state.json
+ * cloudSql: tier, storage, max_connections) and C-INFRA's fixed posture and
+ * database flags (gcp-ops-infra-manifest.mjs CLOUD_SQL_POSTURE,
+ * databaseFlags); the check pins every mirrored value equal. It differs from
+ * production only where a disposable instance must: no deletion protection,
+ * no automated backups or point-in-time recovery, and test labels.
+ * Connectivity is production's: a public address reachable only through the
+ * Cloud SQL connector (connector enforcement REQUIRED, no authorized
+ * networks), because the Job's connector and the seed's dial ipType PUBLIC
+ * (cloud-run/cloud-sql.mjs, scripts/gcp-fastpath-connection.mjs); a
+ * private-IP-only instance would need a runtime change and VPC egress first.
+ */
+export const FASTPATH_MEASUREMENT = Object.freeze({
+  ...FASTPATH_MEASUREMENT_CLOUD_TARGET,
+  databaseVersion: "POSTGRES_17",
+  edition: "ENTERPRISE",
+  availabilityType: "ZONAL",
+  tier: "db-custom-4-16384",
+  storageSizeGb: 50,
+  maxConnections: 100,
+  // C-INFRA's CLOUD_SQL_LOGGING_FLAGS and max_connections, sorted by name.
+  databaseFlags: Object.freeze([
+    ["cloudsql.iam_authentication", "on"], ["log_error_verbosity", "terse"], ["log_lock_waits", "off"],
+    ["log_min_duration_statement", "-1"], ["log_min_error_statement", "panic"], ["log_parameter_max_length", "0"],
+    ["log_parameter_max_length_on_error", "0"], ["log_statement", "none"], ["log_temp_files", "-1"],
+    ["max_connections", "100"],
+  ].map((pair) => Object.freeze(pair))),
+  labels: Object.freeze({ app: "tibotattle", environment: "test", "managed-by": "claude-fastpath",
+    purpose: "meas-prodtier" }),
+  // The fast-path test identities: the seed's migrator and the Job's runtime user.
+  iamServiceAccounts: Object.freeze(["tibotattle-test-migrator@tibotattle.iam.gserviceaccount.com",
+    "tibotattle-test-runtime@tibotattle.iam.gserviceaccount.com"]),
+  // Bounds of one `sql operations wait` (instance create and delete).
+  operationWaitSeconds: 3_600,
+});
+
+/** The measurement instance `name` names (tibotattle-meas-prodtier-<YYYYMMDD>), or a refusal. */
+export function assertMeasurementInstance(name) {
+  const instance = fastpathMeasurementInstance(name);
+  if (instance === null) fail("FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID", String(name));
+  return instance;
+}
+
 const IMAGE_REFERENCE =
   /^us-east1-docker\.pkg\.dev\/tibotattle\/tibotattle-test\/tibotattle-host@sha256:([a-f0-9]{64})$/u;
 const COMMIT = /^[a-f0-9]{40}$/u;
@@ -142,8 +197,12 @@ export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
 const STEPS = Object.freeze([
   "build", "database", "migrate", "verify-database", "seed", "refresh", "refresh-idle", "refresh-uncapped", "origin",
-  "verify", "protected", "all",
+  "verify", "protected", "all", "meas-create", "meas-teardown",
 ]);
+/** The steps --meas-instance applies to (the measurement estate has no migrate Job, origin or golden seed). */
+const MEASUREMENT_STEPS = Object.freeze(["meas-create", "meas-teardown", "refresh", "refresh-idle", "refresh-uncapped"]);
+/** A Cloud SQL operation id (`sql instances create --async` names one). */
+const SQL_OPERATION = /^[a-z0-9][a-z0-9-]{0,99}$/u;
 /** The refresh job's own task-timeout setting (cloud-run/analytics-refresh.mjs TASK_TIMEOUT_SECONDS). */
 export const REFRESH_TASK_TIMEOUT_ENV = "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS";
 /** Cloud Run's and the refresh guard's task-timeout ceiling (168 h). */
@@ -195,13 +254,31 @@ export function primarySchemaOf(schema = FASTPATH_TEST.primarySchema) {
   return schema;
 }
 
-function databaseEnv(schema) {
+function databaseEnv(schema, instanceConnectionName = FASTPATH_TEST.instanceConnectionName) {
   return [
     ["GOOGLE_CLOUD_PROJECT", FASTPATH_TEST.project],
-    ["PRIMARY_INSTANCE_CONNECTION_NAME", FASTPATH_TEST.instanceConnectionName],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", instanceConnectionName],
     ["PRIMARY_DATABASE", FASTPATH_TEST.database],
     ["PRIMARY_SCHEMA", primarySchemaOf(schema)],
   ];
+}
+
+/**
+ * The refresh Job a step targets: the fast-path test Job on the test primary,
+ * or, with a measurement instance, the measurement Job on that instance,
+ * which reads a seeded schema only (the Job refuses anything else too).
+ */
+export function refreshTarget({ measInstance, schema } = {}) {
+  if (measInstance === undefined || measInstance === null) {
+    return Object.freeze({ job: FASTPATH_TEST.refreshJob, instanceConnectionName: FASTPATH_TEST.instanceConnectionName,
+      measInstance: null });
+  }
+  const instance = assertMeasurementInstance(measInstance);
+  if (schema !== undefined && !primarySchemaOf(schema).startsWith(FASTPATH_MEASUREMENT.seededSchemaPrefix)) {
+    fail("FASTPATH_DEPLOY_SCHEMA_INVALID", "a measurement instance's refresh reads a seeded schema only");
+  }
+  return Object.freeze({ job: assertFastpathName(FASTPATH_MEASUREMENT.refreshJob),
+    instanceConnectionName: instance.instanceConnectionName, measInstance: instance.instance });
 }
 
 function mergeEnv(base, overrides) {
@@ -311,9 +388,14 @@ function refreshProfile(name) {
   return REFRESH_JOB_PROFILES[name];
 }
 
-/** gcloud command that creates or updates the analytics-refresh Job. */
-export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [], profile = "standard" }) {
+/**
+ * gcloud command that creates or updates the analytics-refresh Job (with
+ * `measInstance`, the measurement Job on that instance).
+ */
+export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs = [], profile = "standard",
+  measInstance } = {}) {
   if (!IMAGE_REFERENCE.test(image ?? "")) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
+  const target = refreshTarget({ measInstance, schema });
   if (now !== undefined && !ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   const resources = refreshProfile(profile);
   const args = [
@@ -325,13 +407,13 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
   ];
   if (args.some((arg) => /[,\s]/u.test(arg))) fail("FASTPATH_DEPLOY_ARGS_INVALID");
   return gcloudArgs([
-    "run", "jobs", "deploy", assertFastpathName(FASTPATH_TEST.refreshJob),
+    "run", "jobs", "deploy", assertFastpathName(target.job),
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`,
     `--image=${image}`,
     `--service-account=${FASTPATH_TEST.runtimeServiceAccount}`,
     "--command=node", `--args=${args.join(",")}`,
     envFlag(mergeEnv([
-      ...databaseEnv(schema),
+      ...databaseEnv(schema, target.instanceConnectionName),
       ["POSTGRES_IAM_USER", FASTPATH_TEST.runtimeIamUser],
       ...(now === undefined ? [] : [["ANALYTICS_V2_TEST_CLOCK", "1"]]),
       ...resources.env,
@@ -339,6 +421,121 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
     "--tasks=1", "--parallelism=1", "--max-retries=0", `--task-timeout=${resources.taskTimeoutSeconds}s`,
     `--cpu=${resources.cpu}`, `--memory=${resources.memory}`, labelsFlag(),
   ]);
+}
+
+// ---------------------------------------------------------------------------
+// The measurement estate's Cloud SQL commands. Every builder takes only a name
+// assertMeasurementInstance accepts, so no other instance can be named.
+
+/** Read-only: one measurement instance. */
+export function measInstanceDescribeCommand(instance) {
+  return gcloudArgs(["sql", "instances", "describe", assertMeasurementInstance(instance).instance,
+    `--project=${FASTPATH_TEST.project}`, "--format=json"]);
+}
+
+/** Create one measurement instance (asynchronously; meas-create waits on the operation). */
+export function measInstanceCreateCommand(instance) {
+  const m = FASTPATH_MEASUREMENT;
+  return gcloudArgs(["sql", "instances", "create", assertMeasurementInstance(instance).instance,
+    `--project=${FASTPATH_TEST.project}`, `--region=${m.region}`,
+    `--database-version=${m.databaseVersion}`, `--edition=${m.edition}`, `--tier=${m.tier}`,
+    `--availability-type=${m.availabilityType}`, "--storage-type=SSD", `--storage-size=${m.storageSizeGb}GB`,
+    "--storage-auto-increase", "--no-deletion-protection", "--no-backup",
+    "--assign-ip", "--connector-enforcement=REQUIRED", "--no-insights-config-query-insights-enabled",
+    `--database-flags=${m.databaseFlags.map(([name, value]) => `${name}=${value}`).join(",")}`,
+    "--labels=" + Object.entries(m.labels).map(([key, value]) => `${key}=${value}`).join(","),
+    "--async", "--format=json"]);
+}
+
+/** Wait for one Cloud SQL operation of the test project (bounded). */
+export function sqlOperationWaitCommand(operation) {
+  if (typeof operation !== "string" || !SQL_OPERATION.test(operation)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "operation");
+  }
+  return gcloudArgs(["sql", "operations", "wait", operation, `--project=${FASTPATH_TEST.project}`,
+    `--timeout=${FASTPATH_MEASUREMENT.operationWaitSeconds}`]);
+}
+
+/** Read-only: a measurement instance's databases. */
+export function measDatabasesListCommand(instance) {
+  return gcloudArgs(["sql", "databases", "list", `--instance=${assertMeasurementInstance(instance).instance}`,
+    `--project=${FASTPATH_TEST.project}`, "--format=json"]);
+}
+
+/** Create the disposable fast-path database on a measurement instance. */
+export function measDatabaseCreateCommand(instance) {
+  return gcloudArgs(["sql", "databases", "create", FASTPATH_MEASUREMENT.database,
+    `--instance=${assertMeasurementInstance(instance).instance}`, `--project=${FASTPATH_TEST.project}`]);
+}
+
+/** Read-only: a measurement instance's users. */
+export function measUsersListCommand(instance) {
+  return gcloudArgs(["sql", "users", "list", `--instance=${assertMeasurementInstance(instance).instance}`,
+    `--project=${FASTPATH_TEST.project}`, "--format=json"]);
+}
+
+/** Create one of the fast-path test identities as an IAM database user on a measurement instance. */
+export function measIamUserCreateCommand(instance, serviceAccount) {
+  if (!FASTPATH_MEASUREMENT.iamServiceAccounts.includes(serviceAccount)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "service account");
+  }
+  return gcloudArgs(["sql", "users", "create", serviceAccount,
+    `--instance=${assertMeasurementInstance(instance).instance}`, `--project=${FASTPATH_TEST.project}`,
+    "--type=cloud_iam_service_account"]);
+}
+
+/** Delete one measurement instance (meas-teardown, after its read-back proves it is one this wrapper built). */
+export function measInstanceDeleteCommand(instance) {
+  return gcloudArgs(["sql", "instances", "delete", assertMeasurementInstance(instance).instance,
+    `--project=${FASTPATH_TEST.project}`, "--async", "--quiet", "--format=json"]);
+}
+
+/** Cancel one running execution of the measurement refresh Job (meas-teardown, before the Job's delete). */
+export function measExecutionCancelCommand(execution) {
+  return gcloudArgs(["run", "jobs", "executions", "cancel",
+    assertExecutionOf(FASTPATH_MEASUREMENT.refreshJob, execution),
+    `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--quiet"]);
+}
+
+/** Delete the measurement refresh Job (and so its executions). */
+export function measJobDeleteCommand() {
+  return gcloudArgs(["run", "jobs", "delete", assertFastpathName(FASTPATH_MEASUREMENT.refreshJob),
+    `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--quiet"]);
+}
+
+/** The fast-path test IAM user name Cloud SQL lists for a service account (the address less .gserviceaccount.com). */
+function iamUserOf(serviceAccount) {
+  return serviceAccount.replace(/\.gserviceaccount\.com$/u, "");
+}
+
+/**
+ * Where a described instance differs from the measurement shape this wrapper
+ * creates, by field name only. A missing or foreign label means the wrapper
+ * did not build it: meas-create and meas-teardown refuse it.
+ */
+export function measurementInstanceMismatches(described, instance) {
+  const m = FASTPATH_MEASUREMENT;
+  const settings = described?.settings ?? {};
+  const ip = settings.ipConfiguration ?? {};
+  const flags = Object.fromEntries((Array.isArray(settings.databaseFlags) ? settings.databaseFlags : [])
+    .map((flag) => [flag?.name, flag?.value]));
+  const labels = settings.userLabels ?? {};
+  return [
+    ["name", described?.name === assertMeasurementInstance(instance).instance],
+    ["project", described?.project === FASTPATH_TEST.project],
+    ["region", described?.region === m.region],
+    ["databaseVersion", described?.databaseVersion === m.databaseVersion],
+    ["edition", (settings.edition ?? m.edition) === m.edition],
+    ["tier", settings.tier === m.tier],
+    ["availabilityType", settings.availabilityType === m.availabilityType],
+    ["dataDiskType", settings.dataDiskType === "PD_SSD"],
+    ["ipv4Enabled", ip.ipv4Enabled === true],
+    ["authorizedNetworks", (Array.isArray(ip.authorizedNetworks) ? ip.authorizedNetworks : []).length === 0],
+    ["connectorEnforcement", settings.connectorEnforcement === "REQUIRED"],
+    ["databaseFlags", m.databaseFlags.every(([name, value]) => flags[name] === value)
+      && Object.keys(flags).length === m.databaseFlags.length],
+    ["labels", Object.entries(m.labels).every(([key, value]) => labels[key] === value)],
+  ].filter(([, equal]) => !equal).map(([field]) => field);
 }
 
 /**
@@ -431,11 +628,16 @@ export function runningExecutions(executions) {
  * schema shares, so a second execution would exit LOCK_HELD having done
  * nothing, and a deploy would change the Job under the running one.
  */
-export function assertRefreshIdle(runner) {
-  const listed = runner.json(jobExecutionsCommand(FASTPATH_TEST.refreshJob), { read: true, placeholderJson: [] });
+export function assertRefreshIdle(runner, { job = FASTPATH_TEST.refreshJob } = {}) {
+  if (job !== FASTPATH_TEST.refreshJob) {
+    // The measurement Job exists only once a measurement's refresh deployed it.
+    const described = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true, placeholderJson: null });
+    if (described === null && !runner.dryRun) return Object.freeze({ step: "refresh-idle", job, running: 0, absent: true });
+  }
+  const listed = runner.json(jobExecutionsCommand(job), { read: true, placeholderJson: [] });
   const running = runningExecutions(listed ?? []);
   if (running.length > 0) fail("FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING", running.join(","));
-  return Object.freeze({ step: "refresh-idle", job: FASTPATH_TEST.refreshJob, running: 0 });
+  return Object.freeze({ step: "refresh-idle", job, running: 0 });
 }
 
 /** The final content-free status line of a refresh execution, or null. */
@@ -850,7 +1052,7 @@ function parseArgs(argv) {
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
     corpus: undefined, dump: undefined, refreshProfile: undefined, resolvedGolden: undefined,
-    taskTimeoutSeconds: undefined, afterRefresh: undefined,
+    taskTimeoutSeconds: undefined, afterRefresh: undefined, measInstance: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -877,6 +1079,7 @@ function parseArgs(argv) {
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
     else if (key === "after-refresh") options.afterRefresh = resolve(value);
+    else if (key === "meas-instance") options.measInstance = assertMeasurementInstance(value).instance;
     else if (key === "task-timeout-seconds") {
       if (!/^[1-9][0-9]{0,6}$/u.test(value)) fail("FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", value);
       options.taskTimeoutSeconds = Number(value);
@@ -903,6 +1106,12 @@ function parseArgs(argv) {
   }
   options.refreshProfile ??= "standard";
   refreshProfile(options.refreshProfile);
+  if (options.measInstance !== undefined && !MEASUREMENT_STEPS.includes(step)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", `--meas-instance applies to ${MEASUREMENT_STEPS.join(", ")} only`);
+  }
+  if (step.startsWith("meas-") && options.measInstance === undefined) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", `${step} needs --meas-instance`);
+  }
   return options;
 }
 
@@ -938,6 +1147,14 @@ Steps:
   verify           GET /api/health and /api/v1/community/daily with a journey-SA ID token; save body
   protected        read the shared test services' revisions (never written)
   all              build, database, migrate, verify-database, seed, refresh, origin, verify, protected
+  meas-create      the disposable production-tier measurement instance --meas-instance (test project only):
+                   create it if absent (${FASTPATH_MEASUREMENT.databaseVersion} ${FASTPATH_MEASUREMENT.edition} ${FASTPATH_MEASUREMENT.tier}, ${FASTPATH_MEASUREMENT.storageSizeGb} GB SSD,
+                   production's flags, connector-only public address, no deletion protection or backups, labels
+                   purpose=${FASTPATH_MEASUREMENT.labels.purpose}), wait for it, read it back against that shape, then
+                   create ${FASTPATH_MEASUREMENT.database} and the migrator and runtime IAM users if absent. An existing
+                   instance that does not read back as one this wrapper built is refused
+  meas-teardown    delete ${FASTPATH_MEASUREMENT.refreshJob} and the --meas-instance instance (only one that reads back
+                   with this wrapper's labels and shape; absent is success), wait, read back absent
 Options:
   --commit=<ref>          commit to build (required for build, migrate and all)
   --image=<repo@sha256:>  use an existing image digest instead of building
@@ -963,6 +1180,9 @@ Options:
                           or typed_legacy_transfer_rehearsal_target_fastpath_<8 hex> (default: the seeded schema)
   --task-timeout-seconds=<n>  refresh-uncapped: the execution's task timeout and time guard
   --after-refresh=<path>  refresh-uncapped: the refresh.json of the guarded refresh it follows
+  --meas-instance=<name>  tibotattle-meas-prodtier-<YYYYMMDD>: meas-create/meas-teardown's instance; refresh,
+                          refresh-idle and refresh-uncapped then use ${FASTPATH_MEASUREMENT.refreshJob} on it
+                          (a seeded --schema only)
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -1322,19 +1542,135 @@ async function stepRefresh(runner, options, image) {
   if (options.commit !== undefined && !commitHasRefreshEntry(resolveCommit(options.commit))) {
     fail("FASTPATH_DEPLOY_REFRESH_ENTRY_ABSENT", "cloud-run/build.mjs has no analytics-refresh entry at --commit");
   }
+  const target = refreshTarget({ measInstance: options.measInstance, schema: options.schema });
   // Never redeploy the Job under a running execution, nor start one that would only meet its lock.
-  assertRefreshIdle(runner);
-  const result = await deployAndExecuteJob(runner, options, FASTPATH_TEST.refreshJob,
+  assertRefreshIdle(runner, { job: target.job });
+  const result = await deployAndExecuteJob(runner, options, target.job,
     refreshJobCommand({ image, now: options.now, schema: options.schema, extraEnv: options.refreshEnv,
-      extraArgs: options.refreshArgs, profile: options.refreshProfile }));
+      extraArgs: options.refreshArgs, profile: options.refreshProfile, measInstance: options.measInstance }));
   const receipt = { step: "refresh", image, schema: primarySchemaOf(options.schema), now: options.now ?? null,
-    profile: options.refreshProfile, resources: REFRESH_JOB_PROFILES[options.refreshProfile], ...result };
+    profile: options.refreshProfile, resources: REFRESH_JOB_PROFILES[options.refreshProfile],
+    measInstance: target.measInstance, instanceConnectionName: target.instanceConnectionName, ...result };
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt("refresh.json", receipt);
     if (!result.succeeded) fail("FASTPATH_DEPLOY_REFRESH_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
     // LOCK_HELD exits 0 having read and written nothing: not a refresh.
     if (refreshStatusLine(result.results)?.state === "LOCK_HELD") {
       fail("FASTPATH_DEPLOY_REFRESH_LOCK_HELD", "another refresh held the fast-path database's advisory lock");
+    }
+  }
+  return receipt;
+}
+
+/** The operation id a `--async --format=json` Cloud SQL command printed. */
+function sqlOperationOf(result) {
+  if (result.dry) return "dry-run-operation";
+  let operation = null;
+  try { operation = JSON.parse(result.stdout); } catch { /* below */ }
+  const name = Array.isArray(operation) ? operation[0]?.name : operation?.name;
+  if (typeof name !== "string" || !SQL_OPERATION.test(name)) fail("FASTPATH_DEPLOY_JSON_INVALID", "sql operation");
+  return name;
+}
+
+/**
+ * meas-create (see HELP): the measurement instance, its database and IAM
+ * users, each created only when absent and read back after. An existing
+ * instance that does not read back as this wrapper's is refused untouched.
+ */
+export async function stepMeasCreate(runner, options, { wallClock = Date.now } = {}) {
+  const { instance, instanceConnectionName } = assertMeasurementInstance(options.measInstance);
+  const describe = measInstanceDescribeCommand(instance);
+  const before = runner.json(describe, { read: true, allowFailure: true, placeholderJson: null });
+  const receipt = { step: "meas-create", instance, instanceConnectionName, existed: before !== null && !runner.dryRun,
+    createSeconds: null, state: null, mismatches: null, databaseCreated: false, usersCreated: [] };
+  if (before !== null && !runner.dryRun) {
+    const foreign = measurementInstanceMismatches(before, instance);
+    if (foreign.includes("labels") || foreign.includes("name") || foreign.includes("project")) {
+      fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
+    }
+  } else {
+    const started = wallClock();
+    const created = runner.exec(measInstanceCreateCommand(instance),
+      { placeholder: JSON.stringify({ name: "dry-run-operation" }) });
+    runner.exec(sqlOperationWaitCommand(sqlOperationOf(created)), { read: true });
+    receipt.createSeconds = runner.dryRun ? null : Math.round((wallClock() - started) / 1_000);
+  }
+  const after = runner.json(describe, { read: true, placeholderJson: null });
+  if (!runner.dryRun) {
+    receipt.state = after?.state ?? null;
+    receipt.mismatches = measurementInstanceMismatches(after, instance);
+    if (receipt.state !== "RUNNABLE" || receipt.mismatches.length > 0) {
+      await runner.receipt("meas-create.json", receipt);
+      fail("FASTPATH_DEPLOY_MEAS_INSTANCE_UNEXPECTED", [receipt.state, ...receipt.mismatches].join(","));
+    }
+  }
+  const databases = runner.json(measDatabasesListCommand(instance), { read: true, placeholderJson: [] }) ?? [];
+  if (!databases.some((database) => database?.name === FASTPATH_MEASUREMENT.database)) {
+    runner.exec(measDatabaseCreateCommand(instance));
+    receipt.databaseCreated = !runner.dryRun;
+  }
+  const users = runner.json(measUsersListCommand(instance), { read: true, placeholderJson: [] }) ?? [];
+  for (const serviceAccount of FASTPATH_MEASUREMENT.iamServiceAccounts) {
+    const live = users.find((user) => user?.name === iamUserOf(serviceAccount) || user?.name === serviceAccount);
+    if (live === undefined) {
+      runner.exec(measIamUserCreateCommand(instance, serviceAccount));
+      if (!runner.dryRun) receipt.usersCreated.push(iamUserOf(serviceAccount));
+    } else if (live.type !== "CLOUD_IAM_SERVICE_ACCOUNT") {
+      fail("FASTPATH_DEPLOY_MEAS_USER_UNEXPECTED", iamUserOf(serviceAccount));
+    }
+  }
+  if (!runner.dryRun) receipt.path = await runner.receipt("meas-create.json", receipt);
+  return receipt;
+}
+
+/**
+ * meas-teardown (see HELP): the measurement Job, then the instance, each only
+ * if present, the instance only when it reads back as this wrapper's; both
+ * read back absent. Meant to run whatever happened before it.
+ */
+export async function stepMeasTeardown(runner, options) {
+  const { instance } = assertMeasurementInstance(options.measInstance);
+  const job = FASTPATH_MEASUREMENT.refreshJob;
+  const receipt = { step: "meas-teardown", instance, job, cancelled: [], jobDeleted: false, instanceDeleted: false,
+    jobAbsent: null, instanceAbsent: null, errors: [] };
+  // The Job first (its running executions cancelled), then the instance even
+  // if the Job's removal failed: the instance is what costs.
+  try {
+    const jobBefore = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true, placeholderJson: {} });
+    if (jobBefore !== null) {
+      const listed = runner.json(jobExecutionsCommand(job), { read: true, allowFailure: true, placeholderJson: [] });
+      for (const execution of runner.dryRun ? [] : runningExecutions(listed ?? [])) {
+        runner.exec(measExecutionCancelCommand(execution));
+        receipt.cancelled.push(execution);
+      }
+      runner.exec(measJobDeleteCommand());
+      receipt.jobDeleted = !runner.dryRun;
+    }
+  } catch (error) {
+    receipt.errors.push(typeof error?.code === "string" ? error.code : "FASTPATH_DEPLOY_FAILED");
+  }
+  const describe = measInstanceDescribeCommand(instance);
+  const before = runner.json(describe, { read: true, allowFailure: true, placeholderJson: {} });
+  if (before !== null) {
+    if (!runner.dryRun) {
+      const foreign = measurementInstanceMismatches(before, instance);
+      if (foreign.includes("labels") || foreign.includes("name") || foreign.includes("project")) {
+        receipt.path = await runner.receipt("meas-teardown.json", { ...receipt, refused: foreign });
+        fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
+      }
+    }
+    const deleted = runner.exec(measInstanceDeleteCommand(instance),
+      { placeholder: JSON.stringify({ name: "dry-run-operation" }) });
+    runner.exec(sqlOperationWaitCommand(sqlOperationOf(deleted)), { read: true });
+    receipt.instanceDeleted = !runner.dryRun;
+  }
+  if (!runner.dryRun) {
+    receipt.jobAbsent = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true }) === null;
+    receipt.instanceAbsent = runner.json(describe, { read: true, allowFailure: true }) === null;
+    receipt.path = await runner.receipt("meas-teardown.json", receipt);
+    if (!receipt.jobAbsent || !receipt.instanceAbsent || receipt.errors.length > 0) {
+      fail("FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE", `job absent ${receipt.jobAbsent}, instance absent ${
+        receipt.instanceAbsent}${receipt.errors.length > 0 ? `, ${receipt.errors.join(",")}` : ""}`);
     }
   }
   return receipt;
@@ -1390,7 +1726,8 @@ function isoMinus(instant, milliseconds) {
  */
 export async function stepRefreshUncapped(runner, options, image, { sleep = defaultSleep, wallClock = Date.now,
   pollMs = 60_000, maxPollFailures = 30, logAttempts = 30, logIntervalMs = 20_000 } = {}) {
-  const job = FASTPATH_TEST.refreshJob;
+  const target = refreshTarget({ measInstance: options.measInstance, schema: options.schema });
+  const job = target.job;
   const profile = refreshProfile(options.refreshProfile);
   const timeout = options.taskTimeoutSeconds;
   if (!Number.isSafeInteger(timeout) || timeout <= profile.taskTimeoutSeconds
@@ -1403,7 +1740,7 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
   }
   const schema = primarySchemaOf(options.schema);
   const expected = expectedRefreshTask({ image, now: options.now, schema, extraEnv: options.refreshEnv,
-    extraArgs: options.refreshArgs, profile: options.refreshProfile });
+    extraArgs: options.refreshArgs, profile: options.refreshProfile, measInstance: options.measInstance });
 
   // The guarded refresh this follows: its deploy succeeded (the receipt is
   // written only after it), it ran this image, schema, clock and profile, and
@@ -1420,6 +1757,8 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
     ["schema", guarded?.schema === schema],
     ["now", (guarded?.now ?? null) === (options.now ?? null)],
     ["profile", guarded?.profile === options.refreshProfile],
+    ["measInstance", (guarded?.measInstance ?? null) === target.measInstance],
+    ["job", guarded?.job === job],
     ["execution", typeof guarded?.execution === "string" && guarded.execution.length > 0],
   ].filter(([, equal]) => !equal).map(([field]) => field);
   if (guardedMismatches.length > 0) {
@@ -1429,7 +1768,7 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
   if (guardedLine?.state === "LOCK_HELD") fail("FASTPATH_DEPLOY_REFRESH_LOCK_HELD", "the guarded refresh did nothing");
 
   // Nothing else is running, and the Job is exactly the guarded refresh's.
-  assertRefreshIdle(runner);
+  assertRefreshIdle(runner, { job });
   const described = runner.json(jobDescribeCommand(job), { read: true, placeholderJson: null });
   const jobTask = runner.dryRun ? null : jobTaskSpec(described);
   if (!runner.dryRun) {
@@ -1440,7 +1779,8 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
   const overrides = { taskTimeoutSeconds: timeout, env: [[REFRESH_TASK_TIMEOUT_ENV, String(timeout)]] };
   const execute = executeJobCommand(job, overrides);
   const receipt = {
-    step: "refresh-uncapped", job, image, schema, now: options.now ?? null, profile: options.refreshProfile,
+    step: "refresh-uncapped", job, measInstance: target.measInstance, image, schema, now: options.now ?? null,
+    profile: options.refreshProfile,
     taskTimeoutSeconds: timeout, overrides: render(execute),
     afterRefresh: { path: options.afterRefresh, execution: guarded.execution, succeeded: guarded.succeeded ?? null,
       durationSeconds: guarded.durationSeconds ?? null, statusLine: guardedLine },
@@ -1501,6 +1841,10 @@ export async function stepRefreshUncapped(runner, options, image, { sleep = defa
         executionMismatches.push("guardEnv");
       }
       if (Object.hasOwn(env, "PRIMARY_SCHEMA") && env.PRIMARY_SCHEMA !== schema) executionMismatches.push("schemaEnv");
+      if (Object.hasOwn(env, "PRIMARY_INSTANCE_CONNECTION_NAME")
+          && env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName) {
+        executionMismatches.push("instanceEnv");
+      }
     }
     receipt.executionMismatches = executionMismatches;
     const since = isoMinus(execution.metadata?.creationTimestamp, 60_000) ?? isoMinus(receipt.status.startTime, 60_000)
@@ -1687,7 +2031,10 @@ export async function main(argv = process.argv.slice(2)) {
     else if (step === "refresh") {
       if (options.skip.has("refresh")) continue;
       result = await stepRefresh(runner, options, image);
-    } else if (step === "refresh-idle") result = assertRefreshIdle(runner);
+    } else if (step === "refresh-idle") {
+      result = assertRefreshIdle(runner, { job: refreshTarget({ measInstance: options.measInstance }).job });
+    } else if (step === "meas-create") result = await stepMeasCreate(runner, options);
+    else if (step === "meas-teardown") result = await stepMeasTeardown(runner, options);
     else if (step === "refresh-uncapped") result = await stepRefreshUncapped(runner, options, image);
     else if (step === "origin") result = await stepOrigin(runner, options, image);
     else if (step === "verify") result = await stepVerify(runner, options);

@@ -14,7 +14,8 @@ import { DIGEST_ONLY_GOLDEN_NOW, DIGEST_ONLY_GOLDEN_SOURCE,
 import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "../postgres-test/fixtures/fastpath-cloud-database.mjs";
 import { GCP_FASTPATH_CLOUD_TARGET, GCP_FASTPATH_CLOUD_TARGET_REFUSALS,
   gcpFastpathCloudTargetRefusal } from "./gcp-fastpath-cloud-target.mjs";
-import { GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
+import { createGcpFastpathPool, fastpathInstanceConnectionName, GCP_FASTPATH_CONNECTION,
+  validateTarget } from "./gcp-fastpath-connection.mjs";
 import { fastpathRehearsalSchemas } from "./gcp-fastpath-rehearsal.mjs";
 import {
   corpusGolden,
@@ -293,6 +294,24 @@ test("the connection targets only the disposable fast-path database", () => {
     assert.throws(() => validateTarget(bad), (error) => error?.code === "GCP_FASTPATH_CONNECTION_TARGET_INVALID");
   }
   assert.deepEqual(Object.keys(GCP_FASTPATH_CONNECTION.identities).sort(), ["migrator", "runtime"]);
+});
+
+test("--meas-instance dials the same database on a measurement instance and names no other instance", async () => {
+  assert.equal(fastpathInstanceConnectionName(undefined), GCP_FASTPATH_CONNECTION.instanceConnectionName);
+  assert.equal(fastpathInstanceConnectionName("tibotattle-meas-prodtier-20261003"),
+    "tibotattle:us-east1:tibotattle-meas-prodtier-20261003");
+  for (const bad of ["tibotattle-primary", "tibotattle-test-primary-20260922", "tibotattle-meas-prodtier-20261399", ""]) {
+    assert.throws(() => fastpathInstanceConnectionName(bad),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", bad);
+    // Refused before any gcloud call (no impersonation is attempted).
+    await assert.rejects(createGcpFastpathPool({ measInstance: bad, spawn: () => assert.fail("no gcloud") }),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", bad);
+  }
+  const script = fileURLToPath(new URL("./gcp-fastpath-seed.mjs", import.meta.url));
+  const run = spawnSync(process.execPath, [script, "seed", "--target=gcp-fastpath", "--commit=HEAD",
+    "--meas-instance=tibotattle-primary"], { encoding: "utf8" });
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /GCP_FASTPATH_CONNECTION_INSTANCE_INVALID/u);
 });
 
 // ---------------------------------------------------------------------------

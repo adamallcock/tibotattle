@@ -658,6 +658,13 @@ test("names of the test estate or a rehearsal are refused", () => {
     target.runtimeServiceAccount, "tibotattle-test-primary-20260922", "tibotattle-test-ledger-20260922"]) {
     assert.ok(manifest.TEST_TARGET_NAMES.includes(value), value);
   }
+  // The disposable measurement instances and their Job (MEAS-SYNTH) are test names.
+  for (const name of ["tibotattle-meas-prodtier-20261003", "tibotattle-fastpath-meas-analytics-refresh"]) {
+    assert.ok(manifest.TEST_TARGET_NAMES.includes(name)
+      || manifest.TEST_TARGET_PREFIXES.some((prefix) => name.startsWith(prefix)), name);
+  }
+  refused((value) => { value.cloudSql.instance = "tibotattle-meas-prodtier-20261003"; },
+    "DESIRED_STATE_TEST_TARGET_NAME:plane:cloudSql.instance");
   // A location is not an identity: the test region stays usable.
   assert.equal(manifest.TEST_TARGET_NAMES.includes(target.region), false);
   assert.equal(manifest.validateDesiredState(fixture()).region, target.region);

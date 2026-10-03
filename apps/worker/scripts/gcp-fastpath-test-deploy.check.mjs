@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync as readFileSyncText } from "node:fs";
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -10,6 +11,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 import {
+  assertMeasurementInstance,
   assertRefreshIdle,
   countMigrationsAtCommit,
   EDGE_PROXY_SOURCE,
@@ -23,11 +25,22 @@ import {
   executionLogsCommand,
   expectedRefreshTask,
   FASTPATH_CORPORA,
+  FASTPATH_MEASUREMENT,
   FASTPATH_TEST,
   jobDescribeCommand,
   jobExecutionsCommand,
   jobTaskSpec,
   main,
+  measDatabaseCreateCommand,
+  measDatabasesListCommand,
+  measExecutionCancelCommand,
+  measIamUserCreateCommand,
+  measInstanceCreateCommand,
+  measInstanceDeleteCommand,
+  measInstanceDescribeCommand,
+  measJobDeleteCommand,
+  measurementInstanceMismatches,
+  measUsersListCommand,
   migrateJobCommand,
   ORIGIN_BUCKET_RUNTIME_BINDING,
   originBucketBindingCommand,
@@ -43,9 +56,13 @@ import {
   REFRESH_TASK_TIMEOUT_ENV,
   REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS,
   refreshJobCommand,
+  refreshTarget,
   refreshTaskMismatches,
   renderOriginService,
   runningExecutions,
+  sqlOperationWaitCommand,
+  stepMeasCreate,
+  stepMeasTeardown,
   stepRefreshUncapped,
   stepsReadGolden,
   uncappedOutcome,
@@ -56,8 +73,11 @@ import { readSeedGolden } from "./gcp-fastpath-seed.mjs";
 import { DIGEST_ONLY_GOLDEN_SOURCE, withDigestOnlyGolden } from "../analytics-v2-test/fixtures/digest-only-golden.mjs";
 import {
   analyticsV2TestClock,
+  FASTPATH_MEASUREMENT_CLOUD_TARGET,
   FASTPATH_TEST_CLOUD_TARGET,
+  fastpathMeasurementInstance,
   fastpathTestDatabaseConfig,
+  isFastpathMeasurementInstanceConnectionName,
 } from "../cloud-run/origin-fastpath-mode.mjs";
 import { GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB } from "./gcp-fastpath-rehearsal.mjs";
 import { GCP_FASTPATH_SEED } from "./gcp-fastpath-seed.mjs";
@@ -65,8 +85,12 @@ import {
   ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
+  readAnalyticsRefreshProductionTarget,
   resolveAnalyticsRefreshDatabase,
 } from "../cloud-run/analytics-refresh.mjs";
+import { CLOUD_SQL_LOGGING_FLAGS, CLOUD_SQL_POSTURE, cloudSqlCreateArgs, databaseFlags,
+  loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
+import { fastpathInstanceConnectionName } from "./gcp-fastpath-connection.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const IMAGE = `${FASTPATH_TEST.imageRepository}@sha256:${"a".repeat(64)}`;
@@ -722,7 +746,7 @@ function scriptedRunner(answer, { dryRun = false } = {}) {
 async function uncappedOptions(dir, guarded = {}) {
   const afterRefresh = join(dir, "refresh.json");
   await writeFile(afterRefresh, JSON.stringify({ step: "refresh", image: IMAGE, schema: SEEDED, now: MEAS_NOW,
-    profile: "dense", execution: `${REFRESH_JOB}-g7h2k`, succeeded: false, durationSeconds: 6_900,
+    profile: "dense", job: REFRESH_JOB, execution: `${REFRESH_JOB}-g7h2k`, succeeded: false, durationSeconds: 6_900,
     results: [{ status: "failed", code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED", phase: "compute" }], ...guarded }));
   return { refreshProfile: "dense", schema: SEEDED, now: MEAS_NOW, refreshEnv: [...GUARD_ENV], refreshArgs: [],
     taskTimeoutSeconds: UNCAPPED, afterRefresh };
@@ -1159,4 +1183,363 @@ test("the refresh step refuses to deploy over a running execution and fails a LO
       assert.deepEqual([receipt.succeeded, receipt.results.at(-1).state], [true, "LOCK_HELD"]);
     },
   });
+});
+
+// ---------------------------------------------------------------------------
+// The disposable production-tier measurement estate (MEAS-SYNTH).
+
+const MEAS = "tibotattle-meas-prodtier-20261003";
+const MEAS_CONNECTION = `tibotattle:us-east1:${MEAS}`;
+const MEAS_JOB = FASTPATH_MEASUREMENT.refreshJob;
+const FOREIGN_INSTANCE_NAMES = Object.freeze(["tibotattle-primary", "tibotattle-staging-primary",
+  "tibotattle-test-primary-20260922", "tibotattle-meas-prodtier-20261332", "tibotattle-meas-prodtier-20250101",
+  "tibotattle-meas-prodtier-2026100", "tibotattle-meas-prodtier-20261003-b", "Tibotattle-meas-prodtier-20261003",
+  " tibotattle-meas-prodtier-20261003", "tibotattle-meas-prodtier-", "", null, undefined]);
+
+/** A Cloud SQL instance as `sql instances describe --format=json` renders the one meas-create builds. */
+function measInstanceResource(overrides = {}, settingsOverrides = {}) {
+  return {
+    name: MEAS, project: "tibotattle", region: "us-east1", databaseVersion: "POSTGRES_17", state: "RUNNABLE",
+    settings: { tier: "db-custom-4-16384", edition: "ENTERPRISE", availabilityType: "ZONAL", dataDiskType: "PD_SSD",
+      connectorEnforcement: "REQUIRED", ipConfiguration: { ipv4Enabled: true, authorizedNetworks: [] },
+      databaseFlags: FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })),
+      userLabels: { ...FASTPATH_MEASUREMENT.labels }, deletionProtectionEnabled: false, ...settingsOverrides },
+    ...overrides,
+  };
+}
+
+const sqlKind = (command) => (command[1] === "sql" ? command.slice(1, 4).join(" ") : kindOf(command));
+
+/** A Runner stand-in whose exec and json both answer from `answer(kind, nth, command)`; FAILED fails the call. */
+function measRunner(answer) {
+  const runner = {
+    dryRun: false, commands: [], receipts: {},
+    print(command) { this.commands.push(command); },
+    call(command, options) {
+      this.commands.push(command);
+      const kind = sqlKind(command);
+      const value = answer(kind, this.commands.filter((seen) => sqlKind(seen) === kind).length, command);
+      if (value === FAILED) {
+        if (options.allowFailure) return { status: 1, stdout: "", stderr: "" };
+        throw Object.assign(new Error("FASTPATH_DEPLOY_COMMAND_FAILED"), { code: "FASTPATH_DEPLOY_COMMAND_FAILED" });
+      }
+      return { status: 0, stdout: value === undefined ? "" : JSON.stringify(value), stderr: "" };
+    },
+    exec(command, options = {}) { return this.call(command, options); },
+    json(command, options = {}) {
+      const result = this.call(command, options);
+      return result.status !== 0 || result.stdout === "" ? null : JSON.parse(result.stdout);
+    },
+    async receipt(name, value) { this.receipts[name] = structuredClone(value); return `/receipts/${name}`; },
+  };
+  return runner;
+}
+
+test("measurement names: only tibotattle-meas-prodtier-<YYYYMMDD>; production, staging and test names are refused", () => {
+  assert.deepEqual({ ...fastpathMeasurementInstance(MEAS) }, { instance: MEAS, instanceConnectionName: MEAS_CONNECTION });
+  assert.equal(isFastpathMeasurementInstanceConnectionName(MEAS_CONNECTION), true);
+  for (const value of [FASTPATH_TEST.instanceConnectionName, `tibotattle:us-central1:${MEAS}`, `other:us-east1:${MEAS}`,
+    `${MEAS_CONNECTION}:x`, MEAS]) {
+    assert.equal(isFastpathMeasurementInstanceConnectionName(value), false, value);
+  }
+  const production = JSON.parse(readFileSyncText(join(WORKER_ROOT, "cloud-run/infra/production.desired-state.json")));
+  const staging = loadCommittedDesiredState("staging");
+  for (const name of [...FOREIGN_INSTANCE_NAMES, production.cloudSql.instance, staging.cloudSql.instance]) {
+    assert.equal(fastpathMeasurementInstance(name), null, String(name));
+    for (const build of [assertMeasurementInstance, measInstanceDescribeCommand, measInstanceCreateCommand,
+      measInstanceDeleteCommand, measDatabasesListCommand, measDatabaseCreateCommand, measUsersListCommand,
+      (instance) => measIamUserCreateCommand(instance, FASTPATH_MEASUREMENT.iamServiceAccounts[0]),
+      // Without a measurement instance (null, undefined) these target the fast-path test Job.
+      ...(name === null || name === undefined ? [] : [(instance) => refreshTarget({ measInstance: instance }),
+        (instance) => refreshJobCommand({ image: IMAGE, schema: SEEDED, measInstance: instance })])]) {
+      expectCode(() => build(name), "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID");
+    }
+    assert.throws(() => fastpathInstanceConnectionName(name ?? "x"),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", String(name));
+  }
+  assert.equal(fastpathInstanceConnectionName(undefined), FASTPATH_TEST.instanceConnectionName);
+  assert.equal(refreshTarget({ measInstance: null }).job, FASTPATH_TEST.refreshJob);
+  assert.equal(fastpathInstanceConnectionName(MEAS), MEAS_CONNECTION);
+  expectCode(() => measIamUserCreateCommand(MEAS, "someone@tibotattle.iam.gserviceaccount.com"),
+    "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  for (const operation of ["", "a b", "x".repeat(101), "../x", undefined]) {
+    expectCode(() => sqlOperationWaitCommand(operation), "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  }
+  // Every measurement command: gcloud, the test project, this instance or the measurement Job, nothing else.
+  const commands = [measInstanceDescribeCommand(MEAS), measInstanceCreateCommand(MEAS), measInstanceDeleteCommand(MEAS),
+    measDatabasesListCommand(MEAS), measDatabaseCreateCommand(MEAS), measUsersListCommand(MEAS),
+    ...FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => measIamUserCreateCommand(MEAS, account)),
+    sqlOperationWaitCommand("0a1b2c3d-op"), measJobDeleteCommand(), measExecutionCancelCommand(`${MEAS_JOB}-ab12c`)];
+  for (const command of commands) {
+    assert.equal(command[0], "gcloud");
+    assert.equal(command.filter((arg) => arg.startsWith("--project=")).join(), "--project=tibotattle");
+    const named = command.filter((arg) => /tibotattle-(?:meas|fastpath|test|primary|staging)/u.test(arg)
+      && !arg.startsWith("--labels=") && !arg.includes("@tibotattle.iam"));
+    for (const arg of named) assert.ok(arg === MEAS || arg === `--instance=${MEAS}` || arg.startsWith(MEAS_JOB), arg);
+  }
+  assert.deepEqual(measInstanceDeleteCommand(MEAS), ["gcloud", "sql", "instances", "delete", MEAS, "--project=tibotattle",
+    "--async", "--quiet", "--format=json"]);
+  assert.deepEqual(measJobDeleteCommand(), ["gcloud", "run", "jobs", "delete", MEAS_JOB, "--project=tibotattle",
+    "--region=us-east1", "--quiet"]);
+  expectCode(() => measExecutionCancelCommand(`${REFRESH_JOB}-ab12c`), "FASTPATH_DEPLOY_EXECUTION_INVALID");
+  assert.equal(FASTPATH_MEASUREMENT.refreshJob, FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob);
+  assert.equal(MEAS_JOB.startsWith("tibotattle-fastpath-"), true, "the wrapper's fast-path name rule holds");
+});
+
+test("the measurement instance is production's shape: tier, storage, posture and flags mirror C-INFRA", () => {
+  const production = JSON.parse(readFileSyncText(join(WORKER_ROOT, "cloud-run/infra/production.desired-state.json")));
+  const m = FASTPATH_MEASUREMENT;
+  assert.deepEqual([m.tier, m.storageSizeGb, m.maxConnections],
+    [production.cloudSql.tier, production.cloudSql.storageSizeGb, production.cloudSql.maxConnections]);
+  assert.deepEqual([m.databaseVersion, m.edition, m.availabilityType],
+    [CLOUD_SQL_POSTURE.databaseVersion, CLOUD_SQL_POSTURE.edition, CLOUD_SQL_POSTURE.availabilityType]);
+  assert.deepEqual(m.databaseFlags.map(([name, value]) => ({ name, value })),
+    databaseFlags({ cloudSql: { maxConnections: production.cloudSql.maxConnections } }).map((flag) => ({ ...flag })));
+  assert.equal(Object.keys(CLOUD_SQL_LOGGING_FLAGS).length + 1, m.databaseFlags.length);
+  assert.equal(CLOUD_SQL_POSTURE.connectorEnforcement, "REQUIRED");
+  assert.deepEqual(CLOUD_SQL_POSTURE.authorizedNetworks, []);
+  // The create command equals C-INFRA's instance command on every shared flag;
+  // it differs only where a disposable instance must.
+  const create = measInstanceCreateCommand(MEAS).slice(1);
+  const reference = cloudSqlCreateArgs({ ...loadCommittedDesiredState("staging"),
+    cloudSql: { ...loadCommittedDesiredState("staging").cloudSql, tier: production.cloudSql.tier,
+      storageSizeGb: production.cloudSql.storageSizeGb, maxConnections: production.cloudSql.maxConnections } });
+  const shared = (args) => args.filter((arg) => /^--(?:database-version|edition|tier|availability-type|storage-type|storage-size|storage-auto-increase|assign-ip|connector-enforcement|no-insights-config-query-insights-enabled|database-flags)\b/u.test(arg));
+  assert.deepEqual(shared(create), shared([...reference]));
+  assert.equal(shared(create).length, 11);
+  const own = create.filter((arg) => !shared([arg]).length && !["sql", "instances", "create", MEAS].includes(arg));
+  assert.deepEqual(own, ["--project=tibotattle", "--region=us-east1", "--no-deletion-protection", "--no-backup",
+    "--labels=app=tibotattle,environment=test,managed-by=claude-fastpath,purpose=meas-prodtier", "--async",
+    "--format=json"]);
+  assert.equal(create.some((arg) => /authorized-networks|--no-assign-ip|--network=|--deletion-protection$/u.test(arg)), false);
+  // A read-back is checked field by field; a foreign label set is visible as such.
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource(), MEAS), []);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    ipConfiguration: { ipv4Enabled: true, authorizedNetworks: [{ value: "0.0.0.0/0" }] },
+    connectorEnforcement: "NOT_REQUIRED", tier: "db-g1-small" }), MEAS), ["tier", "authorizedNetworks", "connectorEnforcement"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, { userLabels: {} }), MEAS), ["labels"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })),
+      { name: "log_statement", value: "all" }] }), MEAS), ["databaseFlags"]);
+});
+
+test("meas-create builds the instance once, waits, reads it back, and refuses an instance it did not build", async () => {
+  let created = false;
+  const fresh = measRunner((kind) => {
+    if (kind === "sql instances describe") return created ? measInstanceResource() : FAILED;
+    if (kind === "sql instances create") { created = true; return { name: "op-create-1" }; }
+    if (kind === "sql operations wait") return undefined;
+    if (kind === "sql databases list") return [{ name: "postgres" }];
+    if (kind === "sql databases create") return undefined;
+    if (kind === "sql users list") return [{ name: "postgres", type: "BUILT_IN" }];
+    if (kind === "sql users create") return undefined;
+    return assert.fail(kind);
+  });
+  let clock = 0;
+  const receipt = await stepMeasCreate(fresh, { measInstance: MEAS }, { wallClock: () => (clock += 450_000) });
+  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances describe", "sql instances create", "sql operations wait",
+    "sql instances describe", "sql databases list", "sql databases create", "sql users list", "sql users create",
+    "sql users create"]);
+  assert.deepEqual(fresh.commands[1], measInstanceCreateCommand(MEAS));
+  assert.deepEqual(fresh.commands[2], sqlOperationWaitCommand("op-create-1"));
+  assert.deepEqual(fresh.commands.slice(-2), FASTPATH_MEASUREMENT.iamServiceAccounts
+    .map((account) => measIamUserCreateCommand(MEAS, account)));
+  assert.deepEqual([receipt.existed, receipt.createSeconds, receipt.state, receipt.mismatches, receipt.databaseCreated],
+    [false, 450, "RUNNABLE", [], true]);
+  assert.deepEqual(receipt.usersCreated, ["tibotattle-test-migrator@tibotattle.iam", "tibotattle-test-runtime@tibotattle.iam"]);
+
+  // Re-run over its own instance: reads only.
+  const again = measRunner((kind) => ({
+    "sql instances describe": measInstanceResource(),
+    "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
+    "sql users list": FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => ({
+      name: account.replace(/\.gserviceaccount\.com$/u, ""), type: "CLOUD_IAM_SERVICE_ACCOUNT" })),
+  })[kind] ?? assert.fail(kind));
+  const reread = await stepMeasCreate(again, { measInstance: MEAS });
+  assert.equal(reread.existed, true);
+  assert.deepEqual(again.commands.map(sqlKind), ["sql instances describe", "sql instances describe",
+    "sql databases list", "sql users list"]);
+
+  // Someone else's instance of that name, or a built-in user of the identity's name: refused, nothing written.
+  const foreign = measRunner((kind) => (kind === "sql instances describe"
+    ? measInstanceResource({}, { userLabels: { app: "other" } }) : assert.fail(kind)));
+  await assert.rejects(stepMeasCreate(foreign, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
+  const impostor = measRunner((kind) => ({
+    "sql instances describe": measInstanceResource(), "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
+    "sql users list": [{ name: "tibotattle-test-migrator@tibotattle.iam", type: "BUILT_IN" }],
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasCreate(impostor, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_USER_UNEXPECTED");
+  assert.equal(impostor.commands.some((command) => sqlKind(command) === "sql users create"), false);
+
+  // A created instance that reads back with another shape stops before the database and users.
+  let made = false;
+  const drifted = measRunner((kind) => {
+    if (kind === "sql instances describe") return made ? measInstanceResource({}, { connectorEnforcement: "NOT_REQUIRED" }) : FAILED;
+    if (kind === "sql instances create") { made = true; return { name: "op-create-2" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasCreate(drifted, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_UNEXPECTED" && error.message.endsWith("RUNNABLE,connectorEnforcement"));
+  assert.deepEqual(drifted.receipts["meas-create.json"].mismatches, ["connectorEnforcement"]);
+});
+
+test("meas-teardown cancels and deletes the Job, deletes only an instance it built, and is idempotent", async () => {
+  const running = uncappedExecution(`${MEAS_JOB}-r1abc`, { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z",
+    running: true });
+  let gone = false;
+  let jobGone = false;
+  const full = measRunner((kind) => {
+    if (kind === "run jobs describe") return jobGone ? FAILED : {};
+    if (kind === "run jobs executions list") return [running];
+    if (kind === "run jobs executions cancel") return undefined;
+    if (kind === "run jobs delete") { jobGone = true; return undefined; }
+    if (kind === "sql instances describe") return gone ? FAILED : measInstanceResource();
+    if (kind === "sql instances delete") { gone = true; return { name: "op-delete-1" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  const receipt = await stepMeasTeardown(full, { measInstance: MEAS });
+  assert.deepEqual(full.commands.map(sqlKind), ["run jobs describe", "run jobs executions list",
+    "run jobs executions cancel", "run jobs delete", "sql instances describe", "sql instances delete",
+    "sql operations wait", "run jobs describe", "sql instances describe"]);
+  assert.deepEqual(full.commands[2], measExecutionCancelCommand(`${MEAS_JOB}-r1abc`));
+  assert.deepEqual(full.commands[5], measInstanceDeleteCommand(MEAS));
+  assert.deepEqual(full.commands[6], sqlOperationWaitCommand("op-delete-1"));
+  assert.deepEqual([receipt.cancelled, receipt.jobDeleted, receipt.instanceDeleted, receipt.jobAbsent,
+    receipt.instanceAbsent], [[`${MEAS_JOB}-r1abc`], true, true, true, true]);
+
+  // Nothing left: reads only, success.
+  const empty = measRunner((kind) => (["run jobs describe", "sql instances describe"].includes(kind) ? FAILED : assert.fail(kind)));
+  const none = await stepMeasTeardown(empty, { measInstance: MEAS });
+  assert.deepEqual([none.jobDeleted, none.instanceDeleted, none.jobAbsent, none.instanceAbsent], [false, false, true, true]);
+
+  // An instance of that name this wrapper did not build is never deleted.
+  const foreign = measRunner((kind) => (kind === "sql instances describe"
+    ? measInstanceResource({}, { userLabels: {} }) : kind === "run jobs describe" ? FAILED : assert.fail(kind)));
+  await assert.rejects(stepMeasTeardown(foreign, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
+  assert.equal(foreign.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+
+  // A Job that cannot be deleted does not keep the instance alive; the step still fails.
+  let deleted = false;
+  const stuck = measRunner((kind) => {
+    if (kind === "run jobs describe") return {};
+    if (kind === "run jobs executions list") return [];
+    if (kind === "run jobs delete") return FAILED;
+    if (kind === "sql instances describe") return deleted ? FAILED : measInstanceResource();
+    if (kind === "sql instances delete") { deleted = true; return { name: "op-delete-2" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasTeardown(stuck, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE");
+  assert.equal(deleted, true);
+  assert.deepEqual(stuck.receipts["meas-teardown.json"].errors, ["FASTPATH_DEPLOY_COMMAND_FAILED"]);
+});
+
+test("a measurement refresh deploys the measurement Job on its instance, which the Job alone accepts", async () => {
+  const command = refreshJobCommand({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+    profile: "dense", measInstance: MEAS });
+  assert.equal(command[4], MEAS_JOB);
+  const task = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+    profile: "dense", measInstance: MEAS });
+  const shared = denseTask();
+  assert.deepEqual({ ...task, env: { ...task.env, PRIMARY_INSTANCE_CONNECTION_NAME: null } },
+    { ...shared, env: { ...shared.env, PRIMARY_INSTANCE_CONNECTION_NAME: null } }, "only the instance differs");
+  assert.equal(task.env.PRIMARY_INSTANCE_CONNECTION_NAME, MEAS_CONNECTION);
+  expectCode(() => refreshJobCommand({ image: IMAGE, schema: FASTPATH_TEST.primarySchema, measInstance: MEAS }),
+    "FASTPATH_DEPLOY_SCHEMA_INVALID");
+  // The Job's own target check, with the env the wrapper renders.
+  const env = { ...task.env, CLOUD_RUN_JOB: MEAS_JOB };
+  assert.deepEqual({ ...await resolveAnalyticsRefreshDatabase(env, { schema: SEEDED }) }, { kind: "cloud-sql",
+    instanceConnectionName: MEAS_CONNECTION, database: "tibotattle_fastpath", iamUser: FASTPATH_TEST.runtimeIamUser });
+  const forbidden = (overrides, schema = SEEDED) => assert.rejects(
+    resolveAnalyticsRefreshDatabase({ ...env, ...overrides }, { schema }),
+    (error) => error?.code === "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN", JSON.stringify({ overrides, schema }));
+  await forbidden({}, FASTPATH_TEST.primarySchema);
+  await forbidden({}, "tibotattle_fastpath_other");
+  for (const instance of [FASTPATH_TEST.instanceConnectionName, "tibotattle:us-east1:tibotattle-primary",
+    "tibotattle:us-east1:tibotattle-meas-prodtier-20261332", `tibotattle:us-central1:${MEAS}`]) {
+    await forbidden({ PRIMARY_INSTANCE_CONNECTION_NAME: instance });
+  }
+  await forbidden({ PRIMARY_DATABASE: "tibotattle" });
+  await forbidden({ POSTGRES_IAM_USER: "someone-else@tibotattle.iam" });
+  // The fast-path test Job never reaches a measurement instance.
+  await forbidden({ CLOUD_RUN_JOB: FASTPATH_TEST.refreshJob });
+  // A production or staging target naming any measurement resource is refused.
+  const production = { ANALYTICS_REFRESH_TARGET: "production", CLOUD_RUN_JOB: "tibotattle-analytics-refresh",
+    CLOUD_RUN_TASK_INDEX: "0", CLOUD_RUN_TASK_COUNT: "1",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "example-ops-prod1:us-east1:tibotattle-primary", PRIMARY_DATABASE: "tibotattle_primary",
+    PRIMARY_SCHEMA: "tibotattle_primary", POSTGRES_IAM_USER: "tibotattle-runtime@example-ops-prod1.iam",
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752" };
+  assert.equal((await readAnalyticsRefreshProductionTarget(production)).target, "production");
+  for (const [name, value] of [["PRIMARY_INSTANCE_CONNECTION_NAME", MEAS_CONNECTION],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:tibotattle-meas-prodtier-20261003"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:tibotattle-meas-prodtier-x"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:primary-meas"],
+    ["CLOUD_RUN_JOB", MEAS_JOB]]) {
+    await assert.rejects(readAnalyticsRefreshProductionTarget({ ...production, [name]: value }),
+      (error) => error?.code === "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN" && error.field === name, value);
+  }
+});
+
+test("refresh-uncapped on a measurement instance follows only that instance's guarded refresh", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const measTask = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+      profile: "dense", measInstance: MEAS });
+    const guarded = { job: MEAS_JOB, measInstance: MEAS, execution: `${MEAS_JOB}-g7h2k` };
+    for (const [overrides, field] of [[{ measInstance: null }, "measInstance"], [{ job: REFRESH_JOB }, "job"],
+      [{ measInstance: "tibotattle-meas-prodtier-20261004" }, "measInstance"]]) {
+      const runner = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+      const options = { ...await uncappedOptions(dir, { ...guarded, ...overrides }), measInstance: MEAS };
+      await assert.rejects(stepRefreshUncapped(runner, options, IMAGE, NO_WAIT),
+        (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH" && error.message.includes(field),
+        JSON.stringify(overrides));
+    }
+    // The fast-path Job's guarded refresh does not admit a measurement uncapped run, nor the reverse.
+    const runner = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+    await assert.rejects(stepRefreshUncapped(runner, { ...await uncappedOptions(dir), measInstance: MEAS }, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH");
+    await assert.rejects(stepRefreshUncapped(runner, await uncappedOptions(dir, guarded), IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH");
+    // Matching: reads the measurement Job, executes it with overrides only, and reads its execution.
+    const name = `${MEAS_JOB}-u5xyz`;
+    const execution = taskResource("Execution", { ...measTask, env: { ...measTask.env, [REFRESH_TASK_TIMEOUT_ENV]: String(UNCAPPED) },
+      timeoutSeconds: UNCAPPED }, { metadata: { name, creationTimestamp: "2026-10-04T00:00:05Z" },
+      status: { startTime: "2026-10-04T00:00:20Z", completionTime: "2026-10-04T05:00:20Z", succeededCount: 1, failedCount: 0,
+        conditions: [{ type: "Completed", status: "True" }] } });
+    const ok = scriptedRunner((command, nth) => {
+      const kind = kindOf(command);
+      if (kind === "run jobs describe") return taskResource("Job", measTask);
+      if (kind === "run jobs executions list" && nth === 1) return [];
+      if (kind === "run jobs execute") return execution;
+      if (kind === "logging read") return [{ timestamp: "2026-10-04T05:00:19Z", jsonPayload: { status: "ok", state: "complete" } }];
+      return assert.fail(kind);
+    });
+    const receipt = await stepRefreshUncapped(ok, { ...await uncappedOptions(dir, guarded), measInstance: MEAS }, IMAGE, NO_WAIT);
+    assert.deepEqual([receipt.outcome, receipt.job, receipt.measInstance, receipt.durationSeconds],
+      ["complete", MEAS_JOB, MEAS, 18_000]);
+    for (const command of ok.commands) {
+      assert.equal(command.some((arg) => arg.includes(REFRESH_JOB)), false, "never the shared fast-path Job");
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--meas-instance applies to the measurement steps only, and the meas steps require it", async () => {
+  const run = async (argv) => {
+    try { await main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]); return null; } catch (error) { return error.code; }
+  };
+  for (const step of ["migrate", "seed", "origin", "build", "all", "verify-database", "database"]) {
+    assert.equal(await run([step, `--meas-instance=${MEAS}`]), "FASTPATH_DEPLOY_ARGUMENT_INVALID", step);
+  }
+  for (const step of ["meas-create", "meas-teardown"]) {
+    assert.equal(await run([step]), "FASTPATH_DEPLOY_ARGUMENT_INVALID", step);
+    assert.equal(await run([step, "--meas-instance=tibotattle-primary"]), "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID", step);
+  }
 });

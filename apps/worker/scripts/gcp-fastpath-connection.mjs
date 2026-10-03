@@ -13,6 +13,11 @@
  *   import { createGcpFastpathPool } from "./gcp-fastpath-connection.mjs";
  *   const { pool, close } = await createGcpFastpathPool({ as: "migrator" });
  *
+ * `measInstance` (tibotattle-meas-prodtier-<YYYYMMDD>) connects to the same
+ * database on a disposable production-tier measurement instance instead
+ * (cloud-run/origin-fastpath-mode.mjs FASTPATH_MEASUREMENT_CLOUD_TARGET);
+ * no other instance can be named.
+ *
  *   # Unix-socket proxy for tools that only take a socket directory and port:
  *   node scripts/gcp-fastpath-connection.mjs proxy --as=migrator --socket-dir=<dir> [--port=55499]
  */
@@ -22,6 +27,8 @@ import { lstat, mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { fastpathMeasurementInstance } from "../cloud-run/origin-fastpath-mode.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -54,6 +61,17 @@ function identityFor(as) {
   const identity = GCP_FASTPATH_CONNECTION.identities[as];
   if (identity === undefined) fail("GCP_FASTPATH_CONNECTION_IDENTITY_INVALID", String(as));
   return identity;
+}
+
+/**
+ * The instance connection name a pool or proxy dials: the test primary, or a
+ * measurement instance by its validated name.
+ */
+export function fastpathInstanceConnectionName(measInstance) {
+  if (measInstance === undefined || measInstance === null) return GCP_FASTPATH_CONNECTION.instanceConnectionName;
+  const instance = fastpathMeasurementInstance(measInstance);
+  if (instance === null) fail("GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", String(measInstance));
+  return instance.instanceConnectionName;
 }
 
 export function validateTarget(target) {
@@ -112,15 +130,17 @@ export async function createGcpFastpathPool({
   as = "migrator",
   max = 4,
   applicationName = "tibotattle-fastpath-seed",
+  measInstance,
   spawn = spawnSync,
 } = {}) {
   const identity = identityFor(as);
+  const instanceConnectionName = fastpathInstanceConnectionName(measInstance);
   if (!Number.isSafeInteger(max) || max < 1 || max > 8) fail("GCP_FASTPATH_CONNECTION_POOL_SIZE_INVALID");
   const { connector, pg } = await impersonatedConnector(identity, spawn);
   let pool;
   try {
     const options = await connector.getOptions({
-      instanceConnectionName: GCP_FASTPATH_CONNECTION.instanceConnectionName,
+      instanceConnectionName,
       authType: "IAM",
       ipType: "PUBLIC",
     });
@@ -147,6 +167,7 @@ export async function createGcpFastpathPool({
   return Object.freeze({
     pool,
     identity: identity.iamUser,
+    instanceConnectionName,
     database: GCP_FASTPATH_CONNECTION.database,
     async close() {
       await pool.end().catch(() => {});
@@ -164,9 +185,11 @@ export async function startGcpFastpathSocketProxy({
   as = "migrator",
   socketDir,
   port = 55499,
+  measInstance,
   spawn = spawnSync,
 } = {}) {
   const identity = identityFor(as);
+  const instanceConnectionName = fastpathInstanceConnectionName(measInstance);
   if (typeof socketDir !== "string" || !isAbsolute(socketDir)) fail("GCP_FASTPATH_CONNECTION_SOCKET_DIR_INVALID");
   if (!Number.isSafeInteger(port) || port < 1024 || port > 65_535) fail("GCP_FASTPATH_CONNECTION_PORT_INVALID");
   await mkdir(socketDir, { recursive: true, mode: 0o700 });
@@ -174,7 +197,7 @@ export async function startGcpFastpathSocketProxy({
   if (await lstat(path).catch(() => null)) fail("GCP_FASTPATH_CONNECTION_SOCKET_EXISTS", path);
   const { connector } = await impersonatedConnector(identity, spawn);
   await connector.startLocalProxy({
-    instanceConnectionName: GCP_FASTPATH_CONNECTION.instanceConnectionName,
+    instanceConnectionName,
     authType: "IAM",
     ipType: "PUBLIC",
     listenOptions: { path },
@@ -200,6 +223,7 @@ function parseProxyArgs(argv) {
     else if (key === "socket-dir") options.socketDir = resolve(value);
     else if (key === "port") options.port = Number(value);
     else if (key === "target") validateTarget(value);
+    else if (key === "meas-instance") options.measInstance = value;
     else fail("GCP_FASTPATH_CONNECTION_ARGUMENT_INVALID", argument);
   }
   return options;
@@ -208,7 +232,7 @@ function parseProxyArgs(argv) {
 async function main(argv) {
   if (argv[0] !== "proxy") {
     console.error("Usage: node scripts/gcp-fastpath-connection.mjs proxy [--target=gcp-fastpath] "
-      + "--as=migrator|runtime --socket-dir=<absolute dir> [--port=55499]");
+      + "--as=migrator|runtime --socket-dir=<absolute dir> [--port=55499] [--meas-instance=<name>]");
     process.exitCode = 2;
     return;
   }

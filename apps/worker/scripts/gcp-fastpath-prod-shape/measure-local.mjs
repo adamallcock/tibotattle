@@ -6,21 +6,35 @@
 //   ~/.nvm/versions/node/v26.2.0/bin/node --max-old-space-size=49152 \
 //     apps/worker/scripts/gcp-fastpath-prod-shape/measure-local.mjs \
 //       --corpus <seed-source.mjs work dir> --out <report.json> [--keep-database] [--reuse-database <name>]
-//       [--guard-probe] [--node22 <path>]
+//       [--clone-from <name>] [--import-only] [--profile dense|dense-workers] [--guard-probe] [--node22 <path>]
 //
 //  1. creates a fresh database meas_synth_<8 hex> on the cluster (never an
 //     existing one), a fast-path rehearsal target schema in it, and applies
 //     every promoted primary migration with the production runner;
 //  2. imports the sealed corpus through the reviewed importer chain
 //     (import-corpus.mjs), then ANALYZEs the schema;
+//     With --clone-from <meas_synth_…> the fresh database is instead a
+//     template copy of a kept, already imported one (CREATE DATABASE …
+//     TEMPLATE; the source must have no connections), so two profiles can be
+//     measured on byte-identical inputs; with --import-only the run stops
+//     here and keeps the database for such clones;
 //  3. runs cloud-run/dist/analytics-refresh.mjs --mode=full once under
-//     Node 22 with the PRODUCTION task profile's heap and budget
-//     (--max-old-space-size=12288, ANALYTICS_V2_MEMORY_BUDGET_MIB=10752; no
-//     task timeout, so the run is measured to the end), wrapped in
-//     /usr/bin/time -l for the process's peak resident set;
-//  4. records the job's receipt (phase timings, memory summary, owner and
-//     refusal counts), the wall time, the peak RSS and the output sizes
-//     (rows and bytes of every analytics_v2 table and the published payloads);
+//     Node 22 with a test-deploy refresh task profile's heap, budget and
+//     compute Workers (--profile, default dense, the production profile:
+//     --max-old-space-size=12288, ANALYTICS_V2_MEMORY_BUDGET_MIB=10752,
+//     inline; dense-workers: a 3,072 MiB main heap and --workers=4, K-PAR;
+//     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; no task timeout, so
+//     the run is measured to the end), wrapped in /usr/bin/time -l for the
+//     process's peak resident set, while the process's resident set and CPU
+//     time are sampled every 5 s (ps) for the utilisation of its threads;
+//  4. records the job's receipt (phase timings, read ledger, memory summary,
+//     owner and refusal counts), the wall time, the peak RSS, the samples'
+//     utilisation summary, the per-owner resource record the run row keeps
+//     (estimate, heap peak; content-free digests only), the output sizes
+//     (rows and bytes of every analytics_v2 table and the published
+//     payloads) and a content digest of every output table, which leaves out
+//     only the run's identity and stamps (run_id, kernel_id,
+//     manifest_version, timestamps), so two runs on the same inputs compare;
 //  5. --guard-probe: a second refresh with
 //     ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400 (the production task
 //     timeout), stopped after 600 s unless it ends sooner, records whether the
@@ -39,11 +53,12 @@ import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 
 import { fastpathRehearsalSchemas } from "../gcp-fastpath-rehearsal.mjs";
+import { REFRESH_JOB_PROFILES } from "../gcp-fastpath-test-deploy.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../postgres-migrations.mjs";
 import { importProdShapeCorpus, readProdShapeCorpus } from "./import-corpus.mjs";
 import { PROD_SHAPE_REFRESH_NOW } from "./prod-shape-corpus.mjs";
@@ -59,6 +74,29 @@ const DATABASE = /^meas_synth_[0-9a-f]{8}$/u;
 /** The production task profile (cloud-run/analytics-refresh.mjs ANALYTICS_REFRESH_PRODUCTION_JOB, "dense"). */
 export const PRODUCTION_PROFILE = Object.freeze({ cpu: 4, memoryGiB: 16, heapMiB: 12_288, budgetMiB: 10_752,
   taskTimeoutSeconds: 14_400 });
+/** The refresh task profiles this measurement runs locally (the test-deploy wrapper's, by name). */
+export const MEASURE_PROFILES = Object.freeze(["dense", "dense-workers"]);
+
+/** One test-deploy refresh profile as the local run takes it: heap, budget, Workers, task timeout. */
+export function measureProfile(name) {
+  if (!MEASURE_PROFILES.includes(name)) fail("MEAS_SYNTH_PROFILE_INVALID", String(name));
+  const profile = REFRESH_JOB_PROFILES[name];
+  const budget = new Map(profile.env).get("ANALYTICS_V2_MEMORY_BUDGET_MIB");
+  if (profile.memory !== "16Gi" || profile.cpu !== 4 || budget !== String(PRODUCTION_PROFILE.budgetMiB)) {
+    fail("MEAS_SYNTH_PROFILE_INVALID", name);
+  }
+  return Object.freeze({ name, cpu: profile.cpu, memoryGiB: 16, heapMiB: profile.heapMiB,
+    budgetMiB: PRODUCTION_PROFILE.budgetMiB, workers: profile.workers, taskTimeoutSeconds: profile.taskTimeoutSeconds });
+}
+
+/**
+ * The columns an output digest leaves out: the run's identity, the kernel
+ * stamps and wall-clock instants. Everything else a run stores is compared.
+ */
+export const OUTPUT_DIGEST_VOLATILE_KEYS = Object.freeze(["run_id", "kernel_id", "manifest_version", "released_at",
+  "computed_at", "started_at", "finished_at", "registered_at", "timings", "compatibility_sha256"]);
+/** Run-level tables, which hold one row per run and are not outputs to compare. */
+const OUTPUT_DIGEST_SKIPPED_TABLES = new Set(["analytics_v2_runs", "analytics_v2_kernels"]);
 
 function fail(code, detail) {
   throw Object.assign(new Error(detail === undefined ? code : `${code}: ${detail}`), { code });
@@ -66,7 +104,7 @@ function fail(code, detail) {
 
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
-    node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22 };
+    cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22 };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -74,11 +112,22 @@ function parseArguments(argv) {
     else if (argument === "--keep-database") options.keepDatabase = true;
     else if (argument === "--reuse-database") options.reuseDatabase = next();
     else if (argument === "--guard-probe") options.guardProbe = true;
+    else if (argument === "--clone-from") options.cloneFrom = next();
+    else if (argument === "--import-only") options.importOnly = true;
+    else if (argument === "--profile") options.profile = next();
     else if (argument === "--node22") options.node22 = next();
     else fail("MEAS_SYNTH_ARGUMENT_INVALID", argument);
   }
   if (!options.corpus || !options.out) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--corpus and --out are required");
   if (options.reuseDatabase !== null && !DATABASE.test(options.reuseDatabase)) fail("MEAS_SYNTH_DATABASE_INVALID");
+  if (options.cloneFrom !== null && (!DATABASE.test(options.cloneFrom) || options.reuseDatabase !== null)) {
+    fail("MEAS_SYNTH_DATABASE_INVALID", "--clone-from takes a meas_synth_<8 hex> database, without --reuse-database");
+  }
+  if (options.importOnly && (options.reuseDatabase !== null || options.cloneFrom !== null || options.guardProbe)) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "--import-only imports a fresh database and runs nothing");
+  }
+  if (options.importOnly) options.keepDatabase = true;
+  options.profile = measureProfile(options.profile);
   return options;
 }
 
@@ -122,31 +171,109 @@ function lastJson(text) {
   return null;
 }
 
-function refreshEnv(endpoint, database, extra = {}) {
+function refreshEnv(endpoint, database, profile, extra = {}) {
   return { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1",
-    ANALYTICS_V2_MEMORY_BUDGET_MIB: String(PRODUCTION_PROFILE.budgetMiB),
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.budgetMiB),
     PG_TEST_SOCKET: endpoint.host, PG_TEST_PORT: String(endpoint.port), PG_TEST_DATABASE: database, ...extra };
 }
 
-/** One full refresh under /usr/bin/time -l, measured to the end. */
-async function runRefresh({ node22, endpoint, database, schema, outDir, label }) {
-  const started = performance.now();
-  let stdout = "", stderr = "", exitCode = 0;
-  try {
-    ({ stdout, stderr } = await execFileAsync("/usr/bin/time", ["-l", node22,
-      `--max-old-space-size=${PRODUCTION_PROFILE.heapMiB}`, DIST_REFRESH, "--mode=full",
-      `--now=${PROD_SHAPE_REFRESH_NOW}`, `--schema=${schema}`], {
-      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database), maxBuffer: 256 * 1024 * 1024,
-    }));
-  } catch (error) {
-    stdout = error.stdout ?? ""; stderr = error.stderr ?? "";
-    exitCode = typeof error.code === "number" ? error.code : 1;
+/** The job's arguments under a profile (the wrapper's refreshJobCommand order). */
+export function refreshArguments(profile, schema) {
+  return [`--max-old-space-size=${profile.heapMiB}`, DIST_REFRESH, "--mode=full", `--now=${PROD_SHAPE_REFRESH_NOW}`,
+    `--schema=${schema}`, ...(profile.workers > 1 ? [`--workers=${profile.workers}`] : [])];
+}
+
+/** "[[dd-]hh:]mm:ss[.ff]" (ps time) in seconds, or null. */
+export function psSeconds(text) {
+  const match = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+(?:\.\d+)?)$/u.exec(String(text).trim());
+  if (match === null) return null;
+  const [, days = "0", hours = "0", minutes, seconds] = match;
+  return Number(days) * 86_400 + Number(hours) * 3_600 + Number(minutes) * 60 + Number(seconds);
+}
+
+/**
+ * Busy cores between consecutive samples (CPU seconds over wall seconds), as
+ * a distribution: the share of sampled wall time at each whole number of busy
+ * cores (rounded), the mean, and the CPU over wall of the whole sampled span.
+ */
+export function utilisationSummary(samples, { cores }) {
+  const spans = [];
+  for (let index = 1; index < samples.length; index++) {
+    const wall = samples[index].atS - samples[index - 1].atS;
+    const cpu = samples[index].cpuS - samples[index - 1].cpuS;
+    if (wall > 0 && cpu >= 0) spans.push({ wall, busy: cpu / wall });
   }
+  const wall = spans.reduce((sum, span) => sum + span.wall, 0);
+  if (wall === 0) return null;
+  const shares = {};
+  for (const span of spans) {
+    const key = String(Math.min(cores + 1, Math.max(0, Math.round(span.busy))));
+    shares[key] = (shares[key] ?? 0) + span.wall / wall;
+  }
+  const busy = spans.reduce((sum, span) => sum + span.busy * span.wall, 0) / wall;
+  return { sampledWallS: Math.round(wall), meanBusyCores: Number(busy.toFixed(2)),
+    utilisationOfCores: Number((busy / cores).toFixed(3)), cores,
+    wallShareByBusyCores: Object.fromEntries(Object.entries(shares).sort(([a], [b]) => Number(a) - Number(b))
+      .map(([key, share]) => [key, Number(share.toFixed(3))])),
+    peakRssMiB: Math.ceil(Math.max(...samples.map((sample) => sample.rssKiB)) / 1024) };
+}
+
+/** Samples a process's resident set (KiB) and CPU time (s) every `intervalMs` (ps), until stopped. */
+function sampleProcess(pid, { intervalMs = 5_000, started = performance.now() } = {}) {
+  const samples = [];
+  let stopped = false;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const { stdout } = await execFileAsync("/bin/ps", ["-o", "rss=,time=", "-p", String(pid)]);
+      const [rss, time] = stdout.trim().split(/\s+/u);
+      const cpuS = psSeconds(time);
+      if (Number.isSafeInteger(Number(rss)) && cpuS !== null) {
+        samples.push({ atS: (performance.now() - started) / 1_000, rssKiB: Number(rss), cpuS });
+      }
+    } catch { /* the process ended */ }
+  };
+  const timer = setInterval(tick, intervalMs);
+  void tick();
+  return { samples, stop() { stopped = true; clearInterval(timer); } };
+}
+
+/** The child of `parentPid` (the job under /usr/bin/time), polled until it appears. */
+async function childPid(parentPid, { attempts = 50 } = {}) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const { stdout } = await execFileAsync("/usr/bin/pgrep", ["-P", String(parentPid)]);
+      const pid = Number(stdout.trim().split("\n")[0]);
+      if (Number.isSafeInteger(pid) && pid > 0) return pid;
+    } catch { /* not yet */ }
+    await new Promise((wait) => setTimeout(wait, 100));
+  }
+  return null;
+}
+
+/** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
+async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile }) {
+  const started = performance.now();
+  const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
+    cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile), stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exited = new Promise((resolveExit) => child.on("close", (code) => resolveExit(code)));
+  const pid = await childPid(child.pid);
+  const sampler = pid === null ? null : sampleProcess(pid, { started });
+  const code = await exited;
+  sampler?.stop();
+  const exitCode = typeof code === "number" ? code : 1;
   const wallMs = Math.round(performance.now() - started);
   await writeFile(join(outDir, `${label}.stdout.json`), String(stdout));
   await writeFile(join(outDir, `${label}.stderr.txt`), String(stderr));
+  const samples = sampler?.samples ?? [];
+  await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
-    time: parseTimeL(stderr) };
+    time: parseTimeL(stderr),
+    utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 
 /**
@@ -157,13 +284,12 @@ async function runRefresh({ node22, endpoint, database, schema, outDir, label })
  * plan-checkpoint marker, so "stopped-unrefused" does not show that the plan
  * checkpoint was reached.
  */
-async function guardProbe({ node22, endpoint, database, schema, waitMs = 600_000 }) {
+async function guardProbe({ node22, endpoint, database, schema, profile, waitMs = 600_000 }) {
   return new Promise((resolveProbe) => {
-    const child = spawn(node22, [`--max-old-space-size=${PRODUCTION_PROFILE.heapMiB}`, DIST_REFRESH, "--mode=full",
-      `--now=${PROD_SHAPE_REFRESH_NOW}`, `--schema=${schema}`], {
+    const child = spawn(node22, refreshArguments(profile, schema), {
       cwd: CLOUD_RUN_ROOT, stdio: ["ignore", "pipe", "pipe"],
-      env: refreshEnv(endpoint, database, {
-        ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: String(PRODUCTION_PROFILE.taskTimeoutSeconds) }),
+      env: refreshEnv(endpoint, database, profile, {
+        ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: String(profile.taskTimeoutSeconds) }),
     });
     let stdout = "", stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -174,7 +300,7 @@ async function guardProbe({ node22, endpoint, database, schema, waitMs = 600_000
       clearTimeout(timer);
       const error = lastJson(stderr);
       const refused = /^ANALYTICS_V2_REFRESH_DEADLINE_/u.test(error?.code ?? "");
-      resolveProbe({ taskTimeoutSeconds: PRODUCTION_PROFILE.taskTimeoutSeconds, waitMs, exitCode: code, signal,
+      resolveProbe({ taskTimeoutSeconds: profile.taskTimeoutSeconds, waitMs, exitCode: code, signal,
         elapsedMs: Math.round(performance.now() - started),
         outcome: refused ? "refused" : code === null && signal === "SIGTERM" ? "stopped-unrefused" : "exited",
         refusalCode: refused ? error.code : null,
@@ -184,7 +310,7 @@ async function guardProbe({ node22, endpoint, database, schema, waitMs = 600_000
 }
 
 /** Rows and bytes of every analytics_v2 table, and the published payload bytes. */
-async function outputSizes(pool, schema) {
+export async function outputSizes(pool, schema) {
   const quoted = `"${schema}"`;
   const tables = await pool.query(`SELECT c.relname AS name, pg_total_relation_size(c.oid)::bigint AS bytes,
       pg_relation_size(c.oid)::bigint AS heap_bytes FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -202,6 +328,51 @@ async function outputSizes(pool, schema) {
       payloadBytes: Number(payloads.rows[0].bytes), maxPayloadBytes: payloads.rows[0].max_bytes } };
 }
 
+/**
+ * A content digest of every output table: sha256 over the sorted md5 of each
+ * row's JSON with OUTPUT_DIGEST_VOLATILE_KEYS removed. Equal digests mean the
+ * same stored rows, whatever the run's identity, stamps or clock instants.
+ */
+export async function outputDigests(pool, schema) {
+  const tables = await pool.query(`SELECT c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE 'analytics_v2%' ORDER BY c.relname`, [schema]);
+  const out = {};
+  for (const { name } of tables.rows) {
+    if (OUTPUT_DIGEST_SKIPPED_TABLES.has(name)) continue;
+    const result = await pool.query(`SELECT count(*)::bigint AS rows,
+        encode(sha256(convert_to(COALESCE(string_agg(h, '' ORDER BY h), ''), 'UTF8')), 'hex') AS sha256
+      FROM (SELECT md5((to_jsonb(t) - $1::text[])::text) AS h FROM "${schema}"."${name}" t) s`,
+    [OUTPUT_DIGEST_VOLATILE_KEYS]);
+    out[name] = { rows: Number(result.rows[0].rows), sha256: result.rows[0].sha256 };
+  }
+  return out;
+}
+
+/**
+ * The newest run row's per-owner resource record (analytics_v2_runs.timings
+ * owners: estimate, heap peak, output bytes and counts), with each owner
+ * named by a 12-hex prefix of its digest only, plus the run's stamps.
+ */
+export async function runRecord(pool, schema) {
+  const result = await pool.query(`SELECT timings, kernel_id, manifest_version, compatibility_sha256,
+      exclusions_sha256, extract(epoch FROM finished_at - started_at)::float8 AS seconds
+    FROM "${schema}".analytics_v2_runs ORDER BY finished_at DESC LIMIT 1`);
+  const row = result.rows[0];
+  if (row === undefined) return null;
+  const MIB = 1_048_576;
+  const owners = (Array.isArray(row.timings?.owners) ? row.timings.owners : []).map((owner) => ({
+    owner: String(owner.ownerDigest ?? "").slice(0, 12), admitted: owner.admitted === true,
+    usage: owner.usage ?? null, quota: owner.quota ?? null, session: owner.session ?? null,
+    analysisUsage: owner.analysisUsage ?? null,
+    estimateMiB: Number.isSafeInteger(owner.estimateBytes) ? Math.ceil(owner.estimateBytes / MIB) : null,
+    heapPeakMiB: Number.isSafeInteger(owner.heapPeakBytes) ? Math.ceil(owner.heapPeakBytes / MIB) : null,
+    outputMiB: Number.isSafeInteger(owner.outputBytes) ? Math.ceil(owner.outputBytes / MIB) : null,
+  })).sort((left, right) => (right.estimateMiB ?? 0) - (left.estimateMiB ?? 0));
+  return { kernelId: row.kernel_id, manifestVersion: row.manifest_version,
+    compatibilitySha256: row.compatibility_sha256, exclusionsSha256: row.exclusions_sha256,
+    runSeconds: row.seconds, owners };
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (!existsSync(options.node22)) fail("MEAS_SYNTH_NODE22_MISSING");
@@ -213,14 +384,17 @@ async function main() {
   const outDir = dirname(options.out);
   await mkdir(outDir, { recursive: true });
   const database = options.reuseDatabase ?? `meas_synth_${randomBytes(4).toString("hex")}`;
-  const suffix = createHashSuffix(database);
+  // A clone keeps its template's schema, named from the template's suffix.
+  const suffix = createHashSuffix(options.cloneFrom ?? database);
   const { schema, controlSchema } = fastpathRehearsalSchemas(suffix);
   const report = {
     schemaVersion: "gcp-fastpath-prod-shape-local-measurement-v1",
     startedAt: new Date().toISOString(),
     node: { driver: process.version, analyticsRefresh: node22Version },
-    database, schema, reusedDatabase: options.reuseDatabase !== null,
-    profile: PRODUCTION_PROFILE, refreshNow: PROD_SHAPE_REFRESH_NOW,
+    database, schema, reusedDatabase: options.reuseDatabase !== null, clonedFrom: options.cloneFrom,
+    profile: options.profile, refreshArguments: refreshArguments(options.profile, schema).slice(1)
+      .map((argument) => (argument === DIST_REFRESH ? "dist/analytics-refresh.mjs" : argument)),
+    refreshNow: PROD_SHAPE_REFRESH_NOW,
     corpus: { sealedSha256: corpus.manifest.sealed.sha256, scale: corpus.manifest.corpus.scale,
       owners: corpus.manifest.owners.length, totals: corpus.manifest.totals, own3: corpus.manifest.own3 },
     steps: {},
@@ -235,11 +409,19 @@ async function main() {
     if (options.reuseDatabase === null) {
       const exists = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", [database]);
       if (exists.rows.length > 0) fail("MEAS_SYNTH_DATABASE_EXISTS");
-      await admin.query(`CREATE DATABASE "${database}"`);
+      if (options.cloneFrom !== null) {
+        const source = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", [options.cloneFrom]);
+        if (source.rows.length !== 1) fail("MEAS_SYNTH_DATABASE_INVALID", "--clone-from names no database");
+        const cloneStarted = performance.now();
+        await admin.query(`CREATE DATABASE "${database}" TEMPLATE "${options.cloneFrom}"`);
+        report.steps.clone = { from: options.cloneFrom, ms: Math.round(performance.now() - cloneStarted) };
+      } else {
+        await admin.query(`CREATE DATABASE "${database}"`);
+      }
       created = true;
     }
     pool = poolFor(endpoint, database);
-    if (options.reuseDatabase === null) {
+    if (options.reuseDatabase === null && options.cloneFrom === null) {
       const migrateStarted = performance.now();
       for (const name of [schema, controlSchema]) await pool.query(`CREATE SCHEMA "${name}"`);
       const primary = await applyPostgresMigrations({ role: "primary", schema, pool });
@@ -257,20 +439,30 @@ async function main() {
       }
       await save();
     }
-    console.error(`# refresh (production profile) on ${schema}`);
-    const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1" });
+    if (options.importOnly) {
+      report.finishedAt = new Date().toISOString();
+      await save();
+      return;
+    }
+    console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
+    const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
+      profile: options.profile });
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
-      timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null,
+      timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
+      utilisation: run.utilisation,
       owners: run.receipt?.owners ?? null, ownerDays: run.receipt?.ownerDays ?? null,
       refusals: run.receipt?.refusals ?? null, refusalsByReason: run.receipt?.refusalsByReason ?? null,
       published: Array.isArray(run.receipt?.published) ? run.receipt.published.length : null,
       blocked: run.receipt?.blocked ?? null, error: run.error, time: run.time };
     await save();
     report.steps.outputs = await outputSizes(pool, schema);
+    report.steps.outputDigests = await outputDigests(pool, schema);
+    report.steps.run = await runRecord(pool, schema);
     await save();
     if (options.guardProbe) {
       console.error("# guard probe (task timeout 14,400 s)");
-      report.steps.guardProbe = await guardProbe({ node22: options.node22, endpoint, database, schema });
+      report.steps.guardProbe = await guardProbe({ node22: options.node22, endpoint, database, schema,
+        profile: options.profile });
       await save();
     }
     report.finishedAt = new Date().toISOString();
@@ -293,8 +485,10 @@ function createHashSuffix(database) {
   return database.slice("meas_synth_".length);
 }
 
-main().catch((error) => {
-  console.error(JSON.stringify({ status: "error", code: error?.code ?? "MEAS_SYNTH_FAILED",
-    message: String(error?.message ?? "").slice(0, 2_000) }));
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(JSON.stringify({ status: "error", code: error?.code ?? "MEAS_SYNTH_FAILED",
+      message: String(error?.message ?? "").slice(0, 2_000) }));
+    process.exitCode = 1;
+  });
+}

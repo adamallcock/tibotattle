@@ -159,8 +159,10 @@ import {
   normalizeIamUser,
 } from "./cloud-sql.mjs";
 import {
+  FASTPATH_MEASUREMENT_CLOUD_TARGET,
   FASTPATH_TEST_CLOUD_TARGET,
   FASTPATH_TEST_SCHEMA_PREFIXES,
+  isFastpathMeasurementInstanceConnectionName,
   isFastpathTestSchema,
 } from "./origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
@@ -309,8 +311,12 @@ const INSTANCE_CONNECTION_NAME =
 const DATABASE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
 // A disposable rehearsal instance (postgres-production-migrations.mjs SCRATCH_INSTANCE_PATTERN).
 const SCRATCH_INSTANCE = /-rehearsal-[a-z0-9]{8}b?$/u;
-/** Tokens that mark a test or rehearsal resource; a production target refuses them. */
-const TEST_TOKENS = Object.freeze(["test", "rehearsal", "fastpath"]);
+/**
+ * Tokens that mark a test, rehearsal or measurement resource; a production
+ * target refuses them ("meas": the disposable measurement instances,
+ * FASTPATH_MEASUREMENT_CLOUD_TARGET).
+ */
+const TEST_TOKENS = Object.freeze(["test", "rehearsal", "fastpath", "meas"]);
 /** Schema prefixes of the test and rehearsal estates (refused under a production target). */
 const TEST_SCHEMA_PREFIXES = Object.freeze([
   ...FASTPATH_TEST_SCHEMA_PREFIXES,
@@ -517,6 +523,7 @@ function testTargetIdentities() {
     `${iam.postgres.iamUser}.gserviceaccount.com`,
     fastpath.instanceConnectionName, fastpath.database, fastpath.primarySchema,
     fastpath.iamUser, `${fastpath.iamUser}.gserviceaccount.com`, fastpath.refreshJob, fastpath.originService,
+    FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob,
   ]);
 }
 const TEST_TARGET_VALUES = testTargetIdentities();
@@ -641,6 +648,10 @@ export async function readAnalyticsRefreshProductionTarget(env = {}) {
     }
   }
   const instance = instanceConnectionName.split(":")[2];
+  if (isFastpathMeasurementInstanceConnectionName(instanceConnectionName)
+      || instance.startsWith(FASTPATH_MEASUREMENT_CLOUD_TARGET.instancePrefix)) {
+    fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", { field: "PRIMARY_INSTANCE_CONNECTION_NAME" });
+  }
   if (SCRATCH_INSTANCE.test(instance)) fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN",
     { field: "PRIMARY_INSTANCE_CONNECTION_NAME" });
   if (TEST_SCHEMA_PREFIXES.some((prefix) => schema.startsWith(prefix))) {
@@ -764,8 +775,10 @@ async function privateSocketDirectory(directory) {
  * a Cloud Run Job may reach only the private test primary: the shared test
  * database, or, for the fast-path refresh Job alone, the disposable fast-path
  * database and only a pinned or seeded fast-path schema (`schema`, the parsed
- * --schema). Anywhere else only a loopback or private-socket PostgreSQL is
- * accepted.
+ * --schema); the measurement refresh Job alone
+ * (FASTPATH_MEASUREMENT_CLOUD_TARGET) reaches a disposable measurement
+ * instance's fast-path database, a seeded schema only. Anywhere else only a
+ * loopback or private-socket PostgreSQL is accepted.
  */
 export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {}) {
   const production = await readAnalyticsRefreshProductionTarget(env);
@@ -782,16 +795,26 @@ export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {})
   if (typeof env.CLOUD_RUN_JOB === "string" && env.CLOUD_RUN_JOB.length > 0) {
     if (env.K_SERVICE !== undefined) fail("ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
     const fastpath = env.CLOUD_RUN_JOB === FASTPATH_TEST_CLOUD_TARGET.refreshJob;
+    const measurement = env.CLOUD_RUN_JOB === FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob;
     const target = fastpath
       ? { instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
         database: FASTPATH_TEST_CLOUD_TARGET.database }
-      : CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
-    if (env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
+      : measurement
+        // The measurement Job: any measurement instance (by name), never another.
+        ? { instanceConnectionName: isFastpathMeasurementInstanceConnectionName(env.PRIMARY_INSTANCE_CONNECTION_NAME)
+          ? env.PRIMARY_INSTANCE_CONNECTION_NAME : null,
+        database: FASTPATH_MEASUREMENT_CLOUD_TARGET.database }
+        : CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
+    if (target.instanceConnectionName === null || env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
         || env.PRIMARY_DATABASE !== target.database) {
       fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
     }
     if (fastpath && !(isFastpathTestSchema(schema) && (schema === FASTPATH_TEST_CLOUD_TARGET.primarySchema
         || schema.startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)))) {
+      fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
+    }
+    if (measurement && !(isFastpathTestSchema(schema)
+        && schema.startsWith(FASTPATH_MEASUREMENT_CLOUD_TARGET.seededSchemaPrefix))) {
       fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
     }
     let iamUser;
