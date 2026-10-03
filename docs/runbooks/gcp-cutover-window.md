@@ -124,7 +124,7 @@ a no-go.
 |---|---|---|
 | Production line known | OWN-1, OAI-2 | The production commit P is recorded from the live health and its ancestry checked against `d43c8f92` |
 | Catch-up to P | OAI-3 to OAI-9, F-REDERIVE, F-REGISTRY, F-V12P if it applies | Kernels, packages and contracts match P. Renumbered D1 migrations match production's applied tail (the seal's expected ledger depends on it) |
-| Route decisions | OWN-2, OWN-3, E-PORTS | Kept and retired routes are decided from production traffic counts. Retired routes answer `503 POSTGRES_ROUTE_NOT_PORTED` or are ported |
+| Route decisions | OWN-2, OWN-3, E-PORTS, ROUTES-R12 | Decided in round 12 (2026-10-02) and built in the registry (`cloud-run/postgres-production-registry.mjs`): legacy enroll, Google and Apple sign-in, security reset, participant export, the performance device and consent routes and v0.x uploads are retired and answer `503 POSTGRES_ROUTE_NOT_PORTED` with no `retry-after`; the accountless performance authorization answers production's definite `403 TELEMETRY_TRANSPORT_BLOCKED`; credential renew, disconnect and the OD-CR-1 session-authority routes stay ported |
 | Origin code | C-SIMP, C-ADMIN, C-MAINT, C-REFRESH, D-CRB, D-PT5A, D-OPS3, D-OPS4, D-BLOB, E-PT8 | Merged on the deploy line and green. The status of each at the time of writing is in [open gaps](#open-gaps-in-tooling-and-decisions) |
 | Estate | PROD-1, OWN-5, OWN-5b, OWN-5c, OPS2-READ | The OPS-2 plan was applied by the owner and its readback reads clean. The first live readback parsed correctly on the test project |
 | Secrets | PROD-2, OWN-6, OWN-6b | Secret Manager is populated and the envelope keys are identical. `IDENTITY_LINK_SECRET` is the newly generated version the desired state mounts: the production value is lost, so the cutover rotates the pin ([identity-link rotation](#identity-link-rotation-round-16)). Nobody has written a new value into the Cloudflare Worker's `IDENTITY_LINK_SECRET`. The Cloudflare edge secrets are in place and the typed baseline was recaptured after each put |
@@ -704,7 +704,7 @@ the target is final for this seal.
 | `CUTOVER_IDENTITY_ROTATION_INVALID`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH` | P8-R | The rotation document does not hash to the inputs' digest or is malformed, its `from` is not the sealed row, or the pin is not its `to`. Recompute it with `identity-rotate-pin` |
 | `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8-R, `identity-rotate-pin` | Under a rotation the labels are the origin's, not inputs: `to`, the pin and `expectedIdentityKeyVersion` must be `PRODUCTION_IDENTITY_LINK_SECRET_VERSION` (`production-v2`) and `from` one of `PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS` (`production-v1`), from `postgres-production-configuration.mjs`. Every step that reads the rotation re-checks this |
 | `CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE` | `identity-rotate-pin` | The sealed-pin file is not a private regular file: group or other permission bits (a plain redirect under umask 022 is `0644`), another owner, a second link, a symlink in its path, empty, over 64 KiB or absent. Recreate it under `umask 077` (step 1) |
-| `CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED` | P8-R | A route that reads the identity-link pin, link keys or cooldowns is classified other than `od-cr-2` in the registry. At preflight this is the registry classification only (every consumer is `od-cr-2`, which the default ported set excludes); the real ported set is refused at host boot (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`). A rotation is not admissible; stop |
+| `CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED` | P8-R | A route that reads the identity-link pin, link keys or cooldowns is classified other than `retired` in the registry. At preflight this is the registry classification only (every consumer is `retired`, which the default ported set excludes); the real ported set is refused at host boot (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`). A rotation is not admissible; stop |
 | `CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`, `CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH` | P8 | The committed production desired state mounts no numeric version, or the pin names another secret or version than the mount |
 | `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable, still has a placeholder project, or its `scheduler` map is not a set of job names that includes `analytics-refresh` |
 | `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
@@ -810,7 +810,7 @@ Steps:
    `to` (`CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH`), and the pin must name the
    desired state's mount (P8's mount codes). The consumer refusal
    (`CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED`) at preflight checks the
-   registry classification: every identity-link consumer must be `od-cr-2`.
+   registry classification: every identity-link consumer must be `retired`.
    It cannot see the TypeScript ported set; the host's boot refusal below
    covers that. GO prints
    `identityRotationAuthorizationToken` beside the run token. It is bound to
@@ -1147,7 +1147,7 @@ line at `2b5c90cd`.
 | Import orchestrator and finalize sequencing | H.4 | `built` (E-PT8) on a synthetic seal and a local PostgreSQL 17 target only; the production transfer identity and its Cloud SQL Auth Proxy connection are not provisioned (PT8-I) |
 | Read-only pre-fence quiescence query | H.1 | `built` (E-QUIESCE); not yet run against the provider |
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
-| Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `built` behind the Access chokepoint but not selected (D-CRB): the admin host answers `503 POSTGRES_ROUTE_NOT_PORTED` until ADMIN-R12 flips the policy; the overview answers 503 until its sources exist (E-ADMIN) |
+| Admin routes at the origin | H.7 | `built` (C-ADMIN, ADMIN-R12): the production and staging composition opens the admin host behind the Access chokepoint (round 12). The overview is `admin-overview-v0.6`: the synthetic-contribution counts, historical publication and deletion-ledger blocks answer `{"status":"unavailable"}` until their sources exist (E-ADMIN); database health is `admin-database-health-v0.2`, the removed ledger `not_applicable`. The admin UI that reads both versions ships with the edge Worker; local proof only |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
 | Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |

@@ -1,8 +1,10 @@
 /**
  * GET /api/v1/admin/overview over PostgreSQL (GCP, C-ADMIN).
  *
- * The body is d43c8f92's 'admin-overview-v0.5' in typed storage mode:
- * handleAdminOverview composing readAdminOverview (admin-operations.ts) with
+ * The body is 'admin-overview-v0.6': d43c8f92's 'admin-overview-v0.5' in
+ * typed storage mode, plus the explicit unavailable state owner round 12
+ * decided (below). It is handleAdminOverview composing readAdminOverview
+ * (admin-operations.ts) with
  * readStorageAdminOverview (storage-admin-overview.ts), the upload-ingress
  * status, the distribution block and the typed reconstruction placeholder,
  * in the Worker's key order. Every block below names its GCP source:
@@ -30,9 +32,14 @@
  * - snapshots [] and pendingHistoricalRebuilds null: the Worker's typed values.
  *
  * Three blocks have no GCP data source on this line, and the module never
- * fills them with zeros or a guess. Each is an injected source; without it the
- * whole overview is the Worker's own 503 BACKEND_STORAGE_UNAVAILABLE, the
- * answer the Worker gives when any overview source cannot be read:
+ * fills them with zeros or a guess. Owner round 12 (2026-10-02, OWN-17
+ * questions 1 and 2: open the admin console with what is ported; sections
+ * with no GCP source show "unavailable", never an invented value) gives each
+ * an explicit closed unavailable state, POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE
+ * ({ status: "unavailable" }), in place of the whole overview's 503. That
+ * new variant is why the version moved from the Worker's v0.5 to v0.6; a
+ * block whose source the root injects keeps the Worker's exact v0.5 shape,
+ * which never carries a status key. The sources are built after cutover:
  *
  * - counts.contributions.synthetic: the D1 `contributions` table has no
  *   PostgreSQL relation (it is untransferred legacy state);
@@ -40,8 +47,13 @@
  *   graph-preview freshness have no analytics_v2 counterpart;
  * - deletionLedger: the deletion-ledger tombstones. The PostgreSQL line has
  *   no deletion ledger (decisions D2, D4 and D6 of 2026-09-26), so there is
- *   no reader here; what the block reports once the ledger is gone is OWN-17
- *   question 1, and until it is answered the root injects nothing.
+ *   no reader here and the block stays unavailable. (The database-health
+ *   route reports the removed ledger's role as not_applicable.)
+ *
+ * An injected source that fails is still the Worker's own 503
+ * BACKEND_STORAGE_UNAVAILABLE (a reviewed ApiError keeps its code), as for
+ * every other block: unavailable means "no source", never "the source
+ * failed".
  *
  * All primary reads run in one REPEATABLE READ READ ONLY snapshot. A
  * reviewed ApiError (for example 503 COLLECTION_CONTROL_UNAVAILABLE) keeps its
@@ -63,7 +75,16 @@ import { parseStoredJson } from "./stored-record";
 import { parseTelemetryStorageMode } from "./telemetry-storage-mode";
 import { readUploadIngressStatus } from "./upload-ingress-admission";
 
-export const POSTGRES_ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.5" as const;
+export const POSTGRES_ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.6" as const;
+
+/** Round 12: the closed state of an overview block that has no GCP source. */
+export const POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE = Object.freeze({ status: "unavailable" } as const);
+export type PostgresAdminOverviewUnavailable = typeof POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE;
+
+/** The overview blocks that answer POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE without a source. */
+export const POSTGRES_ADMIN_OVERVIEW_SOURCELESS_BLOCKS = Object.freeze([
+  "syntheticContributions", "historicalPublication", "deletionLedger",
+] as const);
 
 /** d43c8f92 admin-operations.ts constants. */
 const DIAGNOSTIC_RETENTION_DAYS = 30;
@@ -499,12 +520,20 @@ function typedOverview(typed: TypedRead) {
   };
 }
 
-async function required<T>(source: (() => Promise<T>) | undefined): Promise<T> {
+/** An injected source's block, or the explicit unavailable state when there is none. */
+async function sourced<T>(
+  source: (() => Promise<T>) | undefined,
+): Promise<T | PostgresAdminOverviewUnavailable> {
+  if (source === undefined) return POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE;
   if (typeof source !== "function") unavailable();
   return source();
 }
 
-/** The 'admin-overview-v0.5' body, or an ApiError (503 unless a reviewed code). */
+function isUnavailable(value: unknown): value is PostgresAdminOverviewUnavailable {
+  return value === POSTGRES_ADMIN_OVERVIEW_UNAVAILABLE;
+}
+
+/** The 'admin-overview-v0.6' body, or an ApiError (503 unless a reviewed code). */
 export async function readPostgresAdminOverview(
   options: PostgresAdminOverviewOptions,
 ): Promise<Record<string, unknown>> {
@@ -525,9 +554,9 @@ export async function readPostgresAdminOverview(
   const [primaryResult, synthetic, historicalPublication, deletionLedger, ingress, distribution] =
     await Promise.allSettled([
       readPrimary(pool, schema, mode.sourceNamespace, at, nowEpoch, diagnosticReference),
-      required(sources.syntheticContributions),
-      required(sources.historicalPublication),
-      required(sources.deletionLedger),
+      sourced(sources.syntheticContributions),
+      sourced(sources.historicalPublication),
+      sourced(sources.deletionLedger),
       readUploadIngressStatus(env as unknown as Env),
       readPostgresAdminDistribution(pool, schema, env, nowEpoch),
     ]);
@@ -568,7 +597,7 @@ export async function readPostgresAdminOverview(
       },
       contributions: {
         contributingAccounts: typed.contributions.contributingAccounts,
-        synthetic: {
+        synthetic: isUnavailable(syntheticCounts) ? syntheticCounts : {
           total: syntheticCounts.total,
           bounded: syntheticCounts.bounded,
           accepted: syntheticCounts.accepted,

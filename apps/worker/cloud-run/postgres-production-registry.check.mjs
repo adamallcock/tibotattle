@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { after, before, test } from "node:test";
@@ -8,7 +9,6 @@ import {
   ADMIN_HOST_ROUTE_IDS,
   IDENTITY_LINK_CONSUMER_ROUTE_IDS,
   OD_CR_1_CONTESTED_ROUTE_IDS,
-  OD_CR_2_UNPORTED_ROUTE_IDS,
   ORIGIN_ROOT_ROUTE_IDS,
   ORIGIN_ROUTE_DISPOSITIONS,
   POSTGRES_SCOPE_ROUTE_IDS,
@@ -16,7 +16,10 @@ import {
   PRODUCTION_ROUTE_PARITY_BASIS,
   PRODUCTION_ROUTE_REGISTRY_CODES,
   PRODUCTION_ROUTE_TABLE,
+  RETIRED_DEFINITE_ROUTE_IDS,
   RETIRED_ONLINE_ERASURE_SURFACES,
+  RETIRED_ROUTE_DEFINITE_ANSWERS,
+  RETIRED_ROUTE_IDS,
   assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
   isProductionRouteRegistry,
@@ -25,7 +28,8 @@ import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./orig
 
 // CR-6 registry without a database: the pinned d43c8f92 route table against
 // the Worker's own WORKER_ROUTE_POLICY, the injected ported set (scope, the
-// OD-CR-1 contested routes and the OD-CR-2 admin routes), the production
+// OD-CR-1 contested routes and the OD-CR-2 admin routes), the round-12
+// retired routes (the uniform 503 and the one definite 4xx), the production
 // list in src/backend-composition.ts, the route-module fold (one registry)
 // and every closed refusal. Every handler is a synthetic stub.
 
@@ -69,6 +73,16 @@ const BRIEF_CONTESTED = Object.freeze([
   "session", "logout", "participant_devices", "participant_device_revocation", "device_pairing",
   "device_pairing_claim", "telemetry_v12_consent", "device_disconnect", "device_credential_renew",
 ]);
+/** Owner round 12 (2026-10-02): retired at the switch, listed independently of the table. */
+const ROUND_12_RETIRED = Object.freeze([
+  "enroll", "identity_google_start", "identity_google_callback", "identity_google_result", "identity_apple_start",
+  "identity_apple_callback", "identity_apple_result", "security_reset", "participant_export",
+  "telemetry_performance_capabilities", "telemetry_performance_consent", "telemetry_performance_reports",
+]);
+/** Round 12: production's definite answer, read from d43c8f92 (telemetry-performance-policy.ts invalid()). */
+const ROUND_12_DEFINITE = Object.freeze({
+  accountless_telemetry_performance_authorization: { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" },
+});
 const EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
 
 const observedCodes = new Set();
@@ -130,8 +144,12 @@ test("the table is the d43c8f92 policy: 51 routes in Worker order, one class eac
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.SCOPE), 21);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_1), 9);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 6);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_2), 13);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED), 12);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED_DEFINITE), 1);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.ROOT), 2);
+  // Every round-12 question is answered: no route is left undecided.
+  assert.deepEqual(Object.values(PRODUCTION_ROUTE_CLASSES).sort(),
+    ["admin", "od-cr-1", "retired", "retired-definite", "root", "scope"]);
 });
 
 test("the class lists match the brief and the production ported list", () => {
@@ -139,8 +157,8 @@ test("the class lists match the brief and the production ported list", () => {
   assert.deepEqual([...OD_CR_1_CONTESTED_ROUTE_IDS].sort(), [...BRIEF_CONTESTED].sort());
   assert.deepEqual([...ORIGIN_ROOT_ROUTE_IDS], ["apple_domain_association", "sparkle_appcast_guard"]);
   const all = new Set([...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS,
-    ...ADMIN_HOST_ROUTE_IDS, ...OD_CR_2_UNPORTED_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
-  assert.equal(all.size, 51, "the five classes are disjoint and cover the policy");
+    ...ADMIN_HOST_ROUTE_IDS, ...RETIRED_ROUTE_IDS, ...RETIRED_DEFINITE_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
+  assert.equal(all.size, 51, "the six classes are disjoint and cover the policy");
   // The production list (src/backend-composition.ts, OD-CR-1: all nine) is
   // scope plus the contested routes, in Worker order; the edge-test and
   // loopback origins serve exactly this list too.
@@ -151,13 +169,54 @@ test("the class lists match the brief and the production ported list", () => {
   const admin = policy.filter((route) => route.authority === "admin").map((route) => route.id);
   assert.deepEqual([...ADMIN_HOST_ROUTE_IDS], admin);
   assert.deepEqual([...productionAdminRouteIds], admin);
-  assert.equal(OD_CR_2_UNPORTED_ROUTE_IDS.length, 13);
-  for (const id of ["enroll", "identity_google_start", "identity_google_callback", "identity_google_result",
-    "identity_apple_start", "identity_apple_callback", "identity_apple_result", "security_reset",
-    "participant_export", "telemetry_performance_capabilities", "telemetry_performance_consent",
-    "telemetry_performance_reports", "accountless_telemetry_performance_authorization"]) {
-    assert.ok(OD_CR_2_UNPORTED_ROUTE_IDS.includes(id), id);
+  // Round 12: the retired routes and the one definite answer, exactly.
+  assert.deepEqual([...RETIRED_ROUTE_IDS].sort(), [...ROUND_12_RETIRED].sort());
+  assert.deepEqual([...RETIRED_DEFINITE_ROUTE_IDS], Object.keys(ROUND_12_DEFINITE));
+  assert.deepEqual(JSON.parse(JSON.stringify(RETIRED_ROUTE_DEFINITE_ANSWERS)), ROUND_12_DEFINITE);
+  assert.deepEqual(Object.keys(RETIRED_ROUTE_DEFINITE_ANSWERS), [...RETIRED_DEFINITE_ROUTE_IDS]);
+  assert.ok(Object.isFrozen(RETIRED_ROUTE_DEFINITE_ANSWERS));
+  for (const answer of Object.values(RETIRED_ROUTE_DEFINITE_ANSWERS)) {
+    assert.ok(Object.isFrozen(answer));
+    assert.ok(answer.status >= 400 && answer.status < 500, "a definite answer is a 4xx, never retryable");
   }
+  // Round 12 keeps credential renew, disconnect and every OD-CR-1 session-authority port.
+  for (const id of ["device_credential_renew", "device_disconnect", "session", "logout", "device_pairing",
+    "device_pairing_claim", "participant_devices", "participant_device_revocation", "telemetry_v12_consent"]) {
+    assert.ok(OD_CR_1_CONTESTED_ROUTE_IDS.includes(id), id);
+    assert.ok(productionPortedRouteIds.includes(id), id);
+  }
+});
+
+test("round 12: the definite answer is production's d43c8f92 code for the route", async () => {
+  // The Worker grants the accountless performance authorization only while
+  // telemetry_performance_runtime is 'active'; ingestion-isolation 0009 seeds
+  // it 'staged', so the grant's owner query finds no row and answers its
+  // invalid(): 403 TELEMETRY_TRANSPORT_BLOCKED. Read from the parity basis.
+  const show = (path) => new Promise((resolveShow, rejectShow) => {
+    execFile("git", ["show", `${PRODUCTION_ROUTE_PARITY_BASIS.commit}:${path}`], { cwd: WORKER_ROOT,
+      maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => (error ? rejectShow(error) : resolveShow(stdout)));
+  });
+  let policySource;
+  let migration;
+  let index;
+  try {
+    [policySource, migration, index] = await Promise.all([
+      show("apps/worker/src/telemetry-performance-policy.ts"),
+      show("apps/worker/ingestion-isolation-migrations/0009_performance_reports.sql"),
+      show("apps/worker/src/index.ts"),
+    ]);
+  } catch {
+    // A shallow checkout without the parity basis cannot read it; the
+    // pinned answer above still holds the decision.
+    return;
+  }
+  assert.match(policySource, /function invalid\(code: "TELEMETRY_TRANSPORT_BLOCKED"[^)]*= "TELEMETRY_TRANSPORT_BLOCKED"\): never \{\s*throw new ApiError\(403, code\);/u);
+  const grant = policySource.slice(policySource.indexOf("export async function grantTelemetryPerformanceAccountlessAuthorization"));
+  assert.match(grant, /AND r\.state = 'active'[\s\S]*?if \(!owner\) invalid\(\);/u);
+  assert.match(migration, /INSERT INTO telemetry_performance_runtime[\s\S]*?'staged', 1,/u);
+  assert.match(index, /case "accountless_telemetry_performance_authorization":\s*return handleAccountlessTelemetryPerformanceAuthorization\(request, env\);/u);
+  assert.deepEqual(RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization,
+    { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
 });
 
 test("online erasure is retired: no policy route, DELETE /api/v1/me is unknown_api", () => {
@@ -191,51 +250,63 @@ function assertCoverage(registry, portedIds) {
   assert.deepEqual([...registry.rootRouteIds], [...ORIGIN_ROOT_ROUTE_IDS]);
   const expectedUnported = policy
     .map((route) => route.id)
-    .filter((id) => !portedSet.has(id) && !ORIGIN_ROOT_ROUTE_IDS.includes(id))
+    .filter((id) => !portedSet.has(id) && !ORIGIN_ROOT_ROUTE_IDS.includes(id) && !RETIRED_DEFINITE_ROUTE_IDS.includes(id))
     .sort();
   assert.deepEqual([...registry.unportedRouteIds], expectedUnported, "sorted");
-  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.rootRouteIds.length, 51);
+  assert.deepEqual([...registry.definiteRouteIds], [...RETIRED_DEFINITE_ROUTE_IDS]);
+  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.definiteRouteIds.length
+    + registry.rootRouteIds.length, 51);
   for (const route of policy) {
     const resolved = registry.resolve(route.id);
     assert.ok(Object.isFrozen(resolved));
-    assert.deepEqual(Object.keys(resolved), ["disposition", "handler"]);
+    assert.deepEqual(Object.keys(resolved), ["disposition", "handler", "answer"]);
     if (ORIGIN_ROOT_ROUTE_IDS.includes(route.id)) {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.ROOT, route.id);
       assert.equal(resolved.handler, null);
+      assert.equal(resolved.answer, null);
     } else if (portedSet.has(route.id)) {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.PORTED, route.id);
       assert.equal(resolved.handler.routeId, route.id);
+      assert.equal(resolved.answer, null);
+    } else if (RETIRED_DEFINITE_ROUTE_IDS.includes(route.id)) {
+      assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.DEFINITE, route.id);
+      assert.equal(resolved.handler, null);
+      assert.equal(resolved.answer, RETIRED_ROUTE_DEFINITE_ANSWERS[route.id]);
     } else {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.UNPORTED, route.id);
       assert.equal(resolved.handler, null);
+      assert.equal(resolved.answer, null);
     }
   }
 }
 
-test("scope only (OD-CR-1 answers none): 21 ported, 28 unported, 2 root", () => {
+test("scope only (OD-CR-1 answers none): 21 ported, 27 unported, 1 definite, 2 root", () => {
   const registry = build();
   assertCoverage(registry, POSTGRES_SCOPE_ROUTE_IDS);
   assert.equal(registry.portedRouteIds.length, 21);
-  assert.equal(registry.unportedRouteIds.length, 28);
+  assert.equal(registry.unportedRouteIds.length, 27);
   for (const id of OD_CR_1_CONTESTED_ROUTE_IDS) {
     assert.equal(registry.resolve(id).disposition, "unported", id);
   }
 });
 
-test("the production list (scope plus all nine contested routes): 30 ported, 19 unported, 2 root", () => {
+test("the production list (scope plus all nine contested routes): 30 ported, 18 unported, 1 definite, 2 root", () => {
   const registry = build({ portedRouteIds: productionPortedRouteIds });
   assertCoverage(registry, productionPortedRouteIds);
   assert.equal(registry.portedRouteIds.length, 30);
   assert.deepEqual([...registry.unportedRouteIds],
-    [...ADMIN_HOST_ROUTE_IDS, ...OD_CR_2_UNPORTED_ROUTE_IDS].sort());
+    [...ADMIN_HOST_ROUTE_IDS, ...RETIRED_ROUTE_IDS].sort());
 });
 
-test("an open admin host adds the six admin routes: 36 ported, 13 unported, 2 root", () => {
+test("an open admin host (round 12) adds the six admin routes: 36 ported, 12 retired, 1 definite, 2 root", () => {
   const ported = [...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS];
   const registry = build({ portedRouteIds: ported });
   assertCoverage(registry, ported);
   assert.equal(registry.portedRouteIds.length, 36);
-  assert.deepEqual([...registry.unportedRouteIds], [...OD_CR_2_UNPORTED_ROUTE_IDS].sort());
+  assert.deepEqual([...registry.unportedRouteIds], [...RETIRED_ROUTE_IDS].sort());
+  assert.deepEqual([...registry.definiteRouteIds], ["accountless_telemetry_performance_authorization"]);
+  assert.deepEqual({ ...registry.resolve("accountless_telemetry_performance_authorization") },
+    { disposition: "definite", handler: null, answer: ROUND_12_DEFINITE.accountless_telemetry_performance_authorization });
 });
 
 test("scope plus any single contested route, in any order of the injected list", () => {
@@ -325,21 +396,25 @@ test("PRODUCTION_ROUTE_ROOT_CLAIMED: a root route ported or given a handler", ()
   }
 });
 
-test("PRODUCTION_ROUTE_PORT_UNDECIDED: no od-cr-2 route can be ported without an owner answer", () => {
-  assert.equal(OD_CR_2_UNPORTED_ROUTE_IDS.length, 13);
-  for (const id of OD_CR_2_UNPORTED_ROUTE_IDS) {
+test("PRODUCTION_ROUTE_PORT_RETIRED: no round-12 retired route can be ported", () => {
+  assert.equal(RETIRED_ROUTE_IDS.length + RETIRED_DEFINITE_ROUTE_IDS.length, 13);
+  for (const id of [...RETIRED_ROUTE_IDS, ...RETIRED_DEFINITE_ROUTE_IDS]) {
     refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
-      "PRODUCTION_ROUTE_PORT_UNDECIDED", id);
+      "PRODUCTION_ROUTE_PORT_RETIRED", id);
+    // A handler offered for it is refused too, even without porting it.
+    const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
+    handlers.set(id, stub(id));
+    refused(() => build({ handlers }), "PRODUCTION_ROUTE_HANDLER_UNEXPECTED", `${id} handler`);
   }
 });
 
-test("IDENTITY_LINK_ROTATION_CONSUMER_PORTED: every identity-link consumer stays od-cr-2 and unported", () => {
+test("IDENTITY_LINK_ROTATION_CONSUMER_PORTED: every identity-link consumer stays retired and unported", () => {
   // Round 16 rotates the lost IDENTITY_LINK_SECRET only because round 12
   // retires every route that reads its pin, link keys or cooldown digests.
   assert.deepEqual([...IDENTITY_LINK_CONSUMER_ROUTE_IDS], ["enroll", "identity_google_start",
     "identity_google_callback", "identity_google_result", "identity_apple_start", "identity_apple_callback",
     "identity_apple_result", "security_reset", "participant_export"]);
-  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.ok(OD_CR_2_UNPORTED_ROUTE_IDS.includes(id), id);
+  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.ok(RETIRED_ROUTE_IDS.includes(id), id);
   // The production list (and an open admin host) ports none of them.
   assert.equal(assertIdentityLinkConsumersRetired([...productionPortedRouteIds]), 9);
   assert.equal(assertIdentityLinkConsumersRetired([...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS]), 9);
@@ -372,7 +447,8 @@ test("PRODUCTION_ROUTE_HANDLERS_INVALID: handlers must be a Map", () => {
 
 test("PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler outside the ported set", () => {
   const extraKeys = [
-    ...OD_CR_2_UNPORTED_ROUTE_IDS,
+    ...RETIRED_ROUTE_IDS,
+    ...RETIRED_DEFINITE_ROUTE_IDS,
     ...OD_CR_1_CONTESTED_ROUTE_IDS,
     ...ADMIN_HOST_ROUTE_IDS,
     EFFECTIVE_PAGE_PATH,

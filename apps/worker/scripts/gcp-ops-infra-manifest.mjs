@@ -74,6 +74,7 @@ import {
   PRODUCTION_RESOURCE_FINGERPRINT,
   PRODUCTION_RESOURCE_MARKER,
   REQUIRED_SECRET_NAMES,
+  RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES,
   STAGING_ADMISSION_MODES,
   STAGING_PROVIDED_VAR_NAMES,
   STAGING_RESOURCE_MARKER,
@@ -211,18 +212,16 @@ export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({
 export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({});
 
 /**
- * CR-3 secrets a production desired state may leave out (owner decision
- * 2026-10-02, round 12: Google and Apple sign-in are retired at the switch,
- * with no port). The committed production file leaves both out, so OPS-2
- * never makes a production container for them; its check pins that. Staging
- * keeps its inert synthetic copies, and the synthetic fixture keeps both so
- * the service render stays covered, until ROUTES-R12 narrows CR-3. While CR-3
- * still requires a secret the desired state leaves out, the service cannot
- * boot, so OPS-2 defers it (SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>).
- * Once ROUTES-R12 drops the names from CR-3, that deferral clears itself and
- * any file still naming them is refused as SECRET_UNKNOWN.
+ * The Google and Apple sign-in secrets owner round 12 (2026-10-02) retired
+ * at the switch, with no port. ROUTES-R12 removed them from CR-3
+ * (RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES), so they are no secret of either
+ * plane: a desired state that still names one is refused as
+ * SECRET_UNKNOWN:<name>, no template references them, and OPS-2 never makes
+ * a container for them. The staging plane's earlier inert copies stay in
+ * the test project's Secret Manager, unreferenced, until an owner decides to
+ * remove them; nothing here deletes them.
  */
-export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+export const RETIRED_PRODUCTION_SECRET_NAMES = RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES;
 
 /**
  * CR-3 optional secrets that nothing on the production estate reads, so a
@@ -241,9 +240,7 @@ export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIEN
 export const UNREAD_PRODUCTION_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
 
 /** Every CR-3 secret a production desired state may leave out. */
-export const PRODUCTION_OMITTABLE_SECRET_NAMES = Object.freeze([
-  ...RETIRED_PRODUCTION_SECRET_NAMES, ...UNREAD_PRODUCTION_SECRET_NAMES,
-]);
+export const PRODUCTION_OMITTABLE_SECRET_NAMES = Object.freeze([...UNREAD_PRODUCTION_SECRET_NAMES]);
 
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
   "runtime", "migrator", "scheduler", "builder", "edgeInvoker", "verifier",
@@ -1104,14 +1101,14 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   };
 
   // Secret Manager secrets: exactly CR-3's required and optional names (less,
-  // in production, the retired and unread ones), each named by its Secret
+  // in production, the unread one), each named by its Secret
   // Manager secret id, in its plane's form, and a pinned version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
     if (!secretNames.includes(name)) fail(`SECRET_UNKNOWN:${name}`);
   }
-  // Production may leave out a retired (round 12) or unread secret; every other name is required.
+  // Production may leave out an unread secret; every other name is required.
   const omittableSecretNames = environment === "production" ? PRODUCTION_OMITTABLE_SECRET_NAMES : [];
   const secrets = {};
   for (const name of secretNames) {
@@ -1508,9 +1505,7 @@ export function renderServiceTemplateValues(values, { templateText, environment 
  * Why the desired service's template cannot be rendered for any image, or
  * null: the environment has no service template (SERVICE_TEMPLATE_UNAVAILABLE),
  * the telemetry storage namespace is unassigned, a staging setting the
- * staging template needs is not yet there (stagingServiceBlocker), or the
- * desired state leaves out a retired secret that CR-3 still requires
- * (RETIRED_PRODUCTION_SECRET_NAMES).
+ * staging template needs is not yet there (stagingServiceBlocker).
  */
 export function serviceTemplateBlocker(desired) {
   if (Object.hasOwn(SERVICE_TEMPLATE_UNAVAILABLE, desired.environment)) {
@@ -1518,9 +1513,6 @@ export function serviceTemplateBlocker(desired) {
   }
   if (desired.service.telemetryStorageNamespace === null) return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
   if (desired.environment === "staging") return stagingServiceBlocker(desired);
-  // A secret the plane retired but CR-3 still requires: the service would not boot.
-  const retired = REQUIRED_SECRET_NAMES.find((name) => !Object.hasOwn(desired.secrets, name));
-  if (retired !== undefined) return `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${retired}`;
   return null;
 }
 
@@ -2026,16 +2018,14 @@ export function rolloutTarget(environment, { readFile, readSource } = {}) {
 export const SERVICE_COMPOSITION_PENDING = Object.freeze({});
 
 /**
- * The inert synthetic identity-provider identifiers the staging template
- * carries literally. They name no registered Google client, Apple service,
- * key or team; scripts/gcp-staging-secrets.mjs gives their secrets inert
- * synthetic values, so Google and Apple sign-in cannot complete on staging.
+ * The inert synthetic identity-provider identifier the staging template
+ * carries literally (CR-3's staging plane still requires the public Google
+ * client id). It names no registered Google client. Round 12 retired Google
+ * and Apple sign-in, so the plane mounts no sign-in secret and carries no
+ * Apple setting at all.
  */
 export const STAGING_INERT_IDENTITY_PROVIDER_VARS = Object.freeze({
   GOOGLE_OIDC_CLIENT_ID: "000000000000-tibotattlestaginginert.apps.googleusercontent.com",
-  APPLE_SERVICES_ID: "com.tibotattle.staging.inert",
-  APPLE_KEY_ID: "STAGINGK01",
-  APPLE_TEAM_ID: "STAGINGT01",
 });
 
 /** Every env name the staging service carries, in template order (the optional token may be omitted). */
@@ -2043,7 +2033,7 @@ export const STAGING_SERVICE_ENV_NAMES = Object.freeze([
   "HOST", "HOST_MODE", "HOST_ORIGIN", "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN", "DEPLOYMENT_SOURCE_COMMIT",
   "EDGE_ORIGIN_MODE", "EDGE_ORIGIN_AUDIENCE", "EDGE_INVOKER_SERVICE_ACCOUNT", "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS",
   "TELEMETRY_STORAGE_NAMESPACE", "STAGING_ADMISSION_MODE", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "ACCESS_ADMIN_EMAIL",
-  "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "APPLE_SERVICES_ID", "APPLE_KEY_ID", "APPLE_TEAM_ID",
+  "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID",
   "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
   "GCS_QUARANTINE_BUCKET_HISTORY_PROOF", ...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES,
 ]);

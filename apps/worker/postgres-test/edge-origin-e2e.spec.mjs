@@ -114,6 +114,7 @@ import {
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
 import { liveWriteRows } from "../scripts/edge-live-check.mjs";
+import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../cloud-run/postgres-production-registry.mjs";
 import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
 import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
@@ -518,6 +519,19 @@ function assertUnported(answer, label) {
   assert.equal(answer.header("cache-control"), "no-store", label);
 }
 
+/**
+ * A retired-definite route's answer through the edge (round 12): the
+ * registry's status and code in the Worker envelope, no-store, and no
+ * retry-after, never the unported 503.
+ */
+function assertDefinite(answer, expect, label) {
+  assert.equal(answer.status, expect.status, `${label}: ${answer.text}`);
+  assert.deepEqual(errorEnvelope(answer), { keys: ["error"], errorKeys: ["code", "requestId"], code: expect.code },
+    label);
+  assert.equal(answer.header("retry-after"), null, `${label}: no retry-after`);
+  assert.equal(answer.header("cache-control"), "no-store", label);
+}
+
 function errorEnvelope(answer) {
   const value = answer.json();
   if (value === null || typeof value !== "object" || value.error === null || typeof value.error !== "object") {
@@ -707,6 +721,7 @@ async function runRow(f, row, { edge = f.edge, reference = f.reference, ip = nex
     assert.deepEqual(transparencyMismatches(f, edgeAnswer, exchanges[0]), [], `${row.id}: transparency`);
   }
   if (row.comparators.includes("unported")) assertUnported(edgeAnswer, row.id);
+  if (row.comparators.includes("definite")) assertDefinite(edgeAnswer, row.expect, row.id);
   const expect = row.expect ?? {};
   if (expect.status !== undefined) assert.equal(edgeAnswer.status, expect.status, `${row.id}: ${edgeAnswer.text.slice(0, 300)}`);
   if (expect.code !== undefined) assert.equal(errorEnvelope(edgeAnswer)?.code, expect.code, row.id);
@@ -903,9 +918,9 @@ test("S2 admin: the Access chokepoint equals the Worker; owner admin APIs forwar
   // with distribution analytics configured an owner overview read starts the
   // Cloudflare GraphQL reads on that same single path. The front end serves
   // the synthetic JWKS and refuses api.cloudflare.com; the overview is the
-  // origin's closed unported 503 (the admin host is refused at the origin,
-  // OD-CR-3, until ADMIN-R12 opens it), so nothing is merged and the answer
-  // passes through.
+  // origin's closed unported 503 (the edge-test origin composes no admin
+  // family, so its admin host stays refused, OD-CR-3; production opens it,
+  // ADMIN-R12), so nothing is merged and the answer passes through.
   const jwksHost = "synthetic-edge.cloudflareaccess.com";
   const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
     upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(f.origin.port),
@@ -943,7 +958,8 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const f = await fixture();
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
-  for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS })) {
+  for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS,
+    definiteAnswers: RETIRED_ROUTE_DEFINITE_ANSWERS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
@@ -1445,7 +1461,7 @@ function v01Contribution() {
   };
 }
 
-test("S5 v1.0 and v0.1: the shipped backfill engine and the prepared-contribution uploader run through the edge", {
+test("S5 v1.0 and v0.1: the shipped backfill engine runs through the edge; the retired v0.1 uploader is the 503", {
   skip: SKIP, timeout: LONG,
 }, async () => {
   const f = await fixture();
@@ -1504,7 +1520,9 @@ test("S5 v1.0 and v0.1: the shipped backfill engine and the prepared-contributio
     await rm(directory, { recursive: true, force: true });
   }
 
-  // v0.1: a prepared contribution through the composed v0.1 envelope, then a replay.
+  // v0.1: owner round 12 retires v0.x uploads. The prepared contribution is
+  // authorized under the default v1.0 format, then refused before its claim
+  // with the uniform 503 through the edge, and nothing is admitted.
   const v01Log = [];
   const v01Fetch = edgeClientFetch(f, { log: v01Log });
   const v01Owner = await socialOwner(f, {
@@ -1518,20 +1536,19 @@ test("S5 v1.0 and v0.1: the shipped backfill engine and the prepared-contributio
     withDeviceSecret: async ({ expectedOrigin, operation }) =>
       operation(v01Owner.secret, { origin: expectedOrigin, deviceId: v01Owner.deviceId }),
   });
-  const accepted = await syncPrepared();
-  assert.equal(accepted.status, "accepted");
+  await assert.rejects(syncPrepared());
   const upload = v01Log.find((entry) => entry.path === CONTRIBUTIONS_PATH);
-  assert.equal(upload.status, 202);
+  assert.equal(upload.status, 503);
   const v01Rows = async () => (await base.query(`SELECT
       (SELECT count(*)::int FROM ${t("telemetry_contributions")} WHERE participant_id = $1) AS contributions,
       (SELECT count(*)::int FROM ${t("telemetry_records")} WHERE participant_id = $1) AS records`,
   [v01Owner.participantId])).rows[0];
-  assert.deepEqual(await v01Rows(), { contributions: 1, records: 2 });
-  assert.equal(f.objects.size > 0, true);
-  const v01Replay = await reupload(v01Fetch, EDGE_E2E_PUBLIC_ORIGIN, v01Owner.deviceAuthorization, upload.body);
-  assert.equal(v01Replay.status, 202);
-  assert.equal(v01Replay.headers.get("idempotency-replayed"), "true");
-  assert.deepEqual(await v01Rows(), { contributions: 1, records: 2 });
+  assert.deepEqual(await v01Rows(), { contributions: 0, records: 0 });
+  const v01Retry = await reupload(v01Fetch, EDGE_E2E_PUBLIC_ORIGIN, v01Owner.deviceAuthorization, upload.body);
+  assert.equal(v01Retry.status, 503);
+  assert.equal(v01Retry.headers.get("retry-after"), null);
+  assert.equal((await v01Retry.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED");
+  assert.deepEqual(await v01Rows(), { contributions: 0, records: 0 });
 });
 
 test("S5 personal routes: session, pairing create and claim, devices, revoke, disconnect and logout through the edge", {

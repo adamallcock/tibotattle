@@ -32,13 +32,13 @@ production estate reads unclean until that instance is deleted.
   words. In staging it is a `tibotattle-staging-` id of lowercase words.
 - An owner placeholder (`null` at `project`, `projectNumber`, `region` or
   `bucket.location`) is refused with `DESIRED_STATE_PLACEHOLDER_UNFILLED`.
-- Production may leave out the secrets round 12 retired with Google and Apple
-  sign-in (`RETIRED_PRODUCTION_SECRET_NAMES`: `GOOGLE_OIDC_CLIENT_SECRET`,
-  `APPLE_PRIVATE_KEY`), and the committed file does, so no production
-  container is made for them. Staging names all seven until ROUTES-R12
-  narrows CR-3. While CR-3 still requires a secret the file leaves out, the
-  service is deferred (`SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>`); that
-  clears itself when ROUTES-R12 drops the name.
+- The secrets round 12 retired with Google and Apple sign-in
+  (`RETIRED_PRODUCTION_SECRET_NAMES`: `GOOGLE_OIDC_CLIENT_SECRET`,
+  `APPLE_PRIVATE_KEY`) are no CR-3 secret since ROUTES-R12: neither plane's
+  file may name them (`SECRET_UNKNOWN:<name>`), no service template
+  references them, and CR-3 refuses them in a deployment's environment
+  (`<NAME>_RETIRED`). The staging plane's earlier inert containers stay in
+  the test project, unreferenced, until the owner removes them.
 - Production may also leave out an optional CR-3 secret that nothing on the
   production estate reads (`UNREAD_PRODUCTION_SECRET_NAMES`:
   `DISTRIBUTION_GITHUB_API_TOKEN`), and the committed file does. The

@@ -51,8 +51,6 @@
     "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "tibotattle-staging-rate-limit-secret", "version": "1" },
     "ENVELOPE_PUBLIC_JWK": { "secretName": "tibotattle-staging-envelope-public-jwk", "version": "1" },
     "ENVELOPE_PRIVATE_JWK": { "secretName": "tibotattle-staging-envelope-private-jwk", "version": "1" },
-    "GOOGLE_OIDC_CLIENT_SECRET": { "secretName": "tibotattle-staging-google-oidc-client-secret", "version": "1" },
-    "APPLE_PRIVATE_KEY": { "secretName": "tibotattle-staging-apple-private-key", "version": "1" },
     "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "tibotattle-staging-distribution-github-token", "version": "1" }
   },
   "cloudSql": {

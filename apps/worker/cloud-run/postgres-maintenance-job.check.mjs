@@ -80,9 +80,6 @@ function stagingJobEnv(overrides = {}) {
     ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
     IDENTITY_LINK_SECRET_VERSION: "staging-v1",
     GOOGLE_OIDC_CLIENT_ID: "123456789012-syntheticstaging.apps.googleusercontent.com",
-    APPLE_SERVICES_ID: "example.synthetic.staging",
-    APPLE_KEY_ID: "SYNTHKEY01",
-    APPLE_TEAM_ID: "SYNTHTEAM1",
     ...overrides,
   };
   delete env.DISTRIBUTION_GITHUB_API_TOKEN;

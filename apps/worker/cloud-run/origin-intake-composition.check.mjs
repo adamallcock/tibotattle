@@ -18,6 +18,8 @@ import {
 } from "./contribution-envelope-registry.mjs";
 import {
   ORIGIN_INTAKE_HOST_MODES,
+  ORIGIN_INTAKE_RETIRED_ENVELOPE_SCHEMA_VERSIONS,
+  ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
   createOriginIntakeComposition,
   originIntakeServedInMode,
 } from "./origin-intake-composition.mjs";
@@ -65,8 +67,7 @@ function options(overrides = {}) {
       crypto: stubs(["decryptSyntheticEnvelope", "sha256Hex"]),
       boundedBody: stubs(["readBoundedRequestBody"]),
       legacyAdmission: stubs([
-        "admitPostgresTelemetryV1Contribution", "admitPostgresTelemetryV01Contribution",
-        "recordPostgresDeviceUploadReceipt",
+        "admitPostgresTelemetryV1Contribution", "recordPostgresDeviceUploadReceipt",
       ]),
       transportWriteAuthority: stubs(["assertPostgresTelemetryTransportWriteAllowed"]),
       uploadAuthorization: stubs(["createPostgresDeviceUploadAuthorization"]),
@@ -90,16 +91,22 @@ function options(overrides = {}) {
   };
 }
 
-test("the composition registers v1.1, v1.0 and v0.1 with their formats, the receipt recorder and one route module", () => {
+test("the composition registers v1.1 and v1.0 live, the retired v0.x pair, the receipt recorder and one route module", () => {
   const configured = options();
   const intake = createOriginIntakeComposition(configured);
   assert.deepEqual(intake.contributionEnvelopes.map(({ schemaVersion, ownsReceipt }) => [schemaVersion, ownsReceipt]), [
     ["telemetry-envelope-v1.1", true],
     ["telemetry-envelope-v1.0", false],
     ["telemetry-envelope-v0.1", false],
+    ["telemetry-envelope-v0.2", false],
   ]);
+  assert.deepEqual([...ORIGIN_INTAKE_RETIRED_ENVELOPE_SCHEMA_VERSIONS],
+    ["telemetry-envelope-v0.1", "telemetry-envelope-v0.2"]);
+  assert.deepEqual([...ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS],
+    ["telemetry-contribution-v1.0", "telemetry-contribution-v1.1"]);
   assert.deepEqual(Object.keys(intake.uploadAuthorizationFormats).sort(), [
-    "telemetry-contribution-v0.1", "telemetry-contribution-v1.0", "telemetry-contribution-v1.1",
+    "telemetry-contribution-v0.1", "telemetry-contribution-v0.2", "telemetry-contribution-v1.0",
+    "telemetry-contribution-v1.1",
   ]);
   // Beside the dispatch's own v1.2 entries, the two tables pair exactly.
   const formats = createUploadAuthorizationFormats(new Map([
@@ -119,7 +126,7 @@ test("the composition registers v1.1, v1.0 and v0.1 with their formats, the rece
   assert.deepEqual([...intake.pathnames], [...V11_PATHNAMES, ...SHARED_LEGACY_PATHNAMES]);
 });
 
-test("the v1.0 and v0.1 envelopes each reach their own admitter", async () => {
+test("the v1.0 envelope reaches its admitter; no v0.x admitter is composed (round 12)", async () => {
   const calls = [];
   const admitter = (name) => async (input) => {
     calls.push([name, input.body.value.schemaVersion]);
@@ -133,6 +140,7 @@ test("the v1.0 and v0.1 envelopes each reach their own admitter", async () => {
       legacyAdmission: {
         ...configured.adapters.legacyAdmission,
         admitPostgresTelemetryV1Contribution: admitter("v1.0 admitter"),
+        // A v0.1 admitter the root still passes is never wired to a route.
         admitPostgresTelemetryV01Contribution: admitter("v0.1 admitter"),
       },
     },
@@ -141,22 +149,42 @@ test("the v1.0 and v0.1 envelopes each reach their own admitter", async () => {
     primaryPool: pool, schema: configured.schemaOptions, objectStore: {}, sourceNamespace: "synthetic-namespace",
     envelopePublicJwk: configured.envelopePublicJwk, envelopePrivateJwk: configured.envelopePrivateJwk,
   });
-  for (const schemaVersion of ["telemetry-envelope-v1.0", "telemetry-envelope-v0.1"]) {
+  const participant = Object.freeze({ id: "synthetic-participant", consentVersion: "privacy-safe-telemetry-v0.1" });
+  const claimed = Object.freeze({ authorizationId: "synthetic-authorization", authorizationKind: "device" });
+  for (const schemaVersion of ["telemetry-envelope-v1.0", "telemetry-envelope-v0.1", "telemetry-envelope-v0.2"]) {
     const value = { schemaVersion, synthetic: false, keyId: "k", wrappedKey: "w", iv: "i", ciphertext: "c" };
     const registration = intake.contributionEnvelopes.find((entry) => entry.schemaVersion === schemaVersion);
-    const response = await registration.handler(
-      Object.freeze({ raw: JSON.stringify(value), value }),
-      Object.freeze({ id: "synthetic-participant", consentVersion: "privacy-safe-telemetry-v0.1" }),
-      "synthetic-device",
-      Object.freeze({ authorizationId: "synthetic-authorization", authorizationKind: "device" }),
-      context,
-    );
-    assert.equal(response.status, 202, schemaVersion);
+    const body = Object.freeze({ raw: JSON.stringify(value), value });
+    if (schemaVersion === "telemetry-envelope-v1.0") {
+      const response = await registration.handler(body, participant, "synthetic-device", claimed, context);
+      assert.equal(response.status, 202, schemaVersion);
+      continue;
+    }
+    // Retired: the pre-claim check answers the uniform 503 (no retry-after),
+    // and the handler behind it answers the same refusal.
+    assert.throws(() => registration.validateEnvelope(value, body.raw), (error) => {
+      assert.deepEqual([error.status, error.code, error.responseHeaders], [503, "POSTGRES_ROUTE_NOT_PORTED", undefined]);
+      return true;
+    }, schemaVersion);
+    assert.throws(() => registration.handler(body, participant, "synthetic-device", claimed, context),
+      { code: "POSTGRES_ROUTE_NOT_PORTED", status: 503 }, schemaVersion);
   }
-  assert.deepEqual(calls, [
-    ["v1.0 admitter", "telemetry-envelope-v1.0"],
-    ["v0.1 admitter", "telemetry-envelope-v0.1"],
-  ]);
+  assert.deepEqual(calls, [["v1.0 admitter", "telemetry-envelope-v1.0"]]);
+});
+
+test("the retired v0.x formats never authorize: the write authority answers the uniform 503", async () => {
+  const intake = createOriginIntakeComposition(options());
+  for (const version of ["telemetry-contribution-v0.1", "telemetry-contribution-v0.2"]) {
+    const format = intake.uploadAuthorizationFormats[version];
+    assert.throws(() => format.assertUploadAllowed(pool, { participantId: "p", deviceId: "d" }, Date.now(),
+      { schema: { primarySchema: "synthetic_primary" } }), (error) => {
+      assert.deepEqual([error.status, error.code, error.responseHeaders], [503, "POSTGRES_ROUTE_NOT_PORTED", undefined]);
+      return true;
+    }, version);
+  }
+  // The live v1.x formats still reach the transport write authority.
+  assert.throws(() => intake.uploadAuthorizationFormats["telemetry-contribution-v1.0"].assertUploadAllowed(
+    pool, {}, 0, { schema: {} }), /assertPostgresTelemetryTransportWriteAllowed must not be reached/u);
 });
 
 test("only the host modes whose clients reach the intake compose it; the retired cloud-run-iam does not", () => {

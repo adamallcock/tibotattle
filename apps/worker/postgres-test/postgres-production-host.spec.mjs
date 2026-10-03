@@ -167,8 +167,6 @@ function productionEnvironment({ primarySchema, port, keys }) {
     ENVELOPE_PRIVATE_JWK: keys.privateText,
     IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-value-0000000001",
     POSTGRES_RATE_LIMIT_SECRET: "synthetic-rate-limit-secret-value-00000000002",
-    GOOGLE_OIDC_CLIENT_SECRET: "synthetic-google-client-secret-value-3",
-    APPLE_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGljLWFwcGxlLWtleQ==\\n-----END PRIVATE KEY-----",
   };
 }
 
@@ -436,14 +434,20 @@ test("the storage gate rereads the receipt on every request: drift and a newer s
   await refusedNow("newer schema");
 }));
 
-test("unported routes and the admin host: the closed 503 under the edge's request id, no retry-after", {
+test("round 12: retired routes are the closed 503, the performance authorization its definite 403, the admin host open", {
   skip: SKIP, timeout: 300_000,
 }, () => withProductionHost(async ({ port }) => {
   for (const [label, method, path, hostKind, extra] of [
     ["participant export", "GET", "/api/v1/me/export", "apex", {}],
     ["Google sign-in start", "POST", "/api/v1/identity/google/start", "apex", { "content-type": "application/json" }],
-    ["admin overview on the admin host", "GET", "/api/v1/admin/overview", "admin",
-      { "cf-access-jwt-assertion": "synthetic.access.assertion" }],
+    ["Apple sign-in start", "POST", "/api/v1/identity/apple/start", "apex", { "content-type": "application/json" }],
+    ["legacy enroll", "POST", "/api/v1/enroll", "apex", { "content-type": "application/json" }],
+    ["security reset", "POST", "/api/v1/me/security-reset", "apex", { "content-type": "application/json" }],
+    ["performance capabilities", "GET", "/api/v1/device/telemetry/performance/capabilities", "apex", {}],
+    ["performance consent", "POST", "/api/v1/me/device-telemetry-performance-consents", "apex",
+      { "content-type": "application/json" }],
+    ["performance reports", "POST", "/api/v1/device/telemetry/performance/reports", "apex",
+      { "content-type": "application/json" }],
   ]) {
     const requestId = randomUUID();
     const answer = await send(port, { method, path, ...(method === "POST" ? { body: "{}" } : {}),
@@ -452,6 +456,26 @@ test("unported routes and the admin host: the closed 503 under the edge's reques
     assert.deepEqual(JSON.parse(answer.text), { error: { code: "POSTGRES_ROUTE_NOT_PORTED", requestId } }, label);
     assert.equal(answer.headers["retry-after"], undefined, `${label}: no retry-after (OD-CR-6 iv)`);
     assertNoStoreMarked(answer, label);
+  }
+  // The accountless performance authorization: production's definite 403, no retry-after.
+  {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "POST", path: "/api/v1/accountless/telemetry-performance-authorization",
+      body: "{}", headers: { ...edgeHeaders({ requestId, admission: "v1;accountless_ownership;allowed" }),
+        "content-type": "application/json", authorization: "Device um_device_synthetic.unknown" } });
+    assert.equal(answer.status, 403, answer.text);
+    assert.deepEqual(JSON.parse(answer.text), { error: { code: "TELEMETRY_TRANSPORT_BLOCKED", requestId } });
+    assert.equal(answer.headers["retry-after"], undefined);
+    assertNoStoreMarked(answer, "performance authorization");
+  }
+  // ADMIN-R12: the admin host runs the Access chokepoint; a forged assertion is the Worker's 403.
+  {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "GET", path: "/api/v1/admin/overview",
+      headers: { ...edgeHeaders({ hostKind: "admin", requestId }), "cf-access-jwt-assertion": "synthetic.access.assertion" } });
+    assert.equal(answer.status, 403, answer.text);
+    assert.equal(JSON.parse(answer.text).error.code, "ACCESS_REQUIRED");
+    assertNoStoreMarked(answer, "admin host");
   }
   // OD-CR-6 (ii), accepted: a query string on a v1.2 POST route or on the
   // upload-authorization route is refused, where the Worker ignores it; (i)

@@ -22,7 +22,9 @@
 //     three-key body and uploads the real encrypted v1.0 envelope;
 //   - v0.1: syncPreparedContributionEntryOnce (src/contribution-device-sync.js),
 //     which encrypts a prepared v0.1 contribution with the shipped envelope
-//     builder, authorizes it with the three-key body and uploads it.
+//     builder, authorizes it with the three-key body and uploads it; owner
+//     round 12 retires v0.x uploads, so the upload is the uniform 503
+//     POSTGRES_ROUTE_NOT_PORTED and nothing is admitted or claimed.
 // Re-runs and re-uploads prove idempotence; unregistered envelope versions
 // keep the origin's pre-change refusal byte for byte.
 //
@@ -711,11 +713,12 @@ function v01Contribution() {
   };
 }
 
-test("a shipped v0.1 client uploads a prepared contribution through the composed v0.1 envelope, then replays", {
+test("round 12: a shipped v0.1 client's upload is the uniform 503; nothing is admitted, claimed or stored", {
   skip: !PG_TEST_SOCKET, timeout: 300_000,
 }, () => withOrigin(async (origin) => {
   const { base, t, fetchImpl, exchanges, store } = origin;
-  // A social participant at the rank-1 transport floor, as the v1.0 case.
+  // A social participant at the rank-1 transport floor, which d43c8f92 would
+  // still admit v0.1 for: the retirement is the origin's, not the floor's.
   const owner = await socialOwner(origin, {
     participantId: `synthetic-intake-v01-${randomBytes(4).toString("hex")}`,
     pairingConsent: { consentVersion: V1_CONSENT.privacyContractVersion,
@@ -727,38 +730,40 @@ test("a shipped v0.1 client uploads a prepared contribution through the composed
     withDeviceSecret: async ({ expectedOrigin, operation }) =>
       operation(owner.secret, { origin: expectedOrigin, deviceId: owner.deviceId }),
   });
-  const first = await sync();
-  assert.equal(first.status, "accepted");
-  assert.match(first.contributionId, /^contribution:[0-9a-f-]{36}$/u);
+  await assert.rejects(sync());
+  // The shipped three-key body asks for the default v1.0 format, which is still authorized.
   const authorization = exchanges.find((exchange) => exchange.path === UPLOAD_AUTHORIZATIONS_PATH);
   assert.equal(authorization.status, 201);
   assert.equal(Object.keys(JSON.parse(authorization.body)).sort().join(), "contentLengthBytes,contentType,envelopeDigest");
+  // The v0.1 envelope is refused before its authorization is claimed: the uniform 503, no retry-after.
   const upload = exchanges.find((exchange) => exchange.path === CONTRIBUTIONS_PATH);
-  assert.equal(upload.status, 202);
-  assert.equal(JSON.parse(upload.body).schemaVersion, "telemetry-envelope-v0.1");
-
-  // The v0.1 admitter wrote the v0.1 rows; no typed v1.0 chunk exists.
-  const rows = async () => (await base.query(`SELECT
+  assert.equal(upload.status, 503);
+  const raw = upload.body;
+  assert.equal(JSON.parse(raw).schemaVersion, "telemetry-envelope-v0.1");
+  const retired = await reupload(fetchImpl, owner.deviceAuthorization, raw);
+  assert.equal(retired.status, 503);
+  assert.equal(retired.headers.get("retry-after"), null);
+  assert.deepEqual(Object.keys((await retired.json()).error).sort(), ["code", "requestId"]);
+  const counts = (await base.query(`SELECT
       (SELECT count(*)::int FROM ${t("telemetry_contributions")} WHERE participant_id = $1) AS contributions,
       (SELECT count(*)::int FROM ${t("telemetry_records")} WHERE participant_id = $1) AS records,
-      (SELECT COALESCE(sum(accepted_count), 0)::int FROM ${t("telemetry_contribution_admission_windows")}
-        WHERE participant_id = $1) AS admitted,
-      (SELECT count(*)::int FROM ${t("telemetry_v1_chunks")} WHERE participant_id = $1) AS v1Chunks`,
+      (SELECT count(*)::int FROM ${t("telemetry_v1_chunks")} WHERE participant_id = $1) AS v1chunks`,
   [owner.participantId])).rows[0];
-  assert.deepEqual(await rows(), { contributions: 1, records: 2, admitted: 1, v1chunks: 0 });
-  const contribution = (await base.query(`SELECT id, r2_key FROM ${t("telemetry_contributions")}
-    WHERE participant_id = $1`, [owner.participantId])).rows[0];
-  assert.equal(contribution.id, first.contributionId);
-  assert.equal(store.objects.get(contribution.r2_key), upload.body);
-
-  // Re-uploading the exact envelope under a fresh three-key authorization replays it.
-  const replay = await reupload(fetchImpl, owner.deviceAuthorization, upload.body);
-  assert.equal(replay.status, 202);
-  assert.equal(replay.headers.get("idempotency-replayed"), "true");
-  const receipt = await replay.json();
-  assert.deepEqual([receipt.contributionId, receipt.status, receipt.replayed], [first.contributionId, "accepted", true]);
-  assert.deepEqual(await rows(), { contributions: 1, records: 2, admitted: 1, v1chunks: 0 });
-  assert.deepEqual(await grantStates(base, t, owner.participantId), [{ state: "consumed", n: 2 }]);
+  assert.deepEqual(counts, { contributions: 0, records: 0, v1chunks: 0 });
+  assert.equal(store.objects.size, 0, "no quarantine object was written");
+  // Both authorizations stay issued and unclaimed (they expire on their own).
+  assert.deepEqual((await grantStates(base, t, owner.participantId)).filter((row) => row.state === "consumed"), []);
+  // Asking for a v0.x format explicitly is the same 503, before anything is issued.
+  for (const telemetrySchemaVersion of ["telemetry-contribution-v0.1", "telemetry-contribution-v0.2"]) {
+    const before = await grantStates(base, t, owner.participantId);
+    const refused = await post(fetchImpl, UPLOAD_AUTHORIZATIONS_PATH, {
+      envelopeDigest: "a".repeat(64), contentLengthBytes: 10, contentType: "application/json", telemetrySchemaVersion,
+    }, { authorization: owner.deviceAuthorization });
+    assert.equal(refused.status, 503, telemetrySchemaVersion);
+    assert.equal(refused.headers.get("retry-after"), null, telemetrySchemaVersion);
+    assert.equal((await refused.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED", telemetrySchemaVersion);
+    assert.deepEqual(await grantStates(base, t, owner.participantId), before, telemetrySchemaVersion);
+  }
 }));
 
 async function withPinnedRequestId(work) {
@@ -786,7 +791,6 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
     iv: "B".repeat(16), ciphertext: "C".repeat(64),
   });
   for (const [label, body, status] of [
-    ["a v0.2 envelope with the six envelope keys", sixKeys("telemetry-envelope-v0.2"), 500],
     ["a v1.3 envelope with the six envelope keys", sixKeys("telemetry-envelope-v1.3"), 500],
     ["a v9.0 envelope with other keys", JSON.stringify({ schemaVersion: "telemetry-envelope-v9.0", payload: "x" }), 400],
     ["an envelope without a schemaVersion", JSON.stringify({ synthetic: false, keyId: "key:x", extra: 1 }), 400],
@@ -803,9 +807,18 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
         ? PREFLIGHT_UPLOAD_AUTH_INVALID_BODY : PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
     }
   }
-  // d43c8f92 answers an unknown transport, and v0.2's blocked lifecycle, 403
-  // before issuing anything; the shipped three-key body defaults to v1.0.
-  for (const telemetrySchemaVersion of ["telemetry-contribution-v9.9", "telemetry-contribution-v0.2"]) {
+  // Round 12: a v0.2 envelope is registered as retired, so it is the uniform
+  // 503 (after the preflight's own 401 without an authorization).
+  for (const authorization of [undefined, `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}`]) {
+    const answer = await post(fetchImpl, CONTRIBUTIONS_PATH, sixKeys("telemetry-envelope-v0.2"),
+      authorization === undefined ? {} : { authorization });
+    assert.equal(answer.status, authorization === undefined ? 401 : 503);
+    assert.equal((await answer.json()).error.code, authorization === undefined ? "UPLOAD_AUTH_INVALID"
+      : "POSTGRES_ROUTE_NOT_PORTED");
+  }
+  // d43c8f92 answers an unknown transport 403 before issuing anything; the
+  // shipped three-key body defaults to v1.0. (Round 12 answers v0.x 503.)
+  for (const telemetrySchemaVersion of ["telemetry-contribution-v9.9"]) {
     const refused = await post(fetchImpl, UPLOAD_AUTHORIZATIONS_PATH, {
       envelopeDigest: "a".repeat(64), contentLengthBytes: 10, contentType: "application/json", telemetrySchemaVersion,
     }, { authorization: owner.deviceAuthorization });

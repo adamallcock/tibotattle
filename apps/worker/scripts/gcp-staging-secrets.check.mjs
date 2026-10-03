@@ -150,7 +150,13 @@ test("the dry run makes no call, prints the plan and authorization, and keeps no
   assert.equal(dry.project, "tibotattle");
   assert.match(dry.authorization, /^staging-secrets:tibotattle:[a-f0-9]{16}$/u);
   assert.equal(dry.authorization, secrets.stagingSecretsAuthorization(staging()));
-  assert.deepEqual(dry.generationSelfTest, { valuesGenerated: 7, valuesChecked: 7, valuesKept: 0 });
+  // Round 12 retired the Google and Apple sign-in secrets: five staging secrets remain.
+  assert.deepEqual(dry.generationSelfTest, { valuesGenerated: 5, valuesChecked: 5, valuesKept: 0 });
+  assert.deepEqual(Object.keys(secrets.STAGING_SECRET_KINDS), [...VARIABLES]);
+  for (const name of ["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]) {
+    assert.equal(Object.hasOwn(secrets.STAGING_SECRET_KINDS, name), false, name);
+    assert.throws(() => secrets.generateStagingSecretValues([name]), { code: `STAGING_SECRET_UNKNOWN:${name}` }, name);
+  }
   assert.deepEqual(dry.secrets.map((entry) => entry.variable), Object.keys(staging().secrets));
   assert.ok(dry.reads.every((argv) => argv.at(-1) === QUIET));
   for (const entry of dry.secrets) {
@@ -197,7 +203,7 @@ test("apply creates missing containers as OPS-2 would and adds one stdin-fed ver
   assert.deepEqual(world.calls[0].argv, ["secrets", "list", "--project=tibotattle", "--format=json", QUIET]);
   assert.ok(world.calls.every(({ argv }) => argv.filter((arg) => arg === QUIET).length === 1));
   const changes = mutations(world.calls);
-  assert.equal(changes.length, 14);
+  assert.equal(changes.length, 10);
   for (const name of VARIABLES) {
     const id = desired.secrets[name].secretName;
     const create = changes.find(({ argv }) => argv[1] === "create" && argv[2] === id);
@@ -213,7 +219,7 @@ test("apply creates missing containers as OPS-2 would and adds one stdin-fed ver
   assert.equal(world.calls.some(({ argv }) => argv.includes("access")), false);
   // The values: fresh, staging-shaped, CR-3-valid, and nowhere in argv or the report.
   const values = new Map(world.inputs.map(({ id, value }) => [VARIABLES.find((name) => desired.secrets[name].secretName === id), value]));
-  assert.equal(values.size, 7);
+  assert.equal(values.size, 5);
   secrets.assertStagingSecretValues(values);
   const publicJwk = JSON.parse(values.get("ENVELOPE_PUBLIC_JWK"));
   const privateJwk = JSON.parse(values.get("ENVELOPE_PRIVATE_JWK"));
@@ -221,14 +227,13 @@ test("apply creates missing containers as OPS-2 would and adds one stdin-fed ver
   assert.equal(privateJwk.kid, publicJwk.kid);
   assert.equal(publicJwk.d, undefined);
   assert.equal(typeof privateJwk.d, "string");
-  assert.match(values.get("APPLE_PRIVATE_KEY"), /^-----BEGIN PRIVATE KEY-----\n[\s\S]+\n-----END PRIVATE KEY-----\n$/u);
-  for (const name of ["GOOGLE_OIDC_CLIENT_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"]) {
+  for (const name of ["DISTRIBUTION_GITHUB_API_TOKEN"]) {
     assert.match(values.get(name), /^staging-inert-[A-Za-z0-9_-]{43}$/u, name);
   }
   for (const name of ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET"]) {
     assert.match(values.get(name), /^[A-Za-z0-9_-]{64}$/u, name);
   }
-  assert.equal(new Set(values.values()).size, 7, "every value is distinct");
+  assert.equal(new Set(values.values()).size, 5, "every value is distinct");
   const text = JSON.stringify(report) + JSON.stringify(world.calls);
   assertNoValues(text, world.inputs);
   // A second run makes different values: nothing is derived or cached.
@@ -245,7 +250,7 @@ test("a rerun is resumable: secrets with an ENABLED version are reported, not re
     [id("POSTGRES_RATE_LIMIT_SECRET")]: [{ version: "1", state: "DISABLED" }, { version: "3", state: "ENABLED" }],
     [id("ENVELOPE_PUBLIC_JWK")]: [{ version: "1", state: "ENABLED" }],
     [id("ENVELOPE_PRIVATE_JWK")]: [{ version: "1", state: "ENABLED" }],
-    [id("APPLE_PRIVATE_KEY")]: [],
+    [id("DISTRIBUTION_GITHUB_API_TOKEN")]: [],
   });
   const report = secrets.provisionStagingSecrets(desired, { authorize: secrets.stagingSecretsAuthorization(desired),
     runner: world.runner });
@@ -256,12 +261,9 @@ test("a rerun is resumable: secrets with an ENABLED version are reported, not re
   assert.equal(byName.ENVELOPE_PUBLIC_JWK.outcome, "already_provisioned");
   assert.equal(report.envelopePairReissued, false);
   // An empty existing container gets its first version, without a create.
-  assert.deepEqual([byName.APPLE_PRIVATE_KEY.container, byName.APPLE_PRIVATE_KEY.outcome, byName.APPLE_PRIVATE_KEY.version],
-    ["existing", "added", "1"]);
-  assert.deepEqual([byName.GOOGLE_OIDC_CLIENT_SECRET.container, byName.GOOGLE_OIDC_CLIENT_SECRET.outcome],
-    ["created", "added"]);
-  assert.deepEqual(world.inputs.map((entry) => entry.id).sort(),
-    [id("APPLE_PRIVATE_KEY"), id("DISTRIBUTION_GITHUB_API_TOKEN"), id("GOOGLE_OIDC_CLIENT_SECRET")].sort());
+  assert.deepEqual([byName.DISTRIBUTION_GITHUB_API_TOKEN.container, byName.DISTRIBUTION_GITHUB_API_TOKEN.outcome,
+    byName.DISTRIBUTION_GITHUB_API_TOKEN.version], ["existing", "added", "1"]);
+  assert.deepEqual(world.inputs.map((entry) => entry.id).sort(), [id("DISTRIBUTION_GITHUB_API_TOKEN")]);
 });
 
 test("half a pinned envelope pair, unusable versions or a wrong authorization refuse before any change", () => {
@@ -275,8 +277,8 @@ test("half a pinned envelope pair, unusable versions or a wrong authorization re
   for (const [desired, initial, code] of [
     [publicPinned, { [id("ENVELOPE_PUBLIC_JWK")]: [{ version: "1", state: "ENABLED" }] }, "STAGING_ENVELOPE_PAIR_PARTIAL"],
     [privatePinned, { [id("ENVELOPE_PUBLIC_JWK")]: [{ version: "1", state: "ENABLED" }] }, "STAGING_ENVELOPE_PAIR_PARTIAL"],
-    [unpinned, { [id("APPLE_PRIVATE_KEY")]: [{ version: "1", state: "DESTROYED" }, { version: "2", state: "DISABLED" }] },
-      "STAGING_SECRET_VERSIONS_UNUSABLE:APPLE_PRIVATE_KEY"],
+    [unpinned, { [id("DISTRIBUTION_GITHUB_API_TOKEN")]: [{ version: "1", state: "DESTROYED" },
+      { version: "2", state: "DISABLED" }] }, "STAGING_SECRET_VERSIONS_UNUSABLE:DISTRIBUTION_GITHUB_API_TOKEN"],
     // A disabled orphan is a human's act: stop, never reissue past it.
     [unpinned, { [id("ENVELOPE_PUBLIC_JWK")]: [{ version: "1", state: "DISABLED" }] },
       "STAGING_SECRET_VERSIONS_UNUSABLE:ENVELOPE_PUBLIC_JWK"],
@@ -328,7 +330,7 @@ test("a failure between the two envelope-key adds resumes: the rerun reissues th
   assert.deepEqual([byName.ENVELOPE_PRIVATE_JWK.container, byName.ENVELOPE_PRIVATE_JWK.outcome,
     byName.ENVELOPE_PRIVATE_JWK.version], ["existing", "added", "1"]);
   assert.deepEqual(report.pins, { IDENTITY_LINK_SECRET: "1", POSTGRES_RATE_LIMIT_SECRET: "1", ENVELOPE_PUBLIC_JWK: "2",
-    ENVELOPE_PRIVATE_JWK: "1", GOOGLE_OIDC_CLIENT_SECRET: "1", APPLE_PRIVATE_KEY: "1", DISTRIBUTION_GITHUB_API_TOKEN: "1" });
+    ENVELOPE_PRIVATE_JWK: "1", DISTRIBUTION_GITHUB_API_TOKEN: "1" });
   // The pinned versions are one fresh pair; the orphan public version 1 is another key, left ENABLED and unpinned.
   const pinnedPublic = assertOnePair(world, desired, "2", "1");
   assert.notEqual(JSON.parse(storedValue(world, id("ENVELOPE_PUBLIC_JWK"), "1")).n, pinnedPublic.n);
@@ -465,15 +467,15 @@ test("--write-pins pins every reported version into the committed staging file, 
   const expected = JSON.parse(STAGING_TEXT);
   for (const name of VARIABLES) expected.secrets[name].version = "1";
   assert.deepEqual(pinned, expected);
-  // Only the seven version lines differ.
+  // Only the five version lines differ.
   const before = STAGING_TEXT.split("\n");
   const after = written.split("\n");
   assert.equal(before.length, after.length);
   const changed = before.filter((line, index) => line !== after[index]);
-  assert.equal(changed.length, 7);
+  assert.equal(changed.length, 5);
   assert.ok(changed.every((line) => /"version": null \},?$/u.test(line)));
   assertNoValues(out + written, world.inputs);
-  assert.equal(manifest.validateDesiredState(pinned).secrets.APPLE_PRIVATE_KEY.version, "1");
+  assert.equal(manifest.validateDesiredState(pinned).secrets.DISTRIBUTION_GITHUB_API_TOKEN.version, "1");
 });
 
 test("--report-out is reserved before any call, written exclusively and owner-only", async () => {
@@ -538,7 +540,7 @@ test("a failed run releases the report, so the same command reruns, resumes and 
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")).pins, result.pins);
     assert.equal(store.writes, 1);
     const changed = STAGING_TEXT.split("\n").filter((line, index) => line !== store.text.split("\n")[index]);
-    assert.equal(changed.length, 7);
+    assert.equal(changed.length, 5);
     assert.equal(manifest.validateDesiredState(JSON.parse(store.text)).secrets.ENVELOPE_PUBLIC_JWK.version, "2");
     assertNoValues(out + err + store.text + await readFile(path, "utf8"), world.inputs);
   } finally {

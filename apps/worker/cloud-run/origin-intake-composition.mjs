@@ -7,16 +7,19 @@
  * createPostgresTestV12DayManifestDispatch and to its route-module registry:
  *
  * - contributionEnvelopes: telemetry-envelope-v1.1 (IN-2,
- *   envelopes/v11.mjs, ownsReceipt: true), telemetry-envelope-v1.0 and
- *   telemetry-envelope-v0.1 (IN-3, envelopes/v10.mjs and v01.mjs, whose
- *   receipt the shared preamble records). Every other version stays
- *   unregistered and keeps the origin's pre-change refusal.
- * - uploadAuthorizationFormats: telemetry-contribution-v1.0, -v1.1 and
- *   -v0.1, each enforced by TA-1's transport write authority
- *   (src/postgres-transport-write-authority.ts), so the envelope and format
- *   tables pair exactly (assertContributionEnvelopeFormats). v0.2 has no
- *   envelope and therefore no format: it is answered 403
- *   TELEMETRY_TRANSPORT_BLOCKED, as d43c8f92 answers its blocked lifecycle.
+ *   envelopes/v11.mjs, ownsReceipt: true) and telemetry-envelope-v1.0 (IN-3,
+ *   envelopes/v10.mjs, whose receipt the shared preamble records), plus the
+ *   two v0.x envelopes owner round 12 retires at the switch
+ *   (telemetry-envelope-v0.1 and -v0.2): each is registered as a retired
+ *   envelope whose pre-claim check answers 503 POSTGRES_ROUTE_NOT_PORTED, so
+ *   no upload authorization is claimed and nothing is admitted. Every other
+ *   version stays unregistered and keeps the origin's pre-change refusal.
+ * - uploadAuthorizationFormats: telemetry-contribution-v1.0 and -v1.1, each
+ *   enforced by TA-1's transport write authority
+ *   (src/postgres-transport-write-authority.ts), plus the retired -v0.1 and
+ *   -v0.2 formats, whose write authority is the same 503 (no authorization
+ *   is created), so the envelope and format tables pair exactly
+ *   (assertContributionEnvelopeFormats).
  * - recordPostgresDeviceUploadReceipt: IN-3's port of d43c8f92
  *   recordDeviceUploadReceipt, which the preamble runs after the v1.0 and
  *   v0.1 handlers.
@@ -44,10 +47,14 @@
  * adapter. Plain JavaScript so node:test specs can load it directly.
  */
 
-import { createUploadAuthorizationFormats } from "./contribution-envelope-registry.mjs";
-import { createTelemetryV01ContributionEnvelope } from "./envelopes/v01.mjs";
+import { createUploadAuthorizationFormats, registerContributionEnvelope } from "./contribution-envelope-registry.mjs";
 import { createTelemetryV10ContributionEnvelope } from "./envelopes/v10.mjs";
-import { legacyUploadAuthorizationFormatEntries } from "./upload-authorization-formats.mjs";
+import {
+  ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
+  legacyUploadAuthorizationFormatEntries,
+  retiredFormatRefusal,
+  retiredUploadAuthorizationFormatEntries,
+} from "./upload-authorization-formats.mjs";
 import { createUploadAuthorizationRouteModule } from "./routes/upload-authorizations.mjs";
 import { createTelemetryV11OriginIntake } from "./routes/v11-composition.mjs";
 import { methodNotAllowed, routeErrorResponse } from "./routes/v11-route-support.mjs";
@@ -84,13 +91,32 @@ const SHARED_LEGACY_PATHNAMES = Object.freeze([
 export const ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = Object.freeze([
   "telemetry-contribution-v1.0",
   "telemetry-contribution-v1.1",
-  "telemetry-contribution-v0.1",
 ]);
+
+/**
+ * The envelopes owner round 12 retires (v0.x uploads), each paired with its
+ * retired format (ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS).
+ */
+export const ORIGIN_INTAKE_RETIRED_ENVELOPE_SCHEMA_VERSIONS = Object.freeze(
+  ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS.map((version) =>
+    version.replace("telemetry-contribution-", "telemetry-envelope-")),
+);
+
+/**
+ * A retired envelope (round 12): its pre-claim check answers the retired
+ * format's 503 POSTGRES_ROUTE_NOT_PORTED before the upload authorization is
+ * claimed, so its handler is unreachable (it answers the same refusal).
+ */
+function retiredContributionEnvelope(schemaVersion) {
+  const refuse = () => {
+    throw retiredFormatRefusal();
+  };
+  return registerContributionEnvelope(schemaVersion, refuse, { validateEnvelope: refuse });
+}
 
 const ADAPTER_EXPORTS = Object.freeze({
   legacyAdmission: Object.freeze([
     "admitPostgresTelemetryV1Contribution",
-    "admitPostgresTelemetryV01Contribution",
     "recordPostgresDeviceUploadReceipt",
   ]),
   transportWriteAuthority: Object.freeze(["assertPostgresTelemetryTransportWriteAllowed"]),
@@ -186,18 +212,19 @@ export function createOriginIntakeComposition(options) {
     envelopePrivateJwk: options.envelopePrivateJwk,
   });
 
-  const legacyFormats = legacyUploadAuthorizationFormatEntries({
-    assertTelemetryTransportWriteAllowed: transportWriteAuthority.assertPostgresTelemetryTransportWriteAllowed,
-    schemaVersions: ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
+  const legacyFormats = Object.freeze({
+    ...legacyUploadAuthorizationFormatEntries({
+      assertTelemetryTransportWriteAllowed: transportWriteAuthority.assertPostgresTelemetryTransportWriteAllowed,
+      schemaVersions: ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
+    }),
+    ...retiredUploadAuthorizationFormatEntries(),
   });
   const contributionEnvelopes = Object.freeze([
     v11.envelopeRegistration,
     createTelemetryV10ContributionEnvelope({
       admitTelemetryV1Contribution: legacyAdmission.admitPostgresTelemetryV1Contribution,
     }),
-    createTelemetryV01ContributionEnvelope({
-      admitTelemetryV01Contribution: legacyAdmission.admitPostgresTelemetryV01Contribution,
-    }),
+    ...ORIGIN_INTAKE_RETIRED_ENVELOPE_SCHEMA_VERSIONS.map(retiredContributionEnvelope),
   ]);
 
   const uploadAuthorizations = createUploadAuthorizationRouteModule({

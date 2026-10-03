@@ -43,10 +43,10 @@
 # CR-3 (postgres-production-configuration.mjs) pins them by plane.
 #
 # Synthetic only. Production data and production secrets never enter this
-# plane. The Google and Apple identifiers below are inert synthetic values
-# that name no registered client, service or key; the matching Secret
-# Manager secrets hold inert synthetic values from scripts/gcp-staging-
-# secrets.mjs, so Google and Apple sign-in cannot complete on staging.
+# plane. The Google client identifier below is an inert synthetic value that
+# names no registered client. Owner round 12 retired Google and Apple sign-in
+# at the switch: the plane mounts no sign-in secret and carries no Apple
+# setting (CR-3 refuses them when present).
 #
 # OD-2 (2026-10-02): GCS_QUARANTINE_BUCKET_HISTORY_PROOF is the bucket-birth
 # receipt's proof record for GCS_BUCKET_NAME, as the desired state pins it.
@@ -116,15 +116,9 @@ spec:
               value: '${ACCESS_ADMIN_EMAIL}'
             - name: IDENTITY_LINK_SECRET_VERSION
               value: '${IDENTITY_LINK_SECRET_VERSION}'
-            # Inert synthetic identity-provider identifiers (see the header).
+            # Inert synthetic identity-provider identifier (see the header).
             - name: GOOGLE_OIDC_CLIENT_ID
               value: '000000000000-tibotattlestaginginert.apps.googleusercontent.com'
-            - name: APPLE_SERVICES_ID
-              value: 'com.tibotattle.staging.inert'
-            - name: APPLE_KEY_ID
-              value: 'STAGINGK01'
-            - name: APPLE_TEAM_ID
-              value: 'STAGINGT01'
             - name: PRIMARY_INSTANCE_CONNECTION_NAME
               value: '${PRIMARY_INSTANCE_CONNECTION_NAME}'
             - name: PRIMARY_DATABASE
@@ -157,16 +151,6 @@ spec:
                 secretKeyRef:
                   name: ENVELOPE_PRIVATE_JWK
                   key: '${SECRET_VERSION_ENVELOPE_PRIVATE_JWK}'
-            - name: GOOGLE_OIDC_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: GOOGLE_OIDC_CLIENT_SECRET
-                  key: '${SECRET_VERSION_GOOGLE_OIDC_CLIENT_SECRET}'
-            - name: APPLE_PRIVATE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: APPLE_PRIVATE_KEY
-                  key: '${SECRET_VERSION_APPLE_PRIVATE_KEY}'
             # Optional, as in EP-7: omitted when its version renders empty.
             - name: DISTRIBUTION_GITHUB_API_TOKEN
               valueFrom:

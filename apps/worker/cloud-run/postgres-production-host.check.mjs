@@ -36,6 +36,7 @@ let dispatchModule;
 let errors;
 let routeRegistry;
 let runtimeSchema;
+let registry;
 
 before(async () => {
   vite = await createServer({
@@ -45,7 +46,7 @@ before(async () => {
     server: { middlewareMode: true, hmr: false, ws: false },
     appType: "custom",
   });
-  [host, configuration, composition, dispatchModule, errors, routeRegistry, runtimeSchema] = await Promise.all([
+  [host, configuration, composition, dispatchModule, errors, routeRegistry, runtimeSchema, registry] = await Promise.all([
     vite.ssrLoadModule("/cloud-run/postgres-production-host.mjs"),
     vite.ssrLoadModule("/cloud-run/postgres-production-configuration.mjs"),
     vite.ssrLoadModule("/src/backend-composition.ts"),
@@ -53,6 +54,7 @@ before(async () => {
     vite.ssrLoadModule("/src/errors.ts"),
     vite.ssrLoadModule("/src/route-registry.ts"),
     vite.ssrLoadModule("/src/postgres-runtime-schema.ts"),
+    vite.ssrLoadModule("/cloud-run/postgres-production-registry.mjs"),
   ]);
 });
 
@@ -75,8 +77,6 @@ function envelopeKeys(kid) {
 const SECRETS = Object.freeze({
   IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-value-0000000001",
   POSTGRES_RATE_LIMIT_SECRET: "synthetic-rate-limit-secret-value-00000000002",
-  GOOGLE_OIDC_CLIENT_SECRET: "synthetic-google-client-secret-value-3",
-  APPLE_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGljLWFwcGxlLWtleQ==\\n-----END PRIVATE KEY-----",
 });
 
 function productionEnv(overrides = {}) {
@@ -121,9 +121,6 @@ function stagingEnv(overrides = {}) {
     ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
     IDENTITY_LINK_SECRET_VERSION: "staging-v1",
     GOOGLE_OIDC_CLIENT_ID: "123456789012-syntheticstaging.apps.googleusercontent.com",
-    APPLE_SERVICES_ID: "example.synthetic.staging",
-    APPLE_KEY_ID: "SYNTHKEY01",
-    APPLE_TEAM_ID: "SYNTHTEAM1",
     ...envelopeKeys("key:synthetic-staging-host"),
     ...overrides,
   });
@@ -198,9 +195,11 @@ function invokerRequest(path, { method = "GET", hostKind = "apex", headers = {} 
 
 test("constants: the composition root's owner answers", () => {
   assert.deepEqual({ ...host.PRODUCTION_HOST_MODES }, { production: "production", staging: "staging" });
-  // OWN-17 was answered in round 12; the flip is ADMIN-R12, scheduled after
-  // D-CRB, so the admin host stays refused here (OD-CR-3).
-  assert.equal(host.PRODUCTION_ADMIN_HOST_POLICY, "refuse");
+  // OWN-17 was answered in round 12 (open with what is ported): ADMIN-R12
+  // opens the production and staging admin host (OD-CR-3). The edge-test
+  // rehearsal composes no admin family, so its admin host stays refused.
+  assert.equal(host.PRODUCTION_ADMIN_HOST_POLICY, "chokepoint");
+  assert.equal(host.EDGE_TEST_ADMIN_HOST_POLICY, "refuse");
   assert.equal(host.PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS, null, "OD-CR-6 (iv)");
   assert.equal(host.PRODUCTION_STORAGE_GATE_TTL_MILLISECONDS, 0, "OD-ROLL / OD-CR-10");
   assert.deepEqual(Object.keys(host.createUploadIngressAuthority()).sort(),
@@ -253,24 +252,43 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
     assert.equal(runtime.listenHost, "0.0.0.0");
     assert.equal(runtime.listenPort, 8080);
     assert.equal(configuration.isProductionConfiguration(runtime.configuration), true);
-    assert.deepEqual([...runtime.registry.portedRouteIds], [...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS]);
-    for (const id of composition.POSTGRES_ADMIN_HOST_ROUTE_IDS) {
-      assert.equal(runtime.registry.resolve(id).disposition, "unported", id);
-    }
+    // Round 12 (ADMIN-R12): the default composition opens the admin host,
+    // so the six admin routes are ported beside the production list.
+    assert.deepEqual([...runtime.registry.portedRouteIds].sort(), [
+      ...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS, ...composition.POSTGRES_ADMIN_HOST_ROUTE_IDS].sort());
+    assert.deepEqual([...runtime.registry.unportedRouteIds], [...registry.RETIRED_ROUTE_IDS].sort());
+    assert.deepEqual([...runtime.registry.definiteRouteIds], ["accountless_telemetry_performance_authorization"]);
 
-    // An unported route: the closed 503 under the edge's request id, no
+    // A retired route: the closed 503 under the edge's request id, no
     // retry-after (OD-CR-6 iv), no-store, marked by EP-6. No storage is read.
-    const unported = await runtime.productionDispatch(invokerRequest("/api/v1/me/export"));
-    assert.equal(unported.status, 503);
-    assert.deepEqual(await unported.json(), { error: { code: "POSTGRES_ROUTE_NOT_PORTED", requestId: REQUEST_ID } });
-    assert.equal(unported.headers.get("retry-after"), null);
-    assert.equal(unported.headers.get("cache-control"), "no-store");
-    assert.equal(unported.headers.get("x-tibotattle-origin"), "1");
-    // The admin host is refused before anything (OD-CR-3), even with an Access token.
+    for (const [path, method] of [["/api/v1/me/export", "GET"], ["/api/v1/enroll", "POST"],
+      ["/api/v1/identity/google/start", "POST"], ["/api/v1/identity/apple/start", "POST"],
+      ["/api/v1/me/security-reset", "POST"], ["/api/v1/device/telemetry/performance/capabilities", "GET"],
+      ["/api/v1/me/device-telemetry-performance-consents", "POST"],
+      ["/api/v1/device/telemetry/performance/reports", "POST"]]) {
+      const unported = await runtime.productionDispatch(invokerRequest(path, { method }));
+      assert.equal(unported.status, 503, path);
+      assert.deepEqual(await unported.json(), { error: { code: "POSTGRES_ROUTE_NOT_PORTED", requestId: REQUEST_ID } },
+        path);
+      assert.equal(unported.headers.get("retry-after"), null, path);
+      assert.equal(unported.headers.get("cache-control"), "no-store", path);
+      assert.equal(unported.headers.get("x-tibotattle-origin"), "1", path);
+    }
+    // The accountless performance authorization: production's definite 403.
+    const performance = await runtime.productionDispatch(invokerRequest(
+      "/api/v1/accountless/telemetry-performance-authorization", { method: "POST" }));
+    assert.equal(performance.status, 403);
+    assert.deepEqual(await performance.json(),
+      { error: { code: "TELEMETRY_TRANSPORT_BLOCKED", requestId: REQUEST_ID } });
+    assert.equal(performance.headers.get("retry-after"), null);
+    assert.equal(performance.headers.get("cache-control"), "no-store");
+    assert.equal(performance.headers.get("x-tibotattle-origin"), "1");
+    // The admin host now runs the Access chokepoint first: a forged assertion
+    // is the Worker's 403, before any family or read.
     const admin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview",
       { hostKind: "admin", headers: { "cf-access-jwt-assertion": "synthetic.access.jwt" } }));
-    assert.equal(admin.status, 503);
-    assert.equal((await admin.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED");
+    assert.equal(admin.status, 403);
+    assert.equal((await admin.json()).error.code, "ACCESS_REQUIRED");
     // The six admin ids are 404 on the apex.
     const apexAdmin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview"));
     assert.equal(apexAdmin.status, 404);
@@ -289,10 +307,30 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
   }
 });
 
-test("OD-CR-3 'chokepoint' (the OWN-17 switch): six more routes, Access before any family", async () => {
+test("OD-CR-3 'refuse' stays available to a caller that passes it: the admin host is the unported 503", async () => {
   const seams = dependencies();
   const runtime = await host.createPostgresProductionRuntime({
-    processEnv: productionEnv(), hostMode: "production", adminHostPolicy: "chokepoint",
+    processEnv: productionEnv(), hostMode: "production", adminHostPolicy: "refuse",
+    dependencies: seams.dependencies,
+  });
+  try {
+    assert.deepEqual([...runtime.registry.portedRouteIds], [...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS]);
+    for (const id of composition.POSTGRES_ADMIN_HOST_ROUTE_IDS) {
+      assert.equal(runtime.registry.resolve(id).disposition, "unported", id);
+    }
+    const admin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview",
+      { hostKind: "admin", headers: { "cf-access-jwt-assertion": "synthetic.access.jwt" } }));
+    assert.equal(admin.status, 503);
+    assert.equal((await admin.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED");
+  } finally {
+    for (const pool of runtime.pools) await pool.end();
+  }
+});
+
+test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more routes, Access before any family", async () => {
+  const seams = dependencies();
+  const runtime = await host.createPostgresProductionRuntime({
+    processEnv: productionEnv(), hostMode: "production",
     dependencies: seams.dependencies,
   });
   try {
@@ -321,8 +359,10 @@ test("HOST_MODE staging uses the staging plane's origin-tier limits (300/6), not
     assert.equal(runtime.configuration.rateLimits.originTier.UPLOAD_PRINCIPAL.limit, 6);
     // createProductionWorkerEnv refuses a limiter whose limit is not the
     // plane's (<NAME>_BINDING_LIMIT_MISMATCH); the composition succeeded, so
-    // both origin-tier limiters carry the staging values.
-    assert.deepEqual([...runtime.registry.portedRouteIds], [...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS]);
+    // both origin-tier limiters carry the staging values. Staging opens its
+    // admin host as production does (round 12).
+    assert.deepEqual([...runtime.registry.portedRouteIds].sort(), [
+      ...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS, ...composition.POSTGRES_ADMIN_HOST_ROUTE_IDS].sort());
   } finally {
     for (const pool of runtime.pools) await pool.end();
   }
@@ -341,6 +381,13 @@ test("refusals: closed codes before any pool, and a later refusal closes what op
       "POSTGRES_TEST_HTTP_MODE_FORBIDDEN"],
     ["a ledger setting", { processEnv: productionEnv({ LEDGER_DATABASE: "x" }), hostMode: "production" },
       "LEDGER_DATABASE_FORBIDDEN"],
+    // Round 12: a pre-round-12 template that still mounts a sign-in secret fails closed.
+    ["a retired Google secret", { processEnv: productionEnv({ GOOGLE_OIDC_CLIENT_SECRET: "x" }), hostMode: "production" },
+      "GOOGLE_OIDC_CLIENT_SECRET_RETIRED"],
+    ["a retired Apple key", { processEnv: productionEnv({ APPLE_PRIVATE_KEY: "" }), hostMode: "production" },
+      "APPLE_PRIVATE_KEY_RETIRED"],
+    ["a retired Apple id", { processEnv: stagingEnv({ APPLE_KEY_ID: "SYNTHKEY01" }), hostMode: "staging" },
+      "APPLE_KEY_ID_RETIRED"],
     ["a test JWKS seam", { processEnv: productionEnv({ ACCESS_TEST_JWKS_JSON: "{}" }), hostMode: "production" },
       "ACCESS_TEST_JWKS_JSON_FORBIDDEN"],
     ["staging values under production", { processEnv: stagingEnv(), hostMode: "production" },
@@ -377,7 +424,7 @@ test("round 16: under the rotated identity-link label no identity-link consumer 
   assert.equal(host.assertIdentityLinkRotationComposable("production-v2", ported), true);
   assert.equal(host.assertIdentityLinkRotationComposable("production-v2", [...ported, ...admin]), true);
   assert.equal(host.assertIdentityLinkRotationComposable("staging-v1", [...ported, "enroll"]), false,
-    "an unrotated label is left to the registry's own od-cr-2 refusal");
+    "an unrotated label is left to the registry's own retired-route refusal");
   for (const id of ["enroll", "identity_google_callback", "identity_apple_result", "security_reset", "participant_export"]) {
     assert.throws(() => host.assertIdentityLinkRotationComposable("production-v2", [...ported, id]),
       (error) => error.code === "IDENTITY_LINK_ROTATION_CONSUMER_PORTED" && error.message === error.code, id);

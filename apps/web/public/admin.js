@@ -1365,9 +1365,15 @@ function renderDatabaseHealth() {
     : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
   const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
   const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
+  // The removed ledger (admin-database-health-v0.2) is not a JSON-mode role.
+  const statusLabel = row => row.role === "deletion_ledger" && row.status === "not_applicable"
+    ? "Removed (append-only)" : statuses[row.status];
+  const measurement = (row, value) => row.status === "not_applicable" ? "Not applicable"
+    : value === null ? "Unavailable" : value;
   $("#database-health-rows").replaceChildren(...(snapshot?.databases ?? []).map(row => tableRow([
-    labels[row.role], statuses[row.status], row.responseMs === null ? "Unavailable" : `${formatNumber(row.responseMs)} ms`,
-    row.databaseBytes === null ? "Unavailable" : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`,
+    labels[row.role], statusLabel(row),
+    measurement(row, row.responseMs === null ? null : `${formatNumber(row.responseMs)} ms`),
+    measurement(row, row.databaseBytes === null ? null : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`),
   ])));
 }
 
@@ -2167,7 +2173,10 @@ function renderOperational(overview) {
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
   const historical = overview.historicalPublication;
-  const publicationRows = historical
+  const historicalUnavailable = historical?.status === "unavailable";
+  const publicationRows = historicalUnavailable
+    ? [["Historical model publication", "unavailable on this host (no source yet)"]]
+    : historical
     ? [
       ["Historical model days", count(
         historical.publishedDays,

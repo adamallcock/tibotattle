@@ -94,8 +94,9 @@ excluded. Installation credentials authenticate an uploader; they do not prove
 a unique person or a provider account. Quota/usage linkage, replay, deduplication,
 abuse budgets and aggregate eligibility keep their independent contracts.
 
-Legacy native/social enrollment remains compatible during the transition. The
-new installation mode must not route the person through sign-in. The initial
+Legacy native/social enrollment remained compatible during the transition; the
+Google Cloud cutover amendment below retires it at the switch. The new
+installation mode must not route the person through sign-in. The initial
 enrollment-only ledger is not upload authority; authenticated upload ownership,
 revocation and renewal require an additive implementation before collection can
 be activated in a distributed build.
@@ -111,12 +112,19 @@ Owner decisions of 2026-10-02 amend the transition for the switch of the hosted
 service to Google Cloud. Nothing here has happened yet; it takes effect at the
 switch.
 
-- **Round 12: native social enrollment retires at the switch.** Google and
-  Apple sign-in and the legacy `/api/v1/enroll` route are not ported. Credential
-  renewal and disconnect stay, so already-paired native social devices keep
-  uploading until their 180-day credential sunsets and then move to the
-  accountless desktop path. The session, logout, pairing, device and v1.2
-  consent routes stay ported. The retirement is disclosed at the cutover.
+- **Round 12: native social sign-in retires at the switch.** Google and Apple
+  sign-in and the legacy `/api/v1/enroll` route are not ported: from the switch
+  they answer `503 POSTGRES_ROUTE_NOT_PORTED`, and no native social device can
+  be newly enrolled. Credential renewal and disconnect stay ported, so the
+  existing native social devices (14 credentials, 13 participants, on
+  2026-10-02) keep uploading and can still disconnect until their 180-day
+  credential sunsets, which fall between 2027-02-08 and 2027-03-14. After its
+  sunset a device cannot renew; the person moves to the Electron app and the
+  accountless desktop path under this policy (fresh-install defaults, the
+  persistent opt-out, no sign-in). The session, logout, pairing, pairing
+  claim, device, revocation and v1.2 consent routes stay ported, although no
+  new web session can be created once the imported ones expire. The
+  retirement is disclosed at the cutover.
 - **Round 16: the identity-link secret is rotated.** The production
   `IDENTITY_LINK_SECRET` that keys sign-in link keys is lost, so the cutover
   installs a newly generated secret under a new key-version label, through a
@@ -132,7 +140,9 @@ switch.
   participant. The imported link keys remain stored, content-free and unused.
   Uploads, the content-free sharing contract, pseudonymity and the 180-day
   sunsets are unchanged, so no public disclosure beyond round 12's retirement
-  is needed.
+  is needed. Because the secret was rotated, a Google or Apple identity link
+  made before the switch cannot be re-established on Google Cloud, even if a
+  social sign-in were ever ported again.
 - This record does not claim that the old link keys are unlinkable to provider
   accounts until the Cloudflare Worker's copy of the old secret is deleted
   after the switch.

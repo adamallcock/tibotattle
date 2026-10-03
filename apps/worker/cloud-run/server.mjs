@@ -60,6 +60,7 @@ import {
 import { createRequestContextStore, requestIdFrom } from "./postgres-request-context.mjs";
 import { createPrivateTestRequestHandler, createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
 import {
+  EDGE_TEST_ADMIN_HOST_POLICY,
   PRODUCTION_ADMIN_HOST_POLICY,
   PRODUCTION_HOST_MODES,
   PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS,
@@ -512,7 +513,8 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       };
     }
     // edge-test: the production request handler behind EP-6, byte for byte
-    // the production pipeline (E12 proves it end to end).
+    // the production pipeline (E12 proves it end to end), except that the
+    // admin host stays refused (round 12 opens it in production and staging).
     const handler = createProductionRequestHandler({
       registry,
       env: admissionEnv,
@@ -520,7 +522,8 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       requestContext: edgeRequestContext,
       storageGate,
       recordDiagnostic: (event) => recordPostgresDiagnosticError(primaryPool, schemaOptions, event),
-      adminHostPolicy: PRODUCTION_ADMIN_HOST_POLICY,
+      // No admin family or Access configuration here: the admin host stays refused.
+      adminHostPolicy: EDGE_TEST_ADMIN_HOST_POLICY,
       unportedRetryAfterSeconds: PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS,
     });
     return {

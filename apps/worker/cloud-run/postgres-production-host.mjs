@@ -25,14 +25,19 @@
  * (POSTGRES_PORTED_WORKER_ROUTE_IDS, with the route modules folded in), the
  * CR-6 handler and EP-6 in front of it.
  *
- * The admin host (OD-CR-3) is a composition-root decision:
- * PRODUCTION_ADMIN_HOST_POLICY stays 'refuse' (503 POSTGRES_ROUTE_NOT_PORTED
- * for every admin-host request). The owner answered OWN-17 in round 12 (open
- * with what is ported); the checklist schedules the flip as ADMIN-R12, after
- * D-CRB. With 'chokepoint' the runtime builds createPostgresAdminAccessChokepoint
- * once over the env, registers C-ADMIN's six routes (no analytics pool while
- * analytics_v2 lives in primary, migration 0059) and injects C-MAINT's
- * lifecycle pass as their run_maintenance task.
+ * The admin host (OD-CR-3) is a composition-root decision. The owner
+ * answered OWN-17 in round 12 (2026-10-02): open it with what is ported, and
+ * show "unavailable" for every section with no GCP source (ADMIN-R12).
+ * PRODUCTION_ADMIN_HOST_POLICY is therefore 'chokepoint': the runtime builds
+ * createPostgresAdminAccessChokepoint once over the env, registers C-ADMIN's
+ * six routes (no analytics pool while analytics_v2 lives in primary,
+ * migration 0059) and injects C-MAINT's lifecycle pass as their
+ * run_maintenance task. No overview source is injected: the synthetic
+ * contribution counts, historical publication and deletion-ledger blocks
+ * answer their explicit unavailable state ('admin-overview-v0.6'), and the
+ * database health reports the removed ledger not_applicable
+ * ('admin-database-health-v0.2'). 'refuse' (503 POSTGRES_ROUTE_NOT_PORTED for
+ * every admin-host request) stays available to a caller that passes it.
  *
  * Nothing here reads process.env except through CR-3, and nothing here
  * logs: the handler and EP-6 own the request and refusal lines.
@@ -197,15 +202,23 @@ export const PRODUCTION_HOST_MODES = Object.freeze({
 });
 
 /**
- * OD-CR-3 for the production and staging admin host: 'refuse'. The owner
- * answered OWN-17 questions 1 and 2 in round 12 (open the admin host with
- * what is ported; sections without a GCP source say "unavailable"), and
- * the cutover checklist schedules that as ADMIN-R12, after D-CRB, together
- * with the overview's unavailable sections and the not_applicable ledger
- * DTO. Flipping this to 'chokepoint' is the one-line change that serves
- * C-ADMIN's six routes behind the Access chokepoint.
+ * OD-CR-3 for the production and staging admin host: 'chokepoint'. The owner
+ * answered OWN-17 questions 1 to 3 in round 12 (open the admin host with
+ * what is ported; sections without a GCP source say "unavailable"; the
+ * removed deletion ledger is not_applicable with a closed-DTO version bump),
+ * built as ADMIN-R12: C-ADMIN's six routes are served behind the Access
+ * chokepoint. Without ACCESS_AUD (round 11's staging roll) the chokepoint
+ * answers every admin-host request 503 ADMIN_NOT_CONFIGURED, as the Worker
+ * does.
  */
-export const PRODUCTION_ADMIN_HOST_POLICY = "refuse";
+export const PRODUCTION_ADMIN_HOST_POLICY = "chokepoint";
+
+/**
+ * The edge-test rehearsal origin (server.mjs, EDGE_ORIGIN_MODE=edge-test)
+ * composes no admin family and no Access configuration, so its admin host
+ * stays refused (503 POSTGRES_ROUTE_NOT_PORTED) after round 12.
+ */
+export const EDGE_TEST_ADMIN_HOST_POLICY = "refuse";
 
 /** OD-CR-6 (iv): unported routes answer without retry-after. */
 export const PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS = null;

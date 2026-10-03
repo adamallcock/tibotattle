@@ -267,7 +267,10 @@ test("a doctored staging template is refused by the renderer", () => {
     doctor("autoscaling.knative.dev/minScale: '0'", "autoscaling.knative.dev/minScale: '1'"),
     doctor("value: '000000000000-tibotattlestaginginert.apps.googleusercontent.com'",
       `value: '${configuration.PRODUCTION_VARS.GOOGLE_OIDC_CLIENT_ID}'`),
-    doctor("value: 'STAGINGK01'", `value: '${configuration.PRODUCTION_VARS.APPLE_KEY_ID}'`),
+    // Round 12: a pre-round-12 Apple setting or sign-in secret reference is refused.
+    before("HOST_MODE", "            - name: APPLE_KEY_ID\n              value: 'STAGINGK01'\n"),
+    before("IDENTITY_LINK_SECRET", "            - name: GOOGLE_OIDC_CLIENT_SECRET\n              valueFrom:\n"
+      + "                secretKeyRef:\n                  name: GOOGLE_OIDC_CLIENT_SECRET\n                  key: '1'\n"),
     doctor("\"bucket\":\"${GCS_BUCKET_NAME}\"", "\"bucket\":\"tibotattle-staging-other\""),
     doctor("\"softDeleteRetentionDurationSeconds\":\"0\"", "\"softDeleteRetentionDurationSeconds\":\"604800\""),
     doctor("            - name: GCS_QUARANTINE_BUCKET_HISTORY_PROOF\n", "            - name: GCS_QUARANTINE_PROOF_OTHER\n"),
@@ -372,8 +375,9 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     .map((entry) => `${entry.id}:${entry.deferred}`);
   const first = plan();
   assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
-  // 26 plane operations plus the verifier token-creator grant (operator named 2026-10-02).
-  assert.equal(first.summary.executable, 27);
+  // 24 plane operations plus the verifier token-creator grant (operator named 2026-10-02);
+  // round 12 retired the two sign-in secrets, and with them their two containers.
+  assert.equal(first.summary.executable, 25);
   // D-CRB composes HOST_MODE staging, so the service waits only for the bootstrap image.
   assert.ok(deferred(first).includes("run-service:create:BOOTSTRAP_IMAGE_REQUIRED"));
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));

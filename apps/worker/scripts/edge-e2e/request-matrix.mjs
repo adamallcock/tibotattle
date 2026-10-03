@@ -22,6 +22,9 @@
 //   answer: 503 POSTGRES_ROUTE_NOT_PORTED in the Worker envelope, no-store,
 //   no retry-after (OD-CR-6 (iv)). Its body carries the request id, so the
 //   comparator reads fields, never bytes.
+// - definite: a route owner round 12 retired with a definite answer instead
+//   (the registry's RETIRED_ROUTE_DEFINITE_ANSWERS, passed in): that status
+//   and code in the Worker envelope, no-store, no retry-after.
 
 /** Fixed synthetic values the rows use; none is a real credential. */
 export const MATRIX_VALUES = Object.freeze({
@@ -280,11 +283,12 @@ export function forwardedRows({ registry }) {
 
 /**
  * S3's sweep: one request for every forwarded (route, method) pair, each
- * expected to be served (servedRouteIds: the production ported list) or to
- * answer the closed unported 503, and to carry the admission header exactly
- * when EP-1 names the route.
+ * expected to be served (servedRouteIds: the production ported list), to
+ * answer its retired-definite answer (definiteAnswers: route id -> {status,
+ * code}) or to answer the closed unported 503, and to carry the admission
+ * header exactly when EP-1 names the route.
  */
-export function sweepRows({ registry, servedRouteIds }) {
+export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
   const served = new Set(servedRouteIds);
   const rows = [];
   for (const route of registry) {
@@ -305,8 +309,15 @@ export function sweepRows({ registry, servedRouteIds }) {
           ...(post ? { "content-type": "application/json" } : {}),
         },
         ...(post ? { body: "{}" } : {}),
-        comparators: served.has(route.id) ? ["transparency"] : ["transparency", "unported"],
-        expect: { served: served.has(route.id) },
+        ...(Object.hasOwn(definiteAnswers, route.id)
+          ? {
+            comparators: ["transparency", "definite"],
+            expect: { status: definiteAnswers[route.id].status, code: definiteAnswers[route.id].code },
+          }
+          : {
+            comparators: served.has(route.id) ? ["transparency"] : ["transparency", "unported"],
+            expect: { served: served.has(route.id) },
+          }),
       }));
     }
   }

@@ -3,8 +3,9 @@
  *
  * d43c8f92 handleAdminDatabaseHealth in access mode: GET only, any query
  * string (even an empty value) is 400 BODY_INVALID, then the closed
- * 'admin-database-health-v0.1' DTO from the injected readDatabaseHealth
- * adapter (src/postgres-admin-database-health.ts by default).
+ * 'admin-database-health-v0.2' DTO from the injected readDatabaseHealth
+ * adapter (src/postgres-admin-database-health.ts by default): the Worker's
+ * v0.1 with the removed deletion ledger reported not_applicable (round 12).
  */
 
 import { ApiError } from "../../src/errors.ts";

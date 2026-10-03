@@ -372,9 +372,12 @@ test("pins are exact, validated, one line each, and never move an existing pin",
   for (const [value, code] of [
     [{ IDENTITY_LINK_SECRET: "5" }, "STAGING_SECRET_VERSION_ALREADY_PINNED:IDENTITY_LINK_SECRET"],
     [{ OTHER_SECRET: "1" }, "STAGING_SECRET_UNKNOWN:OTHER_SECRET"],
-    [{ APPLE_PRIVATE_KEY: "0" }, "STAGING_SECRET_VERSION_INVALID:APPLE_PRIVATE_KEY"],
-    [{ APPLE_PRIVATE_KEY: 1 }, "STAGING_SECRET_VERSION_INVALID:APPLE_PRIVATE_KEY"],
-    [{ APPLE_PRIVATE_KEY: "latest" }, "STAGING_SECRET_VERSION_INVALID:APPLE_PRIVATE_KEY"],
+    // Round 12 retired the sign-in secrets: they are no staging secret to pin.
+    [{ APPLE_PRIVATE_KEY: "1" }, "STAGING_SECRET_UNKNOWN:APPLE_PRIVATE_KEY"],
+    [{ GOOGLE_OIDC_CLIENT_SECRET: "1" }, "STAGING_SECRET_UNKNOWN:GOOGLE_OIDC_CLIENT_SECRET"],
+    [{ DISTRIBUTION_GITHUB_API_TOKEN: "0" }, "STAGING_SECRET_VERSION_INVALID:DISTRIBUTION_GITHUB_API_TOKEN"],
+    [{ DISTRIBUTION_GITHUB_API_TOKEN: 1 }, "STAGING_SECRET_VERSION_INVALID:DISTRIBUTION_GITHUB_API_TOKEN"],
+    [{ DISTRIBUTION_GITHUB_API_TOKEN: "latest" }, "STAGING_SECRET_VERSION_INVALID:DISTRIBUTION_GITHUB_API_TOKEN"],
     [{}, "STAGING_SECRET_PINS_INVALID"],
   ]) {
     assert.throws(() => pins.pinStagingSecretVersions(secret.text, value), { code }, code);
@@ -385,8 +388,8 @@ test("pins are exact, validated, one line each, and never move an existing pin",
   }
   // A reformatted file is not edited blindly.
   const reformatted = JSON.stringify(JSON.parse(STAGING_TEXT), null, 4);
-  assert.throws(() => pins.pinStagingSecretVersions(reformatted, { APPLE_PRIVATE_KEY: "1" }),
-    { code: "STAGING_DESIRED_STATE_LAYOUT_UNEXPECTED:secrets.APPLE_PRIVATE_KEY" });
+  assert.throws(() => pins.pinStagingSecretVersions(reformatted, { DISTRIBUTION_GITHUB_API_TOKEN: "1" }),
+    { code: "STAGING_DESIRED_STATE_LAYOUT_UNEXPECTED:secrets.DISTRIBUTION_GITHUB_API_TOKEN" });
   // Only the committed staging file: never production, never the synthetic fixture.
   assert.throws(() => pins.pinStagingSecretVersions(PRODUCTION_TEXT, { ENVELOPE_PRIVATE_JWK: "1" }),
     { code: "GCP_INFRA_ENVIRONMENT_MISMATCH" });
@@ -401,7 +404,7 @@ test("the staging file is replaced atomically and never through a symlink", asyn
   await withDirectory(async (directory) => {
     const path = join(directory, "staging.desired-state.json");
     await writeFile(path, STAGING_TEXT);
-    const next = pins.pinStagingSecretVersions(STAGING_TEXT, { APPLE_PRIVATE_KEY: "2" }).text;
+    const next = pins.pinStagingSecretVersions(STAGING_TEXT, { DISTRIBUTION_GITHUB_API_TOKEN: "2" }).text;
     pins.writeStagingDesiredStateFile(next, path);
     assert.equal(await readFile(path, "utf8"), next);
     assert.deepEqual((await import("node:fs")).readdirSync(directory), ["staging.desired-state.json"]);

@@ -201,7 +201,8 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   // The fixture's three jobs and the maintenance trigger (created, paused, then
   // granted) add four; the refresh trigger's create and the scheduler's
   // executor grant on the refresh job wait for the owner's cadence.
-  assert.deepEqual(result.summary, { executable: 38, deferred: 2, refused: 0 });
+  // Round 12 retired the two sign-in secrets, so the fixture holds five containers.
+  assert.deepEqual(result.summary, { executable: 36, deferred: 2, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -409,7 +410,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
-  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 39, deferred: 0, refused: 0 });
   gcloud.calls.length = 0;
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
@@ -422,7 +423,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const firstMutation = sequence.indexOf("mutate");
   const lastMutation = sequence.lastIndexOf("mutate");
   assert.ok(firstMutation > 0 && sequence.slice(0, firstMutation).every((kind) => kind === "read"));
-  assert.equal(sequence.filter((kind) => kind === "mutate").length, 41);
+  assert.equal(sequence.filter((kind) => kind === "mutate").length, 39);
   assert.ok(sequence.slice(lastMutation + 1).every((kind) => kind === "read"));
   // Both triggers were created and then paused; apply never resumes either.
   assert.equal(trigger(world).state, "PAUSED");
@@ -444,7 +445,7 @@ test("by default the analytics-refresh job deploys, and its trigger is created a
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
-  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 39, deferred: 0, refused: 0 });
   // Create, then pause at once, then (only then) the scheduler's run.jobsExecutor, for each trigger in turn.
   const executor = `run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
   const maintenanceExecutor = `run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
@@ -743,14 +744,14 @@ test("first creates wait for a bootstrap image and the owner's pinned, enabled s
   assert.equal(noValues.operations.find((entry) => entry.id === "run-service:create").deferred,
     "SECRET_VERSION_UNAVAILABLE:IDENTITY_LINK_SECRET");
   assert.ok(noValues.operations.some((entry) => entry.id === "secret:create:IDENTITY_LINK_SECRET"));
-  const unpinned = desiredState({ synthetic: false, mutate: (value) => { value.secrets.APPLE_PRIVATE_KEY.version = null; } });
+  const unpinned = desiredState({ synthetic: false, mutate: (value) => { value.secrets.ENVELOPE_PRIVATE_JWK.version = null; } });
   assert.equal(plan(unpinned, fake(unpinned, bornWorld(unpinned)).runner, { bootstrap: BOOTSTRAP })
-    .operations.find((entry) => entry.id === "run-service:create").deferred, "SECRET_VERSION_UNPINNED:APPLE_PRIVATE_KEY");
+    .operations.find((entry) => entry.id === "run-service:create").deferred, "SECRET_VERSION_UNPINNED:ENVELOPE_PRIVATE_JWK");
   const disabled = bornWorld(desired);
-  disabled.secretVersions.GOOGLE_OIDC_CLIENT_SECRET[0].state = "DISABLED";
+  disabled.secretVersions.POSTGRES_RATE_LIMIT_SECRET[0].state = "DISABLED";
   assert.equal(plan(desired, fake(desired, disabled).runner, { bootstrap: BOOTSTRAP })
     .operations.find((entry) => entry.id === "run-service:create").deferred,
-  "SECRET_VERSION_UNAVAILABLE:GOOGLE_OIDC_CLIENT_SECRET");
+  "SECRET_VERSION_UNAVAILABLE:POSTGRES_RATE_LIMIT_SECRET");
   assert.throws(() => operations.normalizeBootstrap({ imageDigest: "latest", sourceCommit: "d".repeat(40) }),
     { code: "BOOTSTRAP_IMAGE_INVALID" });
 });

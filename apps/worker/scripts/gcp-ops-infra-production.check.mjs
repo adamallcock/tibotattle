@@ -130,22 +130,27 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     value.service.telemetryStorageNamespace = "synthetic-namespace";
   });
   const second = plan({ bootstrap: IMAGE });
-  // The scheduler account's executor grant on the refresh job is not among them: with no cadence
-  // there is no refresh trigger, and the grant waits for the plan that creates and pauses one
-  // (SCHEDULER_CADENCE_UNSET). The maintenance job's trigger has its pinned cadence (D-OPS4), so it
-  // is created, paused at once, and only then granted.
-  assert.deepEqual(executable(second), ["run-job:create:production-migrate", "run-job:create:analytics-refresh",
+  // ROUTES-R12 narrowed CR-3 to the committed secrets, so the service and its two invoker
+  // grants are created in this pass. The scheduler account's executor grant on the refresh job is
+  // not among them: with no cadence there is no refresh trigger, and the grant waits for the plan
+  // that creates and pauses one (SCHEDULER_CADENCE_UNSET). The maintenance job's trigger has its
+  // pinned cadence (D-OPS4), so it is created, paused at once, and only then granted.
+  assert.deepEqual(executable(second), [
+    "run-service:create",
+    "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|",
+    "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|",
+    "run-job:create:production-migrate", "run-job:create:analytics-refresh",
     "run-job:create:maintenance", "scheduler:create:maintenance", "scheduler:pause:maintenance", MAINTENANCE_EXECUTOR]);
   assert.deepEqual(deferred(second).filter((entry) => entry.endsWith(":SCHEDULER_CADENCE_UNSET")), [
     "scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET", `${EXECUTOR}:SCHEDULER_CADENCE_UNSET`]);
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
-  // The service waits for ROUTES-R12: CR-3 still requires the retired Google secret.
-  assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], [
-    "DEFERRED:run-service:create:SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET",
-    "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|:SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET",
-    "DEFERRED:run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|:SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET",
-  ]);
+  // Nothing waits any more: the service composed with the committed secrets.
+  assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], []);
+  // The rendered service mounts exactly the four kept secrets, none of them a retired sign-in one.
+  assert.equal(world.services.length, 1);
+  assert.deepEqual(world.services[0].spec.template.spec.containers[0].env
+    .filter((entry) => entry.valueFrom !== undefined).map((entry) => entry.name), [...KEPT_SECRETS]);
   // Pass 2 still creates no refresh trigger: the cadence is the owner's, and the clean reasons above
   // omit it. Nor does the scheduler account hold run.jobsExecutor on the refresh job: both wait for
   // the cadence. The only trigger is the maintenance job's, PAUSED, with its grant.
@@ -161,7 +166,6 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   assert.deepEqual([...operations.infrastructureCleanliness(plan(), { requireCadence: true }).reasons.filter(
     (reason) => reason.endsWith(":SCHEDULER_CADENCE_UNSET"))], [
     "DEFERRED:scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET", `DEFERRED:${EXECUTOR}:SCHEDULER_CADENCE_UNSET`]);
-  assert.deepEqual(world.services, []);
   // Every mutation named the production project and nothing else.
   const mutations = gcloud.calls.filter((call) => operations.classifyGcloudCommand(call) === "mutate");
   assert.ok(mutations.length > 0);

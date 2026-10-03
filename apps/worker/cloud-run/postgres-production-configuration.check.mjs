@@ -36,17 +36,15 @@ const vite = await createServer({
 });
 let canonical;
 try {
-  const [storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication, quarantineStore] = await Promise.all([
+  const [storage, crypto, identityLink, postgresClient, rateLimiter, quarantineStore] = await Promise.all([
     vite.ssrLoadModule("/src/telemetry-storage-mode.ts"),
     vite.ssrLoadModule("/src/crypto.ts"),
     vite.ssrLoadModule("/src/identity-link-configuration.ts"),
     vite.ssrLoadModule("/src/postgres-client.ts"),
-    vite.ssrLoadModule("/src/identity-apple.ts"),
     vite.ssrLoadModule("/src/postgres-rate-limiter.ts"),
-    vite.ssrLoadModule("/src/storage-publication-worker.ts"),
     vite.ssrLoadModule("/src/gcs-quarantine-object-store.ts"),
   ]);
-  canonical = { storage, crypto, identityLink, postgresClient, apple, rateLimiter, publication, quarantineStore };
+  canonical = { storage, crypto, identityLink, postgresClient, rateLimiter, quarantineStore };
 } finally {
   await vite.close();
 }
@@ -57,8 +55,6 @@ try {
 const SECRET_VALUES = Object.freeze({
   IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-value-0000000001",
   POSTGRES_RATE_LIMIT_SECRET: "synthetic-rate-limit-secret-value-00000000002",
-  GOOGLE_OIDC_CLIENT_SECRET: "synthetic-google-client-secret-value-3",
-  APPLE_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGljLWFwcGxlLWtleQ==\\n-----END PRIVATE KEY-----",
   DISTRIBUTION_GITHUB_API_TOKEN: "synthetic-github-token-value-4",
 });
 const PRIVATE_EXPONENT = "synthetic-private-exponent-value-5";
@@ -115,8 +111,6 @@ function serviceSecrets() {
     ...envelopeKeys("key:synthetic-production-check"),
     IDENTITY_LINK_SECRET: SECRET_VALUES.IDENTITY_LINK_SECRET,
     POSTGRES_RATE_LIMIT_SECRET: SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET,
-    GOOGLE_OIDC_CLIENT_SECRET: SECRET_VALUES.GOOGLE_OIDC_CLIENT_SECRET,
-    APPLE_PRIVATE_KEY: SECRET_VALUES.APPLE_PRIVATE_KEY,
     DISTRIBUTION_GITHUB_API_TOKEN: SECRET_VALUES.DISTRIBUTION_GITHUB_API_TOKEN,
   };
 }
@@ -124,15 +118,26 @@ function serviceSecrets() {
 // The secrets each job consumes, listed here independently of the module.
 const JOB_SECRET_NAMES = Object.freeze({
   "maintenance-job": ["IDENTITY_LINK_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"],
-  "analytics-job": [],
   "staging-maintenance-job": ["IDENTITY_LINK_SECRET"],
-  "staging-analytics-job": [],
 });
 const JOB_PROFILES = Object.freeze(Object.keys(JOB_SECRET_NAMES));
 const SERVICE_ONLY_SECRET_NAMES = Object.freeze([
   "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
-  "GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY",
 ]);
+// Owner round 12 (2026-10-02): the analytics-refresh job is governed by
+// C-REFRESH's contract alone; these former CR-3 profiles are no profiles.
+const RETIRED_PROFILES = Object.freeze(["analytics-job", "staging-analytics-job"]);
+// Owner round 12: native social sign-in retires, so these Worker settings
+// are never origin configuration and are refused when present, even empty.
+const RETIRED_SOCIAL_SIGN_IN_SECRETS = Object.freeze({
+  GOOGLE_OIDC_CLIENT_SECRET: "synthetic-google-client-secret-value-3",
+  APPLE_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGljLWFwcGxlLWtleQ==\\n-----END PRIVATE KEY-----",
+});
+const RETIRED_SOCIAL_SIGN_IN_VARS = Object.freeze({
+  APPLE_SERVICES_ID: "example.synthetic.staging",
+  APPLE_KEY_ID: "SYNTHKEY01",
+  APPLE_TEAM_ID: "SYNTHTEAM1",
+});
 
 function productionEnv(overrides = {}) {
   return {
@@ -165,9 +170,6 @@ function stagingPlane() {
     ACCESS_ADMIN_EMAIL: "owner@synthetic.example",
     IDENTITY_LINK_SECRET_VERSION: "staging-v1",
     GOOGLE_OIDC_CLIENT_ID: "123456789012-syntheticstaging.apps.googleusercontent.com",
-    APPLE_SERVICES_ID: "example.synthetic.staging",
-    APPLE_KEY_ID: "SYNTHKEY01",
-    APPLE_TEAM_ID: "SYNTHTEAM1",
   };
 }
 
@@ -222,7 +224,9 @@ function serviceBindings(originTier = configuration.ORIGIN_TIER_RATE_LIMITS) {
   }));
 }
 
-const LEAK_MARKERS = Object.freeze([...Object.values(SECRET_VALUES), PRIVATE_EXPONENT]);
+const LEAK_MARKERS = Object.freeze([
+  ...Object.values(SECRET_VALUES), ...Object.values(RETIRED_SOCIAL_SIGN_IN_SECRETS), PRIVATE_EXPONENT,
+]);
 
 // The deletion-ledger and bucket-history settings the single-instance
 // configuration retired (decisions D2 and D4, SIMP-0 item 7). Each is refused
@@ -233,13 +237,16 @@ const RETIRED_LEDGER_VARIABLE_NAMES = Object.freeze([
 ]);
 
 // The refused variables, listed here independently of the module. Each one's
-// code is `${name}_FORBIDDEN`.
+// code is `${name}_FORBIDDEN`, except the retired sign-in settings below.
 const FORBIDDEN_VARIABLE_NAMES = Object.freeze([
   "ACCESS_TEST_JWKS_JSON", "ADMIN_OWNER_FIXTURE_JSON", "ADMIN_OWNER_PREVIOUS_FIXTURE_JSON",
   "DISTRIBUTION_ANALYTICS_API_TOKEN",
   "EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON", "EDGE_PROOF_SECRET", "EDGE_PROOF_SHA256",
   "IDENTITY_TEST_JWKS_JSON", "POSTGRES_TEST_HTTP_MODE", "SPARKLE_APPCAST_GUARD_TOKEN",
   ...RETIRED_LEDGER_VARIABLE_NAMES,
+]);
+const RETIRED_SIGN_IN_SETTING_NAMES = Object.freeze([
+  ...Object.keys(RETIRED_SOCIAL_SIGN_IN_SECRETS), ...Object.keys(RETIRED_SOCIAL_SIGN_IN_VARS),
 ]);
 
 // Every D1, R2 and asset binding and every test or development seam the
@@ -354,18 +361,11 @@ test("exports the frozen production constants", () => {
     UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 6, periodSeconds: 60 },
   });
   assert.deepEqual(configuration.PRODUCTION_CONFIGURATION_PROFILES, [
-    "production", "staging", "maintenance-job", "analytics-job",
-    "staging-maintenance-job", "staging-analytics-job",
+    "production", "staging", "maintenance-job", "staging-maintenance-job",
   ]);
-  const analyticsSwitches = [
-    "POSTGRES_ANALYTICS_MODE", "POSTGRES_ANALYTICS_PUBLICATION_LANE",
-    "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL",
-  ];
   assert.deepEqual(configuration.PRODUCTION_JOB_SWITCH_NAMES, {
     "maintenance-job": ["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"],
-    "analytics-job": analyticsSwitches,
     "staging-maintenance-job": ["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"],
-    "staging-analytics-job": analyticsSwitches,
   });
   // The staging Worker's closed posture (wrangler.jsonc env.staging).
   assert.deepEqual(configuration.STAGING_CONTAINMENT_VARS, {
@@ -393,9 +393,16 @@ test("exports the frozen production constants", () => {
     "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_AUTHORIZATION_RATE_LIMIT",
     "UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_INGRESS_BUDGET",
   ]);
+  // Round 12: the Google and Apple sign-in secrets are no CR-3 secret.
   assert.deepEqual(configuration.REQUIRED_SECRET_NAMES, [
-    "IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK",
-    "ENVELOPE_PRIVATE_JWK", "GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY",
+    "IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
+  ]);
+  assert.deepEqual(configuration.RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES, ["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+  assert.deepEqual(configuration.RETIRED_SOCIAL_SIGN_IN_VAR_NAMES, ["APPLE_SERVICES_ID", "APPLE_KEY_ID", "APPLE_TEAM_ID"]);
+  assert.deepEqual(configuration.RETIRED_SOCIAL_SIGN_IN_SETTINGS, RETIRED_SIGN_IN_SETTING_NAMES);
+  assert.deepEqual(configuration.STAGING_PROVIDED_VAR_NAMES, [
+    "PUBLIC_ORIGIN", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "ACCESS_ADMIN_EMAIL", "IDENTITY_LINK_SECRET_VERSION",
+    "GOOGLE_OIDC_CLIENT_ID",
   ]);
   assert.deepEqual(configuration.OPTIONAL_SECRET_NAMES, ["DISTRIBUTION_GITHUB_API_TOKEN"]);
   const service = {
@@ -406,18 +413,17 @@ test("exports the frozen production constants", () => {
     production: service,
     staging: service,
     "maintenance-job": { required: ["IDENTITY_LINK_SECRET"], optional: ["DISTRIBUTION_GITHUB_API_TOKEN"] },
-    "analytics-job": { required: [], optional: [] },
     "staging-maintenance-job": { required: ["IDENTITY_LINK_SECRET"], optional: [] },
-    "staging-analytics-job": { required: [], optional: [] },
   });
   for (const profile of JOB_PROFILES) {
     const { required, optional } = configuration.PRODUCTION_PROFILE_SECRET_NAMES[profile];
     assert.deepEqual([...required, ...optional], JOB_SECRET_NAMES[profile], profile);
   }
   // Pinned independently of the module, so dropping or relabelling an entry fails here.
-  assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLES, Object.fromEntries(
-    FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
-  ));
+  assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLES, Object.fromEntries([
+    ...FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
+    ...RETIRED_SIGN_IN_SETTING_NAMES.map((name) => [name, `${name}_RETIRED`]),
+  ]));
   assert.deepEqual(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES, {
     HOST_RATE_LIMIT_: "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN",
     LEDGER_: "LEDGER_CONFIGURATION_FORBIDDEN",
@@ -451,7 +457,8 @@ test("exports the frozen production constants", () => {
   for (const label of ["production-v1", "staging-v1", undefined]) {
     assert.equal(configuration.isRotatedIdentityLinkVersion(label), false, String(label));
   }
-  // Staging refuses each of these; both OAuth client identities are included.
+  // Staging refuses each of these; both OAuth client identities are included,
+  // the retired Apple ones as literals (round 12 removed them from the vars).
   assert.deepEqual(configuration.PRODUCTION_RESOURCE_FINGERPRINT, {
     origins: ["https://tibotattle.com", "https://admin.tibotattle.com", "https://www.tibotattle.com"],
     hosts: ["tibotattle.com", "admin.tibotattle.com", "www.tibotattle.com"],
@@ -460,7 +467,7 @@ test("exports the frozen production constants", () => {
     retiredIdentityLinkSecretVersions: ["production-v1"],
     googleOidcClientId: vars.GOOGLE_OIDC_CLIENT_ID,
     appleServicesId: "com.usagemonitor.web",
-    appleKeyId: vars.APPLE_KEY_ID,
+    appleKeyId: "L58X7J2J7A",
     cloudflareResourceNames: [
       "app-usagemonitor",
       "app-usagemonitor-production",
@@ -469,6 +476,12 @@ test("exports the frozen production constants", () => {
       "tibotattle-updates",
     ],
   });
+  for (const name of RETIRED_SIGN_IN_SETTING_NAMES) {
+    assert.equal(Object.hasOwn(vars, name), false, name);
+    assert.equal(configuration.STAGING_PROVIDED_VAR_NAMES.includes(name), false, name);
+    assert.equal([...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES].includes(name),
+      false, name);
+  }
   for (const name of Object.keys(vars)) {
     assert.equal(configuration.EDGE_ONLY_VAR_NAMES.includes(name), false, name);
     assert.equal(configuration.EDGE_ONLY_VAR_PREFIXES.some((prefix) => name.startsWith(prefix)), false, name);
@@ -577,6 +590,8 @@ test("an optional secret may be absent", () => {
 test("each forbidden variable aborts with its own code in every profile, even when empty", () => {
   const cases = [
     ...FORBIDDEN_VARIABLE_NAMES.map((name) => [name, `${name}_FORBIDDEN`]),
+    // Round 12: a pre-round-12 template's sign-in settings fail closed.
+    ...RETIRED_SIGN_IN_SETTING_NAMES.map((name) => [name, `${name}_RETIRED`]),
     ["HOST_RATE_LIMIT_ENROLLMENT_RATE_LIMIT_LIMIT", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
     ["HOST_RATE_LIMIT_CLIENT_ATTEMPT_RATE_LIMIT_PERIOD_SECONDS", "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN"],
     // Any other ledger-named setting, by prefix.
@@ -584,7 +599,8 @@ test("each forbidden variable aborts with its own code in every profile, even wh
   ];
   assert.equal(new Set(cases.map(([, code]) => code)).size, cases.length - 1);
   for (const [name, code] of cases) {
-    for (const value of ["synthetic-forbidden-value", ""]) {
+    for (const value of ["synthetic-forbidden-value", "", RETIRED_SOCIAL_SIGN_IN_SECRETS[name]].filter(
+      (candidate) => candidate !== undefined)) {
       expectCode(() => readProductionConfiguration(productionEnv({ [name]: value }), "production"), code);
       expectCode(() => readProductionConfiguration(stagingEnv({ [name]: value }), "staging"), code);
       for (const profile of JOB_PROFILES) {
@@ -630,10 +646,10 @@ test("each job requires only the secrets it consumes and refuses the rest", () =
           `${name}_PROFILE_FORBIDDEN`);
       }
     }
-    assertNoLeak(env, [SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET, SECRET_VALUES.APPLE_PRIVATE_KEY,
-      SECRET_VALUES.GOOGLE_OIDC_CLIENT_SECRET, PRIVATE_EXPONENT]);
+    assertNoLeak(env, [SECRET_VALUES.POSTGRES_RATE_LIMIT_SECRET, PRIVATE_EXPONENT]);
   }
-  // The production maintenance job reads the optional GitHub token; the staging one never does.
+  // The production maintenance job accepts the optional GitHub token (its
+  // lifecycle pass never reads it); the staging one refuses it.
   const withoutToken = expectAccepted(without(jobEnv("maintenance-job"), "DISTRIBUTION_GITHUB_API_TOKEN"),
     "maintenance-job");
   assert.deepEqual(Object.keys(withoutToken.secrets), ["IDENTITY_LINK_SECRET"]);
@@ -662,7 +678,9 @@ test("malformed secrets abort with named codes and never echo a value", () => {
       "ENVELOPE_PRIVATE_JWK_INVALID"],
     [{ ENVELOPE_PRIVATE_JWK: JSON.stringify({ kty: "RSA", kid: "key:other", n: "n", e: "e", d: marker }) },
       "ENVELOPE_KEY_ID_MISMATCH"],
-    [{ APPLE_PRIVATE_KEY: marker }, "APPLE_PRIVATE_KEY_INVALID"],
+    // Round 12: a retired sign-in secret is refused by name before any parse.
+    [{ APPLE_PRIVATE_KEY: marker }, "APPLE_PRIVATE_KEY_RETIRED"],
+    [{ GOOGLE_OIDC_CLIENT_SECRET: marker }, "GOOGLE_OIDC_CLIENT_SECRET_RETIRED"],
     [{ DISTRIBUTION_GITHUB_API_TOKEN: "x".repeat(65_537) }, "DISTRIBUTION_GITHUB_API_TOKEN_INVALID"],
   ];
   for (const [overrides, code] of cases) {
@@ -858,9 +876,9 @@ test("staging requires its own plane and aborts on any production value", () => 
     [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
     [{ IDENTITY_LINK_SECRET_VERSION: "production-v2" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
     [{ GOOGLE_OIDC_CLIENT_ID: production.GOOGLE_OIDC_CLIENT_ID }, "GOOGLE_OIDC_CLIENT_ID_PRODUCTION_VALUE_FORBIDDEN"],
-    // Apple's OAuth client (the id_token audience) is separated like Google's.
-    [{ APPLE_SERVICES_ID: production.APPLE_SERVICES_ID }, "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
-    [{ APPLE_KEY_ID: production.APPLE_KEY_ID }, "APPLE_KEY_ID_PRODUCTION_VALUE_FORBIDDEN"],
+    // Round 12: the staging plane carries no Apple setting at all.
+    [{ APPLE_SERVICES_ID: "com.usagemonitor.web" }, "APPLE_SERVICES_ID_RETIRED"],
+    [{ APPLE_KEY_ID: "L58X7J2J7A" }, "APPLE_KEY_ID_RETIRED"],
     [{ GCS_BUCKET_NAME: "app-usagemonitor-production-quarantine" },
       "GCS_BUCKET_NAME_PRODUCTION_VALUE_FORBIDDEN"],
     [{ K_SERVICE: "tibotattle-production-staging" }, "K_SERVICE_PRODUCTION_VALUE_FORBIDDEN"],
@@ -895,23 +913,18 @@ test("staging requires its own plane and aborts on any production value", () => 
     [{ IDENTITY_LINK_SECRET_VERSION: "-staging" }, "IDENTITY_LINK_SECRET_VERSION_INVALID"],
     [{ GOOGLE_OIDC_CLIENT_ID: "not-a-client-id" }, "GOOGLE_OIDC_CLIENT_ID_INVALID"],
     [{ GOOGLE_OIDC_CLIENT_ID: "123456789012-synthetic.apps.example.com" }, "GOOGLE_OIDC_CLIENT_ID_INVALID"],
-    [{ APPLE_SERVICES_ID: ".synthetic.staging" }, "APPLE_SERVICES_ID_INVALID"],
-    [{ APPLE_SERVICES_ID: "synthetic staging" }, "APPLE_SERVICES_ID_INVALID"],
-    [{ APPLE_TEAM_ID: "synthteam1" }, "APPLE_TEAM_ID_INVALID"],
-    [{ APPLE_TEAM_ID: "SYNTHTEAM" }, "APPLE_TEAM_ID_INVALID"],
-    [{ APPLE_KEY_ID: "SYNTHKEY001" }, "APPLE_KEY_ID_INVALID"],
-    [without(stagingEnv(), "APPLE_KEY_ID"), "APPLE_KEY_ID_MISSING"],
+    ...Object.entries(RETIRED_SOCIAL_SIGN_IN_VARS).map(([name, value]) => [{ [name]: value }, `${name}_RETIRED`]),
+    [without(stagingEnv(), "GOOGLE_OIDC_CLIENT_ID"), "GOOGLE_OIDC_CLIENT_ID_MISSING"],
   ];
   for (const [overrides, code] of cases) {
     const env = "HOST_MODE" in overrides ? overrides : stagingEnv(overrides);
     expectCode(() => readProductionConfiguration(env, "staging"), code);
   }
-  // Staging may share the owner's Access team, admin email and Apple team;
-  // those identify no production secret, data plane or OAuth client.
+  // Staging may share the owner's Access team and admin email; those
+  // identify no production secret, data plane or OAuth client.
   expectAccepted(stagingEnv({
     ACCESS_TEAM_DOMAIN: production.ACCESS_TEAM_DOMAIN,
     ACCESS_ADMIN_EMAIL: production.ACCESS_ADMIN_EMAIL,
-    APPLE_TEAM_ID: production.APPLE_TEAM_ID,
   }), "staging");
   assert.equal(expectAccepted(stagingEnv({ ACCESS_ADMIN_EMAIL: email254 }), "staging")
     .vars.ACCESS_ADMIN_EMAIL, email254);
@@ -985,7 +998,7 @@ test("staging is synthetic-only by default: a closed posture no setting can open
 });
 
 test("staging jobs run on the staging plane with its identity, origins and markers", () => {
-  for (const profile of ["staging-maintenance-job", "staging-analytics-job"]) {
+  for (const profile of ["staging-maintenance-job"]) {
     const config = expectAccepted(jobEnv(profile, {
       ENROLLMENT_MODE: "open",
       INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized",
@@ -1023,13 +1036,15 @@ test("staging jobs run on the staging plane with its identity, origins and marke
         "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
       [{ IDENTITY_LINK_SECRET_VERSION: "production-v2" },
         "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
-      [{ APPLE_SERVICES_ID: configuration.PRODUCTION_VARS.APPLE_SERVICES_ID },
-        "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ GOOGLE_OIDC_CLIENT_ID: configuration.PRODUCTION_VARS.GOOGLE_OIDC_CLIENT_ID },
+        "GOOGLE_OIDC_CLIENT_ID_PRODUCTION_VALUE_FORBIDDEN"],
+      // Round 12: a staging job carries no Apple setting either.
+      [{ APPLE_SERVICES_ID: "com.usagemonitor.web" }, "APPLE_SERVICES_ID_RETIRED"],
       [{ PUBLIC_ORIGIN: "https://tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" },
         "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
       [{ ADMIN_HOST_ORIGIN: "https://ops.other.example" }, "ADMIN_HOST_ORIGIN_INVALID"],
       [without(jobEnv(profile), "PUBLIC_ORIGIN"), "PUBLIC_ORIGIN_MISSING"],
-      [without(jobEnv(profile), "APPLE_TEAM_ID"), "APPLE_TEAM_ID_MISSING"],
+      [without(jobEnv(profile), "GOOGLE_OIDC_CLIENT_ID"), "GOOGLE_OIDC_CLIENT_ID_MISSING"],
     ];
     for (const [overrides, code] of cases) {
       const env = "DEPLOYMENT_SOURCE_COMMIT" in overrides ? overrides : jobEnv(profile, overrides);
@@ -1101,8 +1116,6 @@ test("the frozen env holds only named keys, pinned vars and the injected binding
     "IDENTITY_LINK_SECRET",
     "ENVELOPE_PUBLIC_JWK",
     "ENVELOPE_PRIVATE_JWK",
-    "GOOGLE_OIDC_CLIENT_SECRET",
-    "APPLE_PRIVATE_KEY",
     "DISTRIBUTION_GITHUB_API_TOKEN",
     ...configuration.PRODUCTION_WORKER_BINDING_NAMES,
   ].sort());
@@ -1118,7 +1131,8 @@ test("the frozen env holds only named keys, pinned vars and the injected binding
   assert.equal(env.ACCESS_AUD, configuration.PRODUCTION_VARS.ACCESS_AUD);
   assert.equal(env.EDGE_ORIGIN_MODE, "cloudflare-worker-iam");
   assert.equal(env.IDENTITY_LINK_SECRET, SECRET_VALUES.IDENTITY_LINK_SECRET);
-  assert.equal(env.GOOGLE_OIDC_CLIENT_SECRET, SECRET_VALUES.GOOGLE_OIDC_CLIENT_SECRET);
+  // Round 12: no retired sign-in setting reaches the Worker env.
+  for (const name of configuration.RETIRED_SOCIAL_SIGN_IN_SETTINGS) assert.equal(Reflect.get(env, name), undefined, name);
   for (const name of configuration.PRODUCTION_WORKER_BINDING_NAMES) {
     assert.equal(env[name], bindings[name], name);
   }
@@ -1307,68 +1321,38 @@ test("the maintenance-job profile requires the enabled switch and carries it", (
     "PRODUCTION_JOB_BINDINGS_FORBIDDEN");
 });
 
-test("the analytics-job profiles carry their switches with Worker semantics", () => {
-  for (const profile of ["analytics-job", "staging-analytics-job"]) {
-    const defaults = expectAccepted(jobEnv(profile), profile);
-    assert.deepEqual(defaults.jobSwitches, {
-      POSTGRES_ANALYTICS_MODE: "disabled",
-      POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
-      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "disabled",
-    });
-    const enabled = expectAccepted(jobEnv(profile, {
+test("round 12: the analytics-job profiles are retired; C-REFRESH alone governs the analytics job", () => {
+  // Every former analytics-job environment, switches included, is refused as
+  // an unknown profile: no CR-3 read can configure the refresh job.
+  for (const profile of RETIRED_PROFILES) {
+    const staging = profile.startsWith("staging-");
+    const env = {
+      CLOUD_RUN_JOB: `tibotattle-${staging ? "staging-" : ""}analytics-refresh`,
+      ...productionResources(),
+      ...(staging ? stagingPlane() : {}),
       POSTGRES_ANALYTICS_MODE: "enabled",
-      POSTGRES_ANALYTICS_PUBLICATION_LANE: "",
-      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "enabled",
-      POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled",
-    }), profile);
-    const env = createProductionWorkerEnv(enabled);
-    assert.equal(env.POSTGRES_ANALYTICS_MODE, "enabled");
-    assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_LANE, "disabled");
-    assert.equal(env.POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL, "enabled");
-    assert.equal(env.PUBLIC_ANALYTICS_MODE, "enabled");
-    assert.equal(Reflect.get(env, "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"), undefined);
-    assert.deepEqual(expectAccepted(jobEnv(profile, {
-      POSTGRES_ANALYTICS_MODE: "disabled",
-      POSTGRES_ANALYTICS_PUBLICATION_LANE: "disabled",
-      POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL: "",
-    }), profile).jobSwitches, defaults.jobSwitches);
-    // As STORAGE_ANALYTICS_MODE (storage-analytics-worker.ts): only unset or
-    // 'disabled' is off, 'enabled' is on, and anything else, an empty value
-    // included, is a configuration error, never a silent no-op.
-    for (const value of ["", "Enabled", "true", "on", " enabled"]) {
-      expectCode(() => readProductionConfiguration(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: value }), profile),
-        "POSTGRES_ANALYTICS_MODE_INVALID");
-    }
-    // As PUBLICATION_LANE and PUBLICATION_LANE_EXTERNAL (`=== 'enabled'`):
-    // every other value is off, and it never stops the job's other lanes.
-    for (const name of ["POSTGRES_ANALYTICS_PUBLICATION_LANE", "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL"]) {
-      for (const value of ["Enabled", "true", "on", " enabled", "enabled ", "1"]) {
-        const config = expectAccepted(jobEnv(profile, { POSTGRES_ANALYTICS_MODE: "enabled", [name]: value }),
-          profile);
-        assert.equal(config.jobSwitches[name], "disabled", `${name}=${JSON.stringify(value)}`);
-        assert.equal(config.jobSwitches.POSTGRES_ANALYTICS_MODE, "enabled");
-        assert.equal(createProductionWorkerEnv(config)[name], "disabled");
-      }
-      assert.equal(expectAccepted(jobEnv(profile, { [name]: "enabled" }), profile).jobSwitches[name], "enabled");
-    }
-    // Cross-checked against the Worker's own lane predicate
-    // (storagePublicationLaneEnabled; PUBLICATION_LANE_EXTERNAL is read the
-    // same way inline in storage-analytics-worker.ts).
-    for (const value of [undefined, "", "enabled", "disabled", "Enabled", "true", " enabled", "enabled "]) {
-      const overrides = value === undefined ? {} : { POSTGRES_ANALYTICS_PUBLICATION_LANE: value };
-      assert.equal(
-        expectAccepted(jobEnv(profile, overrides), profile).jobSwitches.POSTGRES_ANALYTICS_PUBLICATION_LANE === "enabled",
-        canonical.publication.storagePublicationLaneEnabled(value === undefined ? {} : { PUBLICATION_LANE: value }),
-        JSON.stringify(value),
-      );
-    }
+    };
+    expectCode(() => readProductionConfiguration(env, profile), "PRODUCTION_PROFILE_INVALID");
+    assert.equal(configuration.PRODUCTION_CONFIGURATION_PROFILES.includes(profile), false, profile);
+    assert.equal(Object.hasOwn(configuration.PRODUCTION_PROFILE_SECRET_NAMES, profile), false, profile);
+    assert.equal(Object.hasOwn(configuration.PRODUCTION_JOB_SWITCH_NAMES, profile), false, profile);
   }
+  // The analytics switches are no CR-3 setting in any remaining profile: the
+  // service and the maintenance jobs ignore them and never carry them.
   const service = createProductionWorkerEnv(
     expectAccepted(productionEnv({ POSTGRES_ANALYTICS_MODE: "enabled" }), "production"),
     { bindings: serviceBindings() },
   );
-  for (const names of Object.values(configuration.PRODUCTION_JOB_SWITCH_NAMES)) {
-    for (const name of names) assert.equal(Reflect.get(service, name), undefined, name);
+  for (const name of ["POSTGRES_ANALYTICS_MODE", "POSTGRES_ANALYTICS_PUBLICATION_LANE",
+    "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL", "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]) {
+    assert.equal(Reflect.get(service, name), undefined, name);
+  }
+  for (const profile of JOB_PROFILES) {
+    const env = createProductionWorkerEnv(expectAccepted(jobEnv(profile, {
+      POSTGRES_ANALYTICS_MODE: "enabled", POSTGRES_ANALYTICS_PUBLICATION_LANE: "enabled",
+    }), profile));
+    assert.equal(Reflect.get(env, "POSTGRES_ANALYTICS_MODE"), undefined, profile);
+    assert.equal(Reflect.get(env, "POSTGRES_ANALYTICS_PUBLICATION_LANE"), undefined, profile);
   }
 });
 
@@ -1545,7 +1529,7 @@ test("the envelope key grammar matches src/crypto.ts", () => {
   }
 });
 
-test("the IAM user, schema, Apple key and identity-version mirrors match their sources", () => {
+test("the IAM user, schema and identity-version mirrors match their sources", () => {
   for (const value of [
     "origin-runtime@synthetic-project.iam",
     "origin-runtime@synthetic-project.iam.gserviceaccount.com",
@@ -1574,24 +1558,6 @@ test("the IAM user, schema, Apple key and identity-version mirrors match their s
         primarySchema: primary,
       })),
       primary,
-    );
-  }
-  for (const key of [
-    SECRET_VALUES.APPLE_PRIVATE_KEY,
-    SECRET_VALUES.APPLE_PRIVATE_KEY.replaceAll("\\n", "\n"),
-    "-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----",
-    "-----BEGIN EC PRIVATE KEY-----\nc3ludGhldGlj\n-----END EC PRIVATE KEY-----",
-    "c3ludGhldGlj",
-  ]) {
-    assert.equal(
-      acceptsProduction({ APPLE_PRIVATE_KEY: key }),
-      acceptsCanonical(() => canonical.apple.appleSignInConfiguration({
-        APPLE_SERVICES_ID: configuration.PRODUCTION_VARS.APPLE_SERVICES_ID,
-        APPLE_TEAM_ID: configuration.PRODUCTION_VARS.APPLE_TEAM_ID,
-        APPLE_KEY_ID: configuration.PRODUCTION_VARS.APPLE_KEY_ID,
-        APPLE_PRIVATE_KEY: key,
-      })),
-      key,
     );
   }
   for (const version of ["staging-v1", "staging.v2_x", "-staging", "a".repeat(64), "a".repeat(65), "st aging"]) {

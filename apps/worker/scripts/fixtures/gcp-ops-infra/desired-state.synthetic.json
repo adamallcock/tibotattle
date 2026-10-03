@@ -51,8 +51,6 @@
     "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": "1" },
     "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": "1" },
     "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": "1" },
-    "GOOGLE_OIDC_CLIENT_SECRET": { "secretName": "GOOGLE_OIDC_CLIENT_SECRET", "version": "1" },
-    "APPLE_PRIVATE_KEY": { "secretName": "APPLE_PRIVATE_KEY", "version": "1" },
     "DISTRIBUTION_GITHUB_API_TOKEN": { "secretName": "DISTRIBUTION_GITHUB_API_TOKEN", "version": null }
   },
   "cloudSql": {

@@ -40,8 +40,6 @@
         "properties": {
           "secrets": {
             "required": [
-              "GOOGLE_OIDC_CLIENT_SECRET",
-              "APPLE_PRIVATE_KEY",
               "DISTRIBUTION_GITHUB_API_TOKEN"
             ]
           }
@@ -295,7 +293,7 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
-      "description": "CR-3's secret names. Production may leave out GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY (round 12 retired Google and Apple sign-in; RETIRED_PRODUCTION_SECRET_NAMES) and DISTRIBUTION_GITHUB_API_TOKEN (nothing on the production estate reads it; UNREAD_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name all seven until ROUTES-R12 narrows CR-3 (the root allOf).",
+      "description": "CR-3's secret names. Production may leave out DISTRIBUTION_GITHUB_API_TOKEN (nothing on the production estate reads it; UNREAD_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name every one (the root allOf). Round 12 retired Google and Apple sign-in, so GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY are no CR-3 secret and are refused (SECRET_UNKNOWN).",
       "required": [
         "IDENTITY_LINK_SECRET",
         "POSTGRES_RATE_LIMIT_SECRET",
@@ -386,54 +384,6 @@
             "secretName": {
               "type": "string",
               "pattern": "^(?:ENVELOPE_PRIVATE_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
-              "maxLength": 255,
-              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
-            },
-            "version": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "pattern": "^[1-9][0-9]{0,9}$",
-              "description": "The pinned version number; null until populated"
-            }
-          }
-        },
-        "GOOGLE_OIDC_CLIENT_SECRET": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "secretName",
-            "version"
-          ],
-          "properties": {
-            "secretName": {
-              "type": "string",
-              "pattern": "^(?:GOOGLE_OIDC_CLIENT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
-              "maxLength": 255,
-              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
-            },
-            "version": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "pattern": "^[1-9][0-9]{0,9}$",
-              "description": "The pinned version number; null until populated"
-            }
-          }
-        },
-        "APPLE_PRIVATE_KEY": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "secretName",
-            "version"
-          ],
-          "properties": {
-            "secretName": {
-              "type": "string",
-              "pattern": "^(?:APPLE_PRIVATE_KEY|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
               "maxLength": 255,
               "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
             },

@@ -564,6 +564,79 @@ test("step 7: every unported route answers the closed 503 and reaches no family"
   }
 });
 
+test("round 12: every retired route answers the uniform 503 with no retry-after in the production composition", async () => {
+  // The production root injects null (OD-CR-6 (iv)); kept and admin routes are served.
+  const ported = [...SCOPE_AND_CONTESTED(), ...registryModule.ADMIN_HOST_ROUTE_IDS];
+  const f = fixture({ ported, unportedRetryAfterSeconds: null });
+  assert.deepEqual([...f.registry.unportedRouteIds], [...registryModule.RETIRED_ROUTE_IDS].sort());
+  for (const id of registryModule.RETIRED_ROUTE_IDS) {
+    for (const method of methodsOf(id)) {
+      const response = await f.handler(f.edge(request(pathOf(id), {
+        method,
+        ...(method === "POST" ? { body: "{\"synthetic\":true}", headers: { "content-type": "application/json" } } : {}),
+      })));
+      const error = await assertError(response, 503, "POSTGRES_ROUTE_NOT_PORTED", `${method} ${id}`,
+        { requestId: EDGE_REQUEST_ID });
+      assert.deepEqual(Object.keys(error), ["code", "requestId"]);
+    }
+  }
+  assert.equal(f.calls.length, 0, "no retired route reaches a family");
+  // Each answer is one warn line with the closed code; none is a diagnostic.
+  for (const line of parsedLines(f.lines)) {
+    assert.deepEqual([line.event, line.level, line.code, line.status],
+      ["request_failed", "warn", "POSTGRES_ROUTE_NOT_PORTED", 503]);
+  }
+  assert.equal(f.diagnostics.length, 0);
+  // The kept routes (credential renew, disconnect and every OD-CR-1 session port) still run their family.
+  for (const id of ["device_credential_renew", "device_disconnect", "session", "logout", "device_pairing",
+    "device_pairing_claim", "participant_devices", "participant_device_revocation", "telemetry_v12_consent"]) {
+    const [method] = methodsOf(id);
+    const response = await f.handler(f.edge(request(pathOf(id), { method,
+      ...(method === "GET" ? {} : { body: "{}", headers: { "content-type": "application/json" } }) })));
+    assert.equal(response.status, 200, id);
+    assert.deepEqual(await response.json(), { served: id });
+  }
+});
+
+test("round 12: the accountless performance authorization answers production's definite 403, never a family", async () => {
+  const id = "accountless_telemetry_performance_authorization";
+  assert.deepEqual(registryModule.RETIRED_DEFINITE_ROUTE_IDS, [id]);
+  for (const unportedRetryAfterSeconds of [null, TEST_UNPORTED_RETRY_AFTER]) {
+    const f = fixture({ ported: SCOPE_AND_CONTESTED(), unportedRetryAfterSeconds });
+    assert.equal(f.registry.unportedRouteIds.includes(id), false);
+    // Whatever the caller sends (a valid-looking body, a bearer, a session
+    // cookie, no body), the answer is the d43c8f92 terminal code: no
+    // retry-after (not even an injected one), the Worker envelope, no-store.
+    for (const init of [
+      { method: "POST", body: JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
+        policyVersion: "accountless-telemetry-performance-policy-v1",
+        authorizationBasis: "accountless-performance-policy-v1" }),
+      headers: { "content-type": "application/json", authorization: "Device synthetic.synthetic" } },
+      { method: "POST", body: "{}", headers: { "content-type": "application/json", cookie: "__Host-usage_monitor_session=x" } },
+      { method: "POST" },
+    ]) {
+      const response = await f.handler(f.edge(request(pathOf(id), init)));
+      const error = await assertError(response, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${id} ${JSON.stringify(init.headers)}`,
+        { requestId: EDGE_REQUEST_ID });
+      assert.deepEqual(Object.keys(error), ["code", "requestId"]);
+    }
+    // A wrong method keeps the registry's 405 first, as the Worker answers it.
+    await assertError(await f.handler(f.edge(request(pathOf(id), { method: "GET" }))), 405, "METHOD_NOT_ALLOWED",
+      `${id} GET`, { allow: "POST", requestId: EDGE_REQUEST_ID });
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.gateCalls.length, 0, "the definite answer reads no storage");
+    // Logged as the Worker logs a 4xx: request_failed at warn; never a sampled 5xx diagnostic.
+    const lines = parsedLines(f.lines).filter((line) => line.code === "TELEMETRY_TRANSPORT_BLOCKED");
+    assert.equal(lines.length, 3);
+    for (const line of lines) assert.deepEqual([line.event, line.level, line.status], ["request_failed", "warn", 403]);
+    assert.ok(f.diagnostics.every((event) => event.status < 500));
+  }
+  // A registry the root built without the definite route cannot exist: it is never portable.
+  assert.throws(() => registryModule.createProductionRouteRegistry({ routePolicy: policy,
+    portedRouteIds: [...SCOPE(), id], handlers: new Map([...SCOPE(), id].map((routeId) => [routeId, async () => null])) }),
+  { code: "PRODUCTION_ROUTE_PORT_RETIRED" });
+});
+
 test("OD-CR-6(iv): the unported retry-after is the injected one, or none for null, at both unported sites", async () => {
   for (const [unportedRetryAfterSeconds, expected] of [[null, null], [1, "1"], [3600, "3600"]]) {
     const label = String(unportedRetryAfterSeconds);
@@ -871,6 +944,14 @@ test("behind EP-6, every unported route under every admission outcome is the mar
       assert.equal(response.headers.get("x-tibotattle-origin"), "1", `${id} ${outcome}`);
       await assertError(response, 503, "POSTGRES_ROUTE_NOT_PORTED", `${id} ${outcome}`,
         { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
+    }
+  }
+  // Round 12: the retired-definite route answers its 403 under every outcome, marked, never limited.
+  for (const id of f.registry.definiteRouteIds) {
+    for (const outcome of [undefined, "allowed", "limited", "unavailable"]) {
+      const response = await boundary(raw(pathOf(id), { method: "POST", outcome }));
+      assert.equal(response.headers.get("x-tibotattle-origin"), "1", `${id} ${outcome}`);
+      await assertError(response, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${id} ${outcome}`, { requestId: EDGE_REQUEST_ID });
     }
   }
   // The admin host under 'refuse', marked the same way.
