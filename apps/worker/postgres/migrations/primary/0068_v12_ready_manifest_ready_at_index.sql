@@ -15,11 +15,12 @@
 -- ready_at, so the aggregate becomes one backward index step. The read stays
 -- read only and the probe's SQL does not change.
 --
--- NUMBER. Staged as 0921 (placeholder); the integrator assigns the primary
--- number at promotion, and ops-runtime-probe.spec.mjs finds this file by its
--- suffix so the rename needs no spec edit. The migration is purely additive
--- (one index), so it needs no CONTRACT_MIGRATIONS entry and drops, rewrites
--- and constrains nothing.
+-- NUMBER. Primary 0068, assigned by the integrator at the D-OPS4 follow-up
+-- merge (2026-10-02), right after pending_object_transfer_holds (0067). Until
+-- then it was staged as staged-migrations/primary/0921_v12_ready_manifest_
+-- ready_at_index.sql (a placeholder number); ops-runtime-probe.spec.mjs finds
+-- it by its name suffix. The migration is purely additive (one index), so it
+-- needs no CONTRACT_MIGRATIONS entry and drops, rewrites and constrains nothing.
 --
 -- COST. CREATE INDEX takes a SHARE lock on telemetry_v12_day_manifests for the
 -- build, so writers to that table wait while it runs; the runner's 5 s lock

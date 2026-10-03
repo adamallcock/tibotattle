@@ -65,10 +65,11 @@ no ledger, tombstone, replay or erasure-job signal: the append-only line has
 none.
 
 The ready-manifest age reads one entry of a partial index on
-`telemetry_v12_day_manifests (ready_at) WHERE state = 'ready'`. Without that
-index (staged as `0921_v12_ready_manifest_ready_at_index.sql` until the
-integrator promotes it) the read is a table scan that grows with the table and
-ends as `STATEMENT_TIMEOUT`; apply the migration before registering the probe.
+`telemetry_v12_day_manifests (ready_at) WHERE state = 'ready'`, created by
+primary migration `0068_v12_ready_manifest_ready_at_index.sql`. Without that
+index the read is a table scan that grows with the table and ends as
+`STATEMENT_TIMEOUT`; migrate the database through `0068` before registering the
+probe.
 
 The backup audit writes the OPS-1 verdict as a level (0 ok, 1 warn, 2 breach)
 with its closed codes, whether point-in-time recovery is on, and the age of the
@@ -85,7 +86,7 @@ and never a breach. A restorable copy older than 365 days is level 2.
   Nothing in this change grants it.
 - **The `opsBackupAudit` account** and its two permissions, and registering the
   jobs (an image roll, two triggers created paused, the connection budget), after
-  the ready-manifest index above is promoted and applied.
+  the ready-manifest index above (primary `0068`) is applied.
 - **Alerts** on these lines wait for the monitoring bundle (E-OPS5) and the
   owner's notification channel.
 
