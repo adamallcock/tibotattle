@@ -244,7 +244,12 @@ async function sealedSourceIdOf(seal) {
   }
 }
 
-async function fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256) {
+/**
+ * The EP-8 fence receipt's 'analytics' entry (its id digest and bookmark),
+ * read with the fence's own reader at the sha256 the seal pinned. Also the
+ * REV-SEED revision-floor capture's binding (cutover-revision-floor.mjs).
+ */
+export async function fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256) {
   let receipt;
   try {
     receipt = await readCloudflareWriterFenceReceipt(resolve(String(fenceReceiptPath)), fenceReceiptSha256);

@@ -24,7 +24,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +54,18 @@ const STAGED_FILE = "0059_analytics_v2.sql";
 // below applies the chain before it and then this file by hand.
 const KERNEL_STAGED_FILE = "0069_analytics_v2_run_stamps.sql";
 const PRIMARY_MIGRATIONS_DIRECTORY = join(WORKER_ROOT, "postgres", "migrations", "primary");
+const STAGED_PRIMARY_DIRECTORY = join(WORKER_ROOT, "postgres", "staged-migrations", "primary");
+// REV-SEED's revision floor: staged under a placeholder number until the
+// integrator promotes it; found by its name suffix either way.
+const FLOOR_SUFFIX = "_analytics_v2_revision_floor.sql";
+const FLOOR_STAGED_FILE = await (async () => {
+  const staged = (await readdir(STAGED_PRIMARY_DIRECTORY).catch(() => [])).filter((name) => name.endsWith(FLOOR_SUFFIX));
+  const promoted = (await readPostgresMigrations({ role: "primary" })).map(({ name }) => name)
+    .filter((name) => name.endsWith(FLOOR_SUFFIX));
+  assert.equal(staged.length + promoted.length, 1, "exactly one revision-floor migration, staged or promoted");
+  return { name: staged[0] ?? promoted[0], directory: staged.length === 1 ? STAGED_PRIMARY_DIRECTORY
+    : PRIMARY_MIGRATIONS_DIRECTORY };
+})();
 const ENDPOINT = await postgresTestEndpoint();
 const PG_SKIP = ENDPOINT === null
   ? "set PG_TEST_SOCKET (or PG_TEST_HOST) and PG_TEST_PORT for the local PostgreSQL 17 cluster"
@@ -175,7 +187,7 @@ async function withDatabase(label, callback) {
         role: "primary",
         schema,
         pool,
-        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE],
+        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE, FLOOR_STAGED_FILE.name],
       });
       // Before promotion 0059 is staged; after an unchanged promotion it is stock.
       assert.ok(
@@ -257,6 +269,24 @@ async function runRows(pool, schema) {
 async function count(pool, schema, table) {
   const result = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, table)}`);
   return result.rows[0].n;
+}
+
+/**
+ * Load a synthetic REV-SEED revision floor by hand, as the cutover import's
+ * loader writes it: the day rows, then the singleton that summarizes them.
+ * `days` maps a day to Cloudflare's last revision.
+ */
+async function loadSpecFloor(pool, schema, days) {
+  const entries = Object.entries(days).sort(([left], [right]) => (left < right ? -1 : 1));
+  for (const [day, revision] of entries) {
+    await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_revision_floor")} (day, revision) VALUES ($1, $2)`,
+      [day, revision]);
+  }
+  await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_revision_floor_source")} (id, provenance, seal_id,
+      floor_sha256, fence_receipt_sha256, analytics_bookmark_sha256, source_commit, captured_at, day_count, max_revision)
+    VALUES (1, 'synthetic', $1, $2, $3, NULL, $4, $5, $6, $7)`,
+  [digest("floor-seal"), digest(`floor:${JSON.stringify(entries)}`), digest("floor-fence"), "c".repeat(40), NOW_1,
+    entries.length, Math.max(...entries.map(([, revision]) => revision))]);
 }
 
 // ---------------------------------------------------------------------------
@@ -657,8 +687,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 70,
-      "the 70-migration primary chain, 0059 and the run stamps staged or promoted");
+    assert.equal(stock.length + stagedCount, 71,
+      "the 71-migration primary chain, 0059, the run stamps and the revision floor staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -668,14 +698,23 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
         ORDER BY 1`,
       [schema],
     );
-    assert.deepEqual(tables.rows.map((row) => row.name), Object.values(contract.ANALYTICS_V2_TABLES).sort());
-    for (const [key, table] of Object.entries(contract.ANALYTICS_V2_TABLES)) {
+    // The contract's tables, and REV-SEED's revision floor, which the store
+    // names (it decides no kernel value, so it stays out of contract.ts).
+    assert.deepEqual(tables.rows.map((row) => row.name), [...Object.values(contract.ANALYTICS_V2_TABLES),
+      ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES)].sort());
+    const described = [
+      ...Object.entries(contract.ANALYTICS_V2_TABLES).map(([key, table]) => [table,
+        contract.ANALYTICS_V2_COLUMNS[key], contract.ANALYTICS_V2_PRIMARY_KEYS[key]]),
+      ...Object.entries(store.ANALYTICS_V2_REVISION_FLOOR_TABLES).map(([key, table]) => [table,
+        store.ANALYTICS_V2_REVISION_FLOOR_COLUMNS[key], store.ANALYTICS_V2_REVISION_FLOOR_PRIMARY_KEYS[key]]),
+    ];
+    for (const [table, expectedColumns, expectedKey] of described) {
       const columns = await pool.query(
         `SELECT column_name::text AS name FROM information_schema.columns
           WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
         [schema, table],
       );
-      assert.deepEqual(columns.rows.map((row) => row.name), [...contract.ANALYTICS_V2_COLUMNS[key]], table);
+      assert.deepEqual(columns.rows.map((row) => row.name), [...expectedColumns], table);
       const primaryKey = await pool.query(
         `SELECT a.attname::text AS name
            FROM pg_index i
@@ -684,7 +723,7 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
           ORDER BY array_position(i.indkey::int2[], a.attnum)`,
         [`"${schema}"."${table}"`],
       );
-      assert.deepEqual(primaryKey.rows.map((row) => row.name), [...contract.ANALYTICS_V2_PRIMARY_KEYS[key]], table);
+      assert.deepEqual(primaryKey.rows.map((row) => row.name), [...expectedKey], table);
     }
     const otherSchemas = await pool.query(
       `SELECT count(*)::integer AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -838,6 +877,8 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         await client.query("BEGIN");
         await client.query(`SET LOCAL search_path TO "${schema}"`);
         await client.query(sql);
+        // REV-SEED's floor, which the store reads, follows the run stamps.
+        await client.query(await readFile(join(FLOOR_STAGED_FILE.directory, FLOOR_STAGED_FILE.name), "utf8"));
         await client.query("COMMIT");
         assert.equal(await count(pool, schema, "analytics_v2_kernels"), 0, "no kernel is seeded");
         for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_published_daily"]) {
@@ -1130,6 +1171,78 @@ test("PG17: revision = max(previous, revisionSeed) + 1 and released_at = --now, 
     assert.equal(bumped.revision, 101);
     assert.equal(bumped.payload.aggregateId, `community-daily:${DAY_1}:r101`);
     assert.equal(bumped.released_at, NOW_3);
+  });
+});
+
+test("PG17 REV-SEED: a day continues above its revision floor, a day without one starts at r1, a rerun mints nothing", {
+  skip: PG_SKIP,
+  timeout: 240_000,
+}, async () => {
+  await withDatabase("floor", async ({ pool, createSchema }) => {
+    const floored = await createSchema();
+    const twin = await createSchema();
+    const bare = await createSchema();
+    for (const { schema } of [floored, twin]) await loadSpecFloor(pool, schema, { [DAY_1]: 5, [DAY_3]: 2 });
+    const receipts = [];
+    for (const { schema } of [floored, twin, bare]) {
+      await seedBaseCorpus(pool, schema);
+      receipts.push(await runJob({ schema }));
+    }
+    assert.deepEqual(receipts[0].revisionFloor, { present: true, dayCount: 2, maxRevision: 5 });
+    assert.deepEqual(receipts[2].revisionFloor, { present: false, dayCount: 0, maxRevision: 0 },
+      "a test target publishes with an absent floor as 0");
+    const heads = await publishedRows(pool, floored.schema);
+    // Cloudflare's r5 continues at r6; a day it never published starts at r1.
+    assert.deepEqual([DAY_1, DAY_2, DAY_3].map((day) => heads.get(day).revision), [6, 1, 3]);
+    for (const day of [DAY_1, DAY_2, DAY_3]) {
+      const head = heads.get(day);
+      assert.equal(head.payload.revision, head.revision);
+      assert.equal(head.payload.aggregateId, `community-daily:${day}:r${head.revision}`);
+    }
+    const bareHeads = await publishedRows(pool, bare.schema);
+    assert.deepEqual([DAY_1, DAY_2, DAY_3].map((day) => bareHeads.get(day).revision), [1, 1, 1],
+      "without a floor, full-mode revisions are exactly what they were");
+    // The same prior state, floor, --now and seed give byte-identical heads.
+    const twinHeads = await publishedRows(pool, twin.schema);
+    for (const day of [DAY_1, DAY_2, DAY_3]) {
+      const { run_id: _left, ...left } = heads.get(day);
+      const { run_id: _right, ...right } = twinHeads.get(day);
+      assert.deepEqual(left, right, day);
+    }
+    // A rerun over unchanged sources mints no revision; a change mints head + 1.
+    const before = await analyticsSnapshot(pool, floored.schema);
+    const rerun = await runJob({ schema: floored.schema, now: NOW_2 });
+    assert.deepEqual(rerun.published, []);
+    const after = await analyticsSnapshot(pool, floored.schema);
+    assert.equal(after.analytics_v2_published_daily, before.analytics_v2_published_daily);
+    await setUsage(pool, floored.schema, OWNER_A, DAY_1, 4);
+    await runJob({ schema: floored.schema, now: NOW_3 });
+    assert.equal((await publishedRows(pool, floored.schema)).get(DAY_1).revision, 7);
+  });
+});
+
+test("PG17 REV-SEED: the floor and the revision seed combine as max(head, floor, seed) + 1", {
+  skip: PG_SKIP,
+  timeout: 240_000,
+}, async () => {
+  await withDatabase("floor-seed", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await loadSpecFloor(pool, schema, { [DAY_1]: 5 });
+    await seedBaseCorpus(pool, schema);
+    await runJob({ schema, seed: 3 });
+    let heads = await publishedRows(pool, schema);
+    assert.deepEqual([DAY_1, DAY_2, DAY_3].map((day) => heads.get(day).revision), [6, 4, 4]);
+    await setUsage(pool, schema, OWNER_A, DAY_1, 4);
+    await setUsage(pool, schema, OWNER_B, DAY_2, 8);
+    await runJob({ schema, seed: 10, now: NOW_2 });
+    heads = await publishedRows(pool, schema);
+    assert.deepEqual([DAY_1, DAY_2].map((day) => heads.get(day).revision), [11, 11]);
+    // The one computation every publishing path uses.
+    assert.equal(store.nextPublishedRevision({ head: 6, floor: 5, seed: 3 }), 7);
+    assert.equal(store.nextPublishedRevision({ head: null, floor: 9, seed: 0 }), 10);
+    assert.equal(store.nextPublishedRevision({ head: undefined, floor: undefined, seed: 0 }), 1);
+    assert.throws(() => store.nextPublishedRevision({ head: -1, seed: 0 }), { code: "ANALYTICS_V2_STATE_INVALID" });
+    assert.throws(() => store.nextPublishedRevision({ floor: 1.5, seed: 0 }), { code: "ANALYTICS_V2_STATE_INVALID" });
   });
 });
 
@@ -1731,7 +1844,8 @@ test("PG17: the store replaces computed owners' rows only inside the run horizon
       });
       const state0 = await store.readAnalyticsV2RefreshState(client, { schema });
       assert.deepEqual({ ...state0 }, { cursor: null, carriedBlockedDays: [], cacheFloorDay: null,
-        appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [] });
+        appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [],
+        revisionFloor: { present: false, dayCount: 0, maxRevision: 0 } });
 
       await write({
         ownerDays: [ownerDay("2026-03-01", 1), ownerDay("2026-09-28", 2)],
@@ -3335,12 +3449,12 @@ test("PG17: the production target path runs a full refresh on the real clock and
     await seedBaseCorpus(pool, schema);
     const databases = [];
     const env = productionEnvironment("production", { PRIMARY_SCHEMA: schema, ANALYTICS_V2_MEMORY_BUDGET_MIB: "1024" });
-    const before = Date.now();
-    const run = await job.runAnalyticsRefresh({
+    let computed = 0;
+    const productionRun = () => job.runAnalyticsRefresh({
       argv: ["--mode=full"],
       env,
       dependencies: {
-        modules: { store, pipeline: createSpecPipeline() },
+        modules: { store, pipeline: createSpecPipeline({ beforeCompute: () => { computed += 1; } }) },
         kernelIdentity,
         createConnector: () => ({ close() {} }),
         // The Cloud SQL target resolved from the contract, served by the local cluster.
@@ -3351,7 +3465,24 @@ test("PG17: the production target path runs a full refresh on the real clock and
         closeResources: async ({ pools }) => { for (const value of pools) await value.end(); },
       },
     });
+    // REV-SEED: without the cutover's revision floor a production run refuses
+    // in the read snapshot, before compute, and writes nothing (no run row).
+    const untouched = await analyticsSnapshot(pool, schema);
+    await assert.rejects(productionRun(), (error) => {
+      assert.equal(error.code, "ANALYTICS_V2_REVISION_FLOOR_ABSENT");
+      assert.equal(error.phase, "read");
+      return true;
+    });
+    assert.equal(computed, 0, "nothing was computed");
+    assert.deepEqual(await analyticsSnapshot(pool, schema), untouched);
+    assert.equal((await runRows(pool, schema)).length, 0);
+    await loadSpecFloor(pool, schema, { [DAY_2]: 3 });
+    databases.length = 0;
+    const before = Date.now();
+    const run = await productionRun();
     assert.equal(run.state, "complete");
+    assert.deepEqual(run.revisionFloor, { present: true, dayCount: 1, maxRevision: 3 });
+    assert.equal((await publishedRows(pool, schema)).get(DAY_2).revision, 4);
     assert.equal(run.target, "production");
     assert.equal(run.schema, schema);
     assert.equal(run.clock, "wall");

@@ -23,6 +23,7 @@ import {
   IDENTITY_LINK_PIN_TABLE,
   KEPT_SESSION_AUTHORITY_TABLES,
   OWNER_FLAGS,
+  OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
   OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED,
   RETIRED_SOCIAL_CHAIN_TABLES,
   SOURCE_ROLES,
@@ -220,8 +221,15 @@ test("the stage plan covers PT-1's stages once, in dependency order; waivers are
   // It writes no table receipt: coverage keeps exactly PT-3's one receipt for the pin table.
   assert.equal(DISPOSITIONS.some(item => item.stage === IDENTITY_LINK_ROTATION_STAGE), false);
   assert.equal(stagePrerequisites("post-import").length, TRANSFER_STAGES.length - 1);
-  assert.deepEqual(Object.keys(WAIVABLE).sort(), ["accountless-retention", "analytics-community-history", "analytics-expectation",
+  assert.deepEqual(Object.keys(WAIVABLE).sort(), ["accountless-retention", "analytics-expectation",
     "analytics-history", "objects", "performance"]);
+  // REV-SEED (round 14): the revision floor is loaded, never waived, and it
+  // writes no table receipt (the analytics D1 is never sealed).
+  assert.deepEqual(STAGE_PLAN.find(entry => entry.stage === "analytics-community-history"),
+    { stage: "analytics-community-history", kind: "runner" });
+  assert.equal(codeOf(() => assertWaiverAllowed("analytics-community-history", "analytics-recomputed:d3")),
+    "CUTOVER_STAGE_WAIVER_REFUSED");
+  assert.equal(DISPOSITIONS.some(item => item.stage === "analytics-community-history"), false);
   for (const [stage, [reason]] of Object.entries(WAIVABLE)) assert.doesNotThrow(() => assertWaiverAllowed(stage, reason));
   assert.equal(codeOf(() => assertWaiverAllowed("performance", "another-reason")), "CUTOVER_STAGE_WAIVER_REFUSED");
   // A stage with an imported or mapped table is never waivable.
@@ -238,7 +246,7 @@ test("the merged trigger policy covers every importer and the disposition policy
     "community_aggregate_exclusions", "collection_controls"]) {
     assert.ok(Object.hasOwn(COMPLETE_TRIGGER_POLICY, tableName), tableName);
   }
-  assert.equal(dispositionPolicySha256(), "154244fd7e2b06895c3bddc22c284e848788c8cbc53a8aaab6348a3844e3bac8",
+  assert.equal(dispositionPolicySha256(), "488844450074b37e3fcae3b98ed7d17f9316ba1e11dda480f01be5874bffe4c3",
     "a reviewed change to dispositions, rules, flags, the stage plan or the trigger policy must update this pin");
 });
 
@@ -767,11 +775,13 @@ function inputs(overrides = {}) {
     sealManifestPath: "/owner/seal/seal-manifest.json",
     expectedSourceCommit: "1".repeat(40),
     fenceReceiptSha256: "2".repeat(64),
+    fenceReceiptPath: "/owner/fence-receipts/fence.json",
     expectedIdentityKeyVersion: "prod-v1",
     deletionDigestProjection: { path: "/owner/deletion-digests.txt", sha256: "3".repeat(64) },
     interimPublicRead: { exportPath: "/owner/own4.json", sha256: "4".repeat(64), capturedAt: "2026-10-01T23:30:00.000Z",
       sourceCommit: "1".repeat(40), evidenceDate: "2026-10-01" },
     adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64) },
+    revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64) },
     schedulerEvidencePath: "/owner/scheduler.json",
     ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
     allowedRoleMembers: [],
@@ -787,10 +797,19 @@ test("pt8-inputs.json is a closed contract", () => {
     { deletionDigestProjection: { path: "/x", sha256: "nope" } },
     { adminHistoryExport: { path: "relative/export.json", sha256: "5".repeat(64) } },
     { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "nope" } },
-    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } }]) {
+    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } },
+    { revisionFloor: { path: "relative/revision-floor.json", sha256: "6".repeat(64) } },
+    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "nope" } },
+    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64), provenance: "synthetic" } },
+    { fenceReceiptPath: "relative/fence.json" }, { fenceReceiptPath: "/owner/../owner/fence.json" },
+    { ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED, "synthetic-revision-floor"] }]) {
     assert.throws(() => validateTransferInputs(inputs(bad)), { code: "CUTOVER_INPUTS_INVALID" }, JSON.stringify(bad));
   }
-  for (const key of ["schedulerEvidencePath", "adminHistoryExport"]) {
+  // The dress rehearsal's declaration is one of the closed owner flags.
+  assert.deepEqual(validateTransferInputs(inputs({ ownerFlags: [OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
+    OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED] })).ownerFlags, [OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
+    OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED]);
+  for (const key of ["schedulerEvidencePath", "adminHistoryExport", "revisionFloor", "fenceReceiptPath"]) {
     const missing = inputs();
     delete missing[key];
     assert.throws(() => validateTransferInputs(missing), { code: "CUTOVER_INPUTS_INVALID" }, key);

@@ -353,11 +353,12 @@ after(async () => {
   await admin.end();
 });
 
-test("the residue migration follows 0053 and 0063, only the additive 0065-0068, the reviewed run stamps 0069 and the additive catalog store 0070 follow it, and it raises only constants", () => {
+test("the residue migration follows 0053 and 0063, only the additive 0065-0068, the reviewed run stamps 0069, the additive catalog store 0070 and the additive revision floor 0071 follow it, and it raises only constants", () => {
   assert.deepEqual(PRIMARY.filter(({ version }) => version > RESIDUE_VERSION).map(({ name }) => name),
     ["0065_interim_public_read.sql", "0066_community_aggregate_exclusions.sql",
       "0067_pending_object_transfer_holds.sql", "0068_v12_ready_manifest_ready_at_index.sql",
-      "0069_analytics_v2_run_stamps.sql", "0070_catalog_manifest_store.sql"]);
+      "0069_analytics_v2_run_stamps.sql", "0070_catalog_manifest_store.sql",
+      "0071_analytics_v2_revision_floor.sql"]);
   assert.ok(RESIDUE_VERSION > 63, "the residue follows 0063");
   assert.equal(/\bEXECUTE\b/u.test(RESIDUE_SQL), false, "no dynamic SQL (OPS-10 expand classifier)");
   const raises = [...RESIDUE_SQL.matchAll(/RAISE EXCEPTION ('[^']*'|[^;]*);/gu)].map((match) => match[1]);

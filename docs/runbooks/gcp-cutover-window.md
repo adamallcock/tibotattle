@@ -430,9 +430,48 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    the row count of any other source id; no id. The post-import step of H.4
    requires the file and its sha256. `built` (D-PT4X); the provider has never
    been contacted.
+7. **Capture the revision floor from the analytics D1 (round 14).** GCP's
+   community daily publications must continue above the revisions Cloudflare
+   published: each day continues at Cloudflare's last revision plus one, and a
+   day Cloudflare never published starts at r1. The floor comes from the
+   current analytics D1 lineage only. It is one read-only, bookmark-bracketed
+   SELECT, run after the EP-8 verify (the fence is quiet) and after the seal,
+   with the same private analytics source file as step 6:
+
+   ```bash
+   node scripts/cutover-revision-floor.mjs capture --inventory <private seal inventory> \
+     --seal <seal manifest> --seal-id <sealId> --analytics-source <private analytics source file> \
+     --fence-receipt <EP-8 verify receipt> --out <private owner directory> --execute --remote --owner-read-only
+   ```
+
+   Without `--execute --remote --owner-read-only` it is a dry run that spawns
+   nothing. It reads as the non-sealable read role `analytics-floor`, which the
+   guarded transport admits for exactly one statement pinned by its sha256
+   (`CUTOVER_REVISION_FLOOR_STATEMENT` in `cutover-source-seal.mjs`: the
+   largest revision per day over `analytics_community_daily_heads` and
+   `analytics_community_daily_publications`, every source id, withheld days
+   included). Both bookmarks it reads must equal the fence receipt's analytics
+   bookmark. It writes `revision-floor.json` (`0400`, never overwritten:
+   schema `tibotattle-cutover-revision-floor-v1`, days and integers, the seal
+   id, the fence receipt's sha256, the source commit and the sha256 of the
+   bookmark) and prints the file's sha256 (the `floorSha256` the inputs pin),
+   the day count, the largest revision and the first and last day; never the
+   bookmark, a database id or a source id. `node scripts/cutover-revision-floor.mjs
+   check --floor <file> --sha256 <hex> --seal <manifest> --seal-id <sealId>`
+   re-validates it offline. `built` (REV-SEED); the provider has never been
+   contacted. The dress rehearsal does not capture: it loads a synthetic floor
+   (round 14), written by `cutover-revision-floor.mjs synthetic` from its seal
+   and its frozen export (each frozen day at its frozen revision), and its
+   `pt8-inputs.json` declares the owner flag
+   `dress-rehearsal-synthetic-revision-floor`. A synthetic floor covers only
+   the frozen export's days, at revisions read before the fence, so P16
+   refuses one without that flag, and refuses the flag with a captured
+   floor: the window's inputs never carry it. If the capture refuses, capture
+   again inside a quiet fence; a synthetic floor is never a substitute.
 
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
-after the fence), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
+after the fence; for the revision floor, Cloudflare could have published after
+the capture, so the floor is void), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
 (production's applied tail differs from the expected ledger at P, see the
 renumbering gate, or the inventory selects the wrong ledger layout),
 `CUTOVER_SECRET_IN_OUTPUT`, `CUTOVER_OWNER_DIRECTORY_UNSAFE`.
@@ -440,10 +479,16 @@ Each is content-free and leaves nothing behind. A bookmark drift means the
 fence was not quiet: abort and fence again. The admin history export adds
 `CUTOVER_FENCE_SOURCE_MISMATCH` (the analytics source file names another D1)
 and `CUTOVER_ADMIN_HISTORY_VALUE_INVALID` (a stored snapshot outside the
-d43c8f92 gauge grammar); neither touches the seal.
+d43c8f92 gauge grammar); neither touches the seal. The revision floor adds
+`CUTOVER_FLOOR_STATEMENT_REFUSED` (any statement but the pinned one on the
+floor role), `REVISION_FLOOR_EMPTY` (no published day), `REVISION_FLOOR_TOO_LARGE`
+(over 4,000 days), `REVISION_FLOOR_DAY_INVALID` and
+`REVISION_FLOOR_REVISION_INVALID` (a day or revision outside the closed
+format); each leaves nothing behind and none touches the seal.
 
 Evidence kept: the seal manifest and its sha256, the projection sha256 values,
-the frozen export's digest, the admin history export's sha256. Abort: Abort A.
+the frozen export's digest, the admin history export's sha256, the revision
+floor's sha256. Abort: Abort A.
 The seal is lost and a later attempt needs a fresh fence.
 
 ## H.4 Import and verify
@@ -467,7 +512,7 @@ target. Its reference, including the owner directory, the authorization
 tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator).
 
 1. **Preflight (read-only).** `node $S preflight --owner-dir <dir> <connection>`
-   runs P1 to P15 and prints `GO` with the `run` authorization token, or a
+   runs P1 to P16 and prints `GO` with the `run` authorization token, or a
    closed refusal code. Among them: one disposition per sealed table (P3), the
    correction runtime staged with no facts (P4,
    `CUTOVER_CORRECTION_RUNTIME_ACTIVE`), erasure quiescence (P5), the
@@ -481,7 +526,13 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    state's project, exactly the triggers its `scheduler` map manages, all
    paused, no alert, under 6 hours old), and the H.3 step 6 admin history
    export, read at its recorded sha256 and bound to this seal, inventory,
-   fence receipt and sealed source (P15).
+   fence receipt and sealed source (P15), and the H.3 step 7 revision floor,
+   read at its recorded sha256, bound to this seal, fence receipt and source
+   commit, captured inside this fence (its capture block names the analytics
+   D1 and the sha256 of the bookmark that the fence receipt, read at the
+   seal's pin, records; only the dress rehearsal loads a synthetic floor,
+   under its owner flag), and at or above every revision the frozen read
+   serves (P16).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
    With a declared identity-link rotation it prints a second token, and the
@@ -491,10 +542,12 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    `legacy-contributions`, the eight D-PT5A stages, the waivers
    (`performance` under the owner flag `performance-routes-retired`,
    `accountless-retention` while its sealed table is empty, `objects` until
-   PT-7, the three analytics stages because analytics is recomputed; but see
-   the revision floor in [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator),
-   which round 14 moves into this import),
-   D-PT4X `pending-registrations`, `owner-lifecycle-verify` and `post-import`.
+   PT-7, `analytics-expectation` and `analytics-history` because analytics is
+   recomputed), D-PT4X `pending-registrations`, `owner-lifecycle-verify`,
+   REV-SEED's `analytics-community-history` (round 14: it loads the H.3 step 7
+   revision floor, once, before `markLive`; see
+   [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator)) and
+   `post-import`.
    Post-import restarts the typed identities (TL-1), maps the admin metric
    history (the sealed snapshots and cache, and the H.3 step 6 analytics D1
    export named in `pt8-inputs.json`) and the aggregate exclusions (D-PT4X),
@@ -569,7 +622,8 @@ is spent.
 Design: `design/pt8-lite-design-2026-10-02.md` in the cutover workspace, with
 the code-forced corrections of its section 1 applied. Round 13 holds: the
 cutover runs on the proven full-recompute analytics engine, so the
-orchestrator imports no analytics state and waives the three analytics stages.
+orchestrator imports no analytics state, waives two analytics stages and loads
+the revision floor in the third.
 Round 12 holds: the native social chain is retired, and PT-3 still imports the
 tables the kept session routes and credential renew and disconnect
 authenticate against (pinned in `KEPT_SESSION_AUTHORITY_TABLES`); the retired
@@ -578,19 +632,32 @@ identity-link pin (`IDENTITY_LINK_PIN_TABLE`) is imported verbatim too, but no
 kept route reads it: it is the continuity record that round 16's
 [identity-link rotation](#identity-link-rotation-round-16) moves.
 
-**The revision floor is not loaded yet (round 14).** Round 14 places REV-SEED's
-per-day revision floor inside this import, in the `analytics-community-history`
-stage, before `markLive`: each day continues at Cloudflare's last published
-revision plus one. REV-SEED is `not built`. Until it lands, that stage is
-still waived as `analytics-recomputed:d3`, the closed waiver map still admits
-that waiver, no receipt records a floor, and the production refresh's
-`ANALYTICS_V2_REVISION_FLOOR_ABSENT` refusal does not exist yet. A production
-import run before REV-SEED replaces the waiver would go live with no floor,
-and nothing would stop the first production refresh from publishing
-revisions that do not continue above Cloudflare's, which round 12 rules out.
-Follow-up (E-PT8, after REV-SEED): make
-`analytics-community-history` a runner stage that loads the floor, and remove
-its `WAIVABLE` entry.
+**The revision floor (round 14).** REV-SEED's per-day revision floor is loaded
+inside this import, by the `analytics-community-history` stage, before
+`markLive`: each day continues at Cloudflare's last published revision plus
+one (round 12: no "revision restart"). The stage is a runner, no longer a
+waiver, and the closed waiver map refuses `analytics-recomputed:d3` for it. It
+reads `revision-floor.json` at the sha256 the inputs pin, re-checks P16 (this
+seal, fence receipt and source commit; a capture block naming the fence
+receipt's analytics D1 and bookmark, the receipt read again from
+`fenceReceiptPath`, so a fence released since preflight refuses; a synthetic
+floor only under the dress-rehearsal flag; every frozen-read revision at or
+below the floor, else `REVISION_FLOOR_BELOW_FROZEN_EXPORT`), and in one
+transaction with its stage receipt writes `analytics_v2_revision_floor` (one row per day)
+and then `analytics_v2_revision_floor_source` (the singleton provenance:
+`captured` or, at the dress rehearsal, `synthetic`). A rerun that finds the
+identical floor writes nothing; any other floor is `REVISION_FLOOR_CONFLICT`,
+and a target with a published day is `REVISION_FLOOR_PUBLICATION_EXISTS`. The
+database enforces the same: both tables are immutable, refuse any insert once
+a day is published, and a separate trigger refuses any published head at or
+below its day's floor. The analytics D1 is never sealed, so the stage writes
+no table receipt; its stage receipt (row count = days) digests the floor.
+The tables' migration is primary
+`0071_analytics_v2_revision_floor.sql` (promoted from its staged placeholder
+`0951` at the REV-SEED merge into the fast-path final line); a target without
+it fails P10 (`CUTOVER_TARGET_REVISION_FLOOR_TABLE_MISSING`). The production
+refresh refuses `ANALYTICS_V2_REVISION_FLOOR_ABSENT` until this stage has run
+(H.8).
 
 **The seal is consumed, never produced.** The orchestrator reads a PT-2-lite
 seal only through `readCutoverSeal` and `openSealedSourceFromSeal`
@@ -603,14 +670,20 @@ table that has no reviewed disposition.
 stated). The owner writes `pt8-inputs.json` (schema
 `tibotattle-pt8-lite-inputs-v1`, closed keys): `contractId`, `sealId`,
 `sealManifestPath`, `expectedSourceCommit` (P), `fenceReceiptSha256`,
-`expectedIdentityKeyVersion`, `deletionDigestProjection` (path and sha256, from
+`fenceReceiptPath` (the EP-8 verify receipt itself, in its private receipts
+directory beside its apply receipt; P16 and the floor stage read its
+analytics entry at `fenceReceiptSha256`), `expectedIdentityKeyVersion`,
+`deletionDigestProjection` (path and sha256, from
 `cutover-source-projections.mjs deletion-digests`), `interimPublicRead` (the
 OWN-4 export path and its recorded sha256, capture instant, source commit and
 evidence date), `adminHistoryExport` (the path of H.3 step 6's
 `admin-history-export.json` and the sha256 that step printed),
-`schedulerEvidencePath` (a C-INFRA scheduler probe receipt
+`revisionFloor` (the path of H.3 step 7's `revision-floor.json` and the
+`floorSha256` that step printed; at the dress rehearsal, the synthetic
+floor's), `schedulerEvidencePath` (a C-INFRA scheduler probe receipt
 taken after the fence), `ownerFlags` (`performance-routes-retired`,
-`accept-orphan-registration-clearing`) and `allowedRoleMembers`. The
+`accept-orphan-registration-clearing`, and at the dress rehearsal only
+`dress-rehearsal-synthetic-revision-floor`) and `allowedRoleMembers`. The
 orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
 `release-controls.json`, `flip-gate.json`, `mark-live.json`,
 `post-live-check.json`, `pt8-report.json` and the advisory
@@ -723,6 +796,12 @@ the target is final for this seal.
 | `CUTOVER_INTERIM_READ_FACTS_INVALID` and the C-IPR `INTERIM_PUBLIC_READ_*` codes | P12 | The OWN-4 export or its facts do not hold (captured after the fence, another commit, another day) |
 | `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that, or it is present but disabled or altered (no flag excuses that) |
 | `CUTOVER_ADMIN_HISTORY_EXPORT_INVALID`, `CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH` | P15 (again at post-import) | The admin history export is unreadable, not private, or not at the recorded sha256; or it was taken for another seal, inventory, fence receipt or sealed source. Export again for this seal (H.3 step 6) and record its sha256 in the inputs |
+| `REVISION_FLOOR_FILE_INVALID`, `REVISION_FLOOR_SEAL_MISMATCH` | P16 (again at the `analytics-community-history` stage) | The revision floor is unreadable, not private, not canonical or not at the recorded sha256; or it was captured for another seal, fence receipt or source commit. Capture again for this seal (H.3 step 7) |
+| `REVISION_FLOOR_BELOW_FROZEN_EXPORT` | P16 (again at the stage) | A day of the frozen export has a revision above the floor (or no floor). The floor is not Cloudflare's maximum: never edit it; find why (the wrong analytics D1, or a capture outside the fence) and capture again |
+| `REVISION_FLOOR_CAPTURE_FENCE_MISMATCH` | P16 (again at the stage) | The captured floor's capture block names another analytics D1 or another bookmark than the fence receipt the seal pins: it was taken outside this fence. Capture again for this seal and fence (H.3 step 7) |
+| `REVISION_FLOOR_PROVENANCE_REFUSED` | P16 (again at the stage) | A synthetic floor without the owner flag `dress-rehearsal-synthetic-revision-floor`, or that flag with a captured floor. In the window, capture the floor; only the dress rehearsal declares the flag |
+| `CUTOVER_FENCE_RECEIPT_INVALID` | P16 (again at the stage) | `fenceReceiptPath` is not the private fence receipt at `fenceReceiptSha256` beside its apply receipt, or that fence was released. Point the inputs at the EP-8 verify receipt; after a release, fence and seal again |
+| `CUTOVER_TARGET_REVISION_FLOOR_TABLE_MISSING` | P10 | The target lacks the revision-floor migration. Migrate the target with the promoted chain |
 
 During `run` and finalize: `CUTOVER_CORRECTION_OWNER_NOT_ACTIVE` (the
 `usage-correction` stage: sealed correction history whose participant or owner
@@ -735,7 +814,10 @@ link is not `active`; D-PT5A refuses it before the stage touches the target),
 `CUTOVER_PARITY_SAMPLE_MISMATCH` (with the class), `CUTOVER_FLIP_EVIDENCE_INVALID`,
 `CUTOVER_FLIP_EVIDENCE_STALE`, `CUTOVER_INTERIM_READ_NOT_LOADED` (the frozen
 read is absent, or is not the export post-import loaded),
-`CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `CUTOVER_POST_LIVE_NOT_READY` (also from
+`CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `REVISION_FLOOR_CONFLICT` and
+`REVISION_FLOOR_PUBLICATION_EXISTS` (the `analytics-community-history` stage:
+another floor is stored, or a day is already published),
+`CUTOVER_POST_LIVE_NOT_READY` (also from
 `report` before `post-live-check` has passed) and PT-1's own
 codes (for example `CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED`). Each is a NO-GO:
 diagnose, never bypass. The design adds no override flag beyond the two named
@@ -1020,7 +1102,13 @@ resume. `owner`.
 1. Run the analytics-refresh job once, by hand, with the trigger still
    paused, and wait for it. Read its content-free receipt line. `ok` with state
    `LOCK_HELD` means another run held the lock and nothing was written; that is
-   not a build. Success needs a completed run. The production contract of the
+   not a build. Success needs a completed run. Its `revisionFloor` must read
+   `present: true` with the day count and largest revision H.3 step 7 printed:
+   every republished day continues above Cloudflare's last revision. A
+   production run with no floor loaded refuses
+   `ANALYTICS_V2_REVISION_FLOOR_ABSENT` before reading anything and writes
+   nothing (the H.4 import has not run its `analytics-community-history`
+   stage); staging and test targets publish from r1 without one. The production contract of the
    job (bounded history loading, output accounting, a time guard) is `built`
    (C-REFRESH); the measured dense run took 66 minutes on a test seed, and the
    production figure is unmeasured.
@@ -1035,10 +1123,12 @@ resume. `owner`.
    the measurements. Then set its committed state to `ENABLED`. Tooling:
    explicit pause-all and resume-all are `not built` (D-OPS3).
 
-Recomputed history can differ from what Cloudflare published, published
-revisions restart, and past contributions stay in recomputed history. These
-are accepted differences and are disclosed on the privacy page (E-OPS9); they
-are not defects of the cold build.
+Recomputed history can differ from what Cloudflare published, and past
+contributions stay in recomputed history. These are accepted differences and
+are disclosed on the privacy page (E-OPS9); they are not defects of the cold
+build. Published revisions do not restart: each republished day continues
+above Cloudflare's last revision (round 12, REV-SEED), so an aggregate
+identifier the frozen read served is never reused for other content.
 
 ## Abort A, before any gcp-mode version
 
@@ -1138,7 +1228,8 @@ noted.
 | `FENCE_INVENTORY_CHANGED` | EP-8 apply, verify | The fenced surface differs from the plan receipt's fingerprint. Rerun inventory and plan, then use the new receipt |
 | `FENCE_WINDOW_TOO_SHORT`, `FENCE_WINDOW_TOO_EARLY` | EP-8 verify | Run too soon: wait until `appliedAt` + 2 x the quiet window + 5 minutes (35 minutes at the minimum), or fix the `--window-start` |
 | `FENCE_NOT_QUIESCENT` | EP-8 verify | A D1 bookmark or the quarantine digest moved inside the window: something wrote after the fence. Find the writer; do not shorten the window |
-| `CUTOVER_SOURCE_BOOKMARK_DRIFT`, `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` | Seal, flip evidence | A source changed after the fence. The seal is void |
+| `CUTOVER_SOURCE_BOOKMARK_DRIFT`, `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` | Seal, revision floor, flip evidence | A source changed after the fence. The seal (or the floor) is void |
+| `ANALYTICS_V2_REVISION_FLOOR_ABSENT` | H.8 | A production refresh found no revision floor. The import's `analytics-community-history` stage has not loaded it; never run the production refresh before it has |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PARTICIPANT_ERASURE_PENDING` | Seal, PT-3 | An erased or mid-erasure participant is in the sealed set. Finish the erasure on Cloudflare and re-seal |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH` | PT-3 | The configured pin, or under round 16 the rotation's `from`, does not match the sealed pin. Rotate only through the recorded [identity-link rotation](#identity-link-rotation-round-16) |
 | `CUTOVER_IDENTITY_ROTATION_STATE_INVALID` | Run, post-import, flip gate, post-live | The target pin is neither the rotation's `from` nor its completed `to` for this run, or (without a rotation) differs from the pin. Something wrote the pin row outside the orchestrator: diagnose, never bypass |
@@ -1163,6 +1254,7 @@ line at `2b5c90cd`.
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | `built` (C-ADMIN, ADMIN-R12): the production and staging composition opens the admin host behind the Access chokepoint (round 12). The overview is `admin-overview-v0.6`: the synthetic-contribution counts, historical publication and deletion-ledger blocks answer `{"status":"unavailable"}` until their sources exist (E-ADMIN); database health is `admin-database-health-v0.2`, the removed ledger `not_applicable`. The admin UI that reads both versions ships with the edge Worker; local proof only |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
+| Revision floor: capture, load, refresh refusal | H.3, H.4, H.8 | `built` (REV-SEED) on synthetic data and a local PostgreSQL 17 target only; its migration is promoted as primary `0071`; the capture has never contacted the provider |
 | Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |

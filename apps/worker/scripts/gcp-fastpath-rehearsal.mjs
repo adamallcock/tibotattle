@@ -72,6 +72,15 @@
 //                               promoted migration (K-STAMP's kernel stamps)
 //   --refresh-workers <n>       run analytics-refresh with --workers=<n> (default 1,
 //                               inline; K-PAR)
+//   --synthetic-revision-floor  REV-SEED (round 14): before the first refresh, load a
+//                               synthetic revision floor through the cutover loader
+//                               (cutover-revision-floor.mjs): every golden day but each
+//                               seventh at its golden revision plus (its index mod 5).
+//                               The gate revisionFloorRespected then holds every
+//                               published day at exactly its floor + 1 (r1 without
+//                               one). Needs the floor migration (--staged-primary
+//                               <its staged name> while it is staged). Parity
+//                               normalizes revision fields, so it is unchanged
 //   --keep-schema, --out <file>, --node22 <path>
 //
 // Rehearsal-only and local-only: it never reads production, never pushes and
@@ -105,6 +114,12 @@ import {
   readAnalyticsV2OwnerRows,
 } from "./analytics-v2-owner-parity-compare.mjs";
 import { comparePerDate } from "./gcp-fastpath-dense-oracle/per-date-compare.mjs";
+import {
+  CUTOVER_REVISION_FLOOR_SCHEMA,
+  loadRevisionFloorInTransaction,
+  parseRevisionFloorFile,
+  renderRevisionFloorFile,
+} from "./cutover-revision-floor.mjs";
 import { rebuildOracleSqlite } from "./gcp-fastpath-oracle-sqlite.mjs";
 import {
   compareFastpathOwnerRevisions,
@@ -179,7 +194,7 @@ export function parseArguments(argv) {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
     dump: null, perDateExpected: null, ownerReference: null, dense: false,
     refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null, stagedPrimary: [],
-    refreshWorkers: 1,
+    refreshWorkers: 1, syntheticRevisionFloor: false,
   };
   const valueOf = (index, argument) => {
     const value = argv[index];
@@ -193,6 +208,7 @@ export function parseArguments(argv) {
     if (argument === "--golden") options.golden = valueOf(++index, argument);
     else if (argument === "--keep-schema") options.keepSchema = true;
     else if (argument === "--dense") options.dense = true;
+    else if (argument === "--synthetic-revision-floor") options.syntheticRevisionFloor = true;
     else if (argument === "--out") options.out = valueOf(++index, argument);
     else if (argument === "--node22") options.node22 = valueOf(++index, argument);
     else if (argument === "--dump") options.dump = valueOf(++index, argument);
@@ -230,6 +246,10 @@ export function parseArguments(argv) {
     }
     options.perDateExpected = join(options.golden, "per-date-expected.json");
     options.ownerReference = options.golden;
+  }
+  // A floor is loadable only before the first publication: never on a reused schema.
+  if (options.syntheticRevisionFloor && options.reuseSchema !== null) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--synthetic-revision-floor" });
   }
   if (options.reuseSchema !== null) {
     if (!options.reuseSchema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
@@ -578,6 +598,38 @@ function refreshMeasurement(run) {
   };
 }
 
+/**
+ * REV-SEED: the rehearsal's synthetic revision floor, a pure function of the
+ * golden (every golden day but each seventh, at its golden revision plus its
+ * index mod 5), loaded through the cutover loader in one transaction.
+ */
+export function syntheticRehearsalFloorDays(goldenDays) {
+  return [...goldenDays].map(({ day, revision }) => [day, revision]).sort(([left], [right]) => (left < right ? -1 : 1))
+    .flatMap(([day, revision], index) => (index % 7 === 6 ? [] : [[day, revision + (index % 5)]]));
+}
+
+async function loadSyntheticRehearsalFloor(pool, schema, { golden, manifest, nowIso }) {
+  const days = syntheticRehearsalFloorDays(golden.days);
+  const digest = (label) => createHash("sha256").update(`gcp-fastpath-rehearsal:${label}`).digest("hex");
+  const { text, floorSha256 } = renderRevisionFloorFile({ schema: CUTOVER_REVISION_FLOOR_SCHEMA, provenance: "synthetic",
+    sealId: digest(`seal:${manifest.nowMs}`), fenceReceiptSha256: digest("fence"), sourceCommit: manifest.sourceCommit,
+    capturedAt: nowIso, capture: null, days, dayCount: days.length,
+    maxRevision: Math.max(...days.map(([, revision]) => revision)) });
+  const floor = parseRevisionFloorFile(new TextEncoder().encode(text), floorSha256);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const receipt = await loadRevisionFloorInTransaction({ client, schema, floor });
+    await client.query("COMMIT");
+    return { receipt, floor: new Map(days) };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function publishedSnapshot(pool, schema) {
   const result = await pool.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, revision, payload_sha256,
       run_id::text AS run_id FROM ${quoteIdentifier(schema)}.analytics_v2_published_daily ORDER BY day`);
@@ -847,6 +899,14 @@ async function main() {
       }));
     }
 
+    // REV-SEED: a synthetic revision floor, before any publication.
+    let syntheticFloor = null;
+    if (options.syntheticRevisionFloor) {
+      syntheticFloor = await loadSyntheticRehearsalFloor(pool, schema, { golden, manifest, nowIso });
+      report.steps.revisionFloor = { state: syntheticFloor.receipt.state, dayCount: syntheticFloor.receipt.dayCount,
+        maxRevision: syntheticFloor.receipt.maxRevision, floorSha256: syntheticFloor.receipt.floorSha256 };
+    }
+
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
       timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers });
@@ -858,6 +918,14 @@ async function main() {
     if (first.receipt?.state !== "complete") fail("REHEARSAL_REFRESH_INCOMPLETE", { state: first.receipt?.state ?? null });
     report.measurement = { refreshFirst: refreshMeasurement(first) };
     const afterFirst = await publishedSnapshot(pool, schema);
+    if (syntheticFloor !== null) {
+      // Per day: exactly one above the floor, or r1 where there is none.
+      const offFloor = afterFirst.filter((row) => row.revision !== (syntheticFloor.floor.get(row.day) ?? 0) + 1);
+      report.steps.revisionFloor.publishedDays = afterFirst.length;
+      report.steps.revisionFloor.flooredDays = afterFirst.filter((row) => syntheticFloor.floor.has(row.day)).length;
+      report.steps.revisionFloor.offFloorDays = offFloor.length;
+      report.steps.revisionFloor.receipt = first.receipt?.revisionFloor ?? null;
+    }
 
     // 5-6. The fastpath-test origin and the public read.
     origin = await timed(timings, "origin:start", async () => spawnOrigin({
@@ -929,6 +997,8 @@ async function main() {
         : { breakdownsV13Declared: report.parity.breakdownsV13.accepted === true }),
       ...(report.perDate === undefined ? {} : { perDateEqual: report.perDate.equal === true }),
       ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
+      ...(syntheticFloor === null ? {} : { revisionFloorRespected: report.steps.revisionFloor.offFloorDays === 0
+        && report.steps.revisionFloor.flooredDays > 0 && report.steps.revisionFloor.receipt?.present === true }),
     };
     report.status = Object.values(report.gates).every(Boolean) ? "pass" : "gate_failed";
   } catch (error) {

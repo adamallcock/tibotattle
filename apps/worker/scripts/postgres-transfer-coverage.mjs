@@ -96,11 +96,20 @@ function fail(code, details = undefined) {
 /** The sealed source roles PT-8-lite covers (the analytics D1 is never sealed: decision D3). */
 export const SOURCE_ROLES = Object.freeze(["ingestion", "deletion-ledger"]);
 
-/** The closed owner flags (design section 3 and P13). */
+/** The closed owner flags (design section 3, P13 and P16). */
 export const OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED = "performance-routes-retired";
+/**
+ * REV-SEED (round 14): the run is the dress rehearsal, so P16 and the
+ * 'analytics-community-history' stage admit its synthetic revision floor
+ * (cutover-revision-floor.mjs synthetic). Without it they admit only a floor
+ * the capture took inside this fence, and with it they refuse a captured
+ * floor (REVISION_FLOOR_PROVENANCE_REFUSED).
+ */
+export const OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR = "dress-rehearsal-synthetic-revision-floor";
 export const OWNER_FLAGS = Object.freeze([
   OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED,
   OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
+  OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -133,7 +142,11 @@ export const STAGE_PLAN = Object.freeze([
   Object.freeze({ stage: "objects", kind: "waiver", reason: "deferred-post-flip:pt-7" }),
   Object.freeze({ stage: "analytics-expectation", kind: "waiver", reason: "analytics-recomputed:d3" }),
   Object.freeze({ stage: "analytics-history", kind: "waiver", reason: "analytics-recomputed:d3" }),
-  Object.freeze({ stage: "analytics-community-history", kind: "waiver", reason: "analytics-recomputed:d3" }),
+  // REV-SEED (round 14): Cloudflare's per-day revision floor, loaded before
+  // markLive so GCP's publications continue above it
+  // (cutover-revision-floor.mjs). The analytics D1 is never sealed, so this
+  // stage writes no table receipt; its stage receipt digests the floor.
+  Object.freeze({ stage: "analytics-community-history", kind: "runner" }),
   Object.freeze({ stage: "post-import", kind: "orchestrator" }),
 ]);
 
