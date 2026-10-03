@@ -1,5 +1,5 @@
 import { canonicalJson } from "../canonical-json";
-import { sha256Hex } from "../crypto";
+import { hostSha256Hex, type HostSha256Hex } from "../host-primitives";
 /**
  * analytics-v2 compute core (A-2): one pure, single-threaded full recompute of
  * every community analytics output from effective owner occurrences, using
@@ -247,6 +247,8 @@ export type AnalyticsV2QueuedDaysInput =
 export interface ComputeAnalyticsV2Input {
   /** Optional proof observer: only a SHA-256 digest of merge order leaves compute. */
   readonly emissionSequenceDigest?: (digest: string) => void;
+  /** Synchronous SHA-256 composition adapter for portable proof callers; GCP supplies its host primitive. */
+  readonly emissionSequenceHash?: HostSha256Hex;
   readonly owners: readonly AnalyticsV2Owner[];
   readonly occurrencesByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
   /**
@@ -764,9 +766,21 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     neededDays: Object.freeze(neededDays), segments: Object.freeze(segments), rangeFromDay: range.fromDay,
     queued: Object.freeze(queued), modelDates: Object.freeze(modelDates), resources });
   /** Append one owner output in production order and charge it to the account. */
-  const observedEmissions: AnalyticsV2OwnerEmission[] | null = input.emissionSequenceDigest === undefined ? null : [];
+  const sequenceHash = input.emissionSequenceHash ?? hostSha256Hex;
+  if (input.emissionSequenceDigest !== undefined && sequenceHash === null) invalid("emissionSequenceHash");
+  const sequenceMethod = "analytics-v2-emission-sequence-v1";
+  const sequenceDigestOf = (text: string): string => {
+    const digest = sequenceHash!(text);
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) invalid("emissionSequenceHash");
+    return digest;
+  };
+  let sequenceDigest: string | null = input.emissionSequenceDigest === undefined ? null
+    : sequenceDigestOf(canonicalJson([sequenceMethod]));
   const merge = (emission: AnalyticsV2OwnerEmission): void => {
-    observedEmissions?.push(emission);
+    // Constant retained memory: one previous digest and one canonical row.
+    // No row content crosses the digest-only observer or waits in a hash queue.
+    if (sequenceDigest !== null) sequenceDigest = sequenceDigestOf(canonicalJson([sequenceMethod, sequenceDigest,
+      emission.kind, canonicalJson(emission.kind === "refusal" ? emission.refusal : emission.row)]));
     switch (emission.kind) {
       case "refusal": pushRefusal(emission.refusal); return;
       case "ownerDay": ownerDays.push(emission.row); break;
@@ -940,7 +954,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions,
     ownerSets: ownerSetInput.state, savedValues }));
 
-  if (observedEmissions !== null) input.emissionSequenceDigest!(await sha256Hex(canonicalJson(observedEmissions)));
+  if (sequenceDigest !== null) input.emissionSequenceDigest!(sequenceDigest);
 
   return {
     contractVersion: ANALYTICS_V2_CONTRACT_VERSION,
