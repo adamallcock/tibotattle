@@ -17,9 +17,15 @@
  * What is rendered (docs: cloud-run/infra/monitoring.md, one anchor each):
  *
  *   origin-5xx-ratio       page    Cloud Run 5xx over all requests > 2 % for
- *                                  10 min, less the origin's own 503
- *                                  POSTGRES_ROUTE_NOT_PORTED answers (counted
- *                                  from its request log line, W3-CRA/CR-6).
+ *                                  10 min, with at least 5 net 5xx answers in
+ *                                  the window, both counts net of the
+ *                                  deliberate unported answers: each an exact
+ *                                  route path plus its code
+ *                                  (ORIGIN_5XX_EXCLUSIONS), counted from the
+ *                                  origin's request log line (W3-CRA/CR-6),
+ *                                  never a code alone. It reads only what
+ *                                  reaches Cloud Run: an answer the edge makes
+ *                                  itself is outside its inputs.
  *   refresh-lock-held      ticket  any analytics-refresh receipt with state
  *                                  LOCK_HELD in the last hour.
  *   refresh-not-completed  page    no analytics-refresh receipt with state
@@ -53,6 +59,13 @@
  *                                  Google's front-end 403 (status exactly
  *                                  403, Google's body text); anything else
  *                                  fails the check.
+ *   edge-health            page    an unauthenticated uptime check of the
+ *                                  plane's public /api/health, through the
+ *                                  Cloudflare edge, must get 200 with status
+ *                                  ok. In gcp mode the origin answers it, so
+ *                                  an edge-to-origin outage (503
+ *                                  EDGE_ORIGIN_UNAVAILABLE), which Cloud Run
+ *                                  never sees, fails the check.
  *   sql-cpu, sql-memory,   ticket  Cloud SQL utilisation over its bound for
  *   sql-disk,                      10 min; connections over 80 % of the
  *   sql-connections                committed max_connections.
@@ -68,15 +81,18 @@
  * deferred with a closed reason (SCHEDULER_CADENCE_UNSET,
  * SCHEDULER_CADENCE_UNSUPPORTED (fires fewer than twice in 400 days),
  * TRIGGER_COMMITTED_PAUSED, PRODUCER_NOT_IN_MANIFEST:<job>,
- * NOTIFICATION_CHANNEL_UNASSIGNED), so applying it could never page on a
- * signal nothing emits. Absence and ratio conditions use Cloud Monitoring's
- * PromQL conditions; the PromQL names of log-based metrics
- * (logging_googleapis_com:user_<name>) and of Cloud Scheduler's attempt log
- * shape are assumptions to confirm at the first readback against the test
- * project, as OPS-2's readback was.
+ * PUBLIC_ORIGIN_UNASSIGNED, NOTIFICATION_CHANNEL_UNASSIGNED), so applying it
+ * could never page on a signal nothing emits. Absence and ratio conditions
+ * use Cloud Monitoring's PromQL conditions; the PromQL names of log-based
+ * metrics (logging_googleapis_com:user_<name>), how increase() extrapolates
+ * them, and the shape of Cloud Scheduler's attempt log are assumptions to
+ * confirm at the first readback against the test project, as OPS-2's
+ * readback was.
  */
 
 import { canonicalJson } from "../src/canonical-json.ts";
+import { WORKER_ROUTE_POLICY, matchWorkerRoute } from "../src/route-registry.ts";
+import { PRODUCTION_PUBLIC_ORIGIN } from "../cloud-run/postgres-production-configuration.mjs";
 import {
   JOB_NAMES,
   SCHEDULED_JOB_NAMES,
@@ -95,12 +111,12 @@ const API_SEVERITY = Object.freeze({ page: "CRITICAL", ticket: "ERROR", info: "W
 export const MONITORING_RUNBOOK = "apps/worker/cloud-run/infra/monitoring.md";
 export const MONITORING_POLICY_IDS = Object.freeze([
   "origin-5xx-ratio", "refresh-lock-held", "refresh-not-completed", "refresh-output-headroom", "scheduler-quiet",
-  "origin-lock",
+  "origin-lock", "edge-health",
   "sql-cpu", "sql-memory", "sql-disk", "sql-connections", "unseen-tokens", "unseen-tokens-silent",
 ]);
 export const MONITORING_DEFERRALS = Object.freeze([
   "NOTIFICATION_CHANNEL_UNASSIGNED", "SCHEDULER_CADENCE_UNSET", "SCHEDULER_CADENCE_UNSUPPORTED",
-  "TRIGGER_COMMITTED_PAUSED", "PRODUCER_NOT_IN_MANIFEST",
+  "TRIGGER_COMMITTED_PAUSED", "PRODUCER_NOT_IN_MANIFEST", "PUBLIC_ORIGIN_UNASSIGNED",
 ]);
 
 /** The origin's request log line (W3-CRA cloud-run/postgres-host-dispatch.mjs ORIGIN_REQUEST_LOG_FIELDS, 3024a521). */
@@ -137,10 +153,133 @@ export const SCHEDULER_ATTEMPT_LOG_TYPE = "type.googleapis.com/google.cloud.sche
 export const GOOGLE_FRONT_END_403_TEXT = "Your client does not have permission";
 /** The only status the origin-lock check accepts. */
 export const ORIGIN_LOCK_ACCEPTED_STATUSES = Object.freeze([403]);
+/**
+ * The edge-health check: an unauthenticated GET of the plane's public
+ * /api/health, through the Cloudflare edge, must answer exactly 200 with
+ * status ok. The Worker answers it in worker mode, barrier health in fenced
+ * mode and the Cloud Run origin in gcp mode (thin edge decision, section 11),
+ * so in gcp mode it fails on the edge's own 503 EDGE_ORIGIN_UNAVAILABLE or
+ * EDGE_NOT_CONFIGURED, which never reach Cloud Run.
+ */
+export const EDGE_HEALTH_ACCEPTED_STATUSES = Object.freeze([200]);
+export const EDGE_HEALTH_OK_TEXT = '"status":"ok"';
+
+/**
+ * The deliberate unported answers origin-5xx-ratio leaves out, each by an
+ * exact WORKER_ROUTE_POLICY pathname plus its status and code, never by a
+ * code alone. The origin's request log line carries no path: it carries
+ * routeClass, which matchWorkerRoute binds one-to-one to an exact pathname
+ * (routeClass is the route id), so each entry renders as that routeClass
+ * together with its code. Cloud Run's own request log carries the status but
+ * not the body's code, and its URL (httpRequest) is outside the privacy
+ * contract.
+ * - round 12 (2026-10-02): the native social chain (Google, Apple, legacy
+ *   /api/v1/enroll), security reset, and the performance device and consent
+ *   routes are retired;
+ * - OD-CR-2 (round 1): participant export is retired;
+ * - C-ADMIN: an admin task with no PostgreSQL port answers 503
+ *   POSTGRES_ROUTE_NOT_PORTED on the admin action route.
+ * v0.x uploads (round 12) share POST /api/v1/contributions with every live
+ * upload and are refused with a 4xx there, so nothing is excluded for them;
+ * the accountless performance authorization answers a definite 4xx (round
+ * 12), so it is not excluded either: a 5xx from it is a defect.
+ */
+export const ORIGIN_5XX_EXCLUSIONS = Object.freeze([
+  ["/api/v1/enroll", "round-12"],
+  ["/api/v1/identity/google/start", "round-12"],
+  ["/api/v1/identity/google/callback", "round-12"],
+  ["/api/v1/identity/google/result", "round-12"],
+  ["/api/v1/identity/apple/start", "round-12"],
+  ["/api/v1/identity/apple/callback", "round-12"],
+  ["/api/v1/identity/apple/result", "round-12"],
+  ["/api/v1/me/security-reset", "round-12"],
+  ["/api/v1/device/telemetry/performance/capabilities", "round-12"],
+  ["/api/v1/me/device-telemetry-performance-consents", "round-12"],
+  ["/api/v1/device/telemetry/performance/reports", "round-12"],
+  ["/api/v1/me/export", "od-cr-2"],
+  ["/api/v1/admin/action", "c-admin"],
+].map(([path, decision]) => Object.freeze({
+  path,
+  status: ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status,
+  code: ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code,
+  decision,
+})));
+/** The only codes an exclusion may name. */
+export const ORIGIN_5XX_EXCLUDABLE_CODES = Object.freeze([ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code]);
+/**
+ * Codes an exclusion may never name; the refusal is a guard only. The
+ * loopback test dispatcher's refusal is never a deliberate answer, and counts
+ * as a 5xx if a deployed origin ever gives it. The edge's own
+ * EDGE_ORIGIN_UNAVAILABLE is made at the Cloudflare edge and never reaches
+ * Cloud Run, so it is outside origin-5xx-ratio's inputs altogether:
+ * edge-health watches that path.
+ */
+export const ORIGIN_5XX_NEVER_EXCLUDED_CODES = Object.freeze([
+  "POSTGRES_TEST_ROUTE_UNSUPPORTED",
+  "EDGE_ORIGIN_UNAVAILABLE",
+]);
+/**
+ * Exact paths that are never excluded, whatever the code: the live upload
+ * route v0.x shares, the accountless performance authorization (a definite
+ * 4xx, round 12), and the renew and disconnect routes round 12 keeps.
+ */
+export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
+  "/api/v1/contributions",
+  "/api/v1/device/upload-authorizations",
+  "/api/v1/accountless/telemetry-performance-authorization",
+  "/api/v1/device/credential/renew",
+  "/api/v1/device/disconnect",
+]);
+const ROUTE_CLASS = /^[a-z][a-z0-9_]*$/u;
+const EXCLUSION_KEYS = Object.freeze(["code", "decision", "path", "status"]);
+
+/**
+ * Validate an exclusion table: each entry names an exact WORKER_ROUTE_POLICY
+ * pathname, a 5xx status and an excludable code (with that code's own
+ * status), once. Returns the entries with their routeClass; throws
+ * MONITORING_5XX_EXCLUSION_* otherwise.
+ */
+export function originFiveXxExclusions(entries) {
+  if (!Array.isArray(entries)) fail("MONITORING_5XX_EXCLUSION_INVALID");
+  const seen = new Set();
+  return Object.freeze(entries.map((entry) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)
+        || JSON.stringify(Object.keys(entry).sort()) !== JSON.stringify(EXCLUSION_KEYS)
+        || typeof entry.decision !== "string" || entry.decision.length === 0) {
+      fail("MONITORING_5XX_EXCLUSION_INVALID");
+    }
+    const { path, status, code } = entry;
+    if (typeof path !== "string" || path.length === 0) fail("MONITORING_5XX_EXCLUSION_INVALID");
+    if (ORIGIN_5XX_NEVER_EXCLUDED_CODES.includes(code) || !ORIGIN_5XX_EXCLUDABLE_CODES.includes(code)) {
+      fail("MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN");
+    }
+    if (status !== ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status) fail("MONITORING_5XX_EXCLUSION_INVALID");
+    if (ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(path)) fail("MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN");
+    const route = matchWorkerRoute(path);
+    if (route.kind !== "exact" || !WORKER_ROUTE_POLICY.some((definition) => definition.pathname === path)
+        || !ROUTE_CLASS.test(route.routeClass)) {
+      fail("MONITORING_5XX_EXCLUSION_PATH_NOT_EXACT");
+    }
+    const key = `${route.routeClass}\u0000${code}`;
+    if (seen.has(key)) fail("MONITORING_5XX_EXCLUSION_DUPLICATE");
+    seen.add(key);
+    return Object.freeze({ path, routeClass: route.routeClass, status, code });
+  }));
+}
 
 export const MONITORING_THRESHOLDS = Object.freeze({
   originFiveXxRatio: 0.02,
   originFiveXxWindowMinutes: 10,
+  /**
+   * The window must also hold at least this many net 5xx answers. One error
+   * never pages: increase() extrapolates a count to the window's edges (about
+   * 1.1 times with 60 s samples, more for a sparse series), and 5 leaves a
+   * wide margin. Below 250 requests per window (5 / 0.02) this count binds,
+   * so a window whose requests all fail pages once it holds 5 of them,
+   * whatever its volume; from 250 requests the 2 % share binds. A starting
+   * value, like round 9's thresholds: tune after a week of real traffic.
+   */
+  originFiveXxMinimumErrors: 5,
   cadenceSlackMinutes: 60,
   schedulerQuietMinimumHours: SCHEDULER_PAUSE_ALERT_THRESHOLD_HOURS,
   sqlCpuUtilization: 0.8,
@@ -154,6 +293,56 @@ export const MONITORING_THRESHOLDS = Object.freeze({
   unseenProbeSilentHours: 26,
   uptimePeriodSeconds: 300,
 });
+
+/**
+ * origin-5xx-ratio's one PromQL query, for a service and the PromQL name of
+ * its origin-request-failure metric:
+ *
+ *   ((errors / requests) > ratio) and on() (errors >= minimum errors)
+ *
+ * errors and requests are Cloud Run's 5xx and all-request counts over the
+ * window, each net of the same exclusion term: one selector per (status,
+ * code) pinned to its exact routeClasses, or 0 while the origin logs none.
+ * The renderer and the scanner both build it here, so a rendered query that
+ * differs from it in any part is refused.
+ */
+export function originFiveXxQuery(service, requestFailureMetric) {
+  const t = MONITORING_THRESHOLDS;
+  const window = `${t.originFiveXxWindowMinutes}m`;
+  const groups = new Map();
+  for (const { routeClass, status, code } of originFiveXxExclusions(ORIGIN_5XX_EXCLUSIONS)) {
+    const key = `${status} ${code}`;
+    if (!groups.has(key)) groups.set(key, { status, code, routeClasses: [] });
+    groups.get(key).routeClasses.push(routeClass);
+  }
+  const excluded = [...groups.values()].map(({ status, code, routeClasses }) =>
+    `(sum(increase(${requestFailureMetric}{monitored_resource="cloud_run_revision",`
+    + `service_name=${quote(service)},routeClass=~${quote(routeClasses.join("|"))},status="${status}",`
+    + `code=${quote(code)}}[${window}])) or vector(0))`).join(" + ");
+  const requests = (extra = "") => `sum(increase(run_googleapis_com:request_count{monitored_resource=`
+    + `"cloud_run_revision",service_name=${quote(service)}${extra}}[${window}]))`;
+  const errors = `(${requests(',response_code_class="5xx"')} - (${excluded}))`;
+  const counted = `(${requests()} - (${excluded}))`;
+  return `((${errors} / ${counted}) > ${t.originFiveXxRatio})`
+    + ` and on() (${errors} >= ${t.originFiveXxMinimumErrors})`;
+}
+
+/** origin-5xx-ratio's conditions: the one query, held for the whole window. */
+export function originFiveXxConditions(service, requestFailureMetric) {
+  return [promCondition("origin 5xx ratio", originFiveXxQuery(service, requestFailureMetric),
+    { duration: `${MONITORING_THRESHOLDS.originFiveXxWindowMinutes * 60}s` })];
+}
+
+/**
+ * The host of the plane's public edge origin, which edge-health probes:
+ * production's public origin, or the staging edge's (stagingOrigin), or null
+ * while a staging plane has none.
+ */
+export function publicEdgeHost(desired) {
+  const origin = desired.environment === "production" ? PRODUCTION_PUBLIC_ORIGIN
+    : desired.stagingOrigin?.publicOrigin;
+  return typeof origin === "string" ? new URL(origin).host : null;
+}
 
 /**
  * The only log fields a rendered filter or label extractor may read. None
@@ -309,6 +498,48 @@ function distributionMetric(desired, id, { description, filter, valueField }) {
   };
 }
 
+/** An unauthenticated GET of https://<host>/api/health that accepts exactly these statuses and this text. */
+function uptimeCheck(desired, id, { host, accepted, content }) {
+  return {
+    kind: "uptime-check",
+    id,
+    name: displayName(desired, id),
+    body: {
+      displayName: displayName(desired, id),
+      monitoredResource: { type: "uptime_url", labels: { project_id: desired.project, host } },
+      httpCheck: {
+        requestMethod: "GET",
+        path: "/api/health",
+        port: 443,
+        useSsl: true,
+        validateSsl: true,
+        acceptedResponseStatusCodes: accepted.map((statusValue) => ({ statusValue })),
+      },
+      contentMatchers: [{ content, matcher: "CONTAINS_STRING" }],
+      period: `${MONITORING_THRESHOLDS.uptimePeriodSeconds}s`,
+      timeout: "10s",
+    },
+  };
+}
+
+/** An uptime check failing from more than one checker location for 10 minutes. */
+function uptimeFailingCondition(displayName_, host) {
+  return {
+    displayName: displayName_,
+    conditionThreshold: {
+      // The check id is assigned at create; the host names this plane's check.
+      filter: `metric.type="monitoring.googleapis.com/uptime_check/check_passed" AND resource.type="uptime_url"`
+        + ` AND resource.label.host=${quote(host)}`,
+      comparison: "COMPARISON_GT",
+      thresholdValue: 1,
+      duration: "600s",
+      aggregations: [{ alignmentPeriod: "1200s", perSeriesAligner: "ALIGN_NEXT_OLDER",
+        crossSeriesReducer: "REDUCE_COUNT_FALSE", groupByFields: ["resource.label.host"] }],
+      trigger: { count: 1 },
+    },
+  };
+}
+
 function alertPolicy(desired, id, { severity, summary, conditions, notificationChannel }) {
   if (!ALERT_SEVERITIES.includes(severity) || !MONITORING_POLICY_IDS.includes(id)) fail("MONITORING_POLICY_INVALID");
   return {
@@ -438,26 +669,13 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
   ];
   const metricName = (id) => promName(monitoringName(desired, id));
 
-  const uptime = {
-    kind: "uptime-check",
-    id: "origin-lock",
-    name: displayName(desired, "origin-lock"),
-    body: {
-      displayName: displayName(desired, "origin-lock"),
-      monitoredResource: { type: "uptime_url", labels: { project_id: desired.project, host: desired.service.host } },
-      httpCheck: {
-        requestMethod: "GET",
-        path: "/api/health",
-        port: 443,
-        useSsl: true,
-        validateSsl: true,
-        acceptedResponseStatusCodes: ORIGIN_LOCK_ACCEPTED_STATUSES.map((statusValue) => ({ statusValue })),
-      },
-      contentMatchers: [{ content: GOOGLE_FRONT_END_403_TEXT, matcher: "CONTAINS_STRING" }],
-      period: `${t.uptimePeriodSeconds}s`,
-      timeout: "10s",
-    },
-  };
+  const edgeHost = publicEdgeHost(desired);
+  const uptimeChecks = [
+    uptimeCheck(desired, "origin-lock", { host: desired.service.host, accepted: ORIGIN_LOCK_ACCEPTED_STATUSES,
+      content: GOOGLE_FRONT_END_403_TEXT }),
+    ...(edgeHost === null ? [] : [uptimeCheck(desired, "edge-health", { host: edgeHost,
+      accepted: EDGE_HEALTH_ACCEPTED_STATUSES, content: EDGE_HEALTH_OK_TEXT })]),
+  ];
 
   const policies = [];
   const add = (id, options, deferred = null, deferredConditions = []) => {
@@ -467,18 +685,12 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
       ...(deferredConditions.length === 0 ? {} : { deferredConditions }) });
   };
 
-  const notPorted = `${metricName("origin-request-failure")}{monitored_resource="cloud_run_revision",`
-    + `service_name=${quote(service)},status="${origin.notPorted.status}",code=${quote(origin.notPorted.code)}}`;
-  const requests = (extra = "") => `run_googleapis_com:request_count{monitored_resource="cloud_run_revision",`
-    + `service_name=${quote(service)}${extra}}`;
-  const window = `${t.originFiveXxWindowMinutes}m`;
   add("origin-5xx-ratio", {
     severity: "page",
-    summary: `Origin 5xx share over ${t.originFiveXxRatio * 100} % for ${t.originFiveXxWindowMinutes} min, `
-      + "excluding 503 POSTGRES_ROUTE_NOT_PORTED.",
-    conditions: [promCondition("origin 5xx ratio",
-      `(sum(rate(${requests(',response_code_class="5xx"')}[${window}])) - (sum(rate(${notPorted}[${window}])) or vector(0)))`
-      + ` / sum(rate(${requests()}[${window}])) > ${t.originFiveXxRatio}`, { duration: `${t.originFiveXxWindowMinutes * 60}s` })],
+    summary: `Origin 5xx share over ${t.originFiveXxRatio * 100} % for ${t.originFiveXxWindowMinutes} min, with at `
+      + `least ${t.originFiveXxMinimumErrors} net 5xx answers in the window, net of the deliberate unported answers `
+      + "(exact route plus code). An answer the edge makes itself never reaches Cloud Run: see edge-health.",
+    conditions: originFiveXxConditions(service, metricName("origin-request-failure")),
   });
   add("refresh-lock-held", {
     severity: "ticket",
@@ -526,21 +738,15 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
   add("origin-lock", {
     severity: "page",
     summary: "The run.app origin answered an unauthenticated request with something other than Google's 403.",
-    conditions: [{
-      displayName: "origin-lock uptime check failing",
-      conditionThreshold: {
-        // The check id is assigned at create; the host names this plane's check.
-        filter: `metric.type="monitoring.googleapis.com/uptime_check/check_passed" AND resource.type="uptime_url"`
-          + ` AND resource.label.host=${quote(desired.service.host)}`,
-        comparison: "COMPARISON_GT",
-        thresholdValue: 1,
-        duration: "600s",
-        aggregations: [{ alignmentPeriod: "1200s", perSeriesAligner: "ALIGN_NEXT_OLDER",
-          crossSeriesReducer: "REDUCE_COUNT_FALSE", groupByFields: ["resource.label.host"] }],
-        trigger: { count: 1 },
-      },
-    }],
+    conditions: [uptimeFailingCondition("origin-lock uptime check failing", desired.service.host)],
   });
+  add("edge-health", {
+    severity: "page",
+    summary: "Public /api/health through the Cloudflare edge did not answer 200 with status ok. In gcp mode the "
+      + "origin answers it, so an edge-to-origin outage (503 EDGE_ORIGIN_UNAVAILABLE), which never reaches Cloud "
+      + "Run, pages here.",
+    conditions: edgeHost === null ? [] : [uptimeFailingCondition("edge-health uptime check failing", edgeHost)],
+  }, edgeHost === null ? "PUBLIC_ORIGIN_UNASSIGNED" : null);
   const database = `${desired.project}:${desired.cloudSql.instance}`;
   const sql = (metric) => `metric.type="cloudsql.googleapis.com/database/${metric}" AND resource.type="cloudsql_database"`
     + ` AND resource.label.database_id=${quote(database)}`;
@@ -581,7 +787,7 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
     desiredStateDigest: desiredStateDigest(desired),
     notificationChannel: notificationChannel === null ? "unassigned" : "assigned",
     metrics,
-    uptimeChecks: [uptime],
+    uptimeChecks,
     policies,
   };
   scanMonitoringPrivacy(rendered);
@@ -617,11 +823,91 @@ function scanQuery(text, where) {
   }
 }
 
+/** The matcher shape of an exclusion selector: label and operator, in order. */
+const FIVE_XX_EXCLUSION_SELECTOR = Object.freeze([
+  ["monitored_resource", "="], ["service_name", "="], ["routeClass", "=~"], ["status", "="], ["code", "="],
+]);
+
+/** A selector's `label op "value"` matchers, or null when one does not parse. */
+function selectorMatchers(selector) {
+  const matchers = [];
+  for (const part of selector.split(",")) {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(=~|!~|!=|=)\s*"([^"]*)"\s*$/u.exec(part);
+    if (match === null) return null;
+    matchers.push(match.slice(1));
+  }
+  return matchers;
+}
+
+/**
+ * origin-5xx-ratio stays exact and whole:
+ * - no never-excluded code appears (MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN);
+ * - every selector that names a code also names routeClasses, with code=
+ *   (MONITORING_5XX_EXCLUSION_CODE_ALONE);
+ * - every such selector, and every selector of the origin request metric, has
+ *   exactly the matchers monitored_resource=, service_name=, routeClass=~,
+ *   status= and code=, in that order (MONITORING_5XX_EXCLUSION_SELECTOR_INVALID),
+ *   and each routeClass it names is listed with that status and code
+ *   (MONITORING_5XX_EXCLUSION_NOT_LISTED);
+ * - the policy's conditions are exactly originFiveXxConditions for the
+ *   service the origin request metric reads: the same operators, threshold,
+ *   minimum error count, window, duration and exclusion term
+ *   (MONITORING_5XX_QUERY_NOT_CANONICAL).
+ */
+function scanFiveXxPolicy(policy, rendered) {
+  const metric = rendered.metrics.find(({ id }) => id === "origin-request-failure");
+  if (metric === undefined) fail("MONITORING_5XX_QUERY_NOT_CANONICAL");
+  const requestFailure = promName(metric.name);
+  const allowed = new Set(originFiveXxExclusions(ORIGIN_5XX_EXCLUSIONS)
+    .map(({ routeClass, status, code }) => `${routeClass} ${status} ${code}`));
+  const queries = policy.body.conditions.map((condition) => condition.conditionPrometheusQueryLanguage?.query);
+  for (const query of queries) {
+    if (typeof query !== "string") fail("MONITORING_5XX_QUERY_NOT_CANONICAL");
+    for (const code of ORIGIN_5XX_NEVER_EXCLUDED_CODES) {
+      if (query.includes(code)) fail("MONITORING_5XX_EXCLUSION_CODE_FORBIDDEN");
+    }
+    for (const [, name, selector] of query.matchAll(/([A-Za-z_:][A-Za-z0-9_:]*)\s*\{([^}]*)\}/gu)) {
+      const matchers = selectorMatchers(selector);
+      const code = matchers?.find(([label]) => label === "code");
+      if (name !== requestFailure && code === undefined && !/(?:^|,)\s*code\s*[=!]/u.test(selector)) continue;
+      if (matchers === null) fail("MONITORING_5XX_EXCLUSION_SELECTOR_INVALID");
+      if (code !== undefined && (code[1] !== "=" || !matchers.some(([label]) => label === "routeClass"))) {
+        fail("MONITORING_5XX_EXCLUSION_CODE_ALONE");
+      }
+      if (name !== requestFailure || JSON.stringify(matchers.map(([label, operator]) => [label, operator]))
+          !== JSON.stringify(FIVE_XX_EXCLUSION_SELECTOR)) {
+        fail("MONITORING_5XX_EXCLUSION_SELECTOR_INVALID");
+      }
+      const [, , [, , routeClasses], [, , status], [, , codeValue]] = matchers;
+      for (const routeClass of routeClasses.split("|")) {
+        if (!allowed.has(`${routeClass} ${status} ${codeValue}`)) fail("MONITORING_5XX_EXCLUSION_NOT_LISTED");
+      }
+    }
+  }
+  // The service is the one the origin request metric reads, so the query cannot move to another.
+  const service = /(?:^| AND )resource\.labels\.service_name="([^"]*)"(?: AND |$)/u.exec(metric.body.filter)?.[1];
+  if (service === undefined
+      || canonicalJson(policy.body.conditions) !== canonicalJson(originFiveXxConditions(service, requestFailure))) {
+    fail("MONITORING_5XX_QUERY_NOT_CANONICAL");
+  }
+}
+
+/** What each uptime check must accept, the text it must find, and whether it probes run.app. */
+const UPTIME_CHECK_CONTRACTS = Object.freeze({
+  "origin-lock": Object.freeze({ accepted: ORIGIN_LOCK_ACCEPTED_STATUSES, content: GOOGLE_FRONT_END_403_TEXT,
+    runApp: true, code: "MONITORING_ORIGIN_LOCK_INVALID" }),
+  "edge-health": Object.freeze({ accepted: EDGE_HEALTH_ACCEPTED_STATUSES, content: EDGE_HEALTH_OK_TEXT,
+    runApp: false, code: "MONITORING_EDGE_HEALTH_INVALID" }),
+});
+
 /**
  * Throws MONITORING_FIELD_FORBIDDEN or MONITORING_*_NOT_ALLOWLISTED unless
  * every log filter, label extractor and value extractor reads only
- * ALLOWED_LOG_FIELDS and
- * every PromQL query matches only ALLOWED_QUERY_LABELS.
+ * ALLOWED_LOG_FIELDS and every PromQL query matches only ALLOWED_QUERY_LABELS;
+ * MONITORING_5XX_* unless origin-5xx-ratio is exactly the contract's
+ * (scanFiveXxPolicy); and MONITORING_*_INVALID unless each uptime check is an
+ * unauthenticated GET of /api/health accepting exactly its contract's statuses
+ * and text, origin-lock on run.app and edge-health never on it.
  */
 export function scanMonitoringPrivacy(rendered) {
   for (const metric of rendered.metrics) {
@@ -648,11 +934,24 @@ export function scanMonitoringPrivacy(rendered) {
       }
     }
   }
+  const fiveXx = rendered.policies.filter(({ id }) => id === "origin-5xx-ratio");
+  if (fiveXx.length !== 1) fail("MONITORING_5XX_QUERY_NOT_CANONICAL");
+  scanFiveXxPolicy(fiveXx[0], rendered);
+  const checks = new Set();
   for (const check of rendered.uptimeChecks) {
-    const accepted = check.body.httpCheck.acceptedResponseStatusCodes.map(({ statusValue }) => statusValue);
-    if (JSON.stringify(accepted) !== JSON.stringify(ORIGIN_LOCK_ACCEPTED_STATUSES)
-        || check.body.httpCheck.headers !== undefined || check.body.httpCheck.authInfo !== undefined) {
-      fail("MONITORING_ORIGIN_LOCK_INVALID");
+    const contract = Object.hasOwn(UPTIME_CHECK_CONTRACTS, check.id) ? UPTIME_CHECK_CONTRACTS[check.id] : null;
+    if (contract === null || checks.has(check.id)) fail("MONITORING_UPTIME_CHECK_INVALID");
+    checks.add(check.id);
+    const { httpCheck, monitoredResource, contentMatchers } = check.body;
+    const accepted = httpCheck.acceptedResponseStatusCodes.map(({ statusValue }) => statusValue);
+    const host = monitoredResource?.labels?.host;
+    if (JSON.stringify(accepted) !== JSON.stringify(contract.accepted)
+        || httpCheck.headers !== undefined || httpCheck.authInfo !== undefined
+        || httpCheck.requestMethod !== "GET" || httpCheck.path !== "/api/health"
+        || typeof host !== "string" || host.endsWith(".run.app") !== contract.runApp
+        || JSON.stringify(contentMatchers)
+          !== JSON.stringify([{ content: contract.content, matcher: "CONTAINS_STRING" }])) {
+      fail(contract.code);
     }
   }
   return true;

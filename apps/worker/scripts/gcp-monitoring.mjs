@@ -2,7 +2,7 @@
 
 /**
  * Operator CLI for monitoring and alerting as code (OPS-5, E-OPS5): render,
- * readback and plan for the metrics, uptime check and policies, and the one
+ * readback and plan for the metrics, uptime checks and policies, and the one
  * email notification channel (OWN-5c). The only write is notification-channel
  * creating that channel under its plan digest; nothing here changes or
  * deletes a monitoring resource, and applying the policies is a later,
@@ -10,7 +10,7 @@
  *
  *   render  (--environment=<production|staging> | --desired-state=<abs path>)
  *           [--notification-channel=projects/<project>/notificationChannels/<id>]
- *     The plane's log-based metrics, uptime check and alert policies
+ *     The plane's log-based metrics, uptime checks and alert policies
  *     (gcp-ops-monitoring-policies.mjs), privacy-scanned; no call.
  *   readback (--environment | --desired-state)
  *     Three list calls (logging metrics, uptime checks, alert policies), each

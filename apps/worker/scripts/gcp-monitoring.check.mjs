@@ -161,7 +161,8 @@ test("readback issues three guarded list calls and keeps only the plane's own re
 test("the plan is deterministic, never applies, defers what waits and refuses deletes", async () => {
   // An empty project: everything is a create; the policies wait for the channel or their signal.
   const empty = JSON.parse((await run(["plan", "--environment=staging"])).out);
-  assert.deepEqual(empty.summary, { create: 7, update: 0, unchanged: 0, deferred: 12, refused: 0 });
+  // Six metrics and two uptime checks (origin-lock, edge-health) are creates; the thirteen policies wait.
+  assert.deepEqual(empty.summary, { create: 8, update: 0, unchanged: 0, deferred: 13, refused: 0 });
   assert.match(empty.apply, /^not available/u);
   assert.equal(empty.notificationChannel, "unassigned");
   const again = JSON.parse((await run(["plan", "--environment=staging"])).out);
@@ -170,7 +171,7 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   const rendered = renderMonitoring(STAGING, { notificationChannel: CHANNEL });
   const live = liveFrom(rendered);
   const converged = planMonitoring(rendered, readbackMonitoring(STAGING, { runner: fakeMonitoring(live).runner }));
-  assert.equal(converged.summary.unchanged, 19);
+  assert.equal(converged.summary.unchanged, 21);
   assert.deepEqual([converged.summary.create, converged.summary.update, converged.summary.refused], [0, 0, 0]);
   live.metrics[0].filter += ' AND jsonPayload.code="X"';
   // A distribution metric that extracts another field, or buckets differently, is drift too.
@@ -194,7 +195,7 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   const otherChannel = planMonitoring(renderMonitoring(STAGING, {
     notificationChannel: `projects/${PROJECT}/notificationChannels/42` }),
   readbackMonitoring(STAGING, { runner: fakeMonitoring(liveFrom(rendered)).runner }));
-  assert.equal(otherChannel.operations.filter(({ action }) => action === "update").length, 12);
+  assert.equal(otherChannel.operations.filter(({ action }) => action === "update").length, 13);
   assert.throws(() => planMonitoring(rendered, { schema: "other" }), { code: "MONITORING_PLAN_READBACK_INVALID" });
   // A policy that dropped a deferred trigger's condition says so in the plan.
   const dropped = structuredClone(rendered);
