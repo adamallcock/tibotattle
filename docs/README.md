@@ -70,6 +70,7 @@ their status changes; current Cloudflare behavior follows the authorities above.
 | Area | Document | Status | Boundary |
 |---|---|---|---|
 | GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal, sized cutover backlog and alignment with the OpenAI September 29 release; no production change |
+| GCP replay parsing | [Internal analytics JSON replay](./decisions/2026-10-03-internal-analytics-json-replay.md) | Accepted internal last-value-wins decision; isolated source candidate | Native parsing is explicit at two GCP reconstruction callsites; raw ingress and default correction callers remain strict; integration and performance qualification pending |
 | GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Accepted 2026-10-02; implementation and cutover pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
 | GCP cutover window | [GCP cutover window](./runbooks/gcp-cutover-window.md) | Draft | Steps H.1 to H.8 with preconditions, attestations, abort path and tooling status; not operational and authorizes nothing |
 | GCP origin rollout | [GCP origin rollout](./runbooks/gcp-rollout.md) | Draft | Preflight, build, migrate and roll with the accepted per-migration write outage and an explicit scheduler pause and resume; forward only |

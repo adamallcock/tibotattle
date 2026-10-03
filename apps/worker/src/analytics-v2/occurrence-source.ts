@@ -48,7 +48,7 @@ import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
 import type { PostgresClient } from "../postgres-client";
 import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../telemetry-v12-typed-codec";
-import { prepareUsageCorrectionAssertion } from "../telemetry-usage-reconciliation";
+import { prepareAnalyticsReplayUsageCorrectionAssertion } from "../telemetry-usage-reconciliation";
 import {
   decodeTypedTelemetryId,
   encodeTypedTelemetryId,
@@ -1128,9 +1128,9 @@ async function parseCorrectionFact(row: Record<string, unknown>): Promise<Teleme
     };
   }
   const recordJson = canonicalTelemetryV11Json(record);
-  let assertion: Awaited<ReturnType<typeof prepareUsageCorrectionAssertion>>;
+  let assertion: Awaited<ReturnType<typeof prepareAnalyticsReplayUsageCorrectionAssertion>>;
   try {
-    assertion = await prepareUsageCorrectionAssertion({ format, recordJson });
+    assertion = await prepareAnalyticsReplayUsageCorrectionAssertion({ format, recordJson });
   } catch {
     return sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
   }
@@ -1477,7 +1477,7 @@ async function assembleOccurrences(candidates: Map<number, Map<string, Candidate
           occurrence_id: record.occurrenceId, observed_at: record.observedAt,
           record_json: record.sourceRecordJson, canonical_digest: "" }));
         const reconciled = await reconcileGroups(ownerDigest, participantId, dayFromNumber(day), ordered,
-          dayDirect, v12Sources, dayFacts);
+          dayDirect, v12Sources, dayFacts, { jsonParsing: "internal_analytics_replay" });
         rows = reconciled.map(usageRow);
       } else {
         rows = ordered.map((candidate) => genericOccurrence(ownerDigest, participantId, stream, candidate,

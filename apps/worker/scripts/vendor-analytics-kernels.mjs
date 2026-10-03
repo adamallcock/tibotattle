@@ -185,6 +185,121 @@ assertPatchSpecs(EXPORT_PATCHES);
  */
 export const SOURCE_PATCHES = Object.freeze([
   {
+    id: "internal-analytics-json-replay",
+    path: "apps/worker/src/telemetry-usage-reconciliation.ts",
+    // Explicit GCP replay composition; existing callers retain strict defaults.
+    hunks: [
+      { find: `import { parseStrictJson } from "./strict-json";
+import {
+`, replace: `import { parseStrictJson } from "./strict-json";
+import { ApiError, type ErrorCode } from "./errors";
+import {
+` },
+      { find: `
+function parseUsage(input: UsageCorrectionInput): { canonical: string; legacy: TelemetryV1UsageEvent } {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) fail();
+`, replace: `
+/** Explicit Node/GCP replay composition; raw admission defaults stay strict. */
+export interface UsageCorrectionParsingOptions {
+  readonly jsonParsing?: "internal_analytics_replay";
+}
+
+function parseInternalAnalyticsJson(raw: string, errorCode: ErrorCode = "BODY_INVALID"): unknown {
+  if (typeof raw !== "string") throw new TypeError("raw must be a string");
+  try { return JSON.parse(raw) as unknown; }
+  catch { throw new ApiError(400, errorCode); }
+}
+
+function recordJsonParser(options?: UsageCorrectionParsingOptions): typeof parseStrictJson {
+  if (options?.jsonParsing === undefined) return parseStrictJson;
+  if (options.jsonParsing === "internal_analytics_replay") return parseInternalAnalyticsJson;
+  return fail();
+}
+
+function parseUsage(input: UsageCorrectionInput, parseRecordJson = parseStrictJson): { canonical: string; legacy: TelemetryV1UsageEvent } {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) fail();
+` },
+      { find: `  try {
+    const value = parseStrictJson(input.recordJson);
+    if (input.format === "v12") {
+`, replace: `  try {
+    const value = parseRecordJson(input.recordJson);
+    if (input.format === "v12") {
+` },
+      { find: `
+async function prepare(input: UsageCorrectionInput) {
+  const parsed = parseUsage(input);
+  const row = parsed.legacy;
+`, replace: `
+async function prepare(input: UsageCorrectionInput, parseRecordJson = parseStrictJson) {
+  const parsed = parseUsage(input, parseRecordJson);
+  const row = parsed.legacy;
+` },
+      { find: `  return (await prepare(input)).assertion;
+}
+`, replace: `  return (await prepare(input)).assertion;
+}
+
+/** Internal reconstructed analytics records only; never the raw admission API. */
+export async function prepareAnalyticsReplayUsageCorrectionAssertion(input: UsageCorrectionInput): Promise<UsageCorrectionAssertion> {
+  return (await prepare(input, parseInternalAnalyticsJson)).assertion;
+}
+` },
+      { find: `class UsageCorrectionOccurrenceAccumulatorImpl {
+  readonly #ownerScope: string;
+`, replace: `class UsageCorrectionOccurrenceAccumulatorImpl {
+  readonly #parseRecordJson: typeof parseStrictJson;
+  readonly #ownerScope: string;
+` },
+      { find: `    assertOccurrenceId(options?.occurrenceId);
+    this.#ownerScope = options.ownerScope;
+`, replace: `    assertOccurrenceId(options?.occurrenceId);
+    this.#parseRecordJson = recordJsonParser(options);
+    this.#ownerScope = options.ownerScope;
+` },
+      { find: `      for (const source of snapshots) {
+        const row = await prepare(source);
+        if (row.assertion.occurrenceId !== this.#occurrenceId) {
+`, replace: `      for (const source of snapshots) {
+        const row = await prepare(source, this.#parseRecordJson);
+        if (row.assertion.occurrenceId !== this.#occurrenceId) {
+` },
+      { find: `
+export interface UsageCorrectionOccurrenceAccumulatorOptions {
+  readonly ownerScope: string;
+`, replace: `
+export interface UsageCorrectionOccurrenceAccumulatorOptions extends UsageCorrectionParsingOptions {
+  readonly ownerScope: string;
+` },
+    ],
+  },
+  {
+    id: "internal-analytics-json-composition",
+    path: "apps/worker/src/telemetry-usage-effective-reader.ts",
+    // Explicit GCP replay composition; existing callers retain strict defaults.
+    hunks: [
+      { find: `  createUsageCorrectionOccurrenceAccumulator,
+  type UsageCorrectionFormat,
+`, replace: `  createUsageCorrectionOccurrenceAccumulator,
+  type UsageCorrectionParsingOptions,
+  type UsageCorrectionFormat,
+` },
+      { find: `  facts: readonly TelemetryUsageCorrectionFactRow[],
+): Promise<readonly EffectiveUsageOccurrence[]> {
+`, replace: `  facts: readonly TelemetryUsageCorrectionFactRow[],
+  parsing?: UsageCorrectionParsingOptions,
+): Promise<readonly EffectiveUsageOccurrence[]> {
+` },
+      { find: `    if (!all.length) fail("EFFECTIVE_USAGE_SOURCE_CONFLICT");
+    const accumulator = createUsageCorrectionOccurrenceAccumulator({ ownerScope, occurrenceId: candidate.occurrence_id });
+    for (let offset = 0; offset < all.length; offset += 200) {
+`, replace: `    if (!all.length) fail("EFFECTIVE_USAGE_SOURCE_CONFLICT");
+    const accumulator = createUsageCorrectionOccurrenceAccumulator({ ownerScope, occurrenceId: candidate.occurrence_id, jsonParsing: parsing?.jsonParsing });
+    for (let offset = 0; offset < all.length; offset += 200) {
+` },
+    ],
+  },
+  {
     id: "usage-row-evidence-memo",
     path: "apps/worker/src/quota-analysis-v11.ts",
     // Parse and price each usage row once per row object: usageRowEvidence's row-only steps (the stored-record

@@ -71,6 +71,18 @@
   ],
   "sourcePatches": [
     {
+      "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
+      "id": "internal-analytics-json-replay",
+      "hunks": 9,
+      "sha256": "6120ad25ec598168134ac9d22806bd9655c9f6992b1c930e1b44da74e7ea552f"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
+      "id": "internal-analytics-json-composition",
+      "hunks": 3,
+      "sha256": "a7b1b6e95160bd08c662b77731b5216b87e5b470e8650e00e92504031645c1e5"
+    },
+    {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "id": "usage-row-evidence-memo",
       "hunks": 2,
@@ -103,8 +115,8 @@
     "package": 40,
     "exportPatched": 6,
     "exportPatchedFiles": 3,
-    "sourcePatched": 4,
-    "sourcePatchedFiles": 3,
+    "sourcePatched": 6,
+    "sourcePatchedFiles": 5,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -560,15 +572,15 @@
     {
       "path": "apps/worker/src/telemetry-usage-effective-reader.ts",
       "blob": "ffa88be6734fa65a3b4134d138d15ba21e1edc01",
-      "sha256": "c255ad88120b03487bccd7ac4ca2594cb5f6d0bf05da6722e32f519c8215887e",
-      "patch": "export",
+      "sha256": "1743861169af3e29b5119af0dc2c29aa818df14e894a3f3ece7d01c2bf92f279",
+      "patch": "export+source",
       "reach": "kernel"
     },
     {
       "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
       "blob": "bd511909d1fe7122e088f639acee4d8cf2eba723",
-      "sha256": "35458510a2f2c69710bf7cf78e701cdd0e504cbbe903ba3a0ecc1ace6271d15c",
-      "patch": "none",
+      "sha256": "6f9e018f97ddaadd519dfc529dcb8aed593de49e802d21e783a8a34b79681a62",
+      "patch": "source",
       "reach": "kernel"
     },
     {

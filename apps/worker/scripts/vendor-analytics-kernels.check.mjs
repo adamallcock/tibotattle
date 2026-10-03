@@ -67,6 +67,10 @@ const PINNED_PATCH_SPECS = [
  * file, id, hunk count and sha256 of their exact [find, replace] texts.
  */
 const PINNED_SOURCE_PATCHES = [
+  ["apps/worker/src/telemetry-usage-reconciliation.ts", "internal-analytics-json-replay", 9,
+    "6120ad25ec598168134ac9d22806bd9655c9f6992b1c930e1b44da74e7ea552f"],
+  ["apps/worker/src/telemetry-usage-effective-reader.ts", "internal-analytics-json-composition", 3,
+    "a7b1b6e95160bd08c662b77731b5216b87e5b470e8650e00e92504031645c1e5"],
   ["apps/worker/src/quota-analysis-v11.ts", "usage-row-evidence-memo", 2,
     "1abf1f05fae29ce856a82adcd7538205ff6f4ad194466350c17a0096d15f1df3"],
   ["apps/worker/src/quota-analysis-v11.ts", "reduction-payload-bytes", 3,
