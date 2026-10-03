@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -31,22 +31,31 @@ import {
   reconcilePostgresPendingObjects,
   releasePostgresPendingObjectTransferHolds,
 } from "../src/postgres-quarantine-reconciliation.ts";
+import {
+  SYNTHETIC_OTHER_SOURCE_ID,
+  buildSyntheticAnalyticsD1,
+  exportSyntheticAdminHistory,
+  writeAnalyticsSourceFixture,
+} from "./fixtures/w2-seal/admin-history-fixtures.mjs";
 import { createW2SealCluster, PRIMARY_SCHEMA } from "./fixtures/w2-seal/pg-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
 import {
   SYNTHETIC_IDENTITY_LINK_SECRET,
   SYNTHETIC_IDENTITY_LINK_VERSION,
   identityLinkFingerprint,
+  privateDirectory,
 } from "./fixtures/w2-seal/synthetic-sources.mjs";
 import { applyStockAndStagedMigrations, STAGED_MIGRATIONS_ROOT } from "./staged-migrations-harness.mjs";
 
 // D-PT4X acceptance on PostgreSQL 17 over a synthetic PT-2-lite seal of the
 // Q-1 corpus plus synthetic v0.x history, pending registrations, admin metric
-// snapshots and aggregate exclusions: N-V0X ('legacy-contributions'), the
+// snapshots and aggregate exclusions, and a synthetic analytics D1 exported by
+// cutover-admin-history-export.mjs: N-V0X ('legacy-contributions'), the
 // pending_quarantine_objects -> pending_objects mapping with the E-PT4
-// transfer holds ('pending-registrations'), N-ADMINHIST and N-EXCL (receipts
-// under 'post-import'), PT-8 preflight P13, and the reconciler honouring the
-// holds. Everything is local and synthetic.
+// transfer holds ('pending-registrations'), N-ADMINHIST (sealed, analytics and
+// cache snapshots; hostile caches) and N-EXCL (receipts under 'post-import'),
+// PT-8 preflight P13, and the reconciler honouring the holds. Everything is
+// local and synthetic.
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -65,6 +74,10 @@ const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const EXCLUSIONS_SUFFIX = "_community_aggregate_exclusions.sql";
 const HOLDS_SUFFIX = "_pending_object_transfer_holds.sql";
+// One target per hostile admin history cache variant (and the valid control),
+// created with the others: the cluster holds the transfer-role lock until it
+// is disposed, so a second cluster inside a test would wait on this one.
+const CACHE_VARIANT_TARGETS = 10;
 
 const isCode = code => error => (error instanceof LegacyContributionTransferError
   || error instanceof PostgresTransferTargetError || error instanceof CutoverSourceError) && error.code === code;
@@ -198,11 +211,14 @@ function syntheticHistorySql(sealedPath, fixture) {
       cohortParticipants_plus: 3 }) }));
   for (const row of snapshots) statements.push(insert("admin_metric_snapshots", row));
   const cacheOnly = { capturedAt: iso(nowMs - 30 * HOUR), metrics: { participantsTotal: 7, bandFitCount: 2 } };
+  // The analytics D1 holds a raw row at this instant: the raw row wins.
+  const cacheShadowed = { capturedAt: iso(nowMs - 40 * HOUR), metrics: { participantsTotal: 99 } };
   statements.push(insert("admin_metrics_history_cache", {
     singleton: 1, generated_at: iso(nowMs - HOUR),
     payload_json: JSON.stringify({ schemaVersion: "admin-metrics-history-v0.3", generatedAt: iso(nowMs - HOUR),
       events: {}, downloads: { available: false, byDayStartsAt: "2026-09-01", byDay: [] },
-      gauges: { snapshots: [cacheOnly, { capturedAt: snapshots[0].captured_at, metrics: { participantsTotal: 10 } }] } }),
+      gauges: { snapshots: [cacheShadowed, cacheOnly,
+        { capturedAt: snapshots[0].captured_at, metrics: { participantsTotal: 10 } }] } }),
   }));
   const exclusions = [
     { exclusion_id: "exclusion-active", participant_id: participant, scope: "community_weekly", reason_code: "data_quality",
@@ -215,7 +231,28 @@ function syntheticHistorySql(sealedPath, fixture) {
   ];
   for (const row of exclusions) statements.push(insert("community_aggregate_exclusions", row));
   statements.push(...triggers.map(trigger => `${trigger.sql};`));
-  return { sql: statements.join("\n"), contributions, pending, snapshots, cacheOnly, exclusions };
+  return { sql: statements.join("\n"), contributions, pending, snapshots, cacheOnly, cacheShadowed, exclusions };
+}
+
+/**
+ * The analytics D1's typed-storage snapshots for the sealed source: one at the
+ * instant of a cache entry (it wins over the cache), one at a sealed row's
+ * instant (the sealed row wins; it is shadowed), and three no other source
+ * holds. Two rows belong to another source id and are only counted.
+ */
+function syntheticAnalyticsSnapshots(fixture, history) {
+  const iso = epoch => new Date(epoch).toISOString();
+  const row = (epoch, metrics) => [iso(epoch), JSON.stringify(metrics)];
+  const { nowMs } = fixture;
+  const snapshots = [
+    row(nowMs - 50 * HOUR, { participantsTotal: 5, bandFitCount: 1 }),
+    row(nowMs - 40 * HOUR, { participantsTotal: 6, bandFitCount: 1 }),
+    row(nowMs - 90 * 60 * 1000, { participantsTotal: 11, quarantinePendingObjects: 4 }),
+    [history.snapshots[2].captured_at, JSON.stringify({ participantsTotal: 999 })],
+    row(nowMs - 30 * 60 * 1000, { participantsTotal: 13, cohortParticipants_pro: 2 }),
+  ].sort((left, right) => (left[0] < right[0] ? -1 : 1));
+  const other = [row(nowMs - 2 * HOUR, { participantsTotal: 1 }), row(nowMs - HOUR, { participantsTotal: 2 })];
+  return { snapshots, other, shadowed: history.snapshots[2].captured_at };
 }
 
 async function count(pool, name, where = "") {
@@ -291,10 +328,14 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
   let world;
   let history;
   let forged;
+  let forgedSeal;
+  let analytics;
+  let adminHistory;
   let cluster;
   let main;
   let clean;
   let bare;
+  let cacheTargets;
   let sealedDb;
   const receipts = {};
   const handles = {};
@@ -306,11 +347,18 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     const seal = await readCutoverSeal({ manifestPath: outputPathsOf(run.out).manifest, expectedSealId: result.sealId });
     history = syntheticHistorySql(seal.sources.ingestion.path, world.fixture);
     forged = await forgeVariantSeal(seal, history.sql);
-    const forgedSeal = await readCutoverSeal({ manifestPath: forged.manifestPath, expectedSealId: forged.sealId });
+    forgedSeal = await readCutoverSeal({ manifestPath: forged.manifestPath, expectedSealId: forged.sealId });
     sealedDb = new DatabaseSync(forgedSeal.sources.ingestion.path, { readOnly: true });
+    const analyticsDirectory = await privateDirectory("dpt4x-spec-analytics-");
+    analytics = syntheticAnalyticsSnapshots(world.fixture, history);
+    analytics.path = buildSyntheticAnalyticsD1({ directory: analyticsDirectory, commit: world.commit,
+      sourceId: sealedDb.prepare("SELECT source_id FROM storage_source_state").get().source_id,
+      snapshots: analytics.snapshots, otherSnapshots: analytics.other });
+    analytics.sourcePath = await writeAnalyticsSourceFixture({ directory: analyticsDirectory });
+    adminHistory = await exportFor(forged);
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
-      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 3, label: "dpt4x" });
-    [main, clean, bare] = cluster.targets;
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 3 + CACHE_VARIANT_TARGETS, label: "dpt4x" });
+    [main, clean, bare, ...cacheTargets] = cluster.targets;
     const exclusions = await migrationBySuffix(EXCLUSIONS_SUFFIX);
     const holds = await migrationBySuffix(HOLDS_SUFFIX);
     // Every target gets both migrations by the same path whether they are
@@ -337,6 +385,13 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     await world?.dispose();
   });
 
+  /** The analytics admin history export bound to one seal, as runner arguments. */
+  async function exportFor(target) {
+    const exported = await exportSyntheticAdminHistory({ world, seal: target, analyticsPath: analytics.path,
+      analyticsSourcePath: analytics.sourcePath });
+    return { adminHistoryExportPath: exported.path, adminHistoryExportSha256: exported.sha256 };
+  }
+
   async function beginImporting(target) {
     const handle = await target.open(forged.sealId);
     await beginRun(handle, { sealedAt: forged.sealedAt });
@@ -358,7 +413,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     const handle = await beginImporting(bare);
     handles.bare = handle;
     for (const run of [runLegacyContributionsProduction, runOperationalHistoryProduction, runPendingRegistrationsProduction]) {
-      await expect(run({ handle, sealManifestPath: forged.manifestPath }), run.name)
+      await expect(run({ handle, sealManifestPath: forged.manifestPath, ...adminHistory }), run.name)
         .rejects.toSatisfy(isCode("CUTOVER_STAGE_INCOMPLETE"));
     }
     for (const name of [...LEGACY_CONTRIBUTIONS_ORDER, "pending_objects", "analytics_admin_metric_snapshots",
@@ -529,23 +584,36 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
 
   it("maps admin metric snapshots and imports aggregate exclusions under post-import", async () => {
     const handle = handles.main;
-    receipts.operational = await runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath, pageRows: 2 });
-    const cleanReceipt = await runOperationalHistoryProduction({ handle: handles.clean, sealManifestPath: forged.manifestPath });
+    receipts.operational = await runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath, pageRows: 2,
+      ...adminHistory });
+    const cleanReceipt = await runOperationalHistoryProduction({ handle: handles.clean, sealManifestPath: forged.manifestPath,
+      ...adminHistory });
     expect(cleanReceipt.receiptSha256).toBe(receipts.operational.receiptSha256);
     const { adminMetricHistory, exclusions } = receipts.operational;
     expect(adminMetricHistory.sealedSnapshots.rows).toBe(3);
+    // The cache adds only its cache-only entry: the analytics raw row wins at
+    // the shadowed entry's instant and the sealed row at the duplicate's.
     expect(adminMetricHistory.cache).toMatchObject({ state: "valid", rows: 1, snapshotsAdded: 1 });
-    expect(adminMetricHistory.mapped.rows).toBe(4);
-    expect(exclusions).toMatchObject({ sealed: { rows: 2 }, imported: { rows: 1 }, participantAbsent: 1 });
+    expect(adminMetricHistory.analytics).toEqual({ exportSha256: adminHistory.adminHistoryExportSha256,
+      snapshots: { rows: 5, sha256: expect.stringMatching(/^[0-9a-f]{64}$/u) }, snapshotsAdded: 4,
+      snapshotsAddedSha256: expect.stringMatching(/^[0-9a-f]{64}$/u), shadowed: 1, otherSourceRows: 2 });
+    expect(adminMetricHistory.mapped.rows).toBe(8);
+    expect(exclusions).toMatchObject({ sealed: { rows: 2 }, imported: { rows: 1 }, participantAbsent: 1, activeImported: 1 });
 
     const sourceId = sealedDb.prepare("SELECT source_id FROM storage_source_state").get().source_id;
     const snapshots = await main.ownerPrimary.query(`SELECT source_id,
         to_char(captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS captured_at, metrics_json
       FROM ${table("analytics_admin_metric_snapshots")} ORDER BY captured_at`);
-    expect(snapshots.rows).toEqual([
-      { source_id: sourceId, captured_at: history.cacheOnly.capturedAt, metrics_json: JSON.stringify(history.cacheOnly.metrics) },
-      ...history.snapshots.map(row => ({ source_id: sourceId, captured_at: row.captured_at, metrics_json: row.metrics_json })),
-    ]);
+    const expected = [
+      ...history.snapshots.map(row => [row.captured_at, row.metrics_json]),
+      ...analytics.snapshots.filter(([capturedAt]) => capturedAt !== analytics.shadowed),
+      [history.cacheOnly.capturedAt, JSON.stringify(history.cacheOnly.metrics)],
+    ].sort((left, right) => (left[0] < right[0] ? -1 : 1))
+      .map(([capturedAt, metricsJson]) => ({ source_id: sourceId, captured_at: capturedAt, metrics_json: metricsJson }));
+    expect(snapshots.rows).toEqual(expected);
+    expect(snapshots.rows.find(row => row.captured_at === history.cacheShadowed.capturedAt).metrics_json)
+      .toBe(analytics.snapshots.find(([capturedAt]) => capturedAt === history.cacheShadowed.capturedAt)[1]);
+    expect(snapshots.rows.find(row => row.captured_at === analytics.shadowed).metrics_json).toBe(history.snapshots[2].metrics_json);
     const excluded = await main.ownerPrimary.query(`SELECT exclusion_id, participant_id, state FROM ${table("community_aggregate_exclusions")}`);
     expect(excluded.rows).toEqual([{ exclusion_id: "exclusion-active", participant_id: world.fixture.ids.participant,
       state: "active" }]);
@@ -556,7 +624,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
       FROM tibotattle_transfer.transfer_table_receipts WHERE stage = 'post-import' ORDER BY source_table`);
     expect(operationalReceipts.rows).toEqual([
       { source_table: "admin_metric_snapshots", disposition: "mapped:admin-metrics-history",
-        target_table: "analytics_admin_metric_snapshots", state: "complete", source_rows: 3, target_rows: 4 },
+        target_table: "analytics_admin_metric_snapshots", state: "complete", source_rows: 3, target_rows: 8 },
       { source_table: "admin_metrics_history_cache", disposition: "mapped:admin-metrics-history",
         target_table: "analytics_admin_metric_snapshots", state: "complete", source_rows: 1, target_rows: 1 },
       { source_table: "community_aggregate_exclusions", disposition: "imported:community-aggregate-exclusions",
@@ -570,12 +638,14 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     const relations = [table("analytics_admin_metric_snapshots"), table("community_aggregate_exclusions"),
       "tibotattle_transfer.transfer_table_receipts", "tibotattle_transfer.transfer_checkpoints"];
     const before = await xmins(main.ownerPrimary, relations);
-    const replay = await runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath });
+    const replay = await runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath, ...adminHistory });
     expect(replay.receiptSha256).toBe(receipts.operational.receiptSha256);
     expect(await xmins(main.ownerPrimary, relations)).toEqual(before);
     const text = JSON.stringify(receipts.operational);
-    for (const value of [world.fixture.ids.participant, sourceId, "exclusion-active"]) {
+    const exportText = await readFile(adminHistory.adminHistoryExportPath, "utf8");
+    for (const value of [world.fixture.ids.participant, sourceId, "exclusion-active", SYNTHETIC_OTHER_SOURCE_ID]) {
       expect(text.includes(value), "no id in the receipt").toBe(false);
+      expect(exportText.includes(value), "no id in the export").toBe(false);
     }
   }, 600_000);
 
@@ -792,7 +862,7 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     const handle = handles.bare;
     const pool = bare.ownerPrimary;
     const exclusions = table("community_aggregate_exclusions");
-    const run = () => runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath });
+    const run = () => runOperationalHistoryProduction({ handle, sealManifestPath: forged.manifestPath, ...adminHistory });
     const untouched = async () => {
       expect(await count(pool, "analytics_admin_metric_snapshots")).toBe(0);
       expect(await count(pool, "community_aggregate_exclusions")).toBe(0);
@@ -825,4 +895,65 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT4X legacy contributions, pending registrat
     await pool.query(`UPDATE ${table("storage_source_state")} SET source_id = $1`, [sourceId]);
     expect((await run()).receiptSha256).toBe(receipts.operational.receiptSha256);
   }, 600_000);
+
+  it("a hostile admin history cache maps nothing and leaves the sealed and analytics snapshots mapped", async () => {
+    // Each variant breaks one clause of the closed cache contract around an
+    // entry that a valid cache adds (the control). Each runs end to end on its
+    // own target, against its own seal and its own bound analytics export.
+    const sourceId = sealedDb.prepare("SELECT source_id FROM storage_source_state").get().source_id;
+    const iso = epoch => new Date(epoch).toISOString();
+    const { nowMs } = world.fixture;
+    const addedAt = iso(nowMs - 20 * HOUR);
+    const entry = { capturedAt: addedAt, metrics: { participantsTotal: 3 } };
+    const payload = (snapshots, extra = {}) => ({ schemaVersion: "admin-metrics-history-v0.3", generatedAt: iso(nowMs - HOUR),
+      events: {}, downloads: { available: false, byDayStartsAt: "2026-09-01", byDay: [] }, gauges: { snapshots }, ...extra });
+    const CONTROL = "a valid cache (control)";
+    const variants = {
+      [CONTROL]: payload([entry]),
+      "a stale schemaVersion": { ...payload([entry]), schemaVersion: "admin-metrics-history-v0.2" },
+      "an extra key on an entry": payload([{ ...entry, source: 1 }]),
+      "a non-canonical capturedAt": payload([{ ...entry, capturedAt: addedAt.replace(/\.\d{3}Z$/u, "Z") }]),
+      "a negative gauge": payload([{ ...entry, metrics: { participantsTotal: -3 } }]),
+      "a nested gauge": payload([{ ...entry, metrics: { participantsTotal: { n: 3 } } }]),
+      "a non-integer gauge": payload([{ ...entry, metrics: { participantsTotal: 3.5 } }]),
+      "a gauge name outside the grammar": payload([{ ...entry, metrics: { "participants-total": 3 } }]),
+      "a payload over 512 KiB": payload([entry], { events: { pad: "x".repeat(512 * 1024) } }),
+      "more than 400 entries": payload([entry, ...Array.from({ length: 400 }, (_, index) =>
+        ({ capturedAt: iso(nowMs - (60 + index) * HOUR), metrics: { participantsTotal: index } }))]),
+    };
+    const baseRows = [...history.snapshots.map(row => [row.captured_at, row.metrics_json]),
+      ...analytics.snapshots.filter(([capturedAt]) => capturedAt !== analytics.shadowed)];
+    expect(Object.keys(variants)).toHaveLength(CACHE_VARIANT_TARGETS);
+    const stagedFiles = [await migrationBySuffix(EXCLUSIONS_SUFFIX), await migrationBySuffix(HOLDS_SUFFIX)];
+    for (const [index, [label, value]] of Object.entries(variants).entries()) {
+      const control = label === CONTROL;
+      const target = cacheTargets[index];
+      await applyStockAndStagedMigrations({ role: "primary", schema: PRIMARY_SCHEMA, pool: target.ownerPrimary, stagedFiles });
+      const variant = await forgeVariantSeal(forgedSeal, `PRAGMA ignore_check_constraints = ON;
+        UPDATE admin_metrics_history_cache SET payload_json = ${literal(JSON.stringify(value))}`);
+      const handle = await target.open(variant.sealId);
+      await beginRun(handle, { sealedAt: variant.sealedAt });
+      await advanceRun(handle, "importing");
+      // A synthetic stand-in for PT-3: nothing this runner writes depends on it.
+      await withTransferTransaction(handle, "primary", client => stageReceipt(client, handle, { stage: "identity-authority",
+        state: "complete", rowCount: 0, byteCount: 0, receiptSha256: sha("d-pt4x-synthetic-stub:identity-authority") }));
+      const result = await runOperationalHistoryProduction({ handle, sealManifestPath: variant.manifestPath,
+        ...await exportFor(variant) });
+      expect(result.adminMetricHistory.cache, label).toMatchObject({ state: control ? "valid" : "invalid", rows: 1,
+        snapshotsAdded: control ? 1 : 0 });
+      expect(result.adminMetricHistory.analytics, label).toMatchObject({ snapshotsAdded: 4, shadowed: 1 });
+      const rows = [...baseRows, ...(control ? [[addedAt, JSON.stringify(entry.metrics)]] : [])]
+        .sort((left, right) => (left[0] < right[0] ? -1 : 1))
+        .map(([capturedAt, metricsJson]) => ({ source_id: sourceId, captured_at: capturedAt, metrics_json: metricsJson }));
+      expect(result.adminMetricHistory.mapped.rows, label).toBe(rows.length);
+      const stored = await target.ownerPrimary.query(`SELECT source_id,
+          to_char(captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS captured_at, metrics_json
+        FROM ${table("analytics_admin_metric_snapshots")} ORDER BY captured_at`);
+      expect(stored.rows, label).toEqual(rows);
+      const cacheReceipt = await target.ownerPrimary.query(`SELECT source_row_count::int AS source_rows,
+          target_row_count::int AS target_rows FROM tibotattle_transfer.transfer_table_receipts
+        WHERE source_table = 'admin_metrics_history_cache'`);
+      expect(cacheReceipt.rows, label).toEqual([{ source_rows: 1, target_rows: control ? 1 : 0 }]);
+    }
+  }, 900_000);
 });
