@@ -551,8 +551,9 @@ requires it to be fresh (its source is the checked-out commit, its base the
 live fenced commit) and its manifest to be the candidate. It then rechecks the
 live manifest against the replaced pin before the upload, proves the replaced
 source produced it, stages exactly the candidate manifest built from the
-switch commit, and requires the candidate live after it. Keep this deploy's
-operation journal directory unmodified: it is the evidence a later website
+switch commit, and requires the candidate live after it. Leave this deploy's
+operation journal, receipt and generated site in place until they are
+archived (below): the archived journal is the evidence a later website
 rollback to the switch's site names. The retained pair (`--retained-public-source`,
 `--expected-live-manifest-sha256`) is refused alongside a candidate
 (`PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT`). Every refusal is in
@@ -566,6 +567,25 @@ After the deploy:
   secrets are deleted in a later, separately authorized step.
 - Every per-address rate-limit window resets once at the switch, because the
   keys are re-derived under the edge secret.
+- Archive the switch release, once the deploy reports `verified`, from
+  `apps/worker` on the switch checkout. The tool is on the edge-port and
+  fast-path lines since round 15, tested locally with synthetic data and never
+  run against a live release. It writes nothing remote:
+
+  ```bash
+  npm run production:release-archive -- \
+    --operation <absolute operation directory of the H.6 deploy> \
+    --web-release-receipt <absolute path of the switch checkout's .release-build/web-release-receipt.json> \
+    --archive /absolute/owner-private/release-archive
+  ```
+
+  It refuses a journal that is not a verified typed production deploy, and a
+  receipt or site that is not the one the journal left live. It writes
+  `<archive>/<journal identityDigest>/` with the journal, receipt, site and a
+  content-free index, and never overwrites; a rerun prints
+  `PRODUCTION_RELEASE_ALREADY_ARCHIVED`. Record the printed
+  `journalIdentityDigest`. See
+  [Archive the release](./2026-08-17-web-only-release.md#5-archive-the-release).
 
 If the deploy refuses before upload, the edge is still `fenced`: fix the
 cause and retry, or use Abort A. **If the outcome is uncertain, treat the
@@ -678,11 +698,12 @@ Each item is its own authorized operation. Order is flexible except where
 noted.
 
 - Web-only releases resume through `production:deploy --edge-mode=gcp` with a
-  fresh web-release receipt, and a website rollback re-deploys a previously
-  released site by its receipt (`--rollback-web-release-receipt`) and the
-  journal of the verified deploy that released it
-  (`--rollback-release-operation`); see
-  [Production edge modes](./production-edge-modes.md#web-only-releases).
+  fresh web-release receipt, and each is archived once verified
+  (`production:release-archive`). A website rollback re-deploys a previously
+  released site from its archive entry: the restored receipt
+  (`--rollback-web-release-receipt`) and the entry's archived journal of the
+  verified deploy that released it (`--rollback-release-operation`); see
+  [Production edge modes](./production-edge-modes.md#website-rollback).
   Prepare receipts and generated sites on the edge-port line. A rollback past
   the switch is refused (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`): it is not an edge
   rollback, which stays the brake.

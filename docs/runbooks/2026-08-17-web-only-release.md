@@ -187,10 +187,11 @@ npm run product:web-release:prepare -- \
 ```
 
 The command writes the generated site and local receipt but makes no network
-mutation. Keep both until post-deployment verification is complete, then keep
-a private copy of both as this release's rollback point (see
-[Rollback](#rollback)); the receipt carries private Git SHAs. The candidate
-must remain clean and at the same commit between preparation and deployment.
+mutation. Keep both in place until the deploy is verified and
+[archived](#5-archive-the-release) with its operation journal: that archive
+entry is this release's rollback point. The receipt carries private Git SHAs.
+The candidate must remain clean and at the same commit between preparation and
+deployment.
 
 ## 3. Validate before asking for deployment authority
 
@@ -270,7 +271,7 @@ the reviewed public-site closure.
 Never substitute a raw `wrangler deploy` command: it would bypass the
 web-only receipt and source-scope checks. Record the successful source commit,
 receipt digest, deploy time, and live smoke-check result as the next deployed
-baseline.
+baseline, then [archive the release](#5-archive-the-release).
 
 ### Once production runs the edge entry
 
@@ -303,7 +304,59 @@ commit and its base the live commit. It refuses the retained pair
 (`--retained-public-source`, `--expected-live-manifest-sha256`) alongside a
 candidate, a candidate equal to the live manifest, and a candidate without an
 edge mode; [Production edge modes](production-edge-modes.md#changing-the-public-site)
-lists every refusal.
+lists every refusal. Once it is verified,
+[archive the release](#5-archive-the-release).
+
+## 5. Archive the release
+
+Every production deploy is typed, so a verified deploy leaves an operation
+journal, and a website rollback needs that journal together with the
+release's receipt and generated site. Archive the three after every verified
+typed production deploy that ships a site: each web-only release in either
+form above, the gcp switch, and each website rollback. Do it right after the
+deploy reports `verified`, before the checkout is cleaned or reused. From
+`apps/worker` on the checkout that deployed:
+
+```bash
+npm run production:release-archive -- \
+  --operation <absolute operation directory of the deploy> \
+  --web-release-receipt <absolute path of that checkout's .release-build/web-release-receipt.json> \
+  --archive /absolute/owner-private/release-archive
+```
+
+The operation directory is the deploy's `--operation`, or by default
+`.release-build/production-operations/<deploy commit>` in the checkout. The
+archive directory belongs to the owner, outside every Git checkout: it must be
+`0700`, owned by the caller and named by its real path, with no `.git` in it or
+any parent. A missing last component is created `0700`. The script:
+
+- archives only a verified typed production deploy whose state still matches
+  its binding digest, the rollback's own rule
+  (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED`), and refuses a journal
+  a running operation holds (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY`);
+- re-verifies the receipt with this lane's checks against the checkout's
+  generated site, requires its manifest and source commit to be the site the
+  journal left live (`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), and
+  requires the generated site to be exactly its manifest
+  (`PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID`);
+- assembles a private staging copy, proves it (the journal did not move, the
+  copied journal is the same verified release, the copied site passes the
+  same site check), and renames it to `<archive>/<journal identityDigest>/`:
+  `journal/` (private, as the deploy left it), `web-release-receipt.json`,
+  `public-release-site/` and a content-free `index.json` holding only the
+  manifest sha256, the site's source commit, the deploy commit, the journal
+  identityDigest and the receipt's sha256;
+- never overwrites. A rerun for the same release prints
+  `PRODUCTION_RELEASE_ALREADY_ARCHIVED`; a different entry under that digest
+  is refused (`PRODUCTION_RELEASE_ARCHIVE_CONFLICT`) and left as it is.
+
+It prints codes, commits and digests only, never deploys, and does not change
+its inputs. Record the printed `journalIdentityDigest` with the deployed
+baseline. An archive failure does not undo the deploy: keep the journal,
+receipt and site in place, fix the cause and rerun until it prints
+`PRODUCTION_RELEASE_ARCHIVED` or `PRODUCTION_RELEASE_ALREADY_ARCHIVED`. A
+`.staging-*` directory an interrupted run leaves in the archive is not an
+entry. Never edit an entry: a rollback reads its journal as archived.
 
 ## Rollback
 
@@ -311,23 +364,32 @@ Do not deploy an old checkout directly: the scope gate deliberately requires
 the candidate to descend from the current deployed base.
 
 **Once production runs the edge entry,** roll back by re-deploying a
-previously released site by its receipt. Keep each release's receipt,
-generated site and production operation journal directory privately, prepared
-on the edge-port line, which runs these deploys (a receipt or site prepared on
-this line can fail there):
+previously released site from its [archive entry](#5-archive-the-release). Its
+receipt and site were prepared on the edge-port line, which runs these deploys
+(a receipt or site prepared on this line can fail there):
 
-1. Restore that release's private copy of the generated site into
-   `.release-build/public-release-site` of a clean checkout of the live commit
-   (or a descendant of it), and its receipt under `.release-build`, outside
-   that directory.
+1. Pick the entry whose `index.json` names the site to restore (its
+   `manifestSha256` and `sourceCommit`). In a clean checkout of the live
+   commit (or a descendant of it) with no `.release-build/public-release-site`,
+   restore the entry's site and receipt:
+
+   ```bash
+   ENTRY=/absolute/owner-private/release-archive/<journal identityDigest>
+   mkdir -p .release-build
+   cp -R "$ENTRY/public-release-site" .release-build/public-release-site
+   cp "$ENTRY/web-release-receipt.json" .release-build/web-release-receipt.json
+   ```
+
 2. Run the typed command above with
    `--rollback-web-release-receipt <absolute restored receipt>` in place of
    `--web-release-receipt`, plus
-   `--rollback-release-operation <that release's unmodified journal directory>`,
-   the receipt's `site.manifestSha256` as the candidate, and the live site as
-   the replaced pair. On a checkout of the live commit itself, add a fresh,
-   absolute private `--operation` directory; the default one for that commit
-   holds the earlier deploy's journal.
+   `--rollback-release-operation "$ENTRY/journal"`, the archived journal used
+   in place (never copied out or edited), the index's `manifestSha256` as the
+   candidate, and the live site as the replaced pair. On a checkout of the
+   live commit itself, add a fresh, absolute private `--operation` directory;
+   the default one for that commit holds the earlier deploy's journal.
+3. Once the rollback is verified, archive it like any release: its journal,
+   the restored receipt and site become the rollback point for this site.
 
 The receipt's source must be the live commit or one of its ancestors, the
 restored site must still match the receipt byte for byte, and the staged site
@@ -338,7 +400,7 @@ the receipt's source commit (`PRODUCTION_ROLLBACK_OPERATION_INVALID`,
 site was released. After the switch the restored site must carry the privacy
 marker, so the site cannot roll back past the switch.
 
-**Before the edge entry,** or when no private copy of the earlier site
+**Before the edge entry,** or when no archive entry of the earlier site
 survives, make a new, clean revert commit on top of the current deployed
 web-only source that changes only allowed public files. Prepare and authorize
 it through the same lane, reusing the same released installer evidence unless

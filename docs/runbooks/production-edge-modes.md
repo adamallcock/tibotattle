@@ -165,7 +165,7 @@ A typed deploy pins the public site in one of two closed ways. They never mix.
 | Site | Flags | Before the upload | After the upload |
 |---|---|---|---|
 | Kept | `--retained-public-source <live site's source sha> --expected-live-manifest-sha256 <live manifest sha256>` | The live manifest is the pinned one. The staged site is exactly that manifest, built from the retained source | The live manifest is still the pinned one |
-| Changed | `--candidate-public-manifest-sha256 <candidate sha256>`; one of `--web-release-receipt <receipt>`, or `--rollback-web-release-receipt <receipt>` with `--rollback-release-operation <that release's journal directory>`; and `--replaced-public-source <live site's source sha> --replaced-live-manifest-sha256 <live manifest sha256>` | The live manifest is the replaced one, and its source provenance matches the replaced source commit. The staged site is exactly the candidate manifest, built from the receipt's source commit | The live manifest is the candidate |
+| Changed | `--candidate-public-manifest-sha256 <candidate sha256>`; one of `--web-release-receipt <receipt>`, or `--rollback-web-release-receipt <receipt>` with `--rollback-release-operation <that release's archived journal>`; and `--replaced-public-source <live site's source sha> --replaced-live-manifest-sha256 <live manifest sha256>` | The live manifest is the replaced one, and its source provenance matches the replaced source commit. The staged site is exactly the candidate manifest, built from the receipt's source commit | The live manifest is the candidate |
 
 **Prepare on the edge-port line.** These deploys run from the edge-port line,
 and both rows stage the site with that line's `stage-production-assets.mjs`;
@@ -199,9 +199,9 @@ and the generated site in `.release-build/public-release-site`), then:
   ancestor of the deploy source. A receipt proves a site's bytes and scope,
   not that the site was ever live, so `--rollback-release-operation` names
   the operation journal of the typed production deploy that left the site
-  live (its directory, unmodified, by default
-  `.release-build/production-operations/<that deploy's commit>` in the
-  checkout that ran it). The journal must be a verified typed production
+  live: the `journal/` of that release's
+  [archive entry](./2026-08-17-web-only-release.md#5-archive-the-release),
+  used in place. The journal must be a verified typed production
   deploy whose state still matches its binding digest. The site it left live
   (the candidate it shipped, or the retained site it kept) must be the
   receipt's manifest built from the receipt's source commit, and its deploy
@@ -463,6 +463,12 @@ it pinned with `--retained-public-source`. Without the candidate the switch is
 refused `EDGE_PRIVACY_PAGE_NOT_CUTOVER`; with the retained pair added it is
 refused `PRODUCTION_CANDIDATE_SITE_RETAINED_PIN_CONFLICT`.
 
+Once the switch is verified, archive it from `apps/worker` on the switch
+checkout with `npm run production:release-archive` ([Archive the
+release](./2026-08-17-web-only-release.md#5-archive-the-release)): its
+journal, receipt and privacy-marker site are the rollback point for the
+switch's site.
+
 ### Web-only releases
 
 From P1 on, a web-only release is a changed-site deploy through
@@ -479,6 +485,8 @@ fence, `--edge-mode gcp` after the switch; the owner's round 12 decision).
    commit as `--expected-previous-source`. In gcp mode keep the gcp plan,
    `--origin-commit` (the live origin commit) and the verifier account; in
    worker mode use `--edge-mode worker` alone.
+3. Once it is verified, archive it with `npm run production:release-archive`
+   ([Archive the release](./2026-08-17-web-only-release.md#5-archive-the-release)).
 
 E10 applies the mode's rules. In gcp mode no Cloud Run redeploy is needed;
 the predecessor and post-deploy identity come from the Cloudflare bindings,
@@ -494,29 +502,30 @@ receipt, not by deploying an old checkout. Only a site that a verified typed
 production deploy left live can come back; a receipt prepared later for
 another commit is refused (`PRODUCTION_ROLLBACK_SITE_NOT_RELEASED`).
 
-1. Keep each release's receipt, its generated
-   `.release-build/public-release-site` directory and its production
-   operation journal directory privately after the release (they carry
-   private Git SHAs). Prepare and keep them on the edge-port line: a receipt
-   or site prepared on this line can fail there. Keep the journal directory
-   unmodified, with its private permissions; the deploy reads it as it was
-   left.
-2. On a clean checkout of the live commit, or a descendant of it, restore that
-   release's generated directory into `.release-build/public-release-site`
-   and its receipt anywhere under `.release-build` outside that directory.
+1. Archive every release after it is verified ([Archive the
+   release](./2026-08-17-web-only-release.md#5-archive-the-release)): the
+   switch, each web-only release and each rollback. The entry keeps the
+   deploy's operation journal, private and as the deploy left it, with the
+   release's receipt and generated site. Prepare them on the edge-port line: a
+   receipt or site prepared on this line can fail there. Never edit an entry.
+2. On a clean checkout of the live commit, or a descendant of it, restore the
+   entry's `public-release-site` into `.release-build/public-release-site` and
+   its `web-release-receipt.json` anywhere under `.release-build` outside that
+   directory.
 3. Deploy as in [the switch's site](#the-switchs-site), with
    `--rollback-web-release-receipt <restored receipt>` in place of
    `--web-release-receipt`, plus
-   `--rollback-release-operation <that release's journal directory>`, the
-   receipt's `site.manifestSha256` as the candidate, and the live site as
-   the replaced pair. On a checkout of the live commit itself, also pass a
-   fresh, absolute private `--operation` directory: the default one for that
-   commit holds the earlier deploy's journal
-   (`RELEASE_OPERATION_EXISTS_USE_RESUME`).
+   `--rollback-release-operation <the entry's journal directory>` (the
+   archived journal, used in place), the entry index's `manifestSha256` as
+   the candidate, and the live site as the replaced pair. On a checkout of
+   the live commit itself, also pass a fresh, absolute private `--operation`
+   directory: the default one for that commit holds the earlier deploy's
+   journal (`RELEASE_OPERATION_EXISTS_USE_RESUME`).
 
-The site PROD-5 kept has PROD-5's journal as its evidence. A site live only
-before the typed journals, with no verified typed journal, cannot be a
-rollback target.
+The site PROD-5 kept has PROD-5's journal as its evidence; archive that
+journal with the kept site's web-release receipt and generated site in the
+same way. A site live only before the typed journals, with no verified typed
+journal, cannot be a rollback target.
 
 In gcp mode a rollback past the switch is refused
 (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`): the restored site must carry the marker.

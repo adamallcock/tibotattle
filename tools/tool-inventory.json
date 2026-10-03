@@ -205,7 +205,9 @@
         "apps/worker/scripts/cloudflare-writer-fence.mjs",
         "apps/worker/scripts/edge-mode-configuration.mjs",
         "apps/worker/scripts/production-edge-mode.mjs",
-        "apps/worker/scripts/production-edge-mode.check.mjs"
+        "apps/worker/scripts/production-edge-mode.check.mjs",
+        "apps/worker/scripts/production-release-archive.mjs",
+        "apps/worker/scripts/production-release-archive.check.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",
@@ -485,7 +487,9 @@
         "scripts/deploy-web-release.js",
         "scripts/prepare-web-release.js",
         "test/web-release-lane.test.js",
-        "scripts/reconcile-release-publication.mjs"
+        "scripts/reconcile-release-publication.mjs",
+        "apps/worker/scripts/production-deploy.mjs",
+        "apps/worker/scripts/production-release-archive.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",

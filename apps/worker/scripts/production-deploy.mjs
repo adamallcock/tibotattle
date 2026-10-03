@@ -3045,9 +3045,10 @@ export function parseProductionDeploymentArgs(argv) {
  * or from the rollback source it named), or the retained site it kept. Both
  * were proven at staging against their source commit. null unless the journal
  * is a verified typed production operation whose state still matches the
- * binding digest it was opened with.
+ * binding digest it was opened with. A rollback and the release archive
+ * (production-release-archive.mjs) apply this same rule.
  */
-function releasedSiteOfOperation(record) {
+export function releasedSiteOfOperation(record) {
   const state = record?.state;
   const pin = state?.typed;
   if (record?.kind !== "production"
