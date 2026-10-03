@@ -25,6 +25,45 @@
  *     owner-day delete cascades to the replaced price rows), mapping each
  *     row's card ids to the kernel's card refs and a price basis.
  *
+ * W1E (staged migration analytics_v2_pricing_classes; refresh optimization
+ * program section 3.2.1, rank 4): a run whose bundle states a pricer
+ * (kernel.ts analyticsV2BundledPricer) also registers its kernel's PRICING
+ * CLASS in step 1, and the proof in step 2 is established in one of two ways,
+ * recorded per transition (analytics_v2_transition_proofs):
+ *  - method 1, reprice: every stored event of the older kernel is repriced
+ *    under this bundle's kernel (K-PERCARD's proof). It is used whenever
+ *    either kernel's pricing class is unknown (a kernel registered before
+ *    W1E, or a bundle stating no pricer) or the classes differ: fail closed.
+ *  - method 2, pricing-class identity: both kernels are registered in the
+ *    same pricing class (the same pricing code, method version, projection
+ *    and cards), so every stored input prices exactly as stored and the
+ *    proof holds by that identity. The proof still reads every owner-day's
+ *    row metadata (the counts, the price-unknown stale owner-days and the
+ *    stored kernel and projection checks are the same as method 1's), but
+ *    reprices only a deterministic sample of about 1 in
+ *    ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR owner-days (keyed by the
+ *    class, the two kernels and the owner-day; the first priced owner-day
+ *    always), never fetching the other owner-days' stored inputs. A sampled
+ *    owner-day that does not price exactly as stored is a pricing class that
+ *    under-covers its pricer: ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH ends
+ *    the run and nothing is written.
+ * For well-formed stored state either method yields the same verdict, counts
+ * and stale set, so the recorded transition is the same; only the work and
+ * the analytics_v2_transition_proofs row differ. A bundle stating no pricer
+ * records no pricing class and no proof-method row.
+ *
+ * Method 2 narrows the stored inputs' integrity checks to its sample. On
+ * every priced owner-day it still checks, from the row alone, what
+ * decodeAnalyticsV2PriceInputs checks before it inflates (the projection,
+ * the codec, the digest's form, the event count and its bound, non-empty
+ * bytes), failing the run with the same ANALYTICS_V2_PRICE_INPUTS_CORRUPT as
+ * method 1. The body (inflation, the canonical text's sha256, the closed
+ * document and its event count against input_events) is checked only on the
+ * sampled owner-days: a body corrupted under a sound header fails method 1
+ * and passes method 2 unless sampled, and method 2 counts the stored
+ * input_events. The integrity of an unsampled body is owed to whatever reads
+ * it next (a reprice, or Wave 3b's reuse, which decodes it).
+ *
  * Integer ids (card_ref, price_basis_id, transition_id) are assigned here as
  * the stored maximum plus a rank in a fixed order (card id and content,
  * basis digest, older kernel), under the refresh lock, so they are gap-free
@@ -35,11 +74,22 @@
  * price modules' own), never SQL text or a stored value.
  */
 
+import { canonicalJson } from "../canonical-json";
+import { sha256Hex } from "../crypto";
 import type { PostgresClient } from "../postgres-client";
 import { ANALYTICS_V2_TABLES, type AnalyticsV2OwnerDayPriceRow } from "./contract";
-import type { AnalyticsV2RunStamp } from "./kernel";
 import {
+  analyticsV2BundledPricer,
+  analyticsV2PricingClass,
+  type AnalyticsV2Pricer,
+  type AnalyticsV2PricingClass,
+  type AnalyticsV2RunStamp,
+} from "./kernel";
+import {
+  ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS,
+  ANALYTICS_V2_PRICE_INPUTS_CODEC,
   ANALYTICS_V2_PRICE_PROJECTION_VERSION,
+  AnalyticsV2PriceError,
   analyticsV2KernelPriceCards,
   analyticsV2PriceCardSetSha256,
   decodeAnalyticsV2PriceInputs,
@@ -50,6 +100,7 @@ import {
 } from "./price-attribution";
 import {
   ANALYTICS_V2_STALE_CAUSE,
+  type AnalyticsV2KernelCardDiff,
   analyticsV2PriceDirtyOwnerDays,
   analyticsV2PriceTransitionProof,
   diffAnalyticsV2KernelCards,
@@ -71,8 +122,85 @@ import {
 const TABLES = ANALYTICS_V2_TABLES;
 /** Stored owner-days read per page by the proof (each carries its deflated inputs). */
 const PROOF_PAGE_ROWS = 100;
+/** Stored owner-days read per page by a pricing-class identity proof (metadata only). */
+const IDENTITY_PAGE_ROWS = 2_000;
 const OWNER_DIGEST = /^[0-9a-f]{64}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+
+/**
+ * W1E's tables (staged migration analytics_v2_pricing_classes). They decide
+ * no stored value, so they stay out of contract.ts (the compute closure).
+ */
+export const ANALYTICS_V2_PRICING_CLASS_TABLES = Object.freeze({
+  pricingClasses: "analytics_v2_pricing_classes",
+  kernelPricingClasses: "analytics_v2_kernel_pricing_classes",
+  transitionProofs: "analytics_v2_transition_proofs",
+} as const);
+export const ANALYTICS_V2_PRICING_CLASS_COLUMNS = Object.freeze({
+  pricingClasses: Object.freeze(["pricing_class_id", "class_sha256", "pricer_sha256", "pricing_method_version",
+    "projection_version", "cards_sha256", "first_kernel_id", "registered_at"] as const),
+  kernelPricingClasses: Object.freeze(["kernel_id", "pricing_class_id", "registered_at"] as const),
+  transitionProofs: Object.freeze(["transition_id", "method", "pricing_class_id", "sample_divisor",
+    "repriced_owner_days", "repriced_events"] as const),
+} as const);
+export const ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS = Object.freeze({
+  pricingClasses: Object.freeze(["pricing_class_id"] as const),
+  kernelPricingClasses: Object.freeze(["kernel_id"] as const),
+  transitionProofs: Object.freeze(["transition_id"] as const),
+} as const);
+const CLASS_TABLES = ANALYTICS_V2_PRICING_CLASS_TABLES;
+
+/** analytics_v2_transition_proofs.method */
+export const ANALYTICS_V2_TRANSITION_PROOF_METHOD = Object.freeze({ reprice: 1, pricingClass: 2 } as const);
+/** A pricing-class identity proof reprices about one owner-day in this many. */
+export const ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR = 100;
+/** The sample key's method (analyticsV2PricingClassSampled). */
+export const ANALYTICS_V2_PRICING_CLASS_SAMPLE_METHOD = "analytics-v2-pricing-class-sample-v1" as const;
+
+export type AnalyticsV2PricingClassErrorCode =
+  | "ANALYTICS_V2_PRICING_CLASS_CONFLICT"
+  | "ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH"
+  | "ANALYTICS_V2_PRICING_CLASS_STATE_INVALID";
+
+/** A closed, content-free pricing-class failure: the run ends, nothing is written. */
+export class AnalyticsV2PricingClassError extends Error {
+  constructor(readonly code: AnalyticsV2PricingClassErrorCode) {
+    super(code);
+    this.name = "AnalyticsV2PricingClassError";
+  }
+}
+
+const classFail = (code: AnalyticsV2PricingClassErrorCode): never => { throw new AnalyticsV2PricingClassError(code); };
+
+/** How one transition's proof was established (analytics_v2_transition_proofs). */
+export interface AnalyticsV2TransitionEstablishment {
+  readonly method: (typeof ANALYTICS_V2_TRANSITION_PROOF_METHOD)[keyof typeof ANALYTICS_V2_TRANSITION_PROOF_METHOD];
+  /** The shared class (method 2), else null. */
+  readonly pricingClassId: number | null;
+  readonly sampleDivisor: number | null;
+  readonly repricedOwnerDays: number;
+  readonly repricedEvents: number;
+}
+
+/** A proven transition with how its proof was established (absent when the bundle states no pricer). */
+export type AnalyticsV2EstablishedTransitionProof = AnalyticsV2PriceTransitionProof & {
+  readonly establishment?: AnalyticsV2TransitionEstablishment;
+};
+
+/**
+ * Whether a pricing-class identity proof reprices this owner-day: about one
+ * in ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR, keyed by the class, the two
+ * kernels and the owner-day, so each transition samples its own owner-days
+ * and a rerun samples the same ones.
+ */
+export async function analyticsV2PricingClassSampled(input: {
+  readonly classSha256: string; readonly fromKernel: number; readonly toKernel: number;
+  readonly ownerDigest: string; readonly day: string;
+}): Promise<boolean> {
+  const key = await sha256Hex(canonicalJson([ANALYTICS_V2_PRICING_CLASS_SAMPLE_METHOD, input.classSha256,
+    input.fromKernel, input.toKernel, input.ownerDigest, input.day]));
+  return Number.parseInt(key.slice(0, 12), 16) % ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR === 0;
+}
 
 /** A kernel's registered card: its ref and content. */
 export interface AnalyticsV2KernelCardRef {
@@ -124,8 +252,12 @@ async function readKernelPrices(client: PostgresClient, schema: string, kernelId
  */
 export async function registerAnalyticsV2KernelPrices(client: PostgresClient, schema: string,
   stamp: AnalyticsV2RunStamp, registeredAt: string,
-  cards: AnalyticsV2KernelPriceCards): Promise<{ readonly refs: ReadonlyMap<string, AnalyticsV2KernelCardRef>;
-    readonly cardsRegistered: number }> {
+  cards: AnalyticsV2KernelPriceCards,
+  pricer: AnalyticsV2Pricer | null = analyticsV2BundledPricer()): Promise<{
+    readonly refs: ReadonlyMap<string, AnalyticsV2KernelCardRef>;
+    readonly cardsRegistered: number;
+    /** W1E: the kernel's pricing class, or null when the bundle stated no pricer (unknown). */
+    readonly pricingClass: { readonly pricingClassId: number; readonly classSha256: string } | null }> {
   const kernelId = stamp.kernel.kernelId;
   const computeSha256 = stamp.computeSha256 ?? null;
   const inserted = rowsOf(await client.query(
@@ -170,11 +302,71 @@ export async function registerAnalyticsV2KernelPrices(client: PostgresClient, sc
         || card.contentSha256 !== cards.cards[index]!.contentSha256)) {
     fail("ANALYTICS_V2_KERNEL_PRICES_CONFLICT");
   }
+  const pricingClass = pricer === null ? null : await registerAnalyticsV2PricingClass(client, schema, kernelId,
+    await analyticsV2PricingClass({ pricer, projectionVersion: ANALYTICS_V2_PRICE_PROJECTION_VERSION,
+      cardsSha256: cards.cardsSha256 }), registeredAt);
   return Object.freeze({
     refs: new Map(stored!.registered.map((card) => [card.cardId, Object.freeze({ cardRef: card.cardRef,
       contentSha256: card.contentSha256 })])),
     cardsRegistered,
+    pricingClass,
   });
+}
+
+/** The stored pricing class of `kernelId`, or null when it has none (unknown). */
+async function readKernelPricingClass(client: PostgresClient, schema: string, kernelId: number): Promise<{
+  readonly pricingClassId: number; readonly classSha256: string;
+} | null> {
+  const rows = rowsOf<Record<string, unknown>>(await client.query(
+    `SELECT k.pricing_class_id, c.class_sha256
+       FROM ${relation(schema, CLASS_TABLES.kernelPricingClasses)} k
+       JOIN ${relation(schema, CLASS_TABLES.pricingClasses)} c ON c.pricing_class_id = k.pricing_class_id
+      WHERE k.kernel_id = $1::smallint`, [kernelId]), "ANALYTICS_V2_READ_FAILED");
+  if (rows.length === 0) return null;
+  const row = rows[0]!;
+  if (typeof row.class_sha256 !== "string" || !SHA256.test(row.class_sha256)) classFail("ANALYTICS_V2_PRICING_CLASS_STATE_INVALID");
+  return Object.freeze({ pricingClassId: countOf(row.pricing_class_id, "pricingClasses.id"),
+    classSha256: row.class_sha256 as string });
+}
+
+/**
+ * Register `pricingClass` (once, with the stored maximum id plus one) and
+ * link `kernelId` to it (once); a stored class or link that differs is
+ * ANALYTICS_V2_PRICING_CLASS_CONFLICT. Runs inside the write transaction,
+ * after the kernel's cards (the migration's trigger holds the class to them).
+ */
+async function registerAnalyticsV2PricingClass(client: PostgresClient, schema: string, kernelId: number,
+  pricingClass: AnalyticsV2PricingClass, registeredAt: string): Promise<{
+    readonly pricingClassId: number; readonly classSha256: string }> {
+  await client.query(
+    `INSERT INTO ${relation(schema, CLASS_TABLES.pricingClasses)}
+       (pricing_class_id, class_sha256, pricer_sha256, pricing_method_version, projection_version, cards_sha256,
+        first_kernel_id, registered_at)
+     SELECT coalesce(max(pricing_class_id), 0) + 1, $1, $2, $3, $4, $5, $6::smallint, $7::timestamptz
+       FROM ${relation(schema, CLASS_TABLES.pricingClasses)}
+     ON CONFLICT (class_sha256) DO NOTHING`,
+    [pricingClass.classSha256, pricingClass.pricerSha256, pricingClass.pricingMethodVersion,
+      pricingClass.projectionVersion, pricingClass.cardsSha256, kernelId, registeredAt]);
+  const stored = rowsOf<Record<string, unknown>>(await client.query(
+    `SELECT pricing_class_id, pricer_sha256, pricing_method_version, projection_version, cards_sha256
+       FROM ${relation(schema, CLASS_TABLES.pricingClasses)} WHERE class_sha256 = $1`, [pricingClass.classSha256]),
+  "ANALYTICS_V2_WRITE_FAILED");
+  if (stored.length !== 1 || stored[0]!.pricer_sha256 !== pricingClass.pricerSha256
+      || stored[0]!.pricing_method_version !== pricingClass.pricingMethodVersion
+      || stored[0]!.projection_version !== pricingClass.projectionVersion
+      || stored[0]!.cards_sha256 !== pricingClass.cardsSha256) {
+    classFail("ANALYTICS_V2_PRICING_CLASS_CONFLICT");
+  }
+  const pricingClassId = countOf(stored[0]!.pricing_class_id, "pricingClasses.id");
+  await client.query(
+    `INSERT INTO ${relation(schema, CLASS_TABLES.kernelPricingClasses)} (kernel_id, pricing_class_id, registered_at)
+     VALUES ($1::smallint, $2::integer, $3::timestamptz)
+     ON CONFLICT (kernel_id) DO NOTHING`, [kernelId, pricingClassId, registeredAt]);
+  const linked = await readKernelPricingClass(client, schema, kernelId);
+  if (linked === null || linked.pricingClassId !== pricingClassId || linked.classSha256 !== pricingClass.classSha256) {
+    classFail("ANALYTICS_V2_PRICING_CLASS_CONFLICT");
+  }
+  return Object.freeze({ pricingClassId, classSha256: pricingClass.classSha256 });
 }
 
 /** Older kernels that stamp stored owner-days and have no transition to `kernelId` yet, with their owner-day counts. */
@@ -194,72 +386,225 @@ Promise<readonly { readonly fromKernel: number; readonly ownerDays: number }[]> 
 
 /**
  * Prove every pending transition to the run's kernel over the stored price
- * inputs (price-transition.ts). Reads only; the Job runs it in its read
- * snapshot. `cards` and `price` default to this bundle's kernel (a spec may
- * state another).
+ * inputs (price-transition.ts), by a full reprice or, when both kernels are
+ * in the same pricing class, by that identity with a sampled reprice (see the
+ * module comment). Reads only; the Job runs it in its read snapshot. `cards`,
+ * `price` and `pricer` default to this bundle's kernel (a spec may state
+ * others; a null `pricer` is an unknown pricing class).
  */
 export async function proveAnalyticsV2PriceTransitions(client: PostgresClient, options: {
   readonly schema: string;
   readonly stamp: AnalyticsV2RunStamp;
   readonly cards?: AnalyticsV2KernelPriceCards;
   readonly price?: (input: AnalyticsV2PriceInput) => AnalyticsV2PricedEvent;
+  readonly pricer?: AnalyticsV2Pricer | null;
 }): Promise<AnalyticsV2PriceTransitions> {
   const { schema, stamp } = options;
   const toKernel = stamp.kernel.kernelId;
   const cards = options.cards ?? await analyticsV2KernelPriceCards();
-  const transitions: AnalyticsV2PriceTransitionProof[] = [];
+  const pricer = options.pricer === undefined ? analyticsV2BundledPricer() : options.pricer;
+  // W1E: this bundle's pricing class; null (unknown) proves every transition by a full reprice.
+  const toClass = pricer === null ? null : await analyticsV2PricingClass({ pricer,
+    projectionVersion: ANALYTICS_V2_PRICE_PROJECTION_VERSION, cardsSha256: cards.cardsSha256 });
+  const transitions: AnalyticsV2EstablishedTransitionProof[] = [];
   for (const { fromKernel, ownerDays: expected } of await pendingTransitions(client, schema, toKernel)) {
     const from = await readKernelPrices(client, schema, fromKernel);
     const diff = from === null ? null : diffAnalyticsV2KernelCards(from.registered, cards.cards);
-    const stale: AnalyticsV2StaleOwnerDay[] = [];
-    let ownerDays = 0, events = 0, violation = false;
-    let after: { ownerDigest: string; day: string } | null = null;
-    for (;;) {
-      const page = rowsOf<Record<string, unknown>>(await client.query(
-        `SELECT d.owner_digest, d.day::text AS day, (d.daily IS NOT NULL) AS has_daily,
-                p.kernel_id::integer AS price_kernel, p.projection_version, p.codec, p.inputs, p.inputs_sha256,
-                p.input_events
-           FROM ${relation(schema, TABLES.ownerDay)} d
-           LEFT JOIN ${relation(schema, TABLES.ownerDayPrice)} p ON p.owner_digest = d.owner_digest AND p.day = d.day
-          WHERE d.kernel_id = $1::smallint
-            AND ($2::text IS NULL OR (d.owner_digest, d.day) > ($2::text, $3::date))
-          ORDER BY d.owner_digest, d.day
-          LIMIT $4::integer`,
-        [fromKernel, after?.ownerDigest ?? null, after?.day ?? null, PROOF_PAGE_ROWS]), "ANALYTICS_V2_READ_FAILED");
-      for (const row of page) {
-        if (typeof row.owner_digest !== "string" || !OWNER_DIGEST.test(row.owner_digest) || typeof row.day !== "string") {
-          fail("ANALYTICS_V2_PRICE_STATE_INVALID", "ownerDay");
-        }
-        const ownerDigest = row.owner_digest as string, day = row.day as string;
-        ownerDays += 1;
-        after = { ownerDigest, day };
-        // A refused owner-day has no price: not a price staleness.
-        if (row.has_daily !== true) continue;
-        if (row.price_kernel === null) {
-          stale.push({ ownerDigest, day, cause: ANALYTICS_V2_STALE_CAUSE.priceUnknown });
-          continue;
-        }
-        // A price row is written with its owner-day row by the same kernel, after that kernel's cards.
-        if (row.price_kernel !== fromKernel || diff === null) fail("ANALYTICS_V2_PRICE_STATE_INVALID", "ownerDayPrice");
-        if (!repriceableAnalyticsV2Projection(row.projection_version)) {
-          stale.push({ ownerDigest, day, cause: ANALYTICS_V2_STALE_CAUSE.priceUnknown });
-          continue;
-        }
-        const decoded = await decodeAnalyticsV2PriceInputs({ projectionVersion: row.projection_version as string,
-          codec: row.codec as string, sha256: row.inputs_sha256 as string, events: row.input_events as number,
-          bytes: row.inputs as Uint8Array });
-        const proof = proveAnalyticsV2DayPrices(decoded.events, diff!, options.price);
-        events += proof.events;
-        violation ||= proof.violation;
-        if (proof.cause !== null) stale.push({ ownerDigest, day, cause: proof.cause });
-      }
-      if (page.length < PROOF_PAGE_ROWS) break;
+    const fromClass = toClass === null ? null : await readKernelPricingClass(client, schema, fromKernel);
+    const shared = toClass !== null && fromClass !== null && fromClass.classSha256 === toClass.classSha256
+      ? fromClass : null;
+    if (shared !== null && (from === null || diff === null || diff.added.length + diff.removed.length
+        + diff.changed.length !== 0 || from.cardsSha256 !== cards.cardsSha256
+        || from.projectionVersion !== ANALYTICS_V2_PRICE_PROJECTION_VERSION)) {
+      // One class, other cards or projection: the stored class does not describe the stored kernel.
+      classFail("ANALYTICS_V2_PRICING_CLASS_STATE_INVALID");
     }
-    if (ownerDays !== expected) fail("ANALYTICS_V2_PRICE_TRANSITION_STALE");
-    transitions.push(analyticsV2PriceTransitionProof({ fromKernel, toKernel, fromComputeSha256: from?.computeSha256 ?? null,
-      toComputeSha256: stamp.computeSha256 ?? null, diff, ownerDays, events, violation, stale }));
+    const proven = shared === null
+      ? await proveByReprice(client, schema, { fromKernel, diff, price: options.price })
+      : await proveByPricingClass(client, schema, { fromKernel, toKernel, diff: diff!, price: options.price,
+        classSha256: shared.classSha256 });
+    if (proven.ownerDays !== expected) fail("ANALYTICS_V2_PRICE_TRANSITION_STALE");
+    const proof = analyticsV2PriceTransitionProof({ fromKernel, toKernel, fromComputeSha256: from?.computeSha256 ?? null,
+      toComputeSha256: stamp.computeSha256 ?? null, diff, ownerDays: proven.ownerDays, events: proven.events,
+      violation: proven.violation, stale: proven.stale });
+    transitions.push(toClass === null ? proof : Object.freeze({ ...proof, establishment: Object.freeze({
+      method: shared === null ? ANALYTICS_V2_TRANSITION_PROOF_METHOD.reprice : ANALYTICS_V2_TRANSITION_PROOF_METHOD.pricingClass,
+      pricingClassId: shared === null ? null : shared.pricingClassId,
+      sampleDivisor: shared === null ? null : ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR,
+      repricedOwnerDays: proven.repricedOwnerDays,
+      repricedEvents: proven.repricedEvents,
+    }) }));
   }
   return Object.freeze({ toKernel, transitions: Object.freeze(transitions) });
+}
+
+/** What one older kernel's stored owner-days proved. */
+interface ProvenOwnerDays {
+  readonly ownerDays: number;
+  readonly events: number;
+  readonly violation: boolean;
+  readonly stale: readonly AnalyticsV2StaleOwnerDay[];
+  readonly repricedOwnerDays: number;
+  readonly repricedEvents: number;
+}
+
+/**
+ * One stored owner-day row's checks before any reprice, shared by both
+ * methods: a refused owner-day is skipped, a missing or other-projection
+ * price row is price-unknown, and a price row of another kernel (or of a
+ * kernel without cards) is invalid state. Returns whether it reprices.
+ */
+function priceRowStatus(row: Record<string, unknown>, fromKernel: number, diff: AnalyticsV2KernelCardDiff | null):
+"skip" | "unknown" | "reprice" {
+  if (row.has_daily !== true) return "skip";
+  if (row.price_kernel === null) return "unknown";
+  // A price row is written with its owner-day row by the same kernel, after that kernel's cards.
+  if (row.price_kernel !== fromKernel || diff === null) fail("ANALYTICS_V2_PRICE_STATE_INVALID", "ownerDayPrice");
+  return repriceableAnalyticsV2Projection(row.projection_version) ? "reprice" : "unknown";
+}
+
+function ownerDayKey(row: Record<string, unknown>): { ownerDigest: string; day: string } {
+  if (typeof row.owner_digest !== "string" || !OWNER_DIGEST.test(row.owner_digest) || typeof row.day !== "string") {
+    fail("ANALYTICS_V2_PRICE_STATE_INVALID", "ownerDay");
+  }
+  return { ownerDigest: row.owner_digest as string, day: row.day as string };
+}
+
+/** Decode one stored owner-day's inputs (the codec checks digest and event count) and prove them. */
+async function proveStoredDay(row: Record<string, unknown>, diff: AnalyticsV2KernelCardDiff,
+  price: ((input: AnalyticsV2PriceInput) => AnalyticsV2PricedEvent) | undefined) {
+  const decoded = await decodeAnalyticsV2PriceInputs({ projectionVersion: row.projection_version as string,
+    codec: row.codec as string, sha256: row.inputs_sha256 as string, events: row.input_events as number,
+    bytes: row.inputs as Uint8Array });
+  return proveAnalyticsV2DayPrices(decoded.events, diff, price);
+}
+
+/**
+ * What decodeAnalyticsV2PriceInputs checks of a stored owner-day's inputs
+ * before it inflates them, from the row alone (method 2's per-row integrity
+ * check; see the module comment): anything else is the same
+ * ANALYTICS_V2_PRICE_INPUTS_CORRUPT. `has_inputs` is the row's non-empty bytes.
+ */
+function soundStoredInputsHeader(row: Record<string, unknown>): void {
+  const events = row.input_events;
+  if (row.projection_version !== ANALYTICS_V2_PRICE_PROJECTION_VERSION || row.codec !== ANALYTICS_V2_PRICE_INPUTS_CODEC
+      || typeof row.inputs_sha256 !== "string" || !SHA256.test(row.inputs_sha256)
+      || typeof events !== "number" || !Number.isSafeInteger(events) || events < 0
+      || events > ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS || row.has_inputs !== true) {
+    throw new AnalyticsV2PriceError("ANALYTICS_V2_PRICE_INPUTS_CORRUPT");
+  }
+}
+
+/** Method 1 (K-PERCARD): reprice every stored event of `fromKernel`. */
+async function proveByReprice(client: PostgresClient, schema: string, input: {
+  readonly fromKernel: number; readonly diff: AnalyticsV2KernelCardDiff | null;
+  readonly price: ((input: AnalyticsV2PriceInput) => AnalyticsV2PricedEvent) | undefined;
+}): Promise<ProvenOwnerDays> {
+  const { fromKernel, diff } = input;
+  const stale: AnalyticsV2StaleOwnerDay[] = [];
+  let ownerDays = 0, events = 0, violation = false, repriced = 0;
+  let after: { ownerDigest: string; day: string } | null = null;
+  for (;;) {
+    const page = rowsOf<Record<string, unknown>>(await client.query(
+      `SELECT d.owner_digest, d.day::text AS day, (d.daily IS NOT NULL) AS has_daily,
+              p.kernel_id::integer AS price_kernel, p.projection_version, p.codec, p.inputs, p.inputs_sha256,
+              p.input_events
+         FROM ${relation(schema, TABLES.ownerDay)} d
+         LEFT JOIN ${relation(schema, TABLES.ownerDayPrice)} p ON p.owner_digest = d.owner_digest AND p.day = d.day
+        WHERE d.kernel_id = $1::smallint
+          AND ($2::text IS NULL OR (d.owner_digest, d.day) > ($2::text, $3::date))
+        ORDER BY d.owner_digest, d.day
+        LIMIT $4::integer`,
+      [fromKernel, after?.ownerDigest ?? null, after?.day ?? null, PROOF_PAGE_ROWS]), "ANALYTICS_V2_READ_FAILED");
+    for (const row of page) {
+      const key = ownerDayKey(row);
+      ownerDays += 1;
+      after = key;
+      const status = priceRowStatus(row, fromKernel, diff);
+      if (status === "skip") continue;
+      if (status === "unknown") {
+        stale.push({ ...key, cause: ANALYTICS_V2_STALE_CAUSE.priceUnknown });
+        continue;
+      }
+      const proof = await proveStoredDay(row, diff!, input.price);
+      events += proof.events;
+      repriced += 1;
+      violation ||= proof.violation;
+      if (proof.cause !== null) stale.push({ ...key, cause: proof.cause });
+    }
+    if (page.length < PROOF_PAGE_ROWS) break;
+  }
+  return { ownerDays, events, violation, stale, repricedOwnerDays: repriced, repricedEvents: events };
+}
+
+/**
+ * Method 2 (W1E): both kernels are in the same pricing class, so every stored
+ * input prices as stored. Every owner-day's metadata is read and checked as
+ * method 1 checks it, with its stored inputs' header (soundStoredInputsHeader),
+ * its event count is the stored one (the codec holds input_events to the
+ * document whenever it is decoded), and only the sampled owner-days' inputs
+ * are fetched, decoded and repriced; any of them that does not price exactly
+ * as stored is ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH.
+ */
+async function proveByPricingClass(client: PostgresClient, schema: string, input: {
+  readonly fromKernel: number; readonly toKernel: number; readonly diff: AnalyticsV2KernelCardDiff;
+  readonly classSha256: string;
+  readonly price: ((input: AnalyticsV2PriceInput) => AnalyticsV2PricedEvent) | undefined;
+}): Promise<ProvenOwnerDays> {
+  const { fromKernel, toKernel, diff, classSha256 } = input;
+  const stale: AnalyticsV2StaleOwnerDay[] = [];
+  let ownerDays = 0, events = 0, repricedOwnerDays = 0, repricedEvents = 0, priced = 0;
+  let after: { ownerDigest: string; day: string } | null = null;
+  for (;;) {
+    const page = rowsOf<Record<string, unknown>>(await client.query(
+      `SELECT d.owner_digest, d.day::text AS day, (d.daily IS NOT NULL) AS has_daily,
+              p.kernel_id::integer AS price_kernel, p.projection_version, p.codec, p.inputs_sha256, p.input_events,
+              (octet_length(p.inputs) > 0) AS has_inputs
+         FROM ${relation(schema, TABLES.ownerDay)} d
+         LEFT JOIN ${relation(schema, TABLES.ownerDayPrice)} p ON p.owner_digest = d.owner_digest AND p.day = d.day
+        WHERE d.kernel_id = $1::smallint
+          AND ($2::text IS NULL OR (d.owner_digest, d.day) > ($2::text, $3::date))
+        ORDER BY d.owner_digest, d.day
+        LIMIT $4::integer`,
+      [fromKernel, after?.ownerDigest ?? null, after?.day ?? null, IDENTITY_PAGE_ROWS]), "ANALYTICS_V2_READ_FAILED");
+    const sampled: { ownerDigest: string; day: string }[] = [];
+    for (const row of page) {
+      const key = ownerDayKey(row);
+      ownerDays += 1;
+      after = key;
+      const status = priceRowStatus(row, fromKernel, diff);
+      if (status === "skip") continue;
+      if (status === "unknown") {
+        stale.push({ ...key, cause: ANALYTICS_V2_STALE_CAUSE.priceUnknown });
+        continue;
+      }
+      soundStoredInputsHeader(row);
+      events += row.input_events as number;
+      // The first priced owner-day is always sampled, so a non-empty transition is never proven by identity alone.
+      if (priced++ === 0 || await analyticsV2PricingClassSampled({ classSha256, fromKernel, toKernel, ...key })) {
+        sampled.push(key);
+      }
+    }
+    if (sampled.length > 0) {
+      const rows = rowsOf<Record<string, unknown>>(await client.query(
+        `SELECT p.owner_digest, p.day::text AS day, p.kernel_id::integer AS price_kernel, p.projection_version, p.codec,
+                p.inputs, p.inputs_sha256, p.input_events
+           FROM unnest($2::text[], $3::date[]) AS s(owner_digest, day)
+           JOIN ${relation(schema, TABLES.ownerDayPrice)} p ON p.owner_digest = s.owner_digest AND p.day = s.day
+          WHERE p.kernel_id = $1::smallint
+          ORDER BY p.owner_digest, p.day`,
+        [fromKernel, sampled.map((key) => key.ownerDigest), sampled.map((key) => key.day)]), "ANALYTICS_V2_READ_FAILED");
+      if (rows.length !== sampled.length) fail("ANALYTICS_V2_PRICE_TRANSITION_STALE");
+      for (const row of rows) {
+        const proof = await proveStoredDay(row, diff, input.price);
+        repricedOwnerDays += 1;
+        repricedEvents += proof.events;
+        if (proof.cause !== null || proof.violation) classFail("ANALYTICS_V2_PRICING_CLASS_SAMPLE_MISMATCH");
+      }
+    }
+    if (page.length < IDENTITY_PAGE_ROWS) break;
+  }
+  return { ownerDays, events, violation: false, stale, repricedOwnerDays, repricedEvents };
 }
 
 /**
@@ -282,6 +627,10 @@ export async function recordAnalyticsV2PriceTransitions(client: PostgresClient, 
   })) {
     fail("ANALYTICS_V2_PRICE_TRANSITION_STALE");
   }
+  // W1E: every establishment is checked before any row is written.
+  for (const transition of proof.transitions as readonly AnalyticsV2EstablishedTransitionProof[]) {
+    if (transition.establishment !== undefined) validEstablishment(transition, transition.establishment);
+  }
   const summary = [];
   for (const transition of proof.transitions as readonly AnalyticsV2PriceTransitionProof[]) {
     const inserted = rowsOf<{ transition_id: unknown }>(await client.query(
@@ -297,6 +646,10 @@ export async function recordAnalyticsV2PriceTransitions(client: PostgresClient, 
         transition.stale.length, runId, recordedAt]), "ANALYTICS_V2_WRITE_FAILED");
     if (inserted.length !== 1) fail("ANALYTICS_V2_WRITE_FAILED", "kernelTransitions");
     const transitionId = countOf(inserted[0]!.transition_id, "kernelTransitions.id");
+    const establishment = (transition as AnalyticsV2EstablishedTransitionProof).establishment;
+    if (establishment !== undefined) {
+      await recordAnalyticsV2TransitionEstablishment(client, schema, transitionId, transition, establishment);
+    }
     await insertRecordset(client,
       `INSERT INTO ${relation(schema, TABLES.transitionStale)} (transition_id, owner_digest, day, cause)
        SELECT transition_id, owner_digest, day, cause
@@ -308,6 +661,40 @@ export async function recordAnalyticsV2PriceTransitions(client: PostgresClient, 
       compatible: transition.compatible, ownerDays: transition.ownerDays, staleOwnerDays: transition.stale.length }));
   }
   return Object.freeze(summary);
+}
+
+/**
+ * How one transition's proof was established (W1E), checked: method 1
+ * repriced every event and names no class; method 2 names a class, the
+ * sample divisor and a proof that holds. The class itself is checked against
+ * both kernels' stored classes by the migration's trigger when it is recorded.
+ */
+function validEstablishment(transition: AnalyticsV2PriceTransitionProof,
+  establishment: AnalyticsV2TransitionEstablishment): void {
+  if (establishment === null || typeof establishment !== "object") classFail("ANALYTICS_V2_PRICING_CLASS_STATE_INVALID");
+  const { method, pricingClassId, sampleDivisor, repricedOwnerDays, repricedEvents } = establishment;
+  const identity = method === ANALYTICS_V2_TRANSITION_PROOF_METHOD.pricingClass;
+  if ((method !== ANALYTICS_V2_TRANSITION_PROOF_METHOD.reprice && !identity)
+      || !Number.isSafeInteger(repricedOwnerDays) || repricedOwnerDays < 0 || repricedOwnerDays > transition.ownerDays
+      || !Number.isSafeInteger(repricedEvents) || repricedEvents < 0 || repricedEvents > transition.events
+      || (identity ? !Number.isSafeInteger(pricingClassId) || (pricingClassId as number) < 1
+        || sampleDivisor !== ANALYTICS_V2_PRICING_CLASS_SAMPLE_DIVISOR || !transition.proofHolds
+        : pricingClassId !== null || sampleDivisor !== null || repricedEvents !== transition.events)) {
+    classFail("ANALYTICS_V2_PRICING_CLASS_STATE_INVALID");
+  }
+}
+
+async function recordAnalyticsV2TransitionEstablishment(client: PostgresClient, schema: string, transitionId: number,
+  transition: AnalyticsV2PriceTransitionProof, establishment: AnalyticsV2TransitionEstablishment): Promise<void> {
+  validEstablishment(transition, establishment);
+  const { method, pricingClassId, sampleDivisor, repricedOwnerDays, repricedEvents } = establishment;
+  const inserted = rowsOf(await client.query(
+    `INSERT INTO ${relation(schema, CLASS_TABLES.transitionProofs)}
+       (transition_id, method, pricing_class_id, sample_divisor, repriced_owner_days, repriced_events)
+     VALUES ($1::integer, $2::smallint, $3::integer, $4::integer, $5::integer, $6::bigint)
+     RETURNING transition_id`,
+    [transitionId, method, pricingClassId, sampleDivisor, repricedOwnerDays, repricedEvents]), "ANALYTICS_V2_WRITE_FAILED");
+  if (inserted.length !== 1) fail("ANALYTICS_V2_WRITE_FAILED", "transitionProofs");
 }
 
 /**
