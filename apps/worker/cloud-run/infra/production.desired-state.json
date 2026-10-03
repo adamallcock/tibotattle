@@ -47,10 +47,10 @@
     ]
   },
   "secrets": {
-    "IDENTITY_LINK_SECRET": { "secretName": "IDENTITY_LINK_SECRET", "version": null },
-    "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": null },
-    "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": null },
-    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": null }
+    "IDENTITY_LINK_SECRET": { "secretName": "IDENTITY_LINK_SECRET", "version": "1" },
+    "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": "1" },
+    "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": "1" },
+    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": "1" }
   },
   "cloudSql": {
     "instance": "tibotattle-primary",
