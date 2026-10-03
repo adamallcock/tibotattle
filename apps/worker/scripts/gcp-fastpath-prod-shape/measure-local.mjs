@@ -25,8 +25,8 @@
 //     explicitly selects dense-workers with --workers=4 and no inherited heap
 //     flags. Dense inline uses heap12288MiB and semi-space64MiB; both profiles
 //     use ANALYTICS_V2_MEMORY_BUDGET_MIB=10752;
-//     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; no task timeout, so
-//     the run is measured to the end), wrapped in /usr/bin/time -l for the
+//     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; a24h task timeout),
+//     wrapped in /usr/bin/time -l for the
 //     process's peak resident set, while the process's resident set and CPU
 //     time are sampled every 5 s (ps) for the utilisation of its threads;
 //  4. records the job's receipt (phase timings, read ledger, memory summary,
@@ -83,7 +83,7 @@ const DIST_REFRESH = join(CLOUD_RUN_ROOT, "dist", "analytics-refresh.mjs");
 const DEFAULT_NODE22 = join(homedir(), ".nvm/versions/node/v22.16.0/bin/node");
 const PRIVATE_SOCKET = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const DATABASE = /^meas_synth_[0-9a-f]{8}$/u;
-/** The production task profile (cloud-run/analytics-refresh.mjs ANALYTICS_REFRESH_PRODUCTION_JOB, "dense"). */
+/** Shared production resources plus the dense inline comparison heap; Workers have no inherited heap flags. */
 export const PRODUCTION_PROFILE = Object.freeze({ cpu: 4, memoryGiB: 16, heapMiB: 12_288, budgetMiB: 10_752,
   taskTimeoutSeconds: 86_400 });
 /** The refresh task profiles this measurement runs locally (the test-deploy wrapper's, by name). */
@@ -504,7 +504,7 @@ async function main() {
     report.steps.run = await runRecord(pool, schema);
     await save();
     if (options.guardProbe) {
-      console.error("# guard probe (task timeout 14,400 s)");
+      console.error(`# guard probe (task timeout ${measureProfile(options.profile).taskTimeoutSeconds} s)`);
       report.steps.guardProbe = await guardProbe({ node22: options.node22, endpoint, database, schema,
         profile: options.profile });
       await save();
