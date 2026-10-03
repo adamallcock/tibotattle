@@ -74,7 +74,7 @@ A parent retaining horizon occurrences while a model-block child maps cloned occ
 
 Part A alone, frozen at `41e19cc9871478a125f510949fd59e575b8e36aa` (approved base plus both existing prerequisite fixes and A, without B), passed 25 files/258 analytics tests under Node 22.16.0 in 332.71 seconds. Vendor, typecheck, root preflight and architecture passed. Part B alone, frozen at `bd19a13eb2ae06e29f40a80d882ae2f31f7082af` (approved base plus both prerequisite fixes and B, without A), passed 24 files/261 analytics tests in 315.21 seconds. Its vendor, typecheck, preflight and architecture gates passed. Independent review verified B source equality with `264b8020`, found no actionable source defect and independently passed all 16 vendor-source specs in 20.93 seconds.
 
-The earlier A runs stopped on known pricer/plugin assertion prerequisites; the earlier mixed-snapshot combined attempt remains failed/unqualified history. Both fixes were applied before either final standalone gate began; neither source tree changed during its gate. Complete combined analytics qualification is pending; no assertions were weakened.
+The earlier A runs stopped on known pricer/plugin assertion prerequisites; the earlier mixed-snapshot combined attempt remains failed/unqualified history. Both fixes were applied before either final standalone gate began; neither source tree changed during its gate. The settled combined source was clean and frozen at `6defdc3718595c3c93947ebc899f59bf148a6bc7` throughout its final gate: 25 files/265 analytics tests passed in 360.36 seconds, including the four quota specs and 16 vendor specs; root preflight and architecture passed. No assertions were weakened. The final receipt-only commit records this result without changing that source.
 
 Closure registration, Cloud Run build/check and gcp:fastpath:scripts-check are deferred to the integrator's combined registry/pin fold. No local provisional entry is left behind.
 
@@ -85,6 +85,8 @@ Remaining scheduled evidence:
 3. CPU-profile o01 mapping/reduction, recording inclusive helper/original time, model wall, GC and heap/RSS. Run s015/o05 ABBA with host load.
 4. Confirm allocation and first-walk costs with the corpus mix; measure combined parent/child dense-workers heap peaks against unchanged budgets.
 5. After measured local savings, project with the program's model factor 2.51 and labelled owner/total-work bounds. No cloud saving is inferred from these micro measurements.
+
+Raw content-free logs and aggregate reports are archived under `/Users/adamallcock/Documents/Coding/tibotattle-gcp-parity/receipts/perf-model-residue-2026-10-03/codex-model-residue-20261003/` with directory mode 700. `validation-summary.json` distinguishes qualified final gates from failed or unqualified history.
 
 No private PostgreSQL cluster was created, so none required teardown. Validation worktrees are local throwaway copies; the implementation branch is preserved. No corpus disk footprint or private session data was created.
 
