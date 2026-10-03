@@ -55,7 +55,7 @@ function settings(source = SOURCE) {
     tail_consumers: [],
     logpush: false,
     limits: runtime.limits,
-    observability: { enabled: true, head_sampling_rate: 1, redact_query_string: true },
+    observability: { enabled: true, head_sampling_rate: 1, redact_query_string: false },
     annotations: { "workers/message": "synthetic" },
     cache_options: runtime.cache_options,
     bindings: bindings(source),
@@ -300,4 +300,140 @@ test("a candidate D1 migrations_dir is accepted only as the release guard's own 
     assert.equal(result.code, "PRODUCTION_LIVE_CONFIG_BINDING_INVALID", `${binding} ${directory}`);
     assert.deepEqual(Object.keys(result).sort(), ["code", "ok"]);
   }
+});
+
+// The settings API's observability object as captured read-only on
+// 2026-10-03 for the staging edge Worker and the production Worker, each
+// deployed from a config declaring only { enabled: true, head_sampling_rate: 1 }.
+const LIVE_OBSERVABILITY = Object.freeze({
+  staging: {
+    enabled: true,
+    head_sampling_rate: 1,
+    redact_query_string: false,
+    logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: true },
+    traces: { enabled: false, persist: true, head_sampling_rate: 1 },
+  },
+  production: {
+    enabled: true,
+    head_sampling_rate: 1,
+    redact_query_string: false,
+    logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: true },
+    traces: { enabled: false, persist: true, head_sampling_rate: 1 },
+  },
+});
+const DECLARED_OBSERVABILITY = Object.freeze({ enabled: true, head_sampling_rate: 1 });
+
+function liveSnapshot(observability) {
+  const value = inventory();
+  value.settings.observability = structuredClone(observability);
+  return createProductionLiveConfigSnapshot(value);
+}
+
+function verifyDeclared(snapshot, observability) {
+  const candidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot: baseline(), sourceCommit: NEXT_SOURCE });
+  candidate.env.production.observability = structuredClone(observability);
+  return verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE });
+}
+
+test("the captured staging and production observability shapes match a config that declares only enabled and sampling", () => {
+  for (const [name, observability] of Object.entries(LIVE_OBSERVABILITY)) {
+    const snapshot = liveSnapshot(observability);
+    assert.equal(snapshot.settings.observability.redact_query_string, undefined, name);
+    assert.deepEqual(snapshot.settings.placement, {}, name);
+    // A candidate declared from the tracked config (the genesis path) ...
+    const declared = verifyDeclared(snapshot, DECLARED_OBSERVABILITY);
+    assert.equal(declared.ok, true, `${name}: ${declared.code}`);
+    assert.equal(declared.actualFingerprint, snapshot.fingerprint, name);
+    // ... and one rendered from the live snapshot (the typed redeploy path).
+    const rendered = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
+    assert.equal(Object.hasOwn(rendered.env.production.observability, "redact_query_string"), false, name);
+    // Live placement {} is the absent form: the candidate does not declare it.
+    assert.equal(Object.hasOwn(rendered.env.production, "placement"), false, name);
+    assert.equal(verifyProductionLiveConfig({ snapshot, candidateConfig: rendered, sourceCommit: NEXT_SOURCE }).ok, true, name);
+  }
+});
+
+test("a live observability value other than the pinned default is drift for an undeclared field", () => {
+  const mutations = [
+    ["traces.enabled", (value) => { value.traces.enabled = true; }],
+    ["traces.persist", (value) => { value.traces.persist = false; }],
+    ["traces.head_sampling_rate", (value) => { value.traces.head_sampling_rate = 0.5; }],
+    ["logs.persist", (value) => { value.logs.persist = false; }],
+    ["logs.enabled", (value) => { value.logs.enabled = false; }],
+    ["logs.invocation_logs", (value) => { value.logs.invocation_logs = false; }],
+    ["logs.head_sampling_rate", (value) => { value.logs.head_sampling_rate = 0.25; }],
+    ["logs.destinations", (value) => { value.logs.destinations = ["synthetic-destination"]; }],
+    ["traces.destinations", (value) => { value.traces.destinations = []; }],
+    ["traces.invocation_logs", (value) => { value.traces.invocation_logs = true; }],
+    ["redact_query_string", (value) => { value.redact_query_string = true; }],
+  ];
+  for (const [name, mutate] of mutations) {
+    const observability = structuredClone(LIVE_OBSERVABILITY.production);
+    mutate(observability);
+    const snapshot = liveSnapshot(observability);
+    const result = verifyDeclared(snapshot, DECLARED_OBSERVABILITY);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.code, "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_DRIFT", name);
+    assert.deepEqual(Object.keys(result).sort(), ["code", "ok"], name);
+  }
+  // Wrangler cannot carry the API-only key, so a non-default value is not rendered away.
+  const redacted = liveSnapshot({ ...LIVE_OBSERVABILITY.production, redact_query_string: true });
+  assert.equal(redacted.settings.observability.redact_query_string, true);
+  assert.throws(() => renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot: redacted, sourceCommit: NEXT_SOURCE }),
+    { code: "PRODUCTION_LIVE_CONFIG_CONFIG_CONFIG_SETTINGS_DRIFT" });
+});
+
+test("pinned defaults apply only to the observed enabled, full-sampling declaration", () => {
+  for (const declaration of [{ enabled: true }, { enabled: true, head_sampling_rate: 0.5 }, { enabled: false, head_sampling_rate: 1 }]) {
+    const snapshot = liveSnapshot({ ...LIVE_OBSERVABILITY.production, ...declaration });
+    const result = verifyDeclared(snapshot, declaration);
+    assert.equal(result.code, "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_DRIFT", JSON.stringify(declaration));
+  }
+});
+
+test("unknown observability keys fail closed in the live inventory and the candidate config", () => {
+  for (const mutate of [
+    (value) => { value.unexpected = true; },
+    (value) => { value.logs.unexpected = true; },
+    (value) => { value.traces.unexpected = true; },
+    (value) => { value.redact_query_string = "false"; },
+  ]) {
+    const observability = structuredClone(LIVE_OBSERVABILITY.production);
+    mutate(observability);
+    assert.throws(() => liveSnapshot(observability), { code: "PRODUCTION_LIVE_CONFIG_SETTINGS_INVALID" });
+  }
+  const snapshot = liveSnapshot(LIVE_OBSERVABILITY.production);
+  for (const declaration of [
+    { ...DECLARED_OBSERVABILITY, unexpected: true },
+    { ...DECLARED_OBSERVABILITY, redact_query_string: false },
+    { ...DECLARED_OBSERVABILITY, logs: { unexpected: true } },
+  ]) {
+    assert.equal(verifyDeclared(snapshot, declaration).code, "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_INVALID");
+  }
+});
+
+test("observability fields a config declares compare exactly", () => {
+  const snapshot = liveSnapshot(LIVE_OBSERVABILITY.production);
+  const exact = structuredClone(LIVE_OBSERVABILITY.production);
+  delete exact.redact_query_string;
+  for (const declaration of [
+    exact,
+    { ...DECLARED_OBSERVABILITY, logs: { persist: true } },
+    { ...DECLARED_OBSERVABILITY, traces: { enabled: false } },
+  ]) {
+    assert.equal(verifyDeclared(snapshot, declaration).ok, true, JSON.stringify(declaration));
+  }
+  for (const declaration of [
+    { ...DECLARED_OBSERVABILITY, logs: { persist: false } },
+    { ...DECLARED_OBSERVABILITY, logs: { invocation_logs: false } },
+    { ...DECLARED_OBSERVABILITY, traces: { enabled: true } },
+    { ...DECLARED_OBSERVABILITY, traces: { destinations: [] } },
+  ]) {
+    assert.equal(verifyDeclared(snapshot, declaration).code, "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_DRIFT", JSON.stringify(declaration));
+  }
+  // A declared field the live response omits is still drift.
+  const sparse = liveSnapshot(DECLARED_OBSERVABILITY);
+  assert.equal(verifyDeclared(sparse, { ...DECLARED_OBSERVABILITY, logs: { persist: true } }).code,
+    "PRODUCTION_LIVE_CONFIG_CONFIG_SETTINGS_DRIFT");
+  assert.equal(verifyDeclared(sparse, DECLARED_OBSERVABILITY).ok, true);
 });

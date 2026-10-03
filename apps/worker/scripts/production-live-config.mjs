@@ -367,44 +367,105 @@ function normalizeSettings(settings, runtime, versionBindings) {
   };
 }
 
-// The Workers settings API exposes redact_query_string alongside the
-// observability payload, but Wrangler's declarative config does not accept
-// that API-only field. Keep the fields Wrangler can round-trip and deliberately
-// omit the API-only value instead of emitting an invalid config file.
-function normalizeObservability(value) {
-  requiredObject(value, "SETTINGS_INVALID");
+const OBSERVABILITY_KEYS = Object.freeze(["enabled", "head_sampling_rate"]);
+const OBSERVABILITY_SECTIONS = Object.freeze(["logs", "traces"]);
+const OBSERVABILITY_SECTION_KEYS = Object.freeze(["enabled", "head_sampling_rate", "invocation_logs", "persist", "destinations"]);
+// The Workers settings API reports `redact_query_string` beside the
+// observability payload; Wrangler's declarative config cannot set it.
+const OBSERVABILITY_API_ONLY_KEY = "redact_query_string";
+
+/**
+ * Cloudflare's pinned defaults for observability fields a Wrangler config may
+ * leave unset, as the settings API reported them for both the staging edge and
+ * the production Worker on 2026-10-03 (each declaring only
+ * `{ enabled: true, head_sampling_rate: 1 }`). A field the config does not set
+ * compares equal only when the live value is exactly this default, and the
+ * section defaults apply only in that observed declaration context. Any other
+ * value, any destination, and any key outside this table stays drift; unknown
+ * keys are refused when the snapshot is normalized.
+ */
+const OBSERVABILITY_API_DEFAULTS = Object.freeze({ [OBSERVABILITY_API_ONLY_KEY]: false });
+const OBSERVABILITY_SECTION_DEFAULTS = Object.freeze({
+  logs: Object.freeze({ enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: true }),
+  traces: Object.freeze({ enabled: false, head_sampling_rate: 1, persist: true }),
+});
+
+/**
+ * Canonicalize an observability object. Every key is closed: an unknown
+ * top-level or section key fails rather than being dropped. The API-only
+ * `redact_query_string` is accepted only from a live inventory, and is kept
+ * in the canonical form unless it is exactly its pinned default (the form
+ * Wrangler can round-trip), so any other value remains visible as drift.
+ */
+function normalizeObservability(value, { code = "SETTINGS_INVALID", apiOnly = true } = {}) {
+  requiredObject(value, code);
+  const allowed = [...OBSERVABILITY_KEYS, ...OBSERVABILITY_SECTIONS, ...(apiOnly ? [OBSERVABILITY_API_ONLY_KEY] : [])];
+  if (Object.keys(value).some((key) => !allowed.includes(key))) fail(code);
   const result = {};
-  for (const key of ["enabled", "head_sampling_rate"]) {
+  for (const key of OBSERVABILITY_KEYS) {
     if (value[key] !== undefined) {
       result[key] = key === "enabled"
-        ? requiredBoolean(value[key], "SETTINGS_INVALID")
-        : normalizedSamplingRate(value[key]);
+        ? requiredBoolean(value[key], code)
+        : normalizedSamplingRate(value[key], code);
     }
   }
-  for (const section of ["logs", "traces"]) {
+  for (const section of OBSERVABILITY_SECTIONS) {
     if (value[section] === undefined) continue;
-    const source = requiredObject(value[section], "SETTINGS_INVALID");
+    const source = requiredObject(value[section], code);
+    if (Object.keys(source).some((key) => !OBSERVABILITY_SECTION_KEYS.includes(key))) fail(code);
     const target = {};
-    for (const key of ["enabled", "head_sampling_rate", "invocation_logs", "persist", "destinations"]) {
+    for (const key of OBSERVABILITY_SECTION_KEYS) {
       if (source[key] === undefined) continue;
       if (key === "enabled" || key === "invocation_logs" || key === "persist") {
-        target[key] = requiredBoolean(source[key], "SETTINGS_INVALID");
+        target[key] = requiredBoolean(source[key], code);
       } else if (key === "head_sampling_rate") {
-        if (typeof source[key] !== "number" || !Number.isFinite(source[key])
-            || source[key] < 0 || source[key] > 1) fail("SETTINGS_INVALID");
-        target[key] = source[key];
+        target[key] = normalizedSamplingRate(source[key], code);
       } else {
-        target[key] = normalizeStringArray(source[key], "SETTINGS_INVALID");
+        target[key] = normalizeStringArray(source[key], code);
       }
     }
     result[section] = target;
   }
+  if (apiOnly && value[OBSERVABILITY_API_ONLY_KEY] !== undefined) {
+    const apiValue = requiredBoolean(value[OBSERVABILITY_API_ONLY_KEY], code);
+    if (apiValue !== OBSERVABILITY_API_DEFAULTS[OBSERVABILITY_API_ONLY_KEY]) {
+      result[OBSERVABILITY_API_ONLY_KEY] = apiValue;
+    }
+  }
   return result;
 }
 
-function normalizedSamplingRate(value) {
+/**
+ * A candidate config's observability as the live settings API would report
+ * it: each section field the config leaves unset takes the live value only
+ * when that value is exactly the pinned default. Declared fields, non-default
+ * values and unlisted keys are left alone, so they still compare exactly.
+ */
+function observabilityWithPinnedDefaults(declared, live) {
+  if (declared.enabled !== true || declared.head_sampling_rate !== 1 || !object(live)) return declared;
+  const result = { ...declared };
+  for (const section of OBSERVABILITY_SECTIONS) {
+    if (!object(live[section])) continue;
+    const defaults = OBSERVABILITY_SECTION_DEFAULTS[section];
+    const target = { ...(declared[section] ?? {}) };
+    for (const [key, value] of Object.entries(live[section])) {
+      if (!own(target, key) && own(defaults, key) && defaults[key] === value) target[key] = value;
+    }
+    if (declared[section] !== undefined || Object.keys(target).length > 0) result[section] = target;
+  }
+  return normalizeObservability(result, { code: "CONFIG_SETTINGS_INVALID", apiOnly: false });
+}
+
+/** The live observability rendered as Wrangler config, which cannot carry the API-only key. */
+function observabilityConfig(observability) {
+  const config = cloneJson(observability);
+  delete config[OBSERVABILITY_API_ONLY_KEY];
+  return config;
+}
+
+function normalizedSamplingRate(value, code = "SETTINGS_INVALID") {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
-    fail("SETTINGS_INVALID");
+    fail(code);
   }
   return value;
 }
@@ -689,7 +750,10 @@ function candidateComparable({ config, snapshot }) {
       : cloneJson(environment.placement, "CONFIG_SETTINGS_INVALID"),
     tail_consumers: cloneJson(environment.tail_consumers, "CONFIG_SETTINGS_INVALID"),
     logpush: requiredBoolean(environment.logpush, "CONFIG_SETTINGS_INVALID"),
-    observability: normalizeObservability(environment.observability),
+    observability: observabilityWithPinnedDefaults(
+      normalizeObservability(environment.observability, { code: "CONFIG_SETTINGS_INVALID", apiOnly: false }),
+      snapshot.settings.observability,
+    ),
   };
   return {
     bindings: actualBindings,
@@ -869,7 +933,7 @@ export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceComm
     compatibility_flags: normalized.runtime.compatibility_flags,
     limits: cloneJson(normalized.runtime.limits),
     cache: cloneJson(normalized.runtime.cache_options),
-    observability: cloneJson(normalized.settings.observability),
+    observability: observabilityConfig(normalized.settings.observability),
     logpush: normalized.settings.logpush,
     tail_consumers: cloneJson(normalized.settings.tail_consumers),
     routes: routeConfig(normalized),
