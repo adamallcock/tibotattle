@@ -18,7 +18,7 @@ test("before precedes spawn, during is drained, and after follows child exit", a
   const { result, evidence } = await measured;
   assert.equal(result, 0); assert.equal(cancelled, true);
   assert.deepEqual(order, ["refresh-before", "spawn", "refresh-during-1", "exit", "during-drained", "refresh-after"]);
-  assert.equal(evidence.scope, "refresh-child-only"); assert.equal(evidence.during.length, 1);
+  assert.equal(evidence.scope, "refresh-child-window"); assert.equal(evidence.during.length, 1);
 });
 test("before failure prevents child spawn and child failure retains its identity after cleanup", async () => {
   const failure = new Error("synthetic failure"); let spawned = false;

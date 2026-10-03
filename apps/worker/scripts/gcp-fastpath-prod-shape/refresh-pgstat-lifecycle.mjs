@@ -41,6 +41,9 @@ export async function refreshPgStatLifecycle({ run, snapshot = null, intervalMs 
   let after;
   try { after = await snapshot("refresh-after"); } catch (error) { if (!failed) throw error; }
   if (failed) throw failure;
-  return { result, evidence: { scope: "refresh-child-only", childStartedAt, childExitedAt, intervalMs, maxDuring,
+  return { result, evidence: { scope: "refresh-child-window",
+    limitations: ["diagnostic queries included", "IO and WAL counters are cluster-wide",
+      "ranked statement retention may omit prior rows", "statement reset continuity is not independently established"],
+    childStartedAt, childExitedAt, intervalMs, maxDuring,
     saturated: attempted >= maxDuring, before, during, after, delta: pgStatDelta(before, after), errors } };
 }
