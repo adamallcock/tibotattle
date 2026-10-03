@@ -117,6 +117,11 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/analytics-refresh-worker.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker.mjs" }),
   // MEAS-SYNTH: the refresh Job's opt-in CPU profiler (refused under a production target).
   Object.freeze({ source: "cloud-run/analytics-refresh-profile.mjs", destination: "apps/worker/cloud-run/analytics-refresh-profile.mjs" }),
+  // Runtime imports of the local-only isolate profiler must be present even
+  // when diagnostics are disabled; checks/conformance fixtures stay outside.
+  Object.freeze({ source: "cloud-run/analytics-refresh-worker-profile.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker-profile.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-allocation-profile.mjs", destination: "apps/worker/cloud-run/analytics-refresh-allocation-profile.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-memory-profile.mjs", destination: "apps/worker/cloud-run/analytics-refresh-memory-profile.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-kernel-closure.mjs", destination: "apps/worker/cloud-run/analytics-kernel-closure.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-fast-pricer-binding.mjs", destination: "apps/worker/cloud-run/analytics-fast-pricer-binding.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
