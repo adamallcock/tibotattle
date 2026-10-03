@@ -16,7 +16,9 @@ import {
   QUIESCENCE_MAX_REFS,
   QUIESCENCE_PHASES,
   QUIESCENCE_SOURCE_ROLES,
+  QUIESCENCE_MAX_ARMS_PER_STATEMENT,
   QUIESCENCE_STATEMENTS,
+  QUIESCENCE_STATEMENT_LAYOUT,
   QuiescenceCheckError,
   describeQuiescenceQueries,
   evaluateQuiescence,
@@ -178,9 +180,22 @@ function envelope(rows) {
   return JSON.stringify([{ results: rows, success: true, meta: {} }]);
 }
 
-/** What `wrangler d1 execute --json` would answer for the printed statement of a role. */
+/** Wrangler's JSON numbers: SQLite's big integers as plain numbers. */
+function jsonRows(rows) {
+  return rows.map(row => ({ ...row, v: typeof row.v === "bigint" ? Number(row.v) : row.v }));
+}
+
+/** Every part of a role, run read-only on one file: all of the role's fact rows. */
+function roleRows(path, role) {
+  return QUIESCENCE_STATEMENTS[role].flatMap(sql => rowsOf(path, sql));
+}
+
+/**
+ * What the owner saves for a role: `wrangler d1 execute --json` for each
+ * printed part, merged into one array (`jq -s add`), one envelope per part.
+ */
 function wranglerOutput(role, path) {
-  return envelope(rowsOf(path, QUIESCENCE_STATEMENTS[role]).map(row => ({ ...row, v: typeof row.v === "bigint" ? Number(row.v) : row.v })));
+  return JSON.stringify(QUIESCENCE_STATEMENTS[role].flatMap(sql => JSON.parse(envelope(jsonRows(rowsOf(path, sql))))));
 }
 
 async function resultFile(text) {
@@ -207,27 +222,63 @@ after(async () => {
   await world?.dispose();
 });
 
-test("the statements are one read-only SELECT per role, built from the importer's own predicates", () => {
+test("the statements are read-only SELECTs of at most five arms, built from the importer's own predicates", () => {
   assert.deepEqual(Object.keys(QUIESCENCE_STATEMENTS), [...QUIESCENCE_SOURCE_ROLES]);
+  // D1 refuses 18-19 arms ("too many terms in compound SELECT") and accepts 5 (provider check 2026-10-02).
+  assert.equal(QUIESCENCE_MAX_ARMS_PER_STATEMENT, 5);
+  assert.deepEqual(Object.fromEntries(QUIESCENCE_SOURCE_ROLES.map(role => [role,
+    QUIESCENCE_STATEMENTS[role].map(sql => sql.split("\nUNION ALL ").length)])),
+  { ingestion: [5, 5, 5, 4], "deletion-ledger": [5], analytics: [4, 2] });
   for (const role of QUIESCENCE_SOURCE_ROLES) {
-    assert.equal(assertSelectOnly(QUIESCENCE_STATEMENTS[role]), QUIESCENCE_STATEMENTS[role], role);
-    assert.ok(Buffer.byteLength(QUIESCENCE_STATEMENTS[role]) < 4096, `${role}: a statement an owner can paste`);
+    for (const [index, sql] of QUIESCENCE_STATEMENTS[role].entries()) {
+      assert.equal(assertSelectOnly(sql), sql, role);
+      assert.ok(Buffer.byteLength(sql) < 4096, `${role}: a statement an owner can paste`);
+      // The layout names exactly the arms the part holds, and only the UNION ALL joins them.
+      assert.equal((sql.match(/\bUNION\b/gu) ?? []).length, QUIESCENCE_STATEMENT_LAYOUT[role][index].length - 1);
+      assert.ok(QUIESCENCE_STATEMENT_LAYOUT[role][index].length <= QUIESCENCE_MAX_ARMS_PER_STATEMENT);
+    }
+  }
+  // Facts the consistency checks relate share a part (only the six participant counts cannot).
+  const partOf = (role, id) => QUIESCENCE_STATEMENT_LAYOUT[role].findIndex(part => part.includes(id));
+  for (const [role, ids] of [
+    ["ingestion", ["participants/total", "participants/not_quiescent", "participants/not_active", "participants/deletion_fenced",
+      "participants/deleting"]],
+    ["ingestion", ["owner_links/total", "owner_links/erased", "owner_links/withdrawn"]],
+    ["ingestion", ["quarantine/total", "quarantine/registered", "quarantine/deleting", "quarantine/oldest_registered_at"]],
+    ["ingestion", ["correction/runtime_rows", "correction/runtime_state"]],
+    ["ingestion", ["journal", "journal_terminal"]],
+    ["deletion-ledger", ["erasure_jobs/total", "erasure_jobs/pending", "erasure_jobs/complete", "erasure_jobs/pending_participants"]],
+    ["analytics", ["delivery/cursor_rows", "delivery_cursor"]],
+    ["analytics", ["delivery/terminal_rows", "delivery_terminal"]],
+    ["analytics", ["delivery/queue_rows", "delivery_queue"]],
+  ]) {
+    assert.equal(new Set(ids.map(id => partOf(role, id))).size, 1, ids.join());
+    assert.ok(partOf(role, ids[0]) >= 0, ids[0]);
   }
   // PT-3's refusal predicate and its two disjuncts are the exported ones, verbatim.
   assert.equal(PARTICIPANT_NOT_QUIESCENT_PREDICATE,
     `${PARTICIPANT_NOT_ACTIVE_PREDICATE} OR ${PARTICIPANT_DELETION_FENCED_PREDICATE}`);
   assert.equal(PARTICIPANT_NOT_ACTIVE_PREDICATE, "state IS NOT 'active'");
   assert.equal(PARTICIPANT_DELETION_FENCED_PREDICATE, "deletion_session_id IS NOT NULL");
-  const ingestion = QUIESCENCE_STATEMENTS.ingestion;
+  const ingestion = QUIESCENCE_STATEMENTS.ingestion.join("\n");
   assert.ok(ingestion.includes(`FROM participants WHERE ${PARTICIPANT_NOT_QUIESCENT_PREDICATE}\n`));
   assert.ok(ingestion.includes(`FROM participants WHERE ${PARTICIPANT_NOT_ACTIVE_PREDICATE}\n`));
   assert.ok(ingestion.includes(`FROM participants WHERE ${PARTICIPANT_DELETION_FENCED_PREDICATE}\n`));
   // The documented read-only mode runs exactly these statements.
   const printed = JSON.parse(describeQuiescenceQueries());
   assert.equal(printed.schema, CUTOVER_QUIESCENCE_QUERIES_SCHEMA);
+  assert.equal(printed.schema, "tibotattle-cutover-quiescence-queries-v2");
+  assert.equal(printed.maxArmsPerStatement, QUIESCENCE_MAX_ARMS_PER_STATEMENT);
   assert.deepEqual(printed.queries.map(item => item.role), [...QUIESCENCE_SOURCE_ROLES]);
-  for (const item of printed.queries) assert.equal(item.sql, QUIESCENCE_STATEMENTS[item.role]);
-  assert.equal(describeQuiescenceQueries({ role: "deletion-ledger", sql: true }), QUIESCENCE_STATEMENTS["deletion-ledger"]);
+  for (const item of printed.queries) {
+    assert.deepEqual(item.parts.map(entry => entry.sql), [...QUIESCENCE_STATEMENTS[item.role]]);
+    assert.deepEqual(item.parts.map(entry => entry.part), QUIESCENCE_STATEMENTS[item.role].map((_, index) => index + 1));
+    assert.deepEqual(item.parts.map(entry => entry.arms), QUIESCENCE_STATEMENT_LAYOUT[item.role].map(part => part.length));
+  }
+  assert.equal(describeQuiescenceQueries({ role: "deletion-ledger", sql: true, part: 1 }), QUIESCENCE_STATEMENTS["deletion-ledger"][0]);
+  for (const part of [undefined, 0, 2, 1.5]) {
+    assert.throws(() => describeQuiescenceQueries({ role: "deletion-ledger", sql: true, part }), isCode("QUIESCENCE_ARGUMENT_INVALID"));
+  }
 });
 
 test("the predicates are imported, never copied: PT-3 builds its refusal from the exported constant", () => {
@@ -637,8 +688,8 @@ test("analytics delivery states what it covers: the drain proof's other reasons 
   // The statements read what the Worker's own helpers and the proof read.
   const authority = readFileSync(join(WORKER_ROOT, "src", "storage-community-authority.ts"), "utf8").replace(/\s+/gu, " ");
   const flat = (text) => text.replace(/\s+/gu, " ");
-  const ingestionSql = flat(QUIESCENCE_STATEMENTS.ingestion);
-  const analyticsSql = flat(QUIESCENCE_STATEMENTS.analytics);
+  const ingestionSql = flat(QUIESCENCE_STATEMENTS.ingestion.join(" "));
+  const analyticsSql = flat(QUIESCENCE_STATEMENTS.analytics.join(" "));
   const sourceTerminal = "SELECT COALESCE(MAX(public_authority_epoch),0) AS epoch FROM storage_ingestion_changes "
     + "WHERE kind IN('owner-withdrawn','owner-erased')";
   assert.ok(authority.includes(sourceTerminal), "readStorageCommunitySourceTerminalEpoch still reads this");
@@ -650,7 +701,7 @@ test("analytics delivery states what it covers: the drain proof's other reasons 
 });
 
 test("an ingestion source with no source-state row has no journal to measure and is not-evaluated", async () => {
-  const facts = rowsOf(clean.ingestion, QUIESCENCE_STATEMENTS.ingestion)
+  const facts = roleRows(clean.ingestion, "ingestion")
     .filter(row => row.c !== "journal" && row.c !== "journal_terminal");
   const report = evaluateQuiescence({ mode: "wrangler-results", phase: POST, now: NOW, facts: {
     ingestion: normalizeQuiescenceFacts("ingestion", facts),
@@ -940,6 +991,12 @@ test("arguments are closed", async () => {
   for (const argv of [[], ["bogus"], ["check", "--ingestion"], ["check", "--ingestion", "--ledger", "x"],
     ["check", "--ingestion", "a", "--ingestion", "b"], ["check", "--nope", "a"], ["check", "--ingestion-result", "a"],
     ["evaluate", "--ingestion", "a"], ["queries", "--role", "catchup"], ["queries", "--sql"], ["queries", "--role", "ingestion", "--sql", "--sql"],
+    // Bare SQL is one part: --sql and --part go together, and the part exists.
+    ["queries", "--role", "ingestion", "--sql"], ["queries", "--role", "ingestion", "--part", "1"],
+    ["queries", "--sql", "--part", "1"], ["queries", "--role", "ingestion", "--sql", "--part", "0"],
+    ["queries", "--role", "ingestion", "--sql", "--part", "5"], ["queries", "--role", "deletion-ledger", "--sql", "--part", "2"],
+    ["queries", "--role", "analytics", "--sql", "--part", "01"], ["queries", "--role", "analytics", "--sql", "--part", "x"],
+    ["queries", "--role", "analytics", "--sql", "--part", "1", "--part", "2"],
     ["check", "--sql"],
     // The phase has no default, is closed, repeats nowhere, and belongs to check and evaluate only.
     ["check", "--ingestion", "a"], ["evaluate", "--ingestion-result", "a"], ["check", "--phase", "soon", "--ingestion", "a"],
@@ -953,8 +1010,9 @@ test("arguments are closed", async () => {
     { command: "evaluate", phase: "post-fence", ingestion: "a" });
   assert.deepEqual(parseQuiescenceArguments(["check", "--phase", "post-fence", "--seal", "m.json", "--seal-id", "0".repeat(64)]),
     { command: "check", phase: "post-fence", seal: "m.json", sealId: "0".repeat(64) });
-  assert.deepEqual(parseQuiescenceArguments(["queries", "--role", "analytics", "--sql"]),
-    { command: "queries", role: "analytics", sql: true });
+  assert.deepEqual(parseQuiescenceArguments(["queries", "--role", "analytics", "--sql", "--part", "2"]),
+    { command: "queries", role: "analytics", sql: true, part: 2 });
+  assert.deepEqual(parseQuiescenceArguments(["queries", "--role", "analytics"]), { command: "queries", role: "analytics" });
 });
 
 // ---------------------------------------------------------------------------
@@ -962,12 +1020,17 @@ test("arguments are closed", async () => {
 
 test("the printed statements, run read-only, give the same report as the SQLite mode, minus the local-hashing check", async () => {
   const printed = JSON.parse(cli(["queries"]).stdout);
-  for (const item of printed.queries) assert.equal(item.sql, QUIESCENCE_STATEMENTS[item.role]);
+  for (const item of printed.queries) assert.deepEqual(item.parts.map(entry => entry.sql), [...QUIESCENCE_STATEMENTS[item.role]]);
   for (const role of QUIESCENCE_SOURCE_ROLES) {
-    const bare = cli(["queries", "--role", role, "--sql"]);
-    assert.equal(bare.status, 0);
-    assert.equal(bare.stdout, `${QUIESCENCE_STATEMENTS[role]}\n`);
-    assert.equal(assertSelectOnly(bare.stdout.trimEnd()), QUIESCENCE_STATEMENTS[role]);
+    for (const [index, sql] of QUIESCENCE_STATEMENTS[role].entries()) {
+      const bare = cli(["queries", "--role", role, "--sql", "--part", String(index + 1)]);
+      assert.equal(bare.status, 0);
+      assert.equal(bare.stdout, `${sql}\n`);
+      assert.equal(assertSelectOnly(bare.stdout.trimEnd()), sql);
+    }
+    const beyond = cli(["queries", "--role", role, "--sql", "--part", String(QUIESCENCE_STATEMENTS[role].length + 1)]);
+    assert.equal(beyond.status, 1);
+    assert.equal(beyond.stdout, "");
   }
 
   const sources = { ingestion: clean.ingestion, "deletion-ledger": clean.ledger, analytics: clean.analytics };
@@ -1012,17 +1075,38 @@ test("the printed statements, run read-only, give the same report as the SQLite 
   }
 });
 
-test("a statement cut at its UNION ALL boundaries gives the same facts when its parts' outputs are merged", async () => {
+test("the printed parts' outputs, merged in any order, give the facts of the role's arms read all at once", async () => {
   const sources = { ingestion: clean.ingestion, "deletion-ledger": clean.ledger, analytics: clean.analytics };
   for (const [role, path] of Object.entries(sources)) {
-    const arms = QUIESCENCE_STATEMENTS[role].split("\nUNION ALL ");
+    const arms = QUIESCENCE_STATEMENTS[role].flatMap(sql => sql.split("\nUNION ALL "));
     assert.ok(arms.length >= 2, role);
-    const whole = parseWranglerQuiescenceResult(role, wranglerOutput(role, path));
+    // SQLite has no five-arm limit: one compound SELECT of every arm is the reference.
+    const whole = normalizeQuiescenceFacts(role, jsonRows(rowsOf(path, arms.join("\nUNION ALL "))));
+    const printed = parseWranglerQuiescenceResult(role, wranglerOutput(role, path));
+    const reversed = parseWranglerQuiescenceResult(role, JSON.stringify(JSON.parse(wranglerOutput(role, path)).reverse()));
+    assert.equal(JSON.parse(wranglerOutput(role, path)).length, QUIESCENCE_STATEMENTS[role].length, "one envelope per part");
+    for (const read of [printed, reversed, readQuiescenceFacts(role, new DatabaseSync(path, { readOnly: true }))]) {
+      for (const family of ["journal", "journal_terminal", "delivery_cursor", "delivery_queue", "delivery_terminal"]) {
+        assert.deepEqual([...(read.family(family) ?? [])], [...(whole.family(family) ?? [])], `${role} ${family}`);
+      }
+      for (const [c, k] of [["participants", "total"], ["participants", "state_unrecognized"], ["quarantine", "oldest_registered_at"],
+        ["correction", "runtime_state"], ["correction", "history"], ["erasure_jobs", "total"], ["tombstones", "total"],
+        ["delivery", "cursor_rows"], ["delivery", "queue_rows"]]) {
+        assert.equal(read.get(c, k), whole.get(c, k), `${role} ${c}/${k}`);
+      }
+    }
+    // A part left out, or a part saved twice, is refused: every fact exactly once.
+    const parts = JSON.parse(wranglerOutput(role, path));
+    if (parts.length > 1) {
+      assert.throws(() => parseWranglerQuiescenceResult(role, JSON.stringify(parts.slice(1))), isCode("QUIESCENCE_FACT_MISSING"), role);
+    }
+    assert.throws(() => parseWranglerQuiescenceResult(role, JSON.stringify([...parts, parts.at(-1)])),
+      isCode("QUIESCENCE_FACT_DUPLICATE"), role);
+    // Any other cut at a UNION ALL merges to the same facts too: every arm names its own c, k and v.
     for (const cut of [1, Math.ceil(arms.length / 2), arms.length - 1]) {
-      const parts = [arms.slice(0, cut), arms.slice(cut)].map(group => group.join("\nUNION ALL "));
-      for (const part of parts) assert.equal(assertSelectOnly(part), part, "each part is a read-only SELECT of its own");
-      const merged = JSON.stringify(parts.flatMap(part => JSON.parse(envelope(rowsOf(path, part).map(row => ({ ...row,
-        v: typeof row.v === "bigint" ? Number(row.v) : row.v }))))));
+      const halves = [arms.slice(0, cut), arms.slice(cut)].map(group => group.join("\nUNION ALL "));
+      for (const half of halves) assert.equal(assertSelectOnly(half), half, "each part is a read-only SELECT of its own");
+      const merged = JSON.stringify(halves.flatMap(half => JSON.parse(envelope(jsonRows(rowsOf(path, half))))));
       const split = parseWranglerQuiescenceResult(role, merged);
       for (const family of ["journal", "delivery_cursor"]) assert.deepEqual([...(split.family(family) ?? [])], [...(whole.family(family) ?? [])]);
       for (const [c, k] of [["participants", "total"], ["quarantine", "oldest_registered_at"], ["correction", "runtime_state"],
@@ -1035,14 +1119,15 @@ test("a statement cut at its UNION ALL boundaries gives the same facts when its 
 
 test("saved output that is not the closed answer of the printed statement is refused", async () => {
   const good = JSON.parse(wranglerOutput("ingestion", clean.ingestion));
-  const rows = good[0].results;
+  const rows = good.flatMap(part => part.results);
   const refusals = [
     ["not JSON", "{", "QUIESCENCE_RESULT_INVALID"],
     ["not an array", JSON.stringify({ results: rows, success: true }), "QUIESCENCE_RESULT_INVALID"],
-    ["the same part twice", JSON.stringify([good[0], good[0]]), "QUIESCENCE_FACT_DUPLICATE"],
+    ["the same part twice", JSON.stringify([...good, good[0]]), "QUIESCENCE_FACT_DUPLICATE"],
     ["no result", "[]", "QUIESCENCE_RESULT_INVALID"],
     ["nine results", JSON.stringify(Array.from({ length: 9 }, () => ({ success: true, results: [] }))), "QUIESCENCE_RESULT_INVALID"],
-    ["one failed part", JSON.stringify([good[0], { success: false, results: [] }]), "QUIESCENCE_RESULT_INVALID"],
+    ["one failed part", JSON.stringify([...good, { success: false, results: [] }]), "QUIESCENCE_RESULT_INVALID"],
+    ["unmerged parts (jq -s without add)", JSON.stringify(good.map(part => [part])), "QUIESCENCE_RESULT_INVALID"],
     ["success false", JSON.stringify([{ ...good[0], success: false }]), "QUIESCENCE_RESULT_INVALID"],
     ["results not an array", JSON.stringify([{ success: true, results: "x" }]), "QUIESCENCE_RESULT_INVALID"],
     ["a missing fact", envelope(rows.filter(row => !(row.c === "correction" && row.k === "facts"))), "QUIESCENCE_FACT_MISSING"],
@@ -1074,7 +1159,7 @@ test("saved output that is not the closed answer of the printed statement is ref
   }
   assert.throws(() => parseWranglerQuiescenceResult("analytics", wranglerOutput("ingestion", clean.ingestion)),
     isCode("QUIESCENCE_FACT_UNKNOWN"), "a role's output is not another role's");
-  const analyticsRows = JSON.parse(wranglerOutput("analytics", clean.analytics))[0].results;
+  const analyticsRows = JSON.parse(wranglerOutput("analytics", clean.analytics)).flatMap(part => part.results);
   assert.throws(() => parseWranglerQuiescenceResult("analytics", envelope(analyticsRows.map(row => (row.c === "delivery" ? { ...row, v: 4 } : row)))),
     isCode("QUIESCENCE_FACT_INCONSISTENT"), "the cursor row count must equal the rows listed");
   assert.throws(() => normalizeQuiescenceFacts("catchup", []), isCode("QUIESCENCE_ARGUMENT_INVALID"));

@@ -189,22 +189,32 @@ the quiescence statements, and plan; no write). `owner`.
    late costs a full extra fence cycle. Run the read-only quiescence check
    (E-QUIESCE) with `--phase pre-fence`. It gates on mid-erasure participants,
    tombstoned participants and pending erasure jobs, and prints counts and
-   opaque references only. From `apps/worker`, print each role's statement
-   (`ingestion`, `deletion-ledger`, `analytics`), run it through a read-only
-   `wrangler d1 execute <database> --remote --json --command "<statement>"`
-   with the owner's read-only credentials in the environment, save the output
-   privately, and evaluate it (the script's header has the exact commands):
+   opaque references only. D1 refuses a compound SELECT of 18 or 19 arms
+   ("too many terms in compound SELECT", 7500) and accepts 5 (provider check
+   2026-10-02), so each role's statement is printed in parts of at most five
+   arms: `ingestion` 4 parts, `deletion-ledger` 1, `analytics` 2. From
+   `apps/worker`, run each part through a read-only
+   `wrangler d1 execute <database> --remote --json --command "<part>"` with
+   the owner's read-only credentials in the environment, save each output
+   privately, merge each role's parts into one array, and evaluate (the
+   script's header has the exact commands):
 
    ```bash
-   node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql
+   node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql --part 1
+   jq -s add <ingestion part 1> <part 2> <part 3> <part 4> > <private ingestion result>
    node scripts/cutover-quiescence-check.mjs evaluate --phase pre-fence --ingestion-result <private file> --ledger-result <private file> --analytics-result <private file>
    ```
 
-   `evaluate` cannot hash, so its best result is exit 3 with only
-   `deletion-digest-intersection` not evaluated; `check` on exported D1 files
-   answers the intersection. Exit 2 (`blocked`): finish the erasure on
-   Cloudflare and rerun; there is no override. `built`, but its statements and
-   the shape of Wrangler's output have not been run against the provider.
+   `evaluate` requires every fact exactly once across the merged parts, so a
+   missing or repeated part is refused. Parts read separate snapshots: on a
+   live source, a `QUIESCENCE_FACT_INCONSISTENT` refusal means a related fact
+   moved between two parts; rerun. `evaluate` cannot hash, so its best result
+   is exit 3 with only `deletion-digest-intersection` not evaluated; `check`
+   on exported D1 files answers the intersection. Exit 2 (`blocked`): finish
+   the erasure on Cloudflare and rerun; there is no override. The provider
+   check of 2026-10-02 ran hand-cut parts of the earlier single statements and
+   merged them (`evaluate` read them: exit 3, nothing blocked); the printed
+   five-arm parts themselves have not yet been run against the provider.
 5. **Inventory and plan the fence.** Neither command needs a fenced Worker,
    and both are read-only, so a refusal here costs nothing. From `apps/worker`,
    with `CLOUDFLARE_API_TOKEN` supplied through the approved credential

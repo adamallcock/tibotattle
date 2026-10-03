@@ -99,32 +99,47 @@
 //               --ingestion <file> [--ledger <file>]   exported D1 SQLite files;
 //               --analytics <file>                     an exported analytics D1.
 //             It also derives opaque references (refs) for the offending rows.
-//   queries   prints the read-only statements, one SELECT per role, that
-//             `check` runs; every one passes the seal transport's
-//             SELECT-only guard (assertSelectOnly).
+//   queries   prints the read-only statements that `check` runs: each role's
+//             facts in parts of at most five UNION ALL arms
+//             (QUIESCENCE_MAX_ARMS_PER_STATEMENT), one SELECT per part; every
+//             one passes the seal transport's SELECT-only guard
+//             (assertSelectOnly).
 //   evaluate  turns the saved output of those statements into the same
 //             report: --ingestion-result, --ledger-result, --analytics-result
-//             name files holding `wrangler d1 execute --json` output. The
+//             name files holding `wrangler d1 execute --json` output, one
+//             role's parts merged into one array (below). The
 //             deletion-digest intersection and the refs need local hashing and
 //             local rows, so this mode reports that check as not-evaluated.
 //
 // Owner-run read-only Wrangler mode (documented only; this script never runs
-// Wrangler). From apps/worker, with the owner's own read-only credentials in
-// the environment (never on a command line) and the production database
-// names, once per role:
+// Wrangler). D1 refuses a compound SELECT of 18 or 19 UNION ALL arms ("too many
+// terms in compound SELECT", code 7500) and accepts 5 (provider check
+// 2026-10-02, receipts/quiesce-prefence-20261002), so each role's facts are
+// printed in parts of at most five arms: ingestion 4 parts, deletion-ledger 1,
+// analytics 2 (`queries` with no --sql lists them). Facts that the consistency
+// checks relate sit in one part where five arms allow; only the participant
+// counts (six facts) span two parts. From apps/worker, with the owner's own
+// read-only credentials in the environment (never on a command line) and the
+// production database names, once per part:
 //
-//   node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql
 //   npx wrangler d1 execute <ingestion-database-name> --config <a wrangler config naming it> \
 //     --remote --json \
-//     --command "$(node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql)" \
-//     > ingestion-result.json
+//     --command "$(node scripts/cutover-quiescence-check.mjs queries --role ingestion --sql --part 1)" \
+//     > ingestion-part-1.json
 //
-// and likewise `--role deletion-ledger` and `--role analytics`. Each statement
-// is a single SELECT of about twenty UNION ALL arms. Whether D1 accepts a
-// compound SELECT that size has not been verified against the provider: if it
-// refuses, split the statement at any UNION ALL (every arm names its own c, k
-// and v columns), run the parts, and merge their outputs into one JSON array
-// (jq -s add part-1.json part-2.json) before `evaluate`. Then:
+// and parts 2 to 4, then `--role deletion-ledger` (part 1) and `--role
+// analytics` (parts 1 and 2). Merge each role's part outputs into one JSON
+// array, in any order:
+//
+//   jq -s add ingestion-part-1.json ingestion-part-2.json ingestion-part-3.json \
+//     ingestion-part-4.json > ingestion-result.json
+//
+// `evaluate` reads that merged array (at most eight parts): it takes the rows
+// of every part together and still requires every fact exactly once, so a
+// missing or repeated part is refused (QUIESCENCE_FACT_MISSING,
+// QUIESCENCE_FACT_DUPLICATE). Parts run as separate commands read separate
+// snapshots of a live source: a relation between facts of two parts that
+// moved in between is refused as QUIESCENCE_FACT_INCONSISTENT; rerun. Then:
 //
 //   node scripts/cutover-quiescence-check.mjs evaluate --phase pre-fence \
 //     --ingestion-result ingestion-result.json \
@@ -167,7 +182,7 @@ import {
 } from "./postgres-identity-authority-transfer.mjs";
 
 export const CUTOVER_QUIESCENCE_REPORT_SCHEMA = "tibotattle-cutover-quiescence-report-v1";
-export const CUTOVER_QUIESCENCE_QUERIES_SCHEMA = "tibotattle-cutover-quiescence-queries-v1";
+export const CUTOVER_QUIESCENCE_QUERIES_SCHEMA = "tibotattle-cutover-quiescence-queries-v2";
 export const QUIESCENCE_SOURCE_ROLES = Object.freeze(["ingestion", "deletion-ledger", "analytics"]);
 /** The phase of the cutover a run belongs to; it decides which checks gate (see GATES). */
 export const QUIESCENCE_PHASES = Object.freeze(["pre-fence", "post-fence"]);
@@ -235,9 +250,9 @@ export function opaqueRef(kind, value) {
 }
 
 // ---------------------------------------------------------------------------
-// The statements: one SELECT per role, a UNION ALL of (c, k, v) facts. A single
-// statement is one snapshot of the source, and one statement is all an owner has
-// to run by hand. A table that is absent fails the whole statement (fail loud).
+// The statements: per role, a UNION ALL of (c, k, v) facts, cut into parts of at
+// most QUIESCENCE_MAX_ARMS_PER_STATEMENT arms (D1's compound-SELECT limit; see
+// the header). A table that is absent fails its part (fail loud).
 
 const PARTICIPANT_STATE_LIST = CUTOVER_PARTICIPANT_STATES.map(state => `'${state}'`).join(", ");
 
@@ -313,17 +328,61 @@ const ROLE_DEFINITIONS = Object.freeze({
   analytics: Object.freeze({ facts: ANALYTICS_FACTS, dynamic: ANALYTICS_DYNAMIC }),
 });
 
-function buildStatement(role) {
+/**
+ * D1 refuses a compound SELECT of 18 or 19 arms and accepts 5 (provider check
+ * 2026-10-02): no printed statement has more arms than this.
+ */
+export const QUIESCENCE_MAX_ARMS_PER_STATEMENT = 5;
+
+/**
+ * Each role's parts, as arm ids: 'c/k' for a static fact, 'c' for a dynamic
+ * family. Facts that assertFactsConsistent relates share a part, so a live
+ * source read part by part cannot disagree with itself across parts, except
+ * the six participant counts, which cannot share one part of five: only
+ * state_unrecognized (zero on a healthy source) sits apart from the others.
+ */
+export const QUIESCENCE_STATEMENT_LAYOUT = Object.freeze({
+  ingestion: Object.freeze([
+    Object.freeze(["participants/total", "participants/not_quiescent", "participants/not_active",
+      "participants/deletion_fenced", "participants/deleting"]),
+    Object.freeze(["participants/state_unrecognized", "owner_links/total", "owner_links/erased", "owner_links/withdrawn",
+      "correction/history"]),
+    Object.freeze(["quarantine/total", "quarantine/registered", "quarantine/deleting", "quarantine/oldest_registered_at",
+      "correction/facts"]),
+    Object.freeze(["correction/runtime_rows", "correction/runtime_state", "journal", "journal_terminal"]),
+  ]),
+  "deletion-ledger": Object.freeze([
+    Object.freeze(["erasure_jobs/total", "erasure_jobs/pending", "erasure_jobs/complete", "erasure_jobs/pending_participants",
+      "tombstones/total"]),
+  ]),
+  analytics: Object.freeze([
+    Object.freeze(["delivery/cursor_rows", "delivery_cursor", "delivery/terminal_rows", "delivery_terminal"]),
+    Object.freeze(["delivery/queue_rows", "delivery_queue"]),
+  ]),
+});
+
+function buildStatements(role) {
   const { facts, dynamic } = ROLE_DEFINITIONS[role];
-  const arms = [];
-  for (const [c, k, , value, from] of facts) arms.push(selectArm(`'${c}'`, `'${k}'`, value, from));
-  for (const [c, keyColumn, value, from] of dynamic) arms.push(selectArm(`'${c}'`, keyColumn, value, from));
-  return assertSelectOnly(arms.join("\nUNION ALL "));
+  const arms = new Map();
+  for (const [c, k, , value, from] of facts) arms.set(`${c}/${k}`, selectArm(`'${c}'`, `'${k}'`, value, from));
+  for (const [c, keyColumn, value, from] of dynamic) arms.set(c, selectArm(`'${c}'`, keyColumn, value, from));
+  const layout = QUIESCENCE_STATEMENT_LAYOUT[role];
+  const placed = layout.flat();
+  // The layout places every arm exactly once, in parts of one to five arms.
+  if (placed.length !== arms.size || new Set(placed).size !== placed.length || placed.some(id => !arms.has(id))
+      || layout.some(part => part.length === 0 || part.length > QUIESCENCE_MAX_ARMS_PER_STATEMENT)) {
+    throw new Error(`QUIESCENCE_STATEMENT_LAYOUT_INVALID:${role}`);
+  }
+  return Object.freeze(layout.map(part => assertSelectOnly(part.map(id => arms.get(id)).join("\nUNION ALL "))));
 }
 
-/** The read-only statement a role runs, one SELECT (the seal transport's SELECT-only guard holds). */
+/**
+ * The read-only statements a role runs, in order: one SELECT per part (the
+ * seal transport's SELECT-only guard holds for each). `check` runs them on
+ * local files and `queries` prints them for D1.
+ */
 export const QUIESCENCE_STATEMENTS = Object.freeze(Object.fromEntries(QUIESCENCE_SOURCE_ROLES
-  .map(role => [role, buildStatement(role)])));
+  .map(role => [role, buildStatements(role)])));
 
 // ---------------------------------------------------------------------------
 // Facts: the closed, typed rows a statement returns.
@@ -434,18 +493,23 @@ function readStatement(database, sql, role) {
   }
 }
 
-/** Run a role's statement on an open SQLite database (read-only) and normalise its facts. */
+/**
+ * Run a role's statements on an open SQLite database (read-only) and normalise
+ * their facts together. The file is hash-verified unchanged around the read,
+ * so its parts read one state.
+ */
 export function readQuiescenceFacts(role, database) {
-  return normalizeQuiescenceFacts(role, readStatement(database, QUIESCENCE_STATEMENTS[role], role));
+  if (!Object.hasOwn(QUIESCENCE_STATEMENTS, role)) fail("QUIESCENCE_ARGUMENT_INVALID");
+  return normalizeQuiescenceFacts(role, QUIESCENCE_STATEMENTS[role].flatMap(sql => readStatement(database, sql, role)));
 }
 
 /**
  * Parse the saved output of `wrangler d1 execute <db> --remote --json
  * --command "<statement>"`: the envelope the seal's transport accepts (a
- * result with success true and a results array). Up to eight results are
- * accepted and their rows concatenated, so an owner whose D1 refuses the
- * statement as one compound SELECT can run it in parts (split at a UNION ALL)
- * and merge the outputs; every fact is still required exactly once.
+ * result with success true and a results array). A role's parts, each run as
+ * its own command, are merged into one array (`jq -s add`, any order): up to
+ * eight results are accepted and their rows taken together, and every fact
+ * is still required exactly once, so a missing or repeated part refuses.
  */
 export function parseWranglerQuiescenceResult(role, text) {
   let parsed;
@@ -940,7 +1004,7 @@ const COMMAND_FLAGS = Object.freeze({
     "--ledger": "ledger", "--analytics": "analytics" }),
   evaluate: Object.freeze({ "--phase": "phase", "--ingestion-result": "ingestion", "--ledger-result": "ledger",
     "--analytics-result": "analytics" }),
-  queries: Object.freeze({ "--role": "role" }),
+  queries: Object.freeze({ "--role": "role", "--part": "part" }),
 });
 
 export function parseQuiescenceArguments(argv) {
@@ -971,25 +1035,51 @@ export function parseQuiescenceArguments(argv) {
   }
   if (command === "queries") {
     if (options.role !== undefined && !QUIESCENCE_SOURCE_ROLES.includes(options.role)) fail("QUIESCENCE_ARGUMENT_INVALID");
-    if (options.sql === true && options.role === undefined) fail("QUIESCENCE_ARGUMENT_INVALID");
+    // Bare SQL is one part of one role: --sql needs --role and --part, and --part needs --sql.
+    if ((options.sql === true) !== (options.part !== undefined)) fail("QUIESCENCE_ARGUMENT_INVALID");
+    if (options.sql === true) {
+      if (options.role === undefined || !/^[1-9][0-9]?$/u.test(options.part)
+          || Number(options.part) > QUIESCENCE_STATEMENTS[options.role].length) {
+        fail("QUIESCENCE_ARGUMENT_INVALID");
+      }
+      options.part = Number(options.part);
+    }
   }
   return options;
 }
 
-/** The statements as a document, or one role's bare SQL (for a shell substitution). */
-export function describeQuiescenceQueries({ role, sql = false } = {}) {
-  if (sql) return QUIESCENCE_STATEMENTS[role];
+/**
+ * The statements as a document (each role's parts, numbered from 1, with
+ * their arm counts), or one part's bare SQL (for a shell substitution).
+ */
+export function describeQuiescenceQueries({ role, sql = false, part } = {}) {
+  if (sql) {
+    const statements = QUIESCENCE_STATEMENTS[role];
+    if (statements === undefined || !Number.isSafeInteger(part) || part < 1 || part > statements.length) {
+      fail("QUIESCENCE_ARGUMENT_INVALID");
+    }
+    return statements[part - 1];
+  }
   const roles = role === undefined ? QUIESCENCE_SOURCE_ROLES : [role];
   return JSON.stringify({
     schema: CUTOVER_QUIESCENCE_QUERIES_SCHEMA,
-    queries: roles.map(name => ({ role: name, sql: QUIESCENCE_STATEMENTS[name], sha256: sha256Hex(QUIESCENCE_STATEMENTS[name]) })),
+    maxArmsPerStatement: QUIESCENCE_MAX_ARMS_PER_STATEMENT,
+    queries: roles.map(name => ({
+      role: name,
+      parts: QUIESCENCE_STATEMENTS[name].map((statement, index) => ({
+        part: index + 1,
+        arms: QUIESCENCE_STATEMENT_LAYOUT[name][index].length,
+        sql: statement,
+        sha256: sha256Hex(statement),
+      })),
+    })),
   });
 }
 
 async function main(argv) {
   const options = parseQuiescenceArguments(argv);
   if (options.command === "queries") {
-    const text = describeQuiescenceQueries({ role: options.role, sql: options.sql === true });
+    const text = describeQuiescenceQueries({ role: options.role, sql: options.sql === true, part: options.part });
     process.stdout.write(`${text}\n`);
     return;
   }
