@@ -122,3 +122,68 @@ created for this run and removed afterwards.
 - Who pipes the secret into `identity-rotate-pin` (round 16 says Claude runs
   the secret commands; PT-8 design section 6 says the owner) is an owner
   question.
+
+## Integration into the fast-path final line (2026-10-03)
+
+`claude/gcp-fp-idlink-rotate` at `8a869b40` (with E-PT8 at `c1049565`) was
+merged into `claude/gcp-fastpath-final` from pre-merge head `9c076313`
+(`git merge --no-ff 8a869b40`, merge commit `066876e9`), followed by one
+integration fix commit, `4422cbbe`. Local, synthetic evidence only: macOS
+arm64, Node 26.2.0, and a private throwaway PostgreSQL 17.10 cluster on its
+own socket, created for this run and removed afterwards. Nothing was pushed or
+deployed, and no Wrangler, gcloud or provider call ran.
+
+Conflicts: `apps/worker/package.json` (`postgres:cutover-seal:check` keeps the
+final line's admin history export checks and adds the orchestrator's;
+`postgres:domain:check` keeps the final line's list, without E-RETIRE's
+`analytics-history-transfer` spec, and adds
+`identity-link-rotation-kept-routes`), and H.4 of the cutover runbook (the
+orchestrator's procedure replaces the "not built" steps).
+
+Integration fixes (`4422cbbe`):
+
+- The orchestrator's post-import omitted the analytics D1 admin history export
+  that D-PT4X's second review made mandatory, so a run would refuse
+  `CUTOVER_LEGACY_ARGUMENT_INVALID` after importing every stage.
+  `pt8-inputs.json` gains the closed key `adminHistoryExport`
+  (`{ path, sha256 }`, from H.3 step 6); post-import passes it, and a new
+  read-only preflight check, P15, binds it to the seal, inventory, fence
+  receipt and sealed source (`checkAdminHistoryExportBinding`, the runner's
+  own binding), refusing `CUTOVER_ADMIN_HISTORY_EXPORT_INVALID` or
+  `_MISMATCH` before any write. The E-PT8 receipt's P1 to P14 is now P1 to P15.
+- `dispositionPolicySha256` is pinned at `154244fd…`: only the trigger-policy
+  reason text of the two usage-correction tables differs (D-PT5A's second
+  review). `SCHEDULED_TRIGGER_JOBS`, the desired-state schema literal
+  (`…-desired-state-v2`) and the scheduler probe schema did not change.
+- The D-PT5A spec pinned 19 transfer stages; round 16 makes 20. That pin
+  already failed on `8a869b40` alone (20 stages, pin 19).
+- D-CRB's registry substitute in `postgres-production-host.check.mjs`
+  re-exports `assertIdentityLinkConsumersRetired`, which the boot refusal
+  imports.
+- PROD-PREP's `gcp-identity-link-pin-check.mjs` reads the origin's label, now
+  `production-v2`. Against Cloudflare's D1 pin it reports
+  `KEY_VERSION_MISMATCH` and `FINGERPRINT_MISMATCH` and exits 2, which is the
+  expected round-16 outcome; its tests now say so. It has no rotated mode, so
+  production-apply step 10 and the rollout gate are recorded as open, not
+  passed (the first open gate above, still open).
+
+No migration on either side was staged or added; the primary chain still ends
+at `0070_catalog_manifest_store.sql`.
+
+| Gate on `4422cbbe` (from `apps/worker` unless noted) | Result |
+|---|---|
+| `npm run scripts:check` | exit 0; 1,110 tests, 0 failures |
+| `npm run gcp:ops:infra:check` | exit 0, 336/336 (2 failed at the merge commit: the pin-check label) |
+| `npm run postgres:cutover-seal:check` | exit 0, 129/129 |
+| `npm run catalog:manifest:check` | exit 0, 9/9 |
+| `node --test scripts/postgres-production-transfer.check.mjs` | 24/24 (the policy pin failed at the merge commit) |
+| `node --test scripts/ci-postgres-suite.check.mjs` | 43/43 |
+| `cloud-run`: `npm run check` | exit 0, 419 tests, 0 failures (1 failed at the merge commit: the registry substitute) |
+| `vitest run --config vitest.postgres.config.ts` (private PG17) | 14 files, 101 passed, 1 skipped, as on INT-D; the D-PT5A spec's stage count then passed 22/22 alone after its fix |
+| `vitest run … postgres-production-transfer.spec.mjs` (private PG17) | 5/5 |
+| `node --test --test-concurrency=1` on `identity-link-rotation-kept-routes`, `analytics-v2-refresh`, `postgres-production-host`, `postgres-transfer-target`, `catalog-manifest-store` specs (private PG17) | 1/1, 51/51, 8/8, 18/18, 10/10 |
+| root: `npm run architecture:check`, `npm run test:preflight` | pass; 958 files, 21/21 |
+
+Still open after the integration: a rotated mode for the pin check; the
+orchestrator inputs in the PT-8 design (outside this repository) do not yet
+list `adminHistoryExport`; and the round-14 revision floor (REV-SEED).
