@@ -422,6 +422,8 @@ test("the pass result and code vocabularies are closed", () => {
   assert.deepEqual([...pass.POSTGRES_LIFECYCLE_PASS_OUTCOMES], ["complete", "partial", "skipped", "refused", "failure"]);
   assert.deepEqual(Object.keys(pass.POSTGRES_LIFECYCLE_PASS_CODES), [...pass.POSTGRES_LIFECYCLE_PASS_OUTCOMES]);
   assert.deepEqual([...pass.POSTGRES_LIFECYCLE_PASS_CODES.skipped], ["MAINTENANCE_IN_PROGRESS", "MIGRATION_IN_PROGRESS"]);
+  assert.deepEqual([...pass.POSTGRES_LIFECYCLE_PASS_CODES.partial],
+    ["QUARANTINE_RECONCILIATION_BACKLOG", "MAINTENANCE_PURGE_BACKLOG"], "MAINT-PURGE adds the purge backlog");
   assert.equal(pass.POSTGRES_LIFECYCLE_PASS_SAFETY_WINDOW_MILLISECONDS, 24 * 60 * 60 * 1_000);
   assert.equal(pass.POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN, "tibotattle/postgres-scheduled-maintenance/v1");
   assert.equal(pass.POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX, "tibotattle:primary:");

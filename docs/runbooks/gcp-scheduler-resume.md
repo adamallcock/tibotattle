@@ -131,7 +131,11 @@ Per job:
 - **Maintenance.** Run one pass by hand first and confirm its receipt, so the
   first scheduled pass starts from a fresh lifecycle state. The pass skips with
   `MIGRATION_IN_PROGRESS` while a migration runs, and a held lock returns
-  `MAINTENANCE_IN_PROGRESS` with no write.
+  `MAINTENANCE_IN_PROGRESS` with no write. Each pass also runs one bounded
+  page of the expired sign-in handoff, sign-in window and device-lifecycle
+  purges (MAINT-PURGE). A `partial` receipt is a backlog that later passes
+  drain: `QUARANTINE_RECONCILIATION_BACKLOG` leaves `/api/ready` not_ready,
+  `MAINTENANCE_PURGE_BACKLOG` does not.
 - **Analytics-refresh.** On the first resume after the cutover, a manual run has
   completed and the first Google Cloud publication is confirmed
   ([cutover window, H.8](./gcp-cutover-window.md#h8-analytics-cold-build)). On

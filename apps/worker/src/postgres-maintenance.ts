@@ -6,6 +6,11 @@
  * maintenance remain explicit incomplete gates; this module must not report
  * a full lifecycle pass while either is absent.
  *
+ * The identity purge (purgePostgresExpiredIdentityRows) is the one policy for
+ * handoff and sign-in window expiry: both this scheduled slice and the
+ * MP-2-lite lifecycle pass (src/postgres-lifecycle-pass.ts, MAINT-PURGE) call
+ * it, together with purgePostgresStaleDeviceLifecycleRows.
+ *
  * There is no deletion ledger, tombstone or re-enrollment cooldown to purge
  * (decisions D2, D4 and D6 of 2026-09-26). Owner decision OD-4 (answered
  * 2026-10-02) fixes the report shape: re-enrollment cooldowns are neither
@@ -212,6 +217,40 @@ async function purgeSpecs(
   return Object.freeze({ purged, complete });
 }
 
+export interface PostgresIdentityPurgeOptions {
+  readonly schema?: PostgresSchemaOptions;
+  /** The purge clock in epoch milliseconds: handoffs expired at it are purged. */
+  readonly nowEpoch: number;
+}
+
+/**
+ * One bounded page of each identity purge: Apple and Google sign-in handoffs
+ * expired at `nowEpoch` (100 each) and sign-in admission windows older than
+ * the 24-hour retention (1,000). Each page deletes only rows past its cutoff,
+ * skips rows another transaction holds, and reports complete only when a
+ * readback finds nothing left past the cutoff, so a replay purges nothing
+ * twice and a backlog drains across runs. Invalid options throw before any
+ * connection.
+ */
+export async function purgePostgresExpiredIdentityRows(
+  pool: PostgresPool,
+  options: PostgresIdentityPurgeOptions,
+): Promise<PostgresIdentityPurgeReceipt> {
+  if (!pool || typeof pool.connect !== "function" || !options || typeof options !== "object") {
+    return invalidOptions();
+  }
+  const schema = safeSchema(options.schema);
+  const nowEpoch = validateNow(options.nowEpoch);
+  const handoffs = await purgeSpecs(pool, schema.primary, IDENTITY_PURGES.slice(0, 2),
+    new Date(nowEpoch).toISOString());
+  const admission = await purgePage(pool, schema.primary, IDENTITY_PURGES[2]!,
+    new Date(nowEpoch - POSTGRES_SIGNIN_ADMISSION_RETENTION_MILLISECONDS).toISOString());
+  return Object.freeze({
+    purged: handoffs.purged + admission.purged,
+    complete: handoffs.complete && admission.complete,
+  });
+}
+
 async function withSessionLock<T>(
   pool: PostgresPool,
   operation: () => Promise<T>,
@@ -318,9 +357,9 @@ export async function runPostgresScheduledMaintenance(
       // A caller still composing the retired deletion-ledger pool, or still
       // injecting the pre-OD-4 report policy, is stale.
       || RETIRED_OPTIONS.some((name) => Object.hasOwn(options, name))) return invalidOptions();
-  const schema = safeSchema(options.schema);
+  // Refuse an invalid schema before any connection is taken.
+  safeSchema(options.schema);
   const nowEpoch = validateNow(options.nowEpoch ?? Date.now());
-  const cutoff = new Date(nowEpoch).toISOString();
   let leaseAcquired = false;
   let primary: PostgresIdentityPurgeReceipt = Object.freeze({ purged: 0, complete: false });
   let objectReconciliation: PostgresPendingObjectReconciliationResult | null = null;
@@ -335,21 +374,9 @@ export async function runPostgresScheduledMaintenance(
   try {
     const locked = await withSessionLock(options.primaryPool, async () => {
       leaseAcquired = true;
-      const primaryHandoffs = await purgeSpecs(
-        options.primaryPool,
-        schema.primary,
-        IDENTITY_PURGES.slice(0, 2),
-        cutoff,
-      );
-      const admission = await purgePage(
-        options.primaryPool,
-        schema.primary,
-        IDENTITY_PURGES[2]!,
-        new Date(nowEpoch - POSTGRES_SIGNIN_ADMISSION_RETENTION_MILLISECONDS).toISOString(),
-      );
-      primary = Object.freeze({
-        purged: primaryHandoffs.purged + admission.purged,
-        complete: primaryHandoffs.complete && admission.complete,
+      primary = await purgePostgresExpiredIdentityRows(options.primaryPool, {
+        schema: options.schema,
+        nowEpoch,
       });
       deviceLifecycle = await purgePostgresStaleDeviceLifecycleRows(options.primaryPool, {
         schema: options.schema,

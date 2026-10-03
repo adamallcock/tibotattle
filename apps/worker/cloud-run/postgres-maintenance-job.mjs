@@ -6,9 +6,10 @@
  *
  * One execution runs one runPostgresLifecyclePass
  * (src/postgres-lifecycle-pass.ts) for the current one-minute cycle: the
- * lifecycle row, then one page of up to 100 quarantine registrations (the
- * Worker's batch), under the shared maintenance advisory lock and the primary
- * migration fence. That pass is what lets GET /api/ready on the origin read
+ * lifecycle row, one bounded page of each scheduled identity and
+ * device-lifecycle purge (MAINT-PURGE), then one page of up to 100 quarantine
+ * registrations (the Worker's batch), under the shared maintenance advisory
+ * lock and the primary migration fence. That pass is what lets GET /api/ready on the origin read
  * 'ready' (owner decision OD-CR-4). It is a separate workload from the
  * request-serving origin: it has no HOST_MODE and serves nothing.
  *
@@ -54,7 +55,8 @@
  *
  * Output: one content-free JSON receipt line on stdout, or one JSON error
  * line with a closed code on stderr. Exit 0 for complete, partial (a
- * reconciliation backlog above 100, drained by later executions) and skipped
+ * reconciliation backlog above 100, or a purge backlog beyond one page,
+ * drained by later executions) and skipped
  * (another maintenance run holds the lock, or a migration holds the fence);
  * 1 for refused, failure or configuration; 2 for a usage refusal.
  */
