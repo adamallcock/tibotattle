@@ -521,53 +521,6 @@ function legacyCandidatesSql(s: string): string {
       FROM direct GROUP BY observed_day,occurrence_id`;
 }
 
-/** Reviewed READ-PLAN pair eligibility; selection builders own the default count. */
-function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: string): string {
-  return `selection_pairs AS MATERIALIZED (
-      SELECT DISTINCT proof.chunk_key,proof.manifest_key FROM ${fence} selected
-        JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=selected.id
-    ), ${completenessCte === undefined ? `selection_chunk_proofs AS MATERIALIZED (
-      SELECT count_allocation.chunk_id,count(*) AS proof_count
-        FROM ${s}.typed_v11_chunk_allocations count_allocation
-        JOIN ${s}.typed_telemetry_chunks physical_chunk
-          ON physical_chunk.namespace_id=count_allocation.namespace_id AND physical_chunk.format=11
-         AND physical_chunk.original_id=count_allocation.chunk_original
-        JOIN ${s}.typed_v11_record_proofs count_proof ON count_proof.chunk_key=physical_chunk.id
-        JOIN ${s}.typed_v11_manifest_memberships count_membership
-          ON count_membership.typed_manifest_id=count_proof.manifest_key
-       WHERE count_allocation.chunk_id IN (
-         SELECT reach_allocation.chunk_id FROM selection_pairs pairs
-           JOIN ${s}.typed_telemetry_chunks reach_chunk ON reach_chunk.id=pairs.chunk_key
-           JOIN ${s}.typed_v11_chunk_allocations reach_allocation
-             ON reach_allocation.namespace_id=reach_chunk.namespace_id
-            AND reach_allocation.chunk_original=reach_chunk.original_id)
-       GROUP BY count_allocation.chunk_id
-
-    ), ` : ""}selection_pairs_ok AS MATERIALIZED (
-      SELECT pairs.chunk_key,pairs.manifest_key FROM selection_pairs pairs
-       WHERE EXISTS (SELECT 1 FROM ${s}.typed_telemetry_chunks proof_chunk
-          JOIN ${s}.typed_v11_chunk_allocations allocation ON allocation.namespace_id=proof_chunk.namespace_id
-           AND allocation.chunk_original=proof_chunk.original_id
-          JOIN ${s}.typed_v11_manifest_memberships admitted_manifest
-            ON admitted_manifest.typed_manifest_id=pairs.manifest_key
-          JOIN ${s}.telemetry_v11_chunks chunk ON chunk.id=allocation.chunk_id AND chunk.stream=$4
-          JOIN ${s}.telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admitted_manifest.manifest_id
-          JOIN ${s}.telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
-          JOIN ${s}.storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
-           AND event.owner_digest=$1 AND event.participant_id=$2
-          JOIN ${s}.telemetry_v11_domains generation ON generation.id=event.generation_id
-           AND generation.id=domain_day.generation_id
-           AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
-           AND event.manifest_digest=generation.manifest_digest
-           AND event.from_day=generation.from_day AND event.through_day=generation.through_day
-           AND event.input_revision=generation.input_revision
-          JOIN ${s}.device_credentials generation_device ON generation_device.id=generation.device_id
-           AND generation_device.participant_id=generation.participant_id
-         WHERE proof_chunk.id=pairs.chunk_key
-           AND (chunk.id,chunk.record_count::bigint) IN (
-             SELECT complete.chunk_id,complete.proof_count FROM ${completenessCte ?? "selection_chunk_proofs"} complete))
-    )`;
-}
 
 
 /**

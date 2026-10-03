@@ -317,27 +317,51 @@ test("pair keys distinguish manifests sharing a chunk and chunks sharing a manif
   }
 });
 
-test("expansion SQL remains byte-identical and candidate bounds retain their refusal", { skip: SKIP }, async (t) => {
-  const fixture = fixtures.active;
-  await snapshot(fixture, async (context) => {
-    const capture = async (reader) => {
-      const texts = [];
-      const client = { query: async (...args) => {
+test("combined selection/expansion parity and candidate refusal", { skip: SKIP, timeout: 300_000 }, async () => {
+  for (const runtime of ["active", "staged"]) {
+    const fixture = fixtures[runtime];
+    await snapshot(fixture, async (context) => {
+      const oracleTexts = [];
+      const oracleClient = { query: async (...args) => {
         const text = typeof args[0] === "string" ? args[0] : args[0].text;
-        if (text.startsWith("/* analytics_v2:occurrences.legacy_sources")) texts.push(text.replaceAll(`"${fixture.schema}"`, '"read_plan_fixed"'));
+        if (text.startsWith("/* analytics_v2:occurrences.legacy_sources"))
+          oracleTexts.push(text.replaceAll(`"${fixture.schema}"`, '"read_plan_fixed"'));
         return context.client.query(...args);
       } };
-      await reader.readOwnerOccurrences({ ...context, client }, { ownerDigest: fixture.owners.lima.ownerDigest,
-        stream: "usage", fromDay: D1, throughDay: D3 });
-      return texts;
-    };
-    const before = await capture(oracle), after = await capture(head);
-    assert.ok(before.length > 0); assert.deepEqual(after, before);
-    t.diagnostic(`legacy_sources fixed-schema SHA256 ${createHash("sha256").update(before[0]).digest("hex")}`);
-    const options = { ownerDigest: fixture.owners.lima.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3, maxCandidates: 1 };
-    assert.deepEqual(await outcome(() => head.readOwnerOccurrences(context, options)), { error: "ANALYTICS_V2_SOURCE_LIMIT" });
-    assert.deepEqual(await outcome(() => oracle.readOwnerOccurrences(context, options)), { error: "ANALYTICS_V2_SOURCE_LIMIT" });
-  });
+      await oracle.readOwnerOccurrences({ ...context, client: oracleClient }, {
+        ownerDigest: fixture.owners.lima.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+      assert.ok(oracleTexts.length > 0);
+      assert.equal(createHash("sha256").update(oracleTexts[0]).digest("hex"),
+        "12495b65def619474f98982d3f79e9aa6c597c8884494c91da94299e737af5d0",
+        "the historical fixed-schema oracle expansion SQL cannot drift");
+      const bytes = async (reader, method, options) => outcome(async () =>
+        JSON.stringify([...await reader[method](context, options)]));
+      for (const owner of Object.values(fixture.owners)) {
+        for (const stream of ["usage", "quota", "session"]) {
+          for (const [fromDay, throughDay] of [[D1, D3], [D1, D1], [D2, D3], [D3, D3],
+            [FLOOR, day(-99_999)], [day(number(D3) + 1), day(number(D3) + 1)]]) {
+            const options = { ownerDigest: owner.ownerDigest, stream, fromDay, throughDay };
+            for (const method of ["readOwnerOccurrences", "readOwnerDayFingerprints"])
+              assert.deepEqual(await bytes(head, method, options), await bytes(oracle, method, options),
+                `${runtime}/${stream}/${fromDay}/${throughDay}/${method}: exact map order and object bytes`);
+          }
+        }
+      }
+      const options = { ownerDigest: fixture.owners.lima.ownerDigest, stream: "usage",
+        fromDay: D1, throughDay: D3, maxCandidates: 1 };
+      for (const reader of [head, oracle]) {
+        const expansionCalls = [];
+        const client = { query: async (...args) => {
+          const text = typeof args[0] === "string" ? args[0] : args[0].text;
+          if (/^\/\* analytics_v2:occurrences\.[^ ]*_sources/u.test(text)) expansionCalls.push(text);
+          return context.client.query(...args);
+        } };
+        assert.deepEqual(await outcome(() => reader.readOwnerOccurrences({ ...context, client }, options)),
+          { error: "ANALYTICS_V2_SOURCE_LIMIT" });
+        assert.deepEqual(expansionCalls, [], "candidate refusal precedes every source expansion query");
+      }
+    });
+  }
 });
 
 test("actual snapshot pipeline inputs equal the old pre-owner pass at concurrency 1–4", { skip: SKIP, timeout: 120_000 }, async () => {
