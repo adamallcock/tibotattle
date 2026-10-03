@@ -84,6 +84,7 @@ const READ_TIMEOUT_MS = 300_000;
  * carries a value, an identifier or a schema name.
  */
 export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
+  "snapshot.control",
   "snapshot.read_only",
   "snapshot.plan_cache",
   "owners.runtime",

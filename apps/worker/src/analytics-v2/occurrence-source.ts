@@ -118,6 +118,10 @@ export const MAX_ANALYTICS_V2_OCCURRENCE_DAYS = 400;
 const FIRST_EVIDENCE_FLOOR_DAY_NUMBER = -100_000;
 /** Occurrence ids expanded per source batch (production's page bound). */
 const EXPANSION_BATCH = 200;
+const EXPANSION_GROUP_IDS = 2_000;
+/** A statement buffers at most G+1 raw rows, preserving the old batch bound. */
+export const MAX_ANALYTICS_V2_EXPANSION_GROUP_ROWS = 40_001;
+const EXPANSION_GROUP_ROWS = MAX_ANALYTICS_V2_EXPANSION_GROUP_ROWS;
 /**
  * Distinct legacy or correction source variants one 200-id batch may expand
  * to: 200 variants per occurrence. d43c8f92's Worker reader stops at 3,200
@@ -507,34 +511,100 @@ function legacyCandidatesSql(s: string): string {
       FROM direct GROUP BY observed_day,occurrence_id`;
 }
 
+/** Reviewed READ-PLAN pair eligibility; selection builders own the default count. */
+function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: string): string {
+  return `selection_pairs AS MATERIALIZED (
+      SELECT DISTINCT proof.chunk_key,proof.manifest_key FROM ${fence} selected
+        JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=selected.id
+    ), ${completenessCte === undefined ? `selection_chunk_proofs AS MATERIALIZED (
+      SELECT count_allocation.chunk_id,count(*) AS proof_count
+        FROM ${s}.typed_v11_chunk_allocations count_allocation
+        JOIN ${s}.typed_telemetry_chunks physical_chunk
+          ON physical_chunk.namespace_id=count_allocation.namespace_id AND physical_chunk.format=11
+         AND physical_chunk.original_id=count_allocation.chunk_original
+        JOIN ${s}.typed_v11_record_proofs count_proof ON count_proof.chunk_key=physical_chunk.id
+        JOIN ${s}.typed_v11_manifest_memberships count_membership
+          ON count_membership.typed_manifest_id=count_proof.manifest_key
+       WHERE count_allocation.chunk_id IN (
+         SELECT reach_allocation.chunk_id FROM selection_pairs pairs
+           JOIN ${s}.typed_telemetry_chunks reach_chunk ON reach_chunk.id=pairs.chunk_key
+           JOIN ${s}.typed_v11_chunk_allocations reach_allocation
+             ON reach_allocation.namespace_id=reach_chunk.namespace_id
+            AND reach_allocation.chunk_original=reach_chunk.original_id)
+       GROUP BY count_allocation.chunk_id
+
+    ), ` : ""}selection_pairs_ok AS MATERIALIZED (
+      SELECT pairs.chunk_key,pairs.manifest_key FROM selection_pairs pairs
+       WHERE EXISTS (SELECT 1 FROM ${s}.typed_telemetry_chunks proof_chunk
+          JOIN ${s}.typed_v11_chunk_allocations allocation ON allocation.namespace_id=proof_chunk.namespace_id
+           AND allocation.chunk_original=proof_chunk.original_id
+          JOIN ${s}.typed_v11_manifest_memberships admitted_manifest
+            ON admitted_manifest.typed_manifest_id=pairs.manifest_key
+          JOIN ${s}.telemetry_v11_chunks chunk ON chunk.id=allocation.chunk_id AND chunk.stream=$4
+          JOIN ${s}.telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admitted_manifest.manifest_id
+          JOIN ${s}.telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
+          JOIN ${s}.storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
+           AND event.owner_digest=$1 AND event.participant_id=$2
+          JOIN ${s}.telemetry_v11_domains generation ON generation.id=event.generation_id
+           AND generation.id=domain_day.generation_id
+           AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
+           AND event.manifest_digest=generation.manifest_digest
+           AND event.from_day=generation.from_day AND event.through_day=generation.through_day
+           AND event.input_revision=generation.input_revision
+          JOIN ${s}.device_credentials generation_device ON generation_device.id=generation.device_id
+           AND generation_device.participant_id=generation.participant_id
+         WHERE proof_chunk.id=pairs.chunk_key
+           AND (chunk.id,chunk.record_count::bigint) IN (
+             SELECT complete.chunk_id,complete.proof_count FROM ${completenessCte ?? "selection_chunk_proofs"} complete))
+    )`;
+}
+
+
 /**
- * $1 owner, $2 participant, $3 stream code, $4 stream name, $5 occurrence ids
- * (hex text[]).
+ * Expansion-local grouped proof count. Count physical (chunk, manifest)
+ * groups first, then join UNIQUE typed_manifest_id memberships and allocations.
+ * This sums exactly d3's allocation -> physical format11 -> proof -> membership
+ * join multiplicity; requested sub-batches never change physical completeness.
+ */
+function expansionChunkProofsSql(s: string, fence: string): string {
+  return `expansion_reached_chunks AS MATERIALIZED (
+      SELECT DISTINCT allocation.chunk_id FROM ${fence} reached
+        JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=reached.id
+        JOIN ${s}.typed_telemetry_chunks physical ON physical.id=proof.chunk_key
+        JOIN ${s}.typed_v11_chunk_allocations allocation
+          ON allocation.namespace_id=physical.namespace_id AND allocation.chunk_original=physical.original_id
+    ), expansion_physical_counts AS MATERIALIZED (
+      SELECT proof.chunk_key,proof.manifest_key,count(*) AS proof_count
+        FROM ${s}.typed_v11_record_proofs proof
+       WHERE proof.chunk_key IN (
+         SELECT physical.id FROM ${s}.typed_v11_chunk_allocations allocation
+           JOIN expansion_reached_chunks reached ON reached.chunk_id=allocation.chunk_id
+           JOIN ${s}.typed_telemetry_chunks physical ON physical.namespace_id=allocation.namespace_id
+            AND physical.format=11 AND physical.original_id=allocation.chunk_original)
+       GROUP BY proof.chunk_key,proof.manifest_key
+    ), v11_chunk_proofs AS MATERIALIZED (
+      SELECT allocation.chunk_id,sum(counted.proof_count)::bigint AS proof_count
+        FROM ${s}.typed_v11_chunk_allocations allocation
+        JOIN expansion_reached_chunks reached ON reached.chunk_id=allocation.chunk_id
+        JOIN ${s}.typed_telemetry_chunks physical ON physical.namespace_id=allocation.namespace_id
+         AND physical.format=11 AND physical.original_id=allocation.chunk_original
+        JOIN expansion_physical_counts counted ON counted.chunk_key=physical.id
+        JOIN ${s}.typed_v11_manifest_memberships membership ON membership.typed_manifest_id=counted.manifest_key
+       GROUP BY allocation.chunk_id
+    )`;
+}
+
+/**
+ * UNION ALL of 200-id DIRECT_SOURCE_SQL expansions. SQL ordinal membership
+ * follows compareText input order, never bytea order. The narrow representative
+ * rows are capped per logical batch before dictionary joins, then by G+1.
  *
- * The selection is production's DIRECT_SOURCE_SQL: every typed legacy row of
- * a requested occurrence and stream that legacyDirectSql admits. It is shaped
- * as c0600bc2 shaped the v1.2 expansion, so its cost follows the batch, not
- * the owner. No index leads with occurrence_id, so an unfenced filter walked
- * every v1 chunk, admission and record and every v1.1 record and proof of the
- * owner for each 200-id batch (C-REFRESH measured about 32 ms a batch for a
- * 12,000-record owner and 200 ms for a 72,000-record one, the same batch: a
- * read quadratic in owner size). Here the owner's typed devices (v1) and
- * typed manifests (v1.1) are fenced first, each is probed once on its unique
- * (device_id or manifest_id, stream, occurrence_id) key for the batch's ids,
- * and each matched record is then checked against the unchanged joins in a
- * fenced LATERAL (OFFSET 0 keeps it per record). The fence is implied by the
- * joins it precedes: a selected v1 record's device and a selected v1.1
- * record's manifest belong to the record's (namespace, owner) (0030's foreign
- * keys), which is its format's membership of participant $2. The v1.1 chunk
- * completeness test is applied after the LATERAL, against the counts of the
- * chunks the matched records reach (v11ChunkProofsSql), the same per-row
- * predicate. So the rows, their multiplicity and the grouping below are
- * unchanged.
  */
 function legacySourcesSql(s: string): string {
   const requested = "ARRAY(SELECT wanted.occurrence_id FROM requested wanted)";
   return `WITH requested AS MATERIALIZED (
-      SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($5::text[]) value
+      SELECT decode(value,'hex') AS occurrence_id,((ordinal-1)/${EXPANSION_BATCH})::integer AS sub_batch
+        FROM unnest($5::text[]) WITH ORDINALITY AS input(value,ordinal)
     ), owner_parents AS MATERIALIZED (
       SELECT 10 AS format,parent_device.id AS parent_id
         FROM ${s}.typed_telemetry_owner_memberships parent_membership
@@ -549,7 +619,7 @@ function legacySourcesSql(s: string): string {
          AND parent_manifest.owner_id=parent_membership.owner_id
        WHERE parent_membership.participant_id=$2 AND parent_membership.source_format=11
     ), matched AS MATERIALIZED (
-      SELECT probe.id FROM owner_parents parent
+      SELECT probe.id,wanted.sub_batch FROM owner_parents parent
         CROSS JOIN LATERAL (
           SELECT probed.id FROM ${s}.typed_telemetry_records probed
            WHERE parent.format=10 AND probed.format=10 AND probed.device_id=parent.parent_id AND probed.stream=$3
@@ -559,18 +629,40 @@ function legacySourcesSql(s: string): string {
            WHERE parent.format=11 AND probed.format=11 AND probed.manifest_id=parent.parent_id AND probed.stream=$3
              AND probed.occurrence_id=ANY(${requested})
           OFFSET 0
-        ) probe
-    ), ${v11ChunkProofsSql(s, "matched")}, direct AS MATERIALIZED (
-      SELECT eligible.* FROM matched CROSS JOIN LATERAL (
-        ${legacyDirectSql(s, "record.id=matched.id")}
+        ) probe JOIN ${s}.typed_telemetry_records matched_record ON matched_record.id=probe.id
+      JOIN requested wanted ON wanted.occurrence_id=matched_record.occurrence_id
+    ), ${expansionChunkProofsSql(s, "matched")},
+    ${legacySelectionPairCtesSql(s, "matched", "v11_chunk_proofs")}, direct AS MATERIALIZED (
+      SELECT eligible.*,matched.sub_batch FROM matched CROSS JOIN LATERAL (
+        ${legacyDirectSql(s, "record.id=matched.id AND record.format=10")}
         OFFSET 0) eligible
        WHERE ${legacyV11CompleteSql("eligible")}
+      UNION ALL
+      SELECT record.id AS storage_row_id,record.format,record.occurrence_id,record.observed_at_ms,
+             record.observed_day,record.canonical_digest,typed_device.original_id AS device_blob,
+             NULL::text AS v11_chunk_id,NULL::integer AS v11_chunk_records,matched.sub_batch
+        FROM matched
+        JOIN ${s}.typed_telemetry_records record ON record.id=matched.id AND record.format=11 AND record.stream=$3
+        JOIN ${s}.typed_telemetry_owner_memberships membership ON membership.namespace_id=record.namespace_id
+         AND membership.owner_id=record.owner_id AND membership.participant_id=$2 AND membership.source_format=11
+        JOIN ${s}.typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
+         AND v11.source_namespace=membership.source_namespace AND v11.namespace_id=membership.namespace_id
+        JOIN ${s}.typed_telemetry_devices typed_device ON typed_device.id=record.device_id
+         AND typed_device.namespace_id=record.namespace_id
+        JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=record.id
+        JOIN selection_pairs_ok ON selection_pairs_ok.chunk_key=proof.chunk_key
+         AND selection_pairs_ok.manifest_key=proof.manifest_key
     ),
     grouped AS MATERIALIZED (
-      SELECT min(storage_row_id) AS storage_row_id FROM direct
-       GROUP BY device_blob,occurrence_id,observed_at_ms,canonical_digest,format
+      SELECT min(storage_row_id) AS storage_row_id,sub_batch FROM direct
+       GROUP BY sub_batch,device_blob,occurrence_id,observed_at_ms,canonical_digest,format
+    ), ranked AS MATERIALIZED (
+      SELECT *,row_number() OVER (PARTITION BY sub_batch ORDER BY storage_row_id) AS batch_row FROM grouped
+    ), selected AS MATERIALIZED (
+      SELECT storage_row_id,sub_batch FROM ranked WHERE batch_row<=${MAX_BATCH_SOURCE_ROWS + 1}
+       ORDER BY sub_batch,storage_row_id LIMIT ${EXPANSION_GROUP_ROWS + 1}
     )
-    SELECT record.id AS storage_row_id,record.source_row_id,record.format,record.stream,record.occurrence_id,
+    SELECT selected.sub_batch,record.id AS storage_row_id,record.source_row_id,record.format,record.stream,record.occurrence_id,
            record.observed_at_ms,record.canonical_digest,typed_device.original_id AS device_blob,
            provider.value AS provider,identifier.value AS session_id,
            model.value AS model,speed.value AS speed_mode,tier.value AS api_service_tier,
@@ -590,8 +682,8 @@ function legacySourcesSql(s: string): string {
                JOIN ${s}.typed_telemetry_dictionary tool ON tool.id=tool_count.tool_class_id
               WHERE tool_count.record_id=record.id
            ),'{}') ELSE NULL END AS tool_json
-      FROM grouped
-      JOIN ${s}.typed_telemetry_records record ON record.id=grouped.storage_row_id
+      FROM selected
+      JOIN ${s}.typed_telemetry_records record ON record.id=selected.storage_row_id
       JOIN ${s}.typed_telemetry_devices typed_device ON typed_device.id=record.device_id
       JOIN ${s}.typed_telemetry_dictionary provider ON provider.id=record.provider_id
       LEFT JOIN ${s}.typed_telemetry_usage usage ON usage.record_id=record.id
@@ -612,7 +704,8 @@ function legacySourcesSql(s: string): string {
       LEFT JOIN ${s}.typed_telemetry_dictionary slot_row ON slot_row.id=quota.slot_id
       LEFT JOIN ${s}.typed_telemetry_attributions attribution
         ON attribution.id=COALESCE(usage.attribution_id,dimensions.attribution_id)
-      LEFT JOIN ${s}.typed_telemetry_dictionary attribution_plan ON attribution_plan.id=attribution.plan_type_id`;
+      LEFT JOIN ${s}.typed_telemetry_dictionary attribution_plan ON attribution_plan.id=attribution.plan_type_id
+     ORDER BY selected.sub_batch,record.id`;
 }
 
 interface LegacyRow {
@@ -791,22 +884,24 @@ function v12CandidatesSql(s: string): string {
  */
 function v12OccurrencesSql(s: string): string {
   return `WITH requested AS MATERIALIZED (
-      SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($4::text[]) value
+      SELECT decode(value,'hex') AS occurrence_id,((ordinal-1)/${EXPANSION_BATCH})::integer AS sub_batch
+        FROM unnest($4::text[]) WITH ORDINALITY AS input(value,ordinal)
     ), owner_manifests AS MATERIALIZED (
       SELECT owned.id FROM ${s}.telemetry_v12_day_manifests owned
        WHERE owned.participant_id=$1 AND owned.state='ready'
     ), matched AS MATERIALIZED (
-      SELECT probe.id FROM owner_manifests owned
+      SELECT probe.id,wanted.sub_batch FROM owner_manifests owned
         CROSS JOIN LATERAL (
           SELECT r.id FROM ${s}.telemetry_v12_typed_records r
            WHERE r.manifest_id=owned.id AND r.stream=$2
              AND r.occurrence_id=ANY(ARRAY(SELECT wanted.occurrence_id FROM requested wanted))
           OFFSET 0
-        ) probe
+        ) probe JOIN ${s}.telemetry_v12_typed_records matched_record ON matched_record.id=probe.id
+      JOIN requested wanted ON wanted.occurrence_id=matched_record.occurrence_id
     ), retained_auth AS MATERIALIZED (
       ${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}
     ), eligible AS MATERIALIZED (
-      SELECT r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
+      SELECT matched.sub_batch,r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
         FROM matched
         JOIN ${s}.telemetry_v12_typed_records r ON r.id=matched.id
         CROSS JOIN LATERAL (
@@ -828,12 +923,15 @@ function v12OccurrencesSql(s: string): string {
           OFFSET 0
         ) scope
     ), grouped AS MATERIALIZED (
-      SELECT min(id) AS id FROM eligible
-       GROUP BY source_device_id,occurrence_id,observed_at_ms,canonical_digest
-    ), selected AS (
-      SELECT id FROM grouped ORDER BY id LIMIT $5
+      SELECT min(id) AS id,sub_batch FROM eligible
+       GROUP BY sub_batch,source_device_id,occurrence_id,observed_at_ms,canonical_digest
+    ), ranked AS MATERIALIZED (
+      SELECT *,row_number() OVER (PARTITION BY sub_batch ORDER BY id) AS batch_row FROM grouped
+    ), selected AS MATERIALIZED (
+      SELECT id,sub_batch FROM ranked WHERE batch_row<=$5
+       ORDER BY sub_batch,id LIMIT ${EXPANSION_GROUP_ROWS + 1}
     )
-    SELECT selected.id::text AS storage_row_id,r.manifest_id,r.record_index,
+    SELECT selected.sub_batch,selected.id::text AS storage_row_id,r.manifest_id,r.record_index,
            r.stream,r.occurrence_id,r.observed_at_ms,r.observed_day,r.canonical_digest,
            provider.value AS provider,
            u.session_id,model.value AS model,speed.value AS speed_mode,
@@ -876,7 +974,7 @@ function v12OccurrencesSql(s: string): string {
       LEFT JOIN ${s}.typed_telemetry_dictionary qslot ON qslot.id=q.slot_id
       LEFT JOIN ${s}.telemetry_v12_typed_attributions qa ON qa.id=q.attribution_id
       LEFT JOIN ${s}.typed_telemetry_dictionary qaplan ON qaplan.id=qa.plan_type_id
-     ORDER BY r.occurrence_id,r.observed_at_ms,r.manifest_id COLLATE "C",r.record_index`;
+     ORDER BY selected.sub_batch,r.occurrence_id,r.observed_at_ms,r.manifest_id COLLATE "C",r.record_index`;
 }
 
 /** d43c8f92 telemetry-v12-effective-reader.ts normalizeV12Record. */
@@ -973,17 +1071,22 @@ function correctionCandidatesSql(s: string): string {
 /** $1 owner digest hex, $2 occurrence ids (hex text[]), $3 limit. */
 function correctionVariantsSql(s: string): string {
   return `WITH requested AS MATERIALIZED (
-      SELECT DISTINCT decode(value,'hex') AS occurrence_id FROM unnest($2::text[]) value
+      SELECT decode(value,'hex') AS occurrence_id,((ordinal-1)/${EXPANSION_BATCH})::integer AS sub_batch
+        FROM unnest($2::text[]) WITH ORDINALITY AS input(value,ordinal)
     ), representatives AS MATERIALIZED (
-      SELECT min(f.id) AS fact_id
+      SELECT min(f.id) AS fact_id,wanted.sub_batch
         FROM ${s}.telemetry_usage_correction_history h
         JOIN ${s}.telemetry_usage_correction_facts f ON f.history_id=h.id AND f.method_version=1
-       WHERE h.owner_digest=decode($1,'hex') AND h.occurrence_id IN (SELECT occurrence_id FROM requested)
-       GROUP BY h.source_format,h.device_id,h.occurrence_id,h.event_time_ms,h.record_digest
-    ), selected AS (
-      SELECT fact_id FROM representatives ORDER BY fact_id LIMIT $3
+       JOIN requested wanted ON wanted.occurrence_id=h.occurrence_id
+       WHERE h.owner_digest=decode($1,'hex')
+       GROUP BY wanted.sub_batch,h.source_format,h.device_id,h.occurrence_id,h.event_time_ms,h.record_digest
+    ), ranked AS MATERIALIZED (
+      SELECT *,row_number() OVER (PARTITION BY sub_batch ORDER BY fact_id) AS batch_row FROM representatives
+    ), selected AS MATERIALIZED (
+      SELECT fact_id,sub_batch FROM ranked WHERE batch_row<=$3
+       ORDER BY sub_batch,fact_id
     )
-    SELECT h.*,f.id AS fact_id,f.method_version AS fact_method_version,f.captured_at_ms AS fact_captured_at_ms,
+    SELECT selected.sub_batch,h.*,f.id AS fact_id,f.method_version AS fact_method_version,f.captured_at_ms AS fact_captured_at_ms,
            provider.value AS provider_value,session.value AS session_blob,model.value AS model_value,
            speed.value AS speed_mode_value,tier.value AS api_service_tier_value,surface.value AS surface_value,
            billing.value AS billing_surface_value,effort.value AS reasoning_effort_value,
@@ -1008,7 +1111,7 @@ function correctionVariantsSql(s: string): string {
       JOIN ${s}.typed_telemetry_dictionary outcome ON outcome.id=h.outcome_id
       LEFT JOIN ${s}.typed_telemetry_attributions attribution ON attribution.id=h.attribution_id
       LEFT JOIN ${s}.typed_telemetry_dictionary attribution_plan ON attribution_plan.id=attribution.plan_type_id
-     ORDER BY f.id`;
+     ORDER BY selected.sub_batch,f.id LIMIT ${EXPANSION_GROUP_ROWS + 1}`;
 }
 
 function nullableId(value: unknown): string | null {
@@ -1122,6 +1225,143 @@ function readerStatements(s: string): Promise<ReaderStatements> {
   return cached;
 }
 
+/** Raw driver rows are clone-friendly; only the SQL ordinal is a helper. */
+interface RawExpansionBatch {
+  readonly ids: readonly string[];
+  readonly legacy: LegacyRow[];
+  readonly v12: V12StorageRow[];
+  readonly facts: Record<string, unknown>[];
+}
+
+function expansionOrdinal(row: object, count: number): number {
+  return safeInteger((row as Record<string, unknown>).sub_batch, 0, count - 1);
+}
+
+function stripExpansionOrdinal<Row extends object>(row: Row): Row {
+  const { sub_batch: _ordinal, ...source } = row as Record<string, unknown>;
+  return source as Row;
+}
+
+/**
+ * Fetch UNION ALL logical batches with SQL bounds, yielding only complete
+ * leading batches. A G+1 result's final ordinal is incomplete; reissue it.
+ * Each family holds <=G+1 rows; a logical batch holds <=40,001 per family.
+ * A failing grouped SQL statement is rolled back to a read-only savepoint and
+ * reissued at the old 200-id granularity; cancellation is terminal. Per-batch
+ * SQL errors are deferred by family, preserving preceding decode refusals. No query or snapshot work escapes this iterator.
+ */
+async function* fetchRawExpansion(client: PostgresClient, s: string, now: string, scope: OwnerScope,
+  ownerDigest: string, stream: EffectiveTelemetryStream, occurrenceIds: readonly string[],
+  corrections: boolean, expandV12: boolean): AsyncGenerator<RawExpansionBatch> {
+  const statements = await readerStatements(s);
+  for (const group of chunks(occurrenceIds, EXPANSION_GROUP_IDS)) {
+    const batches = chunks(group, EXPANSION_BATCH);
+    let first = 0;
+    let singleBatch = false;
+    while (first < batches.length) {
+      const remaining = batches.slice(first, singleBatch ? first + 1 : batches.length);
+      const savepoint = remaining.length > 1;
+      if (savepoint) await client.query(analyticsV2Statement("snapshot.control", "SAVEPOINT analytics_v2_expansion"));
+      let queryFailure: unknown;
+      const encoded = remaining.flat().map(occurrenceHex);
+      // Fetch in legacy/v12/correction order; hold failures until the same
+      // logical position at which the old per-batch reader would see them.
+      const result = async <Row extends object>(active: boolean, statement: AnalyticsV2PreparedStatement,
+        binds: unknown[]): Promise<{ rows: Row[]; error?: unknown }> => {
+        if (!active || queryFailure !== undefined) return { rows: [] };
+        try { return await queryPrepared<Row>(client, statement, binds); }
+        catch (error) { queryFailure = error; return { rows: [], error }; }
+      };
+      const legacy = await result<LegacyRow>(scope.v1Namespace !== null || scope.v11Namespace !== null,
+        statements.legacySources, [ownerDigest, scope.participantId, STREAM_CODES[stream], stream, encoded]);
+      const v12 = await result<V12StorageRow>(expandV12 && scope.v12ReadyManifests,
+        statements.v12Sources, [scope.participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
+      const facts = await result<Record<string, unknown>>(corrections && scope.correctionFactsPresent,
+        statements.correctionSources, [ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
+      if (savepoint) {
+        if (queryFailure !== undefined) {
+          await client.query(analyticsV2Statement("snapshot.control", "ROLLBACK TO SAVEPOINT analytics_v2_expansion"));
+        }
+        await client.query(analyticsV2Statement("snapshot.control", "RELEASE SAVEPOINT analytics_v2_expansion"));
+      }
+      if (queryFailure !== undefined && savepoint) {
+        // SQL row defects and statement timeouts can belong to a later batch.
+        // Re-run the original logical granularity before decoding/refusing.
+        // Explicit query cancellation is terminal and is never retried.
+        const cancelled = queryFailure as { code?: unknown; message?: unknown };
+        if (cancelled?.code === "57014" && cancelled.message === "canceling statement due to user request") {
+          throw queryFailure;
+        }
+        singleBatch = true;
+        continue;
+      }
+      let complete = remaining.length;
+      for (const family of [legacy, v12, facts]) {
+        if (family.rows.length > EXPANSION_GROUP_ROWS + 1) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+        if (family.rows.length > EXPANSION_GROUP_ROWS) {
+          complete = Math.min(complete, expansionOrdinal(family.rows.at(-1)!, remaining.length));
+        }
+      }
+      if (complete === 0) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+      const rowsFor = <Row extends object>(family: { rows: Row[]; error?: unknown }, ordinal: number): Row[] => {
+        if (family.error !== undefined) throw family.error;
+        return family.rows.filter((row) => expansionOrdinal(row, remaining.length) === ordinal)
+          .map(stripExpansionOrdinal);
+      };
+      for (let ordinal = 0; ordinal < complete; ordinal += 1) {
+        // Getter errors are raised by the assembler in family precedence.
+        yield { ids: remaining[ordinal]!, get legacy() { return rowsFor(legacy, ordinal); },
+          get v12() { return rowsFor(v12, ordinal); }, get facts() { return rowsFor(facts, ordinal); } };
+      }
+      first += complete;
+    }
+  }
+}
+
+interface ExpandedSources {
+  readonly direct: Map<string, TypedTelemetryCompatibilityRecord[]>;
+  readonly v12: Map<string, TelemetryV12EffectiveRecord[]>;
+  readonly facts: Map<string, TelemetryUsageCorrectionFactRow[]>;
+}
+
+function pushSource<T>(target: Map<string, T[]>, id: string, value: T): void {
+  const group = target.get(id);
+  if (group) group.push(value); else target.set(id, [value]);
+}
+
+/** Pure decode/verify seam: no driver, transaction or platform operations. */
+async function assembleRawExpansion(raw: RawExpansionBatch, scope: OwnerScope, ownerDigest: string,
+  stream: EffectiveTelemetryStream, target: ExpandedSources): Promise<void> {
+  const requested = new Set(raw.ids);
+  const legacy = raw.legacy;
+  if (legacy.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  const decoded: TypedTelemetryCompatibilityRecord[] = [];
+  for (const row of legacy) decoded.push(await decodeLegacyRow(row, scope.participantId,
+    scope.v1Namespace ?? scope.v11Namespace ?? "", stream));
+  const physical = new Map(legacy.map((row, index) => [decoded[index]!, safeInteger(row.storage_row_id, 1)]));
+  decoded.sort((left, right) => compareText(left.occurrence_id, right.occurrence_id)
+    || physical.get(left)! - physical.get(right)!);
+  for (const row of decoded) {
+    if (!requested.has(row.occurrence_id)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    pushSource(target.direct, row.occurrence_id, row);
+  }
+  const v12 = raw.v12;
+  if (v12.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  for (const row of v12) {
+    const record = await decodeV12Row(stream, row);
+    if (!requested.has(record.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    pushSource(target.v12, record.occurrenceId, record);
+  }
+  const facts = raw.facts;
+  if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  for (const row of facts) {
+    const fact = await parseCorrectionFact(row);
+    if (fact.ownerDigest !== ownerDigest || fact.participantId !== scope.participantId
+        || !requested.has(fact.source.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    pushSource(target.facts, fact.source.occurrenceId, fact);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------------
@@ -1232,64 +1472,30 @@ export async function readOwnerOccurrences(
     const direct = new Map<string, TypedTelemetryCompatibilityRecord[]>();
     const v12 = new Map<string, TelemetryV12EffectiveRecord[]>();
     const facts = new Map<string, TelemetryUsageCorrectionFactRow[]>();
-    const push = <T>(target: Map<string, T[]>, id: string, value: T): void => {
-      const group = target.get(id);
-      if (group) group.push(value); else target.set(id, [value]);
-    };
-    const statements = await readerStatements(s);
-    const batches = chunks(occurrenceIds, EXPANSION_BATCH);
-    if (batches.length > 0) await withGenericPlans(client, async () => {
-      for (const batch of batches) {
-        const encoded = batch.map(occurrenceHex);
-        const requested = new Set(batch);
-        if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
-          const rows = await queryPrepared<LegacyRow>(client, statements.legacySources, [...streamBinds, encoded]);
-          if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-          const decoded: TypedTelemetryCompatibilityRecord[] = [];
-          for (const row of rows.rows) decoded.push(await decodeLegacyRow(row, participantId, sourceNamespace, stream));
-          // d43c8f92 readSourceBatches order: (occurrence id, physical row id).
-          const physical = new Map(rows.rows.map((row, index) => [decoded[index]!, safeInteger(row.storage_row_id, 1)]));
-          decoded.sort((left, right) => compareText(left.occurrence_id, right.occurrence_id)
-            || physical.get(left)! - physical.get(right)!);
-          for (const row of decoded) {
-            if (!requested.has(row.occurrence_id)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-            push(direct, row.occurrence_id, row);
-          }
-        }
-        if (expandV12 && scope.v12ReadyManifests) {
-          const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
-            [participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
-          if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-          for (const row of rows.rows) {
-            const record = await decodeV12Row(stream, row);
-            if (!requested.has(record.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-            push(v12, record.occurrenceId, record);
-          }
-        }
-        if (corrections && scope.correctionFactsPresent) {
-          const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
-            [ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
-          if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-          for (const row of rows.rows) {
-            const fact = await parseCorrectionFact(row);
-            if (fact.ownerDigest !== ownerDigest || fact.participantId !== participantId
-                || !requested.has(fact.source.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-            push(facts, fact.source.occurrenceId, fact);
-          }
-        }
+    if (occurrenceIds.length > 0) await withGenericPlans(client, async () => {
+      for await (const raw of fetchRawExpansion(client, s, now, scope, ownerDigest, stream,
+        occurrenceIds, corrections, expandV12)) {
+        await assembleRawExpansion(raw, scope, ownerDigest, stream, { direct, v12, facts });
       }
     });
 
-    // 3. Reconcile per observed day with the vendored d43c8f92 kernels.
+    return assembleOccurrences(candidates, scope.participantId, ownerDigest, stream, { direct, v12, facts });
+  });
+}
+
+/** Pure reconciliation seam; preserves candidate coordinate and output key order. */
+async function assembleOccurrences(candidates: Map<number, Map<string, Candidate>>, participantId: string,
+  ownerDigest: string, stream: EffectiveTelemetryStream, sources: ExpandedSources):
+  Promise<Map<AnalyticsV2Day, EffectiveTelemetryOccurrence[]>> {
     const output = new Map<AnalyticsV2Day, EffectiveTelemetryOccurrence[]>();
     for (const day of [...candidates.keys()].sort((left, right) => left - right)) {
       const ordered = [...candidates.get(day)!.values()].sort(compareCandidates);
       const ids = ordered.map((candidate) => candidate.occurrence_id);
-      const dayDirect = ids.flatMap((id) => direct.get(id) ?? []);
-      const dayV12 = ids.flatMap((id) => v12.get(id) ?? []);
+      const dayDirect = ids.flatMap((id) => sources.direct.get(id) ?? []);
+      const dayV12 = ids.flatMap((id) => sources.v12.get(id) ?? []);
       let rows: EffectiveTelemetryOccurrence[];
       if (stream === "usage") {
-        const dayFacts = ids.flatMap((id) => facts.get(id) ?? []).sort((left, right) => left.id - right.id);
+        const dayFacts = ids.flatMap((id) => sources.facts.get(id) ?? []).sort((left, right) => left.id - right.id);
         const v12Sources = dayV12.map((record) => ({ source_record_key: record.sourceRecordKey,
           occurrence_id: record.occurrenceId, observed_at: record.observedAt,
           record_json: record.sourceRecordJson, canonical_digest: "" }));
@@ -1303,7 +1509,6 @@ export async function readOwnerOccurrences(
       output.set(dayFromNumber(day), rows);
     }
     return output;
-  });
 }
 
 /** Renumber a statement's $n parameters by `offset` so several statements share one parameter list. */
@@ -1668,32 +1873,23 @@ export async function readOwnerDayFingerprints(
       const streamBinds = [base.ownerDigest, scope.participantId, STREAM_CODES[stream], stream];
       // Each occurrence's selected source rows, digested once.
       const sourceDigests = new Map<string, string>();
-      const batches = chunks(occurrenceIds, EXPANSION_BATCH);
-      if (batches.length > 0) await withGenericPlans(client, async () => {
-        for (const batch of batches) {
-          const encoded = batch.map(occurrenceHex);
+      if (occurrenceIds.length > 0) await withGenericPlans(client, async () => {
+        for await (const raw of fetchRawExpansion(client, s, now, scope, base.ownerDigest, stream,
+          occurrenceIds, corrections, expandV12)) {
           const byOccurrence = new Map<string, { legacy: unknown[]; v12: unknown[]; facts: unknown[] }>(
-            batch.map((id) => [id, { legacy: [], v12: [], facts: [] }]));
+            raw.ids.map((id) => [id, { legacy: [], v12: [], facts: [] }]));
           const keyed = (blob: unknown) => byOccurrence.get(occurrenceText(blob)) ?? sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-          if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
-            const rows = await queryPrepared<LegacyRow>(client, statements.legacySources, [...streamBinds, encoded]);
-            if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-            const ordered = [...rows.rows].sort((left, right) =>
-              safeInteger(left.storage_row_id, 1) - safeInteger(right.storage_row_id, 1));
-            for (const row of ordered) keyed(row.occurrence_id).legacy.push(canonicalRow(row as unknown as Record<string, unknown>));
-          }
-          if (expandV12 && scope.v12ReadyManifests) {
-            const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
-              [scope.participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
-            if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-            for (const row of rows.rows) keyed(row.occurrence_id).v12.push(canonicalRow(row));
-          }
-          if (corrections && scope.correctionFactsPresent) {
-            const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
-              [base.ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
-            if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-            for (const row of rows.rows) keyed(row.occurrence_id).facts.push(canonicalRow(row));
-          }
+          const legacy = raw.legacy;
+          if (legacy.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          const ordered = [...legacy].sort((left, right) =>
+            safeInteger(left.storage_row_id, 1) - safeInteger(right.storage_row_id, 1));
+          for (const row of ordered) keyed(row.occurrence_id).legacy.push(canonicalRow(row as unknown as Record<string, unknown>));
+          const v12 = raw.v12;
+          if (v12.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          for (const row of v12) keyed(row.occurrence_id).v12.push(canonicalRow(row));
+          const facts = raw.facts;
+          if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+          for (const row of facts) keyed(row.occurrence_id).facts.push(canonicalRow(row));
           for (const [id, sources] of byOccurrence) {
             sourceDigests.set(id, await sha256Hex(canonicalJson([sources.legacy, sources.v12, sources.facts])));
           }

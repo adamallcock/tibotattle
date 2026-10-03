@@ -190,7 +190,7 @@ const PLAN_BASES = ["unavailable", "same_source_occurrence", "provisional_marker
  * digests are the bytes the production readers verify.
  */
 export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null,
-  v12Scope = false, denseLegacy = null, legacyScope = false }) {
+  v12Scope = false, denseLegacy = null, legacyScope = false, expansionCorrections = false }) {
   if (correctionRuntime !== "active" && correctionRuntime !== "staged") throw new Error("fixture_runtime_invalid");
   const { codec, v12codec, reconciliation, sha256Hex } = modules;
   const quoted = `"${schema}"`;
@@ -850,6 +850,22 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       totalInputContextTokens: CORRECTED_TOTALS.totalInputContextTokens,
       components: { ...unknownTotals.components, outputCombinedTokens: CORRECTED_TOTALS.outputCombinedTokens },
     }) });
+  if (expansionCorrections) {
+    for (let offset = 0; offset < 420; offset += 200) {
+      const records = Array.from({ length: Math.min(200, 420 - offset) }, (_, index) =>
+        usageRecord("v1", `event:readexp:${String(offset + index).padStart(5, "0")}`, at(D1, "12:00:00"), unknownTotals));
+      const chunk = await v1Chunk({ participantId: bravoId, deviceId: bravoDevice, ownerDigest: bravoDigest,
+        stream: "usage", day: D1, records });
+      for (let index = 0; index < records.length; index += 1) {
+        for (let variant = 0; variant < 3; variant += 1) {
+          await correctionFact({ participantId: bravoId, ownerDigest: bravoDigest,
+            chunk: { ...chunk, typed: [chunk.typed[index]] },
+            record: { ...records[index], totalInputContextTokens: 1000 + variant,
+              components: { ...unknownTotals.components, outputCombinedTokens: CORRECTED_TOTALS.outputCombinedTokens } } });
+        }
+      }
+    }
+  }
   await legacyContribution(bravoId, "bravo");
 
   // charlie: social, accepted v0.2 only.

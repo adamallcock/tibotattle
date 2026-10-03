@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { loadExpansionReaders, compareExpansionRead } from "../scripts/gcp-read-expansion-ab.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import {
   CORRECTED_TOTALS,
@@ -60,6 +61,8 @@ async function endpoint() {
   }
   return { host: PG_TEST_HOST, port: PG_TEST_PORT };
 }
+
+
 
 let pool;
 let vite;
@@ -858,6 +861,7 @@ test("N-EXCL: the exclusions are read whole and fail closed; F(o,d) and W(o) mov
     await assert.rejects(read(), (error) => error?.code === "ANALYTICS_V2_SOURCE_UNAVAILABLE", "an absent table");
   });
 
+
 test("READ-EXPANSION: empty families skip only with same-snapshot proofs and settings restore", { skip: SKIP }, async () => {
   await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
     await snapshot.client.query("SELECT set_config('jit','on',true),set_config('work_mem','8MB',true)");
@@ -890,4 +894,311 @@ test("READ-EXPANSION: empty families skip only with same-snapshot proofs and set
     const failedRestore = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
     assert.deepEqual(failedRestore, restored, "caller settings restore after an operation refusal");
   });
+});
+
+
+test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot with positive grouped corrections", { skip: SKIP, timeout: 180_000 }, async () => {
+  const schema = `analytics_v2_expand_${randomBytes(6).toString("hex")}`;
+  await pool.query(`CREATE SCHEMA "${schema}"`);
+  schemas.push(schema);
+  await applyPostgresMigrations({ role: "primary", schema, pool });
+  const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed,
+    correctionRuntime: "active", expansionCorrections: true, denseLegacy: { days: 1, usagePerDay: 420 } });
+  const readers = await loadExpansionReaders();
+  const familyFirst = await loadExpansionReaders({ candidateSourceTransform: (source) => {
+    const first = source.indexOf("      for (let ordinal = 0; ordinal < complete; ordinal += 1) {");
+    const last = source.indexOf("      first += complete;", first);
+    assert.ok(first > 0 && last > first);
+    return source.slice(0, first) + `      for (let family = 0; family < 3; family += 1) {
+        for (let ordinal = 0; ordinal < complete; ordinal += 1) {
+          yield { ids: remaining[ordinal]!,
+            get legacy() { return family === 0 ? rowsFor(legacy, ordinal) : []; },
+            get v12() { return family === 1 ? rowsFor(v12, ordinal) : []; },
+            get facts() { return family === 2 ? rowsFor(facts, ordinal) : []; } };
+        }
+      }
+` + source.slice(last);
+  } });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const snapshotId = (await client.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
+    assert.match(snapshotId, /^[0-9A-F]+-[0-9A-F]+-[0-9]+$/u);
+    const observed = [];
+    const tracking = { query: async (...args) => {
+      const result = await client.query(...args);
+      const text = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (/analytics_v2:occurrences\.(legacy_sources|v12_sources|correction_sources)/u.test(text)) {
+        observed.push({ text, rows: result.rows });
+        if (text.includes("WITH ORDINALITY")) {
+          assert.ok(result.rows.length <= modules.occurrences.MAX_ANALYTICS_V2_EXPANSION_GROUP_ROWS + 1);
+          const counts = new Map();
+          for (const row of result.rows) counts.set(row.sub_batch, (counts.get(row.sub_batch) ?? 0) + 1);
+          for (const count of counts.values()) assert.ok(count <= 40001);
+        }
+      }
+      return result;
+    } };
+    const scoped = { pool, client: tracking, schema, nowMs: NOW_MS };
+    for (const owner of Object.values(fixture.owners).filter((entry) => entry.ownerDigest && entry.devices.length)) {
+      for (const stream of STREAMS) await compareExpansionRead(readers, scoped,
+        { ownerDigest: owner.ownerDigest, stream, fromDay: D1, throughDay: D3 });
+    }
+    const facts = observed.filter((entry) => entry.text.includes("occurrences.correction_sources")
+      && entry.text.includes("WITH ORDINALITY") && entry.rows.length > 1000);
+    assert.ok(facts.length > 0);
+    assert.ok(new Set(facts[0].rows.map((row) => row.sub_batch)).size >= 2);
+    for (const ordinal of new Set(facts[0].rows.map((row) => row.sub_batch))) {
+      const ids = facts[0].rows.filter((row) => row.sub_batch === ordinal).map((row) => row.fact_id);
+      assert.deepEqual(ids, [...ids].sort((a, b) => a - b), "facts keep their physical id order within each batch");
+    }
+    const factSamples = facts[0].rows;
+    const target = (index) => `event:readexp:${String(index).padStart(5, "0")}`;
+    const encodedId = (id) => Buffer.from(modules.seed.codec.encodeTypedTelemetryId(id)).toString("hex");
+    const sample = (rows, id) => rows.find((row) => Buffer.from(row.occurrence_id).toString("hex") === encodedId(id));
+    const refusalCases = [
+      { conflict: 0, limit: 200, code: "ANALYTICS_V2_SOURCE_CONFLICT" },
+      { conflict: 200, limit: 0, code: "ANALYTICS_V2_SOURCE_LIMIT" },
+    ];
+    for (const scenario of refusalCases) {
+      const defectClient = { query: async (...args) => {
+        const result = await client.query(...args);
+        const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+        const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+        if (sql.includes("occurrences.legacy_sources")) {
+          const id = target(scenario.conflict);
+          return { ...result, rows: result.rows.map((row) => Buffer.from(row.occurrence_id).toString("hex") === encodedId(id)
+            ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
+        }
+        if (sql.includes("occurrences.correction_sources")) {
+          const id = target(scenario.limit);
+          const ordinal = binds[1].indexOf(encodedId(id));
+          if (ordinal >= 0) {
+            const row = sample(factSamples, id);
+            assert.ok(row);
+            const { sub_batch: _old, ...source } = row;
+            return { ...result, rows: Array.from({ length: 40001 }, () => sql.includes("WITH ORDINALITY")
+              ? { ...source, sub_batch: Math.floor(ordinal / 200) } : source) };
+          }
+        }
+        return result;
+      } };
+      const input = { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
+      for (const reader of [readers.base, readers.candidate]) {
+        await assert.rejects(reader.occurrences.readOwnerOccurrences({ ...scoped, client: defectClient }, input),
+          (error) => error?.code === scenario.code);
+      }
+      if (scenario.limit === 0) {
+        await assert.rejects(familyFirst.candidate.occurrences.readOwnerOccurrences({ ...scoped, client: defectClient }, input),
+          (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT",
+          "negative control: processing whole-group legacy before corrections loses the earlier LIMIT");
+        assert.notEqual(scenario.code, "ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+    }
+    for (const expected of ["ANALYTICS_V2_SOURCE_CONFLICT", "ANALYTICS_V2_SOURCE_LIMIT"]) {
+      const sameBatchClient = { query: async (...args) => {
+        const result = await client.query(...args);
+        const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+        if (sql.includes("occurrences.legacy_sources") && expected.endsWith("CONFLICT")) {
+          return { ...result, rows: result.rows.map((row, index) => index === 0
+            ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
+        }
+        if (sql.includes("occurrences.v12_sources")) {
+          assert.ok(result.rows.length);
+          return { ...result, rows: Array.from({ length: 40001 }, () => result.rows[0]) };
+        }
+        if (sql.includes("occurrences.scope")) return { ...result,
+          rows: result.rows.map((row) => ({ ...row, correction_facts_present: true })) };
+        if (sql.includes("occurrences.correction_sources")) return { ...result,
+          rows: [{ ...factSamples[0], sub_batch: 0, record_digest: Buffer.alloc(32, 255) }] };
+        return result;
+      } };
+      for (const reader of [readers.base, readers.candidate]) {
+        await assert.rejects(reader.occurrences.readOwnerOccurrences({ ...scoped, client: sameBatchClient },
+          { ownerDigest: fixture.owners.alpha.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
+          (error) => error?.code === expected);
+      }
+    }
+    // Exercise the unchanged real constants through the production decode
+    // seam. These driver-row probes supplement the real SQL correction cap.
+    for (const family of ["legacy_sources", "v12_sources", "correction_sources"]) {
+      const ownerDigest = family === "correction_sources" ? fixture.owners.bravo.ownerDigest : fixture.owners.alpha.ownerDigest;
+      const input = { ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
+      for (const count of [40000, 40001]) {
+        const boundaryClient = { query: async (...args) => {
+          const result = await client.query(...args);
+          const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+          if (sql.includes(`occurrences.${family}`)) {
+            assert.ok(result.rows.length > 0);
+            const grouped = sql.includes("WITH ORDINALITY");
+            if (family === "correction_sources") {
+              const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+              if (!binds[1].includes(encodedId(target(0)))) return result;
+            }
+            const leading = result.rows.filter((row) => !grouped || row.sub_batch === 0);
+            const firstRow = [...leading].sort((a, b) => Number(a.storage_row_id ?? a.fact_id)
+              - Number(b.storage_row_id ?? b.fact_id))[0];
+            const rows = [...Array.from({ length: count }, () => firstRow),
+              ...result.rows.filter((row) => grouped && row.sub_batch > 0)];
+            return { ...result, rows: grouped ? rows.slice(0, 40002) : rows };
+          }
+          return result;
+        } };
+        const caller = { ...scoped, client: boundaryClient };
+        if (count === 40000) await compareExpansionRead(readers, caller, input);
+        else for (const reader of [readers.base, readers.candidate]) {
+          await assert.rejects(reader.occurrences.readOwnerOccurrences(caller, input),
+            (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
+        }
+      }
+    }
+    // PostgreSQL statement errors abort the group, so the savepoint must
+    // restore the snapshot before replaying the original logical batches.
+    let recoveredGroups = 0;
+    const recoverableSqlClient = { query: async (...args) => {
+      const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (sql.includes("occurrences.legacy_sources") && sql.includes("WITH ORDINALITY")) {
+        const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+        if (binds[4].length > 200) { recoveredGroups += 1; return client.query("SELECT 1/0"); }
+      }
+      return client.query(...args);
+    } };
+    await compareExpansionRead(readers, { ...scoped, client: recoverableSqlClient },
+      { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+    assert.ok(recoveredGroups >= 2, "both Maps and fingerprints recover real aborted grouped statements");
+    const sqlPrecedenceClient = { query: async (...args) => {
+      const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+      const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+      if (sql.includes("occurrences.legacy_sources") && binds[4].includes(encodedId(target(200)))) {
+        return client.query("SELECT 1/0");
+      }
+      const result = await client.query(...args);
+      if (sql.includes("occurrences.legacy_sources")) return { ...result, rows: result.rows.map((row) =>
+        Buffer.from(row.occurrence_id).toString("hex") === encodedId(target(0))
+          ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
+      return result;
+    } };
+    for (const reader of [readers.base, readers.candidate]) {
+      await assert.rejects(reader.occurrences.readOwnerOccurrences({ ...scoped, client: sqlPrecedenceClient },
+        { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
+        (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT",
+        "an earlier decode refusal wins over a reachable later-batch SQL failure");
+    }
+    const cancellation = Object.assign(new Error("canceling statement due to user request"), { code: "57014" });
+    let cancelledReads = 0;
+    const cancelledClient = { query: async (...args) => {
+      const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (sql.includes("occurrences.legacy_sources")) { cancelledReads += 1; throw cancellation; }
+      return client.query(...args);
+    } };
+    await assert.rejects(readers.candidate.occurrences.readOwnerOccurrences({ ...scoped, client: cancelledClient },
+      { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
+      (error) => error === cancellation);
+    assert.equal(cancelledReads, 1, "explicit cancellation is terminal, without source retries");
+    assert.equal((await client.query("SELECT 1 AS alive")).rows[0].alive, 1, "snapshot remains usable after cancellation cleanup");
+    // A SQL-tagging defect must be checked against its logical batch, even
+    // when the decoded id belongs to another batch of the same group.
+    const mistagClient = { query: async (...args) => {
+      const result = await client.query(...args);
+      const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (sql.includes("occurrences.legacy_sources") && sql.includes("WITH ORDINALITY")) {
+        return { ...result, rows: result.rows.map((row) =>
+          Buffer.from(row.occurrence_id).toString("hex") === encodedId(target(200)) ? { ...row, sub_batch: 0 } : row) };
+      }
+      return result;
+    } };
+    await assert.rejects(readers.candidate.occurrences.readOwnerOccurrences({ ...scoped, client: mistagClient },
+      { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
+      (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT");
+    await client.query("ROLLBACK");
+    // Real SQL budget pressure: one logical batch has exactly 40,000
+    // correction variants; later batches force a complete-prefix reissue.
+    const columns = (await pool.query(`SELECT column_name FROM information_schema.columns
+      WHERE table_schema=$1 AND table_name='telemetry_usage_correction_history' ORDER BY ordinal_position`, [schema]))
+      .rows.map((row) => row.column_name);
+    assert.ok(columns.every((name) => /^[a-z_]+$/u.test(name)));
+    const bulkFacts = async (first, last) => {
+      const expressions = columns.map((name) => name === "id" || name === "device_id" ? "1000000+n" : `h."${name}"`);
+      await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_history (${columns.map((name) => `"${name}"`).join(",")})
+        SELECT ${expressions.join(",")} FROM generate_series($1::integer,$2::integer) n
+        CROSS JOIN LATERAL (SELECT * FROM "${schema}".telemetry_usage_correction_history
+          WHERE occurrence_id=decode($3,'hex') ORDER BY id LIMIT 1) h`, [first, last, encodedId(target(0))]);
+      await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_facts(id,history_id,method_version,captured_at_ms)
+        SELECT id,id,1,captured_at_ms FROM "${schema}".telemetry_usage_correction_history
+         WHERE id BETWEEN 1000000+$1::integer AND 1000000+$2::integer`, [first, last]);
+    };
+    await bulkFacts(1, 39400);
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    observed.length = 0;
+    await compareExpansionRead(readers, scoped,
+      { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+    const groupedFactReads = observed.filter((entry) => entry.text.includes("occurrences.correction_sources")
+      && entry.text.includes("WITH ORDINALITY"));
+    assert.ok(groupedFactReads.some((entry) => entry.rows.length === 40002), "G+1 sentinel bounds SQL buffering");
+    assert.ok(groupedFactReads.some((entry) => entry.rows.length < 40001), "the incomplete tail is reissued");
+    await client.query("ROLLBACK");
+    await bulkFacts(39401, 39401);
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const limitInput = { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
+    for (const reader of [readers.base, readers.candidate]) {
+      await assert.rejects(reader.occurrences.readOwnerOccurrences(scoped, limitInput),
+        (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
+      await assert.rejects(reader.occurrences.readOwnerDayFingerprints(scoped, limitInput),
+        (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
+    }
+    await client.query("ROLLBACK");
+  } finally {
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
+    await readers.close();
+    await familyFirst.close();
+  }
+});
+
+
+test("READ-EXPANSION: missing correction dictionaries cannot hide a later logical batch", { skip: SKIP, timeout: 180_000 }, async () => {
+  const schema = `analytics_v2_expand_missing_${randomBytes(6).toString("hex")}`;
+  await pool.query(`CREATE SCHEMA "${schema}"`);
+  schemas.push(schema);
+  await applyPostgresMigrations({ role: "primary", schema, pool });
+  const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed,
+    correctionRuntime: "active", expansionCorrections: true });
+  const id = Buffer.from(modules.seed.codec.encodeTypedTelemetryId("event:readexp:00000")).toString("hex");
+  const columns = (await pool.query(`SELECT column_name FROM information_schema.columns
+    WHERE table_schema=$1 AND table_name='telemetry_usage_correction_history' ORDER BY ordinal_position`, [schema]))
+    .rows.map((row) => row.column_name);
+  assert.ok(columns.every((name) => /^[a-z_]+$/u.test(name)));
+  // Archived dictionary references intentionally have no FK. These facts
+  // reach the narrow cap but disappear at the unchanged mandatory wide join.
+  const expressions = columns.map((name) => name === "id" || name === "device_id" ? "2000000+n"
+    : name === "provider_id" ? "999999999" : `h."${name}"`);
+  await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_history (${columns.map((name) => `"${name}"`).join(",")})
+    SELECT ${expressions.join(",")} FROM generate_series(1,39400) n
+    CROSS JOIN LATERAL (SELECT * FROM "${schema}".telemetry_usage_correction_history
+      WHERE occurrence_id=decode($1,'hex') ORDER BY id LIMIT 1) h`, [id]);
+  await pool.query(`INSERT INTO "${schema}".telemetry_usage_correction_facts(id,history_id,method_version,captured_at_ms)
+    SELECT id,id,1,captured_at_ms FROM "${schema}".telemetry_usage_correction_history WHERE id>2000000`);
+  const readers = await loadExpansionReaders();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const seen = [];
+    const tracking = { query: async (...args) => {
+      const result = await client.query(...args);
+      const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (sql.includes("occurrences.correction_sources") && sql.includes("WITH ORDINALITY")) seen.push(result.rows);
+      return result;
+    } };
+    const input = { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
+    await compareExpansionRead(readers, { pool, client: tracking, schema, nowMs: NOW_MS }, input);
+    assert.ok(seen.length >= 2);
+    assert.ok(seen.every((rows) => rows.length < 40002 && rows.some((row) => row.sub_batch > 0)),
+      "wide output below G+1 retains facts from later batches for both Maps and fingerprints");
+    assert.equal((await client.query(`SELECT count(*)::integer AS count FROM "${schema}".telemetry_usage_correction_facts`)).rows[0].count, 40661,
+      "the narrow grouped input exceeds G+1 while the first logical batch is exactly 40000");
+  } finally {
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
+    await readers.close();
+  }
 });
