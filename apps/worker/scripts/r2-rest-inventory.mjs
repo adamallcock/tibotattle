@@ -169,6 +169,15 @@ export async function scanR2RestInventory(input) {
     } finally {
       clearTimeout(timer);
     }
+    // The REST API omits result_info for an empty initial list. Accept only
+    // that canonical envelope; absence on a continuation cannot prove completion.
+    const emptyInitialPage = cursor === null && pages === 1 && record(page)
+      && page.success === true && Array.isArray(page.result) && page.result.length === 0
+      && !Object.hasOwn(page, "result_info")
+      && Object.keys(page).every(name => ["success", "errors", "messages", "result"].includes(name))
+      && Array.isArray(page.errors) && page.errors.length === 0
+      && Array.isArray(page.messages) && page.messages.length === 0;
+    if (emptyInitialPage) break;
     if (!record(page) || page.success !== true || !Array.isArray(page.result)
         || page.result.length > pageSize || !record(page.result_info)
         || typeof page.result_info.is_truncated !== "boolean") {

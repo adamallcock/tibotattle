@@ -122,3 +122,40 @@ test("inventory rejects invalid target parameters before any provider request", 
   assert.equal(called, false);
   assert.ok(R2RestInventoryError.prototype instanceof Error);
 });
+
+
+test("canonical empty initial list without pagination is terminal and retains the empty digest", async () => {
+  let calls = 0;
+  const observed = { success: true, errors: [], messages: [], result: [] };
+  const actual = await scanR2RestInventory(input(async () => { calls++; return response(observed); }));
+  const explicit = await scanR2RestInventory(input(async () => response(page([]))));
+  assert.deepEqual(actual, explicit);
+  assert.equal(calls, 1);
+  assert.equal(actual.objects, 0);
+  assert.equal(actual.bytes, 0);
+  assert.equal(actual.pages, 1);
+});
+
+test("missing pagination refuses nonempty, contradictory and continuation envelopes", async () => {
+  const empty = { success: true, errors: [], messages: [], result: [] };
+  for (const malformed of [
+    { ...empty, result: [object("synthetic/private")] },
+    { ...empty, cursor: "next" },
+    { ...empty, is_truncated: true },
+    { ...empty, has_more: true },
+    { ...empty, total_count: 1 },
+    { ...empty, result_info: null },
+    { ...empty, result_info: {} },
+    { ...empty, errors: [{ code: 1000 }] },
+    { ...empty, messages: ["ambiguous"] },
+    { success: true, result: [] },
+  ]) {
+    await assert.rejects(scanR2RestInventory(input(async () => response(malformed))),
+      { code: "R2_INVENTORY_RESPONSE_INVALID" });
+  }
+  let calls = 0;
+  await assert.rejects(scanR2RestInventory(input(async () => response(calls++ === 0
+    ? page([object("synthetic/first")], "next") : empty))),
+  { code: "R2_INVENTORY_RESPONSE_INVALID" });
+  assert.equal(calls, 2);
+});

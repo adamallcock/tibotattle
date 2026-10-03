@@ -349,6 +349,12 @@ length depends on the export and import, which the cutover runbook orders.
    complete version weights and an unchanged head readback. Missing anchors,
    ambiguous metadata/order or a changing head refuse; they never authorize
    skipping history or weakening account inventory completeness.
+   The R2 quarantine scan accepts the API's canonical successful empty initial
+   list without `result_info` only when its errors and messages are empty and
+   no other envelope fields supply ambiguous pagination hints. This exception
+   applies only to the first cursor-free page; nonempty lists and continuation
+   pages still require explicit boolean truncation metadata. Missing metadata
+   never proves an empty continuation complete.
 
    ```bash
    node scripts/cloudflare-writer-fence.mjs inventory --plan=<private fence plan> --receipts=<private receipts directory>
