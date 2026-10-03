@@ -73,19 +73,19 @@ for (const extension of [false, true]) test(`real bundled owner and model-block 
   assert.ok(manifest.captures.some((capture) => capture.role === "owner"));
   assert.ok(manifest.captures.some((capture) => capture.role === "model-block"));
   assert.equal(manifest.skipped, 0);
-  if (extension) {
-    assert.equal(manifest.completeCoverage, false, "bounded phase history overflow is explicitly incomplete");
-    assert.ok(manifest.captures.some((capture) => capture.extension?.phases.error === "PHASE_PROFILE_TRUNCATED"));
-  } else assert.equal(manifest.completeCoverage, true);
+  assert.equal(manifest.completeCoverage, true);
   for (const capture of manifest.captures) {
-    if (extension && capture.extension.phases.error !== null) assert.equal(capture.error, "WORKER_PROFILE_EXTENSION_FAILED");
-    else assert.equal(capture.error, null);
+    assert.equal(capture.error, null);
     assert.ok(Number.isInteger(capture.termination.exitCode));
     assert.ok(capture.profileSha256);
     if (extension) {
       assert.ok(capture.extension.allocation.sha256);
       assert.ok(capture.extension.memory.sha256);
       assert.ok(capture.extension.phases.sha256);
+      const phases = JSON.parse(await readFile(join(directory, `isolate-${String(capture.id).padStart(3, "0")}`, "phases.json"), "utf8"));
+      assert.equal(phases.completeTemporalCoverage, false);
+      assert.equal(phases.contextIsNotExclusiveDuration, true);
+      assert.equal(phases.truncated, false);
     }
     assert.ok(capture.startInspectorMs >= 0);
     assert.ok(capture.stopAndPersistMs >= 0);

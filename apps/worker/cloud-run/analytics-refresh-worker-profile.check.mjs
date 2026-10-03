@@ -196,3 +196,33 @@ test("mixed artifact modes, wrong identity and changed hashes cannot qualify ext
     assert.equal(manifest.completeCoverage, false, kind);
   }
 });
+
+test("busy checkpoint hooks bound numeric stats by cadence and disclose coarse context", async () => {
+  const { startNumericMemory } = await import("./analytics-refresh-memory-profile.mjs");
+  const root = fixture(), c = createWorkerProfileCoordinator({ ...settings(root), memory: true },
+    { workerUrl: new URL(import.meta.url), mainUrl: new URL(import.meta.url) });
+  const config = c.grant("main");
+  let epoch = Date.now(), samples = 0, monotonicMs = 0;
+  const p = startWorkerProfile(config, { epochNow: () => epoch, now: () => monotonicMs, createSession: () => fake(empty), observerFactory: noObserver,
+    memoryFactory(options) { const memory = startNumericMemory(options); return {
+      sample(reason) { samples++; return memory.sample(reason); }, finish: () => memory.finish(),
+    }; } });
+  const start = epoch;
+  for (let index = 0; index < 10_000; index++) { monotonicMs = Math.floor(index / 100); epoch = start + monotonicMs; p.checkpoint(index % 2 ? 5 : 6); }
+  const beforeRollback = samples;
+  monotonicMs = 200; epoch = start - 1; p.checkpoint(7);
+  assert.equal(samples, beforeRollback + 1, "wall rollback must not suppress monotonic cadence sampling");
+  p.finish(); c.finish();
+  assert.ok(samples <= 10, `${samples} expensive checkpoint stats calls for 10000 hooks / 100ms`);
+  const phases = JSON.parse(readFileSync(join(config.directory, "phases.json")));
+  assert.ok(phases.coalescedChanges > 9900);
+  assert.ok(phases.epochRollbackCount > 0);
+  assert.equal(phases.wallClockRollbacksClamped, true);
+  assert.equal(phases.completeTemporalCoverage, false);
+  assert.equal(phases.contextIsNotExclusiveDuration, true);
+  assert.equal(phases.truncated, false);
+  assert.ok(phases.phases.length < 10);
+  assert.equal(JSON.parse(readFileSync(join(settings(root).directory, "manifest.json"))).completeCoverage, true);
+  console.log(JSON.stringify({ checkpointHooks: 10000, simulatedMs: 100, expensiveCheckpointStatsCalls: samples,
+    contextRows: phases.phases.length, coalescedChanges: phases.coalescedChanges, contextIntervalMs: phases.contextIntervalMs }));
+});

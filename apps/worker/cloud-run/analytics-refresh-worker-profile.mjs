@@ -14,7 +14,7 @@ const MIB = 1024 * 1024;
 export const WORKER_PROFILE_LIMITS = Object.freeze({ captures: 256, totalBytes: 512 * MIB,
   profileBytes: 2 * MIB - 8192, durationMs: 600_000, sampleUs: 10_000 });
 export const EXTENDED_PROFILE_LIMITS = Object.freeze({ cpuBytes: 1024 * 1024, allocationBytes: 768 * 1024,
-  memoryBytes: 64 * 1024, phaseBytes: 8 * 1024, phaseRows: 256 });
+  memoryBytes: 64 * 1024, phaseBytes: 8 * 1024, phaseRows: 256, contextIntervalMs: 2500, checkpointMemoryIntervalMs: 20 });
 export const PROFILE_WORK_PHASES = Object.freeze({ unknown: 0, modules: 1, read: 2, compute: 3, write: 4,
   prepare: 5, scalar: 6, model: 7, deserialize: 8, serialize: 9, workEnd: 10, captureOverhead: 11,
   captureEnd: 12, cache: 13, community: 14, lock: 15, state: 16, close: 17 });
@@ -68,8 +68,14 @@ function validateCaptureExtension(value, entry, directory, summary) {
   });
   else if (value.memory !== null) throw fault("WORKER_PROFILE_CAPTURE_INVALID");
   validateFile(value.phases, "phases.json", EXTENDED_PROFILE_LIMITS.phaseBytes, (receipt) => {
-    if (!exactKeys(receipt, ["schemaVersion", "phaseIdsAreWorkContext", "memoryReasonIdsAreSeparate", "phases", "truncated"])
+    if (!exactKeys(receipt, ["schemaVersion", "phaseIdsAreWorkContext", "memoryReasonIdsAreSeparate", "phases", "truncated", "contextIntervalMs", "checkpointMemoryIntervalMs", "coalescedChanges", "completeTemporalCoverage", "contextIsNotExclusiveDuration", "epochRollbackCount", "wallClockRollbacksClamped", "cadenceClock"])
         || receipt.schemaVersion !== "local-work-phases-v1" || receipt.phaseIdsAreWorkContext !== true
+        || receipt.cadenceClock !== "monotonic"
+        || receipt.contextIntervalMs !== EXTENDED_PROFILE_LIMITS.contextIntervalMs
+        || receipt.checkpointMemoryIntervalMs !== EXTENDED_PROFILE_LIMITS.checkpointMemoryIntervalMs
+        || !Number.isSafeInteger(receipt.coalescedChanges) || receipt.coalescedChanges < 0
+        || !Number.isSafeInteger(receipt.epochRollbackCount) || receipt.epochRollbackCount < 0 || receipt.wallClockRollbacksClamped !== true
+        || receipt.completeTemporalCoverage !== false || receipt.contextIsNotExclusiveDuration !== true
         || receipt.memoryReasonIdsAreSeparate !== true || typeof receipt.truncated !== "boolean"
         || !Array.isArray(receipt.phases) || receipt.phases.length > EXTENDED_PROFILE_LIMITS.phaseRows) throw fault("WORKER_PROFILE_CAPTURE_INVALID");
     let previous = 0;
@@ -202,19 +208,32 @@ export function createWorkerProfileCoordinator(settings, { workerUrl, mainUrl = 
 }
 /** Runtime profiler faults never replace the computation's outcome. */
 export function startWorkerProfile(config, { createSession = () => new Session(),
-  observerFactory = (callback) => new PerformanceObserver(callback), now = () => performance.now() } = {}) {
+  observerFactory = (callback) => new PerformanceObserver(callback), now = () => performance.now(),
+  epochNow = () => Date.now(), memoryFactory = startNumericMemory } = {}) {
   if (config === null || config === undefined) return null;
   const extended = config.modes !== undefined;
   let allocation = null, numericMemory = null;
-  const phases = []; let phaseTruncated = false;
+  const phases = []; let phaseTruncated = false, coalescedChanges = 0;
+  const seenContexts = new Set();
+  let lastContext = null, lastContextAt = -Infinity, lastMemoryAt = -Infinity, lastEpoch = 0, epochRollbackCount = 0;
   const phase = (id) => {
-    if (!extended || finished) return;
-    if (!Number.isInteger(id) || id < 0 || id > 17) return;
-    if (phases.at(-1)?.[1] !== id) {
-      if (phases.length >= EXTENDED_PROFILE_LIMITS.phaseRows) { phases.splice(1, 1); phaseTruncated = true; }
-      phases.push([Date.now(), id]);
+    if (!extended || finished || !Number.isInteger(id) || id < 0 || id > 17) return;
+    const cadenceMs = now();
+    const observedEpoch = epochNow();
+    if (observedEpoch < lastEpoch) epochRollbackCount += 1;
+    const timestamp = Math.max(observedEpoch, lastEpoch); lastEpoch = timestamp;
+    const boundary = [PROFILE_WORK_PHASES.workEnd, PROFILE_WORK_PHASES.captureOverhead, PROFILE_WORK_PHASES.captureEnd].includes(id);
+    if (lastContext !== id) {
+      if (boundary || !seenContexts.has(id) || cadenceMs - lastContextAt >= EXTENDED_PROFILE_LIMITS.contextIntervalMs) {
+        if (phases.length >= EXTENDED_PROFILE_LIMITS.phaseRows) { phases.splice(1, 1); phaseTruncated = true; }
+        phases.push([timestamp, id]); lastContextAt = cadenceMs;
+      } else coalescedChanges += 1;
+      seenContexts.add(id); lastContext = id;
     }
-    try { numericMemory?.sample(id === 11 ? 3 : 5); } catch { /* numeric receipt exposes sampling faults */ }
+    if (boundary || cadenceMs - lastMemoryAt >= EXTENDED_PROFILE_LIMITS.checkpointMemoryIntervalMs) {
+      lastMemoryAt = cadenceMs;
+      try { numericMemory?.sample(id === PROFILE_WORK_PHASES.captureOverhead ? 3 : 5); } catch { /* receipt exposes faults */ }
+    }
   };
   let session, observer, timer, finished = false, running = false, error = null;
   const started = now();
@@ -295,7 +314,9 @@ export function startWorkerProfile(config, { createSession = () => new Session()
       }
       try {
         extension.phases = persistCaptureArtifact(config.directory, "phases.json", { schemaVersion: "local-work-phases-v1",
-          phaseIdsAreWorkContext: true, memoryReasonIdsAreSeparate: true, phases, truncated: phaseTruncated }, EXTENDED_PROFILE_LIMITS.phaseBytes);
+          phaseIdsAreWorkContext: true, memoryReasonIdsAreSeparate: true, phases, truncated: phaseTruncated,
+          contextIntervalMs: EXTENDED_PROFILE_LIMITS.contextIntervalMs, checkpointMemoryIntervalMs: EXTENDED_PROFILE_LIMITS.checkpointMemoryIntervalMs,
+          coalescedChanges, completeTemporalCoverage: false, contextIsNotExclusiveDuration: true, epochRollbackCount, wallClockRollbacksClamped: true, cadenceClock: "monotonic" }, EXTENDED_PROFILE_LIMITS.phaseBytes);
         if (phaseTruncated) extension.phases.error = "PHASE_PROFILE_TRUNCATED";
       } catch { extension.phases = { bytes: 0, sha256: null, error: "PHASE_PROFILE_CAPTURE_FAILED" }; }
       if ([extension.allocation, extension.memory, extension.phases].some((entry) => entry?.error)) error ??= "WORKER_PROFILE_EXTENSION_FAILED";
@@ -320,7 +341,7 @@ export function startWorkerProfile(config, { createSession = () => new Session()
         || typeof config.modes.allocation !== "boolean" || typeof config.modes.memory !== "boolean"
         || !(config.modes.allocation || config.modes.memory) || config.profileBytes !== EXTENDED_PROFILE_LIMITS.cpuBytes)) throw fault("WORKER_PROFILE_SETTINGS_INVALID");
     privateDirectory(config.directory);
-    if (extended && config.modes.memory) numericMemory = startNumericMemory({ enabled: true,
+    if (extended && config.modes.memory) numericMemory = memoryFactory({ enabled: true,
       isolateId: config.id, role: config.role === "main" ? "main" : "worker", maxBytes: EXTENDED_PROFILE_LIMITS.memoryBytes });
     phase(PROFILE_WORK_PHASES.captureOverhead);
     const initStarted = now();
