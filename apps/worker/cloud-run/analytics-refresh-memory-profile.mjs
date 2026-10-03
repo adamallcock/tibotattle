@@ -108,9 +108,10 @@ export function startNumericMemory({ enabled = false, isolateId = 0, role = "mai
       gc: { count: gcCount, durationMs: finite(gcDurationMs) }, metricNames: MEMORY_METRICS,
       spaceNames: MEMORY_SPACES, rows, last, peaks, spacePeaks, rssPeakSample };
     // Bound the serialized receipt, including summaries; never truncate structured JSON.
-    while (Buffer.byteLength(JSON.stringify(finished)) > maxBytes && rows.length > 0) {
-      rows.shift(); finished.sampling.dropped += 1;
+    while (Buffer.byteLength(JSON.stringify(finished)) > maxBytes && rows.length > 2) {
+      rows.splice(1, 1); finished.sampling.dropped += 1;
     }
+    finished.sampling.historyTruncated = finished.sampling.dropped > 0;
     if (Buffer.byteLength(JSON.stringify(finished)) > maxBytes) throw new Error("MEMORY_PROFILE_BYTE_CAP");
     return structuredClone(finished);
   } });

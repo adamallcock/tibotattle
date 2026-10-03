@@ -59,3 +59,22 @@ assert.equal(recentResult.rows[0][1], MEMORY_PHASE.start);
 assert.equal(recentResult.rows[2][0], recentResult.last[0]);
 assert.ok(recentResult.rows[1][0] >= recentResult.last[0] - 20);
 assert.equal(recentResult.rows[3][1], MEMORY_PHASE.end);
+
+const large = Number.MAX_SAFE_INTEGER;
+const capped = startNumericMemory({ enabled: true, maxSamples: 128, maxBytes: 16_384,
+  adapters: { ...adapters,
+    memory: () => ({ heapUsed: large, heapTotal: large, external: large, arrayBuffers: large, rss: large }),
+    heap: () => ({ total_physical_size: large, used_heap_size: large, malloced_memory: large, peak_malloced_memory: large }),
+    spaces: () => ["read_only_space", "new_space", "old_space", "code_space", "shared_space",
+      "new_large_object_space", "large_object_space", "code_large_object_space", "shared_large_object_space",
+      "trusted_space", "trusted_large_object_space"].map((space_name) => ({ space_name, space_size: large,
+      space_used_size: large, space_available_size: large, physical_space_size: large })),
+  } });
+for (let i = 0; i < 30; i += 1) { tick += 20; capped.sample(); }
+const cappedResult = capped.finish();
+assert.ok(cappedResult.sampling.attempts < 128);
+assert.ok(cappedResult.sampling.dropped > 0);
+assert.equal(cappedResult.sampling.historyTruncated, true);
+assert.equal(cappedResult.rows[0][1], MEMORY_PHASE.start);
+assert.equal(cappedResult.rows.at(-1)[1], MEMORY_PHASE.end);
+assert.ok(Buffer.byteLength(JSON.stringify(cappedResult)) <= 16_384);
