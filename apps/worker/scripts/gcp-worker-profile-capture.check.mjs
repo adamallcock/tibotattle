@@ -62,9 +62,9 @@ async function run(workers, size, extra = {}) {
   } finally { await pool.abort(); assert.equal(pool.running, 0); }
 }
 
-test("real bundled owner and model-block capture preserves exact inline outputs", { timeout: 60000 }, async () => {
-  const directory = join(TEMP, "captures");
-  const captures = createWorkerProfileCoordinator({ directory, source: "a".repeat(40) },
+for (const extension of [false, true]) test(`real bundled owner and model-block capture preserves exact inline outputs (extension=${extension})`, { timeout: 60000 }, async () => {
+  const directory = join(TEMP, extension ? "extended-captures" : "captures");
+  const captures = createWorkerProfileCoordinator({ directory, source: "a".repeat(40), ...(extension ? { allocation: true, memory: true } : {}) },
     { workerUrl: pathToFileURL(join(TEMP, "analytics-refresh-worker.mjs")), runId: "synthetic-fixture" });
   const stats = await run(8, 14, { profileCapture: captures });
   captures.finish();
@@ -73,11 +73,20 @@ test("real bundled owner and model-block capture preserves exact inline outputs"
   assert.ok(manifest.captures.some((capture) => capture.role === "owner"));
   assert.ok(manifest.captures.some((capture) => capture.role === "model-block"));
   assert.equal(manifest.skipped, 0);
-  assert.equal(manifest.completeCoverage, true);
+  if (extension) {
+    assert.equal(manifest.completeCoverage, false, "bounded phase history overflow is explicitly incomplete");
+    assert.ok(manifest.captures.some((capture) => capture.extension?.phases.error === "PHASE_PROFILE_TRUNCATED"));
+  } else assert.equal(manifest.completeCoverage, true);
   for (const capture of manifest.captures) {
-    assert.equal(capture.error, null);
+    if (extension && capture.extension.phases.error !== null) assert.equal(capture.error, "WORKER_PROFILE_EXTENSION_FAILED");
+    else assert.equal(capture.error, null);
     assert.ok(Number.isInteger(capture.termination.exitCode));
     assert.ok(capture.profileSha256);
+    if (extension) {
+      assert.ok(capture.extension.allocation.sha256);
+      assert.ok(capture.extension.memory.sha256);
+      assert.ok(capture.extension.phases.sha256);
+    }
     assert.ok(capture.startInspectorMs >= 0);
     assert.ok(capture.stopAndPersistMs >= 0);
   }

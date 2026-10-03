@@ -112,7 +112,7 @@ function fail(code, detail) {
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
     cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null, workerProfileDir: null, workerProfileSource: null };
+    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null, workerProfileDir: null, workerProfileSource: null, allocationProfile: false, memoryProfile: false };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -129,6 +129,8 @@ function parseArguments(argv) {
       if (!/^\d+$/u.test(value ?? "") || Number(value) < 10 || Number(value) > 1800) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--pgstat-interval takes 10..1800 s");
       options.pgStatIntervalSeconds = Number(value);
     }
+    else if (argument === "--allocation-profile") options.allocationProfile = true;
+    else if (argument === "--memory-profile") options.memoryProfile = true;
     else if (argument === "--worker-profile-dir") options.workerProfileDir = resolve(next());
     else if (argument === "--worker-profile-source") options.workerProfileSource = next();
     else if (argument === "--cpu-profile") {
@@ -156,9 +158,10 @@ function parseArguments(argv) {
   if ((options.cpuProfileDir !== null || options.cpuProfileSummarySeconds !== null) && options.cpuProfileUs === null) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-dir and --cpu-profile-summary need --cpu-profile");
   }
+  if ((options.allocationProfile || options.memoryProfile) && options.cpuProfileUs !== null) fail("MEAS_SYNTH_ARGUMENT_INVALID", "Allocation/memory capture uses unified 10ms main CPU sampling; omit --cpu-profile");
   options.profile = measureProfile(options.profile);
   workerProfileEnv(options);
-  if (options.workerProfileDir !== null && (options.profile.workers < 2 || options.importOnly || options.guardProbe)) {
+  if (options.workerProfileDir !== null && ((options.profile.workers < 2 && !options.allocationProfile && !options.memoryProfile) || options.importOnly || options.guardProbe)) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "Worker profiling requires one local parallel refresh");
   }
   return options;
@@ -306,12 +309,15 @@ async function childPid(parentPid, { attempts = 50 } = {}) {
 }
 
 /** Explicit projection only; do not inherit local diagnostic settings from the environment. */
-export function workerProfileEnv({ workerProfileDir = null, workerProfileSource = null } = {}) {
-  if (workerProfileDir === null && workerProfileSource === null) return {};
+export function workerProfileEnv({ workerProfileDir = null, workerProfileSource = null, allocationProfile = false, memoryProfile = false } = {}) {
+  if (typeof allocationProfile !== "boolean" || typeof memoryProfile !== "boolean") fail("MEAS_SYNTH_ARGUMENT_INVALID", "Capture modes are boolean options");
+  if (workerProfileDir === null && workerProfileSource === null && !allocationProfile && !memoryProfile) return {};
   if (typeof workerProfileDir !== "string" || !workerProfileDir.startsWith("/")
       || !/^[a-f0-9]{40}$/u.test(workerProfileSource ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "Worker profile directory and exact source are required together");
   return { ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: workerProfileDir,
-    ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: workerProfileSource };
+    ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: workerProfileSource,
+    ...(allocationProfile ? { ANALYTICS_V2_LOCAL_WORKER_PROFILE_ALLOCATION: "1" } : {}),
+    ...(memoryProfile ? { ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY: "1" } : {}) };
 }
 
 /** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
@@ -538,7 +544,7 @@ async function main() {
       pgStat: options.pgStatIntervalSeconds === null ? null : { intervalMs: options.pgStatIntervalSeconds * 1000, snapshot: (label) => capturePgStat(pool, label) } });
     if (run.pgStat !== null) report.steps.refreshPgStat = run.pgStat;
     if (options.workerProfileDir !== null) report.steps.workerProfileCapture = { directory: options.workerProfileDir,
-      declaredSource: options.workerProfileSource, scope: "local synthetic isolate diagnostics; inspect manifest coverage" };
+      declaredSource: options.workerProfileSource, modes: { cpu: true, allocation: options.allocationProfile, memory: options.memoryProfile }, scope: "local synthetic isolate diagnostics; inspect manifest coverage" };
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,

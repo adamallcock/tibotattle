@@ -690,3 +690,13 @@ test("real production-tier callers abort cleanup failures independently of refre
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test("allocation and memory flags project explicitly and require private capture binding", async () => {
+  const { workerProfileEnv } = await import("./measure-local.mjs");
+  assert.throws(() => workerProfileEnv({ allocationProfile: true }), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+  assert.deepEqual(workerProfileEnv({ workerProfileDir: "/private/tmp/synthetic", workerProfileSource: "a".repeat(40), allocationProfile: true, memoryProfile: true }), {
+    ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: "/private/tmp/synthetic", ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: "a".repeat(40),
+    ANALYTICS_V2_LOCAL_WORKER_PROFILE_ALLOCATION: "1", ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY: "1",
+  });
+});

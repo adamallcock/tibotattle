@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync, chmodSync, readFileSync, existsSync, symlinkSync, readdirSync, writeFileSync, lstatSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -144,4 +145,54 @@ test("zero-capture runs cannot claim complete Worker coverage", () => {
   const root = fixture(), c = coordinator(root); c.finish();
   const manifest = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
   assert.equal(manifest.captures.length, 0); assert.equal(manifest.completeCoverage, false);
+});
+
+test("extended main and actual owner/block Workers share bounded CPU/allocation/memory capture", async () => {
+  const root = fixture();
+  const c = createWorkerProfileCoordinator({ ...settings(root), allocation: true, memory: true },
+    { workerUrl: new URL(import.meta.url), mainUrl: new URL(import.meta.url), runId: "extended-synthetic" });
+  const main = c.grant("main"), p = startWorkerProfile(main);
+  p.checkpoint(2);
+  for (const role of ["owner", "model-block"]) {
+    const config = c.grant(role, main.id), worker = await realWorker(config);
+    worker.on("exit", (code) => c.exited(config.id, code));
+    assert.equal((await once(worker, "message"))[0], "original-success");
+    await once(worker, "exit");
+  }
+  p.finish(); c.finish();
+  const manifest = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
+  assert.equal(manifest.completeCoverage, true);
+  assert.equal(manifest.captures.length, 3);
+  assert.equal(manifest.captures[0].termination, null);
+  for (const capture of manifest.captures) {
+    assert.equal(capture.extension.allocationRequested, true);
+    assert.equal(capture.extension.memoryRequested, true);
+    assert.ok(capture.extension.allocation.bytes > 0);
+    assert.ok(capture.extension.memory.bytes > 0);
+    assert.ok(capture.extension.phases.bytes > 0);
+  }
+});
+
+test("mixed artifact modes, wrong identity and changed hashes cannot qualify extended coverage", () => {
+  for (const kind of ["mode", "hash", "identity", "missing", "falseComplete"]) {
+    const root = fixture();
+    const c = createWorkerProfileCoordinator({ ...settings(root), memory: true },
+      { workerUrl: new URL(import.meta.url), mainUrl: new URL(import.meta.url) });
+    const config = c.grant("main"), p = startWorkerProfile(config);
+    p.finish();
+    const path = join(config.directory, "summary.json"), s = JSON.parse(readFileSync(path));
+    if (kind === "mode") s.extension.allocationRequested = true;
+    if (kind === "hash") s.extension.memory.sha256 = "a".repeat(64);
+    if (kind === "identity") {
+      const memoryPath = join(config.directory, "memory.json"), memory = JSON.parse(readFileSync(memoryPath));
+      memory.isolateId = 99; const data = JSON.stringify(memory);
+      writeFileSync(memoryPath, data); s.extension.memory.bytes = Buffer.byteLength(data);
+      s.extension.memory.sha256 = createHash("sha256").update(data).digest("hex");
+    }
+    if (kind === "missing") s.extension.memory = null;
+    if (kind === "falseComplete") s.extension.memory = { bytes: 0, sha256: null, error: "MEMORY_PROFILE_CAPTURE_FAILED" };
+    writeFileSync(path, JSON.stringify(s)); c.finish();
+    const manifest = JSON.parse(readFileSync(join(settings(root).directory, "manifest.json")));
+    assert.equal(manifest.completeCoverage, false, kind);
+  }
 });

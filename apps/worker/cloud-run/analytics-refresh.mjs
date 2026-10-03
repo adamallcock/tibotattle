@@ -196,7 +196,7 @@
  * source file still answers --help under plain Node 22.
  */
 
-import { readWorkerProfileSettings, createWorkerProfileCoordinator } from "./analytics-refresh-worker-profile.mjs";
+import { readWorkerProfileSettings, createWorkerProfileCoordinator, startWorkerProfile, PROFILE_WORK_PHASES } from "./analytics-refresh-worker-profile.mjs";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -1505,13 +1505,15 @@ export async function runAnalyticsRefresh({
   let failure;
   let profiler = null;
   let workerProfiles = null;
+  let mainCapture = null;
   let onSignal = null;
   try {
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
     const workerProfileSettings = readWorkerProfileSettings(env, { target: production?.target ?? null });
     if (workerProfileSettings !== null) workerProfiles = createWorkerProfileCoordinator(workerProfileSettings,
-      { workerUrl: dependencies.workerUrl ?? new URL("./analytics-refresh-worker.mjs", import.meta.url) });
+      { workerUrl: dependencies.workerUrl ?? new URL("./analytics-refresh-worker.mjs", import.meta.url), mainUrl: new URL(import.meta.url) });
+    if (workerProfileSettings?.allocation || workerProfileSettings?.memory) mainCapture = startWorkerProfile(workerProfiles.grant("main"));
     const resources = analyticsRefreshResources(env,
       dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit,
       // An injected heap limit is not this process's, so neither are its flags.
@@ -1522,7 +1524,7 @@ export async function runAnalyticsRefresh({
     // The opt-in profiler starts before the first refusal that can follow, so
     // a refused or failed run still leaves its exit summary.
     const profileSettings = readAnalyticsRefreshProfileSettings(env, { target: production?.target ?? null });
-    if (profileSettings !== null) {
+    if (profileSettings !== null && mainCapture === null) {
       profiler = await (dependencies.createProfiler ?? createAnalyticsRefreshProfiler)({
         settings: profileSettings,
         phase: () => phase,
@@ -1541,8 +1543,9 @@ export async function runAnalyticsRefresh({
         process.on("SIGTERM", onSignal);
       }
     }
-    const checkpoint = profiler === null ? guard.checkpoint : (event) => {
-      profiler.checkpoint(event);
+    const checkpoint = profiler === null && mainCapture === null ? guard.checkpoint : (event) => {
+      profiler?.checkpoint(event);
+      mainCapture?.checkpoint(PROFILE_WORK_PHASES[phase] ?? PROFILE_WORK_PHASES.unknown);
       guard.checkpoint(event);
     };
     // A deadline that leaves no room for the write and the exit is refused
@@ -1550,6 +1553,7 @@ export async function runAnalyticsRefresh({
     guard.checkpoint(Object.freeze({ kind: "start" }));
     const database = await resolveAnalyticsRefreshDatabase(env, { schema: parsed.schema });
     phase = "modules";
+    mainCapture?.checkpoint(PROFILE_WORK_PHASES.modules);
     const modules = dependencies.modules ?? await loadAnalyticsV2Modules();
     const { store, pipeline } = modules ?? {};
     if (typeof store?.writeRunOutputs !== "function"
@@ -1569,6 +1573,7 @@ export async function runAnalyticsRefresh({
     client = await pool.connect();
 
     phase = "lock";
+    mainCapture?.checkpoint(PROFILE_WORK_PHASES.lock);
     const lock = await client.query("SELECT pg_try_advisory_lock(hashtext($1)) AS acquired",
       [ANALYTICS_REFRESH_LOCK_KEY]);
     if (lock?.rows?.[0]?.acquired !== true) {
@@ -1576,6 +1581,7 @@ export async function runAnalyticsRefresh({
     } else {
       locked = true;
       phase = "read";
+      mainCapture?.checkpoint(PROFILE_WORK_PHASES.read);
       const readStartedMs = wallClock();
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       readOpen = true;
@@ -1641,11 +1647,12 @@ export async function runAnalyticsRefresh({
         readMs = Math.max(0, wallClock() - readStartedMs);
         // Owners are read in the same snapshot while they are computed.
         phase = "compute";
+        mainCapture?.checkpoint(PROFILE_WORK_PHASES.compute);
         outputs = await pipeline.compute(inputs, {
           mode: parsed.mode,
           nowMs,
           revisionSeed: parsed.revisionSeed,
-          ...(guard.active || profiler !== null ? { checkpoint } : {}),
+          ...(guard.active || profiler !== null || mainCapture !== null ? { checkpoint } : {}),
           ...(ownerPool === undefined ? {} : { ownerPool }),
         });
         const statements = ledger.summary();
@@ -1679,6 +1686,7 @@ export async function runAnalyticsRefresh({
       }
 
       phase = "write";
+      mainCapture?.checkpoint(PROFILE_WORK_PHASES.write);
       guard.beforeWrite(outputs.resources?.account?.accountBytes);
       const runId = (dependencies.randomUUID ?? randomUUID)();
       const written = await store.writeRunOutputs(client, outputs, {
@@ -1770,6 +1778,7 @@ export async function runAnalyticsRefresh({
         });
       }
     }
+    mainCapture?.finish(failure === undefined ? "complete" : "work-failed");
     if (workerProfiles !== null) {
       try { workerProfiles.finish({ analyticsRunId: receipt?.runId ?? null }); } catch {
         try { process.stderr.write(`${JSON.stringify({ workerProfile: "local-isolate-v1", coverage: "incomplete",

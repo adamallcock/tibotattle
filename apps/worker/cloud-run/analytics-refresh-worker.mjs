@@ -33,7 +33,7 @@
 import { constants as performanceConstants, PerformanceObserver } from "node:perf_hooks";
 import { deserialize, getHeapStatistics, serialize } from "node:v8";
 import { parentPort, workerData } from "node:worker_threads";
-import { startWorkerProfile } from "./analytics-refresh-worker-profile.mjs";
+import { startWorkerProfile, PROFILE_WORK_PHASES } from "./analytics-refresh-worker-profile.mjs";
 
 let isolateProfile = null;
 const startIsolateProfile = () => {
@@ -100,11 +100,13 @@ async function runBlock() {
       { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
   }
   const serializedBytes = receive.serialized.byteLength;
+  isolateProfile?.checkpoint?.(PROFILE_WORK_PHASES.deserialize);
   const input = deserialize(receive.serialized);
   receive.serialized = null;
   const cloneMs = receive.cloneMs + performance.now() - cloneStarted;
   const dates = [];
   let heapPeakBytes = getHeapStatistics().used_heap_size;
+  isolateProfile?.checkpoint?.(PROFILE_WORK_PHASES.model);
   const evaluationStarted = performance.now();
   for (const day of input.dates) {
     parentPort.postMessage({ type: "progress", event: { kind: "model", index: context.modelDates.indexOf(day), accountBytes: 0 } });
@@ -120,6 +122,7 @@ async function runBlock() {
     throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
       { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
   }
+  isolateProfile?.checkpoint?.(PROFILE_WORK_PHASES.serialize);
   const result = serialize(resultValue);
   if (result.buffer.byteLength > resultBoundBytes) {
     throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
@@ -318,6 +321,7 @@ async function run() {
       accountBytes: () => 0,
       progress: (event) => parentPort.postMessage({ type: "progress", event }),
       timed: async (phase, work) => {
+        isolateProfile?.checkpoint?.(PROFILE_WORK_PHASES[phase] ?? PROFILE_WORK_PHASES.unknown);
         const started = performance.now();
         try { return await work(); } finally { timings[phase] = (timings[phase] ?? 0) + (performance.now() - started); }
       },
