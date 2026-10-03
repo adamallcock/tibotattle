@@ -28,7 +28,9 @@
 // vendored files cannot do without). Each module is then written byte-for-byte
 // from its git blob. The three workspace packages are vendored whole
 // (package.json, index.js, index.d.ts and src/**). The only edits are the
-// `export ` tokens that EXPORT_PATCHES adds. Type-only imports are erased by
+// `export ` tokens that EXPORT_PATCHES adds and the reviewed, semantics-
+// preserving SOURCE_PATCHES hunks (exact text, located by text, reversible,
+// recorded in MANIFEST.json). Type-only imports are erased by
 // esbuild and are deliberately not vendored; for the few Worker modules that
 // vendored files name only for types, tsc emits declaration stubs from the
 // commit's sources so that tsc-checked consumers of entry.ts still typecheck.
@@ -165,6 +167,152 @@ export function assertPatchSpecs(patches) {
   }
 }
 assertPatchSpecs(EXPORT_PATCHES);
+
+/**
+ * Reviewed source patches: the only edits to vendored bytes beyond the export
+ * tokens. Each changes how fast a kernel computes, never what it computes, and
+ * carries its own argument for that in the patched text; the refresh's output
+ * parity with the unpatched kernels (every analytics_v2 table digest and the
+ * served body) is the acceptance gate, recorded with the change that adds one.
+ *
+ * A patch names a vendored Worker file, an id and its hunks. A hunk is an
+ * exact `find` text and its `replace` text. Hunks are applied in order to the
+ * export-patched file; each `find` must occur exactly once when it is applied,
+ * and each `replace` exactly once in the result, so the check can reverse
+ * every hunk and prove the file's git blob. Like the export patches they are
+ * located by text, not by line, and a commit where one does not resolve
+ * refuses the run (SOURCE_PATCH_UNRESOLVED): a re-vendor reviews them again.
+ */
+export const SOURCE_PATCHES = Object.freeze([
+  {
+    id: "usage-row-evidence-memo",
+    path: "apps/worker/src/quota-analysis-v11.ts",
+    // Parse and price each usage row once per row object: usageRowEvidence's row-only steps (the stored-record
+    // parse with its attribution, and the price) are memoized on the row in a WeakMap, keyed to the exact
+    // record_json and observed_at they were computed from; the session step still runs on every call, before
+    // the price. The GCP native path re-reads an owner's prepared usage rows for each of its 70 model windows
+    // (REFRESH-OPT d1).
+    hunks: [
+      { find: `async function usageRowEvidence(row: UsageRow,
+  session: (sessionKey: string | null, observedAtMs: number, scope: string | null) => Promise<Refusal | null>,
+): Promise<{ attribution: TelemetryV11Attribution; scope: string | null; end: number;
+  priced: NonNullable<ReturnType<typeof priceChunkUsageRecord>> } | Refusal | null> {
+  if (!TOKEN.test(row.provider)) return null;
+  const record = parseStoredRecordJson(row.record_json);
+  if (!record) return refused("invalid_attribution_record");
+  let attribution: TelemetryV11Attribution;
+  try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+  catch { return refused("invalid_attribution_record"); }
+`,
+        replace: `async function usageRowEvidence(row: UsageRow,
+  session: (sessionKey: string | null, observedAtMs: number, scope: string | null) => Promise<Refusal | null>,
+): Promise<{ attribution: TelemetryV11Attribution; scope: string | null; end: number;
+  priced: NonNullable<ReturnType<typeof priceChunkUsageRecord>> } | Refusal | null> {
+  if (!TOKEN.test(row.provider)) return null;
+  // GCP source patch usage-row-evidence-memo: the parse and the price are pure
+  // functions of (record_json, observed_at), memoized on the row object.
+  const memo = usageRowEvidenceMemo(row);
+  if (memo.attribution === null) return refused("invalid_attribution_record");
+  const attribution: TelemetryV11Attribution = memo.attribution;
+` },
+      { find: `  const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  if (priced === null) return null;
+  return { attribution, scope, end, priced };
+}
+`,
+        replace: `  if (memo.priced === undefined) memo.priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  const priced = memo.priced;
+  if (priced === null) return null;
+  return { attribution, scope, end, priced };
+}
+
+/** GCP source patch usage-row-evidence-memo (not in d43c8f92). The row-only
+ * steps of usageRowEvidence, each computed at most once per row object: the
+ * stored-record parse with its attribution (null when either refuses), and the
+ * price (undefined until first asked for, which keeps it after the session
+ * step). A memo answers only while the row still carries the exact
+ * record_json and observed_at it was computed from. Callers only read these
+ * values, and a throw is never memoized. Rows the GCP native path re-reads for
+ * each of an owner's model windows are then parsed and priced once. */
+interface UsageRowEvidenceMemo {
+  readonly recordJson: string;
+  readonly observedAt: string;
+  readonly attribution: TelemetryV11Attribution | null;
+  priced?: ReturnType<typeof priceChunkUsageRecord>;
+}
+const usageRowEvidenceMemos = new WeakMap<UsageRow, UsageRowEvidenceMemo>();
+function usageRowEvidenceMemo(row: UsageRow): UsageRowEvidenceMemo {
+  const known = usageRowEvidenceMemos.get(row);
+  if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) return known;
+  const record = parseStoredRecordJson(row.record_json);
+  let attribution: TelemetryV11Attribution | null = null;
+  if (record) {
+    try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+    catch { attribution = null; }
+  }
+  const memo: UsageRowEvidenceMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution };
+  usageRowEvidenceMemos.set(row, memo);
+  return memo;
+}
+` },
+    ],
+  },
+].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));
+
+const SOURCE_PATCH_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/** Throws unless every source patch names a Worker source file, an id and non-empty, distinct hunks, once per (id, path). */
+export function assertSourcePatchSpecs(patches) {
+  const seen = new Set();
+  for (const patch of patches) {
+    if (typeof patch.path !== "string" || !patch.path.startsWith(`${WORKER_SRC}/`) || patch.path.split("/").includes("..")) {
+      throw new VendorError("SOURCE_PATCH_SPEC_INVALID", `path ${JSON.stringify(patch.path)}`);
+    }
+    if (typeof patch.id !== "string" || !SOURCE_PATCH_ID.test(patch.id)) {
+      throw new VendorError("SOURCE_PATCH_SPEC_INVALID", `id ${JSON.stringify(patch.id)}`);
+    }
+    if (!Array.isArray(patch.hunks) || patch.hunks.length === 0 || !patch.hunks.every((hunk) => typeof hunk.find === "string"
+      && typeof hunk.replace === "string" && hunk.find.length > 0 && hunk.replace.length > 0 && hunk.find !== hunk.replace)) {
+      throw new VendorError("SOURCE_PATCH_SPEC_INVALID", `hunks of ${patch.id} in ${patch.path}`);
+    }
+    const key = `${patch.path}\0${patch.id}`;
+    if (seen.has(key)) throw new VendorError("SOURCE_PATCH_SPEC_INVALID", `duplicate ${patch.id} in ${patch.path}`);
+    seen.add(key);
+  }
+}
+assertSourcePatchSpecs(SOURCE_PATCHES);
+
+const occurrences = (text, part) => text.split(part).length - 1;
+
+/**
+ * Applies this file's source patches to its (export-patched) bytes, in list
+ * order: each hunk's `find` must occur exactly once (SOURCE_PATCH_UNRESOLVED),
+ * and afterwards each `replace` exactly once (SOURCE_PATCH_NOT_REVERSIBLE).
+ */
+export function applySourcePatches(path, bytes, patches = SOURCE_PATCHES) {
+  const mine = patches.filter((patch) => patch.path === path);
+  if (!mine.length) return bytes;
+  let text = bytes.toString("utf8");
+  for (const patch of mine) {
+    for (const [index, hunk] of patch.hunks.entries()) {
+      const found = occurrences(text, hunk.find);
+      if (found !== 1) throw new VendorError("SOURCE_PATCH_UNRESOLVED", `${path}: ${patch.id} hunk ${index + 1} matches ${found} times`);
+      text = text.replace(hunk.find, () => hunk.replace);
+    }
+  }
+  for (const patch of mine) {
+    for (const [index, hunk] of patch.hunks.entries()) {
+      if (occurrences(text, hunk.replace) !== 1) throw new VendorError("SOURCE_PATCH_NOT_REVERSIBLE", `${path}: ${patch.id} hunk ${index + 1}`);
+    }
+  }
+  return Buffer.from(text, "utf8");
+}
+
+/** A source patch as MANIFEST.json records it: where, which, how many hunks, and a digest of their exact texts. */
+export function sourcePatchRecord(patch) {
+  return { path: patch.path, id: patch.id, hunks: patch.hunks.length,
+    sha256: sha256(Buffer.from(JSON.stringify(patch.hunks.map(({ find, replace }) => [find, replace])), "utf8")) };
+}
 
 // ---------------------------------------------------------------------------
 // Commit and layout
@@ -938,8 +1086,9 @@ function resolveAuthoredSource(layout, authoredFrom, { provenance = true } = {})
 
 /**
  * Runs `fn` over a throwaway extraction of the commit laid out like the vendor
- * directory (export patches applied, authored files copied), then deletes it.
- * Every export patch must resolve by symbol before anything is extracted.
+ * directory (export and source patches applied, authored files copied), then
+ * deletes it. Every export patch must resolve by symbol, and every source
+ * patch by text, before anything is extracted.
  */
 export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFrom, provenance = true } = {}, fn) {
   const root = repoRoot();
@@ -957,11 +1106,16 @@ export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFr
   const blobs = readBlobs(root, extractable.map((path) => tree.get(path).blob));
   const textAt = (path) => (tree.has(path) && blobs.has(tree.get(path).blob) ? blobs.get(tree.get(path).blob).toString("utf8") : undefined);
   const exportPlan = await planExportPatches({ readText: textAt });
+  for (const patch of SOURCE_PATCHES) {
+    if (!extractable.includes(patch.path)) throw new VendorError("SOURCE_PATCH_UNRESOLVED", `${patch.path} is not in ${layout.commit}`);
+  }
+  const vendoredBytes = (path) => applySourcePatches(path, applyExportPatches(path, blobs.get(tree.get(path).blob), exportPlan));
   const scratch = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-"));
   try {
-    for (const path of extractable) writeFile(join(scratch, path), applyExportPatches(path, blobs.get(tree.get(path).blob), exportPlan));
+    for (const path of extractable) writeFile(join(scratch, path), vendoredBytes(path));
     for (const file of AUTHORED_FILES) writeFile(join(scratch, file), readFileSync(join(authored.dir, file)));
-    return await fn({ scratch, tree, exportPlan, authored, replacing, blobs: (path) => blobs.get(tree.get(path).blob) });
+    return await fn({ scratch, tree, exportPlan, authored, replacing, blobs: (path) => blobs.get(tree.get(path).blob),
+      vendoredBytes });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -1038,13 +1192,22 @@ export async function regenerateTypeStubs(manifest, { outRoot = WORKER_ROOT } = 
 // The manifest
 // ---------------------------------------------------------------------------
 
+/** A vendored file's MANIFEST.json `patch` value. */
+export function filePatchKind(exported, sourcePatched) {
+  return exported && sourcePatched ? "export+source" : exported ? "export" : sourcePatched ? "source" : "none";
+}
+
 /**
  * MANIFEST.json for one vendored commit. Its shape is schema v1 and does not
  * depend on how the patches were located: each applied patch records the line
  * the locator found and the declaration's recorded start. A symbol the commit
- * already exports adds `exportsAlreadyPresent` (absent otherwise).
+ * already exports adds `exportsAlreadyPresent` (absent otherwise). Source
+ * patches add `sourcePatches` (sourcePatchRecord) and their counts (absent
+ * without any); a file's `patch` is "none", "export", "source" or
+ * "export+source" (filePatchKind).
  */
-export function buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan }) {
+
+export function buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan, sourcePatches = [] }) {
   const applied = exportPlan.filter((resolution) => resolution.status === "apply");
   const present = exportPlan.filter((resolution) => resolution.status === "already-exported");
   return {
@@ -1063,6 +1226,7 @@ export function buildManifest({ layout, closure, files, typeStubs, parityTests, 
     },
     exportPatches: applied.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })),
     ...(present.length ? { exportsAlreadyPresent: present.map(({ path, line, symbol }) => ({ path, line, symbol })) } : {}),
+    ...(sourcePatches.length ? { sourcePatches: sourcePatches.map(sourcePatchRecord) } : {}),
     counts: {
       files: files.length,
       kernel: files.filter((file) => file.reach === "kernel").length,
@@ -1070,7 +1234,11 @@ export function buildManifest({ layout, closure, files, typeStubs, parityTests, 
       parity: files.filter((file) => file.reach === "parity").length,
       package: files.filter((file) => file.reach === "package").length,
       exportPatched: applied.length,
-      exportPatchedFiles: files.filter((file) => file.patch === "export").length,
+      exportPatchedFiles: files.filter((file) => file.patch === "export" || file.patch === "export+source").length,
+      ...(sourcePatches.length ? {
+        sourcePatched: sourcePatches.length,
+        sourcePatchedFiles: files.filter((file) => file.patch === "source" || file.patch === "export+source").length,
+      } : {}),
       typeStubs: typeStubs.length,
       parityTests: parityTests.length,
     },
@@ -1215,7 +1383,8 @@ export function workerIndexAt(root, commit) {
 export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom, provenance = true,
   onVocabularies } = {}) {
   const layout = vendorLayout({ commit, outRoot });
-  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored, replacing }) => {
+  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored, replacing,
+    vendoredBytes }) => {
     // 1. Runtime closure from the facade, the website normalizer and the parity specs.
     const esbuild = loadEsbuild();
     const parityInputs = new Set(paritySources().map(({ source }) => source));
@@ -1230,17 +1399,19 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
 
     // 2. Files: the closure plus the whole of each vendored package.
     const patchedPaths = new Set(exportPlan.filter((resolution) => resolution.status === "apply").map((resolution) => resolution.path));
+    const sourcePatchedPaths = new Set(SOURCE_PATCHES.map((patch) => patch.path));
     const files = [];
     for (const path of [...tree.keys()].sort()) {
       const pkg = PACKAGE_RULE.exec(path);
       const value = pkg && VENDORED_PACKAGES.includes(pkg[1]) ? "package" : reach.get(path);
       if (!value) continue;
-      const vendored = applyExportPatches(path, blobs(path), exportPlan);
+      const vendored = vendoredBytes(path);
       files.push({ path, blob: tree.get(path).blob, sha256: sha256(vendored),
-        patch: patchedPaths.has(path) ? "export" : "none", reach: value, bytes: vendored });
+        patch: filePatchKind(patchedPaths.has(path), sourcePatchedPaths.has(path)), reach: value, bytes: vendored });
     }
     for (const path of reach.keys()) if (!files.some((file) => file.path === path)) throw new VendorError("CLOSURE_INPUT_NOT_IN_TREE", path);
     for (const path of patchedPaths) if (!files.some((file) => file.path === path)) throw new VendorError("EXPORT_PATCH_FILE_NOT_VENDORED", path);
+    for (const path of sourcePatchedPaths) if (!files.some((file) => file.path === path)) throw new VendorError("SOURCE_PATCH_FILE_NOT_VENDORED", path);
 
     // 3. Declaration stubs for type-only imports that leave the runtime closure.
     const vendoredPaths = new Set(files.map((file) => file.path));
@@ -1260,7 +1431,7 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
     // 4. Prove the tree on its own before anything real is touched: stage exactly
     //    the files that would be written, then bundle, load and typecheck the
     //    stage, and derive the GCP-only vocabularies from it.
-    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan });
+    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan, sourcePatches: SOURCE_PATCHES });
     const stage = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-stage-"));
     let verified;
     let vocabularies;
@@ -1362,7 +1533,8 @@ async function dryRunGeneration({ layout, referenceDirectory }) {
 
 /**
  * Writes nothing in the repository. Resolves every export patch at `commit`,
- * confirms the resolvable set with the parser, and (when a reference manifest
+ * confirms the resolvable set with the parser, resolves every source patch's
+ * hunks by text (`sourcePatches`), and (when a reference manifest
  * is given) lists the reference's files whose blobs differ at `commit`, the
  * facade imports that no longer resolve and the commits the facade's provenance
  * text names. When the patches and the facade's imports resolve it then does
@@ -1392,6 +1564,17 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
       verification = { status: "failed", detail: error.message };
     }
   }
+  const sourcePatches = SOURCE_PATCHES.map((patch) => {
+    const text = readTextAt(root, layout.commit, patch.path);
+    if (text === undefined) return { path: patch.path, id: patch.id, status: "file-missing" };
+    try {
+      applySourcePatches(patch.path, Buffer.from(text, "utf8"), [patch]);
+      return { path: patch.path, id: patch.id, status: "apply" };
+    } catch (error) {
+      if (!(error instanceof VendorError)) throw error;
+      return { path: patch.path, id: patch.id, status: "unresolved", detail: error.message };
+    }
+  });
   const patches = resolutions.map(({ path, symbol, declaration, status, line, original, detail }) => ({
     path, symbol, declaration, status, ...(line === undefined ? {} : { line }), ...(original === undefined ? {} : { original }),
     ...(PATCH_OK.has(status) ? {} : { detail }),
@@ -1405,7 +1588,8 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
       return { entry: "entry.ts", named: commitsNamedIn(text), foreign: foreignCommitsNamed(text, layout.commit, known) };
     })()
     : null;
-  const patchesOk = resolutions.every((resolution) => PATCH_OK.has(resolution.status)) && verification.status === "passed";
+  const patchesOk = resolutions.every((resolution) => PATCH_OK.has(resolution.status)) && verification.status === "passed"
+    && sourcePatches.every((patch) => patch.status === "apply");
   const facadeOk = facade !== null && facade.unresolved.length === 0;
   let generation = { status: "skipped", detail: "a patch did not resolve" };
   if (patchesOk && !facadeOk) generation = { status: "skipped", detail: facade ? "the facade imports modules the commit no longer has" : "there is no reviewed facade to build with" };
@@ -1416,6 +1600,7 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
     patches,
     summary,
     verification,
+    sourcePatches,
     drift: reference ? driftAgainstReference(root, layout.commit, reference) : null,
     facade,
     provenance,

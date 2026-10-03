@@ -5,12 +5,13 @@
 // patches, commit transitions and vocabulary derivation. Run from apps/worker:
 //   node scripts/vendor-analytics-kernels.check.mjs
 // It needs the git objects of the vendored commit and fails closed without
-// them. The identity arithmetic (git blob ids, export-token removal and the
-// parity rewrite reversal) is implemented here independently of the generator;
-// only the reviewed lists are shared. The d43c8f92 export patches are pinned
-// below, both as the symbols the generator is given and as the lines the
-// generator must find them on; a tree holding another commit is checked
-// against its own manifest. The generated type stubs are checked by re-emitting
+// them. The identity arithmetic (git blob ids, export-token removal, source
+// patch reversal and the parity rewrite reversal) is implemented here
+// independently of the generator; only the reviewed lists are shared. The
+// d43c8f92 export patches are pinned below, both as the symbols the generator
+// is given and as the lines the generator must find them on, and so are the
+// source patches, by file, id, hunk count and digest of their exact texts; a
+// tree holding another commit is checked against its own manifest. The generated type stubs are checked by re-emitting
 // them, and by typechecking the app program plus one consumer of entry.ts with
 // this checkout's tsc. A scratch regeneration of the committed commit must
 // reproduce the committed tree and vocabularies byte for byte, and so must a
@@ -27,7 +28,8 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  applyExportPatches, assertExportPatchesResolved, assertPatchSpecs, assertSourceCommit, AUTHORED_FILES, buildManifest,
+  applyExportPatches, applySourcePatches, assertExportPatchesResolved, assertPatchSpecs, assertSourceCommit,
+  assertSourcePatchSpecs, AUTHORED_FILES, buildManifest, filePatchKind, SOURCE_PATCHES,
   commitsNamedIn, EXPORT_PATCHES, foreignCommitsNamed, locateExportSymbol, main, MANIFEST_FILE, MANIFEST_SCHEMA, maskNonCode,
   PARITY_HELPERS, PARITY_SPECS, parseArguments, parseCommit, planExportPatches, reachableInputs, regenerateTypeStubs,
   reportAtCommit, resolveExportPatches, SOURCE_COMMIT, VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches,
@@ -60,6 +62,14 @@ const PINNED_PATCH_SPECS = [
   ["apps/worker/src/storage-community-daily.ts", "publicInputs", "function"],
   ["apps/worker/src/quota-analysis-v1.ts", "buildPricingEvent", "function"],
 ].map(([path, symbol, declaration]) => ({ path, symbol, declaration }));
+/**
+ * Pinned on purpose, like the export patches: the reviewed source patches by
+ * file, id, hunk count and sha256 of their exact [find, replace] texts.
+ */
+const PINNED_SOURCE_PATCHES = [
+  ["apps/worker/src/quota-analysis-v11.ts", "usage-row-evidence-memo", 2,
+    "7cbb505b174d6ec236e396b5a1a5727a2ba81437a9ca5678955e5912604fc475"],
+].map(([path, id, hunks, sha256]) => ({ path, id, hunks, sha256 }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 
 const blobId = (bytes) => createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
@@ -102,10 +112,37 @@ function quotedRewrite(text, from, to) {
   return ["'", "\""].reduce((value, quote) => value.split(`${quote}${from}`).join(`${quote}${to}`), text);
 }
 
+/** The source patches' recorded digest, computed here from their texts. */
+const hunksDigest = (patch) => digest(Buffer.from(JSON.stringify(patch.hunks.map(({ find, replace }) => [find, replace])), "utf8"));
+const occurrences = (text, part) => text.split(part).length - 1;
+
+/**
+ * Undoes exactly the recorded source patches of `path`: last hunk first, each
+ * `replace` must occur exactly once and goes back to its `find`. The texts come
+ * from the reviewed list and must match the recorded digest.
+ */
+function reverseSourcePatches(path, bytes, sourcePatches) {
+  const recorded = sourcePatches.filter((patch) => patch.path === path);
+  if (!recorded.length) return bytes;
+  let text = bytes.toString("utf8");
+  for (const record of [...recorded].reverse()) {
+    const patch = SOURCE_PATCHES.find((candidate) => candidate.path === path && candidate.id === record.id);
+    assert.ok(patch, `${path}: no reviewed source patch ${record.id}`);
+    assert.equal(hunksDigest(patch), record.sha256, `${path}: ${record.id} texts differ from the recorded digest`);
+    assert.equal(patch.hunks.length, record.hunks);
+    for (const hunk of [...patch.hunks].reverse()) {
+      assert.equal(occurrences(text, hunk.replace), 1, `${path}: ${record.id} replacement is not present exactly once`);
+      text = text.replace(hunk.replace, () => hunk.find);
+    }
+  }
+  return Buffer.from(text, "utf8");
+}
+
 /** A vendored tree under test: where it lives, its manifest and the patches it must record. */
-function describeTree(layout, patches) {
+function describeTree(layout, patches, sourcePatches) {
   const manifest = JSON.parse(readFileSync(join(layout.vendorRoot, MANIFEST_FILE), "utf8"));
-  return { layout, manifest, patches, commit: layout.commit, short: layout.short };
+  return { layout, manifest, patches, sourcePatches: sourcePatches ?? manifest.sourcePatches ?? [],
+    commit: layout.commit, short: layout.short };
 }
 
 // ---------------------------------------------------------------------------
@@ -113,24 +150,32 @@ function describeTree(layout, patches) {
 // ---------------------------------------------------------------------------
 
 function assertManifestPins(tree) {
-  const { manifest, patches, commit } = tree;
+  const { manifest, patches, sourcePatches, commit } = tree;
   assert.equal(manifest.schemaVersion, MANIFEST_SCHEMA);
   assert.equal(manifest.sourceCommit, commit);
   assert.equal(git(["rev-parse", "--verify", `${commit}^{commit}`]).trim(), commit);
   assert.deepEqual(manifest.exportPatches, patches);
   assert.equal(manifest.counts.exportPatched, patches.length);
+  assert.deepEqual(manifest.sourcePatches ?? [], sourcePatches);
+  assert.equal(manifest.counts.sourcePatched ?? 0, sourcePatches.length);
   const patchedFiles = [...new Set(patches.map((patch) => patch.path))].sort();
-  assert.deepEqual(manifest.files.filter((file) => file.patch === "export").map((file) => file.path).sort(), patchedFiles);
-  assert.ok(manifest.files.every((file) => file.patch === (patchedFiles.includes(file.path) ? "export" : "none")));
+  const sourceFiles = [...new Set(sourcePatches.map((patch) => patch.path))].sort();
+  assert.ok(manifest.files.every((file) => file.patch === filePatchKind(patchedFiles.includes(file.path),
+    sourceFiles.includes(file.path))), "every file's patch kind is the patches recorded for it");
+  assert.deepEqual(manifest.files.filter((file) => file.patch.split("+").includes("export")).map((file) => file.path).sort(),
+    patchedFiles);
+  assert.deepEqual(manifest.files.filter((file) => file.patch.split("+").includes("source")).map((file) => file.path).sort(),
+    sourceFiles);
+  assert.equal(manifest.counts.sourcePatchedFiles ?? 0, sourceFiles.length);
 }
 
 function assertFilesMatchCommit(tree) {
-  const { manifest, patches, commit, layout } = tree;
+  const { manifest, patches, sourcePatches, commit, layout } = tree;
   const expected = revParse(commit, manifest.files.map((file) => file.path));
   for (const file of manifest.files) {
     const bytes = readFileSync(join(layout.vendorRoot, file.path));
     assert.equal(digest(bytes), file.sha256, `${file.path} sha256 differs from the manifest`);
-    const original = stripExportTokens(file.path, bytes, patches);
+    const original = stripExportTokens(file.path, reverseSourcePatches(file.path, bytes, sourcePatches), patches);
     if (file.patch === "export") {
       const count = patches.filter((patch) => patch.path === file.path).length;
       assert.equal(bytes.length, original.length + TOKEN.length * count, `${file.path} has edits beyond its export tokens`);
@@ -428,7 +473,8 @@ const RECORDED = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFES
 /** The commit the stable directory holds now: d43c8f92 today, the production commit after a re-vendor. */
 const CURRENT = RECORDED.sourceCommit;
 const CURRENT_LAYOUT = vendorLayout({ commit: CURRENT });
-const committedTrees = [describeTree(CURRENT_LAYOUT, CURRENT === COMMIT ? PINNED_EXPORT_PATCHES : RECORDED.exportPatches)];
+const committedTrees = [describeTree(CURRENT_LAYOUT, CURRENT === COMMIT ? PINNED_EXPORT_PATCHES : RECORDED.exportPatches,
+  CURRENT === COMMIT ? PINNED_SOURCE_PATCHES : RECORDED.sourcePatches ?? [])];
 
 test("the vendor root holds exactly the one stable tree, and the parity root exactly its specs", () => {
   assert.deepEqual(readdirSync(join(WORKER_ROOT, "vendor")).sort(), [STABLE_VENDOR_RELATIVE.split("/")[1]]);
@@ -440,7 +486,7 @@ for (const tree of committedTrees) {
   const isDefault = tree.commit === COMMIT;
   const title = (text) => (isDefault ? text : `[${tree.short}] ${text}`);
 
-  test(title(isDefault ? "the manifest pins d43c8f92 and exactly six export patches" : `the manifest pins ${tree.short} and its recorded export patches`), () => {
+  test(title(isDefault ? "the manifest pins d43c8f92, exactly six export patches and the pinned source patches" : `the manifest pins ${tree.short} and its recorded export and source patches`), () => {
     assertManifestPins(tree);
     if (!isDefault) return;
     assert.equal(SOURCE_COMMIT, COMMIT);
@@ -449,6 +495,10 @@ for (const tree of committedTrees) {
     assert.equal(tree.manifest.counts.exportPatched, 6);
     assert.equal(tree.manifest.counts.exportPatchedFiles, 3);
     assert.equal(tree.manifest.exportsAlreadyPresent, undefined);
+    assert.deepEqual(SOURCE_PATCHES.map((patch) => ({ path: patch.path, id: patch.id, hunks: patch.hunks.length,
+      sha256: hunksDigest(patch) })), PINNED_SOURCE_PATCHES);
+    assert.equal(tree.manifest.counts.sourcePatched, PINNED_SOURCE_PATCHES.length);
+    assert.equal(tree.manifest.counts.sourcePatchedFiles, new Set(PINNED_SOURCE_PATCHES.map((patch) => patch.path)).size);
   });
 
   test(title("the generated GCP-only vocabularies are exactly what the vendored tree gives"), async () => {
@@ -464,7 +514,7 @@ for (const tree of committedTrees) {
     assert.equal(derived.communityDailyReadSchemaVersion, "community-daily-read-v1.0");
   });
 
-  test(title(`every vendored file equals git rev-parse ${tree.short}:<path> after export-token removal`), () => {
+  test(title(`every vendored file equals git rev-parse ${tree.short}:<path> after source-patch reversal and export-token removal`), () => {
     assertFilesMatchCommit(tree);
   });
 
@@ -620,6 +670,37 @@ test("the patch list names symbols and kinds, never lines", () => {
   assert.throws(() => assertPatchSpecs([{ ...patchFor("a"), path: "apps/worker/test/a.ts" }]), refusedWith("EXPORT_PATCH_SPEC_INVALID"));
   assert.throws(() => assertPatchSpecs([{ ...patchFor("a"), path: "apps/worker/src/../x.ts" }]), refusedWith("EXPORT_PATCH_SPEC_INVALID"));
   assert.throws(() => assertPatchSpecs([patchFor("a"), patchFor("a")]), refusedWith("EXPORT_PATCH_SPEC_INVALID"));
+});
+
+test("source patches name a Worker file, an id and non-empty distinct hunks, once per file", () => {
+  const ok = { path: "apps/worker/src/a.ts", id: "a-patch", hunks: [{ find: "x", replace: "y" }] };
+  assertSourcePatchSpecs([ok]);
+  for (const bad of [{ ...ok, path: "apps/worker/test/a.ts" }, { ...ok, path: "apps/worker/src/../a.ts" },
+    { ...ok, id: "Not An Id" }, { ...ok, hunks: [] }, { ...ok, hunks: [{ find: "", replace: "y" }] },
+    { ...ok, hunks: [{ find: "x", replace: "x" }] }, { ...ok, hunks: [{ find: "x" }] }]) {
+    assert.throws(() => assertSourcePatchSpecs([bad]), refusedWith("SOURCE_PATCH_SPEC_INVALID"));
+  }
+  assert.throws(() => assertSourcePatchSpecs([ok, ok]), refusedWith("SOURCE_PATCH_SPEC_INVALID"));
+  assertSourcePatchSpecs([ok, { ...ok, path: "apps/worker/src/b.ts" }]);
+});
+
+test("a source patch applies only where each hunk matches exactly once, and only when it can be reversed", () => {
+  const path = "apps/worker/src/a.ts";
+  const patch = (hunks) => [{ path, id: "a-patch", hunks }];
+  const bytes = Buffer.from("const a = 1;\nconst b = 2;\n");
+  assert.equal(applySourcePatches(path, bytes, patch([{ find: "const b = 2;", replace: "const b = 3;" },
+    { find: "a = 1", replace: "a = 4" }])).toString(), "const a = 4;\nconst b = 3;\n");
+  assert.equal(applySourcePatches("apps/worker/src/other.ts", bytes, patch([{ find: "zzz", replace: "y" }])), bytes);
+  assert.throws(() => applySourcePatches(path, bytes, patch([{ find: "const c", replace: "y" }])),
+    refusedWith("SOURCE_PATCH_UNRESOLVED"));
+  assert.throws(() => applySourcePatches(path, bytes, patch([{ find: "const ", replace: "let " }])),
+    refusedWith("SOURCE_PATCH_UNRESOLVED"));
+  // A replacement the file already holds elsewhere, or one a later hunk
+  // rewrites, could not be undone unambiguously.
+  assert.throws(() => applySourcePatches(path, bytes, patch([{ find: "const b = 2;", replace: "const a = 1;" }])),
+    refusedWith("SOURCE_PATCH_NOT_REVERSIBLE"));
+  assert.throws(() => applySourcePatches(path, bytes, patch([{ find: "a = 1", replace: "a = 4" },
+    { find: "a = 4;", replace: "a = 5;" }])), refusedWith("SOURCE_PATCH_NOT_REVERSIBLE"));
 });
 
 test("a function is found by symbol wherever it sits, and the line is derived", () => {
@@ -1282,6 +1363,7 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.deepEqual(report.patches.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })), PINNED_EXPORT_PATCHES);
   assert.deepEqual(report.summary, { apply: 6 });
   assert.equal(report.verification.status, "passed");
+  assert.deepEqual(report.sourcePatches, PINNED_SOURCE_PATCHES.map(({ path, id }) => ({ path, id, status: "apply" })));
   assert.deepEqual(report.drift.changed, []);
   assert.deepEqual(report.drift.removed, []);
   assert.equal(report.drift.identical, report.drift.checked);

@@ -69,6 +69,14 @@
       "original": "function buildPricingEvent("
     }
   ],
+  "sourcePatches": [
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "id": "usage-row-evidence-memo",
+      "hunks": 2,
+      "sha256": "7cbb505b174d6ec236e396b5a1a5727a2ba81437a9ca5678955e5912604fc475"
+    }
+  ],
   "counts": {
     "files": 132,
     "kernel": 84,
@@ -77,6 +85,8 @@
     "package": 40,
     "exportPatched": 6,
     "exportPatchedFiles": 3,
+    "sourcePatched": 1,
+    "sourcePatchedFiles": 1,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -350,8 +360,8 @@
     {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
-      "sha256": "6b1e1b9f94a9b31653e5c02218cb3a696190bef24c2a3e77e7e3dd2e86be06f6",
-      "patch": "none",
+      "sha256": "0acaf410ff760bca0c2da45e2eab22d033ccb1709cd995e31ef9ce941c4384a7",
+      "patch": "source",
       "reach": "kernel"
     },
     {

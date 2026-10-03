@@ -1081,20 +1081,50 @@ async function usageRowEvidence(row: UsageRow,
 ): Promise<{ attribution: TelemetryV11Attribution; scope: string | null; end: number;
   priced: NonNullable<ReturnType<typeof priceChunkUsageRecord>> } | Refusal | null> {
   if (!TOKEN.test(row.provider)) return null;
-  const record = parseStoredRecordJson(row.record_json);
-  if (!record) return refused("invalid_attribution_record");
-  let attribution: TelemetryV11Attribution;
-  try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
-  catch { return refused("invalid_attribution_record"); }
+  // GCP source patch usage-row-evidence-memo: the parse and the price are pure
+  // functions of (record_json, observed_at), memoized on the row object.
+  const memo = usageRowEvidenceMemo(row);
+  if (memo.attribution === null) return refused("invalid_attribution_record");
+  const attribution: TelemetryV11Attribution = memo.attribution;
   const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
   const end = Date.parse(row.observed_at);
   if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
   const sessionKey = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
   const rejected = await session(sessionKey, end, scope);
   if (rejected) return rejected;
-  const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  if (memo.priced === undefined) memo.priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  const priced = memo.priced;
   if (priced === null) return null;
   return { attribution, scope, end, priced };
+}
+
+/** GCP source patch usage-row-evidence-memo (not in d43c8f92). The row-only
+ * steps of usageRowEvidence, each computed at most once per row object: the
+ * stored-record parse with its attribution (null when either refuses), and the
+ * price (undefined until first asked for, which keeps it after the session
+ * step). A memo answers only while the row still carries the exact
+ * record_json and observed_at it was computed from. Callers only read these
+ * values, and a throw is never memoized. Rows the GCP native path re-reads for
+ * each of an owner's model windows are then parsed and priced once. */
+interface UsageRowEvidenceMemo {
+  readonly recordJson: string;
+  readonly observedAt: string;
+  readonly attribution: TelemetryV11Attribution | null;
+  priced?: ReturnType<typeof priceChunkUsageRecord>;
+}
+const usageRowEvidenceMemos = new WeakMap<UsageRow, UsageRowEvidenceMemo>();
+function usageRowEvidenceMemo(row: UsageRow): UsageRowEvidenceMemo {
+  const known = usageRowEvidenceMemos.get(row);
+  if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) return known;
+  const record = parseStoredRecordJson(row.record_json);
+  let attribution: TelemetryV11Attribution | null = null;
+  if (record) {
+    try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+    catch { attribution = null; }
+  }
+  const memo: UsageRowEvidenceMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution };
+  usageRowEvidenceMemos.set(row, memo);
+  return memo;
 }
 
 export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string): Promise<V11PreparedUsageFeature> {

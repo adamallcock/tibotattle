@@ -28,8 +28,10 @@
  * Production's daily lane (storage-community-daily.ts) folds every record of
  * an owner-day with no day bound.
  *
- * This module composes the same exported kernel steps in memory. Nothing in
- * vendor/ is edited. The bounds that do apply are:
+ * This module composes the same exported kernel steps in memory. vendor/
+ * carries no GCP edit beyond the generator's export tokens and its reviewed,
+ * semantics-preserving source patches (vendor-analytics-kernels.mjs
+ * SOURCE_PATCHES). The bounds that do apply are:
  * - every kernel bound inside those steps (1,000,000 windowed usage rows,
  *   100,000 sessions, the 8 MiB reduction checkpoint, the quota and plan
  *   limits). These define production's published answer, so they stay;
