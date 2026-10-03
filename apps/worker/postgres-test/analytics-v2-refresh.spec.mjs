@@ -2418,6 +2418,82 @@ test("PG17 N-EXCL: an exclusion leaves its owner out of the days it covers, repu
   });
 });
 
+// N-EXCL (K-CORE-A review): an owner excluded on day D is outside D's
+// cohort, as d43c8f92's weekly builder removed an excluded participant before
+// anything else. Its refusals (a refused owner-day, typed evidence of a
+// non-effective source) are recorded as before but block no day it is
+// excluded on; a day stays blocked while one owner not excluded on it blocks it.
+test("PG17 N-EXCL: an excluded owner's refusals are recorded but block no day it is excluded on", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("exclusion-refusals", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    // Staged runtime: alpha's crossed-midnight occurrence is a conflict on D1
+    // and D2, and bravo (mixed) and echo (v1.1) are typed non-effective
+    // members of the daily cohort with evidence on D1.
+    const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules,
+      correctionRuntime: "staged" });
+    const { alpha, bravo, echo } = fixture.owners;
+    const { D1, D2, D3 } = seedFixture;
+    const pipeline = realPipeline();
+    const now = new Date(seedFixture.NOW_MS).toISOString();
+    const exclusions = quoted(schema, "community_aggregate_exclusions");
+    let next = 0;
+    const exclude = (participantId, fromDay, throughDay) => pool.query(`INSERT INTO ${exclusions} (exclusion_id,
+        participant_id, scope, reason_code, state, effective_at, expires_at, created_at, created_by_digest)
+      VALUES ($1, $2, 'community_weekly', 'data_quality', 'active', $3, $4, $3, $5)`,
+    [`synthetic-exclusion-${next += 1}`, participantId, `${fromDay}T00:00:00.000Z`,
+      new Date(Date.parse(`${throughDay}T00:00:00.000Z`) + 86_400_000).toISOString(), "e".repeat(64)]);
+    const lastRefusals = async () => (await runRows(pool, schema)).at(-1).refusals;
+    const alphaRows = async () => {
+      const rows = {};
+      for (const table of ["analytics_v2_owner_day", "analytics_v2_cache_bands", "analytics_v2_owner_model_dates"]) {
+        rows[table] = (await pool.query(`SELECT COALESCE(jsonb_agg(to_jsonb(t) - 'run_id'
+            ORDER BY (to_jsonb(t) - 'run_id')::text), '[]'::jsonb)::text AS rows
+           FROM ${quoted(schema, table)} t WHERE owner_digest = $1`, [alpha.ownerDigest])).rows[0].rows;
+      }
+      return rows;
+    };
+
+    const first = await runJob({ schema, now, pipeline });
+    assert.equal(first.state, "complete");
+    assert.deepEqual(first.blocked, [D1, D2]);
+    assert.deepEqual(first.published, [D3]);
+    const refusals = await lastRefusals();
+    const daily = (ownerDigest) => refusals.filter((refusal) => refusal.ownerDigest === ownerDigest
+      && refusal.family === "daily").map((refusal) => `${refusal.day}:${refusal.reason}`);
+    assert.deepEqual(daily(alpha.ownerDigest), [`${D1}:source_conflict_or_order`, `${D2}:source_conflict_or_order`]);
+    assert.deepEqual(daily(bravo.ownerDigest), [`${D1}:non_effective_source_unported`]);
+    assert.deepEqual(daily(echo.ownerDigest), [`${D1}:non_effective_source_unported`]);
+    const ownRows = await alphaRows();
+
+    // alpha excluded on D1 and D2: D2 (alpha its only blocker) publishes; D1
+    // stays blocked by bravo and echo, which are not excluded on it.
+    await exclude(alpha.participantId, D1, D2);
+    const second = await runJob({ schema, now, pipeline });
+    assert.equal(second.state, "complete");
+    assert.deepEqual(second.blocked, [D1]);
+    assert.deepEqual(second.published, [D2]);
+    assert.deepEqual(await lastRefusals(), refusals, "every refusal is recorded as before");
+
+    // bravo and echo excluded on D1 too: nothing blocks it any more.
+    await exclude(bravo.participantId, D1, D1);
+    await exclude(echo.participantId, D1, D1);
+    const third = await runJob({ schema, now, pipeline });
+    assert.equal(third.state, "complete");
+    assert.deepEqual(third.blocked, []);
+    assert.deepEqual(third.published, [D1]);
+    assert.deepEqual(await lastRefusals(), refusals);
+    const heads = await publishedRows(pool, schema);
+    assert.deepEqual([...heads.keys()], [D1, D2, D3]);
+    // D1 and D2 hold no evidence of an owner of their cohort: alpha, bravo and
+    // echo are left out of their folds, not counted.
+    for (const day of [D1, D2]) assert.equal(heads.get(day).payload.totals.contributingParticipants, 0, day);
+    assert.deepEqual(await alphaRows(), ownRows, "the excluded owner's own rows are unchanged");
+  });
+});
+
 // K-PAR: owners computed by compute Workers merge to exactly the inline rows.
 test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes exactly the inline run's rows", {
   skip: PG_SKIP,
@@ -2577,12 +2653,13 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
  * A-2 compute. `countOf(ownerDigest, stream, day, actual)` may override a
  * count A-1 reports; `reads` records the owner of every occurrence read.
  */
-function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream, _day, actual) => actual, reads = [] }) {
+function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream, _day, actual) => actual, reads = [],
+  exclusionRead = () => NO_EXCLUSION_READER.readAnalyticsV2Exclusions() }) {
   const daysOf = (ownerDigest, stream, fromDay, throughDay) => [...(facts.get(ownerDigest) ?? new Map())]
     .filter(([day, streams]) => day >= fromDay && day <= throughDay && streams[stream].length > 0);
   return job.createAnalyticsV2Pipeline({
     owners: { listAnalyticsV2Owners: async () => ({ owners, unlinked: [], correctionRuntimeActive: true }),
-      ...NO_EXCLUSION_READER },
+      readAnalyticsV2Exclusions: async () => exclusionRead() },
     queuedDays: {
       readQueuedDays: async (context, { afterSequence }) => {
         const events = journal.filter((event) => event.sequence > afterSequence);
@@ -2709,7 +2786,9 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
   // A-1 counts 200,000 usage occurrences on today (an estimate of about 1.6 GB).
   const countOf = (ownerDigest, stream, day, actual) =>
     (grown && ownerDigest === big.digest && stream === "usage" && day === synthetic.TODAY ? 200_000 : actual);
-  const pipeline = syntheticPipeline({ owners, facts, journal, countOf, reads });
+  // The table's read (A-1 readAnalyticsV2Exclusions' shape): none until the third run.
+  let exclusionRead = NO_EXCLUSION_READER.readAnalyticsV2Exclusions();
+  const pipeline = syntheticPipeline({ owners, facts, journal, countOf, reads, exclusionRead: () => exclusionRead });
   await withDatabase("memory-budget", async ({ pool, createSchema }) => {
     const { schema } = await createSchema();
     const now = new Date(synthetic.NOW_MS).toISOString();
@@ -2757,6 +2836,35 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
     assert.equal(previewBefore.coverage.uploadingParticipantCount, 4);
     const preview = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`)).rows[0].preview;
     assert.equal(preview, null);
+
+    // N-EXCL: the operator excludes it from every day. It is still refused
+    // and never read, but its refusals no longer decide the community
+    // outputs: today publishes, and the preview is the cohort's without it.
+    exclusionRead = { rows: 1, active: 1, sha256: "3".repeat(64), activeByParticipant: new Map([
+      [synthetic.effectiveV2Owner(big).participantId, [{ effectiveAtUs: 0, expiresAtUs: null }]]]) };
+    reads.length = 0;
+    const third = await runJob({ schema, now, pipeline });
+    assert.equal(third.state, "complete");
+    assert.equal(reads.includes(big.digest), false, "an excluded refused owner is still never read");
+    // The changed table queues every published day, each holding its evidence:
+    // one owner refusal and a daily refusal for each, recorded as before.
+    assert.deepEqual(third.refusalsByReason, { memory_budget: 1 + corpus.publishedDays.length });
+    assert.deepEqual(third.exclusions, { rows: 1, active: 1, excludedOwners: 1, changed: true,
+      republishedDays: corpus.publishedDays.length - 1 });
+    assert.deepEqual(third.blocked, []);
+    // It contributed to every day of the first run's heads, so each day it is
+    // now left out of is a new revision.
+    assert.deepEqual(third.published, corpus.publishedDays);
+    assert.deepEqual((await runRows(pool, schema))[2].refusals, [
+      { ownerDigest: big.digest, day: null, family: "owner", reason: "memory_budget" },
+      ...corpus.publishedDays.map((day) => ({ ownerDigest: big.digest, day, family: "daily", reason: "memory_budget" })),
+    ]);
+    const excludedPreview = (await pool.query(`SELECT preview FROM ${quoted(schema, "analytics_v2_preview")}`))
+      .rows[0].preview;
+    assert.notEqual(excludedPreview, null);
+    assert.equal(excludedPreview.coverage.uploadingParticipantCount, 3);
+    assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_fits"), fits,
+      "the refused owner's stored fit is retained");
   });
 });
 

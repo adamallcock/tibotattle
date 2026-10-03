@@ -41,9 +41,18 @@
  *   never pins a result.
  * - A refused owner-day blocks that queued community day; the day keeps its
  *   prior published revision (A-3).
+ * - Community aggregate exclusions (N-EXCL, compute-community.ts): an owner
+ *   excluded on day D is outside D's community cohort, as d43c8f92's weekly
+ *   builder removed an excluded participant before anything else. So its
+ *   refusals (non-effective typed evidence, the memory budget, a refused
+ *   owner-day) never block D, and its missing fit never withholds the
+ *   preview when it is excluded on every day the preview carries. Its own
+ *   refusals are recorded exactly as before; `blockedDays` lists only the
+ *   days a non-excluded owner blocks.
  * - The preview follows d43c8f92 publishStorageCommunityGraphPreview: it is
- *   built only when every effective owner has a current fits result. One
- *   effective owner without one (a refused scalar fit, or the memory budget)
+ *   built only when every effective owner of its cohort has a current fits
+ *   result. One effective owner without one (a refused scalar fit, or the
+ *   memory budget) that is not excluded on every day the preview carries
  *   withholds it: preview is null and A-4 serves the allowance as
  *   temporarily unavailable. A partial fit cohort is never published, because
  *   the preview's coverage counts would silently omit that owner. (Production
@@ -293,8 +302,10 @@ export interface ComputeAnalyticsV2Input {
   /**
    * N-EXCL (exclusions.ts): owner -> its active community aggregate
    * exclusions. An owner excluded on day D is left out of D's daily fold and
-   * the preview's day D; its own rows are computed as before. Every key must
-   * be an owner of the run. Defaults to none.
+   * the preview's day D; its refusals block no day it is excluded on, and
+   * its missing fit withholds the preview only while it is a member of a day
+   * the preview carries. Its own rows and refusals are computed as before.
+   * Every key must be an owner of the run (of any source). Defaults to none.
    */
   readonly exclusions?: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
   /**
@@ -616,7 +627,17 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const ownerFits: AnalyticsV2OwnerFitsRow[] = [];
   const ownerModelDates: AnalyticsV2OwnerModelDateRow[] = [];
   const ownerResources: AnalyticsV2OwnerResources[] = [];
-  const blocked = new Set<AnalyticsV2Day>();
+  /**
+   * queued day -> the owners that block it (a refused owner-day, the memory
+   * budget or non-effective typed evidence). The community fold decides which
+   * of them block the community day: only an owner not excluded on it.
+   */
+  const blockers = new Map<AnalyticsV2Day, Set<AnalyticsV2OwnerDigest>>();
+  const block = (day: AnalyticsV2Day, ownerDigest: AnalyticsV2OwnerDigest): void => {
+    const owners = blockers.get(day);
+    if (owners === undefined) blockers.set(day, new Set([ownerDigest]));
+    else owners.add(ownerDigest);
+  };
   /** queued day -> computed owner -> unfinalized daily values (owners in digest order). */
   const dailyValues = new Map<AnalyticsV2Day, Map<AnalyticsV2OwnerDigest, V11DailyProjectionValues>>(
     queued.map((day) => [day, new Map()]));
@@ -767,7 +788,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
       if (owner.hasV1 || owner.hasV11 || owner.hasV12) {
         for (const day of queued) {
           if (occurrences !== undefined && !hasEvidence(occurrences.get(day))) continue;
-          blocked.add(day);
+          block(day, ownerDigest);
           pushRefusal(analyticsV2Refusal(ownerDigest, day, "daily", "non_effective_source_unported"));
         }
       }
@@ -785,7 +806,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
       pushRefusal(analyticsV2Refusal(ownerDigest, null, "owner", "memory_budget"));
       for (const day of queued) {
         if (!evidence.has(day)) continue;
-        blocked.add(day);
+        block(day, ownerDigest);
         pushRefusal(analyticsV2Refusal(ownerDigest, day, "daily", "memory_budget"));
       }
       ownerResources.push(Object.freeze({ ...resource, admitted: false, heapPeakBytes: null,
@@ -829,7 +850,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
       computation = result.computation;
     }
     for (const [day, values] of computation.dailyValues) dailyValues.get(day)!.set(ownerDigest, values);
-    for (const day of computation.blockedDays) blocked.add(day);
+    for (const day of computation.blockedDays) block(day, ownerDigest);
     if (computation.fits !== null) fitsByOwner.set(ownerDigest, computation.fits);
     for (const [day, result] of computation.compositions) compositionsByDate.get(day)!.push({ ownerDigest, result });
     for (const day of computation.modelRefused) modelRefusedByDate.get(day)!.push(ownerDigest);
@@ -841,7 +862,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   // ---- Community outputs.
   checkpoint(Object.freeze({ kind: "community", accountBytes }));
   const community = await timed("community", () => buildAnalyticsV2Community({ nowMs,
-    revisionSeed: input.revisionSeed, queued, blocked, dailyValues, computedOwners, effectiveDigests,
+    revisionSeed: input.revisionSeed, queued, blockers, dailyValues, computedOwners, effectiveDigests,
     devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions }));
 
   return {
@@ -856,7 +877,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     ownerFits,
     ownerModelDates,
     dailyCandidates: community.dailyCandidates,
-    blockedDays: [...blocked].sort(),
+    blockedDays: community.blockedDays,
     preview: community.preview,
     refusals: refusals.sort(compareAnalyticsV2Refusals),
     journal: { lastSequence },

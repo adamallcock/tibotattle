@@ -1,12 +1,12 @@
 {
   "schemaVersion": "analytics-v2-kernel-registry-v1",
-  "rule": "Append-only. Each entry is one kernel: the vendored kernels (vendorManifestSha256, from productionCommit), the GCP compute closure (computeClosureSha256, cloud-run/analytics-kernel-closure.mjs) and the orchestration method (methodVersion). Ids are assigned here, never by a database, so they are identical in every environment. Never edit or remove an entry: a changed closure, vendor manifest or method is a new entry with the next id. scripts/analytics-v2-kernel-registry.check.mjs pins every entry and refuses a closure no entry names.",
+  "rule": "Append-only. Each entry is one kernel: the vendored kernels (vendorManifestSha256, from productionCommit), the GCP compute closure (computeClosureSha256, cloud-run/analytics-kernel-closure.mjs) and the orchestration method (methodVersion). Ids are assigned here, never by a database, so they are identical in every environment. Never edit or remove an entry: a changed closure, vendor manifest or method is a new entry with the next id. scripts/analytics-v2-kernel-registry.check.mjs pins every entry and refuses a closure no entry names; cloud-run/build.mjs refuses to build one (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED).",
   "kernels": [
     {
       "kernelId": 1,
       "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
       "vendorManifestSha256": "97acb9afc16e5cf18c11e2c33d18e60e38b46484ace3a9df4fa5a85d6b52ef66",
-      "computeClosureSha256": "f0df5908002daae0560688b1c3d81da58c570647639bd6e18fef04f105e905fa",
+      "computeClosureSha256": "71ac8d242c8a521077641cbda2d8bbfa35315950b8fca6e0d20e52c0d6b42388",
       "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
       "priceRegistryVersion": "app-official-api-prices-v0.8",
       "methodVersion": "analytics-v2-method-v1"

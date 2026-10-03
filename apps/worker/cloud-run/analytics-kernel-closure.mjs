@@ -34,12 +34,20 @@
  *   by package, version and path inside the package, never by where the
  *   install put it (apps/worker/node_modules locally, cloud-run/node_modules
  *   in the image).
+ *
+ * The build refuses an identity no kernel-registry.json entry names
+ * (resolveAnalyticsKernelRegistryEntry, CLOUD_RUN_BUILD_KERNEL_UNREGISTERED),
+ * so an image built from unregistered code fails its build (the Dockerfile
+ * runs `npm run build`) instead of deploying a Job that refuses every run.
+ * Only `--kernel-closure` skips that check: it is how a new entry's digests
+ * are found.
  */
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Script } from "node:vm";
 
 export const ANALYTICS_KERNEL_CLOSURE_VERSION = "analytics-v2-compute-closure-v2";
 const CLOUD_RUN_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -216,4 +224,53 @@ export function analyticsKernelDefines(identity) {
     [ANALYTICS_KERNEL_DEFINES.computeClosureSha256]: JSON.stringify(identity.computeClosureSha256),
     [ANALYTICS_KERNEL_DEFINES.vendorManifestSha256]: JSON.stringify(identity.vendorManifestSha256),
   });
+}
+
+/** The module that resolves a bundle's identity to its registry entry (the Job's own resolver). */
+export const ANALYTICS_KERNEL_REGISTRY_MODULE = resolve(WORKER_ROOT, "src", "analytics-v2", "kernel.ts");
+
+/**
+ * The kernel-registry.json entry naming `identity`, resolved exactly as the
+ * refresh Job resolves its bundle: src/analytics-v2/kernel.ts and the
+ * registry are bundled with `identity`'s defines (analyticsKernelDefines) and
+ * resolveAnalyticsV2Kernel(analyticsV2BundledKernelIdentity()) runs on that
+ * bundle, so the method version is the code's own. The bundle (this
+ * repository's kernel.ts and its imports, nothing else) is evaluated in a
+ * fresh context holding only the globals it needs, never imported.
+ * Refuses CLOUD_RUN_BUILD_KERNEL_UNREGISTERED, carrying the two digests,
+ * when no entry names it, and CLOUD_RUN_BUILD_KERNEL_REGISTRY_INVALID for a
+ * malformed registry. `build` and `options` are as for
+ * computeAnalyticsKernelIdentity.
+ */
+export async function resolveAnalyticsKernelRegistryEntry({ build, options, identity, cwd = process.cwd() }) {
+  if (typeof build !== "function" || options === null || typeof options !== "object" || identity === null
+      || typeof identity !== "object" || typeof identity.computeClosureSha256 !== "string"
+      || typeof identity.vendorManifestSha256 !== "string") {
+    fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  }
+  const { define: _define, entryPoints: _entryPoints, outdir: _outdir, entryNames: _entryNames,
+    outExtension: _outExtension, metafile: _metafile, external: _external, ...shared } = options;
+  // Self-contained (no externals; packages' ESM entries, which make no
+  // dynamic require) and one script, so it loads nothing at run time.
+  const result = await build({ ...shared, absWorkingDir: cwd, entryPoints: [ANALYTICS_KERNEL_REGISTRY_MODULE],
+    write: false, external: [], mainFields: ["module", "main"], format: "iife", globalName: "analyticsV2Kernel",
+    define: analyticsKernelDefines(identity) });
+  if (!Array.isArray(result.outputFiles) || result.outputFiles.length !== 1) fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  const context = { TextEncoder, TextDecoder, crypto: globalThis.crypto };
+  new Script(result.outputFiles[0].text, { filename: "analytics-v2-kernel-registry.js" }).runInNewContext(context);
+  const kernel = context.analyticsV2Kernel;
+  if (typeof kernel?.resolveAnalyticsV2Kernel !== "function"
+      || typeof kernel?.analyticsV2BundledKernelIdentity !== "function") {
+    fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  }
+  try {
+    return kernel.resolveAnalyticsV2Kernel(kernel.analyticsV2BundledKernelIdentity());
+  } catch (error) {
+    if (error?.code === "ANALYTICS_V2_KERNEL_UNREGISTERED") {
+      fail("CLOUD_RUN_BUILD_KERNEL_UNREGISTERED", { computeClosureSha256: identity.computeClosureSha256,
+        vendorManifestSha256: identity.vendorManifestSha256 });
+    }
+    if (error?.code === "ANALYTICS_V2_KERNEL_REGISTRY_INVALID") fail("CLOUD_RUN_BUILD_KERNEL_REGISTRY_INVALID");
+    throw error;
+  }
 }

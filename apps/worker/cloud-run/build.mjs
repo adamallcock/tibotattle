@@ -8,6 +8,7 @@ import {
   ANALYTICS_REFRESH_WORKER_ENTRY,
   analyticsKernelDefines,
   computeAnalyticsKernelIdentity,
+  resolveAnalyticsKernelRegistryEntry,
 } from "./analytics-kernel-closure.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
@@ -108,7 +109,17 @@ const kernelIdentity = await computeAnalyticsKernelIdentity({ build, options, ve
 options.define = { ...(options.define ?? {}), ...analyticsKernelDefines(kernelIdentity) };
 const kernel = { computeClosureSha256: kernelIdentity.computeClosureSha256,
   vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs };
-if (process.argv.includes("--kernel-closure")) {
+const kernelClosureOnly = process.argv.includes("--kernel-closure");
+// Refuse to build (or check) a bundle no kernel-registry.json entry names
+// (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED), before anything is bundled: the image
+// build runs this, so an unregistered compute closure fails the image rather
+// than deploying a Job that refuses every run. The entry's id is reported with
+// the digests. --kernel-closure skips it: that is how a new entry's digests
+// are found.
+if (!kernelClosureOnly) {
+  kernel.kernelId = (await resolveAnalyticsKernelRegistryEntry({ build, options, identity: kernelIdentity })).kernelId;
+}
+if (kernelClosureOnly) {
   // Every input of the compute class, by the name it is hashed under (K-STAMP).
   console.log(JSON.stringify({ status: "ok", mode: "kernel-closure", kernel, names: kernelIdentity.names }));
 } else if (process.argv.includes("--check")) {

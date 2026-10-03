@@ -19,11 +19,16 @@
  *     out the owner's fits, and its model composition for date D leaves out
  *     the owner's result (evaluated or refused). The preview's coverage
  *     counts are those of its last day (today).
- * The owner's own rows (owner-day, cache bands, fits, model dates) are
- * computed and stored as before: an exclusion removes an owner from what the
- * community sees, never from its own evidence. The community cache-retention
- * series (folded from the owners' cache bands when served) is not one of the
- * aggregates the contract names, and is unchanged.
+ * An owner excluded on D is outside D's cohort, as d43c8f92's weekly builder
+ * removed an excluded participant before anything else: its refusals (a
+ * refused owner-day, the memory budget, non-effective typed evidence) never
+ * block D's daily, and its missing fit never withholds the preview unless it
+ * is a member of some day the preview carries.
+ * The owner's own rows (owner-day, cache bands, fits, model dates) and
+ * refusals are computed and stored as before: an exclusion removes an owner
+ * from what the community sees, never from its own evidence. The community
+ * cache-retention series (folded from the owners' cache bands when served) is
+ * not one of the aggregates the contract names, and is unchanged.
  *
  * At d43c8f92 only the v0.3 weekly builder read the table, and GCP does not
  * compute that snapshot, so applying the exclusions here is a declared
@@ -113,8 +118,10 @@ export function analyticsV2ExclusionsOn<T extends AnalyticsV2ExclusionInterval>(
  * The identity of the whole table as one run read it: a sha256 over every
  * row, active or revoked, in exclusion-id order. A new row, a revocation or
  * an edit changes it; the run row records it (exclusions_sha256), and a run
- * that reads a different digest republishes every published day. Stored in
- * the run row only, never in a receipt or a log.
+ * that reads a different digest republishes every published day under its
+ * own kernel (analytics-refresh-read.mjs analyticsRefreshPublicationDays has
+ * the constraint this puts on a content-changing kernel). Stored in the run
+ * row only, never in a receipt or a log.
  */
 export async function analyticsV2ExclusionsSha256(rows: readonly AnalyticsV2ExclusionRow[]): Promise<string> {
   return sha256Hex(canonicalJson([ANALYTICS_V2_EXCLUSIONS_METHOD, rows.map((row) => [row.exclusionId,

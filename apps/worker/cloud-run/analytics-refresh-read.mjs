@@ -348,6 +348,16 @@ function daySpan(fromDay, throughDay) {
  * the last completed run (N-EXCL, `exclusionsChanged`): every published day
  * is then queued too, so a new, revoked or edited exclusion reaches each day
  * it covers or covered (a day whose content is unchanged keeps its revision).
+ *
+ * Constraint on a content-changing kernel (K-REPRICE, E-OWNERSET): every
+ * queued day is recomputed under the run's own kernel. With kernel 1 (parity
+ * with d43c8f92) a day the change does not cover recomputes to the same
+ * content and keeps its revision. Once a kernel that changes content is the
+ * current one, one exclusion change would give every published day a new
+ * revision under it, including days the change never covered, before
+ * K-REPRICE's owner decision between attestation and revision applies. That
+ * change must first queue only the days whose excluded owner set changed
+ * (the per-day saved owner set, E-OWNERSET, gives each day's set).
  */
 export function analyticsRefreshPublicationDays(journalDays, state, { exclusionsChanged = false } = {}) {
   return [...new Set([...journalDays, ...state.carriedBlockedDays,

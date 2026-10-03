@@ -6,13 +6,16 @@
  *   (REGISTRY_PINS): editing or removing an entry fails; appending one needs
  *   its pin added in the same change, which a reviewer sees.
  * - The newest entry names the current build: `node cloud-run/build.mjs
- *   --check` reports the bundle's kernel identity (the compute-closure digest
- *   and the vendored manifest digest it stamps through esbuild defines), and
- *   some entry must name it, or the Job would refuse every run with
- *   ANALYTICS_V2_KERNEL_UNREGISTERED. A change to any module of the compute
- *   closure (comments included) therefore needs a new entry before it merges;
- *   the failure lists every closure input (`node cloud-run/build.mjs
- *   --kernel-closure` prints them too).
+ *   --kernel-closure` reports the bundle's kernel identity (the compute-closure
+ *   digest and the vendored manifest digest it stamps through esbuild
+ *   defines), and some entry must name it, or the Job would refuse every run
+ *   with ANALYTICS_V2_KERNEL_UNREGISTERED. A change to any module of the
+ *   compute closure (comments included) therefore needs a new entry before it
+ *   merges; the failure lists every closure input.
+ * - The build itself refuses an identity no entry names
+ *   (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED, through the Job's own resolver), so
+ *   the image build fails instead of deploying a Job that refuses every run;
+ *   `--check` and the default build report the entry's id.
  * - The closure holds every module that decides a stored value (the compute
  *   core, the community fold, the readers and their codecs) and none of the
  *   I/O plumbing, and a change to the community fold or the occurrence
@@ -36,6 +39,7 @@ import { promisify } from "node:util";
 import {
   ANALYTICS_KERNEL_CLOSURE_PLUMBING,
   computeAnalyticsKernelIdentity,
+  resolveAnalyticsKernelRegistryEntry,
 } from "../cloud-run/analytics-kernel-closure.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -44,7 +48,7 @@ const REGISTRY_PATH = join(WORKER_ROOT, "src", "analytics-v2", "kernel-registry.
 const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
 /** sha256 of each entry's canonical JSON, in id order. Append only. */
 const REGISTRY_PINS = Object.freeze([
-  "063b3ead7c28ff6153e59dfc1c79f368acb46f8db96b95550f33a8240cab143c",
+  "3de37fc69519e9db59e6d8c81a6920547e4292b6e0f493c8f4df6f68c4f21a8a",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -65,11 +69,18 @@ async function buildReport(flag) {
   return JSON.parse(stdout.trim().split("\n").at(-1));
 }
 
+const esbuild = () => createRequire(join(WORKER_ROOT, "cloud-run", "package.json"))("esbuild");
+
 /** The closure identity under the build's own esbuild, with `read` substituted (a mutation). */
 async function identityWith(read) {
-  const esbuild = createRequire(join(WORKER_ROOT, "cloud-run", "package.json"))("esbuild");
-  return computeAnalyticsKernelIdentity({ build: esbuild.build, options: BUILD_OPTIONS, vendorRoot: VENDOR_ROOT,
+  return computeAnalyticsKernelIdentity({ build: esbuild().build, options: BUILD_OPTIONS, vendorRoot: VENDOR_ROOT,
     cwd: join(WORKER_ROOT, "cloud-run"), ...(read === undefined ? {} : { read }) });
+}
+
+/** The registry entry the build resolves for `identity` (the build's own check). */
+function entryFor(identity) {
+  return resolveAnalyticsKernelRegistryEntry({ build: esbuild().build, options: BUILD_OPTIONS, identity,
+    cwd: join(WORKER_ROOT, "cloud-run") });
 }
 
 const named = (entries, identity) => entries.filter((entry) => entry.computeClosureSha256 === identity.computeClosureSha256
@@ -102,17 +113,19 @@ test("the registry is closed, numbered 1..n and pinned entry by entry (append-on
 
 test("an entry names the code this checkout builds, and its vendored kernels", async () => {
   const value = await registry();
-  const report = await buildReport("--check");
+  const report = await buildReport("--kernel-closure");
   assert.equal(report.status, "ok");
   assert.match(report.kernel.computeClosureSha256, /^[0-9a-f]{64}$/u);
   assert.ok(report.kernel.closureInputs > 50, "the closure holds the vendored kernels");
   const current = named(value.kernels, report.kernel);
   if (current.length !== 1) {
-    const { names } = await buildReport("--kernel-closure");
     assert.fail(`no kernel-registry.json entry names this build's compute closure ${report.kernel.computeClosureSha256}`
-      + ` (${names.length} inputs): append one with its pin. The closure:\n${names.join("\n")}`);
+      + ` (${report.names.length} inputs): append one with its pin. The closure:\n${report.names.join("\n")}`);
   }
   assert.equal(current[0].kernelId, value.kernels.length, "the build is the newest kernel");
+  // The build resolves the same entry through the Job's resolver and reports it.
+  const checked = await buildReport("--check");
+  assert.deepEqual(checked.kernel, { ...report.kernel, kernelId: current[0].kernelId });
   const manifestBytes = await readFile(join(VENDOR_ROOT, "MANIFEST.json"));
   assert.equal(sha256(manifestBytes), report.kernel.vendorManifestSha256);
   const manifest = JSON.parse(manifestBytes.toString("utf8"));
@@ -148,7 +161,7 @@ test("the closure holds every module that decides a stored value and no I/O plum
   assert.equal(report.names.some((name) => name.includes("node_modules")), false);
 });
 
-test("a change to the community fold or the occurrence reader is a closure no entry names", async () => {
+test("a change to the community fold or the occurrence reader is a closure no entry names, and the build refuses it", async () => {
   const value = await registry();
   for (const module of ["compute-community.ts", "occurrence-source.ts", "owners.ts"]) {
     const target = join(WORKER_ROOT, "src", "analytics-v2", module);
@@ -158,7 +171,16 @@ test("a change to the community fold or the occurrence reader is a closure no en
       return path === target ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// mutation\n")]) : bytes;
     });
     assert.equal(named(value.kernels, mutated).length, 0, `${module} changed without a registry entry`);
+    // The build's own check refuses it, naming the digests (an image build fails here).
+    await assert.rejects(entryFor(mutated), { code: "CLOUD_RUN_BUILD_KERNEL_UNREGISTERED",
+      computeClosureSha256: mutated.computeClosureSha256, vendorManifestSha256: mutated.vendorManifestSha256 });
   }
+  // The unmutated identity resolves to the newest entry; a changed vendored
+  // manifest alone is refused too.
+  const identity = await identityWith();
+  assert.equal((await entryFor(identity)).kernelId, value.kernels.length);
+  await assert.rejects(entryFor({ ...identity, vendorManifestSha256: "0".repeat(64) }),
+    { code: "CLOUD_RUN_BUILD_KERNEL_UNREGISTERED" });
   // A stale workspace package copy is refused rather than hashed.
   const copy = `${sep}node_modules${sep}@app-usagemonitor${sep}telemetry-contract${sep}index.js`;
   await assert.rejects(identityWith(async (path, ...rest) => {
