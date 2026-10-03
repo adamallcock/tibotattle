@@ -639,7 +639,14 @@ envelopes, with these owner-accepted differences (owner decisions,
   body shape, credentials). The gate rereads the receipt on every request.
 - **(iv) Unported routes send no `retry-after`.** They answer
   `503 POSTGRES_ROUTE_NOT_PORTED`, so clients that retry only on a
-  `retry-after` do not retry them.
+  `retry-after` do not retry them. Since round 12 every unported route is
+  retired (legacy enroll, Google and Apple sign-in, security reset,
+  participant export, the performance device and consent routes), as are
+  v0.x uploads (a v0.1 or v0.2 envelope or upload-authorization format). One
+  retired route deviates from the uniform 503: the accountless performance
+  authorization answers production's definite `403
+  TELEMETRY_TRANSPORT_BLOCKED`, so Electron parks after one call instead of
+  retrying on the shared accountless-ownership budget.
 - **(v) Assets get a JSON 404.** A request for an asset path that reaches the
   origin answers the Worker's JSON `404 NOT_FOUND`, not an HTML page. The
   edge serves the site's assets itself, so only a request the edge forwards

@@ -48,9 +48,11 @@ import { createPostgresAdminAccessChokepoint } from "../src/postgres-admin-acces
  * cloud-run/postgres-host-dispatch.check.mjs, the E12 rows
  * (postgres-test/edge-origin-e2e.spec.mjs) and, for the composed
  * HOST_MODE origin over PostgreSQL 17, postgres-test/postgres-production-host.spec.mjs.
- * Phase B (D-CRB) pins the composition root's answers: the admin host
- * refused (OD-CR-3, until ADMIN-R12 opens it after round 12's OWN-17
- * answer; the chokepoint cells here run the switch's other position) and no unported retry-after (OD-CR-6(iv)).
+ * Phase B (D-CRB) pinned the composition root's answers; round 12 opened the
+ * production admin host (OD-CR-3 'chokepoint', ADMIN-R12; the 'refuse' cells
+ * here run the switch's other position, which the edge-test origin keeps), and
+ * there is no unported retry-after (OD-CR-6(iv)). Round 12 also answers the
+ * accountless performance authorization with production's definite 403.
  */
 
 interface TestBindings extends Env {
@@ -66,6 +68,7 @@ interface TestBindings extends Env {
 interface ResolvedRoute {
   readonly disposition: string;
   readonly handler: ((request: Request) => Promise<Response>) | null;
+  readonly answer: { readonly status: number; readonly code: string } | null;
 }
 interface ProductionRegistry {
   readonly unportedRouteIds: readonly string[];
@@ -618,6 +621,21 @@ describe("(F) documented deviations from the Worker", () => {
         expect(production.calls).toStrictEqual([]);
       }
     });
+
+  it("round 12: the accountless performance authorization is production's definite 403, never the 503", async () => {
+    for (const retryAfterSeconds of [60, null] as const) {
+      const production = origin(workerEnv(), "refuse", undefined, retryAfterSeconds);
+      const id = "accountless_telemetry_performance_authorization";
+      expect(production.registry.resolve(id).disposition).toBe("definite");
+      expect(production.registry.unportedRouteIds).not.toContain(id);
+      const route = WORKER_ROUTE_POLICY.find((entry) => entry.id === id)!;
+      const response = await production.handler(new Request(PUBLIC_ORIGIN + route.pathname, { method: "POST" }));
+      expect(await snapshot(response)).toStrictEqual({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", allow: null,
+        cacheControl: "no-store", location: null });
+      expect(response.headers.get("retry-after")).toBeNull();
+      expect(production.calls).toStrictEqual([]);
+    }
+  });
 
   it("assets are a JSON 404 (the edge serves the site); the admin host under 'refuse' is the unported 503", async () => {
     const production = origin(workerEnv(), "refuse");

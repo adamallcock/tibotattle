@@ -13,14 +13,29 @@
  *   createProductionWorkerEnv(configuration, { bindings }) -> frozen env
  *
  * Profiles belong to one of two planes. The production plane has the
- * 'production' service and the 'maintenance-job' and 'analytics-job' jobs;
- * the staging plane mirrors them as 'staging', 'staging-maintenance-job' and
- * 'staging-analytics-job'. Each profile requires only the secrets it consumes
- * (PRODUCTION_PROFILE_SECRET_NAMES) and refuses the others, even when empty.
- * Job templates and secret mounts therefore render
- * PRODUCTION_PROFILE_SECRET_NAMES[profile]; REQUIRED_SECRET_NAMES and
- * OPTIONAL_SECRET_NAMES are the service set (and the Secret Manager
- * containers), not what every workload mounts.
+ * 'production' service and the 'maintenance-job' job; the staging plane
+ * mirrors them as 'staging' and 'staging-maintenance-job'. Each profile
+ * requires only the secrets it consumes (PRODUCTION_PROFILE_SECRET_NAMES) and
+ * refuses the others, even when empty. Job templates and secret mounts
+ * therefore render PRODUCTION_PROFILE_SECRET_NAMES[profile];
+ * REQUIRED_SECRET_NAMES and OPTIONAL_SECRET_NAMES are the service set (and
+ * the Secret Manager containers), not what every workload mounts.
+ *
+ * The analytics-refresh job is not a CR-3 profile. Owner round 12
+ * (2026-10-02, OWN-20.1) made C-REFRESH's own contract
+ * (cloud-run/analytics-refresh.mjs, readAnalyticsRefreshProductionTarget)
+ * the only one that governs it, and retired the former 'analytics-job' and
+ * 'staging-analytics-job' profiles together with the spec's equality pin
+ * between the two contracts. Asking for either profile is
+ * PRODUCTION_PROFILE_INVALID.
+ *
+ * Owner round 12 also retires native social sign-in (Google and Apple) and
+ * the legacy enroll route at the switch, with no port. The origin therefore
+ * carries none of their settings: GOOGLE_OIDC_CLIENT_SECRET and
+ * APPLE_PRIVATE_KEY are no CR-3 secret, the Apple key id, team id and
+ * services id are no pinned or staging var, and each of those five names is
+ * refused when present, even empty (RETIRED_SOCIAL_SIGN_IN_SETTINGS), so a
+ * deployment rendered from a pre-round-12 template fails closed.
  *
  * Test-target refusal compares resource identities, not name coincidences: a
  * deployment value equal to the IAM test deployment's service, origin or host,
@@ -223,8 +238,6 @@ export const REQUIRED_SECRET_NAMES = Object.freeze([
   "POSTGRES_RATE_LIMIT_SECRET",
   "ENVELOPE_PUBLIC_JWK",
   "ENVELOPE_PRIVATE_JWK",
-  "GOOGLE_OIDC_CLIENT_SECRET",
-  "APPLE_PRIVATE_KEY",
 ]);
 export const OPTIONAL_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
 
@@ -232,17 +245,18 @@ const SERVICE_SECRETS = Object.freeze({
   required: REQUIRED_SECRET_NAMES,
   optional: OPTIONAL_SECRET_NAMES,
 });
-const NO_SECRETS = Object.freeze({ required: Object.freeze([]), optional: Object.freeze([]) });
 
 /**
  * The secrets each profile consumes; any other REQUIRED/OPTIONAL secret
- * present in a profile's environment is refused. The service reads all of
+ * present in a profile's environment is refused. The service accepts all of
  * them. The maintenance profiles require IDENTITY_LINK_SECRET to be present
  * (at least 32 characters) but the PostgreSQL lifecycle pass reads no
  * identity secret: identity hand-off and sign-in purges are absent and the
  * cooldown items are constant (the D1 Worker's backend lifecycle and restore
- * replay were its readers). Production maintenance may also read the GitHub
- * distribution sync token. The analytics lanes read none.
+ * replay were its readers). Production maintenance accepts the GitHub
+ * distribution token as optional, but its lifecycle pass never reads it, and
+ * the committed production desired state mounts it nowhere
+ * (scripts/gcp-ops-infra-manifest.mjs UNREAD_PRODUCTION_SECRET_NAMES).
  */
 export const PRODUCTION_PROFILE_SECRET_NAMES = Object.freeze({
   production: SERVICE_SECRETS,
@@ -251,12 +265,10 @@ export const PRODUCTION_PROFILE_SECRET_NAMES = Object.freeze({
     required: Object.freeze(["IDENTITY_LINK_SECRET"]),
     optional: Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]),
   }),
-  "analytics-job": NO_SECRETS,
   "staging-maintenance-job": Object.freeze({
     required: Object.freeze(["IDENTITY_LINK_SECRET"]),
     optional: Object.freeze([]),
   }),
-  "staging-analytics-job": NO_SECRETS,
 });
 
 /** Origin secrets the Cloudflare Worker never had. */
@@ -267,9 +279,31 @@ const WORKER_ENV_SECRET_NAMES = Object.freeze([
   "IDENTITY_LINK_SECRET",
   "ENVELOPE_PUBLIC_JWK",
   "ENVELOPE_PRIVATE_JWK",
+  "DISTRIBUTION_GITHUB_API_TOKEN",
+]);
+
+/**
+ * Owner round 12 (2026-10-02): native social sign-in retires at the switch.
+ * The Cloudflare Worker's Google and Apple settings that only sign-in read
+ * (wrangler.jsonc env.production keeps them until the Worker is retired) are
+ * never origin configuration: the two secrets left REQUIRED_SECRET_NAMES and
+ * the three Apple identifiers left PRODUCTION_VARS and the staging plane's
+ * provided vars. Each is refused in every profile when present, even empty
+ * (<NAME>_RETIRED). GOOGLE_OIDC_CLIENT_ID is a public client identifier, not
+ * a credential, and stays a pinned var.
+ */
+export const RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES = Object.freeze([
   "GOOGLE_OIDC_CLIENT_SECRET",
   "APPLE_PRIVATE_KEY",
-  "DISTRIBUTION_GITHUB_API_TOKEN",
+]);
+export const RETIRED_SOCIAL_SIGN_IN_VAR_NAMES = Object.freeze([
+  "APPLE_SERVICES_ID",
+  "APPLE_KEY_ID",
+  "APPLE_TEAM_ID",
+]);
+export const RETIRED_SOCIAL_SIGN_IN_SETTINGS = Object.freeze([
+  ...RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES,
+  ...RETIRED_SOCIAL_SIGN_IN_VAR_NAMES,
 ]);
 
 /** Cloudflare-only secrets. They stay at the edge and are refused here. */
@@ -348,9 +382,6 @@ export const PRODUCTION_VARS = Object.freeze({
   INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized",
   IDENTITY_LINK_SECRET_VERSION: PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
   GOOGLE_OIDC_CLIENT_ID: "806510610397-f6k0uje651hpurbmfr7vub9iqj04428j.apps.googleusercontent.com",
-  APPLE_SERVICES_ID: "com.usagemonitor.web",
-  APPLE_KEY_ID: "L58X7J2J7A",
-  APPLE_TEAM_ID: "43RTH622SB",
   ACCESS_TEAM_DOMAIN: "tibotattle.cloudflareaccess.com",
   ACCESS_AUD: "3ffbc68d303a9da74f462a685b788c57935c65024df4e9b144e1c872598bb61c",
   ACCESS_ADMIN_EMAIL: "adamallcock@gmail.com",
@@ -377,10 +408,12 @@ export const PRODUCTION_RESOURCE_FINGERPRINT = Object.freeze({
   accessAud: PRODUCTION_VARS.ACCESS_AUD,
   identityLinkSecretVersion: PRODUCTION_VARS.IDENTITY_LINK_SECRET_VERSION,
   retiredIdentityLinkSecretVersions: PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
-  // Both OAuth clients: each is the audience its id_tokens are verified against.
+  // Both OAuth clients: each is the audience its id_tokens were verified
+  // against. Round 12 retired the Apple settings from the origin, but their
+  // production values stay fingerprinted so no staging value can reuse them.
   googleOidcClientId: PRODUCTION_VARS.GOOGLE_OIDC_CLIENT_ID,
-  appleServicesId: PRODUCTION_VARS.APPLE_SERVICES_ID,
-  appleKeyId: PRODUCTION_VARS.APPLE_KEY_ID,
+  appleServicesId: "com.usagemonitor.web",
+  appleKeyId: "L58X7J2J7A",
   // The Cloudflare production Worker, its D1 databases and R2 buckets.
   cloudflareResourceNames: Object.freeze([
     "app-usagemonitor",
@@ -418,6 +451,8 @@ export const PRODUCTION_FORBIDDEN_VARIABLES = Object.freeze({
   LEDGER_DATABASE: "LEDGER_DATABASE_FORBIDDEN",
   LEDGER_SCHEMA: "LEDGER_SCHEMA_FORBIDDEN",
   GCS_ERASURE_BUCKET_HISTORY_PROOF: "GCS_ERASURE_BUCKET_HISTORY_PROOF_FORBIDDEN",
+  // Retired with native social sign-in (owner round 12).
+  ...Object.fromEntries(RETIRED_SOCIAL_SIGN_IN_SETTINGS.map((name) => [name, `${name}_RETIRED`])),
 });
 export const PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES = Object.freeze({
   HOST_RATE_LIMIT_: "HOST_RATE_LIMIT_OVERRIDE_FORBIDDEN",
@@ -458,9 +493,7 @@ export const PRODUCTION_CONFIGURATION_PROFILES = Object.freeze([
   "production",
   "staging",
   "maintenance-job",
-  "analytics-job",
   "staging-maintenance-job",
-  "staging-analytics-job",
 ]);
 
 /** Each profile's plane, workload kind and job. */
@@ -468,24 +501,15 @@ const PROFILE_SHAPES = Object.freeze({
   production: Object.freeze({ plane: "production", workload: "service", job: null }),
   staging: Object.freeze({ plane: "staging", workload: "service", job: null }),
   "maintenance-job": Object.freeze({ plane: "production", workload: "job", job: "maintenance" }),
-  "analytics-job": Object.freeze({ plane: "production", workload: "job", job: "analytics" }),
   "staging-maintenance-job": Object.freeze({ plane: "staging", workload: "job", job: "maintenance" }),
-  "staging-analytics-job": Object.freeze({ plane: "staging", workload: "job", job: "analytics" }),
 });
 
 const MAINTENANCE_SWITCH_NAMES = Object.freeze(["POSTGRES_SCHEDULED_MAINTENANCE_ENABLED"]);
-const ANALYTICS_SWITCH_NAMES = Object.freeze([
-  "POSTGRES_ANALYTICS_MODE",
-  "POSTGRES_ANALYTICS_PUBLICATION_LANE",
-  "POSTGRES_ANALYTICS_PUBLICATION_EXTERNAL",
-]);
 
 /** Job switches, by profile (see readJobSwitches for their semantics). */
 export const PRODUCTION_JOB_SWITCH_NAMES = Object.freeze({
   "maintenance-job": MAINTENANCE_SWITCH_NAMES,
-  "analytics-job": ANALYTICS_SWITCH_NAMES,
   "staging-maintenance-job": MAINTENANCE_SWITCH_NAMES,
-  "staging-analytics-job": ANALYTICS_SWITCH_NAMES,
 });
 
 /**
@@ -539,9 +563,6 @@ export const STAGING_PROVIDED_VAR_NAMES = Object.freeze([
   "ACCESS_ADMIN_EMAIL",
   "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID",
-  "APPLE_SERVICES_ID",
-  "APPLE_KEY_ID",
-  "APPLE_TEAM_ID",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -585,11 +606,6 @@ const IDENTITY_LINK_SECRET_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const MIN_IDENTITY_LINK_SECRET_LENGTH = 32;
 const MIN_RATE_LIMIT_SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 65_536;
-// Mirrors src/identity-apple.ts.
-const PKCS8_PEM_PATTERN =
-  /-----BEGIN PRIVATE KEY-----([\sA-Za-z0-9+/=]+)-----END PRIVATE KEY-----/u;
-const APPLE_ID_PATTERN = /^[A-Z0-9]{10}$/u;
-const APPLE_SERVICES_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,254}[A-Za-z0-9])?$/u;
 const ACCESS_AUD_PATTERN = /^[a-f0-9]{64}$/u;
 const ACCESS_TEAM_DOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/u;
 // At most 64 + 1 + 189 = 254 characters, the longest usable address.
@@ -597,7 +613,6 @@ const EMAIL_PATTERN = /^[!-?A-~]{1,64}@[a-z0-9](?:[a-z0-9.-]{0,187}[a-z0-9])?$/u
 const GOOGLE_OIDC_CLIENT_ID_PATTERN = /^[0-9]{1,32}-[a-z0-9]{1,64}\.apps\.googleusercontent\.com$/u;
 const DNS_HOSTNAME_PATTERN =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
-const SWITCH_VALUES = new Set(["enabled", "disabled"]);
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -851,7 +866,7 @@ function readSecrets(environment, profile) {
       && secretBytes(values.get("POSTGRES_RATE_LIMIT_SECRET")) < MIN_RATE_LIMIT_SECRET_BYTES) {
     configurationError("POSTGRES_RATE_LIMIT_SECRET_INVALID");
   }
-  // The envelope pair and the Apple key are service secrets, always together.
+  // The envelope pair is a service secret, always together.
   let envelopeKeyId = null;
   if (values.has("ENVELOPE_PUBLIC_JWK")) {
     const publicJwk = parseJwk(values.get("ENVELOPE_PUBLIC_JWK"), "ENVELOPE_PUBLIC_JWK_INVALID");
@@ -860,11 +875,6 @@ function readSecrets(environment, profile) {
     if (typeof privateJwk.d !== "string") configurationError("ENVELOPE_PRIVATE_JWK_INVALID");
     if (privateJwk.kid !== publicJwk.kid) configurationError("ENVELOPE_KEY_ID_MISMATCH");
     envelopeKeyId = publicJwk.kid;
-  }
-  // Secret stores commonly flatten the .p8 newlines to backslash-n.
-  if (values.has("APPLE_PRIVATE_KEY")
-      && !PKCS8_PEM_PATTERN.test(values.get("APPLE_PRIVATE_KEY").replaceAll("\\n", "\n"))) {
-    configurationError("APPLE_PRIVATE_KEY_INVALID");
   }
   for (const name of optional) {
     const value = environment.value(name);
@@ -877,29 +887,6 @@ function readSecrets(environment, profile) {
   return { handles: Object.freeze(handles), envelopeKeyId };
 }
 
-/**
- * An analytics job switch, read as the Worker reads its counterpart
- * (storage-analytics-worker.ts, storage-publication-worker.ts):
- * - POSTGRES_ANALYTICS_MODE (STORAGE_ANALYTICS_MODE): unset or 'disabled' is
- *   off, 'enabled' is on, and anything else, an empty value included, is a
- *   configuration error.
- * - the publication lane switches (PUBLICATION_LANE, PUBLICATION_LANE_EXTERNAL):
- *   exactly 'enabled' is on and every other value, unset included, is off, as
- *   the Worker's `=== 'enabled'` reads them. A value such as 'true' is never
- *   a configuration error: it leaves the lane as unset would and never stops
- *   the job's other lanes (delivery and its erasure step among them).
- * The configuration and env carry the normalized 'enabled' or 'disabled'.
- */
-function analyticsSwitch(environment, name) {
-  if (name !== "POSTGRES_ANALYTICS_MODE") {
-    return environment.raw(name) === "enabled" ? "enabled" : "disabled";
-  }
-  if (!environment.has(name)) return "disabled";
-  const value = environment.raw(name);
-  if (!SWITCH_VALUES.has(value)) configurationError(`${name}_INVALID`);
-  return value;
-}
-
 function readJobSwitches(environment, job) {
   if (job === "maintenance") {
     // The existing gate: anything but 'enabled' keeps the writer dormant.
@@ -909,10 +896,6 @@ function readJobSwitches(environment, job) {
     });
     assertPostgresScheduledMaintenanceEnabled(probe);
     return Object.freeze({ POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" });
-  }
-  if (job === "analytics") {
-    return Object.freeze(Object.fromEntries(ANALYTICS_SWITCH_NAMES
-      .map((name) => [name, analyticsSwitch(environment, name)])));
   }
   return Object.freeze({});
 }
@@ -955,9 +938,6 @@ function readStagingVars(environment) {
     ACCESS_ADMIN_EMAIL: EMAIL_PATTERN,
     IDENTITY_LINK_SECRET_VERSION: IDENTITY_LINK_SECRET_VERSION_PATTERN,
     GOOGLE_OIDC_CLIENT_ID: GOOGLE_OIDC_CLIENT_ID_PATTERN,
-    APPLE_SERVICES_ID: APPLE_SERVICES_ID_PATTERN,
-    APPLE_KEY_ID: APPLE_ID_PATTERN,
-    APPLE_TEAM_ID: APPLE_ID_PATTERN,
   };
   const vars = {};
   for (const [name, pattern] of Object.entries(patterns)) {
@@ -1052,9 +1032,9 @@ function assertPlaneSeparation(plane, planeNames, stagingValues) {
 /**
  * Validates a process environment for one profile and returns a frozen
  * configuration. `profile` is one of PRODUCTION_CONFIGURATION_PROFILES:
- * 'production' or 'staging' for the service, 'maintenance-job' /
- * 'analytics-job' for the production jobs and 'staging-maintenance-job' /
- * 'staging-analytics-job' for the staging plane's jobs. Throws an Error whose
+ * 'production' or 'staging' for the service, 'maintenance-job' for the
+ * production maintenance job and 'staging-maintenance-job' for the staging
+ * plane's. Throws an Error whose
  * message and `code` name the first refused setting.
  */
 export function readProductionConfiguration(processEnv, profile) {

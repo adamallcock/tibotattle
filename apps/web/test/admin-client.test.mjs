@@ -882,7 +882,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
 
 test("expanded overview uses a new schema and requires an explicit recognized storage mode", async () => {
   const payload = await fixture("admin-overview-valid.json");
-  for (const version of ["admin-overview-v0.3", "admin-overview-v0.4", "admin-overview-v0.6"]) {
+  for (const version of ["admin-overview-v0.3", "admin-overview-v0.4", "admin-overview-v0.7", undefined]) {
     assert.throws(() => projectAdminOverview({ ...payload, schemaVersion: version }), /ADMIN_OVERVIEW_INVALID/u);
   }
   for (const mode of [undefined, "unknown"]) {
@@ -920,6 +920,53 @@ test("typed admin overview projects target publication evidence without a legacy
     const invalid = structuredClone(payload);
     mutate(invalid);
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
+  }
+});
+
+function typedOverviewPayload(payload) {
+  payload.service.telemetryStorageMode = "typed";
+  payload.snapshots = [];
+  payload.pendingHistoricalRebuilds = null;
+  payload.pendingHistoricalRebuildsBounded = null;
+  payload.historicalPublication = {
+    publishedDays: 69,
+    publishedDaysBounded: false,
+    latestEvidenceDay: "2026-08-16",
+    latestComputedAt: "2026-08-17T11:55:00.000Z",
+    previewState: "current",
+    previewGeneratedAt: "2026-08-17T11:56:00.000Z",
+  };
+  return payload;
+}
+
+test("round 12: the Google Cloud origin's v0.6 overview reads an explicit unavailable block, never a value", async () => {
+  const v05 = typedOverviewPayload(await fixture("admin-overview-valid.json"));
+  v05.schemaVersion = "admin-overview-v0.5";
+  // A v0.6 body whose blocks all have a source projects exactly as v0.5 does.
+  const sourced = { ...structuredClone(v05), schemaVersion: "admin-overview-v0.6" };
+  assert.deepEqual(projectAdminOverview(sourced), projectAdminOverview(v05));
+  // With no source the origin says so; the projection keeps only that state.
+  const unavailable = structuredClone(sourced);
+  unavailable.historicalPublication = { status: "unavailable" };
+  unavailable.deletionLedger = { status: "unavailable" };
+  unavailable.counts.contributions.synthetic = { status: "unavailable" };
+  const projected = projectAdminOverview(unavailable);
+  assert.deepEqual(projected.historicalPublication, { status: "unavailable" });
+  assert.equal(Object.isFrozen(projected.historicalPublication), true);
+  assert.equal("publishedDays" in projected.historicalPublication, false, "no invented count");
+  assert.deepEqual({ ...projected, historicalPublication: null }, { ...projectAdminOverview(v05), historicalPublication: null });
+  // v0.5 (the Worker's) never carries the unavailable state, and v0.6's is closed.
+  for (const [version, block] of [
+    ["admin-overview-v0.5", { status: "unavailable" }],
+    ["admin-overview-v0.6", { status: "unavailable", publishedDays: 0 }],
+    ["admin-overview-v0.6", { status: "not_applicable" }],
+    ["admin-overview-v0.6", { status: "available" }],
+    ["admin-overview-v0.6", null],
+  ]) {
+    const invalid = structuredClone(unavailable);
+    invalid.schemaVersion = version;
+    invalid.historicalPublication = block;
+    assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u, `${version} ${JSON.stringify(block)}`);
   }
 });
 
@@ -1449,6 +1496,38 @@ test("database health projects only closed, consistent role evidence", async () 
   }
 });
 
+
+test("round 12: database health v0.2 reports the removed deletion ledger not_applicable, closed", async () => {
+  const v01 = await fixture("admin-database-health-valid.json");
+  const input = structuredClone(v01);
+  input.schemaVersion = "admin-database-health-v0.2";
+  input.databases[1] = { role: "deletion_ledger", status: "not_applicable", responseMs: null, databaseBytes: null };
+  const projected = projectAdminDatabaseHealth(input);
+  assert.equal(projected.schemaVersion, "admin-database-health-v0.2");
+  assert.deepEqual(projected.databases[1], input.databases[1]);
+  assert.equal(projected.status, "available", "two reachable roles and the removed ledger are a healthy console");
+  // The Worker's v0.1 is still read as before, and v0.1 never admits a not_applicable ledger.
+  assert.equal(projectAdminDatabaseHealth(v01).status, "available");
+  const v01Ledgerless = structuredClone(input);
+  v01Ledgerless.schemaVersion = "admin-database-health-v0.1";
+  assert.throws(() => projectAdminDatabaseHealth(v01Ledgerless), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  for (const alter of [
+    x => { x.databases[1] = { ...v01.databases[1] }; },
+    x => { x.databases[1].status = "not_configured"; },
+    x => { x.databases[1].responseMs = 0; },
+    x => { x.databases[1].databaseBytes = 0; },
+    x => { x.schemaVersion = "admin-database-health-v0.3"; },
+    x => { x.status = "degraded"; },
+  ]) {
+    const bad = structuredClone(input); alter(bad);
+    assert.throws(() => projectAdminDatabaseHealth(bad), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  }
+  // In json mode the analytics role is not_applicable too, as in v0.1.
+  const json = structuredClone(input);
+  json.storageMode = "json";
+  json.databases[2] = { role: "analytics", status: "not_applicable", responseMs: null, databaseBytes: null };
+  assert.equal(projectAdminDatabaseHealth(json).status, "available");
+});
 
 test("version totals validate OS coverage, counts and unavailable states without inferring legacy totals", async () => {
   const payload = await fixture("admin-overview-valid.json");

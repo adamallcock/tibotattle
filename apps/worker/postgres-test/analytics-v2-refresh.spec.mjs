@@ -3019,40 +3019,28 @@ test("production target: the closed contract reads the six variables and the den
   assert.ok(profile.heapMiB <= memory.taskMemoryMiB - memory.nativeReserveMiB);
 });
 
-test("production target: the plane, the shared values and the patterns agree with CR-3's reader", async () => {
+test("production target: C-REFRESH's contract alone governs the job; CR-3 has no analytics-job profile", async () => {
+  // Owner round 12 (OWN-20.1): CR-3's analytics-job profiles and the equality
+  // pin between the two contracts are retired. CR-3 refuses either profile,
+  // so no CR-3 read can configure this job, and the job's own policy is its own.
   const configuration = await import("../cloud-run/postgres-production-configuration.mjs");
-  // The Job mirrors CR-3's refusal policy exactly (it cannot import CR-3: see the entry).
-  const policy = job.ANALYTICS_REFRESH_CR3_POLICY;
-  assert.deepEqual([...policy.forbiddenVariables].sort(), Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLES).sort());
-  assert.deepEqual([...policy.forbiddenPrefixes].sort(),
-    Object.keys(configuration.PRODUCTION_FORBIDDEN_VARIABLE_PREFIXES).sort());
-  assert.equal(policy.stagingMarker, configuration.STAGING_RESOURCE_MARKER);
-  assert.equal(policy.productionMarker, configuration.PRODUCTION_RESOURCE_MARKER);
-  assert.deepEqual([...policy.fingerprint].sort(), [...new Set(Object.values(configuration.PRODUCTION_RESOURCE_FINGERPRINT)
-    .flatMap((value) => (Array.isArray(value) ? value : [value])))].sort());
-  // Everything CR-3's analytics-job profiles need beyond the refresh contract (synthetic values).
-  const bucket = (plane) => (plane === "staging" ? "example-staging-quarantine" : "example-quarantine");
-  const cr3 = (env, plane) => ({ ...env, TELEMETRY_STORAGE_NAMESPACE: "example-namespace",
-    GCS_BUCKET_NAME: bucket(plane),
-    // OD-2: every CR-3 profile that names GCS_BUCKET_NAME requires its birth proof.
-    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({ bucket: bucket(plane), bucketGeneration: "1700000000000001",
-      bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0" }),
-    ...(plane === "staging" ? { PUBLIC_ORIGIN: "https://example-staging.example.org",
-      ADMIN_HOST_ORIGIN: "https://admin.example-staging.example.org", ACCESS_TEAM_DOMAIN: "example.cloudflareaccess.com",
-      ACCESS_AUD: "a".repeat(64), ACCESS_ADMIN_EMAIL: "owner@example.org", IDENTITY_LINK_SECRET_VERSION: "staging-v1",
-      GOOGLE_OIDC_CLIENT_ID: "1-example.apps.googleusercontent.com", APPLE_SERVICES_ID: "org.example.staging",
-      APPLE_KEY_ID: "ABCDEFGHIJ", APPLE_TEAM_ID: "ABCDEFGHIJ" } : {}) });
-  const strip = (env) => Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("ANALYTICS_")));
-  for (const target of ["production", "staging"]) {
-    const env = productionEnvironment(target);
-    const accepted = configuration.readProductionConfiguration(cr3(strip(env), target),
-      target === "staging" ? "staging-analytics-job" : "analytics-job");
-    const read = await job.readAnalyticsRefreshProductionTarget(env);
-    assert.deepEqual({ ...accepted.resources.primary }, { instanceConnectionName: read.instanceConnectionName,
-      database: read.database, schema: read.schema });
-    assert.equal(accepted.resources.iamUser, read.iamUser);
+  for (const [target, profile] of [["production", "analytics-job"], ["staging", "staging-analytics-job"]]) {
+    assert.equal(configuration.PRODUCTION_CONFIGURATION_PROFILES.includes(profile), false, profile);
+    assert.throws(() => configuration.readProductionConfiguration(productionEnvironment(target), profile),
+      { code: "PRODUCTION_PROFILE_INVALID" }, profile);
+    // The refresh contract reads the same environment on its own.
+    const read = await job.readAnalyticsRefreshProductionTarget(productionEnvironment(target));
+    assert.equal(typeof read.instanceConnectionName, "string", target);
   }
-  // Values CR-3 refuses, the refresh contract refuses too.
+  // The job's policy stays closed and frozen; it is no mirror any more.
+  const policy = job.ANALYTICS_REFRESH_CR3_POLICY;
+  assert.ok(Object.isFrozen(policy) && Object.isFrozen(policy.forbiddenVariables) && Object.isFrozen(policy.fingerprint));
+  assert.deepEqual(Object.keys(policy), ["forbiddenVariables", "forbiddenPrefixes", "stagingMarker", "productionMarker",
+    "fingerprint"]);
+  for (const name of policy.forbiddenVariables) {
+    await refusedTarget(productionEnvironment("production", { [name]: "" }), "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", name);
+  }
+  // Values the refresh contract refuses on its own.
   for (const [name, value] of [
     ["PRIMARY_INSTANCE_CONNECTION_NAME", "ex:us-east1:primary"],
     ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:useast1:example-primary"],
@@ -3064,8 +3052,6 @@ test("production target: the plane, the shared values and the patterns agree wit
       ? "tibotattle:us-east1:tibotattle-test-primary-20260922" : ""],
   ]) {
     const env = productionEnvironment("production", { [name]: value });
-    assert.throws(() => configuration.readProductionConfiguration(cr3(strip(env), "production"), "analytics-job"),
-      undefined, `${name} (CR-3)`);
     await assert.rejects(job.readAnalyticsRefreshProductionTarget(env), (error) =>
       ["ANALYTICS_V2_REFRESH_ENV_INVALID", "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN"].includes(error.code)
         && error.field === name, `${name} (refresh)`);

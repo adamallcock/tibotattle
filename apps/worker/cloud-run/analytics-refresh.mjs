@@ -50,9 +50,10 @@
  * PGOPTIONS, PGSSLMODE or PGPASSWORD), the Node runtime variables that change
  * the code loaded, the database driver or TLS trust
  * (ANALYTICS_REFRESH_RUNTIME_FORBIDDEN: NODE_OPTIONS, NODE_PG_FORCE_NATIVE,
- * NODE_TLS_REJECT_UNAUTHORIZED, NODE_EXTRA_CA_CERTS), every variable
- * postgres-production-configuration.mjs (CR-3) refuses in production (its
- * test seams, edge secrets, the retired ledger settings),
+ * NODE_TLS_REJECT_UNAUTHORIZED, NODE_EXTRA_CA_CERTS), every variable of the
+ * job's own production refusal policy (ANALYTICS_REFRESH_CR3_POLICY: the
+ * test seams, edge secrets and retired ledger settings CR-3 refused when the
+ * policy was taken from it),
  * ANALYTICS_V2_TEST_CLOCK and GOOGLE_APPLICATION_CREDENTIALS are refused, as
  * are a test or rehearsal target (the IAM test and fast-path resources, a test
  * or rehearsal schema, database, instance or job) and a resource carrying the
@@ -522,17 +523,17 @@ function testTargetIdentities() {
 const TEST_TARGET_VALUES = testTargetIdentities();
 
 /**
- * CR-3's production refusal policy (cloud-run/postgres-production-configuration.mjs):
- * the variables and prefixes it refuses in production, its plane markers and
- * the production resource fingerprint values (Cloudflare's production names).
- * CR-3 refuses the fingerprint on the staging plane only; this job refuses it
- * on both planes, which is stricter and refuses no GCP name the committed
- * desired states use. Mirrored, not imported: CR-3 imports Worker TypeScript
- * (so the source entry could not answer --help under plain Node 22) and is not
- * part of the audited image build context. The spec pins every value equal to
- * CR-3's exports. Which contract governs the production analytics job (this
- * one, or CR-3's unused analytics-job profiles) is an open integration
- * decision; until it is taken the equality pin is the guard against drift.
+ * The job's production refusal policy: the variables and prefixes it refuses
+ * in production, the plane markers and the production resource fingerprint
+ * values (Cloudflare's production names). Its values were taken from CR-3
+ * (cloud-run/postgres-production-configuration.mjs) and keep CR-3's name for
+ * a byte-stable build. Owner round 12 (2026-10-02, OWN-20.1) made this
+ * contract (C-REFRESH's) the only one that governs the production analytics
+ * job: CR-3's analytics-job profiles and the spec's equality pin between the
+ * two were retired, so this policy is owned here and changes only with a
+ * reviewed change to this file. The job refuses the fingerprint on both
+ * planes (CR-3 refuses it on the staging plane only), which is stricter and
+ * refuses no GCP name the committed desired states use.
  */
 export const ANALYTICS_REFRESH_CR3_POLICY = Object.freeze({
   forbiddenVariables: Object.freeze([
@@ -577,7 +578,7 @@ function productionValue(env, name, pattern) {
  * with a closed code naming the setting and never its value:
  * - ANALYTICS_V2_REFRESH_TARGET_INVALID: a target other than production or staging;
  * - ANALYTICS_V2_TEST_CLOCK_FORBIDDEN: ANALYTICS_V2_TEST_CLOCK present (even empty);
- * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any CR-3 production-forbidden variable or
+ * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any production-forbidden variable of the job's policy or
  *   prefix, GOOGLE_APPLICATION_CREDENTIALS, a refused Node runtime variable
  *   (ANALYTICS_REFRESH_RUNTIME_FORBIDDEN), or any other variable in the closed
  *   namespaces (ANALYTICS_REFRESH_CLOSED_PREFIXES);

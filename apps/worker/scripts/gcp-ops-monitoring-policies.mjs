@@ -179,10 +179,20 @@ export const EDGE_HEALTH_OK_TEXT = '"status":"ok"';
  * - OD-CR-2 (round 1): participant export is retired;
  * - C-ADMIN: an admin task with no PostgreSQL port answers 503
  *   POSTGRES_ROUTE_NOT_PORTED on the admin action route.
- * v0.x uploads (round 12) share POST /api/v1/contributions with every live
- * upload and are refused with a 4xx there, so nothing is excluded for them;
- * the accountless performance authorization answers a definite 4xx (round
- * 12), so it is not excluded either: a 5xx from it is a defect.
+ * v0.x uploads (round 12) answer the same uniform 503
+ * POSTGRES_ROUTE_NOT_PORTED (a retired v0.1 or v0.2 envelope on
+ * /api/v1/contributions, a retired format on
+ * /api/v1/device/upload-authorizations; RETIRED_FORMAT_ANSWER in
+ * cloud-run/upload-authorization-formats.mjs), but both paths are shared
+ * with every live v1 upload and an exclusion keys only on routeClass, status
+ * and code, never on the schema version. So no exclusion is possible for
+ * them (ORIGIN_5XX_NEVER_EXCLUDED_PATHS): each v0.x 503 counts toward the
+ * 5xx ratio and the minimum error count. The live ingestion database never
+ * admitted a v0.x row (OD-8), so the impact is theoretical; whether to keep
+ * counting them is an open owner question (monitoring.md, origin-5xx-ratio).
+ * The accountless performance authorization answers a definite 403
+ * TELEMETRY_TRANSPORT_BLOCKED (round 12), so it is not excluded either: a
+ * 5xx from it is a defect.
  */
 export const ORIGIN_5XX_EXCLUSIONS = Object.freeze([
   ["/api/v1/enroll", "round-12"],
@@ -219,9 +229,10 @@ export const ORIGIN_5XX_NEVER_EXCLUDED_CODES = Object.freeze([
   "EDGE_ORIGIN_UNAVAILABLE",
 ]);
 /**
- * Exact paths that are never excluded, whatever the code: the live upload
- * route v0.x shares, the accountless performance authorization (a definite
- * 4xx, round 12), and the renew and disconnect routes round 12 keeps.
+ * Exact paths that are never excluded, whatever the code: the two live
+ * upload routes v0.x shares (their round-12 v0.x 503s therefore count as
+ * errors), the accountless performance authorization (a definite 403, round
+ * 12), and the renew and disconnect routes round 12 keeps.
  */
 export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
   "/api/v1/contributions",

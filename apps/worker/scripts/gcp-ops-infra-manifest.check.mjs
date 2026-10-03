@@ -718,29 +718,29 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
     [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES]);
   for (const name of configuration.REQUIRED_SECRET_NAMES) {
     assert.equal(desired.secrets[name].required, true, name);
-    if (manifest.RETIRED_PRODUCTION_SECRET_NAMES.includes(name)) continue;
     // Removing a required container fails the CR-3 cross-check.
     refused((value) => { delete value.secrets[name]; }, `SECRET_CONTAINER_MISSING:${name}`);
   }
-  // Round 12: production may leave out the retired Google and Apple secrets,
-  // and its service then waits until CR-3 stops requiring them; staging may not.
+  // Round 12 retired Google and Apple sign-in and ROUTES-R12 narrowed CR-3:
+  // the two secrets are no container of either plane, and a desired state
+  // that still names one is refused, production and staging alike.
   assert.deepEqual([...manifest.RETIRED_PRODUCTION_SECRET_NAMES], ["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+  assert.deepEqual([...manifest.PRODUCTION_OMITTABLE_SECRET_NAMES], ["DISTRIBUTION_GITHUB_API_TOKEN"]);
   for (const name of manifest.RETIRED_PRODUCTION_SECRET_NAMES) {
-    assert.equal(configuration.REQUIRED_SECRET_NAMES.includes(name), true, `${name} is still CR-3's until ROUTES-R12`);
-    const omitted = manifest.validateDesiredState(fixture((value) => { delete value.secrets[name]; }));
-    assert.equal(Object.hasOwn(omitted.secrets, name), false, name);
-    assert.equal(manifest.serviceRenderBlocker(omitted), `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${name}`, name);
-    assert.throws(() => manifest.renderService(omitted, { imageDigest: "c".repeat(64), sourceCommit: "d".repeat(40) }),
-      { code: `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${name}` }, name);
-    assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => { delete value.secrets[name]; })),
-      { code: `SECRET_CONTAINER_MISSING:${name}` }, name);
+    assert.equal(configuration.REQUIRED_SECRET_NAMES.includes(name), false, name);
+    assert.equal(configuration.OPTIONAL_SECRET_NAMES.includes(name), false, name);
+    refused((value) => { value.secrets[name] = { secretName: name, version: "1" }; }, `SECRET_UNKNOWN:${name}`);
+    assert.throws(() => manifest.validateDesiredState(committed("staging", (value) => {
+      value.secrets[name] = { secretName: `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`, version: "1" };
+    })), { code: `SECRET_UNKNOWN:${name}` }, name);
   }
+  // The fixture's service renders with no sign-in secret and nothing waits for one.
+  assert.equal(manifest.serviceRenderBlocker(desired), null);
   // Production may also leave out the optional GitHub token, which nothing on
   // the production estate reads: the service renders exactly as with its
   // version unpinned (the entry omitted), and nothing waits. Staging may not.
   assert.deepEqual([...manifest.UNREAD_PRODUCTION_SECRET_NAMES], ["DISTRIBUTION_GITHUB_API_TOKEN"]);
-  assert.deepEqual([...manifest.PRODUCTION_OMITTABLE_SECRET_NAMES],
-    [...manifest.RETIRED_PRODUCTION_SECRET_NAMES, ...manifest.UNREAD_PRODUCTION_SECRET_NAMES]);
+  assert.deepEqual([...manifest.PRODUCTION_OMITTABLE_SECRET_NAMES], [...manifest.UNREAD_PRODUCTION_SECRET_NAMES]);
   assert.equal(desired.secrets.DISTRIBUTION_GITHUB_API_TOKEN.version, null);
   for (const name of manifest.UNREAD_PRODUCTION_SECRET_NAMES) {
     assert.equal(configuration.OPTIONAL_SECRET_NAMES.includes(name), true, `${name} is optional in CR-3`);
@@ -778,7 +778,7 @@ test("Secret Manager containers are exactly CR-3's secret names, never an edge-o
   }
   refused((value) => {
     value.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-shared-secret";
-    value.secrets.APPLE_PRIVATE_KEY.secretName = "tibotattle-shared-secret";
+    value.secrets.POSTGRES_RATE_LIMIT_SECRET.secretName = "tibotattle-shared-secret";
   }, "SECRET_NAMES_NOT_DISTINCT");
   // Secret ids are project-wide: a test-estate secret is never reused.
   refused((value) => { value.secrets.ENVELOPE_PRIVATE_JWK.secretName = "tibotattle-test-envelope-private-jwk-20260922"; },
@@ -960,8 +960,8 @@ test("the IAM-private service renders from EP-7's template with no deletion-ledg
     === "DISTRIBUTION_GITHUB_API_TOKEN").valueFrom.secretKeyRef, { name: "DISTRIBUTION_GITHUB_API_TOKEN", key: "3" });
   // A required secret whose version is not pinned cannot render.
   assert.throws(() => manifest.renderService(manifest.validateDesiredState(fixture((value) => {
-    value.secrets.APPLE_PRIVATE_KEY.version = null;
-  })), IMAGE), { code: "SECRET_VERSION_UNPINNED:APPLE_PRIVATE_KEY" });
+    value.secrets.ENVELOPE_PRIVATE_JWK.version = null;
+  })), IMAGE), { code: "SECRET_VERSION_UNPINNED:ENVELOPE_PRIVATE_JWK" });
   for (const image of [{ ...IMAGE, imageDigest: "latest" }, { ...IMAGE, sourceCommit: "main" }]) {
     assert.throws(() => manifest.renderService(desired, image), (error) => /^SERVICE_RENDER_/u.test(error.code));
   }
@@ -981,8 +981,6 @@ test("the rendered service env is a production configuration CR-3 accepts, with 
     POSTGRES_RATE_LIMIT_SECRET: "synthetic-rate-limit-secret-value-00000000002",
     ENVELOPE_PUBLIC_JWK: JSON.stringify({ kty: "RSA", kid, n: "synthetic-modulus", e: "AQAB" }),
     ENVELOPE_PRIVATE_JWK: JSON.stringify({ kty: "RSA", kid, n: "synthetic-modulus", e: "AQAB", d: "synthetic-d" }),
-    GOOGLE_OIDC_CLIENT_SECRET: "synthetic-google-client-secret-value",
-    APPLE_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nc3ludGhldGlj\\n-----END PRIVATE KEY-----",
   });
   const config = configuration.readProductionConfiguration(env, "production");
   assert.deepEqual(config.resources, {
@@ -1426,11 +1424,12 @@ test("the committed production desired state: OWN-5 filled by PROD-PREP, and ref
   assert.equal(desired.projectTenancy, "dedicated");
   assert.equal(desired.serviceAccounts.verifier.accountId, "tibotattle-verifier");
   assert.equal(desired.connectionBudget.fits, true);
-  // The service waits for the namespace, then for ROUTES-R12 to narrow CR-3.
+  // The service waits for the namespace only: ROUTES-R12 narrowed CR-3, so
+  // the committed production secrets compose the service.
   assert.equal(manifest.serviceRenderBlocker(desired), "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED");
   const named = manifest.validateDesiredState(JSON.parse(unpinnedProductionText(COMMITTED.production)
     .replace('"telemetryStorageNamespace": null', '"telemetryStorageNamespace": "synthetic-namespace"')));
-  assert.equal(manifest.serviceRenderBlocker(named), "SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET");
+  assert.equal(manifest.serviceRenderBlocker(named), null);
   assert.equal(manifest.rolloutTargetFromDesiredState(desired).project, "tibotattle-prod");
   // Its refresh job is the entry's production job, and the entry accepts its production names.
   await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
@@ -1501,15 +1500,15 @@ test("committed files refuse secret material anywhere, before any shape check", 
       "desiredState.secrets.IDENTITY_LINK_SECRET.value"],
     ["staging", (value) => { value.secrets.ENVELOPE_PRIVATE_JWK.jwk = { kty: "RSA" }; },
       "desiredState.secrets.ENVELOPE_PRIVATE_JWK.jwk"],
-    ["staging", (value) => { value.secrets.APPLE_PRIVATE_KEY.privateKey = pem; },
-      "desiredState.secrets.APPLE_PRIVATE_KEY.privateKey"],
+    ["staging", (value) => { value.secrets.ENVELOPE_PUBLIC_JWK.privateKey = pem; },
+      "desiredState.secrets.ENVELOPE_PUBLIC_JWK.privateKey"],
     ["staging", (value) => { value.serviceAccounts.edgeInvoker.keyJson = "{}"; },
       "desiredState.serviceAccounts.edgeInvoker.keyJson"],
     ["staging", (value) => { value.password = "x"; }, "desiredState.password"],
     ["staging", (value) => { value.service.audience = pem; }, "desiredState.service.audience"],
     ["staging", (value) => { value.service.audience = jwk; }, "desiredState.service.audience"],
-    ["staging", (value) => { value.secrets.GOOGLE_OIDC_CLIENT_SECRET.secretName = `AIza${"Sy".repeat(17)}x`; },
-      "desiredState.secrets.GOOGLE_OIDC_CLIENT_SECRET.secretName"],
+    ["staging", (value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = `AIza${"Sy".repeat(17)}x`; },
+      "desiredState.secrets.IDENTITY_LINK_SECRET.secretName"],
     ["staging", (value) => { value.secrets.DISTRIBUTION_GITHUB_API_TOKEN.secretName = `ghp_${"aB3".repeat(12)}`; },
       "desiredState.secrets.DISTRIBUTION_GITHUB_API_TOKEN.secretName"],
     ["staging", (value) => { value.secrets.POSTGRES_RATE_LIMIT_SECRET.secretName = "Q2xhdWRlU3ludGhldGljU2VjcmV0VmFsdWUxMjM0"; },
@@ -1677,7 +1676,11 @@ test("the service render names each secret by its Secret Manager id and waits fo
   const env = manifest.renderService(renamed, IMAGE).spec.template.spec.containers[0].env;
   const reference = (name) => env.find((entry) => entry.name === name).valueFrom.secretKeyRef;
   assert.deepEqual(reference("IDENTITY_LINK_SECRET"), { name: "tibotattle-identity-link", key: "1" });
-  assert.deepEqual(reference("APPLE_PRIVATE_KEY"), { name: "APPLE_PRIVATE_KEY", key: "1" });
+  assert.deepEqual(reference("ENVELOPE_PRIVATE_JWK"), { name: "ENVELOPE_PRIVATE_JWK", key: "1" });
+  // Round 12: no sign-in secret is referenced at all.
+  for (const name of manifest.RETIRED_PRODUCTION_SECRET_NAMES) {
+    assert.equal(env.some((entry) => entry.name === name), false, name);
+  }
   assert.deepEqual(reference("DISTRIBUTION_GITHUB_API_TOKEN"), { name: "DISTRIBUTION_GITHUB_API_TOKEN", key: "2" });
   // EP-7's own render (the template's variable names) is unchanged.
   const values = manifest.serviceTemplateValues(renamed, IMAGE);

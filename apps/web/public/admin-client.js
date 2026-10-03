@@ -4,6 +4,23 @@ import {
 } from "./telemetry-shared.generated.js";
 
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.5";
+/**
+ * The Google Cloud origin's overview (owner round 12, 2026-10-02): v0.5 plus
+ * an explicit { status: "unavailable" } for a block with no source there. The
+ * Cloudflare Worker keeps serving v0.5 until the switch; both are read.
+ */
+const ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION = "admin-overview-v0.6";
+const ADMIN_OVERVIEW_SCHEMA_VERSIONS = new Set([
+  ADMIN_OVERVIEW_SCHEMA_VERSION, ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION,
+]);
+/**
+ * admin-database-health-v0.1 is the Worker's; v0.2 is the Google Cloud
+ * origin's, where the removed deletion ledger is always not_applicable.
+ */
+const ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION = "admin-database-health-v0.2";
+const ADMIN_DATABASE_HEALTH_SCHEMA_VERSIONS = new Set([
+  "admin-database-health-v0.1", ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION,
+]);
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -213,7 +230,8 @@ function isoTimestamp(value, code) {
 export function projectAdminDatabaseHealth(value) {
   const code = "ADMIN_DATABASE_HEALTH_INVALID";
   const source = record(value, code);
-  if (source.schemaVersion !== "admin-database-health-v0.1") invalid(code);
+  if (!ADMIN_DATABASE_HEALTH_SCHEMA_VERSIONS.has(source.schemaVersion)) invalid(code);
+  const ledgerless = source.schemaVersion === ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION;
   const storageMode = enumValue(source.storageMode, new Set(["json", "typed", "unknown"]), code);
   const roles = ["primary", "deletion_ledger", "analytics"];
   const rows = array(source.databases, code);
@@ -224,7 +242,8 @@ export function projectAdminDatabaseHealth(value) {
     const status = enumValue(row.status, new Set([
       "reachable", "unavailable", "timeout", "not_configured", "not_applicable",
     ]), code);
-    const unused = row.role === "analytics" && storageMode === "json";
+    const unused = (row.role === "analytics" && storageMode === "json")
+      || (ledgerless && row.role === "deletion_ledger");
     if ((status === "not_applicable") !== unused) invalid(code);
     if (status !== "reachable" && (row.responseMs !== null || row.databaseBytes !== null)) invalid(code);
     if (status === "reachable" && row.responseMs === null) invalid(code);
@@ -1059,6 +1078,14 @@ function projectDailyPublication(value) {
   });
 }
 
+/** The closed state of a v0.6 overview block that has no source on the origin. */
+function isUnavailableBlock(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === 1 && value.status === "unavailable";
+}
+
+const UNAVAILABLE_BLOCK = Object.freeze({ status: "unavailable" });
+
 function projectHistoricalPublication(value) {
   if (value === null) return null;
   const publication = record(value, "ADMIN_OVERVIEW_INVALID");
@@ -1805,9 +1832,10 @@ function projectErrors(value) {
  */
 export function projectAdminOverview(value) {
   const overview = record(value, "ADMIN_OVERVIEW_INVALID");
-  if (overview.schemaVersion !== ADMIN_OVERVIEW_SCHEMA_VERSION) {
+  if (!ADMIN_OVERVIEW_SCHEMA_VERSIONS.has(overview.schemaVersion)) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
+  const unavailableAllowed = overview.schemaVersion === ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION;
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
   const storageMode = enumValue(service.telemetryStorageMode, new Set(["json", "typed"]), "ADMIN_OVERVIEW_INVALID");
   const typed = storageMode === "typed";
@@ -1837,8 +1865,11 @@ export function projectAdminOverview(value) {
       createdAt: string(item.createdAt, "ADMIN_OVERVIEW_INVALID"),
     });
   });
+  // v0.6 only: a typed origin with no historical source says so explicitly.
   const historicalPublication = typed
-    ? projectHistoricalPublication(overview.historicalPublication)
+    ? unavailableAllowed && isUnavailableBlock(overview.historicalPublication)
+      ? UNAVAILABLE_BLOCK
+      : projectHistoricalPublication(overview.historicalPublication)
     : null;
   if (typed && historicalPublication === null) {
     invalid("ADMIN_OVERVIEW_INVALID");

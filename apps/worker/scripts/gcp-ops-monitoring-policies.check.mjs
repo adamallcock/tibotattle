@@ -6,7 +6,7 @@
  * credentials), the edge-health check (the public host through the edge,
  * exactly 200 with status ok), the 5xx ratio's minimum error count, evaluated
  * window by window, and its exact route-plus-code exclusions (never a code
- * alone, never the live or 4xx routes), the scanner's refusal of any other
+ * alone, never the shared upload or kept routes), the scanner's refusal of any other
  * 5xx query, cadence-derived windows and the closed deferrals and runbook
  * anchors. No call is made.
  */
@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as monitoring from "./gcp-ops-monitoring-policies.mjs";
 import { WORKER_ROUTE_POLICY, matchWorkerRoute } from "../src/route-registry.ts";
+import { RETIRED_FORMAT_ANSWER } from "../cloud-run/upload-authorization-formats.mjs";
 
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = dirname(SCRIPTS_ROOT);
@@ -405,16 +406,32 @@ test("5xx exclusions name round 12's retired routes and the deliberate unported 
     assert.deepEqual([entry.status, entry.code], [503, "POSTGRES_ROUTE_NOT_PORTED"]);
   }
   const paths = monitoring.ORIGIN_5XX_EXCLUSIONS.map(({ path }) => path);
-  // Kept and live routes are never excluded: v0.x shares the live upload
-  // route, the accountless performance authorization answers a definite 4xx,
-  // and round 12 keeps renew and disconnect.
+  // Kept and live routes are never excluded: v0.x shares the two live upload
+  // routes (so its round-12 503s count as errors), the accountless
+  // performance authorization answers a definite 403, and round 12 keeps
+  // renew and disconnect.
   for (const kept of monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS) assert.equal(paths.includes(kept), false, kept);
-  for (const kept of ["/api/v1/contributions", "/api/v1/accountless/telemetry-performance-authorization",
+  for (const kept of ["/api/v1/contributions", "/api/v1/device/upload-authorizations",
+    "/api/v1/accountless/telemetry-performance-authorization",
     "/api/v1/device/credential/renew", "/api/v1/device/disconnect"]) {
     assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(kept), kept);
   }
   assert.deepEqual([...monitoring.ORIGIN_5XX_NEVER_EXCLUDED_CODES], ["POSTGRES_TEST_ROUTE_UNSUPPORTED",
     "EDGE_ORIGIN_UNAVAILABLE"]);
+});
+
+test("round 12's v0.x upload 503s count toward the 5xx ratio: their shared paths cannot be excluded", () => {
+  // The retired v0.x envelopes and formats answer the very code the
+  // exclusions subtract, a 5xx, not a 4xx...
+  assert.deepEqual([RETIRED_FORMAT_ANSWER.status, RETIRED_FORMAT_ANSWER.code],
+    [monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status, monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code]);
+  // ...on the two paths every live v1 upload shares, which no exclusion may name.
+  const routeClasses = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
+  for (const path of ["/api/v1/contributions", "/api/v1/device/upload-authorizations"]) {
+    assert.equal(routeClasses.includes(matchWorkerRoute(path).routeClass), false, path);
+    assert.throws(() => monitoring.originFiveXxExclusions([{ path, status: 503, code: "POSTGRES_ROUTE_NOT_PORTED",
+      decision: "round-12" }]), { code: "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN" });
+  }
 });
 
 test("5xx exclusions refuse a code alone, an inexact path, a kept route and the never-excluded codes", () => {
@@ -728,15 +745,18 @@ test("the origin request contract mirrors the origin's own log line (cloud-run/p
     .exec(source);
   assert.ok(notPorted, "ORIGIN_ROUTE_NOT_PORTED");
   assert.deepEqual({ status: Number(notPorted[1]), code: notPorted[2] }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
-  // Every excluded route is one the origin deliberately leaves unported (or
-  // the admin action route, whose unported tasks answer the same code); the
-  // accountless performance authorization is the one unported route left in.
+  // Every excluded route is one round 12 retired to the uniform 503 (or the
+  // admin action route, whose unported tasks answer the same code), and every
+  // such retired route is excluded; the accountless performance
+  // authorization is retired to a definite 403 instead, so it is left in.
   const registry = await import("../cloud-run/postgres-production-registry.mjs");
   const excluded = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
   for (const routeClass of excluded) {
     assert.ok(routeClass === "admin_action" ? registry.ADMIN_HOST_ROUTE_IDS.includes(routeClass)
-      : registry.OD_CR_2_UNPORTED_ROUTE_IDS.includes(routeClass), routeClass);
+      : registry.RETIRED_ROUTE_IDS.includes(routeClass), routeClass);
   }
-  assert.deepEqual(registry.OD_CR_2_UNPORTED_ROUTE_IDS.filter((id) => !excluded.includes(id)),
-    ["accountless_telemetry_performance_authorization"]);
+  assert.deepEqual(registry.RETIRED_ROUTE_IDS.filter((id) => !excluded.includes(id)), []);
+  assert.deepEqual([...registry.RETIRED_DEFINITE_ROUTE_IDS], ["accountless_telemetry_performance_authorization"]);
+  assert.equal(registry.RETIRED_DEFINITE_ROUTE_IDS.some((id) => excluded.includes(id)), false);
+  assert.ok(registry.RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization.status < 500);
 });

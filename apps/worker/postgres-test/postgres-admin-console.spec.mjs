@@ -7,9 +7,13 @@
 // database and the deletion ledger), opened through the reviewed D1 adapter
 // (cloud-run/sealed-sqlite-d1-adapter.mjs). The PostgreSQL line has no
 // deletion ledger (decisions D2, D4 and D6 of 2026-09-26): the overview's
-// deletionLedger block has no PostgreSQL reader, so the spec injects a
-// synthetic source (the Worker's own block over the D1 fixture) wherever the
-// composed overview must answer 200. The expected body is
+// deletionLedger block has no PostgreSQL reader, so where the spec compares
+// with the Worker it injects a synthetic source (the Worker's own block over
+// the D1 fixture). Without a source each such block is the closed
+// { status: "unavailable" } of 'admin-overview-v0.6' (owner round 12); with
+// every source injected the body is the Worker's v0.5 apart from the
+// schemaVersion, and the database health is the Worker's v0.1 apart from the
+// version and the removed ledger's not_applicable row (v0.2). The expected body is
 // computed by the Worker's code: the vendored d43c8f92 readAdminOverview and
 // setCollectionControls (vendor/analytics-d43c8f92, byte copies), and this
 // checkout's readGithubDistributionSnapshot, readDistributionAnalytics and
@@ -551,7 +555,12 @@ test("overview deep-equals the d43c8f92 Worker's typed overview over the same ev
   const actual = await m.overview.readPostgresAdminOverview({
     pool, schema, env: ENV, nowEpoch: NOW_MS, diagnosticReference: REQUEST_ID, sources: sourcesFrom(expected),
   });
-  assert.equal(JSON.stringify(actual), JSON.stringify(expected), "byte-identical JSON, key order included");
+  // Round 12: the origin's DTO is v0.6; with every source injected it is the
+  // Worker's v0.5 body byte for byte apart from that version.
+  assert.equal(expected.schemaVersion, "admin-overview-v0.5");
+  assert.equal(actual.schemaVersion, "admin-overview-v0.6");
+  assert.equal(JSON.stringify({ ...actual, schemaVersion: expected.schemaVersion }), JSON.stringify(expected),
+    "byte-identical JSON, key order included");
   // The fixture exercises every count it claims to.
   const contributions = actual.counts.contributions;
   assert.deepEqual(contributions.incrementalChunks,
@@ -571,19 +580,43 @@ test("overview deep-equals the d43c8f92 Worker's typed overview over the same ev
     latestReleasedAt: "2026-10-02T00:05:00.000Z", pendingRebuilds: 0, pendingRebuildsBounded: false });
 });
 
-test("overview blocks without a GCP source are the Worker's 503, never zeros", { skip }, async () => {
+test("round 12: overview blocks without a GCP source are the explicit unavailable state, never zeros", { skip },
+  async () => {
   const expected = await workerOverview();
   const full = sourcesFrom(expected);
-  for (const missing of ["syntheticContributions", "historicalPublication", "deletionLedger"]) {
+  const paths = {
+    syntheticContributions: (body) => body.counts.contributions.synthetic,
+    historicalPublication: (body) => body.historicalPublication,
+    deletionLedger: (body) => body.deletionLedger,
+  };
+  assert.deepEqual([...m.overview.POSTGRES_ADMIN_OVERVIEW_SOURCELESS_BLOCKS], Object.keys(paths));
+  for (const missing of Object.keys(paths)) {
     const sources = { ...full };
     delete sources[missing];
-    assert.equal(await apiError(m.overview.readPostgresAdminOverview({
-      pool, schema, env: ENV, nowEpoch: NOW_MS, sources,
-    })), "503 BACKEND_STORAGE_UNAVAILABLE", missing);
+    const body = await m.overview.readPostgresAdminOverview({ pool, schema, env: ENV, nowEpoch: NOW_MS, sources });
+    assert.equal(body.schemaVersion, "admin-overview-v0.6", missing);
+    assert.deepEqual(JSON.parse(JSON.stringify(paths[missing](body))), { status: "unavailable" }, missing);
+    // Every other block is unchanged: the Worker's value over the same evidence.
+    const sameAsWorker = JSON.parse(JSON.stringify({ ...body, schemaVersion: expected.schemaVersion }));
+    const workerValue = JSON.parse(JSON.stringify(expected));
+    if (missing === "syntheticContributions") workerValue.counts.contributions.synthetic = { status: "unavailable" };
+    else workerValue[missing] = { status: "unavailable" };
+    assert.deepEqual(sameAsWorker, workerValue, missing);
   }
-  assert.equal(await apiError(m.overview.readPostgresAdminOverview({
+  // The production composition injects no source: all three are unavailable,
+  // with no count, day or timestamp invented.
+  const bare = JSON.parse(JSON.stringify(await m.overview.readPostgresAdminOverview({
     pool, schema, env: ENV, nowEpoch: NOW_MS,
-  })), "503 BACKEND_STORAGE_UNAVAILABLE");
+  })));
+  for (const read of Object.values(paths)) assert.deepEqual(read(bare), { status: "unavailable" });
+  // An injected source that fails is still the Worker's 503: unavailable
+  // means "no source", never "the source failed".
+  for (const failing of Object.keys(paths)) {
+    assert.equal(await apiError(m.overview.readPostgresAdminOverview({
+      pool, schema, env: ENV, nowEpoch: NOW_MS,
+      sources: { ...full, [failing]: async () => { throw new Error("synthetic source failure"); } },
+    })), "503 BACKEND_STORAGE_UNAVAILABLE", failing);
+  }
   // A json-mode or mismatched namespace env is refused, not served from typed rows.
   for (const env of [
     Object.freeze({ ...ENV, TELEMETRY_STORAGE_MODE: "json" }),
@@ -643,7 +676,8 @@ const INGRESS_POLICY_ENV = Object.freeze({
 });
 
 test("overview ingress is the Worker's readUploadIngressStatus over the PostgreSQL budget binding", { skip }, async () => {
-  const expected = await workerOverview();
+  // The Worker's body under the origin's v0.6 version (round 12), every source injected.
+  const expected = { ...(await workerOverview()), schemaVersion: "admin-overview-v0.6" };
   const budget = m.ingress.createPostgresUploadIngressBudget(pool, { primarySchema: schema });
   const requestedNames = [];
   // The binding shape cloud-run/server.mjs composes.
@@ -733,34 +767,59 @@ function shape(body) {
       : key === "observedAt" ? "<t>" : value)));
 }
 
-test("database health keeps the Worker's closed DTO, role order and statuses", { skip }, async () => {
+/**
+ * The Worker's v0.1 body as the PostgreSQL v0.2 reports it (round 12): the
+ * removed deletion ledger not_applicable, the status recomputed by the
+ * Worker's own rule over the rows.
+ */
+function ledgerless(workerBody) {
+  const databases = workerBody.databases.map((row) => (row.role === "deletion_ledger"
+    ? { role: row.role, status: "not_applicable", responseMs: null, databaseBytes: null } : row));
+  return {
+    ...workerBody,
+    schemaVersion: "admin-database-health-v0.2",
+    status: workerBody.storageMode !== "unknown" && databases.every((row) =>
+      row.status === "reachable" || row.status === "not_applicable") ? "available" : "degraded",
+    databases,
+  };
+}
+
+test("round 12: database health is the Worker's closed DTO with the removed ledger not_applicable (v0.2)", { skip },
+  async () => {
   const failing = { connect: async () => { throw new Error("synthetic"); } };
   const hanging = { connect: () => new Promise(() => {}) };
   const cases = [
     // [env, pools, Worker bindings]
     [ENV, { primary: pool, analytics: pool }, { USAGE_MONITOR_DB: d1Binding(), ANALYTICS_DB: d1Binding() }],
-    [ENV, { primary: pool, deletionLedger: pool, analytics: pool },
-      { USAGE_MONITOR_DB: d1Binding(), DELETION_LEDGER: d1Binding(), ANALYTICS_DB: d1Binding() }],
-    [Object.freeze({ TELEMETRY_STORAGE_MODE: "json" }), { primary: pool, deletionLedger: failing },
-      { USAGE_MONITOR_DB: d1Binding(), DELETION_LEDGER: d1Binding({ fail: true }) }],
+    [ENV, { primary: pool, analytics: failing }, { USAGE_MONITOR_DB: d1Binding(), ANALYTICS_DB: d1Binding({ fail: true }) }],
+    [Object.freeze({ TELEMETRY_STORAGE_MODE: "json" }), { primary: pool },
+      { USAGE_MONITOR_DB: d1Binding() }],
     [Object.freeze({ TELEMETRY_STORAGE_MODE: "bogus" }), { primary: pool },
       { USAGE_MONITOR_DB: d1Binding() }],
   ];
   for (const [env, pools, bindings] of cases) {
     const actual = await m.health.readPostgresAdminDatabaseHealth({ env, pools, clock: Date.now });
-    const expected = await m.workerDatabaseHealth.readAdminDatabaseHealth({ ...env, ...bindings });
+    const expected = ledgerless(await m.workerDatabaseHealth.readAdminDatabaseHealth({ ...env, ...bindings }));
     assert.deepEqual(shape(actual), shape(expected));
     assert.equal(JSON.stringify(Object.keys(actual)), JSON.stringify(Object.keys(expected)));
     const primary = actual.databases[0];
     assert.equal(primary.status, "reachable");
     assert.ok(Number.isSafeInteger(primary.databaseBytes) && primary.databaseBytes > 0);
+    assert.deepEqual(actual.databases[1], { role: "deletion_ledger", status: "not_applicable", responseMs: null,
+      databaseBytes: null });
   }
+  // The healthy typed origin is 'available' (v0.1 with an absent ledger never was).
+  assert.equal((await m.health.readPostgresAdminDatabaseHealth({ env: ENV, pools: { primary: pool, analytics: pool } }))
+    .status, "available");
   const slow = await m.health.readPostgresAdminDatabaseHealth({
-    env: ENV, pools: { primary: pool, deletionLedger: hanging, analytics: pool }, probeTimeoutMs: 50,
+    env: ENV, pools: { primary: pool, analytics: hanging }, probeTimeoutMs: 50,
   });
-  assert.deepEqual(slow.databases[1], { role: "deletion_ledger", status: "timeout", responseMs: null,
+  assert.deepEqual(slow.databases[2], { role: "analytics", status: "timeout", responseMs: null,
     databaseBytes: null });
   assert.equal(slow.status, "degraded");
+  // A ledger pool is refused, never probed.
+  await assert.rejects(m.health.readPostgresAdminDatabaseHealth({ env: ENV, pools: { primary: pool, deletionLedger: pool } }),
+    TypeError);
 });
 
 // ---------------------------------------------------------------------------
@@ -945,32 +1004,34 @@ test("the composed console serves the routes over PostgreSQL with the root's ide
   // counterpart; everything else is the Worker's body byte for byte.
   const served = await overview.json();
   served.audit = served.audit.filter((row) => row.details?.code !== "LIFECYCLE_STATE_CONFLICT");
-  assert.equal(JSON.stringify(served), JSON.stringify(expected));
+  assert.equal(served.schemaVersion, "admin-overview-v0.6");
+  assert.equal(JSON.stringify({ ...served, schemaVersion: expected.schemaVersion }), JSON.stringify(expected));
 
   const health = await dispatch("admin_database_health", new Request(`${ORIGIN}/api/v1/admin/database-health`));
   const healthBody = await health.json();
   assert.equal(health.status, 200);
-  // There is no ledger pool (LEAD-SIMP retired the ledger), so the closed DTO
-  // reports deletion_ledger not_configured and the status stays degraded;
-  // how a retired role is represented is OWN-17 question 3.
+  // There is no ledger pool (LEAD-SIMP retired the ledger): round 12 (OWN-17
+  // question 3) reports the role not_applicable in the v0.2 DTO, so a
+  // healthy origin is 'available'.
+  assert.equal(healthBody.schemaVersion, "admin-database-health-v0.2");
   assert.deepEqual(healthBody.databases.map((row) => [row.role, row.status]),
-    [["primary", "reachable"], ["deletion_ledger", "not_configured"], ["analytics", "reachable"]]);
-  assert.equal(healthBody.status, "degraded");
+    [["primary", "reachable"], ["deletion_ledger", "not_applicable"], ["analytics", "reachable"]]);
+  assert.equal(healthBody.status, "available");
   // One database holds both roles, so they report the same size.
   assert.equal(healthBody.databases[2].databaseBytes, healthBody.databases[0].databaseBytes);
   // An explicit analytics pool that fails is reported as failing, never
   // replaced by primary.
   const failing = { connect: async () => { throw new Error("synthetic"); } };
-  for (const [pools, statuses] of [
-    [{ primary: pool }, ["reachable", "not_configured", "reachable"]],
-    [{ primary: pool, analytics: failing }, ["reachable", "not_configured", "unavailable"]],
+  for (const [pools, statuses, status] of [
+    [{ primary: pool }, ["reachable", "not_applicable", "reachable"], "available"],
+    [{ primary: pool, analytics: failing }, ["reachable", "not_applicable", "unavailable"], "degraded"],
   ]) {
     const body = await m.adminConsole.createAdminConsoleAdapters({
       requestContext: store.accessor, clock: () => NOW_MS, env: ENV, pools,
       schemaOptions: { primarySchema: schema },
     }).readDatabaseHealth();
     assert.deepEqual(body.databases.map((row) => row.status), statuses);
-    assert.equal(body.status, "degraded");
+    assert.equal(body.status, status);
   }
 
   await setPreview(null);

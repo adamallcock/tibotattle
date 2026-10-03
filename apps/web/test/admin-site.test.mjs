@@ -2216,6 +2216,33 @@ test("database checks remain independent, label stale data and recover", async (
   }, {}, () => reply());
 });
 
+test("round 12: the Google Cloud origin's v0.2 health shows the removed ledger, and v0.6 an unavailable history", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.schemaVersion = "admin-overview-v0.6";
+  overview.service.telemetryStorageMode = "typed";
+  overview.snapshots = [];
+  overview.pendingHistoricalRebuilds = null;
+  overview.pendingHistoricalRebuildsBounded = null;
+  overview.historicalPublication = { status: "unavailable" };
+  overview.deletionLedger = { status: "unavailable" };
+  overview.counts.contributions.synthetic = { status: "unavailable" };
+  const health = await fixture("admin-database-health-valid.json");
+  health.schemaVersion = "admin-database-health-v0.2";
+  health.databases[1] = { role: "deletion_ledger", status: "not_applicable", responseMs: null, databaseBytes: null };
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[0] ? response(overview) : unavailableResponse(),
+    async documentRef => {
+      const status = documentRef.byId.get("database-health-status");
+      await waitFor(() => status.textContent === "All required API databases readable");
+      assert.deepEqual(tableTexts(documentRef, "database-health-rows")[1],
+        ["Deletion ledger", "Removed (append-only)", "Not applicable", "Not applicable"]);
+      await waitFor(() => /Historical model publication/u.test(allText(documentRef.byId.get("lifecycle-status"))));
+      const lifecycle = allText(documentRef.byId.get("lifecycle-status"));
+      assert.match(lifecycle, /unavailable on this host/u);
+      assert.doesNotMatch(lifecycle, /Historical model days/u, "no invented count");
+      assert.ok(documentRef.byId.get("counts").children.length > 0, "the rest of the overview renders");
+    }, {}, () => response(health));
+});
+
 test("database failures reach attention and older Workers show unavailable without losing overview", async () => {
   const overview = await fixture("admin-overview-valid.json");
   const degraded = await fixture("admin-database-health-valid.json");

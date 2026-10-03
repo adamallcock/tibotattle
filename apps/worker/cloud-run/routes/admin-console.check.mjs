@@ -39,6 +39,8 @@ let edgeContract;
 let routeRegistry;
 let errors;
 
+const loadDatabaseHealth = () => vite.ssrLoadModule("/src/postgres-admin-database-health.ts");
+
 before(async () => {
   vite = await createServer({
     root: WORKER_ROOT,
@@ -90,9 +92,9 @@ function recorder() {
 function adapters(overrides = {}) {
   const { calls, record } = recorder();
   const admin = {
-    readOverview: record("readOverview", { schemaVersion: "admin-overview-v0.5" }),
+    readOverview: record("readOverview", { schemaVersion: "admin-overview-v0.6" }),
     readAllowancePreview: record("readAllowancePreview", { schemaVersion: "preview" }),
-    readDatabaseHealth: record("readDatabaseHealth", { schemaVersion: "admin-database-health-v0.1" }),
+    readDatabaseHealth: record("readDatabaseHealth", { schemaVersion: "admin-database-health-v0.2" }),
     setCollectionControls: record("setCollectionControls", { schemaVersion: "collection-controls-v0.1" }),
     beginAudit: record("beginAudit", "11111111-2222-4333-8444-555555555555"),
     finishAudit: record("finishAudit", undefined),
@@ -252,10 +254,10 @@ test("overview validates diagnosticReference and passes the request time", async
   }
   assert.deepEqual(calls, []);
   await expectOk(await call(map, store, "admin_overview", adminRequest("/api/v1/admin/overview")),
-    { schemaVersion: "admin-overview-v0.5" });
+    { schemaVersion: "admin-overview-v0.6" });
   await expectOk(await call(map, store, "admin_overview",
     adminRequest(`/api/v1/admin/overview?diagnosticReference=${REQUEST_ID}&other=1`)),
-  { schemaVersion: "admin-overview-v0.5" });
+  { schemaVersion: "admin-overview-v0.6" });
   assert.deepEqual(calls.map((entry) => entry.args[0]), [
     { nowEpoch: NOW_MS },
     { nowEpoch: NOW_MS, diagnosticReference: REQUEST_ID },
@@ -310,7 +312,7 @@ test("database health refuses any query string", async () => {
   assert.deepEqual(calls, []);
   // A bare '?' is an empty search, exactly as in the Worker.
   await expectOk(await call(map, store, "admin_database_health", adminRequest("/api/v1/admin/database-health?")),
-    { schemaVersion: "admin-database-health-v0.1" });
+    { schemaVersion: "admin-database-health-v0.2" });
 });
 
 test("reconstruction progress validates its query, then has no GCP source", async () => {
@@ -577,8 +579,9 @@ test("database health binds the analytics role to the primary pool by default, n
   const primary = countingPool();
   const byDefault = await health({ primary });
   assert.equal(primary.connects, 2, "the primary and analytics roles each probe the primary pool");
+  // Round 12 (OWN-17 Q3): the removed deletion ledger is not_applicable, never probed.
   assert.deepEqual(statuses(byDefault),
-    [["primary", "unavailable"], ["deletion_ledger", "not_configured"], ["analytics", "unavailable"]]);
+    [["primary", "unavailable"], ["deletion_ledger", "not_applicable"], ["analytics", "unavailable"]]);
   assert.equal(byDefault.status, "degraded");
 
   const primaryOnly = countingPool();
@@ -587,6 +590,59 @@ test("database health binds the analytics role to the primary pool by default, n
   assert.equal(primaryOnly.connects, 1);
   assert.equal(analytics.connects, 1, "an explicit analytics pool is probed as given");
   assert.deepEqual(statuses(explicit), statuses(byDefault));
+});
+
+/** A pool whose one constant probe answers reachable (every other statement is a no-op). */
+function reachablePool(bytes = "8192") {
+  const pool = {
+    connects: 0,
+    statements: [],
+    async connect() {
+      pool.connects += 1;
+      return {
+        async query(text) {
+          pool.statements.push(String(text));
+          return /pg_database_size/u.test(String(text))
+            ? { rows: [{ reachable: 1, database_bytes: bytes }], rowCount: 1 }
+            : { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  };
+  return pool;
+}
+
+test("round 12: database health is the closed v0.2 DTO, the removed ledger not_applicable", async () => {
+  const env = Object.freeze({ TELEMETRY_STORAGE_MODE: "typed",
+    TELEMETRY_STORAGE_NAMESPACE: "00000000-0000-4000-8000-0000000000ad" });
+  const primary = reachablePool();
+  const body = await console_.createAdminConsoleAdapters({
+    requestContext: () => undefined, clock: () => NOW_MS, env, pools: { primary },
+    schemaOptions: { primarySchema: "s" },
+  }).readDatabaseHealth();
+  assert.deepEqual(Object.keys(body), ["schemaVersion", "observedAt", "storageMode", "status", "databases"]);
+  assert.equal(body.schemaVersion, "admin-database-health-v0.2");
+  assert.equal(body.storageMode, "typed");
+  assert.deepEqual(body.databases.map((row) => Object.keys(row)),
+    [["role", "status", "responseMs", "databaseBytes"], ["role", "status", "responseMs", "databaseBytes"],
+      ["role", "status", "responseMs", "databaseBytes"]]);
+  assert.deepEqual(body.databases[1], { role: "deletion_ledger", status: "not_applicable", responseMs: null,
+    databaseBytes: null });
+  assert.deepEqual(body.databases.map((row) => [row.role, row.status, row.databaseBytes]),
+    [["primary", "reachable", 8192], ["deletion_ledger", "not_applicable", null], ["analytics", "reachable", 8192]]);
+  // With the ledger not_applicable, two reachable roles make the console 'available' (v0.1 could never be).
+  assert.equal(body.status, "available");
+  assert.equal(primary.connects, 2, "the ledger role opens no connection");
+  // A stale root that still hands a ledger pool is refused at composition, never probed.
+  assert.throws(() => console_.createAdminConsoleAdapters({
+    requestContext: () => undefined, clock: () => NOW_MS, env, pools: { primary, deletionLedger: reachablePool() },
+    schemaOptions: { primarySchema: "s" },
+  }), /admin_console/u);
+  // And the reader itself refuses a ledger pool rather than probing it.
+  const { readPostgresAdminDatabaseHealth } = await loadDatabaseHealth();
+  await assert.rejects(readPostgresAdminDatabaseHealth({ env, pools: { primary, deletionLedger: reachablePool() } }),
+    TypeError);
 });
 
 test("the single dispatcher routes by exact pathname only", async () => {

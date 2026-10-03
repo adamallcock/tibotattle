@@ -6,8 +6,9 @@
  * an optional diagnosticReference that must be a v4 request id (else 400
  * BODY_INVALID), then the overview body with no-store and vary: Cookie.
  * The body comes from the injected readOverview adapter
- * (src/postgres-admin-overview.ts by default, see admin-console.mjs); its
- * ApiError is the answer.
+ * (src/postgres-admin-overview.ts by default, see admin-console.mjs:
+ * 'admin-overview-v0.6', whose blocks with no GCP source are the closed
+ * { status: "unavailable" }); its ApiError is the answer.
  */
 
 import { ApiError } from "../../src/errors.ts";

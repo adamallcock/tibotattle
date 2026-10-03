@@ -70,7 +70,8 @@
 # Secrets come only from Secret Manager through secretKeyRef, with pinned
 # versions. The Cloudflare-only edge secrets (the edge client key secret, the
 # edge invoker key, the distribution analytics token and every Sparkle value)
-# never belong here.
+# never belong here, and neither do the Google and Apple sign-in settings
+# owner round 12 retired at the switch (CR-3 refuses them when present).
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -158,19 +159,11 @@ spec:
                 secretKeyRef:
                   name: ENVELOPE_PRIVATE_JWK
                   key: '${SECRET_VERSION_ENVELOPE_PRIVATE_JWK}'
-            - name: GOOGLE_OIDC_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: GOOGLE_OIDC_CLIENT_SECRET
-                  key: '${SECRET_VERSION_GOOGLE_OIDC_CLIENT_SECRET}'
-            - name: APPLE_PRIVATE_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: APPLE_PRIVATE_KEY
-                  key: '${SECRET_VERSION_APPLE_PRIVATE_KEY}'
             # Optional. When no GitHub token is configured its version renders
-            # empty and the entry is omitted; the admin distribution view then
-            # falls back to anonymous GitHub release reads.
+            # empty and the entry is omitted. Nothing in the service reads it:
+            # the admin distribution view serves the stored GitHub snapshot and
+            # makes no network request, and the committed production desired
+            # state leaves the token out (UNREAD_PRODUCTION_SECRET_NAMES).
             - name: DISTRIBUTION_GITHUB_API_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -19,18 +19,33 @@
  * - scope (21): ported by the CR-6/CR-7 scope (with RD-2 and RD-3);
  * - od-cr-1 (9): the contested routes; the owner answered OD-CR-1 on
  *   2026-10-02 by porting all nine (src/backend-composition.ts
- *   POSTGRES_PORTED_WORKER_ROUTE_IDS is scope plus these);
+ *   POSTGRES_PORTED_WORKER_ROUTE_IDS is scope plus these), and round 12
+ *   keeps them ported (credential renew and disconnect carry the native
+ *   social devices to their 180-day sunsets);
  * - admin (6): the admin console routes, which OD-CR-2 requires at the
  *   switch (ported by C-ADMIN); they are served only on the admin host,
  *   behind the Access chokepoint, and only when the composition root opens
- *   the admin host (OD-CR-3; ADMIN-R12 opens it after round 12);
- * - od-cr-2 (13): unported (enroll, Google and Apple sign-in, security
- *   reset, participant export and the four performance routes), decided
- *   from production traffic (OD-CR-2); they answer 503 at cutover;
+ *   the admin host (OD-CR-3; round 12 opens it, ADMIN-R12);
+ * - retired (12): retired at the switch by owner round 12 (2026-10-02),
+ *   never ported: the native social chain (legacy enroll, Google and Apple
+ *   sign-in), security reset, participant export (no identity to export
+ *   against) and the three performance device and consent routes. They
+ *   answer the uniform 503 POSTGRES_ROUTE_NOT_PORTED with no retry-after
+ *   (OD-CR-6 (iv));
+ * - retired-definite (1): the accountless performance authorization, retired
+ *   like the others but answered with the definite 4xx production gives
+ *   today (RETIRED_ROUTE_DEFINITE_ANSWERS), a route-specific deviation from
+ *   OD-CR-6's uniform 503 that round 12 decided so callers park after one
+ *   call instead of retrying on the shared accountless_ownership budget;
  * - root (2).
+ * Round 12 also retires v0.x uploads, which are formats inside two ported
+ * scope routes (contributions and device_upload_authorization), not routes:
+ * origin-intake-composition.mjs registers the v0.1 and v0.2 envelopes and
+ * formats as retired, answering the same uniform 503.
  * The ported set is INJECTED: it must contain every scope route and may add
- * any subset of the od-cr-1 and admin routes. Porting an od-cr-2 route needs
- * an owner answer and a reviewed change of its class here first.
+ * any subset of the od-cr-1 and admin routes. A retired route can never be
+ * ported (PRODUCTION_ROUTE_PORT_RETIRED); porting one needs a new owner
+ * decision and a reviewed change of its class here first.
  *
  * One registry (wave-3 critic host gap 5): the origin's route modules
  * (origin-route-modules.mjs, the overridable built-ins community/daily and
@@ -54,7 +69,10 @@ import { ORIGIN_OVERRIDABLE_BUILT_INS, isOriginRouteModuleRegistry } from "./ori
 
 export const ORIGIN_ROUTE_DISPOSITIONS = Object.freeze({
   PORTED: "ported",
+  /** The uniform 503 POSTGRES_ROUTE_NOT_PORTED (OD-CR-6 (iv): no retry-after). */
   UNPORTED: "unported",
+  /** A retired route's fixed definite answer (RETIRED_ROUTE_DEFINITE_ANSWERS). */
+  DEFINITE: "definite",
   ROOT: "root",
 });
 
@@ -63,7 +81,8 @@ export const PRODUCTION_ROUTE_CLASSES = Object.freeze({
   SCOPE: "scope",
   OD_CR_1: "od-cr-1",
   ADMIN: "admin",
-  OD_CR_2: "od-cr-2",
+  RETIRED: "retired",
+  RETIRED_DEFINITE: "retired-definite",
   ROOT: "root",
 });
 
@@ -87,7 +106,8 @@ export const PRODUCTION_ROUTE_PARITY_BASIS = Object.freeze({
 const S = PRODUCTION_ROUTE_CLASSES.SCOPE;
 const C = PRODUCTION_ROUTE_CLASSES.OD_CR_1;
 const A = PRODUCTION_ROUTE_CLASSES.ADMIN;
-const U = PRODUCTION_ROUTE_CLASSES.OD_CR_2;
+const X = PRODUCTION_ROUTE_CLASSES.RETIRED;
+const D = PRODUCTION_ROUTE_CLASSES.RETIRED_DEFINITE;
 const R = PRODUCTION_ROUTE_CLASSES.ROOT;
 
 /** Every d43c8f92 production route, in Worker (policy) order, with its class. */
@@ -95,19 +115,19 @@ export const PRODUCTION_ROUTE_TABLE = Object.freeze([
   ["apple_domain_association", R],
   ["health", S],
   ["ready", S],
-  ["enroll", U],
+  ["enroll", X],
   ["accountless_enrollment", S],
   ["accountless_ownership", S],
   ["accountless_telemetry_v12_authorization", S],
-  ["accountless_telemetry_performance_authorization", U],
+  ["accountless_telemetry_performance_authorization", D],
   ["accountless_renewal", S],
   ["sparkle_appcast_guard", R],
-  ["identity_google_start", U],
-  ["identity_google_callback", U],
-  ["identity_google_result", U],
-  ["identity_apple_start", U],
-  ["identity_apple_callback", U],
-  ["identity_apple_result", U],
+  ["identity_google_start", X],
+  ["identity_google_callback", X],
+  ["identity_google_result", X],
+  ["identity_apple_start", X],
+  ["identity_apple_callback", X],
+  ["identity_apple_result", X],
   ["session", C],
   ["logout", C],
   ["admin_overview", A],
@@ -116,7 +136,7 @@ export const PRODUCTION_ROUTE_TABLE = Object.freeze([
   ["admin_database_health", A],
   ["admin_reconstruction_progress", A],
   ["admin_action", A],
-  ["security_reset", U],
+  ["security_reset", X],
   ["device_pairing", C],
   ["device_pairing_claim", C],
   ["device_upload_authorization", S],
@@ -125,9 +145,9 @@ export const PRODUCTION_ROUTE_TABLE = Object.freeze([
   ["device_sync_state", S],
   ["device_sync_capabilities", S],
   ["device_sync_capabilities_v12", S],
-  ["telemetry_performance_capabilities", U],
-  ["telemetry_performance_consent", U],
-  ["telemetry_performance_reports", U],
+  ["telemetry_performance_capabilities", X],
+  ["telemetry_performance_consent", X],
+  ["telemetry_performance_reports", X],
   ["telemetry_v11_consent", S],
   ["telemetry_v12_consent", C],
   ["telemetry_v11_day_manifests", S],
@@ -141,7 +161,7 @@ export const PRODUCTION_ROUTE_TABLE = Object.freeze([
   ["participant_device_revocation", C],
   ["envelope_key", S],
   ["contributions", S],
-  ["participant_export", U],
+  ["participant_export", X],
   ["community_daily", S],
 ].map(([id, routeClass], index) => Object.freeze({ workerOrder: index + 1, id, routeClass })));
 
@@ -157,8 +177,35 @@ export const POSTGRES_SCOPE_ROUTE_IDS = idsOfClass(S);
 export const OD_CR_1_CONTESTED_ROUTE_IDS = idsOfClass(C);
 /** OD-CR-2: the 6 admin console routes, served on the admin host behind the chokepoint. */
 export const ADMIN_HOST_ROUTE_IDS = idsOfClass(A);
-/** OD-CR-2: the 13 routes the origin does not serve. */
-export const OD_CR_2_UNPORTED_ROUTE_IDS = idsOfClass(U);
+/** Round 12: the 12 retired routes, answered 503 POSTGRES_ROUTE_NOT_PORTED. */
+export const RETIRED_ROUTE_IDS = idsOfClass(X);
+/** Round 12: the retired route answered with a definite 4xx instead. */
+export const RETIRED_DEFINITE_ROUTE_IDS = idsOfClass(D);
+
+/**
+ * Round 12 (2026-10-02, "accountless performance authorization: a definite
+ * 4xx, the same as production today"): the answer of each retired-definite
+ * route, rendered in the Worker envelope ({error: {code, requestId}}) with
+ * no retry-after and never reaching a family.
+ *
+ * accountless_telemetry_performance_authorization: at d43c8f92
+ * handleAccountlessTelemetryPerformanceAuthorization grants only while
+ * telemetry_performance_runtime is 'active', and ingestion-isolation
+ * migration 0009 seeds that row 'staged' (nothing activates it), so
+ * grantTelemetryPerformanceAccountlessAuthorization finds no owner row and
+ * answers invalid(): 403 TELEMETRY_TRANSPORT_BLOCKED. Production's 30-day
+ * edge counts (command pack, 2026-10-02) show every call to the route
+ * answered 4xx. The origin answers that terminal code to every allowed
+ * method, without the Worker's earlier preamble steps (cookie, admission,
+ * device bearer, body), each of which is also a 4xx or a configuration 503
+ * the caller cannot clear: Electron's client parks on any 4xx.
+ */
+export const RETIRED_ROUTE_DEFINITE_ANSWERS = Object.freeze({
+  accountless_telemetry_performance_authorization: Object.freeze({
+    status: 403,
+    code: "TELEMETRY_TRANSPORT_BLOCKED",
+  }),
+});
 
 /** Online-erasure surfaces retired under append-only; neither is a registry route. */
 export const RETIRED_ONLINE_ERASURE_SURFACES = Object.freeze([
@@ -179,7 +226,7 @@ export const RETIRED_ONLINE_ERASURE_SURFACES = Object.freeze([
  * parity basis: the pin (identity_link_secret_configuration), a provider
  * subject's link key (participants.identity_link_key and the hand-off rows)
  * or a re-enrolment cooldown digest. Round 12 retires every one of them at
- * the switch, and round 16 rotates the lost secret on that basis alone
+ * the switch (class retired), and round 16 rotates the lost secret on that basis alone
  * (scripts/postgres-identity-link-pin.mjs). Under a rotated label none may
  * be ported: a ported sign-in would answer 503 against an unrotated pin, or
  * silently mint a new participant for an existing social account against a
@@ -204,7 +251,7 @@ export const PRODUCTION_ROUTE_REGISTRY_CODES = Object.freeze([
   "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT",
   "PRODUCTION_ROUTE_PORTED_SET_INVALID",
   "PRODUCTION_ROUTE_ROOT_CLAIMED",
-  "PRODUCTION_ROUTE_PORT_UNDECIDED",
+  "PRODUCTION_ROUTE_PORT_RETIRED",
   "PRODUCTION_ROUTE_SCOPE_INCOMPLETE",
   "PRODUCTION_ROUTE_HANDLERS_INVALID",
   "PRODUCTION_ROUTE_HANDLER_UNEXPECTED",
@@ -215,6 +262,7 @@ export const PRODUCTION_ROUTE_REGISTRY_CODES = Object.freeze([
 
 const TABLE_BY_ID = new Map(PRODUCTION_ROUTE_TABLE.map((route) => [route.id, route]));
 const ROOT_IDS = new Set(ORIGIN_ROOT_ROUTE_IDS);
+const RETIRED_CLASSES = new Set([X, D]);
 const ROUTE_METHODS = new Set(["GET", "POST", "DELETE"]);
 
 /** Registries createProductionRouteRegistry issued; nothing else is a registry. */
@@ -226,7 +274,7 @@ function refuse(code) {
 
 /**
  * Refuses IDENTITY_LINK_ROTATION_CONSUMER_PORTED unless every identity-link
- * consumer is od-cr-2 (unported) in PRODUCTION_ROUTE_TABLE and absent from
+ * consumer is retired (the 503 class) in PRODUCTION_ROUTE_TABLE and absent from
  * the given ported set. Returns the number of consumers checked. The
  * cutover preflight (P8-R) and the production host (under a rotated label)
  * both call it.
@@ -237,7 +285,7 @@ export function assertIdentityLinkConsumersRetired(portedRouteIds) {
   }
   const ported = new Set(portedRouteIds);
   for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) {
-    if (TABLE_BY_ID.get(id)?.routeClass !== PRODUCTION_ROUTE_CLASSES.OD_CR_2 || ported.has(id)) {
+    if (TABLE_BY_ID.get(id)?.routeClass !== PRODUCTION_ROUTE_CLASSES.RETIRED || ported.has(id)) {
       refuse("IDENTITY_LINK_ROTATION_CONSUMER_PORTED");
     }
   }
@@ -270,7 +318,7 @@ function validatedPolicy(routePolicy) {
   return routePolicy;
 }
 
-/** The injected ported set: scope plus any OD-CR-1 and admin subset, nothing else. */
+/** The injected ported set: scope plus any OD-CR-1 and admin subset, never a retired route. */
 function validatedPortedIds(portedRouteIds, policyIds) {
   if (!Array.isArray(portedRouteIds)
       || portedRouteIds.some((id) => typeof id !== "string")
@@ -280,7 +328,7 @@ function validatedPortedIds(portedRouteIds, policyIds) {
   for (const id of portedRouteIds) {
     if (!policyIds.has(id)) refuse("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE");
     if (ROOT_IDS.has(id)) refuse("PRODUCTION_ROUTE_ROOT_CLAIMED");
-    if (TABLE_BY_ID.get(id).routeClass === U) refuse("PRODUCTION_ROUTE_PORT_UNDECIDED");
+    if (RETIRED_CLASSES.has(TABLE_BY_ID.get(id).routeClass)) refuse("PRODUCTION_ROUTE_PORT_RETIRED");
   }
   const ported = new Set(portedRouteIds);
   if (POSTGRES_SCOPE_ROUTE_IDS.some((id) => !ported.has(id))) refuse("PRODUCTION_ROUTE_SCOPE_INCOMPLETE");
@@ -341,7 +389,8 @@ function foldedHandlers(snapshot, policy, ported, routeModules, routeModuleConte
  * - PRODUCTION_ROUTE_PORTED_SET_INVALID: portedRouteIds is not an array of
  *   distinct strings;
  * - PRODUCTION_ROUTE_ROOT_CLAIMED: a root route is ported or has a handler;
- * - PRODUCTION_ROUTE_PORT_UNDECIDED: an od-cr-2 route is ported;
+ * - PRODUCTION_ROUTE_PORT_RETIRED: a retired or retired-definite route is
+ *   ported;
  * - PRODUCTION_ROUTE_SCOPE_INCOMPLETE: a scope route is not ported;
  * - PRODUCTION_ROUTE_HANDLERS_INVALID: handlers is not a Map;
  * - PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler key outside the ported
@@ -352,10 +401,12 @@ function foldedHandlers(snapshot, policy, ported, routeModules, routeModuleConte
  *   route-module registry, or routeModuleContext is not a function.
  *
  * Returns a frozen registry: resolve(routeId) gives a frozen
- * { disposition, handler } (handler null unless ported; an id outside the
- * policy throws PRODUCTION_ROUTE_UNKNOWN); portedRouteIds and
- * portedPathnames in Worker order; unportedRouteIds sorted; rootRouteIds;
- * coverage 'complete' (ported + unported + root is exactly the policy).
+ * { disposition, handler, answer } (handler null unless ported, answer null
+ * unless definite; an id outside the policy throws PRODUCTION_ROUTE_UNKNOWN);
+ * portedRouteIds and portedPathnames in Worker order; unportedRouteIds (the
+ * 503 answers: every retired route and any admin route the root did not
+ * port) and definiteRouteIds sorted; rootRouteIds; coverage 'complete'
+ * (ported + unported + definite + root is exactly the policy).
  */
 export function createProductionRouteRegistry({
   routePolicy, handlers, portedRouteIds, routeModules, routeModuleContext,
@@ -367,25 +418,31 @@ export function createProductionRouteRegistry({
     routeModuleContext);
   const resolutions = new Map();
   for (const entry of policy) {
+    const definite = TABLE_BY_ID.get(entry.id).routeClass === D;
     const disposition = ROOT_IDS.has(entry.id)
       ? ORIGIN_ROUTE_DISPOSITIONS.ROOT
-      : ported.has(entry.id) ? ORIGIN_ROUTE_DISPOSITIONS.PORTED : ORIGIN_ROUTE_DISPOSITIONS.UNPORTED;
+      : ported.has(entry.id) ? ORIGIN_ROUTE_DISPOSITIONS.PORTED
+        : definite ? ORIGIN_ROUTE_DISPOSITIONS.DEFINITE : ORIGIN_ROUTE_DISPOSITIONS.UNPORTED;
     resolutions.set(entry.id, Object.freeze({
       disposition,
       handler: disposition === ORIGIN_ROUTE_DISPOSITIONS.PORTED ? snapshot.get(entry.id) : null,
+      answer: definite ? RETIRED_ROUTE_DEFINITE_ANSWERS[entry.id] : null,
     }));
   }
   const portedEntries = policy.filter((entry) => ported.has(entry.id));
-  const unportedRouteIds = Object.freeze(policy
-    .filter((entry) => resolutions.get(entry.id).disposition === ORIGIN_ROUTE_DISPOSITIONS.UNPORTED)
+  const withDisposition = (disposition) => Object.freeze(policy
+    .filter((entry) => resolutions.get(entry.id).disposition === disposition)
     .map((entry) => entry.id)
     .sort());
+  const unportedRouteIds = withDisposition(ORIGIN_ROUTE_DISPOSITIONS.UNPORTED);
+  const definiteRouteIds = withDisposition(ORIGIN_ROUTE_DISPOSITIONS.DEFINITE);
   const registry = Object.freeze({
     routePolicy: policy,
     parityBasis: PRODUCTION_ROUTE_PARITY_BASIS,
     portedRouteIds: Object.freeze(portedEntries.map((entry) => entry.id)),
     portedPathnames: Object.freeze(portedEntries.map((entry) => entry.pathname)),
     unportedRouteIds,
+    definiteRouteIds,
     rootRouteIds: ORIGIN_ROOT_ROUTE_IDS,
     coverage: "complete",
     resolve(routeId) {

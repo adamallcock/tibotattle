@@ -292,8 +292,9 @@ only non-staging-named entry is `custom-role:create` for
 `tibotattleQuarantineStore`.
 
 Expected plan: exit 0, no findings or blockers, `summary.refused` 0. With
-the secrets and bucket already made, the first plan has 29 executable
-operations and 9 deferred.
+the secrets and bucket already made, the first plan has 27 executable
+operations and 9 deferred (round 12 retired the Google and Apple sign-in
+secrets from CR-3, and with them their two accessor bindings).
 
 - Executable: the accounts, roles, repository, accessor bindings, Cloud SQL,
   the verifier grant from step 1, and the maintenance trigger's create and

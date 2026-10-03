@@ -86,10 +86,13 @@ export function createPostgresWorkerBackend(
  * devices, revocation, pairing, pairing claim, v1.2 consent, disconnect and
  * credential renew), in policy order. The six admin console routes are
  * served only on the admin host, behind the Access chokepoint
- * (POSTGRES_ADMIN_HOST_ROUTE_IDS). Every other route (enroll, Google and
- * Apple sign-in, security reset, participant export and the four
- * performance routes; OD-CR-2) answers 503 POSTGRES_ROUTE_NOT_PORTED, and
- * the two root routes are answered by the origin itself. The Worker's own D1
+ * (POSTGRES_ADMIN_HOST_ROUTE_IDS). Every other route is retired at the
+ * switch by owner round 12 (2026-10-02): legacy enroll, Google and Apple
+ * sign-in, security reset, participant export and the three performance
+ * device and consent routes answer 503 POSTGRES_ROUTE_NOT_PORTED, and the
+ * accountless performance authorization answers production's definite
+ * 403 TELEMETRY_TRANSPORT_BLOCKED; the two root routes are answered by the
+ * origin itself. The Worker's own D1
  * handler never serves the PostgreSQL backend: the cloud-run registry
  * (postgres-production-registry.mjs) validates this list against its pinned
  * route classes.
@@ -131,9 +134,9 @@ export const POSTGRES_PORTED_WORKER_ROUTE_IDS = Object.freeze([
  * The admin console routes (the policy's 'admin' authority) the origin
  * serves on the admin host only, after the Access chokepoint (owner decision
  * OD-CR-2: the six admin console routes must work at the switch; ported by
- * C-ADMIN). The production admin host keeps its OD-CR-3 refusal until
- * ADMIN-R12 (round 12 answered OWN-17: open with what is ported); the
- * composition root holds that switch.
+ * C-ADMIN). Round 12 answered OWN-17 (open with what is ported), so the
+ * production and staging composition root opens the admin host (OD-CR-3
+ * 'chokepoint', ADMIN-R12); the composition root holds that switch.
  */
 export const POSTGRES_ADMIN_HOST_ROUTE_IDS = Object.freeze(WORKER_ROUTE_POLICY
   .filter((route) => route.authority === "admin")

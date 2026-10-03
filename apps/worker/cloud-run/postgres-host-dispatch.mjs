@@ -33,9 +33,14 @@
  *    EP-6's edgeServedAssets (the edge serves the site), rendered here with
  *    this request's id, unlogged as the Worker's asset fetch is.
  * 7. Exact routes by disposition: root routes answer 404 NOT_FOUND (the
- *    method was enforced in step 4); unported routes answer
+ *    method was enforced in step 4); unported routes (every route owner
+ *    round 12 retired, and an admin route the root did not port) answer
  *    503 POSTGRES_ROUTE_NOT_PORTED, with the injected OD-CR-6(iv)
- *    retry-after or none, and never reach a family; a ported route runs its
+ *    retry-after or none, and never reach a family; a retired-definite
+ *    route answers its registry answer (round 12: the accountless
+ *    performance authorization's 403 TELEMETRY_TRANSPORT_BLOCKED, as
+ *    production answers it) with no retry-after, and never reaches a
+ *    family either; a ported route runs its
  *    family handler inside the request context store with
  *    {requestId, routeId[, adminIdentityKey]}.
  *    community_daily first passes the storage gate, and its 200 passes
@@ -83,9 +88,11 @@ export const ORIGIN_REQUEST_LOG_FIELDS = Object.freeze([
 
 /**
  * OD-CR-3: the admin host at the origin. The owner answered it (refuse until
- * ported; OWN-17, round 12, opens it with what is ported, scheduled as
- * ADMIN-R12), and the composition root injects the answer. There is no
- * default; the handler refuses to build without one of these.
+ * ported; OWN-17, round 12, opens it with what is ported: ADMIN-R12 makes
+ * the production composition root inject 'chokepoint'), and the root
+ * injects the answer. There is no default; the handler refuses to build
+ * without one of these. 'refuse' remains for an origin mode that serves no
+ * admin route.
  */
 export const ORIGIN_ADMIN_HOST_POLICIES = Object.freeze(["refuse", "chokepoint"]);
 
@@ -427,6 +434,9 @@ export function createProductionRequestHandler({
       if (route.kind === "asset") return noStore(errorResponse(new ApiError(404, "NOT_FOUND"), requestId));
       const resolved = registry.resolve(route.id);
       if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.ROOT) throw new ApiError(404, "NOT_FOUND");
+      if (resolved.disposition === ORIGIN_ROUTE_DISPOSITIONS.DEFINITE) {
+        throw new ApiError(resolved.answer.status, resolved.answer.code);
+      }
       if (resolved.disposition !== ORIGIN_ROUTE_DISPOSITIONS.PORTED) throw routeNotPorted(retryAfterSeconds);
       if (route.id === "community_daily") await assertStorageCurrent(storageGate);
       const context = adminRoute

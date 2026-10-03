@@ -3,12 +3,20 @@
  * Worker's readAdminDatabaseHealth (admin-database-health.ts at d43c8f92)
  * with each D1 binding replaced by the pool of the same role.
  *
- * The DTO is the closed 'admin-database-health-v0.1' contract:
+ * The DTO is the closed 'admin-database-health-v0.2' contract: the Worker's
+ * 'admin-database-health-v0.1' with one change, owner round 12 (2026-10-02,
+ * OWN-17 question 3):
  * - the roles are always primary, deletion_ledger and analytics, in that
  *   order;
- * - a role whose pool the composition root does not supply is
- *   'not_configured', exactly as the Worker reports an absent binding (it is
- *   never aliased to another role or omitted);
+ * - deletion_ledger is always 'not_applicable', with no measurement: the
+ *   PostgreSQL line removed the deletion ledger (decisions D2, D4 and D6 of
+ *   2026-09-26), so there is no pool to probe and no role to configure. In
+ *   v0.1 the role could only be not_applicable for analytics in json mode,
+ *   and an absent ledger read 'not_configured', which kept the status
+ *   'degraded' forever; that changed meaning is the version bump;
+ * - a primary or analytics role whose pool the composition root does not
+ *   supply is 'not_configured', exactly as the Worker reports an absent
+ *   binding (it is never aliased to another role or omitted);
  * - in json storage mode the analytics role is 'not_applicable';
  * - a probe is one constant read, bounded to 5 s: 'reachable' with its
  *   response time and pg_database_size of the connected database (the
@@ -25,7 +33,7 @@ import type { PostgresClient, PostgresPool } from "./postgres-client";
 import { withPostgresRead } from "./postgres-client";
 import { parseTelemetryStorageMode } from "./telemetry-storage-mode";
 
-export const POSTGRES_ADMIN_DATABASE_HEALTH_SCHEMA_VERSION = "admin-database-health-v0.1" as const;
+export const POSTGRES_ADMIN_DATABASE_HEALTH_SCHEMA_VERSION = "admin-database-health-v0.2" as const;
 /** d43c8f92 DATABASE_PROBE_TIMEOUT_MS. */
 export const POSTGRES_DATABASE_PROBE_TIMEOUT_MS = 5_000;
 
@@ -55,10 +63,12 @@ export interface PostgresAdminDatabaseHealth {
 export interface PostgresAdminDatabaseHealthOptions {
   /** The frozen Worker-shaped env; only the telemetry storage mode is read. */
   readonly env: unknown;
-  /** The pool of each role, or undefined when the role has no database. */
+  /**
+   * The pool of each probed role, or undefined when the role has no
+   * database. There is no deletion-ledger pool: that role is not_applicable.
+   */
   readonly pools: {
     readonly primary?: PostgresPool;
-    readonly deletionLedger?: PostgresPool;
     readonly analytics?: PostgresPool;
   };
   /** Epoch milliseconds; defaults to Date.now. */
@@ -143,16 +153,20 @@ export async function readPostgresAdminDatabaseHealth(
     // Keep the other roles visible, as the Worker does.
   }
   const pools = options.pools ?? {};
-  const [primary, deletion, analytical] = await Promise.all([
+  // A stale root that still hands a ledger pool is refused, never probed.
+  if (Object.hasOwn(pools, "deletionLedger")) {
+    throw new TypeError("invalid admin database health options");
+  }
+  const notApplicable = { status: "not_applicable" as const, ...EMPTY };
+  const [primary, analytical] = await Promise.all([
     probe(pools.primary, clock, timeoutMs),
-    probe(pools.deletionLedger, clock, timeoutMs),
     storageMode === "json"
-      ? Promise.resolve({ status: "not_applicable" as const, ...EMPTY })
+      ? Promise.resolve(notApplicable)
       : probe(pools.analytics, clock, timeoutMs),
   ]);
   const databases: PostgresAdminDatabaseRow[] = [
     { role: "primary", ...primary },
-    { role: "deletion_ledger", ...deletion },
+    { role: "deletion_ledger", ...notApplicable },
     { role: "analytics", ...analytical },
   ];
   return {

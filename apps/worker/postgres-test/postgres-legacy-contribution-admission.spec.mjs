@@ -1643,7 +1643,8 @@ test("PG17 without the correction runtime row a v1.0 usage correction is 503, as
 }));
 
 // ---------------------------------------------------------------------------
-// telemetry-envelope-v0.1 (not retired at d43c8f92; see envelopes/v01.mjs).
+// telemetry-envelope-v0.1 (not retired at d43c8f92; retired at the switch by
+// owner round 12, so only this spec registers it; see envelopes/v01.mjs).
 
 function v01Contribution(suffix = "a") {
   const toolClassCounts = {

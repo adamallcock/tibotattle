@@ -287,16 +287,18 @@ export const PRODUCTION_IDENTITY_LINK_ROTATION_LABELS = Object.freeze({
 /**
  * Every route a production registry may port (the classes it admits); the
  * P8-R consumer refusal checks the identity-link consumers against it. Every
- * consumer is od-cr-2, which this set excludes by construction, so on the CLI
- * path the refusal reduces to the registry classification (a consumer
- * reclassified out of od-cr-2 refuses). The real ported set lives in
+ * consumer is retired (round 12), and this set excludes the retired classes
+ * by construction, so on the CLI path the refusal reduces to the registry
+ * classification (a consumer reclassified out of retired refuses). The real
+ * ported set lives in
  * TypeScript (src/backend-composition.ts) that plain Node cannot load here;
  * the production host's boot refusal (assertIdentityLinkRotationComposable)
  * checks that set. The library API (the synthetic spec) may inject another
  * set; the CLI never does.
  */
 export const PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS = Object.freeze(PRODUCTION_ROUTE_TABLE
-  .filter(route => ![PRODUCTION_ROUTE_CLASSES.OD_CR_2, PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
+  .filter(route => ![PRODUCTION_ROUTE_CLASSES.RETIRED, PRODUCTION_ROUTE_CLASSES.RETIRED_DEFINITE,
+    PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
   .map(route => route.id));
 /** The finalize order (design sections 1 and 8). */
 export const FINALIZE_ORDER = Object.freeze([
@@ -873,7 +875,7 @@ async function readRotation(context) {
 /**
  * P8-R's consumer refusal: a rotation is admitted only while every route
  * that consumes the identity-link pin, link keys or cooldown digests is
- * od-cr-2 in the registry and outside the ported set (round 12 retires them
+ * retired in the registry and outside the ported set (round 12 retires them
  * all). On the CLI path the ported set is PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS,
  * so what this proves at preflight is the registry classification; the real
  * ported set is refused at host boot. The PostgreSQL lifecycle pass reads no

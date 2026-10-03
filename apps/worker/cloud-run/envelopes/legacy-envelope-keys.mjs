@@ -1,7 +1,10 @@
 /**
  * The d43c8f92 Worker's exact envelope key check (index.ts
- * hasExactEnvelopeKeyOccurrences) for the legacy envelopes the PostgreSQL
- * origin serves (envelopes/v10.mjs, envelopes/v01.mjs).
+ * hasExactEnvelopeKeyOccurrences) for the legacy envelope the PostgreSQL
+ * origin serves (envelopes/v10.mjs) and for envelopes/v01.mjs, which owner
+ * round 12 retires at the switch: the composed origin registers a retired
+ * 503 envelope for v0.1, and v01.mjs is kept only for the legacy-admission
+ * spec.
  *
  * handleContribution runs it over the exact claimed body text after the
  * upload-authorization claim and before any envelope handler, for every

@@ -85,9 +85,16 @@ Prefer the lesser control when it contains the harm:
 - Collection controls stop enrollment, upload registration and processing. They
   never retract a publication, and turning publication off is a reversible
   serving switch that serves the same revisions when turned back on. The
-  control surface at the origin is the admin routes: C-ADMIN's modules are
-  `built` but not registered in the host until D-CRB, and the console cannot
-  act while the overview answers 503 (E-ADMIN). The
+  control surface at the origin is the admin routes. Since ADMIN-R12 (owner
+  round 12) the production and staging composition opens the admin host
+  behind the Access chokepoint, and `set_collection_controls` works over the
+  API (local proof only). The overview is `admin-overview-v0.6`: its
+  synthetic-contribution counts, historical publication and deletion-ledger
+  blocks answer `{"status":"unavailable"}` until their sources exist
+  (E-ADMIN). The console can act once the edge Worker serves the admin
+  client that reads overview v0.6 and database health v0.2 (E-EDGEPORT).
+  Until then the deployed client refuses both versions as invalid and keeps
+  its controls disabled: it fails closed and never shows a wrong value. The
   Cloudflare collection-control operator reads Cloudflare's D1 and does not apply
   after the switch; a Google Cloud equivalent is `not built`.
 - A trigger pause stops a job
@@ -314,7 +321,7 @@ accepted contributions. See
 | Thresholds that justify the brake, the observation period, escalation and notification | Owner decisions, not recorded |
 | Monitoring, alerting and the origin-lock check | `not built` (E-OPS5) |
 | Restore tooling and its rehearsal | Staging rehearsal tool `built`, never run live (E-OPS7). Its do-not-restore step has no list until OA-9, so it never reports that uploads may reopen. Real-recovery tooling `not built` (OPS-7) |
-| Operator controls for collection containment at the origin | Route modules `built` (C-ADMIN; `set_collection_controls` works over the API), registration in the host `not built` (D-CRB), console blocked while the overview answers 503 (E-ADMIN); a Google Cloud operator wrapper is `not built` |
+| Operator controls for collection containment at the origin | Route modules `built` (C-ADMIN; `set_collection_controls` works over the API) and the admin host opened behind the Access chokepoint (ADMIN-R12), local proof only. The overview is `admin-overview-v0.6`, with three blocks `{"status":"unavailable"}` (E-ADMIN). The console can act once the edge ships the admin client that reads v0.6 and database health v0.2 (E-EDGEPORT); until then the deployed client fails closed on both. A Google Cloud operator wrapper is `not built` |
 | Scheduler pause-all and resume-all | `not built` (D-OPS3) |
 | Custody of the do-not-restore list and the erasure intake channel | Open (OA-9), decided after the cutover |
 | Edge live capture and barrier-proof writers | `not built`; no command writes either file |

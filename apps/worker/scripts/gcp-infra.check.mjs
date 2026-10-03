@@ -56,8 +56,7 @@ function reader(committed = UNMARKED_TEXT) {
 
 function world(project) {
   const value = withSecretValues(emptyWorld(), { project, region: "us-east1",
-    names: ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK",
-      "GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"] });
+    names: ["IDENTITY_LINK_SECRET", "POSTGRES_RATE_LIMIT_SECRET", "ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"] });
   value.buckets.push(bornBucket({ name: "synthetic-ops-quarantine", location: "US-EAST1" }));
   return value;
 }
@@ -396,10 +395,11 @@ test("the committed desired states render offline: staging's and production's wa
   assert.ok(scheduled.scheduler["analytics-refresh"].includes("--time-zone=Etc/UTC"));
   // Round 12 retired Google and Apple sign-in: no production secret, container or reference names them.
   assert.doesNotMatch(production.out, /GOOGLE_OIDC_CLIENT_SECRET|APPLE_PRIVATE_KEY|tibotattle-test|staging|BEGIN PRIVATE KEY/u);
-  // With the namespace pinned, the service still waits for ROUTES-R12 to narrow CR-3.
+  // With the namespace pinned, the service waits only for the bucket's birth proof: ROUTES-R12
+  // narrowed CR-3 to the committed secrets, so no retired sign-in secret holds it back.
   const named = unpinnedProductionText().replace('"telemetryStorageNamespace": null', '"telemetryStorageNamespace": "synthetic-namespace"');
   const waiting = JSON.parse((await run(["render", "--environment=production", ...IMAGE], { readFile: reader(named) })).out);
-  assert.deepEqual(waiting.service, { unavailable: "SERVICE_RETIRED_SECRET_STILL_REQUIRED:GOOGLE_OIDC_CLIENT_SECRET" });
+  assert.deepEqual(waiting.service, { unavailable: "SERVICE_RENDER_BUCKET_PROOF_UNPINNED" });
   // A production file whose OWN-5 placeholders are unfilled is refused before any call.
   for (const command of ["render", "plan", "readback", "scheduler-probe"]) {
     const unfilled = await run([command, "--environment=production"], { readFile: reader(unfilledProductionText()) });

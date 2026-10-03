@@ -45,16 +45,29 @@ export const LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = Object.freeze([
 ]);
 
 /**
- * The retained v0.x formats. d43c8f92 still authorizes v0.1 for a
+ * The v0.x formats d43c8f92 still knows: it authorizes v0.1 for a
  * participant whose floor is rank 1 (format lifecycle 'accepted' since D1
- * 0044) and refuses v0.2 through its 'blocked' lifecycle. Register these
- * only together with a telemetry-envelope-v0.1 handler; until then an
- * authorization the origin issued could not be redeemed.
+ * 0044) and refuses v0.2 through its 'blocked' lifecycle. A live entry for
+ * one of them must pair with its envelope handler; the composed origin
+ * registers neither live, because round 12 retires both (below).
  */
 export const RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = Object.freeze([
   "telemetry-contribution-v0.1",
   "telemetry-contribution-v0.2",
 ]);
+
+/**
+ * Owner round 12 (2026-10-02, "zero-traffic routes: retire ... v0.x
+ * uploads"; OD-8 decided from traffic: no v0.x row was ever admitted on the
+ * live ingestion database) retires both v0.x formats at the switch. The
+ * composed origin registers each as a retired format and envelope
+ * (origin-intake-composition.mjs) that answers the uniform
+ * RETIRED_FORMAT_ANSWER, 503 POSTGRES_ROUTE_NOT_PORTED with no retry-after
+ * (OD-CR-6 (iv)), and never authorizes or admits anything. Sealed historical
+ * v0.x contributions are still imported (E-PT4); only new uploads retire.
+ */
+export const ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS;
+export const RETIRED_FORMAT_ANSWER = Object.freeze({ status: 503, code: "POSTGRES_ROUTE_NOT_PORTED" });
 
 /** Every identifier telemetryTransportSchemaVersion accepts at d43c8f92. */
 export const TRANSPORT_SCHEMA_VERSIONS = Object.freeze([
@@ -132,6 +145,35 @@ export function resolveUploadAuthorizationFormat(formats, telemetrySchemaVersion
   const format = formats.resolve(telemetrySchemaVersion);
   if (format === null || format === undefined) throw refusal(403, "TELEMETRY_TRANSPORT_BLOCKED");
   return format;
+}
+
+/** A fresh RETIRED_FORMAT_ANSWER refusal (no retry-after header). */
+export function retiredFormatRefusal() {
+  return refusal(RETIRED_FORMAT_ANSWER.status, RETIRED_FORMAT_ANSWER.code);
+}
+
+/**
+ * Format entries for the round-12 retired v0.x formats: each one's
+ * assertUploadAllowed throws retiredFormatRefusal(), so the route answers
+ * 503 POSTGRES_ROUTE_NOT_PORTED where the format would decide (after the
+ * route's request guards, device bearer, admission and body checks, as for
+ * every format) and no authorization is ever created for it. Registering
+ * the entries, rather than leaving the versions unregistered, keeps them
+ * from the 403 TELEMETRY_TRANSPORT_BLOCKED of an unknown format.
+ *
+ * @returns {Readonly<Record<string, Readonly<{ assertUploadAllowed: Function }>>>}
+ */
+export function retiredUploadAuthorizationFormatEntries() {
+  /** @type {Record<string, Readonly<{ assertUploadAllowed: Function }>>} */
+  const entries = {};
+  for (const schemaVersion of ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS) {
+    entries[schemaVersion] = Object.freeze({
+      assertUploadAllowed() {
+        throw retiredFormatRefusal();
+      },
+    });
+  }
+  return Object.freeze(entries);
 }
 
 /**

@@ -12,7 +12,10 @@
  *     else is base drift). The receipt also records when, and from which
  *     Worker version, the live value was observed;
  *   - a var may instead be edge-only (it stays with the Cloudflare edge) or
- *     deployment-provided (each deployment supplies and validates it);
+ *     deployment-provided (each deployment supplies and validates it), or
+ *     one of the native sign-in settings owner round 12 retired at the switch
+ *     (RETIRED_SOCIAL_SIGN_IN_VAR_NAMES: the Worker keeps them until it is
+ *     retired; the origin never pins them and refuses them when present);
  *   - a var in the closed rotated category (ORIGIN_ROTATED_VAR_NAMES) must
  *     equal its recorded `wrangler` value in wrangler.jsonc and its recorded
  *     `origin` value in PRODUCTION_VARS. Round 16 rotates the lost
@@ -24,7 +27,10 @@
  *   - every PRODUCTION_VARS key is in wrangler.jsonc or declared origin-only;
  *   - the eight rate limits split into the six edge-tier names and the two
  *     origin-tier limits, whose values must match;
- *   - the Worker's required secrets are a subset of the origin's, and the
+ *   - the Worker's required secrets are the origin's, the edge's or a
+ *     round-12 retired sign-in secret (RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES,
+ *     never an origin secret), every origin-required secret is the
+ *     Worker's (except the origin-only ones), and the
  *     production hostnames and Cloudflare resource names match the frozen
  *     origins and fingerprint;
  *   - the staging plane's closed posture (STAGING_CONTAINMENT_VARS and
@@ -155,6 +161,10 @@ function varFindings(wranglerVars, overrides) {
       findings.push(`ORIGIN_ONLY_VAR_IN_WRANGLER:${name}`);
       continue;
     }
+    if (configuration.RETIRED_SOCIAL_SIGN_IN_VAR_NAMES.includes(name)) {
+      if (Object.hasOwn(pinned, name)) findings.push(`RETIRED_VAR_PINNED:${name}`);
+      continue;
+    }
     if (!Object.hasOwn(pinned, name)) {
       findings.push(`VAR_UNCLASSIFIED:${name}`);
       continue;
@@ -234,6 +244,10 @@ function secretFindings(secrets) {
   const findings = [];
   const origin = [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES];
   for (const name of required) {
+    if (configuration.RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES.includes(name)) {
+      if (origin.includes(name)) findings.push(`RETIRED_SECRET_IN_ORIGIN:${name}`);
+      continue;
+    }
     if (!origin.includes(name) && !configuration.EDGE_ONLY_SECRET_NAMES.includes(name)) {
       findings.push(`SECRET_UNCLASSIFIED:${name}`);
     }
@@ -573,8 +587,13 @@ test("unclassified or undeclared vars, secrets and hosts fail", async () => {
       "\"GOOGLE_OIDC_CLIENT_SECRET\"\n", "\"GOOGLE_OIDC_CLIENT_SECRET\",\n          \"SYNTHETIC_NEW_SECRET\"\n"),
   }), ["SECRET_UNCLASSIFIED:SYNTHETIC_NEW_SECRET"]);
   assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT, "          \"IDENTITY_LINK_SECRET\",\n          \"APPLE_PRIVATE_KEY\",\n",
+      "          \"APPLE_PRIVATE_KEY\",\n"),
+  }), ["SECRET_UNDECLARED:IDENTITY_LINK_SECRET"]);
+  // Round 12: a retired sign-in secret may leave the Worker without drift.
+  assert.deepEqual(await driftOfTempCopy({
     wranglerText: doctorProduction(WRANGLER_TEXT, "          \"APPLE_PRIVATE_KEY\",\n", ""),
-  }), ["SECRET_UNDECLARED:APPLE_PRIVATE_KEY"]);
+  }), []);
   assert.deepEqual(await driftOfTempCopy({
     wranglerText: doctorProduction(WRANGLER_TEXT,
       "{ \"pattern\": \"www.tibotattle.com\", \"custom_domain\": true },",
@@ -585,6 +604,31 @@ test("unclassified or undeclared vars, secrets and hosts fail", async () => {
       "\"bucket_name\": \"app-usagemonitor-production-quarantine\"",
       "\"bucket_name\": \"app-usagemonitor-production-quarantine-v2\""),
   }), ["FINGERPRINT_CLOUDFLARE_RESOURCES_DRIFT"]);
+});
+
+test("round 12: the retired sign-in settings stay with the Worker and are never origin configuration", async () => {
+  const secrets = [...configuration.REQUIRED_SECRET_NAMES, ...configuration.OPTIONAL_SECRET_NAMES];
+  assert.deepEqual([...configuration.RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES], ["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+  assert.deepEqual([...configuration.RETIRED_SOCIAL_SIGN_IN_VAR_NAMES], ["APPLE_SERVICES_ID", "APPLE_KEY_ID", "APPLE_TEAM_ID"]);
+  for (const name of configuration.RETIRED_SOCIAL_SIGN_IN_SETTINGS) {
+    assert.equal(Object.hasOwn(configuration.PRODUCTION_VARS, name), false, name);
+    assert.equal(configuration.STAGING_PROVIDED_VAR_NAMES.includes(name), false, name);
+    assert.equal(secrets.includes(name), false, name);
+    assert.equal(configuration.PRODUCTION_FORBIDDEN_VARIABLES[name], `${name}_RETIRED`, name);
+  }
+  // The checked-in Worker still declares them (it serves sign-in until the
+  // switch); their values may change there without origin drift.
+  const production = parseJsonc(WRANGLER_TEXT).env.production;
+  for (const name of configuration.RETIRED_SOCIAL_SIGN_IN_VAR_NAMES) {
+    assert.equal(typeof production.vars[name], "string", name);
+  }
+  for (const name of configuration.RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES) {
+    assert.ok(production.secrets.required.includes(name), name);
+  }
+  assert.deepEqual(await driftOfTempCopy({
+    wranglerText: doctorProduction(WRANGLER_TEXT, `"APPLE_KEY_ID": ${JSON.stringify(production.vars.APPLE_KEY_ID)}`,
+      "\"APPLE_KEY_ID\": \"SYNTHKEY02\""),
+  }), []);
 });
 
 test("the retired ledger and history-proof settings are never origin configuration", async () => {

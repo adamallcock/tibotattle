@@ -23,14 +23,12 @@
  *   requires the staging token on the key id). The pair is one unit: both
  *   keys get a version from the same pair in the same run, the public key
  *   first (ENVELOPE_PAIR), and values for half a pair are never made.
- * - GOOGLE_OIDC_CLIENT_SECRET, DISTRIBUTION_GITHUB_API_TOKEN: INERT,
- *   `staging-inert-` plus 32 random bytes. They are no Google client secret
- *   and no GitHub token; Google sign-in on staging cannot complete, and a
- *   GitHub call with the token is refused by GitHub.
- * - APPLE_PRIVATE_KEY: INERT, a freshly generated P-256 PKCS#8 PEM that no
- *   Apple key id names; Apple sign-in on staging cannot complete.
- * The staging template pairs these with inert identifiers
- * (STAGING_INERT_IDENTITY_PROVIDER_VARS in gcp-ops-infra-manifest.mjs).
+ * - DISTRIBUTION_GITHUB_API_TOKEN: INERT, `staging-inert-` plus 32 random
+ *   bytes. It is no GitHub token; a GitHub call with it is refused by GitHub.
+ * Owner round 12 retired Google and Apple sign-in, so the plane has no
+ * GOOGLE_OIDC_CLIENT_SECRET or APPLE_PRIVATE_KEY any more (CR-3 refuses
+ * them). Their earlier inert containers in the test project are left as
+ * they are: this tool never disables, destroys or deletes anything.
  *
  * Only staging: --environment must be staging, every id must be the staging
  * plane's (`tibotattle-staging-...`, STAGING_SECRET_ID) and none may carry a
@@ -107,8 +105,6 @@ export const STAGING_SECRET_KINDS = Object.freeze({
   POSTGRES_RATE_LIMIT_SECRET: "random-48-bytes-base64url",
   ENVELOPE_PUBLIC_JWK: "rsa-2048-public-jwk-staging-kid",
   ENVELOPE_PRIVATE_JWK: "rsa-2048-private-jwk-staging-kid",
-  GOOGLE_OIDC_CLIENT_SECRET: "inert-random",
-  APPLE_PRIVATE_KEY: "inert-p256-pkcs8-pem",
   DISTRIBUTION_GITHUB_API_TOKEN: "inert-random",
 });
 export const ENVELOPE_PAIR = Object.freeze(["ENVELOPE_PUBLIC_JWK", "ENVELOPE_PRIVATE_JWK"]);
@@ -130,7 +126,6 @@ const GCLOUD_TIMEOUT_MS = 120_000;
 const VERSION_NAME = /^projects\/[a-z0-9-]+\/secrets\/([A-Za-z0-9_-]{1,255})\/versions\/([1-9][0-9]{0,9})$/u;
 const VERSION = /^[1-9][0-9]{0,9}$/u;
 const KID = /^key:[A-Za-z0-9._-]{1,64}$/u;
-const PKCS8_PEM = /-----BEGIN PRIVATE KEY-----([\sA-Za-z0-9+/=]+)-----END PRIVATE KEY-----/u;
 const MAX_SECRET_BYTES = 65_536;
 const FORBIDDEN_ID_TOKENS = Object.freeze(["production", "prod", "test", "rehearsal", "synthetic"]);
 
@@ -205,11 +200,6 @@ function envelopePair() {
   };
 }
 
-function inertAppleKey() {
-  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-  return privateKey.export({ type: "pkcs8", format: "pem" });
-}
-
 /**
  * Fresh synthetic values for `variables` (a Map; the caller drops it). The
  * envelope pair is always made together.
@@ -228,7 +218,6 @@ export function generateStagingSecretValues(variables) {
     if (kind === undefined) fail(`STAGING_SECRET_UNKNOWN:${name}`);
     if (kind === "random-48-bytes-base64url") values.set(name, randomToken());
     else if (kind === "inert-random") values.set(name, inertToken());
-    else if (kind === "inert-p256-pkcs8-pem") values.set(name, inertAppleKey());
     else fail(`STAGING_SECRET_UNKNOWN:${name}`);
   }
   assertStagingSecretValues(values);
@@ -258,8 +247,7 @@ export function assertStagingSecretValues(values) {
     }
     const kind = STAGING_SECRET_KINDS[name];
     if ((kind === "random-48-bytes-base64url" && !/^[A-Za-z0-9_-]{64}$/u.test(value))
-        || (kind === "inert-random" && !value.startsWith(INERT_VALUE_PREFIX))
-        || (kind === "inert-p256-pkcs8-pem" && !PKCS8_PEM.test(value))) {
+        || (kind === "inert-random" && !value.startsWith(INERT_VALUE_PREFIX))) {
       fail(`STAGING_SECRET_VALUE_INVALID:${name}`);
     }
   }

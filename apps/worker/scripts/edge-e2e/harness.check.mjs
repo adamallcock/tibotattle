@@ -16,6 +16,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { bundleExportNames, readCompatibility, wranglerEnvironment } from "./edge-bundle.mjs";
+import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../../cloud-run/postgres-production-registry.mjs";
 import {
   EDGE_E2E_AUDIENCE,
   EDGE_E2E_INVOKER,
@@ -187,10 +188,20 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
       assert.equal(inS4, served.includes(route.id), `${route.id} ${method}: in S4 exactly when the origin serves it`);
     }
   }
-  // The policy routes the origin does not serve are swept as unported rows.
-  const sweep = sweepRows({ registry: routes, servedRouteIds: served });
+  // The policy routes the origin does not serve are swept as unported rows,
+  // or (round 12) as their retired-definite answer.
+  const sweep = sweepRows({ registry: routes, servedRouteIds: served, definiteAnswers: RETIRED_ROUTE_DEFINITE_ANSWERS });
   for (const route of policyRoutes.filter((candidate) => !served.includes(candidate.id))) {
-    assert.ok(sweep.some((row) => row.routeId === route.id && row.comparators.includes("unported")), route.id);
+    const comparator = Object.hasOwn(RETIRED_ROUTE_DEFINITE_ANSWERS, route.id) ? "definite" : "unported";
+    assert.ok(sweep.some((row) => row.routeId === route.id && row.comparators.includes(comparator)), route.id);
+  }
+  // The definite route is never swept as the unported 503, and its expected
+  // answer is the registry's.
+  const definite = sweep.filter((row) => row.comparators.includes("definite"));
+  assert.deepEqual([...new Set(definite.map((row) => row.routeId))], Object.keys(RETIRED_ROUTE_DEFINITE_ANSWERS));
+  for (const row of definite) {
+    assert.equal(row.comparators.includes("unported"), false, row.id);
+    assert.deepEqual(row.expect, { ...RETIRED_ROUTE_DEFINITE_ANSWERS[row.routeId] }, row.id);
   }
   assert.deepEqual([...EDGE_LOCAL_ROUTE_IDS].sort(), ["apple_domain_association", "sparkle_appcast_guard"]);
   // Removing one sweep row is detected.

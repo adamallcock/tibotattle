@@ -2,10 +2,10 @@
  * The six admin console routes on the PostgreSQL origin (GCP, C-ADMIN), as
  * one family for the composition root to register (D-CRB). The production
  * host registers it only when its admin-host policy is 'chokepoint'
- * (OD-CR-3); it ships 'refuse'. The owner answered OWN-17 in round 12 (open
- * with what is ported; sections without a GCP source say "unavailable"),
- * and the checklist schedules the flip as ADMIN-R12, after D-CRB, so
- * registering it is not a decision this module takes.
+ * (OD-CR-3), which it is since ADMIN-R12: the owner answered OWN-17 in round
+ * 12 (open with what is ported; sections without a GCP source say
+ * "unavailable"; the removed deletion ledger is not_applicable).
+ * Registering it is the composition root's decision, not this module's.
  *
  * Root contract (d43c8f92 handleRequest, admin-hostname branch):
  * 1. A request on the admin host first passes the chokepoint
@@ -23,7 +23,10 @@
  *
  * Defaults: every PostgreSQL reader and writer is bound here from the primary
  * pool and schema. Admin reads with no GCP source stay unavailable unless the
- * root injects one (see the route modules and src/postgres-admin-overview.ts).
+ * root injects one: the overview's three sourceless blocks answer the closed
+ * { status: "unavailable" } ('admin-overview-v0.6'), and the metrics history
+ * and reconstruction progress routes answer the Worker's own unavailable
+ * statuses (see the route modules and src/postgres-admin-overview.ts).
  * The database-health analytics role defaults to the primary pool, because
  * primary migration 0059 places the analytics_v2 tables in that database.
  */
@@ -102,12 +105,12 @@ function optionalPool(name, value) {
  *   pools: {primary, analytics?} (analytics defaults to primary, where 0059
  *     places analytics_v2; an explicit analytics pool is probed as given and
  *     never falls back to primary). There is no ledger pool: the database
- *     health's deletion_ledger role is always 'not_configured' (how the
- *     closed DTO represents the retired role is OWN-17 question 3),
+ *     health's deletion_ledger role is always 'not_applicable'
+ *     ('admin-database-health-v0.2', OWN-17 question 3, round 12),
  *   schemaOptions: {primarySchema},
  *   overviewSources?: {syntheticContributions?, historicalPublication?, deletionLedger?}
- *     (none has a default: each block is the Worker's 503 until the root
- *     injects its source, which OWN-17 question 1 decides),
+ *     (none has a default: each block is { status: "unavailable" } until the
+ *     root injects its source, OWN-17 questions 1 and 2, round 12),
  *   readMetricsHistory?, readReconstructionProgress? (no GCP source: unavailable),
  *   maintenance?: {runMaintenance?, syncDistribution?, telemetryRuntimeActivation?,
  *     transportRollback?, v11EvidenceAdoption?} (unported: 503 POSTGRES_ROUTE_NOT_PORTED).

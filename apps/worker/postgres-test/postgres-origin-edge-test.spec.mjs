@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../cloud-run/postgres-production-registry.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -552,6 +553,7 @@ test("served routes: every production ported pair is served; every other forward
   const served = new Set(m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS);
   let servedPairs = 0;
   let unportedPairs = 0;
+  let definitePairs = 0;
   const observedServedIds = new Set();
   for (const route of m.registry.WORKER_ROUTE_POLICY) {
     if (EDGE_LOCAL_ROUTE_IDS.has(route.id)) continue;
@@ -571,13 +573,20 @@ test("served routes: every production ported pair is served; every other forward
           assert.ok(!ADMISSION_CODES.includes(errorCode(answer)), `${label}: admitted (${answer.text})`);
           observedServedIds.add(route.id);
           servedPairs += 1;
+        } else if (Object.hasOwn(RETIRED_ROUTE_DEFINITE_ANSWERS, route.id)) {
+          // Round 12: the retired-definite route answers production's 4xx, never the 503.
+          const definite = RETIRED_ROUTE_DEFINITE_ANSWERS[route.id];
+          assert.equal(answer.status, definite.status, label);
+          assert.equal(errorCode(answer), definite.code, label);
+          assert.equal(answer.headers["retry-after"], undefined, label);
+          definitePairs += 1;
         } else {
           assertUnported(m, answer, label, request.headers["x-tibotattle-edge-request-id"]);
           unportedPairs += 1;
         }
       }
-      // The admin host is refused before anything, as production refuses it
-      // until ADMIN-R12 opens it (OD-CR-3; OWN-17 answered in round 12).
+      // The edge-test origin composes no admin family, so its admin host is
+      // refused before anything (OD-CR-3); production opens it (ADMIN-R12).
       const adminLabel = `${method} ${route.pathname} (${route.id}) on the admin host`;
       const adminRequest = reachableRequest(route, method, { hostKind: "admin", admission });
       assertUnported(m, await send(port, adminRequest), adminLabel, adminRequest.headers["x-tibotattle-edge-request-id"]);
@@ -586,6 +595,7 @@ test("served routes: every production ported pair is served; every other forward
   assert.deepEqual([...observedServedIds].sort(), [...served].sort(), "every served id was probed");
   assert.equal(servedPairs, 32, "30 served ids, two with GET and POST");
   assert.ok(unportedPairs > 0);
+  assert.equal(definitePairs, 1, "the accountless performance authorization, POST only");
 }));
 
 // ---------------------------------------------------------------------------
