@@ -1092,7 +1092,7 @@ async function usageRowEvidence(row: UsageRow,
   const sessionKey = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
   const rejected = await session(sessionKey, end, scope);
   if (rejected) return rejected;
-  if (memo.priced === undefined) memo.priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  if (memo.priced === undefined) memo.priced = usageRowEvidencePrice(row);
   const priced = memo.priced;
   if (priced === null) return null;
   return { attribution, scope, end, priced };
@@ -1105,7 +1105,11 @@ async function usageRowEvidence(row: UsageRow,
  * step). A memo answers only while the row still carries the exact
  * record_json and observed_at it was computed from. Callers only read these
  * values, and a throw is never memoized. Rows the GCP native path re-reads for
- * each of an owner's model windows are then parsed and priced once. */
+ * each of an owner's model windows are then parsed and priced once.
+ *
+ * A memo lives as long as its row, so it is kept small: an attribution and a
+ * model id equal to one already held are shared (value-equal, never written),
+ * from bounded intern tables. */
 interface UsageRowEvidenceMemo {
   readonly recordJson: string;
   readonly observedAt: string;
@@ -1113,6 +1117,15 @@ interface UsageRowEvidenceMemo {
   priced?: ReturnType<typeof priceChunkUsageRecord>;
 }
 const usageRowEvidenceMemos = new WeakMap<UsageRow, UsageRowEvidenceMemo>();
+const USAGE_ROW_EVIDENCE_INTERNS = 4096;
+const usageRowAttributions = new Map<string, TelemetryV11Attribution>();
+const usageRowModels = new Map<string, string>();
+function internUsageRowValue<T>(table: Map<string, T>, key: string, value: T): T {
+  const known = table.get(key);
+  if (known !== undefined) return known;
+  if (table.size < USAGE_ROW_EVIDENCE_INTERNS) table.set(key, value);
+  return value;
+}
 function usageRowEvidenceMemo(row: UsageRow): UsageRowEvidenceMemo {
   const known = usageRowEvidenceMemos.get(row);
   if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) return known;
@@ -1122,9 +1135,19 @@ function usageRowEvidenceMemo(row: UsageRow): UsageRowEvidenceMemo {
     try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
     catch { attribution = null; }
   }
-  const memo: UsageRowEvidenceMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution };
+  if (attribution !== null) {
+    attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
+      attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
+  }
+  const memo: UsageRowEvidenceMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution,
+    priced: undefined };
   usageRowEvidenceMemos.set(row, memo);
   return memo;
+}
+function usageRowEvidencePrice(row: UsageRow): ReturnType<typeof priceChunkUsageRecord> {
+  const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
+  if (priced === null || priced.modelId === null) return priced;
+  return { ...priced, modelId: internUsageRowValue(usageRowModels, priced.modelId, priced.modelId) };
 }
 
 export async function prepareV11UsageFeature(row: UsageRow, ownerDigest: string): Promise<V11PreparedUsageFeature> {

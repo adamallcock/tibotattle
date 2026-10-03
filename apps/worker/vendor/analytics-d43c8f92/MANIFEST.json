@@ -74,7 +74,7 @@
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "id": "usage-row-evidence-memo",
       "hunks": 2,
-      "sha256": "7cbb505b174d6ec236e396b5a1a5727a2ba81437a9ca5678955e5912604fc475"
+      "sha256": "1abf1f05fae29ce856a82adcd7538205ff6f4ad194466350c17a0096d15f1df3"
     },
     {
       "path": "apps/worker/src/v11-daily-projection-values.ts",
@@ -372,7 +372,7 @@
     {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
-      "sha256": "0acaf410ff760bca0c2da45e2eab22d033ccb1709cd995e31ef9ce941c4384a7",
+      "sha256": "bf4107942e7be4af8475cac1b12dc7fa4b6b96f2632fce2e4ceb7ba67cf4ade9",
       "patch": "source",
       "reach": "kernel"
     },
