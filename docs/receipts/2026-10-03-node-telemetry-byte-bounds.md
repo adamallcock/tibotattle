@@ -40,4 +40,12 @@ npm exec -- vitest run --config vitest.analytics-v2.config.mjs analytics-v2-test
 node cloud-run/build.mjs --kernel-closure
 ```
 
-Root preflight, architecture, Worker typecheck and pricing-class checks qualify the final pinned source. Complete registry/closure and producer-runtime gates remain deferred as specified above.
+## Frozen source acceptance
+
+Source checkpoint `8051f9fcc751bd85060224d1da8c3d2b9f394663` stayed clean and unchanged throughout the serial Node 22.16.0 gate. The actual-composition differential suite passed 7/7 (334 exact serialization comparisons), existing Node host spec 11/11, pricing-class checks 9/9, Worker typecheck, root preflight and architecture checks. Actual Node closure derivation passed with both required refresh Job and compute Worker outputs bound. Independent read-only review found no actionable source issue and independently passed the seven owning Node tests in 3.17 seconds, verifying the reviewed source/test files still matched this checkpoint. Review accepts source composition and identity correctness; it does not qualify registration, packaging, real L2 producer identity or workload performance.
+
+The reported compute closure SHA256 is `dcf7f55b703dd69a6a8ae8bf893ed288cdf9ab6b9b3911e848ea88b25f27cd8f`, with 170 closure inputs, compute SHA256 `a34fca2da092e725959c074a34e074e47ed6594af9b75b507aaaa8a9a1b5acb3`, and vendor manifest SHA256 `424029091301630c4ae3d66244302a102fa30053540e9c530e349eb52a00bdae`. These are this isolated source set's identities, not consolidated registration pins.
+
+Build-context `--check` refused `CLOUD_RUN_CONTEXT_IMPORT_OUTSIDE_CONTEXT`. A read-only extraction from the exact Wave26 baseline reproduces two missing allowlist edges: both `cloud-run/analytics-refresh.mjs` and `cloud-run/analytics-refresh-worker.mjs` import `./analytics-refresh-worker-profile.mjs`, which is absent from the baseline context allowlist. The new byte-bounds policy is included correctly. Packaging remains unqualified until the coordinator's separate profiler-closure repair; this lane makes no unrelated packaging change. Both normal build and build `--check` under Node 22.16.0 also refused the expected `CLOUD_RUN_BUILD_KERNEL_UNREGISTERED`, preserving the registration boundary.
+
+Captured gate logs and baseline-gap proof are private local evidence under `/private/tmp/tibotattle-node-byte-bounds-evidence-20261003`. Complete combined analytics, resource admission, consolidated registry/closure and actual L2 producer-runtime gates remain deferred. The accepted research branch remains unchanged at `2ab8e5acbeefd1a6876cb02c06c54e07ef3648b1`.
