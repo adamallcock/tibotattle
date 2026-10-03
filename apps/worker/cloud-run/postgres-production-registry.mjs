@@ -8,7 +8,8 @@
  * disposition:
  * - ported: served by an injected family handler;
  * - unported: answered by the request handler with the closed
- *   503 POSTGRES_ROUTE_NOT_PORTED (retry-after 60), never by a family;
+ *   503 POSTGRES_ROUTE_NOT_PORTED and no retry-after (OD-CR-6 (iv)), never
+ *   by a family;
  * - root: answered by the request handler itself, as the Worker answers it
  *   (apple_domain_association 404 for every method; the disabled Sparkle
  *   appcast guard 405 Allow: POST, else 404). The edge answers both first.

@@ -2101,9 +2101,11 @@ test("PG17 the upload-authorization route module issues for shipped three-key bo
     await assertWorkerRefusal(await service.authorizeUploadResponse(device, body, options), status, code, label);
     if (label === "a cookie") assert.deepEqual(service.steps, ["storage", "admission"], "refused before the bearer");
   }
+  // OD-CR-6 (ii), accepted: a query string is refused where the Worker
+  // ignores it; (i) the refusal is the Worker envelope with a request id.
   const query = await service.authorizeUploadResponse(device, base, { search: "?synthetic=1" });
-  assert.equal(query.status, 503);
-  assert.deepEqual(await query.json(), { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+  assert.equal(query.headers.get("retry-after"), null);
+  await assertWorkerRefusal(query, 503, "POSTGRES_TEST_ROUTE_UNSUPPORTED", "a query string (OD-CR-6 ii)");
   // A disabled upload-registration control refuses before the body.
   await pool.query(`UPDATE "${schema}".collection_controls SET revision = 3, control_state = 'degraded',
       upload_registration_enabled = false, updated_at = $1 WHERE singleton = 1`, [iso()]);

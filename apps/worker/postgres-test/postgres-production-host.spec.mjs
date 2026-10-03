@@ -445,14 +445,23 @@ test("unported routes and the admin host: the closed 503 under the edge's reques
     assert.equal(answer.headers["retry-after"], undefined, `${label}: no retry-after (OD-CR-6 iv)`);
     assertNoStoreMarked(answer, label);
   }
-  // OD-CR-6 (ii), accepted: a query string on a v1.2 POST route is refused,
-  // where the Worker ignores it.
-  const queried = await send(port, { method: "POST", path: "/api/v1/contributions?synthetic=1", body: "{}",
-    headers: { ...edgeHeaders({ admission: "v1;upload_ingress;allowed" }), "content-type": "application/json",
-      authorization: `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}` } });
-  assert.equal(queried.status, 503, queried.text);
-  assert.equal(JSON.parse(queried.text).error, "POSTGRES_TEST_ROUTE_UNSUPPORTED");
-  assertNoStoreMarked(queried, "query string on POST");
+  // OD-CR-6 (ii), accepted: a query string on a v1.2 POST route or on the
+  // upload-authorization route is refused, where the Worker ignores it; (i)
+  // the refusal is the Worker envelope under the edge's request id.
+  for (const [path, admission, authorization] of [
+    ["/api/v1/contributions?synthetic=1", "v1;upload_ingress;allowed",
+      `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}`],
+    ["/api/v1/device/upload-authorizations?synthetic=1", undefined, "Device um_device_synthetic.unknown"],
+  ]) {
+    const requestId = randomUUID();
+    const queried = await send(port, { method: "POST", path, body: "{}",
+      headers: { ...edgeHeaders({ requestId, ...(admission === undefined ? {} : { admission }) }),
+        "content-type": "application/json", authorization } });
+    assert.equal(queried.status, 503, `${path}: ${queried.text}`);
+    assert.deepEqual(JSON.parse(queried.text), { error: { code: "POSTGRES_TEST_ROUTE_UNSUPPORTED", requestId } }, path);
+    assert.equal(queried.headers["retry-after"], undefined, path);
+    assertNoStoreMarked(queried, `query string on POST ${path}`);
+  }
   // A stranger is EP-6's unmarked 421; so is a request for another host.
   const stranger = await send(port, { path: "/api/health",
     headers: edgeHeaders({ email: "stranger@synthetic-project.iam.gserviceaccount.com" }) });

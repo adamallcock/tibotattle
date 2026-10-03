@@ -60,11 +60,10 @@ export const POSTGRES_READINESS_POLICY_KEYS = Object.freeze([
 ] as const);
 
 /**
- * OD-CR-4 (open owner decision): what /api/ready means on GCP. Only the
- * Worker-exact definition is implemented; it serves options (a) and (b),
- * which differ in the rollout gates and the maintenance writer, not in this
- * DTO. Option (c), a GCP-specific definition, would add a value here. The
- * builder takes this as a required parameter with no default.
+ * OD-CR-4: what /api/ready means on GCP. The owner answered "worker-exact"
+ * (2026-10-02), the only definition implemented. A GCP-specific definition
+ * would need a new owner decision and would add a value here. The builder
+ * takes this as a required parameter with no default.
  */
 export const POSTGRES_READINESS_SEMANTICS = Object.freeze(["worker-exact"] as const);
 

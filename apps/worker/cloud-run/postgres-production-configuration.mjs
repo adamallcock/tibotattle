@@ -43,9 +43,10 @@
  * that names GCS_BUCKET_NAME requires it, as the OPS-2 bucket-birth receipt's
  * proof record for exactly that bucket (closed keys, decimal generations,
  * soft delete "0"), and returns it as resources.bucketHistoryProof. The
- * quarantine store needs it on a bucket with soft delete disabled; the
- * validator mirrors parseGcsQuarantineBucketHistoryProof in
- * src/gcs-quarantine-object-store.ts. The Cloudflare
+ * quarantine store needs it on a bucket with soft delete disabled. This
+ * validator (parseQuarantineBucketHistoryProof) is the one OD-2 grammar: the
+ * test host and the maintenance Job read the proof through it, and the
+ * store's own parser was removed (D-CRB). The Cloudflare
  * DELETION_LEDGER binding and the production deletion-ledger D1 name stay in
  * the absent-key and fingerprint lists: that is cutover hygiene, not a GCP
  * resource.

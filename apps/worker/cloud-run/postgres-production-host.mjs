@@ -20,14 +20,16 @@
  * cfg.rateLimits.originTier and PRODUCTION_ADMISSION_TIMEOUTS, the shared
  * PostgreSQL ingress budget, the EP-6 edge replay bindings, the GCS
  * quarantine store with CR-3's bucket birth proof (OD-2), the storage gate
- * (TTL 0, OD-ROLL / OD-CR-10), the families, the registry
+ * (TTL 0, OD-ROLL / OD-CR-10, on the data pool so the readiness pool stays
+ * RD-2's and RD-3's alone), the families, the registry
  * (POSTGRES_PORTED_WORKER_ROUTE_IDS, with the route modules folded in), the
  * CR-6 handler and EP-6 in front of it.
  *
  * The admin host (OD-CR-3) is a composition-root decision:
  * PRODUCTION_ADMIN_HOST_POLICY stays 'refuse' (503 POSTGRES_ROUTE_NOT_PORTED
- * for every admin-host request) until the owner answers OWN-17 question 2.
- * With 'chokepoint' the runtime builds createPostgresAdminAccessChokepoint
+ * for every admin-host request). The owner answered OWN-17 in round 12 (open
+ * with what is ported); the checklist schedules the flip as ADMIN-R12, after
+ * D-CRB. With 'chokepoint' the runtime builds createPostgresAdminAccessChokepoint
  * once over the env, registers C-ADMIN's six routes (no analytics pool while
  * analytics_v2 lives in primary, migration 0059) and injects C-MAINT's
  * lifecycle pass as their run_maintenance task.
@@ -713,8 +715,14 @@ export async function createPostgresProductionRuntime({
     const objectStore = (dependencies.createGcsQuarantineObjectStore ?? createGcsQuarantineObjectStore)(
       bucket, accessToken, undefined, undefined, bucketHistoryProof,
     );
+    // The gate reads on the data pool, never the readiness pool: with TTL 0
+    // every gated request makes its own receipt read, and on the one
+    // readiness connection those reads would queue /api/ready and
+    // /api/health behind request traffic (and each other). Every caller
+    // reads the gate before it takes a data connection and holds none while
+    // it waits, so the gate's checkout cannot deadlock the family's.
     const storageGate = createPostgresStorageGate({
-      primaryPool: readinessPool,
+      primaryPool: dataPool,
       schemaOptions: { primarySchema },
       expectedMigrations: POSTGRES_RUNTIME_MIGRATIONS,
       positiveTtlMilliseconds: PRODUCTION_STORAGE_GATE_TTL_MILLISECONDS,

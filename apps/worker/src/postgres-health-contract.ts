@@ -31,10 +31,11 @@ export const POSTGRES_HEALTH_OMITTED_WORKER_KEYS = Object.freeze([
 ] as const);
 
 /**
- * OD-CR-5 (open owner decision): the two capability flags for features the
- * origin does not serve yet. The Worker reports both as constant true; the
- * owner chooses between keeping those constants and deriving them from the
- * route registry. The builder takes both as required booleans, no default.
+ * OD-CR-5: the two capability flags for features the origin may not serve.
+ * The Worker reports both as constant true; the owner answered (2026-10-02)
+ * that the origin derives them from the route registry
+ * (cloud-run/postgres-health-dispatch.mjs healthCapabilityFlags). The builder
+ * takes both as required booleans, no default.
  */
 export const POSTGRES_HEALTH_CAPABILITY_FLAG_KEYS = Object.freeze([
   "participantExport",

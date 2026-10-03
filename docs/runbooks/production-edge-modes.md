@@ -283,12 +283,21 @@ verifier is limited at the origin to plain `GET /api/health` and
 - **First roll:** `/api/ready` reads the rows C-MAINT's lifecycle pass writes,
   so a freshly migrated origin answers `503` until one pass has run. The
   rollout tool (`scripts/gcp-production-rollout.mjs`) runs one execution of
-  the target's maintenance job after the roll and before it verifies. While
-  the edge is not in gcp mode (the roll then verifies through this
-  verifier), a target without a `maintenanceJob` is refused before any write
-  (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`) until D-OPS4 adds the job to the
-  desired state. The same tool refuses a target whose edge `upstreamOrigin`
-  is not the rolled service's run.app origin (the origin's `HOST_ORIGIN`).
+  the target's maintenance job (the desired state's `maintenance` job,
+  D-OPS4) after the roll and before it verifies. Staging cannot deploy that
+  job yet, so a staging target names none; while the edge is not in gcp mode
+  (the roll then verifies through this verifier), a target without a
+  `maintenanceJob` is refused before any write
+  (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). The same tool refuses a target whose
+  edge `upstreamOrigin` is not the rolled service's run.app origin (the
+  origin's `HOST_ORIGIN`).
+- **Finding F8 status:** the edge decision record's F8 (the fast-path test
+  origin serves no `/api/ready`, so no gcp deploy can pass) is closed in
+  source, not in deployment: the production origin (`HOST_MODE=production`
+  or `staging`, D-CRB) and the fastpath-test mode serve Worker-shaped
+  `/api/health` (RD-3) and `/api/ready` (RD-2). The verifier passes only
+  against a rolled production-host revision after its first maintenance
+  pass, and none is deployed yet.
 
 ## 6. Releases and deploys in gcp mode
 
@@ -341,9 +350,12 @@ envelopes, with these owner-accepted differences (owner decisions,
   `x-tibotattle-edge-request-id`, so the edge, origin and client lines join
   on one id.
 - **(ii) A query string on POST routes is refused.** A query string on a
-  v1.2 POST route or on `POST /api/v1/device/upload-authorizations` answers
-  `503 POSTGRES_TEST_ROUTE_UNSUPPORTED`, where the Worker ignores it. No
-  shipped client sends one.
+  v1.2 POST route (among them `POST /api/v1/contributions`) or on
+  `POST /api/v1/device/upload-authorizations` answers
+  `503 POSTGRES_TEST_ROUTE_UNSUPPORTED` in the Worker envelope
+  (`{"error":{"code","requestId"}}`, the edge's request id, no
+  `retry-after`), where the Worker ignores the query. No shipped client
+  sends one.
 - **(iii) The storage 503 can come first.** While the origin's migration
   receipt does not match its image (a migration applied ahead of the roll),
   the storage-gated routes answer `503 BACKEND_STORAGE_UNAVAILABLE`, which

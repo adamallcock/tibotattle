@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { after, before, test } from "node:test";
+import { after, before, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
@@ -29,6 +29,10 @@ let vite;
 let host;
 let configuration;
 let composition;
+let dispatchModule;
+let errors;
+let routeRegistry;
+let runtimeSchema;
 
 before(async () => {
   vite = await createServer({
@@ -38,10 +42,14 @@ before(async () => {
     server: { middlewareMode: true, hmr: false, ws: false },
     appType: "custom",
   });
-  [host, configuration, composition] = await Promise.all([
+  [host, configuration, composition, dispatchModule, errors, routeRegistry, runtimeSchema] = await Promise.all([
     vite.ssrLoadModule("/cloud-run/postgres-production-host.mjs"),
     vite.ssrLoadModule("/cloud-run/postgres-production-configuration.mjs"),
     vite.ssrLoadModule("/src/backend-composition.ts"),
+    vite.ssrLoadModule("/cloud-run/postgres-test-dispatch.mjs"),
+    vite.ssrLoadModule("/src/errors.ts"),
+    vite.ssrLoadModule("/src/route-registry.ts"),
+    vite.ssrLoadModule("/src/postgres-runtime-schema.ts"),
   ]);
 });
 
@@ -187,7 +195,8 @@ function invokerRequest(path, { method = "GET", hostKind = "apex", headers = {} 
 
 test("constants: the composition root's owner answers", () => {
   assert.deepEqual({ ...host.PRODUCTION_HOST_MODES }, { production: "production", staging: "staging" });
-  // OWN-17 question 2 is open: the admin host stays refused (OD-CR-3).
+  // OWN-17 was answered in round 12; the flip is ADMIN-R12, scheduled after
+  // D-CRB, so the admin host stays refused here (OD-CR-3).
   assert.equal(host.PRODUCTION_ADMIN_HOST_POLICY, "refuse");
   assert.equal(host.PRODUCTION_UNPORTED_RETRY_AFTER_SECONDS, null, "OD-CR-6 (iv)");
   assert.equal(host.PRODUCTION_STORAGE_GATE_TTL_MILLISECONDS, 0, "OD-ROLL / OD-CR-10");
@@ -360,6 +369,368 @@ test("composeOriginFamilies refuses an incomplete dependency set", () => {
   assert.throws(() => host.composeOriginFamilies(null), { code: host.ORIGIN_COMPOSITION_INVALID });
   assert.throws(() => host.composeOriginFamilies({ dataPool: { connect() {} } }), { code: host.ORIGIN_COMPOSITION_INVALID });
 });
+
+/**
+ * Pools whose connections answer from a script: the data pool can be held
+ * (every connect waits until released, then fails), the admission pool
+ * answers the ingress-budget probe as a fresh, full budget, and the
+ * readiness pool answers every statement with no rows. Connects are counted
+ * per pool name; no network is reached.
+ */
+function scriptedPools() {
+  const connects = new Map();
+  const held = [];
+  let hold = false;
+  const client = (name) => ({
+    async query(sql) {
+      const text = String(sql);
+      const now = String(Date.now());
+      if (name === "tibotattle-origin-admission" && text.includes("SELECT tokens")) {
+        return { rows: [{ tokens: "64", updated_at_ms: now, concurrency_denials: "0", start_rate_denials: "0",
+          last_denied_at_ms: null }], rowCount: 1 };
+      }
+      if (text.includes("AS now_ms")) return { rows: [{ now_ms: now }], rowCount: 1 };
+      return { rows: [], rowCount: 1 };
+    },
+    release() {},
+  });
+  return {
+    connects,
+    hold() { hold = true; },
+    release() {
+      hold = false;
+      for (const reject of held.splice(0)) reject(new Error("synthetic: released without a connection"));
+    },
+    heldCount: () => held.length,
+    async createIamPool(options) {
+      const name = options.applicationName;
+      connects.set(name, 0);
+      return {
+        options,
+        async connect() {
+          connects.set(name, connects.get(name) + 1);
+          if (name === "tibotattle-origin-data") {
+            if (hold) return new Promise((_, reject) => { held.push(reject); });
+            throw new Error("synthetic: no data connection");
+          }
+          return client(name);
+        },
+        async end() {},
+      };
+    },
+  };
+}
+
+test("OD-CR-6 (i): every ported route's error answer is the Worker envelope under the edge's request id, query or not",
+  async () => {
+    const seams = dependencies();
+    const runtime = await host.createPostgresProductionRuntime({
+      processEnv: productionEnv(), hostMode: "production", dependencies: seams.dependencies,
+    });
+    try {
+      const ported = new Set(composition.POSTGRES_PORTED_WORKER_ROUTE_IDS);
+      const queryRefused = [];
+      let answered = 0;
+      for (const route of routeRegistry.WORKER_ROUTE_POLICY) {
+        if (!ported.has(route.id)) continue;
+        const methods = route.methods === "all" ? ["GET", "POST"] : route.methods;
+        for (const method of methods) {
+          for (const query of ["", "?synthetic=1"]) {
+            const label = `${method} ${route.id}${query}`;
+            const response = await runtime.productionDispatch(invokerRequest(`${route.pathname}${query}`, {
+              method,
+              headers: {
+                "content-type": "application/json",
+                authorization: `Upload um_device_upload_${crypto.randomUUID()}.${"A".repeat(43)}`,
+              },
+              ...(method === "GET" ? {} : { body: "{}" }),
+            }));
+            answered += 1;
+            assert.equal(response.headers.get("x-tibotattle-origin"), "1", label);
+            if (response.status < 400) continue;
+            const body = await response.json();
+            assert.deepEqual(Object.keys(body), ["error"], `${label}: the Worker envelope, never a flat body`);
+            assert.equal(body.error.requestId, REQUEST_ID, `${label}: the edge's request id`);
+            assert.match(body.error.code, /^[A-Z0-9_]+$/u, label);
+            if (body.error.code === "POSTGRES_TEST_ROUTE_UNSUPPORTED") {
+              assert.equal(response.status, 503, label);
+              assert.equal(response.headers.get("retry-after"), null, label);
+              assert.equal(query, "?synthetic=1", `${label}: only a query string reaches this refusal`);
+              queryRefused.push(route.id);
+            }
+          }
+        }
+      }
+      assert.ok(answered > 60, "every ported route and method was asked");
+      // OD-CR-6 (ii), accepted: exactly the POST routes that serve no query.
+      assert.deepEqual(queryRefused.sort(), [
+        "accountless_enrollment", "accountless_ownership", "accountless_renewal",
+        "accountless_telemetry_v12_authorization", "contributions", "device_credential_renew",
+        "device_upload_authorization", "telemetry_v12_day_manifests", "telemetry_v12_domain_activate",
+        "telemetry_v12_domain_predecessor",
+      ]);
+    } finally {
+      for (const pool of runtime.pools) await pool.end();
+    }
+  });
+
+test("the storage gate reads on the data pool: forty gated requests never queue /api/ready or /api/health", async () => {
+  // TTL 0 (OD-ROLL / OD-CR-10) gives every gated request its own receipt
+  // read. On the one readiness connection those reads would queue RD-2 and
+  // RD-3 behind request traffic; on the data pool they wait where the
+  // request's own reads wait, and the readiness pool stays the status
+  // families' alone.
+  const pools = scriptedPools();
+  const seams = dependencies();
+  const runtime = await host.createPostgresProductionRuntime({
+    processEnv: productionEnv(), hostMode: "production",
+    dependencies: { ...seams.dependencies, createIamPool: pools.createIamPool },
+  });
+  try {
+    pools.hold();
+    const gated = Array.from({ length: 40 }, () => runtime.productionDispatch(invokerRequest("/api/v1/community/daily")));
+    for (let turn = 0; turn < 50 && pools.heldCount() < 40; turn += 1) await new Promise((done) => setImmediate(done));
+    assert.equal(pools.heldCount(), 40, "each gated request makes its own read (no shared read, no reuse)");
+    assert.equal(pools.connects.get("tibotattle-origin-data"), 40);
+    assert.equal(pools.connects.get("tibotattle-origin-readiness"), 0, "no gate read touches the readiness pool");
+    // While every data connection is held, readiness and health still answer
+    // from the readiness pool (and the budget probe from the admission pool).
+    for (const path of ["/api/ready", "/api/health"]) {
+      const before = pools.connects.get("tibotattle-origin-readiness");
+      const answer = await Promise.race([
+        runtime.productionDispatch(invokerRequest(path)),
+        new Promise((done) => { setTimeout(() => done(null), 5_000).unref(); }),
+      ]);
+      assert.notEqual(answer, null, `${path} answered while the gate's reads were held`);
+      assert.equal(answer.headers.get("x-tibotattle-origin"), "1", path);
+      assert.ok(pools.connects.get("tibotattle-origin-readiness") > before, `${path} read the readiness pool`);
+    }
+    assert.equal(pools.connects.get("tibotattle-origin-data"), 40, "readiness and health took no data connection");
+    assert.equal(pools.heldCount(), 40, "the gated requests were still waiting");
+    pools.release();
+    for (const response of await Promise.all(gated)) {
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(),
+        { error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: REQUEST_ID } }, "a failed read refuses closed");
+    }
+  } finally {
+    pools.release();
+    for (const pool of runtime.pools) await pool.end();
+  }
+});
+
+/** The community-daily family over a pool it never reaches. */
+function communityDailyFamily(overrides) {
+  return dispatchModule.createPostgresTestCommunityDailyDispatch({
+    requestContext: () => ({ requestId: REQUEST_ID }),
+    primaryPool: { async connect() { throw new Error("synthetic: the family must not read"); } },
+    schemaOptions: { primarySchema: "origin_primary" },
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    readPostgresPublishedCommunityDaily: async () => { throw new Error("synthetic: the family must not read"); },
+    healthDispatch: async () => new Response(null, { status: 503 }),
+    ...overrides,
+  });
+}
+
+const COMMUNITY_DAILY_READ = "/api/v1/community/daily?from=2026-09-01&to=2026-09-30";
+
+async function assertAdmitted(family, origin, label) {
+  const response = await family(new Request(`${origin}${COMMUNITY_DAILY_READ}`));
+  assert.equal(response.status, 503, label);
+  assert.deepEqual(await response.json(), { error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: REQUEST_ID } },
+    `${label}: admitted, so the storage gate answered`);
+}
+
+async function assertRefused(family, origin, label) {
+  const response = await family(new Request(`${origin}${COMMUNITY_DAILY_READ}`));
+  assert.equal(response.status, 503, label);
+  assert.deepEqual(await response.json(), { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" },
+    `${label}: refused before the gate`);
+}
+
+test("the families' origin admission: an issued configuration admits its public and admin origins, nothing else does",
+  async () => {
+    for (const [plane, env] of [["production", productionEnv()], ["staging", stagingEnv()]]) {
+      const issued = configuration.readProductionConfiguration(env, plane);
+      assert.equal(configuration.isProductionConfiguration(issued), true);
+      const { public: publicOrigin, admin: adminOrigin } = issued.origins;
+      assert.notEqual(publicOrigin, adminOrigin);
+      const family = communityDailyFamily({ productionConfiguration: issued, privateOrigin: publicOrigin });
+      await assertAdmitted(family, publicOrigin, `${plane} public origin`);
+      // EP-6 rebuilds an admin-host request on the admin origin (critic hostGap 6).
+      await assertAdmitted(family, adminOrigin, `${plane} admin origin`);
+      for (const other of [issued.origins.host, "https://evil.tibotattle.com", "http://127.0.0.1:8080",
+        "https://tibotattle.test", plane === "production" ? "https://admin.staging.synthetic.example"
+          : "https://admin.tibotattle.com"]) {
+        await assertRefused(family, other, `${plane} ${other}`);
+      }
+      // A lookalike (a copy CR-3 never issued, frozen or not) is refused at
+      // construction; so is an issued configuration under another origin.
+      for (const [label, lookalike] of [
+        ["frozen copy", Object.freeze({ ...issued })],
+        ["deep copy", JSON.parse(JSON.stringify(issued))],
+        ["frozen deep copy", Object.freeze(JSON.parse(JSON.stringify(issued)))],
+      ]) {
+        assert.equal(configuration.isProductionConfiguration(lookalike), false, label);
+        assert.throws(() => communityDailyFamily({ productionConfiguration: lookalike, privateOrigin: publicOrigin }),
+          { code: "POSTGRES_TEST_PRIVATE_ORIGIN_INVALID" }, `${plane} ${label}`);
+        assert.throws(() => host.composeOriginFamilies({
+          dataPool: { async connect() { throw new Error("synthetic"); } },
+          primarySchema: "origin_primary",
+          sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+          admissionEnv: Object.freeze({}),
+          storageGate: { async assertCurrent() {}, async probe() { return new Response(null, { status: 200 }); } },
+          dispatchOrigin: publicOrigin,
+          productionConfiguration: lookalike,
+          requestContext: () => undefined,
+          routeModuleContext: () => Object.freeze({}),
+          statusDispatchers: { health: async () => new Response(null), ready: async () => new Response(null) },
+        }), { code: "POSTGRES_TEST_PRIVATE_ORIGIN_INVALID" }, `composeOriginFamilies: ${plane} ${label}`);
+      }
+      for (const privateOrigin of [adminOrigin, issued.origins.host, "http://127.0.0.1:8080"]) {
+        assert.throws(() => communityDailyFamily({ productionConfiguration: issued, privateOrigin }),
+          { code: "POSTGRES_TEST_PRIVATE_ORIGIN_INVALID" }, `${plane} private origin ${privateOrigin}`);
+      }
+    }
+    // A test configuration admits its own private origin only: never an admin origin.
+    const loopback = communityDailyFamily({ privateOrigin: "http://127.0.0.1:8080" });
+    await assertAdmitted(loopback, "http://127.0.0.1:8080", "loopback test origin");
+    for (const other of ["https://admin.tibotattle.com", "https://tibotattle.com", "https://tibotattle.test"]) {
+      await assertRefused(loopback, other, `loopback test configuration: ${other}`);
+    }
+    const edgeTest = communityDailyFamily({ privateOrigin: "https://tibotattle.test" });
+    await assertAdmitted(edgeTest, "https://tibotattle.test", "edge-test origin");
+    await assertRefused(edgeTest, "https://admin.tibotattle.test", "edge-test configuration: an admin origin");
+  });
+
+const UPLOAD_ORIGIN = "http://127.0.0.1:8080";
+const LEASE = Object.freeze({ leaseId: "synthetic-lease" });
+
+/** A v1.2 dispatch whose contributions preamble runs on stubs (no pool is reached). */
+function contributionsDispatch({ uploadIngress = null, claims = [] } = {}) {
+  const unreachable = (name) => async () => { throw new Error(`synthetic: ${name} must not run`); };
+  return dispatchModule.createPostgresTestV12DayManifestDispatch({
+    requestContext: () => ({ requestId: REQUEST_ID }),
+    primaryPool: { async connect() { throw new Error("synthetic: no pool"); } },
+    expectedMigrations: runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS,
+    storageGate: { async assertCurrent() {}, async probe() { return new Response(null, { status: 200 }); } },
+    privateOrigin: UPLOAD_ORIGIN,
+    healthDispatch: async () => new Response(null, { status: 200 }),
+    admissionEnv: Object.freeze({
+      UPLOAD_INGRESS_REQUEST_RATE_LIMIT: { async limit() { return { success: true }; } },
+      UPLOAD_INGRESS_CLIENT_RATE_LIMIT: { async limit() { return { success: true }; } },
+    }),
+    assertAdmissionBindings() {},
+    assertAttemptAllowed: async () => {},
+    assertUploadAuthorizationBindings() {},
+    assertUploadAuthorizationAllowed: async () => {},
+    assertUploadIngressRequestAllowed: async () => {},
+    uploadIngress,
+    authenticatePostgresDevice: unreachable("authenticatePostgresDevice"),
+    disconnectPostgresAuthenticatedDevice: unreachable("disconnectPostgresAuthenticatedDevice"),
+    readPostgresDeviceSyncState: unreachable("readPostgresDeviceSyncState"),
+    readPostgresDeviceSyncCapabilities: unreachable("readPostgresDeviceSyncCapabilities"),
+    readPostgresDeviceSyncV12Capabilities: unreachable("readPostgresDeviceSyncV12Capabilities"),
+    readPostgresV12DayCandidates: unreachable("readPostgresV12DayCandidates"),
+    createPostgresTypedV12Domain: () => ({ createPredecessor: unreachable("createPredecessor"),
+      activate: unreachable("activate") }),
+    readPostgresTelemetryV12EffectivePage: unreachable("readPostgresTelemetryV12EffectivePage"),
+    publicEnvelopeKey: () => { throw new Error("synthetic: no envelope key"); },
+    sourceNamespace: "synthetic-namespace",
+    assertPostgresV12UploadAllowed: unreachable("assertPostgresV12UploadAllowed"),
+    createPostgresDeviceUploadAuthorization: unreachable("createPostgresDeviceUploadAuthorization"),
+    registerPostgresTypedV12DayManifest: unreachable("registerPostgresTypedV12DayManifest"),
+    claimPostgresDeviceUploadAuthorization: async () => { claims.push("claim"); throw new Error("synthetic: no claim"); },
+    abandonPostgresDeviceUploadAuthorization: async () => {},
+    persistPostgresTypedV12StagedChunk: unreachable("persistPostgresTypedV12StagedChunk"),
+    decryptSyntheticEnvelope: unreachable("decryptSyntheticEnvelope"),
+    validateTelemetryV12Envelope() {},
+    validateTelemetryV12StagedChunk: unreachable("validateTelemetryV12StagedChunk"),
+    sha256Hex: async () => "0".repeat(64),
+    objectStore: { async put() {}, async delete() {} },
+    envelopePublicJwk: '{"synthetic":"public"}',
+    envelopePrivateJwk: '{"synthetic":"private"}',
+    readBoundedRequestBody: async () => new TextEncoder().encode("{}"),
+    maxRequestBytes: 1_024,
+  });
+}
+
+const UPLOAD_CREDENTIAL = `Upload um_device_upload_${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}.${"A".repeat(43)}`;
+
+function contribution() {
+  return new Request(`${UPLOAD_ORIGIN}/api/v1/contributions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: UPLOAD_CREDENTIAL },
+    body: "{}",
+  });
+}
+
+/** An ingress authority that records every call; heartbeat and release behaviour are injected. */
+function recordingAuthority({ assertActive = async () => {}, releaseLease = async () => {} } = {}) {
+  const calls = [];
+  return {
+    calls,
+    authority: Object.freeze({
+      assertConfiguration() { calls.push("configuration"); },
+      bodyReadPolicy() { calls.push("body-policy"); return { maximumTotalMilliseconds: 60_000, maximumIdleMilliseconds: 15_000 }; },
+      async acquireLease() { calls.push("acquire"); return LEASE; },
+      startHeartbeat(_env, lease) {
+        calls.push(`heartbeat:${lease.leaseId}`);
+        return {
+          async assertActive() { calls.push("assert-active"); await assertActive(); },
+          async stop() { calls.push("stop"); },
+        };
+      },
+      async releaseLease(_env, lease) { calls.push(`release:${lease.leaseId}`); await releaseLease(); },
+    }),
+  };
+}
+
+test("contributions: no ingress authority fails closed, a lost heartbeat answers the Worker's code, the lease is always released",
+  async (t) => {
+    // Built without the authority, the route fails closed before any byte or claim.
+    const claims = [];
+    const bare = await contributionsDispatch({ claims })(contribution());
+    assert.equal(bare.status, 503);
+    assert.deepEqual(await bare.json(), { error: { code: "ADMISSION_CONFIGURATION_INVALID", requestId: REQUEST_ID } });
+    assert.deepEqual(claims, []);
+    // A malformed authority is refused when the dispatch is built.
+    assert.throws(() => contributionsDispatch({ uploadIngress: { acquireLease() {} } }),
+      { code: "POSTGRES_TEST_V12_DISPATCH_CONFIGURATION_INVALID" });
+
+    // The heartbeat fails after the body: the Worker's 503
+    // UPLOAD_INGRESS_UNAVAILABLE (with its retry-after), no claim, and the
+    // heartbeat is stopped and the lease released.
+    const lost = recordingAuthority({
+      assertActive: async () => {
+        throw new errors.ApiError(503, "UPLOAD_INGRESS_UNAVAILABLE", { responseHeaders: { "retry-after": "60" } });
+      },
+    });
+    const lostClaims = [];
+    const fenced = await contributionsDispatch({ uploadIngress: lost.authority, claims: lostClaims })(contribution());
+    assert.equal(fenced.status, 503);
+    assert.deepEqual(await fenced.json(), { error: { code: "UPLOAD_INGRESS_UNAVAILABLE", requestId: REQUEST_ID } });
+    assert.equal(fenced.headers.get("retry-after"), "60");
+    assert.deepEqual(lostClaims, [], "the claim is never reached once the lease is lost");
+    assert.deepEqual(lost.calls, ["configuration", "body-policy", "acquire", "heartbeat:synthetic-lease",
+      "assert-active", "stop", "release:synthetic-lease"]);
+
+    // A failed release never changes the answer; it writes exactly one
+    // content-free warn line.
+    const warnings = [];
+    const warn = mock.method(console, "warn", (...args) => { warnings.push(args.join(" ")); });
+    t.after(() => warn.mock.restore());
+    const failing = recordingAuthority({ releaseLease: async () => {
+      throw new Error(`synthetic release failure ${UPLOAD_CREDENTIAL}`);
+    } });
+    const refused = await contributionsDispatch({ uploadIngress: failing.authority })(contribution());
+    warn.mock.restore();
+    assert.equal(refused.status, 400, "the body's own refusal stands");
+    assert.deepEqual(await refused.json(), { error: { code: "ENVELOPE_INVALID", requestId: REQUEST_ID } });
+    assert.deepEqual(failing.calls.slice(-2), ["stop", "release:synthetic-lease"]);
+    assert.deepEqual(warnings, ['{"level":"warn","event":"upload_ingress_lease_release_failed"}']);
+    assert.deepEqual(Object.keys(JSON.parse(warnings[0])), ["level", "event"]);
+  });
 
 test("the image runs every entry as the unprivileged node user, which owns none of its files", async () => {
   const dockerfile = await readFile(resolve(WORKER_ROOT, "cloud-run/Dockerfile"), "utf8");

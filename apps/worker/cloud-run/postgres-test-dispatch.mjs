@@ -2402,18 +2402,27 @@ export function createPostgresTestV12DayManifestDispatch({
         code: "AUTH_INVALID", status: 401,
       }), requestIdFrom(requestContext, request));
     }
-    if ((!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
+    if (!envelopeKeyRoute && !manifestRoute && !manifestReadRoute
         && !uploadAuthorizationRoute && !disconnectRoute && !contributionRoute
         && !syncStateRoute && !syncManifestRoute && !syncCapabilitiesRoute && !syncCapabilitiesV12Route
         && !v12DomainPredecessorRoute && !v12DomainActivateRoute
         && !v12EffectivePageRoute && !accountlessEnrollmentRoute
         && !accountlessOwnershipRoute && !accountlessV12AuthorizationRoute
-        && !accountlessRenewalRoute && !deviceCredentialRenewalRoute)
-        || (url.search && !envelopeKeyRoute && !manifestReadRoute
-          && !disconnectPath && !syncStatePath && !syncManifestPath
-          && !syncCapabilitiesPath && !syncCapabilitiesV12Path
-          && !v12EffectivePageRoute)) {
+        && !accountlessRenewalRoute && !deviceCredentialRenewalRoute) {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
+    }
+    // A query string on a route that serves none (every v1.2 POST route):
+    // OD-CR-6 (ii), an owner-accepted refusal where the Worker ignores the
+    // query. The production registry reaches this dispatch only for its own
+    // routes, so this refusal is reachable there, and it answers in the
+    // Worker envelope under the edge's request id (OD-CR-6 (i)).
+    if (url.search && !envelopeKeyRoute && !manifestReadRoute
+        && !disconnectPath && !syncStatePath && !syncManifestPath
+        && !syncCapabilitiesPath && !syncCapabilitiesV12Path
+        && !v12EffectivePageRoute) {
+      return routeError(Object.assign(new Error("POSTGRES_TEST_ROUTE_UNSUPPORTED"), {
+        code: "POSTGRES_TEST_ROUTE_UNSUPPORTED", status: 503,
+      }), requestIdFrom(requestContext, request));
     }
     if ((accountlessEnrollmentRoute || accountlessOwnershipRoute || accountlessV12AuthorizationRoute
       || accountlessRenewalRoute)

@@ -82,17 +82,18 @@ export const ORIGIN_REQUEST_LOG_FIELDS = Object.freeze([
 ]);
 
 /**
- * OD-CR-3 (open owner decision): the admin host at the origin while the admin
- * routes are unported. There is no default; the handler refuses to build
- * without one of these.
+ * OD-CR-3: the admin host at the origin. The owner answered it (refuse until
+ * ported; OWN-17, round 12, opens it with what is ported, scheduled as
+ * ADMIN-R12), and the composition root injects the answer. There is no
+ * default; the handler refuses to build without one of these.
  */
 export const ORIGIN_ADMIN_HOST_POLICIES = Object.freeze(["refuse", "chokepoint"]);
 
 /**
  * The closed answer for an unported route (and the admin host under
- * 'refuse'). Its retry-after is OD-CR-6(iv), an open owner decision, so it
- * is not part of this constant: createProductionRequestHandler takes it as
- * the required unportedRetryAfterSeconds.
+ * 'refuse'). Its retry-after is OD-CR-6 (iv), answered by the owner as none;
+ * the composition root injects that answer as the required
+ * unportedRetryAfterSeconds (null), so it is not part of this constant.
  */
 export const ORIGIN_ROUTE_NOT_PORTED = Object.freeze({
   status: 503,
