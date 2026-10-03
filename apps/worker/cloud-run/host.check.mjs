@@ -41,6 +41,7 @@ import {
 } from "./request-boundary.mjs";
 import { createFilesystemAssets } from "./assets.mjs";
 import { nodeTimingSafeEqual } from "./node-crypto-adapter.mjs";
+import { assertNodeHostAlias, cloudRunBuildPlugins, nodeHostAliasedFiles, nodeHostPrimitivesModule } from "./node-host-build.mjs";
 // The shipped desktop client itself, so the dispatch is exercised in the
 // client's request order rather than a hand-assembled sequence.
 import { runTelemetryV12Sync } from "../../../src/contribution/telemetry-v12-sync.js";
@@ -1021,6 +1022,7 @@ test("partial HTTP health fails closed when the database or its receipt is unava
 test("host startup keeps loopback modes and rejects missing or mismatched Cloud Run identity/config", async () => {
   const temporary = await mkdtemp(join(ROOT, ".tmp-postgres-health-host-"));
   try {
+    // build.mjs's plugins: the server that ships hashes through node:crypto.
     const result = await build({
       entryPoints: [resolve(ROOT, "server.mjs")],
       bundle: true,
@@ -1030,7 +1032,10 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       write: false,
       external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"],
       logLevel: "silent",
+      metafile: true,
+      plugins: cloudRunBuildPlugins(WORKER_ROOT),
     });
+    assertNodeHostAlias(result.metafile, { workerRoot: WORKER_ROOT, requiredEntries: [resolve(ROOT, "server.mjs")] });
     const output = result.outputFiles?.[0]?.contents;
     assert.ok(output instanceof Uint8Array);
     const bundlePath = join(temporary, "server.mjs");
@@ -5104,6 +5109,8 @@ test("built Node host installs native timing comparison before session authentic
         };
       }
     `;
+    // build.mjs's plugins, so the session digests take the Node host path
+    // the shipped server takes (node:crypto), not WebCrypto.
     const result = await build({
       stdin: { contents: entry, resolveDir: ROOT, sourcefile: "node-host-session-check.mjs" },
       bundle: true,
@@ -5113,7 +5120,12 @@ test("built Node host installs native timing comparison before session authentic
       write: false,
       external: ["jsonc-parser"],
       logLevel: "silent",
+      metafile: true,
+      plugins: cloudRunBuildPlugins(WORKER_ROOT),
     });
+    const sessionInputs = new Set(Object.keys(result.metafile.inputs).map((path) => resolve(process.cwd(), path)));
+    assert.ok(sessionInputs.has(nodeHostPrimitivesModule(WORKER_ROOT)), "the session check hashes through the Node host primitives");
+    for (const replaced of nodeHostAliasedFiles(WORKER_ROOT)) assert.equal(sessionInputs.has(replaced), false, replaced);
     const output = result.outputFiles?.[0]?.contents;
     assert.ok(output instanceof Uint8Array);
     const outputPath = join(temporary, "check.mjs");

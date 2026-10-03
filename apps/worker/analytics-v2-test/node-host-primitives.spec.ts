@@ -1,15 +1,17 @@
-// Wave 1A: the Cloud Run Node host primitives (cloud-run/node-crypto-adapter.mjs)
+// Wave 1A: the Cloud Run Node host primitives (cloud-run/node-host-primitives.mjs)
 // are byte-identical to the portable paths they replace.
 //
 // - SHA-256: node:crypto against WebCrypto for strings (ASCII, multi-byte,
 //   lone surrogates, which both encode as U+FFFD), byte views at offsets
 //   (pooled Buffer slices), ArrayBuffers and large inputs; through our
-//   src/crypto.ts (host-primitives.ts mocked to the adapter, as the Cloud Run
-//   build composes it) and through the adapter's vendored-crypto surface.
+//   src/crypto.ts (host-primitives.ts mocked to the primitives, as the Cloud
+//   Run build composes it) and through their vendored-crypto surface.
 // - Hex: Buffer's encoder against the byte table, and the typed-id decoder
 //   on the Buffer path against the kernel-4 decoder (every compressed form).
-// - The esbuild alias: ESM bundles replace exactly src/host-primitives.ts
-//   and the vendored crypto.ts; the registry resolver's IIFE keeps WebCrypto.
+// - The esbuild alias (cloud-run/node-host-build.mjs): ESM bundles replace
+//   exactly src/host-primitives.ts and the vendored crypto.ts; the registry
+//   resolver's IIFE keeps WebCrypto; and assertNodeHostAlias refuses a bundle
+//   that escaped the alias or does not hash through the primitives.
 // Synthetic inputs only.
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
@@ -17,11 +19,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/host-primitives", async () => {
-  const adapter = await import("../cloud-run/node-crypto-adapter.mjs");
+  const adapter = await import("../cloud-run/node-host-primitives.mjs");
   return { hostSha256: adapter.hostSha256, hostSha256Hex: adapter.hostSha256Hex, hostBytesHex: adapter.hostBytesHex };
 });
 
-import * as adapter from "../cloud-run/node-crypto-adapter.mjs";
+import * as adapter from "../cloud-run/node-host-primitives.mjs";
+import * as hostBuild from "../cloud-run/node-host-build.mjs";
 import { sha256, sha256Hex } from "../src/crypto";
 import { hostBytesHex, hostSha256Hex } from "../src/host-primitives";
 import {
@@ -62,7 +65,7 @@ function inputs(): Array<string | Uint8Array> {
 }
 
 describe("Node host primitives (Cloud Run)", () => {
-  it("the mocked host-primitives module is the adapter, as the Cloud Run build composes it", () => {
+  it("the mocked host-primitives module is the Node primitives module, as the Cloud Run build composes it", () => {
     expect(hostSha256Hex).toBe(adapter.hostSha256Hex);
     expect(hostBytesHex).toBe(adapter.hostBytesHex);
   });
@@ -110,24 +113,104 @@ describe("Node host primitives (Cloud Run)", () => {
     expect(expectDecoderMatchesReference(edgeCases())).toBeGreaterThan(80);
   });
 
+  const esbuild = () => createRequire(join(WORKER_ROOT, "cloud-run", "package.json"))("esbuild");
+  const workerPaths = (metafile: { inputs: Record<string, unknown> }) =>
+    new Set(Object.keys(metafile.inputs).map((path) => relative(WORKER_ROOT, resolve(WORKER_ROOT, path))));
+  const PRIMITIVES = "cloud-run/node-host-primitives.mjs";
+  const VENDORED_CRYPTO = "vendor/analytics-d43c8f92/apps/worker/src/crypto.ts";
+
   it("aliases exactly the two replaced files in ESM bundles, and nothing in the registry resolver's IIFE", async () => {
-    const { build } = createRequire(join(WORKER_ROOT, "cloud-run", "package.json"))("esbuild");
     const inputsOf = async (format: "esm" | "iife") => {
-      const result = await build({ entryPoints: [join(WORKER_ROOT, "src", "typed-telemetry-repository.ts")], bundle: true,
+      const result = await esbuild().build({ entryPoints: [join(WORKER_ROOT, "src", "typed-telemetry-repository.ts")], bundle: true,
         platform: "node", format, write: false, metafile: true, logLevel: "silent", absWorkingDir: WORKER_ROOT,
         outdir: join(WORKER_ROOT, "cloud-run", "dist-spec"), external: ["pg"],
-        plugins: [adapter.nodeHostAliasPlugin(WORKER_ROOT)] });
-      return new Set(Object.keys(result.metafile.inputs).map((path) => relative(WORKER_ROOT, resolve(WORKER_ROOT, path))));
+        plugins: hostBuild.cloudRunBuildPlugins(WORKER_ROOT) });
+      return workerPaths(result.metafile);
     };
     const esm = await inputsOf("esm");
-    expect(esm.has("cloud-run/node-crypto-adapter.mjs")).toBe(true);
+    expect(esm.has(PRIMITIVES)).toBe(true);
     expect(esm.has("src/host-primitives.ts")).toBe(false);
     expect(esm.has("src/crypto.ts")).toBe(true);
+    // Neither the build tooling nor the server's timing-safe comparison is bundled with the primitives.
+    expect(esm.has("cloud-run/node-host-build.mjs")).toBe(false);
+    expect(esm.has("cloud-run/node-crypto-adapter.mjs")).toBe(false);
     const iife = await inputsOf("iife");
-    expect(iife.has("cloud-run/node-crypto-adapter.mjs")).toBe(false);
+    expect(iife.has(PRIMITIVES)).toBe(false);
     expect(iife.has("src/host-primitives.ts")).toBe(true);
-    expect(adapter.nodeHostAliasedFiles(WORKER_ROOT).map((path) => relative(WORKER_ROOT, path))).toEqual([
-      "src/host-primitives.ts", "vendor/analytics-d43c8f92/apps/worker/src/crypto.ts"]);
-    expect(() => adapter.nodeHostAliasPlugin("")).toThrow("NODE_HOST_ALIAS_ROOT_INVALID");
+    expect(hostBuild.nodeHostAliasedFiles(WORKER_ROOT).map((path) => relative(WORKER_ROOT, path))).toEqual([
+      "src/host-primitives.ts", VENDORED_CRYPTO]);
+    expect(relative(WORKER_ROOT, hostBuild.nodeHostPrimitivesModule(WORKER_ROOT))).toBe(PRIMITIVES);
+    expect(() => hostBuild.nodeHostAliasPlugin("")).toThrow("NODE_HOST_ALIAS_ROOT_INVALID");
+    expect(hostBuild.cloudRunBuildPlugins(WORKER_ROOT).map((plugin) => plugin.name)).toEqual(["node-host-primitives"]);
+  });
+
+  describe("assertNodeHostAlias refuses a bundle that would fall back to WebCrypto", () => {
+    const refreshEntry = join(WORKER_ROOT, "cloud-run", "analytics-refresh.mjs");
+    const workerEntry = join(WORKER_ROOT, "cloud-run", "analytics-refresh-worker.mjs");
+    const options = { workerRoot: WORKER_ROOT, requiredEntries: [refreshEntry, workerEntry], cwd: WORKER_ROOT };
+    const output = (entryPoint: string, inputs: string[]) => ({ entryPoint, inputs: Object.fromEntries(inputs.map((path) => [path, {}])) });
+    const refusal = (fn: () => unknown) => {
+      try {
+        fn();
+      } catch (error) {
+        return { code: (error as { code?: string }).code, entry: (error as { entry?: string }).entry,
+          input: (error as { input?: string }).input };
+      }
+      return null;
+    };
+
+    it("passes a metafile in which every required entry hashes through the primitives", () => {
+      const metafile = { inputs: { [PRIMITIVES]: {}, "src/crypto.ts": {} },
+        outputs: { "dist/a.mjs": output("cloud-run/analytics-refresh.mjs", [PRIMITIVES]),
+          "dist/b.mjs": output("cloud-run/analytics-refresh-worker.mjs", ["src/crypto.ts", PRIMITIVES]) } };
+      expect(refusal(() => hostBuild.assertNodeHostAlias(metafile, options))).toBeNull();
+    });
+
+    it("refuses a metafile holding a replaced file (ESCAPED), whichever output holds it", () => {
+      for (const replaced of [VENDORED_CRYPTO, "src/host-primitives.ts"]) {
+        const metafile = { inputs: { [PRIMITIVES]: {}, [replaced]: {} },
+          outputs: { "dist/a.mjs": output("cloud-run/analytics-refresh.mjs", [PRIMITIVES]),
+            "dist/b.mjs": output("cloud-run/analytics-refresh-worker.mjs", [PRIMITIVES]),
+            "dist/c.mjs": output("cloud-run/server.mjs", [replaced]) } };
+        expect(refusal(() => hostBuild.assertNodeHostAlias(metafile, options)))
+          .toEqual({ code: "CLOUD_RUN_BUILD_NODE_HOST_ALIAS_ESCAPED", entry: undefined, input: replaced });
+      }
+    });
+
+    it("refuses a required entry whose output lacks the primitives, or that has no output (MISSING)", () => {
+      const withoutPrimitives = { inputs: { [PRIMITIVES]: {} },
+        outputs: { "dist/a.mjs": output("cloud-run/analytics-refresh.mjs", [PRIMITIVES]),
+          "dist/b.mjs": output("cloud-run/analytics-refresh-worker.mjs", ["src/crypto.ts"]) } };
+      expect(refusal(() => hostBuild.assertNodeHostAlias(withoutPrimitives, options)))
+        .toEqual({ code: "CLOUD_RUN_BUILD_NODE_HOST_ALIAS_MISSING", entry: "cloud-run/analytics-refresh-worker.mjs", input: undefined });
+      const withoutOutput = { inputs: { [PRIMITIVES]: {} },
+        outputs: { "dist/a.mjs": output("cloud-run/analytics-refresh.mjs", [PRIMITIVES]) } };
+      expect(refusal(() => hostBuild.assertNodeHostAlias(withoutOutput, options)))
+        .toEqual({ code: "CLOUD_RUN_BUILD_NODE_HOST_ALIAS_MISSING", entry: "cloud-run/analytics-refresh-worker.mjs", input: undefined });
+      expect(() => hostBuild.assertNodeHostAlias({ inputs: {}, outputs: {} }, { ...options, requiredEntries: [] }))
+        .toThrow("NODE_HOST_ALIAS_REQUIRED_ENTRIES_INVALID");
+    });
+
+    it("refuses a real importer the alias filter does not see ('./crypto.js')", async () => {
+      const result = await esbuild().build({ stdin: { contents: 'export { sha256Hex } from "./crypto.js";',
+        resolveDir: dirname(join(WORKER_ROOT, VENDORED_CRYPTO)), sourcefile: "escaped-importer.ts", loader: "ts" },
+        bundle: true, platform: "node", format: "esm", write: false, metafile: true, logLevel: "silent",
+        absWorkingDir: WORKER_ROOT, plugins: hostBuild.cloudRunBuildPlugins(WORKER_ROOT) });
+      expect(workerPaths(result.metafile).has(VENDORED_CRYPTO)).toBe(true);
+      expect(refusal(() => hostBuild.assertNodeHostAlias(result.metafile, { ...options, requiredEntries: [refreshEntry] }))?.code)
+        .toBe("CLOUD_RUN_BUILD_NODE_HOST_ALIAS_ESCAPED");
+    });
+
+    it("refuses the real refresh bundles built without the plugin, and passes them built with it", async () => {
+      const bundle = (plugins: unknown[]) => esbuild().build({ entryPoints: [refreshEntry, workerEntry], bundle: true,
+        platform: "node", format: "esm", target: "node22", write: false, metafile: true, logLevel: "silent",
+        absWorkingDir: WORKER_ROOT, outdir: join(WORKER_ROOT, "cloud-run", "dist-spec"),
+        external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], plugins });
+      const without = await bundle([]);
+      expect(refusal(() => hostBuild.assertNodeHostAlias(without.metafile, options))?.code)
+        .toBe("CLOUD_RUN_BUILD_NODE_HOST_ALIAS_ESCAPED");
+      const shipped = await bundle(hostBuild.cloudRunBuildPlugins(WORKER_ROOT));
+      expect(refusal(() => hostBuild.assertNodeHostAlias(shipped.metafile, options))).toBeNull();
+    }, 120_000);
   });
 });

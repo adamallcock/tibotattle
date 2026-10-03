@@ -8,11 +8,12 @@
  * so nothing here may import a Node builtin.
  *
  * The Cloud Run build (cloud-run/build.mjs, nodeHostAliasPlugin in
- * cloud-run/node-crypto-adapter.mjs) replaces this module with that adapter,
- * whose same-named exports are node:crypto's synchronous SHA-256 and
- * node:buffer's hex encoder. Both produce byte-identical results to the
- * portable paths: SHA-256 is one algorithm, and a string is hashed as its
- * WHATWG UTF-8 encoding (lone surrogates as U+FFFD) on both.
+ * cloud-run/node-host-build.mjs) replaces this module with
+ * cloud-run/node-host-primitives.mjs, whose same-named exports are
+ * node:crypto's synchronous SHA-256 and node:buffer's hex encoder. Both
+ * produce byte-identical results to the portable paths: SHA-256 is one
+ * algorithm, and a string is hashed as its WHATWG UTF-8 encoding (lone
+ * surrogates as U+FFFD) on both.
  */
 
 /** SHA-256 of `value` (a string is hashed as UTF-8) as a fresh 32-byte array. */

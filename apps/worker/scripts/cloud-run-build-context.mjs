@@ -102,6 +102,10 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.check.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
+  // Wave 1A: the Node host primitives the refresh and server bundles hash
+  // through, and the build-only alias that composes them (build.mjs).
+  Object.freeze({ source: "cloud-run/node-host-primitives.mjs", destination: "apps/worker/cloud-run/node-host-primitives.mjs" }),
+  Object.freeze({ source: "cloud-run/node-host-build.mjs", destination: "apps/worker/cloud-run/node-host-build.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),

@@ -77,6 +77,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { cloudRunBuildPlugins } from "../cloud-run/node-host-build.mjs";
 
 export const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -637,7 +638,7 @@ export function loadEsbuild(root = WORKER_ROOT) {
 }
 
 /**
- * Bundle build.mjs's entry points in memory, with its options, and list per
+ * Bundle build.mjs's entry points in memory, with its options and plugins, and list per
  * output (`<entry name>.mjs`) the shipped modules naming a column (`byFile`) and
  * the import edges that lead to a D1 reader (`reachByFile`).
  */
@@ -659,6 +660,8 @@ export async function shippedReaders(root = WORKER_ROOT, esbuild = loadEsbuild(r
     logLevel: "silent",
     metafile: true,
     write: false,
+    // build.mjs's plugins (the Node host alias), so the scan sees the shipped import graph.
+    plugins: cloudRunBuildPlugins(root),
   });
   const toWorkerPath = (path) => relative(root, resolve(cloudRun, path)).split(sep).join("/");
   const metaByName = new Map(Object.entries(result.metafile.outputs).map(([path, meta]) => [path.split("/").pop(), meta]));
