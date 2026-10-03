@@ -116,3 +116,96 @@ export function startNumericMemory({ enabled = false, isolateId = 0, role = "mai
     return structuredClone(finished);
   } });
 }
+
+/** Single closed schema authority for local numeric artifacts. Never includes offending values in errors. */
+export function validateNumericMemoryReceipt(receipt) {
+  const fail = () => { throw new Error("MEMORY_PROFILE_INVALID_RECEIPT"); };
+  const check = (value) => { if (!value) fail(); };
+  const integer = (value, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) =>
+    Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+  const nullable = (value) => value === null || integer(value);
+  const keys = (value, expected) => {
+    check(value !== null && typeof value === "object" && !Array.isArray(value));
+    check(Object.keys(value).sort().join(",") === [...expected].sort().join(","));
+  };
+  const vector = (value, length, test) => {
+    check(Array.isArray(value) && value.length === length);
+    for (const item of value) check(test(item));
+  };
+  const row = (value) => {
+    check(Array.isArray(value) && value.length === 4);
+    check(nullable(value[0]) && integer(value[1], 0, 5));
+    vector(value[2], MEMORY_METRICS.length, nullable);
+    check(Array.isArray(value[3]) && value[3].length === MEMORY_SPACES.length);
+    value[3].forEach((space) => vector(space, 4, nullable));
+    if (receipt.role === "worker") check(value[2][8] === null);
+  };
+  const peak = (value) => {
+    if (value === null) return;
+    check(Array.isArray(value) && value.length === 3);
+    check(integer(value[0]) && nullable(value[1]) && integer(value[2], 0, 5));
+  };
+  keys(receipt, ["schema", "isolateId", "role", "startedEpochMs", "rssScope", "arrayBuffersSubsetOfExternal",
+    "sampling", "gc", "metricNames", "spaceNames", "rows", "last", "peaks", "spacePeaks", "rssPeakSample"]);
+  check(receipt.schema === "analytics-refresh-numeric-memory-v1");
+  check(integer(receipt.isolateId, 0, 65_535) && ["main", "worker"].includes(receipt.role));
+  check(nullable(receipt.startedEpochMs));
+  check(receipt.rssScope === (receipt.role === "main" ? "process-wide" : "omitted"));
+  check(receipt.arrayBuffersSubsetOfExternal === true);
+  check(JSON.stringify(receipt.metricNames) === JSON.stringify(MEMORY_METRICS));
+  check(JSON.stringify(receipt.spaceNames) === JSON.stringify(MEMORY_SPACES));
+  const sampling = receipt.sampling;
+  keys(sampling, ["intervalMs", "maxSamples", "maxBytes", "attempts", "errors", "dropped", "maxGapMs",
+    "historyTruncated", "historyPolicy", "phaseIdsAreSampleReasons", "knownHeapSpacesOnly", "completeTemporalCoverage",
+    "timerCallbacksCanBeBlocked", "independentPeaksAreNotAdditive", "timerAvailable", "gcObserverAvailable", "gcBoundary", "peaks"]);
+  check(integer(sampling.intervalMs, 10, 60_000) && integer(sampling.maxSamples, 2, 128));
+  check(integer(sampling.maxBytes, 16_384, 65_536));
+  for (const name of ["attempts", "errors", "dropped", "maxGapMs"]) check(integer(sampling[name]));
+  check(sampling.attempts >= 2 && sampling.dropped <= sampling.attempts);
+  check(sampling.historyTruncated === (sampling.dropped > 0));
+  check(sampling.historyPolicy === "start-and-recent-with-reserved-end");
+  for (const name of ["phaseIdsAreSampleReasons", "knownHeapSpacesOnly", "timerCallbacksCanBeBlocked", "independentPeaksAreNotAdditive"]) check(sampling[name] === true);
+  check(sampling.completeTemporalCoverage === false);
+  check(typeof sampling.timerAvailable === "boolean" && typeof sampling.gcObserverAvailable === "boolean");
+  check(sampling.gcBoundary === "after-asynchronous-delivery" && sampling.peaks === "observed-lower-bounds");
+  keys(receipt.gc, ["count", "durationMs"]);
+  check(integer(receipt.gc.count) && nullable(receipt.gc.durationMs));
+  check(Array.isArray(receipt.rows) && receipt.rows.length <= sampling.maxSamples);
+  check(receipt.rows.length + sampling.dropped <= sampling.attempts);
+  let previous = null;
+  for (const item of receipt.rows) {
+    row(item);
+    if (item[0] !== null) { check(previous === null || item[0] >= previous); previous = item[0]; }
+  }
+  if (receipt.last !== null) {
+    row(receipt.last);
+    check(receipt.last[0] === null || previous === null || receipt.last[0] >= previous);
+    if (receipt.rows.length > 0) check(JSON.stringify(receipt.rows.at(-1)) === JSON.stringify(receipt.last));
+  } else check(receipt.rows.length === 0);
+  check(Array.isArray(receipt.peaks) && receipt.peaks.length === MEMORY_METRICS.length);
+  for (const item of receipt.peaks) peak(item);
+  check(Array.isArray(receipt.spacePeaks) && receipt.spacePeaks.length === MEMORY_SPACES.length);
+  for (const space of receipt.spacePeaks) { check(Array.isArray(space) && space.length === 4); for (const item of space) peak(item); }
+  if (receipt.role === "worker") check(receipt.peaks[8] === null && receipt.rssPeakSample === null);
+  if (receipt.rssPeakSample !== null) {
+    row(receipt.rssPeakSample);
+    check(receipt.role === "main" && receipt.peaks[8] !== null);
+    check(JSON.stringify([receipt.rssPeakSample[2][8], receipt.rssPeakSample[0], receipt.rssPeakSample[1]]) === JSON.stringify(receipt.peaks[8]));
+  } else check(receipt.peaks[8] === null);
+  for (const item of [...receipt.rows, ...(receipt.last === null ? [] : [receipt.last])]) {
+    item[2].forEach((value, id) => { if (value !== null) check(receipt.peaks[id] !== null && receipt.peaks[id][0] >= value); });
+    item[3].forEach((space, id) => space.forEach((value, column) => {
+      if (value !== null) check(receipt.spacePeaks[id][column] !== null && receipt.spacePeaks[id][column][0] >= value);
+    }));
+  }
+  const lastTime = receipt.last?.[0] ?? null;
+  const checkPeakTime = (value) => { if (value !== null && value[1] !== null && lastTime !== null) check(value[1] <= lastTime); };
+  receipt.peaks.forEach(checkPeakTime);
+  receipt.spacePeaks.forEach((space) => space.forEach(checkPeakTime));
+  if (sampling.errors === 0) {
+    check(receipt.rows.length >= 2 && receipt.rows[0][1] === MEMORY_PHASE.start && receipt.rows.at(-1)[1] === MEMORY_PHASE.end);
+    check(receipt.rows.length + sampling.dropped === sampling.attempts);
+  }
+  check(Buffer.byteLength(JSON.stringify(receipt)) <= sampling.maxBytes);
+  return receipt;
+}

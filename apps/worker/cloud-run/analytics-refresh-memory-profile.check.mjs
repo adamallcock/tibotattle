@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { startNumericMemory, MEMORY_PHASE } from "./analytics-refresh-memory-profile.mjs";
+import { startNumericMemory, validateNumericMemoryReceipt, MEMORY_PHASE } from "./analytics-refresh-memory-profile.mjs";
 let calls = 0;
 assert.equal(startNumericMemory({ adapters: { memory() { calls += 1; } } }), null);
 assert.equal(calls, 0);
@@ -78,3 +78,23 @@ assert.equal(cappedResult.sampling.historyTruncated, true);
 assert.equal(cappedResult.rows[0][1], MEMORY_PHASE.start);
 assert.equal(cappedResult.rows.at(-1)[1], MEMORY_PHASE.end);
 assert.ok(Buffer.byteLength(JSON.stringify(cappedResult)) <= 16_384);
+
+for (const value of [profile.finish(), invalidResult, failed.finish(), recentResult, cappedResult]) validateNumericMemoryReceipt(value);
+const rejectMutation = (mutate) => {
+  const value = structuredClone(cappedResult); mutate(value);
+  assert.throws(() => validateNumericMemoryReceipt(value), /MEMORY_PROFILE_INVALID_RECEIPT/u);
+};
+rejectMutation((value) => { value.private = "unknown"; });
+rejectMutation((value) => { value.sampling.historyTruncated = false; });
+rejectMutation((value) => { value.sampling.completeTemporalCoverage = true; });
+rejectMutation((value) => { value.rows[0][2][0] = -1; });
+rejectMutation((value) => { value.rows[0][2][0] = Infinity; });
+rejectMutation((value) => { value.rows[0][0] = value.last[0] + 1; });
+rejectMutation((value) => { value.role = "worker"; value.rssScope = "omitted"; });
+rejectMutation((value) => { value.metricNames[0] = "private"; });
+rejectMutation((value) => { value.rows[0][1] = 7; });
+rejectMutation((value) => { value.sampling.dropped = value.sampling.attempts + 1; });
+rejectMutation((value) => { value.sampling.maxBytes = 10; });
+rejectMutation((value) => { value.peaks[0][1] = value.last[0] + 1; });
+rejectMutation((value) => { value.rssPeakSample[2][8] = 1; });
+rejectMutation((value) => { value.gc.unknown = 1; });
