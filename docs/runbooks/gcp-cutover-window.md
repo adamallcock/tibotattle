@@ -335,7 +335,8 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    not quiet, bookmarks that do not match the inventory's databases, and a
    barrier proof that does not match the receipt's commit. `built`.
 3. **Seal.** Only the ingestion and deletion-ledger D1 databases are sealable;
-   the analytics D1 is never imported, because analytics history is recomputed.
+   the analytics D1 is never sealed, because analytics history is recomputed.
+   Its admin metric snapshots are the one exception, read in step 6.
 
    ```bash
    node scripts/cutover-source-seal.mjs seal --inventory <private seal inventory> \
@@ -371,17 +372,47 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    read item defines (OWN-4). `owner`; the format and the loader are `built`
    (C-IPR). The loader's table is primary migration `0065`, promoted at the
    C-SIMP-RECON merge.
+6. **Export the admin metric history from the analytics D1.** Production runs
+   typed storage (the live Worker binds `ANALYTICS_DB`, and that D1 carries the
+   typed storage ledger), which since the 2026-09-12 D1 migration captures the
+   hourly admin gauge snapshots only in the analytics D1
+   (`analytics_admin_metric_snapshots`); the sealed ingestion table stops at
+   the switch. The import maps both, so the admin charts continue without a
+   gap (round 5). This is one bounded, read-only export, not a seal. The
+   owner's private analytics source file (`0600`, schema
+   `tibotattle-cutover-analytics-source-v1`: `binding` `ANALYTICS_DB`,
+   `databaseName`, `databaseId`) must name the D1 that the EP-8 fence receipt
+   records as `analytics`:
+
+   ```bash
+   node scripts/cutover-admin-history-export.mjs export --inventory <private seal inventory> \
+     --seal <seal manifest> --seal-id <sealId> --analytics-source <private analytics source file> \
+     --fence-receipt <EP-8 verify receipt> --out <private owner directory> --execute --remote --owner-read-only
+   ```
+
+   Without `--execute --remote --owner-read-only` it is a dry run that spawns
+   nothing. Both bookmarks it reads must equal the fence receipt's analytics
+   bookmark. It checks the `0016_admin_metrics_history.sql` ledger row against
+   Git at P, reads every snapshot of the sealed source id in pages, and writes
+   `admin-history-export.json` (`0400`, never overwritten). It prints the
+   export's sha256, the snapshot count, the first and last capture instants and
+   the row count of any other source id; no id. The post-import step of H.4
+   requires the file and its sha256. `built` (D-PT4X); the provider has never
+   been contacted.
 
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
 after the fence), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
 (production's applied tail differs from the expected ledger at P, see the
 renumbering gate), `CUTOVER_SECRET_IN_OUTPUT`, `CUTOVER_OWNER_DIRECTORY_UNSAFE`.
 Each is content-free and leaves nothing behind. A bookmark drift means the
-fence was not quiet: abort and fence again.
+fence was not quiet: abort and fence again. The admin history export adds
+`CUTOVER_FENCE_SOURCE_MISMATCH` (the analytics source file names another D1)
+and `CUTOVER_ADMIN_HISTORY_VALUE_INVALID` (a stored snapshot outside the
+d43c8f92 gauge grammar); neither touches the seal.
 
 Evidence kept: the seal manifest and its sha256, the projection sha256 values,
-the frozen export's digest. Abort: Abort A. The seal is lost and a later
-attempt needs a fresh fence.
+the frozen export's digest, the admin history export's sha256. Abort: Abort A.
+The seal is lost and a later attempt needs a fresh fence.
 
 ## H.4 Import and verify
 

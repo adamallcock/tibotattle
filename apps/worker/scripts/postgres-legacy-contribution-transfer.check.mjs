@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { readCutoverSeal } from "./cutover-source-seal.mjs";
+import { CUTOVER_ADMIN_HISTORY_EXPORT_FILE, readSealedStorageSourceId } from "./cutover-admin-history-export.mjs";
+import { canonicalJson, readCutoverSeal, sha256Hex } from "./cutover-source-seal.mjs";
 import {
   LEGACY_CONTRIBUTIONS_ORDER,
   LEGACY_CONTRIBUTIONS_STAGE,
@@ -36,6 +37,12 @@ import { CHUNK_REGISTRATION_FAMILIES, TELEMETRY_PRODUCTION_DISPOSITIONS } from "
 import { PostgresTransferTargetError, TRANSFER_STAGES } from "./postgres-transfer-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import { Q1_INGESTION_DUMP } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
+import {
+  buildSyntheticAnalyticsD1,
+  exportSyntheticAdminHistory,
+  writeAnalyticsSourceFixture,
+} from "../postgres-test/fixtures/w2-seal/admin-history-fixtures.mjs";
+import { privateDirectory } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
 
 // D-PT4X contract checks without a database: the frozen column maps, order,
 // dispositions and trigger policy; the canonical value codec; every sealed-
@@ -55,6 +62,12 @@ const DISPOSITION = /^(?:(?:imported|mapped|claimed-by):[a-z][a-z0-9]*(?:-[a-z0-
 let world;
 let seal;
 let manifestPath;
+let analytics;
+let sealExport;
+// Syntactically valid admin history export arguments that name no file: the
+// sealed-source refusals must fire before the export is read.
+const UNREAD_EXPORT = Object.freeze({ adminHistoryExportPath: "/nonexistent/admin-history-export.json",
+  adminHistoryExportSha256: "0".repeat(64) });
 
 const isCode = code => error => (error instanceof LegacyContributionTransferError
   || error instanceof PostgresTransferTargetError) && error.code === code;
@@ -67,7 +80,31 @@ before(async () => {
   const result = await run.run();
   manifestPath = outputPathsOf(run.out).manifest;
   seal = await readCutoverSeal({ manifestPath, expectedSealId: result.sealId });
+  const database = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
+  let sourceId;
+  try {
+    sourceId = readSealedStorageSourceId(database).sourceId;
+  } finally {
+    database.close();
+  }
+  const directory = await privateDirectory("dpt4x-check-analytics-");
+  const start = Date.parse("2026-09-12T06:00:00.000Z");
+  analytics = {
+    path: buildSyntheticAnalyticsD1({ directory, commit: world.commit, sourceId,
+      snapshots: [0, 1, 2].map(index => [new Date(start + index * 3_600_000).toISOString(), `{"participantsTotal":${index}}`]) }),
+    sourcePath: await writeAnalyticsSourceFixture({ directory }),
+  };
+  sealExport = await exportFor({ manifestPath, sealId: result.sealId });
 });
+
+/** The analytics admin history export bound to one seal, as runner arguments. */
+async function exportFor(target) {
+  const exported = await exportSyntheticAdminHistory({ world, seal: target, analyticsPath: analytics.path,
+    analyticsSourcePath: analytics.sourcePath });
+  return Object.freeze({ adminHistoryExportPath: exported.path, adminHistoryExportSha256: exported.sha256 });
+}
+
+const exportArgs = (run, args) => (run === runOperationalHistoryProduction ? args : {});
 
 after(async () => {
   await world?.dispose();
@@ -162,11 +199,11 @@ test("arguments are closed: pages at most 256 rows and 4 MiB, a handle, a hook f
   for (const run of RUNNERS) {
     for (const options of [{ pageRows: LEGACY_TRANSFER_MAX_PAGE_ROWS + 1 }, { pageRows: 0 },
       { pageBytes: LEGACY_TRANSFER_MAX_PAGE_BYTES + 1 }, { pageBytes: 10 }, { onPage: "kill" }, { handle: null }]) {
-      await assert.rejects(run({ handle, sealManifestPath: manifestPath, ...options }),
+      await assert.rejects(run({ handle, sealManifestPath: manifestPath, ...exportArgs(run, sealExport), ...options }),
         isCode("CUTOVER_LEGACY_ARGUMENT_INVALID"), `${run.name} ${JSON.stringify(Object.keys(options))}`);
     }
-    await assert.rejects(run({ handle: { sealManifestSha256: "0".repeat(64) }, sealManifestPath: manifestPath }),
-      error => error?.code === "CUTOVER_SEAL_MANIFEST_INVALID", run.name);
+    await assert.rejects(run({ handle: { sealManifestSha256: "0".repeat(64) }, sealManifestPath: manifestPath,
+      ...exportArgs(run, sealExport) }), error => error?.code === "CUTOVER_SEAL_MANIFEST_INVALID", run.name);
   }
   for (const ownerFlags of [["accept-everything"], "x", [OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
     OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING]]) {
@@ -177,7 +214,8 @@ test("arguments are closed: pages at most 256 rows and 4 MiB, a handle, a hook f
   // A clean seal passes every source check and only then meets the target:
   // the unregistered handle is refused by PT-1 (no database was reached).
   for (const run of RUNNERS) {
-    await assert.rejects(run({ handle, sealManifestPath: manifestPath }), isCode("CUTOVER_TARGET_HANDLE_INVALID"), run.name);
+    await assert.rejects(run({ handle, sealManifestPath: manifestPath, ...exportArgs(run, sealExport) }),
+      isCode("CUTOVER_TARGET_HANDLE_INVALID"), run.name);
   }
   await assert.rejects(checkPendingObjectTransferGuard(handle), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
 });
@@ -237,14 +275,44 @@ test("every sealed-source refusal fires before the target is touched", async () 
   ];
   for (const [run, sql, code] of cases) {
     const forged = await forgeVariantSeal(seal, sql);
-    await assert.rejects(run({ handle: { sealManifestSha256: forged.sealId }, sealManifestPath: forged.manifestPath }),
-      isCode(code), `${run.name}: ${sql.slice(0, 80)}`);
+    await assert.rejects(run({ handle: { sealManifestSha256: forged.sealId }, sealManifestPath: forged.manifestPath,
+      ...exportArgs(run, UNREAD_EXPORT) }), isCode(code), `${run.name}: ${sql.slice(0, 80)}`);
   }
-  // An invalid cache contributes nothing and is reported; it is not a refusal.
+  // An invalid cache contributes nothing and is reported; it is not a refusal
+  // (its effect on the mapped rows is the PostgreSQL spec's hostile-cache case).
   const forged = await forgeVariantSeal(seal, `INSERT INTO admin_metrics_history_cache (singleton, generated_at, payload_json)
     VALUES (1, '${instant}', '{"schemaVersion":"admin-metrics-history-v0.2","gauges":{"snapshots":[]}}')`);
   await assert.rejects(runOperationalHistoryProduction({ handle: { sealManifestSha256: forged.sealId },
-    sealManifestPath: forged.manifestPath }), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
+    sealManifestPath: forged.manifestPath, ...await exportFor(forged) }), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
+});
+
+test("the operational history needs an analytics export bound to its seal, read after the sealed checks and before the target", async () => {
+  const handle = { sealManifestSha256: seal.manifest.sealId };
+  const run = args => runOperationalHistoryProduction({ handle, sealManifestPath: manifestPath, ...args });
+  for (const args of [{}, { adminHistoryExportPath: sealExport.adminHistoryExportPath },
+    { ...sealExport, adminHistoryExportSha256: "x" }, { ...sealExport, adminHistoryExportPath: 5 },
+    { ...sealExport, adminHistoryExportPath: "" }]) {
+    await assert.rejects(run(args), isCode("CUTOVER_LEGACY_ARGUMENT_INVALID"), JSON.stringify(Object.keys(args)));
+  }
+  await assert.rejects(run(UNREAD_EXPORT), isCode("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID"));
+  await assert.rejects(run({ ...sealExport, adminHistoryExportSha256: "0".repeat(64) }),
+    isCode("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID"));
+  // A valid export of another seal (same inventory, fence and source) is refused.
+  const other = await forgeVariantSeal(seal, `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)
+    VALUES ('2026-09-01T00:00:00.000Z', '{}')`);
+  assert.notEqual(other.sealId, seal.manifest.sealId);
+  await assert.rejects(run(await exportFor(other)), isCode("CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH"));
+  // A valid export whose binding names another inventory, fence receipt or source.
+  const original = JSON.parse(await readFile(sealExport.adminHistoryExportPath, "utf8"));
+  const directory = await privateDirectory("dpt4x-check-rebound-");
+  for (const field of ["inventorySha256", "fenceReceiptSha256", "sourceIdSha256"]) {
+    const text = `${canonicalJson({ ...original, [field]: sha256Hex(`other-${field}`) })}\n`;
+    const path = join(directory, `${field}-${CUTOVER_ADMIN_HISTORY_EXPORT_FILE}`);
+    await writeFile(path, text, { mode: 0o600, flag: "wx" });
+    await assert.rejects(run({ adminHistoryExportPath: path, adminHistoryExportSha256: sha256Hex(text) }),
+      isCode("CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH"), field);
+  }
+  await assert.rejects(run(sealExport), isCode("CUTOVER_TARGET_HANDLE_INVALID"));
 });
 
 test("the E-PT4 guard is pinned to the reconciler and the staged migrations", async () => {
