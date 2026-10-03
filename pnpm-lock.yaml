@@ -14,6 +14,7 @@ overrides:
 
 patchedDependencies:
   app-builder-lib@26.15.7: 5821cdf7573fa16696c7b0440c919f360393e91520a42fd81360eb6a5de555b8
+  http-cache-semantics@4.2.0: 6e7076d25b3bdb7a6e9cd709a5d6f63c3b9f0d9308f12659b2dddb08dc904a93
 
 importers:
 
@@ -1520,7 +1521,7 @@ snapshots:
     dependencies:
       clone-response: 1.0.3
       get-stream: 5.2.0
-      http-cache-semantics: 4.2.0
+      http-cache-semantics: 4.2.0(patch_hash=6e7076d25b3bdb7a6e9cd709a5d6f63c3b9f0d9308f12659b2dddb08dc904a93)
       keyv: 4.5.4
       lowercase-keys: 2.0.0
       normalize-url: 6.1.0
@@ -1921,7 +1922,7 @@ snapshots:
     dependencies:
       lru-cache: 6.0.0
 
-  http-cache-semantics@4.2.0: {}
+  http-cache-semantics@4.2.0(patch_hash=6e7076d25b3bdb7a6e9cd709a5d6f63c3b9f0d9308f12659b2dddb08dc904a93): {}
 
   http-proxy-agent@7.0.2:
     dependencies:
