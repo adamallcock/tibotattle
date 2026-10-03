@@ -5,13 +5,14 @@
  * entry "postgres-maintenance-job" -> dist/postgres-maintenance-job.mjs).
  *
  * One execution runs one runPostgresLifecyclePass
- * (src/postgres-lifecycle-pass.ts) for the current one-minute cycle: the
- * lifecycle row, one bounded page of each scheduled identity and
- * device-lifecycle purge (MAINT-PURGE), then one page of up to 100 quarantine
- * registrations (the Worker's batch), under the shared maintenance advisory
- * lock and the primary migration fence. That pass is what lets GET /api/ready on the origin read
- * 'ready' (owner decision OD-CR-4). It is a separate workload from the
- * request-serving origin: it has no HOST_MODE and serves nothing.
+ * (src/postgres-lifecycle-pass.ts) for the current one-minute cycle, in the
+ * Worker's order: one bounded page of each scheduled identity and
+ * device-lifecycle purge (MAINT-PURGE), the lifecycle row, then one page of
+ * up to 100 quarantine registrations (the Worker's batch), under the shared
+ * maintenance advisory lock and the primary migration fence. That pass is
+ * what lets GET /api/ready on the origin read 'ready' (owner decision
+ * OD-CR-4). It is a separate workload from the request-serving origin: it
+ * has no HOST_MODE and serves nothing.
  *
  * Schedule (the D-OPS4 trigger contract): every minute,
  * POSTGRES_MAINTENANCE_JOB_SCHEDULE ('* * * * *'), the d43c8f92 Worker cron.

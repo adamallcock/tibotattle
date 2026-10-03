@@ -382,6 +382,45 @@ test("the pass rejects malformed options before any connection", async () => {
   assert.equal(connects, 1);
 });
 
+test("the identity purge policy rejects malformed options before any connection", async () => {
+  // purgePostgresExpiredIdentityRows (MAINT-PURGE) is exported for the pass and
+  // the scheduled slice; a refusal must never take a connection.
+  const maintenance = await vite.ssrLoadModule("/src/postgres-maintenance.ts");
+  const { PostgresStorageError } = await vite.ssrLoadModule("/src/postgres-client.ts");
+  let connects = 0;
+  const pool = { async connect() { connects += 1; throw new Error("unreachable"); } };
+  const valid = { nowEpoch: Date.parse("2026-10-02T12:00:00.000Z") };
+  const invalid = [
+    ["no pool", null, valid],
+    ["undefined pool", undefined, valid],
+    ["a pool without connect", {}, valid],
+    ["a non-function connect", { connect: 1 }, valid],
+    ["null options", pool, null],
+    ["undefined options", pool, undefined],
+    ["string options", pool, "options"],
+    ["number options", pool, 5],
+    ["no nowEpoch", pool, {}],
+    ["a negative nowEpoch", pool, { nowEpoch: -1 }],
+    ["a fractional nowEpoch", pool, { nowEpoch: 1.5 }],
+    ["a string nowEpoch", pool, { nowEpoch: "0" }],
+    ["a NaN nowEpoch", pool, { nowEpoch: Number.NaN }],
+    ["a nowEpoch past the 13-digit bound", pool, { nowEpoch: 10_000_000_000_000 }],
+    ["an unquoted schema name", pool, { ...valid, schema: { primarySchema: "Bad-Schema" } }],
+    ["a reserved schema", pool, { ...valid, schema: { primarySchema: "pg_catalog" } }],
+    ["a non-object schema", pool, { ...valid, schema: "origin_primary" }],
+  ];
+  for (const [label, candidate, options] of invalid) {
+    await assert.rejects(maintenance.purgePostgresExpiredIdentityRows(candidate, options), (error) =>
+      error instanceof PostgresStorageError && error.code === "invalid"
+        && error.operation === "maintenance.options", label);
+  }
+  assert.equal(connects, 0, "no refusal took a connection");
+  // Valid options reach the pool; its failure is a storage error, not a refusal.
+  await assert.rejects(maintenance.purgePostgresExpiredIdentityRows(pool, valid), (error) =>
+    error instanceof PostgresStorageError && error.code === "unavailable");
+  assert.equal(connects, 1);
+});
+
 test("a migration holding the fence skips the pass after the maintenance lock, which is released", async () => {
   const statements = [];
   const releases = [];

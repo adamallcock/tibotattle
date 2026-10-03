@@ -19,7 +19,9 @@
 // request (TTL 0) and refuses a drifted or newer schema; unported routes and
 // the admin host answer the closed 503 under the edge's request id with no
 // retry-after; the contribution path takes and releases an ingress lease;
-// and every log line is the closed shape without request content.
+// the admin run_maintenance task reports and audits the lifecycle pass's
+// folded purges under the Worker's keys (MAINT-PURGE); and every log line is
+// the closed shape without request content.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -534,4 +536,145 @@ test("log lines: the closed request line and the refusal line, without request c
     for (const value of Object.values(INJECTED)) assert.ok(!line.includes(value), `no ${value} in ${line}`);
     assert.ok(!line.includes("stranger@"), `no account in ${line}`);
   }
+}));
+
+test("admin run_maintenance reports and audits the folded purges under the Worker's keys", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ base, t, primarySchema, objectStore, m }) => {
+  const adminConsole = await vite.ssrLoadModule("/cloud-run/routes/admin-console.mjs");
+  const adminAction = await vite.ssrLoadModule("/cloud-run/routes/admin-action.mjs");
+  const { createRequestContextStore } = await vite.ssrLoadModule("/cloud-run/postgres-request-context.mjs");
+  const owner = "owner@synthetic.example";
+  const adminOrigin = "https://admin.synthetic.example";
+  const now = Date.now();
+  // Two admin cycles in the past, so the pass's completion clock (the real
+  // clock) is never before its cycle.
+  const firstAt = now - 2 * 60_000;
+  const secondAt = now - 60_000;
+  let adminNow = firstAt;
+
+  // Synthetic, content-free rows past each cutoff: two expired handoffs per
+  // provider, one sign-in window past the 24 h retention, and one unused
+  // pairing more than the device-lifecycle page of 250.
+  const expired = new Date(now - 10 * 60_000).toISOString();
+  const issued = new Date(now - 20 * 60_000).toISOString();
+  const states = [randomUUID(), randomUUID()].map((id) => `synthetic-admin-maint-${id}`);
+  await base.query(`INSERT INTO ${t("apple_signin_handoffs")} (state, nonce_hash, created_at, expires_at)
+    SELECT seed.state, $2, $3::timestamptz, $4::timestamptz FROM unnest($1::text[]) AS seed(state)`,
+  [states, "a".repeat(64), issued, expired]);
+  await base.query(`INSERT INTO ${t("google_signin_handoffs")} (state, created_at, expires_at)
+    SELECT seed.state, $2::timestamptz, $3::timestamptz FROM unnest($1::text[]) AS seed(state)`,
+  [states, issued, expired]);
+  const agedWindow = new Date(now - 25 * 60 * 60_000).toISOString();
+  await base.query(`INSERT INTO ${t("sign_in_start_admission_windows")}
+      (window_started_at, accepted_count, last_accepted_at)
+    VALUES ($1::timestamptz, 1, $1::timestamptz)`, [agedWindow]);
+  const participant = `synthetic-admin-maint-participant-${randomUUID()}`;
+  const session = `synthetic-admin-maint-session-${randomUUID()}`;
+  await base.query(`INSERT INTO ${t("participants")} (id, owner_kind, state, created_at)
+    VALUES ($1, 'social', 'active', $2::timestamptz)`, [participant, issued]);
+  await base.query(`INSERT INTO ${t("web_sessions")}
+      (id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at)
+    VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $5::timestamptz)`,
+  [session, participant, randomBytes(32), randomBytes(32), issued, new Date(now + 60 * 60_000).toISOString()]);
+  const pairings = Array.from({ length: 251 }, () => `synthetic-admin-maint-pairing-${randomUUID()}`);
+  await base.query(`INSERT INTO ${t("device_pairings")} (
+      id, participant_id, issued_by_session_id, secret_hash, consent_version,
+      transport_consent_version, state, issued_at, expires_at)
+    SELECT seed.id, $2, $3, seed.secret, 'privacy-safe-telemetry-v0.1', 'privacy-safe-telemetry-v0.1',
+      'unused', $4::timestamptz, $5::timestamptz
+      FROM unnest($1::text[], $6::bytea[]) AS seed(id, secret)`,
+  [pairings, participant, session, issued, expired, pairings.map(() => randomBytes(32))]);
+
+  const store = createRequestContextStore();
+  const handlers = adminConsole.createAdminConsoleHandlers({
+    requestContext: store.accessor,
+    clock: () => adminNow,
+    env: Object.freeze({ ENVIRONMENT: "production", TELEMETRY_STORAGE_NAMESPACE: NAMESPACE }),
+    pools: { primary: base },
+    schemaOptions: { primarySchema },
+    maintenance: m.host.createLifecyclePassMaintenance({ pool: base, objectStore, primarySchema }),
+  });
+  const runMaintenance = async () => {
+    const response = await store.dispatch(new Request(`${adminOrigin}/api/v1/admin/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: adminOrigin, "x-usage-monitor-admin": "1" },
+      body: JSON.stringify({ action: "run_maintenance" }),
+    }), { requestId: randomUUID(), routeId: "admin_action", adminIdentityKey: owner },
+    handlers.get("admin_action"));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.schemaVersion, "admin-action-v0.1");
+    assert.equal(body.action, "run_maintenance");
+    const audit = await base.query(`SELECT outcome, details_json FROM ${t("admin_action_audit")}
+      WHERE action = 'run_maintenance' ORDER BY id DESC LIMIT 1`);
+    assert.equal(audit.rows[0].outcome, "success");
+    return { result: body.result, details: JSON.parse(audit.rows[0].details_json) };
+  };
+  const countRows = async () => (await base.query(`SELECT
+      (SELECT count(*) FROM ${t("apple_signin_handoffs")})::int AS apple,
+      (SELECT count(*) FROM ${t("google_signin_handoffs")})::int AS google,
+      (SELECT count(*) FROM ${t("sign_in_start_admission_windows")})::int AS windows,
+      (SELECT count(*) FROM ${t("device_pairings")} WHERE state = 'unused')::int AS unused`)).rows[0];
+
+  // The first run purges and reports each part under the Worker's keys, in
+  // the Worker's order. The device-lifecycle backlog (one pairing beyond the
+  // page) does not enter the Worker's completeness: the code stays OK.
+  const first = await runMaintenance();
+  assert.deepEqual(first.result, {
+    code: "OK",
+    lifecycleComplete: true,
+    quarantineRetentionComplete: true,
+    restoreReplayComplete: true,
+    quarantineReconciliationComplete: true,
+    expiredIdentityHandoffsPurged: 4,
+    expiredIdentityHandoffPurgeComplete: true,
+    expiredDeletionTombstonesPurged: 0,
+    deletionTombstonePurgeComplete: true,
+    expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+    primaryIdentityReenrollmentCooldownPurgeComplete: true,
+    expiredIdentityReenrollmentCooldownsPurged: 0,
+    identityReenrollmentCooldownPurgeComplete: true,
+    expiredSignInAdmissionsPurged: 1,
+    signInAdmissionPurgeComplete: true,
+    staleDevicePairingsRevoked: 250,
+    staleDeviceCredentialsRevoked: 0,
+    staleDeviceUploadAuthorizationsRevoked: 0,
+    expiredDeviceCredentialRotationsPurged: 0,
+    expiredDevicePairingEventsPurged: 0,
+    aggregateRebuildComplete: false,
+    aggregateRebuildDelegated: true,
+    publicationEnabled: null,
+  });
+  assert.deepEqual(Object.keys(first.result).slice(0, 7), ["code", "lifecycleComplete",
+    "quarantineRetentionComplete", "restoreReplayComplete", "quarantineReconciliationComplete",
+    "expiredIdentityHandoffsPurged", "expiredIdentityHandoffPurgeComplete"], "the Worker's key order");
+  // The success audit records every Worker audit field, the purge among them.
+  assert.deepEqual(Object.keys(first.details), [...adminAction.RUN_MAINTENANCE_AUDIT_FIELDS]);
+  assert.equal(first.details.code, "OK");
+  assert.equal(first.details.expiredIdentityHandoffsPurged, 4);
+  assert.equal(first.details.expiredIdentityHandoffPurgeComplete, true);
+  assert.deepEqual(await countRows(), { apple: 0, google: 0, windows: 0, unused: 1 });
+
+  // The same minute is the cycle already complete: no purge ran, so the purge
+  // keys are absent from the result and the audit, never reported as done.
+  const repeat = await runMaintenance();
+  assert.equal(repeat.result.code, "OK");
+  for (const key of ["expiredIdentityHandoffsPurged", "expiredIdentityHandoffPurgeComplete",
+    "expiredSignInAdmissionsPurged", "signInAdmissionPurgeComplete", "staleDevicePairingsRevoked"]) {
+    assert.equal(Object.hasOwn(repeat.result, key), false, key);
+    assert.equal(Object.hasOwn(repeat.details, key), false, key);
+  }
+  assert.deepEqual(await countRows(), { apple: 0, google: 0, windows: 0, unused: 1 });
+
+  // The next cycle drains the device backlog.
+  adminNow = secondAt;
+  const next = await runMaintenance();
+  assert.equal(next.result.code, "OK");
+  assert.equal(next.result.expiredIdentityHandoffsPurged, 0);
+  assert.equal(next.result.expiredIdentityHandoffPurgeComplete, true);
+  assert.equal(next.result.staleDevicePairingsRevoked, 1);
+  assert.equal(next.details.expiredIdentityHandoffsPurged, 0);
+  assert.deepEqual(await countRows(), { apple: 0, google: 0, windows: 0, unused: 0 });
+  assert.doesNotMatch(JSON.stringify([first, repeat, next]), /synthetic-admin-maint|owner@/u, "content-free");
 }));

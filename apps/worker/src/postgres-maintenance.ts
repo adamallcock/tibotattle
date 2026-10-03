@@ -92,6 +92,18 @@ export interface PostgresIdentityPurgeReceipt {
   readonly complete: boolean;
 }
 
+/**
+ * The identity purge's receipt: the combined totals (purged, complete) and
+ * each of its two parts, which the Worker reports under separate keys
+ * (expiredIdentityHandoffs* and expiredSignInAdmissions*).
+ */
+export interface PostgresExpiredIdentityPurgeReceipt extends PostgresIdentityPurgeReceipt {
+  /** Expired Apple and Google sign-in handoffs, one page of 100 per provider. */
+  readonly handoffs: PostgresIdentityPurgeReceipt;
+  /** Sign-in admission windows past the 24-hour retention, one page of 1,000. */
+  readonly signInAdmissions: PostgresIdentityPurgeReceipt;
+}
+
 export interface PostgresScheduledMaintenanceResult {
   readonly outcome: "partial" | "skipped" | "failure";
   readonly code: string;
@@ -229,25 +241,37 @@ export interface PostgresIdentityPurgeOptions {
  * the 24-hour retention (1,000). Each page deletes only rows past its cutoff,
  * skips rows another transaction holds, and reports complete only when a
  * readback finds nothing left past the cutoff, so a replay purges nothing
- * twice and a backlog drains across runs. Invalid options throw before any
- * connection.
+ * twice and a backlog drains across runs. The receipt carries the handoff
+ * and sign-in window parts separately, as the Worker reports them.
+ *
+ * Invalid options (no pool, a pool without connect, options that are not an
+ * object, a nowEpoch outside 0 to 9,999,999,999,999 whole milliseconds, or
+ * an invalid schema) throw PostgresStorageError('invalid',
+ * 'maintenance.options') before any connection is taken.
  */
 export async function purgePostgresExpiredIdentityRows(
   pool: PostgresPool,
   options: PostgresIdentityPurgeOptions,
-): Promise<PostgresIdentityPurgeReceipt> {
+): Promise<PostgresExpiredIdentityPurgeReceipt> {
   if (!pool || typeof pool.connect !== "function" || !options || typeof options !== "object") {
     return invalidOptions();
   }
-  const schema = safeSchema(options.schema);
   const nowEpoch = validateNow(options.nowEpoch);
+  let schema: ReturnType<typeof safeSchema>;
+  try {
+    schema = safeSchema(options.schema);
+  } catch {
+    return invalidOptions();
+  }
   const handoffs = await purgeSpecs(pool, schema.primary, IDENTITY_PURGES.slice(0, 2),
     new Date(nowEpoch).toISOString());
-  const admission = await purgePage(pool, schema.primary, IDENTITY_PURGES[2]!,
+  const signInAdmissions = await purgePage(pool, schema.primary, IDENTITY_PURGES[2]!,
     new Date(nowEpoch - POSTGRES_SIGNIN_ADMISSION_RETENTION_MILLISECONDS).toISOString());
   return Object.freeze({
-    purged: handoffs.purged + admission.purged,
-    complete: handoffs.complete && admission.complete,
+    purged: handoffs.purged + signInAdmissions.purged,
+    complete: handoffs.complete && signInAdmissions.complete,
+    handoffs,
+    signInAdmissions,
   });
 }
 
@@ -374,10 +398,12 @@ export async function runPostgresScheduledMaintenance(
   try {
     const locked = await withSessionLock(options.primaryPool, async () => {
       leaseAcquired = true;
-      primary = await purgePostgresExpiredIdentityRows(options.primaryPool, {
+      const identity = await purgePostgresExpiredIdentityRows(options.primaryPool, {
         schema: options.schema,
         nowEpoch,
       });
+      // This slice reports the combined identity totals only (its shape is unchanged).
+      primary = Object.freeze({ purged: identity.purged, complete: identity.complete });
       deviceLifecycle = await purgePostgresStaleDeviceLifecycleRows(options.primaryPool, {
         schema: options.schema,
         nowEpoch,
