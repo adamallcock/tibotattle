@@ -824,7 +824,9 @@ test("semi-space (R19 SEMI): the young generation a larger semi-space adds is no
   // 12,480 MiB with the flag, 12,336 MiB without): the output budget is the
   // pre-flag 351 MiB either way, the old space and 48 MiB less the budget and
   // the reserves.
-  const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  const { REFRESH_JOB_PROFILES } = await import("../scripts/gcp-fastpath-test-deploy.mjs");
+  const profile = { ...REFRESH_JOB_PROFILES.dense, memoryBudgetMiB: 10_752,
+    args: ["--max-old-space-size=12288", "--max-semi-space-size=64"] };
   const env = { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) };
   const nodeFlags = profile.args.slice(0, 2);
   const withSemi = job.analyticsRefreshResources(env, 12_480 * MIB, { execArgv: nodeFlags });
@@ -851,14 +853,17 @@ test("semi-space (R19 SEMI): the young generation a larger semi-space adds is no
   }
   assert.equal(job.analyticsRefreshResources(env, 12_312 * MIB, { execArgv: ["--max-old-space-size=12288",
     "--max-semi-space-size=8"] }).compute.outputBudgetBytes, expected - 24 * MIB);
-  // dense-workers (K-PAR, four Workers, a 3,072 MiB main heap, no semi-space
-  // flag) keeps its pre-R19 runtime output budget under its real flags.
+  // dense-workers has four Workers, the default main heap, and no process-wide V8 flags.
+  // Its output budget remains the whole main heap less the same runtime reserves.
   const parallelEnv = { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) };
-  const parallel = job.analyticsRefreshResources(parallelEnv, (3_072 + 48) * MIB,
-    { workers: 4, execArgv: ["--max-old-space-size=3072"] });
+  const parallel = job.analyticsRefreshResources(parallelEnv, job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB * MIB,
+    { workers: 4, execArgv: [] });
   assert.equal(parallel.compute.outputBudgetBytes,
-    job.analyticsRefreshResources(parallelEnv, (3_072 + 48) * MIB, { workers: 4 }).compute.outputBudgetBytes);
-  assert.equal(parallel.compute.outputBudgetBytes, (3_072 + 48 - 256) * MIB - 250_000 * 4_096);
+    job.analyticsRefreshResources(parallelEnv, job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB * MIB, { workers: 4 }).compute.outputBudgetBytes);
+  assert.equal(parallel.compute.outputBudgetBytes, (job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB - 256) * MIB - 250_000 * 4_096);
+  assert.throws(() => job.analyticsRefreshResources(parallelEnv, job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB * MIB,
+    { workers: 4, execArgv: ["--max-semi-space-size=64"] }),
+    { code: "ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN" });
   // NODE_OPTIONS declarations count, the command line after them.
   assert.equal(job.analyticsRefreshResources({ ...env, NODE_OPTIONS: "--max-old-space-size=12288" }, 12_480 * MIB)
     .youngGenerationBytes, 192 * MIB);
@@ -938,8 +943,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 73,
-      "the 73-migration primary chain, 0059, the run stamps, the revision floor, the price cards and the owner sets staged or promoted");
+    assert.equal(stock.length + stagedCount, 74,
+      "the 74-migration primary chain, 0059, the run stamps, the revision floor, the price cards and the owner sets staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -952,13 +957,16 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     // The contract's tables, and REV-SEED's revision floor, which the store
     // names (it decides no kernel value, so it stays out of contract.ts).
     assert.deepEqual(tables.rows.map((row) => row.name), [...Object.values(contract.ANALYTICS_V2_TABLES),
-      ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES)].sort());
+      ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES),
+      ...Object.values(store.ANALYTICS_V2_PRICING_CLASS_TABLES)].sort());
     const described = [
       ...Object.entries(contract.ANALYTICS_V2_TABLES).map(([key, table]) => [table,
         contract.ANALYTICS_V2_COLUMNS[key], contract.ANALYTICS_V2_PRIMARY_KEYS[key]]),
       ...Object.entries(store.ANALYTICS_V2_REVISION_FLOOR_TABLES).map(([key, table]) => [table,
         store.ANALYTICS_V2_REVISION_FLOOR_COLUMNS[key], store.ANALYTICS_V2_REVISION_FLOOR_PRIMARY_KEYS[key]]),
     ];
+    described.push(...Object.entries(store.ANALYTICS_V2_PRICING_CLASS_TABLES).map(([key, table]) => [table,
+      store.ANALYTICS_V2_PRICING_CLASS_COLUMNS[key], store.ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS[key]]));
     for (const [table, expectedColumns, expectedKey] of described) {
       const columns = await pool.query(
         `SELECT column_name::text AS name FROM information_schema.columns

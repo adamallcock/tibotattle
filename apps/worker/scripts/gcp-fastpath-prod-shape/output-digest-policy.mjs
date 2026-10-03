@@ -40,14 +40,15 @@ export function semanticOutputRow(table, row) {
   return Object.fromEntries(Object.entries(row).filter(([key]) => !omitted.has(key)));
 }
 /** Validate projected-out stamps before hashing; a wrong stamp cannot disappear. Fresh-run schemas only. */
-export async function assertOutputProvenance(pool, schema, { kernelId, computeSha256, manifestVersion = 1 } = {}) {
+export async function assertOutputProvenance(pool, schema, { kernelId, computeSha256, manifestVersion = 1, expectedRunCount = 1 } = {}) {
   if (!identifier.test(schema) || ![4, 5].includes(kernelId) || !/^[0-9a-f]{64}$/u.test(computeSha256)
-      || !Number.isSafeInteger(manifestVersion) || manifestVersion < 1) fail("MEAS_OUTPUT_PROVENANCE_BINDING_INVALID");
+      || !Number.isSafeInteger(manifestVersion) || manifestVersion < 1
+      || !Number.isSafeInteger(expectedRunCount) || expectedRunCount < 1 || expectedRunCount > 2) fail("MEAS_OUTPUT_PROVENANCE_BINDING_INVALID");
   const q = `"${schema}"`;
   const checks = [
     ["required", `SELECT CASE WHEN (SELECT count(*) FROM ${q}.analytics_v2_kernels) = 1
       AND (SELECT count(*) FROM ${q}.analytics_v2_kernel_prices) = 1
-      AND (SELECT count(*) FROM ${q}.analytics_v2_runs) = 1 THEN 0 ELSE 1 END AS mismatches`, []],
+      AND (SELECT count(*) FROM ${q}.analytics_v2_runs) = $1 THEN 0 ELSE 1 END AS mismatches`, [expectedRunCount]],
     ["kernel", `SELECT count(*)::int AS mismatches FROM ${q}.analytics_v2_kernels
       WHERE kernel_id IS DISTINCT FROM $1`, [kernelId]],
     ["compute", `SELECT count(*)::int AS mismatches FROM ${q}.analytics_v2_kernel_prices
@@ -102,7 +103,7 @@ export async function assertOutputProvenance(pool, schema, { kernelId, computeSh
     const result = await pool.query(sql, args);
     if (result.rows.length !== 1 || Number(result.rows[0].mismatches) !== 0) fail(`MEAS_OUTPUT_PROVENANCE_INVALID:${label}`);
   }
-  return { kernelId, computeSha256, manifestVersion, pricingClassTables: classCount, checks: checks.length };
+  return { kernelId, computeSha256, manifestVersion, expectedRunCount, pricingClassTables: classCount, checks: checks.length };
 }
 /** Content-free evidence: raw full-row digests plus separately scoped semantic projections. */
 export async function collectOutputDigestEvidence(pool, schema, binding) {

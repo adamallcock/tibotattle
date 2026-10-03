@@ -53,6 +53,8 @@ import {
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 
+import { cloudRunBuildPlugins } from "../cloud-run/node-host-build.mjs";
+
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLOUD_RUN_ROOT = join(WORKER_ROOT, "cloud-run");
 const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
@@ -708,7 +710,7 @@ async function buildRefreshJob({ outdir, edits = new Map(), next = false, pricer
     const edit = all.get(path);
     return edit === undefined ? bytes : Buffer.from(edit(Buffer.from(bytes).toString("utf8")), "utf8");
   };
-  const options = jobBuildOptions(outdir, [plugin]);
+  const options = jobBuildOptions(outdir, [...cloudRunBuildPlugins(WORKER_ROOT), plugin]);
   const identityOf = () => computeAnalyticsKernelIdentity({ build: esbuild.build, options, vendorRoot: VENDOR_ROOT,
     cwd: CLOUD_RUN_ROOT, read });
   const identity = await identityOf();

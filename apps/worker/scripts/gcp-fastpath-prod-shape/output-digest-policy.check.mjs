@@ -42,3 +42,10 @@ test("raw provenance is retained beside each semantic digest, including all thre
     assert.equal(result.tables[table].semanticSha256, "b".repeat(64));
   }
 });
+
+test("Q1's explicit two completed runs keep all stamp checks; unbounded counts refuse", async () => {
+  const result = await assertOutputProvenance(pool(), "synthetic", { ...binding, expectedRunCount: 2 });
+  assert.equal(result.expectedRunCount, 2);
+  await assert.rejects(assertOutputProvenance(pool({ bad: "state <>" }), "synthetic", { ...binding, expectedRunCount: 2 }), { code: "MEAS_OUTPUT_PROVENANCE_INVALID:run" });
+  await assert.rejects(assertOutputProvenance(pool(), "synthetic", { ...binding, expectedRunCount: 3 }), { code: "MEAS_OUTPUT_PROVENANCE_BINDING_INVALID" });
+});

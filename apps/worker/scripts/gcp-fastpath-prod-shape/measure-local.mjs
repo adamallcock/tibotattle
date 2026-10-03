@@ -71,6 +71,7 @@ import { fastpathRehearsalSchemas } from "../gcp-fastpath-rehearsal.mjs";
 import { REFRESH_JOB_PROFILES } from "../gcp-fastpath-test-deploy.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../postgres-migrations.mjs";
 import { importProdShapeCorpus, readProdShapeCorpus } from "./import-corpus.mjs";
+import { collectOutputDigestEvidence, OUTPUT_DIGEST_POLICY } from "./output-digest-policy.mjs";
 import { PROD_SHAPE_REFRESH_NOW } from "./prod-shape-corpus.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -83,7 +84,7 @@ const PRIVATE_SOCKET = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const DATABASE = /^meas_synth_[0-9a-f]{8}$/u;
 /** The production task profile (cloud-run/analytics-refresh.mjs ANALYTICS_REFRESH_PRODUCTION_JOB, "dense"). */
 export const PRODUCTION_PROFILE = Object.freeze({ cpu: 4, memoryGiB: 16, heapMiB: 12_288, budgetMiB: 10_752,
-  taskTimeoutSeconds: 14_400 });
+  taskTimeoutSeconds: 86_400 });
 /** The refresh task profiles this measurement runs locally (the test-deploy wrapper's, by name). */
 export const MEASURE_PROFILES = Object.freeze(["dense", "dense-workers"]);
 
@@ -95,18 +96,11 @@ export function measureProfile(name) {
   if (profile.memory !== "16Gi" || profile.cpu !== 4 || budget !== String(PRODUCTION_PROFILE.budgetMiB)) {
     fail("MEAS_SYNTH_PROFILE_INVALID", name);
   }
-  return Object.freeze({ name, cpu: profile.cpu, memoryGiB: 16, heapMiB: profile.heapMiB,
+  return Object.freeze({ name, cpu: profile.cpu, memoryGiB: 16, heapMiB: profile.heapMiB, semiSpaceMiB: profile.semiSpaceMiB,
     budgetMiB: PRODUCTION_PROFILE.budgetMiB, workers: profile.workers, taskTimeoutSeconds: profile.taskTimeoutSeconds });
 }
 
-/**
- * The columns an output digest leaves out: the run's identity, the kernel
- * stamps and wall-clock instants. Everything else a run stores is compared.
- */
-export const OUTPUT_DIGEST_VOLATILE_KEYS = Object.freeze(["run_id", "kernel_id", "manifest_version", "released_at",
-  "computed_at", "started_at", "finished_at", "registered_at", "timings", "compatibility_sha256"]);
-/** Run-level tables, which hold one row per run and are not outputs to compare. */
-const OUTPUT_DIGEST_SKIPPED_TABLES = new Set(["analytics_v2_runs", "analytics_v2_kernels"]);
+export { OUTPUT_DIGEST_POLICY };
 
 function fail(code, detail) {
   throw Object.assign(new Error(detail === undefined ? code : `${code}: ${detail}`), { code });
@@ -223,7 +217,8 @@ export function profileLines(text) {
 
 /** The job's arguments under a profile (the wrapper's refreshJobCommand order). */
 export function refreshArguments(profile, schema) {
-  return [`--max-old-space-size=${profile.heapMiB}`, DIST_REFRESH, "--mode=full", `--now=${PROD_SHAPE_REFRESH_NOW}`,
+  return [...(profile.heapMiB === null ? [] : [`--max-old-space-size=${profile.heapMiB}`]),
+    ...(profile.semiSpaceMiB === null ? [] : [`--max-semi-space-size=${profile.semiSpaceMiB}`]), DIST_REFRESH, "--mode=full", `--now=${PROD_SHAPE_REFRESH_NOW}`,
     `--schema=${schema}`, ...(profile.workers > 1 ? [`--workers=${profile.workers}`] : [])];
 }
 
@@ -373,24 +368,22 @@ export async function outputSizes(pool, schema) {
       payloadBytes: Number(payloads.rows[0].bytes), maxPayloadBytes: payloads.rows[0].max_bytes } };
 }
 
-/**
- * A content digest of every output table: sha256 over the sorted md5 of each
- * row's JSON with OUTPUT_DIGEST_VOLATILE_KEYS removed. Equal digests mean the
- * same stored rows, whatever the run's identity, stamps or clock instants.
- */
-export async function outputDigests(pool, schema) {
-  const tables = await pool.query(`SELECT c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = $1 AND c.relkind = 'r' AND c.relname LIKE 'analytics_v2%' ORDER BY c.relname`, [schema]);
-  const out = {};
-  for (const { name } of tables.rows) {
-    if (OUTPUT_DIGEST_SKIPPED_TABLES.has(name)) continue;
-    const result = await pool.query(`SELECT count(*)::bigint AS rows,
-        encode(sha256(convert_to(COALESCE(string_agg(h, '' ORDER BY h), ''), 'UTF8')), 'hex') AS sha256
-      FROM (SELECT md5((to_jsonb(t) - $1::text[])::text) AS h FROM "${schema}"."${name}" t) s`,
-    [OUTPUT_DIGEST_VOLATILE_KEYS]);
-    out[name] = { rows: Number(result.rows[0].rows), sha256: result.rows[0].sha256 };
-  }
-  return out;
+/** Source-bound fresh-run evidence; callers must supply exact kernel and compute-class identity. */
+export async function outputDigests(pool, schema, binding) {
+  const evidence = await collectOutputDigestEvidence(pool, schema, binding);
+  return Object.fromEntries(Object.entries(evidence.tables).filter(([, table]) => table.semanticSha256 !== null)
+    .map(([name, table]) => [name, { rows: table.rows, sha256: table.semanticSha256 }]));
+}
+
+async function expectedOutputBinding() {
+  const { stdout } = await execFileAsync(process.execPath, [join(CLOUD_RUN_ROOT, "build.mjs"), "--kernel-closure"],
+    { cwd: CLOUD_RUN_ROOT, maxBuffer: 4 * 1024 * 1024 });
+  const identity = JSON.parse(stdout.trim()).kernel;
+  const registry = JSON.parse(await readFile(join(WORKER_ROOT, "src/analytics-v2/kernel-registry.json"), "utf8"));
+  const matches = registry.kernels.filter((entry) => entry.computeClosureSha256 === identity.computeClosureSha256
+    && entry.vendorManifestSha256 === identity.vendorManifestSha256);
+  if (matches.length !== 1) fail("MEAS_OUTPUT_PROVENANCE_BINDING_INVALID");
+  return { kernelId: matches[0].kernelId, computeSha256: identity.computeSha256, manifestVersion: 1 };
 }
 
 /**
@@ -503,7 +496,10 @@ async function main() {
       cpuProfileUs: options.cpuProfileUs, cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, profile: run.profileLines.at(-1) ?? null, profileLines: run.profileLines };
     await save();
     report.steps.outputs = await outputSizes(pool, schema);
-    report.steps.outputDigests = await outputDigests(pool, schema);
+    report.steps.outputDigestEvidence = await collectOutputDigestEvidence(pool, schema, await expectedOutputBinding());
+    report.steps.outputDigests = Object.fromEntries(Object.entries(report.steps.outputDigestEvidence.tables)
+      .filter(([, table]) => table.semanticSha256 !== null)
+      .map(([name, table]) => [name, { rows: table.rows, sha256: table.semanticSha256 }]));
     report.steps.run = await runRecord(pool, schema);
     await save();
     if (options.guardProbe) {

@@ -37,3 +37,11 @@ Existing MEAS-SYNTH global field removal is insufficient by itself for this comb
 ## Current checks
 
 At the reconciliation stage, pool/read checks passed 21/21 and combined deploy/production-migration checks passed 60/60. The pricing-class suite passed all eight behavioral/negative cases; its ninth exact-input inventory required the expected new `fast-pricer.ts` input. The final settled-source validation and independent review remain open.
+
+## Settled-source checkpoint
+
+Kernel5 compute closure is `e022061bb1bccd6e3906fcbf5dc49edec1a06dbee63e70a74a8df22b1e1d9156`, vendor manifest `85e919a6f439ff351c37d5df373d2d7299dafa1d4cac2359de9b580f151d7241`, and entry pin `3e81ee257f82806f03ed6aa4bb545d8d416b22d4e144a1042e6a9acda22b8248`. Build check and full bundle build pass; registry8/8 and pricing-class9/9 pass. Pure measurement helpers12/12 pass with local process visibility. Scoped digest negatives6/6 pass.
+
+The first focused PostgreSQL pass had69passes,3failures and1skip. All three were stale integration test wiring: missing production plugins in the W1E build fixture, the old73-migration count, and SEMI using the new Worker production profile for inline assertions. Individual repairs retain existing budget assertions and add Worker semi-space refusal coverage. The focused repair pass4/4 passes, including built kernels5/6,31stored owner-days,601events, and exact19-table full-versus-identity price proof. Full settled PostgreSQL repetition remains open. An automatic-review rejection of a broader proposed test-block rewrite occurred before execution; the accepted repair preserved the assertions.
+
+The comparison collector explicitly supports one fresh completed run, or two same-kernel completed Q1 reruns when `expectedRunCount: 2` is supplied. It reports raw full-row hashes and per-table semantic hashes, exact policy hash and validated stamp evidence. Unknown tables and columns have no implicit masking. The baseline full run is retained by its owner for same-database reviewed policy capture; the old slice seven-family comparison requires an independently reviewed actual-schema equivalence proof.

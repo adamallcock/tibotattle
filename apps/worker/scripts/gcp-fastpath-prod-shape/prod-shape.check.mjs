@@ -388,15 +388,15 @@ test("the production-tier script's signal handling tears down at once and leaves
 });
 
 test("the local measurement runs the wrapper's dense profiles and summarises busy cores from ps samples", async () => {
-  const { measureProfile, psSeconds, refreshArguments, utilisationSummary, OUTPUT_DIGEST_VOLATILE_KEYS } =
+  const { measureProfile, psSeconds, refreshArguments, utilisationSummary, OUTPUT_DIGEST_POLICY } =
     await import("./measure-local.mjs");
-  assert.deepEqual({ ...measureProfile("dense") }, { name: "dense", cpu: 4, memoryGiB: 16, heapMiB: 12_288,
-    budgetMiB: 10_752, workers: 1, taskTimeoutSeconds: 14_400 });
-  assert.deepEqual({ ...measureProfile("dense-workers") }, { name: "dense-workers", cpu: 4, memoryGiB: 16, heapMiB: 3_072,
-    budgetMiB: 10_752, workers: 4, taskTimeoutSeconds: 14_400 });
+  assert.deepEqual({ ...measureProfile("dense") }, { name: "dense", cpu: 4, memoryGiB: 16, heapMiB: 12_288, semiSpaceMiB: 64,
+    budgetMiB: 10_752, workers: 1, taskTimeoutSeconds: 86_400 });
+  assert.deepEqual({ ...measureProfile("dense-workers") }, { name: "dense-workers", cpu: 4, memoryGiB: 16, heapMiB: null, semiSpaceMiB: null,
+    budgetMiB: 10_752, workers: 4, taskTimeoutSeconds: 86_400 });
   assert.throws(() => measureProfile("standard"), (error) => error?.code === "MEAS_SYNTH_PROFILE_INVALID");
   assert.deepEqual(refreshArguments(measureProfile("dense-workers"), "s").filter((arg) => !arg.includes("/")),
-    ["--max-old-space-size=3072", "--mode=full", "--now=2026-10-01T12:46:00.000Z", "--schema=s", "--workers=4"]);
+    ["--mode=full", "--now=2026-10-01T12:46:00.000Z", "--schema=s", "--workers=4"]);
   assert.equal(refreshArguments(measureProfile("dense"), "s").some((arg) => arg.startsWith("--workers")), false);
   assert.deepEqual([psSeconds("0:01.50"), psSeconds("12:03.25"), psSeconds("1:02:03.50"), psSeconds("2-00:00:01"),
     psSeconds("x")], [1.5, 723.25, 3_723.5, 172_801, null]);
@@ -405,9 +405,9 @@ test("the local measurement runs the wrapper's dense profiles and summarises bus
   assert.deepEqual(summary, { sampledWallS: 30, meanBusyCores: 1.67, utilisationOfCores: 0.417, cores: 4,
     wallShareByBusyCores: { 0: 0.333, 1: 0.333, 4: 0.333 }, peakRssMiB: 4 });
   assert.equal(utilisationSummary([{ atS: 0, cpuS: 0, rssKiB: 1 }], { cores: 4 }), null);
-  // Run identity, stamps and instants only: every stored value is compared.
-  assert.deepEqual([...OUTPUT_DIGEST_VOLATILE_KEYS].sort(), ["compatibility_sha256", "computed_at", "finished_at",
-    "kernel_id", "manifest_version", "registered_at", "released_at", "run_id", "started_at", "timings"]);
+  assert.deepEqual(OUTPUT_DIGEST_POLICY.analytics_v2_price_cards, ["first_kernel_id"]);
+  assert.deepEqual(OUTPUT_DIGEST_POLICY.analytics_v2_kernel_prices, ["kernel_id", "registered_at", "compute_sha256"]);
+  assert.deepEqual(OUTPUT_DIGEST_POLICY.analytics_v2_transition_proofs, []);
 });
 
 // MEAS-SYNTH profiling: the local run's profiler options, the database delta
