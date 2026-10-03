@@ -21,9 +21,10 @@
 //     here and keeps the database for such clones;
 //  3. runs cloud-run/dist/analytics-refresh.mjs --mode=full once under
 //     Node 22 with a test-deploy refresh task profile's heap, budget and
-//     compute Workers (--profile, default dense, the production profile:
-//     --max-old-space-size=12288, ANALYTICS_V2_MEMORY_BUDGET_MIB=10752,
-//     inline; dense-workers: a 3,072 MiB main heap and --workers=4, K-PAR;
+//     compute Workers (--profile, default dense for inline comparison; production
+//     explicitly selects dense-workers with --workers=4 and no inherited heap
+//     flags. Dense inline uses heap12288MiB and semi-space64MiB; both profiles
+//     use ANALYTICS_V2_MEMORY_BUDGET_MIB=10752;
 //     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; no task timeout, so
 //     the run is measured to the end), wrapped in /usr/bin/time -l for the
 //     process's peak resident set, while the process's resident set and CPU
@@ -34,10 +35,10 @@
 //     (estimate, heap peak; content-free digests only), the output sizes
 //     (rows and bytes of every analytics_v2 table and the published
 //     payloads) and a content digest of every output table, which leaves out
-//     only the run's identity and stamps (run_id, kernel_id,
-//     manifest_version, timestamps), so two runs on the same inputs compare;
+//     only each table's declared identity and stamps, retaining raw hashes
+//     and checking kernel/compute/manifest provenance separately;
 //  5. --guard-probe: a second refresh with
-//     ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400 (the production task
+//     ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=86400 (the production task
 //     timeout), stopped after 600 s unless it ends sooner, records whether the
 //     time guard refused it within that window. The job logs no
 //     plan-checkpoint marker, so a probe stopped unrefused shows only that no

@@ -98,8 +98,8 @@ test("inherited, non-enumerable and accessor-bearing inputs preserve values and 
   assertSame(reference, pricer, component, "component accessor exception");
 });
 
-// The production scalar finisher reprices raw rows even after day preparation.
-// Reset the counter after preparation so this assertion proves that second seam.
+// Preparation must execute the production binding; reductions reuse its memoized
+// prices while retaining the exact scalar and model output bytes.
 test("V11 scalar and model reductions preserve bytes through the bound runtime", async () => {
   const owner = syntheticOwner(1), day = "2026-09-28", start = dayMs(day);
   const rows = Array.from({ length: 9 }, (_, i) => usage(owner, i + 1, start + (i + 0.5) * 3_600_000));
@@ -107,20 +107,23 @@ test("V11 scalar and model reductions preserve bytes through the bound runtime",
   const pin = { source: "v1.1", participantId: owner.participant, generationId: "synthetic-pricer-reduction",
     fromDay: day, throughDay: day, inputRevision: 1, mutationEpoch: 1, fingerprint: "d".repeat(64) };
   const input = { day, ownerDigest: owner.digest, usage: rows, quota: quotas, session: [] };
-  const beforeDay = await oracle.module.prepareSharedAnalyticsDay(input);
-  const afterDay = await fast.module.prepareSharedAnalyticsDay(input);
   const marker = Symbol.for("gcp-pricer-binding-proof");
+  const beforeDay = await oracle.module.prepareSharedAnalyticsDay(input);
+  globalThis[marker] = 0;
+  const afterDay = await fast.module.prepareSharedAnalyticsDay(input);
+  assert.ok(globalThis[marker] > 0, "preparation must execute the fast binding");
   globalThis[marker] = 0;
   const scalarBefore = await oracle.module.evaluateSharedScalarDate({ pin, day, ownerDigest: owner.digest, days: [beforeDay] });
   const scalarAfter = await fast.module.evaluateSharedScalarDate({ pin, day, ownerDigest: owner.digest, days: [afterDay] });
   assert.equal(scalarAfter.analysis.status, "ready");
   assert.ok(scalarAfter.selectedFits.length > 0);
   assert.equal(JSON.stringify(scalarAfter), JSON.stringify(scalarBefore));
-  assert.ok(globalThis[marker] > 0, "scalar finisher must execute the fast binding after preparation");
+  assert.equal(globalThis[marker], 0, "scalar finisher must reuse prepared prices");
   const modelBefore = await oracle.module.evaluateSharedModelDate({ pin, day, ownerDigest: owner.digest, days: [beforeDay] });
   const modelAfter = await fast.module.evaluateSharedModelDate({ pin, day, ownerDigest: owner.digest, days: [afterDay] });
   assert.equal(modelAfter.status, "ready");
   assert.equal(JSON.stringify(modelAfter), JSON.stringify(modelBefore));
+  assert.equal(globalThis[marker], 0, "model reduction must reuse prepared prices");
 });
 
 test("proxies retain reference property evaluation and revoked-proxy errors", () => {
