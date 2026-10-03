@@ -857,3 +857,37 @@ test("N-EXCL: the exclusions are read whole and fail closed; F(o,d) and W(o) mov
     await pool.query(`ALTER TABLE ${table} RENAME TO community_aggregate_exclusions_hidden`);
     await assert.rejects(read(), (error) => error?.code === "ANALYTICS_V2_SOURCE_UNAVAILABLE", "an absent table");
   });
+
+test("READ-EXPANSION: empty families skip only with same-snapshot proofs and settings restore", { skip: SKIP }, async () => {
+  await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
+    await snapshot.client.query("SELECT set_config('jit','on',true),set_config('work_mem','8MB',true)");
+    const seen = [];
+    const client = { query: async (...args) => {
+      const statement = typeof args[0] === "string" ? args[0] : args[0].text;
+      if (/analytics_v2:occurrences\.(legacy_sources|v12_sources|correction_sources)/u.test(statement)) {
+        const settings = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
+        assert.deepEqual(settings, { jit: "off", mem: "64MB" });
+        seen.push(statement.match(/analytics_v2:occurrences\.([a-z_]+)/u)[1]);
+      }
+      return snapshot.client.query(...args);
+    } };
+    await modules.occurrences.readOwnerOccurrences({ ...snapshot, client }, {
+      ownerDigest: fixtures.active.owners.echo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
+    });
+    assert.ok(seen.includes("legacy_sources"));
+    assert.equal(seen.includes("v12_sources"), false);
+    assert.equal(seen.includes("correction_sources"), false);
+    seen.length = 0;
+    await modules.occurrences.readOwnerOccurrences({ ...snapshot, client }, {
+      ownerDigest: fixtures.active.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
+    });
+    assert.ok(seen.includes("correction_sources"), "method-version-1 correction facts are never skipped");
+    const restored = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
+    assert.deepEqual(restored, { jit: "on", mem: "8MB" });
+    const failure = new Error("synthetic-expansion-cancelled");
+    await assert.rejects(modules.owners.withGenericPlans(snapshot.client, async () => { throw failure; }),
+      (error) => error === failure);
+    const failedRestore = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
+    assert.deepEqual(failedRestore, restored, "caller settings restore after an operation refusal");
+  });
+});

@@ -154,13 +154,19 @@ export async function queryPrepared<Row extends object = Record<string, unknown>
  * which for the fenced expansion statements is every call; their plan shape
  * is fixed by the MATERIALIZED fences and OFFSET 0 laterals, so the generic
  * plan executes no slower (measured on the dense and Q-1 corpora, K-CORE-A
- * receipt). Transaction-local: it ends with the reader's transaction.
+ * receipt). Transaction-local: it ends with the reader's transaction. Expansion also
+ * pins jit off and work_mem to 64MB; all settings restore for a supplied client.
  */
 export async function withGenericPlans<T>(client: PostgresClient, operation: () => Promise<T>): Promise<T> {
-  const set = await client.query<{ previous: unknown }>(analyticsV2Statement("snapshot.plan_cache",
-    "SELECT current_setting('plan_cache_mode') AS previous, set_config('plan_cache_mode','force_generic_plan',true)"));
+  const set = await client.query<{ previous: unknown; previous_jit: unknown; previous_work_mem: unknown }>(analyticsV2Statement("snapshot.plan_cache",
+    "SELECT current_setting('plan_cache_mode') AS previous, current_setting('jit') AS previous_jit, "
+    + "current_setting('work_mem') AS previous_work_mem, set_config('plan_cache_mode','force_generic_plan',true), "
+    + "set_config('jit','off',true), set_config('work_mem','64MB',true)"));
   const previous = set.rows[0]?.previous;
-  if (typeof previous !== "string" || !/^[a-z_]{1,32}$/u.test(previous)) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+  const previousJit = set.rows[0]?.previous_jit;
+  const previousWorkMem = set.rows[0]?.previous_work_mem;
+  if (typeof previous !== "string" || !/^[a-z_]{1,32}$/u.test(previous)
+      || typeof previousJit !== "string" || typeof previousWorkMem !== "string") sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   let failed = false;
   try {
     return await operation();
@@ -173,7 +179,8 @@ export async function withGenericPlans<T>(client: PostgresClient, operation: () 
     // error is kept (an aborted transaction refuses the restore anyway).
     try {
       await client.query(analyticsV2Statement("snapshot.plan_cache",
-        "SELECT set_config('plan_cache_mode',$1,true)"), [previous]);
+        "SELECT set_config('plan_cache_mode',$1,true), set_config('jit',$2,true), set_config('work_mem',$3,true)"),
+      [previous, previousJit, previousWorkMem]);
     } catch (error) {
       if (!failed) throw error;
     }
@@ -201,9 +208,10 @@ function preserve(error: unknown): Error | null {
   return error instanceof AnalyticsV2SourceError ? error : null;
 }
 
-async function assertReadOnly(client: PostgresClient): Promise<void> {
+async function assertReadOnly(client: PostgresClient, configure = false): Promise<void> {
   const result = await client.query<{ read_only: unknown }>(analyticsV2Statement("snapshot.read_only",
-    "SELECT current_setting('transaction_read_only') AS read_only"));
+    "SELECT current_setting('transaction_read_only') AS read_only"
+    + (configure ? ",set_config('jit','off',true),set_config('work_mem','64MB',true)" : "")));
   if (result.rows.length !== 1 || result.rows[0]?.read_only !== "on") sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
 }
 
@@ -218,7 +226,7 @@ export async function withAnalyticsV2ReadSnapshot<T>(
   quotedSchema(context.schema);
   nowTimestamp(context.nowMs);
   return withPostgresRead(context.pool, async (client) => {
-    await assertReadOnly(client);
+    await assertReadOnly(client, true);
     return operation({ pool: context.pool, schema: context.schema, nowMs: context.nowMs, client });
   }, { operation: "analytics_v2.read", isolationLevel: "repeatable_read",
     statementTimeoutMilliseconds: READ_TIMEOUT_MS, lockTimeoutMilliseconds: 5_000, preserveSafeError: preserve });

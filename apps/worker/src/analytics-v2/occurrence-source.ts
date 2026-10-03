@@ -231,6 +231,10 @@ interface OwnerScope {
   readonly v1Namespace: string | null;
   readonly v11Namespace: string | null;
   readonly correctionActive: boolean;
+  /** Same-snapshot existence proof for empty correction expansion. */
+  readonly correctionFactsPresent: boolean;
+  /** Ready manifests are a necessary condition for v1.2 expansion. */
+  readonly v12ReadyManifests: boolean;
   /** v1.2 runtime active (production's `v12_state === "active"`). */
   readonly v12RuntimeActive: boolean;
   /** ...and the participant has a v1.2 head (production's candidate and usage-source gate). */
@@ -243,6 +247,11 @@ function ownerScopeSql(s: string): string {
             AND r.schema_version='telemetry-usage-correction-v1' AND r.method_version='usage-total-correction-v1')
             AS correction_present,
           ${correctionRuntimeActiveSql(s)} AS correction_active,
+          EXISTS(SELECT 1 FROM ${s}.telemetry_usage_correction_history h
+            JOIN ${s}.telemetry_usage_correction_facts f ON f.history_id=h.id AND f.method_version=1
+            WHERE h.owner_digest=decode($1,'hex')) AS correction_facts_present,
+          EXISTS(SELECT 1 FROM ${s}.telemetry_v12_day_manifests m
+            WHERE m.participant_id=link.participant_id AND m.state='ready') AS v12_ready_manifests,
           v12head.generation_id AS v12_generation_id,v12runtime.state AS v12_state
      FROM ${s}.storage_v11_owner_links link
      JOIN ${s}.storage_source_state source ON source.singleton=1
@@ -259,11 +268,13 @@ function ownerScopeSql(s: string): string {
 async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: string): Promise<OwnerScope> {
   const result = await queryPrepared<{
     participant_id: unknown; v1_namespace: unknown; v11_namespace: unknown; correction_present: unknown;
-    correction_active: unknown; v12_generation_id: unknown; v12_state: unknown;
+    correction_active: unknown; correction_facts_present: unknown; v12_ready_manifests: unknown;
+    v12_generation_id: unknown; v12_state: unknown;
   }>(client, (await readerStatements(s)).scope, [ownerDigest]);
   const row = result.rows[0];
   if (result.rows.length !== 1 || row === undefined || typeof row.participant_id !== "string"
-      || row.correction_present !== true || typeof row.correction_active !== "boolean") {
+      || row.correction_present !== true || typeof row.correction_active !== "boolean"
+      || typeof row.correction_facts_present !== "boolean" || typeof row.v12_ready_manifests !== "boolean") {
     return sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   }
   const v1Namespace = row.v1_namespace === null ? null : text(row.v1_namespace);
@@ -277,7 +288,8 @@ async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: st
   // d43c8f92 readOwnerScope's CAS refusal: no legacy family and no active v1.2 runtime.
   if (v1Namespace === null && v11Namespace === null && !v12RuntimeActive) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   return Object.freeze({ participantId: row.participant_id, v1Namespace, v11Namespace,
-    correctionActive: row.correction_active, v12RuntimeActive, v12HeadActive });
+    correctionActive: row.correction_active, correctionFactsPresent: row.correction_facts_present,
+    v12ReadyManifests: row.v12_ready_manifests, v12RuntimeActive, v12HeadActive });
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,7 +1256,7 @@ export async function readOwnerOccurrences(
             push(direct, row.occurrence_id, row);
           }
         }
-        if (expandV12) {
+        if (expandV12 && scope.v12ReadyManifests) {
           const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
             [participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
           if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
@@ -1254,7 +1266,7 @@ export async function readOwnerOccurrences(
             push(v12, record.occurrenceId, record);
           }
         }
-        if (corrections) {
+        if (corrections && scope.correctionFactsPresent) {
           const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
             [ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
           if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
@@ -1670,13 +1682,13 @@ export async function readOwnerDayFingerprints(
               safeInteger(left.storage_row_id, 1) - safeInteger(right.storage_row_id, 1));
             for (const row of ordered) keyed(row.occurrence_id).legacy.push(canonicalRow(row as unknown as Record<string, unknown>));
           }
-          if (expandV12) {
+          if (expandV12 && scope.v12ReadyManifests) {
             const rows = await queryPrepared<V12StorageRow>(client, statements.v12Sources,
               [scope.participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
             if (rows.rows.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
             for (const row of rows.rows) keyed(row.occurrence_id).v12.push(canonicalRow(row));
           }
-          if (corrections) {
+          if (corrections && scope.correctionFactsPresent) {
             const rows = await queryPrepared<Record<string, unknown>>(client, statements.correctionSources,
               [base.ownerDigest, encoded, MAX_BATCH_SOURCE_ROWS + 1]);
             if (rows.rows.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
