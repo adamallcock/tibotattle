@@ -22,6 +22,7 @@
 
 import type { AnalyticsV2Day, AnalyticsV2Owner, AnalyticsV2OwnerDigest } from "./contract";
 import {
+  analyticsV2Statement,
   dayFromNumber,
   dayNumber,
   nowTimestamp,
@@ -113,7 +114,7 @@ export async function countContributingDevices(
   return onReadSnapshot(context, async (client) => {
     if (members.length > 0) {
       const result = await client.query<{ day: unknown; owner_digest: unknown; device_id: unknown }>(
-        devicesSql(s), [JSON.stringify(members), now]);
+        analyticsV2Statement("devices.count", devicesSql(s)), [JSON.stringify(members), now]);
       for (const row of result.rows) {
         const set = typeof row.day === "string" && typeof row.owner_digest === "string"
           ? devices.get(row.day)?.get(row.owner_digest) : undefined;

@@ -83,7 +83,7 @@ What follows from the decision:
 | Backup audit | Operator | A receipt from `node scripts/gcp-backup-horizon.mjs audit` is at most 6 hours old and is not a breach (exit 3 blocks) |
 | Schema reviewed | `migrate` | The migrations are expand-compatible or reviewed in `CONTRACT_MIGRATIONS`, and the append-only residue migration is present (`PRODUCTION_SIMP_RESIDUE_MISSING` until it lands) |
 | Jobs quiescent | `migrate`, `roll` | Every Cloud Scheduler trigger of a Cloud Run job in the location is paused, and nothing is running (`ROLLOUT_JOBS_NOT_PAUSED`, `ROLLOUT_JOBS_RUNNING`) |
-| Fresh lifecycle pass | `roll` | Whenever the live edge is not in `gcp` mode, `roll` checks the served commit through the verifier path, which needs `/api/ready` to read `ready`. Readiness goes stale 2 hours after the last completed maintenance pass, and the maintenance trigger, once one exists, is paused for the rollout, so the last completed pass must be under 2 hours old when `roll` reaches that check (`EDGE_ORIGIN_VERIFIER_NOT_READY` otherwise). This covers every pre-switch rollout, the pre-staging one included, and every rollout while the edge is braked to `fenced` |
+| Lifecycle pass | `roll` | Whenever the live edge is not in `gcp` mode, `roll` checks the served commit through the verifier path, which needs `/api/ready` to read `ready`, and readiness needs a completed maintenance pass under 2 hours old. `roll` runs that pass itself: one execution of the target's maintenance job after it moves and reads back the service and jobs and before it checks the served commit (`ROLLOUT_MAINTENANCE_PASS_FAILED` unless exactly one execution succeeds; D-CRB). A target without a maintenance job (staging, which cannot deploy it yet) is refused before any write outside `gcp` mode (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). This covers every pre-switch rollout, the pre-staging one included, and every rollout while the edge is braked to `fenced` |
 | Edge capture | `roll` | A verified capture of the live edge, at most 15 minutes old, for this environment |
 | Contract blob | `roll` | If the live edge is in gcp mode, `apps/worker/src/edge-origin-contract.ts` has the same Git blob at `--commit` and at the live edge's commit (`EDGE_CONTRACT_DRIFT`), and the edge points at this service |
 | Lock | Every mutating verb | The shared production deployment lock is free |
@@ -133,7 +133,7 @@ and print the argv; they run no `gcloud` and make no request.
 
 5. **Dry-run migrate and roll.** The same commands as steps 7 and 8 without
    `--execute`, with the digest. Read the printed argv.
-6. **Record, pause and drain the triggers, then run a pass.** Pause the
+6. **Record, pause and drain the triggers.** Pause the
    triggers of this plane's Cloud Run jobs, then wait for running executions to
    finish. Do not cancel a running refresh as part of this procedure; if one
    runs long, the owner decides whether to wait or to defer the rollout. The
@@ -158,14 +158,11 @@ and print the argv; they run no `gcloud` and make no request.
      `roll` refuse `ROLLOUT_JOBS_NOT_PAUSED`, and the owner settles it with
      that estate's owner before going on.
    - Run `preflight` again and confirm it reports quiescent.
-   - **Run a maintenance pass by hand** if the last completed pass is not
-     comfortably inside 2 hours of the expected `roll` time, and before
-     `migrate` so the outage window does not grow. A pass skips with
-     `MIGRATION_IN_PROGRESS` while a migration runs. If `migrate` runs long
-     enough to push the last pass past 2 hours before `roll`, the pass must run
-     again before `roll` and extends the outage window. The maintenance job is
-     `built` (C-MAINT) but is not in the rollout target (D-OPS4), so how the pass
-     is started by hand is an open item.
+   - No maintenance pass by hand is needed for the roll: `roll` moves the
+     maintenance job's image with the other jobs and then runs one pass itself,
+     before its served-commit check (step 8). The maintenance job is `built`
+     (C-MAINT) and is in the production rollout target and desired state
+     (D-OPS4). A pass skips with `MIGRATION_IN_PROGRESS` while a migration runs.
 
    Record the paused list and the time in UTC. If the pause outlasts the
    scheduler probe's 6 hour threshold for a trigger whose committed state is
@@ -197,7 +194,9 @@ and print the argv; they run no `gcloud` and make no request.
    It requires a matching migrate receipt (at most 24 hours old), checks the
    edge capture's age and identity, re-checks quiescence, moves the service and every job in the
    infrastructure manifest to one digest and commit, and reads each back. It
-   then checks the served commit: public `GET /api/health` when the live edge
+   then runs one execution of the target's maintenance job (the lifecycle pass
+   the new origin's `/api/ready` reads) and checks the served commit: public
+   `GET /api/health` when the live edge
    is in gcp mode, otherwise the verifier path (`GET /api/health` and
    `GET /api/ready` as the verifier account). It prints the roll receipt,
    including `secondsSinceMigrate` and `pausedTriggers`. Keep it. The outage
@@ -209,7 +208,8 @@ and print the argv; they run no `gcloud` and make no request.
    exits 0. The roll receipt's served commit equals `--commit`. In `gcp` mode
    the served-commit check reads only public health (status `ok` and the
    commit), not `/api/ready`; readiness still goes stale 2 hours after the last
-   pass, so run a pass by hand now if the pause was long.
+   pass (the roll's own pass, when the target has a maintenance job), so
+   resume the maintenance trigger within that window.
 10. **Resume the triggers, explicitly and in order,** under
     [GCP scheduler resume](./gcp-scheduler-resume.md#resume-after-a-rollout).
     Resume only a trigger that is in this plane's committed desired state with
@@ -235,7 +235,9 @@ and print the argv; they run no `gcloud` and make no request.
 | `ROLLOUT_MIGRATE_RECEIPT_STALE`, `ROLLOUT_MIGRATE_RECEIPT_MISMATCH` | The receipt is older than 24 hours, or is for another commit, digest or job | Rerun `migrate` for the exact digest to get a fresh receipt. This is a no-op for an applied schema |
 | `ROLLOUT_EDGE_LIVE_STALE`, `ROLLOUT_EDGE_LIVE_UNVERIFIED` | The edge capture is older than 15 minutes or fails verification | Capture again |
 | `EDGE_CONTRACT_DRIFT`, `ROLLOUT_EDGE_ORIGIN_MISMATCH` | The contract blob differs from the live gcp edge's, or the edge points at another service | Do not roll. See [contract changes](#contract-changes) |
-| `ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH`, `ROLLOUT_ORIGIN_COMMIT_MISMATCH`, `EDGE_ORIGIN_VERIFIER_*` | The served commit is not the rolled commit, or the verifier path failed. `EDGE_ORIGIN_VERIFIER_NOT_READY` means `/api/ready` did not read `ready`, usually a stale lifecycle pass. This check runs after the service and every job moved, so the roll has already happened and left no receipt | Run a maintenance pass, then run `roll` again for the same digest. The rerun needs a new edge capture (the first is likely past 15 minutes, and no command writes one, see [open gaps](#open-gaps)). Avoid it by meeting the fresh-pass precondition first. If the commit is wrong, treat the roll as incomplete and fix forward |
+| `ROLLOUT_MAINTENANCE_JOB_REQUIRED` | The edge is not in `gcp` mode and the target names no maintenance job (staging today) | Nothing was written. The verifier path cannot pass without a lifecycle pass; give the plane its maintenance job first |
+| `ROLLOUT_MAINTENANCE_PASS_FAILED` | The roll's maintenance execution did not succeed exactly once. This runs after the service and every job moved, so the roll has already happened and left no receipt | Read the execution's closed log lines, fix the cause, then run `roll` again for the same digest with a new edge capture. If the image is wrong, treat the roll as incomplete and fix forward |
+| `ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH`, `ROLLOUT_ORIGIN_COMMIT_MISMATCH`, `EDGE_ORIGIN_VERIFIER_*` | The served commit is not the rolled commit, or the verifier path failed. `EDGE_ORIGIN_VERIFIER_NOT_READY` means `/api/ready` did not read `ready` even after the roll's own pass: read its checks (the lifecycle, retention and reconciliation rows the pass writes). This check runs after the service and every job moved, so the roll has already happened and left no receipt | Fix the cause, then run `roll` again for the same digest. The rerun needs a new edge capture (the first is likely past 15 minutes, and no command writes one, see [open gaps](#open-gaps)). If the commit is wrong, treat the roll as incomplete and fix forward |
 | `PRODUCTION_COORDINATION_*` | The shared deployment lock is held | A retained lock is a stop. Do not retry with raw tools; follow the typed reconciliation in [Production service operations](./production-operations.md#guarded-deployment-wrapper) |
 
 After a failure between `migrate` and a successful `roll`, the previous
@@ -272,12 +274,12 @@ The first production rollout pre-stages the origin (checklist PROD-3):
    `roll` accept an estate with none.
 4. A freshly migrated, empty origin reads `not_ready` until its first
    maintenance pass, and the verifier path inside `roll` requires `/api/ready`
-   to read `ready`. A pass therefore has to complete after `migrate` and before
-   `roll`: it cannot run between the roll and its check, because that check is
-   part of `roll`. How that first pass is started before any maintenance job
-   exists in the rollout target is the open first-roll item (D-CRB, D-OPS4).
-   Until it is decided, expect the first roll's served-commit check to fail
-   `EDGE_ORIGIN_VERIFIER_NOT_READY` after the service and jobs have moved.
+   to read `ready`. `roll` runs that first pass itself, with the new image,
+   after the service and jobs move and before its served-commit check (D-CRB),
+   so no pass is needed between `migrate` and `roll`. Locally, the PostgreSQL
+   production-host spec shows the verifier refused on a fresh schema and
+   passing after one lifecycle pass (run in process, not through the job);
+   no project has run the roll's pass.
 
 ## Open gaps
 
@@ -287,9 +289,9 @@ The first production rollout pre-stages the origin (checklist PROD-3):
 | Live edge capture writer | `not built`. The roll consumes the file; nothing writes it |
 | Pre-migration backup count | The code takes two (`PRE_MIGRATION_BACKUPS`); the owner decided one plus point-in-time recovery. The change and its tests are `not built` (backup-count item) |
 | Pre-migration backup expiry | The code labels them to expire in 30 days. The privacy disclosure drafted for the cutover says pre-change backups are kept at most 90 days. Reconcile before either is published |
-| First-roll ready path | `not built` (D-CRB, D-OPS4): a pass must complete between `migrate` and `roll`, and nothing starts one yet |
+| First-roll ready path | `built` (D-CRB): `roll` runs one maintenance job execution before its served-commit check. Local proof only; not run in any project. Staging has no maintenance job yet, so its origin-verifier roll is refused before any write |
 | Contract-blob check on every origin deploy | The roll checks it only while the edge is in gcp mode. The all-modes check is `not built` (D-BLOB) |
-| Maintenance job in the rollout target | `not built` (D-OPS4). The manifest's jobs are the migration job and the refresh job |
+| Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging load test with a migrate and roll under load | Open (OPS-11) |
 

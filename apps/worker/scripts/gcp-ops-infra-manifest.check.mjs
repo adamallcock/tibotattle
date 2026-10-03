@@ -15,14 +15,18 @@ import {
   ANALYTICS_REFRESH_PRODUCTION_ENV,
   ANALYTICS_REFRESH_PRODUCTION_JOB,
   ANALYTICS_REFRESH_RESOURCE_ENV,
+  ANALYTICS_REFRESH_TASK_MEMORY_CHECK,
+  ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   analyticsRefreshTaskTimeoutMs,
   parseAnalyticsRefreshArguments,
   readAnalyticsRefreshProductionTarget,
 } from "../cloud-run/analytics-refresh.mjs";
+import * as probeContract from "../cloud-run/ops-probe-contract.mjs";
+import * as maintenanceContract from "../cloud-run/postgres-maintenance-job-contract.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
 import * as migrations from "../cloud-run/postgres-production-migrations.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import { FASTPATH_TEST, REFRESH_JOB_PROFILES } from "./gcp-fastpath-test-deploy.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
@@ -65,7 +69,9 @@ function stagingNames(value) {
   value.service.name = "synthetic-staging-origin";
   value.jobs["production-migrate"].name = "synthetic-staging-migrate";
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
+  value.jobs.maintenance.name = "synthetic-staging-maintenance";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
+  value.scheduler.maintenance.name = "synthetic-staging-maintenance-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
     secret.secretName = `tibotattle-staging-${name.toLowerCase().replaceAll("_", "-")}`;
   }
@@ -97,6 +103,8 @@ async function assertRefreshRenderIsProductionJob(job, desired) {
   assert.deepEqual(container.args, [...profile.args]);
   assert.equal(container.args[0], `--max-old-space-size=${profile.heapMiB}`);
   assert.equal(container.args[1], profile.entry);
+  assert.equal(parseAnalyticsRefreshArguments(container.args.slice(2), {
+    ...Object.fromEntries(container.env.map((entry) => [entry.name, entry.value])) }).workers, profile.workers);
   assert.deepEqual(container.resources, { limits: { cpu: profile.cpu, memory: profile.memory } });
   assert.equal(task.timeoutSeconds, String(profile.taskTimeoutSeconds));
   assert.equal(task.maxRetries, profile.maxRetries);
@@ -134,17 +142,22 @@ test("the synthetic fixture validates closed, frozen and marked synthetic", () =
   assert.equal(manifest.readDesiredStateFile(FIXTURE_PATH).project, "synthetic-ops-project");
 });
 
-test("the fast path renders exactly two jobs and one owner-cadenced scheduler trigger", () => {
-  assert.deepEqual([...manifest.JOB_NAMES], ["production-migrate", "analytics-refresh"]);
-  assert.deepEqual([...manifest.SCHEDULED_JOB_NAMES], ["analytics-refresh"]);
+test("the fast path renders exactly three jobs: one owner-cadenced trigger and one pinned to the Worker cron", () => {
+  assert.deepEqual([...manifest.JOB_NAMES], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.deepEqual([...manifest.SCHEDULED_JOB_NAMES], ["analytics-refresh", "maintenance"]);
   assert.deepEqual(Object.keys(manifest.JOB_DEFINITIONS), [...manifest.JOB_NAMES]);
-  for (const absent of ["maintenance", "analytics-delivery", "analytics-publication", "analytics-graph",
+  // The OPS-4 probe jobs (cloud-run/ops-probe-contract.mjs OPS_PROBE_JOBS) are
+  // a contract, not yet an estate: the backup audit needs an account of its
+  // own, an owner decision. Nothing else renders either.
+  for (const absent of ["analytics-delivery", "analytics-publication", "analytics-graph",
     "analytics-graph-day", "analytics-cache-retention", "restore-verify", "ops-runtime-probe", "ops-backup-audit"]) {
     assert.equal(manifest.JOB_NAMES.includes(absent), false, absent);
   }
   refused((value) => { value.jobs["analytics-delivery"] = { name: "synthetic-analytics-delivery", maxConnections: 2 }; },
     "JOB_NAMES_MISMATCH");
   refused((value) => { delete value.jobs["production-migrate"]; }, "JOB_NAMES_MISMATCH");
+  refused((value) => { delete value.jobs.maintenance; }, "JOB_NAMES_MISMATCH");
+  refused((value) => { delete value.scheduler.maintenance; }, "SCHEDULER_JOBS_MISMATCH");
   refused((value) => {
     value.scheduler["production-migrate"] = { name: "synthetic-migrate-trigger", schedule: null, state: "PAUSED" };
   }, "SCHEDULER_JOBS_MISMATCH");
@@ -161,6 +174,45 @@ test("the fast path renders exactly two jobs and one owner-cadenced scheduler tr
     assert.equal(manifest.validateDesiredState(fixture((value) => {
       value.scheduler["analytics-refresh"].schedule = schedule;
     })).scheduler["analytics-refresh"].schedule, schedule);
+  }
+});
+
+test("the maintenance trigger's cadence is the job's own contract: every minute, never null, never another", () => {
+  // Single-sourced from the job's contract leaf (D-OPS4), not restated.
+  assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "* * * * *");
+  assert.deepEqual({ ...manifest.PINNED_SCHEDULER_CADENCES }, { maintenance: "* * * * *" });
+  assert.equal(manifest.MAINTENANCE_JOB_CONTRACT.schedule, maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE);
+  assert.equal(Object.hasOwn(manifest.PINNED_SCHEDULER_CADENCES, "analytics-refresh"), false, "the refresh cadence is the owner's");
+  const valid = manifest.validateDesiredState(fixture());
+  assert.deepEqual({ ...valid.scheduler.maintenance }, { name: "synthetic-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
+  assert.equal(valid.jobs.maintenance.maxConnections, 2);
+  // A slower trigger leaves /api/ready not_ready; no other cadence validates, and a bad cron is invalid first.
+  for (const schedule of [null, "0 * * * *", "*/5 * * * *", "*/2 * * * *", "* * * * 1", "15 3 * * *", "* * * 1 *"]) {
+    refused((value) => { value.scheduler.maintenance.schedule = schedule; }, "SCHEDULER_CADENCE_MISMATCH:maintenance");
+  }
+  for (const schedule of ["", "daily", "* * * *", "60 * * * *", "* * * * * *"]) {
+    refused((value) => { value.scheduler.maintenance.schedule = schedule; }, "SCHEDULER_CADENCE_INVALID:maintenance");
+  }
+  refused((value) => { delete value.scheduler.maintenance.schedule; }, "DESIRED_STATE_KEY_MISSING:scheduler.maintenance.schedule");
+  // Explicit resume only: created and paused, then ENABLED once the owner resumes it and commits the state.
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.scheduler.maintenance.state = "ENABLED"; }))
+    .scheduler.maintenance.state, "ENABLED");
+  for (const state of ["paused", "RUNNING", "DISABLED", null, ""]) {
+    refused((value) => { value.scheduler.maintenance.state = state; }, "DESIRED_STATE_VALUE_INVALID:scheduler.maintenance.state");
+  }
+  assert.notEqual(manifest.desiredStateDigest(valid), manifest.desiredStateDigest(manifest.validateDesiredState(
+    fixture((value) => { value.scheduler.maintenance.state = "ENABLED"; }))), "the state is part of the plan's identity");
+  // The pool the job opens (a lock session plus one transaction) is declared.
+  assert.equal(manifest.MAINTENANCE_JOB_CONTRACT.poolMax, maintenanceContract.POSTGRES_MAINTENANCE_JOB_POOL_MAX);
+  assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_POOL_MAX, 2);
+  refused((value) => { value.jobs.maintenance.maxConnections = 1; }, "JOB_POOL_MAX_UNDERDECLARED:maintenance");
+  refused((value) => { value.jobs.maintenance.maxConnections = 0; }, "DESIRED_STATE_VALUE_INVALID:jobs.maintenance.maxConnections");
+  // Both committed files carry exactly the pinned cadence and are created paused.
+  for (const environment of ["production", "staging"]) {
+    const raw = JSON.parse(COMMITTED[environment]);
+    assert.equal(raw.scheduler.maintenance.schedule, maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE, environment);
+    assert.equal(raw.scheduler.maintenance.state, "PAUSED", environment);
+    assert.equal(raw.jobs.maintenance.maxConnections, 2, environment);
   }
 });
 
@@ -187,18 +239,18 @@ test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENAB
 });
 
 test("the analytics-refresh job renders the production refresh-job contract in the dense profile", async () => {
-  // The deferral is lifted: both jobs deploy, and OPS-10 moves both.
+  // The deferral is lifted: every job deploys, and OPS-10 moves each of them.
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
-  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense", cpu: "4", memory: "16Gi",
-    heapMiB: 12_288, memoryBudgetMiB: 10_752, timeoutSeconds: 14_400 });
+    heapMiB: 12_288, memoryBudgetMiB: 10_752, workers: 1, timeoutSeconds: 14_400 });
   // It is the dense measurement profile (MEAS-3 runs it), field for field,
   // including the budget that profile sets, so the two cannot drift.
   const dense = REFRESH_JOB_PROFILES.dense;
-  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB,
+  assert.deepEqual({ cpu: String(dense.cpu), memory: dense.memory, heapMiB: dense.heapMiB, workers: dense.workers,
     timeoutSeconds: dense.taskTimeoutSeconds, env: dense.env.map((entry) => [...entry]) }, {
     cpu: manifest.ANALYTICS_REFRESH_TASK_PROFILE.cpu, memory: manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory,
-    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB,
+    heapMiB: manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB, workers: manifest.ANALYTICS_REFRESH_TASK_PROFILE.workers,
     timeoutSeconds: manifest.ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
     env: [["ANALYTICS_V2_MEMORY_BUDGET_MIB", String(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB)]] });
   for (const value of [unmarked(), unmarked(stagingNames)]) {
@@ -206,7 +258,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     const job = manifest.renderJob(desired, "analytics-refresh", IMAGE);
     const task = job.spec.template.spec.template.spec;
     const container = task.containers[0];
-    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else.
+    // node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full, nothing else: owners are
+    // computed inline until MEAS-3 measures the compute Workers (K-CORE-A review).
     assert.deepEqual(container.command, ["node"]);
     assert.deepEqual(container.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
     assert.deepEqual(container.resources, { limits: { cpu: "4", memory: "16Gi" } });
@@ -235,15 +288,25 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.equal(parsed.mode, "full");
     assert.equal(parsed.schema, desired.cloudSql.schema);
     assert.equal(parsed.nowMs, null);
-    // Its resource gate admits the rendered budget under the profile's heap,
-    // and refuses it under a heap one MiB short of budget plus reserve.
+    assert.equal(parsed.workers, 1);
+    // Its resource gate admits the rendered budget under the profile's heap
+    // (inline: the budget is inside the heap), and refuses it under a heap
+    // one MiB short of budget plus reserve.
     const MIB = 1024 * 1024;
     const heap = manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB * MIB;
-    const resources = analyticsRefreshResources(env, heap);
+    const resources = analyticsRefreshResources(env, heap, { workers: parsed.workers });
     assert.equal(resources.compute.memoryBudgetBytes, 10_752 * MIB);
     assert.ok(resources.requiredHeapBytes <= heap);
-    assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB),
+    assert.throws(() => analyticsRefreshResources(env, resources.requiredHeapBytes - MIB, { workers: parsed.workers }),
       { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
+    // The task memory holds the heap (and, inline, no Worker heaps), with the
+    // native reserve left over.
+    const memory = ANALYTICS_REFRESH_TASK_MEMORY_CHECK;
+    assert.equal(memory.taskMemoryMiB, Number.parseInt(manifest.ANALYTICS_REFRESH_TASK_PROFILE.memory, 10) * 1024);
+    const workerMiB = manifest.ANALYTICS_REFRESH_TASK_PROFILE.workers > 1
+      ? manifest.ANALYTICS_REFRESH_TASK_PROFILE.memoryBudgetMiB + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB : 0;
+    assert.ok(manifest.ANALYTICS_REFRESH_TASK_PROFILE.heapMiB + workerMiB
+      <= memory.taskMemoryMiB - memory.nativeReserveMiB);
 
     // The render IS the entry's production job (C-REFRESH), field for field.
     await assertRefreshRenderIsProductionJob(job, desired);
@@ -258,6 +321,8 @@ test("the analytics-refresh job renders the production refresh-job contract in t
       ["8Gi", (value) => { containerOf(value).resources.limits.memory = "8Gi"; }],
       ["2 vCPU", (value) => { containerOf(value).resources.limits.cpu = "2"; }],
       ["heap 6144", (value) => { containerOf(value).args[0] = "--max-old-space-size=6144"; }],
+      ["four workers", (value) => { containerOf(value).args.push("--workers=4"); }],
+      ["one worker flag", (value) => { containerOf(value).args.push("--workers=1"); }],
       ["retries", (value) => { value.spec.template.spec.template.spec.maxRetries = 3; }],
       ["two tasks", (value) => { value.spec.template.spec.taskCount = 2; }],
       ["budget", (value) => { containerOf(value).env.find((entry) => entry.name === "ANALYTICS_V2_MEMORY_BUDGET_MIB")
@@ -281,17 +346,244 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     { code: "JOB_NAME_UNKNOWN" });
 });
 
+/**
+ * The D-OPS4 binding: a rendered maintenance job is C-MAINT's job contract
+ * (MAINTENANCE_JOB_CONTRACT, built from the job's own contract leaf), every
+ * field it states. Its plain env is exactly the closed configuration plus
+ * OPS-10's provenance variable and nothing the job refuses; its secrets are
+ * exactly the profile's, by Secret Manager reference at a pinned version,
+ * never a value; its quarantine bucket proof is the closed record the service
+ * renders; and CR-3's own maintenance-job profile reader accepts it. A
+ * doctored render fails one of these.
+ */
+function assertMaintenanceRenderIsJobContract(job, desired) {
+  const profile = manifest.MAINTENANCE_JOB_CONTRACT;
+  const task = job.spec.template.spec.template.spec;
+  const container = task.containers[0];
+  assert.deepEqual(container.command, ["node"]);
+  assert.deepEqual(container.args, [profile.entry, `--profile=${profile.profile}`]);
+  assert.equal(profile.entry, `dist/${maintenanceContract.POSTGRES_MAINTENANCE_JOB_ENTRY}.mjs`);
+  assert.equal(profile.profile, "maintenance-job");
+  assert.deepEqual(container.resources, { limits: { cpu: profile.cpu, memory: profile.memory } });
+  assert.equal(task.timeoutSeconds, String(profile.taskTimeoutSeconds));
+  assert.equal(task.maxRetries, 0);
+  assert.equal(job.spec.template.spec.taskCount, 1);
+  assert.equal(job.spec.template.spec.parallelism, 1);
+  assert.equal(task.serviceAccountName, desired.serviceAccounts.runtime.email);
+  assert.equal(task.containers.length, 1);
+  for (const entry of container.env) assert.equal((entry.value === undefined) !== (entry.valueFrom === undefined), true, entry.name);
+  const plain = container.env.filter((entry) => entry.valueFrom === undefined);
+  const references = container.env.filter((entry) => entry.valueFrom !== undefined);
+  assert.deepEqual(plain.map((entry) => entry.name), [...profile.configurationEnv, ...profile.provenanceEnv]);
+  const names = container.env.map((entry) => entry.name);
+  for (const forbidden of profile.refusedVariables) assert.equal(names.includes(forbidden), false, forbidden);
+  for (const prefix of profile.refusedPrefixes) assert.equal(names.some((name) => name.startsWith(prefix)), false, prefix);
+  assert.equal(names.includes("CLOUD_RUN_JOB"), false, "Cloud Run supplies the job name");
+  assert.deepEqual(references.map((entry) => entry.name).sort(),
+    profile.secrets.filter((name) => desired.secrets[name].version !== null).sort());
+  for (const entry of references) {
+    assert.deepEqual(entry.valueFrom, { secretKeyRef: { name: desired.secrets[entry.name].secretName, key: desired.secrets[entry.name].version } });
+  }
+  const env = Object.fromEntries(plain.map((entry) => [entry.name, entry.value]));
+  assert.equal(env.GCS_QUARANTINE_BUCKET_HISTORY_PROOF, JSON.stringify({
+    bucket: desired.bucket.name, bucketGeneration: desired.bucket.proof.bucketGeneration,
+    bucketMetageneration: desired.bucket.proof.bucketMetageneration, softDeleteRetentionDurationSeconds: "0",
+  }));
+  assert.equal(env.POSTGRES_SCHEDULED_MAINTENANCE_ENABLED, "enabled");
+  assert.equal(env.DEPLOYMENT_SOURCE_COMMIT, IMAGE.sourceCommit);
+  // CR-3's maintenance-job profile reads the render as the job reads its environment.
+  const synthetic = Object.fromEntries(references.map((entry) => [entry.name, `synthetic-${"0".repeat(64)}`]));
+  const read = configuration.readProductionConfiguration({ ...env, ...synthetic, CLOUD_RUN_JOB: job.metadata.name }, profile.profile);
+  assert.equal(read.profile, "maintenance-job");
+  assert.equal(read.plane, desired.environment);
+  assert.equal(read.deployment.workload.kind, "job");
+  assert.equal(read.deployment.workload.name, desired.jobs.maintenance.name);
+  assert.equal(read.deployment.sourceCommit, IMAGE.sourceCommit);
+  assert.equal(read.jobSwitches.POSTGRES_SCHEDULED_MAINTENANCE_ENABLED, "enabled");
+  assert.equal(read.resources.primary.instanceConnectionName, desired.cloudSql.connectionName);
+  assert.equal(read.resources.bucket, desired.bucket.name);
+  assert.equal(read.resources.bucketHistoryProof.bucket, desired.bucket.name);
+  assert.equal(read.resources.bucketHistoryProof.bucketGeneration, desired.bucket.proof.bucketGeneration);
+  assert.deepEqual(Object.keys(read.secrets).sort(), references.map((entry) => entry.name).sort());
+}
+
+test("the maintenance job renders C-MAINT's job contract, and CR-3's maintenance-job profile reads the render", () => {
+  const contract = manifest.MAINTENANCE_JOB_CONTRACT;
+  assert.deepEqual({ ...manifest.JOB_DEFINITIONS.maintenance, args: [...manifest.JOB_DEFINITIONS.maintenance.args],
+    env: [...manifest.JOB_DEFINITIONS.maintenance.env], secrets: [...manifest.JOB_DEFINITIONS.maintenance.secrets] }, {
+    account: "runtime",
+    args: ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"],
+    timeoutSeconds: 300,
+    cpu: "1",
+    memory: "512Mi",
+    env: ["TELEMETRY_STORAGE_NAMESPACE", "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA",
+      "POSTGRES_IAM_USER", "GCS_BUCKET_NAME", "GCS_QUARANTINE_BUCKET_HISTORY_PROOF",
+      "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED", "DEPLOYMENT_SOURCE_COMMIT"],
+    secrets: ["IDENTITY_LINK_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"],
+  });
+  // The job refuses these, so no render carries one: the contract names the job's own lists.
+  assert.deepEqual([...contract.refusedVariables], Object.keys(maintenanceContract.POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES));
+  assert.deepEqual([...contract.refusedPrefixes], Object.keys(maintenanceContract.POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES));
+  assert.deepEqual([...contract.refusedVariables], ["HOST_MODE", "K_SERVICE"]);
+  // The first prefix is the local PostgreSQL test endpoint family; the second is the job's own tunables.
+  assert.equal(contract.refusedPrefixes.length, 2);
+  assert.equal(contract.refusedPrefixes[1], "POSTGRES_MAINTENANCE_JOB_");
+  assert.match(contract.refusedPrefixes[0], /^[A-Z]+_TEST_$/u);
+  // Its secrets are exactly the maintenance-job profile's, required first.
+  assert.deepEqual([...contract.secrets], [...configuration.PRODUCTION_PROFILE_SECRET_NAMES["maintenance-job"].required,
+    ...configuration.PRODUCTION_PROFILE_SECRET_NAMES["maintenance-job"].optional]);
+  assert.deepEqual([...maintenanceContract.POSTGRES_MAINTENANCE_JOB_PROFILES], ["maintenance-job", "staging-maintenance-job"]);
+
+  const pinned = manifest.validateDesiredState(unmarked((value) => { value.secrets.DISTRIBUTION_GITHUB_API_TOKEN.version = "2"; }));
+  const unpinnedOptional = manifest.validateDesiredState(unmarked());
+  for (const desired of [pinned, unpinnedOptional]) {
+    const job = manifest.renderJob(desired, "maintenance", IMAGE);
+    assert.equal(job.kind, "Job");
+    assert.equal(job.metadata.name, "synthetic-maintenance");
+    assertMaintenanceRenderIsJobContract(job, desired);
+    // The image is the one it is rolled to, by digest.
+    assert.equal(job.spec.template.spec.template.spec.containers[0].image,
+      `${desired.artifactRegistry.imageRepository}@sha256:${IMAGE.imageDigest}`);
+  }
+  const references = (job) => job.spec.template.spec.template.spec.containers[0].env
+    .filter((entry) => entry.valueFrom !== undefined).map((entry) => [entry.name, entry.valueFrom.secretKeyRef.key]);
+  assert.deepEqual(references(manifest.renderJob(pinned, "maintenance", IMAGE)),
+    [["IDENTITY_LINK_SECRET", "1"], ["DISTRIBUTION_GITHUB_API_TOKEN", "2"]]);
+  assert.deepEqual(references(manifest.renderJob(unpinnedOptional, "maintenance", IMAGE)), [["IDENTITY_LINK_SECRET", "1"]],
+    "an optional secret with no pinned version is omitted");
+  // A secret named by a plane id is referenced by that id, as the service does.
+  const renamed = manifest.validateDesiredState(unmarked((value) => { value.secrets.IDENTITY_LINK_SECRET.secretName = "tibotattle-identity-link"; }));
+  assert.deepEqual(manifest.renderJob(renamed, "maintenance", IMAGE).spec.template.spec.template.spec.containers[0].env
+    .find((entry) => entry.name === "IDENTITY_LINK_SECRET").valueFrom.secretKeyRef, { name: "tibotattle-identity-link", key: "1" });
+  // The bucket proof is the closed record the service renders, byte for byte.
+  const serviceProof = manifest.renderService(pinned, IMAGE).spec.template.spec.containers[0].env
+    .find((entry) => entry.name === "GCS_QUARANTINE_BUCKET_HISTORY_PROOF").value;
+  assert.equal(manifest.renderJob(pinned, "maintenance", IMAGE).spec.template.spec.template.spec.containers[0].env
+    .find((entry) => entry.name === "GCS_QUARANTINE_BUCKET_HISTORY_PROOF").value, serviceProof);
+  // No secret value, key, token or JWK is anywhere in a render.
+  assert.doesNotMatch(JSON.stringify(manifest.renderJob(pinned, "maintenance", IMAGE)), /BEGIN [A-Z ]+KEY|"kty"|ghp_|ya29\./u);
+
+  // The render waits for what only the desired state can supply.
+  const noNamespace = manifest.validateDesiredState(unmarked((value) => { value.service.telemetryStorageNamespace = null; }));
+  assert.equal(manifest.jobRenderBlocker(noNamespace, "maintenance"), "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED");
+  assert.equal(manifest.jobRenderBlocker(noNamespace, "analytics-refresh"), null, "the refresh reads no namespace");
+  assert.equal(manifest.jobRenderBlocker(noNamespace, "production-migrate"), null);
+  assert.throws(() => manifest.renderJob(noNamespace, "maintenance", IMAGE), { code: "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED" });
+  assert.equal(manifest.renderJob(noNamespace, "analytics-refresh", IMAGE).kind, "Job");
+  const noProof = manifest.validateDesiredState(unmarked((value) => { value.bucket.proof = null; }));
+  assert.throws(() => manifest.renderJob(noProof, "maintenance", IMAGE), { code: "JOB_RENDER_BUCKET_PROOF_UNPINNED" });
+  assert.equal(manifest.renderJob(noProof, "analytics-refresh", IMAGE).kind, "Job");
+  const noSecret = manifest.validateDesiredState(unmarked((value) => { value.secrets.IDENTITY_LINK_SECRET.version = null; }));
+  assert.throws(() => manifest.renderJob(noSecret, "maintenance", IMAGE), { code: "SECRET_VERSION_UNPINNED:IDENTITY_LINK_SECRET" });
+  // A staging plane cannot have it until the staging service template supplies the plane's own values.
+  const staging = manifest.validateDesiredState(unmarked(stagingNames));
+  assert.deepEqual({ ...manifest.JOB_ENVIRONMENT_UNAVAILABLE.maintenance }, { staging: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
+  assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE");
+  assert.throws(() => manifest.renderJob(staging, "maintenance", IMAGE), { code: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
+  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual([...manifest.deployedJobNames(pinned)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.throws(() => manifest.jobRenderBlocker(pinned, "analytics-delivery"), { code: "JOB_NAME_UNKNOWN" });
+
+  // Its trigger runs the job through the Cloud Run Admin API, in UTC, with no retry, every minute.
+  assert.deepEqual([...manifest.schedulerFlags(pinned, "maintenance")], [
+    `--project=${UNMARKED_PROJECT}`,
+    "--location=us-east1",
+    "--schedule=* * * * *",
+    "--time-zone=Etc/UTC",
+    `--uri=https://run.googleapis.com/v2/projects/${UNMARKED_PROJECT}/locations/us-east1/jobs/synthetic-maintenance:run`,
+    "--http-method=POST",
+    `--oauth-service-account-email=${pinned.serviceAccounts.scheduler.email}`,
+    "--oauth-token-scope=https://www.googleapis.com/auth/cloud-platform",
+    "--max-retry-attempts=0",
+  ]);
+
+  // The binding refuses a render that drifts from the contract in any field it states.
+  const rendered = manifest.renderJob(pinned, "maintenance", IMAGE);
+  const taskOf = (value) => value.spec.template.spec.template.spec;
+  const containerOf = (value) => taskOf(value).containers[0];
+  const addEnv = (name, value) => (doctored) => { containerOf(doctored).env.push({ name, value }); };
+  for (const [label, mutate] of [
+    ["timeout 3600", (value) => { taskOf(value).timeoutSeconds = "3600"; }],
+    ["1Gi", (value) => { containerOf(value).resources.limits.memory = "1Gi"; }],
+    ["2 vCPU", (value) => { containerOf(value).resources.limits.cpu = "2"; }],
+    ["retries", (value) => { taskOf(value).maxRetries = 3; }],
+    ["two tasks", (value) => { value.spec.template.spec.taskCount = 2; }],
+    ["staging profile", (value) => { containerOf(value).args[1] = "--profile=staging-maintenance-job"; }],
+    ["another entry", (value) => { containerOf(value).args[0] = "dist/analytics-refresh.mjs"; }],
+    ["extra argument", (value) => { containerOf(value).args.push("--now=1"); }],
+    ["migrator account", (value) => { taskOf(value).serviceAccountName = pinned.serviceAccounts.migrator.email; }],
+    ["HOST_MODE", addEnv("HOST_MODE", "production")],
+    ["K_SERVICE", addEnv("K_SERVICE", "synthetic-origin")],
+    ["local endpoint", addEnv(`${contract.refusedPrefixes[0]}SOCKET`, "/private/tmp/x/socket")],
+    ["tunable", addEnv("POSTGRES_MAINTENANCE_JOB_PAGE", "10")],
+    ["job name set by hand", addEnv("CLOUD_RUN_JOB", "synthetic-maintenance")],
+    ["unrelated env", addEnv("PGOPTIONS", "-c x=y")],
+    ["missing proof", (value) => { containerOf(value).env = containerOf(value).env.filter((entry) => entry.name !== "GCS_QUARANTINE_BUCKET_HISTORY_PROOF"); }],
+    ["proof of another bucket", (value) => {
+      containerOf(value).env.find((entry) => entry.name === "GCS_QUARANTINE_BUCKET_HISTORY_PROOF").value = JSON.stringify({
+        bucket: "synthetic-other-bucket", bucketGeneration: "1700000000000001", bucketMetageneration: "1",
+        softDeleteRetentionDurationSeconds: "0" });
+    }],
+    ["maintenance switch off", (value) => { containerOf(value).env.find((entry) => entry.name === "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED").value = "disabled"; }],
+    ["secret by value", (value) => {
+      const env = containerOf(value).env;
+      env[env.findIndex((entry) => entry.name === "IDENTITY_LINK_SECRET")] = { name: "IDENTITY_LINK_SECRET", value: "synthetic-inline-value" };
+    }],
+    ["a secret the profile never reads", (value) => { containerOf(value).env.push({ name: "POSTGRES_RATE_LIMIT_SECRET",
+      valueFrom: { secretKeyRef: { name: "POSTGRES_RATE_LIMIT_SECRET", key: "1" } } }); }],
+    ["a secret at another version", (value) => { containerOf(value).env.find((entry) => entry.name === "IDENTITY_LINK_SECRET")
+      .valueFrom.secretKeyRef.key = "9"; }],
+    ["a secret under another name", (value) => { containerOf(value).env.find((entry) => entry.name === "IDENTITY_LINK_SECRET")
+      .valueFrom.secretKeyRef.name = "tibotattle-other-secret"; }],
+    ["source commit", (value) => { containerOf(value).env.find((entry) => entry.name === "DEPLOYMENT_SOURCE_COMMIT").value = "c".repeat(40); }],
+  ]) {
+    const doctored = structuredClone(rendered);
+    mutate(doctored);
+    assert.throws(() => assertMaintenanceRenderIsJobContract(doctored, pinned), undefined, label);
+  }
+  assertMaintenanceRenderIsJobContract(structuredClone(rendered), pinned);
+});
+
+test("the OPS-4 probe contract is consistent with the estate it would be registered in", () => {
+  // The log-redaction posture is the Cloud SQL logging posture OPS-2 renders, setting for setting.
+  for (const [name, value] of Object.entries(probeContract.OPS_LOG_REDACTION_SETTINGS)) {
+    assert.equal(manifest.CLOUD_SQL_LOGGING_FLAGS[name], value, name);
+  }
+  const runtime = probeContract.OPS_PROBE_JOBS["ops-runtime-probe"];
+  const backup = probeContract.OPS_PROBE_JOBS["ops-backup-audit"];
+  // The runtime probe runs as an account the manifest already manages; its one read-only
+  // connection fits in the budget's headroom, so registering it needs no new account or budget.
+  assert.ok(manifest.SERVICE_ACCOUNT_ROLES.includes(runtime.account));
+  assert.ok(runtime.pools.primary <= manifest.CONNECTION_HEADROOM);
+  // The audit's account (opsBackupAudit) is not managed yet: that is the owner decision the receipt names.
+  assert.equal(manifest.SERVICE_ACCOUNT_ROLES.includes(backup.account), false);
+  assert.deepEqual(Object.keys(backup.pools), []);
+  // Both cadences are valid five-field crons by the validator that owns the scheduler's grammar.
+  for (const job of [runtime, backup]) {
+    assert.equal(manifest.validateDesiredState(fixture((value) => { value.scheduler["analytics-refresh"].schedule = job.schedule; }))
+      .scheduler["analytics-refresh"].schedule, job.schedule);
+  }
+  // Neither probe is a job of the estate yet, and the manifest renders no job the contract does not name.
+  assert.deepEqual(manifest.JOB_NAMES.filter((name) => Object.hasOwn(probeContract.OPS_PROBE_JOBS, name)), []);
+  // The runtime probe's application name is not the maintenance job's pool name.
+  assert.notEqual(runtime.applicationName, maintenanceContract.POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME);
+});
+
 test("the connection budget is for one instance with no ledger pool and refuses overflow", () => {
   assert.deepEqual(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE, { primary: 8 });
   const desired = manifest.validateDesiredState(fixture());
-  // (4 + 4) x 8 + 4 + 1 + 3 + 10 = 82.
+  // (4 + 4) x 8 + (4 + 2) + 1 + 3 + 10 = 84: the scheduled jobs are the
+  // refresh (4) and the maintenance pass (2); the migration runs alone (1).
   assert.deepEqual({ ...desired.connectionBudget }, {
-    perInstance: 8, instances: 8, serviceConnections: 64, jobBudget: 4, migration: 1,
-    superuserReserved: 3, headroom: 10, total: 82, maxConnections: 100, fits: true,
+    perInstance: 8, instances: 8, serviceConnections: 64, jobBudget: 6, migration: 1,
+    superuserReserved: 3, headroom: 10, total: 84, maxConnections: 100, fits: true,
   });
-  assert.equal(manifest.validateDesiredState(fixture((value) => { value.cloudSql.maxConnections = 82; }))
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.cloudSql.maxConnections = 84; }))
     .connectionBudget.fits, true);
-  refused((value) => { value.cloudSql.maxConnections = 81; }, "CONNECTION_BUDGET_EXCEEDED");
+  refused((value) => { value.cloudSql.maxConnections = 83; }, "CONNECTION_BUDGET_EXCEEDED");
+  refused((value) => { value.jobs.maintenance.maxConnections = 19; }, "CONNECTION_BUDGET_EXCEEDED");
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.jobs.maintenance.maxConnections = 18; }))
+    .connectionBudget.fits, true);
   refused((value) => { value.service.maxInstances = 6; value.service.rolloutOverlapInstances = 6; },
     "CONNECTION_BUDGET_EXCEEDED");
   refused((value) => { value.jobs["analytics-refresh"].maxConnections = 23; }, "CONNECTION_BUDGET_EXCEEDED");
@@ -781,17 +1073,39 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
     region: "us-east1",
     service: "synthetic-origin",
     migrationJob: "synthetic-production-migrate",
-    // Both jobs deploy, so the rollout moves both.
-    jobNames: ["synthetic-production-migrate", "synthetic-analytics-refresh"],
+    // Every job deploys, so the rollout moves each of them, the maintenance pass included.
+    jobNames: ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance"],
     primaryInstance: "synthetic-primary",
     imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
     builderServiceAccount: `synthetic-builder@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
     // The EP-6 verifier path roll reads /api/health through outside gcp mode.
     verifierServiceAccount: `synthetic-verifier@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
     originAudience: "synthetic-edge-origin-audience",
+    // The deployed maintenance Job (D-OPS4): OPS-10 runs one lifecycle pass
+    // after the roll and before it verifies (D-CRB).
+    maintenanceJob: "synthetic-maintenance",
   });
+  assert.equal(manifest.MAINTENANCE_JOB_KEY, "maintenance");
+  assert.equal(manifest.JOB_NAMES.includes(manifest.MAINTENANCE_JOB_KEY), true);
   assert.equal(Object.isFrozen(target.jobNames), true);
-  assert.equal(manifest.rolloutTarget("staging", { readFile }).service, "synthetic-staging-origin");
+  assert.deepEqual(rollout.validateRolloutTarget(target, "production"), target);
+  // A staging plane cannot have the maintenance Job yet
+  // (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE): the rollout does not
+  // move it, and the target names no maintenance Job although the staging
+  // desired state names one, so the target stays valid (one of jobNames or
+  // null) and OPS-10 refuses the origin-verifier roll there
+  // (ROLLOUT_MAINTENANCE_JOB_REQUIRED) instead of throwing.
+  const staging = manifest.rolloutTarget("staging", { readFile });
+  assert.equal(staging.service, "synthetic-staging-origin");
+  assert.deepEqual([...staging.jobNames], ["synthetic-staging-migrate", "synthetic-staging-refresh"]);
+  assert.equal(staging.maintenanceJob, null);
+  assert.deepEqual(rollout.validateRolloutTarget(staging, "staging"), staging);
+  // Every validated desired state carries the maintenance entry (the job
+  // list is exactly JOB_NAMES), so the derivation never reads a missing key.
+  assert.throws(() => manifest.validateDesiredState(unmarked((value) => {
+    stagingNames(value);
+    delete value.jobs.maintenance;
+  })), { code: "JOB_NAMES_MISMATCH" });
   const refusedWith = (environment, text, code) => {
     const reader = (path) => (path === manifest.committedDesiredStatePath(environment) ? text : readFile(path));
     assert.throws(() => manifest.rolloutTarget(environment, { readFile: reader }), { code }, `${environment} ${code}`);
@@ -845,6 +1159,9 @@ test("OPS-10 accepts the rendered migration job and the rollout target (integrat
     const target = manifest.rolloutTargetFromDesiredState(desired);
     assert.deepEqual(rollout.validateRolloutTarget(target, desired.environment), target);
     assert.equal(target.migrationJob, rendered.metadata.name);
+    // Production deploys the maintenance Job and names it; staging cannot (D-OPS4).
+    assert.equal(target.maintenanceJob,
+      desired.environment === "production" ? manifest.renderJob(desired, "maintenance", IMAGE).metadata.name : null);
   }
 });
 
@@ -982,7 +1299,16 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   // Its service waits for a staging template; everything else renders.
   assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_SERVICE_TEMPLATE_UNAVAILABLE");
   assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE" });
-  for (const job of manifest.JOB_NAMES) assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
+  for (const job of manifest.JOB_NAMES) {
+    if (job === "maintenance") continue;
+    assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
+  }
+  // Its maintenance job waits for the staging plane's own origins and identity values (the service template's).
+  assert.equal(manifest.jobRenderBlocker(desired, "maintenance"), "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE");
+  assert.throws(() => manifest.renderJob(desired, "maintenance", IMAGE), { code: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
+  assert.deepEqual([...manifest.deployedJobNames(desired)], ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual(desired.scheduler.maintenance, {
+    name: "tibotattle-staging-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
   // Its refresh job is the entry's production job, and the entry accepts its staging names.
   await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
 });

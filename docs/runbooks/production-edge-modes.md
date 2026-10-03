@@ -280,6 +280,24 @@ verifier is limited at the origin to plain `GET /api/health` and
   deploy's `--origin-commit`.
 - **Receipts:** they hold statuses and the origin commit only, never a token, an
   email or a key.
+- **First roll:** `/api/ready` reads the rows C-MAINT's lifecycle pass writes,
+  so a freshly migrated origin answers `503` until one pass has run. The
+  rollout tool (`scripts/gcp-production-rollout.mjs`) runs one execution of
+  the target's maintenance job (the desired state's `maintenance` job,
+  D-OPS4) after the roll and before it verifies. Staging cannot deploy that
+  job yet, so a staging target names none; while the edge is not in gcp mode
+  (the roll then verifies through this verifier), a target without a
+  `maintenanceJob` is refused before any write
+  (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). The same tool refuses a target whose
+  edge `upstreamOrigin` is not the rolled service's run.app origin (the
+  origin's `HOST_ORIGIN`).
+- **Finding F8 status:** the edge decision record's F8 (the fast-path test
+  origin serves no `/api/ready`, so no gcp deploy can pass) is closed in
+  source, not in deployment: the production origin (`HOST_MODE=production`
+  or `staging`, D-CRB) and the fastpath-test mode serve Worker-shaped
+  `/api/health` (RD-3) and `/api/ready` (RD-2). The verifier passes only
+  against a rolled production-host revision after its first maintenance
+  pass, and none is deployed yet.
 
 ## 6. Releases and deploys in gcp mode
 
@@ -321,6 +339,49 @@ Edge logs are content-free JSON lines.
 | The same | `edge_upstream_unavailable` with `EDGE_UPSTREAM_UNMARKED` | An unmarked answer: Google's front end refused, Cloud Run was overloaded, or the origin boundary returned its 421 |
 | Admin 403 or 503 | `edge_admin_chokepoint_refused` | The Access chokepoint refused a forwarded admin-host request |
 | Overview without Cloudflare download figures | `edge_distribution_merge_skipped` | The merge failed; the origin's bytes were served unchanged |
+
+### Origin answers that differ from the Worker (OD-CR-6)
+
+The GCP origin answers the Worker's routes with the Worker's codes and
+envelopes, with these owner-accepted differences (owner decisions,
+2026-10-02):
+
+- **(i) Request id, fixed.** Every error envelope carries the edge's
+  `x-tibotattle-edge-request-id`, so the edge, origin and client lines join
+  on one id.
+- **(ii) A query string on POST routes is refused.** A query string on a
+  v1.2 POST route (among them `POST /api/v1/contributions`) or on
+  `POST /api/v1/device/upload-authorizations` answers
+  `503 POSTGRES_TEST_ROUTE_UNSUPPORTED` in the Worker envelope
+  (`{"error":{"code","requestId"}}`, the edge's request id, no
+  `retry-after`), where the Worker ignores the query. No shipped client
+  sends one.
+- **(iii) The storage 503 can come first.** While the origin's migration
+  receipt does not match its image (a migration applied ahead of the roll),
+  the storage-gated routes answer `503 BACKEND_STORAGE_UNAVAILABLE`, which
+  can precede refusals the Worker makes from the request alone (method,
+  body shape, credentials). The gate rereads the receipt on every request.
+- **(iv) Unported routes send no `retry-after`.** They answer
+  `503 POSTGRES_ROUTE_NOT_PORTED`, so clients that retry only on a
+  `retry-after` do not retry them.
+- **(v) Assets get a JSON 404.** A request for an asset path that reaches the
+  origin answers the Worker's JSON `404 NOT_FOUND`, not an HTML page. The
+  edge serves the site's assets itself, so only a request the edge forwards
+  by mistake sees it.
+
+One more difference has no owner decision yet. **Status answers are reused
+for up to 1 s.** Concurrent `/api/ready` and `/api/health` requests on one
+instance share a single evaluation, and a completed evaluation (ready or
+not ready) is reused for up to 1 s (`STATUS_REUSE_MILLISECONDS` in
+`cloud-run/postgres-readiness-dispatch.mjs`, from the wave-3 host design).
+A refusal such as `503 BACKEND_STORAGE_UNAVAILABLE` is never reused. The
+Worker evaluates every request, so OD-CR-4 ("`/api/ready` matches the
+Worker exactly") does not cover this reuse: a change to the lifecycle rows,
+the migration receipt or a typed pin can show on these two routes up to
+1 s late, and in that second the stale answer can be `ready` as well as
+not ready. The storage-gated routes reread the receipt on every request and
+are not affected. Until the owner accepts or removes the reuse, read
+`/api/ready` more than 1 s after the change it must reflect.
 
 ## 7. Local proof and the optional live check
 
@@ -381,7 +442,9 @@ creates.
   non-Cloudflare host, which Miniflare does not add; the
   [edge IP probe](../../apps/worker/scripts/edge-ip-probe/README.md) observes
   those), Workers Rate Limiting across locations, Access, custom domains, the
-  production origin composition (CR-6 and CR-7) or production data.
+  `HOST_MODE` production composition (CR-7; `postgres-production-host.spec.mjs`
+  rehearses it locally) or production data. The edge-test origin already
+  answers through the CR-6 handler and registry the production host uses.
 
 ### Optional live check (OD-E3)
 
@@ -403,8 +466,9 @@ authorization in chat for each of these:
    `POST /api/v1/contributions` answers `503 BACKEND_STORAGE_UNAVAILABLE`. The
    seed and migrate steps grant the runtime role `EXECUTE` on
    `storage_journal_append` and `storage_owner_link_ensure`; without it the
-   v1.2 domain activation answers 503. In fastpath-test mode `/api/ready`
-   answers `503 POSTGRES_TEST_ROUTE_UNSUPPORTED` by design (F8).
+   v1.2 domain activation answers 503. `/api/ready` is the Worker-shaped
+   readiness (RD-2): it answers `503` until a lifecycle pass has run on the
+   seeded schema.
 2. Run the read-only tier:
    `node scripts/edge-live-check.mjs run --authorize=EDGE_LIVE_CHECK_READ_ONLY`.
 3. Separately, run the write tier, which enrolls synthetic accountless devices
@@ -425,9 +489,9 @@ names, digests and timings, never a token, a key, an email or an address.
 To explain an origin `421`, read the edge-test origin's Cloud Run log (a
 separate read-only GCP operation). Each refusal writes one content-free line,
 `{"event":"edge_origin_boundary_refusal","reason":"<code>"}`, while the client
-still gets the constant `421`. The code names the refusal site, from
-`EDGE_TEST_REQUEST_REFUSAL_REASONS` (`cloud-run/origin-edge-test-mode.mjs`,
-such as `host_mismatch`) or `EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS`
+still gets the constant `421`. The production origin writes the same line.
+The code names the refusal site, from `ORIGIN_REQUEST_REFUSAL_REASONS`
+(`cloud-run/origin-node-request.mjs`, such as `host_mismatch`) or `EDGE_ORIGIN_BOUNDARY_REFUSAL_REASONS`
 (`cloud-run/postgres-edge-origin-dispatch.mjs`, such as
 `invoker_bearer_prefix_missing`, `invoker_segments` or `audience_mismatch`).
 A refusal of the delivered `x-serverless-authorization` adds `invokerShape`:

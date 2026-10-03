@@ -21,8 +21,8 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
-  CLOUD_RUN_IAM_TEST_TARGET,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestParticipantDevicesDispatch,
   createPostgresTestPersonalSessionDispatch,
@@ -189,7 +189,10 @@ function receiptPool({ major = 17, primaryExists = true, primaryHistory, onConne
         return {
           async query(sql) {
             if (sql.startsWith("SELECT current_setting")) {
-              return { rows: [{ server_version_num: major * 10_000, schema_exists: existsFor(role) }] };
+              // The one shared reader's probe (src/postgres-schema-receipt.ts):
+              // the history table's regclass, null when it is absent.
+              return { rows: [{ server_version_num: major * 10_000, schema_exists: existsFor(role),
+                history: existsFor(role) ? "_tibotattle_migration_history" : null }] };
             }
             if (sql.startsWith("SELECT version, name, checksum_sha256")) {
               const source = expectedFor(role) ?? ONE_MIGRATION[role];
@@ -208,6 +211,39 @@ function receiptPool({ major = 17, primaryExists = true, primaryHistory, onConne
       },
     };
   };
+}
+
+/**
+ * The Worker's upload-ingress policy over the shared PostgreSQL budget, as
+ * the origin composes it (D-CRB: the contributions preamble takes the lease
+ * with the 60 s / 15 s body policy): the env keys and the injected authority.
+ */
+async function uploadIngressFixture(vite, primaryPool, primarySchema) {
+  const [ingress, budgetModule] = await Promise.all([
+    vite.ssrLoadModule("/src/upload-ingress-admission.ts"),
+    vite.ssrLoadModule("/src/postgres-ingress-budget.ts"),
+  ]);
+  const budget = budgetModule.createPostgresUploadIngressBudget(primaryPool, { primarySchema });
+  return Object.freeze({
+    env: Object.freeze({
+      UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+      UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+      UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "1200",
+      UPLOAD_INGRESS_BURST: "1200",
+      UPLOAD_INGRESS_LEASE_SECONDS: "90",
+      UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+      UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+      UPLOAD_INGRESS_BUDGET: Object.freeze({ getByName: () => budget }),
+    }),
+    uploadIngress: Object.freeze({
+      assertConfiguration: ingress.assertUploadIngressConfiguration,
+      bodyReadPolicy: ingress.uploadIngressBodyReadPolicy,
+      acquireLease: ingress.acquireUploadIngressLease,
+      startHeartbeat: ingress.startUploadIngressLeaseHeartbeat,
+      releaseLease: ingress.releaseUploadIngressLease,
+    }),
+    budget,
+  });
 }
 
 async function localPostgresEndpoint() {
@@ -920,6 +956,42 @@ test("partial HTTP health fails closed when the database or its receipt is unava
   assert.equal(missingResponse.status, 503);
   assert.equal((await missingResponse.json()).checks.primaryMigrationReceipt.status, "schema_missing");
 
+  // PostgreSQL 16 with a current history: the one reader refuses the major
+  // version before it reads the history, and so do the health and the gate.
+  let oldHistoryReads = 0;
+  const oldPools = receiptPool({ major: 16, primaryHistory: currentHistory });
+  const countingOld = (role) => {
+    const pool = oldPools(role);
+    return {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql) {
+            if (sql.startsWith("SELECT version, name, checksum_sha256")) oldHistoryReads += 1;
+            return client.query(sql);
+          },
+          release() { client.release(); },
+        };
+      },
+    };
+  };
+  const old = createPostgresTestHealthDispatch({
+    primaryPool: countingOld("primary"),
+    schemaOptions: { primarySchema: "health_primary" },
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const oldResponse = await old(new Request("http://127.0.0.1:8080/api/health"));
+  assert.equal(oldResponse.status, 503);
+  assert.equal((await oldResponse.json()).checks.primaryMigrationReceipt.status, "unsupported_postgres_version");
+  const oldGate = createPostgresTestStorageReceiptCheck({
+    primaryPool: countingOld("primary"),
+    schemaOptions: { primarySchema: "health_primary" },
+    expectedMigrations: ONE_MIGRATION,
+  });
+  await assert.rejects(oldGate(), (error) => error?.status === 503 && error?.code === "BACKEND_STORAGE_UNAVAILABLE");
+  assert.equal(oldHistoryReads, 0, "no history read on an unsupported major");
+
   // The health and storage gate take one pool and the primary manifest only:
   // a stale composition that passes a second pool, a second schema or a
   // second manifest role is refused at construction (LEAD-SIMP).
@@ -970,7 +1042,7 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
       "PRIMARY_INSTANCE_CONNECTION_NAME", "POSTGRES_IAM_USER",
       "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET",
       "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET",
-      "SIGN_IN_START_MAX_PER_MINUTE"]) {
+      "SIGN_IN_START_MAX_PER_MINUTE", "HOST_MODE", "DEPLOYMENT_SOURCE_COMMIT", "LEDGER_DATABASE"]) {
       delete baseEnv[name];
     }
     const blocked = spawnSync(process.execPath, [bundlePath], {
@@ -1071,6 +1143,44 @@ test("host startup keeps loopback modes and rejects missing or mismatched Cloud 
         code: "POSTGRES_TEST_HTTP_MODE_INVALID",
       });
     }
+
+    // HOST_MODE (D-CRB): an unknown value and a test mode beside it are
+    // refused first; the maintenance CLI and the owner fixture commands are
+    // never the request-serving origin's; with a valid mode, CR-3 alone
+    // configures it and its codes pass through (a set-but-empty test mode,
+    // a ledger setting, the first missing setting).
+    for (const [label, args, environment, code] of [
+      ["an unknown mode", [], { HOST_MODE: "preview" }, "HOST_MODE_INVALID"],
+      ["a test mode beside it", [], { HOST_MODE: "production", POSTGRES_TEST_HTTP_MODE: "fastpath-test" },
+        "HOST_MODE_CONFLICT"],
+      ["the scheduled CLI", ["--scheduled"], { HOST_MODE: "production",
+        POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: "enabled" }, "POSTGRES_SCHEDULED_HOST_MODE_FORBIDDEN"],
+      ["the owner bootstrap", ["--bootstrap-owner"], { HOST_MODE: "staging" }, "HOST_MODE_COMMAND_UNSUPPORTED"],
+      ["the owner session refresh", ["--refresh-owner-session"], { HOST_MODE: "production" },
+        "HOST_MODE_COMMAND_UNSUPPORTED"],
+      ["an empty test mode", [], { HOST_MODE: "production", POSTGRES_TEST_HTTP_MODE: "" },
+        "POSTGRES_TEST_HTTP_MODE_FORBIDDEN"],
+      ["a ledger setting", [], { HOST_MODE: "production", LEDGER_DATABASE: "synthetic_ledger" },
+        "LEDGER_DATABASE_FORBIDDEN"],
+      ["no settings", [], { HOST_MODE: "production" }, "DEPLOYMENT_SOURCE_COMMIT_MISSING"],
+    ]) {
+      const refused = spawnSync(process.execPath, [bundlePath, ...args], {
+        cwd: ROOT,
+        env: { ...baseEnv, ...environment },
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      assert.equal(refused.status, 1, label);
+      assert.deepEqual(JSON.parse(refused.stderr.trim()), { status: "error", code }, label);
+    }
+    // Without a test mode or HOST_MODE no request path exists: the dispatch
+    // answers the closed 503 and never reaches a Worker handler.
+    const unsupported = await dispatchCloudRunHostRequest(
+      new Request("http://127.0.0.1:8080/api/v1/community/daily"), {});
+    assert.equal(unsupported.status, 503);
+    const unsupportedBody = await unsupported.json();
+    assert.equal(unsupportedBody.error.code, "POSTGRES_REQUEST_PATH_UNSUPPORTED");
+    assert.match(unsupportedBody.error.requestId, /^[0-9a-f-]{36}$/u);
 
     const proof = (bucket, extra = {}) => JSON.stringify({
       bucket,
@@ -1540,7 +1650,7 @@ test("private health dispatch validates the current primary PostgreSQL 17 receip
         },
       },
     });
-    assert.equal(POSTGRES_RUNTIME_MIGRATIONS.primary.length, 67);
+    assert.equal(POSTGRES_RUNTIME_MIGRATIONS.primary.length, 69);
     assert.equal(JSON.stringify(health).includes(primarySchema), false);
     assert.equal(Object.hasOwn(health.checks, "database"), false);
     assert.ok(connections >= 1);
@@ -2393,10 +2503,12 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       [nowIso],
     );
 
+    const ingressFixture = await uploadIngressFixture(vite, primaryPool, primarySchema);
     const admissionEnv = {
       ENVIRONMENT: "test",
       ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
       ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+      ...ingressFixture.env,
     };
     for (const [binding, name, limit] of [
       ["ENROLLMENT_RATE_LIMIT", "ENROLLMENT", 20],
@@ -2474,6 +2586,7 @@ test("loopback device sync dispatch uses real PostgreSQL authority and never rea
       assertUploadAuthorizationBindings: admission.assertUploadAuthorizationBindings,
       assertUploadAuthorizationAllowed: admission.assertUploadAuthorizationAllowed,
       assertUploadIngressRequestAllowed: admission.assertUploadIngressRequestAllowed,
+      uploadIngress: ingressFixture.uploadIngress,
       authenticatePostgresDevice: transport.authenticatePostgresDevice,
       disconnectPostgresAuthenticatedDevice:
         postgresDeviceDisconnectAdapter.disconnectPostgresAuthenticatedDevice,

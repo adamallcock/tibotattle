@@ -24,6 +24,7 @@
  * never an identifier, digest or row value.
  */
 
+import { sha256Hex } from "../crypto";
 import { quotePostgresIdentifier, withPostgresRead, type PostgresClient } from "../postgres-client";
 import {
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
@@ -31,6 +32,13 @@ import {
   type AnalyticsV2OwnerSource,
   type AnalyticsV2ReadContext,
 } from "./contract";
+import {
+  ANALYTICS_V2_EXCLUSION_SCOPE,
+  ANALYTICS_V2_EXCLUSION_STATES,
+  analyticsV2ExclusionsSha256,
+  type AnalyticsV2ExclusionInterval,
+  type AnalyticsV2ExclusionRow,
+} from "./exclusions";
 
 // ---------------------------------------------------------------------------
 // Shared read primitives
@@ -66,6 +74,108 @@ export interface AnalyticsV2SnapshotContext extends AnalyticsV2ReadContext {
 
 const READ_TIMEOUT_MS = 300_000;
 
+/**
+ * The closed statement families of the A-1 readers (K-PGSTAT). Every reader
+ * statement starts with the comment `/* analytics_v2:<family> *\/`, so the
+ * refresh Job's statement ledger can attribute client wall time, rows and
+ * bytes per family, and pg_stat_statements (which keeps the first query text
+ * of each queryid, comments included) can attribute server execution and
+ * planning time to the same families. The tag is a code constant: it never
+ * carries a value, an identifier or a schema name.
+ */
+export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
+  "snapshot.read_only",
+  "snapshot.plan_cache",
+  "owners.runtime",
+  "owners.roster",
+  "occurrences.scope",
+  "occurrences.legacy_candidates",
+  "occurrences.v12_candidates",
+  "occurrences.correction_candidates",
+  "occurrences.legacy_sources",
+  "occurrences.v12_sources",
+  "occurrences.correction_sources",
+  "occurrences.counts",
+  "occurrences.first_evidence",
+  "occurrences.watermark",
+  "devices.count",
+  "queued_days.page",
+  "exclusions.read",
+] as const);
+export type AnalyticsV2StatementFamily = (typeof ANALYTICS_V2_STATEMENT_FAMILIES)[number];
+
+/** `sql` with its family tag (see ANALYTICS_V2_STATEMENT_FAMILIES). */
+export function analyticsV2Statement(family: AnalyticsV2StatementFamily, sql: string): string {
+  if (!(ANALYTICS_V2_STATEMENT_FAMILIES as readonly string[]).includes(family)) {
+    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
+  }
+  return `/* analytics_v2:${family} */ ${sql}`;
+}
+
+/**
+ * A named (server-side prepared) statement (K-READ): PostgreSQL parses and
+ * plans it once per connection, so a statement a run issues thousands of
+ * times is not re-planned for every call. The name is derived from the full
+ * text (schema included), so one connection never binds a name to two texts.
+ * The Job's snapshot read pool and node-pg's own client both accept the
+ * { name, text, values } form; it changes no row, only the planning work.
+ */
+export interface AnalyticsV2PreparedStatement {
+  readonly name: string;
+  readonly text: string;
+}
+
+const PREPARED_NAME_PREFIX = "a2_";
+
+export async function analyticsV2PreparedStatement(family: AnalyticsV2StatementFamily,
+  sql: string): Promise<AnalyticsV2PreparedStatement> {
+  const text = analyticsV2Statement(family, sql);
+  const digest = await sha256Hex(text);
+  return Object.freeze({ name: `${PREPARED_NAME_PREFIX}${family.replace(/\./gu, "_")}_${digest.slice(0, 16)}`, text });
+}
+
+/** Run a prepared statement on `client` (see analyticsV2PreparedStatement). */
+export async function queryPrepared<Row extends object = Record<string, unknown>>(client: PostgresClient,
+  statement: AnalyticsV2PreparedStatement, values: unknown[]): Promise<{ rows: Row[] }> {
+  const preparing = client as unknown as {
+    query(config: { name: string; text: string; values: unknown[] }): Promise<{ rows: Row[] }>;
+  };
+  return preparing.query({ name: statement.name, text: statement.text, values });
+}
+
+/**
+ * Plan the rest of the caller's read-only transaction's prepared statements
+ * generically (K-READ). PostgreSQL's default (`auto`) keeps re-planning a
+ * prepared statement whose estimated generic cost exceeds its custom plans,
+ * which for the fenced expansion statements is every call; their plan shape
+ * is fixed by the MATERIALIZED fences and OFFSET 0 laterals, so the generic
+ * plan executes no slower (measured on the dense and Q-1 corpora, K-CORE-A
+ * receipt). Transaction-local: it ends with the reader's transaction.
+ */
+export async function withGenericPlans<T>(client: PostgresClient, operation: () => Promise<T>): Promise<T> {
+  const set = await client.query<{ previous: unknown }>(analyticsV2Statement("snapshot.plan_cache",
+    "SELECT current_setting('plan_cache_mode') AS previous, set_config('plan_cache_mode','force_generic_plan',true)"));
+  const previous = set.rows[0]?.previous;
+  if (typeof previous !== "string" || !/^[a-z_]{1,32}$/u.test(previous)) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+  let failed = false;
+  try {
+    return await operation();
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    // Restore the caller's mode: a caller-supplied snapshot may run more
+    // statements in the same transaction. After a failure the operation's own
+    // error is kept (an aborted transaction refuses the restore anyway).
+    try {
+      await client.query(analyticsV2Statement("snapshot.plan_cache",
+        "SELECT set_config('plan_cache_mode',$1,true)"), [previous]);
+    } catch (error) {
+      if (!failed) throw error;
+    }
+  }
+}
+
 /** The pinned clock as a timestamptz bind value (millisecond ISO-8601). */
 export function nowTimestamp(nowMs: unknown): string {
   if (typeof nowMs !== "number" || !Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > 8_640_000_000_000_000) {
@@ -88,7 +198,8 @@ function preserve(error: unknown): Error | null {
 }
 
 async function assertReadOnly(client: PostgresClient): Promise<void> {
-  const result = await client.query<{ read_only: unknown }>("SELECT current_setting('transaction_read_only') AS read_only");
+  const result = await client.query<{ read_only: unknown }>(analyticsV2Statement("snapshot.read_only",
+    "SELECT current_setting('transaction_read_only') AS read_only"));
   if (result.rows.length !== 1 || result.rows[0]?.read_only !== "on") sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
 }
 
@@ -353,9 +464,11 @@ export async function listAnalyticsV2Owners(context: AnalyticsV2SnapshotContext)
   const s = quotedSchema(context.schema);
   const now = nowTimestamp(context.nowMs);
   return onReadSnapshot(context, async (client) => {
-    const runtime = await client.query<{ active: unknown }>(`SELECT ${correctionRuntimeActiveSql(s)} AS active`);
+    const runtime = await client.query<{ active: unknown }>(analyticsV2Statement("owners.runtime",
+      `SELECT ${correctionRuntimeActiveSql(s)} AS active`));
     const correctionRuntimeActive = flag(runtime.rows[0]?.active);
-    const result = await client.query<OwnerRow>(analyticsV2OwnersSql(s), [now, MAX_ANALYTICS_V2_OWNERS + 1]);
+    const result = await client.query<OwnerRow>(analyticsV2Statement("owners.roster", analyticsV2OwnersSql(s)),
+      [now, MAX_ANALYTICS_V2_OWNERS + 1]);
     if (result.rows.length > MAX_ANALYTICS_V2_OWNERS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
     const owners: AnalyticsV2Owner[] = [];
     const unlinked: AnalyticsV2UnlinkedOwner[] = [];
@@ -385,4 +498,131 @@ export async function listAnalyticsV2Owners(context: AnalyticsV2SnapshotContext)
     }
     return Object.freeze({ owners: Object.freeze(owners), unlinked: Object.freeze(unlinked), correctionRuntimeActive });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Community aggregate exclusions (N-EXCL)
+// ---------------------------------------------------------------------------
+
+/** Bound on one exclusion read; a larger table fails closed (LIMIT). */
+export const MAX_ANALYTICS_V2_EXCLUSIONS = 100_000;
+const EXCLUSION_ID = /^[^\u0000-\u001f\u007f]{1,120}$/u;
+const MICROSECONDS = /^(?:0|[1-9]\d{0,15})$/u;
+
+/** What one run read of community_aggregate_exclusions (exclusions.ts has the contract). */
+export interface AnalyticsV2Exclusions {
+  /** Rows of every state, and those in state 'active'. */
+  readonly rows: number;
+  readonly active: number;
+  /** analyticsV2ExclusionsSha256 of every row: the run row records it (exclusions_sha256). */
+  readonly sha256: string;
+  /** participant id -> its active exclusions, in exclusion-id order. */
+  readonly activeByParticipant: ReadonlyMap<string, readonly AnalyticsV2ExclusionInterval[]>;
+}
+
+function microsecondsOf(value: unknown, nullable: boolean): number | null {
+  if (value === null && nullable) return null;
+  if (typeof value !== "string" || !MICROSECONDS.test(value)) return sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+  return safeInteger(value);
+}
+
+/**
+ * Read community_aggregate_exclusions in the run's snapshot (N-EXCL): every
+ * row, so the run can apply the active ones per day (exclusions.ts) and
+ * record the digest of all of them. The table is required (primary 0066): a
+ * schema without it is ANALYTICS_V2_SOURCE_UNAVAILABLE, never "no
+ * exclusions", or operator exclusions would silently stop applying. A scope
+ * or state the contract does not define is ANALYTICS_V2_SOURCE_CONFLICT: its
+ * effect on the community outputs would be unknown. Instants are read in
+ * microseconds, PostgreSQL's own resolution. Nothing read here reaches a
+ * receipt except counts.
+ */
+export async function readAnalyticsV2Exclusions(context: AnalyticsV2SnapshotContext): Promise<AnalyticsV2Exclusions> {
+  const s = quotedSchema(context.schema);
+  return onReadSnapshot(context, async (client) => {
+    const present = await client.query<{ present: unknown }>(analyticsV2Statement("exclusions.read",
+      "SELECT to_regclass($1) IS NOT NULL AS present"), [`${s}.community_aggregate_exclusions`]);
+    if (present.rows[0]?.present !== true) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+    const result = await client.query<Record<string, unknown>>(analyticsV2Statement("exclusions.read",
+      `SELECT exclusion_id, participant_id, scope, state,
+              (extract(epoch FROM effective_at) * 1000000)::bigint::text AS effective_at_us,
+              (extract(epoch FROM expires_at) * 1000000)::bigint::text AS expires_at_us
+         FROM ${s}.community_aggregate_exclusions
+        ORDER BY exclusion_id COLLATE "C" LIMIT $1`), [MAX_ANALYTICS_V2_EXCLUSIONS + 1]);
+    if (result.rows.length > MAX_ANALYTICS_V2_EXCLUSIONS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+    const rows: AnalyticsV2ExclusionRow[] = [];
+    const activeByParticipant = new Map<string, AnalyticsV2ExclusionInterval[]>();
+    for (const row of result.rows) {
+      if (typeof row.exclusion_id !== "string" || !EXCLUSION_ID.test(row.exclusion_id)
+          || typeof row.participant_id !== "string" || row.participant_id.length === 0
+          || row.participant_id.length > 200) {
+        sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+      }
+      if (row.scope !== ANALYTICS_V2_EXCLUSION_SCOPE
+          || !(ANALYTICS_V2_EXCLUSION_STATES as readonly unknown[]).includes(row.state)) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      const effectiveAtUs = microsecondsOf(row.effective_at_us, false)!;
+      const expiresAtUs = microsecondsOf(row.expires_at_us, true);
+      if (expiresAtUs !== null && expiresAtUs <= effectiveAtUs) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      rows.push(Object.freeze({ exclusionId: row.exclusion_id as string, participantId: row.participant_id as string,
+        scope: row.scope as string, state: row.state as string, effectiveAtUs, expiresAtUs }));
+      if (row.state !== "active") continue;
+      const intervals = activeByParticipant.get(row.participant_id as string) ?? [];
+      intervals.push(Object.freeze({ effectiveAtUs, expiresAtUs }));
+      activeByParticipant.set(row.participant_id as string, intervals);
+    }
+    if (new Set(rows.map((row) => row.exclusionId)).size !== rows.length) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    const frozen = new Map<string, readonly AnalyticsV2ExclusionInterval[]>();
+    for (const [participantId, intervals] of activeByParticipant) frozen.set(participantId, Object.freeze(intervals));
+    return Object.freeze({
+      rows: rows.length,
+      active: rows.filter((row) => row.state === "active").length,
+      sha256: await analyticsV2ExclusionsSha256(rows),
+      activeByParticipant: frozen,
+    });
+  });
+}
+
+/** One active exclusion of a participant with its id (the evidence identity's exclusion input). */
+export interface AnalyticsV2ActiveExclusion extends AnalyticsV2ExclusionInterval {
+  readonly exclusionId: string;
+}
+
+/**
+ * One participant's active community_weekly exclusions, in exclusion-id
+ * order, read on the caller's snapshot client (F(o,d), occurrence-source.ts).
+ * The same validation and refusals as readAnalyticsV2Exclusions.
+ */
+export async function readParticipantActiveExclusions(client: PostgresClient, s: string,
+  participantId: string): Promise<readonly AnalyticsV2ActiveExclusion[]> {
+  const result = await client.query<Record<string, unknown>>(analyticsV2Statement("exclusions.read",
+    `SELECT exclusion_id,
+            (extract(epoch FROM effective_at) * 1000000)::bigint::text AS effective_at_us,
+            (extract(epoch FROM expires_at) * 1000000)::bigint::text AS expires_at_us
+       FROM ${s}.community_aggregate_exclusions
+      WHERE participant_id = $1 AND scope = '${ANALYTICS_V2_EXCLUSION_SCOPE}' AND state = 'active'
+      ORDER BY exclusion_id COLLATE "C" LIMIT $2`), [participantId, MAX_ANALYTICS_V2_EXCLUSIONS + 1]);
+  if (result.rows.length > MAX_ANALYTICS_V2_EXCLUSIONS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  return Object.freeze(result.rows.map((row) => {
+    if (typeof row.exclusion_id !== "string" || !EXCLUSION_ID.test(row.exclusion_id)) {
+      return sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+    }
+    const effectiveAtUs = microsecondsOf(row.effective_at_us, false)!;
+    const expiresAtUs = microsecondsOf(row.expires_at_us, true);
+    if (expiresAtUs !== null && expiresAtUs <= effectiveAtUs) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    return Object.freeze({ exclusionId: row.exclusion_id, effectiveAtUs, expiresAtUs });
+  }));
+}
+
+/**
+ * SQL of one participant's exclusion rows (any state) as one ordered text,
+ * for the owner watermark W(o): a new, revoked or edited row moves it.
+ * `participant` is the SQL expression of the participant id.
+ */
+export function participantExclusionsWatermarkSql(s: string, participant: string): string {
+  return `(SELECT string_agg(x.exclusion_id || ':' || x.scope || ':' || x.state || ':'
+      || (extract(epoch FROM x.effective_at) * 1000000)::bigint::text || ':'
+      || coalesce((extract(epoch FROM x.expires_at) * 1000000)::bigint::text, ''), ',' ORDER BY x.exclusion_id COLLATE "C")
+     FROM ${s}.community_aggregate_exclusions x WHERE x.participant_id = ${participant})`;
 }

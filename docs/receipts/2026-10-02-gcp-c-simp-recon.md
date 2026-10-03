@@ -26,6 +26,13 @@ that merge, the `CUTOVER-CHECKLIST.md` update, and the promotion of C-IPR's
 staged `0065_interim_public_read.sql`. `0064_append_only_residue.sql` is
 final (OD-1) and this stream did not change it.
 
+> **Supersession note, 2026-10-03 (UTC).** This receipt records the branch
+> before its merge. Since then, `-final` has merged the stream head
+> `b72ebadb` as `90a8c048`, D-CRB has delivered both of its open items, and
+> the owner's round 12 has answered OWN-17. See
+> [Status after integration](#status-after-integration). The other sections
+> are unchanged and describe the branch as committed.
+
 All evidence is **local and synthetic**: one macOS arm64 workstation, Node
 26.2.0 for tooling, Node 22.16.0 for the dist and the analytics-v2 suite, and
 the local PostgreSQL 17 fan-out cluster on a private Unix socket (port
@@ -195,3 +202,48 @@ The integrator owes the following at the merge:
   - consolidate `readSchemaReceipt` and the lifecycle pass's reader into one shared reader, and delete the `RECEIPT_READER_EXCEPTIONS` entry;
   - move `cloud-run/server.mjs`'s test-host proof read (it calls `parseGcsQuarantineBucketHistoryProof` in src, the grammar CR-3 mirrors and is pinned equal to, with the same `_MISSING`/`_INVALID` codes) onto CR-3 when the production host composes through `readProductionConfiguration`.
 - **MAINT-PURGE** is unchanged: the pass still leaves out the scheduled purges.
+
+## Status after integration
+
+This section was recorded on 2026-10-03 (UTC) against
+`claude/gcp-fastpath-final` at `6c005069`. It comes from reading the source
+with `git`. This stream reran no gate on the final line.
+
+- **Merge.** The stream head was `b72ebadb`, the third commit above. An
+  earlier stream report named `0296846c` with two commits, and that was
+  stale. `-final` merged `b72ebadb` as `90a8c048`, whose parents are
+  `999295fd` and `b72ebadb`. It then added the integration fix `092dff19`
+  and promoted C-IPR's migration as primary 0065 (`fce3572e`).
+  `CUTOVER-CHECKLIST.md` records the same stream head. The commit that adds
+  this section changes only this receipt.
+- **Receipt reader and the OD-2 grammar.** At `b72ebadb` the maintenance Job
+  uses CR-3's parse. `cloud-run/server.mjs` still reads the proof through
+  `parseGcsQuarantineBucketHistoryProof` in src, so two OD-2 grammars exist,
+  and `postgres-production-configuration.check.mjs` pins them equal. The
+  D-CRB checklist entry carries the item this receipt asked for. D-CRB's
+  `3c91cd19`, merged as `6c005069`, then did both of the D-CRB
+  [open items](#open-items):
+  - `src/postgres-schema-receipt.ts` is the one migration-receipt reader. The
+    lifecycle pass and the test dispatch import it.
+    `scripts/ledger-absence.check.mjs` has no `RECEIPT_READER_EXCEPTIONS`,
+    and its test asserts that no exception remains.
+  - `parseGcsQuarantineBucketHistoryProof` is deleted from src, which keeps
+    only the setting name. `server.mjs` reads the proof through CR-3's
+    `parseQuarantineBucketHistoryProof`, and the configuration check asserts
+    that the src export is gone.
+
+  The D-CRB checklist entry stays open until its integration gates run on
+  `6c005069`.
+- **OWN-17.** The owner answered it in round 12, at about 21:50 UTC on
+  2026-10-02, after this stream's commits. Under that answer:
+  - the admin console opens with what is ported;
+  - a section with no GCP source shows "unavailable";
+  - database health reports the removed ledger as `not_applicable`, with a
+    closed-DTO version bump.
+
+  This stream's behaviour was correct under rounds 1 to 8, and it is still
+  what `-final` does at `6c005069`. The overview is 503 until all three
+  sources are injected, and `postgres-admin-console.spec.mjs` asserts that
+  `deletion_ledger` is `not_configured` with status `degraded`. The checklist
+  item ADMIN-R12 owns the change.
+- **MAINT-PURGE** is unchanged.

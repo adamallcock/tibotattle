@@ -60,6 +60,14 @@
 //   --refresh-timeout-minutes <n>  per analytics-refresh run (default 30, at most 720)
 //   --reuse-schema <schema>     skip steps 1 to 3 and run against a target an earlier
 //                               --keep-schema run imported (never dropped here)
+//   --staged-primary <name>     also apply this staged primary migration (repeatable;
+//                               postgres/staged-migrations/primary/<name>) through the
+//                               staged-migrations harness, as the specs do: its SQL
+//                               runs after the stock chain and is not recorded as a
+//                               receipt. For a line whose code needs a not yet
+//                               promoted migration (K-STAMP's kernel stamps)
+//   --refresh-workers <n>       run analytics-refresh with --workers=<n> (default 1,
+//                               inline; K-PAR)
 //   --keep-schema, --out <file>, --node22 <path>
 //
 // Rehearsal-only and local-only: it never reads production, never pushes and
@@ -107,6 +115,7 @@ import {
   transferPostgresIngestionJournal,
 } from "./postgres-ingestion-journal-transfer.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "./postgres-migrations.mjs";
+import { applyStockAndStagedMigrations } from "../postgres-test/staged-migrations-harness.mjs";
 import {
   createSealedSqliteTypedLegacyRehearsalSource,
   POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX,
@@ -165,7 +174,8 @@ export function parseArguments(argv) {
   const options = {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
     dump: null, perDateExpected: null, ownerReference: null, dense: false,
-    refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null,
+    refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null, stagedPrimary: [],
+    refreshWorkers: 1,
   };
   const valueOf = (index, argument) => {
     const value = argv[index];
@@ -185,6 +195,17 @@ export function parseArguments(argv) {
     else if (argument === "--per-date-expected") options.perDateExpected = valueOf(++index, argument);
     else if (argument === "--owner-reference") options.ownerReference = valueOf(++index, argument);
     else if (argument === "--reuse-schema") options.reuseSchema = valueOf(++index, argument);
+    else if (argument === "--staged-primary") {
+      const name = valueOf(++index, argument);
+      if (!/^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name) || options.stagedPrimary.includes(name)) {
+        fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      }
+      options.stagedPrimary.push(name);
+    } else if (argument === "--refresh-workers") {
+      const workers = Number(valueOf(++index, argument));
+      if (!Number.isSafeInteger(workers) || workers < 1 || workers > 16) fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      options.refreshWorkers = workers;
+    }
     else if (argument === "--refresh-timeout-minutes") {
       const minutes = Number(valueOf(++index, argument));
       if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > MAX_REFRESH_TIMEOUT_MINUTES) {
@@ -297,14 +318,15 @@ async function freePort() {
   });
 }
 
-async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes }) {
+async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes, workers = 1 }) {
   const started = performance.now();
   let stdout;
   let stderr;
   let exitCode = 0;
   try {
     ({ stdout, stderr } = await execFileAsync(node22, [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`,
-      DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`], {
+      DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`,
+      ...(workers > 1 ? [`--workers=${workers}`] : [])], {
       cwd: CLOUD_RUN_ROOT,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1", ...endpointEnv },
       maxBuffer: 64 * 1024 * 1024,
@@ -771,6 +793,7 @@ async function main() {
       dump: dump === null ? null : { sha256: dump.sha256, pinnedByManifest: dump.pinned } },
     schema,
     reusedSchema: options.reuseSchema !== null,
+    refreshWorkers: options.refreshWorkers,
     steps: {},
     gates: {},
     timingsMs: timings,
@@ -795,11 +818,21 @@ async function main() {
           await pool.query(`CREATE SCHEMA ${quoteIdentifier(name)}`);
           created.push(name);
         }
-        const primary = await applyPostgresMigrations({ role: "primary", schema, pool });
+        let primary;
+        let staged = [];
+        if (options.stagedPrimary.length === 0) {
+          primary = await applyPostgresMigrations({ role: "primary", schema, pool });
+        } else {
+          const applied = await applyStockAndStagedMigrations({ role: "primary", schema, pool,
+            stagedFiles: options.stagedPrimary });
+          primary = { applied: applied.stockApplied, migrations: await readPostgresMigrations({ role: "primary" }) };
+          staged = applied.staged.map(({ name, sha256 }) => ({ name, sha256 }));
+        }
         const expected = await readPostgresMigrations({ role: "primary" });
         report.steps.migrate = {
           primaryApplied: primary.applied, primaryTail: primary.migrations.at(-1)?.name,
           expectedPrimary: expected.length,
+          ...(staged.length === 0 ? {} : { staged }),
         };
         if (primary.applied !== expected.length) fail("REHEARSAL_MIGRATION_INCOMPLETE");
       });
@@ -818,7 +851,7 @@ async function main() {
 
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
-      timeoutMinutes: options.refreshTimeoutMinutes });
+      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers });
     timings["refresh:first"] = first.wallMs;
     report.steps.refreshFirst = { exitCode: first.exitCode, receipt: first.receipt, error: first.error };
     if (first.exitCode !== 0) fail("REHEARSAL_REFRESH_FAILED", { error: first.error });
@@ -871,7 +904,7 @@ async function main() {
 
     // 8. A second run at the same clock must create no revision.
     const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
-      timeoutMinutes: options.refreshTimeoutMinutes });
+      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers });
     timings["refresh:second"] = second.wallMs;
     report.steps.refreshSecond = { exitCode: second.exitCode, receipt: second.receipt, error: second.error };
     report.measurement.refreshSecond = refreshMeasurement(second);

@@ -112,7 +112,7 @@ async function loadModules() {
   });
   const load = (path) => vite.ssrLoadModule(path);
   const [server, runtimeSchema, transport, uploadAuthorization, workerAdmission,
-    bodyReader, constants, workerCrypto] = await Promise.all([
+    bodyReader, constants, workerCrypto, ingress, ingressBudget, healthContract] = await Promise.all([
     load("/cloud-run/server.mjs"),
     load("/src/postgres-runtime-schema.ts"),
     load("/src/postgres-typed-v12-transport.ts"),
@@ -121,10 +121,13 @@ async function loadModules() {
     load("/src/bounded-body.ts"),
     load("/src/constants.ts"),
     load("/src/crypto.ts"),
+    load("/src/upload-ingress-admission.ts"),
+    load("/src/postgres-ingress-budget.ts"),
+    load("/src/postgres-health-contract.ts"),
   ]);
   modules = {
     server, runtimeSchema, transport, uploadAuthorization, workerAdmission,
-    bodyReader, constants, workerCrypto,
+    bodyReader, constants, workerCrypto, ingress, ingressBudget, healthContract,
   };
   return modules;
 }
@@ -227,7 +230,7 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
-  "ANALYTICS_V2_ENABLED",
+  "ANALYTICS_V2_ENABLED", "DEPLOYMENT_SOURCE_COMMIT",
 ]);
 
 /** The GCP fast-path origin's Cloud Run environment (D-1 sidecar variant), minus secrets. */
@@ -259,6 +262,8 @@ function fastpathEnvironment(primarySchema, overrides = {}) {
       bucketMetageneration: "1",
       softDeleteRetentionDurationSeconds: "0",
     }),
+    // RD-3 /api/health reports it as deployment.sourceCommit.
+    DEPLOYMENT_SOURCE_COMMIT: "0123456789abcdef0123456789abcdef01234567",
     ...overrides,
   };
 }
@@ -310,7 +315,12 @@ function runtimeDependencies({ socket = null, extra = {} } = {}) {
     },
     createGcsQuarantineObjectStore() {
       calls.push("gcs-object-store");
-      return { put: mustNotCall("objectStore.put"), delete: mustNotCall("objectStore.delete") };
+      // RD-3's probe reads one missing key; nothing here writes or deletes.
+      return {
+        async head() { return null; },
+        put: mustNotCall("objectStore.put"),
+        delete: mustNotCall("objectStore.delete"),
+      };
     },
     ...extra,
   };
@@ -518,7 +528,8 @@ test("(f) the origin composition root injects the analytics-v2 route factory and
 test("(a) in fastpath-test a stub community-daily module overrides the built-in, and only that route", {
   skip: !PG_TEST_SOCKET,
 }, async () => {
-  const { server } = await loadModules();
+  const m = await loadModules();
+  const { server } = m;
   const socket = await localSocket();
   await withSchemas("tibotattle_fastpath_spec_", async ({ primarySchema }) => {
     const factoryCalls = [];
@@ -568,7 +579,12 @@ test("(a) in fastpath-test a stub community-daily module overrides the built-in,
       assert.deepEqual(await overridden.json(), { stub: "analytics-v2-community-daily" });
       assert.equal(handled.length, 1);
       assert.equal(handled[0].url, daily);
-      assert.deepEqual(handled[0].context, { origin: FASTPATH_ORIGIN, hostMode: "fastpath-test" });
+      // The module context carries the request id the root's request context
+      // holds (OD-CR-6 (i)); a loopback request has none registered, so it
+      // is a fresh v4 id.
+      const { requestId, ...moduleContext } = handled[0].context;
+      assert.deepEqual(moduleContext, { origin: FASTPATH_ORIGIN, hostMode: "fastpath-test" });
+      assert.match(requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
       assert.ok(Object.isFrozen(handled[0].context));
 
       // A method the module does not claim keeps the built-in's refusal.
@@ -581,11 +597,15 @@ test("(a) in fastpath-test a stub community-daily module overrides the built-in,
       );
       assert.equal(foreign.status, 503);
       assert.equal((await foreign.json()).error, "POSTGRES_TEST_ROUTE_UNSUPPORTED");
-      // A non-overridable route keeps its built-in: the rehearsal schema pair
-      // on one instance is migrated and ready.
+      // A non-overridable route keeps its own family: RD-3 /api/health, the
+      // Worker body (minus the two append-only keys) the production origin
+      // serves, now also in fastpath-test (D-CRB, one registry).
       const health = await runtime.postgresTestDispatch(new Request(`${FASTPATH_ORIGIN}/api/health`));
       assert.equal(health.status, 200);
-      assert.equal((await health.json()).status, "ready");
+      const healthBody = await health.json();
+      assert.equal(healthBody.status, "ok");
+      assert.deepEqual(m.healthContract.validatePostgresHealthBody(healthBody), []);
+      assert.equal(healthBody.deployment.sourceCommit, "0123456789abcdef0123456789abcdef01234567");
       assert.equal(handled.length, 1, "only GET community/daily on the private origin reached the module");
     } finally {
       await closeRuntime(runtime);
@@ -655,7 +675,35 @@ async function insertSocialDevice(base, primarySchema, consentVersion) {
   return { participantId, deviceId, deviceAuthorization: `Device um_device_${deviceId}.${deviceSecret}` };
 }
 
+/**
+ * The Worker's upload-ingress policy over the shared PostgreSQL budget, as the
+ * origin composes it (D-CRB): the lease and the 60 s / 15 s body read.
+ */
+function uploadIngressFixture(m, base, primarySchema) {
+  const budget = m.ingressBudget.createPostgresUploadIngressBudget(base, { primarySchema });
+  return {
+    env: {
+      UPLOAD_INGRESS_QUEUE_MODE: "disabled",
+      UPLOAD_INGRESS_MAX_CONCURRENT: "8",
+      UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "1200",
+      UPLOAD_INGRESS_BURST: "1200",
+      UPLOAD_INGRESS_LEASE_SECONDS: "90",
+      UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+      UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+      UPLOAD_INGRESS_BUDGET: Object.freeze({ getByName: () => budget }),
+    },
+    authority: Object.freeze({
+      assertConfiguration: m.ingress.assertUploadIngressConfiguration,
+      bodyReadPolicy: m.ingress.uploadIngressBodyReadPolicy,
+      acquireLease: m.ingress.acquireUploadIngressLease,
+      startHeartbeat: m.ingress.startUploadIngressLeaseHeartbeat,
+      releaseLease: m.ingress.releaseUploadIngressLease,
+    }),
+  };
+}
+
 function contributionDispatch(m, { base, primarySchema }, overrides = {}) {
+  const ingress = uploadIngressFixture(m, base, primarySchema);
   return createPostgresTestV12DayManifestDispatch({
     primaryPool: base,
     schemaOptions: { primarySchema },
@@ -672,7 +720,9 @@ function contributionDispatch(m, { base, primarySchema }, overrides = {}) {
       UPLOAD_PRINCIPAL_RATE_LIMIT: allowAll(),
       UPLOAD_INGRESS_REQUEST_RATE_LIMIT: allowAll(),
       UPLOAD_INGRESS_CLIENT_RATE_LIMIT: allowAll(),
+      ...ingress.env,
     }),
+    uploadIngress: ingress.authority,
     assertAdmissionBindings: m.workerAdmission.assertAdmissionBindings,
     assertAttemptAllowed: m.workerAdmission.assertAttemptAllowed,
     assertUploadAuthorizationBindings: m.workerAdmission.assertUploadAuthorizationBindings,

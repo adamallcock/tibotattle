@@ -5,8 +5,9 @@
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
  * analytics kernels and the analytics-refresh Job, the MP-2-lite maintenance
- * Job and the production configuration it reads, the route-family contract
- * the admin route modules import, canonical migrations,
+ * Job and the production configuration it reads, the CR-6/CR-7 production
+ * host composition, the route-family contract the admin route modules
+ * import, canonical migrations,
  * migration runner, the shared runtime-grant policy and the production
  * migration Job, the private daily publication Job and verifier, their
  * shared receipt contract, test-only activation and independent restore
@@ -40,8 +41,8 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 67;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0067_pending_object_transfer_holds.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 69;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0069_analytics_v2_run_stamps.sql";
 const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
   "apps/worker/cloud-run/postgres-community-daily-activation.mjs",
   "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",
@@ -75,6 +76,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/oauth-gateway.check.mjs", destination: "apps/worker/cloud-run/oauth-gateway.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-gate.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-gate.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-test-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-test-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/cloud-run-iam-test-target.mjs", destination: "apps/worker/cloud-run/cloud-run-iam-test-target.mjs" }),
   Object.freeze({ source: "cloud-run/origin-route-modules.mjs", destination: "apps/worker/cloud-run/origin-route-modules.mjs" }),
   Object.freeze({ source: "cloud-run/origin-fastpath-mode.mjs", destination: "apps/worker/cloud-run/origin-fastpath-mode.mjs" }),
   Object.freeze({ source: "cloud-run/contribution-envelope-registry.mjs", destination: "apps/worker/cloud-run/contribution-envelope-registry.mjs" }),
@@ -122,10 +124,34 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
+  // K-CORE-A: the refresh Job's read side (K-SPLIT), its compute Worker pool
+  // and Worker entry (K-PAR), and the build-time kernel identity (K-STAMP).
+  Object.freeze({ source: "cloud-run/analytics-refresh-read.mjs", destination: "apps/worker/cloud-run/analytics-refresh-read.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-pool.mjs", destination: "apps/worker/cloud-run/analytics-refresh-pool.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-refresh-worker.mjs", destination: "apps/worker/cloud-run/analytics-refresh-worker.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-kernel-closure.mjs", destination: "apps/worker/cloud-run/analytics-kernel-closure.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-maintenance-job-contract.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job-contract.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.check.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-production-configuration.mjs", destination: "apps/worker/cloud-run/postgres-production-configuration.mjs" }),
+  // The CR-6/CR-7 production host (D-CRB): the route registry, the
+  // Worker-order handler, the Node adapter, the RD-2/RD-3 families, the
+  // request-context store and the composition server.mjs serves.
+  Object.freeze({ source: "cloud-run/postgres-production-host.mjs", destination: "apps/worker/cloud-run/postgres-production-host.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-production-registry.mjs", destination: "apps/worker/cloud-run/postgres-production-registry.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-host-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-host-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/origin-node-request.mjs", destination: "apps/worker/cloud-run/origin-node-request.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-readiness-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-readiness-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-health-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-health-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-request-context.mjs", destination: "apps/worker/cloud-run/postgres-request-context.mjs" }),
+  // The OPS-4 probe jobs: the closed line contract, the runtime liveness probe,
+  // the backup-audit probe and the OPS-1 policy core the audit judges with.
+  Object.freeze({ source: "cloud-run/ops-probe-contract.mjs", destination: "apps/worker/cloud-run/ops-probe-contract.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-runtime-probe-job.mjs", destination: "apps/worker/cloud-run/ops-runtime-probe-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-audit-job.mjs", destination: "apps/worker/cloud-run/ops-backup-audit-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-probe-job.check.mjs", destination: "apps/worker/cloud-run/ops-probe-job.check.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-horizon.mjs", destination: "apps/worker/cloud-run/ops-backup-horizon.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.

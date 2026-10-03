@@ -9,7 +9,7 @@ import {
   closeCloudSqlResources,
   createIamPool as createCloudSqlIamPool,
 } from "./cloud-sql.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 export const TEST_ACTIVATION_JOB = "tibotattle-v12-test-activate";
 export const TEST_ACTIVATION_SERVICE_ACCOUNT =
@@ -19,8 +19,8 @@ export const TEST_ACTIVATION_MIGRATION_ROOT = "/app/apps/worker/postgres/migrati
 export const TEST_ACTIVATION_TARGET = CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
 
 const TEST_ACTIVATION_PROJECT = CLOUD_RUN_IAM_TEST_TARGET.project;
-const EXPECTED_MIGRATION_COUNT = 67;
-const EXPECTED_MIGRATION_TAIL = "0067_pending_object_transfer_holds.sql";
+const EXPECTED_MIGRATION_COUNT = 69;
+const EXPECTED_MIGRATION_TAIL = "0069_analytics_v2_run_stamps.sql";
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;

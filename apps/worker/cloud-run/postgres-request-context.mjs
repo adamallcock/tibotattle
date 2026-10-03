@@ -56,6 +56,20 @@ function frozenContext(context) {
 }
 
 /**
+ * The root's request id for this exact Request through a context accessor
+ * (FC-4), so the log line, the diagnostic row and the error body share one
+ * id. Without an accessor, or for an unregistered request (a unit harness or
+ * a legacy loopback mode), a fresh id is minted. The one definition both the
+ * route families (postgres-family-contract.mjs requestIdFor) and the
+ * PostgreSQL test dispatchers (OD-CR-6 (i)) use.
+ */
+export function requestIdFrom(accessor, request) {
+  const context = typeof accessor === "function" ? accessor(request) : undefined;
+  const requestId = context !== null && typeof context === "object" ? context.requestId : undefined;
+  return typeof requestId === "string" && REQUEST_ID.test(requestId) ? requestId : crypto.randomUUID();
+}
+
+/**
  * Create one store per runtime. register, release and dispatch belong to the
  * root; families receive only accessor (as deps.requestContext).
  */

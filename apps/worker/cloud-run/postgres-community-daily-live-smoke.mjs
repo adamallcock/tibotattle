@@ -4,7 +4,7 @@ import { lstat, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GoogleAuth } from "google-auth-library";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   POSTGRES_COMMUNITY_DAILY_TEST_JOB,
   POSTGRES_COMMUNITY_DAILY_TEST_PROJECTION_SCOPE,

@@ -16,7 +16,11 @@
 //     single owner of D1 pending_quarantine_objects: every sealed row lands
 //     exactly once in pending_objects (object_key = r2_key; contribution id,
 //     kind, registered_at, state and lease verbatim; registration_token is the
-//     column DEFAULT). A row a telemetry stage (D-PT5A) already mapped must be
+//     column DEFAULT), except that a chunk-owned registration (contribution id
+//     a sealed chunk's id, r2_key that chunk's key) takes its family's
+//     PostgreSQL kind (telemetry_v1, telemetry_v11 or telemetry_v12), the
+//     reviewed T-0 mapping the telemetry stages (D-PT5A) apply through
+//     CHUNK_REGISTRATION_FAMILIES. A row a telemetry stage already mapped must be
 //     equal, field by field; any other row, a missing one or an extra one
 //     refuses CUTOVER_PENDING_OBJECT_CONFLICT. PostgreSQL
 //     pending_quarantine_objects stays empty. With every registration it
@@ -26,10 +30,16 @@
 //   * runOperationalHistoryProduction, table receipts under PT-8-lite's
 //     'post-import' stage (it writes no stage receipt; PT-8 folds its
 //     receiptSha256 into the post-import receipt):
-//       - N-ADMINHIST: admin_metric_snapshots, plus any snapshot that only the
-//         cached admin_metrics_history_cache payload still carries, mapped into
+//       - N-ADMINHIST: admin_metric_snapshots, then the analytics D1's
+//         snapshots of the sealed source from the required admin history
+//         export (cutover-admin-history-export.mjs: typed storage captures
+//         only there since 2026-09-12, and the seal never carries the
+//         analytics D1), then any snapshot that only the cached
+//         admin_metrics_history_cache payload still carries, mapped into
 //         analytics_admin_metric_snapshots under the sealed
-//         storage_source_state.source_id, so the admin charts continue;
+//         storage_source_state.source_id, so the admin charts continue. A
+//         raw row wins on captured_at: an analytics row never replaces a
+//         sealed one, and a cache entry never replaces either;
 //       - N-EXCL: community_aggregate_exclusions imported into its staged
 //         PostgreSQL table, for rows whose participant is a sealed participant.
 //         A row naming any other participant (D1 keeps the audit row after an
@@ -55,6 +65,15 @@
 //     source or target is ever placed in an error, log or receipt.
 
 import { createHash } from "node:crypto";
+import {
+  ADMIN_MAX_SNAPSHOT_JSON,
+  CutoverAdminHistoryError,
+  isCanonicalAdminInstant,
+  readCutoverAdminHistoryExport,
+  readSealedStorageSourceId,
+  validAdminGaugeMetrics,
+  validAdminGaugeMetricsJson,
+} from "./cutover-admin-history-export.mjs";
 import { CutoverSourceError, openSealedSourceFromSeal, readCutoverSeal } from "./cutover-source-seal.mjs";
 import {
   PostgresFastpathIdentityCopyError,
@@ -62,6 +81,7 @@ import {
   fastpathIdentityTargetExpression,
   fastpathIdentityTargetValue,
 } from "./postgres-fastpath-identity-copy.mjs";
+import { CHUNK_REGISTRATION_FAMILIES } from "./postgres-production-telemetry-modes.mjs";
 import {
   EMPTY_PREFIX_CHAIN,
   PostgresTransferTargetError,
@@ -101,6 +121,8 @@ export const PRODUCTION_STAGING_RELATIONS = Object.freeze([]);
 export const PRODUCTION_RETAINED_RELATIONS = Object.freeze([]);
 
 export const LEGACY_CONTRIBUTION_TRANSFER_ERROR_CODES = Object.freeze([
+  "CUTOVER_ADMIN_HISTORY_EXPORT_INVALID",
+  "CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH",
   "CUTOVER_CHECKPOINT_DIVERGED",
   "CUTOVER_COLUMN_UNMAPPED",
   "CUTOVER_LEGACY_ARGUMENT_INVALID",
@@ -125,9 +147,6 @@ const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const SQLSTATE = /^[0-9A-Z]{5}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]{0,39})(?:\.[0-9]{1,30})?$/u;
-const GAUGE_KEY = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u;
-const MAX_GAUGES = 128;
-const MAX_SNAPSHOT_JSON = 4000;
 const MAX_CACHE_JSON = 512 * 1024;
 const MAX_CACHE_SNAPSHOTS = 400;
 const MAX_OBJECT_KEY = 1024;
@@ -457,7 +476,7 @@ export const LEGACY_TRANSFER_COLUMN_MAP = Object.freeze(Object.fromEntries([
 export function legacyContributionPolicySha256() {
   return HASH(JSON.stringify([LEGACY_CONTRIBUTION_TRANSFER_SCHEMA, LEGACY_CONTRIBUTIONS_ORDER, LEGACY_TRANSFER_COLUMN_MAP,
     LEGACY_TRIGGER_POLICY, LEGACY_TRANSFER_DISPOSITIONS, PENDING_REGISTRATIONS_PREREQUISITE_STAGES,
-    LEGACY_MUST_BE_EMPTY, EXCLUSIONS.where]));
+    LEGACY_MUST_BE_EMPTY, EXCLUSIONS.where, CHUNK_REGISTRATION_FAMILIES]));
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1013,34 @@ function assertPendingRow(row) {
   }
 }
 
+const SEALED_TELEMETRY_KIND = "telemetry";
+
+/**
+ * The family of each chunk-owned registration on a page: contribution id ->
+ * { key, kind } for every sealed 'telemetry' registration whose contribution
+ * id is a sealed chunk's id (CHUNK_REGISTRATION_FAMILIES, shared with D-PT5A).
+ */
+function chunkFamilies(database, page) {
+  const ids = page.filter(row => row.values[2] === SEALED_TELEMETRY_KIND).map(row => row.values[1]);
+  const families = new Map();
+  if (ids.length === 0) return families;
+  const marks = ids.map(() => "?").join(", ");
+  for (const [chunkTable, kind] of CHUNK_REGISTRATION_FAMILIES) {
+    for (const chunk of sourceAll(database, `SELECT id, r2_key FROM ${quote(chunkTable)} WHERE id IN (${marks})`, ids, chunkTable)) {
+      if (families.has(chunk.id)) fail("CUTOVER_SOURCE_VALUE_INVALID", { table: PENDING_SOURCE.name });
+      families.set(chunk.id, { key: chunk.r2_key, kind });
+    }
+  }
+  return families;
+}
+
+/**
+ * The sealed registrations, each re-asserted against D1's CHECKs and mapped:
+ * verbatim, except that a chunk-owned one takes its family's PostgreSQL kind
+ * (the reviewed T-0 mapping D-PT5A's chunk stages applied to the rows they
+ * wrote). A chunk-owned registration under another object key refuses; the
+ * telemetry stages, which are prerequisites, already refuse it.
+ */
 function pendingSource(database) {
   const base = tableSource(database, PENDING_SOURCE);
   return Object.freeze({
@@ -1001,7 +1048,18 @@ function pendingSource(database) {
     page(after, limit) {
       const page = base.page(after, limit);
       for (const row of page) assertPendingRow(row);
-      return page;
+      const families = chunkFamilies(database, page);
+      return page.map(row => {
+        const family = families.get(row.values[1]);
+        if (family === undefined) return row;
+        if (family.key !== row.values[0]) fail("CUTOVER_SOURCE_VALUE_INVALID", { table: PENDING_SOURCE.name });
+        const values = [...row.values];
+        const parameters = [...row.parameters];
+        values[2] = family.kind;
+        parameters[2] = family.kind;
+        return { ...row, values, parameters,
+          size: row.size - Buffer.byteLength(SEALED_TELEMETRY_KIND) + Buffer.byteLength(family.kind) };
+      });
     },
   });
 }
@@ -1243,67 +1301,80 @@ function plainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
-function isCanonicalInstant(value) {
-  if (typeof value !== "string") return false;
-  const epoch = Date.parse(value);
-  return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
-}
-
-/**
- * A gauge snapshot is a flat JSON object of at most 128 gauges, each a
- * structural name and a non-negative safe integer: aggregate counts only.
- */
-function validGaugeMetrics(metrics) {
-  const object = plainObject(metrics);
-  if (object === null) return false;
-  const entries = Object.entries(object);
-  return entries.length <= MAX_GAUGES
-    && entries.every(([key, value]) => GAUGE_KEY.test(key) && Number.isSafeInteger(value) && value >= 0);
-}
+// The gauge grammar (a flat object of at most 128 structural names, each a
+// non-negative safe integer, in at most 4,000 characters) and the canonical
+// instant are the export module's, so the sealed rows, the cache entries and
+// the analytics export are held to one definition.
 
 function snapshotRow(capturedAt, metricsJson) {
   return { values: [capturedAt, metricsJson], parameters: [capturedAt, metricsJson],
     size: Buffer.byteLength(capturedAt) + Buffer.byteLength(metricsJson) };
 }
 
+function byCapturedAt(left, right) {
+  return left.values[0] < right.values[0] ? -1 : 1;
+}
+
+function rowsDigest(rows) {
+  const digest = createRowsDigest();
+  for (const row of [...rows].sort(byCapturedAt)) digest.update(row.values);
+  return digest.digest();
+}
+
 function sealedSourceId(database) {
-  if (!sourceTablePresent(database, "storage_source_state")) fail("CUTOVER_SOURCE_TABLE_MISSING", { table: "storage_source_state" });
-  const rows = sourceAll(database, "SELECT singleton, source_id FROM storage_source_state", [], "storage_source_state");
-  if (rows.length !== 1 || rows[0].singleton !== 1n || typeof rows[0].source_id !== "string"
-      || !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u.test(rows[0].source_id)) {
-    fail("CUTOVER_SOURCE_SINGLETON_INVALID", { table: "storage_source_state" });
-  }
-  return rows[0].source_id;
+  const read = readSealedStorageSourceId(database);
+  if (read.state === "absent") fail("CUTOVER_SOURCE_TABLE_MISSING", { table: "storage_source_state" });
+  if (read.state !== "valid") fail("CUTOVER_SOURCE_SINGLETON_INVALID", { table: "storage_source_state" });
+  return read.sourceId;
 }
 
 /**
- * The snapshots to map: every sealed admin_metric_snapshots row (a canonical
- * instant key and a valid gauge object, verbatim text), plus each snapshot
- * that only the cached history payload still carries. An invalid or absent
- * cache contributes nothing and is reported as such.
+ * The analytics D1 export (cutover-admin-history-export.mjs), pinned by its
+ * sha256 and bound to this seal, its inventory, its fence receipt and the
+ * sealed source id. An unreadable or malformed export is
+ * CUTOVER_ADMIN_HISTORY_EXPORT_INVALID; a valid one taken for another seal or
+ * source is CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH.
  */
-function adminSnapshotPlan(database, pageRows) {
+async function boundAdminHistoryExport(seal, sourceId, path, sha256) {
+  let exported;
+  try {
+    exported = await readCutoverAdminHistoryExport({ path, expectedSha256: sha256 });
+  } catch (error) {
+    if (error instanceof CutoverAdminHistoryError || error instanceof CutoverSourceError) {
+      fail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+    }
+    throw error;
+  }
+  if (exported.sealId !== seal.manifest.sealId || exported.inventorySha256 !== seal.manifest.inventorySha256
+      || exported.fenceReceiptSha256 !== seal.manifest.fence?.fenceReceiptSha256 || exported.sourceIdSha256 !== HASH(sourceId)) {
+    fail("CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH");
+  }
+  return exported;
+}
+
+/**
+ * The sealed half of the plan, where every check that can refuse runs: each
+ * sealed admin_metric_snapshots row (a canonical instant key and a valid gauge
+ * object, verbatim text), and the cached history payload judged against the
+ * closed cache contract (schemaVersion v0.3; at most 400 entries of exactly
+ * capturedAt and metrics, each a canonical instant and a valid gauge object;
+ * at most 512 KiB). An invalid or absent cache contributes nothing and is
+ * reported as such; it is never a refusal.
+ */
+function sealedAdminSnapshots(database, pageRows) {
   assertSourceColumnMap(database, ADMIN_SNAPSHOTS.name, ADMIN_SNAPSHOTS.columns.map(column => column.source));
   assertSourceColumnMap(database, "admin_metrics_history_cache", [...ADMIN_CACHE_COLUMNS]);
   const sealedSource = tableSource(database, ADMIN_SNAPSHOTS);
   const rows = [];
-  const captured = new Set();
   let after = null;
   for (;;) {
     const page = sealedSource.page(after, pageRows);
     for (const row of page) {
       const [capturedAt, metricsJson] = row.values;
-      let metrics;
-      try {
-        metrics = JSON.parse(metricsJson);
-      } catch {
-        metrics = null;
-      }
-      if (metricsJson.length > MAX_SNAPSHOT_JSON || !validGaugeMetrics(metrics)) {
+      if (!validAdminGaugeMetricsJson(metricsJson)) {
         fail("CUTOVER_SOURCE_VALUE_INVALID", { table: ADMIN_SNAPSHOTS.name, column: "metrics_json" });
       }
       rows.push(snapshotRow(capturedAt, metricsJson));
-      captured.add(capturedAt);
       after = row.key;
     }
     if (page.length < pageRows) break;
@@ -1312,8 +1383,8 @@ function adminSnapshotPlan(database, pageRows) {
   const cacheRows = sourceAll(database, "SELECT singleton, generated_at, payload_json FROM admin_metrics_history_cache",
     [], "admin_metrics_history_cache");
   const cacheDigest = createRowsDigest();
-  let cacheState = "absent";
-  const cacheOnly = [];
+  let state = "absent";
+  let entries = [];
   if (cacheRows.length > 1) fail("CUTOVER_SOURCE_SINGLETON_INVALID", { table: "admin_metrics_history_cache" });
   if (cacheRows.length === 1) {
     const row = cacheRows[0];
@@ -1331,56 +1402,95 @@ function adminSnapshotPlan(database, pageRows) {
     const valid = plainObject(payload)?.schemaVersion === ADMIN_METRICS_HISTORY_SCHEMA_VERSION
       && Array.isArray(snapshots) && snapshots.length <= MAX_CACHE_SNAPSHOTS
       && snapshots.every(entry => plainObject(entry) !== null && Object.keys(entry).sort().join() === "capturedAt,metrics"
-        && isCanonicalInstant(entry.capturedAt) && validGaugeMetrics(entry.metrics)
-        && JSON.stringify(entry.metrics).length <= MAX_SNAPSHOT_JSON);
-    cacheState = valid ? "valid" : "invalid";
-    if (valid) {
-      for (const entry of snapshots) {
-        if (captured.has(entry.capturedAt)) continue;
-        captured.add(entry.capturedAt);
-        cacheOnly.push(snapshotRow(entry.capturedAt, JSON.stringify(entry.metrics)));
-      }
-    }
+        && isCanonicalAdminInstant(entry.capturedAt) && validAdminGaugeMetrics(entry.metrics)
+        && JSON.stringify(entry.metrics).length <= ADMIN_MAX_SNAPSHOT_JSON);
+    state = valid ? "valid" : "invalid";
+    if (valid) entries = snapshots;
   }
-  const all = [...rows, ...cacheOnly].sort((left, right) => (left.values[0] < right.values[0] ? -1 : 1));
-  const cacheOnlyDigest = createRowsDigest();
-  for (const row of [...cacheOnly].sort((left, right) => (left.values[0] < right.values[0] ? -1 : 1))) {
-    cacheOnlyDigest.update(row.values);
+  return { rows, sealedFacts, cache: { state, rows: cacheRows.length, sha256: cacheDigest.digest(), entries } };
+}
+
+/**
+ * The snapshots to map, a raw row winning on captured_at: every sealed row;
+ * then each analytics export row at an instant no sealed row holds (one that
+ * collides is counted as shadowed, never mapped); then each valid cache entry
+ * at an instant neither holds.
+ */
+function adminSnapshotPlan(sealed, exported) {
+  const captured = new Set(sealed.rows.map(row => row.values[0]));
+  const analyticsAdded = [];
+  let shadowed = 0;
+  for (const [capturedAt, metricsJson] of exported.snapshots) {
+    if (captured.has(capturedAt)) {
+      shadowed += 1;
+      continue;
+    }
+    captured.add(capturedAt);
+    analyticsAdded.push(snapshotRow(capturedAt, metricsJson));
+  }
+  const cacheOnly = [];
+  for (const entry of sealed.cache.entries) {
+    if (captured.has(entry.capturedAt)) continue;
+    captured.add(entry.capturedAt);
+    cacheOnly.push(snapshotRow(entry.capturedAt, JSON.stringify(entry.metrics)));
   }
   return {
-    source: listSource(ADMIN_SNAPSHOTS, all),
-    sealedFacts,
-    cache: Object.freeze({ state: cacheState, rows: cacheRows.length, sha256: cacheDigest.digest(),
-      snapshotsAdded: cacheOnly.length, snapshotsAddedSha256: cacheOnlyDigest.digest() }),
+    source: listSource(ADMIN_SNAPSHOTS, [...sealed.rows, ...analyticsAdded, ...cacheOnly].sort(byCapturedAt)),
+    sealedFacts: sealed.sealedFacts,
+    cache: Object.freeze({ state: sealed.cache.state, rows: sealed.cache.rows, sha256: sealed.cache.sha256,
+      snapshotsAdded: cacheOnly.length, snapshotsAddedSha256: rowsDigest(cacheOnly) }),
+    analytics: Object.freeze({ exportSha256: exported.exportSha256,
+      snapshots: Object.freeze({ rows: exported.snapshots.length, sha256: exported.snapshotsSha256 }),
+      snapshotsAdded: analyticsAdded.length, snapshotsAddedSha256: rowsDigest(analyticsAdded), shadowed,
+      otherSourceRows: exported.otherSourceRows }),
   };
+}
+
+function validateAdminHistoryArguments(path, sha256) {
+  if (typeof path !== "string" || path.length === 0 || typeof sha256 !== "string" || !SHA256.test(sha256)) {
+    fail("CUTOVER_LEGACY_ARGUMENT_INVALID");
+  }
 }
 
 /**
  * Map the admin metric history (N-ADMINHIST) and import the aggregate
- * exclusions (N-EXCL). Writes table receipts under 'post-import' and no stage
- * receipt: PT-8-lite folds the returned receiptSha256 into its post-import
- * receipt. Needs 'identity-authority' complete; replays without writing.
+ * exclusions (N-EXCL). The analytics D1 export (adminHistoryExportPath, pinned
+ * by adminHistoryExportSha256) is required: it is read after every sealed
+ * check and before the target is touched. Writes table receipts under
+ * 'post-import' and no stage receipt: PT-8-lite folds the returned
+ * receiptSha256, which binds the export's sha256 and counts, into its
+ * post-import receipt. Needs 'identity-authority' complete; replays without
+ * writing.
  */
 export async function runOperationalHistoryProduction({
   handle,
   sealManifestPath,
+  adminHistoryExportPath,
+  adminHistoryExportSha256,
   pageRows = LEGACY_TRANSFER_MAX_PAGE_ROWS,
   pageBytes = LEGACY_TRANSFER_MAX_PAGE_BYTES,
   onPage = null,
 } = {}) {
   validatePaging(pageRows, pageBytes, onPage);
   validateHandle(handle);
+  validateAdminHistoryArguments(adminHistoryExportPath, adminHistoryExportSha256);
   return withSealed(handle, sealManifestPath, async (seal, sealed, database) => {
     const stage = OPERATIONAL_HISTORY_STAGE;
     const schema = handle.primarySchema;
     const sourceId = sealedSourceId(database);
     const constants = [["source_id", sourceId]];
-    const admin = adminSnapshotPlan(database, pageRows);
-    const adminFacts = sourceFacts(admin.source, pageRows);
+    const sealedAdmin = sealedAdminSnapshots(database, pageRows);
     assertSourceColumnMap(database, EXCLUSIONS.name, EXCLUSIONS.columns.map(column => column.source));
     const exclusionSource = tableSource(database, EXCLUSIONS);
     const exclusionFacts = sourceFacts(exclusionSource, pageRows);
     const exclusionAll = sourceFacts(tableSource(database, { ...EXCLUSIONS, where: null }), pageRows);
+    // Active community exclusions among the imported rows: K-CORE-A's declared
+    // difference from the d43c8f92 oracle exists only when this is above 0.
+    const exclusionActive = sourceCount(database, EXCLUSIONS.name,
+      `(${EXCLUSIONS.where}) AND "scope" = 'community_weekly' AND "state" = 'active'`);
+    const exported = await boundAdminHistoryExport(seal, sourceId, adminHistoryExportPath, adminHistoryExportSha256);
+    const admin = adminSnapshotPlan(sealedAdmin, exported);
+    const adminFacts = sourceFacts(admin.source, pageRows);
     const preflight = await withTransferTransaction(handle, "primary", async client => {
       await requireImportingRun(client, handle);
       await assertStageComplete(handle, "identity-authority", client);
@@ -1434,12 +1544,19 @@ export async function runOperationalHistoryProduction({
         sealedSnapshots: { rows: admin.sealedFacts.rows, sha256: admin.sealedFacts.sha256 },
         cache: { state: admin.cache.state, rows: admin.cache.rows, sha256: admin.cache.sha256,
           snapshotsAdded: admin.cache.snapshotsAdded, snapshotsAddedSha256: admin.cache.snapshotsAddedSha256 },
+        // The analytics D1 is not a sealed source, so it has no table receipt
+        // (PT-8-lite's coverage admits sealed tables only); its export is
+        // bound here, and through receiptSha256 into the post-import receipt.
+        analytics: { exportSha256: admin.analytics.exportSha256, snapshots: { ...admin.analytics.snapshots },
+          snapshotsAdded: admin.analytics.snapshotsAdded, snapshotsAddedSha256: admin.analytics.snapshotsAddedSha256,
+          shadowed: admin.analytics.shadowed, otherSourceRows: admin.analytics.otherSourceRows },
         mapped: { rows: adminTable.targetRows, sha256: adminFacts.sha256 },
       },
       exclusions: {
         sealed: { rows: exclusionAll.rows, sha256: exclusionAll.sha256 },
         imported: { rows: exclusionTable.targetRows, sha256: exclusionFacts.sha256 },
         participantAbsent: exclusionAll.rows - exclusionFacts.rows,
+        activeImported: exclusionActive,
       },
     };
     const receiptSha256 = HASH(JSON.stringify(summary));

@@ -12,12 +12,14 @@
 // Google or Cloudflare; every account, token, key and row is synthetic and
 // content-free, and each fixture drops only the schemas it created.
 //
-// It proves: the boundary's constant refusals over the wire; which forwarded
-// (route, method) pairs the composition serves; that every EP-1 policy route
-// it serves replays the edge's outcome at the Worker's own call point; the
-// d43c8f92 order fixes that only show under a limited outcome or a cookie;
-// and that fastpath-test without the edge charges its PostgreSQL limiters at
-// the same points.
+// It proves: the boundary's constant refusals over the wire; that edge-test
+// is the production pipeline (D-CRB: the CR-6 handler over the one registry
+// and the production ported list, RD-2 /api/ready and RD-3 /api/health, the
+// closed unported answer under the root's request id, and the admin host's
+// OD-CR-3 refusal); that every EP-1 policy route it serves replays the edge's
+// outcome at the Worker's own call point; the d43c8f92 order fixes that only
+// show under a limited outcome or a cookie; and that fastpath-test without
+// the edge charges its PostgreSQL limiters at the same points.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -65,15 +67,18 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [server, codec, registry, policy, contract, edgeMode] = await Promise.all([
+  const [server, codec, registry, policy, contract, edgeMode, composition, readiness, health] = await Promise.all([
     load("/cloud-run/server.mjs"),
     load("/src/typed-telemetry-codec.ts"),
     load("/src/route-registry.ts"),
     load("/src/edge-admission-policy.ts"),
     load("/src/edge-origin-contract.ts"),
     load("/cloud-run/origin-edge-test-mode.mjs"),
+    load("/src/backend-composition.ts"),
+    load("/src/postgres-readiness-contract.ts"),
+    load("/src/postgres-health-contract.ts"),
   ]);
-  modules = { server, codec, registry, policy, contract, edgeMode };
+  modules = { server, codec, registry, policy, contract, edgeMode, composition, readiness, health };
   return modules;
 }
 
@@ -250,6 +255,7 @@ async function withOrigin({ edge, environment = {} }, run) {
         },
         async createGoogleAccessTokenProvider() { return async () => "synthetic-access-token"; },
         createGcsQuarantineObjectStore: () => ({
+          async head(key) { return objects.has(key) ? { key } : null; },
           async put(key, value) { objects.set(key, value); },
           async delete(key) { objects.delete(key); },
         }),
@@ -380,9 +386,19 @@ function assertBoundaryRefusal(m, answer, label) {
   assert.equal(answer.headers["x-tibotattle-origin"], undefined, `${label}: never marked`);
 }
 
-function assertUnported(m, answer, label) {
-  assert.equal(answer.status, 503, label);
-  assert.equal(answer.text, m.edgeMode.EDGE_TEST_UNPORTED_BODY, label);
+/**
+ * The production handler's closed unported answer: 503
+ * POSTGRES_ROUTE_NOT_PORTED in the Worker envelope, under the edge's request
+ * id when one was sent (OD-CR-6 (i)), with no retry-after (OD-CR-6 (iv)),
+ * no-store and the boundary's marker.
+ */
+function assertUnported(m, answer, label, requestId = undefined) {
+  assert.equal(answer.status, 503, `${label}: ${answer.text}`);
+  const body = JSON.parse(answer.text);
+  assert.deepEqual(Object.keys(body), ["error"], label);
+  assert.equal(body.error.code, "POSTGRES_ROUTE_NOT_PORTED", label);
+  if (requestId !== undefined) assert.equal(body.error.requestId, requestId, `${label}: the edge's request id`);
+  assert.equal(answer.headers["retry-after"], undefined, `${label}: no retry-after`);
   assert.equal(answer.headers["cache-control"], "no-store", label);
   assertMarked(answer, label);
 }
@@ -477,12 +493,26 @@ test("boundary refusals are the unmarked 421 with connection: close, before any 
     for (const value of [...Object.values(callbackHeaders), ...Object.values(wrongHostHeaders)]) sentValues.add(value);
 
     // A verifier may only read health and readiness.
+    // RD-3 health; this composition carries no deployment commit, so the
+    // body is the Worker's without a deployment block.
     const health = await send(port, { path: "/api/health", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
     assert.equal(health.status, 200, health.text);
-    assert.equal(JSON.parse(health.text).status, "ready");
+    const healthBody = JSON.parse(health.text);
+    assert.equal(healthBody.status, "ok");
+    assert.equal(healthBody.checks.lifecycle, "never_run");
+    assert.equal(Object.hasOwn(healthBody.checks, "deletionLedger"), false);
+    assert.equal(healthBody.capabilities.participantExport, false, "OD-CR-5: export is unported");
     assertMarked(health, "verifier health");
+    // RD-2 ready: Worker-exact, not_ready on an origin no lifecycle pass has
+    // run against (OD-CR-4).
     const ready = await send(port, { path: "/api/ready", headers: { "x-serverless-authorization": token({ email: VERIFIER }) } });
-    assertUnported(m, ready, "verifier ready (fastpath-test serves no /api/ready)");
+    assert.equal(ready.status, 503, ready.text);
+    const readyBody = JSON.parse(ready.text);
+    assert.deepEqual(m.readiness.validatePostgresReadinessBody(readyBody), []);
+    assert.equal(readyBody.status, "not_ready");
+    assert.equal(readyBody.checks.lifecycle, "never_run");
+    assert.equal(ready.headers["cache-control"], "no-store");
+    assertMarked(ready, "verifier ready");
     assert.deepEqual(lines, [], "admitted verifier reads log nothing");
     const verifierPost = await send(port, { method: "POST", path: "/api/health", body: "{}",
       headers: { "x-serverless-authorization": token({ email: VERIFIER }), "content-type": "application/json" } });
@@ -516,10 +546,10 @@ test("boundary refusals are the unmarked 421 with connection: close, before any 
 // ---------------------------------------------------------------------------
 // Served routes
 
-test("served routes: every EDGE_TEST_SERVED_ROUTE_IDS pair is served; every other forwarded pair is unported", {
+test("served routes: every production ported pair is served; every other forwarded pair is unported", {
   skip: SKIP, timeout: 300_000,
 }, () => withOrigin({ edge: true }, async ({ m, port }) => {
-  const served = new Set(m.edgeMode.EDGE_TEST_SERVED_ROUTE_IDS);
+  const served = new Set(m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS);
   let servedPairs = 0;
   let unportedPairs = 0;
   const observedServedIds = new Set();
@@ -533,26 +563,28 @@ test("served routes: every EDGE_TEST_SERVED_ROUTE_IDS pair is served; every othe
       // other pair reaches the origin on the apex.
       if (!route.id.startsWith("admin_")) {
         const label = `${method} ${route.pathname} (${route.id}) on the apex`;
-        const answer = await send(port, reachableRequest(route, method, { admission }));
+        const request = reachableRequest(route, method, { admission });
+        const answer = await send(port, request);
         assertMarked(answer, label);
         if (served.has(route.id)) {
-          assert.notEqual(answer.text, m.edgeMode.EDGE_TEST_UNPORTED_BODY, label);
+          assert.notEqual(errorCode(answer), "POSTGRES_ROUTE_NOT_PORTED", label);
           assert.ok(!ADMISSION_CODES.includes(errorCode(answer)), `${label}: admitted (${answer.text})`);
           observedServedIds.add(route.id);
           servedPairs += 1;
         } else {
-          assertUnported(m, answer, label);
+          assertUnported(m, answer, label, request.headers["x-tibotattle-edge-request-id"]);
           unportedPairs += 1;
         }
       }
-      // On the admin host the composition serves nothing.
+      // The admin host is refused before anything, as production refuses it
+      // until ADMIN-R12 opens it (OD-CR-3; OWN-17 answered in round 12).
       const adminLabel = `${method} ${route.pathname} (${route.id}) on the admin host`;
-      assertUnported(m, await send(port, reachableRequest(route, method, { hostKind: "admin", admission })),
-        adminLabel);
+      const adminRequest = reachableRequest(route, method, { hostKind: "admin", admission });
+      assertUnported(m, await send(port, adminRequest), adminLabel, adminRequest.headers["x-tibotattle-edge-request-id"]);
     }
   }
   assert.deepEqual([...observedServedIds].sort(), [...served].sort(), "every served id was probed");
-  assert.equal(servedPairs, 31, "29 served ids, two with GET and POST");
+  assert.equal(servedPairs, 32, "30 served ids, two with GET and POST");
   assert.ok(unportedPairs > 0);
 }));
 
@@ -562,7 +594,7 @@ test("served routes: every EDGE_TEST_SERVED_ROUTE_IDS pair is served; every othe
 test("replay parity: each served EP-1 policy route answers the Worker helper's 429 and 503 for the edge outcome", {
   skip: SKIP, timeout: 300_000,
 }, () => withOrigin({ edge: true }, async ({ m, port }) => {
-  const served = new Set(m.edgeMode.EDGE_TEST_SERVED_ROUTE_IDS);
+  const served = new Set(m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS);
   const routes = m.registry.WORKER_ROUTE_POLICY
     .filter((route) => served.has(route.id) && m.policy.edgeAdmissionPolicyFor(route.id) !== null);
   assert.deepEqual(routes.map((route) => route.id).sort(), [

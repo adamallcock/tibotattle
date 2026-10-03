@@ -73,6 +73,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
   let cluster;
   let target;
   let clean;
+  let audit;
   let receipt;
   let sealedDb;
 
@@ -85,8 +86,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     seal = await readCutoverSeal({ manifestPath, expectedSealId: result.sealId });
     sealedDb = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
-      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 2, label: "pt3" });
-    [target, clean] = cluster.targets;
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 3, label: "pt3" });
+    [target, clean, audit] = cluster.targets;
   }, 600_000);
 
   afterAll(async () => {
@@ -371,6 +372,25 @@ describe.skipIf(!PG_TEST_SOCKET)("PT-3 identity and authority importer on Postgr
     expect(shape.rows).toHaveLength(1);
     expect(cluster.erased.name.endsWith("_enrollment_grants_erased_redeemer.sql")).toBe(true);
   });
+
+  it("digests integer-keyed tables in numeric key order: a text projection must not decide ORDER BY", async () => {
+    // admin_action_audit is keyed by an integer id. With ten or more rows the target scan sorted "10" before "2" (the
+    // output alias is a text projection), the digest then differed from the sealed one and the stage refused.
+    const inserts = Array.from({ length: 14 }, (_, index) => `INSERT INTO admin_action_audit(operation_id, action,
+      actor_identity_digest, outcome, details_json, created_at)
+      VALUES ('${randomUUID()}', 'sync_distribution', '${"a".repeat(64)}', 'success', '{}', '2026-10-01T00:00:0${index % 10}.000Z')`).join(";\n");
+    const forged = await forgeVariantSeal(seal, inserts);
+    const handle = await beginImporting(audit, forged.sealId, forged.sealedAt);
+    try {
+      const result = await runIdentityAuthorityTransfer({ handle, sealManifestPath: forged.manifestPath, identityLinkPin: PIN });
+      const sealedRows = Number(sealedDb.prepare("SELECT count(*) AS n FROM admin_action_audit").get().n) + 14;
+      expect(result.tables.admin_action_audit.sourceRows).toBe(sealedRows);
+      expect(result.tables.admin_action_audit.targetRows).toBe(sealedRows);
+      expect(await count(audit.ownerPrimary, "admin_action_audit")).toBe(sealedRows);
+    } finally {
+      await abandonRun(handle);
+    }
+  }, 600_000);
 
   it("an imported session, device and pairing authenticate with the fixture secrets; a rotated-out secret revokes", async () => {
     const { ids, secrets, nowMs } = world.fixture;

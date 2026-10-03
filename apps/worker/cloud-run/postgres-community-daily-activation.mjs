@@ -11,9 +11,7 @@ import {
   normalizeIamUser,
 } from "./cloud-sql.mjs";
 import { readPostgresMigrations } from "./postgres-migrations.mjs";
-import {
-  CLOUD_RUN_IAM_TEST_TARGET,
-} from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   readPostgresCommunityDailyDaySourceEligibility,
 } from "../src/postgres-community-daily-publisher.ts";
@@ -36,8 +34,8 @@ export const POSTGRES_COMMUNITY_DAILY_ACTIVATION_SOURCE_NAMESPACE =
 export const POSTGRES_COMMUNITY_DAILY_ACTIVATION_TARGET =
   CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
 
-const EXPECTED_MIGRATION_COUNT = 67;
-const EXPECTED_MIGRATION_TAIL = "0067_pending_object_transfer_holds.sql";
+const EXPECTED_MIGRATION_COUNT = 69;
+const EXPECTED_MIGRATION_TAIL = "0069_analytics_v2_run_stamps.sql";
 const METADATA_EMAIL_URL =
   "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email";
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;

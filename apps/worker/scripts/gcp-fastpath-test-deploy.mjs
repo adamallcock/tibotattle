@@ -120,6 +120,11 @@ export const EDGE_TEST_ORIGIN_MODE = "edge-test";
  */
 export const EDGE_TEST_PRODUCTION_SETTINGS = Object.freeze([
   "ENROLLMENT_MODE", "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SIGN_IN_START_MAX_PER_MINUTE",
+  "PUBLIC_ANALYTICS_MODE",
+  // The upload-ingress policy (D-CRB): the lease budget and the 60 s / 15 s
+  // body read at production's values, as E12's origin runs them.
+  "UPLOAD_INGRESS_MAX_CONCURRENT", "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "UPLOAD_INGRESS_BURST",
+  "UPLOAD_INGRESS_LEASE_SECONDS", "UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "UPLOAD_INGRESS_BODY_IDLE_SECONDS",
 ]);
 /** The rest of that admission env, and why an edge-test origin does not take production's value. */
 export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
@@ -130,6 +135,8 @@ export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
   IDENTITY_LINK_SECRET_VERSION: "names that secret; Google enrollment routes only, not composed by any test mode",
   GOOGLE_OIDC_CLIENT_ID: "production's OAuth client, for the Google sign-in routes, which no test host mode composes",
   GOOGLE_OIDC_CLIENT_SECRET: "a production secret; Google sign-in routes only, not composed by any test mode",
+  DEPLOYMENT_SOURCE_COMMIT: "not a wrangler.jsonc setting: production's comes from its deploy; unset, this test "
+    + "origin's /api/health reports deployment.sourceCommit null, so the release verifier never accepts it",
 });
 /** A source id or typed-storage namespace the origin and an env flag both accept. */
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
@@ -267,17 +274,28 @@ export function migrateJobCommand({ image, expectedCounts }) {
  * the task timeout is two hours.
  *
  * dense: the dense-owner measurement profile (receipt
- * docs/receipts/2026-10-01-gcp-dense-owner-parity.md). A 16 GiB task (Cloud
- * Run needs 4 vCPU for it) with a 12,288 MiB heap and a 10,752 MiB budget,
- * which the memory model says admits the largest real owner (about 2.52
- * million records) even when every record falls in the 170 analysis days.
- * Compute stays single-threaded; the extra vCPUs are Cloud Run's minimum for
- * the memory and serve the garbage collector and the database driver. Four
- * hours of task time cover the local dense run several times over.
+ * docs/receipts/2026-10-01-gcp-dense-owner-parity.md), which is the
+ * production profile (OPS-2's ANALYTICS_REFRESH_TASK_PROFILE pins the two
+ * equal). A 16 GiB task (Cloud Run needs 4 vCPU for it) with a 12,288 MiB
+ * heap and a 10,752 MiB budget, which the memory model says admits the
+ * largest real owner (about 2.52 million records) even when every record
+ * falls in the 170 analysis days. Compute stays inline (one owner at a time);
+ * the extra vCPUs are Cloud Run's minimum for the memory and serve the
+ * garbage collector and the database driver. Four hours of task time cover
+ * the local dense run several times over.
+ *
+ * dense-workers: the same task and budget with four compute Workers (K-PAR,
+ * one per vCPU, the largest owner alone) and a 3,072 MiB main heap (runtime,
+ * one read chunk, the output account). It is the MEAS-3 measurement of the
+ * Workers' heap peaks on real owners, which the production profile waits for
+ * (K-CORE-A review); it is not the production profile.
  */
 export const REFRESH_JOB_PROFILES = Object.freeze({
-  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, taskTimeoutSeconds: 7_200, env: Object.freeze([]) }),
-  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, taskTimeoutSeconds: 14_400,
+  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, workers: 1, taskTimeoutSeconds: 7_200,
+    env: Object.freeze([]) }),
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, workers: 1, taskTimeoutSeconds: 14_400,
+    env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
+  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, workers: 4, taskTimeoutSeconds: 14_400,
     env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
 });
 /** The default (standard) profile; the local rehearsal runs its heap. */
@@ -302,6 +320,7 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
     `--max-old-space-size=${resources.heapMiB}`,
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
+    ...(resources.workers > 1 ? [`--workers=${resources.workers}`] : []),
     ...extraArgs,
   ];
   if (args.some((arg) => /[,\s]/u.test(arg))) fail("FASTPATH_DEPLOY_ARGS_INVALID");
@@ -898,7 +917,8 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
-                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h); refused
+                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h;
+                   dense-workers: dense with four compute Workers and a 3,072 MiB main heap, for MEAS-3); refused
                    while an execution of it is running; a LOCK_HELD execution fails the step
   refresh-idle     read-only: refuse while an execution of ${FASTPATH_TEST.refreshJob} is running (its
                    database-wide advisory lock would make another refresh exit LOCK_HELD)
@@ -935,7 +955,8 @@ Options:
   --dump=<path>           the golden's source dump when the golden commits only its digest (golden-dense);
                           refused unless its sha256 equals the golden manifest's sourceDump.jsonSha256;
                           seed, and origin over a seeded schema, refuse without it before any remote command
-  --refresh-profile=standard|dense   the refresh Job's task size (default: the corpus's, else standard)
+  --refresh-profile=standard|dense|dense-workers   the refresh Job's task size (default: the corpus's,
+                          else standard)
   --schema-suffix=<hex8>  seeded schema suffix (default: from the commit and the golden dump digest)
   --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
   --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}

@@ -22,6 +22,7 @@ import {
   routeErrorResponse,
   routeFailure,
   validateDeviceRouteDependencies,
+  routeRequestId,
 } from "./v11-route-support.mjs";
 
 export const TELEMETRY_V11_DOMAIN_PREDECESSOR_PATH = "/api/v1/me/telemetry-v11/domain-predecessor";
@@ -45,7 +46,7 @@ export function createTelemetryV11DomainPredecessorRouteModule(dependencies) {
         { participantId: device.participantId, deviceId: device.deviceId }, Date.now(),
       ));
     } catch (error) {
-      return routeErrorResponse(error);
+      return routeErrorResponse(error, routeRequestId(deps, request));
     }
   }
 

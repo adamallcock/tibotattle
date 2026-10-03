@@ -37,7 +37,7 @@ import { after, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -78,6 +78,7 @@ import {
   createReferenceInstance,
   createSparkleFixture,
   readCheckedInProductionLimits,
+  readSanitizedProductionVars,
 } from "../scripts/edge-e2e/edge-instances.mjs";
 import {
   SIGNATURE_REMOVED,
@@ -190,17 +191,20 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [registry, policy, contract, edgeMode, session, codec, constants, subrequest] = await Promise.all([
-    load("/src/route-registry.ts"),
-    load("/src/edge-admission-policy.ts"),
-    load("/src/edge-origin-contract.ts"),
-    load("/cloud-run/origin-edge-test-mode.mjs"),
-    load("/src/session.ts"),
-    load("/src/typed-telemetry-codec.ts"),
-    load("/src/constants.ts"),
-    load("/src/edge-google-subrequest.ts"),
-  ]);
-  return { registry, policy, contract, edgeMode, session, codec, constants, subrequest };
+  const [registry, policy, contract, composition, session, codec, constants, subrequest, readiness, ingressBudget] =
+    await Promise.all([
+      load("/src/route-registry.ts"),
+      load("/src/edge-admission-policy.ts"),
+      load("/src/edge-origin-contract.ts"),
+      load("/src/backend-composition.ts"),
+      load("/src/session.ts"),
+      load("/src/typed-telemetry-codec.ts"),
+      load("/src/constants.ts"),
+      load("/src/edge-google-subrequest.ts"),
+      load("/src/postgres-readiness-contract.ts"),
+      load("/src/postgres-ingress-budget.ts"),
+    ]);
+  return { registry, policy, contract, composition, session, codec, constants, subrequest, readiness, ingressBudget };
 }
 
 async function localSocket() {
@@ -240,6 +244,17 @@ async function envelopeKeys() {
   };
 }
 
+/**
+ * The upload-ingress budget the origin takes its shared lease from (D-CRB:
+ * the contributions preamble now leases as the Worker does), set to the
+ * checked-in env.production values the reference Worker's Durable Object
+ * runs, so both refuse at the same budget.
+ */
+const ORIGIN_INGRESS_VAR_NAMES = Object.freeze([
+  "UPLOAD_INGRESS_MAX_CONCURRENT", "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "UPLOAD_INGRESS_BURST",
+  "UPLOAD_INGRESS_LEASE_SECONDS", "UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "UPLOAD_INGRESS_BODY_IDLE_SECONDS",
+]);
+
 const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "POSTGRES_TEST_HTTP_MODE", "HOST", "PORT", "HOST_ORIGIN", "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN",
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
@@ -252,7 +267,7 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
   "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS",
   "EDGE_ORIGIN_MODE", "EDGE_ORIGIN_AUDIENCE", "EDGE_INVOKER_SERVICE_ACCOUNT",
-  "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS",
+  "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS", ...ORIGIN_INGRESS_VAR_NAMES,
 ]);
 
 async function withEnvironment(environment, work) {
@@ -313,6 +328,7 @@ let serverModule = null;
  */
 async function startOrigin({ socket, schema, keys, nowMs = null, objects, settings = {} }) {
   serverModule ??= await import(pathToFileURL(DIST_SERVER).href);
+  const productionVars = await readSanitizedProductionVars(WORKER_ROOT);
   const port = await freePort();
   const hostOrigin = `http://127.0.0.1:${port}`;
   const bucket = "synthetic-edge-e2e-bucket";
@@ -343,6 +359,7 @@ async function startOrigin({ socket, schema, keys, nowMs = null, objects, settin
     EDGE_ORIGIN_AUDIENCE: EDGE_E2E_AUDIENCE,
     EDGE_INVOKER_SERVICE_ACCOUNT: EDGE_E2E_INVOKER,
     EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: EDGE_E2E_VERIFIER,
+    ...Object.fromEntries(ORIGIN_INGRESS_VAR_NAMES.map((name) => [name, productionVars[name]])),
     ...settings,
   };
   const sigterm = process.listeners("SIGTERM");
@@ -360,6 +377,8 @@ async function startOrigin({ socket, schema, keys, nowMs = null, objects, settin
         },
         async createGoogleAccessTokenProvider() { return async () => "synthetic-access-token"; },
         createGcsQuarantineObjectStore: () => ({
+          // RD-3's probe reads one key, which no upload ever writes.
+          async head(key) { return objects.has(key) ? { key } : null; },
           async put(key, value) { objects.set(key, typeof value === "string" ? value : Buffer.from(value).toString()); },
           async delete(key) { objects.delete(key); },
         }),
@@ -477,6 +496,23 @@ function materialize(row, f) {
     url: `${HOST_ORIGINS[row.host]}${row.path}`,
     options: { method: row.method, headers, body, chunked: row.chunked === true },
   };
+}
+
+/** The production handler's closed unported code (CR-6, D-CRB). */
+const UNPORTED_CODE = "POSTGRES_ROUTE_NOT_PORTED";
+
+/**
+ * The origin's closed unported answer through the edge: 503 with exactly the
+ * Worker envelope keys and POSTGRES_ROUTE_NOT_PORTED, no-store, and no
+ * retry-after (OD-CR-6 (iv)). The body carries a request id, so fields are
+ * compared, never bytes.
+ */
+function assertUnported(answer, label) {
+  assert.equal(answer.status, 503, `${label}: ${answer.text}`);
+  assert.deepEqual(errorEnvelope(answer), { keys: ["error"], errorKeys: ["code", "requestId"], code: UNPORTED_CODE },
+    label);
+  assert.equal(answer.header("retry-after"), null, `${label}: no retry-after`);
+  assert.equal(answer.header("cache-control"), "no-store", label);
 }
 
 function errorEnvelope(answer) {
@@ -667,17 +703,14 @@ async function runRow(f, row, { edge = f.edge, reference = f.reference, ip = nex
     assert.equal(exchanges.length, 1, `${row.id}: exactly one forwarded exchange`);
     assert.deepEqual(transparencyMismatches(f, edgeAnswer, exchanges[0]), [], `${row.id}: transparency`);
   }
-  if (row.comparators.includes("unported")) {
-    assert.equal(edgeAnswer.status, 503, `${row.id}: ${edgeAnswer.text}`);
-    assert.equal(edgeAnswer.text, f.m.edgeMode.EDGE_TEST_UNPORTED_BODY, row.id);
-  }
+  if (row.comparators.includes("unported")) assertUnported(edgeAnswer, row.id);
   const expect = row.expect ?? {};
   if (expect.status !== undefined) assert.equal(edgeAnswer.status, expect.status, `${row.id}: ${edgeAnswer.text.slice(0, 300)}`);
   if (expect.code !== undefined) assert.equal(errorEnvelope(edgeAnswer)?.code, expect.code, row.id);
   if (expect.location !== undefined) assert.equal(edgeAnswer.header("location"), expect.location, row.id);
   if (expect.allow !== undefined) assert.equal(edgeAnswer.header("allow"), expect.allow, row.id);
   if (expect.served !== undefined) {
-    assert.equal(edgeAnswer.text === f.m.edgeMode.EDGE_TEST_UNPORTED_BODY, !expect.served,
+    assert.equal(errorEnvelope(edgeAnswer)?.code === UNPORTED_CODE, !expect.served,
       `${row.id}: served=${expect.served} (${edgeAnswer.status} ${edgeAnswer.text.slice(0, 160)})`);
   }
   for (const exchange of exchanges) {
@@ -867,7 +900,9 @@ test("S2 admin: the Access chokepoint equals the Worker; owner admin APIs forwar
   // with distribution analytics configured an owner overview read starts the
   // Cloudflare GraphQL reads on that same single path. The front end serves
   // the synthetic JWKS and refuses api.cloudflare.com; the overview is the
-  // origin's unported 503, so nothing is merged and the answer passes through.
+  // origin's closed unported 503 (the admin host is refused at the origin,
+  // OD-CR-3, until ADMIN-R12 opens it), so nothing is merged and the answer
+  // passes through.
   const jwksHost = "synthetic-edge.cloudflareaccess.com";
   const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
     upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(f.origin.port),
@@ -882,8 +917,7 @@ test("S2 admin: the Access chokepoint equals the Worker; owner admin APIs forwar
   disposers.push(() => production.dispose());
   const overview = await production.fetch(`${EDGE_E2E_ADMIN_ORIGIN}/api/v1/admin/overview`, { ip: nextIp(),
     headers: { "cf-access-jwt-assertion": f.access.owner() } });
-  assert.equal(overview.status, 503, overview.text);
-  assert.equal(overview.text, f.m.edgeMode.EDGE_TEST_UNPORTED_BODY);
+  assertUnported(overview, "production-environment overview");
   assert.equal(frontEnd.exchanges.length, 1, "the overview was forwarded once");
   assert.deepEqual(transparencyMismatches(f, overview, frontEnd.exchanges[0]), []);
   assert.deepEqual(frontEnd.fixtureRequests.map((request) => request.host), [jwksHost], "the JWKS came over the edge's network");
@@ -906,18 +940,22 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const f = await fixture();
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
-  for (const row of sweepRows({ registry, servedRouteIds: f.m.edgeMode.EDGE_TEST_SERVED_ROUTE_IDS })) {
+  for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
+  // RD-3 health (the Worker body minus the two append-only keys) and RD-2
+  // ready, Worker-exact: not_ready until a lifecycle pass ran (OD-CR-4).
   const health = await f.frontEnd.direct({ path: "/api/health", email: EDGE_E2E_VERIFIER });
   assert.equal(health.status, 200);
   assert.equal(health.headers["x-tibotattle-origin"], "1");
-  assert.equal(JSON.parse(health.body.toString()).status, "ready");
+  assert.equal(JSON.parse(health.body.toString()).status, "ok");
   const ready = await f.frontEnd.direct({ path: "/api/ready", email: EDGE_E2E_VERIFIER });
   assert.equal(ready.status, 503);
   assert.equal(ready.headers["x-tibotattle-origin"], "1");
-  assert.equal(ready.body.toString(), f.m.edgeMode.EDGE_TEST_UNPORTED_BODY);
+  const readyBody = JSON.parse(ready.body.toString());
+  assert.deepEqual(f.m.readiness.validatePostgresReadinessBody(readyBody), []);
+  assert.equal(readyBody.status, "not_ready");
   // Without a token Google's front end refuses before the origin, unmarked.
   const anonymous = await f.frontEnd.direct({ path: "/api/health" });
   assert.equal(anonymous.status, 401);
@@ -925,9 +963,9 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const stranger = await f.frontEnd.direct({ path: "/api/health", email: EDGE_E2E_STRANGER });
   assert.equal(stranger.status, 403);
   assert.equal(stranger.headers["x-tibotattle-origin"], undefined);
-  // The edge reaches /api/ready as the invoker: the unported 503, marked, passed through.
+  // The edge reaches /api/ready as the invoker: RD-2's not_ready 503, passed through.
   await runRow(f, { id: "ready-through-edge", stage: "S3", routeId: "ready", host: "apex", method: "GET",
-    path: "/api/ready", headers: {}, comparators: ["transparency", "unported"], expect: {} });
+    path: "/api/ready", headers: {}, comparators: ["transparency"], expect: { status: 503, served: true } });
 });
 
 // ---------------------------------------------------------------------------
@@ -1919,7 +1957,7 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   const pair = { edge, reference };
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   const rows = admissionRows({ registry, policyFor: f.m.policy.edgeAdmissionPolicyFor,
-    servedRouteIds: f.m.edgeMode.EDGE_TEST_SERVED_ROUTE_IDS })
+    servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS })
     .map((row) => (row.routeId === "contributions" ? { ...row, body: S4_CONTRIBUTION_BODY } : row));
   const byRoute = (routeId, method = null) => rows.find((row) => row.routeId === routeId
     && (method === null || row.method === method));
@@ -1995,14 +2033,71 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
 
   // E. Upload ingress at the production limits. The Worker's own upload budget
   // (a Durable Object: 1200 starts per minute, burst 1200) refuses before its
-  // 3000/60 address limiters can, so beyond the first 1000 the edge is checked
-  // alone: 3000 admitted from one address and the 3001st limited.
+  // 3000/60 address limiters can, and the origin now takes the same shared
+  // lease over its PostgreSQL budget with the same values (D-CRB), so it
+  // refuses there too. The first 1000 pairs are compared with the Worker.
+  // The rest pins the origin's budget to its configured size through the
+  // budget's own accounting. The burst starts on a full budget (it waits for
+  // the refill first). From the first start on, each start takes one token
+  // and the configured rate refills startsPerMinute / 60 000 tokens per
+  // millisecond of the database clock the budget keeps, so after the burst
+  //   claims = burst - tokens left + rate * (last update - first start).
+  // The first start comes after the start reading, and within
+  // FIRST_START_ALLOWANCE_MS of it; claims outside the range that gives mean
+  // another burst size or rate. The burst must also outrun the refill, so
+  // the budget refuses, and every other request is the budget's 429. A
+  // missing, unlimited or wrongly sized budget fails. Then the edge's own
+  // address limiter is checked alone: 3000 forwarded from one address and
+  // the 3001st limited at the edge.
+  const ingressVars = await readSanitizedProductionVars(WORKER_ROOT);
+  const ingressBurst = Number(ingressVars.UPLOAD_INGRESS_BURST);
+  const startsPerMinute = Number(ingressVars.UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE);
+  assert.ok(Number.isSafeInteger(ingressBurst) && ingressBurst >= 1_000 && ingressBurst < limits.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    "the checked-in burst lies between the compared pairs and the address limit");
+  assert.ok(Number.isSafeInteger(startsPerMinute) && startsPerMinute > 0);
+  const budgetName = f.m.ingressBudget.POSTGRES_UPLOAD_INGRESS_BUDGET_NAME;
+  /** The budget's start tokens now (its own refill rule, capped at the burst) and the database clock. */
+  const ingressBudgetNow = async () => {
+    const clock = (await f.base.query(
+      "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::float8 AS now_ms")).rows[0].now_ms;
+    const row = (await f.base.query(`SELECT tokens::float8 AS tokens,
+        floor(extract(epoch FROM updated_at)*1000)::float8 AS updated_ms
+      FROM ${f.t("upload_ingress_budget_states")} WHERE budget_name=$1`, [budgetName])).rows[0];
+    // No row yet: the first acquire creates the budget full.
+    const tokens = row === undefined ? ingressBurst
+      : Math.min(ingressBurst, row.tokens + ((clock - row.updated_ms) * startsPerMinute) / 60_000);
+    return { tokens, nowMs: clock };
+  };
+  const beforeRefill = await ingressBudgetNow();
+  if (beforeRefill.tokens < ingressBurst) {
+    await sleep(Math.ceil(((ingressBurst - beforeRefill.tokens) * 60_000) / startsPerMinute) + 250);
+  }
   await windowWithRoom(WINDOW_MS);
+  const ingressStart = await ingressBudgetNow();
+  assert.equal(ingressStart.tokens, ingressBurst, "the burst starts on a full budget");
   const ingressIp = nextIp();
   const ingressRow = { ...byRoute("contributions"), id: "contributions at the production limit" };
   const answers = await burst(f, ingressRow, { ...pair, count: limits.UPLOAD_INGRESS_CLIENT_RATE_LIMIT, ip: ingressIp,
     compareFirst: 1_000 });
-  assert.ok(answers.every(({ edgeAnswer }) => edgeAnswer.status === 401), "3000 admitted (then refused at the claim)");
+  const ingressEnd = (await f.base.query(`SELECT tokens::float8 AS tokens,
+      floor(extract(epoch FROM updated_at)*1000)::float8 AS updated_ms
+    FROM ${f.t("upload_ingress_budget_states")} WHERE budget_name=$1`, [budgetName])).rows[0];
+  assert.ok(ingressEnd !== undefined, "the burst went through the origin's budget");
+  const claimed = answers.filter(({ edgeAnswer }) => edgeAnswer.status === 401).length;
+  const budgetRefused = answers.filter(({ edgeAnswer }) => edgeAnswer.status === 429
+    && errorEnvelope(edgeAnswer)?.code === "UPLOAD_INGRESS_LIMIT_REACHED").length;
+  assert.equal(claimed + budgetRefused, answers.length,
+    "3000 forwarded: each admitted to the claim or refused by the shared ingress budget");
+  assert.ok(budgetRefused >= 1, "the burst outran the budget's refill, so the budget refused");
+  const FIRST_START_ALLOWANCE_MS = 2_000;
+  const burstMs = ingressEnd.updated_ms - ingressStart.nowMs;
+  const tokensPerMs = startsPerMinute / 60_000;
+  const mostClaims = ingressBurst - ingressEnd.tokens + tokensPerMs * burstMs;
+  const leastClaims = mostClaims - tokensPerMs * FIRST_START_ALLOWANCE_MS;
+  // One start of slack either way for the budget's millisecond clock.
+  assert.ok(claimed <= Math.floor(mostClaims) + 1 && claimed >= Math.ceil(leastClaims) - 1,
+    `claimed ${claimed} in ${burstMs} ms: a ${ingressBurst} burst at ${startsPerMinute} a minute allows `
+    + `${leastClaims.toFixed(1)} to ${mostClaims.toFixed(1)}`);
   for (const [index, { edgeAnswer, referenceAnswer }] of answers.slice(0, 1_000).entries()) {
     assert.deepEqual(workerMismatches(edgeAnswer, referenceAnswer), [], `ingress pair ${index + 1}`);
   }
@@ -2011,7 +2106,8 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   assert.equal(errorEnvelope(over.edgeAnswer)?.code, "UPLOAD_INGRESS_LIMIT_REACHED");
   assert.equal(over.edgeAnswer.header("retry-after"), "60");
   assert.ok(admissionOf(over.exchanges)?.endsWith(";limited"));
-  f.rows.push({ stage: "S4", id: "ingress-production-edge", pairs: answers.length + 1, compared: 1_000 });
+  f.rows.push({ stage: "S4", id: "ingress-production-edge", pairs: answers.length + 1, compared: 1_000,
+    claimed, budgetRefused, burstMs });
 
   // F. Request-only refusals spend no budget, as in the Worker, where they come
   // before its limiter: from one address, more refused requests than the
@@ -2178,10 +2274,15 @@ async function seededRehearsal() {
   // which can cut a piped stdout short on macOS.
   const directory = await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-"));
   const out = join(directory, "report.json");
+  // A line whose code needs a staged (not yet promoted) primary migration
+  // rehearses with it applied, as its specs do (K-STAMP's kernel stamps).
+  const staged = (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
+    .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
   try {
     await execFileAsync(node,
       [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
-        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED])], {
+        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
+        ...staged.flatMap((name) => ["--staged-primary", name])], {
         cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
         env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
           PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,

@@ -28,7 +28,7 @@ import {
   functionSignature,
   restrictedFunctionsMatchPolicy,
 } from "./test-migrations.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 
 const EXECUTION = "tibotattle-test-database-migrate-20260924-abc12";
 // The retired A2 primary target (owner decision OD-6): the shared test
@@ -361,7 +361,7 @@ const manifest = await buildPostgresMigrationManifest({ rootDirectory: POSTGRES_
 test("the a2 profile is retired (OD-6): no profile, 'a2' or the A2 Job and target is accepted", async () => {
   assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v2");
   assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
-  assert.equal(manifest.roles.primary.length, 67);
+  assert.equal(manifest.roles.primary.length, 69);
   assert.deepEqual(Object.keys(FASTPATH_MIGRATION_TARGETS), ["primary"]);
   assert.equal(TEST_MIGRATIONS_RUNTIME_IAM_USER, "tibotattle-test-runtime@tibotattle.iam");
   // The A2 Job's name stays a refusal identity until owner action OA-4.
@@ -536,10 +536,10 @@ test("the primary migrations are checksum-read back and repeated runs are idempo
   const second = await run();
   assert.deepEqual(first, second);
   assert.deepEqual(Object.keys(first.migrations), ["primary"]);
-  assert.equal(first.migrations.primary.applied, 67);
-  assert.equal(first.migrations.primary.latest.name, "0067_pending_object_transfer_holds.sql");
+  assert.equal(first.migrations.primary.applied, 69);
+  assert.equal(first.migrations.primary.latest.name, "0069_analytics_v2_run_stamps.sql");
   assert.match(first.migrations.primary.manifestSha256, /^[0-9a-f]{64}$/u);
-  assert.equal(harness.schemaReceipts.get(FASTPATH_MIGRATION_TARGETS.primary.schema).length, 67);
+  assert.equal(harness.schemaReceipts.get(FASTPATH_MIGRATION_TARGETS.primary.schema).length, 69);
   assert.equal(harness.poolCount, 2, "one primary pool per run, no ledger pool");
   assert.equal(harness.applyCalls, 2);
   assert.equal(harness.cleanupCalls, 2);
@@ -586,7 +586,7 @@ test("the primary migrations are checksum-read back and repeated runs are idempo
     "the retired A2 schema never receives grants");
 });
 
-test("benchmark profile applies 67 receipts and verifies runtime grants on every exact primary schema", async () => {
+test("benchmark profile applies 69 receipts and verifies runtime grants on every exact primary schema", async () => {
   const harness = makeHarness(manifest, { graphBenchmark: true });
   const result = await runTestMigrations({
     env: validBenchmarkEnv(),
@@ -597,7 +597,7 @@ test("benchmark profile applies 67 receipts and verifies runtime grants on every
   assert.equal(result.profile, GRAPH_BENCHMARK_MIGRATION_PROFILE);
   assert.equal(result.migrations.primarySchemas.length, 7);
   assert.deepEqual(result.migrations.primarySchemas.map(({ schema, applied }) => [schema, applied]),
-    GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 67]));
+    GRAPH_BENCHMARK_MIGRATION_TARGETS.map(({ schema }) => [schema, 69]));
   assert.equal(harness.poolCount, 1, "both schemas use only the pinned primary database pool");
   assert.equal(harness.applyCalls, 7);
   assert.equal(harness.cleanupCalls, 1);
@@ -605,7 +605,7 @@ test("benchmark profile applies 67 receipts and verifies runtime grants on every
   assert.equal(harness.events.some(({ role }) => role === "ledger"), false);
 
   for (const { schema } of GRAPH_BENCHMARK_MIGRATION_TARGETS) {
-    assert.equal(harness.schemaReceipts.get(schema).length, 67);
+    assert.equal(harness.schemaReceipts.get(schema).length, 69);
     assert.equal(harness.schemaOwners.get(schema), TEST_MIGRATIONS_IAM_USER);
     const quoted = `"${schema}"`;
     assert.equal(harness.events.some(({ sql }) => sql === `CREATE SCHEMA ${quoted}`), true);

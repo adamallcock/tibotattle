@@ -44,6 +44,13 @@
  * A state readback does not recognize is a blocker. probeScheduler is the
  * paused-too-long signal: a resumed trigger left PAUSED past the threshold.
  *
+ * A job that reads configuration only the desired state can supply (the
+ * maintenance job: the telemetry namespace, the quarantine bucket's birth
+ * proof, and secrets at pinned versions) is deferred like the service until
+ * each exists (jobInputDeferral), and its trigger is not created while it is
+ * (the trigger would only name a job that does not exist). A job its
+ * environment cannot have (JOB_ENVIRONMENT_UNAVAILABLE) is never created.
+ *
  * The verifier account carries the operator's
  * roles/iam.serviceAccountTokenCreator grant (OD-CR-7), read with
  * `iam service-accounts get-iam-policy` and bound with
@@ -87,6 +94,7 @@ import {
   CLOUD_SQL_POSTURE,
   DEFERRED_JOBS,
   JOBS_EXECUTOR_ROLE,
+  JOB_DEFINITIONS,
   JOB_NAMES,
   LOGGING_POSTURE,
   QUARANTINE_STORE_ROLE_DESCRIPTION,
@@ -108,6 +116,7 @@ import {
   desiredProjectBindings,
   desiredStateDigest,
   fail,
+  jobRenderBlocker,
   jobRunUri,
   renderEdgeIamPolicy,
   renderJob,
@@ -1129,6 +1138,31 @@ function serviceDeferral(desired, observed) {
   return null;
 }
 
+/**
+ * Why a job cannot be rendered yet from what the desired state and the estate
+ * hold, or null: its environment cannot have it, a namespace is unassigned
+ * (jobRenderBlocker), the bucket birth proof it reads is unpinned, or a secret
+ * it reads has no pinned version or a version that is not enabled. A job that
+ * reads none of these is never deferred here.
+ */
+function jobInputDeferral(desired, observed, job) {
+  const blocker = jobRenderBlocker(desired, job);
+  if (blocker !== null) return blocker;
+  const definition = JOB_DEFINITIONS[job];
+  if (definition.env.includes("GCS_QUARANTINE_BUCKET_HISTORY_PROOF") && desired.bucket.proof === null) {
+    return "BUCKET_PROOF_UNPINNED";
+  }
+  for (const name of definition.secrets ?? []) {
+    const secret = desired.secrets[name];
+    if (secret.version === null) {
+      if (secret.required) return `SECRET_VERSION_UNPINNED:${name}`;
+      continue;
+    }
+    if (observed.secrets[name]?.versions?.[secret.version] !== "ENABLED") return `SECRET_VERSION_UNAVAILABLE:${name}`;
+  }
+  return null;
+}
+
 function runImage(live, bootstrap, label) {
   if (live === null) return bootstrap === null ? { deferred: "BOOTSTRAP_IMAGE_REQUIRED" } : { image: bootstrap };
   if (live.imageDigest === null) return { deferred: `${label}_LIVE_IMAGE_UNRECOGNIZED` };
@@ -1210,9 +1244,15 @@ function jobOperations(desired, observed, bootstrap, usage, jobDeferrals, execut
     const jobDeferral = live === null ? jobDeferrals[job] : undefined;
     const image = jobDeferral === undefined ? runImage(live, bootstrap, "JOB") : { deferred: jobDeferral };
     if (live === null && jobDeferral === undefined) usage.bootstrap = true;
-    if (image.deferred !== undefined) {
+    // Inputs the desired state or the estate does not hold yet (jobInputDeferral)
+    // defer the create or update, like the service's own. A job its environment
+    // cannot have (or whose namespace is unassigned) never asks for an image.
+    const inputs = jobDeferral === undefined ? jobInputDeferral(desired, observed, job) : null;
+    const blocked = inputs !== null && jobRenderBlocker(desired, job) === inputs ? inputs : null;
+    const deferral = blocked ?? image.deferred ?? inputs ?? null;
+    if (deferral !== null) {
       operations.push(operation(`run-job:${live === null ? "create" : "update"}:${job}`,
-        live === null ? "create" : "update", replaceArgv, { deferred: image.deferred }));
+        live === null ? "create" : "update", replaceArgv, { deferred: deferral }));
     } else {
       const rendered = renderJob(desired, job, image.image);
       if (live === null) {
@@ -1228,7 +1268,7 @@ function jobOperations(desired, observed, bootstrap, usage, jobDeferrals, execut
       `--member=${binding.member}`, `--role=${binding.role}`];
     const iam = live === null
       ? desiredBindings.map((binding) => operation(`run-job-iam:${job}:bind:${bindingId(binding)}`, "bind", add(binding),
-        image.deferred === undefined ? {} : { deferred: image.deferred }))
+        deferral === null ? {} : { deferred: deferral }))
       : bindingOperations(`run-job-iam:${job}`, desiredBindings, live.bindings, add,
         (binding) => ["run", "jobs", "remove-iam-policy-binding", desired.jobs[job].name, project, region,
           `--member=${binding.member}`, `--role=${binding.role}`]);
@@ -1242,7 +1282,23 @@ function jobOperations(desired, observed, bootstrap, usage, jobDeferrals, execut
   return operations;
 }
 
-function schedulerOperations(desired, observed, blockers, jobDeferrals, executorBinds) {
+/**
+ * The trigger holds: for each job that is not live yet, why its trigger is not
+ * created either. A registry deferral (DEFERRED_JOBS) and a job input
+ * deferral hold it; a missing bootstrap image does not (the trigger is created
+ * paused and cannot start a job it has no executor binding on).
+ */
+function triggerHolds(desired, observed, jobDeferrals) {
+  const holds = {};
+  for (const job of SCHEDULED_JOB_NAMES) {
+    if (observed.jobs.managed[job] !== null) continue;
+    const reason = jobDeferrals[job] ?? jobInputDeferral(desired, observed, job);
+    if (reason !== null) holds[job] = reason;
+  }
+  return holds;
+}
+
+function schedulerOperations(desired, observed, blockers, holds, executorBinds) {
   const project = `--project=${desired.project}`;
   const location = `--location=${desired.region}`;
   const operations = [];
@@ -1253,7 +1309,7 @@ function schedulerOperations(desired, observed, blockers, jobDeferrals, executor
     }
   }
   for (const job of SCHEDULED_JOB_NAMES) {
-    operations.push(...triggerOperations(desired, observed, blockers, jobDeferrals, job));
+    operations.push(...triggerOperations(desired, observed, blockers, holds, job));
     // Only now may the scheduler account run the job: a trigger whose pause
     // failed above is ENABLED but cannot start it.
     operations.push(...(executorBinds[job] ?? []));
@@ -1262,7 +1318,7 @@ function schedulerOperations(desired, observed, blockers, jobDeferrals, executor
 }
 
 /** One trigger's operations: create then pause, pause, deferred resume or update. */
-function triggerOperations(desired, observed, blockers, jobDeferrals, job) {
+function triggerOperations(desired, observed, blockers, holds, job) {
   const project = `--project=${desired.project}`;
   const location = `--location=${desired.region}`;
   const trigger = desired.scheduler[job];
@@ -1280,10 +1336,10 @@ function triggerOperations(desired, observed, blockers, jobDeferrals, job) {
   const pause = operation(`scheduler:pause:${job}`, "update",
     ["scheduler", "jobs", "pause", trigger.name, project, location]);
   if (live === null) {
-    if (jobDeferrals[job] !== undefined && observed.jobs.managed[job] === null) {
+    if (holds[job] !== undefined) {
       // No trigger for a job that is not created.
       return [operation(`scheduler:create:${job}`, "create",
-        ["scheduler", "jobs", "create", "http", trigger.name, ...flags], { deferred: jobDeferrals[job] })];
+        ["scheduler", "jobs", "create", "http", trigger.name, ...flags], { deferred: holds[job] })];
     }
     // Cloud Scheduler creates a trigger ENABLED; apply pauses it at once,
     // whatever the desired state, and never resumes it (OPS-3 does). Should
@@ -1416,7 +1472,7 @@ export function planInfrastructure(desired, readback, { bootstrap: rawBootstrap,
     ...loggingOperations(desired, observed),
     ...serviceOperations(desired, observed, bootstrap, usage),
     ...jobOperations(desired, observed, bootstrap, usage, jobDeferrals, executorBinds),
-    ...schedulerOperations(desired, observed, blockers, jobDeferrals, executorBinds),
+    ...schedulerOperations(desired, observed, blockers, triggerHolds(desired, observed, jobDeferrals), executorBinds),
   ];
   assertTriggersCreatedPaused(operations);
   if (bootstrap !== null && !usage.bootstrap) fail("BOOTSTRAP_IMAGE_UNUSED");

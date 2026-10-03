@@ -4,6 +4,12 @@ import { mkdir } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import {
+  ANALYTICS_REFRESH_WORKER_ENTRY,
+  analyticsKernelDefines,
+  computeAnalyticsKernelIdentity,
+  resolveAnalyticsKernelRegistryEntry,
+} from "./analytics-kernel-closure.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const ENTRY = resolve(ROOT, "server.mjs");
@@ -19,6 +25,8 @@ const COMMUNITY_DAILY_RESTORE_ENTRY = resolve(ROOT, "postgres-community-daily-re
 const ANALYTICS_REFRESH_ENTRY = resolve(ROOT, "analytics-refresh.mjs");
 const PRODUCTION_MIGRATIONS_ENTRY = resolve(ROOT, "postgres-production-migrations.mjs");
 const MAINTENANCE_JOB_ENTRY = resolve(ROOT, "postgres-maintenance-job.mjs");
+const OPS_RUNTIME_PROBE_ENTRY = resolve(ROOT, "ops-runtime-probe-job.mjs");
+const OPS_BACKUP_AUDIT_ENTRY = resolve(ROOT, "ops-backup-audit-job.mjs");
 const OUTDIR = resolve(ROOT, "dist");
 // The vendored d43c8f92 kernels resolve @app-usagemonitor/* to the packages
 // vendored beside them through vendor/analytics-d43c8f92/tsconfig.json
@@ -40,8 +48,12 @@ const options = {
     "postgres-community-daily-prepare-test": COMMUNITY_DAILY_PREPARE_ENTRY,
     "postgres-community-daily-restore-test": COMMUNITY_DAILY_RESTORE_ENTRY,
     "analytics-refresh": ANALYTICS_REFRESH_ENTRY,
+    // K-PAR: the compute Worker the refresh Job spawns (dist/ beside it).
+    "analytics-refresh-worker": ANALYTICS_REFRESH_WORKER_ENTRY,
     "production-migrations": PRODUCTION_MIGRATIONS_ENTRY,
     "postgres-maintenance-job": MAINTENANCE_JOB_ENTRY,
+    "ops-runtime-probe-job": OPS_RUNTIME_PROBE_ENTRY,
+    "ops-backup-audit-job": OPS_BACKUP_AUDIT_ENTRY,
   },
   bundle: true,
   platform: "node",
@@ -90,13 +102,34 @@ function assertVendoredPackageResolution(metafile) {
   }
   return vendoredInputs;
 }
-if (process.argv.includes("--check")) {
+// K-STAMP: the kernel identity (vendored manifest and compute closure) every
+// bundle carries; src/analytics-v2/kernel.ts reads it, the Job refuses a
+// bundle whose identity has no kernel-registry.json entry.
+const kernelIdentity = await computeAnalyticsKernelIdentity({ build, options, vendorRoot: VENDOR_ROOT });
+options.define = { ...(options.define ?? {}), ...analyticsKernelDefines(kernelIdentity) };
+const kernel = { computeClosureSha256: kernelIdentity.computeClosureSha256,
+  vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs };
+const kernelClosureOnly = process.argv.includes("--kernel-closure");
+// Refuse to build (or check) a bundle no kernel-registry.json entry names
+// (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED), before anything is bundled: the image
+// build runs this, so an unregistered compute closure fails the image rather
+// than deploying a Job that refuses every run. The entry's id is reported with
+// the digests. --kernel-closure skips it: that is how a new entry's digests
+// are found.
+if (!kernelClosureOnly) {
+  kernel.kernelId = (await resolveAnalyticsKernelRegistryEntry({ build, options, identity: kernelIdentity })).kernelId;
+}
+if (kernelClosureOnly) {
+  // Every input of the compute class, by the name it is hashed under (K-STAMP).
+  console.log(JSON.stringify({ status: "ok", mode: "kernel-closure", kernel, names: kernelIdentity.names }));
+} else if (process.argv.includes("--check")) {
   const result = await build({ ...options, write: false });
   assertVendoredPackageResolution(result.metafile);
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs", "analytics-refresh.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs"],
+    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
+    kernel,
   }));
 } else {
   await mkdir(OUTDIR, { recursive: true });
@@ -105,6 +138,7 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs", "dist/analytics-refresh.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs"],
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
+    kernel,
   }));
 }
