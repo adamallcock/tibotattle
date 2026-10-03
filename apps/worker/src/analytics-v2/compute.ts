@@ -1,3 +1,5 @@
+import { canonicalJson } from "../canonical-json";
+import { sha256Hex } from "../crypto";
 /**
  * analytics-v2 compute core (A-2): one pure, single-threaded full recompute of
  * every community analytics output from effective owner occurrences, using
@@ -243,6 +245,8 @@ export type AnalyticsV2QueuedDaysInput =
   | readonly AnalyticsV2Day[];
 
 export interface ComputeAnalyticsV2Input {
+  /** Optional proof observer: only a SHA-256 digest of merge order leaves compute. */
+  readonly emissionSequenceDigest?: (digest: string) => void;
   readonly owners: readonly AnalyticsV2Owner[];
   readonly occurrencesByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
   /**
@@ -760,7 +764,9 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     neededDays: Object.freeze(neededDays), segments: Object.freeze(segments), rangeFromDay: range.fromDay,
     queued: Object.freeze(queued), modelDates: Object.freeze(modelDates), resources });
   /** Append one owner output in production order and charge it to the account. */
+  const observedEmissions: AnalyticsV2OwnerEmission[] | null = input.emissionSequenceDigest === undefined ? null : [];
   const merge = (emission: AnalyticsV2OwnerEmission): void => {
+    observedEmissions?.push(emission);
     switch (emission.kind) {
       case "refusal": pushRefusal(emission.refusal); return;
       case "ownerDay": ownerDays.push(emission.row); break;
@@ -933,6 +939,8 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     effectiveDigests,
     devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions,
     ownerSets: ownerSetInput.state, savedValues }));
+
+  if (observedEmissions !== null) input.emissionSequenceDigest!(await sha256Hex(canonicalJson(observedEmissions)));
 
   return {
     contractVersion: ANALYTICS_V2_CONTRACT_VERSION,

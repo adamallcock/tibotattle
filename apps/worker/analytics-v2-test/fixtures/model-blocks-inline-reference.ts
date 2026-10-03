@@ -1,3 +1,4 @@
+// Frozen pre-stage oracle from approved base 48c26716; synthetic differential tests only.
 /**
  * analytics-v2 compute core, one effective owner (K-SPLIT, the K-PAR unit).
  *
@@ -27,12 +28,18 @@
  * no kernel output depends on it.
  */
 import {
+  CACHE_RETENTION_METHOD,
+  modelHistoryWindow,
+  validateV11DailyProjectionValues,
   type CommunityAllowanceFit,
+  type SharedAnalyticsDay,
   type V11DailyProjectionValues,
   type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
 import {
+  ANALYTICS_V2_CACHE_BAND_COUNTERS,
   ANALYTICS_V2_DAY_PATTERN,
+  type AnalyticsV2CacheBandCounter,
   type AnalyticsV2CacheBandRow,
   type AnalyticsV2Day,
   type AnalyticsV2Owner,
@@ -42,22 +49,51 @@ import {
   type AnalyticsV2OwnerModelDateRow,
   type AnalyticsV2Phase,
   type AnalyticsV2Refusal,
-} from "./contract";
+} from "../../src/analytics-v2/contract";
 import {
+  analyticsV2CacheView,
+  evaluateAnalyticsV2CacheDay,
+  evaluateAnalyticsV2ModelDate,
+  evaluateAnalyticsV2ScalarDate,
+  prepareAnalyticsV2Day,
   type AnalyticsV2CacheDay,
   type AnalyticsV2PreparedDay,
-} from "./native-path";
-import { EMPTY_DAY_OCCURRENCES,
-  type AnalyticsV2DayOccurrences } from "./pin";
-import { prepareSpan, evaluatePreparedSpanCache, evaluateScalar, evaluateModelBlock } from "./units";
+} from "../../src/analytics-v2/native-path";
+import { analyticsV2DayDigest, analyticsV2RefusedDayDigest, buildAnalyticsV2Pin, EMPTY_DAY_OCCURRENCES,
+  type AnalyticsV2DayOccurrences } from "../../src/analytics-v2/pin";
+import { attributeAnalyticsV2DayPrices } from "../../src/analytics-v2/price-attribution";
+import { analyticsV2Refusal, kernelRefusalReason } from "../../src/analytics-v2/refusals";
 import {
   analyticsV2OutputRowBytes,
   type AnalyticsV2DayEvidence,
   type AnalyticsV2DaySpan,
   type AnalyticsV2Resources,
-} from "./resources";
+} from "../../src/analytics-v2/resources";
+
+const DAY_MS = 86_400_000;
+const CACHE_LOOKBACK_DAYS: number = CACHE_RETENTION_METHOD.lookbackDays;
+
+const COUNTER_FIELDS = Object.freeze({
+  adjacencies: "adjacencies",
+  reused_more_than_half: "reusedMoreThanHalf",
+  matched_or_exceeded: "matchedOrExceeded",
+  unordered_ties: "unorderedTies",
+  excluded_insufficient_evidence: "excludedInsufficientEvidence",
+  excluded_context_contracted: "excludedContextContracted",
+  sessions: "sessions",
+} as const satisfies Record<AnalyticsV2CacheBandCounter, string>);
 
 const invalid = (what: string): never => { throw new TypeError(`ANALYTICS_V2_INPUT_INVALID:${what}`); };
+
+const label = (at: number): AnalyticsV2Day => new Date(at).toISOString().slice(0, 10);
+const addDays = (day: AnalyticsV2Day, days: number): AnalyticsV2Day => label(Date.parse(`${day}T00:00:00.000Z`) + days * DAY_MS);
+function daysBetween(fromDay: AnalyticsV2Day, throughDay: AnalyticsV2Day): AnalyticsV2Day[] {
+  const out: AnalyticsV2Day[] = [];
+  for (let at = Date.parse(`${fromDay}T00:00:00.000Z`), end = Date.parse(`${throughDay}T00:00:00.000Z`); at <= end; at += DAY_MS) {
+    out.push(label(at));
+  }
+  return out;
+}
 
 function dayStart(day: string, what: string): number {
   const at = Date.parse(`${day}T00:00:00.000Z`);
@@ -101,6 +137,29 @@ export function analyticsV2DayOccurrences(value: unknown): AnalyticsV2DayOccurre
   if (!day || typeof day !== "object" || !Array.isArray(day.usage) || !Array.isArray(day.quota)
     || !Array.isArray(day.session)) invalid("occurrencesByOwner");
   return day;
+}
+
+function hasEvidence(day: AnalyticsV2DayOccurrences | undefined): boolean {
+  return day !== undefined && day.usage.length + day.quota.length + day.session.length > 0;
+}
+
+function stripFinalized(daily: SharedAnalyticsDay["daily"]): V11DailyProjectionValues {
+  // prepareSharedAnalyticsDay returns the FINALIZED daily (it adds coverage and
+  // knownCostNanousd). Folds and validateV11DailyProjectionValues take the
+  // closed, unfinalized shape, exactly as the compose proof strips it.
+  const { coverage: _coverage, knownCostNanousd: _known, ...value } = daily;
+  return value;
+}
+
+function bandCounters(band: Record<(typeof COUNTER_FIELDS)[AnalyticsV2CacheBandCounter], number>) {
+  return Object.freeze(Object.fromEntries(ANALYTICS_V2_CACHE_BAND_COUNTERS.map((counter) =>
+    [counter, band[COUNTER_FIELDS[counter]]]))) as Readonly<Record<AnalyticsV2CacheBandCounter, number>>;
+}
+
+function withoutFingerprint(result: V1ModelCompositionResult): Omit<V1ModelCompositionResult, "inputFingerprint"> {
+  if (!("inputFingerprint" in result)) return result;
+  const { inputFingerprint: _fingerprint, ...stored } = result;
+  return stored;
 }
 
 /**
@@ -147,7 +206,6 @@ export interface AnalyticsV2OwnerHooks {
   readonly timed: <T>(phase: AnalyticsV2Phase, work: () => Promise<T> | T) => Promise<T>;
   /** Heap in use, sampled for heapPeakBytes (operational metadata only). */
   readonly memoryProbe?: () => number;
-
 }
 
 /** Everything the community fold needs from one computed owner. */
@@ -192,6 +250,7 @@ export async function computeAnalyticsV2Owner(input: {
   const queuedSet = new Set(context.queued);
   const timed = hooks.timed;
   const emit = hooks.emit;
+  const pushRefusal = (refusal: AnalyticsV2Refusal): void => emit({ kind: "refusal", refusal });
   const dailyValues = new Map<AnalyticsV2Day, V11DailyProjectionValues>();
   const blocked = new Set<AnalyticsV2Day>();
   const compositions: Array<readonly [AnalyticsV2Day, V1ModelCompositionResult]> = [];
@@ -214,30 +273,71 @@ export async function computeAnalyticsV2Owner(input: {
   const dayDigests = new Map<AnalyticsV2Day, string>();
   const prepareNeededDay = async (day: AnalyticsV2Day, value: AnalyticsV2DayOccurrences): Promise<void> => {
     await timed("prepare", async () => {
-      const result = await prepareSpan({ owner, span: [[day, value]], lookbackCacheTail: cacheViews,
-        analysisFrom, today, cacheFromDay, queued: queuedSet, resources, includeCache: false });
-      for (const emission of result.emissions) emit(emission);
-      if (result.terminalError !== null) throw result.terminalError;
-      for (const [key, preparedDay] of result.prepared) prepared.set(key, preparedDay);
-      for (const [key, digest] of result.dayDigests) dayDigests.set(key, digest);
-      for (const [key, daily] of result.dailyValues) dailyValues.set(key, daily);
-      for (const key of result.blockedDays) blocked.add(key);
-      cacheViews.clear();
-      for (const [key, view] of result.cacheTail) cacheViews.set(key, view);
+      const analysisDay = day >= analysisFrom && day <= today;
+      let refusal: AnalyticsV2Refusal["reason"] | null = null, daily: V11DailyProjectionValues | null = null;
+      let preparedDay = false;
+      try {
+        // The day backstop applies here, before anything serializes the day.
+        const shared = await prepareAnalyticsV2Day({ day, ownerDigest, usage: value.usage,
+          quota: value.quota, session: value.session }, resources);
+        preparedDay = true;
+        if (analysisDay) prepared.set(day, shared);
+        cacheViews.set(day, analyticsV2CacheView(shared));
+        daily = stripFinalized(shared.daily);
+        validateV11DailyProjectionValues(daily);
+      } catch (error) {
+        refusal = kernelRefusalReason(error);
+        if (refusal === null) throw error;
+        pushRefusal(analyticsV2Refusal(ownerDigest, day, "daily", refusal));
+      }
+      // Only a prepared day is digested: its size is within the backstop, so
+      // the one-string digest fits. Every window containing an unprepared
+      // day is refused (incomplete_window), so its marker never pins a result.
+      if (analysisDay) {
+        dayDigests.set(day, preparedDay ? await analyticsV2DayDigest(day, value) : await analyticsV2RefusedDayDigest(day));
+      }
+      if (queuedSet.has(day)) {
+        if (daily === null) blocked.add(day);
+        else dailyValues.set(day, daily);
+      }
+      if (hasEvidence(value)) {
+        // The prepared-day observer: a stored owner-day with daily values gets
+        // its price row (the attribution fails the run on any disagreement
+        // with the kernel's daily pricing; it is never a refusal).
+        const price = refusal === null && daily !== null
+          ? await attributeAnalyticsV2DayPrices({ day, usage: value.usage, daily }) : null;
+        emit({ kind: "ownerDay", row: Object.freeze({ ownerDigest, day, daily, refusal }) });
+        if (price !== null) emit({ kind: "ownerDayPrice", row: Object.freeze({ ownerDigest, day, ...price }) });
+      }
     });
     sample();
-    if (day >= cacheFromDay && day <= today) await timed("cache", () => {
-      const result = evaluatePreparedSpanCache({ ownerDigest, day, today, cacheFromDay, cacheTail: cacheViews });
-      for (const emission of result.emissions) emit(emission);
-      if (result.terminalError !== null) throw result.terminalError;
-      cacheViews.clear();
-      for (const [key, view] of result.cacheTail) cacheViews.set(key, view);
-    });
-    else {
-      const result = evaluatePreparedSpanCache({ ownerDigest, day, today, cacheFromDay, cacheTail: cacheViews });
-      cacheViews.clear();
-      for (const [key, view] of result.cacheTail) cacheViews.set(key, view);
+    // ---- Cache continuity: the day with its 7-day carry. A prepared day
+    // with no cache items has no groups and needs no reducer call; a refused
+    // day or lookback day is absent, and the reducer records that.
+    if (day >= cacheFromDay && day <= today) {
+      await timed("cache", () => {
+        const own = cacheViews.get(day);
+        if (own !== undefined && own.cacheItems.length === 0) return;
+        let aggregate: ReturnType<typeof evaluateAnalyticsV2CacheDay>;
+        try {
+          aggregate = evaluateAnalyticsV2CacheDay({ day, ownerDigest,
+            days: daysBetween(addDays(day, -CACHE_LOOKBACK_DAYS), day).flatMap((value) => cacheViews.get(value) ?? []) });
+        } catch (error) {
+          const reason = kernelRefusalReason(error);
+          if (reason === null) throw error;
+          pushRefusal(analyticsV2Refusal(ownerDigest, day, "cache", reason));
+          return;
+        }
+        for (const group of aggregate.groups) {
+          for (const band of group.bands) {
+            emit({ kind: "cacheBand", row: Object.freeze({ ownerDigest, day, model: group.model, effort: group.effort,
+              band: band.band, counters: bandCounters(band) }) });
+          }
+        }
+      });
     }
+    const oldest = addDays(day, -CACHE_LOOKBACK_DAYS);
+    for (const kept of [...cacheViews.keys()]) if (kept <= oldest) cacheViews.delete(kept);
   };
   let occurrences: ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences> = new Map();
   // K-PAR-MEM: with a loader the computation owns each loaded segment, and a
@@ -316,29 +416,52 @@ export async function computeAnalyticsV2Owner(input: {
   owned.clear();
 
   cacheViews.clear();
-  // K-PAR-MEM quota semantics: only the final segment is visible to model windows.
-  if (load === null) for (const [day, value] of occurrences) {
-    if (value.quota.length > 0) horizonQuota.set(day, value.quota);
-  }
-  const windowInputs = { owner, dates: context.modelDates, prepared, dayDigests, horizonQuota };
+  const windowFor = (day: AnalyticsV2Day): AnalyticsV2PreparedDay[] =>
+    daysBetween(modelHistoryWindow(day).fromDay, day).flatMap((value) => prepared.get(value) ?? []);
+  // The last segment's quota occurrences of `day` (none for a day outside it),
+  // exactly what the window kernels were always given.
+  const quotaOccurrences = (day: AnalyticsV2Day) => (load === null
+    ? (occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES).quota
+    : horizonQuota.get(day) ?? EMPTY_DAY_OCCURRENCES.quota);
+
+  // ---- Current scalar fits: today only.
   hooks.progress(Object.freeze({ kind: "scalar", accountBytes: hooks.accountBytes() }));
   await timed("scalar", async () => {
-    const result = await evaluateScalar(windowInputs, today);
-    for (const emission of result.emissions) emit(emission);
-    if (result.terminalError !== null) throw result.terminalError;
-    fits = result.fits;
+    let result: Awaited<ReturnType<typeof evaluateAnalyticsV2ScalarDate>>;
+    try {
+      const pin = await buildAnalyticsV2Pin({ owner, day: today, dayDigests });
+      result = await evaluateAnalyticsV2ScalarDate({ pin, day: today, ownerDigest, days: windowFor(today),
+        quotaOccurrences });
+    } catch (error) {
+      const reason = kernelRefusalReason(error);
+      if (reason === null) throw error;
+      pushRefusal(analyticsV2Refusal(ownerDigest, today, "scalar", reason));
+      return;
+    }
+    fits = result.selectedFits;
+    emit({ kind: "fits", row: Object.freeze({ ownerDigest, asOfDay: today, fits: result.selectedFits }) });
   });
   sample();
+
+  // ---- Model history: each of the 70 dates over its own 101-day window.
   await timed("model", async () => {
-    // Inline dates remain separate calls: progress and output charging happen
-    // before evaluating the next date, preserving refusal precedence exactly.
     for (const [modelIndex, day] of context.modelDates.entries()) {
       hooks.progress(Object.freeze({ kind: "model", index: modelIndex, accountBytes: hooks.accountBytes() }));
-      const [result] = await evaluateModelBlock({ ...windowInputs, dates: [day] });
-      if ("terminalError" in result!) throw result.terminalError;
-      if (result!.composition === null) modelRefused.push(day);
-      else compositions.push([day, result!.composition]);
-      emit(result!.emission);
+      let result: V1ModelCompositionResult;
+      try {
+        const pin = await buildAnalyticsV2Pin({ owner, day, dayDigests });
+        result = await evaluateAnalyticsV2ModelDate({ pin, day, ownerDigest, days: windowFor(day),
+          quotaOccurrences }) as V1ModelCompositionResult;
+      } catch (error) {
+        const reason = kernelRefusalReason(error);
+        if (reason === null) throw error;
+        pushRefusal(analyticsV2Refusal(ownerDigest, day, "model", reason));
+        modelRefused.push(day);
+        sample();
+        continue;
+      }
+      compositions.push([day, result] as const);
+      emit({ kind: "modelDate", row: Object.freeze({ ownerDigest, day, result: withoutFingerprint(result) }) });
       sample();
     }
   });
