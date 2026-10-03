@@ -14,7 +14,8 @@ import { DIGEST_ONLY_GOLDEN_NOW, DIGEST_ONLY_GOLDEN_SOURCE,
 import { localFastpathTcpHost, withLocalFastpathCloudDatabase } from "../postgres-test/fixtures/fastpath-cloud-database.mjs";
 import { GCP_FASTPATH_CLOUD_TARGET, GCP_FASTPATH_CLOUD_TARGET_REFUSALS,
   gcpFastpathCloudTargetRefusal } from "./gcp-fastpath-cloud-target.mjs";
-import { GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
+import { createGcpFastpathPool, fastpathInstanceConnectionName, GCP_FASTPATH_CONNECTION,
+  validateTarget } from "./gcp-fastpath-connection.mjs";
 import { fastpathRehearsalSchemas } from "./gcp-fastpath-rehearsal.mjs";
 import {
   corpusGolden,
@@ -23,9 +24,11 @@ import {
   goldenPath,
   goldenSourceIdentity,
   loadSeedStages,
+  loadStage,
   planSeed,
   readSeedGolden,
   runGcpFastpathSeed,
+  SEALED_CORPUS_STAGE,
   SEED_STAGES,
   seededSchemas,
   seedMarker,
@@ -72,6 +75,21 @@ test("every stage contract matches the real module exports", async () => {
   }
 });
 
+// MEAS-SYNTH review (2026-10-03): a static import of the sealed-corpus
+// importer loaded the rehearsal loader's whole chain (node:sqlite, pg, every
+// importer) before any plan, for every command.
+test("the seed loads its stages, the sealed-corpus importer included, only after the plan and contract-checked", async () => {
+  const source = await readFile(join(dirname(fileURLToPath(import.meta.url)), "gcp-fastpath-seed.mjs"), "utf8");
+  const specifiers = [...source.matchAll(/^import\s[^;]*?from\s+"([^"]+)";/gmsu)].map(([, specifier]) => specifier);
+  assert.deepEqual(specifiers.filter((specifier) => !specifier.startsWith("node:")), ["./gcp-fastpath-connection.mjs"]);
+  assert.equal(GCP_FASTPATH_SEED.sealedCorpusPaths.includes(SEALED_CORPUS_STAGE.path), true,
+    "the plan holds the importer to the commit");
+  const module = await loadStage(SEALED_CORPUS_STAGE);
+  for (const name of SEALED_CORPUS_STAGE.exports) assert.equal(typeof module[name], "function", name);
+  await assert.rejects(loadStage({ ...SEALED_CORPUS_STAGE, exports: [...SEALED_CORPUS_STAGE.exports, "absentExport"] }),
+    (error) => error?.code === "GCP_FASTPATH_SEED_STAGE_CONTRACT_MISMATCH");
+});
+
 test("seed skips with its reason when any chain stage or the golden is absent at the commit", () => {
   const withoutT1 = planSeed(COMMIT, { spawn: fakeGit({
     present: [...ALL_STAGES.filter((path) => path !== stagePath("identity")), GOLDEN_MANIFEST] }) });
@@ -100,6 +118,39 @@ test("seed runs only from a checkout equal to the commit in stages, migrations a
   }
   assert.throws(() => goldenPath("/tmp/elsewhere"), (error) => error?.code === "GCP_FASTPATH_SEED_GOLDEN_INVALID");
   assert.equal(goldenPath(), GOLDEN);
+});
+
+test("a --sealed-corpus seed has no golden: its importer files must exist at the commit and equal the checkout", () => {
+  const corpusPaths = [...GCP_FASTPATH_SEED.sealedCorpusPaths];
+  assert.deepEqual(corpusPaths, ["apps/worker/scripts/gcp-fastpath-prod-shape/import-corpus.mjs",
+    "apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape-corpus.mjs",
+    "apps/worker/scripts/postgres-fastpath-identity-copy.mjs"]);
+  const present = [...ALL_STAGES, ...corpusPaths];
+  const plan = planSeed(COMMIT, { spawn: fakeGit({ present }), sealedCorpus: true });
+  assert.equal(plan.decision, "run");
+  assert.equal(plan.golden, null);
+  // A golden-mode plan of the same commit still needs its golden.
+  assert.equal(planSeed(COMMIT, { spawn: fakeGit({ present }) }).decision, "skip");
+  const missing = planSeed(COMMIT, { spawn: fakeGit({ present: present.filter((path) => path !== corpusPaths[0]) }),
+    sealedCorpus: true });
+  assert.equal(missing.decision, "skip");
+  assert.match(missing.reason, /sealed-corpus importer \(apps\/worker\/scripts\/gcp-fastpath-prod-shape\/import-corpus\.mjs\)/u);
+  for (const dirty of [...corpusPaths, stagePath("v12"), "apps/worker/postgres/migrations"]) {
+    const refused = planSeed(COMMIT, { spawn: fakeGit({ present, dirty: [dirty] }), sealedCorpus: true });
+    assert.equal(refused.decision, "refuse", dirty);
+  }
+});
+
+test("--sealed-corpus excludes --corpus, --golden and --dump", async () => {
+  await assert.rejects(runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: "/nonexistent", dump: "/nonexistent.json",
+    log: () => {} }), (error) => error?.code === "GCP_FASTPATH_SEED_ARGUMENT_INVALID");
+  const script = fileURLToPath(new URL("./gcp-fastpath-seed.mjs", import.meta.url));
+  for (const other of ["--corpus=dense", "--golden=apps/worker/analytics-v2-test/golden", "--dump=/nonexistent.json"]) {
+    const run = spawnSync(process.execPath, [script, "seed", "--target=gcp-fastpath", "--commit=HEAD",
+      "--sealed-corpus=/nonexistent", other], { encoding: "utf8" });
+    assert.equal(run.status, 1, other);
+    assert.match(run.stderr, /GCP_FASTPATH_SEED_ARGUMENT_INVALID/u, other);
+  }
 });
 
 test("--corpus selects a committed golden; the dense golden's dump must match its pinned digest", async () => {
@@ -243,6 +294,24 @@ test("the connection targets only the disposable fast-path database", () => {
     assert.throws(() => validateTarget(bad), (error) => error?.code === "GCP_FASTPATH_CONNECTION_TARGET_INVALID");
   }
   assert.deepEqual(Object.keys(GCP_FASTPATH_CONNECTION.identities).sort(), ["migrator", "runtime"]);
+});
+
+test("--meas-instance dials the same database on a measurement instance and names no other instance", async () => {
+  assert.equal(fastpathInstanceConnectionName(undefined), GCP_FASTPATH_CONNECTION.instanceConnectionName);
+  assert.equal(fastpathInstanceConnectionName("tibotattle-meas-prodtier-20261003"),
+    "tibotattle:us-east1:tibotattle-meas-prodtier-20261003");
+  for (const bad of ["tibotattle-primary", "tibotattle-test-primary-20260922", "tibotattle-meas-prodtier-20261399", ""]) {
+    assert.throws(() => fastpathInstanceConnectionName(bad),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", bad);
+    // Refused before any gcloud call (no impersonation is attempted).
+    await assert.rejects(createGcpFastpathPool({ measInstance: bad, spawn: () => assert.fail("no gcloud") }),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", bad);
+  }
+  const script = fileURLToPath(new URL("./gcp-fastpath-seed.mjs", import.meta.url));
+  const run = spawnSync(process.execPath, [script, "seed", "--target=gcp-fastpath", "--commit=HEAD",
+    "--meas-instance=tibotattle-primary"], { encoding: "utf8" });
+  assert.equal(run.status, 1);
+  assert.match(run.stderr, /GCP_FASTPATH_CONNECTION_INSTANCE_INVALID/u);
 });
 
 // ---------------------------------------------------------------------------
@@ -561,3 +630,38 @@ test("PG17 over TCP: the seed's chain passes the cloud-target exception as a non
       }
     });
 });
+
+test("PG17: a --sealed-corpus seed imports a production-shaped corpus through the same chain, idempotently",
+  { skip: LOCAL_SKIP || (!process.env.MEAS_SYNTH_CORPUS
+    && "needs MEAS_SYNTH_CORPUS (a scripts/gcp-fastpath-prod-shape/seed-source.mjs work directory)"),
+  timeout: 3_600_000 }, async () => {
+    const options = await localPoolOptions();
+    const admin = new pg.Pool({ ...options, max: 1 });
+    admin.on("error", () => {});
+    const database = `meas_synth_seedcheck_${randomBytes(4).toString("hex")}`;
+    let pool = null;
+    try {
+      await admin.query(`CREATE DATABASE "${database}"`);
+      pool = new pg.Pool({ ...options, database, max: 4 });
+      pool.on("error", () => {});
+      const dependencies = { spawn: cleanCheckoutGit, createPool: async () => ({ pool, identity: options.user,
+        close: async () => {} }), expectedOwner: null, grantRuntime: async () => {}, readBack: async (schema) => ({ schema }) };
+      const first = await runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: process.env.MEAS_SYNTH_CORPUS,
+        dependencies, log: () => {} });
+      assert.equal(first.status, "seeded");
+      assert.equal(first.nowIso, "2026-10-01T12:46:00.000Z");
+      assert.equal(first.sealedCorpus.sealedSha256, first.dumpSha256);
+      assert.deepEqual({ ...first.sourceIdentity }, { sourceId: "gcp-fastpath-oracle", sourceNamespace: "gcp-fastpath-oracle" });
+      for (const [name, entry] of Object.entries(first.steps.importVerification)) assert.equal(entry.equal, true, name);
+      assert.ok(first.steps.analyze.tables > 0);
+      assert.equal(first.steps.maxSourceTableRows, 20_000_000);
+      const again = await runGcpFastpathSeed({ commit: "HEAD", sealedCorpus: process.env.MEAS_SYNTH_CORPUS,
+        dependencies, log: () => {} });
+      assert.equal(again.status, "already-seeded");
+      assert.equal(again.schema, first.schema);
+    } finally {
+      await pool?.end().catch(() => {});
+      await admin.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`).catch(() => {});
+      await admin.end().catch(() => {});
+    }
+  });

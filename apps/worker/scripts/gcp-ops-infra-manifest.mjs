@@ -71,7 +71,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../src/canonical-json.ts";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
-import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+import { FASTPATH_MEASUREMENT_CLOUD_TARGET, FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
 import {
   EDGE_ONLY_SECRET_NAMES,
   OPTIONAL_SECRET_NAMES,
@@ -653,6 +653,7 @@ function testTargetNames() {
       TEST_MIGRATIONS_SERVICE_ACCOUNT, TEST_MIGRATIONS_IAM_USER, TEST_MIGRATIONS_RUNTIME_IAM_USER],
     CLOUD_RUN_IAM_TEST_TARGET,
     FASTPATH_TEST_CLOUD_TARGET,
+    FASTPATH_MEASUREMENT_CLOUD_TARGET,
     GCP_TEST_BUCKET_HISTORY_TARGET,
     FASTPATH_TEST,
   ]) {
@@ -668,6 +669,9 @@ export const TEST_TARGET_PREFIXES = Object.freeze([
   GCP_TEST_BUCKET_HISTORY_TARGET.bucketPrefix,
   "tibotattle-test-",
   "tibotattle-fastpath-test-",
+  // The disposable production-tier measurement instances and their Job (MEAS-SYNTH).
+  FASTPATH_MEASUREMENT_CLOUD_TARGET.instancePrefix,
+  "tibotattle-fastpath-meas-",
 ]);
 
 // ---------------------------------------------------------------------------

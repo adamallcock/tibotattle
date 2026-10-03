@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readFileSync as readFileSyncText } from "node:fs";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 import {
   checkOriginEdgeContract,
+  assertMeasurementInstance,
+  assertRefreshIdle,
   countMigrationsAtCommit,
   EDGE_PROXY_SOURCE,
   EDGE_TEST_PRODUCTION_SETTINGS,
@@ -18,9 +21,32 @@ import {
   edgeTestProductionEnv,
   ensureOriginBucketRuntimeBinding,
   executeJobCommand,
+  executionCompleted,
+  executionDescribeCommand,
+  executionLogsCommand,
+  expectedRefreshTask,
   FASTPATH_CORPORA,
+  FASTPATH_MEASUREMENT,
   FASTPATH_TEST,
+  jobDescribeCommand,
+  jobExecutionsCommand,
+  jobsListCommand,
+  jobTaskSpec,
   main,
+  measDatabaseCreateCommand,
+  measDatabasesListCommand,
+  measExecutionCancelCommand,
+  measIamUserCreateCommand,
+  measCreateFlags,
+  measFlagsListCommand,
+  measInstanceCreateCommand,
+  measInstanceDeleteCommand,
+  measInstanceDescribeCommand,
+  measInstancesListCommand,
+  measJobDeleteCommand,
+  measurementInstanceMismatches,
+  measurementInstancesListed,
+  measUsersListCommand,
   migrateJobCommand,
   ORIGIN_BUCKET_RUNTIME_BINDING,
   originBucketBindingCommand,
@@ -30,11 +56,26 @@ import {
   originInvokerCommand,
   originSourceEnv,
   primarySchemaOf,
+  readExecutionLog,
   REFRESH_JOB_PROFILES,
   REFRESH_JOB_RESOURCES,
+  REFRESH_TASK_TIMEOUT_ENV,
+  REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS,
   refreshJobCommand,
+  refreshTarget,
+  refreshTaskMismatches,
   renderOriginService,
+  runningExecutions,
+  sqlOperationWaitCommand,
+  REFRESH_PROFILE_SCHEMA,
+  stepMeasCreate,
+  stepMeasMetrics,
+  stepMeasPgStat,
+  stepMeasPgStatEnable,
+  stepMeasTeardown,
+  stepRefreshUncapped,
   stepsReadGolden,
+  uncappedOutcome,
   validateOriginBucketPolicy,
   validateOriginPolicy,
 } from "./gcp-fastpath-test-deploy.mjs";
@@ -42,8 +83,11 @@ import { readSeedGolden } from "./gcp-fastpath-seed.mjs";
 import { DIGEST_ONLY_GOLDEN_SOURCE, withDigestOnlyGolden } from "../analytics-v2-test/fixtures/digest-only-golden.mjs";
 import {
   analyticsV2TestClock,
+  FASTPATH_MEASUREMENT_CLOUD_TARGET,
   FASTPATH_TEST_CLOUD_TARGET,
+  fastpathMeasurementInstance,
   fastpathTestDatabaseConfig,
+  isFastpathMeasurementInstanceConnectionName,
 } from "../cloud-run/origin-fastpath-mode.mjs";
 import {
   GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB,
@@ -56,8 +100,12 @@ import {
   ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
+  readAnalyticsRefreshProductionTarget,
   resolveAnalyticsRefreshDatabase,
 } from "../cloud-run/analytics-refresh.mjs";
+import { CLOUD_SQL_LOGGING_FLAGS, CLOUD_SQL_POSTURE, cloudSqlCreateArgs, databaseFlags,
+  loadCommittedDesiredState } from "./gcp-ops-infra-manifest.mjs";
+import { fastpathInstanceConnectionName } from "./gcp-fastpath-connection.mjs";
 
 import { applyEdgeModeSnapshotDelta } from "./edge-mode-configuration.mjs";
 import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
@@ -772,3 +820,1301 @@ test("D-BLOB: the origin step refuses before any remote command without a fresh,
     const { error } = await capturedMain([...base, ...synthetic]);
     assert.equal(error?.code, "EDGE_CONTRACT_DRIFT", "an edge commit this checkout lacks never matches");
   });
+// MEAS-SYNTH review (2026-10-03): the production-scale measurement's uncapped
+// execution ran a raw `gcloud run jobs execute` whatever the guarded deploy
+// did, kept no receipt when the execution failed, and could not tell a
+// LOCK_HELD no-op from a refresh. It is now this step.
+const REFRESH_JOB = FASTPATH_TEST.refreshJob;
+const MEAS_NOW = "2026-10-01T12:46:00.000Z";
+const GUARD_ENV = Object.freeze([[REFRESH_TASK_TIMEOUT_ENV, "14400"]]);
+const UNCAPPED = 172_800;
+const NO_WAIT = Object.freeze({ sleep: async () => {}, wallClock: () => Date.parse("2026-10-04T00:00:00.000Z") });
+const FAILED = Symbol("gcloud failed");
+
+function denseTask(overrides = {}) {
+  return { ...expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+    profile: "dense" }), ...overrides };
+}
+
+/** A Job or an execution as `run jobs describe` / `run jobs executions describe --format=json` render it (v1). */
+function taskResource(kind, task, extra = {}) {
+  const taskSpec = { containers: [{ image: task.image, command: task.command, args: task.args,
+    env: Object.entries(task.env).map(([name, value]) => ({ name, value })),
+    resources: { limits: { cpu: task.cpu, memory: task.memory } } }],
+  maxRetries: 0, timeoutSeconds: String(task.timeoutSeconds), serviceAccountName: FASTPATH_TEST.runtimeServiceAccount };
+  const spec = kind === "Job" ? { template: { spec: { parallelism: 1, taskCount: 1, template: { spec: taskSpec } } } }
+    : { parallelism: 1, taskCount: 1, template: { spec: taskSpec } };
+  return { apiVersion: "run.googleapis.com/v1", kind, ...extra, spec };
+}
+
+function uncappedExecution(name, { created, start, end, succeeded = true, running = false }) {
+  const task = denseTask({ env: { ...denseTask().env, [REFRESH_TASK_TIMEOUT_ENV]: String(UNCAPPED) },
+    timeoutSeconds: UNCAPPED });
+  return taskResource("Execution", task, {
+    metadata: { name, creationTimestamp: created },
+    status: { startTime: start, ...(running ? {} : { completionTime: end }),
+      succeededCount: running || !succeeded ? 0 : 1, failedCount: running || succeeded ? 0 : 1,
+      conditions: [{ type: "Completed", status: running ? "Unknown" : succeeded ? "True" : "False" }] },
+  });
+}
+
+const kindOf = (command) => (command[1] === "logging" ? "logging read"
+  : command.slice(1, command[3] === "executions" ? 5 : 4).join(" "));
+
+/** A Runner stand-in: answers every gcloud call from `answer(command, nthOfItsKind)`; spawns nothing. */
+function scriptedRunner(answer, { dryRun = false } = {}) {
+  return {
+    dryRun, commands: [], receipts: {},
+    print(command) { this.commands.push(command); },
+    exec(command) { this.commands.push(command); return { status: 0, stdout: "", stderr: "", dry: dryRun }; },
+    json(command, options = {}) {
+      this.commands.push(command);
+      const value = answer(command, this.commands.filter((seen) => kindOf(seen) === kindOf(command)).length);
+      if (value === FAILED) {
+        if (options.allowFailure) return null;
+        throw Object.assign(new Error("FASTPATH_DEPLOY_COMMAND_FAILED"), { code: "FASTPATH_DEPLOY_COMMAND_FAILED" });
+      }
+      return value === undefined ? (options.placeholderJson ?? null) : structuredClone(value);
+    },
+    async receipt(name, value) { this.receipts[name] = structuredClone(value); return `/receipts/${name}`; },
+  };
+}
+
+/** The guarded refresh's refresh.json (a DEADLINE_PROJECTED refusal by default) and refresh-uncapped's options. */
+async function uncappedOptions(dir, guarded = {}) {
+  const afterRefresh = join(dir, "refresh.json");
+  await writeFile(afterRefresh, JSON.stringify({ step: "refresh", image: IMAGE, schema: SEEDED, now: MEAS_NOW,
+    profile: "dense", job: REFRESH_JOB, execution: `${REFRESH_JOB}-g7h2k`, succeeded: false, durationSeconds: 6_900,
+    results: [{ status: "failed", code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED", phase: "compute" }], ...guarded }));
+  return { refreshProfile: "dense", schema: SEEDED, now: MEAS_NOW, refreshEnv: [...GUARD_ENV], refreshArgs: [],
+    taskTimeoutSeconds: UNCAPPED, afterRefresh };
+}
+
+/** The idle listing and the Job read-back, then `rest` for everything after them. */
+function readyRunner(rest, { job = taskResource("Job", denseTask()) } = {}) {
+  return scriptedRunner((command, nth) => {
+    const kind = kindOf(command);
+    if (kind === "run jobs executions list" && nth === 1) return [];
+    if (kind === "run jobs describe") return job;
+    return rest(kind, nth, command);
+  });
+}
+
+test("execution overrides and the refresh reads target only the fast-path refresh Job in tibotattle", () => {
+  assert.deepEqual(executeJobCommand(REFRESH_JOB), ["gcloud", "run", "jobs", "execute", REFRESH_JOB,
+    "--project=tibotattle", "--region=us-east1", "--wait", "--format=json"], "no overrides: unchanged");
+  const uncapped = executeJobCommand(REFRESH_JOB, { taskTimeoutSeconds: UNCAPPED,
+    env: [[REFRESH_TASK_TIMEOUT_ENV, String(UNCAPPED)]] });
+  assert.deepEqual(uncapped, ["gcloud", "run", "jobs", "execute", REFRESH_JOB, "--project=tibotattle",
+    "--region=us-east1", `--task-timeout=${UNCAPPED}s`, `--update-env-vars=${REFRESH_TASK_TIMEOUT_ENV}=${UNCAPPED}`,
+    "--wait", "--format=json"]);
+  for (const taskTimeoutSeconds of [0, 59, 1.5, REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS + 1, "86400"]) {
+    expectCode(() => executeJobCommand(REFRESH_JOB, { taskTimeoutSeconds }), "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID");
+  }
+  expectCode(() => executeJobCommand(REFRESH_JOB, { env: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
+  const execution = `${REFRESH_JOB}-ab12c`;
+  const reads = [jobExecutionsCommand(REFRESH_JOB), jobExecutionsCommand(REFRESH_JOB, { limit: 1 }),
+    jobDescribeCommand(REFRESH_JOB), executionDescribeCommand(REFRESH_JOB, execution),
+    executionLogsCommand(REFRESH_JOB, execution), executionLogsCommand(REFRESH_JOB, execution,
+      { since: "2026-10-04T00:00:00.000Z" })];
+  for (const command of [uncapped, ...reads]) {
+    assert.equal(command[0], "gcloud");
+    assert.equal(command.includes("--project=tibotattle"), true);
+    assert.equal(command.some((arg) => arg.includes(REFRESH_JOB)), true);
+    for (const name of FASTPATH_TEST.protectedServices) assert.equal(command.some((arg) => arg.includes(name)), false);
+  }
+  assert.deepEqual(reads[1].slice(0, 6), ["gcloud", "run", "jobs", "executions", "list", `--job=${REFRESH_JOB}`]);
+  assert.equal(reads[1].includes("--limit=1"), true);
+  // Without a bound the log read looks back two hours; with one it covers a run of any length.
+  assert.equal(reads[4].includes("--freshness=2h"), true);
+  assert.equal(reads[5].includes("--freshness=2h"), false);
+  assert.match(reads[5][3], /AND timestamp>="2026-10-04T00:00:00\.000Z"$/u);
+  for (const job of ["tibotattle-test-app", "tibotattle-test-database-migrate"]) {
+    for (const build of [() => jobExecutionsCommand(job), () => jobDescribeCommand(job),
+      () => executeJobCommand(job, { taskTimeoutSeconds: UNCAPPED })]) {
+      expectCode(build, "FASTPATH_DEPLOY_TARGET_NOT_FASTPATH");
+    }
+  }
+  for (const other of ["tibotattle-test-app-ab12c", `${FASTPATH_TEST.migrateJob}-ab12c`, `${REFRESH_JOB}-AB`, ""]) {
+    expectCode(() => executionDescribeCommand(REFRESH_JOB, other), "FASTPATH_DEPLOY_EXECUTION_INVALID");
+    expectCode(() => executionLogsCommand(REFRESH_JOB, other), "FASTPATH_DEPLOY_EXECUTION_INVALID");
+  }
+  expectCode(() => executionLogsCommand(REFRESH_JOB, execution, { since: "yesterday" }),
+    "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+});
+
+test("running executions, task read-backs and uncapped outcomes are classified from the rendered resources", () => {
+  const at = { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z", end: "2026-10-04T10:00:20Z" };
+  const running = uncappedExecution(`${REFRESH_JOB}-r1abc`, { ...at, running: true });
+  const done = uncappedExecution(`${REFRESH_JOB}-d1abc`, at);
+  const failed = uncappedExecution(`${REFRESH_JOB}-f1abc`, { ...at, succeeded: false });
+  assert.equal(executionCompleted(running), false);
+  assert.equal(executionCompleted(done), true);
+  assert.equal(executionCompleted(failed), true);
+  assert.equal(executionCompleted({ status: { completionTime: at.end } }), true, "no conditions: the completion time");
+  assert.equal(executionCompleted({ status: {} }), false);
+  assert.deepEqual(runningExecutions([done, running, failed, { metadata: { name: "x" }, status: {} }]),
+    [`${REFRESH_JOB}-r1abc`, "x"]);
+  assert.throws(() => runningExecutions(null), (error) => error?.code === "FASTPATH_DEPLOY_JSON_INVALID");
+  assert.throws(() => assertRefreshIdle(scriptedRunner(() => [running])),
+    (error) => error?.code === "FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING" && error.message.endsWith(`${REFRESH_JOB}-r1abc`));
+  assert.equal(assertRefreshIdle(scriptedRunner(() => [done, failed])).running, 0);
+
+  // The read-back equals what refreshJobCommand deploys, in both shapes.
+  const expected = denseTask();
+  assert.deepEqual(expected.args, ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full",
+    `--schema=${SEEDED}`, `--now=${MEAS_NOW}`]);
+  assert.equal(expected.env[REFRESH_TASK_TIMEOUT_ENV], "14400");
+  assert.equal(expected.env.PRIMARY_SCHEMA, SEEDED);
+  assert.deepEqual([expected.cpu, expected.memory, expected.timeoutSeconds], ["4", "16Gi", 14_400]);
+  const job = taskResource("Job", expected);
+  assert.deepEqual(jobTaskSpec(job), expected);
+  assert.deepEqual(refreshTaskMismatches(jobTaskSpec(job), expected), []);
+  const { kind: _kind, ...unlabelled } = job;
+  assert.deepEqual(jobTaskSpec(unlabelled), expected, "an unlabelled Job is read by its shape");
+  assert.deepEqual(jobTaskSpec(taskResource("Execution", expected)), expected);
+  assert.deepEqual(refreshTaskMismatches(jobTaskSpec(taskResource("Job", { ...expected, cpu: "4000m" })), expected), []);
+  assert.deepEqual(refreshTaskMismatches(jobTaskSpec(taskResource("Job", { ...expected,
+    env: { ...expected.env, EXTRA: "1" }, timeoutSeconds: 7_200 })), expected), ["env", "timeoutSeconds"]);
+  assert.equal(jobTaskSpec({ kind: "Job", spec: { template: { spec: { template: { spec: { containers: [] } } } } } }), null);
+  assert.deepEqual(refreshTaskMismatches(null, expected), ["task"]);
+
+  const outcome = (input) => uncappedOutcome({ completed: true, succeeded: false, statusLine: null,
+    durationSeconds: 1_000, taskTimeoutSeconds: UNCAPPED, ...input });
+  assert.deepEqual(outcome({ completed: false }), { outcome: "unfinished", code: null });
+  assert.deepEqual(outcome({ succeeded: true, statusLine: { status: "ok", state: "complete" } }),
+    { outcome: "complete", code: null });
+  assert.deepEqual(outcome({ succeeded: true, statusLine: { status: "ok", state: "LOCK_HELD" } }),
+    { outcome: "lock-held", code: null });
+  assert.deepEqual(outcome({ statusLine: { status: "failed", code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" } }),
+    { outcome: "failed", code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" });
+  assert.deepEqual(outcome({ durationSeconds: UNCAPPED }), { outcome: "killed-at-task-timeout", code: null });
+  assert.deepEqual(outcome({}), { outcome: "failed-without-status-line", code: null });
+  assert.deepEqual(outcome({ succeeded: true }), { outcome: "succeeded-without-status-line", code: null });
+});
+
+test("refresh-uncapped refuses a missing, mismatched or LOCK_HELD guarded refresh before any remote command", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const mismatch = "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH";
+    const cases = [
+      [{}, { afterRefresh: join(dir, "absent.json") }, "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_INVALID"],
+      [{ image: `${FASTPATH_TEST.imageRepository}@sha256:${"b".repeat(64)}` }, {}, mismatch],
+      [{ schema: "typed_legacy_transfer_rehearsal_target_fastpath_00000000" }, {}, mismatch],
+      [{ now: null }, {}, mismatch],
+      [{ profile: "standard" }, {}, mismatch],
+      // The deploy wrapper writes refresh.json only after the deploy; a receipt without an execution is refused.
+      [{ execution: null }, {}, mismatch],
+      [{ step: "migrate" }, {}, mismatch],
+      [{ succeeded: true, results: [{ status: "ok", state: "LOCK_HELD" }] }, {}, "FASTPATH_DEPLOY_REFRESH_LOCK_HELD"],
+      [{}, { taskTimeoutSeconds: 14_400 }, "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID"],
+      [{}, { taskTimeoutSeconds: REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS + 1 }, "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID"],
+      [{}, { taskTimeoutSeconds: undefined }, "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID"],
+      [{}, { schema: undefined }, "FASTPATH_DEPLOY_ARGUMENT_INVALID"],
+      [{}, { afterRefresh: undefined }, "FASTPATH_DEPLOY_ARGUMENT_INVALID"],
+    ];
+    for (const [guarded, overrides, code] of cases) {
+      const runner = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+      const options = { ...await uncappedOptions(dir, guarded), ...overrides };
+      await assert.rejects(stepRefreshUncapped(runner, options, IMAGE, NO_WAIT), (error) => error?.code === code,
+        JSON.stringify({ guarded, overrides }));
+      assert.deepEqual(runner.commands, [], JSON.stringify({ guarded, overrides }));
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("refresh-uncapped refuses while a refresh runs, or when the Job does not read back as the guarded one", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const options = await uncappedOptions(dir);
+    const busy = scriptedRunner((command) => (kindOf(command) === "run jobs executions list"
+      ? [uncappedExecution(`${REFRESH_JOB}-r1abc`, { created: "2026-10-03T22:00:00Z", start: "2026-10-03T22:00:10Z",
+        running: true })] : assert.fail(kindOf(command))));
+    await assert.rejects(stepRefreshUncapped(busy, options, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING");
+    assert.deepEqual(busy.commands.map(kindOf), ["run jobs executions list"]);
+    const expected = denseTask();
+    const variants = {
+      image: { ...expected, image: `${FASTPATH_TEST.imageRepository}@sha256:${"c".repeat(64)}` },
+      args: { ...expected, args: expected.args.map((arg) => (arg.startsWith("--schema=")
+        ? `--schema=${FASTPATH_TEST.primarySchema}` : arg)) },
+      env: { ...expected, env: { ...expected.env, [REFRESH_TASK_TIMEOUT_ENV]: "7200" } },
+      memory: { ...expected, memory: "8Gi" },
+      timeoutSeconds: { ...expected, timeoutSeconds: 7_200 },
+    };
+    for (const [field, task] of Object.entries(variants)) {
+      const runner = readyRunner((kind) => assert.fail(`${field}: ${kind}`), { job: taskResource("Job", task) });
+      await assert.rejects(stepRefreshUncapped(runner, options, IMAGE, NO_WAIT),
+        (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_JOB_MISMATCH" && error.message.endsWith(`: ${field}`), field);
+      assert.deepEqual(runner.commands.map(kindOf), ["run jobs executions list", "run jobs describe"], field);
+    }
+    const unreadable = readyRunner((kind) => assert.fail(kind), { job: {} });
+    await assert.rejects(stepRefreshUncapped(unreadable, options, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_JOB_MISMATCH" && error.message.endsWith(": task"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("refresh-uncapped times one execution to its end and keeps its status, status line and log read", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const options = await uncappedOptions(dir);
+    const name = `${REFRESH_JOB}-u5xyz`;
+    const done = uncappedExecution(name, { created: "2026-10-04T00:00:05.123456Z", start: "2026-10-04T00:00:20Z",
+      end: "2026-10-04T15:00:20Z" });
+    const line = { schemaVersion: "analytics-refresh-receipt-v1", status: "ok", state: "complete",
+      timings: { read: 1 }, timeGuard: { taskTimeoutSeconds: UNCAPPED, plannedSeconds: 10_998 } };
+    const runner = readyRunner((kind, nth) => {
+      if (kind === "run jobs execute") return done;
+      // Ingestion lag: the first read has no status line yet.
+      if (kind === "logging read") {
+        return nth === 1 ? [] : [{ timestamp: "2026-10-04T15:00:19Z", jsonPayload: line },
+          { timestamp: "2026-10-04T00:00:21Z", severity: "INFO", textPayload: "Container started" }];
+      }
+      return assert.fail(kind);
+    });
+    const receipt = await stepRefreshUncapped(runner, options, IMAGE, NO_WAIT);
+    assert.deepEqual(runner.commands.map(kindOf), ["run jobs executions list", "run jobs describe",
+      "run jobs execute", "logging read", "logging read"]);
+    const execute = runner.commands[2];
+    assert.deepEqual(execute, executeJobCommand(REFRESH_JOB, { taskTimeoutSeconds: UNCAPPED,
+      env: [[REFRESH_TASK_TIMEOUT_ENV, String(UNCAPPED)]] }));
+    assert.equal(execute.some((arg) => /^--(?:image|args|set-env-vars|cpu|memory)=/u.test(arg)), false,
+      "execution-level overrides only");
+    assert.match(runner.commands[3][3], /timestamp>="2026-10-03T23:59:05\.123Z"$/u, "since the execution was created");
+    assert.equal(runner.commands[3].includes("--freshness=2h"), false);
+    assert.equal(receipt.outcome, "complete");
+    assert.equal(receipt.execution, name);
+    assert.equal(receipt.durationSeconds, 54_000);
+    assert.deepEqual(receipt.statusLine, line);
+    assert.deepEqual(receipt.systemMessages, [{ timestamp: "2026-10-04T00:00:21Z", severity: "INFO",
+      text: "Container started" }]);
+    assert.deepEqual(receipt.executionMismatches, []);
+    assert.deepEqual([receipt.status.startTime, receipt.status.completionTime, receipt.status.failedCount],
+      ["2026-10-04T00:00:20Z", "2026-10-04T15:00:20Z", 0]);
+    assert.equal(receipt.afterRefresh.statusLine.code, "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED");
+    assert.deepEqual(runner.receipts["refresh-uncapped.json"].durationSeconds, 54_000);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("refresh-uncapped keeps a receipt for every failed outcome and fails the step", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const options = await uncappedOptions(dir);
+    const at = { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z" };
+
+    // `execute --wait` loses the execution: the newest one is taken because it
+    // is this one, polled to its end, and its refusal recorded.
+    const name = `${REFRESH_JOB}-f2abc`;
+    const refusal = { status: "failed", code: "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED", phase: "compute",
+      deadline: { taskTimeoutSeconds: UNCAPPED, elapsedSeconds: 70_000, ownersStarted: 3, ownersPlanned: 53 } };
+    const lost = readyRunner((kind, nth) => {
+      if (kind === "run jobs execute") return FAILED;
+      if (kind === "run jobs executions list") return [uncappedExecution(name, { ...at, running: true })];
+      if (kind === "run jobs executions describe") {
+        return nth === 1 ? uncappedExecution(name, { ...at, running: true })
+          : uncappedExecution(name, { ...at, end: "2026-10-04T20:00:00Z", succeeded: false });
+      }
+      if (kind === "logging read") return [{ timestamp: "2026-10-04T19:59:59Z", jsonPayload: refusal }];
+      return assert.fail(kind);
+    });
+    await assert.rejects(stepRefreshUncapped(lost, options, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_REFRESH_FAILED"
+        && error.message.endsWith("failed ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED"));
+    assert.deepEqual(lost.commands.map(kindOf), ["run jobs executions list", "run jobs describe", "run jobs execute",
+      "run jobs executions list", "run jobs executions describe", "run jobs executions describe", "logging read"]);
+    assert.equal(lost.commands[3].includes("--limit=1"), true);
+    const lostReceipt = lost.receipts["refresh-uncapped.json"];
+    assert.deepEqual([lostReceipt.execution, lostReceipt.completed, lostReceipt.outcome, lostReceipt.code],
+      [name, true, "failed", "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED"]);
+    assert.deepEqual([lostReceipt.status.failedCount, lostReceipt.durationSeconds], [1, 71_980]);
+    assert.deepEqual(lostReceipt.statusLine.deadline, refusal.deadline);
+
+    // Killed at the task timeout: no status line, Cloud Run's own messages kept.
+    const killedName = `${REFRESH_JOB}-k3abc`;
+    const killed = readyRunner((kind) => {
+      if (kind === "run jobs execute") {
+        return uncappedExecution(killedName, { ...at, end: "2026-10-06T00:00:20Z", succeeded: false });
+      }
+      if (kind === "logging read") {
+        return [{ timestamp: "2026-10-06T00:00:19Z", severity: "ERROR", textPayload: "Task timed out." }];
+      }
+      return assert.fail(kind);
+    });
+    await assert.rejects(stepRefreshUncapped(killed, options, IMAGE, { ...NO_WAIT, logAttempts: 3 }),
+      (error) => error?.code === "FASTPATH_DEPLOY_REFRESH_FAILED" && error.message.endsWith("killed-at-task-timeout"));
+    const killedReceipt = killed.receipts["refresh-uncapped.json"];
+    assert.equal(killedReceipt.durationSeconds, UNCAPPED);
+    assert.deepEqual(killedReceipt.systemMessages.map(({ text }) => text), ["Task timed out."]);
+    assert.equal(killed.commands.filter((command) => kindOf(command) === "logging read").length, 3,
+      "the log is read until its attempts run out");
+
+    // A LOCK_HELD execution did nothing.
+    const held = readyRunner((kind) => {
+      if (kind === "run jobs execute") {
+        return uncappedExecution(`${REFRESH_JOB}-l4abc`, { ...at, end: "2026-10-04T00:01:00Z" });
+      }
+      if (kind === "logging read") return [{ timestamp: "2026-10-04T00:00:59Z", jsonPayload: { status: "ok", state: "LOCK_HELD" } }];
+      return assert.fail(kind);
+    });
+    await assert.rejects(stepRefreshUncapped(held, options, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_REFRESH_LOCK_HELD");
+    assert.equal(held.receipts["refresh-uncapped.json"].outcome, "lock-held");
+
+    // The newest execution predates the request, or runs another task: it is not this one.
+    for (const stranger of [
+      uncappedExecution(`${REFRESH_JOB}-o5abc`, { created: "2026-10-03T20:00:00Z", start: "2026-10-03T20:00:10Z",
+        end: "2026-10-03T21:00:00Z" }),
+      taskResource("Execution", { ...denseTask(), image: `${FASTPATH_TEST.imageRepository}@sha256:${"d".repeat(64)}` },
+        { metadata: { name: `${REFRESH_JOB}-o6abc`, creationTimestamp: "2026-10-04T00:00:05Z" }, status: {} }),
+    ]) {
+      const absent = readyRunner((kind) => {
+        if (kind === "run jobs execute") return FAILED;
+        if (kind === "run jobs executions list") return [stranger];
+        return assert.fail(kind);
+      });
+      await assert.rejects(stepRefreshUncapped(absent, options, IMAGE, NO_WAIT),
+        (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_EXECUTION_ABSENT");
+      assert.equal(absent.receipts["refresh-uncapped.json"].execution, null);
+    }
+
+    // A transient read failure while polling is retried; a describe that never answers ends the wait honestly.
+    const silentName = `${REFRESH_JOB}-s7abc`;
+    const silent = readyRunner((kind) => {
+      if (kind === "run jobs execute") return FAILED;
+      if (kind === "run jobs executions list") return [uncappedExecution(silentName, { ...at, running: true })];
+      if (kind === "run jobs executions describe") return FAILED;
+      if (kind === "logging read") return [];
+      return assert.fail(kind);
+    });
+    await assert.rejects(stepRefreshUncapped(silent, options, IMAGE, { ...NO_WAIT, maxPollFailures: 4, logAttempts: 1 }),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_EXECUTION_UNFINISHED");
+    assert.equal(silent.commands.filter((command) => kindOf(command) === "run jobs executions describe").length, 4);
+    assert.deepEqual([silent.receipts["refresh-uncapped.json"].completed,
+      silent.receipts["refresh-uncapped.json"].outcome], [false, "unfinished"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readExecutionLog orders status lines oldest first and waits out ingestion lag", async () => {
+  const execution = `${REFRESH_JOB}-ab12c`;
+  let reads = 0;
+  const runner = scriptedRunner(() => {
+    reads += 1;
+    return reads < 3 ? [] : [{ timestamp: "2026-10-04T02:00:00Z", jsonPayload: { status: "ok", n: 2 } },
+      { timestamp: "2026-10-04T01:00:00Z", textPayload: JSON.stringify({ status: "ok", n: 1 }) },
+      { timestamp: "2026-10-04T00:30:00Z", textPayload: "x".repeat(600) }];
+  });
+  const sleeps = [];
+  const log = await readExecutionLog(runner, REFRESH_JOB, execution, { attempts: 5, intervalMs: 7,
+    sleep: async (milliseconds) => { sleeps.push(milliseconds); } });
+  assert.deepEqual(log.lines.map(({ n }) => n), [1, 2]);
+  assert.deepEqual(log.systemMessages.map(({ text }) => text.length), [500]);
+  assert.deepEqual(sleeps, [7, 7]);
+  const empty = await readExecutionLog(scriptedRunner(() => []), REFRESH_JOB, execution,
+    { attempts: 2, sleep: async () => {} });
+  assert.deepEqual(empty, { lines: [], systemMessages: [], profiles: [] });
+});
+
+test("a dry-run refresh-uncapped prints only reads and the one execution, never a deploy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const { afterRefresh } = await uncappedOptions(dir);
+    const argv = ["refresh-uncapped", "--dry-run", `--image=${IMAGE}`, `--schema=${SEEDED}`, `--now=${MEAS_NOW}`,
+      "--refresh-profile=dense", `--refresh-env=${REFRESH_TASK_TIMEOUT_ENV}=14400`, `--task-timeout-seconds=${UNCAPPED}`,
+      `--after-refresh=${afterRefresh}`, `--out=${dir}`];
+    const { printed, report, error } = await capturedMain(argv);
+    assert.equal(error, undefined);
+    assert.equal(report.steps[0].dryRun, true);
+    assert.equal(printed.every((line) => line.startsWith("[dry-run] gcloud ")), true);
+    const order = ["gcloud run jobs executions list", "gcloud run jobs describe", "gcloud run jobs execute",
+      "gcloud run jobs executions describe", "gcloud logging read"];
+    assert.deepEqual(printed.map((line) => order.findIndex((prefix) => line.slice(10).startsWith(prefix))),
+      [0, 1, 2, 3, 4]);
+    assert.equal(printed[2].includes(`--task-timeout=${UNCAPPED}s`)
+      && printed[2].includes(`--update-env-vars=${REFRESH_TASK_TIMEOUT_ENV}=${UNCAPPED}`), true);
+    assert.equal(printed.some((line) => line.includes("jobs deploy")), false);
+    const refused = await capturedMain(argv.map((arg) => (arg.startsWith("--task-timeout-seconds=")
+      ? "--task-timeout-seconds=14400" : arg)));
+    assert.equal(refused.error?.code, "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID");
+    assert.deepEqual(refused.printed, []);
+    for (const value of ["0", "1.5", "-1", "abc"]) {
+      const invalid = await capturedMain([...argv.slice(0, -1), `--task-timeout-seconds=${value}`, `--out=${dir}`]);
+      assert.equal(invalid.error?.code, "FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", value);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * main() in a child process whose PATH resolves `gcloud` to a stand-in that
+ * answers from `answers` (by command kind) and logs every call. The real
+ * gcloud is never reachable: the probe below must reach the stand-in first.
+ */
+async function withFakeGcloud(answers, run) {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-fake-gcloud-"));
+  try {
+    const fake = join(dir, "fake-gcloud.mjs");
+    await writeFile(fake, `import { appendFileSync, readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--fake-probe") { process.stdout.write("fake-gcloud"); process.exit(0); }
+appendFileSync(${JSON.stringify(join(dir, "calls.jsonl"))}, JSON.stringify(args) + "\\n");
+const kind = args[0] === "logging" ? "logging read" : args.slice(0, args[2] === "executions" ? 4 : 3).join(" ");
+const answer = JSON.parse(readFileSync(${JSON.stringify(join(dir, "answers.json"))}, "utf8"))[kind];
+if (answer === undefined) { process.stderr.write("unexpected " + kind); process.exit(3); }
+process.stdout.write(answer.stdout ?? ""); process.exit(answer.status ?? 0);
+`);
+    await writeFile(join(dir, "answers.json"), JSON.stringify(answers));
+    await writeFile(join(dir, "gcloud"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fake)} "$@"\n`);
+    await chmod(join(dir, "gcloud"), 0o755);
+    const env = { ...process.env, PATH: `${dir}:${process.env.PATH}` };
+    const probe = spawnSync("gcloud", ["--fake-probe"], { env, encoding: "utf8" });
+    assert.equal(probe.stdout, "fake-gcloud", "the stand-in shadows any real gcloud");
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+const { main } = await import(${JSON.stringify(join(WORKER_ROOT, "scripts/gcp-fastpath-test-deploy.mjs"))});
+try { await main(JSON.parse(process.argv[1])); console.error("RESULT " + JSON.stringify({ ok: true })); }
+catch (error) { console.error("RESULT " + JSON.stringify({ code: error?.code ?? null })); }`, JSON.stringify(run.argv(dir))],
+    { env, encoding: "utf8", cwd: WORKER_ROOT });
+    const result = JSON.parse(child.stderr.split("\n").find((line) => line.startsWith("RESULT ")).slice(7));
+    const calls = (await readFile(join(dir, "calls.jsonl"), "utf8").catch(() => "")).split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line));
+    return await run.check({ result, calls, dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("the refresh step refuses to deploy over a running execution and fails a LOCK_HELD execution", async () => {
+  const refreshArgv = (dir) => ["refresh", `--image=${IMAGE}`, `--schema=${SEEDED}`, `--now=${MEAS_NOW}`,
+    "--refresh-profile=dense", `--out=${join(dir, "out")}`];
+  const at = { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z", end: "2026-10-04T00:01:00Z" };
+  await withFakeGcloud({
+    "run jobs executions list": { stdout: JSON.stringify([uncappedExecution(`${REFRESH_JOB}-r1abc`,
+      { ...at, running: true })]) },
+  }, {
+    argv: refreshArgv,
+    check({ result, calls }) {
+      assert.equal(result.code, "FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING");
+      assert.deepEqual(calls.map((args) => kindOf(["gcloud", ...args])), ["run jobs executions list"],
+        "nothing is deployed");
+    },
+  });
+  await withFakeGcloud({
+    "run jobs executions list": { stdout: "[]" },
+    "run jobs deploy": { stdout: "" },
+    "run jobs execute": { stdout: JSON.stringify(uncappedExecution(`${REFRESH_JOB}-l4abc`, at)) },
+    "logging read": { stdout: JSON.stringify([{ timestamp: at.end, jsonPayload: { status: "ok", state: "LOCK_HELD" } }]) },
+  }, {
+    argv: refreshArgv,
+    async check({ result, calls, dir }) {
+      assert.equal(result.code, "FASTPATH_DEPLOY_REFRESH_LOCK_HELD");
+      assert.deepEqual(calls.map((args) => kindOf(["gcloud", ...args])),
+        ["run jobs executions list", "run jobs deploy", "run jobs execute", "logging read"]);
+      const receipt = JSON.parse(await readFile(join(dir, "out", "refresh.json"), "utf8"));
+      assert.deepEqual([receipt.succeeded, receipt.results.at(-1).state], [true, "LOCK_HELD"]);
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The disposable production-tier measurement estate (MEAS-SYNTH).
+
+const MEAS = "tibotattle-meas-prodtier-20261003";
+const MEAS_CONNECTION = `tibotattle:us-east1:${MEAS}`;
+const MEAS_JOB = FASTPATH_MEASUREMENT.refreshJob;
+const FOREIGN_INSTANCE_NAMES = Object.freeze(["tibotattle-primary", "tibotattle-staging-primary",
+  "tibotattle-test-primary-20260922", "tibotattle-meas-prodtier-20261332", "tibotattle-meas-prodtier-20250101",
+  "tibotattle-meas-prodtier-2026100", "tibotattle-meas-prodtier-20261003-b", "Tibotattle-meas-prodtier-20261003",
+  " tibotattle-meas-prodtier-20261003", "tibotattle-meas-prodtier-", "", null, undefined]);
+
+/** A Cloud SQL instance as `sql instances describe --format=json` renders the one meas-create builds. */
+function measInstanceResource(overrides = {}, settingsOverrides = {}) {
+  return {
+    name: MEAS, project: "tibotattle", region: "us-east1", databaseVersion: "POSTGRES_17", state: "RUNNABLE",
+    settings: { tier: "db-custom-4-16384", edition: "ENTERPRISE", availabilityType: "ZONAL", dataDiskType: "PD_SSD",
+      connectorEnforcement: "REQUIRED", ipConfiguration: { ipv4Enabled: true, authorizedNetworks: [] },
+      databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+        .map(([name, value]) => ({ name, value })),
+      insightsConfig: { queryInsightsEnabled: true, queryPlansPerMinute: 5, queryStringLength: 4500,
+        recordApplicationTags: false, recordClientAddress: false },
+      userLabels: { ...FASTPATH_MEASUREMENT.labels }, deletionProtectionEnabled: false, ...settingsOverrides },
+    ...overrides,
+  };
+}
+
+const sqlKind = (command) => (command[1] === "sql" ? command.slice(1, 4).join(" ") : kindOf(command));
+/** Another instance and Job of the test project, as listings render them: never a measurement resource. */
+const OTHER_INSTANCE = Object.freeze({ name: FASTPATH_TEST.instance, project: "tibotattle", region: "us-east1",
+  settings: { userLabels: { app: "tibotattle", environment: "test" } } });
+const OTHER_JOB = Object.freeze({ metadata: { name: FASTPATH_TEST.refreshJob } });
+
+/** A Runner stand-in whose exec and json both answer from `answer(kind, nth, command)`; FAILED fails the call. */
+function measRunner(answer) {
+  const runner = {
+    dryRun: false, commands: [], receipts: {},
+    print(command) { this.commands.push(command); },
+    call(command, options) {
+      this.commands.push(command);
+      const kind = sqlKind(command);
+      const value = answer(kind, this.commands.filter((seen) => sqlKind(seen) === kind).length, command);
+      if (value === FAILED) {
+        if (options.allowFailure) return { status: 1, stdout: "", stderr: "" };
+        throw Object.assign(new Error("FASTPATH_DEPLOY_COMMAND_FAILED"), { code: "FASTPATH_DEPLOY_COMMAND_FAILED" });
+      }
+      return { status: 0, stdout: value === undefined ? "" : JSON.stringify(value), stderr: "" };
+    },
+    exec(command, options = {}) { return this.call(command, options); },
+    json(command, options = {}) {
+      const result = this.call(command, options);
+      return result.status !== 0 || result.stdout === "" ? null : JSON.parse(result.stdout);
+    },
+    async receipt(name, value) { this.receipts[name] = structuredClone(value); return `/receipts/${name}`; },
+  };
+  return runner;
+}
+
+test("measurement names: only tibotattle-meas-prodtier-<YYYYMMDD>; production, staging and test names are refused", () => {
+  assert.deepEqual({ ...fastpathMeasurementInstance(MEAS) }, { instance: MEAS, instanceConnectionName: MEAS_CONNECTION });
+  assert.equal(isFastpathMeasurementInstanceConnectionName(MEAS_CONNECTION), true);
+  for (const value of [FASTPATH_TEST.instanceConnectionName, `tibotattle:us-central1:${MEAS}`, `other:us-east1:${MEAS}`,
+    `${MEAS_CONNECTION}:x`, MEAS]) {
+    assert.equal(isFastpathMeasurementInstanceConnectionName(value), false, value);
+  }
+  const production = JSON.parse(readFileSyncText(join(WORKER_ROOT, "cloud-run/infra/production.desired-state.json")));
+  const staging = loadCommittedDesiredState("staging");
+  for (const name of [...FOREIGN_INSTANCE_NAMES, production.cloudSql.instance, staging.cloudSql.instance]) {
+    assert.equal(fastpathMeasurementInstance(name), null, String(name));
+    for (const build of [assertMeasurementInstance, measInstanceDescribeCommand, measInstanceCreateCommand,
+      measInstanceDeleteCommand, measDatabasesListCommand, measDatabaseCreateCommand, measUsersListCommand,
+      (instance) => measIamUserCreateCommand(instance, FASTPATH_MEASUREMENT.iamServiceAccounts[0]),
+      // Without a measurement instance (null, undefined) these target the fast-path test Job.
+      ...(name === null || name === undefined ? [] : [(instance) => refreshTarget({ measInstance: instance }),
+        (instance) => refreshJobCommand({ image: IMAGE, schema: SEEDED, measInstance: instance })])]) {
+      expectCode(() => build(name), "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID");
+    }
+    assert.throws(() => fastpathInstanceConnectionName(name ?? "x"),
+      (error) => error?.code === "GCP_FASTPATH_CONNECTION_INSTANCE_INVALID", String(name));
+  }
+  assert.equal(fastpathInstanceConnectionName(undefined), FASTPATH_TEST.instanceConnectionName);
+  assert.equal(refreshTarget({ measInstance: null }).job, FASTPATH_TEST.refreshJob);
+  assert.equal(fastpathInstanceConnectionName(MEAS), MEAS_CONNECTION);
+  expectCode(() => measIamUserCreateCommand(MEAS, "someone@tibotattle.iam.gserviceaccount.com"),
+    "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  for (const operation of ["", "a b", "x".repeat(101), "../x", undefined]) {
+    expectCode(() => sqlOperationWaitCommand(operation), "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  }
+  // Every measurement command: gcloud, the test project, this instance or the measurement Job, nothing else.
+  const commands = [measInstanceDescribeCommand(MEAS), measInstanceCreateCommand(MEAS), measInstanceDeleteCommand(MEAS),
+    measDatabasesListCommand(MEAS), measDatabaseCreateCommand(MEAS), measUsersListCommand(MEAS),
+    ...FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => measIamUserCreateCommand(MEAS, account)),
+    sqlOperationWaitCommand("0a1b2c3d-op"), measJobDeleteCommand(), measExecutionCancelCommand(`${MEAS_JOB}-ab12c`),
+    measInstancesListCommand(), jobsListCommand()];
+  for (const command of commands) {
+    assert.equal(command[0], "gcloud");
+    assert.equal(command.filter((arg) => arg.startsWith("--project=")).join(), "--project=tibotattle");
+    const named = command.filter((arg) => /tibotattle-(?:meas|fastpath|test|primary|staging)/u.test(arg)
+      && !arg.startsWith("--labels=") && !arg.includes("@tibotattle.iam"));
+    for (const arg of named) assert.ok(arg === MEAS || arg === `--instance=${MEAS}` || arg.startsWith(MEAS_JOB), arg);
+  }
+  assert.deepEqual(measInstanceDeleteCommand(MEAS), ["gcloud", "sql", "instances", "delete", MEAS, "--project=tibotattle",
+    "--async", "--quiet", "--format=json"]);
+  // The presence reads list the test project only, read-only.
+  assert.deepEqual(measInstancesListCommand(), ["gcloud", "sql", "instances", "list", "--project=tibotattle", "--format=json"]);
+  assert.deepEqual(jobsListCommand(), ["gcloud", "run", "jobs", "list", "--project=tibotattle", "--region=us-east1",
+    "--format=json"]);
+  assert.deepEqual(measJobDeleteCommand(), ["gcloud", "run", "jobs", "delete", MEAS_JOB, "--project=tibotattle",
+    "--region=us-east1", "--quiet"]);
+  expectCode(() => measExecutionCancelCommand(`${REFRESH_JOB}-ab12c`), "FASTPATH_DEPLOY_EXECUTION_INVALID");
+  assert.equal(FASTPATH_MEASUREMENT.refreshJob, FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob);
+  assert.equal(MEAS_JOB.startsWith("tibotattle-fastpath-"), true, "the wrapper's fast-path name rule holds");
+});
+
+test("the measurement instance is production's shape: tier, storage, posture and flags mirror C-INFRA", () => {
+  const production = JSON.parse(readFileSyncText(join(WORKER_ROOT, "cloud-run/infra/production.desired-state.json")));
+  const m = FASTPATH_MEASUREMENT;
+  assert.deepEqual([m.tier, m.storageSizeGb, m.maxConnections],
+    [production.cloudSql.tier, production.cloudSql.storageSizeGb, production.cloudSql.maxConnections]);
+  assert.deepEqual([m.databaseVersion, m.edition, m.availabilityType],
+    [CLOUD_SQL_POSTURE.databaseVersion, CLOUD_SQL_POSTURE.edition, CLOUD_SQL_POSTURE.availabilityType]);
+  assert.deepEqual(m.databaseFlags.map(([name, value]) => ({ name, value })),
+    databaseFlags({ cloudSql: { maxConnections: production.cloudSql.maxConnections } }).map((flag) => ({ ...flag })));
+  assert.equal(Object.keys(CLOUD_SQL_LOGGING_FLAGS).length + 1, m.databaseFlags.length);
+  assert.equal(CLOUD_SQL_POSTURE.connectorEnforcement, "REQUIRED");
+  assert.deepEqual(CLOUD_SQL_POSTURE.authorizedNetworks, []);
+  // The create command equals C-INFRA's instance command on every shared flag;
+  // it differs only where a disposable instance must.
+  const create = measInstanceCreateCommand(MEAS).slice(1);
+  const reference = cloudSqlCreateArgs({ ...loadCommittedDesiredState("staging"),
+    cloudSql: { ...loadCommittedDesiredState("staging").cloudSql, tier: production.cloudSql.tier,
+      storageSizeGb: production.cloudSql.storageSizeGb, maxConnections: production.cloudSql.maxConnections } });
+  const shared = (args) => args.filter((arg) => /^--(?:database-version|edition|tier|availability-type|storage-type|storage-size|storage-auto-increase|assign-ip|connector-enforcement)\b/u.test(arg));
+  assert.deepEqual(shared(create), shared([...reference]));
+  assert.equal(shared(create).length, 9);
+  // Flags: production's, plus the profiling diagnostics, nothing else.
+  const flagsOf = (args) => args.find((arg) => arg.startsWith("--database-flags=")).slice("--database-flags=".length)
+    .split(",").sort();
+  const productionFlags = flagsOf([...reference]);
+  const diagnostics = m.diagnosticFlags.map(([name, value]) => `${name}=${value}`);
+  assert.deepEqual(flagsOf(create), [...productionFlags, ...diagnostics].sort());
+  assert.deepEqual(diagnostics, ["pg_stat_statements.track=all", "track_io_timing=on"]);
+  // Query Insights: production keeps it off; the measurement instance turns it on, without client
+  // addresses or application tags (a stated divergence for the profile).
+  assert.equal(reference.includes("--no-insights-config-query-insights-enabled"), true);
+  const own = create.filter((arg) => !shared([arg]).length && !arg.startsWith("--database-flags=")
+    && !["sql", "instances", "create", MEAS].includes(arg));
+  assert.deepEqual(own, ["--project=tibotattle", "--region=us-east1", "--no-deletion-protection", "--no-backup",
+    "--insights-config-query-insights-enabled", "--insights-config-query-plans-per-minute=5",
+    "--insights-config-query-string-length=4500", "--no-insights-config-record-application-tags",
+    "--no-insights-config-record-client-address",
+    "--labels=app=tibotattle,environment=test,managed-by=claude-fastpath,purpose=meas-prodtier", "--async",
+    "--format=json"]);
+  assert.equal(create.some((arg) => /authorized-networks|--no-assign-ip|--network=|--deletion-protection$/u.test(arg)), false);
+  // A read-back is checked field by field; a foreign label set is visible as such.
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource(), MEAS), []);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    ipConfiguration: { ipv4Enabled: true, authorizedNetworks: [{ value: "0.0.0.0/0" }] },
+    connectorEnforcement: "NOT_REQUIRED", tier: "db-g1-small" }), MEAS), ["tier", "authorizedNetworks", "connectorEnforcement"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, { userLabels: {} }), MEAS), ["labels"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+      .map(([name, value]) => ({ name, value })).concat([{ name: "log_statement", value: "all" }]) }), MEAS),
+  ["databaseFlags"]);
+  // The profiling diagnostics: required flags, an optional flag only at its value, and Query Insights.
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: FASTPATH_MEASUREMENT.databaseFlags.map(([name, value]) => ({ name, value })) }), MEAS),
+  ["diagnosticFlags"]);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags,
+      ...FASTPATH_MEASUREMENT.optionalDiagnosticFlags].map(([name, value]) => ({ name, value })) }), MEAS), []);
+  assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, {
+    databaseFlags: [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+      .map(([name, value]) => ({ name, value })).concat([{ name: "cloudsql.enable_pg_stat_statements", value: "off" }]) }),
+  MEAS), ["diagnosticFlags"]);
+  for (const insightsConfig of [undefined, { queryInsightsEnabled: false }, { queryInsightsEnabled: true,
+    queryPlansPerMinute: 5, queryStringLength: 4500, recordClientAddress: true }]) {
+    assert.deepEqual(measurementInstanceMismatches(measInstanceResource({}, { insightsConfig }), MEAS), ["queryInsights"]);
+  }
+});
+
+test("meas-create's flags: a listing must name every mirrored and required flag; optional ones only when listed", () => {
+  const m = FASTPATH_MEASUREMENT;
+  assert.deepEqual(measFlagsListCommand(), ["gcloud", "sql", "flags", "list", "--database-version=POSTGRES_17",
+    "--project=tibotattle", "--format=json"]);
+  const names = (pairs) => pairs.map(([name]) => ({ name }));
+  const without = measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags]));
+  assert.deepEqual(without.optionalApplied, []);
+  assert.deepEqual(without.optionalUnlisted, ["cloudsql.enable_pg_stat_statements"]);
+  assert.deepEqual(without.flags.map(([name]) => name), [...m.databaseFlags, ...m.diagnosticFlags].map(([name]) => name)
+    .sort());
+  const withOptional = measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags, ...m.optionalDiagnosticFlags,
+    ["unrelated_flag"]]));
+  assert.deepEqual(withOptional.optionalApplied, ["cloudsql.enable_pg_stat_statements"]);
+  assert.equal(measInstanceCreateCommand(MEAS, withOptional.flags).find((arg) => arg.startsWith("--database-flags="))
+    .includes("cloudsql.enable_pg_stat_statements=on"), true);
+  for (const missing of ["track_io_timing", "pg_stat_statements.track", "cloudsql.iam_authentication"]) {
+    expectCode(() => measCreateFlags(names([...m.databaseFlags, ...m.diagnosticFlags])
+      .filter(({ name }) => name !== missing)), "FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED");
+  }
+  expectCode(() => measCreateFlags({ flags: [] }), "FASTPATH_DEPLOY_JSON_INVALID");
+  // The create command takes only a set measCreateFlags can return.
+  for (const flags of [m.databaseFlags, [...m.databaseFlags, ...m.diagnosticFlags, ["log_statement", "all"]],
+    [...m.databaseFlags, ["track_io_timing", "off"], ["pg_stat_statements.track", "all"]]]) {
+    expectCode(() => measInstanceCreateCommand(MEAS, flags), "FASTPATH_DEPLOY_ARGUMENT_INVALID");
+  }
+});
+
+test("meas-create builds the instance once, waits, reads it back, and refuses an instance it did not build", async () => {
+  let created = false;
+  const listing = [...FASTPATH_MEASUREMENT.databaseFlags, ...FASTPATH_MEASUREMENT.diagnosticFlags]
+    .map(([name]) => ({ name }));
+  const fresh = measRunner((kind) => {
+    if (kind === "sql instances list") return [OTHER_INSTANCE];
+    if (kind === "sql flags list") return listing;
+    if (kind === "sql instances describe") return created ? measInstanceResource() : assert.fail("describe before create");
+    if (kind === "sql instances create") { created = true; return { name: "op-create-1" }; }
+    if (kind === "sql operations wait") return undefined;
+    if (kind === "sql databases list") return [{ name: "postgres" }];
+    if (kind === "sql databases create") return undefined;
+    if (kind === "sql users list") return [{ name: "postgres", type: "BUILT_IN" }];
+    if (kind === "sql users create") return undefined;
+    return assert.fail(kind);
+  });
+  let clock = 0;
+  const receipt = await stepMeasCreate(fresh, { measInstance: MEAS }, { wallClock: () => (clock += 450_000) });
+  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances list", "sql flags list", "sql instances create",
+    "sql operations wait", "sql instances describe", "sql databases list", "sql databases create", "sql users list",
+    "sql users create", "sql users create"]);
+  assert.deepEqual(fresh.commands[0], measInstancesListCommand());
+  assert.deepEqual(fresh.commands[1], measFlagsListCommand());
+  assert.deepEqual(fresh.commands[2], measInstanceCreateCommand(MEAS));
+  assert.deepEqual(fresh.commands[3], sqlOperationWaitCommand("op-create-1"));
+  assert.deepEqual(receipt.optionalFlagsUnlisted, ["cloudsql.enable_pg_stat_statements"]);
+  assert.equal(receipt.databaseFlags.includes("track_io_timing=on"), true);
+  assert.deepEqual(fresh.commands.slice(-2), FASTPATH_MEASUREMENT.iamServiceAccounts
+    .map((account) => measIamUserCreateCommand(MEAS, account)));
+  assert.deepEqual([receipt.existed, receipt.createSeconds, receipt.state, receipt.mismatches, receipt.databaseCreated],
+    [false, 450, "RUNNABLE", [], true]);
+  assert.deepEqual(receipt.usersCreated, ["tibotattle-test-migrator@tibotattle.iam", "tibotattle-test-runtime@tibotattle.iam"]);
+
+  // Re-run over its own instance: reads only.
+  const again = measRunner((kind) => ({
+    "sql instances list": [OTHER_INSTANCE, measInstanceResource()],
+    "sql instances describe": measInstanceResource(),
+    "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
+    "sql users list": FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => ({
+      name: account.replace(/\.gserviceaccount\.com$/u, ""), type: "CLOUD_IAM_SERVICE_ACCOUNT" })),
+  })[kind] ?? assert.fail(kind));
+  const reread = await stepMeasCreate(again, { measInstance: MEAS });
+  assert.equal(reread.existed, true);
+  assert.deepEqual(again.commands.map(sqlKind), ["sql instances list", "sql instances describe", "sql instances describe",
+    "sql databases list", "sql users list"]);
+
+  // A listing that fails (expired credentials, network, permission) is not "absent": nothing is created.
+  for (const unread of [FAILED, undefined, { items: [] }, [{ state: "RUNNABLE" }]]) {
+    const blind = measRunner((kind) => (kind === "sql instances list" ? unread : assert.fail(kind)));
+    await assert.rejects(stepMeasCreate(blind, { measInstance: MEAS }),
+      (error) => ["FASTPATH_DEPLOY_COMMAND_FAILED", "FASTPATH_DEPLOY_JSON_INVALID"].includes(error?.code), String(unread));
+    assert.deepEqual(blind.commands.map(sqlKind), ["sql instances list"]);
+  }
+
+  // Someone else's instance of that name, or a built-in user of the identity's name: refused, nothing written.
+  const foreign = measRunner((kind) => ({
+    "sql instances list": [measInstanceResource({}, { userLabels: { app: "other" } })],
+    "sql instances describe": measInstanceResource({}, { userLabels: { app: "other" } }),
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasCreate(foreign, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
+  const impostor = measRunner((kind) => ({
+    "sql instances list": [measInstanceResource()],
+    "sql instances describe": measInstanceResource(), "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
+    "sql users list": [{ name: "tibotattle-test-migrator@tibotattle.iam", type: "BUILT_IN" }],
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasCreate(impostor, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_USER_UNEXPECTED");
+  assert.equal(impostor.commands.some((command) => sqlKind(command) === "sql users create"), false);
+
+  // A created instance that reads back with another shape stops before the database and users.
+  let made = false;
+  const drifted = measRunner((kind) => {
+    if (kind === "sql instances list") return [];
+    if (kind === "sql flags list") return listing;
+    if (kind === "sql instances describe") return made ? measInstanceResource({}, { connectorEnforcement: "NOT_REQUIRED" }) : FAILED;
+    if (kind === "sql instances create") { made = true; return { name: "op-create-2" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasCreate(drifted, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_UNEXPECTED" && error.message.endsWith("RUNNABLE,connectorEnforcement"));
+  assert.deepEqual(drifted.receipts["meas-create.json"].mismatches, ["connectorEnforcement"]);
+
+  // A version whose listing lacks a required diagnostic flag: refused before any write.
+  const unsupported = measRunner((kind) => {
+    if (kind === "sql instances list") return [];
+    if (kind === "sql flags list") return listing.filter(({ name }) => name !== "track_io_timing");
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasCreate(unsupported, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_FLAG_UNSUPPORTED" && error.message.endsWith("track_io_timing"));
+  assert.deepEqual(unsupported.commands.map(sqlKind), ["sql instances list", "sql flags list"]);
+});
+
+test("meas-teardown cancels and deletes the Job, deletes only an instance it built, and is idempotent", async () => {
+  const running = uncappedExecution(`${MEAS_JOB}-r1abc`, { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z",
+    running: true });
+  let gone = false;
+  let jobGone = false;
+  const full = measRunner((kind) => {
+    if (kind === "run jobs list") return jobGone ? [OTHER_JOB] : [OTHER_JOB, { metadata: { name: MEAS_JOB } }];
+    if (kind === "run jobs executions list") return [running];
+    if (kind === "run jobs executions cancel") return undefined;
+    if (kind === "run jobs delete") { jobGone = true; return undefined; }
+    if (kind === "sql instances list") return gone ? [OTHER_INSTANCE] : [OTHER_INSTANCE, measInstanceResource()];
+    if (kind === "sql instances describe") return gone ? FAILED : measInstanceResource();
+    if (kind === "sql instances delete") { gone = true; return { name: "op-delete-1" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  const receipt = await stepMeasTeardown(full, { measInstance: MEAS });
+  assert.deepEqual(full.commands.map(sqlKind), ["run jobs list", "run jobs executions list",
+    "run jobs executions cancel", "run jobs delete", "sql instances list", "sql instances describe",
+    "sql instances delete", "sql operations wait", "run jobs list", "sql instances list"]);
+  assert.deepEqual(full.commands[0], jobsListCommand());
+  assert.deepEqual(full.commands[2], measExecutionCancelCommand(`${MEAS_JOB}-r1abc`));
+  assert.deepEqual(full.commands[4], measInstancesListCommand());
+  assert.deepEqual(full.commands[6], measInstanceDeleteCommand(MEAS));
+  assert.deepEqual(full.commands[7], sqlOperationWaitCommand("op-delete-1"));
+  assert.deepEqual([receipt.jobPresent, receipt.instancePresent, receipt.cancelled, receipt.jobDeleted,
+    receipt.instanceDeleted, receipt.jobAbsent, receipt.instanceAbsent, receipt.remainingMeasurementInstances,
+    receipt.errors], [true, true, [`${MEAS_JOB}-r1abc`], true, true, true, true, [], []]);
+
+  // Nothing left: reads only, success.
+  const empty = measRunner((kind) => (kind === "run jobs list" ? [OTHER_JOB]
+    : kind === "sql instances list" ? [OTHER_INSTANCE] : assert.fail(kind)));
+  const none = await stepMeasTeardown(empty, { measInstance: MEAS });
+  assert.deepEqual([none.jobPresent, none.instancePresent, none.jobDeleted, none.instanceDeleted, none.jobAbsent,
+    none.instanceAbsent, none.remainingMeasurementInstances], [false, false, false, false, true, true, []]);
+  assert.deepEqual(empty.commands.map(sqlKind), ["run jobs list", "sql instances list", "run jobs list", "sql instances list"]);
+
+  // An instance of that name this wrapper did not build is never deleted.
+  const foreign = measRunner((kind) => ({
+    "run jobs list": [], "sql instances list": [measInstanceResource({}, { userLabels: {} })],
+    "sql instances describe": measInstanceResource({}, { userLabels: {} }),
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasTeardown(foreign, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
+  assert.equal(foreign.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+
+  // A Job that cannot be deleted does not keep the instance alive; the step still fails.
+  let deleted = false;
+  const stuck = measRunner((kind) => {
+    if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
+    if (kind === "run jobs executions list") return [];
+    if (kind === "run jobs delete") return FAILED;
+    if (kind === "sql instances list") return deleted ? [] : [measInstanceResource()];
+    if (kind === "sql instances describe") return measInstanceResource();
+    if (kind === "sql instances delete") { deleted = true; return { name: "op-delete-2" }; }
+    if (kind === "sql operations wait") return undefined;
+    return assert.fail(kind);
+  });
+  await assert.rejects(stepMeasTeardown(stuck, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("job absent false"));
+  assert.equal(deleted, true);
+  assert.deepEqual(stuck.receipts["meas-teardown.json"].errors, ["job:FASTPATH_DEPLOY_COMMAND_FAILED"]);
+  assert.equal(stuck.receipts["meas-teardown.json"].instanceAbsent, true);
+});
+
+// MEAS-SYNTH review (2026-10-03): teardown took a failed describe for
+// "absent", so with expired credentials after a 13-20 h run it deleted
+// nothing, reported both absent and exited 0, leaving the prod-tier instance
+// running. Absence now comes only from listings that succeeded.
+test("meas-teardown never reports success when its reads fail, and names any measurement instance left running", async () => {
+  // Every gcloud call fails (reauthentication required, network, quota): nothing is deleted, and the step fails.
+  const blind = measRunner(() => FAILED);
+  await assert.rejects(stepMeasTeardown(blind, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE"
+      && error.message.includes("job absent null, instance absent null, measurement instances remaining unread"));
+  const unread = blind.receipts["meas-teardown.json"];
+  assert.deepEqual([unread.jobPresent, unread.instancePresent, unread.jobDeleted, unread.instanceDeleted, unread.jobAbsent,
+    unread.instanceAbsent, unread.remainingMeasurementInstances], [null, null, false, false, null, null, null]);
+  assert.deepEqual(unread.errors, ["job:FASTPATH_DEPLOY_COMMAND_FAILED", "instance:FASTPATH_DEPLOY_COMMAND_FAILED",
+    "job-readback:FASTPATH_DEPLOY_COMMAND_FAILED", "instance-readback:FASTPATH_DEPLOY_COMMAND_FAILED"]);
+  assert.deepEqual(blind.commands.map(sqlKind), ["run jobs list", "sql instances list", "run jobs list", "sql instances list"]);
+
+  // Only the describe of a listed instance fails: it is not deleted, and the step fails.
+  const halfBlind = measRunner((kind) => ({ "run jobs list": [], "sql instances list": [measInstanceResource()],
+    "sql instances describe": FAILED })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasTeardown(halfBlind, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("instance absent false"));
+  assert.equal(halfBlind.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+  assert.deepEqual(halfBlind.receipts["meas-teardown.json"].remainingMeasurementInstances, [MEAS]);
+
+  // An unreadable listing is not an empty one.
+  for (const listing of [undefined, { items: [] }, [{ state: "RUNNABLE" }]]) {
+    const odd = measRunner((kind) => (kind === "run jobs list" ? [] : kind === "sql instances list" ? listing
+      : assert.fail(kind)));
+    await assert.rejects(stepMeasTeardown(odd, { measInstance: MEAS }),
+      (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("instance absent null"),
+      JSON.stringify(listing));
+    assert.deepEqual(odd.receipts["meas-teardown.json"].errors, ["instance:FASTPATH_DEPLOY_JSON_INVALID",
+      "instance-readback:FASTPATH_DEPLOY_JSON_INVALID"], JSON.stringify(listing));
+    assert.equal(odd.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+  }
+  const oddJobs = measRunner((kind) => (kind === "run jobs list" ? [{ spec: {} }] : kind === "sql instances list" ? []
+    : assert.fail(kind)));
+  await assert.rejects(stepMeasTeardown(oddJobs, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("job absent null"));
+  assert.equal(oddJobs.commands.some((command) => sqlKind(command) === "run jobs delete"), false);
+
+  // The named instance never existed (a `date` re-evaluated after midnight), but another
+  // measurement instance is running: it is named, never deleted by this call, and the step fails.
+  const yesterday = "tibotattle-meas-prodtier-20261002";
+  const unlabelled = "tibotattle-meas-prodtier-20261001";
+  const drift = measRunner((kind) => ({ "run jobs list": [OTHER_JOB],
+    "sql instances list": [OTHER_INSTANCE, measInstanceResource({ name: yesterday }),
+      measInstanceResource({ name: unlabelled }, { userLabels: {} }),
+      { ...OTHER_INSTANCE, name: "someone-elses-instance", settings: { userLabels: { purpose: "meas-prodtier" } } }],
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasTeardown(drift, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE"
+      && error.message.includes(`measurement instances remaining someone-elses-instance ${unlabelled} ${yesterday}`));
+  const drifted = drift.receipts["meas-teardown.json"];
+  assert.deepEqual([drifted.instancePresent, drifted.instanceAbsent, drifted.errors], [false, true, []]);
+  assert.deepEqual(drifted.remainingMeasurementInstances, ["someone-elses-instance", unlabelled, yesterday]);
+  assert.equal(drift.commands.some((command) => ["sql instances describe", "sql instances delete"].includes(sqlKind(command))),
+    false);
+  assert.deepEqual(measurementInstancesListed([OTHER_INSTANCE]), []);
+
+  // A dry run prints the deletions as if both existed, and reads nothing back.
+  const dry = { ...measRunner(() => assert.fail("no remote command in a dry run")), dryRun: true };
+  dry.json = function json(command, options = {}) { this.commands.push(command); return options.placeholderJson ?? null; };
+  dry.exec = function exec(command, { placeholder = "" } = {}) { this.commands.push(command); return { status: 0, stdout: placeholder, dry: true }; };
+  const printed = await stepMeasTeardown(dry, { measInstance: MEAS });
+  assert.deepEqual(dry.commands.map(sqlKind), ["run jobs list", "run jobs executions list", "run jobs delete",
+    "sql instances list", "sql instances describe", "sql instances delete", "sql operations wait"]);
+  assert.deepEqual([printed.jobAbsent, printed.instanceAbsent, printed.errors], [null, null, []]);
+});
+
+test("refresh-idle reads the measurement Job's presence from a listing; a failed read is not absence", () => {
+  const listing = (jobs) => scriptedRunner((command) => (kindOf(command) === "run jobs list" ? jobs
+    : kindOf(command) === "run jobs executions list" ? [] : assert.fail(kindOf(command))));
+  const absent = listing([{ metadata: { name: REFRESH_JOB } }]);
+  assert.deepEqual({ ...assertRefreshIdle(absent, { job: MEAS_JOB }) }, { step: "refresh-idle", job: MEAS_JOB, running: 0,
+    absent: true });
+  assert.deepEqual(absent.commands, [jobsListCommand()]);
+  const present = listing([{ metadata: { name: MEAS_JOB } }]);
+  assert.equal(assertRefreshIdle(present, { job: MEAS_JOB }).running, 0);
+  assert.deepEqual(present.commands.map(kindOf), ["run jobs list", "run jobs executions list"]);
+  // v2 resource names are read too.
+  assert.equal(assertRefreshIdle(listing([{ name: `projects/tibotattle/locations/us-east1/jobs/${MEAS_JOB}` }]),
+    { job: MEAS_JOB }).absent, undefined);
+  expectCode(() => assertRefreshIdle(listing(FAILED), { job: MEAS_JOB }), "FASTPATH_DEPLOY_COMMAND_FAILED");
+  expectCode(() => assertRefreshIdle(listing({ jobs: [] }), { job: MEAS_JOB }), "FASTPATH_DEPLOY_JSON_INVALID");
+  expectCode(() => assertRefreshIdle(listing([{}]), { job: MEAS_JOB }), "FASTPATH_DEPLOY_JSON_INVALID");
+  const running = uncappedExecution(`${MEAS_JOB}-r9xyz`, { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z",
+    running: true });
+  const busy = scriptedRunner((command) => (kindOf(command) === "run jobs list" ? [{ metadata: { name: MEAS_JOB } }]
+    : [running]));
+  expectCode(() => assertRefreshIdle(busy, { job: MEAS_JOB }), "FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING");
+});
+
+test("a measurement refresh deploys the measurement Job on its instance, which the Job alone accepts", async () => {
+  const command = refreshJobCommand({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+    profile: "dense", measInstance: MEAS });
+  assert.equal(command[4], MEAS_JOB);
+  const task = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+    profile: "dense", measInstance: MEAS });
+  const shared = denseTask();
+  assert.deepEqual({ ...task, env: { ...task.env, PRIMARY_INSTANCE_CONNECTION_NAME: null } },
+    { ...shared, env: { ...shared.env, PRIMARY_INSTANCE_CONNECTION_NAME: null } }, "only the instance differs");
+  assert.equal(task.env.PRIMARY_INSTANCE_CONNECTION_NAME, MEAS_CONNECTION);
+  expectCode(() => refreshJobCommand({ image: IMAGE, schema: FASTPATH_TEST.primarySchema, measInstance: MEAS }),
+    "FASTPATH_DEPLOY_SCHEMA_INVALID");
+  // The Job's own target check, with the env the wrapper renders.
+  const env = { ...task.env, CLOUD_RUN_JOB: MEAS_JOB };
+  assert.deepEqual({ ...await resolveAnalyticsRefreshDatabase(env, { schema: SEEDED }) }, { kind: "cloud-sql",
+    instanceConnectionName: MEAS_CONNECTION, database: "tibotattle_fastpath", iamUser: FASTPATH_TEST.runtimeIamUser });
+  const forbidden = (overrides, schema = SEEDED) => assert.rejects(
+    resolveAnalyticsRefreshDatabase({ ...env, ...overrides }, { schema }),
+    (error) => error?.code === "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN", JSON.stringify({ overrides, schema }));
+  await forbidden({}, FASTPATH_TEST.primarySchema);
+  await forbidden({}, "tibotattle_fastpath_other");
+  for (const instance of [FASTPATH_TEST.instanceConnectionName, "tibotattle:us-east1:tibotattle-primary",
+    "tibotattle:us-east1:tibotattle-meas-prodtier-20261332", `tibotattle:us-central1:${MEAS}`]) {
+    await forbidden({ PRIMARY_INSTANCE_CONNECTION_NAME: instance });
+  }
+  await forbidden({ PRIMARY_DATABASE: "tibotattle" });
+  await forbidden({ POSTGRES_IAM_USER: "someone-else@tibotattle.iam" });
+  // The fast-path test Job never reaches a measurement instance.
+  await forbidden({ CLOUD_RUN_JOB: FASTPATH_TEST.refreshJob });
+  // A production or staging target naming any measurement resource is refused.
+  const production = { ANALYTICS_REFRESH_TARGET: "production", CLOUD_RUN_JOB: "tibotattle-analytics-refresh",
+    CLOUD_RUN_TASK_INDEX: "0", CLOUD_RUN_TASK_COUNT: "1",
+    PRIMARY_INSTANCE_CONNECTION_NAME: "example-ops-prod1:us-east1:tibotattle-primary", PRIMARY_DATABASE: "tibotattle_primary",
+    PRIMARY_SCHEMA: "tibotattle_primary", POSTGRES_IAM_USER: "tibotattle-runtime@example-ops-prod1.iam",
+    ANALYTICS_V2_MEMORY_BUDGET_MIB: "10752" };
+  assert.equal((await readAnalyticsRefreshProductionTarget(production)).target, "production");
+  for (const [name, value] of [["PRIMARY_INSTANCE_CONNECTION_NAME", MEAS_CONNECTION],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:tibotattle-meas-prodtier-20261003"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:tibotattle-meas-prodtier-x"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:primary-meas"],
+    ["CLOUD_RUN_JOB", MEAS_JOB]]) {
+    await assert.rejects(readAnalyticsRefreshProductionTarget({ ...production, [name]: value }),
+      (error) => error?.code === "ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN" && error.field === name, value);
+  }
+});
+
+test("refresh-uncapped on a measurement instance follows only that instance's guarded refresh", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const measTask = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: GUARD_ENV,
+      profile: "dense", measInstance: MEAS });
+    const guarded = { job: MEAS_JOB, measInstance: MEAS, execution: `${MEAS_JOB}-g7h2k` };
+    for (const [overrides, field] of [[{ measInstance: null }, "measInstance"], [{ job: REFRESH_JOB }, "job"],
+      [{ measInstance: "tibotattle-meas-prodtier-20261004" }, "measInstance"]]) {
+      const runner = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+      const options = { ...await uncappedOptions(dir, { ...guarded, ...overrides }), measInstance: MEAS };
+      await assert.rejects(stepRefreshUncapped(runner, options, IMAGE, NO_WAIT),
+        (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH" && error.message.includes(field),
+        JSON.stringify(overrides));
+    }
+    // The fast-path Job's guarded refresh does not admit a measurement uncapped run, nor the reverse.
+    const runner = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+    await assert.rejects(stepRefreshUncapped(runner, { ...await uncappedOptions(dir), measInstance: MEAS }, IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH");
+    await assert.rejects(stepRefreshUncapped(runner, await uncappedOptions(dir, guarded), IMAGE, NO_WAIT),
+      (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH");
+    // Matching: reads the measurement Job, executes it with overrides only, and reads its execution.
+    const name = `${MEAS_JOB}-u5xyz`;
+    const execution = taskResource("Execution", { ...measTask, env: { ...measTask.env, [REFRESH_TASK_TIMEOUT_ENV]: String(UNCAPPED) },
+      timeoutSeconds: UNCAPPED }, { metadata: { name, creationTimestamp: "2026-10-04T00:00:05Z" },
+      status: { startTime: "2026-10-04T00:00:20Z", completionTime: "2026-10-04T05:00:20Z", succeededCount: 1, failedCount: 0,
+        conditions: [{ type: "Completed", status: "True" }] } });
+    const ok = scriptedRunner((command, nth) => {
+      const kind = kindOf(command);
+      if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
+      if (kind === "run jobs describe") return taskResource("Job", measTask);
+      if (kind === "run jobs executions list" && nth === 1) return [];
+      if (kind === "run jobs execute") return execution;
+      if (kind === "logging read") return [{ timestamp: "2026-10-04T05:00:19Z", jsonPayload: { status: "ok", state: "complete" } }];
+      return assert.fail(kind);
+    });
+    const receipt = await stepRefreshUncapped(ok, { ...await uncappedOptions(dir, guarded), measInstance: MEAS }, IMAGE, NO_WAIT);
+    assert.deepEqual([receipt.outcome, receipt.job, receipt.measInstance, receipt.durationSeconds],
+      ["complete", MEAS_JOB, MEAS, 18_000]);
+    for (const command of ok.commands) {
+      assert.equal(command.some((arg) => arg.includes(REFRESH_JOB)), false, "never the shared fast-path Job");
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("--meas-instance applies to the measurement steps only, and the meas steps require it", async () => {
+  const run = async (argv) => {
+    try { await main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]); return null; } catch (error) { return error.code; }
+  };
+  for (const step of ["migrate", "seed", "origin", "build", "all", "verify-database", "database"]) {
+    assert.equal(await run([step, `--meas-instance=${MEAS}`]), "FASTPATH_DEPLOY_ARGUMENT_INVALID", step);
+  }
+  for (const step of ["meas-create", "meas-teardown"]) {
+    assert.equal(await run([step]), "FASTPATH_DEPLOY_ARGUMENT_INVALID", step);
+    assert.equal(await run([step, "--meas-instance=tibotattle-primary"]), "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID", step);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// MEAS-SYNTH profiling: the profiled uncapped run, the database snapshots and
+// the Cloud Monitoring read.
+
+test("the profiler's summary lines are collected apart from status lines; the schema matches the Job's", async () => {
+  const { ANALYTICS_REFRESH_PROFILE_SCHEMA } = await import("../cloud-run/analytics-refresh-profile.mjs");
+  assert.equal(REFRESH_PROFILE_SCHEMA, ANALYTICS_REFRESH_PROFILE_SCHEMA);
+  const profile = (sequence, reason) => ({ profile: REFRESH_PROFILE_SCHEMA, sequence, reason, phase: "compute" });
+  const runner = scriptedRunner(() => [
+    { timestamp: "2026-10-04T03:00:01Z", jsonPayload: { status: "ok", state: "complete" } },
+    { timestamp: "2026-10-04T03:00:00Z", jsonPayload: profile(1, "exit") },
+    { timestamp: "2026-10-04T00:30:00Z", textPayload: JSON.stringify(profile(0, "interval")) },
+    { timestamp: "2026-10-04T00:00:01Z", jsonPayload: { profile: "something-else", sequence: 9 } },
+  ]);
+  const log = await readExecutionLog(runner, REFRESH_JOB, `${REFRESH_JOB}-ab12c`, { attempts: 1 });
+  assert.deepEqual(log.lines, [{ status: "ok", state: "complete" }]);
+  assert.deepEqual(log.profiles.map(({ sequence, reason }) => [sequence, reason]), [[0, "interval"], [1, "exit"]]);
+});
+
+test("the profiled run needs no guarded execution: refresh --no-execute deploys, refresh-uncapped follows it", async () => {
+  const deployedOnly = (dir) => ["refresh", `--image=${IMAGE}`, `--schema=${SEEDED}`, `--now=${MEAS_NOW}`,
+    "--refresh-profile=dense", `--meas-instance=${MEAS}`, "--no-execute",
+    "--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu", `--out=${join(dir, "out")}`];
+  await withFakeGcloud({
+    "run jobs list": { stdout: "[]" },
+    "run jobs deploy": { stdout: "" },
+  }, {
+    argv: deployedOnly,
+    async check({ result, calls, dir }) {
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(calls.map((args) => kindOf(["gcloud", ...args])), ["run jobs list", "run jobs deploy"],
+        "deployed, never executed");
+      const deploy = calls[1];
+      assert.equal(deploy[3], MEAS_JOB);
+      assert.equal(deploy.find((arg) => arg.startsWith("--set-env-vars=")).includes("ANALYTICS_V2_REFRESH_PROFILE=cpu"),
+        true);
+      const receipt = JSON.parse(await readFile(join(dir, "out", "refresh.json"), "utf8"));
+      assert.deepEqual([receipt.step, receipt.executed, receipt.job, receipt.measInstance], ["refresh", false, MEAS_JOB,
+        MEAS]);
+    },
+  });
+  const dir = await mkdtemp(join(tmpdir(), "fastpath-uncapped-"));
+  try {
+    const env = [...GUARD_ENV, ["ANALYTICS_V2_REFRESH_PROFILE", "cpu"]];
+    const measTask = expectedRefreshTask({ image: IMAGE, now: MEAS_NOW, schema: SEEDED, extraEnv: env,
+      profile: "dense", measInstance: MEAS });
+    const guarded = { job: MEAS_JOB, measInstance: MEAS, executed: false, execution: undefined, succeeded: undefined,
+      durationSeconds: undefined, results: undefined };
+    const options = { ...await uncappedOptions(dir, guarded), measInstance: MEAS, refreshEnv: env };
+    const name = `${MEAS_JOB}-p9xyz`;
+    const execution = taskResource("Execution", { ...measTask, env: { ...measTask.env,
+      [REFRESH_TASK_TIMEOUT_ENV]: String(UNCAPPED) }, timeoutSeconds: UNCAPPED },
+    { metadata: { name, creationTimestamp: "2026-10-04T00:00:05Z" },
+      status: { startTime: "2026-10-04T00:00:20Z", completionTime: "2026-10-04T12:00:20Z", succeededCount: 1,
+        failedCount: 0, conditions: [{ type: "Completed", status: "True" }] } });
+    const ok = scriptedRunner((command, nth) => {
+      const kind = kindOf(command);
+      if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
+      if (kind === "run jobs describe") return taskResource("Job", measTask);
+      if (kind === "run jobs executions list" && nth === 1) return [];
+      if (kind === "run jobs execute") return execution;
+      if (kind === "logging read") {
+        return [{ timestamp: "2026-10-04T12:00:19Z", jsonPayload: { status: "ok", state: "complete" } },
+          { timestamp: "2026-10-04T12:00:18Z", jsonPayload: { profile: REFRESH_PROFILE_SCHEMA, sequence: 24,
+            reason: "exit" } }];
+      }
+      return assert.fail(kind);
+    });
+    const receipt = await stepRefreshUncapped(ok, options, IMAGE, NO_WAIT);
+    assert.deepEqual([receipt.outcome, receipt.afterRefresh.executed, receipt.afterRefresh.execution,
+      receipt.durationSeconds], ["complete", false, null, 43_200]);
+    assert.deepEqual(receipt.profiles.map(({ sequence }) => sequence), [24]);
+    // A deployed-only receipt that names an execution is a contradiction only the executed flag settles;
+    // one with neither is still refused.
+    const neither = scriptedRunner((command) => assert.fail(`no remote command: ${kindOf(command)}`));
+    await assert.rejects(stepRefreshUncapped(neither, { ...await uncappedOptions(dir, { ...guarded, executed: undefined }),
+      measInstance: MEAS, refreshEnv: env }, IMAGE, NO_WAIT),
+    (error) => error?.code === "FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH" && error.message.endsWith("execution"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/** A pg client stand-in for the snapshot: records every statement, answers from `answer(text)`. */
+function snapshotClient(answer) {
+  const sent = [];
+  return {
+    sent,
+    async query(text, values) {
+      sent.push(text.replace(/\s+/gu, " ").trim());
+      const value = answer(text, values);
+      if (value instanceof Error) throw value;
+      return { rows: value ?? [] };
+    },
+    release() {},
+  };
+}
+
+function snapshotPool(client, calls) {
+  return async (options, as, applicationName) => {
+    calls.push({ instance: options.measInstance, as, applicationName });
+    return { pool: { connect: async () => client, query: (text) => client.query(text) },
+      async close() { calls.push("closed"); } };
+  };
+}
+
+test("meas-pgstat reads one content-free snapshot in a read-only transaction and writes nothing", async () => {
+  const statement = (query, role, total) => ({ role, queryid: "-7351234567890", toplevel: true, query,
+    figures: { calls: 3, total_exec_time: total, rows: 9, shared_blks_read: 4, shared_blk_read_time: 1.5, userid: 10 } });
+  const client = snapshotClient((text) => {
+    if (/FROM pg_settings/u.test(text)) return [{ name: "track_io_timing", setting: "on", unit: null }];
+    if (/FROM pg_extension/u.test(text)) return [{ extversion: "1.11" }];
+    if (/FROM pg_stat_statements/u.test(text)) {
+      return [
+        statement("/* analytics_v2:occurrences.load */ SELECT x FROM t WHERE owner = $1 AND note = 'person@example.com'",
+          FASTPATH_TEST.runtimeIamUser, 900),
+        statement("INSERT INTO t VALUES ($$secret body$$, E'it''s')", FASTPATH_TEST.migratorIamUser, 50),
+        statement("<insufficient privilege>", "someone-else", 10),
+      ];
+    }
+    if (/FROM pg_stat_database/u.test(text)) return [{ row: { blks_read: 7, blks_hit: 70, datname: "x", stats_reset: "t" } }];
+    if (/FROM pg_stat_io/u.test(text)) return [{ row: { backend_type: "client backend", object: "relation",
+      context: "normal", reads: 5, read_time: 2.5, op_bytes: 8192 } }];
+    if (/to_regclass/u.test(text)) return [{ present: true }];
+    if (/FROM pg_stat_activity/u.test(text)) return [{ role: FASTPATH_TEST.runtimeIamUser,
+      application_name: "tibotattle-analytics-refresh", backend_type: "client backend", state: "active",
+      wait_event_type: "IO", wait_event: "DataFileRead", sessions: 1 }, { role: "x", application_name: "psql 'private'",
+      backend_type: "client backend", state: "idle", wait_event_type: null, wait_event: null, sessions: 2 }];
+    return [];
+  });
+  const calls = [];
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const result = await stepMeasPgStat(runner, { measInstance: MEAS, label: "during-03", as: "migrator" },
+    { createPool: snapshotPool(client, calls) });
+  assert.deepEqual(calls, [{ instance: MEAS, as: "migrator", applicationName: "tibotattle-meas-pgstat" }, "closed"]);
+  assert.equal(client.sent[0], "BEGIN READ ONLY");
+  assert.equal(client.sent.at(-1), "ROLLBACK");
+  for (const text of client.sent) {
+    assert.match(text, /^(?:BEGIN READ ONLY|ROLLBACK|SET LOCAL statement_timeout|SAVEPOINT|RELEASE SAVEPOINT|SELECT )/u, text);
+  }
+  const receipt = runner.receipts["meas-pgstat-during-03.json"];
+  assert.equal(result.path, "/receipts/meas-pgstat-during-03.json");
+  const text = JSON.stringify(receipt);
+  for (const leaked of ["person@example.com", "secret body", "it''s", "private", FASTPATH_TEST.runtimeIamUser,
+    FASTPATH_TEST.migratorIamUser, "someone-else"]) {
+    assert.equal(text.includes(leaked), false, leaked);
+  }
+  assert.deepEqual(receipt.statements.map(({ role, family, text: statementText }) => [role, family, statementText]), [
+    ["runtime", "occurrences.load", "/* analytics_v2:occurrences.load */ SELECT x FROM t WHERE owner = $1 AND note = '?'"],
+    ["migrator", null, "INSERT INTO t VALUES ('?', '?')"],
+    ["other", null, "(hidden)"],
+  ]);
+  assert.deepEqual([receipt.statementsTotal, receipt.hiddenStatements, receipt.statements[0].shared_blk_read_time],
+    [3, 1, 1.5]);
+  assert.equal(Object.hasOwn(receipt.statements[0], "userid"), false);
+  assert.deepEqual(receipt.database, { blks_read: 7, blks_hit: 70 });
+  assert.deepEqual(receipt.sessions.map(({ role, application, waitEvent }) => [role, application, waitEvent]),
+    [["other", "other", null], ["runtime", "tibotattle-analytics-refresh", "DataFileRead"]]);
+  // A label is required and closed.
+  for (const argv of [["meas-pgstat", `--meas-instance=${MEAS}`], ["meas-pgstat", `--meas-instance=${MEAS}`, "--label=A B"],
+    ["meas-pgstat", `--meas-instance=${MEAS}`, "--label=x", "--as=postgres"]]) {
+    await assert.rejects(main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]),
+      (error) => error?.code === "FASTPATH_DEPLOY_ARGUMENT_INVALID", argv.join(" "));
+  }
+});
+
+test("meas-pgstat-enable creates the extension on the measurement database only and fails when it cannot", async () => {
+  const ok = snapshotClient((text) => (/FROM pg_extension/u.test(text) ? [{ extversion: "1.11" }] : []));
+  const calls = [];
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const receipt = await stepMeasPgStatEnable(runner, { measInstance: MEAS }, { createPool: snapshotPool(ok, calls) });
+  assert.deepEqual([receipt.extension, receipt.reset], ["1.11", true]);
+  assert.deepEqual(ok.sent, ["SET statement_timeout = '60s'", "CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+    "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'", "SELECT pg_stat_statements_reset()"]);
+  assert.deepEqual(calls[0], { instance: MEAS, as: "migrator", applicationName: "tibotattle-meas-pgstat" });
+  const denied = snapshotClient((text) => (/CREATE EXTENSION/u.test(text)
+    ? Object.assign(new Error("permission denied"), { code: "42501" }) : []));
+  const failing = measRunner(() => assert.fail("no gcloud"));
+  await assert.rejects(stepMeasPgStatEnable(failing, { measInstance: MEAS }, { createPool: snapshotPool(denied, []) }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_PGSTAT_UNAVAILABLE" && error.message.endsWith("42501"));
+  assert.deepEqual(failing.receipts["meas-pgstat-enable.json"].sqlState, "42501");
+  await assert.rejects(stepMeasPgStatEnable(failing, { measInstance: "tibotattle-primary" }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_INVALID");
+});
+
+test("meas-metrics reads only the measurement Job's and instance's series in the test project, GET only", async () => {
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, init });
+    const metric = new URL(url).searchParams.get("filter");
+    if (metric.includes("memory/utilizations")) return { ok: false, status: 404, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({ timeSeries: [{
+      resource: { type: "cloud_run_job", labels: { job_name: MEAS_JOB, location: "us-east1", instance_id: "abc123" } },
+      metric: { labels: { state: "active" } },
+      points: [{ interval: { endTime: "2026-10-04T00:02:00Z" }, value: { doubleValue: 0.5 } },
+        { interval: { endTime: "2026-10-04T00:01:00Z" }, value: { distributionValue: { mean: 0.25 } } },
+        { interval: { endTime: "2026-10-04T00:03:00Z" }, value: { int64Value: "1" } }] }] }) };
+  };
+  const runner = measRunner(() => assert.fail("no gcloud"));
+  const result = await stepMeasMetrics(runner, { measInstance: MEAS, since: "2026-10-04T00:00:00Z",
+    until: "2026-10-04T13:00:00Z" }, { token: () => "test-token-value", fetchImpl });
+  assert.ok(requests.length >= 8);
+  for (const { url, init } of requests) {
+    const parsed = new URL(url);
+    assert.equal(parsed.origin + parsed.pathname, "https://monitoring.googleapis.com/v3/projects/tibotattle/timeSeries");
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers.authorization, "Bearer test-token-value");
+    const filter = parsed.searchParams.get("filter");
+    assert.ok(filter.includes(`resource.labels.job_name = "${MEAS_JOB}"`)
+      || filter.includes(`resource.labels.database_id = "tibotattle:${MEAS}"`), filter);
+    assert.equal(url.includes("test-token-value"), false);
+  }
+  const receipt = runner.receipts["meas-metrics.json"];
+  assert.equal(JSON.stringify(receipt).includes("test-token-value"), false);
+  const cpu = receipt.metrics.find(({ metric, aligner }) => metric === "job-cpu-utilization" && aligner === "ALIGN_MEAN");
+  assert.deepEqual([cpu.httpStatus, cpu.series[0].points, cpu.series[0].mean, cpu.series[0].max, cpu.series[0].first],
+    [200, 3, 0.5833, 1, "2026-10-04T00:01:00Z"]);
+  assert.deepEqual(cpu.series[0].resource, { job_name: MEAS_JOB, location: "us-east1" }, "only closed labels are kept");
+  assert.equal(receipt.metrics.find(({ metric }) => metric === "job-memory-utilization").httpStatus, 404);
+  assert.equal(result.metrics.length, requests.length);
+  for (const argv of [["meas-metrics", `--meas-instance=${MEAS}`], ["meas-metrics", `--meas-instance=${MEAS}`,
+    "--since=2026-10-04T00:00:00Z"], ["meas-metrics", `--meas-instance=${MEAS}`, "--since=yesterday",
+    "--until=2026-10-04T00:00:00Z"]]) {
+    await assert.rejects(main([...argv, "--dry-run", `--out=${join(tmpdir(), "fastpath-meas-args")}`]),
+      (error) => error?.code === "FASTPATH_DEPLOY_ARGUMENT_INVALID", argv.join(" "));
+  }
+  await assert.rejects(stepMeasMetrics(runner, { measInstance: MEAS, since: "2026-10-04T13:00:00Z",
+    until: "2026-10-04T00:00:00Z" }, { token: () => "t", fetchImpl }), (error) => error?.code === "MEAS_METRICS_WINDOW_INVALID");
+});

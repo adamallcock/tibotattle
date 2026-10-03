@@ -469,11 +469,14 @@ export async function sealFastpathRehearsalSource({ dumpPath, workDirectory }) {
  * `cloudFastpathTarget: true`, which the ingestion-journal importer accepts
  * in place of a local Unix-socket session solely for the fast-path Cloud SQL
  * target (scripts/gcp-fastpath-cloud-target.mjs); the local rehearsal never
- * passes it.
+ * passes it. `maxSourceTableRows` raises the T-1 copies' per-table bound
+ * (postgres-fastpath-identity-copy.mjs maxTableRows) for the production-shaped
+ * measurement corpus (scripts/gcp-fastpath-prod-shape) only; the rehearsal and
+ * the GCP seed leave it at the copies' default.
  */
 export async function loadFastpathRehearsalImporters({
   pool, schema, controlSchema, suffix, sealedSource, dumpPath, workDirectory, roster, timings = {},
-  cloudFastpathTarget = false,
+  cloudFastpathTarget = false, maxSourceTableRows = undefined,
 }) {
   if (typeof schema !== "string" || !schema.startsWith(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX)) {
     fail("REHEARSAL_TARGET_SCHEMA_INVALID");
@@ -486,6 +489,7 @@ export async function loadFastpathRehearsalImporters({
     steps.identityCopy = await timed(timings, "importer:t1-identity", async () => {
       const receipt = await runPostgresFastpathIdentityCopy({
         source: identitySource, pool, targetSchema: schema, publicSourceOwnerParity: "defer",
+        maxTableRows: maxSourceTableRows,
       });
       return {
         status: receipt.status,
@@ -519,6 +523,7 @@ export async function loadFastpathRehearsalImporters({
     steps.legacyTransport = await timed(timings, "importer:legacy-transport", async () =>
       transportReceipt(await runPostgresFastpathTransportCopy({
         source: identitySource, pool, targetSchema: schema, part: "legacy-transport",
+        maxTableRows: maxSourceTableRows,
       })));
 
     const v12Source = await createSealedSqliteV12RehearsalSource(sealedSource);
@@ -540,6 +545,7 @@ export async function loadFastpathRehearsalImporters({
     steps.v12EventSources = await timed(timings, "importer:v12-event-sources", async () =>
       transportReceipt(await runPostgresFastpathTransportCopy({
         source: identitySource, pool, targetSchema: schema, part: "v12-event-sources",
+        maxTableRows: maxSourceTableRows,
       })));
 
     const correctionSource = await createSealedSqliteUsageCorrectionSource(sealedSource);

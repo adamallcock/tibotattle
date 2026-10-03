@@ -184,6 +184,13 @@
  * when absent), and the first-run baseline it read (R19 `baseline`: firstRun
  * and frozenInterimRead, booleans).
  *
+ * Profiling (MEAS-SYNTH, analytics-refresh-profile.mjs): ANALYTICS_V2_REFRESH_PROFILE=cpu
+ * runs node:inspector's sampling profiler and writes a content-free summary
+ * line to stderr every ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS (default
+ * 30 min), at exit (complete, refused or failed) and on SIGTERM. A staging
+ * target and the test targets accept it; a production target refuses every
+ * ANALYTICS_V2_REFRESH_PROFILE* variable (ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN).
+ *
  * The TypeScript store and the A-1/A-2 modules are loaded through literal
  * dynamic imports, so esbuild bundles them into the dist entry while the
  * source file still answers --help under plain Node 22.
@@ -202,8 +209,10 @@ import {
   normalizeIamUser,
 } from "./cloud-sql.mjs";
 import {
+  FASTPATH_MEASUREMENT_CLOUD_TARGET,
   FASTPATH_TEST_CLOUD_TARGET,
   FASTPATH_TEST_SCHEMA_PREFIXES,
+  isFastpathMeasurementInstanceConnectionName,
   isFastpathTestSchema,
 } from "./origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
@@ -222,6 +231,12 @@ import {
   analyticsRefreshWorkerPoolMinimumBytes,
   createAnalyticsRefreshOwnerPool,
 } from "./analytics-refresh-pool.mjs";
+import {
+  ANALYTICS_REFRESH_PROFILE_PREFIX,
+  ANALYTICS_REFRESH_PROFILE_STAGING_ENV,
+  createAnalyticsRefreshProfiler,
+  readAnalyticsRefreshProfileSettings,
+} from "./analytics-refresh-profile.mjs";
 
 // The read side (K-SPLIT) and the compute workers (K-PAR): re-exported so
 // callers keep one import surface.
@@ -233,6 +248,12 @@ export {
   analyticsRefreshWorkerPoolMinimumBytes,
   createAnalyticsRefreshOwnerPool,
 } from "./analytics-refresh-pool.mjs";
+export {
+  ANALYTICS_REFRESH_PROFILE_ENV,
+  ANALYTICS_REFRESH_PROFILE_SCHEMA,
+  ANALYTICS_REFRESH_PROFILE_STAGING_ENV,
+  readAnalyticsRefreshProfileSettings,
+} from "./analytics-refresh-profile.mjs";
 export {
   ANALYTICS_REFRESH_STATEMENT_MODEL,
   analyticsRefreshServerStatementDelta,
@@ -380,8 +401,12 @@ const INSTANCE_CONNECTION_NAME =
 const DATABASE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/u;
 // A disposable rehearsal instance (postgres-production-migrations.mjs SCRATCH_INSTANCE_PATTERN).
 const SCRATCH_INSTANCE = /-rehearsal-[a-z0-9]{8}b?$/u;
-/** Tokens that mark a test or rehearsal resource; a production target refuses them. */
-const TEST_TOKENS = Object.freeze(["test", "rehearsal", "fastpath"]);
+/**
+ * Tokens that mark a test, rehearsal or measurement resource; a production
+ * target refuses them ("meas": the disposable measurement instances,
+ * FASTPATH_MEASUREMENT_CLOUD_TARGET).
+ */
+const TEST_TOKENS = Object.freeze(["test", "rehearsal", "fastpath", "meas"]);
 /** Schema prefixes of the test and rehearsal estates (refused under a production target). */
 const TEST_SCHEMA_PREFIXES = Object.freeze([
   ...FASTPATH_TEST_SCHEMA_PREFIXES,
@@ -642,6 +667,7 @@ function testTargetIdentities() {
     `${iam.postgres.iamUser}.gserviceaccount.com`,
     fastpath.instanceConnectionName, fastpath.database, fastpath.primarySchema,
     fastpath.iamUser, `${fastpath.iamUser}.gserviceaccount.com`, fastpath.refreshJob, fastpath.originService,
+    FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob,
   ]);
 }
 const TEST_TARGET_VALUES = testTargetIdentities();
@@ -702,7 +728,10 @@ function productionValue(env, name, pattern) {
  * with a closed code naming the setting and never its value:
  * - ANALYTICS_V2_REFRESH_TARGET_INVALID: a target other than production or staging;
  * - ANALYTICS_V2_TEST_CLOCK_FORBIDDEN: ANALYTICS_V2_TEST_CLOCK present (even empty);
- * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any production-forbidden variable of the job's policy or
+ * - ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN: any ANALYTICS_V2_REFRESH_PROFILE*
+ *   variable under a production target (a staging target accepts
+ *   ANALYTICS_REFRESH_PROFILE_STAGING_ENV and no other);
+ * - ANALYTICS_V2_REFRESH_ENV_FORBIDDEN: any production-forbidden variable or
  *   prefix, GOOGLE_APPLICATION_CREDENTIALS, a refused Node runtime variable
  *   (ANALYTICS_REFRESH_RUNTIME_FORBIDDEN), or any other variable in the closed
  *   namespaces (ANALYTICS_REFRESH_CLOSED_PREFIXES);
@@ -719,6 +748,12 @@ export async function readAnalyticsRefreshProductionTarget(env = {}) {
   if (Object.hasOwn(env, "ANALYTICS_V2_TEST_CLOCK")) fail("ANALYTICS_V2_TEST_CLOCK_FORBIDDEN");
   const policy = PRODUCTION_POLICY;
   const names = Object.keys(env);
+  // The opt-in profiler (analytics-refresh-profile.mjs): never in production;
+  // staging accepts its mode, sampling interval and summary period only.
+  const profileNames = names.filter((name) => name.startsWith(ANALYTICS_REFRESH_PROFILE_PREFIX)).sort();
+  if (target === "production" && profileNames.length > 0) {
+    fail("ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN", { field: profileNames[0] });
+  }
   for (const name of policy.forbiddenVariables) {
     if (Object.hasOwn(env, name)) fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
   }
@@ -734,7 +769,8 @@ export async function readAnalyticsRefreshProductionTarget(env = {}) {
   }
   for (const name of names.sort()) {
     if (ANALYTICS_REFRESH_CLOSED_PREFIXES.some((prefix) => name.startsWith(prefix))
-        && !ANALYTICS_REFRESH_PRODUCTION_ENV.includes(name)) {
+        && !ANALYTICS_REFRESH_PRODUCTION_ENV.includes(name)
+        && !(target === "staging" && ANALYTICS_REFRESH_PROFILE_STAGING_ENV.includes(name))) {
       fail("ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", { field: name });
     }
   }
@@ -768,6 +804,10 @@ export async function readAnalyticsRefreshProductionTarget(env = {}) {
     }
   }
   const instance = instanceConnectionName.split(":")[2];
+  if (isFastpathMeasurementInstanceConnectionName(instanceConnectionName)
+      || instance.startsWith(FASTPATH_MEASUREMENT_CLOUD_TARGET.instancePrefix)) {
+    fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN", { field: "PRIMARY_INSTANCE_CONNECTION_NAME" });
+  }
   if (SCRATCH_INSTANCE.test(instance)) fail("ANALYTICS_V2_REFRESH_TEST_TARGET_FORBIDDEN",
     { field: "PRIMARY_INSTANCE_CONNECTION_NAME" });
   if (TEST_SCHEMA_PREFIXES.some((prefix) => schema.startsWith(prefix))) {
@@ -925,8 +965,10 @@ async function privateSocketDirectory(directory) {
  * a Cloud Run Job may reach only the private test primary: the shared test
  * database, or, for the fast-path refresh Job alone, the disposable fast-path
  * database and only a pinned or seeded fast-path schema (`schema`, the parsed
- * --schema). Anywhere else only a loopback or private-socket PostgreSQL is
- * accepted.
+ * --schema); the measurement refresh Job alone
+ * (FASTPATH_MEASUREMENT_CLOUD_TARGET) reaches a disposable measurement
+ * instance's fast-path database, a seeded schema only. Anywhere else only a
+ * loopback or private-socket PostgreSQL is accepted.
  */
 export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {}) {
   const production = await readAnalyticsRefreshProductionTarget(env);
@@ -943,16 +985,26 @@ export async function resolveAnalyticsRefreshDatabase(env = {}, { schema } = {})
   if (typeof env.CLOUD_RUN_JOB === "string" && env.CLOUD_RUN_JOB.length > 0) {
     if (env.K_SERVICE !== undefined) fail("ANALYTICS_V2_REFRESH_CONTEXT_INVALID");
     const fastpath = env.CLOUD_RUN_JOB === FASTPATH_TEST_CLOUD_TARGET.refreshJob;
+    const measurement = env.CLOUD_RUN_JOB === FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob;
     const target = fastpath
       ? { instanceConnectionName: FASTPATH_TEST_CLOUD_TARGET.instanceConnectionName,
         database: FASTPATH_TEST_CLOUD_TARGET.database }
-      : CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
-    if (env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
+      : measurement
+        // The measurement Job: any measurement instance (by name), never another.
+        ? { instanceConnectionName: isFastpathMeasurementInstanceConnectionName(env.PRIMARY_INSTANCE_CONNECTION_NAME)
+          ? env.PRIMARY_INSTANCE_CONNECTION_NAME : null,
+        database: FASTPATH_MEASUREMENT_CLOUD_TARGET.database }
+        : CLOUD_RUN_IAM_TEST_TARGET.postgres.primary;
+    if (target.instanceConnectionName === null || env.PRIMARY_INSTANCE_CONNECTION_NAME !== target.instanceConnectionName
         || env.PRIMARY_DATABASE !== target.database) {
       fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
     }
     if (fastpath && !(isFastpathTestSchema(schema) && (schema === FASTPATH_TEST_CLOUD_TARGET.primarySchema
         || schema.startsWith(FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix)))) {
+      fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
+    }
+    if (measurement && !(isFastpathTestSchema(schema)
+        && schema.startsWith(FASTPATH_MEASUREMENT_CLOUD_TARGET.seededSchemaPrefix))) {
       fail("ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN");
     }
     let iamUser;
@@ -1390,7 +1442,8 @@ function refusalFigures(error) {
 /**
  * Run one refresh. dependencies (tests and the composition root only):
  * createPool(database, {connector}), createConnector(), closeResources(),
- * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, execArgv, peakRssBytes().
+ * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, execArgv, peakRssBytes(),
+ * createProfiler(options), writeProfileLine(line), profileSignals (false: no SIGTERM handler).
  * Returns the receipt; throws an error carrying a closed code and phase (and,
  * for a deadline or output-budget refusal, its content-free figures).
  */
@@ -1427,6 +1480,8 @@ export async function runAnalyticsRefresh({
   let discard = false;
   let receipt;
   let failure;
+  let profiler = null;
+  let onSignal = null;
   try {
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
@@ -1437,6 +1492,32 @@ export async function runAnalyticsRefresh({
         execArgv: dependencies.execArgv ?? (dependencies.heapLimitBytes === undefined ? process.execArgv : []) });
     const guard = createAnalyticsRefreshTimeGuard({ startedAtMs,
       taskTimeoutMs: analyticsRefreshTaskTimeoutMs(env, production), wallClock });
+    // The opt-in profiler starts before the first refusal that can follow, so
+    // a refused or failed run still leaves its exit summary.
+    const profileSettings = readAnalyticsRefreshProfileSettings(env, { target: production?.target ?? null });
+    if (profileSettings !== null) {
+      profiler = await (dependencies.createProfiler ?? createAnalyticsRefreshProfiler)({
+        settings: profileSettings,
+        phase: () => phase,
+        wallClock,
+        bundleUrls: [import.meta.url],
+        ...(dependencies.writeProfileLine === undefined ? {} : { write: dependencies.writeProfileLine }),
+      });
+      profiler.start();
+      if (dependencies.profileSignals !== false) {
+        // Cloud Run's task timeout and a cancel send SIGTERM: fold the last
+        // window, then end as the default handler would.
+        onSignal = () => {
+          process.off("SIGTERM", onSignal);
+          try { profiler.finishNow("signal"); } finally { process.kill(process.pid, "SIGTERM"); }
+        };
+        process.on("SIGTERM", onSignal);
+      }
+    }
+    const checkpoint = profiler === null ? guard.checkpoint : (event) => {
+      profiler.checkpoint(event);
+      guard.checkpoint(event);
+    };
     // A deadline that leaves no room for the write and the exit is refused
     // before any module, pool or lock.
     guard.checkpoint(Object.freeze({ kind: "start" }));
@@ -1521,7 +1602,7 @@ export async function runAnalyticsRefresh({
           state,
           revisionSeed: parsed.revisionSeed,
           resources,
-          checkpoint: guard.checkpoint,
+          checkpoint,
           // K-PAR-MEM: with compute Workers, owner loads run concurrently on
           // the snapshot read connections. The owner-scoped reads before
           // compute stay one at a time: three at once pushed a count past the
@@ -1538,7 +1619,7 @@ export async function runAnalyticsRefresh({
           mode: parsed.mode,
           nowMs,
           revisionSeed: parsed.revisionSeed,
-          ...(guard.active ? { checkpoint: guard.checkpoint } : {}),
+          ...(guard.active || profiler !== null ? { checkpoint } : {}),
           ...(ownerPool === undefined ? {} : { ownerPool }),
         });
         const statements = ledger.summary();
@@ -1662,6 +1743,11 @@ export async function runAnalyticsRefresh({
           phase: "cleanup",
         });
       }
+    }
+    if (profiler !== null) {
+      if (onSignal !== null) process.off("SIGTERM", onSignal);
+      // The exit summary precedes the receipt or error line main() writes.
+      await profiler.finish(failure === undefined ? "exit" : "exit-failed");
     }
   }
   mainHeap.stop();

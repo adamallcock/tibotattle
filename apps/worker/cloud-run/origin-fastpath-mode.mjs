@@ -53,6 +53,57 @@ export const FASTPATH_TEST_CLOUD_TARGET = Object.freeze({
   refreshJob: "tibotattle-fastpath-test-analytics-refresh",
 });
 
+/**
+ * The disposable production-tier measurement estate (MEAS-SYNTH, test
+ * project only): one Cloud SQL instance per measurement, named
+ * tibotattle-meas-prodtier-<YYYYMMDD>, created and deleted by
+ * scripts/gcp-fastpath-test-deploy.mjs (meas-create, meas-teardown), holding
+ * the same disposable database and seeded schemas as the fast-path test
+ * instance, read by its own refresh Job. That Job accepts no other instance
+ * and only a seeded schema, and a production or staging target naming any of
+ * these is refused (analytics-refresh.mjs). No origin serves it.
+ */
+export const FASTPATH_MEASUREMENT_CLOUD_TARGET = Object.freeze({
+  project: FASTPATH_TEST_CLOUD_TARGET.project,
+  region: "us-east1",
+  instancePrefix: "tibotattle-meas-prodtier-",
+  database: FASTPATH_TEST_CLOUD_TARGET.database,
+  seededSchemaPrefix: FASTPATH_TEST_CLOUD_TARGET.seededSchemaPrefix,
+  iamUser: FASTPATH_TEST_CLOUD_TARGET.iamUser,
+  refreshJob: "tibotattle-fastpath-meas-analytics-refresh",
+});
+const MEASUREMENT_INSTANCE = /^tibotattle-meas-prodtier-(\d{4})(\d{2})(\d{2})$/u;
+
+/**
+ * The measurement instance `name` and its connection name, or null unless
+ * `name` is tibotattle-meas-prodtier-<YYYYMMDD> with a real calendar date
+ * from 2026 on.
+ *
+ * @param {unknown} name
+ */
+export function fastpathMeasurementInstance(name) {
+  const match = typeof name === "string" ? MEASUREMENT_INSTANCE.exec(name) : null;
+  if (match === null) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (year < 2026 || date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    return null;
+  }
+  const target = FASTPATH_MEASUREMENT_CLOUD_TARGET;
+  return Object.freeze({ instance: name, instanceConnectionName: `${target.project}:${target.region}:${name}` });
+}
+
+/**
+ * True when `value` is a measurement instance's connection name.
+ *
+ * @param {unknown} value
+ */
+export function isFastpathMeasurementInstanceConnectionName(value) {
+  if (typeof value !== "string") return false;
+  const parts = value.split(":");
+  return parts.length === 3 && fastpathMeasurementInstance(parts[2])?.instanceConnectionName === value;
+}
+
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const ROUTE_MODULE_FIELDS = Object.freeze(["method", "pathname", "overridesBuiltIn", "handler"]);
 const EPOCH_MILLISECONDS = /^(?:0|[1-9][0-9]{0,15})$/u;

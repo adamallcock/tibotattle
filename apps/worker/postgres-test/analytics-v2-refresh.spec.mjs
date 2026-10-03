@@ -40,7 +40,7 @@ import {
 } from "./staged-migrations-harness.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
-import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+import { FASTPATH_MEASUREMENT_CLOUD_TARGET, FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
@@ -1969,6 +1969,30 @@ test("database targets: Cloud Run reaches only the private test primary; local n
   "another Job never reaches the fast-path database");
   await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...fastpath, POSTGRES_IAM_USER: "someone-else@tibotattle.iam" },
     { schema: "tibotattle_fastpath_20261001" }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" });
+
+  // The measurement refresh Job alone reaches a disposable measurement
+  // instance (tibotattle-meas-prodtier-<YYYYMMDD>), its fast-path database
+  // and a seeded schema only.
+  const seeded = "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d";
+  const measurement = { ...fastpath, CLOUD_RUN_JOB: FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob,
+    PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-meas-prodtier-20261003" };
+  assert.deepEqual({ ...await job.resolveAnalyticsRefreshDatabase(measurement, { schema: seeded }) }, {
+    kind: "cloud-sql", instanceConnectionName: "tibotattle:us-east1:tibotattle-meas-prodtier-20261003",
+    database: "tibotattle_fastpath", iamUser: "tibotattle-test-runtime@tibotattle.iam",
+  });
+  for (const schema of [undefined, "tibotattle_fastpath_20261001", "tibotattle_v12_a2_20260925", "public"]) {
+    await assert.rejects(job.resolveAnalyticsRefreshDatabase(measurement, { schema }),
+      { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, String(schema));
+  }
+  for (const change of [{ PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-test-primary-20260922" },
+    { PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-meas-prodtier-20261399" },
+    { PRIMARY_INSTANCE_CONNECTION_NAME: "tibotattle:us-east1:tibotattle-primary" },
+    { PRIMARY_DATABASE: "tibotattle" }, { POSTGRES_IAM_USER: "someone-else@tibotattle.iam" }]) {
+    await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...measurement, ...change }, { schema: seeded }),
+      { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, JSON.stringify(change));
+  }
+  await assert.rejects(job.resolveAnalyticsRefreshDatabase({ ...measurement, CLOUD_RUN_JOB: fastpath.CLOUD_RUN_JOB },
+    { schema: seeded }), { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" }, "the fast-path Job never reaches it");
 });
 
 // ---------------------------------------------------------------------------
@@ -4151,6 +4175,9 @@ test("production target: every other variable, test seam, test target and contex
     ["POSTGRES_IAM_USER", iam.postgres.iamUser],
     ["POSTGRES_IAM_USER", `${fastpath.iamUser}.gserviceaccount.com`],
     ["CLOUD_RUN_JOB", fastpath.refreshJob],
+    ["CLOUD_RUN_JOB", FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "tibotattle:us-east1:tibotattle-meas-prodtier-20261003"],
+    ["PRIMARY_INSTANCE_CONNECTION_NAME", "example-ops-prod1:us-east1:example-meas-primary"],
     ["CLOUD_RUN_JOB", "example-analytics-refresh-test"],
     ["CLOUD_RUN_JOB", "app-usagemonitor-production"],
   ]) {
@@ -4189,6 +4216,40 @@ test("production target: --schema, --now and --revision-seed are refused before 
       (error) => error.code === "ANALYTICS_V2_REFRESH_RESOURCES_INVALID"
         && error.field === "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS", value);
   }
+});
+
+test("production target: the CPU profiler is refused in production, accepted in staging and the test targets", async () => {
+  const profile = { ANALYTICS_V2_REFRESH_PROFILE: "cpu", ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: "5000",
+    ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS: "1800" };
+  for (const name of [...Object.keys(profile), "ANALYTICS_V2_REFRESH_PROFILE_DIR", "ANALYTICS_V2_REFRESH_PROFILE_X"]) {
+    for (const value of ["cpu", ""]) {
+      await refusedTarget(productionEnvironment("production", { [name]: value }), "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN",
+        name);
+    }
+  }
+  // Staging accepts the mode, the sampling interval and the summary period, nothing else.
+  const staging = productionEnvironment("staging", profile);
+  assert.equal((await job.readAnalyticsRefreshProductionTarget(staging)).target, "staging");
+  assert.deepEqual(job.readAnalyticsRefreshProfileSettings(staging, { target: "staging" }),
+    { mode: "cpu", sampleUs: 5_000, summaryMs: 1_800_000, directory: null });
+  for (const name of ["ANALYTICS_V2_REFRESH_PROFILE_DIR", "ANALYTICS_V2_REFRESH_PROFILE_X"]) {
+    await refusedTarget({ ...staging, [name]: "/tmp/x" }, "ANALYTICS_V2_REFRESH_ENV_FORBIDDEN", name);
+  }
+  // The measurement Job (a test target) accepts it; inside Cloud Run never a local directory.
+  const measurement = { ...profile, CLOUD_RUN_JOB: FASTPATH_MEASUREMENT_CLOUD_TARGET.refreshJob };
+  assert.equal(job.readAnalyticsRefreshProfileSettings(measurement).sampleUs, 5_000);
+  assert.throws(() => job.readAnalyticsRefreshProfileSettings({ ...measurement,
+    ANALYTICS_V2_REFRESH_PROFILE_DIR: "/tmp/x" }), { code: "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN" });
+  // A production run with the profiler is refused in configuration, before any profiler, pool or module.
+  let created = 0;
+  await assert.rejects(job.runAnalyticsRefresh({ argv: ["--mode=full"], env: productionEnvironment("production",
+    { ANALYTICS_V2_REFRESH_PROFILE: "cpu" }), dependencies: {
+    createProfiler: () => { created += 1; return {}; }, createPool: () => { created += 1; return {}; },
+    createConnector: () => { created += 1; return {}; },
+    modules: { get store() { created += 1; return {}; }, pipeline: {} } } }),
+  (error) => error.code === "ANALYTICS_V2_REFRESH_PROFILE_FORBIDDEN" && error.phase === "configuration"
+    && error.field === "ANALYTICS_V2_REFRESH_PROFILE");
+  assert.equal(created, 0);
 });
 
 test("time guard (K-PAR): remaining owners are spread over the workers, never faster than the largest alone", () => {
