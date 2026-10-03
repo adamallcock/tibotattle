@@ -346,8 +346,10 @@ test("the production-tier script's signal handling tears down at once and leaves
   const samplerFile = join(dir, "sampler-started");
   const own = `printf '%s\\n' $$ >> '${ownedFile}'; /bin/sleep 30 & printf '%s\\n' $! >> '${ownedFile}'; wait`;
   writeFileSync(join(dir, "owned.sh"), own);
+  writeFileSync(join(dir, "resistant.sh"), `trap '' TERM; ${own}`);
   const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0", "SAMPLER=0",
-    definition("child"), definition("tree"), definition("terminate"), definition("stop"),
+    definition("child").replace("CHILD=$!; wait", `CHILD=$!; print -r -- $CHILD >> '${ownedFile}'; wait`),
+    definition("tree"), definition("terminate"), definition("stop"),
     "teardown() { [[ $TORN == 1 ]] && return; TORN=1; printf 'teardown %.1f\\n' $(( EPOCHREALTIME - T0 )); }",
     `D() { /bin/sh "${join(dir, "owned.sh")}"; }`,
     "trap teardown EXIT", "trap stop INT TERM HUP",
@@ -367,6 +369,19 @@ test("the production-tier script's signal handling tears down at once and leaves
 ` +
     `  fi; print -r -- "$found"; }`;
   const finishingHarness = sampledHarness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`, "D() { /bin/sleep 0.5; }");
+  const rootResistantHarness = harness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`,
+    `D() { trap '' TERM; /bin/sh "${join(dir, "resistant.sh")}"; }`)
+    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr D x");
+  const descendantResistantHarness = rootResistantHarness.replace("D() { trap '' TERM;", "D() {");
+  const resistantCompletionHarness = finishingHarness.replace(
+    `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "owned.sh")}"; }`,
+    `pgstat() { touch '${samplerFile}'; child /dev/stdout /dev/stderr /bin/sh "${join(dir, "resistant.sh")}"; }`);
+  const captureFailureHarness = harness.replace("trap teardown EXIT", "pgrep() { return 2; }\ntrap teardown EXIT")
+    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr /bin/sleep 30");
+  const captureCompletionFailureHarness = finishingHarness
+    .replace(definition("sampler"), "sampler() { exec /bin/sleep 30; }")
+    .replace("SAMPLER=$!", `SAMPLER=$!; print -r -- $SAMPLER >> '${ownedFile}'`)
+    .replace("trap teardown EXIT", "pgrep() { return 2; }\ntrap teardown EXIT");
   const racingHarness = sampledHarness.replace("trap teardown EXIT", `${race}\ntrap teardown EXIT`);
   const ownedPids = () => existsSync(ownedFile) ? readFileSync(ownedFile, "utf8").trim().split(/\s+/u).map(Number) : [];
   const running = (pid) => {
@@ -376,23 +391,31 @@ test("the production-tier script's signal handling tears down at once and leaves
     return result.status === 0 && result.stdout.trim() !== "" && !result.stdout.trim().startsWith("Z");
   };
   const delay = () => new Promise((wake) => setTimeout(wake, 20));
+  const unrelated = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
+  const unrelatedExit = new Promise(resolveExit => unrelated.on("exit", resolveExit));
   try {
     for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
-      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness]]) {
+      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness],
+      ["SIGTERM", rootResistantHarness], ["SIGTERM", descendantResistantHarness], [null, resistantCompletionHarness],
+      ["SIGTERM", captureFailureHarness], [null, captureCompletionFailureHarness]]) {
       rmSync(ownedFile, { force: true });
       rmSync(samplerFile, { force: true });
       const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
       let output = "";
       shell.stdout.on("data", (chunk) => { output += chunk; });
       shell.stderr.on("data", (chunk) => { output += chunk; });
+      const closed = new Promise((resolveClose) => shell.on("close", resolveClose));
       const exited = new Promise((resolveExit) => shell.on("exit", (code) => resolveExit(code)));
       try {
+        assert.equal(running(unrelated.pid), true, "unrelated owned sentinel is visible");
         const started = Date.now();
-        while (ownedPids().length < 2 && Date.now() - started < 5_000) await delay();
-        assert.equal(ownedPids().length >= 2, true, "the exact owned step started");
+        const captureFailed = script === captureFailureHarness || script === captureCompletionFailureHarness;
+        const minimumPids = script === captureFailureHarness ? 1 : script === captureCompletionFailureHarness ? 2 : 3;
+        while (ownedPids().length < minimumPids && Date.now() - started < 5_000) await delay();
+        assert.equal(ownedPids().length >= minimumPids, true, "the exact owned step started");
         if (script === sampledHarness) {
-          while (ownedPids().length < 4 && Date.now() - started < 5_000) await delay();
-          assert.equal(ownedPids().length >= 4, true, "the exact owned sampler started");
+          while (ownedPids().length < 6 && Date.now() - started < 5_000) await delay();
+          assert.equal(ownedPids().length >= 6, true, "the exact owned sampler started");
         }
         // A refused ps read must fail this gate, never look like successful
         // cleanup. Prove visibility and group ownership while children live.
@@ -409,11 +432,18 @@ test("the production-tier script's signal handling tears down at once and leaves
           timer.unref();
         })]);
         assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
-        assert.equal(code, signal === null ? 0 : 130, signal);
-        assert.match(output, signal === null ? /^finished\nteardown \d+\.\d\n$/u : /^teardown \d+\.\d\n$/u,
+        assert.equal(code, script === captureCompletionFailureHarness ? 1 : signal === null ? 0 : 130, signal);
+        assert.match(output, captureFailed ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nteardown \d+\.\d\n$/u
+          : signal === null ? /^finished\nteardown \d+\.\d\n$/u : /^teardown \d+\.\d\n$/u,
           `${signal}: teardown ran with the expected step outcome`);
+        await Promise.race([closed, new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error("owned descendants retained output pipes")), 5_000);
+          timer.unref();
+        })]);
+        assert.ok(Date.now() - signalled < 5_000, "exit and held output pipes close within the existing teardown bound");
         await new Promise((wake) => setTimeout(wake, 300));
         assert.deepEqual(ownedPids().filter(running), [], `${signal} ${script === racingHarness ? "racing sampler" : script === sampledHarness ? "active sampler" : "step"}: no orphaned exact-owned step or sampler`);
+        assert.equal(running(unrelated.pid), true, "cleanup preserves an unrelated process group");
       } finally {
         // detached:true gives this one harness its own process group. Cleanup
         // targets only that exact group, including escaped descendants, never
@@ -422,7 +452,11 @@ test("the production-tier script's signal handling tears down at once and leaves
         await exited;
       }
     }
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    try { unrelated.kill("SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    await unrelatedExit;
+    rmSync(dir, { recursive: true, force: true });
+  }
 
 });
 

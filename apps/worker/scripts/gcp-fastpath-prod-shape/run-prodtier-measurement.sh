@@ -105,8 +105,9 @@
 # metrics read included) runs as a background child the shell waits on,
 # because zsh runs an INT/TERM/HUP trap only once a FOREGROUND child exits
 # (up to the 48 h cap) but interrupts `wait` at once. The trap
-# signals the child and all its descendants (node and the gcloud it runs)
-# and exits, and the EXIT trap tears down at once. Only the child's output is
+# freezes and forcibly cancels the owned child tree (node and its gcloud)
+# without a grace/resume window or blocking wait, then exits; the EXIT trap
+# performs authoritative remote teardown at once. Only the child's output is
 # redirected, so the teardown's lines reach this script's log. SIGKILL (and a
 # host crash or sleep) cannot be trapped: then run, by hand, from apps/worker,
 #   $NODE26 scripts/gcp-fastpath-test-deploy.mjs meas-teardown \
@@ -179,21 +180,35 @@ child() {
 # A frozen parent cannot create new descendants while we freeze the subtree.
 tree() {
   kill -STOP $1 2>/dev/null || return
-  local p
+  local p children rc
   print -r -- $1
-  for p in $(pgrep -P $1 2>/dev/null); do tree $p; done
+  children=$(pgrep -P $1 2>/dev/null); rc=$?
+  # pgrep's 1 means no children; other failures cannot prove a complete tree.
+  (( rc <= 1 )) || return 2
+  for p in $=children; do tree $p || return 2; done
 }
 terminate() {
-  local root=$1
+  local root=$1 captured position
   local -a pids
-  pids=($(tree $root))
-  (( ${#pids} )) || return 0
-  # TERM stays pending while stopped; CONT lets each owned process handle it.
-  # Reap the direct child before forgetting its PID, including normal sampler
-  # shutdown after an execution. No command-pattern or global process signals.
-  kill -TERM $pids 2>/dev/null
-  kill -CONT $pids 2>/dev/null
-  wait $root 2>/dev/null
+  pids=($(tree $root)); captured=$?
+  # These disposable local drivers are forcibly cancelled while STILL frozen.
+  # Resuming for grace would reopen spawning, and waiting on a TERM-resistant
+  # child would block the authoritative EXIT meas-teardown indefinitely.
+  # Frozen PIDs retain their identity; kill descendants before their parents,
+  # with no delayed resignal after unfreezing and no shared process-group kill.
+  if (( ${#pids} )); then
+    kill -TERM $pids 2>/dev/null
+    for (( position=${#pids}; position>0; position-- )); do
+      kill -KILL $pids[$position] 2>/dev/null
+    done
+  fi
+  # Even a partial capture disposes every already-frozen PID. Report failure
+  # rather than claiming all descendants were discovered; EXIT still tears
+  # down the remote measurement resources. Normal completion must fail too.
+  if (( captured )); then
+    print -u2 -- 'MEAS_LOCAL_PROCESS_CAPTURE_FAILED'
+    return 1
+  fi
   return 0
 }
 stop() { (( SAMPLER )) && terminate $SAMPLER; SAMPLER=0
@@ -222,7 +237,8 @@ sampled() {
   sampler "$label" &
   SAMPLER=$!
   child "$@"; local rc=$?
-  (( SAMPLER )) && terminate $SAMPLER; SAMPLER=0
+  if (( SAMPLER )); then terminate $SAMPLER || rc=1; fi
+  SAMPLER=0
   return $rc
 }
 # The Cloud Monitoring read for one run: the execution's window from its
