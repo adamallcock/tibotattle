@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   CUTOVER_REVISION_FLOOR_FILE,
   CUTOVER_REVISION_FLOOR_SCHEMA,
+  REVISION_FLOOR_DRESS_REHEARSAL_SWITCH,
   REVISION_FLOOR_MAX_DAYS,
   REVISION_FLOOR_TABLES,
   RevisionFloorError,
@@ -42,6 +43,7 @@ import { writeAnalyticsSourceFixture, SYNTHETIC_ANALYTICS_DATABASE_NAME } from "
 import { SYNTHETIC_ACCOUNT_ID, SYNTHETIC_BOOKMARKS, SYNTHETIC_D1 } from "../postgres-test/fixtures/w2-seal/fence-fixtures.mjs";
 import { headCommit, outputPathsOf, prepareSealWorld, sealWorld, writeFakeWranglerCli } from "../postgres-test/fixtures/w2-seal/seal-harness.mjs";
 import { createFakeCutoverTransport, privateDirectory } from "../postgres-test/fixtures/w2-seal/synthetic-sources.mjs";
+import { OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR } from "./postgres-transfer-coverage.mjs";
 
 // REV-SEED (owner decisions round 14): the revision-floor capture over a
 // synthetic W2-SEAL seal, its EP-8 fence fixture and a synthetic analytics D1
@@ -454,10 +456,58 @@ test("the dress rehearsal's synthetic floor: each frozen day at its frozen revis
     ownerDirectory: out }), isCode("CUTOVER_OUTPUT_EXISTS"));
   await assert.rejects(writeSyntheticRevisionFloor({ manifestPath: seal.manifestPath, sealId: seal.sealId, frozenDays: [],
     ownerDirectory: await privateDirectory("rev-seed-synthetic-empty-") }), isCode("REVISION_FLOOR_EMPTY"));
-  const checked = await checkRevisionFloor({ floorPath: result.path, floorSha256: result.floorSha256,
-    manifestPath: seal.manifestPath, sealId: seal.sealId });
+  const checkArgs = { floorPath: result.path, floorSha256: result.floorSha256, manifestPath: seal.manifestPath,
+    sealId: seal.sealId, fenceReceiptPath: world.fence.path };
+  // Like P16, the offline check admits a synthetic floor only under the dress-rehearsal declaration.
+  await assert.rejects(checkRevisionFloor(checkArgs), isCode("REVISION_FLOOR_PROVENANCE_REFUSED"));
+  const checked = await checkRevisionFloor({ ...checkArgs, syntheticAdmitted: true });
   assert.equal(checked.mode, "check");
   assert.equal(checked.provenance, "synthetic");
+  assert.equal(checked.fenceBound, false);
+});
+
+test("the offline check holds the floor to the fence exactly as P16 does (R19 (b))", async () => {
+  const fenced = { idSha256: sha256Hex(`d1:${SYNTHETIC_D1.analytics}`), bookmark: SYNTHETIC_BOOKMARKS.analytics };
+  const out = await privateDirectory("rev-seed-offline-check-");
+  const written = await capture({ ownerDirectory: out });
+  const capturedPath = join(out, CUTOVER_REVISION_FLOOR_FILE);
+  const args = { manifestPath: seal.manifestPath, sealId: seal.sealId, fenceReceiptPath: world.fence.path };
+  assert.deepEqual(await checkRevisionFloor({ ...args, floorPath: capturedPath, floorSha256: written.floorSha256 }),
+    { mode: "check", provenance: "captured", floorSha256: written.floorSha256, sealId: seal.sealId, dayCount: 4,
+      maxRevision: 7, firstDay: "2026-09-27", lastDay: "2026-09-30", fenceBound: true });
+  // A floor bound to this seal whose capture block names another bookmark (a
+  // capture outside this fence) or another D1: the seal binding alone passed
+  // it before; now the offline check refuses it with P16's code.
+  const captured = await readRevisionFloorFile({ path: capturedPath, expectedSha256: written.floorSha256 });
+  const directoryOf = await privateDirectory("rev-seed-offline-foreign-");
+  const script = join(WORKER_ROOT, "scripts", "cutover-revision-floor.mjs");
+  for (const [label, captureBlock] of [["another bookmark", { ...captured.capture, analyticsBookmarkSha256: sha256Hex(DRIFTED) }],
+    ["another D1", { ...captured.capture, analyticsDatabaseIdSha256: sha256Hex(`d1:${SYNTHETIC_D1["catchup-control"]}`) }]]) {
+    const { text, floorSha256 } = renderRevisionFloorFile(body(EXPECTED_DAYS, { provenance: "captured", capture: captureBlock }));
+    const path = join(directoryOf, `floor-${randomUUID()}.json`);
+    await writeFile(path, text, { mode: 0o400, flag: "wx" });
+    const floor = await readRevisionFloorFile({ path, expectedSha256: floorSha256 });
+    assert.equal(assertRevisionFloorBinding(floor, revisionFloorSealFacts(sealed)), floor, `${label}: bound to the seal`);
+    assert.throws(() => assertRevisionFloorProvenance(floor, { fencedAnalytics: fenced, syntheticAdmitted: false }),
+      isCode("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH"), `${label}: P16's rule`);
+    await assert.rejects(checkRevisionFloor({ ...args, floorPath: path, floorSha256 }),
+      isCode("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH"), label);
+    assert.throws(() => execFileSync(process.execPath, [script, "check", "--floor", path, "--sha256", floorSha256,
+      "--seal", seal.manifestPath, "--seal-id", seal.sealId, "--fence-receipt", world.fence.path],
+    { stdio: ["ignore", "pipe", "pipe"] }), error => error.status === 1
+      && error.stderr.toString().trim() === "REVISION_FLOOR_CAPTURE_FENCE_MISMATCH" && error.stdout.length === 0, label);
+  }
+  // The dress-rehearsal declaration refuses a captured floor; the receipt is read at the seal's pin.
+  await assert.rejects(checkRevisionFloor({ ...args, floorPath: capturedPath, floorSha256: written.floorSha256,
+    syntheticAdmitted: true }), isCode("REVISION_FLOOR_PROVENANCE_REFUSED"));
+  await assert.rejects(checkRevisionFloor({ ...args, fenceReceiptPath: world.proof.path, floorPath: capturedPath,
+    floorSha256: written.floorSha256 }), isCode("CUTOVER_FENCE_RECEIPT_INVALID"));
+  for (const options of [{ fenceReceiptPath: undefined }, { fenceReceiptPath: "" }, { syntheticAdmitted: "yes" }]) {
+    await assert.rejects(checkRevisionFloor({ ...args, floorPath: capturedPath, floorSha256: written.floorSha256, ...options }),
+      isCode("REVISION_FLOOR_USAGE"), JSON.stringify(options));
+  }
+  // The switch is PT-8-lite's owner flag.
+  assert.equal(REVISION_FLOOR_DRESS_REHEARSAL_SWITCH, `--${OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR}`);
 });
 
 test("the CLI: a content-free dry run, an offline check, and closed flags", async () => {
@@ -469,12 +519,19 @@ test("the CLI: a content-free dry run, an offline check, and closed flags", asyn
     analyticsDatabaseIdSha256: sha256Hex(`d1:${SYNTHETIC_D1.analytics}`), statementSha256: CUTOVER_REVISION_FLOOR_STATEMENT_SHA256 });
   const out = await privateDirectory("rev-seed-cli-check-");
   const written = await capture({ ownerDirectory: out });
-  const checked = execFileSync(process.execPath, [script, "check", "--floor", join(out, CUTOVER_REVISION_FLOOR_FILE),
-    "--sha256", written.floorSha256, "--seal", seal.manifestPath, "--seal-id", seal.sealId], { encoding: "utf8" });
+  const checkArgv = ["check", "--floor", join(out, CUTOVER_REVISION_FLOOR_FILE), "--sha256", written.floorSha256,
+    "--seal", seal.manifestPath, "--seal-id", seal.sealId, "--fence-receipt", world.fence.path];
+  const checked = execFileSync(process.execPath, [script, ...checkArgv], { encoding: "utf8" });
   assert.deepEqual(JSON.parse(checked), { command: "check", mode: "check", provenance: "captured",
-    floorSha256: written.floorSha256, dayCount: 4, maxRevision: 7, firstDay: "2026-09-27", lastDay: "2026-09-30" });
+    floorSha256: written.floorSha256, dayCount: 4, maxRevision: 7, firstDay: "2026-09-27", lastDay: "2026-09-30",
+    fenceBound: true });
+  assert.equal(parseRevisionFloorArguments([...checkArgv, REVISION_FLOOR_DRESS_REHEARSAL_SWITCH]).syntheticAdmitted, true);
+  assert.equal(parseRevisionFloorArguments(checkArgv).syntheticAdmitted, undefined);
   for (const bad of [[], ["seal"], ["capture", "--inventory"], [...args, "--execute", "--execute"],
-    ["check", "--floor", "x", "--sha256", "y", "--seal", "z"]]) {
+    ["check", "--floor", "x", "--sha256", "y", "--seal", "z"],
+    // The fence receipt is required, and the switch is not a value flag.
+    checkArgv.slice(0, -2), [...checkArgv, REVISION_FLOOR_DRESS_REHEARSAL_SWITCH, REVISION_FLOOR_DRESS_REHEARSAL_SWITCH],
+    [...args, REVISION_FLOOR_DRESS_REHEARSAL_SWITCH]]) {
     assert.throws(() => parseRevisionFloorArguments(bad), isCode("REVISION_FLOOR_USAGE"), JSON.stringify(bad));
   }
   assert.throws(() => execFileSync(process.execPath, [script, "capture", "--seal-id", "x"], { stdio: ["ignore", "pipe", "pipe"] }),

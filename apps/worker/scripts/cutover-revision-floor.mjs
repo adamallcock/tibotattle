@@ -34,7 +34,17 @@
 //              each frozen day at its frozen revision. Same file format,
 //              provenance 'synthetic' and no capture block.
 //   check      Offline: validate a floor file at its pinned sha256 against
-//              the seal it must be bound to. Writes nothing.
+//              the seal it must be bound to and, through --fence-receipt (the
+//              EP-8 verify receipt, read at the seal's pin), against the fence
+//              exactly as preflight P16 does (checkRevisionFloorProvenance):
+//              a captured floor whose capture block names another D1 or
+//              bookmark is REVISION_FLOOR_CAPTURE_FENCE_MISMATCH, and a
+//              synthetic floor is admitted only with the switch
+//              --dress-rehearsal-synthetic-revision-floor (PT-8-lite's owner
+//              flag of the same name), which a captured floor refuses
+//              (REVISION_FLOOR_PROVENANCE_REFUSED). R19 hardening (b): an
+//              offline check no longer passes a floor that P16 refuses on
+//              the fence. Writes nothing.
 //
 // The production import (P16 and the 'analytics-community-history' stage)
 // also holds the floor to the fence: checkRevisionFloorProvenance reads the
@@ -573,12 +583,32 @@ export async function writeSyntheticRevisionFloor({ manifestPath, sealId, frozen
     maxRevision: Math.max(...days.map(([, revision]) => revision)) });
 }
 
-/** Offline: the floor file at its pin, bound to the seal. Writes nothing. */
-export async function checkRevisionFloor({ floorPath, floorSha256, manifestPath, sealId } = {}) {
+/**
+ * The check's dress-rehearsal switch: PT-8-lite's owner flag
+ * 'dress-rehearsal-synthetic-revision-floor' (postgres-transfer-coverage.mjs
+ * OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR; the check pins them
+ * equal) as a CLI switch.
+ */
+export const REVISION_FLOOR_DRESS_REHEARSAL_SWITCH = "--dress-rehearsal-synthetic-revision-floor";
+
+/**
+ * Offline: the floor file at its pin, bound to the seal, and held to the
+ * fence receipt the seal pins exactly as P16 holds it
+ * (checkRevisionFloorProvenance). `syntheticAdmitted` is the dress
+ * rehearsal's declaration. Writes nothing.
+ */
+export async function checkRevisionFloor({ floorPath, floorSha256, manifestPath, sealId, fenceReceiptPath,
+  syntheticAdmitted = false } = {}) {
+  if (typeof fenceReceiptPath !== "string" || fenceReceiptPath.length === 0 || typeof syntheticAdmitted !== "boolean") {
+    floorFail("REVISION_FLOOR_USAGE");
+  }
   const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
+  const facts = revisionFloorSealFacts(seal);
   const floor = assertRevisionFloorBinding(await readRevisionFloorFile({ path: floorPath, expectedSha256: floorSha256 }),
-    revisionFloorSealFacts(seal));
-  return Object.freeze({ mode: "check", ...revisionFloorSummary(floor) });
+    facts);
+  const provenance = await checkRevisionFloorProvenance({ floor, fenceReceiptPath,
+    fenceReceiptSha256: facts.fenceReceiptSha256, syntheticAdmitted });
+  return Object.freeze({ mode: "check", ...revisionFloorSummary(floor), fenceBound: provenance.fenceBound });
 }
 
 // ---------------------------------------------------------------------------
@@ -597,8 +627,9 @@ const COMMANDS = Object.freeze({
     switches: {},
   },
   check: {
-    values: { "--floor": "floorPath", "--sha256": "floorSha256", "--seal": "manifestPath", "--seal-id": "sealId" },
-    switches: {},
+    values: { "--floor": "floorPath", "--sha256": "floorSha256", "--seal": "manifestPath", "--seal-id": "sealId",
+      "--fence-receipt": "fenceReceiptPath" },
+    switches: { [REVISION_FLOOR_DRESS_REHEARSAL_SWITCH]: "syntheticAdmitted" },
   },
 });
 
@@ -648,7 +679,8 @@ async function main(argv) {
       frozenDays: prepared.frozen.days, ownerDirectory: resolve(options.ownerDirectory) });
   } else {
     result = await checkRevisionFloor({ floorPath: resolve(options.floorPath), floorSha256: options.floorSha256,
-      manifestPath: resolve(options.manifestPath), sealId: options.sealId });
+      manifestPath: resolve(options.manifestPath), sealId: options.sealId,
+      fenceReceiptPath: resolve(options.fenceReceiptPath), syntheticAdmitted: options.syntheticAdmitted === true });
   }
   const { path: _path, sealId: _sealId, ...printable } = result;
   process.stdout.write(`${JSON.stringify({ command: options.command, ...printable })}\n`);

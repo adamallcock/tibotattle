@@ -9,6 +9,7 @@ import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  CUTOVER_ANALYTICS_BOOKMARK_ROLE,
   canonicalJson,
   runCutoverSeal,
   sha256File,
@@ -32,6 +33,17 @@ import {
   removePrivateDirectories,
   syntheticTombstoneDigests,
 } from "./synthetic-sources.mjs";
+import { writeAnalyticsSourceFixture } from "./admin-history-fixtures.mjs";
+
+/**
+ * The bookmarks verify-unchanged reads through the injected fake transport:
+ * the sealed sources' and, under the bookmark-only role, the analytics D1's
+ * fenced pin (R19 hardening (c)).
+ */
+export const SYNTHETIC_UNCHANGED_BOOKMARKS = Object.freeze({
+  ...SYNTHETIC_BOOKMARKS,
+  [CUTOVER_ANALYTICS_BOOKMARK_ROLE]: SYNTHETIC_BOOKMARKS.analytics,
+});
 
 export function headCommit(cwd) {
   return execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -46,6 +58,9 @@ export async function prepareSealWorld({ commit, nowMs = Date.now(), ingestion =
   const inventory = await writeInventoryFixture({ directory: work, commit });
   const fence = await writeFenceReceiptFixture({ directory: work });
   const proof = await writeBarrierProofFixture({ directory: work });
+  // The owner's 0600 analytics source file naming the fenced analytics D1
+  // (verify-unchanged's bookmark bracket, the floor capture, the admin history export).
+  const analyticsSource = await writeAnalyticsSourceFixture({ directory: work });
   return {
     work,
     commit,
@@ -56,6 +71,7 @@ export async function prepareSealWorld({ commit, nowMs = Date.now(), ingestion =
     inventory,
     fence,
     proof,
+    analyticsSource,
     remotePaths: { ingestion: sources.path, "deletion-ledger": ledger.path },
     exportPaths: {
       [SYNTHETIC_DATABASE_NAMES.ingestion]: sources.path,
@@ -152,6 +168,8 @@ export async function writeFakeWranglerCli(directory) {
 function roleOfConfig(configPath) {
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   const databaseId = config.d1_databases?.[0]?.database_id;
+  // The analytics D1 (never sealed) answers under its fence label.
+  if (databaseId === SYNTHETIC_D1.analytics) return "analytics";
   const role = Object.keys(SYNTHETIC_DATABASE_NAMES).find(candidate => SYNTHETIC_D1[candidate] === databaseId);
   if (role === undefined) throw new Error("W2_SEAL_FIXTURE_UNKNOWN_DATABASE");
   return role;
@@ -161,7 +179,7 @@ function roleOfConfig(configPath) {
  * The injected spawn behind the DEFAULT Wrangler transport and export (no
  * provider is contacted): `d1 time-travel info <name> --json --config <c>`
  * answers {bookmark} from `bookmarks` (a value, or a function of that role's
- * call number); the query launcher's `d1 execute` runs the frozen SQL file
+ * call number; the analytics D1 answers as `analytics`); the query launcher's `d1 execute` runs the frozen SQL file
  * (its sha256 checked as the preload does) on the role's synthetic file and
  * answers Wrangler's JSON envelope; `d1 export` is createFakeWranglerSpawn.
  * Each call records its kind, role and the pinned config's mode.

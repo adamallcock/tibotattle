@@ -82,7 +82,7 @@ export const CUTOVER_SOURCE_ROLES = Object.freeze(Object.keys(CUTOVER_SEALABLE_S
 export const CUTOVER_LEDGER_TABLES = Object.freeze(["d1_migrations", "d1_storage_migrations"]);
 
 /**
- * REV-SEED (owner decisions round 14): the one NON-sealable read role. Its
+ * REV-SEED (owner decisions round 14): a NON-sealable read role. Its
  * source is the production analytics D1, which is never sealed, and the
  * guarded transport admits exactly one statement against it, pinned by its
  * sha256 (any other SQL is CUTOVER_FLOOR_STATEMENT_REFUSED, after the
@@ -104,9 +104,21 @@ export const CUTOVER_REVISION_FLOOR_STATEMENT = "SELECT day,MAX(revision) AS rev
   + `GROUP BY day ORDER BY day LIMIT ${CUTOVER_REVISION_FLOOR_MAX_DAYS + 1}`;
 export const CUTOVER_REVISION_FLOOR_STATEMENT_SHA256 = createHash("sha256")
   .update(CUTOVER_REVISION_FLOOR_STATEMENT).digest("hex");
-/** The non-sealable read roles and the one statement sha256 each admits. */
+/**
+ * R19 hardening (c): the second NON-sealable read role, over the same
+ * production analytics D1. verify-unchanged (cutover-source-fence.mjs) reads
+ * its time-travel bookmark through this role before and after the sealed
+ * sources, so a Cloudflare publication after the revision floor's capture
+ * refuses the flip evidence (CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE). It reads
+ * bookmarks only: the guarded transport admits NO statement on it
+ * (CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED, after the SELECT-only rule). The
+ * inventory never names it either.
+ */
+export const CUTOVER_ANALYTICS_BOOKMARK_ROLE = "analytics-bookmark";
+/** The non-sealable read roles and the one statement sha256 each admits (null: none). */
 const CUTOVER_PINNED_READ_ROLES = Object.freeze({
   [CUTOVER_ANALYTICS_FLOOR_ROLE]: CUTOVER_REVISION_FLOOR_STATEMENT_SHA256,
+  [CUTOVER_ANALYTICS_BOOKMARK_ROLE]: null,
 });
 
 // Ledger layouts. "fresh-chain" (the default when a source names no layout)
@@ -153,8 +165,10 @@ const STORAGE_LEDGER_SQL = "CREATE TABLE d1_storage_migrations (name TEXT PRIMAR
 
 export const CUTOVER_ERROR_CODES = Object.freeze([
   "CUTOVER_AGGREGATE_MISMATCH",
+  "CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE",
   "CUTOVER_ARGUMENT_INVALID",
   "CUTOVER_BARRIER_PROOF_INVALID",
+  "CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED",
   "CUTOVER_ERASED_PARTICIPANT_PRESENT",
   "CUTOVER_EXPECTED_LEDGER_INVALID",
   "CUTOVER_EXPORT_FAILED",
@@ -889,11 +903,13 @@ export function assertSelectOnly(sql) {
 }
 
 /**
- * A pinned read role (CUTOVER_ANALYTICS_FLOOR_ROLE) admits exactly its one
- * statement; any other role is unaffected here.
+ * A pinned read role admits exactly its one statement
+ * (CUTOVER_ANALYTICS_FLOOR_ROLE) or none (CUTOVER_ANALYTICS_BOOKMARK_ROLE);
+ * any other role is unaffected here.
  */
 export function assertPinnedRoleStatement(role, sql) {
   if (!Object.hasOwn(CUTOVER_PINNED_READ_ROLES, role)) return sql;
+  if (CUTOVER_PINNED_READ_ROLES[role] === null) fail("CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED");
   if (typeof sql !== "string" || sha256Hex(sql) !== CUTOVER_PINNED_READ_ROLES[role]) {
     fail("CUTOVER_FLOOR_STATEMENT_REFUSED");
   }

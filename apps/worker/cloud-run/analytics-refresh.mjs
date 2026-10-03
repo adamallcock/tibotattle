@@ -57,6 +57,13 @@
  * production target refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT, in the read
  * snapshot before any read or compute and writing nothing, when no floor is
  * loaded; a staging target or a test target treats an absent floor as 0.
+ * Before that check, a production FIRST run (no completed run row, or no
+ * recorded journal cursor) refuses ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT
+ * the same way when NEITHER the frozen interim read (C-IPR's row) NOR the
+ * revision floor is loaded: a first run must start from some record of
+ * Cloudflare's published history (R19 hardening (d), in addition to the H.4
+ * flip gate's CUTOVER_INTERIM_READ_NOT_LOADED). Staging and test targets,
+ * with or without a synthetic floor, are not gated.
  * The environment is closed
  * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
  * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
@@ -162,7 +169,8 @@
  * row records the digest of the exclusions applied, and a run that finds
  * them changed republishes every published day), and the revision floor it
  * read (REV-SEED `revisionFloor`: present, dayCount and maxRevision; 0 and 0
- * when absent).
+ * when absent), and the first-run baseline it read (R19 `baseline`: firstRun
+ * and frozenInterimRead, booleans).
  *
  * The TypeScript store and the A-1/A-2 modules are loaded through literal
  * dynamic imports, so esbuild bundles them into the dist entry while the
@@ -425,7 +433,9 @@ POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
 --revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
 --mode=full (the dense profile, inline, 4 h task timeout). A production target
 refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT until the cutover import has loaded
-the revision floor.
+the revision floor, and a production first run refuses
+ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT when neither the frozen interim read
+nor the revision floor is loaded.
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
@@ -1083,6 +1093,38 @@ function exclusionSummary(value) {
     changed: value.changed, republishedDays: value.republishedDays });
 }
 
+/** R19 hardening (d): the closed refusal of a production first run without any Cloudflare baseline. */
+export const ANALYTICS_REFRESH_FIRST_RUN_REFUSAL = "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT";
+
+/**
+ * The receipt's content-free baseline facts (R19 hardening (d)): whether this
+ * is a first run and whether the frozen interim read is loaded. Anything but
+ * the store's booleans reads as a first run without the frozen read, so the
+ * production gate fails closed.
+ */
+export function analyticsRefreshBaseline(state) {
+  return Object.freeze({
+    firstRun: state?.firstRun !== false,
+    frozenInterimRead: state?.frozenInterimRead === true,
+  });
+}
+
+/**
+ * The read-snapshot gates of a production target, in order (null when it may
+ * run): a first run with neither the frozen interim read nor the revision
+ * floor is ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT; any run without the floor
+ * is ANALYTICS_V2_REVISION_FLOOR_ABSENT. Staging and test targets are never
+ * gated here.
+ */
+export function analyticsRefreshBaselineRefusal({ target, baseline, revisionFloor }) {
+  if (target !== "production") return null;
+  if (baseline?.firstRun !== false && baseline?.frozenInterimRead !== true && revisionFloor?.present !== true) {
+    return ANALYTICS_REFRESH_FIRST_RUN_REFUSAL;
+  }
+  if (revisionFloor?.present !== true) return "ANALYTICS_V2_REVISION_FLOOR_ABSENT";
+  return null;
+}
+
 /**
  * The receipt's content-free revision floor (REV-SEED): whether the cutover's
  * floor is loaded, its day count and its largest revision. Anything but the
@@ -1280,13 +1322,16 @@ export async function runAnalyticsRefresh({
       const state = await store.readAnalyticsV2RefreshState(client, { schema: parsed.schema });
       // REV-SEED: a production run publishes only above Cloudflare's last
       // revisions, so it refuses before any read or compute without the
-      // floor the cutover import loads. Staging and test targets publish
-      // above whatever floor is stored, none being 0.
+      // floor the cutover import loads. R19 (d): a production first run also
+      // needs the frozen interim read or the floor, and refuses first when it
+      // has neither. Staging and test targets publish above whatever floor is
+      // stored, none being 0.
       const revisionFloor = revisionFloorSummary(state?.revisionFloor);
       base.revisionFloor = revisionFloor;
-      if (production?.target === "production" && !revisionFloor.present) {
-        fail("ANALYTICS_V2_REVISION_FLOOR_ABSENT");
-      }
+      const baseline = analyticsRefreshBaseline(state);
+      base.baseline = baseline;
+      const baselineRefusal = analyticsRefreshBaselineRefusal({ target: production?.target, baseline, revisionFloor });
+      if (baselineRefusal !== null) fail(baselineRefusal);
       // K-PERCARD: prove the transitions from older stored kernels to this
       // one over their stored price inputs, in the read snapshot; the write
       // re-checks the proof and records it.
