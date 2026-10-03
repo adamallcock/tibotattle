@@ -850,6 +850,8 @@ test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health f
     const { server, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
       "import * as real from \"/cloud-run/postgres-production-registry.mjs\";",
       "export const ADMIN_HOST_ROUTE_IDS = real.ADMIN_HOST_ROUTE_IDS;",
+      // The round-16 boot refusal (assertIdentityLinkRotationComposable) reads it too.
+      "export const assertIdentityLinkConsumersRetired = real.assertIdentityLinkConsumersRetired;",
       "export function createProductionRouteRegistry(options) {",
       "  const registry = real.createProductionRouteRegistry(options);",
       "  return Object.freeze({ ...registry, resolve(id) {",

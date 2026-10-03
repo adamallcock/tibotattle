@@ -26,13 +26,14 @@
 //   target-check      Read-only, before the fence: contract, PostgreSQL 17,
 //                     migration tail, empty target, transfer-login memberships,
 //                     trigger-policy coverage, the frozen-read table.
-//   preflight         Read-only: P1-P14 (seal, fence binding, coverage,
+//   preflight         Read-only: P1-P15 (seal, fence binding, coverage,
 //                     correction runtime, erasure quiescence, the deletion-
 //                     digest exclusion count, bootstrap, identity pin bound
 //                     to the sealed row and to the committed production
 //                     desired state's mount, controls, target, scheduler
 //                     pause, the OWN-4 export, the pending-object guard,
-//                     Sparkle nonces). GO writes preflight.json (0400);
+//                     Sparkle nonces, the analytics D1 admin history export
+//                     bound to this seal). GO writes preflight.json (0400);
 //                     NO-GO writes nothing.
 //   run               PROTECTED. Re-proves P10's memberships and P11's
 //                     scheduler pause, then R1 open/begin, R2 every stage of
@@ -147,6 +148,7 @@ import {
 } from "../cloud-run/postgres-production-configuration.mjs";
 import {
   OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
+  checkAdminHistoryExportBinding,
   checkPendingObjectTransferGuard,
   runLegacyContributionsProduction,
   runOperationalHistoryProduction,
@@ -490,12 +492,15 @@ function absolutePath(value, code = "CUTOVER_INPUTS_INVALID") {
  * Validate a parsed pt8-inputs.json (closed keys). identityLinkRotation is
  * the one optional key: { rotationSha256 }, the sha256 of the owner
  * directory's identity-rotation.json (round 16). Its presence switches P8 to
- * P8-R and requires the identity-rotation token at `run`.
+ * P8-R and requires the identity-rotation token at `run`. adminHistoryExport
+ * is { path, sha256 }: H.3 step 6's analytics D1 export
+ * (cutover-admin-history-export.mjs), which post-import's admin history
+ * mapping requires and P15 binds to the seal.
  */
 export function validateTransferInputs(value) {
   const keys = ["schema", "contractId", "sealId", "sealManifestPath", "expectedSourceCommit", "fenceReceiptSha256",
-    "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "schedulerEvidencePath",
-    "ownerFlags", "allowedRoleMembers"];
+    "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "adminHistoryExport",
+    "schedulerEvidencePath", "ownerFlags", "allowedRoleMembers"];
   const rotationDeclared = record(value) && Object.hasOwn(value, "identityLinkRotation");
   exactKeys(value, rotationDeclared ? [...keys, "identityLinkRotation"] : keys, "CUTOVER_INPUTS_INVALID");
   if (rotationDeclared) {
@@ -515,6 +520,9 @@ export function validateTransferInputs(value) {
   exactKeys(value.deletionDigestProjection, ["path", "sha256"], "CUTOVER_INPUTS_INVALID");
   absolutePath(value.deletionDigestProjection.path);
   sha(value.deletionDigestProjection.sha256, "CUTOVER_INPUTS_INVALID");
+  exactKeys(value.adminHistoryExport, ["path", "sha256"], "CUTOVER_INPUTS_INVALID");
+  absolutePath(value.adminHistoryExport.path);
+  sha(value.adminHistoryExport.sha256, "CUTOVER_INPUTS_INVALID");
   const interim = exactKeys(value.interimPublicRead, ["exportPath", "sha256", "capturedAt", "sourceCommit", "evidenceDate"],
     "CUTOVER_INPUTS_INVALID");
   absolutePath(interim.exportPath);
@@ -1162,13 +1170,18 @@ export async function runPreflight(context) {
     // P10 target (open refuses a non-empty target unless this seal resumes).
     const handle = await openHandle(context);
     checks.P10 = Object.freeze({ contractId: handle.contractId, mode: handle.mode, ...await targetFacts(handle) });
-    // P11 scheduler, P12 the OWN-4 export, P13 the pending-object guard, P14 nonces.
+    // P11 scheduler, P12 the OWN-4 export, P13 the pending-object guard, P14
+    // nonces, P15 the admin history export (post-import's mapping refuses an
+    // unbound one too, but only after every stage has imported).
     checks.P11 = await schedulerCheck(context, seal, deployment);
     checks.P12 = (await interimReadCheck(context, seal)).receipt;
     const guard = await checkPendingObjectTransferGuard(handle, { ownerFlags: context.inputs.ownerFlags
       .filter(flag => flag === OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING) });
     checks.P13 = Object.freeze({ guard: guard.guard });
     checks.P14 = Object.freeze({ unexpiredAtSeal: sparkleNonceCount(ingestion, Date.parse(seal.manifest.createdAt) / 1000) });
+    checks.P15 = await checkAdminHistoryExportBinding({ seal, database: ingestion,
+      adminHistoryExportPath: context.inputs.adminHistoryExport.path,
+      adminHistoryExportSha256: context.inputs.adminHistoryExport.sha256 });
     return Object.freeze({
       schema: `${PRODUCTION_TRANSFER_SCHEMA}-preflight`,
       verdict: "GO",
@@ -1571,7 +1584,8 @@ async function runPostImport(context, handle, sealed, preflightSha256) {
   const typedIdentities = await restartTypedIdentities(handle);
   await step(context, "post-import:tl1", { count: typedIdentities });
   const history = await runOperationalHistoryProduction({ handle, sealManifestPath: context.inputs.sealManifestPath,
-    ...context.runnerOptions });
+    adminHistoryExportPath: context.inputs.adminHistoryExport.path,
+    adminHistoryExportSha256: context.inputs.adminHistoryExport.sha256, ...context.runnerOptions });
   await step(context, "post-import:operational-history");
   const deletion = await deletionDigestCheck(context, sealed);
   const invariants = await postImportInvariants(context, handle, sealed, deletion.digests);

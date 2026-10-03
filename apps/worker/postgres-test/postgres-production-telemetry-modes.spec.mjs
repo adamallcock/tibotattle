@@ -305,7 +305,8 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A telemetry production stages on PostgreS
         expect(row.target_sha256).toBeNull();
       }
     }
-    expect(TRANSFER_STAGES.length).toBe(19);
+    // 20 since round 16 added PT-8's identity-link-rotation stage.
+    expect(TRANSFER_STAGES.length).toBe(20);
     // No staging or mirror relation was created, and the control schema holds only its frozen relations.
     expect(PRODUCTION_STAGING_RELATIONS).toEqual([]);
     expect(PRODUCTION_RETAINED_RELATIONS).toEqual([]);

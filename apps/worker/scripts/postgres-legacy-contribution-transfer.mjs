@@ -1453,6 +1453,22 @@ function validateAdminHistoryArguments(path, sha256) {
 }
 
 /**
+ * Read-only, no target: the export binding runOperationalHistoryProduction
+ * enforces, for PT-8-lite's preflight, so an export taken for another seal,
+ * inventory, fence receipt or source refuses before the import starts rather
+ * than at post-import. `seal` is a readCutoverSeal result and `database` its
+ * open sealed ingestion database. Returns the export's sha256 and counts only.
+ */
+export async function checkAdminHistoryExportBinding({ seal, database, adminHistoryExportPath,
+  adminHistoryExportSha256 } = {}) {
+  validateAdminHistoryArguments(adminHistoryExportPath, adminHistoryExportSha256);
+  const exported = await boundAdminHistoryExport(seal, sealedSourceId(database), adminHistoryExportPath,
+    adminHistoryExportSha256);
+  return Object.freeze({ exportSha256: exported.exportSha256, snapshots: exported.snapshots.length,
+    otherSourceRows: exported.otherSourceRows });
+}
+
+/**
  * Map the admin metric history (N-ADMINHIST) and import the aggregate
  * exclusions (N-EXCL). The analytics D1 export (adminHistoryExportPath, pinned
  * by adminHistoryExportSha256) is required: it is read after every sealed

@@ -16,6 +16,15 @@
  * IDENTITY_CONFIGURATION_INVALID on the session ports, and it would silently
  * change the edge admission's replay keys. This check finds it first.
  *
+ * Round 16 (2026-10-02): Cloudflare's value is lost, so the cutover rotates
+ * it. The origin runs the rotated label (PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+ * 'production-v2') with a newly generated version, and the E-PT8 orchestrator
+ * moves the imported pin to it under its own token and receipt. Against a pin
+ * read from production's D1 (the retired label and the lost secret's
+ * fingerprint) this check therefore reports KEY_VERSION_MISMATCH and
+ * FINGERPRINT_MISMATCH and exits 2. It has no rotated mode yet; until it does,
+ * it is not a passable gate for the rotated secret.
+ *
  * Secret: the IDENTITY_LINK_SECRET version that the committed production
  * desired state pins. Before that pin is committed, --version names it; when
  * both exist they must agree. The tool reads it with one read-only call,

@@ -457,7 +457,7 @@ target. Its reference, including the owner directory, the authorization
 tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator).
 
 1. **Preflight (read-only).** `node $S preflight --owner-dir <dir> <connection>`
-   runs P1 to P14 and prints `GO` with the `run` authorization token, or a
+   runs P1 to P15 and prints `GO` with the `run` authorization token, or a
    closed refusal code. Among them: one disposition per sealed table (P3), the
    correction runtime staged with no facts (P4,
    `CUTOVER_CORRECTION_RUNTIME_ACTIVE`), erasure quiescence (P5), the
@@ -467,9 +467,11 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    mounts; under round 16's rotation, P8-R instead, see
    [identity-link rotation](#identity-link-rotation-round-16)), no privilege
    on the transfer control schema for any role but its owner, `PUBLIC`
-   included (P10), and the scheduler probe (P11: the desired
+   included (P10), the scheduler probe (P11: the desired
    state's project, exactly the triggers its `scheduler` map manages, all
-   paused, no alert, under 6 hours old).
+   paused, no alert, under 6 hours old), and the H.3 step 6 admin history
+   export, read at its recorded sha256 and bound to this seal, inventory,
+   fence receipt and sealed source (P15).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
    With a declared identity-link rotation it prints a second token, and the
@@ -484,7 +486,9 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    which round 14 moves into this import),
    D-PT4X `pending-registrations`, `owner-lifecycle-verify` and `post-import`.
    Post-import restarts the typed identities (TL-1), maps the admin metric
-   history and the aggregate exclusions (D-PT4X), checks the invariants,
+   history (the sealed snapshots and cache, and the H.3 step 6 analytics D1
+   export named in `pt8-inputs.json`) and the aggregate exclusions (D-PT4X),
+   checks the invariants,
    finalizes coverage, runs the parity sample, **loads the frozen public read**
    (C-IPR) and **drops the staging relations**. Then the run moves to
    `verifying` and `verified`. A killed `run` is rerun with the same token.
@@ -592,7 +596,9 @@ stated). The owner writes `pt8-inputs.json` (schema
 `expectedIdentityKeyVersion`, `deletionDigestProjection` (path and sha256, from
 `cutover-source-projections.mjs deletion-digests`), `interimPublicRead` (the
 OWN-4 export path and its recorded sha256, capture instant, source commit and
-evidence date), `schedulerEvidencePath` (a C-INFRA scheduler probe receipt
+evidence date), `adminHistoryExport` (the path of H.3 step 6's
+`admin-history-export.json` and the sha256 that step printed),
+`schedulerEvidencePath` (a C-INFRA scheduler probe receipt
 taken after the fence), `ownerFlags` (`performance-routes-retired`,
 `accept-orphan-registration-clearing`) and `allowedRoleMembers`. The
 orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
@@ -706,8 +712,12 @@ the target is final for this seal.
 | `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 (again at `run`) | The probe does not name exactly the triggers the committed production desired state's `scheduler` map manages (`analytics-refresh`, and `maintenance` once C-INFRA manages it), all paused, for the desired state's project with no alert; or it predates the fence, is over 6 h old or has a non-strict instant |
 | `CUTOVER_INTERIM_READ_FACTS_INVALID` and the C-IPR `INTERIM_PUBLIC_READ_*` codes | P12 | The OWN-4 export or its facts do not hold (captured after the fence, another commit, another day) |
 | `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that, or it is present but disabled or altered (no flag excuses that) |
+| `CUTOVER_ADMIN_HISTORY_EXPORT_INVALID`, `CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH` | P15 (again at post-import) | The admin history export is unreadable, not private, or not at the recorded sha256; or it was taken for another seal, inventory, fence receipt or sealed source. Export again for this seal (H.3 step 6) and record its sha256 in the inputs |
 
-During `run` and finalize: `CUTOVER_OWNER_REVISIONS_DIVERGED`,
+During `run` and finalize: `CUTOVER_CORRECTION_OWNER_NOT_ACTIVE` (the
+`usage-correction` stage: sealed correction history whose participant or owner
+link is not `active`; D-PT5A refuses it before the stage touches the target),
+`CUTOVER_OWNER_REVISIONS_DIVERGED`,
 `CUTOVER_PUBLIC_SOURCE_OWNERS_DIVERGED`, `CUTOVER_PENDING_OBJECT_CONFLICT`,
 `CUTOVER_RUNTIME_RESET_NOT_AT_SEED`, `CUTOVER_BOOTSTRAP_TARGET_INVALID`,
 `CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID`, `CUTOVER_COVERAGE_RECEIPT_MISSING`,

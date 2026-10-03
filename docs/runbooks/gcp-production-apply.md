@@ -324,6 +324,18 @@ Without it, a wrong byte would show only after the roll, as 503
 `IDENTITY_CONFIGURATION_INVALID`, and would silently change the edge
 admission's replay keys. Nothing here writes anything.
 
+**Round 16 changes this step.** Cloudflare's `IDENTITY_LINK_SECRET` is lost,
+so the cutover rotates it: Secret Manager holds a newly generated version, the
+origin runs the label `production-v2`, and the cutover orchestrator moves the
+imported pin to it under its own token and receipt
+([cutover window](./gcp-cutover-window.md#identity-link-rotation-round-16)).
+Against the D1 pin below (label `production-v1`, the lost secret's
+fingerprint), the check now reads `mismatch` with `KEY_VERSION_MISMATCH` and
+`FINGERPRINT_MISMATCH` and exits 2. That is expected, and it does not clear
+this gate: the check has no rotated mode yet, so it cannot yet prove the
+mounted version's bytes. Until it gains one, this gate is open; record it as
+open rather than passing it.
+
 First the expected pin, which is not secret, from production's D1 through
 the owner's Wrangler login (a read-only `SELECT`; the pin never changes once
 set, so any time before the seal reads the value the seal carries):
@@ -353,7 +365,7 @@ content-free reasons, never the value or a fingerprint. Expect exit 0 and
 | `FINGERPRINT_MISMATCH` with `MATCHES_WITHOUT_TRAILING_NEWLINE` | The custody command added a newline. The owner adds a new version without it (with `tr -d '\n'`), and the pin moves to it |
 | `FINGERPRINT_MISMATCH` with `MATCHES_WITH_TRAILING_NEWLINE` | The original value ends in a newline that was stripped. Add a new version with it |
 | `FINGERPRINT_MISMATCH` alone | Not Cloudflare's value. Stop and ask the owner |
-| `KEY_VERSION_MISMATCH` | The D1 pin's label is not `production-v1`, which the origin expects. Stop and ask |
+| `KEY_VERSION_MISMATCH` | The pin's label is not `production-v2`, the label the origin runs (`PRODUCTION_IDENTITY_LINK_SECRET_VERSION`). With `FINGERPRINT_MISMATCH`, against the D1 pin, this is the round-16 rotation (above), not a custody slip. Otherwise stop and ask |
 | `SECRET_TOO_SHORT` | Under 32 characters; the origin refuses it. Stop and ask |
 
 The superseded version stays (never destroy it to retry); only the pinned

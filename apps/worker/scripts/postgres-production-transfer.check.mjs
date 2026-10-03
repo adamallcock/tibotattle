@@ -238,7 +238,7 @@ test("the merged trigger policy covers every importer and the disposition policy
     "community_aggregate_exclusions", "collection_controls"]) {
     assert.ok(Object.hasOwn(COMPLETE_TRIGGER_POLICY, tableName), tableName);
   }
-  assert.equal(dispositionPolicySha256(), "e05ac1fd3821b67ff70e0dd496ecf5719f7e7494f2a020eb08a9e2c17fb5bfbb",
+  assert.equal(dispositionPolicySha256(), "154244fd7e2b06895c3bddc22c284e848788c8cbc53a8aaab6348a3844e3bac8",
     "a reviewed change to dispositions, rules, flags, the stage plan or the trigger policy must update this pin");
 });
 
@@ -771,6 +771,7 @@ function inputs(overrides = {}) {
     deletionDigestProjection: { path: "/owner/deletion-digests.txt", sha256: "3".repeat(64) },
     interimPublicRead: { exportPath: "/owner/own4.json", sha256: "4".repeat(64), capturedAt: "2026-10-01T23:30:00.000Z",
       sourceCommit: "1".repeat(40), evidenceDate: "2026-10-01" },
+    adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64) },
     schedulerEvidencePath: "/owner/scheduler.json",
     ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
     allowedRoleMembers: [],
@@ -783,12 +784,17 @@ test("pt8-inputs.json is a closed contract", () => {
   for (const bad of [{ extra: 1 }, { sealId: "x" }, { sealManifestPath: "relative/path" }, { ownerFlags: ["unknown"] },
     { expectedSourceCommit: "short" }, { allowedRoleMembers: ["a", "a"] },
     { interimPublicRead: { ...inputs().interimPublicRead, capturedAt: "2026-10-01" } },
-    { deletionDigestProjection: { path: "/x", sha256: "nope" } }]) {
+    { deletionDigestProjection: { path: "/x", sha256: "nope" } },
+    { adminHistoryExport: { path: "relative/export.json", sha256: "5".repeat(64) } },
+    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "nope" } },
+    { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } }]) {
     assert.throws(() => validateTransferInputs(inputs(bad)), { code: "CUTOVER_INPUTS_INVALID" }, JSON.stringify(bad));
   }
-  const missing = inputs();
-  delete missing.schedulerEvidencePath;
-  assert.throws(() => validateTransferInputs(missing), { code: "CUTOVER_INPUTS_INVALID" });
+  for (const key of ["schedulerEvidencePath", "adminHistoryExport"]) {
+    const missing = inputs();
+    delete missing[key];
+    assert.throws(() => validateTransferInputs(missing), { code: "CUTOVER_INPUTS_INVALID" }, key);
+  }
 });
 
 test("the CLI is dry by default: --execute needs --confirm, --confirm needs --execute, flags are closed", async () => {

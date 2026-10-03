@@ -47,6 +47,11 @@ import {
   PENDING_OBJECT_TRANSFER_HOLD_TABLE,
 } from "../scripts/postgres-legacy-contribution-transfer.mjs";
 import { dropTransferStagingRelations, withTransferTransaction } from "../scripts/postgres-transfer-target.mjs";
+import {
+  buildSyntheticAnalyticsD1,
+  exportSyntheticAdminHistory,
+  writeAnalyticsSourceFixture,
+} from "./fixtures/w2-seal/admin-history-fixtures.mjs";
 import { createW2SealCluster, PRIMARY_SCHEMA, TRANSFER_ROLE, localSocket } from "./fixtures/w2-seal/pg-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
 import { SYNTHETIC_BOOKMARKS, writeBarrierProofFixture, writeFenceReceiptFixture } from "./fixtures/w2-seal/fence-fixtures.mjs";
@@ -99,6 +104,29 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
   let cluster;
   let admin;
   let participantIds;
+  let analytics;
+  const adminHistoryExports = new Map();
+
+  /**
+   * H.3 step 6's analytics D1 admin history export for one seal (D-PT4X),
+   * cached per seal: the export is deterministic. A variant seal the export
+   * itself refuses gets the main seal's export; such a seal is refused by an
+   * earlier preflight check, and P15 would refuse the borrowed export anyway.
+   */
+  async function adminHistoryExportFor(manifest, sealId) {
+    if (!adminHistoryExports.has(sealId)) {
+      let exported;
+      try {
+        exported = await exportSyntheticAdminHistory({ world, seal: { manifestPath: manifest, sealId },
+          analyticsPath: analytics.path, analyticsSourcePath: analytics.sourcePath });
+      } catch (error) {
+        if (sealId === seal.manifest.sealId) throw error;
+        return adminHistoryExportFor(manifestPath, seal.manifest.sealId);
+      }
+      adminHistoryExports.set(sealId, { path: exported.path, sha256: exported.sha256 });
+    }
+    return adminHistoryExports.get(sealId);
+  }
 
   /**
    * A fresh owner directory with pin, projection, OWN-4 export, scheduler
@@ -154,6 +182,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       deletionDigestProjection: { path: projection.path, sha256: projection.sha256 },
       interimPublicRead: { exportPath: join(directory, "own4-export.json"), sha256: exportSha256(bytes),
         capturedAt: FIXTURE_CAPTURED_AT, sourceCommit: world.commit, evidenceDate: FIXTURE_EVIDENCE_DATE },
+      adminHistoryExport: await adminHistoryExportFor(manifest, sealId),
       schedulerEvidencePath: join(directory, "scheduler-probe.json"),
       ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
       allowedRoleMembers: [],
@@ -313,6 +342,23 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     const sealed = await run.run();
     manifestPath = outputPathsOf(run.out).manifest;
     seal = await readCutoverSeal({ manifestPath, expectedSealId: sealed.sealId });
+    // The analytics D1's admin snapshots under the sealed source id, and one
+    // row of another source the export counts but never carries.
+    const analyticsDirectory = await privateDirectory("ept8-analytics-");
+    const sealedIngestion = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
+    let sourceId;
+    try {
+      sourceId = sealedIngestion.prepare("SELECT source_id FROM storage_source_state").get().source_id;
+    } finally {
+      sealedIngestion.close();
+    }
+    analytics = {
+      path: buildSyntheticAnalyticsD1({ directory: analyticsDirectory, commit: world.commit, sourceId,
+        snapshots: [["2026-10-01T22:00:00.000Z", JSON.stringify({ participantsTotal: 7 })],
+          ["2026-10-01T23:00:00.000Z", JSON.stringify({ participantsTotal: 8, bandFitCount: 1 })]],
+        otherSnapshots: [["2026-10-01T23:00:00.000Z", JSON.stringify({ participantsTotal: 1 })]] }),
+      sourcePath: await writeAnalyticsSourceFixture({ directory: analyticsDirectory }),
+    };
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
       password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 7, label: "ept8" });
     const endpoint = await localSocket(PG_TEST_SOCKET, PG_TEST_PORT);
@@ -393,6 +439,12 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       return body;
     };
     expect(await postImport(directory)).toEqual(await postImport(cleanDirectory));
+    // Post-import mapped the analytics D1 export (H.3 step 6): both snapshots
+    // of the sealed source, and none of the other source's.
+    const { rows: mapped } = await target.ownerPrimary.query(`SELECT count(*)::int AS n
+      FROM ${table("analytics_admin_metric_snapshots")}
+     WHERE captured_at IN ('2026-10-01T22:00:00.000Z'::timestamptz, '2026-10-01T23:00:00.000Z'::timestamptz)`);
+    expect(mapped[0].n).toBe(2);
     // One receipt per sealed table, with exactly the disposition's token and stage.
     const present = new Set(resumed.tables.map(row => `${row.source_role}:${row.source_table}`));
     for (const item of DISPOSITIONS) {
@@ -645,6 +697,15 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(await own4({ capturedAt: "2026-10-02T00:30:00.000Z" })).toBe("CUTOVER_INTERIM_READ_FACTS_INVALID");
     expect(await own4({ sourceCommit: "c".repeat(40) })).toBe("CUTOVER_INTERIM_READ_FACTS_INVALID");
     expect(await own4({ sha256: "d".repeat(64) })).toMatch(/^INTERIM_PUBLIC_READ_/u);
+    // P15: the admin history export must be this seal's, byte for byte.
+    const mainExport = await adminHistoryExportFor(manifestPath, seal.manifest.sealId);
+    await refuse({ inputs: { adminHistoryExport: { ...mainExport, sha256: "d".repeat(64) } } },
+      "CUTOVER_ADMIN_HISTORY_EXPORT_INVALID", "P15 another digest");
+    const otherSeal = await variant("INSERT INTO sparkle_appcast_guard_nonces(nonce, expires_at) VALUES ('ept8-p15-nonce', 1)");
+    const otherExport = await adminHistoryExportFor(otherSeal.manifest, otherSeal.sealId);
+    expect(otherExport.sha256).not.toBe(mainExport.sha256);
+    await refuse({ inputs: { adminHistoryExport: otherExport } }, "CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH",
+      "P15 another seal's export");
     // Nothing above wrote to the target.
     expect(await targetRows(target)).toBe(0);
 
@@ -692,11 +753,13 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(await codeOf(runImport(await context(target, directory, killAfter("stage:identity-authority")), authorization)))
       .toBe("synthetic kill");
     // A published day (only a refresh writes one) ends the frozen read: a resumed preflight refuses.
+    // Since the run stamps (primary 0069) a published day names its kernel
+    // and manifest version; the replica role skips the kernel foreign key.
     await tamper(target, `INSERT INTO ${table("analytics_v2_published_daily")}(day, revision, released_at, payload,
-        payload_sha256, run_id)
+        payload_sha256, run_id, kernel_id, manifest_version)
       VALUES ('2026-10-01', 1, clock_timestamp(),
         '{"day":"2026-10-01","revision":1,"aggregateId":"community-daily:2026-10-01:r1"}'::jsonb, repeat('0', 64),
-        '00000000-0000-4000-8000-000000000001')`);
+        '00000000-0000-4000-8000-000000000001', 1, 1)`);
     await refuse({}, "CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING", "P10 published day");
     await tamper(target, `DELETE FROM ${table("analytics_v2_published_daily")} WHERE day = '2026-10-01'`);
     const early = await flipEvidence("before-verified");

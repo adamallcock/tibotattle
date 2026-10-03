@@ -12,6 +12,10 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import {
+  PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+  PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
+} from "../cloud-run/postgres-production-configuration.mjs";
 import * as check from "./gcp-identity-link-pin-check.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
@@ -21,6 +25,13 @@ process.env.PATH = "/nonexistent-gcloud-guard";
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SECRET = "synthetic-identity-link-secret-value-0000000001";
 const OTHER = "synthetic-identity-link-secret-value-0000000002";
+/**
+ * Round 16: the origin runs the rotated label; Cloudflare's D1 pin carries the
+ * retired one, so a pin read from production's D1 never matches the new
+ * secret (the cutover rotates the imported pin; see the E-PT8 orchestrator).
+ */
+const CURRENT_LABEL = PRODUCTION_IDENTITY_LINK_SECRET_VERSION;
+const RETIRED_LABEL = PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS[0];
 const SECRETS = Object.freeze([SECRET, `${SECRET}\n`, "s".repeat(32), `${"long-synthetic-key-".repeat(9)}é`, "﻿synthetic-bom-led-identity-link-0001"]);
 
 async function workerFingerprint() {
@@ -42,7 +53,7 @@ function desired(version = "1") {
   return manifest.validateDesiredState(value);
 }
 
-function pinFor(secret, keyVersion = "production-v1") {
+function pinFor(secret, keyVersion = CURRENT_LABEL) {
   return { keyVersion, secretFingerprint: check.identityLinkSecretFingerprint(secret) };
 }
 
@@ -65,7 +76,7 @@ function fakeGcloud(value, { status = 0, name, encode = (bytes) => bytes.toStrin
   return { spawn, calls };
 }
 
-async function run(argv, { value = SECRET, pin = d1Output({ key_version: "production-v1",
+async function run(argv, { value = SECRET, pin = d1Output({ key_version: CURRENT_LABEL,
   secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }), desiredState = desired(), gcloud } = {}) {
   const fake = gcloud ?? fakeGcloud(value);
   const out = [];
@@ -147,7 +158,7 @@ test("a match reads the pinned version once, read-only, without a shell or HTTP 
   const report = JSON.parse(result.stdout);
   assert.deepEqual(report, { schema: check.IDENTITY_LINK_PIN_CHECK_SCHEMA, environment: "production",
     project: "tibotattle-prod", secret: "IDENTITY_LINK_SECRET", version: "1", versionPinned: true,
-    expectedKeyVersion: "production-v1", outcome: "match", reasons: [] });
+    expectedKeyVersion: CURRENT_LABEL, outcome: "match", reasons: [] });
   assertContentFree(result.stdout);
   assert.equal(result.stderr, "");
   // gcloud's base64url alphabet and a project-id response name are accepted too.
@@ -166,7 +177,9 @@ test("a mismatch names its reasons without content, including the trailing-newli
     [`${SECRET}\r\n`, pinFor(SECRET), ["FINGERPRINT_MISMATCH", "MATCHES_WITHOUT_TRAILING_NEWLINE"]],
     [SECRET, pinFor(`${SECRET}\n`), ["FINGERPRINT_MISMATCH", "MATCHES_WITH_TRAILING_NEWLINE"]],
     [OTHER, pinFor(SECRET), ["FINGERPRINT_MISMATCH"]],
-    [SECRET, pinFor(SECRET, "production-v2"), ["KEY_VERSION_MISMATCH"]],
+    [SECRET, pinFor(SECRET, RETIRED_LABEL), ["KEY_VERSION_MISMATCH"]],
+    // Round 16: the rotated secret against Cloudflare's D1 pin (the lost secret, the retired label).
+    [SECRET, pinFor(OTHER, RETIRED_LABEL), ["KEY_VERSION_MISMATCH", "FINGERPRINT_MISMATCH"]],
     ["short-synthetic", pinFor("short-synthetic"), ["SECRET_TOO_SHORT"]],
   ];
   for (const [value, pin, reasons] of cases) {
