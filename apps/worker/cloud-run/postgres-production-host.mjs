@@ -263,15 +263,52 @@ export function createUploadIngressAuthority() {
   });
 }
 
+const PASS_STORAGE_UNAVAILABLE = Object.freeze({ status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+const PASS_STATE_CONFLICT = Object.freeze({ status: 503, code: "LIFECYCLE_STATE_CONFLICT" });
+const PASS_INTERNAL_ERROR = Object.freeze({ status: 500, code: "INTERNAL_ERROR" });
+
+/**
+ * The admin action's error for each refused or failed lifecycle pass code
+ * (POSTGRES_LIFECYCLE_PASS_CODES.refused and .failure). A pass that cannot
+ * complete is an error of run_maintenance, never a result: d43c8f92
+ * runScheduledMaintenance throws, so handleAdminAction writes a 'failure'
+ * audit with the error's code and answers the error (index.ts:3806-3851).
+ * Each code takes the Worker's answer for the same condition: a schema,
+ * receipt or row the pass cannot trust is 503 BACKEND_STORAGE_UNAVAILABLE
+ * (the storage gate's refusal and the Worker's for a missing retention row);
+ * a lease, cycle, pin or CHECK conflict on the lifecycle rows is 503
+ * LIFECYCLE_STATE_CONFLICT (the Worker's answer for a lost maintenance or
+ * reconciliation lease); a driver or object-store failure is 500
+ * INTERNAL_ERROR (a D1 or R2 failure inside the Worker's pass is a raw
+ * error). A code outside this table is also 500 INTERNAL_ERROR.
+ */
+export const LIFECYCLE_PASS_ADMIN_ERRORS = Object.freeze({
+  POSTGRES_VERSION_UNSUPPORTED: PASS_STORAGE_UNAVAILABLE,
+  POSTGRES_SCHEMA_RECEIPT_MISMATCH: PASS_STORAGE_UNAVAILABLE,
+  LIFECYCLE_STATE_MISSING: PASS_STORAGE_UNAVAILABLE,
+  LIFECYCLE_STATE_SHAPE_INVALID: PASS_STORAGE_UNAVAILABLE,
+  LIFECYCLE_QUARANTINE_RETENTION_UNPORTED: PASS_STORAGE_UNAVAILABLE,
+  LIFECYCLE_RESTORE_PIN_CONFLICT: PASS_STATE_CONFLICT,
+  LIFECYCLE_LEASE_CONFLICT: PASS_STATE_CONFLICT,
+  LIFECYCLE_CYCLE_REGRESSED: PASS_STATE_CONFLICT,
+  LIFECYCLE_STATE_CHECK_CONFLICT: PASS_STATE_CONFLICT,
+  POSTGRES_MAINTENANCE_UNAVAILABLE: PASS_INTERNAL_ERROR,
+  QUARANTINE_OBJECT_STORAGE_UNAVAILABLE: PASS_INTERNAL_ERROR,
+});
+
 /**
  * C-MAINT's lifecycle pass as the admin action's run_maintenance task
  * (C-ADMIN admin-action.mjs, audited by RUN_MAINTENANCE_AUDIT_FIELDS): the
  * pass for the request's whole-minute cycle, mapped to the Worker's result
- * keys. A pass that cannot take the maintenance lock or the migration fence
- * is MAINTENANCE_IN_PROGRESS, which the action answers 409
- * LIFECYCLE_STATE_CONFLICT. Erasure-era items are the constant not-applicable
- * values of owner decision OD-4; phases the pass does not run (identity
- * hand-off and sign-in purges) are absent, never reported as done.
+ * keys. A complete pass is OK and a partial one MAINTENANCE_INCOMPLETE, the
+ * Worker's two result codes. A pass that cannot take the maintenance lock or
+ * the migration fence is MAINTENANCE_IN_PROGRESS, which the action answers
+ * 409 LIFECYCLE_STATE_CONFLICT. A refused or failed pass throws its
+ * LIFECYCLE_PASS_ADMIN_ERRORS entry, so the action records a failure audit
+ * and answers that error, as the Worker does. Erasure-era items are the
+ * constant not-applicable values of owner decision OD-4; phases the pass
+ * does not run (identity hand-off and sign-in purges) are absent, never
+ * reported as done.
  */
 export function createLifecyclePassMaintenance({ pool, objectStore, primarySchema }) {
   return Object.freeze({
@@ -284,9 +321,14 @@ export function createLifecyclePassMaintenance({ pool, objectStore, primarySchem
         expectedPrimaryMigrations: POSTGRES_RUNTIME_MIGRATIONS.primary,
       });
       if (result.outcome === "skipped") return Object.freeze({ code: "MAINTENANCE_IN_PROGRESS" });
+      if (result.outcome !== "complete" && result.outcome !== "partial") {
+        const answer = Object.hasOwn(LIFECYCLE_PASS_ADMIN_ERRORS, result.code)
+          ? LIFECYCLE_PASS_ADMIN_ERRORS[result.code]
+          : PASS_INTERNAL_ERROR;
+        throw new ApiError(answer.status, answer.code);
+      }
       return Object.freeze({
-        code: result.outcome === "complete" ? "OK"
-          : result.outcome === "partial" ? "MAINTENANCE_INCOMPLETE" : result.code,
+        code: result.outcome === "complete" ? "OK" : "MAINTENANCE_INCOMPLETE",
         lifecycleComplete: result.lifecycleComplete,
         quarantineRetentionComplete: result.quarantineRetentionComplete,
         restoreReplayComplete: result.appendOnlyNotApplicable.restoreReplayComplete,
@@ -624,11 +666,19 @@ function listenPort(processEnv) {
   return port;
 }
 
-/** The edge-tier binding names agree across CR-3, EP-6's replay and the edge policy. */
-function assertEdgeTierBindings() {
+/**
+ * The edge-tier binding names agree across CR-3, EP-6's replay and the edge
+ * policy, in any order; otherwise EDGE_TIER_BINDINGS_DRIFT. The runtime
+ * passes the three module lists; the lists are a parameter only so the check
+ * can drift each one.
+ */
+export function assertEdgeTierBindings({
+  configuration = EDGE_TIER_RATE_LIMIT_BINDINGS,
+  replay = EDGE_ADMISSION_REPLAY_BINDINGS,
+  policy = EDGE_ADMISSION_BINDINGS,
+} = {}) {
   const sorted = (names) => JSON.stringify([...names].sort());
-  if (sorted(EDGE_TIER_RATE_LIMIT_BINDINGS) !== sorted(EDGE_ADMISSION_REPLAY_BINDINGS)
-      || sorted(EDGE_TIER_RATE_LIMIT_BINDINGS) !== sorted(EDGE_ADMISSION_BINDINGS)) {
+  if (sorted(configuration) !== sorted(replay) || sorted(configuration) !== sorted(policy)) {
     refuse("EDGE_TIER_BINDINGS_DRIFT");
   }
 }

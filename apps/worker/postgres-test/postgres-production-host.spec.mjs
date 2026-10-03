@@ -19,7 +19,11 @@
 // request (TTL 0) and refuses a drifted or newer schema; unported routes and
 // the admin host answer the closed 503 under the edge's request id with no
 // retry-after; the contribution path takes and releases an ingress lease;
-// and every log line is the closed shape without request content.
+// every log line is the closed shape without request content; RD-2's reader
+// refuses a missing or wrong typed pin and a missing or malformed lifecycle
+// row with 503 BACKEND_STORAGE_UNAVAILABLE before the builder runs; and
+// run_maintenance over C-MAINT's lifecycle pass (the ADMIN-R12 path) answers
+// and audits a refused or skipped pass as the Worker does, never as 200.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -68,15 +72,17 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [server, host, codec, health, ingressBudget, readiness] = await Promise.all([
+  const [server, host, codec, health, ingressBudget, readiness, adminConsole, lifecyclePass] = await Promise.all([
     load("/cloud-run/server.mjs"),
     load("/cloud-run/postgres-production-host.mjs"),
     load("/src/typed-telemetry-codec.ts"),
     load("/src/postgres-health-contract.ts"),
     load("/src/postgres-ingress-budget.ts"),
     load("/cloud-run/postgres-readiness-dispatch.mjs"),
+    load("/cloud-run/routes/admin-console.mjs"),
+    load("/src/postgres-lifecycle-pass.ts"),
   ]);
-  modules = { server, host, codec, health, ingressBudget, readiness };
+  modules = { server, host, codec, health, ingressBudget, readiness, adminConsole, lifecyclePass };
   return modules;
 }
 
@@ -534,4 +540,147 @@ test("log lines: the closed request line and the refusal line, without request c
     for (const value of Object.values(INJECTED)) assert.ok(!line.includes(value), `no ${value} in ${line}`);
     assert.ok(!line.includes("stranger@"), `no account in ${line}`);
   }
+}));
+
+test("RD-2's reader refuses a missing or wrong typed pin and a missing or malformed lifecycle row: 503 BACKEND_STORAGE_UNAVAILABLE", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ m, base, t, port, primarySchema, objectStore }) => {
+  await m.host.createLifecyclePassMaintenance({ pool: base, objectStore, primarySchema }).runMaintenance(Date.now());
+  const ready = async () => {
+    await afterReuseWindow(m);
+    return send(port, { path: "/api/ready", headers: verifierHeaders() });
+  };
+  assert.equal((await ready()).status, 200, "ready once the pass has run");
+  const other = await base.query(`INSERT INTO ${t("typed_telemetry_namespaces")} (original_id)
+    VALUES ($1) RETURNING id`, [Buffer.from(m.codec.encodeTypedTelemetryId("synthetic-other-namespace"))]);
+  const otherNamespaceId = other.rows[0].id;
+  // Each case replaces one singleton row and then puts the saved row back:
+  // a DELETE, then an INSERT of the row as JSON (the v1.1 pin's 0060 guard
+  // covers UPDATE only, and the 0033 and 0049 CHECKs still apply).
+  const saved = async (table, key) => (await base.query(
+    `SELECT to_jsonb(saved) AS row FROM ${t(table)} saved WHERE ${key} = 1`)).rows[0].row;
+  const replace = async (table, key, row) => {
+    await base.query(`DELETE FROM ${t(table)} WHERE ${key} = 1`);
+    if (row !== null) {
+      await base.query(`INSERT INTO ${t(table)} SELECT * FROM jsonb_populate_record(NULL::${t(table)}, $1::jsonb)`,
+        [JSON.stringify(row)]);
+    }
+  };
+  const cases = [];
+  for (const [family, table] of [["v1", "typed_v1_admission_state"], ["v1.1", "typed_v11_admission_state"]]) {
+    cases.push([`the ${family} pin deleted`, table, "id", () => null]);
+    cases.push([`the ${family} pin naming another namespace`, table, "id",
+      (row) => ({ ...row, source_namespace: "synthetic-other-namespace" })]);
+    // 0033 admits runtime contract versions 0 and 1 only; the reader requires 1.
+    cases.push([`the ${family} pin at runtime contract version 0`, table, "id",
+      (row) => ({ ...row, runtime_contract_version: 0 })]);
+    cases.push([`the ${family} pin joined to another namespace's original id`, table, "id",
+      (row) => ({ ...row, namespace_id: otherNamespaceId })]);
+  }
+  cases.push(["the retention row deleted", "retention_state", "singleton", () => null]);
+  cases.push(["the reconciliation row deleted", "quarantine_reconciliation_state", "singleton", () => null]);
+  // Values the 0049 CHECKs admit and the closed readers refuse (StateShapeError).
+  cases.push(["a retention counter beyond the reader's bound", "retention_state", "singleton",
+    (row) => ({ ...row, quarantine_objects_deleted: "10000000000000000" })]);
+  cases.push(["a reconciliation counter beyond the reader's bound", "quarantine_reconciliation_state", "singleton",
+    (row) => ({ ...row, registrations_examined: "10000000000000000" })]);
+  for (const [label, table, key, change] of cases) {
+    const original = await saved(table, key);
+    await replace(table, key, change(original));
+    try {
+      const answer = await ready();
+      assert.equal(answer.status, 503, `${label}: ${answer.text}`);
+      // The reader's refusal, not the builder's not_ready body.
+      assert.equal(errorOf(answer)?.code, "BACKEND_STORAGE_UNAVAILABLE", `${label}: ${answer.text}`);
+      assertNoStoreMarked(answer, label);
+    } finally {
+      await replace(table, key, original);
+    }
+    assert.equal((await ready()).status, 200, `${label}: ready again once the row is restored`);
+  }
+}));
+
+test("run_maintenance through the admin action: a refused or skipped pass is a failure audit and the Worker's error", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ m, base, t, primarySchema, objectStore }) => {
+  const adminOrigin = "https://admin.synthetic.example";
+  const contexts = new WeakMap();
+  const handlers = m.adminConsole.createAdminConsoleHandlers({
+    requestContext: (request) => contexts.get(request),
+    env: Object.freeze({ ENVIRONMENT: "production", TELEMETRY_STORAGE_NAMESPACE: NAMESPACE }),
+    pools: { primary: base },
+    schemaOptions: { primarySchema },
+    maintenance: m.host.createLifecyclePassMaintenance({ pool: base, objectStore, primarySchema }),
+  });
+  const audits = async () => (await base.query(`SELECT action, outcome, details_json::jsonb AS details
+      FROM ${t("admin_action_audit")} ORDER BY id`)).rows;
+  const run = async (label, status) => {
+    const before = (await audits()).length;
+    const requestId = randomUUID();
+    const request = new Request(`${adminOrigin}/api/v1/admin/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: adminOrigin, "sec-fetch-site": "same-origin",
+        "x-usage-monitor-admin": "1" },
+      body: JSON.stringify({ action: "run_maintenance" }),
+    });
+    contexts.set(request, Object.freeze({ requestId, routeId: "admin_action",
+      adminIdentityKey: "owner@synthetic.example" }));
+    const response = await handlers.get("admin_action")(request);
+    const body = await response.json();
+    assert.equal(response.status, status, `${label}: ${JSON.stringify(body)}`);
+    assert.equal(response.headers.get("retry-after"), null, label);
+    const added = (await audits()).slice(before);
+    assert.equal(added.length, 1, `${label}: one audit row`);
+    assert.equal(added[0].action, "run_maintenance", label);
+    return { body, audit: added[0], requestId };
+  };
+  const refused = async (label, status, code) => {
+    const { body, audit, requestId } = await run(label, status);
+    assert.deepEqual(body, { error: { code, requestId } }, label);
+    assert.equal(audit.outcome, "failure", `${label}: never a success audit`);
+    assert.deepEqual(audit.details, { code }, label);
+  };
+
+  // A complete pass: 200 with the Worker's OK and a success audit.
+  const complete = await run("complete", 200);
+  assert.equal(complete.body.result.code, "OK");
+  assert.equal(complete.audit.outcome, "success");
+  assert.equal(complete.audit.details.code, "OK");
+  assert.equal(complete.audit.details.lifecycleComplete, true);
+
+  // Refused, POSTGRES_SCHEMA_RECEIPT_MISMATCH: 503 BACKEND_STORAGE_UNAVAILABLE.
+  const history = t("_tibotattle_migration_history");
+  const last = (await base.query(`SELECT version, checksum_sha256 FROM ${history} ORDER BY version DESC LIMIT 1`)).rows[0];
+  await base.query(`UPDATE ${history} SET checksum_sha256=$1 WHERE version=$2`, ["0".repeat(64), last.version]);
+  try {
+    await refused("refused: a drifted receipt", 503, "BACKEND_STORAGE_UNAVAILABLE");
+  } finally {
+    await base.query(`UPDATE ${history} SET checksum_sha256=$1 WHERE version=$2`, [last.checksum_sha256, last.version]);
+  }
+
+  // Refused, LIFECYCLE_LEASE_CONFLICT: 503 LIFECYCLE_STATE_CONFLICT.
+  await base.query(`UPDATE ${t("retention_state")}
+      SET lease_id='synthetic-foreign-lease', lease_expires_at=now() + interval '1 hour' WHERE singleton=1`);
+  try {
+    await refused("refused: a lease the pass does not own", 503, "LIFECYCLE_STATE_CONFLICT");
+  } finally {
+    await base.query(`UPDATE ${t("retention_state")} SET lease_id=NULL, lease_expires_at=NULL WHERE singleton=1`);
+  }
+
+  // Skipped, MAINTENANCE_IN_PROGRESS: the Worker's 409 LIFECYCLE_STATE_CONFLICT.
+  const holder = await base.connect();
+  try {
+    await holder.query("SELECT pg_advisory_lock(hashtextextended($1, 0))",
+      [m.lifecyclePass.POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN]);
+    await refused("skipped: the maintenance lock held elsewhere", 409, "LIFECYCLE_STATE_CONFLICT");
+  } finally {
+    await holder.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+      [m.lifecyclePass.POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN]).catch(() => undefined);
+    holder.release();
+  }
+
+  // Everything restored: the next run succeeds again.
+  const again = await run("restored", 200);
+  assert.equal(again.body.result.code, "OK");
+  assert.equal(again.audit.outcome, "success");
 }));

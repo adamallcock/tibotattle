@@ -956,6 +956,42 @@ test("partial HTTP health fails closed when the database or its receipt is unava
   assert.equal(missingResponse.status, 503);
   assert.equal((await missingResponse.json()).checks.primaryMigrationReceipt.status, "schema_missing");
 
+  // PostgreSQL 16 with a current history: the one reader refuses the major
+  // version before it reads the history, and so do the health and the gate.
+  let oldHistoryReads = 0;
+  const oldPools = receiptPool({ major: 16, primaryHistory: currentHistory });
+  const countingOld = (role) => {
+    const pool = oldPools(role);
+    return {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql) {
+            if (sql.startsWith("SELECT version, name, checksum_sha256")) oldHistoryReads += 1;
+            return client.query(sql);
+          },
+          release() { client.release(); },
+        };
+      },
+    };
+  };
+  const old = createPostgresTestHealthDispatch({
+    primaryPool: countingOld("primary"),
+    schemaOptions: { primarySchema: "health_primary" },
+    expectedMigrations: ONE_MIGRATION,
+    privateOrigin: "http://127.0.0.1:8080",
+  });
+  const oldResponse = await old(new Request("http://127.0.0.1:8080/api/health"));
+  assert.equal(oldResponse.status, 503);
+  assert.equal((await oldResponse.json()).checks.primaryMigrationReceipt.status, "unsupported_postgres_version");
+  const oldGate = createPostgresTestStorageReceiptCheck({
+    primaryPool: countingOld("primary"),
+    schemaOptions: { primarySchema: "health_primary" },
+    expectedMigrations: ONE_MIGRATION,
+  });
+  await assert.rejects(oldGate(), (error) => error?.status === 503 && error?.code === "BACKEND_STORAGE_UNAVAILABLE");
+  assert.equal(oldHistoryReads, 0, "no history read on an unsupported major");
+
   // The health and storage gate take one pool and the primary manifest only:
   // a stale composition that passes a second pool, a second schema or a
   // second manifest role is refused at construction (LEAD-SIMP).

@@ -10,11 +10,14 @@ import { createServer } from "vite";
 // the plane's origin-tier limits; the bind address is 0.0.0.0 only for a
 // validated Cloud Run service; refusals happen before any pool and close
 // what opened; the registry ports the production list (plus the six admin
-// routes only when the composition root opens the admin host); and requests
+// routes only when the composition root opens the admin host); requests
 // that need no storage (unported routes, the refused or chokepointed admin
 // host, EP-6 refusals) answer through the real EP-6 boundary and the CR-6
-// handler. The storage paths (RD-2, RD-3, the families, the lifecycle pass
-// and the ingress lease) run against PostgreSQL 17 in
+// handler; startup refuses a drift between the edge-tier binding lists and
+// between the health flags and the registry; and run_maintenance answers a
+// refused or failed lifecycle pass with an error and a failure audit. The
+// storage paths (RD-2, RD-3, the families, the lifecycle pass, the admin
+// action over it and the ingress lease) run against PostgreSQL 17 in
 // postgres-test/postgres-production-host.spec.mjs. Every value is synthetic.
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -743,3 +746,249 @@ test("the image runs every entry as the unprivileged node user, which owns none 
   // The copied code stays root-owned (read-only to node): nothing chowns it.
   assert.doesNotMatch(dockerfile, /--chown|\bchown\b|\bchmod\b/u);
 });
+
+// ---------------------------------------------------------------------------
+// Startup drift refusals (wave-3 host brief: the EDGE_TIER drift assertion,
+// and the OD-CR-5 flags against the registry)
+
+/**
+ * The host loaded in its own Vite graph with one of its own imports replaced
+ * by `code` (only where the host is the importer), so a startup assertion
+ * meets the drift it must refuse without any seam in the production module.
+ */
+async function hostWithSubstitute(source, code) {
+  const substituteId = "\0d-crb-drift-substitute.mjs";
+  const server = await createServer({
+    root: WORKER_ROOT,
+    configFile: false,
+    logLevel: "silent",
+    server: { middlewareMode: true, hmr: false, ws: false },
+    appType: "custom",
+    plugins: [{
+      name: "d-crb-drift-substitute",
+      enforce: "pre",
+      resolveId(requested, importer) {
+        return requested === source && importer?.endsWith("/cloud-run/postgres-production-host.mjs")
+          ? substituteId : null;
+      },
+      load(id) {
+        return id === substituteId ? code : null;
+      },
+    }],
+  });
+  try {
+    return { server, drifted: await server.ssrLoadModule("/cloud-run/postgres-production-host.mjs") };
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
+}
+
+test("EDGE_TIER_BINDINGS_DRIFT: any of the three edge-tier lists drifting refuses, before any pool", async () => {
+  const [limiters, edgePolicy] = await Promise.all([
+    vite.ssrLoadModule("/cloud-run/postgres-edge-admission-limiters.mjs"),
+    vite.ssrLoadModule("/src/edge-admission-policy.ts"),
+  ]);
+  const lists = {
+    configuration: [...configuration.EDGE_TIER_RATE_LIMIT_BINDINGS],
+    replay: [...limiters.EDGE_ADMISSION_REPLAY_BINDINGS],
+    policy: [...edgePolicy.EDGE_ADMISSION_BINDINGS],
+  };
+  assert.ok(lists.configuration.length > 1);
+  host.assertEdgeTierBindings();
+  host.assertEdgeTierBindings(lists);
+  host.assertEdgeTierBindings({ ...lists, replay: [...lists.replay].reverse() });
+  for (const name of Object.keys(lists)) {
+    for (const [label, drifted] of [
+      ["one missing", lists[name].slice(1)],
+      ["one extra", [...lists[name], "SYNTHETIC_EXTRA_RATE_LIMIT"]],
+      ["one renamed", [`${lists[name][0]}_RENAMED`, ...lists[name].slice(1)]],
+    ]) {
+      assert.throws(() => host.assertEdgeTierBindings({ ...lists, [name]: drifted }),
+        { code: "EDGE_TIER_BINDINGS_DRIFT" }, `${name}: ${label}`);
+    }
+  }
+  // The composed runtime makes the check itself: EP-6's replay list missing
+  // one binding refuses before a connector, pool or store exists.
+  const { server, drifted } = await hostWithSubstitute("./postgres-edge-admission-limiters.mjs", [
+    "import * as real from \"/cloud-run/postgres-edge-admission-limiters.mjs\";",
+    "export const createEdgeAdmissionLimiters = real.createEdgeAdmissionLimiters;",
+    "export const EDGE_ADMISSION_REPLAY_BINDINGS = Object.freeze(real.EDGE_ADMISSION_REPLAY_BINDINGS.slice(1));",
+  ].join("\n"));
+  try {
+    const seams = dependencies();
+    await refusedBefore(() => drifted.createPostgresProductionRuntime({ processEnv: productionEnv(),
+      hostMode: "production", dependencies: seams.dependencies }), "EDGE_TIER_BINDINGS_DRIFT", "a drifted replay list");
+    assert.deepEqual(seams.calls, [], "no connector, pool or store");
+  } finally {
+    await server.close();
+  }
+});
+
+test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health flags refuses and closes what opened",
+  async () => {
+    // The registry the runtime builds, wrapped so that resolve() may claim one
+    // more route ported than the list the flags came from.
+    const claim = Symbol.for("d-crb.production-host.registry-claim");
+    const { server, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
+      "import * as real from \"/cloud-run/postgres-production-registry.mjs\";",
+      "export const ADMIN_HOST_ROUTE_IDS = real.ADMIN_HOST_ROUTE_IDS;",
+      "export function createProductionRouteRegistry(options) {",
+      "  const registry = real.createProductionRouteRegistry(options);",
+      "  return Object.freeze({ ...registry, resolve(id) {",
+      `    return id === globalThis[Symbol.for(${JSON.stringify(claim.description)})]`,
+      "      ? Object.freeze({ disposition: real.ORIGIN_ROUTE_DISPOSITIONS.PORTED, handler: async () => new Response(null) })",
+      "      : registry.resolve(id);",
+      "  } });",
+      "}",
+    ].join("\n"));
+    try {
+      // Control: with no claim the flags agree and the composition goes on to
+      // the CR-6 handler, which refuses the wrapper as an unissued registry.
+      const control = dependencies();
+      await refusedBefore(() => drifted.createPostgresProductionRuntime({ processEnv: productionEnv(),
+        hostMode: "production", dependencies: control.dependencies }), "PRODUCTION_HANDLER_REGISTRY_INVALID",
+      "no claim: past the flags check");
+      // Each OD-CR-5 flag's route claimed ported by the registry alone.
+      for (const routeId of ["participant_export", "identity_google_start"]) {
+        globalThis[claim] = routeId;
+        const seams = dependencies();
+        await refusedBefore(() => drifted.createPostgresProductionRuntime({ processEnv: productionEnv(),
+          hostMode: "production", dependencies: seams.dependencies }), "HEALTH_CAPABILITY_FLAGS_DRIFT", routeId);
+        assert.deepEqual(seams.calls.filter((call) => call.startsWith("pool-end:")).sort(), [
+          "pool-end:tibotattle-origin-admission", "pool-end:tibotattle-origin-data",
+          "pool-end:tibotattle-origin-readiness",
+        ], `${routeId}: every opened pool is closed`);
+        assert.ok(seams.calls.includes("connector-closed"), `${routeId}: the connector is closed`);
+      }
+    } finally {
+      delete globalThis[claim];
+      await server.close();
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// run_maintenance over C-MAINT's lifecycle pass (the ADMIN-R12 path)
+
+const ADMIN_ORIGIN = "https://admin.synthetic.example";
+const ADMIN_OWNER = "owner@synthetic.example";
+const MAINTENANCE_NOW = Date.parse("2026-10-02T12:00:30.000Z");
+
+/**
+ * A pool whose sessions answer the lifecycle pass from a script: the
+ * maintenance lock (held or not), the migration fence, the transaction
+ * statements and the one receipt probe, with `serverVersionNum`. Any other
+ * statement fails the check. Statements are recorded by their first words.
+ */
+function scriptedPassPool({ maintenanceLock = true, serverVersionNum = 170_004 } = {}) {
+  const statements = [];
+  return {
+    statements,
+    pool: {
+      async connect() {
+        return {
+          async query(text) {
+            const sql = String(text).trim();
+            statements.push(sql.split(/\s+/u).slice(0, 2).join(" "));
+            if (sql.startsWith("SELECT pg_try_advisory_lock(")) return { rows: [{ acquired: maintenanceLock }] };
+            if (sql.startsWith("SELECT pg_try_advisory_lock_shared(")) return { rows: [{ acquired: true }] };
+            if (sql.startsWith("SELECT pg_advisory_unlock")) return { rows: [{ released: true }] };
+            if (sql.includes("current_setting('server_version_num')")) {
+              return { rows: [{ server_version_num: serverVersionNum, schema_exists: true, history: "synthetic" }] };
+            }
+            if (/^(?:BEGIN|SET LOCAL|COMMIT|ROLLBACK)\b/u.test(sql)) return { rows: [] };
+            throw new Error("the scripted pass reached a statement it does not answer");
+          },
+          release() {},
+        };
+      },
+    },
+  };
+}
+
+/** C-ADMIN's admin_action family with recording audit adapters and the real lifecycle-pass task. */
+async function maintenanceAction(pool) {
+  const action = await vite.ssrLoadModule("/cloud-run/routes/admin-action.mjs");
+  const calls = [];
+  const audit = (name, value) => async (input) => {
+    calls.push([name, input.outcome ?? null, JSON.parse(JSON.stringify(input.details))]);
+    return value;
+  };
+  const contexts = new WeakMap();
+  const dispatch = action.createAdminActionDispatch({
+    requestContext: (request) => contexts.get(request),
+    clock: () => MAINTENANCE_NOW,
+    admin: {
+      setCollectionControls: async () => { throw new Error("not reached"); },
+      beginAudit: audit("beginAudit", "11111111-2222-4333-8444-555555555555"),
+      finishAudit: audit("finishAudit", undefined),
+      finishAuditBestEffort: audit("finishAuditBestEffort", undefined),
+      maintenance: host.createLifecyclePassMaintenance({
+        pool, objectStore: { async head() { return null; }, async delete() {} }, primarySchema: "origin_primary",
+      }),
+    },
+  });
+  return {
+    calls,
+    async run() {
+      const request = new Request(`${ADMIN_ORIGIN}/api/v1/admin/action`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ADMIN_ORIGIN, "sec-fetch-site": "same-origin",
+          "x-usage-monitor-admin": "1" },
+        body: JSON.stringify({ action: "run_maintenance" }),
+      });
+      contexts.set(request, Object.freeze({ requestId: REQUEST_ID, routeId: "admin_action", adminIdentityKey: ADMIN_OWNER }));
+      return dispatch(request);
+    },
+  };
+}
+
+test("run_maintenance over the lifecycle pass: a refused or failed pass is a failure audit and an error, never 200",
+  async () => {
+    const pass = await vite.ssrLoadModule("/src/postgres-lifecycle-pass.ts");
+    // Every refused and failed pass code has exactly one of the three Worker answers.
+    const { refused, failure } = pass.POSTGRES_LIFECYCLE_PASS_CODES;
+    assert.deepEqual(Object.keys(host.LIFECYCLE_PASS_ADMIN_ERRORS).sort(), [...refused, ...failure].sort());
+    const answers = Object.values(host.LIFECYCLE_PASS_ADMIN_ERRORS).map((answer) => `${answer.status} ${answer.code}`);
+    assert.deepEqual([...new Set(answers)].sort(),
+      ["500 INTERNAL_ERROR", "503 BACKEND_STORAGE_UNAVAILABLE", "503 LIFECYCLE_STATE_CONFLICT"]);
+    for (const code of failure) {
+      assert.equal(`${host.LIFECYCLE_PASS_ADMIN_ERRORS[code].status} ${host.LIFECYCLE_PASS_ADMIN_ERRORS[code].code}`,
+        "500 INTERNAL_ERROR", code);
+    }
+    for (const code of ["POSTGRES_VERSION_UNSUPPORTED", "POSTGRES_SCHEMA_RECEIPT_MISMATCH", "LIFECYCLE_STATE_MISSING",
+      "LIFECYCLE_STATE_SHAPE_INVALID"]) {
+      assert.equal(host.LIFECYCLE_PASS_ADMIN_ERRORS[code].code, "BACKEND_STORAGE_UNAVAILABLE", code);
+    }
+    for (const code of ["LIFECYCLE_LEASE_CONFLICT", "LIFECYCLE_CYCLE_REGRESSED", "LIFECYCLE_STATE_CHECK_CONFLICT",
+      "LIFECYCLE_RESTORE_PIN_CONFLICT"]) {
+      assert.equal(host.LIFECYCLE_PASS_ADMIN_ERRORS[code].code, "LIFECYCLE_STATE_CONFLICT", code);
+    }
+
+    const expectFailure = async (pool, status, code, label) => {
+      const action = await maintenanceAction(pool);
+      const response = await action.run();
+      assert.equal(response.status, status, label);
+      assert.deepEqual(await response.json(), { error: { code, requestId: REQUEST_ID } }, label);
+      assert.equal(response.headers.get("retry-after"), null, label);
+      assert.deepEqual(action.calls, [
+        ["beginAudit", null, { phase: "started" }],
+        ["finishAuditBestEffort", "failure", { code }],
+      ], `${label}: a started and a failure audit, no success`);
+    };
+    // A failed pass (no session): the Worker's raw-failure answer.
+    await expectFailure({ async connect() { throw new Error("synthetic connect failure"); } },
+      500, "INTERNAL_ERROR", "failure: POSTGRES_MAINTENANCE_UNAVAILABLE");
+    // A refused pass: PostgreSQL 16 under the lock, read through the one
+    // receipt reader inside the pass's transaction; nothing is written.
+    const old = scriptedPassPool({ serverVersionNum: 160_004 });
+    await expectFailure(old.pool, 503, "BACKEND_STORAGE_UNAVAILABLE", "refused: POSTGRES_VERSION_UNSUPPORTED");
+    assert.ok(old.statements.includes("SELECT current_setting('server_version_num')::integer"), old.statements.join("; "));
+    assert.ok(old.statements.includes("ROLLBACK"), "the refused transaction rolls back");
+    assert.ok(!old.statements.some((statement) => /^(?:INSERT|UPDATE|DELETE)\b/u.test(statement)), "nothing written");
+    assert.equal(old.statements.filter((statement) => statement.startsWith("SELECT pg_advisory_unlock")).length, 2,
+      "the lock and the fence are released");
+    // A skipped pass is still the Worker's 409 (C-ADMIN's mapping).
+    const busy = scriptedPassPool({ maintenanceLock: false });
+    await expectFailure(busy.pool, 409, "LIFECYCLE_STATE_CONFLICT", "skipped: MAINTENANCE_IN_PROGRESS");
+  });
