@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -341,50 +341,89 @@ test("the production-tier script's signal handling tears down at once and leaves
     const end = lines.findIndex((line, index) => index > start && line === "}");
     return lines.slice(start, end + 1).join("\n");
   };
-  const marker = `29.${process.pid % 10_000}1`;
   const dir = mkdtempSync(join(tmpdir(), "prodtier-trap-"));
+  const ownedFile = join(dir, "owned-pids");
+  const samplerFile = join(dir, "sampler-started");
+  const own = `printf '%s\\n' $$ >> '${ownedFile}'; /bin/sleep 30 & printf '%s\\n' $! >> '${ownedFile}'; wait`;
+  writeFileSync(join(dir, "owned.sh"), own);
   const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0", "SAMPLER=0",
-    definition("child"), definition("tree"), definition("stop"),
+    definition("child"), definition("tree"), definition("terminate"), definition("stop"),
     "teardown() { [[ $TORN == 1 ]] && return; TORN=1; printf 'teardown %.1f\\n' $(( EPOCHREALTIME - T0 )); }",
-    // D's shape: a function whose process runs another (node, then its gcloud).
-    `D() { /bin/sh -c '/bin/sleep ${marker}; true'; }`,
+    `D() { /bin/sh "${join(dir, "owned.sh")}"; }`,
     "trap teardown EXIT", "trap stop INT TERM HUP",
     `child "${join(dir, "step.log")}" - D x || exit 1`, "echo finished"].join("\n");
-  // The same with the database sampler running beside the step (`sampled`), mid-snapshot: its snapshot is
-  // itself a waited child (as pgstat runs it), and both trees end.
-  const samplerMarker = `31.${process.pid % 10_000}2`;
   const sampledHarness = harness.replace(`child "${join(dir, "step.log")}" - D x || exit 1`, [
-    "PGSTAT_INTERVAL=0.1", `pgstat() { child /dev/null - /bin/sh -c '/bin/sleep ${samplerMarker}; true'; }`,
+    "PGSTAT_INTERVAL=0.1", `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "owned.sh")}"; }`,
     definition("sampler"), definition("sampled"),
     `sampled lbl "${join(dir, "step.log")}" - D x || exit 1`].join("\n"));
-  const running = () => spawnSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" }).status === 0;
-  const samplerRunning = () => spawnSync("pgrep", ["-f", `sleep ${samplerMarker}`], { encoding: "utf8" }).status === 0;
+  // Widen precisely the snapshot-to-signal race: a sampler whose sleeping
+  // child was enumerated can finish sleeping and spawn its snapshot child
+  // before tree() returns. Only this owned sampler is delayed, never global ps.
+  const race = `pgrep() { local found n; found=$(command pgrep "$@" 2>/dev/null);
+` +
+    `  if [[ "$2" == "$SAMPLER" ]]; then
+` +
+    `    for n in {1..100}; do [[ -f '${samplerFile}' ]] && break; /bin/sleep 0.01; done
+` +
+    `  fi; print -r -- "$found"; }`;
+  const finishingHarness = sampledHarness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`, "D() { /bin/sleep 0.5; }");
+  const racingHarness = sampledHarness.replace("trap teardown EXIT", `${race}\ntrap teardown EXIT`);
+  const ownedPids = () => existsSync(ownedFile) ? readFileSync(ownedFile, "utf8").trim().split(/\s+/u).map(Number) : [];
+  const running = (pid) => {
+    const result = spawnSync("ps", ["-p", String(pid), "-o", "stat="], { encoding: "utf8" });
+    if (result.error) throw result.error;
+    if (result.status !== 0 && result.status !== 1) throw new Error(`process visibility refused: ${result.stderr}`);
+    return result.status === 0 && result.stdout.trim() !== "" && !result.stdout.trim().startsWith("Z");
+  };
+  const delay = () => new Promise((wake) => setTimeout(wake, 20));
   try {
     for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
-      ["SIGTERM", sampledHarness]]) {
-      const shell = spawn("zsh", ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
+      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness]]) {
+      rmSync(ownedFile, { force: true });
+      rmSync(samplerFile, { force: true });
+      const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
       let output = "";
       shell.stdout.on("data", (chunk) => { output += chunk; });
+      shell.stderr.on("data", (chunk) => { output += chunk; });
       const exited = new Promise((resolveExit) => shell.on("exit", (code) => resolveExit(code)));
-      const started = Date.now();
-      while (!running() && Date.now() - started < 10_000) await new Promise((wake) => setTimeout(wake, 100));
-      assert.equal(running(), true, "the stand-in step started");
-      if (script === sampledHarness) assert.equal(samplerRunning(), true, "the sampler is running beside it");
-      const signalled = Date.now();
-      shell.kill(signal);
-      const code = await exited;
-      assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
-      assert.equal(code, 130, signal);
-      assert.match(output, /^teardown \d+\.\d\n$/u, `${signal}: teardown ran, the step did not finish`);
-      await new Promise((wake) => setTimeout(wake, 300));
-      assert.equal(running(), false, `${signal}: no orphaned grandchild`);
-      assert.equal(samplerRunning(), false, `${signal}: no orphaned sampler`);
+      try {
+        const started = Date.now();
+        while (ownedPids().length < 2 && Date.now() - started < 5_000) await delay();
+        assert.equal(ownedPids().length >= 2, true, "the exact owned step started");
+        if (script === sampledHarness) {
+          while (ownedPids().length < 4 && Date.now() - started < 5_000) await delay();
+          assert.equal(ownedPids().length >= 4, true, "the exact owned sampler started");
+        }
+        // A refused ps read must fail this gate, never look like successful
+        // cleanup. Prove visibility and group ownership while children live.
+        for (const pid of ownedPids()) {
+          assert.equal(running(pid), true, "exact owned child is visible before cleanup");
+          const group = spawnSync("ps", ["-p", String(pid), "-o", "pgid="], { encoding: "utf8" });
+          assert.equal(group.status, 0, "owned process group is readable");
+          assert.equal(Number(group.stdout.trim()), shell.pid, "owned child belongs to the isolated harness group");
+        }
+        const signalled = Date.now();
+        if (signal !== null) shell.kill(signal);
+        const code = await Promise.race([exited, new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error(`${signal}: teardown exceeded 5 seconds`)), 5_000);
+          timer.unref();
+        })]);
+        assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
+        assert.equal(code, signal === null ? 0 : 130, signal);
+        assert.match(output, signal === null ? /^finished\nteardown \d+\.\d\n$/u : /^teardown \d+\.\d\n$/u,
+          `${signal}: teardown ran with the expected step outcome`);
+        await new Promise((wake) => setTimeout(wake, 300));
+        assert.deepEqual(ownedPids().filter(running), [], `${signal} ${script === racingHarness ? "racing sampler" : script === sampledHarness ? "active sampler" : "step"}: no orphaned exact-owned step or sampler`);
+      } finally {
+        // detached:true gives this one harness its own process group. Cleanup
+        // targets only that exact group, including escaped descendants, never
+        // command substrings or processes owned by another measurement.
+        try { process.kill(-shell.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+        await exited;
+      }
     }
-  } finally {
-    spawnSync("pkill", ["-f", `sleep ${marker}`]);
-    spawnSync("pkill", ["-f", `sleep ${samplerMarker}`]);
-    rmSync(dir, { recursive: true, force: true });
-  }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+
 });
 
 test("the local measurement runs the wrapper's dense profiles and summarises busy cores from ps samples", async () => {

@@ -174,10 +174,30 @@ child() {
   if [[ $err == - ]]; then "$@" > "$out" 2>&1 & else "$@" > "$out" 2> "$err" & fi
   CHILD=$!; wait $CHILD; local rc=$?; CHILD=0; return $rc
 }
-# A process and all its descendants (D's subshell, node, the gcloud it runs).
-tree() { local p; print -r -- $1; for p in $(pgrep -P $1 2>/dev/null); do tree $p; done; }
-stop() { (( SAMPLER )) && kill -TERM $(tree $SAMPLER) 2>/dev/null; SAMPLER=0
-  (( CHILD )) && kill -TERM $(tree $CHILD) 2>/dev/null; CHILD=0; exit 130; }
+# Freeze each owned parent before enumerating its children. Otherwise a sampler
+# can finish sleep and spawn a snapshot after tree() captured the old children.
+# A frozen parent cannot create new descendants while we freeze the subtree.
+tree() {
+  kill -STOP $1 2>/dev/null || return
+  local p
+  print -r -- $1
+  for p in $(pgrep -P $1 2>/dev/null); do tree $p; done
+}
+terminate() {
+  local root=$1
+  local -a pids
+  pids=($(tree $root))
+  (( ${#pids} )) || return 0
+  # TERM stays pending while stopped; CONT lets each owned process handle it.
+  # Reap the direct child before forgetting its PID, including normal sampler
+  # shutdown after an execution. No command-pattern or global process signals.
+  kill -TERM $pids 2>/dev/null
+  kill -CONT $pids 2>/dev/null
+  wait $root 2>/dev/null
+  return 0
+}
+stop() { (( SAMPLER )) && terminate $SAMPLER; SAMPLER=0
+  (( CHILD )) && terminate $CHILD; CHILD=0; exit 130; }
 # One read-only database snapshot (bounded: a 15 s connect and 60 s statement
 # timeout), a waited child; a failure is recorded, never fatal.
 pgstat() {
@@ -202,7 +222,7 @@ sampled() {
   sampler "$label" &
   SAMPLER=$!
   child "$@"; local rc=$?
-  (( SAMPLER )) && kill -TERM $(tree $SAMPLER) 2>/dev/null; SAMPLER=0
+  (( SAMPLER )) && terminate $SAMPLER; SAMPLER=0
   return $rc
 }
 # The Cloud Monitoring read for one run: the execution's window from its
