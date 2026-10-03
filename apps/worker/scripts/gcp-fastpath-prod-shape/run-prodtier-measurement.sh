@@ -237,7 +237,16 @@ sampled() {
   sampler "$label" &
   SAMPLER=$!
   child "$@"; local rc=$?
-  if (( SAMPLER )); then terminate $SAMPLER || rc=1; fi
+  if (( SAMPLER )); then
+    if ! terminate $SAMPLER; then
+      SAMPLER=0
+      # Refresh refusal codes are measurement data; cleanup failure is not.
+      # Exit this wrapper here so both real callers reach EXIT teardown even
+      # when a refresh receipt already exists and would otherwise be consumed.
+      print -u2 -- 'MEAS_LOCAL_PROCESS_CLEANUP_FAILED'
+      exit 1
+    fi
+  fi
   SAMPLER=0
   return $rc
 }

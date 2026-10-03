@@ -32,8 +32,18 @@ drivers; the independent EXIT `meas-teardown` remains authoritative for remote
 cancellation and cleanup. Frozen identities are not signalled again after an
 unfreeze/grace interval. No shared production process group is signalled.
 
+The next checkpoint `12c3aabff0f95aa20f9363b87d8f1f0c8fb707b0` fixed
+resistant-process disposal but was also requested-changes: the real guarded
+and uncapped callers treat refresh exit codes as data, so a generic nonzero
+`sampled` return did not stop them from using existing receipts.
+
+Cleanup failure now emits the separate `MEAS_LOCAL_PROCESS_CLEANUP_FAILED`
+marker and exits the wrapper from `sampled`, triggering EXIT teardown before
+either maintained caller can read or qualify an existing receipt. Successful
+cleanup still returns the original refresh exit code unchanged.
+
 A capture error still disposes every already-frozen PID and reports
-`MEAS_LOCAL_PROCESS_CAPTURE_FAILED`; normal sampler cleanup propagates failure.
+`MEAS_LOCAL_PROCESS_CAPTURE_FAILED`; normal sampler cleanup exits the wrapper on failure.
 It does not claim undiscovered descendants were proved absent. Teardown, exit
 130, measurement profiles and task timeouts are unchanged.
 The test records only its own child PIDs and starts each harness in a dedicated
@@ -47,13 +57,17 @@ Validation:
 - `zsh -n apps/worker/scripts/gcp-fastpath-prod-shape/run-prodtier-measurement.sh`
   passed.
 - `node --test apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs`
-  passed 13/13 local fixture tests.
+  passed 14/14 local fixture tests.
 - The revised regression covers TERM/INT/HUP, active sampler, controlled spawn
   race, normal completion, TERM-resistant root, TERM-resistant descendants,
   resistant sampler completion, capture refusal and normal-cleanup capture-error
   propagation. Exit and inherited output
   pipes must close within the existing five-second bound; all recorded owned
   processes must be gone.
+- A regression executes the real guarded/uncapped caller loop verbatim with
+  synthetic command adapters and already-written receipts. Cleanup failures
+  exit 1 and run teardown without metrics or continuation; ordinary guarded
+  and uncapped refusal codes 7 and 9 remain data and continue normally.
 - An unrelated exact-owned sentinel in a separate group survives every case.
 - The revised visibility/group-ownership and resistant-child regression passed,
   including three repeated extended runs. Earlier five ordinary-child repetitions

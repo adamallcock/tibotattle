@@ -433,7 +433,8 @@ test("the production-tier script's signal handling tears down at once and leaves
         })]);
         assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
         assert.equal(code, script === captureCompletionFailureHarness ? 1 : signal === null ? 0 : 130, signal);
-        assert.match(output, captureFailed ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nteardown \d+\.\d\n$/u
+        assert.match(output, script === captureCompletionFailureHarness ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nMEAS_LOCAL_PROCESS_CLEANUP_FAILED\nteardown \d+\.\d\n$/u
+          : captureFailed ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nteardown \d+\.\d\n$/u
           : signal === null ? /^finished\nteardown \d+\.\d\n$/u : /^teardown \d+\.\d\n$/u,
           `${signal}: teardown ran with the expected step outcome`);
         await Promise.race([closed, new Promise((_, reject) => {
@@ -605,4 +606,87 @@ test("local Worker profiling projection is explicit and paired with exact source
   assert.throws(() => workerProfileEnv({ workerProfileDir: "relative", workerProfileSource: "a".repeat(40) }), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
   assert.deepEqual(workerProfileEnv({ workerProfileDir: "/private/tmp/synthetic", workerProfileSource: "a".repeat(40) }), {
     ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: "/private/tmp/synthetic", ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: "a".repeat(40) });
+});
+
+// Execute the maintained guarded/uncapped caller loop verbatim. Existing
+// receipts must not turn failed local cleanup into a successful measurement;
+// ordinary refresh refusal codes must still remain data.
+test("real production-tier callers abort cleanup failures independently of refresh receipt outcomes", async () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
+  const definition = name => {
+    const lines = source.split("\n"), start = lines.findIndex(line => line.startsWith(`${name}() {`));
+    assert.ok(start >= 0, name);
+    if (lines[start].trimEnd().endsWith("}")) return lines[start];
+    return lines.slice(start, lines.findIndex((line, index) => index > start && line === "}") + 1).join("\n");
+  };
+  const start = source.lastIndexOf('for PROFILE in "${PROFILES[@]}"; do');
+  const end = source.indexOf("\ndone", start) + "\ndone".length;
+  assert.ok(start >= 0 && end > start, "the actual profile caller loop exists");
+  const callers = source.slice(start, end);
+  assert.match(callers, /sampled "\$PROFILE-guarded"/u);
+  assert.match(callers, /sampled "\$PROFILE"/u);
+  const root = mkdtempSync(join(tmpdir(), "prodtier-callers-"));
+  try {
+    for (const [name, guarded, failure] of [["guarded-failure", 1, true], ["uncapped-failure", 0, true],
+      ["refusals-remain-data", 1, false]]) {
+      const dir = join(root, name), pidsPath = join(dir, "sampler-pids");
+      mkdirSync(dir, { mode: 0o700 });
+      const script = ["set -u", "CHILD=0", "SAMPLER=0", `OUT='${dir}'`, `GUARDED=${guarded}`,
+        "PROFILES=(dense)", "REFRESH_ENV=()", "INSTANCE=synthetic-measurement", "IMG=synthetic-image",
+        "SCHEMA=synthetic", "NOW=2026-10-01T12:46:00.000Z", "UNCAPPED_TIMEOUT=172800",
+        `NODE26='${process.execPath}'`, definition("child"), definition("tree"), definition("terminate"),
+        definition("sampled").replace("SAMPLER=$!", `SAMPLER=$!; print -r -- $SAMPLER >> '${pidsPath}'`),
+        // A synthetic long-lived sampler root; no unseen child is fabricated
+        // when the deliberately refused enumeration is exercised.
+        "sampler() { exec /bin/sleep 30; }", "step() { :; }", "pgstat() { :; }",
+        "metrics() { print -r -- metrics-reached; }", "teardown() { print -r -- teardown; }", "trap teardown EXIT",
+        failure ? "pgrep() { return 2; }" : "",
+        `D() { local action=$1 arg destination=''; shift; for arg in "$@"; do
+          [[ "$arg" == --out=* ]] && destination=\${arg#--out=}; done
+          mkdir -p "$destination"; /bin/sleep 0.2
+          if [[ "$action" == refresh ]]; then
+            print -r -- '${failure ? '{"results":[{"status":"ok","state":"complete"}]}' : '{"results":[{"status":"failed","code":"TIME_GUARD_REACHED"}]}'}' > "$destination/refresh.json"
+            return ${failure ? 0 : 7}
+          fi
+          print -r -- '{}' > "$destination/refresh-uncapped.json"
+          return ${failure ? 0 : 9}
+        }`, callers, "print -r -- continued"].join("\n");
+      const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      shell.stdout.on("data", chunk => { output += chunk; });
+      shell.stderr.on("data", chunk => { output += chunk; });
+      const exit = new Promise(resolveExit => shell.on("exit", resolveExit));
+      const close = new Promise(resolveClose => shell.on("close", resolveClose));
+      try {
+        const began = Date.now();
+        while (!existsSync(pidsPath) && Date.now() - began < 5_000) await new Promise(resolveWait => setTimeout(resolveWait, 10));
+        assert.ok(existsSync(pidsPath), `${name}: real caller started its sampler`);
+        const first = Number(readFileSync(pidsPath, "utf8").trim().split(/\s+/u)[0]);
+        const visible = spawnSync("ps", ["-p", String(first), "-o", "pgid="], { encoding: "utf8" });
+        assert.equal(visible.status, 0, "actual sampler process is visible");
+        assert.equal(Number(visible.stdout.trim()), shell.pid, "actual sampler belongs to the owned group");
+        const timeout = new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error(`${name}: wrapper or held pipe exceeded 5 seconds`)), 5_000);
+          timer.unref();
+        });
+        const code = await Promise.race([exit, timeout]);
+        await Promise.race([close, timeout]);
+        assert.equal(code, failure ? 1 : 0, name);
+        assert.match(output, /teardown\n/u, "EXIT teardown ran");
+        assert.ok(existsSync(join(dir, "dense", "refresh", "refresh.json")), "a refresh receipt existed");
+        if (failure) {
+          assert.match(output, /MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nMEAS_LOCAL_PROCESS_CLEANUP_FAILED\n/u);
+          assert.doesNotMatch(output, /continued|metrics-reached/u, "caller cannot qualify or continue after cleanup failure");
+          if (!guarded) assert.ok(existsSync(join(dir, "dense", "uncapped", "refresh-uncapped.json")));
+        } else {
+          assert.match(output, /refresh dense rc=7 \(a guard refusal is data\)/u);
+          assert.match(output, /uncapped dense rc=9/u);
+          assert.match(output, /metrics-reached\ncontinued\nteardown\n/u);
+        }
+      } finally {
+        try { process.kill(-shell.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+        await exit;
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
