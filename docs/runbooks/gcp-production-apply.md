@@ -241,6 +241,14 @@ jobs and the executor binding), and an empty scheduler list (the trigger waits
 for the cadence). The readback is the post-apply proof of the logging
 exclusion. Keep the files; they are content-free.
 
+From pass 2 on, each trigger apply creates carries `httpTarget.headers =
+{"User-Agent": "Google-Cloud-Scheduler"}`, stored by Cloud Scheduler although
+apply passes no `--headers` (observed on staging, 2026-10-03). Readback
+accepts exactly that map as no override; any other header, value or name
+casing, an extra header, or a body is still drift, and `--require-clean`
+reports `EXECUTABLE:scheduler:update:<job>`. Do not apply that update to
+clear a header: it passes no header or body flag, so it does not remove one.
+
 ## 7. Secrets
 
 OPS-2 made the four containers in step 5. Versions come from two places.

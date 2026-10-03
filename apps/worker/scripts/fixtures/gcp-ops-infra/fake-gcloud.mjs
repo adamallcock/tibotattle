@@ -150,6 +150,13 @@ function applySqlFlags(instance, argv) {
 }
 
 /**
+ * The header map live Cloud Scheduler stores on a created HTTP job (staging
+ * readback, 2026-10-03). Kept literal here, not imported, so the fixture
+ * records what was observed rather than what the planner accepts.
+ */
+export const INJECTED_SCHEDULER_HEADERS = Object.freeze({ "User-Agent": "Google-Cloud-Scheduler" });
+
+/**
  * Returns { runner, calls, world }. `files` maps a written spec path to its
  * text (the in-memory writer the check gives apply). `failWhen(argv)` makes a
  * call exit non-zero with a marker on stderr. `clock()` stamps a trigger's
@@ -306,6 +313,15 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
       case words.slice(0, 4).join(" ") === "scheduler jobs update http": {
         const jobName = `projects/${project}/locations/${region}/jobs/${words[4]}`;
         const previous = world.schedulerJobs.find((job) => job.name === jobName);
+        if (argv.some((arg) => /^--(?:headers|update-headers|remove-headers|clear-headers|message-body)/u.test(arg))) {
+          return { status: 2, stdout: "", stderr: "synthetic: header and body flags are not modelled" };
+        }
+        // Cloud Scheduler stores this header on every HTTP job created without
+        // --headers (observed live on staging, 2026-10-03); an update that
+        // names no header or body flag keeps the stored headers and body.
+        const created = words[2] === "create";
+        const headers = created ? { ...INJECTED_SCHEDULER_HEADERS } : previous?.httpTarget?.headers;
+        const body = created ? undefined : previous?.httpTarget?.body;
         world.schedulerJobs = world.schedulerJobs.filter((job) => job.name !== jobName);
         world.schedulerJobs.push({
           name: jobName,
@@ -314,6 +330,8 @@ export function createFakeGcloud(world, { files = new Map(), failWhen = () => fa
           httpTarget: {
             uri: flag(argv, "--uri"),
             httpMethod: flag(argv, "--http-method"),
+            ...(headers === undefined ? {} : { headers: structuredClone(headers) }),
+            ...(body === undefined ? {} : { body }),
             oauthToken: { serviceAccountEmail: flag(argv, "--oauth-service-account-email"),
               scope: flag(argv, "--oauth-token-scope") },
           },
