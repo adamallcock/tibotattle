@@ -13,6 +13,13 @@
 // byte-equal to the Worker's identityLinkSecretFingerprint
 // (src/identity-link-configuration.ts). It is a keyed digest: keep it in the
 // owner directory, never in the repository.
+//
+// The pin hashes the EXACT stdin bytes, because the service hashes the exact
+// mounted bytes (configuredIdentityLinkSecret checks only the length and never
+// trims). Input ending in "\n" or "\r" is refused rather than stripped: a
+// Secret Manager version stored with a trailing newline (for example written
+// with `echo … |`) loads WITH it, so a stripped pin would pass P8 and the
+// service would then fail every hosted-identity operation after markLive.
 
 import { createHmac } from "node:crypto";
 
@@ -49,9 +56,11 @@ export function identityLinkSecretFingerprint(secret) {
 }
 
 /**
- * Read the secret from a stream (stdin): at most 4 KiB of UTF-8, one optional
- * trailing newline removed (what `gcloud secrets versions access` and `echo`
- * add). The bytes are never logged.
+ * Read the secret from a stream (stdin): at most 4 KiB of strict UTF-8, kept
+ * byte for byte (a leading byte-order mark is kept too). Input that ends in a
+ * line feed or a carriage return is refused (CUTOVER_IDENTITY_LINK_SECRET_INVALID),
+ * never stripped: check how that Secret Manager version was stored. The bytes
+ * are never logged.
  */
 export async function readSecretFromStream(stream) {
   const chunks = [];
@@ -64,12 +73,11 @@ export async function readSecretFromStream(stream) {
   }
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
   } catch {
     fail("CUTOVER_IDENTITY_LINK_SECRET_INVALID");
   }
-  if (text.endsWith("\r\n")) text = text.slice(0, -2);
-  else if (text.endsWith("\n")) text = text.slice(0, -1);
+  if (text.endsWith("\n") || text.endsWith("\r")) fail("CUTOVER_IDENTITY_LINK_SECRET_INVALID");
   return text;
 }
 

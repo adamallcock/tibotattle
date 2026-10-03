@@ -20,8 +20,8 @@ import {
   OWNER_FILES,
   PRODUCTION_DESIRED_STATE_FILE,
   PRODUCTION_TRANSFER_INPUTS_SCHEMA,
-  SCHEDULED_TRIGGER_JOBS,
   SCHEDULER_PROBE_SCHEMA,
+  TYPED_IDENTITY_TABLES,
   abandon,
   createTransferContext,
   flipGate,
@@ -35,6 +35,11 @@ import {
   writeReport,
 } from "../scripts/postgres-production-transfer.mjs";
 import { DISPOSITIONS, OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED, STAGE_PLAN } from "../scripts/postgres-transfer-coverage.mjs";
+import {
+  OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
+  PENDING_OBJECT_TRANSFER_HOLD_GUARD,
+  PENDING_OBJECT_TRANSFER_HOLD_TABLE,
+} from "../scripts/postgres-legacy-contribution-transfer.mjs";
 import { dropTransferStagingRelations, withTransferTransaction } from "../scripts/postgres-transfer-target.mjs";
 import { createW2SealCluster, PRIMARY_SCHEMA, TRANSFER_ROLE, localSocket } from "./fixtures/w2-seal/pg-target.mjs";
 import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorld } from "./fixtures/w2-seal/seal-harness.mjs";
@@ -86,7 +91,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
   async function ownerDirectory(target, { manifest = manifestPath, sealId = seal.manifest.sealId, inputs = {},
     pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {} } = {}) {
     const directory = await privateDirectory("ept8-owner-");
-    await writeIdentityPin({ ownerDirectory: directory, stream: Readable.from([`${pinSecret}\n`]),
+    await writeIdentityPin({ ownerDirectory: directory, stream: Readable.from([pinSecret]),
       keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, secretName: IDENTITY_MOUNT.secretName,
       secretVersion: IDENTITY_MOUNT.version, now: CONTEXT_NOW });
     const projectionSeal = ledgerSeal ?? await readCutoverSeal({ manifestPath: manifest, expectedSealId: sealId });
@@ -124,8 +129,9 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     return directory;
   }
 
+  /** One paused entry per managed trigger: the committed production desired state's scheduler map (P11). */
   function pausedTriggers() {
-    return SCHEDULED_TRIGGER_JOBS.map(job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED",
+    return world.managedTriggers.map(job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED",
       liveState: "PAUSED", quietMinutes: null, verdict: "paused_as_desired", alert: false }));
   }
 
@@ -179,6 +185,27 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
         (id, payload_text, payload_sha256, captured_at, source_commit, evidence_date, loaded_at)
       VALUES (1, $1, $2, $3::timestamptz, $4, $5::date, $6::timestamptz)`,
     [row.payload_text, row.payload_sha256, row.captured_at, row.source_commit, row.evidence_date, row.loaded_at]);
+  }
+
+  /**
+   * Replace the loaded frozen read with another valid export (the same body
+   * plus one trailing space: other bytes, another digest) and return a
+   * restorer for the original row.
+   */
+  async function swapFrozenRead(target) {
+    const [row] = await tamper(target, `SELECT payload_text, payload_sha256 FROM ${table("community_daily_frozen_export")}
+      WHERE id = 1`);
+    expect(row).toBeDefined();
+    const restoreOriginal = await removeFrozenRead(target);
+    const [swapped] = await tamper(target, `INSERT INTO ${table("community_daily_frozen_export")}
+        (id, payload_text, payload_sha256, captured_at, source_commit, evidence_date)
+      SELECT 1, $1 || ' ', encode(sha256(convert_to($1 || ' ', 'UTF8')), 'hex'), $2::timestamptz, $3, $4::date
+      RETURNING payload_sha256`, [row.payload_text, FIXTURE_CAPTURED_AT, world.commit, FIXTURE_EVIDENCE_DATE]);
+    expect(swapped.payload_sha256).not.toBe(row.payload_sha256);
+    return async () => {
+      await tamper(target, `DELETE FROM ${table("community_daily_frozen_export")} WHERE id = 1`);
+      await restoreOriginal();
+    };
   }
 
   /**
@@ -245,6 +272,8 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     world.fence = await writeFenceReceiptFixture({ directory: fenceDirectory, appliedAtMs: FENCE_APPLIED_MS });
     world.proof = await writeBarrierProofFixture({ directory: fenceDirectory, observedAtMs: FENCE_APPLIED_MS + 20 * 60_000 });
     world.desiredStatePath = await desiredStateFile();
+    world.managedTriggers = Object.keys(JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"))
+      .scheduler).sort();
     const run = await sealWorld(world, { overrides: { now: () => SEAL_NOW } });
     const sealed = await run.run();
     manifestPath = outputPathsOf(run.out).manifest;
@@ -418,15 +447,25 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     // L1: the first maintenance pass (simulated) and the post-live check; then the report.
     expect(await codeOf(postLiveCheck(await context(target, directory, { now: () => new Date() }))))
       .toBe("CUTOVER_POST_LIVE_NOT_READY");
+    // L2 needs L1's receipt: no report before the post-live check has passed.
+    expect(await codeOf(writeReport(await context(target, directory)))).toBe("CUTOVER_POST_LIVE_NOT_READY");
+    expect(await readdir(directory)).not.toContain(OWNER_FILES.report);
     await target.adminPrimary.query(`UPDATE ${table("retention_state")} SET state = 'completed',
       last_started_at = date_trunc('milliseconds', now()), last_completed_at = date_trunc('milliseconds', now()),
       maintenance_run_at = date_trunc('milliseconds', now()), restore_replay_complete = true, quarantine_retention_complete = true`);
     await target.adminPrimary.query(`UPDATE ${table("quarantine_reconciliation_state")} SET state = 'completed',
       last_started_at = date_trunc('milliseconds', now()), last_completed_at = date_trunc('milliseconds', now()),
       maintenance_run_at = (SELECT maintenance_run_at FROM ${table("retention_state")})`);
-    expect((await postLiveCheck(await context(target, directory, { now: () => new Date() }))).ready).toBe(true);
+    const postLive = await postLiveCheck(await context(target, directory, { now: () => new Date() }));
+    expect(postLive.ready).toBe(true);
+    // Clock-free: a later check (after another pass) computes the same receipt.
+    expect((await postLiveCheck(await context(target, directory, { now: () => new Date() }))).postLiveCheckSha256)
+      .toBe(postLive.postLiveCheckSha256);
     const report = await writeReport(await context(target, directory));
     expect(report.reportSha256).toMatch(/^[0-9a-f]{64}$/u);
+    const reportBody = JSON.parse(await readFile(join(directory, OWNER_FILES.report), "utf8"));
+    expect(reportBody.receipts.postLiveCheck).toBe(postLive.postLiveCheckSha256);
+    expect(reportBody.gates).toEqual({ preflight: "GO", flipGate: "ready", markLive: "live", postLiveCheck: "ready" });
 
     // Content-free: no participant id, secret or fingerprint in any receipt but the pin.
     const fingerprint = identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET);
@@ -521,13 +560,42 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     } finally {
       await admin.query(`GRANT "${cluster.roles.owner}" TO "${cluster.roles.transfer}" WITH INHERIT FALSE`);
     }
+    // P10: a privilege on the transfer control schema or a relation in it, PUBLIC
+    // (grantee 0, no pg_roles row) included: PT-1's flip-gate predicate, before the import.
+    for (const [grant, revoke] of [
+      ["GRANT USAGE ON SCHEMA tibotattle_transfer TO PUBLIC", "REVOKE USAGE ON SCHEMA tibotattle_transfer FROM PUBLIC"],
+      ["GRANT SELECT ON tibotattle_transfer.transfer_runs TO PUBLIC", "REVOKE SELECT ON tibotattle_transfer.transfer_runs FROM PUBLIC"],
+    ]) {
+      await target.adminPrimary.query(grant);
+      try {
+        await refuse({}, "CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", `P10 ${grant}`);
+      } finally {
+        await target.adminPrimary.query(revoke);
+      }
+    }
+    // P13: a present but disabled transfer-hold guard refuses, and the owner
+    // flag (passed through preflight's filter) never excuses it.
+    const holds = table(PENDING_OBJECT_TRANSFER_HOLD_TABLE);
+    await target.adminPrimary.query(`ALTER TABLE ${holds} DISABLE TRIGGER ${PENDING_OBJECT_TRANSFER_HOLD_GUARD}`);
+    try {
+      await refuse({}, "CUTOVER_PENDING_OBJECT_GUARD_MISSING", "P13 disabled guard");
+      await refuse({ inputs: { ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED, OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING] } },
+        "CUTOVER_PENDING_OBJECT_GUARD_MISSING", "P13 disabled guard with the owner flag");
+    } finally {
+      await target.adminPrimary.query(`ALTER TABLE ${holds} ENABLE TRIGGER ${PENDING_OBJECT_TRANSFER_HOLD_GUARD}`);
+    }
     // P11 scheduler (the producer's shape; DB-free cases are in the check), P12 the OWN-4 facts.
     await refuse({ scheduler: { triggers: pausedTriggers().map(trigger => ({ ...trigger, liveState: "ENABLED", verdict: "running" })) } },
       "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 running");
     await refuse({ scheduler: { checkedAt: "2026-10-01T23:00:00.000Z" } }, "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 before fence");
     await refuse({ scheduler: { project: "tibotattle-another" } }, "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 another project");
-    await refuse({ scheduler: { triggers: [...pausedTriggers(), { ...pausedTriggers()[0], job: "maintenance" }] } },
+    await refuse({ scheduler: { triggers: [...pausedTriggers(), { ...pausedTriggers()[0], job: "synthetic-unmanaged" }] } },
       "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 an unmanaged trigger");
+    // A trigger the desired state manages but the probe does not report.
+    const { scheduler: committedScheduler } = JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"));
+    await refuse({}, "CUTOVER_SCHEDULER_NOT_PAUSED", "P11 a managed trigger unreported", { desiredStatePath:
+      await desiredStateFile({ scheduler: { ...committedScheduler,
+        "synthetic-managed": { name: "tibotattle-synthetic-managed-trigger", schedule: null, state: "PAUSED" } } }) });
     const own4 = async (overrides) => {
       const directory = await ownerDirectory(target);
       const inputs = JSON.parse(await readFile(join(directory, OWNER_FILES.inputs), "utf8"));
@@ -610,6 +678,29 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_OWNER_REVISIONS_DIVERGED");
     await tamper(target, `UPDATE ${table("storage_owner_revisions")} SET authority_epoch = authority_epoch - 1
       WHERE source_id = $1 AND owner_digest = $2`, [revision.source_id, revision.owner_digest]);
+    // Post-import TL-1: a typed identity at or below max(id) once the restart
+    // has run (a restart that did not take effect) refuses before anything
+    // later in post-import.
+    const restartFunction = `${table("typed_telemetry_restart_identities")}()`;
+    const [restartDefinition] = (await target.adminPrimary.query(
+      `SELECT pg_get_functiondef($1::regprocedure) AS sql`, [restartFunction])).rows;
+    let headroomTable;
+    for (const name of TYPED_IDENTITY_TABLES) {
+      const { rows } = await target.adminPrimary.query(`SELECT COALESCE(max(id), 0)::int AS maximum FROM ${table(name)}`);
+      if (rows[0].maximum >= 1) {
+        headroomTable = name;
+        break;
+      }
+    }
+    expect(headroomTable).toBeDefined();
+    await target.adminPrimary.query(`CREATE OR REPLACE FUNCTION ${restartFunction} RETURNS void LANGUAGE plpgsql AS $$
+      BEGIN END; $$`);
+    try {
+      await target.adminPrimary.query(`SELECT setval(pg_get_serial_sequence($1, 'id'), 1, false)`, [table(headroomTable)]);
+      expect(await codeOf(runImport(await context(target, directory), authorization))).toBe("CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID");
+    } finally {
+      await target.adminPrimary.query(restartDefinition.sql);
+    }
     // Post-import: a pending object that is not a sealed registration.
     await target.adminPrimary.query(`INSERT INTO ${table("pending_objects")}(contribution_id, object_key)
       VALUES ('ept8-tamper', 'telemetry/ept8-tamper')`);
@@ -721,7 +812,15 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     let restore = await removeFrozenRead(target);
     expect(await codeOf(flipGate(await at(later), { flipEvidencePath: flip2.path }))).toBe("CUTOVER_INTERIM_READ_NOT_LOADED");
     await restore();
+    // F4: a row with id = 1 is not enough; it must be the export post-import
+    // loaded (post-import.json), not another one loaded in its place.
+    restore = await swapFrozenRead(target);
+    expect(await codeOf(flipGate(await at(later), { flipEvidencePath: flip2.path }))).toBe("CUTOVER_INTERIM_READ_NOT_LOADED");
+    await restore();
     const gate = await flipGate(await at(later), { flipEvidencePath: flip2.path });
+    const gateBody = JSON.parse(await readFile(join(directory, OWNER_FILES.flipGate), "utf8"));
+    const postImportBody = JSON.parse(await readFile(join(directory, OWNER_FILES.postImport), "utf8"));
+    expect(gateBody.interimReadPayloadSha256).toBe(postImportBody.interimRead.payloadSha256);
     expect(gate.ready).toBe(true);
     // F5 re-proves the frozen read immediately before live.
     const authorization = { flipEvidenceSha256: flip2.sha256, execute: true, confirm: gate.markLiveAuthorizationToken };

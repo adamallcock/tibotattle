@@ -52,7 +52,7 @@ import {
   PRODUCTION_DESIRED_STATE_FILE,
   PROTECTED_STEPS,
   ProductionTransferError,
-  SCHEDULED_TRIGGER_JOBS,
+  REQUIRED_SCHEDULED_TRIGGERS,
   SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS,
   SCHEDULER_PROBE_SCHEMA,
   assertStepOrder,
@@ -226,8 +226,25 @@ test("the pin equals the Worker's fingerprint, refuses short secrets and 'latest
     createHmac("sha256", SECRET).update("app-usagemonitor/identity-link-secret-fingerprint/v1\0").digest("hex"));
   assert.equal(IDENTITY_LINK_FINGERPRINT_DOMAIN, "app-usagemonitor/identity-link-secret-fingerprint/v1\0");
   assert.throws(() => identityLinkSecretFingerprint("x".repeat(31)), { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" });
-  assert.equal(await readSecretFromStream(Readable.from([`${SECRET}\n`])), SECRET);
-  assert.equal(await readSecretFromStream(Readable.from([`${SECRET}\r\n`])), SECRET);
+  // The service hashes the mounted value as it is: configuredIdentityLinkSecret never trims.
+  const configured = worker.slice(worker.indexOf("function configuredIdentityLinkSecret("),
+    worker.indexOf("function configuredIdentityLinkSecretVersion("));
+  assert.ok(configured.includes("return value;") && !configured.includes("trim"), "the Worker keeps the exact secret bytes");
+  // So the pin hashes the exact stdin bytes: nothing is stripped.
+  assert.equal(await readSecretFromStream(Readable.from([SECRET])), SECRET);
+  assert.equal(await readSecretFromStream(Readable.from([SECRET.slice(0, 10), Buffer.from(SECRET.slice(10), "utf8")])), SECRET);
+  assert.equal(await readSecretFromStream(Readable.from([`\uFEFF${SECRET}`])), `\uFEFF${SECRET}`, "a byte-order mark is kept");
+  assert.equal(await readSecretFromStream(Readable.from([` ${SECRET} `])), ` ${SECRET} `, "spaces are part of the secret");
+  // A trailing line feed or carriage return is refused, never stripped: a
+  // version stored with one loads WITH it, so a stripped pin would equal the
+  // sealed fingerprint (P8 passes) while the service computes another one.
+  assert.notEqual(identityLinkSecretFingerprint(`${SECRET}\n`), identityLinkSecretFingerprint(SECRET));
+  for (const ending of ["\n", "\r\n", "\r", "\n\n"]) {
+    await assert.rejects(readSecretFromStream(Readable.from([`${SECRET}${ending}`])),
+      { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" }, JSON.stringify(ending));
+  }
+  await assert.rejects(readSecretFromStream(Readable.from([Buffer.from([0x61, 0xff, 0x62])])),
+    { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" }, "not UTF-8");
   await assert.rejects(readSecretFromStream(Readable.from([Buffer.alloc(5000, 0x61)])), { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" });
   const base = { secret: SECRET, keyVersion: "prod-v1", secretName: "identity-link", secretVersion: "3",
     computedAt: "2026-10-02T00:00:00.000Z" };
@@ -263,7 +280,7 @@ test("P8 binds the pin to the secret and numeric version the production service 
     { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" }, "another secret than the template mounts");
 });
 
-test("the committed production desired state is read as data: schema, environment, project and the closed mount", async () => {
+test("the committed production desired state is read as data: schema, environment, project, the scheduler set and the closed mount", async () => {
   const committed = JSON.parse(await readFile(new URL(`../${PRODUCTION_DESIRED_STATE_FILE}`, import.meta.url), "utf8"));
   assert.equal(committed.schemaVersion, DESIRED_STATE_SCHEMA);
   assert.equal(committed.environment, "production");
@@ -276,7 +293,14 @@ test("the committed production desired state is read as data: schema, environmen
   const filled = { ...committed, project: "tibotattle-synthetic-prod",
     secrets: { ...committed.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET", version: "7" } } };
   assert.deepEqual(await readProductionDeployment(await write("filled.json", filled)),
-    { project: "tibotattle-synthetic-prod", identityLinkMount: { secretName: "IDENTITY_LINK_SECRET", version: "7" } });
+    { project: "tibotattle-synthetic-prod", scheduledTriggers: Object.keys(committed.scheduler).sort(),
+      identityLinkMount: { secretName: "IDENTITY_LINK_SECRET", version: "7" } });
+  // P11's managed set follows the scheduler map, so a trigger C-INFRA adds
+  // (maintenance on the fast-path final line) is required without a code change.
+  const withMaintenance = { ...filled, scheduler: { ...filled.scheduler,
+    maintenance: { name: "tibotattle-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" } } };
+  assert.deepEqual((await readProductionDeployment(await write("maintenance.json", withMaintenance))).scheduledTriggers,
+    ["analytics-refresh", "maintenance"]);
   // An unpinned mount reads, and P8 refuses it (above); an unfilled project refuses here.
   const unpinned = { ...filled, secrets: { ...filled.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET",
     version: null } } };
@@ -285,7 +309,11 @@ test("the committed production desired state is read as data: schema, environmen
     ["schema", { ...filled, schemaVersion: "tibotattle-gcp-ops-infra-desired-state-v1" }],
     ["mount-keys", { ...filled, secrets: { ...filled.secrets, IDENTITY_LINK_SECRET: { secretName: "IDENTITY_LINK_SECRET",
       version: "7", value: "x" } } }],
-    ["no-mount", { ...filled, secrets: {} }]]) {
+    ["no-mount", { ...filled, secrets: {} }],
+    ["no-scheduler", { ...filled, scheduler: undefined }],
+    ["no-refresh-trigger", { ...filled, scheduler: { maintenance: withMaintenance.scheduler.maintenance } }],
+    ["scheduler-list", { ...filled, scheduler: ["analytics-refresh"] }],
+    ["scheduler-name", { ...filled, scheduler: { ...filled.scheduler, "Not A Job": {} } }]]) {
     await assert.rejects(readProductionDeployment(await write(`${name}.json`, bad)), { code: "CUTOVER_DESIRED_STATE_INVALID" }, name);
   }
   await assert.rejects(readProductionDeployment(join(scratch, "absent.json")), { code: "CUTOVER_DESIRED_STATE_INVALID" });
@@ -295,20 +323,35 @@ test("P11 accepts only the producer's shape: the managed trigger set, paused, no
   const appliedMs = Date.parse("2026-10-02T00:00:00.000Z");
   const nowMs = Date.parse("2026-10-02T02:00:00.000Z");
   // probeScheduler's output (gcp-ops-infra-operations.mjs) for the paused production plane.
-  const probe = (overrides = {}) => ({
+  const pausedEntry = job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED", liveState: "PAUSED",
+    quietMinutes: null, verdict: "paused_as_desired", alert: false });
+  const probe = (overrides = {}, managed = REQUIRED_SCHEDULED_TRIGGERS) => ({
     schema: SCHEDULER_PROBE_SCHEMA, environment: "production", project: "tibotattle-synthetic-prod",
-    checkedAt: "2026-10-02T00:30:00.000Z", thresholdHours: 6,
-    triggers: SCHEDULED_TRIGGER_JOBS.map(job => ({ job, name: `tibotattle-${job}-trigger`, desiredState: "PAUSED",
-      liveState: "PAUSED", quietMinutes: null, verdict: "paused_as_desired", alert: false })),
+    checkedAt: "2026-10-02T00:30:00.000Z", thresholdHours: 6, triggers: managed.map(pausedEntry),
     alert: false, signal: null, ...overrides,
   });
-  const bind = { project: "tibotattle-synthetic-prod", appliedMs, nowMs };
-  assert.equal(validateSchedulerEvidence(probe(), bind), SCHEDULED_TRIGGER_JOBS.length);
+  const bind = { project: "tibotattle-synthetic-prod", managed: [...REQUIRED_SCHEDULED_TRIGGERS], appliedMs, nowMs };
+  assert.equal(validateSchedulerEvidence(probe(), bind), REQUIRED_SCHEDULED_TRIGGERS.length);
+  // The fast-path final line's set: every managed trigger must be reported, in any order.
+  const both = ["analytics-refresh", "maintenance"];
+  assert.equal(validateSchedulerEvidence(probe({}, [...both].reverse()), { ...bind, managed: both }), 2);
+  for (const [label, value] of Object.entries({
+    "maintenance missing": probe({}, ["analytics-refresh"]),
+    "maintenance running": probe({ triggers: [pausedEntry("analytics-refresh"),
+      { ...pausedEntry("maintenance"), liveState: "ENABLED", verdict: "running" }] }, both),
+  })) {
+    assert.throws(() => validateSchedulerEvidence(value, { ...bind, managed: both }), { code: "CUTOVER_SCHEDULER_NOT_PAUSED" }, label);
+  }
+  // The managed set itself must be a set of job names that includes the refresh.
+  for (const managed of [undefined, [], ["maintenance"], ["analytics-refresh", "analytics-refresh"], ["Analytics Refresh"]]) {
+    assert.throws(() => validateSchedulerEvidence(probe({}, managed ?? []), { ...bind, managed }),
+      { code: "CUTOVER_SCHEDULER_NOT_PAUSED" }, JSON.stringify(managed));
+  }
   const paused = probe().triggers[0];
   const refusals = {
-    "an unmanaged extra trigger": probe({ triggers: [...probe().triggers, { ...paused, job: "maintenance" }] }),
+    "an unmanaged extra trigger": probe({ triggers: [...probe().triggers, { ...paused, job: "synthetic-unmanaged" }] }),
     "a duplicated trigger": probe({ triggers: [paused, paused] }),
-    "another trigger in its place": probe({ triggers: [{ ...paused, job: "maintenance" }] }),
+    "another trigger in its place": probe({ triggers: [{ ...paused, job: "synthetic-unmanaged" }] }),
     "a missing trigger": probe({ triggers: [] }),
     "a running trigger": probe({ triggers: [{ ...paused, liveState: "ENABLED", verdict: "running" }] }),
     "an absent trigger": probe({ triggers: [{ ...paused, liveState: null, verdict: "absent_not_created" }] }),
@@ -479,8 +522,15 @@ test("pinned literals equal their owners: the scheduler probe, the desired state
     assert.ok(probe.includes(fragment), fragment);
   }
   const manifest = await readFile(new URL("./gcp-ops-infra-manifest.mjs", import.meta.url), "utf8");
-  assert.ok(manifest.includes(`SCHEDULED_JOB_NAMES = Object.freeze(${JSON.stringify(SCHEDULED_TRIGGER_JOBS)
-    .replaceAll(",", ", ")});`));
+  // P11's managed set is the committed production scheduler map, which must be
+  // exactly C-INFRA's SCHEDULED_JOB_NAMES (the set probeScheduler reports).
+  const literal = /export const SCHEDULED_JOB_NAMES = Object\.freeze\((\[[^\]]*\])\);/u.exec(manifest);
+  assert.ok(literal, "C-INFRA's SCHEDULED_JOB_NAMES literal");
+  const scheduledJobNames = JSON.parse(literal[1]);
+  const committed = JSON.parse(await readFile(new URL(`../${PRODUCTION_DESIRED_STATE_FILE}`, import.meta.url), "utf8"));
+  assert.deepEqual(Object.keys(committed.scheduler).sort(), [...scheduledJobNames].sort(),
+    "the committed production scheduler map names exactly C-INFRA's SCHEDULED_JOB_NAMES");
+  for (const job of REQUIRED_SCHEDULED_TRIGGERS) assert.ok(scheduledJobNames.includes(job), job);
   assert.ok(manifest.includes(`GCP_OPS_INFRA_DESIRED_STATE_SCHEMA = "${DESIRED_STATE_SCHEMA}"`));
   assert.ok(manifest.includes(`production: "${PRODUCTION_DESIRED_STATE_FILE}"`));
   const lifecycle = await readFile(new URL("../src/postgres-lifecycle-pass.ts", import.meta.url), "utf8");

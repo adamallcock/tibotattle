@@ -34,14 +34,17 @@
 //                     release-controls.json (0400).
 //   flip-gate         Read-only: flip-2 evidence taken after the recorded
 //                     release instant,
-//                     the staging-drop readback, the frozen read loaded,
+//                     the staging-drop readback, the frozen read equal to
+//                     the export post-import loaded (post-import.json),
 //                     assertFlipReady, zero unexpired sealed Sparkle nonces.
 //                     Writes flip-gate.json (0400).
 //   mark-live         PROTECTED, the point of no return for the target.
 //                     markLive with the flip-2 sha256. Writes mark-live.json.
 //   post-live-check   Read-only: the first maintenance pass completed on one
-//                     cycle less than 2 h ago.
-//   report            Writes pt8-report.json (0400): every receipt sha256.
+//                     cycle less than 2 h ago. Writes post-live-check.json
+//                     (0400, clock-free so a rerun is equal).
+//   report            Requires post-live-check.json; writes pt8-report.json
+//                     (0400): every receipt sha256 and every gate result.
 //   abandon           PROTECTED, pre-live only: PT-1 abandonRun.
 //
 // Dry run by default: a PROTECTED step without --execute performs only its
@@ -151,6 +154,7 @@ import {
   assertCollectionControlsDegradedForImport,
   assertControlSchemaAllowlist,
   assertFlipReady,
+  assertNoRuntimePrivilege,
   assertNoTransferUserOwnership,
   assertTriggerPolicyCoverage,
   beginRun,
@@ -187,17 +191,25 @@ const INTERIM_PUBLIC_READ_TABLE = "community_daily_frozen_export";
  */
 export const SCHEDULER_PROBE_SCHEMA = "tibotattle-gcp-ops-infra-scheduler-probe-v1";
 /**
- * The managed scheduler triggers, one probe entry each: C-INFRA's
- * SCHEDULED_JOB_NAMES (gcp-ops-infra-manifest.mjs, whose imports pull the
- * Cloud SQL connector; the check pins the literal equal). P11 requires the
- * probe to report exactly this set.
+ * P11's managed trigger set is NOT a constant here: it is the key set of the
+ * committed production desired state's closed `scheduler` map, which C-INFRA's
+ * validator holds equal to its SCHEDULED_JOB_NAMES (gcp-ops-infra-manifest.mjs,
+ * whose imports pull the Cloud SQL connector; the check pins the committed
+ * keys equal to that literal). probeScheduler reports one entry per name in
+ * that set, so the two cannot drift when C-INFRA adds a trigger (the
+ * fast-path final line manages `maintenance` too, as design P11 requires).
+ * The set must contain at least these: the refresh would publish, which ends
+ * the frozen read and reads a partial import.
  */
-export const SCHEDULED_TRIGGER_JOBS = Object.freeze(["analytics-refresh"]);
+export const REQUIRED_SCHEDULED_TRIGGERS = Object.freeze(["analytics-refresh"]);
+const SCHEDULED_JOB_NAME = /^[a-z][a-z0-9-]{0,62}$/u;
+const MAX_SCHEDULED_TRIGGERS = 16;
 /**
  * The committed production desired state, relative to apps/worker (C-INFRA's
  * COMMITTED_DESIRED_STATE_FILES.production), and its schema literal
  * (GCP_OPS_INFRA_DESIRED_STATE_SCHEMA); the check pins both. P8 binds the pin
- * to its IDENTITY_LINK_SECRET mount and P11 binds the probe to its project.
+ * to its IDENTITY_LINK_SECRET mount and P11 binds the probe to its project
+ * and its scheduler map.
  */
 export const PRODUCTION_DESIRED_STATE_FILE = "cloud-run/infra/production.desired-state.json";
 export const DESIRED_STATE_SCHEMA = "tibotattle-gcp-ops-infra-desired-state-v2";
@@ -214,6 +226,7 @@ export const OWNER_FILES = Object.freeze({
   release: "release-controls.json",
   flipGate: "flip-gate.json",
   markLive: "mark-live.json",
+  postLiveCheck: "post-live-check.json",
   report: "pt8-report.json",
   journal: "pt8-journal.ndjson",
 });
@@ -752,9 +765,12 @@ function controlsCheck(database) {
 /**
  * The committed production desired state, read as data (not through C-INFRA's
  * validator module, whose imports need the Cloud SQL connector): the project
- * the scheduler probe must name (P11) and the IDENTITY_LINK_SECRET mount the
- * identity pin must name (P8). An unfilled project placeholder refuses here; an
- * unpinned mount version refuses at P8 (CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED).
+ * and the managed trigger set (the `scheduler` map's keys, sorted) that the
+ * scheduler probe must name (P11), and the IDENTITY_LINK_SECRET mount the
+ * identity pin must name (P8). An unfilled project placeholder, or a scheduler
+ * map that is not a set of job names including REQUIRED_SCHEDULED_TRIGGERS,
+ * refuses here; an unpinned mount version refuses at P8
+ * (CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED).
  */
 export async function readProductionDeployment(path) {
   let value;
@@ -766,30 +782,37 @@ export async function readProductionDeployment(path) {
     fail("CUTOVER_DESIRED_STATE_INVALID", { check: "desired-state" });
   }
   const mount = value?.secrets?.IDENTITY_LINK_SECRET;
+  const triggers = record(value?.scheduler) ? Object.keys(value.scheduler).sort() : [];
   if (!record(value) || value.schemaVersion !== DESIRED_STATE_SCHEMA || value.environment !== "production"
       || typeof value.project !== "string" || !GCP_PROJECT.test(value.project)
-      || !record(mount) || Object.keys(mount).sort().join(",") !== "secretName,version") {
+      || !record(mount) || Object.keys(mount).sort().join(",") !== "secretName,version"
+      || triggers.length > MAX_SCHEDULED_TRIGGERS || triggers.some(job => !SCHEDULED_JOB_NAME.test(job))
+      || REQUIRED_SCHEDULED_TRIGGERS.some(job => !triggers.includes(job))) {
     fail("CUTOVER_DESIRED_STATE_INVALID", { check: "desired-state" });
   }
-  return Object.freeze({ project: value.project,
+  return Object.freeze({ project: value.project, scheduledTriggers: Object.freeze(triggers),
     identityLinkMount: Object.freeze({ secretName: mount.secretName, version: mount.version }) });
 }
 
 /**
  * P11 over a parsed C-INFRA scheduler probe receipt (probeScheduler in
  * gcp-ops-infra-operations.mjs): the production environment and project, no
- * alert, exactly one entry per managed trigger (SCHEDULED_TRIGGER_JOBS), every
- * one live PAUSED, and a strict checkedAt no earlier than the fence apply
+ * alert, exactly one entry per managed trigger (`managed`: the committed
+ * desired state's scheduler keys, from readProductionDeployment), every one
+ * live PAUSED, and a strict checkedAt no earlier than the fence apply
  * instant, not in the future and at most 6 h old at `nowMs`.
  */
-export function validateSchedulerEvidence(value, { project, appliedMs, nowMs }) {
+export function validateSchedulerEvidence(value, { project, managed, appliedMs, nowMs }) {
   const checkedMs = instantMs(value?.checkedAt);
   const triggers = Array.isArray(value?.triggers) ? value.triggers : null;
   const jobs = triggers === null ? [] : triggers.map(trigger => (record(trigger) ? trigger.job : null));
+  const expected = Array.isArray(managed) && managed.every(job => typeof job === "string" && SCHEDULED_JOB_NAME.test(job))
+      && new Set(managed).size === managed.length && REQUIRED_SCHEDULED_TRIGGERS.every(job => managed.includes(job))
+    ? [...managed].sort() : null;
   if (!record(value) || value.schema !== SCHEDULER_PROBE_SCHEMA || value.environment !== "production"
       || typeof project !== "string" || value.project !== project || value.alert !== false
-      || triggers === null || triggers.length !== SCHEDULED_TRIGGER_JOBS.length
-      || [...jobs].sort().join("\n") !== [...SCHEDULED_TRIGGER_JOBS].sort().join("\n")
+      || expected === null || triggers === null || triggers.length !== expected.length
+      || [...jobs].sort().join("\n") !== expected.join("\n")
       || triggers.some(trigger => !record(trigger) || trigger.liveState !== "PAUSED")
       || checkedMs === null || !Number.isFinite(appliedMs) || !Number.isFinite(nowMs) || checkedMs < appliedMs
       || checkedMs > nowMs || nowMs - checkedMs > SCHEDULER_EVIDENCE_MAXIMUM_AGE_MILLISECONDS) {
@@ -801,8 +824,9 @@ export function validateSchedulerEvidence(value, { project, appliedMs, nowMs }) 
 async function schedulerCheck(context, seal, deployment) {
   const { value, sha256 } = await readOwnerJson(context.inputs.schedulerEvidencePath, "CUTOVER_SCHEDULER_NOT_PAUSED");
   const triggersPaused = validateSchedulerEvidence(value, { project: deployment.project,
-    appliedMs: Date.parse(seal.manifest.fence?.window?.appliedAt ?? ""), nowMs: context.now().getTime() });
-  return Object.freeze({ evidenceSha256: sha256, triggersPaused });
+    managed: deployment.scheduledTriggers, appliedMs: Date.parse(seal.manifest.fence?.window?.appliedAt ?? ""),
+    nowMs: context.now().getTime() });
+  return Object.freeze({ evidenceSha256: sha256, triggersPaused, jobs: deployment.scheduledTriggers });
 }
 
 function utcDay(ms) {
@@ -854,7 +878,9 @@ async function targetFacts(handle, { requireEmptyFrozenRead = true } = {}) {
 /**
  * P10's identity half: the transfer login reaches the schema owner and
  * tibotattle_source_transfer by SET only, never by inheritance, and no role
- * but the owner holds a privilege on the transfer control schema.
+ * but the owner (PUBLIC included) holds a privilege on the transfer control
+ * schema or anything in it: PT-1's own flip-gate predicate, so preflight
+ * refuses what assertFlipReady would refuse only after the whole import.
  */
 async function transferLoginCheck(client, handle) {
   const { rows: memberships } = await client.query(`SELECT role.rolname::text AS role, am.set_option, am.inherit_option
@@ -869,11 +895,14 @@ async function transferLoginCheck(client, handle) {
       fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
     }
   }
-  const { rows: privileges } = await client.query(`SELECT count(*)::int AS n FROM pg_catalog.pg_namespace n
-      CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl, acldefault('n', n.nspowner))) acl
-      JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
-     WHERE n.nspname = $1 AND grantee.oid <> n.nspowner`, [TRANSFER_CONTROL_SCHEMA]);
-  if (privileges[0].n !== 0) fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
+  try {
+    await assertNoRuntimePrivilege(client);
+  } catch (error) {
+    if (error instanceof PostgresTransferTargetError && error.code === "CUTOVER_FLIP_RUNTIME_PRIVILEGE") {
+      fail("CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID", { check: "P10" });
+    }
+    throw error;
+  }
 }
 
 /** Read-only, before the fence: the target accepts a fresh import (no seal needed). */
@@ -1276,10 +1305,13 @@ async function runPostImport(context, handle, sealed, preflightSha256) {
 }
 
 /**
- * A complete post-import stage is skipped on a rerun; its owner receipt must
- * then exist and carry the receipt digest the stage committed.
+ * The owner receipt of a complete post-import stage, bound to the database:
+ * post-import.json must exist, name this seal, carry the receipt digest the
+ * stage committed, and that digest must be the digest of its own body. A rerun
+ * that skips the complete stage requires it, and so does the flip gate, which
+ * ties the frozen read it reads back to the export post-import loaded.
  */
-async function assertPostImportReceiptBound(context, handle) {
+async function readBoundPostImport(context, handle) {
   const committed = await withTransferTransaction(handle, "primary", async client => {
     const { rows } = await client.query(`SELECT receipt.receipt_sha256 FROM ${TRANSFER_CONTROL_SCHEMA}.transfer_stage_receipts receipt
         JOIN ${TRANSFER_CONTROL_SCHEMA}.transfer_runs run ON run.run_id = receipt.run_id
@@ -1288,10 +1320,13 @@ async function assertPostImportReceiptBound(context, handle) {
     return rows.length === 1 ? rows[0].receipt_sha256 : null;
   }, { readOnly: true });
   if (!await fileExists(context.path("postImport"))) fail("CUTOVER_RECEIPT_CONFLICT", { step: "post-import" });
-  const { value } = await readOwnerJson(context.path("postImport"), "CUTOVER_RECEIPT_CONFLICT");
+  const { value, sha256 } = await readOwnerJson(context.path("postImport"), "CUTOVER_RECEIPT_CONFLICT");
   if (committed === null || !record(value) || value.receiptSha256 !== committed || value.sealId !== context.inputs.sealId) {
     fail("CUTOVER_RECEIPT_CONFLICT", { step: "post-import" });
   }
+  const { receiptSha256, ...body } = value;
+  if (HASH(canonicalJson(body)) !== receiptSha256) fail("CUTOVER_RECEIPT_CONFLICT", { step: "post-import" });
+  return Object.freeze({ postImport: value, postImportSha256: sha256 });
 }
 
 /**
@@ -1347,7 +1382,7 @@ export async function runImport(context, { execute = false, confirm = undefined 
         complete = await completeStages(handle);
       }
       if (!complete.has("post-import")) await runPostImport(context, handle, sealed, preflightSha256);
-      else await assertPostImportReceiptBound(context, handle);
+      else await readBoundPostImport(context, handle);
       await advanceRun(handle, "verifying");
       state = "verifying";
       await step(context, "verifying");
@@ -1468,6 +1503,11 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
   const evidence = await validateFlipEvidence(flipEvidencePath, seal,
     { afterMs: Math.max(instantMs(release.releasedAt), instantMs(release.flipEvidenceVerifiedAt)) });
   if (evidence.sha256 === release.flipEvidenceSha256) fail("CUTOVER_FLIP_EVIDENCE_STALE");
+  // The frozen read must be the export post-import loaded (post-import.json,
+  // bound to the committed stage receipt), not merely some row with id = 1.
+  const { postImport, postImportSha256 } = await readBoundPostImport(context, handle);
+  const loadedPayloadSha256 = record(postImport.interimRead) ? postImport.interimRead.payloadSha256 : null;
+  if (typeof loadedPayloadSha256 !== "string" || !SHA256.test(loadedPayloadSha256)) fail("CUTOVER_INTERIM_READ_NOT_LOADED");
   const facts = await withTransferTransaction(handle, "primary", async client => {
     // The staging-drop readback: PT-1's dropped-relation receipts cover the
     // registry exactly and the control schema holds only its allowlist.
@@ -1480,7 +1520,7 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
     const relations = await assertControlSchemaAllowlist(client);
     const { rows: frozen } = await client.query(`SELECT payload_sha256 FROM ${quote(handle.primarySchema)}.${INTERIM_PUBLIC_READ_TABLE}
       WHERE id = 1`);
-    if (frozen.length !== 1) fail("CUTOVER_INTERIM_READ_NOT_LOADED");
+    if (frozen.length !== 1 || frozen[0].payload_sha256 !== loadedPayloadSha256) fail("CUTOVER_INTERIM_READ_NOT_LOADED");
     const ready = await assertFlipReady(client, handle, { flipEvidenceSha256: evidence.sha256,
       allowedRoleMembers: [...context.inputs.allowedRoleMembers] });
     return { controlRelations: relations.length, frozenPayloadSha256: frozen[0].payload_sha256, ready };
@@ -1493,6 +1533,7 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
     sealId: context.inputs.sealId,
     contractId: context.inputs.contractId,
     runId: run.runId,
+    postImportSha256,
     releaseSha256,
     flipEvidence1Sha256: release.flipEvidenceSha256,
     flipEvidence2Sha256: evidence.sha256,
@@ -1568,20 +1609,44 @@ export async function postLiveCheck(context) {
       || ages.some(age => !Number.isFinite(age) || age < 0 || age > POST_LIVE_MAXIMUM_PASS_AGE_MILLISECONDS)) {
     fail("CUTOVER_POST_LIVE_NOT_READY");
   }
-  await journal(context, "post-live-check", "ready");
-  return Object.freeze({ step: "post-live-check", ready: true, runState: "live" });
+  // The L1 gate's receipt: content-free and clock-free (no instant and no
+  // age), so a later check after another pass computes identical bytes.
+  const body = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-post-live-check`, sealId: context.inputs.sealId,
+    contractId: context.inputs.contractId, runId: run.runId, ready: true, retentionState: "completed",
+    reconciliationState: "completed", sameCycle: true, maximumPassAgeMilliseconds: POST_LIVE_MAXIMUM_PASS_AGE_MILLISECONDS };
+  const postLiveCheckSha256 = await writeReceiptOnce(context.path("postLiveCheck"), body);
+  await journal(context, "post-live-check", "ready", { postLiveCheckSha256 });
+  return Object.freeze({ step: "post-live-check", ready: true, runState: "live", postLiveCheckSha256 });
 }
 
+/**
+ * L2: every receipt's sha256 and every gate's result. It requires the L1
+ * post-live-check receipt (the SWITCH GO gate): without it, it refuses
+ * CUTOVER_POST_LIVE_NOT_READY and writes nothing.
+ */
 export async function writeReport(context) {
   const { run, released, flipGate: gated } = await finalizeFacts(context);
   assertStepOrder("report", { runState: run?.state ?? null, released, flipGate: gated });
+  if (!await fileExists(context.path("postLiveCheck"))) fail("CUTOVER_POST_LIVE_NOT_READY", { step: "report" });
   const digests = {};
-  for (const name of ["preflight", "postImport", "release", "flipGate", "markLive", "pin"]) {
-    digests[name] = (await readOwnerJson(context.path(name), "CUTOVER_STEP_ORDER_VIOLATION")).sha256;
+  const values = {};
+  for (const name of ["preflight", "postImport", "release", "flipGate", "markLive", "postLiveCheck", "pin"]) {
+    const { value, sha256 } = await readOwnerJson(context.path(name), "CUTOVER_STEP_ORDER_VIOLATION");
+    digests[name] = sha256;
+    values[name] = value;
+  }
+  const { preflight, flipGate: gate, postLiveCheck: postLive } = values;
+  if (!record(preflight) || preflight.verdict !== "GO" || preflight.sealId !== context.inputs.sealId
+      || !record(gate) || gate.ready !== true || gate.runId !== run.runId) {
+    fail("CUTOVER_STEP_ORDER_VIOLATION", { step: "report" });
+  }
+  if (!record(postLive) || postLive.ready !== true || postLive.runId !== run.runId || postLive.sealId !== context.inputs.sealId) {
+    fail("CUTOVER_POST_LIVE_NOT_READY", { step: "report" });
   }
   const body = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-report`, sealId: context.inputs.sealId,
     contractId: context.inputs.contractId, runId: run.runId, runState: run.state, inputsSha256: context.inputsSha256,
-    dispositionPolicySha256: dispositionPolicySha256(), flipEvidenceSha256: run.flipEvidenceSha256, receipts: digests };
+    dispositionPolicySha256: dispositionPolicySha256(), flipEvidenceSha256: run.flipEvidenceSha256, receipts: digests,
+    gates: { preflight: "GO", flipGate: "ready", markLive: run.state, postLiveCheck: "ready" } };
   const reportSha256 = await writeReceiptOnce(context.path("report"), body);
   return Object.freeze({ step: "report", reportSha256 });
 }

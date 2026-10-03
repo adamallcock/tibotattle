@@ -411,15 +411,19 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    deletion-digest exclusion count (P6), the public-source bootstrap at
    `completed=1` (P7), the identity pin (P8: the sealed fingerprint, and the
    secret and numeric version that the committed production desired state
-   mounts) and the scheduler probe (P11: the desired state's project, exactly
-   the managed triggers, all paused, no alert, under 6 hours old).
+   mounts), no privilege on the transfer control schema for any role but its
+   owner, `PUBLIC` included (P10), and the scheduler probe (P11: the desired
+   state's project, exactly the triggers its `scheduler` map manages, all
+   paused, no alert, under 6 hours old).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
    It runs the stages in dependency order: PT-3 `identity-authority`, D-PT4X
    `legacy-contributions`, the eight D-PT5A stages, the waivers
    (`performance` under the owner flag `performance-routes-retired`,
    `accountless-retention` while its sealed table is empty, `objects` until
-   PT-7, the three analytics stages because analytics is recomputed),
+   PT-7, the three analytics stages because analytics is recomputed; but see
+   the revision floor in [the orchestrator section](#h4-reference-the-pt-8-lite-orchestrator),
+   which round 14 moves into this import),
    D-PT4X `pending-registrations`, `owner-lifecycle-verify` and `post-import`.
    Post-import restarts the typed identities (TL-1), maps the admin metric
    history and the aggregate exclusions (D-PT4X), checks the invariants,
@@ -454,7 +458,9 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
      than `releasedAt`. Evidence taken between flip-1 and the release is
      refused (`CUTOVER_FLIP_EVIDENCE_STALE`).
    - `node $S flip-gate --flip-evidence <flip-2>/flip-evidence.json`
-     (read-only) reads back the staging drop and the loaded frozen read, runs
+     (read-only) reads back the staging drop and the loaded frozen read, which
+     must be the export post-import loaded (the `payloadSha256` in
+     `post-import.json`, whose digest the post-import stage committed), runs
      `assertFlipReady` and checks that no sealed Sparkle nonce is unexpired. It
      writes `flip-gate.json` and prints the `mark-live` token.
    - `node $S mark-live --flip-evidence-sha256 <flip-2 sha256>` (protected).
@@ -469,15 +475,19 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
 5. **Run a maintenance pass and resume the maintenance trigger.** Readiness
    goes stale 2 hours after the last pass, and an empty origin reads not ready
    until the first pass. Run one pass by hand until it reports complete, then
-   `node $S post-live-check` (read-only), then resume the maintenance trigger
-   under [GCP scheduler resume](./gcp-scheduler-resume.md). The job is `built`
+   `node $S post-live-check` (read-only on the target; it writes
+   `post-live-check.json`, which carries no instant, so a later check is
+   equal), then resume the maintenance trigger under
+   [GCP scheduler resume](./gcp-scheduler-resume.md). The job is `built`
    (C-MAINT); its trigger in the desired state is `not built` (D-OPS4). After
-   H.8, `node $S report` writes `pt8-report.json`.
+   H.8, `node $S report` writes `pt8-report.json`. It refuses
+   `CUTOVER_POST_LIVE_NOT_READY` until `post-live-check.json` exists.
 
 Evidence kept: the run's stage and table receipts (counts, digests, states),
 the owner directory's content-free receipts (`preflight.json`,
 `post-import.json`, `release-controls.json`, `flip-gate.json`,
-`mark-live.json`, `pt8-report.json`), the flip-evidence sha256 and the
+`mark-live.json`, `post-live-check.json`, `pt8-report.json`), the
+flip-evidence sha256 and the
 transfer run id. Abort: Abort A. The target database
 is spent.
 
@@ -491,6 +501,20 @@ Round 12 holds: the native social chain is retired, and PT-3 still imports the
 tables the kept session routes and credential renew and disconnect
 authenticate against (pinned in `KEPT_SESSION_AUTHORITY_TABLES`); the retired
 chain's short-lived handoff rows are imported verbatim and are inert.
+
+**The revision floor is not loaded yet (round 14).** Round 14 places REV-SEED's
+per-day revision floor inside this import, in the `analytics-community-history`
+stage, before `markLive`: each day continues at Cloudflare's last published
+revision plus one. REV-SEED is `not built`. Until it lands, that stage is
+still waived as `analytics-recomputed:d3`, the closed waiver map still admits
+that waiver, no receipt records a floor, and the production refresh's
+`ANALYTICS_V2_REVISION_FLOOR_ABSENT` refusal does not exist yet. A production
+import run before REV-SEED replaces the waiver would go live with no floor,
+and nothing would stop the first production refresh from publishing
+revisions that do not continue above Cloudflare's, which round 12 rules out.
+Follow-up (E-PT8, after REV-SEED): make
+`analytics-community-history` a runner stage that loads the floor, and remove
+its `WAIVABLE` entry.
 
 **The seal is consumed, never produced.** The orchestrator reads a PT-2-lite
 seal only through `readCutoverSeal` and `openSealedSourceFromSeal`
@@ -511,7 +535,8 @@ taken after the fence), `ownerFlags` (`performance-routes-retired`,
 `accept-orphan-registration-clearing`) and `allowedRoleMembers`. The
 orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
 `release-controls.json`, `flip-gate.json`, `mark-live.json`,
-`pt8-report.json` and the advisory `pt8-journal.ndjson` (`0600`). A receipt
+`post-live-check.json`, `pt8-report.json` and the advisory
+`pt8-journal.ndjson` (`0600`). A receipt
 is written once; a rerun that computes identical bytes reuses it and any other
 result refuses `CUTOVER_RECEIPT_CONFLICT`. `post-import.json` is written before
 the post-import stage commits. A rerun that finds the stage complete requires
@@ -527,7 +552,15 @@ gcloud secrets versions access <N> --secret=<identity-link secret id> | \
   node $S identity-pin --owner-dir <dir> --key-version <label> --secret-name <id> --secret-version <N>
 ```
 
-A secret shorter than 32 characters and a version of `latest` are refused.
+The pin hashes the exact bytes on standard input, because the service hashes
+the exact mounted bytes and never trims them. Input that ends in a line feed or
+a carriage return is refused (`CUTOVER_IDENTITY_LINK_SECRET_INVALID`), never
+stripped. That refusal means the version was probably stored with a trailing
+newline (for example through `echo … |`), and the service would load it with
+the newline and compute another fingerprint than the sealed one. Do not strip
+it by hand: add a version without the newline (`printf '%s'`), pin the
+desired state's mount to that version, and take the pin again from it. A
+secret shorter than 32 characters and a version of `latest` are refused.
 `--secret-name` and `--secret-version` must equal the `IDENTITY_LINK_SECRET`
 entry of the committed production desired state
 (`apps/worker/cloud-run/infra/production.desired-state.json`), which is the
@@ -598,12 +631,12 @@ the target is final for this seal.
 | `CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE` | P7 | The sealed bootstrap is not complete |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8 | The pin differs from the sealed row or the deployed label. Never rotate the secret to pass |
 | `CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`, `CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH` | P8 | The committed production desired state mounts no numeric version, or the pin names another secret or version than the mount |
-| `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable or still has a placeholder project |
+| `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable, still has a placeholder project, or its `scheduler` map is not a set of job names that includes `analytics-refresh` |
 | `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
-| `CUTOVER_TARGET_NOT_EMPTY`, `CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID` (again at `run`), `CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING` | P10 | The target is not the pre-staged empty database, the login's membership inherits, or the frozen-read table is absent or a published day exists |
-| `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 (again at `run`) | The probe does not name exactly the managed triggers, all paused, for the desired state's project with no alert; or it predates the fence, is over 6 h old or has a non-strict instant |
+| `CUTOVER_TARGET_NOT_EMPTY`, `CUTOVER_TRANSFER_LOGIN_MEMBERSHIP_INVALID` (again at `run`), `CUTOVER_TARGET_FROZEN_READ_TABLE_MISSING` | P10 | The target is not the pre-staged empty database, the login's membership inherits, a role other than the owner (`PUBLIC` included) holds a privilege on the transfer control schema or anything in it (PT-1's flip-gate predicate), or the frozen-read table is absent or a published day exists |
+| `CUTOVER_SCHEDULER_NOT_PAUSED` | P11 (again at `run`) | The probe does not name exactly the triggers the committed production desired state's `scheduler` map manages (`analytics-refresh`, and `maintenance` once C-INFRA manages it), all paused, for the desired state's project with no alert; or it predates the fence, is over 6 h old or has a non-strict instant |
 | `CUTOVER_INTERIM_READ_FACTS_INVALID` and the C-IPR `INTERIM_PUBLIC_READ_*` codes | P12 | The OWN-4 export or its facts do not hold (captured after the fence, another commit, another day) |
-| `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that |
+| `CUTOVER_PENDING_OBJECT_GUARD_MISSING` | P13 | The transfer-hold guard is absent and no owner flag accepts that, or it is present but disabled or altered (no flag excuses that) |
 
 During `run` and finalize: `CUTOVER_OWNER_REVISIONS_DIVERGED`,
 `CUTOVER_PUBLIC_SOURCE_OWNERS_DIVERGED`, `CUTOVER_PENDING_OBJECT_CONFLICT`,
@@ -611,8 +644,10 @@ During `run` and finalize: `CUTOVER_OWNER_REVISIONS_DIVERGED`,
 `CUTOVER_TYPED_IDENTITY_HEADROOM_INVALID`, `CUTOVER_COVERAGE_RECEIPT_MISSING`,
 `CUTOVER_COVERAGE_RECEIPT_MISMATCH`, `CUTOVER_COVERAGE_RECEIPT_UNEXPECTED`,
 `CUTOVER_PARITY_SAMPLE_MISMATCH` (with the class), `CUTOVER_FLIP_EVIDENCE_INVALID`,
-`CUTOVER_FLIP_EVIDENCE_STALE`, `CUTOVER_INTERIM_READ_NOT_LOADED`,
-`CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `CUTOVER_POST_LIVE_NOT_READY` and PT-1's own
+`CUTOVER_FLIP_EVIDENCE_STALE`, `CUTOVER_INTERIM_READ_NOT_LOADED` (the frozen
+read is absent, or is not the export post-import loaded),
+`CUTOVER_SPARKLE_NONCES_UNEXPIRED`, `CUTOVER_POST_LIVE_NOT_READY` (also from
+`report` before `post-live-check` has passed) and PT-1's own
 codes (for example `CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED`). Each is a NO-GO:
 diagnose, never bypass. The design adds no override flag beyond the two named
 owner flags.
