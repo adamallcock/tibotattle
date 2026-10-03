@@ -66,6 +66,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Script } from "node:vm";
+import { assertAnalyticsFastPricerBinding, FAST_PRICER_BINDING_POLICY } from "./analytics-fast-pricer-binding.mjs";
 
 export const ANALYTICS_KERNEL_CLOSURE_VERSION = "analytics-v2-compute-closure-v2";
 /** The compute class's digest method (computeSha256). v2 masks the facade's provenance commit. */
@@ -223,6 +224,7 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
   const result = await build({ ...shared, absWorkingDir: cwd,
     entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY], write: false, metafile: true,
     outdir: resolve(CLOUD_RUN_ROOT, "dist") });
+  assertAnalyticsFastPricerBinding(result.metafile, cwd);
   const graph = new Map();
   for (const [path, input] of Object.entries(result.metafile.inputs)) {
     graph.set(resolve(cwd, path), (input.imports ?? []).filter((imported) => !imported.external)
@@ -258,6 +260,10 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
     if (byName.has(name) && byName.get(name) !== digest) fail("ANALYTICS_KERNEL_CLOSURE_NAME_COLLISION", { name });
     byName.set(name, digest);
   }
+  // This build-time resolution policy decides which pricer the compute
+  // closure executes. Hash it even though runtime code never imports tooling.
+  const [policyName, policyDigest] = await closureEntry(FAST_PRICER_BINDING_POLICY, read);
+  byName.set(policyName, policyDigest);
   const inputs = [...byName].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
   // The compute class: every input but the vendored price registry, which
   // must be one, with the facade (which must be one too) hashed with its

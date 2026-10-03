@@ -20,7 +20,7 @@
  * The prepared-day observer (K-PERCARD): every owner-day this run prepares
  * and stores with daily values is also handed to the price attribution
  * (price-attribution.ts), which prices each usage event through the
- * vendored buildPricingEvent and priceTelemetryUsageEvent, checks the result
+ * vendored buildPricingEvent and the byte-identical GCP fast pricer, checks the result
  * against the kernel's own daily pricing block (a difference ends the run:
  * ANALYTICS_V2_PRICE_ATTRIBUTION_MISMATCH) and emits the owner-day's price
  * row right after its owner-day row. It reads nothing the kernels do not, and

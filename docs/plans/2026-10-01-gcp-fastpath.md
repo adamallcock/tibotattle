@@ -143,9 +143,12 @@ same image), triggered by Cloud Scheduler. Each run:
    canonical-fact store.
 3. Lists owners and per-owner source routing with production's `hasEffective`
    rule, filtered by `community_public_source_owners`.
-4. Runs the production kernels unchanged, vendored from `d43c8f92` together
-   with that commit's `accounting`, `quota-analysis` and `telemetry-contract`
-   packages, in one process:
+4. Runs the production kernels vendored from `d43c8f92` together with that
+   commit's `accounting`, `quota-analysis` and `telemetry-contract` packages.
+   Vendor source bytes stay unchanged. The GCP build binds their usage-pricing
+   edge to the GCP-owned fast pricer; the
+   [2026-10-03 pricer receipt](../receipts/2026-10-03-gcp-pricer-perf.md) records
+   byte-identical proof against the independent original pricer. The steps are:
    - `prepareSharedAnalyticsDay` per owner-day;
    - `evaluateSharedScalarDate` for today;
    - `evaluateSharedModelDate` for 70 dates, each over a 101-day window;

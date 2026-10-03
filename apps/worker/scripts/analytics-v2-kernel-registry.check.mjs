@@ -28,6 +28,7 @@
  */
 
 import assert from "node:assert/strict";
+import { analyticsFastPricerPlugin, FAST_PRICER_BINDING_POLICY } from "../cloud-run/analytics-fast-pricer-binding.mjs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
@@ -61,11 +62,13 @@ const REGISTRY_PINS = Object.freeze([
   // K-PERCARD branch before any merge or durable stamped run, when its review
   // fixes changed price-transition.ts.)
   "c18c6dd6017885fcfaddf7df87ce6c80162737039f00dd208c4e83f4fed66f6f",
+  // Kernel 4: byte-identical GCP fast pricing and its reviewed import binding.
+  "5b90c4d73e1508ff7cca02463a1bc82c640995e6cd84e650170eb51f28e0a682",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
 /** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph. */
-const BUILD_OPTIONS = Object.freeze({ bundle: true, platform: "node", format: "esm", target: "node22",
+const BUILD_OPTIONS = Object.freeze({ plugins: [analyticsFastPricerPlugin()], bundle: true, platform: "node", format: "esm", target: "node22",
   external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent" });
 
 const canonical = (entry) => JSON.stringify(Object.fromEntries(ENTRY_KEYS.map((key) => [key, entry[key]])));
@@ -157,6 +160,7 @@ test("the closure holds every module that decides a stored value and no I/O plum
   for (const decides of [
     "apps/worker/src/analytics-v2/compute.ts", "apps/worker/src/analytics-v2/compute-owner.ts",
     "apps/worker/src/analytics-v2/compute-community.ts", "apps/worker/src/analytics-v2/native-path.ts",
+    "apps/worker/src/analytics-v2/fast-pricer.ts", "apps/worker/cloud-run/analytics-fast-pricer-binding.mjs",
     "apps/worker/src/analytics-v2/occurrence-source.ts", "apps/worker/src/analytics-v2/owners.ts",
     "apps/worker/src/analytics-v2/devices.ts", "apps/worker/src/analytics-v2/queued-days.ts",
     "apps/worker/src/telemetry-usage-reconciliation.ts", "apps/worker/src/typed-telemetry-codec.ts",
@@ -340,4 +344,18 @@ test("the run-stamps migration seeds no kernel and leaves earlier rows unattribu
   const sql = await readFile(join(staged ? directory : promoted, name), "utf8");
   assert.doesNotMatch(sql, /INSERT\s+INTO\s+analytics_v2_kernels/iu, "kernels are registered by the run that stamps with them");
   assert.doesNotMatch(sql, /kernel_id\s+smallint\s+NOT\s+NULL\s+DEFAULT/iu, "no row is given a kernel it was not written by");
+});
+
+
+test("the fast-pricer binding policy is hashed, and an unbound import graph is refused", async () => {
+  const original = await identityWith();
+  const mutated = await identityWith(async (path, ...rest) => {
+    const bytes = await readFile(path, ...rest);
+    return path === FAST_PRICER_BINDING_POLICY ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// mutation\n")]) : bytes;
+  });
+  assert.notEqual(mutated.computeClosureSha256, original.computeClosureSha256);
+  assert.notEqual(mutated.computeSha256, original.computeSha256);
+  const { plugins: _plugins, ...unbound } = BUILD_OPTIONS;
+  await assert.rejects(computeAnalyticsKernelIdentity({ build: esbuild().build, options: unbound,
+    vendorRoot: VENDOR_ROOT, cwd: join(WORKER_ROOT, "cloud-run") }), { code: "ANALYTICS_FAST_PRICER_BINDING_MISSING" });
 });

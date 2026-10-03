@@ -4,6 +4,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { analyticsFastPricerPlugin } from "./analytics-fast-pricer-binding.mjs";
 import {
   ANALYTICS_REFRESH_WORKER_ENTRY,
   analyticsKernelDefines,
@@ -47,6 +48,7 @@ const options = {
     "ops-runtime-probe-job": OPS_RUNTIME_PROBE_ENTRY,
     "ops-backup-audit-job": OPS_BACKUP_AUDIT_ENTRY,
   },
+  plugins: [analyticsFastPricerPlugin()],
   bundle: true,
   platform: "node",
   format: "esm",
