@@ -11,8 +11,9 @@ This is a 2026-10-02 receipt for stream K-CORE-A on branch
 `claude/gcp-fp-k-core-a`. The build (`febbae7f`) was made on
 `claude/gcp-fastpath-final` at `fce3572e` (then `2b5c90cd`); the review round
 (`b325fc91`, section "Review round" below) fixed its findings, and the branch
-then merged the final line at `112d27cc` (`387f6567`). The parity and gate
-results below marked "merged tree" ran on that merged tree; the K-PGSTAT,
+then merged the final line at `112d27cc` (`387f6567`) and at `07001c00`
+(`2959668b`, D-OPS4's primary 0068). The parity and gate results below
+marked "merged tree" ran on those merged trees, as each row says; the K-PGSTAT,
 reader A/B and timing-pair measurements ran on the build commit and are not
 affected by the review fixes (which change no reader statement; they add one
 exclusion read per run).
@@ -325,9 +326,9 @@ Every rehearsal imported fresh into `kcore_a_work` with the staged migration
 applied through the staged-migrations harness (`--staged-primary`), and ran
 both refreshes under Node 22.16.0.
 
-### Merged tree (`387f6567`, after the review round)
+### Merged tree (`2959668b`, after the review round)
 
-The promoted chain now ends at `0067_pending_object_transfer_holds.sql`, so
+The promoted chain now ends at `0068_v12_ready_manifest_ready_at_index.sql`, so
 D-PT4X's exclusions table is present and read; the staged
 `0911_analytics_v2_run_stamps.sql` is applied on top. Both corpora hold no
 exclusion rows (receipt `exclusions`: 0 rows, 0 active, unchanged, 0
@@ -335,9 +336,9 @@ republished days).
 
 | Run | Result |
 |---|---|
-| Q-1, W = 1 | `pass`, every gate true (importers, first refresh, read 200, second run 0 new revisions, parity 0 unexpected, per-date equal, owner parity 0 unexpected: fits 4/4, model dates 280/280, owner-days 672/672, cache owner-days 680/680, refusals 15/15); refresh 16.0 s and 15.4 s (beside the dense run) |
-| Q-1, W = 4 | `pass`, every gate true, the same family counts; refresh 9.5 s and 9.9 s; every run stamped kernel 1, manifest 1 |
-| Dense, W = 1 (the production profile) | `pass`, every gate true (owner parity: fits 5/5, model dates 350/350, owner-days 840/840, cache owner-days 850/850, refusals 15/15); refresh 760 s and 771 s, read phase 90.5 s and 108.1 s (load average 10 to 12, beside the other runs) |
+| Q-1, W = 1 | `pass`, every gate true (importers, first refresh, read 200, second run 0 new revisions, parity 0 unexpected, per-date equal, owner parity 0 unexpected: fits 4/4, model dates 280/280, owner-days 672/672, cache owner-days 680/680, refusals 15/15); refresh 16.7 s and 15.8 s |
+| Q-1, W = 4 | `pass`, every gate true, the same family counts; refresh 9.2 s and 10.2 s; every run stamped kernel 1, manifest 1 |
+| Dense, W = 1 (the production profile) | `pass`, every gate true (owner parity: fits 5/5, model dates 350/350, owner-days 840/840, cache owner-days 850/850, refusals 15/15); refresh 695 s and 692 s, read phase 81.2 s and 86.1 s (load average about 6 to 8). On `387f6567` (before 0068) it also passed: 760 s and 771 s, read 90.5 s and 108.1 s under a load of 10 to 12 |
 | Rows against the base commit `fce3572e` | dense: every stored family equal apart from run ids and stamps (owner-day 850, cache bands 22,230, fits 5, model dates 346, refusals 15), the stored preview and the served response byte-identical; Q-1 at W = 1 and W = 4 the same (owner-day 680, cache bands 7,710, fits 4, model dates 276, refusals 15) |
 
 ### Build commit (`febbae7f`'s tree, before the review round)
@@ -384,7 +385,7 @@ rehearsals concurrently.
 
 ## Gates
 
-### Merged tree (`387f6567`)
+### Merged tree (`387f6567`; rows marked 0068 re-ran on `2959668b`)
 
 Local. PostgreSQL 17 fan-out cluster, port 55433, private socket.
 
@@ -392,17 +393,17 @@ Local. PostgreSQL 17 fan-out cluster, port 55433, private socket.
 |---|---|
 | `npx tsc --noEmit` (apps/worker) | rc 0 |
 | `npm run analytics-v2:check` (Node 22.16.0) | 15 files, 165/165 (new: `exclusions.spec.ts`, `kernel.spec.ts`) |
-| PostgreSQL specs: `analytics-v2-refresh`, `analytics-v2-occurrence-source`, `analytics-v2-community-daily-route`, `analytics-v2-interim-public-read`, `online-erasure-absence`, `staged-migrations-harness`, `postgres-admin-console` (`PG_TEST_DATABASE=kcore_a_spec`) | 117/117 |
+| PostgreSQL specs: `analytics-v2-refresh`, `analytics-v2-occurrence-source`, `analytics-v2-community-daily-route`, `analytics-v2-interim-public-read`, `online-erasure-absence`, `staged-migrations-harness`, `postgres-admin-console` (`PG_TEST_DATABASE=kcore_a_spec`) | 117/117; 0068: 117/117 |
 | `npm run postgres:domain:check` (`PG_TEST_DATABASE=kcore_a_spec`) | vitest 16 files, 111 pass, 1 skipped; node 428: 426 pass, 1 skipped, 1 fail. The failure is `postgres-origin-fastpath.spec.mjs` (e), which pins the default database name `postgres` in a refusal it builds from `PG_TEST_DATABASE`; rerun with `PG_TEST_DATABASE=postgres`, 1/1. An environment choice, not a product failure |
-| `cloud-run` `npm run check` (Node 26.2.0) | rc 0, 435 pass, 5 skipped (includes the pool check, `analytics-refresh-read.check.mjs`, the build with the Worker entry and kernel identity, and the build-context check) |
+| `cloud-run` `npm run check` (Node 26.2.0) | rc 0, 435 pass, 5 skipped (0068: the same) (includes the pool check, `analytics-refresh-read.check.mjs`, the build with the Worker entry and kernel identity, and the build-context check) |
 | `npm run gcp:ops:infra:check` | 206/206 |
 | `npm run gcp:fastpath:scripts-check` | rc 0, 84 pass, 3 skipped (the kernel-registry check 5/5) |
 | `npm run gcp:production-tooling:local-check` | rc 0, 349 pass, 5 skipped |
 | `npm run scripts:check` | 1,084/1,084 (25 runs) |
-| `npm run postgres:migrations:check` | rc 0, 13/13 |
+| `npm run postgres:migrations:check` | rc 0, 13/13 (0068: rc 0); kernel-registry check 0068: 5/5 |
 | `node scripts/ci-postgres-suite.mjs --plan` | failures [] |
 | `test/hosted-backend-workflow.test.js` | 20/20 |
-| Q-1 (W = 1 and 4) and dense (W = 1) rehearsals | `pass` (above) |
+| Q-1 (W = 1 and 4) and dense (W = 1) rehearsals | `pass` on both merges (above) |
 | Root `npm run architecture:check` | passed (959 production files, 4,114 imports, 0 debt edges) |
 | Root `npm run test:preflight` | rc 0, 20/20 |
 
