@@ -5,7 +5,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
 import { OPS_ACTIVITY_CLASSES, OPS_BACKLOG_CAP, OPS_PROBE_NAMES, OPS_PROBES, opsProbeNamesForJob, serializeOpsProbeLine }
   from "../cloud-run/ops-probe-contract.mjs";
 import { collectOpsRuntimeSignals, runLogRedactionProbe, runOpsRuntimeProbe } from "../cloud-run/ops-runtime-probe-job.mjs";
@@ -23,6 +24,11 @@ import { collectOpsRuntimeSignals, runLogRedactionProbe, runOpsRuntimeProbe } fr
  * lifecycle guards belong to the writers under test elsewhere; here they only
  * need to leave a row for the probe to read) and remove them afterwards. Roles
  * are prefixed d_ops4_ and dropped. Every row and name is synthetic.
+ *
+ * The primary chain is the stock set plus the one staged index this probe's
+ * v1.2 manifest read depends on (found by its name suffix, staged or, once the
+ * integrator has promoted it under a primary number, stock; see
+ * READY_AT_INDEX_SUFFIX).
  */
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
@@ -35,6 +41,16 @@ const SKIP = !PG_TEST_HOST && !PG_TEST_SOCKET;
 const SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const SCHEMA = "d_ops4_primary";
 const OWNER_SENTINEL = "d0".repeat(32);
+const READY_AT_INDEX_SUFFIX = "_v12_ready_manifest_ready_at_index.sql";
+const READY_AT_INDEX = "telemetry_v12_manifests_ready_at";
+
+/** The partial ready_at index migration: exactly one, staged or promoted. */
+async function readyAtIndexMigration() {
+  const [staged, stock] = await Promise.all([listStagedMigrations("primary"), readPostgresMigrations({ role: "primary" })]);
+  const found = [...staged, ...stock].filter(({ name }) => name.endsWith(READY_AT_INDEX_SUFFIX));
+  assert.equal(found.length, 1, "exactly one ready_at index migration, staged or promoted");
+  return found[0];
+}
 
 async function endpoint() {
   const socket = PG_TEST_SOCKET || (PG_TEST_HOST?.startsWith("/") ? PG_TEST_HOST : undefined);
@@ -84,8 +100,10 @@ function environment() {
     await admin.query(`CREATE DATABASE "${databaseName}"`);
     pool = poolFor(host, port, databaseName, { application_name: "d-ops4-test" });
     await pool.query(`CREATE SCHEMA "${SCHEMA}"`);
-    const applied = await applyPostgresMigrations({ role: "primary", schema: SCHEMA, pool });
-    assert.ok(applied.applied > 0);
+    const migration = await readyAtIndexMigration();
+    const applied = await applyStockAndStagedMigrations({ role: "primary", schema: SCHEMA, pool, stagedFiles: [migration.name] });
+    assert.ok(applied.stockApplied > 0);
+    assert.equal(applied.staged.length + applied.promoted.length, 1, "the ready_at index is applied once, staged or already stock");
     return { host, port };
   })();
   return setupPromise;
@@ -426,6 +444,84 @@ test("the journal reads walk the (source_id, sequence) primary key: no scan of t
     assert.ok(Math.max(...actualRows) <= OPS_BACKLOG_CAP, `no node returns more than the cap: ${actualRows}`);
   } finally {
     await resetJournal();
+  }
+});
+
+/** Every node of an EXPLAIN (FORMAT JSON) plan, depth first. */
+function planNodes(root) {
+  const nodes = [];
+  const walk = (node) => {
+    if (node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (typeof node["Node Type"] === "string") nodes.push(node);
+    walk(node.Plan);
+    walk(node.Plans);
+  };
+  walk(root);
+  return nodes;
+}
+
+test("the v1.2 manifest read walks the partial ready_at index: no scan of the manifests and a one-row read", { skip: SKIP, timeout: 240_000 }, async () => {
+  await environment();
+  try {
+    await seeding(async (client) => {
+      // 10,000 ready manifests (kept for good once ready) beside 20,000 staged ones. ready_at is spread over
+      // a year and the staged rows carry none, so only an index on the ready rows can answer without a scan.
+      await client.query(`INSERT INTO ${table("telemetry_v12_day_manifests")}
+        (id, participant_id, device_id, chunk_day, manifest_digest, parser_version, manifest_json, expected_chunk_count, state, created_at, ready_at)
+        SELECT gen_random_uuid()::text, 'd-ops4-plan-p-' || n, 'd-ops4-plan-d-' || n, current_date,
+               md5('plan-a' || n::text) || md5('plan-b' || n::text), 'synthetic', '{}', 0,
+               CASE WHEN n % 3 = 0 THEN 'ready' ELSE 'staged' END, now() - interval '400 days',
+               CASE WHEN n % 3 = 0 THEN now() - (n || ' minutes')::interval END
+          FROM generate_series(1, 30000) AS n`);
+    });
+    await pool.query(`ANALYZE ${table("telemetry_v12_day_manifests")}`);
+    // The statement the probe really issues, captured from a real run.
+    const issued = [];
+    await withClient(async (real) => {
+      const recording = { query: (text, values) => { issued.push({ text, values }); return real.query(text, values); } };
+      const lines = await collectOpsRuntimeSignals({ client: recording, schema: SCHEMA });
+      const age = new Map(lines.map((line) => [line.probe, line])).get("v12_newest_ready_manifest_age_seconds");
+      assert.equal(age.state, "ok");
+      assert.ok(age.value >= 180 && age.value < 240, `the newest ready manifest is n = 3, 3 minutes old: ${age.value}`);
+    });
+    const reads = issued.filter((entry) => entry.text.includes('"telemetry_v12_day_manifests"'));
+    assert.equal(reads.length, 1, "the manifest age is one statement");
+    const manifestScans = (plan) => planNodes(plan).filter((node) => node["Relation Name"] === "telemetry_v12_day_manifests");
+    const scansOf = async (explain) => manifestScans((await pool.query(`${explain} ${reads[0].text}`, reads[0].values)).rows[0]["QUERY PLAN"]);
+
+    const planned = await scansOf("EXPLAIN (FORMAT JSON)");
+    assert.ok(planned.length > 0, "the plan reads the manifests");
+    for (const node of planned) {
+      assert.match(node["Node Type"], /^Index (Only )?Scan$/u, `no sequential scan of the manifests: ${node["Node Type"]}`);
+      assert.equal(node["Index Name"], READY_AT_INDEX);
+      assert.equal(node["Scan Direction"], "Backward", "the newest ready_at is the last key of the index");
+    }
+    // Run, the read touches one index entry, not the 10,000 ready rows or the 30,000 rows of the table.
+    const analyzed = await scansOf("EXPLAIN (ANALYZE, FORMAT JSON)");
+    for (const node of analyzed) {
+      assert.ok(node["Actual Rows"] <= 1, `the scan returns one row: ${node["Actual Rows"]}`);
+      assert.ok((node["Rows Removed by Filter"] ?? 0) === 0, "no filtered rows: the index holds only ready rows");
+    }
+    // The control: with the index gone the same statement is a sequential scan of the whole table, so the
+    // assertions above fail for the unindexed read. DROP INDEX is transactional and rolled back.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DROP INDEX ${table(READY_AT_INDEX)}`);
+      await client.query("SET LOCAL enable_seqscan = off");
+      const without = manifestScans((await client.query(`EXPLAIN (FORMAT JSON) ${reads[0].text}`, reads[0].values)).rows[0]["QUERY PLAN"]);
+      assert.ok(without.some((node) => node["Node Type"] === "Seq Scan"), "without the index the read is a sequential scan, even with seqscan discouraged");
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+    const indexed = await pool.query(`SELECT pg_get_indexdef(index_class.oid) AS definition
+      FROM pg_class index_class WHERE index_class.relname = $1 AND index_class.relnamespace = $2::regnamespace`, [READY_AT_INDEX, `"${SCHEMA}"`]);
+    assert.equal(indexed.rowCount, 1, "the rolled-back control left the index in place");
+    assert.match(indexed.rows[0].definition, /\(ready_at\) WHERE \(state = 'ready'::text\)$/u);
+  } finally {
+    await seeding((client) => client.query(`DELETE FROM ${table("telemetry_v12_day_manifests")} WHERE participant_id LIKE 'd-ops4-plan-p-%'`));
   }
 });
 

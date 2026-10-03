@@ -654,8 +654,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 68,
-      "the 67-migration primary chain and the staged kernel stamps, 0059 staged or promoted");
+    assert.equal(stock.length + stagedCount, 69,
+      "the 68-migration primary chain and the staged run stamps, 0059 staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 

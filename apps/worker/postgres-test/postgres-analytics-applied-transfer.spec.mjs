@@ -122,8 +122,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL 17 synthetic analytics applied rece
       await pool.query(`CREATE SCHEMA ${quoted}`);
       schemaCreated = true;
       const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-      expect(migration.applied).toBe(67);
-      expect(migration.migrations.at(-1)?.name).toBe("0067_pending_object_transfer_holds.sql");
+      expect(migration.applied).toBe(68);
+      expect(migration.migrations.at(-1)?.name).toBe("0068_v12_ready_manifest_ready_at_index.sql");
       fixture = await makeSealedSource();
 
       await pool.query(`CREATE TABLE ${table(POSTGRES_ANALYTICS_APPLIED_RECEIPT_TABLE)} (

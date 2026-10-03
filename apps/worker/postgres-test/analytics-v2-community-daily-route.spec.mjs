@@ -11,9 +11,9 @@
 //
 // Schema: the full promoted primary chain through the production runner,
 // which carries A-3's 0059_analytics_v2.sql and ends at the promoted tail
-// 0067_pending_object_transfer_holds.sql (both asserted). 0059 keeps published
-// heads append-only, so published rows are seeded once and never updated or
-// deleted; scenarios vary only the preview and cache rows.
+// 0068_v12_ready_manifest_ready_at_index.sql (both asserted). 0059 keeps
+// published heads append-only, so published rows are seeded once and never
+// updated or deleted; scenarios vary only the preview and cache rows.
 //
 // Run: PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=55433 \
 //   node --test postgres-test/analytics-v2-community-daily-route.spec.mjs
@@ -31,7 +31,7 @@ import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analyt
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const A3_MIGRATION = "0059_analytics_v2.sql";
-const PRIMARY_TAIL = "0067_pending_object_transfer_holds.sql";
+const PRIMARY_TAIL = "0068_v12_ready_manifest_ready_at_index.sql";
 
 const NOW_MS = Date.parse("2026-10-01T12:00:00.000Z");
 const GENERATED_AT = "2026-10-01T12:00:00.000Z";
@@ -105,7 +105,7 @@ async function createSchema() {
   await pool.query(`CREATE SCHEMA ${quotedSchema}`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
   await defaultAnalyticsV2FixtureStamps(pool, schema);
-  assert.equal(applied.migrations.at(-1)?.name, PRIMARY_TAIL, "the promoted chain ends at 0067");
+  assert.equal(applied.migrations.at(-1)?.name, PRIMARY_TAIL, "the promoted chain ends at 0068");
   assert.equal(applied.migrations.filter(({ name }) => name === A3_MIGRATION).length, 1,
     "the promoted chain carries A-3's 0059");
   ddl = `promoted primary chain through ${PRIMARY_TAIL}`;

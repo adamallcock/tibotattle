@@ -64,6 +64,13 @@ reset; the probe keeps no state, so a consumer differences two lines. There is
 no ledger, tombstone, replay or erasure-job signal: the append-only line has
 none.
 
+The ready-manifest age reads one entry of a partial index on
+`telemetry_v12_day_manifests (ready_at) WHERE state = 'ready'`, created by
+primary migration `0068_v12_ready_manifest_ready_at_index.sql`. Without that
+index the read is a table scan that grows with the table and ends as
+`STATEMENT_TIMEOUT`; migrate the database through `0068` before registering the
+probe.
+
 The backup audit writes the OPS-1 verdict as a level (0 ok, 1 warn, 2 breach)
 with its closed codes, whether point-in-time recovery is on, and the age of the
 newest successful automated backup. A fetch failure is `unavailable`, never ok
@@ -78,7 +85,8 @@ and never a breach. A restorable copy older than 365 days is level 2.
   credentials read other sessions' query text, which the probe never selects.
   Nothing in this change grants it.
 - **The `opsBackupAudit` account** and its two permissions, and registering the
-  jobs (an image roll, two triggers created paused, the connection budget).
+  jobs (an image roll, two triggers created paused, the connection budget), after
+  the ready-manifest index above (primary `0068`) is applied.
 - **Alerts** on these lines wait for the monitoring bundle (E-OPS5) and the
   owner's notification channel.
 
