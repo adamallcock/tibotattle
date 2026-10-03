@@ -520,6 +520,17 @@ gates are in the
   task timeout. It also added the production and staging target contract,
   which the OPS-2 render is pinned to. The reader variant bound divergence
   and the xmin hold remain disclosed; MEAS-3 recalibrates the models.
+- R19 SEMI (2026-10-03, owner decisions round 19: adopt now;
+  [receipt](../receipts/2026-10-03-gcp-r19-semi.md)). The inline refresh job
+  runs with `--max-semi-space-size=64` beside `--max-old-space-size` (the
+  production job, its OPS-2 render, the `standard` and `dense` test-deploy
+  profiles and the inline local rehearsal; not `dense-workers`). The output
+  budget excludes only young-generation growth above the historical 48 MiB
+  allowance. The dense profile's starting output budget stays 351 MiB with
+  or without the flag, instead of 495 MiB with the flag alone. The receipt's
+  `memory.youngGenerationMiB` reports the inferred young generation. The
+  `dense-workers` main budget retains the same 48 MiB allowance; Worker
+  footprint sizing continues to use the complete heap limit.
 
 ## Cutover backlog
 

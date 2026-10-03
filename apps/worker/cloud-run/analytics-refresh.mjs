@@ -49,7 +49,8 @@
  *
  * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
  * reviewed target path. The invocation is exactly
- *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full
+ *   node --max-old-space-size=<heap> --max-semi-space-size=<semi>
+ *     dist/analytics-refresh.mjs --mode=full
  * (ANALYTICS_REFRESH_PRODUCTION_JOB: inline, no --workers), with no --schema, --now or
  * --revision-seed, on the real clock: revisions follow the stored heads and
  * the stored Cloudflare revision floor (REV-SEED: the cutover import loads
@@ -132,12 +133,18 @@
  *                                        (default 256, 32..256)
  *   ANALYTICS_V2_READ_CHUNK_OCCURRENCES  occurrences one read call targets
  *                                        (default 250000, 10000..2000000)
- * The heap is partitioned: the per-owner budget, the read reserve (4 KiB per
- * read-chunk occurrence), a 256 MiB runtime reserve, and the rest is the
- * output budget, which A-2's output account charges every held output row
- * against (resources.ts). The run refuses to start
- * (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless the output budget is at
- * least 64 MiB. Once the plan has fixed the largest admitted owner's
+ * The heap is partitioned: the per-owner budget, the read reserve
+ * (4 KiB per read-chunk occurrence), a 256 MiB runtime reserve, and the rest
+ * is the output budget, which A-2's output account charges every held output
+ * row against (resources.ts). The partitioned heap is V8's heap_size_limit
+ * less the young-generation growth beyond the 48 MiB the budget counted before
+ * R19 (ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES): when the Node flags
+ * declare --max-old-space-size, the young generation is the rest of
+ * heap_size_limit (analyticsRefreshYoungGenerationBytes), so a larger
+ * semi-space (--max-semi-space-size) does not grow the output budget, and the
+ * budget is at most the declared old space plus 48 MiB less the reserves. The run
+ * refuses to start (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless the output
+ * budget is at least 64 MiB. Once the plan has fixed the largest admitted owner's
  * estimate, the output budget also takes the rest of the per-owner budget
  * (compute reclaimUnusedOwnerBudget, resources.ts analyticsV2OutputBudget);
  * the run refuses mid-run (ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED, nothing
@@ -296,6 +303,15 @@ export const ANALYTICS_REFRESH_RUNTIME_FORBIDDEN = Object.freeze(["NODE_OPTIONS"
  * Workers for that measurement. One task, no retries: a run either writes
  * everything in one transaction or nothing, and the time guard refuses it
  * before taskTimeoutSeconds. `args` follows `node`.
+ *
+ * semiSpaceMiB (owner decisions round 19, item SEMI): V8's semi-space,
+ * --max-semi-space-size=64 instead of the default 16 MiB. The paired d0
+ * measurement (design/refresh-profile-slices-2026-10-03.md) cut scavenges by
+ * 75%, GC time by 62% and wall time by 6.4% on the o05 probe, with all seven
+ * output tables identical. The young generation it adds (three semi-spaces:
+ * 192 MiB instead of 48 MiB on Node.js 22.16.0, where heap_size_limit reads
+ * 12,480 MiB instead of 12,336 MiB) is excluded from the output budget
+ * (analyticsRefreshResources), and the task memory check counts it.
  */
 export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
   entry: "dist/analytics-refresh.mjs",
@@ -303,23 +319,28 @@ export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
   cpu: "4",
   memory: "16Gi",
   heapMiB: 12_288,
+  semiSpaceMiB: 64,
   memoryBudgetMiB: 10_752,
   workers: 1,
   taskTimeoutSeconds: 14_400,
   tasks: 1,
   parallelism: 1,
   maxRetries: 0,
-  args: Object.freeze(["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]),
+  args: Object.freeze(["--max-old-space-size=12288", "--max-semi-space-size=64", "dist/analytics-refresh.mjs",
+    "--mode=full"]),
   env: ANALYTICS_REFRESH_PRODUCTION_ENV,
 });
 /**
  * The task-memory relation a refresh profile must keep (K-PAR): the main heap
- * and, with compute Workers, the Workers' per-owner budget and one heap
- * reserve (the pool keeps the Workers' heap limits together within the budget
- * plus one reserve; inline the budget is inside the main heap), with at least
- * nativeReserveMiB of the task's memory left for native allocations.
+ * (its old space and, when the profile sets a semi-space, the young
+ * generation of youngGenerationSemiSpaces semi-spaces) and, with compute
+ * Workers, the Workers' per-owner budget and one heap reserve (the pool keeps
+ * the Workers' heap limits together within the budget plus one reserve;
+ * inline the budget is inside the main heap), with at least nativeReserveMiB
+ * of the task's memory left for native allocations.
  */
-export const ANALYTICS_REFRESH_TASK_MEMORY_CHECK = Object.freeze({ taskMemoryMiB: 16_384, nativeReserveMiB: 1_024 });
+export const ANALYTICS_REFRESH_TASK_MEMORY_CHECK = Object.freeze({ taskMemoryMiB: 16_384, nativeReserveMiB: 1_024,
+  youngGenerationSemiSpaces: 3 });
 const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed", "workers"]);
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/u;
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -392,6 +413,41 @@ export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ runtimeBytes: 256 
   minimumOutputBudgetBytes: 64 * MIB });
 /** resources.ts ANALYTICS_V2_RESOURCE_BOUNDS.outputBudgetBytes.maximum (the spec pins the equality). */
 const MAX_OUTPUT_BUDGET_BYTES = 30_720 * MIB;
+/**
+ * The young generation the output budget keeps counting: the 48 MiB V8 gives
+ * the job by default on Node.js 22.16.0 (three 16 MiB semi-spaces), which the
+ * budget counted before R19. Owner decisions round 19 adopt
+ * --max-semi-space-size=64 with the output budget corrected for the
+ * young-generation growth only, so the growth beyond this is excluded and the
+ * budget stays where the default young generation left it, on every profile.
+ */
+export const ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES = 48 * MIB;
+const OLD_SPACE_FLAG = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/su;
+const OLD_SPACE_MIB = /^[1-9]\d{0,8}$/u;
+
+/**
+ * The young-generation bytes inside V8's heap_size_limit, which hold no
+ * retained output row: heap_size_limit less the old-space size the Node flags
+ * declare (--max-old-space-size, the last declaration winning, NODE_OPTIONS
+ * before the command line as Node applies them). V8 adds its young generation
+ * to the declared old space (Node.js 22.16.0: three semi-spaces, so 48 MiB at
+ * the default 16 MiB semi-space and 192 MiB at --max-semi-space-size=64), and
+ * the default semi-space differs between Node versions (Node.js 24.14.0 gives
+ * 192 MiB and 26.2.0 96 MiB without the flag), so the declared old space is
+ * the one figure the job can trust. Without a declaration (or with one it
+ * cannot read, or one above the limit) it is 0, and the whole limit is
+ * partitioned, as before R19.
+ */
+export function analyticsRefreshYoungGenerationBytes(heapLimitBytes, flags = []) {
+  let declaredBytes = null;
+  for (const flag of Array.isArray(flags) ? flags : []) {
+    const match = typeof flag === "string" ? OLD_SPACE_FLAG.exec(flag) : null;
+    if (match === null) continue;
+    declaredBytes = match[1] !== undefined && OLD_SPACE_MIB.test(match[1]) ? Number(match[1]) * MIB : null;
+  }
+  if (declaredBytes === null || !Number.isSafeInteger(heapLimitBytes) || declaredBytes > heapLimitBytes) return 0;
+  return heapLimitBytes - declaredBytes;
+}
 
 /**
  * Measured phase rates (Node.js 22.16.0, local PostgreSQL 17, the dense-final
@@ -435,19 +491,21 @@ refusal) or 1 (failure).
 Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
 exactly PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
 POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
---revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
---mode=full (the dense profile, inline, 4 h task timeout). A production target
-refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT until the cutover import has loaded
-the revision floor, and a production first run refuses
-ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT when the frozen interim read is absent,
-even if the revision floor is loaded.
+--revision-seed; run as node --max-old-space-size=12288 --max-semi-space-size=64
+ dist/analytics-refresh.mjs --mode=full (the dense profile, inline, 4 h task
+ timeout). A production target refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT until
+ the cutover import has loaded the revision floor, and a production first run
+ refuses ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT when the frozen interim read
+ is absent, even if the revision floor is loaded.
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
 ANALYTICS_V2_READ_CHUNK_OCCURRENCES (250000), and, outside production,
-ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (none). The Node heap limit must cover
-the budget, 256 MiB, 4 KiB per read-chunk occurrence and a 64 MiB output budget
-(run the Job with --max-old-space-size=6144 for the defaults).
+ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (none). The Node old space and 48 MiB
+of the young generation must cover the budget, 256 MiB, 4 KiB per read-chunk
+occurrence and a 64 MiB output budget (run the Job with
+--max-old-space-size=6144 for the defaults); young generation beyond 48 MiB
+(a larger --max-semi-space-size) is not counted.
 `;
 
 function fail(code, extra = {}) {
@@ -745,11 +803,15 @@ function resourceValue(env, entry) {
  * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit that leaves less
  * than the minimum output budget after the per-owner budget, the read
  * reserve and the runtime reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT).
- * The rest of the heap is the output budget (compute.outputBudgetBytes), so
- * the whole run is bounded: one admitted owner's estimate, the accounted
- * outputs and held inputs, and the reserves.
+ * The rest of the partitioned heap is the output budget
+ * (compute.outputBudgetBytes), so the whole run is bounded: one admitted
+ * owner's estimate, the accounted outputs and held inputs, and the reserves.
+ * heapLimitBytes is V8's heap_size_limit; execArgv (and env.NODE_OPTIONS) are
+ * the Node flags, from which the young generation is read
+ * (analyticsRefreshYoungGenerationBytes); the part of it beyond
+ * ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES is not partitioned.
  */
-export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1 } = {}) {
+export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1, execArgv = [] } = {}) {
   const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
   const reserve = ANALYTICS_REFRESH_HEAP_RESERVE;
   if (!Number.isSafeInteger(workers) || workers < ANALYTICS_REFRESH_WORKER_BOUNDS.minimum
@@ -766,14 +828,19 @@ export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1 } =
   const ownerBytesInHeap = workers === 1 ? memoryBudgetBytes : 0;
   const reservedBytes = ownerBytesInHeap + reserve.runtimeBytes + readChunkOccurrences * reserve.bytesPerReadCandidate;
   const requiredHeapBytes = reservedBytes + reserve.minimumOutputBudgetBytes;
-  if (!Number.isSafeInteger(heapLimitBytes) || heapLimitBytes < requiredHeapBytes) {
-    fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
-  }
-  const outputBudgetBytes = Math.min(heapLimitBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
+  if (!Number.isSafeInteger(heapLimitBytes)) fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
+  const nodeOptions = typeof env?.NODE_OPTIONS === "string" ? env.NODE_OPTIONS.split(/\s+/u) : [];
+  const youngGenerationBytes = analyticsRefreshYoungGenerationBytes(heapLimitBytes,
+    [...nodeOptions, ...(Array.isArray(execArgv) ? execArgv : [])]);
+  const partitionedBytes = heapLimitBytes
+    - Math.max(0, youngGenerationBytes - ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES);
+  if (partitionedBytes < requiredHeapBytes) fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
+  const outputBudgetBytes = Math.min(partitionedBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
   return Object.freeze({
     compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes, outputBudgetBytes }),
     readChunkOccurrences,
     heapLimitBytes,
+    youngGenerationBytes,
     requiredHeapBytes,
     workers,
   });
@@ -1197,6 +1264,7 @@ function memorySummary(resources, recorded, peakRssBytes) {
     maxDayRecordMiB: toMiB(resources.compute.maxDayRecordBytes),
     readChunkOccurrences: resources.readChunkOccurrences,
     heapLimitMiB: Math.floor(resources.heapLimitBytes / MIB),
+    youngGenerationMiB: Math.floor((resources.youngGenerationBytes ?? 0) / MIB),
     requiredHeapMiB: toMiB(resources.requiredHeapBytes),
     ownersComputed: owners.filter((owner) => owner.admitted === true).length,
     ownersRefused: owners.filter((owner) => owner.admitted === false).length,
@@ -1240,7 +1308,7 @@ function refusalFigures(error) {
 /**
  * Run one refresh. dependencies (tests and the composition root only):
  * createPool(database, {connector}), createConnector(), closeResources(),
- * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, peakRssBytes().
+ * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, execArgv, peakRssBytes().
  * Returns the receipt; throws an error carrying a closed code and phase (and,
  * for a deadline or output-budget refusal, its content-free figures).
  */
@@ -1278,7 +1346,10 @@ export async function runAnalyticsRefresh({
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
     const resources = analyticsRefreshResources(env,
-      dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit, { workers: parsed.workers });
+      dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit,
+      // An injected heap limit is not this process's, so neither are its flags.
+      { workers: parsed.workers,
+        execArgv: dependencies.execArgv ?? (dependencies.heapLimitBytes === undefined ? process.execArgv : []) });
     const guard = createAnalyticsRefreshTimeGuard({ startedAtMs,
       taskTimeoutMs: analyticsRefreshTaskTimeoutMs(env, production), wallClock });
     // A deadline that leaves no room for the write and the exit is refused

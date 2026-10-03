@@ -45,9 +45,14 @@ import {
   FASTPATH_TEST_CLOUD_TARGET,
   fastpathTestDatabaseConfig,
 } from "../cloud-run/origin-fastpath-mode.mjs";
-import { GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB } from "./gcp-fastpath-rehearsal.mjs";
+import {
+  GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB,
+  GCP_FASTPATH_REHEARSAL_REFRESH_SEMI_SPACE_MIB,
+} from "./gcp-fastpath-rehearsal.mjs";
 import { GCP_FASTPATH_SEED } from "./gcp-fastpath-seed.mjs";
 import {
+  ANALYTICS_REFRESH_PRODUCTION_JOB,
+  ANALYTICS_REFRESH_TASK_MEMORY_CHECK,
   ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
   analyticsRefreshResources,
   parseAnalyticsRefreshArguments,
@@ -162,7 +167,8 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
 
   const plain = refreshJobCommand({ image: IMAGE });
   assert.equal(plain.includes(
-    "--args=--max-old-space-size=6144,dist/analytics-refresh.mjs,--mode=full,--schema=tibotattle_fastpath_20261001"), true);
+    "--args=--max-old-space-size=6144,--max-semi-space-size=64,dist/analytics-refresh.mjs,--mode=full,"
+    + "--schema=tibotattle_fastpath_20261001"), true);
   assert.equal(plain.some((arg) => arg.includes("ANALYTICS_V2_TEST_CLOCK")), false);
   const clocked = refreshJobCommand({ image: IMAGE, now: "2026-10-01T00:00:00Z", extraEnv: [["EXTRA_FLAG", "1"]] });
   assert.equal(clocked.some((arg) => arg.endsWith(",--now=2026-10-01T00:00:00Z")), true);
@@ -173,10 +179,14 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
     assert.equal(clocked.includes(flag), true, flag);
   }
   const MIB = 1_048_576;
-  const heapLimit = (REFRESH_JOB_RESOURCES.heapMiB + 48) * MIB;
-  assert.ok(analyticsRefreshResources({}, heapLimit).requiredHeapBytes <= REFRESH_JOB_RESOURCES.heapMiB * MIB,
-    "the default budget plus reserve fits the Job's old-space size");
+  // heap_size_limit is the old space plus three semi-spaces (Node.js 22.16.0).
+  const heapLimit = (REFRESH_JOB_RESOURCES.heapMiB + 3 * REFRESH_JOB_RESOURCES.semiSpaceMiB) * MIB;
+  assert.ok(analyticsRefreshResources({}, heapLimit, { execArgv: [`--max-old-space-size=${REFRESH_JOB_RESOURCES.heapMiB}`,
+    `--max-semi-space-size=${REFRESH_JOB_RESOURCES.semiSpaceMiB}`] }).requiredHeapBytes
+    <= REFRESH_JOB_RESOURCES.heapMiB * MIB, "the default budget plus reserve fits the Job's old-space size");
   assert.equal(GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB, REFRESH_JOB_RESOURCES.heapMiB, "the rehearsal runs the Job's heap");
+  assert.equal(GCP_FASTPATH_REHEARSAL_REFRESH_SEMI_SPACE_MIB, REFRESH_JOB_RESOURCES.semiSpaceMiB,
+    "the inline rehearsal runs the Job's semi-space");
   expectCode(() => refreshJobCommand({ image: IMAGE, now: "yesterday" }), "FASTPATH_DEPLOY_NOW_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraArgs: ["--a,b"] }), "FASTPATH_DEPLOY_ARGS_INVALID");
   expectCode(() => refreshJobCommand({ image: IMAGE, extraEnv: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
@@ -190,17 +200,22 @@ test("refresh profiles: the standard Job stays the default; the dense Jobs are 4
   for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
     assert.equal(dense.includes(flag), true, flag);
   }
-  // The dense profile is the production profile: inline (no --workers).
-  assert.equal(dense.some((arg) => arg.startsWith("--args=--max-old-space-size=12288,dist/analytics-refresh.mjs,")
+  // The dense profile is the production profile: inline (no --workers), with
+  // the production job's 64 MiB semi-space (owner decisions round 19, SEMI).
+  assert.equal(dense.some((arg) => arg.startsWith(
+    "--args=--max-old-space-size=12288,--max-semi-space-size=64,dist/analytics-refresh.mjs,")
     && !arg.includes("--workers")), true);
+  assert.equal(REFRESH_JOB_PROFILES.dense.semiSpaceMiB, ANALYTICS_REFRESH_PRODUCTION_JOB.semiSpaceMiB);
   // dense-workers is the MEAS-3 measurement of the compute Workers (K-PAR):
   // the same task and budget, a 3,072 MiB main heap and four Workers.
   const workers = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense-workers" });
   for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
     assert.equal(workers.includes(flag), true, flag);
   }
+  // No semi-space flag with compute Workers: a V8 flag reaches every Worker isolate (K-PAR-MEM's to settle).
   assert.equal(workers.some((arg) => arg.startsWith("--args=--max-old-space-size=3072,dist/analytics-refresh.mjs,")
     && arg.endsWith(",--workers=4")), true);
+  assert.equal(workers.some((arg) => arg.includes("--max-semi-space-size")), false);
   assert.equal(workers.some((arg) => arg.startsWith("--set-env-vars=")
     && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")), true);
   assert.equal(dense.some((arg) => arg.startsWith("--set-env-vars=") && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")
@@ -213,15 +228,23 @@ test("refresh profiles: the standard Job stays the default; the dense Jobs are 4
   const MIB = 1_048_576;
   for (const [name, profile] of Object.entries(REFRESH_JOB_PROFILES)) {
     const env = Object.fromEntries(profile.env);
-    // The job's own start-up guard accepts the profile's heap for its budget...
-    const resources = analyticsRefreshResources(env, (profile.heapMiB + 48) * MIB, { workers: profile.workers });
+    // The job's own start-up guard accepts the profile's old space for its
+    // budget (the young generation, 3 semi-spaces at 16 MiB by default, is
+    // not counted toward it)...
+    const youngMiB = ANALYTICS_REFRESH_TASK_MEMORY_CHECK.youngGenerationSemiSpaces * (profile.semiSpaceMiB ?? 16);
+    const execArgv = [`--max-old-space-size=${profile.heapMiB}`,
+      ...(profile.semiSpaceMiB === null ? [] : [`--max-semi-space-size=${profile.semiSpaceMiB}`])];
+    const resources = analyticsRefreshResources(env, (profile.heapMiB + youngMiB) * MIB,
+      { workers: profile.workers, execArgv });
+    assert.equal(resources.youngGenerationBytes, youngMiB * MIB, name);
     assert.ok(resources.requiredHeapBytes <= profile.heapMiB * MIB, name);
-    // ...and Cloud Run's memory holds the heap, the compute Workers' heap
-    // limits (K-PAR: together at most the budget plus one reserve; inline the
-    // budget is inside the heap) plus at least 1 GiB of native memory.
+    // ...and Cloud Run's memory holds the heap (old space and young
+    // generation), the compute Workers' heap limits (K-PAR: together at most
+    // the budget plus one reserve; inline the budget is inside the heap) plus
+    // at least 1 GiB of native memory.
     const workerMiB = profile.workers > 1
       ? resources.compute.memoryBudgetBytes / MIB + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB : 0;
-    assert.ok(Number.parseInt(profile.memory, 10) * 1024 - profile.heapMiB - workerMiB >= 1_024, name);
+    assert.ok(Number.parseInt(profile.memory, 10) * 1024 - profile.heapMiB - youngMiB - workerMiB >= 1_024, name);
   }
   expectCode(() => refreshJobCommand({ image: IMAGE, profile: "huge" }), "FASTPATH_DEPLOY_REFRESH_PROFILE_INVALID");
 });
@@ -393,10 +416,11 @@ test("the deploy script and the composition roots agree on the clock, database, 
 
   // Refresh: the Job's args and env parse, take the test clock and reach only tibotattle_fastpath.
   const command = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:00:00Z", schema: seeded });
-  // node's own flag (the heap) comes before the script; the job parses what follows it.
+  // node's own flags (the heap and the semi-space) come before the script; the job parses what follows it.
   const nodeArgs = command.find((arg) => arg.startsWith("--args=")).slice("--args=".length).split(",");
-  assert.deepEqual(nodeArgs.slice(0, 2), ["--max-old-space-size=6144", "dist/analytics-refresh.mjs"]);
-  const args = nodeArgs.slice(2);
+  assert.deepEqual(nodeArgs.slice(0, 3), ["--max-old-space-size=6144", "--max-semi-space-size=64",
+    "dist/analytics-refresh.mjs"]);
+  const args = nodeArgs.slice(3);
   const jobEnv = { ...commandEnv(command), CLOUD_RUN_JOB: FASTPATH_TEST.refreshJob };
   const parsed = parseAnalyticsRefreshArguments(args, jobEnv);
   assert.equal(parsed.schema, seeded);
