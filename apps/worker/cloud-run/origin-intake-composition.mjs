@@ -21,8 +21,8 @@
  *   is created), so the envelope and format tables pair exactly
  *   (assertContributionEnvelopeFormats).
  * - recordPostgresDeviceUploadReceipt: IN-3's port of d43c8f92
- *   recordDeviceUploadReceipt, which the preamble runs after the v1.0 and
- *   v0.1 handlers.
+ *   recordDeviceUploadReceipt, which the preamble runs after the v1.0
+ *   handler (the retired v0.x envelopes refuse before any claim).
  * - routeModules: IN-3's POST /api/v1/device/upload-authorizations module,
  *   which replaces the v1.2-only built-in (shipped v1.0 clients send three
  *   body keys). It authenticates the device bearer under the Worker's

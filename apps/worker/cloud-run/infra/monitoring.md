@@ -120,8 +120,20 @@ whole only when every trigger's condition does.
 
 **Page.** For 10 minutes, Cloud Run's 5xx responses exceed 2 % of all
 requests. The origin's own `503 POSTGRES_ROUTE_NOT_PORTED` answers are
-subtracted first. Those are counted from its request log line, which is
-contained by design until D-CRB ports the route.
+subtracted first, counted from its request log line. Since owner round 12
+most of them are permanent, not a wait for a port:
+
+- the retired routes, which can never be ported
+  (`PRODUCTION_ROUTE_PORT_RETIRED` in `postgres-production-registry.mjs`);
+- v0.x uploads on two ported routes: a v0.1 or v0.2 envelope on
+  `contributions`, and a v0.1 or v0.2 format on `device_upload_authorization`;
+- an admin task with no PostgreSQL port on `admin_action` (C-ADMIN), until
+  it is ported.
+
+The subtraction keys on the status and code, not the route class, so it
+covers all three. An exclusion keyed by route must also list
+`contributions` and `device_upload_authorization` for this code, or count
+their v0.x answers as errors.
 
 1. Read the request log line's `routeClass` and `code` labels to find which
    route class fails.

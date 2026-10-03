@@ -3,16 +3,23 @@
  * (GCP fast path, IN-3). A registry entry, not a route, dispatched after the
  * shared contributions preamble exactly like envelopes/v10.mjs.
  *
- * Not retired: d43c8f92 still routes telemetry-envelope-v0.1 to
+ * Retired at the switch; the composed origin does not register this module.
+ * d43c8f92 still routes telemetry-envelope-v0.1 to
  * handleTelemetryContribution, and the D1 format table keeps
- * telemetry-contribution-v0.1 'accepted' (migrations/0044), so a social
- * participant whose transport floor is still rank 1 can upload it. The port
- * is admitPostgresTelemetryV01Contribution in
- * src/postgres-legacy-contribution-admission.ts, injected here. It needs
- * primary 0061, legacy_contribution_admission (weekly admission window),
- * and the retained v0.1 upload-authorization format
- * (upload-authorization-formats.mjs RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS);
- * register all three together or none.
+ * telemetry-contribution-v0.1 'accepted' (migrations/0044), but owner round
+ * 12 (2026-10-02) retires v0.x uploads at the switch. The composed origin
+ * (origin-intake-composition.mjs) registers a retired envelope and a retired
+ * format for v0.1 and v0.2 instead, and each answers 503
+ * POSTGRES_ROUTE_NOT_PORTED before any upload authorization is claimed. This
+ * module and its port, admitPostgresTelemetryV01Contribution in
+ * src/postgres-legacy-contribution-admission.ts, are kept only for
+ * postgres-test/postgres-legacy-contribution-admission.spec.mjs, which proves
+ * the port against primary 0061 and legacy_contribution_admission. Do not
+ * register this module in a production or staging composition. Re-admitting
+ * v0.1 uploads would need a new owner decision. It would also need this
+ * envelope, the port and a live v0.1 upload-authorization format
+ * (upload-authorization-formats.mjs RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS)
+ * registered together, in place of the retired pair.
  *
  * Arguments are those of envelopes/v10.mjs; the context needs primaryPool,
  * schema, objectStore, envelopePublicJwk and envelopePrivateJwk. As there,

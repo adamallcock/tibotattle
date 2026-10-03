@@ -990,9 +990,13 @@ Read, do not change:
 - The maintenance trigger running and the lifecycle pass fresh.
 - Database load: CPU, memory, connections and disk.
 - One owner-controlled client completing a sync end to end (proposed).
-- The admin overview, once the admin routes are served. C-ADMIN's route
-  modules are `built` but not registered in the host until D-CRB, and the
-  overview answers 503 until its missing sources exist (E-ADMIN).
+- The admin overview. The composition opens the admin host behind the Access
+  chokepoint (ADMIN-R12). The overview is `admin-overview-v0.6`, whose
+  synthetic-contribution counts, historical publication and deletion-ledger
+  blocks answer `{"status":"unavailable"}` until their sources exist
+  (E-ADMIN). The console reads it once the edge serves the admin client that
+  accepts overview v0.6 and database health v0.2 (E-EDGEPORT); until then the
+  deployed client fails closed on both and its controls stay disabled.
 
 The duration of the observation and the thresholds that justify the brake are
 owner decisions that are not recorded yet. The brake is gcp to fenced

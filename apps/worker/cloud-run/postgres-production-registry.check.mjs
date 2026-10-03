@@ -187,29 +187,32 @@ test("the class lists match the brief and the production ported list", () => {
   }
 });
 
-test("round 12: the definite answer is production's d43c8f92 code for the route", async () => {
+test("round 12: the definite answer is production's d43c8f92 code for the route", async (t) => {
   // The Worker grants the accountless performance authorization only while
   // telemetry_performance_runtime is 'active'; ingestion-isolation 0009 seeds
   // it 'staged', so the grant's owner query finds no row and answers its
   // invalid(): 403 TELEMETRY_TRANSPORT_BLOCKED. Read from the parity basis.
-  const show = (path) => new Promise((resolveShow, rejectShow) => {
-    execFile("git", ["show", `${PRODUCTION_ROUTE_PARITY_BASIS.commit}:${path}`], { cwd: WORKER_ROOT,
-      maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => (error ? rejectShow(error) : resolveShow(stdout)));
+  const git = (args) => new Promise((resolveGit, rejectGit) => {
+    execFile("git", args, { cwd: WORKER_ROOT, maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout) => (error ? rejectGit(error) : resolveGit(stdout)));
   });
-  let policySource;
-  let migration;
-  let index;
+  const basis = PRODUCTION_ROUTE_PARITY_BASIS.commit;
   try {
-    [policySource, migration, index] = await Promise.all([
-      show("apps/worker/src/telemetry-performance-policy.ts"),
-      show("apps/worker/ingestion-isolation-migrations/0009_performance_reports.sql"),
-      show("apps/worker/src/index.ts"),
-    ]);
+    await git(["cat-file", "-e", `${basis}^{commit}`]);
   } catch {
-    // A shallow checkout without the parity basis cannot read it; the
-    // pinned answer above still holds the decision.
+    // A checkout without the parity basis (a shallow clone) cannot prove the
+    // answer from source: report a skip, never a pass.
+    t.skip(`parity basis ${basis} unavailable in this checkout`);
     return;
   }
+  // The basis is present, so every read must succeed: a missing file fails.
+  const show = (path) => git(["show", `${basis}:${path}`]);
+  const [policySource, migration, index] = await Promise.all([
+    show("apps/worker/src/telemetry-performance-policy.ts"),
+    show("apps/worker/ingestion-isolation-migrations/0009_performance_reports.sql"),
+    show("apps/worker/src/index.ts"),
+  ]);
+  assert.ok(policySource.includes("export async function grantTelemetryPerformanceAccountlessAuthorization"));
   assert.match(policySource, /function invalid\(code: "TELEMETRY_TRANSPORT_BLOCKED"[^)]*= "TELEMETRY_TRANSPORT_BLOCKED"\): never \{\s*throw new ApiError\(403, code\);/u);
   const grant = policySource.slice(policySource.indexOf("export async function grantTelemetryPerformanceAccountlessAuthorization"));
   assert.match(grant, /AND r\.state = 'active'[\s\S]*?if \(!owner\) invalid\(\);/u);
