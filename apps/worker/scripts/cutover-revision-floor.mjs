@@ -36,6 +36,17 @@
 //   check      Offline: validate a floor file at its pinned sha256 against
 //              the seal it must be bound to. Writes nothing.
 //
+// The production import (P16 and the 'analytics-community-history' stage)
+// also holds the floor to the fence: checkRevisionFloorProvenance reads the
+// fence receipt at the digest the seal pins and refuses a 'captured' floor
+// whose capture block names another D1 or bookmark than the receipt's
+// analytics entry (REVISION_FLOOR_CAPTURE_FENCE_MISMATCH). A 'synthetic'
+// floor covers only the frozen export's days, at revisions read before the
+// fence, so it is admitted only when the run declares the dress rehearsal
+// (PT-8-lite's owner flag 'dress-rehearsal-synthetic-revision-floor'), and
+// that declaration is refused with a captured floor
+// (REVISION_FLOOR_PROVENANCE_REFUSED both ways).
+//
 // The file (schema tibotattle-cutover-revision-floor-v1) is the canonical
 // JSON of { schema, provenance, sealId, fenceReceiptSha256, sourceCommit,
 // capturedAt, capture, days, dayCount, maxRevision } plus a newline; its
@@ -92,10 +103,12 @@ const MAX_FILE_BYTES = 1024 * 1024;
 
 export const REVISION_FLOOR_ERROR_CODES = Object.freeze([
   "REVISION_FLOOR_BELOW_FROZEN_EXPORT",
+  "REVISION_FLOOR_CAPTURE_FENCE_MISMATCH",
   "REVISION_FLOOR_CONFLICT",
   "REVISION_FLOOR_DAY_INVALID",
   "REVISION_FLOOR_EMPTY",
   "REVISION_FLOOR_FILE_INVALID",
+  "REVISION_FLOOR_PROVENANCE_REFUSED",
   "REVISION_FLOOR_PUBLICATION_EXISTS",
   "REVISION_FLOOR_READBACK_MISMATCH",
   "REVISION_FLOOR_REVISION_INVALID",
@@ -284,6 +297,46 @@ export function assertRevisionFloorCoversFrozen(floor, frozenDays) {
     checked += 1;
   }
   return Object.freeze({ frozenDays: checked });
+}
+
+/**
+ * The production import's provenance rule (P16 and the stage).
+ * `fencedAnalytics` is the fence receipt's analytics entry ({ idSha256,
+ * bookmark }, read at the digest the seal pins); `syntheticAdmitted` is the
+ * run's dress-rehearsal declaration. A 'captured' floor must name exactly
+ * that D1 and the sha256 of exactly that bookmark (the capture refused any
+ * other B0), so a floor captured outside this fence or from another D1 is
+ * REVISION_FLOOR_CAPTURE_FENCE_MISMATCH. A 'synthetic' floor is admitted only
+ * under the declaration, and the declaration only with a synthetic floor
+ * (REVISION_FLOOR_PROVENANCE_REFUSED).
+ */
+export function assertRevisionFloorProvenance(floor, { fencedAnalytics, syntheticAdmitted } = {}) {
+  if (!record(floor) || !REVISION_FLOOR_PROVENANCES.includes(floor.provenance) || typeof syntheticAdmitted !== "boolean"
+      || !record(fencedAnalytics) || typeof fencedAnalytics.idSha256 !== "string" || !SHA256.test(fencedAnalytics.idSha256)
+      || typeof fencedAnalytics.bookmark !== "string" || fencedAnalytics.bookmark.length === 0) {
+    floorFail("REVISION_FLOOR_USAGE");
+  }
+  if ((floor.provenance === "synthetic") !== syntheticAdmitted) floorFail("REVISION_FLOOR_PROVENANCE_REFUSED");
+  if (floor.provenance === "captured" && (!record(floor.capture)
+      || floor.capture.analyticsDatabaseIdSha256 !== fencedAnalytics.idSha256
+      || floor.capture.analyticsBookmarkSha256 !== sha256Hex(fencedAnalytics.bookmark))) {
+    floorFail("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH");
+  }
+  return Object.freeze({ provenance: floor.provenance, fenceBound: floor.provenance === "captured" });
+}
+
+/**
+ * assertRevisionFloorProvenance against the fence receipt file. Its analytics
+ * entry is read at `fenceReceiptSha256` (the seal's pin) by the EP-8
+ * consumer-side reader, which also refuses a released fence
+ * (CUTOVER_FENCE_RECEIPT_INVALID). Read-only.
+ */
+export async function checkRevisionFloorProvenance({ floor, fenceReceiptPath, fenceReceiptSha256, syntheticAdmitted } = {}) {
+  if (typeof fenceReceiptPath !== "string" || typeof fenceReceiptSha256 !== "string" || !SHA256.test(fenceReceiptSha256)) {
+    floorFail("REVISION_FLOOR_USAGE");
+  }
+  const fencedAnalytics = await fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256);
+  return assertRevisionFloorProvenance(floor, { fencedAnalytics, syntheticAdmitted });
 }
 
 /** Content-free facts about a floor, for receipts. */

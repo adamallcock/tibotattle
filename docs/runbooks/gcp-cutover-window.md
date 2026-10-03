@@ -451,7 +451,13 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    re-validates it offline. `built` (REV-SEED); the provider has never been
    contacted. The dress rehearsal does not capture: it loads a synthetic floor
    (round 14), written by `cutover-revision-floor.mjs synthetic` from its seal
-   and its frozen export (each frozen day at its frozen revision).
+   and its frozen export (each frozen day at its frozen revision), and its
+   `pt8-inputs.json` declares the owner flag
+   `dress-rehearsal-synthetic-revision-floor`. A synthetic floor covers only
+   the frozen export's days, at revisions read before the fence, so P16
+   refuses one without that flag, and refuses the flag with a captured
+   floor: the window's inputs never carry it. If the capture refuses, capture
+   again inside a quiet fence; a synthetic floor is never a substitute.
 
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
 after the fence; for the revision floor, Cloudflare could have published after
@@ -512,7 +518,11 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    export, read at its recorded sha256 and bound to this seal, inventory,
    fence receipt and sealed source (P15), and the H.3 step 7 revision floor,
    read at its recorded sha256, bound to this seal, fence receipt and source
-   commit, and at or above every revision the frozen read serves (P16).
+   commit, captured inside this fence (its capture block names the analytics
+   D1 and the sha256 of the bookmark that the fence receipt, read at the
+   seal's pin, records; only the dress rehearsal loads a synthetic floor,
+   under its owner flag), and at or above every revision the frozen read
+   serves (P16).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
    With a declared identity-link rotation it prints a second token, and the
@@ -618,9 +628,12 @@ inside this import, by the `analytics-community-history` stage, before
 one (round 12: no "revision restart"). The stage is a runner, no longer a
 waiver, and the closed waiver map refuses `analytics-recomputed:d3` for it. It
 reads `revision-floor.json` at the sha256 the inputs pin, re-checks P16 (this
-seal, fence receipt and source commit; every frozen-read revision at or below
-the floor, else `REVISION_FLOOR_BELOW_FROZEN_EXPORT`), and in one transaction
-with its stage receipt writes `analytics_v2_revision_floor` (one row per day)
+seal, fence receipt and source commit; a capture block naming the fence
+receipt's analytics D1 and bookmark, the receipt read again from
+`fenceReceiptPath`, so a fence released since preflight refuses; a synthetic
+floor only under the dress-rehearsal flag; every frozen-read revision at or
+below the floor, else `REVISION_FLOOR_BELOW_FROZEN_EXPORT`), and in one
+transaction with its stage receipt writes `analytics_v2_revision_floor` (one row per day)
 and then `analytics_v2_revision_floor_source` (the singleton provenance:
 `captured` or, at the dress rehearsal, `synthetic`). A rerun that finds the
 identical floor writes nothing; any other floor is `REVISION_FLOOR_CONFLICT`,
@@ -647,7 +660,10 @@ table that has no reviewed disposition.
 stated). The owner writes `pt8-inputs.json` (schema
 `tibotattle-pt8-lite-inputs-v1`, closed keys): `contractId`, `sealId`,
 `sealManifestPath`, `expectedSourceCommit` (P), `fenceReceiptSha256`,
-`expectedIdentityKeyVersion`, `deletionDigestProjection` (path and sha256, from
+`fenceReceiptPath` (the EP-8 verify receipt itself, in its private receipts
+directory beside its apply receipt; P16 and the floor stage read its
+analytics entry at `fenceReceiptSha256`), `expectedIdentityKeyVersion`,
+`deletionDigestProjection` (path and sha256, from
 `cutover-source-projections.mjs deletion-digests`), `interimPublicRead` (the
 OWN-4 export path and its recorded sha256, capture instant, source commit and
 evidence date), `adminHistoryExport` (the path of H.3 step 6's
@@ -656,7 +672,8 @@ evidence date), `adminHistoryExport` (the path of H.3 step 6's
 `floorSha256` that step printed; at the dress rehearsal, the synthetic
 floor's), `schedulerEvidencePath` (a C-INFRA scheduler probe receipt
 taken after the fence), `ownerFlags` (`performance-routes-retired`,
-`accept-orphan-registration-clearing`) and `allowedRoleMembers`. The
+`accept-orphan-registration-clearing`, and at the dress rehearsal only
+`dress-rehearsal-synthetic-revision-floor`) and `allowedRoleMembers`. The
 orchestrator writes `identity-pin.json`, `preflight.json`, `post-import.json`,
 `release-controls.json`, `flip-gate.json`, `mark-live.json`,
 `post-live-check.json`, `pt8-report.json` and the advisory
@@ -771,6 +788,9 @@ the target is final for this seal.
 | `CUTOVER_ADMIN_HISTORY_EXPORT_INVALID`, `CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH` | P15 (again at post-import) | The admin history export is unreadable, not private, or not at the recorded sha256; or it was taken for another seal, inventory, fence receipt or sealed source. Export again for this seal (H.3 step 6) and record its sha256 in the inputs |
 | `REVISION_FLOOR_FILE_INVALID`, `REVISION_FLOOR_SEAL_MISMATCH` | P16 (again at the `analytics-community-history` stage) | The revision floor is unreadable, not private, not canonical or not at the recorded sha256; or it was captured for another seal, fence receipt or source commit. Capture again for this seal (H.3 step 7) |
 | `REVISION_FLOOR_BELOW_FROZEN_EXPORT` | P16 (again at the stage) | A day of the frozen export has a revision above the floor (or no floor). The floor is not Cloudflare's maximum: never edit it; find why (the wrong analytics D1, or a capture outside the fence) and capture again |
+| `REVISION_FLOOR_CAPTURE_FENCE_MISMATCH` | P16 (again at the stage) | The captured floor's capture block names another analytics D1 or another bookmark than the fence receipt the seal pins: it was taken outside this fence. Capture again for this seal and fence (H.3 step 7) |
+| `REVISION_FLOOR_PROVENANCE_REFUSED` | P16 (again at the stage) | A synthetic floor without the owner flag `dress-rehearsal-synthetic-revision-floor`, or that flag with a captured floor. In the window, capture the floor; only the dress rehearsal declares the flag |
+| `CUTOVER_FENCE_RECEIPT_INVALID` | P16 (again at the stage) | `fenceReceiptPath` is not the private fence receipt at `fenceReceiptSha256` beside its apply receipt, or that fence was released. Point the inputs at the EP-8 verify receipt; after a release, fence and seal again |
 | `CUTOVER_TARGET_REVISION_FLOOR_TABLE_MISSING` | P10 | The target lacks the revision-floor migration. Migrate the target with the promoted chain |
 
 During `run` and finalize: `CUTOVER_CORRECTION_OWNER_NOT_ACTIVE` (the

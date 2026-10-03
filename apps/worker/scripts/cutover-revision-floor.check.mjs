@@ -15,8 +15,10 @@ import {
   RevisionFloorError,
   assertRevisionFloorBinding,
   assertRevisionFloorCoversFrozen,
+  assertRevisionFloorProvenance,
   captureRevisionFloor,
   checkRevisionFloor,
+  checkRevisionFloorProvenance,
   parseRevisionFloorFile,
   parseRevisionFloorArguments,
   readRevisionFloorFile,
@@ -385,6 +387,53 @@ test("the floor is bound to its seal and must cover every frozen-read revision",
     isCode("REVISION_FLOOR_BELOW_FROZEN_EXPORT"), "a frozen day the floor lacks");
   assert.throws(() => assertRevisionFloorCoversFrozen(floor, [{ day: "2026-10-01", revision: 0 }]),
     isCode("REVISION_FLOOR_USAGE"));
+});
+
+test("the import admits a captured floor only from this fence, and a synthetic one only under the dress-rehearsal declaration", async () => {
+  const floorOf = value => {
+    const { text, floorSha256 } = renderRevisionFloorFile(value);
+    return parseRevisionFloorFile(new TextEncoder().encode(text), floorSha256);
+  };
+  const fenced = { idSha256: sha256Hex(`d1:${SYNTHETIC_D1.analytics}`), bookmark: SYNTHETIC_BOOKMARKS.analytics };
+  const fence = { fenceReceiptPath: world.fence.path, fenceReceiptSha256: world.fence.sha256 };
+  const out = await privateDirectory("rev-seed-provenance-");
+  const written = await capture({ ownerDirectory: out });
+  const captured = await readRevisionFloorFile({ path: join(out, CUTOVER_REVISION_FLOOR_FILE), expectedSha256: written.floorSha256 });
+  assert.deepEqual(assertRevisionFloorProvenance(captured, { fencedAnalytics: fenced, syntheticAdmitted: false }),
+    { provenance: "captured", fenceBound: true });
+  assert.deepEqual(await checkRevisionFloorProvenance({ floor: captured, ...fence, syntheticAdmitted: false }),
+    { provenance: "captured", fenceBound: true });
+  // A capture block naming another bookmark (a capture outside this fence) or another D1.
+  for (const [label, capture] of [["another bookmark", { ...captured.capture, analyticsBookmarkSha256: sha256Hex(DRIFTED) }],
+    ["another D1", { ...captured.capture, analyticsDatabaseIdSha256: sha256Hex(`d1:${SYNTHETIC_D1["catchup-control"]}`) }],
+    ["the bookmark itself, not its digest", { ...captured.capture, analyticsBookmarkSha256: sha256Hex(sha256Hex(fenced.bookmark)) }]]) {
+    const foreign = floorOf(body(EXPECTED_DAYS, { provenance: "captured", capture }));
+    assert.throws(() => assertRevisionFloorProvenance(foreign, { fencedAnalytics: fenced, syntheticAdmitted: false }),
+      isCode("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH"), label);
+    await assert.rejects(checkRevisionFloorProvenance({ floor: foreign, ...fence, syntheticAdmitted: false }),
+      isCode("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH"), label);
+  }
+  // The dress-rehearsal declaration refuses a captured floor; a synthetic floor needs it.
+  assert.throws(() => assertRevisionFloorProvenance(captured, { fencedAnalytics: fenced, syntheticAdmitted: true }),
+    isCode("REVISION_FLOOR_PROVENANCE_REFUSED"));
+  const synthetic = floorOf(body());
+  assert.throws(() => assertRevisionFloorProvenance(synthetic, { fencedAnalytics: fenced, syntheticAdmitted: false }),
+    isCode("REVISION_FLOOR_PROVENANCE_REFUSED"));
+  await assert.rejects(checkRevisionFloorProvenance({ floor: synthetic, ...fence, syntheticAdmitted: false }),
+    isCode("REVISION_FLOOR_PROVENANCE_REFUSED"));
+  assert.deepEqual(await checkRevisionFloorProvenance({ floor: synthetic, ...fence, syntheticAdmitted: true }),
+    { provenance: "synthetic", fenceBound: false });
+  // The fence receipt is read at the seal's pin, through the EP-8 reader.
+  await assert.rejects(checkRevisionFloorProvenance({ floor: captured, ...fence, fenceReceiptSha256: "e".repeat(64),
+    syntheticAdmitted: false }), isCode("CUTOVER_FENCE_RECEIPT_INVALID"));
+  await assert.rejects(checkRevisionFloorProvenance({ floor: captured, ...fence, fenceReceiptPath: world.proof.path,
+    syntheticAdmitted: false }), isCode("CUTOVER_FENCE_RECEIPT_INVALID"));
+  for (const options of [{ fencedAnalytics: fenced }, { fencedAnalytics: null, syntheticAdmitted: false },
+    { fencedAnalytics: { ...fenced, idSha256: "x" }, syntheticAdmitted: false }]) {
+    assert.throws(() => assertRevisionFloorProvenance(captured, options), isCode("REVISION_FLOOR_USAGE"));
+  }
+  await assert.rejects(checkRevisionFloorProvenance({ floor: captured, fenceReceiptPath: world.fence.path,
+    syntheticAdmitted: false }), isCode("REVISION_FLOOR_USAGE"));
 });
 
 test("the dress rehearsal's synthetic floor: each frozen day at its frozen revision, bound to the seal", async () => {

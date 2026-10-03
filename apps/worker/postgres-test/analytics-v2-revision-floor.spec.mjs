@@ -304,3 +304,59 @@ test("a load waits for an uncommitted publication and then refuses: the floor ne
     loader.release();
   }
 });
+
+test("a publication that commits while the loader waits fails the load as REVISION_FLOOR_WRITE_FAILED (P1005)", { skip }, async () => {
+  // The loader's own check finds no committed publication, so the refusal
+  // can only come from the day insert's trigger once the publication commits.
+  const schema = await createSchema();
+  const publisher = await pool.connect();
+  const loader = await pool.connect();
+  try {
+    const { pid } = (await loader.query("SELECT pg_backend_pid() AS pid")).rows[0];
+    await publisher.query("BEGIN");
+    await publisher.query(`INSERT INTO ${q(schema, "analytics_v2_published_daily")} (day, revision, released_at, payload,
+        payload_sha256, run_id) VALUES ('2026-09-28', 1, '2026-10-02T06:00:00Z',
+        '{"aggregateId":"community-daily:2026-09-28:r1","day":"2026-09-28","revision":1}', $1, $2)`,
+    [digest("loader-race"), RUN_ID]);
+    await loader.query("BEGIN");
+    const pending = loadRevisionFloorInTransaction({ client: loader, schema, floor: floorOf(FLOOR) })
+      .then(() => null, (error) => error);
+    // Wait until the loader's day insert is blocked on the publication's lock.
+    let waiting = false;
+    for (let attempt = 0; attempt < 200 && !waiting; attempt += 1) {
+      const { rows } = await pool.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1", [pid]);
+      waiting = rows[0]?.wait_event_type === "Lock";
+      if (!waiting) await new Promise((resolve) => { setTimeout(resolve, 25); });
+    }
+    assert.equal(waiting, true, "the loader waits on the publication");
+    await publisher.query("COMMIT");
+    const error = await pending;
+    assert.equal(error?.code, "REVISION_FLOOR_WRITE_FAILED");
+    assert.equal(error.sqlState, "P1005");
+    assert.equal(error.message, "REVISION_FLOOR_WRITE_FAILED", "content-free: no database message");
+    await loader.query("ROLLBACK");
+    assert.deepEqual(await snapshot(schema), { analytics_v2_revision_floor: "[]", analytics_v2_revision_floor_source: "[]" });
+  } finally {
+    await publisher.query("ROLLBACK").catch(() => {});
+    await loader.query("ROLLBACK").catch(() => {});
+    publisher.release();
+    loader.release();
+  }
+});
+
+test("a stored floor that differs from the file after the load is REVISION_FLOOR_READBACK_MISMATCH", { skip }, async () => {
+  // Synthetic tampering below the loader: a trigger that moves one day that
+  // is not the largest, so the singleton's summary guard still passes.
+  const schema = await createSchema();
+  await pool.query(`CREATE FUNCTION ${q(schema, "spec_floor_tamper")}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.day = DATE '2026-09-29' THEN NEW.revision := NEW.revision + 1; END IF;
+      RETURN NEW;
+    END;
+    $$`);
+  await pool.query(`CREATE TRIGGER spec_floor_tamper BEFORE INSERT ON ${q(schema, "analytics_v2_revision_floor")}
+    FOR EACH ROW EXECUTE FUNCTION ${q(schema, "spec_floor_tamper")}()`);
+  await assert.rejects(load(schema, floorOf(FLOOR)), { code: "REVISION_FLOOR_READBACK_MISMATCH" });
+  assert.deepEqual(await snapshot(schema), { analytics_v2_revision_floor: "[]", analytics_v2_revision_floor_source: "[]" },
+    "the caller's rollback leaves nothing");
+});

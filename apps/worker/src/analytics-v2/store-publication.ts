@@ -16,9 +16,12 @@
  * Cloudflare published at rN continues at rN+1; a day it never published
  * starts at r1. nextPublishedRevision is the ONE place a published revision
  * is computed: every publishing path (this full-mode write, and any later
- * incremental, reprice or purge republish) must call it, and a static check
- * holds that no other module computes one. The database refuses a head at or
- * below its floor independently (analytics_v2_published_daily_above_floor).
+ * incremental, reprice or purge republish) must call it. Static checks
+ * (analytics-v2-test/publication-revision.spec.ts) hold that no other
+ * analytics_v2 or refresh-Job module computes a revision, and that no
+ * non-test Worker source but this one writes the published heads. A table
+ * name assembled at run time escapes them; the database refuses a head at
+ * or below its floor regardless (analytics_v2_published_daily_above_floor).
  */
 
 import type { PostgresClient } from "../postgres-client";

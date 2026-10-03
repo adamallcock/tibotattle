@@ -23,6 +23,7 @@ import {
   IDENTITY_LINK_PIN_TABLE,
   KEPT_SESSION_AUTHORITY_TABLES,
   OWNER_FLAGS,
+  OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
   OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED,
   RETIRED_SOCIAL_CHAIN_TABLES,
   SOURCE_ROLES,
@@ -245,7 +246,7 @@ test("the merged trigger policy covers every importer and the disposition policy
     "community_aggregate_exclusions", "collection_controls"]) {
     assert.ok(Object.hasOwn(COMPLETE_TRIGGER_POLICY, tableName), tableName);
   }
-  assert.equal(dispositionPolicySha256(), "288baae6789b801af27884f5034bcc6d6d2eb9b0de9f2d6f88408d6230e9f6ce",
+  assert.equal(dispositionPolicySha256(), "488844450074b37e3fcae3b98ed7d17f9316ba1e11dda480f01be5874bffe4c3",
     "a reviewed change to dispositions, rules, flags, the stage plan or the trigger policy must update this pin");
 });
 
@@ -774,6 +775,7 @@ function inputs(overrides = {}) {
     sealManifestPath: "/owner/seal/seal-manifest.json",
     expectedSourceCommit: "1".repeat(40),
     fenceReceiptSha256: "2".repeat(64),
+    fenceReceiptPath: "/owner/fence-receipts/fence.json",
     expectedIdentityKeyVersion: "prod-v1",
     deletionDigestProjection: { path: "/owner/deletion-digests.txt", sha256: "3".repeat(64) },
     interimPublicRead: { exportPath: "/owner/own4.json", sha256: "4".repeat(64), capturedAt: "2026-10-01T23:30:00.000Z",
@@ -798,10 +800,16 @@ test("pt8-inputs.json is a closed contract", () => {
     { adminHistoryExport: { path: "/owner/admin-history-export.json", sha256: "5".repeat(64), extra: 1 } },
     { revisionFloor: { path: "relative/revision-floor.json", sha256: "6".repeat(64) } },
     { revisionFloor: { path: "/owner/revision-floor.json", sha256: "nope" } },
-    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64), provenance: "synthetic" } }]) {
+    { revisionFloor: { path: "/owner/revision-floor.json", sha256: "6".repeat(64), provenance: "synthetic" } },
+    { fenceReceiptPath: "relative/fence.json" }, { fenceReceiptPath: "/owner/../owner/fence.json" },
+    { ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED, "synthetic-revision-floor"] }]) {
     assert.throws(() => validateTransferInputs(inputs(bad)), { code: "CUTOVER_INPUTS_INVALID" }, JSON.stringify(bad));
   }
-  for (const key of ["schedulerEvidencePath", "adminHistoryExport", "revisionFloor"]) {
+  // The dress rehearsal's declaration is one of the closed owner flags.
+  assert.deepEqual(validateTransferInputs(inputs({ ownerFlags: [OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
+    OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED] })).ownerFlags, [OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
+    OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED]);
+  for (const key of ["schedulerEvidencePath", "adminHistoryExport", "revisionFloor", "fenceReceiptPath"]) {
     const missing = inputs();
     delete missing[key];
     assert.throws(() => validateTransferInputs(missing), { code: "CUTOVER_INPUTS_INVALID" }, key);

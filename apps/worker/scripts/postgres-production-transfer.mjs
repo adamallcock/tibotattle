@@ -35,7 +35,9 @@
 //                     Sparkle nonces, the analytics D1 admin history export
 //                     bound to this seal, the REV-SEED revision floor bound
 //                     to this seal and at or above every frozen-read
-//                     revision). GO writes preflight.json (0400);
+//                     revision, captured inside this fence unless the
+//                     inputs declare the dress rehearsal's synthetic floor).
+//                     GO writes preflight.json (0400);
 //                     NO-GO writes nothing.
 //   run               PROTECTED. Re-proves P10's memberships and P11's
 //                     scheduler pause, then R1 open/begin, R2 every stage of
@@ -123,6 +125,7 @@ import {
   REVISION_FLOOR_TABLES,
   assertRevisionFloorBinding,
   assertRevisionFloorCoversFrozen,
+  checkRevisionFloorProvenance,
   loadRevisionFloorInTransaction,
   readRevisionFloorFile,
   revisionFloorSealFacts,
@@ -171,6 +174,7 @@ import {
   COMPLETE_TRIGGER_POLICY,
   DISPOSITIONS,
   DISPOSITION_INDEX,
+  OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR,
   RUNTIME_RESET_TABLES,
   STAGE_PLAN,
   STAGING_DROP_REGISTRY,
@@ -513,11 +517,13 @@ function absolutePath(value, code = "CUTOVER_INPUTS_INVALID") {
  * sha256 }: H.3 step 7's revision-floor.json (cutover-revision-floor.mjs
  * capture, or its synthetic floor at the dress rehearsal), which the
  * 'analytics-community-history' stage loads and P16 binds to the seal and
- * the frozen read.
+ * the frozen read. fenceReceiptPath is the EP-8 fence receipt itself (the
+ * file whose sha256 is fenceReceiptSha256 and the seal's pin): P16 and the
+ * stage read its analytics entry, which a captured floor must name.
  */
 export function validateTransferInputs(value) {
   const keys = ["schema", "contractId", "sealId", "sealManifestPath", "expectedSourceCommit", "fenceReceiptSha256",
-    "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "adminHistoryExport",
+    "fenceReceiptPath", "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "adminHistoryExport",
     "revisionFloor", "schedulerEvidencePath", "ownerFlags", "allowedRoleMembers"];
   const rotationDeclared = record(value) && Object.hasOwn(value, "identityLinkRotation");
   exactKeys(value, rotationDeclared ? [...keys, "identityLinkRotation"] : keys, "CUTOVER_INPUTS_INVALID");
@@ -533,6 +539,7 @@ export function validateTransferInputs(value) {
   }
   sha(value.sealId, "CUTOVER_INPUTS_INVALID");
   sha(value.fenceReceiptSha256, "CUTOVER_INPUTS_INVALID");
+  absolutePath(value.fenceReceiptPath);
   absolutePath(value.sealManifestPath);
   absolutePath(value.schedulerEvidencePath);
   exactKeys(value.deletionDigestProjection, ["path", "sha256"], "CUTOVER_INPUTS_INVALID");
@@ -1016,15 +1023,26 @@ async function interimReadCheck(context, seal) {
 
 /**
  * REV-SEED: the owner's revision floor at its pinned sha256, bound to this
- * seal (id, fence receipt, source commit) and at or above every revision the
- * frozen read serves (REVISION_FLOOR_BELOW_FROZEN_EXPORT). Read-only.
+ * seal (id, fence receipt, source commit), taken inside this fence, and at
+ * or above every revision the frozen read serves
+ * (REVISION_FLOOR_BELOW_FROZEN_EXPORT). A captured floor's capture block
+ * must name the fence receipt's analytics D1 and bookmark (the receipt read
+ * at the seal's pin; REVISION_FLOOR_CAPTURE_FENCE_MISMATCH). A synthetic
+ * floor covers only the frozen export's days at pre-fence revisions, so it
+ * needs the dress-rehearsal owner flag, and the flag refuses a captured floor
+ * (REVISION_FLOOR_PROVENANCE_REFUSED). Read-only.
  */
 async function revisionFloorCheck(context, seal) {
+  const facts = revisionFloorSealFacts(seal);
   const floor = assertRevisionFloorBinding(await readRevisionFloorFile({ path: context.inputs.revisionFloor.path,
-    expectedSha256: context.inputs.revisionFloor.sha256 }), revisionFloorSealFacts(seal));
+    expectedSha256: context.inputs.revisionFloor.sha256 }), facts);
+  const provenance = await checkRevisionFloorProvenance({ floor, fenceReceiptPath: context.inputs.fenceReceiptPath,
+    fenceReceiptSha256: facts.fenceReceiptSha256,
+    syntheticAdmitted: context.inputs.ownerFlags.includes(OWNER_FLAG_DRESS_REHEARSAL_SYNTHETIC_REVISION_FLOOR) });
   const { prepared } = await interimReadCheck(context, seal);
   const covered = assertRevisionFloorCoversFrozen(floor, prepared.frozen.days);
-  return { floor, receipt: Object.freeze({ ...revisionFloorSummary(floor), frozenDaysCovered: covered.frozenDays }) };
+  return { floor, receipt: Object.freeze({ ...revisionFloorSummary(floor), fenceBound: provenance.fenceBound,
+    frozenDaysCovered: covered.frozenDays }) };
 }
 
 function sparkleNonceCount(database, atSeconds) {
