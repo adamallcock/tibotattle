@@ -654,7 +654,8 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
   // limit (no Node flags given) is partitioned whole: 12,336 MiB (a 12,288 MiB
   // old space and the default 48 MiB young generation) with the 10,752 MiB
   // budget leaves about 350 MiB of output budget. Under the job's flags the
-  // young generation is excluded (see the semi-space test below).
+  // young generation beyond those 48 MiB is excluded (see the semi-space test
+  // below), so the budget stays there.
   const dense = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
   const inlineHeapMiB = 12_288;
   const denseResources = job.analyticsRefreshResources(
@@ -791,31 +792,58 @@ test("semi-space (R19 SEMI): the young generation a larger semi-space adds is no
   }
   assert.equal(young(Number.NaN, ["--max-old-space-size=12288"]), 0);
 
+  // The budget keeps counting the 48 MiB default young generation it counted
+  // before R19 (owner decisions round 19: corrected for the growth only).
+  assert.equal(job.ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES, 48 * MIB);
   // The production profile's flags on Node.js 22.16.0 (heap_size_limit
   // 12,480 MiB with the flag, 12,336 MiB without): the output budget is the
-  // same either way, the old space less the budget and the reserves.
+  // pre-flag 351 MiB either way, the old space and 48 MiB less the budget and
+  // the reserves.
   const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
   const env = { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) };
   const nodeFlags = profile.args.slice(0, 2);
   const withSemi = job.analyticsRefreshResources(env, 12_480 * MIB, { execArgv: nodeFlags });
   const withoutSemi = job.analyticsRefreshResources(env, 12_336 * MIB, { execArgv: nodeFlags.slice(0, 1) });
-  const expected = (profile.heapMiB - profile.memoryBudgetMiB - 256) * MIB - 250_000 * 4_096;
+  const preFlag = job.analyticsRefreshResources(env, 12_336 * MIB);
+  const expected = (profile.heapMiB + 48 - profile.memoryBudgetMiB - 256) * MIB - 250_000 * 4_096;
   assert.equal(withSemi.compute.outputBudgetBytes, expected);
   assert.equal(withoutSemi.compute.outputBudgetBytes, expected);
-  assert.equal(Math.floor(expected / MIB), 303);
+  assert.equal(preFlag.compute.outputBudgetBytes, expected, "the pre-R19 partition of the same heap");
+  assert.equal(Math.floor(expected / MIB), 351);
   assert.equal(withSemi.youngGenerationBytes, 192 * MIB);
   assert.equal(withSemi.heapLimitBytes, 12_480 * MIB);
-  // Without the exclusion the flag would have added 144 MiB (351 to 495 MiB).
+  // Without the correction the flag would have added 144 MiB (351 to 495 MiB).
   assert.equal(Math.floor(job.analyticsRefreshResources(env, 12_480 * MIB).compute.outputBudgetBytes / MIB), 495);
+  // The same 351 MiB on the other local runtimes' heap limits for the job's
+  // old space (Node.js 24.14.0: 12,480 MiB with or without the flag; 26.2.0:
+  // 12,384 MiB without, 12,480 MiB with), and with a young generation under
+  // 48 MiB the whole limit is partitioned.
+  for (const heapMiB of [12_480, 12_384]) {
+    for (const flags of [nodeFlags, nodeFlags.slice(0, 1)]) {
+      assert.equal(job.analyticsRefreshResources(env, heapMiB * MIB, { execArgv: flags }).compute.outputBudgetBytes,
+        expected, `${heapMiB} ${flags.join(" ")}`);
+    }
+  }
+  assert.equal(job.analyticsRefreshResources(env, 12_312 * MIB, { execArgv: ["--max-old-space-size=12288",
+    "--max-semi-space-size=8"] }).compute.outputBudgetBytes, expected - 24 * MIB);
+  // dense-workers (K-PAR, four Workers, a 3,072 MiB main heap, no semi-space
+  // flag) keeps its pre-R19 runtime output budget under its real flags.
+  const parallelEnv = { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) };
+  const parallel = job.analyticsRefreshResources(parallelEnv, (3_072 + 48) * MIB,
+    { workers: 4, execArgv: ["--max-old-space-size=3072"] });
+  assert.equal(parallel.compute.outputBudgetBytes,
+    job.analyticsRefreshResources(parallelEnv, (3_072 + 48) * MIB, { workers: 4 }).compute.outputBudgetBytes);
+  assert.equal(parallel.compute.outputBudgetBytes, (3_072 + 48 - 256) * MIB - 250_000 * 4_096);
   // NODE_OPTIONS declarations count, the command line after them.
   assert.equal(job.analyticsRefreshResources({ ...env, NODE_OPTIONS: "--max-old-space-size=12288" }, 12_480 * MIB)
     .youngGenerationBytes, 192 * MIB);
   assert.equal(job.analyticsRefreshResources({ ...env, NODE_OPTIONS: "--max-old-space-size=12000" }, 12_480 * MIB,
     { execArgv: nodeFlags }).youngGenerationBytes, 192 * MIB);
-  // The start-up guard checks the old space: one whose heap_size_limit clears
-  // the requirement only through its young generation is refused, before any
-  // database work.
-  const shortMiB = Math.ceil(withSemi.requiredHeapBytes / MIB) - 1;
+  // The start-up guard checks the partitioned heap: an old space whose
+  // heap_size_limit clears the requirement only through the young-generation
+  // growth is refused, before any database work.
+  const shortMiB = Math.ceil(withSemi.requiredHeapBytes / MIB) - 49;
+  assert.ok((shortMiB + 48) * MIB < withSemi.requiredHeapBytes);
   assert.ok((shortMiB + 192) * MIB >= withSemi.requiredHeapBytes);
   let pools = 0;
   await assert.rejects(job.runAnalyticsRefresh({
@@ -830,6 +858,37 @@ test("semi-space (R19 SEMI): the young generation a larger semi-space adds is no
     return true;
   });
   assert.equal(pools, 0);
+});
+
+test("semi-space (R19 SEMI): the entry reads its own Node flags under Node v22.16.0", { timeout: 120_000 }, async () => {
+  // The composition root passes process.execArgv, so the real flags (not an
+  // injected list) decide the partition. With --max-semi-space-size=64 the
+  // heap limit is the old space plus 192 MiB, of which 48 MiB count: an old
+  // space 49 MiB short of the requirement is refused at start-up, and one
+  // 48 MiB short passes the heap guard and is refused only by its one-minute
+  // deadline. Were the flags not read, both would pass the heap guard; were
+  // the whole young generation excluded, both would be refused.
+  const available = await access(NODE_22).then(() => true, () => false);
+  assert.ok(available, "Node v22.16.0 is required for the image runtime check");
+  const MIB = 1_048_576;
+  const requiredMiB = Math.ceil(job.analyticsRefreshResources({}, 64 * 1_024 * MIB).requiredHeapBytes / MIB);
+  const run = (oldSpaceMiB) => execFileAsync(NODE_22,
+    [`--max-old-space-size=${oldSpaceMiB}`, "--max-semi-space-size=64", JOB_PATH, "--mode=full",
+      "--schema=analytics_v2_semi_cli", `--now=${NOW_1}`], {
+      env: { ANALYTICS_V2_TEST_CLOCK: "1", PG_TEST_SOCKET: "/private/tmp/tibotattle-pg-unused/socket",
+        ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: "60", PATH: process.env.PATH },
+      cwd: WORKER_ROOT,
+    }).then(() => null, (error) => error);
+  const short = await run(requiredMiB - 49);
+  assert.equal(short?.code, 1);
+  assert.equal(short.stdout, "");
+  assert.deepEqual(JSON.parse(short.stderr.trim()), { schemaVersion: job.ANALYTICS_REFRESH_RECEIPT_VERSION,
+    status: "failed", code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT", phase: "configuration" });
+  const enough = await run(requiredMiB - 48);
+  assert.equal(enough?.code, 1);
+  const line = JSON.parse(enough.stderr.trim());
+  assert.equal(line.code, "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED");
+  assert.equal(line.phase, "configuration");
 });
 
 test("(f, heap) a heap below the budget plus the reserve is refused before any database work", async () => {

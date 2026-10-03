@@ -522,11 +522,12 @@ gates are in the
   runs with `--max-semi-space-size=64` beside `--max-old-space-size` (the
   production job, its OPS-2 render, the `standard` and `dense` test-deploy
   profiles and the inline local rehearsal; not `dense-workers`). The output
-  budget is now taken from the declared old space, so the 192 MiB young
-  generation the flag gives V8 (48 MiB at the default) is not counted: the
-  dense profile's starting output budget is 303 MiB with or without the flag,
-  instead of 351 MiB before and 495 MiB with the flag alone. The receipt's
-  `memory.youngGenerationMiB` shows the flag in effect.
+  budget excludes only young-generation growth above the historical 48 MiB
+  allowance. The dense profile's starting output budget stays 351 MiB with
+  or without the flag, instead of 495 MiB with the flag alone. The receipt's
+  `memory.youngGenerationMiB` reports the inferred young generation. The
+  `dense-workers` main budget retains the same 48 MiB allowance; Worker
+  footprint sizing continues to use the complete heap limit.
 
 ## Cutover backlog
 

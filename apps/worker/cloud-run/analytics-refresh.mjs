@@ -126,14 +126,16 @@
  *                                        (default 256, 32..256)
  *   ANALYTICS_V2_READ_CHUNK_OCCURRENCES  occurrences one read call targets
  *                                        (default 250000, 10000..2000000)
- * The old generation is partitioned: the per-owner budget, the read reserve
+ * The heap is partitioned: the per-owner budget, the read reserve
  * (4 KiB per read-chunk occurrence), a 256 MiB runtime reserve, and the rest
  * is the output budget, which A-2's output account charges every held output
- * row against (resources.ts). The old generation is V8's heap_size_limit less
- * its young generation, which holds no retained row: when the Node flags
+ * row against (resources.ts). The partitioned heap is V8's heap_size_limit
+ * less the young-generation growth beyond the 48 MiB the budget counted before
+ * R19 (ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES): when the Node flags
  * declare --max-old-space-size, the young generation is the rest of
  * heap_size_limit (analyticsRefreshYoungGenerationBytes), so a larger
- * semi-space (--max-semi-space-size) does not grow the output budget. The run
+ * semi-space (--max-semi-space-size) does not grow the output budget, and the
+ * budget is at most the declared old space plus 48 MiB less the reserves. The run
  * refuses to start (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT) unless the output
  * budget is at least 64 MiB. Once the plan has fixed the largest admitted owner's
  * estimate, the output budget also takes the rest of the per-owner budget
@@ -398,6 +400,15 @@ export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ runtimeBytes: 256 
   minimumOutputBudgetBytes: 64 * MIB });
 /** resources.ts ANALYTICS_V2_RESOURCE_BOUNDS.outputBudgetBytes.maximum (the spec pins the equality). */
 const MAX_OUTPUT_BUDGET_BYTES = 30_720 * MIB;
+/**
+ * The young generation the output budget keeps counting: the 48 MiB V8 gives
+ * the job by default on Node.js 22.16.0 (three 16 MiB semi-spaces), which the
+ * budget counted before R19. Owner decisions round 19 adopt
+ * --max-semi-space-size=64 with the output budget corrected for the
+ * young-generation growth only, so the growth beyond this is excluded and the
+ * budget stays where the default young generation left it, on every profile.
+ */
+export const ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES = 48 * MIB;
 const OLD_SPACE_FLAG = /^--max[-_]old[-_]space[-_]size(?:=(.*))?$/su;
 const OLD_SPACE_MIB = /^[1-9]\d{0,8}$/u;
 
@@ -408,9 +419,10 @@ const OLD_SPACE_MIB = /^[1-9]\d{0,8}$/u;
  * before the command line as Node applies them). V8 adds its young generation
  * to the declared old space (Node.js 22.16.0: three semi-spaces, so 48 MiB at
  * the default 16 MiB semi-space and 192 MiB at --max-semi-space-size=64), and
- * the default semi-space differs between Node versions, so the declared old
- * space is the one figure the job can trust. Without a declaration (or with
- * one it cannot read, or one above the limit) it is 0, and the whole limit is
+ * the default semi-space differs between Node versions (Node.js 24.14.0 gives
+ * 192 MiB and 26.2.0 96 MiB without the flag), so the declared old space is
+ * the one figure the job can trust. Without a declaration (or with one it
+ * cannot read, or one above the limit) it is 0, and the whole limit is
  * partitioned, as before R19.
  */
 export function analyticsRefreshYoungGenerationBytes(heapLimitBytes, flags = []) {
@@ -474,10 +486,11 @@ the cutover import has loaded the revision floor.
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
 ANALYTICS_V2_READ_CHUNK_OCCURRENCES (250000), and, outside production,
-ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (none). The Node old space must cover
-the budget, 256 MiB, 4 KiB per read-chunk occurrence and a 64 MiB output budget
-(run the Job with --max-old-space-size=6144 for the defaults); the young
-generation (--max-semi-space-size) is not counted.
+ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS (none). The Node old space and 48 MiB
+of the young generation must cover the budget, 256 MiB, 4 KiB per read-chunk
+occurrence and a 64 MiB output budget (run the Job with
+--max-old-space-size=6144 for the defaults); young generation beyond 48 MiB
+(a larger --max-semi-space-size) is not counted.
 `;
 
 function fail(code, extra = {}) {
@@ -775,12 +788,13 @@ function resourceValue(env, entry) {
  * (ANALYTICS_V2_REFRESH_RESOURCES_INVALID), or a heap limit that leaves less
  * than the minimum output budget after the per-owner budget, the read
  * reserve and the runtime reserve (ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT).
- * The rest of the old generation is the output budget
+ * The rest of the partitioned heap is the output budget
  * (compute.outputBudgetBytes), so the whole run is bounded: one admitted
  * owner's estimate, the accounted outputs and held inputs, and the reserves.
  * heapLimitBytes is V8's heap_size_limit; execArgv (and env.NODE_OPTIONS) are
- * the Node flags, from which the young generation is excluded
- * (analyticsRefreshYoungGenerationBytes).
+ * the Node flags, from which the young generation is read
+ * (analyticsRefreshYoungGenerationBytes); the part of it beyond
+ * ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES is not partitioned.
  */
 export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1, execArgv = [] } = {}) {
   const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
@@ -803,9 +817,10 @@ export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1, ex
   const nodeOptions = typeof env?.NODE_OPTIONS === "string" ? env.NODE_OPTIONS.split(/\s+/u) : [];
   const youngGenerationBytes = analyticsRefreshYoungGenerationBytes(heapLimitBytes,
     [...nodeOptions, ...(Array.isArray(execArgv) ? execArgv : [])]);
-  const oldGenerationBytes = heapLimitBytes - youngGenerationBytes;
-  if (oldGenerationBytes < requiredHeapBytes) fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
-  const outputBudgetBytes = Math.min(oldGenerationBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
+  const partitionedBytes = heapLimitBytes
+    - Math.max(0, youngGenerationBytes - ANALYTICS_REFRESH_COUNTED_YOUNG_GENERATION_BYTES);
+  if (partitionedBytes < requiredHeapBytes) fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
+  const outputBudgetBytes = Math.min(partitionedBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
   return Object.freeze({
     compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes, outputBudgetBytes }),
     readChunkOccurrences,

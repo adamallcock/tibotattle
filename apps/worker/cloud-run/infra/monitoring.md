@@ -249,11 +249,14 @@ refresh-not-completed is (no cadence, or committed `PAUSED`).
 
 What to do: read the receipt's `memory` block (`accountMiB`,
 `effectiveOutputBudgetMiB`, `largestOwnerOutputMiB`, `heldInputMiB`) and
-`ownersComputed`. The output budget is the declared old space
-(`--max-old-space-size`) less the per-owner budget and the reserves. V8's
-young generation (`memory.youngGenerationMiB`: 192 MiB under the job's
-`--max-semi-space-size=64`) is part of `heapLimitMiB` but holds no output, so
-it is not counted (R19 SEMI). Growth with history or roster is expected: the C-REFRESH
+`ownersComputed`. The output budget partitions the declared old space plus
+up to the historical 48 MiB young-generation allowance, less the per-owner
+budget (inline only) and reserves. The inferred young generation
+(`memory.youngGenerationMiB`) is 192 MiB for the inline job's
+`--max-semi-space-size=64`; only its growth above 48 MiB is excluded (R19
+SEMI). The Workers profile does not receive that flag. Its main heap excludes
+no per-owner budget, and task-footprint sizing uses the complete heap limit.
+Growth with history or roster is expected: the C-REFRESH
 receipt projects the dense profile's budget to hold its planning roster for
 about 641 days. The remedies are incremental refresh (decision D3, revised)
 or a larger task memory profile (OWN-5), not a smaller history.

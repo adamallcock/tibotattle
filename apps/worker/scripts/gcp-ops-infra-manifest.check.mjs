@@ -315,9 +315,9 @@ test("the analytics-refresh job renders the production refresh-job contract in t
     assert.equal(resources.compute.outputBudgetBytes, analyticsRefreshResources(env, heap + 48 * MIB,
       { workers: parsed.workers, execArgv: [nodeFlags[0]] }).compute.outputBudgetBytes,
     "the semi-space leaves the output budget where the default young generation left it");
-    // An old space just short of the requirement is refused even though its
-    // young generation would carry heap_size_limit past it.
-    const shortMiB = Math.ceil(resources.requiredHeapBytes / MIB) - 1;
+    // An old space plus the historical 48 MiB allowance just short of the
+    // requirement is refused even though young-generation growth clears it.
+    const shortMiB = Math.ceil(resources.requiredHeapBytes / MIB) - 49;
     assert.throws(() => analyticsRefreshResources(env, (shortMiB + youngMiB) * MIB,
       { workers: parsed.workers, execArgv: [`--max-old-space-size=${shortMiB}`, nodeFlags[1]] }),
     { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" });
