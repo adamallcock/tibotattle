@@ -15,6 +15,7 @@ import {
   analyticsV2ExclusionsSha256,
   validAnalyticsV2ExclusionIntervals,
 } from "../src/analytics-v2/exclusions";
+import { analyticsV2ExcludedOn as ownersExcludedOn } from "../src/analytics-v2/owners";
 import type { AdminCommunityAllowancePreview } from "../vendor/analytics-d43c8f92/entry";
 import {
   addDays,
@@ -67,6 +68,11 @@ describe("community aggregate exclusions: the per-day predicate", () => {
       day)).toEqual([{ effectiveAtUs: start, expiresAtUs: end }]);
     expect(() => analyticsV2ExcludedOn([{ effectiveAtUs: start, expiresAtUs: null }], "2026-02-30"))
       .toThrow("ANALYTICS_V2_INPUT_INVALID:exclusions.day");
+  });
+
+  it("is the one predicate the refresh applies to an unlinked participant (EXCL-UNLINKED, round 19)", () => {
+    // cloud-run/analytics-refresh-read.mjs takes it from owners.ts: a re-export, never a second copy.
+    expect(ownersExcludedOn).toBe(analyticsV2ExcludedOn);
   });
 
   it("refuses malformed intervals and pins the digest of no exclusions", async () => {

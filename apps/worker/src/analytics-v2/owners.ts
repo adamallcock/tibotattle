@@ -383,7 +383,10 @@ export function correctionRuntimeActiveSql(s: string): string {
  * An eligible participant that has no active storage owner link. Production
  * keeps such owners explicit (ownerDigest null): the daily lane refuses them
  * and the graph treats them as pending. They are reported, never dropped and
- * never given an inferred digest.
+ * never given an inferred digest. One with typed evidence blocks each queued
+ * day it is not excluded on (analytics-refresh-read.mjs; owner decision round
+ * 19, EXCL-UNLINKED: an active exclusion covering day D lifts the refusal for
+ * D, a declared difference from d43c8f92, whose refusal ignores exclusions).
  */
 export interface AnalyticsV2UnlinkedOwner {
   readonly participantId: string;
@@ -507,6 +510,14 @@ export async function listAnalyticsV2Owners(context: AnalyticsV2SnapshotContext)
 // ---------------------------------------------------------------------------
 // Community aggregate exclusions (N-EXCL)
 // ---------------------------------------------------------------------------
+
+/**
+ * The per-day exclusion predicate (exclusions.ts), re-exported so the refresh
+ * Job's read composition applies the same predicate to an unlinked
+ * participant's active exclusions (EXCL-UNLINKED, round 19) without a second
+ * copy of the rule.
+ */
+export { analyticsV2ExcludedOn } from "./exclusions";
 
 /** Bound on one exclusion read; a larger table fails closed (LIMIT). */
 export const MAX_ANALYTICS_V2_EXCLUSIONS = 100_000;

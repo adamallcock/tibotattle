@@ -62,6 +62,22 @@
 // Every other difference is reported as unexpected; the caller decides how to
 // label it and must say so in its receipt.
 //
+// Two further declared differences are conditional on production state that
+// no golden corpus holds, so they have no family here and a rehearsal over
+// the Q-1 or dense corpus stays byte-equal (src/analytics-v2/exclusions.ts
+// has the contract):
+// - N-EXCL (round 5): an owner with an active community_weekly exclusion
+//   covering day D is left out of D's public daily and allowance preview,
+//   where d43c8f92 applies the exclusions to its weekly snapshot only.
+//   It arises only while production holds an active exclusion row.
+// - EXCL-UNLINKED (round 19, "the exclusion lifts it"): an eligible
+//   participant with typed evidence and no active owner link blocks only the
+//   days its active exclusions do not cover, where d43c8f92's daily cohort
+//   refusal blocks every day. It arises only while such a participant exists
+//   and an active row covers one of the compared days.
+// A corpus that holds either condition must label the resulting differences
+// in its receipt; this compare does not accept them.
+//
 // CLI: node scripts/analytics-v2-parity-compare.mjs --golden <dir> --actual <response.json>
 //        [--actual-preview <preview.json>] [--per-date-expected <per-date-expected.json>]
 // The withheld dates are read from <dir>/manifest.json when it exists. The

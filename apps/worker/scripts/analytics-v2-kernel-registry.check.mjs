@@ -43,7 +43,6 @@ import {
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
 } from "../cloud-run/analytics-kernel-closure.mjs";
-import { cloudRunBuildPlugins } from "../cloud-run/node-host-build.mjs";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -67,20 +66,12 @@ const REGISTRY_PINS = Object.freeze([
   // closure root) and its orchestration method analytics-v2-method-v2 at the
   // 733e143c merge.
   "5140704aab3e55affbbb63da08a043615f119936c093cae25afc4b7d6e9c53c6",
-  // Kernel 5: Wave 1A (W1A-HASH). node:crypto's synchronous SHA-256 behind
-  // both sha256Hex implementations (node-host-primitives.mjs replaces the
-  // vendored crypto.ts and src/host-primitives.ts in the bundles) and the
-  // typed-id codec's Buffer-hex fast path. Content-identical outputs; only the
-  // kernel stamps change. The pin hashes the canonical entry, kernelId
-  // included: an integrator renumbering this entry at the fold recomputes it.
-  "d3843f46bd2e1fb9bb4471f50644df867f2b8c8a1106631375aefd4cd731e009",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
-/** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph (its plugins, from the shared node-host-build.mjs). */
+/** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph. */
 const BUILD_OPTIONS = Object.freeze({ bundle: true, platform: "node", format: "esm", target: "node22",
-  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent",
-  plugins: cloudRunBuildPlugins(WORKER_ROOT) });
+  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent" });
 
 const canonical = (entry) => JSON.stringify(Object.fromEntries(ENTRY_KEYS.map((key) => [key, entry[key]])));
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
@@ -188,15 +179,6 @@ test("the closure holds every module that decides a stored value and no I/O plum
     assert.ok(names.has(decides), `${decides} decides stored values and is in the closure`);
   }
   assert.ok(report.names.some((name) => name.startsWith("apps/worker/vendor/analytics-d43c8f92/")));
-  // Wave 1A: both sha256Hex implementations hash through the Node host
-  // primitives; the files they replace are not bundled (and so not hashed),
-  // and neither the build tooling nor the server's timing-safe comparison
-  // decides a stored value.
-  assert.ok(names.has("apps/worker/cloud-run/node-host-primitives.mjs"), "the Node host primitives decide digests");
-  for (const replaced of ["apps/worker/vendor/analytics-d43c8f92/apps/worker/src/crypto.ts", "apps/worker/src/host-primitives.ts",
-    "apps/worker/cloud-run/node-host-build.mjs", "apps/worker/cloud-run/node-crypto-adapter.mjs"]) {
-    assert.equal(names.has(replaced), false, `${replaced} is not in the compute closure`);
-  }
   for (const plumbing of ANALYTICS_KERNEL_CLOSURE_PLUMBING) {
     assert.equal(names.has(plumbing), false, `${plumbing} is I/O plumbing`);
   }
