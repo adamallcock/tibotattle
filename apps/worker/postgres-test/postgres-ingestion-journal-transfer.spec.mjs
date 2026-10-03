@@ -125,8 +125,8 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL 17 sealed ingestion journal transfe
       await pool.query(`CREATE SCHEMA ${quoted}`);
       schemaCreated = true;
       const migration = await applyPostgresMigrations({ role: "primary", schema, pool });
-      expect(migration.applied).toBe(71);
-      expect(migration.migrations.at(-1)?.name).toBe("0071_analytics_v2_revision_floor.sql");
+      expect(migration.applied).toBe(72);
+      expect(migration.migrations.at(-1)?.name).toBe("0072_analytics_v2_price_cards.sql");
       fixture = await makeSealedSource();
 
       await pool.query(`ALTER TABLE ${table("storage_ingestion_changes")}
@@ -227,7 +227,7 @@ describe.skipIf(!PG_TEST_SOCKET || !PG_TEST_TCP_HOST)(
             const schema = `typed_legacy_transfer_rehearsal_target_fastpath_${randomBytes(4).toString("hex")}`;
             await migrator.query(`CREATE SCHEMA "${schema}"`);
             const migration = await applyPostgresMigrations({ role: "primary", schema, pool: migrator });
-            expect(migration.applied).toBe(71);
+            expect(migration.applied).toBe(72);
             const table = name => `"${schema}"."${name}"`;
             const transferId = "synthetic-ingestion-journal-cloud-fastpath";
             const attempt = (pool, options = {}) => transferPostgresIngestionJournal({ source: fixture.source,

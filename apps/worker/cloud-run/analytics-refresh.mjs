@@ -11,8 +11,10 @@
  *   2. open one REPEATABLE READ READ ONLY transaction on that session, export
  *      its snapshot, read the prior analytics_v2 state (journal cursor, the
  *      days the last run left blocked, the earliest stored cache-band day),
- *      and run every A-1 reader through a pool whose transactions all import
- *      that snapshot;
+ *      prove the kernel transitions from older stored kernels to this one
+ *      over their stored price inputs (K-PERCARD, store-price.ts; nothing to
+ *      prove once a transition is recorded), and run every A-1 reader through
+ *      a pool whose transactions all import that snapshot;
  *   3. compute with A-2 (pure): A-1's exact evidence counts
  *      (countOwnerOccurrences) decide the per-owner memory guard and the read
  *      spans before anything is read; an admitted owner is then read in the
@@ -27,7 +29,9 @@
  *      are identical. The exporting transaction stays open until the last
  *      read;
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
- *      the same session, then release the lock.
+ *      the same session (with the price rows the prepared-day observer
+ *      attributed, the kernel's price cards and the proven transitions, which
+ *      the store re-checks against the stored rows), then release the lock.
  *
  * Publication follows production's queue (d43c8f92
  * advanceNextStorageCommunityDaily): a run recomputes and may republish only
@@ -143,7 +147,10 @@
  * statement ledger (K-PGSTAT `reads`: calls, client wall time, rows and bytes
  * per statement family, the read phase's unattributed remainder, and the
  * server's execution and planning time per family when pg_stat_statements is
- * readable), and content-free counts of the community aggregate exclusions
+ * readable), K-PERCARD's `prices` (the kernel's card count, the cards, bases
+ * and owner-day price rows written, and each kernel transition recorded with
+ * its verdict and stale owner-day count), and content-free counts of the
+ * community aggregate exclusions
  * it applied (N-EXCL, src/analytics-v2/exclusions.ts: an owner excluded on a
  * day is left out of that day's public daily and allowance preview; the run
  * row records the digest of the exclusions applied, and a run that finds
@@ -1043,12 +1050,14 @@ export function analyticsRefreshRunStamp(store, identity) {
     fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE");
   }
   let kernel;
+  const stated = identity ?? store.analyticsV2BundledKernelIdentity();
   try {
-    kernel = store.resolveAnalyticsV2Kernel(identity ?? store.analyticsV2BundledKernelIdentity());
+    kernel = store.resolveAnalyticsV2Kernel(stated);
   } catch (error) {
     fail(error?.code === "ANALYTICS_V2_KERNEL_REGISTRY_INVALID" ? error.code : "ANALYTICS_V2_KERNEL_UNREGISTERED");
   }
-  return store.analyticsV2BaselineRunStamp(kernel);
+  // K-PERCARD: the bundle's compute class rides on the stamp (null when it stated none).
+  return store.analyticsV2BaselineRunStamp(kernel, typeof stated?.computeSha256 === "string" ? stated.computeSha256 : null);
 }
 
 /**
@@ -1081,6 +1090,26 @@ function revisionFloorSummary(value) {
     return absent;
   }
   return Object.freeze({ present: true, dayCount: value.dayCount, maxRevision: value.maxRevision });
+}
+
+/**
+ * The receipt's content-free price summary (K-PERCARD): the kernel's card
+ * count, the cards and bases this run registered, its price rows, and each
+ * transition recorded (kernel ids, the verdict and owner-day counts).
+ */
+function priceSummary(value) {
+  const count = (entry) => Number.isSafeInteger(entry) && entry >= 0;
+  if (value === null || typeof value !== "object" || !count(value.kernelCards) || !count(value.cardsRegistered)
+      || !count(value.basesRegistered) || !count(value.ownerDays) || !Array.isArray(value.transitions)) {
+    return null;
+  }
+  return Object.freeze({ kernelCards: value.kernelCards, cardsRegistered: value.cardsRegistered,
+    basesRegistered: value.basesRegistered, ownerDays: value.ownerDays,
+    transitions: Object.freeze(value.transitions.filter((entry) => entry !== null && typeof entry === "object"
+      && count(entry.fromKernel) && count(entry.toKernel) && typeof entry.compatible === "boolean"
+      && count(entry.ownerDays) && count(entry.staleOwnerDays))
+      .map((entry) => Object.freeze({ fromKernel: entry.fromKernel, toKernel: entry.toKernel,
+        compatible: entry.compatible, ownerDays: entry.ownerDays, staleOwnerDays: entry.staleOwnerDays }))) });
 }
 
 function safeCode(error, fallback) {
@@ -1207,6 +1236,7 @@ export async function runAnalyticsRefresh({
     const { store, pipeline } = modules ?? {};
     if (typeof store?.writeRunOutputs !== "function"
         || typeof store?.readAnalyticsV2RefreshState !== "function"
+        || typeof store?.proveAnalyticsV2PriceTransitions !== "function"
         || typeof pipeline?.read !== "function" || typeof pipeline?.compute !== "function") {
       fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE");
     }
@@ -1250,6 +1280,10 @@ export async function runAnalyticsRefresh({
       if (production?.target === "production" && !revisionFloor.present) {
         fail("ANALYTICS_V2_REVISION_FLOOR_ABSENT");
       }
+      // K-PERCARD: prove the transitions from older stored kernels to this
+      // one over their stored price inputs, in the read snapshot; the write
+      // re-checks the proof and records it.
+      const priceTransitions = await store.proveAnalyticsV2PriceTransitions(client, { schema: parsed.schema, stamp });
       // K-PGSTAT: the read side's round trips by statement family, and the
       // server's execution and planning time for the same families when
       // pg_stat_statements is readable (snapshots on their own connection).
@@ -1325,6 +1359,7 @@ export async function runAnalyticsRefresh({
         stamp,
         // N-EXCL: the exclusions this run applied (the store refuses a run without them).
         exclusionsSha256: outputs.exclusionsSha256,
+        priceTransitions,
       });
       // Content-free read counts the default pipeline reports (closed keys).
       const readSummary = Object.fromEntries(READ_SUMMARY_KEYS
@@ -1349,6 +1384,7 @@ export async function runAnalyticsRefresh({
         memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)()),
         reads,
         exclusions: exclusionSummary(outputs.exclusions),
+        prices: priceSummary(written.prices),
         timeGuard: guard.summary(),
       });
     }

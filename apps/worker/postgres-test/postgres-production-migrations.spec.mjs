@@ -8,7 +8,7 @@
 // the attached identity are replaced by local stand-ins. The spec shows:
 //
 //   - on a fresh schema of a '-rehearsal-xxxxxxxx' scratch target the job
-//     applies primary 0001-0071 forward, and the distinct runtime role ends
+//     applies primary 0001-0072 forward, and the distinct runtime role ends
 //     with exactly table DML plus EXECUTE on the three runtime functions: it
 //     cannot CREATE in the schema, cannot write the migration history, and
 //     every operator-only entrypoint is present and closed to it;
@@ -223,12 +223,12 @@ const REAL_RESIDUE = "0064_append_only_residue.sql";
 const nextNumber = () => String(primary.length + 1).padStart(4, "0");
 let firstReceipt;
 
-test("PG17 a fresh scratch schema is migrated 0001-0071 forward and the runtime role ends with exactly DML plus the three runtime functions", {
+test("PG17 a fresh scratch schema is migrated 0001-0072 forward and the runtime role ends with exactly DML plus the three runtime functions", {
   skip: !PG_TEST_SOCKET,
   timeout: 300_000,
 }, async () => {
-  assert.equal(primary.length, 71, "the promoted primary tail");
-  assert.equal(primary.at(-1).name, "0071_analytics_v2_revision_floor.sql");
+  assert.equal(primary.length, 72, "the promoted primary tail");
+  assert.equal(primary.at(-1).name, "0072_analytics_v2_price_cards.sql");
   assert.equal(primary.find(({ name }) => name === REAL_RESIDUE)?.version, 64);
   const { calls, dependencies } = jobDependencies();
   const receipt = await runProductionMigrations({ env: jobEnv(), dependencies });
@@ -241,7 +241,7 @@ test("PG17 a fresh scratch schema is migrated 0001-0071 forward and the runtime 
   assert.deepEqual(receipt.target, {
     kind: "scratch", instanceConnectionName: SCRATCH_INSTANCE, database: DATABASE, schema: SCRATCH_SCHEMA,
   });
-  assert.equal(receipt.migrations.count, 71);
+  assert.equal(receipt.migrations.count, 72);
   assert.equal(receipt.migrations.latest.name, primary.at(-1).name);
   assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE, "the real manifest carries the SIMP residue");
   assert.equal(receipt.migrations.contractReviewed, Object.keys(CONTRACT_MIGRATIONS).length);
@@ -381,7 +381,7 @@ test("PG17 a non-scratch target is refused PRODUCTION_SIMP_RESIDUE_MISSING befor
     PRIMARY_SCHEMA: REFUSED_SCHEMA,
   });
   // The image's manifest as it was before the real residue: the residue and
-  // every later migration (0065-0071) removed, so the copy has no numbering gap.
+  // every later migration (0065-0072) removed, so the copy has no numbering gap.
   const root = await mkdtemp(join(tmpdir(), "w2-opsdb-migrations-"));
   try {
     await cp(join(POSTGRES_MIGRATION_ROOT, "primary"), join(root, "primary"), { recursive: true });
@@ -412,8 +412,9 @@ test("PG17 with the SIMP residue in the image manifest the environment target is
   timeout: 300_000,
 }, async () => {
   // The real manifest: LEAD-SIMP's residue, followed by the additive 0065-0068,
-  // K-CORE-A's reviewed run stamps 0069, KM-CORE's additive catalog store 0070
-  // and REV-SEED's additive revision floor 0071.
+  // K-CORE-A's reviewed run stamps 0069, KM-CORE's additive catalog store 0070,
+  // REV-SEED's additive revision floor 0071 and K-PERCARD's additive price
+  // cards 0072.
   assert.ok(REAL_RESIDUE.endsWith(SIMP_RESIDUE_MIGRATION_SUFFIX));
   const { calls, dependencies } = jobDependencies();
   const receipt = await runProductionMigrations({
@@ -422,12 +423,12 @@ test("PG17 with the SIMP residue in the image manifest the environment target is
   });
   assert.deepEqual(calls.roles, ["primary"]);
   assert.equal(verifyProductionMigrationReceipt(receipt).target.kind, "environment");
-  assert.equal(receipt.migrations.count, 71);
+  assert.equal(receipt.migrations.count, 72);
   assert.equal(receipt.migrations.simpResidue, REAL_RESIDUE);
   const history = await state.superuser.query(
     `SELECT count(*)::integer AS n FROM ${q(ENVIRONMENT_SCHEMA)}.${q(HISTORY)}`,
   );
-  assert.equal(history.rows[0].n, 71);
+  assert.equal(history.rows[0].n, 72);
   const schemas = await state.superuser.query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'w2_opsdb_%' ORDER BY nspname");
   assert.deepEqual(schemas.rows.map(({ nspname }) => nspname), [SCRATCH_SCHEMA, ENVIRONMENT_SCHEMA].sort(),
     "only the two migrated primary schemas exist: no ledger schema was created");

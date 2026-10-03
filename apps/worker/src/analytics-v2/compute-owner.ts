@@ -16,6 +16,15 @@
  * point and the stored row order are those of the inline run. The queued
  * days' daily values, the blocked days, the fits and the model compositions
  * the community fold needs are returned once the owner is done.
+ *
+ * The prepared-day observer (K-PERCARD): every owner-day this run prepares
+ * and stores with daily values is also handed to the price attribution
+ * (price-attribution.ts), which prices each usage event through the
+ * vendored buildPricingEvent and priceTelemetryUsageEvent, checks the result
+ * against the kernel's own daily pricing block (a difference ends the run:
+ * ANALYTICS_V2_PRICE_ATTRIBUTION_MISMATCH) and emits the owner-day's price
+ * row right after its owner-day row. It reads nothing the kernels do not, and
+ * no kernel output depends on it.
  */
 import {
   CACHE_RETENTION_METHOD,
@@ -33,6 +42,7 @@ import {
   type AnalyticsV2CacheBandRow,
   type AnalyticsV2Day,
   type AnalyticsV2Owner,
+  type AnalyticsV2OwnerDayPriceRow,
   type AnalyticsV2OwnerDayRow,
   type AnalyticsV2OwnerFitsRow,
   type AnalyticsV2OwnerModelDateRow,
@@ -50,6 +60,7 @@ import {
 } from "./native-path";
 import { analyticsV2DayDigest, analyticsV2RefusedDayDigest, buildAnalyticsV2Pin, EMPTY_DAY_OCCURRENCES,
   type AnalyticsV2DayOccurrences } from "./pin";
+import { attributeAnalyticsV2DayPrices } from "./price-attribution";
 import { analyticsV2Refusal, kernelRefusalReason } from "./refusals";
 import {
   analyticsV2OutputRowBytes,
@@ -173,6 +184,7 @@ export interface AnalyticsV2OwnerRunContext {
 /** One owner output, handed to the caller in production order. */
 export type AnalyticsV2OwnerEmission =
   | { readonly kind: "ownerDay"; readonly row: AnalyticsV2OwnerDayRow }
+  | { readonly kind: "ownerDayPrice"; readonly row: AnalyticsV2OwnerDayPriceRow }
   | { readonly kind: "cacheBand"; readonly row: AnalyticsV2CacheBandRow }
   | { readonly kind: "refusal"; readonly refusal: AnalyticsV2Refusal }
   | { readonly kind: "fits"; readonly row: AnalyticsV2OwnerFitsRow }
@@ -283,7 +295,13 @@ export async function computeAnalyticsV2Owner(input: {
         else dailyValues.set(day, daily);
       }
       if (hasEvidence(value)) {
+        // The prepared-day observer: a stored owner-day with daily values gets
+        // its price row (the attribution fails the run on any disagreement
+        // with the kernel's daily pricing; it is never a refusal).
+        const price = refusal === null && daily !== null
+          ? await attributeAnalyticsV2DayPrices({ day, usage: value.usage, daily }) : null;
         emit({ kind: "ownerDay", row: Object.freeze({ ownerDigest, day, daily, refusal }) });
+        if (price !== null) emit({ kind: "ownerDayPrice", row: Object.freeze({ ownerDigest, day, ...price }) });
       }
     });
     sample();

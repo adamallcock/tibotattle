@@ -230,7 +230,7 @@ async function withOrigin(run) {
       created.push(schema);
     }
     const primary = await applyPostgresMigrations({ role: "primary", schema: primarySchema, pool: base });
-    assert.equal(primary.migrations.at(-1)?.name, "0071_analytics_v2_revision_floor.sql");
+    assert.equal(primary.migrations.at(-1)?.name, "0072_analytics_v2_price_cards.sql");
     const t = (name) => `"${primarySchema}"."${name}"`;
     await base.query(`UPDATE ${t("collection_controls")}
         SET revision=2, control_state='operational', enrollment_enabled=true, upload_registration_enabled=true,

@@ -34,8 +34,8 @@ const SECRET_PATH_PARTS = new Set([
 ]);
 // Primary only: the frozen ledger fragments stay in the repository (owner
 // action OA-4) and never enter the qualification image.
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 71;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0071_analytics_v2_revision_floor.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 72;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0072_analytics_v2_price_cards.sql";
 
 const ALLOWLIST = Object.freeze([
   Object.freeze({ source: "gcp-test/package.json", destination: "apps/worker/gcp-test/package.json" }),

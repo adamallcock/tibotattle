@@ -86,6 +86,13 @@ describe("kernel registry (K-STAMP)", () => {
     }
     expect(analyticsV2BaselineRunStamp(entry(1))).toEqual({ kernel: entry(1), manifestVersion: 1 });
     expect(() => analyticsV2BaselineRunStamp({ ...entry(1), kernelId: 0 })).toThrow("ANALYTICS_V2_KERNEL_REGISTRY_INVALID");
+    // K-PERCARD: a stated compute class rides on the stamp; it never selects the registry entry.
+    expect(analyticsV2BaselineRunStamp(entry(1), "c".repeat(64)))
+      .toEqual({ kernel: entry(1), manifestVersion: 1, computeSha256: "c".repeat(64) });
+    expect(resolveAnalyticsV2Kernel({ ...identity, computeSha256: "c".repeat(64) }, registry).kernelId).toBe(2);
+    for (const bad of ["C".repeat(64), "c".repeat(63), ""]) {
+      expect(() => analyticsV2BaselineRunStamp(entry(1), bad)).toThrow("ANALYTICS_V2_KERNEL_REGISTRY_INVALID");
+    }
   });
 
   it("moves the compatibility class with the closure, the method and every refusal-deciding resource", async () => {

@@ -109,8 +109,8 @@
  *   counts differ from its evidence fails the run. Without a loader the
  *   evidence is counted from `occurrencesByOwner` and the results are
  *   identical: each day is processed exactly once, in day order, either way.
- * - Output account: every output row (owner-day, cache band, fits, model
- *   date, refusal) and every held non-effective occurrence is charged to the
+ * - Output account: every output row (owner-day, its price row, cache band,
+ *   fits, model date, refusal) and every held non-effective occurrence is charged to the
  *   run's output account as it is produced (resources.ts
  *   ANALYTICS_V2_OUTPUT_MODEL). The moment the account exceeds the run's
  *   output budget the run fails with ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED and
@@ -151,6 +151,7 @@ import {
   type AnalyticsV2CacheBandRow,
   type AnalyticsV2Day,
   type AnalyticsV2Owner,
+  type AnalyticsV2OwnerDayPriceRow,
   type AnalyticsV2OwnerDayRow,
   type AnalyticsV2OwnerDigest,
   type AnalyticsV2OwnerFitsRow,
@@ -623,6 +624,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const analysisFrom = analysisDays[0]!;
   const refusals: AnalyticsV2Refusal[] = [];
   const ownerDays: AnalyticsV2OwnerDayRow[] = [];
+  const ownerDayPrices: AnalyticsV2OwnerDayPriceRow[] = [];
   const cacheBands: AnalyticsV2CacheBandRow[] = [];
   const ownerFits: AnalyticsV2OwnerFitsRow[] = [];
   const ownerModelDates: AnalyticsV2OwnerModelDateRow[] = [];
@@ -721,6 +723,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     switch (emission.kind) {
       case "refusal": pushRefusal(emission.refusal); return;
       case "ownerDay": ownerDays.push(emission.row); break;
+      case "ownerDayPrice": ownerDayPrices.push(emission.row); break;
       case "cacheBand": cacheBands.push(emission.row); break;
       case "fits": ownerFits.push(emission.row); break;
       case "modelDate": ownerModelDates.push(emission.row); break;
@@ -873,6 +876,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     revisionSeed: input.revisionSeed,
     owners,
     ownerDays,
+    ownerDayPrices,
     cacheBands,
     ownerFits,
     ownerModelDates,

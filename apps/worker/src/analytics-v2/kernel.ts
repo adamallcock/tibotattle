@@ -20,6 +20,17 @@
  *   recorded on the run row (compatibility_sha256) so a memo can tell when a
  *   stored result was computed under different resources.
  *
+ * - The compute class (K-PERCARD, engine v2 section 5.3: compute_sha256) is
+ *   the compute closure WITHOUT the vendored price registry (its cards and
+ *   manifest), stamped at build time through a third define. Two kernels
+ *   with the same compute class differ at most in their price cards, so a
+ *   transition between them can be compatible once its proof over the
+ *   stored price inputs holds (price-transition.ts). It is derived from the
+ *   closure the registry entry pins, so it is not a registry field; the
+ *   store records it per kernel (analytics_v2_kernel_prices) and refuses a
+ *   kernel that states another one. A bundle that states none (a spec
+ *   running the sources unbundled) records null: no compatibility claim.
+ *
  * Every analytics_v2 row a run writes carries its kernel_id and
  * manifest_version (staged migration analytics_v2_run_stamps; the store
  * refuses ANALYTICS_V2_KERNEL_CONFLICT for a registry entry that disagrees
@@ -34,6 +45,7 @@ import registryJson from "./kernel-registry.json";
 
 declare const __ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__: string | undefined;
 declare const __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__: string | undefined;
+declare const __ANALYTICS_V2_COMPUTE_SHA256__: string | undefined;
 
 /** The GCP orchestration method (pin, digests, memo and owner-set rules). A bump is a new kernel. */
 export const ANALYTICS_V2_METHOD_VERSION = "analytics-v2-method-v1" as const;
@@ -71,12 +83,16 @@ export interface AnalyticsV2KernelIdentity {
   readonly vendorManifestSha256: string;
   readonly computeClosureSha256: string;
   readonly methodVersion: string;
+  /** The compute class (the closure without the vendored price registry); absent when unknown. */
+  readonly computeSha256?: string;
 }
 
 /** The stamp one run writes on every row (kernel and manifest) and on its run row (compatibility). */
 export interface AnalyticsV2RunStamp {
   readonly kernel: AnalyticsV2KernelEntry;
   readonly manifestVersion: number;
+  /** K-PERCARD: the bundle's compute class, or null (absent) when it stated none. */
+  readonly computeSha256?: string | null;
 }
 
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -139,8 +155,10 @@ export function analyticsV2BundledKernelIdentity(): AnalyticsV2KernelIdentity | 
   const manifest = typeof __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__ === "string"
     ? __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__ : null;
   if (closure === null || manifest === null) return null;
+  const compute = typeof __ANALYTICS_V2_COMPUTE_SHA256__ === "string" && SHA256.test(__ANALYTICS_V2_COMPUTE_SHA256__)
+    ? __ANALYTICS_V2_COMPUTE_SHA256__ : null;
   return Object.freeze({ vendorManifestSha256: manifest, computeClosureSha256: closure,
-    methodVersion: ANALYTICS_V2_METHOD_VERSION });
+    methodVersion: ANALYTICS_V2_METHOD_VERSION, ...(compute === null ? {} : { computeSha256: compute }) });
 }
 
 /** The registry entry naming `identity`; ANALYTICS_V2_KERNEL_UNREGISTERED when none does. */
@@ -154,9 +172,15 @@ export function resolveAnalyticsV2Kernel(identity: AnalyticsV2KernelIdentity | n
   return entry;
 }
 
-/** The stamp of a run on the compiled baseline (manifest version 1). */
-export function analyticsV2BaselineRunStamp(kernel: AnalyticsV2KernelEntry): AnalyticsV2RunStamp {
-  return Object.freeze({ kernel: validAnalyticsV2KernelEntry(kernel), manifestVersion: ANALYTICS_V2_MANIFEST_BASELINE_VERSION });
+/**
+ * The stamp of a run on the compiled baseline (manifest version 1), with the
+ * bundle's compute class when it stated one (K-PERCARD).
+ */
+export function analyticsV2BaselineRunStamp(kernel: AnalyticsV2KernelEntry,
+  computeSha256: string | null = null): AnalyticsV2RunStamp {
+  if (computeSha256 !== null && (typeof computeSha256 !== "string" || !SHA256.test(computeSha256))) registryFail();
+  return Object.freeze({ kernel: validAnalyticsV2KernelEntry(kernel), manifestVersion: ANALYTICS_V2_MANIFEST_BASELINE_VERSION,
+    ...(computeSha256 === null ? {} : { computeSha256 }) });
 }
 
 /**

@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.5" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.6" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -66,6 +66,17 @@ export const ANALYTICS_V2_TABLES = Object.freeze({
   journalCursor: "analytics_v2_journal_cursor",
   // K-STAMP (staged migration analytics_v2_run_stamps): kernel-registry.json's copy.
   kernels: "analytics_v2_kernels",
+  // K-PERCARD (staged migration analytics_v2_price_cards): per-card price
+  // staleness. Each kernel's cards and compute class, the deduplicated price
+  // bases, each owner-day's price basis and stored price inputs, and the
+  // kernel transitions with the owner-days they make stale.
+  kernelPrices: "analytics_v2_kernel_prices",
+  priceCards: "analytics_v2_price_cards",
+  kernelCards: "analytics_v2_kernel_cards",
+  priceBases: "analytics_v2_price_bases",
+  ownerDayPrice: "analytics_v2_owner_day_price",
+  kernelTransitions: "analytics_v2_kernel_transitions",
+  transitionStale: "analytics_v2_transition_stale",
 } as const);
 export type AnalyticsV2TableKey = keyof typeof ANALYTICS_V2_TABLES;
 export type AnalyticsV2TableName = (typeof ANALYTICS_V2_TABLES)[AnalyticsV2TableKey];
@@ -108,6 +119,21 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
     "kernel_id", "production_commit", "vendor_manifest_sha256", "compute_closure_sha256",
     "price_registry_sha256", "price_registry_version", "method_version", "registered_at",
   ] as const),
+  kernelPrices: Object.freeze([
+    "kernel_id", "compute_sha256", "cards_sha256", "cards", "projection_version", "registered_at",
+  ] as const),
+  priceCards: Object.freeze(["card_ref", "card_id", "content_sha256", "first_kernel_id"] as const),
+  kernelCards: Object.freeze(["kernel_id", "card_ref", "card_id"] as const),
+  priceBases: Object.freeze(["price_basis_id", "basis_sha256", "card_refs"] as const),
+  ownerDayPrice: Object.freeze([
+    "owner_digest", "day", "price_basis_id", "usage_events", "unpriced_events", "partially_priced_events",
+    "projection_version", "codec", "inputs", "inputs_sha256", "input_events", "run_id", "kernel_id", "manifest_version",
+  ] as const),
+  kernelTransitions: Object.freeze([
+    "transition_id", "from_kernel", "to_kernel", "compute_equal", "proof_holds", "compatible", "cards_added",
+    "cards_removed", "cards_changed", "owner_days", "events", "stale_owner_days", "proof_run", "recorded_at",
+  ] as const),
+  transitionStale: Object.freeze(["transition_id", "owner_digest", "day", "cause"] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 /** Primary keys. Singletons (preview, journal cursor) use id = 1. */
@@ -121,6 +147,13 @@ export const ANALYTICS_V2_PRIMARY_KEYS = Object.freeze({
   preview: Object.freeze(["id"] as const),
   journalCursor: Object.freeze(["id"] as const),
   kernels: Object.freeze(["kernel_id"] as const),
+  kernelPrices: Object.freeze(["kernel_id"] as const),
+  priceCards: Object.freeze(["card_ref"] as const),
+  kernelCards: Object.freeze(["kernel_id", "card_ref"] as const),
+  priceBases: Object.freeze(["price_basis_id"] as const),
+  ownerDayPrice: Object.freeze(["owner_digest", "day"] as const),
+  kernelTransitions: Object.freeze(["transition_id"] as const),
+  transitionStale: Object.freeze(["transition_id", "owner_digest", "day"] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 export const ANALYTICS_V2_SINGLETON_ID = 1 as const;
@@ -264,6 +297,33 @@ export interface AnalyticsV2OwnerDayRow {
   readonly refusal: AnalyticsV2RefusalReason | null;
 }
 
+/**
+ * analytics_v2_owner_day_price (K-PERCARD): one owner-day's price attribution,
+ * one-to-one with its owner-day row that has daily values (price-attribution
+ * .ts). The store maps cardIds to the kernel's card refs and a deduplicated
+ * price basis.
+ */
+export interface AnalyticsV2OwnerDayPriceRow {
+  readonly ownerDigest: AnalyticsV2OwnerDigest;
+  readonly day: AnalyticsV2Day;
+  /** The price basis: every card id any event's pricing selected, sorted, unique. */
+  readonly cardIds: readonly string[];
+  readonly usageEvents: number;
+  /** Unpriced and unshapeable events (the daily fold's unpriced count). */
+  readonly unpricedEvents: number;
+  readonly partiallyPricedEvents: number;
+  /** The stored price inputs: each event's projection and this kernel's result. */
+  readonly inputs: {
+    readonly projectionVersion: string;
+    readonly codec: string;
+    /** sha256 of the canonical document text. */
+    readonly sha256: string;
+    readonly events: number;
+    /** The deflated document, base64. */
+    readonly data: string;
+  };
+}
+
 /** analytics_v2_cache_bands: one owner, day, model, effort and band. */
 export interface AnalyticsV2CacheBandRow {
   readonly ownerDigest: AnalyticsV2OwnerDigest;
@@ -335,6 +395,8 @@ export interface AnalyticsV2RunOutputs {
   readonly revisionSeed: number;
   readonly owners: readonly AnalyticsV2Owner[];
   readonly ownerDays: readonly AnalyticsV2OwnerDayRow[];
+  /** One per ownerDays row with daily values, in the same order (K-PERCARD). */
+  readonly ownerDayPrices: readonly AnalyticsV2OwnerDayPriceRow[];
   readonly cacheBands: readonly AnalyticsV2CacheBandRow[];
   readonly ownerFits: readonly AnalyticsV2OwnerFitsRow[];
   readonly ownerModelDates: readonly AnalyticsV2OwnerModelDateRow[];

@@ -53,6 +53,9 @@ const STAGED_FILE = "0059_analytics_v2.sql";
 // the K-CORE-A merge. The harness skips a promoted name; the backfill case
 // below applies the chain before it and then this file by hand.
 const KERNEL_STAGED_FILE = "0069_analytics_v2_run_stamps.sql";
+// K-PERCARD's per-card price staleness: staged as 0912, promoted as primary
+// 0072 at the K-PERCARD merge. The harness skips a promoted name.
+const PRICE_STAGED_FILE = "0072_analytics_v2_price_cards.sql";
 const PRIMARY_MIGRATIONS_DIRECTORY = join(WORKER_ROOT, "postgres", "migrations", "primary");
 const STAGED_PRIMARY_DIRECTORY = join(WORKER_ROOT, "postgres", "staged-migrations", "primary");
 // REV-SEED's revision floor: staged under a placeholder number until the
@@ -99,6 +102,9 @@ let contract;
 let store;
 let kernelIdentity;
 let specStamp;
+/** K-PERCARD: the price attribution, and the stored inputs of an owner-day with no usage event. */
+let prices;
+let emptyPriceInputs;
 /** resources.ts: the GCP bounds the Job's environment mirrors. */
 let resources;
 /** The real A-1 readers and A-2 compute core, as the Job bundles them. */
@@ -131,6 +137,8 @@ before(async () => {
   // The harness's literal is the module's digest of no exclusions.
   assert.equal((await load("/src/analytics-v2/exclusions.ts")).ANALYTICS_V2_NO_EXCLUSIONS_SHA256, NO_EXCLUSIONS);
   resources = await load("/src/analytics-v2/resources.ts");
+  prices = await load("/src/analytics-v2/price-attribution.ts");
+  emptyPriceInputs = (await prices.encodeAnalyticsV2PriceInputs([])).inputs;
   a1 = {
     owners: await load("/src/analytics-v2/owners.ts"),
     occurrences: await load("/src/analytics-v2/occurrence-source.ts"),
@@ -187,7 +195,7 @@ async function withDatabase(label, callback) {
         role: "primary",
         schema,
         pool,
-        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE, FLOOR_STAGED_FILE.name],
+        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE, FLOOR_STAGED_FILE.name, PRICE_STAGED_FILE],
       });
       // Before promotion 0059 is staged; after an unchanged promotion it is stock.
       assert.ok(
@@ -311,6 +319,31 @@ function contractOwner(ownerDigest, source) {
 }
 
 /**
+ * K-PERCARD: the price row the prepared-day observer gives an owner-day of
+ * `usageEvents` synthetic usage events (one fully priced d43c8f92 record
+ * each), priced and encoded by the real attribution module.
+ */
+async function specPriceRow(ownerDigest, day, usageEvents) {
+  const input = prices.analyticsV2PriceInput({ provider: "openai_codex", modelId: "gpt-5.6-sol",
+    billingSurface: "chatgpt_subscription", speedMode: "standard", apiServiceTier: "default", reasoningEffort: "high",
+    eventTime: `${day}T12:00:00.000Z`, totalInputContextTokens: 1000,
+    components: { inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: null } });
+  const priced = prices.priceAnalyticsV2Input(input);
+  const events = Array.from({ length: usageEvents }, () => ({ input, priced }));
+  const { inputs, cardIds } = await prices.encodeAnalyticsV2PriceInputs(events);
+  return { ownerDigest, day, cardIds, usageEvents, unpricedEvents: 0, partiallyPricedEvents: 0, inputs };
+}
+
+/** Price rows with no usage event for the owner-day rows with daily values (hand-built outputs). */
+function emptyPriceRows(ownerDays) {
+  return (Array.isArray(ownerDays) ? ownerDays : [])
+    .filter((row) => row !== null && typeof row === "object" && row.daily !== null && row.daily !== undefined)
+    .map((row) => ({ ownerDigest: row.ownerDigest, day: row.day, cardIds: [], usageEvents: 0, unpricedEvents: 0,
+      partiallyPricedEvents: 0, inputs: emptyPriceInputs }));
+}
+
+/**
  * Reads go through the Job's snapshot pool on two separate connections, so
  * the snapshot case can prove they share one snapshot.
  */
@@ -358,6 +391,7 @@ function createSpecPipeline(hooks = {}) {
       const owners = [...effective.map((owner) => contractOwner(owner, "effective")),
         contractOwner(OWNER_LEGACY, "v0.2")];
       const ownerDays = [];
+      const ownerDayPrices = [];
       const cacheBands = [];
       const ownerModelDates = [];
       const refusals = [{ ownerDigest: OWNER_LEGACY, day: null, family: "owner", reason: "non_effective_source_unported" }];
@@ -375,6 +409,7 @@ function createSpecPipeline(hooks = {}) {
           daily: { usageEvents: row.usage_events, models: [{ modelId: "synthetic-model", usageEvents: row.usage_events }] },
           refusal: null,
         });
+        ownerDayPrices.push(await specPriceRow(row.owner_digest, row.day, row.usage_events));
         for (const band of store.ANALYTICS_V2_CACHE_BANDS) {
           cacheBands.push({
             ownerDigest: row.owner_digest,
@@ -439,6 +474,7 @@ function createSpecPipeline(hooks = {}) {
         revisionSeed,
         owners,
         ownerDays,
+        ownerDayPrices,
         cacheBands,
         ownerFits,
         ownerModelDates,
@@ -687,8 +723,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 71,
-      "the 71-migration primary chain, 0059, the run stamps and the revision floor staged or promoted");
+    assert.equal(stock.length + stagedCount, 72,
+      "the 72-migration primary chain, 0059, the run stamps, the revision floor and the price cards staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -879,6 +915,8 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         await client.query(sql);
         // REV-SEED's floor, which the store reads, follows the run stamps.
         await client.query(await readFile(join(FLOOR_STAGED_FILE.directory, FLOOR_STAGED_FILE.name), "utf8"));
+        // K-PERCARD's tables (additive; the store writes them with every run).
+        await client.query(await priceMigrationSql());
         await client.query("COMMIT");
         assert.equal(await count(pool, schema, "analytics_v2_kernels"), 0, "no kernel is seeded");
         for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_published_daily"]) {
@@ -1322,9 +1360,18 @@ test("PG17: the store refuses to write without the refresh lock when another ses
   });
 });
 
+/** K-PERCARD's migration text, staged or promoted (found by its name suffix). */
+async function priceMigrationSql() {
+  for (const directory of [join(WORKER_ROOT, "postgres", "staged-migrations", "primary"), PRIMARY_MIGRATIONS_DIRECTORY]) {
+    const name = (await readdir(directory).catch(() => [])).find((entry) => /^\d{4}_analytics_v2_price_cards\.sql$/u.test(entry));
+    if (name !== undefined) return readFile(join(directory, name), "utf8");
+  }
+  throw new Error("the analytics_v2_price_cards migration is neither staged nor promoted");
+}
+
 function minimalOutputs(overrides = {}) {
   const nowMs = Date.parse(NOW_1);
-  return {
+  const outputs = {
     contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION,
     mode: "full",
     nowMs,
@@ -1343,6 +1390,9 @@ function minimalOutputs(overrides = {}) {
     timings: {},
     ...overrides,
   };
+  // K-PERCARD: every owner-day with daily values carries its price row.
+  return Object.hasOwn(overrides, "ownerDayPrices") ? outputs
+    : { ...outputs, ownerDayPrices: emptyPriceRows(outputs.ownerDays) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,7 +2152,7 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
           return {
             contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION, mode: "full", nowMs: input.nowMs,
             today: utcDay(input.nowMs), revisionSeed: input.revisionSeed, owners: input.owners, ownerDays: [],
-            cacheBands: [], ownerFits: [], ownerModelDates: [], preview: null, refusals: [], timings: {},
+            ownerDayPrices: [], cacheBands: [], ownerFits: [], ownerModelDates: [], preview: null, refusals: [], timings: {},
             dailyCandidates: input.queuedDays.filter((day) => day !== "2026-04-10")
               .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64) })),
             blockedDays: ["2026-04-10"],
@@ -2436,6 +2486,37 @@ for (const correctionRuntime of ["active", "staged"]) {
       for (const table of ["analytics_v2_owner_day", "analytics_v2_owner_model_dates", "analytics_v2_preview"]) {
         assert.ok(await count(pool, schema, table) > 0, table);
       }
+      // K-PERCARD: the kernel's cards are registered once, and every owner-day
+      // with daily values has exactly one price row whose basis is the
+      // kernel's cards (the prepared-day observer agreed with the kernel).
+      const priced = async () => (await pool.query(`SELECT d.owner_digest, d.day::text AS day, p.price_basis_id,
+          p.usage_events, p.unpriced_events, p.partially_priced_events, p.inputs_sha256, p.kernel_id, b.basis_sha256,
+          (p.run_id = d.run_id) AS same_run,
+          (d.daily -> 'pricing' ->> 'unpriced')::integer AS daily_unpriced,
+          (d.daily -> 'counts' ->> 'usage')::integer AS daily_usage,
+          NOT EXISTS (SELECT 1 FROM unnest(b.card_refs) AS ref WHERE NOT EXISTS (
+            SELECT 1 FROM ${quoted(schema, "analytics_v2_kernel_cards")} k WHERE k.kernel_id = p.kernel_id AND k.card_ref = ref))
+            AS basis_in_kernel
+         FROM ${quoted(schema, "analytics_v2_owner_day")} d
+         LEFT JOIN ${quoted(schema, "analytics_v2_owner_day_price")} p ON p.owner_digest = d.owner_digest AND p.day = d.day
+         LEFT JOIN ${quoted(schema, "analytics_v2_price_bases")} b ON b.price_basis_id = p.price_basis_id
+        WHERE d.daily IS NOT NULL ORDER BY d.owner_digest, d.day`)).rows;
+      const firstPrices = await priced();
+      // With the correction runtime active the effective owners have priced days.
+      if (correctionRuntime === "active") assert.ok(firstPrices.length > 0);
+      for (const row of firstPrices) {
+        assert.ok(row.price_basis_id !== null, "every owner-day with daily values has a price row");
+        assert.equal(row.same_run, true);
+        assert.equal(row.basis_in_kernel, true);
+        assert.equal(row.usage_events, row.daily_usage, "the price row counts the day's usage events");
+        assert.equal(row.unpriced_events, row.daily_unpriced, "and agrees with the kernel's unpriced count");
+      }
+      assert.equal(await count(pool, schema, "analytics_v2_owner_day_price"), firstPrices.length);
+      const kernelCards = await count(pool, schema, "analytics_v2_kernel_cards");
+      assert.ok(kernelCards > 100, "the d43c8f92 registry's cards");
+      assert.deepEqual(first.prices, { kernelCards, cardsRegistered: kernelCards,
+        basesRegistered: await count(pool, schema, "analytics_v2_price_bases"), ownerDays: firstPrices.length,
+        transitions: [] });
 
       // (b) An identical rerun queues nothing new: only the carried blocked
       // days are recomputed, and no revision moves.
@@ -2444,6 +2525,10 @@ for (const correctionRuntime of ["active", "staged"]) {
       assert.deepEqual(second.published, []);
       assert.deepEqual(second.blocked, first.blocked);
       assert.deepEqual(await publishedRows(pool, schema), heads);
+      // The rerun registers nothing new and reproduces every price row (ids, bases, inputs).
+      assert.deepEqual(second.prices, { kernelCards, cardsRegistered: 0, basesRegistered: 0, ownerDays: firstPrices.length,
+        transitions: [] });
+      assert.deepEqual(await priced(), firstPrices);
       const ownerDays2 = await ownerScopedRows(pool, schema, "analytics_v2_owner_day");
       const cacheBands2 = await ownerScopedRows(pool, schema, "analytics_v2_cache_bands");
 

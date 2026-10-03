@@ -8,7 +8,10 @@
  *     for the Job's session that already holds it; any other session is
  *     refused) and re-reads the journal cursor FOR UPDATE, refusing a cursor
  *     that moved since the Job's read snapshot;
- *  2. it replaces the owner-scoped families (owner_day, cache_bands,
+ *  1a. it registers the run kernel's price cards and records the kernel
+ *     transitions from older stored kernels with their stale owner-days
+ *     (K-PERCARD, store-price.ts);
+ *  2. it replaces the owner-scoped families (owner_day with its price rows, cache_bands,
  *     owner_fits, owner_model_dates) of the owners this run computed (source
  *     'effective'), and only inside the run's horizon: owner_day rows from
  *     horizon.ownerDayFromDay and cache_bands rows from
@@ -53,6 +56,14 @@ import type { PostgresClient } from "../postgres-client";
 import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2PublicationSummary, type AnalyticsV2RunOutputs } from "./contract";
 import { analyticsV2CompatibilitySha256 } from "./kernel";
 import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
+import { AnalyticsV2PriceError, analyticsV2KernelPriceCards } from "./price-attribution";
+import { AnalyticsV2TransitionError } from "./price-transition";
+import {
+  proveAnalyticsV2PriceTransitions,
+  recordAnalyticsV2PriceTransitions,
+  registerAnalyticsV2KernelPrices,
+  writeAnalyticsV2OwnerDayPrices,
+} from "./store-price";
 import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily } from "./store-publication";
 // REV-SEED: the one published-revision computation, for every publishing path.
 export { nextPublishedRevision } from "./store-publication";
@@ -90,6 +101,10 @@ export {
   resolveAnalyticsV2Kernel,
 } from "./kernel";
 export type { AnalyticsV2KernelEntry, AnalyticsV2KernelIdentity, AnalyticsV2RunStamp } from "./kernel";
+// K-PERCARD: the transition proof the Job runs in its read snapshot, and the
+// derived-regime dirtiness an incremental planner reads.
+export { proveAnalyticsV2PriceTransitions, readAnalyticsV2PriceDirtyOwnerDays } from "./store-price";
+export type { AnalyticsV2PriceTransitions, AnalyticsV2PriceWriteSummary } from "./store-run";
 export {
   ANALYTICS_V2_CACHE_BANDS,
   ANALYTICS_V2_DAILY_REVISION_FIELDS,
@@ -148,6 +163,7 @@ export async function writeRunOutputs(
   const stamp = validRunStamp(options.stamp);
   const wallClock = options.wallClock ?? Date.now;
   const prepared = await prepareOutputs(outputs, horizon);
+  const priceCards = await analyticsV2KernelPriceCards();
   // The run's compatibility class; unknown (null) for a run without a resource record.
   const compatibilitySha256 = prepared.resources === null ? null
     : await analyticsV2CompatibilitySha256(stamp.kernel, prepared.resources.configuration);
@@ -165,8 +181,16 @@ export async function writeRunOutputs(
 
     const storedCursor = await lockAnalyticsV2Run(client, schema, options.expectedCursor, prepared.lastSequence);
     await registerAnalyticsV2RunKernel(client, schema, stamp, releasedAt);
+    // K-PERCARD: the kernel's cards, then the transitions from older stored
+    // kernels (over their rows, before the derived rows are replaced).
+    const kernelPrices = await registerAnalyticsV2KernelPrices(client, schema, stamp, releasedAt, priceCards);
+    const transitions = await recordAnalyticsV2PriceTransitions(client, schema,
+      options.priceTransitions ?? await proveAnalyticsV2PriceTransitions(client, { schema, stamp, cards: priceCards }),
+      stamp, runId, releasedAt);
     const retainedOwners = await writeAnalyticsV2DerivedFamilies(client, schema, outputs,
       prepared.computedOwnerDigests, horizon, runId, stamp);
+    const basesRegistered = await writeAnalyticsV2OwnerDayPrices(client, schema, outputs.ownerDayPrices,
+      kernelPrices.refs, runId, stamp);
     const { published, unchanged } = await writeAnalyticsV2PublishedDaily(client, schema, prepared, runId,
       releasedAt, stamp);
     await writeAnalyticsV2Preview(client, schema, outputs.preview, releasedAt, runId, stamp);
@@ -211,6 +235,8 @@ export async function writeRunOutputs(
       publication,
       cursor,
       timings,
+      prices: Object.freeze({ kernelCards: priceCards.cards.length, cardsRegistered: kernelPrices.cardsRegistered,
+        basesRegistered, ownerDays: outputs.ownerDayPrices.length, transitions }),
     });
   } catch (error) {
     if (transactionStarted) {
@@ -221,6 +247,8 @@ export async function writeRunOutputs(
       }
     }
     if (error instanceof AnalyticsV2StoreError) throw error;
+    // K-PERCARD's closed, content-free codes (corrupt stored inputs, an invalid transition) pass through.
+    if (error instanceof AnalyticsV2PriceError || error instanceof AnalyticsV2TransitionError) throw error;
     const sqlState = sqlStateOf(error);
     throw new AnalyticsV2StoreError("ANALYTICS_V2_WRITE_FAILED", sqlState === undefined ? {} : { sqlState });
   }
