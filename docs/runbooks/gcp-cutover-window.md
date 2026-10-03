@@ -1024,7 +1024,11 @@ resume. `owner`.
 Recomputed history can differ from what Cloudflare published, published
 revisions restart, and past contributions stay in recomputed history. These
 are accepted differences and are disclosed on the privacy page (E-OPS9); they
-are not defects of the cold build.
+are not defects of the cold build. Each frozen-window day's saved owner set is
+the participants at GCP's first publication of it (owner decision round 7);
+`analytics_v2_daily_owner_set_bootstrap` lists every such day with the set's
+size and Cloudflare's `contributingParticipants`, verified (provenance 2) when
+they agree and disclosed (provenance 3) when they differ (E-OWNERSET).
 
 ## Abort A, before any gcp-mode version
 

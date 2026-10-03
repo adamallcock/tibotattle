@@ -35,8 +35,12 @@ import registryJson from "./kernel-registry.json";
 declare const __ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__: string | undefined;
 declare const __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__: string | undefined;
 
-/** The GCP orchestration method (pin, digests, memo and owner-set rules). A bump is a new kernel. */
-export const ANALYTICS_V2_METHOD_VERSION = "analytics-v2-method-v1" as const;
+/**
+ * The GCP orchestration method (pin, digests, memo and owner-set rules). A
+ * bump is a new kernel. v2: a published day folds its saved owner set
+ * (E-OWNERSET, compute-community.ts).
+ */
+export const ANALYTICS_V2_METHOD_VERSION = "analytics-v2-method-v2" as const;
 /** manifest_version of the compiled baseline (the catalog vendored with the kernels). */
 export const ANALYTICS_V2_MANIFEST_BASELINE_VERSION = 1 as const;
 export const ANALYTICS_V2_KERNEL_REGISTRY_VERSION = "analytics-v2-kernel-registry-v1" as const;

@@ -36,6 +36,7 @@ import {
   NO_ANALYTICS_V2_EXCLUSIONS_SHA256,
   applyStockAndStagedMigrations,
   postgresTestEndpoint,
+  stagedOrPromotedMigrationName,
 } from "./staged-migrations-harness.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
@@ -44,6 +45,8 @@ import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-targe
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 import * as synthetic from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
+import { denseGoldenExportBody, exportInput } from "../analytics-v2-test/fixtures/interim-public-read-export.mjs";
+import { checkInterimPublicRead, loadInterimPublicRead } from "../scripts/gcp-interim-public-read-load.mjs";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -53,6 +56,9 @@ const STAGED_FILE = "0059_analytics_v2.sql";
 // the K-CORE-A merge. The harness skips a promoted name; the backfill case
 // below applies the chain before it and then this file by hand.
 const KERNEL_STAGED_FILE = "0069_analytics_v2_run_stamps.sql";
+// E-OWNERSET's saved owner sets: staged under a placeholder number until the
+// integrator promotes it, so it is found by its name suffix.
+const OWNER_SETS_FILE = await stagedOrPromotedMigrationName("primary", "_analytics_v2_owner_sets.sql");
 const PRIMARY_MIGRATIONS_DIRECTORY = join(WORKER_ROOT, "postgres", "migrations", "primary");
 const ENDPOINT = await postgresTestEndpoint();
 const PG_SKIP = ENDPOINT === null
@@ -124,6 +130,7 @@ before(async () => {
     occurrences: await load("/src/analytics-v2/occurrence-source.ts"),
     devices: await load("/src/analytics-v2/devices.ts"),
     queuedDays: await load("/src/analytics-v2/queued-days.ts"),
+    ownerSets: await load("/src/analytics-v2/owner-sets.ts"),
   };
   a2 = await load("/src/analytics-v2/compute.ts");
   seedModules = {
@@ -175,7 +182,7 @@ async function withDatabase(label, callback) {
         role: "primary",
         schema,
         pool,
-        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE],
+        stagedFiles: [STAGED_FILE, KERNEL_STAGED_FILE, OWNER_SETS_FILE],
       });
       // Before promotion 0059 is staged; after an unchanged promotion it is stock.
       assert.ok(
@@ -280,6 +287,40 @@ function contractOwner(ownerDigest, source) {
   };
 }
 
+/** The fold's owner-set summary of a run that folded no saved contribution (E-OWNERSET). */
+const NO_OWNER_SETS = Object.freeze({ contributionRetainedEvidenceAbsent: 0, savedMembersFolded: 0,
+  memberContributionUnavailableDays: [] });
+
+/**
+ * The stand-in's owner set of one day (E-OWNERSET): every owner with a row on
+ * it, as a computed member folding its usage (contract AnalyticsV2DailyMember).
+ */
+function standInMembers(rows) {
+  return [...rows].sort((left, right) => (left.owner_digest < right.owner_digest ? -1 : 1)).map((row) => ({
+    ownerDigest: row.owner_digest, origin: "computed", savedVersion: null, devices: 1,
+    values: { schemaVersion: "synthetic-daily-values-v1", usageEvents: row.usage_events },
+  }));
+}
+
+/**
+ * The stand-in's saved members of one day without a row on it (departed):
+ * each folds its current stored contribution (owner decision round 2).
+ */
+function standInDeparted(inputs, day, rows) {
+  const present = new Set(rows.map((row) => row.owner_digest));
+  return [...inputs.ownerSetState.days.get(day).members].filter(([ownerDigest]) => !present.has(ownerDigest))
+    .map(([ownerDigest, member]) => {
+      const values = inputs.savedValues.get(`${day}\u0001${ownerDigest}\u0001${member.version}`);
+      assert.ok(values !== undefined, "the stand-in loaded every departed member's values");
+      return { usageEvents: values.usageEvents,
+        member: { ownerDigest, origin: "saved", values: null, devices: null, savedVersion: member.version } };
+    });
+}
+
+/** A run row's owner-set summary with these writes and nothing folded from storage. */
+const ownerSetWrites = (membersAdded, contributionVersions) => ({ ...NO_OWNER_SETS, membersAdded, contributionVersions,
+  bootstrapVerifiedDays: [], bootstrapDisclosedDays: [] });
+
 /**
  * Reads go through the Job's snapshot pool on two separate connections, so
  * the snapshot case can prove they share one snapshot.
@@ -319,7 +360,21 @@ function createSpecPipeline(hooks = {}) {
       const lastSequence = journal.length === 0
         ? (state.cursor === null ? null : Number(state.cursor))
         : Number(journal[journal.length - 1].sequence);
-      return { usage, queuedDays, lastSequence };
+      // E-OWNERSET: the queued days' saved sets, through the real reader, and
+      // the stored values of every member without a row on its day (the
+      // stand-in's departed members), as A-2's fold reads them.
+      const context = { pool, schema, nowMs };
+      const ownerSetState = await a1.ownerSets.readAnalyticsV2OwnerSetState(context, { days: queuedDays });
+      const needed = [];
+      for (const [day, saved] of ownerSetState.days) {
+        for (const [ownerDigest, member] of saved.members) {
+          if (!usage.some((row) => row.day === day && row.owner_digest === ownerDigest)) {
+            needed.push({ day, ownerDigest, version: member.version });
+          }
+        }
+      }
+      const savedValues = await a1.ownerSets.readAnalyticsV2SavedContributionValues(context, needed);
+      return { usage, queuedDays, lastSequence, ownerSetState, savedValues };
     },
     async compute(inputs, { nowMs, revisionSeed, mode }) {
       await hooks.beforeCompute?.();
@@ -399,7 +454,12 @@ function createSpecPipeline(hooks = {}) {
           },
           cells: [],
         };
-        dailyCandidates.push({ day, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload) });
+        const departed = standInDeparted(inputs, day, rows);
+        payload.totals.contributingParticipants += departed.length;
+        payload.totals.usageEvents += departed.reduce((sum, member) => sum + member.usageEvents, 0);
+        dailyCandidates.push({ day, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload),
+          members: [...standInMembers(rows), ...departed.map((member) => member.member)]
+            .sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1)), bootstrap: null });
       }
       return {
         contractVersion: contract.ANALYTICS_V2_CONTRACT_VERSION,
@@ -414,6 +474,7 @@ function createSpecPipeline(hooks = {}) {
         ownerModelDates,
         dailyCandidates,
         blockedDays: [...blocked].sort(),
+        ownerSets: NO_OWNER_SETS,
         preview: { schemaVersion: "synthetic-preview", owners: effective.length },
         refusals,
         journal: { lastSequence: inputs.lastSequence },
@@ -657,8 +718,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 70,
-      "the 70-migration primary chain, 0059 and the run stamps staged or promoted");
+    assert.equal(stock.length + stagedCount, 71,
+      "the 70-migration primary chain and the owner sets, staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -717,7 +778,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
     try {
       // The migration seeds no kernel: the first run that stamps registers its own.
       assert.deepEqual(await kernels(), []);
-      const payload = { day: DAY_1, value: 1 };
+      const payload = { day: DAY_1, value: 1, totals: { contributingParticipants: 0 } };
       // A third argument, even undefined, replaces the recorded exclusions digest.
       const write = (stamp, options = {}, ...digest) => store.writeRunOutputs(client,
         minimalOutputs({
@@ -728,7 +789,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
         }), { schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null,
           horizon: STAND_IN_HORIZON, stamp, exclusionsSha256: digest.length === 0 ? NO_EXCLUSIONS : digest[0] });
       await write(specStamp, { dailyCandidates: [{ day: DAY_1, payload,
-        payloadSha256: await store.analyticsV2DailyContentSha256(payload) }] });
+        payloadSha256: await store.analyticsV2DailyContentSha256(payload), members: [], bootstrap: null }] });
       assert.deepEqual(await kernels(), [{ kernel_id: 1, production_commit: registry[0].productionCommit,
         vendor_manifest_sha256: registry[0].vendorManifestSha256, compute_closure_sha256: registry[0].computeClosureSha256,
         price_registry_sha256: registry[0].priceRegistrySha256, price_registry_version: registry[0].priceRegistryVersion,
@@ -1035,7 +1096,8 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
     assert.deepEqual(runs1[0].refusals, [
       { ownerDigest: OWNER_LEGACY, day: null, family: "owner", reason: "non_effective_source_unported" },
     ]);
-    assert.deepEqual(runs1[0].publication, { published: [DAY_1, DAY_2, DAY_3], unchanged: [], blocked: [] });
+    assert.deepEqual(runs1[0].publication, { published: [DAY_1, DAY_2, DAY_3], unchanged: [], blocked: [],
+      ownerSets: ownerSetWrites(4, 4) });
     assert.ok(Number.isFinite(runs1[0].timings.read) && Number.isFinite(runs1[0].timings.write));
     const heads1 = await publishedRows(pool, schema);
     for (const day of [DAY_1, DAY_2, DAY_3]) {
@@ -1064,7 +1126,7 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
     assert.equal(second.cursor, "4");
     const runs2 = await runRows(pool, schema);
     assert.equal(runs2.length, 2);
-    assert.deepEqual(runs2[1].publication, { published: [], unchanged: [], blocked: [] });
+    assert.deepEqual(runs2[1].publication, { published: [], unchanged: [], blocked: [], ownerSets: ownerSetWrites(0, 0) });
     assert.deepEqual(await publishedRows(pool, schema), heads1, "published heads are byte-identical");
     // Journal events re-queue the days without a source change, at a later
     // --now: the digests exclude releasedAt, so the run row records the three
@@ -1079,7 +1141,7 @@ test("PG17 (a)(b)(c): full runs write every family, rerun publishes nothing, one
     assert.equal(third.unchanged, 3);
     assert.equal(third.cursor, "7");
     assert.deepEqual((await runRows(pool, schema))[2].publication,
-      { published: [], unchanged: [DAY_1, DAY_2, DAY_3], blocked: [] });
+      { published: [], unchanged: [DAY_1, DAY_2, DAY_3], blocked: [], ownerSets: ownerSetWrites(0, 0) });
     assert.deepEqual(await publishedRows(pool, schema), heads1, "published heads are byte-identical");
 
     // (c) One owner-day changes: exactly that day's revision moves by one.
@@ -1224,6 +1286,7 @@ function minimalOutputs(overrides = {}) {
     ownerModelDates: [],
     dailyCandidates: [],
     blockedDays: [],
+    ownerSets: NO_OWNER_SETS,
     preview: null,
     refusals: [],
     journal: { lastSequence: null },
@@ -1616,7 +1679,8 @@ test("PG17 (g): a blocked conflict day keeps its prior row, stays pending, and i
     assert.deepEqual(heads2.get(DAY_2), heads1.get(DAY_2), "the blocked day keeps its prior row exactly");
     assert.equal(heads2.get(DAY_3).revision, 2);
     const runs = await runRows(pool, schema);
-    assert.deepEqual(runs.at(-1).publication, { published: [DAY_3], unchanged: [], blocked: [DAY_2] });
+    assert.deepEqual(runs.at(-1).publication, { published: [DAY_3], unchanged: [], blocked: [DAY_2],
+      ownerSets: ownerSetWrites(0, 1) });
     assert.deepEqual(runs.at(-1).refusals.filter((refusal) => refusal.family === "daily"),
       [{ ownerDigest: OWNER_A, day: DAY_2, family: "daily", reason: "source_conflict_or_order" }]);
     const refusedDay = await pool.query(`SELECT daily, refusal FROM ${quoted(schema, "analytics_v2_owner_day")}
@@ -1693,8 +1757,9 @@ test("PG17: a full run replaces only computed owners' families; absent owners' r
     }
     assert.deepEqual(await publishedRows(pool, schema), heads1, "published history is not rewritten");
 
-    // A later journal event re-queues DAY_3: that day alone is recomputed from
-    // the current roster (production's queue semantics).
+    // A later journal event re-queues DAY_3: that day alone is recomputed
+    // (production's queue semantics), over its saved owner set: the departed
+    // OWNER_B keeps its contribution of 11 (owner decision round 2, E-OWNERSET).
     await setUsage(pool, schema, OWNER_A, DAY_3, 4);
     const requeued = await runJob({ schema, now: NOW_3 });
     assert.deepEqual(requeued.published, [DAY_3]);
@@ -1702,7 +1767,12 @@ test("PG17: a full run replaces only computed owners' families; absent owners' r
     assert.deepEqual(heads3.get(DAY_1), heads1.get(DAY_1));
     assert.deepEqual(heads3.get(DAY_2), heads1.get(DAY_2));
     assert.equal(heads3.get(DAY_3).revision, 2);
-    assert.equal(heads3.get(DAY_3).payload.totals.usageEvents, 4);
+    assert.deepEqual(heads3.get(DAY_3).payload.totals, { contributingParticipants: 2, usageEvents: 15 });
+    assert.deepEqual(requeued.ownerSets, ownerSetWrites(1, 1));
+    const members = await pool.query(`SELECT owner_digest, first_revision FROM
+        ${quoted(schema, "analytics_v2_daily_owner_sets")} WHERE day = $1 ORDER BY owner_digest`, [DAY_3]);
+    assert.deepEqual(members.rows, [{ owner_digest: OWNER_A, first_revision: 2 }, { owner_digest: OWNER_B, first_revision: 1 }]
+      .sort((left, right) => (left.owner_digest < right.owner_digest ? -1 : 1)));
     assert.deepEqual(await ownerRows(OWNER_B), ownerB1);
     assert.notEqual(first.runId, requeued.runId);
   });
@@ -1789,7 +1859,8 @@ test("PG17: a payload over the cap in its jsonb text form is refused with its ow
     try {
       // Compact JSON stays under the cap; jsonb's text form (", " and ": ")
       // does not, and that is what 0059's CHECK measures.
-      const payload = { day: DAY_1, cells: Array.from({ length: 17_800 }, (_, index) => ({ a: index % 10, b: 1 })) };
+      const payload = { day: DAY_1, totals: { contributingParticipants: 0 },
+        cells: Array.from({ length: 17_800 }, (_, index) => ({ a: index % 10, b: 1 })) };
       const stampedBytes = Buffer.byteLength(JSON.stringify(store.stampAnalyticsV2DailyPayload(payload,
         { day: DAY_1, revision: 1, releasedAt: NOW_1 })));
       assert.ok(stampedBytes < store.ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES, `compact ${stampedBytes}`);
@@ -1798,7 +1869,8 @@ test("PG17: a payload over the cap in its jsonb text form is refused with its ow
       assert.ok(jsonbBytes > store.ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES, `jsonb ${jsonbBytes}`);
       const before = await analyticsSnapshot(pool, schema);
       await assert.rejects(store.writeRunOutputs(client, minimalOutputs({
-        dailyCandidates: [{ day: DAY_1, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload) }],
+        dailyCandidates: [{ day: DAY_1, payload, payloadSha256: await store.analyticsV2DailyContentSha256(payload),
+          members: [], bootstrap: null }],
       }), {
         schema, runId: randomUUID(), startedAtMs: Date.parse(NOW_1), expectedCursor: null, horizon: STAND_IN_HORIZON, stamp: specStamp,
         exclusionsSha256: NO_EXCLUSIONS,
@@ -1974,6 +2046,18 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
             [day, new Map(owners.map((owner) => [owner.ownerDigest, 2]))]));
         },
       },
+      // E-OWNERSET: no day has a saved set yet, and no frozen export applies.
+      ownerSets: {
+        async readAnalyticsV2OwnerSetState(context, options) {
+          assert.equal(context.nowMs, WIRING_NOW_MS);
+          calls.ownerSets = [...options.days];
+          return { days: new Map(options.days.map((day) => [day, { members: new Map(), bootstrapped: false }])),
+            frozen: null };
+        },
+        async readAnalyticsV2SavedContributionValues() {
+          throw new Error("no saved contribution is needed");
+        },
+      },
       compute: {
         ANALYTICS_V2_ANALYSIS_DAYS: a2.ANALYTICS_V2_ANALYSIS_DAYS,
         analyticsV2RequiredOccurrenceRange: a2.analyticsV2RequiredOccurrenceRange,
@@ -1990,8 +2074,9 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
             today: utcDay(input.nowMs), revisionSeed: input.revisionSeed, owners: input.owners, ownerDays: [],
             cacheBands: [], ownerFits: [], ownerModelDates: [], preview: null, refusals: [], timings: {},
             dailyCandidates: input.queuedDays.filter((day) => day !== "2026-04-10")
-              .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64) })),
+              .map((day) => ({ day, payload: { day }, payloadSha256: "0".repeat(64), members: [], bootstrap: null })),
             blockedDays: ["2026-04-10"],
+            ownerSets: NO_OWNER_SETS,
             journal: { lastSequence: null },
           };
         },
@@ -2270,6 +2355,7 @@ function realPipeline() {
     devices: a1.devices,
     queuedDays: a1.queuedDays,
     compute: a2,
+    ownerSets: a1.ownerSets,
   });
 }
 
@@ -2632,6 +2718,7 @@ test("PG17: real A-2 cache-band history survives later runs unchanged (retention
         [day, new Map(owners.map((owner) => [owner.ownerDigest, 1]))])),
     },
     compute: a2,
+    ownerSets: a1.ownerSets,
   });
   await withDatabase("cache-history", async ({ pool, createSchema }) => {
     const { schema } = await createSchema();
@@ -2700,6 +2787,7 @@ function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream,
         [day, new Map(contributors.map((owner) => [owner.ownerDigest, 1]))])),
     },
     compute: a2,
+    ownerSets: a1.ownerSets,
   });
 }
 
@@ -2881,6 +2969,93 @@ test("PG17: an owner over the memory budget is refused with memory_budget, never
     assert.equal(excludedPreview.coverage.uploadingParticipantCount, 3);
     assert.equal(await ownerScopedRows(pool, schema, "analytics_v2_owner_fits"), fits,
       "the refused owner's stored fit is retained");
+  });
+});
+
+// E-OWNERSET (engine v2 design section 6.2-6.3; owner decisions round 2 and
+// round 7) through the real A-2 fold, the real owner-set reader and the real
+// store: a published day keeps the contribution of a member that departed or
+// whose read went empty (never a zero, no new revision), an unfoldable
+// contribution blocks its day, and GCP's first publication of a frozen-window
+// day records the participants at cutover against Cloudflare's frozen count.
+test("PG17 E-OWNERSET: saved owner sets keep departed members, block unfoldable ones and bootstrap from the frozen window", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  const corpus = synthetic.composeProofCorpus();
+  const owners = [...corpus.owners];
+  const facts = new Map(synthetic.COMPOSE_OWNERS.map((owner) => [owner.digest, synthetic.composeFacts(owner)]));
+  const journal = journalOf(corpus.publishedDays);
+  const pipeline = syntheticPipeline({ owners, facts, journal });
+  const today = synthetic.TODAY;
+  const [first, second, third] = [...owners].sort((left, right) => (left.ownerDigest < right.ownerDigest ? -1 : 1));
+  // The frozen Cloudflare export: the dense golden's window, with today's count
+  // set to this corpus's three participants (verified) and every other day at
+  // its golden count of five (disclosed).
+  const body = denseGoldenExportBody();
+  body.days = body.days.map((day) => (day.day !== today ? day : { ...day, payload: { ...day.payload,
+    totals: { ...day.payload.totals, contributingParticipants: 3 } } }));
+  const input = exportInput(body);
+  const { prepared } = await checkInterimPublicRead({ exportBytes: input.exportBytes, sha256: input.expectedSha256,
+    capturedAt: input.capturedAt, sourceCommit: input.sourceCommit, evidenceDate: input.evidenceDate });
+  await withDatabase("owner-sets", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await loadInterimPublicRead({ pool, schema, prepared });
+    const now = new Date(synthetic.NOW_MS).toISOString();
+    const sets = quoted(schema, "analytics_v2_daily_owner_sets");
+    const contributions = quoted(schema, "analytics_v2_daily_contributions");
+
+    const run1 = await runJob({ schema, now, pipeline });
+    assert.deepEqual(run1.published, corpus.publishedDays);
+    assert.deepEqual(run1.ownerSets, { ...NO_OWNER_SETS, membersAdded: 3 * corpus.publishedDays.length,
+      contributionVersions: 3 * corpus.publishedDays.length, bootstrapVerifiedDays: [today],
+      bootstrapDisclosedDays: corpus.publishedDays.filter((day) => day !== today) });
+    assert.deepEqual((await pool.query(`SELECT provenance, count(*)::int AS n FROM ${sets} GROUP BY provenance
+        ORDER BY provenance`)).rows, [{ provenance: 2, n: 3 }, { provenance: 3, n: 3 * (corpus.publishedDays.length - 1) }]);
+    assert.deepEqual((await pool.query(`SELECT to_char(day, 'YYYY-MM-DD') AS day, provenance, set_size, frozen_participants,
+        frozen_export_sha256 FROM ${quoted(schema, "analytics_v2_daily_owner_set_bootstrap")} WHERE day = $1`, [today])).rows,
+    [{ day: today, provenance: 2, set_size: 3, frozen_participants: 3, frozen_export_sha256: input.expectedSha256 }]);
+    const heads1 = await publishedRows(pool, schema);
+    // Every stored contribution is the computed owner's daily values, as folded.
+    const stored = (await pool.query(`SELECT owner_digest, daily_values, devices, version FROM ${contributions}
+        WHERE day = $1 ORDER BY owner_digest`, [today])).rows;
+    assert.deepEqual(stored.map((row) => [row.owner_digest, row.version, row.devices]),
+      [[first.ownerDigest, 1, 1], [second.ownerDigest, 1, 1], [third.ownerDigest, 1, 1]]);
+    assert.equal(stored[0].daily_values.day, today);
+    assert.equal(stored[0].daily_values.schemaVersion, "v11-daily-projection-values-v2");
+
+    // The third owner departs (opt-out, disconnect): a re-queued today folds its
+    // saved contribution, so the content and the revision are unchanged.
+    owners.splice(owners.indexOf(third), 1);
+    journal.push({ sequence: journal.length + 1, day: today });
+    const run2 = await runJob({ schema, now, pipeline });
+    assert.deepEqual([run2.published, run2.unchanged], [[], 1]);
+    assert.equal(run2.ownerSets.savedMembersFolded, 1);
+    assert.deepEqual(await publishedRows(pool, schema), heads1);
+
+    // The second owner's evidence for today vanishes: its last contribution is
+    // kept, never read as zero.
+    facts.get(second.ownerDigest).delete(today);
+    journal.push({ sequence: journal.length + 1, day: today });
+    const run3 = await runJob({ schema, now, pipeline });
+    assert.deepEqual([run3.published, run3.unchanged], [[], 1]);
+    assert.deepEqual([run3.ownerSets.contributionRetainedEvidenceAbsent, run3.ownerSets.savedMembersFolded], [1, 1]);
+    assert.deepEqual(await publishedRows(pool, schema), heads1);
+
+    // A contribution the run's kernel cannot fold (another price registry)
+    // blocks the day, which keeps its head and stays queued.
+    const foreign = { ...stored[2].daily_values, registrySha256: "0".repeat(64) };
+    const digests = await a1.ownerSets.analyticsV2ContributionDigests(foreign);
+    await pool.query(`INSERT INTO ${contributions} (day, owner_digest, version, daily_values, values_schema, values_sha256,
+        stable_values_sha256, devices, price_kernel_id, first_revision, run_id, kernel_id, manifest_version)
+        VALUES ($1, $2, 2, $3::jsonb, $4, $5, $6, 1, 1, $7, $8, 1, 1)`, [today, third.ownerDigest, JSON.stringify(foreign),
+      foreign.schemaVersion, digests.valuesSha256, digests.stableValuesSha256, heads1.get(today).revision + 1, randomUUID()]);
+    journal.push({ sequence: journal.length + 1, day: today });
+    const run4 = await runJob({ schema, now, pipeline });
+    assert.deepEqual([run4.published, run4.blocked], [[], [today]]);
+    assert.deepEqual(run4.ownerSets.memberContributionUnavailableDays, [today]);
+    assert.deepEqual(await publishedRows(pool, schema), heads1);
+    assert.deepEqual((await runRows(pool, schema)).at(-1).publication.blocked, [today]);
   });
 });
 

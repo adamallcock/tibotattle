@@ -52,6 +52,9 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 2: K-VENDOR2's export patch of buildPricingEvent and the entry
   // facade's pricing re-exports, met with K-CORE-A at the PROD-PREP merge.
   "f45bc8e89f659bcecfab40c37b81ae130de36ceff7831f0cc0b057328421daef",
+  // Kernel 3: E-OWNERSET's saved owner sets (method v2, owner-sets.ts in the
+  // closure). The integrator renumbers it if another stream registers 3 first.
+  "38860cb120575aeaac42a43a8f6397e19d3db232dc8f53d644a4c8cbd174d7c8",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -86,8 +89,13 @@ function entryFor(identity) {
     cwd: join(WORKER_ROOT, "cloud-run") });
 }
 
+/** The orchestration method the code declares (src/analytics-v2/kernel.ts ANALYTICS_V2_METHOD_VERSION). */
+const METHOD_VERSION = (await readFile(join(WORKER_ROOT, "src", "analytics-v2", "kernel.ts"), "utf8"))
+  .match(/export const ANALYTICS_V2_METHOD_VERSION = "(analytics-v2-method-v[1-9][0-9]{0,5})" as const;/u)?.[1];
+assert.ok(METHOD_VERSION !== undefined, "kernel.ts declares ANALYTICS_V2_METHOD_VERSION");
+
 const named = (entries, identity) => entries.filter((entry) => entry.computeClosureSha256 === identity.computeClosureSha256
-  && entry.vendorManifestSha256 === identity.vendorManifestSha256 && entry.methodVersion === "analytics-v2-method-v1");
+  && entry.vendorManifestSha256 === identity.vendorManifestSha256 && entry.methodVersion === METHOD_VERSION);
 
 test("the registry is closed, numbered 1..n and pinned entry by entry (append-only)", async () => {
   const value = await registry();
@@ -150,6 +158,7 @@ test("the closure holds every module that decides a stored value and no I/O plum
     "apps/worker/src/analytics-v2/compute-community.ts", "apps/worker/src/analytics-v2/native-path.ts",
     "apps/worker/src/analytics-v2/occurrence-source.ts", "apps/worker/src/analytics-v2/owners.ts",
     "apps/worker/src/analytics-v2/devices.ts", "apps/worker/src/analytics-v2/queued-days.ts",
+    "apps/worker/src/analytics-v2/owner-sets.ts",
     "apps/worker/src/telemetry-usage-reconciliation.ts", "apps/worker/src/typed-telemetry-codec.ts",
     "apps/worker/src/telemetry-v12-typed-codec.ts", "apps/worker/cloud-run/analytics-refresh-read.mjs",
     "apps/worker/cloud-run/analytics-refresh-worker.mjs", "packages/telemetry-contract/index.js",
@@ -164,9 +173,9 @@ test("the closure holds every module that decides a stored value and no I/O plum
   assert.equal(report.names.some((name) => name.includes("node_modules")), false);
 });
 
-test("a change to the community fold or the occurrence reader is a closure no entry names, and the build refuses it", async () => {
+test("a change to the community fold, the occurrence reader or the owner-set reader is a closure no entry names, and the build refuses it", async () => {
   const value = await registry();
-  for (const module of ["compute-community.ts", "occurrence-source.ts", "owners.ts"]) {
+  for (const module of ["compute-community.ts", "occurrence-source.ts", "owners.ts", "owner-sets.ts"]) {
     const target = join(WORKER_ROOT, "src", "analytics-v2", module);
     const mutated = await identityWith(async (path, ...rest) => {
       const bytes = await readFile(path, ...rest);

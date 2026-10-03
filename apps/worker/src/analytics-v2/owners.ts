@@ -101,6 +101,10 @@ export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
   "devices.count",
   "queued_days.page",
   "exclusions.read",
+  // E-OWNERSET (owner-sets.ts): saved sets, stored contribution values, the frozen counts.
+  "owner_sets.read",
+  "owner_sets.values",
+  "owner_sets.frozen",
 ] as const);
 export type AnalyticsV2StatementFamily = (typeof ANALYTICS_V2_STATEMENT_FAMILIES)[number];
 

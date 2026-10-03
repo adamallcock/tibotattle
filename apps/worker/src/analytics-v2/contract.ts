@@ -25,7 +25,7 @@ import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
 
 /** Version of this contract; bump with any name or shape change. */
-export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.5" as const;
+export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.6" as const;
 
 /**
  * The analytics_v2 migration: primary role, runtime schema, number assigned in
@@ -66,6 +66,12 @@ export const ANALYTICS_V2_TABLES = Object.freeze({
   journalCursor: "analytics_v2_journal_cursor",
   // K-STAMP (staged migration analytics_v2_run_stamps): kernel-registry.json's copy.
   kernels: "analytics_v2_kernels",
+  // E-OWNERSET (staged migration analytics_v2_owner_sets): each published
+  // day's saved owner set S(d), its members' versioned contributions, and the
+  // frozen-window bootstrap receipt (owner-set-contract below).
+  dailyOwnerSets: "analytics_v2_daily_owner_sets",
+  dailyContributions: "analytics_v2_daily_contributions",
+  ownerSetBootstrap: "analytics_v2_daily_owner_set_bootstrap",
 } as const);
 export type AnalyticsV2TableKey = keyof typeof ANALYTICS_V2_TABLES;
 export type AnalyticsV2TableName = (typeof ANALYTICS_V2_TABLES)[AnalyticsV2TableKey];
@@ -108,6 +114,18 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
     "kernel_id", "production_commit", "vendor_manifest_sha256", "compute_closure_sha256",
     "price_registry_sha256", "price_registry_version", "method_version", "registered_at",
   ] as const),
+  dailyOwnerSets: Object.freeze([
+    "day", "owner_digest", "first_revision", "provenance", "run_id", "kernel_id", "manifest_version",
+  ] as const),
+  dailyContributions: Object.freeze([
+    "day", "owner_digest", "version", "evidence_fp", "daily_values", "values_schema", "values_sha256",
+    "stable_values_sha256", "devices", "price_basis_id", "price_kernel_id", "first_revision", "run_id",
+    "kernel_id", "manifest_version",
+  ] as const),
+  ownerSetBootstrap: Object.freeze([
+    "day", "provenance", "set_size", "frozen_participants", "frozen_export_sha256", "first_revision", "run_id",
+    "kernel_id", "manifest_version",
+  ] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 /** Primary keys. Singletons (preview, journal cursor) use id = 1. */
@@ -121,7 +139,30 @@ export const ANALYTICS_V2_PRIMARY_KEYS = Object.freeze({
   preview: Object.freeze(["id"] as const),
   journalCursor: Object.freeze(["id"] as const),
   kernels: Object.freeze(["kernel_id"] as const),
+  dailyOwnerSets: Object.freeze(["day", "owner_digest"] as const),
+  dailyContributions: Object.freeze(["day", "owner_digest", "version"] as const),
+  ownerSetBootstrap: Object.freeze(["day"] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
+
+/**
+ * The offline owner purge's analytics_v2 inventory: every table that holds
+ * an owner's rows, keyed by its owner_digest column, in the order the purge
+ * deletes them (a contribution before its set row, which it references). The
+ * running service never deletes from them (owner decision D2, Variant B); the
+ * purge (PURGE-1, owner tooling) names the owner in
+ * tibotattle.analytics_v2_offline_purge for the saved-set tables, then
+ * republishes the affected days over the smaller set (owner decision round
+ * 7). A spec compares this list with the migrated catalog: an analytics_v2
+ * table with an owner_digest column that is not listed fails it.
+ */
+export const ANALYTICS_V2_OWNER_SCOPED_TABLES = Object.freeze([
+  "ownerDay",
+  "cacheBands",
+  "ownerFits",
+  "ownerModelDates",
+  "dailyContributions",
+  "dailyOwnerSets",
+] as const satisfies readonly AnalyticsV2TableKey[]);
 
 export const ANALYTICS_V2_SINGLETON_ID = 1 as const;
 
@@ -289,14 +330,142 @@ export interface AnalyticsV2OwnerModelDateRow {
 }
 
 /**
+ * Saved owner sets (E-OWNERSET, engine v2 design section 6.2; owner decision
+ * round 2: past contributions are kept). A published day d folds its saved
+ * set S(d) plus every computed owner with non-empty daily values on d:
+ * - "computed": an owner this run computed, with non-empty values on d; it
+ *   folds those values and its device count. When it is not yet in S(d) the
+ *   publication adds it; when its values or devices differ from its current
+ *   contribution, a new contribution version is appended;
+ * - "retained": a computed member of S(d) whose read for d is empty: it folds
+ *   its current contribution (never a zero), counted as
+ *   contributionRetainedEvidenceAbsent;
+ * - "saved": a member of S(d) this run did not compute (disconnected, opted
+ *   out, not ported, refused by the memory budget): it folds its current
+ *   contribution;
+ * - "excluded": a member of S(d) with an active community aggregate exclusion
+ *   on d (N-EXCL): it stays in S(d) and folds nothing.
+ * A member whose current contribution cannot be folded under the run's
+ * kernel (its values schema or price identity is not current; K-REPRICE
+ * reprices them after cutover) blocks the day instead
+ * (memberContributionUnavailableDays): never a zero, never dropped.
+ */
+export const ANALYTICS_V2_DAILY_MEMBER_ORIGINS = Object.freeze(["computed", "retained", "saved", "excluded"] as const);
+export type AnalyticsV2DailyMemberOrigin = (typeof ANALYTICS_V2_DAILY_MEMBER_ORIGINS)[number];
+
+/**
+ * One member of a candidate day's owner set after its publication. `values`
+ * and `devices` are the computed member's fresh fold inputs (null for the
+ * others, whose stored contribution is folded or, excluded, nothing).
+ * `savedVersion` is the contribution version the fold read for a retained or
+ * saved member (null for computed and excluded members): the store refuses
+ * the run when it is no longer the member's current version.
+ */
+export interface AnalyticsV2DailyMember {
+  readonly ownerDigest: AnalyticsV2OwnerDigest;
+  readonly origin: AnalyticsV2DailyMemberOrigin;
+  readonly values: AnalyticsV2KernelValue | null;
+  readonly devices: number | null;
+  readonly savedVersion: number | null;
+}
+
+/** analytics_v2_daily_owner_sets.provenance (see the staged owner-sets migration). */
+export const ANALYTICS_V2_OWNER_SET_PROVENANCE = Object.freeze({
+  /** Recorded at a GCP publication outside the frozen window, or added to an existing set. */
+  published: 1,
+  /** The participants at GCP's first publication of a frozen-window day, counted equal to Cloudflare's. */
+  cutoverVerified: 2,
+  /** The same, with a different count or no Cloudflare publication of the day (disclosed). */
+  cutoverDisclosed: 3,
+} as const);
+
+/**
+ * The first recording of a frozen-window day's set (owner decision round 7:
+ * the participants at GCP's first publication, compared with the frozen
+ * Cloudflare export's contributingParticipants and disclosed when they
+ * differ). Null for every other publication: its new members take
+ * provenance 1.
+ */
+export interface AnalyticsV2OwnerSetBootstrap {
+  readonly provenance: 2 | 3;
+  /** The frozen export's contributingParticipants for the day; null when it did not publish it. */
+  readonly frozenParticipants: number | null;
+  readonly frozenExportSha256: string;
+}
+
+/**
  * A computed community daily payload for a queued day. A-3 publishes it only
  * when payloadSha256 differs from the stored row: revision =
- * max(previous, revisionSeed) + 1 and released_at = nowMs.
+ * max(previous, revisionSeed) + 1 and released_at = nowMs. A publication
+ * also records the day's owner set (`members`, in owner-digest order) and
+ * its contributions; an unchanged candidate records nothing.
  */
 export interface AnalyticsV2DailyCandidate {
   readonly day: AnalyticsV2Day;
   readonly payload: AnalyticsV2KernelValue;
   readonly payloadSha256: string;
+  readonly members: readonly AnalyticsV2DailyMember[];
+  readonly bootstrap: AnalyticsV2OwnerSetBootstrap | null;
+}
+
+/**
+ * A member of a day's saved set as the read snapshot holds it (A-1
+ * owner-sets.ts readAnalyticsV2OwnerSetState): its current contribution's
+ * version, device count and values digest. The values themselves are loaded
+ * only for the members a fold needs them for.
+ */
+export interface AnalyticsV2SavedMember {
+  readonly version: number;
+  readonly devices: number;
+  readonly valuesSha256: string;
+}
+
+/** One queued day's saved set, and whether its frozen-window bootstrap receipt exists. */
+export interface AnalyticsV2SavedDay {
+  readonly members: ReadonlyMap<AnalyticsV2OwnerDigest, AnalyticsV2SavedMember>;
+  readonly bootstrapped: boolean;
+}
+
+/**
+ * The frozen Cloudflare export's per-day contributingParticipants (C-IPR),
+ * over its whole window [fromDay, throughDay]; a window day it did not
+ * publish has no entry.
+ */
+export interface AnalyticsV2FrozenParticipants {
+  readonly exportSha256: string;
+  readonly fromDay: AnalyticsV2Day;
+  readonly throughDay: AnalyticsV2Day;
+  readonly participants: ReadonlyMap<AnalyticsV2Day, number>;
+}
+
+/**
+ * The owner-set state a run folds with: every queued day's saved set (a day
+ * without one maps to an empty set) and, when some queued day without a set
+ * lies inside the frozen window, the frozen counts (otherwise null).
+ */
+export interface AnalyticsV2OwnerSetState {
+  readonly days: ReadonlyMap<AnalyticsV2Day, AnalyticsV2SavedDay>;
+  readonly frozen: AnalyticsV2FrozenParticipants | null;
+}
+
+/** One stored contribution to load: a member's version of one day. */
+export interface AnalyticsV2ContributionKey {
+  readonly day: AnalyticsV2Day;
+  readonly ownerDigest: AnalyticsV2OwnerDigest;
+  readonly version: number;
+}
+
+/**
+ * The run's owner-set outcome (content-free counts and days), recorded in
+ * analytics_v2_runs.publication.ownerSets and the Job receipt.
+ */
+export interface AnalyticsV2OwnerSetSummary {
+  /** Candidate-day folds of a computed member's retained contribution (its read for the day was empty). */
+  readonly contributionRetainedEvidenceAbsent: number;
+  /** Candidate-day folds of a saved member this run did not compute. */
+  readonly savedMembersFolded: number;
+  /** Queued days blocked because a member's contribution could not be folded (member_contribution_unavailable). */
+  readonly memberContributionUnavailableDays: readonly AnalyticsV2Day[];
 }
 
 /** analytics_v2_published_daily as stored and served. */
@@ -314,6 +483,17 @@ export interface AnalyticsV2PublicationSummary {
   readonly unchanged: readonly AnalyticsV2Day[];
   /** Days with a conflict row or an unprepared eligible owner; each keeps its prior revision. */
   readonly blocked: readonly AnalyticsV2Day[];
+  /** What the published days recorded in their owner sets (E-OWNERSET). */
+  readonly ownerSets: AnalyticsV2OwnerSetWriteSummary;
+}
+
+/** The owner-set rows one run's publications appended (counts and days only). */
+export interface AnalyticsV2OwnerSetWriteSummary extends AnalyticsV2OwnerSetSummary {
+  readonly membersAdded: number;
+  readonly contributionVersions: number;
+  /** Frozen-window days whose set this run recorded first, by provenance. */
+  readonly bootstrapVerifiedDays: readonly AnalyticsV2Day[];
+  readonly bootstrapDisclosedDays: readonly AnalyticsV2Day[];
 }
 
 /** Wall-time phases recorded per run (milliseconds). */
@@ -340,6 +520,8 @@ export interface AnalyticsV2RunOutputs {
   readonly ownerModelDates: readonly AnalyticsV2OwnerModelDateRow[];
   readonly dailyCandidates: readonly AnalyticsV2DailyCandidate[];
   readonly blockedDays: readonly AnalyticsV2Day[];
+  /** The fold's owner-set outcome (E-OWNERSET). */
+  readonly ownerSets: AnalyticsV2OwnerSetSummary;
   /**
    * The admin community allowance preview (v0.3), or null when it is withheld
    * (an effective owner without a current fits result) or cannot be built.

@@ -128,6 +128,22 @@ export async function listStagedMigrations(role, {
 }
 
 /**
+ * The one migration of `role` whose name ends with `suffix`, staged or
+ * promoted: a file staged under a placeholder number is renamed when the
+ * integrator promotes it, so a spec names it by suffix and passes the result
+ * as a staged file (the harness skips it once promoted). Exactly one must
+ * exist across both places.
+ */
+export async function stagedOrPromotedMigrationName(role, suffix) {
+  assertRole(role);
+  if (typeof suffix !== "string" || !/^_[a-z][a-z0-9_-]*\.sql$/u.test(suffix)) fail("STAGED_MIGRATION_SELECTION_INVALID");
+  const [staged, stock] = await Promise.all([listStagedMigrations(role), readPostgresMigrations({ role })]);
+  const found = [...staged, ...stock].filter(({ name }) => name.endsWith(suffix));
+  if (found.length !== 1) fail("STAGED_MIGRATION_SELECTION_INVALID");
+  return found[0].name;
+}
+
+/**
  * Resolve a spec's named staged files against the staged listing and the
  * stock set without touching PostgreSQL. A name already present in the
  * stock set was promoted and is skipped; the same name in both places, or a

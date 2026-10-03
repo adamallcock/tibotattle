@@ -8,6 +8,12 @@
  * unchanged digest keeps the row untouched, and a blocked day is never
  * written, so it keeps its prior row (or stays absent). The preview row is
  * upserted. Moved out of store.ts unchanged in behaviour.
+ *
+ * nextPublishedRevision is the single place a publication's
+ * revision is decided. Every record of that revision takes the value it
+ * returns: the head here, and the owner-set rows and contribution versions
+ * the same publication appends (store-owner-sets.ts, first_revision), so a
+ * change to the rule (REV-SEED's per-day floor) reaches all of them at once.
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -29,10 +35,29 @@ import {
   type StoredHeadRow,
 } from "./store-run";
 
-/** Publish the changed daily candidates; returns the published and unchanged days, in candidate order. */
+/**
+ * The revision a publication of a day takes: one above the day's current
+ * head and above the run's revision seed. The single publication helper (see
+ * the module comment).
+ */
+export function nextPublishedRevision(input: {
+  readonly headRevision: number | null; readonly revisionSeed: number;
+}): number {
+  const head = input.headRevision ?? 0;
+  if (!Number.isSafeInteger(head) || head < 0 || !Number.isSafeInteger(input.revisionSeed) || input.revisionSeed < 0) {
+    fail("ANALYTICS_V2_STATE_INVALID", "publishedDaily.revision");
+  }
+  return Math.max(head, input.revisionSeed) + 1;
+}
+
+/**
+ * Publish the changed daily candidates; returns the published and unchanged
+ * days, in candidate order, and the revision each published day took.
+ */
 export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, schema: string,
   prepared: PreparedOutputs, runId: string, releasedAt: string, stamp: AnalyticsV2RunStamp): Promise<{
     readonly published: AnalyticsV2Day[]; readonly unchanged: AnalyticsV2Day[];
+    readonly revisions: ReadonlyMap<AnalyticsV2Day, number>;
   }> {
   const tables = ANALYTICS_V2_TABLES;
   // Published heads: write only days whose content digest changed. Blocked
@@ -56,6 +81,7 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
   }
   const published: AnalyticsV2Day[] = [];
   const unchanged: AnalyticsV2Day[] = [];
+  const revisions = new Map<AnalyticsV2Day, number>();
   const publishRows: unknown[] = [];
   for (const candidate of prepared.dailyCandidates) {
     const head = heads.get(candidate.day);
@@ -63,7 +89,9 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
       unchanged.push(candidate.day);
       continue;
     }
-    const revision = Math.max(head?.revision ?? 0, prepared.revisionSeed) + 1;
+    const revision = nextPublishedRevision({ headRevision: head?.revision ?? null,
+      revisionSeed: prepared.revisionSeed });
+    revisions.set(candidate.day, revision);
     const payload = stampAnalyticsV2DailyPayload(candidate.payload, {
       day: candidate.day,
       revision,
@@ -113,7 +141,7 @@ export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, sch
     publishRows,
     "dailyCandidates",
     "ANALYTICS_V2_PUBLICATION_CONFLICT");
-  return { published, unchanged };
+  return { published, unchanged, revisions };
 }
 
 /** Upsert the preview singleton (null when the run withheld it). */

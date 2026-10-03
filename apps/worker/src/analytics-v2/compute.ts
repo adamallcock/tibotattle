@@ -148,6 +148,7 @@ import {
   ANALYTICS_V2_CONTRACT_VERSION,
   ANALYTICS_V2_DAY_PATTERN,
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
+  ANALYTICS_V2_SHA256_PATTERN,
   type AnalyticsV2CacheBandRow,
   type AnalyticsV2Day,
   type AnalyticsV2Owner,
@@ -156,6 +157,7 @@ import {
   type AnalyticsV2OwnerFitsRow,
   type AnalyticsV2OwnerModelDateRow,
   type AnalyticsV2OwnerResources,
+  type AnalyticsV2OwnerSetState,
   type AnalyticsV2OwnerSource,
   type AnalyticsV2Phase,
   type AnalyticsV2Refusal,
@@ -163,6 +165,8 @@ import {
 } from "./contract";
 import {
   ANALYTICS_V2_MODEL_DATES,
+  analyticsV2NeededContributions,
+  analyticsV2SavedValueKey,
   buildAnalyticsV2Community,
   type AnalyticsV2ComputedDailyCandidate,
 } from "./compute-community";
@@ -308,6 +312,19 @@ export interface ComputeAnalyticsV2Input {
    * Every key must be an owner of the run (of any source). Defaults to none.
    */
   readonly exclusions?: ReadonlyMap<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>;
+  /**
+   * E-OWNERSET (owner-sets.ts, compute-community.ts): the queued days' saved
+   * owner sets and the frozen counts read in the run's snapshot, and a loader
+   * for the stored contribution values the fold needs (keys as
+   * analyticsV2ContributionKey). Defaults to no saved set and no frozen
+   * export, for callers that publish nothing; the store refuses a
+   * publication whose stored set differs from the one folded.
+   */
+  readonly ownerSets?: {
+    readonly state: AnalyticsV2OwnerSetState;
+    readonly loadValues: (keys: ReadonlyArray<{ readonly day: AnalyticsV2Day;
+      readonly ownerDigest: AnalyticsV2OwnerDigest; readonly version: number }>) => Promise<ReadonlyMap<string, unknown>>;
+  };
   /**
    * K-PAR: computes admitted effective owners outside the main thread (the
    * Job's compute workers). Requires `loadOwnerOccurrences`; the pool asks it
@@ -548,6 +565,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     || typeof ownerPool.abort !== "function" || !Number.isSafeInteger(ownerPool.workers) || ownerPool.workers < 1
     || loader === undefined)) invalid("ownerPool");
   const checkpoint = input.checkpoint ?? ((): void => {});
+  const ownerSetInput = validOwnerSetInput(input.ownerSets, queued);
   const ownerSet = new Set(owners.map((owner) => owner.ownerDigest));
   const effectiveDigests = owners.filter((owner) => owner.source === "effective").map((owner) => owner.ownerDigest);
   const exclusions = new Map<AnalyticsV2OwnerDigest, readonly AnalyticsV2ExclusionInterval[]>();
@@ -861,9 +879,26 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
 
   // ---- Community outputs.
   checkpoint(Object.freeze({ kind: "community", accountBytes }));
+  // The saved contributions the fold needs (E-OWNERSET), loaded once and
+  // held to the output account as the held input they are.
+  const needed = analyticsV2NeededContributions({ queued, ownerSets: ownerSetInput.state, computedOwners,
+    dailyValues, exclusions });
+  const savedValues = new Map<string, unknown>();
+  if (needed.length > 0) {
+    const loaded = await ownerSetInput.loadValues(Object.freeze(needed.map((key) => Object.freeze({ ...key }))));
+    if (!(loaded instanceof Map)) invalid("ownerSets.loadValues");
+    for (const key of needed) {
+      const name = analyticsV2SavedValueKey(key.day, key.ownerDigest, key.version);
+      if (!loaded.has(name)) continue;
+      const value = loaded.get(name);
+      charge(analyticsV2OutputRowBytes(value));
+      savedValues.set(name, value);
+    }
+  }
   const community = await timed("community", () => buildAnalyticsV2Community({ nowMs,
     revisionSeed: input.revisionSeed, queued, blockers, dailyValues, computedOwners, effectiveDigests,
-    devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions }));
+    devicesByDay: input.devicesByDay, fitsByOwner, modelDates, compositionsByDate, modelRefusedByDate, exclusions,
+    ownerSets: ownerSetInput.state, savedValues }));
 
   return {
     contractVersion: ANALYTICS_V2_CONTRACT_VERSION,
@@ -878,6 +913,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
     ownerModelDates,
     dailyCandidates: community.dailyCandidates,
     blockedDays: community.blockedDays,
+    ownerSets: community.ownerSets,
     preview: community.preview,
     refusals: refusals.sort(compareAnalyticsV2Refusals),
     journal: { lastSequence },
@@ -889,6 +925,49 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
       account: Object.freeze({ heldInputBytes, accountBytes, outputBudgetBytes }),
     }),
   };
+}
+
+const NO_OWNER_SETS_LOADER = async (): Promise<ReadonlyMap<string, unknown>> => new Map();
+
+/**
+ * The owner-set input (E-OWNERSET), validated: a state for queued days only,
+ * each set's members with positive versions and device counts, the frozen
+ * counts well formed. Absent: no saved set and no frozen export.
+ */
+function validOwnerSetInput(value: ComputeAnalyticsV2Input["ownerSets"], queued: readonly AnalyticsV2Day[]): {
+  readonly state: AnalyticsV2OwnerSetState;
+  readonly loadValues: NonNullable<ComputeAnalyticsV2Input["ownerSets"]>["loadValues"];
+} {
+  if (value === undefined) return { state: Object.freeze({ days: new Map(), frozen: null }), loadValues: NO_OWNER_SETS_LOADER };
+  if (value === null || typeof value !== "object" || typeof value.loadValues !== "function"
+    || value.state === null || typeof value.state !== "object" || !(value.state.days instanceof Map)) invalid("ownerSets");
+  const queuedSet = new Set(queued);
+  for (const [day, saved] of value.state.days) {
+    if (!queuedSet.has(day) || saved === null || typeof saved !== "object" || !(saved.members instanceof Map)
+      || typeof saved.bootstrapped !== "boolean") invalid("ownerSets.days");
+    for (const [ownerDigest, member] of saved.members) {
+      if (!ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(ownerDigest) || member === null || typeof member !== "object"
+        || !Number.isSafeInteger(member.version) || member.version < 1 || !Number.isSafeInteger(member.devices)
+        || member.devices < 1 || typeof member.valuesSha256 !== "string"
+        || !ANALYTICS_V2_SHA256_PATTERN.test(member.valuesSha256)) invalid("ownerSets.members");
+    }
+  }
+  const frozen = value.state.frozen;
+  if (frozen !== null) {
+    if (typeof frozen !== "object" || typeof frozen.exportSha256 !== "string"
+      || !ANALYTICS_V2_SHA256_PATTERN.test(frozen.exportSha256) || !(frozen.participants instanceof Map)) {
+      invalid("ownerSets.frozen");
+    }
+    dayStart(frozen.fromDay, "ownerSets.frozen"); dayStart(frozen.throughDay, "ownerSets.frozen");
+    if (frozen.fromDay > frozen.throughDay) invalid("ownerSets.frozen");
+    for (const [day, count] of frozen.participants) {
+      dayStart(day, "ownerSets.frozen");
+      if (day < frozen.fromDay || day > frozen.throughDay || !Number.isSafeInteger(count) || count < 0) {
+        invalid("ownerSets.frozen");
+      }
+    }
+  }
+  return { state: value.state, loadValues: value.loadValues };
 }
 
 /** A worker's or the inline owner's progress event, tagged with its owner's checkpoint index. */

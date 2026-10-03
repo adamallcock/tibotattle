@@ -77,6 +77,8 @@ export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
   // A-1: contributing devices and the queued days.
   "apps/worker/src/analytics-v2/devices.ts",
   "apps/worker/src/analytics-v2/queued-days.ts",
+  // E-OWNERSET: the saved owner sets, stored contributions and frozen counts a fold reads.
+  "apps/worker/src/analytics-v2/owner-sets.ts",
 ]);
 /**
  * I/O plumbing (repository paths): never in the closure and never walked
