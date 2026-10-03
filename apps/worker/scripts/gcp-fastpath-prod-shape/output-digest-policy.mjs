@@ -41,7 +41,7 @@ export function semanticOutputRow(table, row) {
 }
 /** Validate projected-out stamps before hashing; a wrong stamp cannot disappear. Fresh-run schemas only. */
 export async function assertOutputProvenance(pool, schema, { kernelId, computeSha256, manifestVersion = 1, expectedRunCount = 1 } = {}) {
-  if (!identifier.test(schema) || ![4, 5].includes(kernelId) || !/^[0-9a-f]{64}$/u.test(computeSha256)
+  if (!identifier.test(schema) || ![4, 5, 6].includes(kernelId) || !/^[0-9a-f]{64}$/u.test(computeSha256)
       || !Number.isSafeInteger(manifestVersion) || manifestVersion < 1
       || !Number.isSafeInteger(expectedRunCount) || expectedRunCount < 1 || expectedRunCount > 2) fail("MEAS_OUTPUT_PROVENANCE_BINDING_INVALID");
   const q = `"${schema}"`;
@@ -85,7 +85,7 @@ export async function assertOutputProvenance(pool, schema, { kernelId, computeSh
   }
   const classes = ["analytics_v2_pricing_classes", "analytics_v2_kernel_pricing_classes", "analytics_v2_transition_proofs"];
   const classCount = classes.filter((table) => present.has(table)).length;
-  if (kernelId === 5 && classCount !== 3 || kernelId === 4 && classCount !== 0) fail("MEAS_OUTPUT_CLASS_SCHEMA_INVALID");
+  if ([5, 6].includes(kernelId) && classCount !== 3 || kernelId === 4 && classCount !== 0) fail("MEAS_OUTPUT_CLASS_SCHEMA_INVALID");
   if (classCount === 3) {
     for (const [table, required] of Object.entries(PRICING_CLASS_SCHEMA)) {
       const actual = [...present.get(table)].sort();

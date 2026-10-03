@@ -157,6 +157,10 @@ function parseArguments(argv) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-dir and --cpu-profile-summary need --cpu-profile");
   }
   options.profile = measureProfile(options.profile);
+  workerProfileEnv(options);
+  if (options.workerProfileDir !== null && (options.profile.workers < 2 || options.importOnly || options.guardProbe)) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "Worker profiling requires one local parallel refresh");
+  }
   return options;
 }
 

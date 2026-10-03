@@ -65,3 +65,27 @@ test("every projected run identity must link to a completed expected run, includ
     }
   }
 });
+
+
+test("kernel 6 retains strict pricing-class presence, provenance and raw evidence", async () => {
+  const six = { ...binding, kernelId: 6 };
+  const result = await collectOutputDigestEvidence(pool(), "synthetic", six);
+  assert.equal(result.provenance.pricingClassTables, 3);
+  assert.equal(result.provenance.expectedRunCount, 1);
+  for (const table of Object.keys(PRICING_CLASS_SCHEMA)) {
+    assert.equal(result.tables[table].rawSha256, "a".repeat(64));
+    assert.equal(result.tables[table].semanticSha256, "b".repeat(64));
+    await assert.rejects(assertOutputProvenance(pool({ catalog: columns.filter((row) => row.table_name !== table) }),
+      "synthetic", six), { code: "MEAS_OUTPUT_CLASS_SCHEMA_INVALID" });
+  }
+  for (const bad of ["kernel_id IS DISTINCT FROM", "compute_sha256 IS DISTINCT FROM", "manifest_version IS DISTINCT FROM",
+    "first_kernel_id IS DISTINCT FROM", "state <>", "c.cards_sha256 IS DISTINCT FROM", "p.method NOT IN"])
+    await assert.rejects(collectOutputDigestEvidence(pool({ bad }), "synthetic", six),
+      { code: /MEAS_OUTPUT_PROVENANCE_INVALID/u });
+  await assert.rejects(assertOutputProvenance(pool(), "synthetic", { ...six, kernelId: 7 }),
+    { code: "MEAS_OUTPUT_PROVENANCE_BINDING_INVALID" });
+  const legacyCatalog = columns.filter((row) => !Object.hasOwn(PRICING_CLASS_SCHEMA, row.table_name));
+  assert.equal((await assertOutputProvenance(pool({ catalog: legacyCatalog }), "synthetic", { ...six, kernelId: 4 })).pricingClassTables, 0);
+  await assert.rejects(assertOutputProvenance(pool(), "synthetic", { ...six, kernelId: 4 }),
+    { code: "MEAS_OUTPUT_CLASS_SCHEMA_INVALID" });
+});
