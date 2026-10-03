@@ -287,14 +287,20 @@ export function migrateJobCommand({ image, expectedCounts }) {
  * one read chunk, the output account). It is the MEAS-3 measurement of the
  * Workers' heap peaks on real owners, which the production profile waits for
  * (K-CORE-A review); it is not the production profile.
+ *
+ * semiSpaceMiB (owner decisions round 19, item SEMI): the inline profiles run
+ * V8's semi-space at 64 MiB (--max-semi-space-size), as the production job
+ * does; the job excludes the young generation it adds from the output budget.
+ * dense-workers sets none (null): a V8 flag applies to every Worker isolate,
+ * and the compute Workers' memory is K-PAR-MEM's to settle.
  */
 export const REFRESH_JOB_PROFILES = Object.freeze({
-  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, workers: 1, taskTimeoutSeconds: 7_200,
-    env: Object.freeze([]) }),
-  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, workers: 1, taskTimeoutSeconds: 14_400,
-    env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
-  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, workers: 4, taskTimeoutSeconds: 14_400,
-    env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
+  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, semiSpaceMiB: 64, workers: 1,
+    taskTimeoutSeconds: 7_200, env: Object.freeze([]) }),
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, semiSpaceMiB: 64, workers: 1,
+    taskTimeoutSeconds: 14_400, env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
+  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, semiSpaceMiB: null, workers: 4,
+    taskTimeoutSeconds: 14_400, env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
 });
 /** The default (standard) profile; the local rehearsal runs its heap. */
 export const REFRESH_JOB_RESOURCES = REFRESH_JOB_PROFILES.standard;
@@ -316,6 +322,7 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
   const resources = refreshProfile(profile);
   const args = [
     `--max-old-space-size=${resources.heapMiB}`,
+    ...(resources.semiSpaceMiB === null ? [] : [`--max-semi-space-size=${resources.semiSpaceMiB}`]),
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
     ...(resources.workers > 1 ? [`--workers=${resources.workers}`] : []),
@@ -752,7 +759,8 @@ Steps:
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
                    heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h;
-                   dense-workers: dense with four compute Workers and a 3,072 MiB main heap, for MEAS-3)
+                   both with a 64 MiB semi-space; dense-workers: dense with four compute Workers, a 3,072 MiB
+                   main heap and the default semi-space, for MEAS-3)
   origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
                    (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded

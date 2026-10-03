@@ -348,15 +348,19 @@ export const LOGGING_POSTURE = Object.freeze({
  * ANALYTICS_REFRESH_PRODUCTION_JOB; the test-deploy profile `dense-workers`
  * measures them). The manifest check holds this profile equal to the
  * measurement profile and the render equal to analytics-refresh.mjs
- * ANALYTICS_REFRESH_PRODUCTION_JOB (args, CPU, memory, heap, workers, task
- * timeout, retries, tasks and env), and proves the budget and the task memory
- * against that module's exported bounds.
+ * ANALYTICS_REFRESH_PRODUCTION_JOB (args, CPU, memory, heap, semi-space,
+ * workers, task timeout, retries, tasks and env), and proves the budget and
+ * the task memory against that module's exported bounds. semiSpaceMiB is
+ * V8's semi-space (--max-semi-space-size; owner decisions round 19, item
+ * SEMI): it cuts the scavenges of the young generation, and the job excludes
+ * the young generation it adds from the output budget.
  */
 export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
   name: "dense",
   cpu: "4",
   memory: "16Gi",
   heapMiB: 12_288,
+  semiSpaceMiB: 64,
   memoryBudgetMiB: 10_752,
   workers: 1,
   timeoutSeconds: 14_400,
@@ -365,7 +369,8 @@ export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
 /**
  * The production refresh-job contract (C-REFRESH implements it; OPS-2
  * renders it). Invocation: node --max-old-space-size=<heap>
- * dist/analytics-refresh.mjs --mode=full (and --workers=<n> only for a profile
+ * --max-semi-space-size=<semi> dist/analytics-refresh.mjs --mode=full (and
+ * --workers=<n> only for a profile
  * with compute Workers), with no --schema and no --now; the real clock is used. Configuration comes from exactly the closed env below.
  * DEPLOYMENT_SOURCE_COMMIT is deployment provenance, not configuration: OPS-2
  * renders it and OPS-10's roll moves it on every job. ANALYTICS_V2_TEST_CLOCK
@@ -453,6 +458,7 @@ export const JOB_DEFINITIONS = Object.freeze({
   "analytics-refresh": Object.freeze({
     account: "runtime",
     args: Object.freeze([`--max-old-space-size=${ANALYTICS_REFRESH_TASK_PROFILE.heapMiB}`,
+      `--max-semi-space-size=${ANALYTICS_REFRESH_TASK_PROFILE.semiSpaceMiB}`,
       ANALYTICS_REFRESH_JOB_CONTRACT.entry, ANALYTICS_REFRESH_JOB_CONTRACT.mode,
       ...(ANALYTICS_REFRESH_TASK_PROFILE.workers > 1 ? [`--workers=${ANALYTICS_REFRESH_TASK_PROFILE.workers}`] : [])]),
     timeoutSeconds: ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,

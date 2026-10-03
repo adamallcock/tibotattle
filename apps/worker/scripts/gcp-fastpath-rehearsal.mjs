@@ -176,6 +176,13 @@ const PUBLISHED_ALLOWANCE_STATE = Object.freeze({ allowanceState: "ready", allow
  * its check): the job's default memory budget needs it.
  */
 export const GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB = 6_144;
+/**
+ * V8's semi-space for an inline rehearsal refresh, as the deployed inline Job
+ * runs it (REFRESH_JOB_RESOURCES.semiSpaceMiB, pinned equal by its check;
+ * owner decisions round 19, item SEMI). A run with compute Workers sets none,
+ * as the dense-workers profile does.
+ */
+export const GCP_FASTPATH_REHEARSAL_REFRESH_SEMI_SPACE_MIB = 64;
 
 class RehearsalError extends Error {
   constructor(code, details = {}) {
@@ -349,6 +356,7 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes,
   let exitCode = 0;
   try {
     ({ stdout, stderr } = await execFileAsync(node22, [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`,
+      ...(workers > 1 ? [] : [`--max-semi-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_SEMI_SPACE_MIB}`]),
       DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`,
       ...(workers > 1 ? [`--workers=${workers}`] : [])], {
       cwd: CLOUD_RUN_ROOT,
