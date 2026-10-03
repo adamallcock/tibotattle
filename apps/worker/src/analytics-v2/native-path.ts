@@ -357,9 +357,18 @@ function usageReader(days: readonly AnalyticsV2PreparedDay[]) {
 /**
  * The native paged quota acquisition (storage-effective-history.ts
  * advanceStorageEffectiveAnalysis, acquisition phase, without a prepared
- * store): one 200-row page per call, stopping at every phase boundary; each
- * phase rewinds to the first quota day with the window ordinal at zero, and
- * the ordinal runs across the window's days within a phase.
+ * store): 200-row pages, stopping at every phase boundary; each phase rewinds
+ * to the first quota day with the window ordinal at zero, and the ordinal runs
+ * across the window's days within a phase.
+ *
+ * Production's effective lane spends one call per page because it stages a
+ * checkpoint between D1 statements. Here nothing is staged, so each call takes
+ * every page of its phase (REFRESH-OPT d2): one checkpoint validation and one
+ * state rebuild per phase instead of per page, which made a window's
+ * acquisition quadratic in its quota rows. advanceV11QuotaAcquisition returns
+ * the same deterministic successor whatever the page grouping (production's
+ * typed history lane, storage-v11-history.ts, groups pages the same way), and
+ * stopAtPhaseBoundary still ends each call where the phase rewinds.
  */
 async function pagedQuotaAcquisition(identity: V11QuotaAcquisitionIdentity, quotaDays: readonly string[],
   occurrencesOf: (day: string) => readonly EffectiveTelemetryOccurrence[], throughDay: string):
@@ -368,10 +377,12 @@ Promise<V11CompletedQuotaAcquisition | { status: "not_testable"; reason: string 
   const first = (): { day: string; complete: boolean } => ({ day: quotaDays[0] ?? throughDay,
     complete: quotaDays.length === 0 });
   const cursor = { phase: "plan" as V11QuotaAcquisitionCheckpoint["phase"], ...first(), offset: 0, ordinal: 0 };
-  // Every row is read once per phase (four phases), one page per call.
+  // Every row is read once per phase (four phases): at most phasePages pages,
+  // all of them in the phase's one call.
   let rows = 0;
   for (const day of quotaDays) rows += occurrencesOf(day).length;
-  const maximumCalls = 4 * (Math.ceil(rows / PAGE_SIZE) + quotaDays.length + 2);
+  const phasePages = Math.ceil(rows / PAGE_SIZE) + quotaDays.length + 2;
+  const maximumCalls = 4 * phasePages;
   for (let call = 0; call < maximumCalls; call += 1) {
     if (cursor.phase !== acquisition.phase) {
       Object.assign(cursor, { phase: acquisition.phase, ...first(), offset: 0, ordinal: 0 });
@@ -393,8 +404,8 @@ Promise<V11CompletedQuotaAcquisition | { status: "not_testable"; reason: string 
       },
     };
     const step = await advanceV11QuotaAcquisition(reader, identity,
-      { remainingQueries: 1, deadlineMs: Number.MAX_SAFE_INTEGER, now: () => 0 }, acquisition,
-      { maxPages: 1, stopAtPhaseBoundary: true });
+      { remainingQueries: phasePages, deadlineMs: Number.MAX_SAFE_INTEGER, now: () => 0 }, acquisition,
+      { maxPages: phasePages, stopAtPhaseBoundary: true });
     if (step.status === "not_testable") return step;
     if (step.status === "complete") {
       return { identity: step.identity, planAnchors: step.planAnchors, quotaRows: step.quotaRows };
