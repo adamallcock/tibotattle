@@ -69,6 +69,10 @@ const PINNED_PATCH_SPECS = [
 const PINNED_SOURCE_PATCHES = [
   ["apps/worker/src/quota-analysis-v11.ts", "usage-row-evidence-memo", 2,
     "7cbb505b174d6ec236e396b5a1a5727a2ba81437a9ca5678955e5912604fc475"],
+  ["apps/worker/src/v11-daily-projection-values.ts", "daily-fold-trusted-state", 5,
+    "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"],
+  ["apps/worker/src/analytics-shared-reducers.ts", "daily-fold-trusted-state", 2,
+    "4ff0cd7345ad201938d0196e3a2571ff522b3458fd89811ebf362649073c3c06"],
 ].map(([path, id, hunks, sha256]) => ({ path, id, hunks, sha256 }));
 const PACKAGE_FILE = /^packages\/([a-z-]+)\/(package\.json|index\.js|index\.d\.ts|src\/.+)$/;
 

@@ -88,6 +88,9 @@ export {
   createV11DailyProjectionValues,
   finalizeV11DailyProjectionValues,
   foldV11DailyProjectionValues,
+  // Source-patched (daily-fold-trusted-state): the same fold, page for page,
+  // with the accumulated state validated once by the caller.
+  foldV11DailyProjectionValuesTrusted,
   mergeV11DailyProjectionValues,
   validateV11DailyProjectionValues,
 } from "./apps/worker/src/v11-daily-projection-values";

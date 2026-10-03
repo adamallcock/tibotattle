@@ -6,7 +6,11 @@
 //   the native path's model windows re-read an owner's prepared rows) gives
 //   exactly what a fresh copy of the row gives, the session step still runs
 //   before the price on every call, and a row whose record_json or
-//   observed_at changed is evaluated again.
+//   observed_at changed is evaluated again;
+// - daily-fold-trusted-state: folding an owner-day one record at a time with
+//   the trusted fold returns, after every record, exactly the state the
+//   checked fold returns, including past the 200-cell top-K, and a record the
+//   checked fold refuses is refused the same way.
 import { describe, expect, it } from "vitest";
 import {
   advanceV11UsageReduction,
@@ -25,6 +29,14 @@ import {
 import { modelHistoryWindow } from "../vendor/analytics-d43c8f92/apps/worker/src/model-history-window";
 import type { EffectiveTelemetryOccurrence } from "../vendor/analytics-d43c8f92/apps/worker/src/telemetry-usage-effective-reader";
 import type { V11SourcePin } from "../vendor/analytics-d43c8f92/apps/worker/src/telemetry-v11-domain";
+import {
+  createV11DailyProjectionValues,
+  finalizeV11DailyProjectionValues,
+  foldV11DailyProjectionValues,
+  foldV11DailyProjectionValuesTrusted,
+  MAX_V11_DAILY_MODEL_CELLS,
+  validateV11DailyProjectionValues,
+} from "../vendor/analytics-d43c8f92/apps/worker/src/v11-daily-projection-values";
 import { v11UsageRecord } from "./kernel-parity/helpers/telemetry-v11";
 
 const day = "2026-09-28", start = Date.parse(day), owner = "a".repeat(64);
@@ -138,5 +150,42 @@ describe("source patch usage-row-evidence-memo", () => {
     expect(await v11PreparedUsageDayRow(row, sessionDigest)).toEqual(await v11PreparedUsageDayRow(fresh(other), sessionDigest));
     row.observed_at = new Date(start + 86_399_000).toISOString();
     expect(await v11PreparedUsageDayRow(row, sessionDigest)).toEqual(await v11PreparedUsageDayRow(fresh(row), sessionDigest));
+  });
+});
+
+describe("source patch daily-fold-trusted-state", () => {
+  const providers = ["openai_codex", "anthropic_claude"];
+  function records(count: number): unknown[] {
+    const out: unknown[] = [];
+    for (let index = 0; index < count; index += 1) {
+      // 260 distinct (provider, model) cells in a shuffled order, so the
+      // lexical top 200 moves while the day is folded and cells overflow.
+      const model = `model-${((index * 7919) % 260).toString().padStart(3, "0")}`;
+      out.push(v11UsageRecord(day, "a", { eventId: `event:synthetic:${index.toString().padStart(5, "0")}`,
+        eventTime: new Date(start + index * 1_000).toISOString(), provider: providers[index % 2],
+        modelId: index % 11 === 0 ? "gpt-5.4" : model }));
+    }
+    return out;
+  }
+
+  it("returns exactly the checked fold's state after every record, past the top-K", () => {
+    let checked = createV11DailyProjectionValues(day), trusted = createV11DailyProjectionValues(day);
+    for (const record of records(900)) {
+      checked = foldV11DailyProjectionValues(checked, [record]);
+      trusted = foldV11DailyProjectionValuesTrusted(trusted, [record]);
+      expect(JSON.stringify(trusted)).toBe(JSON.stringify(checked));
+    }
+    expect(checked.cells).toHaveLength(MAX_V11_DAILY_MODEL_CELLS);
+    expect(checked.omitted.usageEvents).toBeGreaterThan(0);
+    validateV11DailyProjectionValues(trusted);
+    expect(JSON.stringify(finalizeV11DailyProjectionValues(trusted)))
+      .toBe(JSON.stringify(finalizeV11DailyProjectionValues(checked)));
+  });
+
+  it("refuses a record the checked fold refuses, with the same error", () => {
+    const state = foldV11DailyProjectionValuesTrusted(createV11DailyProjectionValues(day), records(3).slice(0, 1));
+    const otherDay = v11UsageRecord("2026-09-27", "a", { eventId: `event:synthetic:${"9".repeat(5)}` });
+    expect(() => foldV11DailyProjectionValues(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
+    expect(() => foldV11DailyProjectionValuesTrusted(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
   });
 });

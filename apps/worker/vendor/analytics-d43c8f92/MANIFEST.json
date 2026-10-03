@@ -75,6 +75,18 @@
       "id": "usage-row-evidence-memo",
       "hunks": 2,
       "sha256": "7cbb505b174d6ec236e396b5a1a5727a2ba81437a9ca5678955e5912604fc475"
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection-values.ts",
+      "id": "daily-fold-trusted-state",
+      "hunks": 5,
+      "sha256": "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"
+    },
+    {
+      "path": "apps/worker/src/analytics-shared-reducers.ts",
+      "id": "daily-fold-trusted-state",
+      "hunks": 2,
+      "sha256": "4ff0cd7345ad201938d0196e3a2571ff522b3458fd89811ebf362649073c3c06"
     }
   ],
   "counts": {
@@ -85,8 +97,8 @@
     "package": 40,
     "exportPatched": 6,
     "exportPatchedFiles": 3,
-    "sourcePatched": 1,
-    "sourcePatchedFiles": 1,
+    "sourcePatched": 3,
+    "sourcePatchedFiles": 3,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -157,8 +169,8 @@
     {
       "path": "apps/worker/src/analytics-shared-reducers.ts",
       "blob": "743116a177d31537dad5193b89a0915006776fa3",
-      "sha256": "1b8dee053c6d13420f9c05a960b458e7b4e27f4b3bb1f875e86277f1a97a231a",
-      "patch": "none",
+      "sha256": "20b0365672637c11c6c5b8ec7ad71b6790ab8ba9e58fe48db185553f1ef2f64c",
+      "patch": "source",
       "reach": "kernel"
     },
     {
@@ -717,8 +729,8 @@
     {
       "path": "apps/worker/src/v11-daily-projection-values.ts",
       "blob": "d8630374eebdbc5615c964cce3deb61a1ac9755d",
-      "sha256": "64ddc7d045cef6b8ec585febd9d9c6a1d0d95dc96a09e6761bbacefbf55e2952",
-      "patch": "none",
+      "sha256": "5be2b53dfd5b4b83485db1f74ff46659f46d8828a814e023fdf892d520be7bf8",
+      "patch": "source",
       "reach": "kernel"
     },
     {

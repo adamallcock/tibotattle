@@ -20,7 +20,7 @@ import { type V11CompletedQuotaAcquisition } from './quota-analysis-v11-reader';
 import { type V11SourcePin } from './telemetry-v11-domain';
 import { type EffectiveTelemetryOccurrence, type EffectiveTelemetryStream } from './telemetry-usage-effective-reader';
 import { createV11DailyProjectionValues, finalizeV11DailyProjectionValues,
-  foldV11DailyProjectionValues } from './v11-daily-projection-values';
+  foldV11DailyProjectionValuesTrusted, validateV11DailyProjectionValues } from './v11-daily-projection-values';
 
 const DAY_MS = 86_400_000;
 const QUOTA_WINDOW_MINUTES = 10_080;
@@ -103,8 +103,11 @@ export async function prepareSharedAnalyticsDay(input: SharedAnalyticsDayInput):
   for (const rows of [input.usage, input.quota, input.session]) {
     // Match the effective daily reader's one-record folds. This avoids a
     // page-local model-cell limit changing the lexical top-K selection.
-    for (const row of rows) daily = foldV11DailyProjectionValues(daily, [JSON.parse(row.recordJson!)]);
+    // GCP source patch daily-fold-trusted-state: the same one-record folds,
+    // with the accumulated state validated once, after the last of them.
+    for (const row of rows) daily = foldV11DailyProjectionValuesTrusted(daily, [JSON.parse(row.recordJson!)]);
   }
+  validateV11DailyProjectionValues(daily);
 
   let quotaPending: EffectiveQuotaDayPending | null = null;
   for (let offset = 0; offset < input.quota.length; offset += PAGE_SIZE) {

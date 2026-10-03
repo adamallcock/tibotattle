@@ -257,6 +257,91 @@ function usageRowEvidenceMemo(row: UsageRow): UsageRowEvidenceMemo {
 ` },
     ],
   },
+  {
+    id: "daily-fold-trusted-state",
+    path: "apps/worker/src/v11-daily-projection-values.ts",
+    // foldV11DailyProjectionValuesTrusted: the same one-record fold, page for page, without re-normalizing and
+    // re-validating the accumulated state on every record; the caller validates the day's state once
+    // (REFRESH-OPT d5). mergeV11DailyProjectionValues and foldV11DailyProjectionValues are unchanged.
+    hunks: [
+      { find: `export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues): V11DailyProjectionValues {
+  a=normalizeV11DailyProjectionValues(a);b=normalizeV11DailyProjectionValues(b);if(a.day!==b.day)fail();
+`,
+        replace: `export function mergeV11DailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues): V11DailyProjectionValues {
+  return mergeDailyProjectionValues(a,b,false);
+}
+/** GCP source patch daily-fold-trusted-state (not in d43c8f92): the merge
+ * above, unchanged, except that a trusted a (a state this module built) is
+ * neither normalized nor validated again and the result is left for the
+ * caller's one validation. b is always normalized and validated. */
+function mergeDailyProjectionValues(a: V11DailyProjectionValues,b: V11DailyProjectionValues,trustedA: boolean): V11DailyProjectionValues {
+  a=trustedA?a:normalizeV11DailyProjectionValues(a);b=normalizeV11DailyProjectionValues(b);if(a.day!==b.day)fail();
+` },
+      { find: `  result.cells=sorted.slice(0,MAX_V11_DAILY_MODEL_CELLS);validateV11DailyProjectionValues(result);return result;
+`,
+        replace: `  result.cells=sorted.slice(0,MAX_V11_DAILY_MODEL_CELLS);if(!trustedA)validateV11DailyProjectionValues(result);return result;
+` },
+      { find: `function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[]): V11DailyProjectionValues {
+  state=normalizeV11DailyProjectionValues(state);
+`,
+        replace: `function foldDailyProjectionValues(format:'v1'|'v11',state: V11DailyProjectionValues, records: readonly unknown[], trustedState = false): V11DailyProjectionValues {
+  state=trustedState?state:normalizeV11DailyProjectionValues(state);
+` },
+      { find: `  page.cells=[...cells.values()].sort(compare);
+  return mergeV11DailyProjectionValues(state,page);
+}
+`,
+        replace: `  page.cells=[...cells.values()].sort(compare);
+  return mergeDailyProjectionValues(state,page,trustedState);
+}
+` },
+      { find: `export function foldV11DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v11',state,records);
+}
+`,
+        replace: `export function foldV11DailyProjectionValues(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v11',state,records);
+}
+/** GCP source patch daily-fold-trusted-state (not in d43c8f92). The same fold
+ * as foldV11DailyProjectionValues, page for page, for a caller that folds one
+ * owner-day from createV11DailyProjectionValues one record at a time and then
+ * calls validateV11DailyProjectionValues once on the result: the state passed in must be
+ * createV11DailyProjectionValues's or this function's own output. The page is
+ * validated on every call as before; only the re-validation of the
+ * accumulated state is skipped. That validation cannot fail here: each check
+ * on a merge of two valid values is additive or holds by construction, and the
+ * only bounds a sum could cross (MAX_V11_DAILY_VALUES_RECORDS, 25 decimal
+ * digits) are out of reach for a day of at most 250,000 records, so every
+ * returned state, and the result, is exactly what the checked fold returns. */
+export function foldV11DailyProjectionValuesTrusted(state:V11DailyProjectionValues,records:readonly unknown[]):V11DailyProjectionValues {
+ return foldDailyProjectionValues('v11',state,records,true);
+}
+` },
+    ],
+  },
+  {
+    id: "daily-fold-trusted-state",
+    path: "apps/worker/src/analytics-shared-reducers.ts",
+    // prepareSharedAnalyticsDay folds the day with foldV11DailyProjectionValuesTrusted, then validates the
+    // state once, before any later step can refuse the day (REFRESH-OPT d5).
+    hunks: [
+      { find: `import { createV11DailyProjectionValues, finalizeV11DailyProjectionValues,
+  foldV11DailyProjectionValues } from './v11-daily-projection-values';
+`,
+        replace: `import { createV11DailyProjectionValues, finalizeV11DailyProjectionValues,
+  foldV11DailyProjectionValuesTrusted, validateV11DailyProjectionValues } from './v11-daily-projection-values';
+` },
+      { find: `    for (const row of rows) daily = foldV11DailyProjectionValues(daily, [JSON.parse(row.recordJson!)]);
+  }
+`,
+        replace: `    // GCP source patch daily-fold-trusted-state: the same one-record folds,
+    // with the accumulated state validated once, after the last of them.
+    for (const row of rows) daily = foldV11DailyProjectionValuesTrusted(daily, [JSON.parse(row.recordJson!)]);
+  }
+  validateV11DailyProjectionValues(daily);
+` },
+    ],
+  },
 ].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));
 
 const SOURCE_PATCH_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

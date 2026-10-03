@@ -66,7 +66,7 @@ import {
   finishEffectiveQuotaDay,
   finishV11UsageReduction,
   foldEffectiveQuotaDays,
-  foldV11DailyProjectionValues,
+  foldV11DailyProjectionValuesTrusted,
   foldV11UsageModelReduction,
   mapEffectiveQuotaPageRow,
   mapEffectiveUsagePageRow,
@@ -74,6 +74,7 @@ import {
   prepareSharedAnalyticsDay,
   selectCommunityAllowanceAnalysisFits,
   SharedAnalyticsUnavailable,
+  validateV11DailyProjectionValues,
   type CacheRetentionDayAggregate,
   type CacheRetentionItem,
   type CommunityAllowanceFit,
@@ -213,10 +214,13 @@ Promise<AnalyticsV2PreparedDay> {
   }
   if (bytes > limits.maxDayRecordBytes) throw new SharedAnalyticsUnavailable("day_byte_limit");
 
+  // The same one-record folds as the vendored preparation (source patch
+  // daily-fold-trusted-state), with the state validated once after the last.
   let daily = createV11DailyProjectionValues(input.day);
   for (const rows of [input.usage, input.quota, input.session]) {
-    for (const row of rows) daily = foldV11DailyProjectionValues(daily, [JSON.parse(row.recordJson!)]);
+    for (const row of rows) daily = foldV11DailyProjectionValuesTrusted(daily, [JSON.parse(row.recordJson!)]);
   }
+  validateV11DailyProjectionValues(daily);
 
   let quotaPending: EffectiveQuotaDayPending | null = null;
   let quotaBounded = false;
