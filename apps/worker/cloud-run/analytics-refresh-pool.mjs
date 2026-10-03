@@ -67,7 +67,7 @@
  * W = 4 to the same bytes.
  */
 
-import { Worker } from "node:worker_threads";
+import { MessageChannel, Worker } from "node:worker_threads";
 
 const MIB = 1_024 * 1_024;
 /**
@@ -146,9 +146,11 @@ export function analyticsRefreshWorkerPoolMinimumBytes(memoryBudgetBytes) {
  * }} options
  */
 export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, poolBytes, loadConcurrency = 1, workerUrl,
-  createWorker } = {}) {
+  createWorker, modelBlockSize = 10, modelFanOut = "auto" } = {}) {
   const model = ANALYTICS_REFRESH_WORKER_HEAP_MODEL;
-  if (!Number.isSafeInteger(workers) || workers < ANALYTICS_REFRESH_WORKER_BOUNDS.minimum
+  if (!Number.isSafeInteger(modelBlockSize) || modelBlockSize < 1 || modelBlockSize > 70
+      || !["auto", "all", "off"].includes(modelFanOut)
+      || !Number.isSafeInteger(workers) || workers < ANALYTICS_REFRESH_WORKER_BOUNDS.minimum
       || workers > ANALYTICS_REFRESH_WORKER_BOUNDS.maximum
       || !Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes < 1
       || !Number.isSafeInteger(poolBytes) || poolBytes < model.overheadBytes + model.heapReserveBytes
@@ -168,6 +170,9 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
   let aborting;
   const stopping = new Set();
   const stats = { started: 0, retriedAlone: 0, peakRunning: 0, peakChargedBytes: 0, peakLoads: 0,
+    modelBlockedOwners: 0, modelBlocksPerOwner: [], blockMeasurements: [], blockGrantsRequested: 0, blockGrantsGranted: 0,
+    blockGrantsRefused: 0, blockSerializedBytes: 0, blockCloneMs: 0, blockEvaluationMs: 0,
+    blockHeapPeakBytes: null,
     largestGcCallbackHeapBytes: null, largestGcCallbackHeapShareOfLimit: null };
   /**
    * Loads waiting for a read slot: the largest owner's first (it is the run's
@@ -178,8 +183,8 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
   let loadsRunning = 0;
 
   const limitOf = (entry) => (entry.alone ? aloneLimitBytes
-    : analyticsRefreshWorkerHeapLimitBytes(entry.task.estimateBytes, poolBytes));
-  const chargeOf = (entry) => limitOf(entry) + model.overheadBytes;
+    : analyticsRefreshWorkerHeapLimitBytes(entry.blockEstimateBytes ?? entry.task.estimateBytes, poolBytes));
+  const chargeOf = (entry) => limitOf(entry) + model.overheadBytes + (entry.payloadReserveBytes ?? 0);
 
   const admit = () => {
     if (aborted) return;
@@ -210,12 +215,21 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     if (entry.stopping !== null) return entry.stopping;
     const worker = entry.worker;
     entry.worker = null;
+    entry.grantPort?.close();
+    entry.grantPort = null;
     if (worker !== null) worker.removeAllListeners("message");
     // Keep the isolate's admission charge and slot until its termination is
     // confirmed. A result message arrives before the isolate has exited.
     const chargeBytes = entry.chargeBytes;
     const stopped = Promise.resolve().then(() => worker?.terminate()).then(() => {
       if (running.delete(entry)) chargedBytes -= chargeBytes;
+      if (entry.parent !== undefined) {
+        entry.parent.children.delete(entry);
+        if (entry.parent.worker !== null && !entry.parent.blockFailure && !entry.parent.settled) {
+          try { entry.parent.worker.postMessage({ type: "blockReleased", id: entry.blockId }); }
+          catch { fail(entry.parent, "ANALYTICS_V2_REFRESH_WORKER_TRANSFER_FAILED"); }
+        }
+      }
       admit();
     });
     entry.stopping = stopped;
@@ -265,8 +279,132 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     admit();
   };
 
+  // New children are stopped before delegating to the unchanged owner's OOM
+  // retry. Retiring children keep their slots/charge until release confirms exit.
+  const familyOutOfMemory = (entry) => {
+    if (entry.settled || entry.blockFailure) return;
+    if (entry.children.size === 0) { outOfMemory(entry); return; }
+    entry.blockFailure = true;
+    void Promise.all([...entry.children].map(release)).then(() => outOfMemory(entry), () => {
+      fail(entry, "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED");
+    });
+  };
+
+  /** No-wait grants: reserve sizing/clone memory BEFORE the sender serializes. */
+  const grantBlocks = (parent, message) => {
+    if (!Array.isArray(message.blocks) || message.blocks.length > 69
+        || !Number.isSafeInteger(message.totalBlocks) || message.totalBlocks < 1 || message.totalBlocks > 70
+        || message.blocks.length !== message.totalBlocks - 1 || parent.blocksRequested) {
+      fail(parent, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); return;
+    }
+    parent.blocksRequested = true;
+    stats.modelBlockedOwners += 1;
+    stats.modelBlocksPerOwner.push({ ownerIndex: parent.task.index, blocks: message.totalBlocks });
+    const grants = [];
+    const transfers = [];
+    const quotaRows = parent.task.evidence.reduce((sum, [, counts]) => sum + counts.quota, 0);
+    for (const block of message.blocks) {
+      stats.blockGrantsRequested += 1;
+      if (!Number.isSafeInteger(block.id) || block.id < 0 || !Number.isSafeInteger(block.quotaRows)
+          || block.quotaRows < 0 || block.quotaRows > quotaRows
+          || !Number.isSafeInteger(block.dateCount) || block.dateCount < 1 || block.dateCount > 70
+          || !Number.isSafeInteger(block.payloadBoundBytes) || block.payloadBoundBytes < MIB
+          || grants.some((grant) => grant.id === block.id)) {
+        fail(parent, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); return;
+      }
+      // Full owner estimate is deliberately conservative until isolated block
+      // peaks qualify tighter sizes. The measured quota memo (379.53 B/row)
+      // gets an additional 512 B/row. Neither changes resources.ts verdicts.
+      const payloadBoundBytes = block.payloadBoundBytes;
+      // A date's reduction checkpoint is bounded at 8 MiB. Reserve that full
+      // envelope for every returned date, independent of input density.
+      const resultBoundBytes = block.dateCount * 8 * MIB;
+      const child = { task: parent.task, context: parent.context, parent, blockId: block.id,
+        blockEstimateBytes: parent.task.estimateBytes + block.quotaRows * 512,
+        payloadReserveBytes: payloadBoundBytes * 2 + resultBoundBytes * 2, payloadBoundBytes, resultBoundBytes,
+        worker: null, grantPort: null, settled: false, alone: false, attempt: parent.attempt, chargeBytes: 0, stopping: null,
+        resolve: () => {}, reject: () => {}, resultSent: false, consumed: false };
+      // Every denial is immediate; it never enters the owner admission queue.
+      if (parent.alone || [...running].some((entry) => entry.alone) || running.size >= workers
+          || chargedBytes + chargeOf(child) > poolBytes) {
+        stats.blockGrantsRefused += 1;
+        grants.push({ id: block.id, port: null }); continue;
+      }
+      const { port1, port2 } = new MessageChannel();
+      child.grantPort = port1;
+      parent.children.add(child);
+      running.add(child);
+      child.chargeBytes = chargeOf(child);
+      chargedBytes += child.chargeBytes;
+      stats.blockGrantsGranted += 1;
+      stats.peakRunning = Math.max(stats.peakRunning, running.size);
+      stats.peakChargedBytes = Math.max(stats.peakChargedBytes, chargedBytes);
+      let worker;
+      try {
+        worker = spawn(url, { workerData: { block: true, port: port2, task: parent.task,
+          context: parent.context, payloadBoundBytes, resultBoundBytes }, transferList: [port2],
+          resourceLimits: { maxOldGenerationSizeMb: limitOf(child) / MIB,
+            maxYoungGenerationSizeMb: model.youngGenerationBytes / MIB },
+          env: {}, argv: [], stdout: false, stderr: false });
+      } catch {
+        port1.close(); port2.close(); fail(parent, "ANALYTICS_V2_REFRESH_WORKER_START_FAILED"); return;
+      }
+      child.worker = worker;
+      const attempt = parent.attempt;
+      const current = () => !aborted && !parent.settled && !parent.blockFailure
+        && parent.attempt === attempt && child.worker === worker;
+      worker.on("message", (event) => {
+        if (!current()) return;
+        if (event?.type === "heap") {
+          if (!Number.isSafeInteger(event.limitBytes) || event.limitBytes < limitOf(child)
+              || event.limitBytes > limitOf(child) + model.overheadBytes) {
+            fail(parent, "ANALYTICS_V2_REFRESH_WORKER_HEAP_LIMIT_UNAPPLIED");
+          }
+        } else if (event?.type === "progress") {
+          try { parent.io.progress(event.event); }
+          catch (error) { settle(parent, error, null); void abort().catch(() => {}); }
+        } else if (event?.type === "blockDone") {
+          if (child.resultSent || !Number.isSafeInteger(event.serializedBytes) || event.serializedBytes < 0
+              || event.serializedBytes > child.payloadBoundBytes
+              || !Number.isFinite(event.cloneMs) || event.cloneMs < 0
+              || !Number.isFinite(event.evaluationMs) || event.evaluationMs < 0
+              || !(event.heapPeakBytes === null || (Number.isSafeInteger(event.heapPeakBytes) && event.heapPeakBytes >= 0))) {
+            fail(parent, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); return;
+          }
+          child.resultSent = true;
+          stats.blockSerializedBytes += event.serializedBytes;
+          stats.blockCloneMs += event.cloneMs;
+          stats.blockEvaluationMs += event.evaluationMs;
+          stats.blockHeapPeakBytes = Math.max(stats.blockHeapPeakBytes ?? 0, event.heapPeakBytes ?? 0);
+          stats.blockMeasurements.push({ ownerIndex: parent.task.index, blockIndex: child.blockId,
+            serializedBytes: event.serializedBytes, cloneMs: event.cloneMs, evaluationMs: event.evaluationMs,
+            heapPeakBytes: event.heapPeakBytes ?? null, memoRebuildMs: null });
+          if (child.consumed) release(child);
+        } else if (event?.type === "failed") {
+          fail(parent, typeof event.code === "string" && SAFE_CODE.test(event.code)
+            ? event.code : "ANALYTICS_V2_REFRESH_WORKER_FAILED");
+        } else fail(parent, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID");
+      });
+      worker.on("error", (error) => {
+        if (!current()) return;
+        if (error?.code === "ERR_WORKER_OUT_OF_MEMORY") familyOutOfMemory(parent);
+        else fail(parent, "ANALYTICS_V2_REFRESH_WORKER_FAILED");
+      });
+      worker.on("exit", () => { if (current()) fail(parent, "ANALYTICS_V2_REFRESH_WORKER_EXITED"); });
+      grants.push({ id: block.id, port: port1, payloadBoundBytes, resultBoundBytes });
+      transfers.push(port1);
+    }
+    try {
+      parent.worker.postMessage({ type: "blockGrants", id: message.id, grants }, transfers);
+      for (const child of parent.children) child.grantPort = null;
+    }
+    catch { fail(parent, "ANALYTICS_V2_REFRESH_WORKER_TRANSFER_FAILED"); }
+  };
+
   const start = (entry) => {
     entry.stopping = null;
+    entry.blockFailure = false;
+    entry.blocksRequested = false;
     running.add(entry);
     entry.chargeBytes = chargeOf(entry);
     chargedBytes += entry.chargeBytes;
@@ -283,7 +421,8 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     let worker;
     try {
       worker = spawn(url, {
-        workerData: { task: entry.task, context: entry.context },
+        workerData: { task: entry.task, context: entry.context,
+          modelBlockSize, modelFanOut: entry.alone ? "off" : modelFanOut },
         resourceLimits: { maxOldGenerationSizeMb: limitOf(entry) / MIB,
           maxYoungGenerationSizeMb: model.youngGenerationBytes / MIB },
         // The Worker inherits no environment and no argv: it reads neither.
@@ -298,10 +437,19 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     }
     entry.worker = worker;
     const attempt = entry.attempt;
-    const current = () => !entry.settled && entry.attempt === attempt && entry.worker === worker;
+    const current = () => !entry.settled && !entry.blockFailure && entry.attempt === attempt && entry.worker === worker;
     worker.on("message", (message) => {
       if (!current() || message === null || typeof message !== "object") return;
       switch (message.type) {
+        case "blockRequest":
+          grantBlocks(entry, message); break;
+        case "blockConsumed": {
+          const child = [...entry.children].find((value) => value.blockId === message.id);
+          if (child === undefined || child.consumed) { fail(entry, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); break; }
+          child.consumed = true;
+          if (child.resultSent) release(child);
+          break;
+        }
         case "load": {
           const id = message.id;
           const span = Object.freeze({ fromDay: message.span?.fromDay, throughDay: message.span?.throughDay });
@@ -358,6 +506,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
           }
           break;
         case "result":
+          if (entry.children.size > 0) { fail(entry, "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID"); break; }
           if (Number.isSafeInteger(message.gcCallbackHeapPeakBytes) && message.gcCallbackHeapPeakBytes >= 0) {
             stats.largestGcCallbackHeapBytes = Math.max(stats.largestGcCallbackHeapBytes ?? 0, message.gcCallbackHeapPeakBytes);
             stats.largestGcCallbackHeapShareOfLimit = Math.max(stats.largestGcCallbackHeapShareOfLimit ?? 0,
@@ -376,7 +525,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     });
     worker.on("error", (error) => {
       if (!current()) return;
-      if (error?.code === "ERR_WORKER_OUT_OF_MEMORY") outOfMemory(entry);
+      if (error?.code === "ERR_WORKER_OUT_OF_MEMORY") familyOutOfMemory(entry);
       else fail(entry, "ANALYTICS_V2_REFRESH_WORKER_FAILED");
     });
     worker.on("exit", () => {
@@ -420,7 +569,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
       }
       return new Promise((resolve, reject) => {
         const entry = { task, context, io, resolve, reject, worker: null, settled: false, alone: false, attempt: 0,
-          chargeBytes: 0, stopping: null };
+          chargeBytes: 0, stopping: null, children: new Set(), blockFailure: false, blocksRequested: false };
         let position = queue.findIndex((queued) => !queued.alone && (queued.task.estimateBytes < task.estimateBytes
           || (queued.task.estimateBytes === task.estimateBytes && queued.task.index > task.index)));
         if (position < 0) position = queue.length;
@@ -434,6 +583,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
     /** Operational metadata: running Workers (spec use). */
     get running() { return running.size; },
     /** Content-free operational counts for the receipt. */
-    stats: () => Object.freeze({ ...stats }),
+    stats: () => Object.freeze({ ...stats, modelBlocksPerOwner: Object.freeze([...stats.modelBlocksPerOwner]),
+      blockMeasurements: Object.freeze([...stats.blockMeasurements].sort((a, b) => a.ownerIndex - b.ownerIndex || a.blockIndex - b.blockIndex)) }),
   });
 }

@@ -49,7 +49,8 @@ import {
 } from "./native-path";
 import { EMPTY_DAY_OCCURRENCES,
   type AnalyticsV2DayOccurrences } from "./pin";
-import { prepareSpan, evaluatePreparedSpanCache, evaluateScalar, evaluateModelBlock } from "./units";
+import { prepareSpan, evaluatePreparedSpanCache, evaluateScalar, evaluateModelBlock, shouldFanOutModelDates,
+  type AnalyticsV2ModelBlockInput, type AnalyticsV2ModelDateUnit } from "./units";
 import {
   analyticsV2OutputRowBytes,
   type AnalyticsV2DayEvidence,
@@ -147,7 +148,14 @@ export interface AnalyticsV2OwnerHooks {
   readonly timed: <T>(phase: AnalyticsV2Phase, work: () => Promise<T> | T) => Promise<T>;
   /** Heap in use, sampled for heapPeakBytes (operational metadata only). */
   readonly memoryProbe?: () => number;
-
+  /** Worker composition only; no callback crosses into the pure model units. */
+  readonly modelBlocks?: {
+    readonly size: number;
+    readonly fanOut: "auto" | "all" | "off";
+    readonly run: (input: AnalyticsV2ModelBlockInput) => Promise<{
+      readonly dates: readonly AnalyticsV2ModelDateUnit[]; readonly heapPeakBytes: number | null;
+    }>;
+  };
 }
 
 /** Everything the community fold needs from one computed owner. */
@@ -330,16 +338,27 @@ export async function computeAnalyticsV2Owner(input: {
   });
   sample();
   await timed("model", async () => {
-    // Inline dates remain separate calls: progress and output charging happen
-    // before evaluating the next date, preserving refusal precedence exactly.
-    for (const [modelIndex, day] of context.modelDates.entries()) {
-      hooks.progress(Object.freeze({ kind: "model", index: modelIndex, accountBytes: hooks.accountBytes() }));
-      const [result] = await evaluateModelBlock({ ...windowInputs, dates: [day] });
-      if ("terminalError" in result!) throw result.terminalError;
-      if (result!.composition === null) modelRefused.push(day);
-      else compositions.push([day, result!.composition]);
-      emit(result!.emission);
+    const replay = (result: AnalyticsV2ModelDateUnit): void => {
+      if ("terminalError" in result) throw result.terminalError;
+      if (result.composition === null) modelRefused.push(result.day);
+      else compositions.push([result.day, result.composition]);
+      emit(result.emission);
       sample();
+    };
+    if (hooks.modelBlocks !== undefined && shouldFanOutModelDates(evidence, context.modelDates, hooks.modelBlocks.fanOut)) {
+      const result = await hooks.modelBlocks.run(windowInputs);
+      // Operational metadata only: maximum sampled used heap over the owner
+      // isolate and each block isolate; never a whole-process RSS claim.
+      if (result.heapPeakBytes !== null) heapPeak = Math.max(heapPeak ?? 0, result.heapPeakBytes);
+      for (const date of result.dates) replay(date);
+    } else {
+      // Inline dates remain separate calls: progress and output charging happen
+      // before evaluating the next date, preserving refusal precedence exactly.
+      for (const [modelIndex, day] of context.modelDates.entries()) {
+        hooks.progress(Object.freeze({ kind: "model", index: modelIndex, accountBytes: hooks.accountBytes() }));
+        const [result] = await evaluateModelBlock({ ...windowInputs, dates: [day] });
+        replay(result!);
+      }
     }
   });
   // `prepared` (with its usage rows) and the horizon's quota occurrences are released with this scope.

@@ -31,9 +31,42 @@
  */
 
 import { constants as performanceConstants, PerformanceObserver } from "node:perf_hooks";
-import { getHeapStatistics } from "node:v8";
+import { deserialize, getHeapStatistics, serialize } from "node:v8";
 import { parentPort, workerData } from "node:worker_threads";
 import { mergeAnalyticsRefreshOccurrencePart } from "./analytics-refresh-read.mjs";
+
+/** Conservative pre-serialization bound for the closed plain-value model graph.
+ * Includes strings at three bytes per UTF-16 unit, headers/keys and references;
+ * repeated objects are counted once. The actual v8 bytes are checked before transfer.
+ */
+export function analyticsRefreshSerializationBound(value) {
+  const seen = new WeakSet();
+  const pending = [value];
+  let bytes = 64;
+  while (pending.length > 0) {
+    const item = pending.pop();
+    if (typeof item === "string") { bytes += 64 + item.length * 3; continue; }
+    if (typeof item === "function" || typeof item === "symbol" || typeof item === "bigint") {
+      throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+        { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+    }
+    if (item === null || typeof item !== "object") { bytes += 64; continue; }
+    if (!(item instanceof Map) && !Array.isArray(item)
+        && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) {
+      throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+        { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+    }
+    if (seen.has(item)) { bytes += 64; continue; }
+    seen.add(item);
+    bytes += 64;
+    if (item instanceof Map) for (const [key, value] of item) { bytes += 64; pending.push(key, value); }
+    else if (Array.isArray(item)) for (const value of item) pending.push(value);
+    else for (const [key, value] of Object.entries(item)) { bytes += 64 + key.length * 3; pending.push(value); }
+    if (!Number.isSafeInteger(bytes)) throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+      { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+  }
+  return Math.max(1_048_576, bytes);
+}
 
 const SAFE_CODE = /^ANALYTICS_V2_[A-Z0-9_]+$/u;
 
@@ -44,6 +77,49 @@ function closedCode(error) {
   const message = typeof error?.message === "string" ? error.message : "";
   const prefix = /^(ANALYTICS_V2_[A-Z0-9_]+)(?::|$)/u.exec(message);
   return prefix ? prefix[1] : "ANALYTICS_V2_REFRESH_WORKER_FAILED";
+}
+
+/** A block receives one transferred serialized payload. Row identity survives within it. */
+async function runBlock() {
+  const { port, task, context, payloadBoundBytes, resultBoundBytes } = workerData;
+  parentPort.postMessage({ type: "heap", limitBytes: getHeapStatistics().heap_size_limit });
+  // Keep the isolate alive until pool termination confirms its admission release.
+  parentPort.on("message", () => {});
+  const { evaluateModelBlock } = await import("../src/analytics-v2/units.ts");
+  const receive = await new Promise((resolve) => port.once("message", resolve));
+  const cloneStarted = performance.now();
+  if (!receive?.serialized || receive.serialized.buffer.byteLength > payloadBoundBytes) {
+    throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+      { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+  }
+  const serializedBytes = receive.serialized.byteLength;
+  const input = deserialize(receive.serialized);
+  receive.serialized = null;
+  const cloneMs = receive.cloneMs + performance.now() - cloneStarted;
+  const dates = [];
+  let heapPeakBytes = getHeapStatistics().used_heap_size;
+  const evaluationStarted = performance.now();
+  for (const day of input.dates) {
+    parentPort.postMessage({ type: "progress", event: { kind: "model", index: context.modelDates.indexOf(day), accountBytes: 0 } });
+    const [result] = await evaluateModelBlock({ ...input, dates: [day] });
+    if ("terminalError" in result) result.terminalError = { code: closedCode(result.terminalError) };
+    dates.push(result);
+    heapPeakBytes = Math.max(heapPeakBytes, getHeapStatistics().used_heap_size);
+    if ("terminalError" in result) break;
+  }
+  const evaluationMs = performance.now() - evaluationStarted;
+  const resultValue = { dates, heapPeakBytes };
+  if (analyticsRefreshSerializationBound(resultValue) > resultBoundBytes) {
+    throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+      { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+  }
+  const result = serialize(resultValue);
+  if (result.buffer.byteLength > resultBoundBytes) {
+    throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+      { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+  }
+  port.postMessage({ serialized: result }, [result.buffer]);
+  parentPort.postMessage({ type: "blockDone", serializedBytes, cloneMs, evaluationMs, heapPeakBytes });
 }
 
 async function run() {
@@ -64,8 +140,20 @@ async function run() {
   // completes (mergeAnalyticsRefreshOccurrencePart), so the map is the
   // inline load's.
   const loads = new Map();
+  const grantRequests = new Map();
+  const dispatched = new Map();
   let nextId = 0;
   parentPort.on("message", (message) => {
+    if (message?.type === "blockGrants") {
+      const request = grantRequests.get(message.id);
+      if (request !== undefined) { grantRequests.delete(message.id); request.resolve(message.grants); }
+      return;
+    }
+    if (message?.type === "blockReleased") {
+      const block = dispatched.get(message.id);
+      if (block !== undefined) { dispatched.delete(message.id); block.resolve(block.value); }
+      return;
+    }
     const pending = loads.get(message?.id);
     if (pending === undefined) return;
     switch (message.type) {
@@ -109,6 +197,90 @@ async function run() {
     loads.set(id, { parts: new Map(), resolve, reject });
     parentPort.postMessage({ type: "load", id, span: { fromDay: span.fromDay, throughDay: span.throughDay } });
   });
+  const runBlocks = async (input) => {
+    const { partitionModelDates, modelBlockPayload, evaluateModelBlock } = await import("../src/analytics-v2/units.ts");
+    const blocks = partitionModelDates(input.dates, workerData.modelBlockSize);
+    const id = nextId++;
+    const grants = await new Promise((resolve, reject) => {
+      grantRequests.set(id, { resolve, reject });
+      parentPort.postMessage({ type: "blockRequest", id, totalBlocks: blocks.length,
+        blocks: blocks.slice(0, -1).map((dates, id) => {
+          // Payload construction only copies map entries; rows stay shared in
+          // the owner until all granted blocks have been posted synchronously.
+          const payload = modelBlockPayload(input, dates);
+          const quotaRows = [...payload.horizonQuota.values()].reduce((sum, rows) => sum + rows.length, 0);
+          return { id, quotaRows, dateCount: dates.length, payloadBoundBytes: analyticsRefreshSerializationBound(payload) };
+        }) });
+    });
+    const work = new Map();
+    const keptDates = [];
+    for (const [blockId, dates] of blocks.entries()) {
+      const grant = grants.find((value) => value.id === blockId);
+      if (grant?.port == null) { keptDates.push(...dates); continue; }
+      const promise = new Promise((resolve, reject) => {
+        const pending = { resolve, reject, value: undefined };
+        dispatched.set(blockId, pending);
+        grant.port.once("message", (message) => {
+          try {
+            if (!message?.serialized || message.serialized.buffer.byteLength > grant.resultBoundBytes) {
+              throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+                { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+            }
+            pending.value = deserialize(message.serialized);
+            for (const result of pending.value.dates) if ("terminalError" in result) {
+              const code = closedCode(result.terminalError);
+              result.terminalError = Object.assign(new Error(code), { code });
+            }
+            // Return the consumed native result buffer to its child before
+            // acknowledging. The parent view is detached immediately; native
+            // ownership remains charged until that child's termination.
+            grant.port.postMessage({ consumed: true, serialized: message.serialized }, [message.serialized.buffer]);
+            grant.port.close();
+            parentPort.postMessage({ type: "blockConsumed", id: blockId });
+            // Resolve only after main confirms child termination; its slot,
+            // heap and payload reservation remain charged until that point.
+          } catch (error) { reject(error); }
+        });
+        const started = performance.now();
+        const payload = modelBlockPayload(input, dates);
+        const serialized = serialize(payload);
+        if (serialized.buffer.byteLength > grant.payloadBoundBytes) {
+          throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
+            { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
+        }
+        grant.port.postMessage({ serialized, cloneMs: performance.now() - started }, [serialized.buffer]);
+      });
+      // A failure may arrive while owner-local dates run. Attach immediately.
+      promise.catch(() => {});
+      work.set(blockId, promise);
+    }
+    // Serialization and transfer are synchronous. All grants are posted before
+    // removing days that neither the last nor any denied block still needs.
+    const keep = new Set();
+    for (const day of keptDates) {
+      const payload = modelBlockPayload(input, [day]);
+      for (const key of payload.dayDigests.keys()) keep.add(key);
+    }
+    for (const values of [input.prepared, input.dayDigests, input.horizonQuota]) {
+      for (const day of values.keys()) if (!keep.has(day)) values.delete(day);
+    }
+    let heapPeakBytes = getHeapStatistics().used_heap_size;
+    // Every denied block and the last block run in owner date order.
+    for (const [blockId, dates] of blocks.entries()) if (!work.has(blockId)) {
+      const results = [];
+      for (const day of dates) {
+        parentPort.postMessage({ type: "progress", event: { kind: "model", index: context.modelDates.indexOf(day), accountBytes: 0 } });
+        const [result] = await evaluateModelBlock({ ...input, dates: [day] });
+        results.push(result);
+        heapPeakBytes = Math.max(heapPeakBytes, getHeapStatistics().used_heap_size);
+        if ("terminalError" in result) break;
+      }
+      work.set(blockId, Promise.resolve({ dates: results, heapPeakBytes }));
+    }
+    const completed = await Promise.all(blocks.map((_, id) => work.get(id)));
+    return { dates: completed.flatMap((block) => block.dates),
+      heapPeakBytes: Math.max(heapPeakBytes, ...completed.map((block) => block.heapPeakBytes ?? 0)) };
+  };
   // Operational metadata only (K-PAR-MEM): a major-GC observer samples
   // the heap when its callback runs. Delivery can be delayed by synchronous
   // compute, so this is not a post-GC live-heap peak. No decision reads it.
@@ -141,6 +313,7 @@ async function run() {
         try { return await work(); } finally { timings[phase] = (timings[phase] ?? 0) + (performance.now() - started); }
       },
       memoryProbe: () => getHeapStatistics().used_heap_size,
+      modelBlocks: { size: workerData.modelBlockSize, fanOut: workerData.modelFanOut, run: runBlocks },
     },
   });
   collections.disconnect();
@@ -148,7 +321,8 @@ async function run() {
 }
 
 try {
-  await run();
+  if (workerData?.block === true) await runBlock();
+  else await run();
 } catch (error) {
   parentPort?.postMessage({ type: "failed", code: closedCode(error) });
 }

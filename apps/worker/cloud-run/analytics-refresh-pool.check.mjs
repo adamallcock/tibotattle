@@ -434,3 +434,173 @@ test("abort drains a load already reading before it lets snapshot readers close"
   assert.equal(drained, true);
   assert.equal(spawned[0].posted.length, 0, "no late part is delivered to the terminated Worker");
 });
+
+const requestBlocks = (worker, id = 0, blocks = 2) => worker.emit("message", { type: "blockRequest", id,
+  totalBlocks: blocks, blocks: Array.from({ length: blocks - 1 }, (_, id) =>
+    ({ id, quotaRows: 0, dateCount: 1, payloadBoundBytes: MIB })) });
+
+test("MODEL-BLOCKS no-wait requests deny locally when two owners fill W=2", { timeout: 2000 }, async () => {
+  const { spawned, createWorker } = scriptedWorkers((worker, data) => {
+    if (data.block) assert.fail("no child can start while both owner slots are occupied");
+    worker.on("_posted", (message) => {
+      if (message.type !== "blockGrants") return;
+      assert.equal(message.grants.every((grant) => grant.port === null), true);
+      // Both owners stay live through both grant responses, so requests never wait.
+      if (spawned.every((other) => other.posted.some((posted) => posted.type === "blockGrants"))) {
+        for (const other of spawned) result(other, other.options.workerData.task.index);
+      }
+    });
+    requestBlocks(worker, 0, 5);
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+  const values = await Promise.all([pool.compute(task(0, 10), {}, io()), pool.compute(task(1, 10), {}, io())]);
+  assert.equal(values.length, 2);
+  assert.equal(pool.stats().blockGrantsRequested, 8);
+  assert.equal(pool.stats().blockGrantsRefused, 8);
+  assert.equal(pool.stats().blockGrantsGranted, 0);
+  assert.equal(pool.running, 0);
+});
+
+test("MODEL-BLOCKS reserves before serialization and retains child charge until consumption AND termination", {
+  timeout: 2000,
+}, async () => {
+  let child, releaseChild, parent;
+  const { createWorker } = scriptedWorkers((worker, data) => {
+    if (data.block) {
+      child = worker;
+      worker.terminate = () => new Promise((resolve) => { releaseChild = () => { data.port.close(); resolve(0); }; });
+      return;
+    }
+    parent = worker;
+    worker.on("_posted", (message) => {
+      if (message.type === "blockGrants") {
+        assert.ok(message.grants[0].port);
+        message.grants[0].port.close();
+      } else if (message.type === "blockReleased") result(worker, data.task.index);
+    });
+    requestBlocks(worker);
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+  const finished = pool.compute(task(0, 10), {}, io());
+  await new Promise((resolve) => setImmediate(resolve));
+  const peak = pool.stats().peakChargedBytes;
+  assert.equal(pool.running, 2);
+  assert.ok(peak > 2 * chargeMiB(10) * MIB, "extra input/result native buffers charged");
+  child.emit("message", { type: "blockDone", serializedBytes: 100, cloneMs: 1, evaluationMs: 2, heapPeakBytes: 1000 });
+  assert.equal(pool.running, 2, "result alone does not release the payload or isolate");
+  parent.emit("message", { type: "blockConsumed", id: 0 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(pool.running, 2, "retiring child retains slot/charge");
+  releaseChild();
+  await finished;
+  assert.equal(pool.running, 0);
+  assert.equal(pool.stats().blockGrantsGranted, 1);
+});
+
+test("MODEL-BLOCKS child OOM terminates siblings, retries owner once alone with fan-out off", {
+  timeout: 2000,
+}, async () => {
+  const attempts = [];
+  const { spawned, createWorker } = scriptedWorkers((worker, data) => {
+    if (data.block) {
+      const terminate = worker.terminate;
+      worker.terminate = async () => { data.port.close(); return terminate(); };
+      if (spawned.filter((worker) => worker.options.workerData.block).length === 2) {
+        setImmediate(() => worker.emit("error", { code: "ERR_WORKER_OUT_OF_MEMORY" }));
+      }
+      return;
+    }
+    attempts.push(data.modelFanOut);
+    if (data.modelFanOut === "off") { result(worker, data.task.index); return; }
+    worker.on("_posted", (message) => {
+      if (message.type === "blockGrants") for (const grant of message.grants) grant.port?.close();
+    });
+    requestBlocks(worker, 0, 3);
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 3, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+  const value = await pool.compute(task(0, 10), {}, io());
+  assert.deepEqual(attempts, ["all", "off"]);
+  assert.equal(value.computation.index, 0);
+  assert.equal(pool.stats().retriedAlone, 1);
+  assert.ok(spawned.every((worker) => worker.terminated));
+  assert.equal(pool.running, 0);
+});
+
+test("MODEL-BLOCKS two owners share one child slot; child OOM drains before owner alone retry", { timeout: 2000 }, async () => {
+  let child;
+  const attempts = [];
+  const { spawned, createWorker } = scriptedWorkers((worker, data) => {
+    if (data.block) {
+      child = worker;
+      const terminate = worker.terminate;
+      worker.terminate = async () => { data.port.close(); return terminate(); };
+      return;
+    }
+    attempts.push([data.task.index, data.modelFanOut]);
+    if (data.modelFanOut === "off") { assert.equal(child.terminated, true); result(worker, data.task.index); return; }
+    worker.on("_posted", (message) => {
+      if (message.type !== "blockGrants") return;
+      for (const grant of message.grants) grant.port?.close();
+      if (data.task.index === 1) {
+        assert.ok(message.grants.every((grant) => grant.port === null));
+        result(worker, data.task.index);
+        setImmediate(() => child.emit("error", { code: "ERR_WORKER_OUT_OF_MEMORY" }));
+      }
+    });
+    requestBlocks(worker, 0, 3);
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 3, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+  const values = await Promise.all([pool.compute(task(0, 10), {}, io()), pool.compute(task(1, 10), {}, io())]);
+  assert.deepEqual(values.map((value) => value.computation.index), [0, 1]);
+  assert.deepEqual(attempts, [[0, "all"], [1, "all"], [0, "off"]]);
+  assert.equal(pool.stats().blockGrantsGranted, 1);
+  assert.equal(pool.stats().blockGrantsRefused, 3);
+  assert.equal(pool.stats().retriedAlone, 1);
+  assert.ok(spawned.every((worker) => worker.terminated));
+});
+
+for (const failureCase of ["child-oom-repeat", "child-failed", "oversized-done", "duplicate-done", "parent-result-early", "grant-transfer"]) {
+  test(`MODEL-BLOCKS ${failureCase} fails closed, drains children and returns no owner emissions`, { timeout: 2000 }, async () => {
+    const { spawned, createWorker } = scriptedWorkers((worker, data) => {
+      if (data.block) {
+        const terminate = worker.terminate;
+        worker.terminate = async () => { data.port.close(); return terminate(); };
+        setImmediate(() => {
+          if (failureCase === "child-oom-repeat") worker.emit("error", { code: "ERR_WORKER_OUT_OF_MEMORY" });
+          else if (failureCase === "child-failed") worker.emit("message", { type: "failed", code: "private text" });
+          else if (failureCase === "oversized-done") worker.emit("message", { type: "blockDone", serializedBytes: 2 * MIB,
+            cloneMs: 1, evaluationMs: 1, heapPeakBytes: null });
+          else if (failureCase === "duplicate-done") {
+            const event = { type: "blockDone", serializedBytes: 1, cloneMs: 1, evaluationMs: 1, heapPeakBytes: null };
+            worker.emit("message", event); worker.emit("message", event);
+          }
+        });
+        return;
+      }
+      if (data.modelFanOut === "off") { worker.emit("error", { code: "ERR_WORKER_OUT_OF_MEMORY" }); return; }
+      if (failureCase === "grant-transfer") worker.postMessage = () => { throw new Error("synthetic transfer error"); };
+      else worker.on("_posted", (message) => {
+        if (message.type === "blockGrants") {
+          for (const grant of message.grants) grant.port?.close();
+          if (failureCase === "parent-result-early") result(worker, data.task.index);
+        }
+      });
+      requestBlocks(worker);
+    });
+    const pool = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB,
+      poolBytes: 4096 * MIB, modelFanOut: "all", createWorker }));
+    const code = failureCase === "child-oom-repeat" ? "ANALYTICS_V2_REFRESH_WORKER_OUT_OF_MEMORY"
+      : failureCase === "child-failed" ? "ANALYTICS_V2_REFRESH_WORKER_FAILED"
+      : failureCase === "grant-transfer" ? "ANALYTICS_V2_REFRESH_WORKER_TRANSFER_FAILED"
+      : "ANALYTICS_V2_REFRESH_WORKER_PROTOCOL_INVALID";
+    await assert.rejects(pool.compute(task(0, 10), {}, io()), { code });
+    await pool.abort();
+    assert.equal(pool.running, 0);
+    assert.ok(spawned.every((worker) => worker.terminated));
+    assert.equal(pool.stats().retriedAlone, failureCase === "child-oom-repeat" ? 1 : 0);
+  });
+}

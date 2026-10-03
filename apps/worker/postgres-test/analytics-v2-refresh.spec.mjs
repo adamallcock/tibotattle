@@ -42,6 +42,7 @@ import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
 import { FASTPATH_MEASUREMENT_CLOUD_TARGET, FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
 import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
+import { refreshMeasurement } from "../scripts/gcp-fastpath-rehearsal.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 import * as synthetic from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
@@ -3361,11 +3362,13 @@ test("PG17 EXCL-DEPARTED: real exclusions keep a disconnected saved member hidde
 });
 
 // K-PAR: owners computed by compute Workers merge to exactly the inline rows.
-test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes exactly the inline run's rows", {
+test("PG17 K-PAR: W=2/4/8 x b=1/5/14/70 over the real readers and kernels writes exactly the inline run's rows", {
   skip: PG_SKIP,
   timeout: 900_000,
 }, async () => {
-  const workerUrl = new URL("../cloud-run/dist/analytics-refresh-worker.mjs", import.meta.url);
+  const workerUrl = process.env.GCP_MODEL_BLOCKS_TEST_WORKER_PATH
+    ? new URL(`file://${process.env.GCP_MODEL_BLOCKS_TEST_WORKER_PATH}`)
+    : new URL("../cloud-run/dist/analytics-refresh-worker.mjs", import.meta.url);
   await access(workerUrl, undefined).catch(() => assert.fail("build cloud-run/dist first (node cloud-run/build.mjs)"));
   const dump = async (pool, schema) => {
     const rows = {};
@@ -3382,12 +3385,12 @@ test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes e
   };
   await withDatabase("workers", async ({ pool, createSchema }) => {
     const dumps = new Map();
-    for (const workers of [1, 2, 4]) {
+    for (const [workers, blockSize] of [[1, 70], ...[2, 4, 8].flatMap((workers) => [1, 5, 14, 70].map((size) => [workers, size]))]) {
       const { schema } = await createSchema();
       await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active" });
       const now = new Date(seedFixture.NOW_MS).toISOString();
       const run = await job.runAnalyticsRefresh({
-        argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`, `--workers=${workers}`],
+        argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`, `--workers=${workers}`, `--model-block-size=${blockSize}`, "--model-fanout=all"],
         env: jobEnvironment(),
         dependencies: { modules: { store, pipeline: realPipeline() }, createPool: jobPool, kernelIdentity,
           workerUrl },
@@ -3405,19 +3408,28 @@ test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes e
       assert.ok(run.reads.phaseWallMs >= 0 && run.reads.unattributedMs >= 0);
       // N-EXCL: the table (primary 0066) is empty, unchanged since no run: nothing is applied or republished.
       assert.deepEqual(run.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
-      dumps.set(workers, await dump(pool, schema));
+      if (workers > 1) {
+        const blocks = run.memory.workerPool.modelBlocks;
+        assert.ok(blocks.blockedOwners > 0);
+        assert.ok(blocks.blocksPerOwner.every((owner) => owner.blocks === Math.ceil(70 / blockSize)));
+        assert.equal(blocks.grantsRequested, blocks.grantsGranted + blocks.grantsRefused);
+        if (workers === 8 && blockSize < 70) assert.ok(blocks.grantsGranted > 0);
+        if (blockSize === 70) assert.equal(blocks.grantsGranted, 0, "the only block is the owner-last block");
+        assert.deepEqual(refreshMeasurement({ receipt: run, wallMs: 0 }).memory.workerPool.modelBlocks, blocks,
+          "real refresh receipt retains block metrics through the rehearsal report path");
+      }
+      dumps.set(`${workers}:${blockSize}`, await dump(pool, schema));
       // A second run over the same snapshot state publishes nothing, as inline.
       const second = await job.runAnalyticsRefresh({
-        argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`, `--workers=${workers}`],
+        argv: ["--mode=full", `--schema=${schema}`, `--now=${now}`, `--workers=${workers}`, `--model-block-size=${blockSize}`, "--model-fanout=all"],
         env: jobEnvironment(),
         dependencies: { modules: { store, pipeline: realPipeline() }, createPool: jobPool, kernelIdentity,
           workerUrl },
       });
       assert.deepEqual(second.published, []);
     }
-    const inline = JSON.stringify(dumps.get(1));
-    assert.equal(JSON.stringify(dumps.get(2)), inline, "two Workers write the inline rows, byte for byte");
-    assert.equal(JSON.stringify(dumps.get(4)), inline, "four Workers write the inline rows, byte for byte");
+    const inline = JSON.stringify(dumps.get("1:70"));
+    for (const [key, value] of dumps) assert.equal(JSON.stringify(value), inline, `${key} writes the inline rows byte for byte`);
   });
 });
 
@@ -4048,7 +4060,7 @@ test("production target: the closed contract reads the six variables and the den
   // The rendered invocation parses to the real clock and PRIMARY_SCHEMA.
   const parsed = job.parseAnalyticsRefreshArguments(profile.args.slice(1), productionEnvironment());
   assert.deepEqual({ ...parsed }, { help: false, mode: "full", schema: "tibotattle_runtime", nowMs: null,
-    revisionSeed: 0, workers: 4 });
+    revisionSeed: 0, workers: 4, modelBlockSize: 10, modelFanOut: "auto" });
   // V8's default heap for the task holds the reserves and the minimum output
   // budget; the Workers' pool (the task less that heap and the native
   // reserve) holds the budget's largest owner alone.
@@ -4663,4 +4675,19 @@ test("the source entry prints a deadline refusal's figures and exits 1, before a
     "refuseAtSeconds", "taskTimeoutSeconds"]);
   assert.equal(line.deadline.taskTimeoutSeconds, 60);
   assert.equal(line.deadline.ownersPlanned, null);
+});
+
+
+test("MODEL-BLOCKS Job flags retain deterministic defaults and reject invalid modes/sizes", () => {
+  const env = { PRIMARY_SCHEMA: "synthetic" };
+  const defaults = job.parseAnalyticsRefreshArguments(["--mode=full"], env);
+  assert.equal(defaults.modelBlockSize, 10);
+  assert.equal(defaults.modelFanOut, "auto");
+  const options = job.parseAnalyticsRefreshArguments(["--mode=full", "--model-block-size=14", "--model-fanout=all"], env);
+  assert.equal(options.modelBlockSize, 14);
+  assert.equal(options.modelFanOut, "all");
+  for (const flag of ["--model-block-size=0", "--model-block-size=71", "--model-block-size=1.5", "--model-fanout=sometimes"]) {
+    assert.throws(() => job.parseAnalyticsRefreshArguments(["--mode=full", flag], env),
+      { code: "ANALYTICS_V2_REFRESH_MODEL_BLOCKS_INVALID" });
+  }
 });

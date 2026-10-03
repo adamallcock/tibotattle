@@ -201,7 +201,7 @@ export function parseArguments(argv) {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
     dump: null, perDateExpected: null, ownerReference: null, dense: false,
     refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null, stagedPrimary: [],
-    refreshWorkers: 1, syntheticRevisionFloor: false,
+    refreshWorkers: 1, refreshModelBlockSize: 10, refreshModelFanOut: "auto", syntheticRevisionFloor: false,
   };
   const valueOf = (index, argument) => {
     const value = argv[index];
@@ -233,7 +233,15 @@ export function parseArguments(argv) {
       if (!Number.isSafeInteger(workers) || workers < 1 || workers > 16) fail("REHEARSAL_ARGUMENT_INVALID", { argument });
       options.refreshWorkers = workers;
     }
-    else if (argument === "--refresh-timeout-minutes") {
+    else if (argument === "--refresh-model-block-size") {
+      const size = Number(valueOf(++index, argument));
+      if (!Number.isSafeInteger(size) || size < 1 || size > 70) fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      options.refreshModelBlockSize = size;
+    } else if (argument === "--refresh-model-fanout") {
+      const mode = valueOf(++index, argument);
+      if (!["auto", "all", "off"].includes(mode)) fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      options.refreshModelFanOut = mode;
+    } else if (argument === "--refresh-timeout-minutes") {
       const minutes = Number(valueOf(++index, argument));
       if (!Number.isSafeInteger(minutes) || minutes < 1 || minutes > MAX_REFRESH_TIMEOUT_MINUTES) {
         fail("REHEARSAL_ARGUMENT_INVALID", { argument });
@@ -349,7 +357,7 @@ async function freePort() {
   });
 }
 
-async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes, workers = 1 }) {
+async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes, workers = 1, modelBlockSize = 10, modelFanOut = "auto" }) {
   const started = performance.now();
   let stdout;
   let stderr;
@@ -361,7 +369,8 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes,
       ...(workers > 1 ? [] : [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`]),
       ...(workers > 1 ? [] : [`--max-semi-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_SEMI_SPACE_MIB}`]),
       DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`,
-      ...(workers > 1 ? [`--workers=${workers}`] : [])], {
+      ...(workers > 1 ? [`--workers=${workers}`] : []),
+      `--model-block-size=${modelBlockSize}`, `--model-fanout=${modelFanOut}`], {
       cwd: CLOUD_RUN_ROOT,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1", ...endpointEnv },
       maxBuffer: 64 * 1024 * 1024,
@@ -605,7 +614,7 @@ export const FASTPATH_REHEARSAL_COUNTED_TABLES = Object.freeze([
  * and memory summary (its peak resident set included), straight from its
  * receipt.
  */
-function refreshMeasurement(run) {
+export function refreshMeasurement(run) {
   const receipt = run.receipt ?? {};
   return {
     wallMs: run.wallMs,
@@ -926,7 +935,8 @@ async function main() {
 
     // 4. analytics-refresh (dist, Node 22) at the golden's clock.
     const first = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
-      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers });
+      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
+      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
     timings["refresh:first"] = first.wallMs;
     report.steps.refreshFirst = { exitCode: first.exitCode, receipt: first.receipt, error: first.error };
     if (first.exitCode !== 0) fail("REHEARSAL_REFRESH_FAILED", { error: first.error });
@@ -987,7 +997,8 @@ async function main() {
 
     // 8. A second run at the same clock must create no revision.
     const second = await runRefresh({ node22: options.node22, endpointEnv, schema, nowIso,
-      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers });
+      timeoutMinutes: options.refreshTimeoutMinutes, workers: options.refreshWorkers,
+      modelBlockSize: options.refreshModelBlockSize, modelFanOut: options.refreshModelFanOut });
     timings["refresh:second"] = second.wallMs;
     report.steps.refreshSecond = { exitCode: second.exitCode, receipt: second.receipt, error: second.error };
     report.measurement.refreshSecond = refreshMeasurement(second);

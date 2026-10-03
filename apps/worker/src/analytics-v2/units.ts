@@ -200,3 +200,27 @@ export async function evaluateModelBlock(input: AnalyticsV2ModelBlockInput): Pro
   }
   return dates;
 }
+
+/** Deterministic dispatch predicate; only evidence counts decide auto dispatch. */
+export function shouldFanOutModelDates(evidence: ReadonlyMap<string, { readonly usage: number }>,
+  dates: readonly string[], mode: "auto" | "all" | "off"): boolean {
+  if (mode !== "auto") return mode === "all";
+  return dates.some((day) => {
+    const from = modelHistoryWindow(day).fromDay;
+    let rows = 0;
+    for (const [key, value] of evidence) if (key >= from && key <= day) rows += value.usage;
+    return rows > 120_000;
+  });
+}
+/** Blocks retain the full prepared-day shape; model-view pruning requires its own read-trace proof. */
+export function modelBlockPayload(input: AnalyticsV2ModelBlockInput, dates: readonly string[]): AnalyticsV2ModelBlockInput {
+  const from = modelHistoryWindow(dates[0]!).fromDay, through = dates.at(-1)!;
+  const trim = <T>(values: ReadonlyMap<string, T>) => new Map([...values].filter(([day]) => day >= from && day <= through));
+  return { owner: input.owner, dates, prepared: trim(input.prepared), dayDigests: trim(input.dayDigests),
+    horizonQuota: trim(input.horizonQuota) };
+}
+export function partitionModelDates(dates: readonly string[], size: number): readonly (readonly string[])[] {
+  const blocks: string[][] = [];
+  for (let index = 0; index < dates.length; index += size) blocks.push(dates.slice(index, index + size));
+  return blocks;
+}

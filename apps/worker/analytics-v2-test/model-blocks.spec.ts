@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { canonicalJson } from "../src/canonical-json";
 import { computeAnalyticsV2Owner, analyticsV2EvidenceOf, analyticsV2EmissionBytes,
   type AnalyticsV2OwnerEmission, type AnalyticsV2OwnerRunContext } from "../src/analytics-v2/compute-owner";
 import { computeAnalyticsV2Owner as reference } from "./fixtures/model-blocks-inline-reference";
-import { prepareSpan, evaluateModelBlock, type AnalyticsV2ModelBlockInput } from "../src/analytics-v2/units";
+import { prepareSpan, evaluateModelBlock, partitionModelDates, type AnalyticsV2ModelBlockInput } from "../src/analytics-v2/units";
 import { ANALYTICS_V2_DEFAULT_RESOURCES } from "../src/analytics-v2/resources";
-import { modelHistoryWindow } from "../vendor/analytics-d43c8f92/entry";
+import * as nativePath from "../src/analytics-v2/native-path";
+import { modelHistoryWindow, SharedAnalyticsUnavailable } from "../vendor/analytics-d43c8f92/entry";
 import { addDays, composeProofCorpus, denseFacts, effectiveV2Owner, syntheticOwner, TODAY } from "./fixtures/synthetic-occurrences.mjs";
 
 const dates = Array.from({ length: 70 }, (_, i) => addDays(TODAY, i - 69));
@@ -68,6 +69,13 @@ describe("MODEL-BLOCKS inline stage proof", () => {
     const horizonQuota = new Map([...occurrences].map(([day, value]) => [day, value.quota]));
     const input: AnalyticsV2ModelBlockInput = { owner, dates, prepared: prepared.prepared,
       dayDigests: prepared.dayDigests, horizonQuota };
+    const nativeInput = { ...input, prepared: new Map([...input.prepared].map(([day, value]) =>
+      [day, { ...value, modelUsage: null, quota: null }])) };
+    const nativeOrdered = await evaluateModelBlock(nativeInput);
+    const nativeByDay = new Map(nativeOrdered.map((result) => [result.day, result]));
+    for (const result of await evaluateModelBlock({ ...nativeInput, dates: [...dates].reverse() })) {
+      expect(result).toEqual(nativeByDay.get(result.day));
+    }
     const ordered = await evaluateModelBlock(input);
     const byDay = new Map(ordered.map((result) => [result.day, result]));
     const shuffled = [...dates].sort((a, b) => digest(a).localeCompare(digest(b)));
@@ -94,4 +102,35 @@ describe("MODEL-BLOCKS inline stage proof", () => {
       expect(completed.flat().sort((a, b) => a.day.localeCompare(b.day))).toEqual(ordered);
     }
   }, 60000);
+});
+
+
+it("MODEL-BLOCKS replays earlier refusal/emissions before the first date-ordered terminal error", async () => {
+  const owner = effectiveV2Owner(syntheticOwner(9, "pro")), occurrences = new Map();
+  const input = { context, owner, occurrences, evidence: analyticsV2EvidenceOf(occurrences), load: null };
+  const original = nativePath.evaluateAnalyticsV2ModelDate;
+  const spy = vi.spyOn(nativePath, "evaluateAnalyticsV2ModelDate").mockImplementation(async (window) => {
+    if (window.day === dates[2]) throw new SharedAnalyticsUnavailable("incomplete_window");
+    if (window.day === dates[5] || window.day === dates[30]) {
+      const code = window.day === dates[5] ? "ANALYTICS_V2_SYNTHETIC_FIRST" : "ANALYTICS_V2_SYNTHETIC_SECOND";
+      throw Object.assign(new Error(code), { code });
+    }
+    return original(window);
+  });
+  try {
+    const before = capture(), after = capture();
+    await expect(reference({ ...input, hooks: before.hooks })).rejects.toMatchObject({ code: "ANALYTICS_V2_SYNTHETIC_FIRST" });
+    await expect(computeAnalyticsV2Owner({ ...input, hooks: { ...after.hooks, modelBlocks: { size: 5, fanOut: "all",
+      run: async (input) => {
+        const blocks = partitionModelDates(input.dates, 5);
+        const completed = await Promise.all([...blocks].reverse().map(async (dates, index) => {
+          await new Promise((resolve) => setTimeout(resolve, index % 3));
+          return evaluateModelBlock({ ...input, dates });
+        }));
+        return { dates: completed.reverse().flat(), heapPeakBytes: null };
+      } } } })).rejects.toMatchObject({ code: "ANALYTICS_V2_SYNTHETIC_FIRST" });
+    expect(after.emissions).toEqual(before.emissions);
+    expect(after.account).toBe(before.account);
+    expect(after.emissions.some((emission) => emission.kind === "refusal" && emission.refusal.day === dates[2])).toBe(true);
+  } finally { spy.mockRestore(); }
 });

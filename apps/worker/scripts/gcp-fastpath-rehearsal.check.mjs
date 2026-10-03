@@ -96,3 +96,14 @@ test("REV-SEED: the synthetic revision floor option is a fresh-schema rehearsal 
     ["2026-09-05", 5], ["2026-09-06", 1], ["2026-09-08", 3]]);
   assert.deepEqual(syntheticRehearsalFloorDays(days), floor, "a pure function of the golden");
 });
+
+
+test("MODEL-BLOCKS flags are bounded pure rehearsal pass-throughs", () => {
+  const options = parseArguments(["--golden", "/g", "--refresh-model-block-size", "14", "--refresh-model-fanout", "all"]);
+  assert.equal(options.refreshModelBlockSize, 14);
+  assert.equal(options.refreshModelFanOut, "all");
+  for (const flags of [["--refresh-model-block-size", "0"], ["--refresh-model-block-size", "71"],
+    ["--refresh-model-block-size", "1.5"], ["--refresh-model-fanout", "sometimes"]]) {
+    assert.throws(() => parseArguments(["--golden", "/g", ...flags]), refused("REHEARSAL_ARGUMENT_INVALID"));
+  }
+});

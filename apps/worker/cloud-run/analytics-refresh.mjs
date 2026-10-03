@@ -370,7 +370,7 @@ export const ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB = 4_144;
  */
 export const ANALYTICS_REFRESH_TASK_MEMORY_CHECK = Object.freeze({ taskMemoryMiB: 16_384, nativeReserveMiB: 1_024,
   youngGenerationSemiSpaces: 3 });
-const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed", "workers"]);
+const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed", "workers", "model-block-size", "model-fanout"]);
 const ISO_INSTANT = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/u;
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const DECIMAL = /^(?:0|[1-9]\d{0,9})$/u;
@@ -536,6 +536,8 @@ refusal) or 1 (failure).
   --revision-seed=<n>    first published revision is above n (default 0); a
                          day publishes at max(head, revision floor, n) + 1
   --workers=<n>          compute Workers, 1..16 (default 1: inline)
+  --model-block-size=<b> contiguous dates per block, 1..70 (default 10)
+  --model-fanout=<mode>  auto, all or off (default auto)
   --help                 print this text
 
 Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
@@ -630,6 +632,11 @@ export function parseAnalyticsRefreshArguments(argv, env = {}) {
       || Number(workersText) > ANALYTICS_REFRESH_WORKER_BOUNDS.maximum) {
     usageFail("ANALYTICS_V2_REFRESH_WORKERS_INVALID");
   }
+  // model-blocks-flags: independent of read-plan's readConcurrency hunk.
+  const modelBlockSizeText = flags.get("model-block-size") ?? "10";
+  const modelFanOut = flags.get("model-fanout") ?? "auto";
+  if (!DECIMAL.test(modelBlockSizeText) || Number(modelBlockSizeText) < 1 || Number(modelBlockSizeText) > 70
+      || !["auto", "all", "off"].includes(modelFanOut)) usageFail("ANALYTICS_V2_REFRESH_MODEL_BLOCKS_INVALID");
   return Object.freeze({
     help: false,
     mode,
@@ -637,6 +644,7 @@ export function parseAnalyticsRefreshArguments(argv, env = {}) {
     nowMs,
     revisionSeed: Number(seedText),
     workers: Number(workersText),
+    modelBlockSize: Number(modelBlockSizeText), modelFanOut,
   });
 }
 
@@ -1393,6 +1401,20 @@ function memorySummary(resources, recorded, peakRssBytes, { mainHeapPeakBytes = 
         peakRunning: workerPool.peakRunning,
         peakChargedMiB: toMiB(workerPool.peakChargedBytes),
         peakLoads: workerPool.peakLoads,
+        // model-blocks-metrics: receipt projection only; no time-guard change.
+        ...(workerPool.modelBlockedOwners > 0 ? { modelBlocks: Object.freeze({
+          blockedOwners: workerPool.modelBlockedOwners,
+          blocksPerOwner: workerPool.modelBlocksPerOwner,
+          grantsRequested: workerPool.blockGrantsRequested,
+          grantsGranted: workerPool.blockGrantsGranted,
+          grantsRefused: workerPool.blockGrantsRefused,
+          ownerEvaluatedBlocks: workerPool.modelBlockedOwners + workerPool.blockGrantsRefused,
+          serializedBytes: workerPool.blockSerializedBytes,
+          cloneMs: workerPool.blockCloneMs,
+          evaluationMs: workerPool.blockEvaluationMs,
+          heapPeakBytes: workerPool.blockHeapPeakBytes,
+          measurements: workerPool.blockMeasurements,
+        }) } : {}),
         largestGcCallbackHeapMiB: workerPool.largestGcCallbackHeapBytes === null
           ? null : toMiB(workerPool.largestGcCallbackHeapBytes),
         largestGcCallbackHeapPercentOfLimit: workerPool.largestGcCallbackHeapShareOfLimit === null
@@ -1587,6 +1609,7 @@ export async function runAnalyticsRefresh({
       if (parsed.workers > 1) {
         ownerPool = (dependencies.createOwnerPool ?? createAnalyticsRefreshOwnerPool)({
           workers: parsed.workers, memoryBudgetBytes: resources.compute.memoryBudgetBytes,
+          modelBlockSize: parsed.modelBlockSize, modelFanOut: parsed.modelFanOut,
           poolBytes: resources.workerPool.poolBytes, loadConcurrency: resources.workerPool.loadConcurrency,
           ...(dependencies.workerUrl === undefined ? {} : { workerUrl: dependencies.workerUrl }) });
       }

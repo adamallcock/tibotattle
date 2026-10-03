@@ -15,7 +15,7 @@ it("MODEL-BLOCKS digest-only observer matches an independent rolling digest and 
   await computeAnalyticsV2({ ...input, emissionSequenceHash: (value) => { hashes.push(hash(value)); return hash(value); } });
   expect(hashes).toEqual([]);
   await computeAnalyticsV2({ ...input, emissionSequenceHash: hash, emissionSequenceDigest: (value) => { observed.push(value); } });
-  let expected = hash(canonicalJson(["analytics-v2-emission-sequence-v1"]));
+  const oracleEmissions = new Map<number, AnalyticsV2OwnerEmission[]>();
   // A pool facade delegates to the frozen owner oracle, but compute still
   // constructs the actual context and performs its original merge/account.
   await computeAnalyticsV2({ ...input, loadOwnerOccurrences: async (ownerDigest, span) =>
@@ -34,17 +34,21 @@ it("MODEL-BLOCKS digest-only observer matches an independent rolling digest and 
           return loaded;
         }, hooks: { emit: (emission) => { emissions.push(emission); }, accountBytes: () => 0,
           progress: io.progress, timed: async (_phase, work) => work() } });
+      oracleEmissions.set(task.index, emissions);
       return { emissions, computation, timings: {} };
-    } }, emissionSequenceHash: (value) => {
-      // SHA inputs are bounded to the current row and previous digest; no
-      // emission array is constructed for observation.
-      expect(typeof value).toBe("string");
-      if (typeof value === "string") {
-        const frame = JSON.parse(value);
-        if (frame.length > 1) expected = hash(canonicalJson([frame[0], expected, frame[2], frame[3]]));
-      }
-      return hash(value);
-    }, emissionSequenceDigest: (value) => { observed.push(value); } });
+    } }, emissionSequenceHash: hash, emissionSequenceDigest: (value) => { observed.push(value); } });
+  // Derive the expected sequence ONLY from the frozen pre-refactor owner
+  // oracle. Production hash inputs cannot define what this test expects.
+  let expected = hash(canonicalJson(["analytics-v2-emission-sequence-v1"]));
+  let modelDates = 0;
+  for (const [, emissions] of [...oracleEmissions].sort(([left], [right]) => left - right)) {
+    for (const emission of emissions) {
+      if (emission.kind === "modelDate") modelDates += 1;
+      expected = hash(canonicalJson(["analytics-v2-emission-sequence-v1", expected, emission.kind,
+        canonicalJson(emission.kind === "refusal" ? emission.refusal : emission.row)]));
+    }
+  }
+  expect(modelDates).toBeGreaterThan(0);
   expect(observed).toEqual([expected, expected]);
   await expect(computeAnalyticsV2({ ...input, emissionSequenceHash: () => "not-a-digest", emissionSequenceDigest: () => {
     throw new Error("malformed digest must never reach observer");
