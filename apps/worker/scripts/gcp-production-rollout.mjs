@@ -951,28 +951,63 @@ export function parseCaptureEdgeArguments(argv) {
 
 /**
  * The capture's destination: a path that does not exist (not even as a
- * symlink), whose parent is an existing directory outside the repository
- * (compared on real paths, case-insensitively, so a symlinked or
- * differently-cased parent cannot reach the checkout). Returns the path under
- * the parent's real path.
+ * symlink), whose parent is an existing directory outside every git checkout
+ * and safe to hold an owner-only file (see captureParentSafe). Returns the
+ * path under the parent's real path.
  */
 async function captureOutputPath(output, repositoryRoot) {
   if ((await lstat(output).catch(() => null)) !== null) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS");
   let parent;
-  let root;
   try {
     parent = await realpath(dirname(output));
+  } catch {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  }
+  if (basename(output) === "") fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  await captureParentSafe(parent, repositoryRoot);
+  return join(parent, basename(output));
+}
+
+/**
+ * The checks on the capture's real parent directory, run before the reads and
+ * again once the file is open:
+ * - a directory outside this repository (compared on real paths,
+ *   case-insensitively, so a symlinked or differently-cased parent cannot
+ *   reach the checkout);
+ * - outside every other git checkout too (the owner's main checkout, a
+ *   sibling worktree, a `.git` directory): no directory from the parent up to
+ *   `/` holds a `.git` entry, file or directory. A `.git` directory's own
+ *   parent holds it, so a path inside one is refused as well. An entry that
+ *   cannot be read is treated as present;
+ * - the rule of production-reconcile.mjs createPrivateReconciliationOutputDirectory:
+ *   owned by this user and not group- or world-writable, unless it is a
+ *   root-owned sticky directory, so nobody else can later replace the capture.
+ */
+async function captureParentSafe(parent, repositoryRoot) {
+  let info;
+  let root;
+  try {
+    info = await lstat(parent);
     root = await realpath(repositoryRoot);
   } catch {
     fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
   }
-  if (!(await lstat(parent)).isDirectory() || basename(output) === "") fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  if (!info.isDirectory()) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
   const folded = parent.toLowerCase();
   const rootFolded = root.toLowerCase();
   if (folded === rootFolded || folded.startsWith(rootFolded.endsWith(sep) ? rootFolded : `${rootFolded}${sep}`)) {
     fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY");
   }
-  return join(parent, basename(output));
+  for (let directory = parent; ; directory = dirname(directory)) {
+    const marker = await lstat(join(directory, ".git")).then(() => true, (error) => error?.code !== "ENOENT");
+    if (marker) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY");
+    if (dirname(directory) === directory) break;
+  }
+  const uid = process.getuid?.();
+  const rootOwnedSticky = info.uid === 0 && (info.mode & 0o1000) !== 0;
+  if (!rootOwnedSticky && ((uid !== undefined && info.uid !== uid) || (info.mode & 0o022) !== 0)) {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE");
+  }
 }
 
 /**
@@ -1006,8 +1041,16 @@ function liveReadCode(error) {
     : "ROLLOUT_EDGE_CAPTURE_READ_FAILED";
 }
 
-/** O_EXCL and O_NOFOLLOW at mode 0600: an existing path or a symlink is refused, never followed or replaced. */
-async function writeCaptureExclusive(path, bytes) {
+/**
+ * O_EXCL and O_NOFOLLOW at mode 0600: an existing path or a symlink is
+ * refused, never followed or replaced. O_NOFOLLOW guards only the last
+ * component, so before any byte is written the open file must still be the
+ * entry at `path` on real paths (a parent swapped for a symlink during the
+ * reads is caught) and the parent must pass captureParentSafe again. On a
+ * failure the empty file this call created is removed, matched by device
+ * and inode.
+ */
+async function writeCaptureExclusive(path, bytes, repositoryRoot) {
   let handle;
   try {
     handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
@@ -1016,6 +1059,21 @@ async function writeCaptureExclusive(path, bytes) {
     fail(error?.code === "EEXIST" || error?.code === "ELOOP"
       ? "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS" : "ROLLOUT_EDGE_CAPTURE_WRITE_FAILED");
   }
+  let opened;
+  try {
+    opened = await handle.stat();
+    const real = await realpath(path);
+    const entry = await lstat(real);
+    if (real !== path || !entry.isFile() || entry.dev !== opened.dev || entry.ino !== opened.ino) {
+      fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED");
+    }
+    await captureParentSafe(dirname(real), repositoryRoot);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await removeCreatedCapture(path, opened);
+    fail(/^ROLLOUT_EDGE_CAPTURE_OUTPUT_[A-Z_]+$/u.test(error?.code ?? "") ? error.code
+      : "ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED");
+  }
   try {
     await handle.chmod(0o600);
     await handle.writeFile(bytes);
@@ -1023,9 +1081,20 @@ async function writeCaptureExclusive(path, bytes) {
     await handle.close();
   } catch {
     await handle.close().catch(() => {});
-    // Only the file this call just created exclusively.
-    await unlink(path).catch(() => {});
+    await removeCreatedCapture(path, opened);
     fail("ROLLOUT_EDGE_CAPTURE_WRITE_FAILED");
+  }
+}
+
+/** Unlink only the file this call created: the entry at `path` (or where it now resolves) with the open file's device and inode. */
+async function removeCreatedCapture(path, opened) {
+  if (opened === undefined) return;
+  for (const candidate of [await realpath(path).catch(() => null), path]) {
+    const entry = candidate === null ? null : await lstat(candidate).catch(() => null);
+    if (entry?.isFile() && entry.dev === opened.dev && entry.ino === opened.ino) {
+      await unlink(candidate).catch(() => {});
+      return;
+    }
   }
 }
 
@@ -1085,7 +1154,7 @@ async function captureEdge(argv, dependencies) {
   });
   const bytes = Buffer.from(`${JSON.stringify(capture, null, 2)}\n`, "utf8");
   if (bytes.length > EDGE_CAPTURE_MAX_BYTES) fail("ROLLOUT_EDGE_CAPTURE_TOO_LARGE");
-  await writeCaptureExclusive(output, bytes);
+  await writeCaptureExclusive(output, bytes, context.repositoryRoot);
   return deepFreeze({
     status: "ok",
     verb: args.verb,

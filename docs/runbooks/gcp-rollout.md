@@ -128,8 +128,14 @@ and print the argv; they run no `gcloud` and make no request.
      `staging.tibotattle.com` and `admin.staging.tibotattle.com`, never
      `wrangler.jsonc`'s workers.dev `env.staging`. The command verifies the
      capture exactly as `roll` will and writes nothing unless it verifies. It
-     then writes the file once, mode 0600, and refuses an existing path, a
-     symlink or a path inside the repository. It prints only the mode, the
+     then writes the file once, mode 0600. It refuses an existing path or a
+     symlink, and a parent directory that is inside any git checkout (a
+     directory from it up to `/` holds a `.git` entry, which covers this
+     checkout, the main checkout, other worktrees and `.git` itself) or that
+     another user could write to (it must be the owner's and not group- or
+     world-writable, unless it is a root-owned sticky directory such as
+     `/tmp`). Once the file is open it checks the path again, so a parent
+     swapped during the reads is refused. It prints only the mode, the
      edge commit, the capture time and the file's sha256. The file holds the
      account id and the Worker's binding values: keep it owner-private and
      never commit it. Without `--execute` it checks the arguments, the output
@@ -258,7 +264,7 @@ and print the argv; they run no `gcloud` and make no request.
 | `POSTGRES_MIGRATION_CONFLICT` | A lifecycle pass holds the migration fence | Nothing was applied. Wait for the pass and rerun |
 | `ROLLOUT_MIGRATE_RECEIPT_STALE`, `ROLLOUT_MIGRATE_RECEIPT_MISMATCH` | The receipt is older than 24 hours, or is for another commit, digest or job | Rerun `migrate` for the exact digest to get a fresh receipt. This is a no-op for an applied schema |
 | `ROLLOUT_EDGE_LIVE_STALE`, `ROLLOUT_EDGE_LIVE_UNVERIFIED` | The edge capture is older than 15 minutes or fails verification | Capture again |
-| `ROLLOUT_EDGE_CAPTURE_*`, `PRODUCTION_LIVE_*` from `capture-edge` | The output path exists, is a symlink or is inside the repository; the inventory is missing, changed or of another Worker; or the read-only Cloudflare reads were refused (`PRODUCTION_LIVE_CREDENTIAL_REQUIRED`: no token). A `ROLLOUT_EDGE_LIVE_*` code means the live edge itself does not verify | Nothing was written. Fix the input and capture again. Do not roll over an edge that does not verify |
+| `ROLLOUT_EDGE_CAPTURE_*`, `PRODUCTION_LIVE_*` from `capture-edge` | The output path exists or is a symlink, its parent is inside a git checkout (`ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY`) or writable by another user (`ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE`), or the path changed during the reads (`ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED`); the inventory is missing, changed or of another Worker; or the read-only Cloudflare reads were refused (`PRODUCTION_LIVE_CREDENTIAL_REQUIRED`: no token). A `ROLLOUT_EDGE_LIVE_*` code means the live edge itself does not verify | Nothing was written. Fix the input and capture again. Do not roll over an edge that does not verify |
 | `EDGE_CONTRACT_DRIFT`, `ROLLOUT_EDGE_ORIGIN_MISMATCH` | The contract blob differs from the live gcp edge's, or the edge points at another service | Do not roll. See [contract changes](#contract-changes) |
 | `ROLLOUT_MAINTENANCE_JOB_REQUIRED` | The edge is not in `gcp` mode and the target names no maintenance job (staging today) | Nothing was written. The verifier path cannot pass without a lifecycle pass; give the plane its maintenance job first |
 | `ROLLOUT_MAINTENANCE_PASS_FAILED` | The roll's maintenance execution did not succeed exactly once. This runs after the service and every job moved, so the roll has already happened and left no receipt | Read the execution's closed log lines, fix the cause, then run `roll` again for the same digest with a new edge capture. If the image is wrong, treat the roll as incomplete and fix forward |

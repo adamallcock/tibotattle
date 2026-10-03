@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1518,13 +1518,15 @@ test("capture-edge writes exactly the capture roll reads, 0600, verified as roll
       const space = await captureWorkspace(t);
       await mkdir(join(space.directory, "out"));
       let clock = NOW - 30_000;
-      const { calls, dependencies } = captureDependencies(space, edge, { now: () => (clock += 1_000) });
+      // The reads take a minute of the clock.
+      const { calls, dependencies } = captureDependencies(space, edge,
+        { now: () => (clock += 1_000), onCapture: () => { clock += 60_000; } });
       const result = await runRollout(captureArgv(space, environment), dependencies);
       const label = `${environment} ${liveEdgeMode(edge) ?? "unset"}`;
       assert.deepEqual(Object.keys(result), ["status", "verb", "environment", "mode", "edgeCommit", "capturedAt", "sha256"]);
       assert.deepEqual([result.status, result.verb, result.environment, result.mode, result.edgeCommit],
         ["ok", "capture-edge", environment, liveEdgeMode(edge) ?? "unset", EDGE_COMMIT], label);
-      // The clock before the first read, not after the self-check.
+      // The clock before the first read: not after the reads, nor after the self-check.
       assert.equal(result.capturedAt, new Date(NOW - 29_000).toISOString(), label);
       assert.deepEqual(calls.provider, [{ accountId: ACCOUNT_ID,
         workerName: environment === "production" ? "app-usagemonitor" : "app-usagemonitor-staging-edge" }], label);
@@ -1603,6 +1605,85 @@ test("capture-edge refuses an existing output, a symlink, or a path in the repos
   await assert.rejects(runRollout(captureArgv({ ...space, output: join(space.directory, "missing", "edge.json") }), orphan),
     isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID"));
 });
+
+test("capture-edge refuses an output in any git checkout: another checkout, a worktree, a .git directory", async (t) => {
+  const space = await captureWorkspace(t);
+  // A synthetic main checkout (a .git directory) and a linked worktree (a .git file) beside the repository root.
+  const main = join(space.directory, "main");
+  await mkdir(join(main, ".git", "objects"), { recursive: true });
+  await mkdir(join(main, "evidence", "deep"), { recursive: true });
+  const worktree = join(space.directory, "worktree");
+  await mkdir(worktree);
+  await writeFile(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "worktree")}\n`);
+  await symlink(join(main, "evidence"), join(space.directory, "to-main"));
+  for (const output of [join(main, "edge.json"), join(main, "evidence", "deep", "edge.json"),
+    join(main, ".git", "edge.json"), join(main, ".git", "objects", "edge.json"), join(worktree, "edge.json"),
+    join(space.directory, "to-main", "edge.json")]) {
+    const { calls, dependencies } = captureDependencies(space, gcpLive);
+    await assert.rejects(runRollout(captureArgv({ ...space, output }), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"), output);
+    await assert.rejects(runRollout(captureArgv({ ...space, output }, "production", []), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"), `${output}: the dry run refuses it too`);
+    assert.deepEqual(calls.provider, [], output);
+    assert.equal(await absent(output), true, output);
+  }
+  // A directory beside them, with no .git above it, is accepted.
+  await mkdir(join(space.directory, "out"));
+  const { dependencies } = captureDependencies(space, gcpLive);
+  assert.equal((await runRollout(captureArgv(space), dependencies)).status, "ok");
+});
+
+test("capture-edge refuses a parent another user could write to, as the reviewed private-output rule does",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    const out = join(space.directory, "out");
+    await mkdir(out);
+    t.after(() => chmod(out, 0o700).catch(() => {}));
+    for (const mode of [0o777, 0o770, 0o703, 0o1777, 0o720]) {
+      await chmod(out, mode);
+      const { calls, dependencies } = captureDependencies(space, gcpLive);
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE"),
+        mode.toString(8));
+      assert.deepEqual(calls.provider, [], mode.toString(8));
+      assert.equal(await absent(space.output), true, mode.toString(8));
+    }
+    await chmod(out, 0o755);
+    const { dependencies } = captureDependencies(space, gcpLive);
+    assert.equal((await runRollout(captureArgv(space), dependencies)).status, "ok");
+    // A root-owned sticky directory (the system temporary directory) is accepted: a dry run, so nothing is written.
+    const shared = await stat("/tmp").catch(() => null);
+    if (shared !== null && shared.uid === 0 && (shared.mode & 0o1000) !== 0) {
+      const output = join("/tmp", `edge-capture-${process.pid}-${Date.now()}.json`);
+      const { calls, dependencies: dry } = captureDependencies(space, gcpLive);
+      assert.equal((await runRollout(captureArgv({ ...space, output }, "production", []), dry)).status, "dry-run");
+      assert.deepEqual(calls.provider, []);
+      assert.equal(await absent(output), true);
+    }
+  });
+
+test("capture-edge checks the output again once open: a parent swapped for a symlink during the reads is refused",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    const out = join(space.directory, "out");
+    const elsewhere = join(space.directory, "elsewhere");
+    await mkdir(join(space.repository, "evidence"));
+    await mkdir(elsewhere);
+    for (const [label, target] of [["into the repository", join(space.repository, "evidence")],
+      ["to another directory", elsewhere]]) {
+      await rm(out, { recursive: true, force: true });
+      await rm(`${out}-away`, { recursive: true, force: true });
+      await mkdir(out);
+      const swap = async () => {
+        await rename(out, `${out}-away`);
+        await symlink(target, out);
+      };
+      const { dependencies } = captureDependencies(space, gcpLive, { onCapture: swap });
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED"),
+        label);
+      assert.deepEqual(await readdir(target), [], `${label}: the created file is removed, nothing written through it`);
+      assert.deepEqual(await readdir(`${out}-away`), [], label);
+    }
+  });
 
 test("capture-edge writes with O_EXCL: a file or symlink that appears during the reads is never replaced or followed",
   async (t) => {
