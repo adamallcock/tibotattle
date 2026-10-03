@@ -5,7 +5,7 @@
 // fails with V0X_ESBUILD_UNAVAILABLE without them. No database, no network.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,9 +13,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   ALLOWED, bundleReaders, classifyCodeMention, classifySqlMention, collectAllSql, collectSources,
-  D1_DDL_FILES, D1_READER_FILES, D1_REACH, declaredPriceColumns, findPriceMentions, importGraph, loadEsbuild, parseBuildEntries,
+  D1_DDL_FILES, D1_READER_FILES, D1_REACH, declaredPriceColumns, findPriceMentions, importGraph, loadEsbuild, parseBuildEntries, readBuildEntries,
   POSTGRES_DDL_FILE, PRICE_COLUMNS, reachEdges, reachSlack, reachViolations, readerInventory, readerSlack, readerViolations,
-  serverIdentifiers, SHIPPED_ALLOWANCE, shippedReaders, shippedSlack, shippedViolations, UNATTRIBUTED, WORKER_ROOT, wildcardLines,
+  serverIdentifiers, SHIPPED_ALLOWANCE, shippedReaders, shippedSlack, shippedViolations, UNATTRIBUTED, VERBATIM_TRANSFER_DECLARATION,
+  WORKER_ROOT, wildcardLines,
 } from "./v0x-admission-price-readers.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "v0x-admission-price-readers.mjs");
@@ -27,8 +28,14 @@ const realReaders = readerInventory(sources);
 
 test("the readers found in the real tree are exactly the allowlisted ones, and no unlisted module names a receipt column", () => {
   assert.ok(sources.size > 300, "the scan covers the Worker's source, scripts, vendor tree and PostgreSQL SQL");
-  for (const directory of ["src/", "cloud-run/", "scripts/", "vendor/", "postgres/migrations/primary/", "postgres/staged-migrations/primary/"]) {
+  for (const directory of ["src/", "cloud-run/", "scripts/", "vendor/", "postgres/migrations/primary/"]) {
     assert.ok([...sources.keys()].some((file) => file.startsWith(directory)), `the scan walks ${directory}`);
+  }
+  // The staged-migrations directory is empty between promotions; whatever is
+  // staged there is scanned with the rest of postgres/.
+  const stagedDirectory = join(WORKER_ROOT, "postgres", "staged-migrations", "primary");
+  for (const name of existsSync(stagedDirectory) ? readdirSync(stagedDirectory).filter((file) => file.endsWith(".sql")) : []) {
+    assert.ok(sources.has(`postgres/staged-migrations/primary/${name}`), `the scan walks the staged ${name}`);
   }
   assert.ok([...sources.keys()].some((file) => file.startsWith("src/analytics-v2/")), "the scan walks the GCP analytics modules");
   assert.ok([...sources.keys()].some((file) => file.startsWith("cloud-run/routes/")), "the scan walks the Cloud Run routes");
@@ -36,7 +43,8 @@ test("the readers found in the real tree are exactly the allowlisted ones, and n
   // Every entry is a real file, so a typo cannot hide behind a ceiling.
   for (const { file } of ALLOWED) assert.ok(existsSync(join(WORKER_ROOT, file)), `${file} exists`);
   // The list only shrinks: a reader may disappear, but the admission writer, the DDL and the guard's own list are fixed points.
-  const known = new Set(["admission", "d1-legacy", "vendored-d1-legacy", "d1-trigger-mirror", "ddl", "guard"]);
+  const known = new Set(["admission", "d1-legacy", "vendored-d1-legacy", "d1-trigger-mirror", "ddl", "guard",
+    "verbatim-transfer"]);
   for (const { role, file } of realReaders) assert.ok(known.has(role), `${file} has the unlisted role ${role}`);
   for (const role of ["admission", "ddl", "guard"]) assert.ok(realReaders.some((reader) => reader.role === role), `${role} is found`);
 });
@@ -65,6 +73,24 @@ test("the GCP admission module only writes the receipt columns: every mention is
   const source = sources.get(ADMISSION);
   assert.match(source, /INSERT INTO \$\{table\(schema, "telemetry_records"\)\} \(/u);
   assert.match(source, /UPDATE \$\{table\(schema, "telemetry_contributions"\)\}\s+SET server_cost_nanousd = \$1/u);
+});
+
+test("the verbatim v0.x transfer only declares the receipt columns, so it copies each sealed row unchanged", () => {
+  const TRANSFER = "scripts/postgres-legacy-contribution-transfer.mjs";
+  const entry = ALLOWED.find(({ file }) => file === TRANSFER);
+  assert.deepEqual([entry.role, [...entry.kinds]], ["verbatim-transfer", ["read"]]);
+  const mentions = findPriceMentions(TRANSFER, sources.get(TRANSFER));
+  // Eleven telemetry_contributions and fifteen telemetry_records receipt columns.
+  assert.equal(mentions.length, 26);
+  assert.deepEqual([...sources.get(TRANSFER).matchAll(VERBATIM_TRANSFER_DECLARATION)].map((match) => match[1]).sort(),
+    mentions.map(({ column }) => column).sort());
+  // A read of a receipt value is refused even under the ceiling.
+  const doctored = new Map(sources).set(TRANSFER, sources.get(TRANSFER).replace('int("server_cost_nanousd")',
+    'int("server_cost_nanousd")); const total = row.server_cost_nanousd; void ((total'));
+  assert.ok(readerViolations(doctored).some((line) => line.startsWith(`${TRANSFER}:`)
+    && line.endsWith("only copies receipts verbatim")), "a value read is refused");
+  // Nor may any other role use it: the role is the transfer's alone.
+  assert.deepEqual(ALLOWED.filter(({ role }) => role === "verbatim-transfer").map(({ file }) => file), [TRANSFER]);
 });
 
 test("the Cloudflare D1 readers are the only other readers, and none is a PostgreSQL or GCP module", () => {
@@ -137,11 +163,15 @@ test("the reach proof: the origin's import graph into the D1 readers equals the 
   assert.deepEqual(shipped.reachByFile.get("server.mjs"), D1_REACH["server.mjs"]);
   // Positive controls: the graph sees the real edges, so "no new route" is not a parser that sees nothing.
   const origin = shipped.reachByFile.get("server.mjs");
-  assert.ok(origin["src/index.ts"].includes("src/telemetry-repository.ts"));
   assert.deepEqual(origin["src/postgres-legacy-contribution-admission.ts"], ["src/telemetry-repository.ts"]);
   assert.deepEqual(origin["src/telemetry-repository.ts"], ["src/quota-analysis.ts"]);
-  assert.ok(origin["cloud-run/server.mjs"].includes("src/index.ts"));
-  assert.ok(Object.keys(origin).length > 20, "the Worker's D1 plumbing is in the reach, so a narrower reach would be a parser that stopped seeing it");
+  assert.deepEqual(origin["cloud-run/server.mjs"], ["cloud-run/postgres-production-host.mjs"]);
+  assert.deepEqual(origin["cloud-run/postgres-production-host.mjs"],
+    ["src/postgres-community-daily.ts", "src/postgres-legacy-contribution-admission.ts"]);
+  // D-CRB: the origin no longer bundles the Worker's index.ts, so it is in no reach.
+  assert.equal(Object.hasOwn(origin, "src/index.ts"), false);
+  assert.ok(Object.keys(origin).length >= 10,
+    "the GCP ports and the community helpers that reach the D1 modules are in the reach, so a narrower reach would be a parser that stopped seeing them");
   // The entries that ship no reader may import one only where esbuild then drops it; the bundle proof is their guarantee.
   for (const [entry, readers] of shipped.byFile) {
     if (!(entry in D1_REACH)) assert.equal([...readers].some((reader) => D1_READER_FILES.includes(reader)), false, entry);
@@ -165,21 +195,21 @@ test("negative: a new route that imports a D1 reader, or a member that gains an 
   ]);
   // The same through the quota module, and through a reader's importer instead of the reader.
   assert.equal(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], route), [route]: ["src/quota-analysis.ts"] })).length, 2);
-  assert.equal(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], route), [route]: ["src/index.ts"] })).length, 2);
-  assert.equal(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], route), [route]: ["src/telemetry-v0.2-repository.ts"] })).length, 2);
+  assert.equal(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], route), [route]: ["src/community-allowance.ts"] })).length, 2);
+  assert.equal(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], route), [route]: ["src/postgres-legacy-contribution-admission.ts"] })).length, 2);
   // An existing member gains a direct import of a reader or of another member (the host, or a GCP port).
   assert.deepEqual(reachViolations(doctoredReach({ "cloud-run/server.mjs": sortedPlus(real["cloud-run/server.mjs"], "src/telemetry-repository.ts") })).map((line) => line.split(";")[0]),
     ["server.mjs: cloud-run/server.mjs imports src/telemetry-repository.ts, a D1 receipt reader"]);
   assert.deepEqual(reachViolations(doctoredReach({ "src/postgres-community-daily.ts": sortedPlus(real["src/postgres-community-daily.ts"], "src/quota-analysis.ts") })).map((line) => line.split(";")[0]),
     ["server.mjs: src/postgres-community-daily.ts imports src/quota-analysis.ts, a D1 receipt reader"]);
-  assert.equal(reachViolations(doctoredReach({ "src/postgres-google-enrollment.ts": sortedPlus(real["src/postgres-google-enrollment.ts"], "src/telemetry-v0.2-repository.ts") })).length, 1);
+  assert.equal(reachViolations(doctoredReach({ "src/community-refresh-lanes.ts": sortedPlus(real["src/community-refresh-lanes.ts"], "src/telemetry-repository.ts") })).length, 1);
   // An entry that ships a reader and has no reviewed reach has every edge refused, whatever else is pinned.
   assert.equal(reachViolations(shipped.reachByFile, {}).length, edgeCount(real));
-  assert.equal(reachViolations(shipped.reachByFile, { "server.mjs": { "cloud-run/server.mjs": ["src/index.ts"] } }).length, edgeCount(real) - 1);
+  assert.equal(reachViolations(shipped.reachByFile, { "server.mjs": { "cloud-run/server.mjs": ["cloud-run/postgres-production-host.mjs"] } }).length, edgeCount(real) - 1);
   // An edge that disappears is slack, never a failure.
-  const smaller = doctoredReach({ "src/postgres-google-enrollment.ts": [] });
+  const smaller = doctoredReach({ "src/community-refresh-lanes.ts": [] });
   assert.deepEqual(reachViolations(smaller), []);
-  assert.deepEqual(reachSlack(smaller), ["server.mjs no longer has the import src/postgres-google-enrollment.ts -> src/retention.ts; remove it from D1_REACH"]);
+  assert.deepEqual(reachSlack(smaller), ["server.mjs no longer has the import src/community-refresh-lanes.ts -> src/community-allowance.ts; remove it from D1_REACH"]);
   function edgeCount(reach) {
     return Object.values(reach).reduce((count, imports) => count + imports.length, 0);
   }
@@ -277,8 +307,11 @@ test("the reach is a pure function of the import graph: externals, cycles, an un
 });
 
 test("build.mjs entry parsing refuses a layout it cannot read completely instead of scanning fewer entries", async () => {
-  const real = parseBuildEntries(await readFile(join(WORKER_ROOT, "cloud-run", "build.mjs"), "utf8"));
+  const real = await readBuildEntries(join(WORKER_ROOT, "cloud-run"));
   assert.ok(real.entries.length >= 15);
+  // K-PAR's compute Worker entry is imported from analytics-kernel-closure.mjs, never re-declared.
+  assert.deepEqual(real.entries.find(({ name }) => name === "analytics-refresh-worker"),
+    { name: "analytics-refresh-worker", file: "analytics-refresh-worker.mjs" });
   assert.deepEqual(real.external, ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"]);
   const source = [
     'const ENTRY = resolve(ROOT, "server.mjs");',
@@ -301,6 +334,24 @@ test("build.mjs entry parsing refuses a layout it cannot read completely instead
     { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
   assert.throws(() => parseBuildEntries(source.replace('  external: ["pg"],\n', "")), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
   assert.throws(() => parseBuildEntries("const x = 1;"), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+  // A whole-line comment in the entry block declares nothing.
+  assert.deepEqual(parseBuildEntries(source.replace("    server: ENTRY,", "    // the origin\n    server: ENTRY,")).entries,
+    parseBuildEntries(source).entries);
+  // An entry constant imported from a sibling module is read from that module's own export.
+  const importing = `import {\n  WORKER_ENTRY,\n  other,\n} from "./closure.mjs";\n${source.replace("    server: ENTRY,",
+    "    server: ENTRY,\n    worker: WORKER_ENTRY,")}`;
+  const sibling = 'const CLOUD_RUN_ROOT = dirname(fileURLToPath(import.meta.url));\n'
+    + 'export const WORKER_ENTRY = resolve(CLOUD_RUN_ROOT, "worker.mjs");\n';
+  assert.deepEqual(parseBuildEntries(importing, { "./closure.mjs": sibling }).entries, [
+    { name: "server", file: "server.mjs" }, { name: "worker", file: "worker.mjs" },
+    { name: "analytics-refresh", file: "analytics-refresh.mjs" },
+  ]);
+  // Unread, or not exported in the recognised form, it is refused.
+  assert.throws(() => parseBuildEntries(importing), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+  assert.throws(() => parseBuildEntries(importing, { "./closure.mjs": sibling.replace("export const WORKER_ENTRY", "export let WORKER_ENTRY") }),
+    { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+  assert.throws(() => parseBuildEntries(importing, { "./closure.mjs": sibling.replace("CLOUD_RUN_ROOT, \"worker.mjs\"", "elsewhere, \"worker.mjs\"") }),
+    { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
 });
 
 test("mentions are classified: INSERT lists and UPDATE assignments write, a frozen quoted list is inventory, every other use reads", () => {
@@ -657,6 +708,6 @@ test("the command line lists the readers and exits 0 on the real tree", () => {
   assert.equal(listed.status, 0, listed.stderr);
   assert.match(listed.stdout, /^admission +\d+ +src\/postgres-legacy-contribution-admission\.ts +\[\d+ write\] \d+ column\(s\)$/mu);
   assert.match(listed.stdout, /^ships analytics-refresh\.mjs: none$/mu);
-  assert.match(listed.stdout, /^reach server\.mjs: 27 module\(s\), 69 import\(s\) lead to src\/quota-analysis\.ts, src\/telemetry-repository\.ts$/mu);
+  assert.match(listed.stdout, /^reach server\.mjs: 11 module\(s\), 16 import\(s\) lead to src\/quota-analysis\.ts, src\/telemetry-repository\.ts$/mu);
   assert.match(listed.stdout, /^ships server\.mjs: .*src\/postgres-legacy-contribution-admission\.ts/mu);
 });

@@ -129,6 +129,14 @@ const TEST_FILE = /\.(?:check|spec|test)\.[cm]?[jt]s$/u;
  *                      trigger field list: names only, no value is read.
  *   guard              this module's own column list.
  *   ddl                the PostgreSQL column definitions.
+ *   verbatim-transfer  the sealed D1-to-PostgreSQL v0.x history transfer
+ *                      (D-PT4X's PT-4 stage 'legacy-contributions'): it names
+ *                      every column of telemetry_contributions and
+ *                      telemetry_records, receipts included, only in its
+ *                      column declarations, so each sealed row is copied
+ *                      verbatim. Copy only: every mention is a column-spec
+ *                      call (VERBATIM_TRANSFER_DECLARATION); it never prices
+ *                      from or reads a receipt for analysis.
  */
 export const ALLOWED = Object.freeze([
   ["src/postgres-legacy-contribution-admission.ts", "admission", ["write"], 26],
@@ -138,6 +146,7 @@ export const ALLOWED = Object.freeze([
   ["scripts/staging-readiness-lib.mjs", "d1-trigger-mirror", ["inventory"], 11],
   ["scripts/v0x-admission-price-readers.mjs", "guard", ["inventory"], 20],
   [POSTGRES_DDL_FILE, "ddl", ["ddl"], 30],
+  ["scripts/postgres-legacy-contribution-transfer.mjs", "verbatim-transfer", ["read"], 26],
 ].map(([file, role, kinds, max]) => Object.freeze({ file, role, kinds: Object.freeze(kinds), max })));
 
 /**
@@ -154,6 +163,13 @@ export const SHIPPED_ALLOWANCE = Object.freeze({
   ]),
 });
 
+/**
+ * A verbatim-transfer module's only allowed mention: a column-spec call
+ * (text, int, instant, real, decimal or json) whose one argument is the quoted
+ * name of a receipt column.
+ */
+export const VERBATIM_TRANSFER_DECLARATION = /\b(?:text|int|instant|real|decimal|json)\("(server_[a-z0-9_]+)"\)/gu;
+
 /** The Cloudflare D1 modules that read receipts: every ALLOWED entry with the d1-legacy role. */
 export const D1_READER_FILES = Object.freeze(ALLOWED.filter(({ role }) => role === "d1-legacy").map(({ file }) => file).sort());
 
@@ -164,51 +180,37 @@ export const D1_READER_FILES = Object.freeze(ALLOWED.filter(({ role }) => role =
  * empty list). The origin carries the Worker's D1 code, so a
  * new GCP route imported into it can import the D1 repository and call a
  * reader without naming a column, which neither the source scan nor the shipped
- * text can see. Any edge not listed here is refused. Reviewed at 1bea3b5f:
- *   cloud-run/server.mjs      the host; it composes the Worker's index.ts and
- *                             three GCP ports. The origin binds both D1 handles
- *                             to a proxy that throws on any access.
- *   src/index.ts              the Worker's fetch handler: the intended path to
- *                             the D1 repository, with its D1-internal helpers.
+ * text can see. Any edge not listed here is refused. Reviewed at 1bea3b5f,
+ * then again where K-V0X met D-CRB on the fast-path final line (the PROD-PREP
+ * merge, 2026-10-03):
+ *   cloud-run/server.mjs      the host; it no longer bundles the Worker's
+ *                             index.ts (D-CRB, CR-6/CR-7 phase B), so 17 of
+ *                             the 27 modules reviewed at 1bea3b5f, index.ts
+ *                             among them, no longer reach a reader from the
+ *                             origin. Its only edge is D-CRB's production
+ *                             host.
+ *   cloud-run/postgres-production-host.mjs
+ *                             D-CRB's production composition: the same two GCP
+ *                             ports server.mjs imported directly at 1bea3b5f
+ *                             (the community daily read and the v0.1
+ *                             admission), moved, not added.
  *   src/postgres-*.ts         GCP ports; each imports only helper functions.
  * A new edge into this graph is a decision, not a fix: route the new code
  * through stored quantities and the current registry instead.
  */
 export const D1_REACH = Object.freeze({
   "server.mjs": Object.freeze(Object.fromEntries(Object.entries({
-    "cloud-run/server.mjs": ["src/index.ts", "src/postgres-community-daily.ts", "src/postgres-google-enrollment.ts", "src/postgres-legacy-contribution-admission.ts"],
+    "cloud-run/postgres-production-host.mjs": ["src/postgres-community-daily.ts", "src/postgres-legacy-contribution-admission.ts"],
+    "cloud-run/server.mjs": ["cloud-run/postgres-production-host.mjs"],
     "src/admin-community-allowance.ts": ["src/community-allowance.ts", "src/community-publication.ts"],
-    "src/admin-graph-refresh-progress.ts": ["src/community-allowance.ts", "src/community-model-history.ts", "src/community-refresh-lanes.ts"],
-    "src/admin-metrics-history.ts": ["src/community-allowance.ts", "src/community-daily-aggregates.ts", "src/storage-community-graph-publication.ts"],
-    "src/admin-reconstruction-progress.ts": ["src/community-daily-aggregates.ts"],
     "src/community-allowance.ts": ["src/quota-analysis.ts"],
-    "src/community-analysis-warmer.ts": ["src/community-allowance.ts", "src/community-refresh-lanes.ts", "src/quota-analysis.ts"],
     "src/community-daily-aggregates.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts", "src/community-publication.ts", "src/community-refresh-lanes.ts"],
-    "src/community-model-history.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts"],
     "src/community-publication.ts": ["src/community-allowance.ts"],
     "src/community-refresh-lanes.ts": ["src/community-allowance.ts"],
-    "src/index.ts": [
-      "src/admin-community-allowance.ts", "src/admin-graph-refresh-progress.ts", "src/admin-metrics-history.ts", "src/admin-reconstruction-progress.ts",
-      "src/community-allowance.ts", "src/community-analysis-warmer.ts", "src/community-daily-aggregates.ts", "src/community-model-history.ts",
-      "src/participant-erasure.ts", "src/public-allowance-breakdowns.ts", "src/retention.ts", "src/storage-community-daily.ts",
-      "src/storage-community-graph-publication.ts", "src/storage-community-progress.ts", "src/storage-erasure.ts", "src/telemetry-repository.ts",
-      "src/telemetry-v0.2-repository.ts",
-    ],
-    "src/participant-erasure.ts": ["src/retention.ts", "src/storage-erasure.ts", "src/telemetry-repository.ts"],
     "src/postgres-community-daily.ts": ["src/community-allowance.ts", "src/community-daily-aggregates.ts"],
-    "src/postgres-google-enrollment.ts": ["src/retention.ts"],
     "src/postgres-legacy-contribution-admission.ts": ["src/telemetry-repository.ts"],
-    "src/public-allowance-breakdowns.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts"],
     "src/quota-analysis.ts": [],
-    "src/retention.ts": ["src/storage-erasure.ts"],
-    "src/storage-community-daily.ts": ["src/community-daily-aggregates.ts", "src/storage-community-graph-publication.ts"],
-    "src/storage-community-graph-publication.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts", "src/storage-community-graph.ts"],
-    "src/storage-community-graph.ts": ["src/community-allowance.ts", "src/quota-analysis.ts"],
-    "src/storage-community-progress.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts", "src/storage-community-graph.ts"],
-    "src/storage-erasure.ts": ["src/storage-community-daily.ts", "src/storage-community-graph-publication.ts", "src/storage-graph-retirement.ts"],
-    "src/storage-graph-retirement.ts": ["src/admin-community-allowance.ts", "src/storage-community-graph.ts"],
     "src/telemetry-repository.ts": ["src/quota-analysis.ts"],
-    "src/telemetry-v0.2-repository.ts": ["src/telemetry-repository.ts"],
   }).map(([importer, imports]) => [importer, Object.freeze(imports)]))),
 });
 
@@ -457,6 +459,13 @@ export function readerViolations(sources, allowed = ALLOWED) {
     if (mentions.length > entry.max) {
       violations.push(`${file}:${lines} has ${mentions.length} mention(s) (${summarize(mentions)}), at most ${entry.max} allowed for role ${entry.role}`);
     }
+    if (entry.role === "verbatim-transfer") {
+      // Copy only: every mention must be a column declaration, never a read of a value.
+      const declarations = [...sources.get(file).matchAll(VERBATIM_TRANSFER_DECLARATION)].length;
+      if (declarations !== mentions.length) {
+        violations.push(`${file}:${lines} has ${mentions.length - declarations} mention(s) outside a column declaration; role ${entry.role} only copies receipts verbatim`);
+      }
+    }
   }
   return violations;
 }
@@ -535,24 +544,63 @@ export function serverIdentifiers(source) {
   return new Set([...source.matchAll(/(?<![A-Za-z0-9_])server_[a-z0-9_]+/gu)].map((match) => match[0]));
 }
 
-/** build.mjs's entry-point files, its external list and its output directory, parsed from its source. */
-export function parseBuildEntries(buildSource) {
+/**
+ * build.mjs's entry-point files and its external list, parsed from its source.
+ * An entry constant is declared in build.mjs (`const X_ENTRY = resolve(ROOT,
+ * "<file>")`) or imported from a sibling module whose source `imported` maps
+ * by its import specifier (`export const X_ENTRY = resolve(CLOUD_RUN_ROOT,
+ * "<file>")`; K-PAR's compute Worker entry is named once, in
+ * analytics-kernel-closure.mjs, so the kernel closure and the build cannot
+ * disagree). A whole-line `//` comment in the entry block declares nothing and
+ * is skipped; any other line must be a recognised entry.
+ */
+export function parseBuildEntries(buildSource, imported = {}) {
+  const unparseable = () => {
+    throw Object.assign(new Error("V0X_BUILD_ENTRIES_UNPARSEABLE"), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+  };
   const constants = new Map([...buildSource.matchAll(/^const ([A-Z0-9_]*ENTRY) = resolve\(ROOT, "([^"]+)"\);$/gmu)]
     .map((match) => [match[1], match[2]]));
+  for (const match of buildSource.matchAll(/^import \{([^}]*)\} from "(\.\/[^"]+)";$/gmu)) {
+    const names = match[1].split(",").map((name) => name.trim()).filter((name) => /^[A-Z0-9_]*ENTRY$/u.test(name));
+    if (names.length === 0) continue;
+    const source = imported[match[2]];
+    if (typeof source !== "string" || !/^const CLOUD_RUN_ROOT = dirname\(fileURLToPath\(import\.meta\.url\)\);$/mu.test(source)) {
+      unparseable();
+    }
+    for (const name of names) {
+      const exported = new RegExp(`^export const ${name} = resolve\\(CLOUD_RUN_ROOT, "([^"]+)"\\);$`, "mu").exec(source);
+      if (exported === null || constants.has(name)) unparseable();
+      constants.set(name, exported[1]);
+    }
+  }
   const block = /entryPoints:\s*\{([^}]*)\}/u.exec(buildSource)?.[1] ?? "";
-  const lines = block.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  const lines = block.split("\n").map((line) => line.trim()).filter((line) => line !== "" && !line.startsWith("//"));
   const declared = lines.map((line) => /^(?:"([^"]+)"|([A-Za-z0-9_]+)):\s*([A-Z0-9_]+),?$/u.exec(line))
     .map((match) => match && { name: match[1] ?? match[2], constant: match[3] });
   const external = /external:\s*(\[[^\]]*\])/u.exec(buildSource)?.[1];
-  // Every line of the entry block must be a recognised entry: a line in another style is refused, never skipped.
+  // Every other line of the entry block must be a recognised entry: a line in another style is refused, never skipped.
   if (constants.size === 0 || declared.length !== constants.size || declared.some((entry) => entry === null)
       || declared.some(({ constant }) => !constants.has(constant)) || external === undefined) {
-    throw Object.assign(new Error("V0X_BUILD_ENTRIES_UNPARSEABLE"), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+    unparseable();
   }
   return {
     entries: declared.map(({ name, constant }) => ({ name, file: constants.get(constant) })),
     external: JSON.parse(external),
   };
+}
+
+/** build.mjs and the sibling modules it imports entry constants from, read under `cloudRun`. */
+export async function readBuildEntries(cloudRun) {
+  const buildSource = await readFile(join(cloudRun, "build.mjs"), "utf8");
+  const imported = {};
+  for (const match of buildSource.matchAll(/^import \{([^}]*)\} from "(\.\/[^"]+)";$/gmu)) {
+    if (!match[1].split(",").some((name) => /^[A-Z0-9_]*ENTRY$/u.test(name.trim()))) continue;
+    if (!/^\.\/[a-z0-9-]+\.mjs$/u.test(match[2])) {
+      throw Object.assign(new Error("V0X_BUILD_ENTRIES_UNPARSEABLE"), { code: "V0X_BUILD_ENTRIES_UNPARSEABLE" });
+    }
+    imported[match[2]] = await readFile(join(cloudRun, match[2]), "utf8");
+  }
+  return parseBuildEntries(buildSource, imported);
 }
 
 /** A bundle's text before its first recognised module marker; it belongs to no module. */
@@ -595,7 +643,7 @@ export function loadEsbuild(root = WORKER_ROOT) {
  */
 export async function shippedReaders(root = WORKER_ROOT, esbuild = loadEsbuild(root), readerFiles = D1_READER_FILES) {
   const cloudRun = join(root, "cloud-run");
-  const { entries, external } = parseBuildEntries(await readFile(join(cloudRun, "build.mjs"), "utf8"));
+  const { entries, external } = await readBuildEntries(cloudRun);
   const result = await esbuild.build({
     absWorkingDir: cloudRun,
     entryPoints: Object.fromEntries(entries.map(({ name, file }) => [name, join(cloudRun, file)])),
