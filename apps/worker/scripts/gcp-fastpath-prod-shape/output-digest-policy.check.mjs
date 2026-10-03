@@ -49,3 +49,19 @@ test("Q1's explicit two completed runs keep all stamp checks; unbounded counts r
   await assert.rejects(assertOutputProvenance(pool({ bad: "state <>" }), "synthetic", { ...binding, expectedRunCount: 2 }), { code: "MEAS_OUTPUT_PROVENANCE_INVALID:run" });
   await assert.rejects(assertOutputProvenance(pool(), "synthetic", { ...binding, expectedRunCount: 3 }), { code: "MEAS_OUTPUT_PROVENANCE_BINDING_INVALID" });
 });
+
+test("every projected run identity must link to a completed expected run, including Q1 reruns", async () => {
+  const valid = pool();
+  await assertOutputProvenance(valid, "synthetic", { ...binding, expectedRunCount: 2 });
+  for (const [table, omitted] of Object.entries(OUTPUT_DIGEST_POLICY)) {
+    for (const key of omitted.filter((key) => ["run_id", "proof_run"].includes(key))) {
+      const fragment = `FROM "synthetic"."${table}" t`;
+      const call = valid.calls.find(([sql]) => sql.includes(fragment) && sql.includes(`t."${key}"`));
+      assert.ok(call, `${table}.${key} must receive a link check`);
+      assert.match(call[0], /r\.state = 'complete'/u);
+      assert.deepEqual(call[1], [binding.kernelId, binding.manifestVersion]);
+      await assert.rejects(collectOutputDigestEvidence(pool({ bad: fragment }), "synthetic",
+        { ...binding, expectedRunCount: 2 }), { code: `MEAS_OUTPUT_PROVENANCE_INVALID:${table}.${key}` });
+    }
+  }
+});

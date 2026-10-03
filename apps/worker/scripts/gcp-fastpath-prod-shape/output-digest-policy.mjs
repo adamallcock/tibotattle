@@ -71,6 +71,13 @@ export async function assertOutputProvenance(pool, schema, { kernelId, computeSh
     const known = present.get(table);
     if (!known) continue;
     for (const key of omitted) {
+      if (["run_id", "proof_run"].includes(key) && known.has(key)) {
+        checks.push([`${table}.${key}`, `SELECT count(*)::int AS mismatches FROM ${q}."${table}" t
+          WHERE NOT EXISTS (SELECT 1 FROM ${q}.analytics_v2_runs r
+            WHERE r.run_id = t."${key}" AND r.kernel_id = $1
+              AND r.manifest_version = $2 AND r.state = 'complete')`, [kernelId, manifestVersion]]);
+        continue;
+      }
       if (!["kernel_id", "first_kernel_id", "price_kernel_id", "manifest_version"].includes(key) || !known.has(key)) continue;
       checks.push([`${table}.${key}`, `SELECT count(*)::int AS mismatches FROM ${q}."${table}"
         WHERE "${key}" IS DISTINCT FROM $1`, [key === "manifest_version" ? manifestVersion : kernelId]]);
