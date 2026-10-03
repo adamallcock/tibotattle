@@ -1,0 +1,5 @@
+# Approved temporary exact-patch exception; see dated decision.
+[[IgnoredVulns]]
+id = "GHSA-ch52-4w7c-c8xp"
+ignoreUntil = 2026-10-10
+reason = "Reviewed max-stale patch aa858673; exact-byte CI gate; expires 2026-10-10 UTC."
