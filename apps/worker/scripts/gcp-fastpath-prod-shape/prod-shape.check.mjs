@@ -295,7 +295,8 @@ test("the production-tier script reaches only its measurement instance, through 
   assert.match(code, /^GUARDED=\$\{MEAS_GUARDED:-0\}$/mu);
   assert.match(code, /^CPU_PROFILE=\$\{MEAS_CPU_PROFILE:-cpu\}$/mu);
   assert.equal(calls("refresh").filter((line) => line.includes("--no-execute")).length, 1);
-  assert.match(code, /REFRESH_ENV\+=\(--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu\s+--refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="\$CPU_SAMPLE_US"\)/u);
+  assert.match(code, /REFRESH_ENV\+=\(--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu\s+--refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="\$CPU_SAMPLE_US"\s+--refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS="\$PROFILE_SUMMARY"\)/u);
+  assert.match(code, /^PROFILE_SUMMARY=\$\{MEAS_PROFILE_SUMMARY_SECONDS:-600\}$/mu);
   // Database snapshots before, during (the sampler) and after; Cloud Monitoring after.
   for (const label of ['"$PROFILE-before"', '"$PROFILE-after"']) assert.ok(code.includes(`pgstat ${label}`), label);
   assert.match(code, /pgstat "\$1-during-\$\(printf %02d \$n\)"/u);
@@ -307,14 +308,19 @@ test("the production-tier script reaches only its measurement instance, through 
   const create = lines.findIndex((line) => line.trimStart().replace(CHILD, "").startsWith("D meas-create "));
   assert.ok(trap > 0 && trap < create, "trap before meas-create");
   assert.ok(lines.findIndex((line) => line.trim() === "trap stop INT TERM HUP") > trap, "signals stop the child");
-  // Every remote step after the trap, the seed included, is a waited child, so a signal tears down at once.
-  for (const line of [seed, ...["meas-create", "refresh", "refresh-uncapped"].flatMap(calls)]) {
+  // Every remote step after the trap, the seed, the database snapshots and the metrics read included, is a
+  // waited child, so a signal tears down at once (the EXIT trap's own meas-teardown is the one foreground call).
+  for (const line of [seed, ...["meas-create", "refresh", "refresh-uncapped", "meas-pgstat-enable", "meas-pgstat",
+    "meas-metrics"].flatMap(calls)]) {
     assert.match(line.trimStart(), CHILD, line);
   }
   assert.match(code, /if \[\[ ! -f "\$RUN\/refresh\/refresh\.json" \]\]; then/u);
   assert.match(code, /if \[\[ "\$OUTCOME" == "LOCK_HELD" \]\]; then/u);
   // The instance name is evaluated once and kept for a manual teardown.
   assert.match(code, /^print -r -- "\$INSTANCE" > "\$OUT\/instance"$/mu);
+  // Its own PID, so an early stop signals this shell only (never `pkill -f`, which also hits caffeinate).
+  assert.match(code, /^print -r -- \$\$ > "\$OUT\/pid"$/mu);
+  assert.doesNotMatch(code, /pkill/u);
   const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
   if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
 });
@@ -344,10 +350,12 @@ test("the production-tier script's signal handling tears down at once and leaves
     `D() { /bin/sh -c '/bin/sleep ${marker}; true'; }`,
     "trap teardown EXIT", "trap stop INT TERM HUP",
     `child "${join(dir, "step.log")}" - D x || exit 1`, "echo finished"].join("\n");
-  // The same with the database sampler running beside the step (`sampled`): both trees end.
+  // The same with the database sampler running beside the step (`sampled`), mid-snapshot: its snapshot is
+  // itself a waited child (as pgstat runs it), and both trees end.
   const samplerMarker = `31.${process.pid % 10_000}2`;
   const sampledHarness = harness.replace(`child "${join(dir, "step.log")}" - D x || exit 1`, [
-    `PGSTAT_INTERVAL=${samplerMarker}`, "pgstat() { true; }", definition("sampler"), definition("sampled"),
+    "PGSTAT_INTERVAL=0.1", `pgstat() { child /dev/null - /bin/sh -c '/bin/sleep ${samplerMarker}; true'; }`,
+    definition("sampler"), definition("sampled"),
     `sampled lbl "${join(dir, "step.log")}" - D x || exit 1`].join("\n"));
   const running = () => spawnSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" }).status === 0;
   const samplerRunning = () => spawnSync("pgrep", ["-f", `sleep ${samplerMarker}`], { encoding: "utf8" }).status === 0;
@@ -409,6 +417,9 @@ test("the local measurement passes the profiler's env and keeps only its summary
   assert.deepEqual(cpuProfileEnv(), {});
   assert.deepEqual(cpuProfileEnv({ cpuProfileUs: 5_000 }), { ANALYTICS_V2_REFRESH_PROFILE: "cpu",
     ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: "5000" });
+  assert.equal(cpuProfileEnv({ cpuProfileUs: 10_000, cpuProfileSummarySeconds: 10 })
+    .ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS, "10");
+  assert.equal(Object.hasOwn(cpuProfileEnv({ cpuProfileUs: 10_000 }), "ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS"), false);
   assert.deepEqual(cpuProfileEnv({ cpuProfileUs: 1_000, cpuProfileDir: "/abs/dir" }).ANALYTICS_V2_REFRESH_PROFILE_DIR,
     "/abs/dir");
   const stderr = ['{"profile":"analytics-refresh-profile-v1","sequence":0}', "not json",
@@ -444,7 +455,7 @@ test("the database delta ranks statements by server time and counts a new statem
     { migrator: "m", runtime: "r" })), ["migrator", "runtime", "cloudsqladmin", "postgres", "other"]);
 });
 
-test("the run summary reads a partial receipt directory: a killed run still shows its profile and database delta", async () => {
+test("the run summary reads a partial receipt directory: a killed run shows its database delta, and its profile from saved logs", async () => {
   const { summarizeProdtier } = await import("./summarize-prodtier.mjs");
   const dir = mkdtempSync(join(tmpdir(), "prodtier-summary-"));
   try {
@@ -471,16 +482,34 @@ test("the run summary reads a partial receipt directory: a killed run still show
       ["dense-during-02", 90, 9]);
     assert.deepEqual(dense.sessions.map(({ label }) => label), ["dense-before", "dense-during-01", "dense-during-02"]);
     assert.equal(dense.cloudMonitoring, null);
+    assert.deepEqual([dense.profile.source, dense.profile.lines, dense.profile.last], [null, 0, null]);
     // With the uncapped receipt and its profile lines, the last line and the cadence are kept.
     const line = (sequence, reason) => ({ profile: "analytics-refresh-profile-v1", sequence, reason, phase: "compute",
       elapsedSeconds: sequence * 1800, progress: { ownersStarted: sequence }, memory: { heapUsedMiB: 1 },
       eventLoop: { utilization: 0.9 }, gc: { ms: 5 }, top: { self: [["(garbage collector)", 1, 1]] } });
+    // Mid-run or after an operator stop, the lines exist only in Cloud Logging: a saved listing gives the
+    // newest execution's lines, in order, without duplicates; other entries are ignored.
+    const entry = (execution, timestamp, value, text = false) => ({ timestamp, labels: {
+      "run.googleapis.com/execution_name": execution }, ...(text ? { textPayload: JSON.stringify(value) }
+      : { jsonPayload: value }) });
+    write("dense/profile-log.json", [
+      entry("j-old", "2026-10-01T00:00:00Z", line(7, "exit")),
+      entry("j-x", "2026-10-03T01:00:00Z", line(1, "interval")),
+      entry("j-x", "2026-10-03T00:30:00Z", line(0, "interval"), true),
+      entry("j-x", "2026-10-03T01:00:00Z", line(1, "interval")),
+      entry("j-x", "2026-10-03T01:01:00Z", { status: "ok", state: "complete" }),
+      { timestamp: "2026-10-03T01:02:00Z", textPayload: "Container called exit(143)." },
+    ]);
+    const logged = summarizeProdtier(dir, ["dense"]).runs.dense;
+    assert.deepEqual([logged.profile.source, logged.profile.lines, logged.profile.loggedExecution,
+      logged.profile.last.sequence], ["cloud-logging", 2, "j-x", 1]);
+    assert.deepEqual(logged.profile.cadence.map(({ sequence }) => sequence), [0, 1]);
     write("dense/uncapped/refresh-uncapped.json", { step: "refresh-uncapped", execution: "j-x", durationSeconds: 3_600,
       outcome: "complete", statusLine: { status: "ok", state: "complete", timings: { read: 1 } },
       profiles: [line(0, "interval"), line(1, "exit")] });
     const full = summarizeProdtier(dir, ["dense"]).runs.dense;
-    assert.deepEqual([full.uncapped.outcome, full.uncapped.state, full.profile.lines, full.profile.last.reason],
-      ["complete", "complete", 2, "exit"]);
+    assert.deepEqual([full.uncapped.outcome, full.uncapped.state, full.profile.lines, full.profile.last.reason,
+      full.profile.source], ["complete", "complete", 2, "exit", "receipt"]);
     assert.deepEqual(full.profile.cadence.map(({ sequence, elapsedSeconds }) => [sequence, elapsedSeconds]),
       [[0, 0], [1, 1800]]);
   } finally {

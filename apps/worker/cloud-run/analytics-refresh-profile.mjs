@@ -31,9 +31,11 @@
  * one content-free JSON line to stderr (ANALYTICS_REFRESH_PROFILE_SCHEMA):
  * the top 40 functions by self and by total time since the start, the top
  * files by self time, the window's top functions, the run phase and owner
- * progress counts, heap and resident set, GC totals by kind, CPU time and
- * event-loop utilisation. The line carries no `status` key, so the deploy
- * wrapper never takes it for the run's status line.
+ * progress counts, heap and resident set, GC totals by kind, CPU time,
+ * event-loop utilisation and the profiler's own cost (`fold`: the folds so
+ * far, their total and latest stop-fold-restart time, and the time spent
+ * serializing and writing the earlier lines). The line carries no `status`
+ * key, so the deploy wrapper never takes it for the run's status line.
  *
  * Content-free: a function is named "<file>:<function>". The file is a
  * repository-relative module path: the bundle's own module markers (esbuild
@@ -344,6 +346,8 @@ export async function createAnalyticsRefreshProfiler({ settings, phase = () => n
   let failed = null;
   let timer = null;
   let peakRssBytes = 0;
+  // The profiler's own cost, measured on the real clock (never the injected one).
+  const cost = { count: 0, ms: 0, lastMs: 0, writeMs: 0 };
 
   const post = (method, params) => {
     let result;
@@ -406,11 +410,15 @@ export async function createAnalyticsRefreshProfiler({ settings, phase = () => n
         windowSelf: ranked(windowSelf, ANALYTICS_REFRESH_PROFILE_TOP.window,
           [...windowSelf.values()].reduce((sum, value) => sum + value, 0)),
       },
+      fold: { count: cost.count, ms: Math.round(cost.ms), lastMs: Math.round(cost.lastMs),
+        writeMs: Math.round(cost.writeMs) },
       ...(failed === null ? {} : { error: failed }),
     };
     eluWindow = elu;
     sequence += 1;
+    const writeStartedAt = performance.now();
     try { write(JSON.stringify(line)); } catch { /* the log is best effort */ }
+    cost.writeMs += performance.now() - writeStartedAt;
   };
   const fold = async (reason, restart) => {
     if (!running) return;
@@ -418,6 +426,7 @@ export async function createAnalyticsRefreshProfiler({ settings, phase = () => n
     let windowSamples = 0;
     let raw = null;
     const windowStartMs = windowStartedAtMs;
+    const foldStartedAt = performance.now();
     try {
       running = false;
       const { profile } = post("Profiler.stop");
@@ -431,6 +440,9 @@ export async function createAnalyticsRefreshProfiler({ settings, phase = () => n
         : "ANALYTICS_V2_REFRESH_PROFILE_FAILED";
       running = false;
     }
+    cost.lastMs = performance.now() - foldStartedAt;
+    cost.ms += cost.lastMs;
+    cost.count += 1;
     const at = sequence;
     emit(reason, windowSelf, windowSamples, windowStartMs);
     if (raw !== null) {

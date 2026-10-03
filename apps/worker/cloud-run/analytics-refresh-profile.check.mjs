@@ -41,8 +41,11 @@ function assertContentFree(line) {
   // Never mistaken for the run's status line by the deploy wrapper.
   assert.equal(Object.hasOwn(value, "status"), false);
   assert.deepEqual(Object.keys(value).filter((key) => key !== "error").sort(), ["cpu", "elapsedSeconds", "eventLoop",
-    "gc", "memory", "phase", "profile", "profiledSeconds", "progress", "reason", "sampleIntervalUs", "samples",
+    "fold", "gc", "memory", "phase", "profile", "profiledSeconds", "progress", "reason", "sampleIntervalUs", "samples",
     "sequence", "top", "windowSeconds"]);
+  assert.deepEqual(Object.keys(value.fold).sort(), ["count", "lastMs", "ms", "writeMs"]);
+  for (const figure of Object.values(value.fold)) assert.ok(Number.isSafeInteger(figure) && figure >= 0);
+  assert.ok(value.fold.count === value.sequence + 1 && value.fold.lastMs <= value.fold.ms, "one fold per line");
   for (const list of Object.values(value.top)) {
     for (const [key, milliseconds, percent] of list) {
       assert.match(key, /^(?:\([a-z ]+\)|(?:\([a-z]+\)|node:[a-z0-9_/.()-]+|(?:apps|packages|src|scripts|tools|node_modules)\/[A-Za-z0-9@_.+/-]+)(?::[A-Za-z0-9_$.#<> ()[\]-]+)?)$/u, key);

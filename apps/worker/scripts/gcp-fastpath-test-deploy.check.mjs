@@ -1932,7 +1932,7 @@ test("meas-pgstat-enable creates the extension on the measurement database only 
   const runner = measRunner(() => assert.fail("no gcloud"));
   const receipt = await stepMeasPgStatEnable(runner, { measInstance: MEAS }, { createPool: snapshotPool(ok, calls) });
   assert.deepEqual([receipt.extension, receipt.reset], ["1.11", true]);
-  assert.deepEqual(ok.sent, ["CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
+  assert.deepEqual(ok.sent, ["SET statement_timeout = '60s'", "CREATE EXTENSION IF NOT EXISTS pg_stat_statements",
     "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'", "SELECT pg_stat_statements_reset()"]);
   assert.deepEqual(calls[0], { instance: MEAS, as: "migrator", applicationName: "tibotattle-meas-pgstat" });
   const denied = snapshotClient((text) => (/CREATE EXTENSION/u.test(text)

@@ -1624,7 +1624,8 @@ async function stepVerifyDatabase(runner) {
     `--impersonate-service-account=${FASTPATH_TEST.migratorServiceAccount}`, `--project=${FASTPATH_TEST.project}`]);
   runner.print(command, "token kept in memory; Cloud SQL connector, BEGIN READ ONLY");
   if (runner.dryRun) return { step: "verify-database", dryRun: true };
-  const minted = spawnSync(command[0], command.slice(1), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const minted = spawnSync(command[0], command.slice(1), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    timeout: TOKEN_MINT_TIMEOUT_MS });
   if (minted.status !== 0) fail("FASTPATH_DEPLOY_IMPERSONATION_FAILED", "migrator");
   const cloudRunRequire = createRequire(join(WORKER_ROOT, "cloud-run/package.json"));
   const { Connector } = await import(pathToFileURL(cloudRunRequire.resolve("@google-cloud/cloud-sql-connector")).href);
@@ -1928,25 +1929,33 @@ async function measPool(options, as, applicationName) {
 export async function stepMeasPgStatEnable(runner, options, { createPool = measPool } = {}) {
   const { instance } = assertMeasurementInstance(options.measInstance);
   runner.print(["(connector)", `--meas-instance=${instance}`, "--as=migrator",
-    "CREATE EXTENSION IF NOT EXISTS pg_stat_statements; SELECT pg_stat_statements_reset()"],
+    "SET statement_timeout = '60s'; CREATE EXTENSION IF NOT EXISTS pg_stat_statements; SELECT pg_stat_statements_reset()"],
   "measurement database only");
   if (runner.dryRun) return { step: "meas-pgstat-enable", instance, dryRun: true };
   const receipt = { step: "meas-pgstat-enable", instance, extension: null, reset: false, sqlState: null };
   const connection = await createPool(options, "migrator", "tibotattle-meas-pgstat");
   try {
+    // One session, bounded: every statement (and any lock wait) ends within 60 s.
+    const client = await connection.pool.connect();
     try {
-      await connection.pool.query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-      const version = await connection.pool.query(
-        "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'");
-      receipt.extension = /^[0-9.]{1,16}$/u.test(version.rows[0]?.extversion ?? "") ? version.rows[0].extversion : null;
-    } catch (error) {
-      receipt.sqlState = typeof error?.code === "string" && /^[0-9A-Z]{5}$/u.test(error.code) ? error.code : null;
-    }
-    if (receipt.extension !== null) {
+      await client.query("SET statement_timeout = '60s'");
       try {
-        await connection.pool.query("SELECT pg_stat_statements_reset()");
-        receipt.reset = true;
-      } catch { /* not allowed for this role: deltas still apply */ }
+        await client.query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
+        const version = await client.query(
+          "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'");
+        receipt.extension = /^[0-9.]{1,16}$/u.test(version.rows[0]?.extversion ?? "") ? version.rows[0].extversion
+          : null;
+      } catch (error) {
+        receipt.sqlState = typeof error?.code === "string" && /^[0-9A-Z]{5}$/u.test(error.code) ? error.code : null;
+      }
+      if (receipt.extension !== null) {
+        try {
+          await client.query("SELECT pg_stat_statements_reset()");
+          receipt.reset = true;
+        } catch { /* not allowed for this role: deltas still apply */ }
+      }
+    } finally {
+      client.release();
     }
   } finally {
     await connection.close();
@@ -1983,10 +1992,13 @@ export async function stepMeasPgStat(runner, options, { createPool = measPool } 
     statements: snapshot.statements?.length ?? null, errors: snapshot.errors };
 }
 
+/** A token mint that hangs (gcloud waiting on the network or a prompt) is killed and fails. */
+const TOKEN_MINT_TIMEOUT_MS = 120_000;
+
 /** The operator's own access token (read-only use), held in memory only. */
 function operatorAccessToken() {
   const minted = spawnSync("gcloud", ["auth", "print-access-token", `--project=${FASTPATH_TEST.project}`],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 });
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024, timeout: TOKEN_MINT_TIMEOUT_MS });
   const token = minted.status === 0 ? String(minted.stdout).trim() : "";
   if (token.length === 0 || token.length > 16 * 1024 || !/^[\x21-\x7e]+$/u.test(token)) {
     fail("FASTPATH_DEPLOY_TOKEN_FAILED", "gcloud auth print-access-token");

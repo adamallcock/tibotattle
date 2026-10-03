@@ -48,6 +48,15 @@ fully profiled, and for a small slice to show where the time goes. This round
 adds the profiling to the kit and checks it locally on a 1% slice. **No cloud
 step ran.** Branch `claude/gcp-fp-meas-synth`, on `cfd610f0`.
 
+A same-day review of `918b38d6` corrected this section:
+- the overhead claim is withdrawn and the fold path is now measured;
+- profile lines are in Cloud Logging only, mid-run and after an operator
+  stop;
+- the `signal` line is best effort;
+- the database snapshots and the metrics read are now waited children;
+- an early stop signals the script's recorded PID, not `pkill -f`;
+- the kit's summary period is now 600 s.
+
 ### What the kit now records
 
 **The job (`apps/worker/cloud-run/analytics-refresh-profile.mjs`):**
@@ -55,14 +64,28 @@ step ran.** Branch `claude/gcp-fp-meas-synth`, on `cfd610f0`.
 - `ANALYTICS_V2_REFRESH_PROFILE=cpu` starts node:inspector's sampling
   profiler in the job's main thread. `ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US`
   sets the interval (default 10,000 us, 1,000 to 100,000).
-- Every 30 min (`ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS`), at exit
-  (complete, refused, failed, the time guard included) and on SIGTERM (Cloud
-  Run's task timeout or a cancel), it writes one JSON line to stderr:
+- Every 30 min by default (`ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS`;
+  the cloud kit sets 10 min) and at exit
+  (complete, refused, failed, the time guard included), it writes one JSON
+  line to stderr. The interval lines are the reliable record: they are
+  written synchronously, from a refresh checkpoint or the timer.
+  - On SIGTERM (Cloud Run's task timeout or a cancel) it also tries a
+    `signal` line. This is **best effort**. A Node signal handler runs only
+    when the event loop is free, so a synchronous compute call that outlasts
+    Cloud Run's grace period ends in SIGKILL with no `signal` line. (Locally,
+    a TERM sent 0.6 s into a 4 s busy loop reached the handler at 4.1 s.) How
+    long these synchronous stretches are at full scale is not measured.
+  - The handler also replaces the default SIGTERM action while profiling: it
+    folds, then re-raises SIGTERM, so the job still ends with 143.
+  - Each line holds:
   - the top 40 functions by self time and by total time since the start, the
     top 20 files, and the window's top 15;
   - the run phase and owner progress counts;
   - heap and resident set, GC count and time by kind, CPU time and busy
-    cores, and event-loop utilisation.
+    cores, and event-loop utilisation;
+  - the profiler's own cost (`fold`): the number of folds, their total and
+    latest stop-fold-restart time, and the time spent serializing and writing
+    the earlier lines. The cloud run therefore measures its own fold path.
 - It is content-free. A function is `<repository path>:<name>`. The path
   comes from the bundle's own module markers, and any other path is cut to its
   repository or `node_modules` tail. A name that is not identifier-like is
@@ -73,8 +96,11 @@ step ran.** Branch `claude/gcp-fp-meas-synth`, on `cfd610f0`.
   measurement job included, accept them too. Only a local run, outside Cloud
   Run, accepts `ANALYTICS_V2_REFRESH_PROFILE_DIR` for raw `.cpuprofile` files.
 - The line has no `status` key. The wrapper's log read keeps the lines apart
-  (`profiles` in `refresh.json` and `refresh-uncapped.json`), and they stay in
-  Cloud Logging if the run is killed.
+  (`profiles` in `refresh.json` and `refresh-uncapped.json`). Those receipts
+  are written only after the execution ends and the wrapper's polling
+  finishes. During the run, or after the operator stops the script (the
+  wrapper has no SIGTERM handler), the lines exist **only in Cloud Logging**.
+  See "If the run is stopped or killed" below for saving them.
 - **No raw profile is uploaded from Cloud Run.** The runtime account's only
   bucket write is the fast-path origin bucket's `telemetry/` namespace, which
   the origin reads, and the job image has no storage client. The summary lines
@@ -96,8 +122,9 @@ step ran.** Branch `claude/gcp-fp-meas-synth`, on `cfd610f0`.
   - This is a stated divergence from production, which runs Insights off and
     neither diagnostic flag. Their overhead was not measured.
 - `meas-pgstat-enable` (the one write, on the measurement database only, as
-  the migrator IAM user): `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`,
-  then `pg_stat_statements_reset()` when the role may. If it fails, the run
+  the migrator IAM user, in one session with `statement_timeout` 60 s):
+  `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`, then
+  `pg_stat_statements_reset()` when the role may. If it fails, the run
   goes on without statement statistics.
 - `meas-pgstat --label=<name>`: read-only (`BEGIN READ ONLY`, 60 s statement
   timeout), through the connector, as the migrator. It snapshots
@@ -123,11 +150,26 @@ CPU, memory, disk operations and bytes sent.
 - Database snapshots are taken before the run, every 30 min during it (a
   sampler beside the waited child) and after it. Then the metrics are read.
 - `summarize-prodtier.mjs` writes `summary.json`. It works on a partial
-  directory, so a killed run still shows its last profile line, its database
-  delta to the last snapshot and its sessions.
+  directory, so a killed run still shows its database delta to the last
+  snapshot and its sessions. Its profile lines appear only once the
+  Cloud Logging lines are saved to `$OUT/<profile>/profile-log.json`
+  (`profile.source` is then `cloud-logging`, using the newest execution's
+  lines). Without that file, `profile.lines` is 0 and `profile.last` is null
+  until `refresh-uncapped` writes its receipt.
 - Teardown is unchanged: the `EXIT` trap, and a signal stops the child and the
   sampler at once (`prod-shape.check.mjs` sends TERM to the script's own
-  functions with a sampler running).
+  functions with a sampler mid-snapshot).
+- Every remote step after the trap runs as a waited background child,
+  including the snapshots, `meas-pgstat-enable` and `meas-metrics`. So a
+  signal is never deferred behind one of them. The token mints
+  (`gcloud auth print-access-token`) are killed after 120 s.
+- The script records its own PID in `$OUT/pid`. Stop it with
+  `kill -TERM $(cat "$OUT/pid")`, never `pkill -f`: that pattern also
+  matches `caffeinate`, which lets the Mac sleep during teardown, and the
+  script's forked subshells, whose node processes it orphans.
+- `MEAS_PROFILE_SUMMARY_SECONDS` (default 600) sets the profiler's period
+  for the cloud run. The job's own default stays 1,800. See "Profiler
+  overhead" for the cost per fold.
 
 ### The 1% slice: where the time goes
 
@@ -172,31 +214,65 @@ says little about model time. The cloud run's profile lines answer that.
 
 ### Profiler overhead
 
-The same slice was run with the profiler off and at 1, 5 and 10 ms, three
-times each, interleaved, on template copies:
+**Result: the profiler's wall-time overhead is not resolved on this host.**
+Two series on the same slice disagree by more than any effect they could
+show. The profiler's own fold-and-write cost is measured directly, and it is
+small.
 
-| Sampling | Wall time, s (3 runs) | Fastest vs off | Median vs off | Samples |
-|---|---|---:|---:|---:|
-| off | 74.6, 71.7, 82.4 | | | |
-| 1 ms | 74.8, 75.3, 81.8 | +4.3% | +1.0% | about 54,000 |
-| 5 ms | 76.1, 75.8, 92.5 | +5.7% | +2.1% | about 12,000 |
-| 10 ms | 74.7, 84.2, 85.6 | +4.2% | +12.9% | about 6,500 |
+**First series** (three runs per setting, interleaved, template copies;
+host load 7 to 9):
 
-A fixed CPU-bound loop was also timed: five fresh processes per mode,
-interleaved, about 2.2 s each. Its medians against off were −0.2% (1 ms),
-+2.1% (5 ms) and −1.0% (10 ms).
+| Sampling | Wall time, s | Fastest vs off | Median vs off | Mean vs off | Samples |
+|---|---|---:|---:|---:|---:|
+| off | 74.6, 71.7, 82.4 | | | | |
+| 1 ms | 74.8, 75.3, 81.8 | +4.3% | +0.9% | +1.4% | about 54,000 |
+| 5 ms | 76.1, 75.8, 92.5 | +5.7% | +2.0% | +6.9% | about 12,000 |
+| 10 ms | 74.7, 84.2, 85.6 | +4.2% | **+12.9%** | +6.9% | about 6,500 |
 
-What these show:
+- With the profiler off, the slice alone spread 15%. At n=3, the 10 ms median
+  of +12.9% cannot be told apart from noise. Nor can the fastest-vs-fastest
+  figures of about +4%.
+- The earlier wording ("under about 5% at 1 to 10 ms") used only the fastest
+  runs at 1 and 10 ms. **It is withdrawn.**
+- Every run lasted about 75 s against the 1,800 s summary period. So each
+  wrote only its exit line, and the periodic fold path was never exercised.
 
-- The profiler's cost is **not separable from this host's noise**. With the
-  profiler off, the slice alone spread 15%.
-- The differences do not scale with the sampling rate: 1 ms takes about
-  eight times the samples of 10 ms at the same cost.
-- The defensible statement is: under about 5% on this host at 1 to 10 ms, and
-  about 2% or less on pure compute.
-- The kit samples at 10 ms. That gives about 180,000 samples per 30-minute
-  window, with the smallest footprint.
-- The overhead on Cloud Run is not measured.
+**Second series, with the fold path** (five runs per setting, interleaved,
+template copies, after this round's `fold` field was added; host load 9 to
+10.5). `10 ms, 10 s` sets `ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS=10`,
+so each run takes 8 periodic stop-fold-restart cycles plus the exit fold:
+
+| Setting | Wall time, s (sorted) | Median vs off | Mean vs off | Lines | Measured fold + write |
+|---|---|---:|---:|---:|---|
+| off | 81.1, 82.8, 86.0, 89.0, 89.0 | | | | |
+| 10 ms, exit only | 83.3, 84.5, 86.4, 89.2, 90.4 | +0.5% | +1.4% | 1 | 13-15 ms per run |
+| 10 ms, 10 s period | 87.0, 87.5, 88.4, 88.9, 90.3 | +2.8% | +3.4% | 9 | 0.77-0.84 s per run |
+| 1 ms, exit only (n=2) | 83.5, 88.0 | −0.3% | +0.2% | 1 | 31-33 ms (58,000-62,000 samples) |
+
+- The off runs spread 9.7%. The 10 ms exit-only median is now +0.5%, against
+  +12.9% in the first series. So wall-time overhead at 10 ms is unresolved on
+  this host, and the sampling cost cannot be separated from noise.
+- The fold path is measured directly, by the profiler's own `fold` field.
+  - A periodic fold (stop, fold, restart) costs 109 to 153 ms.
+  - The exit fold, which has no restart, costs 4 to 33 ms, even for a window
+    of about 60,000 samples. So most of a periodic fold's cost is the
+    restart, not the number of samples.
+  - Serializing and writing a line costs about 0.1 ms.
+- At a 10 s period this is about 0.9% of wall time. The rest of the +2.8%
+  median is within this host's noise. For the cloud run, the kit now uses a 600 s period
+  (`MEAS_PROFILE_SUMMARY_SECONDS`, default 600). Over 13 h that is about 78
+  folds. At this slice's cost, that is about 10 s, under 0.1%. That figure is
+  extrapolated: a long window's fold over the full run's larger call tree was
+  not measured locally. The cloud run's own `fold` field will report it.
+- A fixed CPU-bound loop (five fresh processes per mode, interleaved, about
+  2.2 s each) gave medians against off of −0.2% (1 ms), +2.1% (5 ms) and
+  −1.0% (10 ms). That is also within noise.
+- **The overhead on Cloud Run is not measured.** The cloud run's `fold`
+  totals give the fold path's share. The sampling cost on Cloud Run would
+  need an unprofiled control run.
+
+Reports: `~/Library/Caches/tibotattle-meas-synth/profile-overhead-s001/runs`
+(first series) and `runs-fold` (second series). The databases were dropped.
 
 ### Running it
 
@@ -205,7 +281,7 @@ is the runbook: its header lists every step and setting. Defaults:
 
 - the `dense` profile only;
 - no guarded run;
-- the CPU profiler at 10 ms;
+- the CPU profiler at 10 ms, with a summary line every 600 s;
 - database snapshots every 1,800 s;
 - an uncapped cap of 172,800 s.
 
@@ -219,17 +295,18 @@ no profiler: it ignores the setting and runs unprofiled.
 | Seed | 2 to 6 h |
 | `meas-pgstat-enable`, each `meas-pgstat` | under a minute each |
 | Deploy (`refresh --no-execute`) | about a minute |
-| Uncapped, profiled `dense` run | 10 to 13 h projected (cap 48 h); about 26 profile lines and 26 snapshots |
+| Uncapped, profiled `dense` run | 10 to 13 h projected (cap 48 h); about 78 profile lines and 26 snapshots |
 | `meas-metrics` | about a minute; rerunnable later, read-only |
 | `meas-teardown` | about 5 to 10 min |
 
-If the run is killed:
+If the run is stopped or killed:
 
-- The job's last profile lines are in Cloud Logging (filter
-  `jsonPayload.profile="analytics-refresh-profile-v1"` on the measurement
-  job).
+- The job's profile lines are only in Cloud Logging. Save them read-only with
+  the `gcloud logging read` command in the run script's header, to
+  `$OUT/dense/profile-log.json`. The last reliable line is the latest
+  `interval` line. A `signal` line may or may not follow.
 - The snapshots taken so far are in `$OUT/pgstat`, and
-  `summarize-prodtier.mjs $OUT dense` summarises them.
+  `summarize-prodtier.mjs $OUT dense` summarises them with the saved lines.
 - Teardown follows the second round's rules.
 
 ### Reproduce (third round)
@@ -246,7 +323,7 @@ Local only:
 - One run per mode, each on a template copy:
 
   ```
-  … measure-local.mjs --corpus <dir> --out <report.json> --clone-from meas_synth_<hex> [--cpu-profile 1000|5000|10000] [--cpu-profile-dir <dir>]
+  … measure-local.mjs --corpus <dir> --out <report.json> --clone-from meas_synth_<hex> [--cpu-profile 1000|5000|10000] [--cpu-profile-summary 10] [--cpu-profile-dir <dir>]
   ```
 
   Each report keeps every profile line (`steps.refresh.profileLines`).

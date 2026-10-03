@@ -52,6 +52,8 @@ export const GCP_FASTPATH_CONNECTION = Object.freeze({
 
 // gcloud access tokens last one hour; refresh well before that.
 const TOKEN_LIFETIME_MILLISECONDS = 45 * 60_000;
+// A mint that hangs (gcloud waiting on the network or a prompt) is killed and fails (then retried by firstAccessToken).
+const TOKEN_MINT_TIMEOUT_MILLISECONDS = 120_000;
 
 function fail(code, detail) {
   throw Object.assign(new Error(detail === undefined ? code : `${code}: ${detail}`), { code });
@@ -85,7 +87,8 @@ function mintAccessToken(serviceAccount, spawn) {
     "auth", "print-access-token",
     `--impersonate-service-account=${serviceAccount}`,
     `--project=${GCP_FASTPATH_CONNECTION.project}`,
-  ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024 });
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 64 * 1024,
+    timeout: TOKEN_MINT_TIMEOUT_MILLISECONDS });
   const token = minted?.status === 0 ? String(minted.stdout).trim() : "";
   if (token.length === 0 || token.length > 16 * 1024 || !/^[\x21-\x7e]+$/u.test(token)) {
     fail("GCP_FASTPATH_CONNECTION_IMPERSONATION_FAILED", serviceAccount);

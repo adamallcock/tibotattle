@@ -14,7 +14,11 @@
 # Profiling (MEAS-SYNTH, 2026-10-03): the main deliverable is ONE profiled,
 # UNCAPPED run per profile, which shows where its time goes even if it is
 # killed: the Job's CPU profiler (ANALYTICS_V2_REFRESH_PROFILE=cpu) logs a
-# content-free summary every 30 min and at exit or SIGTERM; the database's
+# content-free summary every MEAS_PROFILE_SUMMARY_SECONDS (10 min; written
+# synchronously at a refresh checkpoint or on its timer: the reliable record)
+# and at exit; on SIGTERM it also tries a "signal" line, best effort only (its
+# handler runs only when the event loop is free, so a long synchronous compute
+# call can outlast Cloud Run's grace period and end in SIGKILL first); the database's
 # pg_stat_statements, pg_stat_database and pg_stat_io are snapshotted before
 # the run, every MEAS_PGSTAT_INTERVAL during it and after it (meas-pgstat,
 # read-only); Cloud Monitoring's CPU and memory series for the Job and the
@@ -48,6 +52,11 @@
 #   MEAS_CPU_PROFILE  the Job's CPU profiler: "cpu" (default) or "off"
 #   MEAS_CPU_SAMPLE_US  its V8 sampling interval (default 10000 us; the
 #                   receipt states the measured overhead, 1000..100000)
+#   MEAS_PROFILE_SUMMARY_SECONDS  its summary period (default 600, 60..86400;
+#                   the job's own default is 1800). A shorter period loses
+#                   less at a kill and costs one more stop-fold-restart per
+#                   period: about 0.1-0.15 s each on the 1% slice (the
+#                   receipt), and every line reports its cost in `fold`
 #   MEAS_PGSTAT_INTERVAL  seconds between meas-pgstat snapshots during a run
 #                   (default 1800)
 #
@@ -92,9 +101,10 @@
 #              from listings that succeeded; it fails while any measurement
 #              instance remains in the project
 #
-# Teardown: every step after the trap runs as a background child the shell
-# waits on, because zsh runs an INT/TERM/HUP trap only once a FOREGROUND
-# child exits (up to the 48 h cap) but interrupts `wait` at once. The trap
+# Teardown: every remote step after the trap (the database snapshots and the
+# metrics read included) runs as a background child the shell waits on,
+# because zsh runs an INT/TERM/HUP trap only once a FOREGROUND child exits
+# (up to the 48 h cap) but interrupts `wait` at once. The trap
 # signals the child and all its descendants (node and the gcloud it runs)
 # and exits, and the EXIT trap tears down at once. Only the child's output is
 # redirected, so the teardown's lines reach this script's log. SIGKILL (and a
@@ -104,6 +114,23 @@
 # and check instanceAbsent and jobAbsent are true and
 # remainingMeasurementInstances is [] in its meas-teardown.json. The remote
 # execution survives the local child; meas-teardown cancels it.
+#
+# Stopping early: signal THIS shell only, by the PID it records at start:
+#   kill -TERM $(cat $MEAS_OUT/pid)
+# Never `pkill -f run-prodtier-measurement.sh`: that pattern also matches
+# caffeinate (the Mac may then sleep during teardown) and the script's forked
+# subshells, whose node processes it orphans.
+#
+# Profile lines while the run executes, or after a stop: they reach
+# $MEAS_OUT/<profile>/uncapped/refresh-uncapped.json only when refresh-uncapped
+# finishes polling, so mid-run or after a stop they exist only in Cloud
+# Logging. Save them (read-only) where summarize-prodtier.mjs reads them:
+#   gcloud logging read 'resource.type="cloud_run_job" AND
+#     resource.labels.job_name="tibotattle-fastpath-meas-analytics-refresh" AND
+#     jsonPayload.profile="analytics-refresh-profile-v1"' --project=tibotattle \
+#     --freshness=3d --format=json > $MEAS_OUT/<profile>/profile-log.json
+# (summary.json's profile.source then says "cloud-logging"; the newest
+# execution's lines are used).
 #
 # Occupancy: the measurement instance and Job are this run's own, so the
 # shared fast-path database's lock and Job are untouched and nothing else
@@ -126,12 +153,14 @@ GUARDED=${MEAS_GUARDED:-0}
 CPU_PROFILE=${MEAS_CPU_PROFILE:-cpu}
 CPU_SAMPLE_US=${MEAS_CPU_SAMPLE_US:-10000}
 PGSTAT_INTERVAL=${MEAS_PGSTAT_INTERVAL:-1800}
+PROFILE_SUMMARY=${MEAS_PROFILE_SUMMARY_SECONDS:-600}
 # The Job's env beyond its profile: the production time guard (the uncapped
 # execution overrides it) and the CPU profiler. refresh and refresh-uncapped
 # take the same list, so the uncapped run reads back the Job refresh deployed.
 REFRESH_ENV=(--refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400)
 [[ "$CPU_PROFILE" == cpu ]] && REFRESH_ENV+=(--refresh-env=ANALYTICS_V2_REFRESH_PROFILE=cpu
-  --refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="$CPU_SAMPLE_US")
+  --refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US="$CPU_SAMPLE_US"
+  --refresh-env=ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS="$PROFILE_SUMMARY")
 D() { "$NODE26" scripts/gcp-fastpath-test-deploy.mjs "$@"; }
 step() { echo "== $(date -u +%H:%M:%S) $1"; }
 TORN=0
@@ -150,10 +179,10 @@ tree() { local p; print -r -- $1; for p in $(pgrep -P $1 2>/dev/null); do tree $
 stop() { (( SAMPLER )) && kill -TERM $(tree $SAMPLER) 2>/dev/null; SAMPLER=0
   (( CHILD )) && kill -TERM $(tree $CHILD) 2>/dev/null; CHILD=0; exit 130; }
 # One read-only database snapshot (bounded: a 15 s connect and 60 s statement
-# timeout); a failure is recorded, never fatal.
+# timeout), a waited child; a failure is recorded, never fatal.
 pgstat() {
   (( PGSTAT )) || return 0
-  D meas-pgstat --meas-instance="$INSTANCE" --label="$1" --out="$OUT/pgstat" > "$OUT/pgstat/$1.log" 2>&1 \
+  child "$OUT/pgstat/$1.log" - D meas-pgstat --meas-instance="$INSTANCE" --label="$1" --out="$OUT/pgstat" \
     || echo "pgstat $1 failed (see $OUT/pgstat/$1.log)"
 }
 # Snapshots every PGSTAT_INTERVAL while a run executes (a background loop the
@@ -189,8 +218,8 @@ metrics() {
     console.log(iso(start - 300000) + " " + iso(end + 300000));' "$receipt" 2>/dev/null) \
     || { echo "metrics $label: no execution window in $receipt"; return 0; }
   mkdir -p -m 700 "$OUT/metrics"
-  D meas-metrics --meas-instance="$INSTANCE" --since="${window% *}" --until="${window#* }" \
-    --out="$OUT/metrics/$label" > "$OUT/metrics/$label.log" 2>&1 || echo "metrics $label failed (see $OUT/metrics/$label.log)"
+  child "$OUT/metrics/$label.log" - D meas-metrics --meas-instance="$INSTANCE" --since="${window% *}" --until="${window#* }" \
+    --out="$OUT/metrics/$label" || echo "metrics $label failed (see $OUT/metrics/$label.log)"
 }
 teardown() {
   [[ $TORN == 1 ]] && return; TORN=1
@@ -205,8 +234,11 @@ teardown() {
 }
 mkdir -p -m 700 "$OUT"
 print -r -- "$INSTANCE" > "$OUT/instance"
+# This shell's PID: stop the run with `kill -TERM $(cat $OUT/pid)` (see "Stopping early").
+print -r -- $$ > "$OUT/pid"
 echo "commit $COMMIT"; echo "instance $INSTANCE"; echo "corpus $CORPUS"; echo "profiles ${PROFILES[*]}"; echo "out $OUT"
-echo "guarded $GUARDED; cpu profile $CPU_PROFILE at $CPU_SAMPLE_US us; pgstat every $PGSTAT_INTERVAL s"
+echo "guarded $GUARDED; cpu profile $CPU_PROFILE at $CPU_SAMPLE_US us, summary every $PROFILE_SUMMARY s; pgstat every $PGSTAT_INTERVAL s"
+echo "pid $$ (stop: kill -TERM \$(cat $OUT/pid))"
 cd "$WORKER" || exit 2
 
 step preflight
@@ -225,6 +257,7 @@ done
 [[ "$CPU_PROFILE" == cpu || "$CPU_PROFILE" == off ]] || { echo "preflight FAILED: MEAS_CPU_PROFILE must be cpu or off"; exit 1; }
 [[ "$CPU_SAMPLE_US" == <1000-100000> ]] || { echo "preflight FAILED: MEAS_CPU_SAMPLE_US must be 1000..100000"; exit 1; }
 [[ "$PGSTAT_INTERVAL" == <60-86400> ]] || { echo "preflight FAILED: MEAS_PGSTAT_INTERVAL must be 60..86400"; exit 1; }
+[[ "$PROFILE_SUMMARY" == <60-86400> ]] || { echo "preflight FAILED: MEAS_PROFILE_SUMMARY_SECONDS must be 60..86400"; exit 1; }
 "$NODE26" -e '
   const fs = require("fs"), path = require("path"), crypto = require("crypto");
   const m = JSON.parse(fs.readFileSync(process.argv[1] + "/corpus-manifest.json", "utf8"));
@@ -269,7 +302,7 @@ echo "schema $SCHEMA"
 
 mkdir -p -m 700 "$OUT/pgstat"
 step pgstat-enable
-D meas-pgstat-enable --meas-instance="$INSTANCE" --out="$OUT/pgstat" > "$OUT/pgstat/enable.log" 2>&1 \
+child "$OUT/pgstat/enable.log" - D meas-pgstat-enable --meas-instance="$INSTANCE" --out="$OUT/pgstat" \
   || echo "pg_stat_statements unavailable (see $OUT/pgstat/enable.log): measuring without statement statistics"
 
 for PROFILE in "${PROFILES[@]}"; do

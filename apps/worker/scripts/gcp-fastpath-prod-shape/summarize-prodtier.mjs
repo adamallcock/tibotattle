@@ -14,6 +14,13 @@
 // "-during-NN" one, when the run never reached "after"), every snapshot's
 // sessions by wait event, and the Cloud Monitoring series summaries (without
 // their points). Content-free inputs give a content-free summary.
+//
+// Profile lines reach the receipts only when refresh-uncapped (or the guarded
+// refresh) finishes polling and writes its receipt. While the run executes,
+// or after the operator stops the script, they exist only in Cloud Logging:
+// save them read-only to <OUT>/<profile>/profile-log.json (the gcloud logging
+// read command in the run script's header) and this summary uses that file's
+// newest execution when no receipt holds lines (profile.source says which).
 
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -39,11 +46,43 @@ function run(receipt, status) {
     serverStatements: status?.reads?.server ?? null, deadline: status?.deadline ?? null };
 }
 
+const PROFILE_SCHEMA = "analytics-refresh-profile-v1";
+const EXECUTION_LABEL = "run.googleapis.com/execution_name";
+
+/**
+ * Profile lines from a saved `gcloud logging read --format=json` listing: the
+ * newest execution's lines (by its latest entry), in sequence order. Anything
+ * that is not a profile line is ignored.
+ */
+export function loggedProfileLines(entries) {
+  const byExecution = new Map();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    let value = entry?.jsonPayload ?? null;
+    if (value === null && typeof entry?.textPayload === "string") {
+      try { value = JSON.parse(entry.textPayload); } catch { value = null; }
+    }
+    if (!value || typeof value !== "object" || value.profile !== PROFILE_SCHEMA) continue;
+    const execution = typeof entry?.labels?.[EXECUTION_LABEL] === "string" ? entry.labels[EXECUTION_LABEL] : "";
+    const at = Date.parse(entry?.timestamp ?? "") || 0;
+    const group = byExecution.get(execution) ?? { execution, latest: 0, lines: [] };
+    group.latest = Math.max(group.latest, at);
+    group.lines.push(value);
+    byExecution.set(execution, group);
+  }
+  const newest = [...byExecution.values()].sort((left, right) => right.latest - left.latest)[0];
+  if (newest === undefined) return { execution: null, lines: [] };
+  const seen = new Set();
+  const lines = newest.lines.filter((line) => !seen.has(line.sequence) && seen.add(line.sequence))
+    .sort((left, right) => left.sequence - right.sequence);
+  return { execution: newest.execution || null, lines };
+}
+
 function profileCadence(lines) {
   return (Array.isArray(lines) ? lines : []).map((line) => ({ sequence: line.sequence, reason: line.reason,
     phase: line.phase, elapsedSeconds: line.elapsedSeconds, progress: line.progress,
     heapUsedMiB: line.memory?.heapUsedMiB ?? null, rssMiB: line.memory?.rssMiB ?? null,
-    eventLoopUtilization: line.eventLoop?.utilization ?? null, gcMs: line.gc?.ms ?? null }));
+    eventLoopUtilization: line.eventLoop?.utilization ?? null, gcMs: line.gc?.ms ?? null,
+    foldMs: line.fold?.lastMs ?? null, profilerMs: line.fold === undefined ? null : line.fold.ms + line.fold.writeMs }));
 }
 
 /** The pgstat snapshots of one profile, by label: before, during-NN (in order), after. */
@@ -77,14 +116,20 @@ export function summarizeProdtier(out, profiles) {
   for (const profile of profiles) {
     const guarded = read(join(out, profile, "refresh", "refresh.json"));
     const uncapped = read(join(out, profile, "uncapped", "refresh-uncapped.json"));
-    const lines = [...(guarded?.profiles ?? []), ...(uncapped?.profiles ?? [])];
+    const receiptLines = [...(guarded?.profiles ?? []), ...(uncapped?.profiles ?? [])];
+    const logged = loggedProfileLines(read(join(out, profile, "profile-log.json")));
+    // The run's own lines: the uncapped run's, else the guarded run's, else the saved log's newest execution.
+    const own = uncapped?.profiles?.length ? uncapped.profiles : guarded?.profiles?.length ? guarded.profiles
+      : logged.lines;
+    const source = receiptLines.length > 0 ? "receipt" : logged.lines.length > 0 ? "cloud-logging" : null;
     const { before, during, after } = snapshots(out, profile);
     const end = after ?? during.at(-1) ?? null;
     summary.runs[profile] = {
       guarded: guarded?.executed === false ? { executed: false } : run(guarded, lastStatus(guarded)),
       uncapped: run(uncapped, uncapped?.statusLine ?? null),
-      profile: { lines: lines.length, cadence: profileCadence(uncapped?.profiles ?? guarded?.profiles ?? []),
-        last: (uncapped?.profiles ?? guarded?.profiles ?? []).at(-1) ?? null },
+      profile: { source, lines: source === "receipt" ? receiptLines.length : logged.lines.length,
+        loggedExecution: source === "cloud-logging" ? logged.execution : null,
+        cadence: profileCadence(own), last: own.at(-1) ?? null },
       database: before === null || end === null ? null : measPgStatDelta(before, end),
       sessions: [before, ...during, after].filter(Boolean).map((snapshot) => ({ label: snapshot.label,
         takenAt: snapshot.takenAt, sessions: snapshot.sessions })),

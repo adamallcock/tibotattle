@@ -7,7 +7,7 @@
 //     apps/worker/scripts/gcp-fastpath-prod-shape/measure-local.mjs \
 //       --corpus <seed-source.mjs work dir> --out <report.json> [--keep-database] [--reuse-database <name>]
 //       [--clone-from <name>] [--import-only] [--profile dense|dense-workers] [--guard-probe] [--node22 <path>]
-//       [--cpu-profile <sample interval, us>] [--cpu-profile-dir <absolute dir>]
+//       [--cpu-profile <sample interval, us>] [--cpu-profile-summary <seconds>] [--cpu-profile-dir <absolute dir>]
 //
 //  1. creates a fresh database meas_synth_<8 hex> on the cluster (never an
 //     existing one), a fast-path rehearsal target schema in it, and applies
@@ -49,6 +49,9 @@
 // (cloud-run/analytics-refresh-profile.mjs: ANALYTICS_V2_REFRESH_PROFILE=cpu at
 // that sampling interval); the report keeps every content-free summary line
 // (steps.refresh.profileLines) and the last one (steps.refresh.profile).
+// --cpu-profile-summary <seconds> sets its summary period (10..86400; the
+// job's default is 1800), so a short run exercises the periodic
+// stop-fold-restart path a long run takes.
 // --cpu-profile-dir also keeps one sanitized .cpuprofile per window there.
 //
 // Local and synthetic only: no network, no production data, no secrets.
@@ -112,7 +115,7 @@ function fail(code, detail) {
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
     cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    cpuProfileUs: null, cpuProfileDir: null };
+    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -128,6 +131,12 @@ function parseArguments(argv) {
       const value = next();
       if (!/^[1-9]\d{3,5}$/u.test(value ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile takes 1000..100000 us");
       options.cpuProfileUs = Number(value);
+    } else if (argument === "--cpu-profile-summary") {
+      const value = next();
+      if (!/^[1-9]\d{1,4}$/u.test(value ?? "") || Number(value) < 10 || Number(value) > 86_400) {
+        fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-summary takes 10..86400 s");
+      }
+      options.cpuProfileSummarySeconds = Number(value);
     } else if (argument === "--cpu-profile-dir") options.cpuProfileDir = resolve(next());
     else fail("MEAS_SYNTH_ARGUMENT_INVALID", argument);
   }
@@ -140,8 +149,8 @@ function parseArguments(argv) {
     fail("MEAS_SYNTH_ARGUMENT_INVALID", "--import-only imports a fresh database and runs nothing");
   }
   if (options.importOnly) options.keepDatabase = true;
-  if (options.cpuProfileDir !== null && options.cpuProfileUs === null) {
-    fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-dir needs --cpu-profile");
+  if ((options.cpuProfileDir !== null || options.cpuProfileSummarySeconds !== null) && options.cpuProfileUs === null) {
+    fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile-dir and --cpu-profile-summary need --cpu-profile");
   }
   options.profile = measureProfile(options.profile);
   return options;
@@ -194,9 +203,11 @@ function refreshEnv(endpoint, database, profile, extra = {}) {
 }
 
 /** The profiler environment for --cpu-profile (empty without it). */
-export function cpuProfileEnv({ cpuProfileUs = null, cpuProfileDir = null } = {}) {
+export function cpuProfileEnv({ cpuProfileUs = null, cpuProfileSummarySeconds = null, cpuProfileDir = null } = {}) {
   if (cpuProfileUs === null) return {};
   return { ANALYTICS_V2_REFRESH_PROFILE: "cpu", ANALYTICS_V2_REFRESH_PROFILE_SAMPLE_US: String(cpuProfileUs),
+    ...(cpuProfileSummarySeconds === null ? {}
+      : { ANALYTICS_V2_REFRESH_PROFILE_SUMMARY_SECONDS: String(cpuProfileSummarySeconds) }),
     ...(cpuProfileDir === null ? {} : { ANALYTICS_V2_REFRESH_PROFILE_DIR: cpuProfileDir }) };
 }
 
@@ -480,7 +491,8 @@ async function main() {
     }
     console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
     const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
-      profile: options.profile, cpuProfile: { cpuProfileUs: options.cpuProfileUs, cpuProfileDir: options.cpuProfileDir } });
+      profile: options.profile, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
+        cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, cpuProfileDir: options.cpuProfileDir } });
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,
@@ -488,7 +500,7 @@ async function main() {
       refusals: run.receipt?.refusals ?? null, refusalsByReason: run.receipt?.refusalsByReason ?? null,
       published: Array.isArray(run.receipt?.published) ? run.receipt.published.length : null,
       blocked: run.receipt?.blocked ?? null, error: run.error, time: run.time,
-      cpuProfileUs: options.cpuProfileUs, profile: run.profileLines.at(-1) ?? null, profileLines: run.profileLines };
+      cpuProfileUs: options.cpuProfileUs, cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, profile: run.profileLines.at(-1) ?? null, profileLines: run.profileLines };
     await save();
     report.steps.outputs = await outputSizes(pool, schema);
     report.steps.outputDigests = await outputDigests(pool, schema);
