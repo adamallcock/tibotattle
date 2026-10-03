@@ -3076,6 +3076,120 @@ test("PG17 EXCL-UNLINKED: an unlinked typed participant blocks exactly the days 
   });
 });
 
+// EXCL-DEPARTED (round 19): real roster, saved-member and exclusion readers.
+// Losing current eligibility is not an erasure of a saved contribution.
+test("PG17 EXCL-DEPARTED: real exclusions keep a disconnected saved member hidden per day and revocation restores it", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("exclusion-departed-real", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules,
+      correctionRuntime: "active" });
+    const { alpha, echo } = fixture.owners;
+    const { D1, D2 } = seedFixture;
+    const now = new Date(seedFixture.NOW_MS).toISOString();
+    const pipeline = realPipeline();
+    const exclusions = quoted(schema, "community_aggregate_exclusions");
+    const insertExclusion = async (id, participantId, effectiveAt, expiresAt) => pool.query(
+      `INSERT INTO ${exclusions} (exclusion_id, participant_id, scope, reason_code, state,
+          effective_at, expires_at, created_at, created_by_digest)
+       VALUES ($1, $2, 'community_weekly', 'data_quality', 'active', $3, $4, $3, $5)`,
+      [id, participantId, effectiveAt, expiresAt, "e".repeat(64)]);
+    // Alpha's crossed-midnight conflict must not obscure echo's saved fold.
+    await insertExclusion("synthetic-departed-alpha", alpha.participantId, `${D1}T00:00:00.000000Z`, null);
+    const first = await runJob({ schema, now, pipeline });
+    assert.ok(first.published.includes(D1));
+    const before = await publishedRows(pool, schema);
+    const original = before.get(D1);
+    const participants = (head) => head.payload.totals.contributingParticipants;
+    assert.ok(participants(original) > 0);
+    const savedRows = async () => (await pool.query(
+      `SELECT day::text, version, devices, values_sha256::text AS values_sha256
+         FROM ${quoted(schema, "analytics_v2_daily_contributions")}
+        WHERE owner_digest = $1 ORDER BY day, version`, [echo.ownerDigest])).rows;
+    const savedBefore = await savedRows();
+    assert.ok(savedBefore.length > 0, "echo has a saved contribution before departure");
+
+    // A security disconnect removes echo from the real public roster. The
+    // retained opt-out marker stays in place, but no longer grants eligibility.
+    // No participant or historical contribution is erased.
+    await pool.query(`UPDATE ${quoted(schema, "accountless_enrollment_ledger")}
+      SET revocation_reason = 'security_reset' WHERE device_id = ANY($1::text[])`, [echo.devices]);
+    for (const table of ["accountless_upload_owners", "accountless_v11_device_authorizations"]) {
+      await pool.query(`UPDATE ${quoted(schema, table)} SET revocation_reason = 'security_reset'
+        WHERE participant_id = $1`, [echo.participantId]);
+    }
+    await pool.query(`UPDATE ${quoted(schema, "storage_v11_owner_links")} SET state = 'withdrawn'
+      WHERE participant_id = $1`, [echo.participantId]);
+    const context = { pool, schema, nowMs: seedFixture.NOW_MS };
+    const roster = await a1.owners.listAnalyticsV2Owners(context);
+    assert.ok(![...roster.owners, ...roster.unlinked].some((owner) => owner.participantId === echo.participantId));
+    const saved = await a1.ownerSets.readAnalyticsV2OwnerSetState(context, { days: [D1] });
+    assert.equal(saved.days.get(D1).members.get(echo.ownerDigest).participantId, echo.participantId,
+      "the withdrawn link still resolves the saved member");
+
+    // A changed real-table row outside the saved member's D1 requeues history.
+    // With no exclusion of echo, departure alone preserves its exact content.
+    await insertExclusion("synthetic-departed-boundary", echo.participantId, `${D2}T00:00:00.000000Z`, null);
+    const outside = await runJob({ schema, now, pipeline });
+    assert.equal(outside.exclusions.changed, true);
+    assert.ok(outside.exclusions.republishedDays >= before.size);
+    assert.ok(outside.ownerSets.savedMembersFolded >= 1);
+    assert.deepEqual((await publishedRows(pool, schema)).get(D1), original,
+      "effective_at at D1's end leaves its departed member included");
+    assert.deepEqual(await savedRows(), savedBefore);
+
+    // Moving the effective instant one microsecond into D1 excludes it.
+    await pool.query(`UPDATE ${exclusions} SET effective_at = $1 WHERE exclusion_id = 'synthetic-departed-boundary'`,
+      [`${D1}T23:59:59.999999Z`]);
+    const hidden = await runJob({ schema, now, pipeline });
+    assert.equal(hidden.exclusions.changed, true);
+    assert.ok(hidden.exclusions.republishedDays >= before.size);
+    assert.ok(hidden.published.includes(D1));
+    const hiddenHead = (await publishedRows(pool, schema)).get(D1);
+    assert.equal(participants(hiddenHead), participants(original) - 1);
+    assert.equal(hiddenHead.revision, original.revision + 1);
+    assert.notEqual(hiddenHead.payload_sha256, original.payload_sha256);
+    assert.deepEqual(await savedRows(), savedBefore, "exclusion hides saved data without removing it");
+    const unchanged = await runJob({ schema, now, pipeline });
+    assert.equal(unchanged.exclusions.changed, false);
+    assert.equal(unchanged.exclusions.republishedDays, 0);
+    assert.deepEqual(unchanged.published, []);
+
+    // Expiry exactly at D1's start covers nothing; one microsecond later
+    // covers D1. PostgreSQL's microsecond precision reaches the real fold.
+    await pool.query(`UPDATE ${exclusions} SET effective_at = $1, expires_at = $2
+      WHERE exclusion_id = 'synthetic-departed-boundary'`,
+    ["2026-09-27T00:00:00.000000Z", `${D1}T00:00:00.000000Z`]);
+    const expired = await runJob({ schema, now, pipeline });
+    assert.equal(expired.exclusions.changed, true);
+    assert.ok(expired.published.includes(D1));
+    const restored = (await publishedRows(pool, schema)).get(D1);
+    assert.equal(restored.payload_sha256, original.payload_sha256);
+    assert.equal(restored.revision, hiddenHead.revision + 1);
+    await pool.query(`UPDATE ${exclusions} SET expires_at = $1 WHERE exclusion_id = 'synthetic-departed-boundary'`,
+      [`${D1}T00:00:00.000001Z`]);
+    const overlapped = await runJob({ schema, now, pipeline });
+    assert.equal(overlapped.exclusions.changed, true);
+    const overlapHead = (await publishedRows(pool, schema)).get(D1);
+    assert.equal(overlapHead.payload_sha256, hiddenHead.payload_sha256);
+    assert.equal(overlapHead.revision, restored.revision + 1);
+
+    await pool.query(`UPDATE ${exclusions} SET state = 'revoked', revoked_at = $1, revoked_by_digest = $2
+      WHERE exclusion_id = 'synthetic-departed-boundary'`, [now, "f".repeat(64)]);
+    const revoked = await runJob({ schema, now, pipeline });
+    assert.equal(revoked.exclusions.changed, true);
+    assert.ok(revoked.exclusions.republishedDays >= before.size);
+    assert.ok(revoked.ownerSets.savedMembersFolded >= 1);
+    const final = (await publishedRows(pool, schema)).get(D1);
+    assert.equal(final.payload_sha256, original.payload_sha256);
+    assert.equal(final.revision, overlapHead.revision + 1);
+    assert.deepEqual(await savedRows(), savedBefore);
+    assert.equal(JSON.stringify(revoked).includes(echo.participantId), false);
+  });
+});
+
 // K-PAR: owners computed by compute Workers merge to exactly the inline rows.
 test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes exactly the inline run's rows", {
   skip: PG_SKIP,
