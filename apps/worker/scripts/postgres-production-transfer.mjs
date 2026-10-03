@@ -15,9 +15,12 @@
 //   identity-rotate-pin
 //                     OWNER ONLY (round 16: the production secret is lost).
 //                     Reads the NEW IDENTITY_LINK_SECRET from stdin and the
-//                     sealed D1 pin from --sealed-pin-file; writes
-//                     identity-pin.json (the new label) and
+//                     sealed D1 pin from --sealed-pin-file (a private file);
+//                     writes identity-pin.json (the new label) and
 //                     identity-rotation.json (0400, once each). No database.
+//                     --from-key-version must be a retired production label
+//                     and --to-key-version the label the origin runs
+//                     (cloud-run/postgres-production-configuration.mjs).
 //                     The inputs then declare identityLinkRotation, and the
 //                     run needs a second token (--confirm-identity-rotation).
 //   target-check      Read-only, before the fence: contract, PostgreSQL 17,
@@ -123,6 +126,7 @@ import {
   IDENTITY_LINK_ROTATION_SCHEMA,
   assertPinMatchesMount,
   assertPinMatchesSealed,
+  assertRotationLabels,
   assertRotationMatchesSealed,
   buildIdentityLinkPin,
   buildIdentityLinkRotation,
@@ -137,6 +141,10 @@ import {
   PRODUCTION_ROUTE_TABLE,
   assertIdentityLinkConsumersRetired,
 } from "../cloud-run/postgres-production-registry.mjs";
+import {
+  PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+  PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
+} from "../cloud-run/postgres-production-configuration.mjs";
 import {
   OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
   checkPendingObjectTransferGuard,
@@ -265,9 +273,25 @@ const AUTHORIZATION_STEPS = Object.freeze([...PROTECTED_STEPS, IDENTITY_ROTATION
 export const IDENTITY_LINK_ROTATION_STAGE = "identity-link-rotation";
 const IDENTITY_LINK_ROTATION_CHECKPOINT = "identity-link-pin";
 /**
+ * Round 16: the labels a production rotation moves between, from the
+ * origin's own configuration: `to` (and the inputs' expectedIdentityKeyVersion)
+ * must be the label the origin runs, `from` a label production retired. The
+ * CLI and the library API both use these; nothing injects others.
+ */
+export const PRODUCTION_IDENTITY_LINK_ROTATION_LABELS = Object.freeze({
+  currentKeyVersion: PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+  retiredKeyVersions: PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
+});
+/**
  * Every route a production registry may port (the classes it admits); the
- * P8-R consumer refusal checks the identity-link consumers against it. The
- * library API (the synthetic spec) may inject another set; the CLI never does.
+ * P8-R consumer refusal checks the identity-link consumers against it. Every
+ * consumer is od-cr-2, which this set excludes by construction, so on the CLI
+ * path the refusal reduces to the registry classification (a consumer
+ * reclassified out of od-cr-2 refuses). The real ported set lives in
+ * TypeScript (src/backend-composition.ts) that plain Node cannot load here;
+ * the production host's boot refusal (assertIdentityLinkRotationComposable)
+ * checks that set. The library API (the synthetic spec) may inject another
+ * set; the CLI never does.
  */
 export const PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS = Object.freeze(PRODUCTION_ROUTE_TABLE
   .filter(route => ![PRODUCTION_ROUTE_CLASSES.OD_CR_2, PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
@@ -292,8 +316,11 @@ export const PRODUCTION_TRANSFER_ERROR_CODES = Object.freeze([
   "CUTOVER_EXECUTE_REQUIRED",
   "CUTOVER_FLIP_EVIDENCE_INVALID",
   "CUTOVER_FLIP_EVIDENCE_STALE",
+  "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH",
   "CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED",
   "CUTOVER_IDENTITY_ROTATION_INVALID",
+  "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH",
+  "CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE",
   "CUTOVER_IDENTITY_ROTATION_STATE_INVALID",
   "CUTOVER_INPUTS_INVALID",
   "CUTOVER_INTERIM_READ_FACTS_INVALID",
@@ -815,23 +842,34 @@ async function readPin(context) {
  * declare none. The document must hash to the inputs' rotationSha256 (it is
  * tamper-evident: the run token binds the inputs, which bind this digest)
  * and be the closed rotation schema naming exactly the registry's consumer
- * routes; anything else refuses CUTOVER_IDENTITY_ROTATION_INVALID.
+ * routes; anything else refuses CUTOVER_IDENTITY_ROTATION_INVALID. Its labels
+ * and the inputs' expectedIdentityKeyVersion are tied to the origin's
+ * configuration (PRODUCTION_IDENTITY_LINK_ROTATION_LABELS): `to` and the
+ * expected label must be the label the origin runs and `from` a retired one,
+ * at every step that reads the rotation (CUTOVER_IDENTITY_LINK_VERSION_MISMATCH).
  */
 async function readRotation(context) {
   const declared = context.inputs.identityLinkRotation;
   if (declared === undefined) return null;
+  if (context.inputs.expectedIdentityKeyVersion !== PRODUCTION_IDENTITY_LINK_ROTATION_LABELS.currentKeyVersion) {
+    fail("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH", { check: "P8" });
+  }
   const { value, sha256 } = await readOwnerJson(context.path("rotation"), "CUTOVER_IDENTITY_ROTATION_INVALID");
   if (sha256 !== declared.rotationSha256) fail("CUTOVER_IDENTITY_ROTATION_INVALID", { check: "P8" });
-  return Object.freeze({ rotation: validateIdentityLinkRotation(value, { consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS }),
-    rotationSha256: sha256 });
+  const rotation = validateIdentityLinkRotation(value, { consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS });
+  assertRotationLabels({ fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion },
+    PRODUCTION_IDENTITY_LINK_ROTATION_LABELS);
+  return Object.freeze({ rotation, rotationSha256: sha256 });
 }
 
 /**
  * P8-R's consumer refusal: a rotation is admitted only while every route
  * that consumes the identity-link pin, link keys or cooldown digests is
  * od-cr-2 in the registry and outside the ported set (round 12 retires them
- * all). The PostgreSQL lifecycle pass reads no identity secret; the check
- * pins that statically.
+ * all). On the CLI path the ported set is PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS,
+ * so what this proves at preflight is the registry classification; the real
+ * ported set is refused at host boot. The PostgreSQL lifecycle pass reads no
+ * identity secret; the check pins that statically.
  */
 function identityLinkConsumersCheck(portedRouteIds) {
   try {
@@ -1025,15 +1063,31 @@ export async function targetCheck({ pool, contractId, rootDirectory = undefined 
 export async function writeIdentityRotation({ ownerDirectory, stream, sealedPinFile, fromKeyVersion, toKeyVersion,
   secretName, secretVersion, now = () => new Date(), forbiddenRoots = undefined }) {
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
-  const sealedPin = parseSealedPinFile(await readPrivateFile(absolutePath(sealedPinFile, "CUTOVER_ARGUMENT_INVALID"),
-    64 * 1024, "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH"));
+  // The labels first, before the sealed pin or the secret is read: production
+  // rotates only from a retired label to the label the origin runs.
+  assertRotationLabels({ fromKeyVersion, toKeyVersion }, PRODUCTION_IDENTITY_LINK_ROTATION_LABELS);
+  const sealedPath = absolutePath(sealedPinFile, "CUTOVER_ARGUMENT_INVALID");
+  let sealedBytes;
+  try {
+    // A private file only: no group or other bits, one link, the caller's own,
+    // no symlink in the path, 1 byte to 64 KiB. A plain shell redirect under
+    // the usual umask is 0644; write it under `umask 077` (or chmod 400).
+    sealedBytes = await readPrivateFile(sealedPath, 64 * 1024, "CUTOVER_ARGUMENT_INVALID");
+  } catch {
+    fail("CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE", { step: "identity-rotate-pin" });
+  }
+  const sealedPin = parseSealedPinFile(sealedBytes);
+  // The sealed pin must carry the retired label named, checked before the
+  // secret is read (the builder refuses it again).
+  if (sealedPin.keyVersion !== fromKeyVersion) fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH", { step: "identity-rotate-pin" });
   // Both documents are written once: refuse before either exists half-made.
   for (const name of [OWNER_FILES.pin, OWNER_FILES.rotation]) {
     if (await fileExists(join(directory, name))) fail("CUTOVER_RECEIPT_CONFLICT", { step: "identity-rotate-pin" });
   }
   const secret = await readSecretFromStream(stream);
   const { pin, rotation } = buildIdentityLinkRotation({ secret, sealedPin, fromKeyVersion, toKeyVersion, secretName,
-    secretVersion, consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS, computedAt: now().toISOString() });
+    secretVersion, consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS, computedAt: now().toISOString(),
+    labels: PRODUCTION_IDENTITY_LINK_ROTATION_LABELS });
   const pinSha256 = await writePrivateFileOnce(join(directory, OWNER_FILES.pin), `${canonicalJson(pin)}\n`, 0o400);
   const rotationSha256 = await writePrivateFileOnce(join(directory, OWNER_FILES.rotation), `${canonicalJson(rotation)}\n`,
     0o400);
@@ -1093,10 +1147,11 @@ export async function runPreflight(context) {
       checks.P8 = Object.freeze({ pinSha256, keyVersion: pinned.keyVersion, secretVersion: mounted.secretVersion,
         mountBound: true });
     } else {
-      // P8-R (round 16): from == the sealed row, the pin == to, the mount,
-      // and every identity-link consumer retired.
+      // P8-R (round 16): the labels are the origin's (readRotation tied the
+      // inputs too), from == the sealed row, the pin == to, the mount, and
+      // every identity-link consumer retired.
       const rotated = assertRotationMatchesSealed(declared.rotation, pin, sealedPinRows,
-        { expectedKeyVersion: context.inputs.expectedIdentityKeyVersion });
+        PRODUCTION_IDENTITY_LINK_ROTATION_LABELS);
       const mounted = assertPinMatchesMount(pin, deployment.identityLinkMount);
       const consumersRetired = identityLinkConsumersCheck(context.portedRouteIds);
       checks.P8 = Object.freeze({ pinSha256, keyVersion: rotated.toKeyVersion, secretVersion: mounted.secretVersion,

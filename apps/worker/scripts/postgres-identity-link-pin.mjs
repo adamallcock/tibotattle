@@ -163,20 +163,32 @@ export function assertPinMatchesMount(pin, mount) {
 // Round 16: rotate at the cutover (owner decisions 2026-10-02, round 16).
 //
 // The production IDENTITY_LINK_SECRET is lost (Cloudflare Worker secrets are
-// write-only). Round 12 retires every route that consumes it
-// (IDENTITY_LINK_CONSUMER_ROUTE_IDS), so the owner chose to ROTATE: the
-// origin mounts a newly generated Secret Manager version under a new label,
-// and the imported D1 pin row is replaced at the cutover only under a
-// second authorization token and a recorded, tamper-evident rotation
+// write-only). Round 12 retires every route that consumes the pin, a link key
+// or a cooldown digest (IDENTITY_LINK_CONSUMER_ROUTE_IDS), so the owner chose
+// to ROTATE: the origin mounts a newly generated Secret Manager version under
+// a new label, and the imported D1 pin row is replaced at the cutover only
+// under a second authorization token and a recorded, tamper-evident rotation
 // document. Never silently: without the document every continuity check
-// still refuses a mismatched secret.
+// still refuses a mismatched secret. (The origin still keys its 60-second
+// rate-limit subjects with the secret; those carry no continuity.)
+//
+// The labels are not free: a rotation moves the pin FROM a label the
+// deployment retired TO the label the deployment runs (the production
+// composition passes PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS and
+// PRODUCTION_IDENTITY_LINK_SECRET_VERSION from
+// cloud-run/postgres-production-configuration.mjs), so a pin can never be
+// moved to a label the origin does not use.
 //
 // `identity-rotate-pin` (owner only) reads the NEW secret from stdin, like
 // `identity-pin`, and the sealed D1 pin from --sealed-pin-file: the output of
 // the read-only
-//   wrangler d1 execute <production database> --remote --env production --json \
-//     --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration"
+//   (umask 077; wrangler d1 execute <production database> --remote --env production --json \
+//     --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration" \
+//     > <owner dir>/sealed-pin.json)
 // (a keyed digest, kept in the 0700 owner directory, never the repository).
+// The file must be private (no group or other permission bits, one link, the
+// caller's own): a plain redirect under the usual umask makes it 0644, which
+// refuses CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE.
 // It writes identity-pin.json (the new pin) and identity-rotation.json.
 
 export const IDENTITY_LINK_ROTATION_SCHEMA = "tibotattle-identity-link-rotation-v1";
@@ -254,17 +266,38 @@ export function validateIdentityLinkRotation(value, { consumerRouteIds }) {
 }
 
 /**
+ * The rotation's label rule. `labels` is the deployment's
+ * { currentKeyVersion, retiredKeyVersions }: a non-empty list of retired
+ * labels that excludes the current one (anything else refuses
+ * CUTOVER_IDENTITY_PIN_INVALID). `toKeyVersion` must be the current label and
+ * `fromKeyVersion` one of the retired labels; any other well-formed label,
+ * another plane's included, refuses CUTOVER_IDENTITY_LINK_VERSION_MISMATCH.
+ */
+export function assertRotationLabels({ fromKeyVersion, toKeyVersion }, labels) {
+  const current = labels?.currentKeyVersion;
+  const retired = labels?.retiredKeyVersions;
+  if (typeof current !== "string" || !KEY_VERSION.test(current) || !Array.isArray(retired) || retired.length === 0
+      || retired.some(label => typeof label !== "string" || !KEY_VERSION.test(label)) || retired.includes(current)) {
+    fail("CUTOVER_IDENTITY_PIN_INVALID");
+  }
+  if (toKeyVersion !== current || !retired.includes(fromKeyVersion)) fail("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH");
+  return Object.freeze({ fromKeyVersion, toKeyVersion });
+}
+
+/**
  * Build the rotation's two owner documents from the NEW secret: the pin of
  * the new secret (the existing pin schema, labelled `toKeyVersion`) and the
  * rotation document binding it to the sealed D1 pin. The sealed pin must
- * carry `fromKeyVersion`; the labels and the fingerprints must both change.
+ * carry `fromKeyVersion`, the labels must satisfy assertRotationLabels for
+ * the deployment's `labels`, and the fingerprints must change.
  */
 export function buildIdentityLinkRotation({ secret, sealedPin, fromKeyVersion, toKeyVersion, secretName,
-  secretVersion, consumerRouteIds, computedAt }) {
+  secretVersion, consumerRouteIds, computedAt, labels }) {
   if (sealedPin === null || typeof sealedPin !== "object" || typeof fromKeyVersion !== "string"
       || !KEY_VERSION.test(fromKeyVersion) || sealedPin.keyVersion !== fromKeyVersion) {
     fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
   }
+  assertRotationLabels({ fromKeyVersion, toKeyVersion }, labels);
   const pin = buildIdentityLinkPin({ secret, keyVersion: toKeyVersion, secretName, secretVersion, computedAt });
   const rotation = validateIdentityLinkRotation({
     schema: IDENTITY_LINK_ROTATION_SCHEMA,
@@ -280,21 +313,21 @@ export function buildIdentityLinkRotation({ secret, sealedPin, fromKeyVersion, t
 }
 
 /**
- * Preflight P8-R over a rotation: `from` must be the sealed D1 row exactly
- * (CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH), the pin must be the rotation's
- * `to` (CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH), and `to` must carry the
- * expected deployment label (CUTOVER_IDENTITY_LINK_VERSION_MISMATCH).
+ * Preflight P8-R over a rotation: both labels must follow the deployment's
+ * `labels` ({ currentKeyVersion, retiredKeyVersions }; `to` and the pin carry
+ * the current label, `from` a retired one; CUTOVER_IDENTITY_LINK_VERSION_MISMATCH),
+ * `from` must be the sealed D1 row exactly
+ * (CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH), and the pin must be the
+ * rotation's `to` (CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH).
  */
-export function assertRotationMatchesSealed(rotation, pin, sealedRows, { expectedKeyVersion }) {
+export function assertRotationMatchesSealed(rotation, pin, sealedRows, labels) {
   const valid = validateIdentityLinkPin(pin);
-  if (typeof expectedKeyVersion !== "string" || !KEY_VERSION.test(expectedKeyVersion)) fail("CUTOVER_IDENTITY_PIN_INVALID");
+  assertRotationLabels({ fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion }, labels);
   if (!Array.isArray(sealedRows) || sealedRows.length !== 1 || sealedRows[0].key_version !== rotation.from.keyVersion
       || sealedRows[0].secret_fingerprint !== rotation.from.secretFingerprint) {
     fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
   }
-  if (rotation.to.keyVersion !== expectedKeyVersion || valid.keyVersion !== expectedKeyVersion) {
-    fail("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH");
-  }
+  if (valid.keyVersion !== labels.currentKeyVersion) fail("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH");
   if (valid.secretFingerprint !== rotation.to.secretFingerprint || valid.secretName !== rotation.to.secretName
       || valid.secretVersion !== rotation.to.secretVersion) {
     fail("CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH");

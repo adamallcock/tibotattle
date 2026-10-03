@@ -41,6 +41,7 @@ import {
   IDENTITY_LINK_ROTATION_SCHEMA,
   assertPinMatchesMount,
   assertPinMatchesSealed,
+  assertRotationLabels,
   assertRotationMatchesSealed,
   buildIdentityLinkPin,
   buildIdentityLinkRotation,
@@ -51,6 +52,10 @@ import {
   validateIdentityLinkRotation,
 } from "./postgres-identity-link-pin.mjs";
 import { IDENTITY_LINK_CONSUMER_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
+import {
+  PRODUCTION_RESOURCE_FINGERPRINT,
+  PRODUCTION_VARS,
+} from "../cloud-run/postgres-production-configuration.mjs";
 import { PARITY_CLASSES, selectParitySample } from "./postgres-transfer-parity-sample.mjs";
 import {
   DESIRED_STATE_SCHEMA,
@@ -59,6 +64,7 @@ import {
   IDENTITY_ROTATION_AUTHORIZATION_STEP,
   OWNER_FILES,
   PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS,
+  PRODUCTION_IDENTITY_LINK_ROTATION_LABELS,
   MIGRATION_FENCE_LOCK_PREFIX,
   PRODUCTION_TRANSFER_ERROR_CODES,
   PRODUCTION_TRANSFER_INPUTS_SCHEMA,
@@ -310,12 +316,51 @@ const NEW_SECRET = "ept8-check-synthetic-rotated-identity-link-secret-0";
 const OLD_FINGERPRINT = identityLinkSecretFingerprint(SECRET);
 const SEALED_ROW = Object.freeze({ key_version: "production-v1", secret_fingerprint: OLD_FINGERPRINT });
 
+const LABELS = PRODUCTION_IDENTITY_LINK_ROTATION_LABELS;
+
 function rotationFixture(overrides = {}) {
   return buildIdentityLinkRotation({ secret: NEW_SECRET, sealedPin: { keyVersion: "production-v1",
     secretFingerprint: OLD_FINGERPRINT }, fromKeyVersion: "production-v1", toKeyVersion: "production-v2",
   secretName: "IDENTITY_LINK_SECRET", secretVersion: "1", consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
-  computedAt: "2026-10-03T00:00:00.000Z", ...overrides });
+  computedAt: "2026-10-03T00:00:00.000Z", labels: LABELS, ...overrides });
 }
+
+/** A self-consistent rotation to an arbitrary label, built as if the labels were free (the reviewer's probe). */
+function forgedRotation({ fromKeyVersion = "production-v1", toKeyVersion }) {
+  return rotationFixture({ sealedPin: { keyVersion: fromKeyVersion, secretFingerprint: OLD_FINGERPRINT }, fromKeyVersion,
+    toKeyVersion, labels: { currentKeyVersion: toKeyVersion, retiredKeyVersions: [fromKeyVersion] } });
+}
+
+test("round 16: the rotation labels are the ones the origin runs, never any other well-formed label", () => {
+  // The transfer's labels are the production configuration's, not an input.
+  assert.equal(LABELS.currentKeyVersion, PRODUCTION_VARS.IDENTITY_LINK_SECRET_VERSION);
+  assert.equal(LABELS.currentKeyVersion, PRODUCTION_RESOURCE_FINGERPRINT.identityLinkSecretVersion);
+  assert.deepEqual([...LABELS.retiredKeyVersions], [...PRODUCTION_RESOURCE_FINGERPRINT.retiredIdentityLinkSecretVersions]);
+  assert.deepEqual({ ...LABELS, retiredKeyVersions: [...LABELS.retiredKeyVersions] },
+    { currentKeyVersion: "production-v2", retiredKeyVersions: ["production-v1"] });
+  assert.ok(Object.isFrozen(LABELS) && Object.isFrozen(LABELS.retiredKeyVersions));
+  assert.deepEqual({ ...assertRotationLabels({ fromKeyVersion: "production-v1", toKeyVersion: "production-v2" }, LABELS) },
+    { fromKeyVersion: "production-v1", toKeyVersion: "production-v2" });
+  for (const [fromKeyVersion, toKeyVersion] of [["production-v1", "production-v3"], ["production-v1", "staging-v1"],
+    ["staging-v1", "production-v2"], ["production-v0", "production-v2"], ["production-v2", "production-v2"],
+    ["production-v1", "production-v1"], [undefined, "production-v2"], ["production-v1", null]]) {
+    assert.throws(() => assertRotationLabels({ fromKeyVersion, toKeyVersion }, LABELS),
+      { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" }, `${fromKeyVersion} -> ${toKeyVersion}`);
+  }
+  // A malformed label policy is a programming error, never a pass.
+  for (const labels of [undefined, {}, { currentKeyVersion: "production-v2", retiredKeyVersions: [] },
+    { currentKeyVersion: "production-v2", retiredKeyVersions: ["production-v2"] },
+    { currentKeyVersion: "production-v2", retiredKeyVersions: "production-v1" },
+    { currentKeyVersion: "bad label!", retiredKeyVersions: ["production-v1"] }]) {
+    assert.throws(() => assertRotationLabels({ fromKeyVersion: "production-v1", toKeyVersion: "production-v2" }, labels),
+      { code: "CUTOVER_IDENTITY_PIN_INVALID" }, JSON.stringify(labels));
+  }
+  // The builder refuses free labels too.
+  for (const toKeyVersion of ["production-v3", "staging-v1"]) {
+    assert.throws(() => rotationFixture({ toKeyVersion }), { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" }, toKeyVersion);
+  }
+  assert.throws(() => rotationFixture({ labels: undefined }), { code: "CUTOVER_IDENTITY_PIN_INVALID" });
+});
 
 test("round 16: the rotation document binds the sealed pin to the new pin, closed and tamper-evident", () => {
   const { pin, rotation } = rotationFixture();
@@ -359,7 +404,7 @@ test("round 16: the rotation document binds the sealed pin to the new pin, close
   assert.throws(() => buildIdentityLinkRotation({ secret: SECRET, sealedPin: { keyVersion: "production-v1",
     secretFingerprint: OLD_FINGERPRINT }, fromKeyVersion: "production-v1", toKeyVersion: "production-v2",
   secretName: "IDENTITY_LINK_SECRET", secretVersion: "1", consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
-  computedAt: "2026-10-03T00:00:00.000Z" }), { code: "CUTOVER_IDENTITY_ROTATION_INVALID" });
+  computedAt: "2026-10-03T00:00:00.000Z", labels: LABELS }), { code: "CUTOVER_IDENTITY_ROTATION_INVALID" });
   assert.throws(() => rotationFixture({ fromKeyVersion: "production-v0" }), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
   assert.throws(() => rotationFixture({ secretVersion: "latest" }), { code: "CUTOVER_IDENTITY_PIN_INVALID" });
 });
@@ -367,38 +412,53 @@ test("round 16: the rotation document binds the sealed pin to the new pin, close
 test("round 16: P8-R needs the rotation; the new pin alone, a wrong label or another from never pass", () => {
   const { pin, rotation } = rotationFixture();
   const expected = { expectedKeyVersion: "production-v2" };
-  assert.deepEqual(assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], expected),
+  assert.deepEqual(assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], LABELS),
     { fromKeyVersion: "production-v1", toKeyVersion: "production-v2", toSecretVersion: "1" });
   // The new secret's pin WITHOUT the rotation document is the unchanged P8: refused.
   assert.throws(() => assertPinMatchesSealed(pin, [SEALED_ROW], expected), { code: "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH" });
   assert.throws(() => assertPinMatchesSealed(pin, [SEALED_ROW], { expectedKeyVersion: "production-v1" }),
     { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" });
-  // A wrong key version.
-  for (const label of ["production-v1", "production-v3"]) {
-    assert.throws(() => assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], { expectedKeyVersion: label }),
+  // A wrong key version: a self-consistent rotation (the sealed row, the pin
+  // and the document agree) to a label the origin does not run, or from a
+  // label production never retired, never passes against the origin's labels.
+  for (const label of ["production-v3", "staging-v1"]) {
+    const forged = forgedRotation({ toKeyVersion: label });
+    assert.equal(forged.pin.keyVersion, label);
+    assert.throws(() => assertRotationMatchesSealed(forged.rotation, forged.pin, [SEALED_ROW], LABELS),
       { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" }, label);
   }
+  const fromStaging = forgedRotation({ fromKeyVersion: "staging-v1", toKeyVersion: "production-v2" });
+  assert.throws(() => assertRotationMatchesSealed(fromStaging.rotation, fromStaging.pin,
+    [{ ...SEALED_ROW, key_version: "staging-v1" }], LABELS), { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" });
+  // A pin under another label than its rotation's to.
+  const relabelled = buildIdentityLinkPin({ secret: NEW_SECRET, keyVersion: "production-v3", secretName: "IDENTITY_LINK_SECRET",
+    secretVersion: "1", computedAt: "2026-10-03T00:00:00.000Z" });
+  assert.throws(() => assertRotationMatchesSealed(rotation, relabelled, [SEALED_ROW], LABELS),
+    { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" });
+  assert.throws(() => assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], expected), { code: "CUTOVER_IDENTITY_PIN_INVALID" },
+    "the label policy is required");
   // The sealed row is not the rotation's from.
   for (const row of [{ ...SEALED_ROW, secret_fingerprint: "f".repeat(64) }, { ...SEALED_ROW, key_version: "production-v0" }]) {
-    assert.throws(() => assertRotationMatchesSealed(rotation, pin, [row], expected),
+    assert.throws(() => assertRotationMatchesSealed(rotation, pin, [row], LABELS),
       { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
   }
-  assert.throws(() => assertRotationMatchesSealed(rotation, pin, [], expected), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  assert.throws(() => assertRotationMatchesSealed(rotation, pin, [], LABELS), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
   // The pin is not the rotation's to: another secret, or another Secret Manager version.
   const other = buildIdentityLinkPin({ secret: `${NEW_SECRET}x`, keyVersion: "production-v2", secretName: "IDENTITY_LINK_SECRET",
     secretVersion: "1", computedAt: "2026-10-03T00:00:00.000Z" });
-  assert.throws(() => assertRotationMatchesSealed(rotation, other, [SEALED_ROW], expected),
+  assert.throws(() => assertRotationMatchesSealed(rotation, other, [SEALED_ROW], LABELS),
     { code: "CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH" });
   const version2 = buildIdentityLinkPin({ secret: NEW_SECRET, keyVersion: "production-v2", secretName: "IDENTITY_LINK_SECRET",
     secretVersion: "2", computedAt: "2026-10-03T00:00:00.000Z" });
-  assert.throws(() => assertRotationMatchesSealed(rotation, version2, [SEALED_ROW], expected),
+  assert.throws(() => assertRotationMatchesSealed(rotation, version2, [SEALED_ROW], LABELS),
     { code: "CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH" });
   // The mount must still name the pin's numeric version.
   assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: null }),
     { code: "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED" });
   assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: "2" }),
     { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" });
-  // The consumer refusal's default ported set is everything a registry may port: no consumer is in it.
+  // The consumer refusal's default ported set is everything a registry may port: no consumer is in it,
+  // so at preflight the refusal is the registry classification (the boot refusal checks the real set).
   for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.includes(id), false, id);
   assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.length, 36, "21 scope, 9 contested, 6 admin");
 });
@@ -434,8 +494,33 @@ test("round 16: identity-rotate-pin writes the two 0400 documents once, from std
   // A trailing newline (an `echo |` store) is refused before anything is written.
   await assert.rejects(writeIdentityRotation({ ...options, stream: Readable.from([`${NEW_SECRET}\n`]) }),
     { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" });
-  await assert.rejects(writeIdentityRotation({ ...options, fromKeyVersion: "production-v0",
-    stream: Readable.from([NEW_SECRET]) }), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  // Labels other than the origin's are refused before the sealed pin or the secret is read.
+  const untouched = () => Readable.from((function* secretSource() {
+    throw new Error("the secret must not be read");
+  })());
+  for (const labels of [{ toKeyVersion: "production-v3" }, { toKeyVersion: "staging-v1" },
+    { fromKeyVersion: "production-v0" }, { fromKeyVersion: "staging-v1" }]) {
+    await assert.rejects(writeIdentityRotation({ ...options, ...labels, sealedPinFile: join(directory, "absent.json"),
+      stream: untouched() }), { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" }, JSON.stringify(labels));
+  }
+  // The sealed-pin file must be private: a plain redirect under umask 022
+  // (0644) gets its own code, not the from-mismatch one.
+  const wideOpen = join(directory, "sealed-pin-0644.json");
+  await writeFile(wideOpen, await readFile(sealedPinFile));
+  await chmod(wideOpen, 0o644);
+  for (const path of [wideOpen, join(directory, "absent.json")]) {
+    await assert.rejects(writeIdentityRotation({ ...options, sealedPinFile: path, stream: untouched() }),
+      { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE" }, path);
+  }
+  // A private sealed-pin file of another plane (its label is not --from-key-version) is the from mismatch.
+  const otherPlane = join(directory, "sealed-pin-staging.json");
+  await writeFile(otherPlane, JSON.stringify([{ results: [{ key_version: "staging-v1",
+    secret_fingerprint: OLD_FINGERPRINT }], success: true, meta: {} }]), { mode: 0o400 });
+  await assert.rejects(writeIdentityRotation({ ...options, sealedPinFile: otherPlane, stream: untouched() }),
+    { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  const { readdir } = await import("node:fs/promises");
+  assert.deepEqual((await readdir(directory)).filter(name => [OWNER_FILES.pin, OWNER_FILES.rotation].includes(name)), [],
+    "no refusal wrote a document");
   const printed = await writeIdentityRotation({ ...options, stream: Readable.from([NEW_SECRET]) });
   assert.deepEqual(Object.keys(printed).sort(), ["fromKeyVersion", "pinSha256", "rotationSha256", "schema", "secretVersion",
     "step", "toKeyVersion"]);

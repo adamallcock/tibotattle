@@ -1,6 +1,8 @@
 // Round 16 (owner decisions 2026-10-02): the lost IDENTITY_LINK_SECRET is
 // rotated at the cutover, which is safe only because round 12 retires every
-// route that consumes it. The routes round 12 and OD-CR-1 KEEP (the social
+// route that consumes the pin, a link key or a cooldown digest (the origin
+// still keys its 60-second rate-limit subjects with the secret, which carry
+// no continuity). The routes round 12 and OD-CR-1 KEEP (the social
 // session, credential renew and disconnect, which keep the 14 native social
 // devices uploading until their 180-day sunsets) must work unchanged with the
 // rotated pin. This spec proves it on PostgreSQL 17: the session read, renew

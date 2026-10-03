@@ -19,12 +19,16 @@ read, and nothing touched Cloudflare, Secret Manager or Cloud SQL.
 Round 16 of the 2026-10-02 owner decisions: the production
 `IDENTITY_LINK_SECRET` is lost (Cloudflare Worker secrets are write-only and
 the owner has no copy), so the cutover rotates it. That is admissible only
-because round 12 retires every route that consumes the secret.
+because round 12 retires every route that consumes the identity-link pin, a
+provider subject's link key or a re-enrolment cooldown digest. The origin
+still keys its rate-limit subjects (client address and upload principal) with
+the secret; those keys last one 60-second window and carry no continuity.
 
 | Item | Value |
 |---|---|
 | Retired label (D1 pin, `wrangler.jsonc` env.production) | `production-v1` |
 | Rotated label (origin `PRODUCTION_VARS`) | `production-v2` |
+| Label rule | A rotation moves only from a label in `PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS` to `PRODUCTION_IDENTITY_LINK_SECRET_VERSION` (`postgres-production-configuration.mjs`); `expectedIdentityKeyVersion` must equal the latter. The orchestrator imports both; no input or flag overrides them |
 | Secret Manager secret and version to mount | `IDENTITY_LINK_SECRET`, version `1` (the newly generated value) |
 | Rotation document schema | `tibotattle-identity-link-rotation-v1`, reason `secret-lost` |
 | Owner document digests | None yet: `identity-rotate-pin` has not run |
@@ -35,7 +39,7 @@ Fingerprints are keyed digests and appear in no repository file.
 
 | Part | Where |
 |---|---|
-| Rotation document, sealed-pin file parser, P8-R comparison | `apps/worker/scripts/postgres-identity-link-pin.mjs` |
+| Rotation document, sealed-pin file parser, the label rule (`assertRotationLabels`), P8-R comparison | `apps/worker/scripts/postgres-identity-link-pin.mjs` |
 | `identity-rotate-pin` (owner, stdin only), P8-R, the second token, the `identity-link-rotation` stage, continuity at post-import, the flip gate and the post-live check, the report's `rotation` digest | `apps/worker/scripts/postgres-production-transfer.mjs` |
 | PT-3's closed rotate mode (`sealed == rotation.from`, `pinMode: rotated`; the row is still copied verbatim) | `apps/worker/scripts/postgres-identity-authority-transfer.mjs` |
 | The new stage in PT-1's list and the plan; the pin table split from the kept-session tables | `postgres-transfer-target.mjs`, `postgres-transfer-coverage.mjs` |
@@ -52,9 +56,24 @@ Fingerprints are keyed digests and appear in no repository file.
   refuses a rotation token.
 - The new secret's pin without the rotation document fails P8
   (`CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`) under either label.
-- A wrong key version fails (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`), as do
-  a `from` that is not the sealed row, a pin that is not `to`, an unpinned or
-  mismatched mount, and a ported consumer, at preflight and at host boot.
+- A wrong key version fails (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`). That
+  includes a self-consistent rotation (pin, document and inputs all agreeing,
+  and the inputs carrying its digest) to `production-v3` or `staging-v1`, and
+  `identity-rotate-pin` asked for either label or for a `from` that production
+  never retired; those are refused before the secret is read. A `from` that is
+  not the sealed row, a pin that is not `to`, and an unpinned or mismatched
+  mount fail too.
+- A ported consumer is refused at preflight only through the registry
+  classification: every consumer is `od-cr-2`, which the CLI's default ported
+  set (`PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS`) excludes by construction, so
+  the preflight refusal fires if a consumer is reclassified (the spec's ported
+  consumer case injects the set through the library API). The real ported
+  set is TypeScript that plain Node cannot load at preflight; the production
+  host's boot refusal (`assertIdentityLinkRotationComposable`) checks it.
+- `identity-rotate-pin` reads the sealed-pin file only if it is private: a
+  `0644` file (a plain redirect under umask 022) or a missing one refuses
+  `CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE`, distinct from the `from`
+  mismatch. The runbook creates it under `umask 077`.
 - The rotation document is closed and tamper-evident: a schema-valid edit no
   longer hashes to the inputs' `rotationSha256`
   (`CUTOVER_IDENTITY_ROTATION_INVALID`).
@@ -78,12 +97,12 @@ created for this run and removed afterwards.
 
 | Command | Result |
 |---|---|
-| `node --test scripts/postgres-production-transfer.check.mjs` (apps/worker) | 23 of 23 |
-| `npm run postgres:cutover-seal:check` (apps/worker) | 111 of 111 |
+| `node --test scripts/postgres-production-transfer.check.mjs` (apps/worker) | 24 of 24 (after the review fixes; 23 of 23 before) |
+| `npm run postgres:cutover-seal:check` (apps/worker) | 112 of 112 (after the review fixes; 111 of 111 before) |
 | `node --test scripts/postgres-identity-authority-transfer.check.mjs`, `scripts/postgres-transfer-target.check.mjs` | 6 of 6, 16 of 16 |
 | `node --test scripts/cloud-run-production-configuration.check.mjs` | 12 of 12 |
 | `node --test cloud-run/postgres-production-configuration.check.mjs`, `cloud-run/postgres-production-registry.check.mjs`, `cloud-run/postgres-production-host.check.mjs` | 28 of 28, 23 of 23, 13 of 13 |
-| `vitest run --config vitest.postgres.config.ts postgres-test/postgres-production-transfer.spec.mjs` | 5 of 5 |
+| `vitest run --config vitest.postgres.config.ts postgres-test/postgres-production-transfer.spec.mjs` | 5 of 5 (rerun after the review fixes, with the world sealing `production-v1` and the forged-label cases) |
 | `node --test postgres-test/identity-link-rotation-kept-routes.spec.mjs` | 1 of 1 |
 | `node --test postgres-test/analytics-v2-refresh.spec.mjs` (CR-3 equality case) | 1 of 1 |
 | `node --test scripts/ci-postgres-suite.check.mjs` (spec registration) | 43 of 43 |

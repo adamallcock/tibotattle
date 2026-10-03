@@ -122,13 +122,17 @@ switch.
   installs a newly generated secret under a new key-version label, through a
   recorded and separately authorized step
   ([cutover window](../runbooks/gcp-cutover-window.md#identity-link-rotation-round-16)).
-  This is admissible only because round 12 retires every route that uses the
-  secret. Consequences: prior Google and Apple sign-in links cannot be
-  re-established, and any future social sign-in starts a new identity
-  namespace rather than reattaching an existing participant. The imported link
-  keys remain stored, content-free and unused. Uploads, the content-free
-  sharing contract, pseudonymity and the 180-day sunsets are unchanged, so no
-  public disclosure beyond round 12's retirement is needed.
+  This is admissible only because round 12 retires every route that consumes
+  the identity-link pin, a provider subject's link key or a re-enrolment
+  cooldown digest. The origin still keys its rate-limit subjects (client
+  address and upload principal) with the secret; those keys last one
+  60-second window and carry no continuity. Consequences: prior Google and
+  Apple sign-in links cannot be re-established, and any future social sign-in
+  starts a new identity namespace rather than reattaching an existing
+  participant. The imported link keys remain stored, content-free and unused.
+  Uploads, the content-free sharing contract, pseudonymity and the 180-day
+  sunsets are unchanged, so no public disclosure beyond round 12's retirement
+  is needed.
 - This record does not claim that the old link keys are unlinkable to provider
   accounts until the Cloudflare Worker's copy of the old secret is deleted
   after the switch.

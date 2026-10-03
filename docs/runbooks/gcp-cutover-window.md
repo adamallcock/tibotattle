@@ -643,7 +643,9 @@ the target is final for this seal.
 | `CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE` | P7 | The sealed bootstrap is not complete |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8, P8-R | The pin differs from the sealed row or the deployed label. Under round 16 the only rotation is the recorded [identity-link rotation](#identity-link-rotation-round-16); never edit a pin or a row to pass |
 | `CUTOVER_IDENTITY_ROTATION_INVALID`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH` | P8-R | The rotation document does not hash to the inputs' digest or is malformed, its `from` is not the sealed row, or the pin is not its `to`. Recompute it with `identity-rotate-pin` |
-| `CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED` | P8-R | A route that reads the identity-link pin, link keys or cooldowns would be ported. A rotation is not admissible; stop |
+| `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8-R, `identity-rotate-pin` | Under a rotation the labels are the origin's, not inputs: `to`, the pin and `expectedIdentityKeyVersion` must be `PRODUCTION_IDENTITY_LINK_SECRET_VERSION` (`production-v2`) and `from` one of `PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS` (`production-v1`), from `postgres-production-configuration.mjs`. Every step that reads the rotation re-checks this |
+| `CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE` | `identity-rotate-pin` | The sealed-pin file is not a private regular file: group or other permission bits (a plain redirect under umask 022 is `0644`), another owner, a second link, a symlink in its path, empty, over 64 KiB or absent. Recreate it under `umask 077` (step 1) |
+| `CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED` | P8-R | A route that reads the identity-link pin, link keys or cooldowns is classified other than `od-cr-2` in the registry. At preflight this is the registry classification only (every consumer is `od-cr-2`, which the default ported set excludes); the real ported set is refused at host boot (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`). A rotation is not admissible; stop |
 | `CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`, `CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH` | P8 | The committed production desired state mounts no numeric version, or the pin names another secret or version than the mount |
 | `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable, still has a placeholder project, or its `scheduler` map is not a set of job names that includes `analytics-refresh` |
 | `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
@@ -698,15 +700,19 @@ Preconditions (read-only):
 Steps:
 
 1. Read the D1 pin (read-only, approved in the window) into the owner
-   directory, `0400`:
+   directory. The subshell's `umask 077` creates the file `0600`; the
+   `chmod` makes it `0400`:
 
    ```bash
-   npx wrangler d1 execute <production ingestion D1> --remote --env production --json \
+   (umask 077; npx wrangler d1 execute <production ingestion D1> --remote --env production --json \
      --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration" \
-     > <dir>/sealed-pin.json
+     > <dir>/sealed-pin.json) && chmod 400 <dir>/sealed-pin.json
    ```
 
    It is a keyed digest: it stays in the owner directory, never the repository.
+   `identity-rotate-pin` reads only a private file. A plain redirect under the
+   usual umask leaves it `0644`, which refuses
+   `CUTOVER_IDENTITY_ROTATION_SOURCE_UNREADABLE`, not the `from` mismatch.
 2. Owner: compute the new pin and the rotation document. The new secret is
    read from standard input only:
 
@@ -717,6 +723,12 @@ Steps:
        --sealed-pin-file <dir>/sealed-pin.json
    ```
 
+   The labels are not free: `--to-key-version` must be the label the origin
+   runs and `--from-key-version` a retired production label (both from
+   `postgres-production-configuration.mjs`), and the sealed-pin file must carry
+   `--from-key-version`. Each is refused before the secret is read
+   (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`,
+   `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`).
    It writes `identity-pin.json` (the new secret, labelled `production-v2`)
    and `identity-rotation.json` (`tibotattle-identity-link-rotation-v1`: the
    sealed `from`, the new `to` with its secret name and version, the reason
@@ -726,13 +738,18 @@ Steps:
 3. In `pt8-inputs.json`, set `expectedIdentityKeyVersion` to `production-v2`
    and add `"identityLinkRotation": { "rotationSha256": "<printed rotationSha256>" }`.
 4. Preflight runs P8-R instead of P8: the document must hash to
-   `rotationSha256` (`CUTOVER_IDENTITY_ROTATION_INVALID`), `from` must be the
-   sealed row exactly (`CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`), the pin
-   must be `to` (`CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH`) under the expected
-   label (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`), the pin must name the
-   desired state's mount (P8's mount codes), and every identity-link consumer
-   must be `od-cr-2` and unported
-   (`CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED`). GO prints
+   `rotationSha256` (`CUTOVER_IDENTITY_ROTATION_INVALID`); `to`, the pin and
+   `expectedIdentityKeyVersion` must be the origin's label and `from` a
+   retired production label (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`; any
+   other well-formed label, `production-v3` or `staging-v1` included, is
+   refused even when the documents agree on it); `from` must be the sealed
+   row exactly (`CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`), the pin must be
+   `to` (`CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH`), and the pin must name the
+   desired state's mount (P8's mount codes). The consumer refusal
+   (`CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED`) at preflight checks the
+   registry classification: every identity-link consumer must be `od-cr-2`.
+   It cannot see the TypeScript ported set; the host's boot refusal below
+   covers that. GO prints
    `identityRotationAuthorizationToken` beside the run token. It is bound to
    the seal, the contract, the inputs, the preflight, the rotation document,
    both labels and the secret version.
@@ -756,7 +773,10 @@ Without `identityLinkRotation`, P8 is unchanged and the new secret's pin is
 refused (`CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`). Never edit the sealed row,
 the target row or the pin by hand to make a check pass. Under the rotated
 label the production host also refuses to compose if any identity-link
-consumer is ported (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`). Prior Google and
+consumer is in its real ported set (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`).
+The origin still keys its rate-limit subjects (client address and upload
+principal) with the new secret; those keys last one 60-second window and carry
+no continuity, so the rotation does not affect them. Prior Google and
 Apple links cannot be re-established; any future social sign-in starts a new
 identity namespace.
 

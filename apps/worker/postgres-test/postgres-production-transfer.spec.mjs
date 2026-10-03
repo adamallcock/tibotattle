@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -11,6 +12,10 @@ import {
   goldenExportBody,
   sha256Hex as exportSha256,
 } from "../analytics-v2-test/fixtures/interim-public-read-export.mjs";
+import {
+  PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+  PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
+} from "../cloud-run/postgres-production-configuration.mjs";
 import { verifyCutoverUnchanged } from "../scripts/cutover-source-fence.mjs";
 import { participantDeletionDigest, projectDeletionDigests } from "../scripts/cutover-source-projections.mjs";
 import { openSealedSourceFromSeal, readCutoverSeal, writePrivateFileOnce } from "../scripts/cutover-source-seal.mjs";
@@ -47,7 +52,6 @@ import { forgeVariantSeal, headCommit, outputPathsOf, prepareSealWorld, sealWorl
 import { SYNTHETIC_BOOKMARKS, writeBarrierProofFixture, writeFenceReceiptFixture } from "./fixtures/w2-seal/fence-fixtures.mjs";
 import {
   SYNTHETIC_IDENTITY_LINK_SECRET,
-  SYNTHETIC_IDENTITY_LINK_VERSION,
   createFakeCutoverTransport,
   identityLinkFingerprint,
   privateDirectory,
@@ -70,8 +74,13 @@ const table = name => `"${PRIMARY_SCHEMA}"."${name}"`;
 /** The synthetic production plane: its project, and the identity-link mount the pin must name. */
 const DESIRED_PROJECT = "tibotattle-synthetic";
 const IDENTITY_MOUNT = Object.freeze({ secretName: "IDENTITY_LINK_SECRET", version: "3" });
-/** Round 16: the rotated label and a NEW synthetic secret (the production value is lost). */
-const ROTATED_VERSION = "production-v2";
+/**
+ * Round 16: the world seals production's retired label (with the synthetic
+ * secret), so the rotation runs between the origin's real labels; the
+ * rotated label and a NEW synthetic secret (the production value is lost).
+ */
+const SEALED_IDENTITY_LINK_VERSION = PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS[0];
+const ROTATED_VERSION = PRODUCTION_IDENTITY_LINK_SECRET_VERSION;
 const ROTATED_SECRET = "ept8-synthetic-rotated-identity-link-secret-000000";
 
 async function codeOf(promise) {
@@ -99,7 +108,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
    */
   async function ownerDirectory(target, { manifest = manifestPath, sealId = seal.manifest.sealId, inputs = {},
     pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {}, rotation = null,
-    pinKeyVersion = SYNTHETIC_IDENTITY_LINK_VERSION } = {}) {
+    pinKeyVersion = SEALED_IDENTITY_LINK_VERSION } = {}) {
     const directory = await privateDirectory("ept8-owner-");
     let rotationInputs = {};
     if (rotation === null) {
@@ -109,11 +118,11 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     } else {
       const sealedPinFile = join(directory, "sealed-pin.json");
       await writePrivateFileOnce(sealedPinFile, `${JSON.stringify([{ results: [{
-        key_version: rotation.fromKeyVersion ?? SYNTHETIC_IDENTITY_LINK_VERSION,
+        key_version: rotation.fromKeyVersion ?? SEALED_IDENTITY_LINK_VERSION,
         secret_fingerprint: rotation.fromFingerprint ?? identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET) }],
       success: true, meta: {} }])}\n`, 0o400);
       const written = await writeIdentityRotation({ ownerDirectory: directory, stream: Readable.from([rotation.secret]),
-        sealedPinFile, fromKeyVersion: rotation.fromKeyVersion ?? SYNTHETIC_IDENTITY_LINK_VERSION,
+        sealedPinFile, fromKeyVersion: rotation.fromKeyVersion ?? SEALED_IDENTITY_LINK_VERSION,
         toKeyVersion: ROTATED_VERSION, secretName: IDENTITY_MOUNT.secretName, secretVersion: IDENTITY_MOUNT.version,
         now: CONTEXT_NOW });
       rotationInputs = { expectedIdentityKeyVersion: ROTATED_VERSION,
@@ -141,7 +150,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       sealManifestPath: manifest,
       expectedSourceCommit: world.commit,
       fenceReceiptSha256: world.fence.sha256,
-      expectedIdentityKeyVersion: SYNTHETIC_IDENTITY_LINK_VERSION,
+      expectedIdentityKeyVersion: SEALED_IDENTITY_LINK_VERSION,
       deletionDigestProjection: { path: projection.path, sha256: projection.sha256 },
       interimPublicRead: { exportPath: join(directory, "own4-export.json"), sha256: exportSha256(bytes),
         capturedAt: FIXTURE_CAPTURED_AT, sourceCommit: world.commit, evidenceDate: FIXTURE_EVIDENCE_DATE },
@@ -279,7 +288,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
 
   beforeAll(async () => {
     const commit = headCommit(WORKER_ROOT);
-    world = await prepareSealWorld({ commit });
+    world = await prepareSealWorld({ commit, ingestion: { identityLinkVersion: SEALED_IDENTITY_LINK_VERSION } });
     // The Q-1 runtime is 'active'; a seal PT-8 accepts carries the staged runtime (P4).
     const writable = new DatabaseSync(world.ingestionPath);
     try {
@@ -886,6 +895,28 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       "from is not the sealed row");
     await refuse({ rotation, inputs: { identityLinkRotation: { rotationSha256: "a".repeat(64) } } },
       "CUTOVER_IDENTITY_ROTATION_INVALID", "the inputs name another rotation document");
+    // A self-consistent rotation to a label the origin does not run (the pin,
+    // the document and the inputs all agree on it, and the inputs carry its
+    // digest) never passes: the labels are the origin's configuration.
+    for (const label of ["production-v3", "staging-v1"]) {
+      const forged = await ownerDirectory(target, { rotation });
+      const rewrite = async (name, text) => {
+        const path = join(forged, name);
+        await chmod(path, 0o600);
+        await writeFile(path, text);
+        await chmod(path, 0o400);
+      };
+      const ownerJson = async name => JSON.parse(await readFile(join(forged, name), "utf8"));
+      const document = await ownerJson(OWNER_FILES.rotation);
+      const documentText = `${JSON.stringify({ ...document, to: { ...document.to, keyVersion: label } })}\n`;
+      await rewrite(OWNER_FILES.pin, `${JSON.stringify({ ...await ownerJson(OWNER_FILES.pin), keyVersion: label })}\n`);
+      await rewrite(OWNER_FILES.rotation, documentText);
+      await rewrite(OWNER_FILES.inputs, `${JSON.stringify({ ...await ownerJson(OWNER_FILES.inputs),
+        expectedIdentityKeyVersion: label,
+        identityLinkRotation: { rotationSha256: createHash("sha256").update(documentText).digest("hex") } })}\n`);
+      expect(await codeOf(runPreflight(await context(target, forged))), label).toBe("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH");
+      expect(await readdir(forged), label).not.toContain(OWNER_FILES.preflight);
+    }
     await refuse({ rotation }, "CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED", "a ported consumer",
       { portedRouteIds: ["health", "enroll"] });
     const { secrets } = JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"));
@@ -908,7 +939,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     const directory = await ownerDirectory(target, { rotation });
     const preflight = await runPreflight(await context(target, directory));
     expect(preflight.checks.P8).toMatchObject({ keyVersion: ROTATED_VERSION, secretVersion: IDENTITY_MOUNT.version,
-      rotation: { fromKeyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, toKeyVersion: ROTATED_VERSION, consumersRetired: 9 } });
+      rotation: { fromKeyVersion: SEALED_IDENTITY_LINK_VERSION, toKeyVersion: ROTATED_VERSION, consumersRetired: 9 } });
     expect(preflight.identityRotationAuthorizationToken).toMatch(/^[0-9a-f]{64}$/u);
     expect(preflight.identityRotationAuthorizationToken).not.toBe(preflight.runAuthorizationToken);
     const dry = await runImport(await context(target, directory));
@@ -926,7 +957,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     // receipt: everything rolls back, PT-3's verbatim copy stays the sealed row.
     expect(await codeOf(runImport(await context(target, directory, killAfter("identity-link-rotation:updated")),
       authorization))).toBe("synthetic kill");
-    expect(await readPin()).toEqual([{ key_version: SYNTHETIC_IDENTITY_LINK_VERSION, secret_fingerprint: sealedFingerprint }]);
+    expect(await readPin()).toEqual([{ key_version: SEALED_IDENTITY_LINK_VERSION, secret_fingerprint: sealedFingerprint }]);
     let stages = (await receipts(target)).stages;
     expect(stages.find(row => row.stage === "identity-authority")?.state).toBe("complete");
     expect(stages.some(row => row.stage === "identity-link-rotation")).toBe(false);
@@ -936,7 +967,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       authorization))).toBe("synthetic kill");
     expect(await readPin()).toEqual([{ key_version: ROTATED_VERSION, secret_fingerprint: rotatedFingerprint }]);
     await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET key_version = $1, secret_fingerprint = $2`,
-      [SYNTHETIC_IDENTITY_LINK_VERSION, sealedFingerprint]);
+      [SEALED_IDENTITY_LINK_VERSION, sealedFingerprint]);
     expect(await codeOf(runImport(await context(target, directory), authorization)))
       .toBe("CUTOVER_IDENTITY_ROTATION_STATE_INVALID");
     await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET key_version = $1, secret_fingerprint = $2`,

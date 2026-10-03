@@ -235,7 +235,8 @@ Classify before mutating, and use the least control that contains the harm.
   recorded [identity-link rotation](./gcp-cutover-window.md#identity-link-rotation-round-16):
   the Cloudflare value is lost, and round 12 retires every route that reads the
   pin or a link key. The kept session, device, renew and disconnect routes do
-  not read it; at the origin it keys only the address rate-limit subjects. The
+  not read it; at the origin it keys only the rate-limit subjects (client
+  address and upload principal, 60-second windows, no continuity). The
   imported pin is the continuity record: a later rotation is a new owner
   decision with its own recorded pin change, never a hand edit of the pin row.
 - Never put an edge secret in Secret Manager, the origin, the repository, a log
