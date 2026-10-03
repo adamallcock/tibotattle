@@ -10,6 +10,7 @@ import {
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
 } from "./analytics-kernel-closure.mjs";
+import { nodeHostAliasedFiles, nodeHostAliasPlugin } from "./node-crypto-adapter.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
 const ENTRY = resolve(ROOT, "server.mjs");
@@ -31,6 +32,8 @@ const OUTDIR = resolve(ROOT, "dist");
 // bundle this checkout's packages under the vendored kernels instead.
 const VENDOR_ROOT = resolve(ROOT, "../vendor/analytics-d43c8f92");
 const VENDORED_PACKAGES = resolve(VENDOR_ROOT, "packages");
+const WORKER_ROOT = resolve(ROOT, "..");
+const NODE_CRYPTO_ADAPTER = resolve(ROOT, "node-crypto-adapter.mjs");
 const options = {
   entryPoints: {
     server: ENTRY,
@@ -58,7 +61,39 @@ const options = {
   external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"],
   logLevel: "silent",
   metafile: true,
+  // Wave 1A: node:crypto's synchronous SHA-256 and Buffer hex behind both
+  // sha256Hex implementations (src/host-primitives.ts and the vendored
+  // crypto.ts resolve to node-crypto-adapter.mjs; the vendored file stays
+  // byte-identical). It decides the import graph, so the kernel closure and
+  // scripts/analytics-v2-kernel-registry.check.mjs carry it too.
+  plugins: [nodeHostAliasPlugin(WORKER_ROOT)],
 };
+
+/**
+ * Refuse a bundle that still holds a file the Node host alias replaces, or a
+ * refresh bundle that does not hash through node-crypto-adapter.mjs: an
+ * importer that escaped the alias would silently fall back to WebCrypto.
+ */
+function assertNodeHostAlias(metafile) {
+  const cwd = process.cwd();
+  const inputs = new Set(Object.keys(metafile.inputs).map((path) => resolve(cwd, path)));
+  for (const file of nodeHostAliasedFiles(WORKER_ROOT)) {
+    if (inputs.has(file)) {
+      throw Object.assign(new Error("CLOUD_RUN_BUILD_NODE_HOST_ALIAS_ESCAPED"), {
+        code: "CLOUD_RUN_BUILD_NODE_HOST_ALIAS_ESCAPED", input: relative(ROOT, file),
+      });
+    }
+  }
+  for (const entry of [ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY]) {
+    const output = Object.values(metafile.outputs)
+      .find((candidate) => candidate.entryPoint !== undefined && resolve(cwd, candidate.entryPoint) === entry);
+    if (output === undefined || !Object.keys(output.inputs).some((path) => resolve(cwd, path) === NODE_CRYPTO_ADAPTER)) {
+      throw Object.assign(new Error("CLOUD_RUN_BUILD_NODE_HOST_ALIAS_MISSING"), {
+        code: "CLOUD_RUN_BUILD_NODE_HOST_ALIAS_MISSING", entry: relative(ROOT, entry),
+      });
+    }
+  }
+}
 
 /**
  * Refuse a bundle in which a vendored kernel file imports a workspace package
@@ -119,6 +154,7 @@ if (kernelClosureOnly) {
 } else if (process.argv.includes("--check")) {
   const result = await build({ ...options, write: false });
   assertVendoredPackageResolution(result.metafile);
+  assertNodeHostAlias(result.metafile);
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
@@ -129,6 +165,7 @@ if (kernelClosureOnly) {
   await mkdir(OUTDIR, { recursive: true });
   const result = await build(options);
   assertVendoredPackageResolution(result.metafile);
+  assertNodeHostAlias(result.metafile);
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",

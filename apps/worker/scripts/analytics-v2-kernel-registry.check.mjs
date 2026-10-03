@@ -43,6 +43,7 @@ import {
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
 } from "../cloud-run/analytics-kernel-closure.mjs";
+import { nodeHostAliasPlugin } from "../cloud-run/node-crypto-adapter.mjs";
 
 const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -66,12 +67,19 @@ const REGISTRY_PINS = Object.freeze([
   // closure root) and its orchestration method analytics-v2-method-v2 at the
   // 733e143c merge.
   "5140704aab3e55affbbb63da08a043615f119936c093cae25afc4b7d6e9c53c6",
+  // Kernel 5: Wave 1A (W1A-HASH). node:crypto's synchronous SHA-256 behind
+  // both sha256Hex implementations (node-crypto-adapter.mjs replaces the
+  // vendored crypto.ts and src/host-primitives.ts in the bundles) and the
+  // typed-id codec's Buffer-hex fast path. Byte-identical outputs; the
+  // integrator renumbers it at the merge fold if another entry lands first.
+  "2296ef72b42f9f8f691c58de29b219445d94482c127f00df35533bbc4200749e",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
-/** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph. */
+/** cloud-run/build.mjs's options, as far as they decide the refresh bundles' import graph (the Node host alias included). */
 const BUILD_OPTIONS = Object.freeze({ bundle: true, platform: "node", format: "esm", target: "node22",
-  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent" });
+  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"], logLevel: "silent",
+  plugins: [nodeHostAliasPlugin(WORKER_ROOT)] });
 
 const canonical = (entry) => JSON.stringify(Object.fromEntries(ENTRY_KEYS.map((key) => [key, entry[key]])));
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
@@ -179,6 +187,12 @@ test("the closure holds every module that decides a stored value and no I/O plum
     assert.ok(names.has(decides), `${decides} decides stored values and is in the closure`);
   }
   assert.ok(report.names.some((name) => name.startsWith("apps/worker/vendor/analytics-d43c8f92/")));
+  // Wave 1A: both sha256Hex implementations hash through the Node host
+  // adapter; the files it replaces are not bundled (and so not hashed).
+  assert.ok(names.has("apps/worker/cloud-run/node-crypto-adapter.mjs"), "the Node host adapter decides digests");
+  for (const replaced of ["apps/worker/vendor/analytics-d43c8f92/apps/worker/src/crypto.ts", "apps/worker/src/host-primitives.ts"]) {
+    assert.equal(names.has(replaced), false, `${replaced} is replaced by the Node host adapter`);
+  }
   for (const plumbing of ANALYTICS_KERNEL_CLOSURE_PLUMBING) {
     assert.equal(names.has(plumbing), false, `${plumbing} is I/O plumbing`);
   }
