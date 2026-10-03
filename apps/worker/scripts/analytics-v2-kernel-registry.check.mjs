@@ -70,6 +70,8 @@ const REGISTRY_PINS = Object.freeze([
   "5140704aab3e55affbbb63da08a043615f119936c093cae25afc4b7d6e9c53c6",
   // Kernel 5: settled Wave25 REFRESH, PRICER, W1A and KPAR compute closure.
   "3e81ee257f82806f03ed6aa4bb545d8d416b22d4e144a1042e6a9acda22b8248",
+  // Kernel 6: composed Wave26 reader/model sources and local diagnostic plumbing.
+  "fb1f6c882c5b60c208405b754cd0f69eb734aeeae79e1100ad5cbbe3b703d2d5",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
