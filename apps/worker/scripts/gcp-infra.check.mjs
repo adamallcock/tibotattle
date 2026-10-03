@@ -82,12 +82,17 @@ async function run(argv, { project = "synthetic-ops-project", gcloud, writer = m
 test("arguments are closed and dangerous combinations are refused", () => {
   assert.deepEqual(parseGcpInfraArgs(["plan", `--desired-state=${FIXTURE_PATH}`]), {
     command: "plan", desiredStatePath: FIXTURE_PATH, environment: null, bootstrap: null, authorize: null, apply: false,
-    requireClean: false, receiptPath: null, pauseReceiptPath: null, only: null,
+    requireClean: false, requireCadence: false, receiptPath: null, pauseReceiptPath: null, only: null,
   });
   // OPS-10's preflight argv (ROLLOUT_ARGV.infraReadback): no path, the environment's committed file.
   assert.deepEqual(parseGcpInfraArgs(["readback", "--require-clean", "--environment=production"]), {
     command: "readback", desiredStatePath: null, environment: "production", bootstrap: null, authorize: null,
-    apply: false, requireClean: true, receiptPath: null, pauseReceiptPath: null, only: null,
+    apply: false, requireClean: true, requireCadence: false, receiptPath: null, pauseReceiptPath: null, only: null,
+  });
+  // The cutover's stricter form of the same preflight.
+  assert.deepEqual(parseGcpInfraArgs(["readback", "--require-clean", "--require-cadence", "--environment=production"]), {
+    command: "readback", desiredStatePath: null, environment: "production", bootstrap: null, authorize: null,
+    apply: false, requireClean: true, requireCadence: true, receiptPath: null, pauseReceiptPath: null, only: null,
   });
   const cases = [
     [[], "GCP_INFRA_COMMAND_INVALID"],
@@ -116,6 +121,14 @@ test("arguments are closed and dangerous combinations are refused", () => {
     [["readback", "--environment=production", "--require-clean", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
     [["readback", "--environment=production", "--require-clean=yes"], "GCP_INFRA_ARGUMENT_INVALID"],
     [["plan", "--environment=production", "--require-clean"], "GCP_INFRA_ARGUMENT_INVALID"],
+    // --require-cadence strengthens --require-clean and means nothing without it, or on any other command.
+    [["readback", "--environment=production", "--require-cadence"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback", "--environment=production", "--require-clean", "--require-cadence", "--require-cadence"],
+      "GCP_INFRA_ARGUMENT_INVALID"],
+    [["readback", "--environment=production", "--require-clean", "--require-cadence=yes"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["plan", "--environment=production", "--require-clean", "--require-cadence"], "GCP_INFRA_ARGUMENT_INVALID"],
+    [["apply", "--environment=production", "--require-cadence", "--authorize=" + "a".repeat(64)],
+      "GCP_INFRA_ARGUMENT_INVALID"],
     [["apply", "--environment=production", "--require-clean", "--authorize=" + "a".repeat(64)],
       "GCP_INFRA_ARGUMENT_INVALID"],
     // A real change is made only from the committed desired state.
@@ -264,9 +277,25 @@ test("readback --require-clean --environment is OPS-10's preflight: exit 0 only 
   const verdict = JSON.parse(clean.out);
   assert.deepEqual([verdict.clean, verdict.reasons, verdict.environment, verdict.project],
     [true, [], "production", project]);
-  assert.deepEqual(verdict.summary, { executable: 0, deferred: 1, refused: 0 });
+  // Two deferrals: the trigger's create and the scheduler's executor grant, both waiting on the cadence.
+  assert.deepEqual(verdict.summary, { executable: 0, deferred: 2, refused: 0 });
   assert.equal(verdict.readback.schema, "tibotattle-gcp-ops-infra-readback-v1");
   assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
+  // The cutover's stricter form refuses the unset cadence the rollout accepts; both are read-only.
+  gcloud.calls.length = 0;
+  const strict = await run([...preflight, "--require-cadence"], { gcloud });
+  assert.equal(strict.code, 2, strict.out);
+  const strictVerdict = JSON.parse(strict.out);
+  assert.deepEqual([strictVerdict.clean, strictVerdict.schema], [false, "tibotattle-gcp-ops-infra-clean-v1"]);
+  assert.deepEqual(strictVerdict.reasons, [
+    "DEFERRED:scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
+    `DEFERRED:run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:synthetic-scheduler@${
+      project}.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET`,
+  ]);
+  assert.equal(strictVerdict.planDigest, verdict.planDigest);
+  assert.ok(gcloud.calls.every((argv) => classifyGcloudCommand(argv) === "read"));
+  // The rollout's argv does not carry it: the cadence is measured on the rolled image.
+  assert.equal(rolloutArgv.includes("--require-cadence"), false);
   // A running trigger, a stale proof or any drift fails it.
   gcloud.world.buckets[0].metageneration = "2";
   const stale = await run(preflight, { gcloud });

@@ -193,7 +193,8 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(result.synthetic, true);
   assert.deepEqual(result.blockers, []);
   assert.deepEqual(result.findings, []);
-  assert.deepEqual(result.summary, { executable: 35, deferred: 1, refused: 0 });
+  // The trigger's create and the scheduler's executor grant wait for the owner's cadence.
+  assert.deepEqual(result.summary, { executable: 34, deferred: 2, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -231,7 +232,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-service-iam:bind:")).map((entry) => entry.argv.at(-1)),
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
   // Exactly the two fast-path jobs, both created; only the trigger waits,
-  // for the owner's cadence.
+  // for the owner's cadence, and with it the scheduler's executor grant.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
     ["run-job:create:production-migrate", "run-job:create:analytics-refresh"]);
   const refresh = JSON.parse(byId.get("run-job:create:analytics-refresh").file.content);
@@ -239,6 +240,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
   assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]), [
     ["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"],
+    [EXECUTOR(desired), "SCHEDULER_CADENCE_UNSET"],
   ]);
   // No bucket update, no bucket IAM operation, no delete.
   for (const entry of result.operations) {
@@ -477,6 +479,68 @@ test("a trigger whose pause failed after its create is paused by the next plan, 
     ["scheduler:pause:analytics-refresh"]);
 });
 
+test("the scheduler's executor grant follows its trigger: withheld while the cadence is unset, and a live grant blocks the create", () => {
+  const JOB_POLICY = "synthetic-analytics-refresh";
+  const granted = (world) => JSON.stringify(world.jobPolicies[JOB_POLICY] ?? {}).includes("roles/run.jobsExecutor");
+  const unset = desiredState({ synthetic: false });
+  const scheduled = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = bornWorld(unset);
+  const apply = (desired, gcloud, result, options = {}) => operations.applyInfrastructure(desired, { runner: gcloud.runner,
+    authorize: result.planDigest, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED, ...options });
+  const create = "scheduler:create:analytics-refresh";
+  const pause = "scheduler:pause:analytics-refresh";
+
+  // No cadence: the jobs are created, but no trigger and no grant, so nothing can start the job.
+  const gcloud = fake(unset, world);
+  const first = plan(unset, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
+  assert.deepEqual(ops(first, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]),
+    [[create, "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unset), "SCHEDULER_CADENCE_UNSET"]]);
+  apply(unset, gcloud, first, { bootstrap: BOOTSTRAP });
+  assert.deepEqual([granted(world), world.schedulerJobs.length, world.jobs.length], [false, 0, 2]);
+  assert.equal(operations.infrastructureCleanliness(plan(unset, gcloud.runner, UNDEFERRED)).clean, true);
+
+  // The owner commits a cadence: the next plan creates, pauses, and only then grants.
+  const later = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([later.blockers, later.operations.map((entry) => entry.id)], [[], [create, pause, EXECUTOR(scheduled)]]);
+  // A pause that fails leaves an ENABLED trigger the account cannot yet use to start the job.
+  const failing = fake(scheduled, world, { failWhen: (argv) => argv.slice(0, 3).join(" ") === "scheduler jobs pause" });
+  assert.throws(() => apply(scheduled, failing, later), (error) => error.code === "APPLY_OPERATION_FAILED"
+    && error.operation === pause);
+  assert.deepEqual([trigger(world).state, granted(world)], ["ENABLED", false]);
+  // The next plan pauses it and only then grants, and then the estate has converged.
+  const repair = fake(scheduled, world);
+  const replan = plan(scheduled, repair.runner, UNDEFERRED);
+  assert.deepEqual(replan.operations.map((entry) => entry.id), [pause, EXECUTOR(scheduled)]);
+  apply(scheduled, repair, replan);
+  assert.deepEqual([trigger(world).state, granted(world)], ["PAUSED", true]);
+  assert.deepEqual(plan(scheduled, repair.runner, UNDEFERRED).operations, []);
+
+  // A grant that is already live when a create is planned (the trigger was removed by hand, or the
+  // estate was bound before it) would let the ENABLED trigger start the job before its pause: the
+  // plan blocks, and apply, which never removes a grant, refuses it without a single mutation.
+  world.schedulerJobs = [];
+  const blockedGcloud = fake(scheduled, world);
+  const blocked = plan(scheduled, blockedGcloud.runner, UNDEFERRED);
+  assert.deepEqual(blocked.blockers, ["SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh"]);
+  assert.deepEqual(blocked.operations.map((entry) => entry.id), [create, pause]);
+  assert.deepEqual([...operations.infrastructureCleanliness(blocked).reasons], [
+    "BLOCKER:SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh", `EXECUTABLE:${create}`, `EXECUTABLE:${pause}`]);
+  blockedGcloud.calls.length = 0;
+  assert.throws(() => apply(scheduled, blockedGcloud, blocked), { code: "APPLY_BLOCKED" });
+  assert.equal(kinds(blockedGcloud.calls).includes("mutate"), false);
+  assert.equal(world.schedulerJobs.length, 0);
+  // The owner removes the grant by hand; the next plan clears the block and restores the order.
+  world.jobPolicies[JOB_POLICY] = {};
+  const cleared = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([cleared.blockers, cleared.operations.map((entry) => entry.id)],
+    [[], [create, pause, EXECUTOR(scheduled)]]);
+  apply(scheduled, fake(scheduled, world), cleared);
+  assert.deepEqual([trigger(world).state, granted(world)], ["PAUSED", true]);
+  // A live trigger with its grant is the converged estate, not a create, so it blocks nothing.
+  const live = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([live.blockers, live.operations], [[], []]);
+});
+
 test("the trigger's desired state is honoured without ever resuming, and an unknown live state blocks", () => {
   const paused = desiredState({ synthetic: false, mutate: CADENCE });
   const resumed = desiredState({ synthetic: false, mutate: (value) => {
@@ -550,8 +614,21 @@ test("OPS-10's clean verdict needs no finding, blocker, executable, refused or u
   const desired = desiredState({ synthetic: false });
   const world = convergedWorld(desired);
   const converged = plan(desired, fake(desired, world).runner);
-  assert.deepEqual(converged.summary, { executable: 0, deferred: 1, refused: 0 });
+  assert.deepEqual(converged.summary, { executable: 0, deferred: 2, refused: 0 });
   assert.deepEqual({ ...operations.infrastructureCleanliness(converged) }, { clean: true, reasons: [] });
+  // The cutover's stricter form (readback --require-cadence) refuses exactly the unset cadence's two deferrals.
+  assert.deepEqual({ ...operations.infrastructureCleanliness(converged, { requireCadence: true }) }, { clean: false,
+    reasons: ["DEFERRED:scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
+      `DEFERRED:${EXECUTOR(desired)}:SCHEDULER_CADENCE_UNSET`] });
+  assert.throws(() => operations.infrastructureCleanliness(converged, { requireCadence: "yes" }),
+    { code: "CLEANLINESS_OPTIONS_INVALID" });
+  // A committed cadence, with its trigger created paused, is clean in both forms.
+  const scheduled = desiredState({ synthetic: false, mutate: CADENCE });
+  const settled = plan(scheduled, fake(scheduled, convergedWorld(scheduled, UNDEFERRED)).runner, UNDEFERRED);
+  for (const requireCadence of [false, true]) {
+    assert.deepEqual({ ...operations.infrastructureCleanliness(settled, { requireCadence }) },
+      { clean: true, reasons: [] }, String(requireCadence));
+  }
   const verdict = (mutate) => {
     const copy = structuredClone(world);
     mutate(copy);
@@ -789,7 +866,7 @@ test("the verifier's token-creator grant waits for the operator, and its own pol
   const waiting = plan(unassigned, fake(unassigned, world).runner);
   assert.deepEqual(waiting.operations.map((entry) => [entry.id, entry.deferred]),
     [["verifier-iam:token-creator", "VERIFIER_TOKEN_CREATOR_UNASSIGNED"], ["scheduler:create:analytics-refresh",
-      "SCHEDULER_CADENCE_UNSET"]]);
+      "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unassigned), "SCHEDULER_CADENCE_UNSET"]]);
   assert.deepEqual([...operations.infrastructureCleanliness(waiting).reasons],
     ["DEFERRED:verifier-iam:token-creator:VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
   // Assigned: one bind on the verifier account, read back from its own policy, then converged.

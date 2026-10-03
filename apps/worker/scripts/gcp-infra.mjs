@@ -19,10 +19,14 @@
  *     and a content-free verdict per managed trigger; exit 2 when a resumed
  *     trigger has stayed PAUSED past the threshold (6 h), or when its state
  *     or the evidence for it is missing or unrecognized.
- *   readback     --desired-state=<abs path> [--require-clean]
+ *   readback     --desired-state=<abs path> [--require-clean [--require-cadence]]
  *     The live estate through describe, get-iam-policy and list calls only.
  *     With --require-clean (OPS-10's preflight), the readback, its plan's
  *     digest and summary, and a clean verdict; exit 0 only when clean.
+ *     --require-cadence (only with --require-clean; the cutover's scheduler
+ *     gate, never the rollout's) also refuses an unset refresh cadence: the
+ *     rollout must run before the cadence can be measured, the cutover must
+ *     not run without it.
  *   plan         --desired-state=<abs path> [--bootstrap-image-digest --bootstrap-source-commit]
  *     Readback plus the deterministic plan and its planDigest. This is the
  *     dry run; nothing changes.
@@ -107,7 +111,7 @@ export const GCP_OPS_INFRA_CLEAN_SCHEMA = "tibotattle-gcp-ops-infra-clean-v1";
 const SOURCE = Object.freeze(["--desired-state", "--environment"]);
 const COMMANDS = Object.freeze({
   render: Object.freeze([...SOURCE, "--bootstrap-image-digest", "--bootstrap-source-commit"]),
-  readback: Object.freeze([...SOURCE, "--require-clean"]),
+  readback: Object.freeze([...SOURCE, "--require-clean", "--require-cadence"]),
   plan: Object.freeze([...SOURCE, "--bootstrap-image-digest", "--bootstrap-source-commit"]),
   apply: Object.freeze([...SOURCE, "--authorize", "--bootstrap-image-digest", "--bootstrap-source-commit"]),
   "bucket-birth": Object.freeze([...SOURCE, "--authorize", "--receipt-out", "--apply"]),
@@ -118,7 +122,7 @@ const COMMANDS = Object.freeze({
 const OPS3_COMMANDS = Object.freeze(["pause-all", "resume-all"]);
 const PAUSE_RECEIPT_MAX_BYTES = 256 * 1024;
 const TRIGGER_LIST = /^[A-Za-z0-9_-]{1,500}(?:,[A-Za-z0-9_-]{1,500})*$/u;
-const BOOLEAN_FLAGS = Object.freeze(["--apply", "--require-clean"]);
+const BOOLEAN_FLAGS = Object.freeze(["--apply", "--require-clean", "--require-cadence"]);
 
 function fail(code) {
   throw new GcpOpsInfraError(code);
@@ -156,6 +160,8 @@ export function parseGcpInfraArgs(argv) {
   if ((image === undefined) !== (commit === undefined)) fail("BOOTSTRAP_IMAGE_INVALID");
   const bootstrap = image === undefined ? null : normalizeBootstrap({ imageDigest: image, sourceCommit: commit });
   const apply = values.get("--apply") === true;
+  // Alone it would be a silent no-op: the cadence is part of the clean verdict.
+  if (values.has("--require-cadence") && !values.has("--require-clean")) fail("GCP_INFRA_ARGUMENT_INVALID");
   if (command === "apply" && !values.has("--authorize")) fail("APPLY_AUTHORIZATION_REQUIRED");
   if (command === "bucket-birth" && apply !== values.has("--authorize")) fail("BUCKET_BIRTH_AUTHORIZATION_MISMATCH");
   if (command === "bucket-birth" && !apply && values.has("--receipt-out")) fail("GCP_INFRA_ARGUMENT_INVALID");
@@ -187,6 +193,7 @@ export function parseGcpInfraArgs(argv) {
     authorize: values.get("--authorize") ?? null,
     apply,
     requireClean: values.get("--require-clean") === true,
+    requireCadence: values.get("--require-cadence") === true,
     receiptPath: receiptPath === null ? null : resolve(receiptPath),
     pauseReceiptPath: pauseReceiptPath === null ? null : resolve(pauseReceiptPath),
     only: onlyValue === null ? null : Object.freeze(onlyValue.split(",")),
@@ -321,7 +328,7 @@ export async function main(argv = process.argv.slice(2), {
       const readback = readbackInfrastructure(desired, { runner });
       if (config.requireClean) {
         const plan = planInfrastructure(desired, readback);
-        const verdict = infrastructureCleanliness(plan);
+        const verdict = infrastructureCleanliness(plan, { requireCadence: config.requireCadence });
         print({
           schema: GCP_OPS_INFRA_CLEAN_SCHEMA,
           environment: desired.environment,

@@ -201,8 +201,12 @@ The owner approves this list and its `planDigest`:
   (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), both jobs and the scheduler's
   executor binding (`BOOTSTRAP_IMAGE_REQUIRED`), and the trigger
   `tibotattle-analytics-refresh-trigger` (`SCHEDULER_CADENCE_UNSET`, C3). The
-  trigger deferral is not a readiness reason: `--require-clean` treats it as
-  clean.
+  trigger deferral is not a readiness reason for the rollout: `--require-clean`
+  treats it as clean, because the measurement that decides the cadence needs
+  the rolled image. It is one for the cutover, whose scheduler gate
+  (`gcp-cutover-window.md`) runs `readback --require-clean --require-cadence`
+  and refuses an unset cadence. Nothing else notices a cadence that was never
+  committed: the refresh alerts wait on it too.
 
 There is no container for `DISTRIBUTION_GITHUB_API_TOKEN`: nothing on the
 production estate reads it (`UNREAD_PRODUCTION_SECRET_NAMES`), and the
@@ -370,10 +374,10 @@ Applying the alert policies is a later, separately authorized step.
 | Step | Gate |
 |---|---|
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
-| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs and the scheduler's executor binding; no trigger exists yet. A new plan digest, so a new per-pass approval (C1) |
+| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image. Creates both jobs. It does not grant the scheduler account `roles/run.jobsExecutor`: the grant waits with the trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start either job. A new plan digest, so a new per-pass approval (C1) |
 | The service and its invoker bindings | ROUTES-R12 drops `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template; the deferral then clears itself. Also the namespace pin (step 8) |
 | Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |
-| Create the trigger | After the production-scale measurement the owner supplies the refresh cadence (C3). Commit it as `scheduler.analytics-refresh.schedule`, then `plan` and `apply` under a new digest and a new per-pass approval: the trigger is created and paused at once |
+| Create the trigger | After the production-scale measurement the owner supplies the refresh cadence (C3). Commit it as `scheduler.analytics-refresh.schedule`, then `plan` and `apply` under a new digest and a new per-pass approval. The plan is three operations in this order: the trigger create, its pause, and then the scheduler's executor grant. The trigger can start the job only after the grant, so run it when no refresh is running, and check the result with `gcloud scheduler jobs describe tibotattle-analytics-refresh-trigger --location=us-east1 --project=tibotattle-prod --format="value(state)"`, which must read `PAUSED`. If the pause fails the trigger is `ENABLED` but the account holds no grant, so it cannot run the job; re-plan, and the repair plan pauses it and then grants. If the plan blocks on `SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh`, the account already holds a grant on the job (an earlier pass 2 that bound it, or a trigger removed by hand), and an `ENABLED` trigger created now could start the job before its pause: stop, and the owner removes `roles/run.jobsExecutor` for the scheduler account on `tibotattle-analytics-refresh` with an exact-target `gcloud run jobs remove-iam-policy-binding`, then re-plans. Apply never removes a grant |
 | Resume the trigger | OPS-3 only, at cutover (`docs/runbooks/gcp-scheduler-resume.md`) |
 
 ## If something must be undone

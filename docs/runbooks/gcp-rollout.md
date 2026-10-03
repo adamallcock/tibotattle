@@ -79,7 +79,7 @@ What follows from the decision:
 |---|---|---|
 | Clean checkout | `preflight` | The working tree is clean and `HEAD` equals `--commit` (`ROLLOUT_TREE_DIRTY`, `ROLLOUT_COMMIT_NOT_CHECKED_OUT`) |
 | Local gates green | Operator | `npm run gcp:production-tooling:local-check` from `apps/worker` passes on the commit, with the local PostgreSQL 17 cluster |
-| Estate clean | `preflight` | `node scripts/gcp-infra.mjs readback --require-clean --environment=<env>` exits 0. A paused trigger whose committed state is `ENABLED` is a clean deferral |
+| Estate clean | `preflight` | `node scripts/gcp-infra.mjs readback --require-clean --environment=<env>` exits 0. A paused trigger whose committed state is `ENABLED` is a clean deferral, and so is an unset refresh cadence (the rollout comes before the measurement that decides it); the cutover's scheduler gate adds `--require-cadence` ([cutover window](./gcp-cutover-window.md)) |
 | Backup audit | Operator | A receipt from `node scripts/gcp-backup-horizon.mjs audit` is at most 6 hours old and is not a breach (exit 3 blocks) |
 | Identity-link continuity (production) | Operator | `node scripts/gcp-identity-link-pin-check.mjs --environment=production --pin-file=<pin>` reads `match` for the `IDENTITY_LINK_SECRET` version the desired state pins (`docs/runbooks/gcp-production-apply.md`, step 10). The origin never re-pins, so a mismatch would only show after the roll, as 503 `IDENTITY_CONFIGURATION_INVALID`. Procedural: `preflight` does not run it |
 | Schema reviewed | `migrate` | The migrations are expand-compatible or reviewed in `CONTRACT_MIGRATIONS`, and the append-only residue migration is present (`PRODUCTION_SIMP_RESIDUE_MISSING` until it lands) |

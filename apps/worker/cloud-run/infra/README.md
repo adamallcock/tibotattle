@@ -66,7 +66,7 @@ created.
 | `secrets.*.version` | The service is not rendered (`SECRET_VERSION_UNPINNED`) |
 | `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
 | `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries. Staging's value was chosen by Claude (see below) |
-| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence). Production stays `null` until the owner decides the cadence after the production-scale measurement (round 15, C3); pass 1 then defers the create as `SCHEDULER_CADENCE_UNSET` and plans no pause |
+| `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence), and the scheduler account's executor grant on the job waits with it. Production stays `null` until the owner decides the cadence after the production-scale measurement (round 15, C3); pass 1 then defers the create as `SCHEDULER_CADENCE_UNSET` and plans no pause. `readback --require-clean` accepts that for the rollout; `--require-cadence` (the cutover gate) refuses it |
 | `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
 
 ### Production values PROD-PREP filled (owner decisions round 13)
@@ -139,6 +139,21 @@ Apply creates the analytics-refresh trigger and pauses it in the same apply,
 and only then grants the scheduler account `roles/run.jobsExecutor` on the
 job. Apply never resumes a trigger; OPS-3 does, and the owner then sets the
 committed `state` to `ENABLED`.
+
+That order keeps a trigger whose pause failed from starting the job only if
+the account holds no grant when the create runs. So while the committed
+`schedule` is `null`, apply withholds the grant too (deferred as
+`SCHEDULER_CADENCE_UNSET`, with the trigger), and the plan that follows a
+committed cadence creates the trigger, pauses it, and then grants. A grant
+that is already live when a create is planned (a trigger removed by hand, or
+an estate bound before its trigger existed) blocks the plan as
+`SCHEDULER_CREATE_EXECUTOR_BOUND:<job>`; apply never removes a grant, so the
+owner removes it first, with exact targets, and re-plans.
+
+An unset cadence is a clean deferral for `readback --require-clean`, which is
+the rollout's preflight: the production-scale measurement that decides the
+cadence needs the rolled image. The cutover's scheduler gate is
+`readback --require-clean --require-cadence`, which refuses it.
 
 OPS-3 is `gcp-infra.mjs pause-all` and `resume-all`. Both are dry runs
 unless run with `--apply --authorize=<planDigest>` from the committed desired

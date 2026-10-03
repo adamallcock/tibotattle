@@ -34,7 +34,13 @@
  * resumes it). A plan creates a trigger and pauses it immediately, and binds
  * the scheduler account's run.jobsExecutor on the job only after that pause
  * (assertTriggersCreatedPaused refuses any other order), so a trigger whose
- * pause failed is ENABLED but cannot start the job. Readback reads the state;
+ * pause failed is ENABLED but cannot start the job. That holds only while the
+ * account holds no grant on the job when the create runs. While the committed
+ * schedule is null the grant is withheld (deferred as SCHEDULER_CADENCE_UNSET
+ * with the trigger), so the plan that follows a committed cadence finds none;
+ * a grant already live when a create is planned blocks the plan
+ * (SCHEDULER_CREATE_EXECUTOR_BOUND:<job>) until the owner removes it, because
+ * apply never removes one. Readback reads the state;
  * a trigger that runs while PAUSED is desired is a
  * SCHEDULER_TRIGGER_ENABLED:<job> finding, and the plan pauses it, so a
  * create whose pause failed is paused by the next apply rather than reported
@@ -63,7 +69,10 @@
  *
  * infrastructureCleanliness(plan) is OPS-10's `readback --require-clean`
  * verdict: clean only with no finding, no blocker, nothing executable, nothing
- * refused, and no deferral outside CLEAN_DEFERRALS.
+ * refused, and no deferral outside CLEAN_DEFERRALS. An unset cadence is a
+ * clean deferral for the rollout, which must run before the cadence can be
+ * measured; `--require-cadence` (requireCadence) is the cutover's stricter
+ * form, which refuses it.
  *
  * The bucket is born only by gcp-ops-bucket-birth.mjs. Apply refuses until the
  * desired state pins that birth proof (APPLY_BUCKET_PROOF_UNPINNED), and
@@ -193,15 +202,23 @@ export const SCHEDULER_RESUME_DEFERRAL = "SCHEDULER_TRIGGER_RESUME_PENDING";
 /** The operator's token-creator grant while the desired state names no operator (not clean). */
 export const VERIFIER_TOKEN_CREATOR_DEFERRAL = "VERIFIER_TOKEN_CREATOR_UNASSIGNED";
 /**
+ * A trigger's create, and the scheduler account's executor grant on its job,
+ * while the committed schedule is null (decision D3: no default cadence).
+ */
+export const SCHEDULER_CADENCE_DEFERRAL = "SCHEDULER_CADENCE_UNSET";
+/**
  * Deferrals that leave the estate clean for OPS-10: an owner decision not yet
  * made (the D3 cadence), a job DEFERRED_JOBS names, and a resume OPS-3 owns.
+ * The cadence is clean for the rollout only: the production-scale measurement
+ * that decides it needs the rolled image, so a cutover gate asks for it with
+ * infrastructureCleanliness(plan, { requireCadence: true }).
  * Every other deferral (a bootstrap image, a secret version, an unrecognized
  * live image, the verifier's unnamed operator, a service template or
  * telemetry namespace not yet available) means the estate is not yet what
  * the desired state describes.
  */
 export const CLEAN_DEFERRALS = Object.freeze([
-  "SCHEDULER_CADENCE_UNSET",
+  SCHEDULER_CADENCE_DEFERRAL,
   SCHEDULER_RESUME_DEFERRAL,
   ...new Set(Object.values(DEFERRED_JOBS)),
 ]);
@@ -1256,7 +1273,13 @@ function jobOperations(desired, observed, bootstrap, usage, jobDeferrals, execut
         (binding) => ["run", "jobs", "remove-iam-policy-binding", desired.jobs[job].name, project, region,
           `--member=${binding.member}`, `--role=${binding.role}`]);
     if (SCHEDULED_JOB_NAMES.includes(job)) {
-      executorBinds[job] = iam.filter((entry) => entry.action === "bind");
+      // With no committed cadence no trigger is created, so nothing needs the
+      // grant yet. Withholding it keeps the scheduler account unable to run
+      // the job until the plan that creates and pauses the trigger, whose
+      // grant follows the pause. A grant that is already live is left alone
+      // and blocks that create (triggerOperations).
+      const withheld = desired.scheduler[job].schedule === null ? { deferred: SCHEDULER_CADENCE_DEFERRAL } : {};
+      executorBinds[job] = iam.filter((entry) => entry.action === "bind").map((entry) => ({ ...withheld, ...entry }));
       operations.push(...iam.filter((entry) => entry.action !== "bind"));
     } else {
       operations.push(...iam);
@@ -1295,7 +1318,7 @@ function triggerOperations(desired, observed, blockers, jobDeferrals, job) {
     // created, and a live trigger is drift that only the owner removes.
     return [live === null
       ? operation(`scheduler:create:${job}`, "create", ["scheduler", "jobs", "create", "http", trigger.name, project,
-        location], { deferred: "SCHEDULER_CADENCE_UNSET" })
+        location], { deferred: SCHEDULER_CADENCE_DEFERRAL })
       : operation(`scheduler:delete:${trigger.name}`, "delete", ["scheduler", "jobs", "delete", trigger.name, project,
         location])];
   }
@@ -1313,6 +1336,13 @@ function triggerOperations(desired, observed, blockers, jobDeferrals, job) {
     // the pause fail, readback sees the ENABLED trigger and the next plan
     // pauses it again; meanwhile it cannot start the job, because the
     // scheduler account's run.jobsExecutor is bound only after this pause.
+    // That holds only while the account holds no grant on the job yet: with
+    // one already live (an estate bound before its trigger existed, or a
+    // trigger removed by hand) the create blocks the plan until the owner
+    // removes the grant, and the next plan grants it again after the pause.
+    const granted = observed.jobs.managed[job]?.bindings
+      .some((binding) => binding.member === desired.serviceAccounts.scheduler.member) ?? false;
+    if (granted) blockers.push(`SCHEDULER_CREATE_EXECUTOR_BOUND:${job}`);
     return [operation(`scheduler:create:${job}`, "create",
       ["scheduler", "jobs", "create", "http", trigger.name, ...flags]), pause];
   }
@@ -1393,15 +1423,21 @@ export function normalizeJobDeferrals(jobDeferrals) {
  * OPS-10's `readback --require-clean` verdict on a plan: clean only when it
  * holds no finding, no blocker, no executable or refused operation, and no
  * deferral outside CLEAN_DEFERRALS. Reasons are closed codes and operation ids.
+ * With requireCadence (`--require-cadence`, the cutover's scheduler gate) the
+ * unset cadence is no longer a clean deferral: a committed cadence, and the
+ * trigger created paused under it, are what the estate must hold.
  */
-export function infrastructureCleanliness(plan) {
+export function infrastructureCleanliness(plan, { requireCadence = false } = {}) {
+  if (typeof requireCadence !== "boolean") fail("CLEANLINESS_OPTIONS_INVALID");
+  const clean = (deferral) => CLEAN_DEFERRALS.includes(deferral)
+    && !(requireCadence && deferral === SCHEDULER_CADENCE_DEFERRAL);
   const reasons = [
     ...plan.findings.map((finding) => `FINDING:${finding}`),
     ...plan.blockers.map((blocker) => `BLOCKER:${blocker}`),
     ...plan.operations.flatMap((entry) => {
       if (REFUSED_ACTIONS.includes(entry.action)) return [`REFUSED:${entry.id}`];
       if (entry.deferred === undefined) return [`EXECUTABLE:${entry.id}`];
-      return CLEAN_DEFERRALS.includes(entry.deferred) ? [] : [`DEFERRED:${entry.id}:${entry.deferred}`];
+      return clean(entry.deferred) ? [] : [`DEFERRED:${entry.id}:${entry.deferred}`];
     }),
   ];
   return deepFreeze({ clean: reasons.length === 0, reasons });

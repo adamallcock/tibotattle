@@ -373,10 +373,13 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
   const second = plan({ bootstrap: IMAGE });
+  // Staging commits no refresh cadence, so no trigger is created and the scheduler's executor grant
+  // is withheld with it (SCHEDULER_CADENCE_UNSET): the account cannot run a job nothing triggers.
   assert.deepEqual(second.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id), [
     "run-job:create:production-migrate", "run-job:create:analytics-refresh",
-    "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|",
   ]);
+  assert.ok(deferred(second).includes(
+    "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
   assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], [

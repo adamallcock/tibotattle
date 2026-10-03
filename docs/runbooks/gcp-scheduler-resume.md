@@ -48,7 +48,8 @@ roll), [GCP brake and incidents](./gcp-brake-and-incidents.md), and the
 | Piece | State |
 |---|---|
 | Triggers in the committed desired state | `built`: one per scheduled job, `analytics-refresh` only. The migration job is manual and has no trigger |
-| Apply creates a trigger and pauses it in the same apply, then grants the scheduler account `roles/run.jobsExecutor` on the job | `built`. A trigger whose pause failed cannot start the job |
+| Apply creates a trigger and pauses it in the same apply, then grants the scheduler account `roles/run.jobsExecutor` on the job | `built`. A trigger whose pause failed cannot start the job, because the grant is withheld while the cadence is unset and a grant already live blocks the create (`SCHEDULER_CREATE_EXECUTOR_BOUND:<job>`) |
+| `gcp-infra.mjs readback --require-clean --require-cadence` refuses an unset cadence | `built`. The cutover's scheduler gate; the rollout's `--require-clean` still accepts it, because the cadence is measured on the rolled image |
 | Apply never resumes. It pauses a live trigger that runs while `PAUSED` is committed | `built` |
 | Readback treats a paused trigger with committed `ENABLED` as the deferral `SCHEDULER_TRIGGER_RESUME_PENDING`, which keeps the estate clean | `built` |
 | `node scripts/gcp-infra.mjs scheduler-probe --environment=<env>`: one read of the location's scheduler jobs and a content-free verdict per trigger; exit 2 on an alert | `built` |
