@@ -272,12 +272,13 @@ async function fixture(t) {
   const receipts = join(root, 'receipts');
   await mkdir(receipts, { mode: 0o700 });
   const world = createWorld();
+  let observation;
   const run = (subcommand, extra = {}) => runCloudflareWriterFence({
     subcommand, plan: planInput(), receiptsDirectory: receipts, cliPath, fetcher: world.fetcher,
-    environment: { PATH: '/usr/bin', HOME: root, CLOUDFLARE_API_TOKEN: TOKEN }, now: () => world.now, ...extra,
+    environment: { PATH: '/usr/bin', HOME: root, CLOUDFLARE_API_TOKEN: TOKEN }, now: () => world.now, ...(subcommand === 'verify' ? { observation } : {}), ...extra,
   });
   const mutations = () => world.calls.filter(call => call.method !== 'GET' && !call.href.endsWith('/graphql'));
-  return { root, receipts, world, run, mutations, cliPath };
+  return { root, receipts, world, run, mutations, cliPath, setObservation: digest => { observation = digest; } };
 }
 
 // Plan in worker mode, fenced deploy (the drain runs after it), then apply at T0.
@@ -287,7 +288,11 @@ async function applied(f) {
   f.world.deployProduction('fenced');
   f.world.now = T0;
   const apply = await f.run('apply', { confirm: planned.sha256, analyticsDrainComplete: true });
-  return { planned, apply };
+  f.world.now = T0 + 15 * MINUTE;
+  const observation = await f.run('observe', { fence: planned.sha256 });
+  f.setObservation(observation.sha256);
+  f.world.now = T0;
+  return { planned, apply, observation };
 }
 
 const receiptNames = async (f, prefix) => (await readdir(f.receipts)).filter(name => name.startsWith(prefix));
@@ -499,7 +504,7 @@ test('apply refuses an edited plan receipt, an unsafe receipts directory and a c
   try {
     await assert.rejects(apply(f, planned), { code: 'FENCE_BUSY' });
     await assert.rejects(f.run('release', { confirm: planned.sha256, preGcp: true }), { code: 'FENCE_BUSY' });
-    await assert.rejects(f.run('verify', { fence: planned.sha256 }), { code: 'FENCE_BUSY' });
+    await assert.rejects(f.run('verify', { fence: planned.sha256, observation: 'a'.repeat(64) }), { code: 'FENCE_BUSY' });
   } finally { release(); }
   assert.equal(f.world.calls.length, before);
   assert.deepEqual(await receiptNames(f, 'apply'), []);
@@ -580,20 +585,22 @@ test('an interrupted apply resumes from its journal and never re-issues a comple
   assert.equal(f.mutations().filter(call => call.method === 'PATCH').length, 1);
 });
 
-test('verify pins bookmarks and the R2 digest after a quiet window, tolerating writes inside that window', async t => {
+test('verify pins current bookmarks and R2 after a quiet window, tolerating writes before observation', async t => {
   const f = await fixture(t);
   const { planned, apply: applied_ } = await applied(f);
-  // An in-flight pass finishing inside the quiet window, seen by bookmarks and analytics alike.
+  // An in-flight pass finishing during cooldown, before the prospective observation.
   f.world.write(D1.analytics, T0 + 5 * MINUTE);
   f.world.analytics.d1.push({ databaseId: D1.analytics, at: T0 + 5 * MINUTE, rowsWritten: 4, writeQueries: 1 });
   f.world.analytics.invocations.push({ scriptName: 'synthetic-analytics', at: T0 + 5 * MINUTE, requests: 1 });
+  f.world.now = T0 + 15 * MINUTE;
+  f.setObservation((await f.run('observe', { fence: planned.sha256 })).sha256);
   f.world.now = T0 + 20 * MINUTE;
   await assert.rejects(f.run('verify', { fence: planned.sha256 }), { code: 'FENCE_WINDOW_TOO_SHORT' });
   // The bookmark window would be long enough; the lag-trimmed analytics interval is not.
   f.world.now = VERIFY_AT - 2 * MINUTE;
   await assert.rejects(f.run('verify', { fence: planned.sha256 }), { code: 'FENCE_WINDOW_TOO_SHORT' });
   f.world.now = VERIFY_AT;
-  await assert.rejects(f.run('verify', { fence: planned.sha256, windowStart: iso(T0 + 14 * MINUTE) }), { code: 'FENCE_WINDOW_TOO_EARLY' });
+  await assert.rejects(f.run('verify', { fence: planned.sha256, windowStart: iso(T0 + 14 * MINUTE) }), { code: 'FENCE_ARGUMENTS_INVALID' });
   assert.deepEqual(await receiptNames(f, 'fence-'), []);
   const before = f.world.calls.length;
   const verified = await f.run('verify', { fence: planned.sha256 });
@@ -833,7 +840,7 @@ test('release restores the journalled prior state after an apply that stopped pa
       assert.equal(released.receipt.applyReceiptSha256, null, label);
       assert.equal(released.receipt.mutationsIssued, landed ? 4 : 3, label);
       await assert.rejects(apply(f, planned), { code: 'FENCE_RELEASED' }, label);
-      await assert.rejects(f.run('verify', { fence: planned.sha256 }), { code: 'FENCE_RELEASED' }, label);
+      await assert.rejects(f.run('verify', { fence: planned.sha256, observation: 'a'.repeat(64) }), { code: 'FENCE_RELEASED' }, label);
       await assert.rejects(f.run('release', { confirm: planned.sha256, preGcp: true }), { code: 'FENCE_ALREADY_RELEASED' }, label);
     }
   }
@@ -1079,4 +1086,120 @@ test('history refuses missing anchors, duplicates, ambiguous order and racing cu
     await assert.rejects(f.run('verify',{fence:planned.sha256}),{code:'FENCE_HISTORY_INCOMPLETE'},scenario);
     assert.deepEqual(await receiptNames(f,'fence-'),[]);
   }
+});
+
+
+test('prospective observations use current mode only and cannot qualify a fence', async t => {
+  const f = await fixture(t);
+  const beforeApply = f.world.calls.length;
+  await assert.rejects(f.run('observe', { fence: 'a'.repeat(64) }), { code: 'FENCE_NOT_APPLIED' });
+  assert.equal(f.world.calls.length, beforeApply);
+  const { planned, observation } = await applied(f);
+  assert.equal(observation.receipt.bookmarkMode, 'current-literal');
+  assert.equal(observation.receipt.completedAt, iso(T0 + 15 * MINUTE));
+  assert.deepEqual(await receiptNames(f, 'fence-'), []);
+  assert.ok(f.world.calls.filter(call => call.href.includes('/time_travel/bookmark')).every(call => !call.href.includes('timestamp=')));
+  f.world.now = VERIFY_AT;
+  const before = f.world.calls.length;
+  await assert.rejects(f.run('verify', { fence: planned.sha256, observation: undefined }), { code: 'FENCE_ARGUMENTS_INVALID' });
+  assert.equal(f.world.calls.length, before);
+  await assert.rejects(readCloudflareWriterFenceReceipt(observation.path, observation.sha256), { code: 'FENCE_RECEIPT_INVALID' });
+});
+
+test('observation tamper, incomplete targets, cross-plan and future times refuse before provider reads', async t => {
+  const cases = {
+    mode: value => { value.bookmarkMode = 'timestamp'; },
+    plan: value => { value.planSha256 = 'a'.repeat(64); },
+    apply: value => { value.applyReceiptSha256 = 'a'.repeat(64); },
+    account: value => { value.accountSha256 = 'a'.repeat(64); },
+    fingerprint: value => { value.fingerprintSha256 = 'a'.repeat(64); },
+    partial: value => { value.d1.pop(); },
+    target: value => { value.d1[0].idSha256 = 'a'.repeat(64); },
+    future: value => { value.completedAt = iso(VERIFY_AT + MINUTE); },
+    reversed: value => { value.completedAt = iso(T0); },
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    const f = await fixture(t);
+    const { planned, observation } = await applied(f);
+    const value = structuredClone(observation.receipt);
+    change(value);
+    const bytes = `${JSON.stringify(value)}\n`, digest = sha256(bytes);
+    await writeFile(join(f.receipts, `observation-${digest}.json`), bytes, { mode: 0o600 });
+    f.world.now = VERIFY_AT;
+    const before = f.world.calls.length;
+    await assert.rejects(f.run('verify', { fence: planned.sha256, observation: digest }), { code: 'FENCE_RECEIPT_INVALID' }, name);
+    assert.equal(f.world.calls.length, before, name);
+  }
+});
+
+test('consumer reopens observation and original plan, rejecting changed bytes and retrospective claims', async t => {
+  const f = await fixture(t);
+  const { planned, observation } = await applied(f);
+  f.world.now = VERIFY_AT;
+  const verified = await f.run('verify', { fence: planned.sha256 });
+  const original = await readFile(observation.path);
+  await writeFile(observation.path, `${JSON.stringify({ ...observation.receipt, completedAt: iso(T0 + 16 * MINUTE) })}\n`, { mode: 0o600 });
+  await assert.rejects(readCloudflareWriterFenceReceipt(verified.path, verified.sha256), { code: 'FENCE_RECEIPT_INVALID' });
+  await writeFile(observation.path, original, { mode: 0o600 });
+  const planPath = join(f.receipts, `plan-${planned.sha256}.json`);
+  const oldPlan = await readFile(planPath);
+  await writeFile(planPath, `${JSON.stringify({ ...JSON.parse(oldPlan), planSha256: 'a'.repeat(64) })}\n`, { mode: 0o600 });
+  await assert.rejects(readCloudflareWriterFenceReceipt(verified.path, verified.sha256), { code: 'FENCE_RECEIPT_INVALID' });
+  await writeFile(planPath, oldPlan, { mode: 0o600 });
+  assert.deepEqual(await readCloudflareWriterFenceReceipt(verified.path, verified.sha256), verified.receipt);
+});
+
+test('completion owns the window and observation refuses partial captures, released fences and drift', async t => {
+  const f = await fixture(t);
+  const { planned } = await applied(f);
+  f.world.now = T0 + 15 * MINUTE;
+  let tick = f.world.now;
+  const observation = await f.run('observe', { fence: planned.sha256, now: () => { const value = tick; tick += MINUTE; return value; } });
+  assert.ok(Date.parse(observation.receipt.completedAt) > Date.parse(observation.receipt.startedAt));
+  f.setObservation(observation.sha256);
+  f.world.now = Date.parse(observation.receipt.completedAt) + 20 * MINUTE - 1;
+  await assert.rejects(f.run('verify', { fence: planned.sha256 }), { code: 'FENCE_WINDOW_TOO_SHORT' });
+  f.world.now += 1;
+  const verified = await f.run('verify', { fence: planned.sha256 });
+  assert.equal(verified.receipt.window.start, observation.receipt.completedAt);
+  await f.run('release', { confirm: planned.sha256, preGcp: true });
+  const before = f.world.calls.length;
+  await assert.rejects(f.run('observe', { fence: planned.sha256 }), { code: 'FENCE_RELEASED' });
+  assert.equal(f.world.calls.length, before);
+
+  for (const kind of ['partial', 'drift']) {
+    const g = await fixture(t);
+    const { planned: plan } = await applied(g);
+    const names = await receiptNames(g, 'observation-');
+    const fetcher = async (url, init) => {
+      if (kind === 'partial' && String(url).includes(`/d1/database/${D1.analytics}/time_travel/bookmark`)) {
+        return new Response(JSON.stringify({ success: true, errors: [], result: {} }), { status: 200 });
+      }
+      return g.world.fetcher(url, init);
+    };
+    g.world.now = T0 + 15 * MINUTE;
+    if (kind === 'drift') g.world.scripts.get(CRON_SCRIPTS[0]).crons = ['* * * * *'];
+    await assert.rejects(g.run('observe', { fence: plan.sha256, fetcher }),
+      { code: kind === 'partial' ? 'FENCE_PROVIDER_RESPONSE_INVALID' : 'FENCE_NOT_APPLIED' });
+    assert.deepEqual(await receiptNames(g, 'observation-'), names);
+  }
+});
+
+test('legacy v1 receipts retain their original strict reader policy without observation reinterpretation', async t => {
+  const f = await fixture(t);
+  const { planned } = await applied(f);
+  f.world.now = VERIFY_AT;
+  const verified = await f.run('verify', { fence: planned.sha256 });
+  const value = structuredClone(verified.receipt);
+  value.schema = 'cloudflare-writer-fence-receipt-v1';
+  delete value.observationSha256;
+  delete value.bookmarkMode;
+  const bytes = `${JSON.stringify(value)}\n`, digest = sha256(bytes);
+  const path = join(f.receipts, `fence-${digest}.json`);
+  await writeFile(path, bytes, { mode: 0o600 });
+  assert.deepEqual(await readCloudflareWriterFenceReceipt(path, digest), value);
+  value.bookmarkMode = 'current-literal';
+  const changed = `${JSON.stringify(value)}\n`;
+  await writeFile(path, changed, { mode: 0o600 });
+  await assert.rejects(readCloudflareWriterFenceReceipt(path, sha256(changed)), { code: 'FENCE_RECEIPT_INVALID' });
 });

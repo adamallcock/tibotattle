@@ -29,12 +29,15 @@ import { durablePrivateJson, identityDigest, operationError } from '../../../scr
  *   production Worker must already be fenced and its analytics drain
  *   complete (the drain is proved by HX-6, not here; the operator attests to
  *   it and the receipt says so). A released fence is never re-applied.
- * - verify --fence=<plan receipt sha256> (read-only against the provider,
+ * - observe --fence=<plan receipt sha256> (read-only): captures current-mode
+ *   D1 bookmarks under checked fence/source pins after the apply cooldown.
+ *   Its completion after all reads owns the prospective start; no fence proof.
+ * - verify --fence=<plan receipt sha256> --observation=<receipt sha256>
+ *   (read-only against the provider,
  *   serialised with apply and release): production Worker is one version at
  *   100% with EDGE_UPSTREAM_MODE='fenced' since the fence; zero schedules and
- *   paused delivery as observed; D1 time-travel bookmarks equal at a window
- *   start at least quietWindowMinutes after the last apply and at the window
- *   end; R2 quarantine digest equal to the baseline taken at apply, before
+ *   paused delivery as observed; current-mode D1 bookmarks literally equal
+ *   to the pinned observation over its prospective window; R2 quarantine digest equal to the baseline taken at apply, before
  *   any write; GraphQL rowsWritten/writeQueries 0 per listed database and no
  *   invocation of any fenced script over [start, end - analytics lag], an
  *   interval itself at least quietWindowMinutes long (so neither proof covers
@@ -59,7 +62,10 @@ export const FENCE_INVENTORY_REFUSAL_SCHEMA = 'cloudflare-writer-fence-inventory
 export const FENCE_PLAN_RECEIPT_SCHEMA = 'cloudflare-writer-fence-plan-receipt-v1';
 export const FENCE_APPLY_INTENT_SCHEMA = 'cloudflare-writer-fence-apply-intent-v1';
 export const FENCE_APPLY_RECEIPT_SCHEMA = 'cloudflare-writer-fence-apply-v1';
-export const FENCE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v1';
+export const FENCE_LEGACY_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v1';
+export const FENCE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v2';
+export const FENCE_OBSERVATION_SCHEMA = 'cloudflare-writer-fence-observation-v1';
+const BOOKMARK_MODE = 'current-literal';
 export const FENCE_RELEASE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-release-v1';
 export const FENCE_EDGE_MODE_BINDING = 'EDGE_UPSTREAM_MODE';
 export const FENCE_MIN_QUIET_WINDOW_MINUTES = 15;
@@ -127,6 +133,7 @@ export const FENCE_REQUEST_BUDGETS = Object.freeze({
   inventory: INVENTORY_READS,
   plan: INVENTORY_READS,
   apply: INVENTORY_READS + R2_READS + 3 * MAX_FENCED_SCRIPTS,
+  observe: 2 * INVENTORY_READS + 2 * HISTORY_READS + Object.keys(FENCE_D1_LABELS).length + R2_READS,
   verify: INVENTORY_READS + HISTORY_READS + 2 * Object.keys(FENCE_D1_LABELS).length + R2_READS + 2,
   release: HISTORY_READS + 3 * MAX_FENCED_SCRIPTS,
 });
@@ -354,7 +361,7 @@ async function readReceipt(path, schema) {
   try { bytes = await readMaintenanceFile(path, 1024 * 1024); } catch { fail('FENCE_RECEIPT_UNSAFE'); }
   let value;
   try { value = JSON.parse(bytes.toString('utf8')); } catch { fail('FENCE_RECEIPT_INVALID'); }
-  if (!record(value) || value.schema !== schema) fail('FENCE_RECEIPT_INVALID');
+  if (!record(value) || !(Array.isArray(schema) ? schema.includes(value.schema) : value.schema === schema)) fail('FENCE_RECEIPT_INVALID');
   return { value, sha256: sha256(bytes) };
 }
 
@@ -961,7 +968,100 @@ async function applyCommand({ client, plan, now, receiptsDirectory, confirm, ana
   return writeReceipt(receiptPath, receipt);
 }
 
-async function verifyCommand({ client, plan, now, receiptsDirectory, fence, windowStartMs }) {
+// Time Travel exposes timestamp-selected and current bookmarks without a
+// cross-mode equality guarantee. Preserve opaque values literally and compare
+// two prospective current-mode observations only.
+// https://developers.cloudflare.com/api/resources/d1/subresources/database/subresources/time_travel/methods/get_bookmark/
+async function currentBookmarks(client, plan) {
+  const d1 = [];
+  for (const [label, id] of Object.entries(plan.d1)) {
+    const result = await client.api(`/accounts/${plan.accountId}/d1/database/${id}/time_travel/bookmark`);
+    if (!record(result) || typeof result.bookmark !== 'string' || !OPAQUE.test(result.bookmark)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
+    d1.push({ label, idSha256: idDigest('d1', id), bookmark: result.bookmark });
+  }
+  return d1;
+}
+
+async function checkObservationPlan(directory, observed, apply) {
+  const { value: planned, sha256: digest } = await readReceipt(
+    join(directory, `plan-${observed.planReceiptSha256}.json`), FENCE_PLAN_RECEIPT_SCHEMA);
+  const inventory = planned.inventory;
+  if (digest !== observed.planReceiptSha256 || planned.planSha256 !== observed.planSha256
+      || planned.fingerprintSha256 !== observed.fingerprintSha256
+      || inventory?.accountSha256 !== observed.accountSha256 || inventory?.planSha256 !== observed.planSha256
+      || inventory?.productionWorker?.name !== observed.productionWorker.name
+      || planned.quietWindowMinutes !== apply.quietWindowMinutes || !Array.isArray(inventory?.dataResources)) fail(RECEIPT_INVALID);
+  const expected = inventory.dataResources.filter(item => item.kind === 'd1').map(({ label, idSha256 }) => ({ label, idSha256 }));
+  if (!sameList(expected, observed.d1.map(({ label, idSha256 }) => ({ label, idSha256 })))
+      || inventory.dataResources.find(item => item.kind === 'r2')?.idSha256 !== observed.r2.bucketSha256) fail(RECEIPT_INVALID);
+}
+
+async function observeCommand({ client, plan, now, receiptsDirectory, fence }) {
+  const releasePath = join(receiptsDirectory, `release-${fence}.json`);
+  if (await exists(releasePath)) fail('FENCE_RELEASED');
+  if (!await exists(join(receiptsDirectory, `apply-${fence}.json`))) fail('FENCE_NOT_APPLIED');
+  const { value: apply, sha256: applyReceiptSha256 } = await readReceipt(
+    join(receiptsDirectory, `apply-${fence}.json`), FENCE_APPLY_RECEIPT_SCHEMA);
+  checkApplyReceipt(apply, plan, fence);
+  const startedAt = now();
+  if (!Number.isSafeInteger(startedAt) || startedAt < apply.appliedAtMs + plan.quietWindowMinutes * 60_000) fail('FENCE_WINDOW_TOO_EARLY');
+  const checkLive = async () => {
+    const inventory = await collectInventory(client, plan, { now, requireFenced: true, receiptsDirectory });
+    if (inventory.fingerprintSha256 !== apply.fingerprintSha256) fail('FENCE_INVENTORY_CHANGED');
+    for (const deployment of await productionHistory(client, plan, apply.productionWorker.deploymentId)) {
+      if (!singleVersion(deployment) || deployment.modes[0] !== 'fenced') fail('PRODUCTION_WORKER_NOT_FENCED');
+    }
+    for (const spec of plan.fencedScripts) {
+      if (inventory.crons.get(spec.name).length !== 0
+          || (spec.kind === 'queue-consumer' && inventory.delivery.get(spec.name).paused !== true)) fail('FENCE_NOT_APPLIED');
+    }
+    return inventory;
+  };
+  const before = await checkLive();
+  const r2 = await client.r2Digest();
+  if (!sameList(r2, apply.r2Baseline)) fail('FENCE_NOT_QUIESCENT');
+  const d1 = await currentBookmarks(client, plan);
+  const after = await checkLive();
+  if (!sameList(before.production, after.production)) fail('FENCE_INVENTORY_CHANGED');
+  const completedAt = now();
+  if (!Number.isSafeInteger(completedAt) || completedAt < startedAt) fail(RECEIPT_INVALID);
+  if (await exists(releasePath)) fail('FENCE_RELEASED');
+  const receipt = { schema: FENCE_OBSERVATION_SCHEMA, bookmarkMode: BOOKMARK_MODE,
+    planSha256: plan.planSha256, planReceiptSha256: fence, applyReceiptSha256,
+    accountSha256: idDigest('account', plan.accountId), fingerprintSha256: after.fingerprintSha256,
+    startedAt: iso(startedAt), completedAt: iso(completedAt),
+    productionWorker: { name: plan.productionWorker, deploymentId: after.production.deploymentId,
+      versionId: after.production.versionId, mode: 'fenced', sourceCommit: after.production.sourceCommit }, d1, r2 };
+  checkObservation(receipt, apply, applyReceiptSha256);
+  await checkObservationPlan(receiptsDirectory, receipt, apply);
+  return writeReceipt(contentPath(receiptsDirectory, 'observation', receipt), receipt);
+}
+
+function checkObservation(value, apply, applySha256) {
+  exactKeys(value, ['schema', 'bookmarkMode', 'planSha256', 'planReceiptSha256', 'applyReceiptSha256',
+    'accountSha256', 'fingerprintSha256', 'startedAt', 'completedAt', 'productionWorker', 'd1', 'r2'], RECEIPT_INVALID);
+  const start = isoMs(value.startedAt), end = isoMs(value.completedAt);
+  if (value.schema !== FENCE_OBSERVATION_SCHEMA || value.bookmarkMode !== BOOKMARK_MODE
+      || value.planSha256 !== apply.planSha256 || value.planReceiptSha256 !== apply.planReceiptSha256
+      || value.applyReceiptSha256 !== applySha256 || value.fingerprintSha256 !== apply.fingerprintSha256
+      || !SHA256.test(value.accountSha256 ?? '') || start === null || end === null || end < start
+      || start < apply.appliedAtMs + apply.quietWindowMinutes * 60_000) fail(RECEIPT_INVALID);
+  const production = value.productionWorker;
+  exactKeys(production, ['name', 'deploymentId', 'versionId', 'mode', 'sourceCommit'], RECEIPT_INVALID);
+  checkProductionAnchor(production);
+  if (!SCRIPT.test(production.name ?? '') || !COMMIT.test(production.sourceCommit ?? '')) fail(RECEIPT_INVALID);
+  const labels = Object.keys(FENCE_D1_LABELS);
+  if (!Array.isArray(value.d1) || value.d1.length !== labels.length) fail(RECEIPT_INVALID);
+  value.d1.forEach((item, index) => {
+    exactKeys(item, ['label', 'idSha256', 'bookmark'], RECEIPT_INVALID);
+    if (item.label !== labels[index] || !SHA256.test(item.idSha256 ?? '') || !OPAQUE.test(item.bookmark ?? '')) fail(RECEIPT_INVALID);
+  });
+  if (new Set(value.d1.map(item => item.idSha256)).size !== labels.length) fail(RECEIPT_INVALID);
+  checkR2Digest(value.r2);
+  if (!sameList(value.r2, apply.r2Baseline)) fail(RECEIPT_INVALID);
+}
+
+async function verifyCommand({ client, plan, now, receiptsDirectory, fence, observation }) {
   const releasePath = join(receiptsDirectory, `release-${fence}.json`);
   if (await exists(releasePath)) fail('FENCE_RELEASED');
   const applyPath = join(receiptsDirectory, `apply-${fence}.json`);
@@ -973,7 +1073,16 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
   // Analytics stop a lag margin short of now; that interval must itself be a
   // full quiet window, so absent (not yet ingested) data is never the proof.
   const analyticsEndMs = endMs - FENCE_ANALYTICS_LAG_MINUTES * 60_000;
-  const startMs = windowStartMs ?? apply.appliedAtMs + quietMs;
+  const { value: observed, sha256: observationSha256 } = await readReceipt(
+    join(receiptsDirectory, `observation-${observation}.json`), FENCE_OBSERVATION_SCHEMA);
+  if (observationSha256 !== observation) fail(RECEIPT_INVALID);
+  checkObservation(observed, apply, applyReceiptSha256);
+  await checkObservationPlan(receiptsDirectory, observed, apply);
+  if (observed.planSha256 !== plan.planSha256 || observed.accountSha256 !== idDigest('account', plan.accountId)
+      || !sameList(observed.d1.map(({ label, idSha256 }) => ({ label, idSha256 })),
+        Object.entries(plan.d1).map(([label, id]) => ({ label, idSha256: idDigest('d1', id) })))) fail(RECEIPT_INVALID);
+  const startMs = isoMs(observed.completedAt);
+  if (startMs > endMs) fail(RECEIPT_INVALID);
   if (startMs < apply.appliedAtMs + quietMs) fail('FENCE_WINDOW_TOO_EARLY');
   if (analyticsEndMs - startMs < quietMs) fail('FENCE_WINDOW_TOO_SHORT');
 
@@ -982,6 +1091,8 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
   for (const deployment of await productionHistory(client, plan, apply.productionWorker.deploymentId)) {
     if (!singleVersion(deployment) || deployment.modes[0] !== 'fenced') fail('PRODUCTION_WORKER_NOT_FENCED');
   }
+  if (!sameList(observed.productionWorker, { name: plan.productionWorker, deploymentId: inventory.production.deploymentId,
+    versionId: inventory.production.versionId, mode: 'fenced', sourceCommit: inventory.production.sourceCommit })) fail('FENCE_INVENTORY_CHANGED');
   // The receipt states the observed schedules and delivery, not the target.
   const fencedScripts = plan.fencedScripts.map(spec => {
     const crons = inventory.crons.get(spec.name);
@@ -990,21 +1101,8 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
     return { name: spec.name, kind: spec.kind, crons, deliveryPaused };
   });
 
-  const bookmark = async (id, atMs) => {
-    const query = atMs === null ? '' : `?timestamp=${encodeURIComponent(iso(atMs))}`;
-    const result = await client.api(`/accounts/${plan.accountId}/d1/database/${id}/time_travel/bookmark${query}`);
-    if (!record(result) || typeof result.bookmark !== 'string' || !OPAQUE.test(result.bookmark)) {
-      fail('FENCE_PROVIDER_RESPONSE_INVALID');
-    }
-    return result.bookmark;
-  };
-  const d1 = [];
-  for (const [label, id] of Object.entries(plan.d1)) {
-    const atStart = await bookmark(id, startMs);
-    const atEnd = await bookmark(id, null);
-    if (atStart !== atEnd) fail('FENCE_NOT_QUIESCENT');
-    d1.push({ label, idSha256: idDigest('d1', id), bookmark: atEnd });
-  }
+  const d1 = await currentBookmarks(client, plan);
+  if (!sameList(d1, observed.d1)) fail('FENCE_NOT_QUIESCENT');
   const r2 = await client.r2Digest();
   if (r2.bucketSha256 !== apply.r2Baseline.bucketSha256 || r2.inventorySha256 !== apply.r2Baseline.inventorySha256
       || r2.objects !== apply.r2Baseline.objects || r2.bytes !== apply.r2Baseline.bytes) fail('FENCE_NOT_QUIESCENT');
@@ -1044,6 +1142,8 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, wind
     planSha256: plan.planSha256,
     planReceiptSha256: fence,
     applyReceiptSha256,
+    observationSha256,
+    bookmarkMode: BOOKMARK_MODE,
     accountSha256: idDigest('account', plan.accountId),
     verifiedAt: iso(endMs),
     productionWorker: { name: plan.productionWorker, deploymentId: inventory.production.deploymentId,
@@ -1136,7 +1236,7 @@ async function releaseCommand({ client, plan, now, receiptsDirectory, confirm })
   return writeReceipt(receiptPath, receipt);
 }
 
-const COMMANDS = { inventory: inventoryCommand, plan: planCommand, apply: applyCommand, verify: verifyCommand, release: releaseCommand };
+const COMMANDS = { inventory: inventoryCommand, plan: planCommand, apply: applyCommand, observe: observeCommand, verify: verifyCommand, release: releaseCommand };
 
 /**
  * Programmatic entry. `plan` is the parsed owner plan JSON. Preconditions that
@@ -1144,7 +1244,7 @@ const COMMANDS = { inventory: inventoryCommand, plan: planCommand, apply: applyC
  * credential) are enforced before the first request.
  */
 export async function runCloudflareWriterFence({ subcommand, plan: input, receiptsDirectory, confirm, fence,
-  windowStart, preGcp = false, analyticsDrainComplete = false, cliPath = DEFAULT_CLI_PATH, fetcher = globalThis.fetch,
+  windowStart, observation, preGcp = false, analyticsDrainComplete = false, cliPath = DEFAULT_CLI_PATH, fetcher = globalThis.fetch,
   environment = process.env, now = Date.now }) {
   if (!Object.hasOwn(COMMANDS, subcommand ?? '')) fail('FENCE_ARGUMENTS_INVALID');
   const plan = validateCloudflareWriterFencePlan(input);
@@ -1154,21 +1254,18 @@ export async function runCloudflareWriterFence({ subcommand, plan: input, receip
     if (!SHA256.test(confirm)) fail('FENCE_CONFIRMATION_MISMATCH');
   } else if (confirm !== undefined && confirm !== null) fail('FENCE_ARGUMENTS_INVALID');
   if (subcommand === 'apply' && analyticsDrainComplete !== true) fail('FENCE_DRAIN_UNATTESTED');
-  if (subcommand === 'verify' ? !SHA256.test(fence ?? '') : fence !== undefined && fence !== null) fail('FENCE_ARGUMENTS_INVALID');
-  let windowStartMs = null;
-  if (windowStart !== undefined && windowStart !== null) {
-    windowStartMs = Date.parse(windowStart);
-    if (subcommand !== 'verify' || typeof windowStart !== 'string' || !Number.isSafeInteger(windowStartMs)) fail('FENCE_ARGUMENTS_INVALID');
-  }
+  if (['observe', 'verify'].includes(subcommand) ? !SHA256.test(fence ?? '') : fence !== undefined && fence !== null) fail('FENCE_ARGUMENTS_INVALID');
+  if (windowStart !== undefined && windowStart !== null) fail('FENCE_ARGUMENTS_INVALID');
+  if (subcommand === 'verify' ? !SHA256.test(observation ?? '') : observation !== undefined && observation !== null) fail('FENCE_ARGUMENTS_INVALID');
   if (typeof receiptsDirectory !== 'string') fail('FENCE_RECEIPTS_DIRECTORY_UNSAFE');
   receiptsDirectory = resolve(receiptsDirectory);
   await assertPrivateDirectory(receiptsDirectory);
   const client = createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetcher, environment });
-  // apply, verify and release serialise on the receipts directory, so a fence
+  // apply, observe, verify and release serialise on the receipts directory, so a fence
   // receipt is never written while a release of the same fence is running.
-  const unlock = ['apply', 'verify', 'release'].includes(subcommand) ? await lockReceipts(receiptsDirectory) : () => {};
+  const unlock = ['apply', 'observe', 'verify', 'release'].includes(subcommand) ? await lockReceipts(receiptsDirectory) : () => {};
   try {
-    return await COMMANDS[subcommand]({ client, plan, now, receiptsDirectory, confirm, fence, windowStartMs, analyticsDrainComplete });
+    return await COMMANDS[subcommand]({ client, plan, now, receiptsDirectory, confirm, fence, observation, analyticsDrainComplete });
   } catch (error) {
     // Budget refusals are raised inside provider adapters that re-code
     // transport failures; restore the budget code once it tripped.
@@ -1181,7 +1278,9 @@ export async function runCloudflareWriterFence({ subcommand, plan: input, receip
 
 function checkFenceReceipt(value) {
   exactKeys(value, ['schema', 'planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256', 'verifiedAt',
-    'productionWorker', 'fencedScripts', 'window', 'd1', 'r2', 'analytics'], RECEIPT_INVALID);
+    'productionWorker', 'fencedScripts', 'window', 'd1', 'r2', 'analytics',
+    ...(value.schema === FENCE_RECEIPT_SCHEMA ? ['observationSha256', 'bookmarkMode'] : [])], RECEIPT_INVALID);
+  if (value.schema === FENCE_RECEIPT_SCHEMA && (!SHA256.test(value.observationSha256 ?? '') || value.bookmarkMode !== BOOKMARK_MODE)) fail(RECEIPT_INVALID);
   if (['planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256'].some(key => !SHA256.test(value[key] ?? ''))) {
     fail(RECEIPT_INVALID);
   }
@@ -1255,7 +1354,7 @@ export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
   const receiptPath = resolve(path);
   const directory = dirname(receiptPath);
   await assertPrivateDirectory(directory);
-  const { value, sha256: actual } = await readReceipt(receiptPath, FENCE_RECEIPT_SCHEMA);
+  const { value, sha256: actual } = await readReceipt(receiptPath, [FENCE_RECEIPT_SCHEMA, FENCE_LEGACY_RECEIPT_SCHEMA]);
   if (actual !== expectedSha256) fail(RECEIPT_INVALID);
   checkFenceReceipt(value);
   if (await exists(join(directory, `release-${value.planReceiptSha256}.json`))) fail('FENCE_RELEASED');
@@ -1268,11 +1367,24 @@ export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
       || !sameList(apply.r2Baseline, value.r2)) {
     fail(RECEIPT_INVALID);
   }
+  if (value.schema === FENCE_RECEIPT_SCHEMA) {
+    const { value: observed, sha256: observationSha256 } = await readReceipt(
+      join(directory, `observation-${value.observationSha256}.json`), FENCE_OBSERVATION_SCHEMA);
+    if (observationSha256 !== value.observationSha256) fail(RECEIPT_INVALID);
+    checkObservation(observed, apply, applySha256);
+    await checkObservationPlan(directory, observed, apply);
+    const { value: planned } = await readReceipt(join(directory, `plan-${value.planReceiptSha256}.json`), FENCE_PLAN_RECEIPT_SCHEMA);
+    const expectedScripts = planned.inventory.fencedScripts.map(({ name, kind }) => ({ name, kind }));
+    if (!sameList(expectedScripts, value.fencedScripts.map(({ name, kind }) => ({ name, kind })))) fail(RECEIPT_INVALID);
+    if (observed.accountSha256 !== value.accountSha256 || observed.completedAt !== value.window.start
+        || !sameList(observed.productionWorker, value.productionWorker) || !sameList(observed.d1, value.d1)
+        || !sameList(observed.r2, value.r2)) fail(RECEIPT_INVALID);
+  }
   return value;
 }
 
 const FLAG_SPECS = {
-  '--plan': 'value', '--receipts': 'value', '--confirm': 'value', '--fence': 'value', '--window-start': 'value',
+  '--plan': 'value', '--receipts': 'value', '--confirm': 'value', '--fence': 'value', '--observation': 'value', '--window-start': 'value',
   '--pre-gcp': 'switch', '--analytics-drain-complete': 'switch',
 };
 export function parseCloudflareWriterFenceArguments(args) {
@@ -1290,7 +1402,7 @@ export function parseCloudflareWriterFenceArguments(args) {
       if (typeof value !== 'string' || value.length === 0 || value.startsWith('--')) fail('FENCE_ARGUMENTS_INVALID');
     } else if (inline !== undefined) fail('FENCE_ARGUMENTS_INVALID');
     const key = { '--plan': 'planPath', '--receipts': 'receiptsDirectory', '--confirm': 'confirm', '--fence': 'fence',
-      '--window-start': 'windowStart', '--pre-gcp': 'preGcp', '--analytics-drain-complete': 'analyticsDrainComplete' }[flag];
+      '--observation': 'observation', '--window-start': 'windowStart', '--pre-gcp': 'preGcp', '--analytics-drain-complete': 'analyticsDrainComplete' }[flag];
     options[key] = value;
   }
   if (!options.planPath || !options.receiptsDirectory) fail('FENCE_ARGUMENTS_INVALID');
