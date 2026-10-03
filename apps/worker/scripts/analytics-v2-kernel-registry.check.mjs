@@ -72,6 +72,8 @@ const REGISTRY_PINS = Object.freeze([
   "3e81ee257f82806f03ed6aa4bb545d8d416b22d4e144a1042e6a9acda22b8248",
   // Kernel 6: composed Wave26 reader/model sources and local diagnostic plumbing.
   "fb1f6c882c5b60c208405b754cd0f69eb734aeeae79e1100ad5cbbe3b703d2d5",
+  // Kernel 7: admitted Wave27 internal-native replay and exact Node byte composition.
+  "974d2df796bb3c4c1c232f3c6068cfbbf1097cfac41429bf7660a4c521fa12d9",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
