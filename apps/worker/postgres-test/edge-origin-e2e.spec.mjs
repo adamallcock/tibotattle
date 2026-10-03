@@ -26,11 +26,14 @@
 //
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
-// Run it serially under the image runtime (Node 22):
+// Run it serially under the image runtime (Node 22). The fast-path test-deploy
+// script this spec imports reaches src/edge-origin-contract.ts through the
+// rollout tooling, so a Node 22 before 22.18 needs --experimental-strip-types
+// (the origin itself still loads from the bundled cloud-run/dist):
 //
 //   cd apps/worker && node cloud-run/build.mjs
 //   PG_TEST_SOCKET=... PG_TEST_PORT=... ~/.nvm/versions/node/v22.16.0/bin/node \
-//     --test --test-concurrency=1 postgres-test/edge-origin-e2e.spec.mjs
+//     --experimental-strip-types --test --test-concurrency=1 postgres-test/edge-origin-e2e.spec.mjs
 
 import assert from "node:assert/strict";
 import { after, test } from "node:test";

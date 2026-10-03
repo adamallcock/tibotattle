@@ -664,12 +664,17 @@ are not affected. Until the owner accepts or removes the reuse, read
 ### Local end-to-end (E12)
 
 From `apps/worker`, under Node 22 (the image runtime), with a local
-PostgreSQL 17 cluster:
+PostgreSQL 17 cluster. The spec imports the fast-path test-deploy script,
+which reaches `src/edge-origin-contract.ts` through the rollout tooling, so a
+Node 22 before 22.18 (such as 22.16.0) needs `--experimental-strip-types`;
+without it the spec fails to load with `ERR_UNKNOWN_FILE_EXTENSION`. The
+origin under test still loads from the bundled `cloud-run/dist`.
 
 ```bash
 node cloud-run/build.mjs
 PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
-  node --test --test-concurrency=1 postgres-test/edge-origin-e2e.spec.mjs
+  node --experimental-strip-types --test --test-concurrency=1 \
+  postgres-test/edge-origin-e2e.spec.mjs
 ```
 
 `npm run edge:e2e` runs the same two commands with the `node` on PATH, and
