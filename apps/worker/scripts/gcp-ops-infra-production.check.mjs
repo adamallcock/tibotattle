@@ -11,7 +11,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
-import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import { bornBucket, createFakeGcloud, emptyWorld, memoryWriter, withCloudBuildBucket }
+  from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
 import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
@@ -198,6 +199,37 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     assert.doesNotMatch(call.join(" "), LEFT_OUT);
     assert.doesNotMatch(call.join(" "), /tibotattle-test|staging/u);
   }
+});
+
+test("BUILD-SOURCE: when tibotattle-prod_cloudbuild already exists, pass 1 binds instead of creating and pass 1b is empty", () => {
+  let desired = production();
+  const world = emptyWorld();
+  const writer = memoryWriter();
+  const gcloud = createFakeGcloud(world, { files: writer.files, project: desired.project, region: desired.region,
+    projectNumber: desired.projectNumber });
+  // Some earlier submit made the project's default Cloud Build bucket, with Cloud Storage's own bindings only.
+  withCloudBuildBucket(world, { project: desired.project, projectNumber: desired.projectNumber });
+  const plan = (options = {}) => operations.planInfrastructure(desired,
+    operations.readbackInfrastructure(desired, { runner: gcloud.runner }), options);
+  // Step 3 (before the birth) and step 5 (pass 1): 30 executable, 10 deferred, no BUILD_SOURCE finding.
+  const before = plan();
+  assert.deepEqual([before.findings, executable(before).length, deferred(before).length],
+    [["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"], 30, 10]);
+  world.buckets.push(bornBucket({ name: desired.bucket.name, location: desired.bucket.location,
+    generation: PROOF.bucketGeneration, extra: { projectNumber: desired.projectNumber } }));
+  desired = production((value) => { value.bucket.proof = { ...PROOF }; });
+  const first = plan();
+  assert.deepEqual([first.findings, first.blockers, executable(first).length, deferred(first).length],
+    [[], [], 30, 10]);
+  assert.ok(executable(first).includes(BUILD_SOURCE_READER));
+  assert.equal(first.operations.some((entry) => entry.id === "build-source-bucket:create"), false);
+  const applied = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
+    createSpecWriter: () => writer.create() });
+  // Step 5's remaining executable is 0, so there is no pass 1b (approval 4b) to run.
+  assert.deepEqual({ ...applied.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 10, refused: 0 });
+  assert.deepEqual(world.bucketPolicies[BUILD_SOURCE_BUCKET].bindings.filter((binding) =>
+    binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
+    members: ["serviceAccount:tibotattle-builder@tibotattle-prod.iam.gserviceaccount.com"] }]);
 });
 
 test("a cadence the owner commits later (synthetic here) is created paused after pass 2, with the grant only after the pause", () => {

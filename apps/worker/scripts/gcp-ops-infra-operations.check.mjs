@@ -1912,13 +1912,44 @@ test("BUILD-SOURCE: readback detects a missing binding, a broader role, an extra
   const convenience = observe((world) => { policy(world).bindings.push({ role: "roles/storage.legacyObjectReader",
     members: [`projectViewer:${desired.project}`] }); });
   assert.deepEqual([convenience.findings, convenience.summary.refused], [[], 0]);
-  // A listed bucket of another project number is never read further or bound on.
+  // A listed bucket of another project number is never read further or bound on. Live
+  // `storage buckets list --project` lists only the project's own buckets, so this is a
+  // defensive check; a name held elsewhere reads back ABSENT (the next test).
   const foreign = refusedApply((world) => {
     world.buckets.find((entry) => entry.name === bucket).projectNumber = "999999999999";
     withoutReader(world);
   }, "APPLY_BLOCKED");
   assert.deepEqual([foreign.findings, foreign.blockers], [["BUILD_SOURCE_BUCKET_FOREIGN"], ["BUILD_SOURCE_BUCKET_FOREIGN"]]);
   assert.equal(ops(foreign, (entry) => entry.id.startsWith("build-source-bucket")).length, 0);
+  // Drift is scoped to the managed binding: another member reading through a different role is
+  // outside it (round-19 reading of "an extra member"; widening it is an owner decision).
+  for (const role of ["roles/storage.legacyObjectReader", "roles/storage.admin"]) {
+    const other = observe((world) => { policy(world).bindings.push({ role, members: ["user:reader@example.com"] }); });
+    assert.deepEqual([other.findings, other.summary.refused], [[], 0], role);
+  }
+});
+
+test("BUILD-SOURCE: a name another project holds is invisible to the project listing, so pass 1 stops at its create", () => {
+  // `storage buckets list --project=<project>` returns only that project's buckets, so a
+  // <project>_cloudbuild held elsewhere reads back ABSENT (never FOREIGN), the plan creates
+  // it, and the live create's 409 stops apply at that operation. Every rerun plans it again;
+  // the owner decides. OPS-10's describe precheck is the check that can see such a bucket.
+  const desired = desiredState({ synthetic: false });
+  const world = convergedWorld(desired);
+  world.buckets = world.buckets.filter((bucket) => bucket.name !== desired.buildSource.bucket);
+  delete world.bucketPolicies[desired.buildSource.bucket];
+  const isCreate = (argv) => argv.slice(0, 3).join(" ") === "storage buckets create";
+  const gcloud = fake(desired, world, { failWhen: isCreate });
+  const first = plan(desired, gcloud.runner);
+  assert.deepEqual([first.findings, first.blockers], [["BUILD_SOURCE_BUCKET_ABSENT"], []]);
+  gcloud.calls.length = 0;
+  assert.throws(() => operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
+    createSpecWriter: () => gcloud.writer.create() }),
+  (error) => error.code === "APPLY_OPERATION_FAILED" && error.operation === "build-source-bucket:create");
+  assert.deepEqual(gcloud.calls.filter((argv) => operations.classifyGcloudCommand(argv) === "mutate"),
+    [[...manifest.buildSourceBucketCreateArgs(desired)]]);
+  assert.deepEqual(ops(plan(desired, gcloud.runner), (entry) => entry.deferred === undefined).map((entry) => entry.id),
+    ["build-source-bucket:create"]);
 });
 
 test("BUILD-SOURCE: a plan never mutates another bucket, and the builder holds no project storage role", () => {

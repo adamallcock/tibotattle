@@ -1167,11 +1167,13 @@ async function archiveSha256Of(path) {
  * checks that the bucket is the project's own nor refuses an absent one (it
  * creates it with its own defaults), so build reads it first, read-only: it
  * must exist (ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE: run the OPS-2 apply that
- * creates it), carry the target's project number
- * (ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN), and its policy must give the builder
- * roles/storage.objectViewer unconditionally and name no public member
- * (ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED: the OPS-2 binding is missing or the
- * bucket is public). Broader roles and extra members are OPS-2 readback's
+ * creates it; an unreadable bucket another project holds also lands here, and
+ * then OPS-2's create fails), carry the target's project number
+ * (ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN: an owner decision, OPS-2 cannot clear
+ * it), and its policy must give the builder roles/storage.objectViewer
+ * unconditionally and name no public member
+ * (ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED: OPS-2 binds a missing binding, but a
+ * public member blocks OPS-2 and needs the owner). Broader roles and extra members are OPS-2 readback's
  * drift. Nothing is printed but the code.
  */
 function checkBuildSource(context, target) {

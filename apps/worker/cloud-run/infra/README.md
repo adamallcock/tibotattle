@@ -148,10 +148,27 @@ the default bucket failed with a 403 on `storage.objects.get` (staging,
   the reader role). The last three are the finding
   `BUILD_SOURCE_BUCKET_IAM_DRIFT` and a refused delete, so apply refuses the
   plan until the owner removes them. A public member is the finding and blocker
-  `BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER`. A listed bucket with another
-  project number is `BUILD_SOURCE_BUCKET_FOREIGN`, and nothing binds on it.
-  Cloud Storage's project convenience members (`projectOwner:`,
-  `projectEditor:`, `projectViewer:`) on the legacy roles are not drift.
+  `BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER`. Cloud Storage's project
+  convenience members (`projectOwner:`, `projectEditor:`, `projectViewer:`)
+  on the legacy roles are not drift.
+- Drift is scoped to the managed binding: the builder's roles and the
+  members of `roles/storage.objectViewer`. Another member who can read the
+  source archives through a different role on the bucket (for example
+  `roles/storage.legacyObjectReader` or `roles/storage.admin`) is not
+  reported. That is the round-19 reading of "an extra member"; widening it
+  to every read-capable role is an owner decision.
+- A listed bucket with another project number is `BUILD_SOURCE_BUCKET_FOREIGN`,
+  and nothing binds on it. That check is defensive only: `gcloud storage
+  buckets list --project` returns only the project's own buckets, so OPS-2
+  cannot see a `<project>_cloudbuild` name that another project holds. It
+  reads back as `BUILD_SOURCE_BUCKET_ABSENT`, the plan creates it, and the
+  create fails at apply (a 409 from Cloud Storage), so apply stops with
+  `APPLY_OPERATION_FAILED` at `build-source-bucket:create`. Every operation
+  planned after it in that pass is not run, and every rerun plans the same
+  create. Stop and escalate to the owner: the round-19 design names no other
+  bucket. OPS-10's `build` precheck is the check that can see such a bucket
+  (`ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN` when it is readable,
+  `ROLLOUT_BUILD_SOURCE_BUCKET_UNAVAILABLE` when it is not).
 - When the bucket is absent (the production project before its first
   submit), readback reports `BUILD_SOURCE_BUCKET_ABSENT` and the plan:
   - creates the bucket with `gcloud storage buckets create
@@ -175,7 +192,10 @@ the default bucket failed with a 403 on `storage.objects.get` (staging,
   `ROLLOUT_BUILD_SOURCE_BUCKET_FOREIGN` (another project number) or
   `ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED` (no unconditional builder read,
   or a public member). It qualifies the build's storage source against that
-  bucket and the `source/` prefix.
+  bucket and the `source/` prefix. Plan and apply OPS-2, then retry, for
+  `UNAVAILABLE` and for `UNQUALIFIED` from a missing binding. `FOREIGN`, and
+  `UNQUALIFIED` from a public member, need the owner: OPS-2 binds nothing on
+  a foreign bucket and blocks on a public member.
 
 Why OPS-2 creates an absent bucket instead of using a first-submit sequence:
 

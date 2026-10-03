@@ -126,7 +126,7 @@ bootstrap image.
 
 | Command (from `apps/worker` unless noted) | Result |
 |---|---|
-| `npm run gcp:ops:infra:check` (includes `gcp-ops-infra-staging-service.check.mjs`, `gcp-ops-infra-production.check.mjs`, `gcp-infra.check.mjs`) | 354 tests, 354 pass, 0 fail |
+| `npm run gcp:ops:infra:check` (includes `gcp-ops-infra-staging-service.check.mjs`, `gcp-ops-infra-production.check.mjs`, `gcp-infra.check.mjs`) | 357 tests, 357 pass, 0 fail (354 before the review follow-up) |
 | `npm run gcp:production-rollout:check` | 29 tests, 29 pass, 0 fail |
 | `node --test scripts/gcp-origin-verifier-smoke.check.mjs` | 10 tests, 10 pass, 0 fail |
 | root `npm run test:preflight` (Node 26.2.0) | exit 0; documentation gate 21 pass, 0 fail |
@@ -153,12 +153,63 @@ New coverage:
 - the production rehearsal's pass 1 create, its deferred binding and the
   pass 2 binding.
 
+## Review follow-up
+
+A review of `a0a9aece` raised five low findings. Each was checked against the
+code and an in-memory rehearsal; none was refuted, and each is resolved on
+the same branch:
+
+1. **Production counts when the bucket already exists.** The runbook said
+   29 executable / 10 deferred. The rehearsal gives 30 / 10, because the
+   bind is executable rather than deferred. `gcp-production-apply.md` now says
+   so, and in that case pass 1 runs the bind: step 5's `remaining` has 0
+   executable, step 9's plan has 0, and pass 1b (approval 4b) is skipped. A
+   new production test pins these counts.
+2. **`BUILD_SOURCE_BUCKET_FOREIGN` cannot fire live.** Confirmed:
+   `storage buckets list --project` names only the project's own buckets, so
+   a `<project>_cloudbuild` that another project holds reads back absent. The
+   plan then creates it, and the create's 409 stops apply with
+   `APPLY_OPERATION_FAILED` before the later pass-1 operations. Option (b) was
+   chosen: the check stays as a defensive one, and the README, the operations
+   module and the production runbook (step 5) now state the real behaviour:
+   stop and escalate to the owner. Option (a), a `describe` after a missing
+   listing, was not taken, because the guard deliberately discards gcloud's
+   error output. It cannot tell a 404 (truly absent: create) from a 403 (held
+   elsewhere), and treating a failed read as absence would turn missing
+   evidence into a planned create. A new operations test pins the failed
+   create and the replan. OPS-10's `build` precheck remains the check that
+   sees such a bucket: `FOREIGN` when it is readable, `UNAVAILABLE` when it
+   is not.
+3. **Refusal guidance.** `gcp-rollout.md` step 4, the staging gated tail's
+   bootstrap-image row and the production bootstrap-image row now split the
+   cases. For `UNAVAILABLE`, or `UNQUALIFIED` from a missing binding: apply
+   OPS-2 and retry. For `FOREIGN`, or `UNQUALIFIED` from a public member:
+   escalate to the owner, since OPS-2 binds nothing on a foreign bucket and
+   blocks on a public member.
+4. **The live staging path was untested.** A new rehearsal, "the live staging
+   path", models it: pass 1 is applied without the bind, and the next plan's
+   executables are exactly the one bind (its argv pinned). After that bind
+   is applied, pass 2 has no build-source operation and the plane reads
+   clean.
+5. **Drift scope.** The narrow reading was kept. Drift covers the builder's
+   roles and the members of `roles/storage.objectViewer`; another member who
+   reads through a different role (for example `legacyObjectReader` or
+   `storage.admin`) is not reported. The README states this, and a test pins
+   it. Widening `READER_EXTRA_MEMBER` to every role that includes
+   `storage.objects.get` is an owner decision. It would have to exempt Cloud
+   Storage's project convenience members, and in the shared sandbox it could
+   refuse the staging apply over a co-tenant's grant.
+
 ## What this does not prove
 
 - That live `gcloud storage buckets list --raw` and `get-iam-policy` output
   parses as the fake does.
 - That a live build reads its source under the binding.
-- That the production project's bucket name is free.
+- That the production project's bucket name is free. OPS-2 cannot see a
+  name another project holds: it shows up only as a failed
+  `build-source-bucket:create` at production pass 1 (review follow-up 2).
+- That no other principal reads the source archives through a role other
+  than `roles/storage.objectViewer` (review follow-up 5).
 
 Each is a live gate: OPS-2 plan and apply, then the bootstrap-image build
 for staging and, after owner approval, for production. The staging plane's

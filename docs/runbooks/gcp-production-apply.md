@@ -80,7 +80,7 @@ after a clear yes:
 | 2 | 4 | Creates the bucket (`--authorize=bucket-birth:tibotattle-prod:tibotattle-quarantine`) |
 | 3 | 5 | OPS-2 pass 1 (`--authorize=<planDigest>`): one approval over the 30 listed operations |
 | 4 | 7 | Generates `POSTGRES_RATE_LIMIT_SECRET` version 1 straight into Secret Manager |
-| 4b | 9 | OPS-2 pass 1b (`--authorize=<planDigest>`): the builder's `roles/storage.objectViewer` on `gs://tibotattle-prod_cloudbuild`, one operation |
+| 4b | 9 | OPS-2 pass 1b (`--authorize=<planDigest>`): the builder's `roles/storage.objectViewer` on `gs://tibotattle-prod_cloudbuild`, one operation. Skipped when the bucket existed before pass 1, which then binds it |
 | 5 | 11 | Creates the production alert channel (`--authorize=<planDigest>`) |
 
 The owner-held secret versions are added in step 7 (round 16: the owner
@@ -137,7 +137,11 @@ Expect `exit=2`, `summary.refused` 0, `blockers` exactly
 executable and 11 deferred operations. `BUILD_SOURCE_BUCKET_ABSENT` means no
 `gcloud builds submit` has run in the project yet, so the default Cloud Build
 bucket does not exist. If it does exist, the finding is absent and the plan
-binds instead of creating (29 executable, 10 deferred). Stop on a refused
+binds instead of creating: 30 executable, 10 deferred, because the bind is
+executable rather than deferred. In that case pass 1 runs the bind: step 5's
+plan has no finding (30 executable, 10 deferred), its `remaining` has 0
+executable, step 6's reasons omit the binding, step 9's plan has 0
+executable, and pass 1b (approval 4b) is skipped. Stop on a refused
 operation, any other finding, or any live plane resource you did not expect.
 
 ## 4. Bucket birth and its proof (approval 2)
@@ -193,7 +197,9 @@ node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringi
 ```
 
 Expect exit 0, `findings` exactly `["BUILD_SOURCE_BUCKET_ABSENT"]`, no
-blockers, 30 executable, 11 deferred, 0 refused.
+blockers, 30 executable, 11 deferred, 0 refused. If the default Cloud Build
+bucket already exists (step 3), expect no finding, 30 executable and 10
+deferred, with the builder's binding executable in this pass.
 The owner approves this list and its `planDigest`:
 
 - executable: six service accounts; the verifier's token-creator grant for
@@ -242,8 +248,17 @@ node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDiges
 Expect exit 0 and `remaining` with 1 executable (the builder's binding, now
 that the bucket exists) and 10 deferred. Cloud SQL
 takes several minutes. No trigger exists, and the scheduler account has no
-executor grant, so nothing can start a job. Stop on the staging runbook's
+executor grant, so nothing can start a job. If the bucket already existed
+(step 3), expect 0 executable remaining. Stop on the staging runbook's
 step 7 conditions.
+
+If apply fails with `APPLY_OPERATION_FAILED` at `build-source-bucket:create`,
+another project already holds the name `tibotattle-prod_cloudbuild`. OPS-2
+cannot see that: a project's bucket listing names only its own buckets, so
+readback reported the bucket absent. The operations planned after the create
+(the logging exclusion among them) did not run, and every rerun plans the same
+create. Stop and escalate to the owner; the round-19 design names no other
+bucket.
 
 ## 6. Readback (read-only)
 
@@ -347,13 +362,18 @@ now wait on the bootstrap image only: ROUTES-R12 removed the retired Google
 and Apple sign-in secrets from CR-3, so the committed secrets compose the
 service.
 
+If pass 1 bound it already (the bucket existed at step 3), the plan has 0
+executable and pass 1b is skipped.
+
 Pass 1b (approval 4b): after the owner approves that one operation and its
 `planDigest`, run
 `node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDigest>`.
 Expect exit 0 and 0 executable remaining. Readback's `observed.buildSource`
 then has `"owned": true`, `drift: []`, and the builder as the only member of
 `roles/storage.objectViewer`. Stop on `BUILD_SOURCE_BUCKET_IAM_DRIFT` (a broader
-role or an extra member on that bucket) or `BUILD_SOURCE_BUCKET_FOREIGN`.
+role or an extra member on that bucket) or `BUILD_SOURCE_BUCKET_FOREIGN`
+(defensive: a bucket another project holds is not listed, and shows up in
+step 5 as the failed create instead).
 
 ## 10. Identity-link rotation check (read-only; a gate before PROD-3)
 
@@ -436,7 +456,7 @@ Applying the alert policies is a later, separately authorized step.
 
 | Step | Gate |
 |---|---|
-| Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | Pass 1b applied (step 9). The dry run must show `"buildSource": { "bucket": "tibotattle-prod_cloudbuild", "sourceDir": "gs://tibotattle-prod_cloudbuild/source" }` and `--gcs-source-staging-dir=gs://tibotattle-prod_cloudbuild/source` on the submit; `build` refuses before the lock on `ROLLOUT_BUILD_SOURCE_BUCKET_*` (`docs/runbooks/gcp-rollout.md`, step 4). OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
+| Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | Pass 1b applied (step 9), or the binding applied in pass 1 when the bucket already existed. The dry run must show `"buildSource": { "bucket": "tibotattle-prod_cloudbuild", "sourceDir": "gs://tibotattle-prod_cloudbuild/source" }` and `--gcs-source-staging-dir=gs://tibotattle-prod_cloudbuild/source` on the submit; `build` refuses before the lock on `ROLLOUT_BUILD_SOURCE_BUCKET_*` (`docs/runbooks/gcp-rollout.md`, step 4: re-apply OPS-2 for `UNAVAILABLE` or a missing binding; escalate to the owner for `FOREIGN` or a public member). OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
 | Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image and the namespace pin (step 8). Creates the migration, refresh and maintenance jobs, then D-OPS4's maintenance trigger at its pinned `* * * * *` cadence: the trigger create, its pause, and only then the scheduler's executor grant on `tibotattle-maintenance`, the order the refresh trigger follows below. The trigger stays `PAUSED` until OPS-3 resumes it at cutover. It does not grant the scheduler account `roles/run.jobsExecutor` on the refresh job: that grant waits with the refresh trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start the refresh or migration job. A new plan digest, so a new per-pass approval (C1) |
 | The service and its invoker bindings | Created in pass 2 with the jobs: ROUTES-R12 dropped `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template. They need the namespace pin (step 8) and the bootstrap image |
 | Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |

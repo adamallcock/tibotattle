@@ -142,10 +142,20 @@ and print the argv; they run no `gcloud` and make no request.
    - `ROLLOUT_BUILD_SOURCE_BUCKET_UNQUALIFIED` when there is no unconditional
      builder read or there is a public member.
 
-   gcloud does not make these checks for an explicit staging directory. Each
-   of these refusals means: plan and apply OPS-2 (it creates an absent
-   bucket, then binds in the next pass), then retry. The build is qualified
-   only if its storage source is in that bucket under `source/`.
+   gcloud does not make these checks for an explicit staging directory. What
+   to do depends on the refusal:
+
+   - `UNAVAILABLE`, or `UNQUALIFIED` because the builder's binding is
+     missing: plan and apply OPS-2 (it creates an absent bucket, then binds in
+     the next pass), then retry. If OPS-2's `build-source-bucket:create` then
+     fails, another project holds the name: stop and escalate to the owner.
+   - `FOREIGN`, or `UNQUALIFIED` because the bucket has a public member: stop
+     and escalate to the owner. OPS-2 cannot clear either: it binds nothing on
+     a foreign bucket, and a public member blocks its apply
+     (`BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER`).
+
+   The build is qualified only if its storage source is in that bucket under
+   `source/`.
 
    ```bash
    node scripts/gcp-production-rollout.mjs build --environment=<env> --commit=<commit> \

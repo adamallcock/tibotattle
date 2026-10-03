@@ -461,23 +461,65 @@ test("the committed JSON Schema closes stagingOrigin to the validator's keys and
   assert.deepEqual(object.properties.accessAud.type, ["string", "null"]);
 });
 
-test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 the service and the jobs", () => {
+/** The staging rehearsal's world: born bucket, secrets, a co-tenant and the shared default Cloud Build bucket. */
+function stagingRehearsal() {
   const staging = desired();
   const world = emptyWorld();
   withSecretValues(world, { project: staging.project, region: staging.region,
     names: Object.values(staging.secrets).map((secret) => secret.secretName) });
   world.buckets.push(bornBucket({ name: staging.bucket.name, location: staging.bucket.location,
     generation: PROOF.bucketGeneration, extra: { projectNumber: staging.projectNumber } }));
-  // A co-tenant of the shared test project, never read into the plan or touched.
   world.services.push({ metadata: { name: "tibotattle-test-app" }, spec: { template: { spec: { containers: [{}] } } } });
-  // BUILD-SOURCE: the shared project's default Cloud Build bucket exists (the
-  // test estate's builds made it), with no grant for the staging builder.
   withCloudBuildBucket(world, { project: staging.project, projectNumber: staging.projectNumber });
   const writer = memoryWriter();
   const gcloud = createFakeGcloud(world, { files: writer.files, project: staging.project, region: staging.region,
     projectNumber: staging.projectNumber });
   const plan = (options = {}) => operations.planInfrastructure(staging,
     operations.readbackInfrastructure(staging, { runner: gcloud.runner }), options);
+  const apply = (result, options = {}) => operations.applyInfrastructure(staging, { runner: gcloud.runner,
+    authorize: result.planDigest, createSpecWriter: () => writer.create(), ...options });
+  return { staging, world, gcloud, plan, apply };
+}
+
+const STAGING_SOURCE_READER = "build-source-bucket-iam:bind:roles/storage.objectViewer|"
+  + "serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com|";
+
+test("the live staging path (in memory): pass 1 applied before BUILD-SOURCE, then a bind-only pass, then pass 2", () => {
+  const { world, gcloud, plan, apply } = stagingRehearsal();
+  // Live staging applied pass 1 before this change: the plane exists, and the builder has no
+  // read on tibotattle_cloudbuild (the bind is stripped to model that earlier checkout's result).
+  apply(plan());
+  const policy = world.bucketPolicies.tibotattle_cloudbuild;
+  policy.bindings = policy.bindings.filter((binding) => binding.role !== "roles/storage.objectViewer");
+  // The next plan holds exactly one executable operation, the bind, and nothing refused or found.
+  const bindOnly = plan();
+  assert.deepEqual([bindOnly.summary.refused, bindOnly.findings, bindOnly.blockers], [0, [], []]);
+  assert.deepEqual(bindOnly.operations.filter((entry) => entry.deferred === undefined)
+    .map((entry) => [entry.id, entry.argv]), [[STAGING_SOURCE_READER,
+    ["storage", "buckets", "add-iam-policy-binding", "gs://tibotattle_cloudbuild", "--project=tibotattle",
+      "--member=serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com",
+      "--role=roles/storage.objectViewer"]]]);
+  gcloud.calls.length = 0;
+  const receipt = apply(bindOnly);
+  assert.deepEqual(gcloud.calls.filter((argv) => operations.classifyGcloudCommand(argv) === "mutate"),
+    [bindOnly.operations.find((entry) => entry.id === STAGING_SOURCE_READER).argv]);
+  assert.equal(receipt.remaining.executable, 0);
+  assert.deepEqual(policy.bindings.filter((binding) => binding.role === "roles/storage.objectViewer"),
+    [{ role: "roles/storage.objectViewer",
+      members: ["serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com"] }]);
+  // Pass 2 (the bootstrap image) then holds no build-source operation and converges.
+  const second = plan({ bootstrap: IMAGE });
+  assert.equal(second.operations.some((entry) => entry.id.startsWith("build-source-bucket")), false);
+  assert.equal(second.summary.executable, 7);
+  apply(second, { bootstrap: IMAGE });
+  assert.deepEqual(operations.infrastructureCleanliness(plan()), { clean: true, reasons: [] });
+});
+
+test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 the service and the jobs", () => {
+  // The world holds a co-tenant of the shared test project (never read into the plan or
+  // touched) and, for BUILD-SOURCE, the shared project's default Cloud Build bucket (the
+  // test estate's builds made it), with no grant for the staging builder.
+  const { world, gcloud, plan, apply } = stagingRehearsal();
   const deferred = (result) => result.operations.filter((entry) => entry.deferred !== undefined)
     .map((entry) => `${entry.id}:${entry.deferred}`);
   const first = plan();
@@ -492,7 +534,7 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   assert.equal(first.summary.executable, 28);
   assert.deepEqual(first.operations.filter((entry) => entry.id.startsWith("build-source-bucket"))
     .map((entry) => [entry.id, entry.argv, entry.deferred]), [[
-    "build-source-bucket-iam:bind:roles/storage.objectViewer|serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com|",
+    STAGING_SOURCE_READER,
     ["storage", "buckets", "add-iam-policy-binding", "gs://tibotattle_cloudbuild", "--project=tibotattle",
       "--member=serviceAccount:tibotattle-staging-builder@tibotattle.iam.gserviceaccount.com",
       "--role=roles/storage.objectViewer"], undefined]]);
@@ -502,8 +544,7 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   // D-CRB composes HOST_MODE staging, so the service waits only for the bootstrap image.
   assert.ok(deferred(first).includes("run-service:create:BOOTSTRAP_IMAGE_REQUIRED"));
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));
-  operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: first.planDigest,
-    createSpecWriter: () => writer.create() });
+  apply(first);
   // After pass 1 the staging builder can read its build sources, and nothing else changed on that bucket.
   assert.deepEqual(world.bucketPolicies.tibotattle_cloudbuild.bindings.filter((binding) =>
     binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
@@ -523,8 +564,7 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   ]);
   assert.ok(deferred(second).includes(
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET"));
-  operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
-    createSpecWriter: () => writer.create() });
+  apply(second, { bootstrap: IMAGE });
   // The plane is clean: only the refresh trigger and its grant wait, for the owner's cadence
   // (SCHEDULER_CADENCE_UNSET, a clean deferral), so a staging readback --require-clean passes.
   const settled = plan();

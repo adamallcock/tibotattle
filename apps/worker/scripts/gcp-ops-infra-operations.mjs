@@ -93,8 +93,14 @@
  * missing reader binding and refuses (delete) every other builder, reader or
  * public binding; drift other than a missing binding is also the finding
  * BUILD_SOURCE_BUCKET_IAM_DRIFT, and a public member the finding and blocker
- * BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER. A listed bucket of another
- * project number is BUILD_SOURCE_BUCKET_FOREIGN and is never bound on. An
+ * BUILD_SOURCE_BUCKET_POLICY_PUBLIC_MEMBER. Drift covers the builder and the
+ * reader role only: another member holding some other role on the bucket is
+ * outside it (an owner decision to widen). A listed bucket of another
+ * project number is BUILD_SOURCE_BUCKET_FOREIGN and is never bound on; that
+ * check is defensive, since a live project listing names only the project's
+ * own buckets. A name another project holds therefore reads back absent, and
+ * its create fails at apply (APPLY_OPERATION_FAILED), stopping the pass there;
+ * OPS-10's describe precheck is the check that can see it. An
  * absent bucket is the finding BUILD_SOURCE_BUCKET_ABSENT: the plan creates it
  * (buildSourceBucketCreateArgs: the plane's region, uniform bucket-level
  * access, public access prevention enforced) and defers the binding with that
