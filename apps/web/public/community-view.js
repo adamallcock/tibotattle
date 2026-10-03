@@ -6,8 +6,7 @@ export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd,
-  PUBLIC_ALLOWANCE_MODEL_CONFIG } from "./community-data.js";
+import { chartedModelsWith, normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
 import {
   compact,
   compactPrecise,
@@ -507,6 +506,27 @@ function buildCommunityAllowanceSingleChartModel(series, {
   };
 }
 
+/**
+ * Model series in display order. This page's own charted list is authoritative
+ * for its own models; the entries a publication carried metadata for (the only
+ * ones with a published `order`) lead, by that order, and may add models the
+ * page has never seen. Every other model follows in the page's own order. The
+ * input list is never reordered. Without metadata this is the page's own list.
+ * `pinned` marks the page's roster models that keep a card even with no
+ * estimate, while any other model is charted only when it has one.
+ */
+function modelDefinitions(modelConfig) {
+  return chartedModelsWith(modelConfig.filter(entry => Number.isSafeInteger(entry.order)))
+    .map(({ modelId, label, family, order, pinned }, index) => {
+      const published = Number.isSafeInteger(order);
+      return { tier: published ? 0 : 1, definition: {
+        key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index, family),
+        order: published ? order : index, pinned: pinned === true,
+      } };
+    }).sort((left, right) => left.tier - right.tier || left.definition.order - right.definition.order)
+    .map(({ definition }) => definition);
+}
+
 /** Presentation only: validated public series in, shared dollar axes and gap-aware
  * geometry out. No owner data access, pricing, fitting, or inferred history. */
 export function buildCommunityAllowanceChartModel(series, options = {}) {
@@ -535,10 +555,7 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
       .map(([key, label, color]) => ({
       key, label, view: "plans", className: `allowance-series-${color}`,
     })),
-    ...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(({ modelId, label }, index) => ({
-      key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
-      order: index,
-    })),
+    ...modelDefinitions(series.breakdowns.modelConfig),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
@@ -638,9 +655,12 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
   const visibleByKey = new Map(visible.map(definition => [definition.key, definition]));
+  // The page's pinned roster keeps a card (and a legend entry) while it has no
+  // estimate; every other model, however it became known, is drawn only once it
+  // has one. A catalog of dozens of models must not become dozens of empty cards.
   const cardSeries = view === "models"
-    ? viewDefinitions.map(definition => visibleByKey.get(definition.key)
-      ?? { ...definition, latest: null }) : visible;
+    ? viewDefinitions.filter(definition => definition.pinned || visibleByKey.has(definition.key))
+      .map(definition => visibleByKey.get(definition.key) ?? { ...definition, latest: null }) : visible;
   const dots = visible.flatMap(definition => definition.dots)
     .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
   const dayTicks = Array.from({ length: 6 }, (_, index) => {
@@ -1565,7 +1585,9 @@ export function renderCommunityAllowanceSection({
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const series = normalizeCommunityDailySeries(payload);
+  // A payload handed over with retained provenance came out of this browser's
+  // own store, and only such a payload may carry the stored-copy counters.
+  const series = normalizeCommunityDailySeries(payload, { retained: cache !== null && cache !== undefined });
   // v1.0 breakdowns contain only plan/model rows: the aggregate still comes
   // from independently published daily values. Later breakdowns own their
   // combined estimate, so labels must follow the selected value's source.
@@ -1622,6 +1644,12 @@ export function renderCommunityAllowanceSection({
     return "breakdowns_unavailable";
   }
 
+  // Estimates the server published for a model this page cannot name are left
+  // out of the model view. Say so there, so the gap is stated and not silent.
+  // Plan and aggregate figures never depended on them.
+  const unrecognizedModelNotice = () => view === "models"
+    && (series.breakdowns?.unrecognizedModelTuples ?? 0) > 0
+    ? [node("p", "snapshot-disclosure", t("community.allowance.unrecognizedModels"))] : [];
   const model = buildCommunityAllowanceChartModel(series, { rangeDays, view });
   if (model === null) {
     const anyEstimate = buildCommunityAllowanceChartModel(series, { view }) !== null;
@@ -1633,7 +1661,7 @@ export function renderCommunityAllowanceSection({
         ? "community.allowance.noneInRange"
         : view === "models" ? "community.allowance.modelsAccumulating"
         : "community.allowance.stillAccumulating"),
-    ));
+    ), ...unrecognizedModelNotice());
     return anyEstimate ? "no_estimates_in_range" : "estimates_accumulating";
   }
 
@@ -1698,7 +1726,8 @@ export function renderCommunityAllowanceSection({
     }
     container.append(node("p", "snapshot-disclosure", t(view === "models"
       ? series.breakdowns?.isCurrent === false ? "community.allowance.modelMethodLegacy" : "community.allowance.modelMethod"
-      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")));
+      : series.breakdowns?.isCurrent ? "community.allowance.planMethod" : "community.allowance.planMethodLegacy")),
+    ...unrecognizedModelNotice());
     return "published";
   }
   const headline = node("div", "allowance-headline");

@@ -146,7 +146,7 @@ test("date range and absent public breakdowns fail honestly without affecting ag
 
 test("public view controls and method caveats are translated in every shipped language", () => {
   for (const locale of ["en-US", "zh-Hans", "es"]) {
-    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus"]) {
+    for (const suffix of ["viewLabel", "viewAggregate", "viewPlans", "viewModels", "smallSampleDisclosure", "breakdownsUnavailable", "modelsAccumulating", "noModelEstimate", "planMethod", "modelMethod", "planChartLabel", "modelChartLabel", "planChartDescription", "modelChartDescription", "cardsCaption", "legendFocus", "unrecognizedModels"]) {
       const key = `community.allowance.${suffix}`;
       const value = translate(key, {}, locale);
       assert.notEqual(value, key);
@@ -226,9 +226,19 @@ test("optional public breakdown rejects private extras and invalid evidence with
     value => { value.days[0].byPlanType.pro.identity = "PRIVATE_CANARY"; },
     value => { value.days[0].byPlanType.pro.band80Usd.raw = "PRIVATE_CANARY"; },
     value => { value.days[0].byPlanType.team = value.days[0].byPlanType.pro; },
-    value => { value.days[0].models = [["private-model-canary", 1234, 1]]; },
+    // An UNKNOWN model id no longer invalidates the block: that tuple is
+    // dropped and counted instead (community-model-tolerance.test.mjs). A
+    // reviewed model kept off the primary comparison, an id that is not shaped
+    // like a model id, and a repeated id are still producer faults.
     value => { value.days[0].models = [["gpt-5.3-codex-spark", 1234, 1]]; },
+    value => { value.days[0].models = [["claude-opus-5", 1234, 1]]; },
+    value => { value.days[0].models = [["<private-model-canary>", 1234, 1]]; },
+    value => { value.days[0].models = [["private-model-canary", 1234, 1], ["private-model-canary", 1234, 1]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1, "PRIVATE_CANARY"]]; },
+    value => { value.days[0].models = [[null, 1234, 1]]; },
+    value => { value.days[0].models = [["gpt-6-astra", 1234, 1], "private-model-canary"]; },
+    value => { value.days[0].models = [["private-model-canary", "1234", 1]]; },
+    value => { value.days[0].models = [["private-model-canary", 1234, 0]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 1], ["gpt-6-astra", 1234, 1]]; },
     value => { value.days[0].models = [["gpt-6-astra", 1234, 0]]; },
     value => { value.days[0].models = [["gpt-6-astra", "1234", 1]]; },
@@ -416,10 +426,11 @@ test("real public render shows model sample semantics, per-view labels and discl
       assert.match(container.text, /1 source/u);
       const cards = container.descendants().filter(element => element.tag === "article");
       assert.deepEqual(cards.map(card => card.descendants().find(element => element.tag === "h3")?.text),
-        ["GPT-6 Astra", "GPT-6.1 Sol", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
+        ["GPT-6 Astra", "GPT-6 Sol", "GPT-6 Luna", "GPT-5.6 Terra", "GPT-5.6 Sol", "GPT-5.6 Luna"]);
       assert.doesNotMatch(container.text, /GPT-5.5/u);
-      assert.match(cards[1].text, /No published estimate yet/u);
-      assert.match(cards[4].text, /No published estimate yet/u);
+      // GPT-6.1 Sol has no estimate here, so the page does not name it at all.
+      assert.doesNotMatch(container.text, /GPT-6\.1 Sol/u);
+      assert.match(cards[3].text, /No published estimate yet/u);
       assert.match(cards[0].text.trim(), /^GPT-6 Astra/u);
       assert.match(cards[0].className, /allowance-model-astra/u);
       assert.ok(cards.every(card => !/\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2}, \d{4}\b/u.test(card.text)),
