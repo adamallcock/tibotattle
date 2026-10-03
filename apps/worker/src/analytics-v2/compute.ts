@@ -275,8 +275,7 @@ export interface ComputeAnalyticsV2Input {
    * loader, occurrencesByOwner holds non-effective owners only and
    * ownerEvidence is required.
    */
-  readonly loadOwnerOccurrences?: (ownerDigest: AnalyticsV2OwnerDigest, range: AnalyticsV2DayRange) =>
-    Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
+  readonly loadOwnerOccurrences?: AnalyticsV2OwnerLoader;
   /**
    * Exact per-day evidence counts of every effective owner over the read
    * range (A-1 countOwnerOccurrences). Required with a loader and refused
@@ -341,6 +340,23 @@ export interface ComputeAnalyticsV2Input {
   readonly ownerPool?: AnalyticsV2OwnerPool;
 }
 
+/**
+ * One effective owner's occurrences over an inclusive range. Called with two
+ * arguments it resolves to the range's days (inline). An owner pool may pass
+ * `onPart` (K-PAR-MEM): each read call's days of one stream then go to it as
+ * they are read, with the call's ordinal in the sequential read order, and the
+ * call resolves to null; the receiver merges the parts in ordinal order
+ * (cloud-run/analytics-refresh-read.mjs mergeAnalyticsRefreshOccurrencePart),
+ * which builds the inline map.
+ */
+export type AnalyticsV2OwnerLoader = (ownerDigest: AnalyticsV2OwnerDigest, range: AnalyticsV2DayRange,
+  onPart?: AnalyticsV2OccurrencePartSink) => Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences> | null>;
+
+/** Receives one read call's days of one stream, with its ordinal (K-PAR-MEM streamed loads). */
+export type AnalyticsV2OccurrencePartSink = (stream: "usage" | "quota" | "session",
+  days: ReadonlyMap<AnalyticsV2Day, readonly AnalyticsV2DayOccurrences["usage"][number][]>,
+  ordinal: number) => void | Promise<void>;
+
 /** One admitted effective owner handed to an owner pool (structured-clone safe). */
 export interface AnalyticsV2OwnerTask {
   /** The owner's index among the run's effective owners (its checkpoint index). */
@@ -369,7 +385,8 @@ export interface AnalyticsV2OwnerPool {
    * scalar and model events (and may throw: the task then fails).
    */
   compute(task: AnalyticsV2OwnerTask, context: AnalyticsV2OwnerRunContext, io: {
-    readonly load: (span: AnalyticsV2DaySpan) => Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>;
+    readonly load: (span: AnalyticsV2DaySpan, onPart?: AnalyticsV2OccurrencePartSink) =>
+      Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences> | null>;
     readonly progress: (event: AnalyticsV2OwnerProgress) => void;
     readonly started: () => void;
   }): Promise<AnalyticsV2OwnerTaskResult>;
@@ -783,7 +800,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         evidence: Object.freeze([...evidenceByOwner.get(ownerDigest)!].sort(([left], [right]) => (left < right ? -1 : 1))),
         estimateBytes: estimate.estimateBytes });
       const result = ownerPool.compute(task, ownerContext, {
-        load: (span) => loader!(ownerDigest, span),
+        load: (span, onPart) => loader!(ownerDigest, span, onPart),
         // The Worker does not hold the account: its events carry the main thread's.
         progress: (event) => checkpoint(withOwnerIndex({ ...event, accountBytes: accountBytes + pendingBytes },
           taskIndex)),
@@ -852,7 +869,11 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
         context: ownerContext,
         owner,
         evidence,
-        load: loader === undefined ? null : (span) => loader(ownerDigest, span),
+        load: loader === undefined ? null : async (span) => {
+          const days = await loader(ownerDigest, span);
+          if (days === null) invalid("loadOwnerOccurrences");
+          return days!;
+        },
         ...(loader === undefined ? { occurrences: input.occurrencesByOwner.get(ownerDigest)! } : {}),
         hooks: {
           emit: merge,

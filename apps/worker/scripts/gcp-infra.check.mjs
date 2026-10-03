@@ -200,7 +200,7 @@ test("render makes no call and shows the estate", async () => {
   assert.equal(withImage.jobs["production-migrate"].kind, "Job");
   // The analytics-refresh job renders the production refresh-job contract.
   assert.deepEqual(withImage.jobs["analytics-refresh"].spec.template.spec.template.spec.containers[0].args,
-    ["--max-old-space-size=12288", "--max-semi-space-size=64", "dist/analytics-refresh.mjs", "--mode=full"]);
+    ["dist/analytics-refresh.mjs", "--mode=full", "--workers=4"]);
   // The maintenance job renders C-MAINT's job contract (D-OPS4), secrets by reference only.
   assert.deepEqual(withImage.jobs.maintenance.spec.template.spec.template.spec.containers[0].args,
     ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);

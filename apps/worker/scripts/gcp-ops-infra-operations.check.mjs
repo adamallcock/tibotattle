@@ -270,7 +270,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
       "--region=us-east1", `--member=${desired.serviceAccounts.scheduler.member}`, "--role=roles/run.jobsExecutor"]);
   const refresh = JSON.parse(byId.get("run-job:create:analytics-refresh").file.content);
   assert.deepEqual(refresh.spec.template.spec.template.spec.containers[0].args,
-    ["--max-old-space-size=12288", "--max-semi-space-size=64", "dist/analytics-refresh.mjs", "--mode=full"]);
+    ["dist/analytics-refresh.mjs", "--mode=full", "--workers=4"]);
   assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]), [
     ["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"],
     [EXECUTOR(desired), "SCHEDULER_CADENCE_UNSET"],

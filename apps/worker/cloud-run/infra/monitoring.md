@@ -227,6 +227,22 @@ also exits 0, so a succeeded execution does not count as a run. Check the
 trigger first (scheduler-quiet), then the job's failure line (`code`), then
 `LOCK_HELD`.
 
+The production job runs four compute Workers (K-PAR-MEM) with a 24 h task
+timeout. Their failure codes are closed and content-free:
+`ANALYTICS_V2_REFRESH_WORKER_OUT_OF_MEMORY` (an owner outgrew even the
+Workers' whole pool, after its one retry alone),
+`ANALYTICS_V2_REFRESH_WORKER_HEAP_LIMIT_UNAPPLIED` or
+`ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN` (a V8 heap flag reached
+the job, which would override the Workers' heap limits: check the rendered
+args and `NODE_OPTIONS`), and `ANALYTICS_V2_REFRESH_WORKER_POOL_INSUFFICIENT`
+(the main heap left the Workers less than the budget). A completed receipt's
+`memory.workerPool` reports the pool, how many owners were retried alone
+(`retriedAlone`, normally 0), the most Workers and loads at once and the
+largest observed GC-callback heap sample against its limit
+(`largestGcCallbackHeapPercentOfLimit`); a rising `retriedAlone` or a share near
+100 % means the Workers' heap model needs recalibrating before it fails a
+run.
+
 ## refresh-output-headroom
 
 **Ticket.** One policy, two conditions, read from what the refresh already

@@ -449,6 +449,84 @@ export function analyticsRefreshReadSpans(range, chunkDays, dayCounts, maxOccurr
   return spans;
 }
 
+/**
+ * Merge one read call's result (day -> occurrences of `stream`) into `byDay`
+ * (day -> {usage, quota, session}). The one merge both the inline read and a
+ * compute Worker's streamed load use (K-PAR-MEM), so a load builds the same
+ * map, with the same key order, wherever its parts are assembled.
+ */
+export function mergeAnalyticsRefreshOccurrencePart(byDay, stream, days) {
+  if (!OCCURRENCE_STREAMS.includes(stream) || !(days instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+  for (const [day, list] of days) {
+    const entry = byDay.get(day) ?? { usage: [], quota: [], session: [] };
+    entry[stream] = list;
+    byDay.set(day, entry);
+  }
+  return byDay;
+}
+
+/** Bounds of the read side's concurrent snapshot reads (K-PAR-MEM). */
+export const ANALYTICS_REFRESH_READ_CONCURRENCY = Object.freeze({ minimum: 1, maximum: 8 });
+
+/**
+ * Run `work(item, index)` for every item with at most `concurrency` running
+ * at once, in item order. The first failure stops new work; the call settles
+ * only after every started item has, then throws that failure, so no read
+ * outlives the call. Results are returned in item order.
+ */
+export async function analyticsRefreshForEachConcurrent(items, concurrency, work) {
+  if (!Number.isSafeInteger(concurrency) || concurrency < ANALYTICS_REFRESH_READ_CONCURRENCY.minimum
+      || concurrency > ANALYTICS_REFRESH_READ_CONCURRENCY.maximum) {
+    fail("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID");
+  }
+  const results = new Array(items.length);
+  let next = 0;
+  let failure = null;
+  const lane = async () => {
+    while (failure === null && next < items.length) {
+      const index = next++;
+      try {
+        results[index] = await work(items[index], index);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, items.length)) }, lane));
+  if (failure !== null) throw failure.error;
+  return results;
+}
+
+/**
+ * A counting semaphore of `size` slots: run(work) waits for a slot (first
+ * come, first served), runs work and frees the slot however it settles.
+ */
+export function analyticsRefreshSlots(size) {
+  if (!Number.isSafeInteger(size) || size < ANALYTICS_REFRESH_READ_CONCURRENCY.minimum
+      || size > ANALYTICS_REFRESH_READ_CONCURRENCY.maximum) {
+    fail("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID");
+  }
+  let free = size;
+  const waiting = [];
+  const release = () => {
+    const next = waiting.shift();
+    if (next === undefined) free += 1;
+    else next();
+  };
+  return Object.freeze({
+    size,
+    async run(work) {
+      if (free > 0) free -= 1;
+      else await new Promise((resolve) => { waiting.push(resolve); });
+      try {
+        return await work();
+      } finally {
+        release();
+      }
+    },
+  });
+}
+
 function requireFunction(module, name) {
   const value = module?.[name];
   if (typeof value !== "function") fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE", { missing: name });
@@ -574,30 +652,49 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
     return fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
   }
 
-  /** `rangesOf(stream)` -> the ranges to read; a range may carry a candidate bound. */
-  async function readOwnerDays(context, ownerDigest, rangesOf) {
-    const byDay = new Map();
-    for (const stream of OCCURRENCE_STREAMS) {
-      for (const range of rangesOf(stream)) {
-        const result = await readOccurrences(context, {
-          ownerDigest,
-          stream,
-          fromDay: range.fromDay,
-          throughDay: range.throughDay,
-          ...(range.maxCandidates === undefined ? {} : { maxCandidates: range.maxCandidates }),
-        });
-        if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
-        for (const [day, list] of result) {
-          if (!isDay(day) || day < range.fromDay || day > range.throughDay || !Array.isArray(list)) {
-            fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
-          }
-          const entry = byDay.get(day) ?? { usage: [], quota: [], session: [] };
-          entry[stream] = list;
-          byDay.set(day, entry);
+  /**
+   * `rangesOf(stream)` -> the ranges to read; a range may carry a candidate
+   * bound. Without `onPart` the calls run one at a time and their days are
+   * merged here and returned. With it (K-PAR-MEM: an owner computed in a
+   * Worker), its calls are started together and each runs when it holds one
+   * of `callSlots` (the loads' shared read slots, one per snapshot
+   * connection, so no call ever waits on the connection pool), and each
+   * call's result is handed to
+   * `onPart(stream, days, ordinal)` as soon as it is validated and nothing is
+   * kept, so the main heap holds the calls in flight, not the segment.
+   * `ordinal` is the call's place in the sequential order (streams usage,
+   * quota, session; ranges ascending); the receiver merges the parts in
+   * ordinal order with mergeAnalyticsRefreshOccurrencePart, so it builds the
+   * same map, with the same key order, as the sequential read.
+   */
+  async function readOwnerDays(context, ownerDigest, rangesOf, onPart = null, callSlots = null) {
+    const calls = OCCURRENCE_STREAMS.flatMap((stream) => rangesOf(stream).map((range) => ({ stream, range })));
+    const readCall = async ({ stream, range }) => {
+      const result = await readOccurrences(context, {
+        ownerDigest,
+        stream,
+        fromDay: range.fromDay,
+        throughDay: range.throughDay,
+        ...(range.maxCandidates === undefined ? {} : { maxCandidates: range.maxCandidates }),
+      });
+      if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+      for (const [day, list] of result) {
+        if (!isDay(day) || day < range.fromDay || day > range.throughDay || !Array.isArray(list)) {
+          fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
         }
       }
+      return result;
+    };
+    if (onPart === null) {
+      const byDay = new Map();
+      for (const call of calls) mergeAnalyticsRefreshOccurrencePart(byDay, call.stream, await readCall(call));
+      return byDay;
     }
-    return byDay;
+    await analyticsRefreshForEachConcurrent(calls, callSlots.size, async (call, ordinal) => {
+      const days = await callSlots.run(() => readCall(call));
+      await onPart(call.stream, days, ordinal);
+    });
+    return null;
   }
 
   /** One effective owner's exact counts per stream and day over `chunks` (A-1's own candidate selection). */
@@ -628,13 +725,34 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   }
 
   return Object.freeze({
-    async read({ pool, schema, nowMs, state, resources, checkpoint = () => {} }) {
+    /**
+     * `readConcurrency` (K-PAR-MEM, default 1): the owner-scoped reads before
+     * compute (first evidence days, exact counts, non-effective queued days)
+     * run on up to that many snapshot connections at once; their results are
+     * combined in owner order, so the inputs are the same at any value.
+     * `loadConcurrency` (default 1): owner loads that may run at once during
+     * compute (compute Workers); each load's read calls then target the read
+     * chunk divided by it, so the loads in flight together hold about one
+     * read chunk of occurrences in the main heap, as one load did.
+     */
+    async read({ pool, schema, nowMs, state, resources, checkpoint = () => {}, readConcurrency = 1,
+      loadConcurrency = 1 }) {
       const context = Object.freeze({ pool, schema, nowMs });
       const readChunk = resources?.readChunkOccurrences
         ?? ANALYTICS_REFRESH_DEFAULT_READ_CHUNK_OCCURRENCES;
       if (!Number.isSafeInteger(readChunk) || readChunk < 1 || readChunk > ANALYTICS_REFRESH_MAX_READ_CANDIDATES) {
         fail("ANALYTICS_V2_REFRESH_RESOURCES_INVALID");
       }
+      for (const value of [readConcurrency, loadConcurrency]) {
+        if (!Number.isSafeInteger(value) || value < ANALYTICS_REFRESH_READ_CONCURRENCY.minimum
+            || value > ANALYTICS_REFRESH_READ_CONCURRENCY.maximum) {
+          fail("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID");
+        }
+      }
+      const loadChunk = Math.max(1, Math.ceil(readChunk / loadConcurrency));
+      // The read calls of every streamed load share loadConcurrency slots, so
+      // at most that many run at once, whatever the loads in flight.
+      const callSlots = analyticsRefreshSlots(loadConcurrency);
       const listing = await listOwners(context);
       if (listing === null || typeof listing !== "object" || Array.isArray(listing)
           || !Array.isArray(listing.owners) || !Array.isArray(listing.unlinked)
@@ -687,13 +805,15 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // Production has no lower bound on cache history: start at the first
       // evidence day of any effective owner, whatever the queue holds.
       let firstEvidenceDay = null;
-      for (const owner of ownerList) {
-        if (owner.source !== "effective") continue;
+      const effectiveList = ownerList.filter((owner) => owner.source === "effective");
+      const firstDays = await analyticsRefreshForEachConcurrent(effectiveList, readConcurrency, async (owner) => {
         checkpoint(Object.freeze({ kind: "read" }));
         const first = await readFirstEvidenceDay(context, { ownerDigest: owner.ownerDigest, throughDay: today });
-        if (first === null) continue;
-        if (!isDay(first) || first > today) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
-        if (firstEvidenceDay === null || first < firstEvidenceDay) firstEvidenceDay = first;
+        if (first !== null && (!isDay(first) || first > today)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+        return first;
+      });
+      for (const first of firstDays) {
+        if (first !== null && (firstEvidenceDay === null || first < firstEvidenceDay)) firstEvidenceDay = first;
       }
       const cacheFromDay = analyticsRefreshCacheFromDay({
         today,
@@ -720,20 +840,31 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const streamCounts = new Map();
       const occurrencesByOwner = new Map();
       let nonEffectiveUnread = 0;
-      for (const owner of ownerList) {
+      // Read concurrently, combined below in owner order.
+      const perOwner = await analyticsRefreshForEachConcurrent(ownerList, readConcurrency, async (owner) => {
         checkpoint(Object.freeze({ kind: "read" }));
         if (owner.source === "effective") {
-          const counted = await countOwnerEvidence(context, owner.ownerDigest, fullRange);
-          ownerEvidence.set(owner.ownerDigest, counted.evidence);
-          streamCounts.set(owner.ownerDigest, counted.byStream);
-        } else if (hasTypedEvidence(owner)) {
-          try {
-            occurrencesByOwner.set(owner.ownerDigest, await readOwnerDays(context, owner.ownerDigest, () => queuedSpans));
-          } catch (error) {
-            // Fail closed for publication only: unread, A-2 blocks every queued day.
-            if (!isSourceError(error)) throw error;
-            nonEffectiveUnread += 1;
-          }
+          return { counted: await countOwnerEvidence(context, owner.ownerDigest, fullRange) };
+        }
+        if (!hasTypedEvidence(owner)) return null;
+        try {
+          return { days: await readOwnerDays(context, owner.ownerDigest, () => queuedSpans) };
+        } catch (error) {
+          // Fail closed for publication only: unread, A-2 blocks every queued day.
+          if (!isSourceError(error)) throw error;
+          return { unread: true };
+        }
+      });
+      for (const [index, owner] of ownerList.entries()) {
+        const value = perOwner[index];
+        if (value === null) continue;
+        if (value.counted !== undefined) {
+          ownerEvidence.set(owner.ownerDigest, value.counted.evidence);
+          streamCounts.set(owner.ownerDigest, value.counted.byStream);
+        } else if (value.days !== undefined) {
+          occurrencesByOwner.set(owner.ownerDigest, value.days);
+        } else {
+          nonEffectiveUnread += 1;
         }
       }
 
@@ -771,11 +902,15 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const loadSavedContributions = (keys) => readSavedValues(context, keys);
 
       // One effective owner's occurrences over one A-2 segment (the whole
-      // range when none is named), in spans of about the read chunk by its
-      // exact counts. Called by A-2 only while the run's read snapshot is open
-      // (runAnalyticsRefresh closes it after compute).
+      // range when none is named), in spans of about the per-load chunk by
+      // its exact counts. Called by A-2 only while the run's read snapshot is
+      // open (runAnalyticsRefresh closes it after compute). With `onPart`
+      // (a compute Worker's load) the read calls run on the loads' shared
+      // slots, up to loadConcurrency at once, each call's days go to onPart
+      // with its ordinal, and the call resolves to null (readOwnerDays).
       let loadWallMs = 0;
-      const loadOwnerOccurrences = async (ownerDigest, segment = occurrenceRange) => {
+      const loadOwnerOccurrences = async (ownerDigest, segment = occurrenceRange, onPart = null) => {
+        if (onPart !== null && typeof onPart !== "function") fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
         const counts = streamCounts.get(ownerDigest);
         if (counts === undefined) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
         if (segment === null || typeof segment !== "object" || !isDay(segment.fromDay) || !isDay(segment.throughDay)
@@ -787,14 +922,15 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         const started = performance.now();
         try {
           return await readOwnerDays(context, ownerDigest, (stream) =>
-            analyticsRefreshReadSpans(bounded, chunkDays, counts[stream], readChunk).map((span) => ({
+            analyticsRefreshReadSpans(bounded, chunkDays, counts[stream], loadChunk).map((span) => ({
               fromDay: span.fromDay,
               throughDay: span.throughDay,
-              maxCandidates: Math.min(ANALYTICS_REFRESH_MAX_READ_CANDIDATES, Math.max(readChunk, span.occurrences)),
-            })));
+              maxCandidates: Math.min(ANALYTICS_REFRESH_MAX_READ_CANDIDATES, Math.max(loadChunk, span.occurrences)),
+            })), onPart, onPart === null ? null : callSlots);
         } finally {
-          // Main-thread wall time of the owner loads (K-PGSTAT), whichever
-          // thread computes the owner.
+          // Main-thread time of the owner loads (K-PGSTAT), whichever thread
+          // computes the owner; concurrent loads add their times, as the
+          // statement ledger adds its round trips.
           loadWallMs += performance.now() - started;
         }
       };

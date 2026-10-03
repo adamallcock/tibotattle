@@ -674,23 +674,41 @@ test("resources: environment within bounds, and a heap partitioned into budget, 
   // largest, about 9.4 GiB of output budget instead of 351 MiB.
   assert.equal(resources.analyticsV2OutputBudget(denseResources.compute, 1_517 * MIB, true),
     denseResources.compute.outputBudgetBytes + (dense.memoryBudgetMiB - 1_517) * MIB);
-  // The production profile is inline (K-CORE-A review: no compute Workers
-  // before MEAS-3 measures their heap peaks on real owners).
-  assert.equal(dense.workers, 1);
-  assert.equal(dense.heapMiB, inlineHeapMiB);
-  // K-PAR (the test-deploy profile dense-workers, for MEAS-3): with four
-  // Workers the budget is not in the 3,072 MiB main heap, which holds the
-  // reserves and the output account (no reclaim).
-  const parallelHeapMiB = 3_072;
+  // The production profile runs four compute Workers with no heap flag
+  // (K-PAR-MEM, owner decisions round 17); the inline 12,288 MiB profile above
+  // is the measured fallback.
+  assert.equal(dense.workers, 4);
+  assert.equal(dense.heapMiB, null);
+  // With four Workers the budget is not in the main heap (V8's default for
+  // the task, about 4,144 MiB), which holds the reserves and the output
+  // account (no reclaim); the Workers share the rest of the task less the
+  // native reserve.
+  const parallelHeapMiB = job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB;
   const parallel = job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (parallelHeapMiB + 48) * MIB,
-    { workers: 4 });
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, parallelHeapMiB * MIB, { workers: 4 });
   assert.equal(parallel.workers, 4);
   assert.equal(parallel.compute.memoryBudgetBytes, dense.memoryBudgetMiB * MIB);
-  assert.equal(parallel.compute.outputBudgetBytes, (parallelHeapMiB + 48 - 256) * MIB - 250_000 * 4_096);
+  assert.equal(parallel.compute.outputBudgetBytes, (parallelHeapMiB - 256) * MIB - 250_000 * 4_096);
+  assert.deepEqual({ ...parallel.workerPool }, { poolBytes: (16_384 - 1_024 - parallelHeapMiB) * MIB, loadConcurrency: 3 });
+  assert.equal(job.analyticsRefreshResources({}, parallelHeapMiB * MIB, { workers: 2 }).workerPool.loadConcurrency, 2);
+  assert.equal(job.analyticsRefreshResources({}, 8_192 * MIB).workerPool, null, "inline has no pool");
   assert.throws(() => job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, (parallelHeapMiB + 48) * MIB),
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, parallelHeapMiB * MIB),
   { code: "ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT" }, "inline, the budget does not fit the parallel heap");
+  // A main heap that leaves the Workers less than the budget plus one
+  // Worker's overhead is refused, and so is any V8 heap flag with Workers:
+  // V8 applies it to every isolate, overriding the Workers' limits.
+  assert.throws(() => job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(dense.memoryBudgetMiB) }, 5_000 * MIB, { workers: 4 }),
+  { code: "ANALYTICS_V2_REFRESH_WORKER_POOL_INSUFFICIENT" });
+  for (const flags of [{ execArgv: ["--max-old-space-size=3072"] }, { execArgv: ["--max_heap_size=9000"] }]) {
+    assert.throws(() => job.analyticsRefreshResources({}, parallelHeapMiB * MIB, { workers: 4, ...flags }),
+      { code: "ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN" });
+  }
+  assert.throws(() => job.analyticsRefreshResources({ NODE_OPTIONS: "--max-old-space-size=3072" }, parallelHeapMiB * MIB,
+    { workers: 4 }), { code: "ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN" });
+  assert.equal(job.analyticsRefreshResources({}, (inlineHeapMiB + 48) * MIB,
+    { execArgv: ["--max-old-space-size=12288"] }).workers, 1, "inline keeps its heap flag");
   for (const workers of [0, 17, 1.5]) {
     assert.throws(() => job.analyticsRefreshResources({}, 64 * 1_024 * MIB, { workers }),
       { code: "ANALYTICS_V2_REFRESH_WORKERS_INVALID" });
@@ -741,28 +759,29 @@ test("the production profile's output budget holds the stated roster and history
   const MIB = 1_048_576;
   const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
   const projection = ANALYTICS_REFRESH_OUTPUT_PROJECTION;
-  // The old-space size, not V8's slightly larger limit: the pin errs low.
-  const partition = job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, profile.heapMiB * MIB,
-    { workers: profile.workers }).compute;
-  assert.equal(profile.workers, 1, "the production profile is inline");
-  assert.ok(projection.largestOwnerEstimateMiB * MIB <= partition.memoryBudgetBytes, "the largest owner is admitted");
-  const outputBudget = resources.analyticsV2OutputBudget(partition, projection.largestOwnerEstimateMiB * MIB, true);
   const perDay = projection.denseOwners * projection.denseBytesPerOwnerDay
     + projection.lightOwners * projection.lightBytesPerOwnerDay;
   const projected = perDay * projection.historyDays;
-  assert.ok(projected <= outputBudget,
-    `projected ${Math.ceil(projected / MIB)} MiB over an output budget of ${Math.floor(outputBudget / MIB)} MiB`);
-  // The horizon the profile holds for this roster, recorded in the receipt:
+  // The production profile runs four compute Workers (K-PAR-MEM): the owners'
+  // heaps are the Workers', so the main heap's output budget does not depend
+  // on the largest owner (no reclaim). V8's default heap for the task holds
+  // the reserves and that budget: 2,291 days of this roster.
+  assert.equal(profile.workers, 4, "the production profile runs compute Workers");
+  const parallel = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB * MIB,
+    { workers: profile.workers }).compute;
+  assert.ok(projection.largestOwnerEstimateMiB * MIB <= parallel.memoryBudgetBytes, "the largest owner is admitted");
+  assert.ok(projected <= parallel.outputBudgetBytes,
+    `projected ${Math.ceil(projected / MIB)} MiB over an output budget of ${Math.floor(parallel.outputBudgetBytes / MIB)} MiB`);
+  assert.equal(Math.floor(parallel.outputBudgetBytes / perDay), 2_291);
+  // The inline fallback (a 12,288 MiB heap, the budget inside it, reclaim):
   // 641 days at the high-end estimate, against 238 without the reclaim.
+  const partition = job.analyticsRefreshResources(
+    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, 12_288 * MIB).compute;
+  const outputBudget = resources.analyticsV2OutputBudget(partition, projection.largestOwnerEstimateMiB * MIB, true);
+  assert.ok(projected <= outputBudget);
   assert.equal(Math.floor(outputBudget / perDay), 641);
   assert.equal(Math.floor(partition.outputBudgetBytes / perDay), 238);
-  // K-PAR's dense-workers profile (3,072 MiB main heap, four Workers; MEAS-3
-  // only): the owners' heaps are the Workers', so the main heap's output
-  // budget does not depend on the largest owner (no reclaim): 1,447 days.
-  const parallel = job.analyticsRefreshResources(
-    { ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.memoryBudgetMiB) }, 3_072 * MIB, { workers: 4 }).compute;
-  assert.equal(Math.floor(parallel.outputBudgetBytes / perDay), 1_447);
 });
 
 test("read spans: contiguous, at most the day bound, and about the read chunk by the exact counts", () => {
@@ -3972,7 +3991,7 @@ test("production target: the closed contract reads the six variables and the den
       database: "tibotattle",
       schema: "tibotattle_runtime",
       iamUser: "example-runtime@example-ops-prod1.iam",
-      taskTimeoutSeconds: 14_400,
+      taskTimeoutSeconds: 86_400,
     });
     assert.deepEqual({ ...await job.resolveAnalyticsRefreshDatabase(env, { schema: "tibotattle_runtime" }) }, {
       kind: "cloud-sql", target, instanceConnectionName: env.PRIMARY_INSTANCE_CONNECTION_NAME,
@@ -3980,7 +3999,7 @@ test("production target: the closed contract reads the six variables and the den
     // The schema is PRIMARY_SCHEMA and nothing else.
     await assert.rejects(job.resolveAnalyticsRefreshDatabase(env, { schema: "tibotattle_other" }),
       { code: "ANALYTICS_V2_REFRESH_TARGET_FORBIDDEN" });
-    assert.equal(job.analyticsRefreshTaskTimeoutMs(env, read), 14_400_000);
+    assert.equal(job.analyticsRefreshTaskTimeoutMs(env, read), 86_400_000);
   }
   // The contract C-INFRA renders.
   assert.deepEqual([...job.ANALYTICS_REFRESH_PRODUCTION_ENV], ["ANALYTICS_REFRESH_TARGET",
@@ -3989,26 +4008,25 @@ test("production target: the closed contract reads the six variables and the den
   const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
   assert.deepEqual({ cpu: profile.cpu, memory: profile.memory, heapMiB: profile.heapMiB,
     memoryBudgetMiB: profile.memoryBudgetMiB, taskTimeoutSeconds: profile.taskTimeoutSeconds, tasks: profile.tasks,
-    maxRetries: profile.maxRetries, workers: profile.workers }, { cpu: "4", memory: "16Gi", heapMiB: 12_288,
-    memoryBudgetMiB: 10_752, taskTimeoutSeconds: 14_400, tasks: 1, maxRetries: 0, workers: 1 });
-  // Inline until MEAS-3 measures the compute Workers on real owners (K-CORE-A review).
-  // V8's semi-space is 64 MiB (owner decisions round 19, item SEMI).
-  assert.equal(profile.semiSpaceMiB, 64);
-  assert.deepEqual([...profile.args], ["--max-old-space-size=12288", "--max-semi-space-size=64",
-    "dist/analytics-refresh.mjs", "--mode=full"]);
+    maxRetries: profile.maxRetries, workers: profile.workers }, { cpu: "4", memory: "16Gi", heapMiB: null,
+    memoryBudgetMiB: 10_752, taskTimeoutSeconds: 86_400, tasks: 1, maxRetries: 0, workers: 4 });
+  // Four compute Workers and no heap flag (K-PAR-MEM, owner decisions round 17).
+  assert.deepEqual([...profile.args], ["dist/analytics-refresh.mjs", "--mode=full", "--workers=4"]);
+  assert.equal(profile.args.some((arg) => job.ANALYTICS_REFRESH_V8_HEAP_FLAG.test(arg)), false);
   // The rendered invocation parses to the real clock and PRIMARY_SCHEMA.
-  const parsed = job.parseAnalyticsRefreshArguments(profile.args.slice(3), productionEnvironment());
+  const parsed = job.parseAnalyticsRefreshArguments(profile.args.slice(1), productionEnvironment());
   assert.deepEqual({ ...parsed }, { help: false, mode: "full", schema: "tibotattle_runtime", nowMs: null,
-    revisionSeed: 0, workers: 1 });
-  // The profile's old space holds the budget, the reserves and the minimum
-  // output budget, and the task memory all of it and the young generation
-  // with room for native memory.
+    revisionSeed: 0, workers: 4 });
+  // V8's default heap for the task holds the reserves and the minimum output
+  // budget; the Workers' pool (the task less that heap and the native
+  // reserve) holds the budget's largest owner alone.
   const MIB = 1_048_576;
+  const heap = job.ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB * MIB;
+  const resources = job.analyticsRefreshResources(productionEnvironment(), heap, { workers: profile.workers });
+  assert.ok(resources.requiredHeapBytes <= heap);
   const memory = job.ANALYTICS_REFRESH_TASK_MEMORY_CHECK;
-  const youngMiB = memory.youngGenerationSemiSpaces * profile.semiSpaceMiB;
-  assert.ok(job.analyticsRefreshResources(productionEnvironment(), (profile.heapMiB + youngMiB) * MIB,
-    { workers: profile.workers, execArgv: profile.args.slice(0, 2) }).requiredHeapBytes <= profile.heapMiB * MIB);
-  assert.ok(profile.heapMiB + youngMiB <= memory.taskMemoryMiB - memory.nativeReserveMiB);
+  assert.equal(resources.workerPool.poolBytes, (memory.taskMemoryMiB - memory.nativeReserveMiB) * MIB - heap);
+  assert.ok(resources.workerPool.poolBytes >= job.analyticsRefreshWorkerPoolMinimumBytes(profile.memoryBudgetMiB * MIB));
 });
 
 test("production target: C-REFRESH's contract alone governs the job; CR-3 has no analytics-job profile", async () => {
@@ -4204,6 +4222,41 @@ test("time guard (K-PAR): remaining owners are spread over the workers, never fa
   }
   assert.throws(() => parallel.checkpoint({ kind: "ownerDone", index: 9, accountBytes: 0 }),
     { code: "ANALYTICS_V2_REFRESH_DEADLINE_INVALID" });
+});
+
+test("time guard at the 24 h production timeout: the production-shaped roster plans its largest owner; growth is refused", () => {
+  const model = job.ANALYTICS_REFRESH_TIME_MODEL;
+  const profile = job.ANALYTICS_REFRESH_PRODUCTION_JOB;
+  assert.equal(profile.taskTimeoutSeconds, 86_400);
+  const timeoutMs = profile.taskTimeoutSeconds * 1_000;
+  const clock = 1_000_000;
+  const guardAt = () => job.createAnalyticsRefreshTimeGuard({ startedAtMs: clock, taskTimeoutMs: timeoutMs,
+    wallClock: () => clock });
+  // The production-shaped synthetic corpus (MEAS-SYNTH, 2026-10-03): its
+  // largest owner (2,500,708 occurrences, 1,148,616 analysis usage rows) and
+  // the other 52 owners (5,609,052 and 2,883,707 together) as four equal parts.
+  const largest = { ownerDigest: OWNER_A, admitted: true, occurrences: 2_500_708, analysisUsage: 1_148_616 };
+  const rest = [1, 2, 3, 4].map((part) => ({ ownerDigest: digest(`rest-${part}`), admitted: true,
+    occurrences: 5_609_052 / 4, analysisUsage: 2_883_707 / 4 }));
+  const owners = [largest, ...rest];
+  const ms = (owner) => (model.readMsPerOccurrence + model.prepareMsPerOccurrence) * owner.occurrences
+    + (model.scalarMsPerAnalysisUsage + model.modelMsPerAnalysisUsage) * owner.analysisUsage;
+  const guard = guardAt();
+  guard.checkpoint({ kind: "plan", owners, workers: profile.workers });
+  // Four Workers: never faster than the largest owner alone, about 1.2 h at the local rates.
+  const total = owners.reduce((sum, owner) => sum + ms(owner), 0);
+  const planned = Math.max(total / profile.workers, ...owners.map(ms));
+  assert.equal(planned, ms(largest), "the largest owner is the critical path");
+  assert.equal(guard.summary().plannedSeconds, Math.ceil(planned / 1_000));
+  assert.ok(planned < 2 * 3_600_000 && planned > 3_600_000);
+  // The refusal point keeps the exit margin and the write projection before the 24 h kill.
+  const refuseAt = clock + timeoutMs - model.exitMarginMs - model.writeFixedMs;
+  assert.equal(refuseAt - clock, 86_400_000 - model.exitMarginMs - model.writeFixedMs);
+  // A corpus that could not finish in 24 h even at the local rates is refused at its plan,
+  // before any owner is read: here every owner twenty times as large.
+  const grown = (owner) => ({ ...owner, occurrences: owner.occurrences * 20, analysisUsage: owner.analysisUsage * 20 });
+  assert.throws(() => guardAt().checkpoint({ kind: "plan", owners: owners.map(grown), workers: 4 }),
+    (error) => error.code === "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" && error.deadline.taskTimeoutSeconds === 86_400);
 });
 
 test("time guard: refuses a hopeless plan, an owner that cannot finish and a step that could cross the deadline", () => {
@@ -4420,7 +4473,7 @@ test("PG17: the production target path runs a full refresh on the real clock and
     assert.deepEqual(databases.map(({ kind, target, database, iamUser }) => ({ kind, target, database, iamUser })),
       [{ kind: "cloud-sql", target: "production", database: "tibotattle", iamUser: "example-runtime@example-ops-prod1.iam" }]);
     // The profile's task timeout arms the time guard.
-    assert.deepEqual(run.timeGuard, { taskTimeoutSeconds: 14_400, plannedSeconds: null });
+    assert.deepEqual(run.timeGuard, { taskTimeoutSeconds: 86_400, plannedSeconds: null });
     assert.equal((await runRows(pool, schema)).length, 1);
   });
 });

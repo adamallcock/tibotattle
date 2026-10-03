@@ -192,12 +192,15 @@ test("migrate and refresh Jobs carry the exact database targets, identities and 
   expectCode(() => refreshJobCommand({ image: IMAGE, extraEnv: [["bad-key", "1"]] }), "FASTPATH_DEPLOY_ENV_INVALID");
 });
 
+/** V8's default heap limit for a 16 GiB task under Node 22.16.0 (measured: heap_size_limit without a flag). */
+const V8_DEFAULT_HEAP_LIMIT_MIB = 4_144;
+
 test("refresh profiles: the standard Job stays the default; the dense Jobs are 4 vCPU, 16 GiB with a fitting budget", () => {
   assert.equal(REFRESH_JOB_RESOURCES, REFRESH_JOB_PROFILES.standard);
   assert.deepEqual(Object.keys(REFRESH_JOB_PROFILES), ["standard", "dense", "dense-workers"]);
   assert.deepEqual(refreshJobCommand({ image: IMAGE }), refreshJobCommand({ image: IMAGE, profile: "standard" }));
   const dense = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense" });
-  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
+  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=86400s", "--max-retries=0"]) {
     assert.equal(dense.includes(flag), true, flag);
   }
   // The dense profile is the production profile: inline (no --workers), with
@@ -205,17 +208,16 @@ test("refresh profiles: the standard Job stays the default; the dense Jobs are 4
   assert.equal(dense.some((arg) => arg.startsWith(
     "--args=--max-old-space-size=12288,--max-semi-space-size=64,dist/analytics-refresh.mjs,")
     && !arg.includes("--workers")), true);
-  assert.equal(REFRESH_JOB_PROFILES.dense.semiSpaceMiB, ANALYTICS_REFRESH_PRODUCTION_JOB.semiSpaceMiB);
-  // dense-workers is the MEAS-3 measurement of the compute Workers (K-PAR):
-  // the same task and budget, a 3,072 MiB main heap and four Workers.
+  // dense-workers runs the compute Workers (K-PAR): the same task and budget,
+  // four Workers and NO heap flag, which would override the Workers' limits
+  // (K-PAR-MEM; the Job refuses one with --workers > 1).
   const workers = refreshJobCommand({ image: IMAGE, now: "2026-10-01T12:46:00Z", profile: "dense-workers" });
-  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=14400s", "--max-retries=0"]) {
+  for (const flag of ["--cpu=4", "--memory=16Gi", "--task-timeout=86400s", "--max-retries=0"]) {
     assert.equal(workers.includes(flag), true, flag);
   }
-  // No semi-space flag with compute Workers: a V8 flag reaches every Worker isolate (K-PAR-MEM's to settle).
-  assert.equal(workers.some((arg) => arg.startsWith("--args=--max-old-space-size=3072,dist/analytics-refresh.mjs,")
+  assert.equal(workers.some((arg) => arg.startsWith("--args=dist/analytics-refresh.mjs,")
     && arg.endsWith(",--workers=4")), true);
-  assert.equal(workers.some((arg) => arg.includes("--max-semi-space-size")), false);
+  assert.equal(workers.some((arg) => arg.includes("--max-old-space-size")), false);
   assert.equal(workers.some((arg) => arg.startsWith("--set-env-vars=")
     && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")), true);
   assert.equal(dense.some((arg) => arg.startsWith("--set-env-vars=") && arg.includes("ANALYTICS_V2_MEMORY_BUDGET_MIB=10752")
@@ -228,23 +230,22 @@ test("refresh profiles: the standard Job stays the default; the dense Jobs are 4
   const MIB = 1_048_576;
   for (const [name, profile] of Object.entries(REFRESH_JOB_PROFILES)) {
     const env = Object.fromEntries(profile.env);
-    // The job's own start-up guard accepts the profile's old space for its
-    // budget (the young generation, 3 semi-spaces at 16 MiB by default, is
-    // not counted toward it)...
-    const youngMiB = ANALYTICS_REFRESH_TASK_MEMORY_CHECK.youngGenerationSemiSpaces * (profile.semiSpaceMiB ?? 16);
-    const execArgv = [`--max-old-space-size=${profile.heapMiB}`,
-      ...(profile.semiSpaceMiB === null ? [] : [`--max-semi-space-size=${profile.semiSpaceMiB}`])];
-    const resources = analyticsRefreshResources(env, (profile.heapMiB + youngMiB) * MIB,
-      { workers: profile.workers, execArgv });
-    assert.equal(resources.youngGenerationBytes, youngMiB * MIB, name);
-    assert.ok(resources.requiredHeapBytes <= profile.heapMiB * MIB, name);
-    // ...and Cloud Run's memory holds the heap (old space and young
-    // generation), the compute Workers' heap limits (K-PAR: together at most
-    // the budget plus one reserve; inline the budget is inside the heap) plus
-    // at least 1 GiB of native memory.
-    const workerMiB = profile.workers > 1
-      ? resources.compute.memoryBudgetBytes / MIB + ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES / MIB : 0;
-    assert.ok(Number.parseInt(profile.memory, 10) * 1024 - profile.heapMiB - youngMiB - workerMiB >= 1_024, name);
+    // The job's own start-up guard accepts the profile's heap for its budget...
+    const taskMiB = Number.parseInt(profile.memory, 10) * 1024;
+    // A profile without a heap flag runs at V8's default heap limit for the
+    // task (about 4,144 MiB for 16 GiB under Node 22).
+    const heapMiB = profile.heapMiB ?? V8_DEFAULT_HEAP_LIMIT_MIB - 48;
+    assert.equal(profile.heapMiB === null, profile.workers > 1, `${name}: a heap flag only inline`);
+    const resources = analyticsRefreshResources(env, (heapMiB + 48) * MIB,
+      { workers: profile.workers, taskMemoryBytes: taskMiB * MIB });
+    assert.ok(resources.requiredHeapBytes <= heapMiB * MIB, name);
+    // ...and Cloud Run's memory holds the heap, the compute Workers' pool
+    // (K-PAR-MEM: the task memory the heap and the native reserve leave; the
+    // pool's admission keeps the Workers' heaps and overheads within it, and
+    // it runs the budget's largest owner alone; inline the budget is inside
+    // the heap) plus at least 1 GiB of native memory.
+    const workerMiB = profile.workers > 1 ? resources.workerPool.poolBytes / MIB : 0;
+    assert.ok(taskMiB - (heapMiB + 48) - workerMiB >= 1_024, name);
   }
   expectCode(() => refreshJobCommand({ image: IMAGE, profile: "huge" }), "FASTPATH_DEPLOY_REFRESH_PROFILE_INVALID");
 });
