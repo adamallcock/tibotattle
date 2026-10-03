@@ -585,7 +585,7 @@ test('an interrupted apply resumes from its journal and never re-issues a comple
   assert.equal(f.mutations().filter(call => call.method === 'PATCH').length, 1);
 });
 
-test('verify pins current bookmarks and R2 after a quiet window, tolerating writes before observation', async t => {
+test('verify pins fixed-timestamp bookmarks and R2 after a quiet window, tolerating writes before observation', async t => {
   const f = await fixture(t);
   const { planned, apply: applied_ } = await applied(f);
   // An in-flight pass finishing during cooldown, before the prospective observation.
@@ -882,6 +882,9 @@ test('the fence receipt reader enforces the closed shape, its own receipts direc
     missingLabel: value => { value.d1 = value.d1.slice(0, 3); },
     duplicateDatabase: value => { value.d1[1].idSha256 = value.d1[0].idSha256; },
     badBookmark: value => { value.d1[0].bookmark = 'x'; },
+    endpointDrift: value => { value.bookmarkTimestamp = value.window.end; },
+    endpointMissing: value => { delete value.bookmarkTimestamp; },
+    modeRelabeled: value => { value.bookmarkMode = 'current-literal'; },
     noFencedScripts: value => { value.fencedScripts = []; },
     fencedExtraKey: value => { value.fencedScripts[0].extra = 1; },
     fencedCron: value => { value.fencedScripts[0].crons = ['* * * * *']; },
@@ -1089,16 +1092,19 @@ test('history refuses missing anchors, duplicates, ambiguous order and racing cu
 });
 
 
-test('prospective observations use current mode only and cannot qualify a fence', async t => {
+test('prospective observations select one fixed timestamp and cannot qualify a fence', async t => {
   const f = await fixture(t);
   const beforeApply = f.world.calls.length;
   await assert.rejects(f.run('observe', { fence: 'a'.repeat(64) }), { code: 'FENCE_NOT_APPLIED' });
   assert.equal(f.world.calls.length, beforeApply);
   const { planned, observation } = await applied(f);
-  assert.equal(observation.receipt.bookmarkMode, 'current-literal');
+  assert.equal(observation.receipt.bookmarkMode, 'fixed-timestamp-literal');
+  assert.equal(observation.receipt.bookmarkTimestamp, iso(T0 + 15 * MINUTE));
   assert.equal(observation.receipt.completedAt, iso(T0 + 15 * MINUTE));
   assert.deepEqual(await receiptNames(f, 'fence-'), []);
-  assert.ok(f.world.calls.filter(call => call.href.includes('/time_travel/bookmark')).every(call => !call.href.includes('timestamp=')));
+  const captures = f.world.calls.filter(call => call.href.includes('/time_travel/bookmark'));
+  assert.equal(captures.length, 4);
+  assert.ok(captures.every(call => new URL(call.href).searchParams.get('timestamp') === observation.receipt.bookmarkTimestamp));
   f.world.now = VERIFY_AT;
   const before = f.world.calls.length;
   await assert.rejects(f.run('verify', { fence: planned.sha256, observation: undefined }), { code: 'FENCE_ARGUMENTS_INVALID' });
@@ -1117,6 +1123,10 @@ test('observation tamper, incomplete targets, cross-plan and future times refuse
     target: value => { value.d1[0].idSha256 = 'a'.repeat(64); },
     future: value => { value.completedAt = iso(VERIFY_AT + MINUTE); },
     reversed: value => { value.completedAt = iso(T0); },
+    backdated: value => { value.bookmarkTimestamp = iso(T0); },
+    afterCapture: value => { value.bookmarkTimestamp = iso(T0 + 16 * MINUTE); },
+    missingTimestamp: value => { delete value.bookmarkTimestamp; },
+    relabeled: value => { value.schema = 'cloudflare-writer-fence-observation-v1'; },
   };
   for (const [name, change] of Object.entries(cases)) {
     const f = await fixture(t);
@@ -1194,6 +1204,7 @@ test('legacy v1 receipts retain their original strict reader policy without obse
   value.schema = 'cloudflare-writer-fence-receipt-v1';
   delete value.observationSha256;
   delete value.bookmarkMode;
+  delete value.bookmarkTimestamp;
   const bytes = `${JSON.stringify(value)}\n`, digest = sha256(bytes);
   const path = join(f.receipts, `fence-${digest}.json`);
   await writeFile(path, bytes, { mode: 0o600 });
@@ -1202,4 +1213,51 @@ test('legacy v1 receipts retain their original strict reader policy without obse
   const changed = `${JSON.stringify(value)}\n`;
   await writeFile(path, changed, { mode: 0o600 });
   await assert.rejects(readCloudflareWriterFenceReceipt(path, sha256(changed)), { code: 'FENCE_RECEIPT_INVALID' });
+});
+
+test('fixed endpoints ignore current-mode drift and reread baseline before comparing lag-covered endpoint', async t => {
+  const f = await fixture(t);
+  const { planned, observation } = await applied(f);
+  f.world.now = VERIFY_AT;
+  const before = f.world.calls.length;
+  const verified = await f.run('verify', { fence: planned.sha256 });
+  const captures = f.world.calls.slice(before).filter(call => call.href.includes('/time_travel/bookmark'));
+  assert.equal(captures.length, 8);
+  assert.ok(captures.slice(0, 4).every(call => new URL(call.href).searchParams.get('timestamp') === observation.receipt.bookmarkTimestamp));
+  assert.ok(captures.slice(4).every(call => new URL(call.href).searchParams.get('timestamp') === verified.receipt.analytics.window.end));
+  assert.equal(verified.receipt.bookmarkTimestamp, verified.receipt.analytics.window.end);
+  assert.equal(Date.parse(verified.receipt.verifiedAt) - Date.parse(verified.receipt.bookmarkTimestamp), FENCE_ANALYTICS_LAG_MINUTES * MINUTE);
+  const fetcher = async (url, init) => {
+    if (String(url).includes('/time_travel/bookmark') && new URL(url).searchParams.get('timestamp') === observation.receipt.bookmarkTimestamp) {
+      return new Response(JSON.stringify({ success: true, errors: [], result: { bookmark: 'baseline-drift' } }), { status: 200 });
+    }
+    return f.world.fetcher(url, init);
+  };
+  await assert.rejects(f.run('verify', { fence: planned.sha256, fetcher }), { code: 'FENCE_NOT_QUIESCENT' });
+});
+
+test('legacy v2 reader retains current-mode observation and rejects relabeled fixed receipt', async t => {
+  const f = await fixture(t);
+  const { planned, observation } = await applied(f);
+  f.world.now = VERIFY_AT;
+  const verified = await f.run('verify', { fence: planned.sha256 });
+  const legacyObservation = structuredClone(observation.receipt);
+  legacyObservation.schema = 'cloudflare-writer-fence-observation-v1';
+  legacyObservation.bookmarkMode = 'current-literal';
+  delete legacyObservation.bookmarkTimestamp;
+  const observationBytes = `${JSON.stringify(legacyObservation)}\n`, observationDigest = sha256(observationBytes);
+  await writeFile(join(f.receipts, `observation-${observationDigest}.json`), observationBytes, { mode: 0o600 });
+  const value = structuredClone(verified.receipt);
+  value.schema = 'cloudflare-writer-fence-receipt-v2';
+  value.bookmarkMode = 'current-literal';
+  value.observationSha256 = observationDigest;
+  delete value.bookmarkTimestamp;
+  const bytes = `${JSON.stringify(value)}\n`, digest = sha256(bytes);
+  const path = join(f.receipts, `fence-${digest}.json`);
+  await writeFile(path, bytes, { mode: 0o600 });
+  assert.deepEqual(await readCloudflareWriterFenceReceipt(path, digest), value);
+  value.observationSha256 = observation.sha256;
+  const invalid = `${JSON.stringify(value)}\n`, invalidDigest = sha256(invalid);
+  await writeFile(path, invalid, { mode: 0o600 });
+  await assert.rejects(readCloudflareWriterFenceReceipt(path, invalidDigest), { code: 'FENCE_RECEIPT_INVALID' });
 });

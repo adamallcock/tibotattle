@@ -29,14 +29,14 @@ import { durablePrivateJson, identityDigest, operationError } from '../../../scr
  *   production Worker must already be fenced and its analytics drain
  *   complete (the drain is proved by HX-6, not here; the operator attests to
  *   it and the receipt says so). A released fence is never re-applied.
- * - observe --fence=<plan receipt sha256> (read-only): captures current-mode
+ * - observe --fence=<plan receipt sha256> (read-only): captures fixed-timestamp
  *   D1 bookmarks under checked fence/source pins after the apply cooldown.
  *   Its completion after all reads owns the prospective start; no fence proof.
  * - verify --fence=<plan receipt sha256> --observation=<receipt sha256>
  *   (read-only against the provider,
  *   serialised with apply and release): production Worker is one version at
  *   100% with EDGE_UPSTREAM_MODE='fenced' since the fence; zero schedules and
- *   paused delivery as observed; current-mode D1 bookmarks literally equal
+ *   paused delivery as observed; fixed-timestamp D1 bookmarks literally equal
  *   to the pinned observation over its prospective window; R2 quarantine digest equal to the baseline taken at apply, before
  *   any write; GraphQL rowsWritten/writeQueries 0 per listed database and no
  *   invocation of any fenced script over [start, end - analytics lag], an
@@ -52,8 +52,8 @@ import { durablePrivateJson, identityDigest, operationError } from '../../../scr
  * content-addressed or keyed by the plan receipt, and hold names, binding
  * types, id digests, crons, counts, bookmarks and digests only: never the
  * token, rows, R2 keys, variable text or addresses. GraphQL analytics are
- * provider-lagged corroboration; the D1 bookmarks are the authoritative
- * write-quiescence evidence.
+ * provider-lagged zero-event evidence; fixed-timestamp D1 bookmarks provide
+ * additional state evidence over the same lag-covered interval.
  */
 
 export const FENCE_PLAN_SCHEMA = 'cloudflare-writer-fence-plan-v1';
@@ -63,15 +63,18 @@ export const FENCE_PLAN_RECEIPT_SCHEMA = 'cloudflare-writer-fence-plan-receipt-v
 export const FENCE_APPLY_INTENT_SCHEMA = 'cloudflare-writer-fence-apply-intent-v1';
 export const FENCE_APPLY_RECEIPT_SCHEMA = 'cloudflare-writer-fence-apply-v1';
 export const FENCE_LEGACY_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v1';
-export const FENCE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v2';
-export const FENCE_OBSERVATION_SCHEMA = 'cloudflare-writer-fence-observation-v1';
-const BOOKMARK_MODE = 'current-literal';
+const FENCE_CURRENT_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v2';
+export const FENCE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-receipt-v3';
+const FENCE_CURRENT_OBSERVATION_SCHEMA = 'cloudflare-writer-fence-observation-v1';
+export const FENCE_OBSERVATION_SCHEMA = 'cloudflare-writer-fence-observation-v2';
+const CURRENT_BOOKMARK_MODE = 'current-literal';
+const BOOKMARK_MODE = 'fixed-timestamp-literal';
 export const FENCE_RELEASE_RECEIPT_SCHEMA = 'cloudflare-writer-fence-release-v1';
 export const FENCE_EDGE_MODE_BINDING = 'EDGE_UPSTREAM_MODE';
 export const FENCE_MIN_QUIET_WINDOW_MINUTES = 15;
 // Margin for provider analytics ingestion: GraphQL is queried only up to this
 // long before verify runs, and the receipt says which interval it covered.
-// A margin, not a provider-guaranteed bound; the bookmarks cover up to now.
+// A margin, not a provider-guaranteed bound; the endpoint equals the analytics end.
 export const FENCE_ANALYTICS_LAG_MINUTES = 5;
 
 // Label -> the live binding that proves it, so a plan can never fence (or
@@ -970,12 +973,15 @@ async function applyCommand({ client, plan, now, receiptsDirectory, confirm, ana
 
 // Time Travel exposes timestamp-selected and current bookmarks without a
 // cross-mode equality guarantee. Preserve opaque values literally and compare
-// two prospective current-mode observations only.
+// fixed timestamp selections literally. The API returns the nearest available
+// bookmark at/before a timestamp, without a freshness guarantee; the independent
+// zero-event analytics and all fence guards remain mandatory.
 // https://developers.cloudflare.com/api/resources/d1/subresources/database/subresources/time_travel/methods/get_bookmark/
-async function currentBookmarks(client, plan) {
+async function timestampBookmarks(client, plan, timestamp) {
+  if (isoMs(timestamp) === null) fail(RECEIPT_INVALID);
   const d1 = [];
   for (const [label, id] of Object.entries(plan.d1)) {
-    const result = await client.api(`/accounts/${plan.accountId}/d1/database/${id}/time_travel/bookmark`);
+    const result = await client.api(`/accounts/${plan.accountId}/d1/database/${id}/time_travel/bookmark?timestamp=${encodeURIComponent(timestamp)}`);
     if (!record(result) || typeof result.bookmark !== 'string' || !OPAQUE.test(result.bookmark)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
     d1.push({ label, idSha256: idDigest('d1', id), bookmark: result.bookmark });
   }
@@ -1020,16 +1026,19 @@ async function observeCommand({ client, plan, now, receiptsDirectory, fence }) {
   const before = await checkLive();
   const r2 = await client.r2Digest();
   if (!sameList(r2, apply.r2Baseline)) fail('FENCE_NOT_QUIESCENT');
-  const d1 = await currentBookmarks(client, plan);
+  const bookmarkAt = now();
+  if (!Number.isSafeInteger(bookmarkAt) || bookmarkAt < startedAt) fail(RECEIPT_INVALID);
+  const bookmarkTimestamp = iso(bookmarkAt);
+  const d1 = await timestampBookmarks(client, plan, bookmarkTimestamp);
   const after = await checkLive();
   if (!sameList(before.production, after.production)) fail('FENCE_INVENTORY_CHANGED');
   const completedAt = now();
-  if (!Number.isSafeInteger(completedAt) || completedAt < startedAt) fail(RECEIPT_INVALID);
+  if (!Number.isSafeInteger(completedAt) || completedAt < bookmarkAt) fail(RECEIPT_INVALID);
   if (await exists(releasePath)) fail('FENCE_RELEASED');
   const receipt = { schema: FENCE_OBSERVATION_SCHEMA, bookmarkMode: BOOKMARK_MODE,
     planSha256: plan.planSha256, planReceiptSha256: fence, applyReceiptSha256,
     accountSha256: idDigest('account', plan.accountId), fingerprintSha256: after.fingerprintSha256,
-    startedAt: iso(startedAt), completedAt: iso(completedAt),
+    startedAt: iso(startedAt), completedAt: iso(completedAt), bookmarkTimestamp,
     productionWorker: { name: plan.productionWorker, deploymentId: after.production.deploymentId,
       versionId: after.production.versionId, mode: 'fenced', sourceCommit: after.production.sourceCommit }, d1, r2 };
   checkObservation(receipt, apply, applyReceiptSha256);
@@ -1039,9 +1048,13 @@ async function observeCommand({ client, plan, now, receiptsDirectory, fence }) {
 
 function checkObservation(value, apply, applySha256) {
   exactKeys(value, ['schema', 'bookmarkMode', 'planSha256', 'planReceiptSha256', 'applyReceiptSha256',
-    'accountSha256', 'fingerprintSha256', 'startedAt', 'completedAt', 'productionWorker', 'd1', 'r2'], RECEIPT_INVALID);
+    'accountSha256', 'fingerprintSha256', 'startedAt', 'completedAt', 'productionWorker', 'd1', 'r2',
+    ...(value.schema === FENCE_OBSERVATION_SCHEMA ? ['bookmarkTimestamp'] : [])], RECEIPT_INVALID);
   const start = isoMs(value.startedAt), end = isoMs(value.completedAt);
-  if (value.schema !== FENCE_OBSERVATION_SCHEMA || value.bookmarkMode !== BOOKMARK_MODE
+  const fixed = value.schema === FENCE_OBSERVATION_SCHEMA;
+  if ((!fixed && value.schema !== FENCE_CURRENT_OBSERVATION_SCHEMA)
+      || value.bookmarkMode !== (fixed ? BOOKMARK_MODE : CURRENT_BOOKMARK_MODE)
+      || (fixed && (isoMs(value.bookmarkTimestamp) === null || isoMs(value.bookmarkTimestamp) < start || isoMs(value.bookmarkTimestamp) > end))
       || value.planSha256 !== apply.planSha256 || value.planReceiptSha256 !== apply.planReceiptSha256
       || value.applyReceiptSha256 !== applySha256 || value.fingerprintSha256 !== apply.fingerprintSha256
       || !SHA256.test(value.accountSha256 ?? '') || start === null || end === null || end < start
@@ -1070,6 +1083,7 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, obse
   checkApplyReceipt(apply, plan, fence);
   const quietMs = plan.quietWindowMinutes * 60_000;
   const endMs = now();
+  if (!Number.isSafeInteger(endMs)) fail(RECEIPT_INVALID);
   // Analytics stop a lag margin short of now; that interval must itself be a
   // full quiet window, so absent (not yet ingested) data is never the proof.
   const analyticsEndMs = endMs - FENCE_ANALYTICS_LAG_MINUTES * 60_000;
@@ -1101,7 +1115,10 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, obse
     return { name: spec.name, kind: spec.kind, crons, deliveryPaused };
   });
 
-  const d1 = await currentBookmarks(client, plan);
+  const baseline = await timestampBookmarks(client, plan, observed.bookmarkTimestamp);
+  if (!sameList(baseline, observed.d1)) fail('FENCE_NOT_QUIESCENT');
+  const bookmarkTimestamp = iso(analyticsEndMs);
+  const d1 = await timestampBookmarks(client, plan, bookmarkTimestamp);
   if (!sameList(d1, observed.d1)) fail('FENCE_NOT_QUIESCENT');
   const r2 = await client.r2Digest();
   if (r2.bucketSha256 !== apply.r2Baseline.bucketSha256 || r2.inventorySha256 !== apply.r2Baseline.inventorySha256
@@ -1144,6 +1161,7 @@ async function verifyCommand({ client, plan, now, receiptsDirectory, fence, obse
     applyReceiptSha256,
     observationSha256,
     bookmarkMode: BOOKMARK_MODE,
+    bookmarkTimestamp,
     accountSha256: idDigest('account', plan.accountId),
     verifiedAt: iso(endMs),
     productionWorker: { name: plan.productionWorker, deploymentId: inventory.production.deploymentId,
@@ -1279,8 +1297,11 @@ export async function runCloudflareWriterFence({ subcommand, plan: input, receip
 function checkFenceReceipt(value) {
   exactKeys(value, ['schema', 'planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256', 'verifiedAt',
     'productionWorker', 'fencedScripts', 'window', 'd1', 'r2', 'analytics',
-    ...(value.schema === FENCE_RECEIPT_SCHEMA ? ['observationSha256', 'bookmarkMode'] : [])], RECEIPT_INVALID);
-  if (value.schema === FENCE_RECEIPT_SCHEMA && (!SHA256.test(value.observationSha256 ?? '') || value.bookmarkMode !== BOOKMARK_MODE)) fail(RECEIPT_INVALID);
+    ...([FENCE_RECEIPT_SCHEMA, FENCE_CURRENT_RECEIPT_SCHEMA].includes(value.schema) ? ['observationSha256', 'bookmarkMode'] : []),
+    ...(value.schema === FENCE_RECEIPT_SCHEMA ? ['bookmarkTimestamp'] : [])], RECEIPT_INVALID);
+  if ([FENCE_RECEIPT_SCHEMA, FENCE_CURRENT_RECEIPT_SCHEMA].includes(value.schema)
+      && (!SHA256.test(value.observationSha256 ?? '')
+        || value.bookmarkMode !== (value.schema === FENCE_RECEIPT_SCHEMA ? BOOKMARK_MODE : CURRENT_BOOKMARK_MODE))) fail(RECEIPT_INVALID);
   if (['planSha256', 'planReceiptSha256', 'applyReceiptSha256', 'accountSha256'].some(key => !SHA256.test(value[key] ?? ''))) {
     fail(RECEIPT_INVALID);
   }
@@ -1334,6 +1355,7 @@ function checkFenceReceipt(value) {
       || analyticsEndMs === null || analyticsEndMs !== endMs - lag * 60_000 || analyticsEndMs - startMs < quiet * 60_000) {
     fail(RECEIPT_INVALID);
   }
+  if (value.schema === FENCE_RECEIPT_SCHEMA && value.bookmarkTimestamp !== analytics.window.end) fail(RECEIPT_INVALID);
   if (!Array.isArray(analytics.d1) || analytics.d1.length !== labels.length) fail(RECEIPT_INVALID);
   analytics.d1.forEach((item, index) => {
     exactKeys(item, ['label', 'rowsWritten', 'writeQueries'], RECEIPT_INVALID);
@@ -1354,7 +1376,7 @@ export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
   const receiptPath = resolve(path);
   const directory = dirname(receiptPath);
   await assertPrivateDirectory(directory);
-  const { value, sha256: actual } = await readReceipt(receiptPath, [FENCE_RECEIPT_SCHEMA, FENCE_LEGACY_RECEIPT_SCHEMA]);
+  const { value, sha256: actual } = await readReceipt(receiptPath, [FENCE_RECEIPT_SCHEMA, FENCE_CURRENT_RECEIPT_SCHEMA, FENCE_LEGACY_RECEIPT_SCHEMA]);
   if (actual !== expectedSha256) fail(RECEIPT_INVALID);
   checkFenceReceipt(value);
   if (await exists(join(directory, `release-${value.planReceiptSha256}.json`))) fail('FENCE_RELEASED');
@@ -1367,9 +1389,10 @@ export async function readCloudflareWriterFenceReceipt(path, expectedSha256) {
       || !sameList(apply.r2Baseline, value.r2)) {
     fail(RECEIPT_INVALID);
   }
-  if (value.schema === FENCE_RECEIPT_SCHEMA) {
+  if ([FENCE_RECEIPT_SCHEMA, FENCE_CURRENT_RECEIPT_SCHEMA].includes(value.schema)) {
     const { value: observed, sha256: observationSha256 } = await readReceipt(
-      join(directory, `observation-${value.observationSha256}.json`), FENCE_OBSERVATION_SCHEMA);
+      join(directory, `observation-${value.observationSha256}.json`),
+      value.schema === FENCE_RECEIPT_SCHEMA ? FENCE_OBSERVATION_SCHEMA : FENCE_CURRENT_OBSERVATION_SCHEMA);
     if (observationSha256 !== value.observationSha256) fail(RECEIPT_INVALID);
     checkObservation(observed, apply, applySha256);
     await checkObservationPlan(directory, observed, apply);

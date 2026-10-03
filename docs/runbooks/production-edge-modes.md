@@ -376,22 +376,30 @@ length depends on the export and import, which the cutover runbook orders.
      the writer set, before the fenced deploy; `apply` collects the inventory
      again and refuses drift.
    - Run read-only `observe` after the apply cooldown (the plan's quiet window,
-     at least 15 minutes). It captures all four current-mode D1 bookmarks under
+     at least 15 minutes). It captures all four D1 bookmarks at one internally selected current UTC timestamp under
      unchanged fenced inventory and source/history checks, and the original
      apply R2 baseline. Its private observation receipt is not a verified fence.
      The completion time after all reads owns the prospective window start.
    - Wait a full quiet window plus the five-minute analytics lag after observation
      completion, then run `verify` with its pinned digest. Verification compares
-     current-mode bookmarks literally, retaining the complete writer inventory,
+     fixed-timestamp bookmarks literally at the lag-trimmed analytics end, retaining the complete writer inventory,
      source/history, paused schedule/queue, apply R2 and zero-write/invocation
-     analytics gates. `--window-start` is refused; historical timestamp bookmarks
-     cannot substitute for a captured current-mode baseline. Existing diagnostic
+     analytics gates. `--window-start` is refused; caller-selected timestamps
+     cannot substitute for a prospective captured baseline. Existing diagnostic
      samples cannot be reconstructed into observations.
-   - The v2 fence receipt binds the observation digest and explicit bookmark mode.
+   - The v3 fence receipt binds the v2 observation digest, fixed-timestamp literal
+     mode and exact endpoint timestamp. Verify first rereads the original baseline
+     timestamp and requires the same literal values.
      Consumers reopen the observation, apply and original plan receipts and check
-     exact times, account, targets, source and bookmarks. Legacy v1 receipts retain
-     only their original strict validation; they are never reinterpreted as v2
-     prospective evidence. A changed or released fence requires a fresh observation.
+     exact times, account, targets, source and bookmarks. Legacy v1 and current-mode v2 receipts retain
+     their original strict validation; they are never reinterpreted as v3
+     fixed-timestamp evidence. A changed or released fence requires a fresh observation.
+     Cloudflare returns the nearest available bookmark at or before a timestamp,
+     without a freshness bound. Bookmark equality alone does not prove every write
+     event absent; all independent zero-event analytics and fence guards remain
+     mandatory. The common bookmark/analytics interval ends five minutes before
+     verify starts. An operation requiring 35 minutes in that common interval must
+     wait at least 40 minutes after observation completion, plus its operator margin.
 
 The fence plan is a closed, owner-private file. It names the account, the
 production Worker, the fenced scripts with their expected crons or queue, the
