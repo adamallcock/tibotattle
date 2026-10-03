@@ -476,13 +476,23 @@ test("the maintenance job renders C-MAINT's job contract, and CR-3's maintenance
   assert.equal(manifest.renderJob(noProof, "analytics-refresh", IMAGE).kind, "Job");
   const noSecret = manifest.validateDesiredState(unmarked((value) => { value.secrets.IDENTITY_LINK_SECRET.version = null; }));
   assert.throws(() => manifest.renderJob(noSecret, "maintenance", IMAGE), { code: "SECRET_VERSION_UNPINNED:IDENTITY_LINK_SECRET" });
-  // A staging plane cannot have it until the staging service template supplies the plane's own values.
+  // STAGING-MAINT-RENDER: no environment lacks it any more. A staging plane
+  // waits only for its stagingOrigin block and Access AUD, the codes the
+  // staging service waits with (gcp-ops-infra-staging-service.check.mjs
+  // renders it and has CR-3's staging-maintenance-job profile read it).
+  assert.deepEqual({ ...manifest.JOB_ENVIRONMENT_UNAVAILABLE }, {});
   const staging = manifest.validateDesiredState(unmarked(stagingNames));
-  assert.deepEqual({ ...manifest.JOB_ENVIRONMENT_UNAVAILABLE.maintenance }, { staging: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
-  assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE");
-  assert.throws(() => manifest.renderJob(staging, "maintenance", IMAGE), { code: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
-  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh"]);
+  assert.equal(staging.stagingOrigin, null);
+  assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), "STAGING_ORIGIN_UNASSIGNED");
+  assert.throws(() => manifest.renderJob(staging, "maintenance", IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED" });
+  assert.equal(manifest.jobRenderBlocker(staging, "analytics-refresh"), null, "the refresh reads no plane value");
+  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual([...manifest.deployedJobNames(pinned)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  // Production keeps its own definition: the staging one is never production's.
+  assert.equal(manifest.jobDefinition(pinned, "maintenance"), manifest.JOB_DEFINITIONS.maintenance);
+  assert.equal(manifest.jobDefinition(staging, "maintenance"), manifest.STAGING_JOB_DEFINITIONS.maintenance);
+  assert.equal(manifest.jobDefinition(staging, "analytics-refresh"), manifest.JOB_DEFINITIONS["analytics-refresh"]);
+  assert.throws(() => manifest.jobDefinition(pinned, "analytics-delivery"), { code: "JOB_NAME_UNKNOWN" });
   assert.throws(() => manifest.jobRenderBlocker(pinned, "analytics-delivery"), { code: "JOB_NAME_UNKNOWN" });
 
   // Its trigger runs the job through the Cloud Run Admin API, in UTC, with no retry, every minute.
@@ -1125,16 +1135,15 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
   assert.equal(manifest.JOB_NAMES.includes(manifest.MAINTENANCE_JOB_KEY), true);
   assert.equal(Object.isFrozen(target.jobNames), true);
   assert.deepEqual(rollout.validateRolloutTarget(target, "production"), target);
-  // A staging plane cannot have the maintenance Job yet
-  // (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE): the rollout does not
-  // move it, and the target names no maintenance Job although the staging
-  // desired state names one, so the target stays valid (one of jobNames or
-  // null) and OPS-10 refuses the origin-verifier roll there
-  // (ROLLOUT_MAINTENANCE_JOB_REQUIRED) instead of throwing.
+  // STAGING-MAINT-RENDER: the staging plane deploys its maintenance Job too
+  // (the staging-maintenance-job profile, from its stagingOrigin block), so
+  // its target names it and OPS-10's origin-verifier roll can run the
+  // lifecycle pass there.
   const staging = manifest.rolloutTarget("staging", { readFile });
   assert.equal(staging.service, "synthetic-staging-origin");
-  assert.deepEqual([...staging.jobNames], ["synthetic-staging-migrate", "synthetic-staging-refresh"]);
-  assert.equal(staging.maintenanceJob, null);
+  assert.deepEqual([...staging.jobNames],
+    ["synthetic-staging-migrate", "synthetic-staging-refresh", "synthetic-staging-maintenance"]);
+  assert.equal(staging.maintenanceJob, "synthetic-staging-maintenance");
   assert.deepEqual(rollout.validateRolloutTarget(staging, "staging"), staging);
   // Every validated desired state carries the maintenance entry (the job
   // list is exactly JOB_NAMES), so the derivation never reads a missing key.
@@ -1201,9 +1210,11 @@ test("OPS-10 accepts the rendered migration job and the rollout target (integrat
     const target = manifest.rolloutTargetFromDesiredState(desired);
     assert.deepEqual(rollout.validateRolloutTarget(target, desired.environment), target);
     assert.equal(target.migrationJob, rendered.metadata.name);
-    // Production deploys the maintenance Job and names it; staging cannot (D-OPS4).
-    assert.equal(target.maintenanceJob,
-      desired.environment === "production" ? manifest.renderJob(desired, "maintenance", IMAGE).metadata.name : null);
+    // Both planes deploy the maintenance Job and name it (D-OPS4; STAGING-MAINT-RENDER).
+    assert.equal(target.maintenanceJob, desired.jobs.maintenance.name);
+    if (desired.environment === "production") {
+      assert.equal(target.maintenanceJob, manifest.renderJob(desired, "maintenance", IMAGE).metadata.name);
+    }
   }
 });
 
@@ -1342,17 +1353,17 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   assert.ok(desired.bucket.proof === null || /^[1-9][0-9]*$/u.test(desired.bucket.proof.bucketGeneration));
   assert.ok(Object.values(desired.secrets).every((secret) => secret.version === null || /^[1-9][0-9]*$/u.test(secret.version)));
   assert.equal(desired.connectionBudget.fits, true);
-  // Its service waits for the owner's staging Access AUD (STG-PREP); everything else renders.
-  assert.equal(manifest.serviceRenderBlocker(desired), "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud");
-  assert.throws(() => manifest.renderService(desired, IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud" });
+  // The owner's staging Access AUD is committed (the Access application on
+  // the staging admin host), so the service and every job render, the
+  // maintenance job from the same stagingOrigin block (STAGING-MAINT-RENDER).
+  assert.equal(desired.stagingOrigin.accessAud, "b000414465233b6feb03671fa4ec60cfc505d8bc10e435fd77e8fb78656474ad");
+  assert.equal(manifest.serviceRenderBlocker(desired), null);
+  assert.equal(manifest.renderService(desired, IMAGE).kind, "Service");
   for (const job of manifest.JOB_NAMES) {
-    if (job === "maintenance") continue;
+    assert.equal(manifest.jobRenderBlocker(desired, job), null, job);
     assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
   }
-  // Its maintenance job waits for the staging plane's own origins and identity values (the service template's).
-  assert.equal(manifest.jobRenderBlocker(desired, "maintenance"), "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE");
-  assert.throws(() => manifest.renderJob(desired, "maintenance", IMAGE), { code: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" });
-  assert.deepEqual([...manifest.deployedJobNames(desired)], ["production-migrate", "analytics-refresh"]);
+  assert.deepEqual([...manifest.deployedJobNames(desired)], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual(desired.scheduler.maintenance, {
     name: "tibotattle-staging-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
   // Its refresh job is the entry's production job, and the entry accepts its staging names.

@@ -13,6 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
+import * as maintenanceJob from "../cloud-run/postgres-maintenance-job-contract.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import { CLEAN_DEFERRALS } from "./gcp-ops-infra-operations.mjs";
@@ -30,6 +31,9 @@ const COMMITTED_PRODUCTION = readFileSync(join(WORKER_ROOT, "cloud-run/infra/pro
 const FIXTURE = JSON.parse(readFileSync(join(SCRIPTS_ROOT, "fixtures/gcp-ops-infra/desired-state.synthetic.json"), "utf8"));
 const IMAGE = Object.freeze({ imageDigest: "c".repeat(64), sourceCommit: "d".repeat(40) });
 const SYNTHETIC_AUD = "5a".repeat(32);
+// The AUD tag of the staging admin host's Access application (owner-supplied
+// 2026-10-03; Google IdP, allow policy for the owner's email only). Not a secret.
+const STAGING_ACCESS_AUD = "b000414465233b6feb03671fa4ec60cfc505d8bc10e435fd77e8fb78656474ad";
 const PROOF = Object.freeze({ bucketGeneration: "1700000000000001", bucketMetageneration: "1" });
 
 /** The committed staging file with the values the main session pins, synthetic where not committed. */
@@ -161,6 +165,104 @@ test("the rendered staging env, with provisioner-made secrets, is a staging conf
   assert.throws(() => configuration.readProductionConfiguration(env, "production"), (error) => typeof error.code === "string");
 });
 
+/** A rendered job's container, and its plain env as a name-to-value map. */
+function jobContainer(job) {
+  return job.spec.template.spec.template.spec.containers[0];
+}
+
+test("STAGING-MAINT-RENDER: the staging maintenance job reads stagingOrigin as the service does, and CR-3's staging-maintenance-job profile accepts it", () => {
+  const staging = desired();
+  const job = manifest.renderJob(staging, "maintenance", IMAGE);
+  const container = jobContainer(job);
+  assert.equal(job.metadata.name, "tibotattle-staging-maintenance");
+  assert.equal(job.spec.template.spec.template.spec.serviceAccountName,
+    "tibotattle-staging-runtime@tibotattle.iam.gserviceaccount.com");
+  assert.deepEqual(container.args, ["dist/postgres-maintenance-job.mjs", "--profile=staging-maintenance-job"]);
+  const contract = manifest.MAINTENANCE_JOB_CONTRACT;
+  assert.equal(contract.stagingProfile, maintenanceJob.POSTGRES_MAINTENANCE_JOB_PROFILES[1]);
+  // The plane's own values are CR-3's staging-provided names plus the derived admin origin.
+  assert.deepEqual([...contract.stagingPlaneEnv].sort(),
+    [...configuration.STAGING_PROVIDED_VAR_NAMES, "ADMIN_HOST_ORIGIN"].sort());
+  // Only the staging profile's secret: the plane's GitHub token container is
+  // pinned, but the staging profile refuses it, so the job never names it.
+  assert.deepEqual([...contract.stagingSecrets], [
+    ...configuration.PRODUCTION_PROFILE_SECRET_NAMES["staging-maintenance-job"].required,
+    ...configuration.PRODUCTION_PROFILE_SECRET_NAMES["staging-maintenance-job"].optional]);
+  assert.equal(staging.secrets.DISTRIBUTION_GITHUB_API_TOKEN.version, "1");
+  const references = container.env.filter((entry) => entry.valueFrom !== undefined);
+  assert.deepEqual(references.map((entry) => [entry.name, entry.valueFrom.secretKeyRef]),
+    [["IDENTITY_LINK_SECRET", { name: "tibotattle-staging-identity-link-secret", key: "1" }]]);
+  const plain = Object.fromEntries(container.env.filter((entry) => entry.valueFrom === undefined)
+    .map((entry) => [entry.name, entry.value]));
+  assert.deepEqual(Object.keys(plain), [...contract.configurationEnv, ...contract.stagingPlaneEnv, ...contract.provenanceEnv]);
+  // Every value the job shares with the service is the service's, byte for byte.
+  const service = envOf(manifest.renderService(staging, IMAGE));
+  for (const [name, value] of Object.entries(plain)) {
+    if (name === "POSTGRES_SCHEDULED_MAINTENANCE_ENABLED") continue;
+    assert.equal(value, service.get(name).value, name);
+  }
+  assert.equal(plain.ACCESS_AUD, SYNTHETIC_AUD);
+  assert.equal(plain.ADMIN_HOST_ORIGIN, "https://admin.staging.tibotattle.com");
+  // The service-only settings never reach the job: CR-3 refuses STAGING_ADMISSION_MODE outside the service profile.
+  for (const name of ["HOST_MODE", "HOST_ORIGIN", "STAGING_ADMISSION_MODE", "EDGE_ORIGIN_MODE", "K_SERVICE"]) {
+    assert.equal(Object.hasOwn(plain, name), false, name);
+  }
+  assert.doesNotMatch(JSON.stringify(job), /LEDGER|GCS_ERASURE_BUCKET_HISTORY_PROOF|EDGE_PROOF_|SPARKLE_|production/u);
+
+  // The job's own refusals (postgres-maintenance-job-contract.mjs) find nothing in the render.
+  for (const name of Object.keys(maintenanceJob.POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES)) {
+    assert.equal(Object.hasOwn(plain, name), false, name);
+  }
+  for (const prefix of Object.keys(maintenanceJob.POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES)) {
+    assert.equal(Object.keys(plain).some((name) => name.startsWith(prefix)), false, prefix);
+  }
+  // CR-3's staging-maintenance-job profile (the configuration the job's reader
+  // reads) accepts the render as the job reads its environment; the
+  // production maintenance profile refuses it.
+  const env = { ...plain, CLOUD_RUN_JOB: job.metadata.name };
+  const secrets = generateStagingSecretValues(["IDENTITY_LINK_SECRET"]);
+  for (const [name, value] of secrets) env[name] = value;
+  const config = configuration.readProductionConfiguration(env, "staging-maintenance-job");
+  assert.throws(() => configuration.readProductionConfiguration(env, "maintenance-job"),
+    (error) => typeof error.code === "string");
+  secrets.clear();
+  assert.equal(config.profile, "staging-maintenance-job");
+  assert.equal(config.plane, "staging");
+  assert.equal(config.deployment.workload.kind, "job");
+  assert.equal(config.deployment.workload.name, "tibotattle-staging-maintenance");
+  assert.equal(config.jobSwitches.POSTGRES_SCHEDULED_MAINTENANCE_ENABLED, "enabled");
+  assert.equal(config.vars.ACCESS_AUD, SYNTHETIC_AUD);
+  assert.equal(config.vars.ENROLLMENT_MODE, "disabled");
+  assert.deepEqual(config.origins, { public: "https://staging.tibotattle.com", admin: "https://admin.staging.tibotattle.com",
+    wwwHost: null, host: null });
+  assert.equal(config.resources.bucket, "tibotattle-staging-quarantine");
+  assert.deepEqual(config.resources.bucketHistoryProof,
+    { bucket: "tibotattle-staging-quarantine", ...PROOF, softDeleteRetentionDurationSeconds: "0" });
+  assert.deepEqual(Object.keys(config.secrets), ["IDENTITY_LINK_SECRET"]);
+
+  // It waits with the service's own codes, and only for them.
+  for (const [mutate, code] of [
+    [(value) => { value.stagingOrigin = null; }, "STAGING_ORIGIN_UNASSIGNED"],
+    [(value) => { value.stagingOrigin.accessAud = null; }, "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud"],
+  ]) {
+    assert.equal(manifest.jobRenderBlocker(desired(mutate), "maintenance"), code, code);
+    assert.equal(manifest.serviceRenderBlocker(desired(mutate)), code, code);
+    assert.throws(() => manifest.renderJob(desired(mutate), "maintenance", IMAGE), { code }, code);
+    // The other jobs read no plane value and still render.
+    assert.equal(manifest.renderJob(desired(mutate), "production-migrate", IMAGE).kind, "Job");
+  }
+  assert.throws(() => manifest.renderJob(desired((value) => { value.bucket.proof = null; }), "maintenance", IMAGE),
+    { code: "JOB_RENDER_BUCKET_PROOF_UNPINNED" });
+  assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), null);
+  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  // The committed staging file renders it as it stands.
+  const committed = manifest.loadCommittedDesiredState("staging");
+  const committedEnv = Object.fromEntries(jobContainer(manifest.renderJob(committed, "maintenance", IMAGE)).env
+    .filter((entry) => entry.valueFrom === undefined).map((entry) => [entry.name, entry.value]));
+  assert.equal(committedEnv.ACCESS_AUD, STAGING_ACCESS_AUD);
+  assert.equal(manifest.rolloutTargetFromDesiredState(committed).maintenanceJob, "tibotattle-staging-maintenance");
+});
+
 test("D-CRB composes HOST_MODE staging, so OPS-2 no longer defers the staging service for its composition", () => {
   const staging = desired();
   assert.equal(manifest.serviceTemplateBlocker(staging), null);
@@ -193,10 +295,10 @@ test("the staging service waits, in order, for its settings, the Access AUD, the
   ]) {
     assert.throws(() => manifest.renderService(desired(mutate), IMAGE), { code }, code);
   }
-  // The committed file itself waits for the owner's Access AUD first.
+  // The committed file carries the owner's Access AUD, so it waits for nothing.
   const committed = manifest.loadCommittedDesiredState("staging");
-  assert.equal(manifest.serviceRenderBlocker(committed), "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud");
-  assert.throws(() => manifest.stagingServiceTemplateValues(committed), { code: "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud" });
+  assert.equal(manifest.serviceRenderBlocker(committed), null);
+  assert.equal(manifest.stagingServiceTemplateValues(committed).ACCESS_AUD, STAGING_ACCESS_AUD);
 });
 
 test("stagingOrigin is closed, staging-only and never a production value", () => {
@@ -204,7 +306,7 @@ test("stagingOrigin is closed, staging-only and never a production value", () =>
   assert.deepEqual(committed.stagingOrigin, {
     publicOrigin: "https://staging.tibotattle.com",
     accessTeamDomain: "tibotattle.cloudflareaccess.com",
-    accessAud: null,
+    accessAud: STAGING_ACCESS_AUD,
     accessAdminEmail: configuration.PRODUCTION_VARS.ACCESS_ADMIN_EMAIL,
     identityLinkSecretVersion: "staging-gcp-v1",
     admissionMode: "closed",
@@ -372,8 +474,14 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     .map((entry) => `${entry.id}:${entry.deferred}`);
   const first = plan();
   assert.deepEqual([first.summary.refused, first.findings, first.blockers], [0, [], []]);
-  // 26 plane operations plus the verifier token-creator grant (operator named 2026-10-02).
-  assert.equal(first.summary.executable, 27);
+  // 26 plane operations, the verifier token-creator grant (operator named
+  // 2026-10-02), and the maintenance trigger's create and pause: the staging
+  // maintenance job waits only for the bootstrap image now (STAGING-MAINT-RENDER),
+  // so its trigger is made and paused as production's is, its grant withheld.
+  assert.equal(first.summary.executable, 29);
+  assert.ok(deferred(first).includes("run-job:create:maintenance:BOOTSTRAP_IMAGE_REQUIRED"));
+  assert.deepEqual(first.operations.filter((entry) => entry.deferred === undefined && entry.id.startsWith("scheduler:"))
+    .map((entry) => entry.id), ["scheduler:create:maintenance", "scheduler:pause:maintenance"]);
   // D-CRB composes HOST_MODE staging, so the service waits only for the bootstrap image.
   assert.ok(deferred(first).includes("run-service:create:BOOTSTRAP_IMAGE_REQUIRED"));
   assert.ok(deferred(first).includes("run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED"));
@@ -382,22 +490,27 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
   const second = plan({ bootstrap: IMAGE });
   // Staging commits no refresh cadence, so no trigger is created and the scheduler's executor grant
   // is withheld with it (SCHEDULER_CADENCE_UNSET): the account cannot run a job nothing triggers.
-  // The staging maintenance job, its trigger and grant wait (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE).
+  // The staging maintenance job renders from the stagingOrigin block (STAGING-MAINT-RENDER), and
+  // the scheduler's grant on it follows the trigger's pause in pass 1.
   assert.deepEqual(second.operations.filter((entry) => entry.deferred === undefined).map((entry) => entry.id), [
     "run-service:create",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-invoker@tibotattle.iam.gserviceaccount.com|",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com|",
-    "run-job:create:production-migrate", "run-job:create:analytics-refresh",
+    "run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance",
+    "run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|",
   ]);
   assert.ok(deferred(second).includes(
     "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET"));
   operations.applyInfrastructure(staging, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
     createSpecWriter: () => writer.create() });
-  // Only the staging maintenance job, its trigger and the scheduler's grant on it keep the plane unclean.
-  assert.deepEqual([...operations.infrastructureCleanliness(plan()).reasons], [
-    "DEFERRED:run-job:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    "DEFERRED:scheduler:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    "DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
+  // The plane is clean: only the refresh trigger and its grant wait, for the owner's cadence
+  // (SCHEDULER_CADENCE_UNSET, a clean deferral), so a staging readback --require-clean passes.
+  const settled = plan();
+  assert.deepEqual(operations.infrastructureCleanliness(settled), { clean: true, reasons: [] });
+  assert.equal(settled.summary.executable, 0);
+  assert.deepEqual(deferred(settled), [
+    "scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
+    "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|:SCHEDULER_CADENCE_UNSET",
   ]);
   // Nothing touched the co-tenant, and every mutation named the staging plane.
   assert.deepEqual(world.services.map((service) => service.metadata.name).sort(),

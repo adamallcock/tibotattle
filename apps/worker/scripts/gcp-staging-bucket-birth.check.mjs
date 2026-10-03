@@ -166,7 +166,10 @@ test("apply inserts once, writes the receipt and pins its proof by a one-line ed
     assert.deepEqual(changed, [`    "proof": { "bucketGeneration": "${GENERATION}", "bucketMetageneration": "1" }`]);
     const pinned = pins.validateStagingDesiredStateText(store.text).desired;
     assert.deepEqual(pinned.bucket.proof, result.proof);
-    assert.equal(manifest.serviceTemplateBlocker(pinned), "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud");
+    // The owner's Access AUD is committed, so the pinned proof was the template's last wait.
+    assert.equal(manifest.serviceTemplateBlocker(pinned), null);
+    assert.equal(manifest.serviceTemplateBlocker(pins.validateStagingDesiredStateText(STAGING_TEXT).desired),
+      "SERVICE_RENDER_BUCKET_PROOF_UNPINNED");
     // --verify agrees; a rerun refuses at the reserved receipt, with no insert.
     const verified = await flow.runStagingBucketBirth(pinned, { mode: "verify", receiptPath });
     assert.equal(verified.status, "verified");

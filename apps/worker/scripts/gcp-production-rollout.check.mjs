@@ -76,21 +76,29 @@ const TARGET = Object.freeze({
 });
 const STAGING_PROJECT = "w2-opsdb-staging-synth";
 // The staging target as OPS-2 derives it (rolloutTargetFromDesiredState):
-// staging cannot have the maintenance Job yet
-// (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE, D-OPS4), so it is in
-// neither jobNames nor maintenanceJob.
+// staging deploys its maintenance Job from its stagingOrigin block
+// (STAGING-MAINT-RENDER), so the Job is in jobNames and is maintenanceJob.
 const STAGING_TARGET = Object.freeze({
   environment: "staging",
   project: STAGING_PROJECT,
   region: "us-east1",
   service: "tibotattle-staging-origin",
   migrationJob: "tibotattle-staging-migrate",
-  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics"]),
+  jobNames: Object.freeze(["tibotattle-staging-migrate", "tibotattle-staging-analytics",
+    "tibotattle-staging-maintenance"]),
   primaryInstance: "tibotattle-staging-primary",
   imageRepository: `us-east1-docker.pkg.dev/${STAGING_PROJECT}/tibotattle-staging/origin`,
   builderServiceAccount: `tibotattle-staging-builder@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   verifierServiceAccount: `tibotattle-staging-verifier@${STAGING_PROJECT}.iam.gserviceaccount.com`,
   originAudience: ORIGIN_AUDIENCE,
+  maintenanceJob: "tibotattle-staging-maintenance",
+});
+// A target whose environment could not have the maintenance Job
+// (JOB_ENVIRONMENT_UNAVAILABLE; none today): neither jobNames nor
+// maintenanceJob names it, and the origin-verifier roll is refused.
+const NO_MAINTENANCE_TARGET = Object.freeze({
+  ...STAGING_TARGET,
+  jobNames: Object.freeze(STAGING_TARGET.jobNames.filter((name) => name !== STAGING_TARGET.maintenanceJob)),
   maintenanceJob: null,
 });
 const IMAGE = `${TARGET.imageRepository}@${DIGEST}`;
@@ -836,19 +844,20 @@ test("a staging roll verifies a workers.dev-only gcp edge against staging's own 
     isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"));
 });
 
-test("a staging target has no maintenance Job (D-OPS4), so its origin-verifier roll is refused before any command or lock",
+test("a target with no maintenance Job (D-OPS4) has its origin-verifier roll refused before any command or lock",
   async (t) => {
-    assert.deepEqual(validateRolloutTarget(STAGING_TARGET, "staging"), STAGING_TARGET);
-    assert.equal(STAGING_TARGET.jobNames.includes("tibotattle-staging-maintenance"), false);
-    // A staging target that names a maintenance Job outside its jobNames is
-    // the merge hazard D-CRB closed: refused as invalid, never rolled.
-    assert.throws(() => validateRolloutTarget({ ...STAGING_TARGET, maintenanceJob: "tibotattle-staging-maintenance" },
+    assert.deepEqual(validateRolloutTarget(NO_MAINTENANCE_TARGET, "staging"), NO_MAINTENANCE_TARGET);
+    assert.equal(NO_MAINTENANCE_TARGET.jobNames.includes("tibotattle-staging-maintenance"), false);
+    // A target that names a maintenance Job outside its jobNames is the
+    // merge hazard D-CRB closed: refused as invalid, never rolled.
+    assert.throws(() => validateRolloutTarget({ ...NO_MAINTENANCE_TARGET, maintenanceJob: "tibotattle-staging-maintenance" },
       "staging"), isCode("ROLLOUT_TARGET_INVALID"));
-    const paths = await migrated(t, { target: STAGING_TARGET, edge: stagingGcpLive });
+    const paths = await migrated(t, { target: NO_MAINTENANCE_TARGET, edge: stagingGcpLive });
     await writeFile(paths.edgeLive, capture(stagingWorkerLive));
     const lock = fakeLock();
-    const estate = fakeEstate({ target: STAGING_TARGET });
-    await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(estate, lock)),
+    const estate = fakeEstate({ target: NO_MAINTENANCE_TARGET });
+    await assert.rejects(runRollout(executeRoll(paths, "staging"),
+      dependencies(estate, lock, { loadTarget: async () => NO_MAINTENANCE_TARGET })),
       isCode("ROLLOUT_MAINTENANCE_JOB_REQUIRED"));
     assert.deepEqual(lock.events, []);
     assert.equal(estate.calls.some((argv) => argv[0] === "gcloud" && argv[3] !== "describe"), false);

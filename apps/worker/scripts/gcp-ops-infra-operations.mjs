@@ -104,7 +104,6 @@ import {
   CLOUD_SQL_POSTURE,
   DEFERRED_JOBS,
   JOBS_EXECUTOR_ROLE,
-  JOB_DEFINITIONS,
   JOB_NAMES,
   LOGGING_POSTURE,
   QUARANTINE_STORE_ROLE_DESCRIPTION,
@@ -126,6 +125,7 @@ import {
   desiredProjectBindings,
   desiredStateDigest,
   fail,
+  jobDefinition,
   jobRenderBlocker,
   jobRunUri,
   jobSecretNames,
@@ -1185,15 +1185,15 @@ function serviceDeferral(desired, observed) {
 
 /**
  * Why a job cannot be rendered yet from what the desired state and the estate
- * hold, or null: its environment cannot have it, a namespace is unassigned
- * (jobRenderBlocker), the bucket birth proof it reads is unpinned, or a secret
+ * hold, or null: its environment cannot have it, a namespace or the staging
+ * plane's own values are unassigned (jobRenderBlocker), the bucket birth proof it reads is unpinned, or a secret
  * it reads has no pinned version or a version that is not enabled. A job that
  * reads none of these is never deferred here.
  */
 function jobInputDeferral(desired, observed, job) {
   const blocker = jobRenderBlocker(desired, job);
   if (blocker !== null) return blocker;
-  const definition = JOB_DEFINITIONS[job];
+  const definition = jobDefinition(desired, job);
   if (definition.env.includes("GCS_QUARANTINE_BUCKET_HISTORY_PROOF") && desired.bucket.proof === null) {
     return "BUCKET_PROOF_UNPINNED";
   }

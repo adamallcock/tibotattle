@@ -345,8 +345,18 @@ test("the committed desired states render offline: staging's and production's wa
   assert.equal(staging.calls.length, 0);
   const rendered = JSON.parse(staging.out);
   assert.deepEqual([rendered.environment, rendered.project, rendered.synthetic], ["staging", "tibotattle", false]);
-  // STG-PREP: the staging template renders once the owner's Access AUD is committed.
-  assert.deepEqual(rendered.service, { unavailable: "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud" });
+  // STG-PREP: the owner's Access AUD is committed, so the staging template renders,
+  // and the maintenance job renders the staging-maintenance-job profile from the
+  // same stagingOrigin block (STAGING-MAINT-RENDER).
+  const STAGING_ACCESS_AUD = "b000414465233b6feb03671fa4ec60cfc505d8bc10e435fd77e8fb78656474ad";
+  const plainEnv = (container) => Object.fromEntries(container.env.filter((entry) => entry.valueFrom === undefined)
+    .map((entry) => [entry.name, entry.value]));
+  assert.equal(rendered.service.kind, "Service");
+  assert.equal(plainEnv(rendered.service.spec.template.spec.containers[0]).ACCESS_AUD, STAGING_ACCESS_AUD);
+  const maintenance = rendered.jobs.maintenance.spec.template.spec.template.spec.containers[0];
+  assert.deepEqual(maintenance.args, ["dist/postgres-maintenance-job.mjs", "--profile=staging-maintenance-job"]);
+  assert.equal(plainEnv(maintenance).ACCESS_AUD, STAGING_ACCESS_AUD);
+  assert.equal(plainEnv(maintenance).ADMIN_HOST_ORIGIN, "https://admin.staging.tibotattle.com");
   // The owner named the staging verifier operator on 2026-10-02.
   assert.deepEqual(rendered.verifierIam, { account: "tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com",
     role: "roles/iam.serviceAccountTokenCreator", members: ["user:adamallcock@gmail.com"] });

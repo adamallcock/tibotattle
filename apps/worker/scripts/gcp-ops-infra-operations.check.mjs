@@ -1022,10 +1022,11 @@ test("a shared project's co-tenants and project-wide settings are never read int
     "DEFERRED:run-service:create:STAGING_ORIGIN_UNASSIGNED",
     `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_ORIGIN_UNASSIGNED`,
     `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_ORIGIN_UNASSIGNED`,
-    // The maintenance job, its trigger and the scheduler's grant wait for the same staging values (never created, never clean).
-    "DEFERRED:run-job:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    "DEFERRED:scheduler:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    `DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|${shared.serviceAccounts.scheduler.member}|:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`,
+    // The maintenance job reads the same stagingOrigin block (STAGING-MAINT-RENDER), so it,
+    // its trigger and the scheduler's grant wait with the service's code (never created, never clean).
+    "DEFERRED:run-job:create:maintenance:STAGING_ORIGIN_UNASSIGNED",
+    "DEFERRED:scheduler:create:maintenance:STAGING_ORIGIN_UNASSIGNED",
+    `DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|${shared.serviceAccounts.scheduler.member}|:STAGING_ORIGIN_UNASSIGNED`,
   ]);
   assert.deepEqual(world.jobs.filter((job) => /staging/u.test(job.metadata.name)).map((job) => job.metadata.name),
     ["synthetic-staging-migrate", "synthetic-staging-refresh"], "no staging maintenance job exists");
@@ -1064,22 +1065,24 @@ test("the committed staging desired state plans only its own new resources in th
   assert.deepEqual(result.findings, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
   assert.deepEqual(result.blockers, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
   assert.doesNotMatch(JSON.stringify(result.operations), /tibotattle-test|_Default/u);
-  // Everything it would create is the staging plane's; the service waits for
-  // its Access AUD, the verifier grant for the operator, the trigger for the cadence.
+  // Everything it would create is the staging plane's; the service and the
+  // maintenance job wait for the bucket proof (the owner's Access AUD is
+  // committed), the refresh trigger for the cadence.
   for (const entry of result.operations.filter((operation) => operation.deferred === undefined)) {
     const named = entry.file === undefined ? entry.argv : [...entry.argv, entry.file.content];
     assert.ok(named.some((arg) => /staging/u.test(arg)) || entry.id === "custom-role:create", entry.id);
   }
   const deferrals = new Set(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred));
   // The verifier operator was named on 2026-10-02, so its grant is no longer deferred.
-  assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud"]);
-  // The staging maintenance job, its trigger and the scheduler's grant are deferred, never created.
+  assert.deepEqual([...deferrals].sort(), ["BUCKET_PROOF_UNPINNED", "SCHEDULER_CADENCE_UNSET",
+    "SERVICE_RENDER_BUCKET_PROOF_UNPINNED"]);
+  // The staging maintenance job (STAGING-MAINT-RENDER), its trigger and the
+  // scheduler's grant wait for the proof it reads, as production's do: never created yet.
   assert.deepEqual(ops(result, (entry) => /maintenance/u.test(entry.id)).map((entry) => [entry.id, entry.deferred]), [
-    ["run-job:create:maintenance", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
-    ["scheduler:create:maintenance", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
+    ["run-job:create:maintenance", "BUCKET_PROOF_UNPINNED"],
+    ["scheduler:create:maintenance", "BUCKET_PROOF_UNPINNED"],
     [`run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`,
-      "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
+      "BUCKET_PROOF_UNPINNED"],
   ]);
   assert.ok(ops(result, (entry) => entry.id === "secret:create:IDENTITY_LINK_SECRET")[0].argv
     .includes("tibotattle-staging-identity-link-secret"));

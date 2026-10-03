@@ -189,18 +189,14 @@ export const DEFERRED_JOBS = Object.freeze({});
 /**
  * Jobs OPS-2 cannot render in an environment, with the reason: the job is not
  * created there, is not in the rollout target, and its trigger is not created.
- * The maintenance job's staging profile (staging-maintenance-job) reads the
- * staging plane's own origins and identity values (ACCESS_TEAM_DOMAIN,
- * ACCESS_AUD, ACCESS_ADMIN_EMAIL, IDENTITY_LINK_SECRET_VERSION and the
- * Google and Apple identifiers, PUBLIC_ORIGIN, ADMIN_HOST_ORIGIN). STG-PREP
- * now carries them for the staging service (the stagingOrigin block and the
- * staging service template), but the job render does not read them from
- * there yet, so a staging maintenance job still waits
- * (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE).
+ * None today: the staging maintenance job's entry
+ * (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE) was lifted when its
+ * render began to read the staging plane's own values from the stagingOrigin
+ * block, as the staging service does (STAGING-MAINT-RENDER;
+ * STAGING_JOB_DEFINITIONS). The mechanism stays for a job an environment
+ * cannot have.
  */
-export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({
-  maintenance: Object.freeze({ staging: "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE" }),
-});
+export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({});
 
 /**
  * Services OPS-2 cannot render yet, by environment, with the reason. None
@@ -426,6 +422,15 @@ export const MAINTENANCE_JOB_CONTRACT = Object.freeze({
   ]),
   provenanceEnv: Object.freeze(["DEPLOYMENT_SOURCE_COMMIT"]),
   secrets: Object.freeze(["IDENTITY_LINK_SECRET", "DISTRIBUTION_GITHUB_API_TOKEN"]),
+  // STAGING-MAINT-RENDER: the staging plane runs CR-3's staging-maintenance-job
+  // profile. It reads the plane's own origins and identity values
+  // (STAGING_PROVIDED_VAR_NAMES and ADMIN_HOST_ORIGIN = admin.<public host>),
+  // which the staging service renders from the stagingOrigin block and the
+  // inert identity-provider identifiers, and only that profile's secret.
+  stagingProfile: POSTGRES_MAINTENANCE_JOB_PROFILES[1],
+  stagingPlaneEnv: Object.freeze(["PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN",
+    ...STAGING_PROVIDED_VAR_NAMES.filter((name) => name !== "PUBLIC_ORIGIN")]),
+  stagingSecrets: Object.freeze(["IDENTITY_LINK_SECRET"]),
   refusedVariables: Object.freeze(Object.keys(POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES)),
   refusedPrefixes: Object.freeze(Object.keys(POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES)),
 });
@@ -471,6 +476,31 @@ export const JOB_DEFINITIONS = Object.freeze({
     secrets: MAINTENANCE_JOB_CONTRACT.secrets,
   }),
 });
+
+/**
+ * A job's staging-plane definition where it differs from JOB_DEFINITIONS
+ * (jobDefinition). The maintenance job runs the staging-maintenance-job
+ * profile, with the plane's own values after its configuration and only that
+ * profile's secret (STAGING-MAINT-RENDER).
+ */
+export const STAGING_JOB_DEFINITIONS = Object.freeze({
+  maintenance: Object.freeze({
+    ...JOB_DEFINITIONS.maintenance,
+    args: Object.freeze([MAINTENANCE_JOB_CONTRACT.entry, `--profile=${MAINTENANCE_JOB_CONTRACT.stagingProfile}`]),
+    env: Object.freeze([...MAINTENANCE_JOB_CONTRACT.configurationEnv, ...MAINTENANCE_JOB_CONTRACT.stagingPlaneEnv,
+      ...MAINTENANCE_JOB_CONTRACT.provenanceEnv]),
+    secrets: MAINTENANCE_JOB_CONTRACT.stagingSecrets,
+  }),
+});
+
+/** The definition a desired state's environment renders for `job`. */
+export function jobDefinition(desired, job) {
+  if (!JOB_NAMES.includes(job)) fail("JOB_NAME_UNKNOWN");
+  if (desired.environment === "staging" && Object.hasOwn(STAGING_JOB_DEFINITIONS, job)) {
+    return STAGING_JOB_DEFINITIONS[job];
+  }
+  return JOB_DEFINITIONS[job];
+}
 
 export const SCHEDULER_TIME_ZONE = "Etc/UTC";
 export const SCHEDULER_OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
@@ -1657,9 +1687,12 @@ function bucketProofJson(desired) {
 
 /**
  * Why a job cannot be rendered for this environment, or null: the job does not
- * exist there (JOB_ENVIRONMENT_UNAVAILABLE), or it reads the telemetry storage
+ * exist there (JOB_ENVIRONMENT_UNAVAILABLE), it reads the telemetry storage
  * namespace and the desired state has not assigned it yet (it must equal the
- * namespace the imported data carries, as for the service).
+ * namespace the imported data carries, as for the service), or it reads the
+ * staging plane's own values and the stagingOrigin block or its Access AUD is
+ * not there yet (stagingOriginBlocker, the codes the staging service defers
+ * with).
  */
 export function jobRenderBlocker(desired, job) {
   if (!JOB_NAMES.includes(job)) fail("JOB_NAME_UNKNOWN");
@@ -1667,10 +1700,12 @@ export function jobRenderBlocker(desired, job) {
   if (unavailable !== undefined && Object.hasOwn(unavailable, desired.environment)) {
     return unavailable[desired.environment];
   }
-  if (JOB_DEFINITIONS[job].env.includes("TELEMETRY_STORAGE_NAMESPACE")
+  const definition = jobDefinition(desired, job);
+  if (definition.env.includes("TELEMETRY_STORAGE_NAMESPACE")
       && desired.service.telemetryStorageNamespace === null) {
     return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
   }
+  if (definition.env.includes("PUBLIC_ORIGIN")) return stagingOriginBlocker(desired);
   return null;
 }
 
@@ -1698,8 +1733,21 @@ function jobEnv(desired, job, sourceCommit) {
     GCS_BUCKET_NAME: () => desired.bucket.name,
     GCS_QUARANTINE_BUCKET_HISTORY_PROOF: () => bucketProofJson(desired),
     POSTGRES_SCHEDULED_MAINTENANCE_ENABLED: () => "enabled",
+    // The staging plane's own values, from the stagingOrigin block and the
+    // inert identity-provider identifiers, exactly as the staging service
+    // renders them (stagingServiceTemplateValues and its template).
+    PUBLIC_ORIGIN: () => desired.stagingOrigin.publicOrigin,
+    ADMIN_HOST_ORIGIN: () => desired.stagingOrigin.adminOrigin,
+    ACCESS_TEAM_DOMAIN: () => desired.stagingOrigin.accessTeamDomain,
+    ACCESS_AUD: () => desired.stagingOrigin.accessAud,
+    ACCESS_ADMIN_EMAIL: () => desired.stagingOrigin.accessAdminEmail,
+    IDENTITY_LINK_SECRET_VERSION: () => desired.stagingOrigin.identityLinkSecretVersion,
+    GOOGLE_OIDC_CLIENT_ID: () => STAGING_INERT_IDENTITY_PROVIDER_VARS.GOOGLE_OIDC_CLIENT_ID,
+    APPLE_SERVICES_ID: () => STAGING_INERT_IDENTITY_PROVIDER_VARS.APPLE_SERVICES_ID,
+    APPLE_KEY_ID: () => STAGING_INERT_IDENTITY_PROVIDER_VARS.APPLE_KEY_ID,
+    APPLE_TEAM_ID: () => STAGING_INERT_IDENTITY_PROVIDER_VARS.APPLE_TEAM_ID,
   };
-  return JOB_DEFINITIONS[job].env.map((name) => {
+  return jobDefinition(desired, job).env.map((name) => {
     if (!Object.hasOwn(values, name)) fail(`JOB_RENDER_ENV_UNRESOLVED:${name}`);
     return { name, value: values[name]() };
   });
@@ -1713,7 +1761,7 @@ function jobEnv(desired, job, sourceCommit) {
  * (JOB_RENDER_SECRET_UNKNOWN).
  */
 export function jobSecretNames(desired, job) {
-  return (JOB_DEFINITIONS[job].secrets ?? []).filter((name) => {
+  return (jobDefinition(desired, job).secrets ?? []).filter((name) => {
     if (Object.hasOwn(desired.secrets, name)) return true;
     if (desired.environment === "production" && UNREAD_PRODUCTION_SECRET_NAMES.includes(name)) return false;
     return fail(`JOB_RENDER_SECRET_UNKNOWN:${name}`);
@@ -1744,7 +1792,7 @@ export function renderJob(desired, job, { imageDigest, sourceCommit }) {
   if (typeof sourceCommit !== "string" || !SOURCE_COMMIT.test(sourceCommit)) fail("JOB_RENDER_SOURCE_COMMIT_INVALID");
   const blocker = jobRenderBlocker(desired, job);
   if (blocker !== null) fail(blocker);
-  const definition = JOB_DEFINITIONS[job];
+  const definition = jobDefinition(desired, job);
   return deepFreeze({
     apiVersion: "run.googleapis.com/v1",
     kind: "Job",
@@ -1954,11 +2002,12 @@ export const ROLLOUT_TARGET_KEYS = Object.freeze([
  * The JOB_NAMES key of the MP-2-lite maintenance Job (C-MAINT's
  * dist/postgres-maintenance-job.mjs, added to JOB_NAMES by D-OPS4). A
  * RolloutTarget names it only when the environment deploys it
- * (deployedJobNames(desired)): staging cannot have it yet
- * (JOB_ENVIRONMENT_UNAVAILABLE), so a staging target's maintenanceJob is
- * null and OPS-10's roll refuses the origin-verifier path there
- * (ROLLOUT_MAINTENANCE_JOB_REQUIRED), because only a lifecycle pass makes a
- * new origin's /api/ready read ready (D-CRB).
+ * (deployedJobNames(desired)). Both planes deploy it: staging renders the
+ * staging-maintenance-job profile from its stagingOrigin block
+ * (STAGING-MAINT-RENDER). A target whose environment could not have it
+ * (JOB_ENVIRONMENT_UNAVAILABLE) would carry null, and OPS-10's roll refuses
+ * the origin-verifier path there (ROLLOUT_MAINTENANCE_JOB_REQUIRED), because
+ * only a lifecycle pass makes a new origin's /api/ready read ready (D-CRB).
  */
 export const MAINTENANCE_JOB_KEY = "maintenance";
 
@@ -2139,9 +2188,18 @@ export function validateStagingOrigin(value, environment) {
  * C-SIMP's).
  */
 export function stagingServiceBlocker(desired) {
+  return stagingOriginBlocker(desired)
+    ?? (desired.bucket.proof === null ? "SERVICE_RENDER_BUCKET_PROOF_UNPINNED" : null);
+}
+
+/**
+ * Why the staging plane's own values cannot render yet, or null: no
+ * stagingOrigin block, or no Access AUD. The staging service and the staging
+ * maintenance job both read them, and both defer with these codes.
+ */
+export function stagingOriginBlocker(desired) {
   if (desired.stagingOrigin === null) return "STAGING_ORIGIN_UNASSIGNED";
   if (desired.stagingOrigin.accessAud === null) return "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud";
-  if (desired.bucket.proof === null) return "SERVICE_RENDER_BUCKET_PROOF_UNPINNED";
   return null;
 }
 

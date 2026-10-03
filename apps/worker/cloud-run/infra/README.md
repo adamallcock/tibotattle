@@ -100,15 +100,17 @@ schedule, and `null`, as `SCHEDULER_CADENCE_MISMATCH:maintenance`.
   enabled version (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`,
   `BUCKET_PROOF_UNPINNED`, `SECRET_VERSION_UNPINNED:<name>`,
   `SECRET_VERSION_UNAVAILABLE:<name>`). None of these is a clean deferral.
-- **Staging waits for its environment.** The staging profile
-  (`staging-maintenance-job`) also reads the staging plane's own origins and
-  identity values. STG-PREP's `stagingOrigin` block and staging service
-  template now carry them for the service, but the job render does not read
-  them from there yet. Until it does, the staging job and trigger are never
-  created
-  (`STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`, `JOB_ENVIRONMENT_UNAVAILABLE`)
-  and the staging rollout target does not move the job.
-- **The rollout moves it.** The production target lists the maintenance job,
+- **Staging reads its own plane values.** On the staging plane the job runs
+  the `staging-maintenance-job` profile (`STAGING_JOB_DEFINITIONS`). It also
+  reads the plane's own origins and identity values, rendered from the
+  `stagingOrigin` block and the inert identity-provider identifiers exactly
+  as the staging service renders them, and only `IDENTITY_LINK_SECRET` (the
+  staging profile refuses the GitHub token). Until the block and its Access
+  AUD are committed, the job and its trigger wait with the service's codes
+  (`STAGING_ORIGIN_UNASSIGNED`,
+  `STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`).
+  `JOB_ENVIRONMENT_UNAVAILABLE` is empty.
+- **The rollout moves it.** Both targets list the maintenance job,
   so OPS-10's roll updates its image and `DEPLOYMENT_SOURCE_COMMIT` with the
   other jobs, and its quiescence readback lists its executions.
 
@@ -134,7 +136,7 @@ created.
 | `bucket.proof` | Apply refuses until the bucket-birth receipt's proof is committed; the staging service is not rendered (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`) |
 | `service.telemetryStorageNamespace` | The service is not rendered; it must equal the namespace the imported data carries. Staging's value was chosen by Claude (see below) |
 | `scheduler.analytics-refresh.schedule` | The trigger is not created (decision D3: no default cadence), and the scheduler account's executor grant on the job waits with it. Production stays `null` until the owner decides the cadence after the production-scale measurement (round 15, C3); pass 1 then defers the create as `SCHEDULER_CADENCE_UNSET` and plans no pause. `readback --require-clean` accepts that for the rollout; `--require-cadence` (the cutover gate) refuses it |
-| `stagingOrigin.accessAud` (staging only) | The staging service is not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`) until the owner creates the staging admin Access application |
+| `stagingOrigin.accessAud` (staging only) | The staging service and maintenance job are not rendered (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`). Committed 2026-10-03: the owner's Access application on `admin.staging.tibotattle.com` |
 
 ### Production values PROD-PREP filled (owner decisions round 13)
 
@@ -164,8 +166,8 @@ staging.
 Stream STG-PREP (Claude, not the owner) committed these staging values so
 that the staging service can render once the owner values above arrive. The
 owner confirmed all six as committed on 2026-10-02 (owner decisions, round 9,
-"Staging values"). Until D-CRB lands, OPS-2 defers the staging service in any
-case.
+"Staging values"). The Access AUD is the owner's own value, committed on
+2026-10-03.
 
 | Setting | Committed value | Source |
 |---|---|---|
@@ -175,6 +177,7 @@ case.
 | `stagingOrigin.accessAdminEmail` | the owner's admin email | Production's Access admin email (CR-3's production values) |
 | `stagingOrigin.identityLinkSecretVersion` | `staging-gcp-v1` | Claude's label for the staging identity-link secret; CR-3 refuses a production label |
 | `stagingOrigin.admissionMode` | `closed` | CR-3's fail-closed staging mode; the other mode, `synthetic-rehearsal`, opens accountless admission |
+| `stagingOrigin.accessAud` | `b000414465233b6feb03671fa4ec60cfc505d8bc10e435fd77e8fb78656474ad` | The owner (2026-10-03): the AUD tag of the Access application on `admin.staging.tibotattle.com` (Google IdP, an allow policy for the owner's email only). Not a secret |
 
 ## The staging service
 
@@ -193,11 +196,10 @@ them).
 D-CRB composes `HOST_MODE=staging` in `cloud-run/server.mjs`, so OPS-2 no
 longer holds the service for its composition: the `STAGING_HOST_COMPOSITION_PENDING`
 gate was removed, with its check, when D-CRB and STG-PREP met on the
-fast-path final line. The staging service still waits for the owner's Access
-AUD (`STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud`). The staging
-maintenance job (D-OPS4) stays deferred
-(`STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE`): its render does not
-yet read the staging plane's own origins and identity values.
+fast-path final line. The owner's Access AUD is committed (2026-10-03), so
+the staging service renders, and the staging maintenance job (D-OPS4)
+renders the `staging-maintenance-job` profile from the same `stagingOrigin`
+block (STAGING-MAINT-RENDER).
 
 The staging secrets, bucket birth and apply follow
 `docs/runbooks/gcp-staging-apply.md`, with
