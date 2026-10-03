@@ -1280,7 +1280,8 @@ line at `2b5c90cd`.
 | Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |
-| Barrier proof producer, edge live capture producer | H.2, rollout | No command writes either file |
+| Barrier proof producer | H.2 | No command writes the file |
+| Edge live capture producer | Rollout | `built` (`gcp-production-rollout.mjs capture-edge`), tested locally with a fake provider; never run against Cloudflare |
 | R2 to Cloud Storage copy | After | `not built` (PT-7) |
 | Observation duration and brake thresholds | H.7 | Owner decision, not recorded |
 | v0.x upload 503s in origin-5xx-ratio | H.7 | Owner question, open. Round 12 answers v0.x uploads with the uniform `503 POSTGRES_ROUTE_NOT_PORTED` on `/api/v1/contributions` and `/api/v1/device/upload-authorizations`, paths every live v1 upload shares, so the alert cannot exclude them and they count as 5xx. The live ingestion database never admitted a v0.x row, so the effect is theoretical. Keep counting them, or give v0.x a code the exclusion can name ([monitoring](../../apps/worker/cloud-run/infra/monitoring.md#origin-5xx-ratio)) |

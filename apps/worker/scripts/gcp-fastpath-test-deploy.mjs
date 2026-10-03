@@ -768,9 +768,10 @@ Options:
   --commit=<ref>          commit to build (required for build, migrate, origin and all); the origin step's
                           contract blob is read at it, so with --image it must be the image's commit
   --edge-live=<abs path>  the owner's fresh (15 min) EP-9 capture of the live edge Worker
-                          ({schema, capturedAt, snapshot, deployment}, as gcp-production-rollout.mjs roll reads it);
-                          required for origin and all
-  --edge-environment=production|staging   the tracked Worker the capture is of (wrangler.jsonc env)
+                          ({schema, capturedAt, snapshot, deployment}, as gcp-production-rollout.mjs capture-edge
+                          writes it and roll reads it); required for origin and all
+  --edge-environment=production|staging   the edge Worker the capture is of (production: wrangler.jsonc
+                          env.production; staging: the pinned staging-edge Worker)
   --image=<repo@sha256:>  use an existing image digest instead of building
   --now=<ISO instant>     injected clock (refresh --now + ANALYTICS_V2_TEST_CLOCK=1; origin ANALYTICS_V2_TEST_NOW_MS)
   --out=<dir>             receipt directory (default: $TMPDIR/tibotattle-fastpath-d1)

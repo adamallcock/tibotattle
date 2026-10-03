@@ -110,8 +110,37 @@ and print the argv; they run no `gcloud` and make no request.
      `node scripts/gcp-backup-horizon.mjs audit --environment=<env> --project=<project> --primary-instance=<instance>`,
      saved to an owner-private file. `built`.
    - The live edge capture, schema `tibotattle-edge-live-capture-v1`, at most
-     15 minutes before `roll`. No command in the repository writes this file;
-     the roll consumes it. `not built`: `<command: edge live capture>`.
+     15 minutes before `roll`. `capture-edge` writes it, read-only against
+     Cloudflare (no lock, no `gcloud`, no write), with `CLOUDFLARE_API_TOKEN`
+     in the environment as for the production deploy:
+
+     ```bash
+     node scripts/gcp-production-rollout.mjs capture-edge --environment=<env> \
+       --inventory=<absolute path of the owner-private Cloudflare inventory> --inventory-sha256=<its sha256> \
+       --output=<absolute new path outside the checkout> --execute
+     ```
+
+     The inventory is the private file the production deploy takes
+     (`--inventory`, `--inventory-sha256`); it supplies the account id and must
+     be of this environment's edge Worker. That Worker is `app-usagemonitor`
+     on EP-9's three domains for production. For staging it is the
+     staging-edge Worker `app-usagemonitor-staging-edge` on
+     `staging.tibotattle.com` and `admin.staging.tibotattle.com`, never
+     `wrangler.jsonc`'s workers.dev `env.staging`. The command verifies the
+     capture exactly as `roll` will and writes nothing unless it verifies. It
+     then writes the file once, mode 0600. It refuses an existing path or a
+     symlink, and a parent directory that is inside any git checkout (a
+     directory from it up to `/` holds a `.git` entry, which covers this
+     checkout, the main checkout, other worktrees and `.git` itself) or that
+     another user could write to (it must be the owner's and not group- or
+     world-writable, unless it is a root-owned sticky directory such as
+     `/tmp`). Once the file is open it checks the path again, so a parent
+     swapped during the reads is refused. It prints only the mode, the
+     edge commit, the capture time and the file's sha256. The file holds the
+     account id and the Worker's binding values: keep it owner-private and
+     never commit it. Without `--execute` it checks the arguments, the output
+     path and the inventory, and makes no request. `built`: tested locally
+     with a fake provider, never run against Cloudflare.
 3. **Preflight, read-only.**
 
    ```bash
@@ -235,10 +264,11 @@ and print the argv; they run no `gcloud` and make no request.
 | `POSTGRES_MIGRATION_CONFLICT` | A lifecycle pass holds the migration fence | Nothing was applied. Wait for the pass and rerun |
 | `ROLLOUT_MIGRATE_RECEIPT_STALE`, `ROLLOUT_MIGRATE_RECEIPT_MISMATCH` | The receipt is older than 24 hours, or is for another commit, digest or job | Rerun `migrate` for the exact digest to get a fresh receipt. This is a no-op for an applied schema |
 | `ROLLOUT_EDGE_LIVE_STALE`, `ROLLOUT_EDGE_LIVE_UNVERIFIED` | The edge capture is older than 15 minutes or fails verification | Capture again |
+| `ROLLOUT_EDGE_CAPTURE_*`, `PRODUCTION_LIVE_*` from `capture-edge` | The output path exists or is a symlink, its parent is inside a git checkout (`ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY`) or writable by another user (`ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE`), or the path changed during the reads (`ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED`); the inventory is missing, changed or of another Worker; or the read-only Cloudflare reads were refused (`PRODUCTION_LIVE_CREDENTIAL_REQUIRED`: no token). A `ROLLOUT_EDGE_LIVE_*` code means the live edge itself does not verify | Nothing was written. Fix the input and capture again. Do not roll over an edge that does not verify |
 | `EDGE_CONTRACT_DRIFT`, `ROLLOUT_EDGE_ORIGIN_MISMATCH` | The contract blob differs from the live gcp edge's, or the edge points at another service | Do not roll. See [contract changes](#contract-changes) |
 | `ROLLOUT_MAINTENANCE_JOB_REQUIRED` | The edge is not in `gcp` mode and the target names no maintenance job (staging today) | Nothing was written. The verifier path cannot pass without a lifecycle pass; give the plane its maintenance job first |
 | `ROLLOUT_MAINTENANCE_PASS_FAILED` | The roll's maintenance execution did not succeed exactly once. This runs after the service and every job moved, so the roll has already happened and left no receipt | Read the execution's closed log lines, fix the cause, then run `roll` again for the same digest with a new edge capture. If the image is wrong, treat the roll as incomplete and fix forward |
-| `ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH`, `ROLLOUT_ORIGIN_COMMIT_MISMATCH`, `EDGE_ORIGIN_VERIFIER_*` | The served commit is not the rolled commit, or the verifier path failed. `EDGE_ORIGIN_VERIFIER_NOT_READY` means `/api/ready` did not read `ready` even after the roll's own pass: read its checks (the lifecycle, retention and reconciliation rows the pass writes). This check runs after the service and every job moved, so the roll has already happened and left no receipt | Fix the cause, then run `roll` again for the same digest. The rerun needs a new edge capture (the first is likely past 15 minutes, and no command writes one, see [open gaps](#open-gaps)). If the commit is wrong, treat the roll as incomplete and fix forward |
+| `ROLLOUT_PUBLIC_HEALTH_COMMIT_MISMATCH`, `ROLLOUT_ORIGIN_COMMIT_MISMATCH`, `EDGE_ORIGIN_VERIFIER_*` | The served commit is not the rolled commit, or the verifier path failed. `EDGE_ORIGIN_VERIFIER_NOT_READY` means `/api/ready` did not read `ready` even after the roll's own pass: read its checks (the lifecycle, retention and reconciliation rows the pass writes). This check runs after the service and every job moved, so the roll has already happened and left no receipt | Fix the cause, then run `roll` again for the same digest. The rerun needs a new edge capture from `capture-edge` (the first is likely past 15 minutes). If the commit is wrong, treat the roll as incomplete and fix forward |
 | `PRODUCTION_COORDINATION_*` | The shared deployment lock is held | A retained lock is a stop. Do not retry with raw tools; follow the typed reconciliation in [Production service operations](./production-operations.md#guarded-deployment-wrapper) |
 | `STAGING_COORDINATION_*` | The staging deployment lock is held, or its state is uncertain | A retained staging lock is a stop. Do not delete or move `refs/heads/codex/staging-deployment-lock` by hand; report the owner commit to the owner. The production lock is not involved |
 | `ROLLOUT_LOCK_REF_MISMATCH`, `DEPLOYMENT_COORDINATION_*` | The lock offered for this environment is not its own ref, or the environment is not in the closed mapping | Stop. Nothing was pushed. Fix the checkout; never point one environment at another's lock |
@@ -311,7 +341,7 @@ The first production rollout pre-stages the origin (checklist PROD-3):
 | Gap | State |
 |---|---|
 | Scheduler pause-all and resume-all, with explicit authorization and an ordered list | `not built` (D-OPS3). Every roll refuses while a trigger is unpaused. Requirement: `resume-all` takes its list from this plane's committed desired state (state `ENABLED`) intersected with the live state recorded before the pause, and never from the roll receipt's `pausedTriggers` or from another estate's triggers |
-| Live edge capture writer | `not built`. The roll consumes the file; nothing writes it |
+| Live edge capture writer | `built` (`capture-edge`). Tested locally with a fake provider; never run against Cloudflare |
 | Pre-migration backup count | The code takes two (`PRE_MIGRATION_BACKUPS`); the owner decided one plus point-in-time recovery. The change and its tests are `not built` (backup-count item) |
 | Pre-migration backup expiry | The code labels them to expire in 30 days. The privacy disclosure drafted for the cutover says pre-change backups are kept at most 90 days. Reconcile before either is published |
 | First-roll ready path | `built` (D-CRB): `roll` runs one maintenance job execution before its served-commit check. Local proof only; not run in any project. Staging has no maintenance job yet, so its origin-verifier roll is refused before any write |

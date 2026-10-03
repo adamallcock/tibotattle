@@ -24,6 +24,11 @@
  *              executed, and its 'tibotattle-gcp-migration-v1' receipt read
  *              back from the execution's log and verified. Writes the migrate
  *              receipt that roll requires.
+ *   capture-edge  read-only against Cloudflare: writes the live edge capture
+ *              roll reads (ROLLOUT_EDGE_LIVE_SCHEMA) for the environment's
+ *              edge Worker to a new owner-private file outside the
+ *              repository, after verifying it exactly as roll will. No lock,
+ *              no gcloud, no git; --execute makes the reads.
  *   roll       --authorize=roll:<env>:<digest>. Requires the matching migrate
  *              receipt and a fresh, verified capture of the live edge for this
  *              environment (its own mode, Worker, domains, single deployment
@@ -68,9 +73,10 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdtemp, open, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
@@ -90,6 +96,7 @@ import { canonicalRunAppOrigin, isEdgeOriginAudience, isEdgeServiceAccountEmail 
 import {
   EDGE_MODE_GCP_VARS,
   EDGE_MODE_PRODUCTION_DOMAINS,
+  EDGE_MODE_PRODUCTION_HOSTNAMES,
   EDGE_MODE_PRODUCTION_WORKER_NAME,
   liveEdgeMode,
   verifyEdgeModeLiveSnapshot,
@@ -103,6 +110,8 @@ import {
   verifyEdgeOriginBeforeGcp,
 } from "./production-edge-mode.mjs";
 import { createEnvironmentDeploymentLock, deploymentLockRef } from "./production-deployment-lock.mjs";
+import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
+import { createProductionLiveProvider } from "./production-live-provider.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 export const WORKER_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -125,6 +134,26 @@ export const ROLLOUT_ROLL_RECEIPT_SCHEMA = "tibotattle-gcp-rollout-roll-v1";
 export const ROLLOUT_EDGE_LIVE_SCHEMA = "tibotattle-edge-live-capture-v1";
 export const ROLLOUT_EDGE_LIVE_KEYS = Object.freeze(["schema", "capturedAt", "snapshot", "deployment"]);
 export const EDGE_CAPTURE_MAX_AGE_MS = 15 * 60 * 1_000;
+/** The verb that writes that capture (read-only against Cloudflare; no lock, no gcloud). */
+export const ROLLOUT_EDGE_CAPTURE_VERB = "capture-edge";
+/**
+ * The staging edge roll targets: the staging-edge Worker the edge-port line's
+ * staging-edge driver deploys (scripts/staging-edge-deploy.mjs there), on its
+ * two custom domains, serving the staging service's public origin. It is
+ * pinned here as production's Worker and domains are pinned in
+ * edge-mode-configuration.mjs, because no tracked file of this line declares
+ * it: wrangler.jsonc env.staging is the retired workers.dev Worker
+ * (app-usagemonitor-staging), which the staging-edge driver refuses to reuse,
+ * and the committed staging desired state names the public origin but no
+ * Worker. validateStagingEdgeIdentity refuses any other shape, and the
+ * rollout check binds publicOrigin and the admin domain to the desired
+ * state's stagingOrigin block.
+ */
+export const ROLLOUT_STAGING_EDGE_IDENTITY = Object.freeze({
+  workerName: "app-usagemonitor-staging-edge",
+  domains: Object.freeze(["admin.staging.tibotattle.com", "staging.tibotattle.com"]),
+  publicOrigin: "https://staging.tibotattle.com",
+});
 /**
  * Labelled pre-migration on-demand backups of the primary instance (OPS-10):
  * one, alongside the instance's point-in-time recovery (owner decision
@@ -166,7 +195,7 @@ const SERVICE_ACCOUNT = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0
 const REPOSITORY = /^([a-z]+-[a-z]+[0-9]{1,2})-docker\.pkg\.dev\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/[a-z][a-z0-9-]{0,62}\/[a-z][a-z0-9-]{0,127}$/u;
 const EXECUTION = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const BACKUP_ID = /^[1-9][0-9]{0,18}$/u;
-const SAFE_CODE = /^(?:ROLLOUT_[A-Z0-9_]+|EDGE_CONTRACT_DRIFT|PRODUCTION_SIMP_RESIDUE_MISSING|PRODUCTION_MIGRATION_CONTRACT_[A-Z_]+|POSTGRES_PRODUCTION_MIGRATIONS_RECEIPT_INVALID|BACKUP_[A-Z0-9_]+|PRODUCTION_COORDINATION_[A-Z_]+|STAGING_COORDINATION_[A-Z_]+|DEPLOYMENT_COORDINATION_[A-Z_]+|EDGE_ORIGIN_[A-Z_]+)$/u;
+const SAFE_CODE = /^(?:ROLLOUT_[A-Z0-9_]+|PRODUCTION_LIVE_[A-Z0-9_]+|EDGE_CONTRACT_DRIFT|PRODUCTION_SIMP_RESIDUE_MISSING|PRODUCTION_MIGRATION_CONTRACT_[A-Z_]+|POSTGRES_PRODUCTION_MIGRATIONS_RECEIPT_INVALID|BACKUP_[A-Z0-9_]+|PRODUCTION_COORDINATION_[A-Z_]+|STAGING_COORDINATION_[A-Z_]+|DEPLOYMENT_COORDINATION_[A-Z_]+|EDGE_ORIGIN_[A-Z_]+)$/u;
 
 export class RolloutError extends Error {
   constructor(code) {
@@ -232,15 +261,8 @@ const FLAGS = Object.freeze({
   }),
 });
 
-/**
- * Parse `<verb> --flag=value... [--execute]`. Mutating verbs need
- * --authorize=<verb>:<environment>:<commit or digest> to execute; a supplied
- * authorization must match in a dry run too.
- */
-export function parseRolloutArguments(argv) {
-  if (!Array.isArray(argv) || !ROLLOUT_VERBS.includes(argv[0])) fail("ROLLOUT_VERB_INVALID");
-  const verb = argv[0];
-  const { required, optional } = FLAGS[verb];
+/** `--flag=value` pairs from a closed set, each at most once, and at most one --execute. */
+function readFlags(argv, { required, optional }) {
   const allowed = new Set([...required, ...optional]);
   const values = new Map();
   let execute = false;
@@ -257,6 +279,18 @@ export function parseRolloutArguments(argv) {
     values.set(name, value);
   }
   if (!required.every((name) => values.has(name))) fail("ROLLOUT_ARGUMENT_MISSING");
+  return { values, execute };
+}
+
+/**
+ * Parse `<verb> --flag=value... [--execute]`. Mutating verbs need
+ * --authorize=<verb>:<environment>:<commit or digest> to execute; a supplied
+ * authorization must match in a dry run too.
+ */
+export function parseRolloutArguments(argv) {
+  if (!Array.isArray(argv) || !ROLLOUT_VERBS.includes(argv[0])) fail("ROLLOUT_VERB_INVALID");
+  const verb = argv[0];
+  const { values, execute } = readFlags(argv, FLAGS[verb]);
   const environment = values.get("--environment");
   if (!ROLLOUT_ENVIRONMENTS.includes(environment)) fail("ROLLOUT_ENVIRONMENT_INVALID");
   const commit = values.get("--commit");
@@ -721,11 +755,54 @@ async function defaultReadTrackedConfig() {
 }
 
 /**
- * The environment's edge as the tracked wrangler.jsonc declares it: the
- * Worker name, its custom domains ([] for a workers.dev-only Worker) and
- * PUBLIC_ORIGIN. Production must be EP-9's production Worker and domains.
+ * A staging edge identity is closed: exactly {workerName, domains,
+ * publicOrigin}; a lowercase Worker name carrying the staging token that is
+ * neither production's Worker nor wrangler.jsonc's retired workers.dev
+ * staging Worker; and exactly two custom domains, the public host and its
+ * admin host, each with a staging label below the zone and none of them a
+ * production hostname, with publicOrigin the public host's https origin.
+ * Anything else is ROLLOUT_EDGE_IDENTITY_UNRESOLVED.
+ */
+export function validateStagingEdgeIdentity(identity) {
+  const unresolved = () => fail("ROLLOUT_EDGE_IDENTITY_UNRESOLVED");
+  if (!hasExactKeys(identity, ["workerName", "domains", "publicOrigin"])
+      || typeof identity.workerName !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(identity.workerName)
+      || !tokens(identity.workerName).includes("staging")
+      || [EDGE_MODE_PRODUCTION_WORKER_NAME, "app-usagemonitor-staging"].includes(identity.workerName)
+      || typeof identity.publicOrigin !== "string" || !Array.isArray(identity.domains)) {
+    unresolved();
+  }
+  let origin;
+  try {
+    origin = new URL(identity.publicOrigin);
+  } catch {
+    unresolved();
+  }
+  const host = origin.hostname;
+  const expected = [`admin.${host}`, host].sort();
+  if (origin.protocol !== "https:" || origin.origin !== identity.publicOrigin
+      || JSON.stringify(identity.domains) !== JSON.stringify(expected)
+      || expected.some((domain) => EDGE_MODE_PRODUCTION_HOSTNAMES.includes(domain)
+        || EDGE_MODE_PRODUCTION_DOMAINS.includes(domain)
+        || !domain.split(".").slice(0, -2).includes("staging"))) {
+    unresolved();
+  }
+  return identity;
+}
+
+/**
+ * The environment's edge: the Worker name, its custom domains and
+ * PUBLIC_ORIGIN. Production is as the tracked wrangler.jsonc declares it and
+ * must be EP-9's production Worker and domains. Staging is the pinned
+ * ROLLOUT_STAGING_EDGE_IDENTITY (the staging-edge Worker), never
+ * wrangler.jsonc's env.staging.
  */
 export async function trackedEdgeIdentity(environment, readTrackedConfig = defaultReadTrackedConfig) {
+  if (environment === "staging") {
+    const identity = validateStagingEdgeIdentity(ROLLOUT_STAGING_EDGE_IDENTITY);
+    return deepFreeze({ workerName: identity.workerName, domains: [...identity.domains],
+      publicOrigin: identity.publicOrigin });
+  }
   let config;
   try {
     config = await readTrackedConfig();
@@ -777,7 +854,7 @@ function verifyPreEdgeCapture({ snapshot, deployment, sourceCommit, expectedDoma
 
 /** The owner-supplied live edge capture file: a regular, single-link file of at most 4 MiB of JSON. */
 export function readEdgeLiveCaptureFile(path) {
-  return readBoundedJson(path, "ROLLOUT_EDGE_LIVE_INVALID", 4 * MAX_INPUT_BYTES);
+  return readBoundedJson(path, "ROLLOUT_EDGE_LIVE_INVALID", EDGE_CAPTURE_MAX_BYTES);
 }
 
 /** A capture time is fresh when it is at most EDGE_CAPTURE_MAX_AGE_MS old and not in the future. */
@@ -833,6 +910,259 @@ export async function verifyEdgeLiveCapture(capture, { environment, nowMs, readT
     publicOrigin: identity.publicOrigin,
     upstreamOrigin: mode === "gcp" ? bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.upstreamOrigin) : null,
     originAudience: mode === "gcp" ? bindingText(capture.snapshot, EDGE_MODE_GCP_VARS.originAudience) : null,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Edge capture (capture-edge)
+
+const CAPTURE_EDGE_FLAGS = Object.freeze({
+  required: Object.freeze(["--environment", "--inventory", "--inventory-sha256", "--output"]),
+  optional: Object.freeze([]),
+});
+const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
+/** readEdgeLiveCaptureFile's bound: a capture roll could not read is never written. */
+const EDGE_CAPTURE_MAX_BYTES = 4 * MAX_INPUT_BYTES;
+
+/**
+ * Parse `capture-edge --environment=<env> --inventory=<file>
+ * --inventory-sha256=<hex> --output=<new file> [--execute]`. The inventory is
+ * the owner-private Cloudflare inventory production deploys and the
+ * staging-edge driver already take (--inventory, --inventory-sha256): it
+ * supplies the account id, and CLOUDFLARE_API_TOKEN the credential, exactly as
+ * there. Both paths are absolute.
+ */
+export function parseCaptureEdgeArguments(argv) {
+  if (!Array.isArray(argv) || argv[0] !== ROLLOUT_EDGE_CAPTURE_VERB) fail("ROLLOUT_VERB_INVALID");
+  const { values, execute } = readFlags(argv, CAPTURE_EDGE_FLAGS);
+  const environment = values.get("--environment");
+  if (!ROLLOUT_ENVIRONMENTS.includes(environment)) fail("ROLLOUT_ENVIRONMENT_INVALID");
+  if (!isAbsolute(values.get("--inventory")) || !isAbsolute(values.get("--output"))) fail("ROLLOUT_PATH_INVALID");
+  if (!SHA256.test(values.get("--inventory-sha256"))) fail("ROLLOUT_ARGUMENT_INVALID");
+  return deepFreeze({
+    verb: ROLLOUT_EDGE_CAPTURE_VERB,
+    environment,
+    inventory: values.get("--inventory"),
+    inventorySha256: values.get("--inventory-sha256"),
+    output: resolve(values.get("--output")),
+    execute,
+  });
+}
+
+/**
+ * The capture's destination: a path that does not exist (not even as a
+ * symlink), whose parent is an existing directory outside every git checkout
+ * and safe to hold an owner-only file (see captureParentSafe). Returns the
+ * path under the parent's real path.
+ */
+async function captureOutputPath(output, repositoryRoot) {
+  if ((await lstat(output).catch(() => null)) !== null) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS");
+  let parent;
+  try {
+    parent = await realpath(dirname(output));
+  } catch {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  }
+  if (basename(output) === "") fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  await captureParentSafe(parent, repositoryRoot);
+  return join(parent, basename(output));
+}
+
+/**
+ * The checks on the capture's real parent directory, run before the reads and
+ * again once the file is open:
+ * - a directory outside this repository (compared on real paths,
+ *   case-insensitively, so a symlinked or differently-cased parent cannot
+ *   reach the checkout);
+ * - outside every other git checkout too (the owner's main checkout, a
+ *   sibling worktree, a `.git` directory): no directory from the parent up to
+ *   `/` holds a `.git` entry, file or directory. A `.git` directory's own
+ *   parent holds it, so a path inside one is refused as well. An entry that
+ *   cannot be read is treated as present;
+ * - the rule of production-reconcile.mjs createPrivateReconciliationOutputDirectory:
+ *   owned by this user and not group- or world-writable, unless it is a
+ *   root-owned sticky directory, so nobody else can later replace the capture.
+ */
+async function captureParentSafe(parent, repositoryRoot) {
+  let info;
+  let root;
+  try {
+    info = await lstat(parent);
+    root = await realpath(repositoryRoot);
+  } catch {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  }
+  if (!info.isDirectory()) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID");
+  const folded = parent.toLowerCase();
+  const rootFolded = root.toLowerCase();
+  if (folded === rootFolded || folded.startsWith(rootFolded.endsWith(sep) ? rootFolded : `${rootFolded}${sep}`)) {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY");
+  }
+  for (let directory = parent; ; directory = dirname(directory)) {
+    const marker = await lstat(join(directory, ".git")).then(() => true, (error) => error?.code !== "ENOENT");
+    if (marker) fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY");
+    if (dirname(directory) === directory) break;
+  }
+  const uid = process.getuid?.();
+  const rootOwnedSticky = info.uid === 0 && (info.mode & 0o1000) !== 0;
+  if (!rootOwnedSticky && ((uid !== undefined && info.uid !== uid) || (info.mode & 0o022) !== 0)) {
+    fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE");
+  }
+}
+
+/**
+ * The production deploy's reader (production-reconcile.mjs): a regular,
+ * single-link, owner-only file whose bytes match the given sha256.
+ */
+async function defaultReadCaptureInventory(path, expectedSha256) {
+  if ((await lstat(path).catch(() => null)) === null) fail("ROLLOUT_EDGE_CAPTURE_INVENTORY_REQUIRED");
+  const { readPrivateProductionInventory } = await import("./production-reconcile.mjs");
+  return readPrivateProductionInventory(path, expectedSha256);
+}
+
+/** The account id from the owner-private inventory, which must be of the environment's edge Worker. */
+async function captureAccountId(context, args, identity) {
+  let inventory;
+  try {
+    inventory = await context.readInventory(args.inventory, args.inventorySha256);
+  } catch (error) {
+    fail(error?.code === "ROLLOUT_EDGE_CAPTURE_INVENTORY_REQUIRED" ? error.code : "ROLLOUT_EDGE_CAPTURE_INVENTORY_INVALID");
+  }
+  if (!isRecord(inventory) || typeof inventory.accountId !== "string" || !ACCOUNT_ID.test(inventory.accountId)) {
+    fail("ROLLOUT_EDGE_CAPTURE_INVENTORY_INVALID");
+  }
+  if (inventory.workerName !== identity.workerName) fail("ROLLOUT_EDGE_CAPTURE_TARGET_MISMATCH");
+  return inventory.accountId;
+}
+
+function liveReadCode(error) {
+  return typeof error?.code === "string" && /^PRODUCTION_LIVE_[A-Z0-9_]+$/u.test(error.code)
+    ? error.code
+    : "ROLLOUT_EDGE_CAPTURE_READ_FAILED";
+}
+
+/**
+ * O_EXCL and O_NOFOLLOW at mode 0600: an existing path or a symlink is
+ * refused, never followed or replaced. O_NOFOLLOW guards only the last
+ * component, so before any byte is written the open file must still be the
+ * entry at `path` on real paths (a parent swapped for a symlink during the
+ * reads is caught) and the parent must pass captureParentSafe again. On a
+ * failure the empty file this call created is removed, matched by device
+ * and inode.
+ */
+async function writeCaptureExclusive(path, bytes, repositoryRoot) {
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL
+      | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+  } catch (error) {
+    fail(error?.code === "EEXIST" || error?.code === "ELOOP"
+      ? "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS" : "ROLLOUT_EDGE_CAPTURE_WRITE_FAILED");
+  }
+  let opened;
+  try {
+    opened = await handle.stat();
+    const real = await realpath(path);
+    const entry = await lstat(real);
+    if (real !== path || !entry.isFile() || entry.dev !== opened.dev || entry.ino !== opened.ino) {
+      fail("ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED");
+    }
+    await captureParentSafe(dirname(real), repositoryRoot);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await removeCreatedCapture(path, opened);
+    fail(/^ROLLOUT_EDGE_CAPTURE_OUTPUT_[A-Z_]+$/u.test(error?.code ?? "") ? error.code
+      : "ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED");
+  }
+  try {
+    await handle.chmod(0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+  } catch {
+    await handle.close().catch(() => {});
+    await removeCreatedCapture(path, opened);
+    fail("ROLLOUT_EDGE_CAPTURE_WRITE_FAILED");
+  }
+}
+
+/** Unlink only the file this call created: the entry at `path` (or where it now resolves) with the open file's device and inode. */
+async function removeCreatedCapture(path, opened) {
+  if (opened === undefined) return;
+  for (const candidate of [await realpath(path).catch(() => null), path]) {
+    const entry = candidate === null ? null : await lstat(candidate).catch(() => null);
+    if (entry?.isFile() && entry.dev === opened.dev && entry.ino === opened.ino) {
+      await unlink(candidate).catch(() => {});
+      return;
+    }
+  }
+}
+
+/**
+ * capture-edge: read the environment's edge Worker through the reviewed
+ * read-only provider (createProductionLiveProvider, which refuses a Worker
+ * whose active deployment is not one version at 100% or changes during the
+ * reads), canonicalize it (createProductionLiveConfigSnapshot), and write
+ * {schema, capturedAt, snapshot, deployment}. capturedAt is the injected
+ * clock before the first read, so freshness never overstates; deployment is
+ * that single active version. The capture is verified with
+ * verifyEdgeLiveCapture, as roll will read it, before anything is written,
+ * and an unverified one is refused with nothing written. No lock, no gcloud,
+ * no git. Without --execute it validates the arguments, the output path and
+ * the inventory, and makes no request. The result is content-free: mode,
+ * edge commit, capture time and the file's sha256.
+ */
+async function captureEdge(argv, dependencies) {
+  const args = parseCaptureEdgeArguments(argv);
+  const context = {
+    now: dependencies.now ?? Date.now,
+    readTrackedConfig: dependencies.readTrackedConfig ?? defaultReadTrackedConfig,
+    readInventory: dependencies.readInventory ?? defaultReadCaptureInventory,
+    liveProviderFactory: dependencies.liveProviderFactory ?? createProductionLiveProvider,
+    repositoryRoot: dependencies.repositoryRoot ?? REPOSITORY_ROOT,
+  };
+  const identity = await trackedEdgeIdentity(args.environment, context.readTrackedConfig);
+  const output = await captureOutputPath(args.output, context.repositoryRoot);
+  const accountId = await captureAccountId(context, args, identity);
+  if (!args.execute) {
+    return deepFreeze({ status: "dry-run", verb: args.verb, environment: args.environment, reads: "cloudflare-read-only" });
+  }
+  const capturedAt = new Date(context.now()).toISOString();
+  let inventory;
+  try {
+    inventory = await context.liveProviderFactory({ accountId, workerName: identity.workerName }).capture();
+  } catch (error) {
+    fail(liveReadCode(error));
+  }
+  if (!isRecord(inventory) || inventory.accountId !== accountId || inventory.workerName !== identity.workerName) {
+    fail("ROLLOUT_EDGE_CAPTURE_TARGET_MISMATCH");
+  }
+  let snapshot;
+  try {
+    snapshot = createProductionLiveConfigSnapshot(inventory);
+  } catch (error) {
+    fail(liveReadCode(error));
+  }
+  const capture = {
+    schema: ROLLOUT_EDGE_LIVE_SCHEMA,
+    capturedAt,
+    snapshot,
+    deployment: { versions: [{ version_id: snapshot.versionId, percentage: 100 }] },
+  };
+  const edge = await verifyEdgeLiveCapture(capture, {
+    environment: args.environment, nowMs: context.now(), readTrackedConfig: context.readTrackedConfig,
+  });
+  const bytes = Buffer.from(`${JSON.stringify(capture, null, 2)}\n`, "utf8");
+  if (bytes.length > EDGE_CAPTURE_MAX_BYTES) fail("ROLLOUT_EDGE_CAPTURE_TOO_LARGE");
+  await writeCaptureExclusive(output, bytes, context.repositoryRoot);
+  return deepFreeze({
+    status: "ok",
+    verb: args.verb,
+    environment: args.environment,
+    mode: edge.mode,
+    edgeCommit: edge.edgeCommit,
+    capturedAt: edge.capturedAt,
+    sha256: sha256(bytes),
   });
 }
 
@@ -1406,10 +1736,12 @@ async function runPreflight(context, args, target) {
 /**
  * Run one verb. `dependencies`: run (sync argv runner), loadTarget,
  * lockFactory, now, uuid, tmpdir, fetch, readTrackedConfig,
- * verifyBackupAudit, createBackup, readPrimaryMigrations. Every default
- * touches only this checkout until --execute.
+ * verifyBackupAudit, createBackup, readPrimaryMigrations; capture-edge reads
+ * only now, readTrackedConfig, readInventory, liveProviderFactory and
+ * repositoryRoot. Every default touches only this checkout until --execute.
  */
 export async function runRollout(argv, dependencies = {}) {
+  if (Array.isArray(argv) && argv[0] === ROLLOUT_EDGE_CAPTURE_VERB) return captureEdge(argv, dependencies);
   const args = parseRolloutArguments(argv);
   const context = {
     run: dependencies.run ?? spawnRunner,
@@ -1452,11 +1784,26 @@ export async function runRollout(argv, dependencies = {}) {
 // whose import graph (gcp-fastpath-test-deploy.mjs) imports this module back.
 // Awaiting here would leave this module evaluating while that import waits for
 // it, and Node would exit 13 ("unsettled top-level await") before any verb ran.
+/**
+ * The command line: the result as JSON on stdout, or a closed error code on
+ * stderr, and the exit status. Nothing else is printed.
+ */
+export async function runRolloutCli(argv, dependencies = {}, io = {
+  stdout: (text) => process.stdout.write(text),
+  stderr: (text) => process.stderr.write(text),
+}) {
+  try {
+    const result = await runRollout(argv, dependencies);
+    io.stdout(`${JSON.stringify(result, null, 2)}\n`);
+    return 0;
+  } catch (error) {
+    io.stderr(`${JSON.stringify({ status: "error", code: safeRolloutErrorCode(error) })}\n`);
+    return 1;
+  }
+}
+
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === SCRIPT_FILE) {
-  runRollout(process.argv.slice(2)).then((result) => {
-    console.log(JSON.stringify(result, null, 2));
-  }, (error) => {
-    console.error(JSON.stringify({ status: "error", code: safeRolloutErrorCode(error) }));
-    process.exitCode = 1;
+  runRolloutCli(process.argv.slice(2)).then((status) => {
+    process.exitCode = status;
   });
 }

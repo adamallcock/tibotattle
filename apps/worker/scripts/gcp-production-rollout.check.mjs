@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -26,7 +26,12 @@ import {
   RUNTIME_PRIMARY_FUNCTIONS,
   runtimeGrantPolicyDigest,
 } from "../cloud-run/postgres-runtime-grants.mjs";
-import { applyEdgeModeSnapshotDelta, liveEdgeMode } from "./edge-mode-configuration.mjs";
+import {
+  applyEdgeModeSnapshotDelta,
+  EDGE_MODE_PRODUCTION_DOMAINS,
+  EDGE_MODE_PRODUCTION_WORKER_NAME,
+  liveEdgeMode,
+} from "./edge-mode-configuration.mjs";
 import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
 import {
   createEnvironmentDeploymentLock,
@@ -42,13 +47,21 @@ import {
   loadRolloutTargetFromInfraManifest,
   parseRolloutArguments,
   PRE_MIGRATION_BACKUPS,
+  readEdgeLiveCaptureFile,
+  REPOSITORY_ROOT,
   ROLLOUT_ARGV,
+  ROLLOUT_EDGE_CAPTURE_VERB,
+  ROLLOUT_EDGE_LIVE_KEYS,
   ROLLOUT_EDGE_LIVE_SCHEMA,
   ROLLOUT_MIGRATE_RECEIPT_SCHEMA,
+  ROLLOUT_STAGING_EDGE_IDENTITY,
   runRollout,
+  runRolloutCli,
   safeRolloutErrorCode,
   trackedEdgeIdentity,
   validateRolloutTarget,
+  validateStagingEdgeIdentity,
+  verifyEdgeLiveCapture,
   verifyMigrateReceipt,
 } from "./gcp-production-rollout.mjs";
 
@@ -429,14 +442,14 @@ const fencedLive = deployed(applyEdgeModeSnapshotDelta({ snapshot: withSecrets, 
 const gcpLive = deployed(applyEdgeModeSnapshotDelta({ snapshot: fencedLive, mode: "gcp", plan: GCP_PLAN, trackedConfig: TRACKED }),
   EDGE_COMMIT, versionId(155));
 const preEdgeLive = deployed(FIXTURE, EDGE_COMMIT, versionId(152));
-/** A staging Worker: its own name, no custom domain, its tracked PUBLIC_ORIGIN. */
-const asStaging = (snapshot) => resnapshot(snapshot, {
-  workerName: TRACKED.env.staging.name,
-  domains: [],
-  namespaces: snapshot.namespaces.map((namespace) => ({ ...namespace, script: TRACKED.env.staging.name,
-    name: `${TRACKED.env.staging.name}_${namespace.class}` })),
+/** The staging edge Worker: its pinned name, its two staging custom domains and its public origin. */
+const asStaging = (snapshot, identity = ROLLOUT_STAGING_EDGE_IDENTITY) => resnapshot(snapshot, {
+  workerName: identity.workerName,
+  domains: identity.domains.map((hostname) => ({ hostname })),
+  namespaces: snapshot.namespaces.map((namespace) => ({ ...namespace, script: identity.workerName,
+    name: `${identity.workerName}_${namespace.class}` })),
   bindings: snapshot.bindings.map((binding) => (binding.name === "PUBLIC_ORIGIN"
-    ? { ...binding, text: TRACKED.env.staging.vars.PUBLIC_ORIGIN }
+    ? { ...binding, text: identity.publicOrigin }
     : binding.name === "ENVIRONMENT" ? { ...binding, text: "staging" } : binding)),
 });
 const stagingGcpLive = asStaging(gcpLive);
@@ -517,25 +530,75 @@ test("the target is closed and never a test, rehearsal or other-plane resource",
     isCode("ROLLOUT_TARGET_PLANE_MISMATCH"), "a staging target names every resource with the staging token");
 });
 
-test("the edge identity comes from the tracked wrangler.jsonc, and production is EP-9's Worker and domains", async () => {
+test("the production edge identity comes from the tracked wrangler.jsonc and is EP-9's Worker and domains", async () => {
   const production = await trackedEdgeIdentity("production");
   assert.deepEqual(production, { workerName: "app-usagemonitor",
     domains: ["admin.tibotattle.com", "tibotattle.com", "www.tibotattle.com"], publicOrigin: "https://tibotattle.com" });
-  const staging = await trackedEdgeIdentity("staging");
-  assert.deepEqual({ ...staging, publicOrigin: undefined },
-    { workerName: TRACKED.env.staging.name, domains: [], publicOrigin: undefined }, "staging is a workers.dev-only Worker");
-  assert.equal(staging.publicOrigin, TRACKED.env.staging.vars.PUBLIC_ORIGIN);
   for (const edit of [
     (config) => { config.env.production.name = "app-usagemonitor-other"; },
     (config) => { config.env.production.routes = config.env.production.routes.slice(1); },
     (config) => { config.env.production.vars.PUBLIC_ORIGIN = "https://tibotattle.com/"; },
-    (config) => { delete config.env.staging; },
+    (config) => { delete config.env.production; },
   ]) {
     const config = structuredClone(TRACKED);
     edit(config);
-    await assert.rejects(trackedEdgeIdentity(config.env.staging === undefined ? "staging" : "production", async () => config),
-      isCode("ROLLOUT_EDGE_IDENTITY_UNRESOLVED"));
+    await assert.rejects(trackedEdgeIdentity("production", async () => config), isCode("ROLLOUT_EDGE_IDENTITY_UNRESOLVED"));
   }
+  await assert.rejects(trackedEdgeIdentity("test", async () => TRACKED), isCode("ROLLOUT_EDGE_IDENTITY_UNRESOLVED"));
+});
+
+test("the staging edge identity is the pinned staging-edge Worker, never wrangler.jsonc's workers.dev env.staging", async () => {
+  const pinned = { workerName: "app-usagemonitor-staging-edge",
+    domains: ["admin.staging.tibotattle.com", "staging.tibotattle.com"], publicOrigin: "https://staging.tibotattle.com" };
+  assert.deepEqual(await trackedEdgeIdentity("staging"), pinned);
+  // The tracked config plays no part: neither its absence nor its env.staging changes staging's edge.
+  assert.deepEqual(await trackedEdgeIdentity("staging", async () => { throw new Error("unread"); }), pinned);
+  assert.notEqual(pinned.workerName, TRACKED.env.staging.name);
+  assert.notEqual(pinned.publicOrigin, TRACKED.env.staging.vars.PUBLIC_ORIGIN);
+  // The pin agrees with the committed staging desired state the staging service renders from:
+  // its PUBLIC_ORIGIN and the ADMIN_HOST_ORIGIN derived from it.
+  const desired = JSON.parse(await readFile(new URL("../cloud-run/infra/staging.desired-state.json", import.meta.url), "utf8"));
+  const { validateStagingOrigin } = await import("./gcp-ops-infra-manifest.mjs");
+  const stagingOrigin = validateStagingOrigin(desired.stagingOrigin, "staging");
+  assert.equal(stagingOrigin.publicOrigin, pinned.publicOrigin);
+  assert.deepEqual([new URL(stagingOrigin.adminOrigin).hostname, new URL(stagingOrigin.publicOrigin).hostname].sort(),
+    pinned.domains);
+  assert.deepEqual(validateStagingEdgeIdentity(ROLLOUT_STAGING_EDGE_IDENTITY), ROLLOUT_STAGING_EDGE_IDENTITY);
+  for (const overrides of [
+    { workerName: "app-usagemonitor" },
+    { workerName: "app-usagemonitor-staging" },
+    { workerName: "app-usagemonitor-edge" },
+    { workerName: "App-Usagemonitor-Staging-Edge" },
+    { domains: ["staging.tibotattle.com"] },
+    { domains: ["admin.staging.tibotattle.com", "staging.tibotattle.com", "www.staging.tibotattle.com"] },
+    { domains: ["staging.tibotattle.com", "admin.staging.tibotattle.com"] },
+    { domains: ["admin.tibotattle.com", "tibotattle.com"], publicOrigin: "https://tibotattle.com" },
+    { domains: ["admin.edge.tibotattle.com", "edge.tibotattle.com"], publicOrigin: "https://edge.tibotattle.com" },
+    { publicOrigin: "https://staging.tibotattle.com/" },
+    { publicOrigin: "http://staging.tibotattle.com" },
+    { publicOrigin: "https://admin.staging.tibotattle.com" },
+    { extra: true },
+  ]) {
+    assert.throws(() => validateStagingEdgeIdentity({ ...ROLLOUT_STAGING_EDGE_IDENTITY, ...overrides }),
+      isCode("ROLLOUT_EDGE_IDENTITY_UNRESOLVED"), JSON.stringify(overrides));
+  }
+});
+
+test("a staging capture of another Worker or another domain set is refused", async () => {
+  const verify = (snapshot) => verifyEdgeLiveCapture(JSON.parse(capture(snapshot)), { environment: "staging", nowMs: NOW });
+  assert.equal((await verify(stagingWorkerLive)).mode, "worker");
+  assert.equal((await verify(stagingGcpLive)).publicOrigin, "https://staging.tibotattle.com");
+  const retired = { workerName: TRACKED.env.staging.name, domains: [], publicOrigin: TRACKED.env.staging.vars.PUBLIC_ORIGIN };
+  await assert.rejects(verify(asStaging(workerLive, retired)), isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"),
+    "the retired workers.dev staging Worker");
+  await assert.rejects(verify(workerLive), isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"), "the production Worker");
+  for (const domains of [[], ["staging.tibotattle.com"], [...ROLLOUT_STAGING_EDGE_IDENTITY.domains, "www.staging.tibotattle.com"],
+    ["admin.tibotattle.com", "tibotattle.com", "www.tibotattle.com"]]) {
+    await assert.rejects(verify(asStaging(workerLive, { ...ROLLOUT_STAGING_EDGE_IDENTITY, domains })),
+      isCode("ROLLOUT_EDGE_LIVE_UNVERIFIED"), domains.join(","));
+  }
+  await assert.rejects(verify(asStaging(workerLive, { ...ROLLOUT_STAGING_EDGE_IDENTITY,
+    publicOrigin: TRACKED.env.staging.vars.PUBLIC_ORIGIN })), isCode("ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"));
 });
 
 test("a dry run validates and prints argv only: no gcloud, no node, no request, no lock", async (t) => {
@@ -832,12 +895,12 @@ test("outside gcp mode the served commit is read through the EP-6 verifier path 
   }
 });
 
-test("a staging roll verifies a workers.dev-only gcp edge against staging's own domains and public origin", async (t) => {
+test("a staging roll verifies the staging-edge Worker in gcp mode against staging's own domains and public origin", async (t) => {
   const paths = await migrated(t, { target: STAGING_TARGET, edge: stagingGcpLive });
   const estate = fakeEstate({ target: STAGING_TARGET });
   const receipt = await runRollout(executeRoll(paths, "staging"), dependencies(estate, fakeLock()));
   assert.equal(receipt.environment, "staging");
-  assert.deepEqual(estate.requests.map(({ url }) => url), [`${TRACKED.env.staging.vars.PUBLIC_ORIGIN}/api/health`]);
+  assert.deepEqual(estate.requests.map(({ url }) => url), ["https://staging.tibotattle.com/api/health"]);
   // A production capture is not this environment's edge.
   await writeFile(paths.edgeLive, capture(gcpLive));
   await assert.rejects(runRollout(executeRoll(paths, "staging"), dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock())),
@@ -1387,3 +1450,419 @@ test("the CLI entry finishes: no top-level await deadlocks the manifest's import
       ["dry-run", "build", environment, `refs/heads/codex/${environment}-deployment-lock`]);
   }
 });
+
+// ---------------------------------------------------------------------------
+// capture-edge: the writer of the capture roll reads. Fakes only: the
+// provider factory, the inventory reader and the clock are injected, and no
+// request, lock, gcloud or git process ever runs.
+
+const ACCOUNT_ID = "0a".repeat(16);
+const INVENTORY_SHA256 = "e".repeat(64);
+
+/** A fresh capture workspace outside the repository, with a synthetic repository root beside it. */
+async function captureWorkspace(t) {
+  const directory = await mkdtemp(join(tmpdir(), "edge-capture-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const repository = join(directory, "repository");
+  await mkdir(repository);
+  return { directory, repository, output: join(directory, "out", "edge-live.json"),
+    inventory: join(directory, "inventory.json") };
+}
+
+/** Dependencies for capture-edge: a provider over `snapshot`, and recorders proving no lock or command runs. */
+function captureDependencies(space, snapshot, { identity, now = () => NOW, onCapture, inventory } = {}) {
+  const calls = { provider: [], inventory: [], run: 0, lock: 0, fetch: 0 };
+  return {
+    calls,
+    dependencies: {
+      now,
+      repositoryRoot: space.repository,
+      readInventory: async (path, sha) => {
+        calls.inventory.push([path, sha]);
+        return inventory !== undefined ? inventory : { accountId: ACCOUNT_ID, workerName: identity ?? snapshot.workerName };
+      },
+      liveProviderFactory: (options) => {
+        calls.provider.push(options);
+        return {
+          async capture() {
+            await onCapture?.();
+            return { ...inventoryOf(snapshot), accountId: options.accountId, capturedAt: "ignored" };
+          },
+        };
+      },
+      run: () => { calls.run += 1; throw new Error("no command"); },
+      lockFactory: () => { calls.lock += 1; throw new Error("no lock"); },
+      fetch: () => { calls.fetch += 1; throw new Error("no request"); },
+      loadTarget: async () => { throw new Error("no target"); },
+    },
+  };
+}
+
+const captureArgv = (space, environment = "production", extra = ["--execute"]) => [ROLLOUT_EDGE_CAPTURE_VERB,
+  `--environment=${environment}`, `--inventory=${space.inventory}`, `--inventory-sha256=${INVENTORY_SHA256}`,
+  `--output=${space.output}`, ...extra];
+
+/** The capture's snapshot as the provider inventory canonicalizes it (account id included). */
+const asAccount = (snapshot) => resnapshot(snapshot, { accountId: ACCOUNT_ID });
+
+async function absent(path) {
+  return (await lstat(path).catch(() => null)) === null;
+}
+
+test("capture-edge writes exactly the capture roll reads, 0600, verified as roll verifies it, for both environments",
+  async (t) => {
+    for (const [environment, edge, target] of [
+      ["production", gcpLive, TARGET], ["production", workerLive, TARGET], ["production", preEdgeLive, TARGET],
+      ["staging", stagingGcpLive, STAGING_TARGET], ["staging", stagingWorkerLive, STAGING_TARGET],
+    ]) {
+      const space = await captureWorkspace(t);
+      await mkdir(join(space.directory, "out"));
+      let clock = NOW - 30_000;
+      // The reads take a minute of the clock.
+      const { calls, dependencies } = captureDependencies(space, edge,
+        { now: () => (clock += 1_000), onCapture: () => { clock += 60_000; } });
+      const result = await runRollout(captureArgv(space, environment), dependencies);
+      const label = `${environment} ${liveEdgeMode(edge) ?? "unset"}`;
+      assert.deepEqual(Object.keys(result), ["status", "verb", "environment", "mode", "edgeCommit", "capturedAt", "sha256"]);
+      assert.deepEqual([result.status, result.verb, result.environment, result.mode, result.edgeCommit],
+        ["ok", "capture-edge", environment, liveEdgeMode(edge) ?? "unset", EDGE_COMMIT], label);
+      // The clock before the first read: not after the reads, nor after the self-check.
+      assert.equal(result.capturedAt, new Date(NOW - 29_000).toISOString(), label);
+      assert.deepEqual(calls.provider, [{ accountId: ACCOUNT_ID,
+        workerName: environment === "production" ? "app-usagemonitor" : "app-usagemonitor-staging-edge" }], label);
+      assert.deepEqual(calls.inventory, [[space.inventory, INVENTORY_SHA256]]);
+      assert.deepEqual([calls.run, calls.lock, calls.fetch], [0, 0, 0], `${label}: no command, lock or request`);
+      const bytes = await readFile(space.output);
+      assert.equal(result.sha256, createHash("sha256").update(bytes).digest("hex"));
+      const info = await stat(space.output);
+      assert.equal(info.mode & 0o777, 0o600, label);
+      assert.equal(info.nlink, 1);
+      const written = JSON.parse(bytes);
+      assert.deepEqual(Object.keys(written), [...ROLLOUT_EDGE_LIVE_KEYS]);
+      assert.equal(written.schema, ROLLOUT_EDGE_LIVE_SCHEMA);
+      assert.equal(written.capturedAt, result.capturedAt);
+      assert.deepEqual(written.snapshot, asAccount(edge));
+      assert.deepEqual(written.deployment, { versions: [{ version_id: edge.versionId, percentage: 100 }] });
+      // Roll reads it back through its own reader and verifier, and a roll dry run accepts it.
+      const verified = await verifyEdgeLiveCapture(await readEdgeLiveCaptureFile(space.output),
+        { environment, nowMs: NOW });
+      assert.equal(verified.mode, result.mode);
+      const paths = await migrated(t, { target, edge });
+      await writeFile(paths.edgeLive, bytes);
+      const plan = await runRollout(rollArgv(paths, [], environment), rollDependencies(target));
+      assert.deepEqual(plan.edge, { mode: result.mode, edgeCommit: EDGE_COMMIT, capturedAt: result.capturedAt }, label);
+    }
+  });
+
+/** A roll dry run's own dependencies (a fake estate with matching contract blobs). */
+function rollDependencies(target) {
+  return dependencies(fakeEstate({ target }), fakeLock());
+}
+
+test("capture-edge refuses an existing output, a symlink, or a path in the repository before any read", async (t) => {
+  const space = await captureWorkspace(t);
+  await mkdir(join(space.directory, "out"));
+  const victim = join(space.directory, "victim.json");
+  await writeFile(victim, "victim\n");
+  const cases = [
+    ["existing file", async () => writeFile(space.output, "kept\n"), "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS"],
+    ["symlink to a file", async () => symlink(victim, space.output), "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS"],
+    ["dangling symlink", async () => symlink(join(space.directory, "nowhere.json"), space.output),
+      "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS"],
+    ["existing directory", async () => mkdir(space.output), "ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS"],
+  ];
+  for (const [label, arrange, code] of cases) {
+    await rm(space.output, { recursive: true, force: true });
+    await arrange();
+    const before = await lstat(space.output);
+    const { calls, dependencies } = captureDependencies(space, gcpLive);
+    await assert.rejects(runRollout(captureArgv(space), dependencies), isCode(code), label);
+    assert.deepEqual(calls.provider, [], `${label}: refused before any read`);
+    assert.equal((await lstat(space.output)).mtimeMs, before.mtimeMs, label);
+  }
+  assert.equal(await readFile(victim, "utf8"), "victim\n", "a symlink's target is never written");
+  await rm(space.output, { recursive: true, force: true });
+  // Inside the repository: directly, through a symlinked parent, and the real checkout by default.
+  await mkdir(join(space.repository, "evidence"));
+  await symlink(join(space.repository, "evidence"), join(space.directory, "linked"));
+  for (const output of [join(space.repository, "edge.json"), join(space.repository, "evidence", "edge.json"),
+    join(space.directory, "linked", "edge.json")]) {
+    const { calls, dependencies } = captureDependencies(space, gcpLive);
+    await assert.rejects(runRollout(captureArgv({ ...space, output }), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"), output);
+    assert.deepEqual(calls.provider, []);
+  }
+  assert.deepEqual(await readdir(join(space.repository, "evidence")), []);
+  const inCheckout = join(REPOSITORY_ROOT, "apps", "worker", `edge-capture-${process.pid}.json`);
+  t.after(() => rm(inCheckout, { force: true }));
+  const { dependencies: checkout } = captureDependencies(space, gcpLive);
+  delete checkout.repositoryRoot;
+  await assert.rejects(runRollout(captureArgv({ ...space, output: inCheckout }), checkout),
+    isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"));
+  assert.equal(await absent(inCheckout), true);
+  // A missing parent directory is refused too.
+  const { dependencies: orphan } = captureDependencies(space, gcpLive);
+  await assert.rejects(runRollout(captureArgv({ ...space, output: join(space.directory, "missing", "edge.json") }), orphan),
+    isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_INVALID"));
+});
+
+test("capture-edge refuses an output in any git checkout: another checkout, a worktree, a .git directory", async (t) => {
+  const space = await captureWorkspace(t);
+  // A synthetic main checkout (a .git directory) and a linked worktree (a .git file) beside the repository root.
+  const main = join(space.directory, "main");
+  await mkdir(join(main, ".git", "objects"), { recursive: true });
+  await mkdir(join(main, "evidence", "deep"), { recursive: true });
+  const worktree = join(space.directory, "worktree");
+  await mkdir(worktree);
+  await writeFile(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "worktree")}\n`);
+  await symlink(join(main, "evidence"), join(space.directory, "to-main"));
+  for (const output of [join(main, "edge.json"), join(main, "evidence", "deep", "edge.json"),
+    join(main, ".git", "edge.json"), join(main, ".git", "objects", "edge.json"), join(worktree, "edge.json"),
+    join(space.directory, "to-main", "edge.json")]) {
+    const { calls, dependencies } = captureDependencies(space, gcpLive);
+    await assert.rejects(runRollout(captureArgv({ ...space, output }), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"), output);
+    await assert.rejects(runRollout(captureArgv({ ...space, output }, "production", []), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_IN_REPOSITORY"), `${output}: the dry run refuses it too`);
+    assert.deepEqual(calls.provider, [], output);
+    assert.equal(await absent(output), true, output);
+  }
+  // A directory beside them, with no .git above it, is accepted.
+  await mkdir(join(space.directory, "out"));
+  const { dependencies } = captureDependencies(space, gcpLive);
+  assert.equal((await runRollout(captureArgv(space), dependencies)).status, "ok");
+});
+
+test("capture-edge refuses a parent another user could write to, as the reviewed private-output rule does",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    const out = join(space.directory, "out");
+    await mkdir(out);
+    t.after(() => chmod(out, 0o700).catch(() => {}));
+    for (const mode of [0o777, 0o770, 0o703, 0o1777, 0o720]) {
+      await chmod(out, mode);
+      const { calls, dependencies } = captureDependencies(space, gcpLive);
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_UNSAFE"),
+        mode.toString(8));
+      assert.deepEqual(calls.provider, [], mode.toString(8));
+      assert.equal(await absent(space.output), true, mode.toString(8));
+    }
+    await chmod(out, 0o755);
+    const { dependencies } = captureDependencies(space, gcpLive);
+    assert.equal((await runRollout(captureArgv(space), dependencies)).status, "ok");
+    // A root-owned sticky directory (the system temporary directory) is accepted: a dry run, so nothing is written.
+    const shared = await stat("/tmp").catch(() => null);
+    if (shared !== null && shared.uid === 0 && (shared.mode & 0o1000) !== 0) {
+      const output = join("/tmp", `edge-capture-${process.pid}-${Date.now()}.json`);
+      const { calls, dependencies: dry } = captureDependencies(space, gcpLive);
+      assert.equal((await runRollout(captureArgv({ ...space, output }, "production", []), dry)).status, "dry-run");
+      assert.deepEqual(calls.provider, []);
+      assert.equal(await absent(output), true);
+    }
+  });
+
+test("capture-edge checks the output again once open: a parent swapped for a symlink during the reads is refused",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    const out = join(space.directory, "out");
+    const elsewhere = join(space.directory, "elsewhere");
+    await mkdir(join(space.repository, "evidence"));
+    await mkdir(elsewhere);
+    for (const [label, target] of [["into the repository", join(space.repository, "evidence")],
+      ["to another directory", elsewhere]]) {
+      await rm(out, { recursive: true, force: true });
+      await rm(`${out}-away`, { recursive: true, force: true });
+      await mkdir(out);
+      const swap = async () => {
+        await rename(out, `${out}-away`);
+        await symlink(target, out);
+      };
+      const { dependencies } = captureDependencies(space, gcpLive, { onCapture: swap });
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_CHANGED"),
+        label);
+      assert.deepEqual(await readdir(target), [], `${label}: the created file is removed, nothing written through it`);
+      assert.deepEqual(await readdir(`${out}-away`), [], label);
+    }
+  });
+
+test("capture-edge writes with O_EXCL: a file or symlink that appears during the reads is never replaced or followed",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    await mkdir(join(space.directory, "out"));
+    const victim = join(space.directory, "victim.json");
+    await writeFile(victim, "victim\n");
+    for (const [label, race, survived] of [
+      ["file", () => writeFile(space.output, "racer\n"), async () => (await readFile(space.output, "utf8")) === "racer\n"],
+      ["symlink", () => symlink(victim, space.output), async () => (await lstat(space.output)).isSymbolicLink()],
+    ]) {
+      await rm(space.output, { force: true });
+      const { dependencies } = captureDependencies(space, gcpLive, { onCapture: race });
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_OUTPUT_EXISTS"), label);
+      assert.equal(await survived(), true, `${label}: the racer's entry is left as it was`);
+      assert.equal(await readFile(victim, "utf8"), "victim\n", `${label}: nothing is written through it`);
+    }
+  });
+
+test("capture-edge refuses a capture that does not verify, and writes nothing", async (t) => {
+  const space = await captureWorkspace(t);
+  await mkdir(join(space.directory, "out"));
+  const withCron = resnapshot(gcpLive, { crons: ["*/5 * * * *"] });
+  const cases = [
+    // Production: a moved domain, another public origin, a gcp edge with a leftover cron.
+    ["production", resnapshot(workerLive, { domains: workerLive.domains.slice(1) }), "ROLLOUT_EDGE_LIVE_UNVERIFIED"],
+    ["production", resnapshot(workerLive, { bindings: workerLive.bindings.map((binding) => (binding.name === "PUBLIC_ORIGIN"
+      ? { ...binding, text: "https://www.tibotattle.com" } : binding)) }), "ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"],
+    ["production", withCron, "ROLLOUT_EDGE_LIVE_UNVERIFIED"],
+    ["production", resnapshot(workerLive, { bindings: workerLive.bindings.filter(({ name }) => name !== "DEPLOYMENT_SOURCE_COMMIT") }),
+      "ROLLOUT_EDGE_LIVE_INVALID"],
+    // Staging: the domain set or public origin drifted from the pinned staging edge.
+    ["staging", asStaging(workerLive, { ...ROLLOUT_STAGING_EDGE_IDENTITY, domains: ["staging.tibotattle.com"] }),
+      "ROLLOUT_EDGE_LIVE_UNVERIFIED"],
+    ["staging", asStaging(workerLive, { ...ROLLOUT_STAGING_EDGE_IDENTITY, domains: [] }), "ROLLOUT_EDGE_LIVE_UNVERIFIED"],
+    ["staging", asStaging(workerLive, { ...ROLLOUT_STAGING_EDGE_IDENTITY,
+      publicOrigin: TRACKED.env.staging.vars.PUBLIC_ORIGIN }), "ROLLOUT_EDGE_LIVE_TARGET_MISMATCH"],
+  ];
+  for (const [environment, snapshot, code] of cases) {
+    const { calls, dependencies } = captureDependencies(space, snapshot, {
+      identity: environment === "production" ? "app-usagemonitor" : ROLLOUT_STAGING_EDGE_IDENTITY.workerName });
+    await assert.rejects(runRollout(captureArgv(space, environment), dependencies), isCode(code), `${environment} ${code}`);
+    assert.equal(calls.provider.length, 1);
+    assert.equal(await absent(space.output), true, `${environment} ${code}: nothing written`);
+  }
+  // A provider answering for another Worker or account is refused before the snapshot is used.
+  for (const answer of [{ workerName: "app-usagemonitor-staging" }, { accountId: "1b".repeat(16) }]) {
+    const { dependencies } = captureDependencies(space, stagingWorkerLive, { identity: ROLLOUT_STAGING_EDGE_IDENTITY.workerName });
+    const factory = dependencies.liveProviderFactory;
+    dependencies.liveProviderFactory = (options) => ({
+      capture: async () => ({ ...(await factory(options).capture()), ...answer }),
+    });
+    await assert.rejects(runRollout(captureArgv(space, "staging"), dependencies),
+      isCode("ROLLOUT_EDGE_CAPTURE_TARGET_MISMATCH"), JSON.stringify(answer));
+    assert.equal(await absent(space.output), true);
+  }
+});
+
+test("capture-edge reads only the environment's pinned edge Worker: an inventory of another Worker is refused before any read",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    await mkdir(join(space.directory, "out"));
+    // Production's pins are EP-9's, unchanged.
+    assert.equal(EDGE_MODE_PRODUCTION_WORKER_NAME, "app-usagemonitor");
+    assert.deepEqual([...EDGE_MODE_PRODUCTION_DOMAINS], ["admin.tibotattle.com", "tibotattle.com", "www.tibotattle.com"]);
+    for (const [environment, workerName] of [
+      ["staging", "app-usagemonitor-staging"], ["staging", "app-usagemonitor"],
+      ["production", "app-usagemonitor-staging-edge"], ["production", "app-usagemonitor-synthetic"],
+    ]) {
+      const { calls, dependencies } = captureDependencies(space, gcpLive, { identity: workerName });
+      await assert.rejects(runRollout(captureArgv(space, environment), dependencies),
+        isCode("ROLLOUT_EDGE_CAPTURE_TARGET_MISMATCH"), `${environment} ${workerName}`);
+      assert.deepEqual(calls.provider, []);
+    }
+    for (const inventory of [null, [], { workerName: "app-usagemonitor" }, { accountId: "A".repeat(32), workerName: "app-usagemonitor" }]) {
+      const { calls, dependencies } = captureDependencies(space, gcpLive, { inventory });
+      await assert.rejects(runRollout(captureArgv(space), dependencies), isCode("ROLLOUT_EDGE_CAPTURE_INVENTORY_INVALID"));
+      assert.deepEqual(calls.provider, []);
+    }
+    assert.equal(await absent(space.output), true);
+  });
+
+test("capture-edge: closed arguments, a dry run that reads nothing remote, and the owner-private inventory reader",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    await mkdir(join(space.directory, "out"));
+    const base = captureArgv(space, "production", []);
+    for (const [argv, code] of [
+      [base.filter((arg) => !arg.startsWith("--output=")), "ROLLOUT_ARGUMENT_MISSING"],
+      [base.filter((arg) => !arg.startsWith("--inventory=")), "ROLLOUT_ARGUMENT_MISSING"],
+      [base.map((arg) => (arg.startsWith("--output=") ? "--output=edge.json" : arg)), "ROLLOUT_PATH_INVALID"],
+      [base.map((arg) => (arg.startsWith("--inventory=") ? "--inventory=inventory.json" : arg)), "ROLLOUT_PATH_INVALID"],
+      [base.map((arg) => (arg.startsWith("--inventory-sha256=") ? "--inventory-sha256=abc" : arg)), "ROLLOUT_ARGUMENT_INVALID"],
+      [base.map((arg) => (arg === "--environment=production" ? "--environment=test" : arg)), "ROLLOUT_ENVIRONMENT_INVALID"],
+      [[...base, `--commit=${COMMIT}`], "ROLLOUT_ARGUMENT_INVALID"],
+      [[...base, "--execute", "--execute"], "ROLLOUT_ARGUMENT_INVALID"],
+    ]) {
+      const { calls, dependencies } = captureDependencies(space, gcpLive);
+      await assert.rejects(runRollout(argv, dependencies), isCode(code), argv.join(" "));
+      assert.deepEqual([calls.provider.length, calls.inventory.length], [0, 0]);
+    }
+    const { calls, dependencies } = captureDependencies(space, gcpLive);
+    assert.deepEqual(await runRollout(base, dependencies),
+      { status: "dry-run", verb: "capture-edge", environment: "production", reads: "cloudflare-read-only" });
+    assert.deepEqual([calls.provider.length, calls.inventory.length, calls.run, calls.lock, calls.fetch], [0, 1, 0, 0, 0]);
+    assert.equal(await absent(space.output), true);
+    // The default reader is the production deploy's owner-private inventory reader: 0600, matching sha256.
+    const text = JSON.stringify({ accountId: ACCOUNT_ID, workerName: "app-usagemonitor" });
+    await writeFile(space.inventory, text, { mode: 0o600 });
+    const sha = createHash("sha256").update(text).digest("hex");
+    const real = { repositoryRoot: space.repository };
+    const argv = (hash) => base.map((arg) => (arg.startsWith("--inventory-sha256=") ? `--inventory-sha256=${hash}` : arg));
+    assert.equal((await runRollout(argv(sha), real)).status, "dry-run");
+    await assert.rejects(runRollout(argv(INVENTORY_SHA256), real), isCode("ROLLOUT_EDGE_CAPTURE_INVENTORY_INVALID"));
+    await writeFile(join(space.directory, "open.json"), text, { mode: 0o644 });
+    await assert.rejects(runRollout(argv(sha).map((arg) => (arg.startsWith("--inventory=")
+      ? `--inventory=${join(space.directory, "open.json")}` : arg)), real), isCode("ROLLOUT_EDGE_CAPTURE_INVENTORY_INVALID"));
+    await assert.rejects(runRollout(argv(sha).map((arg) => (arg.startsWith("--inventory=")
+      ? `--inventory=${join(space.directory, "absent.json")}` : arg)), real), isCode("ROLLOUT_EDGE_CAPTURE_INVENTORY_REQUIRED"));
+  });
+
+test("capture-edge prints only a content-free summary: no account id, binding value, path or credential", async (t) => {
+  const space = await captureWorkspace(t);
+  await mkdir(join(space.directory, "out"));
+  const printed = { stdout: [], stderr: [] };
+  const io = { stdout: (text) => printed.stdout.push(text), stderr: (text) => printed.stderr.push(text) };
+  const { dependencies } = captureDependencies(space, gcpLive);
+  assert.equal(await runRolloutCli(captureArgv(space), dependencies, io), 0);
+  assert.deepEqual(printed.stderr, []);
+  const stdout = printed.stdout.join("");
+  const summary = JSON.parse(stdout);
+  assert.deepEqual(Object.keys(summary), ["status", "verb", "environment", "mode", "edgeCommit", "capturedAt", "sha256"]);
+  assert.equal(stdout.includes(ACCOUNT_ID), false, "no account id");
+  assert.equal(stdout.includes(space.directory), false, "no private path");
+  const values = gcpLive.bindings.flatMap((binding) => [binding.text, binding.id, binding.database_id, binding.bucket_name,
+    binding.namespace_id].filter((value) => typeof value === "string" && value.length >= 6
+    // The summary's own fields: the edge commit, and an environment name an ENVIRONMENT var shares.
+    && ![EDGE_COMMIT, summary.environment, summary.mode].includes(value)));
+  assert.ok(values.length > 5, "the fixture carries binding values to look for");
+  for (const value of values) assert.equal(stdout.includes(value), false, "no binding value");
+  assert.equal(stdout.includes(GCP_PLAN.invokerServiceAccount), false);
+  // A failure prints a closed code only, even when the underlying error carries the account id.
+  for (const [error, code] of [
+    [Object.assign(new Error(`read ${ACCOUNT_ID}`), { code: `X_${ACCOUNT_ID}` }), "ROLLOUT_EDGE_CAPTURE_READ_FAILED"],
+    [Object.assign(new Error("PRODUCTION_LIVE_CREDENTIAL_REQUIRED"), { code: "PRODUCTION_LIVE_CREDENTIAL_REQUIRED" }),
+      "PRODUCTION_LIVE_CREDENTIAL_REQUIRED"],
+  ]) {
+    const failing = { ...dependencies, liveProviderFactory: () => ({ capture: async () => { throw error; } }) };
+    await rm(space.output, { force: true });
+    printed.stdout.length = 0;
+    printed.stderr.length = 0;
+    assert.equal(await runRolloutCli(captureArgv(space), failing, io), 1);
+    assert.deepEqual(printed.stdout, []);
+    assert.deepEqual(JSON.parse(printed.stderr.join("")), { status: "error", code });
+    assert.equal(printed.stderr.join("").includes(ACCOUNT_ID), false);
+    assert.equal(await absent(space.output), true);
+  }
+});
+
+test("capture-edge from the command line: a dry run over a real owner-private inventory, and no token means no read",
+  async (t) => {
+    const space = await captureWorkspace(t);
+    await mkdir(join(space.directory, "out"));
+    const text = JSON.stringify({ accountId: ACCOUNT_ID, workerName: "app-usagemonitor-staging-edge" });
+    await writeFile(space.inventory, text, { mode: 0o600 });
+    const sha = createHash("sha256").update(text).digest("hex");
+    const argv = (extra) => [join(import.meta.dirname, "gcp-production-rollout.mjs"), ROLLOUT_EDGE_CAPTURE_VERB,
+      "--environment=staging", `--inventory=${space.inventory}`, `--inventory-sha256=${sha}`, `--output=${space.output}`,
+      ...extra];
+    const dry = spawnSync(process.execPath, argv([]), { encoding: "utf8", env: { PATH: "/nonexistent" }, timeout: 60_000 });
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.deepEqual(JSON.parse(dry.stdout), { status: "dry-run", verb: "capture-edge", environment: "staging",
+      reads: "cloudflare-read-only" });
+    // Without CLOUDFLARE_API_TOKEN the reviewed provider refuses before any request.
+    const refused = spawnSync(process.execPath, argv(["--execute"]), { encoding: "utf8", env: { PATH: "/nonexistent" },
+      timeout: 60_000 });
+    assert.equal(refused.status, 1);
+    assert.equal(refused.stdout, "");
+    assert.deepEqual(JSON.parse(refused.stderr), { status: "error", code: "PRODUCTION_LIVE_CREDENTIAL_REQUIRED" });
+    assert.equal(`${dry.stdout}${refused.stderr}`.includes(ACCOUNT_ID), false);
+    assert.equal(await absent(space.output), true);
+  });
