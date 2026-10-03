@@ -708,12 +708,16 @@ describe("computeAnalyticsV2 (A-2)", () => {
       + counts.quota * ANALYTICS_V2_MEMORY_MODEL.heldBytesPerOccurrence.quota
       + counts.session * ANALYTICS_V2_MEMORY_MODEL.heldBytesPerOccurrence.session, 0);
     expect(account.heldInputBytes).toBe(held);
-    expect(account.accountBytes).toBe(held + rowBytes(outputs.ownerDays) + rowBytes(outputs.cacheBands)
-      + rowBytes(outputs.ownerFits) + rowBytes(outputs.ownerModelDates) + rowBytes(outputs.refusals));
+    // K-PERCARD: each owner-day's price row (its stored price inputs) is a held output row too.
+    expect(outputs.ownerDayPrices.length).toBe(outputs.ownerDays.filter((row) => row.daily !== null).length);
+    expect(account.accountBytes).toBe(held + rowBytes(outputs.ownerDays) + rowBytes(outputs.ownerDayPrices)
+      + rowBytes(outputs.cacheBands) + rowBytes(outputs.ownerFits) + rowBytes(outputs.ownerModelDates)
+      + rowBytes(outputs.refusals));
     for (const entry of outputs.resources!.owners) {
       const own = <T extends { ownerDigest: string }>(rows: readonly T[]) => rows.filter((row) => row.ownerDigest === entry.ownerDigest);
-      expect(entry.outputBytes).toBe(rowBytes(own(outputs.ownerDays)) + rowBytes(own(outputs.cacheBands))
-        + rowBytes(own(outputs.ownerFits)) + rowBytes(own(outputs.ownerModelDates)) + rowBytes(own(outputs.refusals)));
+      expect(entry.outputBytes).toBe(rowBytes(own(outputs.ownerDays)) + rowBytes(own(outputs.ownerDayPrices))
+        + rowBytes(own(outputs.cacheBands)) + rowBytes(own(outputs.ownerFits)) + rowBytes(own(outputs.ownerModelDates))
+        + rowBytes(own(outputs.refusals)));
     }
     expect(outputs.resources!.configuration).toMatchObject({ outputModel: "analytics-v2-output-model-v1",
       outputBudgetBytes: ANALYTICS_V2_DEFAULT_RESOURCES.outputBudgetBytes });

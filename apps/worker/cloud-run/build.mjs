@@ -100,7 +100,9 @@ function assertVendoredPackageResolution(metafile) {
 const kernelIdentity = await computeAnalyticsKernelIdentity({ build, options, vendorRoot: VENDOR_ROOT });
 options.define = { ...(options.define ?? {}), ...analyticsKernelDefines(kernelIdentity) };
 const kernel = { computeClosureSha256: kernelIdentity.computeClosureSha256,
-  vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs };
+  vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs,
+  // K-PERCARD: the compute class (the closure without the vendored price registry).
+  computeSha256: kernelIdentity.computeSha256 };
 const kernelClosureOnly = process.argv.includes("--kernel-closure");
 // Refuse to build (or check) a bundle no kernel-registry.json entry names
 // (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED), before anything is bundled: the image

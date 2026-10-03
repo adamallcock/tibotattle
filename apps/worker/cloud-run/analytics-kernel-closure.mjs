@@ -35,6 +35,13 @@
  *   install put it (apps/worker/node_modules locally, cloud-run/node_modules
  *   in the image).
  *
+ * - computeSha256 (K-PERCARD, engine v2 section 5.3): the compute class, the
+ *   same digest over the closure's inputs WITHOUT the vendored price registry
+ *   (ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT: its cards and manifest). Kernels
+ *   with equal compute classes differ at most in their price cards, which
+ *   the refresh's transition proof reprices exactly. It is stamped through a
+ *   third define; it is not a registry key (the closure digest pins it).
+ *
  * The build refuses an identity no kernel-registry.json entry names
  * (resolveAnalyticsKernelRegistryEntry, CLOUD_RUN_BUILD_KERNEL_UNREGISTERED),
  * so an image built from unregistered code fails its build (the Dockerfile
@@ -50,6 +57,10 @@ import { fileURLToPath } from "node:url";
 import { Script } from "node:vm";
 
 export const ANALYTICS_KERNEL_CLOSURE_VERSION = "analytics-v2-compute-closure-v2";
+/** The compute class's digest method (computeSha256). */
+export const ANALYTICS_KERNEL_COMPUTE_CLASS_VERSION = "analytics-v2-compute-class-v1";
+/** The vendored price registry, relative to the vendored kernel root: outside the compute class. */
+export const ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT = "packages/accounting/src/price-registry.js";
 const CLOUD_RUN_ROOT = dirname(fileURLToPath(import.meta.url));
 const WORKER_ROOT = resolve(CLOUD_RUN_ROOT, "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -77,6 +88,9 @@ export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
   // A-1: contributing devices and the queued days.
   "apps/worker/src/analytics-v2/devices.ts",
   "apps/worker/src/analytics-v2/queued-days.ts",
+  // K-PERCARD: the kernel-transition proof and stale set (the price
+  // attribution is reached from compute-owner.ts).
+  "apps/worker/src/analytics-v2/price-transition.ts",
 ]);
 /**
  * I/O plumbing (repository paths): never in the closure and never walked
@@ -91,6 +105,7 @@ export const ANALYTICS_KERNEL_CLOSURE_PLUMBING = Object.freeze([
   "apps/worker/src/analytics-v2/store-run.ts",
   "apps/worker/src/analytics-v2/store-derived.ts",
   "apps/worker/src/analytics-v2/store-publication.ts",
+  "apps/worker/src/analytics-v2/store-price.ts",
   "apps/worker/src/analytics-v2/kernel.ts",
   "apps/worker/src/analytics-v2/kernel-registry.json",
 ]);
@@ -98,6 +113,7 @@ export const ANALYTICS_KERNEL_CLOSURE_PLUMBING = Object.freeze([
 export const ANALYTICS_KERNEL_DEFINES = Object.freeze({
   computeClosureSha256: "__ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__",
   vendorManifestSha256: "__ANALYTICS_V2_VENDOR_MANIFEST_SHA256__",
+  computeSha256: "__ANALYTICS_V2_COMPUTE_SHA256__",
 });
 const WORKSPACE_SCOPE = "@app-usagemonitor";
 
@@ -210,8 +226,14 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
     byName.set(name, digest);
   }
   const inputs = [...byName].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  // The compute class: every input but the vendored price registry, which must be one.
+  const priceRegistry = relative(REPOSITORY_ROOT, resolve(vendorRoot, ...ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT.split("/")))
+    .split(sep).join("/");
+  if (!byName.has(priceRegistry)) fail("ANALYTICS_KERNEL_CLOSURE_PRICE_REGISTRY_MISSING");
   return Object.freeze({
     computeClosureSha256: sha256(JSON.stringify([ANALYTICS_KERNEL_CLOSURE_VERSION, inputs])),
+    computeSha256: sha256(JSON.stringify([ANALYTICS_KERNEL_COMPUTE_CLASS_VERSION,
+      inputs.filter(([name]) => name !== priceRegistry)])),
     vendorManifestSha256: sha256(await read(resolve(vendorRoot, "MANIFEST.json"))),
     inputs: inputs.length,
     names: Object.freeze(inputs.map(([name]) => name)),
@@ -223,6 +245,9 @@ export function analyticsKernelDefines(identity) {
   return Object.freeze({
     [ANALYTICS_KERNEL_DEFINES.computeClosureSha256]: JSON.stringify(identity.computeClosureSha256),
     [ANALYTICS_KERNEL_DEFINES.vendorManifestSha256]: JSON.stringify(identity.vendorManifestSha256),
+    // An identity without a compute class (a mutation in a check) stamps none: no compatibility claim.
+    [ANALYTICS_KERNEL_DEFINES.computeSha256]: typeof identity.computeSha256 === "string"
+      ? JSON.stringify(identity.computeSha256) : "undefined",
   });
 }
 

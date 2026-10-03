@@ -38,6 +38,13 @@ import {
 } from "./contract";
 import { ANALYTICS_V2_NO_EXCLUSIONS_SHA256 } from "./exclusions";
 import { validAnalyticsV2KernelEntry, type AnalyticsV2RunStamp } from "./kernel";
+import {
+  ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS,
+  ANALYTICS_V2_PRICE_CARD_ID,
+  ANALYTICS_V2_PRICE_INPUTS_CODEC,
+  ANALYTICS_V2_PRICE_PROJECTION_VERSION,
+} from "./price-attribution";
+import type { AnalyticsV2PriceTransitionProof } from "./price-transition";
 
 /** The ten closed cache-continuity bands (d43c8f92 CACHE_RETENTION_BAND_IDS). */
 export const ANALYTICS_V2_CACHE_BANDS = Object.freeze([
@@ -86,6 +93,9 @@ export const ANALYTICS_V2_OUTPUT_LIMITS = Object.freeze({
 export const WRITE_STATEMENT_TIMEOUT_MILLISECONDS = 300_000;
 export const WRITE_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const CHUNK_MAX_ROWS = 5_000;
+const OWNER_DAY_PRICE_KEYS = "cardIds,day,inputs,ownerDigest,partiallyPricedEvents,unpricedEvents,usageEvents";
+const OWNER_DAY_PRICE_INPUT_KEYS = "codec,data,events,projectionVersion,sha256";
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const CHUNK_MAX_BYTES = 4 * 1024 * 1024;
 const MAX_JSON_DEPTH = 64;
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
@@ -110,7 +120,13 @@ export type AnalyticsV2StoreErrorCode =
   | "ANALYTICS_V2_READ_FAILED"
   | "ANALYTICS_V2_WRITE_FAILED"
   | "ANALYTICS_V2_KERNEL_CONFLICT"
-  | "ANALYTICS_V2_KERNEL_REGRESSION";
+  | "ANALYTICS_V2_KERNEL_REGRESSION"
+  // K-PERCARD (store-price.ts).
+  | "ANALYTICS_V2_KERNEL_PRICES_CONFLICT"
+  | "ANALYTICS_V2_PRICE_CARD_UNREGISTERED"
+  | "ANALYTICS_V2_PRICE_BASIS_CONFLICT"
+  | "ANALYTICS_V2_PRICE_TRANSITION_STALE"
+  | "ANALYTICS_V2_PRICE_STATE_INVALID";
 
 /** Safe store failure: a closed code, an optional field path and SQLSTATE. */
 export class AnalyticsV2StoreError extends Error {
@@ -473,6 +489,40 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     }
   }
 
+  // K-PERCARD: one price row per owner-day row with daily values, and no other.
+  assertArray(outputs.ownerDayPrices, "ownerDayPrices");
+  assertCapacity(outputs.ownerDayPrices.length, ANALYTICS_V2_OUTPUT_LIMITS.ownerDays, "ownerDayPrices");
+  const pricedDays = new Set<string>();
+  for (const row of outputs.ownerDays) {
+    if (row.daily !== null && row.daily !== undefined) pricedDays.add(`${row.ownerDigest}:${row.day}`);
+  }
+  const priceRows = new Set<string>();
+  for (const row of outputs.ownerDayPrices) {
+    if (!plainObject(row) || Object.keys(row).sort().join(",") !== OWNER_DAY_PRICE_KEYS) invalid("ownerDayPrices");
+    assertOwnerDigest(row.ownerDigest, computed, "ownerDayPrices.ownerDigest");
+    const key = `${row.ownerDigest}:${assertDay(row.day, "ownerDayPrices.day")}`;
+    if (!pricedDays.has(key) || priceRows.has(key)) invalid("ownerDayPrices.day");
+    priceRows.add(key);
+    assertArray(row.cardIds, "ownerDayPrices.cardIds");
+    for (const [index, cardId] of row.cardIds.entries()) {
+      if (typeof cardId !== "string" || !ANALYTICS_V2_PRICE_CARD_ID.test(cardId)
+          || (index > 0 && compareText(row.cardIds[index - 1] as string, cardId) >= 0)) invalid("ownerDayPrices.cardIds");
+    }
+    const usage = assertNonNegativeSafeInteger(row.usageEvents, "ownerDayPrices.usageEvents");
+    const unpriced = assertNonNegativeSafeInteger(row.unpricedEvents, "ownerDayPrices.unpricedEvents");
+    const partial = assertNonNegativeSafeInteger(row.partiallyPricedEvents, "ownerDayPrices.partiallyPricedEvents");
+    if (usage > ANALYTICS_V2_MAX_PRICE_INPUT_EVENTS || unpriced + partial > usage) invalid("ownerDayPrices.usageEvents");
+    const inputs = row.inputs as unknown;
+    if (!plainObject(inputs) || Object.keys(inputs).sort().join(",") !== OWNER_DAY_PRICE_INPUT_KEYS
+        || inputs.projectionVersion !== ANALYTICS_V2_PRICE_PROJECTION_VERSION || inputs.codec !== ANALYTICS_V2_PRICE_INPUTS_CODEC
+        || typeof inputs.sha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(inputs.sha256)
+        || inputs.events !== usage || typeof inputs.data !== "string" || inputs.data.length === 0
+        || !BASE64.test(inputs.data)) {
+      invalid("ownerDayPrices.inputs");
+    }
+  }
+  if (priceRows.size !== pricedDays.size) invalid("ownerDayPrices");
+
   assertArray(outputs.cacheBands, "cacheBands");
   assertCapacity(outputs.cacheBands.length, ANALYTICS_V2_OUTPUT_LIMITS.cacheBands, "cacheBands");
   for (const row of outputs.cacheBands) {
@@ -621,6 +671,32 @@ export interface WriteAnalyticsV2RunOptions {
    * on the run row so the next run can tell when they changed.
    */
   readonly exclusionsSha256: string;
+  /**
+   * K-PERCARD: the transitions to the run's kernel, proven over the stored
+   * price inputs in the Job's read snapshot (store-price.ts
+   * proveAnalyticsV2PriceTransitions). When absent the store proves them
+   * inside the write transaction. Either way the store re-reads the pending
+   * transitions and refuses a proof that no longer matches them.
+   */
+  readonly priceTransitions?: AnalyticsV2PriceTransitions;
+}
+
+/** K-PERCARD: the proven transitions from every older stored kernel to the run's kernel (store-price.ts). */
+export interface AnalyticsV2PriceTransitions {
+  readonly toKernel: number;
+  readonly transitions: readonly AnalyticsV2PriceTransitionProof[];
+}
+
+/** K-PERCARD: what the price writes did, for the receipt (content-free counts). */
+export interface AnalyticsV2PriceWriteSummary {
+  readonly kernelCards: number;
+  readonly cardsRegistered: number;
+  readonly basesRegistered: number;
+  readonly ownerDays: number;
+  readonly transitions: readonly {
+    readonly fromKernel: number; readonly toKernel: number; readonly compatible: boolean;
+    readonly ownerDays: number; readonly staleOwnerDays: number;
+  }[];
 }
 
 export interface AnalyticsV2WriteReceipt {
@@ -636,6 +712,8 @@ export interface AnalyticsV2WriteReceipt {
   /** The journal cursor after the run, as a decimal string, or null when absent. */
   readonly cursor: string | null;
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
+  /** K-PERCARD: the run kernel's cards, the new cards and bases, the price rows and the transitions recorded. */
+  readonly prices: AnalyticsV2PriceWriteSummary;
 }
 
 export interface StoredHeadRow {
@@ -785,16 +863,23 @@ export async function insertAnalyticsV2RunRow(client: PostgresClient, schema: st
 
 /** A run stamp with a well-formed registry entry and manifest version (kernel.ts). */
 export function validRunStamp(value: unknown): AnalyticsV2RunStamp {
-  if (!plainObject(value) || Object.keys(value).sort().join(",") !== "kernel,manifestVersion"
+  const keys = plainObject(value) ? Object.keys(value).sort().join(",") : "";
+  if (!plainObject(value) || (keys !== "kernel,manifestVersion" && keys !== "computeSha256,kernel,manifestVersion")
       || !Number.isSafeInteger(value.manifestVersion) || (value.manifestVersion as number) < 1
-      || (value.manifestVersion as number) > 2_147_483_647) {
+      || (value.manifestVersion as number) > 2_147_483_647
+      || (value.computeSha256 !== undefined && value.computeSha256 !== null
+        && (typeof value.computeSha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(value.computeSha256)))) {
     fail("ANALYTICS_V2_RUN_INVALID", "stamp");
   }
+  let kernel: AnalyticsV2RunStamp["kernel"];
   try {
-    return Object.freeze({ kernel: validAnalyticsV2KernelEntry(value.kernel), manifestVersion: value.manifestVersion as number });
+    kernel = validAnalyticsV2KernelEntry(value.kernel);
   } catch {
     return fail("ANALYTICS_V2_RUN_INVALID", "stamp.kernel");
   }
+  // K-PERCARD: the compute class (kernel.ts), null when the bundle stated none.
+  return Object.freeze({ kernel, manifestVersion: value.manifestVersion as number,
+    computeSha256: (value.computeSha256 as string | null | undefined) ?? null });
 }
 
 /**

@@ -52,6 +52,11 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 2: K-VENDOR2's export patch of buildPricingEvent and the entry
   // facade's pricing re-exports, met with K-CORE-A at the PROD-PREP merge.
   "f45bc8e89f659bcecfab40c37b81ae130de36ceff7831f0cc0b057328421daef",
+  // Kernel 3: K-PERCARD's prepared-day price observer (price-attribution.ts in
+  // compute-owner.ts, the ownerDayPrices output) and the transition proof
+  // (price-transition.ts, a closure root). Daily, fit and model values are
+  // unchanged; the price rows are new stored values.
+  "a4b4dc2a1755ab15cd02c59189055fe1c38e3185d3ac0a19665de697ce85d273",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -153,6 +158,8 @@ test("the closure holds every module that decides a stored value and no I/O plum
     "apps/worker/src/telemetry-usage-reconciliation.ts", "apps/worker/src/typed-telemetry-codec.ts",
     "apps/worker/src/telemetry-v12-typed-codec.ts", "apps/worker/cloud-run/analytics-refresh-read.mjs",
     "apps/worker/cloud-run/analytics-refresh-worker.mjs", "packages/telemetry-contract/index.js",
+    // K-PERCARD: the price attribution decides analytics_v2_owner_day_price, the transition proof the stale sets.
+    "apps/worker/src/analytics-v2/price-attribution.ts", "apps/worker/src/analytics-v2/price-transition.ts",
   ]) {
     assert.ok(names.has(decides), `${decides} decides stored values and is in the closure`);
   }
@@ -190,6 +197,32 @@ test("a change to the community fold or the occurrence reader is a closure no en
     const bytes = await readFile(path, ...rest);
     return path.endsWith(copy) ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n")]) : bytes;
   }), { code: "ANALYTICS_KERNEL_CLOSURE_WORKSPACE_COPY_STALE" });
+});
+
+test("the compute class is the closure without the vendored price registry, and nothing else (K-PERCARD)", async () => {
+  const identity = await identityWith();
+  const report = await buildReport("--kernel-closure");
+  assert.match(identity.computeSha256, /^[0-9a-f]{64}$/u);
+  assert.notEqual(identity.computeSha256, identity.computeClosureSha256);
+  // The build stamps the same class it reports.
+  assert.equal(report.kernel.computeSha256, identity.computeSha256);
+  const registryFile = join(VENDOR_ROOT, "packages", "accounting", "src", "price-registry.js");
+  const mutatedAt = (target) => identityWith(async (path, ...rest) => {
+    const bytes = await readFile(path, ...rest);
+    return path === target ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// mutation\n")]) : bytes;
+  });
+  // A price-registry change is a new kernel (closure and manifest move) with the same compute class:
+  // its transition can be compatible once the proof over the stored price inputs holds.
+  const repriced = await mutatedAt(registryFile);
+  assert.notEqual(repriced.computeClosureSha256, identity.computeClosureSha256);
+  assert.equal(repriced.computeSha256, identity.computeSha256);
+  // Any other change to the closure (the pricer, the attribution, the compute core) moves the class too.
+  for (const target of [join(VENDOR_ROOT, "apps", "worker", "src", "server-pricing.ts"),
+    join(WORKER_ROOT, "src", "analytics-v2", "price-attribution.ts"), join(WORKER_ROOT, "src", "analytics-v2", "compute-owner.ts")]) {
+    const mutated = await mutatedAt(target);
+    assert.notEqual(mutated.computeClosureSha256, identity.computeClosureSha256, target);
+    assert.notEqual(mutated.computeSha256, identity.computeSha256, target);
+  }
 });
 
 test("the run-stamps migration seeds no kernel and leaves earlier rows unattributed", async () => {
