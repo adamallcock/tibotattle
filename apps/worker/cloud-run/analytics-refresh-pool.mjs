@@ -146,7 +146,7 @@ export function analyticsRefreshWorkerPoolMinimumBytes(memoryBudgetBytes) {
  * }} options
  */
 export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, poolBytes, loadConcurrency = 1, workerUrl,
-  createWorker, modelBlockSize = 10, modelFanOut = "auto" } = {}) {
+  createWorker, modelBlockSize = 10, modelFanOut = "auto", profileCapture = null } = {}) {
   const model = ANALYTICS_REFRESH_WORKER_HEAP_MODEL;
   if (!Number.isSafeInteger(modelBlockSize) || modelBlockSize < 1 || modelBlockSize > 70
       || !["auto", "all", "off"].includes(modelFanOut)
@@ -340,8 +340,9 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
       stats.peakRunning = Math.max(stats.peakRunning, running.size);
       stats.peakChargedBytes = Math.max(stats.peakChargedBytes, chargedBytes);
       let worker;
+      const childProfile = profileCapture?.grant("model-block", parent.profileId ?? null, parent.attempt);
       try {
-        worker = spawn(url, { workerData: { block: true, port: port2, task: parent.task,
+        worker = spawn(url, { workerData: { ...(childProfile == null ? {} : { profileCapture: childProfile }), block: true, port: port2, task: parent.task,
           context: parent.context, payloadBoundBytes, resultBoundBytes }, transferList: [port2],
           resourceLimits: { maxOldGenerationSizeMb: limitOf(child) / MIB,
             maxYoungGenerationSizeMb: model.youngGenerationBytes / MIB },
@@ -349,6 +350,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
       } catch {
         port1.close(); port2.close(); fail(parent, "ANALYTICS_V2_REFRESH_WORKER_START_FAILED"); return;
       }
+      if (childProfile != null) worker.on("exit", (code) => profileCapture.exited(childProfile.id, code));
       child.worker = worker;
       const attempt = parent.attempt;
       const current = () => !aborted && !parent.settled && !parent.blockFailure
@@ -419,9 +421,11 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
       return;
     }
     let worker;
+    const ownerProfile = profileCapture?.grant("owner", null, entry.attempt);
+    if (ownerProfile != null) entry.profileId = ownerProfile.id;
     try {
       worker = spawn(url, {
-        workerData: { task: entry.task, context: entry.context,
+        workerData: { ...(ownerProfile == null ? {} : { profileCapture: ownerProfile }), task: entry.task, context: entry.context,
           modelBlockSize, modelFanOut: entry.alone ? "off" : modelFanOut },
         resourceLimits: { maxOldGenerationSizeMb: limitOf(entry) / MIB,
           maxYoungGenerationSizeMb: model.youngGenerationBytes / MIB },
@@ -435,6 +439,7 @@ export function createAnalyticsRefreshOwnerPool({ workers, memoryBudgetBytes, po
       fail(entry, "ANALYTICS_V2_REFRESH_WORKER_START_FAILED");
       return;
     }
+    if (ownerProfile != null) worker.on("exit", (code) => profileCapture.exited(ownerProfile.id, code));
     entry.worker = worker;
     const attempt = entry.attempt;
     const current = () => !entry.settled && !entry.blockFailure && entry.attempt === attempt && entry.worker === worker;

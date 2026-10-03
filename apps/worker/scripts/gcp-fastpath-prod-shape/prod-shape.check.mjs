@@ -524,3 +524,12 @@ test("local measurement applies the selected explicit task timeout without inher
   assert.equal(Object.hasOwn(env, "NODE_OPTIONS"), false);
   assert.equal(env.ANALYTICS_V2_MEMORY_BUDGET_MIB, "10752");
 });
+
+test("local Worker profiling projection is explicit and paired with exact source", async () => {
+  const { workerProfileEnv } = await import("./measure-local.mjs");
+  assert.deepEqual(workerProfileEnv(), {});
+  assert.throws(() => workerProfileEnv({ workerProfileDir: "/private/tmp/synthetic" }), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+  assert.throws(() => workerProfileEnv({ workerProfileDir: "relative", workerProfileSource: "a".repeat(40) }), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
+  assert.deepEqual(workerProfileEnv({ workerProfileDir: "/private/tmp/synthetic", workerProfileSource: "a".repeat(40) }), {
+    ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: "/private/tmp/synthetic", ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: "a".repeat(40) });
+});

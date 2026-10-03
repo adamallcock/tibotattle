@@ -629,3 +629,31 @@ for (const consumeFirst of [false, true]) test(`MODEL-BLOCKS rejected child term
   await assert.rejects(pool.abort(), { code: "ANALYTICS_V2_REFRESH_WORKER_TERMINATION_FAILED" });
   assert.equal(pool.running, 1, "unconfirmed isolate remains charged; no successful result escapes");
 });
+
+test("optional capture grants identify owner and block without changing admission or heap flags", async () => {
+  const granted = [], exited = [];
+  const capture = { grant(role, parentId, attempt) { const value = { id: granted.length, role, parentId, attempt }; granted.push(value); return value; }, exited(id, code) { exited.push([id, code]); } };
+  const { spawned, createWorker } = scriptedWorkers((worker, data) => {
+    worker.terminate = async () => { data.port?.close(); worker.emit("exit", 0); return 0; };
+    if (data.block) {
+      worker.emit("message", { type: "blockDone", serializedBytes: 100, cloneMs: 1, evaluationMs: 2, heapPeakBytes: 1000 });
+      return;
+    }
+    worker.on("_posted", (message) => {
+      if (message.type === "blockGrants") { message.grants[0].port.close(); worker.emit("message", { type: "blockConsumed", id: 0 }); }
+      else if (message.type === "blockReleased") result(worker, data.task.index);
+    });
+    requestBlocks(worker);
+  });
+  const pool = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB,
+    poolBytes: 4096 * MIB, createWorker, profileCapture: capture }));
+  const value = await pool.compute(task(0, 10), {}, io()); await pool.abort();
+  assert.equal(value.computation.index, 0); assert.equal(pool.running, 0);
+  assert.deepEqual(granted.map(({ role, parentId }) => [role, parentId]), [["owner", null], ["model-block", 0]]);
+  assert.equal(exited.length, 2);
+  assert.equal(spawned[1].options.workerData.profileCapture.parentId, 0);
+  for (const w of spawned) { assert.deepEqual(w.options.env, {}); assert.deepEqual(w.options.argv, []); assert.equal(w.options.resourceLimits.maxYoungGenerationSizeMb, 192); }
+  const disabled = scriptedWorkers((w, data) => { assert.equal(Object.hasOwn(data, "profileCapture"), false); result(w, data.task.index); });
+  const plain = createAnalyticsRefreshOwnerPool(options({ workers: 2, memoryBudgetBytes: 100 * MIB, poolBytes: 4096 * MIB, createWorker: disabled.createWorker }));
+  await plain.compute(task(0, 10), {}, io()); await plain.abort();
+});

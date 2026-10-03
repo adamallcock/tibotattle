@@ -112,7 +112,7 @@ function fail(code, detail) {
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
     cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null };
+    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null, workerProfileDir: null, workerProfileSource: null };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -129,6 +129,8 @@ function parseArguments(argv) {
       if (!/^\d+$/u.test(value ?? "") || Number(value) < 10 || Number(value) > 1800) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--pgstat-interval takes 10..1800 s");
       options.pgStatIntervalSeconds = Number(value);
     }
+    else if (argument === "--worker-profile-dir") options.workerProfileDir = resolve(next());
+    else if (argument === "--worker-profile-source") options.workerProfileSource = next();
     else if (argument === "--cpu-profile") {
       const value = next();
       if (!/^[1-9]\d{3,5}$/u.test(value ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile takes 1000..100000 us");
@@ -299,13 +301,22 @@ async function childPid(parentPid, { attempts = 50 } = {}) {
   return null;
 }
 
+/** Explicit projection only; do not inherit local diagnostic settings from the environment. */
+export function workerProfileEnv({ workerProfileDir = null, workerProfileSource = null } = {}) {
+  if (workerProfileDir === null && workerProfileSource === null) return {};
+  if (typeof workerProfileDir !== "string" || !workerProfileDir.startsWith("/")
+      || !/^[a-f0-9]{40}$/u.test(workerProfileSource ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "Worker profile directory and exact source are required together");
+  return { ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: workerProfileDir,
+    ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: workerProfileSource };
+}
+
 /** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
-async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {}, pgStat = null }) {
+async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
   let started, sampler = null, stdout = "", stderr = "";
   const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
     started = performance.now();
     const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
-      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, cpuProfileEnv(cpuProfile)),
+      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile) }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -518,10 +529,12 @@ async function main() {
     }
     console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
     const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
-      profile: options.profile, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
+      profile: options.profile, workerProfile: options, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
         cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, cpuProfileDir: options.cpuProfileDir },
       pgStat: options.pgStatIntervalSeconds === null ? null : { intervalMs: options.pgStatIntervalSeconds * 1000, snapshot: (label) => capturePgStat(pool, label) } });
     if (run.pgStat !== null) report.steps.refreshPgStat = run.pgStat;
+    if (options.workerProfileDir !== null) report.steps.workerProfileCapture = { directory: options.workerProfileDir,
+      declaredSource: options.workerProfileSource, scope: "local synthetic isolate diagnostics; inspect manifest coverage" };
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,

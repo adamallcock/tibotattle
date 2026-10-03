@@ -196,6 +196,7 @@
  * source file still answers --help under plain Node 22.
  */
 
+import { readWorkerProfileSettings, createWorkerProfileCoordinator } from "./analytics-refresh-worker-profile.mjs";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -1503,10 +1504,14 @@ export async function runAnalyticsRefresh({
   let receipt;
   let failure;
   let profiler = null;
+  let workerProfiles = null;
   let onSignal = null;
   try {
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
+    const workerProfileSettings = readWorkerProfileSettings(env, { target: production?.target ?? null });
+    if (workerProfileSettings !== null) workerProfiles = createWorkerProfileCoordinator(workerProfileSettings,
+      { workerUrl: dependencies.workerUrl ?? new URL("./analytics-refresh-worker.mjs", import.meta.url) });
     const resources = analyticsRefreshResources(env,
       dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit,
       // An injected heap limit is not this process's, so neither are its flags.
@@ -1608,6 +1613,7 @@ export async function runAnalyticsRefresh({
       const readPool = createSnapshotReadPool(pool, snapshot, { ledger });
       if (parsed.workers > 1) {
         ownerPool = (dependencies.createOwnerPool ?? createAnalyticsRefreshOwnerPool)({
+          ...(workerProfiles === null ? {} : { profileCapture: workerProfiles }),
           workers: parsed.workers, memoryBudgetBytes: resources.compute.memoryBudgetBytes,
           modelBlockSize: parsed.modelBlockSize, modelFanOut: parsed.modelFanOut,
           poolBytes: resources.workerPool.poolBytes, loadConcurrency: resources.workerPool.loadConcurrency,
@@ -1762,6 +1768,12 @@ export async function runAnalyticsRefresh({
           code: "ANALYTICS_V2_REFRESH_CLOSE_FAILED",
           phase: "cleanup",
         });
+      }
+    }
+    if (workerProfiles !== null) {
+      try { workerProfiles.finish({ analyticsRunId: receipt?.runId ?? null }); } catch {
+        try { process.stderr.write(`${JSON.stringify({ workerProfile: "local-isolate-v1", coverage: "incomplete",
+          error: "WORKER_PROFILE_MANIFEST_FAILED" })}\n`); } catch { /* retain computation outcome */ }
       }
     }
     if (profiler !== null) {

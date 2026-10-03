@@ -33,6 +33,12 @@
 import { constants as performanceConstants, PerformanceObserver } from "node:perf_hooks";
 import { deserialize, getHeapStatistics, serialize } from "node:v8";
 import { parentPort, workerData } from "node:worker_threads";
+import { startWorkerProfile } from "./analytics-refresh-worker-profile.mjs";
+
+let isolateProfile = null;
+const startIsolateProfile = () => {
+  if (workerData?.profileCapture !== undefined) isolateProfile = startWorkerProfile(workerData.profileCapture);
+};
 import { mergeAnalyticsRefreshOccurrencePart } from "./analytics-refresh-read.mjs";
 
 /** Conservative pre-serialization bound for the closed plain-value model graph.
@@ -83,6 +89,7 @@ function closedCode(error) {
 async function runBlock() {
   const { port, task, context, payloadBoundBytes, resultBoundBytes } = workerData;
   parentPort.postMessage({ type: "heap", limitBytes: getHeapStatistics().heap_size_limit });
+  startIsolateProfile();
   // Keep the isolate alive until pool termination confirms its admission release.
   parentPort.on("message", () => {});
   const { evaluateModelBlock } = await import("../src/analytics-v2/units.ts");
@@ -118,6 +125,7 @@ async function runBlock() {
     throw Object.assign(new Error("ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED"),
       { code: "ANALYTICS_V2_REFRESH_BLOCK_PAYLOAD_BOUND_EXCEEDED" });
   }
+  isolateProfile?.finish("complete");
   port.postMessage({ serialized: result }, [result.buffer]);
   parentPort.postMessage({ type: "blockDone", serializedBytes, cloneMs, evaluationMs, heapPeakBytes });
 }
@@ -129,6 +137,7 @@ async function run() {
   // heap flag (--max-old-space-size) overrides a Worker's resourceLimits in
   // both directions, so the pool checks this before the Worker reads anything.
   parentPort.postMessage({ type: "heap", limitBytes: getHeapStatistics().heap_size_limit });
+  startIsolateProfile();
   const { computeAnalyticsV2Owner } = await import("../src/analytics-v2/compute-owner.ts");
   const { task, context } = workerData ?? {};
   if (task === null || typeof task !== "object" || context === null || typeof context !== "object") {
@@ -317,6 +326,7 @@ async function run() {
     },
   });
   collections.disconnect();
+  isolateProfile?.finish("complete");
   parentPort.postMessage({ type: "result", emissions, computation, timings, gcCallbackHeapPeakBytes });
 }
 
@@ -324,5 +334,8 @@ try {
   if (workerData?.block === true) await runBlock();
   else await run();
 } catch (error) {
+  isolateProfile?.finish("work-failed");
   parentPort?.postMessage({ type: "failed", code: closedCode(error) });
+} finally {
+  isolateProfile?.finish("work-exit");
 }
