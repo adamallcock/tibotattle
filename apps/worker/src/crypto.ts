@@ -1,5 +1,6 @@
 import { MAX_PLAINTEXT_BYTES } from "./constants";
 import { ApiError } from "./errors";
+import { hostSha256, hostSha256Hex } from "./host-primitives";
 import type { SyntheticEnvelope } from "./validation";
 import type { TelemetryEnvelope } from "./telemetry-validation";
 import type { TelemetryV11Envelope, TelemetryV12Envelope } from "@app-usagemonitor/telemetry-contract";
@@ -105,12 +106,18 @@ export function randomSecret(byteLength = 32): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(byteLength)));
 }
 
+// The Cloud Run build supplies node:crypto's synchronous SHA-256 here
+// (host-primitives.ts): an already-resolved digest instead of an awaited
+// WebCrypto call through the shared thread pool, with identical bytes.
+// Workers keep WebCrypto.
 export async function sha256(value: string | Uint8Array): Promise<Uint8Array> {
+  if (hostSha256 !== null) return hostSha256(value);
   const bytes = typeof value === "string" ? encoder.encode(value) : value;
   return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 }
 
 export async function sha256Hex(value: string | Uint8Array): Promise<string> {
+  if (hostSha256Hex !== null) return hostSha256Hex(value);
   const digest = await sha256(value);
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
