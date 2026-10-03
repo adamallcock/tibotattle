@@ -404,7 +404,7 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
         max: options.max,
       })), [
         {
-          role: "primary", schema, database: "postgres",
+          role: "primary", schema, database: process.env.PG_TEST_DATABASE || "postgres",
           instanceConnectionName: "synthetic-project:us-east1:synthetic-fastpath-primary", max: 3,
         },
       ]);
