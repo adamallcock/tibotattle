@@ -524,8 +524,16 @@ another commit is refused (`PRODUCTION_ROLLBACK_SITE_NOT_RELEASED`).
 
 The site PROD-5 kept has PROD-5's journal as its evidence; archive that
 journal with the kept site's web-release receipt and generated site in the
-same way. A site live only before the typed journals, with no verified typed
-journal, cannot be a rollback target.
+same way. That needs a receipt whose source is the retained source and whose
+manifest is the live one, which the edge-port line's lane still accepts; find
+it before PROD-5. Without one, or if the archive refuses it
+(`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_INVALID`,
+`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), the kept site is not a
+rollback target: keep and record the journal, and restore that site, if
+needed, with a revert commit
+([A deploy that kept the site](./2026-08-17-web-only-release.md#5-archive-the-release)).
+A site live only before the typed journals, with no verified typed journal,
+cannot be a rollback target either.
 
 In gcp mode a rollback past the switch is refused
 (`EDGE_PRIVACY_PAGE_NOT_CUTOVER`): the restored site must carry the marker.

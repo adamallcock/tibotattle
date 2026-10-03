@@ -328,20 +328,28 @@ The operation directory is the deploy's `--operation`, or by default
 `.release-build/production-operations/<deploy commit>` in the checkout. The
 archive directory belongs to the owner, outside every Git checkout: it must be
 `0700`, owned by the caller and named by its real path, with no `.git` in it or
-any parent. A missing last component is created `0700`. The script:
+any parent, and it must not be inside the operation directory or contain it
+(`PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID`). A missing last component is
+created `0700`, but only after the journal, receipt and site have verified:
+a refused run writes nothing. The script:
 
 - archives only a verified typed production deploy whose state still matches
   its binding digest, the rollback's own rule
   (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED`), and refuses a journal
-  a running operation holds (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY`);
+  whose lock a running process holds (`PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY`).
+  It probes that SQLite lock read-only, so a `mutex.sqlite-journal` left by a
+  run that was killed is not busy: it is never removed, and is archived as
+  found;
 - re-verifies the receipt with this lane's checks against the checkout's
   generated site, requires its manifest and source commit to be the site the
-  journal left live (`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), and
+  journal left live (`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), archives
+  only bytes that parse to exactly the receipt the lane verified, and
   requires the generated site to be exactly its manifest
   (`PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID`);
 - assembles a private staging copy, proves it (the journal did not move, the
-  copied journal is the same verified release, the copied site passes the
-  same site check), and renames it to `<archive>/<journal identityDigest>/`:
+  copied journal is the same verified release, the copied receipt is still the
+  verified receipt, the copied site passes the same site check), and renames
+  it to `<archive>/<journal identityDigest>/`:
   `journal/` (private, as the deploy left it), `web-release-receipt.json`,
   `public-release-site/` and a content-free `index.json` holding only the
   manifest sha256, the site's source commit, the deploy commit, the journal
@@ -357,6 +365,23 @@ receipt and site in place, fix the cause and rerun until it prints
 `PRODUCTION_RELEASE_ARCHIVED` or `PRODUCTION_RELEASE_ALREADY_ARCHIVED`. A
 `.staging-*` directory an interrupted run leaves in the archive is not an
 entry. Never edit an entry: a rollback reads its journal as archived.
+
+**A deploy that kept the site** (the retained pair, as at P1 or PROD-5 in
+[Production edge modes](production-edge-modes.md#website-rollback)) left the
+retained site live, so its archive needs that site's web-release receipt: its
+`sourceCommit` is the retained source, its `site.manifestSha256` is the live
+manifest, and the lane of the checkout that deployed still accepts it there
+(base an ancestor of the source, a non-empty diff of allowed paths only, its
+catalogue proofs, and the restored generated site). One exists when that
+site was itself prepared through that lane and its receipt was kept; one
+prepared later must rebuild the live manifest byte for byte. Find it before
+the deploy. If there is none, or the archive refuses it
+(`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_INVALID` or
+`PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH`), rerunning cannot help: the
+kept site is not a rollback target. Keep the journal as it is, record that
+with the deployed baseline, and if that site is ever needed again restore it
+with a revert commit ([Rollback](#rollback)). The deploy does not depend on
+the archive.
 
 ## Rollback
 
@@ -401,10 +426,11 @@ site was released. After the switch the restored site must carry the privacy
 marker, so the site cannot roll back past the switch.
 
 **Before the edge entry,** or when no archive entry of the earlier site
-survives, make a new, clean revert commit on top of the current deployed
-web-only source that changes only allowed public files. Prepare and authorize
-it through the same lane, reusing the same released installer evidence unless
-an approved client release also changes it.
+exists (a kept site with no receipt, or an entry that was lost), make a new,
+clean revert commit on top of the current deployed web-only source that
+changes only allowed public files. Prepare and authorize it through the same
+lane, reusing the same released installer evidence unless an approved client
+release also changes it.
 
 This makes each web release and rollback a short, independently reviewable
 commit. Other agents can prepare their own candidates in separate worktrees;

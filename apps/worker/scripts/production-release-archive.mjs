@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { releasedSiteOfOperation } from "./production-deploy.mjs";
@@ -24,9 +25,11 @@ import { verifyGeneratedCommunityAssetTree } from "./stage-production-assets.mjs
 // A website rollback names the archived journal with
 // --rollback-release-operation and restores the archived receipt and site.
 // The script never deploys, never touches the network and never changes its
-// inputs. It refuses an unverified journal, a receipt or site that is not the
-// one the journal left live, and an existing different archive entry; an
-// identical existing entry is reported as already archived.
+// inputs: it writes nothing, not even the archive directory, until the
+// journal, receipt and site have verified. It refuses an unverified or held
+// journal, a receipt or site that is not the one the journal left live, and an
+// existing different archive entry; an identical existing entry is reported as
+// already archived.
 
 export const PRODUCTION_RELEASE_ARCHIVE_SCHEMA = "tibotattle-production-release-archive-v1";
 export const PRODUCTION_RELEASE_ARCHIVE_LAYOUT = Object.freeze({
@@ -37,7 +40,8 @@ export const PRODUCTION_RELEASE_ARCHIVE_LAYOUT = Object.freeze({
 });
 
 const SITE_DIRECTORY = join(".release-build", "public-release-site");
-const BUSY_JOURNAL_FILE = "mutex.sqlite-journal";
+const MUTEX_FILE = "mutex.sqlite";
+const SQLITE_BUSY = 5;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 const MAX_ENTRIES = 10_000;
@@ -97,9 +101,11 @@ export function parseProductionReleaseArchiveArgs(argv) {
  * The archive root must be an absolute, owner-private (0700, caller-owned,
  * not a symlink, by its real path) directory outside every Git checkout:
  * neither it nor any ancestor holds a `.git` entry, and it is not inside the
- * repository the script runs from. A missing leaf is created privately.
+ * repository the script runs from. Checked before anything is read or
+ * written: a root that does not exist yet must have a parent named by its
+ * real path, so nothing is ever created through a link.
  */
-async function prepareArchiveRoot(archiveRoot, repositoryRoot) {
+async function checkArchiveRoot(archiveRoot, repositoryRoot) {
   const root = resolve(archiveRoot);
   if (within(resolve(repositoryRoot), root)) refuse("PRODUCTION_RELEASE_ARCHIVE_INSIDE_REPOSITORY");
   for (let directory = root; ; directory = dirname(directory)) {
@@ -112,6 +118,30 @@ async function prepareArchiveRoot(archiveRoot, repositoryRoot) {
     }
     if (dirname(directory) === directory) break;
   }
+  let existing = null;
+  try {
+    existing = await lstat(root);
+  } catch (error) {
+    if (error?.code !== "ENOENT") refuse("PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE");
+  }
+  const named = existing === null ? dirname(root) : root;
+  let real;
+  try {
+    real = await realpath(named);
+  } catch {
+    refuse("PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE");
+  }
+  if (real !== named
+      || (existing !== null
+        && (!existing.isDirectory() || (existing.mode & 0o077) !== 0 || !ownedByCaller(existing)))) {
+    refuse("PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE");
+  }
+  return root;
+}
+
+// Create a missing archive root privately, once every input has verified,
+// and check it again as created.
+async function createArchiveRoot(root) {
   try {
     await mkdir(root, { mode: 0o700 });
   } catch (error) {
@@ -128,7 +158,30 @@ async function prepareArchiveRoot(archiveRoot, repositoryRoot) {
   if (!info.isDirectory() || real !== root || (info.mode & 0o077) !== 0 || !ownedByCaller(info)) {
     refuse("PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE");
   }
-  return root;
+}
+
+/**
+ * Whether a running operation holds the journal. openOperation holds it with
+ * an exclusive SQLite transaction on `mutex.sqlite`, so this probes that lock
+ * itself: read-only and without waiting, a live holder refuses even a shared
+ * read (SQLITE_BUSY). A holder that was killed leaves no lock, only a stale
+ * `mutex.sqlite-journal`; a read-only connection never rolls back or removes
+ * that file, so such a journal is archived as found. Anything else (no mutex,
+ * not a database) is an unsafe journal.
+ */
+function journalHeld(journalDirectory) {
+  let database = null;
+  try {
+    database = new DatabaseSync(join(journalDirectory, MUTEX_FILE), { readOnly: true });
+    database.exec("PRAGMA busy_timeout = 0");
+    database.prepare("SELECT count(*) AS tables FROM sqlite_master").get();
+    return false;
+  } catch (error) {
+    if (((error?.errcode ?? 0) & 0xff) === SQLITE_BUSY) return true;
+    return refuse("PRODUCTION_RELEASE_ARCHIVE_OPERATION_UNSAFE");
+  } finally {
+    database?.close();
+  }
 }
 
 /**
@@ -240,13 +293,17 @@ function indexBytes(index) {
  *   commit must be the journal's live site.
  * - The generated site is this checkout's `.release-build/public-release-site`,
  *   verified file by file against its manifest.
- * - archiveRoot: owner-private, outside every repository.
+ * - archiveRoot: owner-private, outside every repository, and neither inside
+ *   nor containing the journal. A missing root is created only after the
+ *   journal, receipt and site have verified; a refusal before then writes
+ *   nothing.
  *
  * The entry `<archiveRoot>/<journal identityDigest>/` holds `journal/`,
- * `web-release-receipt.json`, `public-release-site/` and a content-free
- * `index.json`. It is assembled in a private staging directory, verified, then
- * renamed into place. An existing identical entry is `already_archived`; any
- * other existing entry is refused, never overwritten.
+ * `web-release-receipt.json` (the exact bytes whose parse is the verified
+ * receipt), `public-release-site/` and a content-free `index.json`. It is
+ * assembled in a private staging directory, verified, then renamed into place.
+ * An existing identical entry is `already_archived`; any other existing entry
+ * is refused, never overwritten.
  */
 export async function archiveProductionRelease({
   operationDirectory,
@@ -264,9 +321,14 @@ export async function archiveProductionRelease({
   }
   let staging = null;
   try {
-    const root = await prepareArchiveRoot(archiveRoot, repositoryRoot);
+    // The archive never overlaps the journal: an archive inside the journal
+    // would add an entry to the journal it copies. Nothing is written until
+    // the journal, receipt and site verify, so the root is only checked here.
     const journalDirectory = resolve(operationDirectory);
-    if (within(root, journalDirectory)) refuse("PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID");
+    if (within(resolve(archiveRoot), journalDirectory) || within(journalDirectory, resolve(archiveRoot))) {
+      refuse("PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID");
+    }
+    const root = await checkArchiveRoot(archiveRoot, repositoryRoot);
 
     // 1. The journal: a verified typed production deploy, intact, at rest.
     let record;
@@ -285,7 +347,7 @@ export async function archiveProductionRelease({
       privateModes: true,
     });
     if (journalRows.some((row) => row.type !== "file")) refuse("PRODUCTION_RELEASE_ARCHIVE_OPERATION_UNSAFE");
-    if (journalRows.some((row) => row.path === BUSY_JOURNAL_FILE)) refuse("PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY");
+    if (journalHeld(journalDirectory)) refuse("PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY");
 
     // 2. The receipt: the lane's own verification, then the journal's site.
     const repository = resolve(repositoryRoot);
@@ -304,14 +366,15 @@ export async function archiveProductionRelease({
         || receipt.sourceCommit !== released.sourceCommit) {
       refuse("PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH");
     }
+    // The lane read the receipt itself; the bytes archived are read again, so
+    // they must parse to exactly the receipt it verified, field for field.
+    const verifiedReceipt = JSON.stringify(receipt);
     let receiptBytes;
     try {
       const info = await lstat(receiptPath);
       if (!info.isFile() || info.size > MAX_FILE_BYTES) throw new Error();
       receiptBytes = await readFile(receiptPath);
-      const reread = JSON.parse(receiptBytes.toString("utf8"));
-      if (reread?.sourceCommit !== receipt.sourceCommit
-          || reread?.site?.manifestSha256 !== receipt.site.manifestSha256) throw new Error();
+      if (JSON.stringify(JSON.parse(receiptBytes.toString("utf8"))) !== verifiedReceipt) throw new Error();
     } catch {
       refuse("PRODUCTION_RELEASE_ARCHIVE_SOURCE_CHANGED");
     }
@@ -331,7 +394,9 @@ export async function archiveProductionRelease({
     const manifestRow = siteListing.find((row) => row.path === "release-site-manifest.json");
     if (manifestRow?.sha256 !== released.manifestSha256) refuse("PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID");
 
-    // 4. Assemble privately, then prove the copy.
+    // 4. Every input verified: create the archive root if it is missing,
+    // assemble privately, then prove the copy.
+    await createArchiveRoot(root);
     const index = {
       schema: PRODUCTION_RELEASE_ARCHIVE_SCHEMA,
       journalIdentityDigest: record.binding,
@@ -348,7 +413,8 @@ export async function archiveProductionRelease({
     await syncDirectory(staging);
 
     // The journal did not move while it was copied, and the copy is still the
-    // same verified release; the copied site passes the same site check.
+    // same verified release; the copied receipt is still the verified receipt
+    // and the copied site passes the same site check.
     const journalAfter = await treeListing(journalDirectory, {
       code: "PRODUCTION_RELEASE_ARCHIVE_SOURCE_CHANGED",
       singleLink: true,
@@ -357,16 +423,20 @@ export async function archiveProductionRelease({
     if (!sameListing(journalAfter, journalRows)) refuse("PRODUCTION_RELEASE_ARCHIVE_SOURCE_CHANGED");
     let archivedRelease = null;
     let archivedSiteRows;
+    let archivedReceipt = null;
     try {
       const archivedRecord = await readOperation(join(staging, PRODUCTION_RELEASE_ARCHIVE_LAYOUT.journal));
       if (archivedRecord.binding === record.binding) archivedRelease = releasedSiteOfOperation(archivedRecord);
       archivedSiteRows = await verifySite(join(staging, PRODUCTION_RELEASE_ARCHIVE_LAYOUT.site));
+      archivedReceipt = await readFile(join(staging, PRODUCTION_RELEASE_ARCHIVE_LAYOUT.receipt));
     } catch {
       archivedRelease = null;
     }
     if (archivedRelease === null
         || JSON.stringify(archivedRelease) !== JSON.stringify(released)
-        || JSON.stringify(archivedSiteRows) !== JSON.stringify(siteRows)) {
+        || JSON.stringify(archivedSiteRows) !== JSON.stringify(siteRows)
+        || sha256(archivedReceipt) !== index.receiptSha256
+        || JSON.stringify(JSON.parse(archivedReceipt.toString("utf8"))) !== verifiedReceipt) {
       refuse("PRODUCTION_RELEASE_ARCHIVE_COPY_UNVERIFIED");
     }
 

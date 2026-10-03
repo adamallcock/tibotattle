@@ -463,6 +463,7 @@
       "additionalAliases": [],
       "callers": [
         "apps/worker/scripts/production-deploy.check.mjs",
+        "apps/worker/scripts/production-release-archive.check.mjs",
         "apps/worker/scripts/stage-production-assets.check.mjs",
         "apps/worker/scripts/stage-production-assets.mjs",
         "scripts/build-public-release-site.js",

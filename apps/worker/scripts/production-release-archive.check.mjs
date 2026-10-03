@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import {
@@ -9,6 +9,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -18,6 +19,8 @@ import { dirname, join, relative, sep } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { openOperation, readOperation } from "../../../scripts/lib/release-operation.mjs";
+import { PUBLIC_RELEASE_MANIFEST_SCHEMA } from "../../../scripts/public-release-provenance.js";
+import { ADMIN_UI_SHARED_SOURCES } from "./generate-admin-ui-assets.mjs";
 import {
   parseProductionDeploymentArgs,
   releasedSiteOfOperation,
@@ -28,12 +31,22 @@ import {
   parseProductionReleaseArchiveArgs,
   PRODUCTION_RELEASE_ARCHIVE_SCHEMA,
 } from "./production-release-archive.mjs";
+import { verifyGeneratedCommunityAssetTree } from "./stage-production-assets.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "production-release-archive.mjs");
+const RELEASE_OPERATION = new URL("../../../scripts/lib/release-operation.mjs", import.meta.url).href;
+// A release ships a site built from its own deploy commit; a rollback ships
+// one built from an older commit it names; a deploy that keeps the site
+// leaves the retained one live.
 const SITE_SOURCE = "e".repeat(40);
-const DEPLOY_SOURCE = SITE_SOURCE;
+const DEPLOY_COMMIT = "6".repeat(40);
+const ROLLBACK_SOURCE = "5".repeat(40);
+const RETAINED_SOURCE = "9".repeat(40);
+const REPLACED_SOURCE = "7".repeat(40);
+const REPLACED_MANIFEST = "8".repeat(64);
 const LIVE_COMMIT = "a".repeat(40);
 const OWNER = "b".repeat(40);
+const BUSY = { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY" };
 const temporary = [];
 after(async () => {
   for (const directory of temporary) await rm(directory, { recursive: true, force: true });
@@ -49,20 +62,39 @@ async function privateTemporaryDirectory(prefix) {
   return directory;
 }
 
-// A synthetic checkout: a generated site whose manifest lists its files, and
-// a receipt naming that manifest. No real release content.
+async function absent(path) {
+  await assert.rejects(lstat(path), { code: "ENOENT" }, path);
+}
+
+// The smallest site the staging gate (verifyGeneratedCommunityAssetTree)
+// accepts: an index loading the community entry, the SEO files and every
+// shared admin dependency, each listed in a release manifest. No real
+// release content.
+function siteFiles() {
+  const files = {
+    "index.html": '<!doctype html><title>synthetic</title><script type="module" src="./community.js"></script>\n',
+    "community.js": "export const synthetic = true;\n",
+    "robots.txt": "User-agent: *\nAllow: /\n",
+    "sitemap.xml": '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"></urlset>\n',
+  };
+  for (const name of ADMIN_UI_SHARED_SOURCES) files[name] = `/* synthetic ${name} */\n`;
+  return files;
+}
+
+// A synthetic checkout: that generated site and a receipt naming its manifest.
 async function checkout({ siteSource = SITE_SOURCE } = {}) {
   const root = await privateTemporaryDirectory("release-archive-checkout-");
   const site = join(root, ".release-build", "public-release-site");
-  await mkdir(join(site, "assets"), { recursive: true });
-  const files = {
-    "index.html": "<!doctype html><title>synthetic</title>\n",
-    "assets/app.js": "export const synthetic = true;\n",
-  };
+  await mkdir(site, { recursive: true });
+  const files = siteFiles();
   for (const [path, contents] of Object.entries(files)) await writeFile(join(site, path), contents);
   const manifestBytes = Buffer.from(`${JSON.stringify({
-    schemaVersion: "synthetic-manifest",
-    files: Object.entries(files).map(([path, contents]) => ({ path, sha256: sha256(contents) })),
+    schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
+    files: Object.entries(files).map(([path, contents]) => ({
+      path,
+      bytes: Buffer.byteLength(contents),
+      sha256: sha256(contents),
+    })),
   })}\n`);
   await writeFile(join(site, "release-site-manifest.json"), manifestBytes);
   const manifestSha256 = sha256(manifestBytes);
@@ -77,7 +109,8 @@ async function checkout({ siteSource = SITE_SOURCE } = {}) {
   return { root, site, receiptPath, manifestSha256 };
 }
 
-// The lane's verifier, reduced to reading the receipt it was given.
+// The lane's verifier, reduced to reading the receipt it was given. The site
+// gate is the real one throughout.
 function receiptVerifier(expectedRoot, overrides = {}) {
   return async ({ repositoryRoot, receiptPath }) => {
     assert.equal(repositoryRoot, expectedRoot);
@@ -86,44 +119,33 @@ function receiptVerifier(expectedRoot, overrides = {}) {
   };
 }
 
-// The staging gate, reduced to: every file but the manifest is listed in the
-// manifest with its sha256, and nothing else is present.
-async function siteVerifier(directory) {
-  const manifest = JSON.parse(await readFile(join(directory, "release-site-manifest.json"), "utf8"));
-  const expected = new Map(manifest.files.map((row) => [row.path, row.sha256]));
-  const rows = [];
-  async function visit(current) {
-    const entries = await readdir(current, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      const path = join(current, entry.name);
-      if (entry.isDirectory()) { await visit(path); continue; }
-      if (!entry.isFile()) throw new Error("unsafe entry");
-      const name = relative(directory, path).split(sep).join("/");
-      const bytes = await readFile(path);
-      if (name !== "release-site-manifest.json" && expected.get(name) !== sha256(bytes)) {
-        throw new Error("Generated public asset changed after release build");
-      }
-      rows.push({ path: name, bytes: bytes.length, sha256: sha256(bytes) });
-    }
-  }
-  await visit(directory);
-  if (rows.length !== expected.size + 1) throw new Error("Generated public output does not match its release manifest.");
-  return rows;
-}
-
-async function releaseJournal({ manifestSha256, siteSource = SITE_SOURCE, outcome = "verified", state = {} }) {
+// A real operation journal, saved as production-deploy saves a finished
+// typed deploy, for each site shape a verified deploy can leave live.
+async function releaseJournal({
+  manifestSha256,
+  shape = "candidate",
+  siteSource = SITE_SOURCE,
+  deploySource = siteSource,
+  outcome = "verified",
+  state = {},
+}) {
   const directory = await privateTemporaryDirectory("release-archive-journal-");
+  const site = shape === "retained"
+    ? { retainedPublicSourceCommit: siteSource, expectedLiveManifestSha256: manifestSha256 }
+    : {
+      retainedPublicSourceCommit: REPLACED_SOURCE,
+      expectedLiveManifestSha256: REPLACED_MANIFEST,
+      candidatePublicManifestSha256: manifestSha256,
+      ...(shape === "rollback" ? { candidatePublicSourceCommit: siteSource } : {}),
+    };
   const typed = {
     schema: "production-typed-operation-v1",
     liveConfigurationFingerprint: "f".repeat(64),
     predecessorSourceCommit: LIVE_COMMIT,
-    retainedPublicSourceCommit: "9".repeat(40),
-    expectedLiveManifestSha256: "8".repeat(64),
-    candidatePublicManifestSha256: manifestSha256,
+    ...site,
     expectedSchemaIdentity: { schema: "production-typed-schema-v1" },
   };
-  const binding = { sourceCommit: siteSource, previousSourceCommit: LIVE_COMMIT, confirmedMigrations: null, typed };
+  const binding = { sourceCommit: deploySource, previousSourceCommit: LIVE_COMMIT, confirmedMigrations: null, typed };
   const operation = await openOperation({ directory, kind: "production", binding });
   try {
     await operation.save({
@@ -138,7 +160,38 @@ async function releaseJournal({ manifestSha256, siteSource = SITE_SOURCE, outcom
   } finally {
     operation.close();
   }
-  return directory;
+  return { directory, binding };
+}
+
+// Hold a journal from another process, the way a running deploy holds it.
+async function holdInAnotherProcess(directory, binding) {
+  const child = spawn(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    [
+      `import { openOperation } from ${JSON.stringify(RELEASE_OPERATION)};`,
+      "await openOperation({ directory: process.argv[1], kind: \"production\", binding: JSON.parse(process.argv[2]), resume: true });",
+      "process.stdout.write(\"held\\n\");",
+      "setInterval(() => {}, 60_000);",
+    ].join("\n"),
+    directory,
+    JSON.stringify(binding),
+  ], { stdio: ["ignore", "pipe", "ignore"] });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  await new Promise((resolve, reject) => {
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (output.includes("held\n")) resolve();
+    });
+    exited.then(() => reject(new Error("the holder exited before it held the journal")));
+  });
+  return {
+    async kill() {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    },
+  };
 }
 
 async function listing(root) {
@@ -162,9 +215,13 @@ async function listing(root) {
   return rows;
 }
 
-async function fixture(options = {}) {
-  const repository = await checkout(options);
-  const operationDirectory = await releaseJournal({ manifestSha256: repository.manifestSha256, ...options.journal });
+async function fixture({ siteSource = SITE_SOURCE, journal = {} } = {}) {
+  const repository = await checkout({ siteSource });
+  const { directory: operationDirectory, binding } = await releaseJournal({
+    manifestSha256: repository.manifestSha256,
+    siteSource,
+    ...journal,
+  });
   const archiveRoot = join(await privateTemporaryDirectory("release-archive-root-"), "archive");
   const run = (overrides = {}) => archiveProductionRelease({
     operationDirectory,
@@ -172,16 +229,17 @@ async function fixture(options = {}) {
     archiveRoot,
     repositoryRoot: repository.root,
     verifyReceipt: receiptVerifier(repository.root),
-    verifySite: siteVerifier,
     ...overrides,
   });
-  return { ...repository, operationDirectory, archiveRoot, run };
+  return { ...repository, operationDirectory, binding, archiveRoot, run };
 }
 
 test("a verified typed deploy is archived privately with its receipt, site and a content-free index", async () => {
   const f = await fixture();
   const journalBefore = await listing(f.operationDirectory);
   const siteBefore = await listing(f.site);
+  // The fixture's site passes the real staging gate, which the archive runs.
+  const siteRows = await verifyGeneratedCommunityAssetTree(f.site);
   const record = await readOperation(f.operationDirectory);
   const result = await f.run();
   assert.deepEqual(result, {
@@ -189,7 +247,7 @@ test("a verified typed deploy is archived privately with its receipt, site and a
     code: "PRODUCTION_RELEASE_ARCHIVED",
     archive: "created",
     journalIdentityDigest: record.binding,
-    deployCommit: DEPLOY_SOURCE,
+    deployCommit: SITE_SOURCE,
     sourceCommit: SITE_SOURCE,
     manifestSha256: f.manifestSha256,
     receiptSha256: sha256(await readFile(f.receiptPath)),
@@ -209,22 +267,20 @@ test("a verified typed deploy is archived privately with its receipt, site and a
     "journal/mutex.sqlite",
     "journal/operation.json",
     "public-release-site",
-    "public-release-site/assets",
-    "public-release-site/assets/app.js",
-    "public-release-site/index.html",
-    "public-release-site/release-site-manifest.json",
+    ...siteBefore.map(([name]) => `public-release-site/${name}`),
     "web-release-receipt.json",
   ]);
   for (const [name, kind, mode] of archived) assert.equal(mode, kind === "directory" ? "700" : "600", name);
-  // Byte-identical copies.
+  // Byte-identical copies; the copied site passes the same gate.
   assert.deepEqual(
     archived.filter(([name]) => name.startsWith("journal/")).map(([name, digest]) => [name.slice(8), digest]),
     journalBefore.map(([name, digest]) => [name, digest]),
   );
   assert.deepEqual(
-    archived.filter(([name]) => name.startsWith("public-release-site/")).map(([name, kind]) => [name.slice(20), kind]),
-    siteBefore.map(([name, kind]) => [name, kind]),
+    archived.filter(([name]) => name.startsWith("public-release-site/")).map(([name, digest]) => [name.slice(20), digest]),
+    siteBefore.map(([name, digest]) => [name, digest]),
   );
+  assert.deepEqual(await verifyGeneratedCommunityAssetTree(join(entry, "public-release-site")), siteRows);
   assert.deepEqual(await readFile(join(entry, "web-release-receipt.json")), await readFile(f.receiptPath));
 
   // The index holds exactly the content-free identity, no path or journal state.
@@ -232,7 +288,7 @@ test("a verified typed deploy is archived privately with its receipt, site and a
   assert.deepEqual(JSON.parse(indexText), {
     schema: PRODUCTION_RELEASE_ARCHIVE_SCHEMA,
     journalIdentityDigest: record.binding,
-    deployCommit: DEPLOY_SOURCE,
+    deployCommit: SITE_SOURCE,
     sourceCommit: SITE_SOURCE,
     manifestSha256: f.manifestSha256,
     receiptSha256: sha256(await readFile(f.receiptPath)),
@@ -246,33 +302,61 @@ test("a verified typed deploy is archived privately with its receipt, site and a
   assert.deepEqual(releasedSiteOfOperation(archivedRecord), releasedSiteOfOperation(record));
 });
 
-test("a website rollback names the archived journal", async () => {
-  const f = await fixture();
-  const { journalIdentityDigest } = await f.run();
-  const archivedJournal = join(f.archiveRoot, journalIdentityDigest, "journal");
-  const receipt = JSON.parse(await readFile(join(f.archiveRoot, journalIdentityDigest, "web-release-receipt.json"), "utf8"));
-  const options = parseProductionDeploymentArgs([
-    "--confirm", "DEPLOY_PRODUCTION",
-    "--expected-previous-source", "c".repeat(40),
-    "--inventory", "/private/inventory.json",
-    "--inventory-sha256", "1".repeat(64),
-    "--candidate-public-manifest-sha256", f.manifestSha256,
-    "--rollback-web-release-receipt", "/synthetic/checkout/.release-build/web-release-receipt.json",
-    "--rollback-release-operation", archivedJournal,
-    "--replaced-public-source", "d".repeat(40),
-    "--replaced-live-manifest-sha256", "7".repeat(64),
-    "--edge-mode", "worker",
-  ]);
-  const resolved = await resolveProductionCandidateSite({
-    options,
-    workerDirectory: "/synthetic/checkout/apps/worker",
-    headCommit: () => "c".repeat(40),
-    isAncestor: async () => true,
-    verifyReceipt: async () => ({ receipt }),
-  });
-  assert.equal(resolved.ok, true, resolved.code);
-  assert.equal(resolved.options.candidatePublicSourceCommit, SITE_SOURCE);
-  assert.equal(resolved.options.candidatePublicManifestSha256, f.manifestSha256);
+test("each site a verified deploy leaves live is archived and becomes a rollback target", async () => {
+  const shapes = [
+    // A release: the candidate built from the deploy commit.
+    { shape: "candidate", siteSource: SITE_SOURCE, deploySource: SITE_SOURCE },
+    // A rollback: the candidate built from the older commit it names.
+    { shape: "rollback", siteSource: ROLLBACK_SOURCE, deploySource: DEPLOY_COMMIT },
+    // A deploy that kept the site (P1, PROD-5): the retained pair.
+    { shape: "retained", siteSource: RETAINED_SOURCE, deploySource: DEPLOY_COMMIT },
+  ];
+  for (const { shape, siteSource, deploySource } of shapes) {
+    const f = await fixture({ siteSource, journal: { shape, deploySource } });
+    const record = await readOperation(f.operationDirectory);
+    assert.deepEqual(releasedSiteOfOperation(record),
+      { manifestSha256: f.manifestSha256, sourceCommit: siteSource, deploySourceCommit: deploySource }, shape);
+    const created = await f.run();
+    assert.deepEqual(created, {
+      ok: true,
+      code: "PRODUCTION_RELEASE_ARCHIVED",
+      archive: "created",
+      journalIdentityDigest: record.binding,
+      deployCommit: deploySource,
+      sourceCommit: siteSource,
+      manifestSha256: f.manifestSha256,
+      receiptSha256: sha256(await readFile(f.receiptPath)),
+    }, shape);
+    assert.deepEqual(await f.run(),
+      { ...created, code: "PRODUCTION_RELEASE_ALREADY_ARCHIVED", archive: "already_archived" }, shape);
+
+    // A later website rollback names the archived journal, used in place,
+    // with the archived receipt restored.
+    const entry = join(f.archiveRoot, record.binding);
+    const receipt = JSON.parse(await readFile(join(entry, "web-release-receipt.json"), "utf8"));
+    const options = parseProductionDeploymentArgs([
+      "--confirm", "DEPLOY_PRODUCTION",
+      "--expected-previous-source", "c".repeat(40),
+      "--inventory", "/private/inventory.json",
+      "--inventory-sha256", "1".repeat(64),
+      "--candidate-public-manifest-sha256", f.manifestSha256,
+      "--rollback-web-release-receipt", "/synthetic/checkout/.release-build/web-release-receipt.json",
+      "--rollback-release-operation", join(entry, "journal"),
+      "--replaced-public-source", "d".repeat(40),
+      "--replaced-live-manifest-sha256", "3".repeat(64),
+      "--edge-mode", "worker",
+    ]);
+    const resolved = await resolveProductionCandidateSite({
+      options,
+      workerDirectory: "/synthetic/checkout/apps/worker",
+      headCommit: () => "c".repeat(40),
+      isAncestor: async () => true,
+      verifyReceipt: async () => ({ receipt }),
+    });
+    assert.equal(resolved.ok, true, `${shape}: ${resolved.code}`);
+    assert.equal(resolved.options.candidatePublicSourceCommit, siteSource, shape);
+    assert.equal(resolved.options.candidatePublicManifestSha256, f.manifestSha256, shape);
+  }
 });
 
 test("archiving is idempotent and never overwrites a different entry", async () => {
@@ -311,7 +395,7 @@ test("archiving is idempotent and never overwrites a different entry", async () 
   assert.deepEqual(await readdir(h.archiveRoot), [digest]);
 });
 
-test("only a verified, intact, idle typed production journal is archived", async () => {
+test("only a verified, intact typed production journal is archived, and a refusal writes nothing", async () => {
   const refusals = [
     [{ outcome: "deployed_unverified" }, "PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED"],
     [{ outcome: "outcome_unknown" }, "PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED"],
@@ -321,26 +405,66 @@ test("only a verified, intact, idle typed production journal is archived", async
   ];
   for (const [journal, code] of refusals) {
     const f = await fixture({ journal });
+    const before = await listing(f.operationDirectory);
     assert.deepEqual(await f.run(), { ok: false, code }, JSON.stringify(journal));
-    assert.deepEqual(await readdir(f.archiveRoot), []);
+    assert.deepEqual(await listing(f.operationDirectory), before);
+    await absent(f.archiveRoot);
   }
   const f = await fixture();
   assert.deepEqual(await f.run({ operationDirectory: join(f.operationDirectory, "absent") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_INVALID" });
   assert.deepEqual(await f.run({ readReleaseOperation: async () => ({ ...(await readOperation(f.operationDirectory)), kind: "maintenance" }) }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_NOT_VERIFIED" });
-  // A journal held by a running operation.
-  await writeFile(join(f.operationDirectory, "mutex.sqlite-journal"), "", { mode: 0o600 });
-  assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_BUSY" });
-  await rm(join(f.operationDirectory, "mutex.sqlite-journal"));
-  // A journal that is not private, or that holds a link.
+  // A journal that is not private, that holds a link, or whose mutex is
+  // missing or not a database.
   await symlink("/dev/null", join(f.operationDirectory, "link"));
   assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_UNSAFE" });
   await rm(join(f.operationDirectory, "link"));
   await chmod(f.operationDirectory, 0o755);
   assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_INVALID" });
   await chmod(f.operationDirectory, 0o700);
+  await rename(join(f.operationDirectory, "mutex.sqlite"), join(f.operationDirectory, "mutex.parked"));
+  assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_UNSAFE" });
+  await writeFile(join(f.operationDirectory, "mutex.sqlite"), "not a database", { mode: 0o600 });
+  assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_OPERATION_UNSAFE" });
+  await rm(join(f.operationDirectory, "mutex.sqlite"));
+  await rename(join(f.operationDirectory, "mutex.parked"), join(f.operationDirectory, "mutex.sqlite"));
+  await absent(f.archiveRoot);
   assert.equal((await f.run()).code, "PRODUCTION_RELEASE_ARCHIVED");
+});
+
+test("a journal a live operation holds is busy; a killed holder's leftover is archived as found", async () => {
+  const f = await fixture();
+  // The deploy's own lock, held in this process.
+  const held = await openOperation({ directory: f.operationDirectory, kind: "production", binding: f.binding, resume: true });
+  try {
+    assert.deepEqual(await f.run(), BUSY);
+  } finally {
+    held.close();
+  }
+  await absent(f.archiveRoot);
+
+  // Held by another process, which is then killed while it holds it.
+  const holder = await holdInAnotherProcess(f.operationDirectory, f.binding);
+  try {
+    assert.deepEqual(await f.run(), BUSY);
+    await absent(f.archiveRoot);
+  } finally {
+    await holder.kill();
+  }
+  // The killed holder leaves a stale mutex.sqlite-journal and no lock: not busy.
+  const leftover = await listing(f.operationDirectory);
+  assert.deepEqual(leftover.map(([name]) => name), ["mutex.sqlite", "mutex.sqlite-journal", "operation.json"]);
+  const result = await f.run();
+  assert.equal(result.code, "PRODUCTION_RELEASE_ARCHIVED");
+  // The probe never rolls back or removes the leftover; the journal is
+  // archived byte for byte, as found.
+  assert.deepEqual(await listing(f.operationDirectory), leftover);
+  assert.deepEqual(
+    (await listing(join(f.archiveRoot, result.journalIdentityDigest, "journal"))).map(([name, digest]) => [name, digest]),
+    leftover.map(([name, digest]) => [name, digest]),
+  );
+  assert.equal((await f.run()).code, "PRODUCTION_RELEASE_ALREADY_ARCHIVED");
 });
 
 test("the receipt and site must be the ones the journal left live", async () => {
@@ -355,15 +479,32 @@ test("the receipt and site must be the ones the journal left live", async () => 
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_RECEIPT_MISMATCH" });
   // The default verifier is the web-only lane's: this synthetic receipt fails it.
   assert.deepEqual(await f.run({ verifyReceipt: null }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_RECEIPT_INVALID" });
-  // A site changed after the deploy.
-  await writeFile(join(f.site, "assets", "app.js"), "export const synthetic = false;\n");
+  // A site changed after the deploy fails the staging gate.
+  await writeFile(join(f.site, "community.js"), "export const synthetic = false;\n");
   assert.deepEqual(await f.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID" });
-  // The default site verifier is the staging gate's: this synthetic site fails it.
+  await absent(f.archiveRoot);
+
+  // So does a local-only file beside it, and a missing site.
   const g = await fixture();
-  assert.deepEqual(await g.run({ verifySite: undefined }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID" });
+  await writeFile(join(g.site, "app.js"), "export const local = true;\n");
+  assert.deepEqual(await g.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID" });
   await rm(g.site, { recursive: true });
   assert.deepEqual(await g.run(), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SITE_INVALID" });
-  for (const fixtureRoot of [f.archiveRoot, g.archiveRoot]) assert.deepEqual(await readdir(fixtureRoot), []);
+  await absent(g.archiveRoot);
+
+  // The bytes archived must parse to exactly the receipt the lane verified: a
+  // receipt replaced after verification, with the same site and source but
+  // another base, is refused.
+  const h = await fixture();
+  const verify = receiptVerifier(h.root);
+  assert.deepEqual(await h.run({
+    verifyReceipt: async (input) => {
+      const verified = await verify(input);
+      await writeFile(h.receiptPath, `${JSON.stringify({ ...verified.receipt, baseCommit: "2".repeat(40) })}\n`);
+      return verified;
+    },
+  }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SOURCE_CHANGED" });
+  await absent(h.archiveRoot);
 });
 
 test("a journal that moves during the copy, or a copy that does not verify, leaves no entry", async () => {
@@ -376,30 +517,46 @@ test("a journal that moves during the copy, or a copy that does not verify, leav
     },
   }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_SOURCE_CHANGED" });
   assert.deepEqual(await readdir(f.archiveRoot), []);
+
+  // The copied site does not pass the gate as the source did.
   const g = await fixture();
   let calls = 0;
   assert.deepEqual(await g.run({
     verifySite: async (directory) => {
-      const rows = await siteVerifier(directory);
+      const rows = await verifyGeneratedCommunityAssetTree(directory);
       calls += 1;
       return calls === 1 ? rows : rows.slice(1);
     },
   }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_COPY_UNVERIFIED" });
   assert.equal(calls, 2);
   assert.deepEqual(await readdir(g.archiveRoot), []);
+
+  // The copied receipt is no longer the verified receipt.
+  const h = await fixture();
+  let siteChecks = 0;
+  assert.deepEqual(await h.run({
+    verifySite: async (directory) => {
+      siteChecks += 1;
+      if (siteChecks === 2) await writeFile(join(dirname(directory), "web-release-receipt.json"), "{}\n");
+      return verifyGeneratedCommunityAssetTree(directory);
+    },
+  }), { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_COPY_UNVERIFIED" });
+  assert.equal(siteChecks, 2);
+  assert.deepEqual(await readdir(h.archiveRoot), []);
 });
 
-test("the archive directory is owner-private and outside every repository", async () => {
+test("the archive directory is owner-private, outside every repository and apart from the journal", async () => {
   const f = await fixture();
   // Inside the checkout, or under any Git working tree.
   assert.deepEqual(await f.run({ archiveRoot: join(f.root, "archive") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_INSIDE_REPOSITORY" });
+  await absent(join(f.root, "archive"));
   const other = await privateTemporaryDirectory("release-archive-other-repo-");
   await writeFile(join(other, ".git"), "gitdir: elsewhere\n");
   await mkdir(join(other, "nested"));
   assert.deepEqual(await f.run({ archiveRoot: join(other, "nested", "archive") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_INSIDE_REPOSITORY" });
-  // Not private, a symlink, or with no parent.
+  // Not private, a symlink, through a linked parent, or with no parent.
   const parent = await privateTemporaryDirectory("release-archive-unsafe-");
   await mkdir(join(parent, "open"), { mode: 0o755 });
   await chmod(join(parent, "open"), 0o755);
@@ -409,9 +566,25 @@ test("the archive directory is owner-private and outside every repository", asyn
   await symlink(join(parent, "real"), join(parent, "linked"));
   assert.deepEqual(await f.run({ archiveRoot: join(parent, "linked") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE" });
+  assert.deepEqual(await f.run({ archiveRoot: join(parent, "linked", "archive") }),
+    { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE" });
+  assert.deepEqual(await readdir(join(parent, "real")), []);
   assert.deepEqual(await f.run({ archiveRoot: join(parent, "missing", "archive") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_DIRECTORY_UNSAFE" });
-  // The journal cannot come from inside the archive.
+  await absent(join(parent, "missing"));
+
+  // Never inside the journal: a journal outside the checkout, verified or
+  // not, is left exactly as found.
+  for (const journal of [{}, { outcome: "deployed_unverified" }]) {
+    const g = await fixture({ journal });
+    const before = await listing(g.operationDirectory);
+    for (const archiveRoot of [join(g.operationDirectory, "archive"), join(g.operationDirectory, "a", "archive")]) {
+      assert.deepEqual(await g.run({ archiveRoot }),
+        { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID" }, JSON.stringify(journal));
+    }
+    assert.deepEqual(await listing(g.operationDirectory), before);
+  }
+  // Nor is the journal inside the archive.
   await mkdir(f.archiveRoot, { mode: 0o700 });
   assert.deepEqual(await f.run({ operationDirectory: join(f.archiveRoot, "x", "journal") }),
     { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID" });
@@ -419,6 +592,8 @@ test("the archive directory is owner-private and outside every repository", asyn
     assert.deepEqual(await f.run({ [field]: "relative/path" }),
       { ok: false, code: "PRODUCTION_RELEASE_ARCHIVE_ARGUMENTS_INVALID" }, field);
   }
+  assert.deepEqual(await readdir(f.archiveRoot), []);
+  assert.equal((await f.run()).code, "PRODUCTION_RELEASE_ARCHIVED");
 });
 
 test("the CLI takes exactly three absolute arguments", () => {
