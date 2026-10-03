@@ -287,22 +287,21 @@ async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: st
 /**
  * The typed v1 and v1.1 rows the effective reader admits for owner $1 /
  * participant $2 and stream ($3 code, $4 name), restricted by `filter` on the
- * typed `record` alias. Mirrors d43c8f92 CANDIDATE_SQL / DIRECT_SOURCE_SQL.
+ * typed `record` alias. Mirrors d43c8f92 CANDIDATE_SQL / DIRECT_SOURCE_SQL,
+ * except for one predicate it leaves to the caller: the v1.1 chunk
+ * completeness test (`chunk.record_count` equal to the chunk's proof count).
+ * A v1.1 row carries its chunk as v11_chunk_id and v11_chunk_records (null on
+ * a v1 row), and a caller admits exactly the rows legacyV11CompleteSql keeps,
+ * with v11ChunkProofsSql over the same records. Correlated here, the count ran
+ * once per candidate record and walked every proof of the record's chunk (up
+ * to 200), four passes per record (REFRESH-OPT d3); per statement it runs once
+ * per chunk. v1 chunks keep their (small) inline completeness count.
  */
 function legacyDirectSql(s: string, filter: string): string {
   const v1Device = typedIdTextSql("typed_device.original_id");
   const columns = `record.id AS storage_row_id,record.format,record.occurrence_id,record.observed_at_ms,
          record.observed_day,record.canonical_digest,typed_device.original_id AS device_blob`;
-  const v11ProofCount = `(SELECT count(*)
-      FROM ${s}.typed_v11_chunk_allocations count_allocation
-      JOIN ${s}.typed_telemetry_chunks physical_chunk
-        ON physical_chunk.namespace_id=count_allocation.namespace_id AND physical_chunk.format=11
-       AND physical_chunk.original_id=count_allocation.chunk_original
-      JOIN ${s}.typed_v11_record_proofs count_proof ON count_proof.chunk_key=physical_chunk.id
-      JOIN ${s}.typed_v11_manifest_memberships count_membership
-        ON count_membership.typed_manifest_id=count_proof.manifest_key
-     WHERE count_allocation.chunk_id=chunk.id)`;
-  return `SELECT ${columns}
+  return `SELECT ${columns},NULL::text AS v11_chunk_id,NULL::integer AS v11_chunk_records
       FROM ${s}.typed_telemetry_owner_memberships membership
       JOIN ${s}.typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
        AND v1.source_namespace=membership.source_namespace AND v1.namespace_id=membership.namespace_id
@@ -320,7 +319,7 @@ function legacyDirectSql(s: string, filter: string): string {
        AND event.source_namespace=v1.source_namespace
      WHERE membership.participant_id=$2 AND membership.source_format=10 AND ${filter}
     UNION ALL
-    SELECT ${columns}
+    SELECT ${columns},chunk.id AS v11_chunk_id,chunk.record_count AS v11_chunk_records
       FROM ${s}.typed_telemetry_owner_memberships membership
       JOIN ${s}.typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
        AND v11.source_namespace=membership.source_namespace AND v11.namespace_id=membership.namespace_id
@@ -347,8 +346,45 @@ function legacyDirectSql(s: string, filter: string): string {
        AND event.input_revision=generation.input_revision
       JOIN ${s}.device_credentials generation_device ON generation_device.id=generation.device_id
        AND generation_device.participant_id=generation.participant_id
-     WHERE membership.participant_id=$2 AND membership.source_format=11
-       AND chunk.record_count=${v11ProofCount} AND ${filter}`;
+     WHERE membership.participant_id=$2 AND membership.source_format=11 AND ${filter}`;
+}
+
+/**
+ * A MATERIALIZED CTE `v11_chunk_proofs` (chunk_id, proof_count): for every
+ * v1.1 chunk a typed record of CTE `fence` (column `id`) reaches through its
+ * proof and the chunk allocation, which is the path legacyDirectSql joins, the
+ * count d43c8f92's completeness subquery takes for that chunk, unchanged.
+ */
+function v11ChunkProofsSql(s: string, fence: string): string {
+  return `v11_chunk_proofs AS MATERIALIZED (
+      SELECT count_allocation.chunk_id,count(*) AS proof_count
+        FROM ${s}.typed_v11_chunk_allocations count_allocation
+        JOIN ${s}.typed_telemetry_chunks physical_chunk
+          ON physical_chunk.namespace_id=count_allocation.namespace_id AND physical_chunk.format=11
+         AND physical_chunk.original_id=count_allocation.chunk_original
+        JOIN ${s}.typed_v11_record_proofs count_proof ON count_proof.chunk_key=physical_chunk.id
+        JOIN ${s}.typed_v11_manifest_memberships count_membership
+          ON count_membership.typed_manifest_id=count_proof.manifest_key
+       WHERE count_allocation.chunk_id IN (
+         SELECT reach_allocation.chunk_id FROM ${fence} reach
+           JOIN ${s}.typed_v11_record_proofs reach_proof ON reach_proof.typed_record_id=reach.id
+           JOIN ${s}.typed_telemetry_chunks reach_chunk ON reach_chunk.id=reach_proof.chunk_key
+           JOIN ${s}.typed_v11_chunk_allocations reach_allocation
+             ON reach_allocation.namespace_id=reach_chunk.namespace_id
+            AND reach_allocation.chunk_original=reach_chunk.original_id)
+       GROUP BY count_allocation.chunk_id)`;
+}
+
+/**
+ * The completeness predicate legacyDirectSql leaves out, on its row `alias`:
+ * a v1 row passes, and a v1.1 row passes exactly when its chunk's
+ * record_count equals the chunk's proof count. A chunk absent from
+ * v11_chunk_proofs has none (count 0), which no record_count (1 to 200)
+ * equals, as before.
+ */
+function legacyV11CompleteSql(alias: string): string {
+  return `(${alias}.format=10 OR (${alias}.v11_chunk_id,${alias}.v11_chunk_records::bigint) IN (
+      SELECT complete.chunk_id,complete.proof_count FROM v11_chunk_proofs complete))`;
 }
 
 /**
@@ -368,8 +404,10 @@ function legacyDirectSql(s: string, filter: string): string {
  * precedes: a selected record's (namespace, owner, format) is its source
  * format's membership of participant $2 (one per format), its stream is $3,
  * and observed_day BETWEEN $5 AND $6 holds exactly when observed_at_ms lies
- * in [$5, $6 + 1) days (0030's CHECK ties the two). So the rows, their
- * multiplicity and the grouping are unchanged.
+ * in [$5, $6 + 1) days (0030's CHECK ties the two). The v1.1 chunk
+ * completeness test is applied after the LATERAL, against the counts of the
+ * chunks the fenced records reach (v11ChunkProofsSql), the same per-row
+ * predicate. So the rows, their multiplicity and the grouping are unchanged.
  */
 function legacyCandidatesSql(s: string): string {
   return `WITH owned AS MATERIALIZED (
@@ -380,10 +418,11 @@ function legacyCandidatesSql(s: string): string {
          AND owned_record.observed_at_ms>=$5::integer::bigint*${DAY_MS}
          AND owned_record.observed_at_ms<($6::integer::bigint+1)*${DAY_MS}
        WHERE owned_membership.participant_id=$2 AND owned_membership.source_format IN (10,11)
-    ), direct AS (
+    ), ${v11ChunkProofsSql(s, "owned")}, direct AS (
       SELECT eligible.* FROM owned CROSS JOIN LATERAL (
         ${legacyDirectSql(s, "record.id=owned.id AND record.observed_day BETWEEN $5::integer AND $6::integer")}
         OFFSET 0) eligible
+       WHERE ${legacyV11CompleteSql("eligible")}
     )
     SELECT observed_day,occurrence_id,min(observed_at_ms)::text AS observed_at_ms
       FROM direct GROUP BY observed_day,occurrence_id`;
@@ -407,8 +446,11 @@ function legacyCandidatesSql(s: string): string {
  * fenced LATERAL (OFFSET 0 keeps it per record). The fence is implied by the
  * joins it precedes: a selected v1 record's device and a selected v1.1
  * record's manifest belong to the record's (namespace, owner) (0030's foreign
- * keys), which is its format's membership of participant $2. So the rows,
- * their multiplicity and the grouping below are unchanged.
+ * keys), which is its format's membership of participant $2. The v1.1 chunk
+ * completeness test is applied after the LATERAL, against the counts of the
+ * chunks the matched records reach (v11ChunkProofsSql), the same per-row
+ * predicate. So the rows, their multiplicity and the grouping below are
+ * unchanged.
  */
 function legacySourcesSql(s: string): string {
   const requested = "ARRAY(SELECT wanted.occurrence_id FROM requested wanted)";
@@ -439,10 +481,11 @@ function legacySourcesSql(s: string): string {
              AND probed.occurrence_id=ANY(${requested})
           OFFSET 0
         ) probe
-    ), direct AS MATERIALIZED (
+    ), ${v11ChunkProofsSql(s, "matched")}, direct AS MATERIALIZED (
       SELECT eligible.* FROM matched CROSS JOIN LATERAL (
         ${legacyDirectSql(s, "record.id=matched.id")}
         OFFSET 0) eligible
+       WHERE ${legacyV11CompleteSql("eligible")}
     ),
     grouped AS MATERIALIZED (
       SELECT min(storage_row_id) AS storage_row_id FROM direct
