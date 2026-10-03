@@ -7,6 +7,7 @@
 //     apps/worker/scripts/gcp-fastpath-prod-shape/measure-local.mjs \
 //       --corpus <seed-source.mjs work dir> --out <report.json> [--keep-database] [--reuse-database <name>]
 //       [--clone-from <name>] [--import-only] [--profile dense|dense-workers] [--guard-probe] [--node22 <path>]
+//       [--pgstat-interval <10..1800 seconds>]
 //       [--cpu-profile <sample interval, us>] [--cpu-profile-summary <seconds>] [--cpu-profile-dir <absolute dir>]
 //
 //  1. creates a fresh database meas_synth_<8 hex> on the cluster (never an
@@ -73,6 +74,7 @@ import { REFRESH_JOB_PROFILES } from "../gcp-fastpath-test-deploy.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../postgres-migrations.mjs";
 import { importProdShapeCorpus, readProdShapeCorpus } from "./import-corpus.mjs";
 import { collectOutputDigestEvidence, OUTPUT_DIGEST_POLICY } from "./output-digest-policy.mjs";
+import { capturePgStat, pgStatDelta, refreshPgStatLifecycle } from "./refresh-pgstat-lifecycle.mjs";
 import { PROD_SHAPE_REFRESH_NOW } from "./prod-shape-corpus.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -110,7 +112,7 @@ function fail(code, detail) {
 function parseArguments(argv) {
   const options = { corpus: null, out: null, keepDatabase: false, reuseDatabase: null, guardProbe: false,
     cloneFrom: null, importOnly: false, profile: "dense", node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null };
+    cpuProfileUs: null, cpuProfileSummarySeconds: null, cpuProfileDir: null, pgStatIntervalSeconds: null };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index], next = () => argv[++index];
     if (argument === "--corpus") options.corpus = resolve(next());
@@ -122,6 +124,11 @@ function parseArguments(argv) {
     else if (argument === "--import-only") options.importOnly = true;
     else if (argument === "--profile") options.profile = next();
     else if (argument === "--node22") options.node22 = next();
+    else if (argument === "--pgstat-interval") {
+      const value = next();
+      if (!/^\d+$/u.test(value ?? "") || Number(value) < 10 || Number(value) > 1800) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--pgstat-interval takes 10..1800 s");
+      options.pgStatIntervalSeconds = Number(value);
+    }
     else if (argument === "--cpu-profile") {
       const value = next();
       if (!/^[1-9]\d{3,5}$/u.test(value ?? "")) fail("MEAS_SYNTH_ARGUMENT_INVALID", "--cpu-profile takes 1000..100000 us");
@@ -292,28 +299,42 @@ async function childPid(parentPid, { attempts = 50 } = {}) {
 }
 
 /** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
-async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {} }) {
-  const started = performance.now();
-  const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
-    cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, cpuProfileEnv(cpuProfile)),
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "", stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exited = new Promise((resolveExit) => child.on("close", (code) => resolveExit(code)));
-  const pid = await childPid(child.pid);
-  const sampler = pid === null ? null : sampleProcess(pid, { started });
-  const code = await exited;
-  sampler?.stop();
+async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, cpuProfile = {}, pgStat = null }) {
+  let started, sampler = null, stdout = "", stderr = "";
+  const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
+    started = performance.now();
+    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema)], {
+      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, cpuProfileEnv(cpuProfile)),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exited = new Promise((resolveExit, rejectExit) => {
+      child.once("close", resolveExit);
+      child.once("error", rejectExit);
+    });
+    let stopped = false;
+    const pidReady = childPid(child.pid).then((pid) => {
+      if (!stopped && pid !== null) sampler = sampleProcess(pid, { started });
+    });
+    try {
+      const [, code] = await Promise.all([pidReady, exited]);
+      return { code, wallMs: Math.round(performance.now() - started) };
+    } finally {
+      stopped = true;
+      await pidReady;
+      sampler?.stop();
+    }
+  } });
+  const code = measured.result.code;
   const exitCode = typeof code === "number" ? code : 1;
-  const wallMs = Math.round(performance.now() - started);
+  const wallMs = measured.result.wallMs;
   await writeFile(join(outDir, `${label}.stdout.json`), String(stdout));
   await writeFile(join(outDir, `${label}.stderr.txt`), String(stderr));
   const samples = sampler?.samples ?? [];
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
-    time: parseTimeL(stderr), profileLines: profileLines(stderr),
+    time: parseTimeL(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 
@@ -470,11 +491,16 @@ async function main() {
         ms: Math.round(performance.now() - migrateStarted) };
       await save();
       const workDirectory = await realpath(await mkdtemp(join(tmpdir(), "meas-synth-import-")));
+      const importBefore = options.pgStatIntervalSeconds === null ? null : await capturePgStat(pool, "import-before");
       try {
         report.steps.import = await importProdShapeCorpus({ pool, suffix, corpus, workDirectory,
           log: (line) => console.error(line) });
       } finally {
         await rm(workDirectory, { recursive: true, force: true });
+      }
+      if (importBefore !== null) {
+        const after = await capturePgStat(pool, "import-after");
+        report.steps.importPgStat = { scope: "corpus-import-only", before: importBefore, after, delta: pgStatDelta(importBefore, after) };
       }
       await save();
     }
@@ -486,7 +512,9 @@ async function main() {
     console.error(`# refresh (profile ${options.profile.name}) on ${schema}`);
     const run = await runRefresh({ node22: options.node22, endpoint, database, schema, outDir, label: "refresh-1",
       profile: options.profile, cpuProfile: { cpuProfileUs: options.cpuProfileUs,
-        cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, cpuProfileDir: options.cpuProfileDir } });
+        cpuProfileSummarySeconds: options.cpuProfileSummarySeconds, cpuProfileDir: options.cpuProfileDir },
+      pgStat: options.pgStatIntervalSeconds === null ? null : { intervalMs: options.pgStatIntervalSeconds * 1000, snapshot: (label) => capturePgStat(pool, label) } });
+    if (run.pgStat !== null) report.steps.refreshPgStat = run.pgStat;
     report.steps.refresh = { exitCode: run.exitCode, wallMs: run.wallMs, state: run.receipt?.state ?? null,
       timingsMs: run.receipt?.timings ?? null, memory: run.receipt?.memory ?? null, reads: run.receipt?.reads ?? null,
       utilisation: run.utilisation,
