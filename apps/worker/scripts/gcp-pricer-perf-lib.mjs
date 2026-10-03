@@ -13,7 +13,7 @@ export const COMPONENT_KEYS = ["inputUncachedTokens", "inputCacheReadTokens", "i
 const PUBLIC_COMPONENTS = [COMPONENT_KEYS[0], COMPONENT_KEYS[1], COMPONENT_KEYS[2], ...COMPONENT_KEYS.slice(5)];
 
 /** Always bundle an unbound oracle separately; a Vitest import alias is not an oracle. */
-export async function loadPricers({ bound = false, instrument = false } = {}) {
+export async function loadPricers({ bound = false, instrument = false, registryFailure = false, planLimit = null } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "gcp-pricer-perf-"));
   try {
     const plugins = bound ? [analyticsFastPricerPlugin()] : [];
@@ -24,6 +24,31 @@ export async function loadPricers({ bound = false, instrument = false } = {}) {
         return { loader: "ts", resolveDir: dirname(path), contents: source.replace(
           "export { fastPriceTelemetryUsageEvent as priceTelemetryUsageEvent };",
           'export function priceTelemetryUsageEvent(row: TelemetryUsageEvent) { globalThis[Symbol.for("gcp-pricer-binding-proof")] = (globalThis[Symbol.for("gcp-pricer-binding-proof")] ?? 0) + 1; return fastPriceTelemetryUsageEvent(row); }') };
+      });
+    } });
+    if (registryFailure || planLimit !== null) plugins.push({ name: "registry-construction-failure", setup(builder) {
+      builder.onLoad({ filter: /fast-pricer\.ts$/ }, async ({ path }) => {
+        assert.equal(path, FAST_PRICER_MODULE);
+        let source = await readFile(path, "utf8");
+        if (planLimit !== null) {
+          assert.ok(Number.isSafeInteger(planLimit) && planLimit > 0);
+          assert.ok(source.includes("const MAX_PLANS = 16_384;"));
+          source = source.replace("const MAX_PLANS = 16_384;", `const MAX_PLANS = ${planLimit};`);
+        }
+        if (!registryFailure) return { loader: "ts", resolveDir: dirname(path), contents: source };
+        const marker = "for (const card of APP_OFFICIAL_PRICE_CARDS)";
+        assert.ok(source.includes(marker));
+        return { loader: "ts", resolveDir: dirname(path), contents: source.replace(marker,
+          `for (const card of (function* () {
+            let index = 0;
+            for (const item of APP_OFFICIAL_PRICE_CARDS) {
+              if (index++ === 2 && !globalThis[Symbol.for("gcp-pricer-registry-failed")]) {
+                globalThis[Symbol.for("gcp-pricer-registry-failed")] = true;
+                throw new RangeError("synthetic registry construction failure");
+              }
+              yield item;
+            }
+          })())`) };
       });
     } });
     const result = await build({ stdin: { contents: `

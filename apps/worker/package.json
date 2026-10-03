@@ -80,7 +80,7 @@
     "production:reconcile": "node ./scripts/production-reconcile.mjs",
     "production:reconcile:check": "node --test ./scripts/production-live-provider.check.mjs ./scripts/production-live-config.check.mjs ./scripts/production-typed-schema.check.mjs ./scripts/production-typed-preflight.check.mjs ./scripts/production-reconcile.check.mjs ./scripts/production-trigger-repair-rehearsal.check.mjs ./scripts/telemetry-runtime-reconciliation.check.mjs",
     "r2:inventory:check": "node --check ./scripts/r2-rest-inventory.mjs && node --test ./scripts/r2-rest-inventory.check.mjs",
-    "analytics-v2:pricer:check": "node --test ./scripts/gcp-pricer-perf.check.mjs",
+    "analytics-v2:pricer:check": "node --test ./scripts/gcp-pricer-perf.check.mjs && node ./scripts/gcp-pricer-differential.mjs --events=10000",
     "analytics-v2:pricer:fuzz": "node ./scripts/gcp-pricer-differential.mjs",
     "analytics-v2:pricer:benchmark": "node ./scripts/gcp-pricer-benchmark.mjs"
   },

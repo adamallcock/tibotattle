@@ -25,8 +25,6 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const TIERS = ["standard", "priority", "flex", "batch"] as const;
 const modelProviders = new Map<string, Set<string>>();
 const contextModels = new Set<string>();
-const times = new Set<number>();
-const contexts = new Set<number>();
 let initialized = false;
 let TIME_BOUNDARIES: number[] = [];
 let CONTEXT_BOUNDARIES: number[] = [];
@@ -34,29 +32,35 @@ function initializeRegistry(): void {
   if (initialized) return;
   // The broad vendor facade also exports consumers of this adapter. Delay
   // catalog access until the first call, after that ESM cycle has initialized.
-  initialized = true;
+  const nextModelProviders = new Map<string, Set<string>>();
+  const nextContextModels = new Set<string>();
+  const nextTimes = new Set<number>();
+  const nextContexts = new Set<number>();
   for (const card of APP_OFFICIAL_PRICE_CARDS) {
     for (const model of [card.model, ...(card.aliases ?? [])]) {
-      let providers = modelProviders.get(model);
-      if (!providers) { providers = new Set(); modelProviders.set(model, providers); }
+      let providers = nextModelProviders.get(model);
+      if (!providers) { providers = new Set(); nextModelProviders.set(model, providers); }
       providers.add(card.provider);
-      if (card.provider === "openai" && card.metadata?.total_input_context_band != null) contextModels.add(model);
+      if (card.provider === "openai" && card.metadata?.total_input_context_band != null) nextContextModels.add(model);
     }
     for (const [edge, value] of Object.entries(card.effective ?? {})) {
       // RunCost selects by calendar date, with an inclusive `to` day.
       if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)) {
-        times.add(Date.parse(value) + (edge === "to" ? 86_400_000 : 0));
+        nextTimes.add(Date.parse(value) + (edge === "to" ? 86_400_000 : 0));
       }
     }
     for (const component of card.components) {
       const min = component.conditions?.min_total_input_tokens;
       const max = component.conditions?.max_total_input_tokens;
-      if (min !== undefined) contexts.add(Number(min));
-      if (max !== undefined) contexts.add(Number(max) + 1);
+      if (min !== undefined) nextContexts.add(Number(min));
+      if (max !== undefined) nextContexts.add(Number(max) + 1);
     }
   }
-  TIME_BOUNDARIES = [...times].sort((a, b) => a - b);
-  CONTEXT_BOUNDARIES = [...contexts].sort((a, b) => a - b);
+  TIME_BOUNDARIES = [...nextTimes].sort((a, b) => a - b);
+  CONTEXT_BOUNDARIES = [...nextContexts].sort((a, b) => a - b);
+  for (const [model, providers] of nextModelProviders) modelProviders.set(model, providers);
+  for (const model of nextContextModels) contextModels.add(model);
+  initialized = true;
 }
 
 function bucket(value: number, boundaries: readonly number[]): number {
@@ -143,44 +147,60 @@ function usd(nano: number): string {
     : `${whole}.${String(fraction).padStart(9, "0").replace(/0+$/u, "")}`;
 }
 
+export interface FastPricerStats {
+  readonly fastPathHits: number;
+  readonly fallbackCalls: number;
+  readonly planCount: number;
+  readonly maxPlans: number;
+}
+export type FastTelemetryUsagePricer = ((row: TelemetryUsageEvent) => ServerPricingResult) & {
+  /** Content-free snapshot. Fallbacks include calls whose oracle throws. */
+  getStats(): FastPricerStats;
+};
+
 /** A separate bounded structural cache is useful for process-isolated cold/warm proof. */
-export function createFastTelemetryUsagePricer(): (row: TelemetryUsageEvent) => ServerPricingResult {
+export function createFastTelemetryUsagePricer(): FastTelemetryUsagePricer {
   const plans = new Map<string, Map<number, Plan | null>>();
   let planCount = 0;
-  return function fastPrice(row: TelemetryUsageEvent): ServerPricingResult {
+  let fastPathHits = 0, fallbackCalls = 0;
+  const fallback = (row: TelemetryUsageEvent): ServerPricingResult => {
+    fallbackCalls += 1;
+    return referencePrice(row);
+  };
+  const fastPrice = function (row: TelemetryUsageEvent): ServerPricingResult {
     initializeRegistry();
-    if (!row || typeof row !== "object" || types.isProxy(row)) return referencePrice(row);
+    if (!row || typeof row !== "object" || types.isProxy(row)) return fallback(row);
     // Proxy, accessor-bearing or inherited input uses the reference's evaluation
     // order. Ordinary own data properties are the closed specialization.
     for (const name of ROW_KEYS) {
       const descriptor = Object.getOwnPropertyDescriptor(row, name);
-      if (!descriptor || !("value" in descriptor)) return referencePrice(row);
+      if (!descriptor || !("value" in descriptor)) return fallback(row);
     }
     const openai = row.provider === "openai_codex";
     if ((!openai && row.provider !== "anthropic_claude_code")
       || row.modelRecognition !== "recognized" || row.modelId === "unknown"
-      || !modelProviders.get(row.modelId)?.has(openai ? "openai" : "anthropic")) return referencePrice(row);
+      || !modelProviders.get(row.modelId)?.has(openai ? "openai" : "anthropic")) return fallback(row);
     const subscription = row.billingSurface === "chatgpt_subscription" || row.billingSurface === "claude_subscription";
     const tier = subscription ? 0 : row.billingSurface === "openai_api" ? TIERS.indexOf(row.apiServiceTier as typeof TIERS[number]) : -1;
-    if (tier < 0 || typeof row.eventTime !== "string" || !ISO.test(row.eventTime)) return referencePrice(row);
+    if (tier < 0 || typeof row.eventTime !== "string" || !ISO.test(row.eventTime)) return fallback(row);
     const epoch = Date.parse(row.eventTime);
-    if (!Number.isFinite(epoch) || new Date(epoch).toISOString() !== row.eventTime) return referencePrice(row);
+    if (!Number.isFinite(epoch) || new Date(epoch).toISOString() !== row.eventTime) return fallback(row);
     const context = row.totalInputContextTokens;
-    if (context !== null && (typeof context !== "number" || !Number.isSafeInteger(context) || context < 0)) return referencePrice(row);
-    if (openai && contextModels.has(row.modelId) && context === null) return referencePrice(row);
+    if (context !== null && (typeof context !== "number" || !Number.isSafeInteger(context) || context < 0)) return fallback(row);
+    if (openai && contextModels.has(row.modelId) && context === null) return fallback(row);
     const c = row.components;
-    if (!c || typeof c !== "object" || types.isProxy(c) || Array.isArray(c) || Object.keys(c).length !== KEYS.length) return referencePrice(row);
+    if (!c || typeof c !== "object" || types.isProxy(c) || Array.isArray(c) || Object.keys(c).length !== KEYS.length) return fallback(row);
     for (const key of KEYS) {
       const descriptor = Object.getOwnPropertyDescriptor(c, key);
-      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return referencePrice(row);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return fallback(row);
       const value = descriptor.value;
-      if (value !== null && (!Number.isSafeInteger(value) || value < 0 || value > MAX_QUANTITY)) return referencePrice(row);
+      if (value !== null && (!Number.isSafeInteger(value) || value < 0 || value > MAX_QUANTITY)) return fallback(row);
     }
     if (!openai) {
       const split = (c.inputCacheWrite5mTokens ?? 0) + (c.inputCacheWrite1hTokens ?? 0);
       if (((c.inputCacheWriteTokens ?? split) > 0
           && (c.inputCacheWrite5mTokens === null || c.inputCacheWrite1hTokens === null))
-        || c.inputCacheWriteTokens !== null && c.inputCacheWriteTokens !== split) return referencePrice(row);
+        || c.inputCacheWriteTokens !== null && c.inputCacheWriteTokens !== split) return fallback(row);
     }
     const fast = row.billingSurface === "chatgpt_subscription" && row.speedMode === "fast";
     const contextBucket = context === null ? 0 : bucket(context, CONTEXT_BOUNDARIES) + 1;
@@ -191,11 +211,11 @@ export function createFastTelemetryUsagePricer(): (row: TelemetryUsageEvent) => 
     let byCell = plans.get(row.modelId);
     let plan = byCell?.get(key);
     if (plan === undefined) {
-      if (planCount >= MAX_PLANS) return referencePrice(row);
+      if (planCount >= MAX_PLANS) return fallback(row);
       if (!byCell) { byCell = new Map(); plans.set(row.modelId, byCell); }
       plan = compilePlan(row, openai); byCell.set(key, plan); planCount += 1;
     }
-    if (plan === null) return referencePrice(row);
+    if (plan === null) return fallback(row);
     let amount = 0, pricedUnits = 0, unknownUnits = 0, positivePriced = 0, positiveUnknown = 0;
     let unavailable = false;
     const reasons = [...plan.base.unpricedReasonCodes];
@@ -221,7 +241,7 @@ export function createFastTelemetryUsagePricer(): (row: TelemetryUsageEvent) => 
     }
     // Overflow and participant aggregate guards use the original exact path,
     // preserving both the guard precedence and fail-closed token summation.
-    if (!Number.isSafeInteger(amount) || amount > MAX_EVENT_NANOS) return referencePrice(row);
+    if (!Number.isSafeInteger(amount) || amount > MAX_EVENT_NANOS) return fallback(row);
     if (unavailable) addReasons(reasons, ["component_observation_unavailable"]);
     const status = positiveUnknown === 0 && !unavailable ? "fully_priced" : positivePriced > 0 ? "partially_priced" : "unpriced";
     if (status === "unpriced" && reasons.includes("historical_price_missing")) {
@@ -233,6 +253,7 @@ export function createFastTelemetryUsagePricer(): (row: TelemetryUsageEvent) => 
     const coverage = observed === 0 ? status === "fully_priced" ? 100 : 0
       : Number(BigInt(pricedUnits) * 1_000_000n / BigInt(observed)) / 10_000;
     const base = plan.base;
+    fastPathHits += 1;
     return {
       exactCostUsd: usd(amount), costNanousd: amount, coveragePercent: coverage,
       coverageStatus: status, unknownBillableUnits: unknownUnits,
@@ -247,6 +268,9 @@ export function createFastTelemetryUsagePricer(): (row: TelemetryUsageEvent) => 
       speedMultiplier: status === "unpriced" ? null : base.speedMultiplier,
     };
   };
+  return Object.assign(fastPrice, { getStats: (): FastPricerStats => ({
+    fastPathHits, fallbackCalls, planCount, maxPlans: MAX_PLANS,
+  }) });
 }
 
 export const fastPriceTelemetryUsageEvent = createFastTelemetryUsagePricer();

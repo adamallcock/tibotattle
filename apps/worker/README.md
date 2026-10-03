@@ -341,3 +341,40 @@ storage, commands, or this README:
 ```bash
 npm run docs:check
 ```
+
+
+## GCP fast-pricer validation
+
+`npm run analytics-v2:pricer:check` compares the independently bundled pinned
+oracle with the bound pricer: focused contracts plus a deterministic differential
+(currently 91,122 comparisons). It includes all 6,561 null/zero/one component
+masks for each provider, every catalog identity at card date boundaries ±1 ms
+(and inclusive end-day transitions), context thresholds, malformed input and
+10,000 seeded events. The differential prints content-free pricer counters.
+The attribution tripwire shares the fast binding and cannot independently detect
+pricer divergence; the separately bundled oracle differential supplies that gate.
+
+Any change to `apps/worker/vendor/` or `packages/accounting/` requires the full
+`npm run analytics-v2:pricer:fuzz -- --events=3000000 --corpus=<synthetic-corpus>`
+rerun in addition to the regular gate. Use the complete synthetic corpus; private
+session data must never enter this harness. Coordinate full runs with the
+integrator rather than running them concurrently with profiling.
+
+`createFastTelemetryUsagePricer().getStats()` returns an independent content-free
+snapshot. `fastPathHits` counts results returned through the specialization;
+`fallbackCalls` counts oracle calls, including oracle exceptions. Registry
+construction exceptions occur before either counter increments. Internal oracle
+calls used to compile a plan do not count as fallbacks. `planCount` includes
+retained null plans, and `maxPlans` is 16,384. At saturation, uncached cells fall
+back while retained cells stay usable; no eviction or input content is recorded.
+Counters accumulate for that pricer instance, so refresh measurements should
+subtract before/after snapshots and report fast hits divided by fast hits plus
+fallbacks, with registry exceptions separately reported.
+
+Wave 25 integration must drop PRICER-PERF's branch-local kernel entry and pin,
+preserve the integration line's existing entries byte-for-byte, and derive one
+combined kernel 5 after all selected changes with
+`node cloud-run/build.mjs --kernel-closure`. Recompute its registry pin and run
+the owning kernel and analytics gates on the merged tree. This fix branch's
+focused checks do not qualify its retained branch-local kernel closure, deployment
+or combined performance; those remain integrator gates.

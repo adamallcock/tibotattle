@@ -101,5 +101,5 @@ try {
     corpus = { rows, shapeable, formats, recordAdapterComparisons: rows };
   }
   console.log(JSON.stringify({ status: "ok", node: process.version, fuzz, corpus, totalComparisons: compared,
-    wallSeconds: (performance.now() - start) / 1000 }));
+    pricerStats: fast.getStats(), wallSeconds: (performance.now() - start) / 1000 }));
 } finally { await reference.dispose(); await bound.dispose(); }

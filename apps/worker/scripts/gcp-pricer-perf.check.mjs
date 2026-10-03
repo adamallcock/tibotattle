@@ -139,3 +139,53 @@ test("proxies retain reference property evaluation and revoked-proxy errors", ()
     assertSame(reference, pricer, location === "row" ? revocable.proxy : event, `revoked ${location} proxy`);
   }
 });
+
+
+test("content-free counters count completed fast results and oracle calls independently per pricer", () => {
+  const pricer = fast.module.createFastTelemetryUsagePricer();
+  const initial = { fastPathHits: 0, fallbackCalls: 0, planCount: 0, maxPlans: 16_384 };
+  assert.deepEqual(pricer.getStats(), initial);
+  assertSame(oracle.module.priceTelemetryUsageEvent, pricer, ordinaryEvent(), "counter fast path");
+  assertSame(oracle.module.priceTelemetryUsageEvent, pricer, ordinaryEvent(), "counter cached fast path");
+  assertSame(oracle.module.priceTelemetryUsageEvent, pricer, ordinaryEvent({ modelId: "synthetic-unlisted-model" }), "counter fallback");
+  const throwing = ordinaryEvent();
+  Object.defineProperty(throwing, "speedMode", { get() { throw new RangeError("synthetic counter error"); } });
+  assert.throws(() => pricer(throwing), RangeError);
+  assert.deepEqual(pricer.getStats(), { fastPathHits: 2, fallbackCalls: 2, planCount: 1, maxPlans: 16_384 });
+  const snapshot = pricer.getStats();
+  snapshot.planCount = -1;
+  assert.equal(pricer.getStats().planCount, 1);
+  assert.deepEqual(fast.module.createFastTelemetryUsagePricer().getStats(), initial);
+});
+
+
+test("registry initialization retries after partial construction fails", async () => {
+  const marker = Symbol.for("gcp-pricer-registry-failed");
+  delete globalThis[marker];
+  const injected = await loadPricers({ registryFailure: true });
+  try {
+    const pricer = injected.module.createFastTelemetryUsagePricer();
+    assert.throws(() => pricer(ordinaryEvent()), /synthetic registry construction failure/);
+    assert.deepEqual(pricer.getStats(), { fastPathHits: 0, fallbackCalls: 0, planCount: 0, maxPlans: 16_384 });
+    assertSame(oracle.module.priceTelemetryUsageEvent, pricer, ordinaryEvent(), "retried registry construction");
+    assert.equal(pricer.getStats().fastPathHits, 1);
+    assert.equal(pricer.getStats().fallbackCalls, 0);
+  } finally { await injected.dispose(); delete globalThis[marker]; }
+});
+
+
+test("bounded plan cache reports cap fallback while retained cells remain fast", async () => {
+  // Inject a small cap into the real implementation to exercise saturation
+  // without compiling thousands of oracle templates in every regular gate.
+  const capped = await loadPricers({ planLimit: 2 });
+  try {
+    const pricer = capped.module.createFastTelemetryUsagePricer();
+    const rows = [ordinaryEvent(), ordinaryEvent({ speedMode: "fast" }),
+      ordinaryEvent({ billingSurface: "openai_api", apiServiceTier: "standard" })];
+    for (const row of rows) assertSame(oracle.module.priceTelemetryUsageEvent, pricer, row, "cap parity");
+    assert.deepEqual(pricer.getStats(), { fastPathHits: 2, fallbackCalls: 1, planCount: 2, maxPlans: 2 });
+    assertSame(oracle.module.priceTelemetryUsageEvent, pricer, rows[0], "retained cell after saturation");
+    assertSame(oracle.module.priceTelemetryUsageEvent, pricer, rows[2], "uncached cell after saturation");
+    assert.deepEqual(pricer.getStats(), { fastPathHits: 3, fallbackCalls: 2, planCount: 2, maxPlans: 2 });
+  } finally { await capped.dispose(); }
+});
