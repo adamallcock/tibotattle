@@ -522,8 +522,9 @@ export function routeLabel(method, pathname) {
 /**
  * The closed error code of a JSON error body, or null; never any other body
  * content. Both shapes the hosted service answers with count: the API error
- * `{ error: { code } }` and the flat `{ error: "<CODE>" }` of the origin's
- * unported routes (cloud-run/origin-edge-test-mode.mjs EDGE_TEST_UNPORTED_BODY).
+ * `{ error: { code } }` (the origin's unported routes answer
+ * POSTGRES_ROUTE_NOT_PORTED in it) and the flat `{ error: "<CODE>" }` of the
+ * loopback fallback (postgres-test-dispatch.mjs).
  */
 export function errorCodeOf(bytes) {
   try {

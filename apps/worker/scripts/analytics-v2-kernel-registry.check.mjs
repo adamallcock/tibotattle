@@ -44,7 +44,7 @@ const REGISTRY_PATH = join(WORKER_ROOT, "src", "analytics-v2", "kernel-registry.
 const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
 /** sha256 of each entry's canonical JSON, in id order. Append only. */
 const REGISTRY_PINS = Object.freeze([
-  "725afe9ed585481f614b95cfd938388b84d46e76cf18170c8d804fd41185543b",
+  "063b3ead7c28ff6153e59dfc1c79f368acb46f8db96b95550f33a8240cab143c",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

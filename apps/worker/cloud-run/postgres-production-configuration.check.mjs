@@ -14,7 +14,7 @@ import test from "node:test";
 import { inspect } from "node:util";
 import { createServer } from "vite";
 import { normalizeIamUser } from "./cloud-sql.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import * as configuration from "./postgres-production-configuration.mjs";
 
 const {
@@ -485,8 +485,8 @@ test("the module never reads, spreads or copies process.env, and reuses EP-0's v
   const imports = [...code.matchAll(/^import[\s\S]*?from\s+"([^"]+)";/gmu)].map((match) => match[1]);
   assert.deepEqual(imports.sort(), [
     "../src/edge-origin-contract.ts",
+    "./cloud-run-iam-test-target.mjs",
     "./postgres-maintenance-gate.mjs",
-    "./postgres-test-dispatch.mjs",
   ]);
   for (const validator of ["canonicalRunAppOrigin", "isEdgeOriginAudience", "isEdgeServiceAccountEmail"]) {
     assert.ok(new RegExp(`\\b${validator}\\(`, "u").test(code), validator);
@@ -1434,11 +1434,14 @@ function acceptsCanonical(action) {
   }
 }
 
-test("the quarantine bucket-history proof grammar matches parseGcsQuarantineBucketHistoryProof (OD-2)", () => {
+test("one quarantine bucket-history proof grammar: CR-3's, which the store accepts (OD-2)", () => {
   const bucket = "synthetic-origin-quarantine";
-  for (const value of [
+  const token = async () => "synthetic-token";
+  const accepted = [
     proof(bucket),
     proof(bucket, { bucketGeneration: "9223372036854775807", bucketMetageneration: "2" }),
+  ];
+  const refused = [
     proof(bucket, { bucketGeneration: "9223372036854775808" }),
     proof(bucket, { bucketGeneration: "0" }),
     proof(bucket, { bucketGeneration: "1e3" }),
@@ -1451,16 +1454,45 @@ test("the quarantine bucket-history proof grammar matches parseGcsQuarantineBuck
     "{}",
     "[]",
     "not-json",
+    "",
     `${proof(bucket)}${" ".repeat(1_100)}`,
-  ]) {
-    assert.equal(
-      acceptsProduction({ GCS_QUARANTINE_BUCKET_HISTORY_PROOF: value }),
-      acceptsCanonical(() => canonical.quarantineStore.parseGcsQuarantineBucketHistoryProof(value, bucket)),
-      value.slice(0, 120),
-    );
+  ];
+  for (const value of accepted) {
+    assert.equal(acceptsProduction({ GCS_QUARANTINE_BUCKET_HISTORY_PROOF: value }), true, value);
+    const parsed = configuration.parseQuarantineBucketHistoryProof(value, bucket);
+    assert.ok(Object.isFrozen(parsed));
+    assert.deepEqual(parsed, JSON.parse(value));
+    // The store re-validates the parsed proof and accepts it for its bucket only.
+    assert.doesNotThrow(() => canonical.quarantineStore.createGcsQuarantineObjectStore(
+      bucket, token, undefined, undefined, parsed));
+    assert.throws(() => canonical.quarantineStore.createGcsQuarantineObjectStore(
+      "another-synthetic-quarantine", token, undefined, undefined, parsed));
   }
+  for (const value of refused) {
+    assert.equal(acceptsProduction({ GCS_QUARANTINE_BUCKET_HISTORY_PROOF: value }), false, value.slice(0, 120));
+    expectCode(() => configuration.parseQuarantineBucketHistoryProof(value, bucket),
+      "GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID");
+  }
+  expectCode(() => configuration.parseQuarantineBucketHistoryProof(proof(bucket), "Not A Bucket"),
+    "GCS_QUARANTINE_BUCKET_HISTORY_PROOF_INVALID");
+  // The second grammar is gone: src keeps the setting name only.
+  assert.equal(canonical.quarantineStore.parseGcsQuarantineBucketHistoryProof, undefined);
   assert.equal(configuration.QUARANTINE_BUCKET_HISTORY_PROOF_SETTING,
     canonical.quarantineStore.GCS_QUARANTINE_BUCKET_HISTORY_PROOF_SETTING);
+});
+
+test("isProductionConfiguration accepts only an issued configuration, never a lookalike", () => {
+  const issued = readProductionConfiguration(productionEnv(), "production");
+  assert.equal(configuration.isProductionConfiguration(issued), true);
+  const lookalike = Object.freeze({ ...issued });
+  assert.deepEqual(lookalike, issued);
+  assert.equal(configuration.isProductionConfiguration(lookalike), false);
+  assert.equal(configuration.isProductionConfiguration(structuredClone({ origins: issued.origins })), false);
+  for (const value of [null, undefined, "production", 1, [], {}]) {
+    assert.equal(configuration.isProductionConfiguration(value), false, inspect(value));
+  }
+  // A lookalike is also refused where the configuration is consumed.
+  expectCode(() => createProductionWorkerEnv(lookalike, { bindings: {} }), "PRODUCTION_CONFIGURATION_INVALID");
 });
 
 test("the namespace grammar matches parseTelemetryStorageMode", () => {

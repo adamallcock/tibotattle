@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   GcsQuarantineObjectStore,
   createGcsQuarantineObjectStore,
-  parseGcsQuarantineBucketHistoryProof,
   type GcsQuarantineBucketHistoryProof,
   type GcsQuarantineFetch,
 } from "../src/gcs-quarantine-object-store";
@@ -18,21 +17,19 @@ const bucketMetageneration = "1";
 const key = "synthetic/quarantine/object-key";
 const liveGeneration = "1790076862400000001";
 
-function proofSetting(overrides: Record<string, unknown> = {}): string {
-  return JSON.stringify({
+/**
+ * The proof record the origin passes the store: CR-3's parse of
+ * GCS_QUARANTINE_BUCKET_HISTORY_PROOF (cloud-run/postgres-production-configuration.mjs
+ * parseQuarantineBucketHistoryProof, the one grammar), here built directly.
+ */
+function proof(overrides: Record<string, unknown> = {}): GcsQuarantineBucketHistoryProof {
+  return Object.freeze({
     bucket,
     bucketGeneration,
     bucketMetageneration,
     softDeleteRetentionDurationSeconds: "0",
     ...overrides,
-  });
-}
-
-function proof(overrides: Record<string, unknown> = {}): GcsQuarantineBucketHistoryProof {
-  return parseGcsQuarantineBucketHistoryProof(
-    proofSetting(overrides),
-    typeof overrides.bucket === "string" ? overrides.bucket : bucket,
-  );
+  }) as unknown as GcsQuarantineBucketHistoryProof;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -146,7 +143,7 @@ describe("GCS quarantine store bucket birth proof (OD-2)", () => {
     }
   });
 
-  it("refuses a proof object that bypassed the setting parser", () => {
+  it("refuses a malformed proof object", () => {
     const malformed: Array<Record<string, unknown>> = [
       { bucket, bucketGeneration, bucketMetageneration, softDeleteRetentionDurationSeconds: "604800" },
       { bucket, bucketGeneration: 1n, bucketMetageneration, softDeleteRetentionDurationSeconds: "0" },

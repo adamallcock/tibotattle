@@ -40,7 +40,7 @@ import {
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import * as job from "../cloud-run/analytics-refresh.mjs";
 import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "../cloud-run/cloud-run-iam-test-target.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import * as seedFixture from "./fixtures/analytics-v2/direct-seed.mjs";
 import * as synthetic from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";

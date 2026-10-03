@@ -62,6 +62,7 @@ import {
   loopbackOrigin,
 } from "../scripts/edge-e2e/google-front-end.mjs";
 import { parseLoadTestArguments, runLoadTest } from "../scripts/gcp-load-test.mjs";
+import { edgeTestProductionEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -89,7 +90,9 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
   "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS",
   "EDGE_ORIGIN_MODE", "EDGE_ORIGIN_AUDIENCE", "EDGE_INVOKER_SERVICE_ACCOUNT",
-  "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS",
+  "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS", "PUBLIC_ANALYTICS_MODE",
+  "UPLOAD_INGRESS_MAX_CONCURRENT", "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "UPLOAD_INGRESS_BURST",
+  "UPLOAD_INGRESS_LEASE_SECONDS", "UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "UPLOAD_INGRESS_BODY_IDLE_SECONDS",
 ]);
 
 let vite;
@@ -215,6 +218,9 @@ async function startOrigin({ socket, schema, keys, rateLimitSecret }) {
     GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({
       bucket, bucketGeneration: "1", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0",
     }),
+    // The deployed edge-test origin's settings (wrangler.jsonc env.production:
+    // the admission modes and, since D-CRB, the upload-ingress lease budget).
+    ...Object.fromEntries(edgeTestProductionEnv()),
     ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
     ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
     ANALYTICS_V2_ENABLED: "1",
@@ -237,7 +243,8 @@ async function startOrigin({ socket, schema, keys, rateLimitSecret }) {
           return pool;
         },
         async createGoogleAccessTokenProvider() { return async () => "synthetic-access-token"; },
-        createGcsQuarantineObjectStore: () => ({ async put() {}, async delete() {} }),
+        // RD-3 /api/health probes one missing key through head (D-CRB).
+        createGcsQuarantineObjectStore: () => ({ async head() { return null; }, async put() {}, async delete() {} }),
       },
     });
     return { runtime: created, close: await serverModule.serve(created) };

@@ -18,7 +18,10 @@
 //   client unchanged: the origin's status, body bytes and headers, less the
 //   contract's dropped headers and transport framing.
 // - local: the row causes no front-end exchange at all.
-// - unported: the origin answers the composition's unported 503.
+// - unported: the origin answers the production handler's closed unported
+//   answer: 503 POSTGRES_ROUTE_NOT_PORTED in the Worker envelope, no-store,
+//   no retry-after (OD-CR-6 (iv)). Its body carries the request id, so the
+//   comparator reads fields, never bytes.
 
 /** Fixed synthetic values the rows use; none is a real credential. */
 export const MATRIX_VALUES = Object.freeze({
@@ -277,8 +280,9 @@ export function forwardedRows({ registry }) {
 
 /**
  * S3's sweep: one request for every forwarded (route, method) pair, each
- * expected to be served or to answer the unported 503, and to carry the
- * admission header exactly when EP-1 names the route.
+ * expected to be served (servedRouteIds: the production ported list) or to
+ * answer the closed unported 503, and to carry the admission header exactly
+ * when EP-1 names the route.
  */
 export function sweepRows({ registry, servedRouteIds }) {
   const served = new Set(servedRouteIds);

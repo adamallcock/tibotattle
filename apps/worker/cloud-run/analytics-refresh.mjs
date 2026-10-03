@@ -163,7 +163,7 @@ import {
   FASTPATH_TEST_SCHEMA_PREFIXES,
   isFastpathTestSchema,
 } from "./origin-fastpath-mode.mjs";
-import { CLOUD_RUN_IAM_TEST_TARGET } from "./postgres-test-dispatch.mjs";
+import { CLOUD_RUN_IAM_TEST_TARGET } from "./cloud-run-iam-test-target.mjs";
 import {
   ANALYTICS_REFRESH_DEFAULT_READ_CHUNK_OCCURRENCES,
   ANALYTICS_REFRESH_STATEMENT_MODEL,

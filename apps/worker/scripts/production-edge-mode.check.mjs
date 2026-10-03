@@ -241,9 +241,11 @@ function workerHealth(sourceCommit) {
 }
 
 /**
- * The GCP fast-path test origin's health body as createPostgresTestHealthDispatch
- * (cloud-run/postgres-test-dispatch.mjs) serves it: gcp-postgres-test-health-v2,
- * the primary receipt only, in every test mode (LEAD-SIMP).
+ * The test health body createPostgresTestHealthDispatch
+ * (cloud-run/postgres-test-dispatch.mjs) serves: gcp-postgres-test-health-v2,
+ * the primary receipt only. Since D-CRB only the legacy
+ * health-only and health-and-v12-day-manifest modes serve it (fastpath-test,
+ * edge-test and HOST_MODE serve RD-3); it must never pass a gcp gate.
  */
 const FASTPATH_TEST_HEALTH = Object.freeze({
   schemaVersion: "gcp-postgres-test-health-v2",

@@ -24,4 +24,5 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY --from=build /app/apps/worker/cloud-run/dist ./dist
 COPY --from=build /app/apps/worker/cloud-run/assets ./assets
 COPY --from=build /app/apps/worker/postgres/migrations /app/apps/worker/postgres/migrations
+USER node
 CMD ["node", "dist/server.mjs"]

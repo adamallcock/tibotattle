@@ -119,6 +119,11 @@ export const EDGE_TEST_ORIGIN_MODE = "edge-test";
  */
 export const EDGE_TEST_PRODUCTION_SETTINGS = Object.freeze([
   "ENROLLMENT_MODE", "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SIGN_IN_START_MAX_PER_MINUTE",
+  "PUBLIC_ANALYTICS_MODE",
+  // The upload-ingress policy (D-CRB): the lease budget and the 60 s / 15 s
+  // body read at production's values, as E12's origin runs them.
+  "UPLOAD_INGRESS_MAX_CONCURRENT", "UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE", "UPLOAD_INGRESS_BURST",
+  "UPLOAD_INGRESS_LEASE_SECONDS", "UPLOAD_INGRESS_BODY_TOTAL_SECONDS", "UPLOAD_INGRESS_BODY_IDLE_SECONDS",
 ]);
 /** The rest of that admission env, and why an edge-test origin does not take production's value. */
 export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
@@ -129,6 +134,8 @@ export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
   IDENTITY_LINK_SECRET_VERSION: "names that secret; Google enrollment routes only, not composed by any test mode",
   GOOGLE_OIDC_CLIENT_ID: "production's OAuth client, for the Google sign-in routes, which no test host mode composes",
   GOOGLE_OIDC_CLIENT_SECRET: "a production secret; Google sign-in routes only, not composed by any test mode",
+  DEPLOYMENT_SOURCE_COMMIT: "not a wrangler.jsonc setting: production's comes from its deploy; unset, this test "
+    + "origin's /api/health reports deployment.sourceCommit null, so the release verifier never accepts it",
 });
 /** A source id or typed-storage namespace the origin and an env flag both accept. */
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
