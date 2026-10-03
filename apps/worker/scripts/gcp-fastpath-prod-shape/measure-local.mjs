@@ -23,8 +23,11 @@
 //     (rows and bytes of every analytics_v2 table and the published payloads);
 //  5. --guard-probe: a second refresh with
 //     ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400 (the production task
-//     timeout), stopped after its plan checkpoint, records whether the time
-//     guard refuses the run up front;
+//     timeout), stopped after 600 s unless it ends sooner, records whether the
+//     time guard refused it within that window. The job logs no
+//     plan-checkpoint marker, so a probe stopped unrefused shows only that no
+//     refusal came in its first 600 s, not that the plan checkpoint was
+//     reached or passed;
 //  6. drops the database (unless --keep-database).
 //
 // Local and synthetic only: no network, no production data, no secrets.
@@ -147,9 +150,12 @@ async function runRefresh({ node22, endpoint, database, schema, outDir, label })
 }
 
 /**
- * The production time guard's up-front decision: a refresh with the
- * production task timeout, stopped once it has passed its plan checkpoint
- * (it refuses at the plan or is still running after `waitMs`).
+ * The production time guard within its first `waitMs`: a refresh with the
+ * production task timeout, stopped after `waitMs` unless it ends first.
+ * `outcome` is "refused" (a deadline refusal, at whichever checkpoint),
+ * "exited" (it ended otherwise) or "stopped-unrefused". The job logs no
+ * plan-checkpoint marker, so "stopped-unrefused" does not show that the plan
+ * checkpoint was reached.
  */
 async function guardProbe({ node22, endpoint, database, schema, waitMs = 600_000 }) {
   return new Promise((resolveProbe) => {
@@ -167,9 +173,11 @@ async function guardProbe({ node22, endpoint, database, schema, waitMs = 600_000
     child.on("exit", (code, signal) => {
       clearTimeout(timer);
       const error = lastJson(stderr);
-      resolveProbe({ taskTimeoutSeconds: PRODUCTION_PROFILE.taskTimeoutSeconds, exitCode: code, signal,
+      const refused = /^ANALYTICS_V2_REFRESH_DEADLINE_/u.test(error?.code ?? "");
+      resolveProbe({ taskTimeoutSeconds: PRODUCTION_PROFILE.taskTimeoutSeconds, waitMs, exitCode: code, signal,
         elapsedMs: Math.round(performance.now() - started),
-        refusedAtPlan: error?.code === "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED",
+        outcome: refused ? "refused" : code === null && signal === "SIGTERM" ? "stopped-unrefused" : "exited",
+        refusalCode: refused ? error.code : null,
         stoppedAfterMs: signal === "SIGTERM" ? waitMs : null, error, receipt: lastJson(stdout) });
     });
   });

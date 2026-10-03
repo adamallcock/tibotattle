@@ -21,7 +21,9 @@ What this proves, and what it does not:
   synthetic and content-free data only.
 - The Cloud Run figures below are projections, not measurements. The cloud
   gate is `apps/worker/scripts/gcp-fastpath-prod-shape/run-cloud-measurement.sh`
-  in the TEST project. It has not run.
+  in the TEST project. It has not run. It makes every remote call through
+  `apps/worker/scripts/gcp-fastpath-test-deploy.mjs` steps, including
+  `refresh-uncapped`, which times the long run.
 - Nothing here read production data or touched a remote resource.
 
 ## Corpus
@@ -108,13 +110,20 @@ The same engine ran the dense corpus locally in 972 s, so this corpus costs
 ## Cloud projection
 
 Each phase is scaled by its measured cloud-to-local ratio on the dense corpus.
-Both ratio sets compare against the same engine's local dense run:
+Both ratio sets divide by `f8a8620d`'s local dense run (972 s):
 
 - **Ratio set A**: C-REFRESH's cloud rerun (`0d3f73c8`, receipts
-  `gcp-dense-postrefresh-20261002T164129Z`, 2,885 s).
-- **Ratio set B**: MEAS-1 (`afd865a0`, 3,944 s).
+  `gcp-dense-postrefresh-20261002T164129Z`, 2,885 s). It is like-for-like:
+  `0d3f73c8` differs from `f8a8620d` only in two lines of the refresh entry
+  that do not affect timing (the test HTTP mode set and the identity list).
+- **Ratio set B**: MEAS-1 (`afd865a0`, 3,944 s). It is **cross-engine**:
+  between `afd865a0` and `f8a8620d`, `apps/worker/src/analytics-v2` and the
+  refresh entry changed in 8 files (+2,128/−172 lines, including
+  `resources.ts` and `store.ts`). Its ratios therefore mix that engine change
+  with the Cloud Run and Cloud SQL slowdown. How much the change moves each
+  phase was not measured, so set B is not directly comparable with set A.
 
-| Phase | Local | Ratio A | Cloud A | Ratio B | Cloud B |
+| Phase | Local | Ratio A | Cloud A | Ratio B (cross-engine) | Cloud B (cross-engine) |
 |---|---:|---:|---:|---:|---:|
 | Read | 3,843 s | 5.35 | 20,576 s | 8.90 | 34,221 s |
 | Prepare | 2,484 s | 2.13 | 5,301 s | 2.75 | 6,826 s |
@@ -141,14 +150,27 @@ Both ratio sets compare against the same engine's local dense run:
   | Scalar + model (per analysis usage row) | 1.40 ms | 2.28 ms | 5.7 to 6.9 ms |
 
 - For this roster the model plans 10,998 s. That is below the refusal point
-  of about 14,220 s.
+  of about 14,220 s. The figure is arithmetic: the model's rates applied to
+  the manifest's per-owner records and 170-day usage rows. The job did not
+  report it.
 - The `--guard-probe` run (`ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400`)
-  was not refused in its first 600 s.
-- On Cloud Run the owner-checkpoint projection should therefore refuse
-  `ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED` about 1 to 1.5 h into the run,
-  assuming uniform progress, and publish nothing.
+  was not refused in its first 600 s. The job logs no plan-checkpoint marker,
+  so the probe does not show that the plan checkpoint had been reached.
+- The guard re-projects only at owner checkpoints, and owners run in
+  owner-digest order (`compute.ts`). Ordered by the manifest's owner digests,
+  the first owner (o21) carries 0.4% of the planned work and the second (o02)
+  13.5%. So the first checkpoint that can refuse is the third owner's, after
+  13.9% of the planned work. With the cloud running k times the model (k =
+  4.46 for ratio A, 6.26 for ratio B), that is about 0.139 × k × 10,998 s:
+  - **1.9 h** in, at ratio A;
+  - **2.7 h** in, at ratio B.
+  This assumes the job's owner digests equal the manifest's, which the seed
+  pins.
+- On Cloud Run the guard should therefore refuse
+  `ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED` about 2 to 3 h into the run, and
+  publish nothing.
 - A daily production run on this engine and profile would hold the lock for
-  about an hour each day and never publish.
+  about 2 to 3 hours each day and never publish.
 
 **Memory and output fit, with margin:**
 
@@ -174,7 +196,12 @@ owner e used about 1.5 times its estimate.
 1. Do not schedule the production refresh with the 14,400 s profile on this
    engine. As above, it would refuse every day and publish nothing.
 2. Run `run-cloud-measurement.sh` with `MEAS_UNCAPPED=1`. The guarded run
-   should show the refusal; the uncapped run measures the real duration.
+   should show the refusal. The uncapped run (`refresh-uncapped`, capped at
+   172,800 s = 48 h by default) measures the real duration.
+   - It refuses to start unless the guarded run deployed and executed this
+     image on this schema, the Job reads back as that run's task, and no
+     other refresh is running.
+   - It writes `uncapped/refresh-uncapped.json` whatever the outcome.
 3. Before PROD-4, recalibrate `ANALYTICS_REFRESH_TIME_MODEL` to the cloud
    rates that run measures. Then size the task timeout from that measurement:
    the cloud duration × 1.5 for growth, within the job's 604,800 s bound.
@@ -184,7 +211,15 @@ owner e used about 1.5 times its estimate.
    |---|---|
    | ≤ 12 h | Daily, `15 2 * * *` |
    | ≤ 36 h | Every two days, `15 2 */2 * *` |
-   | Longer | Weekly, until K-INCR lands |
+   | Over 36 h, measured | Weekly, until K-INCR lands |
+   | Not finished by the 48 h cap | Over 48 h, length undetermined: weekly until K-INCR, and no daily or two-day schedule. Rerun with a larger `MEAS_UNCAPPED_TIMEOUT` (at most 604,800 s) only if the timeout itself must be sized before K-INCR |
+
+   The run did not finish by the cap if `refresh-uncapped.json` shows either:
+   - outcome `killed-at-task-timeout`; or
+   - outcome `failed` with code `ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED` or
+     `ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED`. The guard runs at the cap too,
+     and its line's `deadline` figures (`elapsedSeconds`, `ownersStarted`,
+     `ownersPlanned`) show how far the run got.
 
    An overlapping trigger exits `LOCK_HELD` (exit 0), so a slow run never
    doubles work. The projection (13.6 to 19.1 h) points to **every two
@@ -213,11 +248,29 @@ All of these are local only:
 
   ```
   npm --prefix apps/worker run gcp:fastpath:prod-shape:check
+  node --test apps/worker/scripts/gcp-fastpath-test-deploy.check.mjs
   MEAS_SYNTH_CORPUS=<small corpus> node --test apps/worker/scripts/gcp-fastpath-seed.check.mjs
+  PG_TEST_SOCKET=… PG_TEST_PORT=55433 node --test apps/worker/postgres-test/postgres-fastpath-identity-copy.spec.mjs
   ```
 
-  The second check passed 2026-10-03 on a scale-0.05 corpus.
+  The third check passed 2026-10-03 on a scale-0.05 corpus. The last one
+  holds the `maxTableRows` bound and its refusals.
 
 The measurement databases were dropped afterwards. The report and manifest are
 kept outside the repository, in the parity home's
 `receipts/meas-synth-local-20261003/`.
+
+## Cloud run occupancy
+
+The refresh takes a database-wide advisory lock in `tibotattle_fastpath`,
+which every seeded schema shares, and there is one fast-path refresh Job.
+While the guarded run (2 to 3 h) and the uncapped run (projected 13.6 to
+19.1 h, capped at 48 h) are in progress:
+
+- The deploy wrapper with this change refuses another fast-path refresh
+  before it deploys (`FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING`).
+- A wrapper without this change still deploys, which does not alter the
+  running execution. Its own execution then exits `LOCK_HELD` having done
+  nothing, and that wrapper reports success.
+- This wrapper's refresh steps now fail on `LOCK_HELD`
+  (`FASTPATH_DEPLOY_REFRESH_LOCK_HELD`) instead of reporting success.

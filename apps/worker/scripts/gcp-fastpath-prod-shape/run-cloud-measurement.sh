@@ -3,7 +3,9 @@
 # PRODUCTION-SHAPED synthetic corpus, in the TEST project `tibotattle` only
 # (the fast-path test database tibotattle_fastpath on the test primary).
 # Never production or staging. Modelled on the parity home's
-# receipts/run-dense-deploy.sh.
+# receipts/run-dense-deploy.sh. This script issues no gcloud command itself:
+# every remote call goes through scripts/gcp-fastpath-test-deploy.mjs (D),
+# whose command builders pin the project, region and fast-path names.
 #
 #   zsh apps/worker/scripts/gcp-fastpath-prod-shape/run-cloud-measurement.sh
 #
@@ -15,33 +17,55 @@
 #                   ~/Documents/Coding/tibotattle-gcp-parity/receipts/gcp-meas-synth-<UTC stamp>)
 #   MEAS_IMAGE      reuse an image digest built from this commit (skips build)
 #   MEAS_SKIP_SEED=1 and MEAS_SCHEMA=<schema>   reuse a schema an earlier run seeded
-#   MEAS_UNCAPPED=1 after the guarded run, execute the same Job once more with a
-#                   24 h task timeout (and the guard at 24 h) to time a run to
-#                   its end; costs up to 24 h of a 4 vCPU / 16 GiB task
+#   MEAS_UNCAPPED=1 when the guarded run does not complete, time one more
+#                   execution of the same Job to its end (D refresh-uncapped):
+#                   execution-level overrides only, a task timeout and the
+#                   time guard at MEAS_UNCAPPED_TIMEOUT (default 172,800 s,
+#                   48 h; at most 604,800). Costs up to that long of a
+#                   4 vCPU / 16 GiB task
 #
 # Steps:
 #   preflight  clean checkout of HEAD for every path the seed and image use;
-#              corpus manifest present, full scale, OWN-3 matched
-#   build      gcp-fastpath-test-deploy.mjs build --commit=HEAD
+#              corpus manifest present, full scale, OWN-3 matched; no refresh
+#              execution running (D refresh-idle)
+#   build      D build --commit=HEAD
 #   migrate    deploy + execute the migrate Job (fast-path test database)
 #   verify-database
 #   seed       gcp-fastpath-seed.mjs seed --sealed-corpus (the reviewed importer
 #              chain through the Cloud SQL connector as the migrator IAM user;
 #              runs on THIS machine, Node 26, large heap; expect hours)
-#   refresh    the refresh Job with the production task profile (dense: 4 vCPU,
-#              16 GiB, heap 12,288 MiB, budget 10,752 MiB, 14,400 s task
-#              timeout) and the production time guard
+#   refresh    D refresh: the refresh Job with the production task profile
+#              (dense: 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB,
+#              14,400 s task timeout) and the production time guard
 #              (ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400), at the
-#              corpus clock 2026-10-01T12:46:00.000Z
-#   uncapped   (MEAS_UNCAPPED=1 only) the same Job, one execution with a 24 h
-#              task timeout and guard
+#              corpus clock 2026-10-01T12:46:00.000Z. Its non-zero exit is
+#              expected (the guard's refusal); the script stops unless
+#              refresh/refresh.json exists (the deploy ran and an execution was
+#              made) and its status line is not LOCK_HELD
+#   uncapped   (MEAS_UNCAPPED=1 only) D refresh-uncapped, which refuses unless
+#              refresh.json names this image, schema, clock and profile, the
+#              Job reads back as exactly that refresh's task, and no execution
+#              is running; it waits for the execution to finish and writes
+#              uncapped/refresh-uncapped.json (status block, duration, status
+#              line, Cloud Run's messages) whatever the outcome
+#   protected  read the shared test services' revisions (never written)
 #
 # Expected (docs/receipts/2026-10-03-gcp-meas-synth.md): the local run took
-# 15,530 s and projects to 13.6-19.1 h on Cloud Run, so the guarded refresh
-# should refuse ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED partway (its time model
-# plans 10,998 s) and publish nothing; run with MEAS_UNCAPPED=1 to measure the
-# real duration, which sets the task timeout, the recalibrated rates and C3.
-#   protected  read the shared test services' revisions (never written)
+# 15,530 s and projects to 13.6-19.1 h on Cloud Run. The guard's time model
+# plans 10,998 s, so it admits the run, then refuses
+# ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED at an owner checkpoint and publishes
+# nothing. Owners run in owner-digest order and the second (o02) carries 13.5%
+# of the planned work, so the first checkpoint that refuses is the third
+# owner's: about 1.9 h in at ratio A, 2.7 h at ratio B. The uncapped run
+# measures the real duration, which sets the task timeout, the recalibrated
+# rates and C3. A kill at the uncapped cap means "longer than the cap,
+# undetermined".
+#
+# Occupancy: the refresh holds a database-wide advisory lock in
+# tibotattle_fastpath, which every seeded schema shares, and there is one
+# fast-path refresh Job. For the guarded run (2-3 h) and the uncapped run
+# (projected 13.6-19.1 h, at most MEAS_UNCAPPED_TIMEOUT) any other workflow's
+# fast-path refresh is refused by the deploy wrapper or exits LOCK_HELD.
 set -u
 setopt pipefail
 H=${MEAS_PARITY_HOME:-$HOME/Documents/Coding/tibotattle-gcp-parity}
@@ -53,9 +77,15 @@ CORPUS=${MEAS_CORPUS:-$HOME/Library/Caches/tibotattle-meas-synth/full/seed}
 OUT=${MEAS_OUT:-$H/receipts/gcp-meas-synth-$(date -u +%Y%m%dT%H%M%SZ)}
 NODE26=${MEAS_NODE26:-$HOME/.nvm/versions/node/v26.2.0/bin/node}
 NOW=2026-10-01T12:46:00.000Z
-JOB=tibotattle-fastpath-test-analytics-refresh
+UNCAPPED_TIMEOUT=${MEAS_UNCAPPED_TIMEOUT:-172800}
+# The guarded and the uncapped steps must render the same Job (refresh-uncapped reads it back).
+GUARDED=(--refresh-profile=dense --refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400)
 D() { "$NODE26" scripts/gcp-fastpath-test-deploy.mjs "$@"; }
 step() { echo "== $(date -u +%H:%M:%S) $1"; }
+protected_and_exit() {
+  step protected; D protected --commit="$COMMIT" --out="$OUT/protected" > "$OUT/protected.log" 2>&1
+  echo "protected rc=$?"; step done; echo "receipts in $OUT"; exit "$1"
+}
 mkdir -p -m 700 "$OUT"
 echo "commit $COMMIT"; echo "corpus $CORPUS"; echo "out $OUT"
 cd "$WORKER" || exit 2
@@ -80,6 +110,9 @@ cat "$OUT/preflight.json"
 "$NODE26" scripts/gcp-fastpath-seed.mjs plan --commit="$COMMIT" --sealed-corpus="$CORPUS" > "$OUT/seed-plan.json" \
   || { echo "preflight FAILED: seed plan"; exit 1; }
 grep -q '"decision": "run"' "$OUT/seed-plan.json" || { echo "preflight FAILED: seed plan refuses"; cat "$OUT/seed-plan.json"; exit 1; }
+[[ "$UNCAPPED_TIMEOUT" == <14401-604800> ]] || { echo "preflight FAILED: MEAS_UNCAPPED_TIMEOUT must be 14401..604800"; exit 1; }
+D refresh-idle --out="$OUT/idle" > "$OUT/idle.log" 2>&1 \
+  || { echo "preflight FAILED: a fast-path refresh execution is running (its database lock would make this run LOCK_HELD)"; tail -c 600 "$OUT/idle.log"; exit 1; }
 
 if [[ -n "${MEAS_IMAGE:-}" ]]; then
   IMG=$MEAS_IMAGE
@@ -104,25 +137,35 @@ fi
 echo "schema $SCHEMA"
 
 step refresh
-D refresh --commit="$COMMIT" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile=dense \
-  --refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400 --out="$OUT/refresh" > "$OUT/refresh.log" 2>&1
-echo "refresh rc=$?"; tail -c 1500 "$OUT/refresh.log"; echo
+D refresh --commit="$COMMIT" --image="$IMG" --schema="$SCHEMA" --now="$NOW" "${GUARDED[@]}" \
+  --out="$OUT/refresh" > "$OUT/refresh.log" 2>&1
+echo "refresh rc=$? (a guard refusal is expected)"; tail -c 1500 "$OUT/refresh.log"; echo
+# No refresh.json: the wrapper refused or the deploy failed, so the Job may
+# still hold an earlier image or schema. Nothing was measured.
+if [[ ! -f "$OUT/refresh/refresh.json" ]]; then
+  echo "refresh FAILED before an execution of this image and schema; not measuring"; protected_and_exit 1
+fi
+OUTCOME=$("$NODE26" -e '
+  const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+  const line = Array.isArray(r.results) && r.results.length > 0 ? r.results.at(-1) : null;
+  console.log(line === null ? "no-status-line" : line.status === "ok" ? String(line.state) : `failed:${line.code}`);' \
+  "$OUT/refresh/refresh.json")
+echo "guarded outcome $OUTCOME"
+if [[ "$OUTCOME" == "LOCK_HELD" ]]; then
+  echo "refresh FAILED: LOCK_HELD, another refresh holds the fast-path database's lock; nothing was measured"
+  protected_and_exit 1
+fi
 
 if [[ "${MEAS_UNCAPPED:-}" == "1" ]]; then
-  # One execution of the Job just deployed, with execution-level overrides only
-  # (the Job's configuration is unchanged): a 24 h task timeout and the guard at 24 h.
-  step uncapped
-  gcloud run jobs execute "$JOB" --project=tibotattle --region=us-east1 --task-timeout=86400s \
-    --update-env-vars=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=86400 --wait --format=json \
-    > "$OUT/uncapped.json" 2> "$OUT/uncapped.log"
-  echo "uncapped rc=$?"
-  EXEC=$("$NODE26" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).metadata.name)}catch{console.log("")}' "$OUT/uncapped.json")
-  if [[ -n "$EXEC" ]]; then
-    gcloud logging read "resource.type=\"cloud_run_job\" AND labels.\"run.googleapis.com/execution_name\"=\"$EXEC\"" \
-      --project=tibotattle --limit=50 --format=json > "$OUT/uncapped-logs.json" 2>> "$OUT/uncapped.log"
+  if [[ "$OUTCOME" == "complete" ]]; then
+    echo "uncapped skipped: the guarded run completed inside its task; refresh/refresh.json is the measurement"
+  else
+    step uncapped
+    D refresh-uncapped --image="$IMG" --schema="$SCHEMA" --now="$NOW" "${GUARDED[@]}" \
+      --task-timeout-seconds="$UNCAPPED_TIMEOUT" --after-refresh="$OUT/refresh/refresh.json" \
+      --out="$OUT/uncapped" > "$OUT/uncapped.log" 2>&1
+    echo "uncapped rc=$? (receipt $OUT/uncapped/refresh-uncapped.json)"; tail -c 1500 "$OUT/uncapped.log"; echo
   fi
 fi
 
-step protected; D protected --commit="$COMMIT" --out="$OUT/protected" > "$OUT/protected.log" 2>&1; echo "protected rc=$?"
-step done
-echo "receipts in $OUT"
+protected_and_exit 0

@@ -5,12 +5,14 @@
 // network. The pricer is a stand-in (record counts and placement do not depend
 // on prices; seed-source.mjs prices with production's own pricer).
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { buildJournalSqlite } from "../gcp-fastpath-rehearsal.mjs";
 import { privacyScan, rebuildOracleSqlite } from "../gcp-fastpath-oracle-sqlite.mjs";
@@ -231,4 +233,30 @@ test("the SQLite seal equals the JSON dump round trip it replaces, and the journ
     assert.deepEqual(masterOf(fromJournal.path).master, masterOf(fromDump.path).master);
     assert.deepEqual(JOURNAL_OBJECTS, ["storage_source_state", "storage_ingestion_changes", "storage_ingestion_owner_cursor"]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+// MEAS-SYNTH review (2026-10-03): the script's uncapped step called gcloud
+// directly, outside the wrapper's guarded command builders and checks.
+test("the cloud measurement script reaches the cloud only through the deploy wrapper's checked steps", () => {
+  const path = join(dirname(fileURLToPath(import.meta.url)), "run-cloud-measurement.sh");
+  const code = readFileSync(path, "utf8").split("\n").filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n").replaceAll("\\\n", " ");
+  assert.doesNotMatch(code, /(?:^|[\s;|&(`$])gcloud(?:\s|$)/mu, "no direct gcloud command");
+  const steps = new Set([...code.matchAll(/(?:^|[\s;{])D ([a-z-]+)/gmu)].map(([, step]) => step));
+  assert.deepEqual([...steps].sort(), ["build", "migrate", "protected", "refresh", "refresh-idle", "refresh-uncapped",
+    "verify-database"]);
+  // The guarded and the uncapped refresh render the same Job: refresh-uncapped reads it back against these flags.
+  const call = (step) => code.split("\n").find((line) => line.trimStart().startsWith(`D ${step} `));
+  for (const step of ["refresh", "refresh-uncapped"]) {
+    for (const flag of ['--image="$IMG"', '--schema="$SCHEMA"', '--now="$NOW"', '"${GUARDED[@]}"']) {
+      assert.equal(call(step).includes(flag), true, `${step} ${flag}`);
+    }
+  }
+  assert.equal(call("refresh-uncapped").includes('--after-refresh="$OUT/refresh/refresh.json"'), true);
+  assert.equal(call("refresh-uncapped").includes('--task-timeout-seconds="$UNCAPPED_TIMEOUT"'), true);
+  // The uncapped run follows only a guarded run that made an execution and did not meet another lock.
+  assert.match(code, /if \[\[ ! -f "\$OUT\/refresh\/refresh\.json" \]\]; then/u);
+  assert.match(code, /if \[\[ "\$OUTCOME" == "LOCK_HELD" \]\]; then/u);
+  const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
+  if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
 });

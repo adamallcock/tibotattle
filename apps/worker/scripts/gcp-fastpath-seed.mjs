@@ -63,7 +63,6 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createGcpFastpathPool, GCP_FASTPATH_CONNECTION, validateTarget } from "./gcp-fastpath-connection.mjs";
-import { prodShapeImporters, readProdShapeCorpus } from "./gcp-fastpath-prod-shape/import-corpus.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -98,6 +97,15 @@ export const GCP_FASTPATH_SEED = Object.freeze({
     "apps/worker/scripts/postgres-fastpath-identity-copy.mjs",
   ]),
 });
+
+/**
+ * The --sealed-corpus importer, loaded like a stage: only after the plan
+ * decides to run, and with its contract checked (it imports the rehearsal
+ * loader's whole chain, which plan, readback and golden seeds never need).
+ */
+export const SEALED_CORPUS_STAGE = Object.freeze({ name: "sealed-corpus", label: "sealed-corpus importer",
+  path: "apps/worker/scripts/gcp-fastpath-prod-shape/import-corpus.mjs",
+  exports: Object.freeze(["readProdShapeCorpus", "prodShapeImporters"]) });
 
 /**
  * The modules the seed's chain runs, with the exports it relies on. The
@@ -309,7 +317,7 @@ async function seededSourceIdentity(pool, schema) {
   return Object.freeze({ sourceId: row.source_id, sourceNamespace: row.v1_namespace });
 }
 
-async function loadStage(stage) {
+export async function loadStage(stage) {
   const module = await import(pathToFileURL(join(REPOSITORY_ROOT, stage.path)).href);
   const missing = stage.exports.filter((name) => typeof module[name] !== "function");
   if (missing.length > 0) {
@@ -421,7 +429,9 @@ export async function runGcpFastpathSeed({
   if (plan.decision === "refuse") fail("GCP_FASTPATH_SEED_CHECKOUT_MISMATCH", plan.reason);
   // A sealed corpus brings its own sealed source, journal-only dump, roster,
   // clock and source identity; its sealed digest stands in for the dump's.
-  const corpus = sealedCorpus === undefined ? null : await readProdShapeCorpus(resolve(sealedCorpus));
+  const sealedCorpusStage = sealedCorpus === undefined ? null : await loadStage(SEALED_CORPUS_STAGE);
+  const corpus = sealedCorpusStage === null ? null
+    : await sealedCorpusStage.readProdShapeCorpus(resolve(sealedCorpus));
   const { manifest, dumpPath, dumpSha256, sourceIdentity } = corpus === null
     ? await readSeedGolden(plan.golden, { dump })
     : { manifest: { now: corpus.nowIso, owners: corpus.roster }, dumpPath: corpus.journalPath,
@@ -474,7 +484,7 @@ export async function runGcpFastpathSeed({
       workDirectory = await realpath(await mkdtemp(join(tmpdir(), "gcp-fastpath-seed-")));
       const sealed = corpus === null ? await loader.sealFastpathRehearsalSource({ dumpPath, workDirectory })
         : { sealedSource: corpus.sealedSource, report: { sha256: corpus.sealedSha256, sealedCorpus: true } };
-      const importers = corpus === null ? loader.loadFastpathRehearsalImporters : prodShapeImporters;
+      const importers = corpus === null ? loader.loadFastpathRehearsalImporters : sealedCorpusStage.prodShapeImporters;
       // The Cloud SQL connector session is not a local Unix socket: the seed,
       // and only the seed, names its fast-path cloud target to the importers
       // (scripts/gcp-fastpath-cloud-target.mjs holds the exact conditions).

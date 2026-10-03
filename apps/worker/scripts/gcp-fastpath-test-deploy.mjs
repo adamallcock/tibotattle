@@ -17,14 +17,15 @@
  *   node scripts/gcp-fastpath-test-deploy.mjs all --commit=<ref> [--now=<ISO>] [--dry-run]
  *   node scripts/gcp-fastpath-test-deploy.mjs <step> [options]
  *
- * Steps: build, database, migrate, verify-database, refresh, origin, verify,
- * protected, all. Run with --help for options.
+ * Steps: build, database, migrate, verify-database, seed, refresh,
+ * refresh-idle, refresh-uncapped, origin, verify, protected, all. Run with
+ * --help for options.
  */
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -133,8 +134,15 @@ export const EDGE_TEST_UNMIRRORED_SETTINGS = Object.freeze({
 /** A source id or typed-storage namespace the origin and an env flag both accept. */
 const SOURCE_IDENTITY = /^[A-Za-z0-9._:-]{1,200}$/u;
 const STEPS = Object.freeze([
-  "build", "database", "migrate", "verify-database", "seed", "refresh", "origin", "verify", "protected", "all",
+  "build", "database", "migrate", "verify-database", "seed", "refresh", "refresh-idle", "refresh-uncapped", "origin",
+  "verify", "protected", "all",
 ]);
+/** The refresh job's own task-timeout setting (cloud-run/analytics-refresh.mjs TASK_TIMEOUT_SECONDS). */
+export const REFRESH_TASK_TIMEOUT_ENV = "ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS";
+/** Cloud Run's and the refresh guard's task-timeout ceiling (168 h). */
+export const REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS = 604_800;
+/** A Cloud Run Job execution name: the job name and a generated suffix. */
+const EXECUTION_NAME = /^[a-z][a-z0-9-]{0,62}$/u;
 const BUILD_TERMINAL = new Set(["SUCCESS", "FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED", "EXPIRED"]);
 
 function fail(code, detail) {
@@ -314,12 +322,180 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
   ]);
 }
 
-export function executeJobCommand(job) {
+/**
+ * gcloud command that executes a Job and waits for it. `overrides` sets
+ * execution-level overrides only (the Job's configuration is unchanged): a
+ * task timeout and extra or replaced env values.
+ */
+export function executeJobCommand(job, { taskTimeoutSeconds, env = [] } = {}) {
+  const overrides = [];
+  if (taskTimeoutSeconds !== undefined) {
+    if (!Number.isSafeInteger(taskTimeoutSeconds) || taskTimeoutSeconds < 60
+        || taskTimeoutSeconds > REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS) {
+      fail("FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", String(taskTimeoutSeconds));
+    }
+    overrides.push(`--task-timeout=${taskTimeoutSeconds}s`);
+  }
+  if (env.length > 0) overrides.push(envFlag(env).replace(/^--set-env-vars=/u, "--update-env-vars="));
   return gcloudArgs([
     "run", "jobs", "execute", assertFastpathName(job),
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`,
-    "--wait", "--format=json",
+    ...overrides, "--wait", "--format=json",
   ]);
+}
+
+/** Read-only: a Job's executions, newest first (`limit` bounds the listing). */
+export function jobExecutionsCommand(job, { limit } = {}) {
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "limit");
+  return gcloudArgs(["run", "jobs", "executions", "list", `--job=${assertFastpathName(job)}`,
+    `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`,
+    ...(limit === undefined ? [] : [`--limit=${limit}`]), "--format=json"]);
+}
+
+/** Read-only: a Job's current configuration. */
+export function jobDescribeCommand(job) {
+  return gcloudArgs(["run", "jobs", "describe", assertFastpathName(job),
+    `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]);
+}
+
+function assertExecutionOf(job, execution) {
+  if (typeof execution !== "string" || !EXECUTION_NAME.test(execution)
+      || !execution.startsWith(`${assertFastpathName(job)}-`)) {
+    fail("FASTPATH_DEPLOY_EXECUTION_INVALID", String(execution));
+  }
+  return execution;
+}
+
+/** Read-only: one execution of a fast-path Job. */
+export function executionDescribeCommand(job, execution) {
+  return gcloudArgs(["run", "jobs", "executions", "describe", assertExecutionOf(job, execution),
+    `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]);
+}
+
+/**
+ * Read-only: one execution's log entries. With `since` (an ISO instant) the
+ * filter carries a timestamp bound, so the read covers a run of any length;
+ * without it the read looks back two hours.
+ */
+export function executionLogsCommand(job, execution, { since } = {}) {
+  if (since !== undefined && !ISO_INSTANT.test(since)) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "since");
+  const filter = [
+    "resource.type=\"cloud_run_job\"",
+    `resource.labels.job_name="${assertFastpathName(job)}"`,
+    `labels."run.googleapis.com/execution_name"="${assertExecutionOf(job, execution)}"`,
+    ...(since === undefined ? [] : [`timestamp>="${since}"`]),
+  ].join(" AND ");
+  return gcloudArgs(["logging", "read", filter, `--project=${FASTPATH_TEST.project}`,
+    "--format=json", "--limit=200", ...(since === undefined ? ["--freshness=2h"] : [])]);
+}
+
+/** Whether an execution (as `executions list/describe` render it) has finished. */
+export function executionCompleted(execution) {
+  const status = execution?.status ?? {};
+  const completed = Array.isArray(status.conditions)
+    ? status.conditions.find((condition) => condition?.type === "Completed") : undefined;
+  if (completed !== undefined) return completed.status === "True" || completed.status === "False";
+  return typeof status.completionTime === "string";
+}
+
+/** The names of a listing's executions that have not finished. */
+export function runningExecutions(executions) {
+  if (!Array.isArray(executions)) fail("FASTPATH_DEPLOY_JSON_INVALID", "executions");
+  return executions.filter((execution) => !executionCompleted(execution))
+    .map((execution) => String(execution?.metadata?.name ?? "<unnamed>"));
+}
+
+/**
+ * Refuses while any execution of the refresh Job is running. The refresh
+ * holds a database-wide advisory lock (analytics-refresh.mjs
+ * ANALYTICS_REFRESH_LOCK_KEY) in the one fast-path database every seeded
+ * schema shares, so a second execution would exit LOCK_HELD having done
+ * nothing, and a deploy would change the Job under the running one.
+ */
+export function assertRefreshIdle(runner) {
+  const listed = runner.json(jobExecutionsCommand(FASTPATH_TEST.refreshJob), { read: true, placeholderJson: [] });
+  const running = runningExecutions(listed ?? []);
+  if (running.length > 0) fail("FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING", running.join(","));
+  return Object.freeze({ step: "refresh-idle", job: FASTPATH_TEST.refreshJob, running: 0 });
+}
+
+/** The final content-free status line of a refresh execution, or null. */
+export function refreshStatusLine(lines) {
+  return Array.isArray(lines) && lines.length > 0 ? lines.at(-1) : null;
+}
+
+/**
+ * The task a Job or an execution runs, as `run jobs describe` and
+ * `run jobs executions describe` render them (Cloud Run Admin API v1:
+ * Job spec.template.spec.template.spec, Execution spec.template.spec).
+ * Null when the resource has no single container.
+ */
+export function jobTaskSpec(resource) {
+  const jobSpec = resource?.spec?.template?.spec?.template?.spec;
+  const executionSpec = resource?.spec?.template?.spec;
+  const spec = resource?.kind === "Job" ? jobSpec : resource?.kind === "Execution" ? executionSpec
+    : resource?.kind === undefined && Array.isArray(jobSpec?.containers) ? jobSpec
+      : resource?.kind === undefined ? executionSpec : undefined;
+  const containers = spec?.containers;
+  if (!Array.isArray(containers) || containers.length !== 1) return null;
+  const [container] = containers;
+  const env = {};
+  for (const entry of Array.isArray(container?.env) ? container.env : []) {
+    if (typeof entry?.name === "string") env[entry.name] = typeof entry.value === "string" ? entry.value : null;
+  }
+  const limits = container?.resources?.limits ?? {};
+  return {
+    image: typeof container?.image === "string" ? container.image : null,
+    command: Array.isArray(container?.command) ? container.command : [],
+    args: Array.isArray(container?.args) ? container.args : [],
+    env,
+    cpu: typeof limits.cpu === "string" ? limits.cpu : null,
+    memory: typeof limits.memory === "string" ? limits.memory : null,
+    timeoutSeconds: spec.timeoutSeconds === undefined ? null : Number(spec.timeoutSeconds),
+  };
+}
+
+/** The task refreshJobCommand deploys, in jobTaskSpec's shape. */
+export function expectedRefreshTask(options) {
+  const command = refreshJobCommand(options);
+  const flag = (name) => command.find((arg) => arg.startsWith(`--${name}=`)).slice(name.length + 3);
+  return {
+    image: flag("image"),
+    command: [flag("command")],
+    args: flag("args").split(","),
+    env: Object.fromEntries(flag("set-env-vars").split(",").map((pair) => {
+      const split = pair.indexOf("=");
+      return [pair.slice(0, split), pair.slice(split + 1)];
+    })),
+    cpu: flag("cpu"),
+    memory: flag("memory"),
+    timeoutSeconds: Number.parseInt(flag("task-timeout"), 10),
+  };
+}
+
+function normalizedCpu(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return value.endsWith("m") ? Number(value.slice(0, -1)) / 1_000 : Number(value);
+}
+
+/**
+ * The fields where a read-back task differs from the expected one, by name
+ * only (values are not echoed). `only` limits the comparison to some fields.
+ */
+export function refreshTaskMismatches(actual, expected, { only } = {}) {
+  if (actual === null) return ["task"];
+  const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  const sorted = (env) => Object.entries(env).sort(([left], [right]) => (left < right ? -1 : 1));
+  return [
+    ["image", () => actual.image === expected.image],
+    ["command", () => same(actual.command, expected.command)],
+    ["args", () => same(actual.args, expected.args)],
+    ["env", () => same(sorted(actual.env), sorted(expected.env))],
+    ["cpu", () => normalizedCpu(actual.cpu) === normalizedCpu(expected.cpu)],
+    ["memory", () => actual.memory === expected.memory],
+    ["timeoutSeconds", () => actual.timeoutSeconds === expected.timeoutSeconds],
+  ].filter(([field]) => only === undefined || only.includes(field))
+    .filter(([, equal]) => !equal()).map(([field]) => field);
 }
 
 /**
@@ -655,6 +831,7 @@ function parseArgs(argv) {
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
     corpus: undefined, dump: undefined, refreshProfile: undefined, resolvedGolden: undefined,
+    taskTimeoutSeconds: undefined, afterRefresh: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -680,7 +857,11 @@ function parseArgs(argv) {
     else if (key === "schema-suffix") options.schemaSuffix = value;
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
-    else if (["refresh-env", "origin-env"].includes(key)) {
+    else if (key === "after-refresh") options.afterRefresh = resolve(value);
+    else if (key === "task-timeout-seconds") {
+      if (!/^[1-9][0-9]{0,6}$/u.test(value)) fail("FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", value);
+      options.taskTimeoutSeconds = Number(value);
+    } else if (["refresh-env", "origin-env"].includes(key)) {
       const split = value.indexOf("=");
       if (split < 1) fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", argument);
       (key === "refresh-env" ? options.refreshEnv : options.originEnv)
@@ -717,7 +898,17 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
-                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h)
+                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h); refused
+                   while an execution of it is running; a LOCK_HELD execution fails the step
+  refresh-idle     read-only: refuse while an execution of ${FASTPATH_TEST.refreshJob} is running (its
+                   database-wide advisory lock would make another refresh exit LOCK_HELD)
+  refresh-uncapped one more execution of the Job \`refresh\` deployed, with execution-level overrides only: task
+                   timeout and ${REFRESH_TASK_TIMEOUT_ENV} at --task-timeout-seconds (above the profile's,
+                   at most ${REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS}). Refused unless --after-refresh=<refresh.json> names
+                   --image, --schema, --now and the profile, its execution was not LOCK_HELD, the Job reads back
+                   with exactly the task the same refresh flags render, and no execution is running. Waits for the
+                   execution to finish, then saves its status, its status line and its system messages
+                   (refresh-uncapped.json)
   origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
                    (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
@@ -749,6 +940,8 @@ Options:
   --replace-seed          drop and re-seed a seeded schema that lacks its completion marker
   --schema=<schema>       primary schema for refresh/origin: ${FASTPATH_TEST.primarySchema}
                           or typed_legacy_transfer_rehearsal_target_fastpath_<8 hex> (default: the seeded schema)
+  --task-timeout-seconds=<n>  refresh-uncapped: the execution's task timeout and time guard
+  --after-refresh=<path>  refresh-uncapped: the refresh.json of the guarded refresh it follows
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -913,23 +1106,43 @@ function stepDatabase(runner) {
   return { step: "database", database: FASTPATH_TEST.database, created: !exists && !runner.dryRun };
 }
 
-async function jobExecutionResult(runner, job, execution) {
-  const filter = [
-    "resource.type=\"cloud_run_job\"",
-    `resource.labels.job_name="${job}"`,
-    `labels."run.googleapis.com/execution_name"="${execution.metadata?.name}"`,
-  ].join(" AND ");
-  const read = gcloudArgs(["logging", "read", filter, `--project=${FASTPATH_TEST.project}`,
-    "--format=json", "--limit=200", "--freshness=2h"]);
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    const entries = runner.json(read, { read: true, quiet: attempt > 0 }) ?? [];
-    const lines = entries.map((entry) => entry.jsonPayload ?? (() => {
-      try { return JSON.parse(entry.textPayload ?? ""); } catch { return null; }
-    })()).filter((value) => value && typeof value === "object" && typeof value.status === "string");
-    if (lines.length > 0) return lines;
-    await new Promise((resolveWait) => setTimeout(resolveWait, 10_000));
+const defaultSleep = (milliseconds) => new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+
+/**
+ * One execution's log, read until it holds a content-free status line (log
+ * ingestion lags the execution): the status lines, oldest first, and Cloud
+ * Run's own text messages (a timeout or memory kill leaves only those).
+ */
+export async function readExecutionLog(runner, job, execution, { since, attempts = 12, intervalMs = 10_000,
+  sleep = defaultSleep } = {}) {
+  const read = executionLogsCommand(job, execution, { since });
+  let systemMessages = [];
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const listed = runner.json(read, { read: true, quiet: attempt > 0 }) ?? [];
+    const entries = (Array.isArray(listed) ? listed : [])
+      .map((entry, index) => ({ entry, index, at: Date.parse(entry?.timestamp ?? "") }))
+      .sort((left, right) => ((left.at || 0) - (right.at || 0)) || (right.index - left.index))
+      .map(({ entry }) => entry);
+    const lines = [];
+    systemMessages = [];
+    for (const entry of entries) {
+      const value = entry?.jsonPayload ?? (() => {
+        try { return JSON.parse(entry?.textPayload ?? ""); } catch { return null; }
+      })();
+      if (value && typeof value === "object" && typeof value.status === "string") lines.push(value);
+      else if (typeof entry?.textPayload === "string" && systemMessages.length < 50) {
+        systemMessages.push({ timestamp: entry.timestamp ?? null, severity: entry.severity ?? null,
+          text: entry.textPayload.slice(0, 500) });
+      }
+    }
+    if (lines.length > 0) return { lines, systemMessages };
+    if (attempt + 1 < attempts) await sleep(intervalMs);
   }
-  return [];
+  return { lines: [], systemMessages };
+}
+
+async function jobExecutionResult(runner, job, execution) {
+  return (await readExecutionLog(runner, job, execution.metadata?.name)).lines;
 }
 
 async function deployAndExecuteJob(runner, options, job, deployCommand) {
@@ -941,9 +1154,7 @@ async function deployAndExecuteJob(runner, options, job, deployCommand) {
   if (runner.dryRun) return { job, executed: "dry-run" };
   if (!execution?.metadata?.name) {
     // A failed execution makes `execute --wait` exit non-zero without JSON.
-    execution = (runner.json(gcloudArgs(["run", "jobs", "executions", "list", `--job=${job}`,
-      `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--limit=1", "--format=json"]),
-    { read: true }) ?? [])[0] ?? null;
+    execution = (runner.json(jobExecutionsCommand(job, { limit: 1 }), { read: true }) ?? [])[0] ?? null;
   }
   const status = execution?.status ?? {};
   const succeeded = Number(status.succeededCount ?? 0) === 1 && Number(status.failedCount ?? 0) === 0;
@@ -1090,6 +1301,8 @@ async function stepRefresh(runner, options, image) {
   if (options.commit !== undefined && !commitHasRefreshEntry(resolveCommit(options.commit))) {
     fail("FASTPATH_DEPLOY_REFRESH_ENTRY_ABSENT", "cloud-run/build.mjs has no analytics-refresh entry at --commit");
   }
+  // Never redeploy the Job under a running execution, nor start one that would only meet its lock.
+  assertRefreshIdle(runner);
   const result = await deployAndExecuteJob(runner, options, FASTPATH_TEST.refreshJob,
     refreshJobCommand({ image, now: options.now, schema: options.schema, extraEnv: options.refreshEnv,
       extraArgs: options.refreshArgs, profile: options.refreshProfile }));
@@ -1098,6 +1311,197 @@ async function stepRefresh(runner, options, image) {
   if (!runner.dryRun && !options.noExecute) {
     receipt.path = await runner.receipt("refresh.json", receipt);
     if (!result.succeeded) fail("FASTPATH_DEPLOY_REFRESH_FAILED", JSON.stringify(result.results?.at(-1) ?? null));
+    // LOCK_HELD exits 0 having read and written nothing: not a refresh.
+    if (refreshStatusLine(result.results)?.state === "LOCK_HELD") {
+      fail("FASTPATH_DEPLOY_REFRESH_LOCK_HELD", "another refresh held the fast-path database's advisory lock");
+    }
+  }
+  return receipt;
+}
+
+/** Content-free classification of a finished uncapped execution. */
+export function uncappedOutcome({ completed, succeeded, statusLine, durationSeconds, taskTimeoutSeconds }) {
+  if (!completed) return { outcome: "unfinished", code: null };
+  if (statusLine?.status === "ok") {
+    if (statusLine.state === "LOCK_HELD") return { outcome: "lock-held", code: null };
+    return { outcome: succeeded && statusLine.state === "complete" ? "complete" : "unexpected", code: null };
+  }
+  if (statusLine?.status === "failed") {
+    return { outcome: "failed", code: typeof statusLine.code === "string" ? statusLine.code : null };
+  }
+  // No status line: a kill at the task timeout leaves only Cloud Run's messages.
+  if (Number.isFinite(durationSeconds) && durationSeconds >= taskTimeoutSeconds - 300) {
+    return { outcome: "killed-at-task-timeout", code: null };
+  }
+  return { outcome: succeeded ? "succeeded-without-status-line" : "failed-without-status-line", code: null };
+}
+
+function executionStatus(execution) {
+  const status = execution?.status ?? {};
+  return {
+    startTime: status.startTime ?? null,
+    completionTime: status.completionTime ?? null,
+    succeededCount: Number(status.succeededCount ?? 0),
+    failedCount: Number(status.failedCount ?? 0),
+    cancelledCount: Number(status.cancelledCount ?? 0),
+    retriedCount: Number(status.retriedCount ?? 0),
+    runningCount: Number(status.runningCount ?? 0),
+    conditions: (Array.isArray(status.conditions) ? status.conditions : []).map((condition) => ({
+      type: condition?.type ?? null, status: condition?.status ?? null, reason: condition?.reason ?? null,
+      message: typeof condition?.message === "string" ? condition.message.slice(0, 500) : null,
+      lastTransitionTime: condition?.lastTransitionTime ?? null,
+    })),
+  };
+}
+
+/** `instant` (any RFC 3339 form Cloud Run renders) less `milliseconds`, as a millisecond ISO instant, or null. */
+function isoMinus(instant, milliseconds) {
+  const at = Date.parse(instant ?? "");
+  return Number.isFinite(at) ? new Date(at - milliseconds).toISOString() : null;
+}
+
+/**
+ * refresh-uncapped (see HELP): one more execution of the refresh Job the
+ * guarded `refresh` step deployed, with execution-level overrides only, so a
+ * run longer than the profile's task timeout is timed to its end. The guarded
+ * refresh's receipt and a read-back of the Job prove what the execution runs;
+ * the receipt is written whatever the execution's outcome, which is data.
+ */
+export async function stepRefreshUncapped(runner, options, image, { sleep = defaultSleep, wallClock = Date.now,
+  pollMs = 60_000, maxPollFailures = 30, logAttempts = 30, logIntervalMs = 20_000 } = {}) {
+  const job = FASTPATH_TEST.refreshJob;
+  const profile = refreshProfile(options.refreshProfile);
+  const timeout = options.taskTimeoutSeconds;
+  if (!Number.isSafeInteger(timeout) || timeout <= profile.taskTimeoutSeconds
+      || timeout > REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS) {
+    fail("FASTPATH_DEPLOY_TASK_TIMEOUT_INVALID", `--task-timeout-seconds above ${profile.taskTimeoutSeconds}, `
+      + `at most ${REFRESH_TASK_TIMEOUT_MAXIMUM_SECONDS}`);
+  }
+  if (options.schema === undefined || options.afterRefresh === undefined) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "refresh-uncapped needs --schema and --after-refresh");
+  }
+  const schema = primarySchemaOf(options.schema);
+  const expected = expectedRefreshTask({ image, now: options.now, schema, extraEnv: options.refreshEnv,
+    extraArgs: options.refreshArgs, profile: options.refreshProfile });
+
+  // The guarded refresh this follows: its deploy succeeded (the receipt is
+  // written only after it), it ran this image, schema, clock and profile, and
+  // it did not meet another refresh's lock.
+  let guarded = null;
+  try {
+    guarded = JSON.parse(await readFile(options.afterRefresh, "utf8"));
+  } catch {
+    fail("FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_INVALID", "unreadable");
+  }
+  const guardedMismatches = [
+    ["step", guarded?.step === "refresh"],
+    ["image", guarded?.image === image],
+    ["schema", guarded?.schema === schema],
+    ["now", (guarded?.now ?? null) === (options.now ?? null)],
+    ["profile", guarded?.profile === options.refreshProfile],
+    ["execution", typeof guarded?.execution === "string" && guarded.execution.length > 0],
+  ].filter(([, equal]) => !equal).map(([field]) => field);
+  if (guardedMismatches.length > 0) {
+    fail("FASTPATH_DEPLOY_UNCAPPED_AFTER_REFRESH_MISMATCH", guardedMismatches.join(","));
+  }
+  const guardedLine = refreshStatusLine(guarded.results);
+  if (guardedLine?.state === "LOCK_HELD") fail("FASTPATH_DEPLOY_REFRESH_LOCK_HELD", "the guarded refresh did nothing");
+
+  // Nothing else is running, and the Job is exactly the guarded refresh's.
+  assertRefreshIdle(runner);
+  const described = runner.json(jobDescribeCommand(job), { read: true, placeholderJson: null });
+  const jobTask = runner.dryRun ? null : jobTaskSpec(described);
+  if (!runner.dryRun) {
+    const mismatches = refreshTaskMismatches(jobTask, expected);
+    if (mismatches.length > 0) fail("FASTPATH_DEPLOY_UNCAPPED_JOB_MISMATCH", mismatches.join(","));
+  }
+
+  const overrides = { taskTimeoutSeconds: timeout, env: [[REFRESH_TASK_TIMEOUT_ENV, String(timeout)]] };
+  const execute = executeJobCommand(job, overrides);
+  const receipt = {
+    step: "refresh-uncapped", job, image, schema, now: options.now ?? null, profile: options.refreshProfile,
+    taskTimeoutSeconds: timeout, overrides: render(execute),
+    afterRefresh: { path: options.afterRefresh, execution: guarded.execution, succeeded: guarded.succeeded ?? null,
+      durationSeconds: guarded.durationSeconds ?? null, statusLine: guardedLine },
+    jobTask, requestedAt: null, execution: null, executionTask: null, executionMismatches: null,
+    completed: false, succeeded: false, status: null, durationSeconds: null, outcome: null, code: null,
+    statusLine: null, results: [], systemMessages: [], logRead: null,
+  };
+  if (runner.dryRun) {
+    runner.exec(execute, { placeholder: "" });
+    const placeholder = `${job}-dryrun`;
+    runner.print(executionDescribeCommand(job, placeholder), "read-only; poll until the execution finishes");
+    runner.print(executionLogsCommand(job, placeholder, { since: "2026-01-01T00:00:00.000Z" }),
+      "read-only; since the execution started, until a status line appears");
+    return { ...receipt, dryRun: true };
+  }
+
+  const requestedAtMs = wallClock();
+  receipt.requestedAt = new Date(requestedAtMs).toISOString();
+  try {
+    let execution = runner.json(execute, { allowFailure: true });
+    if (typeof execution?.metadata?.name !== "string") {
+      // `execute --wait` exits non-zero without JSON when the execution fails
+      // (or gcloud loses the wait): take the newest execution only if it is
+      // this one, created after the request and running this task.
+      const newest = (runner.json(jobExecutionsCommand(job, { limit: 1 }), { read: true, allowFailure: true })
+        ?? [])[0] ?? null;
+      const ours = Date.parse(newest?.metadata?.creationTimestamp ?? "") >= requestedAtMs - 300_000
+        && refreshTaskMismatches(jobTaskSpec(newest), expected, { only: ["image", "command", "args"] }).length === 0;
+      execution = ours ? newest : null;
+    }
+    if (execution === null) fail("FASTPATH_DEPLOY_UNCAPPED_EXECUTION_ABSENT");
+    const name = assertExecutionOf(job, execution.metadata.name);
+    receipt.execution = name;
+    // Poll to the end: the task timeout plus an hour, tolerating transient read failures.
+    const deadlineMs = requestedAtMs + (timeout + 3_600) * 1_000;
+    let failures = 0;
+    let polls = 0;
+    while (!executionCompleted(execution) && wallClock() <= deadlineMs && failures < maxPollFailures) {
+      await sleep(pollMs);
+      const next = runner.json(executionDescribeCommand(job, name), { read: true, allowFailure: true,
+        quiet: polls > 0 });
+      polls += 1;
+      if (next === null) failures += 1;
+      else { failures = 0; execution = next; }
+    }
+    receipt.completed = executionCompleted(execution);
+    receipt.status = executionStatus(execution);
+    receipt.succeeded = receipt.status.succeededCount === 1 && receipt.status.failedCount === 0;
+    receipt.durationSeconds = receipt.status.startTime && receipt.status.completionTime
+      ? (Date.parse(receipt.status.completionTime) - Date.parse(receipt.status.startTime)) / 1_000 : null;
+    receipt.executionTask = jobTaskSpec(execution);
+    const executionMismatches = refreshTaskMismatches(receipt.executionTask, expected,
+      { only: ["image", "command", "args"] });
+    if (receipt.executionTask !== null) {
+      const { env, timeoutSeconds } = receipt.executionTask;
+      if (timeoutSeconds !== null && timeoutSeconds !== timeout) executionMismatches.push("timeoutSeconds");
+      if (Object.hasOwn(env, REFRESH_TASK_TIMEOUT_ENV) && env[REFRESH_TASK_TIMEOUT_ENV] !== String(timeout)) {
+        executionMismatches.push("guardEnv");
+      }
+      if (Object.hasOwn(env, "PRIMARY_SCHEMA") && env.PRIMARY_SCHEMA !== schema) executionMismatches.push("schemaEnv");
+    }
+    receipt.executionMismatches = executionMismatches;
+    const since = isoMinus(execution.metadata?.creationTimestamp, 60_000) ?? isoMinus(receipt.status.startTime, 60_000)
+      ?? isoMinus(receipt.requestedAt, 300_000);
+    receipt.logRead = render(executionLogsCommand(job, name, { since }));
+    const log = await readExecutionLog(runner, job, name, { since, attempts: logAttempts, intervalMs: logIntervalMs,
+      sleep });
+    receipt.results = log.lines;
+    receipt.systemMessages = log.systemMessages;
+    receipt.statusLine = refreshStatusLine(log.lines);
+    Object.assign(receipt, uncappedOutcome({ completed: receipt.completed, succeeded: receipt.succeeded,
+      statusLine: receipt.statusLine, durationSeconds: receipt.durationSeconds, taskTimeoutSeconds: timeout }));
+  } finally {
+    receipt.path = await runner.receipt("refresh-uncapped.json", receipt);
+  }
+  if (receipt.executionMismatches.length > 0) {
+    fail("FASTPATH_DEPLOY_UNCAPPED_EXECUTION_MISMATCH", receipt.executionMismatches.join(","));
+  }
+  if (!receipt.completed) fail("FASTPATH_DEPLOY_UNCAPPED_EXECUTION_UNFINISHED", receipt.execution);
+  if (receipt.outcome === "lock-held") fail("FASTPATH_DEPLOY_REFRESH_LOCK_HELD", receipt.execution);
+  if (receipt.outcome !== "complete") {
+    fail("FASTPATH_DEPLOY_REFRESH_FAILED", `${receipt.outcome}${receipt.code ? ` ${receipt.code}` : ""}`);
   }
   return receipt;
 }
@@ -1243,7 +1647,7 @@ export async function main(argv = process.argv.slice(2)) {
   let image = options.image;
   let protectedBefore = null;
   for (const step of steps) {
-    if (["migrate", "refresh", "origin"].includes(step) && image === undefined) {
+    if (["migrate", "refresh", "refresh-uncapped", "origin"].includes(step) && image === undefined) {
       if (!options.dryRun) fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED", step);
       image = `${FASTPATH_TEST.imageRepository}@sha256:${"0".repeat(64)}`;
     }
@@ -1262,7 +1666,9 @@ export async function main(argv = process.argv.slice(2)) {
     else if (step === "refresh") {
       if (options.skip.has("refresh")) continue;
       result = await stepRefresh(runner, options, image);
-    } else if (step === "origin") result = await stepOrigin(runner, options, image);
+    } else if (step === "refresh-idle") result = assertRefreshIdle(runner);
+    else if (step === "refresh-uncapped") result = await stepRefreshUncapped(runner, options, image);
+    else if (step === "origin") result = await stepOrigin(runner, options, image);
     else if (step === "verify") result = await stepVerify(runner, options);
     else if (step === "protected") result = stepProtected(runner);
     report.steps.push(result);

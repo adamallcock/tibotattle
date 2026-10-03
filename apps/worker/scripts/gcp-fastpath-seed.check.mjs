@@ -23,9 +23,11 @@ import {
   goldenPath,
   goldenSourceIdentity,
   loadSeedStages,
+  loadStage,
   planSeed,
   readSeedGolden,
   runGcpFastpathSeed,
+  SEALED_CORPUS_STAGE,
   SEED_STAGES,
   seededSchemas,
   seedMarker,
@@ -70,6 +72,21 @@ test("every stage contract matches the real module exports", async () => {
   for (const name of ["fastpathRehearsalSchemas", "sealFastpathRehearsalSource", "loadFastpathRehearsalImporters"]) {
     assert.equal(typeof loader[name], "function", name);
   }
+});
+
+// MEAS-SYNTH review (2026-10-03): a static import of the sealed-corpus
+// importer loaded the rehearsal loader's whole chain (node:sqlite, pg, every
+// importer) before any plan, for every command.
+test("the seed loads its stages, the sealed-corpus importer included, only after the plan and contract-checked", async () => {
+  const source = await readFile(join(dirname(fileURLToPath(import.meta.url)), "gcp-fastpath-seed.mjs"), "utf8");
+  const specifiers = [...source.matchAll(/^import\s[^;]*?from\s+"([^"]+)";/gmsu)].map(([, specifier]) => specifier);
+  assert.deepEqual(specifiers.filter((specifier) => !specifier.startsWith("node:")), ["./gcp-fastpath-connection.mjs"]);
+  assert.equal(GCP_FASTPATH_SEED.sealedCorpusPaths.includes(SEALED_CORPUS_STAGE.path), true,
+    "the plan holds the importer to the commit");
+  const module = await loadStage(SEALED_CORPUS_STAGE);
+  for (const name of SEALED_CORPUS_STAGE.exports) assert.equal(typeof module[name], "function", name);
+  await assert.rejects(loadStage({ ...SEALED_CORPUS_STAGE, exports: [...SEALED_CORPUS_STAGE.exports, "absentExport"] }),
+    (error) => error?.code === "GCP_FASTPATH_SEED_STAGE_CONTRACT_MISMATCH");
 });
 
 test("seed skips with its reason when any chain stage or the golden is absent at the commit", () => {
