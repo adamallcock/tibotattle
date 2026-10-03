@@ -51,7 +51,7 @@ Allocation probes used 10,000/10,000/1,000 calls respectively, at one-minute loa
 
 ## Validation and remaining admission
 
-The exact checkpoint will be reviewed for scan correctness, transform scope, error/effect parity and allocation accounting. Run the focused test, root preflight and architecture at the committed checkpoint. Production closure registration, canonical/mirror handling and any Node facade binding are coordinator decisions; none are pre-authorized by this synthetic result.
+Exact checkpoint `f5e286814e6cccb7fbd77cbb139d51ed511d65da` was clean and frozen during its focused differential, root preflight and architecture gates; all passed. Independent read-only review found no actionable issue in scan correctness, transform scope, error/effect parity or allocation accounting, and independently passed both focused tests under Node 22.16.0. The reviewer did not rerun timing/allocation probes. This is research-scope acceptance; production binding and combined performance remain unqualified. Production closure registration, canonical/mirror handling and any Node facade binding are coordinator decisions; none are pre-authorized by this synthetic result.
 
 A Node-only production composition must bind the same exact byte-length operation without changing the descriptor walk or stringify, preserve the portable fallback in Worker/browser builds, and prove resolution/closure hashing with its owning gates. It needs a combined analytics/full-refresh check and measured memory/CPU impact after any privacy-walk optimization. No general incremental JSON serializer should be admitted without a separately closed stable-data contract or a complete semantic proof for inherited hooks and Proxies.
 
