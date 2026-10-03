@@ -49,6 +49,9 @@ const VENDOR_ROOT = join(WORKER_ROOT, "vendor", "analytics-d43c8f92");
 /** sha256 of each entry's canonical JSON, in id order. Append only. */
 const REGISTRY_PINS = Object.freeze([
   "3de37fc69519e9db59e6d8c81a6920547e4292b6e0f493c8f4df6f68c4f21a8a",
+  // Kernel 2: K-VENDOR2's export patch of buildPricingEvent and the entry
+  // facade's pricing re-exports, met with K-CORE-A at the PROD-PREP merge.
+  "f45bc8e89f659bcecfab40c37b81ae130de36ceff7831f0cc0b057328421daef",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
