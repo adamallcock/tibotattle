@@ -48,6 +48,11 @@ export const ALLOWED_MENTIONS = Object.freeze([
   // fresh transfer target counts them as empty only through SEEDED_SINGLETONS.
   ["scripts/postgres-transfer-target.mjs", "current_queue_state", "inventory", 1],
   ["scripts/postgres-transfer-target.mjs", "preparation_counters", "inventory", 1],
+  // PT-8's runtime-reset disposition list (E-PT8): the D1 tables are never
+  // transferred, and the post-import check counts a same-name PostgreSQL table
+  // only when it still exists.
+  ["scripts/postgres-transfer-coverage.mjs", "community_model_composition_days", "inventory", 1],
+  ["scripts/postgres-transfer-coverage.mjs", "community_model_history_dependencies", "inventory", 1],
 ].map(([file, table, kind, max]) => Object.freeze({ file, table, kind, max })));
 
 const IDENTIFIER_LIST_LINE = /^\s*[a-z0-9_]+(?:\s+[a-z0-9_]+)*\s*$/u;
