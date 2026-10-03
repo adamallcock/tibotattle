@@ -44,17 +44,17 @@ import {
   type TelemetryV11Record,
   type TelemetryV12Record,
 } from "@app-usagemonitor/telemetry-contract";
-import { canonicalJson } from "../canonical-json";
-import { sha256Hex } from "../crypto";
-import type { PostgresClient } from "../postgres-client";
-import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../telemetry-v12-typed-codec";
-import { prepareUsageCorrectionAssertion } from "../telemetry-usage-reconciliation";
+import { canonicalJson } from "../../../src/canonical-json";
+import { sha256Hex } from "../../../src/crypto";
+import type { PostgresClient } from "../../../src/postgres-client";
+import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../../../src/telemetry-v12-typed-codec";
+import { prepareUsageCorrectionAssertion } from "../../../src/telemetry-usage-reconciliation";
 import {
   decodeTypedTelemetryId,
   encodeTypedTelemetryId,
   typedTelemetryCanonicalRecords,
   type TypedTelemetryFields,
-} from "../typed-telemetry-codec";
+} from "../../../src/typed-telemetry-codec";
 import {
   genericOccurrence,
   reconcileGroups,
@@ -64,11 +64,11 @@ import {
   type TelemetryUsageCorrectionFactRow,
   type TelemetryV12EffectiveRecord,
   type TypedTelemetryCompatibilityRecord,
-} from "../../vendor/analytics-d43c8f92/entry";
+} from "../../../src/../vendor/analytics-d43c8f92/entry";
 import {
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
   type AnalyticsV2Day,
-} from "./contract";
+} from "../../../src/analytics-v2/contract";
 import {
   DAY_MS,
   analyticsV2PreparedStatement,
@@ -89,8 +89,8 @@ import {
   withGenericPlans,
   type AnalyticsV2PreparedStatement,
   type AnalyticsV2SnapshotContext,
-} from "./owners";
-import { analyticsV2ExclusionsOn } from "./exclusions";
+} from "../../../src/analytics-v2/owners";
+import { analyticsV2ExclusionsOn } from "../../../src/analytics-v2/exclusions";
 
 export type { EffectiveTelemetryOccurrence, EffectiveTelemetryStream };
 
@@ -388,97 +388,27 @@ function legacyV11CompleteSql(alias: string): string {
 }
 
 /**
- * Selection-only v1.1 eligibility. Every join below the record proof is a
- * function of its (chunk_key, manifest_key) pair and the binds. The final
- * candidate grouping is insensitive to the multiplicity EXISTS removes.
- * Expansion retains its existing builders and row multiplicity.
+ * $1 owner, $2 participant, $3 stream code, $4 stream name, $5/$6 first/last
+ * observed day (day numbers).
+ *
+ * The selection is production's CANDIDATE_SQL (legacyDirectSql over the
+ * observed-day range), shaped so its cost follows the range, not the owner.
+ * Unfenced, the planner walked every v1 chunk and admission of the
+ * participant, and joined every v1.1 domain day of the owner against the
+ * range's records, for each call: a cost in the owner's whole history, paid
+ * once per read span (C-REFRESH, measured on a synthetic dense legacy owner).
+ * Here the owner's typed records of the stream in the range are fenced first
+ * through typed_telemetry_owner_time (owner_id, stream, observed_at_ms), and
+ * each is then checked against the unchanged joins in a fenced LATERAL
+ * (OFFSET 0 keeps it per record). The fence is implied by the joins it
+ * precedes: a selected record's (namespace, owner, format) is its source
+ * format's membership of participant $2 (one per format), its stream is $3,
+ * and observed_day BETWEEN $5 AND $6 holds exactly when observed_at_ms lies
+ * in [$5, $6 + 1) days (0030's CHECK ties the two). The v1.1 chunk
+ * completeness test is applied after the LATERAL, against the counts of the
+ * chunks the fenced records reach (v11ChunkProofsSql), the same per-row
+ * predicate. So the rows, their multiplicity and the grouping are unchanged.
  */
-function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: string): string {
-  return `selection_pairs AS MATERIALIZED (
-      SELECT DISTINCT proof.chunk_key,proof.manifest_key FROM ${fence} selected
-        JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=selected.id
-    ), ${completenessCte === undefined ? `selection_chunk_proofs AS MATERIALIZED (
-      SELECT count_allocation.chunk_id,count(*) AS proof_count
-        FROM ${s}.typed_v11_chunk_allocations count_allocation
-        JOIN ${s}.typed_telemetry_chunks physical_chunk
-          ON physical_chunk.namespace_id=count_allocation.namespace_id AND physical_chunk.format=11
-         AND physical_chunk.original_id=count_allocation.chunk_original
-        JOIN ${s}.typed_v11_record_proofs count_proof ON count_proof.chunk_key=physical_chunk.id
-        JOIN ${s}.typed_v11_manifest_memberships count_membership
-          ON count_membership.typed_manifest_id=count_proof.manifest_key
-       WHERE count_allocation.chunk_id IN (
-         SELECT reach_allocation.chunk_id FROM selection_pairs pairs
-           JOIN ${s}.typed_telemetry_chunks reach_chunk ON reach_chunk.id=pairs.chunk_key
-           JOIN ${s}.typed_v11_chunk_allocations reach_allocation
-             ON reach_allocation.namespace_id=reach_chunk.namespace_id
-            AND reach_allocation.chunk_original=reach_chunk.original_id)
-       GROUP BY count_allocation.chunk_id
-
-    ), ` : ""}selection_pairs_ok AS MATERIALIZED (
-      SELECT pairs.chunk_key,pairs.manifest_key FROM selection_pairs pairs
-       WHERE EXISTS (SELECT 1 FROM ${s}.typed_telemetry_chunks proof_chunk
-          JOIN ${s}.typed_v11_chunk_allocations allocation ON allocation.namespace_id=proof_chunk.namespace_id
-           AND allocation.chunk_original=proof_chunk.original_id
-          JOIN ${s}.typed_v11_manifest_memberships admitted_manifest
-            ON admitted_manifest.typed_manifest_id=pairs.manifest_key
-          JOIN ${s}.telemetry_v11_chunks chunk ON chunk.id=allocation.chunk_id AND chunk.stream=$4
-          JOIN ${s}.telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admitted_manifest.manifest_id
-          JOIN ${s}.telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
-          JOIN ${s}.storage_v11_event_sources event ON event.generation_id=domain_day.generation_id
-           AND event.owner_digest=$1 AND event.participant_id=$2
-          JOIN ${s}.telemetry_v11_domains generation ON generation.id=event.generation_id
-           AND generation.id=domain_day.generation_id
-           AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
-           AND event.manifest_digest=generation.manifest_digest
-           AND event.from_day=generation.from_day AND event.through_day=generation.through_day
-           AND event.input_revision=generation.input_revision
-          JOIN ${s}.device_credentials generation_device ON generation_device.id=generation.device_id
-           AND generation_device.participant_id=generation.participant_id
-         WHERE proof_chunk.id=pairs.chunk_key
-           AND (chunk.id,chunk.record_count::bigint) IN (
-             SELECT complete.chunk_id,complete.proof_count FROM ${completenessCte ?? "selection_chunk_proofs"} complete))
-    )`;
-}
-
-/** Selection over a fenced id CTE; the v1 arm keeps its original LATERAL. */
-function legacySelectionSql(s: string, fence: string, filter: string): string {
-  const v1Device = typedIdTextSql("typed_device.original_id");
-  return `SELECT eligible.* FROM ${fence} CROSS JOIN LATERAL (
-      SELECT record.observed_day,record.occurrence_id,record.observed_at_ms
-        FROM ${s}.typed_telemetry_owner_memberships membership
-        JOIN ${s}.typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
-         AND v1.source_namespace=membership.source_namespace AND v1.namespace_id=membership.namespace_id
-        JOIN ${s}.typed_telemetry_records record ON record.namespace_id=membership.namespace_id
-         AND record.owner_id=membership.owner_id AND record.format=10 AND record.stream=$3
-        JOIN ${s}.typed_telemetry_devices typed_device ON typed_device.id=record.device_id
-         AND typed_device.namespace_id=record.namespace_id
-        JOIN ${s}.typed_v1_record_admissions admission ON admission.typed_record_id=record.id
-        JOIN ${s}.telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
-         AND chunk.participant_id=membership.participant_id AND chunk.device_id=(${v1Device})
-         AND chunk.stream=$4 AND chunk.superseded_at IS NULL AND chunk.accepted_record_count=chunk.record_count
-         AND chunk.record_count=(SELECT count(*) FROM ${s}.typed_v1_record_admissions complete
-           WHERE complete.chunk_id=chunk.id)
-        JOIN ${s}.typed_v1_event_sources event ON event.chunk_id=chunk.id AND event.owner_digest=$1
-         AND event.source_namespace=v1.source_namespace
-       WHERE membership.participant_id=$2 AND membership.source_format=10 AND record.id=${fence}.id AND ${filter}
-      OFFSET 0) eligible
-    UNION ALL
-    SELECT record.observed_day,record.occurrence_id,record.observed_at_ms
-      FROM ${fence}
-      JOIN ${s}.typed_telemetry_records record ON record.id=${fence}.id AND record.format=11 AND record.stream=$3
-      JOIN ${s}.typed_telemetry_owner_memberships membership ON membership.namespace_id=record.namespace_id
-       AND membership.owner_id=record.owner_id AND membership.participant_id=$2 AND membership.source_format=11
-      JOIN ${s}.typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
-       AND v11.source_namespace=membership.source_namespace AND v11.namespace_id=membership.namespace_id
-      JOIN ${s}.typed_telemetry_devices typed_device ON typed_device.id=record.device_id
-       AND typed_device.namespace_id=record.namespace_id
-      JOIN ${s}.typed_v11_record_proofs proof ON proof.typed_record_id=record.id
-      JOIN selection_pairs_ok ON selection_pairs_ok.chunk_key=proof.chunk_key
-       AND selection_pairs_ok.manifest_key=proof.manifest_key
-     WHERE ${filter}`;
-}
-
-/** $1 owner, $2 participant, $3 stream code, $4 name, $5/$6 observed days. */
 function legacyCandidatesSql(s: string): string {
   return `WITH owned AS MATERIALIZED (
       SELECT owned_record.id FROM ${s}.typed_telemetry_owner_memberships owned_membership
@@ -488,8 +418,11 @@ function legacyCandidatesSql(s: string): string {
          AND owned_record.observed_at_ms>=$5::integer::bigint*${DAY_MS}
          AND owned_record.observed_at_ms<($6::integer::bigint+1)*${DAY_MS}
        WHERE owned_membership.participant_id=$2 AND owned_membership.source_format IN (10,11)
-    ), ${legacySelectionPairCtesSql(s, "owned")}, direct AS (
-      ${legacySelectionSql(s, "owned", "record.observed_day BETWEEN $5::integer AND $6::integer")}
+    ), ${v11ChunkProofsSql(s, "owned")}, direct AS (
+      SELECT eligible.* FROM owned CROSS JOIN LATERAL (
+        ${legacyDirectSql(s, "record.id=owned.id AND record.observed_day BETWEEN $5::integer AND $6::integer")}
+        OFFSET 0) eligible
+       WHERE ${legacyV11CompleteSql("eligible")}
     )
     SELECT observed_day,occurrence_id,min(observed_at_ms)::text AS observed_at_ms
       FROM direct GROUP BY observed_day,occurrence_id`;
@@ -1404,192 +1337,6 @@ export async function readOwnerFirstEvidenceDay(
     }
     return first === null ? null : dayFromNumber(first);
   });
-}
-
-export interface ReadOwnerEvidencePlanOptions {
-  readonly ownerDigest: string;
-  readonly streams: readonly EffectiveTelemetryStream[];
-  readonly fromDay: AnalyticsV2Day;
-  readonly throughDay: AnalyticsV2Day;
-  readonly firstEvidenceThroughDay: AnalyticsV2Day;
-}
-
-export interface AnalyticsV2StreamEvidencePlan {
-  readonly counts: ReadonlyMap<AnalyticsV2Day, number>;
-  readonly firstEvidenceDay: AnalyticsV2Day | null;
-}
-
-export type AnalyticsV2OwnerEvidencePlan = ReadonlyMap<EffectiveTelemetryStream, AnalyticsV2StreamEvidencePlan>;
-interface EvidencePlanProof {
-  readonly ownerDigest: string;
-  readonly fromDay: number;
-  readonly throughDay: number;
-  readonly pool: AnalyticsV2SnapshotContext["pool"];
-  readonly schema: string;
-  readonly nowMs: number;
-  readonly client: AnalyticsV2SnapshotContext["client"];
-  readonly rows: ReadonlyMap<EffectiveTelemetryStream, readonly Record<string, unknown>[]>;
-  readonly correctionBoundaries: ReadonlyMap<EffectiveTelemetryStream, ReadonlySet<number>>;
-}
-// Keep validation coordinates private and content-free. A plan cannot be forged
-// or applied to another owner, and never contains occurrence identifiers.
-const evidencePlanProofs = new WeakMap<AnalyticsV2OwnerEvidencePlan, EvidencePlanProof>();
-
-/**
- * One scope read and one unnamed counts statement per requested stream, in
- * the caller's snapshot. Selection is set-based; no source is decoded or
- * expanded. First-evidence validation happens in the old stream/source order.
- * Count validation is deferred to countOwnerEvidencePlanRange so the job can
- * preserve its first-evidence → range → chunked-count refusal precedence.
- */
-export async function readOwnerEvidencePlan(
-  context: AnalyticsV2SnapshotContext,
-  options: ReadOwnerEvidencePlanOptions,
-): Promise<AnalyticsV2OwnerEvidencePlan> {
-  if (!options || typeof options !== "object" || typeof options.ownerDigest !== "string"
-      || !ANALYTICS_V2_OWNER_DIGEST_PATTERN.test(options.ownerDigest)
-      || !Array.isArray(options.streams) || options.streams.length < 1 || options.streams.length > 3
-      || new Set(options.streams).size !== options.streams.length
-      || options.streams.some((stream) => !["usage", "quota", "session"].includes(stream))) {
-    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
-  }
-  const fromDay = dayNumber(options.fromDay);
-  const throughDay = dayNumber(options.throughDay);
-  const firstThrough = dayNumber(options.firstEvidenceThroughDay);
-  if (fromDay < FIRST_EVIDENCE_FLOOR_DAY_NUMBER || throughDay < fromDay || firstThrough > throughDay
-      || firstThrough < FIRST_EVIDENCE_FLOOR_DAY_NUMBER) sourceFail("ANALYTICS_V2_SOURCE_INVALID");
-  const s = quotedSchema(context.schema);
-  const now = nowTimestamp(context.nowMs);
-  return onReadSnapshot(context, async (client) => {
-    const scope = await readOwnerScope(client, s, options.ownerDigest);
-    const plan = new Map<EffectiveTelemetryStream, AnalyticsV2StreamEvidencePlan>();
-    const rowsByStream = new Map<EffectiveTelemetryStream, readonly Record<string, unknown>[]>();
-    const boundaries = new Map<EffectiveTelemetryStream, ReadonlySet<number>>();
-    for (const stream of options.streams) {
-      const sources: string[] = [];
-      const firsts: string[] = [];
-      const values: unknown[] = [];
-      let correctionName: string | null = null;
-      const add = (sql: string, binds: readonly unknown[], correction = false): void => {
-        const name = `plan_source_${sources.length}`;
-        sources.push(`${name} AS MATERIALIZED (${shiftParameters(sql, values.length)})`);
-        values.push(...binds);
-        const firstFilter = correction
-          ? `observed_at_ms::bigint<${(firstThrough + 1) * DAY_MS}::bigint`
-          : `observed_day<=${firstThrough}::integer`;
-        firsts.push(`SELECT 'first'::text AS kind,${firsts.length}::integer AS ordinal,
-          min(observed_day)::integer AS observed_day,NULL::text AS occurrences,NULL::text AS start_occurrences
-          FROM ${name} WHERE ${firstFilter}`);
-        if (correction) correctionName = name;
-      };
-      if (scope.v1Namespace !== null || scope.v11Namespace !== null) {
-        add(legacyCandidatesSql(s), [options.ownerDigest, scope.participantId, STREAM_CODES[stream], stream,
-          FIRST_EVIDENCE_FLOOR_DAY_NUMBER, throughDay]);
-      }
-      if (scope.v12HeadActive) {
-        add(v12CandidatesSql(s), [scope.participantId, stream, now,
-          dayFromNumber(FIRST_EVIDENCE_FLOOR_DAY_NUMBER), dayFromNumber(throughDay)]);
-      }
-      if (stream === "usage" && scope.correctionActive) {
-        add(correctionCandidatesSql(s).replace("min(h.event_time_ms)::text AS observed_at_ms",
-          "min(h.event_time_ms)::text AS observed_at_ms,max(h.event_time_ms)::text AS latest_event_at_ms"),
-          [options.ownerDigest, FIRST_EVIDENCE_FLOOR_DAY_NUMBER * DAY_MS,
-          (throughDay + 1) * DAY_MS], true);
-      }
-      const counts = new Map<AnalyticsV2Day, number>();
-      const boundaryDays = new Set<number>();
-      let first: number | null = null;
-      let countRows: readonly Record<string, unknown>[] = [];
-      if (sources.length > 0) {
-        const candidates = sources.map((_, index) => {
-          const name = `plan_source_${index}`;
-          const regular = name === correctionName
-            ? `latest_event_at_ms::bigint>=observed_day::bigint*${DAY_MS}` : "true";
-          return `SELECT observed_day,occurrence_id,${regular} AS regular FROM ${name}`;
-        });
-        // Negative non-midnight corrections select by floor(event day), but
-        // div() names the following day. Only these can cross a count chunk's
-        // upper bound. min(event time) preserves their existence per group.
-        const boundary = correctionName === null ? [] : [`SELECT 'boundary'::text AS kind,0::integer AS ordinal,
-          observed_day,NULL::text AS occurrences,NULL::text AS start_occurrences FROM ${correctionName}
-          WHERE observed_at_ms::bigint<0 AND mod(observed_at_ms::bigint,${DAY_MS})<>0`];
-        const result = await client.query<Record<string, unknown>>(analyticsV2Statement("occurrences.counts",
-          `WITH ${sources.join(",\n")}, plan_coordinates AS (${candidates.join("\nUNION ALL\n")}),
-           plan_candidates AS (SELECT observed_day,occurrence_id,bool_or(regular) AS regular
-             FROM plan_coordinates GROUP BY observed_day,occurrence_id)
-           ${[...firsts, `SELECT 'count'::text AS kind,0::integer AS ordinal,observed_day,
-             count(*)::text AS occurrences,count(*) FILTER (WHERE regular)::text AS start_occurrences
-             FROM plan_candidates GROUP BY observed_day`, ...boundary].join("\nUNION ALL\n")}
-           ORDER BY kind,ordinal,observed_day`), values);
-        // The old first-evidence reader validates each source minimum, even
-        // if an earlier source already supplied a smaller, valid minimum.
-        for (const row of result.rows.filter((row) => row.kind === "first")) {
-          if (row.observed_day === null) continue;
-          const day = safeInteger(row.observed_day, FIRST_EVIDENCE_FLOOR_DAY_NUMBER, firstThrough);
-          if (first === null || day < first) first = day;
-        }
-        countRows = Object.freeze(result.rows.filter((row) => row.kind === "count"));
-        for (const row of countRows) {
-          // Do not surface count-derived refusals before the job's range
-          // checkpoint. The exact raw aggregate is validated per chunk below.
-          const day = Number(row.observed_day);
-          if (Number.isSafeInteger(day) && day >= fromDay && day <= throughDay
-              && day >= FIRST_EVIDENCE_FLOOR_DAY_NUMBER && day <= 100_000) {
-            const count = Number(row.occurrences);
-            if (Number.isSafeInteger(count) && count > 0) counts.set(dayFromNumber(day), count);
-          }
-        }
-        for (const row of result.rows.filter((row) => row.kind === "boundary")) {
-          const day = Number(row.observed_day);
-          if (Number.isSafeInteger(day)) boundaryDays.add(day);
-        }
-      }
-      rowsByStream.set(stream, countRows);
-      boundaries.set(stream, boundaryDays);
-      plan.set(stream, Object.freeze({ counts: Object.freeze(counts),
-        firstEvidenceDay: first === null ? null : dayFromNumber(first) }));
-    }
-    evidencePlanProofs.set(plan, Object.freeze({ ownerDigest: options.ownerDigest, fromDay, throughDay,
-      pool: context.pool, schema: context.schema, nowMs: context.nowMs, client: context.client,
-      rows: rowsByStream, correctionBoundaries: boundaries }));
-    return Object.freeze(plan);
-  });
-}
-
-/**
- * Restrict a plan to exactly one old-reader chunk, including its negative
- * correction refusal. Below FLOOR or outside the plan's domain use the old
- * bounded reader; those reads must not widen first-evidence selection.
- */
-export async function countOwnerEvidencePlanRange(
-  context: AnalyticsV2SnapshotContext,
-  plan: AnalyticsV2OwnerEvidencePlan,
-  options: Omit<ReadOwnerOccurrencesOptions, "maxCandidates">,
-): Promise<Map<AnalyticsV2Day, number>> {
-  const normalized = normalizeOptions(options as ReadOwnerOccurrencesOptions);
-  const proof = evidencePlanProofs.get(plan);
-  if (proof === undefined || proof.ownerDigest !== normalized.ownerDigest || !plan.has(normalized.stream)
-      || proof.pool !== context.pool || proof.schema !== context.schema || proof.nowMs !== context.nowMs
-      || proof.client !== context.client) {
-    return sourceFail("ANALYTICS_V2_SOURCE_INVALID");
-  }
-  if (normalized.fromDay < proof.fromDay || normalized.throughDay > proof.throughDay) {
-    return countOwnerOccurrences(context, options);
-  }
-  if (proof.correctionBoundaries.get(normalized.stream)?.has(normalized.throughDay + 1)) {
-    sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-  }
-  const counts = new Map<AnalyticsV2Day, number>();
-  for (const row of proof.rows.get(normalized.stream) ?? []) {
-    const coordinate = Number(row.observed_day);
-    // A normal candidate is in this chunk by observed day. A correction
-    // can only additionally name throughDay+1, checked just above.
-    if (coordinate < normalized.fromDay || coordinate > normalized.throughDay) continue;
-    const day = safeInteger(row.observed_day, FIRST_EVIDENCE_FLOOR_DAY_NUMBER, 100_000);
-    const count = safeInteger(day === normalized.fromDay ? row.start_occurrences : row.occurrences);
-    if (count > 0) counts.set(dayFromNumber(day), count);
-  }
-  return counts;
 }
 
 // ---------------------------------------------------------------------------
