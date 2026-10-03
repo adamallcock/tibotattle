@@ -79,6 +79,7 @@ export const TELEMETRY_PRODUCTION_ERROR_CODES = Object.freeze([
   "CUTOVER_CHUNK_REGISTRATION_MISMATCH",
   "CUTOVER_COLUMN_UNMAPPED",
   "CUTOVER_CORRECTION_CAS_GUARD_PRESENT",
+  "CUTOVER_CORRECTION_OWNER_NOT_ACTIVE",
   "CUTOVER_ERASED_OWNER_EVIDENCE_PRESENT",
   "CUTOVER_IMPORT_ORDER_INVALID",
   "CUTOVER_JOURNAL_SOURCE_INVALID",
@@ -169,9 +170,8 @@ const PG_TYPES = Object.freeze({
   json: Object.freeze(["jsonb"]),
 });
 const INT_BOUNDS = Object.freeze({ i16: [-32_768n, 32_767n], i32: [-2_147_483_648n, 2_147_483_647n] });
-const TARGET_KEY_CASTS = Object.freeze({
-  text: "text", i16: "bigint", i32: "bigint", i64: "bigint", day: "date", instant: "timestamptz", bytes: "bytea",
-});
+// Key column types whose PostgreSQL order equals the sealed (SQLite) order: text under COLLATE "C", integers, bytes bytewise, instants, days.
+const ORDERED_KEY_TYPES = Object.freeze(["text", "i16", "i32", "i64", "day", "instant", "bytes"]);
 
 export function col(name, type, options = {}) {
   if (!IDENTIFIER.test(name) || !Object.hasOwn(PG_TYPES, type)) throw new TypeError("telemetry production column invalid");
@@ -553,48 +553,49 @@ async function targetCount(client, schema, table, restrict = null) {
   return Number(rows[0].n);
 }
 
+let scanCounter = 0;
+
 /**
- * Digest of the target rows in the sealed key order, read in keyset pages:
- * text keys compare under COLLATE "C", SQLite's BINARY order for UTF-8.
- * `restrict` limits the scan to the sealed keys of a merged seed.
+ * Digest of the target rows in the sealed key order: text keys compare under
+ * COLLATE "C", SQLite's BINARY order for UTF-8. `restrict` limits the scan to
+ * the sealed keys of a merged seed.
+ *
+ * The rows come from one server-side cursor, so the table is ordered once and
+ * read in pages of FETCH. Keyset pages (`WHERE key > $last ORDER BY key LIMIT
+ * n`) cannot use a primary-key index under an explicit COLLATE "C", on any
+ * database, because the planner matches the index's collation by identity: each
+ * page re-scans and re-sorts the rest of the table, so the cost grows with the
+ * square of the row count. It must run inside a transaction (the callers
+ * already do); a cursor needs one, and a failure outside one is a refusal.
  */
 export async function targetTableFacts(client, schema, spec, { restrict = null } = {}) {
   const pageRows = spec.large ? TELEMETRY_PRODUCTION_LARGE_TARGET_PAGE_ROWS : TELEMETRY_PRODUCTION_TARGET_PAGE_ROWS;
   const keys = keyColumns(spec);
-  if (keys.some(column => !Object.hasOwn(TARGET_KEY_CASTS, column.type))) fail("CUTOVER_TELEMETRY_ARGUMENT_INVALID");
+  if (keys.some(column => !ORDERED_KEY_TYPES.includes(column.type))) fail("CUTOVER_TELEMETRY_ARGUMENT_INVALID");
   const collate = column => (column.type === "text" ? ` COLLATE "C"` : "");
-  const list = [
-    ...spec.columns.map(column => `${targetColumnExpression(column)} AS ${quote(column.name)}`),
-    ...keys.map((column, index) => `${targetColumnExpression(column)} AS "__key_${index}"`),
-  ].join(", ");
+  const list = spec.columns.map(column => `${targetColumnExpression(column)} AS ${quote(column.name)}`).join(", ");
   // Qualified by the row alias: an unqualified ORDER BY name would match the
   // output alias first (a text projection), sorting integer keys as text.
   const order = keys.map(column => `target_row.${quote(column.name)}${collate(column)}`).join(", ");
-  const restriction = restrict === null ? [] : [restrict.sql];
-  const restrictionValues = restrict === null ? [] : restrict.values;
-  const placeholder = (column, index) => (column.type === "bytes" ? `decode($${index}::text, 'hex')`
-    : `$${index}::${TARGET_KEY_CASTS[column.type]}${collate(column)}`);
+  const where = restrict === null ? "" : ` WHERE ${restrict.sql}`;
+  const cursor = `telemetry_digest_scan_${scanCounter}`;
+  scanCounter = (scanCounter + 1) % 1_000_000;
   const digest = createRowsDigest();
   let rows = 0;
-  let after = null;
-  for (;;) {
-    const conditions = [...restriction];
-    const values = [...restrictionValues];
-    if (after !== null) {
-      const marks = keys.map((column, index) => placeholder(column, values.length + index + 1));
-      conditions.push(`(${keys.map(column => `target_row.${quote(column.name)}${collate(column)}`).join(", ")}) > (${marks.join(", ")})`);
-      values.push(...after);
+  await q(client, `DECLARE ${cursor} NO SCROLL CURSOR FOR SELECT ${list} FROM ${quote(schema)}.${quote(spec.target)} target_row${where}
+    ORDER BY ${order}`, restrict === null ? [] : [...restrict.values], spec.target);
+  try {
+    for (;;) {
+      const result = await q(client, `FETCH FORWARD ${pageRows} FROM ${cursor}`, [], spec.target);
+      for (const row of result.rows) {
+        digest.update(spec.columns.map(column => canonicalTargetValue(column, row[column.name], spec.target)));
+        rows += 1;
+      }
+      if (result.rows.length < pageRows) break;
     }
-    const where = conditions.length === 0 ? "" : ` WHERE ${conditions.join(" AND ")}`;
-    const result = await q(client, `SELECT ${list} FROM ${quote(schema)}.${quote(spec.target)} target_row${where}
-      ORDER BY ${order} LIMIT ${pageRows}`, values, spec.target);
-    for (const row of result.rows) {
-      digest.update(spec.columns.map(column => canonicalTargetValue(column, row[column.name], spec.target)));
-      rows += 1;
-    }
-    if (result.rows.length < pageRows) break;
-    const last = result.rows.at(-1);
-    after = keys.map((_, index) => last[`__key_${index}`]);
+  } finally {
+    // After a failure the transaction is already aborted and the cursor with it.
+    await client.query(`CLOSE ${cursor}`).catch(() => {});
   }
   return { rows, sha256: digest.digest() };
 }

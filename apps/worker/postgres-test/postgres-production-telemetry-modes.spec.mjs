@@ -51,6 +51,9 @@ import {
   SYNTHETIC_IDENTITY_LINK_VERSION,
   identityLinkFingerprint,
 } from "./fixtures/w2-seal/synthetic-sources.mjs";
+import { correctionHistorySql } from "./fixtures/w2-seal/correction-history.mjs";
+import { localSocket } from "./fixtures/w2-seal/pg-target.mjs";
+import { col, defineTable, sourceTableFacts, targetTableFacts } from "../scripts/postgres-production-telemetry-engine.mjs";
 
 // D-PT5A acceptance on PostgreSQL 17: the eight telemetry stages in PT-1
 // production target mode over a synthetic PT-2-lite seal of the Q-1 corpus,
@@ -830,7 +833,9 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A production stages equal the reviewed re
   let cluster;
   let handle;
   let scratch;
-  // The rehearsal importers validate the schema names' prefixes, so these two disposable names cannot carry the stream id.
+  // The chain runs in a database of its own named for this stream. Only the two schema names inside it cannot carry the
+  // stream id: the rehearsal importers validate their prefixes.
+  const scratchDatabase = `d_pt5a_rehearsal_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const rehearsal = `typed_legacy_transfer_rehearsal_target_fastpath_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const control = `typed_legacy_transfer_rehearsal_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
 
@@ -849,10 +854,18 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A production stages equal the reviewed re
     await runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath, identityLinkPin: PIN });
     for (const stage of TELEMETRY_PRODUCTION_STAGES) await TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: manifestPath });
 
-    // The rehearsal chain over the same sealed file, in a disposable schema of the cluster's default database (the
-    // production control schema is global to a database, so the rehearsal cannot share the target's).
+    // The rehearsal chain over the same sealed file, in a disposable database (the production control schema is global to
+    // a database, so the rehearsal cannot share the target's, and no other suite shares this one).
+    const creator = new pg.Client({ host: cluster.endpoint.host, port: cluster.endpoint.port, user: PG_TEST_USER,
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false });
+    await creator.connect();
+    try {
+      await creator.query(`CREATE DATABASE "${scratchDatabase}"`);
+    } finally {
+      await creator.end();
+    }
     scratch = new pg.Pool({ host: cluster.endpoint.host, port: cluster.endpoint.port, user: PG_TEST_USER, password: PG_TEST_PASSWORD,
-      database: PG_TEST_DATABASE, max: 3, ssl: false });
+      database: scratchDatabase, max: 3, ssl: false });
     scratch.on("error", () => {});
     const pool = scratch;
     await pool.query(`CREATE SCHEMA ${rehearsal}`);
@@ -905,9 +918,19 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A production stages equal the reviewed re
   }
 
   afterAll(async () => {
-    await scratch?.query(`DROP SCHEMA IF EXISTS ${rehearsal} CASCADE`).catch(() => {});
-    await scratch?.query(`DROP SCHEMA IF EXISTS ${control} CASCADE`).catch(() => {});
     await scratch?.end().catch(() => {});
+    if (cluster !== undefined) {
+      const dropper = new pg.Client({ host: cluster.endpoint.host, port: cluster.endpoint.port, user: PG_TEST_USER,
+        password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false });
+      try {
+        await dropper.connect();
+        await dropper.query(`DROP DATABASE IF EXISTS "${scratchDatabase}" WITH (FORCE)`);
+      } catch {
+        // The database is disposable; a failed drop leaves only the stream-prefixed name for the next cleanup.
+      } finally {
+        await dropper.end().catch(() => {});
+      }
+    }
     await cluster?.dispose();
     await world?.dispose();
   });
@@ -942,5 +965,244 @@ describe.skipIf(!PG_TEST_SOCKET)("D-PT5A production stages equal the reviewed re
     const reference = await digests(scratch, rehearsal, shared);
     for (const name of shared) expect(production[name], name).toEqual(reference[name]);
     expect(Object.values(production).reduce((sum, item) => sum + item.n, 0)).toBeGreaterThan(40_000);
+  }, 900_000);
+});
+
+// A withdrawn owner's correction history. D1 keeps history when an owner withdraws and deletes it only on erasure, so a sealed
+// state can hold it; PostgreSQL's insert guards (primary 0034) admit history only for an active participant with an active
+// owner link, which would have refused the page after the runtime page committed. The stage refuses it in the sealed-side
+// preflight instead, with a closed code, before it writes anything.
+describe.skipIf(!PG_TEST_SOCKET)("D-PT5A usage-correction refuses a withdrawn owner's history before it writes", () => {
+  let world;
+  let forged;
+  let cluster;
+
+  beforeAll(async () => {
+    world = await prepareSealWorld({ commit: headCommit(WORKER_ROOT) });
+    const run = await sealWorld(world);
+    const result = await run.run();
+    const seal = await readCutoverSeal({ manifestPath: outputPathsOf(run.out).manifest, expectedSealId: result.sealId });
+    const base = new DatabaseSync(seal.sources.ingestion.path, { readOnly: true });
+    let sql;
+    try {
+      const owner = base.prepare(`SELECT membership.participant_id AS participant_id, membership.typed_owner_id AS owner, link.owner_digest AS digest
+        FROM typed_v1_owner_memberships membership JOIN storage_v11_owner_links link ON link.participant_id = membership.participant_id
+        WHERE link.state = 'active' ORDER BY membership.participant_id LIMIT 1`).get();
+      const triggers = base.prepare(`SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name IN
+        ('storage_v11_owner_links', 'telemetry_usage_correction_history', 'telemetry_usage_correction_facts')`)
+        .all().map(row => `DROP TRIGGER IF EXISTS "${row.name}";`).join("\n");
+      sql = `PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;
+        ${triggers}
+        UPDATE storage_v11_owner_links SET state = 'withdrawn' WHERE participant_id = '${owner.participant_id}';
+        ${correctionHistorySql({ participantId: owner.participant_id, ownerDigestHex: owner.digest, ownerId: Number(owner.owner) })}`;
+    } finally {
+      base.close();
+    }
+    forged = await forgeVariantSeal(seal, sql);
+    cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 1, label: "ptfivewd" });
+  }, 900_000);
+
+  afterAll(async () => {
+    await cluster?.dispose();
+    await world?.dispose();
+  });
+
+  it("imports every earlier stage, then refuses the stage with the closed code and writes nothing for it", async () => {
+    const target = cluster.targets[0];
+    const pool = target.ownerPrimary;
+    const handle = await target.open(forged.sealId);
+    await beginRun(handle, { sealedAt: forged.sealedAt });
+    await advanceRun(handle, "importing");
+    await runIdentityAuthorityTransfer({ handle, sealManifestPath: forged.manifestPath, identityLinkPin: PIN });
+    for (const stage of TELEMETRY_PRODUCTION_STAGES.slice(0, TELEMETRY_PRODUCTION_STAGES.indexOf("usage-correction"))) {
+      await TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: forged.manifestPath });
+      expect(await stageState(pool, stage), stage).toBe("complete");
+    }
+    const link = await pool.query(`SELECT state FROM ${table("storage_v11_owner_links")} WHERE state = 'withdrawn'`);
+    expect(link.rows).toHaveLength(1);
+    await expect(TELEMETRY_PRODUCTION_RUNNERS["usage-correction"]({ handle, sealManifestPath: forged.manifestPath }))
+      .rejects.toSatisfy(refusal("CUTOVER_CORRECTION_OWNER_NOT_ACTIVE", { table: "telemetry_usage_correction_history" }));
+    // Refused before the stage started: no receipt, no checkpoint, no table receipt, and not a row of its evidence tables.
+    expect(await stageState(pool, "usage-correction")).toBeNull();
+    for (const name of ["telemetry_usage_correction_runtime", "telemetry_usage_correction_history", "telemetry_usage_correction_facts"]) {
+      expect(await checkpointOf(pool, `table:${name}`), name).toBeNull();
+      expect(await tableReceiptState(pool, name), name).toBeNull();
+    }
+    expect(await count(pool, "telemetry_usage_correction_history")).toBe(0);
+    expect(await count(pool, "telemetry_usage_correction_facts")).toBe(0);
+    await abandonRun(handle);
+  }, 600_000);
+});
+
+// The target digest of every stage table is read in the sealed key order (text keys under COLLATE "C", SQLite's BINARY order).
+// An explicit COLLATE "C" cannot use a primary-key index, whatever the database's collation, so the scan reads the table
+// through one server-side cursor instead of keyset pages that each re-sort the rest of the table. These cases run on a database
+// whose default collation is not C, where the default order and the sealed order differ, and need the en_US.UTF-8 locale.
+describe.skipIf(!PG_TEST_SOCKET)("D-PT5A target digest scans follow the sealed key order on a database with a non-C collation", () => {
+  const databaseName = `d_pt5a_scan_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const TEXT_SPEC = defineTable({ name: "scan_text", key: ["id"], columns: [col("id", "text"), col("n", "i64")], receipt: false });
+  const FILTERED_SPEC = defineTable({ name: "scan_text", key: ["id"], columns: [col("id", "text"), col("n", "i64")], receipt: false,
+    where: "\"n\" >= 1000" });
+  const PAIR_SPEC = defineTable({ name: "scan_pair", key: ["source_id", "sequence"],
+    columns: [col("source_id", "text"), col("sequence", "i64"), col("label", "text")], receipt: false });
+  const LARGE_SPEC = defineTable({ name: "scan_large", key: ["id"], columns: [col("id", "text"), col("body", "text")], receipt: false, large: true });
+  // Keys whose order differs between en_US.UTF-8 and bytes: case, punctuation, accents, combining marks, astral and U+FFFF.
+  const SPECIAL = ["a", "B", "b", "A", "_x", "-x", "x_y", "x-y", "x y", "Z9", "z9", "é", "e", "f", "\u{1F600}", "￿", "ab", "aB",
+    "Ab", "AB", "0", "00", "1", "10", "2", "éa", "é"];
+  const KEYS = [...new Set([...SPECIAL, ...Array.from({ length: 4500 }, (_, i) =>
+    `${["ID", "id", "Id"][i % 3]}-${(i * 7919).toString(36)}`)])];
+  let admin;
+  let client;
+  let sqlite;
+  let available = false;
+
+  beforeAll(async () => {
+    const endpoint = await localSocket(PG_TEST_SOCKET, PG_TEST_PORT);
+    const config = { ...endpoint, user: PG_TEST_USER, password: PG_TEST_PASSWORD, ssl: false };
+    admin = new pg.Client({ ...config, database: PG_TEST_DATABASE });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE DATABASE "${databaseName}" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8' LC_CTYPE 'en_US.UTF-8'`);
+    } catch (error) {
+      if (!/locale/iu.test(String(error?.message))) throw error;
+      return;
+    }
+    available = true;
+    client = new pg.Client({ ...config, database: databaseName });
+    await client.connect();
+    sqlite = new DatabaseSync(":memory:");
+    sqlite.exec(`CREATE TABLE scan_text (id TEXT PRIMARY KEY, n INTEGER NOT NULL);
+      CREATE TABLE scan_pair (source_id TEXT NOT NULL, sequence INTEGER NOT NULL, label TEXT NOT NULL, PRIMARY KEY (source_id, sequence));
+      CREATE TABLE scan_large (id TEXT PRIMARY KEY, body TEXT NOT NULL);`);
+    await client.query(`CREATE SCHEMA scan_probe;
+      CREATE TABLE scan_probe.scan_text (id text PRIMARY KEY, n bigint NOT NULL);
+      CREATE TABLE scan_probe.scan_pair (source_id text NOT NULL, sequence bigint NOT NULL, label text NOT NULL, PRIMARY KEY (source_id, sequence));
+      CREATE TABLE scan_probe.scan_large (id text PRIMARY KEY, body text NOT NULL)`);
+    const pairs = [];
+    for (const [index, key] of SPECIAL.entries()) for (const sequence of [1, 2, 10]) pairs.push([key, sequence, `label-${index}-${sequence}`]);
+    const large = KEYS.slice(0, 260).map((key, index) => [key, `body-${index}`.repeat(20)]);
+    const insert = sqlite.prepare("INSERT INTO scan_text(id, n) VALUES (?, ?)");
+    for (const [index, key] of KEYS.entries()) insert.run(key, BigInt(index));
+    const insertPair = sqlite.prepare("INSERT INTO scan_pair(source_id, sequence, label) VALUES (?, ?, ?)");
+    for (const [key, sequence, label] of pairs) insertPair.run(key, BigInt(sequence), label);
+    const insertLarge = sqlite.prepare("INSERT INTO scan_large(id, body) VALUES (?, ?)");
+    for (const [key, body] of large) insertLarge.run(key, body);
+    await client.query("INSERT INTO scan_probe.scan_text SELECT * FROM unnest($1::text[], $2::bigint[])", [KEYS, KEYS.map((_, index) => index)]);
+    await client.query("INSERT INTO scan_probe.scan_pair SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[])",
+      [pairs.map(row => row[0]), pairs.map(row => row[1]), pairs.map(row => row[2])]);
+    await client.query("INSERT INTO scan_probe.scan_large SELECT * FROM unnest($1::text[], $2::text[])", [large.map(row => row[0]), large.map(row => row[1])]);
+    await client.query("ANALYZE");
+  }, 120_000);
+
+  afterAll(async () => {
+    sqlite?.close();
+    await client?.end().catch(() => {});
+    await admin?.query(`DROP DATABASE IF EXISTS "${databaseName}" WITH (FORCE)`).catch(() => {});
+    await admin?.end().catch(() => {});
+  });
+
+  async function inTransaction(fn) {
+    await client.query("BEGIN READ ONLY");
+    try {
+      return await fn();
+    } finally {
+      await client.query("ROLLBACK");
+    }
+  }
+
+  it("is a database whose default order differs from the sealed order", async (context) => {
+    if (!available) return context.skip();
+    const orders = await client.query(`SELECT (SELECT array_agg(id ORDER BY id) FROM scan_probe.scan_text) AS default_order,
+      (SELECT array_agg(id ORDER BY id COLLATE "C") FROM scan_probe.scan_text) AS c_order,
+      (SELECT datcollate FROM pg_database WHERE datname = current_database()) AS collation`);
+    expect(orders.rows[0].collation).toBe("en_US.UTF-8");
+    expect(orders.rows[0].default_order).not.toEqual(orders.rows[0].c_order);
+    // The sealed order is SQLite's BINARY order, which is the bytes' order and the C order.
+    const sealedOrder = sqlite.prepare("SELECT id FROM scan_text ORDER BY id").all().map(row => row.id);
+    expect(sealedOrder).toEqual(orders.rows[0].c_order);
+  });
+
+  it("digests text, composite and large-row tables to the sealed digest across many cursor pages", async (context) => {
+    if (!available) return context.skip();
+    for (const [spec, expectedRows] of [[TEXT_SPEC, KEYS.length], [PAIR_SPEC, SPECIAL.length * 3], [LARGE_SPEC, 260]]) {
+      const sealed = sourceTableFacts(sqlite, spec, 256);
+      const target = await inTransaction(() => targetTableFacts(client, "scan_probe", spec));
+      expect(sealed.rows, spec.name).toBe(expectedRows);
+      expect(target, spec.name).toEqual({ rows: sealed.rows, sha256: sealed.sha256 });
+    }
+    expect(KEYS.length).toBeGreaterThan(2 * 2000);
+  });
+
+  it("restricts the scan, reads two tables in one transaction, and refuses closed outside a transaction or for a missing table", async (context) => {
+    if (!available) return context.skip();
+    const sealed = sourceTableFacts(sqlite, FILTERED_SPEC, 256);
+    expect(sealed.rows).toBe(KEYS.length - 1000);
+    await inTransaction(async () => {
+      expect(await targetTableFacts(client, "scan_probe", TEXT_SPEC, { restrict: { sql: "\"n\" >= $1::bigint", values: [1000] } }))
+        .toEqual({ rows: sealed.rows, sha256: sealed.sha256 });
+      // A second scan in the same transaction (cursor names are unique and the first is closed).
+      expect((await targetTableFacts(client, "scan_probe", PAIR_SPEC)).rows).toBe(SPECIAL.length * 3);
+    });
+    await expect(targetTableFacts(client, "scan_probe", TEXT_SPEC)).rejects.toSatisfy(refusal("CUTOVER_TARGET_WRITE_REFUSED",
+      { table: "scan_text", sqlState: "25P01" }));
+    const missing = defineTable({ name: "scan_missing", key: ["id"], columns: [col("id", "text")], receipt: false });
+    await expect(inTransaction(() => targetTableFacts(client, "scan_probe", missing))).rejects.toSatisfy(refusal(
+      "CUTOVER_TARGET_WRITE_REFUSED", { table: "scan_missing", sqlState: "42P01" }));
+  });
+});
+
+// The production database is created without a collation flag (gcp-ops-infra-operations.mjs), so it takes Cloud SQL's default,
+// documented as en_US.UTF8 and not read from a live instance here. The stages must import the same rows and write the same
+// receipts on such a database as on a C database, from the same sealed file.
+describe.skipIf(!PG_TEST_SOCKET)("D-PT5A stages on a database created with the en_US.UTF-8 collation equal the C database", () => {
+  let world;
+  let seal;
+  let manifestPath;
+  let cluster;
+  let usable = false;
+
+  beforeAll(async () => {
+    world = await prepareSealWorld({ commit: headCommit(WORKER_ROOT) });
+    const run = await sealWorld(world);
+    const result = await run.run();
+    manifestPath = outputPathsOf(run.out).manifest;
+    seal = await readCutoverSeal({ manifestPath, expectedSealId: result.sealId });
+    try {
+      cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
+        password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 2, label: "ptfivenc", collations: [null, "en_US.UTF-8"] });
+      usable = true;
+    } catch (error) {
+      if (!/locale/iu.test(String(error?.message))) throw error;
+    }
+  }, 900_000);
+
+  afterAll(async () => {
+    await cluster?.dispose();
+    await world?.dispose();
+  });
+
+  it("imports the same rows and writes the same stage receipts as the C database", async (context) => {
+    if (!usable) return context.skip();
+    const receipts = [];
+    for (const target of cluster.targets) {
+      const collation = (await target.ownerPrimary.query("SELECT datcollate FROM pg_database WHERE datname = current_database()")).rows[0].datcollate;
+      expect(collation, `target ${target.index}`).toBe(target.index === 0 ? "C" : "en_US.UTF-8");
+      const handle = await target.open(seal.manifest.sealId);
+      await beginRun(handle, { sealedAt: seal.manifest.createdAt });
+      await advanceRun(handle, "importing");
+      await runIdentityAuthorityTransfer({ handle, sealManifestPath: manifestPath, identityLinkPin: PIN });
+      const stages = {};
+      for (const stage of TELEMETRY_PRODUCTION_STAGES) {
+        const result = await TELEMETRY_PRODUCTION_RUNNERS[stage]({ handle, sealManifestPath: manifestPath });
+        stages[stage] = { receiptSha256: result.receiptSha256, tables: Object.fromEntries(Object.entries(result.tables)
+          .map(([name, facts]) => [name, [facts.sourceRows, facts.targetRows, facts.sha256]])) };
+        expect(await stageState(target.ownerPrimary, stage), stage).toBe("complete");
+      }
+      receipts.push({ stages, rows: await tableTextDigests(target.ownerPrimary, OWNED_TARGETS), handle });
+    }
+    expect(receipts[1].stages).toEqual(receipts[0].stages);
+    expect(receipts[1].rows).toEqual(receipts[0].rows);
+    for (const { handle } of receipts) await abandonRun(handle);
   }, 900_000);
 });

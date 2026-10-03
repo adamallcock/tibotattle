@@ -416,10 +416,11 @@ list on the deploy line governs.
    `usage-correction` and `ingestion-journal`. Each refuses on the sealed side
    before it touches the target (column closure, an unrepresentable value, a
    broken sealed foreign key, an erased owner link, a participant that is not
-   `active`), checks its prerequisites and trigger policy on the target, and
-   verifies a count and a canonical digest per table against the seal.
-   Nothing here has run against a real seal. The orchestrator that sequences
-   all stages (E-PT8) is `not built`:
+   `active`, usage-correction history whose participant or owner link is not
+   `active` (`CUTOVER_CORRECTION_OWNER_NOT_ACTIVE`)), checks its prerequisites
+   and trigger policy on the target, and verifies a count and a canonical
+   digest per table against the seal. Nothing here has run against a real
+   seal. The orchestrator that sequences all stages (E-PT8) is `not built`:
    `<command: E-PT8 orchestrator, one disposition per sealed table>`.
 2. **Check the orchestrator's dispositions and refusals.** One disposition per
    sealed table, the deletion-digest exclusion count, the identity-pin

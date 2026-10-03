@@ -191,18 +191,20 @@ async function loadModules() {
     logLevel: "silent",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  const [registry, policy, contract, composition, session, codec, constants, subrequest, readiness] = await Promise.all([
-    load("/src/route-registry.ts"),
-    load("/src/edge-admission-policy.ts"),
-    load("/src/edge-origin-contract.ts"),
-    load("/src/backend-composition.ts"),
-    load("/src/session.ts"),
-    load("/src/typed-telemetry-codec.ts"),
-    load("/src/constants.ts"),
-    load("/src/edge-google-subrequest.ts"),
-    load("/src/postgres-readiness-contract.ts"),
-  ]);
-  return { registry, policy, contract, composition, session, codec, constants, subrequest, readiness };
+  const [registry, policy, contract, composition, session, codec, constants, subrequest, readiness, ingressBudget] =
+    await Promise.all([
+      load("/src/route-registry.ts"),
+      load("/src/edge-admission-policy.ts"),
+      load("/src/edge-origin-contract.ts"),
+      load("/src/backend-composition.ts"),
+      load("/src/session.ts"),
+      load("/src/typed-telemetry-codec.ts"),
+      load("/src/constants.ts"),
+      load("/src/edge-google-subrequest.ts"),
+      load("/src/postgres-readiness-contract.ts"),
+      load("/src/postgres-ingress-budget.ts"),
+    ]);
+  return { registry, policy, contract, composition, session, codec, constants, subrequest, readiness, ingressBudget };
 }
 
 async function localSocket() {
@@ -2033,22 +2035,69 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   // (a Durable Object: 1200 starts per minute, burst 1200) refuses before its
   // 3000/60 address limiters can, and the origin now takes the same shared
   // lease over its PostgreSQL budget with the same values (D-CRB), so it
-  // refuses there too. The first 1000 pairs are compared; past the budget the
-  // origin answers the budget's 429 as the Worker would; and the edge's own
-  // address limiter is checked alone: 3000 forwarded from one address (each
-  // admitted to the claim or refused by the shared budget) and the 3001st
-  // limited at the edge.
+  // refuses there too. The first 1000 pairs are compared with the Worker.
+  // The rest pins the origin's budget to its configured size through the
+  // budget's own accounting. The burst starts on a full budget (it waits for
+  // the refill first). From the first start on, each start takes one token
+  // and the configured rate refills startsPerMinute / 60 000 tokens per
+  // millisecond of the database clock the budget keeps, so after the burst
+  //   claims = burst - tokens left + rate * (last update - first start).
+  // The first start comes after the start reading, and within
+  // FIRST_START_ALLOWANCE_MS of it; claims outside the range that gives mean
+  // another burst size or rate. The burst must also outrun the refill, so
+  // the budget refuses, and every other request is the budget's 429. A
+  // missing, unlimited or wrongly sized budget fails. Then the edge's own
+  // address limiter is checked alone: 3000 forwarded from one address and
+  // the 3001st limited at the edge.
+  const ingressVars = await readSanitizedProductionVars(WORKER_ROOT);
+  const ingressBurst = Number(ingressVars.UPLOAD_INGRESS_BURST);
+  const startsPerMinute = Number(ingressVars.UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE);
+  assert.ok(Number.isSafeInteger(ingressBurst) && ingressBurst >= 1_000 && ingressBurst < limits.UPLOAD_INGRESS_CLIENT_RATE_LIMIT,
+    "the checked-in burst lies between the compared pairs and the address limit");
+  assert.ok(Number.isSafeInteger(startsPerMinute) && startsPerMinute > 0);
+  const budgetName = f.m.ingressBudget.POSTGRES_UPLOAD_INGRESS_BUDGET_NAME;
+  /** The budget's start tokens now (its own refill rule, capped at the burst) and the database clock. */
+  const ingressBudgetNow = async () => {
+    const clock = (await f.base.query(
+      "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::float8 AS now_ms")).rows[0].now_ms;
+    const row = (await f.base.query(`SELECT tokens::float8 AS tokens,
+        floor(extract(epoch FROM updated_at)*1000)::float8 AS updated_ms
+      FROM ${f.t("upload_ingress_budget_states")} WHERE budget_name=$1`, [budgetName])).rows[0];
+    // No row yet: the first acquire creates the budget full.
+    const tokens = row === undefined ? ingressBurst
+      : Math.min(ingressBurst, row.tokens + ((clock - row.updated_ms) * startsPerMinute) / 60_000);
+    return { tokens, nowMs: clock };
+  };
+  const beforeRefill = await ingressBudgetNow();
+  if (beforeRefill.tokens < ingressBurst) {
+    await sleep(Math.ceil(((ingressBurst - beforeRefill.tokens) * 60_000) / startsPerMinute) + 250);
+  }
   await windowWithRoom(WINDOW_MS);
+  const ingressStart = await ingressBudgetNow();
+  assert.equal(ingressStart.tokens, ingressBurst, "the burst starts on a full budget");
   const ingressIp = nextIp();
   const ingressRow = { ...byRoute("contributions"), id: "contributions at the production limit" };
   const answers = await burst(f, ingressRow, { ...pair, count: limits.UPLOAD_INGRESS_CLIENT_RATE_LIMIT, ip: ingressIp,
     compareFirst: 1_000 });
+  const ingressEnd = (await f.base.query(`SELECT tokens::float8 AS tokens,
+      floor(extract(epoch FROM updated_at)*1000)::float8 AS updated_ms
+    FROM ${f.t("upload_ingress_budget_states")} WHERE budget_name=$1`, [budgetName])).rows[0];
+  assert.ok(ingressEnd !== undefined, "the burst went through the origin's budget");
   const claimed = answers.filter(({ edgeAnswer }) => edgeAnswer.status === 401).length;
   const budgetRefused = answers.filter(({ edgeAnswer }) => edgeAnswer.status === 429
     && errorEnvelope(edgeAnswer)?.code === "UPLOAD_INGRESS_LIMIT_REACHED").length;
   assert.equal(claimed + budgetRefused, answers.length,
     "3000 forwarded: each admitted to the claim or refused by the shared ingress budget");
-  assert.ok(claimed >= 1_000, `the budget admits at least its first 1000 (${claimed})`);
+  assert.ok(budgetRefused >= 1, "the burst outran the budget's refill, so the budget refused");
+  const FIRST_START_ALLOWANCE_MS = 2_000;
+  const burstMs = ingressEnd.updated_ms - ingressStart.nowMs;
+  const tokensPerMs = startsPerMinute / 60_000;
+  const mostClaims = ingressBurst - ingressEnd.tokens + tokensPerMs * burstMs;
+  const leastClaims = mostClaims - tokensPerMs * FIRST_START_ALLOWANCE_MS;
+  // One start of slack either way for the budget's millisecond clock.
+  assert.ok(claimed <= Math.floor(mostClaims) + 1 && claimed >= Math.ceil(leastClaims) - 1,
+    `claimed ${claimed} in ${burstMs} ms: a ${ingressBurst} burst at ${startsPerMinute} a minute allows `
+    + `${leastClaims.toFixed(1)} to ${mostClaims.toFixed(1)}`);
   for (const [index, { edgeAnswer, referenceAnswer }] of answers.slice(0, 1_000).entries()) {
     assert.deepEqual(workerMismatches(edgeAnswer, referenceAnswer), [], `ingress pair ${index + 1}`);
   }
@@ -2057,7 +2106,8 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   assert.equal(errorEnvelope(over.edgeAnswer)?.code, "UPLOAD_INGRESS_LIMIT_REACHED");
   assert.equal(over.edgeAnswer.header("retry-after"), "60");
   assert.ok(admissionOf(over.exchanges)?.endsWith(";limited"));
-  f.rows.push({ stage: "S4", id: "ingress-production-edge", pairs: answers.length + 1, compared: 1_000 });
+  f.rows.push({ stage: "S4", id: "ingress-production-edge", pairs: answers.length + 1, compared: 1_000,
+    claimed, budgetRefused, burstMs });
 
   // F. Request-only refusals spend no budget, as in the Worker, where they come
   // before its limiter: from one address, more refused requests than the
