@@ -440,6 +440,11 @@ list on the deploy line governs.
    operational history (admin metric snapshots and
    `community_aggregate_exclusions`, mapped in R3 post-import) are `built`
    (D-PT4X; their tables are primary migrations `0066` and `0067`). The
+   post-import mapping requires the H.3 step 6 admin history export and its
+   sha256. It refuses without them (`CUTOVER_LEGACY_ARGUMENT_INVALID`), and
+   refuses an export taken for another seal, inventory, fence receipt or
+   source (`CUTOVER_ADMIN_HISTORY_EXPORT_MISMATCH`) before it touches the
+   target. The
    production modes of the telemetry importers (D-PT5A) are `built` as eight
    PT-1 stages in `postgres-production-telemetry-modes.mjs`:
    `telemetry-v1-v11`, `typed-legacy`, `legacy-admission`,
