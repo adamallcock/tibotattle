@@ -59,8 +59,8 @@
  * loaded; a staging target or a test target treats an absent floor as 0.
  * Before that check, a production FIRST run (no completed run row, or no
  * recorded journal cursor) refuses ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT
- * the same way when NEITHER the frozen interim read (C-IPR's row) NOR the
- * revision floor is loaded: a first run must start from some record of
+ * the same way when the frozen interim read (C-IPR's row) is absent, even if the
+ * revision floor is loaded: a first run must start from the frozen record of
  * Cloudflare's published history (R19 hardening (d), in addition to the H.4
  * flip gate's CUTOVER_INTERIM_READ_NOT_LOADED). Staging and test targets,
  * with or without a synthetic floor, are not gated.
@@ -434,8 +434,8 @@ POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
 --mode=full (the dense profile, inline, 4 h task timeout). A production target
 refuses ANALYTICS_V2_REVISION_FLOOR_ABSENT until the cutover import has loaded
 the revision floor, and a production first run refuses
-ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT when neither the frozen interim read
-nor the revision floor is loaded.
+ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT when the frozen interim read is absent,
+even if the revision floor is loaded.
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
@@ -1093,7 +1093,7 @@ function exclusionSummary(value) {
     changed: value.changed, republishedDays: value.republishedDays });
 }
 
-/** R19 hardening (d): the closed refusal of a production first run without any Cloudflare baseline. */
+/** R19 hardening (d): the closed refusal of a production first run without the frozen interim read. */
 export const ANALYTICS_REFRESH_FIRST_RUN_REFUSAL = "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT";
 
 /**
@@ -1111,14 +1111,14 @@ export function analyticsRefreshBaseline(state) {
 
 /**
  * The read-snapshot gates of a production target, in order (null when it may
- * run): a first run with neither the frozen interim read nor the revision
- * floor is ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT; any run without the floor
+ * run): a first run without the frozen interim read is
+ * ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT; any run without the floor
  * is ANALYTICS_V2_REVISION_FLOOR_ABSENT. Staging and test targets are never
  * gated here.
  */
 export function analyticsRefreshBaselineRefusal({ target, baseline, revisionFloor }) {
   if (target !== "production") return null;
-  if (baseline?.firstRun !== false && baseline?.frozenInterimRead !== true && revisionFloor?.present !== true) {
+  if (baseline?.firstRun !== false && baseline?.frozenInterimRead !== true) {
     return ANALYTICS_REFRESH_FIRST_RUN_REFUSAL;
   }
   if (revisionFloor?.present !== true) return "ANALYTICS_V2_REVISION_FLOOR_ABSENT";
@@ -1323,9 +1323,9 @@ export async function runAnalyticsRefresh({
       // REV-SEED: a production run publishes only above Cloudflare's last
       // revisions, so it refuses before any read or compute without the
       // floor the cutover import loads. R19 (d): a production first run also
-      // needs the frozen interim read or the floor, and refuses first when it
-      // has neither. Staging and test targets publish above whatever floor is
-      // stored, none being 0.
+      // needs the frozen interim read, and refuses first when it is absent
+      // even if the floor is loaded. Staging and test targets publish above
+      // whatever floor is stored, none being 0.
       const revisionFloor = revisionFloorSummary(state?.revisionFloor);
       base.revisionFloor = revisionFloor;
       const baseline = analyticsRefreshBaseline(state);

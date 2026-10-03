@@ -3946,13 +3946,24 @@ test("PG17: the production target path runs a full refresh on the real clock and
     assert.deepEqual(staged.baseline, { firstRun: true, frozenInterimRead: false });
     assert.deepEqual(staged.revisionFloor, { present: false, dayCount: 0, maxRevision: 0 });
     computed = 0;
-    // The floor alone is a baseline: the production first run publishes above it.
+    // A floor alone cannot replace the frozen interim read on a first production run.
     await loadSpecFloor(pool, schema, { [DAY_2]: 3 });
+    const floorOnlyUntouched = await analyticsSnapshot(pool, schema);
+    await assert.rejects(productionRun(), (error) => {
+      assert.equal(error.code, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT");
+      assert.equal(error.phase, "read");
+      return true;
+    });
+    assert.equal(computed, 0, "floor-only first run computed nothing");
+    assert.deepEqual(await analyticsSnapshot(pool, schema), floorOnlyUntouched);
+    assert.equal((await runRows(pool, schema)).length, 0);
+    // Both baselines are required; with the frozen read loaded, production publishes above the floor.
+    await loadInterimPublicRead({ pool, schema, prepared });
     databases.length = 0;
     const before = Date.now();
     const run = await productionRun();
     assert.equal(run.state, "complete");
-    assert.deepEqual(run.baseline, { firstRun: true, frozenInterimRead: false });
+    assert.deepEqual(run.baseline, { firstRun: true, frozenInterimRead: true });
     assert.deepEqual(run.revisionFloor, { present: true, dayCount: 1, maxRevision: 3 });
     assert.equal((await publishedRows(pool, schema)).get(DAY_2).revision, 4);
     assert.equal(run.target, "production");
@@ -3975,11 +3986,13 @@ test("R19 (d): the production baseline gates are closed and fail closed on a mal
     // [target, firstRun, frozenInterimRead, floor, refusal]
     ["production", true, false, noFloor, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT"],
     ["production", true, true, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
-    ["production", true, false, floor, null],
+    ["production", true, false, floor, "ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT"],
     ["production", true, true, floor, null],
     // A later run is gated by the floor only.
     ["production", false, false, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
     ["production", false, false, floor, null],
+    ["production", false, true, noFloor, "ANALYTICS_V2_REVISION_FLOOR_ABSENT"],
+    ["production", false, true, floor, null],
     // Staging and test targets (null) are never gated here.
     ["staging", true, false, noFloor, null],
     [undefined, true, false, noFloor, null],

@@ -1144,10 +1144,11 @@ resume. `owner`.
    nothing (the H.4 import has not run its `analytics-community-history`
    stage); staging and test targets publish from r1 without one. Before that
    check, a production FIRST run (no completed run row, or no recorded
-   journal cursor) with neither the frozen interim read nor the floor loaded
+   journal cursor) without the frozen interim read loaded, even when the floor
+   is loaded,
    refuses `ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT`, also before any read and
    writing nothing: it would otherwise record every day's first owner set
-   without any record of Cloudflare's published history (R19 hardening (d),
+   without the frozen record of Cloudflare's published history (R19 hardening (d),
    in addition to the flip gate's `CUTOVER_INTERIM_READ_NOT_LOADED`). The
    receipt's `baseline` reads `{firstRun, frozenInterimRead}`; this first
    manual run must show `firstRun: true` and `frozenInterimRead: true`.
@@ -1298,7 +1299,7 @@ noted.
 | `CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE` | Flip evidence | The analytics D1's bookmark moved after the fence: Cloudflare published after the revision floor's capture. The floor is void; abort, fence and seal again |
 | `CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED` | Flip evidence | A statement was sent through the bookmark-only role `analytics-bookmark`. A tooling defect: stop |
 | `ANALYTICS_V2_REVISION_FLOOR_ABSENT` | H.8 | A production refresh found no revision floor. The import's `analytics-community-history` stage has not loaded it; never run the production refresh before it has |
-| `ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT` | H.8 | A production first run found neither the frozen interim read nor the revision floor: the H.4 import has not run (or ran against another schema). Nothing was written; never run the production refresh before H.4 is live |
+| `ANALYTICS_V2_FIRST_RUN_BASELINE_ABSENT` | H.8 | A production first run found no frozen interim read, even if the revision floor is loaded: the H.4 import has not run (or ran against another schema). Nothing was written; never run the production refresh before H.4 is live |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PARTICIPANT_ERASURE_PENDING` | Seal, PT-3 | An erased or mid-erasure participant is in the sealed set. Finish the erasure on Cloudflare and re-seal |
 | `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH` | PT-3 | The configured pin, or under round 16 the rotation's `from`, does not match the sealed pin. Rotate only through the recorded [identity-link rotation](#identity-link-rotation-round-16) |
 | `CUTOVER_IDENTITY_ROTATION_STATE_INVALID` | Run, post-import, flip gate, post-live | The target pin is neither the rotation's `from` nor its completed `to` for this run, or (without a rotation) differs from the pin. Something wrote the pin row outside the orchestrator: diagnose, never bypass |
@@ -1323,7 +1324,7 @@ line at `2b5c90cd`.
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
 | Admin routes at the origin | H.7 | `built` (C-ADMIN, ADMIN-R12): the production and staging composition opens the admin host behind the Access chokepoint (round 12). The overview is `admin-overview-v0.6`: the synthetic-contribution counts, historical publication and deletion-ledger blocks answer `{"status":"unavailable"}` until their sources exist (E-ADMIN); database health is `admin-database-health-v0.2`, the removed ledger `not_applicable`. The admin UI that reads both versions ships with the edge Worker; local proof only |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
-| Revision floor: capture, load, refresh refusal | H.3, H.4, H.8 | `built` (REV-SEED) on synthetic data and a local PostgreSQL 17 target only; its migration is promoted as primary `0071`; the capture has never contacted the provider. R19 hardenings `built` the same way: the offline check binds the fence (b), verify-unchanged re-reads the analytics bookmark (c), a production first run refuses without the frozen read or the floor (d) |
+| Revision floor: capture, load, refresh refusal | H.3, H.4, H.8 | `built` (REV-SEED) on synthetic data and a local PostgreSQL 17 target only; its migration is promoted as primary `0071`; the capture has never contacted the provider. R19 hardenings `built` the same way: the offline check binds the fence (b), verify-unchanged re-reads the analytics bookmark (c), a production first run requires the frozen read and every production run requires the floor (d) |
 | Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |
