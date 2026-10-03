@@ -671,6 +671,7 @@ class Hazards {
   private entries = new Map<string, Interval[]>();
   private indexes = new Map<string, { starts: number[]; maximumEnds: number[] }>();
   private intervalCount = 0;
+  private payloadBytes: number | null = null;
   exceeded = false;
   get size():number{return this.intervalCount;}
   snapshot(): Array<{ key: string; intervals: Interval[] }> {
@@ -684,14 +685,26 @@ class Hazards {
     const merged = { ...interval };
     while (bucket.length > 0 && bucket[bucket.length - 1]!.end >= merged.start) {
       const last = bucket.pop()!;
+      if (this.payloadBytes !== null) this.payloadBytes -= reductionJsonBytes(last) + (bucket.length > 0 ? 1 : 0);
       merged.start = Math.min(merged.start, last.start);
       merged.end = Math.max(merged.end, last.end);
       this.intervalCount -= 1;
+    }
+    if (this.payloadBytes !== null) {
+      if (!this.entries.has(key)) this.payloadBytes += reductionJsonBytes({ key, intervals: [] }) + (this.entries.size > 0 ? 1 : 0);
+      this.payloadBytes += reductionJsonBytes(merged) + (bucket.length > 0 ? 1 : 0);
     }
     bucket.push(merged);
     this.intervalCount += 1;
     if (this.intervalCount > MAX_HAZARD_INTERVALS) this.exceeded = true;
     this.entries.set(key, bucket);
+  }
+  /** Count the same snapshot, preserving its finalized-state throw. After the
+   * first exact walk, add() accounts only pushed and popped intervals. */
+  reductionBytes(): number {
+    if (this.indexes.size > 0) throw new Error("v11 hazards already finalized");
+    if (this.payloadBytes === null) this.payloadBytes = reductionJsonBytes(this.snapshot());
+    return this.payloadBytes;
   }
   overlaps(key: string, first: number, last: number): boolean {
     let index = this.indexes.get(key);
@@ -1050,9 +1063,111 @@ function serializeHazards(hazards: Hazards): V11UsageReductionCheckpoint["hazard
 function reductionPayloadBytes(previous:Map<string,{time:number;scope:string|null}>,hazards:Hazards,
   scalarBuckets:Map<string,CostBucket>,modelCosts:Map<string,{observedAtMs:number;model:string;costNanousd:number}>,
   poisoned:Set<number>):number{
-  const payload=JSON.stringify({previous:[...previous],hazards:serializeHazards(hazards),
-    scalarBuckets:[...scalarBuckets],modelCosts:[...modelCosts],poisoned:[...poisoned]});
-  return new TextEncoder().encode(payload).byteLength;
+  // Evaluate in the oracle's property order; finalized hazards still throw
+  // before scalar/model/poisoned are evaluated. The empty object's punctuation
+  // and property names are invariant; each tracked structure includes its [].
+  const previousBytes = reductionMapBytes(previous), hazardBytes = hazards.reductionBytes();
+  return 67 + previousBytes + hazardBytes + reductionMapBytes(scalarBuckets)
+    + reductionMapBytes(modelCosts) + (poisoned instanceof ReductionByteSet
+      ? poisoned.reductionBytes() : reductionJsonBytes([...poisoned]));
+}
+
+/** GCP source patch reduction-payload-bytes. Exact JSON UTF-8 size of plain
+ * reduction data, without allocating its serialization. Non-data entries use
+ * JSON.stringify themselves. Undefined object values are omitted; undefined
+ * array entries become null, just as in JSON.stringify. */
+function reductionStringBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 34 || code === 92 || code === 8 || code === 9 || code === 10 || code === 12 || code === 13) bytes += 2;
+    else if (code < 32) bytes += 6;
+    else if (code < 128) bytes++;
+    else if (code < 2048) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; index++; } else bytes += 6;
+    } else if (code >= 0xdc00 && code <= 0xdfff) bytes += 6;
+    else bytes += 3;
+  }
+  return bytes;
+}
+function reductionJsonBytes(value: unknown): number {
+  if (value === null) return 4;
+  if (typeof value === "string") return reductionStringBytes(value);
+  if (typeof value === "number") return Number.isFinite(value) ? String(value).length : 4;
+  if (typeof value === "boolean") return value ? 4 : 5;
+  if (Array.isArray(value) && !("toJSON" in value)) {
+    let bytes = 2;
+    for (let index = 0; index < value.length; index++) {
+      const entry = value[index];
+      bytes += (index > 0 ? 1 : 0) + (entry === undefined || typeof entry === "function" || typeof entry === "symbol" ? 4 : reductionJsonBytes(entry));
+    }
+    return bytes;
+  }
+  if (typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+    && !("toJSON" in value)) {
+    const keys = Object.keys(value);
+    // Accessors and unusual values use the oracle, preserving JSON behaviour.
+    if (keys.every((key) => Object.getOwnPropertyDescriptor(value, key)?.get === undefined)) {
+      const entries = Object.entries(value);
+      let bytes = 2, count = 0;
+      for (const [key, entry] of entries) {
+        if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue;
+        bytes += (count++ > 0 ? 1 : 0) + reductionStringBytes(key) + 1 + reductionJsonBytes(entry);
+      }
+      return bytes;
+    }
+  }
+  const json = JSON.stringify(value);
+  return json === undefined ? 0 : new TextEncoder().encode(json).byteLength;
+}
+
+/** Map reads expose mutable bucket objects. Capture an entry before its first
+ * get/set on a page; at the next check, measure only those touched entries.
+ * Construction and the first check in each resumed call remain exact walks.
+ * All reducer writes are get+in-place mutation or set; iteration only reads. */
+class ReductionByteMap<K, V> extends Map<K, V> {
+  private entryBytes: number | null = null;
+  private touched = new Map<K, number>();
+  constructor(entries: Iterable<readonly [K, V]>) {
+    super();
+    for (const [key, value] of entries) super.set(key, value);
+  }
+  private touch(key: K): void {
+    if (this.entryBytes !== null && !this.touched.has(key))
+      this.touched.set(key, super.has(key) ? reductionJsonBytes([key, super.get(key)]) : 0);
+  }
+  override get(key: K): V | undefined { this.touch(key); return super.get(key); }
+  override set(key: K, value: V): this { this.touch(key); return super.set(key, value); }
+  override delete(key: K): boolean { this.touch(key); return super.delete(key); }
+  override clear(): void { for (const key of super.keys()) this.touch(key); super.clear(); }
+  reductionBytes(): number {
+    if (this.entryBytes === null) {
+      this.entryBytes = 0;
+      for (const entry of super.entries()) this.entryBytes += reductionJsonBytes(entry);
+    } else for (const [key, before] of this.touched)
+      this.entryBytes += (super.has(key) ? reductionJsonBytes([key, super.get(key)]) : 0) - before;
+    this.touched.clear();
+    return 2 + this.entryBytes + Math.max(0, this.size - 1);
+  }
+}
+function reductionMapBytes<K, V>(value: Map<K, V>): number {
+  return value instanceof ReductionByteMap ? value.reductionBytes() : reductionJsonBytes([...value]);
+}
+class ReductionByteSet extends Set<number> {
+  private entryBytes = 0;
+  constructor(entries: Iterable<number>) { super(); for (const value of entries) this.add(value); }
+  override add(value: number): this {
+    if (!super.has(value)) this.entryBytes += reductionJsonBytes(value === 0 ? 0 : value);
+    return super.add(value);
+  }
+  override delete(value: number): boolean {
+    if (!super.delete(value)) return false;
+    this.entryBytes -= reductionJsonBytes(value === 0 ? 0 : value); return true;
+  }
+  override clear(): void { super.clear(); this.entryBytes = 0; }
+  reductionBytes(): number { return 2 + this.entryBytes + Math.max(0, this.size - 1); }
 }
 
 async function usageDays(db: D1Database, context: Context): Promise<string[] | Refusal> {
@@ -1598,12 +1713,12 @@ export async function advanceV11UsageReduction(db: D1Database, pin: V11SourcePin
       unpricedUsageEventCount:0, attributionUnresolved:false };
   }
   if (state.complete) return sortedReduction(state);
-  const previous = new Map(state.previous.map(entry => [entry.key, { time:entry.time, scope:entry.scope }]));
+  const previous = new ReductionByteMap(state.previous.map(entry => [entry.key, { time:entry.time, scope:entry.scope }]));
   const hazards = reductionHazards(state);
-  const scalarBuckets = new Map(state.scalarBuckets.map(entry => [entry.key, { ...entry.value }]));
-  const modelCosts = new Map(state.modelCosts.map(entry => [entry.key,
+  const scalarBuckets = new ReductionByteMap(state.scalarBuckets.map(entry => [entry.key, { ...entry.value }]));
+  const modelCosts = new ReductionByteMap(state.modelCosts.map(entry => [entry.key,
     { observedAtMs:entry.observedAtMs, model:entry.model, costNanousd:entry.costNanousd }]));
-  const poisoned = new Set(state.poisoned);
+  const poisoned = new ReductionByteSet(state.poisoned);
   const maximum = options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
   for (let page = 0; page < maxPages && state.dayIndex < state.days.length; page += 1) {
     if (budget.remainingQueries < 1 || now() >= budget.deadlineMs) break;

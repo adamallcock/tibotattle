@@ -69,6 +69,8 @@ const PINNED_PATCH_SPECS = [
 const PINNED_SOURCE_PATCHES = [
   ["apps/worker/src/quota-analysis-v11.ts", "usage-row-evidence-memo", 2,
     "1abf1f05fae29ce856a82adcd7538205ff6f4ad194466350c17a0096d15f1df3"],
+  ["apps/worker/src/quota-analysis-v11.ts", "reduction-payload-bytes", 3,
+    "72b182330015387e75cbebfe1cdd70371d34d2a8b968c2f9adc6a78226544a8e"],
   ["apps/worker/src/v11-daily-projection-values.ts", "daily-fold-trusted-state", 5,
     "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"],
   ["apps/worker/src/analytics-shared-reducers.ts", "daily-fold-trusted-state", 2,

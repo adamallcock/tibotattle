@@ -77,6 +77,12 @@
       "sha256": "1abf1f05fae29ce856a82adcd7538205ff6f4ad194466350c17a0096d15f1df3"
     },
     {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "id": "reduction-payload-bytes",
+      "hunks": 3,
+      "sha256": "72b182330015387e75cbebfe1cdd70371d34d2a8b968c2f9adc6a78226544a8e"
+    },
+    {
       "path": "apps/worker/src/v11-daily-projection-values.ts",
       "id": "daily-fold-trusted-state",
       "hunks": 5,
@@ -97,7 +103,7 @@
     "package": 40,
     "exportPatched": 6,
     "exportPatchedFiles": 3,
-    "sourcePatched": 3,
+    "sourcePatched": 4,
     "sourcePatchedFiles": 3,
     "typeStubs": 3,
     "parityTests": 10
@@ -372,7 +378,7 @@
     {
       "path": "apps/worker/src/quota-analysis-v11.ts",
       "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c",
-      "sha256": "bf4107942e7be4af8475cac1b12dc7fa4b6b96f2632fce2e4ceb7ba67cf4ade9",
+      "sha256": "ef7e782ae824d9ecda74183f33d95abd4d20e249905a4070ce8ba09b670356ad",
       "patch": "source",
       "reach": "kernel"
     },

@@ -14,7 +14,7 @@
 //   checked fold refuses is refused the same way.
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   advanceV11UsageReduction,
   createV11QuotaAcquisitionIdentity,
@@ -237,4 +237,93 @@ describe("source patch daily-fold-trusted-state", () => {
     expect(() => foldV11DailyProjectionValues(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
     expect(() => foldV11DailyProjectionValuesTrusted(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
   });
+});
+
+// Harness-only exports and checks are built outside the production closure.
+// The oracle reverses only reduction-payload-bytes; all other source patches
+// and production bindings remain independently owned.
+
+import { loadReductionHarness, payloadOracle } from '../scripts/gcp-model-residue-check-lib.mjs';
+import { residueReduce } from './model-residue-byte-fixture.mjs';
+let loaded: Awaited<ReturnType<typeof loadReductionHarness>>, baseline: Awaited<ReturnType<typeof loadReductionHarness>>;
+beforeAll(async()=> { loaded=await loadReductionHarness({check:true});baseline=await loadReductionHarness({oracle:true,check:true}); });
+afterAll(async()=> {await loaded?.close();await baseline?.close();});
+describe('source patch reduction-payload-bytes',()=> {
+  it('counts JSON escaping, UTF-8, unusual numbers and entry fallbacks exactly',()=> {
+    const m=loaded.module;
+    const strings=['','é','中','💫','\ud800','\udfff','"','\\',...Array.from({length:32},(_,i)=>String.fromCharCode(i)),'\u2028','\u2029','\x7f','feature:'+'a'.repeat(64)];
+    for(const key of strings) for(const value of [...strings,-0,NaN,Infinity,-Infinity,1e21,1e-7,Number.MAX_SAFE_INTEGER,Number.MAX_SAFE_INTEGER+1,true,false,null,undefined]) {
+      const entry={ [key]:value, array:[value,undefined], omit:undefined };
+      expect(m.reductionJsonBytes(entry)).toBe(Buffer.byteLength(JSON.stringify(entry)));
+    }
+    const exotic=[new Date(0),Object.assign(Object.create({toJSON(){return 'é';}}),{value:1}),{get value(){return '中';}},Object.assign([],{toJSON(){return '💫';}})];
+    for(const entry of exotic) expect(m.reductionJsonBytes(entry)).toBe(Buffer.byteLength(JSON.stringify(entry)));
+  });
+  it('tracks get-only in-place updates, first-check growth, replacements, commas and hazard merges',()=> {
+    const m=loaded.module,previous=new m.ReductionByteMap([]),hazards=new m.Hazards(),buckets=new m.ReductionByteMap([]),costs=new m.ReductionByteMap([]),poisoned=new m.ReductionByteSet([]);
+    const compare=()=>expect(m.reductionPayloadBytes(previous,hazards,buckets,costs,poisoned)).toBe(payloadOracle(previous,hazards,buckets,costs,poisoned));
+    for(let i=0;i<1000;i++) previous.set('feature:'+i.toString(16).padStart(64,'0'),{time:i,scope:'é中💫'});
+    buckets.set('bucket',{placement:9,costNanousd:9,fullyPriced:true});costs.set('cost',{observedAtMs:9,model:'é',costNanousd:99});
+    for(let i=0;i<7;i++) hazards.add('all|é',{start:i*10,end:i*10+2,extra:'💫'});
+    compare();
+    buckets.get('bucket').placement=1000;buckets.get('bucket').costNanousd=1e21;buckets.get('bucket').fullyPriced=false;
+    costs.get('cost').costNanousd=Number.MAX_SAFE_INTEGER+1;
+    previous.set('feature:'+'0'.repeat(64),{time:-0,scope:null});previous.set('é',{time:10,scope:null});
+    poisoned.add(-0);poisoned.add(0);poisoned.add(9999);hazards.add('all|é',{start:0,end:100,extra:'中'});compare();
+    previous.delete('é');previous.set('é',{time:100,scope:'new-scope'});compare();
+    poisoned.delete(0);previous.clear();buckets.clear();costs.clear();poisoned.clear();compare();
+    hazards.overlaps('all|é',0,1);
+    expect(()=>m.reductionPayloadBytes(previous,hazards,buckets,costs,poisoned)).toThrow('v11 hazards already finalized');
+    expect(()=>payloadOracle(previous,hazards,buckets,costs,poisoned)).toThrow('v11 hazards already finalized');
+  });
+  it('matches every page integer and JSON successor across resumed scalar and model calls',async()=> {
+    for(const prepared of [false,true]) for(const scalarRequested of [false,true]) for(const maxPages of [1,2,3]) {
+      loaded.module.reductionChecks.length=0;baseline.module.reductionChecks.length=0;
+      const options={prepared,scalarRequested,maxPages};
+      const a=await residueReduce(baseline.module,2400,options),b=await residueReduce(loaded.module,2400,options);
+      expect(b.checkpoints).toEqual(a.checkpoints);expect(loaded.module.reductionChecks).toEqual(baseline.module.reductionChecks);
+      expect(loaded.module.reductionChecks).toHaveLength(12);
+    }
+  },60000);
+  it('delays the first exact walk until the production predicate reaches 4096 and rebuilds after resume', async()=> {
+    const unchecked=await loadReductionHarness();
+    try { for(const prepared of [false,true]) for(const maxPages of [1,3,27]) {
+      const options={prepared,maxPages};
+      expect((await residueReduce(unchecked.module,6000,options)).checkpoints)
+        .toEqual((await residueReduce(baseline.module,6000,options)).checkpoints);
+    } } finally { await unchecked.close(); }
+  },60000);
+  it('counts a partial cost refusal before its invalid bucket is cleared from the successor', async()=> {
+    loaded.module.reductionChecks.length=0;baseline.module.reductionChecks.length=0;
+    const options={prepared:true,maxPages:1,limit:65536,featureCost:Number.MAX_SAFE_INTEGER};
+    const a=await residueReduce(baseline.module,200,options),b=await residueReduce(loaded.module,200,options);
+    expect(b.checkpoints).toEqual(a.checkpoints);expect(loaded.module.reductionChecks).toEqual(baseline.module.reductionChecks);
+    expect(b.state.scalarRefusal).toBe('usage_cost_limit_exceeded');expect(b.state.scalarBuckets).toHaveLength(0);
+  });
+  it('preserves B-1/B/B+1 refusal on a resumed call under an exact 64KiB-plus bound',async()=> {
+    for(const prepared of [false,true]) {
+      baseline.module.reductionChecks.length=0;
+      await residueReduce(baseline.module,1400,{prepared,maxPages:1});
+      const target=baseline.module.reductionChecks.find((entry:{bytes:number})=>entry.bytes>65536);
+      expect(target).toBeDefined();
+      for(const limit of [target.bytes-1,target.bytes,target.bytes+1]) {
+        loaded.module.reductionChecks.length=0;baseline.module.reductionChecks.length=0;
+        const a=await residueReduce(baseline.module,1400,{prepared,maxPages:1,limit}),b=await residueReduce(loaded.module,1400,{prepared,maxPages:1,limit});
+        expect(b.checkpoints).toEqual(a.checkpoints);expect(loaded.module.reductionChecks).toEqual(baseline.module.reductionChecks);
+        expect(b.state.commonRefusal).toBe('reduced_usage_limit_exceeded');expect(b.state.complete).toBe(true);expect(b.calls).toBeGreaterThan(1);
+        expect(b.state.rowsRead).toBe(limit<target.bytes ? target.rows : target.rows+200);
+      }
+    }
+  },60000);
+  it('crosses the actual default 8MiB bound on raw and prepared feature paths with identical refusal pages',async()=> {
+    for(const prepared of [false,true]) {
+      loaded.module.reductionChecks.length=0;baseline.module.reductionChecks.length=0;
+      const a=await residueReduce(baseline.module,50000,{prepared,maxPages:3}),b=await residueReduce(loaded.module,50000,{prepared,maxPages:3});
+      expect(b.checkpoints).toEqual(a.checkpoints);expect(loaded.module.reductionChecks).toEqual(baseline.module.reductionChecks);
+      expect(b.state.commonRefusal).toBe('reduced_usage_limit_exceeded');expect(b.state.complete).toBe(true);
+      const checks=loaded.module.reductionChecks;expect(checks.at(-2).bytes).toBeLessThanOrEqual(8*1024*1024);expect(checks.at(-1).bytes).toBeGreaterThan(8*1024*1024);
+      expect(b.calls).toBeGreaterThan(1);
+      console.log(JSON.stringify({fixture:'model-residue-private-byte-bound',prepared,rows:b.state.rowsRead,pages:checks.length,beforeBytes:checks.at(-2).bytes,refusalBytes:checks.at(-1).bytes,calls:b.calls}));
+    }
+  },180000);
 });
