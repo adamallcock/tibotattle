@@ -84,6 +84,11 @@ import {
 } from "../src/accountless-ownership.ts";
 import { parseTelemetryV12AccountlessAuthorizationJson } from "../src/telemetry-transport-policy.ts";
 import {
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+  ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+} from "../src/telemetry-performance-policy.ts";
+import {
   ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
   parseAccountlessRenewalJson,
 } from "../src/accountless-renewal.ts";
@@ -169,6 +174,7 @@ import { requestIdFrom, createRequestContextStore } from "./postgres-request-con
 import { createProductionRequestHandler } from "./postgres-host-dispatch.mjs";
 import {
   ADMIN_HOST_ROUTE_IDS,
+  RETIRED_DEFINITE_ROUTE_IDS,
   assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
@@ -185,6 +191,7 @@ import {
   revealProductionSecret,
 } from "./postgres-production-configuration.mjs";
 import {
+  createPostgresRetiredPerformanceAuthorizationPreamble,
   createPostgresStorageGate,
   createPostgresTestCommunityDailyDispatch,
   createPostgresTestDevicePairingClaimDispatch,
@@ -441,8 +448,10 @@ function isPool(value) {
  * Returns {handlers, routeModules, routeModuleContext, dispatchers}: handlers
  * maps every route id the composition serves to its built-in (the registry
  * folds the route modules over community_daily and
- * device_upload_authorization; createOriginRouteRegistry); dispatchers are
- * the families themselves (the loopback fallback is the v1.2 dispatch).
+ * device_upload_authorization; createOriginRouteRegistry), and the retired
+ * accountless performance authorization to its preamble (owner round 19:
+ * production's earlier answers, never a grant); dispatchers are the families
+ * themselves (the loopback fallback is the v1.2 dispatch).
  */
 export function composeOriginFamilies(deps) {
   if (deps === null || typeof deps !== "object") refuse(ORIGIN_COMPOSITION_INVALID);
@@ -627,6 +636,28 @@ export function composeOriginFamilies(deps) {
   // serves.
   const intakeThenV12 = async (request) => (intake === null ? null : await intake.dispatch(request))
     ?? v12Dispatch(request);
+  // Round 19: the retired performance authorization's d43c8f92 preamble
+  // (session cookie, ownership mode, admission bindings, upload-registration
+  // control, the replayed accountless_ownership limiter, the accountless
+  // device bearer under the Worker's generic gate, then the body); the
+  // request handler answers its terminal 403 when the preamble passes.
+  const retiredPerformanceAuthorization = createPostgresRetiredPerformanceAuthorizationPreamble({
+    requestContext,
+    primaryPool: dataPool,
+    schemaOptions,
+    storageGate,
+    admissionEnv,
+    assertAdmissionBindings,
+    assertAttemptAllowed,
+    authenticateAccountlessDevice: postgresDeviceBearerAuth.authenticatePostgresAccountlessForV12Grant,
+    readBoundedRequestBody,
+    maxRequestBytes: MAX_REQUEST_BYTES,
+    requestShape: Object.freeze({
+      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    }),
+  });
   const handlers = new Map();
   for (const id of V12_ROUTE_IDS) handlers.set(id, v12Dispatch);
   for (const id of V11_ROUTE_IDS) handlers.set(id, intakeThenV12);
@@ -640,6 +671,7 @@ export function composeOriginFamilies(deps) {
   handlers.set("device_pairing_claim", devicePairingClaim);
   handlers.set("telemetry_v12_consent", telemetryV12Consent);
   handlers.set("community_daily", communityDaily);
+  handlers.set("accountless_telemetry_performance_authorization", retiredPerformanceAuthorization);
   handlers.set("health", statusDispatchers.health);
   // The legacy chain has no RD-2: its /api/ready is the v1.2 dispatch's
   // unsupported 503, as before.
@@ -660,17 +692,18 @@ export function composeOriginFamilies(deps) {
     routeModuleContext,
     dispatchers: Object.freeze({
       communityDaily, participantDevices, personalSession, devicePairing, devicePairingClaim,
-      telemetryV12Consent, v12Dispatch, intake,
+      telemetryV12Consent, v12Dispatch, intake, retiredPerformanceAuthorization,
     }),
   });
 }
 
 /**
  * The CR-6 registry over composed families: the handlers of exactly the
- * ported ids, with the route modules folded in.
+ * ported ids and the retired-definite preambles, with the route modules
+ * folded in.
  */
 export function createOriginRouteRegistry(families, portedRouteIds) {
-  const ported = new Set(portedRouteIds);
+  const ported = new Set([...portedRouteIds, ...RETIRED_DEFINITE_ROUTE_IDS]);
   return createProductionRouteRegistry({
     routePolicy: WORKER_ROUTE_POLICY,
     handlers: new Map([...families.handlers].filter(([id]) => ported.has(id))),

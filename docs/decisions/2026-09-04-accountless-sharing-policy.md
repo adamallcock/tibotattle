@@ -146,3 +146,65 @@ switch.
 - This record does not claim that the old link keys are unlinkable to provider
   accounts until the Cloudflare Worker's copy of the old secret is deleted
   after the switch.
+- **Round 19 (2026-10-03): retired routes answer production's codes.** The
+  owner replaced round 12's fixed answers for two retirements:
+  - *Accountless performance authorization*
+    (`POST /api/v1/accountless/telemetry-performance-authorization`). The
+    origin now runs production's own checks before its terminal answer, in
+    the order of `d43c8f92`
+    `handleAccountlessTelemetryPerformanceAuthorization`. The answers are
+    `401 AUTH_INVALID` for a session cookie, then the ownership-mode,
+    admission-binding and upload-registration `503`s, then the
+    accountless-ownership limiter's `429 ATTEMPT_LIMIT_REACHED` (or `503
+    ADMISSION_RATE_LIMIT_UNAVAILABLE`), each with `retry-after: 60`. Then
+    comes `401 DEVICE_AUTH_INVALID` for a bearer that is not an active
+    accountless device, then `415 CONTENT_TYPE_INVALID`, `400 BODY_INVALID`,
+    `413 BODY_TOO_LARGE` or `408 BODY_TIMEOUT` for the body. Last comes the
+    terminal `403 TELEMETRY_TRANSPORT_BLOCKED`, which production's grant
+    answers while its performance runtime is `staged`. Nothing is ever
+    granted. The 429 is reproducible because the edge evaluates the limiter
+    and sends only its outcome; the origin replays that outcome at the
+    Worker's call point. The origin differs from production in two ways:
+    1. Production's `requireTelemetryPerformanceStorageMode` check, after the
+       bearer, is not reproduced. It reads a D1 table PostgreSQL does not
+       have (the performance tables are not promoted). Production's deployed
+       state passes it, so its `503` never reaches a caller. The origin's
+       storage gate stands in for it, and runs before the ownership mode as
+       on every storage-gated route (OD-CR-6 (iii)). Its `503
+       BACKEND_STORAGE_UNAVAILABLE` therefore comes first only while the
+       origin's migration receipt is not current.
+    2. Production's deletion-ledger tombstone read, after the bearer, is not
+       reproduced. The origin has no deletion ledger (append-only
+       contributions), and a deleted participant has no active device
+       credential, so the bearer check already answers its `401`.
+
+    A session cookie gets the same `401` at the edge first, as on every
+    accountless route (the edge's pre-admission guard), so the origin's own
+    cookie check is defence in depth.
+  - *v0.x uploads* (a `telemetry-contribution-v0.1` or `-v0.2` upload
+    authorization, a `telemetry-envelope-v0.1` or `-v0.2` contribution).
+    They answer `d43c8f92`'s definite `403 TELEMETRY_TRANSPORT_BLOCKED`,
+    the code it gives v0.2, instead of the uniform `503
+    POSTGRES_ROUTE_NOT_PORTED`. The answer comes at the transport
+    write-authority step: after the route's own request, bearer, admission
+    and body checks, and on `/api/v1/contributions` after the upload claim,
+    which is then abandoned, not consumed. The origin first runs the same
+    write authority as production for the v0.x identifier, so its earlier
+    refusals stand (`401 DEVICE_AUTH_INVALID`, or the 403 itself). For v0.2
+    the answer is therefore production's exactly. For v0.1 it differs only
+    where production would still authorize or admit, for a social
+    participant whose transport floor is rank 1. There the retirement
+    answers the same 403. No live v0.x row was ever admitted (OD-8). Two
+    orderings of the shared contributions preamble, which every legacy
+    format already has on the origin, also apply to v0.x:
+    1. The processing control is read after the claim, not before it. While
+       processing is paused, an upload with an unknown authorization
+       answers `401 UPLOAD_AUTH_INVALID` where production answers `503
+       PROCESSING_DISABLED`.
+    2. The envelope's exact-key check runs inside the envelope handler,
+       after the write authority. A v0.x body with a duplicated envelope key
+       and a claimable authorization therefore answers the 403 where
+       production answers `400 ENVELOPE_INVALID`.
+
+    The 5xx alert never excludes the two upload paths, because every live
+    v1 upload shares them.

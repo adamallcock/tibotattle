@@ -16,6 +16,7 @@ import {
   PRODUCTION_ROUTE_PARITY_BASIS,
   PRODUCTION_ROUTE_REGISTRY_CODES,
   PRODUCTION_ROUTE_TABLE,
+  RETIRED_DEFINITE_PREAMBLE_STEPS,
   RETIRED_DEFINITE_ROUTE_IDS,
   RETIRED_ONLINE_ERASURE_SURFACES,
   RETIRED_ROUTE_DEFINITE_ANSWERS,
@@ -29,7 +30,8 @@ import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./orig
 // CR-6 registry without a database: the pinned d43c8f92 route table against
 // the Worker's own WORKER_ROUTE_POLICY, the injected ported set (scope, the
 // OD-CR-1 contested routes and the OD-CR-2 admin routes), the round-12
-// retired routes (the uniform 503 and the one definite 4xx), the production
+// retired routes (the uniform 503, and the one retired-definite route whose
+// preamble round 19 requires), the production
 // list in src/backend-composition.ts, the route-module fold (one registry)
 // and every closed refusal. Every handler is a synthetic stub.
 
@@ -93,8 +95,9 @@ function stub(id) {
   return handler;
 }
 
+/** The ported ids' built-ins plus every retired-definite preamble (round 19). */
 function handlersFor(ids) {
-  return new Map(ids.map((id) => [id, stub(id)]));
+  return new Map([...ids, ...RETIRED_DEFINITE_ROUTE_IDS].map((id) => [id, stub(id)]));
 }
 
 function build({ routePolicy = policy, portedRouteIds = POSTGRES_SCOPE_ROUTE_IDS, handlers } = {}) {
@@ -222,6 +225,52 @@ test("round 12: the definite answer is production's d43c8f92 code for the route"
     { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
 });
 
+test("round 19: the retired-definite preamble steps are d43c8f92's, in handler order, closed and frozen", async (t) => {
+  assert.deepEqual(Object.keys(RETIRED_DEFINITE_PREAMBLE_STEPS), [...RETIRED_DEFINITE_ROUTE_IDS]);
+  assert.ok(Object.isFrozen(RETIRED_DEFINITE_PREAMBLE_STEPS));
+  const steps = RETIRED_DEFINITE_PREAMBLE_STEPS.accountless_telemetry_performance_authorization;
+  assert.ok(Object.isFrozen(steps) && steps.every((step) => Object.isFrozen(step)));
+  assert.deepEqual([...new Set(steps.map(([step]) => step))], ["session_cookie", "storage", "ownership_mode",
+    "admission_bindings", "upload_registration", "attempt_limit", "device_bearer", "body"]);
+  // Every earlier answer differs from the terminal one, so a client can tell them apart.
+  const terminal = RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization;
+  for (const [, status, code] of steps) assert.notDeepEqual([status, code], [terminal.status, terminal.code]);
+  const git = (args) => new Promise((resolveGit, rejectGit) => {
+    execFile("git", args, { cwd: WORKER_ROOT, maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout) => (error ? rejectGit(error) : resolveGit(stdout)));
+  });
+  const basis = PRODUCTION_ROUTE_PARITY_BASIS.commit;
+  try {
+    await git(["cat-file", "-e", `${basis}^{commit}`]);
+  } catch {
+    t.skip(`parity basis ${basis} unavailable in this checkout`);
+    return;
+  }
+  // The handler's call order at the basis: the steps above, with the
+  // storage-mode read the origin does not reproduce (round 19 amendment).
+  const index = await git(["show", `${basis}:apps/worker/src/index.ts`]);
+  const start = index.indexOf("async function handleAccountlessTelemetryPerformanceAuthorization(");
+  const body = index.slice(start, index.indexOf("\n}\n", start));
+  const calls = ["methodNotAllowed([\"POST\"])", "hasSessionCookie(", "assertAccountlessOwnershipEnabled(env)",
+    "assertAdmissionBindings(env)", "assertCollectionControl(env.USAGE_MONITOR_DB, \"uploadRegistration\")",
+    "\"accountless_ownership\"", "authenticateDevice(", "authorization.authorityKind !== \"accountless\"",
+    "requireTelemetryPerformanceStorageMode(",
+    "readBoundedAccountlessTelemetryPerformanceAuthorizationJson(request)",
+    "grantTelemetryPerformanceAccountlessAuthorization("];
+  const positions = calls.map((call) => body.indexOf(call));
+  for (const [i, position] of positions.entries()) assert.ok(position > 0, calls[i]);
+  assert.deepEqual([...positions].sort((a, b) => a - b), positions, "d43c8f92 call order");
+  assert.match(body, /throw new ApiError\(401, "AUTH_INVALID"\)[\s\S]*throw new ApiError\(401, "DEVICE_AUTH_INVALID"\)/u);
+  // The body reader's answers are readBoundedJson's (415, 400, 413) plus the
+  // closed shape's 400, and readBoundedRequestBody's 408.
+  const reader = index.slice(index.indexOf("async function readBoundedAccountlessTelemetryPerformanceAuthorizationJson("));
+  assert.match(reader, /await readBoundedJson\(request\)[\s\S]*?throw new ApiError\(400, "BODY_INVALID"\)/u);
+  const json = index.slice(index.indexOf("async function readBoundedJson("));
+  for (const answer of ["415, \"CONTENT_TYPE_INVALID\"", "400, \"BODY_INVALID\"", "413, \"BODY_TOO_LARGE\""]) {
+    assert.ok(json.slice(0, json.indexOf("\n}\n")).includes(answer), answer);
+  }
+});
+
 test("online erasure is retired: no policy route, DELETE /api/v1/me is unknown_api", () => {
   assert.equal(RETIRED_ONLINE_ERASURE_SURFACES.length, 2);
   assert.ok(Object.isFrozen(RETIRED_ONLINE_ERASURE_SURFACES));
@@ -272,8 +321,9 @@ function assertCoverage(registry, portedIds) {
       assert.equal(resolved.handler.routeId, route.id);
       assert.equal(resolved.answer, null);
     } else if (RETIRED_DEFINITE_ROUTE_IDS.includes(route.id)) {
+      // Round 19: its preamble, then the terminal answer.
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.DEFINITE, route.id);
-      assert.equal(resolved.handler, null);
+      assert.equal(resolved.handler.routeId, route.id);
       assert.equal(resolved.answer, RETIRED_ROUTE_DEFINITE_ANSWERS[route.id]);
     } else {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.UNPORTED, route.id);
@@ -308,8 +358,11 @@ test("an open admin host (round 12) adds the six admin routes: 36 ported, 12 ret
   assert.equal(registry.portedRouteIds.length, 36);
   assert.deepEqual([...registry.unportedRouteIds], [...RETIRED_ROUTE_IDS].sort());
   assert.deepEqual([...registry.definiteRouteIds], ["accountless_telemetry_performance_authorization"]);
-  assert.deepEqual({ ...registry.resolve("accountless_telemetry_performance_authorization") },
-    { disposition: "definite", handler: null, answer: ROUND_12_DEFINITE.accountless_telemetry_performance_authorization });
+  const definite = registry.resolve("accountless_telemetry_performance_authorization");
+  assert.deepEqual([definite.disposition, definite.handler.routeId, definite.answer],
+    ["definite", "accountless_telemetry_performance_authorization",
+      RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization]);
+  assert.deepEqual({ ...definite.answer }, ROUND_12_DEFINITE.accountless_telemetry_performance_authorization);
 });
 
 test("scope plus any single contested route, in any order of the injected list", () => {
@@ -404,10 +457,20 @@ test("PRODUCTION_ROUTE_PORT_RETIRED: no round-12 retired route can be ported", (
   for (const id of [...RETIRED_ROUTE_IDS, ...RETIRED_DEFINITE_ROUTE_IDS]) {
     refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
       "PRODUCTION_ROUTE_PORT_RETIRED", id);
-    // A handler offered for it is refused too, even without porting it.
+  }
+  // A handler offered for a 503-retired route is refused too, even without
+  // porting it; a retired-definite route takes only its preamble (round 19),
+  // which never makes it ported.
+  for (const id of RETIRED_ROUTE_IDS) {
     const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
     handlers.set(id, stub(id));
     refused(() => build({ handlers }), "PRODUCTION_ROUTE_HANDLER_UNEXPECTED", `${id} handler`);
+  }
+  for (const id of RETIRED_DEFINITE_ROUTE_IDS) {
+    const registry = build();
+    assert.equal(registry.resolve(id).disposition, ORIGIN_ROUTE_DISPOSITIONS.DEFINITE, id);
+    assert.equal(registry.portedRouteIds.includes(id), false, id);
+    assert.equal(registry.portedPathnames.includes(policy.find((route) => route.id === id).pathname), false, id);
   }
 });
 
@@ -451,7 +514,6 @@ test("PRODUCTION_ROUTE_HANDLERS_INVALID: handlers must be a Map", () => {
 test("PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler outside the ported set", () => {
   const extraKeys = [
     ...RETIRED_ROUTE_IDS,
-    ...RETIRED_DEFINITE_ROUTE_IDS,
     ...OD_CR_1_CONTESTED_ROUTE_IDS,
     ...ADMIN_HOST_ROUTE_IDS,
     EFFECTIVE_PAGE_PATH,
@@ -466,9 +528,9 @@ test("PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler outside the ported set", ()
   }
 });
 
-test("PRODUCTION_ROUTE_HANDLER_MISSING: every ported id has a function", () => {
+test("PRODUCTION_ROUTE_HANDLER_MISSING: every ported id has a function, every retired-definite id its preamble", () => {
   const ported = [...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS];
-  for (const id of ported) {
+  for (const id of [...ported, ...RETIRED_DEFINITE_ROUTE_IDS]) {
     const handlers = handlersFor(ported);
     handlers.delete(id);
     refused(() => build({ portedRouteIds: ported, handlers }), "PRODUCTION_ROUTE_HANDLER_MISSING", `${id} absent`);

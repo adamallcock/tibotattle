@@ -407,9 +407,9 @@ test("5xx exclusions name round 12's retired routes and the deliberate unported 
   }
   const paths = monitoring.ORIGIN_5XX_EXCLUSIONS.map(({ path }) => path);
   // Kept and live routes are never excluded: v0.x shares the two live upload
-  // routes (so its round-12 503s count as errors), the accountless
-  // performance authorization answers a definite 403, and round 12 keeps
-  // renew and disconnect.
+  // routes (its round-19 answer is a 4xx; any 5xx there stays counted),
+  // the accountless performance authorization answers production's sequence
+  // (round 19), and round 12 keeps renew and disconnect.
   for (const kept of monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS) assert.equal(paths.includes(kept), false, kept);
   for (const kept of ["/api/v1/contributions", "/api/v1/device/upload-authorizations",
     "/api/v1/accountless/telemetry-performance-authorization",
@@ -420,14 +420,17 @@ test("5xx exclusions name round 12's retired routes and the deliberate unported 
     "EDGE_ORIGIN_UNAVAILABLE"]);
 });
 
-test("round 12's v0.x upload 503s count toward the 5xx ratio: their shared paths cannot be excluded", () => {
-  // The retired v0.x envelopes and formats answer the very code the
-  // exclusions subtract, a 5xx, not a 4xx...
-  assert.deepEqual([RETIRED_FORMAT_ANSWER.status, RETIRED_FORMAT_ANSWER.code],
-    [monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.status, monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code]);
-  // ...on the two paths every live v1 upload shares, which no exclusion may name.
+test("round 19: v0.x uploads answer a definite 4xx, and their shared paths still cannot be excluded", () => {
+  // The retired v0.x envelopes and formats answer d43c8f92's definite 403
+  // TELEMETRY_TRANSPORT_BLOCKED, a 4xx outside the 5xx ratio, never the
+  // unported 503 the exclusions subtract...
+  assert.deepEqual({ ...RETIRED_FORMAT_ANSWER }, { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
+  assert.ok(RETIRED_FORMAT_ANSWER.status < 500);
+  assert.notEqual(RETIRED_FORMAT_ANSWER.code, monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code);
+  // ...and the two paths every live v1 upload shares stay unexcludable, whatever the code.
   const routeClasses = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
   for (const path of ["/api/v1/contributions", "/api/v1/device/upload-authorizations"]) {
+    assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(path), path);
     assert.equal(routeClasses.includes(matchWorkerRoute(path).routeClass), false, path);
     assert.throws(() => monitoring.originFiveXxExclusions([{ path, status: 503, code: "POSTGRES_ROUTE_NOT_PORTED",
       decision: "round-12" }]), { code: "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN" });
@@ -748,7 +751,8 @@ test("the origin request contract mirrors the origin's own log line (cloud-run/p
   // Every excluded route is one round 12 retired to the uniform 503 (or the
   // admin action route, whose unported tasks answer the same code), and every
   // such retired route is excluded; the accountless performance
-  // authorization is retired to a definite 403 instead, so it is left in.
+  // authorization answers production's sequence and a definite 403 instead
+  // (round 19), never the unported 503, so it is left in.
   const registry = await import("../cloud-run/postgres-production-registry.mjs");
   const excluded = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
   for (const routeClass of excluded) {

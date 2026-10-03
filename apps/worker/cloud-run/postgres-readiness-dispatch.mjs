@@ -40,7 +40,12 @@ import {
 } from "../src/upload-ingress-admission.ts";
 import { apiErrorToResponse, requestIdFor } from "./postgres-family-contract.mjs";
 
-/** How long a completed status evaluation is reused. */
+/**
+ * How long a completed status evaluation is reused. The Worker evaluates
+ * every request; the owner accepted this reuse as the documented difference
+ * STATUS-REUSE in round 19 (2026-10-03), beside OD-CR-6 (ii), (iii) and (v)
+ * (docs/runbooks/production-edge-modes.md).
+ */
 export const STATUS_REUSE_MILLISECONDS = 1_000;
 
 /** OD-CR-4 (owner answer 2026-10-02): readiness matches the Worker exactly. */

@@ -274,12 +274,18 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
       assert.equal(unported.headers.get("cache-control"), "no-store", path);
       assert.equal(unported.headers.get("x-tibotattle-origin"), "1", path);
     }
-    // The accountless performance authorization: production's definite 403.
+    // The accountless performance authorization runs the composed round-19
+    // preamble (production's earlier answers): a session cookie is its first
+    // refusal, 401 AUTH_INVALID, before any read. The rest of the sequence
+    // and the terminal 403 are proved by retired-performance-authorization
+    // .check.mjs and, over PostgreSQL, postgres-production-host.spec.mjs.
+    assert.equal(typeof runtime.registry.resolve("accountless_telemetry_performance_authorization").handler,
+      "function");
     const performance = await runtime.productionDispatch(invokerRequest(
-      "/api/v1/accountless/telemetry-performance-authorization", { method: "POST" }));
-    assert.equal(performance.status, 403);
-    assert.deepEqual(await performance.json(),
-      { error: { code: "TELEMETRY_TRANSPORT_BLOCKED", requestId: REQUEST_ID } });
+      "/api/v1/accountless/telemetry-performance-authorization",
+      { method: "POST", headers: { cookie: "__Host-usage_monitor_session=synthetic" } }));
+    assert.equal(performance.status, 401);
+    assert.deepEqual(await performance.json(), { error: { code: "AUTH_INVALID", requestId: REQUEST_ID } });
     assert.equal(performance.headers.get("retry-after"), null);
     assert.equal(performance.headers.get("cache-control"), "no-store");
     assert.equal(performance.headers.get("x-tibotattle-origin"), "1");
@@ -897,6 +903,8 @@ test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health f
     const { server, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
       "import * as real from \"/cloud-run/postgres-production-registry.mjs\";",
       "export const ADMIN_HOST_ROUTE_IDS = real.ADMIN_HOST_ROUTE_IDS;",
+      // createOriginRouteRegistry hands the round-19 preambles over too.
+      "export const RETIRED_DEFINITE_ROUTE_IDS = real.RETIRED_DEFINITE_ROUTE_IDS;",
       // The round-16 boot refusal (assertIdentityLinkRotationComposable) reads it too.
       "export const assertIdentityLinkConsumersRetired = real.assertIdentityLinkConsumersRetired;",
       "export function createProductionRouteRegistry(options) {",

@@ -23,8 +23,10 @@
 //   - v0.1: syncPreparedContributionEntryOnce (src/contribution-device-sync.js),
 //     which encrypts a prepared v0.1 contribution with the shipped envelope
 //     builder, authorizes it with the three-key body and uploads it; owner
-//     round 12 retires v0.x uploads, so the upload is the uniform 503
-//     POSTGRES_ROUTE_NOT_PORTED and nothing is admitted or claimed.
+//     round 12 retires v0.x uploads, and round 19 answers them with
+//     d43c8f92's definite 403 TELEMETRY_TRANSPORT_BLOCKED at the transport
+//     write-authority step, so nothing is admitted and the claim is
+//     abandoned, not consumed.
 // Re-runs and re-uploads prove idempotence; unregistered envelope versions
 // keep the origin's pre-change refusal byte for byte.
 //
@@ -713,7 +715,7 @@ function v01Contribution() {
   };
 }
 
-test("round 12: a shipped v0.1 client's upload is the uniform 503; nothing is admitted, claimed or stored", {
+test("round 19: a shipped v0.1 client's upload is the definite 403; nothing is admitted, consumed or stored", {
   skip: !PG_TEST_SOCKET, timeout: 300_000,
 }, () => withOrigin(async (origin) => {
   const { base, t, fetchImpl, exchanges, store } = origin;
@@ -735,15 +737,24 @@ test("round 12: a shipped v0.1 client's upload is the uniform 503; nothing is ad
   const authorization = exchanges.find((exchange) => exchange.path === UPLOAD_AUTHORIZATIONS_PATH);
   assert.equal(authorization.status, 201);
   assert.equal(Object.keys(JSON.parse(authorization.body)).sort().join(), "contentLengthBytes,contentType,envelopeDigest");
-  // The v0.1 envelope is refused before its authorization is claimed: the uniform 503, no retry-after.
+  // The v0.1 envelope is claimed as d43c8f92 claims it, then refused at the
+  // transport write-authority step, where d43c8f92 would have admitted this
+  // rank-1 participant: the definite 403, no retry-after. The claim is abandoned.
   const upload = exchanges.find((exchange) => exchange.path === CONTRIBUTIONS_PATH);
-  assert.equal(upload.status, 503);
+  assert.equal(upload.status, 403);
   const raw = upload.body;
   assert.equal(JSON.parse(raw).schemaVersion, "telemetry-envelope-v0.1");
   const retired = await reupload(fetchImpl, owner.deviceAuthorization, raw);
-  assert.equal(retired.status, 503);
+  assert.equal(retired.status, 403);
   assert.equal(retired.headers.get("retry-after"), null);
-  assert.deepEqual(Object.keys((await retired.json()).error).sort(), ["code", "requestId"]);
+  const retiredError = (await retired.json()).error;
+  assert.deepEqual(Object.keys(retiredError).sort(), ["code", "requestId"]);
+  assert.equal(retiredError.code, "TELEMETRY_TRANSPORT_BLOCKED");
+  // An authorization the upload does not match is still the claim's own 401, as on d43c8f92.
+  const unmatched = await post(fetchImpl, CONTRIBUTIONS_PATH, raw,
+    { authorization: `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}` });
+  assert.equal(unmatched.status, 401);
+  assert.equal((await unmatched.json()).error.code, "UPLOAD_AUTH_INVALID");
   const counts = (await base.query(`SELECT
       (SELECT count(*)::int FROM ${t("telemetry_contributions")} WHERE participant_id = $1) AS contributions,
       (SELECT count(*)::int FROM ${t("telemetry_records")} WHERE participant_id = $1) AS records,
@@ -751,17 +762,19 @@ test("round 12: a shipped v0.1 client's upload is the uniform 503; nothing is ad
   [owner.participantId])).rows[0];
   assert.deepEqual(counts, { contributions: 0, records: 0, v1chunks: 0 });
   assert.equal(store.objects.size, 0, "no quarantine object was written");
-  // Both authorizations stay issued and unclaimed (they expire on their own).
+  // Neither authorization was consumed: each refused claim was abandoned (they expire on their own).
   assert.deepEqual((await grantStates(base, t, owner.participantId)).filter((row) => row.state === "consumed"), []);
-  // Asking for a v0.x format explicitly is the same 503, before anything is issued.
+  // Asking for a v0.x format explicitly is the same definite 403, where the
+  // format decides, and nothing is issued: v0.1 where d43c8f92 would issue
+  // one, v0.2 as d43c8f92 refuses it ('blocked').
   for (const telemetrySchemaVersion of ["telemetry-contribution-v0.1", "telemetry-contribution-v0.2"]) {
     const before = await grantStates(base, t, owner.participantId);
     const refused = await post(fetchImpl, UPLOAD_AUTHORIZATIONS_PATH, {
       envelopeDigest: "a".repeat(64), contentLengthBytes: 10, contentType: "application/json", telemetrySchemaVersion,
     }, { authorization: owner.deviceAuthorization });
-    assert.equal(refused.status, 503, telemetrySchemaVersion);
+    assert.equal(refused.status, 403, telemetrySchemaVersion);
     assert.equal(refused.headers.get("retry-after"), null, telemetrySchemaVersion);
-    assert.equal((await refused.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED", telemetrySchemaVersion);
+    assert.equal((await refused.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED", telemetrySchemaVersion);
     assert.deepEqual(await grantStates(base, t, owner.participantId), before, telemetrySchemaVersion);
   }
 }));
@@ -807,17 +820,23 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
         ? PREFLIGHT_UPLOAD_AUTH_INVALID_BODY : PRE_CHANGE_ENVELOPE_INVALID_BODY, label);
     }
   }
-  // Round 12: a v0.2 envelope is registered as retired, so it is the uniform
-  // 503 (after the preflight's own 401 without an authorization).
+  // A v0.2 envelope is registered as retired (round 12) with no pre-claim
+  // check (round 19): as on d43c8f92, the preflight's 401 comes first without
+  // an authorization and the claim's 401 with an unknown one...
   for (const authorization of [undefined, `Upload um_device_upload_${randomUUID()}.${"A".repeat(43)}`]) {
     const answer = await post(fetchImpl, CONTRIBUTIONS_PATH, sixKeys("telemetry-envelope-v0.2"),
       authorization === undefined ? {} : { authorization });
-    assert.equal(answer.status, authorization === undefined ? 401 : 503);
-    assert.equal((await answer.json()).error.code, authorization === undefined ? "UPLOAD_AUTH_INVALID"
-      : "POSTGRES_ROUTE_NOT_PORTED");
+    assert.equal(answer.status, 401);
+    assert.equal((await answer.json()).error.code, "UPLOAD_AUTH_INVALID");
   }
+  // ...and a claimable upload reaches the transport write authority, which
+  // refuses v0.2 ('blocked') with d43c8f92's definite 403. The claim is abandoned.
+  const blocked = await reupload(fetchImpl, owner.deviceAuthorization, sixKeys("telemetry-envelope-v0.2"));
+  assert.equal(blocked.status, 403);
+  assert.equal(blocked.headers.get("retry-after"), null);
+  assert.equal((await blocked.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED");
   // d43c8f92 answers an unknown transport 403 before issuing anything; the
-  // shipped three-key body defaults to v1.0. (Round 12 answers v0.x 503.)
+  // shipped three-key body defaults to v1.0. (Round 19 answers v0.x 403 too.)
   for (const telemetrySchemaVersion of ["telemetry-contribution-v9.9"]) {
     const refused = await post(fetchImpl, UPLOAD_AUTHORIZATIONS_PATH, {
       envelopeDigest: "a".repeat(64), contentLengthBytes: 10, contentType: "application/json", telemetrySchemaVersion,
@@ -835,5 +854,7 @@ test("unregistered envelope versions keep the pre-change refusal byte for byte; 
       assert.equal((await wrongMethod.json()).error.code, "METHOD_NOT_ALLOWED", `${method} ${path}`);
     }
   }
-  assert.deepEqual(await grantStates(origin.base, origin.t, owner.participantId), []);
+  // The one authorization issued (for the v0.2 upload) was never consumed.
+  assert.deepEqual((await grantStates(origin.base, origin.t, owner.participantId))
+    .filter((row) => row.state === "consumed"), []);
 }));

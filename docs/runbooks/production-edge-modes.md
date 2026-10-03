@@ -619,8 +619,8 @@ Edge logs are content-free JSON lines.
 ### Origin answers that differ from the Worker (OD-CR-6)
 
 The GCP origin answers the Worker's routes with the Worker's codes and
-envelopes, with these owner-accepted differences (owner decisions,
-2026-10-02):
+envelopes, with these owner-accepted differences (owner decisions of
+2026-10-02, and STATUS-REUSE of round 19 on 2026-10-03):
 
 - **(i) Request id, fixed.** Every error envelope carries the edge's
   `x-tibotattle-edge-request-id`, so the edge, origin and client lines join
@@ -641,30 +641,43 @@ envelopes, with these owner-accepted differences (owner decisions,
   `503 POSTGRES_ROUTE_NOT_PORTED`, so clients that retry only on a
   `retry-after` do not retry them. Since round 12 every unported route is
   retired (legacy enroll, Google and Apple sign-in, security reset,
-  participant export, the performance device and consent routes), as are
-  v0.x uploads (a v0.1 or v0.2 envelope or upload-authorization format). One
-  retired route deviates from the uniform 503: the accountless performance
-  authorization answers production's definite `403
-  TELEMETRY_TRANSPORT_BLOCKED`, so Electron parks after one call instead of
-  retrying on the shared accountless-ownership budget.
+  participant export, the performance device and consent routes). Two
+  retirements are never this 503 (round 19, 2026-10-03):
+  - The accountless performance authorization answers production's exact
+    sequence: `401 AUTH_INVALID` for a session cookie, the Worker's
+    configuration and upload-registration `503`s, the accountless-ownership
+    limiter's `429 ATTEMPT_LIMIT_REACHED` (replayed from the edge's
+    outcome), `401 DEVICE_AUTH_INVALID` for a bearer that is not an active
+    accountless device, the body's `415`, `400 BODY_INVALID` or `413`, and
+    then the terminal `403 TELEMETRY_TRANSPORT_BLOCKED`. Nothing is granted.
+    Electron parks on any of these 4xx answers instead of retrying on the
+    shared accountless-ownership budget. What the origin does not reproduce
+    is listed in the
+    [round 19 amendment](../decisions/2026-09-04-accountless-sharing-policy.md#google-cloud-cutover-amendment-2026-10-02).
+  - v0.x uploads (a v0.1 or v0.2 envelope or upload-authorization format)
+    answer d43c8f92's `403 TELEMETRY_TRANSPORT_BLOCKED` at the transport
+    write-authority step, after the claim on `/api/v1/contributions`. An
+    earlier refusal stays the Worker's own (for example `401
+    UPLOAD_AUTH_INVALID` for an unknown upload authorization, or `401
+    DEVICE_AUTH_INVALID` from the write authority).
 - **(v) Assets get a JSON 404.** A request for an asset path that reaches the
   origin answers the Worker's JSON `404 NOT_FOUND`, not an HTML page. The
   edge serves the site's assets itself, so only a request the edge forwards
   by mistake sees it.
-
-One more difference has no owner decision yet. **Status answers are reused
-for up to 1 s.** Concurrent `/api/ready` and `/api/health` requests on one
-instance share a single evaluation, and a completed evaluation (ready or
-not ready) is reused for up to 1 s (`STATUS_REUSE_MILLISECONDS` in
-`cloud-run/postgres-readiness-dispatch.mjs`, from the wave-3 host design).
-A refusal such as `503 BACKEND_STORAGE_UNAVAILABLE` is never reused. The
-Worker evaluates every request, so OD-CR-4 ("`/api/ready` matches the
-Worker exactly") does not cover this reuse: a change to the lifecycle rows,
-the migration receipt or a typed pin can show on these two routes up to
-1 s late, and in that second the stale answer can be `ready` as well as
-not ready. The storage-gated routes reread the receipt on every request and
-are not affected. Until the owner accepts or removes the reuse, read
-`/api/ready` more than 1 s after the change it must reflect.
+- **STATUS-REUSE: status answers are reused for up to 1 s.** Accepted by
+  the owner in round 19 (2026-10-03) as a documented difference, beside
+  (ii), (iii) and (v). Concurrent `/api/ready` and `/api/health` requests on
+  one instance share a single evaluation, and a completed evaluation (ready
+  or not ready) is reused for up to 1 s (`STATUS_REUSE_MILLISECONDS` in
+  `cloud-run/postgres-readiness-dispatch.mjs`, from the wave-3 host
+  design). A refusal such as `503 BACKEND_STORAGE_UNAVAILABLE` is never
+  reused. The Worker evaluates every request, so OD-CR-4 ("`/api/ready`
+  matches the Worker exactly") holds except for this reuse: a change to the
+  lifecycle rows, the migration receipt or a typed pin can show on these
+  two routes up to 1 s late, and in that second the stale answer can be
+  `ready` as well as not ready. The storage-gated routes reread the receipt
+  on every request and are not affected. Read `/api/ready` more than 1 s
+  after the change it must reflect.
 
 ## 7. Local proof and the optional live check
 

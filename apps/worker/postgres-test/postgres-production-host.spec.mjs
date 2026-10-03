@@ -25,10 +25,12 @@
 // run_maintenance over C-MAINT's lifecycle pass (the ADMIN-R12 path) answers
 // and audits a refused or skipped pass as the Worker does, never as 200; and
 // the admin run_maintenance task reports and audits the lifecycle pass's
-// folded purges under the Worker's keys (MAINT-PURGE).
+// folded purges under the Worker's keys (MAINT-PURGE); and the retired
+// accountless performance authorization answers d43c8f92's sequence (owner
+// round 19) for a really enrolled accountless device, then its definite 403.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
-import { randomBytes, randomUUID, webcrypto } from "node:crypto";
+import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
 import http from "node:http";
 import { createServer as createNetServer } from "node:net";
@@ -434,7 +436,7 @@ test("the storage gate rereads the receipt on every request: drift and a newer s
   await refusedNow("newer schema");
 }));
 
-test("round 12: retired routes are the closed 503, the performance authorization its definite 403, the admin host open", {
+test("round 12: retired routes are the closed 503, the performance authorization never the uniform 503, the admin host open", {
   skip: SKIP, timeout: 300_000,
 }, () => withProductionHost(async ({ port }) => {
   for (const [label, method, path, hostKind, extra] of [
@@ -457,14 +459,16 @@ test("round 12: retired routes are the closed 503, the performance authorization
     assert.equal(answer.headers["retry-after"], undefined, `${label}: no retry-after (OD-CR-6 iv)`);
     assertNoStoreMarked(answer, label);
   }
-  // The accountless performance authorization: production's definite 403, no retry-after.
+  // The accountless performance authorization: never the uniform 503. An unknown
+  // bearer stops at production's device-bearer step (round 19; the whole
+  // sequence is the next test).
   {
     const requestId = randomUUID();
     const answer = await send(port, { method: "POST", path: "/api/v1/accountless/telemetry-performance-authorization",
       body: "{}", headers: { ...edgeHeaders({ requestId, admission: "v1;accountless_ownership;allowed" }),
         "content-type": "application/json", authorization: "Device um_device_synthetic.unknown" } });
-    assert.equal(answer.status, 403, answer.text);
-    assert.deepEqual(JSON.parse(answer.text), { error: { code: "TELEMETRY_TRANSPORT_BLOCKED", requestId } });
+    assert.equal(answer.status, 401, answer.text);
+    assert.deepEqual(JSON.parse(answer.text), { error: { code: "DEVICE_AUTH_INVALID", requestId } });
     assert.equal(answer.headers["retry-after"], undefined);
     assertNoStoreMarked(answer, "performance authorization");
   }
@@ -506,6 +510,92 @@ test("round 12: retired routes are the closed 503, the performance authorization
   const tagged = await send(port, { path: "/api/health",
     headers: { ...verifierHeaders(), host: `candidate---${RUN_APP_HOST}` } });
   assert.equal(tagged.status, 200, tagged.text);
+}));
+
+/** src/device-auth.ts deviceHash: the stored hash of an enrolled bearer's secret. */
+function deviceSecretHash(deviceId, secret) {
+  return createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest();
+}
+
+test("round 19: the performance authorization answers d43c8f92's sequence for a real accountless device, then 403", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ base, t, port }) => {
+  const PATH = "/api/v1/accountless/telemetry-performance-authorization";
+  const validBody = JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
+    policyVersion: "accountless-telemetry-performance-policy-v1", authorizationBasis: "accountless-performance-policy-v1" });
+  // A shipped accountless installation enrolls and binds its owner through
+  // the same origin, as Electron does.
+  const deviceId = randomUUID();
+  const secret = randomBytes(32);
+  const bearer = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
+  const enrolled = await send(port, { method: "POST", path: "/api/v1/accountless/enrollment",
+    headers: { ...edgeHeaders({ admission: "v1;enrollment;allowed" }), "content-type": "application/json" },
+    body: JSON.stringify({ schemaVersion: "accountless-enrollment-v0.1", deviceId,
+      deviceSecretHash: deviceSecretHash(deviceId, secret).toString("hex"),
+      policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" }) });
+  assert.equal(enrolled.status, 201, enrolled.text);
+  const owned = await send(port, { method: "POST", path: "/api/v1/accountless/ownership",
+    headers: { ...edgeHeaders({ admission: "v1;accountless_ownership;allowed" }), "content-type": "application/json",
+      authorization: bearer },
+    body: JSON.stringify({ schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" }) });
+  assert.equal(owned.status, 201, owned.text);
+  const usedBefore = (await base.query(`SELECT last_used_at FROM ${t("device_credentials")} WHERE id = $1`,
+    [deviceId])).rows[0].last_used_at;
+
+  const ask = async ({ admission = "v1;accountless_ownership;allowed", authorization = bearer, cookie,
+    contentType = "application/json", body = validBody } = {}) => {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "POST", path: PATH, body,
+      headers: { ...edgeHeaders({ requestId, admission }), ...(authorization === null ? {} : { authorization }),
+        ...(cookie === undefined ? {} : { cookie }), ...(contentType === null ? {} : { "content-type": contentType }) } });
+    assertNoStoreMarked(answer, `${answer.status} ${answer.text}`);
+    assert.equal(JSON.parse(answer.text).error.requestId, requestId);
+    return { status: answer.status, code: errorOf(answer)?.code, retryAfter: answer.headers["retry-after"] ?? null };
+  };
+  // Every check passes: production's terminal answer, no retry-after.
+  assert.deepEqual(await ask(), { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", retryAfter: null });
+  // Like the Worker's authenticateDevice, the accepted bearer was used.
+  const usedAfter = (await base.query(`SELECT last_used_at FROM ${t("device_credentials")} WHERE id = $1`,
+    [deviceId])).rows[0].last_used_at;
+  assert.ok(new Date(usedAfter).getTime() > new Date(usedBefore ?? 0).getTime(), "last_used_at moved");
+  // Step 1: a session cookie, whatever follows.
+  assert.deepEqual(await ask({ cookie: "__Host-usage_monitor_session=synthetic", admission: "v1;accountless_ownership;limited",
+    authorization: null, body: "x" }), { status: 401, code: "AUTH_INVALID", retryAfter: null });
+  // Step 6: the edge's limited or unavailable outcome, replayed before the bearer.
+  assert.deepEqual(await ask({ admission: "v1;accountless_ownership;limited", authorization: "Device um_device_x.y" }),
+    { status: 429, code: "ATTEMPT_LIMIT_REACHED", retryAfter: "60" });
+  assert.deepEqual(await ask({ admission: "v1;accountless_ownership;unavailable" }),
+    { status: 503, code: "ADMISSION_RATE_LIMIT_UNAVAILABLE", retryAfter: "60" });
+  // Step 7: an unknown or malformed bearer, before the body.
+  for (const authorization of [`Device um_device_${randomUUID()}.${randomBytes(32).toString("base64url")}`,
+    `Device um_device_${deviceId}.${randomBytes(32).toString("base64url")}`, "Device not-a-bearer", null]) {
+    assert.deepEqual(await ask({ authorization, contentType: "text/plain", body: "x" }),
+      { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null }, String(authorization));
+  }
+  // Step 8: the body.
+  assert.deepEqual(await ask({ contentType: "text/plain" }), { status: 415, code: "CONTENT_TYPE_INVALID", retryAfter: null });
+  for (const body of ["{}", "{", JSON.stringify({ ...JSON.parse(validBody), extra: true })]) {
+    assert.deepEqual(await ask({ body }), { status: 400, code: "BODY_INVALID", retryAfter: null }, body);
+  }
+  // Step 5: upload registration paused, before the limiter and the bearer.
+  await base.query(`UPDATE ${t("collection_controls")}
+      SET revision = revision + 1, control_state = 'degraded', upload_registration_enabled = false, updated_at = $1
+    WHERE singleton = 1`, [new Date().toISOString()]);
+  assert.deepEqual(await ask({ admission: "v1;accountless_ownership;limited" }),
+    { status: 503, code: "UPLOAD_REGISTRATION_DISABLED", retryAfter: null });
+  await base.query(`UPDATE ${t("collection_controls")}
+      SET revision = revision + 1, control_state = 'operational', upload_registration_enabled = true, updated_at = $1
+    WHERE singleton = 1`, [new Date().toISOString()]);
+  // Step 7 again: a revoked device is the neutral 401, as the Worker answers it.
+  await base.query(`UPDATE ${t("device_credentials")} SET state = 'revoked', revoked_at = $2 WHERE id = $1`,
+    [deviceId, new Date().toISOString()]);
+  assert.deepEqual(await ask(), { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
+  // Nothing was granted anywhere: the origin has no performance authorization
+  // table, and no row names this device outside its enrollment graph.
+  const performanceTables = await base.query(`SELECT table_name FROM information_schema.tables
+    WHERE table_schema = current_schema() AND table_name LIKE '%performance%'`);
+  assert.deepEqual(performanceTables.rows, []);
 }));
 
 test("contributions take an ingress lease and release it on a refused body", {

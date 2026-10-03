@@ -31,7 +31,10 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../cloud-run/postgres-production-registry.mjs";
+import {
+  RETIRED_DEFINITE_PREAMBLE_STEPS,
+  RETIRED_ROUTE_DEFINITE_ANSWERS,
+} from "../cloud-run/postgres-production-registry.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -574,10 +577,13 @@ test("served routes: every production ported pair is served; every other forward
           observedServedIds.add(route.id);
           servedPairs += 1;
         } else if (Object.hasOwn(RETIRED_ROUTE_DEFINITE_ANSWERS, route.id)) {
-          // Round 12: the retired-definite route answers production's 4xx, never the 503.
-          const definite = RETIRED_ROUTE_DEFINITE_ANSWERS[route.id];
-          assert.equal(answer.status, definite.status, label);
-          assert.equal(errorCode(answer), definite.code, label);
+          // Rounds 12 and 19: the retired-definite route runs production's
+          // sequence, never the 503. This allowed request's unknown device
+          // bearer stops at the device-bearer step, as the Worker's does.
+          const [, status, code] = RETIRED_DEFINITE_PREAMBLE_STEPS[route.id]
+            .find(([step]) => step === "device_bearer");
+          assert.equal(answer.status, status, `${label}: ${answer.text}`);
+          assert.equal(errorCode(answer), code, label);
           assert.equal(answer.headers["retry-after"], undefined, label);
           definitePairs += 1;
         } else {

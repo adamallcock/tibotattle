@@ -61,13 +61,25 @@ export const RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = Object.freeze([
  * uploads"; OD-8 decided from traffic: no v0.x row was ever admitted on the
  * live ingestion database) retires both v0.x formats at the switch. The
  * composed origin registers each as a retired format and envelope
- * (origin-intake-composition.mjs) that answers the uniform
- * RETIRED_FORMAT_ANSWER, 503 POSTGRES_ROUTE_NOT_PORTED with no retry-after
- * (OD-CR-6 (iv)), and never authorizes or admits anything. Sealed historical
- * v0.x contributions are still imported (E-PT4); only new uploads retire.
+ * (origin-intake-composition.mjs) that never authorizes or admits anything.
+ * Sealed historical v0.x contributions are still imported (E-PT4); only new
+ * uploads retire.
+ *
+ * Owner round 19 (2026-10-03) fixes the answer: RETIRED_FORMAT_ANSWER, the
+ * definite 403 TELEMETRY_TRANSPORT_BLOCKED d43c8f92 gives v0.2 (its
+ * 'blocked' lifecycle), with no retry-after, at the format's own step (the
+ * transport write authority, after the route's request guards, device
+ * bearer, admission, body and upload claim). Each retired format first runs
+ * that write authority for its own identifier, so every answer d43c8f92
+ * gives before or instead of an authorization is kept exactly (401
+ * DEVICE_AUTH_INVALID with no joined row, 403 TELEMETRY_TRANSPORT_BLOCKED for
+ * v0.2, for an accountless owner or under the floor). Only where d43c8f92
+ * would authorize (v0.1 for a social participant whose floor is rank 1) does
+ * the retirement change the answer, to the same 403. The round-12 answer was
+ * the uniform 503 POSTGRES_ROUTE_NOT_PORTED.
  */
 export const ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS = RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS;
-export const RETIRED_FORMAT_ANSWER = Object.freeze({ status: 503, code: "POSTGRES_ROUTE_NOT_PORTED" });
+export const RETIRED_FORMAT_ANSWER = Object.freeze({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
 
 /** Every identifier telemetryTransportSchemaVersion accepts at d43c8f92. */
 export const TRANSPORT_SCHEMA_VERSIONS = Object.freeze([
@@ -147,28 +159,40 @@ export function resolveUploadAuthorizationFormat(formats, telemetrySchemaVersion
   return format;
 }
 
-/** A fresh RETIRED_FORMAT_ANSWER refusal (no retry-after header). */
+/** A fresh RETIRED_FORMAT_ANSWER refusal (no retry-after header, no details). */
 export function retiredFormatRefusal() {
   return refusal(RETIRED_FORMAT_ANSWER.status, RETIRED_FORMAT_ANSWER.code);
 }
 
 /**
- * Format entries for the round-12 retired v0.x formats: each one's
- * assertUploadAllowed throws retiredFormatRefusal(), so the route answers
- * 503 POSTGRES_ROUTE_NOT_PORTED where the format would decide (after the
- * route's request guards, device bearer, admission and body checks, as for
- * every format) and no authorization is ever created for it. Registering
- * the entries, rather than leaving the versions unregistered, keeps them
- * from the 403 TELEMETRY_TRANSPORT_BLOCKED of an unknown format.
+ * Format entries for the retired v0.x formats (rounds 12 and 19): each
+ * one's assertUploadAllowed runs the injected transport write authority for
+ * its own identifier, exactly as a live format does, so its refusals (401
+ * DEVICE_AUTH_INVALID, 403 TELEMETRY_TRANSPORT_BLOCKED) stand; when the
+ * authority would allow, it throws retiredFormatRefusal() instead. The route
+ * therefore answers where the format decides (after the route's request
+ * guards, device bearer, admission and body checks, as for every format),
+ * and no authorization is ever created for it. On the contributions route
+ * the same entry decides after the claim, which the preamble then abandons.
  *
+ * @param {{
+ *   assertTelemetryTransportWriteAllowed: (
+ *     pool: unknown, principal: unknown, schemaVersion: string,
+ *     options: { nowEpoch: number, schema: unknown },
+ *   ) => unknown,
+ * }} options
  * @returns {Readonly<Record<string, Readonly<{ assertUploadAllowed: Function }>>>}
  */
-export function retiredUploadAuthorizationFormatEntries() {
+export function retiredUploadAuthorizationFormatEntries({ assertTelemetryTransportWriteAllowed } = {}) {
+  if (typeof assertTelemetryTransportWriteAllowed !== "function") {
+    throw formatsError("assertTelemetryTransportWriteAllowed must be a function");
+  }
   /** @type {Record<string, Readonly<{ assertUploadAllowed: Function }>>} */
   const entries = {};
   for (const schemaVersion of ROUND_12_RETIRED_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS) {
     entries[schemaVersion] = Object.freeze({
-      assertUploadAllowed() {
+      async assertUploadAllowed(pool, device, nowEpoch, { schema } = {}) {
+        await assertTelemetryTransportWriteAllowed(pool, device, schemaVersion, { nowEpoch, schema });
         throw retiredFormatRefusal();
       },
     });

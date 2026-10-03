@@ -10,6 +10,9 @@
  * - unported: answered by the request handler with the closed
  *   503 POSTGRES_ROUTE_NOT_PORTED and no retry-after (OD-CR-6 (iv)), never
  *   by a family;
+ * - definite: a retired route answered by its injected preamble's first
+ *   refusal, else by its fixed terminal answer; never by a family and never
+ *   granted;
  * - root: answered by the request handler itself, as the Worker answers it
  *   (apple_domain_association 404 for every method; the disabled Sparkle
  *   appcast guard 405 Allow: POST, else 404). The edge answers both first.
@@ -33,15 +36,23 @@
  *   answer the uniform 503 POSTGRES_ROUTE_NOT_PORTED with no retry-after
  *   (OD-CR-6 (iv));
  * - retired-definite (1): the accountless performance authorization, retired
- *   like the others but answered with the definite 4xx production gives
- *   today (RETIRED_ROUTE_DEFINITE_ANSWERS), a route-specific deviation from
- *   OD-CR-6's uniform 503 that round 12 decided so callers park after one
- *   call instead of retrying on the shared accountless_ownership budget;
+ *   like the others but never the uniform 503: it answers production's exact answer
+ *   sequence (owner round 19, 2026-10-03; round 12 had fixed one code). Its
+ *   injected preamble (postgres-test-dispatch.mjs
+ *   createPostgresRetiredPerformanceAuthorizationPreamble) runs production's
+ *   checks before the grant in order and answers the first refusal; when
+ *   every check passes, the request handler answers the route's terminal
+ *   code (RETIRED_ROUTE_DEFINITE_ANSWERS), which production's grant answers
+ *   while the performance runtime is 'staged'. Nothing is ever granted, so
+ *   callers park on a 4xx instead of retrying on the shared
+ *   accountless_ownership budget;
  * - root (2).
  * Round 12 also retires v0.x uploads, which are formats inside two ported
  * scope routes (contributions and device_upload_authorization), not routes:
  * origin-intake-composition.mjs registers the v0.1 and v0.2 envelopes and
- * formats as retired, answering the same uniform 503.
+ * formats as retired. Round 19 makes their answer d43c8f92's definite 403
+ * TELEMETRY_TRANSPORT_BLOCKED (upload-authorization-formats.mjs
+ * RETIRED_FORMAT_ANSWER), not the uniform 503.
  * The ported set is INJECTED: it must contain every scope route and may add
  * any subset of the od-cr-1 and admin routes. A retired route can never be
  * ported (PRODUCTION_ROUTE_PORT_RETIRED); porting one needs a new owner
@@ -71,7 +82,7 @@ export const ORIGIN_ROUTE_DISPOSITIONS = Object.freeze({
   PORTED: "ported",
   /** The uniform 503 POSTGRES_ROUTE_NOT_PORTED (OD-CR-6 (iv): no retry-after). */
   UNPORTED: "unported",
-  /** A retired route's fixed definite answer (RETIRED_ROUTE_DEFINITE_ANSWERS). */
+  /** A retired route's preamble, then its fixed terminal answer (RETIRED_ROUTE_DEFINITE_ANSWERS). */
   DEFINITE: "definite",
   ROOT: "root",
 });
@@ -179,14 +190,13 @@ export const OD_CR_1_CONTESTED_ROUTE_IDS = idsOfClass(C);
 export const ADMIN_HOST_ROUTE_IDS = idsOfClass(A);
 /** Round 12: the 12 retired routes, answered 503 POSTGRES_ROUTE_NOT_PORTED. */
 export const RETIRED_ROUTE_IDS = idsOfClass(X);
-/** Round 12: the retired route answered with a definite 4xx instead. */
+/** Round 12: the retired route answered with production's sequence, never the uniform 503. */
 export const RETIRED_DEFINITE_ROUTE_IDS = idsOfClass(D);
 
 /**
- * Round 12 (2026-10-02, "accountless performance authorization: a definite
- * 4xx, the same as production today"): the answer of each retired-definite
- * route, rendered in the Worker envelope ({error: {code, requestId}}) with
- * no retry-after and never reaching a family.
+ * The terminal answer of each retired-definite route, rendered in the Worker
+ * envelope ({error: {code, requestId}}) with no retry-after, once its
+ * preamble (RETIRED_DEFINITE_PREAMBLE_STEPS) has passed.
  *
  * accountless_telemetry_performance_authorization: at d43c8f92
  * handleAccountlessTelemetryPerformanceAuthorization grants only while
@@ -195,16 +205,42 @@ export const RETIRED_DEFINITE_ROUTE_IDS = idsOfClass(D);
  * grantTelemetryPerformanceAccountlessAuthorization finds no owner row and
  * answers invalid(): 403 TELEMETRY_TRANSPORT_BLOCKED. Production's 30-day
  * edge counts (command pack, 2026-10-02) show every call to the route
- * answered 4xx. The origin answers that terminal code to every allowed
- * method, without the Worker's earlier preamble steps (cookie, admission,
- * device bearer, body), each of which is also a 4xx or a configuration 503
- * the caller cannot clear: Electron's client parks on any 4xx.
+ * answered 4xx. Round 12 answered this terminal code to every request;
+ * round 19 (2026-10-03) requires production's earlier answers first.
  */
 export const RETIRED_ROUTE_DEFINITE_ANSWERS = Object.freeze({
   accountless_telemetry_performance_authorization: Object.freeze({
     status: 403,
     code: "TELEMETRY_TRANSPORT_BLOCKED",
   }),
+});
+
+/**
+ * Owner round 19 (2026-10-03, "reproduce production's exact codes"): each
+ * retired-definite route's d43c8f92 answer sequence before its terminal
+ * answer, in order, as [step, status, code]. The injected preamble answers
+ * the first that applies. 'storage' is the origin's own storage gate
+ * (OD-CR-6 (iii)); production's later requireTelemetryPerformanceStorageMode
+ * and deletion-ledger tombstone read are not reproduced (the round 19
+ * amendment of docs/decisions/2026-09-04-accountless-sharing-policy.md says
+ * why). A 405 for a wrong method comes first, from the registry envelope.
+ */
+export const RETIRED_DEFINITE_PREAMBLE_STEPS = Object.freeze({
+  accountless_telemetry_performance_authorization: Object.freeze([
+    ["session_cookie", 401, "AUTH_INVALID"],
+    ["storage", 503, "BACKEND_STORAGE_UNAVAILABLE"],
+    ["ownership_mode", 503, "ACCOUNTLESS_OWNERSHIP_DISABLED"],
+    ["ownership_mode", 503, "ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID"],
+    ["admission_bindings", 503, "ADMISSION_CONFIGURATION_INVALID"],
+    ["upload_registration", 503, "UPLOAD_REGISTRATION_DISABLED"],
+    ["attempt_limit", 429, "ATTEMPT_LIMIT_REACHED"],
+    ["attempt_limit", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
+    ["device_bearer", 401, "DEVICE_AUTH_INVALID"],
+    ["body", 415, "CONTENT_TYPE_INVALID"],
+    ["body", 400, "BODY_INVALID"],
+    ["body", 413, "BODY_TOO_LARGE"],
+    ["body", 408, "BODY_TIMEOUT"],
+  ].map((step) => Object.freeze(step))),
 });
 
 /** Online-erasure surfaces retired under append-only; neither is a registry route. */
@@ -335,15 +371,19 @@ function validatedPortedIds(portedRouteIds, policyIds) {
   return ported;
 }
 
-/** A snapshot of the handler Map: exactly one function per ported id. */
+/**
+ * A snapshot of the handler Map: exactly one function per ported id (its
+ * built-in) and per retired-definite id (its preamble, round 19), nothing
+ * else.
+ */
 function validatedHandlers(handlers, ported) {
   if (!(handlers instanceof Map)) refuse("PRODUCTION_ROUTE_HANDLERS_INVALID");
   const snapshot = new Map(handlers);
   for (const key of snapshot.keys()) {
     if (ROOT_IDS.has(key)) refuse("PRODUCTION_ROUTE_ROOT_CLAIMED");
-    if (!ported.has(key)) refuse("PRODUCTION_ROUTE_HANDLER_UNEXPECTED");
+    if (!ported.has(key) && !RETIRED_DEFINITE_ROUTE_IDS.includes(key)) refuse("PRODUCTION_ROUTE_HANDLER_UNEXPECTED");
   }
-  for (const id of ported) {
+  for (const id of [...ported, ...RETIRED_DEFINITE_ROUTE_IDS]) {
     if (typeof snapshot.get(id) !== "function") refuse("PRODUCTION_ROUTE_HANDLER_MISSING");
   }
   return snapshot;
@@ -378,7 +418,9 @@ function foldedHandlers(snapshot, policy, ported, routeModules, routeModuleConte
 /**
  * Build the registry. routePolicy is the Worker's WORKER_ROUTE_POLICY;
  * handlers a Map<routeId, (request) => Promise<Response>> (each ported
- * route's built-in); portedRouteIds the injected ported set (required, no
+ * route's built-in) that also maps each retired-definite id to its preamble,
+ * (request) => Promise<Response | null> (an error answer, or null to let the
+ * terminal answer stand); portedRouteIds the injected ported set (required, no
  * default); routeModules (optional) an origin route-module registry with
  * routeModuleContext(request), the per-request module context, folded into
  * the handlers of the routes they serve. Refusals, in order:
@@ -394,15 +436,19 @@ function foldedHandlers(snapshot, policy, ported, routeModules, routeModuleConte
  * - PRODUCTION_ROUTE_SCOPE_INCOMPLETE: a scope route is not ported;
  * - PRODUCTION_ROUTE_HANDLERS_INVALID: handlers is not a Map;
  * - PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler key outside the ported
- *   set (an unported id, a pathname such as the v1.2 effective page, or
- *   any other key), or a route module for a route that is not ported;
- * - PRODUCTION_ROUTE_HANDLER_MISSING: a ported id without a function;
+ *   and retired-definite sets (an unported id, a pathname such as the v1.2
+ *   effective page, or any other key), or a route module for a route that
+ *   is not ported;
+ * - PRODUCTION_ROUTE_HANDLER_MISSING: a ported id without a function, or a
+ *   retired-definite id without its preamble;
  * - PRODUCTION_ROUTE_MODULES_INVALID: routeModules is not an issued
  *   route-module registry, or routeModuleContext is not a function.
  *
  * Returns a frozen registry: resolve(routeId) gives a frozen
- * { disposition, handler, answer } (handler null unless ported, answer null
- * unless definite; an id outside the policy throws PRODUCTION_ROUTE_UNKNOWN);
+ * { disposition, handler, answer } (handler the built-in when ported and the
+ * preamble when definite, else null; answer the terminal answer when
+ * definite, else null; an id outside the policy throws
+ * PRODUCTION_ROUTE_UNKNOWN);
  * portedRouteIds and portedPathnames in Worker order; unportedRouteIds (the
  * 503 answers: every retired route and any admin route the root did not
  * port) and definiteRouteIds sorted; rootRouteIds; coverage 'complete'
@@ -425,7 +471,9 @@ export function createProductionRouteRegistry({
         : definite ? ORIGIN_ROUTE_DISPOSITIONS.DEFINITE : ORIGIN_ROUTE_DISPOSITIONS.UNPORTED;
     resolutions.set(entry.id, Object.freeze({
       disposition,
-      handler: disposition === ORIGIN_ROUTE_DISPOSITIONS.PORTED ? snapshot.get(entry.id) : null,
+      handler: disposition === ORIGIN_ROUTE_DISPOSITIONS.PORTED || disposition === ORIGIN_ROUTE_DISPOSITIONS.DEFINITE
+        ? snapshot.get(entry.id)
+        : null,
       answer: definite ? RETIRED_ROUTE_DEFINITE_ANSWERS[entry.id] : null,
     }));
   }

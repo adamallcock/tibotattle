@@ -159,6 +159,8 @@ function syntheticOrigin({
     const result = readiness.buildPostgresReadinessBody(readinessState, NOW, { semantics: "worker-exact" });
     return errors.jsonResponse(result.body, result.httpStatus);
   });
+  // Round 19: the retired-definite route takes its preamble; the smoke never reads it.
+  for (const id of registryModule.RETIRED_DEFINITE_ROUTE_IDS) families.set(id, async () => null);
   const registry = registryModule.createProductionRouteRegistry({
     routePolicy: policy, handlers: families, portedRouteIds: registryModule.POSTGRES_SCOPE_ROUTE_IDS,
   });

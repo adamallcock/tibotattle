@@ -16,7 +16,10 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { bundleExportNames, readCompatibility, wranglerEnvironment } from "./edge-bundle.mjs";
-import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../../cloud-run/postgres-production-registry.mjs";
+import {
+  RETIRED_DEFINITE_PREAMBLE_STEPS,
+  RETIRED_ROUTE_DEFINITE_ANSWERS,
+} from "../../cloud-run/postgres-production-registry.mjs";
 import {
   EDGE_E2E_AUDIENCE,
   EDGE_E2E_INVOKER,
@@ -41,8 +44,10 @@ import {
 import {
   EDGE_LOCAL_ROUTE_IDS,
   PUBLICATION_DISABLED_ROW,
+  UNKNOWN_DEVICE_BEARER,
   adminRows,
   admissionRows,
+  definiteSweepAnswers,
   forwardedRows,
   localRows,
   routeMethodCoverage,
@@ -189,20 +194,30 @@ test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair an
     }
   }
   // The policy routes the origin does not serve are swept as unported rows,
-  // or (round 12) as their retired-definite answer.
-  const sweep = sweepRows({ registry: routes, servedRouteIds: served, definiteAnswers: RETIRED_ROUTE_DEFINITE_ANSWERS });
+  // or (rounds 12 and 19) as their retired-definite answer.
+  const definiteAnswers = definiteSweepAnswers(RETIRED_DEFINITE_PREAMBLE_STEPS);
+  const sweep = sweepRows({ registry: routes, servedRouteIds: served, definiteAnswers });
   for (const route of policyRoutes.filter((candidate) => !served.includes(candidate.id))) {
     const comparator = Object.hasOwn(RETIRED_ROUTE_DEFINITE_ANSWERS, route.id) ? "definite" : "unported";
     assert.ok(sweep.some((row) => row.routeId === route.id && row.comparators.includes(comparator)), route.id);
   }
-  // The definite route is never swept as the unported 503, and its expected
-  // answer is the registry's.
+  // The definite route is never swept as the unported 503. Round 19: the
+  // sweep's unknown device bearer stops at the device-bearer step, 401
+  // DEVICE_AUTH_INVALID (never the terminal 403), which the unchanged Worker
+  // gives the same request, so the row also compares with the Worker.
   const definite = sweep.filter((row) => row.comparators.includes("definite"));
   assert.deepEqual([...new Set(definite.map((row) => row.routeId))], Object.keys(RETIRED_ROUTE_DEFINITE_ANSWERS));
+  assert.deepEqual(JSON.parse(JSON.stringify(definiteAnswers)),
+    { accountless_telemetry_performance_authorization: { status: 401, code: "DEVICE_AUTH_INVALID" } });
   for (const row of definite) {
     assert.equal(row.comparators.includes("unported"), false, row.id);
-    assert.deepEqual(row.expect, { ...RETIRED_ROUTE_DEFINITE_ANSWERS[row.routeId] }, row.id);
+    assert.ok(row.comparators.includes("worker"), row.id);
+    assert.deepEqual(row.expect, { ...definiteAnswers[row.routeId] }, row.id);
+    assert.equal(row.headers.authorization, UNKNOWN_DEVICE_BEARER, row.id);
+    assert.equal(row.headers.cookie, undefined, row.id);
   }
+  assert.throws(() => definiteSweepAnswers({ synthetic: [["session_cookie", 401, "AUTH_INVALID"]] }),
+    /REQUEST_MATRIX_DEFINITE_STEP_UNKNOWN synthetic/u);
   assert.deepEqual([...EDGE_LOCAL_ROUTE_IDS].sort(), ["apple_domain_association", "sparkle_appcast_guard"]);
   // Removing one sweep row is detected.
   const short = routeMethodCoverage({ registry: routes, rows: rows.filter((row) => row.id !== "sweep-envelope_key-GET"
