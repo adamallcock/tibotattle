@@ -64,7 +64,7 @@
   "bucket": {
     "name": "tibotattle-quarantine",
     "location": "US-EAST1",
-    "proof": null
+    "proof": { "bucketGeneration": "1790991062981114944", "bucketMetageneration": "1" }
   },
   "service": {
     "name": "tibotattle-origin",
