@@ -30,7 +30,29 @@
  *     completes in one pass, as it does on the Worker. The page is complete
  *     when nothing due remains beyond it and no candidate was deferred.
  *     Throughput parity needs the trigger to run every minute, like the
- *     Worker cron.
+ *     Worker cron;
+ *   - purges (MAINT-PURGE): the identity and device-lifecycle purges of the
+ *     scheduled slice (src/postgres-maintenance.ts), which the Worker's
+ *     scheduled handler runs every invocation: one bounded page each of
+ *     expired Apple and Google sign-in handoffs, aged sign-in admission
+ *     windows (purgePostgresExpiredIdentityRows), then stale device pairings,
+ *     credentials and upload authorizations and expired rotation and
+ *     pairing-event history (purgePostgresStaleDeviceLifecycleRows). The
+ *     cutoff is the completion clock, not the cycle, as the Worker purges
+ *     handoffs at its actual run time. They run in the Worker's order:
+ *     before the lifecycle write, as the Worker's identity phase runs before
+ *     runBackendLifecycle. A preflight transaction first proves the receipt,
+ *     the 0064 pins, the lease pair and the cycle order and finds a cycle
+ *     already complete in both rows, writing nothing; so no purge runs on a
+ *     refused schema or state, and a cycle already complete skips them (its
+ *     first complete pass ran them). A purge failure therefore writes
+ *     neither row (on a new cycle both keep the previous one), and readiness
+ *     reads what it read before, as on a Worker whose identity phase throws
+ *     (OD-CR-4). A purge backlog
+ *     beyond one page leaves readiness alone and reports partial,
+ *     MAINTENANCE_PURGE_BACKLOG; later cycles drain it. Each page deletes or
+ *     revokes only rows past its cutoff and skips rows another transaction
+ *     holds, so a replay changes nothing twice.
  *
  * Safety:
  *   - one session-level advisory lock, shared with the scheduled maintenance
@@ -43,19 +65,22 @@
  *     'tibotattle:primary:<schema>'). While a migration runs the pass is
  *     skipped with no write; while a pass runs the runner refuses
  *     POSTGRES_MIGRATION_CONFLICT. So the reviewed runner never commits a
- *     migration in the middle of a pass, including the reconciler's own
- *     per-object transactions and object-store calls;
- *   - every transaction this module opens (the lifecycle write, the lease,
- *     the completion and the failure record) first proves the primary
- *     migration receipt equals the caller's expected manifest. The
- *     reconciler's per-object transactions do not re-check it; the fence
- *     covers them. A schema change made outside the runner is caught at the
+ *     migration in the middle of a pass, including the purge pages and the
+ *     reconciler's own per-object transactions and object-store calls;
+ *   - every transaction this module opens (the preflight, the lifecycle
+ *     write, the lease, the completion and the failure record) first proves
+ *     the primary migration receipt equals the caller's expected manifest. The
+ *     reconciler's per-object transactions and the purge pages do not
+ *     re-check it; the fence covers them. A schema change made outside the runner is caught at the
  *     pass's next own transaction, after the page in flight;
  *   - idempotent per cycle: a pass whose cycle is already complete in both
  *     rows writes nothing. A cycle older than either stored marker is refused;
- *   - refusals: one raised inside the lifecycle transaction (receipt, pins,
- *     lease pair, regression, shape, or a CHECK violation, SQLSTATE 23514, on
- *     the lifecycle write) rolls back and leaves both rows unchanged. One
+ *   - refusals: one raised in the preflight (receipt, pins, lease pair,
+ *     regression, shape) leaves both rows unchanged and runs no purge; one
+ *     raised inside the lifecycle transaction (the same checks again, or a
+ *     CHECK violation, SQLSTATE 23514, on the lifecycle write) rolls back and
+ *     leaves both rows unchanged after the purges ran, as the Worker's
+ *     runBackendLifecycle can fail after its identity phase. One
  *     raised while the reconciliation lease is taken, a separate transaction,
  *     leaves the lifecycle row on the new cycle (already committed) and the
  *     reconciliation row unchanged, so readiness reads not_ready on the
@@ -85,7 +110,15 @@ import {
   type PostgresQuarantineReconciliationState,
   type PostgresRetentionState,
 } from "./postgres-lifecycle-state";
-import { POSTGRES_SCHEDULED_MAINTENANCE_LOCK_DOMAIN } from "./postgres-maintenance";
+import {
+  purgePostgresStaleDeviceLifecycleRows,
+  type PostgresDeviceLifecycleReceipt,
+} from "./postgres-device-lifecycle";
+import {
+  POSTGRES_SCHEDULED_MAINTENANCE_LOCK_DOMAIN,
+  purgePostgresExpiredIdentityRows,
+  type PostgresExpiredIdentityPurgeReceipt,
+} from "./postgres-maintenance";
 import {
   DEFAULT_POSTGRES_PENDING_OBJECT_SAFETY_WINDOW_MILLISECONDS,
   POSTGRES_PENDING_OBJECT_RECONCILIATION_BATCH_LIMIT,
@@ -138,7 +171,7 @@ export const POSTGRES_LIFECYCLE_PASS_OUTCOMES = Object.freeze([
 /** The closed result codes, by outcome. */
 export const POSTGRES_LIFECYCLE_PASS_CODES = Object.freeze({
   complete: Object.freeze(["LIFECYCLE_PASS_COMPLETE", "LIFECYCLE_CYCLE_ALREADY_COMPLETE"] as const),
-  partial: Object.freeze(["QUARANTINE_RECONCILIATION_BACKLOG"] as const),
+  partial: Object.freeze(["QUARANTINE_RECONCILIATION_BACKLOG", "MAINTENANCE_PURGE_BACKLOG"] as const),
   skipped: Object.freeze(["MAINTENANCE_IN_PROGRESS", "MIGRATION_IN_PROGRESS"] as const),
   refused: Object.freeze([
     "POSTGRES_VERSION_UNSUPPORTED",
@@ -191,6 +224,18 @@ export interface PostgresLifecyclePassReconciliation {
   readonly hasMore: boolean;
 }
 
+/** One run of the folded scheduled purges (MAINT-PURGE): counts and completeness only. */
+export interface PostgresLifecyclePassPurges {
+  /**
+   * Expired Apple and Google handoffs plus aged sign-in admission windows:
+   * the combined totals, and each part under handoffs and signInAdmissions.
+   */
+  readonly identity: PostgresExpiredIdentityPurgeReceipt;
+  readonly deviceLifecycle: PostgresDeviceLifecycleReceipt;
+  /** Nothing past any cutoff remains (every readback found none). */
+  readonly complete: boolean;
+}
+
 export interface PostgresLifecyclePassResult {
   readonly schemaVersion: typeof POSTGRES_LIFECYCLE_PASS_RECEIPT_VERSION;
   readonly outcome: PostgresLifecyclePassOutcome;
@@ -208,6 +253,15 @@ export interface PostgresLifecyclePassResult {
   readonly quarantineObjectsDeleted: 0;
   readonly reconciliation: PostgresLifecyclePassReconciliation | null;
   readonly quarantineReconciliationComplete: boolean;
+  /**
+   * The folded purges of this pass (MAINT-PURGE), or null when this pass did
+   * not finish them: skipped, refused in the preflight, failed before or
+   * during them, or a cycle already complete. Their pages are committed as
+   * they run, so a null after a failure does not mean nothing was purged. A
+   * pass refused or failed after them (the lifecycle write, the lease or the
+   * reconciliation) still reports them.
+   */
+  readonly maintenancePurges: PostgresLifecyclePassPurges | null;
   readonly appendOnlyNotApplicable: typeof POSTGRES_APPEND_ONLY_NOT_APPLICABLE;
 }
 
@@ -416,7 +470,13 @@ interface LifecyclePhase {
   readonly lifecycleWritten: boolean;
 }
 
-async function lifecyclePhase(config: ValidatedOptions): Promise<LifecyclePhase> {
+/**
+ * Prove the receipt, the 0064 pins, the lease pair and the cycle order under
+ * the row locks, and find a cycle already complete in both rows. With `write`
+ * false (the preflight) it stops there and writes nothing; with `write` true
+ * it then stamps the lifecycle row for the cycle unless it already carries it.
+ */
+async function lifecyclePhase(config: ValidatedOptions, write: boolean): Promise<LifecyclePhase> {
   return withPostgresMutation(config.pool, async (client) => {
     await assertReceipt(client, config);
     const { retention, reconciliation } = await lockRows(client, config);
@@ -424,7 +484,7 @@ async function lifecyclePhase(config: ValidatedOptions): Promise<LifecyclePhase>
     if (lifecycleDone && reconciliationCompleteFor(reconciliation, config.cycle)) {
       return Object.freeze({ noop: true, lifecycleWritten: false });
     }
-    if (lifecycleDone) return Object.freeze({ noop: false, lifecycleWritten: false });
+    if (lifecycleDone || !write) return Object.freeze({ noop: false, lifecycleWritten: false });
     const completedAt = canonical(nowFrom(config.clock));
     // restore_replay_complete and restored_participants_suppressed are not
     // written: the WHERE clause re-asserts their pins under the row lock.
@@ -447,7 +507,10 @@ async function lifecyclePhase(config: ValidatedOptions): Promise<LifecyclePhase>
     );
     if (written.rows.length !== 1) throw new LifecyclePassRefusal("LIFECYCLE_RESTORE_PIN_CONFLICT");
     return Object.freeze({ noop: false, lifecycleWritten: true });
-  }, { operation: "lifecycle_pass.lifecycle", preserveSafeError: safeRefusal });
+  }, {
+    operation: write ? "lifecycle_pass.lifecycle" : "lifecycle_pass.preflight",
+    preserveSafeError: safeRefusal,
+  });
 }
 
 function leaseId(cycleEpoch: number): string {
@@ -624,6 +687,7 @@ interface PassBody {
   readonly reconciliation: PostgresLifecyclePassReconciliation | null;
   readonly reconciliationComplete: boolean;
   readonly reconciliationWritten: boolean;
+  readonly purges: PostgresLifecyclePassPurges | null;
   readonly code: PostgresLifecyclePassCode;
   readonly outcome: PostgresLifecyclePassOutcome;
 }
@@ -646,6 +710,7 @@ function result(
     quarantineObjectsDeleted: 0,
     reconciliation: body.reconciliation,
     quarantineReconciliationComplete: body.reconciliationComplete,
+    maintenancePurges: body.purges,
     appendOnlyNotApplicable: POSTGRES_APPEND_ONLY_NOT_APPLICABLE,
   });
 }
@@ -657,6 +722,7 @@ function idle(outcome: PostgresLifecyclePassOutcome, code: PostgresLifecyclePass
     reconciliation: null,
     reconciliationComplete: false,
     reconciliationWritten: false,
+    purges: null,
     code,
     outcome,
   });
@@ -681,25 +747,56 @@ function pageSummary(page: PostgresPendingObjectReconciliationResult): PostgresL
   });
 }
 
+/**
+ * One page of each folded scheduled purge, at the completion clock, in the
+ * Worker's order (handoffs, sign-in windows, device lifecycle). Each opens
+ * its own transactions on the pass's pool; the migration fence the pass
+ * holds covers them, like the reconciler's.
+ */
+async function maintenancePurges(config: ValidatedOptions): Promise<PostgresLifecyclePassPurges> {
+  const nowEpoch = nowFrom(config.clock);
+  const identity = await purgePostgresExpiredIdentityRows(config.pool, {
+    schema: config.schemaOptions,
+    nowEpoch,
+  });
+  const deviceLifecycle = await purgePostgresStaleDeviceLifecycleRows(config.pool, {
+    schema: config.schemaOptions,
+    nowEpoch,
+  });
+  return Object.freeze({
+    identity,
+    deviceLifecycle,
+    complete: identity.complete && deviceLifecycle.complete,
+  });
+}
+
 async function passUnderLock(config: ValidatedOptions): Promise<PassBody> {
   let lifecycleWritten = false;
   let lifecycleComplete = false;
   let reconciliationWritten = false;
+  let purges: PostgresLifecyclePassPurges | null = null;
+  const alreadyComplete = (): PassBody => Object.freeze({
+    lifecycleWritten: false,
+    lifecycleComplete: true,
+    reconciliation: null,
+    reconciliationComplete: true,
+    reconciliationWritten: false,
+    purges,
+    code: "LIFECYCLE_CYCLE_ALREADY_COMPLETE",
+    outcome: "complete",
+  });
   try {
-    const lifecycle = await lifecyclePhase(config);
+    // The Worker's order: prove the state (no write), purge, then stamp the
+    // lifecycle row, so a purge failure writes neither row.
+    if ((await lifecyclePhase(config, false)).noop) return alreadyComplete();
+    const ran = await maintenancePurges(config);
+    purges = ran;
+    const lifecycle = await lifecyclePhase(config, true);
     lifecycleWritten = lifecycle.lifecycleWritten;
     lifecycleComplete = true;
-    if (lifecycle.noop) {
-      return Object.freeze({
-        lifecycleWritten: false,
-        lifecycleComplete: true,
-        reconciliation: null,
-        reconciliationComplete: true,
-        reconciliationWritten: false,
-        code: "LIFECYCLE_CYCLE_ALREADY_COMPLETE",
-        outcome: "complete",
-      });
-    }
+    // Unreachable while the maintenance lock is held (nothing else writes the
+    // two rows), and closed regardless: the purges already ran.
+    if (lifecycle.noop) return alreadyComplete();
     const lease = leaseId(config.cycleEpoch);
     await acquireReconciliation(config, lease);
     reconciliationWritten = true;
@@ -728,8 +825,11 @@ async function passUnderLock(config: ValidatedOptions): Promise<PassBody> {
       reconciliation: pageSummary(page),
       reconciliationComplete: complete,
       reconciliationWritten,
-      code: complete ? "LIFECYCLE_PASS_COMPLETE" : "QUARANTINE_RECONCILIATION_BACKLOG",
-      outcome: complete ? "complete" : "partial",
+      purges,
+      code: !complete
+        ? "QUARANTINE_RECONCILIATION_BACKLOG"
+        : ran.complete ? "LIFECYCLE_PASS_COMPLETE" : "MAINTENANCE_PURGE_BACKLOG",
+      outcome: complete && ran.complete ? "complete" : "partial",
     });
   } catch (error) {
     const base = {
@@ -738,6 +838,7 @@ async function passUnderLock(config: ValidatedOptions): Promise<PassBody> {
       reconciliation: null,
       reconciliationComplete: false,
       reconciliationWritten,
+      purges,
     };
     if (error instanceof LifecyclePassRefusal) {
       return Object.freeze({ ...base, code: error.code, outcome: "refused" });

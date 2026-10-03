@@ -359,8 +359,21 @@ async function reconciliationRow(pool, table) {
 const RESULT_KEYS = Object.freeze([
   "schemaVersion", "outcome", "code", "changed", "cycle", "lockAcquired", "lifecycleComplete",
   "lifecycleWritten", "quarantineRetentionComplete", "quarantineObjectsDeleted", "reconciliation",
-  "quarantineReconciliationComplete", "appendOnlyNotApplicable",
+  "quarantineReconciliationComplete", "maintenancePurges", "appendOnlyNotApplicable",
 ]);
+/** The folded purges of a pass that found nothing to purge (MAINT-PURGE). */
+const NOTHING_PURGED = Object.freeze({
+  identity: {
+    purged: 0, complete: true,
+    handoffs: { purged: 0, complete: true },
+    signInAdmissions: { purged: 0, complete: true },
+  },
+  deviceLifecycle: {
+    pairingsRevoked: 0, devicesRevoked: 0, uploadsRevoked: 0, rotationsPurged: 0, pairingEventsPurged: 0,
+    complete: true,
+  },
+  complete: true,
+});
 const NOT_APPLICABLE = Object.freeze({
   restoreReplayComplete: true, deletionTombstoneRetentionComplete: true, ownerErasureJobsComplete: true,
 });
@@ -416,6 +429,7 @@ test("an empty origin reads not_ready until the first pass, then ready; a repeat
     registrationsExamined: 0, deletionGraceStarted: 0, legacyLeasesAdopted: 0, orphanObjectsDeleted: 0,
     orphanObjectsAlreadyAbsent: 0, referencedObjectsPreserved: 0, candidatesDeferred: 0, hasMore: false,
   });
+  assert.deepEqual(JSON.parse(JSON.stringify(first.maintenancePurges)), NOTHING_PURGED);
 
   const ready = await readiness(pool, schema, BASE_CYCLE + 2_000);
   assert.equal(ready.httpStatus, 200);
@@ -454,6 +468,7 @@ test("an empty origin reads not_ready until the first pass, then ready; a repeat
   assert.equal(repeat.changed, false);
   assert.equal(repeat.lifecycleWritten, false);
   assert.equal(repeat.reconciliation, null);
+  assert.equal(repeat.maintenancePurges, null, "a cycle already complete ran its purges with its first pass");
   assert.deepEqual(await snapshot(pool, table), before);
 
   // The next cycle moves both markers together and stays ready.
@@ -697,10 +712,15 @@ test("every pre-write conflict refuses with a closed code and writes nothing", {
   await pool.query(`UPDATE ${retention} SET last_started_at = $1`, [iso(BASE_CYCLE)]);
 
   // Receipt drift: an older schema, a newer schema and a different image.
+  // The preflight refuses before any purge (MAINT-PURGE): an expired handoff
+  // survives every refusal and goes with the healed pass below.
+  await seedHandoffs(pool, table, 1, BASE_CYCLE - MINUTE, "refused");
   const history = table("_tibotattle_migration_history");
   const last = (await pool.query(`SELECT * FROM ${history} ORDER BY version DESC LIMIT 1`)).rows[0];
   await pool.query(`DELETE FROM ${history} WHERE version = $1`, [last.version]);
-  await refusedWithoutWrite(context, next, "POSTGRES_SCHEMA_RECEIPT_MISMATCH");
+  const receiptRefused = await refusedWithoutWrite(context, next, "POSTGRES_SCHEMA_RECEIPT_MISMATCH");
+  assert.equal(receiptRefused.maintenancePurges, null, "a refused preflight runs no purge");
+  assert.deepEqual(await handoffCount(pool, table), { apple: 1, google: 1 });
   const columns = Object.keys(last);
   await pool.query(
     `INSERT INTO ${history} (${columns.map((name) => `"${name}"`).join(", ")})
@@ -743,8 +763,11 @@ test("every pre-write conflict refuses with a closed code and writes nothing", {
   }
 
   // With every conflict removed the same cycle completes.
+  assert.deepEqual(await handoffCount(pool, table), { apple: 1, google: 1 }, "no refusal purged");
   const healed = await runPass(context, next);
   assert.equal(healed.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.equal(healed.maintenancePurges.identity.handoffs.purged, 2);
+  assert.deepEqual(await handoffCount(pool, table), { apple: 0, google: 0 });
   assert.equal((await readiness(pool, schema, next + 2_000)).body.status, "ready");
 }));
 
@@ -759,7 +782,10 @@ test("a CHECK violation refuses: in the lifecycle write nothing changes, while t
   // A constraint the lifecycle write violates (NOT VALID: the stored row stays legal).
   await pool.query(`ALTER TABLE ${table("retention_state")}
     ADD CONSTRAINT c_maint_synthetic_retention_conflict CHECK (maintenance_run_at <= $$${iso(BASE_CYCLE)}$$::timestamptz) NOT VALID`);
-  await refusedWithoutWrite(context, first, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  const writeRefused = await refusedWithoutWrite(context, first, "LIFECYCLE_STATE_CHECK_CONFLICT");
+  // The purges precede the lifecycle write, as the Worker's identity phase
+  // precedes runBackendLifecycle, so this refusal still reports them.
+  assert.deepEqual(JSON.parse(JSON.stringify(writeRefused.maintenancePurges)), NOTHING_PURGED);
   await pool.query(`ALTER TABLE ${table("retention_state")} DROP CONSTRAINT c_maint_synthetic_retention_conflict`);
 
   // A constraint only the reconciliation lease violates. The lease is taken in
@@ -909,6 +935,191 @@ test("the pass holds the migration runner's lock shared: a running migration ski
   assert.equal(taken.state, "completed");
   assert.equal(taken.lease_id, null);
   assert.equal((await readiness(pool, schema, driftCycle + MINUTE + 2_000)).body.status, "ready");
+}));
+
+/** One sign-in handoff of each provider expiring at `expiresEpoch`, with synthetic states. */
+async function seedHandoffs(pool, table, count, expiresEpoch, label) {
+  const expires = iso(expiresEpoch);
+  const created = iso(expiresEpoch - 10 * MINUTE);
+  const states = Array.from({ length: count }, () => `synthetic-${label}-${randomUUID()}`);
+  await pool.query(
+    `INSERT INTO ${table("apple_signin_handoffs")} (state, nonce_hash, created_at, expires_at)
+     SELECT seed.state, $2, $3::timestamptz, $4::timestamptz FROM unnest($1::text[]) AS seed(state)`,
+    [states, "a".repeat(64), created, expires],
+  );
+  await pool.query(
+    `INSERT INTO ${table("google_signin_handoffs")} (state, created_at, expires_at)
+     SELECT seed.state, $2::timestamptz, $3::timestamptz FROM unnest($1::text[]) AS seed(state)`,
+    [states, created, expires],
+  );
+}
+
+async function handoffCount(pool, table) {
+  return (await pool.query(
+    `SELECT (SELECT count(*) FROM ${table("apple_signin_handoffs")})::int AS apple,
+            (SELECT count(*) FROM ${table("google_signin_handoffs")})::int AS google`,
+  )).rows[0];
+}
+
+/** One active social participant, a web session and one unused pairing expiring at `expiresEpoch`. */
+async function seedPairing(pool, table, expiresEpoch) {
+  const participant = `synthetic-c-maint-participant-${randomUUID()}`;
+  const session = `synthetic-c-maint-session-${randomUUID()}`;
+  const pairing = `synthetic-c-maint-pairing-${randomUUID()}`;
+  await pool.query(
+    `INSERT INTO ${table("participants")} (id, owner_kind, state, created_at)
+     VALUES ($1, 'social', 'active', $2::timestamptz)`,
+    [participant, iso(expiresEpoch - 2 * SAFETY_WINDOW)],
+  );
+  await pool.query(
+    `INSERT INTO ${table("web_sessions")} (id, participant_id, secret_hash, csrf_hash, issued_at, expires_at, last_used_at)
+     VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $5::timestamptz)`,
+    [session, participant, randomBytes(32), randomBytes(32), iso(expiresEpoch - SAFETY_WINDOW),
+      iso(expiresEpoch + 30 * SAFETY_WINDOW)],
+  );
+  await pool.query(
+    `INSERT INTO ${table("device_pairings")} (
+       id, participant_id, issued_by_session_id, secret_hash, consent_version,
+       transport_consent_version, state, issued_at, expires_at
+     ) VALUES ($1, $2, $3, $4, 'privacy-safe-telemetry-v0.1', 'privacy-safe-telemetry-v0.1', 'unused',
+       $5::timestamptz, $6::timestamptz)`,
+    [pairing, participant, session, randomBytes(32), iso(expiresEpoch - SAFETY_WINDOW), iso(expiresEpoch)],
+  );
+  return pairing;
+}
+
+async function pairingState(pool, table, id) {
+  return (await pool.query(`SELECT state FROM ${table("device_pairings")} WHERE id = $1`, [id])).rows[0].state;
+}
+
+test("the pass folds the scheduled purges: bounded pages at the completion clock, live rows kept, a backlog drained, a replay purging nothing twice", {
+  skip: SKIP, timeout: 240_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  const maintenance = await workerModule("/src/postgres-maintenance.ts");
+  assert.equal(maintenance.POSTGRES_MAINTENANCE_IDENTITY_PAGE_SIZE, PAGE, "one handoff page per provider");
+  const clock = BASE_CYCLE + 1_500;
+
+  // 101 handoffs per provider expired before the first pass (one more than a
+  // page), 1 expiring between the next cycle and that pass's completion clock
+  // (the clock, not the cycle, is the cutoff, as the Worker purges at its
+  // actual run time), and 1 still live. Sign-in windows: one past the 24 h
+  // retention, one inside it for every pass below.
+  const next = BASE_CYCLE + MINUTE;
+  await seedHandoffs(pool, table, PAGE + 1, BASE_CYCLE - MINUTE, "expired");
+  await seedHandoffs(pool, table, 1, next + 1_000, "late");
+  await seedHandoffs(pool, table, 1, BASE_CYCLE + 10 * MINUTE, "live");
+  await pool.query(
+    `INSERT INTO ${table("sign_in_start_admission_windows")} (window_started_at, accepted_count, last_accepted_at)
+     VALUES ($1::timestamptz, 1, $1::timestamptz), ($2::timestamptz, 1, $2::timestamptz)`,
+    [iso(clock - SAFETY_WINDOW - MINUTE), iso(clock - SAFETY_WINDOW + 10 * MINUTE)],
+  );
+  const expiredPairing = await seedPairing(pool, table, BASE_CYCLE - MINUTE);
+  const livePairing = await seedPairing(pool, table, BASE_CYCLE + SAFETY_WINDOW);
+
+  const first = await runPass(context, BASE_CYCLE, { clock: () => clock });
+  assert.equal(first.outcome, "partial");
+  assert.equal(first.code, "MAINTENANCE_PURGE_BACKLOG");
+  assert.equal(first.changed, true);
+  assert.equal(first.lifecycleComplete, true);
+  assert.equal(first.quarantineReconciliationComplete, true);
+  // One page per provider (100 + 100) and the one aged sign-in window.
+  assert.deepEqual(JSON.parse(JSON.stringify(first.maintenancePurges)), {
+    identity: {
+      purged: 2 * PAGE + 1, complete: false,
+      handoffs: { purged: 2 * PAGE, complete: false },
+      signInAdmissions: { purged: 1, complete: true },
+    },
+    deviceLifecycle: {
+      pairingsRevoked: 1, devicesRevoked: 0, uploadsRevoked: 0, rotationsPurged: 0, pairingEventsPurged: 0,
+      complete: true,
+    },
+    complete: false,
+  });
+  assert.equal(await pairingState(pool, table, expiredPairing), "revoked");
+  assert.equal(await pairingState(pool, table, livePairing), "unused");
+  assert.equal((await pool.query(`SELECT count(*)::int AS count FROM ${table("sign_in_start_admission_windows")}`))
+    .rows[0].count, 1, "the window inside the 24 h retention stays");
+  assert.deepEqual(await handoffCount(pool, table), { apple: 3, google: 3 });
+  // A purge backlog is housekeeping: readiness reads ready on the matched cycle.
+  assert.equal((await readiness(pool, schema, clock + 500)).body.status, "ready");
+
+  // A retry of the same cycle is the no-op: no singleton write, no purge.
+  const repeat = await runPass(context, BASE_CYCLE, { clock: () => clock + 500 });
+  assert.equal(repeat.code, "LIFECYCLE_CYCLE_ALREADY_COMPLETE");
+  assert.equal(repeat.maintenancePurges, null);
+  assert.deepEqual(await handoffCount(pool, table), { apple: 3, google: 3 });
+
+  // The next cycle drains the backlog, with the late handoff due only by its
+  // completion clock, and keeps every live row.
+  const drained = await runPass(context, next, { clock: () => next + 1_500 });
+  assert.equal(drained.outcome, "complete");
+  assert.equal(drained.code, "LIFECYCLE_PASS_COMPLETE");
+  assert.deepEqual(JSON.parse(JSON.stringify(drained.maintenancePurges)), {
+    ...NOTHING_PURGED,
+    identity: { ...NOTHING_PURGED.identity, purged: 4, handoffs: { purged: 4, complete: true } },
+  });
+  assert.deepEqual(await handoffCount(pool, table), { apple: 1, google: 1 });
+  assert.equal(await pairingState(pool, table, livePairing), "unused");
+
+  // Replayed after everything due is gone, the purges change nothing.
+  const replay = await runPass(context, next + MINUTE, { clock: () => next + MINUTE + 1_500 });
+  assert.equal(replay.outcome, "complete");
+  assert.deepEqual(JSON.parse(JSON.stringify(replay.maintenancePurges)), NOTHING_PURGED);
+  assert.deepEqual(await handoffCount(pool, table), { apple: 1, google: 1 });
+}));
+
+test("a purge failure precedes the lifecycle write, as on the Worker: both rows keep the previous cycle, readiness reads ready, and a retry completes", {
+  skip: SKIP, timeout: 180_000,
+}, async () => withSchema(async (context) => {
+  const { pool, schema, table } = context;
+  await runPass(context, BASE_CYCLE);
+  const next = BASE_CYCLE + MINUTE;
+  await seedHandoffs(pool, table, 2, next - MINUTE, "expired");
+  const before = await snapshot(pool, table);
+
+  // A purge that cannot reach its table (a schema change outside the reviewed
+  // runner, which the receipt does not see) fails the pass after the
+  // preflight and before the lifecycle write. The Worker runs its identity
+  // phase before runBackendLifecycle, so a throw there leaves retention_state
+  // and the reconciliation row on the previous cycle, still matched.
+  await pool.query(`ALTER TABLE ${table("google_signin_handoffs")} RENAME TO google_signin_handoffs_moved`);
+  let failed;
+  try {
+    failed = await runPass(context, next);
+  } finally {
+    await pool.query(`ALTER TABLE ${table("google_signin_handoffs_moved")} RENAME TO google_signin_handoffs`);
+  }
+  assert.equal(failed.outcome, "failure");
+  assert.equal(failed.code, "POSTGRES_MAINTENANCE_UNAVAILABLE");
+  assert.equal(failed.lockAcquired, true);
+  assert.equal(failed.changed, false);
+  assert.equal(failed.lifecycleWritten, false);
+  assert.equal(failed.lifecycleComplete, false);
+  assert.equal(failed.maintenancePurges, null);
+  assert.equal(failed.reconciliation, null);
+  assert.deepEqual(await snapshot(pool, table), before, "neither readiness row was written");
+  assert.equal(await lifecycleRunAt(pool, table), iso(BASE_CYCLE));
+  // OD-CR-4: the Worker-exact readiness of the previous, matched cycle.
+  const stillReady = await readiness(pool, schema, next + 2_000);
+  assert.equal(stillReady.httpStatus, 200);
+  assert.equal(stillReady.body.status, "ready");
+  assert.equal(stillReady.body.checks.maintenanceCycleMatched, true);
+  assert.deepEqual(await handoffCount(pool, table), { apple: 0, google: 2 },
+    "the Apple page committed before the Google page failed");
+
+  // A retry of the same cycle purges, writes the lifecycle row, then reconciles.
+  const retried = await runPass(context, next, { clock: () => next + 3_000 });
+  assert.equal(retried.outcome, "complete");
+  assert.equal(retried.lifecycleWritten, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(retried.maintenancePurges.identity)), {
+    purged: 2, complete: true,
+    handoffs: { purged: 2, complete: true },
+    signInAdmissions: { purged: 0, complete: true },
+  });
+  assert.equal(await lifecycleRunAt(pool, table), iso(next));
+  assert.equal((await readiness(pool, schema, next + 4_000)).body.status, "ready");
+  assert.deepEqual(await handoffCount(pool, table), { apple: 0, google: 0 });
 }));
 
 test("on a schema carrying the 0064 pins the pass keeps restore replay true and suppression 0", {

@@ -9,9 +9,8 @@
  * host composition, the route-family contract the admin route modules
  * import, canonical migrations,
  * migration runner, the shared runtime-grant policy and the production
- * migration Job, the private daily publication Job and verifier, their
- * shared receipt contract, test-only activation and independent restore
- * commands, and the reviewed workspace packages enter this context. The
+ * migration Job, the test-only migration and activation commands, and the
+ * reviewed workspace packages enter this context. The
  * migrations are the primary role only: the frozen ledger fragments stay in
  * the repository (owner action OA-4) and never enter an image.
  */
@@ -43,15 +42,6 @@ const SECRET_PATH_PARTS = new Set([
 ]);
 const EXPECTED_PRIMARY_MIGRATION_COUNT = 70;
 const EXPECTED_PRIMARY_MIGRATION_TAIL = "0070_catalog_manifest_store.sql";
-const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
-  "apps/worker/cloud-run/postgres-community-daily-activation.mjs",
-  "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",
-  "apps/worker/cloud-run/postgres-community-daily-prepare-test.mjs",
-  "apps/worker/cloud-run/postgres-community-daily-restore-test.mjs",
-]);
-const REQUIRED_DAILY_CONTRACT_PATHS = new Set([
-  "apps/worker/cloud-run/postgres-community-daily-contract.mjs",
-]);
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
   ".wrangler",
@@ -111,15 +101,6 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/postgres-community-graph-benchmark.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-benchmark.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-community-graph-readback-diagnostic.check.mjs", destination: "apps/worker/cloud-run/postgres-community-graph-readback-diagnostic.check.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-publish-test.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-publish-test.check.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-contract.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-contract.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-live-smoke.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-live-smoke.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-live-smoke.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-live-smoke.check.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-activation.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-activation.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-activation.check.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-prepare-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-prepare-test.mjs" }),
-  Object.freeze({ source: "cloud-run/postgres-community-daily-restore-test.mjs", destination: "apps/worker/cloud-run/postgres-community-daily-restore-test.mjs" }),
   Object.freeze({ source: "cloud-run/node-crypto-adapter.mjs", destination: "apps/worker/cloud-run/node-crypto-adapter.mjs" }),
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
@@ -300,12 +281,6 @@ async function validateSource(assets) {
   const files = await sourceFiles(assets);
   const includedPaths = new Set(files.map((file) => file.destination));
   await assertImportClosure(files, includedPaths);
-  if ([...REQUIRED_DAILY_ACTIVATION_PATHS].some((path) => !includedPaths.has(path))) {
-    fail("CLOUD_RUN_CONTEXT_DAILY_ACTIVATION_PATH_SET_UNEXPECTED");
-  }
-  if ([...REQUIRED_DAILY_CONTRACT_PATHS].some((path) => !includedPaths.has(path))) {
-    fail("CLOUD_RUN_CONTEXT_DAILY_CONTRACT_PATH_SET_UNEXPECTED");
-  }
   const primary = await readPostgresMigrations({
     role: "primary",
     rootDirectory: join(WORKER_ROOT, "postgres", "migrations"),

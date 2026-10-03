@@ -300,15 +300,26 @@ export const LIFECYCLE_PASS_ADMIN_ERRORS = Object.freeze({
  * C-MAINT's lifecycle pass as the admin action's run_maintenance task
  * (C-ADMIN admin-action.mjs, audited by RUN_MAINTENANCE_AUDIT_FIELDS): the
  * pass for the request's whole-minute cycle, mapped to the Worker's result
- * keys. A complete pass is OK and a partial one MAINTENANCE_INCOMPLETE, the
- * Worker's two result codes. A pass that cannot take the maintenance lock or
- * the migration fence is MAINTENANCE_IN_PROGRESS, which the action answers
- * 409 LIFECYCLE_STATE_CONFLICT. A refused or failed pass throws its
+ * keys in the Worker's order. A pass that cannot take the maintenance lock
+ * or the migration fence is MAINTENANCE_IN_PROGRESS, which the action
+ * answers 409 LIFECYCLE_STATE_CONFLICT. A refused or failed pass throws its
  * LIFECYCLE_PASS_ADMIN_ERRORS entry, so the action records a failure audit
  * and answers that error, as the Worker does. Erasure-era items are the
- * constant not-applicable values of owner decision OD-4; phases the pass
- * does not run (identity hand-off and sign-in purges) are absent, never
- * reported as done.
+ * constant not-applicable values of owner decision OD-4.
+ *
+ * The pass's folded purges (MAINT-PURGE) map to the Worker's keys: expired
+ * handoffs to expiredIdentityHandoffs*, sign-in admission windows to
+ * expiredSignInAdmissions*, and the device-lifecycle counts to the Worker's
+ * five stale and expired counts. When the pass ran no purge (a cycle already
+ * complete in both rows, whose first complete pass ran them) those keys are
+ * absent, never reported as done.
+ *
+ * The code is the Worker's conjunction (scheduled maintenance's complete),
+ * one of the Worker's two result codes: OK when the lifecycle, the
+ * quarantine reconciliation and, when this pass ran them, the handoff and
+ * sign-in window purges are complete, otherwise MAINTENANCE_INCOMPLETE. A
+ * device-lifecycle backlog does not enter it, as on the Worker, although the
+ * pass itself reports it as partial (MAINTENANCE_PURGE_BACKLOG).
  */
 export function createLifecyclePassMaintenance({ pool, objectStore, primarySchema }) {
   return Object.freeze({
@@ -327,18 +338,39 @@ export function createLifecyclePassMaintenance({ pool, objectStore, primarySchem
           : PASS_INTERNAL_ERROR;
         throw new ApiError(answer.status, answer.code);
       }
+      const purges = result.maintenancePurges;
+      const handoffs = purges === null ? null : purges.identity.handoffs;
+      const signInAdmissions = purges === null ? null : purges.identity.signInAdmissions;
+      const device = purges === null ? null : purges.deviceLifecycle;
+      const complete = result.lifecycleComplete && result.quarantineReconciliationComplete
+        && (purges === null || (handoffs.complete && signInAdmissions.complete));
       return Object.freeze({
-        code: result.outcome === "complete" ? "OK" : "MAINTENANCE_INCOMPLETE",
+        code: complete ? "OK" : "MAINTENANCE_INCOMPLETE",
         lifecycleComplete: result.lifecycleComplete,
         quarantineRetentionComplete: result.quarantineRetentionComplete,
         restoreReplayComplete: result.appendOnlyNotApplicable.restoreReplayComplete,
         quarantineReconciliationComplete: result.quarantineReconciliationComplete,
+        ...(handoffs === null ? {} : {
+          expiredIdentityHandoffsPurged: handoffs.purged,
+          expiredIdentityHandoffPurgeComplete: handoffs.complete,
+        }),
         expiredDeletionTombstonesPurged: 0,
         deletionTombstonePurgeComplete: result.appendOnlyNotApplicable.deletionTombstoneRetentionComplete,
         expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
         primaryIdentityReenrollmentCooldownPurgeComplete: true,
         expiredIdentityReenrollmentCooldownsPurged: 0,
         identityReenrollmentCooldownPurgeComplete: true,
+        ...(signInAdmissions === null ? {} : {
+          expiredSignInAdmissionsPurged: signInAdmissions.purged,
+          signInAdmissionPurgeComplete: signInAdmissions.complete,
+        }),
+        ...(device === null ? {} : {
+          staleDevicePairingsRevoked: device.pairingsRevoked,
+          staleDeviceCredentialsRevoked: device.devicesRevoked,
+          staleDeviceUploadAuthorizationsRevoked: device.uploadsRevoked,
+          expiredDeviceCredentialRotationsPurged: device.rotationsPurged,
+          expiredDevicePairingEventsPurged: device.pairingEventsPurged,
+        }),
         aggregateRebuildComplete: false,
         aggregateRebuildDelegated: true,
         publicationEnabled: null,

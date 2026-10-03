@@ -73,11 +73,13 @@ owner approval after automatic review rejected that changed baseline. The
 revision-2 mismatch correctly stopped before fixture inserts; do not treat the
 original approval as approval for the changed revision sequence.
 
-Relevant implementation is in the [A2 activation guard](../../apps/worker/cloud-run/postgres-community-daily-activation.mjs),
-its [focused checks](../../apps/worker/cloud-run/postgres-community-daily-activation.check.mjs),
-the [prepare entrypoint](../../apps/worker/cloud-run/postgres-community-daily-prepare-test.mjs),
-the [restore entrypoint](../../apps/worker/cloud-run/postgres-community-daily-restore-test.mjs),
-and the [daily publisher](../../apps/worker/src/postgres-community-daily-publisher.ts).
+Relevant implementation was in the A2 activation guard
+(`apps/worker/cloud-run/postgres-community-daily-activation.mjs`), its focused
+checks (`postgres-community-daily-activation.check.mjs`), the prepare and
+restore entrypoints (`postgres-community-daily-prepare-test.mjs` and
+`postgres-community-daily-restore-test.mjs`) and the daily publisher
+(`apps/worker/src/postgres-community-daily-publisher.ts`). These files were
+retired on 2026-10-02 (E-RETIRE) and remain in Git history.
 The earlier [read-only daily preflight receipt](./2026-09-25-gcp-a2-daily-preflight-v2.md)
 and [A2 v1.2 test journey](./2026-09-25-gcp-a2-v12-test-journey.md) describe
 separate evidence; neither supplies the missing revision-2 authorization or

@@ -28,9 +28,8 @@ name: Hosted backend
 # environment gap such as a missing EDGE_E2E_NODE or EDGE_E2E_GOLDEN. The Worker
 # gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
-# with the SOCKET profile exported, and the Cloud Run check also gets the
-# loopback TCP endpoint its daily-activation integration test requires, but a
-# skip inside those checks is reported by node:test without failing the job.
+# with the SOCKET profile exported, but a skip inside those checks is reported
+# by node:test without failing the job.
 #
 # The Cloud Run check also runs the offline parts of
 # gcp:production-tooling:local-check (the rollout CLI, the infrastructure
@@ -187,12 +186,6 @@ jobs:
     name: Cloud Run check
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # postgres-community-daily-activation.check.mjs runs its real PostgreSQL 17
-    # test only over loopback TCP (it skips otherwise); this is the container's
-    # published 127.0.0.1 port.
-    env:
-      A2_DAILY_ACTIVATION_TEST_HOST: "127.0.0.1"
-      A2_DAILY_ACTIVATION_TEST_PORT: "55432"
     steps:
       # Full history: the cutover seal check reads pinned commits as git
       # objects (the restore-base generator commit 8da57e76 and its parent, and

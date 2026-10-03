@@ -112,7 +112,7 @@ test("routing over the real postgres-test directory derives exactly the frozen H
   for (const socketOnly of [
     "postgres-test/postgres-maintenance.spec.mjs",
     "postgres-test/v12-transport-roundtrip.spec.mjs",
-    "postgres-test/postgres-community-daily-publisher.spec.mjs",
+    "postgres-test/postgres-community-daily-roundtrip.spec.mjs",
   ]) {
     assert.equal(plan.files.find(({ file }) => file === socketOnly).profile, "SOCKET");
   }

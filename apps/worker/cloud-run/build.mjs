@@ -18,10 +18,6 @@ const MIGRATIONS_ENTRY = resolve(ROOT, "test-migrations.mjs");
 const ACTIVATION_ENTRY = resolve(ROOT, "test-activation.mjs");
 const COMMUNITY_GRAPH_BENCHMARK_ENTRY = resolve(ROOT, "postgres-community-graph-benchmark.mjs");
 const COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY = resolve(ROOT, "postgres-community-graph-readback-diagnostic.mjs");
-const COMMUNITY_DAILY_TEST_ENTRY = resolve(ROOT, "postgres-community-daily-publish-test.mjs");
-const COMMUNITY_DAILY_LIVE_SMOKE_ENTRY = resolve(ROOT, "postgres-community-daily-live-smoke.mjs");
-const COMMUNITY_DAILY_PREPARE_ENTRY = resolve(ROOT, "postgres-community-daily-prepare-test.mjs");
-const COMMUNITY_DAILY_RESTORE_ENTRY = resolve(ROOT, "postgres-community-daily-restore-test.mjs");
 const ANALYTICS_REFRESH_ENTRY = resolve(ROOT, "analytics-refresh.mjs");
 const PRODUCTION_MIGRATIONS_ENTRY = resolve(ROOT, "postgres-production-migrations.mjs");
 const MAINTENANCE_JOB_ENTRY = resolve(ROOT, "postgres-maintenance-job.mjs");
@@ -43,10 +39,6 @@ const options = {
     "test-activation": ACTIVATION_ENTRY,
     "postgres-community-graph-benchmark": COMMUNITY_GRAPH_BENCHMARK_ENTRY,
     "postgres-community-graph-readback-diagnostic": COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY,
-    "postgres-community-daily-publish-test": COMMUNITY_DAILY_TEST_ENTRY,
-    "postgres-community-daily-live-smoke": COMMUNITY_DAILY_LIVE_SMOKE_ENTRY,
-    "postgres-community-daily-prepare-test": COMMUNITY_DAILY_PREPARE_ENTRY,
-    "postgres-community-daily-restore-test": COMMUNITY_DAILY_RESTORE_ENTRY,
     "analytics-refresh": ANALYTICS_REFRESH_ENTRY,
     // K-PAR: the compute Worker the refresh Job spawns (dist/ beside it).
     "analytics-refresh-worker": ANALYTICS_REFRESH_WORKER_ENTRY,
@@ -128,7 +120,7 @@ if (kernelClosureOnly) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "postgres-community-daily-publish-test.mjs", "postgres-community-daily-live-smoke.mjs", "postgres-community-daily-prepare-test.mjs", "postgres-community-daily-restore-test.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
+    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
     kernel,
   }));
 } else {
@@ -138,7 +130,7 @@ if (kernelClosureOnly) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/postgres-community-daily-publish-test.mjs", "dist/postgres-community-daily-live-smoke.mjs", "dist/postgres-community-daily-prepare-test.mjs", "dist/postgres-community-daily-restore-test.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
     kernel,
   }));
 }

@@ -242,7 +242,6 @@ export const STORAGE_RECEIPT_READER = Object.freeze({
 
 /** The cloud-run migrators and Jobs that read or grant the history table for their own receipts. */
 export const MIGRATION_HISTORY_MODULES = Object.freeze([
-  "cloud-run/postgres-community-daily-activation.mjs",
   "cloud-run/postgres-community-graph-benchmark.mjs",
   "cloud-run/postgres-community-graph-readback-diagnostic.mjs",
   "cloud-run/postgres-migrations.mjs",
