@@ -190,7 +190,7 @@ const PLAN_BASES = ["unavailable", "same_source_occurrence", "provisional_marker
  * digests are the bytes the production readers verify.
  */
 export async function seedAnalyticsV2Fixture({ pool, schema, modules, correctionRuntime, dense = null,
-  v12Scope = false, denseLegacy = null, legacyScope = false, expansionCorrections = false }) {
+  v12Scope = false, denseLegacy = null, legacyScope = false, expansionCorrections = false, expansionBoundary = null }) {
   if (correctionRuntime !== "active" && correctionRuntime !== "staged") throw new Error("fixture_runtime_invalid");
   const { codec, v12codec, reconciliation, sha256Hex } = modules;
   const quoted = `"${schema}"`;
@@ -1030,6 +1030,42 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     mike = Object.freeze({ participantId: mikeId, ownerDigest: mikeDigest, devices: Object.freeze([mikeV11]) });
   }
 
+  // Opt-in real SQL expansion boundary: 200 occurrences on 200 eligible
+  // independent source devices (40000 variants), plus one final variant.
+  // Every row passes the existing transport, codec and admission builders.
+  let boundary = null;
+  if (expansionBoundary !== null) {
+    if (!["legacy", "v12"].includes(expansionBoundary)) throw new Error("fixture_boundary_invalid");
+    const name = `boundary-${expansionBoundary}`;
+    const participantId = await participant(name, "social");
+    const ownerDigest = await linkOwner(participantId, name);
+    const format = expansionBoundary === "legacy" ? "v1" : "v12";
+    const records = Array.from({ length: 200 }, (_, index) => usageRecord(format,
+      `event:v2:${digest(`occurrence:${name}:${index}`)}`,
+      new Date(Date.parse(`${D1}T00:00:00.000Z`) + 1000 + index).toISOString()));
+    async function addSource(index) {
+      const deviceName = `${name}-${index}`;
+      const deviceId = await socialDevice(participantId, deviceName, { v12: format === "v12" });
+      const batch = index === 200 ? records.slice(0, 1) : records;
+      if (format === "v1") {
+        await v1Chunk({ participantId, deviceId, ownerDigest, stream: "usage", day: D1, records: batch });
+      } else {
+        await v12Generation({ participantId, deviceId, name: deviceName,
+          days: [{ day: D1, chunks: [{ stream: "usage", records: batch }] }], head: index === 0 });
+      }
+      return deviceId;
+    }
+    for (let index = 0; index < 200; index += 1) await addSource(index);
+    let enabled = false;
+    const enableExtraSource = async () => {
+      if (enabled) throw new Error("fixture_boundary_extra_already_enabled");
+      await addSource(200);
+      enabled = true;
+    };
+    boundary = Object.freeze({ participantId, ownerDigest, enableExtraSource,
+      occurrenceIds: Object.freeze(records.map((record) => record.eventId)) });
+  }
+
   const lastSequence = Number((await q(`SELECT COALESCE(max(sequence),0)::text AS sequence
     FROM ${table("storage_ingestion_changes")}`)).rows[0].sequence);
   return Object.freeze({
@@ -1051,5 +1087,6 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       alphaV11: alphaV11Generation.sequence, bravo: bravoChunk.sequence, last: lastSequence,
     }),
     alphaV12GenerationId: alphaV12Generation.generationId,
+    ...(boundary === null ? {} : { boundary }),
   });
 }

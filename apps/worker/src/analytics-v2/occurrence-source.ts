@@ -239,6 +239,7 @@ interface OwnerScope {
   readonly correctionFactsPresent: boolean;
   /** Ready manifests are a necessary condition for v1.2 expansion. */
   readonly v12ReadyManifests: boolean;
+  readonly legacyOwnerIndexReady: boolean;
   /** v1.2 runtime active (production's `v12_state === "active"`). */
   readonly v12RuntimeActive: boolean;
   /** ...and the participant has a v1.2 head (production's candidate and usage-source gate). */
@@ -256,6 +257,14 @@ function ownerScopeSql(s: string): string {
             WHERE h.owner_digest=decode($1,'hex')) AS correction_facts_present,
           EXISTS(SELECT 1 FROM ${s}.telemetry_v12_day_manifests m
             WHERE m.participant_id=link.participant_id AND m.state='ready') AS v12_ready_manifests,
+          EXISTS(SELECT 1 FROM pg_catalog.pg_index i
+            WHERE i.indexrelid=pg_catalog.to_regclass('${s}.typed_telemetry_owner_occurrence')
+              AND i.indrelid=pg_catalog.to_regclass('${s}.typed_telemetry_records')
+              AND i.indisvalid AND i.indisready AND i.indpred IS NULL AND i.indexprs IS NULL
+              AND i.indnkeyatts=3
+              AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ord)
+                JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                WHERE k.ord<=3 ORDER BY k.ord)=ARRAY['owner_id','stream','occurrence_id']) AS legacy_owner_index_ready,
           v12head.generation_id AS v12_generation_id,v12runtime.state AS v12_state
      FROM ${s}.storage_v11_owner_links link
      JOIN ${s}.storage_source_state source ON source.singleton=1
@@ -272,13 +281,14 @@ function ownerScopeSql(s: string): string {
 async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: string): Promise<OwnerScope> {
   const result = await queryPrepared<{
     participant_id: unknown; v1_namespace: unknown; v11_namespace: unknown; correction_present: unknown;
-    correction_active: unknown; correction_facts_present: unknown; v12_ready_manifests: unknown;
+    correction_active: unknown; correction_facts_present: unknown; v12_ready_manifests: unknown; legacy_owner_index_ready: unknown;
     v12_generation_id: unknown; v12_state: unknown;
   }>(client, (await readerStatements(s)).scope, [ownerDigest]);
   const row = result.rows[0];
   if (result.rows.length !== 1 || row === undefined || typeof row.participant_id !== "string"
       || row.correction_present !== true || typeof row.correction_active !== "boolean"
-      || typeof row.correction_facts_present !== "boolean" || typeof row.v12_ready_manifests !== "boolean") {
+      || typeof row.correction_facts_present !== "boolean" || typeof row.v12_ready_manifests !== "boolean"
+      || typeof row.legacy_owner_index_ready !== "boolean") {
     return sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   }
   const v1Namespace = row.v1_namespace === null ? null : text(row.v1_namespace);
@@ -293,7 +303,7 @@ async function readOwnerScope(client: PostgresClient, s: string, ownerDigest: st
   if (v1Namespace === null && v11Namespace === null && !v12RuntimeActive) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
   return Object.freeze({ participantId: row.participant_id, v1Namespace, v11Namespace,
     correctionActive: row.correction_active, correctionFactsPresent: row.correction_facts_present,
-    v12ReadyManifests: row.v12_ready_manifests, v12RuntimeActive, v12HeadActive });
+    v12ReadyManifests: row.v12_ready_manifests, legacyOwnerIndexReady: row.legacy_owner_index_ready, v12RuntimeActive, v12HeadActive });
 }
 
 // ---------------------------------------------------------------------------
@@ -599,13 +609,25 @@ function expansionChunkProofsSql(s: string, fence: string): string {
  * follows compareText input order, never bytea order. The narrow representative
  * rows are capped per logical batch before dictionary joins, then by G+1.
  *
+ * With the staged index ready, the owner membership probe is a superset of
+ * admitted rows: 0030 ties each record's namespace/format/owner to membership
+ * and its device/manifest to that owner. The direct admission joins still
+ * enforce namespace state, source ownership, completeness and generation CAS.
+ * Without a ready index the existing parent probes remain available.
  */
-function legacySourcesSql(s: string): string {
+function legacySourcesSql(s: string, ownerProbe = false): string {
   const requested = "ARRAY(SELECT wanted.occurrence_id FROM requested wanted)";
   return `WITH requested AS MATERIALIZED (
       SELECT decode(value,'hex') AS occurrence_id,((ordinal-1)/${EXPANSION_BATCH})::integer AS sub_batch
         FROM unnest($5::text[]) WITH ORDINALITY AS input(value,ordinal)
-    ), owner_parents AS MATERIALIZED (
+    ), ${ownerProbe ? `matched AS MATERIALIZED (
+      SELECT probed.id,wanted.sub_batch
+        FROM ${s}.typed_telemetry_owner_memberships membership
+        JOIN ${s}.typed_telemetry_records probed ON probed.namespace_id=membership.namespace_id
+         AND probed.owner_id=membership.owner_id AND probed.format=membership.source_format AND probed.stream=$3
+        JOIN requested wanted ON wanted.occurrence_id=probed.occurrence_id
+       WHERE membership.participant_id=$2 AND membership.source_format IN (10,11)
+    )` : `owner_parents AS MATERIALIZED (
       SELECT 10 AS format,parent_device.id AS parent_id
         FROM ${s}.typed_telemetry_owner_memberships parent_membership
         JOIN ${s}.typed_telemetry_devices parent_device ON parent_device.namespace_id=parent_membership.namespace_id
@@ -631,7 +653,7 @@ function legacySourcesSql(s: string): string {
           OFFSET 0
         ) probe JOIN ${s}.typed_telemetry_records matched_record ON matched_record.id=probe.id
       JOIN requested wanted ON wanted.occurrence_id=matched_record.occurrence_id
-    ), ${expansionChunkProofsSql(s, "matched")},
+    )`}, ${expansionChunkProofsSql(s, "matched")},
     ${legacySelectionPairCtesSql(s, "matched", "v11_chunk_proofs")}, direct AS MATERIALIZED (
       SELECT eligible.*,matched.sub_batch FROM matched CROSS JOIN LATERAL (
         ${legacyDirectSql(s, "record.id=matched.id AND record.format=10")}
@@ -1202,6 +1224,7 @@ async function parseCorrectionFact(row: Record<string, unknown>): Promise<Teleme
 interface ReaderStatements {
   readonly scope: AnalyticsV2PreparedStatement;
   readonly legacySources: AnalyticsV2PreparedStatement;
+  readonly legacyOwnerSources: AnalyticsV2PreparedStatement;
   readonly v12Sources: AnalyticsV2PreparedStatement;
   readonly correctionSources: AnalyticsV2PreparedStatement;
 }
@@ -1217,6 +1240,7 @@ function readerStatements(s: string): Promise<ReaderStatements> {
     cached = (async () => Object.freeze({
       scope: await analyticsV2PreparedStatement("occurrences.scope", ownerScopeSql(s)),
       legacySources: await analyticsV2PreparedStatement("occurrences.legacy_sources", legacySourcesSql(s)),
+      legacyOwnerSources: await analyticsV2PreparedStatement("occurrences.legacy_sources", legacySourcesSql(s, true)),
       v12Sources: await analyticsV2PreparedStatement("occurrences.v12_sources", v12OccurrencesSql(s)),
       correctionSources: await analyticsV2PreparedStatement("occurrences.correction_sources", correctionVariantsSql(s)),
     }))();
@@ -1273,7 +1297,7 @@ async function* fetchRawExpansion(client: PostgresClient, s: string, now: string
         catch (error) { queryFailure = error; return { rows: [], error }; }
       };
       const legacy = await result<LegacyRow>(scope.v1Namespace !== null || scope.v11Namespace !== null,
-        statements.legacySources, [ownerDigest, scope.participantId, STREAM_CODES[stream], stream, encoded]);
+        (scope.legacyOwnerIndexReady ? statements.legacyOwnerSources : statements.legacySources), [ownerDigest, scope.participantId, STREAM_CODES[stream], stream, encoded]);
       const v12 = await result<V12StorageRow>(expandV12 && scope.v12ReadyManifests,
         statements.v12Sources, [scope.participantId, stream, now, encoded, MAX_BATCH_V12_ROWS + 1]);
       const facts = await result<Record<string, unknown>>(corrections && scope.correctionFactsPresent,

@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
-import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { applyPostgresMigrations as applyStockMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { loadExpansionReaders, compareExpansionRead } from "../scripts/gcp-read-expansion-ab.mjs";
+import { applyStockAndStagedMigrations, stagedOrPromotedMigrationName } from "./staged-migrations-harness.mjs";
 import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
 import {
   CORRECTED_TOTALS,
@@ -62,7 +63,12 @@ async function endpoint() {
   return { host: PG_TEST_HOST, port: PG_TEST_PORT };
 }
 
-
+async function applyPostgresMigrations(options) {
+  const stock = await applyStockMigrations(options);
+  if (process.env.READ_EXPANSION_INDEXED === "1") await applyStockAndStagedMigrations({ ...options,
+    stagedFiles: [await stagedOrPromotedMigrationName("primary", "_typed_records_owner_occurrence_idx.sql")] });
+  return stock;
+}
 
 let pool;
 let vite;
@@ -1146,6 +1152,35 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
       await assert.rejects(reader.occurrences.readOwnerDayFingerprints(scoped, limitInput),
         (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
     }
+    await client.query("ROLLBACK");
+    const indexExists = (await pool.query("SELECT to_regclass($1) IS NOT NULL AS present",
+      [`"${schema}".typed_telemetry_owner_occurrence`])).rows[0].present;
+    if (!indexExists) await applyStockAndStagedMigrations({ role: "primary", schema, pool,
+      stagedFiles: [await stagedOrPromotedMigrationName("primary", "_typed_records_owner_occurrence_idx.sql")] });
+    for (const state of [{ valid: true, ready: true }, { valid: false, ready: true }, { valid: true, ready: false }]) {
+      // Synthetic superuser-only catalog fixture models failed concurrent builds.
+      await pool.query(`UPDATE pg_catalog.pg_index SET indisvalid=$1,indisready=$2
+        WHERE indexrelid='"${schema}".typed_telemetry_owner_occurrence'::regclass`, [state.valid, state.ready]);
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      observed.length = 0;
+      for (const stream of STREAMS) await compareExpansionRead(readers, scoped,
+        { ownerDigest: fixture.owners.kilo.ownerDigest, stream, fromDay: D1, throughDay: D3 });
+      const source = observed.find((entry) => entry.text.includes("WITH ORDINALITY")
+        && entry.text.includes("occurrences.legacy_sources"));
+      assert.ok(source);
+      assert.equal(source.text.includes("owner_parents AS MATERIALIZED"), !(state.valid && state.ready));
+      await client.query("ROLLBACK");
+    }
+    await pool.query(`DROP INDEX "${schema}".typed_telemetry_owner_occurrence`);
+    await pool.query(`CREATE INDEX typed_telemetry_owner_occurrence ON "${schema}".typed_telemetry_records
+      (owner_id,stream,observed_at_ms)`);
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    observed.length = 0;
+    await compareExpansionRead(readers, scoped,
+      { ownerDigest: fixture.owners.kilo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+    assert.ok(observed.filter((entry) => entry.text.includes("WITH ORDINALITY")
+      && entry.text.includes("occurrences.legacy_sources")).every((entry) => entry.text.includes("owner_parents")),
+    "an index with the reserved name and wrong key shape never enables the owner probe");
     await client.query("ROLLBACK");
   } finally {
     await client.query("ROLLBACK").catch(() => {});

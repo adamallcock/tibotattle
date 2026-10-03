@@ -82,11 +82,13 @@ async function main() {
   assert.ok(Number.isSafeInteger(nowMs) && nowMs >= 0);
   const pool = new pg.Pool({ host: "127.0.0.1", port, database: process.env.PG_TEST_DATABASE ?? "postgres",
     user: process.env.PG_TEST_USER ?? "postgres", max: 3 });
-  const readers = await loadExpansionReaders({ base: process.env.READ_EXPANSION_BASE ?? DEFAULT_BASE });
-  const exporter = await pool.connect();
+  let readers;
+  let exporter;
   let calls = 0;
   const receipts = [];
   try {
+    readers = await loadExpansionReaders({ base: process.env.READ_EXPANSION_BASE ?? DEFAULT_BASE });
+    exporter = await pool.connect();
     await exporter.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const snapshotId = (await exporter.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
     assert.match(snapshotId, /^[0-9A-F]+-[0-9A-F]+-[0-9]+$/u);
@@ -127,9 +129,11 @@ async function main() {
     console.log(JSON.stringify({ status: "ok", base: process.env.READ_EXPANSION_BASE ?? DEFAULT_BASE,
       comparisons: calls, aggregateSha256: sha(JSON.stringify(receipts)) }));
   } finally {
-    await exporter.query("ROLLBACK").catch(() => {});
-    exporter.release();
-    await readers.close();
+    if (exporter) {
+      await exporter.query("ROLLBACK").catch(() => {});
+      exporter.release();
+    }
+    if (readers) await readers.close();
     await pool.end();
   }
 }
