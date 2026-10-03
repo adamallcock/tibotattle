@@ -45,3 +45,14 @@ Independent semantics review advised replacing the superseded READ-PLAN isolatio
 Bounded Node.js 26.2.0 evidence: expansion A/B helper plus read/pool contracts, `node --test --test-concurrency=1 scripts/gcp-read-expansion-ab.check.mjs cloud-run/analytics-refresh-read.check.mjs cloud-run/analytics-refresh-pool.check.mjs`, 25/25 pass, zero skips. Worker `tsc --noEmit` passes after duplicate repair. `build.mjs --kernel-closure` derives prospective closure 1a8d3f7254c3353e88761c51f6b1cd1b3ca97f6f676c5848fd36a71d5a21447f, vendor unchanged, 166 inputs; no registration. Initial duplicate-function failures and corrected logs are retained in the local log directory.
 
 Registry, pins and kernels 1–5 remain byte-for-byte unchanged; footprint remains 703 MiB. Stage1 GUC restoration and lane skip facts remain in the admitted lane receipt. The lane's full scripts wrapper is not claimed green: separately reproduced sampler race repair is pending separate admission. Wave25 completion receipts are expected evidence-only changes, as clarified by the coordinator; its exact executed source base remains cc447d55. Next source admissions are MODEL-BLOCKS, then canonical MODEL-RESIDUE, after this combined test contract is accepted. Full PostgreSQL parity/performance/serving admission remains pending.
+
+## Composed reader qualification at 4b02094c
+
+Independent semantics review accepted the exact combined contract at 4b02094c6672ead243a190f67a80b8e06a563d85. The candidate was frozen and clean throughout these gates. Root admitted one synthetic PG17.10 cluster on unused loopback port 55547 with C/C database collation, 128 MiB shared buffers, socket directory permissions 0700 and 2 GiB disk ceiling. Settings were verified directly; observed cluster peak remained below 650 MiB and host free disk stayed about 66 GiB, above the 20 GiB floor.
+
+From `apps/worker/`, with `PG_TEST_HOST=127.0.0.1 PG_TEST_SOCKET=/private/tmp/tibotattle-pg-wave26-20261003/socket PG_TEST_PORT=55547`:
+
+- `node --test --test-concurrency=1 --test-name-pattern='combined selection/expansion parity and candidate refusal' postgres-test/analytics-v2-read-plan.spec.mjs`: 1/1 passed, zero skips, 23.96 s.
+- `node --test --test-concurrency=1 postgres-test/analytics-v2-read-plan.spec.mjs postgres-test/analytics-v2-occurrence-source.spec.mjs postgres-test/read-expansion-real-boundaries.spec.mjs`: 30 passed, zero failed, one expected optional A/B harness skip because READ_PLAN_AB_BASE_ROOT is unset, 355.21 s. Real legacy, v12 and correction SQL 40000/40001 boundaries passed; both independent reader oracles, staged-index fallback, missing dictionary and error/cancellation contracts remained covered.
+
+Logs `pg-combined-contract.log` and `pg-readers-composed.log` preserve exact results. No full corpus import ran. The owned cluster was stopped after qualification; no model folds occurred during the frozen reader gate. Future source changes must carry their own evidence scopes.
