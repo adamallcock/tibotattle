@@ -36,9 +36,10 @@
 # Staging-plane limits: the service scales to zero (minScale 0) and to at most
 # MAX_INSTANCES, which the infrastructure validator checks against the staging
 # Cloud SQL connection budget. Request concurrency and timeout equal
-# production's, so the staging load test (OPS-11) measures the production
-# shape. The admission posture (closed enrollment, the upload-ingress
-# budget) and the origin-tier limits (300 and 6 a minute) are not set here:
+# production's, so the staging proof (migrate and roll; the OPS-11 load test
+# was retired in round 11) runs the production shape. The admission posture
+# (closed enrollment, the upload-ingress budget) and the origin-tier limits
+# (300 and 6 a minute) are not set here:
 # CR-3 (postgres-production-configuration.mjs) pins them by plane.
 #
 # Synthetic only. Production data and production secrets never enter this
