@@ -409,8 +409,17 @@ list on the deploy line governs.
    operational history (admin metric snapshots and
    `community_aggregate_exclusions`, mapped in R3 post-import) are `built`
    (D-PT4X; their tables are primary migrations `0066` and `0067`). The
-   production modes of the telemetry importers (D-PT5A) and the orchestrator
-   that sequences all stages (E-PT8) are `not built`:
+   production modes of the telemetry importers (D-PT5A) are `built` as eight
+   PT-1 stages in `postgres-production-telemetry-modes.mjs`:
+   `telemetry-v1-v11`, `typed-legacy`, `legacy-admission`,
+   `header-promotion`, `telemetry-v12`, `v12-event-sources`,
+   `usage-correction` and `ingestion-journal`. Each refuses on the sealed side
+   before it touches the target (column closure, an unrepresentable value, a
+   broken sealed foreign key, an erased owner link, a participant that is not
+   `active`), checks its prerequisites and trigger policy on the target, and
+   verifies a count and a canonical digest per table against the seal.
+   Nothing here has run against a real seal. The orchestrator that sequences
+   all stages (E-PT8) is `not built`:
    `<command: E-PT8 orchestrator, one disposition per sealed table>`.
 2. **Check the orchestrator's dispositions and refusals.** One disposition per
    sealed table, the deletion-digest exclusion count, the identity-pin
@@ -454,8 +463,8 @@ list on the deploy line governs.
    goes stale 2 hours after the last pass, and an empty origin reads not ready
    until the first pass. Run one pass by hand, then resume the maintenance
    trigger under [GCP scheduler resume](./gcp-scheduler-resume.md). The job
-   is `built` (C-MAINT); its trigger in the desired state is `not built`
-   (D-OPS4).
+   is `built` (C-MAINT); its trigger is in the committed desired state, created
+   paused at `* * * * *` (D-OPS4). Nothing starts a pass by hand yet.
 
 Evidence kept: the run's stage receipts (counts, digests, states), the
 flip-evidence sha256, the transfer run id. Abort: Abort A. The target database
@@ -678,19 +687,20 @@ noted.
 Status is as of the line at `c80f99b9` and the checklist on 2026-10-02. The
 C-IPR, C-ADMIN and C-REFRESH rows were re-marked when this draft merged into
 the line after `95c158ba`, and the E-QUIESCE row when E-QUIESCE merged after
-`ebb9304d`.
+`ebb9304d`. The two D-CRB rows were re-marked in D-CRB itself, on top of the
+line at `2b5c90cd`.
 
 | Gap | Affects | State |
 |---|---|---|
 | Verifier smoke command | H.1, H.5 | `in build` (verifier tooling) |
-| Production host composition, first-roll ready path, `HOST_ORIGIN` check | Preconditions, H.5 | `not built` (D-CRB); the origin refuses to start in production until it lands |
-| Telemetry importer production modes | H.4 | `not built` (D-PT5A) |
+| Production host composition, first-roll ready path, `HOST_ORIGIN` check | Preconditions, H.5 | `built` (D-CRB), local proof only (the PostgreSQL 17 production-host spec and E12); no revision is rolled anywhere. The staging service template is open (owner decision on CR-3's staging profile) |
+| Telemetry importer production modes | H.4 | `built` (D-PT5A) on a synthetic seal only; the provider's real export shapes are unverified |
 | Import orchestrator and finalize sequencing | H.4 | `not built` (E-PT8) |
 | Read-only pre-fence quiescence query | H.1 | `built` (E-QUIESCE); not yet run against the provider |
 | Frozen public read: export format, loader, retirement | H.3, H.4, H.8 | `built` (C-IPR), with migration `0065` promoted to primary at the C-SIMP-RECON merge; dropping the stored row is `not built` |
-| Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `not built` (D-CRB); the overview answers 503 until its sources exist (E-ADMIN) |
+| Admin routes at the origin | H.7 | Route modules `built` (C-ADMIN); registration in the host `built` behind the Access chokepoint but not selected (D-CRB): the admin host answers `503 POSTGRES_ROUTE_NOT_PORTED` until ADMIN-R12 flips the policy; the overview answers 503 until its sources exist (E-ADMIN) |
 | Refresh job production contract | H.8 | `built` (C-REFRESH) |
-| Maintenance job and trigger in the desired state | H.4 | `not built` (D-OPS4) |
+| Maintenance job and trigger in the desired state | H.4 | `built` (D-OPS4), created paused; applied and resumed in no project |
 | Scheduler pause-all and resume-all | H.4, H.8 | `not built` (D-OPS3) |
 | Monitoring and alerting, origin-lock check | H.7 | `not built` (E-OPS5) |
 | Barrier proof producer, edge live capture producer | H.2, rollout | No command writes either file |

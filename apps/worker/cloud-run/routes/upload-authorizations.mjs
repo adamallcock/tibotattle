@@ -50,6 +50,7 @@
  */
 
 import { defineOriginRouteModule } from "../origin-route-modules.mjs";
+import { requestIdFrom } from "../postgres-request-context.mjs";
 import {
   parseUploadAuthorizationRequest,
   resolveUploadAuthorizationFormat,
@@ -148,9 +149,11 @@ export function createUploadAuthorizationRouteModule(dependencies) {
     try { url = new URL(request.url); } catch {
       return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
     }
-    // The built-in serves no query string on this route.
-    if (url.search) return json(503, { status: "not_ready", error: "POSTGRES_TEST_ROUTE_UNSUPPORTED" });
-    const requestId = crypto.randomUUID();
+    const requestId = requestIdFrom(deps.requestContext, request);
+    // The built-in serves no query string on this route: OD-CR-6 (ii), an
+    // owner-accepted refusal where the Worker ignores the query, answered in
+    // the Worker envelope under the edge's request id (OD-CR-6 (i)).
+    if (url.search) return routeError(refusal(503, "POSTGRES_TEST_ROUTE_UNSUPPORTED"), requestId);
     try {
       await deps.assertStorageCurrent();
       deps.assertAdmissionBindings(admissionEnv);

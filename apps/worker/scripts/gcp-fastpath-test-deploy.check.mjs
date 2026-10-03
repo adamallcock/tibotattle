@@ -395,7 +395,10 @@ test("an edge-test origin runs the participant routes at wrangler.jsonc env.prod
   const production = parseJsonc(await readFile(resolve(WORKER_ROOT, "wrangler.jsonc"), "utf8")).env.production.vars;
   const expected = Object.fromEntries(EDGE_TEST_PRODUCTION_SETTINGS.map((name) => [name, production[name]]));
   assert.deepEqual(expected, { ENROLLMENT_MODE: "open", ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
-    ACCOUNTLESS_OWNERSHIP_MODE: "enabled", SIGN_IN_START_MAX_PER_MINUTE: production.SIGN_IN_START_MAX_PER_MINUTE });
+    ACCOUNTLESS_OWNERSHIP_MODE: "enabled", SIGN_IN_START_MAX_PER_MINUTE: production.SIGN_IN_START_MAX_PER_MINUTE,
+    PUBLIC_ANALYTICS_MODE: "enabled", UPLOAD_INGRESS_MAX_CONCURRENT: "64", UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "1200",
+    UPLOAD_INGRESS_BURST: "1200", UPLOAD_INGRESS_LEASE_SECONDS: "90", UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+    UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15" });
   assert.deepEqual(Object.fromEntries(edgeTestProductionEnv()), expected);
   // Every setting the origin's admission env reads is mirrored or deliberately not.
   assert.deepEqual(await originAdmissionEnvNames(),

@@ -93,8 +93,13 @@ export function createTelemetryV11OriginIntake(options) {
   }
   const { live, bearer, transport, personalDevices, controls, crypto, boundedBody } = options.adapters;
   const { primaryPool, schema, maxRequestBytes } = options;
+  // OD-CR-6 (i): every route's error body carries the root's request id.
+  const requestContext = options.requestContext;
+  if (requestContext !== undefined && typeof requestContext !== "function") {
+    throw routeConfigurationError(route, "requestContext must be a function");
+  }
   const device = {
-    primaryPool, schema, maxRequestBytes,
+    primaryPool, schema, maxRequestBytes, requestContext,
     admissionEnv: options.admissionEnv,
     assertAdmissionBindings: options.assertAdmissionBindings,
     assertAttemptAllowed: options.assertAttemptAllowed,
@@ -106,7 +111,7 @@ export function createTelemetryV11OriginIntake(options) {
     readBoundedRequestBody: boundedBody.readBoundedRequestBody,
   };
   const consent = createTelemetryV11ConsentRouteModule({
-    primaryPool, schema, maxRequestBytes,
+    primaryPool, schema, maxRequestBytes, requestContext,
     authenticatePersonalSession: personalDevices.authenticatePostgresPersonalSession,
     assertPersonalSessionCsrf: personalDevices.assertPostgresPersonalSessionCsrf,
     assertCollectionControl: controls.assertPostgresCollectionControlFromPool,

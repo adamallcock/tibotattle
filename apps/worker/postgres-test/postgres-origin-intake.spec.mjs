@@ -161,6 +161,21 @@ async function envelopeKeys() {
   return keyPair;
 }
 
+/**
+ * wrangler.jsonc env.production's upload-ingress policy (D-CRB): the origin
+ * takes the Worker's shared lease, and a shipped backfill posts every chunk
+ * in one pass only at production's budget (the composition's defaults are
+ * env.staging's 8/120/16).
+ */
+const PRODUCTION_INGRESS_SETTINGS = Object.freeze({
+  UPLOAD_INGRESS_MAX_CONCURRENT: "64",
+  UPLOAD_INGRESS_MAX_STARTS_PER_MINUTE: "1200",
+  UPLOAD_INGRESS_BURST: "1200",
+  UPLOAD_INGRESS_LEASE_SECONDS: "90",
+  UPLOAD_INGRESS_BODY_TOTAL_SECONDS: "60",
+  UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
+});
+
 const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "POSTGRES_TEST_HTTP_MODE", "HOST", "PORT", "HOST_ORIGIN", "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN",
   "K_SERVICE", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "PRIMARY_INSTANCE_CONNECTION_NAME",
@@ -171,7 +186,7 @@ const RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "ENVIRONMENT", "ENROLLMENT_MODE", "IDENTITY_LINK_SECRET", "IDENTITY_LINK_SECRET_VERSION",
   "GOOGLE_OIDC_CLIENT_ID", "GOOGLE_OIDC_CLIENT_SECRET", "SIGN_IN_START_MAX_PER_MINUTE",
   "ACCOUNTLESS_ENROLLMENT_MODE", "ACCOUNTLESS_OWNERSHIP_MODE", "SOURCE_CONTENT_DIGEST",
-  "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS",
+  "ANALYTICS_V2_ENABLED", "ANALYTICS_V2_TEST_NOW_MS", ...Object.keys(PRODUCTION_INGRESS_SETTINGS),
 ]);
 
 async function withEnvironment(environment, work) {
@@ -260,6 +275,7 @@ async function withOrigin(run) {
       }),
       ACCOUNTLESS_ENROLLMENT_MODE: "enabled",
       ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+      ...PRODUCTION_INGRESS_SETTINGS,
     }, () => m.server.createRuntime({
       dependencies: {
         createConnector: () => ({ close() {} }),

@@ -15,6 +15,8 @@ const COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY = resolve(ROOT, "postgres-commun
 const ANALYTICS_REFRESH_ENTRY = resolve(ROOT, "analytics-refresh.mjs");
 const PRODUCTION_MIGRATIONS_ENTRY = resolve(ROOT, "postgres-production-migrations.mjs");
 const MAINTENANCE_JOB_ENTRY = resolve(ROOT, "postgres-maintenance-job.mjs");
+const OPS_RUNTIME_PROBE_ENTRY = resolve(ROOT, "ops-runtime-probe-job.mjs");
+const OPS_BACKUP_AUDIT_ENTRY = resolve(ROOT, "ops-backup-audit-job.mjs");
 const OUTDIR = resolve(ROOT, "dist");
 // The vendored d43c8f92 kernels resolve @app-usagemonitor/* to the packages
 // vendored beside them through vendor/analytics-d43c8f92/tsconfig.json
@@ -34,6 +36,8 @@ const options = {
     "analytics-refresh": ANALYTICS_REFRESH_ENTRY,
     "production-migrations": PRODUCTION_MIGRATIONS_ENTRY,
     "postgres-maintenance-job": MAINTENANCE_JOB_ENTRY,
+    "ops-runtime-probe-job": OPS_RUNTIME_PROBE_ENTRY,
+    "ops-backup-audit-job": OPS_BACKUP_AUDIT_ENTRY,
   },
   bundle: true,
   platform: "node",
@@ -88,7 +92,7 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs"],
+    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
   }));
 } else {
   await mkdir(OUTDIR, { recursive: true });
@@ -97,6 +101,6 @@ if (process.argv.includes("--check")) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs"],
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
   }));
 }

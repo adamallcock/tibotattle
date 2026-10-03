@@ -5,8 +5,9 @@
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
  * analytics kernels and the analytics-refresh Job, the MP-2-lite maintenance
- * Job and the production configuration it reads, the route-family contract
- * the admin route modules import, canonical migrations,
+ * Job and the production configuration it reads, the CR-6/CR-7 production
+ * host composition, the route-family contract the admin route modules
+ * import, canonical migrations,
  * migration runner, the shared runtime-grant policy and the production
  * migration Job, the test-only migration and activation commands, and the
  * reviewed workspace packages enter this context. The
@@ -65,6 +66,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/oauth-gateway.check.mjs", destination: "apps/worker/cloud-run/oauth-gateway.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-gate.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-gate.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-test-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-test-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/cloud-run-iam-test-target.mjs", destination: "apps/worker/cloud-run/cloud-run-iam-test-target.mjs" }),
   Object.freeze({ source: "cloud-run/origin-route-modules.mjs", destination: "apps/worker/cloud-run/origin-route-modules.mjs" }),
   Object.freeze({ source: "cloud-run/origin-fastpath-mode.mjs", destination: "apps/worker/cloud-run/origin-fastpath-mode.mjs" }),
   Object.freeze({ source: "cloud-run/contribution-envelope-registry.mjs", destination: "apps/worker/cloud-run/contribution-envelope-registry.mjs" }),
@@ -105,8 +107,26 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
   // The MP-2-lite maintenance Job and the production configuration it reads.
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-maintenance-job-contract.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job-contract.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-maintenance-job.check.mjs", destination: "apps/worker/cloud-run/postgres-maintenance-job.check.mjs" }),
   Object.freeze({ source: "cloud-run/postgres-production-configuration.mjs", destination: "apps/worker/cloud-run/postgres-production-configuration.mjs" }),
+  // The CR-6/CR-7 production host (D-CRB): the route registry, the
+  // Worker-order handler, the Node adapter, the RD-2/RD-3 families, the
+  // request-context store and the composition server.mjs serves.
+  Object.freeze({ source: "cloud-run/postgres-production-host.mjs", destination: "apps/worker/cloud-run/postgres-production-host.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-production-registry.mjs", destination: "apps/worker/cloud-run/postgres-production-registry.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-host-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-host-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/origin-node-request.mjs", destination: "apps/worker/cloud-run/origin-node-request.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-readiness-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-readiness-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-health-dispatch.mjs", destination: "apps/worker/cloud-run/postgres-health-dispatch.mjs" }),
+  Object.freeze({ source: "cloud-run/postgres-request-context.mjs", destination: "apps/worker/cloud-run/postgres-request-context.mjs" }),
+  // The OPS-4 probe jobs: the closed line contract, the runtime liveness probe,
+  // the backup-audit probe and the OPS-1 policy core the audit judges with.
+  Object.freeze({ source: "cloud-run/ops-probe-contract.mjs", destination: "apps/worker/cloud-run/ops-probe-contract.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-runtime-probe-job.mjs", destination: "apps/worker/cloud-run/ops-runtime-probe-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-audit-job.mjs", destination: "apps/worker/cloud-run/ops-backup-audit-job.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-probe-job.check.mjs", destination: "apps/worker/cloud-run/ops-probe-job.check.mjs" }),
+  Object.freeze({ source: "cloud-run/ops-backup-horizon.mjs", destination: "apps/worker/cloud-run/ops-backup-horizon.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.

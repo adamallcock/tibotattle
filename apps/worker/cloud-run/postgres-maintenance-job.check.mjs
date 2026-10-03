@@ -29,7 +29,7 @@ const vite = await createServer({
 const job = await vite.ssrLoadModule("/cloud-run/postgres-maintenance-job.mjs");
 const configuration = await vite.ssrLoadModule("/cloud-run/postgres-production-configuration.mjs");
 const pass = await vite.ssrLoadModule("/src/postgres-lifecycle-pass.ts");
-const { CLOUD_RUN_IAM_TEST_TARGET } = await vite.ssrLoadModule("/cloud-run/postgres-test-dispatch.mjs");
+const { CLOUD_RUN_IAM_TEST_TARGET } = await vite.ssrLoadModule("/cloud-run/cloud-run-iam-test-target.mjs");
 after(async () => { await vite.close(); });
 
 const IDENTITY_LINK_SECRET = "synthetic-identity-link-secret-value-0000000001";

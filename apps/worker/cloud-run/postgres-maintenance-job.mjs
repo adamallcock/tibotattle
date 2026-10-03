@@ -72,27 +72,31 @@ import {
   createGoogleAccessTokenProvider,
   createIamPool,
 } from "./cloud-sql.mjs";
+import {
+  POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME,
+  POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS,
+  POSTGRES_MAINTENANCE_JOB_ENTRY,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES,
+  POSTGRES_MAINTENANCE_JOB_POOL_MAX,
+  POSTGRES_MAINTENANCE_JOB_PROFILES,
+  POSTGRES_MAINTENANCE_JOB_SCHEDULE,
+} from "./postgres-maintenance-job-contract.mjs";
 import { readProductionConfiguration } from "./postgres-production-configuration.mjs";
 
-export const POSTGRES_MAINTENANCE_JOB_ENTRY = "postgres-maintenance-job";
 export const POSTGRES_MAINTENANCE_JOB_RECEIPT_VERSION = "postgres-maintenance-job-v1";
-export const POSTGRES_MAINTENANCE_JOB_PROFILES = Object.freeze(["maintenance-job", "staging-maintenance-job"]);
-/** The lock session plus one transaction. */
-export const POSTGRES_MAINTENANCE_JOB_POOL_MAX = 2;
-/** Cycles are whole UTC minutes, the Worker cron's scheduledTime granularity. */
-export const POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS = 60_000;
-export const POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME = "tibotattle-maintenance-job";
-/** The trigger schedule the D-OPS4 Scheduler must use: every minute, as the Worker cron. */
-export const POSTGRES_MAINTENANCE_JOB_SCHEDULE = "* * * * *";
-/** Variables the job refuses even when empty, and the code each gives. */
-export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES = Object.freeze({
-  HOST_MODE: "POSTGRES_MAINTENANCE_JOB_HOST_MODE_FORBIDDEN",
-  K_SERVICE: "POSTGRES_MAINTENANCE_JOB_CONTEXT_INVALID",
-});
-export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES = Object.freeze({
-  PG_TEST_: "POSTGRES_MAINTENANCE_JOB_LOCAL_ENDPOINT_FORBIDDEN",
-  POSTGRES_MAINTENANCE_JOB_: "POSTGRES_MAINTENANCE_JOB_TUNABLE_FORBIDDEN",
-});
+// The contract constants live in postgres-maintenance-job-contract.mjs (a leaf
+// the OPS-2 job definition imports) and are re-exported here unchanged.
+export {
+  POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME,
+  POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS,
+  POSTGRES_MAINTENANCE_JOB_ENTRY,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES,
+  POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES,
+  POSTGRES_MAINTENANCE_JOB_POOL_MAX,
+  POSTGRES_MAINTENANCE_JOB_PROFILES,
+  POSTGRES_MAINTENANCE_JOB_SCHEDULE,
+};
 
 export const POSTGRES_MAINTENANCE_JOB_USAGE = `Usage: node postgres-maintenance-job.mjs --profile=<maintenance-job|staging-maintenance-job>
 

@@ -119,6 +119,7 @@ import {
   type PostgresPendingObjectReconciliationResult,
 } from "./postgres-quarantine-reconciliation";
 import type { PostgresRuntimeMigrationReceipt } from "./postgres-runtime-schema";
+import { POSTGRES_SCHEMA_RECEIPT_MAJOR, readSchemaReceipt } from "./postgres-schema-receipt";
 import type { QuarantineObjectStore } from "./quarantine-object-store";
 
 export const POSTGRES_LIFECYCLE_PASS_RECEIPT_VERSION = "postgres-lifecycle-pass-v1" as const;
@@ -138,7 +139,7 @@ export const POSTGRES_LIFECYCLE_PASS_LOCK_DOMAIN = POSTGRES_SCHEDULED_MAINTENANC
  * holds `${prefix}${primarySchema}` in shared mode as its migration fence.
  */
 export const POSTGRES_LIFECYCLE_PASS_MIGRATION_LOCK_PREFIX = "tibotattle:primary:";
-export const POSTGRES_LIFECYCLE_PASS_POSTGRES_MAJOR = 17;
+export const POSTGRES_LIFECYCLE_PASS_POSTGRES_MAJOR = POSTGRES_SCHEMA_RECEIPT_MAJOR;
 
 /**
  * OD-4 (owner decision 2026-10-02): under append-only there is no restore
@@ -272,14 +273,6 @@ class LifecyclePassRefusal extends Error {
   }
 }
 
-/**
- * This pass reads the migration receipt itself, inside its own transaction.
- * It is the one named, counted exception to the single storage receipt
- * reader (owner decision OWN-19, round 8: pinned until CR phase B, where
- * D-CRB consolidates it with the dispatch's reader); scripts/
- * ledger-absence.check.mjs pins its references, so do not add another.
- */
-const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
 /** The reconciler's and the lease token's 13-digit epoch bound (year 2286). */
 const MAX_EPOCH = 9_999_999_999_999;
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -389,34 +382,16 @@ function table(config: ValidatedOptions, name: string): string {
 }
 
 /**
- * The receipt gate the origin's storage check applies: PostgreSQL 17 and a
+ * The receipt gate the origin's storage check applies, read inside this
+ * transaction through the one shared reader (src/postgres-schema-receipt.ts;
+ * owner decision OWN-19, consolidated by D-CRB): PostgreSQL 17 and a
  * migration history exactly equal to the image's manifest (version, name and
  * checksum, in order). A missing, older, newer or drifted schema refuses.
  */
 async function assertReceipt(client: PostgresClient, config: ValidatedOptions): Promise<void> {
-  const server = await client.query<{ major: number; history: string | null }>(
-    `SELECT current_setting('server_version_num')::integer / 10000 AS major,
-            to_regclass($1)::text AS history`,
-    [`${config.quotedSchema}."${MIGRATION_HISTORY_TABLE}"`],
-  );
-  const row = server.rows[0];
-  if (row?.major !== POSTGRES_LIFECYCLE_PASS_POSTGRES_MAJOR) {
-    throw new LifecyclePassRefusal("POSTGRES_VERSION_UNSUPPORTED");
-  }
-  if (typeof row.history !== "string") throw new LifecyclePassRefusal("POSTGRES_SCHEMA_RECEIPT_MISMATCH");
-  const history = await client.query<{ version: number; name: string; checksum_sha256: string }>(
-    `SELECT version, name, checksum_sha256
-       FROM ${table(config, MIGRATION_HISTORY_TABLE)}
-      ORDER BY version`,
-  );
-  const matches = history.rows.length === config.expected.length
-    && config.expected.every((migration, index) => {
-      const actual = history.rows[index];
-      return actual?.version === migration.version
-        && actual.name === migration.name
-        && actual.checksum_sha256 === migration.sha256;
-    });
-  if (!matches) throw new LifecyclePassRefusal("POSTGRES_SCHEMA_RECEIPT_MISMATCH");
+  const status = await readSchemaReceipt(client, { schema: config.primarySchema, expected: config.expected });
+  if (status === "unsupported_postgres_version") throw new LifecyclePassRefusal("POSTGRES_VERSION_UNSUPPORTED");
+  if (status !== "current") throw new LifecyclePassRefusal("POSTGRES_SCHEMA_RECEIPT_MISMATCH");
 }
 
 interface LockedRows {

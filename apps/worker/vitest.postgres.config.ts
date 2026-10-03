@@ -15,6 +15,7 @@ export default defineConfig({
       "postgres-test/postgres-identity-authority-transfer.spec.mjs",
       "postgres-test/postgres-legacy-contribution-transfer.spec.mjs",
       "postgres-test/cutover-source-seal-rehearsal.spec.mjs",
+      "postgres-test/postgres-production-telemetry-modes.spec.mjs",
     ],
     fileParallelism: false,
   },

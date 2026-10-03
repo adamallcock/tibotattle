@@ -52,7 +52,7 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..")
 let vite;
 let registry;
 let policy;
-let edgeMode;
+let composition;
 
 before(async () => {
   vite = await createServer({
@@ -61,7 +61,9 @@ before(async () => {
   });
   registry = await vite.ssrLoadModule("/src/route-registry.ts");
   policy = await vite.ssrLoadModule("/src/edge-admission-policy.ts");
-  edgeMode = await vite.ssrLoadModule("/cloud-run/origin-edge-test-mode.mjs");
+  // The origin serves the production ported list (D-CRB: edge-test runs the
+  // production handler over the one registry).
+  composition = await vite.ssrLoadModule("/src/backend-composition.ts");
 });
 after(async () => { await vite?.close(); });
 
@@ -165,7 +167,7 @@ test("front-end emulator: any host other than the token endpoint and the origin 
 
 test("the request matrix sends every WORKER_ROUTE_POLICY (route, method) pair and S4 covers every served EP-1 entry", () => {
   const routes = registry.WORKER_ROUTE_POLICY;
-  const served = edgeMode.EDGE_TEST_SERVED_ROUTE_IDS;
+  const served = composition.POSTGRES_PORTED_WORKER_ROUTE_IDS;
   const guard = routes.find((route) => route.id === "sparkle_appcast_guard");
   const rows = [
     ...localRows({ registry: routes }),

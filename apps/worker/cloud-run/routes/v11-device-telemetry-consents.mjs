@@ -25,6 +25,7 @@ import {
   routeErrorResponse,
   routeFailure,
   storageUnavailable,
+  routeRequestId,
 } from "./v11-route-support.mjs";
 
 export const TELEMETRY_V11_CONSENT_PATH = "/api/v1/me/device-telemetry-consents";
@@ -76,7 +77,7 @@ export function createTelemetryV11ConsentRouteModule(dependencies) {
       }, value.consent, Date.now(), { schema: deps.schema });
       return jsonResponse(201, granted, { vary: "Cookie" });
     } catch (error) {
-      return routeErrorResponse(error);
+      return routeErrorResponse(error, routeRequestId(deps, request));
     }
   }
 
