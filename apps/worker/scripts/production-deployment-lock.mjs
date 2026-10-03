@@ -3,6 +3,11 @@ import { operationError } from "../../../scripts/lib/release-operation.mjs";
 
 export const PRODUCTION_LOCK_REF = "refs/heads/codex/production-deployment-lock";
 export const IMMUTABLE_ARTIFACT_LOCK_REF = "refs/heads/codex/immutable-release-artifact-lock";
+// OPS-10 staging rollouts coordinate on their own ref and never on the
+// production lock (owner decision 2026-10-02, round 9, "Deploy lock").
+export const STAGING_LOCK_REF = "refs/heads/codex/staging-deployment-lock";
+/** The closed OPS-10 environment-to-lock-ref mapping. No other environment or ref exists. */
+export const DEPLOYMENT_LOCK_REFS = Object.freeze({ production: PRODUCTION_LOCK_REF, staging: STAGING_LOCK_REF });
 const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const ID = /^[a-f0-9-]{36}$/;
@@ -14,6 +19,45 @@ export function createProductionDeploymentLock({ repositoryRoot, spawn = spawnSy
     if (!ID.test(id) || !SHA.test(sourceCommit) || !SHA.test(previousSourceCommit)) throw operationError("PRODUCTION_COORDINATION_INPUT_INVALID");
     return { schema: 1, id, sourceCommit, previousSourceCommit };
   });
+}
+
+/** The lock ref of one OPS-10 environment; an unknown environment is refused. */
+export function deploymentLockRef(environment) {
+  if (typeof environment !== "string" || !Object.hasOwn(DEPLOYMENT_LOCK_REFS, environment)) {
+    throw operationError("DEPLOYMENT_COORDINATION_ENVIRONMENT_INVALID");
+  }
+  return DEPLOYMENT_LOCK_REFS[environment];
+}
+
+// The staging rollout lock. Same owner fields as production under its own
+// schema, so a staging owner commit never reads as a production one.
+export function createStagingDeploymentLock({ repositoryRoot, spawn = spawnSync }) {
+  return createCoordinationLock({ repositoryRoot, spawn }, STAGING_LOCK_REF, "STAGING_COORDINATION", ({ id, sourceCommit, previousSourceCommit }) => {
+    if (!ID.test(id) || !SHA.test(sourceCommit) || !SHA.test(previousSourceCommit)) throw operationError("STAGING_COORDINATION_INPUT_INVALID");
+    return { schema: "staging-deployment-lock-v1", id, sourceCommit, previousSourceCommit };
+  });
+}
+
+/**
+ * The OPS-10 lock for one environment. The caller names both the environment
+ * and the ref it expects; any pair outside DEPLOYMENT_LOCK_REFS is refused
+ * before Git access, so staging can never take the production ref and
+ * production can never take the staging ref. Production returns exactly
+ * createProductionDeploymentLock.
+ */
+export function createEnvironmentDeploymentLock(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)
+      || Object.keys(options).some(key => !["environment", "ref", "repositoryRoot", "spawn"].includes(key))) {
+    throw operationError("DEPLOYMENT_COORDINATION_INPUT_INVALID");
+  }
+  const { environment, ref, repositoryRoot, spawn } = options;
+  if (deploymentLockRef(environment) !== ref) throw operationError("DEPLOYMENT_COORDINATION_REF_MISMATCH");
+  if (typeof repositoryRoot !== "string" || !repositoryRoot || repositoryRoot.length > 4096
+      || /[\0\r\n]/.test(repositoryRoot) || (spawn !== undefined && typeof spawn !== "function")) {
+    throw operationError("DEPLOYMENT_COORDINATION_INPUT_INVALID");
+  }
+  const lockOptions = spawn === undefined ? { repositoryRoot } : { repositoryRoot, spawn };
+  return environment === "production" ? createProductionDeploymentLock(lockOptions) : createStagingDeploymentLock(lockOptions);
 }
 
 // Only for separately reviewed immutable artifact publication. The writer binds
@@ -45,7 +89,7 @@ export function createImmutableArtifactPublicationLock(options) {
 
 // No expiry/stealing: an uncertain old executor must be reconciled, not fenced
 // by a timer that cannot stop its already-running Cloudflare request.
-// Ref and owner format come only from the two fixed factories above.
+// Ref and owner format come only from the fixed factories above.
 function createCoordinationLock({ repositoryRoot, spawn }, ref, errorPrefix, ownerRecord) {
   const fail = suffix => { throw operationError(`${errorPrefix}_${suffix}`); };
   const git = (args, input) => {
@@ -71,6 +115,7 @@ function createCoordinationLock({ repositoryRoot, spawn }, ref, errorPrefix, own
     if (!SHA.test(owner) || status() !== owner) fail("NOT_OWNER");
   };
   return {
+    ref,
     status,
     createOwner(input) {
       const record = ownerRecord(input);

@@ -104,5 +104,6 @@
       "schedule": "* * * * *",
       "state": "PAUSED"
     }
-  }
+  },
+  "stagingOrigin": null
 }

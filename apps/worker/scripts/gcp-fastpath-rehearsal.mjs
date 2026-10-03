@@ -31,7 +31,11 @@
 //     the oracle's per-date expectation holds: per-date model publication is
 //     the owner's decision of 2026-10-01 (fast-path plan OD-12, decision D7).
 //     Without --per-date-expected such a publication cannot be verified and
-//     fails the parity gate;
+//     fails the parity gate. The route serves allowance breakdowns v1.3 (owner
+//     decision round 7): the compare accepts exactly the declared relabel and
+//     catalog-baseline model-metadata block and holds the v1.3 block's v1.1
+//     reduction to the oracle, and the breakdownsV13Declared gate requires that
+//     a served breakdown is that declared v1.3;
 //  8. runs analytics-refresh again and checks it creates no new revision;
 //  9. drops every schema it created (unless --keep-schema).
 //
@@ -921,6 +925,8 @@ async function main() {
       readStatus200: response.status === 200,
       secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
       parityZeroUnexpected: report.parity.unexpectedDiffs === 0,
+      ...(actual.allowanceBreakdowns === undefined ? {}
+        : { breakdownsV13Declared: report.parity.breakdownsV13.accepted === true }),
       ...(report.perDate === undefined ? {} : { perDateEqual: report.perDate.equal === true }),
       ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
     };

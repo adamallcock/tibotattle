@@ -25,6 +25,8 @@ import { registerContributionEnvelope } from "../cloud-run/contribution-envelope
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
+// The local test database: the spec's own pools and the fastpath-test PRIMARY_DATABASE.
+const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DISPATCH_ORIGIN = "http://127.0.0.1:43931";
 const FASTPATH_PORT = 43932;
@@ -151,7 +153,7 @@ function localPoolOptions(socket, max, applicationName) {
     ...socket,
     user: process.env.PG_TEST_USER || "postgres",
     password: process.env.PG_TEST_PASSWORD || "synthetic-local-only",
-    database: process.env.PG_TEST_DATABASE || "postgres",
+    database: PG_TEST_DATABASE,
     application_name: applicationName,
     ssl: false,
     max,
@@ -249,7 +251,7 @@ function fastpathEnvironment(primarySchema, overrides = {}) {
     PORT: String(FASTPATH_PORT),
     HOST_ORIGIN: FASTPATH_ORIGIN,
     PRIMARY_SCHEMA: primarySchema,
-    PRIMARY_DATABASE: process.env.PG_TEST_DATABASE || "postgres",
+    PRIMARY_DATABASE: PG_TEST_DATABASE,
     PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-fastpath-primary",
     POSTGRES_IAM_USER: "synthetic-fastpath-runtime@synthetic.iam",
     POSTGRES_RATE_LIMIT_SECRET: "synthetic-fastpath-rate-limit-secret-0123456789",
@@ -404,7 +406,7 @@ test("(e) fastpath-test refuses a non-loopback host or origin and a non-rehearsa
         max: options.max,
       })), [
         {
-          role: "primary", schema, database: "postgres",
+          role: "primary", schema, database: PG_TEST_DATABASE,
           instanceConnectionName: "synthetic-project:us-east1:synthetic-fastpath-primary", max: 3,
         },
       ]);

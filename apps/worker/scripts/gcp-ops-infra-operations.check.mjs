@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { canonicalJson } from "../src/canonical-json.ts";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as operations from "./gcp-ops-infra-operations.mjs";
 import {
@@ -25,6 +26,7 @@ import {
   memoryWriter,
   withSecretValues,
 } from "./fixtures/gcp-ops-infra/fake-gcloud.mjs";
+import { unpinnedStagingText } from "./fixtures/gcp-ops-infra/staging-unpinned.mjs";
 
 process.env.PATH = "/nonexistent-gcloud-guard";
 
@@ -196,8 +198,10 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(result.synthetic, true);
   assert.deepEqual(result.blockers, []);
   assert.deepEqual(result.findings, []);
-  // The fixture's three jobs and the maintenance trigger (created, paused, then granted) add four.
-  assert.deepEqual(result.summary, { executable: 39, deferred: 1, refused: 0 });
+  // The fixture's three jobs and the maintenance trigger (created, paused, then
+  // granted) add four; the refresh trigger's create and the scheduler's
+  // executor grant on the refresh job wait for the owner's cadence.
+  assert.deepEqual(result.summary, { executable: 38, deferred: 2, refused: 0 });
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -214,9 +218,12 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   for (const flag of manifest.databaseFlags(desired)) {
     assert.ok(byId.get("cloud-sql:create").argv.at(-1).includes(`${flag.name}=${flag.value}`), flag.name);
   }
+  // PostgreSQL IAM users are the email without ".gserviceaccount.com".
   assert.deepEqual(byId.get("cloud-sql-user:create:runtime").argv, ["sql", "users", "create",
-    desired.serviceAccounts.runtime.email, "--instance=synthetic-primary", "--project=synthetic-ops-project",
+    desired.cloudSql.runtimeIamUser, "--instance=synthetic-primary", "--project=synthetic-ops-project",
     "--type=cloud_iam_service_account"]);
+  assert.equal(byId.get("cloud-sql-user:create:runtime").argv.some((arg) => arg.endsWith(".gserviceaccount.com")), false);
+  assert.equal(byId.get("cloud-sql-user:create:migrator").argv[3], desired.cloudSql.migratorIamUser);
   assert.ok(byId.has("cloud-sql-user:create:migrator"));
   // The conditional custom role, with exactly the parsed permissions.
   assert.ok(byId.get("custom-role:create").argv.includes(`--permissions=${desired.customRole.permissions.join(",")}`));
@@ -232,7 +239,8 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-service-iam:bind:")).map((entry) => entry.argv.at(-1)),
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
   // Exactly the three fast-path jobs, all created; only the refresh trigger
-  // waits, for the owner's cadence. The maintenance trigger has its own: every minute.
+  // waits, for the owner's cadence, and with it the scheduler's executor grant
+  // on the refresh job. The maintenance trigger has its own: every minute.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
     ["run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance"]);
   const maintenance = JSON.parse(byId.get("run-job:create:maintenance").file.content);
@@ -256,6 +264,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     ["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]);
   assert.deepEqual(ops(result, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]), [
     ["scheduler:create:analytics-refresh", "SCHEDULER_CADENCE_UNSET"],
+    [EXECUTOR(desired), "SCHEDULER_CADENCE_UNSET"],
   ]);
   // No bucket update, no bucket IAM operation, no delete.
   for (const entry of result.operations) {
@@ -505,6 +514,68 @@ test("a trigger whose pause failed after its create is paused by the next plan, 
     ["scheduler:pause:analytics-refresh"]);
 });
 
+test("the scheduler's executor grant follows its trigger: withheld while the cadence is unset, and a live grant blocks the create", () => {
+  const JOB_POLICY = "synthetic-analytics-refresh";
+  const granted = (world) => JSON.stringify(world.jobPolicies[JOB_POLICY] ?? {}).includes("roles/run.jobsExecutor");
+  const unset = desiredState({ synthetic: false });
+  const scheduled = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = bornWorld(unset);
+  const apply = (desired, gcloud, result, options = {}) => operations.applyInfrastructure(desired, { runner: gcloud.runner,
+    authorize: result.planDigest, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED, ...options });
+  const create = "scheduler:create:analytics-refresh";
+  const pause = "scheduler:pause:analytics-refresh";
+
+  // No cadence: the jobs are created, but no trigger and no grant, so nothing can start the job.
+  const gcloud = fake(unset, world);
+  const first = plan(unset, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
+  assert.deepEqual(ops(first, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]),
+    [[create, "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unset), "SCHEDULER_CADENCE_UNSET"]]);
+  apply(unset, gcloud, first, { bootstrap: BOOTSTRAP });
+  assert.deepEqual([granted(world), world.schedulerJobs.length, world.jobs.length], [false, 0, 2]);
+  assert.equal(operations.infrastructureCleanliness(plan(unset, gcloud.runner, UNDEFERRED)).clean, true);
+
+  // The owner commits a cadence: the next plan creates, pauses, and only then grants.
+  const later = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([later.blockers, later.operations.map((entry) => entry.id)], [[], [create, pause, EXECUTOR(scheduled)]]);
+  // A pause that fails leaves an ENABLED trigger the account cannot yet use to start the job.
+  const failing = fake(scheduled, world, { failWhen: (argv) => argv.slice(0, 3).join(" ") === "scheduler jobs pause" });
+  assert.throws(() => apply(scheduled, failing, later), (error) => error.code === "APPLY_OPERATION_FAILED"
+    && error.operation === pause);
+  assert.deepEqual([trigger(world).state, granted(world)], ["ENABLED", false]);
+  // The next plan pauses it and only then grants, and then the estate has converged.
+  const repair = fake(scheduled, world);
+  const replan = plan(scheduled, repair.runner, UNDEFERRED);
+  assert.deepEqual(replan.operations.map((entry) => entry.id), [pause, EXECUTOR(scheduled)]);
+  apply(scheduled, repair, replan);
+  assert.deepEqual([trigger(world).state, granted(world)], ["PAUSED", true]);
+  assert.deepEqual(plan(scheduled, repair.runner, UNDEFERRED).operations, []);
+
+  // A grant that is already live when a create is planned (the trigger was removed by hand, or the
+  // estate was bound before it) would let the ENABLED trigger start the job before its pause: the
+  // plan blocks, and apply, which never removes a grant, refuses it without a single mutation.
+  world.schedulerJobs = [];
+  const blockedGcloud = fake(scheduled, world);
+  const blocked = plan(scheduled, blockedGcloud.runner, UNDEFERRED);
+  assert.deepEqual(blocked.blockers, ["SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh"]);
+  assert.deepEqual(blocked.operations.map((entry) => entry.id), [create, pause]);
+  assert.deepEqual([...operations.infrastructureCleanliness(blocked).reasons], [
+    "BLOCKER:SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh", `EXECUTABLE:${create}`, `EXECUTABLE:${pause}`]);
+  blockedGcloud.calls.length = 0;
+  assert.throws(() => apply(scheduled, blockedGcloud, blocked), { code: "APPLY_BLOCKED" });
+  assert.equal(kinds(blockedGcloud.calls).includes("mutate"), false);
+  assert.equal(world.schedulerJobs.length, 0);
+  // The owner removes the grant by hand; the next plan clears the block and restores the order.
+  world.jobPolicies[JOB_POLICY] = {};
+  const cleared = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([cleared.blockers, cleared.operations.map((entry) => entry.id)],
+    [[], [create, pause, EXECUTOR(scheduled)]]);
+  apply(scheduled, fake(scheduled, world), cleared);
+  assert.deepEqual([trigger(world).state, granted(world)], ["PAUSED", true]);
+  // A live trigger with its grant is the converged estate, not a create, so it blocks nothing.
+  const live = plan(scheduled, fake(scheduled, world).runner, UNDEFERRED);
+  assert.deepEqual([live.blockers, live.operations], [[], []]);
+});
+
 test("the trigger's desired state is honoured without ever resuming, and an unknown live state blocks", () => {
   const paused = desiredState({ synthetic: false, mutate: CADENCE });
   const resumed = desiredState({ synthetic: false, mutate: (value) => {
@@ -578,8 +649,21 @@ test("OPS-10's clean verdict needs no finding, blocker, executable, refused or u
   const desired = desiredState({ synthetic: false });
   const world = convergedWorld(desired);
   const converged = plan(desired, fake(desired, world).runner);
-  assert.deepEqual(converged.summary, { executable: 0, deferred: 1, refused: 0 });
+  assert.deepEqual(converged.summary, { executable: 0, deferred: 2, refused: 0 });
   assert.deepEqual({ ...operations.infrastructureCleanliness(converged) }, { clean: true, reasons: [] });
+  // The cutover's stricter form (readback --require-cadence) refuses exactly the unset cadence's two deferrals.
+  assert.deepEqual({ ...operations.infrastructureCleanliness(converged, { requireCadence: true }) }, { clean: false,
+    reasons: ["DEFERRED:scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
+      `DEFERRED:${EXECUTOR(desired)}:SCHEDULER_CADENCE_UNSET`] });
+  assert.throws(() => operations.infrastructureCleanliness(converged, { requireCadence: "yes" }),
+    { code: "CLEANLINESS_OPTIONS_INVALID" });
+  // A committed cadence, with its trigger created paused, is clean in both forms.
+  const scheduled = desiredState({ synthetic: false, mutate: CADENCE });
+  const settled = plan(scheduled, fake(scheduled, convergedWorld(scheduled, UNDEFERRED)).runner, UNDEFERRED);
+  for (const requireCadence of [false, true]) {
+    assert.deepEqual({ ...operations.infrastructureCleanliness(settled, { requireCadence }) },
+      { clean: true, reasons: [] }, String(requireCadence));
+  }
   const verdict = (mutate) => {
     const copy = structuredClone(world);
     mutate(copy);
@@ -714,6 +798,40 @@ test("idempotent updates: drift is set back without recreating anything", () => 
     ["scheduler:pause:analytics-refresh", "scheduler:update:analytics-refresh"]);
 });
 
+test("a rerun with the instance present creates missing IAM users by their PostgreSQL names, never the full email", () => {
+  // The rerun after a first apply that stopped at cloud-sql-user:create: the
+  // managed instance and database exist, and neither IAM user does.
+  const desired = desiredState({ synthetic: false });
+  const instance = desired.cloudSql.instance;
+  const world = convergedWorld(desired, UNDEFERRED);
+  world.sqlUsers[instance] = world.sqlUsers[instance].filter((user) => user.type !== "CLOUD_IAM_SERVICE_ACCOUNT");
+  assert.deepEqual(world.sqlInstances.map((entry) => entry.name), [instance]);
+  assert.ok(world.sqlDatabases[instance].some((database) => database.name === desired.cloudSql.database));
+  const gcloud = fake(desired, world);
+  const users = [["runtime", desired.cloudSql.runtimeIamUser], ["migrator", desired.cloudSql.migratorIamUser]];
+  const createArgv = (iamUser) => ["sql", "users", "create", iamUser, `--instance=${instance}`,
+    `--project=${desired.project}`, "--type=cloud_iam_service_account"];
+  const result = plan(desired, gcloud.runner, UNDEFERRED);
+  assert.deepEqual([result.summary.refused, result.findings, result.blockers], [0, [], []]);
+  const executable = ops(result, (entry) => entry.deferred === undefined);
+  assert.deepEqual(executable.map((entry) => [entry.id, entry.argv]),
+    users.map(([role, iamUser]) => [`cloud-sql-user:create:${role}`, createArgv(iamUser)]));
+  for (const [role, iamUser] of users) {
+    assert.notEqual(iamUser, desired.serviceAccounts[role].email, role);
+    assert.equal(desired.serviceAccounts[role].email.endsWith(".gserviceaccount.com"), true, role);
+  }
+  for (const entry of executable) {
+    assert.equal(entry.argv.some((arg) => arg.endsWith(".gserviceaccount.com")), false, entry.id);
+  }
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
+  // A first apply that made only the runtime user: the rerun creates only the migrator.
+  world.sqlUsers[instance] = world.sqlUsers[instance].filter((user) => user.name !== desired.cloudSql.migratorIamUser);
+  assert.deepEqual(ops(plan(desired, fake(desired, world).runner, UNDEFERRED), (entry) => entry.deferred === undefined)
+    .map((entry) => [entry.id, entry.argv]), [["cloud-sql-user:create:migrator", createArgv(desired.cloudSql.migratorIamUser)]]);
+});
+
 test("a failed operation stops apply, journals what ran and closes the spec writer", () => {
   const desired = desiredState({ synthetic: false });
   const gcloud = fake(desired, bornWorld(desired), { failWhen: (argv) => argv[0] === "secrets" && argv[1] === "create" });
@@ -792,7 +910,7 @@ test("the verifier's token-creator grant waits for the operator, and its own pol
   const waiting = plan(unassigned, fake(unassigned, world).runner);
   assert.deepEqual(waiting.operations.map((entry) => [entry.id, entry.deferred]),
     [["verifier-iam:token-creator", "VERIFIER_TOKEN_CREATOR_UNASSIGNED"], ["scheduler:create:analytics-refresh",
-      "SCHEDULER_CADENCE_UNSET"]]);
+      "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unassigned), "SCHEDULER_CADENCE_UNSET"]]);
   assert.deepEqual([...operations.infrastructureCleanliness(waiting).reasons],
     ["DEFERRED:verifier-iam:token-creator:VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
   // Assigned: one bind on the verifier account, read back from its own policy, then converged.
@@ -896,12 +1014,13 @@ test("a shared project's co-tenants and project-wide settings are never read int
   assert.doesNotMatch(JSON.stringify(result.operations), /tibotattle-test/u);
   operations.applyInfrastructure(shared, { runner: gcloud.runner, authorize: result.planDigest, bootstrap: BOOTSTRAP,
     createSpecWriter: () => gcloud.writer.create() });
-  // The plane converged as far as it can (its service waits for a staging
-  // template); its co-tenants and the project-wide settings are exactly as they were.
+  // The plane converged as far as it can (its service waits for its
+  // stagingOrigin settings, STG-PREP); its co-tenants and the project-wide
+  // settings are exactly as they were.
   assert.deepEqual([...operations.infrastructureCleanliness(plan(shared, gcloud.runner)).reasons], [
-    "DEFERRED:run-service:create:STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
-    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
-    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_SERVICE_TEMPLATE_UNAVAILABLE`,
+    "DEFERRED:run-service:create:STAGING_ORIGIN_UNASSIGNED",
+    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.edgeInvoker.member}|:STAGING_ORIGIN_UNASSIGNED`,
+    `DEFERRED:run-service-iam:bind:roles/run.invoker|${shared.serviceAccounts.verifier.member}|:STAGING_ORIGIN_UNASSIGNED`,
     // The maintenance job, its trigger and the scheduler's grant wait for the same staging values (never created, never clean).
     "DEFERRED:run-job:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
     "DEFERRED:scheduler:create:maintenance:STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
@@ -933,7 +1052,9 @@ test("a shared project's co-tenants and project-wide settings are never read int
 });
 
 test("the committed staging desired state plans only its own new resources in the shared test project", () => {
-  const desired = manifest.loadCommittedDesiredState("staging");
+  // The committed file as it reads before its pins (STG-PREP): the first plan.
+  manifest.loadCommittedDesiredState("staging");
+  const desired = manifest.assertCommittedDesiredState(manifest.validateDesiredState(JSON.parse(unpinnedStagingText())));
   const world = withCoTenants(emptyWorld(), desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
@@ -943,14 +1064,15 @@ test("the committed staging desired state plans only its own new resources in th
   assert.deepEqual(result.blockers, ["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]);
   assert.doesNotMatch(JSON.stringify(result.operations), /tibotattle-test|_Default/u);
   // Everything it would create is the staging plane's; the service waits for
-  // its template, the verifier grant for the operator, the trigger for the cadence.
+  // its Access AUD, the verifier grant for the operator, the trigger for the cadence.
   for (const entry of result.operations.filter((operation) => operation.deferred === undefined)) {
     const named = entry.file === undefined ? entry.argv : [...entry.argv, entry.file.content];
     assert.ok(named.some((arg) => /staging/u.test(arg)) || entry.id === "custom-role:create", entry.id);
   }
   const deferrals = new Set(ops(result, (entry) => entry.deferred !== undefined).map((entry) => entry.deferred));
+  // The verifier operator was named on 2026-10-02, so its grant is no longer deferred.
   assert.deepEqual([...deferrals].sort(), ["SCHEDULER_CADENCE_UNSET", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE",
-    "STAGING_SERVICE_TEMPLATE_UNAVAILABLE", "VERIFIER_TOKEN_CREATOR_UNASSIGNED"]);
+    "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud"]);
   // The staging maintenance job, its trigger and the scheduler's grant are deferred, never created.
   assert.deepEqual(ops(result, (entry) => /maintenance/u.test(entry.id)).map((entry) => [entry.id, entry.deferred]), [
     ["run-job:create:maintenance", "STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE"],
@@ -1241,4 +1363,350 @@ test("the scheduler probe raises the paused-too-long signal only for a resumed t
   const prelaunch = desiredState({ synthetic: false, mutate: CADENCE });
   trigger(world).state = "PAUSED";
   assert.equal(operations.probeScheduler(prelaunch, { runner: fake(prelaunch, world).runner, now: () => nowMs }).alert, false);
+});
+
+// ---------------------------------------------------------------------------
+// OPS-3 pause-all and resume-all (D-OPS3)
+
+const RESUMED = (value) => { CADENCE(value); value.scheduler["analytics-refresh"].state = "ENABLED"; };
+
+/** A converged dedicated project whose managed trigger OPS-3 resumed, plus hand-made triggers. */
+function resumedWorld(desired) {
+  const world = convergedWorld(desired);
+  trigger(world).state = "ENABLED";
+  const runUri = (job) => `https://run.googleapis.com/v2/projects/${desired.project}/locations/${desired.region}/jobs/${job}:run`;
+  world.schedulerJobs.push(
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-hand-made-trigger`, state: "ENABLED",
+      schedule: "0 * * * *", httpTarget: { uri: runUri("synthetic-production-migrate") } },
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-webhook-trigger`, state: "ENABLED",
+      schedule: "0 * * * *", httpTarget: { uri: "https://hooks.example.invalid/synthetic" } },
+    { name: `projects/${desired.project}/locations/${desired.region}/jobs/synthetic-deliberately-paused`, state: "PAUSED",
+      schedule: "0 * * * *", httpTarget: { uri: runUri("synthetic-analytics-refresh") } },
+  );
+  return world;
+}
+
+async function receiptDirectory(t) {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const directory = await mkdtemp(join(tmpdir(), "ops3-receipt-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+/** OPS-10's ROLLOUT_JOBS_NOT_PAUSED rule over a world, with the rollout's own classifier. */
+async function rolloutGateHolds(world) {
+  const { scheduledRunJob } = await import("./gcp-scheduler-run-target.mjs");
+  return world.schedulerJobs.filter((entry) => scheduledRunJob(entry) !== null).every(({ state }) => state === "PAUSED");
+}
+
+test("pause-all is a read-only dry run whose plan pauses every plane trigger and opens OPS-10's gate", async () => {
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const gcloud = fake(desired, world);
+  const first = operations.planPauseAll(desired, { runner: gcloud.runner });
+  assert.deepEqual(gcloud.calls, [["scheduler", "jobs", "list", `--project=${APPLY_PROJECT}`, "--location=us-east1",
+    "--format=json"]]);
+  assert.equal(first.schema, operations.GCP_OPS_PAUSE_ALL_PLAN_SCHEMA);
+  assert.deepEqual(first.triggers.map(({ name, action, runJob }) => [name, action, runJob]), [
+    [TRIGGER, "pause", "synthetic-analytics-refresh"],
+    ["synthetic-deliberately-paused", "none", "synthetic-analytics-refresh"],
+    ["synthetic-hand-made-trigger", "pause", "synthetic-production-migrate"],
+    ["synthetic-webhook-trigger", "pause", null],
+  ]);
+  assert.deepEqual([first.blockers, first.foreignBlocking, first.rolloutGateAfter.satisfied], [[], [], true]);
+  assert.equal(await rolloutGateHolds(world), false, "the gate is shut before pause-all");
+  // Deterministic: the same estate in another order gives the same digest.
+  world.schedulerJobs.reverse();
+  assert.equal(operations.planPauseAll(desired, { runner: fake(desired, world).runner }).planDigest, first.planDigest);
+});
+
+test("pause-all applies only under its digest, pauses only, writes the receipt, and the rollout gate then holds",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const desired = desiredState({ synthetic: false, mutate: RESUMED });
+    const world = resumedWorld(desired);
+    const gcloud = fake(desired, world);
+    const plan = operations.planPauseAll(desired, { runner: gcloud.runner });
+    const receiptPath = join(directory, "pause-all.json");
+    // Refusals before any mutation.
+    for (const [options, code] of [
+      [{ authorize: undefined }, "PAUSE_ALL_AUTHORIZATION_REQUIRED"],
+      [{ authorize: "not-a-digest" }, "PAUSE_ALL_AUTHORIZATION_INVALID"],
+      [{ authorize: "0".repeat(64) }, "PAUSE_ALL_PLAN_DIGEST_MISMATCH"],
+      [{ authorize: plan.planDigest, receiptPath: "relative.json" }, "PAUSE_ALL_RECEIPT_PATH_REQUIRED"],
+    ]) {
+      await assert.rejects(operations.applyPauseAll(desired, { runner: gcloud.runner, receiptPath, ...options }), { code });
+    }
+    await assert.rejects(operations.applyPauseAll(desiredState({ mutate: RESUMED }), { runner: gcloud.runner,
+      authorize: plan.planDigest, receiptPath }), { code: "PAUSE_ALL_SYNTHETIC_TARGET_REFUSED" });
+    assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "nothing mutated by a refusal");
+    const callsBefore = gcloud.calls.length;
+    const receipt = await operations.applyPauseAll(desired, { runner: gcloud.runner, authorize: plan.planDigest,
+      receiptPath, now: () => Date.parse("2026-10-02T12:00:00Z") });
+    const mutations = gcloud.calls.slice(callsBefore).filter((argv) => operations.classifyGcloudCommand(argv) !== "read");
+    assert.deepEqual(mutations.map((argv) => argv.slice(0, 4).join(" ")), [`scheduler jobs pause ${TRIGGER}`,
+      "scheduler jobs pause synthetic-hand-made-trigger", "scheduler jobs pause synthetic-webhook-trigger"]);
+    assert.equal(world.schedulerJobs.every(({ state }) => state === "PAUSED"), true);
+    assert.equal(await rolloutGateHolds(world), true, "ROLLOUT_JOBS_NOT_PAUSED is now satisfiable");
+    assert.deepEqual([receipt.status, receipt.paused, receipt.alreadyPaused, receipt.failed, receipt.rolloutGate.satisfied],
+      ["complete", [TRIGGER, "synthetic-hand-made-trigger", "synthetic-webhook-trigger"],
+        ["synthetic-deliberately-paused"], null, true]);
+    assert.equal(receipt.pausedAt, "2026-10-02T12:00:00.000Z");
+    const written = JSON.parse(readFileSync(receiptPath, "utf8"));
+    assert.deepEqual(written, JSON.parse(JSON.stringify(receipt)));
+    assert.deepEqual(operations.verifyPauseAllReceipt(written, desired, { nowMs: Date.parse("2026-10-02T12:30:00Z") }),
+      written);
+    // Each plane trigger's read-back evidence is recorded for resume-all.
+    assert.deepEqual(written.triggers.find(({ name }) => name === TRIGGER),
+      { name: TRIGGER, state: "PAUSED", userUpdateTime: "2026-10-02T00:00:00Z", lastAttemptTime: null });
+    const { statSync } = await import("node:fs");
+    assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
+    // OPS-10's clean verdict is unchanged for the managed trigger: paused while
+    // committed ENABLED is OPS-3's deferred resume. (The hand-made triggers are
+    // drift in a dedicated project either way.)
+    assert.deepEqual([...operations.infrastructureCleanliness(plan2(desired, world)).reasons], [
+      "REFUSED:scheduler:delete:synthetic-deliberately-paused", "REFUSED:scheduler:delete:synthetic-hand-made-trigger",
+      "REFUSED:scheduler:delete:synthetic-webhook-trigger"]);
+    // A receipt is never overwritten.
+    const again = operations.planPauseAll(desired, { runner: fake(desired, world).runner });
+    await assert.rejects(operations.applyPauseAll(desired, { runner: fake(desired, world).runner,
+      authorize: again.planDigest, receiptPath }), { code: "OPS_RECEIPT_PATH_UNAVAILABLE" });
+  });
+
+function plan2(desired, world) {
+  return plan(desired, fake(desired, world).runner);
+}
+
+test("a failed pause leaves an incomplete receipt naming what was paused, and resume-all resumes only that", async (t) => {
+  const directory = await receiptDirectory(t);
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const failing = fake(desired, world, { failWhen: (argv) => argv.slice(0, 4).join(" ")
+    === "scheduler jobs pause synthetic-hand-made-trigger" });
+  const plan = operations.planPauseAll(desired, { runner: failing.runner });
+  const receiptPath = join(directory, "pause-all.json");
+  const error = await operations.applyPauseAll(desired, { runner: failing.runner, authorize: plan.planDigest, receiptPath })
+    .then(() => null, (caught) => caught);
+  assert.equal(error?.code, "PAUSE_ALL_INCOMPLETE");
+  const written = JSON.parse(readFileSync(receiptPath, "utf8"));
+  assert.deepEqual([written.status, written.paused, written.failed, written.rolloutGate.satisfied],
+    ["incomplete", [TRIGGER], "synthetic-hand-made-trigger", false]);
+  assert.doesNotMatch(JSON.stringify(written), /MARKER/u);
+  // The managed trigger paused by this run is resumed; nothing else is.
+  const resume = operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: written });
+  assert.deepEqual(resume.resume, [TRIGGER]);
+});
+
+test("resume-all resumes only committed-ENABLED managed triggers that pause-all or the operator paused", async (t) => {
+  const directory = await receiptDirectory(t);
+  const desired = desiredState({ synthetic: false, mutate: RESUMED });
+  const world = resumedWorld(desired);
+  const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world).runner });
+  const pausedAt = () => Date.parse("2026-10-02T12:00:00Z");
+  const now = () => Date.parse("2026-10-02T13:00:00Z");
+  const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world).runner,
+    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: pausedAt });
+  const gcloud = fake(desired, world);
+  const plan = operations.planResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now });
+  assert.equal(kinds(gcloud.calls).every((kind) => kind === "read"), true, "the resume plan is a dry run");
+  assert.deepEqual(plan.resume, [TRIGGER], "hand-made triggers are never resumed");
+  assert.deepEqual(plan.triggers, [{ job: "analytics-refresh", name: TRIGGER, committedState: "ENABLED",
+    liveState: "PAUSED", action: "resume" }]);
+  for (const [options, code] of [
+    [{ authorize: undefined }, "RESUME_ALL_AUTHORIZATION_REQUIRED"],
+    [{ authorize: "0".repeat(64) }, "RESUME_ALL_PLAN_DIGEST_MISMATCH"],
+  ]) {
+    assert.throws(() => operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt, now, ...options }),
+      { code });
+  }
+  assert.throws(() => operations.applyResumeAll(desiredState({ mutate: RESUMED }), { runner: gcloud.runner,
+    pauseReceipt: receipt, authorize: plan.planDigest, now }), { code: "RESUME_ALL_SYNTHETIC_TARGET_REFUSED" });
+  const before = gcloud.calls.length;
+  const done = operations.applyResumeAll(desired, { runner: gcloud.runner, pauseReceipt: receipt,
+    authorize: plan.planDigest, now });
+  assert.deepEqual(gcloud.calls.slice(before).filter((argv) => operations.classifyGcloudCommand(argv) !== "read"),
+    [["scheduler", "jobs", "resume", TRIGGER, `--project=${APPLY_PROJECT}`, "--location=us-east1"]]);
+  assert.deepEqual([done.schema, done.outcomes], [operations.GCP_OPS_RESUME_ALL_RECEIPT_SCHEMA,
+    [{ name: TRIGGER, outcome: "resumed" }]]);
+  assert.equal(trigger(world).state, "ENABLED");
+  for (const name of ["synthetic-hand-made-trigger", "synthetic-webhook-trigger", "synthetic-deliberately-paused"]) {
+    assert.equal(world.schedulerJobs.find((entry) => entry.name.endsWith(`/${name}`)).state, "PAUSED", name);
+  }
+  // Applied again, there is nothing left to resume.
+  assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, pauseReceipt: receipt, now })
+    .resume, []);
+});
+
+test("resume-all never resumes a trigger committed PAUSED, or one paused by someone else, and --only is exact", async (t) => {
+  const directory = await receiptDirectory(t);
+  // Committed PAUSED (before OPS-3's first resume): pause-all still pauses, resume-all never resumes.
+  const prelaunch = desiredState({ synthetic: false, mutate: CADENCE });
+  const world = convergedWorld(prelaunch);
+  trigger(world).state = "ENABLED"; // someone resumed it by hand
+  const pausePlan = operations.planPauseAll(prelaunch, { runner: fake(prelaunch, world).runner });
+  const receipt = await operations.applyPauseAll(prelaunch, { runner: fake(prelaunch, world).runner,
+    authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json") });
+  assert.deepEqual(receipt.paused, [TRIGGER]);
+  const committedPaused = operations.planResumeAll(prelaunch, { runner: fake(prelaunch, world).runner, pauseReceipt: receipt });
+  assert.deepEqual([committedPaused.resume, committedPaused.triggers[0].reason], [[], "COMMITTED_STATE_PAUSED"]);
+  assert.throws(() => operations.planResumeAll(prelaunch, { runner: fake(prelaunch, world).runner, only: [TRIGGER] }),
+    { code: "RESUME_ALL_ONLY_INELIGIBLE" });
+  // Committed ENABLED but paused before pause-all ran: not this receipt's to resume.
+  const resumed = desiredState({ synthetic: false, mutate: RESUMED });
+  const quiet = fake(resumed, world).runner;
+  const emptyReceipt = await (async () => {
+    const plan = operations.planPauseAll(resumed, { runner: quiet });
+    return operations.applyPauseAll(resumed, { runner: quiet, authorize: plan.planDigest,
+      receiptPath: join(directory, "pause-again.json") });
+  })();
+  assert.deepEqual([emptyReceipt.paused, emptyReceipt.alreadyPaused], [[], [TRIGGER]]);
+  const deliberate = operations.planResumeAll(resumed, { runner: quiet, pauseReceipt: emptyReceipt });
+  assert.deepEqual([deliberate.resume, deliberate.triggers[0].reason], [[], "NOT_PAUSED_BY_PAUSE_ALL"]);
+  // The operator may name it: --only asserts they paused it.
+  assert.deepEqual(operations.planResumeAll(resumed, { runner: quiet, only: [TRIGGER] }).resume, [TRIGGER]);
+  for (const [source, code] of [
+    [{}, "RESUME_ALL_SOURCE_REQUIRED"],
+    [{ only: [] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ only: ["synthetic-hand-made-trigger"] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ only: [TRIGGER, TRIGGER] }, "RESUME_ALL_ONLY_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, paused: [TRIGGER] } }, "PAUSE_ALL_RECEIPT_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, project: "example-ops-other" } }, "PAUSE_ALL_RECEIPT_INVALID"],
+    [{ pauseReceipt: { ...emptyReceipt, extra: true } }, "PAUSE_ALL_RECEIPT_INVALID"],
+  ]) {
+    assert.throws(() => operations.planResumeAll(resumed, { runner: quiet, ...source }), { code }, code);
+  }
+  // A live state the plan does not recognize blocks resume-all.
+  trigger(world).state = "UPDATE_FAILED";
+  const blocked = operations.planResumeAll(resumed, { runner: fake(resumed, world).runner, pauseReceipt: emptyReceipt });
+  assert.deepEqual(blocked.blockers, [`TRIGGER_STATE_UNRECOGNIZED:${TRIGGER}`]);
+  assert.throws(() => operations.applyResumeAll(resumed, { runner: fake(resumed, world).runner, pauseReceipt: emptyReceipt,
+    authorize: blocked.planDigest }), { code: "RESUME_ALL_BLOCKED" });
+  assert.ok(operations.planPauseAll(resumed, { runner: fake(resumed, world).runner }).blockers
+    .includes(`TRIGGER_STATE_UNRECOGNIZED:${TRIGGER}`));
+});
+
+/** A receipt edited and then re-digested, as a hand-forged or stale file would be. */
+function redigested(receipt, edit) {
+  const copy = structuredClone(receipt);
+  edit(copy);
+  delete copy.digest;
+  return { ...copy, digest: manifest.sha256Hex(canonicalJson(copy)) };
+}
+
+test("resume-all refuses an old receipt and skips a trigger changed after pause-all, even under a valid receipt",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const desired = desiredState({ synthetic: false, mutate: RESUMED });
+    const world = resumedWorld(desired);
+    let tick = 0;
+    const clock = () => `2026-10-02T12:${String(tick++).padStart(2, "0")}:00Z`;
+    const pausedAtMs = Date.parse("2026-10-02T12:30:00Z");
+    const pausePlan = operations.planPauseAll(desired, { runner: fake(desired, world, { clock }).runner });
+    const receipt = await operations.applyPauseAll(desired, { runner: fake(desired, world, { clock }).runner,
+      authorize: pausePlan.planDigest, receiptPath: join(directory, "pause.json"), now: () => pausedAtMs });
+    const at = (iso) => () => Date.parse(iso);
+    const planAt = (now, pauseReceipt = receipt) => operations.planResumeAll(desired,
+      { runner: fake(desired, world, { clock }).runner, pauseReceipt, now });
+    assert.deepEqual(planAt(at("2026-10-03T12:30:00Z")).resume, [TRIGGER], "exactly 24 h old is still current");
+    // Age: a receipt older than 24 h, or dated ahead of now, is refused before any read.
+    assert.equal(operations.PAUSE_ALL_RECEIPT_MAX_AGE_HOURS, 24);
+    assert.throws(() => planAt(at("2026-10-03T12:30:01Z")), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const august = redigested(receipt, (copy) => { copy.pausedAt = "2026-08-01T00:00:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), august), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    assert.throws(() => operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: august, authorize: "0".repeat(64), now: at("2026-10-02T13:00:00Z") }), { code: "PAUSE_ALL_RECEIPT_STALE" });
+    const ahead = redigested(receipt, (copy) => { copy.pausedAt = "2026-10-02T13:06:00.000Z"; });
+    assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), ahead), { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    // The read-back evidence is closed and digested.
+    for (const edit of [
+      (copy) => { copy.triggers[0].extra = true; },
+      (copy) => { copy.triggers[0].userUpdateTime = "yesterday"; },
+      (copy) => { copy.triggers.push(copy.triggers[0]); },
+      (copy) => { copy.triggers = "none"; },
+    ]) {
+      assert.throws(() => planAt(at("2026-10-02T13:00:00Z"), redigested(receipt, edit)),
+        { code: "PAUSE_ALL_RECEIPT_INVALID" });
+    }
+    // No read-back for the trigger (the readback after the pauses failed): not resumed from the receipt.
+    const unread = redigested(receipt, (copy) => { copy.triggers = null; });
+    const missing = planAt(at("2026-10-02T13:00:00Z"), unread);
+    assert.deepEqual([missing.resume, missing.triggers[0].reason], [[], "PAUSE_ALL_READBACK_MISSING"]);
+    // Someone resumed it and paused it again on purpose after pause-all.
+    const now = at("2026-10-02T13:00:00Z");
+    assert.deepEqual(planAt(now).resume, [TRIGGER]);
+    const recorded = receipt.triggers.find(({ name }) => name === TRIGGER);
+    const call = fake(desired, world, { clock }).runner;
+    for (const verb of ["resume", "pause"]) {
+      assert.equal(call(["scheduler", "jobs", verb, TRIGGER, `--project=${desired.project}`, "--location=us-east1"]).status, 0);
+    }
+    assert.equal(trigger(world).state, "PAUSED");
+    assert.notEqual(trigger(world).userUpdateTime, recorded.userUpdateTime);
+    const repaused = planAt(now);
+    assert.deepEqual([repaused.resume, repaused.triggers[0].reason], [[], "CHANGED_AFTER_PAUSE_ALL"]);
+    const none = operations.applyResumeAll(desired, { runner: fake(desired, world, { clock }).runner,
+      pauseReceipt: receipt, authorize: repaused.planDigest, now });
+    assert.deepEqual(none.outcomes, []);
+    assert.equal(trigger(world).state, "PAUSED", "a deliberately re-paused trigger stays paused");
+    // A trigger that ran after pause-all was resumed in between, even if its userUpdateTime did not move.
+    trigger(world).userUpdateTime = recorded.userUpdateTime;
+    trigger(world).lastAttemptTime = "2026-10-02T12:45:00Z";
+    assert.deepEqual(planAt(now).triggers[0].reason, "CHANGED_AFTER_PAUSE_ALL");
+    // --only stays the operator's explicit path for both.
+    assert.deepEqual(operations.planResumeAll(desired, { runner: fake(desired, world).runner, only: [TRIGGER] }).resume,
+      [TRIGGER]);
+    assert.ok(operations.RESUME_SKIP_REASONS.includes("CHANGED_AFTER_PAUSE_ALL")
+      && operations.RESUME_SKIP_REASONS.includes("PAUSE_ALL_READBACK_MISSING"));
+  });
+
+test("in a shared project pause-all touches only the plane, and names a co-tenant trigger that keeps the gate shut",
+  async (t) => {
+    const directory = await receiptDirectory(t);
+    const shared = desiredState({ synthetic: false, mutate: (value) => { sharedStaging(value); CADENCE(value); } });
+    const world = withCoTenants(bornWorld(shared), shared);
+    const runUri = (job) => `https://run.googleapis.com/v2/projects/${shared.project}/locations/${shared.region}/jobs/${job}:run`;
+    world.schedulerJobs.push(
+      { name: `projects/${shared.project}/locations/${shared.region}/jobs/synthetic-staging-trigger`, state: "ENABLED",
+        httpTarget: { uri: runUri("synthetic-staging-refresh") } },
+      { name: `projects/${shared.project}/locations/${shared.region}/jobs/synthetic-staging-hand-made`, state: "ENABLED",
+        httpTarget: { uri: runUri("synthetic-staging-migrate") } },
+    );
+    const plan = operations.planPauseAll(shared, { runner: fake(shared, world).runner });
+    assert.deepEqual(plan.triggers.map(({ name }) => name), ["synthetic-staging-hand-made", "synthetic-staging-trigger"]);
+    assert.deepEqual(plan.foreignBlocking, [{ name: "tibotattle-test-nightly", state: "ENABLED" }]);
+    assert.deepEqual([plan.rolloutGateAfter.satisfied, plan.rolloutGateAfter.reasons],
+      [false, ["TRIGGER_NOT_PAUSED:tibotattle-test-nightly"]]);
+    const gcloud = fake(shared, world);
+    const receipt = await operations.applyPauseAll(shared, { runner: gcloud.runner, authorize: plan.planDigest,
+      receiptPath: join(directory, "pause.json") });
+    assert.deepEqual(receipt.paused, ["synthetic-staging-hand-made", "synthetic-staging-trigger"]);
+    assert.equal(gcloud.calls.some((argv) => argv.includes("tibotattle-test-nightly")), false, "a co-tenant is never touched");
+    assert.equal(world.schedulerJobs.find((entry) => entry.name.endsWith("/tibotattle-test-nightly")).state, "ENABLED");
+    assert.equal(receipt.rolloutGate.satisfied, false);
+  });
+
+test("the pause and resume guards issue only their own shape, and apply and read never know resume", () => {
+  const calls = [];
+  const runner = (argv) => { calls.push(argv); return { status: 0, stdout: "[]" }; };
+  const project = "--project=example-ops-prod1";
+  const pause = operations.guardedGcloud(runner, { mode: "pause", project: "example-ops-prod1" });
+  const resume = operations.guardedGcloud(runner, { mode: "resume", project: "example-ops-prod1" });
+  const apply = operations.guardedGcloud(runner, { mode: "apply", project: "example-ops-prod1" });
+  const read = operations.guardedGcloud(runner, { mode: "read", project: "example-ops-prod1" });
+  assert.throws(() => pause(["sql", "instances", "create", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => pause(["scheduler", "jobs", "update", "http", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => pause(["scheduler", "jobs", "resume", "x", project]), { code: "GCLOUD_COMMAND_FORBIDDEN" });
+  assert.throws(() => resume(["scheduler", "jobs", "pause", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  assert.throws(() => resume(["run", "jobs", "replace", "x", project]), { code: "GCLOUD_MUTATION_UNAUTHORIZED" });
+  for (const call of [apply, read]) {
+    assert.throws(() => call(["scheduler", "jobs", "resume", "x", project]), { code: "GCLOUD_COMMAND_FORBIDDEN" });
+  }
+  assert.throws(() => operations.guardedGcloud(runner, { mode: "admin", project: "example-ops-prod1" }),
+    { code: "GCLOUD_GUARD_MODE_INVALID" });
+  assert.equal(calls.length, 0);
+  assert.equal(pause(["scheduler", "jobs", "pause", "x", project, "--location=us-east1"]), null);
+  assert.equal(resume(["scheduler", "jobs", "resume", "x", project, "--location=us-east1"]), null);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(operations.RESUME_COMMANDS, ["scheduler jobs resume"]);
+  assert.equal(operations.MUTATING_COMMANDS.includes(operations.PAUSE_COMMAND), true);
 });

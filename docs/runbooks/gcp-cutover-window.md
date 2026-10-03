@@ -129,7 +129,7 @@ a no-go.
 | Estate | PROD-1, OWN-5, OWN-5b, OWN-5c, OPS2-READ | The OPS-2 plan was applied by the owner and its readback reads clean. The first live readback parsed correctly on the test project |
 | Secrets | PROD-2, OWN-6, OWN-6b | Secret Manager is populated. The identity-link secret matches the sealed pin and the envelope keys are identical. The Cloudflare edge secrets are in place and the typed baseline was recaptured after each put |
 | Origin pre-staged | PROD-3 | The origin migrated to the tail and rolled ([rollout](./gcp-rollout.md)). A maintenance pass ran. The verifier smoke reads ready. An unauthenticated request to the Cloud Run URL gets Google's 403 |
-| Scheduler | PROD-4, E-OPS5 | Triggers exist and are paused, with the cadence from the refresh measurements. The paused-too-long probe has a runner and a notification target |
+| Scheduler | PROD-4, E-OPS5 | Triggers exist and are paused, with the cadence from the refresh measurements. `node scripts/gcp-infra.mjs readback --require-clean --require-cadence --environment=production` exits 0: without `--require-cadence`, a production estate whose cadence was never committed reads clean, has no trigger, and raises no refresh alert (those wait on the cadence), so this flag is the mechanical guard against it. The paused-too-long alert (`scheduler-quiet`, a log-absence proxy of about 25 h for a daily trigger, accepted in round 11 with no probe job) has a notification target; the probe stays operator-run |
 | Edge | PROD-5, E-EDGEPORT, OWN-7, OWN-7b | The worker-mode edge is live from the edge-port line. The release-guard D1 exists and has no pending migration. All six edge-tier rate-limit bindings are live. The edge IP probe from the `tibotattle.com` zone passed. Each mode was rehearsed on the staging edge, including a fence and abort drill |
 | Candidate site | E-OPS9 | A site built from the edge-port line carries the privacy marker and is not yet deployed. `SECURITY.md`, the privacy page and the local-data reference are in the cutover commit |
 | Owner-private plans | OWN-12 | The EP-8 fence plan (including the analytics catch-up consumer and any recovery analytics Worker), the seal inventory (`expectedSourceCommit` equal to P), the gcp edge plan and the receipts directory exist |
@@ -743,6 +743,7 @@ line at `2b5c90cd`.
 | Barrier proof producer, edge live capture producer | H.2, rollout | No command writes either file |
 | R2 to Cloud Storage copy | After | `not built` (PT-7) |
 | Observation duration and brake thresholds | H.7 | Owner decision, not recorded |
+| Backup-restore rehearsal | Preconditions (Backups) | Staging tool `built`, never run live (E-OPS7). Its do-not-restore step is injected with no list, because custody is OA-9 (decided after cutover). So the Backups precondition, which needs the list reapplied before uploads reopen, cannot clear before cutover as written. Owner decision needed |
 
 ## Evidence boundary
 

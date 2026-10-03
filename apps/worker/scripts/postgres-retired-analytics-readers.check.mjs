@@ -281,3 +281,10 @@ test("the scanner flags doctored sources: a SQL read, an unlisted inventory and 
   // Prefixed D1 names never match.
   assert.deepEqual(findRetiredMentions("src/postgres-x.ts", "community_refresh_lanes community_prepared_source_days"), []);
 });
+
+test("the check is wired into the Worker's complete gate, so a green run proves it ran", async () => {
+  const pkg = JSON.parse(await readFile(join(WORKER_ROOT, "package.json"), "utf8"));
+  assert.equal(pkg.scripts["postgres:retired-readers:check"],
+    "node --check ./scripts/postgres-retired-analytics-readers.check.mjs && node --test ./scripts/postgres-retired-analytics-readers.check.mjs");
+  assert.match(pkg.scripts.check, /(?:^| && )npm run postgres:retired-readers:check(?: && |$)/u);
+});

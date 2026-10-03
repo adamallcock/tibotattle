@@ -23,9 +23,10 @@
  * material. The staging file describes a plane inside the shared GCP test
  * project (projectTenancy 'shared': co-tenant resources are neither managed
  * nor removed, and project-wide logging settings are left alone). The
- * production file keeps its project, project number, region and bucket
- * location as explicit null placeholders, which the validator refuses
- * (DESIRED_STATE_PLACEHOLDER_UNFILLED) until the owner fills them (OWN-5).
+ * production file names the dedicated project tibotattle-prod (OWN-5, filled
+ * by PROD-PREP under owner decisions round 13); the validator still refuses
+ * any file whose project, project number, region or bucket location is an
+ * explicit null placeholder (DESIRED_STATE_PLACEHOLDER_UNFILLED).
  *
  * Topology: one Cloud SQL PostgreSQL 17 ENTERPRISE instance, zonal, with no
  * replica, no high availability and no deletion-ledger instance (append-only
@@ -70,8 +71,11 @@ import {
   EDGE_ONLY_SECRET_NAMES,
   OPTIONAL_SECRET_NAMES,
   PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE,
+  PRODUCTION_RESOURCE_FINGERPRINT,
   PRODUCTION_RESOURCE_MARKER,
   REQUIRED_SECRET_NAMES,
+  STAGING_ADMISSION_MODES,
+  STAGING_PROVIDED_VAR_NAMES,
   STAGING_RESOURCE_MARKER,
 } from "../cloud-run/postgres-production-configuration.mjs";
 import { desiredBackupConfiguration } from "../cloud-run/ops-backup-horizon.mjs";
@@ -188,10 +192,10 @@ export const DEFERRED_JOBS = Object.freeze({});
  * The maintenance job's staging profile (staging-maintenance-job) reads the
  * staging plane's own origins and identity values (ACCESS_TEAM_DOMAIN,
  * ACCESS_AUD, ACCESS_ADMIN_EMAIL, IDENTITY_LINK_SECRET_VERSION and the
- * Google and Apple identifiers, PUBLIC_ORIGIN, ADMIN_HOST_ORIGIN), which the
- * desired state does not carry. They arrive with the staging service
- * template (STG-PREP, D-CRB), the same prerequisite as
- * SERVICE_TEMPLATE_UNAVAILABLE, so a staging maintenance job waits for it
+ * Google and Apple identifiers, PUBLIC_ORIGIN, ADMIN_HOST_ORIGIN). STG-PREP
+ * now carries them for the staging service (the stagingOrigin block and the
+ * staging service template), but the job render does not read them from
+ * there yet, so a staging maintenance job still waits
  * (STAGING_MAINTENANCE_JOB_ENVIRONMENT_UNAVAILABLE).
  */
 export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({
@@ -199,14 +203,45 @@ export const JOB_ENVIRONMENT_UNAVAILABLE = Object.freeze({
 });
 
 /**
- * Services OPS-2 cannot render yet, by environment, with the reason. EP-7's
- * template is the production profile (HOST_MODE production, the production
- * public origin), and CR-3 refuses it under staging-marked names, so a
- * staging service waits for a staging service template (D-CRB, OD-CR-8).
+ * Services OPS-2 cannot render yet, by environment, with the reason. None
+ * today: production renders from EP-7's template and staging from its own
+ * staging template (STG-PREP; SERVICE_TEMPLATE_FILES). The mechanism stays
+ * for an environment whose template is withdrawn.
  */
-export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({
-  staging: "STAGING_SERVICE_TEMPLATE_UNAVAILABLE",
-});
+export const SERVICE_TEMPLATE_UNAVAILABLE = Object.freeze({});
+
+/**
+ * CR-3 secrets a production desired state may leave out (owner decision
+ * 2026-10-02, round 12: Google and Apple sign-in are retired at the switch,
+ * with no port). The committed production file leaves both out, so OPS-2
+ * never makes a production container for them; its check pins that. Staging
+ * keeps its inert synthetic copies, and the synthetic fixture keeps both so
+ * the service render stays covered, until ROUTES-R12 narrows CR-3. While CR-3
+ * still requires a secret the desired state leaves out, the service cannot
+ * boot, so OPS-2 defers it (SERVICE_RETIRED_SECRET_STILL_REQUIRED:<name>).
+ * Once ROUTES-R12 drops the names from CR-3, that deferral clears itself and
+ * any file still naming them is refused as SECRET_UNKNOWN.
+ */
+export const RETIRED_PRODUCTION_SECRET_NAMES = Object.freeze(["GOOGLE_OIDC_CLIENT_SECRET", "APPLE_PRIVATE_KEY"]);
+
+/**
+ * CR-3 optional secrets that nothing on the production estate reads, so a
+ * production desired state may leave them out, and the committed file does.
+ * DISTRIBUTION_GITHUB_API_TOKEN: the origin's admin distribution view reads
+ * the stored GitHub snapshot through a fetcher that refuses every request
+ * (src/postgres-admin-distribution.ts), the service's Worker env never
+ * carries the token (cloud-run/server.mjs), and no production job syncs
+ * GitHub (D-OPS4 is not built). Leaving the container out keeps the
+ * credential out of one more store. The service renders without the entry,
+ * as for an unpinned optional version. A later reader adds the container
+ * back with a desired-state change.
+ */
+export const UNREAD_PRODUCTION_SECRET_NAMES = Object.freeze(["DISTRIBUTION_GITHUB_API_TOKEN"]);
+
+/** Every CR-3 secret a production desired state may leave out. */
+export const PRODUCTION_OMITTABLE_SECRET_NAMES = Object.freeze([
+  ...RETIRED_PRODUCTION_SECRET_NAMES, ...UNREAD_PRODUCTION_SECRET_NAMES,
+]);
 
 export const SERVICE_ACCOUNT_ROLES = Object.freeze([
   "runtime", "migrator", "scheduler", "builder", "edgeInvoker", "verifier",
@@ -441,7 +476,12 @@ export const SCHEDULER_OAUTH_SCOPE = "https://www.googleapis.com/auth/cloud-plat
 /** The project marker apply refuses: the shipped fixture is synthetic. */
 export const SYNTHETIC_PROJECT_MARKER = "synthetic";
 
-const SERVICE_TEMPLATE_PATH = resolve(WORKER_ROOT, "cloud-run/production-service.template.yaml");
+/** Each environment's service template, relative to apps/worker (EP-7's, and STG-PREP's staging one). */
+export const SERVICE_TEMPLATE_FILES = Object.freeze({
+  production: "cloud-run/production-service.template.yaml",
+  staging: "cloud-run/staging-service.template.yaml",
+});
+const SERVICE_TEMPLATE_PATH = resolve(WORKER_ROOT, SERVICE_TEMPLATE_FILES.production);
 const IAM_TEMPLATE_PATH = resolve(WORKER_ROOT, "cloud-run/production-edge-iam.template.json");
 /** The GCS store entry module; its relative imports are followed. */
 export const GCS_STORE_ENTRY = "src/gcs-quarantine-object-store.ts";
@@ -741,6 +781,7 @@ export const DESIRED_STATE_SHAPE = Object.freeze({
   desiredState: Object.freeze([
     "schemaVersion", "environment", "projectTenancy", "project", "projectNumber", "region", "artifactRegistry",
     "serviceAccounts", "customRole", "secrets", "cloudSql", "bucket", "service", "jobs", "scheduler",
+    "stagingOrigin",
   ]),
   artifactRegistry: Object.freeze(["repository", "imageName"]),
   serviceAccount: Object.freeze(["accountId", "projectRoles"]),
@@ -754,6 +795,9 @@ export const DESIRED_STATE_SHAPE = Object.freeze({
   service: Object.freeze(["name", "maxInstances", "rolloutOverlapInstances", "audience", "telemetryStorageNamespace"]),
   job: Object.freeze(["name", "maxConnections"]),
   trigger: Object.freeze(["name", "schedule", "state"]),
+  // STG-PREP: the staging service's own non-secret settings; null in production.
+  stagingOrigin: Object.freeze(["publicOrigin", "accessTeamDomain", "accessAud", "accessAdminEmail",
+    "identityLinkSecretVersion", "admissionMode"]),
 });
 
 function closedKeys(value, keys, path) {
@@ -1057,16 +1101,19 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     permissions: parsedPermissions,
   };
 
-  // Secret Manager secrets: exactly CR-3's required and optional names, each
-  // named by its Secret Manager secret id, in its plane's form, and a pinned
-  // version number.
+  // Secret Manager secrets: exactly CR-3's required and optional names (less,
+  // in production, the retired and unread ones), each named by its Secret
+  // Manager secret id, in its plane's form, and a pinned version number.
   if (!isRecord(input.secrets)) fail("DESIRED_STATE_SHAPE_INVALID:secrets");
   const secretNames = [...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES];
   for (const name of Object.keys(input.secrets)) {
     if (!secretNames.includes(name)) fail(`SECRET_UNKNOWN:${name}`);
   }
+  // Production may leave out a retired (round 12) or unread secret; every other name is required.
+  const omittableSecretNames = environment === "production" ? PRODUCTION_OMITTABLE_SECRET_NAMES : [];
   const secrets = {};
   for (const name of secretNames) {
+    if (!Object.hasOwn(input.secrets, name) && omittableSecretNames.includes(name)) continue;
     if (!Object.hasOwn(input.secrets, name)) fail(`SECRET_CONTAINER_MISSING:${name}`);
     closedKeys(input.secrets[name], DESIRED_STATE_SHAPE.secret, `secrets.${name}`);
     const secretName = text(input.secrets[name].secretName, SECRET_ID, `secrets.${name}.secretName`);
@@ -1207,7 +1254,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     ...JOB_NAMES.map((job) => [`plane:jobs.${job}.name`, jobs[job].name]),
     ...SCHEDULED_JOB_NAMES.map((job) => [`plane:scheduler.${job}.name`, scheduler[job].name]),
     // Secret Manager ids are project-wide: each one is the plane's own.
-    ...secretNames.map((name) => [`plane:secrets.${name}.secretName`, secrets[name].secretName]),
+    ...Object.keys(secrets).map((name) => [`plane:secrets.${name}.secretName`, secrets[name].secretName]),
     ["cloudSql.connectionName", cloudSql.connectionName],
   ];
   nameChecks(names, environment);
@@ -1219,6 +1266,8 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   const resourceNames = [service.name, ...JOB_NAMES.map((job) => jobs[job].name)];
   if (new Set(resourceNames).size !== resourceNames.length) fail("CLOUD_RUN_NAMES_NOT_DISTINCT");
+  // STG-PREP: the staging service's settings (null in production).
+  const stagingOrigin = validateStagingOrigin(input.stagingOrigin, environment);
 
   const desired = {
     schemaVersion: GCP_OPS_INFRA_DESIRED_STATE_SCHEMA,
@@ -1237,6 +1286,7 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
     service,
     jobs,
     scheduler,
+    stagingOrigin,
   };
   const budget = connectionBudget(desired);
   if (!budget.fits) fail("CONNECTION_BUDGET_EXCEEDED");
@@ -1405,11 +1455,21 @@ export function serviceTemplateValues(desired, { imageDigest, sourceCommit }) {
     if (secret.version === null && secret.required) fail(`SECRET_VERSION_UNPINNED:${name}`);
     values[`SECRET_VERSION_${name}`] = secret.version ?? "";
   }
-  return values;
+  // An optional secret the plane leaves out renders as an unpinned one: its entry is omitted.
+  for (const name of OPTIONAL_SECRET_NAMES) {
+    if (!Object.hasOwn(desired.secrets, name)) values[`SECRET_VERSION_${name}`] = "";
+  }
+  // STG-PREP: the staging template's own placeholders.
+  return desired.environment === "staging" ? { ...values, ...stagingServiceTemplateValues(desired) } : values;
 }
 
 function readTemplate(path, readTemplateFile) {
   return readTemplateFile === undefined ? readFileSync(path, "utf8") : readTemplateFile(path);
+}
+
+function serviceTemplatePath(environment) {
+  if (!Object.hasOwn(SERVICE_TEMPLATE_FILES, environment)) fail("GCP_INFRA_ENVIRONMENT_INVALID");
+  return resolve(WORKER_ROOT, SERVICE_TEMPLATE_FILES[environment]);
 }
 
 /**
@@ -1420,8 +1480,8 @@ function readTemplate(path, readTemplateFile) {
  * the reviewed invariants (IAM-private, audience-bound, digest-pinned, no
  * deletion-ledger setting, CR-3 secrets only by secretKeyRef).
  */
-export function renderServiceTemplateValues(values, { templateText } = {}) {
-  const template = parseTemplateYaml(templateText ?? readTemplate(SERVICE_TEMPLATE_PATH));
+export function renderServiceTemplateValues(values, { templateText, environment = "production" } = {}) {
+  const template = parseTemplateYaml(templateText ?? readTemplate(serviceTemplatePath(environment)));
   const names = new Set();
   JSON.stringify(template).replace(PLACEHOLDER, (_, name) => names.add(name));
   for (const name of Object.keys(values)) {
@@ -1437,20 +1497,38 @@ export function renderServiceTemplateValues(values, { templateText } = {}) {
   container.env = container.env.filter((entry) => !optional.has(entry.name)
     || entry.valueFrom?.secretKeyRef?.key !== "");
   assertServiceInvariants(service);
+  // STG-PREP: each plane renders only from its own template.
+  assertPlaneServiceInvariants(service, environment);
   return deepFreeze(service);
 }
 
 /**
- * Why the desired service cannot be rendered for any image, or null: the
- * environment has no service template yet (SERVICE_TEMPLATE_UNAVAILABLE), or
- * the telemetry storage namespace is unassigned.
+ * Why the desired service's template cannot be rendered for any image, or
+ * null: the environment has no service template (SERVICE_TEMPLATE_UNAVAILABLE),
+ * the telemetry storage namespace is unassigned, a staging setting the
+ * staging template needs is not yet there (stagingServiceBlocker), or the
+ * desired state leaves out a retired secret that CR-3 still requires
+ * (RETIRED_PRODUCTION_SECRET_NAMES).
  */
-export function serviceRenderBlocker(desired) {
+export function serviceTemplateBlocker(desired) {
   if (Object.hasOwn(SERVICE_TEMPLATE_UNAVAILABLE, desired.environment)) {
     return SERVICE_TEMPLATE_UNAVAILABLE[desired.environment];
   }
   if (desired.service.telemetryStorageNamespace === null) return "TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED";
+  if (desired.environment === "staging") return stagingServiceBlocker(desired);
+  // A secret the plane retired but CR-3 still requires: the service would not boot.
+  const retired = REQUIRED_SECRET_NAMES.find((name) => !Object.hasOwn(desired.secrets, name));
+  if (retired !== undefined) return `SERVICE_RETIRED_SECRET_STILL_REQUIRED:${retired}`;
   return null;
+}
+
+/**
+ * Why OPS-2 must not create or update the desired service yet, or null: its
+ * template cannot render (serviceTemplateBlocker), or the origin image cannot
+ * serve the environment's composition yet (SERVICE_COMPOSITION_PENDING).
+ */
+export function serviceRenderBlocker(desired) {
+  return serviceTemplateBlocker(desired) ?? SERVICE_COMPOSITION_PENDING[desired.environment] ?? null;
 }
 
 /**
@@ -1481,9 +1559,10 @@ function withSecretNames(service, secrets) {
 
 /** Renders the desired service for an image (live or bootstrap). */
 export function renderService(desired, image, options = {}) {
-  const blocker = serviceRenderBlocker(desired);
+  const blocker = serviceTemplateBlocker(desired);
   if (blocker !== null) fail(blocker);
-  return withSecretNames(renderServiceTemplateValues(serviceTemplateValues(desired, image), options), desired.secrets);
+  return withSecretNames(renderServiceTemplateValues(serviceTemplateValues(desired, image),
+    { ...options, environment: desired.environment }), desired.secrets);
 }
 
 /**
@@ -1820,8 +1899,8 @@ export function assertCommittedDesiredState(desired) {
 
 /**
  * An environment's committed desired state, validated, describing that
- * environment and meeting the committed-file policy. The production file
- * refuses DESIRED_STATE_PLACEHOLDER_UNFILLED until OWN-5 fills it.
+ * environment and meeting the committed-file policy. A file with an unfilled
+ * owner placeholder refuses DESIRED_STATE_PLACEHOLDER_UNFILLED.
  */
 export function loadCommittedDesiredState(environment, { readFile, readSource } = {}) {
   const desired = readDesiredStateFile(committedDesiredStatePath(environment), {
@@ -1905,4 +1984,221 @@ export function rolloutTargetFromDesiredState(desired) {
  */
 export function rolloutTarget(environment, { readFile, readSource } = {}) {
   return rolloutTargetFromDesiredState(loadCommittedDesiredState(environment, { readFile, readSource }));
+}
+
+// ---------------------------------------------------------------------------
+// STG-PREP: the staging service (OD-CR-8 HOST_MODE=staging, OD-2 proof).
+//
+// Kept in its own section so the D-OPS4 (maintenance job and probes) and
+// C-SIMP (OD-2 in EP-7 and CR-3) merges touch nothing here. The staging
+// service renders from cloud-run/staging-service.template.yaml with the
+// committed desired state's stagingOrigin block, the pinned secret versions
+// and the pinned bucket-birth proof.
+
+/**
+ * Services whose template renders but whose origin image cannot serve the
+ * environment's composition yet, by environment, with the reason. OPS-2
+ * defers their create and update (serviceRenderBlocker), so an apply never
+ * replaces a service with a revision that cannot start; renderService still
+ * renders them for review. The server reads no HOST_MODE until D-CRB lands
+ * the production and staging composition (CR-6/CR-7 phase B): the D-CRB
+ * merge removes the staging entry, with its check.
+ */
+export const SERVICE_COMPOSITION_PENDING = Object.freeze({
+  staging: "STAGING_HOST_COMPOSITION_PENDING",
+});
+
+/**
+ * The inert synthetic identity-provider identifiers the staging template
+ * carries literally. They name no registered Google client, Apple service,
+ * key or team; scripts/gcp-staging-secrets.mjs gives their secrets inert
+ * synthetic values, so Google and Apple sign-in cannot complete on staging.
+ */
+export const STAGING_INERT_IDENTITY_PROVIDER_VARS = Object.freeze({
+  GOOGLE_OIDC_CLIENT_ID: "000000000000-tibotattlestaginginert.apps.googleusercontent.com",
+  APPLE_SERVICES_ID: "com.tibotattle.staging.inert",
+  APPLE_KEY_ID: "STAGINGK01",
+  APPLE_TEAM_ID: "STAGINGT01",
+});
+
+/** Every env name the staging service carries, in template order (the optional token may be omitted). */
+export const STAGING_SERVICE_ENV_NAMES = Object.freeze([
+  "HOST", "HOST_MODE", "HOST_ORIGIN", "PUBLIC_ORIGIN", "ADMIN_HOST_ORIGIN", "DEPLOYMENT_SOURCE_COMMIT",
+  "EDGE_ORIGIN_MODE", "EDGE_ORIGIN_AUDIENCE", "EDGE_INVOKER_SERVICE_ACCOUNT", "EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS",
+  "TELEMETRY_STORAGE_NAMESPACE", "STAGING_ADMISSION_MODE", "ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "ACCESS_ADMIN_EMAIL",
+  "IDENTITY_LINK_SECRET_VERSION", "GOOGLE_OIDC_CLIENT_ID", "APPLE_SERVICES_ID", "APPLE_KEY_ID", "APPLE_TEAM_ID",
+  "PRIMARY_INSTANCE_CONNECTION_NAME", "PRIMARY_DATABASE", "PRIMARY_SCHEMA", "POSTGRES_IAM_USER", "GCS_BUCKET_NAME",
+  "GCS_QUARANTINE_BUCKET_HISTORY_PROOF", ...REQUIRED_SECRET_NAMES, ...OPTIONAL_SECRET_NAMES,
+]);
+/** OD-2: the quarantine bucket's birth proof setting (C-SIMP re-admits it in CR-3 and EP-7). */
+export const QUARANTINE_BUCKET_HISTORY_PROOF_ENV = "GCS_QUARANTINE_BUCKET_HISTORY_PROOF";
+const QUARANTINE_PROOF_KEYS = "bucket,bucketGeneration,bucketMetageneration,softDeleteRetentionDurationSeconds";
+export const STAGING_ADMIN_HOST_PREFIX = "admin.";
+
+const ACCESS_AUD_PATTERN = /^[a-f0-9]{64}$/u;
+const ACCESS_TEAM_DOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/u;
+const ADMIN_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]{1,64}@[a-z0-9](?:[a-z0-9.-]{0,187}[a-z0-9])?\.[a-z]{2,}$/u;
+const IDENTITY_LINK_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const DNS_HOST_PATTERN =
+  /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
+
+function productionFingerprintValues() {
+  const values = new Set();
+  for (const value of Object.values(PRODUCTION_RESOURCE_FINGERPRINT)) {
+    for (const item of Array.isArray(value) ? value : [value]) values.add(item);
+  }
+  return values;
+}
+const PRODUCTION_FINGERPRINT = productionFingerprintValues();
+
+/** A canonical https origin of the staging edge's public host, or null. */
+function stagingPublicOrigin(value) {
+  if (typeof value !== "string" || value.length > 256) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.protocol !== "https:" || url.origin !== value || url.port !== "" || url.username !== ""
+      || !DNS_HOST_PATTERN.test(url.hostname) || url.hostname.startsWith(STAGING_ADMIN_HOST_PREFIX)
+      || url.hostname.endsWith(".run.app")) {
+    return null;
+  }
+  return url;
+}
+
+function stagingOriginField(value, pattern, path) {
+  if (typeof value !== "string" || !pattern.test(value) || /["'$\\]/u.test(value)) {
+    fail(`DESIRED_STATE_VALUE_INVALID:stagingOrigin.${path}`);
+  }
+  if (PRODUCTION_FINGERPRINT.has(value)) fail(`STAGING_ORIGIN_PRODUCTION_VALUE_FORBIDDEN:stagingOrigin.${path}`);
+  return value;
+}
+
+/**
+ * The staging service's own non-secret settings. Production carries null
+ * (STAGING_ORIGIN_FORBIDDEN:production otherwise). Staging may carry null
+ * until they are chosen, which only defers its service
+ * (STAGING_ORIGIN_UNASSIGNED); accessAud may be null until the owner creates
+ * the staging admin Access application (staging edge plan phase C). Every
+ * value is closed to CR-3's grammar for its variable and never a production
+ * value: the public origin is the staging edge's https origin, carrying the
+ * staging token, never a run.app or admin host.
+ */
+export function validateStagingOrigin(value, environment) {
+  if (environment !== "staging") {
+    if (value !== null) fail(`STAGING_ORIGIN_FORBIDDEN:${environment}`);
+    return null;
+  }
+  if (value === null) return null;
+  closedKeys(value, DESIRED_STATE_SHAPE.stagingOrigin, "stagingOrigin");
+  const url = stagingPublicOrigin(value.publicOrigin);
+  if (url === null) fail("DESIRED_STATE_VALUE_INVALID:stagingOrigin.publicOrigin");
+  if (PRODUCTION_FINGERPRINT.has(url.origin) || PRODUCTION_FINGERPRINT.has(url.hostname)
+      || PRODUCTION_MARKER.test(url.hostname)) {
+    fail("STAGING_ORIGIN_PRODUCTION_VALUE_FORBIDDEN:stagingOrigin.publicOrigin");
+  }
+  if (!STAGING_MARKER.test(url.hostname)) fail("DESIRED_STATE_STAGING_MARKER_MISSING:stagingOrigin.publicOrigin");
+  const identityLinkSecretVersion = stagingOriginField(value.identityLinkSecretVersion, IDENTITY_LINK_VERSION_PATTERN,
+    "identityLinkSecretVersion");
+  if (!STAGING_MARKER.test(identityLinkSecretVersion)) {
+    fail("DESIRED_STATE_STAGING_MARKER_MISSING:stagingOrigin.identityLinkSecretVersion");
+  }
+  if (!Object.hasOwn(STAGING_ADMISSION_MODES, value.admissionMode)) {
+    fail("DESIRED_STATE_VALUE_INVALID:stagingOrigin.admissionMode");
+  }
+  return Object.freeze({
+    publicOrigin: url.origin,
+    adminOrigin: `https://${STAGING_ADMIN_HOST_PREFIX}${url.hostname}`,
+    accessTeamDomain: stagingOriginField(value.accessTeamDomain, ACCESS_TEAM_DOMAIN_PATTERN, "accessTeamDomain"),
+    accessAud: value.accessAud === null ? null : stagingOriginField(value.accessAud, ACCESS_AUD_PATTERN, "accessAud"),
+    accessAdminEmail: stagingOriginField(value.accessAdminEmail, ADMIN_EMAIL_PATTERN, "accessAdminEmail"),
+    identityLinkSecretVersion,
+    admissionMode: value.admissionMode,
+  });
+}
+
+/**
+ * Why the staging template cannot render yet, or null: no stagingOrigin
+ * block, no Access AUD, or no pinned bucket-birth proof (OD-2: the service
+ * reads the proof, so an unborn bucket has nothing to render; the code is
+ * C-SIMP's).
+ */
+export function stagingServiceBlocker(desired) {
+  if (desired.stagingOrigin === null) return "STAGING_ORIGIN_UNASSIGNED";
+  if (desired.stagingOrigin.accessAud === null) return "STAGING_ORIGIN_UNASSIGNED:stagingOrigin.accessAud";
+  if (desired.bucket.proof === null) return "SERVICE_RENDER_BUCKET_PROOF_UNPINNED";
+  return null;
+}
+
+/** The staging template's own placeholder values (the EP-7 ones come from serviceTemplateValues). */
+export function stagingServiceTemplateValues(desired) {
+  if (desired.environment !== "staging") fail("STAGING_ORIGIN_FORBIDDEN:production");
+  const blocker = stagingServiceBlocker(desired);
+  if (blocker !== null) fail(blocker);
+  const origin = desired.stagingOrigin;
+  return {
+    PUBLIC_ORIGIN: origin.publicOrigin,
+    ADMIN_HOST_ORIGIN: origin.adminOrigin,
+    ACCESS_TEAM_DOMAIN: origin.accessTeamDomain,
+    ACCESS_AUD: origin.accessAud,
+    ACCESS_ADMIN_EMAIL: origin.accessAdminEmail,
+    IDENTITY_LINK_SECRET_VERSION: origin.identityLinkSecretVersion,
+    STAGING_ADMISSION_MODE: origin.admissionMode,
+    GCS_BUCKET_GENERATION: desired.bucket.proof.bucketGeneration,
+    GCS_BUCKET_METAGENERATION: desired.bucket.proof.bucketMetageneration,
+  };
+}
+
+/** OD-2: exactly one plain proof whose closed record names the rendered bucket with soft delete "0". */
+function quarantineProofNamesBucket(env) {
+  const proofs = env.filter((entry) => entry.name === QUARANTINE_BUCKET_HISTORY_PROOF_ENV);
+  const bucket = env.find((entry) => entry.name === "GCS_BUCKET_NAME")?.value;
+  if (proofs.length !== 1 || typeof proofs[0].value !== "string" || proofs[0].valueFrom !== undefined) return false;
+  let proof;
+  try { proof = JSON.parse(proofs[0].value); } catch { return false; }
+  return isRecord(proof) && Object.keys(proof).join(",") === QUARANTINE_PROOF_KEYS
+    && typeof bucket === "string" && proof.bucket === bucket
+    && typeof proof.bucketGeneration === "string" && GENERATION.test(proof.bucketGeneration)
+    && typeof proof.bucketMetageneration === "string" && GENERATION.test(proof.bucketMetageneration)
+    && proof.softDeleteRetentionDurationSeconds === "0";
+}
+
+/**
+ * Each plane renders only from its own template. Production: HOST_MODE
+ * production and no staging admission setting. Staging: exactly the staging
+ * env names, HOST_MODE staging, scale to zero, a staging public origin and
+ * its derived admin origin, CR-3's admission modes, the inert identity
+ * identifiers, the OD-2 proof for the rendered bucket, and no production
+ * value anywhere.
+ */
+function assertPlaneServiceInvariants(service, environment) {
+  const container = service.spec.template.spec.containers[0];
+  const plain = new Map(container.env.filter((entry) => entry.valueFrom === undefined)
+    .map((entry) => [entry.name, entry.value]));
+  const hostMode = plain.get("HOST_MODE");
+  if (environment !== "staging") {
+    if (hostMode !== "production" || plain.has("STAGING_ADMISSION_MODE")) fail("SERVICE_RENDER_INVARIANT_BROKEN");
+    return;
+  }
+  const names = container.env.map((entry) => entry.name);
+  const required = STAGING_SERVICE_ENV_NAMES.filter((name) => !OPTIONAL_SECRET_NAMES.includes(name));
+  const publicOrigin = stagingPublicOrigin(plain.get("PUBLIC_ORIGIN"));
+  const annotations = service.spec.template.metadata?.annotations ?? {};
+  const problems = [
+    new Set(names).size !== names.length,
+    names.some((name) => !STAGING_SERVICE_ENV_NAMES.includes(name)),
+    required.some((name) => !names.includes(name)),
+    hostMode !== "staging",
+    annotations["autoscaling.knative.dev/minScale"] !== "0",
+    !/^[1-9][0-9]?$/u.test(annotations["autoscaling.knative.dev/maxScale"] ?? ""),
+    publicOrigin === null || !STAGING_MARKER.test(publicOrigin.hostname),
+    publicOrigin !== null && plain.get("ADMIN_HOST_ORIGIN") !== `https://${STAGING_ADMIN_HOST_PREFIX}${publicOrigin.hostname}`,
+    !Object.hasOwn(STAGING_ADMISSION_MODES, plain.get("STAGING_ADMISSION_MODE") ?? ""),
+    !ACCESS_AUD_PATTERN.test(plain.get("ACCESS_AUD") ?? ""),
+    Object.entries(STAGING_INERT_IDENTITY_PROVIDER_VARS).some(([name, value]) => plain.get(name) !== value),
+    !quarantineProofNamesBucket(container.env),
+    STAGING_PROVIDED_VAR_NAMES.some((name) => !plain.has(name)),
+    [...plain.values()].some((value) => PRODUCTION_FINGERPRINT.has(value)),
+    publicOrigin !== null && (PRODUCTION_FINGERPRINT.has(publicOrigin.hostname)
+      || PRODUCTION_MARKER.test(publicOrigin.hostname)),
+  ];
+  if (problems.some(Boolean)) fail("SERVICE_RENDER_INVARIANT_BROKEN");
 }

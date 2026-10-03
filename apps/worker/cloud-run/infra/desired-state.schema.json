@@ -20,7 +20,34 @@
     "bucket",
     "service",
     "jobs",
-    "scheduler"
+    "scheduler",
+    "stagingOrigin"
+  ],
+  "allOf": [
+    {
+      "description": "Staging names every CR-3 secret: only production may leave out PRODUCTION_OMITTABLE_SECRET_NAMES.",
+      "if": {
+        "required": [
+          "environment"
+        ],
+        "properties": {
+          "environment": {
+            "const": "staging"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "secrets": {
+            "required": [
+              "GOOGLE_OIDC_CLIENT_SECRET",
+              "APPLE_PRIVATE_KEY",
+              "DISTRIBUTION_GITHUB_API_TOKEN"
+            ]
+          }
+        }
+      }
+    }
   ],
   "properties": {
     "schemaVersion": {
@@ -268,14 +295,12 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
+      "description": "CR-3's secret names. Production may leave out GOOGLE_OIDC_CLIENT_SECRET and APPLE_PRIVATE_KEY (round 12 retired Google and Apple sign-in; RETIRED_PRODUCTION_SECRET_NAMES) and DISTRIBUTION_GITHUB_API_TOKEN (nothing on the production estate reads it; UNREAD_PRODUCTION_SECRET_NAMES), and the committed production file does; staging must name all seven until ROUTES-R12 narrows CR-3 (the root allOf).",
       "required": [
         "IDENTITY_LINK_SECRET",
         "POSTGRES_RATE_LIMIT_SECRET",
         "ENVELOPE_PUBLIC_JWK",
-        "ENVELOPE_PRIVATE_JWK",
-        "GOOGLE_OIDC_CLIENT_SECRET",
-        "APPLE_PRIVATE_KEY",
-        "DISTRIBUTION_GITHUB_API_TOKEN"
+        "ENVELOPE_PRIVATE_JWK"
       ],
       "properties": {
         "IDENTITY_LINK_SECRET": {
@@ -713,6 +738,58 @@
           }
         }
       }
+    },
+    "stagingOrigin": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "publicOrigin",
+            "accessTeamDomain",
+            "accessAud",
+            "accessAdminEmail",
+            "identityLinkSecretVersion",
+            "admissionMode"
+          ],
+          "properties": {
+            "publicOrigin": {
+              "type": "string",
+              "pattern": "^https://[a-z0-9.-]+$",
+              "description": "The staging edge's public https origin; its host carries the staging token and is never an admin or run.app host"
+            },
+            "accessTeamDomain": {
+              "type": "string",
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.cloudflareaccess\\.com$"
+            },
+            "accessAud": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[a-f0-9]{64}$",
+              "description": "The staging admin Access application's AUD tag; null until the owner creates it, and the service cannot render without it"
+            },
+            "accessAdminEmail": {
+              "type": "string"
+            },
+            "identityLinkSecretVersion": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            },
+            "admissionMode": {
+              "enum": [
+                "closed",
+                "synthetic-rehearsal"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "STG-PREP: the staging service's own non-secret settings; null in production, and in staging until chosen (the service cannot render without them)"
     }
   }
 }

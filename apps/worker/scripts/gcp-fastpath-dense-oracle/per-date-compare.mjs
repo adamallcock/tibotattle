@@ -11,9 +11,15 @@
 // them to the per-date publication the fast path implements instead. Objects
 // are compared with their keys sorted; arrays keep their order. Prints one JSON
 // report and exits 0 only when both families are equal. Reads local files only.
+//
+// A served community-allowance-breakdowns-v1.3 block (owner decision round 7)
+// is compared as the v1.1 block it reduces to, and only when its model-metadata
+// block is exactly the declared catalog-baseline block; the oracle's
+// expectation is d43c8f92's v1.1. Any other v1.3 block is unequal.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { declaredBreakdownsV13 } from "../analytics-v2-parity-compare.mjs";
 
 const sorted = (value) => Array.isArray(value) ? value.map(sorted)
   : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sorted(value[key])]))
@@ -36,15 +42,23 @@ export function perDateDiffs(expected, actual, path = "$", out = [], limit = 20)
   return out;
 }
 
-export function comparePerDate({ expected, response, preview }) {
+export function comparePerDate({ expected, response, preview, declaredModelMetadata }) {
+  const declared = declaredBreakdownsV13(response?.allowanceBreakdowns ?? null,
+    ...(declaredModelMetadata === undefined ? [] : [declaredModelMetadata]));
   const families = {
     preview: { expected: expected.preview, actual: preview },
-    allowanceBreakdowns: { expected: expected.allowanceBreakdowns, actual: response?.allowanceBreakdowns ?? null },
+    allowanceBreakdowns: { expected: expected.allowanceBreakdowns, actual: declared.base ?? null },
   };
-  const report = { schemaVersion: "gcp-fastpath-per-date-compare-v1", decision: expected.decision, families: {} };
+  const report = { schemaVersion: "gcp-fastpath-per-date-compare-v2", decision: expected.decision,
+    breakdownsV13: { served: declared.served, accepted: declared.served && declared.valid && declared.metadataEqual === true },
+    families: {} };
   for (const [name, { expected: want, actual: got }] of Object.entries(families)) {
-    const equal = JSON.stringify(sorted(want)) === JSON.stringify(sorted(got));
-    report.families[name] = { equal, diffs: equal ? [] : perDateDiffs(sorted(want), sorted(got)) };
+    const declaredFault = name === "allowanceBreakdowns" && declared.served
+      && !(declared.valid && declared.metadataEqual === true);
+    const equal = !declaredFault && JSON.stringify(sorted(want)) === JSON.stringify(sorted(got));
+    report.families[name] = { equal, diffs: equal ? [] : declaredFault
+      ? [{ path: "$.modelConfig", expected: "<declared v1.3 shape and block>", actual: "<other>" }]
+      : perDateDiffs(sorted(want), sorted(got)) };
   }
   report.equal = Object.values(report.families).every((family) => family.equal);
   return report;

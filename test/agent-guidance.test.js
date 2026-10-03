@@ -213,6 +213,45 @@ test("agent guidance preserves owner erasure and restore after self-service reti
   assert.match(docs, /does not retire owner erasure, privacy-request\s+handling, retention disclosures, or deletion-safe restore/u);
 });
 
+test("agent guidance scopes the raw-identifier invariant for catalog vocabulary to the wire grammar", async () => {
+  const [root, contract, decision, index] = await Promise.all([
+    readRepositoryFile("AGENTS.md"),
+    readRepositoryFile("packages/telemetry-contract/AGENTS.md"),
+    readRepositoryFile("docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md"),
+    readRepositoryFile("docs/README.md"),
+  ]);
+  const grammar = "`[A-Za-z0-9._:-]{1,64}`";
+  const decisionPath = "docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md";
+  // The invariant itself still forbids raw account IDs; only vocabulary inside
+  // the wire grammar is carved out, and the root points at the decision record
+  // for the exact grammar and the `unrecognized` rule.
+  assert.match(root, /raw\s+account IDs and session content must not enter derived artifacts/u);
+  assert.match(
+    root,
+    /Model, provider, speed, tier and plan names in the wire grammar are vocabulary,\s+not account IDs/u,
+  );
+  assert.ok(root.includes(`(\`${decisionPath}\`)`));
+  // Round 11: only the unseen-name probe's log line may list in-grammar model,
+  // speed, tier and plan names; there is no general permission to list names in logs.
+  assert.match(
+    root,
+    /In logs,\s+only the unseen-name probe's line may list in-grammar model, speed, tier and plan names/u,
+  );
+  assert.doesNotMatch(root, /may be listed in logs/u);
+  assert.match(decision, /The unseen-name probe's log line may list in-grammar names \(round 11\)/u);
+  assert.match(decision, /listing these names, or provider names, in any\s+other log or diagnostic needs a new owner decision/u);
+  assert.match(decision, /A string outside the grammar is\s+still only\s+counted, never listed/u);
+  assert.match(decision, /`\[A-Za-z0-9\._:-\]` with 1 to 64 characters/u);
+  assert.match(decision, /counted as `unrecognized`/u);
+  assert.match(contract, /Model, provider, speed, tier and plan\s+names are vocabulary, not raw account\/scope identifiers/u);
+  assert.ok(contract.includes(grammar));
+  assert.ok(contract.includes(decisionPath));
+  assert.match(contract, /unknown models follow the current fingerprint\/unknown policy/u);
+  assert.match(decision, /^status: accepted$/mu);
+  assert.match(decision, /ARNs? (?:that contain|containing) `\/`/u);
+  assert.ok(index.includes("(./decisions/2026-10-02-catalog-vocabulary-plain-text.md)"));
+});
+
 test("agent guidance treats unexpected Keychain prompts as a release blocker without weakening security", async () => {
   const [root, native, scripts, runbook] = await Promise.all([
     readRepositoryFile("AGENTS.md"),

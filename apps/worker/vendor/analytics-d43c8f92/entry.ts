@@ -3,7 +3,7 @@
 // Every other source file in this directory is a byte copy of commit d43c8f92
 // (the production Worker), written by scripts/vendor-analytics-kernels.mjs and
 // verified by scripts/vendor-analytics-kernels.check.mjs against MANIFEST.json.
-// The only edits are five `export ` tokens that MANIFEST.json lists. The
+// The only edits are six `export ` tokens that MANIFEST.json lists. The
 // apps/worker/src/*.d.ts files (MANIFEST.json typeStubs) are tsc declarations of
 // d43c8f92 modules the copies import only for types; they keep tsc-checked
 // consumers compiling and are never loaded at runtime. The three
@@ -11,6 +11,10 @@
 // esbuild) and vitest.analytics-v2.config.mjs (for Vitest) resolve
 // @app-usagemonitor/* imports made inside this directory to those copies, so
 // the kernels never run against the GCP line's own packages.
+//
+// This directory's path is fixed: it does not change when the vendored commit
+// does, so no import of it moves on a re-vendor. MANIFEST.json sourceCommit is
+// the commit the files are copies of, and this text must name the same one.
 //
 // Do not edit vendored files. To change the vendored revision or closure, edit
 // the generator and this facade, then regenerate. The GCP job's larger bounds
@@ -139,6 +143,16 @@ export type {
   PublicCacheRetentionSeries,
   PublicCacheRetentionWindow,
 } from "./apps/worker/src/cache-retention-values";
+
+// Per-event pricing. buildPricingEvent (export-patched) is the projection of a
+// stored v1 usage record that the server pricer reads; the kernel's daily fold
+// prices every event through it and priceTelemetryUsageEvent against the
+// compiled registry below. GCP stores and reprices exactly that projection.
+export { buildPricingEvent } from "./apps/worker/src/quota-analysis-v1";
+export { priceTelemetryUsageEvent } from "./apps/worker/src/server-pricing";
+export type { ServerPricingResult } from "./apps/worker/src/server-pricing";
+export type { TelemetryUsageEvent } from "./apps/worker/src/telemetry-validation";
+export { APP_OFFICIAL_PRICE_CARDS, APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 
 // Model-history window arithmetic.
 export { modelHistoryWindow } from "./apps/worker/src/model-history-window";

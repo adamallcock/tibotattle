@@ -732,7 +732,7 @@ function usageTrackEpochKey(
  * reads (provider, model, billing surface, service tier, speed mode, event
  * time, total input context, components) comes straight from the record.
  */
-function buildPricingEvent(
+export function buildPricingEvent(
   rec: Record<string, unknown>,
   observedAt: string,
 ): TelemetryUsageEvent | null {

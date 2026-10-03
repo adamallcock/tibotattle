@@ -23,7 +23,13 @@
  *   current-price evidence matching totals.usageEvents, and allowance always
  *   removed (typed storage never has a current daily allowance publication);
  * - allowanceBreakdowns is the vendored projectPublicAllowanceGraph over the
- *   stored admin preview; allowanceReadState is `temporarily_unavailable`
+ *   stored admin preview, served as community-allowance-breakdowns-v1.3
+ *   (KM-7, owner decision round 7): the vendored v1.1 block relabelled, with
+ *   the closed model-metadata block of the catalog baseline (manifest_version
+ *   1) appended by the GCP-owned wrapper public-allowance-breakdowns-v13.ts.
+ *   That relabel and block are the DECLARED parity difference from d43c8f92;
+ *   every other byte is the vendored projection's. allowanceReadState is
+ *   `temporarily_unavailable`
  *   whenever the preview is absent, unreadable, oversized or fails the
  *   vendored cache validation, and allowanceState is `ready` exactly when the
  *   projection yields at least one closed published day;
@@ -44,7 +50,9 @@
  * reads the requested days. With neither a publication nor a frozen export
  * the route answers exactly as above, and a frozen export that fails its
  * digest or the contract is 503, never an empty answer. A schema without the
- * frozen table (before its migration) is the same as no export.
+ * frozen table (before its migration) is the same as no export. The frozen
+ * body is Cloudflare's, served verbatim: its breakdowns keep the version the
+ * export carried (v1.0 to v1.2) and are never wrapped as v1.3.
  *
  * Not ported, and why: the PUBLIC_ANALYTICS environment switch (mounting this
  * module is the GCP switch; the edge answers it), the public read limiter's
@@ -89,6 +97,7 @@ import {
   readAnalyticsV2CacheWindowRows,
   type AnalyticsV2CacheWindowRows,
 } from "./cache-windows-sql";
+import { compiledBaselineCatalogManifest } from "../postgres-catalog-store";
 import { ANALYTICS_V2_SINGLETON_ID, ANALYTICS_V2_TABLES, type OriginRouteModule } from "./contract";
 import {
   INTERIM_PUBLIC_READ_ROW_ID,
@@ -97,6 +106,11 @@ import {
   projectInterimPublicRead,
   verifyInterimPublicReadRow,
 } from "./interim-public-read";
+import {
+  buildPublicModelMetadata,
+  wrapPublicAllowanceBreakdownsV13,
+  type PublicModelMetadataEntry,
+} from "./public-allowance-breakdowns-v13";
 
 export const ANALYTICS_V2_COMMUNITY_DAILY_PATH = "/api/v1/community/daily" as const;
 export const ANALYTICS_V2_COMMUNITY_DAILY_SCHEMA_VERSION = "community-daily-read-v1.0" as const;
@@ -462,9 +476,22 @@ function publicDayPayload(day: PublishedDay): void {
 }
 
 /**
+ * The model-metadata block served with every v1.3 breakdown: the catalog
+ * baseline's public roster (manifest_version 1, the compiled d43c8f92
+ * projection; owner decision round 7 keeps the compiled registry at cutover),
+ * which is exactly the six models the d43c8f92 public page charts and never a
+ * model the owner's selected comparison hides. Binding a later manifest here
+ * is the post-cutover KM-4 change.
+ */
+export function analyticsV2PublicModelMetadata(): readonly PublicModelMetadataEntry[] {
+  return buildPublicModelMetadata(compiledBaselineCatalogManifest());
+}
+
+/**
  * Build the community/daily route module. Throws at construction on an
- * invalid pool or schema, unknown options, or an injected clock outside the
- * loopback fast-path test mode.
+ * invalid pool or schema, unknown options, an injected clock outside the
+ * loopback fast-path test mode, or a catalog baseline that cannot be published
+ * as model metadata.
  */
 export function createAnalyticsV2CommunityDailyRoute(
   options: AnalyticsV2CommunityDailyRouteOptions,
@@ -498,6 +525,7 @@ export function createAnalyticsV2CommunityDailyRoute(
     }
     now = clock;
   }
+  const modelMetadata = analyticsV2PublicModelMetadata();
 
   /**
    * The frozen export for the requested range, labelled in headers. A row that
@@ -558,7 +586,8 @@ export function createAnalyticsV2CommunityDailyRoute(
       publishedDays: days.map((day) => day.day), nowMs,
     });
     const allowanceState = graph !== null ? "ready" : "updating";
-    const allowanceBreakdowns = graph?.breakdowns ?? null;
+    const allowanceBreakdowns = graph === null ? null
+      : wrapPublicAllowanceBreakdownsV13(graph.breakdowns, modelMetadata);
     for (const day of days) publicDayPayload(day);
     const cacheRetention = publishableAnalyticsV2CacheRetentionSeries(
       composedCacheRetention(read.cacheWindows),

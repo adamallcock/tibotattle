@@ -6,6 +6,7 @@
 // is synthetic.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parse } from "jsonc-parser";
+import { unfilledProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import {
   primaryManifestSha256,
@@ -27,6 +29,13 @@ import {
 import { applyEdgeModeSnapshotDelta, liveEdgeMode } from "./edge-mode-configuration.mjs";
 import { createProductionLiveConfigSnapshot } from "./production-live-config.mjs";
 import {
+  createEnvironmentDeploymentLock,
+  deploymentLockRef,
+  PRODUCTION_LOCK_REF,
+  STAGING_LOCK_REF,
+} from "./production-deployment-lock.mjs";
+import {
+  assertOriginContractBlob,
   assessProductionBuild,
   EDGE_CAPTURE_MAX_AGE_MS,
   imageReference,
@@ -289,16 +298,23 @@ function fakeEstate({
   return { run, fetch, calls, requests, state };
 }
 
-function fakeLock() {
+function fakeLock({ reportRef } = {}) {
   const events = [];
   let held = null;
   const records = [];
+  const refs = [];
   return {
     events,
     records,
-    factory: ({ repositoryRoot }) => {
+    refs,
+    factory: (options) => {
+      assert.deepEqual(Object.keys(options).sort(), ["environment", "ref", "repositoryRoot"]);
+      const { environment, ref, repositoryRoot } = options;
       assert.equal(typeof repositoryRoot, "string");
+      assert.equal(ref, deploymentLockRef(environment), "the rollout asks for its environment's own ref");
+      refs.push(ref);
       return {
+        ref: reportRef ?? ref,
         createOwner(record) {
           assert.deepEqual(Object.keys(record).sort(), ["id", "previousSourceCommit", "sourceCommit"]);
           records.push(record);
@@ -558,36 +574,39 @@ test("a dry run validates and prints argv only: no gcloud, no node, no request, 
     { fetch: () => assert.fail("never") }));
   assert.deepEqual(rollPlan.servedCommitCheck, { path: "origin-verifier", paths: ["/api/health", "/api/ready"] });
   assert.deepEqual(rollPlan.steps.at(-1).argv, ROLLOUT_ARGV.identityToken(TARGET));
-  assert.deepEqual(rollEstate.calls, []);
+  assert.deepEqual(rollEstate.calls, [ROLLOUT_ARGV.gitBlob(COMMIT, CONTRACT_PATH), ROLLOUT_ARGV.gitBlob(EDGE_COMMIT, CONTRACT_PATH)],
+    "the roll dry run runs only the two local contract blob reads (D-BLOB)");
   await writeFile(migratedPaths.edgeLive, capture(gcpLive));
   const gcpPlan = await runRollout(rollArgv(migratedPaths), dependencies(fakeEstate(), fakeLock()));
   assert.deepEqual(gcpPlan.servedCommitCheck, { path: "public-health", url: "https://tibotattle.com/api/health" });
 });
 
-test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, then the job update and execution, under the lock",
+test("migrate: preflight, quiescent jobs, one labelled pre-migration backup, then the job update and execution, under the lock",
   async (t) => {
     const paths = await workspace(t);
     const estate = fakeEstate();
     const lock = fakeLock();
     const receipt = await runRollout(executeMigrate(paths), dependencies(estate, lock));
+    assert.deepEqual(lock.refs, [PRODUCTION_LOCK_REF], "production takes only the production lock");
     const calls = estate.calls.map((argv) => argv.join(" "));
     const index = (prefix) => calls.findIndex((call) => call.startsWith(prefix));
     const creates = calls.map((call, position) => [call, position]).filter(([call]) => call.startsWith("gcloud sql backups create"));
-    assert.equal(creates.length, 2, "two pre-migration backups");
+    assert.equal(PRE_MIGRATION_BACKUPS, 1, "one pre-migration backup, with point-in-time recovery");
+    assert.equal(creates.length, PRE_MIGRATION_BACKUPS);
     for (const [call] of creates) {
       assert.match(call, /--description=tibotattle-expires-on=2026-11-01;purpose=pre-migration/u);
       assert.match(call, /--instance=tibotattle-primary /u);
       assert.match(call, /--location=us-east1/u);
     }
     assert.deepEqual(estate.calls.filter((argv) => argv.slice(0, 4).join(" ") === "gcloud sql backups create"),
-      [0, 1].map(() => ROLLOUT_ARGV.backupCreate(TARGET, "tibotattle-expires-on=2026-11-01;purpose=pre-migration")),
+      [ROLLOUT_ARGV.backupCreate(TARGET, "tibotattle-expires-on=2026-11-01;purpose=pre-migration")],
       "the dry-run argv is what createOnDemandBackup issues");
     const schedulerReads = calls.map((call, position) => [call, position])
       .filter(([call]) => call.startsWith("gcloud scheduler jobs list")).map(([, position]) => position);
     assert.equal(schedulerReads.length, 2);
     assert.ok(index("node scripts/gcp-infra.mjs readback --require-clean") < creates[0][1]);
     assert.ok(schedulerReads[0] < creates[0][1], "the jobs are quiescent before the first backup");
-    assert.ok(creates[1][1] < schedulerReads[1] && schedulerReads[1] < index(`gcloud run jobs update ${TARGET.migrationJob}`),
+    assert.ok(creates.at(-1)[1] < schedulerReads[1] && schedulerReads[1] < index(`gcloud run jobs update ${TARGET.migrationJob}`),
       "and again after the backups, right before the DDL");
     assert.ok(index(`gcloud run jobs update ${TARGET.migrationJob}`) < index(`gcloud run jobs execute ${TARGET.migrationJob}`));
     assert.ok(index(`gcloud run jobs execute`) < index("gcloud logging read"));
@@ -595,8 +614,7 @@ test("migrate: preflight, quiescent jobs, two labelled pre-migration backups, th
     assert.deepEqual(lock.records, [{ id: "00000000-0000-4000-8000-000000000001", sourceCommit: COMMIT,
       previousSourceCommit: OTHER_COMMIT }], "the lock records the live service's own commit");
     assert.equal(receipt.schema, ROLLOUT_MIGRATE_RECEIPT_SCHEMA);
-    assert.equal(receipt.backups.length, 2);
-    assert.notEqual(receipt.backups[0].id, receipt.backups[1].id);
+    assert.equal(receipt.backups.length, 1);
     assert.equal(receipt.execution, `${TARGET.migrationJob}-x7k2p`);
     assert.equal(receipt.migrationReceiptDigest, jobReceipt().digest);
     const written = JSON.parse(await readFile(paths.migrateReceipt, "utf8"));
@@ -708,7 +726,9 @@ test("roll refuses without a matching migrate receipt, before any command or loc
     [(value) => ({ ...value, digest: `sha256:${"e".repeat(64)}`, image: `${TARGET.imageRepository}@sha256:${"e".repeat(64)}` }),
       "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
     [(value) => ({ ...value, commit: OTHER_COMMIT }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
-    [(value) => ({ ...value, backups: value.backups.slice(0, 1) }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
+    [(value) => ({ ...value, backups: [] }), "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
+    [(value) => ({ ...value, backups: [...value.backups, { id: "1700000000000999", expiresOn: "2026-11-01" }] }),
+      "ROLLOUT_MIGRATE_RECEIPT_INVALID"],
   ]) {
     await writeFile(migratedPaths.migrateReceipt, JSON.stringify(edit(receipt)));
     const rollEstate = fakeEstate();
@@ -792,10 +812,10 @@ test("roll moves the service and every manifest job to one digest and commit, re
 test("outside gcp mode the served commit is read through the EP-6 verifier path on the service's own origin", async (t) => {
   for (const [edge, mode] of [[preEdgeLive, "unset"], [workerLive, "worker"], [fencedLive, "fenced"]]) {
     const paths = await migrated(t, { edge });
-    const estate = fakeEstate({ blobs: {} });
+    const estate = fakeEstate();
     const receipt = await runRollout(executeRoll(paths), dependencies(estate, fakeLock()));
     assert.equal(receipt.edge.mode, mode);
-    assert.equal(receipt.edge.contractBlob, null, "the contract does not bind an edge that does not forward");
+    assert.equal(receipt.edge.contractBlob, "a".repeat(40), "D-BLOB binds the origin to the live edge in every mode");
     assert.deepEqual(estate.calls.filter((argv) => argv.includes("print-identity-token")), [ROLLOUT_ARGV.identityToken(TARGET)]);
     assert.deepEqual(estate.requests.map(({ url }) => url), [`${SERVICE_URL}/api/health`, `${SERVICE_URL}/api/ready`]);
     assert.equal(estate.requests[0].init.headers["x-serverless-authorization"], `Bearer ${TOKEN}`);
@@ -834,6 +854,34 @@ test("a staging target has no maintenance Job (D-OPS4), so its origin-verifier r
     assert.equal(estate.calls.some((argv) => argv[0] === "gcloud" && argv[3] !== "describe"), false);
     assert.deepEqual(estate.requests, []);
   });
+
+test("D-BLOB: roll refuses EDGE_CONTRACT_DRIFT in every edge mode, and against a pre-edge Worker with no contract", async (t) => {
+  for (const edge of [preEdgeLive, workerLive, fencedLive, gcpLive]) {
+    const paths = await migrated(t, { edge });
+    for (const blobs of [
+      { [`${COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40), [`${EDGE_COMMIT}:${CONTRACT_PATH}`]: "b".repeat(40) },
+      // A pre-edge Worker's commit carries no contract file.
+      { [`${COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40) },
+      // Nor may a candidate without one deploy against an edge that has one.
+      { [`${EDGE_COMMIT}:${CONTRACT_PATH}`]: "a".repeat(40) },
+      {},
+    ]) {
+      const estate = fakeEstate({ blobs });
+      const lock = fakeLock();
+      await assert.rejects(runRollout(executeRoll(paths), dependencies(estate, lock)), isCode("EDGE_CONTRACT_DRIFT"));
+      assert.equal(estate.calls.every(([command]) => command === "git"), true, "only local blob reads ran");
+      assert.deepEqual(lock.events, []);
+      await assert.rejects(runRollout(rollArgv(paths), dependencies(fakeEstate({ blobs }), fakeLock())),
+        isCode("EDGE_CONTRACT_DRIFT"), "the dry run refuses too");
+    }
+  }
+  assert.throws(() => assertOriginContractBlob({ originCommit: COMMIT, edgeCommit: EDGE_COMMIT, readBlob: () => "x" }),
+    isCode("EDGE_CONTRACT_DRIFT"), "a malformed blob id never matches");
+  assert.throws(() => assertOriginContractBlob({ originCommit: "HEAD", edgeCommit: EDGE_COMMIT, readBlob: () => "a".repeat(40) }),
+    isCode("EDGE_CONTRACT_DRIFT"), "only full commits are compared");
+  assert.equal(assertOriginContractBlob({ originCommit: COMMIT, edgeCommit: EDGE_COMMIT, readBlob: () => "a".repeat(40) }),
+    "a".repeat(40));
+});
 
 test("roll refuses EDGE_CONTRACT_DRIFT against a gcp-mode edge whose contract blob differs, before any command or lock", async (t) => {
   const paths = await migrated(t);
@@ -932,7 +980,7 @@ test("roll releases the lock on failure, and a readback or served-commit mismatc
     [{ fail: "print-identity-token" }, "EDGE_ORIGIN_IDENTITY_TOKEN_UNAVAILABLE"],
   ]) {
     const lock = fakeLock();
-    await assert.rejects(runRollout(executeRoll(paths), dependencies(fakeEstate({ blobs: {}, ...estateOptions }), lock)),
+    await assert.rejects(runRollout(executeRoll(paths), dependencies(fakeEstate(estateOptions), lock)),
       isCode(code), code);
     assert.deepEqual(lock.events.filter((event) => event !== "assert"), ["acquire", "release"], code);
   }
@@ -1124,21 +1172,41 @@ test("build writes the audited archive, submits that file and qualifies the buil
       archiveSha256: ARCHIVE_SHA256 }).digest, DIGEST);
   });
 
-test("until the committed desired states are complete every verb fails closed, and error codes stay content-free",
+test("an incomplete committed desired state fails every verb closed, a complete one dry-runs without a call, and error codes stay content-free",
   async () => {
   // The default loader reaches the OPS-2 manifest's rolloutTarget, which reads
-  // only the committed desired state: production waits for OWN-5's
-  // placeholders and staging for the verifier's operator. The rollout reports
-  // either as ROLLOUT_INFRA_MANIFEST_UNAVAILABLE before running anything.
-  await assert.rejects(loadRolloutTargetFromInfraManifest("production"),
-    isCode("DESIRED_STATE_PLACEHOLDER_UNFILLED:project"));
-  await assert.rejects(loadRolloutTargetFromInfraManifest("staging"),
-    isCode("ROLLOUT_TARGET_VERIFIER_TOKEN_CREATOR_UNASSIGNED"));
-  for (const environment of ["production", "staging"]) {
-    await assert.rejects(runRollout(["preflight", `--environment=${environment}`, `--commit=${COMMIT}`,
-      "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never") }),
-    isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"), environment);
-  }
+  // only the committed desired state. A manifest refusal (here OWN-5's
+  // placeholders, unfilled) is reported as ROLLOUT_INFRA_MANIFEST_UNAVAILABLE
+  // before anything runs.
+  const unfilledText = unfilledProductionText();
+  const unfilledLoader = async (environment) => (await import("./gcp-ops-infra-manifest.mjs"))
+    .rolloutTarget(environment, { readFile: () => unfilledText });
+  await assert.rejects(unfilledLoader("production"), isCode("DESIRED_STATE_PLACEHOLDER_UNFILLED:project"));
+  await assert.rejects(runRollout(["preflight", "--environment=production", `--commit=${COMMIT}`,
+    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never"), loadTarget: unfilledLoader }),
+  isCode("ROLLOUT_INFRA_MANIFEST_UNAVAILABLE"));
+  // PROD-PREP filled production (round 13): its committed target validates,
+  // a dry run calls nothing, and a mutating verb names the production lock.
+  const production = await loadRolloutTargetFromInfraManifest("production");
+  assert.deepEqual(validateRolloutTarget(production, "production"), production);
+  assert.deepEqual([production.project, production.region, production.service],
+    ["tibotattle-prod", "us-east1", "tibotattle-origin"]);
+  const productionBuild = await runRollout(["build", "--environment=production", `--commit=${COMMIT}`],
+    { run: () => assert.fail("never"), fetch: () => assert.fail("never") });
+  assert.deepEqual([productionBuild.status, productionBuild.environment, productionBuild.lockRef],
+    ["dry-run", "production", "refs/heads/codex/production-deployment-lock"]);
+  // Staging's verifier operator is named (owner decision, 2026-10-02 round
+  // 9), so its committed state now yields a target that OPS-10 validates for
+  // the staging plane. The manifest check holds the unassigned-operator
+  // refusal (rolloutTargetFromDesiredState). A dry run still runs nothing.
+  const staging = await loadRolloutTargetFromInfraManifest("staging");
+  assert.deepEqual(validateRolloutTarget(staging, "staging"), staging);
+  assert.match(staging.verifierServiceAccount, /^tibotattle-staging-verifier@/u);
+  const dryRun = await runRollout(["preflight", "--environment=staging", `--commit=${COMMIT}`,
+    "--backup-audit=/synthetic/audit.json"], { run: () => assert.fail("never"), fetch: () => assert.fail("never") });
+  assert.equal(dryRun.status, "dry-run");
+  assert.equal(dryRun.environment, "staging");
+  assert.equal(dryRun.service, staging.service);
   assert.equal(safeRolloutErrorCode({ code: "EDGE_CONTRACT_DRIFT" }), "EDGE_CONTRACT_DRIFT");
   assert.equal(safeRolloutErrorCode({ code: "PRODUCTION_COORDINATION_BUSY" }), "PRODUCTION_COORDINATION_BUSY");
   assert.equal(safeRolloutErrorCode({ code: "EDGE_ORIGIN_VERIFIER_UNREACHABLE" }), "EDGE_ORIGIN_VERIFIER_UNREACHABLE");
@@ -1167,3 +1235,145 @@ test("preflight executes read-only: clean tree, infrastructure readback, a fresh
     assert.equal(busy.scheduledJobs.quiescent, false);
     assert.deepEqual(busy.scheduledJobs.running.map(({ job }) => job), TARGET.jobNames);
   });
+
+// ---------------------------------------------------------------------------
+// STG-LOCK (owner decision 2026-10-02, round 9): staging coordinates on its own
+// ref and never on the production lock. Git is a fake here: no transport runs.
+
+const APPROVED_REMOTE = "https://github.com/adamallcock/tibotattle.git";
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/** An in-memory git that models the remote refs the lock reads and pushes. */
+function fakeGit() {
+  const remoteRefs = new Map();
+  const calls = [];
+  const messages = new Map();
+  const ok = (stdout = "") => ({ status: 0, stdout, stderr: "" });
+  const spawn = (command, args, options) => {
+    assert.equal(command, "git");
+    calls.push([...args]);
+    const verb = args.find((arg) => !arg.startsWith("-") && !arg.includes("="));
+    if (args.join(" ") === "remote get-url --push --all origin") return ok(`${APPROVED_REMOTE}\n`);
+    if (verb === "ls-remote") {
+      const ref = args.at(-1);
+      return ok(remoteRefs.has(ref) ? `${remoteRefs.get(ref)}\t${ref}\n` : "");
+    }
+    if (verb === "hash-object") return ok(`${EMPTY_TREE}\n`);
+    if (verb === "commit-tree") {
+      const sha = createHash("sha1").update(options.input).digest("hex");
+      messages.set(sha, options.input);
+      return ok(`${sha}\n`);
+    }
+    if (verb === "push") {
+      assert.equal(args.at(-2), APPROVED_REMOTE);
+      const [source, ref] = args.at(-1).split(":");
+      const lease = args.find((arg) => arg.startsWith("--force-with-lease="));
+      assert.equal(lease, `--force-with-lease=${ref}:${source === "" ? remoteRefs.get(ref) : ""}`);
+      if (source === "") remoteRefs.delete(ref);
+      else remoteRefs.set(ref, source);
+      return ok();
+    }
+    return assert.fail(`unexpected git ${args.join(" ")}`);
+  };
+  return { spawn, calls, messages, remoteRefs };
+}
+
+const gitLockFactory = (git) => (options) => createEnvironmentDeploymentLock({ ...options, spawn: git.spawn });
+const pushedRefs = (git) => git.calls.filter((args) => args.includes("push")).map((args) => args.at(-1).split(":")[1]);
+
+test("STG-LOCK: a dry run of each mutating verb prints its environment's exact lock ref; preflight takes no lock", async (t) => {
+  for (const [target, ref] of [[TARGET, "refs/heads/codex/production-deployment-lock"],
+    [STAGING_TARGET, "refs/heads/codex/staging-deployment-lock"]]) {
+    const environment = target.environment;
+    const paths = await workspace(t, target);
+    const estate = fakeEstate({ target });
+    const lock = fakeLock();
+    const build = await runRollout(["build", `--environment=${environment}`, `--commit=${COMMIT}`], dependencies(estate, lock));
+    assert.equal(build.lockRef, ref, environment);
+    const migrate = await runRollout(migrateArgv(paths, [], environment), dependencies(estate, lock));
+    assert.equal(migrate.lockRef, ref, environment);
+    const preflight = await runRollout(["preflight", `--environment=${environment}`, `--commit=${COMMIT}`,
+      `--backup-audit=${paths.audit}`], dependencies(estate, lock));
+    assert.equal(Object.hasOwn(preflight, "lockRef"), false);
+    assert.deepEqual([estate.calls, lock.events, lock.refs], [[], [], []], "a dry run takes no lock");
+  }
+  const migratedPaths = await migrated(t, { target: STAGING_TARGET, edge: stagingGcpLive });
+  const roll = await runRollout(rollArgv(migratedPaths, [], "staging"),
+    dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock()));
+  assert.equal(roll.lockRef, STAGING_LOCK_REF);
+});
+
+test("STG-LOCK: staging migrate and roll push only refs/heads/codex/staging-deployment-lock, through the real lock over a fake git", async (t) => {
+  const paths = await workspace(t, STAGING_TARGET);
+  const git = fakeGit();
+  const lockEvents = [];
+  await runRollout(executeMigrate(paths, "staging"), dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock(),
+    { lockFactory: gitLockFactory(git), lockEvents }));
+  await writeFile(paths.edgeLive, capture(stagingGcpLive));
+  const receipt = await runRollout(executeRoll(paths, "staging"), dependencies(fakeEstate({ target: STAGING_TARGET }), fakeLock(),
+    { lockFactory: gitLockFactory(git), lockEvents }));
+  assert.equal(receipt.environment, "staging");
+  assert.deepEqual(lockEvents, ["acquired", "released", "acquired", "released"]);
+  assert.deepEqual(pushedRefs(git), [STAGING_LOCK_REF, STAGING_LOCK_REF, STAGING_LOCK_REF, STAGING_LOCK_REF]);
+  assert.equal(git.calls.some((args) => args.some((arg) => arg.includes("production-deployment-lock"))), false,
+    "staging never reads or touches the production lock");
+  assert.deepEqual(git.calls.filter((args) => args.includes("ls-remote")).map((args) => args.at(-1)).filter((ref) => ref !== STAGING_LOCK_REF), []);
+  assert.equal(git.remoteRefs.size, 0, "the staging lock is released");
+  for (const message of git.messages.values()) assert.equal(JSON.parse(message).schema, "staging-deployment-lock-v1");
+});
+
+test("STG-LOCK: production keeps the production ref and its schema-1 owner record, byte for byte", async (t) => {
+  const paths = await workspace(t);
+  const git = fakeGit();
+  await runRollout(executeMigrate(paths), dependencies(fakeEstate(), fakeLock(), { lockFactory: gitLockFactory(git) }));
+  assert.deepEqual(pushedRefs(git), [PRODUCTION_LOCK_REF, PRODUCTION_LOCK_REF]);
+  assert.equal(git.calls.some((args) => args.some((arg) => arg.includes("staging-deployment-lock"))), false);
+  assert.deepEqual([...git.messages.values()].map((message) => JSON.parse(message)), [{ schema: 1,
+    id: "00000000-0000-4000-8000-000000000001", sourceCommit: COMMIT, previousSourceCommit: OTHER_COMMIT }]);
+  const [owner] = git.messages.keys();
+  const pushes = git.calls.filter((args) => args.includes("push"));
+  assert.deepEqual(pushes, [
+    ["-c", "push.followTags=false", "push", "--porcelain", `--force-with-lease=${PRODUCTION_LOCK_REF}:`, APPROVED_REMOTE,
+      `${owner}:${PRODUCTION_LOCK_REF}`],
+    ["-c", "push.followTags=false", "push", "--porcelain", `--force-with-lease=${PRODUCTION_LOCK_REF}:${owner}`, APPROVED_REMOTE,
+      `:${PRODUCTION_LOCK_REF}`],
+  ]);
+});
+
+test("STG-LOCK: a lock reporting another environment's ref is refused before any owner, command past the checkout, or push", async (t) => {
+  for (const [target, wrongRef] of [[STAGING_TARGET, PRODUCTION_LOCK_REF], [TARGET, STAGING_LOCK_REF]]) {
+    const paths = await workspace(t, target);
+    const lock = fakeLock({ reportRef: wrongRef });
+    await assert.rejects(runRollout(executeMigrate(paths, target.environment), dependencies(fakeEstate({ target }), lock)),
+      isCode("ROLLOUT_LOCK_REF_MISMATCH"), target.environment);
+    assert.deepEqual([lock.events, lock.records], [[], []], target.environment);
+  }
+  // The real factory refuses a crossed pair itself, with a content-free code.
+  const git = fakeGit();
+  for (const [environment, ref] of [["staging", PRODUCTION_LOCK_REF], ["production", STAGING_LOCK_REF]]) {
+    assert.throws(() => gitLockFactory(git)({ environment, ref, repositoryRoot: "/unused" }),
+      isCode("DEPLOYMENT_COORDINATION_REF_MISMATCH"));
+  }
+  assert.throws(() => gitLockFactory(git)({ environment: "test", ref: STAGING_LOCK_REF, repositoryRoot: "/unused" }),
+    isCode("DEPLOYMENT_COORDINATION_ENVIRONMENT_INVALID"));
+  assert.deepEqual(git.calls, [], "refused before Git access");
+  assert.equal(safeRolloutErrorCode({ code: "DEPLOYMENT_COORDINATION_REF_MISMATCH" }), "DEPLOYMENT_COORDINATION_REF_MISMATCH");
+  assert.equal(safeRolloutErrorCode({ code: "STAGING_COORDINATION_BUSY" }), "STAGING_COORDINATION_BUSY");
+  // An unknown environment never reaches a lock: the argument parser refuses it first.
+  assert.throws(() => parseRolloutArguments(["build", "--environment=test", `--commit=${COMMIT}`]), isCode("ROLLOUT_ENVIRONMENT_INVALID"));
+});
+
+test("the CLI entry finishes: no top-level await deadlocks the manifest's import cycle back to this module", () => {
+  // gcp-ops-infra-manifest.mjs -> gcp-fastpath-test-deploy.mjs -> this module.
+  // With a top-level await at the entry, Node exited 13 before any verb ran.
+  for (const environment of ["staging", "production"]) {
+    const result = spawnSync(process.execPath, [join(import.meta.dirname, "gcp-production-rollout.mjs"), "build",
+      `--environment=${environment}`, `--commit=${COMMIT}`],
+    { encoding: "utf8", env: { PATH: "/nonexistent-gcloud-guard" }, timeout: 60_000 });
+    assert.equal(result.status, 0, `${environment}: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /unsettled top-level await/u);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual([output.status, output.verb, output.environment, output.lockRef],
+      ["dry-run", "build", environment, `refs/heads/codex/${environment}-deployment-lock`]);
+  }
+});

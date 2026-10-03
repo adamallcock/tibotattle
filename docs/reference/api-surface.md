@@ -112,6 +112,23 @@ personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`
 Combined and plan summaries contain only median dollars, account/fit counts and an optional
 middle-80%-of-fits band. Model estimates have no band or reset-fit count.
 
+The GCP origin serves `community-allowance-breakdowns-v1.3` instead (owner
+decision 2026-10-02, round 7): the same v1.1 block, with the same values and
+key order, relabelled, and with one trailing `modelConfig` array of
+`{ id, label, family, order }`, at most 128 entries. A tolerant reader charts
+every model the array names, so the array names only models the public page
+charts. For the catalog baseline (manifest version 1) that is exactly the six
+models the d43c8f92 page charts: GPT-6 Astra, GPT-6 Sol, GPT-6 Luna,
+GPT-5.6 Terra, GPT-5.6 Sol and GPT-5.6 Luna, at orders 0 to 5 in that card
+order, each with its page theme as family. The other 35 primary Codex models,
+GPT-5.5 among them, are the owner's selected comparison's hidden models
+(2026-09-28) and are never named. Each id and label is the manifest's. A model
+tuple keeps its place in `days` whether or not it is named: a reader that knows
+the id keeps it uncharted, and one that does not leaves it out and says so. The
+parity check treats the relabel and the block as the one declared difference
+from the d43c8f92 oracle. The frozen interim export, served before GCP's first
+publication, keeps the breakdown version Cloudflare published.
+
 All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
 Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
 excluded. Model values require the existing composition identification gate;

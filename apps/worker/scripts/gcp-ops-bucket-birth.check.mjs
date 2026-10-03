@@ -344,6 +344,95 @@ test("a failure after the insert releases the reservation and says the bucket no
   });
 });
 
+/**
+ * Readback mismatches: [harness options, the differing field names, values
+ * from either response that must never appear in the diagnostics].
+ */
+function readbackMismatches(desired) {
+  const both = (extra) => ({ readback: createdBucket(desired, extra),
+    response: () => new Response(JSON.stringify(createdBucket(desired, extra)), { status: 200 }) });
+  return [
+    [{ readback: createdBucket(desired, { metageneration: "2" }) }, ["bucketMetageneration"], []],
+    [{ readback: createdBucket(desired, { timeCreated: "2026-10-02T16:48:19.000Z" }) }, ["timeCreated"],
+      ["2026-10-02", "16:48:19", CREATED_AT]],
+    [{ readback: createdBucket(desired, { generation: "1700000000000009", timeCreated: "2026-10-02T16:48:19.000Z" }) },
+      ["bucketGeneration", "timeCreated"], ["1700000000000009", "1700000000000001", "16:48:19", CREATED_AT]],
+    // Both responses agree on a metageneration other than "1": no snapshot
+    // field differs, and the diagnostic still says why the birth stopped.
+    [both({ metageneration: "2" }), ["readbackMetagenerationNotOne"], []],
+  ];
+}
+
+test("a readback mismatch names the differing snapshot fields, and only their names", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  await withDirectory(async (directory) => {
+    const receiptPath = join(directory, "receipt.json");
+    for (const [options, expected, values] of readbackMismatches(desired)) {
+      const run = harness(desired, options);
+      await assert.rejects(birth.runBucketBirth(desired, { apply: true, authorize, receiptPath, runner: run.runner,
+        fetchImpl: run.fetchImpl }), (error) => error.code === "BUCKET_BIRTH_READBACK_MISMATCH"
+          && error.bucketInserted === true
+          && error.receipt === undefined
+          && JSON.stringify(error.differingFields) === JSON.stringify(expected)
+          // names only: no value from either response (no digit at all) leaks into the diagnostics
+          && !/\d/u.test(JSON.stringify(error.differingFields))
+          && values.every((value) => !JSON.stringify(error.differingFields).includes(value)), JSON.stringify(expected));
+      assert.equal(run.requests.length, 1);
+      assert.equal(existsSync(receiptPath), false);
+    }
+  });
+  // The receipt builder itself: equal snapshots whose readback metageneration is not "1".
+  const second = createdBucket(desired, { metageneration: "2" });
+  assert.throws(() => birth.createBucketBirthReceipt(desired, { createResponse: second, readbackResponse: second }),
+    (error) => error.code === "BUCKET_BIRTH_READBACK_MISMATCH"
+      && JSON.stringify(error.differingFields) === JSON.stringify(["readbackMetagenerationNotOne"]));
+});
+
+test("the OPS-2 bucket-birth CLI puts the differing field names, and nothing else, on stderr", async () => {
+  const desired = desiredState();
+  const authorize = birth.bucketBirthAuthorization(desired);
+  // An applying bucket birth reads only the committed desired state (here, its synthetic stand-in).
+  const unborn = JSON.stringify({ ...JSON.parse(JSON.stringify(FIXTURE).replaceAll("synthetic-ops-project",
+    "example-ops-prod1")), bucket: { ...FIXTURE.bucket, proof: null } });
+  for (const [options, expected, values] of readbackMismatches(desired)) {
+    const run = harness(desired, options);
+    const reservations = memoryReservations();
+    const out = [];
+    const err = [];
+    const code = await main(["bucket-birth", "--environment=production", "--apply",
+      `--authorize=${authorize}`, "--receipt-out=/synthetic/receipt.json"], {
+      runner: run.runner,
+      fetchImpl: run.fetchImpl,
+      readFile: () => unborn,
+      reserveReceipt: reservations.reserveReceipt,
+      stdout: (text) => out.push(text),
+      stderr: (text) => err.push(text),
+    });
+    assert.equal(code, 1, JSON.stringify(expected));
+    assert.deepEqual(JSON.parse(err.join("")), { status: "error", code: "BUCKET_BIRTH_READBACK_MISMATCH",
+      bucketInserted: true, differingFields: expected });
+    // No receipt exists, so nothing is printed; the reservation was released unwritten.
+    assert.equal(out.join(""), "");
+    assert.deepEqual(reservations.events.map((event) => event.event), ["reserve", "release"]);
+    assert.equal(run.requests.length, 1);
+    for (const value of [TOKEN, ...values]) assert.equal(err.join("").includes(value), false, value);
+    assert.doesNotMatch(err.join(""), /\d/u);
+  }
+});
+
+test("the same creation instant in the API and gcloud formats is one snapshot; a different instant is not", () => {
+  const desired = desiredState();
+  const api = createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.035Z" });
+  const gcloudRaw = createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.035000+00:00" });
+  const receipt = birth.createBucketBirthReceipt(desired, { createResponse: api, readbackResponse: gcloudRaw });
+  assert.equal(JSON.stringify(receipt).includes("2026-10-01T04:04:18.035Z"), true);
+  assert.throws(() => birth.createBucketBirthReceipt(desired, { createResponse: api,
+    readbackResponse: createdBucket(desired, { timeCreated: "2026-10-01T04:04:18.036000+00:00" }) }),
+  (error) => error.code === "BUCKET_BIRTH_READBACK_MISMATCH"
+    && JSON.stringify(error.differingFields) === JSON.stringify(["timeCreated"]));
+});
+
 test("the module never updates, deletes or reads the IAM policy of a bucket", () => {
   const source = readFileSync(join(SCRIPTS_ROOT, "gcp-ops-bucket-birth.mjs"), "utf8");
   const code = source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");

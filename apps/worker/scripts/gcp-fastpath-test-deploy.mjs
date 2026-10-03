@@ -32,6 +32,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse as parseJsonc } from "jsonc-parser";
 
 import { FASTPATH_TEST_CLOUD_TARGET } from "../cloud-run/origin-fastpath-mode.mjs";
+import {
+  assertOriginContractBlob,
+  readEdgeLiveCaptureFile,
+  ROLLOUT_ENVIRONMENTS,
+  verifyEdgeLiveCapture,
+} from "./gcp-production-rollout.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
@@ -674,6 +680,7 @@ function parseArgs(argv) {
     query: "from=2026-04-15&to=2026-10-01", skip: new Set(), noExecute: false,
     schema: undefined, golden: undefined, schemaSuffix: undefined, replaceSeed: false, sourceIdentity: undefined,
     corpus: undefined, dump: undefined, refreshProfile: undefined, resolvedGolden: undefined,
+    edgeLive: undefined, edgeEnvironment: undefined, edgeContract: undefined,
   };
   for (const argument of rest) {
     if (argument === "--dry-run") { options.dryRun = true; continue; }
@@ -697,6 +704,8 @@ function parseArgs(argv) {
     else if (key === "dump") options.dump = resolve(value);
     else if (key === "refresh-profile") options.refreshProfile = value;
     else if (key === "schema-suffix") options.schemaSuffix = value;
+    else if (key === "edge-live") options.edgeLive = value;
+    else if (key === "edge-environment") options.edgeEnvironment = value;
     else if (key === "skip") value.split(",").forEach((item) => options.skip.add(item));
     else if (key === "refresh-arg") options.refreshArgs.push(value);
     else if (["refresh-env", "origin-env"].includes(key)) {
@@ -710,6 +719,12 @@ function parseArgs(argv) {
     fail("FASTPATH_DEPLOY_IMAGE_DIGEST_REQUIRED");
   }
   if (options.now !== undefined && !ISO_INSTANT.test(options.now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
+  if (options.edgeLive !== undefined && !isAbsolute(options.edgeLive)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--edge-live is an absolute path");
+  }
+  if (options.edgeEnvironment !== undefined && !ROLLOUT_ENVIRONMENTS.includes(options.edgeEnvironment)) {
+    fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--edge-environment is production or staging");
+  }
   if (!/^[A-Za-z0-9=&_.-]{0,256}$/u.test(options.query)) fail("FASTPATH_DEPLOY_QUERY_INVALID");
   if (options.schemaSuffix !== undefined && !/^[0-9a-f]{8}$/u.test(options.schemaSuffix)) {
     fail("FASTPATH_DEPLOY_ARGUMENT_INVALID", "--schema-suffix is 8 lower-case hex digits");
@@ -743,12 +758,19 @@ Steps:
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded
                    schema's origin gets the golden's POSTGRES_SOURCE_ID/POSTGRES_SOURCE_NAMESPACE, and
                    --origin-env=EDGE_ORIGIN_MODE=edge-test adds wrangler.jsonc env.production's
-                   ${EDGE_TEST_PRODUCTION_SETTINGS.join(", ")}
+                   ${EDGE_TEST_PRODUCTION_SETTINGS.join(", ")}; refused (EDGE_CONTRACT_DRIFT), before any remote
+                   command, unless apps/worker/src/edge-origin-contract.ts has the same git blob at --commit and at
+                   the live edge's DEPLOYMENT_SOURCE_COMMIT (D-BLOB; --commit, --edge-live, --edge-environment)
   verify           GET /api/health and /api/v1/community/daily with a journey-SA ID token; save body
   protected        read the shared test services' revisions (never written)
   all              build, database, migrate, verify-database, seed, refresh, origin, verify, protected
 Options:
-  --commit=<ref>          commit to build (required for build, migrate and all)
+  --commit=<ref>          commit to build (required for build, migrate, origin and all); the origin step's
+                          contract blob is read at it, so with --image it must be the image's commit
+  --edge-live=<abs path>  the owner's fresh (15 min) EP-9 capture of the live edge Worker
+                          ({schema, capturedAt, snapshot, deployment}, as gcp-production-rollout.mjs roll reads it);
+                          required for origin and all
+  --edge-environment=production|staging   the tracked Worker the capture is of (wrangler.jsonc env)
   --image=<repo@sha256:>  use an existing image digest instead of building
   --now=<ISO instant>     injected clock (refresh --now + ANALYTICS_V2_TEST_CLOCK=1; origin ANALYTICS_V2_TEST_NOW_MS)
   --out=<dir>             receipt directory (default: $TMPDIR/tibotattle-fastpath-d1)
@@ -826,6 +848,38 @@ function resolveCommit(ref) {
   const commit = resolved.stdout?.trim();
   if (resolved.status !== 0 || !COMMIT.test(commit ?? "")) fail("FASTPATH_DEPLOY_COMMIT_UNRESOLVED", ref);
   return commit;
+}
+
+/** The git blob of `path` at `commit` in this repository, or null; local read-only git. */
+function localGitBlob(commit, path) {
+  const shown = spawnSync("git", ["-C", REPOSITORY_ROOT, "rev-parse", "--verify", "--quiet", `${commit}:${path}`], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  });
+  const blob = shown.stdout?.trim();
+  return shown.status === 0 && COMMIT.test(blob ?? "") ? blob : null;
+}
+
+/**
+ * D-BLOB for the test origin (docs/runbooks/production-edge-modes.md, "Cloud
+ * Run deploys"): verify the owner's live edge capture with the rollout's own
+ * EP-9 check (fresh, of the named tracked Worker, verified for its mode), then
+ * require src/edge-origin-contract.ts to have the same blob at --commit and at
+ * the edge's DEPLOYMENT_SOURCE_COMMIT. Local only: it reads the capture file
+ * and runs read-only git. Returns the content-free contract record.
+ */
+export async function checkOriginEdgeContract(options, { nowMs = Date.now(), readBlob = localGitBlob } = {}) {
+  if (options.edgeLive === undefined || options.edgeEnvironment === undefined) {
+    fail("FASTPATH_DEPLOY_EDGE_LIVE_REQUIRED", "the origin step needs --edge-live and --edge-environment (D-BLOB)");
+  }
+  if (options.commit === undefined) {
+    fail("FASTPATH_DEPLOY_ORIGIN_COMMIT_REQUIRED", "the origin step reads the contract blob at --commit (D-BLOB)");
+  }
+  const originCommit = resolveCommit(options.commit);
+  const capture = await readEdgeLiveCaptureFile(options.edgeLive);
+  const edge = await verifyEdgeLiveCapture(capture, { environment: options.edgeEnvironment, nowMs });
+  const contractBlob = assertOriginContractBlob({ originCommit, edgeCommit: edge.edgeCommit, readBlob });
+  return Object.freeze({ environment: options.edgeEnvironment, mode: edge.mode, edgeCommit: edge.edgeCommit,
+    capturedAt: edge.capturedAt, originCommit, contractBlob });
 }
 
 function commitHasRefreshEntry(commit) {
@@ -1151,6 +1205,12 @@ function ensureOriginBucket(runner) {
 }
 
 async function stepOrigin(runner, options, image) {
+  // D-BLOB, checked before the first remote command by main(); the blob
+  // comparison is repeated here, right before the origin's first write.
+  const edgeContract = options.edgeContract;
+  if (edgeContract === undefined) fail("FASTPATH_DEPLOY_EDGE_LIVE_REQUIRED", "the origin step runs only from main()");
+  assertOriginContractBlob({ originCommit: edgeContract.originCommit, edgeCommit: edgeContract.edgeCommit,
+    readBlob: localGitBlob });
   // Resolved before the bucket write: without the seed step in this run, a seeded
   // schema holds the golden's source (a golden that commits only its dump digest
   // needs the same --dump the seed used), so its refusal precedes every write.
@@ -1177,7 +1237,7 @@ async function stepOrigin(runner, options, image) {
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]),
   { read: true, placeholderJson: {} });
   const receipt = { step: "origin", image, schema: primarySchemaOf(options.schema), variant: options.variant,
-    mode: options.mode, sourceIdentity, yamlPath, bucketBinding, ...invokers,
+    mode: options.mode, sourceIdentity, yamlPath, bucketBinding, edgeContract, ...invokers,
     revision: service?.status?.latestReadyRevisionName ?? null, url: service?.status?.url ?? null };
   if (!runner.dryRun) receipt.path = await runner.receipt("origin.json", receipt);
   return receipt;
@@ -1260,6 +1320,9 @@ export async function main(argv = process.argv.slice(2)) {
   // resolve here (one that commits only its dump digest needs --dump, of that
   // digest), so its refusal never follows a build, migration or bucket write.
   if (stepsReadGolden(steps, options)) await seedGolden(options);
+  // D-BLOB: an origin deploy refuses, before any remote command, unless the
+  // contract blob at --commit equals the live edge's (checkOriginEdgeContract).
+  if (steps.includes("origin")) options.edgeContract = await checkOriginEdgeContract(options);
   const report = { project: FASTPATH_TEST.project, dryRun: options.dryRun, out, steps: [] };
   let image = options.image;
   let protectedBefore = null;
