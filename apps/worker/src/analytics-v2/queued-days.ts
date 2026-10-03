@@ -23,6 +23,7 @@
 
 import type { AnalyticsV2Day, AnalyticsV2OwnerDigest } from "./contract";
 import {
+  analyticsV2Statement,
   onReadSnapshot,
   quotedSchema,
   safeInteger,
@@ -114,7 +115,8 @@ export async function readQueuedDays(
   const limit = options?.limit ?? DEFAULT_LIMIT;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIMIT) sourceFail("ANALYTICS_V2_SOURCE_INVALID");
   return onReadSnapshot(context, async (client) => {
-    const result = await client.query<{ kind: unknown; value: unknown }>(queuedDaysSql(s), [afterSequence, limit]);
+    const result = await client.query<{ kind: unknown; value: unknown }>(
+      analyticsV2Statement("queued_days.page", queuedDaysSql(s)), [afterSequence, limit]);
     const days = new Set<AnalyticsV2Day>();
     const terminalOwners: AnalyticsV2OwnerDigest[] = [];
     let range: string | null = null;

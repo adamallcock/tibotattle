@@ -25,7 +25,7 @@ import { after, before, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { postgresTestEndpoint } from "./staged-migrations-harness.mjs";
+import { defaultAnalyticsV2FixtureStamps, postgresTestEndpoint } from "./staged-migrations-harness.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "../cloud-run/origin-route-modules.mjs";
 import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analytics-v2.config.mjs";
 
@@ -104,6 +104,7 @@ async function createSchema() {
   quotedSchema = `"${schema}"`;
   await pool.query(`CREATE SCHEMA ${quotedSchema}`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
+  await defaultAnalyticsV2FixtureStamps(pool, schema);
   assert.equal(applied.migrations.at(-1)?.name, PRIMARY_TAIL, "the promoted chain ends at 0067");
   assert.equal(applied.migrations.filter(({ name }) => name === A3_MIGRATION).length, 1,
     "the promoted chain carries A-3's 0059");

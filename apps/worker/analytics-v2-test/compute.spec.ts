@@ -780,9 +780,18 @@ describe("computeAnalyticsV2 (A-2)", () => {
       const entry = outputs.resources!.owners.find((owner) => owner.ownerDigest === digest)!;
       return { ownerDigest: digest, admitted: entry.admitted, occurrences: entry.usage + entry.quota + entry.session,
         analysisUsage: entry.analysisUsage, estimateBytes: entry.estimateBytes };
-    }) });
+    }), workers: 1 });
     expect(events.filter((event) => event.kind === "owner").map((event) => [event.index, event.ownerDigest]))
       .toEqual(digests.map((digest, index) => [index, digest]));
+    // K-PAR: every effective owner is closed by ownerDone, in order, and every
+    // segment, scalar and model event names its owner.
+    expect(events.filter((event) => event.kind === "ownerDone").map((event) => event.index))
+      .toEqual(digests.map((_digest, index) => index));
+    for (const [position, event] of events.entries()) {
+      if (event.kind !== "segment" && event.kind !== "scalar" && event.kind !== "model") continue;
+      const owner = events.slice(0, position).filter((earlier) => earlier.kind === "owner").at(-1)!;
+      expect(event.ownerIndex).toBe(owner.index);
+    }
     // The refused owner is never loaded: segments and model dates belong to
     // the three computed owners. Each has two segments: the seven-day cache
     // lookback before the read range (known empty, never loaded) and the

@@ -442,3 +442,29 @@ export async function postgresTestEndpoint(env = process.env) {
     ...(env.PG_TEST_PASSWORD ? { password: env.PG_TEST_PASSWORD } : {}),
   });
 }
+
+/**
+ * Spec fixtures that write analytics_v2 rows by hand (not through the
+ * refresh store) write them as kernel 1 on the compiled baseline manifest.
+ * Once K-STAMP's migration (analytics_v2_kernel_stamps) is in a schema, its
+ * stamp columns have no default; this gives them a schema-local default of
+ * 1 so such fixtures need not name the stamp. A no-op on a schema without
+ * the migration. Test-only, like the rest of this module.
+ */
+export async function defaultAnalyticsV2FixtureStamps(pool, schema) {
+  const present = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present",
+    [`${renderQuotedSchema(schema)}.analytics_v2_kernels`]);
+  if (present.rows[0]?.present !== true) return false;
+  for (const table of ["analytics_v2_runs", "analytics_v2_owner_day", "analytics_v2_cache_bands",
+    "analytics_v2_owner_fits", "analytics_v2_owner_model_dates", "analytics_v2_published_daily",
+    "analytics_v2_preview"]) {
+    await pool.query(`ALTER TABLE ${renderQuotedSchema(schema)}.${table}
+      ALTER COLUMN kernel_id SET DEFAULT 1, ALTER COLUMN manifest_version SET DEFAULT 1`);
+  }
+  return true;
+}
+
+function renderQuotedSchema(schema) {
+  if (typeof schema !== "string" || !/^[a-z_][a-z0-9_]{0,62}$/u.test(schema)) fail("STAGED_MIGRATION_SCHEMA_INVALID");
+  return `"${schema}"`;
+}

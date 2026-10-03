@@ -37,7 +37,7 @@ import { after, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -2178,10 +2178,15 @@ async function seededRehearsal() {
   // which can cut a piped stdout short on macOS.
   const directory = await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-"));
   const out = join(directory, "report.json");
+  // A line whose code needs a staged (not yet promoted) primary migration
+  // rehearses with it applied, as its specs do (K-STAMP's kernel stamps).
+  const staged = (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
+    .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
   try {
     await execFileAsync(node,
       [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
-        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED])], {
+        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
+        ...staged.flatMap((name) => ["--staged-primary", name])], {
         cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
         env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
           PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,

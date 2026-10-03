@@ -24,6 +24,7 @@
  * never an identifier, digest or row value.
  */
 
+import { sha256Hex } from "../crypto";
 import { quotePostgresIdentifier, withPostgresRead, type PostgresClient } from "../postgres-client";
 import {
   ANALYTICS_V2_OWNER_DIGEST_PATTERN,
@@ -66,6 +67,108 @@ export interface AnalyticsV2SnapshotContext extends AnalyticsV2ReadContext {
 
 const READ_TIMEOUT_MS = 300_000;
 
+/**
+ * The closed statement families of the A-1 readers (K-PGSTAT). Every reader
+ * statement starts with the comment `/* analytics_v2:<family> *\/`, so the
+ * refresh Job's statement ledger can attribute client wall time, rows and
+ * bytes per family, and pg_stat_statements (which keeps the first query text
+ * of each queryid, comments included) can attribute server execution and
+ * planning time to the same families. The tag is a code constant: it never
+ * carries a value, an identifier or a schema name.
+ */
+export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
+  "snapshot.read_only",
+  "snapshot.plan_cache",
+  "owners.runtime",
+  "owners.roster",
+  "occurrences.scope",
+  "occurrences.legacy_candidates",
+  "occurrences.v12_candidates",
+  "occurrences.correction_candidates",
+  "occurrences.legacy_sources",
+  "occurrences.v12_sources",
+  "occurrences.correction_sources",
+  "occurrences.counts",
+  "occurrences.first_evidence",
+  "occurrences.watermark",
+  "devices.count",
+  "queued_days.page",
+  "exclusions.scopes",
+] as const);
+export type AnalyticsV2StatementFamily = (typeof ANALYTICS_V2_STATEMENT_FAMILIES)[number];
+
+/** `sql` with its family tag (see ANALYTICS_V2_STATEMENT_FAMILIES). */
+export function analyticsV2Statement(family: AnalyticsV2StatementFamily, sql: string): string {
+  if (!(ANALYTICS_V2_STATEMENT_FAMILIES as readonly string[]).includes(family)) {
+    sourceFail("ANALYTICS_V2_SOURCE_INVALID");
+  }
+  return `/* analytics_v2:${family} */ ${sql}`;
+}
+
+/**
+ * A named (server-side prepared) statement (K-READ): PostgreSQL parses and
+ * plans it once per connection, so a statement a run issues thousands of
+ * times is not re-planned for every call. The name is derived from the full
+ * text (schema included), so one connection never binds a name to two texts.
+ * The Job's snapshot read pool and node-pg's own client both accept the
+ * { name, text, values } form; it changes no row, only the planning work.
+ */
+export interface AnalyticsV2PreparedStatement {
+  readonly name: string;
+  readonly text: string;
+}
+
+const PREPARED_NAME_PREFIX = "a2_";
+
+export async function analyticsV2PreparedStatement(family: AnalyticsV2StatementFamily,
+  sql: string): Promise<AnalyticsV2PreparedStatement> {
+  const text = analyticsV2Statement(family, sql);
+  const digest = await sha256Hex(text);
+  return Object.freeze({ name: `${PREPARED_NAME_PREFIX}${family.replace(/\./gu, "_")}_${digest.slice(0, 16)}`, text });
+}
+
+/** Run a prepared statement on `client` (see analyticsV2PreparedStatement). */
+export async function queryPrepared<Row extends object = Record<string, unknown>>(client: PostgresClient,
+  statement: AnalyticsV2PreparedStatement, values: unknown[]): Promise<{ rows: Row[] }> {
+  const preparing = client as unknown as {
+    query(config: { name: string; text: string; values: unknown[] }): Promise<{ rows: Row[] }>;
+  };
+  return preparing.query({ name: statement.name, text: statement.text, values });
+}
+
+/**
+ * Plan the rest of the caller's read-only transaction's prepared statements
+ * generically (K-READ). PostgreSQL's default (`auto`) keeps re-planning a
+ * prepared statement whose estimated generic cost exceeds its custom plans,
+ * which for the fenced expansion statements is every call; their plan shape
+ * is fixed by the MATERIALIZED fences and OFFSET 0 laterals, so the generic
+ * plan executes no slower (measured on the dense and Q-1 corpora, K-CORE-A
+ * receipt). Transaction-local: it ends with the reader's transaction.
+ */
+export async function withGenericPlans<T>(client: PostgresClient, operation: () => Promise<T>): Promise<T> {
+  const set = await client.query<{ previous: unknown }>(analyticsV2Statement("snapshot.plan_cache",
+    "SELECT current_setting('plan_cache_mode') AS previous, set_config('plan_cache_mode','force_generic_plan',true)"));
+  const previous = set.rows[0]?.previous;
+  if (typeof previous !== "string" || !/^[a-z_]{1,32}$/u.test(previous)) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+  let failed = false;
+  try {
+    return await operation();
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    // Restore the caller's mode: a caller-supplied snapshot may run more
+    // statements in the same transaction. After a failure the operation's own
+    // error is kept (an aborted transaction refuses the restore anyway).
+    try {
+      await client.query(analyticsV2Statement("snapshot.plan_cache",
+        "SELECT set_config('plan_cache_mode',$1,true)"), [previous]);
+    } catch (error) {
+      if (!failed) throw error;
+    }
+  }
+}
+
 /** The pinned clock as a timestamptz bind value (millisecond ISO-8601). */
 export function nowTimestamp(nowMs: unknown): string {
   if (typeof nowMs !== "number" || !Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > 8_640_000_000_000_000) {
@@ -88,7 +191,8 @@ function preserve(error: unknown): Error | null {
 }
 
 async function assertReadOnly(client: PostgresClient): Promise<void> {
-  const result = await client.query<{ read_only: unknown }>("SELECT current_setting('transaction_read_only') AS read_only");
+  const result = await client.query<{ read_only: unknown }>(analyticsV2Statement("snapshot.read_only",
+    "SELECT current_setting('transaction_read_only') AS read_only"));
   if (result.rows.length !== 1 || result.rows[0]?.read_only !== "on") sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
 }
 
@@ -353,9 +457,11 @@ export async function listAnalyticsV2Owners(context: AnalyticsV2SnapshotContext)
   const s = quotedSchema(context.schema);
   const now = nowTimestamp(context.nowMs);
   return onReadSnapshot(context, async (client) => {
-    const runtime = await client.query<{ active: unknown }>(`SELECT ${correctionRuntimeActiveSql(s)} AS active`);
+    const runtime = await client.query<{ active: unknown }>(analyticsV2Statement("owners.runtime",
+      `SELECT ${correctionRuntimeActiveSql(s)} AS active`));
     const correctionRuntimeActive = flag(runtime.rows[0]?.active);
-    const result = await client.query<OwnerRow>(analyticsV2OwnersSql(s), [now, MAX_ANALYTICS_V2_OWNERS + 1]);
+    const result = await client.query<OwnerRow>(analyticsV2Statement("owners.roster", analyticsV2OwnersSql(s)),
+      [now, MAX_ANALYTICS_V2_OWNERS + 1]);
     if (result.rows.length > MAX_ANALYTICS_V2_OWNERS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
     const owners: AnalyticsV2Owner[] = [];
     const unlinked: AnalyticsV2UnlinkedOwner[] = [];
@@ -384,5 +490,59 @@ export async function listAnalyticsV2Owners(context: AnalyticsV2SnapshotContext)
       sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
     }
     return Object.freeze({ owners: Object.freeze(owners), unlinked: Object.freeze(unlinked), correctionRuntimeActive });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Community aggregate exclusions (N-EXCL)
+// ---------------------------------------------------------------------------
+
+/**
+ * The only exclusion scope d43c8f92 defines (D1 0023: CHECK scope =
+ * 'community_weekly'). Its one reader is the v0.3 weekly community snapshot
+ * (community-snapshots.ts buildCommunityWeeklySnapshot), which GCP does not
+ * compute. d43c8f92's storage community daily, graph, cache-retention and
+ * allowance lanes (the outputs analytics_v2 ports) never read the table: an
+ * exclusion change only bumps their policy revision, which re-runs the same
+ * pure computation ("without falsely treating a weekly exclusion as
+ * opt-out", ingestion-isolation 0001). So, as in production, an exclusion
+ * removes no owner from any analytics_v2 output.
+ */
+export const ANALYTICS_V2_EXCLUSION_SCOPES = Object.freeze(["community_weekly"] as const);
+
+export interface AnalyticsV2ExclusionScopes {
+  /** "absent" before the PostgreSQL table exists (D-PT4X); never read as "no exclusions". */
+  readonly table: "present" | "absent";
+  /** Rows per production scope: all of them, and those in state 'active'. */
+  readonly scopes: Readonly<Record<string, { readonly rows: number; readonly active: number }>>;
+}
+
+/**
+ * Read the exclusion scopes in the run's snapshot (N-EXCL): content-free
+ * counts per scope, so the run receipt shows the exclusions that exist and
+ * that, matching production, they apply to no analytics_v2 output. A scope
+ * production does not define is refused (ANALYTICS_V2_SOURCE_CONFLICT): its
+ * effect on the community outputs would be unknown, and it is never ignored
+ * silently. Reads only scope and state.
+ */
+export async function readAnalyticsV2ExclusionScopes(context: AnalyticsV2SnapshotContext): Promise<AnalyticsV2ExclusionScopes> {
+  const s = quotedSchema(context.schema);
+  return onReadSnapshot(context, async (client) => {
+    const present = await client.query<{ present: unknown }>(analyticsV2Statement("exclusions.scopes",
+      "SELECT to_regclass($1) IS NOT NULL AS present"), [`${s}.community_aggregate_exclusions`]);
+    if (typeof present.rows[0]?.present !== "boolean") sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+    if (present.rows[0]!.present !== true) return Object.freeze({ table: "absent", scopes: Object.freeze({}) });
+    const result = await client.query<{ scope: unknown; rows: unknown; active: unknown }>(
+      analyticsV2Statement("exclusions.scopes", `SELECT scope, count(*)::text AS rows,
+          count(*) FILTER (WHERE state = 'active')::text AS active
+         FROM ${s}.community_aggregate_exclusions GROUP BY scope ORDER BY scope COLLATE "C"`));
+    const scopes: Record<string, { rows: number; active: number }> = {};
+    for (const row of result.rows) {
+      if (typeof row.scope !== "string" || !(ANALYTICS_V2_EXCLUSION_SCOPES as readonly string[]).includes(row.scope)) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      scopes[row.scope] = Object.freeze({ rows: safeInteger(row.rows), active: safeInteger(row.active) });
+    }
+    return Object.freeze({ table: "present", scopes: Object.freeze(scopes) });
   });
 }

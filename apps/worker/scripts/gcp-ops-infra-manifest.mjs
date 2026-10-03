@@ -305,32 +305,35 @@ export const LOGGING_POSTURE = Object.freeze({
 /**
  * The analytics-refresh task profile. The default production profile is the
  * dense measurement profile (gcp-fastpath-test-deploy.mjs
- * REFRESH_JOB_PROFILES.dense: 4 vCPU, 16 GiB, a 12288 MiB heap, a 10752 MiB
- * per-owner memory budget, a 4 h task timeout) until the largest real owner
- * is measured on Cloud Run (MEAS-3). That budget is the one the memory model
- * says admits the largest real owner even when every record falls in the
- * analysis days, and the heap holds it beside analytics-refresh.mjs's
- * reserves (256 MiB, 4 KiB per default read-chunk occurrence) and its
- * minimum output budget; a run reclaims for its output account the part of
- * the budget its largest admitted owner leaves. The manifest check holds this
- * profile equal to the measurement profile and the render equal to
- * analytics-refresh.mjs ANALYTICS_REFRESH_PRODUCTION_JOB (args, CPU, memory,
- * heap, task timeout, retries, tasks and env), and proves the budget against
- * that module's exported bounds.
+ * REFRESH_JOB_PROFILES.dense: 4 vCPU, 16 GiB, a 10752 MiB per-owner memory
+ * budget, a 4 h task timeout) until the largest real owner is measured on
+ * Cloud Run (MEAS-3). That budget is the one the memory model says admits the
+ * largest real owner even when every record falls in the analysis days.
+ * K-PAR: four compute Workers (one per vCPU) compute owners inside that
+ * budget, the largest alone, each Worker's heap limited to its owner's
+ * estimate plus a 1,024 MiB reserve and the limits together to the budget
+ * plus one reserve; the 3072 MiB main heap holds analytics-refresh.mjs's
+ * reserves (256 MiB, 4 KiB per default read-chunk occurrence) and the output
+ * account. The manifest check holds this profile equal to the measurement
+ * profile and the render equal to analytics-refresh.mjs
+ * ANALYTICS_REFRESH_PRODUCTION_JOB (args, CPU, memory, heap, workers, task
+ * timeout, retries, tasks and env), and proves the budget and the task memory
+ * against that module's exported bounds.
  */
 export const ANALYTICS_REFRESH_TASK_PROFILE = Object.freeze({
   name: "dense",
   cpu: "4",
   memory: "16Gi",
-  heapMiB: 12_288,
+  heapMiB: 3_072,
   memoryBudgetMiB: 10_752,
+  workers: 4,
   timeoutSeconds: 14_400,
 });
 
 /**
  * The production refresh-job contract (C-REFRESH implements it; OPS-2
  * renders it). Invocation: node --max-old-space-size=<heap>
- * dist/analytics-refresh.mjs --mode=full, with no --schema and no --now; the
+ * dist/analytics-refresh.mjs --mode=full --workers=<n>, with no --schema and no --now; the
  * real clock is used. Configuration comes from exactly the closed env below.
  * DEPLOYMENT_SOURCE_COMMIT is deployment provenance, not configuration: OPS-2
  * renders it and OPS-10's roll moves it on every job. ANALYTICS_V2_TEST_CLOCK
@@ -409,7 +412,8 @@ export const JOB_DEFINITIONS = Object.freeze({
   "analytics-refresh": Object.freeze({
     account: "runtime",
     args: Object.freeze([`--max-old-space-size=${ANALYTICS_REFRESH_TASK_PROFILE.heapMiB}`,
-      ANALYTICS_REFRESH_JOB_CONTRACT.entry, ANALYTICS_REFRESH_JOB_CONTRACT.mode]),
+      ANALYTICS_REFRESH_JOB_CONTRACT.entry, ANALYTICS_REFRESH_JOB_CONTRACT.mode,
+      `--workers=${ANALYTICS_REFRESH_TASK_PROFILE.workers}`]),
     timeoutSeconds: ANALYTICS_REFRESH_TASK_PROFILE.timeoutSeconds,
     cpu: ANALYTICS_REFRESH_TASK_PROFILE.cpu,
     memory: ANALYTICS_REFRESH_TASK_PROFILE.memory,

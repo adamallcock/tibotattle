@@ -259,17 +259,20 @@ export function migrateJobCommand({ image, expectedCounts }) {
  * the task timeout is two hours.
  *
  * dense: the dense-owner measurement profile (receipt
- * docs/receipts/2026-10-01-gcp-dense-owner-parity.md). A 16 GiB task (Cloud
- * Run needs 4 vCPU for it) with a 12,288 MiB heap and a 10,752 MiB budget,
- * which the memory model says admits the largest real owner (about 2.52
- * million records) even when every record falls in the 170 analysis days.
- * Compute stays single-threaded; the extra vCPUs are Cloud Run's minimum for
- * the memory and serve the garbage collector and the database driver. Four
- * hours of task time cover the local dense run several times over.
+ * docs/receipts/2026-10-01-gcp-dense-owner-parity.md), which is the
+ * production profile (OPS-2's ANALYTICS_REFRESH_TASK_PROFILE pins the two
+ * equal). A 16 GiB task (Cloud Run needs 4 vCPU for it) with a 10,752 MiB
+ * per-owner budget, which the memory model says admits the largest real
+ * owner (about 2.52 million records) even when every record falls in the 170
+ * analysis days. K-PAR: owners are computed by four compute Workers, one per
+ * vCPU, inside that budget (the largest owner alone), so the main heap is
+ * 3,072 MiB (runtime, one read chunk, the output account). Four hours of
+ * task time cover the local dense run several times over.
  */
 export const REFRESH_JOB_PROFILES = Object.freeze({
-  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, taskTimeoutSeconds: 7_200, env: Object.freeze([]) }),
-  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, taskTimeoutSeconds: 14_400,
+  standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, workers: 1, taskTimeoutSeconds: 7_200,
+    env: Object.freeze([]) }),
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, workers: 4, taskTimeoutSeconds: 14_400,
     env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
 });
 /** The default (standard) profile; the local rehearsal runs its heap. */
@@ -294,6 +297,7 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
     `--max-old-space-size=${resources.heapMiB}`,
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
+    ...(resources.workers > 1 ? [`--workers=${resources.workers}`] : []),
     ...extraArgs,
   ];
   if (args.some((arg) => /[,\s]/u.test(arg))) fail("FASTPATH_DEPLOY_ARGS_INVALID");

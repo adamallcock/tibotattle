@@ -37,7 +37,7 @@ import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { openSealedSqliteD1, sealedSqliteD1RuntimeSupported } from "../cloud-run/sealed-sqlite-d1-adapter.mjs";
-import { postgresTestEndpoint } from "./staged-migrations-harness.mjs";
+import { defaultAnalyticsV2FixtureStamps, postgresTestEndpoint } from "./staged-migrations-harness.mjs";
 import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analytics-v2.config.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -517,6 +517,7 @@ before(async () => {
   schema = `${STREAM_PREFIX}_p_${suffix}`;
   await pool.query(`CREATE SCHEMA "${schema}"`);
   await applyPostgresMigrations({ role: "primary", schema, pool });
+  await defaultAnalyticsV2FixtureStamps(pool, schema);
   scratch = await realpath(await mkdtemp(join(tmpdir(), "c-admin-d1-")));
   await seedPostgres();
   d1 = await seedD1();

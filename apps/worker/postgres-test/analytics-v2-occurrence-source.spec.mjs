@@ -86,6 +86,7 @@ before(async () => {
     occurrences: await load("/src/analytics-v2/occurrence-source.ts"),
     devices: await load("/src/analytics-v2/devices.ts"),
     queued: await load("/src/analytics-v2/queued-days.ts"),
+    pin: await load("/src/analytics-v2/pin.ts"),
     authority: await load("/src/postgres-storage-community-authority.ts"),
     seed: {
       codec: await load("/src/typed-telemetry-codec.ts"),
@@ -508,4 +509,231 @@ test("the legacy expansion and candidates exclude superseded, incomplete and for
     assert.deepEqual({ status: mike.status, sourceFormats: mike.sourceFormats, sourceCount: mike.sourceCount,
       eventTime: mike.eventTime }, { status: "compatible", sourceFormats: ["v11"], sourceCount: 1,
       eventTime: `${D1}T11:00:00.000Z` });
+  });
+
+// ---------------------------------------------------------------------------
+// K-READ: prepared statements, generic plans, F(o,d) and W(o); N-EXCL
+// ---------------------------------------------------------------------------
+
+const STREAMS = ["usage", "quota", "session"];
+const shift = (day, delta) => new Date(Date.parse(`${day}T00:00:00.000Z`) + delta * 86_400_000).toISOString().slice(0, 10);
+
+/** Per-day evidence digests of the reader's output (the pin's day digests), every stream. */
+async function dayDigests(scoped, ownerDigest, fromDay, throughDay) {
+  const byDay = new Map();
+  for (const stream of STREAMS) {
+    for (const [day, rows] of await modules.occurrences.readOwnerOccurrences(scoped,
+      { ownerDigest, stream, fromDay, throughDay })) {
+      const entry = byDay.get(day) ?? { usage: [], quota: [], session: [] };
+      entry[stream] = rows;
+      byDay.set(day, entry);
+    }
+  }
+  const digests = new Map();
+  for (const [day, value] of byDay) digests.set(day, await modules.pin.analyticsV2DayDigest(day, value));
+  return digests;
+}
+
+test("K-READ: reader statements are tagged and prepared, generic plans stay inside the reader, outputs unchanged",
+  { skip: SKIP, timeout: 180_000 }, async () => {
+    const fixture = fixtures.active;
+    const ownerDigest = fixture.owners.alpha.ownerDigest;
+    // In a caller's snapshot: the reader leaves the caller's plan_cache_mode as it found it.
+    const observed = await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
+      const before = (await snapshot.client.query("SELECT current_setting('plan_cache_mode') AS mode")).rows[0].mode;
+      const first = await modules.occurrences.readOwnerOccurrences(snapshot,
+        { ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+      const after = (await snapshot.client.query("SELECT current_setting('plan_cache_mode') AS mode")).rows[0].mode;
+      // The same connection now holds the prepared statements; a second call reuses them.
+      const prepared = (await snapshot.client.query(`SELECT count(*)::integer AS n FROM pg_prepared_statements
+        WHERE name LIKE 'a2\\_%'`)).rows[0].n;
+      const second = await modules.occurrences.readOwnerOccurrences(snapshot,
+        { ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 });
+      return { before, after, prepared, first: JSON.stringify([...first]), second: JSON.stringify([...second]) };
+    });
+    assert.equal(observed.before, "auto");
+    assert.equal(observed.after, "auto", "the generic-plan setting is transaction-local to the expansion");
+    assert.ok(observed.prepared >= 2, "the scope and expansion statements are server-side prepared");
+    assert.equal(observed.first, observed.second);
+    // Every statement family is a closed code constant; a tag never carries a value.
+    assert.ok(modules.owners.ANALYTICS_V2_STATEMENT_FAMILIES.includes("occurrences.v12_sources"));
+    assert.match(modules.owners.analyticsV2Statement("occurrences.scope", "SELECT 1"),
+      /^\/\* analytics_v2:occurrences\.scope \*\/ SELECT 1$/u);
+    assert.throws(() => modules.owners.analyticsV2Statement("occurrences.unknown", "SELECT 1"),
+      (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
+    const statement = await modules.owners.analyticsV2PreparedStatement("occurrences.scope", "SELECT 1");
+    assert.match(statement.name, /^a2_occurrences_scope_[0-9a-f]{16}$/u);
+  });
+
+test("K-READ: F(o,d) names exactly the reader's evidence days, is stable, and is local to the owner",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    for (const runtime of ["active", "staged"]) {
+      const listing = await modules.owners.listAnalyticsV2Owners(context(runtime));
+      for (const owner of listing.owners.filter((candidate) => candidate.source === "effective")) {
+        const range = { ownerDigest: owner.ownerDigest, fromDay: shift(D3, -399), throughDay: D3 };
+        const fingerprints = await modules.occurrences.readOwnerDayFingerprints(context(runtime), range);
+        const digests = await dayDigests(context(runtime), owner.ownerDigest, range.fromDay, range.throughDay);
+        assert.deepEqual([...fingerprints.keys()], [...digests.keys()].sort(), `${runtime} ${owner.participantId}`);
+        for (const value of fingerprints.values()) assert.match(value, /^[0-9a-f]{64}$/u);
+        assert.deepEqual([...await modules.occurrences.readOwnerDayFingerprints(context(runtime), range)],
+          [...fingerprints], "deterministic");
+      }
+    }
+    // The same owner's evidence in another schema with more owners has the same fingerprints.
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const wider = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      v12Scope: true });
+    const alpha = fixtures.active.owners.alpha.ownerDigest;
+    assert.equal(wider.owners.alpha.ownerDigest, alpha);
+    assert.deepEqual([...await modules.occurrences.readOwnerDayFingerprints({ pool, schema, nowMs: NOW_MS },
+      { ownerDigest: alpha, fromDay: D1, throughDay: D3 })],
+    [...await modules.occurrences.readOwnerDayFingerprints(context("active"),
+      { ownerDigest: alpha, fromDay: D1, throughDay: D3 })], "other owners' evidence moves no fingerprint");
+    await assert.rejects(modules.occurrences.readOwnerDayFingerprints(context("active"),
+      { ownerDigest: alpha, fromDay: D1, throughDay: shift(D1, 400) }), (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
+  });
+
+test("K-READ: every reader-output change moves F(o,d) on that day (mutation proof over a v1.2 chunk and the correction runtime)",
+  { skip: SKIP, timeout: 300_000 }, async () => {
+    // Soundness, per owner and day: an unchanged fingerprint means an
+    // unchanged day digest. Over-invalidation (F moves, output does not) is
+    // allowed; the converse is the defect this proves absent.
+    const proveSound = (label, before, after) => {
+      const days = new Set([...before.digests.keys(), ...after.digests.keys(), ...before.fingerprints.keys(),
+        ...after.fingerprints.keys()]);
+      let moved = 0;
+      for (const day of days) {
+        const outputChanged = before.digests.get(day) !== after.digests.get(day);
+        const fingerprintChanged = before.fingerprints.get(day) !== after.fingerprints.get(day);
+        if (outputChanged) {
+          moved += 1;
+          assert.ok(fingerprintChanged, `${label}: ${day} changed output under an unchanged fingerprint`);
+        }
+      }
+      return moved;
+    };
+    const capture = async (scoped, ownerDigest) => ({
+      digests: await dayDigests(scoped, ownerDigest, shift(D3, -30), D3),
+      fingerprints: await modules.occurrences.readOwnerDayFingerprints(scoped,
+        { ownerDigest, fromDay: shift(D3, -30), throughDay: D3 }),
+    });
+    // The correction runtime: the same evidence read with and without corrections.
+    let runtimeMoves = 0;
+    // Owners the reader reads at both runtimes (linked, with a source family either way).
+    const linked = (await modules.owners.listAnalyticsV2Owners(context("active"))).owners
+      .filter((owner) => owner.hasV1 || owner.hasV11 || owner.hasV12);
+    assert.ok(linked.length > 1);
+    for (const owner of linked) {
+      const before = await capture(context("active"), owner.ownerDigest);
+      const after = await capture(context("staged"), owner.ownerDigest);
+      runtimeMoves += proveSound(`runtime ${owner.participantId}`, before, after);
+    }
+    assert.ok(runtimeMoves > 0, "the correction runtime changes some owner-day's output");
+
+    // A v1.2 chunk made incomplete: its records leave the reader's selection.
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const fixture = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active",
+      v12Scope: true });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const india = fixture.owners.india;
+    const before = await capture(scoped, india.ownerDigest);
+    const client = await pool.connect();
+    try {
+      // Test-only: the typed tables' guards refuse this mutation, which is the point of
+      // seeing what the reader and F do if it ever happened.
+      await client.query("BEGIN");
+      await client.query("SET LOCAL session_replication_role = replica");
+      const deleted = await client.query(`DELETE FROM "${schema}".telemetry_v12_typed_records WHERE id = (
+          SELECT record.id FROM "${schema}".telemetry_v12_typed_records record
+            JOIN "${schema}".telemetry_v12_day_manifests manifest ON manifest.id = record.manifest_id
+           WHERE manifest.participant_id = $1 AND manifest.state = 'ready' ORDER BY record.id LIMIT 1)`,
+      [india.participantId]);
+      assert.equal(deleted.rowCount, 1);
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+    const after = await capture(scoped, india.ownerDigest);
+    assert.ok(proveSound("incomplete v1.2 chunk", before, after) > 0, "the deletion changed india's output");
+  });
+
+test("K-READ: W(o) is stable, local to the owner, and moves with the owner's journal head and scope",
+  { skip: SKIP, timeout: 180_000 }, async () => {
+    const fixture = fixtures.active;
+    const owners = Object.values(fixture.owners).map((owner) => owner.ownerDigest).filter((digest) => typeof digest === "string");
+    const first = await modules.occurrences.readOwnerWatermarks(context("active"), owners);
+    assert.deepEqual([...first.keys()].sort(), [...owners].sort());
+    assert.deepEqual([...await modules.occurrences.readOwnerWatermarks(context("active"), owners)], [...first]);
+    // The correction runtime is part of every owner's scope.
+    const staged = await modules.occurrences.readOwnerWatermarks(context("staged"), owners);
+    assert.ok(owners.every((digest) => staged.get(digest) !== first.get(digest)));
+    // A journal-head move changes that owner's watermark only (in a copy of the fixture).
+    const alpha = fixture.owners.alpha.ownerDigest;
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const copy = await seedAnalyticsV2Fixture({ pool, schema, modules: modules.seed, correctionRuntime: "active" });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const base = await modules.occurrences.readOwnerWatermarks(scoped, owners);
+    assert.deepEqual([...base], [...first], "the same evidence and scope in another schema has the same watermarks");
+    const heads = await pool.query(`SELECT count(*)::integer AS n FROM "${schema}".storage_owner_revisions
+      WHERE owner_digest = $1`, [alpha]);
+    assert.equal(heads.rows[0].n, 1, "the fixture holds alpha's journal head");
+    const writer = await pool.connect();
+    try {
+      await writer.query("BEGIN");
+      await writer.query("SET LOCAL session_replication_role = replica");
+      await writer.query(`UPDATE "${schema}".storage_owner_revisions SET last_sequence = last_sequence + 1,
+        revision = revision + 1 WHERE owner_digest = $1`, [alpha]);
+      await writer.query("COMMIT");
+    } finally {
+      writer.release();
+    }
+    const moved = await modules.occurrences.readOwnerWatermarks(scoped, owners);
+    for (const digest of owners) {
+      assert.equal(moved.get(digest) !== base.get(digest), digest === alpha, digest);
+    }
+    assert.equal(copy.owners.alpha.ownerDigest, alpha);
+    await assert.rejects(modules.occurrences.readOwnerWatermarks(scoped, ["not-a-digest"]),
+      (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
+    await assert.rejects(modules.occurrences.readOwnerWatermarks(scoped, [alpha, alpha]),
+      (error) => error?.code === "ANALYTICS_V2_SOURCE_INVALID");
+  });
+
+test("N-EXCL: exclusion scopes are counted, never applied, and an undefined scope is refused",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const schema = `analytics_v2_a1_${randomBytes(6).toString("hex")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    schemas.push(schema);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const scoped = { pool, schema, nowMs: NOW_MS };
+    const absent = await modules.owners.readAnalyticsV2ExclusionScopes(scoped);
+    assert.deepEqual({ ...absent, scopes: { ...absent.scopes } }, { table: "absent", scopes: {} });
+    // The D-PT4X table's declared contract (D1 0023's columns); created here
+    // only when this line does not have it yet.
+    await pool.query(`CREATE TABLE IF NOT EXISTS "${schema}".community_aggregate_exclusions (
+      exclusion_id text PRIMARY KEY, participant_id text NOT NULL, scope text NOT NULL, reason_code text NOT NULL,
+      state text NOT NULL, effective_at text NOT NULL, expires_at text, created_at text NOT NULL,
+      created_by_digest text NOT NULL, revoked_at text, revoked_by_digest text)`);
+    const row = (id, scope, state) => pool.query(`INSERT INTO "${schema}".community_aggregate_exclusions
+      (exclusion_id, participant_id, scope, reason_code, state, effective_at, created_at, created_by_digest,
+       revoked_at, revoked_by_digest)
+      VALUES ($1, 'participant:synthetic-excluded', $2, 'manual_review', $3, '2026-09-01T00:00:00.000Z',
+       '2026-09-01T00:00:00.000Z', $4, $5, $6)`, [id, scope, state, "c".repeat(64),
+      state === "revoked" ? "2026-09-02T00:00:00.000Z" : null, state === "revoked" ? "d".repeat(64) : null]);
+    await row("x1", "community_weekly", "active");
+    await row("x2", "community_weekly", "revoked");
+    const present = await modules.owners.readAnalyticsV2ExclusionScopes(scoped);
+    assert.deepEqual(JSON.parse(JSON.stringify(present)),
+      { table: "present", scopes: { community_weekly: { rows: 2, active: 1 } } });
+    await row("x3", "community_daily", "active");
+    await assert.rejects(modules.owners.readAnalyticsV2ExclusionScopes(scoped),
+      (error) => error?.code === "ANALYTICS_V2_SOURCE_CONFLICT", "a scope production does not define");
   });
