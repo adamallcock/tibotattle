@@ -41,8 +41,8 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 69;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0069_analytics_v2_run_stamps.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 70;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0070_catalog_manifest_store.sql";
 const REQUIRED_DAILY_ACTIVATION_PATHS = new Set([
   "apps/worker/cloud-run/postgres-community-daily-activation.mjs",
   "apps/worker/cloud-run/postgres-community-daily-activation.check.mjs",

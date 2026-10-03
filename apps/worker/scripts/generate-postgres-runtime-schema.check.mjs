@@ -177,12 +177,13 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     '"0067_pending_object_transfer_holds.sql"',
     '"0068_v12_ready_manifest_ready_at_index.sql"',
     '"0069_analytics_v2_run_stamps.sql"',
+    '"0070_catalog_manifest_store.sql"',
   ]) {
     assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
   }
   assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v2");
   assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
-  assert.equal(manifest.roles.primary.length, 69);
+  assert.equal(manifest.roles.primary.length, 70);
   // No frozen ledger fragment reaches the Worker receipt.
   const rendered = renderPostgresRuntimeSchema(manifest);
   for (const ledgerOnly of [

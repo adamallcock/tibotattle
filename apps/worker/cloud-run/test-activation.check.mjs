@@ -228,7 +228,7 @@ test("configuration pins the activation job, one-task execution, migrator, and p
   assert.equal(parsed.job, TEST_ACTIVATION_JOB);
   assert.equal(parsed.project, CLOUD_RUN_IAM_TEST_TARGET.project);
   assert.equal(parsed.iamUser, TEST_ACTIVATION_IAM_USER);
-  assert.equal(awaitableMigrations.length, 69);
+  assert.equal(awaitableMigrations.length, 70);
   for (const overrides of [
     { CLOUD_RUN_JOB: "another-job" },
     { CLOUD_RUN_EXECUTION: "" },
@@ -276,7 +276,7 @@ test("activation atomically changes both runtime rows and only the narrow v1.2 c
     status: "ok",
     mode: "activate_v12_test",
     job: TEST_ACTIVATION_JOB,
-    migrationReceipt: { primaryVersion: 69 },
+    migrationReceipt: { primaryVersion: 70 },
     changed: true,
     runtimes: { legacy: "active", typed: "active" },
     collectionControls: {

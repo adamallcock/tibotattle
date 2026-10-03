@@ -1,6 +1,6 @@
 /**
- * Server catalog store (KM-3): loader, pin and read APIs over the staged
- * primary migration `*_catalog_manifest_store.sql`.
+ * Server catalog store (KM-3): loader, pin and read APIs over primary
+ * migration `0070_catalog_manifest_store.sql`.
  *
  * LOADER. loadCatalogManifestInTransaction verifies BEFORE it inserts:
  *   1. the envelope signature against the code-pinned keys the composition

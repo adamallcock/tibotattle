@@ -10,12 +10,12 @@
 -- the read APIs serve the compiled d43c8f92 baseline, which is the cutover
 -- state (owner decision round 7: compiled registry at cutover).
 --
--- NUMBER. 0066 is a placeholder (the staged harness needs four digits and the
--- staged run must stay contiguous after C-IPR's 0065). The integrator assigns
--- the next free primary number when it promotes this file, after K-STAMP's
--- migration if that lands first, then regenerates src/postgres-runtime-schema.ts
--- and moves the count and tail pins. The migration is purely additive (four
--- tables, four functions, triggers), so it needs no CONTRACT_MIGRATIONS entry.
+-- NUMBER. Primary 0070, assigned by the integrator at the PROD-PREP merge into
+-- the fast-path final line (2026-10-03), right after K-STAMP's run stamps
+-- (0069). Until then it was staged as
+-- staged-migrations/primary/0066_catalog_manifest_store.sql. The migration is
+-- purely additive (four tables, four functions, triggers), so it needs no
+-- CONTRACT_MIGRATIONS entry.
 --
 -- CONTENT-FREE. Every row is reviewed public configuration: versions,
 -- digests, key ids, price-card ids, vocabulary tokens and the signed envelope
