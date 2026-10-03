@@ -35,6 +35,12 @@
 #              corpus clock 2026-10-01T12:46:00.000Z
 #   uncapped   (MEAS_UNCAPPED=1 only) the same Job, one execution with a 24 h
 #              task timeout and guard
+#
+# Expected (docs/receipts/2026-10-03-gcp-meas-synth.md): the local run took
+# 15,530 s and projects to 13.6-19.1 h on Cloud Run, so the guarded refresh
+# should refuse ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED partway (its time model
+# plans 10,998 s) and publish nothing; run with MEAS_UNCAPPED=1 to measure the
+# real duration, which sets the task timeout, the recalibrated rates and C3.
 #   protected  read the shared test services' revisions (never written)
 set -u
 setopt pipefail
