@@ -26,6 +26,7 @@ export const TRANSFER_CONTROL_SCHEMA = "tibotattle_transfer";
 export const TRANSFER_STAGES = Object.freeze([
   "analytics-expectation",
   "identity-authority",
+  "identity-link-rotation",
   "legacy-contributions",
   "telemetry-v1-v11",
   "typed-legacy",

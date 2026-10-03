@@ -365,6 +365,23 @@ test("refusals: closed codes before any pool, and a later refusal closes what op
   assert.ok(seams.calls.includes("connector-closed"));
 });
 
+test("round 16: under the rotated identity-link label no identity-link consumer may be composed", () => {
+  // Production carries the rotated label; staging its own, unrotated one.
+  assert.equal(configuration.readProductionConfiguration(productionEnv(), "production").vars.IDENTITY_LINK_SECRET_VERSION,
+    "production-v2");
+  const ported = [...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS];
+  const admin = [...composition.POSTGRES_ADMIN_HOST_ROUTE_IDS];
+  assert.equal(host.assertIdentityLinkRotationComposable("production-v2", ported), true);
+  assert.equal(host.assertIdentityLinkRotationComposable("production-v2", [...ported, ...admin]), true);
+  assert.equal(host.assertIdentityLinkRotationComposable("staging-v1", [...ported, "enroll"]), false,
+    "an unrotated label is left to the registry's own od-cr-2 refusal");
+  for (const id of ["enroll", "identity_google_callback", "identity_apple_result", "security_reset", "participant_export"]) {
+    assert.throws(() => host.assertIdentityLinkRotationComposable("production-v2", [...ported, id]),
+      (error) => error.code === "IDENTITY_LINK_ROTATION_CONSUMER_PORTED" && error.message === error.code, id);
+  }
+  // The production composition itself passes it (the composition test above runs under production-v2).
+});
+
 test("composeOriginFamilies refuses an incomplete dependency set", () => {
   assert.throws(() => host.composeOriginFamilies(null), { code: host.ORIGIN_COMPOSITION_INVALID });
   assert.throws(() => host.composeOriginFamilies({ dataPool: { connect() {} } }), { code: host.ORIGIN_COMPOSITION_INVALID });

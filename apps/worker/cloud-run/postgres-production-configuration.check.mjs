@@ -442,13 +442,22 @@ test("exports the frozen production constants", () => {
   assert.equal(vars.EDGE_ORIGIN_MODE, "cloudflare-worker-iam");
   assert.equal(vars.PUBLIC_ORIGIN, configuration.PRODUCTION_PUBLIC_ORIGIN);
   assert.equal(vars.ENVIRONMENT, "production");
-  assert.equal(vars.IDENTITY_LINK_SECRET_VERSION, "production-v1");
+  // Round 16: the lost Cloudflare secret is rotated at the cutover; the
+  // origin label moves to production-v2 and production-v1 is retired.
+  assert.equal(vars.IDENTITY_LINK_SECRET_VERSION, "production-v2");
+  assert.equal(configuration.PRODUCTION_IDENTITY_LINK_SECRET_VERSION, "production-v2");
+  assert.deepEqual([...configuration.PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS], ["production-v1"]);
+  assert.equal(configuration.isRotatedIdentityLinkVersion("production-v2"), true);
+  for (const label of ["production-v1", "staging-v1", undefined]) {
+    assert.equal(configuration.isRotatedIdentityLinkVersion(label), false, String(label));
+  }
   // Staging refuses each of these; both OAuth client identities are included.
   assert.deepEqual(configuration.PRODUCTION_RESOURCE_FINGERPRINT, {
     origins: ["https://tibotattle.com", "https://admin.tibotattle.com", "https://www.tibotattle.com"],
     hosts: ["tibotattle.com", "admin.tibotattle.com", "www.tibotattle.com"],
     accessAud: vars.ACCESS_AUD,
-    identityLinkSecretVersion: "production-v1",
+    identityLinkSecretVersion: "production-v2",
+    retiredIdentityLinkSecretVersions: ["production-v1"],
     googleOidcClientId: vars.GOOGLE_OIDC_CLIENT_ID,
     appleServicesId: "com.usagemonitor.web",
     appleKeyId: vars.APPLE_KEY_ID,
@@ -847,6 +856,7 @@ test("staging requires its own plane and aborts on any production value", () => 
       "PUBLIC_ORIGIN_PRODUCTION_VALUE_FORBIDDEN"],
     [{ ACCESS_AUD: production.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
     [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
+    [{ IDENTITY_LINK_SECRET_VERSION: "production-v2" }, "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
     [{ GOOGLE_OIDC_CLIENT_ID: production.GOOGLE_OIDC_CLIENT_ID }, "GOOGLE_OIDC_CLIENT_ID_PRODUCTION_VALUE_FORBIDDEN"],
     // Apple's OAuth client (the id_token audience) is separated like Google's.
     [{ APPLE_SERVICES_ID: production.APPLE_SERVICES_ID }, "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
@@ -1011,6 +1021,8 @@ test("staging jobs run on the staging plane with its identity, origins and marke
       [{ ACCESS_AUD: configuration.PRODUCTION_VARS.ACCESS_AUD }, "ACCESS_AUD_PRODUCTION_VALUE_FORBIDDEN"],
       [{ IDENTITY_LINK_SECRET_VERSION: "production-v1" },
         "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
+      [{ IDENTITY_LINK_SECRET_VERSION: "production-v2" },
+        "IDENTITY_LINK_SECRET_VERSION_PRODUCTION_VALUE_FORBIDDEN"],
       [{ APPLE_SERVICES_ID: configuration.PRODUCTION_VARS.APPLE_SERVICES_ID },
         "APPLE_SERVICES_ID_PRODUCTION_VALUE_FORBIDDEN"],
       [{ PUBLIC_ORIGIN: "https://tibotattle.com", ADMIN_HOST_ORIGIN: "https://admin.tibotattle.com" },
@@ -1102,7 +1114,7 @@ test("the frozen env holds only named keys, pinned vars and the injected binding
   assert.equal(env.ENVIRONMENT, "production");
   assert.equal(env.ENROLLMENT_MODE, "open");
   assert.equal(env.SIGN_IN_START_MAX_PER_MINUTE, "300");
-  assert.equal(env.IDENTITY_LINK_SECRET_VERSION, "production-v1");
+  assert.equal(env.IDENTITY_LINK_SECRET_VERSION, "production-v2");
   assert.equal(env.ACCESS_AUD, configuration.PRODUCTION_VARS.ACCESS_AUD);
   assert.equal(env.EDGE_ORIGIN_MODE, "cloudflare-worker-iam");
   assert.equal(env.IDENTITY_LINK_SECRET, SECRET_VALUES.IDENTITY_LINK_SECRET);

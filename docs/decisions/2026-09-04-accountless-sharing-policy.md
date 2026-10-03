@@ -104,3 +104,31 @@ The [desktop convergence plan](../plans/2026-09-04-desktop-convergence.md) owns
 implementation and evidence. Publication, production settings, remote database
 migrations, signing and installed replacement remain separate operations.
 Update first-run copy, Settings and public privacy disclosures before activation.
+
+## Google Cloud cutover amendment (2026-10-02)
+
+Owner decisions of 2026-10-02 amend the transition for the switch of the hosted
+service to Google Cloud. Nothing here has happened yet; it takes effect at the
+switch.
+
+- **Round 12: native social enrollment retires at the switch.** Google and
+  Apple sign-in and the legacy `/api/v1/enroll` route are not ported. Credential
+  renewal and disconnect stay, so already-paired native social devices keep
+  uploading until their 180-day credential sunsets and then move to the
+  accountless desktop path. The session, logout, pairing, device and v1.2
+  consent routes stay ported. The retirement is disclosed at the cutover.
+- **Round 16: the identity-link secret is rotated.** The production
+  `IDENTITY_LINK_SECRET` that keys sign-in link keys is lost, so the cutover
+  installs a newly generated secret under a new key-version label, through a
+  recorded and separately authorized step
+  ([cutover window](../runbooks/gcp-cutover-window.md#identity-link-rotation-round-16)).
+  This is admissible only because round 12 retires every route that uses the
+  secret. Consequences: prior Google and Apple sign-in links cannot be
+  re-established, and any future social sign-in starts a new identity
+  namespace rather than reattaching an existing participant. The imported link
+  keys remain stored, content-free and unused. Uploads, the content-free
+  sharing contract, pseudonymity and the 180-day sunsets are unchanged, so no
+  public disclosure beyond round 12's retirement is needed.
+- This record does not claim that the old link keys are unlinkable to provider
+  accounts until the Cloudflare Worker's copy of the old secret is deleted
+  after the switch.

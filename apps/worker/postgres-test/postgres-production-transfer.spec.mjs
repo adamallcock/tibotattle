@@ -1,4 +1,4 @@
-import { readFile, readdir, rename } from "node:fs/promises";
+import { chmod, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { DatabaseSync } from "node:sqlite";
@@ -32,6 +32,7 @@ import {
   runPreflight,
   targetCheck,
   writeIdentityPin,
+  writeIdentityRotation,
   writeReport,
 } from "../scripts/postgres-production-transfer.mjs";
 import { DISPOSITIONS, OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED, STAGE_PLAN } from "../scripts/postgres-transfer-coverage.mjs";
@@ -69,6 +70,9 @@ const table = name => `"${PRIMARY_SCHEMA}"."${name}"`;
 /** The synthetic production plane: its project, and the identity-link mount the pin must name. */
 const DESIRED_PROJECT = "tibotattle-synthetic";
 const IDENTITY_MOUNT = Object.freeze({ secretName: "IDENTITY_LINK_SECRET", version: "3" });
+/** Round 16: the rotated label and a NEW synthetic secret (the production value is lost). */
+const ROTATED_VERSION = "production-v2";
+const ROTATED_SECRET = "ept8-synthetic-rotated-identity-link-secret-000000";
 
 async function codeOf(promise) {
   try {
@@ -87,13 +91,34 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
   let admin;
   let participantIds;
 
-  /** A fresh owner directory with pin, projection, OWN-4 export, scheduler evidence and inputs. */
+  /**
+   * A fresh owner directory with pin, projection, OWN-4 export, scheduler
+   * evidence and inputs. With `rotation`, the pin and identity-rotation.json
+   * come from identity-rotate-pin (the NEW secret from stdin, the sealed D1
+   * pin from a wrangler-shaped file) and the inputs declare the rotation.
+   */
   async function ownerDirectory(target, { manifest = manifestPath, sealId = seal.manifest.sealId, inputs = {},
-    pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {} } = {}) {
+    pinSecret = SYNTHETIC_IDENTITY_LINK_SECRET, ledgerSeal = null, scheduler = {}, rotation = null,
+    pinKeyVersion = SYNTHETIC_IDENTITY_LINK_VERSION } = {}) {
     const directory = await privateDirectory("ept8-owner-");
-    await writeIdentityPin({ ownerDirectory: directory, stream: Readable.from([pinSecret]),
-      keyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, secretName: IDENTITY_MOUNT.secretName,
-      secretVersion: IDENTITY_MOUNT.version, now: CONTEXT_NOW });
+    let rotationInputs = {};
+    if (rotation === null) {
+      await writeIdentityPin({ ownerDirectory: directory, stream: Readable.from([pinSecret]),
+        keyVersion: pinKeyVersion, secretName: IDENTITY_MOUNT.secretName,
+        secretVersion: IDENTITY_MOUNT.version, now: CONTEXT_NOW });
+    } else {
+      const sealedPinFile = join(directory, "sealed-pin.json");
+      await writePrivateFileOnce(sealedPinFile, `${JSON.stringify([{ results: [{
+        key_version: rotation.fromKeyVersion ?? SYNTHETIC_IDENTITY_LINK_VERSION,
+        secret_fingerprint: rotation.fromFingerprint ?? identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET) }],
+      success: true, meta: {} }])}\n`, 0o400);
+      const written = await writeIdentityRotation({ ownerDirectory: directory, stream: Readable.from([rotation.secret]),
+        sealedPinFile, fromKeyVersion: rotation.fromKeyVersion ?? SYNTHETIC_IDENTITY_LINK_VERSION,
+        toKeyVersion: ROTATED_VERSION, secretName: IDENTITY_MOUNT.secretName, secretVersion: IDENTITY_MOUNT.version,
+        now: CONTEXT_NOW });
+      rotationInputs = { expectedIdentityKeyVersion: ROTATED_VERSION,
+        identityLinkRotation: { rotationSha256: written.rotationSha256 } };
+    }
     const projectionSeal = ledgerSeal ?? await readCutoverSeal({ manifestPath: manifest, expectedSealId: sealId });
     const ledger = await openSealedSourceFromSeal(projectionSeal, "deletion-ledger");
     let projection;
@@ -123,6 +148,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
       schedulerEvidencePath: join(directory, "scheduler-probe.json"),
       ownerFlags: [OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED],
       allowedRoleMembers: [],
+      ...rotationInputs,
       ...inputs,
     };
     await writePrivateFileOnce(join(directory, OWNER_FILES.inputs), `${JSON.stringify(value)}\n`, 0o400);
@@ -279,7 +305,7 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     manifestPath = outputPathsOf(run.out).manifest;
     seal = await readCutoverSeal({ manifestPath, expectedSealId: sealed.sealId });
     cluster = await createW2SealCluster({ socket: PG_TEST_SOCKET, port: PG_TEST_PORT, user: PG_TEST_USER,
-      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 5, label: "ept8" });
+      password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, count: 7, label: "ept8" });
     const endpoint = await localSocket(PG_TEST_SOCKET, PG_TEST_PORT);
     admin = new pg.Client({ ...endpoint, user: PG_TEST_USER, password: PG_TEST_PASSWORD, database: PG_TEST_DATABASE, ssl: false });
     await admin.connect();
@@ -620,6 +646,10 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(dry).toMatchObject({ mode: "dry-run", authorizationToken: preflight.runAuthorizationToken, resumed: false });
     expect(await codeOf(runImport(await context(target, directory), { execute: true, confirm: "e".repeat(64) })))
       .toBe("CUTOVER_AUTHORIZATION_MISMATCH");
+    // Round 16: an unrotated run declares no rotation, so a rotation token is refused too.
+    expect(preflight.identityRotationAuthorizationToken).toBeUndefined();
+    expect(await codeOf(runImport(await context(target, directory), { execute: true, confirm: preflight.runAuthorizationToken,
+      confirmIdentityRotation: "e".repeat(64) }))).toBe("CUTOVER_AUTHORIZATION_MISMATCH");
     const holder = new pg.Client({ ...await localSocket(PG_TEST_SOCKET, PG_TEST_PORT), user: PG_TEST_USER,
       password: PG_TEST_PASSWORD, database: target.databases.primary, ssl: false });
     await holder.connect();
@@ -828,5 +858,149 @@ describe.skipIf(!PG_TEST_SOCKET)("E-PT8 PT-8-lite orchestrator on PostgreSQL 17"
     expect(await codeOf(markLiveStep(await context(target, directory), authorization))).toBe("CUTOVER_INTERIM_READ_NOT_LOADED");
     await restore();
     expect((await markLiveStep(await context(target, directory), authorization)).state).toBe("live");
+  }, 900_000);
+
+  it("round 16: rotates the lost identity-link secret at cutover only under its own token and receipt", async () => {
+    await assertNoForeignTransferMembers();
+    const target = cluster.targets[5];
+    const refuse = async (options, expected, label, contextOptions = {}) => {
+      const directory = await ownerDirectory(target, options);
+      expect(await codeOf(runPreflight(await context(target, directory, contextOptions))), label).toBe(expected);
+      expect(await readdir(directory), label).not.toContain(OWNER_FILES.preflight);
+    };
+    const rotation = { secret: ROTATED_SECRET };
+    const sealedFingerprint = identityLinkFingerprint(SYNTHETIC_IDENTITY_LINK_SECRET);
+    const rotatedFingerprint = identityLinkFingerprint(ROTATED_SECRET);
+    const readPin = async () => (await target.ownerPrimary.query(`SELECT key_version, secret_fingerprint
+      FROM ${table("identity_link_secret_configuration")}`)).rows;
+
+    // The new secret's pin WITHOUT the rotation receipt never passes P8: under
+    // the sealed label (the secret differs) or the rotated one (so does the row).
+    await refuse({ pinSecret: ROTATED_SECRET }, "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH", "new secret, old label");
+    await refuse({ pinSecret: ROTATED_SECRET, pinKeyVersion: ROTATED_VERSION,
+      inputs: { expectedIdentityKeyVersion: ROTATED_VERSION } }, "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH", "new secret, new label");
+    // P8-R refusals, before any target write.
+    await refuse({ rotation, inputs: { expectedIdentityKeyVersion: "production-v3" } },
+      "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH", "a wrong key version");
+    await refuse({ rotation: { ...rotation, fromFingerprint: "f".repeat(64) } }, "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH",
+      "from is not the sealed row");
+    await refuse({ rotation, inputs: { identityLinkRotation: { rotationSha256: "a".repeat(64) } } },
+      "CUTOVER_IDENTITY_ROTATION_INVALID", "the inputs name another rotation document");
+    await refuse({ rotation }, "CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED", "a ported consumer",
+      { portedRouteIds: ["health", "enroll"] });
+    const { secrets } = JSON.parse(await readFile(join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE), "utf8"));
+    const mounting = async version => ({ desiredStatePath: await desiredStateFile({
+      secrets: { ...secrets, IDENTITY_LINK_SECRET: { ...IDENTITY_MOUNT, version } } }) });
+    await refuse({ rotation }, "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED", "an unpinned mount", await mounting(null));
+    await refuse({ rotation }, "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH", "another mounted version", await mounting("4"));
+    // Tamper-evident: an edited rotation document no longer hashes to the inputs' digest.
+    const tampered = await ownerDirectory(target, { rotation });
+    const rotationPath = join(tampered, OWNER_FILES.rotation);
+    const document = JSON.parse(await readFile(rotationPath, "utf8"));
+    await chmod(rotationPath, 0o600);
+    // A schema-valid edit (another computedAt): only the digest notices it.
+    await writeFile(rotationPath, `${JSON.stringify({ ...document, computedAt: "2026-10-02T02:00:00.001Z" })}\n`);
+    await chmod(rotationPath, 0o400);
+    expect(await codeOf(runPreflight(await context(target, tampered)))).toBe("CUTOVER_IDENTITY_ROTATION_INVALID");
+    expect(await targetRows(target)).toBe(0);
+
+    // GO: P8-R and a second token.
+    const directory = await ownerDirectory(target, { rotation });
+    const preflight = await runPreflight(await context(target, directory));
+    expect(preflight.checks.P8).toMatchObject({ keyVersion: ROTATED_VERSION, secretVersion: IDENTITY_MOUNT.version,
+      rotation: { fromKeyVersion: SYNTHETIC_IDENTITY_LINK_VERSION, toKeyVersion: ROTATED_VERSION, consumersRetired: 9 } });
+    expect(preflight.identityRotationAuthorizationToken).toMatch(/^[0-9a-f]{64}$/u);
+    expect(preflight.identityRotationAuthorizationToken).not.toBe(preflight.runAuthorizationToken);
+    const dry = await runImport(await context(target, directory));
+    expect(dry).toMatchObject({ mode: "dry-run", authorizationToken: preflight.runAuthorizationToken,
+      identityRotationAuthorizationToken: preflight.identityRotationAuthorizationToken });
+    // No rotation without the token: the run token alone, or a wrong one, writes nothing.
+    const runOnly = { execute: true, confirm: preflight.runAuthorizationToken };
+    expect(await codeOf(runImport(await context(target, directory), runOnly))).toBe("CUTOVER_AUTHORIZATION_MISMATCH");
+    expect(await codeOf(runImport(await context(target, directory), { ...runOnly,
+      confirmIdentityRotation: preflight.runAuthorizationToken }))).toBe("CUTOVER_AUTHORIZATION_MISMATCH");
+    expect(await targetRows(target)).toBe(0);
+    const authorization = { ...runOnly, confirmIdentityRotation: preflight.identityRotationAuthorizationToken };
+
+    // Killed inside the rotation transaction, after the UPDATE and before the
+    // receipt: everything rolls back, PT-3's verbatim copy stays the sealed row.
+    expect(await codeOf(runImport(await context(target, directory, killAfter("identity-link-rotation:updated")),
+      authorization))).toBe("synthetic kill");
+    expect(await readPin()).toEqual([{ key_version: SYNTHETIC_IDENTITY_LINK_VERSION, secret_fingerprint: sealedFingerprint }]);
+    let stages = (await receipts(target)).stages;
+    expect(stages.find(row => row.stage === "identity-authority")?.state).toBe("complete");
+    expect(stages.some(row => row.stage === "identity-link-rotation")).toBe(false);
+    // Resumed and killed right after the rotation commits; then the pin is
+    // set back to `from` behind the orchestrator's back: post-import refuses.
+    expect(await codeOf(runImport(await context(target, directory, killAfter("stage:identity-link-rotation")),
+      authorization))).toBe("synthetic kill");
+    expect(await readPin()).toEqual([{ key_version: ROTATED_VERSION, secret_fingerprint: rotatedFingerprint }]);
+    await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET key_version = $1, secret_fingerprint = $2`,
+      [SYNTHETIC_IDENTITY_LINK_VERSION, sealedFingerprint]);
+    expect(await codeOf(runImport(await context(target, directory), authorization)))
+      .toBe("CUTOVER_IDENTITY_ROTATION_STATE_INVALID");
+    await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET key_version = $1, secret_fingerprint = $2`,
+      [ROTATED_VERSION, rotatedFingerprint]);
+    const finished = await runImport(await context(target, directory), authorization);
+    expect(finished.runState).toBe("verified");
+
+    // The receipts: PT-3's one verbatim table receipt for the pin table, and
+    // the rotation's own stage receipt and checkpoint.
+    const all = await receipts(target);
+    const pinReceipts = all.tables.filter(row => row.source_table === "identity_link_secret_configuration");
+    expect(pinReceipts).toHaveLength(1);
+    expect(pinReceipts[0]).toMatchObject({ stage: "identity-authority", disposition: "imported:identity-authority",
+      state: "complete" });
+    expect(pinReceipts[0].target_sha256).toBe(pinReceipts[0].source_sha256);
+    expect(all.stages.find(row => row.stage === "identity-link-rotation")).toMatchObject({ state: "complete", row_count: "1" });
+    const { rows: checkpoint } = await target.ownerPrimary.query(`SELECT state, row_count::int AS row_count,
+        prefix_chain_sha256, last_key
+      FROM tibotattle_transfer.transfer_checkpoints WHERE stage = 'identity-link-rotation'`);
+    const inputs = JSON.parse(await readFile(join(directory, OWNER_FILES.inputs), "utf8"));
+    expect(checkpoint).toEqual([{ state: "complete", row_count: 1,
+      prefix_chain_sha256: inputs.identityLinkRotation.rotationSha256, last_key: null }]);
+    const postImport = JSON.parse(await readFile(join(directory, OWNER_FILES.postImport), "utf8"));
+    expect(postImport.invariants.identityLink).toEqual({ mode: "rotated", keyVersion: ROTATED_VERSION,
+      rotationSha256: inputs.identityLinkRotation.rotationSha256 });
+    // A rerun of the verified run is a no-op.
+    expect((await runImport(await context(target, directory), authorization)).stagesRun).toEqual([]);
+
+    // Finalize: the flip gate re-asserts the rotated pin and the receipt.
+    const flip1 = await flipEvidence("rotation-flip1");
+    const releaseDry = await releaseControls(await context(target, directory), { flipEvidencePath: flip1.path });
+    await releaseControls(await context(target, directory), { flipEvidencePath: flip1.path, execute: true,
+      confirm: releaseDry.authorizationToken });
+    const flip2 = await flipEvidence("rotation-flip2");
+    await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET secret_fingerprint = $1`, ["e".repeat(64)]);
+    expect(await codeOf(flipGate(await context(target, directory), { flipEvidencePath: flip2.path })))
+      .toBe("CUTOVER_IDENTITY_ROTATION_STATE_INVALID");
+    await tamper(target, `UPDATE ${table("identity_link_secret_configuration")} SET secret_fingerprint = $1`, [rotatedFingerprint]);
+    const gate = await flipGate(await context(target, directory), { flipEvidencePath: flip2.path });
+    expect(JSON.parse(await readFile(join(directory, OWNER_FILES.flipGate), "utf8")).identityLink.mode).toBe("rotated");
+    const live = await markLiveStep(await context(target, directory), { flipEvidenceSha256: flip2.sha256, execute: true,
+      confirm: gate.markLiveAuthorizationToken });
+    expect(live.state).toBe("live");
+    await target.adminPrimary.query(`UPDATE ${table("retention_state")} SET state = 'completed',
+      last_started_at = date_trunc('milliseconds', now()), last_completed_at = date_trunc('milliseconds', now()),
+      maintenance_run_at = date_trunc('milliseconds', now()), restore_replay_complete = true, quarantine_retention_complete = true`);
+    await target.adminPrimary.query(`UPDATE ${table("quarantine_reconciliation_state")} SET state = 'completed',
+      last_started_at = date_trunc('milliseconds', now()), last_completed_at = date_trunc('milliseconds', now()),
+      maintenance_run_at = (SELECT maintenance_run_at FROM ${table("retention_state")})`);
+    expect((await postLiveCheck(await context(target, directory, { now: () => new Date() }))).ready).toBe(true);
+    await writeReport(await context(target, directory));
+    const report = JSON.parse(await readFile(join(directory, OWNER_FILES.report), "utf8"));
+    expect(report.receipts.rotation).toBe(inputs.identityLinkRotation.rotationSha256);
+
+    // Content-free: neither secret nor either fingerprint leaves the pin,
+    // rotation and sealed-pin documents.
+    for (const name of await readdir(directory)) {
+      if (!name.endsWith(".json") && !name.endsWith(".ndjson")) continue;
+      if (["own4-export.json", OWNER_FILES.inputs, OWNER_FILES.pin, OWNER_FILES.rotation, "sealed-pin.json",
+        "scheduler-probe.json"].includes(name)) continue;
+      const text = await readFile(join(directory, name), "utf8");
+      for (const value of [ROTATED_SECRET, SYNTHETIC_IDENTITY_LINK_SECRET, rotatedFingerprint, sealedFingerprint]) {
+        expect(text.includes(value), name).toBe(false);
+      }
+    }
   }, 900_000);
 });

@@ -99,6 +99,7 @@ export const IDENTITY_AUTHORITY_ERROR_CODES = Object.freeze([
   "CUTOVER_COUNTER_UNMAPPED",
   "CUTOVER_IDENTITY_ARGUMENT_INVALID",
   "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH",
+  "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH",
   "CUTOVER_IDENTITY_TABLE_DIGEST_MISMATCH",
   "CUTOVER_IDENTITY_TRANSFER_FAILED",
   "CUTOVER_IMPORT_ORDER_INVALID",
@@ -571,17 +572,49 @@ function sealedBootstrap(database) {
   return Object.freeze({ canonical, cursorsCleared, sha256: HASH(JSON.stringify([canonical.values])) });
 }
 
+function closedKeys(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+}
+
+function validPin(pin) {
+  return closedKeys(pin, ["keyVersion", "secretFingerprint"]) && typeof pin.keyVersion === "string"
+    && VERSION.test(pin.keyVersion) && typeof pin.secretFingerprint === "string" && SHA256.test(pin.secretFingerprint);
+}
+
+/**
+ * The identity-link pin assertion, before the first write. Two closed forms:
+ *   { keyVersion, secretFingerprint }: the configured pin, which must equal
+ *     the sealed row (CUTOVER_IDENTITY_LINK_SECRET_MISMATCH); pinMode 'pinned';
+ *   { mode: 'rotate', sealedPin: { keyVersion, secretFingerprint },
+ *     rotationSha256 }: round 16's rotate-at-cutover, where the configured
+ *     secret is a NEW one and can never equal the sealed row. The sealed row
+ *     must equal the rotation document's `from` exactly
+ *     (CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH); pinMode 'rotated'.
+ * Either way the row is still copied verbatim (source digest == target
+ * digest): the rotation itself is PT-8's later 'identity-link-rotation'
+ * stage, under its own token and receipt. The assertion is never skipped.
+ */
 function assertIdentityLinkPin(database, pin) {
-  if (pin === null || typeof pin !== "object" || typeof pin.keyVersion !== "string" || !VERSION.test(pin.keyVersion)
-      || typeof pin.secretFingerprint !== "string" || !SHA256.test(pin.secretFingerprint)) {
+  let expected;
+  let mode;
+  if (validPin(pin)) {
+    expected = pin;
+    mode = Object.freeze({ pinMode: "pinned" });
+  } else if (closedKeys(pin, ["mode", "sealedPin", "rotationSha256"]) && pin.mode === "rotate"
+      && validPin(pin.sealedPin) && typeof pin.rotationSha256 === "string" && SHA256.test(pin.rotationSha256)) {
+    expected = pin.sealedPin;
+    mode = Object.freeze({ pinMode: "rotated", rotationSha256: pin.rotationSha256 });
+  } else {
     fail("CUTOVER_IDENTITY_ARGUMENT_INVALID");
   }
   const rows = sourceAll(database, "SELECT singleton, key_version, secret_fingerprint FROM identity_link_secret_configuration",
     [], "identity_link_secret_configuration");
-  if (rows.length !== 1 || rows[0].singleton !== 1n || rows[0].key_version !== pin.keyVersion
-      || rows[0].secret_fingerprint !== pin.secretFingerprint) {
-    fail("CUTOVER_IDENTITY_LINK_SECRET_MISMATCH");
+  if (rows.length !== 1 || rows[0].singleton !== 1n || rows[0].key_version !== expected.keyVersion
+      || rows[0].secret_fingerprint !== expected.secretFingerprint) {
+    fail(mode.pinMode === "rotated" ? "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" : "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH");
   }
+  return mode;
 }
 
 /**
@@ -1001,7 +1034,9 @@ async function highWaterSequences(client, schema, counters) {
  * Run the identity-authority stage. `identityLinkPin` is the configured
  * {keyVersion, secretFingerprint} (the fingerprint of the deployed
  * IDENTITY_LINK_SECRET, computed by the owner; this tool never reads the
- * secret). `onPage` is a test hook called after each committed page.
+ * secret), or round 16's closed rotate mode
+ * {mode: 'rotate', sealedPin, rotationSha256} (see assertIdentityLinkPin).
+ * `onPage` is a test hook called after each committed page.
  */
 export async function runIdentityAuthorityTransfer({
   handle,
@@ -1034,7 +1069,7 @@ export async function runIdentityAuthorityTransfer({
     // so an invalid value refuses here rather than after earlier pages.
     const sourceFacts = new Map(ENTRIES.map(item => [item.name, sourceTableFacts(database, item.spec, pageRows)]));
     const counters = assertCounters(database);
-    assertIdentityLinkPin(database, identityLinkPin);
+    const pinMode = assertIdentityLinkPin(database, identityLinkPin);
     const bootstrap = sealedBootstrap(database);
     const controls = sealedControlsRow(database);
     const chain = accountlessChain(database);
@@ -1104,6 +1139,8 @@ export async function runIdentityAuthorityTransfer({
       targetMissing,
       doNotRestore: { deletionDigests: doNotRestore.deletionDigests,
         deletionDigestsSha256: doNotRestore.deletionDigestsSha256 },
+      // Only a rotation adds the field, so an unrotated receipt is unchanged.
+      ...(pinMode.pinMode === "rotated" ? { identityLinkPin: pinMode } : {}),
     };
     const receiptSha256 = HASH(JSON.stringify(summary));
     const rowCount = Object.values(tables).reduce((total, facts) => total + facts.sourceRows, 0) + 2;
@@ -1146,6 +1183,7 @@ export async function runIdentityAuthorityTransfer({
       targetMissing: Object.freeze(targetMissing),
       doNotRestore,
       excluded: IDENTITY_AUTHORITY_EXCLUDED_TABLES,
+      pinMode: pinMode.pinMode,
       rowCount,
       byteCount,
     });

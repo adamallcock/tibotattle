@@ -127,7 +127,7 @@ a no-go.
 | Route decisions | OWN-2, OWN-3, E-PORTS | Kept and retired routes are decided from production traffic counts. Retired routes answer `503 POSTGRES_ROUTE_NOT_PORTED` or are ported |
 | Origin code | C-SIMP, C-ADMIN, C-MAINT, C-REFRESH, D-CRB, D-PT5A, D-OPS3, D-OPS4, D-BLOB, E-PT8 | Merged on the deploy line and green. The status of each at the time of writing is in [open gaps](#open-gaps-in-tooling-and-decisions) |
 | Estate | PROD-1, OWN-5, OWN-5b, OWN-5c, OPS2-READ | The OPS-2 plan was applied by the owner and its readback reads clean. The first live readback parsed correctly on the test project |
-| Secrets | PROD-2, OWN-6, OWN-6b | Secret Manager is populated. The identity-link secret matches the sealed pin and the envelope keys are identical. The Cloudflare edge secrets are in place and the typed baseline was recaptured after each put |
+| Secrets | PROD-2, OWN-6, OWN-6b | Secret Manager is populated and the envelope keys are identical. `IDENTITY_LINK_SECRET` is the newly generated version the desired state mounts: the production value is lost, so the cutover rotates the pin ([identity-link rotation](#identity-link-rotation-round-16)). Nobody has written a new value into the Cloudflare Worker's `IDENTITY_LINK_SECRET`. The Cloudflare edge secrets are in place and the typed baseline was recaptured after each put |
 | Origin pre-staged | PROD-3 | The origin migrated to the tail and rolled ([rollout](./gcp-rollout.md)). A maintenance pass ran. The verifier smoke reads ready. An unauthenticated request to the Cloud Run URL gets Google's 403 |
 | Scheduler | PROD-4, E-OPS5 | Triggers exist and are paused, with the cadence from the refresh measurements. The paused-too-long probe has a runner and a notification target |
 | Edge | PROD-5, E-EDGEPORT, OWN-7, OWN-7b | The worker-mode edge is live from the edge-port line. The release-guard D1 exists and has no pending migration. All six edge-tier rate-limit bindings are live. The edge IP probe from the `tibotattle.com` zone passed. Each mode was rehearsed on the staging edge, including a fence and abort drill |
@@ -411,13 +411,18 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    deletion-digest exclusion count (P6), the public-source bootstrap at
    `completed=1` (P7), the identity pin (P8: the sealed fingerprint, and the
    secret and numeric version that the committed production desired state
-   mounts), no privilege on the transfer control schema for any role but its
-   owner, `PUBLIC` included (P10), and the scheduler probe (P11: the desired
+   mounts; under round 16's rotation, P8-R instead, see
+   [identity-link rotation](#identity-link-rotation-round-16)), no privilege
+   on the transfer control schema for any role but its owner, `PUBLIC`
+   included (P10), and the scheduler probe (P11: the desired
    state's project, exactly the triggers its `scheduler` map manages, all
    paused, no alert, under 6 hours old).
 2. **Import (protected).** `node $S run --owner-dir <dir> <connection>` is a dry
    run that prints the plan and the token; add `--execute --confirm <token>`.
-   It runs the stages in dependency order: PT-3 `identity-authority`, D-PT4X
+   With a declared identity-link rotation it prints a second token, and the
+   run also needs `--confirm-identity-rotation <token>`.
+   It runs the stages in dependency order: PT-3 `identity-authority`,
+   `identity-link-rotation` (a recorded no-op without a rotation), D-PT4X
    `legacy-contributions`, the eight D-PT5A stages, the waivers
    (`performance` under the owner flag `performance-routes-retired`,
    `accountless-retention` while its sealed table is empty, `objects` until
@@ -501,7 +506,10 @@ orchestrator imports no analytics state and waives the three analytics stages.
 Round 12 holds: the native social chain is retired, and PT-3 still imports the
 tables the kept session routes and credential renew and disconnect
 authenticate against (pinned in `KEPT_SESSION_AUTHORITY_TABLES`); the retired
-chain's short-lived handoff rows are imported verbatim and are inert.
+chain's short-lived handoff rows are imported verbatim and are inert. The
+identity-link pin (`IDENTITY_LINK_PIN_TABLE`) is imported verbatim too, but no
+kept route reads it: it is the continuity record that round 16's
+[identity-link rotation](#identity-link-rotation-round-16) moves.
 
 **The revision floor is not loaded yet (round 14).** Round 14 places REV-SEED's
 per-day revision floor inside this import, in the `analytics-community-history`
@@ -570,7 +578,10 @@ no numeric version (`CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`). Pin the version
 in the desired state (owner) before the pin is taken. P8 also refuses a pin of
 another secret or version (`CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH`). The key
 version label (`expectedIdentityKeyVersion`) still comes from `pt8-inputs.json`.
-The pin is a keyed digest: keep it in the owner directory only.
+The pin is a keyed digest: keep it in the owner directory only. The production
+secret is lost, so this cutover takes the pin with `identity-rotate-pin`
+instead ([identity-link rotation](#identity-link-rotation-round-16)), which
+writes the same pin document for the new secret.
 
 **Connection.** Every database subcommand takes `--pg-socket <dir> --pg-port
 <n> --pg-user <transfer IAM user> --pg-database <db>`: a Unix socket directory
@@ -630,7 +641,9 @@ the target is final for this seal.
 | `CUTOVER_PARTICIPANT_ERASURE_PENDING`, `CUTOVER_OWNER_LINK_ERASED` | P3, P5 | An erasure is unfinished. Finish it on Cloudflare and re-seal |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PROJECTION_SEAL_MISMATCH` | P6 | A sealed participant matches a tombstone, or the projection is not this seal's |
 | `CUTOVER_PUBLIC_SOURCE_BOOTSTRAP_INCOMPLETE` | P7 | The sealed bootstrap is not complete |
-| `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8 | The pin differs from the sealed row or the deployed label. Never rotate the secret to pass |
+| `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_LINK_VERSION_MISMATCH` | P8, P8-R | The pin differs from the sealed row or the deployed label. Under round 16 the only rotation is the recorded [identity-link rotation](#identity-link-rotation-round-16); never edit a pin or a row to pass |
+| `CUTOVER_IDENTITY_ROTATION_INVALID`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH` | P8-R | The rotation document does not hash to the inputs' digest or is malformed, its `from` is not the sealed row, or the pin is not its `to`. Recompute it with `identity-rotate-pin` |
+| `CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED` | P8-R | A route that reads the identity-link pin, link keys or cooldowns would be ported. A rotation is not admissible; stop |
 | `CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED`, `CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH` | P8 | The committed production desired state mounts no numeric version, or the pin names another secret or version than the mount |
 | `CUTOVER_DESIRED_STATE_INVALID` | P8, P11 | The committed production desired state is unreadable, still has a placeholder project, or its `scheduler` map is not a set of job names that includes `analytics-refresh` |
 | `CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE` | P9 | The sealed controls admit no degraded form. Re-seal |
@@ -652,6 +665,100 @@ read is absent, or is not the export post-import loaded),
 codes (for example `CUTOVER_FLIP_ROLE_MEMBERS_UNEXPECTED`). Each is a NO-GO:
 diagnose, never bypass. The design adds no override flag beyond the two named
 owner flags.
+
+### Identity-link rotation (round 16)
+
+The production `IDENTITY_LINK_SECRET` is lost: Cloudflare Worker secrets are
+write-only and the owner has no copy. The owner chose to rotate it at the
+cutover (owner decisions 2026-10-02, round 16). That is admissible only
+because round 12 retires every route that reads the pin, a provider
+subject's link key or a re-enrolment cooldown digest
+(`IDENTITY_LINK_CONSUMER_ROUTE_IDS` in `postgres-production-registry.mjs`:
+enroll, Google and Apple sign-in, security reset and participant export). The
+kept routes (session, logout, pairing and claim, devices and revoke, v1.2
+consent, credential renew and disconnect) read none of them, so they keep
+working and the 14 native social devices keep uploading until their 180-day
+sunsets. The imported link keys stay in the database, inert: a key derived
+under the new secret never equals an old one.
+
+Preconditions (read-only):
+
+- The committed production desired state mounts `IDENTITY_LINK_SECRET` at
+  the numeric version that holds the new secret (version `1`; PROD-PREP owns
+  that file).
+- A boolean-only check confirms that version is 43 base64url characters with
+  no trailing line feed or carriage return. If it fails, add a clean version
+  and pin that one instead. The stdin reader refuses a trailing newline.
+- Nobody writes a new value into the Cloudflare Worker's
+  `IDENTITY_LINK_SECRET` before the switch. That would make every pin-gated
+  Cloudflare route (enroll, Google and Apple sign-in and erasure) answer 503
+  `IDENTITY_CONFIGURATION_INVALID` against the D1 pin. `wrangler.jsonc`
+  keeps `production-v1`, which names that secret, until its deletion at P10.
+
+Steps:
+
+1. Read the D1 pin (read-only, approved in the window) into the owner
+   directory, `0400`:
+
+   ```bash
+   npx wrangler d1 execute <production ingestion D1> --remote --env production --json \
+     --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration" \
+     > <dir>/sealed-pin.json
+   ```
+
+   It is a keyed digest: it stays in the owner directory, never the repository.
+2. Owner: compute the new pin and the rotation document. The new secret is
+   read from standard input only:
+
+   ```bash
+   gcloud secrets versions access 1 --secret=IDENTITY_LINK_SECRET --project=<production project> | \
+     node $S identity-rotate-pin --owner-dir <dir> --from-key-version production-v1 \
+       --to-key-version production-v2 --secret-name IDENTITY_LINK_SECRET --secret-version 1 \
+       --sealed-pin-file <dir>/sealed-pin.json
+   ```
+
+   It writes `identity-pin.json` (the new secret, labelled `production-v2`)
+   and `identity-rotation.json` (`tibotattle-identity-link-rotation-v1`: the
+   sealed `from`, the new `to` with its secret name and version, the reason
+   `secret-lost`, the decision and the retired consumer routes), each `0400`
+   and written once. It prints only the labels, the version number and the
+   two files' sha256.
+3. In `pt8-inputs.json`, set `expectedIdentityKeyVersion` to `production-v2`
+   and add `"identityLinkRotation": { "rotationSha256": "<printed rotationSha256>" }`.
+4. Preflight runs P8-R instead of P8: the document must hash to
+   `rotationSha256` (`CUTOVER_IDENTITY_ROTATION_INVALID`), `from` must be the
+   sealed row exactly (`CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH`), the pin
+   must be `to` (`CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH`) under the expected
+   label (`CUTOVER_IDENTITY_LINK_VERSION_MISMATCH`), the pin must name the
+   desired state's mount (P8's mount codes), and every identity-link consumer
+   must be `od-cr-2` and unported
+   (`CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED`). GO prints
+   `identityRotationAuthorizationToken` beside the run token. It is bound to
+   the seal, the contract, the inputs, the preflight, the rotation document,
+   both labels and the secret version.
+5. `run --execute --confirm <run token> --confirm-identity-rotation <rotation token>`.
+   Without the exact second token the run refuses `CUTOVER_AUTHORIZATION_MISMATCH`
+   (step `identity-rotation`) before any write: a run token alone never
+   rotates. PT-3 still copies the sealed pin row verbatim, asserting
+   `sealed == from`. The next stage, `identity-link-rotation`, moves that one
+   row from `from` to `to` in one transaction and records a checkpoint and a
+   stage receipt. A rerun after a crash finds `to` with this rotation's
+   checkpoint and writes nothing; any other state refuses
+   `CUTOVER_IDENTITY_ROTATION_STATE_INVALID`.
+6. Post-import, the flip gate and the post-live check each re-assert that the
+   target pin is `to` and that the rotation's checkpoint and receipt are
+   complete for this run. `pt8-report.json` adds the rotation document's
+   sha256. A new run (after an abandon and a fresh seal) re-presents the same
+   rotation document, and the new seal must still show the unchanged D1 pin
+   as `from`.
+
+Without `identityLinkRotation`, P8 is unchanged and the new secret's pin is
+refused (`CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`). Never edit the sealed row,
+the target row or the pin by hand to make a check pass. Under the rotated
+label the production host also refuses to compose if any identity-link
+consumer is ported (`IDENTITY_LINK_ROTATION_CONSUMER_PORTED`). Prior Google and
+Apple links cannot be re-established; any future social sign-in starts a new
+identity namespace.
 
 ## H.5 Verifier smoke
 
@@ -861,7 +968,8 @@ noted.
 | `FENCE_NOT_QUIESCENT` | EP-8 verify | A D1 bookmark or the quarantine digest moved inside the window: something wrote after the fence. Find the writer; do not shorten the window |
 | `CUTOVER_SOURCE_BOOKMARK_DRIFT`, `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` | Seal, flip evidence | A source changed after the fence. The seal is void |
 | `CUTOVER_ERASED_PARTICIPANT_PRESENT`, `CUTOVER_PARTICIPANT_ERASURE_PENDING` | Seal, PT-3 | An erased or mid-erasure participant is in the sealed set. Finish the erasure on Cloudflare and re-seal |
-| `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH` | PT-3 | The origin's identity-link secret does not match the sealed pin. Do not rotate it to make the import pass |
+| `CUTOVER_IDENTITY_LINK_SECRET_MISMATCH`, `CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH` | PT-3 | The configured pin, or under round 16 the rotation's `from`, does not match the sealed pin. Rotate only through the recorded [identity-link rotation](#identity-link-rotation-round-16) |
+| `CUTOVER_IDENTITY_ROTATION_STATE_INVALID` | Run, post-import, flip gate, post-live | The target pin is neither the rotation's `from` nor its completed `to` for this run, or (without a rotation) differs from the pin. Something wrote the pin row outside the orchestrator: diagnose, never bypass |
 | `CUTOVER_RUN_NOT_VERIFIED`, `CUTOVER_CONTROLS_DIGEST_MISMATCH` | Finalize | The run is not `verified`, or the controls do not equal the sealed row |
 | `MUTATION_BARRIER_ACTIVE` | Edge | Expected while fenced. Not an error |
 

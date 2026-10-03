@@ -20,6 +20,7 @@ import { identityLinkFingerprint as w2SealFingerprint } from "../postgres-test/f
 import {
   COMPLETE_TRIGGER_POLICY,
   DISPOSITIONS,
+  IDENTITY_LINK_PIN_TABLE,
   KEPT_SESSION_AUTHORITY_TABLES,
   OWNER_FLAGS,
   OWNER_FLAG_PERFORMANCE_ROUTES_RETIRED,
@@ -35,17 +36,29 @@ import {
 } from "./postgres-transfer-coverage.mjs";
 import {
   IDENTITY_LINK_FINGERPRINT_DOMAIN,
+  IDENTITY_LINK_ROTATION_DECISION,
+  IDENTITY_LINK_ROTATION_REASON,
+  IDENTITY_LINK_ROTATION_SCHEMA,
   assertPinMatchesMount,
   assertPinMatchesSealed,
+  assertRotationMatchesSealed,
   buildIdentityLinkPin,
+  buildIdentityLinkRotation,
   identityLinkSecretFingerprint,
+  parseSealedPinFile,
   readSecretFromStream,
   validateIdentityLinkPin,
+  validateIdentityLinkRotation,
 } from "./postgres-identity-link-pin.mjs";
+import { IDENTITY_LINK_CONSUMER_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
 import { PARITY_CLASSES, selectParitySample } from "./postgres-transfer-parity-sample.mjs";
 import {
   DESIRED_STATE_SCHEMA,
   FINALIZE_ORDER,
+  IDENTITY_LINK_ROTATION_STAGE,
+  IDENTITY_ROTATION_AUTHORIZATION_STEP,
+  OWNER_FILES,
+  PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS,
   MIGRATION_FENCE_LOCK_PREFIX,
   PRODUCTION_TRANSFER_ERROR_CODES,
   PRODUCTION_TRANSFER_INPUTS_SCHEMA,
@@ -63,6 +76,7 @@ import {
   readProductionDeployment,
   validateSchedulerEvidence,
   validateTransferInputs,
+  writeIdentityRotation,
 } from "./postgres-production-transfer.mjs";
 import { TRANSFER_STAGES } from "./postgres-transfer-target.mjs";
 import { TELEMETRY_PRODUCTION_DISPOSITIONS } from "./postgres-production-telemetry-modes.mjs";
@@ -134,7 +148,11 @@ test("one disposition per sealed table: every importer's tokens are taken verbat
 });
 
 test("round 12: the kept session routes' tables stay PT-3 imports; the retired social chain is still carried inertly", () => {
-  for (const tableName of [...KEPT_SESSION_AUTHORITY_TABLES, ...RETIRED_SOCIAL_CHAIN_TABLES]) {
+  // The identity-link pin is no kept route's authority (round 16): it is the
+  // continuity record PT-3 imports verbatim and the rotation stage moves.
+  assert.equal(KEPT_SESSION_AUTHORITY_TABLES.includes(IDENTITY_LINK_PIN_TABLE), false);
+  assert.equal(IDENTITY_LINK_PIN_TABLE, "identity_link_secret_configuration");
+  for (const tableName of [...KEPT_SESSION_AUTHORITY_TABLES, IDENTITY_LINK_PIN_TABLE, ...RETIRED_SOCIAL_CHAIN_TABLES]) {
     const entry = DISPOSITIONS.find(item => item.role === "ingestion" && item.table === tableName);
     assert.equal(entry.token, "imported:identity-authority", tableName);
     assert.equal(entry.writer, "runner", tableName);
@@ -186,10 +204,15 @@ test("the emptiness, flag and erasure-job rules refuse with a table name and a c
 test("the stage plan covers PT-1's stages once, in dependency order; waivers are closed", () => {
   assert.deepEqual([...STAGE_PLAN.map(entry => entry.stage)].sort(), [...TRANSFER_STAGES].sort());
   assert.equal(STAGE_PLAN[0].stage, "identity-authority");
+  // Round 16: the pin rotation runs right after PT-3 and before anything else.
+  assert.deepEqual(STAGE_PLAN[1], { stage: IDENTITY_LINK_ROTATION_STAGE, kind: "orchestrator" });
   assert.equal(STAGE_PLAN.at(-1).stage, "post-import");
   assert.deepEqual(stagePrerequisites("identity-authority"), []);
-  assert.deepEqual(stagePrerequisites("pending-registrations").slice(0, 4),
-    ["identity-authority", "legacy-contributions", "telemetry-v1-v11", "typed-legacy"]);
+  assert.deepEqual(stagePrerequisites(IDENTITY_LINK_ROTATION_STAGE), ["identity-authority"]);
+  assert.deepEqual(stagePrerequisites("pending-registrations").slice(0, 5),
+    ["identity-authority", IDENTITY_LINK_ROTATION_STAGE, "legacy-contributions", "telemetry-v1-v11", "typed-legacy"]);
+  // It writes no table receipt: coverage keeps exactly PT-3's one receipt for the pin table.
+  assert.equal(DISPOSITIONS.some(item => item.stage === IDENTITY_LINK_ROTATION_STAGE), false);
   assert.equal(stagePrerequisites("post-import").length, TRANSFER_STAGES.length - 1);
   assert.deepEqual(Object.keys(WAIVABLE).sort(), ["accountless-retention", "analytics-community-history", "analytics-expectation",
     "analytics-history", "objects", "performance"]);
@@ -209,7 +232,7 @@ test("the merged trigger policy covers every importer and the disposition policy
     "community_aggregate_exclusions", "collection_controls"]) {
     assert.ok(Object.hasOwn(COMPLETE_TRIGGER_POLICY, tableName), tableName);
   }
-  assert.equal(dispositionPolicySha256(), "003240c669857e38f80f8f369322d68ed1f31b14d0d337f8f73f51023c7ec6bc",
+  assert.equal(dispositionPolicySha256(), "e05ac1fd3821b67ff70e0dd496ecf5719f7e7494f2a020eb08a9e2c17fb5bfbb",
     "a reviewed change to dispositions, rules, flags, the stage plan or the trigger policy must update this pin");
 });
 
@@ -278,6 +301,210 @@ test("P8 binds the pin to the secret and numeric version the production service 
     { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" }, "another version than the template mounts");
   assert.throws(() => assertPinMatchesMount(pin, { secretName: "tibotattle-identity-link", version: "3" }),
     { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" }, "another secret than the template mounts");
+});
+
+// ---------------------------------------------------------------------------
+// Round 16: rotate the lost IDENTITY_LINK_SECRET at the cutover.
+
+const NEW_SECRET = "ept8-check-synthetic-rotated-identity-link-secret-0";
+const OLD_FINGERPRINT = identityLinkSecretFingerprint(SECRET);
+const SEALED_ROW = Object.freeze({ key_version: "production-v1", secret_fingerprint: OLD_FINGERPRINT });
+
+function rotationFixture(overrides = {}) {
+  return buildIdentityLinkRotation({ secret: NEW_SECRET, sealedPin: { keyVersion: "production-v1",
+    secretFingerprint: OLD_FINGERPRINT }, fromKeyVersion: "production-v1", toKeyVersion: "production-v2",
+  secretName: "IDENTITY_LINK_SECRET", secretVersion: "1", consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
+  computedAt: "2026-10-03T00:00:00.000Z", ...overrides });
+}
+
+test("round 16: the rotation document binds the sealed pin to the new pin, closed and tamper-evident", () => {
+  const { pin, rotation } = rotationFixture();
+  assert.equal(pin.keyVersion, "production-v2");
+  assert.equal(pin.secretFingerprint, identityLinkSecretFingerprint(NEW_SECRET));
+  assert.deepEqual(JSON.parse(JSON.stringify(rotation)), {
+    schema: IDENTITY_LINK_ROTATION_SCHEMA,
+    from: { keyVersion: "production-v1", secretFingerprint: OLD_FINGERPRINT },
+    to: { keyVersion: "production-v2", secretFingerprint: pin.secretFingerprint, secretName: "IDENTITY_LINK_SECRET",
+      secretVersion: "1" },
+    reason: IDENTITY_LINK_ROTATION_REASON,
+    decision: IDENTITY_LINK_ROTATION_DECISION,
+    retiredConsumerRoutes: [...IDENTITY_LINK_CONSUMER_ROUTE_IDS],
+    computedAt: "2026-10-03T00:00:00.000Z",
+  });
+  assert.equal(JSON.stringify(rotation).includes(NEW_SECRET), false, "the secret never enters the document");
+  assert.equal(IDENTITY_LINK_ROTATION_DECISION, "owner-decisions-2026-10-02 round 16");
+  const valid = { consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS };
+  assert.deepEqual(validateIdentityLinkRotation(JSON.parse(JSON.stringify(rotation)), valid), rotation);
+  // Tampering with any field, the key set or the consumer list is refused.
+  const copy = () => JSON.parse(JSON.stringify(rotation));
+  for (const [label, mutate] of [
+    ["extra key", value => { value.extra = 1; }],
+    ["schema", value => { value.schema = "tibotattle-identity-link-rotation-v2"; }],
+    ["reason", value => { value.reason = "routine"; }],
+    ["decision", value => { value.decision = "round 15"; }],
+    ["from extra", value => { value.from.recordedAt = "2026-10-03T00:00:00.000Z"; }],
+    ["to without version", value => { delete value.to.secretVersion; }],
+    ["to latest", value => { value.to.secretVersion = "latest"; }],
+    ["same label", value => { value.to.keyVersion = "production-v1"; }],
+    ["same secret", value => { value.to.secretFingerprint = OLD_FINGERPRINT; }],
+    ["a consumer dropped", value => { value.retiredConsumerRoutes.pop(); }],
+    ["consumers reordered", value => { value.retiredConsumerRoutes.reverse(); }],
+    ["bad instant", value => { value.computedAt = "2026-10-03"; }],
+  ]) {
+    const value = copy();
+    mutate(value);
+    assert.throws(() => validateIdentityLinkRotation(value, valid), { code: "CUTOVER_IDENTITY_ROTATION_INVALID" }, label);
+  }
+  // A "rotation" to the same secret, or from a label the sealed pin does not carry, is refused.
+  assert.throws(() => buildIdentityLinkRotation({ secret: SECRET, sealedPin: { keyVersion: "production-v1",
+    secretFingerprint: OLD_FINGERPRINT }, fromKeyVersion: "production-v1", toKeyVersion: "production-v2",
+  secretName: "IDENTITY_LINK_SECRET", secretVersion: "1", consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
+  computedAt: "2026-10-03T00:00:00.000Z" }), { code: "CUTOVER_IDENTITY_ROTATION_INVALID" });
+  assert.throws(() => rotationFixture({ fromKeyVersion: "production-v0" }), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  assert.throws(() => rotationFixture({ secretVersion: "latest" }), { code: "CUTOVER_IDENTITY_PIN_INVALID" });
+});
+
+test("round 16: P8-R needs the rotation; the new pin alone, a wrong label or another from never pass", () => {
+  const { pin, rotation } = rotationFixture();
+  const expected = { expectedKeyVersion: "production-v2" };
+  assert.deepEqual(assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], expected),
+    { fromKeyVersion: "production-v1", toKeyVersion: "production-v2", toSecretVersion: "1" });
+  // The new secret's pin WITHOUT the rotation document is the unchanged P8: refused.
+  assert.throws(() => assertPinMatchesSealed(pin, [SEALED_ROW], expected), { code: "CUTOVER_IDENTITY_LINK_SECRET_MISMATCH" });
+  assert.throws(() => assertPinMatchesSealed(pin, [SEALED_ROW], { expectedKeyVersion: "production-v1" }),
+    { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" });
+  // A wrong key version.
+  for (const label of ["production-v1", "production-v3"]) {
+    assert.throws(() => assertRotationMatchesSealed(rotation, pin, [SEALED_ROW], { expectedKeyVersion: label }),
+      { code: "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH" }, label);
+  }
+  // The sealed row is not the rotation's from.
+  for (const row of [{ ...SEALED_ROW, secret_fingerprint: "f".repeat(64) }, { ...SEALED_ROW, key_version: "production-v0" }]) {
+    assert.throws(() => assertRotationMatchesSealed(rotation, pin, [row], expected),
+      { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  }
+  assert.throws(() => assertRotationMatchesSealed(rotation, pin, [], expected), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  // The pin is not the rotation's to: another secret, or another Secret Manager version.
+  const other = buildIdentityLinkPin({ secret: `${NEW_SECRET}x`, keyVersion: "production-v2", secretName: "IDENTITY_LINK_SECRET",
+    secretVersion: "1", computedAt: "2026-10-03T00:00:00.000Z" });
+  assert.throws(() => assertRotationMatchesSealed(rotation, other, [SEALED_ROW], expected),
+    { code: "CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH" });
+  const version2 = buildIdentityLinkPin({ secret: NEW_SECRET, keyVersion: "production-v2", secretName: "IDENTITY_LINK_SECRET",
+    secretVersion: "2", computedAt: "2026-10-03T00:00:00.000Z" });
+  assert.throws(() => assertRotationMatchesSealed(rotation, version2, [SEALED_ROW], expected),
+    { code: "CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH" });
+  // The mount must still name the pin's numeric version.
+  assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: null }),
+    { code: "CUTOVER_IDENTITY_LINK_MOUNT_UNPINNED" });
+  assert.throws(() => assertPinMatchesMount(pin, { secretName: "IDENTITY_LINK_SECRET", version: "2" }),
+    { code: "CUTOVER_IDENTITY_LINK_MOUNT_MISMATCH" });
+  // The consumer refusal's default ported set is everything a registry may port: no consumer is in it.
+  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.includes(id), false, id);
+  assert.equal(PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS.length, 36, "21 scope, 9 contested, 6 admin");
+});
+
+test("round 16: the sealed-pin file is the wrangler SELECT of one D1 row, nothing more", () => {
+  const row = { key_version: "production-v1", secret_fingerprint: OLD_FINGERPRINT };
+  const wrangler = [{ results: [{ ...row, singleton: 1, recorded_at: "2026-01-01T00:00:00.000Z" }], success: true,
+    meta: { served_by: "synthetic" } }];
+  for (const value of [wrangler, row]) {
+    assert.deepEqual(parseSealedPinFile(Buffer.from(JSON.stringify(value))),
+      { keyVersion: "production-v1", secretFingerprint: OLD_FINGERPRINT });
+  }
+  for (const value of [[], [{ results: [row, row], success: true }], [{ results: [row], success: false }],
+    [{ results: [] , success: true }], { ...row, secret: "x" }, { ...row, secret_fingerprint: "nope" },
+    { ...row, singleton: 2 }, { key_version: "production-v1" }, "text"]) {
+    assert.throws(() => parseSealedPinFile(Buffer.from(JSON.stringify(value))),
+      { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" }, JSON.stringify(value));
+  }
+  assert.throws(() => parseSealedPinFile(Buffer.from("{")), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  assert.throws(() => parseSealedPinFile(Buffer.alloc(70 * 1024, 0x20)), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+});
+
+test("round 16: identity-rotate-pin writes the two 0400 documents once, from stdin only, and prints no secret", async () => {
+  const { realpath, stat } = await import("node:fs/promises");
+  await mkdir(join(scratch, "rotate-owner"), { mode: 0o700 });
+  const directory = await realpath(join(scratch, "rotate-owner"));
+  const sealedPinFile = join(directory, "sealed-pin.json");
+  await writeFile(sealedPinFile, JSON.stringify([{ results: [{ key_version: "production-v1",
+    secret_fingerprint: OLD_FINGERPRINT }], success: true, meta: {} }]), { mode: 0o400 });
+  const options = { ownerDirectory: directory, sealedPinFile, fromKeyVersion: "production-v1",
+    toKeyVersion: "production-v2", secretName: "IDENTITY_LINK_SECRET", secretVersion: "1",
+    now: () => new Date("2026-10-03T00:00:00.000Z") };
+  // A trailing newline (an `echo |` store) is refused before anything is written.
+  await assert.rejects(writeIdentityRotation({ ...options, stream: Readable.from([`${NEW_SECRET}\n`]) }),
+    { code: "CUTOVER_IDENTITY_LINK_SECRET_INVALID" });
+  await assert.rejects(writeIdentityRotation({ ...options, fromKeyVersion: "production-v0",
+    stream: Readable.from([NEW_SECRET]) }), { code: "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH" });
+  const printed = await writeIdentityRotation({ ...options, stream: Readable.from([NEW_SECRET]) });
+  assert.deepEqual(Object.keys(printed).sort(), ["fromKeyVersion", "pinSha256", "rotationSha256", "schema", "secretVersion",
+    "step", "toKeyVersion"]);
+  assert.equal(JSON.stringify(printed).includes(NEW_SECRET), false);
+  assert.equal(JSON.stringify(printed).includes(identityLinkSecretFingerprint(NEW_SECRET)), false, "no fingerprint printed");
+  const { pin, rotation } = rotationFixture();
+  assert.deepEqual(JSON.parse(await readFile(join(directory, OWNER_FILES.pin), "utf8")), JSON.parse(JSON.stringify(pin)));
+  assert.deepEqual(JSON.parse(await readFile(join(directory, OWNER_FILES.rotation), "utf8")),
+    JSON.parse(JSON.stringify(rotation)));
+  for (const name of [OWNER_FILES.pin, OWNER_FILES.rotation]) {
+    assert.equal((await stat(join(directory, name))).mode & 0o777, 0o400, name);
+  }
+  // Once: a second run refuses before reading the secret.
+  await assert.rejects(writeIdentityRotation({ ...options, stream: Readable.from([NEW_SECRET]) }),
+    { code: "CUTOVER_RECEIPT_CONFLICT" });
+});
+
+test("round 16: the inputs may declare a rotation (closed), and its token is a separate authorization", () => {
+  const declared = validateTransferInputs(inputs({ expectedIdentityKeyVersion: "production-v2",
+    identityLinkRotation: { rotationSha256: "5".repeat(64) } }));
+  assert.deepEqual({ ...declared.identityLinkRotation }, { rotationSha256: "5".repeat(64) });
+  assert.equal(Object.hasOwn(validateTransferInputs(inputs()), "identityLinkRotation"), false);
+  for (const bad of [{ identityLinkRotation: {} }, { identityLinkRotation: { rotationSha256: "x" } },
+    { identityLinkRotation: { rotationSha256: "5".repeat(64), mode: "skip" } }, { identityLinkRotation: null }]) {
+    assert.throws(() => validateTransferInputs(inputs(bad)), { code: "CUTOVER_INPUTS_INVALID" }, JSON.stringify(bad));
+  }
+  assert.equal(IDENTITY_ROTATION_AUTHORIZATION_STEP, "identity-rotation");
+  const bindings = { sealId: SEAL_ID, contractId: "prod-target-1", inputsSha256: "c".repeat(64), preflightSha256: "e".repeat(64) };
+  const rotationBindings = { ...bindings, rotationSha256: "5".repeat(64), fromKeyVersion: "production-v1",
+    toKeyVersion: "production-v2", toSecretVersion: "1" };
+  const token = authorizationToken(IDENTITY_ROTATION_AUTHORIZATION_STEP, rotationBindings);
+  assert.notEqual(token, authorizationToken("run", bindings), "the run token never rotates");
+  for (const changed of [{ rotationSha256: "6".repeat(64) }, { toKeyVersion: "production-v3" }, { toSecretVersion: "2" },
+    { fromKeyVersion: "production-v0" }, { preflightSha256: "1".repeat(64) }]) {
+    assert.notEqual(authorizationToken(IDENTITY_ROTATION_AUTHORIZATION_STEP, { ...rotationBindings, ...changed }), token);
+  }
+  // The CLI: the rotation token is a run flag that needs --execute; the owner step needs every flag.
+  assert.equal(parseTransferArguments(["run", "--owner-dir", "/o", "--execute", "--confirm", "a",
+    "--confirm-identity-rotation", "b"])["--confirm-identity-rotation"], "b");
+  assert.throws(() => parseTransferArguments(["run", "--owner-dir", "/o", "--confirm-identity-rotation", "b"]),
+    { code: "CUTOVER_EXECUTE_REQUIRED" });
+  assert.throws(() => parseTransferArguments(["preflight", "--owner-dir", "/o", "--confirm-identity-rotation", "b"]),
+    { code: "CUTOVER_ARGUMENT_INVALID" });
+  const rotate = ["identity-rotate-pin", "--owner-dir", "/o", "--from-key-version", "production-v1", "--to-key-version",
+    "production-v2", "--secret-name", "IDENTITY_LINK_SECRET", "--secret-version", "1", "--sealed-pin-file", "/o/pin.json"];
+  assert.equal(parseTransferArguments(rotate).command, "identity-rotate-pin");
+  for (let index = 3; index < rotate.length; index += 2) {
+    const without = [...rotate.slice(0, index), ...rotate.slice(index + 2)];
+    assert.throws(() => parseTransferArguments(without), { code: "CUTOVER_ARGUMENT_INVALID" }, rotate[index]);
+  }
+  assert.throws(() => parseTransferArguments([...rotate, "--secret", "x"]), { code: "CUTOVER_ARGUMENT_INVALID" });
+});
+
+test("round 16: the kept session, renew and disconnect ports and the lifecycle pass read no identity-link state", async () => {
+  for (const file of ["postgres-personal-session.ts", "postgres-personal-devices.ts", "postgres-device-pairing.ts",
+    "postgres-device-pairing-claim.ts", "postgres-device-credential-renewal.ts", "postgres-device-disconnect.ts",
+    "postgres-device-bearer-auth.ts", "postgres-lifecycle-pass.ts"]) {
+    const source = await readFile(new URL(`../src/${file}`, import.meta.url), "utf8");
+    for (const term of ["IDENTITY_LINK_SECRET", "identity_link_secret_configuration", "identity_link_key",
+      "identity_cooldown_digest", "identityLink"]) {
+      assert.equal(source.includes(term), false, `${file} mentions ${term}`);
+    }
+  }
+  // The production maintenance composition reports the cooldown items as constants, no identity phase.
+  const host = await readFile(new URL("../cloud-run/postgres-production-host.mjs", import.meta.url), "utf8");
+  const maintenance = host.slice(host.indexOf("export function createLifecyclePassMaintenance("),
+    host.indexOf("function isPool("));
+  assert.ok(maintenance.includes("identityReenrollmentCooldownPurgeComplete: true"));
+  assert.equal(/IDENTITY_LINK|identity_link|identityLink/u.test(maintenance), false);
 });
 
 test("the committed production desired state is read as data: schema, environment, project, the scheduler set and the closed mount", async () => {

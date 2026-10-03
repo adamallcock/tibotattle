@@ -12,6 +12,14 @@
 //
 //   identity-pin      OWNER ONLY. Reads IDENTITY_LINK_SECRET from stdin and
 //                     writes identity-pin.json (0400). No database.
+//   identity-rotate-pin
+//                     OWNER ONLY (round 16: the production secret is lost).
+//                     Reads the NEW IDENTITY_LINK_SECRET from stdin and the
+//                     sealed D1 pin from --sealed-pin-file; writes
+//                     identity-pin.json (the new label) and
+//                     identity-rotation.json (0400, once each). No database.
+//                     The inputs then declare identityLinkRotation, and the
+//                     run needs a second token (--confirm-identity-rotation).
 //   target-check      Read-only, before the fence: contract, PostgreSQL 17,
 //                     migration tail, empty target, transfer-login memberships,
 //                     trigger-policy coverage, the frozen-read table.
@@ -112,12 +120,23 @@ import {
 } from "./postgres-identity-authority-transfer.mjs";
 import {
   IDENTITY_LINK_PIN_SCHEMA,
+  IDENTITY_LINK_ROTATION_SCHEMA,
   assertPinMatchesMount,
   assertPinMatchesSealed,
+  assertRotationMatchesSealed,
   buildIdentityLinkPin,
+  buildIdentityLinkRotation,
+  parseSealedPinFile,
   readSecretFromStream,
   validateIdentityLinkPin,
+  validateIdentityLinkRotation,
 } from "./postgres-identity-link-pin.mjs";
+import {
+  IDENTITY_LINK_CONSUMER_ROUTE_IDS,
+  PRODUCTION_ROUTE_CLASSES,
+  PRODUCTION_ROUTE_TABLE,
+  assertIdentityLinkConsumersRetired,
+} from "../cloud-run/postgres-production-registry.mjs";
 import {
   OWNER_FLAG_ACCEPT_ORPHAN_REGISTRATION_CLEARING,
   checkPendingObjectTransferGuard,
@@ -161,6 +180,7 @@ import {
   dropTransferStagingRelations,
   markLive,
   openProductionTransferTarget,
+  recordCheckpoint,
   requireImportingRun,
   restoreSealedCollectionControls,
   scrubCheckpointCursors,
@@ -221,6 +241,7 @@ const PUBLISHED_DAILY_TABLE = "analytics_v2_published_daily";
 export const OWNER_FILES = Object.freeze({
   inputs: "pt8-inputs.json",
   pin: "identity-pin.json",
+  rotation: "identity-rotation.json",
   preflight: "preflight.json",
   postImport: "post-import.json",
   release: "release-controls.json",
@@ -233,6 +254,24 @@ export const OWNER_FILES = Object.freeze({
 
 /** The steps that change the target, each needing --execute and its exact --confirm token. */
 export const PROTECTED_STEPS = Object.freeze(["run", "release-controls", "mark-live", "abandon"]);
+/**
+ * Round 16: a run whose inputs declare an identity-link rotation also needs
+ * this second, separately bound token (--confirm-identity-rotation). The run
+ * token alone can never rotate the pin.
+ */
+export const IDENTITY_ROTATION_AUTHORIZATION_STEP = "identity-rotation";
+const AUTHORIZATION_STEPS = Object.freeze([...PROTECTED_STEPS, IDENTITY_ROTATION_AUTHORIZATION_STEP]);
+/** PT-8's own stage that moves the imported pin to the rotated label, and its checkpoint. */
+export const IDENTITY_LINK_ROTATION_STAGE = "identity-link-rotation";
+const IDENTITY_LINK_ROTATION_CHECKPOINT = "identity-link-pin";
+/**
+ * Every route a production registry may port (the classes it admits); the
+ * P8-R consumer refusal checks the identity-link consumers against it. The
+ * library API (the synthetic spec) may inject another set; the CLI never does.
+ */
+export const PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS = Object.freeze(PRODUCTION_ROUTE_TABLE
+  .filter(route => ![PRODUCTION_ROUTE_CLASSES.OD_CR_2, PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
+  .map(route => route.id));
 /** The finalize order (design sections 1 and 8). */
 export const FINALIZE_ORDER = Object.freeze([
   "preflight", "run", "flip-1", "release-controls", "flip-2", "flip-gate", "mark-live", "post-live-check", "report",
@@ -253,6 +292,9 @@ export const PRODUCTION_TRANSFER_ERROR_CODES = Object.freeze([
   "CUTOVER_EXECUTE_REQUIRED",
   "CUTOVER_FLIP_EVIDENCE_INVALID",
   "CUTOVER_FLIP_EVIDENCE_STALE",
+  "CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED",
+  "CUTOVER_IDENTITY_ROTATION_INVALID",
+  "CUTOVER_IDENTITY_ROTATION_STATE_INVALID",
   "CUTOVER_INPUTS_INVALID",
   "CUTOVER_INTERIM_READ_FACTS_INVALID",
   "CUTOVER_INTERIM_READ_NOT_LOADED",
@@ -356,7 +398,7 @@ function quote(name) {
  * to the seal, the contract, the inputs or the step's evidence changes it.
  */
 export function authorizationToken(step, bindings) {
-  if (!PROTECTED_STEPS.includes(step) || !record(bindings)) fail("CUTOVER_ARGUMENT_INVALID", { step });
+  if (!AUTHORIZATION_STEPS.includes(step) || !record(bindings)) fail("CUTOVER_ARGUMENT_INVALID", { step });
   for (const [key, value] of Object.entries(bindings)) {
     if (!/^[a-z][A-Za-z0-9]{0,40}$/u.test(key) || (typeof value !== "string" && value !== null)) {
       fail("CUTOVER_ARGUMENT_INVALID", { step });
@@ -417,12 +459,22 @@ function absolutePath(value, code = "CUTOVER_INPUTS_INVALID") {
   return value;
 }
 
-/** Validate a parsed pt8-inputs.json (closed keys). */
+/**
+ * Validate a parsed pt8-inputs.json (closed keys). identityLinkRotation is
+ * the one optional key: { rotationSha256 }, the sha256 of the owner
+ * directory's identity-rotation.json (round 16). Its presence switches P8 to
+ * P8-R and requires the identity-rotation token at `run`.
+ */
 export function validateTransferInputs(value) {
   const keys = ["schema", "contractId", "sealId", "sealManifestPath", "expectedSourceCommit", "fenceReceiptSha256",
     "expectedIdentityKeyVersion", "deletionDigestProjection", "interimPublicRead", "schedulerEvidencePath",
     "ownerFlags", "allowedRoleMembers"];
-  exactKeys(value, keys, "CUTOVER_INPUTS_INVALID");
+  const rotationDeclared = record(value) && Object.hasOwn(value, "identityLinkRotation");
+  exactKeys(value, rotationDeclared ? [...keys, "identityLinkRotation"] : keys, "CUTOVER_INPUTS_INVALID");
+  if (rotationDeclared) {
+    exactKeys(value.identityLinkRotation, ["rotationSha256"], "CUTOVER_INPUTS_INVALID");
+    sha(value.identityLinkRotation.rotationSha256, "CUTOVER_INPUTS_INVALID");
+  }
   if (value.schema !== PRODUCTION_TRANSFER_INPUTS_SCHEMA || typeof value.contractId !== "string"
       || !CONTRACT_ID.test(value.contractId) || typeof value.expectedSourceCommit !== "string"
       || !COMMIT.test(value.expectedSourceCommit) || typeof value.expectedIdentityKeyVersion !== "string"
@@ -455,7 +507,8 @@ export function validateTransferInputs(value) {
     fail("CUTOVER_INPUTS_INVALID");
   }
   return Object.freeze({ ...value, ownerFlags: Object.freeze([...value.ownerFlags].sort()),
-    allowedRoleMembers: Object.freeze([...value.allowedRoleMembers].sort()) });
+    allowedRoleMembers: Object.freeze([...value.allowedRoleMembers].sort()),
+    ...(rotationDeclared ? { identityLinkRotation: Object.freeze({ ...value.identityLinkRotation }) } : {}) });
 }
 
 async function readOwnerJson(path, code) {
@@ -516,10 +569,12 @@ async function journal(context, step, event, details = {}) {
  */
 export async function createTransferContext({ ownerDirectory, pool, now = () => new Date(), onStep = null,
   runnerOptions = {}, forbiddenRoots = undefined, rootDirectory = undefined,
-  desiredStatePath = join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE) } = {}) {
+  desiredStatePath = join(WORKER_ROOT, PRODUCTION_DESIRED_STATE_FILE),
+  portedRouteIds = PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS } = {}) {
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
   if (onStep !== null && typeof onStep !== "function") fail("CUTOVER_ARGUMENT_INVALID");
   absolutePath(desiredStatePath, "CUTOVER_ARGUMENT_INVALID");
+  if (!Array.isArray(portedRouteIds) || portedRouteIds.some(id => typeof id !== "string")) fail("CUTOVER_ARGUMENT_INVALID");
   if (!record(runnerOptions) || Object.keys(runnerOptions).some(key => !["pageRows", "pageBytes", "onPage"].includes(key))) {
     fail("CUTOVER_ARGUMENT_INVALID");
   }
@@ -535,6 +590,7 @@ export async function createTransferContext({ ownerDirectory, pool, now = () => 
     runnerOptions: Object.freeze({ ...runnerOptions }),
     rootDirectory,
     desiredStatePath,
+    portedRouteIds: Object.freeze([...portedRouteIds]),
     path: name => join(directory, OWNER_FILES[name]),
   });
 }
@@ -754,6 +810,45 @@ async function readPin(context) {
   return { pin: validateIdentityLinkPin(value), sha256 };
 }
 
+/**
+ * The declared identity-link rotation (round 16), or null when the inputs
+ * declare none. The document must hash to the inputs' rotationSha256 (it is
+ * tamper-evident: the run token binds the inputs, which bind this digest)
+ * and be the closed rotation schema naming exactly the registry's consumer
+ * routes; anything else refuses CUTOVER_IDENTITY_ROTATION_INVALID.
+ */
+async function readRotation(context) {
+  const declared = context.inputs.identityLinkRotation;
+  if (declared === undefined) return null;
+  const { value, sha256 } = await readOwnerJson(context.path("rotation"), "CUTOVER_IDENTITY_ROTATION_INVALID");
+  if (sha256 !== declared.rotationSha256) fail("CUTOVER_IDENTITY_ROTATION_INVALID", { check: "P8" });
+  return Object.freeze({ rotation: validateIdentityLinkRotation(value, { consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS }),
+    rotationSha256: sha256 });
+}
+
+/**
+ * P8-R's consumer refusal: a rotation is admitted only while every route
+ * that consumes the identity-link pin, link keys or cooldown digests is
+ * od-cr-2 in the registry and outside the ported set (round 12 retires them
+ * all). The PostgreSQL lifecycle pass reads no identity secret; the check
+ * pins that statically.
+ */
+function identityLinkConsumersCheck(portedRouteIds) {
+  try {
+    return assertIdentityLinkConsumersRetired([...portedRouteIds]);
+  } catch {
+    return fail("CUTOVER_IDENTITY_ROTATION_CONSUMER_PORTED", { check: "P8" });
+  }
+}
+
+/** The identity-rotation token: bound to the seal, contract, inputs, preflight and the rotation document. */
+function identityRotationToken(context, preflightSha256, { rotation, rotationSha256 }) {
+  return authorizationToken(IDENTITY_ROTATION_AUTHORIZATION_STEP, { sealId: context.inputs.sealId,
+    contractId: context.inputs.contractId, inputsSha256: context.inputsSha256, preflightSha256, rotationSha256,
+    fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion,
+    toSecretVersion: rotation.to.secretVersion });
+}
+
 function controlsCheck(database) {
   const rows = sealedRows(database, "SELECT upload_registration_enabled, processing_enabled FROM collection_controls");
   if (rows.length !== 1 || (rows[0].upload_registration_enabled !== 1n && rows[0].processing_enabled !== 1n)) {
@@ -920,6 +1015,33 @@ export async function targetCheck({ pool, contractId, rootDirectory = undefined 
 // ---------------------------------------------------------------------------
 // Identity pin (owner only).
 
+/**
+ * OWNER ONLY (round 16). The NEW secret from stdin, the sealed D1 pin from
+ * the --sealed-pin-file (read-only wrangler SELECT output). Writes
+ * identity-pin.json for the new secret under `toKeyVersion` and
+ * identity-rotation.json, each 0400 and once. Prints only the labels, the
+ * version number and the two files' sha256.
+ */
+export async function writeIdentityRotation({ ownerDirectory, stream, sealedPinFile, fromKeyVersion, toKeyVersion,
+  secretName, secretVersion, now = () => new Date(), forbiddenRoots = undefined }) {
+  const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
+  const sealedPin = parseSealedPinFile(await readPrivateFile(absolutePath(sealedPinFile, "CUTOVER_ARGUMENT_INVALID"),
+    64 * 1024, "CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH"));
+  // Both documents are written once: refuse before either exists half-made.
+  for (const name of [OWNER_FILES.pin, OWNER_FILES.rotation]) {
+    if (await fileExists(join(directory, name))) fail("CUTOVER_RECEIPT_CONFLICT", { step: "identity-rotate-pin" });
+  }
+  const secret = await readSecretFromStream(stream);
+  const { pin, rotation } = buildIdentityLinkRotation({ secret, sealedPin, fromKeyVersion, toKeyVersion, secretName,
+    secretVersion, consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS, computedAt: now().toISOString() });
+  const pinSha256 = await writePrivateFileOnce(join(directory, OWNER_FILES.pin), `${canonicalJson(pin)}\n`, 0o400);
+  const rotationSha256 = await writePrivateFileOnce(join(directory, OWNER_FILES.rotation), `${canonicalJson(rotation)}\n`,
+    0o400);
+  return Object.freeze({ schema: IDENTITY_LINK_ROTATION_SCHEMA, step: "identity-rotate-pin",
+    fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion, secretVersion: rotation.to.secretVersion,
+    pinSha256, rotationSha256 });
+}
+
 export async function writeIdentityPin({ ownerDirectory, stream, keyVersion, secretName, secretVersion,
   now = () => new Date(), forbiddenRoots = undefined }) {
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
@@ -960,13 +1082,27 @@ export async function runPreflight(context) {
     // committed production desired state names), P9 controls.
     checks.P7 = bootstrapCheck(ingestion);
     const { pin, sha256: pinSha256 } = await readPin(context);
-    const pinned = assertPinMatchesSealed(pin, sealedRows(ingestion,
-      "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration"),
-    { expectedKeyVersion: context.inputs.expectedIdentityKeyVersion });
+    const sealedPinRows = sealedRows(ingestion, "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration");
+    const declared = await readRotation(context);
     const deployment = await readProductionDeployment(context.desiredStatePath);
-    const mounted = assertPinMatchesMount(pin, deployment.identityLinkMount);
-    checks.P8 = Object.freeze({ pinSha256, keyVersion: pinned.keyVersion, secretVersion: mounted.secretVersion,
-      mountBound: true });
+    if (declared === null) {
+      // P8: the pin is the sealed row, unchanged (no rotation without its document).
+      const pinned = assertPinMatchesSealed(pin, sealedPinRows,
+        { expectedKeyVersion: context.inputs.expectedIdentityKeyVersion });
+      const mounted = assertPinMatchesMount(pin, deployment.identityLinkMount);
+      checks.P8 = Object.freeze({ pinSha256, keyVersion: pinned.keyVersion, secretVersion: mounted.secretVersion,
+        mountBound: true });
+    } else {
+      // P8-R (round 16): from == the sealed row, the pin == to, the mount,
+      // and every identity-link consumer retired.
+      const rotated = assertRotationMatchesSealed(declared.rotation, pin, sealedPinRows,
+        { expectedKeyVersion: context.inputs.expectedIdentityKeyVersion });
+      const mounted = assertPinMatchesMount(pin, deployment.identityLinkMount);
+      const consumersRetired = identityLinkConsumersCheck(context.portedRouteIds);
+      checks.P8 = Object.freeze({ pinSha256, keyVersion: rotated.toKeyVersion, secretVersion: mounted.secretVersion,
+        mountBound: true, rotation: Object.freeze({ rotationSha256: declared.rotationSha256,
+          fromKeyVersion: rotated.fromKeyVersion, toKeyVersion: rotated.toKeyVersion, consumersRetired }) });
+    }
     checks.P9 = controlsCheck(ingestion);
     // P10 target (open refuses a non-empty target unless this seal resumes).
     const handle = await openHandle(context);
@@ -991,9 +1127,12 @@ export async function runPreflight(context) {
   });
   const preflightSha256 = await writeReceiptOnce(context.path("preflight"), result);
   await journal(context, "preflight", "go", { preflightSha256 });
+  const declared = await readRotation(context);
   return Object.freeze({ verdict: "GO", preflightSha256, runAuthorizationToken: authorizationToken("run",
     { sealId: context.inputs.sealId, contractId: context.inputs.contractId, inputsSha256: context.inputsSha256,
-      preflightSha256 }), checks: result.checks });
+      preflightSha256 }),
+  ...(declared === null ? {} : { identityRotationAuthorizationToken: identityRotationToken(context, preflightSha256, declared) }),
+  checks: result.checks });
 }
 
 async function readPreflight(context) {
@@ -1092,16 +1231,22 @@ async function runOwnerLifecycleVerify(context, handle, sealed) {
   return Object.freeze({ stage, ownerRevisions: revisions.sourceRows });
 }
 
-async function runStage(context, handle, sealed, entry) {
+async function runStage(context, handle, sealed, entry, rotation) {
   const base = { handle, sealManifestPath: context.inputs.sealManifestPath, ...context.runnerOptions };
   if (entry.kind === "waiver") return runWaiver(context, handle, sealed, entry);
   await assertPrerequisites(handle, entry.stage);
   if (entry.stage === "owner-lifecycle-verify") return runOwnerLifecycleVerify(context, handle, sealed);
+  if (entry.stage === IDENTITY_LINK_ROTATION_STAGE) return runIdentityLinkRotation(context, handle, rotation);
   let result;
   if (entry.stage === "identity-authority") {
     const { pin } = await readPin(context);
-    result = await runIdentityAuthorityTransfer({ ...base,
-      identityLinkPin: { keyVersion: pin.keyVersion, secretFingerprint: pin.secretFingerprint } });
+    // Under a rotation PT-3 asserts sealed == rotation.from (the new pin can
+    // never equal the sealed row) and still copies the row verbatim; the
+    // rotation itself is the next stage.
+    result = await runIdentityAuthorityTransfer({ ...base, identityLinkPin: rotation === null
+      ? { keyVersion: pin.keyVersion, secretFingerprint: pin.secretFingerprint }
+      : { mode: "rotate", sealedPin: { keyVersion: rotation.rotation.from.keyVersion,
+        secretFingerprint: rotation.rotation.from.secretFingerprint }, rotationSha256: rotation.rotationSha256 } });
   } else if (entry.stage === "legacy-contributions") {
     result = await runLegacyContributionsProduction(base);
   } else if (entry.stage === "pending-registrations") {
@@ -1113,6 +1258,116 @@ async function runStage(context, handle, sealed, entry) {
     fail("CUTOVER_ARGUMENT_INVALID", { stage: entry.stage });
   }
   return Object.freeze({ stage: entry.stage, receiptSha256: typeof result?.receiptSha256 === "string" ? result.receiptSha256 : null });
+}
+
+// ---------------------------------------------------------------------------
+// Round 16: the identity-link rotation stage and its continuity checks.
+
+const PIN_INSTANT = `to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+
+/** The target's singleton pin row and this run's rotation checkpoint, inside the caller's transaction. */
+async function readIdentityLinkState(client, handle, { lock = "" } = {}) {
+  const { rows } = await client.query(`SELECT key_version, secret_fingerprint, ${PIN_INSTANT} AS recorded_at
+    FROM ${quote(handle.primarySchema)}.identity_link_secret_configuration WHERE singleton = 1 ${lock}`);
+  const { rows: checkpoints } = await client.query(`SELECT checkpoint.state, checkpoint.row_count::text AS row_count,
+      checkpoint.prefix_chain_sha256
+    FROM ${TRANSFER_CONTROL_SCHEMA}.transfer_checkpoints checkpoint
+    JOIN ${TRANSFER_CONTROL_SCHEMA}.transfer_runs run ON run.run_id = checkpoint.run_id
+   WHERE run.seal_manifest_sha256 = $1 AND run.contract_id = $2 AND run.state <> 'abandoned'
+     AND checkpoint.stage = $3 AND checkpoint.checkpoint_name = $4`,
+  [handle.sealManifestSha256, handle.contractId, IDENTITY_LINK_ROTATION_STAGE, IDENTITY_LINK_ROTATION_CHECKPOINT]);
+  return { row: rows.length === 1 ? rows[0] : null, rows: rows.length, checkpoint: checkpoints[0] ?? null };
+}
+
+const pinEquals = (row, pin) => row !== null && row.key_version === pin.keyVersion
+  && row.secret_fingerprint === pin.secretFingerprint;
+
+/**
+ * The 'identity-link-rotation' stage, right after PT-3. Without a declared
+ * rotation it records a complete no-op receipt. With one, in one transfer
+ * transaction: the singleton pin row FOR UPDATE; if it is the rotation's
+ * `from`, it moves to `to` (recorded_at from the database clock) and the
+ * stage writes its checkpoint (prefix = the rotation document's sha256) and
+ * its receipt; if it is already `to` with this rotation's complete
+ * checkpoint, nothing is written (replay-safe); anything else refuses
+ * CUTOVER_IDENTITY_ROTATION_STATE_INVALID. PT-3's table receipt for the
+ * pin table is untouched, so coverage still sees exactly one table receipt.
+ */
+async function runIdentityLinkRotation(context, handle, rotation) {
+  const stage = IDENTITY_LINK_ROTATION_STAGE;
+  if (rotation === null) {
+    const receiptSha256 = HASH(canonicalJson({ schema: `${PRODUCTION_TRANSFER_SCHEMA}-identity-link-rotation`,
+      sealId: context.inputs.sealId, stage, mode: "unrotated" }));
+    await withTransferTransaction(handle, "primary", async client => {
+      await requireImportingRun(client, handle);
+      for (const prerequisite of stagePrerequisites(stage)) await assertStageCompleteIn(client, handle, prerequisite);
+      await stageReceipt(client, handle, { stage, state: "complete", rowCount: 0, byteCount: 0, receiptSha256 });
+    });
+    return Object.freeze({ stage, rotated: false, receiptSha256 });
+  }
+  const { rotation: document, rotationSha256, rotationTokenSha256 } = rotation;
+  return withTransferTransaction(handle, "primary", async client => {
+    await requireImportingRun(client, handle);
+    for (const prerequisite of stagePrerequisites(stage)) await assertStageCompleteIn(client, handle, prerequisite);
+    const { row, rows, checkpoint } = await readIdentityLinkState(client, handle, { lock: "FOR UPDATE" });
+    if (rows !== 1) fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { stage });
+    if (pinEquals(row, document.from) && checkpoint === null) {
+      const updated = await client.query(`UPDATE ${quote(handle.primarySchema)}.identity_link_secret_configuration
+          SET key_version = $1, secret_fingerprint = $2, recorded_at = date_trunc('milliseconds', clock_timestamp())
+        WHERE singleton = 1 AND key_version = $3 AND secret_fingerprint = $4`,
+      [document.to.keyVersion, document.to.secretFingerprint, document.from.keyVersion, document.from.secretFingerprint]);
+      if (updated.rowCount !== 1) fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { stage });
+      // Synthetic-kill hook INSIDE the transaction: a throw here rolls the
+      // UPDATE back with the receipt never written.
+      if (context.onStep !== null) await context.onStep(`${stage}:updated`);
+      const body = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-identity-link-rotation`, stage, sealId: context.inputs.sealId,
+        fromKeyVersion: document.from.keyVersion, toKeyVersion: document.to.keyVersion,
+        toSecretVersion: document.to.secretVersion, rotationSha256, rotationTokenSha256,
+        previousRecordedAt: row.recorded_at, state: "complete" };
+      const receiptSha256 = HASH(canonicalJson(body));
+      await recordCheckpoint(client, handle, { stage, name: IDENTITY_LINK_ROTATION_CHECKPOINT, state: "complete",
+        rowCount: 1, prefixChainSha256: rotationSha256 });
+      await stageReceipt(client, handle, { stage, state: "complete", rowCount: 1, byteCount: 0, receiptSha256 });
+      return Object.freeze({ stage, rotated: true, replayed: false, receiptSha256 });
+    }
+    if (pinEquals(row, document.to) && checkpoint?.state === "complete" && checkpoint.prefix_chain_sha256 === rotationSha256) {
+      await assertStageCompleteIn(client, handle, stage);
+      return Object.freeze({ stage, rotated: true, replayed: true });
+    }
+    return fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { stage });
+  });
+}
+
+/**
+ * Identity-link continuity, asserted by R3 post-import, the flip gate and
+ * the post-live check (inside the caller's transaction): without a rotation
+ * the target pin is the configured pin (the sealed row); with one it is the
+ * rotation's `to` AND this run holds the rotation's complete checkpoint and
+ * a complete 'identity-link-rotation' stage receipt. Never skipped.
+ */
+async function assertIdentityLinkContinuity(client, handle, { pin, rotation }) {
+  const { row, rows, checkpoint } = await readIdentityLinkState(client, handle);
+  const { rows: stageRows } = await client.query(`SELECT 1 FROM ${TRANSFER_CONTROL_SCHEMA}.transfer_stage_receipts receipt
+      JOIN ${TRANSFER_CONTROL_SCHEMA}.transfer_runs run ON run.run_id = receipt.run_id
+     WHERE run.seal_manifest_sha256 = $1 AND run.contract_id = $2 AND run.state <> 'abandoned'
+       AND receipt.stage = $3 AND receipt.state = 'complete'`,
+  [handle.sealManifestSha256, handle.contractId, IDENTITY_LINK_ROTATION_STAGE]);
+  if (rows !== 1 || stageRows.length !== 1) fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { check: "identity-link" });
+  if (rotation === null) {
+    if (!pinEquals(row, pin) || checkpoint !== null) fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { check: "identity-link" });
+    return Object.freeze({ mode: "pinned", keyVersion: pin.keyVersion });
+  }
+  if (!pinEquals(row, rotation.rotation.to) || checkpoint?.state !== "complete" || checkpoint.row_count !== "1"
+      || checkpoint.prefix_chain_sha256 !== rotation.rotationSha256) {
+    fail("CUTOVER_IDENTITY_ROTATION_STATE_INVALID", { check: "identity-link" });
+  }
+  return Object.freeze({ mode: "rotated", keyVersion: rotation.rotation.to.keyVersion,
+    rotationSha256: rotation.rotationSha256 });
+}
+
+async function identityLinkFacts(context) {
+  const { pin } = await readPin(context);
+  return { pin, rotation: await readRotation(context) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,8 +1397,10 @@ async function postImportInvariants(context, handle, sealed, digests) {
   const schema = handle.primarySchema;
   const ingestion = sealed.database("ingestion");
   const sealedRegistrations = sealedCount(ingestion, "SELECT count(*) AS n FROM pending_quarantine_objects");
+  const identity = await identityLinkFacts(context);
   const facts = await withTransferTransaction(handle, "primary", async client => {
     await assertCollectionControlsDegradedForImport(client, handle);
+    const identityLink = await assertIdentityLinkContinuity(client, handle, identity);
     const { rows: bootstrap } = await client.query(`SELECT policy_version, participant_cursor, source_day_cursor, completed
       FROM ${quote(schema)}.community_public_source_bootstrap`);
     if (bootstrap.length !== 1 || bootstrap[0].policy_version !== PUBLIC_SOURCE_BOOTSTRAP_POLICY
@@ -1185,7 +1442,7 @@ async function postImportInvariants(context, handle, sealed, digests) {
       if (counted[0].n > limit) fail("CUTOVER_RUNTIME_RESET_NOT_AT_SEED", { table });
       atSeed += 1;
     }
-    return { participants, pendingObjects: pending[0].mapped, runtimeResetAtSeed: atSeed };
+    return { participants, pendingObjects: pending[0].mapped, runtimeResetAtSeed: atSeed, identityLink };
   }, { readOnly: true });
   const owners = await comparePublicSourceOwners(handle, ingestion);
   if (owners.equal !== true) fail("CUTOVER_PUBLIC_SOURCE_OWNERS_DIVERGED");
@@ -1345,16 +1602,32 @@ async function recheckImportPreconditions(context, handle, seal) {
 // ---------------------------------------------------------------------------
 // run: R1 to R4.
 
-export async function runImport(context, { execute = false, confirm = undefined } = {}) {
-  const { preflightSha256 } = await readPreflight(context);
+export async function runImport(context, { execute = false, confirm = undefined, confirmIdentityRotation = undefined } = {}) {
+  const { preflight, preflightSha256 } = await readPreflight(context);
   const token = authorizationToken("run", { sealId: context.inputs.sealId, contractId: context.inputs.contractId,
     inputsSha256: context.inputsSha256, preflightSha256 });
+  // Round 16: a declared rotation needs its own token, bound to the
+  // preflight that checked it (P8-R) and to the rotation document.
+  const declared = await readRotation(context);
+  if (declared !== null && preflight.checks?.P8?.rotation?.rotationSha256 !== declared.rotationSha256) {
+    fail("CUTOVER_PREFLIGHT_MISSING");
+  }
+  const rotationToken = declared === null ? null : identityRotationToken(context, preflightSha256, declared);
   const preview = await openHandle(context);
   assertStepOrder("run", { runState: preview.openedRunState, preflight: true });
   if (!authorize("run", token, { execute, confirm })) {
-    return Object.freeze({ mode: "dry-run", step: "run", authorizationToken: token, resumed: preview.resumed,
-      openedRunState: preview.openedRunState, plan: Object.freeze(STAGE_PLAN.map(entry => entry.stage)) });
+    return Object.freeze({ mode: "dry-run", step: "run", authorizationToken: token,
+      ...(rotationToken === null ? {} : { identityRotationAuthorizationToken: rotationToken }),
+      resumed: preview.resumed, openedRunState: preview.openedRunState,
+      plan: Object.freeze(STAGE_PLAN.map(entry => entry.stage)) });
   }
+  // A run token alone never rotates; a rotation token without a declared rotation is refused too.
+  if (rotationToken === null ? confirmIdentityRotation !== undefined
+    : typeof confirmIdentityRotation !== "string" || confirmIdentityRotation !== rotationToken) {
+    fail("CUTOVER_AUTHORIZATION_MISMATCH", { step: IDENTITY_ROTATION_AUTHORIZATION_STEP });
+  }
+  const rotation = declared === null ? null
+    : Object.freeze({ ...declared, rotationTokenSha256: HASH(rotationToken) });
   return withOrchestratorLocks(context, preview.primarySchema, () => withSeal(context, async (sealed) => {
     let handle = await openHandle(context);
     assertStepOrder("run", { runState: handle.openedRunState, preflight: true });
@@ -1376,7 +1649,7 @@ export async function runImport(context, { execute = false, confirm = undefined 
         if (complete.has(entry.stage)) continue;
         // A fresh handle per stage, as a resumed operator run would have.
         handle = await openHandle(context);
-        const result = await runStage(context, handle, sealed, entry);
+        const result = await runStage(context, handle, sealed, entry, rotation);
         ran.push(result.stage);
         await step(context, `stage:${entry.stage}`);
         complete = await completeStages(handle);
@@ -1508,7 +1781,9 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
   const { postImport, postImportSha256 } = await readBoundPostImport(context, handle);
   const loadedPayloadSha256 = record(postImport.interimRead) ? postImport.interimRead.payloadSha256 : null;
   if (typeof loadedPayloadSha256 !== "string" || !SHA256.test(loadedPayloadSha256)) fail("CUTOVER_INTERIM_READ_NOT_LOADED");
+  const identity = await identityLinkFacts(context);
   const facts = await withTransferTransaction(handle, "primary", async client => {
+    const identityLink = await assertIdentityLinkContinuity(client, handle, identity);
     // The staging-drop readback: PT-1's dropped-relation receipts cover the
     // registry exactly and the control schema holds only its allowlist.
     const { rows: dropped } = await client.query(`SELECT relation_name FROM ${TRANSFER_CONTROL_SCHEMA}.transfer_dropped_relations
@@ -1523,7 +1798,7 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
     if (frozen.length !== 1 || frozen[0].payload_sha256 !== loadedPayloadSha256) fail("CUTOVER_INTERIM_READ_NOT_LOADED");
     const ready = await assertFlipReady(client, handle, { flipEvidenceSha256: evidence.sha256,
       allowedRoleMembers: [...context.inputs.allowedRoleMembers] });
-    return { controlRelations: relations.length, frozenPayloadSha256: frozen[0].payload_sha256, ready };
+    return { controlRelations: relations.length, frozenPayloadSha256: frozen[0].payload_sha256, ready, identityLink };
   }, { readOnly: true });
   const nonces = await withSeal(context, async sealed => sparkleNonceCount(sealed.database("ingestion"),
     context.now().getTime() / 1000));
@@ -1543,6 +1818,7 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
     ready: facts.ready.ready,
     waivedRoleMembers: facts.ready.waivedRoleMembers,
     sparkleUnexpired: 0,
+    identityLink: facts.identityLink,
   };
 }
 
@@ -1595,14 +1871,16 @@ export async function postLiveCheck(context) {
   const { handle, run, released, flipGate: gated } = await finalizeFacts(context);
   assertStepOrder("post-live-check", { runState: run?.state ?? null, released, flipGate: gated });
   const nowMs = context.now().getTime();
+  const identity = await identityLinkFacts(context);
   const facts = await withTransferTransaction(handle, "primary", async client => {
+    const identityLink = await assertIdentityLinkContinuity(client, handle, identity);
     const { rows } = await client.query(`SELECT retention.state AS retention_state, reconciliation.state AS reconciliation_state,
         retention.maintenance_run_at = reconciliation.maintenance_run_at AS same_cycle,
         (extract(epoch FROM retention.last_completed_at) * 1000)::bigint::text AS retention_completed_ms,
         (extract(epoch FROM reconciliation.last_completed_at) * 1000)::bigint::text AS reconciliation_completed_ms
       FROM ${quote(handle.primarySchema)}.retention_state retention
       CROSS JOIN ${quote(handle.primarySchema)}.quarantine_reconciliation_state reconciliation`);
-    return rows[0];
+    return { ...rows[0], identityLink };
   }, { readOnly: true });
   const ages = [facts?.retention_completed_ms, facts?.reconciliation_completed_ms].map(value => nowMs - Number(value));
   if (facts?.retention_state !== "completed" || facts?.reconciliation_state !== "completed" || facts?.same_cycle !== true
@@ -1613,7 +1891,8 @@ export async function postLiveCheck(context) {
   // age), so a later check after another pass computes identical bytes.
   const body = { schema: `${PRODUCTION_TRANSFER_SCHEMA}-post-live-check`, sealId: context.inputs.sealId,
     contractId: context.inputs.contractId, runId: run.runId, ready: true, retentionState: "completed",
-    reconciliationState: "completed", sameCycle: true, maximumPassAgeMilliseconds: POST_LIVE_MAXIMUM_PASS_AGE_MILLISECONDS };
+    reconciliationState: "completed", sameCycle: true, maximumPassAgeMilliseconds: POST_LIVE_MAXIMUM_PASS_AGE_MILLISECONDS,
+    identityLink: facts.identityLink };
   const postLiveCheckSha256 = await writeReceiptOnce(context.path("postLiveCheck"), body);
   await journal(context, "post-live-check", "ready", { postLiveCheckSha256 });
   return Object.freeze({ step: "post-live-check", ready: true, runState: "live", postLiveCheckSha256 });
@@ -1635,6 +1914,9 @@ export async function writeReport(context) {
     digests[name] = sha256;
     values[name] = value;
   }
+  // Round 16: a rotated cutover also reports its rotation document.
+  const declared = await readRotation(context);
+  if (declared !== null) digests.rotation = declared.rotationSha256;
   const { preflight, flipGate: gate, postLiveCheck: postLive } = values;
   if (!record(preflight) || preflight.verdict !== "GO" || preflight.sealId !== context.inputs.sealId
       || !record(gate) || gate.ready !== true || gate.runId !== run.runId) {
@@ -1671,9 +1953,12 @@ export async function abandon(context, { execute = false, confirm = undefined } 
 
 const COMMANDS = Object.freeze({
   "identity-pin": { values: ["--owner-dir", "--key-version", "--secret-name", "--secret-version"], switches: [] },
+  "identity-rotate-pin": { values: ["--owner-dir", "--from-key-version", "--to-key-version", "--secret-name",
+    "--secret-version", "--sealed-pin-file"], switches: [] },
   "target-check": { values: ["--contract", ...["--pg-socket", "--pg-port", "--pg-user", "--pg-database"]], switches: [] },
   preflight: { values: ["--owner-dir", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
-  run: { values: ["--owner-dir", "--confirm", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: ["--execute"] },
+  run: { values: ["--owner-dir", "--confirm", "--confirm-identity-rotation", "--pg-socket", "--pg-port", "--pg-user",
+    "--pg-database"], switches: ["--execute"] },
   "release-controls": { values: ["--owner-dir", "--flip-evidence", "--confirm", "--pg-socket", "--pg-port", "--pg-user",
     "--pg-database"], switches: ["--execute"] },
   "flip-gate": { values: ["--owner-dir", "--flip-evidence", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
@@ -1717,6 +2002,11 @@ export function parseTransferArguments(argv) {
     .some(flag => options[flag] === undefined)) {
     fail("CUTOVER_ARGUMENT_INVALID");
   }
+  if (command === "identity-rotate-pin" && ["--from-key-version", "--to-key-version", "--secret-name", "--secret-version",
+    "--sealed-pin-file"].some(flag => options[flag] === undefined)) {
+    fail("CUTOVER_ARGUMENT_INVALID");
+  }
+  if (options["--confirm-identity-rotation"] !== undefined && options["--execute"] !== true) fail("CUTOVER_EXECUTE_REQUIRED");
   return Object.freeze(options);
 }
 
@@ -1759,6 +2049,13 @@ async function main(argv, { stdin = process.stdin, stdout = process.stdout } = {
       keyVersion: options["--key-version"], secretName: options["--secret-name"], secretVersion: options["--secret-version"] }));
     return;
   }
+  if (options.command === "identity-rotate-pin") {
+    print(await writeIdentityRotation({ ownerDirectory: resolve(options["--owner-dir"]), stream: stdin,
+      sealedPinFile: resolve(options["--sealed-pin-file"]), fromKeyVersion: options["--from-key-version"],
+      toKeyVersion: options["--to-key-version"], secretName: options["--secret-name"],
+      secretVersion: options["--secret-version"] }));
+    return;
+  }
   const { default: pg } = await import("pg");
   const pool = new pg.Pool({ ...await connectionOptions(options), password: process.env.PGPASSWORD });
   pool.on("error", () => {});
@@ -1771,7 +2068,8 @@ async function main(argv, { stdin = process.stdin, stdout = process.stdout } = {
     const authorization = { execute: options["--execute"] === true, confirm: options["--confirm"] };
     const handlers = {
       preflight: () => runPreflight(context),
-      run: () => runImport(context, authorization),
+      run: () => runImport(context, { ...authorization,
+        confirmIdentityRotation: options["--confirm-identity-rotation"] }),
       "release-controls": () => releaseControls(context, { flipEvidencePath: resolve(options["--flip-evidence"]), ...authorization }),
       "flip-gate": () => flipGate(context, { flipEvidencePath: resolve(options["--flip-evidence"]) }),
       "mark-live": () => markLiveStep(context, { flipEvidenceSha256: options["--flip-evidence-sha256"], ...authorization }),

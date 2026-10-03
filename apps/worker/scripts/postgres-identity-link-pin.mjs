@@ -158,3 +158,147 @@ export function assertPinMatchesMount(pin, mount) {
   }
   return Object.freeze({ secretName: valid.secretName, secretVersion: valid.secretVersion });
 }
+
+// ---------------------------------------------------------------------------
+// Round 16: rotate at the cutover (owner decisions 2026-10-02, round 16).
+//
+// The production IDENTITY_LINK_SECRET is lost (Cloudflare Worker secrets are
+// write-only). Round 12 retires every route that consumes it
+// (IDENTITY_LINK_CONSUMER_ROUTE_IDS), so the owner chose to ROTATE: the
+// origin mounts a newly generated Secret Manager version under a new label,
+// and the imported D1 pin row is replaced at the cutover only under a
+// second authorization token and a recorded, tamper-evident rotation
+// document. Never silently: without the document every continuity check
+// still refuses a mismatched secret.
+//
+// `identity-rotate-pin` (owner only) reads the NEW secret from stdin, like
+// `identity-pin`, and the sealed D1 pin from --sealed-pin-file: the output of
+// the read-only
+//   wrangler d1 execute <production database> --remote --env production --json \
+//     --command "SELECT key_version, secret_fingerprint FROM identity_link_secret_configuration"
+// (a keyed digest, kept in the 0700 owner directory, never the repository).
+// It writes identity-pin.json (the new pin) and identity-rotation.json.
+
+export const IDENTITY_LINK_ROTATION_SCHEMA = "tibotattle-identity-link-rotation-v1";
+export const IDENTITY_LINK_ROTATION_REASON = "secret-lost";
+export const IDENTITY_LINK_ROTATION_DECISION = "owner-decisions-2026-10-02 round 16";
+const MAX_SEALED_PIN_FILE_BYTES = 64 * 1024;
+const SEALED_PIN_ROW_KEYS = Object.freeze(["key_version", "recorded_at", "secret_fingerprint", "singleton"]);
+
+/**
+ * Parse the sealed-pin file: exactly one D1 row with key_version and
+ * secret_fingerprint (singleton and recorded_at may accompany them), either
+ * as wrangler's --json output ([{ results: [row], success: true, ... }]) or
+ * as the bare row. Refuses CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH.
+ */
+export function parseSealedPinFile(bytes) {
+  let value;
+  try {
+    if (!Buffer.isBuffer(bytes) || bytes.length > MAX_SEALED_PIN_FILE_BYTES) throw new Error("size");
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
+  }
+  let row = value;
+  if (Array.isArray(value)) {
+    if (value.length !== 1 || value[0] === null || typeof value[0] !== "object" || value[0].success !== true
+        || !Array.isArray(value[0].results) || value[0].results.length !== 1) {
+      fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
+    }
+    [row] = value[0].results;
+  }
+  if (row === null || typeof row !== "object" || Array.isArray(row)
+      || Object.keys(row).some(key => !SEALED_PIN_ROW_KEYS.includes(key))
+      || (Object.hasOwn(row, "singleton") && row.singleton !== 1)
+      || typeof row.key_version !== "string" || !KEY_VERSION.test(row.key_version)
+      || typeof row.secret_fingerprint !== "string" || !SHA256.test(row.secret_fingerprint)) {
+    fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
+  }
+  return Object.freeze({ keyVersion: row.key_version, secretFingerprint: row.secret_fingerprint });
+}
+
+function closedRecord(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+}
+
+/**
+ * Validate a parsed identity-rotation.json (closed keys at every level).
+ * `consumerRouteIds` is the registry's IDENTITY_LINK_CONSUMER_ROUTE_IDS: the
+ * document must name exactly that list, in that order.
+ */
+export function validateIdentityLinkRotation(value, { consumerRouteIds }) {
+  if (!closedRecord(value, ["schema", "from", "to", "reason", "decision", "retiredConsumerRoutes", "computedAt"])
+      || value.schema !== IDENTITY_LINK_ROTATION_SCHEMA || value.reason !== IDENTITY_LINK_ROTATION_REASON
+      || value.decision !== IDENTITY_LINK_ROTATION_DECISION
+      || !closedRecord(value.from, ["keyVersion", "secretFingerprint"])
+      || !closedRecord(value.to, ["keyVersion", "secretFingerprint", "secretName", "secretVersion"])
+      || typeof value.from.keyVersion !== "string" || !KEY_VERSION.test(value.from.keyVersion)
+      || typeof value.from.secretFingerprint !== "string" || !SHA256.test(value.from.secretFingerprint)
+      || typeof value.to.keyVersion !== "string" || !KEY_VERSION.test(value.to.keyVersion)
+      || typeof value.to.secretFingerprint !== "string" || !SHA256.test(value.to.secretFingerprint)
+      || typeof value.to.secretName !== "string" || !SECRET_NAME.test(value.to.secretName)
+      || typeof value.to.secretVersion !== "string" || !SECRET_VERSION.test(value.to.secretVersion)
+      || value.from.keyVersion === value.to.keyVersion || value.from.secretFingerprint === value.to.secretFingerprint
+      || !Array.isArray(consumerRouteIds) || !Array.isArray(value.retiredConsumerRoutes)
+      || JSON.stringify(value.retiredConsumerRoutes) !== JSON.stringify([...consumerRouteIds])
+      || typeof value.computedAt !== "string" || !INSTANT.test(value.computedAt)) {
+    fail("CUTOVER_IDENTITY_ROTATION_INVALID");
+  }
+  return Object.freeze({
+    ...value,
+    from: Object.freeze({ ...value.from }),
+    to: Object.freeze({ ...value.to }),
+    retiredConsumerRoutes: Object.freeze([...value.retiredConsumerRoutes]),
+  });
+}
+
+/**
+ * Build the rotation's two owner documents from the NEW secret: the pin of
+ * the new secret (the existing pin schema, labelled `toKeyVersion`) and the
+ * rotation document binding it to the sealed D1 pin. The sealed pin must
+ * carry `fromKeyVersion`; the labels and the fingerprints must both change.
+ */
+export function buildIdentityLinkRotation({ secret, sealedPin, fromKeyVersion, toKeyVersion, secretName,
+  secretVersion, consumerRouteIds, computedAt }) {
+  if (sealedPin === null || typeof sealedPin !== "object" || typeof fromKeyVersion !== "string"
+      || !KEY_VERSION.test(fromKeyVersion) || sealedPin.keyVersion !== fromKeyVersion) {
+    fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
+  }
+  const pin = buildIdentityLinkPin({ secret, keyVersion: toKeyVersion, secretName, secretVersion, computedAt });
+  const rotation = validateIdentityLinkRotation({
+    schema: IDENTITY_LINK_ROTATION_SCHEMA,
+    from: { keyVersion: sealedPin.keyVersion, secretFingerprint: sealedPin.secretFingerprint },
+    to: { keyVersion: pin.keyVersion, secretFingerprint: pin.secretFingerprint, secretName: pin.secretName,
+      secretVersion: pin.secretVersion },
+    reason: IDENTITY_LINK_ROTATION_REASON,
+    decision: IDENTITY_LINK_ROTATION_DECISION,
+    retiredConsumerRoutes: Array.isArray(consumerRouteIds) ? [...consumerRouteIds] : null,
+    computedAt,
+  }, { consumerRouteIds });
+  return Object.freeze({ pin, rotation });
+}
+
+/**
+ * Preflight P8-R over a rotation: `from` must be the sealed D1 row exactly
+ * (CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH), the pin must be the rotation's
+ * `to` (CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH), and `to` must carry the
+ * expected deployment label (CUTOVER_IDENTITY_LINK_VERSION_MISMATCH).
+ */
+export function assertRotationMatchesSealed(rotation, pin, sealedRows, { expectedKeyVersion }) {
+  const valid = validateIdentityLinkPin(pin);
+  if (typeof expectedKeyVersion !== "string" || !KEY_VERSION.test(expectedKeyVersion)) fail("CUTOVER_IDENTITY_PIN_INVALID");
+  if (!Array.isArray(sealedRows) || sealedRows.length !== 1 || sealedRows[0].key_version !== rotation.from.keyVersion
+      || sealedRows[0].secret_fingerprint !== rotation.from.secretFingerprint) {
+    fail("CUTOVER_IDENTITY_ROTATION_SOURCE_MISMATCH");
+  }
+  if (rotation.to.keyVersion !== expectedKeyVersion || valid.keyVersion !== expectedKeyVersion) {
+    fail("CUTOVER_IDENTITY_LINK_VERSION_MISMATCH");
+  }
+  if (valid.secretFingerprint !== rotation.to.secretFingerprint || valid.secretName !== rotation.to.secretName
+      || valid.secretVersion !== rotation.to.secretVersion) {
+    fail("CUTOVER_IDENTITY_ROTATION_PIN_MISMATCH");
+  }
+  return Object.freeze({ fromKeyVersion: rotation.from.keyVersion, toKeyVersion: rotation.to.keyVersion,
+    toSecretVersion: rotation.to.secretVersion });
+}

@@ -13,6 +13,14 @@
  *     Worker version, the live value was observed;
  *   - a var may instead be edge-only (it stays with the Cloudflare edge) or
  *     deployment-provided (each deployment supplies and validates it);
+ *   - a var in the closed rotated category (ORIGIN_ROTATED_VAR_NAMES) must
+ *     equal its recorded `wrangler` value in wrangler.jsonc and its recorded
+ *     `origin` value in PRODUCTION_VARS. Round 16 rotates the lost
+ *     IDENTITY_LINK_SECRET at the cutover: the origin mounts a new secret
+ *     under production-v2, while wrangler.jsonc keeps production-v1, which
+ *     names the Cloudflare secret until its deletion. This is a reviewed
+ *     divergence, not an observed live override, so the live-settings
+ *     receipt never records it;
  *   - every PRODUCTION_VARS key is in wrangler.jsonc or declared origin-only;
  *   - the eight rate limits split into the six edge-tier names and the two
  *     origin-tier limits, whose values must match;
@@ -62,6 +70,14 @@ const RECEIPT_DATE_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/u;
 const RECEIPT_VERSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const PRODUCTION_BUILD_SERVICE_ACCOUNT = "serviceAccount: projects/${PROJECT}/serviceAccounts/${BUILDER_SA}";
 const PRODUCTION_BUILD_IMAGE = "  _IMAGE: ${IMAGE_REPOSITORY}:source-${SOURCE_COMMIT}";
+/**
+ * Vars the origin deliberately rotated away from the checked-in Worker
+ * value. Closed: widening it is a reviewed owner decision (round 16 for the
+ * identity-link label), never a drift fix.
+ */
+const ORIGIN_ROTATED_VAR_NAMES = Object.freeze({
+  IDENTITY_LINK_SECRET_VERSION: Object.freeze({ wrangler: "production-v1", origin: "production-v2" }),
+});
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -141,6 +157,13 @@ function varFindings(wranglerVars, overrides) {
     }
     if (!Object.hasOwn(pinned, name)) {
       findings.push(`VAR_UNCLASSIFIED:${name}`);
+      continue;
+    }
+    if (Object.hasOwn(ORIGIN_ROTATED_VAR_NAMES, name)) {
+      const rotated = ORIGIN_ROTATED_VAR_NAMES[name];
+      if (Object.hasOwn(overrides, name)) findings.push(`ROTATED_VAR_LIVE_OVERRIDE:${name}`);
+      if (value !== rotated.wrangler) findings.push(`ROTATED_VAR_WRANGLER_DRIFT:${name}`);
+      if (pinned[name] !== rotated.origin) findings.push(`ROTATED_VAR_ORIGIN_DRIFT:${name}`);
       continue;
     }
     if (Object.hasOwn(overrides, name)) {
@@ -415,6 +438,33 @@ test("a changed var in a temp copy fails", async () => {
     wranglerText: doctorProduction(WRANGLER_TEXT,
       "\"UPLOAD_INGRESS_MAX_CONCURRENT\": \"64\"", "\"UPLOAD_INGRESS_MAX_CONCURRENT\": 64"),
   }), ["VAR_DRIFT:UPLOAD_INGRESS_MAX_CONCURRENT"]);
+});
+
+test("round 16: the identity-link label is the one closed rotated var, held at both recorded values", async () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(ORIGIN_ROTATED_VAR_NAMES)),
+    { IDENTITY_LINK_SECRET_VERSION: { wrangler: "production-v1", origin: "production-v2" } });
+  // The origin side is the configuration's rotated label; the wrangler side its retired one.
+  assert.equal(ORIGIN_ROTATED_VAR_NAMES.IDENTITY_LINK_SECRET_VERSION.origin,
+    configuration.PRODUCTION_IDENTITY_LINK_SECRET_VERSION);
+  assert.deepEqual([...configuration.PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS],
+    [ORIGIN_ROTATED_VAR_NAMES.IDENTITY_LINK_SECRET_VERSION.wrangler]);
+  assert.equal(configuration.PRODUCTION_VARS.IDENTITY_LINK_SECRET_VERSION, "production-v2");
+  // wrangler.jsonc keeps production-v1: it names the Cloudflare secret, which
+  // nobody rewrites before the switch.
+  assert.ok(WRANGLER_TEXT.includes("\"IDENTITY_LINK_SECRET_VERSION\": \"production-v1\""));
+  // Moving wrangler to the new label, or anywhere else, is drift.
+  for (const label of ["production-v2", "production-v3"]) {
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProduction(WRANGLER_TEXT, "\"IDENTITY_LINK_SECRET_VERSION\": \"production-v1\"",
+        `"IDENTITY_LINK_SECRET_VERSION": "${label}"`),
+    }), ["ROTATED_VAR_WRANGLER_DRIFT:IDENTITY_LINK_SECRET_VERSION"], label);
+  }
+  // The live-settings receipt must not be used to carry the rotation.
+  assert.deepEqual(await driftOfTempCopy({
+    receiptText: doctorReceipt((receipt) => {
+      receipt.overrides.IDENTITY_LINK_SECRET_VERSION = { checkedIn: "json", live: "typed" };
+    }),
+  }), ["ROTATED_VAR_LIVE_OVERRIDE:IDENTITY_LINK_SECRET_VERSION"]);
 });
 
 test("a changed origin-tier limit in a temp copy fails", async () => {

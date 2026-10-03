@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import {
   ADMIN_HOST_ROUTE_IDS,
+  IDENTITY_LINK_CONSUMER_ROUTE_IDS,
   OD_CR_1_CONTESTED_ROUTE_IDS,
   OD_CR_2_UNPORTED_ROUTE_IDS,
   ORIGIN_ROOT_ROUTE_IDS,
@@ -16,6 +17,7 @@ import {
   PRODUCTION_ROUTE_REGISTRY_CODES,
   PRODUCTION_ROUTE_TABLE,
   RETIRED_ONLINE_ERASURE_SURFACES,
+  assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
   isProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
@@ -329,6 +331,24 @@ test("PRODUCTION_ROUTE_PORT_UNDECIDED: no od-cr-2 route can be ported without an
     refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
       "PRODUCTION_ROUTE_PORT_UNDECIDED", id);
   }
+});
+
+test("IDENTITY_LINK_ROTATION_CONSUMER_PORTED: every identity-link consumer stays od-cr-2 and unported", () => {
+  // Round 16 rotates the lost IDENTITY_LINK_SECRET only because round 12
+  // retires every route that reads its pin, link keys or cooldown digests.
+  assert.deepEqual([...IDENTITY_LINK_CONSUMER_ROUTE_IDS], ["enroll", "identity_google_start",
+    "identity_google_callback", "identity_google_result", "identity_apple_start", "identity_apple_callback",
+    "identity_apple_result", "security_reset", "participant_export"]);
+  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) assert.ok(OD_CR_2_UNPORTED_ROUTE_IDS.includes(id), id);
+  // The production list (and an open admin host) ports none of them.
+  assert.equal(assertIdentityLinkConsumersRetired([...productionPortedRouteIds]), 9);
+  assert.equal(assertIdentityLinkConsumersRetired([...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS]), 9);
+  for (const id of IDENTITY_LINK_CONSUMER_ROUTE_IDS) {
+    refused(() => assertIdentityLinkConsumersRetired([...productionPortedRouteIds, id]),
+      "IDENTITY_LINK_ROTATION_CONSUMER_PORTED", id);
+  }
+  refused(() => assertIdentityLinkConsumersRetired(null), "IDENTITY_LINK_ROTATION_CONSUMER_PORTED", "not a list");
+  refused(() => assertIdentityLinkConsumersRetired([1]), "IDENTITY_LINK_ROTATION_CONSUMER_PORTED", "not ids");
 });
 
 test("PRODUCTION_ROUTE_SCOPE_INCOMPLETE: every one of the 21 scope routes is required", () => {

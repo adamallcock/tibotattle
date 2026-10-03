@@ -50,7 +50,7 @@ function throwsWith(code, fn) {
 test("TRANSFER_STAGES is the frozen, ordered production stage list", () => {
   assert.equal(Object.isFrozen(TRANSFER_STAGES), true);
   assert.deepEqual([...TRANSFER_STAGES], [
-    "analytics-expectation", "identity-authority", "legacy-contributions", "telemetry-v1-v11",
+    "analytics-expectation", "identity-authority", "identity-link-rotation", "legacy-contributions", "telemetry-v1-v11",
     "typed-legacy", "legacy-admission", "header-promotion", "telemetry-v12", "v12-event-sources",
     "usage-correction", "performance", "pending-registrations", "accountless-retention",
     "ingestion-journal", "analytics-history", "analytics-community-history",

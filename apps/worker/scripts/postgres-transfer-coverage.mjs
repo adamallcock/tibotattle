@@ -114,6 +114,9 @@ export const OWNER_FLAGS = Object.freeze([
  */
 export const STAGE_PLAN = Object.freeze([
   Object.freeze({ stage: "identity-authority", kind: "runner" }),
+  // Round 16: the identity-link pin rotation (a recorded no-op unless the
+  // inputs declare a rotation); PT-8 writes its stage and checkpoint receipts.
+  Object.freeze({ stage: "identity-link-rotation", kind: "orchestrator" }),
   Object.freeze({ stage: "legacy-contributions", kind: "runner" }),
   Object.freeze({ stage: "telemetry-v1-v11", kind: "runner" }),
   Object.freeze({ stage: "typed-legacy", kind: "runner" }),
@@ -262,12 +265,20 @@ export const DISPOSITION_INDEX = Object.freeze(new Map(DISPOSITIONS.map(item => 
  * KEEPS the session-authority ports (session, logout, pairings, claim,
  * devices, revoke, v1.2 consent) and credential renew and disconnect. The
  * tables those routes authenticate against must stay PT-3 imports; the
- * check pins it.
+ * check pins it. None of those routes reads the identity-link pin, the
+ * IDENTITY_LINK_SECRET or a link key.
  */
 export const KEPT_SESSION_AUTHORITY_TABLES = Object.freeze([
-  "participants", "identity_link_secret_configuration", "web_sessions", "device_pairings", "device_pairing_events",
+  "participants", "web_sessions", "device_pairings", "device_pairing_events",
   "device_credentials", "device_credential_rotations", "enrollment_grants", "telemetry_v12_device_capabilities",
 ]);
+/**
+ * The identity-link pin: imported verbatim by PT-3 as the continuity record
+ * of the IDENTITY_LINK_SECRET, and moved to the rotated label only by the
+ * 'identity-link-rotation' stage under its token and receipt (round 16). No
+ * kept route reads it; only the retired social chain did.
+ */
+export const IDENTITY_LINK_PIN_TABLE = "identity_link_secret_configuration";
 /** Short-lived handoff state of the retired social chain: still imported verbatim by PT-3 and inert after the switch. */
 export const RETIRED_SOCIAL_CHAIN_TABLES = Object.freeze([
   "apple_signin_handoffs", "google_signin_handoffs", "sign_in_start_admission_windows",
@@ -318,7 +329,7 @@ if (RETAINED_TOOL_RELATIONS.length !== 0 || STAGING_DROP_REGISTRY.length !== 0) 
 /** sha256 of the canonical dispositions, rules, flags, stage plan and waivers. */
 export function dispositionPolicySha256() {
   return HASH(JSON.stringify([TRANSFER_COVERAGE_SCHEMA, DISPOSITIONS, OWNER_FLAGS, STAGE_PLAN, WAIVABLE,
-    KEPT_SESSION_AUTHORITY_TABLES, RETIRED_SOCIAL_CHAIN_TABLES, COMPLETE_TRIGGER_POLICY]));
+    KEPT_SESSION_AUTHORITY_TABLES, IDENTITY_LINK_PIN_TABLE, RETIRED_SOCIAL_CHAIN_TABLES, COMPLETE_TRIGGER_POLICY]));
 }
 
 // ---------------------------------------------------------------------------
