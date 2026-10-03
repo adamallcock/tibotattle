@@ -283,17 +283,22 @@ export function migrateJobCommand({ image, expectedCounts }) {
  * the local dense run several times over.
  *
  * dense-workers: the same task and budget with four compute Workers (K-PAR,
- * one per vCPU, the largest owner alone) and a 3,072 MiB main heap (runtime,
- * one read chunk, the output account). It is the MEAS-3 measurement of the
- * Workers' heap peaks on real owners, which the production profile waits for
- * (K-CORE-A review); it is not the production profile.
+ * one per vCPU) and NO heap flag (heapMiB null): a V8 heap flag such as
+ * --max-old-space-size applies to every isolate and overrides the Workers'
+ * own heap limits, so the K-CORE-A profile's 3,072 MiB flag capped every
+ * Worker at about 3 GiB and the largest owner ran out of memory (K-PAR-MEM).
+ * The main heap is V8's default for the task (about 4 GiB: runtime, about one
+ * read chunk across the loads in flight, the output account); the Workers
+ * share the rest of the task less a 1 GiB native reserve, admitted against it
+ * (cloud-run/analytics-refresh-pool.mjs). The Job refuses a heap flag with
+ * --workers > 1 (ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN).
  */
 export const REFRESH_JOB_PROFILES = Object.freeze({
   standard: Object.freeze({ cpu: 2, memory: "8Gi", heapMiB: 6_144, workers: 1, taskTimeoutSeconds: 7_200,
     env: Object.freeze([]) }),
-  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, workers: 1, taskTimeoutSeconds: 14_400,
+  dense: Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 12_288, workers: 1, taskTimeoutSeconds: 86_400,
     env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
-  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: 3_072, workers: 4, taskTimeoutSeconds: 14_400,
+  "dense-workers": Object.freeze({ cpu: 4, memory: "16Gi", heapMiB: null, workers: 4, taskTimeoutSeconds: 86_400,
     env: Object.freeze([Object.freeze(["ANALYTICS_V2_MEMORY_BUDGET_MIB", "10752"])]) }),
 });
 /** The default (standard) profile; the local rehearsal runs its heap. */
@@ -315,7 +320,8 @@ export function refreshJobCommand({ image, now, schema, extraEnv = [], extraArgs
   if (now !== undefined && !ISO_INSTANT.test(now)) fail("FASTPATH_DEPLOY_NOW_INVALID");
   const resources = refreshProfile(profile);
   const args = [
-    `--max-old-space-size=${resources.heapMiB}`,
+    // A profile with compute Workers sets no heap flag (heapMiB null; see REFRESH_JOB_PROFILES).
+    ...(resources.heapMiB === null ? [] : [`--max-old-space-size=${resources.heapMiB}`]),
     "dist/analytics-refresh.mjs", "--mode=full", `--schema=${primarySchemaOf(schema)}`,
     ...(now === undefined ? [] : [`--now=${now}`]),
     ...(resources.workers > 1 ? [`--workers=${resources.workers}`] : []),
@@ -751,8 +757,8 @@ Steps:
                    skips with its reason when a chain stage is absent at --commit; refresh and origin then read
                    that schema at the golden's clock unless --schema/--now say otherwise
   refresh          deploy + execute ${FASTPATH_TEST.refreshJob} (--refresh-profile: standard 2 vCPU, 8 GiB,
-                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 4 h;
-                   dense-workers: dense with four compute Workers and a 3,072 MiB main heap, for MEAS-3)
+                   heap 6,144 MiB, 2 h; dense 4 vCPU, 16 GiB, heap 12,288 MiB, budget 10,752 MiB, 24 h;
+                   dense-workers: dense with four compute Workers and no heap flag, 24 h)
   origin           create/verify gs://${FASTPATH_TEST.originBucket}; ensure the runtime SA's one binding on it
                    (condition ${ORIGIN_BUCKET_RUNTIME_BINDING.condition.title}, read back; any other runtime binding is
                    refused); deploy IAM-private ${FASTPATH_TEST.originService}; journey SA is the only invoker; a seeded

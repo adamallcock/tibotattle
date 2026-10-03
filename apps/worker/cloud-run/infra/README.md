@@ -150,8 +150,13 @@ created.
 decides the refresh cadence after the production-scale measurement, so pass 1
 defers the trigger create (`SCHEDULER_CADENCE_UNSET`) and plans no pause. When
 the cadence is committed, a later plan creates the trigger and pauses it at
-once. A full-recompute run is about 50 min against a 14,400 s timeout, and the
-advisory lock refuses an overlapping run.
+once. The task timeout is 86,400 s (24 h, owner decisions round 17): the
+prior production-shaped synthetic inline measurement took about 4.2 h;
+the loaded recovery comparator took 5.42 h. The prior inline Cloud Run
+projection was 10 to 13 h, not a measured runtime
+(`docs/receipts/2026-10-03-gcp-kpar-mem.md` has the compute-Worker figures).
+The advisory lock refuses an overlapping run, so a daily trigger and a run
+longer than a day never double the work.
 
 `service.telemetryStorageNamespace` stays `null`. Continuity requires the
 production Worker's own `TELEMETRY_STORAGE_NAMESPACE` (legacy and v1.1

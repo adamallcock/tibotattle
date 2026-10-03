@@ -328,7 +328,10 @@ async function runRefresh({ node22, endpointEnv, schema, nowIso, timeoutMinutes,
   let stderr;
   let exitCode = 0;
   try {
-    ({ stdout, stderr } = await execFileAsync(node22, [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`,
+    // With compute Workers no heap flag: V8 applies it to every isolate, over
+    // the Workers' own limits, and the Job refuses it (K-PAR-MEM).
+    ({ stdout, stderr } = await execFileAsync(node22, [
+      ...(workers > 1 ? [] : [`--max-old-space-size=${GCP_FASTPATH_REHEARSAL_REFRESH_HEAP_MIB}`]),
       DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${schema}`,
       ...(workers > 1 ? [`--workers=${workers}`] : [])], {
       cwd: CLOUD_RUN_ROOT,

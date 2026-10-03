@@ -216,6 +216,10 @@ export interface AnalyticsV2OwnerComputation {
  * occurrences over one inclusive span of the read range (the history segments
  * oldest first, each released before the next, then the analysis horizon);
  * `evidence` is the owner's exact per-day counts, which every load must match.
+ * With `prefetch` (K-PAR-MEM, a compute Worker) the next segment's load starts
+ * before the current segment is prepared, so its read overlaps this owner's
+ * own preparation; at most two segments are held at once. The days are still
+ * prepared one at a time in day order, so the outputs are the same.
  */
 export async function computeAnalyticsV2Owner(input: {
   readonly context: AnalyticsV2OwnerRunContext;
@@ -225,6 +229,7 @@ export async function computeAnalyticsV2Owner(input: {
   readonly load: ((span: AnalyticsV2DaySpan) => Promise<ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>>) | null;
   readonly occurrences?: ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences>;
   readonly hooks: AnalyticsV2OwnerHooks;
+  readonly prefetch?: boolean;
 }): Promise<AnalyticsV2OwnerComputation> {
   const { context, owner, evidence, load, hooks } = input;
   const ownerDigest = owner.ownerDigest;
@@ -316,23 +321,53 @@ export async function computeAnalyticsV2Owner(input: {
     for (const kept of [...cacheViews.keys()]) if (kept <= oldest) cacheViews.delete(kept);
   };
   let occurrences: ReadonlyMap<AnalyticsV2Day, AnalyticsV2DayOccurrences> = new Map();
+  // K-PAR-MEM: with a loader the computation owns each loaded segment, and a
+  // day's occurrences are released as soon as the day is prepared (its
+  // prepared rows, cache view and evidence digest are all that later steps
+  // read). Only the last segment's quota occurrences are kept: the windows'
+  // paged quota acquisition reads them (quotaOccurrences below), and every
+  // window day lies in that segment, the analysis horizon. So the owner's
+  // heap peaks at about the larger of a loaded segment and its prepared
+  // analysis days, not at their sum. A caller-held map (no loader) is never
+  // mutated. The outputs are unchanged: each day is prepared exactly once,
+  // from the same occurrences, in the same order.
+  const owned = new Map<AnalyticsV2Day, AnalyticsV2DayOccurrences>();
+  const horizonQuota = new Map<AnalyticsV2Day, AnalyticsV2DayOccurrences["quota"]>();
+  const lastSegment = segments.length - 1;
   let neededIndex = 0;
-  for (const [segmentIndex, segment] of segments.entries()) {
+  const prefetch = input.prefetch === true && load !== null;
+  /** Announce segment `index` (the time guard's step) and start its load; null when nothing is read. */
+  const startSegment = (segmentIndex: number) => {
+    const segment = segments[segmentIndex]!;
     let segmentOccurrences = 0;
     for (const [day, counts] of evidence) {
       if (day >= segment.fromDay && day <= segment.throughDay) segmentOccurrences += evidenceTotal(counts);
     }
     hooks.progress(Object.freeze({ kind: "segment", index: segmentIndex, occurrences: segmentOccurrences,
       accountBytes: hooks.accountBytes() }));
+    if (load === null) return null;
+    const span = Object.freeze({ fromDay: segment.fromDay < context.rangeFromDay ? context.rangeFromDay : segment.fromDay,
+      throughDay: segment.throughDay });
+    if (span.fromDay > span.throughDay) return null;
+    const loading = timed("read", () => load(span));
+    // A prefetched load may fail while the current segment is prepared; it is
+    // handled (and its error thrown) where it is awaited.
+    loading.catch(() => {});
+    return { span, loading };
+  };
+  let next = startSegment(0);
+  for (const [segmentIndex, segment] of segments.entries()) {
+    const current = next;
+    next = null;
     if (load === null) {
       occurrences = input.occurrences!;
     } else {
       // Release the previous segment before the next is loaded.
-      occurrences = new Map();
-      const span = { fromDay: segment.fromDay < context.rangeFromDay ? context.rangeFromDay : segment.fromDay,
-        throughDay: segment.throughDay };
-      if (span.fromDay <= span.throughDay) {
-        const loaded = await timed("read", () => load(Object.freeze(span)));
+      owned.clear();
+      occurrences = owned;
+      if (current !== null) {
+        const span = current.span;
+        const loaded = await current.loading;
         if (!(loaded instanceof Map)) invalid("loadOwnerOccurrences");
         for (const [day, value] of loaded) {
           dayStart(day, "loadOwnerOccurrences");
@@ -341,20 +376,34 @@ export async function computeAnalyticsV2Owner(input: {
         }
         if (!matchesEvidence(loaded, new Map([...evidence].filter(([day]) =>
           day >= span.fromDay && day <= span.throughDay)))) invalid("loadOwnerOccurrences.evidence");
-        occurrences = loaded;
+        for (const [day, value] of loaded) owned.set(day, value);
       }
     }
+    const last = segmentIndex === segments.length - 1;
+    if (prefetch && !last) next = startSegment(segmentIndex + 1);
     for (; neededIndex < neededDays.length && neededDays[neededIndex]! <= segment.throughDay; neededIndex += 1) {
       const day = neededDays[neededIndex]!;
-      await prepareNeededDay(day, occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES);
+      const value = occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES;
+      await prepareNeededDay(day, value);
+      if (load !== null) {
+        if (segmentIndex === lastSegment && value.quota.length > 0) horizonQuota.set(day, value.quota);
+        owned.delete(day);
+      }
     }
+    if (!prefetch && !last) next = startSegment(segmentIndex + 1);
   }
   if (neededIndex !== neededDays.length) throw new Error("ANALYTICS_V2_SEGMENTS_INCOMPLETE");
+  // Days of the range that no step needs (outside the run's horizon) go too.
+  owned.clear();
 
   cacheViews.clear();
   const windowFor = (day: AnalyticsV2Day): AnalyticsV2PreparedDay[] =>
     daysBetween(modelHistoryWindow(day).fromDay, day).flatMap((value) => prepared.get(value) ?? []);
-  const quotaOccurrences = (day: AnalyticsV2Day) => (occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES).quota;
+  // The last segment's quota occurrences of `day` (none for a day outside it),
+  // exactly what the window kernels were always given.
+  const quotaOccurrences = (day: AnalyticsV2Day) => (load === null
+    ? (occurrences.get(day) ?? EMPTY_DAY_OCCURRENCES).quota
+    : horizonQuota.get(day) ?? EMPTY_DAY_OCCURRENCES.quota);
 
   // ---- Current scalar fits: today only.
   hooks.progress(Object.freeze({ kind: "scalar", accountBytes: hooks.accountBytes() }));
@@ -397,7 +446,7 @@ export async function computeAnalyticsV2Owner(input: {
       sample();
     }
   });
-  // `prepared` (with its usage rows) and the owner's last segment are released with this scope.
+  // `prepared` (with its usage rows) and the horizon's quota occurrences are released with this scope.
   return Object.freeze({
     ownerDigest,
     dailyValues: [...dailyValues].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),

@@ -19,13 +19,15 @@
  *      same snapshot in bounded segments (the history before the analysis
  *      horizon in 60-day segments, each released before the next, then the
  *      analysis horizon), computed and released, so a heap holds one segment
- *      of an owner, not its whole history or the corpus. With --workers=1
- *      owners are computed inline, one at a time; with more (K-PAR) they run
- *      in compute Workers (analytics-refresh-pool.mjs), concurrent owners'
- *      estimates within the memory budget, while every read stays in this
- *      thread; either way owners are merged in digest order, so the outputs
- *      are identical. The exporting transaction stays open until the last
- *      read;
+ *      of an owner (two, prefetched, in a compute Worker), not its whole
+ *      history or the corpus. With --workers=1 owners are computed inline,
+ *      one at a time; with more (K-PAR, K-PAR-MEM) they run in compute
+ *      Workers (analytics-refresh-pool.mjs), each with a heap limit from its
+ *      estimate, admitted against the task memory the main heap leaves, while
+ *      every read stays in this thread: the Workers' loads run concurrently on
+ *      the snapshot connections and are streamed to them a read call at a
+ *      time; either way owners are merged in digest order, so the outputs are
+ *      identical. The exporting transaction stays open until the last read;
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
  *      the same session, then release the lock.
  *
@@ -39,8 +41,8 @@
  *
  * Production and staging (ANALYTICS_REFRESH_TARGET=production|staging): the
  * reviewed target path. The invocation is exactly
- *   node --max-old-space-size=<heap> dist/analytics-refresh.mjs --mode=full
- * (ANALYTICS_REFRESH_PRODUCTION_JOB: inline, no --workers), with no --schema, --now or
+ *   node dist/analytics-refresh.mjs --mode=full --workers=4
+ * (ANALYTICS_REFRESH_PRODUCTION_JOB: four compute Workers, no heap flag), with no --schema, --now or
  * --revision-seed, on the real clock. The environment is closed
  * (ANALYTICS_REFRESH_PRODUCTION_ENV): ANALYTICS_REFRESH_TARGET,
  * PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
@@ -175,15 +177,19 @@ import {
 } from "./analytics-refresh-read.mjs";
 import {
   ANALYTICS_REFRESH_WORKER_BOUNDS,
-  ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
+  ANALYTICS_REFRESH_WORKER_HEAP_MODEL,
+  analyticsRefreshWorkerPoolMinimumBytes,
   createAnalyticsRefreshOwnerPool,
 } from "./analytics-refresh-pool.mjs";
 
 // The read side (K-SPLIT) and the compute workers (K-PAR): re-exported so
 // callers keep one import surface.
 export {
+  ANALYTICS_REFRESH_LOAD_CONCURRENCY_BOUNDS,
   ANALYTICS_REFRESH_WORKER_BOUNDS,
-  ANALYTICS_REFRESH_WORKER_HEAP_RESERVE_BYTES,
+  ANALYTICS_REFRESH_WORKER_HEAP_MODEL,
+  analyticsRefreshWorkerHeapLimitBytes,
+  analyticsRefreshWorkerPoolMinimumBytes,
   createAnalyticsRefreshOwnerPool,
 } from "./analytics-refresh-pool.mjs";
 export {
@@ -198,6 +204,10 @@ export {
   ANALYTICS_REFRESH_MAX_READ_CANDIDATES,
   analyticsRefreshCacheFromDay,
   analyticsRefreshDaySpans,
+  analyticsRefreshForEachConcurrent,
+  analyticsRefreshSlots,
+  ANALYTICS_REFRESH_READ_CONCURRENCY,
+  mergeAnalyticsRefreshOccurrencePart,
   analyticsRefreshPublicationDays,
   analyticsRefreshRangeChunks,
   analyticsRefreshReadSpans,
@@ -242,47 +252,58 @@ export const ANALYTICS_REFRESH_RUNTIME_FORBIDDEN = Object.freeze(["NODE_OPTIONS"
   "NODE_TLS_REJECT_UNAUTHORIZED", "NODE_EXTRA_CA_CERTS"]);
 /**
  * The production refresh Job as C-INFRA renders it (gcp-ops-infra-manifest.mjs
- * renderJob; its check pins the render to this object). The task profile is
- * the dense one (4 vCPU, 16 GiB, a 12,288 MiB heap, a 10,752 MiB per-owner
- * budget, 4 h) until MEAS-3 measures the largest real owner on Cloud Run
- * (dense-owner parity receipt). The budget admits that owner at the high end
- * of its estimate (about 10 GiB when its records fall in the 170 analysis
- * days, which memory model v2 still charges whole; cap-raise receipt). A run
- * reclaims the part of it that its largest admitted owner leaves for the
- * output account (compute reclaimUnusedOwnerBudget).
+ * renderJob; its check pins the render to this object): the `dense-workers`
+ * task profile (owner decisions round 17, K-PAR-MEM). 4 vCPU and 16 GiB; four
+ * compute Workers (K-PAR) and NO heap flag (heapMiB null): a V8 heap flag
+ * applies to every isolate and overrides the Workers' own heap limits (the
+ * K-CORE-A W = 4 out-of-memory was the old profile's 3,072 MiB flag capping
+ * every Worker), so the main heap runs at V8's default for the task (about
+ * 4 GiB) and the Workers share the rest less a 1 GiB native reserve, each
+ * with a heap limit from its owner's memory estimate and admitted against
+ * that pool (analytics-refresh-pool.mjs; the Job refuses a heap flag with
+ * --workers > 1). The 10,752 MiB per-owner budget admits the largest real
+ * owner at the high end of its estimate; the pool's whole-pool limit holds it
+ * alone (analyticsRefreshWorkerPoolMinimumBytes).
  *
- * Inline (workers 1, K-CORE-A review): compute Workers (K-PAR, --workers=<n>)
- * stay out of the production profile until MEAS-3 measures a Worker's heap
- * peak on real owners. A Worker's heap limit is its owner's estimate plus a
- * fixed reserve, and the estimate is not a heap bound (the K-CORE-A receipt
- * sampled 2,275 MiB of used heap for a 1,517 MiB estimate), so an owner that
- * outgrows its Worker would fail the whole run where inline it computes in
- * the 12,288 MiB heap. The test-deploy profile `dense-workers` runs the
- * Workers for that measurement. One task, no retries: a run either writes
- * everything in one transaction or nothing, and the time guard refuses it
- * before taskTimeoutSeconds. `args` follows `node`.
+ * The task timeout is 24 h (round 17): the production-shaped synthetic
+ * corpus previously took about 4.2 h locally inline; the concurrently loaded
+ * recovery comparator took 5.42 h. The prior Cloud Run inline projection was
+ * 10 to 13 h, not a measured runtime; the Workers' run is in the K-PAR-MEM receipt. One task,
+ * no retries: a run either writes everything in one transaction or nothing,
+ * and the time guard refuses it before taskTimeoutSeconds. `args` follows
+ * `node`. The inline profile (`dense`: --max-old-space-size=12288, no
+ * --workers) stays the measured fallback.
  */
 export const ANALYTICS_REFRESH_PRODUCTION_JOB = Object.freeze({
   entry: "dist/analytics-refresh.mjs",
-  profile: "dense",
+  profile: "dense-workers",
   cpu: "4",
   memory: "16Gi",
-  heapMiB: 12_288,
+  heapMiB: null,
   memoryBudgetMiB: 10_752,
-  workers: 1,
-  taskTimeoutSeconds: 14_400,
+  workers: 4,
+  taskTimeoutSeconds: 86_400,
   tasks: 1,
   parallelism: 1,
   maxRetries: 0,
-  args: Object.freeze(["--max-old-space-size=12288", "dist/analytics-refresh.mjs", "--mode=full"]),
+  args: Object.freeze(["dist/analytics-refresh.mjs", "--mode=full", "--workers=4"]),
   env: ANALYTICS_REFRESH_PRODUCTION_ENV,
 });
 /**
- * The task-memory relation a refresh profile must keep (K-PAR): the main heap
- * and, with compute Workers, the Workers' per-owner budget and one heap
- * reserve (the pool keeps the Workers' heap limits together within the budget
- * plus one reserve; inline the budget is inside the main heap), with at least
- * nativeReserveMiB of the task's memory left for native allocations.
+ * V8's default heap limit (heap_size_limit, MiB) for a 16 GiB task under
+ * Node.js 22.16.0 without a heap flag: the main heap of the production
+ * profile. Measured locally (the default is the same on any host with at
+ * least 16 GiB); the Job reads the live value at start and derives the
+ * Workers' pool from it, so this constant only sizes the checks.
+ */
+export const ANALYTICS_REFRESH_DEFAULT_HEAP_LIMIT_MIB = 4_144;
+/**
+ * The task-memory relation a refresh profile must keep (K-PAR-MEM): the main
+ * heap and, with compute Workers, their pool (the task memory less the main
+ * heap and the native reserve; the pool's admission keeps the Workers' heap
+ * limits and overheads within it; inline the budget is inside the main
+ * heap), with at least nativeReserveMiB of the task's memory left for native
+ * allocations.
  */
 export const ANALYTICS_REFRESH_TASK_MEMORY_CHECK = Object.freeze({ taskMemoryMiB: 16_384, nativeReserveMiB: 1_024 });
 const KNOWN_FLAGS = new Set(["mode", "schema", "now", "revision-seed", "workers"]);
@@ -295,6 +316,12 @@ const SQL_STATE = /^[0-9A-Z]{5}$/u;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const PRIVATE_SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/u;
 const POOL_MAX = 4;
+/**
+ * Snapshot read connections (K-PAR-MEM): the pool less the session that holds
+ * the lock and exports the snapshot. The owner-scoped reads before compute
+ * and, with compute Workers, the owner loads run on up to this many at once.
+ */
+export const ANALYTICS_REFRESH_READ_CONNECTIONS = POOL_MAX - 1;
 const READ_STATEMENT_TIMEOUT_MILLISECONDS = 120_000;
 const READ_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "terminalOwners", "nonEffectiveUnread"]);
@@ -354,26 +381,37 @@ export const ANALYTICS_REFRESH_RESOURCE_ENV = Object.freeze({
  */
 export const ANALYTICS_REFRESH_HEAP_RESERVE = Object.freeze({ runtimeBytes: 256 * MIB, bytesPerReadCandidate: 4_096,
   minimumOutputBudgetBytes: 64 * MIB });
+/**
+ * V8 heap-size flags (either spelling): with compute Workers they are refused,
+ * because V8 applies them to every isolate and so overrides the Workers'
+ * resourceLimits (K-PAR-MEM).
+ */
+export const ANALYTICS_REFRESH_V8_HEAP_FLAG =
+  /^--(?:max|initial)[-_](?:old[-_]space|heap|semi[-_]space|young[-_]generation)[-_]size(?:=|$)/u;
 /** resources.ts ANALYTICS_V2_RESOURCE_BOUNDS.outputBudgetBytes.maximum (the spec pins the equality). */
 const MAX_OUTPUT_BUDGET_BYTES = 30_720 * MIB;
 
 /**
- * Measured phase rates (Node.js 22.16.0, local PostgreSQL 17, the dense-final
- * refresh of docs/receipts/2026-10-01-gcp-dense-owner-parity.md: 360,462
- * occurrences and about 294,000 analysis usage rows for owner e; read 134 s,
- * prepare 107.5 s, scalar 15.1 s, model 399.3 s, write under 1 s for about
- * 12 MB of rows), rounded down. The owner projection uses them as measured,
- * so a run is refused early only when even the local rates cannot finish;
- * a step about to start is projected at stepFactor times them (the test
- * deploy read Cloud SQL about 5x slower than locally), so no step starts that
- * could cross the refusal point. The write projection is deliberately
- * conservative: about 12 times the measured local rate, plus a fixed minute.
+ * Local planning rates from the completed 2026-10-03 recovery inline run:
+ * Node.js 22.16.0, PostgreSQL 17, 53 synthetic owners, 8,109,760 occurrences
+ * and 4,032,323 analysis usage rows. Read 4,029 s, prepare 3,614 s, scalar
+ * 311 s, model 11,547 s (docs/receipts/2026-10-03-gcp-kpar-mem.md).
+ * Rounded per-occurrence and per-analysis-usage rates replace the smaller
+ * 2026-10-01 dense-owner calibration. The local host was concurrently loaded;
+ * these conservative planning rates are not Cloud Run calibration.
+ *
+ * The plan uses local rates, refusing work that cannot finish even there.
+ * Before each step, stepFactor scales its projection (the earlier test read
+ * Cloud SQL about 5x slower locally), retaining write/exit margins before the
+ * 24-hour task limit. Dedicated production-tier cloud measurements must
+ * recalibrate that factor separately. The write estimate includes a fixed
+ * minute plus a conservative per-MiB allowance.
  */
 export const ANALYTICS_REFRESH_TIME_MODEL = Object.freeze({
-  readMsPerOccurrence: 0.37,
-  prepareMsPerOccurrence: 0.29,
-  scalarMsPerAnalysisUsage: 0.05,
-  modelMsPerAnalysisUsage: 1.35,
+  readMsPerOccurrence: 0.50,
+  prepareMsPerOccurrence: 0.45,
+  scalarMsPerAnalysisUsage: 0.08,
+  modelMsPerAnalysisUsage: 2.86,
   stepFactor: 5,
   writeFixedMs: 60_000,
   writeMsPerAccountMiB: 1_000,
@@ -398,8 +436,9 @@ refusal) or 1 (failure).
 Production and staging: ANALYTICS_REFRESH_TARGET=production|staging with
 exactly PRIMARY_INSTANCE_CONNECTION_NAME, PRIMARY_DATABASE, PRIMARY_SCHEMA,
 POSTGRES_IAM_USER and ANALYTICS_V2_MEMORY_BUDGET_MIB; no --schema, --now or
---revision-seed; run as node --max-old-space-size=12288 dist/analytics-refresh.mjs
---mode=full (the dense profile, inline, 4 h task timeout).
+--revision-seed; run as node dist/analytics-refresh.mjs --mode=full --workers=4
+(the dense-workers profile: four compute Workers, no heap flag, 24 h task
+timeout). With --workers > 1 a V8 heap flag is refused.
 
 Resources (environment, within bounds): ANALYTICS_V2_MEMORY_BUDGET_MIB (4608),
 ANALYTICS_V2_MAX_DAY_OCCURRENCES (250000), ANALYTICS_V2_MAX_DAY_RECORD_MIB (256),
@@ -708,7 +747,8 @@ function resourceValue(env, entry) {
  * the whole run is bounded: one admitted owner's estimate, the accounted
  * outputs and held inputs, and the reserves.
  */
-export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1 } = {}) {
+export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1,
+  taskMemoryBytes = ANALYTICS_REFRESH_TASK_MEMORY_CHECK.taskMemoryMiB * MIB, execArgv = [] } = {}) {
   const spec = ANALYTICS_REFRESH_RESOURCE_ENV;
   const reserve = ANALYTICS_REFRESH_HEAP_RESERVE;
   if (!Number.isSafeInteger(workers) || workers < ANALYTICS_REFRESH_WORKER_BOUNDS.minimum
@@ -721,7 +761,9 @@ export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1 } =
   const readChunkOccurrences = resourceValue(env, spec.readChunkOccurrences);
   // Inline (one worker) the owner being computed lives in the main heap; with
   // compute Workers (K-PAR) it lives in a Worker's own heap, and the main heap
-  // holds one read chunk at a time (the pool serializes loads).
+  // holds about one read chunk across the loads in flight (K-PAR-MEM: each
+  // load's read calls target the chunk divided by the load concurrency, and
+  // are streamed to their Worker one call at a time).
   const ownerBytesInHeap = workers === 1 ? memoryBudgetBytes : 0;
   const reservedBytes = ownerBytesInHeap + reserve.runtimeBytes + readChunkOccurrences * reserve.bytesPerReadCandidate;
   const requiredHeapBytes = reservedBytes + reserve.minimumOutputBudgetBytes;
@@ -729,12 +771,34 @@ export function analyticsRefreshResources(env, heapLimitBytes, { workers = 1 } =
     fail("ANALYTICS_V2_REFRESH_HEAP_INSUFFICIENT");
   }
   const outputBudgetBytes = Math.min(heapLimitBytes - reservedBytes, MAX_OUTPUT_BUDGET_BYTES);
+  // K-PAR-MEM: the compute Workers share the task memory the main heap and
+  // the native reserve leave. The pool must run the largest owner the budget
+  // admits at its modelled heap, alone (analytics-refresh-pool.mjs).
+  let workerPool = null;
+  if (workers > 1) {
+    // A V8 heap flag is process-wide: it overrides every Worker's
+    // resourceLimits (in both directions), so the pool's limits and its
+    // admission would not hold. Compute Workers run with the main heap at
+    // V8's default; the Workers re-check their limits (analytics-refresh-pool.mjs).
+    const flags = [...(Array.isArray(execArgv) ? execArgv : []),
+      ...(typeof env?.NODE_OPTIONS === "string" ? env.NODE_OPTIONS.split(/\s+/u) : [])];
+    if (flags.some((flag) => typeof flag === "string" && ANALYTICS_REFRESH_V8_HEAP_FLAG.test(flag))) {
+      fail("ANALYTICS_V2_REFRESH_WORKER_HEAP_FLAG_FORBIDDEN", { usage: true });
+    }
+    if (!Number.isSafeInteger(taskMemoryBytes) || taskMemoryBytes < 1) fail("ANALYTICS_V2_REFRESH_WORKER_POOL_INSUFFICIENT");
+    const poolBytes = taskMemoryBytes - ANALYTICS_REFRESH_TASK_MEMORY_CHECK.nativeReserveMiB * MIB - heapLimitBytes;
+    if (poolBytes < analyticsRefreshWorkerPoolMinimumBytes(memoryBudgetBytes)) {
+      fail("ANALYTICS_V2_REFRESH_WORKER_POOL_INSUFFICIENT");
+    }
+    workerPool = Object.freeze({ poolBytes, loadConcurrency: Math.min(workers, ANALYTICS_REFRESH_READ_CONNECTIONS) });
+  }
   return Object.freeze({
     compute: Object.freeze({ memoryBudgetBytes, maxDayOccurrences, maxDayRecordBytes, outputBudgetBytes }),
     readChunkOccurrences,
     heapLimitBytes,
     requiredHeapBytes,
     workers,
+    workerPool,
   });
 }
 
@@ -1073,7 +1137,7 @@ function defaultPeakRssBytes() {
  * sampled heap and the process's peak resident set at the end of compute.
  * Per-owner figures go to analytics_v2_runs.timings only.
  */
-function memorySummary(resources, recorded, peakRssBytes) {
+function memorySummary(resources, recorded, peakRssBytes, { mainHeapPeakBytes = null, workerPool = null } = {}) {
   const owners = Array.isArray(recorded?.owners) ? recorded.owners : [];
   const toMiB = (bytes) => Math.ceil(bytes / MIB);
   const largest = (values) => values.reduce((maximum, value) => Math.max(maximum, value), 0);
@@ -1098,6 +1162,37 @@ function memorySummary(resources, recorded, peakRssBytes) {
     accountMiB: Number.isSafeInteger(recorded?.account?.accountBytes) ? toMiB(recorded.account.accountBytes) : null,
     heldInputMiB: Number.isSafeInteger(recorded?.account?.heldInputBytes) ? toMiB(recorded.account.heldInputBytes) : null,
     largestOwnerOutputMiB: toMiB(largest(owners.map((owner) => owner.outputBytes ?? 0))),
+    mainHeapPeakMiB: Number.isSafeInteger(mainHeapPeakBytes) && mainHeapPeakBytes >= 0 ? toMiB(mainHeapPeakBytes) : null,
+    // K-PAR-MEM: the compute Workers' pool and what it did (null inline).
+    workerPool: resources.workerPool === null || resources.workerPool === undefined ? null : Object.freeze({
+      heapModel: ANALYTICS_REFRESH_WORKER_HEAP_MODEL.version,
+      poolMiB: Math.floor(resources.workerPool.poolBytes / MIB),
+      loadConcurrency: resources.workerPool.loadConcurrency,
+      ...(workerPool === null ? {} : {
+        started: workerPool.started,
+        retriedAlone: workerPool.retriedAlone,
+        peakRunning: workerPool.peakRunning,
+        peakChargedMiB: toMiB(workerPool.peakChargedBytes),
+        peakLoads: workerPool.peakLoads,
+        largestGcCallbackHeapMiB: workerPool.largestGcCallbackHeapBytes === null
+          ? null : toMiB(workerPool.largestGcCallbackHeapBytes),
+        largestGcCallbackHeapPercentOfLimit: workerPool.largestGcCallbackHeapShareOfLimit === null
+          ? null : Math.ceil(workerPool.largestGcCallbackHeapShareOfLimit * 100),
+      }),
+    }),
+  });
+}
+
+/** Samples the main heap's used size every few seconds until stopped; peak() is the largest seen. */
+function sampleMainHeap(intervalMs = 2_000) {
+  let peak = 0;
+  const sample = () => { peak = Math.max(peak, getHeapStatistics().used_heap_size); };
+  sample();
+  const timer = setInterval(sample, intervalMs);
+  timer.unref?.();
+  return Object.freeze({
+    peak: () => { sample(); return peak; },
+    stop: () => clearInterval(timer),
   });
 }
 
@@ -1153,6 +1248,9 @@ export async function runAnalyticsRefresh({
     workers: parsed.workers,
   };
   let phase = "configuration";
+  // The main heap's peak, sampled (operational metadata: it sizes the main
+  // heap of a compute-Worker profile; no decision reads it).
+  const mainHeap = sampleMainHeap();
   let ownerPool;
   let connector;
   let pool;
@@ -1166,7 +1264,8 @@ export async function runAnalyticsRefresh({
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
     const resources = analyticsRefreshResources(env,
-      dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit, { workers: parsed.workers });
+      dependencies.heapLimitBytes ?? getHeapStatistics().heap_size_limit,
+      { workers: parsed.workers, execArgv: dependencies.execArgv ?? process.execArgv });
     const guard = createAnalyticsRefreshTimeGuard({ startedAtMs,
       taskTimeoutMs: analyticsRefreshTaskTimeoutMs(env, production), wallClock });
     // A deadline that leaves no room for the write and the exit is refused
@@ -1221,6 +1320,7 @@ export async function runAnalyticsRefresh({
       if (parsed.workers > 1) {
         ownerPool = (dependencies.createOwnerPool ?? createAnalyticsRefreshOwnerPool)({
           workers: parsed.workers, memoryBudgetBytes: resources.compute.memoryBudgetBytes,
+          poolBytes: resources.workerPool.poolBytes, loadConcurrency: resources.workerPool.loadConcurrency,
           ...(dependencies.workerUrl === undefined ? {} : { workerUrl: dependencies.workerUrl }) });
       }
       let inputs;
@@ -1236,6 +1336,14 @@ export async function runAnalyticsRefresh({
           revisionSeed: parsed.revisionSeed,
           resources,
           checkpoint: guard.checkpoint,
+          // K-PAR-MEM: with compute Workers, owner loads run concurrently on
+          // the snapshot read connections. The owner-scoped reads before
+          // compute stay one at a time: three at once pushed a count past the
+          // reader's 300 s statement timeout on the contended local cluster
+          // (docs/receipts/2026-10-03-gcp-kpar-mem.md); the production-tier
+          // measurement decides whether to raise it.
+          readConcurrency: 1,
+          loadConcurrency: resources.workerPool?.loadConcurrency ?? 1,
         });
         readMs = Math.max(0, wallClock() - readStartedMs);
         // Owners are read in the same snapshot while they are computed.
@@ -1261,8 +1369,13 @@ export async function runAnalyticsRefresh({
           server: analyticsRefreshServerStatementDelta(serverBefore, await readAnalyticsRefreshServerStatements(pool)),
         });
       } finally {
-        await readPool.close();
-        if (ownerPool !== undefined) await ownerPool.abort();
+        // Drain streamed loads before closing their snapshot readers. An
+        // aborted Worker can leave a bounded read call in flight.
+        try {
+          if (ownerPool !== undefined) await ownerPool.abort();
+        } finally {
+          await readPool.close();
+        }
       }
       await client.query("COMMIT");
       readOpen = false;
@@ -1308,7 +1421,8 @@ export async function runAnalyticsRefresh({
         blocked: written.publication.blocked,
         cursor: written.cursor,
         timings: written.timings,
-        memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)()),
+        memory: memorySummary(resources, outputs.resources, (dependencies.peakRssBytes ?? defaultPeakRssBytes)(),
+          { mainHeapPeakBytes: mainHeap.peak(), workerPool: ownerPool?.stats?.() ?? null }),
         reads,
         exclusions: exclusionSummary(outputs.exclusions),
         timeGuard: guard.summary(),
@@ -1360,6 +1474,7 @@ export async function runAnalyticsRefresh({
       }
     }
   }
+  mainHeap.stop();
   if (failure !== undefined) throw failure;
   return receipt;
 }
