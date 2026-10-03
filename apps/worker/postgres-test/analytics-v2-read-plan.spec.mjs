@@ -339,3 +339,64 @@ test("expansion SQL remains byte-identical and candidate bounds retain their ref
     assert.deepEqual(await outcome(() => oracle.readOwnerOccurrences(context, options)), { error: "ANALYTICS_V2_SOURCE_LIMIT" });
   });
 });
+
+test("actual snapshot pipeline inputs equal the old pre-owner pass at concurrency 1–4", { skip: SKIP, timeout: 120_000 }, async () => {
+  const { createAnalyticsV2Pipeline, createSnapshotReadPool, createAnalyticsRefreshStatementLedger } = await import("../cloud-run/analytics-refresh-read.mjs");
+  const devices = await vite.ssrLoadModule("/src/analytics-v2/devices.ts");
+  const fixture = fixtures.active;
+  const common = { owners, devices, queuedDays: { readQueuedDays: async () => ({ days: [D1, D2, D3],
+    terminalOwners: [], lastSequence: 0, complete: true }) },
+    ownerSets: { readAnalyticsV2OwnerSetState: async (_context, { days }) => ({ days: new Map(days.map((value) => [value,
+      { members: new Map() }])), frozen: null }), readAnalyticsV2SavedContributionValues: async () => new Map() },
+    compute: { ANALYTICS_V2_ANALYSIS_DAYS: 170, computeAnalyticsV2: async () => ({}),
+      analyticsV2RequiredOccurrenceRange: ({ cacheFromDay }) => ({ fromDay: cacheFromDay, throughDay: D3 }) } };
+  const exporter = await pool.connect();
+  let reads;
+  try {
+    await exporter.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const id = (await exporter.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
+    const ledger = createAnalyticsRefreshStatementLedger();
+    reads = createSnapshotReadPool(pool, id, { ledger });
+    const options = { pool: reads, schema: fixture.schema, nowMs: NOW_MS,
+      state: { cursor: null, carriedBlockedDays: [], publishedDays: [], appliedExclusionsSha256: "0".repeat(64), cacheFloorDay: null } };
+    const old = createAnalyticsV2Pipeline({ ...common, occurrences: { ...oracle } });
+    const planned = createAnalyticsV2Pipeline({ ...common, occurrences: head });
+    const before = await old.read(options);
+    for (const readConcurrency of [1, 2, 3, 4]) {
+      // max4 includes the exporter; up to3 physical read connections suffice
+      // to qualify ordering at requested concurrency4 (one waits locally).
+      const previous = ledger.summary().families;
+      const after = await planned.read({ ...options, readConcurrency });
+      const current = ledger.summary().families;
+      assert.equal(current["occurrences.first_evidence"].calls, previous["occurrences.first_evidence"].calls,
+        "no first-evidence statement after the switch");
+      assert.equal(current["occurrences.counts"].calls - previous["occurrences.counts"].calls,
+        before.owners.filter((owner) => owner.source === "effective").length * 3,
+        "one plan statement per effective owner and stream");
+      for (const field of ["ownerEvidence", "streamCounts", "firstEvidenceDay", "occurrenceRange", "cacheFromDay", "owners",
+        "occurrencesByOwner", "queuedDays", "devicesByDay"]) assert.deepEqual(after[field], before[field], field);
+    }
+  } finally {
+    if (reads) await reads.close();
+    await exporter.query("ROLLBACK"); exporter.release();
+  }
+});
+
+test("corpus A/B entrypoint runs on the same small synthetic schema with content-free output", {
+  skip: SKIP || !process.env.READ_PLAN_AB_BASE_ROOT, timeout: 120_000,
+}, async () => {
+  const { readPlanAB } = await import("../scripts/analytics-v2-read-plan-ab.mjs");
+  const report = await readPlanAB(["--base-root", process.env.READ_PLAN_AB_BASE_ROOT,
+    "--schema", fixtures.staged.schema, "--from", D1, "--through", D3, "--bench"]);
+  assert.ok(report.owners > 0 && report.comparisons.length > 0);
+  assert.equal(report.spans, 1);
+  assert.deepEqual(report.concurrencyTimings.map((row) => row.concurrency), [1, 2, 3, 4]);
+  assert.ok(report.statements.length > 0);
+  for (const statement of report.statements) {
+    assert.ok(Number.isFinite(statement.serverMs) && statement.serverMs >= 0);
+    assert.ok(Number.isFinite(statement.planCost) && statement.planCost >= 0);
+  }
+  for (const comparison of report.comparisons) assert.match(comparison.sha256, /^[0-9a-f]{64}$/u);
+  assert.equal(JSON.stringify(report).includes("ownerDigest"), false);
+  assert.equal(JSON.stringify(report).includes("occurrence_id"), false);
+});

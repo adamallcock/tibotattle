@@ -159,7 +159,7 @@ test("an occurrence part merges by day and stream, and refuses an unknown stream
 });
 
 /** A-1/A-2 stand-ins for the default pipeline: three owners, counted and read per stream and span. */
-function stubPipeline(log) {
+function stubPipeline(log, { plan = false, firstError = null, countError = null, oversizedRange = false } = {}) {
   const OWNERS = ["a", "b", "c"].map((letter) => letter.repeat(64));
   const counts = new Map([["2026-09-01", 3], ["2026-09-20", 2], ["2026-09-30", 4]]);
   const occurrences = {
@@ -182,6 +182,19 @@ function stubPipeline(log) {
       return ownerDigest.startsWith("b") ? "2026-08-01" : "2026-09-01";
     },
   };
+  if (plan) {
+    occurrences.readOwnerEvidencePlan = async (_context, { ownerDigest, streams, fromDay, throughDay, firstEvidenceThroughDay }) => {
+      log.push(["plan", ownerDigest.slice(0, 1), fromDay, throughDay, firstEvidenceThroughDay]);
+      await new Promise((resolve) => setTimeout(resolve, ownerDigest.startsWith("a") ? 5 : 1));
+      if (firstError) throw firstError(ownerDigest);
+      return new Map(streams.map((stream) => [stream, { counts,
+        firstEvidenceDay: ownerDigest.startsWith("b") ? "2026-08-01" : "2026-09-01" }]));
+    };
+    occurrences.countOwnerEvidencePlanRange = async (_context, _plan, { ownerDigest, fromDay, throughDay }) => {
+      if (countError) throw countError(ownerDigest);
+      return new Map([...counts].filter(([day]) => day >= fromDay && day <= throughDay));
+    };
+  }
   return createAnalyticsV2Pipeline({
     owners: {
       analyticsV2ExcludedOn: () => false,
@@ -205,7 +218,7 @@ function stubPipeline(log) {
     compute: {
       ANALYTICS_V2_ANALYSIS_DAYS: 170,
       computeAnalyticsV2: async () => ({}),
-      analyticsV2RequiredOccurrenceRange: ({ cacheFromDay }) => ({ fromDay: cacheFromDay, throughDay: "2026-10-01" }),
+      analyticsV2RequiredOccurrenceRange: ({ cacheFromDay }) => ({ fromDay: oversizedRange ? "1696-03-17" : cacheFromDay, throughDay: "2026-10-01" }),
     },
   });
 }
@@ -265,4 +278,50 @@ test("shared read slots: at most `size` works at once across callers, first come
   assert.deepEqual(results.map((value) => value.status), ["fulfilled", "rejected", "fulfilled", "fulfilled"]);
   assert.equal(await work("e", 1), "e", "a failed work frees its slot");
   for (const size of [0, 9, 1.5]) assert.throws(() => analyticsRefreshSlots(size), refused("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID"));
+});
+
+
+test("merged evidence plans preserve every input and map order at concurrency 1–4, with a checkpoint before each plan", async () => {
+  const state = { cursor: null, carriedBlockedDays: [], publishedDays: [], appliedExclusionsSha256: "0".repeat(64), cacheFloorDay: null };
+  const options = { pool: {}, schema: "s", nowMs: Date.parse("2026-10-01T12:00:00Z"), state };
+  const before = await stubPipeline([]).read(options);
+  for (const readConcurrency of [1, 2, 3, 4]) {
+    const log = [];
+    const after = await stubPipeline(log, { plan: true }).read({ ...options, readConcurrency,
+      checkpoint: (event) => log.push(["checkpoint", event.ownerIndex]) });
+    for (const field of ["ownerEvidence", "streamCounts", "firstEvidenceDay", "occurrenceRange", "cacheFromDay", "owners"])
+      assert.deepEqual(after[field], before[field], field);
+    assert.equal(log.filter(([kind]) => kind === "first" || kind === "count").length, 0);
+    assert.equal(log.filter(([kind]) => kind === "plan").length, 3);
+    for (const [index, letter] of ["a", "b", "c"].entries()) {
+      const at = log.findIndex((entry) => entry[0] === "plan" && entry[1] === letter);
+      assert.deepEqual(log[at - 1], ["checkpoint", index], "checkpoint precedes each owner plan with the sorted owner index");
+    }
+  }
+});
+
+test("ordered first-plan failures precede range, and count failures follow RANGE_EXCEEDED", async () => {
+  const state = { cursor: null, carriedBlockedDays: [], publishedDays: [], appliedExclusionsSha256: "0".repeat(64), cacheFloorDay: null };
+  const options = { pool: {}, schema: "s", nowMs: Date.parse("2026-10-01T12:00:00Z"), state, readConcurrency: 3 };
+  const error = (code) => Object.assign(new Error(code), { code });
+  await assert.rejects(stubPipeline([], { plan: true, oversizedRange: true,
+    firstError: (owner) => error(owner.startsWith("a") ? "ANALYTICS_V2_SOURCE_UNAVAILABLE" : "ANALYTICS_V2_SOURCE_CONFLICT") }).read(options),
+  { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+  await assert.rejects(stubPipeline([], { plan: true, oversizedRange: true,
+    countError: () => error("ANALYTICS_V2_SOURCE_CONFLICT") }).read(options), { code: "ANALYTICS_V2_REFRESH_RANGE_EXCEEDED" });
+  await assert.rejects(stubPipeline([], { plan: true,
+    countError: (owner) => error(owner.startsWith("a") ? "ANALYTICS_V2_SOURCE_LIMIT" : "ANALYTICS_V2_SOURCE_CONFLICT") }).read(options),
+  { code: "ANALYTICS_V2_SOURCE_LIMIT" });
+});
+
+test("checkpoint cancellation settles started plan work and starts no later owner", async () => {
+  const state = { cursor: null, carriedBlockedDays: [], publishedDays: [], appliedExclusionsSha256: "0".repeat(64), cacheFloorDay: null };
+  const log = [];
+  await assert.rejects(stubPipeline(log, { plan: true }).read({ pool: {}, schema: "s", nowMs: Date.parse("2026-10-01T12:00:00Z"), state,
+    readConcurrency: 2, checkpoint: (event) => {
+      log.push(["checkpoint", event.ownerIndex]);
+      if (event.ownerIndex === 1) throw Object.assign(new Error("ANALYTICS_V2_REFRESH_TIME_EXCEEDED"), { code: "ANALYTICS_V2_REFRESH_TIME_EXCEEDED" });
+    } }), { code: "ANALYTICS_V2_REFRESH_TIME_EXCEEDED" });
+  assert.deepEqual(log.filter(([kind]) => kind === "plan").map((entry) => entry[1]), ["a"]);
+  assert.equal(log.some((entry) => entry[0] === "checkpoint" && entry[1] === 2), false);
 });

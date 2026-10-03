@@ -1414,6 +1414,11 @@ export interface ReadOwnerEvidencePlanOptions {
   readonly firstEvidenceThroughDay: AnalyticsV2Day;
 }
 
+/**
+ * Caller-readonly maps: Object.freeze seals their own properties, while
+ * native Map mutators remain available at runtime. Consumers must not mutate
+ * the returned maps. Range validation uses private snapshot aggregates.
+ */
 export interface AnalyticsV2StreamEvidencePlan {
   readonly counts: ReadonlyMap<AnalyticsV2Day, number>;
   readonly firstEvidenceDay: AnalyticsV2Day | null;

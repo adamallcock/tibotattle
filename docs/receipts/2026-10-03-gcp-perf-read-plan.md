@@ -23,8 +23,11 @@ completeness variant; no grouped-count performance claim is made here.
 `readOwnerEvidencePlan` reads scope once, then one unnamed existing
 `occurrences.counts` statement per stream. The counts deduplicate
 (day, occurrence) with GROUP BY and bool_or, preserving the old set UNION
-while allowing hash aggregation. It expands and decodes no source. A frozen
+while allowing hash aggregation. It expands and decodes no source. A caller-readonly frozen
 stream map contains ascending count maps and each stream's first evidence day.
+Object.freeze seals own properties, while native Map mutators remain available
+at runtime; trusted callers must not mutate these maps. Chunk validation reads
+private snapshot aggregates rather than the exposed maps.
 Private content-free metadata permits `countOwnerEvidencePlanRange` to
 reapply the exact 400-day partition checks after the job's range validation.
 A plan is bound to its owner, pool, schema, clock and supplied client; the
@@ -172,3 +175,47 @@ The brief's Cloud SQL ratios 2.5–5.35 and 8.9, projected savings and timeout
 margin remain unverified here. No new local statement performance estimate,
 Cloud SQL JIT benefit or cloud wall-time claim is made. A combined serving
 image must wait for coordinator registration and complete gates.
+
+
+## Stage 2 validation update
+
+The actual PostgreSQL pipeline read inputs are deep-equal to the old pre-owner
+pass at requested concurrency 1–4, including every Map's iteration order,
+non-effective occurrences, planned owners, devices and range. The test holds
+one exported snapshot. Its pool has four connections including the exporter,
+so requested concurrency 4 includes one waiting reader and proves ordering,
+not a four-physical-connection performance or timeout margin.
+The source-family ledger proves zero first_evidence calls and exactly three
+counts statements per effective owner in each planned pass.
+The content-free corpus A/B entrypoint also ran against the same small direct-
+seed schema and approved base checkout, including its sequential EXPLAIN
+mode and concurrency 1–4 mode; no production-shaped corpus was used.
+
+Validated: TypeScript; analytics-v2 254/254 plus the 10,000-event differential
+(91,122 comparisons); unchanged vendor 59/59; architecture; preflight 21/21;
+existing occurrence/new read-plan PG 24/24 before the two additional pipeline/
+script tests; focused additional pipeline/script tests 2/2; refresh-read 11/11.
+Full existing refresh spec: 63/64 pass, with the one bundled K-PAR test refusing
+because cloud-run/dist has not been built for this unregistered closure.
+Cloud-run check reaches the build and refuses CLOUD_RUN_BUILD_KERNEL_UNREGISTERED.
+Fastpath script checks have the expected registry/closure refusals. Q-1 bundled
+rehearsal and the missing bundled K-PAR test wait for coordinator registration;
+no gate or registry assertion was weakened to hide the fold gap.
+
+Internal raw candidate Map insertion order on large corpora remains a specific
+measurement gate: the old SQL groups without ORDER BY. Public occurrence,
+count and fingerprint order is equal in the synthetic tests. This receipt does
+not claim that every unordered intermediate SQL row order is stable across
+full-corpus query plans.
+
+## Final lane closure for integrator
+
+- computeClosureSha256: `082c5df84a25705e71bde3e33db921f384ef571e973085b604e4a25c5cb00f41`
+- computeSha256: `085f70e61c91a6e0e90be6d72d5e610143b1e88b8d6d576bd45e3fbe2610e7e5`
+- vendorManifestSha256: `85e919a6f439ff351c37d5df373d2d7299dafa1d4cac2359de9b580f151d7241`
+
+The coordinator assigns the combined append-only kernel entry. These hashes
+name this isolated lane only; they are not the final combined kernel identity.
+The final new read-plan spec is 9/9 passing with zero skips when supplied the
+private cluster and explicit approved A/B base root. The final scripted read
+checks are 11/11, and staged documentation preflight is 21/21.

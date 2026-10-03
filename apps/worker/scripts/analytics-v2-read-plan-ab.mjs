@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { createServer } from "vite";
 import pg from "pg";
-import { analyticsRefreshRangeChunks, createSnapshotReadPool } from "../cloud-run/analytics-refresh-read.mjs";
+import { analyticsRefreshRangeChunks, analyticsRefreshReadSpans, createSnapshotReadPool } from "../cloud-run/analytics-refresh-read.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const STREAMS = ["usage", "quota", "session"];
@@ -120,21 +120,35 @@ export async function readPlanAB(argv = process.argv.slice(2)) {
       let baseEvidenceMs = performance.now() - oldStart;
       const firstDays = planned.value ? [...planned.value.values()].map((part) => part.firstEvidenceDay).filter((day) => day !== null).sort() : [];
       assert.deepEqual(planned.refusal ? { refusal: planned.refusal } : { value: firstDays[0] ?? null }, oldFirst);
-      for (const stream of STREAMS) for (const [spanIndex, span] of spans.entries()) {
-        const request = { ownerDigest, stream, ...span };
-        for (const method of ["countOwnerOccurrences", "readOwnerOccurrences"]) {
-          phase = `base-${ownerIndex}-${stream}-${spanIndex}-${method}`;
+      for (const stream of STREAMS) {
+        const dayCounts = new Map();
+        for (const [spanIndex, span] of spans.entries()) {
+          const request = { ownerDigest, stream, ...span };
+          phase = `base-${ownerIndex}-${stream}-${spanIndex}-countOwnerOccurrences`;
           const beforeStart = performance.now();
-          const before = await outcome(() => base.occurrences[method](context, request));
-          if (method === "countOwnerOccurrences") baseEvidenceMs += performance.now() - beforeStart;
-          phase = `head-${ownerIndex}-${stream}-${spanIndex}-${method}`;
-          const after = await outcome(() => head.occurrences[method](context, request));
+          const before = await outcome(() => base.occurrences.countOwnerOccurrences(context, request));
+          baseEvidenceMs += performance.now() - beforeStart;
+          phase = `head-${ownerIndex}-${stream}-${spanIndex}-countOwnerOccurrences`;
+          const after = await outcome(() => head.occurrences.countOwnerOccurrences(context, request));
           assert.deepEqual(after, before);
-          report.comparisons.push({ ownerIndex, stream, spanIndex, method, sha256: digest(after),
+          if (before.value) for (const [day, count] of before.value) dayCounts.set(day, count);
+          report.comparisons.push({ ownerIndex, stream, spanIndex, method: "countOwnerOccurrences", sha256: digest(after),
             days: after.value instanceof Map ? after.value.size : null, refusal: after.refusal ?? null });
-          if (method === "countOwnerOccurrences" && planned.value) {
-            assert.deepEqual(await outcome(() => head.occurrences.countOwnerEvidencePlanRange(context, planned.value, request)), before);
-          }
+          if (planned.value) assert.deepEqual(await outcome(() => head.occurrences.countOwnerEvidencePlanRange(context, planned.value, request)), before);
+        }
+        // Use the Job's reviewed public span planner; a whole-history span
+        // over2M candidates could otherwise prove only a matching ceiling
+        // refusal rather than actual occurrence/selection equivalence.
+        const readSpans = analyticsRefreshReadSpans({ fromDay: opts.from, throughDay: opts.through }, 400, dayCounts, 250_000);
+        for (const [spanIndex, span] of readSpans.entries()) {
+          const request = { ownerDigest, stream, ...span };
+          phase = `base-${ownerIndex}-${stream}-${spanIndex}-readOwnerOccurrences`;
+          const before = await outcome(() => base.occurrences.readOwnerOccurrences(context, request));
+          phase = `head-${ownerIndex}-${stream}-${spanIndex}-readOwnerOccurrences`;
+          const after = await outcome(() => head.occurrences.readOwnerOccurrences(context, request));
+          assert.deepEqual(after, before);
+          report.comparisons.push({ ownerIndex, stream, spanIndex, method: "readOwnerOccurrences", sha256: digest(after),
+            days: after.value instanceof Map ? after.value.size : null, refusal: after.refusal ?? null });
         }
       }
       report.planTimings.push({ ownerIndex, planMs, baseFirstAndCountsMs: baseEvidenceMs,

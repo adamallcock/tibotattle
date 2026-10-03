@@ -1603,13 +1603,10 @@ export async function runAnalyticsRefresh({
           revisionSeed: parsed.revisionSeed,
           resources,
           checkpoint,
-          // K-PAR-MEM: with compute Workers, owner loads run concurrently on
-          // the snapshot read connections. The owner-scoped reads before
-          // compute stay one at a time: three at once pushed a count past the
-          // reader's 300 s statement timeout on the contended local cluster
-          // (docs/receipts/2026-10-03-gcp-kpar-mem.md); the production-tier
-          // measurement decides whether to raise it.
-          readConcurrency: 1,
+          // READ-PLAN: the merged evidence pass uses the run's snapshot
+          // read connections. Count validation remains after range checks;
+          // Cloud SQL timeout margin is a separate combined-candidate gate.
+          readConcurrency: ANALYTICS_REFRESH_READ_CONNECTIONS,
           loadConcurrency: resources.workerPool?.loadConcurrency ?? 1,
         });
         readMs = Math.max(0, wallClock() - readStartedMs);

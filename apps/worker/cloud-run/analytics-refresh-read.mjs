@@ -472,13 +472,16 @@ export const ANALYTICS_REFRESH_READ_CONCURRENCY = Object.freeze({ minimum: 1, ma
  * Run `work(item, index)` for every item with at most `concurrency` running
  * at once, in item order. The first failure stops new work; the call settles
  * only after every started item has, then throws that failure, so no read
- * outlives the call. Results are returned in item order.
+ * outlives the call. With failureOrder="item", the smallest started item
+ * index's failure wins; all smaller indices have already started when a
+ * later item fails. Results are returned in item order.
  */
-export async function analyticsRefreshForEachConcurrent(items, concurrency, work) {
+export async function analyticsRefreshForEachConcurrent(items, concurrency, work, { failureOrder = "completion" } = {}) {
   if (!Number.isSafeInteger(concurrency) || concurrency < ANALYTICS_REFRESH_READ_CONCURRENCY.minimum
       || concurrency > ANALYTICS_REFRESH_READ_CONCURRENCY.maximum) {
     fail("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID");
   }
+  if (!["completion", "item"].includes(failureOrder)) fail("ANALYTICS_V2_REFRESH_READ_CONCURRENCY_INVALID");
   const results = new Array(items.length);
   let next = 0;
   let failure = null;
@@ -488,7 +491,7 @@ export async function analyticsRefreshForEachConcurrent(items, concurrency, work
       try {
         results[index] = await work(items[index], index);
       } catch (error) {
-        failure ??= { error };
+        if (failure === null || (failureOrder === "item" && index < failure.index)) failure = { error, index };
       }
     }
   };
@@ -577,6 +580,10 @@ function compareOwners(left, right) {
  *   MAX_ANALYTICS_V2_OCCURRENCE_DAYS a call;
  * - countOwnerOccurrences(context, {ownerDigest, stream, fromDay, throughDay})
  *   -> Map(day -> the exact count readOwnerOccurrences returns), same bound;
+ * - readOwnerEvidencePlan(context, {ownerDigest, streams, fromDay,
+ *   throughDay, firstEvidenceThroughDay}) -> per-stream first days and counts;
+ * - countOwnerEvidencePlanRange(context, plan, options) -> exactly one old
+ *   count chunk, with its correction-boundary refusals after range checks;
  * - readOwnerFirstEvidenceDay(context, {ownerDigest, throughDay}) -> the
  *   owner's first evidence day or null (the cache horizon's lower end);
  * - countContributingDevices(context, {days: Map(day -> effective owners)});
@@ -612,6 +619,14 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
   const countOccurrences = requireFunction(occurrences, "countOwnerOccurrences");
   const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
+  const readEvidencePlan = occurrences?.readOwnerEvidencePlan;
+  const countPlanRange = occurrences?.countOwnerEvidencePlanRange;
+  // Public readers supplied together opt into the merged pass. Older public
+  // reader modules retain their original bounded first/count path.
+  if ((readEvidencePlan !== undefined || countPlanRange !== undefined)
+      && (typeof readEvidencePlan !== "function" || typeof countPlanRange !== "function")) {
+    fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE");
+  }
   const countDevices = requireFunction(devices, "countContributingDevices");
   const readExclusions = requireFunction(owners, "readAnalyticsV2Exclusions");
   const excludedOn = requireFunction(owners, "analyticsV2ExcludedOn");
@@ -698,14 +713,15 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   }
 
   /** One effective owner's exact counts per stream and day over `chunks` (A-1's own candidate selection). */
-  async function countOwnerEvidence(context, ownerDigest, chunks) {
+  async function countOwnerEvidence(context, ownerDigest, chunks, plan = null) {
     const byStream = {};
     const evidence = new Map();
     for (const stream of OCCURRENCE_STREAMS) {
       const counts = new Map();
       for (const chunk of chunks) {
-        const result = await countOccurrences(context, { ownerDigest, stream, fromDay: chunk.fromDay,
-          throughDay: chunk.throughDay });
+        const options = { ownerDigest, stream, fromDay: chunk.fromDay, throughDay: chunk.throughDay };
+        const result = plan === null ? await countOccurrences(context, options)
+          : await countPlanRange(context, plan, options);
         if (!(result instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
         for (const [day, count] of result) {
           if (!isDay(day) || day < chunk.fromDay || day > chunk.throughDay || counts.has(day)
@@ -727,8 +743,9 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   return Object.freeze({
     /**
      * `readConcurrency` (K-PAR-MEM, default 1): the owner-scoped reads before
-     * compute (first evidence days, exact counts, non-effective queued days)
-     * run on up to that many snapshot connections at once; their results are
+     * compute (merged evidence plans, deferred exact count validation and
+     * non-effective queued days) use up to that many snapshot connections;
+     * their results are
      * combined in owner order, so the inputs are the same at any value.
      * `loadConcurrency` (default 1): owner loads that may run at once during
      * compute (compute Workers); each load's read calls then target the read
@@ -805,14 +822,37 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // Production has no lower bound on cache history: start at the first
       // evidence day of any effective owner, whatever the queue holds.
       let firstEvidenceDay = null;
-      const effectiveList = ownerList.filter((owner) => owner.source === "effective");
-      const firstDays = await analyticsRefreshForEachConcurrent(effectiveList, readConcurrency, async (owner) => {
-        checkpoint(Object.freeze({ kind: "read" }));
-        const first = await readFirstEvidenceDay(context, { ownerDigest: owner.ownerDigest, throughDay: today });
-        if (first !== null && (!isDay(first) || first > today)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
-        return first;
-      });
-      for (const first of firstDays) {
+      const effectiveList = ownerList.map((owner, ownerIndex) => ({ owner, ownerIndex }))
+        .filter(({ owner }) => owner.source === "effective");
+      const planThroughDay = days.reduce((latest, day) => day > latest ? day : latest, today);
+      const ownerPlans = new Map();
+      const firstDays = await analyticsRefreshForEachConcurrent(effectiveList, readConcurrency,
+        async ({ owner, ownerIndex }) => {
+          // One existing time-guard checkpoint immediately before each owner
+          // plan; every started read settles before cancellation/refusal escapes.
+          checkpoint(Object.freeze({ kind: "read", ownerIndex }));
+          let first = null;
+          let plan = null;
+          if (readEvidencePlan === undefined) {
+            first = await readFirstEvidenceDay(context, { ownerDigest: owner.ownerDigest, throughDay: today });
+          } else {
+            plan = await readEvidencePlan(context, { ownerDigest: owner.ownerDigest, streams: OCCURRENCE_STREAMS,
+              fromDay: "1696-03-17", throughDay: planThroughDay, firstEvidenceThroughDay: today });
+            if (!(plan instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+            for (const stream of OCCURRENCE_STREAMS) {
+              const part = plan.get(stream);
+              if (!part || !(part.counts instanceof Map)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+              const value = part.firstEvidenceDay;
+              if (value !== null && (!isDay(value) || value > today)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+              if (value !== null && (first === null || value < first)) first = value;
+            }
+          }
+          if (first !== null && (!isDay(first) || first > today)) fail("ANALYTICS_V2_REFRESH_OCCURRENCES_INVALID");
+          return { first, plan };
+        }, { failureOrder: "item" });
+      for (const [index, value] of firstDays.entries()) {
+        const { first, plan } = value;
+        if (plan !== null) ownerPlans.set(effectiveList[index].owner.ownerDigest, plan);
         if (first !== null && (firstEvidenceDay === null || first < firstEvidenceDay)) firstEvidenceDay = first;
       }
       const cacheFromDay = analyticsRefreshCacheFromDay({
@@ -841,10 +881,11 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       const occurrencesByOwner = new Map();
       let nonEffectiveUnread = 0;
       // Read concurrently, combined below in owner order.
-      const perOwner = await analyticsRefreshForEachConcurrent(ownerList, readConcurrency, async (owner) => {
-        checkpoint(Object.freeze({ kind: "read" }));
+      const perOwner = await analyticsRefreshForEachConcurrent(ownerList, readConcurrency, async (owner, ownerIndex) => {
+        checkpoint(Object.freeze({ kind: "read", ownerIndex }));
         if (owner.source === "effective") {
-          return { counted: await countOwnerEvidence(context, owner.ownerDigest, fullRange) };
+          return { counted: await countOwnerEvidence(context, owner.ownerDigest, fullRange,
+            ownerPlans.get(owner.ownerDigest) ?? null) };
         }
         if (!hasTypedEvidence(owner)) return null;
         try {
@@ -854,7 +895,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           if (!isSourceError(error)) throw error;
           return { unread: true };
         }
-      });
+      }, { failureOrder: "item" });
       for (const [index, owner] of ownerList.entries()) {
         const value = perOwner[index];
         if (value === null) continue;
