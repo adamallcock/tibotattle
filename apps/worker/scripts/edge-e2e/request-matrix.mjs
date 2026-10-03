@@ -23,8 +23,12 @@
 //   no retry-after (OD-CR-6 (iv)). Its body carries the request id, so the
 //   comparator reads fields, never bytes.
 // - definite: a route owner round 12 retired with a definite answer instead
-//   (the registry's RETIRED_ROUTE_DEFINITE_ANSWERS, passed in): that status
-//   and code in the Worker envelope, no-store, no retry-after.
+//   of the unported 503. Since round 19 it answers production's sequence
+//   before its terminal answer, so a sweep row expects the answer of the step
+//   its request stops at (definiteSweepAnswers, from the registry's
+//   RETIRED_DEFINITE_PREAMBLE_STEPS, passed in): that status and code in the
+//   Worker envelope, no-store, no retry-after. Its sweep rows also carry the
+//   worker comparator: the unchanged Worker answers the same request alike.
 
 /** Fixed synthetic values the rows use; none is a real credential. */
 export const MATRIX_VALUES = Object.freeze({
@@ -282,11 +286,27 @@ export function forwardedRows({ registry }) {
 }
 
 /**
+ * The answer a sweep row gets from each retired-definite route (round 19):
+ * an allowed, same-origin, cookie-free request with a well-formed but unknown
+ * device bearer passes every earlier step and stops at the device bearer.
+ * preambleSteps is the registry's RETIRED_DEFINITE_PREAMBLE_STEPS (route id
+ * -> [[step, status, code], ...]).
+ */
+export function definiteSweepAnswers(preambleSteps) {
+  return Object.freeze(Object.fromEntries(Object.entries(preambleSteps).map(([routeId, steps]) => {
+    const step = steps.find(([name]) => name === "device_bearer");
+    if (step === undefined) throw new Error(`REQUEST_MATRIX_DEFINITE_STEP_UNKNOWN ${routeId}`);
+    return [routeId, Object.freeze({ status: step[1], code: step[2] })];
+  })));
+}
+
+/**
  * S3's sweep: one request for every forwarded (route, method) pair, each
  * expected to be served (servedRouteIds: the production ported list), to
- * answer its retired-definite answer (definiteAnswers: route id -> {status,
- * code}) or to answer the closed unported 503, and to carry the admission
- * header exactly when EP-1 names the route.
+ * answer as the Worker does at its retired-definite route (definiteAnswers:
+ * route id -> {status, code}, from definiteSweepAnswers) or to answer the
+ * closed unported 503, and to carry the admission header exactly when EP-1
+ * names the route.
  */
 export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
   const served = new Set(servedRouteIds);
@@ -311,7 +331,7 @@ export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
         ...(post ? { body: "{}" } : {}),
         ...(Object.hasOwn(definiteAnswers, route.id)
           ? {
-            comparators: ["transparency", "definite"],
+            comparators: ["transparency", "worker", "definite"],
             expect: { status: definiteAnswers[route.id].status, code: definiteAnswers[route.id].code },
           }
           : {

@@ -97,6 +97,7 @@ import {
   UNKNOWN_UPLOAD_BEARER,
   adminRows,
   admissionRows,
+  definiteSweepAnswers,
   forwardedRows,
   localRows,
   sweepRows,
@@ -114,7 +115,7 @@ import {
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
 import { liveWriteRows } from "../scripts/edge-live-check.mjs";
-import { RETIRED_ROUTE_DEFINITE_ANSWERS } from "../cloud-run/postgres-production-registry.mjs";
+import { RETIRED_DEFINITE_PREAMBLE_STEPS } from "../cloud-run/postgres-production-registry.mjs";
 import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
 import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
 
@@ -520,9 +521,10 @@ function assertUnported(answer, label) {
 }
 
 /**
- * A retired-definite route's answer through the edge (round 12): the
- * registry's status and code in the Worker envelope, no-store, and no
- * retry-after, never the unported 503.
+ * A retired-definite route's answer through the edge (round 12; round 19
+ * runs production's earlier answers first): the expected step's status and
+ * code in the Worker envelope, no-store, and no retry-after, never the
+ * unported 503.
  */
 function assertDefinite(answer, expect, label) {
   assert.equal(answer.status, expect.status, `${label}: ${answer.text}`);
@@ -959,7 +961,7 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
   for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS,
-    definiteAnswers: RETIRED_ROUTE_DEFINITE_ANSWERS })) {
+    definiteAnswers: definiteSweepAnswers(RETIRED_DEFINITE_PREAMBLE_STEPS) })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
@@ -1461,7 +1463,7 @@ function v01Contribution() {
   };
 }
 
-test("S5 v1.0 and v0.1: the shipped backfill engine runs through the edge; the retired v0.1 uploader is the 503", {
+test("S5 v1.0 and v0.1: the shipped backfill engine runs through the edge; the retired v0.1 uploader is the definite 403", {
   skip: SKIP, timeout: LONG,
 }, async () => {
   const f = await fixture();
@@ -1521,8 +1523,10 @@ test("S5 v1.0 and v0.1: the shipped backfill engine runs through the edge; the r
   }
 
   // v0.1: owner round 12 retires v0.x uploads. The prepared contribution is
-  // authorized under the default v1.0 format, then refused before its claim
-  // with the uniform 503 through the edge, and nothing is admitted.
+  // authorized under the default v1.0 format, claimed, then refused at the
+  // transport write-authority step with d43c8f92's definite 403
+  // TELEMETRY_TRANSPORT_BLOCKED (round 19) through the edge, and nothing is
+  // admitted.
   const v01Log = [];
   const v01Fetch = edgeClientFetch(f, { log: v01Log });
   const v01Owner = await socialOwner(f, {
@@ -1538,16 +1542,16 @@ test("S5 v1.0 and v0.1: the shipped backfill engine runs through the edge; the r
   });
   await assert.rejects(syncPrepared());
   const upload = v01Log.find((entry) => entry.path === CONTRIBUTIONS_PATH);
-  assert.equal(upload.status, 503);
+  assert.equal(upload.status, 403);
   const v01Rows = async () => (await base.query(`SELECT
       (SELECT count(*)::int FROM ${t("telemetry_contributions")} WHERE participant_id = $1) AS contributions,
       (SELECT count(*)::int FROM ${t("telemetry_records")} WHERE participant_id = $1) AS records`,
   [v01Owner.participantId])).rows[0];
   assert.deepEqual(await v01Rows(), { contributions: 0, records: 0 });
   const v01Retry = await reupload(v01Fetch, EDGE_E2E_PUBLIC_ORIGIN, v01Owner.deviceAuthorization, upload.body);
-  assert.equal(v01Retry.status, 503);
+  assert.equal(v01Retry.status, 403);
   assert.equal(v01Retry.headers.get("retry-after"), null);
-  assert.equal((await v01Retry.json()).error.code, "POSTGRES_ROUTE_NOT_PORTED");
+  assert.equal((await v01Retry.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED");
   assert.deepEqual(await v01Rows(), { contributions: 0, records: 0 });
 });
 

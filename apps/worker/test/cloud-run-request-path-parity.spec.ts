@@ -52,7 +52,10 @@ import { createPostgresAdminAccessChokepoint } from "../src/postgres-admin-acces
  * production admin host (OD-CR-3 'chokepoint', ADMIN-R12; the 'refuse' cells
  * here run the switch's other position, which the edge-test origin keeps), and
  * there is no unported retry-after (OD-CR-6(iv)). Round 12 also answers the
- * accountless performance authorization with production's definite 403.
+ * accountless performance authorization with production's definite 403;
+ * round 19 runs production's earlier answers first, through an injected
+ * preamble (stubbed to pass here; the real one is proved by
+ * cloud-run/retired-performance-authorization.check.mjs and over PostgreSQL).
  */
 
 interface TestBindings extends Env {
@@ -112,10 +115,17 @@ function origin(
   unportedRetryAfterSeconds: number | null = 60,
 ): Origin {
   const calls: string[] = [];
-  const handlers = new Map(ported.map((id) => [id, async () => {
+  const handlers = new Map<string, () => Promise<Response | null>>(ported.map((id) => [id, async () => {
     calls.push(id);
     return Response.json({ served: id });
   }]));
+  // Round 19: each retired-definite route takes its preamble; this one passes.
+  for (const id of productionRegistry.RETIRED_DEFINITE_ROUTE_IDS) {
+    handlers.set(id, async () => {
+      calls.push(`preamble:${id}`);
+      return null;
+    });
+  }
   const registry: ProductionRegistry = productionRegistry.createProductionRouteRegistry({
     routePolicy: WORKER_ROUTE_POLICY,
     handlers,
@@ -622,7 +632,7 @@ describe("(F) documented deviations from the Worker", () => {
       }
     });
 
-  it("round 12: the accountless performance authorization is production's definite 403, never the 503", async () => {
+  it("round 19: once its preamble passes, the accountless performance authorization is production's definite 403, never the 503", async () => {
     for (const retryAfterSeconds of [60, null] as const) {
       const production = origin(workerEnv(), "refuse", undefined, retryAfterSeconds);
       const id = "accountless_telemetry_performance_authorization";
@@ -633,7 +643,7 @@ describe("(F) documented deviations from the Worker", () => {
       expect(await snapshot(response)).toStrictEqual({ status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", allow: null,
         cacheControl: "no-store", location: null });
       expect(response.headers.get("retry-after")).toBeNull();
-      expect(production.calls).toStrictEqual([]);
+      expect(production.calls).toStrictEqual([`preamble:${id}`]);
     }
   });
 

@@ -42,7 +42,8 @@ after(async () => {
 function registryFor(ported) {
   return registryModule.createProductionRouteRegistry({
     routePolicy: routeRegistry.WORKER_ROUTE_POLICY,
-    handlers: new Map(ported.map((id) => [id, async () => new Response(null)])),
+    handlers: new Map([...ported, ...registryModule.RETIRED_DEFINITE_ROUTE_IDS]
+      .map((id) => [id, async () => new Response(null)])),
     portedRouteIds: ported,
   });
 }

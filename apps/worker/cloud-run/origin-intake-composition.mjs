@@ -11,18 +11,23 @@
  *   envelopes/v10.mjs, whose receipt the shared preamble records), plus the
  *   two v0.x envelopes owner round 12 retires at the switch
  *   (telemetry-envelope-v0.1 and -v0.2): each is registered as a retired
- *   envelope whose pre-claim check answers 503 POSTGRES_ROUTE_NOT_PORTED, so
- *   no upload authorization is claimed and nothing is admitted. Every other
+ *   envelope with no pre-claim check, so it reaches its retired format at
+ *   the write-authority step after the claim, as d43c8f92 reaches its
+ *   transport write authority there; the format answers (round 19) and the
+ *   preamble abandons the claim. Nothing is admitted, and the envelope's
+ *   handler is unreachable (it answers the same refusal). Every other
  *   version stays unregistered and keeps the origin's pre-change refusal.
  * - uploadAuthorizationFormats: telemetry-contribution-v1.0 and -v1.1, each
  *   enforced by TA-1's transport write authority
  *   (src/postgres-transport-write-authority.ts), plus the retired -v0.1 and
- *   -v0.2 formats, whose write authority is the same 503 (no authorization
- *   is created), so the envelope and format tables pair exactly
+ *   -v0.2 formats, which run the same write authority for their own
+ *   identifier and then refuse with d43c8f92's definite 403
+ *   TELEMETRY_TRANSPORT_BLOCKED (owner round 19; no authorization is
+ *   created), so the envelope and format tables pair exactly
  *   (assertContributionEnvelopeFormats).
  * - recordPostgresDeviceUploadReceipt: IN-3's port of d43c8f92
  *   recordDeviceUploadReceipt, which the preamble runs after the v1.0
- *   handler (the retired v0.x envelopes refuse before any claim).
+ *   handler (the retired v0.x formats refuse before any handler).
  * - routeModules: IN-3's POST /api/v1/device/upload-authorizations module,
  *   which replaces the v1.2-only built-in (shipped v1.0 clients send three
  *   body keys). It authenticates the device bearer under the Worker's
@@ -103,15 +108,18 @@ export const ORIGIN_INTAKE_RETIRED_ENVELOPE_SCHEMA_VERSIONS = Object.freeze(
 );
 
 /**
- * A retired envelope (round 12): its pre-claim check answers the retired
- * format's 503 POSTGRES_ROUTE_NOT_PORTED before the upload authorization is
- * claimed, so its handler is unreachable (it answers the same refusal).
+ * A retired envelope (round 12; its answer is round 19's). It has no
+ * pre-claim check: d43c8f92 claims every envelope before it reaches the
+ * transport write authority, so a v0.x upload keeps the claim's answers
+ * (401 UPLOAD_AUTH_INVALID for an unknown or mismatched authorization) and
+ * reaches its retired format, which answers the write authority's refusal
+ * or the definite 403 TELEMETRY_TRANSPORT_BLOCKED. The handler is
+ * unreachable behind that format; it answers the same 403.
  */
 function retiredContributionEnvelope(schemaVersion) {
-  const refuse = () => {
+  return registerContributionEnvelope(schemaVersion, () => {
     throw retiredFormatRefusal();
-  };
-  return registerContributionEnvelope(schemaVersion, refuse, { validateEnvelope: refuse });
+  });
 }
 
 const ADAPTER_EXPORTS = Object.freeze({
@@ -217,7 +225,9 @@ export function createOriginIntakeComposition(options) {
       assertTelemetryTransportWriteAllowed: transportWriteAuthority.assertPostgresTelemetryTransportWriteAllowed,
       schemaVersions: ORIGIN_INTAKE_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
     }),
-    ...retiredUploadAuthorizationFormatEntries(),
+    ...retiredUploadAuthorizationFormatEntries({
+      assertTelemetryTransportWriteAllowed: transportWriteAuthority.assertPostgresTelemetryTransportWriteAllowed,
+    }),
   });
   const contributionEnvelopes = Object.freeze([
     v11.envelopeRegistration,

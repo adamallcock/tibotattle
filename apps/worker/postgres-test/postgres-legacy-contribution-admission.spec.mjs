@@ -22,9 +22,11 @@ import {
   DEFAULT_UPLOAD_AUTHORIZATION_SCHEMA_VERSION,
   LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
   RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS,
+  RETIRED_FORMAT_ANSWER,
   legacyUploadAuthorizationFormatEntries,
   parseUploadAuthorizationRequest,
   resolveUploadAuthorizationFormat,
+  retiredUploadAuthorizationFormatEntries,
 } from "../cloud-run/upload-authorization-formats.mjs";
 import {
   TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION,
@@ -1045,11 +1047,24 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
       return `${error.status} ${error.code}`;
     }
   };
+  // Round 19: the composed origin's retired v0.x formats answer the Worker's
+  // refusal exactly, and d43c8f92's definite 403 TELEMETRY_TRANSPORT_BLOCKED
+  // where the Worker would authorize; never an authorization, never a 503.
+  const retiredFormats = createUploadAuthorizationFormats(retiredUploadAuthorizationFormatEntries({
+    assertTelemetryTransportWriteAllowed:
+      (await workerModule("/src/postgres-transport-write-authority.ts")).assertPostgresTelemetryTransportWriteAllowed,
+  }));
+  const retiredAnswer = `${RETIRED_FORMAT_ANSWER.status} ${RETIRED_FORMAT_ANSWER.code}`;
+  assert.equal(retiredAnswer, "403 TELEMETRY_TRANSPORT_BLOCKED");
   const matrix = async () => {
     const table = {};
     for (const version of [...LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS, ...RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS]) {
       const expected = await workerOutcome(version);
       assert.equal(await originOutcome(allFormats, version), expected, version);
+      if (RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS.includes(version)) {
+        assert.equal(await originOutcome(retiredFormats, version), expected === "allowed" ? retiredAnswer : expected,
+          `retired ${version}`);
+      }
       table[version] = expected;
     }
     return table;
@@ -1092,6 +1107,27 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
     assert.match(refusal.body.error.requestId, /^[0-9a-f-]{36}$/u);
     assert.deepEqual({ ...refusal.body, error: { ...refusal.body.error, requestId: "request-synthetic" } },
       await expected.json());
+  }
+  // A principal with no joined row is the Worker's 401 on both v0.x formats, retired or not.
+  const stranger = Object.freeze({ participantId: `participant:${randomUUID()}`, deviceId: device.deviceId });
+  for (const version of RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS) {
+    let workerAnswer;
+    try {
+      await worker.assertTelemetryTransportWriteAllowed(d1, stranger, version);
+      workerAnswer = "allowed";
+    } catch (error) {
+      workerAnswer = `${error.status} ${error.code}`;
+    }
+    assert.equal(workerAnswer, "401 DEVICE_AUTH_INVALID", version);
+    let retired;
+    try {
+      await resolveUploadAuthorizationFormat(retiredFormats, version).assertUploadAllowed(pool, stranger, Date.now(),
+        { schema: schemaOptions });
+      retired = "allowed";
+    } catch (error) {
+      retired = `${error.status} ${error.code}`;
+    }
+    assert.equal(retired, workerAnswer, `retired ${version}: no joined row`);
   }
   const unissued = await pool.query(`SELECT count(*)::int AS n FROM "${schema}".device_upload_authorizations`);
   assert.equal(unissued.rows[0].n, 0, "a refused request issues nothing");

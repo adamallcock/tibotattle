@@ -2083,6 +2083,154 @@ async function readAccountlessJson(request, maximumBytes, readBody, parse) {
   }
 }
 
+/**
+ * The d43c8f92 accountless performance authorization request body
+ * (index.ts readBoundedAccountlessTelemetryPerformanceAuthorizationJson):
+ * exactly these three keys with these values, else 400 BODY_INVALID. The
+ * values are injected (src/telemetry-performance-policy.ts), so this plain
+ * file carries no copy of them.
+ */
+function performanceAuthorizationBodyParser(requestShape) {
+  const keys = Object.keys(requestShape);
+  return function parsePerformanceAuthorizationBody(raw) {
+    const value = JSON.parse(raw);
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+        || Object.keys(value).length !== keys.length
+        || Object.keys(value).some((key) => !keys.includes(key))
+        || keys.some((key) => Reflect.get(value, key) !== requestShape[key])) {
+      throw Object.assign(new Error("BODY_INVALID"), { code: "BODY_INVALID", status: 400 });
+    }
+    return value;
+  };
+}
+
+const PERFORMANCE_AUTHORIZATION_REQUEST_KEYS = Object.freeze([
+  "authorizationBasis", "policyVersion", "schemaVersion",
+]);
+
+/**
+ * Owner round 19 (2026-10-03): the retired accountless performance
+ * authorization (POST /api/v1/accountless/telemetry-performance-authorization)
+ * answers production's exact sequence, not one fixed code. This is its
+ * preamble: every check d43c8f92
+ * handleAccountlessTelemetryPerformanceAuthorization (index.ts:801-835) makes
+ * before the grant, in that order, each through the origin's port of the
+ * same check (the ones its sibling, the accountless v1.2 authorization,
+ * already uses):
+ *
+ * 1. a session cookie (not any cookie): 401 AUTH_INVALID;
+ * 2. the origin's storage gate: 503 BACKEND_STORAGE_UNAVAILABLE (OD-CR-6
+ *    (iii): it can come before the refusals below);
+ * 3. ACCOUNTLESS_OWNERSHIP_MODE: 503 ACCOUNTLESS_OWNERSHIP_DISABLED or
+ *    ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID;
+ * 4. the admission bindings: 503 ADMISSION_CONFIGURATION_INVALID;
+ * 5. the upload-registration collection control: 503
+ *    UPLOAD_REGISTRATION_DISABLED (or the control's storage refusal);
+ * 6. the accountless_ownership attempt limiter, replaying the edge's
+ *    outcome: 429 ATTEMPT_LIMIT_REACHED, or 503
+ *    ADMISSION_RATE_LIMIT_UNAVAILABLE, each with retry-after 60;
+ * 7. the device bearer under the Worker's generic gate, which must be
+ *    accountless: 401 DEVICE_AUTH_INVALID;
+ * 8. the body (readBoundedJson at MAX_REQUEST_BYTES, then the closed
+ *    three-key shape): 415 CONTENT_TYPE_INVALID, 400 BODY_INVALID, 413
+ *    BODY_TOO_LARGE or 408 BODY_TIMEOUT.
+ *
+ * It answers the first refusal in the Worker envelope under the root's
+ * request id, or null when every check passes. It never grants: the root
+ * then answers the registry's terminal answer (RETIRED_ROUTE_DEFINITE_ANSWERS,
+ * 403 TELEMETRY_TRANSPORT_BLOCKED), as production's
+ * grantTelemetryPerformanceAccountlessAuthorization does while the
+ * performance runtime stays 'staged'.
+ *
+ * Not reproduced, and why (the round 19 amendment in
+ * docs/decisions/2026-09-04-accountless-sharing-policy.md records each):
+ * - requireTelemetryPerformanceStorageMode (index.ts:827, after step 7)
+ *   reads the D1 telemetry_performance_runtime row. PostgreSQL has no such
+ *   table (the performance tables are unpromoted), and production's
+ *   deployed state passes the check (typed storage, the row seeded
+ *   'staged'), so its 503 is unreachable there; the storage gate of step 2
+ *   is the origin's only storage precondition;
+ * - the deletion-ledger tombstone read after step 7: the origin has no
+ *   deletion ledger (append-only), and a tombstoned participant has no
+ *   active device credential, so step 7 already answers its 401;
+ * - nothing else: the query string is ignored, as the Worker ignores it (no
+ *   OD-CR-6 (ii) refusal, because nothing here reads it).
+ */
+export function createPostgresRetiredPerformanceAuthorizationPreamble({
+  requestContext,
+  primaryPool,
+  schemaOptions,
+  storageGate,
+  admissionEnv,
+  assertAdmissionBindings,
+  assertAttemptAllowed,
+  authenticateAccountlessDevice,
+  readBoundedRequestBody,
+  maxRequestBytes,
+  requestShape,
+} = {}) {
+  if (typeof requestContext !== "function"
+      || !validPool(primaryPool)
+      || storageGate === null || typeof storageGate !== "object"
+      || typeof storageGate.assertCurrent !== "function"
+      || admissionEnv === null || typeof admissionEnv !== "object" || !Object.isFrozen(admissionEnv)
+      || typeof assertAdmissionBindings !== "function"
+      || typeof assertAttemptAllowed !== "function"
+      || typeof authenticateAccountlessDevice !== "function"
+      || typeof readBoundedRequestBody !== "function"
+      || !Number.isSafeInteger(maxRequestBytes) || maxRequestBytes < 1
+      || requestShape === null || typeof requestShape !== "object"
+      || Object.keys(requestShape).sort().join(",") !== PERFORMANCE_AUTHORIZATION_REQUEST_KEYS.join(",")
+      || Object.values(requestShape).some((value) => typeof value !== "string" || value.length === 0)) {
+    configurationError("POSTGRES_RETIRED_PERFORMANCE_AUTHORIZATION_CONFIGURATION_INVALID");
+  }
+  const schemas = validatedSchemas(schemaOptions);
+  const schema = Object.freeze({ primarySchema: schemas.primary });
+  const parseBody = performanceAuthorizationBodyParser(Object.freeze({ ...requestShape }));
+  const refusal = (status, code) => Object.assign(new Error(code), { code, status });
+
+  return async function retiredPerformanceAuthorizationPreamble(request) {
+    const requestId = requestIdFrom(requestContext, request);
+    try {
+      // d43c8f92 index.ts:805: the method. The root's registry 405 answers
+      // first; this keeps the preamble closed if it is ever called directly.
+      if (request.method !== "POST") {
+        throw Object.assign(refusal(405, "METHOD_NOT_ALLOWED"), { responseHeaders: { allow: "POST" } });
+      }
+      // index.ts:806-808.
+      if (hasSessionCookie(request.headers.get("cookie"))) throw refusal(401, "AUTH_INVALID");
+      try {
+        await storageGate.assertCurrent();
+      } catch {
+        throw storageUnavailable();
+      }
+      // index.ts:809 assertAccountlessOwnershipEnabled.
+      const mode = admissionEnv.ACCOUNTLESS_OWNERSHIP_MODE;
+      if (mode === undefined || mode === "disabled") throw refusal(503, "ACCOUNTLESS_OWNERSHIP_DISABLED");
+      if (mode !== "enabled") throw refusal(503, "ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID");
+      // index.ts:810-818.
+      assertAdmissionBindings(admissionEnv);
+      await assertPostgresUploadRegistrationEnabled(primaryPool, schemas.primary);
+      await assertAttemptAllowed(
+        admissionEnv.RECOVERY_RATE_LIMIT,
+        admissionEnv.CLIENT_ATTEMPT_RATE_LIMIT,
+        request,
+        admissionEnv,
+        "accountless_ownership",
+      );
+      // index.ts:819-826: authenticateDevice, then a non-accountless
+      // authority is 401 DEVICE_AUTH_INVALID.
+      await authenticateAccountlessDevice(primaryPool, request.headers.get("authorization"), { schema });
+      // index.ts:828 readBoundedAccountlessTelemetryPerformanceAuthorizationJson
+      // (index.ts:827's storage-mode check is not reproduced; see above).
+      await readAccountlessJson(request, maxRequestBytes, readBoundedRequestBody, parseBody);
+      return null;
+    } catch (error) {
+      return routeError(error, requestId);
+    }
+  };
+}
+
 async function readV12StagedChunkVector(pool, schema, principal, manifestId) {
   const table = `${schemaTable(schema)}."telemetry_v12_chunks"`;
   const manifests = `${schemaTable(schema)}."telemetry_v12_day_manifests"`;

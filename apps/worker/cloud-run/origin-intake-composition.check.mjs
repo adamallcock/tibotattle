@@ -160,29 +160,62 @@ test("the v1.0 envelope reaches its admitter; no v0.x admitter is composed (roun
       assert.equal(response.status, 202, schemaVersion);
       continue;
     }
-    // Retired: the pre-claim check answers the uniform 503 (no retry-after),
-    // and the handler behind it answers the same refusal.
-    assert.throws(() => registration.validateEnvelope(value, body.raw), (error) => {
-      assert.deepEqual([error.status, error.code, error.responseHeaders], [503, "POSTGRES_ROUTE_NOT_PORTED", undefined]);
+    // Retired: no pre-claim check (round 19), so the upload is claimed as
+    // d43c8f92 claims it and its retired format answers at the write-authority
+    // step; the handler behind that format answers the same definite 403.
+    assert.equal(registration.validateEnvelope, null, schemaVersion);
+    assert.throws(() => registration.handler(body, participant, "synthetic-device", claimed, context), (error) => {
+      assert.deepEqual([error.status, error.code, error.responseHeaders], [403, "TELEMETRY_TRANSPORT_BLOCKED", undefined]);
       return true;
     }, schemaVersion);
-    assert.throws(() => registration.handler(body, participant, "synthetic-device", claimed, context),
-      { code: "POSTGRES_ROUTE_NOT_PORTED", status: 503 }, schemaVersion);
   }
   assert.deepEqual(calls, [["v1.0 admitter", "telemetry-envelope-v1.0"]]);
 });
 
-test("the retired v0.x formats never authorize: the write authority answers the uniform 503", async () => {
-  const intake = createOriginIntakeComposition(options());
-  for (const version of ["telemetry-contribution-v0.1", "telemetry-contribution-v0.2"]) {
-    const format = intake.uploadAuthorizationFormats[version];
-    assert.throws(() => format.assertUploadAllowed(pool, { participantId: "p", deviceId: "d" }, Date.now(),
-      { schema: { primarySchema: "synthetic_primary" } }), (error) => {
-      assert.deepEqual([error.status, error.code, error.responseHeaders], [503, "POSTGRES_ROUTE_NOT_PORTED", undefined]);
-      return true;
-    }, version);
+test("the retired v0.x formats never authorize: the write authority's refusal, else the definite 403 (round 19)", async () => {
+  const device = Object.freeze({ participantId: "p", deviceId: "d" });
+  const schema = Object.freeze({ primarySchema: "synthetic_primary" });
+  for (const [label, authority, expected] of [
+    // d43c8f92 would authorize v0.1 for a rank-1 social floor: the retirement refuses instead.
+    ["authority allows", async () => undefined, [403, "TELEMETRY_TRANSPORT_BLOCKED"]],
+    // Every refusal of the write authority is d43c8f92's answer and stands.
+    ["no joined row", async () => { throw Object.assign(new Error("x"), { status: 401, code: "DEVICE_AUTH_INVALID" }); },
+      [401, "DEVICE_AUTH_INVALID"]],
+    ["blocked lifecycle", async () => { throw Object.assign(new Error("x"), { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" }); },
+      [403, "TELEMETRY_TRANSPORT_BLOCKED"]],
+    ["storage", async () => { throw Object.assign(new Error("x"), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" }); },
+      [503, "BACKEND_STORAGE_UNAVAILABLE"]],
+  ]) {
+    const calls = [];
+    const configured = options();
+    const intake = createOriginIntakeComposition({
+      ...configured,
+      adapters: {
+        ...configured.adapters,
+        transportWriteAuthority: {
+          async assertPostgresTelemetryTransportWriteAllowed(...args) {
+            calls.push(args);
+            return authority();
+          },
+        },
+      },
+    });
+    for (const version of ["telemetry-contribution-v0.1", "telemetry-contribution-v0.2"]) {
+      const format = intake.uploadAuthorizationFormats[version];
+      await assert.rejects(format.assertUploadAllowed(pool, device, 1_700_000_000_000, { schema }), (error) => {
+        assert.deepEqual([error.status, error.code], expected, `${label} ${version}`);
+        if (label === "authority allows") assert.equal(error.responseHeaders, undefined, "no retry-after");
+        return true;
+      }, `${label} ${version}`);
+    }
+    // Each retired format asked the write authority about its own identifier, exactly as a live format does.
+    assert.deepEqual(calls, [
+      [pool, device, "telemetry-contribution-v0.1", { nowEpoch: 1_700_000_000_000, schema }],
+      [pool, device, "telemetry-contribution-v0.2", { nowEpoch: 1_700_000_000_000, schema }],
+    ], label);
   }
   // The live v1.x formats still reach the transport write authority.
+  const intake = createOriginIntakeComposition(options());
   assert.throws(() => intake.uploadAuthorizationFormats["telemetry-contribution-v1.0"].assertUploadAllowed(
     pool, {}, 0, { schema: {} }), /assertPostgresTelemetryTransportWriteAllowed must not be reached/u);
 });

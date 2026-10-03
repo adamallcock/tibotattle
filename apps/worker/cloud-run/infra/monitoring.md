@@ -163,10 +163,13 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
     code.
 - **Never excluded.** `originFiveXxExclusions` refuses these paths:
   `/api/v1/contributions`, `/api/v1/device/upload-authorizations`,
-  `/api/v1/accountless/telemetry-performance-authorization` (round 12: a
-  definite 403 `TELEMETRY_TRANSPORT_BLOCKED`, so a 5xx from it is a
-  defect), and the renew and disconnect routes round 12 keeps. It also
-  refuses any path that is not an exact `WORKER_ROUTE_POLICY` pathname, any
+  `/api/v1/accountless/telemetry-performance-authorization` (round 19:
+  production's answer sequence, then a definite 403
+  `TELEMETRY_TRANSPORT_BLOCKED`, never the unported 503; its 5xx answers
+  are the Worker's own configuration, containment, storage and admission
+  ones and count like any live route's), and the renew and disconnect
+  routes round 12 keeps. It also refuses any path that is not an exact
+  `WORKER_ROUTE_POLICY` pathname, any
   code other than `POSTGRES_ROUTE_NOT_PORTED`, and two codes by name, as a
   guard only:
   - `POSTGRES_TEST_ROUTE_UNSUPPORTED` counts as a 5xx if a deployed origin
@@ -175,19 +178,17 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
     reaches Cloud Run, so it is outside this alert's inputs altogether. A
     total edge-to-origin outage leaves Cloud Run with fewer requests or
     none, and this alert stays silent. edge-health covers that path.
-- **v0.x uploads count as errors.** Round 12 retires v0.x uploads at the
-  switch with the same uniform `503 POSTGRES_ROUTE_NOT_PORTED`: a v0.1 or
-  v0.2 envelope on `/api/v1/contributions` and a v0.1 or v0.2 format on
+- **v0.x uploads answer a 4xx.** Round 12 retires v0.x uploads at the
+  switch, and round 19 (2026-10-03) answers them with `d43c8f92`'s definite
+  `403 TELEMETRY_TRANSPORT_BLOCKED`, not the unported 503: a v0.1 or v0.2
+  envelope on `/api/v1/contributions` and a v0.1 or v0.2 format on
   `/api/v1/device/upload-authorizations` (`origin-intake-composition.mjs`,
-  `upload-authorization-formats.mjs`). Both paths are shared with every live
-  v1 upload, and the exclusion can key only on `routeClass`, status and
-  code, never on the schema version. So no exclusion is possible for them:
-  excluding either path would also hide that answer from a live v1 upload,
-  should one ever give it. Each v0.x answer therefore counts toward the 5xx ratio and the minimum
-  error count, and a v0.x client retrying at volume can page. The impact is
-  theoretical today: the live ingestion database never admitted a v0.x row
-  (OD-8). Owner question, open: keep counting them, or give v0.x a
-  distinguishable code the exclusion can name.
+  `upload-authorization-formats.mjs` `RETIRED_FORMAT_ANSWER`). This alert
+  counts only 5xx, so the retirement's answer never enters it. The two paths stay never
+  excluded all the same: every live v1 upload shares them, and an exclusion
+  can key only on `routeClass`, status and code, never on the schema
+  version, so excluding either would hide a live upload's 5xx. This
+  resolves round 12's open question about counting v0.x 503s.
 - **The scanner holds the whole query.** `scanMonitoringPrivacy` refuses a
   rendered policy that excludes by code alone, by route alone or beyond the
   table, names either guarded code, or differs in any other part from
