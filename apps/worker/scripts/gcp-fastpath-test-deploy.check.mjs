@@ -29,6 +29,7 @@ import {
   FASTPATH_TEST,
   jobDescribeCommand,
   jobExecutionsCommand,
+  jobsListCommand,
   jobTaskSpec,
   main,
   measDatabaseCreateCommand,
@@ -38,8 +39,10 @@ import {
   measInstanceCreateCommand,
   measInstanceDeleteCommand,
   measInstanceDescribeCommand,
+  measInstancesListCommand,
   measJobDeleteCommand,
   measurementInstanceMismatches,
+  measurementInstancesListed,
   measUsersListCommand,
   migrateJobCommand,
   ORIGIN_BUCKET_RUNTIME_BINDING,
@@ -1209,6 +1212,10 @@ function measInstanceResource(overrides = {}, settingsOverrides = {}) {
 }
 
 const sqlKind = (command) => (command[1] === "sql" ? command.slice(1, 4).join(" ") : kindOf(command));
+/** Another instance and Job of the test project, as listings render them: never a measurement resource. */
+const OTHER_INSTANCE = Object.freeze({ name: FASTPATH_TEST.instance, project: "tibotattle", region: "us-east1",
+  settings: { userLabels: { app: "tibotattle", environment: "test" } } });
+const OTHER_JOB = Object.freeze({ metadata: { name: FASTPATH_TEST.refreshJob } });
 
 /** A Runner stand-in whose exec and json both answer from `answer(kind, nth, command)`; FAILED fails the call. */
 function measRunner(answer) {
@@ -1269,7 +1276,8 @@ test("measurement names: only tibotattle-meas-prodtier-<YYYYMMDD>; production, s
   const commands = [measInstanceDescribeCommand(MEAS), measInstanceCreateCommand(MEAS), measInstanceDeleteCommand(MEAS),
     measDatabasesListCommand(MEAS), measDatabaseCreateCommand(MEAS), measUsersListCommand(MEAS),
     ...FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => measIamUserCreateCommand(MEAS, account)),
-    sqlOperationWaitCommand("0a1b2c3d-op"), measJobDeleteCommand(), measExecutionCancelCommand(`${MEAS_JOB}-ab12c`)];
+    sqlOperationWaitCommand("0a1b2c3d-op"), measJobDeleteCommand(), measExecutionCancelCommand(`${MEAS_JOB}-ab12c`),
+    measInstancesListCommand(), jobsListCommand()];
   for (const command of commands) {
     assert.equal(command[0], "gcloud");
     assert.equal(command.filter((arg) => arg.startsWith("--project=")).join(), "--project=tibotattle");
@@ -1279,6 +1287,10 @@ test("measurement names: only tibotattle-meas-prodtier-<YYYYMMDD>; production, s
   }
   assert.deepEqual(measInstanceDeleteCommand(MEAS), ["gcloud", "sql", "instances", "delete", MEAS, "--project=tibotattle",
     "--async", "--quiet", "--format=json"]);
+  // The presence reads list the test project only, read-only.
+  assert.deepEqual(measInstancesListCommand(), ["gcloud", "sql", "instances", "list", "--project=tibotattle", "--format=json"]);
+  assert.deepEqual(jobsListCommand(), ["gcloud", "run", "jobs", "list", "--project=tibotattle", "--region=us-east1",
+    "--format=json"]);
   assert.deepEqual(measJobDeleteCommand(), ["gcloud", "run", "jobs", "delete", MEAS_JOB, "--project=tibotattle",
     "--region=us-east1", "--quiet"]);
   expectCode(() => measExecutionCancelCommand(`${REFRESH_JOB}-ab12c`), "FASTPATH_DEPLOY_EXECUTION_INVALID");
@@ -1326,7 +1338,8 @@ test("the measurement instance is production's shape: tier, storage, posture and
 test("meas-create builds the instance once, waits, reads it back, and refuses an instance it did not build", async () => {
   let created = false;
   const fresh = measRunner((kind) => {
-    if (kind === "sql instances describe") return created ? measInstanceResource() : FAILED;
+    if (kind === "sql instances list") return [OTHER_INSTANCE];
+    if (kind === "sql instances describe") return created ? measInstanceResource() : assert.fail("describe before create");
     if (kind === "sql instances create") { created = true; return { name: "op-create-1" }; }
     if (kind === "sql operations wait") return undefined;
     if (kind === "sql databases list") return [{ name: "postgres" }];
@@ -1337,9 +1350,10 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   });
   let clock = 0;
   const receipt = await stepMeasCreate(fresh, { measInstance: MEAS }, { wallClock: () => (clock += 450_000) });
-  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances describe", "sql instances create", "sql operations wait",
+  assert.deepEqual(fresh.commands.map(sqlKind), ["sql instances list", "sql instances create", "sql operations wait",
     "sql instances describe", "sql databases list", "sql databases create", "sql users list", "sql users create",
     "sql users create"]);
+  assert.deepEqual(fresh.commands[0], measInstancesListCommand());
   assert.deepEqual(fresh.commands[1], measInstanceCreateCommand(MEAS));
   assert.deepEqual(fresh.commands[2], sqlOperationWaitCommand("op-create-1"));
   assert.deepEqual(fresh.commands.slice(-2), FASTPATH_MEASUREMENT.iamServiceAccounts
@@ -1350,6 +1364,7 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
 
   // Re-run over its own instance: reads only.
   const again = measRunner((kind) => ({
+    "sql instances list": [OTHER_INSTANCE, measInstanceResource()],
     "sql instances describe": measInstanceResource(),
     "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
     "sql users list": FASTPATH_MEASUREMENT.iamServiceAccounts.map((account) => ({
@@ -1357,15 +1372,26 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   })[kind] ?? assert.fail(kind));
   const reread = await stepMeasCreate(again, { measInstance: MEAS });
   assert.equal(reread.existed, true);
-  assert.deepEqual(again.commands.map(sqlKind), ["sql instances describe", "sql instances describe",
+  assert.deepEqual(again.commands.map(sqlKind), ["sql instances list", "sql instances describe", "sql instances describe",
     "sql databases list", "sql users list"]);
 
+  // A listing that fails (expired credentials, network, permission) is not "absent": nothing is created.
+  for (const unread of [FAILED, undefined, { items: [] }, [{ state: "RUNNABLE" }]]) {
+    const blind = measRunner((kind) => (kind === "sql instances list" ? unread : assert.fail(kind)));
+    await assert.rejects(stepMeasCreate(blind, { measInstance: MEAS }),
+      (error) => ["FASTPATH_DEPLOY_COMMAND_FAILED", "FASTPATH_DEPLOY_JSON_INVALID"].includes(error?.code), String(unread));
+    assert.deepEqual(blind.commands.map(sqlKind), ["sql instances list"]);
+  }
+
   // Someone else's instance of that name, or a built-in user of the identity's name: refused, nothing written.
-  const foreign = measRunner((kind) => (kind === "sql instances describe"
-    ? measInstanceResource({}, { userLabels: { app: "other" } }) : assert.fail(kind)));
+  const foreign = measRunner((kind) => ({
+    "sql instances list": [measInstanceResource({}, { userLabels: { app: "other" } })],
+    "sql instances describe": measInstanceResource({}, { userLabels: { app: "other" } }),
+  })[kind] ?? assert.fail(kind));
   await assert.rejects(stepMeasCreate(foreign, { measInstance: MEAS }),
     (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
   const impostor = measRunner((kind) => ({
+    "sql instances list": [measInstanceResource()],
     "sql instances describe": measInstanceResource(), "sql databases list": [{ name: FASTPATH_MEASUREMENT.database }],
     "sql users list": [{ name: "tibotattle-test-migrator@tibotattle.iam", type: "BUILT_IN" }],
   })[kind] ?? assert.fail(kind));
@@ -1376,6 +1402,7 @@ test("meas-create builds the instance once, waits, reads it back, and refuses an
   // A created instance that reads back with another shape stops before the database and users.
   let made = false;
   const drifted = measRunner((kind) => {
+    if (kind === "sql instances list") return [];
     if (kind === "sql instances describe") return made ? measInstanceResource({}, { connectorEnforcement: "NOT_REQUIRED" }) : FAILED;
     if (kind === "sql instances create") { made = true; return { name: "op-create-2" }; }
     if (kind === "sql operations wait") return undefined;
@@ -1392,33 +1419,42 @@ test("meas-teardown cancels and deletes the Job, deletes only an instance it bui
   let gone = false;
   let jobGone = false;
   const full = measRunner((kind) => {
-    if (kind === "run jobs describe") return jobGone ? FAILED : {};
+    if (kind === "run jobs list") return jobGone ? [OTHER_JOB] : [OTHER_JOB, { metadata: { name: MEAS_JOB } }];
     if (kind === "run jobs executions list") return [running];
     if (kind === "run jobs executions cancel") return undefined;
     if (kind === "run jobs delete") { jobGone = true; return undefined; }
+    if (kind === "sql instances list") return gone ? [OTHER_INSTANCE] : [OTHER_INSTANCE, measInstanceResource()];
     if (kind === "sql instances describe") return gone ? FAILED : measInstanceResource();
     if (kind === "sql instances delete") { gone = true; return { name: "op-delete-1" }; }
     if (kind === "sql operations wait") return undefined;
     return assert.fail(kind);
   });
   const receipt = await stepMeasTeardown(full, { measInstance: MEAS });
-  assert.deepEqual(full.commands.map(sqlKind), ["run jobs describe", "run jobs executions list",
-    "run jobs executions cancel", "run jobs delete", "sql instances describe", "sql instances delete",
-    "sql operations wait", "run jobs describe", "sql instances describe"]);
+  assert.deepEqual(full.commands.map(sqlKind), ["run jobs list", "run jobs executions list",
+    "run jobs executions cancel", "run jobs delete", "sql instances list", "sql instances describe",
+    "sql instances delete", "sql operations wait", "run jobs list", "sql instances list"]);
+  assert.deepEqual(full.commands[0], jobsListCommand());
   assert.deepEqual(full.commands[2], measExecutionCancelCommand(`${MEAS_JOB}-r1abc`));
-  assert.deepEqual(full.commands[5], measInstanceDeleteCommand(MEAS));
-  assert.deepEqual(full.commands[6], sqlOperationWaitCommand("op-delete-1"));
-  assert.deepEqual([receipt.cancelled, receipt.jobDeleted, receipt.instanceDeleted, receipt.jobAbsent,
-    receipt.instanceAbsent], [[`${MEAS_JOB}-r1abc`], true, true, true, true]);
+  assert.deepEqual(full.commands[4], measInstancesListCommand());
+  assert.deepEqual(full.commands[6], measInstanceDeleteCommand(MEAS));
+  assert.deepEqual(full.commands[7], sqlOperationWaitCommand("op-delete-1"));
+  assert.deepEqual([receipt.jobPresent, receipt.instancePresent, receipt.cancelled, receipt.jobDeleted,
+    receipt.instanceDeleted, receipt.jobAbsent, receipt.instanceAbsent, receipt.remainingMeasurementInstances,
+    receipt.errors], [true, true, [`${MEAS_JOB}-r1abc`], true, true, true, true, [], []]);
 
   // Nothing left: reads only, success.
-  const empty = measRunner((kind) => (["run jobs describe", "sql instances describe"].includes(kind) ? FAILED : assert.fail(kind)));
+  const empty = measRunner((kind) => (kind === "run jobs list" ? [OTHER_JOB]
+    : kind === "sql instances list" ? [OTHER_INSTANCE] : assert.fail(kind)));
   const none = await stepMeasTeardown(empty, { measInstance: MEAS });
-  assert.deepEqual([none.jobDeleted, none.instanceDeleted, none.jobAbsent, none.instanceAbsent], [false, false, true, true]);
+  assert.deepEqual([none.jobPresent, none.instancePresent, none.jobDeleted, none.instanceDeleted, none.jobAbsent,
+    none.instanceAbsent, none.remainingMeasurementInstances], [false, false, false, false, true, true, []]);
+  assert.deepEqual(empty.commands.map(sqlKind), ["run jobs list", "sql instances list", "run jobs list", "sql instances list"]);
 
   // An instance of that name this wrapper did not build is never deleted.
-  const foreign = measRunner((kind) => (kind === "sql instances describe"
-    ? measInstanceResource({}, { userLabels: {} }) : kind === "run jobs describe" ? FAILED : assert.fail(kind)));
+  const foreign = measRunner((kind) => ({
+    "run jobs list": [], "sql instances list": [measInstanceResource({}, { userLabels: {} })],
+    "sql instances describe": measInstanceResource({}, { userLabels: {} }),
+  })[kind] ?? assert.fail(kind));
   await assert.rejects(stepMeasTeardown(foreign, { measInstance: MEAS }),
     (error) => error?.code === "FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN");
   assert.equal(foreign.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
@@ -1426,18 +1462,114 @@ test("meas-teardown cancels and deletes the Job, deletes only an instance it bui
   // A Job that cannot be deleted does not keep the instance alive; the step still fails.
   let deleted = false;
   const stuck = measRunner((kind) => {
-    if (kind === "run jobs describe") return {};
+    if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
     if (kind === "run jobs executions list") return [];
     if (kind === "run jobs delete") return FAILED;
-    if (kind === "sql instances describe") return deleted ? FAILED : measInstanceResource();
+    if (kind === "sql instances list") return deleted ? [] : [measInstanceResource()];
+    if (kind === "sql instances describe") return measInstanceResource();
     if (kind === "sql instances delete") { deleted = true; return { name: "op-delete-2" }; }
     if (kind === "sql operations wait") return undefined;
     return assert.fail(kind);
   });
   await assert.rejects(stepMeasTeardown(stuck, { measInstance: MEAS }),
-    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE");
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("job absent false"));
   assert.equal(deleted, true);
-  assert.deepEqual(stuck.receipts["meas-teardown.json"].errors, ["FASTPATH_DEPLOY_COMMAND_FAILED"]);
+  assert.deepEqual(stuck.receipts["meas-teardown.json"].errors, ["job:FASTPATH_DEPLOY_COMMAND_FAILED"]);
+  assert.equal(stuck.receipts["meas-teardown.json"].instanceAbsent, true);
+});
+
+// MEAS-SYNTH review (2026-10-03): teardown took a failed describe for
+// "absent", so with expired credentials after a 13-20 h run it deleted
+// nothing, reported both absent and exited 0, leaving the prod-tier instance
+// running. Absence now comes only from listings that succeeded.
+test("meas-teardown never reports success when its reads fail, and names any measurement instance left running", async () => {
+  // Every gcloud call fails (reauthentication required, network, quota): nothing is deleted, and the step fails.
+  const blind = measRunner(() => FAILED);
+  await assert.rejects(stepMeasTeardown(blind, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE"
+      && error.message.includes("job absent null, instance absent null, measurement instances remaining unread"));
+  const unread = blind.receipts["meas-teardown.json"];
+  assert.deepEqual([unread.jobPresent, unread.instancePresent, unread.jobDeleted, unread.instanceDeleted, unread.jobAbsent,
+    unread.instanceAbsent, unread.remainingMeasurementInstances], [null, null, false, false, null, null, null]);
+  assert.deepEqual(unread.errors, ["job:FASTPATH_DEPLOY_COMMAND_FAILED", "instance:FASTPATH_DEPLOY_COMMAND_FAILED",
+    "job-readback:FASTPATH_DEPLOY_COMMAND_FAILED", "instance-readback:FASTPATH_DEPLOY_COMMAND_FAILED"]);
+  assert.deepEqual(blind.commands.map(sqlKind), ["run jobs list", "sql instances list", "run jobs list", "sql instances list"]);
+
+  // Only the describe of a listed instance fails: it is not deleted, and the step fails.
+  const halfBlind = measRunner((kind) => ({ "run jobs list": [], "sql instances list": [measInstanceResource()],
+    "sql instances describe": FAILED })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasTeardown(halfBlind, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("instance absent false"));
+  assert.equal(halfBlind.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+  assert.deepEqual(halfBlind.receipts["meas-teardown.json"].remainingMeasurementInstances, [MEAS]);
+
+  // An unreadable listing is not an empty one.
+  for (const listing of [undefined, { items: [] }, [{ state: "RUNNABLE" }]]) {
+    const odd = measRunner((kind) => (kind === "run jobs list" ? [] : kind === "sql instances list" ? listing
+      : assert.fail(kind)));
+    await assert.rejects(stepMeasTeardown(odd, { measInstance: MEAS }),
+      (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("instance absent null"),
+      JSON.stringify(listing));
+    assert.deepEqual(odd.receipts["meas-teardown.json"].errors, ["instance:FASTPATH_DEPLOY_JSON_INVALID",
+      "instance-readback:FASTPATH_DEPLOY_JSON_INVALID"], JSON.stringify(listing));
+    assert.equal(odd.commands.some((command) => sqlKind(command) === "sql instances delete"), false);
+  }
+  const oddJobs = measRunner((kind) => (kind === "run jobs list" ? [{ spec: {} }] : kind === "sql instances list" ? []
+    : assert.fail(kind)));
+  await assert.rejects(stepMeasTeardown(oddJobs, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE" && error.message.includes("job absent null"));
+  assert.equal(oddJobs.commands.some((command) => sqlKind(command) === "run jobs delete"), false);
+
+  // The named instance never existed (a `date` re-evaluated after midnight), but another
+  // measurement instance is running: it is named, never deleted by this call, and the step fails.
+  const yesterday = "tibotattle-meas-prodtier-20261002";
+  const unlabelled = "tibotattle-meas-prodtier-20261001";
+  const drift = measRunner((kind) => ({ "run jobs list": [OTHER_JOB],
+    "sql instances list": [OTHER_INSTANCE, measInstanceResource({ name: yesterday }),
+      measInstanceResource({ name: unlabelled }, { userLabels: {} }),
+      { ...OTHER_INSTANCE, name: "someone-elses-instance", settings: { userLabels: { purpose: "meas-prodtier" } } }],
+  })[kind] ?? assert.fail(kind));
+  await assert.rejects(stepMeasTeardown(drift, { measInstance: MEAS }),
+    (error) => error?.code === "FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE"
+      && error.message.includes(`measurement instances remaining someone-elses-instance ${unlabelled} ${yesterday}`));
+  const drifted = drift.receipts["meas-teardown.json"];
+  assert.deepEqual([drifted.instancePresent, drifted.instanceAbsent, drifted.errors], [false, true, []]);
+  assert.deepEqual(drifted.remainingMeasurementInstances, ["someone-elses-instance", unlabelled, yesterday]);
+  assert.equal(drift.commands.some((command) => ["sql instances describe", "sql instances delete"].includes(sqlKind(command))),
+    false);
+  assert.deepEqual(measurementInstancesListed([OTHER_INSTANCE]), []);
+
+  // A dry run prints the deletions as if both existed, and reads nothing back.
+  const dry = { ...measRunner(() => assert.fail("no remote command in a dry run")), dryRun: true };
+  dry.json = function json(command, options = {}) { this.commands.push(command); return options.placeholderJson ?? null; };
+  dry.exec = function exec(command, { placeholder = "" } = {}) { this.commands.push(command); return { status: 0, stdout: placeholder, dry: true }; };
+  const printed = await stepMeasTeardown(dry, { measInstance: MEAS });
+  assert.deepEqual(dry.commands.map(sqlKind), ["run jobs list", "run jobs executions list", "run jobs delete",
+    "sql instances list", "sql instances describe", "sql instances delete", "sql operations wait"]);
+  assert.deepEqual([printed.jobAbsent, printed.instanceAbsent, printed.errors], [null, null, []]);
+});
+
+test("refresh-idle reads the measurement Job's presence from a listing; a failed read is not absence", () => {
+  const listing = (jobs) => scriptedRunner((command) => (kindOf(command) === "run jobs list" ? jobs
+    : kindOf(command) === "run jobs executions list" ? [] : assert.fail(kindOf(command))));
+  const absent = listing([{ metadata: { name: REFRESH_JOB } }]);
+  assert.deepEqual({ ...assertRefreshIdle(absent, { job: MEAS_JOB }) }, { step: "refresh-idle", job: MEAS_JOB, running: 0,
+    absent: true });
+  assert.deepEqual(absent.commands, [jobsListCommand()]);
+  const present = listing([{ metadata: { name: MEAS_JOB } }]);
+  assert.equal(assertRefreshIdle(present, { job: MEAS_JOB }).running, 0);
+  assert.deepEqual(present.commands.map(kindOf), ["run jobs list", "run jobs executions list"]);
+  // v2 resource names are read too.
+  assert.equal(assertRefreshIdle(listing([{ name: `projects/tibotattle/locations/us-east1/jobs/${MEAS_JOB}` }]),
+    { job: MEAS_JOB }).absent, undefined);
+  expectCode(() => assertRefreshIdle(listing(FAILED), { job: MEAS_JOB }), "FASTPATH_DEPLOY_COMMAND_FAILED");
+  expectCode(() => assertRefreshIdle(listing({ jobs: [] }), { job: MEAS_JOB }), "FASTPATH_DEPLOY_JSON_INVALID");
+  expectCode(() => assertRefreshIdle(listing([{}]), { job: MEAS_JOB }), "FASTPATH_DEPLOY_JSON_INVALID");
+  const running = uncappedExecution(`${MEAS_JOB}-r9xyz`, { created: "2026-10-04T00:00:05Z", start: "2026-10-04T00:00:20Z",
+    running: true });
+  const busy = scriptedRunner((command) => (kindOf(command) === "run jobs list" ? [{ metadata: { name: MEAS_JOB } }]
+    : [running]));
+  expectCode(() => assertRefreshIdle(busy, { job: MEAS_JOB }), "FASTPATH_DEPLOY_REFRESH_EXECUTION_RUNNING");
 });
 
 test("a measurement refresh deploys the measurement Job on its instance, which the Job alone accepts", async () => {
@@ -1514,6 +1646,7 @@ test("refresh-uncapped on a measurement instance follows only that instance's gu
         conditions: [{ type: "Completed", status: "True" }] } });
     const ok = scriptedRunner((command, nth) => {
       const kind = kindOf(command);
+      if (kind === "run jobs list") return [{ metadata: { name: MEAS_JOB } }];
       if (kind === "run jobs describe") return taskResource("Job", measTask);
       if (kind === "run jobs executions list" && nth === 1) return [];
       if (kind === "run jobs execute") return execution;

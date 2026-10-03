@@ -38,6 +38,9 @@ This receipt holds two rounds, both on 2026-10-03:
 
 ## Second round: K-CORE-A engine
 
+A same-day review corrected this section: the guard's refusal point, the
+idle-time attribution, the input-equality claim and the cloud kit's teardown.
+
 What this round ran:
 
 - Branch `claude/gcp-fp-meas-synth` with `claude/gcp-fastpath-final`
@@ -45,13 +48,16 @@ What this round ran:
 - The runs started 2026-10-03 05:16 UTC and ended at 10:34 UTC.
 - The same sealed corpus as the first round (`27de2e01…29f6`).
 - It was imported through the merged tree's chain into a fresh
-  `meas_synth_fba9c0be`, in 1,259 s (69 migrations, 9.14 GB). Each run read
-  its own template copy (`CREATE DATABASE … TEMPLATE`), so every run had
-  byte-identical inputs.
+  `meas_synth_fba9c0be`, in 1,259 s (69 migrations, 9.14 GB). The two K-CORE-A
+  runs (`dense` and `dense-workers`) each read their own template copy of it
+  (`CREATE DATABASE … TEMPLATE`), so those two had byte-identical inputs.
 - The same-day baseline: `0b8acc40`'s tree (engine `f8a8620d`), exported with
   `git archive`, built under Node 22.16.0. It was imported through its own chain
   into `meas_synth_96baa67c` (67 migrations, run concurrently with the
-  first import).
+  first import), and ran directly on that import, not on a template copy.
+  - Both imports load the same sealed corpus (`27de2e01…`), but input equality
+    across the two engines' imports is not shown. Only output equality is (see
+    "Parity" below).
 - Kernel: closure `71ac8d24…`, registry entry 1. The build stamps it, and this
   branch leaves it unchanged.
 - Run on the local PostgreSQL 17 fan-out cluster (port 55433) on macOS arm64
@@ -114,9 +120,12 @@ The read phase of the inline run, from its statement ledger (K-PGSTAT):
   - `occurrences.v12_sources`: 78 s.
 - `pg_stat_statements` is not installed locally, so the server's share is
   `null`.
-- The counts and first-evidence families run on the server while the client
-  idles. They are the 14% of the run at about 0 busy cores, about 13 minutes
-  before the first owner.
+- The 14% of the run at about 0 busy cores (about 2,080 s) is the client
+  waiting on server statements: 2,140 s in all, led by `legacy_sources` and
+  `legacy_candidates`.
+- The counts and first-evidence families are 826 s (about 13.8 minutes) of
+  that wait. All of it comes before the first owner: the job reads every
+  owner's first evidence day and counts before it plans.
 
 **K-PAR at production scale fails closed.** The `dense-workers` run refused
 `ANALYTICS_V2_REFRESH_WORKER_OUT_OF_MEMORY` 37 minutes in and wrote nothing (every output
@@ -142,7 +151,8 @@ for:
 Even before the failure, the Workers barely overlapped:
 
 - The mean was 0.97 busy cores, and never more than about 3.
-- The first 13 minutes waited on the server's counts.
+- The first 13.8 minutes waited on the server's counts and first-evidence
+  queries.
 - The main thread serves every segment load one at a time.
 
 **Per-Worker RSS is not measurable.** Workers are threads of one process, so
@@ -229,13 +239,33 @@ What follows from the table:
   straddles the 12 h line. Only the production-tier measurement decides it.
 
 The time guard still plans 10,998 s, because `ANALYTICS_REFRESH_TIME_MODEL`
-did not change. Its refusal comes at the third owner's checkpoint, after
-13.9% of the planned work:
+did not change. When it refuses depends on the read ratio r, through the
+pre-owner counts:
 
-- On the dedicated tier, k = 3.4 to 4.3, so the refusal comes about 1.4 to
-  1.8 h in.
-- On the shared-core tier, it comes about 2 h in (k = 4.25).
-- Add the pre-owner counts: 826 s locally, at the read ratio.
+- The plan checkpoint fires only after the counts and first-evidence queries,
+  826 s locally, so about 826 × r s on Cloud Run.
+- The guard refuses when the elapsed time plus the planned work passes about
+  14,220 s (the task timeout less the exit margin and the minimum write). With
+  10,998 s planned, that is any r of about 3.9 or more: the plan checkpoint
+  refuses before any owner starts.
+- Below that, the owners in digest order hold 0.41%, 13.47%, … of the plan.
+  At r up to about 3.75, the third owner's checkpoint refuses, after 13.9% of
+  the planned work. Between about 3.75 and 3.9, the second owner's does.
+
+| Read ratio r | Refusal checkpoint | About |
+|---:|---|---:|
+| 2.5 (dedicated, lower end) | third owner | 1.9 h |
+| 3.0 to 3.75 | third owner | 2.1 to 2.3 h |
+| 3.75 to 3.9 | second owner | 0.9 h |
+| 3.9 to 5.35 (5.35: shared-core set A; dedicated, upper end) | plan | 0.9 to 1.2 h |
+| 8.9 (shared-core set B) | plan | 2.0 h |
+
+So the guarded run should refuse `ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED`
+about 0.9 to 2.3 h in, on either tier. How long it takes and which checkpoint
+refuses is itself a reading of the dedicated tier's read ratio. These figures
+assume each owner's cloud time is the rest of the projected run in its
+planned share. They ignore the output account's small effect on the write
+reserve.
 
 Two directions are not measured, and this receipt claims neither:
 
@@ -300,10 +330,36 @@ name that passes the same check.
    labels. It deletes the instance even if the job's removal failed.
 3. Reads both back absent.
 
+It takes presence and absence only from listings of the project
+(`gcloud sql instances list`, `gcloud run jobs list`) that succeeded:
+
+- A failed read (expired or reauth-required credentials, a network,
+  permission or quota error) is an error, never "absent".
+- Every failure ends the step with `FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE`.
+- It also fails while any measurement instance (label `purpose=meas-prodtier`
+  or the name prefix) remains in the project, and names it in
+  `remainingMeasurementInstances`. A teardown of a name that never existed
+  (for example a `date` evaluated again after midnight) therefore cannot
+  report success while the real instance runs.
+- `meas-create` reads presence the same way.
+
 **The script:**
 `apps/worker/scripts/gcp-fastpath-prod-shape/run-prodtier-measurement.sh`
 runs every step in order, with the teardown on an `EXIT` trap. It issues no
 `gcloud` command of its own.
+
+- It evaluates the instance name once and writes it to `$OUT/instance`.
+- Each long step runs as a background child the script waits on. zsh runs an
+  INT, TERM or HUP trap only after a foreground child exits, which could have
+  been up to the 48 h cap. A waited child lets the trap stop the child and
+  all its descendants at once, and the `EXIT` trap then tears down.
+- SIGKILL, a host crash or sleep cannot be trapped. After any of these, run
+  `meas-teardown --meas-instance=<the name in $OUT/instance>` by hand. Then
+  check `instanceAbsent` and `jobAbsent` are true and
+  `remainingMeasurementInstances` is empty.
+- Cloud SQL may hold a deleted instance's name for days (up to a week, per its
+  documentation; not tested here). A retry after a teardown therefore sets
+  `MEAS_INSTANCE` to another unused valid date.
 
 **Durations to expect:**
 
@@ -312,7 +368,7 @@ runs every step in order, with the teardown on an `EXIT` trap. It issues no
 | Build | about 2 to 15 min |
 | `meas-create` | 10 to 20 min |
 | Seed | 2 to 6 h. The local import took 1,259 s; the dense seed ran at roughly 15 times its local non-v1.2 importers on the shared-core instance |
-| Guarded `dense` run | refused about 1.5 to 2 h in |
+| Guarded `dense` run | refused about 0.9 to 2.3 h in (see the guard table above) |
 | Uncapped run | 10 to 13 h projected (cap 48 h) |
 | `meas-teardown` | about 5 to 10 min |
 

@@ -433,6 +433,38 @@ export function measInstanceDescribeCommand(instance) {
     `--project=${FASTPATH_TEST.project}`, "--format=json"]);
 }
 
+/**
+ * Read-only: the test project's Cloud SQL instances. meas-create and
+ * meas-teardown take an instance's presence or absence only from this
+ * listing having succeeded: a failed describe proves nothing (expired or
+ * reauth-required credentials, a network, permission or quota error).
+ */
+export function measInstancesListCommand() {
+  return gcloudArgs(["sql", "instances", "list", `--project=${FASTPATH_TEST.project}`, "--format=json"]);
+}
+
+/** The listed instances, from a listing that succeeded; a failed or unreadable one fails the call. */
+function listedInstances(runner, { dryRunListed = [] } = {}) {
+  const listed = runner.json(measInstancesListCommand(), { read: true, placeholderJson: dryRunListed });
+  if (!Array.isArray(listed) || listed.some((entry) => typeof entry?.name !== "string" || entry.name.length === 0)) {
+    fail("FASTPATH_DEPLOY_JSON_INVALID", "sql instances list");
+  }
+  return listed;
+}
+
+/**
+ * The names of the listed instances that are measurement instances, by the
+ * purpose label this wrapper sets or by the measurement name prefix, sorted.
+ * meas-teardown fails while any remains, so an instance named by another
+ * date (a re-evaluated `date`, an earlier failed teardown) is not left
+ * running behind a successful teardown of a name that never existed.
+ */
+export function measurementInstancesListed(listed) {
+  return listed.filter((entry) => entry?.settings?.userLabels?.purpose === FASTPATH_MEASUREMENT.labels.purpose
+    || String(entry?.name).startsWith(FASTPATH_MEASUREMENT.instancePrefix))
+    .map((entry) => String(entry.name)).sort();
+}
+
 /** Create one measurement instance (asynchronously; meas-create waits on the operation). */
 export function measInstanceCreateCommand(instance) {
   const m = FASTPATH_MEASUREMENT;
@@ -574,6 +606,37 @@ export function jobDescribeCommand(job) {
     `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`, "--format=json"]);
 }
 
+/**
+ * Read-only: the test project's Cloud Run Jobs in the region. A Job is
+ * absent only when this listing succeeds without it: a failed describe
+ * proves nothing (expired or reauth-required credentials, a network,
+ * permission or quota error all fail it the same way).
+ */
+export function jobsListCommand() {
+  return gcloudArgs(["run", "jobs", "list", `--project=${FASTPATH_TEST.project}`, `--region=${FASTPATH_TEST.region}`,
+    "--format=json"]);
+}
+
+/** The name a `run jobs list` entry carries (v1 metadata.name, or a v2 resource name), or a refusal. */
+function listedJobName(entry) {
+  const name = entry?.metadata?.name ?? (typeof entry?.name === "string" ? entry.name.split("/").at(-1) : undefined);
+  if (typeof name !== "string" || name.length === 0) fail("FASTPATH_DEPLOY_JSON_INVALID", "run jobs list");
+  return name;
+}
+
+/**
+ * Whether the fast-path Job `job` exists, from a listing that succeeded. A
+ * failed or unreadable listing fails the call; it never reads as absent.
+ * A dry run lists it as `dryRunPresent` says.
+ */
+export function fastpathJobPresent(runner, job, { dryRunPresent = false } = {}) {
+  const name = assertFastpathName(job);
+  const listed = runner.json(jobsListCommand(),
+    { read: true, placeholderJson: dryRunPresent ? [{ metadata: { name } }] : [] });
+  if (!Array.isArray(listed)) fail("FASTPATH_DEPLOY_JSON_INVALID", "run jobs list");
+  return listed.map(listedJobName).includes(name);
+}
+
 function assertExecutionOf(job, execution) {
   if (typeof execution !== "string" || !EXECUTION_NAME.test(execution)
       || !execution.startsWith(`${assertFastpathName(job)}-`)) {
@@ -630,9 +693,12 @@ export function runningExecutions(executions) {
  */
 export function assertRefreshIdle(runner, { job = FASTPATH_TEST.refreshJob } = {}) {
   if (job !== FASTPATH_TEST.refreshJob) {
-    // The measurement Job exists only once a measurement's refresh deployed it.
-    const described = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true, placeholderJson: null });
-    if (described === null && !runner.dryRun) return Object.freeze({ step: "refresh-idle", job, running: 0, absent: true });
+    // The measurement Job exists only once a measurement's refresh deployed
+    // it. Absent only by a listing that succeeded: a failed read fails here
+    // rather than skip the running-execution check below.
+    if (!fastpathJobPresent(runner, job) && !runner.dryRun) {
+      return Object.freeze({ step: "refresh-idle", job, running: 0, absent: true });
+    }
   }
   const listed = runner.json(jobExecutionsCommand(job), { read: true, placeholderJson: [] });
   const running = runningExecutions(listed ?? []);
@@ -1152,9 +1218,14 @@ Steps:
                    production's flags, connector-only public address, no deletion protection or backups, labels
                    purpose=${FASTPATH_MEASUREMENT.labels.purpose}), wait for it, read it back against that shape, then
                    create ${FASTPATH_MEASUREMENT.database} and the migrator and runtime IAM users if absent. An existing
-                   instance that does not read back as one this wrapper built is refused
-  meas-teardown    delete ${FASTPATH_MEASUREMENT.refreshJob} and the --meas-instance instance (only one that reads back
-                   with this wrapper's labels and shape; absent is success), wait, read back absent
+                   instance that does not read back as one this wrapper built is refused. Presence is read from a
+                   project listing; a failed read stops the step before any write
+  meas-teardown    cancel and delete ${FASTPATH_MEASUREMENT.refreshJob} and delete the --meas-instance instance (only one
+                   that reads back with this wrapper's labels), wait, then read both back absent. Presence and absence
+                   come only from project listings that succeeded: a failed read is an error, never "absent". It
+                   fails (FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE) on any error, or while ANY measurement instance
+                   (label purpose=${FASTPATH_MEASUREMENT.labels.purpose} or the ${FASTPATH_MEASUREMENT.instancePrefix} prefix) remains in
+                   the project, naming it (remainingMeasurementInstances): tear that one down by its name. Rerunnable
 Options:
   --commit=<ref>          commit to build (required for build, migrate and all)
   --image=<repo@sha256:>  use an existing image digest instead of building
@@ -1182,7 +1253,9 @@ Options:
   --after-refresh=<path>  refresh-uncapped: the refresh.json of the guarded refresh it follows
   --meas-instance=<name>  tibotattle-meas-prodtier-<YYYYMMDD>: meas-create/meas-teardown's instance; refresh,
                           refresh-idle and refresh-uncapped then use ${FASTPATH_MEASUREMENT.refreshJob} on it
-                          (a seeded --schema only)
+                          (a seeded --schema only). The date is a name, not a clock: pin the literal name once per
+                          measurement. Cloud SQL may hold a deleted instance's name for days (up to a week, per its
+                          documentation), so a retry after a teardown takes another unused valid date
   --skip=a,b              skip steps inside "all"
   --no-execute            create/update Jobs without executing them
   --dry-run               print every command; run nothing remote and write nothing remote
@@ -1576,14 +1649,17 @@ function sqlOperationOf(result) {
  * meas-create (see HELP): the measurement instance, its database and IAM
  * users, each created only when absent and read back after. An existing
  * instance that does not read back as this wrapper's is refused untouched.
+ * Presence comes from a project listing that succeeded; a failed read stops
+ * the step before any write.
  */
 export async function stepMeasCreate(runner, options, { wallClock = Date.now } = {}) {
   const { instance, instanceConnectionName } = assertMeasurementInstance(options.measInstance);
   const describe = measInstanceDescribeCommand(instance);
-  const before = runner.json(describe, { read: true, allowFailure: true, placeholderJson: null });
-  const receipt = { step: "meas-create", instance, instanceConnectionName, existed: before !== null && !runner.dryRun,
+  const existed = listedInstances(runner).some((entry) => entry.name === instance);
+  const before = existed ? runner.json(describe, { read: true }) : null;
+  const receipt = { step: "meas-create", instance, instanceConnectionName, existed,
     createSeconds: null, state: null, mismatches: null, databaseCreated: false, usersCreated: [] };
-  if (before !== null && !runner.dryRun) {
+  if (existed) {
     const foreign = measurementInstanceMismatches(before, instance);
     if (foreign.includes("labels") || foreign.includes("name") || foreign.includes("project")) {
       fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
@@ -1625,19 +1701,30 @@ export async function stepMeasCreate(runner, options, { wallClock = Date.now } =
 
 /**
  * meas-teardown (see HELP): the measurement Job, then the instance, each only
- * if present, the instance only when it reads back as this wrapper's; both
- * read back absent. Meant to run whatever happened before it.
+ * if a listing shows it, the instance only when it reads back as this
+ * wrapper's; both then read back absent from listings that succeeded, and no
+ * measurement instance remains in the project. Meant to run whatever
+ * happened before it. A read that fails is an error, never "absent": every
+ * failure lands in `errors` and the step ends
+ * FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE.
  */
 export async function stepMeasTeardown(runner, options) {
   const { instance } = assertMeasurementInstance(options.measInstance);
   const job = FASTPATH_MEASUREMENT.refreshJob;
-  const receipt = { step: "meas-teardown", instance, job, cancelled: [], jobDeleted: false, instanceDeleted: false,
-    jobAbsent: null, instanceAbsent: null, errors: [] };
+  const receipt = { step: "meas-teardown", instance, job, jobPresent: null, instancePresent: null, cancelled: [],
+    jobDeleted: false, instanceDeleted: false, jobAbsent: null, instanceAbsent: null,
+    remainingMeasurementInstances: null, errors: [] };
+  // The receipt keeps codes only; the operator's log gets the message (gcloud's stderr tail).
+  const record = (stage, error) => {
+    const code = typeof error?.code === "string" ? error.code : "FASTPATH_DEPLOY_FAILED";
+    receipt.errors.push(`${stage}:${code}`);
+    console.error(`# meas-teardown ${stage}: ${String(error?.message ?? code)}`);
+  };
   // The Job first (its running executions cancelled), then the instance even
   // if the Job's removal failed: the instance is what costs.
   try {
-    const jobBefore = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true, placeholderJson: {} });
-    if (jobBefore !== null) {
+    receipt.jobPresent = fastpathJobPresent(runner, job, { dryRunPresent: true });
+    if (receipt.jobPresent) {
       const listed = runner.json(jobExecutionsCommand(job), { read: true, allowFailure: true, placeholderJson: [] });
       for (const execution of runner.dryRun ? [] : runningExecutions(listed ?? [])) {
         runner.exec(measExecutionCancelCommand(execution));
@@ -1647,30 +1734,51 @@ export async function stepMeasTeardown(runner, options) {
       receipt.jobDeleted = !runner.dryRun;
     }
   } catch (error) {
-    receipt.errors.push(typeof error?.code === "string" ? error.code : "FASTPATH_DEPLOY_FAILED");
+    record("job", error);
   }
-  const describe = measInstanceDescribeCommand(instance);
-  const before = runner.json(describe, { read: true, allowFailure: true, placeholderJson: {} });
-  if (before !== null) {
-    if (!runner.dryRun) {
-      const foreign = measurementInstanceMismatches(before, instance);
-      if (foreign.includes("labels") || foreign.includes("name") || foreign.includes("project")) {
-        receipt.path = await runner.receipt("meas-teardown.json", { ...receipt, refused: foreign });
-        fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
+  let foreign = null;
+  try {
+    receipt.instancePresent = listedInstances(runner, { dryRunListed: [{ name: instance }] })
+      .some((entry) => entry.name === instance);
+    if (receipt.instancePresent) {
+      const described = runner.json(measInstanceDescribeCommand(instance), { read: true, placeholderJson: {} });
+      const mismatches = runner.dryRun ? [] : measurementInstanceMismatches(described, instance);
+      if (["labels", "name", "project"].some((field) => mismatches.includes(field))) foreign = mismatches;
+      else {
+        const deleted = runner.exec(measInstanceDeleteCommand(instance),
+          { placeholder: JSON.stringify({ name: "dry-run-operation" }) });
+        runner.exec(sqlOperationWaitCommand(sqlOperationOf(deleted)), { read: true });
+        receipt.instanceDeleted = !runner.dryRun;
       }
     }
-    const deleted = runner.exec(measInstanceDeleteCommand(instance),
-      { placeholder: JSON.stringify({ name: "dry-run-operation" }) });
-    runner.exec(sqlOperationWaitCommand(sqlOperationOf(deleted)), { read: true });
-    receipt.instanceDeleted = !runner.dryRun;
+  } catch (error) {
+    record("instance", error);
+  }
+  if (foreign !== null) {
+    receipt.path = await runner.receipt("meas-teardown.json", { ...receipt, refused: foreign });
+    fail("FASTPATH_DEPLOY_MEAS_INSTANCE_FOREIGN", foreign.join(","));
   }
   if (!runner.dryRun) {
-    receipt.jobAbsent = runner.json(jobDescribeCommand(job), { read: true, allowFailure: true }) === null;
-    receipt.instanceAbsent = runner.json(describe, { read: true, allowFailure: true }) === null;
+    try {
+      receipt.jobAbsent = !fastpathJobPresent(runner, job);
+    } catch (error) {
+      record("job-readback", error);
+    }
+    try {
+      const listed = listedInstances(runner);
+      receipt.instanceAbsent = !listed.some((entry) => entry.name === instance);
+      receipt.remainingMeasurementInstances = measurementInstancesListed(listed);
+    } catch (error) {
+      record("instance-readback", error);
+    }
     receipt.path = await runner.receipt("meas-teardown.json", receipt);
-    if (!receipt.jobAbsent || !receipt.instanceAbsent || receipt.errors.length > 0) {
+    const remaining = receipt.remainingMeasurementInstances;
+    if (receipt.jobAbsent !== true || receipt.instanceAbsent !== true || remaining === null || remaining.length > 0
+        || receipt.errors.length > 0) {
       fail("FASTPATH_DEPLOY_MEAS_TEARDOWN_INCOMPLETE", `job absent ${receipt.jobAbsent}, instance absent ${
-        receipt.instanceAbsent}${receipt.errors.length > 0 ? `, ${receipt.errors.join(",")}` : ""}`);
+        receipt.instanceAbsent}, measurement instances remaining ${remaining === null ? "unread"
+        : remaining.length === 0 ? "none" : remaining.join(" ")}${
+        receipt.errors.length > 0 ? `, ${receipt.errors.join(",")}` : ""}`);
     }
   }
   return receipt;

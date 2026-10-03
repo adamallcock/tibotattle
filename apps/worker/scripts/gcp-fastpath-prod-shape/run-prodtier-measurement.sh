@@ -8,12 +8,18 @@
 # the project, the region and the measurement names
 # (tibotattle-meas-prodtier-<YYYYMMDD>, tibotattle-fastpath-meas-analytics-refresh),
 # and through scripts/gcp-fastpath-seed.mjs --meas-instance, whose connection
-# names no other instance. The instance is deleted on every exit (trap).
+# names no other instance. The instance is deleted on every exit the shell
+# can trap (see "Teardown" below).
 #
 #   zsh apps/worker/scripts/gcp-fastpath-prod-shape/run-prodtier-measurement.sh
 #
 # Environment (all optional):
-#   MEAS_INSTANCE   tibotattle-meas-prodtier-<YYYYMMDD> (default: today, UTC)
+#   MEAS_INSTANCE   tibotattle-meas-prodtier-<YYYYMMDD> (default: today, UTC,
+#                   evaluated ONCE here and written to $MEAS_OUT/instance). The
+#                   date is only a name. Cloud SQL may hold a deleted
+#                   instance's name for days (up to a week, per its
+#                   documentation), so a retry after a teardown sets another
+#                   unused valid date
 #   MEAS_CORPUS     seed-source.mjs work directory (default
 #                   ~/Library/Caches/tibotattle-meas-synth/full/seed); it must
 #                   be the full-scale corpus (own3.matches all true)
@@ -50,6 +56,21 @@
 #   collect    summary.json: each run's duration, outcome and phase timings
 #   teardown   (trap, every exit) D meas-teardown: cancel and delete the
 #              measurement Job, delete the instance, read both back absent
+#              from listings that succeeded; it fails while any measurement
+#              instance remains in the project
+#
+# Teardown: every step after the trap runs as a background child the shell
+# waits on, because zsh runs an INT/TERM/HUP trap only once a FOREGROUND
+# child exits (up to the 48 h cap) but interrupts `wait` at once. The trap
+# signals the child and all its descendants (node and the gcloud it runs)
+# and exits, and the EXIT trap tears down at once. Only the child's output is
+# redirected, so the teardown's lines reach this script's log. SIGKILL (and a
+# host crash or sleep) cannot be trapped: then run, by hand, from apps/worker,
+#   $NODE26 scripts/gcp-fastpath-test-deploy.mjs meas-teardown \
+#     --meas-instance=<the literal name in $MEAS_OUT/instance> --out=$MEAS_OUT/teardown-manual
+# and check instanceAbsent and jobAbsent are true and
+# remainingMeasurementInstances is [] in its meas-teardown.json. The remote
+# execution survives the local child; meas-teardown cancels it.
 #
 # Occupancy: the measurement instance and Job are this run's own, so the
 # shared fast-path database's lock and Job are untouched and nothing else
@@ -72,16 +93,30 @@ GUARD=(--refresh-env=ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS=14400)
 D() { "$NODE26" scripts/gcp-fastpath-test-deploy.mjs "$@"; }
 step() { echo "== $(date -u +%H:%M:%S) $1"; }
 TORN=0
+CHILD=0
+# A long step (see "Teardown" above):
+#   child <stdout file> <stderr file, or - for the stdout file> <command...>
+child() {
+  local out=$1 err=$2; shift 2
+  if [[ $err == - ]]; then "$@" > "$out" 2>&1 & else "$@" > "$out" 2> "$err" & fi
+  CHILD=$!; wait $CHILD; local rc=$?; CHILD=0; return $rc
+}
+# A process and all its descendants (D's subshell, node, the gcloud it runs).
+tree() { local p; print -r -- $1; for p in $(pgrep -P $1 2>/dev/null); do tree $p; done; }
+stop() { (( CHILD )) && kill -TERM $(tree $CHILD) 2>/dev/null; CHILD=0; exit 130; }
 teardown() {
   [[ $TORN == 1 ]] && return; TORN=1
   step teardown
   D meas-teardown --meas-instance="$INSTANCE" --out="$OUT/teardown" > "$OUT/teardown.log" 2>&1
   local rc=$?
   echo "teardown rc=$rc (receipt $OUT/teardown/meas-teardown.json)"
-  [[ $rc == 0 ]] || { echo "TEARDOWN FAILED: run it again: D meas-teardown --meas-instance=$INSTANCE"; tail -c 800 "$OUT/teardown.log"; }
+  [[ $rc == 0 ]] || { echo "TEARDOWN FAILED: run it again, and tear down every name in remainingMeasurementInstances:"
+    echo "  (cd $WORKER && $NODE26 scripts/gcp-fastpath-test-deploy.mjs meas-teardown --meas-instance=$INSTANCE --out=$OUT/teardown-retry)"
+    tail -c 800 "$OUT/teardown.log"; }
   echo "receipts in $OUT"
 }
 mkdir -p -m 700 "$OUT"
+print -r -- "$INSTANCE" > "$OUT/instance"
 echo "commit $COMMIT"; echo "instance $INSTANCE"; echo "corpus $CORPUS"; echo "profiles ${PROFILES[*]}"; echo "out $OUT"
 cd "$WORKER" || exit 2
 
@@ -126,14 +161,15 @@ echo "image $IMG"
 
 # From here on the instance may exist: delete it on every exit.
 trap teardown EXIT
-trap 'exit 130' INT TERM
+trap stop INT TERM HUP
 step create
-D meas-create --meas-instance="$INSTANCE" --out="$OUT/create" > "$OUT/create.log" 2>&1 \
+child "$OUT/create.log" - D meas-create --meas-instance="$INSTANCE" --out="$OUT/create" \
   || { echo "create FAILED"; tail -c 800 "$OUT/create.log"; exit 1; }
 
 step seed
-"$NODE26" --max-old-space-size=49152 scripts/gcp-fastpath-seed.mjs seed --target=gcp-fastpath --meas-instance="$INSTANCE" \
-  --commit="$COMMIT" --sealed-corpus="$CORPUS" > "$OUT/seed.json" 2> "$OUT/seed.log" \
+child "$OUT/seed.json" "$OUT/seed.log" \
+  "$NODE26" --max-old-space-size=49152 scripts/gcp-fastpath-seed.mjs seed --target=gcp-fastpath --meas-instance="$INSTANCE" \
+  --commit="$COMMIT" --sealed-corpus="$CORPUS" \
   || { echo "seed FAILED"; tail -c 800 "$OUT/seed.log"; exit 1; }
 SCHEMA=$("$NODE26" -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).schema)' "$OUT/seed.json")
 echo "schema $SCHEMA"
@@ -141,8 +177,9 @@ echo "schema $SCHEMA"
 for PROFILE in "${PROFILES[@]}"; do
   RUN=$OUT/$PROFILE
   step "refresh $PROFILE"
-  D refresh --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile="$PROFILE" "${GUARD[@]}" \
-    --out="$RUN/refresh" > "$RUN.refresh.log" 2>&1
+  child "$RUN.refresh.log" - \
+    D refresh --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" --refresh-profile="$PROFILE" "${GUARD[@]}" \
+    --out="$RUN/refresh"
   echo "refresh $PROFILE rc=$? (a guard refusal is data)"; tail -c 1500 "$RUN.refresh.log"; echo
   # No refresh.json: the wrapper refused or the deploy failed; nothing was measured.
   if [[ ! -f "$RUN/refresh/refresh.json" ]]; then echo "refresh $PROFILE FAILED before an execution; not measuring"; exit 1; fi
@@ -155,10 +192,11 @@ for PROFILE in "${PROFILES[@]}"; do
   if [[ "$OUTCOME" == "LOCK_HELD" ]]; then echo "refresh $PROFILE FAILED: LOCK_HELD on the measurement database"; exit 1; fi
   if [[ "$OUTCOME" != "complete" ]]; then
     step "uncapped $PROFILE"
-    D refresh-uncapped --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" \
+    child "$RUN.uncapped.log" - \
+      D refresh-uncapped --meas-instance="$INSTANCE" --image="$IMG" --schema="$SCHEMA" --now="$NOW" \
       --refresh-profile="$PROFILE" "${GUARD[@]}" \
       --task-timeout-seconds="$UNCAPPED_TIMEOUT" --after-refresh="$RUN/refresh/refresh.json" \
-      --out="$RUN/uncapped" > "$RUN.uncapped.log" 2>&1
+      --out="$RUN/uncapped"
     echo "uncapped $PROFILE rc=$? (receipt $RUN/uncapped/refresh-uncapped.json)"; tail -c 1500 "$RUN.uncapped.log"; echo
   fi
 done

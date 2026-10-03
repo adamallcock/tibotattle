@@ -5,7 +5,7 @@
 // network. The pricer is a stand-in (record counts and placement do not depend
 // on prices; seed-source.mjs prices with production's own pricer).
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -272,7 +272,9 @@ test("the production-tier script reaches only its measurement instance, through 
   const steps = new Set([...code.matchAll(/(?:^|[\s;{])D ([a-z-]+)/gmu)].map(([, step]) => step));
   assert.deepEqual([...steps].sort(), ["build", "meas-create", "meas-teardown", "refresh", "refresh-uncapped"]);
   const lines = code.split("\n");
-  const calls = (step) => lines.filter((line) => line.trimStart().startsWith(`D ${step} `));
+  // A long step is `child <stdout> <stderr|-> <command>`: a background child the shell waits on.
+  const CHILD = /^child\s+\S+\s+\S+\s+/u;
+  const calls = (step) => lines.filter((line) => line.trimStart().replace(CHILD, "").startsWith(`D ${step} `));
   for (const step of ["meas-create", "meas-teardown", "refresh", "refresh-uncapped"]) {
     assert.ok(calls(step).length > 0, step);
     for (const line of calls(step)) assert.equal(line.includes('--meas-instance="$INSTANCE"'), true, `${step} names the instance`);
@@ -286,13 +288,69 @@ test("the production-tier script reaches only its measurement instance, through 
   assert.equal(seed.includes('--meas-instance="$INSTANCE"'), true, "the seed dials the measurement instance only");
   // The teardown trap is set before the instance can exist, and runs on every exit.
   const trap = lines.findIndex((line) => line.trim() === "trap teardown EXIT");
-  const create = lines.findIndex((line) => line.trimStart().startsWith("D meas-create "));
+  const create = lines.findIndex((line) => line.trimStart().replace(CHILD, "").startsWith("D meas-create "));
   assert.ok(trap > 0 && trap < create, "trap before meas-create");
-  assert.match(code, /trap 'exit 130' INT TERM/u);
+  assert.ok(lines.findIndex((line) => line.trim() === "trap stop INT TERM HUP") > trap, "signals stop the child");
+  // Every remote step after the trap, the seed included, is a waited child, so a signal tears down at once.
+  for (const line of [seed, ...["meas-create", "refresh", "refresh-uncapped"].flatMap(calls)]) {
+    assert.match(line.trimStart(), CHILD, line);
+  }
   assert.match(code, /if \[\[ ! -f "\$RUN\/refresh\/refresh\.json" \]\]; then/u);
   assert.match(code, /if \[\[ "\$OUTCOME" == "LOCK_HELD" \]\]; then/u);
+  // The instance name is evaluated once and kept for a manual teardown.
+  assert.match(code, /^print -r -- "\$INSTANCE" > "\$OUT\/instance"$/mu);
   const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
   if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
+});
+
+// MEAS-SYNTH review (2026-10-03): zsh runs a trap only once a FOREGROUND
+// child exits, so a SIGTERM to the script during the uncapped run (up to the
+// 48 h cap) left the instance running until the child ended. The script's own
+// child/tree/stop functions, run here around a stand-in step that holds a
+// grandchild, must tear down at once and leave no process behind.
+test("the production-tier script's signal handling tears down at once and leaves no child running", async (t) => {
+  if (spawnSync("zsh", ["-c", "true"]).error?.code === "ENOENT") return t.skip("zsh is not installed");
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
+  const definition = (name) => {
+    const lines = source.split("\n");
+    const start = lines.findIndex((line) => line.startsWith(`${name}() {`));
+    assert.ok(start >= 0, name);
+    if (lines[start].trimEnd().endsWith("}")) return lines[start];
+    const end = lines.findIndex((line, index) => index > start && line === "}");
+    return lines.slice(start, end + 1).join("\n");
+  };
+  const marker = `29.${process.pid % 10_000}1`;
+  const dir = mkdtempSync(join(tmpdir(), "prodtier-trap-"));
+  const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0",
+    definition("child"), definition("tree"), definition("stop"),
+    "teardown() { [[ $TORN == 1 ]] && return; TORN=1; printf 'teardown %.1f\\n' $(( EPOCHREALTIME - T0 )); }",
+    // D's shape: a function whose process runs another (node, then its gcloud).
+    `D() { /bin/sh -c '/bin/sleep ${marker}; true'; }`,
+    "trap teardown EXIT", "trap stop INT TERM HUP",
+    `child "${join(dir, "step.log")}" - D x || exit 1`, "echo finished"].join("\n");
+  const running = () => spawnSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" }).status === 0;
+  try {
+    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      const shell = spawn("zsh", ["-c", harness], { stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      shell.stdout.on("data", (chunk) => { output += chunk; });
+      const exited = new Promise((resolveExit) => shell.on("exit", (code) => resolveExit(code)));
+      const started = Date.now();
+      while (!running() && Date.now() - started < 10_000) await new Promise((wake) => setTimeout(wake, 100));
+      assert.equal(running(), true, "the stand-in step started");
+      const signalled = Date.now();
+      shell.kill(signal);
+      const code = await exited;
+      assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
+      assert.equal(code, 130, signal);
+      assert.match(output, /^teardown \d+\.\d\n$/u, `${signal}: teardown ran, the step did not finish`);
+      await new Promise((wake) => setTimeout(wake, 300));
+      assert.equal(running(), false, `${signal}: no orphaned grandchild`);
+    }
+  } finally {
+    spawnSync("pkill", ["-f", `sleep ${marker}`]);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("the local measurement runs the wrapper's dense profiles and summarises busy cores from ps samples", async () => {
