@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
+import { applyStockAndStagedMigrations, defaultAnalyticsV2FixtureStamps, listStagedMigrations } from "./staged-migrations-harness.mjs";
 import { OPS_ACTIVITY_CLASSES, OPS_BACKLOG_CAP, OPS_PROBE_NAMES, OPS_PROBES, opsProbeNamesForJob, serializeOpsProbeLine }
   from "../cloud-run/ops-probe-contract.mjs";
 import { collectOpsRuntimeSignals, runLogRedactionProbe, runOpsRuntimeProbe } from "../cloud-run/ops-runtime-probe-job.mjs";
@@ -104,6 +104,10 @@ function environment() {
     const applied = await applyStockAndStagedMigrations({ role: "primary", schema: SCHEMA, pool, stagedFiles: [migration.name] });
     assert.ok(applied.stockApplied > 0);
     assert.equal(applied.staged.length + applied.promoted.length, 1, "the ready_at index is applied once, staged or already stock");
+    // The probe cases write analytics_v2 runs and published days by hand: as
+    // kernel 1 on the compiled manifest once the run stamps (primary 0069)
+    // are in the chain, as the other hand-seeding specs do.
+    assert.equal(await defaultAnalyticsV2FixtureStamps(pool, SCHEMA), true, "the run stamps are in the promoted chain");
     return { host, port };
   })();
   return setupPromise;
