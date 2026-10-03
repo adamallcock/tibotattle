@@ -60,7 +60,9 @@ here.
   4 instances plus 4 for rollout overlap (budget 82 of 100), and backups at
   07:00 UTC. Production-scale timings (MEAS-2) come from the dress rehearsal
   in the production project on a disposable database (REH-1, OWN-11), not
-  from staging.
+  from staging. *Superseded in part (2026-10-02):* the owner removed the
+  OPS-11 load test (round 11); its non-load live checks are part of the
+  [staging proof](../runbooks/gcp-rollout.md#staging-proof).
 - The refresh memory budget, 10,752 MiB under the 12,288 MiB heap: the dense
   measurement profile's budget, which the memory model in
   [the fast-path caps receipt](2026-10-01-gcp-fastpath-caps.md) says admits

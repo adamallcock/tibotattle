@@ -323,6 +323,20 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    node scripts/cutover-source-seal.mjs expected-ledger --inventory <private seal inventory>
    ```
 
+   The inventory selects each source's ledger layout. Production ingestion was
+   restored from a generated base, so its entry must say
+   `"layout": "ingestion-restore-base-v1"` with all six ingestion directories
+   under `d1_storage_migrations` (in role order) and no `d1_migrations`. That
+   layout expects exactly the restore-era ledger: one `0001_restore_base.sql`
+   row with the pinned digest `396753809b96…`, plus every ingestion file at P
+   that the base did not fold (at `d43c8f92`, 13 rows in all). The folded list
+   is recomputed from Git objects at the base generator commit `8da57e76` and
+   must match the qualification's role-input digest; a folded file edited or
+   removed at P refuses as `CUTOVER_EXPECTED_LEDGER_INVALID`. Without a layout
+   the source uses the fresh chain (every file, one row each), which refuses
+   the live ingestion ledger. The deletion-ledger entry keeps the fresh chain
+   under `d1_migrations`. Provenance:
+   [the restore-base receipt](../receipts/2026-10-02-gcp-int-c-seal-restore-base.md).
    `built`.
 2. **Verify the fence for the seal.**
 
@@ -403,7 +417,8 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
 Refusals to plan for: `CUTOVER_SOURCE_BOOKMARK_DRIFT` (a write reached a D1
 after the fence), `CUTOVER_LEDGER_MISMATCH` or `CUTOVER_SCHEMA_MISMATCH`
 (production's applied tail differs from the expected ledger at P, see the
-renumbering gate), `CUTOVER_SECRET_IN_OUTPUT`, `CUTOVER_OWNER_DIRECTORY_UNSAFE`.
+renumbering gate, or the inventory selects the wrong ledger layout),
+`CUTOVER_SECRET_IN_OUTPUT`, `CUTOVER_OWNER_DIRECTORY_UNSAFE`.
 Each is content-free and leaves nothing behind. A bookmark drift means the
 fence was not quiet: abort and fence again. The admin history export adds
 `CUTOVER_FENCE_SOURCE_MISMATCH` (the analytics source file names another D1)

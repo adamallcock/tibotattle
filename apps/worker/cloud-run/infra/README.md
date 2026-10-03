@@ -8,7 +8,7 @@ a rollout reads.
 
 | File | Plane |
 |---|---|
-| `staging.desired-state.json` | Staging, in the shared GCP test project `tibotattle` (`projectTenancy: "shared"`), with new, staging-marked resources only. It is the synthetic plane for the staging load test (OPS-11), the staging edge's origin (OWN-7b) and migrate and roll drills. Production data and production secrets never enter it. |
+| `staging.desired-state.json` | Staging, in the shared GCP test project `tibotattle` (`projectTenancy: "shared"`), with new, staging-marked resources only. It is the synthetic plane for the staging migrate-and-roll proof, the staging edge's origin (OWN-7b) and migrate and roll drills. Production data and production secrets never enter it. |
 | `production.desired-state.json` | Production, in the dedicated project `tibotattle-prod` (number 874229235044, `us-east1`), filled by PROD-PREP under owner decisions round 13. The apply steps, their approvals and the round 15 answers that shape them are in `docs/runbooks/gcp-production-apply.md`. |
 | `desired-state.schema.json` | JSON Schema for editors and review, including which secrets staging must name. `scripts/gcp-ops-infra-manifest.mjs` `validateDesiredState` is authoritative. |
 | `monitoring.md` | The runbook that the OPS-5 alert policies link to, one anchor per policy. The policies are derived from these desired states by `scripts/gcp-ops-monitoring-policies.mjs`. |

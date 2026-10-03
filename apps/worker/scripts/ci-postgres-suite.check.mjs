@@ -63,8 +63,6 @@ import {
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOCKET = "/private/tmp/tibotattle-pg-ci/socket";
 const EDGE_SPEC = "postgres-test/edge-origin-e2e.spec.mjs";
-const LOAD_TEST_SPEC = "postgres-test/gcp-load-test.spec.mjs";
-const EDGE_E2E_SPECS = Object.freeze([EDGE_SPEC, LOAD_TEST_SPEC]);
 const PRODUCTION_MIGRATIONS_SPEC = "postgres-test/postgres-production-migrations.spec.mjs";
 const JOURNAL_TRANSFER_SPEC = "postgres-test/postgres-ingestion-journal-transfer.spec.mjs";
 const EDGE_NODE = "/synthetic/node-v22.16.0/bin/node";
@@ -107,7 +105,7 @@ test("routing over the real postgres-test directory derives exactly the frozen H
   assert.equal(new Set(planned).size, planned.length, "each file is planned once");
   for (const file of onDisk) assert.ok(planned.includes(file), `${file} is planned`);
   for (const entry of plan.files) {
-    assert.equal(entry.profile, EDGE_E2E_SPECS.includes(entry.file)
+    assert.equal(entry.profile, entry.file === EDGE_SPEC
       ? PROFILE_EDGE_E2E
       : EXPECTED_HOST_PROFILE_FILES.includes(entry.file) ? "HOST" : "SOCKET", entry.file);
   }
@@ -883,14 +881,13 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
   assert.deepEqual(edgeCalls.map(({ args }) => args), [
     ["./cloud-run/build.mjs"],
     ["--test", "--test-concurrency=1", "--test-reporter=tap", `./${EDGE_SPEC}`],
-    ["--test", "--test-concurrency=1", "--test-reporter=tap", `./${LOAD_TEST_SPEC}`],
-  ], "EDGE_E2E runs last, through each script's own steps, under the image runtime; the shared build runs once");
+  ], "EDGE_E2E runs last, through edge:e2e's own steps, under the image runtime");
   assert.ok(calls.indexOf(edgeCalls[0]) > calls.findLastIndex(({ env }) => env.PG_TEST_HOST !== undefined));
   for (const call of edgeCalls) {
     assert.equal(call.env.PG_TEST_SOCKET, SOCKET);
     assert.equal(call.env.PG_TEST_HOST, undefined);
   }
-  assert.equal(summary.passedByPass.EDGE_E2E, EDGE_E2E_SPECS.length);
+  assert.equal(summary.passedByPass.EDGE_E2E, 1);
   assert.deepEqual(summary.environmentGaps, []);
 });
 
@@ -991,9 +988,9 @@ test("the loopback TCP pair is optional, set together, loopback only, and reache
 // Extra registration scripts and the explicit EDGE_E2E profile
 // ---------------------------------------------------------------------------
 
-test("the extra registration scripts are frozen, and only edge:e2e and gcp:load-test:local have an explicit profile", () => {
-  assert.deepEqual(EXTRA_REGISTRATION_SCRIPTS, ["edge:e2e", "postgres:production-migrations:check", "gcp:load-test:local"]);
-  assert.deepEqual(SCRIPT_PROFILES, { "edge:e2e": PROFILE_EDGE_E2E, "gcp:load-test:local": PROFILE_EDGE_E2E });
+test("the extra registration scripts are frozen, and only edge:e2e has an explicit profile", () => {
+  assert.deepEqual(EXTRA_REGISTRATION_SCRIPTS, ["edge:e2e", "postgres:production-migrations:check"]);
+  assert.deepEqual(SCRIPT_PROFILES, { "edge:e2e": PROFILE_EDGE_E2E });
   assert.deepEqual(EXTRA_SCRIPT_PREREQUISITES, ["node ./cloud-run/build.mjs"]);
   for (const value of [EXTRA_REGISTRATION_SCRIPTS, SCRIPT_PROFILES, EXTRA_SCRIPT_PREREQUISITES]) {
     assert.equal(Object.isFrozen(value), true);
@@ -1009,25 +1006,17 @@ test("the real plan has no failures: edge-origin-e2e runs in EDGE_E2E and the pr
     runner: "script:edge:e2e", source: "edge:e2e", profile: PROFILE_EDGE_E2E,
     prerequisites: ["node ./cloud-run/build.mjs"], testFlags: ["--test-concurrency=1"],
   });
-  const load = plan.files.find(({ file }) => file === LOAD_TEST_SPEC);
-  assert.deepEqual({ runner: load.runner, source: load.source, profile: load.profile, prerequisites: load.prerequisites,
-    testFlags: load.testFlags }, {
-    runner: "script:gcp:load-test:local", source: "gcp:load-test:local", profile: PROFILE_EDGE_E2E,
-    prerequisites: ["node ./cloud-run/build.mjs"], testFlags: ["--test-concurrency=1"],
-  });
   const production = plan.files.find(({ file }) => file === PRODUCTION_MIGRATIONS_SPEC);
   assert.deepEqual({ runner: production.runner, source: production.source, profile: production.profile },
     { runner: "node", source: "postgres:production-migrations:check", profile: "SOCKET" });
   assert.equal(plan.files.find(({ file }) => file === JOURNAL_TRANSFER_SPEC).profile, "SOCKET");
-  assert.deepEqual(plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E).map(({ file }) => file),
-    EDGE_E2E_SPECS);
-  for (const file of [...EDGE_E2E_SPECS, PRODUCTION_MIGRATIONS_SPEC]) {
+  assert.equal(plan.files.filter(({ profile }) => profile === PROFILE_EDGE_E2E).length, 1);
+  for (const file of [EDGE_SPEC, PRODUCTION_MIGRATIONS_SPEC]) {
     assert.equal(UNREGISTERED_ALLOWLIST.includes(file), false, `${file} is registered, not allowlisted`);
   }
   const registration = await loadRegistration(WORKER_ROOT);
   const { registered } = checkRegistrationRatchet({ onDisk: await listPostgresTestFiles(WORKER_ROOT), registration });
   assert.deepEqual(registered.get(EDGE_SPEC), ["edge:e2e"]);
-  assert.deepEqual(registered.get(LOAD_TEST_SPEC), ["gcp:load-test:local"]);
   assert.deepEqual(registered.get(PRODUCTION_MIGRATIONS_SPEC), ["postgres:production-migrations:check"]);
 });
 
@@ -1116,15 +1105,13 @@ test("without the EDGE_E2E runtime the spec is a named environment gap: never ru
   assert.equal(summary.status, "incomplete");
   assert.deepEqual(summary.failures, []);
   assert.deepEqual(summary.skipped, []);
-  assert.equal(summary.environmentGaps.length, EDGE_E2E_SPECS.length);
-  assert.deepEqual(summary.environmentGaps.map((gap) => ({ ...gap, detail: undefined })),
-    EDGE_E2E_SPECS.map((file) => ({ code: "ENVIRONMENT_GAP", file, profile: PROFILE_EDGE_E2E, detail: undefined })));
-  for (const gap of summary.environmentGaps) {
-    assert.match(gap.detail, new RegExp(`${EDGE_E2E_NODE_VARIABLE} must name the Node v22\\.16\\.0`, "u"));
-    assert.match(gap.detail, new RegExp(`${EDGE_E2E_GOLDEN_VARIABLE} is unset`, "u"));
-  }
-  assert.equal(calls.some(({ args }) => EDGE_E2E_SPECS.some((file) => args.includes(`./${file}`))
-    || args[0] === "./cloud-run/build.mjs"), false, "no edge process starts without its runtime");
+  assert.equal(summary.environmentGaps.length, 1);
+  assert.deepEqual({ ...summary.environmentGaps[0], detail: undefined },
+    { code: "ENVIRONMENT_GAP", file: EDGE_SPEC, profile: PROFILE_EDGE_E2E, detail: undefined });
+  assert.match(summary.environmentGaps[0].detail, new RegExp(`${EDGE_E2E_NODE_VARIABLE} must name the Node v22\\.16\\.0`, "u"));
+  assert.match(summary.environmentGaps[0].detail, new RegExp(`${EDGE_E2E_GOLDEN_VARIABLE} is unset`, "u"));
+  assert.equal(calls.some(({ args }) => args.includes(`./${EDGE_SPEC}`) || args[0] === "./cloud-run/build.mjs"), false,
+    "no edge process starts without its runtime");
   assert.equal(summary.passedByPass.EDGE_E2E, 0);
 });
 
@@ -1167,11 +1154,9 @@ test("a failing EDGE_E2E prerequisite fails the run and the spec does not start"
   assert.equal(summary.status, "failed");
   assert.deepEqual(summary.failures.map(({ code, file }) => [code, file]), [
     ["PREREQUISITE_FAILED", EDGE_SPEC],
-    ["PREREQUISITE_FAILED", LOAD_TEST_SPEC],
     ["EMPTY_SPEC_FILE", EDGE_SPEC],
-    ["EMPTY_SPEC_FILE", LOAD_TEST_SPEC],
   ]);
-  assert.equal(calls.some(({ args }) => EDGE_E2E_SPECS.some((file) => args.includes(`./${file}`))), false);
+  assert.equal(calls.some(({ args }) => args.includes(`./${EDGE_SPEC}`)), false);
 });
 
 test("only an explicit-profile spec may be a gap, and a gap may not also report results", () => {

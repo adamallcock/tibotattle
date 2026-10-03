@@ -47,6 +47,11 @@ const NODE_PLAN = Object.freeze({
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
 });
+// Every job checks out depth 1 except the Cloud Run check, which runs the
+// cutover seal check. That check reads pinned commits (the restore-base
+// generator commit and the Cloudflare production line) as git objects and
+// fails as an environment gap without them, so this job needs full history.
+const FETCH_DEPTH = Object.freeze({ "worker-gate": 1, "cloud-run-check": 0, "postgres-17-suite": 1 });
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -221,7 +226,8 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
     assert.equal(job.environment, undefined, `${id} has no environment`);
     for (const step of job.steps) {
       if (step.uses === CHECKOUT) {
-        assert.deepEqual(step.with, { "fetch-depth": 1, "persist-credentials": false });
+        assert.deepEqual(step.with, { "fetch-depth": FETCH_DEPTH[id], "persist-credentials": false },
+          `${id} checks out its reviewed history depth without persisted credentials`);
       }
       if (step.uses === SETUP_NODE) {
         assert.deepEqual(step.with, {
@@ -237,6 +243,17 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
       NODE_PLAN[id],
       `${id} installs exactly its reviewed Node.js versions, in order`,
     );
+  }
+});
+
+test("every job that runs the cutover seal check checks out full history", async () => {
+  const { workflow } = await loadWorkflow();
+  const sealJobs = Object.entries(workflow.jobs)
+    .filter(([, job]) => runs(job).includes(workerNpm("postgres:cutover-seal:check")));
+  assert.deepEqual(sealJobs.map(([id]) => id), ["cloud-run-check"]);
+  for (const [id, job] of sealJobs) {
+    const checkout = job.steps.find(({ uses: action }) => action === CHECKOUT);
+    assert.equal(checkout.with["fetch-depth"], 0, `${id} needs the pinned commit objects the seal check reads`);
   }
 });
 
