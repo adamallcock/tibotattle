@@ -22,7 +22,7 @@ test("loads a contiguous primary-only migration manifest", async () => {
     manifest.roles.primary.map(({ version, name }) => [version, name]),
     expectedPrimary.map(({ version, name }) => [version, name]),
   );
-  assert.equal(manifest.roles.primary.at(-1).name, "0068_v12_ready_manifest_ready_at_index.sql");
+  assert.equal(manifest.roles.primary.at(-1).name, "0069_analytics_v2_run_stamps.sql");
   for (const migration of manifest.roles.primary) {
     assert.match(migration.sha256, /^[0-9a-f]{64}$/u);
   }

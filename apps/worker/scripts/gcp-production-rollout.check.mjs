@@ -90,8 +90,9 @@ const TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJzeW50aGV0aWMiOnRydWV9.c3ludGhldGlj";
 
 // The checkout's real manifest, which carries LEAD-SIMP's residue
 // (0064_append_only_residue.sql, final name per OD-1) followed by the
-// additive 0065 interim public read, D-PT4X's additive 0066 and 0067 and
-// D-OPS4's additive 0068. The "missing residue" case slices off the residue
+// additive 0065 interim public read, D-PT4X's additive 0066 and 0067,
+// D-OPS4's additive 0068 and K-CORE-A's run stamps 0069 (a reviewed contract
+// migration). The "missing residue" case slices off the residue
 // and everything after it rather than naming a file at a fixed number.
 const MIGRATIONS = Object.freeze(await readPostgresMigrations({ role: "primary" }));
 const RESIDUE = MIGRATIONS.find(({ name }) => name.endsWith("_append_only_residue.sql"));

@@ -2,10 +2,13 @@
 -- two integers) and the community aggregate exclusions a run applied (N-EXCL,
 -- owner decision round 5: "their use in GCP analytics").
 --
--- STAGED. 0911 is a placeholder, chosen outside every sibling stream's
--- staged range (D-PT4X used 0901 and 0902; the catalog manifest store is
--- staged as 0066): the integrator assigns the next free primary number at
--- promotion. Specs and checks find it by its name suffix.
+-- NUMBER. Primary 0069, assigned by the integrator at the K-CORE-A merge
+-- (2026-10-03), right after the ready_at index (0068). Until then it was
+-- staged as staged-migrations/primary/0911_analytics_v2_run_stamps.sql (a
+-- placeholder number); specs and checks find it by its name suffix. It is a
+-- contract migration: dropping the transitional manifest_version defaults
+-- below is a DROP, so it is reviewed in CONTRACT_MIGRATIONS
+-- (cloud-run/postgres-production-migrations.mjs) with its sha256.
 --
 -- Every analytics_v2 row a run writes records the kernel that computed it
 -- (kernel_id, a smallint the repository assigns in

@@ -42,7 +42,7 @@
  * still serves, so a migration that drops, renames or tightens (SET NOT NULL,
  * or a NOT NULL column without a default) is a contract change. Each one must
  * be listed, with its sha256, in the reviewed CONTRACT_MIGRATIONS map; the
- * promoted tail 0001-0068 is classified once below. That review covers the
+ * promoted tail 0001-0069 is classified once below. That review covers the
  * SQL a previous revision issues, not its storage fence. The runtime receipt
  * fence (the one reader, src/postgres-schema-receipt.ts readSchemaReceipt,
  * behind the origin's storage gate in postgres-test-dispatch.mjs) admits a
@@ -136,7 +136,7 @@ export const CONTRACT_OPERATION_KINDS = Object.freeze([
 ]);
 
 /**
- * Reviewed contract migrations of the promoted primary tail (0001-0068),
+ * Reviewed contract migrations of the promoted primary tail (0001-0069),
  * classified with classifyContractOperations and pinned by sha256. A
  * production, staging or scratch database receives this tail in its first
  * migrate, onto an empty schema before any revision serves it, so none of
@@ -276,6 +276,13 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
     sha256: "74fb4aed9c0b1eef7f1433e9e0ea6501bdb8beedffefa17a928ad7774cce37be",
     operations: Object.freeze(["drop", "add-constraint"]),
     reason: "drops the 0053 erasure fences, receipts, terminal watermarks and floor (the daily and preview fence functions are replaced without the floor in the same transaction), the participant-erasure lease index, the re-enrollment cooldowns, the readiness sweeps and the PT-1 contract's ledger columns, and pins retention_state to restore_replay_complete and zero suppressed participants; a residue row, a non-zero watermark, a retention row outside the pins or a contract registered with ledger columns aborts it with nothing changed. On production, staging and scratch targets the whole tail including this migration lands in the first migrate onto an empty schema, so only test targets ever apply it under a serving revision, and there the exact-history receipt fence already makes that revision refuse every storage-gated route until the roll (module header); a previous revision reaches a dropped object in two places: the cloud-run-iam Google enrollment's cooldown read, mounted only when the cloud-run-iam dependency is present, which no fast-path, edge-test or production composition mounts, and the server.mjs --scheduled maintenance (behind POSTGRES_SCHEDULED_MAINTENANCE_ENABLED), whose identity purge deletes expired rows of the primary re-enrollment cooldown table and so, after this migration, fails closed with outcome failure and POSTGRES_MAINTENANCE_UNAVAILABLE having purged only expired sign-in handoffs and run none of its later phases; no repository tooling deploys or schedules --scheduled; the pinned retention values are the 0049 seed and no PostgreSQL writer changes them",
+  }),
+  // K-CORE-A's analytics_v2 run stamps (K-STAMP and N-EXCL), staged as 0911
+  // and promoted as 0069 at the K-CORE-A merge (2026-10-03).
+  "0069_analytics_v2_run_stamps.sql": Object.freeze({
+    sha256: "97d4ef47627dec182f61eb5f94478e5cd2e5f87d6044d891f4d756155170e59d",
+    operations: Object.freeze(["drop"]),
+    reason: "the only DROP is DROP DEFAULT on the manifest_version columns this migration adds to the seven stamped analytics_v2 tables (the default stamps rows written before it as manifest 1 without an UPDATE, so 0059's forward-only trigger never fires); it also adds the append-only analytics_v2_kernels table, nullable kernel_id and compatibility and exclusions digest columns, and NOT VALID checks that leave earlier rows unattributed, and it aborts with nothing changed unless every stored run is mode full. After it every insert or update of a stamped row must name kernel_id and manifest_version. The only writer of those tables is the analytics refresh Job's single write transaction (src/analytics-v2/store.ts); a previous image's refresh run between migrate and roll omits both, is refused by the manifest_version NOT NULL (or the kernel check) and rolls back with nothing written, and the next run of the rolled image writes. The origin, the admin preview, the ops probe and the interim public read loader only read these tables, by named columns. On production, staging and scratch targets the whole tail including this migration lands in the first migrate onto an empty schema; a previous revision behind an exact-history receipt fence still refuses the migrated schema until the roll (module header)",
   }),
 });
 

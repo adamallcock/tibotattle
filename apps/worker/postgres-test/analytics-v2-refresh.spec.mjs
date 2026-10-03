@@ -24,8 +24,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { access, copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -49,8 +49,11 @@ const execFileAsync = promisify(execFile);
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const JOB_PATH = join(WORKER_ROOT, "cloud-run", "analytics-refresh.mjs");
 const STAGED_FILE = "0059_analytics_v2.sql";
-// K-STAMP's staged migration (the integrator renumbers it at promotion).
-const KERNEL_STAGED_FILE = "0911_analytics_v2_run_stamps.sql";
+// K-STAMP's run-stamps migration: staged as 0911, promoted as primary 0069 at
+// the K-CORE-A merge. The harness skips a promoted name; the backfill case
+// below applies the chain before it and then this file by hand.
+const KERNEL_STAGED_FILE = "0069_analytics_v2_run_stamps.sql";
+const PRIMARY_MIGRATIONS_DIRECTORY = join(WORKER_ROOT, "postgres", "migrations", "primary");
 const ENDPOINT = await postgresTestEndpoint();
 const PG_SKIP = ENDPOINT === null
   ? "set PG_TEST_SOCKET (or PG_TEST_HOST) and PG_TEST_PORT for the local PostgreSQL 17 cluster"
@@ -655,7 +658,7 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
     assert.equal(stock.length + stagedCount, 69,
-      "the 68-migration primary chain and the staged run stamps, 0059 staged or promoted");
+      "the 69-migration primary chain, 0059 and the run stamps staged or promoted");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -805,8 +808,20 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
   await withDatabase("kernel-backfill", async ({ pool }) => {
     const schema = `analytics_v2_refresh_${randomBytes(5).toString("hex")}`;
     await pool.query(`CREATE SCHEMA "${schema}"`);
+    // The promoted chain below the run stamps (primary 0069), applied by the
+    // production runner, so the rows below are written before the migration.
+    const kernelVersion = Number(KERNEL_STAGED_FILE.slice(0, 4));
+    const prefixRoot = await mkdtemp(join(tmpdir(), "analytics-v2-run-stamps-"));
     try {
-      await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [STAGED_FILE] });
+      await mkdir(join(prefixRoot, "primary"));
+      for (const migration of await readPostgresMigrations({ role: "primary" })) {
+        if (migration.version < kernelVersion) {
+          await copyFile(join(PRIMARY_MIGRATIONS_DIRECTORY, migration.name), join(prefixRoot, "primary", migration.name));
+        }
+      }
+      const prior = await applyStockAndStagedMigrations({ role: "primary", schema, pool, stagedFiles: [STAGED_FILE],
+        rootDirectory: prefixRoot });
+      assert.equal(prior.stockApplied, kernelVersion - 1, "the chain stops before the run stamps");
       const runId = randomUUID();
       await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_runs")} (run_id, started_at, finished_at, mode, state,
         owners, owner_days, refusals, publication, timings) VALUES ($1, $2, $2, 'full', 'complete', 1, 1, '[]',
@@ -817,7 +832,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
       await pool.query(`INSERT INTO ${quoted(schema, "analytics_v2_published_daily")} (day, revision, released_at,
         payload, payload_sha256, run_id) VALUES ($1, 1, $2, $3::jsonb, $4, $5)`,
       [DAY_1, NOW_1, JSON.stringify(payload), "a".repeat(64), runId]);
-      const sql = await readFile(join(WORKER_ROOT, "postgres", "staged-migrations", "primary", KERNEL_STAGED_FILE), "utf8");
+      const sql = await readFile(join(PRIMARY_MIGRATIONS_DIRECTORY, KERNEL_STAGED_FILE), "utf8");
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -853,6 +868,7 @@ test("PG17: K-STAMP stamps every row with the registry kernel, refuses conflicts
       }
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(prefixRoot, { recursive: true, force: true });
     }
   });
 });

@@ -150,8 +150,9 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
   // C-SIMP-RECON integration promoted C-IPR's interim public read as 0065, and
   // the D-PT4X integration promoted community_aggregate_exclusions as 0066 and
   // pending_object_transfer_holds as 0067, and the D-OPS4 follow-up merge
-  // promoted the ready_at index as 0068, so the runtime receipt fences the
-  // whole promoted primary chain.
+  // promoted the ready_at index as 0068, and the K-CORE-A merge promoted the
+  // analytics_v2 run stamps as 0069, so the runtime receipt fences the whole
+  // promoted primary chain.
   for (const migration of [
     '"0047_host_diagnostic_errors.sql"',
     '"0048_rate_limit_buckets_unlogged.sql"',
@@ -175,12 +176,13 @@ test("Worker migration receipt source is generated exactly from canonical SQL", 
     '"0066_community_aggregate_exclusions.sql"',
     '"0067_pending_object_transfer_holds.sql"',
     '"0068_v12_ready_manifest_ready_at_index.sql"',
+    '"0069_analytics_v2_run_stamps.sql"',
   ]) {
     assert.equal(renderPostgresRuntimeSchema(manifest).includes(migration), true);
   }
   assert.equal(manifest.schemaVersion, "tibotattle-postgres-migration-manifest-v2");
   assert.deepEqual(Object.keys(manifest.roles), ["primary"]);
-  assert.equal(manifest.roles.primary.length, 68);
+  assert.equal(manifest.roles.primary.length, 69);
   // No frozen ledger fragment reaches the Worker receipt.
   const rendered = renderPostgresRuntimeSchema(manifest);
   for (const ledgerOnly of [
