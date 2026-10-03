@@ -196,7 +196,13 @@ function createWorld() {
     if (parts[0] === 'workers' && parts[1] === 'scripts') {
       const script = world.scripts.get(parts[2]);
       if (!script) return Response.json({ success: false, errors: [{ code: 10007 }] }, { status: 404 });
-      if (parts[3] === 'deployments') return ok({ deployments: script.deployments });
+      if (parts[3] === 'deployments') {
+        const limit=Number(parsed.searchParams.get('per_page'));
+        assert.equal(parsed.searchParams.get('page'),'1');
+        assert.ok([1,25].includes(limit));
+        const deployments=script.deployments.slice(0,limit);
+        return Response.json({success:true,result:{deployments},result_info:{page:1,per_page:limit,count:deployments.length,total_count:script.deployments.length,total_pages:Math.ceil(script.deployments.length/limit)}});
+      }
       if (parts[3] === 'versions') {
         return ok({ id: parts[4], number: 1, annotations: { 'workers/message': `synthetic upload from ${DOC_IPV6}` },
           metadata: { author_email: AUTHOR, author_id: 'synthetic-author-id', source: 'wrangler', created_on: iso(world.now) },
@@ -800,6 +806,7 @@ test('release restores the journalled prior state after an apply that stopped pa
       const label = `${name} ${landed ? 'landed' : 'lost'}`;
       const f = await fixture(t);
       const planned = await f.run('plan');
+      f.world.now = T0 - MINUTE;
       f.world.deployProduction('fenced');
       f.world.now = T0;
       // Mutation order: analytics PUT, cache-retention PUT, catch-up PATCH,
@@ -833,6 +840,7 @@ test('release restores the journalled prior state after an apply that stopped pa
   // The journal still refuses a release once gcp has been deployed since the fence.
   const g = await fixture(t);
   const planned = await g.run('plan');
+  g.world.now = T0 - MINUTE;
   g.world.deployProduction('fenced');
   g.world.now = T0;
   g.world.failPutNumber = 2;
@@ -995,4 +1003,80 @@ test('arguments are closed and the CLI prints only codes on failure', async t =>
   const leaky = Object.assign(new Error(`token ${TOKEN}`), { code: 'WRITER_UNACCOUNTED', refusalReceipt: '../../etc/passwd' });
   assert.equal(cloudflareWriterFenceErrorLine(leaky), 'WRITER_UNACCOUNTED\n');
   assert.equal(cloudflareWriterFenceErrorLine(new Error(`token ${TOKEN}`)), 'FENCE_FAILED\n');
+});
+
+
+test('paginated deployment lifetime does not prevent complete current writer inventory', async t => {
+  const f=await fixture(t);
+  const script=f.world.scripts.get('synthetic-guard');
+  const head=script.deployments[0];
+  for(let i=1;i<171;i++)script.deployments.push({...head,id:`synthetic-history-${i}`,created_on:iso(T0-i*MINUTE)});
+  await f.run('inventory');
+  assert.equal(f.mutations().length,0);
+});
+
+test('deployment page metadata and current weightset ambiguity refuse before mutation', async t => {
+  for(const scenario of ['wrong-page','wrong-count','wrong-limit','wrong-total','missing-info','partial-head','duplicate-version']) {
+    const f=await fixture(t), base=f.world.fetcher;
+    f.world.fetcher=async(url,init)=>{
+      const response=await base(url,init);
+      if(!new URL(url).pathname.endsWith('/deployments'))return response;
+      const body=await response.json();
+      if(scenario==='wrong-page')body.result_info.page=2;
+      if(scenario==='wrong-count')body.result_info.count++;
+      if(scenario==='wrong-limit')body.result_info.per_page=10;
+      if(scenario==='wrong-total')body.result_info.total_count++;
+      if(scenario==='missing-info')delete body.result_info;
+      if(scenario==='partial-head')body.result.deployments[0].versions[0].percentage=50;
+      if(scenario==='duplicate-version')body.result.deployments[0].versions=[{...body.result.deployments[0].versions[0],percentage:50},{...body.result.deployments[0].versions[0],percentage:50}];
+      return Response.json(body);
+    };
+    await assert.rejects(f.run('inventory'),{code:scenario.endsWith('head')||scenario==='duplicate-version'?'FENCE_PROVIDER_RESPONSE_INVALID':'PRODUCTION_MAINTENANCE_DEPLOYMENT_PAGE_INVALID'});
+    assert.equal(f.mutations().length,0);
+  }
+});
+
+test('script and queue inventory pagination still refuse before mutations', async t => {
+  for(const endpoint of ['/workers/scripts','/queues']) {
+    const f=await fixture(t),base=f.world.fetcher;
+    f.world.fetcher=async(url,init)=>{
+      const response=await base(url,init);
+      if(!new URL(url).pathname.endsWith(endpoint))return response;
+      const body=await response.json();body.result_info={page:1,count:1,total_count:2,total_pages:2};return Response.json(body);
+    };
+    await assert.rejects(f.run('inventory'),{code:'PRODUCTION_MAINTENANCE_INVENTORY_UNBOUNDED'});
+    assert.equal(f.mutations().length,0);
+  }
+});
+
+
+test('history proves only the complete newest prefix through its anchor, despite older lifetime pages', async t => {
+  const f=await fixture(t);const {planned}=await applied(f);
+  const script=f.world.scripts.get('synthetic-production');
+  const oldest=script.deployments.at(-1);
+  for(let i=1;i<171;i++)script.deployments.push({...oldest,id:`synthetic-old-${i}`,created_on:iso(Date.parse(oldest.created_on)-i*MINUTE)});
+  f.world.now=VERIFY_AT;
+  await f.run('verify',{fence:planned.sha256});
+});
+
+test('history refuses missing anchors, duplicates, ambiguous order and racing current heads', async t => {
+  for(const scenario of ['missing-anchor','duplicate','order','race']) {
+    const f=await fixture(t);const {planned}=await applied(f);f.world.now=VERIFY_AT;
+    const base=f.world.fetcher;let historySeen=false;
+    f.world.fetcher=async(url,init)=>{
+      const response=await base(url,init),parsed=new URL(url);
+      if(!parsed.pathname.endsWith('/synthetic-production/deployments'))return response;
+      const body=await response.json();
+      if(parsed.searchParams.get('per_page')==='25') {
+        historySeen=true;
+        if(scenario==='missing-anchor')body.result.deployments=body.result.deployments.slice(1);
+        if(scenario==='duplicate')body.result.deployments.push(body.result.deployments[0]);
+        if(scenario==='order')body.result.deployments[1].created_on=body.result.deployments[0].created_on;
+        body.result_info.count=body.result.deployments.length;body.result_info.total_count=body.result.deployments.length;body.result_info.total_pages=1;
+      } else if(scenario==='race'&&historySeen)body.result.deployments[0].id='synthetic-raced-head';
+      return Response.json(body);
+    };
+    await assert.rejects(f.run('verify',{fence:planned.sha256}),{code:'FENCE_HISTORY_INCOMPLETE'},scenario);
+    assert.deepEqual(await receiptNames(f,'fence-'),[]);
+  }
 });

@@ -122,7 +122,7 @@ const R2_PAGE_SIZE = 1_000;
 // a schedules readback per fenced script + a queue readback per consumer.
 const INVENTORY_READS = 1 + MAX_ACCOUNT_SCRIPTS * 5 + 1 + MAX_ACCOUNT_QUEUES;
 const R2_READS = 101;
-const HISTORY_READS = 1 + MAX_HISTORY_DEPLOYMENTS * 2;
+const HISTORY_READS = 2 + MAX_HISTORY_DEPLOYMENTS * 2;
 export const FENCE_REQUEST_BUDGETS = Object.freeze({
   inventory: INVENTORY_READS,
   plan: INVENTORY_READS,
@@ -304,6 +304,7 @@ function deploymentOf(value) {
         || !(item.percentage >= 0 && item.percentage <= 100)) fail('FENCE_PROVIDER_RESPONSE_INVALID');
     return { versionId: item.version_id, percentage: item.percentage };
   });
+  if(new Set(versions.map(item=>item.versionId)).size!==versions.length)fail('FENCE_PROVIDER_RESPONSE_INVALID');
   if (Math.abs(versions.reduce((total, item) => total + item.percentage, 0) - 100) > 1e-9) {
     fail('FENCE_PROVIDER_RESPONSE_INVALID');
   }
@@ -469,6 +470,7 @@ function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetch
   };
   return {
     api: transport.api,
+    deploymentPage: transport.deploymentPage,
     mutate,
     graphql,
     r2Digest,
@@ -479,7 +481,7 @@ function createFenceClient({ plan, subcommand, receiptsDirectory, cliPath, fetch
 
 async function readScript(client, plan, name, classification) {
   const path = `/accounts/${plan.accountId}/workers/scripts/${name}`;
-  const deployments = rows(await client.api(`${path}/deployments`), 'deployments', 100);
+  const deployments = rows(await client.deploymentPage(name, 1), 'deployments', 1);
   if (deployments.length === 0 && classification !== 'unlisted' && classification !== 'out-of-scope') {
     fail('FENCE_DEPLOYMENT_UNKNOWN');
   }
@@ -816,7 +818,9 @@ function checkApplyReceipt(value, plan, planReceiptSha256) {
  * active at apply, each with the edge modes of all its versions. */
 async function productionHistory(client, plan, fencedDeploymentId) {
   const path = `/accounts/${plan.accountId}/workers/scripts/${plan.productionWorker}`;
-  const list = rows(await client.api(`${path}/deployments`), 'deployments', 100).map(deploymentOf);
+  const list = rows(await client.deploymentPage(plan.productionWorker, MAX_HISTORY_DEPLOYMENTS), 'deployments', MAX_HISTORY_DEPLOYMENTS).map(deploymentOf);
+  if(new Set(list.map(item=>item.deploymentId)).size!==list.length
+    ||list.some((item,index)=>index>0&&item.createdOnMs>=list[index-1].createdOnMs))fail('FENCE_HISTORY_INCOMPLETE');
   const index = list.findIndex(item => item.deploymentId === fencedDeploymentId);
   if (index < 0 || index >= MAX_HISTORY_DEPLOYMENTS) fail('FENCE_HISTORY_INCOMPLETE');
   const modes = new Map();
@@ -836,6 +840,8 @@ async function productionHistory(client, plan, fencedDeploymentId) {
     }
     history.push({ ...deployment, modes: versionModes });
   }
+  const current=rows(await client.deploymentPage(plan.productionWorker,1),'deployments',1).map(deploymentOf);
+  if(current.length!==1||!sameList(current[0],list[0]))fail('FENCE_HISTORY_INCOMPLETE');
   return history;
 }
 

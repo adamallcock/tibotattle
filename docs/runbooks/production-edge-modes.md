@@ -339,6 +339,16 @@ length depends on the export and import, which the cutover runbook orders.
 1. Run the typed fenced deploy and verify it ([section 2](#2-typed-deploys-per-mode)).
 2. Run EP-8 from `apps/worker`, with `CLOUDFLARE_API_TOKEN` supplied through the
    approved credential mechanism:
+   EP-8 requires complete account script and queue inventories. For each script
+   it reads the explicit first deployment page with one result: Cloudflare
+   [defines the first deployment as currently active](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/list/).
+   Older lifetime history may continue on later pages; page/count/total metadata
+   must still prove the requested newest prefix is complete. Verify and release
+   read a bounded newest prefix of at most 25 deployments through the required
+   fenced anchor, with unique identifiers, strictly descending timestamps,
+   complete version weights and an unchanged head readback. Missing anchors,
+   ambiguous metadata/order or a changing head refuse; they never authorize
+   skipping history or weakening account inventory completeness.
 
    ```bash
    node scripts/cloudflare-writer-fence.mjs inventory --plan=<private fence plan> --receipts=<private receipts directory>
