@@ -219,3 +219,8 @@ name this isolated lane only; they are not the final combined kernel identity.
 The final new read-plan spec is 9/9 passing with zero skips when supplied the
 private cluster and explicit approved A/B base root. The final scripted read
 checks are 11/11, and staged documentation preflight is 21/21.
+
+The private PG 17.10 cluster used only port 55541, C locale, loopback and
+content-free synthetic fixtures. Its final disk size was 618 MiB; it was
+stopped and its owned temporary data/socket/log directory removed after the
+focused gates. No shared cluster or large-corpus import was used.
