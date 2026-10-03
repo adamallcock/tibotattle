@@ -66,6 +66,13 @@ const REGISTRY_PINS = Object.freeze([
   // closure root) and its orchestration method analytics-v2-method-v2 at the
   // 733e143c merge.
   "5140704aab3e55affbbb63da08a043615f119936c093cae25afc4b7d6e9c53c6",
+  // Kernel 5: EXCL-UNLINKED (owner decision round 19): an active exclusion
+  // covering day D lifts an unlinked typed participant's block of D
+  // (analytics-refresh-read.mjs, through owners.ts's re-export of
+  // exclusions.ts's predicate). Values are unchanged; which days publish
+  // changes only while such a participant exists. Side branches of the same
+  // base also append a kernel 5: the integrator renumbers and re-derives.
+  "1fa5ff30e17a11d79d4fc50648b8febcd31730676a1b285f678ffc6f5233a851",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

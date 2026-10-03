@@ -24,6 +24,15 @@
  * refused owner-day, the memory budget, non-effective typed evidence) never
  * block D's daily, and its missing fit never withholds the preview unless it
  * is a member of some day the preview carries.
+ * The same holds for an eligible participant with typed evidence and no
+ * active owner link (owner decision round 19, EXCL-UNLINKED). It has no
+ * owner digest and no run computes it; d43c8f92's daily cohort refusal makes
+ * the whole daily lane unavailable while one exists, whatever its
+ * exclusions. Here it blocks only the queued days it is not excluded on: the
+ * refresh Job's read composition (cloud-run/analytics-refresh-read.mjs)
+ * applies analyticsV2ExcludedOn below to its active rows, found by
+ * participant id. Unexcluded on D, it still blocks D; revoked rows lift
+ * nothing. Its data reaches no aggregate either way.
  * The owner's own rows (owner-day, cache bands, fits, model dates) and
  * refusals are computed and stored as before: an exclusion removes an owner
  * from what the community sees, never from its own evidence. The community
@@ -32,7 +41,10 @@
  *
  * At d43c8f92 only the v0.3 weekly builder read the table, and GCP does not
  * compute that snapshot, so applying the exclusions here is a declared
- * difference from the oracle whenever production holds an active row.
+ * difference from the oracle whenever production holds an active row. The
+ * unlinked lift above is a second declared difference (round 19), which
+ * arises only while an active row names an eligible typed participant
+ * without an active owner link.
  *
  * Instants are microseconds since the epoch (PostgreSQL timestamptz's own
  * resolution), so the per-day predicate here is exactly the SQL one. Pure; no

@@ -160,7 +160,11 @@
  * it applied (N-EXCL, src/analytics-v2/exclusions.ts: an owner excluded on a
  * day is left out of that day's public daily and allowance preview; the run
  * row records the digest of the exclusions applied, and a run that finds
- * them changed republishes every published day), and the revision floor it
+ * them changed republishes every published day), the read side's counts
+ * (`unlinkedTypedOwners`, eligible typed participants without an active owner
+ * link; `unlinkedBlockedDays`, the computed days they withheld, 0 when each is
+ * excluded on every such day: EXCL-UNLINKED, round 19; `terminalOwners`;
+ * `nonEffectiveUnread`), and the revision floor it
  * read (REV-SEED `revisionFloor`: present, dayCount and maxRevision; 0 and 0
  * when absent).
  *
@@ -320,7 +324,8 @@ const PRIVATE_SOCKET_DIRECTORY = /^\/private\/tmp\/tibotattle-pg-[^/]+\/socket$/
 const POOL_MAX = 4;
 const READ_STATEMENT_TIMEOUT_MILLISECONDS = 120_000;
 const READ_LOCK_TIMEOUT_MILLISECONDS = 5_000;
-const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "terminalOwners", "nonEffectiveUnread"]);
+const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "unlinkedBlockedDays", "terminalOwners",
+  "nonEffectiveUnread"]);
 const MIB = 1_024 * 1_024;
 const ENV_DECIMAL = /^(?:0|[1-9]\d{0,9})$/u;
 // Cloud Run job names: a DNS label starting with a letter (CR-3's pattern).

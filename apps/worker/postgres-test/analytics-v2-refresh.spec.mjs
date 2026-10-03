@@ -81,11 +81,17 @@ const PG_SKIP = ENDPOINT === null
   : false;
 /** The digest of no community aggregate exclusions (N-EXCL; exclusions.ts pins the same literal). */
 const NO_EXCLUSIONS = NO_ANALYTICS_V2_EXCLUSIONS_SHA256;
-/** An A-1 owners-module stand-in for a table with no exclusions (N-EXCL). */
+/**
+ * The real per-day exclusion predicate (owners.ts re-exports exclusions.ts's),
+ * resolved when called: the TypeScript modules load in before().
+ */
+const excludedOnPredicate = (intervals, day) => a1.owners.analyticsV2ExcludedOn(intervals, day);
+/** An A-1 owners-module stand-in for a table with no exclusions (N-EXCL), with the real predicate. */
 const NO_EXCLUSION_READER = Object.freeze({
   async readAnalyticsV2Exclusions() {
     return { rows: 0, active: 0, sha256: NO_EXCLUSIONS, activeByParticipant: new Map() };
   },
+  analyticsV2ExcludedOn: excludedOnPredicate,
 });
 /** A prior refresh state as readAnalyticsV2RefreshState returns it, with no exclusions applied. */
 const specState = (state) => Object.freeze({ appliedExclusionsSha256: NO_EXCLUSIONS, publishedDays: [], ...state });
@@ -2169,6 +2175,7 @@ function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["202
           // Not given: the empty table. An explicit value, null included, is returned as is.
           return exclusionRead === undefined ? NO_EXCLUSION_READER.readAnalyticsV2Exclusions() : exclusionRead;
         },
+        analyticsV2ExcludedOn: excludedOnPredicate,
       },
       queuedDays: {
         async readQueuedDays(context, options) {
@@ -2352,7 +2359,8 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.equal(calls.compute.revisionSeed, 3);
   assert.deepEqual(outputs.journal, { lastSequence: 9 });
   assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2026-02-13", cacheBandsFromDay: "2026-02-20" });
-  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, terminalOwners: 1, nonEffectiveUnread: 0 });
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, unlinkedBlockedDays: 0, terminalOwners: 1,
+    nonEffectiveUnread: 0 });
   assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
   // N-EXCL: read once, unchanged and empty: nothing reaches A-2 and nothing extra is queued.
@@ -2397,10 +2405,13 @@ test("default wiring: a linked owner's active exclusions reach A-2, and a change
     await assert.rejects(job.createAnalyticsV2Pipeline(wiringModules().modules)
       .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: malformed }), { code: "ANALYTICS_V2_REFRESH_STATE_INVALID" });
   }
-  // A pipeline without the exclusion reader cannot be built.
-  const { owners: { readAnalyticsV2Exclusions: _read, ...ownersWithout }, ...rest } = wiringModules().modules;
-  assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, owners: ownersWithout }),
-    { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+  // A pipeline without the exclusion reader, or without the per-day
+  // predicate (EXCL-UNLINKED), cannot be built.
+  for (const name of ["readAnalyticsV2Exclusions", "analyticsV2ExcludedOn"]) {
+    const { owners: { [name]: _omitted, ...ownersWithout }, ...rest } = wiringModules().modules;
+    assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, owners: ownersWithout }),
+      { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+  }
 });
 
 // E-OWNERSET (review): a saved member off the roster keeps its exclusions,
@@ -2511,7 +2522,8 @@ test("default wiring: an unlinked typed owner blocks every queued day; a non-eff
   const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
   assert.deepEqual(outputs.dailyCandidates, []);
   assert.deepEqual(outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
-  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, terminalOwners: 1, nonEffectiveUnread: 1 });
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
+    nonEffectiveUnread: 1 });
 
   // The same refusal for an effective owner fails the run: at its count
   // (read) and, should only its read refuse, at its load (compute).
@@ -2546,6 +2558,108 @@ test("default wiring: an unlinked typed owner blocks every queued day; a non-eff
   const { compute: _compute, ...withoutCompute } = wiringModules().modules;
   assert.throws(() => job.createAnalyticsV2Pipeline({ ...withoutCompute, compute: { computeAnalyticsV2() {} } }),
     { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+});
+
+// EXCL-UNLINKED (owner decision round 19, "the exclusion lifts it"; a declared
+// difference from d43c8f92): an eligible typed participant without an active
+// owner link blocks each queued day it is not excluded on, by exclusions.ts's
+// per-day predicate over its own active rows. The stub's queued days are
+// 2026-03-02, 2026-04-10 (blocked by A-2), 2026-09-29 and 2026-09-30.
+test("default wiring: an exclusion lifts an unlinked typed participant's block on exactly the days it covers", async () => {
+  const us = (iso) => Date.parse(iso) * 1_000;
+  const startOf = (day) => us(`${day}T00:00:00.000Z`);
+  const unlinkedV1 = { participantId: "participant-unlinked-v1", hasV1: true, hasV11: false, hasV12: false,
+    hasLegacy: false, hasEffective: false, source: "v1" };
+  const unlinkedV12 = { ...unlinkedV1, participantId: "participant-unlinked-v12", hasV1: false, hasV12: true };
+  const unlinkedLegacy = { ...unlinkedV1, participantId: "participant-unlinked-legacy", hasV1: false, hasLegacy: true,
+    source: "v0.2" };
+  const run = async ({ unlinked, byParticipant }) => {
+    const exclusionRead = { rows: [...byParticipant.values()].flat().length + 1,
+      active: [...byParticipant.values()].flat().length, sha256: NO_EXCLUSIONS,
+      activeByParticipant: new Map([...byParticipant].map(([id, intervals]) => [id, Object.freeze(intervals)])) };
+    const { calls, modules } = wiringModules({ unlinked, exclusionRead });
+    const pipeline = job.createAnalyticsV2Pipeline(modules);
+    const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+    const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+    return { calls, inputs, outputs, published: outputs.dailyCandidates.map((candidate) => candidate.day) };
+  };
+  const all = ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"];
+
+  // Unexcluded: every queued day is blocked, as at d43c8f92.
+  const none = await run({ unlinked: [unlinkedV1], byParticipant: new Map() });
+  assert.deepEqual(none.published, []);
+  assert.deepEqual(none.outputs.blockedDays, all);
+  assert.deepEqual(none.outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
+    nonEffectiveUnread: 0 });
+  // The unlinked participant reaches no A-2 input, and no id leaves the reader.
+  assert.deepEqual([...none.calls.compute.exclusions], []);
+  assert.equal(JSON.stringify(none.outputs.readSummary).includes("participant"), false);
+
+  // Excluded on 2026-09-29 only, [start of D, start of D+1): D publishes; the
+  // day after (expires_at at its first instant covers nothing of it) and the
+  // days before stay blocked.
+  const oneDay = await run({ unlinked: [unlinkedV1], byParticipant: new Map([[unlinkedV1.participantId,
+    [{ effectiveAtUs: startOf("2026-09-29"), expiresAtUs: startOf("2026-09-30") }]]]) });
+  assert.deepEqual(oneDay.published, ["2026-09-29"]);
+  assert.deepEqual(oneDay.outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-30"]);
+  assert.equal(oneDay.outputs.readSummary.unlinkedBlockedDays, 2);
+  assert.equal(oneDay.outputs.readSummary.unlinkedTypedOwners, 1, "the count is the roster's, exclusions aside");
+  // A-2's own block on 2026-04-10 is never lifted by the exclusion.
+  const wide = await run({ unlinked: [unlinkedV1], byParticipant: new Map([[unlinkedV1.participantId,
+    [{ effectiveAtUs: startOf("2026-01-01"), expiresAtUs: null }]]]) });
+  assert.deepEqual(wide.published, ["2026-03-02", "2026-09-29", "2026-09-30"]);
+  assert.deepEqual(wide.outputs.blockedDays, ["2026-04-10"]);
+  assert.equal(wide.outputs.readSummary.unlinkedBlockedDays, 0);
+
+  // Boundary instants (microseconds, the SQL predicate's resolution).
+  const lifted = async (interval) => (await run({ unlinked: [unlinkedV1],
+    byParticipant: new Map([[unlinkedV1.participantId, [interval]]]) })).published;
+  // effective_at at the end of 2026-09-29 (the first instant of 2026-09-30) does not cover 2026-09-29 ...
+  assert.deepEqual(await lifted({ effectiveAtUs: startOf("2026-09-30"), expiresAtUs: null }), ["2026-09-30"]);
+  // ... one microsecond earlier it does.
+  assert.deepEqual(await lifted({ effectiveAtUs: startOf("2026-09-30") - 1, expiresAtUs: null }),
+    ["2026-09-29", "2026-09-30"]);
+  // expires_at at the first instant of 2026-09-29 does not cover it ...
+  assert.deepEqual(await lifted({ effectiveAtUs: startOf("2026-03-02"), expiresAtUs: startOf("2026-09-29") }),
+    ["2026-03-02"]);
+  // ... one microsecond later it does.
+  assert.deepEqual(await lifted({ effectiveAtUs: startOf("2026-03-02"), expiresAtUs: startOf("2026-09-29") + 1 }),
+    ["2026-03-02", "2026-09-29"]);
+  // Two disjoint intervals lift exactly their days.
+  const twoIntervals = await run({ unlinked: [unlinkedV1], byParticipant: new Map([[unlinkedV1.participantId, [
+    { effectiveAtUs: startOf("2026-03-02"), expiresAtUs: startOf("2026-03-03") },
+    { effectiveAtUs: startOf("2026-09-30"), expiresAtUs: null }]]]) });
+  assert.deepEqual(twoIntervals.published, ["2026-03-02", "2026-09-30"]);
+
+  // A second unlinked typed participant not excluded on a day still blocks it.
+  const second = await run({ unlinked: [unlinkedV1, unlinkedV12, unlinkedLegacy], byParticipant: new Map([
+    [unlinkedV1.participantId, [{ effectiveAtUs: startOf("2026-01-01"), expiresAtUs: null }]],
+    [unlinkedV12.participantId, [{ effectiveAtUs: startOf("2026-09-30"), expiresAtUs: null }]]]) });
+  assert.deepEqual(second.published, ["2026-09-30"], "the legacy-only participant is not a daily-cohort member");
+  assert.deepEqual(second.outputs.readSummary.unlinkedTypedOwners, 2);
+  assert.equal(second.outputs.readSummary.unlinkedBlockedDays, 2);
+
+  // Another participant's exclusion (a linked owner's, or an unknown id's) lifts nothing.
+  const others = await run({ unlinked: [unlinkedV1], byParticipant: new Map([
+    [contractOwner(OWNER_A, "effective").participantId, [{ effectiveAtUs: startOf("2026-01-01"), expiresAtUs: null }]],
+    ["participant-unlinked-v1-other", [{ effectiveAtUs: startOf("2026-01-01"), expiresAtUs: null }]]]) });
+  assert.deepEqual(others.published, []);
+
+  // An unlinked entry without a participant id is refused, never treated as unexcluded or excluded.
+  const { participantId: _omitted, ...withoutId } = unlinkedV1;
+  for (const malformed of [withoutId, { ...unlinkedV1, participantId: 7 }]) {
+    await assert.rejects(job.createAnalyticsV2Pipeline(wiringModules({ unlinked: [malformed] }).modules)
+      .read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }),
+    { code: "ANALYTICS_V2_REFRESH_OWNERS_INVALID" });
+  }
+  // A predicate answer other than true does not lift (fail closed).
+  const truthy = wiringModules({ unlinked: [unlinkedV1], exclusionRead: { rows: 1, active: 1, sha256: NO_EXCLUSIONS,
+    activeByParticipant: new Map([[unlinkedV1.participantId, [{ effectiveAtUs: 0, expiresAtUs: null }]]]) } });
+  truthy.modules.owners.analyticsV2ExcludedOn = () => 1;
+  const truthyPipeline = job.createAnalyticsV2Pipeline(truthy.modules);
+  const truthyOutputs = await truthyPipeline.compute(await truthyPipeline.read({ pool: {}, schema: "s",
+    nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.deepEqual(truthyOutputs.dailyCandidates, []);
 });
 
 test("cache horizon and day spans: history is retained back to the floor; reads are chunked and contiguous", () => {
@@ -2868,6 +2982,100 @@ test("PG17 N-EXCL: an excluded owner's refusals are recorded but block no day it
   });
 });
 
+// EXCL-UNLINKED (owner decision round 19, "the exclusion lifts it"; a
+// declared difference from d43c8f92, whose daily cohort refusal ignores
+// exclusions): over the real readers and the real table, an eligible typed
+// participant without an active owner link blocks each queued day its active
+// community_weekly rows do not cover, at the SQL predicate's microsecond
+// boundaries; a revoked row lifts nothing, and a day it blocks again keeps its
+// prior head.
+test("PG17 EXCL-UNLINKED: an unlinked typed participant blocks exactly the days its active exclusions do not cover", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("exclusion-unlinked", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    // Active runtime: alpha's crossed-midnight occurrence is a conflict on D1
+    // and D2; lima (v1 + v1.1) is typed evidence.
+    const fixture = await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules,
+      correctionRuntime: "active", legacyScope: true });
+    const { alpha, lima } = fixture.owners;
+    const { D1, D2, D3 } = seedFixture;
+    const pipeline = realPipeline();
+    const now = new Date(seedFixture.NOW_MS).toISOString();
+    const exclusions = quoted(schema, "community_aggregate_exclusions");
+    let next = 0;
+    const exclude = async (participantId, effectiveAt, expiresAt) => {
+      next += 1;
+      await pool.query(`INSERT INTO ${exclusions} (exclusion_id, participant_id, scope, reason_code, state,
+          effective_at, expires_at, created_at, created_by_digest)
+        VALUES ($1, $2, 'community_weekly', 'data_quality', 'active', $3, $4, $3, $5)`,
+      [`synthetic-unlinked-exclusion-${next}`, participantId, effectiveAt, expiresAt, "e".repeat(64)]);
+      return `synthetic-unlinked-exclusion-${next}`;
+    };
+    // lima's owner link is withdrawn before any run: it stays eligible, with
+    // typed evidence and no active link.
+    await pool.query(`UPDATE ${quoted(schema, "storage_v11_owner_links")} SET state = 'withdrawn'
+      WHERE participant_id = $1`, [lima.participantId]);
+
+    // Unexcluded: nothing publishes; D3 (no other blocker) is withheld by lima.
+    const first = await runJob({ schema, now, pipeline });
+    assert.equal(first.state, "complete");
+    assert.equal(first.unlinkedTypedOwners, 1);
+    assert.equal(first.unlinkedBlockedDays, 1);
+    assert.deepEqual(first.published, []);
+    assert.deepEqual(first.blocked, [D1, D2, D3]);
+
+    // Excluded on D3 only, [D3 00:00, D3+1 00:00): D3 publishes; D1 and D2
+    // stay blocked (alpha's conflict, and lima outside the window).
+    const d3Row = await exclude(lima.participantId, `${D3}T00:00:00.000000Z`, "2026-10-01T00:00:00.000000Z");
+    const second = await runJob({ schema, now, pipeline });
+    assert.equal(second.unlinkedTypedOwners, 1, "the roster count, exclusions aside");
+    assert.equal(second.unlinkedBlockedDays, 0);
+    assert.deepEqual(second.published, [D3]);
+    assert.deepEqual(second.blocked, [D1, D2]);
+    const d3Head = (await publishedRows(pool, schema)).get(D3);
+    assert.equal(d3Head.revision, 1);
+
+    // alpha excluded on D1 and D2: lima, excluded on neither, now blocks both.
+    await exclude(alpha.participantId, `${D1}T00:00:00.000000Z`, `${D3}T00:00:00.000000Z`);
+    const third = await runJob({ schema, now, pipeline });
+    assert.equal(third.unlinkedBlockedDays, 2);
+    assert.deepEqual(third.published, []);
+    assert.deepEqual(third.blocked, [D1, D2]);
+
+    // Boundary instants: effective at D1's last microsecond covers D1; expiring
+    // at D2's first instant covers nothing of D2.
+    await exclude(lima.participantId, `${D1}T23:59:59.999999Z`, `${D2}T00:00:00.000000Z`);
+    const fourth = await runJob({ schema, now, pipeline });
+    assert.equal(fourth.unlinkedBlockedDays, 1);
+    assert.deepEqual(fourth.published, [D1]);
+    assert.deepEqual(fourth.blocked, [D2]);
+
+    // Effective at D2's first instant (expiring at D3's) covers D2: nothing is blocked.
+    await exclude(lima.participantId, `${D2}T00:00:00.000000Z`, `${D3}T00:00:00.000000Z`);
+    const fifth = await runJob({ schema, now, pipeline });
+    assert.equal(fifth.unlinkedBlockedDays, 0);
+    assert.deepEqual(fifth.published, [D2]);
+    assert.deepEqual(fifth.blocked, []);
+
+    // Revoking the D3 row lifts nothing any more: D3 is blocked again and
+    // keeps its prior head; the days other rows cover are unaffected.
+    await pool.query(`UPDATE ${exclusions} SET state = 'revoked', revoked_at = $1, revoked_by_digest = $2
+      WHERE exclusion_id = $3`, [now, "f".repeat(64), d3Row]);
+    const revoked = await runJob({ schema, now, pipeline });
+    assert.equal(revoked.exclusions.changed, true);
+    assert.equal(revoked.unlinkedBlockedDays, 1);
+    assert.deepEqual(revoked.published, []);
+    assert.deepEqual(revoked.blocked, [D3]);
+    const heads = await publishedRows(pool, schema);
+    assert.deepEqual([...heads.keys()], [D1, D2, D3]);
+    assert.deepEqual(heads.get(D3), d3Head, "the blocked day keeps its prior head");
+    // No receipt field names a participant.
+    assert.equal(JSON.stringify(revoked).includes(lima.participantId), false);
+  });
+});
+
 // K-PAR: owners computed by compute Workers merge to exactly the inline rows.
 test("PG17 K-PAR: --workers=2 (and 4) over the real readers and kernels writes exactly the inline run's rows", {
   skip: PG_SKIP,
@@ -3034,7 +3242,7 @@ function syntheticPipeline({ owners, facts, journal, countOf = (_owner, _stream,
     .filter(([day, streams]) => day >= fromDay && day <= throughDay && streams[stream].length > 0);
   return job.createAnalyticsV2Pipeline({
     owners: { listAnalyticsV2Owners: async () => ({ owners, unlinked: [], correctionRuntimeActive: true }),
-      readAnalyticsV2Exclusions: async () => exclusionRead() },
+      readAnalyticsV2Exclusions: async () => exclusionRead(), analyticsV2ExcludedOn: excludedOnPredicate },
     queuedDays: {
       readQueuedDays: async (context, { afterSequence }) => {
         const events = journal.filter((event) => event.sequence > afterSequence);

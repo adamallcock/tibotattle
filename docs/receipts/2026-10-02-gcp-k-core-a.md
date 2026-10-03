@@ -597,7 +597,8 @@ Kernel 1's closure is re-derived in place again (`71ac8d24…`, pin
   excluded: that mirrors d43c8f92's daily cohort refusal, which the reader
   applies to A-2's outputs, and an unlinked participant has no owner digest
   for A-2's per-owner rule. Whether an exclusion should lift it is an open
-  decision, not decided here.
+  decision, not decided here. (Decided 2026-10-03, owner round 19: the
+  exclusion lifts it, per day; see `2026-10-03-gcp-r19-excl.md`.)
 - The Docker build of the image (Linux, `node:22-bookworm-slim`) has not run;
   the image-layout build on macOS stands in for its kernel digest until the
   first test-project image build records it.

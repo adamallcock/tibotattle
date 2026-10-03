@@ -125,8 +125,14 @@ GPT-5.5 among them, are the owner's selected comparison's hidden models
 (2026-09-28) and are never named. Each id and label is the manifest's. A model
 tuple keeps its place in `days` whether or not it is named: a reader that knows
 the id keeps it uncharted, and one that does not leaves it out and says so. The
-parity check treats the relabel and the block as the one declared difference
-from the d43c8f92 oracle. The frozen interim export, served before GCP's first
+parity check treats the relabel and the block as the one unconditional
+declared difference from the d43c8f92 oracle. Two more apply only under
+production state the parity corpora do not hold: an owner with an active
+community aggregate exclusion is left out of the daily figures and allowance
+preview of each day the exclusion covers (round 5), and an eligible
+participant with typed evidence but no active owner link withholds only the
+days its active exclusions do not cover, where d43c8f92 withholds every day
+(round 19). The frozen interim export, served before GCP's first
 publication, keeps the breakdown version Cloudflare published.
 
 All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,

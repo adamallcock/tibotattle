@@ -522,8 +522,11 @@ function compareOwners(left, right) {
  * queued day, never fewer). An eligible typed owner without an active owner
  * link makes production's daily lane unavailable (d43c8f92
  * storage-community-daily.ts cohort()): every queued day is blocked and
- * carried. Legacy-only (v0.2) owners are not daily-cohort members and are not
- * read.
+ * carried, except (owner decision round 19, EXCL-UNLINKED, a declared
+ * difference from d43c8f92) a day on which an active community aggregate
+ * exclusion of its participant covers it (owners.ts analyticsV2ExcludedOn,
+ * exclusions.ts's predicate): it is outside that day's cohort. Legacy-only
+ * (v0.2) owners are not daily-cohort members and are not read.
  */
 export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets }) {
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
@@ -533,6 +536,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
   const readFirstEvidenceDay = requireFunction(occurrences, "readOwnerFirstEvidenceDay");
   const countDevices = requireFunction(devices, "countContributingDevices");
   const readExclusions = requireFunction(owners, "readAnalyticsV2Exclusions");
+  const excludedOn = requireFunction(owners, "analyticsV2ExcludedOn");
   const readOwnerSets = requireFunction(ownerSets, "readAnalyticsV2OwnerSetState");
   const readSavedValues = requireFunction(ownerSets, "readAnalyticsV2SavedContributionValues");
   const computeOutputs = requireFunction(compute, "computeAnalyticsV2");
@@ -636,7 +640,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           || !Array.isArray(listing.owners) || !Array.isArray(listing.unlinked)
           || !listing.owners.every((owner) => owner !== null && typeof owner === "object"
             && typeof owner.ownerDigest === "string" && OWNER_DIGEST.test(owner.ownerDigest))
-          || !listing.unlinked.every((owner) => owner !== null && typeof owner === "object")) {
+          || !listing.unlinked.every((owner) => owner !== null && typeof owner === "object"
+            && typeof owner.participantId === "string")) {
         fail("ANALYTICS_V2_REFRESH_OWNERS_INVALID");
       }
       // N-EXCL (src/analytics-v2/exclusions.ts): the community aggregate
@@ -647,9 +652,11 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // contribution), mapped below through its owner link in any state; a
       // saved member whose link is gone blocks its days in A-2
       // (member_link_unavailable). An eligible participant without an active
-      // link computes nothing; while it has typed evidence nothing publishes.
-      // When the table changed since the last completed run, every published
-      // day is republished.
+      // link computes nothing; while it has typed evidence it blocks every
+      // queued day its own active rows do not cover (EXCL-UNLINKED, round 19:
+      // mapped below by participant id, applied per day in compute). When the
+      // table changed since the last completed run, every published day is
+      // republished.
       const exclusions = await readExclusions(context);
       if (exclusions === null || typeof exclusions !== "object" || !Number.isSafeInteger(exclusions.rows)
           || !Number.isSafeInteger(exclusions.active) || exclusions.active < 0 || exclusions.active > exclusions.rows
@@ -666,6 +673,10 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         const intervals = exclusions.activeByParticipant.get(owner.participantId);
         if (intervals !== undefined) exclusionsByOwner.set(owner.ownerDigest, intervals);
       }
+      // EXCL-UNLINKED: each unlinked typed participant's active intervals
+      // (undefined: none), in listing order. Never an id past this point.
+      const unlinkedTypedExclusions = Object.freeze(listing.unlinked.filter(hasTypedEvidence)
+        .map((owner) => exclusions.activeByParticipant.get(owner.participantId)));
       const exclusionsChanged = exclusions.sha256 !== state.appliedExclusionsSha256;
       const journal = await readJournal(context, state.cursor);
       const unchangedDays = analyticsRefreshPublicationDays(journal.days, state);
@@ -790,7 +801,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
 
       return {
         owners: listing.owners,
-        unlinkedTypedOwners: listing.unlinked.filter(hasTypedEvidence).length,
+        unlinkedTypedOwners: unlinkedTypedExclusions.length,
+        unlinkedTypedExclusions,
         occurrencesByOwner,
         ownerEvidence,
         loadOwnerOccurrences,
@@ -842,14 +854,20 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         fail("ANALYTICS_V2_REFRESH_OUTPUTS_INVALID");
       }
       let publication = {};
-      if (inputs.unlinkedTypedOwners > 0) {
+      let unlinkedBlockedDays = 0;
+      if (inputs.unlinkedTypedExclusions.length > 0) {
         // Production's daily cohort is unavailable while an eligible typed
-        // owner has no owner link: nothing publishes, every queued day is
-        // carried, and each keeps its prior row.
+        // owner has no owner link: its days publish nothing, are carried, and
+        // keep their prior rows. EXCL-UNLINKED (round 19, a declared
+        // difference from d43c8f92): a day every such participant is
+        // excluded on is outside their cohort and publishes as computed.
+        const unlinkedBlocks = (day) => inputs.unlinkedTypedExclusions
+          .some((intervals) => excludedOn(intervals, day) !== true);
+        const withheld = outputs.dailyCandidates.filter((candidate) => unlinkedBlocks(candidate.day));
+        unlinkedBlockedDays = withheld.length;
         publication = {
-          dailyCandidates: [],
-          blockedDays: [...new Set([...outputs.blockedDays,
-            ...outputs.dailyCandidates.map((candidate) => candidate.day)])].sort(),
+          dailyCandidates: outputs.dailyCandidates.filter((candidate) => !unlinkedBlocks(candidate.day)),
+          blockedDays: [...new Set([...outputs.blockedDays, ...withheld.map((candidate) => candidate.day)])].sort(),
         };
       }
       return {
@@ -862,6 +880,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         horizon: { ownerDayFromDay: inputs.occurrenceRange.fromDay, cacheBandsFromDay: inputs.cacheFromDay },
         readSummary: {
           unlinkedTypedOwners: inputs.unlinkedTypedOwners,
+          unlinkedBlockedDays,
           terminalOwners: inputs.terminalOwners,
           nonEffectiveUnread: inputs.nonEffectiveUnread,
         },
