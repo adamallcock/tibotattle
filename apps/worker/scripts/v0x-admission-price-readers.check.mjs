@@ -137,7 +137,8 @@ test("PRICE_COLUMNS equals the columns the D1 and PostgreSQL DDL declare, and no
 test("the bundle proof: no entry ships a reader except the origin's admission and Worker D1 modules, and the refresh job ships none", async () => {
   const shipped = await shippedReaders();
   const outputs = shipped.entries.map(({ name }) => `${name}.mjs`);
-  assert.ok(outputs.length >= 15 && outputs.includes("server.mjs") && outputs.includes("analytics-refresh.mjs"));
+  // 12 entries since E-RETIRE removed the legacy daily publisher bundles (16 before).
+  assert.ok(outputs.length >= 12 && outputs.includes("server.mjs") && outputs.includes("analytics-refresh.mjs"));
   for (const { file } of shipped.entries) assert.ok(existsSync(join(WORKER_ROOT, "cloud-run", file)), `${file} is an entry file`);
   assert.deepEqual([...shipped.byFile.keys()].sort(), outputs.sort(), "every entry produced one output");
   assert.deepEqual(shippedViolations(shipped.byFile), []);
@@ -308,7 +309,7 @@ test("the reach is a pure function of the import graph: externals, cycles, an un
 
 test("build.mjs entry parsing refuses a layout it cannot read completely instead of scanning fewer entries", async () => {
   const real = await readBuildEntries(join(WORKER_ROOT, "cloud-run"));
-  assert.ok(real.entries.length >= 15);
+  assert.ok(real.entries.length >= 12);
   // K-PAR's compute Worker entry is imported from analytics-kernel-closure.mjs, never re-declared.
   assert.deepEqual(real.entries.find(({ name }) => name === "analytics-refresh-worker"),
     { name: "analytics-refresh-worker", file: "analytics-refresh-worker.mjs" });
