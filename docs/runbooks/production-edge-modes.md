@@ -369,6 +369,20 @@ envelopes, with these owner-accepted differences (owner decisions,
   edge serves the site's assets itself, so only a request the edge forwards
   by mistake sees it.
 
+One more difference has no owner decision yet. **Status answers are reused
+for up to 1 s.** Concurrent `/api/ready` and `/api/health` requests on one
+instance share a single evaluation, and a completed evaluation (ready or
+not ready) is reused for up to 1 s (`STATUS_REUSE_MILLISECONDS` in
+`cloud-run/postgres-readiness-dispatch.mjs`, from the wave-3 host design).
+A refusal such as `503 BACKEND_STORAGE_UNAVAILABLE` is never reused. The
+Worker evaluates every request, so OD-CR-4 ("`/api/ready` matches the
+Worker exactly") does not cover this reuse: a change to the lifecycle rows,
+the migration receipt or a typed pin can show on these two routes up to
+1 s late, and in that second the stale answer can be `ready` as well as
+not ready. The storage-gated routes reread the receipt on every request and
+are not affected. Until the owner accepts or removes the reuse, read
+`/api/ready` more than 1 s after the change it must reflect.
+
 ## 7. Local proof and the optional live check
 
 ### Local end-to-end (E12)
