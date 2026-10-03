@@ -198,9 +198,10 @@ function lastJson(text) {
   return null;
 }
 
-function refreshEnv(endpoint, database, profile, extra = {}) {
+export function refreshEnv(endpoint, database, profile, extra = {}) {
   return { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1",
     ANALYTICS_V2_MEMORY_BUDGET_MIB: String(profile.budgetMiB),
+    ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS: String(profile.taskTimeoutSeconds),
     PG_TEST_SOCKET: endpoint.host, PG_TEST_PORT: String(endpoint.port), PG_TEST_DATABASE: database, ...extra };
 }
 

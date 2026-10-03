@@ -516,3 +516,11 @@ test("the run summary reads a partial receipt directory: a killed run shows its 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("local measurement applies the selected explicit task timeout without inherited Worker heap flags", async () => {
+  const { refreshEnv, measureProfile } = await import("./measure-local.mjs");
+  const env = refreshEnv({ host: "/private/tmp/tibotattle-pg-synthetic/socket", port: 55531 }, "meas_synth_12345678", measureProfile("dense-workers"));
+  assert.equal(env.ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS, "86400");
+  assert.equal(Object.hasOwn(env, "NODE_OPTIONS"), false);
+  assert.equal(env.ANALYTICS_V2_MEMORY_BUDGET_MIB, "10752");
+});
