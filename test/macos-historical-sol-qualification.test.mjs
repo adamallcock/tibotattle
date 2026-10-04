@@ -14,6 +14,7 @@ import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
 import { localCompanionStatePaths } from '../src/local-installation-diagnostics.js';
 import { createLocalCollectorRefreshRunner, LocalCompanionRefreshController } from '../src/local-companion-refresh.js';
 import { buildLocalCompanionSnapshot, LocalCompanionDataStore } from '../src/local-companion-data.js';
+import { readAuthoritativeDashboardSnapshot } from '../src/local-authoritative-dashboard-snapshot.js';
 import { refreshReplaySafeAccountingCache } from '../src/replay-safe-accounting-cache.js';
 
 const OLD_ID = '71000000-0000-4000-8000-000000000018';
@@ -130,27 +131,53 @@ test('actual public APIs repair once, replay safely and preserve priced history 
   assert.throws(() => assertHistoricalSolAccounting({ refresh: replayed, overview: dataStore.getOverview(), state: retained,
     repeat: true, previousGeneration: state.generation }), refused('replay_changed'));
   for (const suffix of ['021', '022']) {
-    // Match the composition root: a new store restores the persisted full
-    // snapshot, startup/quick reloads defer broad projection, and the fresh
-    // renderer requests only a quick quota refresh. No fabricated index or
-    // accounting result is supplied for this mode.
+    const saved = await readAuthoritativeDashboardSnapshot({ snapshotFile: value.authoritativeDashboardSnapshotFile });
+    assert.equal(saved.snapshot.overview.accounting.generationMatched, true);
+    // Match the composition root's deferred startup. It retains Usage figures
+    // but deliberately does not reuse the saved snapshot's CURRENT truth.
     const restartedStore = createDataStore();
     await restartedStore.initialize({ purpose: 'startup' });
-    assert.equal(restartedStore.getOverview().accounting.generationMatched, true);
+    assert.equal(restartedStore.getOverview().accounting.generationMatched, false);
+    assert.equal(restartedStore.getOverview().accounting.accountingCacheStatus, 'unavailable');
+    assert.equal(restartedStore.getOverview().accounting.projection.status, 'retained');
     const restarted = new LocalCompanionRefreshController({ runner, dataStore: restartedStore, clock: now,
       createRefreshId: () => `71000000-0000-4000-8000-000000000${suffix}` });
+    const beforeQuickIngests = passes.length;
     assert.equal(restarted.start({ mode: 'quick' }), true);
-    await observeHistoricalSolPass({ dashboard: dashboardFor(restarted, restartedStore), context,
-      phase: 'restart', previousGeneration: state.generation });
+    await waitForHistoricalSolRefresh(() => restarted.getStatus(), null, { allowQuick: true, timeoutMs: 30_000 });
     const quick = restarted.getStatus();
     assert.equal(quick.mode, 'quick');
     assert.equal(Object.hasOwn(quick.result, 'unifiedIndex'), false);
     assert.equal(Object.hasOwn(quick.result, 'accounting'), false);
-    assert.equal(passes.length, 2, 'quick startup does not ingest or reparse');
+    assert.equal(passes.length, beforeQuickIngests, 'quick startup does not ingest or reparse');
     assert.throws(() => assertHistoricalSolAccounting({ refresh: quick, overview: restartedStore.getOverview(), state }),
       refused('accounting_invalid'), 'quick completion cannot prove initial repair');
-    assert.throws(() => assertHistoricalSolAccounting({ refresh: quick, overview: restartedStore.getOverview(),
-      state, repeat: true, restart: true, previousGeneration: state.generation + 1 }), refused('replay_changed'));
+    let current = restarted, detailedActions = 0, retainedRenderingSeen = false;
+    const dashboard = dashboardFor({ getStatus: () => current.getStatus() }, restartedStore);
+    const evaluate = dashboard.evaluate;
+    dashboard.evaluate = async script => {
+      const result = await evaluate(script);
+      if (script.includes('const rows =') && current === restarted) {
+        retainedRenderingSeen = true;
+        assert.equal(result.cost, '$0.13');
+        assert.equal(restartedStore.getOverview().accounting.generationMatched, false);
+      }
+      return result;
+    };
+    await observeHistoricalSolPass({ dashboard, context, phase: 'restart', previousGeneration: state.generation,
+      refreshDetailed: async () => {
+        assert.equal(retainedRenderingSeen, true, 'retained Usage was proved before the user detailed action');
+        detailedActions += 1;
+        current = new LocalCompanionRefreshController({ runner, dataStore: restartedStore, clock: now,
+          createRefreshId: () => `71000000-0000-4000-8000-000000000${String(Number(suffix) + 10).padStart(3, '0')}` });
+        assert.equal(current.start({ mode: 'detailed' }), true);
+        await waitForHistoricalSolRefresh(() => current.getStatus(), quick.refreshId, { timeoutMs: 30_000 });
+      } });
+    assert.equal(detailedActions, 1);
+    assert.equal(passes.length, beforeQuickIngests + 1);
+    assert.equal(passes.at(-1).sourcesReparsedForParserVersion, 0);
+    assert.equal(passes.at(-1).insertedUsageEvents, 0);
+    assert.equal(restartedStore.getOverview().accounting.generationMatched, true);
   }
   assert.deepEqual(historicalSolQualificationReceipt(context), {
     schemaVersion: 'tibotattle-historical-sol-installed-v1', observedAt: '2026-09-29T12:00:01.000Z', reportingPeriod: 'all',

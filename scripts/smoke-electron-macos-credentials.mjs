@@ -538,12 +538,12 @@ export async function runMacCredentialQualification({ intake, execute = false })
       await exerciseEmptyProfileSettings(active.settings);
       if (historicalSol) {
         // Preserve the startup repair before the explicit detailed repeat
-        // replaces its result. Fresh later restarts intentionally use a quick
-        // quota pass; their retained Usage evidence is checked independently.
+        // replaces its result. A quick restart proves retained Usage before
+        // the existing user detailed action re-establishes current authority.
         stage = 'historical_sol_candidate_' + pass;
         const observed = await observeHistoricalSolPass({ dashboard: active.dashboard,
           context: historicalSol, phase: pass === 0 ? 'repair' : 'restart',
-          previousGeneration: historicalGeneration });
+          previousGeneration: historicalGeneration, refreshDetailed: exerciseCredentialRefresh });
         historicalGeneration = observed.generation;
       }
       if (pass === 0) {

@@ -194,29 +194,28 @@ export async function readHistoricalSolState(context) {
   } finally { database.close(); }
 }
 
-export function assertHistoricalSolAccounting({ refresh, overview, state, repeat = false, restart = false, previousGeneration = null }) {
-  const index = refresh?.result?.unifiedIndex, accounting = overview?.accounting;
-  const quickRestart = restart && repeat && refresh?.mode === 'quick';
+function assertHistoricalSolUsage(overview, state) {
+  const accounting = overview?.accounting;
   const history = accounting?.periods?.find(period => period.periodId === 'history');
   const rows = history?.modelUsage ?? history?.byModel;
   const model = Array.isArray(rows) ? rows.filter(row => row.model === HISTORICAL_SOL_FIXTURE.model) : [];
-  if (refresh?.status !== 'succeeded' || (!quickRestart && refresh?.mode !== 'detailed')
-    || overview?.mode !== 'real_local_evidence'
-    || accounting?.sourceMode !== 'unified' || accounting.generationMatched !== true
-    || accounting.accountingCacheStatus !== 'available' || accounting.fallbackCount !== 0
-    || String(accounting.generation) !== String(state.generation) || accounting.generationFingerprint !== state.fingerprint
-    || accounting.sourceCoverageStatus !== 'complete' || accounting.historyCoverage?.status !== 'complete'
+  if (overview?.mode !== 'real_local_evidence' || accounting?.sourceMode !== 'unified'
     || history?.events !== 3 || history.totalTokens !== state.totalTokens || model.length !== 1
     || model[0].events !== 1 || model[0].totalTokens !== HISTORICAL_SOL_FIXTURE.totalTokens
     || model[0].apiPriceEquivalentUsd !== HISTORICAL_SOL_FIXTURE.apiPriceEquivalentUsd
     || model[0].pricingStatus === 'unrecognized' || model[0].pricingStatus === 'known_unpriced'
     || rows.some(row => row.model === 'unknown' && row.events > 0)) fail('accounting_invalid');
+}
+
+export function assertHistoricalSolAccounting({ refresh, overview, state, repeat = false, previousGeneration = null }) {
+  const index = refresh?.result?.unifiedIndex, accounting = overview?.accounting;
+  assertHistoricalSolUsage(overview, state);
+  if (refresh?.status !== 'succeeded' || refresh.mode !== 'detailed'
+    || accounting.generationMatched !== true || accounting.accountingCacheStatus !== 'available'
+    || accounting.fallbackCount !== 0 || String(accounting.generation) !== String(state.generation)
+    || accounting.generationFingerprint !== state.fingerprint || accounting.sourceCoverageStatus !== 'complete'
+    || accounting.historyCoverage?.status !== 'complete') fail('accounting_invalid');
   if (repeat && state.generation !== previousGeneration) fail('replay_changed');
-  // A fresh startup's quick pass only observes quota. Its retained indexed
-  // identity, accounting and rendering must still match; the earlier explicit
-  // detailed repeat independently proves zero inserts/reparse. Never require
-  // ingestion counters from a mode that intentionally does not ingest.
-  if (quickRestart) return true;
   if (index?.status !== 'ingested' || index.totalUsageEvents !== 3
     || refresh.result.accounting?.status !== 'replay_safe' || refresh.result.accounting?.generationMatched !== true
     || refresh.result.accounting?.sourceMode !== 'unified' || refresh.result.accounting?.coverageStatus !== 'complete'
@@ -252,6 +251,20 @@ const UI_PROBE = `(async () => {
     cost: cost?.textContent, costUnavailable: cost?.classList.contains('data-value-unavailable') };
 })()`;
 
+async function observeHistoricalSolRendering(dashboard, { now, wait, deadline }) {
+  if (await dashboard.evaluate(`(()=>{
+    const nav=document.querySelector('[data-nav="method"]');
+    const period=document.querySelector('#reporting-period-controls [data-period="all"]');
+    if(!nav||!period)return false;nav.click();period.click();return true})()`) !== true) fail('rendered_usage_invalid');
+  while (now() <= deadline) {
+    const value = await dashboard.evaluate(UI_PROBE);
+    try { assertHistoricalSolRendered(value); return; }
+    catch (error) { if (error?.credentialStage !== 'historical_sol_rendered_usage_invalid') throw error; }
+    await wait(200);
+  }
+  fail('rendered_usage_invalid');
+}
+
 export async function readHistoricalSolRefreshId(dashboard) {
   const id = await dashboard.evaluate(`(async()=>{const r=await fetch('/api/local/refresh',{cache:'no-store'});
     return r.ok?(await r.json()).refresh?.refreshId:null})()`);
@@ -282,7 +295,7 @@ export async function waitForHistoricalSolRefresh(read, previousRefreshId = null
   fail('refresh_timeout');
 }
 
-export async function observeHistoricalSolPass({ dashboard, context, phase, previousGeneration = null }, {
+export async function observeHistoricalSolPass({ dashboard, context, phase, previousGeneration = null, refreshDetailed = null }, {
   now = Date.now, wait = delay, timeoutMs = 60_000,
 } = {}) {
   const retained = contexts.get(context);
@@ -292,26 +305,31 @@ export async function observeHistoricalSolPass({ dashboard, context, phase, prev
     || (phase === 'restart' && (!retained.repeatObserved || retained.restartsObserved >= 2))) fail('pass_order');
   const repeat = phase !== 'repair';
   const deadline = now() + timeoutMs;
-  const refresh = await waitForHistoricalSolRefresh(() => dashboard.evaluate(`(async()=>{
+  const readRefresh = () => dashboard.evaluate(`(async()=>{
     const r=await fetch('/api/local/refresh',{cache:'no-store'});
-    return r.ok?(await r.json()).refresh:null})()`), retained.lastRefreshId,
-  { now, wait, timeoutMs, allowQuick: phase === 'restart' });
+    return r.ok?(await r.json()).refresh:null})()`);
+  let refresh = await waitForHistoricalSolRefresh(readRefresh, retained.lastRefreshId,
+    { now, wait, timeoutMs, allowQuick: phase === 'restart' });
+  if (refresh.mode === 'quick') {
+    // Deferred startup retains figures while honestly withholding CURRENT
+    // generation/cache authority. Prove stored identity and visible retained
+    // Usage before a user detailed refresh supplies fresh authority/counters.
+    const persisted = await readHistoricalSolState(context);
+    if (persisted.generation !== previousGeneration) fail('replay_changed');
+    const retainedOverview = await dashboard.evaluate(`(async()=>{const r=await fetch('/api/local/overview',{cache:'no-store'});
+      return r.ok?await r.json():null})()`);
+    assertHistoricalSolUsage(retainedOverview, persisted);
+    await observeHistoricalSolRendering(dashboard, { now, wait, deadline });
+    if (typeof refreshDetailed !== 'function') fail('detailed_refresh_missing');
+    const startupId = refresh.refreshId;
+    await refreshDetailed(dashboard);
+    refresh = await waitForHistoricalSolRefresh(readRefresh, startupId, { now, wait, timeoutMs });
+  }
   const state = await readHistoricalSolState(context);
   const overview = await dashboard.evaluate(`(async()=>{const r=await fetch('/api/local/overview',{cache:'no-store'});
     return r.ok?await r.json():null})()`);
-  assertHistoricalSolAccounting({ refresh, overview, state, repeat, restart: phase === 'restart', previousGeneration });
-  if (await dashboard.evaluate(`(()=>{
-    const nav=document.querySelector('[data-nav="method"]');
-    const period=document.querySelector('#reporting-period-controls [data-period="all"]');
-    if(!nav||!period)return false;nav.click();period.click();return true})()`) !== true) fail('rendered_usage_invalid');
-  let rendered = false;
-  while (now() <= deadline) {
-    const value = await dashboard.evaluate(UI_PROBE);
-    try { assertHistoricalSolRendered(value); rendered = true; break; }
-    catch (error) { if (error?.credentialStage !== 'historical_sol_rendered_usage_invalid') throw error; }
-    await wait(200);
-  }
-  if (!rendered) fail('rendered_usage_invalid');
+  assertHistoricalSolAccounting({ refresh, overview, state, repeat, previousGeneration });
+  await observeHistoricalSolRendering(dashboard, { now, wait, deadline: now() + timeoutMs });
   retained.lastRefreshId = refresh.refreshId;
   if (phase === 'repair') retained.repairObserved = true;
   if (phase === 'repeat') retained.repeatObserved = true;

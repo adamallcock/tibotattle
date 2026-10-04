@@ -2441,7 +2441,8 @@
         "scripts/smoke-electron-macos-replacement.mjs",
         "scripts/smoke-electron-macos-sparkle-transition.mjs",
         "scripts/smoke-electron-macos-credentials.mjs",
-        "test/smoke-electron-macos-credentials.test.mjs"
+        "test/smoke-electron-macos-credentials.test.mjs",
+        "test/macos-historical-sol-qualification.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
