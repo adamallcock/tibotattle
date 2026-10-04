@@ -80,29 +80,33 @@ function startTime(stat) {
   if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_IDENTITY_INVALID');
   return value;
 }
-async function processIdentity(pid, expected, temporary) {
-  const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
-  const args = (await readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
+export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary, { read = readFile, link = readlink, hash = digest } = {}) {
+  const stat = await read(`/proc/${pid}/stat`, 'utf8');
+  const args = (await read(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
   if (args.some(arg => arg.startsWith('--type='))) return null;
-  const executable = await readlink(`/proc/${pid}/exe`); // No argv fallback in this lane.
+  const executable = await link(`/proc/${pid}/exe`); // No argv fallback in this lane.
   if (!executable.startsWith(`${temporary}/.mount_`) || basename(executable) !== 'tibotattle') return null;
-  const status = await readFile(`/proc/${pid}/status`, 'utf8');
+  const status = await read(`/proc/${pid}/status`, 'utf8');
   if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_IDENTITY_INVALID');
-  const entries = (await readFile(`/proc/${pid}/environ`, 'utf8')).split('\0');
-  const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN)=/u.test(item)).map(item => {
+  const entries = (await read(`/proc/${pid}/environ`, 'utf8')).split('\0');
+  const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN|ELECTRON_RUN_AS_NODE)=/u.test(item)).map(item => {
     const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
   }));
-  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await readFile(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary });
-  if (await digest(executable) !== expected.executableSha256
-    || await digest(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
-  if (startTime(await readFile(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
+  // The ordinary companion uses this same executable in Node mode. Its closed
+  // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
+  if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
+  if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_ROLE_INVALID');
+  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await read(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary });
+  if (await hash(executable) !== expected.executableSha256
+    || await hash(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
+  if (startTime(await read(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
   return { pid, startTime: startTime(stat), mount: mounted.mount, executable };
 }
 async function ownedApps(expected, temporary) {
   const found = [];
   for (const name of await readdir('/proc')) {
     if (!/^[0-9]+$/u.test(name)) continue;
-    try { const identity = await processIdentity(Number(name), expected, temporary); if (identity) found.push(identity); }
+    try { const identity = await readLinuxFinalAppProcessIdentity(Number(name), expected, temporary); if (identity) found.push(identity); }
     catch (error) { if (error.code?.startsWith('LINUX_FINAL_LIFECYCLE_')) throw error; /* Exited or unrelated. */ }
   }
   return found;

@@ -6,7 +6,8 @@ import { productionElectronCandidatePlan } from '../scripts/package-electron-pro
 import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
-  linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
+  readLinuxFinalAppProcessIdentity } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
@@ -93,6 +94,100 @@ test('kernel FUSE mount plus image runtime identity is required; extracted paths
     m => { delete m.temporary; },
   ]) { const value = mounted(); alter(value); assert.throws(() => selectLinuxFinalFuseMount(value)); }
 });
+function appProcess(role = 'browser') {
+  const value = mounted(), pid = 50, reads = [], hashes = [];
+  value.mountinfo = value.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.TiboTattle.AppImage TiboTattle.AppImage');
+  const expected = { executableSha256: 'a'.repeat(64), asarSha256: 'b'.repeat(64) };
+  const fields = Array(20).fill('0'); fields[0] = 'S'; fields[19] = '100';
+  const environment = role === 'node'
+    ? { TMPDIR: temporary, ELECTRON_RUN_AS_NODE: '1', USAGE_MONITOR_PARENT_PID: '49' }
+    : value.environment;
+  const files = {
+    stat: `${pid} (tibotattle) ${fields.join(' ')}`,
+    cmdline: `${value.executable}\0${role === 'node' ? `${mount}/resources/app.asar/apps/local/server.js\0`
+      : role === 'chromium' ? '--type=renderer\0' : '--remote-debugging-port=12345\0'}`,
+    status: 'Uid:\t1000\t1000\t1000\t1000\n',
+    environ: Object.entries(environment).map(([key, item]) => `${key}=${item}\0`).join(''),
+    mountinfo: value.mountinfo,
+  };
+  const io = {
+    read: async path => {
+      assert.ok(path.startsWith(`/proc/${pid}/`)); const name = path.slice(`/proc/${pid}/`.length);
+      reads.push(name); assert.ok(Object.hasOwn(files, name)); return files[name];
+    },
+    link: async path => { assert.equal(path, `/proc/${pid}/exe`); reads.push('exe'); return value.executable; },
+    hash: async path => {
+      hashes.push(path);
+      assert.ok([value.executable, `${mount}/resources/app.asar`].includes(path));
+      return path === value.executable ? expected.executableSha256 : expected.asarSha256;
+    },
+  };
+  return { value, pid, expected, environment, files, io, reads, hashes };
+}
+
+test('ordinary Node companion sharing the mounted executable is not mistaken for the AppImage browser', async () => {
+  const node = appProcess('node');
+  assert.equal(node.files.cmdline.split('\0').some(arg => arg.startsWith('--type=')), false);
+  // The previous candidate path reached this strict FUSE check and aborted.
+  assert.throws(() => selectLinuxFinalFuseMount({ ...node.value, environment: node.environment }), /FUSE_IDENTITY_INVALID/u);
+  assert.equal(await readLinuxFinalAppProcessIdentity(node.pid, node.expected, temporary, node.io), null);
+  assert.ok(node.reads.includes('environ')); assert.ok(!node.reads.includes('mountinfo'));
+  assert.deepEqual(node.hashes, []);
+  const browser = appProcess();
+  assert.deepEqual(await readLinuxFinalAppProcessIdentity(browser.pid, browser.expected, temporary, browser.io), {
+    pid: browser.pid, startTime: '100', mount, executable: browser.value.executable,
+  });
+  assert.deepEqual(browser.hashes, [browser.value.executable, `${mount}/resources/app.asar`]);
+  assert.equal(browser.reads.filter(name => name === 'stat').length, 2);
+  const chromium = appProcess('chromium');
+  assert.equal(await readLinuxFinalAppProcessIdentity(chromium.pid, chromium.expected, temporary, chromium.io), null);
+  assert.deepEqual(chromium.reads, ['stat', 'cmdline']); assert.deepEqual(chromium.hashes, []);
+});
+
+test('Node-mode markers can exclude a candidate but cannot qualify a browser or bypass an unsupported role', async () => {
+  const node = appProcess(); node.files.environ += 'ELECTRON_RUN_AS_NODE=1\0';
+  assert.equal(await readLinuxFinalAppProcessIdentity(node.pid, node.expected, temporary, node.io), null);
+  assert.deepEqual(node.hashes, []);
+  for (const mode of ['', '0', 'true', '2']) {
+    const value = appProcess(); value.files.environ += `ELECTRON_RUN_AS_NODE=${mode}\0`;
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /PROCESS_ROLE_INVALID/u);
+  }
+});
+
+test('real browser candidates still refuse wrong FUSE identity, extraction mode and credentials', async () => {
+  for (const alter of [
+    v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; },
+    v => { v.files.environ = `APPDIR=${mount}\0`; },
+    v => { v.files.environ += 'APPIMAGE_EXTRACT_AND_RUN=1\0'; },
+    v => { v.files.mountinfo = v.files.mountinfo.replace('fuse.TiboTattle.AppImage', 'tmpfs'); },
+    v => { v.files.mountinfo = v.files.mountinfo.replace('user_id=1000', 'user_id=0'); },
+  ]) {
+    const value = appProcess(); alter(value);
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /FUSE_IDENTITY_INVALID/u);
+    assert.deepEqual(value.hashes, []);
+  }
+  const uid = appProcess(); uid.files.status = 'Uid:\t0\t0\t0\t0\n';
+  await assert.rejects(readLinuxFinalAppProcessIdentity(uid.pid, uid.expected, temporary, uid.io), /PROCESS_IDENTITY_INVALID/u);
+});
+
+test('browser identity keeps both pinned digests, stable process identity and loud file failures', async () => {
+  for (const key of ['executableSha256', 'asarSha256']) {
+    const value = appProcess(), expected = { ...value.expected, [key]: 'c'.repeat(64) };
+    assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, expected, temporary, value.io), null);
+  }
+  const changed = appProcess(); let statReads = 0;
+  await assert.rejects(readLinuxFinalAppProcessIdentity(changed.pid, changed.expected, temporary, {
+    ...changed.io, read: async path => {
+      const value = await changed.io.read(path);
+      return path.endsWith('/stat') && ++statReads > 1 ? value.replace(/100$/u, '101') : value;
+    },
+  }), /PROCESS_BYTES_CHANGED/u);
+  const unsafe = appProcess(), failure = Object.assign(new Error('fixed'), { code: 'LINUX_FINAL_LIFECYCLE_FILE_UNSAFE' });
+  await assert.rejects(readLinuxFinalAppProcessIdentity(unsafe.pid, unsafe.expected, temporary, {
+    ...unsafe.io, hash: async () => { throw failure; },
+  }), error => error === failure);
+});
+
 test('a native renderer must retain Chromium sandbox kernel controls', () => {
   const value = { commandLine: 'tibotattle\0--type=renderer\0', status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' };
   assert.equal(linuxFinalSandboxStatus(value), true);
