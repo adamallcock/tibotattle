@@ -256,7 +256,7 @@ function fakeReadChild(output) {
   child.kill = signal => { child.kills.push(signal); queueMicrotask(() => child.emit('close', null, signal)); return true; };
   queueMicrotask(() => output(child)); return child;
 }
-test('authenticated streamed GET hashes exact bytes, recognizes only zero-byte absence and cancels oversize before settlement', async () => {
+test('authenticated streamed GET hashes exact bytes, recognizes empty absence and cancels oversize before settlement', async () => {
   const bytes = Buffer.from('synthetic object'); let child;
   const run = output => readMacQualificationWranglerStream({ cli: 'unused', args: [], environment: {}, maximumBytes: bytes.length,
     spawnChild: () => { child = fakeReadChild(output); return child; } });
@@ -268,6 +268,29 @@ test('authenticated streamed GET hashes exact bytes, recognizes only zero-byte a
   assert.deepEqual(child.kills, ['SIGKILL']);
   await assert.rejects(run(c => { c.stderr.write(Buffer.alloc(256 * 1024 + 1)); }), /R2_READ_UNKNOWN/u);
   assert.deepEqual(child.kills, ['SIGKILL']);
+});
+test('authenticated GET admits only empty or single-LF absence while successful LF bytes retain their exact hash', async () => {
+  const missing = '✘ [ERROR] The specified key does not exist.\n'; let child;
+  const run = (chunks, stderr = missing, status = 1, signal = null) => readMacQualificationWranglerStream({
+    cli: 'unused', args: [], environment: {}, maximumBytes: 16,
+    spawnChild: () => { child = fakeReadChild(c => {
+      for (const chunk of chunks) c.stdout.write(chunk);
+      c.stderr.write(stderr); c.emit('close', status, signal);
+    }); return child; },
+  });
+  assert.equal(await run([]), null);
+  assert.equal(await run([Buffer.from([0x0a])]), null); assert.deepEqual(child.kills, []);
+  for (const chunks of [['\r'], ['\n\n'], ['\n', '\n'], [' '], ['x'], ['\n', 'x']]) {
+    await assert.rejects(run(chunks), /R2_READ_UNKNOWN/u, `stdout ${JSON.stringify(chunks)}`);
+  }
+  for (const stderr of [`${missing}Authentication error\n`, `${missing}Network error\n`,
+    `${missing}[ERROR] Another error\n`, 'NoSuchKey\n']) {
+    await assert.rejects(run(['\n'], stderr), /R2_READ_UNKNOWN/u);
+  }
+  await assert.rejects(run(['\n'], missing, 2), /R2_READ_UNKNOWN/u);
+  await assert.rejects(run(['\n'], missing, 1, 'SIGTERM'), /R2_READ_UNKNOWN/u);
+  const lf = Buffer.from([0x0a]);
+  assert.deepEqual(await run([lf], '', 0), { bytes: 1, sha256: sha(lf) });
 });
 test('authenticated GET deadline kills the owned child and waits for close', async () => {
   let child;

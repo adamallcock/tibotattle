@@ -214,7 +214,7 @@ export function readMacQualificationWranglerStream({ cli, args, environment, max
     let child;
     try { child = spawnChild(process.execPath, [cli, ...args], { env: environment, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch { reject(operationError('MAC_QUALIFICATION_ARTIFACT_R2_READ_UNKNOWN')); return; }
-    const hash = createHash('sha256'), errors = []; let bytes = 0, errorBytes = 0, failure = null, settled = false;
+    const hash = createHash('sha256'), errors = []; let bytes = 0, firstByte = null, errorBytes = 0, failure = null, settled = false;
     const abort = code => {
       if (failure) return; failure = code; child.stdout.destroy();
       // Wrangler's bin wrapper forks the real CLI. Kill the entire owned GET
@@ -228,7 +228,9 @@ export function readMacQualificationWranglerStream({ cli, args, environment, max
     const finish = error => { if (settled) return; settled = true; clearTimeout(deadline);
       if (error) reject(operationError(`MAC_QUALIFICATION_ARTIFACT_${error}`)); };
     child.stdout.on('data', chunk => {
-      if (failure) return; bytes += chunk.length;
+      if (failure) return;
+      if (bytes === 0 && chunk.length > 0) firstByte = chunk[0];
+      bytes += chunk.length;
       if (bytes > maximumBytes) { abort('R2_READ_OVERSIZE'); return; } hash.update(chunk);
     });
     child.stderr.on('data', chunk => {
@@ -241,7 +243,10 @@ export function readMacQualificationWranglerStream({ cli, args, environment, max
       if (settled) return;
       if (failure) { finish(failure); return; }
       if (status !== 0 || signal) {
-        if (bytes === 0 && isMacQualificationWranglerAbsence({ status, signal, stderr: Buffer.concat(errors).toString('utf8') })) {
+        // Pinned Wrangler can emit exactly one LF before its absent-key error.
+        // No other stdout bytes or whitespace normalization establish absence.
+        if ((bytes === 0 || (bytes === 1 && firstByte === 0x0a))
+          && isMacQualificationWranglerAbsence({ status, signal, stderr: Buffer.concat(errors).toString('utf8') })) {
           finish(); resolveResult(null); return;
         }
         finish('R2_READ_UNKNOWN'); return;
