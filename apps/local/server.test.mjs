@@ -4215,8 +4215,9 @@ test("stale contribution-device credentials return fixed recovery guidance witho
     });
     assert.equal(JSON.stringify(payload).includes(privateCanary), false);
 
-    // Integrated rendered-state contract: this exact client error reaches the
-    // narrow recovery renderer, which offers reset and never generic fallback.
+    // The pairing API remains available to legacy clients. The current shared
+    // dashboard uses the accountless bridge and must not offer a destructive
+    // credential reset or restore the retired pairing ceremony for this code.
     const appSource = await readFile(
       new URL("../web/public/app.js", import.meta.url),
       "utf8",
@@ -4225,31 +4226,18 @@ test("stale contribution-device credentials return fixed recovery guidance witho
       new URL("../web/public/index.html", import.meta.url),
       "utf8",
     );
-    // Re-pinned 2026-08-08 (owner-directed one-step flow): the pairing steps
-    // live inside the merged Review-and-approve ceremony now, and they report
-    // on the merged surface's own status line — the separate connect card and
-    // its #community-connect-status are gone.
-    const connectSource = appSource.match(
-      /async function approveIncrementalContribution\(\) \{([\s\S]*?)\n\}\n/u,
-    )?.[1] ?? "";
-    // Failure handling was centralized: every connect failure routes through
-    // reportContributionConnectFailure, and the recovery contract lives there.
-    const reportFailureSource = appSource.match(
-      /async function reportContributionConnectFailure\([\s\S]*?\) \{([\s\S]*?)\n\}\n/u,
-    )?.[1] ?? "";
-    const recoverySource = appSource.match(
-      /async function renderContributionDeviceRecovery\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n\nconst DEVICE_CREDENTIAL_RESET_CONFIRMATION/u,
-    )?.[1] ?? "";
-    assert.doesNotMatch(htmlSource, /id="community-connect-status"/u);
-    assert.match(htmlSource, /id="incremental-consent-status"/u);
     assert.match(htmlSource, /id="community"[^>]*data-dashboard-page="community"/u);
     assert.doesNotMatch(htmlSource, /id="data"[^>]*data-dashboard-page/u);
     assert.doesNotMatch(htmlSource, /data-nav="data"/u);
-    assert.match(connectSource, /reportContributionConnectFailure\(status, error/u);
-    assert.match(reportFailureSource, /if \(contributionDeviceRecoveryIsRequired\(error\)\) \{\s*\n\s*await renderContributionDeviceRecovery\(status, \{ error \}\);/u);
-    assert.match(recoverySource, /id = "reset-device-credential"/u);
-    assert.match(recoverySource, /leftover contribution-device credential/u);
-    assert.doesNotMatch(recoverySource, /showFailure\(/u);
+    assert.match(htmlSource, /id="electron-accountless-sharing-enabled"/u);
+    assert.doesNotMatch(
+      htmlSource,
+      /id="(?:community-connect-status|incremental-consent-status|reset-device-credential)"/u,
+    );
+    assert.doesNotMatch(
+      appSource,
+      /approveIncrementalContribution|reportContributionConnectFailure|renderContributionDeviceRecovery|reset-device-credential/u,
+    );
     assert.doesNotMatch(appSource, /DO-NOT-LEAK-stale-device-credential-conflict/u);
     assert.equal(reads, 2);
     assert.equal(creates, 0);
@@ -4261,22 +4249,10 @@ test("stale contribution-device credentials return fixed recovery guidance witho
   }
 });
 
-// Regression: a device credential that a signed update left unreadable (its
-// Keychain ACL no longer grants the re-signed companion read access, observed
-// live 2026-08-10) surfaces as credential_locked/denied — and a corrupt or
-// read-back-mismatched secret as credential_unavailable. Before the recovery
-// classifier learned these codes, the pairing mint's up-front capability read
-// (claimContributionDevicePairing -> ensureContributionDeviceCapability ->
-// readContributionDeviceCapability) threw one of them, the route mapped it to a
-// generic 502 pairing_failed with no reset surface, and every retry re-hit the
-// same unreadable item — a silent forever-loop. Each must now reach a 409
-// recovery code that renders the local reset ceremony. Two keep their own code
-// because the reset ceremony is the wrong instruction for them. Denied
-// (2026-08-19): the user caused it by answering Deny in the macOS access
-// dialog, and the dashboard says which dialog to answer differently on the
-// retry; the cure — the reset ceremony — is identical. Locked (2026-08-20):
-// nothing on this Mac is broken, so the cure is unlocking the login keychain
-// and the reset ceremony would force a needless re-pair.
+// Legacy pairing clients still receive distinct, content-free recovery codes.
+// Locked and denied access must not collapse into the same response as a corrupt
+// credential. The current shared dashboard does not expose pairing or reset;
+// preserving these API responses does not reintroduce that retired UI.
 for (const { label, thrown, routeCode } of [
   { label: "locked keychain", thrown: { code: "export_identity_keychain_locked" }, routeCode: "contribution_device_keychain_locked" },
   { label: "denied", thrown: { code: "export_identity_keychain_denied" }, routeCode: "contribution_device_keychain_access_denied" },
@@ -4424,17 +4400,16 @@ test("a declined legacy Keychain migration is preserved and never routed to rese
       new URL("../web/public/app.js", import.meta.url),
       "utf8",
     );
-    const recoveryClassifier = appSource.match(
-      /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}/u,
-    )?.[1] ?? "";
+    const htmlSource = await readFile(
+      new URL("../web/public/index.html", import.meta.url),
+      "utf8",
+    );
     assert.doesNotMatch(
-      recoveryClassifier,
-      /contribution_device_keychain_migration_required/u,
-    );
-    assert.match(
       appSource,
-      /contribution_device_keychain_migration_required:[\s\S]{0,500}Settings… → General[\s\S]{0,500}Review migration… under Secure upgrade[\s\S]{0,500}Do not reset or delete the credential/u,
+      /contributionDeviceRecoveryIsRequired|renderContributionDeviceRecovery|reset-device-credential/u,
     );
+    assert.doesNotMatch(htmlSource, /id="reset-device-credential"/u);
+    assert.match(htmlSource, /id="electron-accountless-sharing-enabled"/u);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

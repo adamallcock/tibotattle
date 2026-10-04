@@ -12,6 +12,16 @@ release, with a few silent attempts before an explained, user-initiated fallback
 This record defines the change and its verification boundary. It is not evidence
 that a signed candidate or an existing user's Keychain has been migrated.
 
+This is a record of the retired native AppKit shell's migration implementation
+and its native qualification. The helper and approval behavior below are
+historical native evidence. Current Electron has no credential migration
+approval entrypoint: its noninteractive preflight preserves legacy credentials
+and blocks startup before Settings when a required credential needs migration.
+Retry repeats the readiness check and does not migrate the credential. Current
+recovery guidance is to quit and contact support with
+`SECURE_STORAGE_MIGRATION_REQUIRED`, preserving credentials and app data; the
+native approval and reset flows described here are not Electron recovery actions.
+
 ## Contract
 
 - A small native helper retains the legacy packaged Node reader's code-signing

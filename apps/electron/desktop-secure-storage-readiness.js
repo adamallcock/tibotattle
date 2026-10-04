@@ -42,8 +42,8 @@ const COPY = Object.freeze({
     detail: "In Keychain Access, confirm the signed TiboTattle app is permitted to read its existing item, then choose Retry. Do not delete or reset the credential.",
   }),
   migration_required: Object.freeze({
-    message: "An existing TiboTattle credential needs a secure upgrade.",
-    detail: "Quit and use the signed TiboTattle Secure upgrade recovery flow before trying again. The legacy credential is retained as the recovery copy.",
+    message: "An existing TiboTattle credential requires migration.",
+    detail: "Quit and contact support with the support code below. The legacy credential is preserved. Do not delete or reset credentials or app data. Retry only repeats the secure credential check; neither Retry nor reinstalling this release migrates the credential.",
   }),
   timeout: Object.freeze({
     message: "macOS did not finish the secure credential check in time.",

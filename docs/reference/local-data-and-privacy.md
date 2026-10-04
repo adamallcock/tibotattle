@@ -176,18 +176,23 @@ native Keychain broker. A content-free binding/renewal record lives under Applic
 Support; it is not the credential. Keys are intentionally separate so one
 identity namespace cannot be joined to another by accident.
 
-The [silent native migration change](../decisions/2026-08-31-silent-keychain-migration.md)
-adds a narrow compatibility helper for existing legacy keys. It authenticates
-its native parent, accepts only fixed capabilities, and passes the unchanged
-value over a private descriptor for app-owned storage and exact readback. It
-adds no network destination, diagnostic field, consent, or uploaded data. The
-legacy recovery copy is retained during migration. Automatic attempts cannot
-open a Keychain prompt; only an explained native approval can do so. An explicit
-credential reset removes that capability's legacy copy before its modern copy,
-and waits for retiring companion writers before deletion. A failed deletion
-does not authorize a new identity or inferred success. Signed synthetic
-qualification is recorded in that decision; this source description does not
-qualify an installed upgrade.
+The [silent native migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+records the retired AppKit shell's compatibility helper for existing legacy
+keys. That helper authenticated its native parent, accepted fixed capabilities,
+and passed the unchanged value over a private descriptor for app-owned storage
+and exact readback. The legacy recovery copy was retained during migration.
+Automatic attempts could not open a Keychain prompt; the older shell's separate,
+explained approval could allow an interactive read. Its explicit credential
+reset and synthetic qualification are historical native evidence, not current
+Electron recovery controls or installed-upgrade proof.
+
+Current Electron has no credential migration approval entrypoint. Its
+noninteractive adapter preserves a legacy credential and blocks the affected
+path when migration is required. A required startup credential blocks before
+Settings and reports `SECURE_STORAGE_MIGRATION_REQUIRED`; quit and contact
+support with that code. Preserve the legacy credential and app data; do not
+delete or reset credentials or app data. Retry only repeats the silent readiness
+check, and reinstalling this release does not perform a credential migration.
 
 The Electron macOS production source serves the four legacy broker capabilities
 through its signed main process and the inherited FD4 channel. A fifth,

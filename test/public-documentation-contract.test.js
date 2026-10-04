@@ -51,9 +51,13 @@ test("maintained Markdown retires self-service promises without implying history
   const guide = await text("docs/user-guide.md");
   assert.match(guide, /It preserves previously contributed hosted\s+history, other devices, and local analysis/u);
   assert.match(guide, /source change, not a deployed-service or installed-release/u);
-  assert.match(guide, /Turn off \*\*Share usage measurements\*\* in Community or Settings/u);
+  assert.match(guide, /Turn off \*\*Share usage measurements\*\* in Community to stop future accountless/u);
+  assert.match(guide, /Settings… → Data & privacy → Community sharing → Manage sharing/u);
   assert.match(guide, /The shared dashboard no longer presents Google\/Apple sign-in/u);
   assert.match(guide, /Older clients may offer \*\*Disconnect this Mac\*\*/u);
+  assert.match(guide, /SECURE_STORAGE_MIGRATION_REQUIRED/u);
+  assert.match(guide, /current Electron app has no self-service credential migration or approval\s+control/u);
+  assert.doesNotMatch(guide, /Choose \*\*Review migration…\*\*|\*\*Approve migration\*\*/u);
 });
 
 test("owner erasure runbook preserves the exact request, retry, and audit contract", async () => {

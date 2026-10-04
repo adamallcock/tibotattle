@@ -235,12 +235,16 @@ breakdowns normalize to `null` while All models remains available. An empty
 array means no eligible same-configuration models were found.
 
 When contribution preparation encounters a preserved legacy export identity
-whose bounded silent migration has not completed, it returns the fixed
-`identity_migration_required` code. The dashboard directs the user to native
-**Settings… → General → Secure upgrade → Review migration…**, then **Check
-again**. Only a separate, explained native approval can enable a Keychain
-prompt. The dashboard offers neither approval authority nor identity reset,
-deletion, or rotation as migration recovery.
+without a usable modern credential, it returns the fixed
+`identity_migration_required` code. This request does not migrate or replace the
+identity. Quit TiboTattle and contact support with this code. Preserve the legacy
+credential and app data; do not delete or reset credentials or app data. The
+current Electron release has no credential migration approval entrypoint.
+Startup blocked by required credential migration instead reports
+`SECURE_STORAGE_MIGRATION_REQUIRED` before Settings is available. Retry only
+repeats the silent readiness check; neither Retry nor reinstalling this release
+performs a credential migration. The dashboard offers no approval authority,
+identity reset, deletion, or rotation as migration recovery.
 
 ### Fixed report pages
 

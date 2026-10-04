@@ -263,3 +263,26 @@ inventory omissions. The missing temporary exception-guard entry and Mac
 qualification caller are now registered, with exact inventory totals retained;
 all six inventory tests pass. The complete source gate must still run against
 the repaired format and fresh R7 receipts.
+
+
+The product gate then exposed two local-server assertions for deliberately
+retired dashboard recovery controls. They now preserve the legacy route's
+closed codes, redaction and no-mutation checks while requiring the current
+accountless control and absence of retired pairing/reset presentation. The full
+local companion lane passes 407/407; current dashboard/help contracts pass
+25/25. The macOS transition source lane passes 127/127 with pinned Sparkle tools.
+
+A current-source audit also found stale guidance directing credential-migration
+failures to absent Electron Settings controls. The fixed dialog, maintained help,
+privacy/API references and native comments now say to quit, preserve credentials
+and app data, and contact support with the fixed code. Retry only repeats the
+silent check. Historical AppKit qualification is explicitly bounded; no new
+migration authority, prompt, credential reset or runtime behavior is introduced.
+Fifty focused native storage/broker tests and documentation/preflight checks pass;
+installed-byte validation remains separate.
+
+The hosted owner additionally confirmed the post-cutover public v1.4/admin v0.4
+reader must ship before the new backend response contracts and client publication
+qualification. The current live reader retains activity but cannot retain all
+new allowance/model/plan breakdowns. This sequence does not block the independent
+client source freeze or tag, and does not authorize changing the parity cutover.
