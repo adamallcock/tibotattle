@@ -11,7 +11,7 @@ import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fingerprintLinuxFinalFile } from '../qualify-electron-linux-installed-lifecycle.mjs';
 
-export const LINUX_APPARMOR_COMPARISON_SCHEMA = 'tibotattle-linux-apparmor-mount-comparison-v4';
+export const LINUX_APPARMOR_COMPARISON_SCHEMA = 'tibotattle-linux-apparmor-mount-comparison-v5';
 export const LINUX_APPARMOR_COMPARISON_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPARMOR_MOUNT_COMPARISON';
 export const LINUX_APPARMOR_DOCKER_VERSION = '28.0.4';
 const PARSER = '/usr/sbin/apparmor_parser';

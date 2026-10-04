@@ -18,7 +18,7 @@ import { LINUX_APPARMOR_COMPARISON_CONFIRMATION, normalizeLinuxAppArmorMountTupl
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXEC = '/opt/tibotattle-updater-exec', IMAGE = `${EXEC}/TiboTattle.AppImage`;
 const SCRIPT = 'scripts/diagnose-electron-linux-appimage-mount.mjs';
-export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v4';
+export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v5';
 export const LINUX_MOUNT_DIAGNOSIS_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS';
 const UNKNOWN = 'unavailable', ROLES = ['current', 'next'];
 const PROBE_STAGES = ['default', 'baseline', 'candidate', 'negative'];
@@ -46,7 +46,10 @@ const STAGE_VALUES = new Set(['not_observed', 'EACCES', 'EPERM', 'ENOENT', 'othe
 const READER_REASONS = new Set(['none', 'kmsg_open_denied', 'kmsg_open_unavailable', 'reader_timeout', 'reader_failed', 'stream_incomplete']);
 export const LINUX_ACTOR_TRACE_REASONS = new Set(['none', 'not_started', 'tracefs_unavailable', 'trace_layout_unavailable',
   'trace_instance_setup_unavailable', 'trace_initial_controls_unavailable', 'trace_cpu_layout_unavailable',
-  'trace_buffer_layout_unavailable', 'trace_options_unavailable', 'trace_clock_unavailable', 'trace_event_layout_unavailable',
+  'trace_buffer_layout_unavailable', 'trace_options_unavailable', 'trace_clock_unavailable',
+  'trace_fork_format_unavailable', 'trace_fork_filter_unavailable', 'trace_fork_trigger_unavailable', 'trace_fork_enable_write_unavailable', 'trace_fork_enable_readback_unavailable',
+  'trace_exec_format_unavailable', 'trace_exec_filter_unavailable', 'trace_exec_trigger_unavailable', 'trace_exec_enable_write_unavailable', 'trace_exec_enable_readback_unavailable',
+  'trace_exit_format_unavailable', 'trace_exit_filter_unavailable', 'trace_exit_trigger_unavailable', 'trace_exit_enable_write_unavailable', 'trace_exit_enable_readback_unavailable',
   'trace_pid_filter_unavailable', 'trace_pipe_unavailable', 'trace_gate_recheck_unavailable', 'trace_start_unavailable',
   'trace_limits_exceeded', 'gate_identity_unavailable', 'trace_stream_incomplete', 'trace_graph_ambiguous', 'trace_cleanup_failed', 'reader_failed', 'reader_timeout']);
 const AUDIT_REASONS = new Set(['not_started', 'not_evaluated', 'observer_start_failed', ...READER_REASONS.values(),
@@ -386,6 +389,7 @@ last = None
 used = events = 0
 profile = None
 root_pid = None
+exit_format = None
 trace_pending = b''
 removed = True
 armed = False
@@ -474,6 +478,35 @@ def configure_trace_buffer():
     total = local_read('buffer_total_size_kb').strip()
     if local_read('buffer_subbuf_size_kb').strip() != '4' or local_read('buffer_size_kb').strip() != '63': raise ValueError()
     if not re.fullmatch(r'[1-9][0-9]*', total) or int(total) > 512: raise ValueError()
+
+def configure_trace_events():
+    global setup_reason, exit_format
+    exit_format = None
+    # Exact upstream print templates only; select the runtime parser from the
+    # live instance format, not a guessed kernel version. The extra boolean is
+    # discarded and never proves thread-group or container cleanup.
+    # https://github.com/torvalds/linux/blob/v6.14/include/trace/events/sched.h
+    # https://github.com/torvalds/linux/blob/v6.17/include/trace/events/sched.h
+    legacy = 'comm=%s pid=%d prio=%d'
+    formats = {'fork': ('comm=%s pid=%d child_comm=%s child_pid=%d',),
+        'exec': ('filename=%s pid=%d old_pid=%d',), 'exit': (legacy, legacy + ' group_dead=%s')}
+    selected = None
+    for kind, expected in formats.items():
+        prefix = 'events/sched/sched_process_' + kind + '/'
+        setup_reason = 'trace_' + kind + '_format_unavailable'
+        lines = [line for line in local_read(prefix + 'format').splitlines() if line.startswith('print fmt:')]
+        match = re.fullmatch(r'print fmt: "([^"\r\n]*)", [^\r\n]+', lines[0]) if len(lines) == 1 else None
+        if not match or match[1] not in expected: raise ValueError()
+        if kind == 'exit': selected = 'legacy' if match[1] == legacy else 'group_dead'
+        setup_reason = 'trace_' + kind + '_filter_unavailable'
+        if local_read(prefix + 'filter').strip() != 'none': raise ValueError()
+        setup_reason = 'trace_' + kind + '_trigger_unavailable'
+        if any(line.strip() and not line.startswith('#') for line in local_read(prefix + 'trigger').splitlines()): raise ValueError()
+        setup_reason = 'trace_' + kind + '_enable_write_unavailable'
+        control(prefix + 'enable', '1\n')
+        setup_reason = 'trace_' + kind + '_enable_readback_unavailable'
+        if local_read(prefix + 'enable').strip() != '1': raise ValueError()
+    exit_format = selected
 
 def no_loss(cpu_set, drained=False):
     if cpus() != cpu_set: return False
@@ -601,7 +634,10 @@ def trace_line(line, cpu_set):
         if not value or common != int(value[2]): raise ValueError()
         event = {'type': 'exec', 'pid': int(value[2]), 'oldPid': int(value[3]), 'image': value[1] == '/opt/tibotattle-updater-exec/TiboTattle.AppImage'}
     else:
-        value = re.fullmatch(r'comm=.{0,16} pid=([0-9]+) prio=-?[0-9]+', body)
+        if exit_format == 'legacy': pattern = r'comm=.{0,16} pid=([0-9]+) prio=-?[0-9]+'
+        elif exit_format == 'group_dead': pattern = r'comm=.{0,16} pid=([0-9]+) prio=-?[0-9]+ group_dead=(?:true|false)'
+        else: raise ValueError()
+        value = re.fullmatch(pattern, body)
         if not value or common != int(value[1]): raise ValueError()
         event = {'type': 'exit', 'pid': int(value[1])}
     events += 1
@@ -700,14 +736,7 @@ try:
         if 'mono' not in local_read('trace_clock').replace('[', '').replace(']', '').split(): raise ValueError()
         control('trace_clock', 'mono\n')
         if '[mono]' not in local_read('trace_clock').split(): raise ValueError()
-        setup_reason = 'trace_event_layout_unavailable'
-        formats = {'fork': 'comm=%s pid=%d child_comm=%s child_pid=%d', 'exec': 'filename=%s pid=%d old_pid=%d', 'exit': 'comm=%s pid=%d prio=%d'}
-        for kind, expected in formats.items():
-            prefix = 'events/sched/sched_process_' + kind + '/'
-            if 'print fmt: "' + expected + '"' not in local_read(prefix + 'format'): raise ValueError()
-            if local_read(prefix + 'filter').strip() != 'none' or any(line.strip() and not line.startswith('#') for line in local_read(prefix + 'trigger').splitlines()): raise ValueError()
-            control(prefix + 'enable', '1\n')
-            if local_read(prefix + 'enable').strip() != '1': raise ValueError()
+        configure_trace_events()
         setup_reason = 'trace_pid_filter_unavailable'
         control('set_event_pid', str(root_pid) + '\n')
         if local_read('set_event_pid').split() != [str(root_pid)] or not no_loss(cpu_set): raise ValueError()
