@@ -2,29 +2,29 @@
 title: 0.1.27 HTTP cache advisory exception decision
 date: 2026-10-03
 type: decision-record
-status: pending-owner-decision
+status: accepted
 ---
 
-## Pending decision and exact scope
+## Accepted boundary
 
-The local 0.1.27 release preparation has the reviewed max-stale mitigation,
-regenerated pnpm lock metadata and passing focused tests. Its OSV exception is
-**inactive**: no root `osv-scanner.toml`, temporary guard or changed OSV workflow
-has been applied. The earlier owner approval for PR #262 is not treated as
-approval to carry its exception into this candidate. This proposal requires the
-owner to accept the remaining limitation, exact advisory scope and expiry.
+The owner explicitly approved the reviewed 0.1.27 release route, including this
+build-only exception, remaining limitation and exact expiry, on 2026-10-03
+(America/New_York). The root-local OSV config, exact-source/status guard and
+checksum-pinned direct-scanner workflow are applied to the release preparation
+based on `b2cefc8d282b4be8518671fbaf613a8f822c370e`. The earlier PR #262 approval
+is not the authority for this candidate; this accepted decision is.
 
 The affected dependency is build-only `electron-builder@26.15.7` through
 `app-builder-lib@26.15.7 → @electron/get@3.1.0 → got@11.8.6 →
 cacheable-request@7.0.4 → http-cache-semantics@4.2.0`. It is outside the closed
-packaged runtime staging list. Proposed suppression covers only the root pnpm
+packaged runtime staging list. Accepted suppression covers only the root pnpm
 lock's GHSA-ch52-4w7c-c8xp and its CVE alias; child locks and unrelated findings
-remain outside scope. This decision does not authorize signing, publication,
-deployment, merging or any external write.
+remain outside scope. This decision defines only the security exception. Artifact qualification and
+publication remain separate gates under the owner's approved release route.
 
 ## Current official status
 
-Read-only npm registry and GitHub API checks on 2026-10-03 confirmed
+Fresh read-only npm registry and GitHub API checks at 2026-10-04T02:12Z confirmed
 [npm latest](https://registry.npmjs.org/http-cache-semantics/latest) remains 4.2.0;
 its full published version list has no later release. The active
 [GitHub advisory](https://github.com/advisories/GHSA-ch52-4w7c-c8xp) still affects
@@ -33,7 +33,7 @@ its full published version list has no later release. The active
 is open and unmerged at `14a8c2ad51740dc39bf3e8f1a11c845a5003f217`.
 No compatible published fix is available in this checked package inventory.
 
-## Local mitigation evidence
+## Preapproval local mitigation evidence
 
 The four-file mitigation is carried selectively from PR #262 exact head
 `b499bf99cae3e27ca64e6733892e8064f4bb744d`; its public reader work is excluded.
@@ -62,7 +62,7 @@ proposed guard and six exception regression tests passed in an isolated preview
 using the same dependency installation. These checks prove source/lock and
 synthetic builder compatibility, not native packaging, signing or hosted CI.
 
-## Fresh scanner evidence
+## Preapproval scanner evidence
 
 Official OSV-Scanner 2.5.1 for Darwin arm64 was verified by SHA-256
 `75c44d6332f892a1e56286f4105a98ed751ae28d215ca0a8b65cc00d84103054` before
@@ -76,13 +76,12 @@ and the scan exited 1. The proposed reason consistently identifies reviewed
 upstream commit `14a8c2ad`.
 
 These commands used `scan source --all-vulns` and explicit temporary outputs.
-The release worktree's exception remains inactive. The scanner artifacts are
-`/private/tmp/tibo-osv-root-review-Ccy1r8` and
-`/private/tmp/tibo-osv-child-review-tlS0iQ/results.json`.
+At that preapproval snapshot, the release worktree's exception remained inactive. Content-free evidence labels are `preapproval-root-lock-scan` and
+`preapproval-child-lock-scope-proof`.
 Documentation governance and all 20 preflight tests passed. These are local
-lock/scope proofs and do not qualify the hosted action-wrapper workflow.
+lock/scope proofs and do not qualify the hosted workflow.
 
-## Remaining risk and proposed enforcement
+## Accepted remaining risk and enforcement
 
 A synthetic check on these installed bytes confirms an explicitly enabled
 shared cache can still reuse `no-cache` or shared `proxy-revalidate` responses
@@ -92,23 +91,25 @@ current build chain's exposure; no default application or cross-user exploit has
 been demonstrated by this review. Enabling shared HTTP caching invalidates the
 risk basis and requires independent review.
 
-Proposed expiry is **2026-10-10T00:00:00Z**, without automatic renewal. The exact
-proposed guard refuses invalid/backdated clocks, expiry, expanded config,
+Accepted expiry is **2026-10-10T00:00:00Z**, without automatic renewal. The exact
+integrated guard refuses invalid/backdated clocks, expiry, expanded config,
 additional root locks, changed lock/workspace/patch/test bytes, installed source
 drift or enabled got cache defaults. Fresh official npm/advisory reads are
-required; unavailable status, a new published release, a declared fixed version,
+required; the complete reviewed 29-version npm publication inventory is pinned,
+including existing beta/next releases. Any added, removed or changed version key
+refuses the exception even when the latest tag remains 4.2.0; unavailable status, a new published release, a declared fixed version,
 withdrawal or advisory scope change refuse the exception and require removal or
 replacement review. Root-local config applies to root locks, with no global
 `--config` and no child-lock inheritance.
 
-The proposed workflow runs guard, focused tests and direct scanning in one
+The integrated workflow runs guard, focused tests and direct scanning in one
 failing check. It keeps `pull_request`, contents-read only, credential persistence
 disabled, no SARIF upload, no cache sharing and no continue-on-error. Checkout and
 Node setup retain their reviewed immutable source SHAs.
 
 The inherited Google wrappers used a mutable scanner image tag, mapped a
 no-package result to success and allowed missing/malformed reporter input to
-become empty results. The bounded pending change replaces only that wrapper pair
+become empty results. The bounded integrated change replaces only that wrapper pair
 with the [official OSV-Scanner 2.5.1 Linux AMD64 binary](https://github.com/google/osv-scanner/releases/download/v2.5.1/osv-scanner_linux_amd64),
 pinned to SHA-256
 `f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be`.
@@ -134,13 +135,44 @@ validate the replacement dependency and normal OSV failure behavior, and retain
 appropriate mitigation regressions. Do not extend expiry or update accepted
 hashes merely to pass CI.
 
-## Concrete approval packet
+## Integrated validation
 
-The isolated local preview is
-`/private/tmp/tibotattle-0.1.27-http-cache-exception-preview`.
-The exact five-file pending guard/config/workflow patch is
-`/private/tmp/tibotattle-0.1.27-http-cache-exception-pending.patch`; it passes
-`git apply --check` against the current release preparation. Applying it remains
-pending the owner's concrete decision. If approved, record the decision here,
-index the accepted authority, rerun the exact integrated guard/tests and obtain
-a fresh OSV result. Hosted CI and all release artifact gates remain separate.
+The reviewed five-file guard/config/workflow patch is applied. Acceptance does
+not extend expiry or change the reviewed lock, workspace, dependency source or
+mitigation-test identities. The original preview and pending patch remain local
+review artifacts; current authority is this indexed decision and the integrated
+source. Fresh integrated validation completed on this base plus the eight owned
+exception/workflow/documentation changes under Node 26.2.0 and pnpm 11.9.0:
+
+| Command or check | Outcome |
+|---|---|
+| `node scripts/check-http-cache-exception.mjs` | Passed exact-source/config/installed bytes, expiry and fresh official status |
+| `node --test --test-concurrency=1 test/http-cache-semantics-security.test.js test/electron-windows-production-signing.test.js test/http-cache-exception.test.js test/http-cache-exception-workflow.test.mjs` | 25/25 passed |
+| `node scripts/check-release-workflow-policy.mjs` | 20 workflow/action files verified |
+| `pnpm run release:trust:check` | Codex contract check passed; 86/86 tests passed |
+| `pnpm run docs:check` | Documentation governance passed |
+| `pnpm run test:preflight` | Root hygiene, whitespace and documentation passed; 20/20 tests passed |
+| Parsed YAML trust/order assertions | Passed contents-read, ordinary PR trigger, static runner and proof-before-scan structure |
+
+The fresh actual recursive native OSV scan used
+`scan source --all-vulns --recursive ./ --format=json` with output outside the
+checkout. It scanned 288 root-lock packages and 188 Worker-lock packages,
+filtered only the selected root advisory/alias and exited 0 with zero unignored
+findings. The content-free receipt label is `integrated-recursive-lock-scan-2026-10-04`.
+A fresh temporary copy of the integrated root lock/config plus the synthetic
+child lock scanned 288 root packages and one child package: root advisory
+filtered, child advisory retained, exit 1. The content-free receipt label is
+`integrated-child-lock-scope-proof-2026-10-04`.
+
+The functional shell proof is explicitly scoped to
+`test/http-cache-exception-workflow.test.mjs`, invoked by the Ubuntu OSV job and
+our local integration command. All assertions remain; no test is skipped.
+Portable guard/schema/source assertions remain in the root `.test.js` suite.
+The Windows portable and production gates use explicit test manifests that do
+not include this Ubuntu shell proof. Hosted Linux CI, artifact packaging/signing,
+installation and publication remain separate gates.
+
+The integrated guard also pins both exception proof files, the actual OSV
+workflow and the root-hygiene contract, alongside every earlier approved source,
+patch, lock and compatibility identity. The publication-inventory regressions
+cover latest remaining 4.2.0 while a new regular or beta version appears.

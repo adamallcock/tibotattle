@@ -14,11 +14,15 @@ about unresolved decisions. The user explicitly deferred the optional app-side
 Codex dashboard reader to the next release. The supported model/client changes
 and subsequent dashboard cleanup/token-mix changes form this release's scope.
 
-Candidate-only delivery versus full four-platform publication is pending the
-user's answer. Local source preparation, focused checks, protected local-only R7
-qualification and candidate preparation proceed toward a concrete reviewable
-result. Publication, production migration/deployment and system installation
-remain separately gated; credentials do not authorize them.
+On October 3 the user approved the entire proposed release process and asked
+for the next version to be released while away for ten hours, explicitly
+authorizing subagents. This includes the exact reviewed temporary security
+exception, protected local R7, source push/PR/merge/tag, native builds, signing,
+notarization, installed qualification, and four-platform publication/readback.
+Proceed through the established gates without asking again for those approved
+outcomes. A failed or unavailable required gate still prevents publication.
+The existing hosted owner retains its cutover and post-cutover compatibility
+lane; this approval does not transfer ownership or waive its compatibility proof.
 
 ## Candidate and ownership
 
@@ -36,16 +40,16 @@ remain separately gated; credentials do not authorize them.
 
 | Item | Status | Acceptance |
 |---|---|---|
-| Scope | Dashboard reader deferred; delivery answer pending | Exact client scope and publication boundary recorded |
+| Scope | Full four-platform release authorized; dashboard reader remains deferred | Exact client scope and publication boundary recorded |
 | Pro Max release contract | Passed source/released/installed vocabulary checks and focused tests | Current released/installed binary and upstream evidence reviewed; ledger lifecycle/provenance agree; required-binary contract check passes without claiming authoritative allowance/window capacities |
-| Packaging dependencies | Exact mitigation installed and tested; temporary exception remains inactive pending owner decision | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
+| Packaging dependencies | Exact mitigation installed and tested; owner approved temporary exception, activation and fresh integrated proof in progress | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
 | Source freeze | Final runtime manifest alignment reviewed; freeze renewed before candidate staging and R7 | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Pinned environment ready; coordinating a window around the GCP owner's heavy local run | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Pending frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Both Mac source candidates staged at ac2c0a57; native, signed and installed artifact gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
-| Delivery | Pending user answer and final-byte gates | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
+| Production candidates | Both Mac source candidates staged at b2cefc8d; native, signed and installed artifact gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
 
@@ -86,8 +90,9 @@ new execution; the earlier review is a dated snapshot, not release proof.
   adapter tests. Fresh OSV proves only the selected root advisory remains and
   that a root exception does not suppress an identical child-lock finding.
   The [security decision packet](../decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md)
-  remains pending. Its proposed workflow verifies fixed scanner bytes and
-  retains direct scanner failures; no suppression has been activated.
+  was approved by the user for this candidate on October 3. Its workflow
+  verifies fixed scanner bytes and retains direct scanner failures; activation
+  and fresh integrated proof are proceeding under that approval.
 - Paused-sharing copy is cause-neutral in all three locales, because the
   renderer receives no cause. Both Community and Settings have focused
   rendering coverage; canonical i18n checks pass. Native rendering is pending.
@@ -104,9 +109,9 @@ new execution; the earlier review is a dated snapshot, not release proof.
   Coordination has requested the exact hosted compatibility gate and a safe
   window for R7; no remote writes were requested or performed by this task.
 
-Delivery scope and the temporary security exception remain user decisions.
+Delivery scope and the exact temporary security exception are approved.
 R7 regeneration, broad source/surface gates, final packages, installed native
-journeys and authorized publication remain outstanding.
+journeys, hosted compatibility and publication/readback remain outstanding.
 
 ## Historical Sol 6.1 upgrade acceptance
 
@@ -211,10 +216,10 @@ publication does not release the client compatibility hold. Candidate notes and
 user help must separate local repair from hosted synchronization.
 
 Both Mac architectures successfully completed unsigned production-source
-preparation at `ac2c0a57f49bfb9cee1e55b6ba750aefbb20f515`. No signing,
+preparation at `b2cefc8d282b4be8518671fbaf613a8f822c370e`. No signing,
 notarization, installation or publication occurred. Worker copied workspace
 packages were refreshed through the owning npm install and all three exact
 copy guards passed. Worker lock metadata is also aligned for the three local
 packages without changing external dependency resolutions; the root lockfile
-remains unchanged. Final release evidence remains held for the security
-decision, R7 resource slot and remaining artifact gates.
+remains unchanged. Final release evidence requires the approved exception
+activation, R7 resource slot, hosted compatibility and remaining artifact gates.
