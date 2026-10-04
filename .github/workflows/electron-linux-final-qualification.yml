@@ -68,7 +68,7 @@ jobs:
         run: node scripts/qualify-electron-linux-installed-lifecycle.mjs --preflight
       - name: Check closed intake and archive refusal contracts
         if: inputs.mode == 'execute'
-        run: node --test test/electron-linux-installed-lifecycle.test.js test/electron-linux-installed-files.test.mjs test/electron-linux-real-appimage-updater.test.js
+        run: node --test test/electron-linux-installed-lifecycle.test.js test/electron-linux-installed-files.test.mjs test/electron-linux-real-appimage-updater.test.js test/electron-linux-startup-diagnostics.test.mjs
       - name: Download exact public predecessor and successful final package
         if: inputs.mode == 'execute'
         env:

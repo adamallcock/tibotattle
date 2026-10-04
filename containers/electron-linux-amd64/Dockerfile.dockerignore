@@ -27,5 +27,7 @@
 !src/**
 !scripts/
 !scripts/smoke-electron-linux.mjs
+!scripts/lib/
+!scripts/lib/linux-startup-diagnostics.mjs
 !scripts/qualify-linux-secret-service.mjs
 !scripts/run-linux-secret-service-qualification.mjs
