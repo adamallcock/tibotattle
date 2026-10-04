@@ -221,7 +221,7 @@ export function guardedMonitoringGcloud(runner, project) {
     }
     let parsed;
     try {
-      parsed = JSON.parse(result.stdout === "" ? "[]" : result.stdout);
+      parsed = JSON.parse(result.stdout);
     } catch {
       fail(`GCLOUD_OUTPUT_INVALID:${what}`);
     }
@@ -262,6 +262,8 @@ export function uptimeView(check) {
   const http = check?.httpCheck ?? {};
   return {
     monitoredResource: check?.monitoredResource ?? null,
+    userLabels: isRecord(check?.userLabels) ? check.userLabels : {},
+    disabled: check?.disabled === true,
     httpCheck: {
       requestMethod: http.requestMethod ?? null, path: http.path ?? null, port: Number(http.port ?? 0),
       useSsl: http.useSsl === true, validateSsl: http.validateSsl === true,
@@ -312,7 +314,8 @@ function managedResource(kind, entry, expected, desired) {
   if (kind === "log-metric") return entry.description === expected.body.description;
   if (kind === "alert-policy") return entry.userLabels?.["managed-by"] === "tibotattle-ops-5"
     && entry.userLabels?.environment === desired.environment;
-  return canonicalJson(entry.monitoredResource) === canonicalJson(expected.body.monitoredResource);
+  return entry.userLabels?.["managed-by"] === "tibotattle-ops-5" && entry.userLabels?.environment === desired.environment
+    && canonicalJson(entry.monitoredResource) === canonicalJson(expected.body.monitoredResource);
 }
 /** Three project-scoped lists. Identity, duplicate and ownership evidence participates in admission. */
 export function readbackMonitoring(desired, { runner = defaultMonitoringRunner } = {}) {

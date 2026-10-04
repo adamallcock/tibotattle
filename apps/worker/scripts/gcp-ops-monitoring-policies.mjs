@@ -519,6 +519,8 @@ function uptimeCheck(desired, id, { host, accepted, content }) {
     body: {
       displayName: displayName(desired, id),
       monitoredResource: { type: "uptime_url", labels: { project_id: desired.project, host } },
+      userLabels: { "managed-by": "tibotattle-ops-5", environment: desired.environment },
+      disabled: false,
       httpCheck: {
         requestMethod: "GET",
         path: "/api/health",

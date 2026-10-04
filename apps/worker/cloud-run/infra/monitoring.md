@@ -57,8 +57,11 @@ never enter monitoring summaries or receipts.
 The executor accepts only its recomputed rendered metric/check/policy
 create/update rows. It refuses deletes, duplicate/foreign IDs, unmanaged
 collisions and any refused row before the first write. Resource ownership
-requires the rendered name plus the maintained metric description, uptime
-host/project binding, or policy management/environment labels respectively.
+requires the rendered name plus the maintained metric description, explicit
+uptime management/environment labels and host/project binding, or policy
+management/environment labels respectively. Legacy unmarked uptime collisions
+are refused; the executor never silently adopts them. Successful read calls
+must return explicit JSON arrays: empty/truncated output is not absence.
 It skips deferred and unchanged rows; cadence, PAUSED-trigger condition
 omissions and the absent unseen-token producer remain source-owned.
 Policy enabled state and auto-close/documentation fields participate in

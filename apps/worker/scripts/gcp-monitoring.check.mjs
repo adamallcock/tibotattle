@@ -604,3 +604,22 @@ test("default admitted REST adapter keeps token in memory, restricts requests, b
   const bad=mutableMonitoring(),badPlan=admittedPlan(bad);const failure=await applyMonitoring(STAGING,{execute:true,authorize:badPlan.planDigest,runner:bad.runner,
     fetchImpl:async()=>new Response("PRIVATE_HTTP_MARKER",{status:403})});assert.equal(failure.status,"partial");assert.equal(failure.failed.code,"MONITORING_API_FAILED");assert.equal(JSON.stringify(failure).includes("PRIVATE_HTTP_MARKER"),false);
 });
+
+test("review P2: same-name/same-host unmarked uptime collision cannot be adopted or updated", async () => {
+  const entry=renderMonitoring(STAGING).uptimeChecks[0],body={...structuredClone(entry.body),name:`projects/${PROJECT}/uptimeCheckConfigs/123`};
+  delete body.userLabels;body.httpCheck.path="/unmanaged";body.httpCheck.acceptedResponseStatusCodes=[{statusValue:200}];
+  const fake=mutableMonitoring({uptime:[body]}),plan=admittedPlan(fake);
+  assert.equal(plan.operations.find(o=>o.kind==="uptime-check"&&o.name===entry.name).refused,"MONITORING_UNMANAGED_TARGET");
+  await assert.rejects(execute(fake),{code:"MONITORING_UNMANAGED_TARGET"});assert.equal(fake.requests.length,0);assert.equal(fake.calls.some(c=>c.argv[0]==="auth"),false);
+  const owned=structuredClone(body);owned.userLabels={...entry.body.userLabels};owned.httpCheck={...entry.body.httpCheck};owned.disabled=true;
+  const managed=mutableMonitoring({uptime:[owned]}),result=await execute(managed);assert.equal(result.status,"applied");
+  const update=managed.requests.find(r=>r.method==="PATCH");assert.equal(update.body.disabled,false);assert.deepEqual(update.body.userLabels,entry.body.userLabels);
+});
+
+test("review P2: every successful empty readback output refuses before any write/token acquisition", async () => {
+  for(const command of MONITORING_READ_COMMANDS) {
+    const fake=mutableMonitoring(),runner=(argv,options)=>argv.slice(0,3).join(" ")===command?{status:0,stdout:""}:fake.runner(argv,options);
+    await assert.rejects(applyMonitoring(STAGING,{execute:true,authorize:"1".repeat(64),runner,transport:fake.transport}),{code:`GCLOUD_OUTPUT_INVALID:${command.replaceAll(" ","-")}`});
+    assert.equal(fake.requests.length,0);assert.equal(fake.calls.some(c=>c.argv[0]==="auth"),false);
+  }
+});
