@@ -48,7 +48,7 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 | Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Complete protected retry finished at 04:28:59 UTC; all ten receipts validated and both exact-runtime freshness checks passed | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Complete client/shared suite passed 5,885 tests with zero failures and 44 existing skips; Worker dry packaging and staging checks passed | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Four-target unsigned preparation verified; private ARM 104d39b1 signed, notarized and independently inspected; hosted identity plan passed; final native/publication gates remain | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Production candidates | Four-target unsigned preparation verified; private signed ARM 104d39b1 passed hosted clean-install, credential and native Sparkle journeys; final dated artifacts remain | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
@@ -498,3 +498,59 @@ The existing v1 hosted route remains applicable: its prior 0.1.20-to-0.1.26
 credential journey passed, and 0.1.27 still requires fresh execution with the
 new signed fixture. Keep that credential result separate from the later exact
 0.1.26-to-0.1.27 production updater result.
+
+
+## October 4 native qualification and approvals
+
+The immutable test-artifact transport is integrated at `e274d582`. Its three
+candidate objects were independently verified, and its exact remote artifact
+lock was released at 09:45 UTC. The unchanged signed ARM candidate source
+`104d39b1` then completed all three hosted native journeys:
+
+- [Clean install](https://github.com/adamallcock/tibotattle/actions/runs/37192558998):
+  empty-profile startup, Settings, restart and persistent opt-out passed.
+- [Credential migration](https://github.com/adamallcock/tibotattle/actions/runs/37192893706):
+  the reviewed 0.1.20 predecessor's modern, invalid and locked cases passed.
+  This proves the recorded item/value/ACL continuity, not unchanged Keychain
+  file identity or the complete credential failure matrix.
+- [Native Sparkle transition](https://github.com/adamallcock/tibotattle/actions/runs/37193203088):
+  the actual 0.1.18 predecessor installed and relaunched the candidate through
+  the isolated test feed, preserving the qualified data and preferences.
+
+All three small receipt archives matched their GitHub digests and passed an
+independent identity and claim-boundary review. These qualify the exact pre-tag
+ARM candidate; they do not qualify Intel, future dated-source artifacts, the
+production feed, hosted contribution or public release. No candidate was
+installed or launched on the owner's Mac.
+
+At 11:25 UTC the hosted owner confirmed all six production outcomes directly
+approved after the user's confirmation. Its guarded TEST seed and primary
+migration began; the remaining approved operations are proceeding under that
+owner. The client checkpoint no longer lists pending human approvals. Actual
+cloud parity, transfer, staging/edge proof, attended cutover and post-cutover
+model/plan/correction compatibility remain separate execution gates. No concrete
+client publication window is yet admitted. Lightweight final-source and
+publication-operation preparation continues while the seed owns local resources.
+
+
+## Historical Sol installed proof follow-through
+
+An acceptance audit found that the existing native fixtures prove ordinary
+refresh completion but use known models. They do not prove the promised repair
+of a retained unknown Sol 6.1 record. The existing signed-Mac credential modern
+case now has a narrowly scoped synthetic fixture and assertion helper for
+0.1.27: a source-backed parser-v18 unknown occurrence must become the same priced
+Sol 6.1 occurrence under parser v19, with unchanged token totals and the original
+known fixture preserved. The actual signed app's completed startup refresh is
+observed before a manual repeat; rendered All history must show the model and
+nonzero price, and repeated refresh plus two restarts must preserve the result.
+
+The helper refuses other profiles, unexpected sources, aliases and unsafe file
+permissions. Its content-free receipt stays absent until all observations pass.
+Earlier candidate receipts do not satisfy this new historical-repair proof.
+Focused regressions include the actual ingestion, accounting, refresh controller
+and overview APIs, plus stale-refresh, identity, duplicate, pricing and rendered
+value failures. They are added to the existing read-only hosted release checks;
+local execution remains deferred while the hosted seed owns the Mac resources.
+Source review and hosted test/native results are recorded separately as they
+complete. Final signed bytes still require their own qualification.

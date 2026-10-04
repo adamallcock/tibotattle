@@ -2915,6 +2915,22 @@
     {
       "classification": "build_release_operation",
       "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-historical-sol-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bounded synthetic retained-parser fixture and content-free installed Usage assertions in the existing disposable Mac credential journey; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "test/macos-historical-sol-qualification.test.mjs"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
       "canonicalPath": "scripts/lib/sparkle-remote-inspection.mjs",
       "stableAlias": null,
       "stableAliasReason": "Private bounded feed observer for the Worker release-readiness check.",

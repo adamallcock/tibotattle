@@ -136,15 +136,56 @@ test('plan and compilation plan remain inert and every physical qualification st
   }
 });
 
+test('0.1.27 credential planning cannot claim historical Sol repair or native execution', async () => {
+  const successor = { ...intake, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' };
+  const plan = await runMacCredentialQualification({ intake: successor });
+  assert.equal(plan.status, 'planned');
+  assert.equal(plan.historicalSolUpgrade, null);
+  assert.deepEqual(plan.cases, []);
+  for (const [key, value] of Object.entries(plan)) if (typeof value === 'boolean') assert.equal(value, false, key);
+});
+
+test('historical repair stays between predecessor attestation and modern-case completion', async () => {
+  const source = await readFile(new URL('../scripts/smoke-electron-macos-credentials.mjs', import.meta.url), 'utf8');
+  const modernStart = source.indexOf("stage = 'modern_fixture'");
+  const refusedStart = source.indexOf("for (const scenario of CREDENTIAL_FIXTURE_CASES.filter");
+  assert.ok(modernStart >= 0 && refusedStart > modernStart);
+  const modern = source.slice(modernStart, refusedStart);
+  const seed = modern.indexOf('await prepareHistoricalSolFixture(');
+  const predecessorStop = modern.lastIndexOf('await stopOwnedMacSharingApp(active); active = null;', seed);
+  const audit = modern.indexOf('proof.predecessorCredentialAudit.afterStop');
+  const attest = modern.indexOf("await fixture.request('attest');", audit);
+  const replacement = modern.indexOf("stage = 'installed_replacement'");
+  assert.ok(predecessorStop >= 0 && audit > predecessorStop && attest > audit
+    && seed > attest && replacement > seed, 'synthetic seed follows stopped/audited predecessor, before replacement');
+  assert.match(modern.slice(attest, seed), /if \(input\.version === '0\.1\.27'\)/u);
+  const startupProof = modern.indexOf('await observeHistoricalSolPass(');
+  const manualRefresh = modern.indexOf('await exerciseCredentialRefresh(active.dashboard)');
+  const repeatProof = modern.indexOf('await observeHistoricalSolPass(', startupProof + 1);
+  const receipt = modern.indexOf('proof.historicalSolUpgrade = historicalSolQualificationReceipt(');
+  const credentialCheck = modern.lastIndexOf("fail('credential_changed')");
+  assert.ok(startupProof > replacement && manualRefresh > startupProof
+    && repeatProof > manualRefresh && credentialCheck > repeatProof && receipt > credentialCheck,
+    'capture startup repair before repeat, and publish proof only after credential-preserving restarts');
+  assert.match(modern, /for \(let pass = 0; pass < 3; pass\+\+\)/u);
+  assert.match(modern, /phase: pass === 0 \? 'repair' : 'restart'/u);
+  const refused = source.slice(refusedStart);
+  assert.doesNotMatch(refused, /prepareHistoricalSolFixture\(|observeHistoricalSolPass\(/u);
+  assert.match(refused, /expectedCredentialReason|observeRefusal/u);
+});
+
 test('execute refuses a non-hosted account before downloads, profiles, installation or Keychain operations', async () => {
-  const script = `import {runMacCredentialQualification} from './scripts/smoke-electron-macos-credentials.mjs';
+  for (const selected of [intake, { ...intake, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' }]) {
+    const script = `import {runMacCredentialQualification} from './scripts/smoke-electron-macos-credentials.mjs';
 globalThis.fetch=()=>{throw new Error('unexpected network')};
-process.stdout.write(JSON.stringify(await runMacCredentialQualification({execute:true,intake:${JSON.stringify(intake)}})));`;
-  const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script],
-    { cwd: new URL('..', import.meta.url), env: { PATH: '/usr/bin:/bin', GITHUB_ACTIONS: 'false' }, encoding: 'utf8' }));
-  assert.equal(result.status, 'failed');
-  assert.equal(result.failureStage, 'disposable_host');
-  assert.equal(result.credentialContinuityQualified, false);
+process.stdout.write(JSON.stringify(await runMacCredentialQualification({execute:true,intake:${JSON.stringify(selected)}})));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script],
+      { cwd: new URL('..', import.meta.url), env: { PATH: '/usr/bin:/bin', GITHUB_ACTIONS: 'false' }, encoding: 'utf8' }));
+    assert.equal(result.status, 'failed');
+    assert.equal(result.failureStage, 'disposable_host');
+    assert.equal(result.credentialContinuityQualified, false);
+    assert.equal(result.historicalSolUpgrade, null);
+  }
 });
 
 test('fixture configuration contains only compiled fixed hosted roots and reviewed cases', () => {

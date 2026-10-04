@@ -975,8 +975,13 @@ coordination factory for an exact new-version draft, its complete allowlisted
 asset set, and finalization as an immutable release. Its closed plan must also
 explicitly name promotion to GitHub's `latest` release: that is a mutable
 discovery change, not an immutable object upload. Bind the source/tag, notes,
-canonical manifest/checksums and completed release-admission receipt before
-draft creation, then verify every downloaded draft and published asset. Require
+canonical manifest/checksums and a retained final admission review before draft
+creation. That review binds the completed source, installed/native and required
+live-hosted evidence to their exact receipt and artifact identities. There is no
+aggregate final-admission validator: use the existing gate-specific validators
+and review the remaining evidence explicitly. Early synthetic admission and
+canonical manifest validation alone do not establish final release readiness.
+Then verify every downloaded draft and published asset. Require
 immutable finalization and fresh `latest` identity readback before releasing the
 artifact owner. Pending qualification or owner acceptance still blocks this
 operation; accepted limits must remain explicit in the manifest and review.
