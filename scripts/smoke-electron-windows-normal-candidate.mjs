@@ -2906,6 +2906,78 @@ export function verifyWindowsNormalCandidateModelPerformance(value) {
     && progress.checked === progress.total;
 }
 
+// Diagnose a rendered-page refusal using fixed categories only. Page text,
+// model names, request URLs, timestamps and arbitrary attributes never leave CDP.
+export function normalizeWindowsNormalCandidatePerformancePageDiagnostic(value) {
+  if (!exactObject(value)) return null;
+  const boolean = key => typeof value[key] === "boolean" ? value[key] : null;
+  const category = (key, allowed) => allowed.includes(value[key]) ? value[key] : "other";
+  const count = (key, cap) => Number.isSafeInteger(value[key]) && value[key] >= 0
+    ? Math.min(value[key], cap) : null;
+  return Object.freeze({
+    navigationPresent: boolean("navigationPresent"),
+    navigationCurrent: boolean("navigationCurrent"),
+    sectionPresent: boolean("sectionPresent"),
+    sectionInert: boolean("sectionInert"),
+    sectionAriaHidden: boolean("sectionAriaHidden"),
+    sectionInactive: boolean("sectionInactive"),
+    documentHidden: boolean("documentHidden"),
+    providerPresent: boolean("providerPresent"),
+    providerNonempty: boolean("providerNonempty"),
+    statusState: category("statusState", ["missing", "unset", "cancelled", "error", "unavailable",
+      "loading", "updating", "ready", "waiting"]),
+    staleStatusPresent: boolean("staleStatusPresent"),
+    reportingPeriod: category("reportingPeriod", ["missing", "24h", "7d", "30d", "all"]),
+    speedMode: category("speedMode", ["missing", "standard", "fast", "ultrafast"]),
+    modelTabCountCapped16: count("modelTabCountCapped16", 16),
+    expectedModelTabPresent: boolean("expectedModelTabPresent"),
+    expectedModelTabSelected: boolean("expectedModelTabSelected"),
+    modelPanelPresent: boolean("modelPanelPresent"),
+    expectedModelPanelLinked: boolean("expectedModelPanelLinked"),
+    chartCountCapped8: count("chartCountCapped8", 8),
+    emptyStatePresent: boolean("emptyStatePresent"),
+  });
+}
+
+export async function inspectWindowsNormalCandidatePerformancePage(cdp) {
+  const value = await cdp.evaluate(`(() => {
+    const section = document.querySelector('#performance');
+    const provider = section?.querySelector('.performance-provider');
+    const status = section?.querySelector('.performance-status');
+    // Preserve the existing admission predicate while collecting its refusal context.
+    const ready = Boolean(section && !section.inert && section.getAttribute('aria-hidden') !== 'true'
+      && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
+    const navigation = document.querySelector('[data-nav="performance"]');
+    const period = document.querySelector('#reporting-period-controls [aria-pressed="true"]');
+    const mode = section?.querySelector('.performance-modes [aria-pressed="true"]');
+    const model = section?.querySelector('[data-performance-focus="model-gpt-5.6-sol"]');
+    const panel = section?.querySelector('#performance-model-panel');
+    const category = (value, allowed) => allowed.includes(value) ? value : 'other';
+    return { ready, diagnostic: {
+      navigationPresent: Boolean(navigation), navigationCurrent: navigation?.getAttribute('aria-current') === 'page',
+      sectionPresent: Boolean(section), sectionInert: section?.inert === true,
+      sectionAriaHidden: section?.getAttribute('aria-hidden') === 'true',
+      sectionInactive: section?.classList.contains('dashboard-page-inactive') === true,
+      documentHidden: document.hidden === true,
+      providerPresent: Boolean(provider), providerNonempty: Boolean(provider?.textContent?.trim()),
+      statusState: !status ? 'missing' : !status.dataset.state ? 'unset'
+        : category(status.dataset.state, ['cancelled', 'error', 'unavailable', 'loading', 'updating', 'ready', 'waiting']),
+      staleStatusPresent: Boolean(section?.querySelector('.performance-status[data-state="stale"]')),
+      reportingPeriod: !period ? 'missing' : category(period.dataset.period, ['24h', '7d', '30d', 'all']),
+      speedMode: !mode ? 'missing' : category(mode.dataset.performanceFocus?.replace(/^mode-/, ''), ['standard', 'fast', 'ultrafast']),
+      modelTabCountCapped16: Math.min(section?.querySelectorAll('.performance-models [role="tab"]').length ?? 0, 16),
+      expectedModelTabPresent: Boolean(model), expectedModelTabSelected: model?.getAttribute('aria-selected') === 'true',
+      modelPanelPresent: Boolean(panel), expectedModelPanelLinked: panel?.getAttribute('aria-labelledby') === 'performance-tab-gpt-5.6-sol',
+      chartCountCapped8: Math.min(panel?.querySelectorAll('.performance-card svg[role="group"]').length ?? 0, 8),
+      emptyStatePresent: Boolean(section?.querySelector('.performance-empty')),
+    }};
+  })()`);
+  return Object.freeze({
+    ready: value?.ready === true,
+    diagnostic: normalizeWindowsNormalCandidatePerformancePageDiagnostic(value?.diagnostic),
+  });
+}
+
 /** Exact synthetic API proof; return only a boolean across the receipt boundary. */
 export function verifyWindowsNormalCandidateProjectsAndThreads(projects, threads) {
   const project = projects?.rows?.[0];
@@ -3108,15 +3180,20 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       link.click();
       return true;
     })()`);
-    if (openedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
-    const renderedPerformance = await waitFor(() => cdp.evaluate(`(() => {
-      const section = document.querySelector('#performance');
-      const provider = section?.querySelector('.performance-provider');
-      const status = section?.querySelector('.performance-status');
-      return Boolean(section && !section.inert && section.getAttribute('aria-hidden') !== 'true'
-        && provider?.textContent?.trim() && status?.dataset?.state === 'ready');
-    })()`), OPERATION_TIMEOUT_MS);
-    if (renderedPerformance !== true) fail("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE");
+    let performancePageDiagnostic = null;
+    const inspectPerformance = async () => {
+      const observation = await inspectWindowsNormalCandidatePerformancePage(cdp);
+      performancePageDiagnostic = observation.diagnostic;
+      return observation.ready;
+    };
+    if (openedPerformance !== true) {
+      try { await inspectPerformance(); } catch { /* Preserve the original refusal. */ }
+      throw Object.assign(failure("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE"), { performancePageDiagnostic });
+    }
+    const renderedPerformance = await waitFor(inspectPerformance, OPERATION_TIMEOUT_MS);
+    if (renderedPerformance !== true) {
+      throw Object.assign(failure("LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE"), { performancePageDiagnostic });
+    }
     onPhase("projects_and_threads");
     const queryWorkUsage = (body) => jsonFetch(new URL("/api/local/work-usage/query", dashboard), {
       fetchImpl: async (url, options) => {
@@ -3567,6 +3644,7 @@ function candidateReceipt({
   startupCompanionProcessDiagnostics = null,
   startupDashboardLoadFailure = null,
   startupCompletionDiagnostic = null,
+  performancePageDiagnostic = null,
   startupFailureCode = null,
   startupPhase = null,
 } = {}) {
@@ -3625,6 +3703,9 @@ function candidateReceipt({
     ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
       startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
     }),
+    ...(normalizeWindowsNormalCandidatePerformancePageDiagnostic(performancePageDiagnostic) === null ? {} : {
+      performancePageDiagnostic: normalizeWindowsNormalCandidatePerformancePageDiagnostic(performancePageDiagnostic),
+    }),
     productionReady: false,
   });
 }
@@ -3682,6 +3763,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let startupCompanionProcessDiagnostics = null;
   let startupDashboardLoadFailure = null;
   let startupCompletionDiagnostic = null;
+  let performancePageDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = {
     quiescent: false,
@@ -3761,6 +3843,9 @@ export async function runWindowsNormalCandidateSmoke(options, {
     startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
       error?.startupCompletionDiagnostic,
     );
+    performancePageDiagnostic = normalizeWindowsNormalCandidatePerformancePageDiagnostic(
+      error?.performancePageDiagnostic,
+    );
   } finally {
     if (firewallName !== null && candidateState.quiescent === true) {
       cleanup.firewallRemoved = await removeFirewall({
@@ -3794,6 +3879,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       startupCompanionProcessDiagnostics,
       startupDashboardLoadFailure,
       startupCompletionDiagnostic,
+      performancePageDiagnostic,
       startupFailureCode,
       startupPhase: candidateState.startupPhase,
     });
