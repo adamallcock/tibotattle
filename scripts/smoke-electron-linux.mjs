@@ -25,6 +25,7 @@ import { join, resolve } from "node:path";
 import { once } from "node:events";
 import { createServer, isIP } from "node:net";
 import { fileURLToPath } from "node:url";
+import { createLinuxStartupDiagnostics } from "./lib/linux-startup-diagnostics.mjs";
 
 import {
   DESKTOP_FIRST_RUN_RECEIPT_FILE_NAME,
@@ -2049,6 +2050,8 @@ export async function runSmoke({
   onRendererReadinessDiagnostics = null,
   onCompanionProcessDiagnostics = null,
   onDashboardFailureDiagnostic = null,
+  onStartupDiagnostic = null,
+  sampleStartupMount = null,
   preserveFixtureAfterCleanQuit = false,
   qualification = "development-only",
   sourceRevision = null,
@@ -2064,6 +2067,8 @@ export async function runSmoke({
       || onRendererReadinessDiagnostics !== null && typeof onRendererReadinessDiagnostics !== "function"
       || onCompanionProcessDiagnostics !== null && typeof onCompanionProcessDiagnostics !== "function"
       || onDashboardFailureDiagnostic !== null && typeof onDashboardFailureDiagnostic !== "function"
+      || onStartupDiagnostic !== null && typeof onStartupDiagnostic !== "function"
+      || sampleStartupMount !== null && typeof sampleStartupMount !== "function"
       || typeof preserveFixtureAfterCleanQuit !== "boolean"
       || typeof writeResult !== "function"
       || typeof qualification !== "string" || qualification.length === 0
@@ -2106,6 +2111,8 @@ export async function runSmoke({
   // Register before the first await so a failed spawn cannot become an
   // unhandled EventEmitter error while all emitted bytes are discarded.
   child.once?.("error", () => {});
+  const startupDiagnostics = onStartupDiagnostic === null ? null
+    : createLinuxStartupDiagnostics({ child, sampleMount: sampleStartupMount });
   let stdoutProduced = false;
   let stderrProduced = false;
   const companionProcessDiagnostics = onCompanionProcessDiagnostics === null
@@ -2117,6 +2124,7 @@ export async function runSmoke({
     stderrProduced = true;
     companionProcessDiagnostics?.feed(chunk);
     dashboardFailureDiagnostics?.feed(chunk);
+    startupDiagnostics?.feed(chunk);
   });
   const attachedPages = new Map();
   const attemptedPageTargetIds = new Set();
@@ -2146,6 +2154,7 @@ export async function runSmoke({
       process.stderr.write("Electron Linux endpoint unavailable.\n");
       throw error;
     });
+    try { await startupDiagnostics?.stop(); } catch { /* Diagnostic only. */ }
     // Poll from the moment the debugging endpoint appears and attach to each
     // debugger-owned page before deciding what it is. Electron can expose an
     // auxiliary or recovery page first; only an exact target-id match to the
@@ -2438,6 +2447,10 @@ export async function runSmoke({
     return result;
   } catch (error) {
     forcedShutdown = true;
+    if (failureStage === "startup" && onStartupDiagnostic !== null) {
+      try { onStartupDiagnostic(await startupDiagnostics.stop()); }
+      catch { /* Capture before forced cleanup without changing the smoke failure. */ }
+    }
     try {
       await resourceDiagnostics.stop();
       const diagnostic = resourceDiagnostics.snapshot();
@@ -2477,6 +2490,7 @@ export async function runSmoke({
     }
     throw error;
   } finally {
+    try { await startupDiagnostics?.stop(); } catch { /* Diagnostic only. */ }
     try { await resourceDiagnostics.stop(); } catch { /* Diagnostic only. */ }
     await companionSnapshotObserver?.stop?.();
     for (const page of attachedPages.values()) {

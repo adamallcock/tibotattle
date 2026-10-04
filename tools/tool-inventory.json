@@ -2038,7 +2038,8 @@
         "scripts/qualify-electron-linux-final-appimage.mjs",
         ".github/workflows/electron-linux-production-package.yml",
         "scripts/qualify-electron-linux-installed-lifecycle.mjs",
-        "scripts/smoke-electron-linux-final-lifecycle.mjs"
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-startup-diagnostics.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2072,7 +2073,8 @@
         ".github/workflows/electron-development-packages.yml",
         "test/electron-windows-normal-candidate.test.js",
         "scripts/smoke-electron-windows-signed-installed.mjs",
-        "scripts/smoke-electron-windows-final-upgrade.mjs"
+        "scripts/smoke-electron-windows-final-upgrade.mjs",
+        "test/electron-windows-normal-candidate-archive.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2144,7 +2146,9 @@
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "test/electron-linux-normal-packaged-smoke.test.js",
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
-        "scripts/smoke-electron-linux-final-lifecycle.mjs"
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-startup-diagnostics.test.mjs",
+        "test/electron-linux-packaged-container.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2697,7 +2701,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-windows-installer-diagnostic.yml",
-        "test/electron-windows-final-upgrade.test.mjs"
+        "test/electron-windows-final-upgrade.test.mjs",
+        "test/electron-windows-frozen-evidence.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-windows-installer-diagnostic.yml",
@@ -2993,7 +2998,8 @@
         ".github/workflows/electron-linux-final-qualification.yml",
         "containers/electron-linux-installed/Dockerfile",
         "test/electron-linux-installed-lifecycle.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/electron-linux-startup-diagnostics.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3013,6 +3019,26 @@
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-startup-diagnostics.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private content-free Linux startup diagnostics used by disposable qualification runners; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-linux.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-startup-diagnostics.test.mjs",
+        "test/electron-linux-packaged-container.test.js",
+        "containers/electron-linux/Dockerfile",
+        "containers/electron-linux-amd64/Dockerfile"
+      ],
+      "decision": "retain_as_internal_linux_qualification_support",
+      "provenance": ".github/workflows/electron-linux-final-qualification.yml",
       "provenanceReason": null,
       "legacyPaths": []
     }

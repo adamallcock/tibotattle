@@ -838,6 +838,15 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
     digest(appPath, "PACKAGE_PATHS_INVALID"),
     digest(asarPath, "PACKAGE_PATHS_INVALID"),
   ]);
+  // ASAR 3.4.1 caches member offsets by archive path. NSIS can replace the
+  // installed bytes at that same path between predecessor and successor checks.
+  // Every fresh verification must read the current header before any member.
+  try {
+    if (typeof asar?.uncache !== "function") fail("ASAR_UNAVAILABLE");
+    asar.uncache(asarPath);
+  } catch {
+    fail("ASAR_UNAVAILABLE");
+  }
   const archiveManifest = readArchiveJson(
     asarPath,
     "package.json",

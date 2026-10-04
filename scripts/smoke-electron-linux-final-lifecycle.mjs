@@ -8,8 +8,11 @@ import { lookup } from 'node:dns/promises';
 import { basename, dirname, join, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild } from './smoke-electron-linux.mjs';
-import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment, runOneNormalApp,
+import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
+  ELECTRON_LINUX_SMOKE_FAILURE_STAGES } from './smoke-electron-linux.mjs';
+import { createLinuxStartupDiagnostics, sampleLinuxStartupFuseMount,
+  validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
+import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment, runOneNormalApp, normalPackagedSmokeFailureStageCode,
   persistLinuxNormalPackagedRestartPreferences, verifyLinuxNormalPackagedRestartPreferences } from './smoke-electron-linux-packaged.mjs';
 import { prepareLinuxUpdaterDownload, realUpdaterFeed, isLinuxUpdaterSettingsURL,
   connectPage as connectUpdaterPage, processHealth as updaterProcessHealth, waitFor as waitForUpdater } from './smoke-electron-linux-real-appimage-updater.mjs';
@@ -220,6 +223,17 @@ async function uninstallImage(expected, preservedFixture = null) {
   try { await lstat(IMAGE); fail('UNINSTALL_FAILED'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (preservedFixture && !isDeepStrictEqual(before, await checkedCheckpoint(preservedFixture))) fail('UNINSTALL_STATE_CHANGED');
 }
+/** Preserve only the maintained smoke-stage code and closed startup evidence. */
+export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
+  const smokeCode = typeof errorCode === 'string' && ELECTRON_LINUX_SMOKE_FAILURE_STAGES.some(stage => {
+    const code = normalPackagedSmokeFailureStageCode(stage);
+    return code !== null && errorCode === `ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_${code}`;
+  });
+  const diagnostic = validateLinuxStartupDiagnostic(startupDiagnostic);
+  return { errorCode: /^LINUX_FINAL_LIFECYCLE_[A-Z_]+$/u.test(errorCode ?? '') || smokeCode
+    ? errorCode : 'LINUX_FINAL_LIFECYCLE_RUNTIME_FAILED',
+  ...(diagnostic === null ? {} : { startupDiagnostic: diagnostic }) };
+}
 export async function runLinuxFinalLifecycle() {
   const contract = assertContainerContract();
   if (process.arch !== 'x64' || process.getuid() !== 1000 || process.version !== 'v26.2.0'
@@ -268,6 +282,7 @@ export async function runLinuxFinalLifecycle() {
     network: 'loopback_only_network_none', feed: 'fixed_production_URL_simulated_locally',
     credentialScope: 'disposable_Secret_Service', rebuilt: false, published: false };
   let child = null, dashboard = null, settings = null, upgradeFixture = null;
+  let startupDiagnostic = null, predecessorStartupDiagnostics = null;
   const owned = [];
   try {
     await new Promise((done, reject) => { server.once('error', reject); server.listen(443, '127.0.0.1', done); });
@@ -279,6 +294,8 @@ export async function runLinuxFinalLifecycle() {
     const runNormal = (fixture, beforeQuit) => runOneNormalApp(identity, {
       appPath: IMAGE, environment: launchEnvironment(fixture, cert), fixture,
       preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
+      run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
+        onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
     });
     await runNormal(clean, async context => {
       cleanIdentity = await currentApp(pair.images.next); await assertRendererSandbox(cleanIdentity);
@@ -298,11 +315,14 @@ export async function runLinuxFinalLifecycle() {
     const environment = launchEnvironment(upgradeFixture, cert);
     const port = await freeTcpPort();
     child = spawn(IMAGE, [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
-      { env: environment, shell: false, stdio: 'ignore' });
+      { env: environment, shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
     child.on('error', () => {});
+    predecessorStartupDiagnostics = createLinuxStartupDiagnostics({ child, sampleMount: sampleLinuxStartupFuseMount });
+    child.stderr.on('data', predecessorStartupDiagnostics.feed);
     dashboard = await connectUpdaterPage(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
     await wait(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
     const previous = await currentApp(pair.images.current); await assertRendererSandbox(previous);
+    await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
     await persistLinuxNormalPackagedRestartPreferences({ cdp: dashboard });
     // Ordinary startup refresh must have reached the persisted keyed observation.
     const beforeScope = await wait(async () => { try { return await checkedCheckpoint(upgradeFixture); } catch { return null; } }, 60000);
@@ -379,8 +399,10 @@ export async function runLinuxFinalLifecycle() {
     receipt.status = 'passed'; receipt.feedRequests = feedRequests; receipt.imageRequests = imageRequests;
     return receipt;
   } catch (error) {
-    error.receipt = { ...receipt, status: 'failed', stage,
-      errorCode: /^LINUX_FINAL_LIFECYCLE_[A-Z_]+$/u.test(error.code ?? '') ? error.code : 'LINUX_FINAL_LIFECYCLE_RUNTIME_FAILED' };
+    if (predecessorStartupDiagnostics !== null) {
+      try { startupDiagnostic = await predecessorStartupDiagnostics.stop(); } catch { /* Diagnostic only. */ }
+    }
+    error.receipt = { ...receipt, status: 'failed', stage, ...linuxFinalFailureDetails(error.code, startupDiagnostic) };
     throw error;
   } finally {
     dashboard?.close(); settings?.close();

@@ -5,6 +5,26 @@ import test from "node:test";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
+test("both base Linux smoke images retain each diagnostic leaf dependency in their narrow context", async () => {
+  const source = await read("scripts/smoke-electron-linux.mjs");
+  const dependencies = [...source.matchAll(/from ["'](\.\/lib\/[^"']+)["']/gu)]
+    .map(([, path]) => `scripts/${path.slice(2)}`);
+  assert.ok(dependencies.includes("scripts/lib/linux-startup-diagnostics.mjs"));
+  for (const dependency of dependencies) {
+    const helper = await read(dependency);
+    const imports = [...helper.matchAll(/from ["']([^"']+)["']/gu)].map(([, path]) => path);
+    assert.ok(imports.every(path => path.startsWith("node:")), "leaf diagnostics must not hide another uncopied dependency");
+    for (const target of ["electron-linux", "electron-linux-amd64"]) {
+      const dockerfile = await read(`containers/${target}/Dockerfile`);
+      const copies = dockerfile.split("\n").map(line => line.replace(/^COPY --chown=node:node /u, "COPY "));
+      assert.equal(copies.filter(line => line === `COPY ${dependency} ./${dependency}`).length, 1);
+      const exceptions = (await read(`containers/${target}/Dockerfile.dockerignore`)).split("\n");
+      assert.ok(exceptions.includes("!scripts/lib/") && exceptions.includes(`!${dependency}`));
+      assert.ok(!exceptions.includes("!scripts/**") && !exceptions.includes("!scripts/lib/**"), "only the exact helper enters either context");
+    }
+  }
+});
+
 test("Linux GUI qualification uses bounded isolated shared memory through reload and updater restart", async () => {
   const workflow = await read(".github/workflows/electron-development-packages.yml");
   const linux = workflow.slice(workflow.indexOf("  linux-x64:"));

@@ -93,6 +93,7 @@ COPY --chown=node:node generated ./generated
 COPY --chown=node:node schemas ./schemas
 COPY --chown=node:node src ./src
 COPY --chown=node:node scripts/smoke-electron-linux.mjs ./scripts/smoke-electron-linux.mjs
+COPY --chown=node:node scripts/lib/linux-startup-diagnostics.mjs ./scripts/lib/linux-startup-diagnostics.mjs
 RUN chown -R node:node /workspace \
   && chown root:root /workspace/node_modules/electron/dist/chrome-sandbox \
   && chmod 4755 /workspace/node_modules/electron/dist/chrome-sandbox

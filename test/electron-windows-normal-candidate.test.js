@@ -1316,6 +1316,7 @@ function packageVerificationDependencies({
     }),
     digest,
     asar: asar ?? {
+      uncache: () => false,
       extractFile: () => Buffer.from(JSON.stringify(manifest)),
     },
     ...(selectedValidateNative === undefined ? {} : { validateNative: selectedValidateNative }),
@@ -1933,14 +1934,14 @@ test("normal candidate package verification keeps its closed failure stages dist
   assert.deepEqual(readCodes, ["SOURCE_CANDIDATE_INVALID", "PACKAGE_STAGED_MANIFEST_INVALID"]);
 
   await assert.rejects(verify({
-    asar: { extractFile: () => { throw new Error("unavailable"); } },
+    asar: { uncache: () => false, extractFile: () => { throw new Error("unavailable"); } },
   }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_ARCHIVE_MANIFEST_INVALID" });
 
   const manifest = { version: "0.1.0", tibotattleDistribution: {
     ...candidateMetadata(), channel: "beta",
   } };
   await assert.rejects(verify({
-    asar: { extractFile: () => Buffer.from(JSON.stringify(manifest)) },
+    asar: { uncache: () => false, extractFile: () => Buffer.from(JSON.stringify(manifest)) },
   }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_METADATA_INVALID" });
 
   let nativeFailureCode = null;
@@ -1976,6 +1977,7 @@ test("normal candidate package verification uses Windows ASAR separators for the
       useNativePair: true,
       digest: async () => nativeDigest,
       asar: {
+        uncache: () => false,
         extractFile: (_archive, member) => {
           members.push(member);
           if (member === "package.json") {
@@ -2033,6 +2035,7 @@ test("normal candidate package verification binds the staged preload and runtime
         : /apps[\\/]electron[\\/]preload\.cjs$/u.test(path)
           ? digestFor(preload) : nativeDigest,
       asar: {
+        uncache: () => false,
         extractFile: (_archive, member) => {
           if (member === "package.json") return Buffer.from(JSON.stringify({
             version: "0.1.0", tibotattleDistribution: candidateMetadata(),

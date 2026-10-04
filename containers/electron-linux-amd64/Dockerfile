@@ -98,6 +98,7 @@ COPY generated ./generated
 COPY schemas ./schemas
 COPY src ./src
 COPY scripts/smoke-electron-linux.mjs ./scripts/smoke-electron-linux.mjs
+COPY scripts/lib/linux-startup-diagnostics.mjs ./scripts/lib/linux-startup-diagnostics.mjs
 COPY scripts/qualify-linux-secret-service.mjs ./scripts/qualify-linux-secret-service.mjs
 COPY scripts/run-linux-secret-service-qualification.mjs ./scripts/run-linux-secret-service-qualification.mjs
 # Docker build steps and unqualified COPY directives run as root, so the
