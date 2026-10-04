@@ -30,7 +30,7 @@ const wait = waitForUpdater;
 const digest = async path => (await fingerprintLinuxFinalFile(path)).sha256;
 const unescapeMount = text => text.replace(/\\(040|011|012|134)/gu, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
 export function linuxFinalTemporary(nonce) {
-  if (!/^[a-f0-9]{32}$/u.test(nonce ?? '')) fail('FUSE_IDENTITY_INVALID');
+  if (!/^[a-f0-9]{32}$/u.test(nonce ?? '')) fail('FUSE_TEMPORARY_INVALID');
   return `${TEMP_ROOT}/${nonce}`;
 }
 export function assertLinuxFinalOwnedPolicy({ nonce, name, profileText, facts }) {
@@ -46,11 +46,12 @@ export function assertLinuxFinalOwnedPolicy({ nonce, name, profileText, facts })
 /** A path alone never proves FUSE. Bind the kernel mount table and the runtime's
  * environment to the installed image. SquashFS file uid is not the app uid. */
 export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE, temporary }) {
-  if (typeof temporary !== 'string' || temporary !== linuxFinalTemporary(temporary.slice(TEMP_ROOT.length + 1))) fail('FUSE_IDENTITY_INVALID');
-  if (image !== IMAGE || typeof executable !== 'string' || posix.resolve(executable) !== executable
-    || posix.basename(executable) !== 'tibotattle') fail('FUSE_IDENTITY_INVALID');
+  if (typeof temporary !== 'string' || temporary !== linuxFinalTemporary(temporary.slice(TEMP_ROOT.length + 1))) fail('FUSE_TEMPORARY_INVALID');
+  if (image !== IMAGE) fail('FUSE_IMAGE_PATH_INVALID');
+  if (typeof executable !== 'string' || posix.resolve(executable) !== executable
+    || posix.basename(executable) !== 'tibotattle') fail('FUSE_EXECUTABLE_PATH_INVALID');
   const mount = posix.dirname(executable);
-  if (!new RegExp(`^${temporary}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_IDENTITY_INVALID');
+  if (!new RegExp(`^${temporary}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_MOUNT_LOCATION_INVALID');
   const rows = mountinfo.split('\n').filter(Boolean).map(line => {
     const parts = line.split(' - '); if (parts.length !== 2) return null;
     const before = parts[0].split(' '), after = parts[1].split(' ');
@@ -58,14 +59,18 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
       options: (before[5] ?? '').split(','), type: after[0], source: unescapeMount(after[1] ?? ''),
       superOptions: (after[2] ?? '').split(',') };
   }).filter(row => row?.mount === mount);
-  if (rows.length !== 1) fail('FUSE_IDENTITY_INVALID');
+  if (rows.length === 0) fail('FUSE_MOUNT_MISSING');
+  if (rows.length !== 1) fail('FUSE_MOUNT_AMBIGUOUS');
   const selected = rows[0];
-  const fuse = selected.type === 'fuse.squashfuse' && selected.source === 'squashfuse'
-    || ['fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type) && [image, posix.basename(image)].includes(selected.source);
-  if (!fuse || selected.root !== '/' || !selected.options.includes('ro')
-    || !selected.superOptions.includes('user_id=1000')
-    || environment.APPIMAGE !== image || environment.APPDIR !== mount
-    || environment.APPIMAGE_EXTRACT_AND_RUN !== undefined) fail('FUSE_IDENTITY_INVALID');
+  if (!['fuse.squashfuse', 'fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type)) fail('FUSE_MOUNT_TYPE_INVALID');
+  if (!(selected.type === 'fuse.squashfuse' ? selected.source === 'squashfuse'
+    : [image, posix.basename(image)].includes(selected.source))) fail('FUSE_MOUNT_SOURCE_INVALID');
+  if (selected.root !== '/') fail('FUSE_MOUNT_ROOT_INVALID');
+  if (!selected.options.includes('ro')) fail('FUSE_MOUNT_READ_ONLY_REQUIRED');
+  if (!selected.superOptions.includes('user_id=1000')) fail('FUSE_MOUNT_UID_INVALID');
+  if (environment.APPIMAGE !== image) fail('FUSE_APPIMAGE_ENV_INVALID');
+  if (environment.APPDIR !== mount) fail('FUSE_APPDIR_ENV_INVALID');
+  if (environment.APPIMAGE_EXTRACT_AND_RUN !== undefined) fail('FUSE_EXTRACTION_MODE_FORBIDDEN');
   return { mount, type: selected.type };
 }
 export function linuxFinalSandboxStatus({ commandLine, status }) {
@@ -77,7 +82,7 @@ export function linuxFinalSandboxStatus({ commandLine, status }) {
 function startTime(stat) {
   const close = stat.lastIndexOf(')');
   const value = stat.slice(close + 2).split(' ')[19];
-  if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_IDENTITY_INVALID');
+  if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_START_TIME_INVALID');
   return value;
 }
 export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary, { read = readFile, link = readlink, hash = digest } = {}) {
@@ -87,7 +92,7 @@ export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary,
   const executable = await link(`/proc/${pid}/exe`); // No argv fallback in this lane.
   if (!executable.startsWith(`${temporary}/.mount_`) || basename(executable) !== 'tibotattle') return null;
   const status = await read(`/proc/${pid}/status`, 'utf8');
-  if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_IDENTITY_INVALID');
+  if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_UID_INVALID');
   const entries = (await read(`/proc/${pid}/environ`, 'utf8')).split('\0');
   const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN|ELECTRON_RUN_AS_NODE)=/u.test(item)).map(item => {
     const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
@@ -255,13 +260,27 @@ export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
 }
 /** The shared smoke retains its late-network stage while beforeQuit runs. Keep
  * failures from these final-lifecycle checks distinct, after its cleanup runs. */
+const IDENTITY_HOOK_FAILURES = new Map([
+  'FUSE_TEMPORARY_INVALID', 'FUSE_IMAGE_PATH_INVALID', 'FUSE_EXECUTABLE_PATH_INVALID',
+  'FUSE_MOUNT_LOCATION_INVALID', 'FUSE_MOUNT_MISSING', 'FUSE_MOUNT_AMBIGUOUS',
+  'FUSE_MOUNT_TYPE_INVALID', 'FUSE_MOUNT_SOURCE_INVALID', 'FUSE_MOUNT_ROOT_INVALID',
+  'FUSE_MOUNT_READ_ONLY_REQUIRED', 'FUSE_MOUNT_UID_INVALID', 'FUSE_APPIMAGE_ENV_INVALID',
+  'FUSE_APPDIR_ENV_INVALID', 'FUSE_EXTRACTION_MODE_FORBIDDEN', 'PROCESS_START_TIME_INVALID',
+  'PROCESS_UID_INVALID', 'PROCESS_ROLE_INVALID', 'PROCESS_BYTES_CHANGED', 'MULTIPLE_APPS',
+  'FILE_UNSAFE', 'FILE_CHANGED',
+].map(code => [`LINUX_FINAL_LIFECYCLE_${code}`, `NORMAL_APP_IDENTITY_${code}`]));
+IDENTITY_HOOK_FAILURES.set('LINUX_REAL_APPIMAGE_TIMEOUT', 'NORMAL_APP_IDENTITY_TIMEOUT');
 export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSandbox, preferences, noUpdate, preserveState = null }) {
   if (![run, readIdentity, assertSandbox, preferences, noUpdate].every(value => typeof value === 'function')
     || preserveState !== null && typeof preserveState !== 'function') fail('NORMAL_HOOK_INVALID');
   let hookFailure = null, entered = false, completed = false, identity;
   const check = async (code, action) => {
     try { return await action(); }
-    catch { hookFailure = code; fail(code); }
+    catch (error) {
+      // Never retain arbitrary error codes, messages, paths or other properties.
+      hookFailure = code === 'NORMAL_APP_IDENTITY_FAILED' ? IDENTITY_HOOK_FAILURES.get(error?.code) ?? code : code;
+      fail(hookFailure);
+    }
   };
   try {
     await run(async context => {

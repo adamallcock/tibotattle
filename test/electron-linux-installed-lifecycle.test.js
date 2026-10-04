@@ -79,20 +79,44 @@ function mounted() {
     mountinfo: `91 40 0:82 / ${mount} ro,nosuid,nodev,relatime - fuse.squashfuse squashfuse ro,user_id=1000,group_id=1000\n`,
     environment: { APPIMAGE: '/opt/tibotattle-updater-exec/TiboTattle.AppImage', APPDIR: mount } };
 }
+const fuseRefusals = [
+  ['FUSE_TEMPORARY_INVALID', m => { delete m.temporary; }],
+  ['FUSE_TEMPORARY_INVALID', m => { m.temporary = '/unowned'; }],
+  ['FUSE_IMAGE_PATH_INVALID', m => { m.image = '/unowned.AppImage'; }],
+  ['FUSE_EXECUTABLE_PATH_INVALID', m => { m.executable = `${mount}/../tibotattle`; }],
+  ['FUSE_EXECUTABLE_PATH_INVALID', m => { m.executable = `${mount}/other`; }],
+  ['FUSE_MOUNT_LOCATION_INVALID', m => { m.executable = '/opt/tibotattle-updater-exec/tmp/appimage_extracted_abc/tibotattle'; }],
+  ['FUSE_MOUNT_LOCATION_INVALID', m => { m.executable = '/tmp/.mount_TiboTa123456/tibotattle'; }],
+  ['FUSE_MOUNT_LOCATION_INVALID', m => { m.temporary = linuxFinalTemporary('b'.repeat(32)); }],
+  ['FUSE_MOUNT_MISSING', m => { m.mountinfo = ''; }],
+  ['FUSE_MOUNT_AMBIGUOUS', m => { m.mountinfo += m.mountinfo; }],
+  ['FUSE_MOUNT_TYPE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse', 'tmpfs'); }],
+  ['FUSE_MOUNT_SOURCE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.squashfuse other'); }],
+  ['FUSE_MOUNT_SOURCE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.squashfuse TiboTattle.AppImage'); }],
+  ['FUSE_MOUNT_SOURCE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.TiboTattle.AppImage other'); }],
+  ['FUSE_MOUNT_SOURCE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.TiboTattle.AppImage squashfuse'); }],
+  ['FUSE_MOUNT_SOURCE_INVALID', m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse squashfuse'); }],
+  ['FUSE_MOUNT_ROOT_INVALID', m => { m.mountinfo = m.mountinfo.replace('0:82 / ', '0:82 /subdir '); }],
+  ['FUSE_MOUNT_READ_ONLY_REQUIRED', m => { m.mountinfo = m.mountinfo.replace('ro,nosuid', 'rw,nosuid'); }],
+  ['FUSE_MOUNT_UID_INVALID', m => { m.mountinfo = m.mountinfo.replace('user_id=1000', 'user_id=0'); }],
+  ['FUSE_APPIMAGE_ENV_INVALID', m => { m.environment.APPIMAGE = '/tmp/other.AppImage'; }],
+  ['FUSE_APPIMAGE_ENV_INVALID', m => { delete m.environment.APPIMAGE; }],
+  ['FUSE_APPDIR_ENV_INVALID', m => { m.environment.APPDIR = '/tmp/other'; }],
+  ['FUSE_APPDIR_ENV_INVALID', m => { delete m.environment.APPDIR; }],
+  ['FUSE_EXTRACTION_MODE_FORBIDDEN', m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = '1'; }],
+  ['FUSE_EXTRACTION_MODE_FORBIDDEN', m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = ''; }],
+];
 test('kernel FUSE mount plus image runtime identity is required; extracted paths are rejected', () => {
-  assert.deepEqual(selectLinuxFinalFuseMount(mounted()), { mount, type: 'fuse.squashfuse' });
-  for (const alter of [
-    m => { m.executable = '/opt/tibotattle-updater-exec/tmp/appimage_extracted_abc/tibotattle'; },
-    m => { m.executable = '/tmp/.mount_TiboTa123456/tibotattle'; },
-    m => { m.mountinfo = m.mountinfo.replace('fuse.squashfuse', 'tmpfs'); },
-    m => { m.mountinfo = m.mountinfo.replace('ro,nosuid', 'rw,nosuid'); },
-    m => { m.mountinfo = m.mountinfo.replace('user_id=1000', 'user_id=0'); },
-    m => { m.mountinfo += m.mountinfo; }, m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = '1'; },
-    m => { m.environment.APPIMAGE = '/tmp/other.AppImage'; }, m => { m.environment.APPDIR = '/tmp/other'; },
-    m => { m.executable = `${mount}/../tibotattle`; },
-    m => { m.temporary = linuxFinalTemporary('b'.repeat(32)); },
-    m => { delete m.temporary; },
-  ]) { const value = mounted(); alter(value); assert.throws(() => selectLinuxFinalFuseMount(value)); }
+  for (const [type, source] of [['fuse.squashfuse', 'squashfuse'], ['fuse.TiboTattle.AppImage', 'TiboTattle.AppImage'],
+    ['fuse.TiboTattle.AppImage', '/opt/tibotattle-updater-exec/TiboTattle.AppImage'],
+    ['fuse', 'TiboTattle.AppImage'], ['fuse', '/opt/tibotattle-updater-exec/TiboTattle.AppImage']]) {
+    const value = mounted(); value.mountinfo = value.mountinfo.replace('fuse.squashfuse squashfuse', `${type} ${source}`);
+    assert.deepEqual(selectLinuxFinalFuseMount(value), { mount, type });
+  }
+  for (const [code, alter] of fuseRefusals) {
+    const value = mounted(); alter(value);
+    assert.throws(() => selectLinuxFinalFuseMount(value), { code: `LINUX_FINAL_LIFECYCLE_${code}` });
+  }
 });
 function appProcess(role = 'browser') {
   const value = mounted(), pid = 50, reads = [], hashes = [];
@@ -129,7 +153,7 @@ test('ordinary Node companion sharing the mounted executable is not mistaken for
   const node = appProcess('node');
   assert.equal(node.files.cmdline.split('\0').some(arg => arg.startsWith('--type=')), false);
   // The previous candidate path reached this strict FUSE check and aborted.
-  assert.throws(() => selectLinuxFinalFuseMount({ ...node.value, environment: node.environment }), /FUSE_IDENTITY_INVALID/u);
+  assert.throws(() => selectLinuxFinalFuseMount({ ...node.value, environment: node.environment }), /FUSE_APPIMAGE_ENV_INVALID/u);
   assert.equal(await readLinuxFinalAppProcessIdentity(node.pid, node.expected, temporary, node.io), null);
   assert.ok(node.reads.includes('environ')); assert.ok(!node.reads.includes('mountinfo'));
   assert.deepEqual(node.hashes, []);
@@ -155,19 +179,19 @@ test('Node-mode markers can exclude a candidate but cannot qualify a browser or 
 });
 
 test('real browser candidates still refuse wrong FUSE identity, extraction mode and credentials', async () => {
-  for (const alter of [
-    v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; },
-    v => { v.files.environ = `APPDIR=${mount}\0`; },
-    v => { v.files.environ += 'APPIMAGE_EXTRACT_AND_RUN=1\0'; },
-    v => { v.files.mountinfo = v.files.mountinfo.replace('fuse.TiboTattle.AppImage', 'tmpfs'); },
-    v => { v.files.mountinfo = v.files.mountinfo.replace('user_id=1000', 'user_id=0'); },
+  for (const [code, alter] of [
+    ['FUSE_APPDIR_ENV_INVALID', v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; }],
+    ['FUSE_APPIMAGE_ENV_INVALID', v => { v.files.environ = `APPDIR=${mount}\0`; }],
+    ['FUSE_EXTRACTION_MODE_FORBIDDEN', v => { v.files.environ += 'APPIMAGE_EXTRACT_AND_RUN=1\0'; }],
+    ['FUSE_MOUNT_TYPE_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('fuse.TiboTattle.AppImage', 'tmpfs'); }],
+    ['FUSE_MOUNT_UID_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('user_id=1000', 'user_id=0'); }],
   ]) {
     const value = appProcess(); alter(value);
-    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /FUSE_IDENTITY_INVALID/u);
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), { code: `LINUX_FINAL_LIFECYCLE_${code}` });
     assert.deepEqual(value.hashes, []);
   }
   const uid = appProcess(); uid.files.status = 'Uid:\t0\t0\t0\t0\n';
-  await assert.rejects(readLinuxFinalAppProcessIdentity(uid.pid, uid.expected, temporary, uid.io), /PROCESS_IDENTITY_INVALID/u);
+  await assert.rejects(readLinuxFinalAppProcessIdentity(uid.pid, uid.expected, temporary, uid.io), /PROCESS_UID_INVALID/u);
 });
 
 test('browser identity keeps both pinned digests, stable process identity and loud file failures', async () => {
@@ -186,6 +210,8 @@ test('browser identity keeps both pinned digests, stable process identity and lo
   await assert.rejects(readLinuxFinalAppProcessIdentity(unsafe.pid, unsafe.expected, temporary, {
     ...unsafe.io, hash: async () => { throw failure; },
   }), error => error === failure);
+  const malformed = appProcess(); malformed.files.stat = malformed.files.stat.replace(/100$/u, 'invalid');
+  await assert.rejects(readLinuxFinalAppProcessIdentity(malformed.pid, malformed.expected, temporary, malformed.io), /PROCESS_START_TIME_INVALID/u);
 });
 
 test('a native renderer must retain Chromium sandbox kernel controls', () => {
@@ -347,4 +373,72 @@ test('final normal journey refuses omitted, swallowed, repeated or invalid hooks
   for (const key of ['run', 'readIdentity', 'assertSandbox', 'preferences', 'noUpdate', 'preserveState']) {
     await assert.rejects(runLinuxFinalNormalJourney({ ...normalJourney().options, [key]: 'invalid' }), /NORMAL_HOOK_INVALID/u);
   }
+});
+
+async function assertIdentityCause(action, reason) {
+  const value = normalJourney(), readIdentity = value.options.readIdentity;
+  value.options.readIdentity = async () => { await readIdentity(); return action(); };
+  await assert.rejects(runLinuxFinalNormalJourney(value.options), error => {
+    const errorCode = `LINUX_FINAL_LIFECYCLE_NORMAL_APP_IDENTITY_${reason}`;
+    assert.equal(error.code, errorCode); assert.equal(error.message, errorCode);
+    // This is the established failed-receipt errorCode bound, not a new schema.
+    assert.match(errorCode, /^LINUX_FINAL_LIFECYCLE_[A-Z_]{1,100}$/u);
+    assert.deepEqual(Object.keys(error), ['code']);
+    assert.deepEqual(linuxFinalFailureDetails(error.code, null), { errorCode });
+    assert.doesNotMatch(JSON.stringify(error), /synthetic detail|PRIVATE_SYNTHETIC_DETAIL/u);
+    assert.deepEqual(value.events, ['identity', 'cleanup']);
+    return true;
+  });
+}
+
+test('every FUSE predicate remains a distinct closed identity cause through the real packaged error mapper', async () => {
+  for (const [code, alter] of fuseRefusals) {
+    const value = mounted(); alter(value);
+    await assertIdentityCause(() => selectLinuxFinalFuseMount(value), code);
+  }
+});
+
+test('process role, UID, start-time and safe-file failures keep only fixed identity causes after cleanup', async () => {
+  for (const [code, alter] of [
+    ['PROCESS_ROLE_INVALID', v => { v.files.environ += 'ELECTRON_RUN_AS_NODE=invalid\0'; }],
+    ['PROCESS_UID_INVALID', v => { v.files.status = 'Uid:\t0\t0\t0\t0\n'; }],
+    ['PROCESS_START_TIME_INVALID', v => { v.files.stat = v.files.stat.replace(/100$/u, 'invalid'); }],
+  ]) {
+    const value = appProcess(); alter(value);
+    await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), code);
+  }
+  const changed = appProcess(); let statReads = 0;
+  await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(changed.pid, changed.expected, temporary, {
+    ...changed.io, read: async path => {
+      const value = await changed.io.read(path);
+      return path.endsWith('/stat') && ++statReads > 1 ? value.replace(/100$/u, '101') : value;
+    },
+  }), 'PROCESS_BYTES_CHANGED');
+  for (const code of ['FILE_UNSAFE', 'FILE_CHANGED']) {
+    const value = appProcess();
+    await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+      ...value.io, hash: async () => {
+        throw Object.assign(new Error('synthetic detail must remain private'), {
+          code: `LINUX_FINAL_LIFECYCLE_${code}`, path: 'PRIVATE_SYNTHETIC_DETAIL',
+        });
+      },
+    }), code);
+  }
+  for (const [code, reason] of [['LINUX_FINAL_LIFECYCLE_MULTIPLE_APPS', 'MULTIPLE_APPS'],
+    ['LINUX_REAL_APPIMAGE_TIMEOUT', 'TIMEOUT']]) {
+    await assertIdentityCause(() => { throw Object.assign(new Error('synthetic detail'), { code }); }, reason);
+  }
+});
+
+test('identity diagnostics refuse unknown, private or oversized codes and do not cross hook boundaries', async () => {
+  for (const code of [undefined, null, 1, 'PRIVATE_SYNTHETIC_DETAIL', 'LINUX_FINAL_LIFECYCLE_PRIVATE_SYNTHETIC_DETAIL',
+    'LINUX_FINAL_LIFECYCLE_FILE_UNSAFE_PRIVATE_SYNTHETIC_DETAIL', `LINUX_FINAL_LIFECYCLE_${'A'.repeat(101)}`]) {
+    await assertIdentityCause(() => { throw Object.assign(new Error('synthetic detail'), { code }); }, 'FAILED');
+  }
+  const value = normalJourney();
+  value.options.assertSandbox = async () => {
+    throw Object.assign(new Error('synthetic detail'), { code: 'LINUX_FINAL_LIFECYCLE_FILE_UNSAFE' });
+  };
+  await assert.rejects(runLinuxFinalNormalJourney(value.options), { code: 'LINUX_FINAL_LIFECYCLE_NORMAL_RENDERER_SANDBOX_FAILED' });
+  assert.deepEqual(value.events, ['identity', 'cleanup']);
 });
