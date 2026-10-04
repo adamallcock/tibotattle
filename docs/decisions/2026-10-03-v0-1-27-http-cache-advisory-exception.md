@@ -80,9 +80,8 @@ Focused validation of this three-file repair passed the live exact-source/status
 guard and all 10 tests in `test/http-cache-exception.test.js` plus
 `test/http-cache-semantics-security.test.js`, with no skips. Node syntax checks
 and whitespace checks passed. The public R7 workload-provenance function returned
-452 files and SHA-256
-`5a24910c95dc84f98837982d753d0e767b47c705067ca4022fadc718ae7949d9`
-both before and after the repair. These three files are outside that workload
+the same file count and digest before and after the repair. These three files
+are outside that workload
 closure; no package, lock, workspace, runtime or receipt input changed.
 No full suite, dependency installation, heavy build or protected R7 operation
 was started by this review. Hosted CI on the reviewed repair remains a separate

@@ -42,12 +42,12 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 |---|---|---|
 | Scope | Full four-platform release authorized; dashboard reader remains deferred | Exact client scope and publication boundary recorded |
 | Pro Max release contract | Passed source/released/installed vocabulary checks and focused tests | Current released/installed binary and upstream evidence reviewed; ledger lifecycle/provenance agree; required-binary contract check passes without claiming authoritative allowance/window capacities |
-| Packaging dependencies | Approved exception active at bdc56099; independent review, live guard, recursive OSV and focused negative tests passed | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
+| Packaging dependencies | Approved exception active; newly published 4.3.0 reviewed at 4b43f2ae without changing the mitigation; fresh hosted OSV passed | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
 | Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
-| Retained R7 evidence | Additive manifest v0.3 and deletion-journal v0.2 repair reviewed; complete fresh protected retry ready | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
-| Complete source/surface gates | Focused client/shared gates passed; complete gates pending repaired frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
+| Retained R7 evidence | Complete protected retry finished at 04:28:59 UTC; all ten receipts validated and both exact-runtime freshness checks passed | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
+| Complete source/surface gates | Only two stale-R7 root assertions remain; UI, companion, Worker tests and Mac transition lanes passed; final local asset dry run pending | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
 | Production candidates | Earlier Mac source stages retained; Apple notarization blocked by an unsigned/expired developer agreement; new-byte native gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
@@ -304,3 +304,67 @@ contract/correction qualification has no committed release window. Final release
 notes must match the actual UTC publication date. Preserve the clean reviewed
 client source and complete local evidence now; do not guess that date or reserve
 an immutable final tag before Apple and hosted prerequisites establish the window.
+
+
+## Reviewed runner and current dependency status
+
+PR [#263](https://github.com/adamallcock/tibotattle/pull/263) carries the release
+preparation. All four hosted checks passed at `665e069a`, including exact-source
+HTTP-cache proof and the recursive OSV scan. Official dependency 4.3.0 appeared
+during the first CI run; two independent, byte-verified synthetic reviews found
+that it still fails all five max-stale mitigation cases. The narrow status update
+at `4b43f2ae` preserves patched 4.2.0, root-only scope and the October 10 expiry.
+Its guard, proof fixture and decision changes leave the R7 workload inputs
+unchanged, as checked through the canonical provenance function. Every subsequent official-status drift still refuses the exception.
+
+The reviewed final-AppImage Linux runner is also integrated at `665e069a`.
+It is registered by merging this preparation PR before the final release tag;
+its validator permits runner revision equal to source revision. After the exact
+final package succeeds, plan and execute must bind the original package receipt,
+source candidate and final artifact digests. No Linux native qualification has
+run yet. Integration passed 29 focused runner/updater/inventory tests, 86 release
+trust tests, architecture and 20 preflight tests. Existing UI and public-release
+site suites passed 997 and 71 tests respectively.
+
+Windows signing uses its existing required-reviewer environment. Read-only
+inspection confirms the authenticated owner is that reviewer and self-review is
+permitted; this is not a demonstrated blocker. The exact pending run must still
+return `current_user_can_approve: true` before the ordinary approval endpoint is
+used under the approved release route. No protection bypass or environment change
+is authorized or needed.
+
+The final download-site update must preserve the hosted owner's then-qualified
+public v1.4 reader and GCP/Worker lineage. Use a separate, clean, receipt-bound
+web-only checkout after the immutable 0.1.27 artifacts exist; do not deploy this
+mixed client checkout over the new public reader. The public reader, matching
+Worker/admin response reader and GCP origin require their separate live gates.
+
+
+## Protected history evidence completed
+
+The complete retry finished successfully at 2026-10-04T04:28:59Z after
+47.8 minutes. The generator installed all ten validated owner-only receipts,
+exited zero and removed its journal. Both exact Node 24.14.0 and 26.2.0 freshness
+checks passed, including rebuilding each decision from all eight measured inputs.
+Each real-history runtime completed two scan/materialize/verify/delete passes;
+all repeated deterministic comparisons matched and preservation/privacy remained
+intact. Independent review found no unexplained receipt changes. The historical
+resource-ceiling decisions remain unresolved, as required by the retained-evidence
+test; no resource-ceiling promotion is claimed.
+
+The hosted owner disclosed a competing 182.20-second synthetic native/compose
+gate during part of this run. Contemporaneous CPU/RSS attribution was unavailable.
+The maintained R7 contract treats these measurements as environment-sensitive and
+does not require an exclusive host for freshness/correctness. Retain the observed
+metrics honestly, with no isolated-timing, comparative-speed or zero-impact claim.
+
+The final native-gate audit found two additional tooling gaps. Reviewed Mac
+production-update v2 is integrated at `8de0e48c`: exact signed 0.1.26 to 0.1.27,
+both architectures, with old owned process identities required to exit before
+success. The old 0.1.20 updater and credential fixture remain available. This is
+source and portable-test evidence; actual production-feed execution follows
+publication. A separate Windows final-installer upgrade runner is under review
+because the maintained publication runbook requires installer upgrade coverage.
+It must preserve one profile across signed 0.1.26 and 0.1.27 without reseeding;
+automatic Windows updater replacement and general credential continuity remain
+outside its claimed scope.
