@@ -6,7 +6,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm, link, symlink, realpath } from
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { fingerprintLinuxFinalFile, LINUX_FINAL_ZIP_EXTRACTOR } from '../scripts/qualify-electron-linux-installed-lifecycle.mjs';
+import { fingerprintLinuxFinalFile, LINUX_FINAL_ZIP_EXTRACTOR, reserveLinuxFinalDirectory } from '../scripts/qualify-electron-linux-installed-lifecycle.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 test('final-byte reads reject links, growth beyond bounds and aliases', async t => {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'linux-final-fingerprint-')); t.after(() => rm(root, { recursive: true, force: true }));
@@ -60,4 +60,13 @@ test('runner admission proves ancestry and same-version source while plan mode c
   const unrelated = git(['rev-parse', 'HEAD']);
   assert.throws(() => preflightLinuxFinalIntake({ ...environment, GITHUB_SHA: unrelated,
     LINUX_FINAL_INTAKE: JSON.stringify({ ...intake, runnerRevision: unrelated }) }, { repositoryRoot: root }), /RUNNER_INVALID/u);
+});
+
+test('acquisition creates only a safe new owned directory and refuses reuse or parent aliases', async t => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'linux-final-reservation-')); t.after(() => rm(root, { recursive: true, force: true }));
+  assert.equal(await reserveLinuxFinalDirectory(root), join(root, '.release-build/linux-final-qualification'));
+  await assert.rejects(reserveLinuxFinalDirectory(root), { code: 'EEXIST' });
+  const unsafe = join(root, 'other'); await mkdir(unsafe);
+  await symlink(join(root, '.release-build'), join(unsafe, '.release-build'));
+  await assert.rejects(reserveLinuxFinalDirectory(unsafe), /PATH_UNSAFE/u);
 });

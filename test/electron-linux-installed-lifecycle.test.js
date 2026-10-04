@@ -101,6 +101,8 @@ test('manual lifecycle lane preserves byte, network, sandbox, FUSE and publicati
   for (const required of ['workflow_dispatch:', 'fetch-depth: 0', 'persist-credentials: false', 'actions: read',
     '--preflight', '--acquire', '--prepare', 'test -c /dev/fuse', '--device /dev/fuse', '--cap-add=SYS_ADMIN',
     '--network none', '--add-host updates.tibotattle.com:127.0.0.1', 'timeout 900s docker run', 'if-no-files-found: error']) assert.ok(workflow.includes(required), required);
+  assert.ok(workflow.indexOf('Install only locked verification dependencies') < workflow.indexOf('Admit exact source package'));
+  assert.ok(workflow.indexOf('Admit exact source package') < workflow.indexOf('Download exact public predecessor'));
   assert.doesNotMatch(workflow, /build-linux-updater-rehearsal|electron-builder|--privileged|--no-sandbox|seccomp=unconfined|apparmor=unconfined|--(?:volume|mount)\b|permissions:\s*write-all|contents: write/u);
   const runtime = await readFile(new URL('../scripts/smoke-electron-linux-final-lifecycle.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(runtime, /APPIMAGE_EXTRACT_AND_RUN:\s*['"]1['"]|ignore-certificate-errors|NODE_TLS_REJECT_UNAUTHORIZED/u);

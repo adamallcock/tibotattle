@@ -671,7 +671,9 @@ its manifest and AppImage digests are pinned in
 `scripts/lib/linux-final-artifact-intake.mjs`. Earlier owner acceptance is not
 reused for the new bytes.
 
-Dispatch `mode=plan` first with the reviewed intake. `mode=execute` also requires
+Dispatch `mode=plan` first with the reviewed intake. Both modes install the
+locked verifier dependencies; plan stops before artifact downloads or application
+execution. `mode=execute` also requires
 `RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE`. The owning preparation entrypoint is
 `scripts/qualify-electron-linux-installed-lifecycle.mjs` (`--preflight`,
 `--acquire`, then `--prepare`); downloads require the workflow's read-only token.

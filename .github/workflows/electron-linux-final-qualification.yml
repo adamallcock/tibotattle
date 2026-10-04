@@ -50,8 +50,6 @@ jobs:
           architecture: x64
           check-latest: false
           package-manager-cache: false
-      - name: Admit exact source package and runner before downloads
-        run: node scripts/qualify-electron-linux-installed-lifecycle.mjs --preflight
       - name: Require native x64 and an actual FUSE device
         if: inputs.mode == 'execute'
         run: |
@@ -60,13 +58,14 @@ jobs:
           test -c /dev/fuse
           node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
       - name: Install only locked verification dependencies
-        if: inputs.mode == 'execute'
         run: |
           set -euo pipefail
           npm install --global corepack@0.34.0 --force --ignore-scripts
           corepack enable
           corepack prepare pnpm@11.9.0 --activate
           pnpm install --frozen-lockfile --ignore-scripts
+      - name: Admit exact source package and runner before artifact downloads
+        run: node scripts/qualify-electron-linux-installed-lifecycle.mjs --preflight
       - name: Check closed intake and archive refusal contracts
         if: inputs.mode == 'execute'
         run: node --test test/electron-linux-installed-lifecycle.test.js test/electron-linux-installed-files.test.mjs test/electron-linux-real-appimage-updater.test.js

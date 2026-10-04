@@ -45,8 +45,11 @@ async function api(path, token) {
     redirect: 'error', signal: AbortSignal.timeout(30000),
   });
   if (!response.ok || Number(response.headers.get('content-length')) > 1024 * 1024) fail('GITHUB_READ_FAILED');
-  const text = await response.text(); if (Buffer.byteLength(text) > 1024 * 1024) fail('GITHUB_READ_FAILED');
-  return JSON.parse(text);
+  const chunks = []; let bytes = 0;
+  for await (const chunk of response.body) {
+    bytes += chunk.length; if (bytes > 1024 * 1024) fail('GITHUB_READ_FAILED'); chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 async function download(url, path, { token, maximum = LIMIT } = {}) {
   // Forward the token only to the fixed GitHub API origin. Redirect downloads
@@ -99,16 +102,25 @@ with zipfile.ZipFile(archive) as z:
             if count != z.getinfo(name).file_size: raise ValueError('entry truncated')
             output.flush(); os.fsync(output.fileno())
 `;
+export async function reserveLinuxFinalDirectory(root) {
+  const directory = join(root, LINUX_FINAL_INPUT), parent = dirname(directory);
+  if (await realpath(root) !== root) fail('PATH_UNSAFE');
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const parentStat = await lstat(parent);
+  if (await realpath(parent) !== parent || !parentStat.isDirectory() || parentStat.isSymbolicLink()
+    || parentStat.uid !== process.getuid() || (parentStat.mode & 0o022) !== 0) fail('PATH_UNSAFE');
+  await mkdir(directory, { mode: 0o700 });
+  return directory;
+}
 export async function acquireLinuxFinalArtifacts(intake, { root = ROOT, token = process.env.GITHUB_TOKEN } = {}) {
   if (typeof token !== 'string' || !token.length) fail('GITHUB_AUTH_REQUIRED');
-  const directory = join(root, LINUX_FINAL_INPUT);
-  await mkdir(directory, { mode: 0o700 });
+  const directory = await reserveLinuxFinalDirectory(root);
   const run = await api(`actions/runs/${intake.packageRunId}`, token);
   validateLinuxFinalPackageRun(run, intake);
   const collection = await api(`actions/runs/${intake.packageRunId}/artifacts?per_page=100`, token);
   if (!Number.isInteger(collection.total_count) || collection.total_count > 100 || !Array.isArray(collection.artifacts)) fail('ARTIFACT_SET_INVALID');
   const matches = collection.artifacts.filter(row => row.name === linuxFinalArtifactName(intake));
-  if (matches.length !== 1 || matches[0].expired || !Number.isSafeInteger(matches[0].id)
+  if (matches.length !== 1 || matches[0].expired !== false || !Number.isSafeInteger(matches[0].id)
     || matches[0].size_in_bytes < 4096 || matches[0].size_in_bytes > LIMIT) fail('ARTIFACT_SET_INVALID');
   const archive = join(directory, 'package.zip');
   await download(`https://api.github.com/repos/${REPO}/actions/artifacts/${matches[0].id}/zip`, archive, { token });
