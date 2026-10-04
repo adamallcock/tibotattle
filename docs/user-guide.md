@@ -90,6 +90,15 @@ Display windows do not delete older local history. The dashboard may show a
 shorter horizon while the local index retains the evidence needed for replay,
 corrections, and longer-term views.
 
+Historical model identification and pricing updates require a completed main
+**Refresh**. Desktop startup requests this refresh once local analysis is
+allowed. Retained session and archived-session logs let the app correct earlier
+unrecognized GPT-6.1 Sol records without changing token totals. An exact stored
+model identity can also be repriced from sufficient preserved token, context
+and time evidence. If a record's model became `unknown` and its original log is
+gone, the app cannot safely reconstruct that identity; missing evidence and
+unsupported historical prices remain explicit.
+
 When local history contains more than one plan, **Allowance** separates the
 plans instead of averaging Plus and Pro reset estimates together. The plan
 selector keeps the headline, history, range, pace and share card on the same
