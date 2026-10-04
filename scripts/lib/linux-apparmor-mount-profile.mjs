@@ -11,7 +11,7 @@ import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fingerprintLinuxFinalFile } from '../qualify-electron-linux-installed-lifecycle.mjs';
 
-export const LINUX_APPARMOR_COMPARISON_SCHEMA = 'tibotattle-linux-apparmor-mount-comparison-v3';
+export const LINUX_APPARMOR_COMPARISON_SCHEMA = 'tibotattle-linux-apparmor-mount-comparison-v4';
 export const LINUX_APPARMOR_COMPARISON_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPARMOR_MOUNT_COMPARISON';
 export const LINUX_APPARMOR_DOCKER_VERSION = '28.0.4';
 const PARSER = '/usr/sbin/apparmor_parser';
@@ -366,6 +366,10 @@ export async function cleanupLinuxAppArmorProfiles({ directory, run, runner, con
 
 const comparisonOutcomes = new Set(['basis_unavailable', 'profile_load_failed', 'baseline_failed', 'tuple_unavailable',
   'candidate_failed', 'negative_unproven', 'interrupted', 'cleanup_failed', 'compared']);
+// Host closure authorizes only an attempt at the separate, owned profile
+// removal checks. Missing in-container proof must still fail probe acceptance.
+const hostClosed = result => result?.row?.containerRemoved === true && result.row.observerStopped === true
+  && result.row.actorTrace?.instanceRemoved === true;
 const clean = result => result?.row?.containerRemoved === true && result.row.observerStopped === true
   && result.row.probe?.cleanup?.childGone === true && result.row.probe.cleanup.mountGone === true;
 const successfulProbe = result => clean(result) && result.row.errorCode === 'none' && result.profileApplied === true
@@ -437,7 +441,7 @@ export async function runLinuxAppArmorComparison(pair, { prepareProfiles, runPro
       const result = await runProbe(stage, role, pair.images[role], name);
       if (!exact(result, ['row', 'tuple', 'profileApplied']) || !validateRow(result.row)
         || result.row.role !== role || result.row.artifactSha256 !== pair.images[role].sha256 || result.row.artifactBytes !== pair.images[role].bytes) refused('basis_unavailable');
-      receipt.cases.push({ stage, ...result }); probePending = !clean(result);
+      receipt.cases.push({ stage, ...result }); probePending = !hostClosed(result);
       return result;
     };
     if (interrupted()) { receipt.outcome = 'interrupted'; return receipt; }

@@ -206,6 +206,59 @@ print(json.dumps(results))
   assert.doesNotMatch(JSON.stringify(result), /filename|comm|\/opt\//u);
 });
 
+test('trace buffer setup admits kernel-rounded 63 KiB only on the bound 4 KiB layout and original cap', () => {
+  const result = syntheticObserver(['configure_trace_buffer'], String.raw`
+def scenario(change):
+    global os, control, local_read
+    writes = []; values = {}; subbuf_reads = [0]
+    os = types.SimpleNamespace(sysconf=lambda name: change.get('page', 4096) if name == 'SC_PAGE_SIZE' else None)
+    def write(name, value):
+        if name != 'buffer_size_kb': raise ValueError()
+        writes.append([name, value])
+        # Actual reviewed kernel rounding: 4080-byte payload per 4096-byte page.
+        pages = (int(value) * 1024 + 4079) // 4080
+        values['buffer_size_kb'] = str((pages * 4080) >> 10)
+        values['buffer_total_size_kb'] = str(int(values['buffer_size_kb']) * change.get('cpus', 4))
+    def read(name):
+        if name == 'buffer_subbuf_size_kb':
+            subbuf_reads[0] += 1
+            return '8' if change.get('drift') and subbuf_reads[0] > 1 else change.get('subbuf', '4')
+        return change.get(name, values[name])
+    control = write; local_read = read
+    try: configure_trace_buffer(); admitted = True
+    except Exception: admitted = False
+    return {'admitted': admitted, 'writes': writes}
+changes = [{}, {'cpus': 8}, {'page': 8192}, {'subbuf': '8'}, {'subbuf': 'synthetic-private-layout'},
+    {'buffer_size_kb': '67'}, {'buffer_size_kb': '64'}, {'buffer_total_size_kb': '513'},
+    {'buffer_total_size_kb': '0'}, {'buffer_total_size_kb': '-1'}, {'buffer_total_size_kb': 'synthetic-private-layout'}, {'drift': True}]
+print(json.dumps([scenario(change) for change in changes]))
+`);
+  const write = [['buffer_size_kb', '63\n']];
+  assert.deepEqual(result.slice(0, 2), [{ admitted: true, writes: write }, { admitted: true, writes: write }]);
+  for (const row of result.slice(2)) assert.equal(row.admitted, false);
+  for (const row of result.slice(2, 5)) assert.deepEqual(row.writes, []);
+  for (const row of result.slice(5)) assert.deepEqual(row.writes, write);
+  assert.doesNotMatch(JSON.stringify(result), /private|layout/u);
+});
+
+test('every trace setup boundary has a fixed closed refusal reason without exposing native readbacks', () => {
+  const reasons = ['trace_instance_setup_unavailable', 'trace_initial_controls_unavailable', 'trace_cpu_layout_unavailable',
+    'trace_buffer_layout_unavailable', 'trace_options_unavailable', 'trace_clock_unavailable', 'trace_event_layout_unavailable',
+    'trace_pid_filter_unavailable', 'trace_pipe_unavailable', 'trace_gate_recheck_unavailable', 'trace_start_unavailable'];
+  assert.deepEqual([...LINUX_MOUNT_KMSG_READER.matchAll(/setup_reason = '([^']+)'/gu)].map(match => match[1]), reasons);
+  assert.match(LINUX_MOUNT_KMSG_READER, /except Exception: incomplete\(setup_reason, True\); raise/u);
+  for (const reason of reasons) {
+    const graph = buildLinuxAppImageActorGraph({ complete: false, reason });
+    assert.deepEqual(graph, { complete: false, reason, actors: new Map() });
+    const value = { schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
+      ...pair.intake, cases: [row('current', { probe: null, errorCode: 'container_failed', appArmorAuditReason: 'reader_failed',
+        actorTrace: { complete: false, reason, instanceRemoved: true } })] };
+    assert.equal(validateLinuxMountDiagnosis(value), value);
+    value.cases[0].actorTrace.reason += '/synthetic-private-readback';
+    assert.equal(validateLinuxMountDiagnosis(value), null);
+  }
+});
+
 test('the actual trace completeness check refuses loss, missing counters, CPU drift and undrained events', () => {
   const result = syntheticObserver(['no_loss'], String.raw`
 text = 'entries: 0\noverrun: 0\ncommit overrun: 0\ndropped events: 0\n'
@@ -442,7 +495,7 @@ test('serial exact-byte comparison stops before the second image when owned cont
   assert.equal(observer.cases.length, 1);
   await assert.rejects(runLinuxMountSequence(pair, async role => row(role, { artifactSha256: 'f'.repeat(64) })), /REFUSED/u);
   for (const mutate of [
-    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v2'; },
+    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v2'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v3'; },
     v => { v.cases[0].probe.environment.appArmor.profile = 'private-profile-marker'; },
     v => { v.cases[0].actorTrace.pid = 77; }, v => { v.cases[0].actorTrace.reason = '/private/trace-marker'; },
     v => { v.cases[0].actorTrace.instanceRemoved = false; }, v => { v.cases[0].actorTrace = { complete: false, reason: 'trace_stream_incomplete', instanceRemoved: true }; },
@@ -701,6 +754,43 @@ test('comparison preserves cleanup and cancellation gates without turning a fail
   assert.doesNotMatch(JSON.stringify(missingBasis), /private-host-details/u);
 });
 
+function failedSetupResult(result) {
+  result.row.probe = null; result.row.errorCode = 'container_failed'; result.tuple = null;
+  result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'reader_failed';
+  result.row.actorTrace = { complete: false, reason: 'trace_buffer_layout_unavailable', instanceRemoved: true };
+}
+
+test('a failed setup can remove its owned profile after host closure without qualifying the probe', async () => {
+  const harness = comparisonHarness({ mutate: failedSetupResult });
+  const result = await runLinuxAppArmorComparison(pair, harness.adapters);
+  assert.equal(result.outcome, 'baseline_failed'); assert.equal(result.cases.length, 1); assert.equal(result.cases[0].row.probe, null);
+  assert.equal(result.profilesRemoved, true); assert.equal(result.profiles.baseline.removed, true); assert.equal(result.qualifiesRelease, false);
+  assert.ok(harness.calls.includes('remove:baseline:true')); assert.ok(!harness.calls.includes('load:candidate'));
+  assert.equal(validateLinuxAppArmorComparison(result, validateRow), result);
+  const incomplete = comparisonHarness({ mutate: result => { result.row.probe.cleanup.childGone = false; } });
+  const unqualified = await runLinuxAppArmorComparison(pair, incomplete.adapters);
+  assert.equal(unqualified.outcome, 'baseline_failed'); assert.equal(unqualified.cases.length, 1); assert.equal(unqualified.profilesRemoved, true);
+  assert.ok(!incomplete.calls.includes('load:candidate'));
+  const removalFailed = comparisonHarness({ mutate: failedSetupResult, failedCleanup: true });
+  const failed = await runLinuxAppArmorComparison(pair, removalFailed.adapters);
+  assert.equal(failed.outcome, 'cleanup_failed'); assert.equal(failed.profilesRemoved, false);
+});
+
+test('absent or unknown host closure never authorizes a profile-removal attempt after setup failure', async () => {
+  for (const field of ['containerRemoved', 'observerStopped', 'instanceRemoved']) for (const value of [false, null, 'unavailable', undefined]) {
+    const harness = comparisonHarness({ mutate: result => {
+      failedSetupResult(result);
+      const target = field === 'instanceRemoved' ? result.row.actorTrace : result.row;
+      if (value === undefined) delete target[field]; else target[field] = value;
+      if (field === 'instanceRemoved') result.row.observerStopped = false;
+    } });
+    const result = await runLinuxAppArmorComparison(pair, harness.adapters);
+    assert.equal(result.outcome, 'cleanup_failed'); assert.equal(result.profilesRemoved, false);
+    assert.ok(harness.calls.includes('remove:baseline:false')); assert.ok(!harness.calls.includes('remove:baseline:true'));
+    assert.ok(!harness.calls.includes('load:candidate'));
+  }
+});
+
 test('comparison changes only the explicit AppArmor selector among container security arguments', () => {
   const base = { role: 'current', nonce: 'a'.repeat(32), runnerRevision: 'b'.repeat(40) };
   const original = linuxMountContainerArguments({ ...base, name: 'tibotattle-mount-diagnosis-current-12345' });
@@ -893,7 +983,7 @@ test('parser operations are bracketed by both bindings, including missing files 
   assert.deepEqual(failed, ['binding', 'operation', 'binding']);
 });
 
-test('comparison v3 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
+test('comparison v4 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
   for (const [provided, expected] of [['abi_missing', 'abi_missing'], ['abi_unsafe', 'abi_unsafe'], ['preprocess_failed', 'preprocess_failed'],
     ['include_remaining', 'include_remaining'], ['parser_config_changed', 'parser_config_changed'], ['private-error-marker', 'unknown'], [undefined, 'unknown']]) {
     const harness = comparisonHarness();
@@ -910,9 +1000,10 @@ test('comparison v3 keeps precise import refusals closed and cannot mislabel an 
   }
   assert.equal(linuxAppArmorImportFailure({ code: 'parser_unavailable', importFailure: 'abi_missing' }), 'none');
   const complete = await runLinuxAppArmorComparison(pair, comparisonHarness().adapters);
-  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v3'); assert.equal(complete.importFailure, 'none');
+  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v4'); assert.equal(complete.importFailure, 'none');
   for (const mutate of [v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v1'; },
-    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v2'; }, v => { delete v.basis.imports; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v2'; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v3'; }, v => { delete v.basis.imports; },
     v => { v.basis.imports.path = '/private/abi-marker'; }, v => { v.basis.imports.abi40Sha256 = 'invalid'; },
     v => { v.importFailure = 'abi_missing'; }]) {
     const changed = structuredClone(complete); mutate(changed); assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);

@@ -18,7 +18,7 @@ import { LINUX_APPARMOR_COMPARISON_CONFIRMATION, normalizeLinuxAppArmorMountTupl
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXEC = '/opt/tibotattle-updater-exec', IMAGE = `${EXEC}/TiboTattle.AppImage`;
 const SCRIPT = 'scripts/diagnose-electron-linux-appimage-mount.mjs';
-export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v3';
+export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v4';
 export const LINUX_MOUNT_DIAGNOSIS_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS';
 const UNKNOWN = 'unavailable', ROLES = ['current', 'next'];
 const PROBE_STAGES = ['default', 'baseline', 'candidate', 'negative'];
@@ -45,6 +45,9 @@ const STAGE_ERRNOS = new Map([['Permission denied', 'EACCES'], ['Operation not p
 const STAGE_VALUES = new Set(['not_observed', 'EACCES', 'EPERM', 'ENOENT', 'other', 'ambiguous']);
 const READER_REASONS = new Set(['none', 'kmsg_open_denied', 'kmsg_open_unavailable', 'reader_timeout', 'reader_failed', 'stream_incomplete']);
 export const LINUX_ACTOR_TRACE_REASONS = new Set(['none', 'not_started', 'tracefs_unavailable', 'trace_layout_unavailable',
+  'trace_instance_setup_unavailable', 'trace_initial_controls_unavailable', 'trace_cpu_layout_unavailable',
+  'trace_buffer_layout_unavailable', 'trace_options_unavailable', 'trace_clock_unavailable', 'trace_event_layout_unavailable',
+  'trace_pid_filter_unavailable', 'trace_pipe_unavailable', 'trace_gate_recheck_unavailable', 'trace_start_unavailable',
   'trace_limits_exceeded', 'gate_identity_unavailable', 'trace_stream_incomplete', 'trace_graph_ambiguous', 'trace_cleanup_failed', 'reader_failed', 'reader_timeout']);
 const AUDIT_REASONS = new Set(['not_started', 'not_evaluated', 'observer_start_failed', ...READER_REASONS.values(),
   ...LINUX_ACTOR_TRACE_REASONS, 'launcher_gate_failed', 'profile_unavailable', 'probe_identity_unavailable', 'probe_cleanup_unproven', 'audit_window_incomplete', 'no_observed_mount_denial',
@@ -461,6 +464,17 @@ def local_read(name, limit=16384):
         if len(data) > limit: raise ValueError()
         return data.decode('utf-8', 'strict')
     finally: os.close(handle)
+def configure_trace_buffer():
+    # x64 Linux v6.14: 4 KiB subbuffers carry 4080 bytes after the 16-byte
+    # header. A 63 KiB request uses 16 data-ring pages (64 KiB), readback 63.
+    # A 64 KiB request instead rounds up to 17 pages/readback 67.
+    # https://github.com/torvalds/linux/blob/v6.14/kernel/trace/ring_buffer.c
+    if os.sysconf('SC_PAGE_SIZE') != 4096 or local_read('buffer_subbuf_size_kb').strip() != '4': raise ValueError()
+    control('buffer_size_kb', '63\n')
+    total = local_read('buffer_total_size_kb').strip()
+    if local_read('buffer_subbuf_size_kb').strip() != '4' or local_read('buffer_size_kb').strip() != '63': raise ValueError()
+    if not re.fullmatch(r'[1-9][0-9]*', total) or int(total) > 512: raise ValueError()
+
 def no_loss(cpu_set, drained=False):
     if cpus() != cpu_set: return False
     for cpu in cpu_set:
@@ -654,6 +668,7 @@ try:
         raise
     os.lseek(fd, 0, os.SEEK_END)
     start = time.monotonic_ns() // 1000
+    setup_reason = 'trace_instance_setup_unavailable'
     try:
         for intent in (False, True):
             try: os.lstat(journal_path(intent)); removed = False; raise ValueError()
@@ -668,19 +683,24 @@ try:
         instance_fd = os.open(instance, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         opened = os.fstat(instance_fd)
         if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid) != (instance_identity.st_dev, instance_identity.st_ino, instance_identity.st_mode, instance_identity.st_uid): raise ValueError()
+        setup_reason = 'trace_initial_controls_unavailable'
         control('tracing_on', '0\n')
         if local_read('tracing_on').strip() != '0' or local_read('current_tracer').strip() != 'nop' or local_read('events/enable').strip() != '0': raise ValueError()
         if local_read('set_event_pid').strip() or local_read('set_event_notrace_pid').strip(): raise ValueError()
+        setup_reason = 'trace_cpu_layout_unavailable'
         cpu_set = cpus()
         listed = {int(name[3:]) for name in os.listdir(instance + '/per_cpu') if re.fullmatch(r'cpu[0-9]+', name)}
         if listed != cpu_set: raise ValueError()
-        control('buffer_size_kb', '64\n')
-        if local_read('buffer_size_kb').strip() != '64' or int(local_read('buffer_total_size_kb').strip()) > 512: raise ValueError()
+        setup_reason = 'trace_buffer_layout_unavailable'
+        configure_trace_buffer()
+        setup_reason = 'trace_options_unavailable'
         control('options/overwrite', '0\n'); control('options/event-fork', '1\n')
         if local_read('options/overwrite').strip() != '0' or local_read('options/event-fork').strip() != '1' or local_read('options/context-info').strip() != '1': raise ValueError()
+        setup_reason = 'trace_clock_unavailable'
         if 'mono' not in local_read('trace_clock').replace('[', '').replace(']', '').split(): raise ValueError()
         control('trace_clock', 'mono\n')
         if '[mono]' not in local_read('trace_clock').split(): raise ValueError()
+        setup_reason = 'trace_event_layout_unavailable'
         formats = {'fork': 'comm=%s pid=%d child_comm=%s child_pid=%d', 'exec': 'filename=%s pid=%d old_pid=%d', 'exit': 'comm=%s pid=%d prio=%d'}
         for kind, expected in formats.items():
             prefix = 'events/sched/sched_process_' + kind + '/'
@@ -688,14 +708,18 @@ try:
             if local_read(prefix + 'filter').strip() != 'none' or any(line.strip() and not line.startswith('#') for line in local_read(prefix + 'trigger').splitlines()): raise ValueError()
             control(prefix + 'enable', '1\n')
             if local_read(prefix + 'enable').strip() != '1': raise ValueError()
+        setup_reason = 'trace_pid_filter_unavailable'
         control('set_event_pid', str(root_pid) + '\n')
         if local_read('set_event_pid').split() != [str(root_pid)] or not no_loss(cpu_set): raise ValueError()
+        setup_reason = 'trace_pipe_unavailable'
         trace_fd = os.open('trace_pipe', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=instance_fd)
+        setup_reason = 'trace_gate_recheck_unavailable'
         if verify_gate() != ((root_pid, root_start), profile): raise ValueError()
+        setup_reason = 'trace_start_unavailable'
         control('tracing_on', '1\n')
         if local_read('tracing_on').strip() != '1': raise ValueError()
         armed = True
-    except Exception: incomplete('trace_layout_unavailable', True); raise
+    except Exception: incomplete(setup_reason, True); raise
     emit({'kind': 'ready', 'start': start, 'rootPid': root_pid})
     pending = ''
     while time.monotonic_ns() // 1000 - start < 30000000:
