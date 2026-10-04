@@ -49,7 +49,9 @@
       "callers": [
         "test/release-publication.test.js",
         "docs/runbooks/release-publication-reconciliation.md",
-        "scripts/publish-electron-stable-feed.mjs"
+        "scripts/publish-electron-stable-feed.mjs",
+        "scripts/publish-macos-qualification-artifacts.mjs",
+        "scripts/lib/macos-qualification-artifact-publication.mjs"
       ],
       "decision": "retain_as_reviewed_release_support",
       "provenance": "docs/runbooks/release-publication-reconciliation.md",
@@ -164,7 +166,9 @@
         "apps/worker/scripts/telemetry-runtime-reconciliation.check.mjs",
         "apps/worker/scripts/telemetry-runtime-reconciliation.mjs",
         "apps/worker/scripts/typed-forward-migration.check.mjs",
-        "apps/worker/scripts/typed-forward-migration.mjs"
+        "apps/worker/scripts/typed-forward-migration.mjs",
+        "scripts/lib/macos-qualification-artifact-publication.mjs",
+        "test/macos-qualification-artifact-publication.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",
@@ -961,7 +965,8 @@
         "test/electron-macos-qualification-identity.test.mjs",
         "docs/runbooks/macos-stable-release-runbook.md",
         "scripts/lib/macos-credential-qualification-intake.mjs",
-        "scripts/smoke-electron-macos-production-update.mjs"
+        "scripts/smoke-electron-macos-production-update.mjs",
+        "scripts/lib/macos-qualification-artifact-publication.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1274,7 +1279,8 @@
         "scripts/publish-sparkle-update.js",
         "test/generate-sparkle-appcast-stable-feed.test.js",
         "test/sparkle-signed-feed-validation.test.js",
-        "scripts/smoke-electron-macos-sparkle-transition.mjs"
+        "scripts/smoke-electron-macos-sparkle-transition.mjs",
+        "scripts/lib/macos-qualification-artifact-publication.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": null,
@@ -2572,6 +2578,38 @@
       "legacyPaths": []
     },
     {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/publish-macos-qualification-artifacts.mjs",
+      "callers": [
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/macos-qualification-artifact-publication.test.js"
+      ],
+      "stableAliasReason": "Explicit immutable qualification-artifact writes require an approved exact plan and held artifact owner; default planning is read-only.",
+      "stableAlias": null,
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/macos-qualification-artifact-publication.mjs",
+      "callers": [
+        "scripts/publish-macos-qualification-artifacts.mjs",
+        "test/macos-qualification-artifact-publication.test.js"
+      ],
+      "stableAliasReason": "Closed internal qualification plan, snapshot, publication and reconciliation support; not a product command.",
+      "stableAlias": null,
+      "additionalAliases": [],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "reusable_benchmark",
       "owner": "local_timing_research",
       "canonicalPath": "tools/reports/inference-timing/parser.mjs",
@@ -2798,7 +2836,8 @@
         "scripts/smoke-electron-macos-credentials.mjs",
         "scripts/lib/macos-credential-qualification-intake.mjs",
         "test/smoke-electron-macos-credentials.test.mjs",
-        "test/fixtures/macos-keychain-migration/README.md"
+        "test/fixtures/macos-keychain-migration/README.md",
+        "scripts/lib/macos-qualification-artifact-publication.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -2814,7 +2853,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-macos-credentials.yml",
-        "test/smoke-electron-macos-credentials.test.mjs"
+        "test/smoke-electron-macos-credentials.test.mjs",
+        "scripts/lib/macos-qualification-artifact-publication.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",

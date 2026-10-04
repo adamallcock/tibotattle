@@ -902,6 +902,74 @@ The lock coordinates participating writers; it does not supply conditional R2
 creation or fence legacy and external writers. Merely holding it does not prove
 immutable path admission or authorize publication.
 
+`scripts/publish-macos-qualification-artifacts.mjs` is the separate closed
+writer for the macOS qualification namespace. Its default `--plan` mode is
+local and read-only. A reviewed proposal binds the exact runner and source
+candidate, complete object set and hashes, and the concurrent production
+operation's object keys for an explicit disjointness check. Native trust
+inspection and approval of those concrete bytes remain separate prerequisites.
+
+The closed proposal schema is `tibotattle-macos-qualification-artifacts-v1`.
+It contains `identity` (the same eight fields admitted by the empty-profile
+lane), the unchanged `sourceCandidate`, `fixtureOperationId` (null without a
+fixture), `objects`, and `productionObjectKeys`. Each object contains exactly
+`family`, `localPath` relative to the artifact root, `sha256`, and `bytes`. An
+empty production key set needs the operator's verified no-overlap basis; it is
+not an inference that no production operation exists.
+
+The only admitted objects are the candidate DMG and optional signed test
+`appcast.xml` under its exact source/bundle/DMG-digest prefix, and the credential
+lane's optional sealed fixture ZIP under its exact runner/operation/archive-digest
+prefix. Object names, MIME types and cache policies are derived from those closed
+families. Arbitrary keys, stable feeds, production appcasts and deletions are not
+accepted. Optional appcasts must pass the existing signed-feed validator against
+the exact DMG; fixture archives retain the existing closed file inventory.
+
+`--prepare` reserves a new private operation inside `.release-build`, snapshots
+and verifies all local bytes before remote I/O, and retains the exact plan.
+Explicit `--publish` requires its approved digest, confirmation and the held
+immutable artifact owner. Before remote I/O, the writer verifies the parentless
+commit, empty tree and closed owner record, whose `id` matches the operation,
+`sourceCommit` names the **candidate source**, and `planSha256` binds that exact
+plan. The separately admitted runner may be a reviewed descendant. The tool
+never acquires, steals or releases the remote lock.
+
+```sh
+node scripts/publish-macos-qualification-artifacts.mjs --plan \
+  --artifact-root <verified-artifacts> --proposal <proposal.json>
+node scripts/publish-macos-qualification-artifacts.mjs --prepare \
+  --artifact-root <verified-artifacts> --proposal <proposal.json> \
+  --operation-directory <new-private-operation>
+```
+
+After exact-plan review and owner acquisition, the explicit writer is:
+
+```sh
+node scripts/publish-macos-qualification-artifacts.mjs --publish \
+  --artifact-root <verified-artifacts> --proposal <proposal.json> \
+  --operation-directory <existing-private-operation> \
+  --approved-plan-sha256 <reviewed-plan-digest> --coordination-owner <held-owner> \
+  --confirm PUBLISH_IMMUTABLE_MAC_QUALIFICATION_ARTIFACTS
+```
+
+Use the plan digest returned by preparation and the owner bound to its operation
+ID. The pinned Wrangler R2
+[streaming object commands](https://developers.cloudflare.com/workers/wrangler/commands/r2/)
+remain the transport; credentials stay in the existing secret store.
+
+The writer checks authoritative R2 state, refuses existing different bytes,
+records durable intent before each upload, and checks authoritative and public
+readback. Interrupted or uncertain writes require explicit GET-only
+`--reconcile --operation-directory <existing-private-operation>
+--approved-plan-sha256 <reviewed-plan-digest> --coordination-owner <held-owner>`.
+Reconciliation reads the retained plan and snapshots, so moved original artifacts
+or unrelated working-tree edits cannot block that read-only recovery. It still
+verifies the historical candidate/runner identities and exact held owner. A
+resumed publication is permitted only after successful reconciliation and fresh
+clean-source/local-input validation. Preserve the journal and owner until the completed result has
+been reviewed. This publishes qualification inputs only and does not qualify
+a native installation, updater journey or stable release.
+
 A separately reviewed GitHub-only release operation may use the same artifact
 coordination factory for an exact new-version draft, its complete allowlisted
 asset set, and finalization as an immutable release. Its closed plan must also

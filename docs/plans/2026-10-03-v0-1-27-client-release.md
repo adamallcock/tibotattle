@@ -48,7 +48,7 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 | Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Complete protected retry finished at 04:28:59 UTC; all ten receipts validated and both exact-runtime freshness checks passed | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Complete client/shared suite passed 5,885 tests with zero failures and 44 existing skips; Worker dry packaging and staging checks passed | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Four-target unsigned CI source preparation and downloaded artifact identities verified at 744390a9; final signed-byte gates await Apple agreement and publication window | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Production candidates | Four-target unsigned preparation verified; private ARM 104d39b1 signed, notarized and independently inspected; hosted identity plan passed; final native/publication gates remain | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
@@ -445,8 +445,56 @@ they still advertise 0.1.26 and must be freshly compared before publication. The
 closed Windows predecessor intake and RSA-4096 diagnostic public-key workflow
 inputs are also prepared; no signing material was printed.
 
-The remaining release gates are unchanged: Apple developer agreement acceptance,
-qualified live hosted compatibility, actual UTC release-date/source/tag freeze,
-four final artifacts, signed installed journeys, canonical publication evidence,
-publication and live updater/site/tap readback. Preparation merge does not satisfy
-those gates or publish version 0.1.27.
+The remaining release gates are qualified live hosted compatibility, actual UTC
+release-date/source/tag freeze, four final artifacts, signed installed journeys,
+canonical publication evidence, publication and live updater/site/tap readback.
+Preparation merge does not satisfy those gates or publish version 0.1.27.
+
+
+## October 4 private candidate qualification
+
+Preparation PR [#263](https://github.com/adamallcock/tibotattle/pull/263) merged
+at `104d39b166e5f90600b7cd6df0bf0c4a03a2f35e`; all four post-merge checks passed.
+The owner accepted the Apple agreement, and the existing notarization profile
+then passed read-only access. A bounded private ARM build at that exact clean
+source completed app and outer-DMG signing, notarization, stapling and Gatekeeper
+checks. Independent inspection verified source/build identity, matching app
+payloads in the builder output, ZIP and DMG, and final updater metadata bound to
+the sealed artifact bytes. No app was launched or installed by this local pass.
+
+The [hosted empty-profile plan](https://github.com/adamallcock/tibotattle/actions/runs/37187424000)
+also passed for the exact private candidate, and its small retained receipt was
+downloaded and digest-verified. Planning admits identity only; it does not
+download the candidate or establish installed behavior. Its required immutable
+test-artifact upload route is being completed before disposable native execution.
+This transport work must retain the separate artifact lock, exact path/hash
+allowlist, disjointness from production operations, durable intent and refusal
+of conflicting or uncertain writes. It cannot publish stable discovery feeds.
+
+The private build retains version 0.1.27, bundle 1035 and build 2026100301, but
+release notes remain Unreleased and no final tag exists. A later dated-source
+change requires fresh final artifacts and their corresponding native proof.
+Private signing success does not establish public availability or complete
+hosted compatibility. The hosted owner has separately deployed and verified its
+authenticated private origin and paused jobs; public traffic and new-contract
+qualification remain separate gates under that owner's control.
+
+The immutable transport implementation now has a closed candidate-bound object
+allowlist, exact owner-record binding, prepared snapshots, bounded authenticated
+transfers and GET-only interrupted-operation reconciliation. Its 27 focused
+regressions pass inside an 88-test integration run that also covers existing Mac
+qualification, inventory, stable-writer and R7 freshness contracts. The owning
+macOS transition/signature/publication lane passes 127 tests; architecture,
+documentation and 20 preflight tests also pass. This is source validation; no
+immutable test upload or native installed execution is established by it.
+
+A separate bounded synthetic ARM credential fixture was compiled and signed
+from unchanged fixture sources at `104d39b1`. Its designated requirement,
+hardened runtime, empty entitlements and closed archive inventory are verified.
+An initial inline-requirement command syntax failure was preserved; unchanged
+compiled bytes were verified before the corrected signing invocation succeeded.
+All owned processes stopped, and the fixture was never executed locally.
+The existing v1 hosted route remains applicable: its prior 0.1.20-to-0.1.26
+credential journey passed, and 0.1.27 still requires fresh execution with the
+new signed fixture. Keep that credential result separate from the later exact
+0.1.26-to-0.1.27 production updater result.
