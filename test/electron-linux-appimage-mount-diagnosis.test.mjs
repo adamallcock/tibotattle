@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { LINUX_MOUNT_DIAGNOSIS_SCHEMA, LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, LINUX_MOUNT_KMSG_READER,
-  normalizeLinuxMountPolicy, createLinuxMountErrorClassifier, selectLinuxMountProbeMount,
+  normalizeLinuxMountPolicy, createLinuxMountErrorClassifier, selectLinuxMountProbeMount, buildLinuxAppImageActorGraph, linuxAppImageGateArguments,
   validateLinuxMountDiagnosis, runLinuxMountSequence, linuxMountPreflightEnvironment,
   linuxMountContainerArguments, linuxMountCleanupArguments, linuxMountOwnedProcessGone, linuxMountAuditReaderReason, correlateLinuxMountAudit, projectLinuxMountProbeFacts } from '../scripts/diagnose-electron-linux-appimage-mount.mjs';
 
@@ -33,10 +33,15 @@ function probe() {
 const pair = { intake: { runnerRevision: 'b'.repeat(40), sourceRevision: 'c'.repeat(40) },
   images: { current: { sha256: 'd'.repeat(64), bytes: 8192 }, next: { sha256: 'e'.repeat(64), bytes: 8193 } } };
 function row(role, changes = {}) { return { role, artifactSha256: pair.images[role].sha256, artifactBytes: pair.images[role].bytes,
-  probe: probe(), errorCode: 'none', appArmorMountDenial: 'unavailable', appArmorAuditReason: 'no_observed_mount_denial', containerRemoved: true, observerStopped: true, ...changes }; }
+  probe: probe(), errorCode: 'none', appArmorMountDenial: 'unavailable', appArmorAuditReason: 'no_observed_mount_denial', containerRemoved: true, observerStopped: true,
+  actorTrace: { complete: true, reason: 'none', instanceRemoved: true }, ...changes }; }
+function actorEvents() {
+  return [{ type: 'exec', pid: 76, oldPid: 76, image: true }, { type: 'fork', pid: 77, parent: 76 },
+    { type: 'exit', pid: 77 }, { type: 'exit', pid: 76 }];
+}
 function auditFixture() {
-  return { profile: 'docker-default', temporary, start: 100, end: 200,
-    observations: new Map([[77, { start: '123', ambiguous: false, first: 120, last: 180 }]]),
+  return { profile: 'docker-default', temporary, containerRemoved: true,
+    graph: buildLinuxAppImageActorGraph({ rootPid: 76, events: actorEvents(), complete: true }),
     audit: { ready: true, closed: true, complete: true, reason: 'none', start: 90, end: 210, records: [
       { time: 150, message: `audit: type=1400 audit(1790000000.123:44): apparmor="DENIED" operation="mount" profile="docker-default" name="${target}/" pid=77 comm="fusermount" srcname="${image}" fstype="fuse" flags="rw, nosuid, nodev"` },
     ] } };
@@ -44,11 +49,227 @@ function auditFixture() {
 
 // The owning native lane already requires Python for exact artifact intake.
 // Compile the exact embedded observer without running any of its host reads.
-test('the exact embedded read-only observer compiles without executing it', () => {
+test('the exact embedded private observer compiles without executing it', () => {
   const result = spawnSync('python3', ['-c', "import sys; compile(sys.stdin.buffer.read(), '<mount-observer>', 'exec')"], {
     input: LINUX_MOUNT_KMSG_READER, stdio: ['pipe', 'ignore', 'ignore'], timeout: 3000, maxBuffer: 4096,
   });
   assert.equal(result.status, 0); assert.equal(result.signal, null); assert.equal(result.error, undefined);
+});
+
+test('kernel actor births retain a fast FUSE child without equating audit delivery with its lifetime', () => {
+  const input = auditFixture();
+  assert.deepEqual([...input.graph.actors.values()], [
+    { pid: 76, birth: 0, parent: null, depth: 0, appImage: true, alive: false },
+    { pid: 77, birth: 2, parent: 76, depth: 1, appImage: true, alive: false },
+  ]);
+  // A queued kernel audit arrives after the complete exit sequence was read.
+  // kmsg delivery's clock need not have Python CLOCK_MONOTONIC's offset.
+  for (const time of [1, 209, 900000000000]) {
+    input.audit.records[0].time = time;
+    assert.deepEqual(correlateLinuxMountAudit(input), { denial: true, reason: 'owned_mount_denial' });
+  }
+  assert.doesNotMatch(JSON.stringify([...input.graph.actors.values()]), /start|first|last|timestamp|comm|filename/u);
+  input.containerRemoved = false;
+  assert.deepEqual(correlateLinuxMountAudit(input), { denial: 'unavailable', reason: 'probe_cleanup_unproven' });
+});
+
+test('actor attribution refuses wrong ancestry, missing exec, ambiguous task mapping and PID reuse', () => {
+  for (const events of [
+    actorEvents().map(event => event.type === 'fork' ? { ...event, parent: 79 } : event),
+    actorEvents().slice(1),
+    actorEvents().map(event => event.type === 'exec' ? { ...event, image: false } : event),
+    actorEvents().map(event => event.type === 'exec' ? { ...event, oldPid: 75 } : event),
+    [...actorEvents().slice(0, 3), { type: 'fork', pid: 77, parent: 76 }, { type: 'exit', pid: 77 }, { type: 'exit', pid: 76 }],
+    [...actorEvents(), { type: 'fork', pid: 78, parent: 76 }],
+    actorEvents().slice(0, -1),
+    actorEvents().map(event => event.type === 'fork' ? { ...event, command: 'synthetic-private-marker' } : event),
+  ]) {
+    const graph = buildLinuxAppImageActorGraph({ rootPid: 76, events, complete: true });
+    assert.equal(graph.complete, false); assert.equal(graph.reason, 'trace_graph_ambiguous'); assert.equal(graph.actors.size, 0);
+  }
+  const input = auditFixture();
+  input.graph = buildLinuxAppImageActorGraph({ rootPid: 76, complete: true, events: [
+    { type: 'fork', pid: 77, parent: 76 }, { type: 'exec', pid: 76, oldPid: 76, image: true },
+    { type: 'exit', pid: 77 }, { type: 'exit', pid: 76 },
+  ] });
+  assert.equal(input.graph.complete, true); assert.equal(input.graph.actors.get(77).appImage, false);
+  assert.equal(correlateLinuxMountAudit(input).reason, 'owned_actor_not_correlated');
+  const priorPids = new Set([77]);
+  assert.equal(buildLinuxAppImageActorGraph({ rootPid: 76, events: actorEvents(), complete: true, priorPids }).reason, 'trace_graph_ambiguous');
+  assert.deepEqual([...priorPids], [77]);
+});
+
+test('actor graph bounds and incomplete capture never turn into a complete ownership claim', () => {
+  const build = changes => buildLinuxAppImageActorGraph({ rootPid: 76, events: actorEvents(), complete: true, ...changes });
+  for (const reason of ['tracefs_unavailable', 'trace_layout_unavailable', 'gate_identity_unavailable', 'trace_stream_incomplete',
+    'trace_cleanup_failed', 'reader_failed', 'reader_timeout']) {
+    const graph = build({ complete: false, reason });
+    assert.deepEqual(graph, { complete: false, reason, actors: new Map() });
+  }
+  assert.equal(build({ complete: false }).reason, 'trace_stream_incomplete');
+  assert.equal(build({ complete: 'yes' }).reason, 'trace_stream_incomplete');
+  assert.equal(build({ complete: false, reason: 'synthetic-private-marker' }).reason, 'trace_stream_incomplete');
+  const fan = [{ type: 'exec', pid: 76, oldPid: 76, image: true }, ...Array.from({ length: 128 }, (_, index) => ({ type: 'fork', pid: 1000 + index, parent: 76 }))];
+  const deep = [{ type: 'exec', pid: 76, oldPid: 76, image: true }, ...Array.from({ length: 33 }, (_, index) => ({ type: 'fork', pid: 77 + index, parent: 76 + index }))];
+  for (const changes of [{ events: Array(4097).fill({ type: 'exit', pid: 76 }) }, { events: fan }, { events: deep },
+    { priorPids: new Set(Array.from({ length: 640 }, (_, index) => 1000 + index)) }]) {
+    assert.deepEqual(build(changes), { complete: false, reason: 'trace_limits_exceeded', actors: new Map() });
+  }
+});
+
+test('the stopped launcher replaces itself with exactly the unchanged mount-only image and C environment', () => {
+  const environment = { TIBOTATTLE_MOUNT_PROBE_NONCE: 'a'.repeat(32), TMPDIR: temporary,
+    LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C', ELECTRON_DISABLE_SANDBOX: '0' };
+  assert.deepEqual(linuxAppImageGateArguments(environment), [image, '--appimage-mount']);
+  for (const change of [{ TMPDIR: '/private/synthetic-other' }, { TIBOTATTLE_MOUNT_PROBE_NONCE: 'b'.repeat(32) },
+    { LC_ALL: 'en_US.UTF-8' }, { LANG: 'en_US.UTF-8' }, { LANGUAGE: 'en_US.UTF-8' },
+    { APPIMAGE_EXTRACT_AND_RUN: '1' }, { ELECTRON_DISABLE_SANDBOX: '1' }]) {
+    assert.throws(() => linuxAppImageGateArguments({ ...environment, ...change }), /^Error: LINUX_MOUNT_DIAGNOSIS_REFUSED$/u);
+  }
+});
+
+// Execute only selected pure function definitions from the exact observer. The
+// observer's imports, top-level launch, /proc reads and tracefs access never run.
+function syntheticObserver(functions, fixture) {
+  const driver = String.raw`
+import ast, json, re, stat, sys, types
+payload = json.loads(sys.stdin.read())
+tree = ast.parse(payload['source'])
+selected = [item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name in payload['functions']]
+if sorted(item.name for item in selected) != sorted(payload['functions']): raise ValueError()
+exec(compile(ast.Module(body=selected, type_ignores=[]), '<synthetic-observer>', 'exec'))
+` + fixture;
+  const result = spawnSync('python3', ['-c', driver], { input: JSON.stringify({ source: LINUX_MOUNT_KMSG_READER, functions }),
+    encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], timeout: 3000, maxBuffer: 65536 });
+  assert.equal(result.status, 0); assert.equal(result.signal, null); assert.equal(result.error, undefined);
+  return JSON.parse(result.stdout);
+}
+
+test('the actual kernel trace parser projects closed actor events and refuses unknown or over-budget records', () => {
+  const result = syntheticObserver(['trace_line'], String.raw`
+rows = []
+events = 0
+emit = rows.append
+prefix = 'synthetic-76 [001] .... 1.000001: sched_process_'
+trace_line(prefix + 'exec: filename=/opt/tibotattle-updater-exec/TiboTattle.AppImage pid=76 old_pid=76', {1})
+trace_line(prefix + 'fork: comm=synthetic pid=76 child_comm=private-marker child_pid=77', {1})
+trace_line('private-marker-77 [001] .... 1.000002: sched_process_exit: comm=private-marker pid=77 prio=120', {1})
+trace_line(prefix + 'exec: filename=/private/synthetic-other pid=76 old_pid=76', {1})
+refused = []
+for line in [prefix + 'fork: comm=x pid=75 child_comm=y child_pid=77',
+    prefix.replace('[001]', '[002]') + 'exit: comm=x pid=76 prio=120',
+    'CPU:1 [LOST 1 EVENTS]', prefix + 'unknown: private-marker',
+    prefix + 'exec: filename=' + 'x' * 4097 + ' pid=76 old_pid=76']:
+    try: trace_line(line, {1}); refused.append(False)
+    except ValueError: refused.append(True)
+events = 4096
+try: trace_line(prefix + 'exit: comm=x pid=76 prio=120', {1}); refused.append(False)
+except OverflowError: refused.append(True)
+print(json.dumps({'rows': rows, 'refused': refused}))
+`);
+  assert.deepEqual(result.rows, [
+    { kind: 'actor', event: { type: 'exec', pid: 76, oldPid: 76, image: true } },
+    { kind: 'actor', event: { type: 'fork', parent: 76, pid: 77 } },
+    { kind: 'actor', event: { type: 'exit', pid: 77 } },
+    { kind: 'actor', event: { type: 'exec', pid: 76, oldPid: 76, image: false } },
+  ]);
+  assert.deepEqual(result.refused, Array(6).fill(true));
+  assert.doesNotMatch(JSON.stringify(result), /private|synthetic|filename|comm|\/opt\//u);
+});
+
+test('the actual trace drain spans chunks and refuses byte overflow, partial tails and unexpected EOF', () => {
+  const result = syntheticObserver(['trace_line', 'drain_trace'], String.raw`
+def scenario(chunks, initial=0, final=False):
+    global os, trace_fd, used, trace_pending, events, emit
+    pending = list(chunks); rows = []
+    def consume(handle, size):
+        if not pending: raise BlockingIOError()
+        return pending.pop(0)
+    os = types.SimpleNamespace(read=consume)
+    trace_fd = 3; used = initial; trace_pending = b''; events = 0; emit = rows.append
+    error = None
+    try: drain_trace({1}, final)
+    except OverflowError: error = 'bounded'
+    except Exception: error = 'incomplete'
+    return {'error': error, 'completeLine': not bool(trace_pending), 'rows': rows}
+line = b'x-76 [001] .... 1.000001: sched_process_exec: filename=/opt/tibotattle-updater-exec/TiboTattle.AppImage pid=76 old_pid=76\n'
+results = [scenario([line[:31], line[31:]]), scenario([b'x' * 8193]), scenario([b'x'], 262144),
+    scenario([b'']), scenario([b''], final=True), scenario([line[:-1], b''], final=True), scenario([b'\xff\n'])]
+print(json.dumps(results))
+`);
+  assert.deepEqual(result[0], { error: null, completeLine: true, rows: [{ kind: 'actor', event: { type: 'exec', pid: 76, oldPid: 76, image: true } }] });
+  assert.equal(result[1].error, 'bounded'); assert.equal(result[2].error, 'bounded');
+  assert.equal(result[3].error, 'incomplete');
+  assert.deepEqual(result[4], { error: null, completeLine: true, rows: [] });
+  assert.deepEqual(result[5], { error: null, completeLine: false, rows: [] });
+  assert.equal(result[6].error, 'incomplete');
+  assert.doesNotMatch(JSON.stringify(result), /filename|comm|\/opt\//u);
+});
+
+test('the actual trace completeness check refuses loss, missing counters, CPU drift and undrained events', () => {
+  const result = syntheticObserver(['no_loss'], String.raw`
+text = 'entries: 0\noverrun: 0\ncommit overrun: 0\ndropped events: 0\n'
+cpus = lambda: {0, 1}
+local_read = lambda name, limit: text
+values = [no_loss({0, 1}, True)]
+for text in ['entries: 1\noverrun: 0\ncommit overrun: 0\ndropped events: 0\n',
+    'entries: 0\noverrun: 1\ncommit overrun: 0\ndropped events: 0\n',
+    'entries: 0\noverrun: 0\ncommit overrun: 1\ndropped events: 0\n',
+    'entries: 0\noverrun: 0\ncommit overrun: 0\ndropped events: 1\n',
+    'entries: 0\noverrun: 0\ncommit overrun: 0\n',
+    'entries: 0\noverrun: 0\ncommit overrun: 0\ndropped events: 0\noverrun: 0\n']:
+    values.append(no_loss({0, 1}, True))
+text = 'entries: 0\noverrun: 0\ncommit overrun: 0\ndropped events: 0\n'
+values.append(no_loss({0}, True))
+print(json.dumps(values))
+`);
+  assert.deepEqual(result, [true, ...Array(7).fill(false)]);
+});
+
+test('trace recovery removes only a journaled inode after both owned processes are gone', () => {
+  const result = syntheticObserver(['cleanup_record'], String.raw`
+record = {'observerPid': 91, 'observerStart': '111', 'initPid': 92, 'initStart': '222',
+    'rootKind': 'tracing', 'instance': 'tibotattle-synthetic', 'device': '7', 'inode': '8'}
+base = types.SimpleNamespace(st_mode=0o40700, st_uid=0, st_dev=7, st_ino=8)
+expected = '/synthetic-tracefs/instances/tibotattle-synthetic'
+def scenario(change):
+    global owned_journal, gone, trace_root, os, control, local_read, instance_fd
+    calls = []; exists = [not change.get('absent', False)]
+    def journal(intent=False):
+        if change.get('denied'): raise PermissionError()
+        if change.get('no_journal') or change.get('intent_only') and not intent: raise FileNotFoundError()
+        return dict(record, rootKind='debug' if change.get('wrong_root') else 'tracing')
+    def info(path):
+        if path != expected: raise ValueError()
+        if not exists[0]: raise FileNotFoundError()
+        return types.SimpleNamespace(**{**vars(base), **({'st_ino': 9} if change.get('wrong_inode') else {})})
+    def remove(path):
+        if path != expected: raise ValueError()
+        calls.append('remove'); exists[0] = False
+    def write(name, value):
+        calls.append(name)
+        if change.get('write_denied'): raise PermissionError()
+    owned_journal = journal
+    gone = lambda pid, ticks: not (change.get('observer_alive') and pid == 91 or change.get('init_alive') and pid == 92)
+    trace_root = lambda: ('/synthetic-tracefs', 'tracing')
+    os = types.SimpleNamespace(lstat=info, open=lambda *args, **kwargs: 3,
+        fstat=lambda handle: types.SimpleNamespace(**{**vars(base), **({'st_ino': 99} if change.get('changed_descriptor') else {})}), close=lambda handle: None, rmdir=remove,
+        O_RDONLY=0, O_DIRECTORY=0, O_NOFOLLOW=0,
+        path=types.SimpleNamespace(realpath=lambda path: path, lexists=lambda path: exists[0]))
+    control = write
+    local_read = lambda name: '1' if change.get('still_tracing') else '0'
+    instance_fd = None
+    try: removed = cleanup_record()
+    except Exception: removed = False
+    return {'removed': removed, 'calls': calls}
+changes = [{}, {'observer_alive': True}, {'init_alive': True}, {'wrong_inode': True}, {'wrong_root': True},
+    {'intent_only': True}, {'denied': True}, {'write_denied': True}, {'still_tracing': True}, {'changed_descriptor': True},
+    {'no_journal': True}, {'intent_only': True, 'absent': True}]
+print(json.dumps([scenario(change) for change in changes]))
+`);
+  assert.deepEqual(result[0], { removed: true, calls: ['tracing_on', 'events/enable', 'options/event-fork', 'remove'] });
+  for (const item of result.slice(1, 10)) { assert.equal(item.removed, false); assert.ok(!item.calls.includes('remove')); }
+  assert.deepEqual(result.slice(10), [{ removed: true, calls: [] }, { removed: true, calls: [] }]);
 });
 
 test('mount diagnosis requires its own explicit confirmation without altering lifecycle admission', () => {
@@ -158,10 +379,10 @@ test('an AppArmor positive requires an owned PID identity, bounded window, activ
   }
   for (const mutate of [
     v => { v.audit.ready = false; }, v => { v.audit.closed = false; }, v => { v.audit.complete = false; },
-    v => { v.audit.records = []; }, v => { v.audit.start = 101; }, v => { v.audit.end = 199; },
-    v => { v.audit.records[0].time = 99; }, v => { v.audit.records[0].time = 201; },
-    v => { v.observations.clear(); }, v => { v.observations.get(77).first = 151; }, v => { v.observations.get(77).last = 149; },
-    v => { v.observations.get(77).ambiguous = true; }, v => { delete v.observations.get(77).start; },
+    v => { v.audit.records = []; }, v => { v.audit.start = 211; }, v => { v.audit.end = 89; },
+    v => { v.audit.records[0].time = -1; }, v => { v.audit.records[0].time = 'private-time-marker'; },
+    v => { v.graph.actors.clear(); }, v => { v.graph.actors.get(77).appImage = false; }, v => { v.graph.actors.get(77).alive = true; },
+    v => { v.graph.complete = false; }, v => { delete v.graph.actors.get(77).birth; }, v => { v.graph.actors.get(77).pid = 78; },
     v => { v.profile = null; }, v => { v.profile = 'another-profile'; },
     ...['pid=77 pid=77', 'pid="77"broken', 'pid=78'].map(text => v => { v.audit.records[0].message = v.audit.records[0].message.replace('pid=77', text); }),
     v => { v.audit.records[0].message = v.audit.records[0].message.replace('operation="mount"', 'operation="open"'); },
@@ -193,13 +414,15 @@ test('unavailable audit reasons preserve uncertainty and require actor ownership
     [v => { v.audit.complete = false; v.audit.reason = 'stream_incomplete'; }, 'stream_incomplete'],
     [v => { v.audit.reason = 'reader_failed'; }, 'reader_failed'],
     [v => { v.profile = null; }, 'profile_unavailable'],
-    [v => { v.observations.clear(); }, 'probe_identity_unavailable'],
-    [v => { v.audit.start = 101; }, 'audit_window_incomplete'],
+    [v => { v.containerRemoved = false; }, 'probe_cleanup_unproven'],
+    [v => { v.graph.actors.clear(); }, 'probe_identity_unavailable'],
+    [v => { v.audit.start = 211; }, 'audit_window_incomplete'],
+    [v => { v.graph.complete = false; v.graph.reason = 'trace_stream_incomplete'; }, 'trace_stream_incomplete'],
     [v => { v.audit.records = []; }, 'no_observed_mount_denial'],
     [v => { v.profile = 'unrelated-profile'; }, 'no_correlated_mount_denial'],
-    [v => { v.observations.get(77).first = 151; }, 'owned_actor_not_correlated'],
+    [v => { v.graph.actors.get(77).appImage = false; }, 'owned_actor_not_correlated'],
     [v => { v.audit.records[0].message = v.audit.records[0].message.replace(image, '/private/source-marker'); }, 'owned_target_source_unrecognized'],
-    [v => { v.observations.get(77).first = 151; v.audit.records[0].message = v.audit.records[0].message.replace(image, '/private/source-marker'); }, 'owned_actor_not_correlated'],
+    [v => { v.graph.actors.get(77).appImage = false; v.audit.records[0].message = v.audit.records[0].message.replace(image, '/private/source-marker'); }, 'owned_actor_not_correlated'],
     [v => { v.audit.records[0].message += ' pid=77'; }, 'match_ambiguous'],
   ]) {
     const input = auditFixture(); mutate(input); const result = correlateLinuxMountAudit(input);
@@ -219,8 +442,10 @@ test('serial exact-byte comparison stops before the second image when owned cont
   assert.equal(observer.cases.length, 1);
   await assert.rejects(runLinuxMountSequence(pair, async role => row(role, { artifactSha256: 'f'.repeat(64) })), /REFUSED/u);
   for (const mutate of [
-    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; },
+    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v2'; },
     v => { v.cases[0].probe.environment.appArmor.profile = 'private-profile-marker'; },
+    v => { v.cases[0].actorTrace.pid = 77; }, v => { v.cases[0].actorTrace.reason = '/private/trace-marker'; },
+    v => { v.cases[0].actorTrace.instanceRemoved = false; }, v => { v.cases[0].actorTrace = { complete: false, reason: 'trace_stream_incomplete', instanceRemoved: true }; },
     v => { v.cases[0].probe.environment.pid = 77; }, v => { v.cases[0].probe.mount = target; },
     v => { v.cases[0].probe.launcherErrors.raw = 'private-stderr-marker'; }, v => { v.cases[0].probe.startup.process.pid = 77; },
     v => { v.cases[0].appArmorMountDenial = 'possibly'; }, v => { v.cases[0].appArmorMountDenial = false; },
@@ -228,6 +453,10 @@ test('serial exact-byte comparison stops before the second image when owned cont
     v => { v.cases[0].probe.launcherErrors.stages.fusermountExec = 'private-error-marker'; },
     v => { v.cases[0].probe.launcherErrors.stages.path = '/private/unowned'; }, v => { v.cases[0].containerRemoved = false; }, v => { v.cases[0].observerStopped = false; },
   ]) { const changed = structuredClone(result); mutate(changed); assert.equal(validateLinuxMountDiagnosis(changed), null); }
+  const unproven = structuredClone(result);
+  Object.assign(unproven.cases[0], { errorCode: 'probe_failed', appArmorMountDenial: true, appArmorAuditReason: 'owned_mount_denial',
+    actorTrace: { complete: false, reason: 'trace_stream_incomplete', instanceRemoved: true } });
+  assert.equal(validateLinuxMountDiagnosis(unproven), null);
   assert.doesNotMatch(JSON.stringify(result), /private-profile-marker|private-stderr-marker|\.mount_|\/opt\/|"pid"|"start"|comm|nonce/u);
 });
 
@@ -276,11 +505,13 @@ test('diagnostic Docker security arguments match the existing lifecycle and keep
   assert.match(dockerfile, /^COPY scripts \.\/scripts$/mu); assert.match(ignore, /^!scripts\/\*\*$/mu);
   assert.match(dockerfile, /^USER node$/mu); assert.match(dockerfile, /CMD \["node", "scripts\/smoke-electron-linux-final-lifecycle\.mjs"\]/u);
   const source = await readFile(new URL('../scripts/diagnose-electron-linux-appimage-mount.mjs', import.meta.url), 'utf8');
-  assert.match(source, /spawn\(IMAGE, \['--appimage-mount'\]/u);
+  assert.match(source, /spawn\(process\.execPath, \[SCRIPT, '--gate'\]/u);
+  assert.match(source, /process\.execve\(IMAGE, args, process\.env\)/u);
+  assert.match(source, /process\.kill\(process\.pid, 'SIGSTOP'\)/u);
   assert.match(source, /LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C'/u);
   assert.doesNotMatch(source, /--appimage-extract|--no-sandbox|--disable-setuid-sandbox|apparmor=unconfined|seccomp=unconfined/u);
   assert.match(source, /'--cidfile'/u);
-  assert.match(source, /audit = beginKernelObserver\(initPid\); row\.observerStopped = false; row\.appArmorAuditReason = 'not_evaluated'/u);
+  assert.match(source, /audit = beginKernelObserver\(context\); row\.observerStopped = false; row\.appArmorAuditReason = 'not_evaluated'/u);
   assert.match(source, /const stopped = await waitUntil\(\(\) => exited, 35000\)/u);
   assert.match(source, /copyFile\(source, IMAGE, constants\.COPYFILE_EXCL\)/u);
   assert.match(source, /installed\.sha256 !== expected\.sha256 \|\| installed\.bytes !== expected\.bytes/u);
@@ -289,6 +520,14 @@ test('diagnostic Docker security arguments match the existing lifecycle and keep
   assert.match(LINUX_MOUNT_KMSG_READER, /sequence != last \+ 1: incomplete\('stream_incomplete'\)/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /used > 262144/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /priority >> 3 == 0/u);
+  assert.match(LINUX_MOUNT_KMSG_READER, /trace_pending or not no_loss\(cpu_set, True\)/u);
+  assert.match(LINUX_MOUNT_KMSG_READER, /dir_fd=instance_fd/u);
+  assert.match(LINUX_MOUNT_KMSG_READER, /journal\(root, root_kind, True\); removed = False\n        os\.mkdir/u);
+  assert.doesNotMatch(LINUX_MOUNT_KMSG_READER, /ptrace|set_ftrace_pid|record-cmd|os\.system|subprocess|mount -t|nsenter/u);
+  const host = source.slice(source.indexOf('async function runHostProbe('), source.indexOf('export function linuxMountCleanupArguments('));
+  assert.ok(host.indexOf('audit.state.ready || audit.state.closed') < host.indexOf("child.stdin.write('go\\n')"));
+  assert.ok(host.indexOf("command('docker', ['rm', '--force', id])") < host.indexOf('kernel = await audit.stop()'));
+  assert.ok(source.indexOf('await cleanupLinuxAppArmorProfiles') > source.indexOf('async function cleanupRecordedContainers'));
   const workflow = await readFile(new URL('../.github/workflows/electron-linux-appimage-mount-diagnosis.yml', import.meta.url), 'utf8');
   for (const required of ['workflow_dispatch:', 'group: electron-linux-final-qualification', 'persist-credentials: false', 'actions: read',
     LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, 'timeout 180s', 'mount-diagnosis.json', '--test-concurrency=1', 'test/tool-inventory.test.js', 'test/release-workflow-policy.test.js', '--cleanup']) assert.ok(workflow.includes(required), required);
@@ -369,7 +608,7 @@ test('the owned audit tuple keeps exact actor correlation and refuses conflictin
   assert.deepEqual(correlateLinuxMountAudit(input), { denial: true, reason: 'owned_mount_denial', tuple: expected });
   input.audit.records.push({ ...input.audit.records[0], message: input.audit.records[0].message.replace('ro, nosuid, nodev', 'rw, nosuid, nodev') });
   assert.equal(correlateLinuxMountAudit(input).tuple, null);
-  input.observations.get(77).last = 149;
+  input.graph.actors.get(77).appImage = false;
   assert.deepEqual(correlateLinuxMountAudit(input), { denial: 'unavailable', reason: 'owned_actor_not_correlated', tuple: null });
 });
 
@@ -423,7 +662,7 @@ test('one serial baseline/candidate comparison includes both exact images and a 
   }
 });
 
-test('missing audit, fast unsampled actors and tuple disagreement stop before candidate policy is loaded', async () => {
+test('missing audit, uncorrelated actors and tuple disagreement stop before candidate policy is loaded', async () => {
   for (const mutate of [
     result => { result.tuple = null; result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'no_observed_mount_denial'; },
     result => { result.tuple = null; result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'owned_actor_not_correlated'; },
@@ -445,7 +684,10 @@ test('comparison preserves cleanup and cancellation gates without turning a fail
     const { adapters } = comparisonHarness({ mutate }); const result = await runLinuxAppArmorComparison(pair, adapters);
     assert.equal(result.outcome, outcome); assert.equal(result.cases.length, count); assert.equal(result.profilesRemoved, true);
   }
-  const unclean = comparisonHarness({ mutate: result => { result.row.containerRemoved = false; result.row.errorCode = 'cleanup_failed'; } });
+  const unclean = comparisonHarness({ mutate: result => {
+    result.row.containerRemoved = false; result.row.errorCode = 'cleanup_failed'; result.tuple = null;
+    result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'probe_cleanup_unproven';
+  } });
   const stopped = await runLinuxAppArmorComparison(pair, unclean.adapters);
   assert.equal(stopped.outcome, 'cleanup_failed'); assert.equal(stopped.cases.length, 1); assert.equal(stopped.profilesRemoved, false);
   assert.ok(!unclean.calls.includes('load:candidate'));
@@ -651,7 +893,7 @@ test('parser operations are bracketed by both bindings, including missing files 
   assert.deepEqual(failed, ['binding', 'operation', 'binding']);
 });
 
-test('comparison v2 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
+test('comparison v3 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
   for (const [provided, expected] of [['abi_missing', 'abi_missing'], ['abi_unsafe', 'abi_unsafe'], ['preprocess_failed', 'preprocess_failed'],
     ['include_remaining', 'include_remaining'], ['parser_config_changed', 'parser_config_changed'], ['private-error-marker', 'unknown'], [undefined, 'unknown']]) {
     const harness = comparisonHarness();
@@ -668,8 +910,9 @@ test('comparison v2 keeps precise import refusals closed and cannot mislabel an 
   }
   assert.equal(linuxAppArmorImportFailure({ code: 'parser_unavailable', importFailure: 'abi_missing' }), 'none');
   const complete = await runLinuxAppArmorComparison(pair, comparisonHarness().adapters);
-  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v2'); assert.equal(complete.importFailure, 'none');
-  for (const mutate of [v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v1'; }, v => { delete v.basis.imports; },
+  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v3'); assert.equal(complete.importFailure, 'none');
+  for (const mutate of [v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v1'; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v2'; }, v => { delete v.basis.imports; },
     v => { v.basis.imports.path = '/private/abi-marker'; }, v => { v.basis.imports.abi40Sha256 = 'invalid'; },
     v => { v.importFailure = 'abi_missing'; }]) {
     const changed = structuredClone(complete); mutate(changed); assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);
