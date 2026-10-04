@@ -799,8 +799,8 @@ around one generated or compiled authority.
 | [`schemas/product-synthetic-v0.1`](../../schemas/product-synthetic-v0.1) | Synthetic product contribution and encrypted envelope |
 | [`schemas/claude-statusline-v0.2`](../../schemas/claude-statusline-v0.2) | Minimized Claude status-line record |
 | [`schemas/provider-accounting-snapshot-v0.1.schema.json`](../../schemas/provider-accounting-snapshot-v0.1.schema.json) | Cross-provider accounting snapshot |
-| [`schemas/export-set-v0.1`](../../schemas/export-set-v0.1), [`v0.2`](../../schemas/export-set-v0.2) | Export-set manifests and evolution |
-| [`schemas/export-deletion-v0.1`](../../schemas/export-deletion-v0.1) | Deletion preflight, journal, commit marker, and receipt |
+| [`schemas/export-set-v0.1`](../../schemas/export-set-v0.1), [`v0.2`](../../schemas/export-set-v0.2), [`v0.3`](../../schemas/export-set-v0.3) | Export-set manifests and evolution; current v0.3 admits the existing 100,000-source runtime ceiling |
+| [`schemas/export-deletion-v0.1`](../../schemas/export-deletion-v0.1), [`v0.2 journal`](../../schemas/export-deletion-v0.2/journal.schema.json) | Retained deletion preflight, journals, commit marker, and receipt; v0.2 journal admits manifest v0.3 |
 | [`schemas/export-workspace-discard-v0.1`](../../schemas/export-workspace-discard-v0.1) | Workspace-discard preflight, journal, commit marker, and receipt |
 | [`schemas/release-evidence-v1`](../../schemas/release-evidence-v1) | Nullable cross-platform release-evidence manifest |
 | [`schemas/r7-release-evidence-v0.1`](../../schemas/r7-release-evidence-v0.1) | R7 release qualification receipt |

@@ -25,8 +25,8 @@ versioning, and retirement rules.
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
 | Public model identity mirror | `packages/telemetry-contract/src/model-catalog.js` only | `apps/web/public/model-catalog.generated.js`; excludes telemetry and admin-history contracts | `npm run telemetry:browser:check` and browser parity/public-asset isolation tests |
 | Reviewed model identities and admin history | `packages/telemetry-contract/src/model-catalog.js` and `admin-model-history.js` | Public package exports and the telemetry browser mirror; closed export/upload model enums checked against the catalog | Catalog tests, `npm run telemetry:check`, browser and upload mirror checks |
-| Export set v0.1/v0.2 | `schemas/export-set-v0.1/` and `schemas/export-set-v0.2/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
-| Export deletion v0.1 | `schemas/export-deletion-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Export deletion tests |
+| Export set v0.1/v0.2/v0.3 | `schemas/export-set-v0.1/`, `schemas/export-set-v0.2/` and `schemas/export-set-v0.3/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
+| Export deletion | `schemas/export-deletion-v0.1/` and `schemas/export-deletion-v0.2/journal.schema.json` | v0.2 journal admits the current manifest; retained preflight, commit marker and receipt stay v0.1. | Export deletion tests |
 | Workspace discard v0.1 | `schemas/export-workspace-discard-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Workspace discard tests |
 | Product synthetic v0.1 | `schemas/product-synthetic-v0.1/` | Contribution and encrypted envelope schemas. | Worker/local acceptance tests |
 | Provider accounting snapshot | `schemas/provider-accounting-snapshot-v0.1.schema.json` | None. | Accounting/export tests |
@@ -51,9 +51,9 @@ The root schema families are grouped as follows:
 | `telemetry-contribution-v1.1/` | 8 | Generated attribution, usage, quota, session, chunk, envelope, day-manifest and complete-domain-manifest contracts. |
 | `telemetry-contribution-v1.2/` | 8 | Independently authorized successor with nullable continuity and non-additive cache-write TTL detail; hosted runtime starts staged. |
 | `telemetry-performance-v1/` | 2 | Independent staged daily measurement and histogram contracts; not a v1.2 usage stream. |
-| `export-deletion-v0.1/` | 4 | Recoverable deletion preflight/journal/commit/receipt. |
+| `export-deletion-v0.1/`, `export-deletion-v0.2/` | 5 | Recoverable deletion preflight/commit/receipt and both immutable journal versions. |
 | `export-workspace-discard-v0.1/` | 4 | Recoverable workspace-discard preflight/journal/commit/receipt. |
-| `export-set-v0.1/`, `export-set-v0.2/` | 2 | Versioned export-set manifests. |
+| `export-set-v0.1/`, `export-set-v0.2/`, `export-set-v0.3/` | 3 | Versioned export-set manifests. |
 | `product-synthetic-v0.1/` | 2 | Synthetic contribution and encrypted envelope. |
 | Claude, provider accounting, release manifest, R7 release, R7 resource | 5 | One schema per listed family. |
 
@@ -169,6 +169,28 @@ A version change includes:
 
 Do not weaken a schema or test to accept an already-invalid payload. Fix the
 producer or introduce an explicit reviewed version transition.
+
+### Local export manifest v0.3
+
+New local sets use `usage-export-set-manifest-v0.3`, with its own schema digest,
+contract and manifest receipt version. Its source-file ceiling is 100,000,
+matching the existing runtime policy across the combined Codex and supplemental
+source plans. The v0.1/v0.2 schema bytes and 5,000-file ceiling remain unchanged;
+an oversized old-version manifest remains invalid. All byte, record, chunk,
+workspace, time and memory limits are unchanged. Packing, gzip representation,
+chunk identities and telemetry compatibility tuples are unchanged.
+
+Current readers still validate and verify both retained versions under their
+existing compatibility checks. A completed v0.2 set can be retried without
+rewriting it only when its manifest and receipt validate and every field other
+than the version-specific manifest header exactly matches the recomputed set.
+Incomplete compressed output resumes to v0.3; plain v0.1 rematerialization still
+fails closed rather than mixing representations. New deletion plans use journal
+v0.2, which explicitly admits the three supported manifest versions. Committed
+v0.1 deletion journals retain their original validator and canonical hash checks,
+so recovery does not restamp or reinterpret their bytes. Unknown versions fail
+closed. This local-only transition does not change hosted contribution contracts
+or qualify the protected R7 release evidence.
 
 ### Staged account/plan attribution contract
 

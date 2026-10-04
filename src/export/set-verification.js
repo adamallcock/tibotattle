@@ -13,9 +13,12 @@ import {
   assertValidExportSetManifest,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3,
   EXPORT_SET_MANIFEST_VERSION_V0_1,
   EXPORT_SET_MANIFEST_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_3,
   exportSetChunkBasenames,
+  isCompressedExportSetManifestVersion,
 } from "./set-schema.js";
 
 const MAXIMUM_MANIFEST_RECEIPT_BYTES = 1024 * 1024;
@@ -376,9 +379,12 @@ function firstRecordFitsPriorChunk(manifest, bundle, firstRow) {
 }
 
 function assertManifestReceipt(receipt, manifestBytes, manifestVersion, hash) {
-  const receiptVersion = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
-    ? EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2
-    : EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1;
+  const receiptVersion = new Map([
+    [EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1],
+    [EXPORT_SET_MANIFEST_VERSION_V0_2, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2],
+    [EXPORT_SET_MANIFEST_VERSION_V0_3, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3],
+  ]).get(manifestVersion);
+  if (receiptVersion === undefined) fail("manifest_receipt");
   const expected = {
     schemaVersion: receiptVersion,
     manifestSha256: hash(manifestBytes),
@@ -389,7 +395,7 @@ function assertManifestReceipt(receipt, manifestBytes, manifestVersion, hash) {
 }
 
 function manifestByteTotals(manifest) {
-  if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2) {
+  if (isCompressedExportSetManifestVersion(manifest.schemaVersion)) {
     return {
       decoded: manifest.totals.decodedBundleBytes,
       encoded: manifest.totals.encodedArtifactBytes,
@@ -633,7 +639,7 @@ export function createLocalExportSetVerifier(options = {}) {
         fail("directory");
       }
       const oppositePattern =
-        manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+        isCompressedExportSetManifestVersion(manifestVersion)
           ? /^chunk-\d{6}\.bundle\.json$/
           : /^chunk-\d{6}\.bundle\.json\.gz$/;
       if (entries.some((name) => oppositePattern.test(name))) {
@@ -933,7 +939,7 @@ export function createLocalExportSetVerifier(options = {}) {
         }
         actualDecodedBytes += verified.bundleBytes.byteLength;
         actualReceiptBytes += verified.receiptBytes.byteLength;
-        if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2) {
+        if (isCompressedExportSetManifestVersion(manifest.schemaVersion)) {
           actualEncodedBytes += entry.artifactBytes;
         }
         resourceGuard.observeExportSetBytes(

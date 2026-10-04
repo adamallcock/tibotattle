@@ -28,6 +28,7 @@ import {
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
   exportSetChunkBasenames,
+  isCompressedExportSetManifestVersion,
   stableJson,
 } from "../export/index.js";
 
@@ -216,7 +217,7 @@ function expectedChunkMetadata(manifest, entry) {
     coveredAt: manifest.coveredAt,
     bundleSha256: entry.bundleSha256,
     bundleBytes: entry.bundleBytes,
-    ...(manifest.schemaVersion.endsWith("v0.2") ? {
+    ...(isCompressedExportSetManifestVersion(manifest.schemaVersion) ? {
       contentEncoding: entry.contentEncoding,
       compressionProfile: entry.compressionProfile,
       artifactSha256: entry.artifactSha256,
@@ -402,7 +403,7 @@ async function buildLocalExportDeletionPlan(options) {
         role: EXPORT_DELETION_INVENTORY_ROLES.chunkArtifact,
         chunkIndex: entry.index,
         path: join(outputDirectoryInfo.path, names.bundle),
-        maximumBytes: manifest.schemaVersion.endsWith("v0.2") ? entry.artifactBytes : entry.bundleBytes,
+        maximumBytes: isCompressedExportSetManifestVersion(manifest.schemaVersion) ? entry.artifactBytes : entry.bundleBytes,
         scope: "output",
       };
     }),

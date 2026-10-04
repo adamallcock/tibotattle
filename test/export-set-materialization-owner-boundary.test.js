@@ -44,7 +44,7 @@ function deferredMaterializer({ onLease = null, onOpen = null } = {}) {
   const contract = Object.fromEntries([
     "sha256", "fail", "stableJson", "buildChunkBundle", "compressChunkBundle",
     "deterministicSetId", "deterministicBundleId", "chooseLargestFittingPrefix",
-    "assertVerifiedChunk", "manifestReceipt", "loadVerifiedLocalMetadataBundleBytes",
+    "assertVerifiedChunk", "manifestReceipt", "retainMatchingManifest", "loadVerifiedLocalMetadataBundleBytes",
     "decompressExportBytes", "verifyPrivacySafeBundle", "assertValidExportSetManifest",
     "computeWorkspaceLogicalRecordsSha256", "combinedSourcePlanCommitment",
   ].map((name) => [name, noop]));
@@ -96,10 +96,11 @@ function lifecycleHarness({
   gzipProfile = EXPORT_GZIP_PROFILE,
   leaseGate = null,
   manifestComparisonError = null,
+  onManifestObservation = null,
   onSecret = null,
 } = {}) {
   const calls = callLog ?? {};
-  Object.assign(calls, { close: 0, finish: 0, lease: 0, open: 0, write: 0 });
+  Object.assign(calls, { close: 0, finish: 0, lease: 0, open: 0, write: 0, manifestObservations: 0 });
   const artifacts = new Map();
   const digest = "d".repeat(64);
   const descriptor = {
@@ -154,7 +155,10 @@ function lifecycleHarness({
     observeCanonicalBundle: () => {},
     observeEncodedArtifact: () => {},
     observeExportSetBytes: () => {},
-    observeManifest: () => {},
+    observeManifest: () => {
+      calls.manifestObservations += 1;
+      onManifestObservation?.(calls.manifestObservations);
+    },
     durableSnapshot: () => {
       if (durableError !== null) throw durableError;
       return { policyVersion: "test" };
@@ -185,6 +189,11 @@ function lifecycleHarness({
       manifestBytes: Buffer.byteLength(manifestText),
       transportReady: false,
     }),
+    retainMatchingManifest: (manifest, manifestText, receiptText) => {
+      if (manifestText !== stableJson(manifest)
+          || stableJson(JSON.parse(receiptText)) !== stableJson(contract.manifestReceipt(manifestText))) fail("manifest_conflict");
+      return { manifest, manifestText, manifestReceipt: contract.manifestReceipt(manifestText) };
+    },
     loadVerifiedLocalMetadataBundleBytes: () => {
       if (chunkVerificationError !== null) throw chunkVerificationError;
       return {};
@@ -583,7 +592,7 @@ test("materialization pins every representation constant before lease or publica
       (error) => error instanceof TypeError
         && error.message === "Local export set materialization configuration is invalid",
     );
-    assert.deepEqual(callLog, { close: 0, finish: 0, lease: 0, open: 0, write: 0 });
+    assert.deepEqual(callLog, { close: 0, finish: 0, lease: 0, open: 0, write: 0, manifestObservations: 0 });
   }
 });
 
@@ -779,4 +788,23 @@ test("supplemental plan snapshots reject nested arrays, sources, bindings, and p
     );
   }
   assert.equal(touched, 0);
+});
+
+
+test("retained manifest retry preserves resource-limit identity outside artifact-read classification", async () => {
+  const failure = new ExportResourceLimitError("elapsed_time");
+  const { calls, materializer } = lifecycleHarness({
+    onManifestObservation(count) {
+      // The first invocation observes its new manifest once. Its retry then
+      // observes the candidate and the exact retained manifest separately.
+      if (count === 3) throw failure;
+    },
+  });
+  await materializer.materializeLocalExportSet(MATERIALIZE_OPTIONS);
+  await assert.rejects(materializer.materializeLocalExportSet(MATERIALIZE_OPTIONS), (error) => error === failure);
+  assert.equal(failure.code, "export_resource_elapsed_time");
+  assert.equal(calls.manifestObservations, 3);
+  assert.equal(calls.close, 2);
+  assert.equal(calls.finish, 2);
+  assert.equal(calls.write, 2);
 });
