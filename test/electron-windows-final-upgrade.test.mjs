@@ -218,6 +218,12 @@ test('frozen workflow preserves clean intake and adds explicit pinned immutable 
   assert.match(wrapper, /expectedVersion: predecessorIntake\.version/u);
   assert.match(wrapper, /referenceOrigin: 'extracted_from_exact_signed_installer'/u);
   assert.match(wrapper, /independentPreSigningStage: false/u);
+  assert.match(workflow, /path: \|\n            \.release-build\/electron-production\/win32-x64\/evidence\//u);
+  for (const role of ['candidate', 'predecessor']) {
+    const retained = wrapper.indexOf(`const ${role}Comparison = await retainWindowsFrozenComparison({ sourceCandidatePath: ${role}.sourceCandidatePath,`);
+    assert.ok(retained >= 0 && retained < wrapper.indexOf('const receipt = await runWindowsFinalUpgrade('));
+    assert.match(wrapper, new RegExp(`assert\\.equal\\(receipt\\.${role === 'candidate' ? 'sourceCandidateSha256' : 'predecessorSourceCandidateSha256'}, ${role}Comparison\\.sha256\\)`, 'u'));
+  }
   assert.doesNotMatch(wrapper, /--clobber|--publish|--sign\b|release.*create/u);
 });
 

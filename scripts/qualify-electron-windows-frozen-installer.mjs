@@ -3,8 +3,9 @@
  * not represented as independent pre-signing source-stage receipts. */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { cp, mkdir, mkdtemp, open, readdir, writeFile } from 'node:fs/promises';
+import { join, resolve, win32 } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { productionElectronCandidatePlan } from './package-electron-production.mjs';
@@ -17,6 +18,23 @@ import { WINDOWS_FINAL_UPGRADE_PREDECESSOR_FILE, parseWindowsFinalUpgradeMode,
 
 const env = process.env;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+
+/** Retain the exact extracted comparison bytes used by the native verifier.
+ * These are not independent pre-signing stage receipts. The default filesystem
+ * boundary is Windows-only; injection supports synthetic filesystem tests. */
+export async function retainWindowsFrozenComparison({ sourceCandidatePath, evidenceDirectory, role }, fileSystem = {}) {
+  assert.ok(role === 'candidate' || role === 'predecessor');
+  const file = `frozen-${role}-source-candidate.json`;
+  const bytes = await readWindowsSignedInstalledEvidence(sourceCandidatePath, 128 * 1024, fileSystem);
+  await assertWindowsSignedInstalledPath(evidenceDirectory, true, fileSystem.inspect);
+  const output = win32.join(evidenceDirectory, file);
+  const handle = await (fileSystem.openFile ?? open)(output, 'wx', 0o600);
+  try { await handle.writeFile(bytes); await handle.sync(); }
+  finally { await handle.close(); }
+  const retained = await readWindowsSignedInstalledEvidence(output, 128 * 1024, fileSystem);
+  assert.ok(retained.equals(bytes));
+  return Object.freeze({ file, bytes: bytes.length, sha256: hash(bytes) });
+}
 function program(command, args, timeout) {
   const result = spawnSync(command, args, { shell: false, stdio: 'ignore', timeout });
   assert.equal(result.error, undefined); assert.equal(result.status, 0);
@@ -78,6 +96,8 @@ async function main() {
   await cp(installer, join(root, 'artifacts', names[0]), { errorOnExist: true, force: false });
   await cp(join(input, 'artifacts', 'latest.yml'), join(root, 'artifacts', 'latest.yml'), { errorOnExist: true, force: false });
   await mkdir(join(root, 'evidence'));
+  const candidateComparison = await retainWindowsFrozenComparison({ sourceCandidatePath: candidate.sourceCandidatePath,
+    evidenceDirectory: join(root, 'evidence'), role: 'candidate' });
   const frozen = { schemaVersion: 'tibotattle-windows-frozen-reference-v1', sourceRevision: env.SOURCE_REVISION,
     qualificationRunnerRevision: env.GITHUB_SHA, installerSha256: env.INSTALLER_SHA256, version: candidate.version,
     buildNumber: candidate.buildNumber, referenceOrigin: 'extracted_from_exact_signed_installer',
@@ -85,7 +105,8 @@ async function main() {
   await writeFile(join(root, 'evidence', 'frozen-reference.json'), `${JSON.stringify(frozen)}\n`, { flag: 'wx', mode: 0o600 });
   const candidateOptions = { ...candidate, installerPath: join(root, 'artifacts', names[0]), installerSha256: env.INSTALLER_SHA256 };
   if (predecessorIntake === null) {
-    await runWindowsSignedInstalled({ ...candidateOptions, receiptPath: join(root, 'evidence', 'windows-signed-installed.json') });
+    const receipt = await runWindowsSignedInstalled({ ...candidateOptions, receiptPath: join(root, 'evidence', 'windows-signed-installed.json') });
+    assert.equal(receipt.sourceCandidateSha256, candidateComparison.sha256);
     console.log('WINDOWS_FROZEN_INSTALLED_QUALIFIED'); return;
   }
   assert.equal(candidate.version, '0.1.27');
@@ -103,20 +124,26 @@ async function main() {
   assert.equal(await digestWindowsSignedInstalledFile(oldInstaller), predecessorIntake.installerSha256);
   const predecessor = await reference(oldInstaller, { expectedSource: predecessorIntake.sourceRevision,
     expectedVersion: predecessorIntake.version, scratch: join(predecessorRoot, 'extracted'), root: join(predecessorRoot, 'reference') });
+  const predecessorComparison = await retainWindowsFrozenComparison({ sourceCandidatePath: predecessor.sourceCandidatePath,
+    evidenceDirectory: join(root, 'evidence'), role: 'predecessor' });
   await writeFile(join(root, 'evidence', 'frozen-predecessor-reference.json'), `${JSON.stringify({
     schemaVersion: 'tibotattle-windows-frozen-predecessor-reference-v1', predecessor: predecessorIntake,
     qualificationRunnerRevision: env.GITHUB_SHA, buildNumber: predecessor.buildNumber,
-    sourceCandidateSha256: hash(await readFile(predecessor.sourceCandidatePath)),
+    sourceCandidateSha256: predecessorComparison.sha256,
     immutableReleaseVerified: true, referenceOrigin: 'extracted_from_exact_signed_installer',
     independentPreSigningStage: false, rebuilt: false, resigned: false, published: false,
   })}\n`, { flag: 'wx', mode: 0o600 });
-  await runWindowsFinalUpgrade({ candidate: candidateOptions,
+  const receipt = await runWindowsFinalUpgrade({ candidate: candidateOptions,
     predecessor: { ...predecessor, installerSha256: predecessorIntake.installerSha256 }, predecessorIntake,
     predecessorManifestPath, receiptPath: join(root, 'evidence', 'windows-final-upgrade.json') });
+  assert.equal(receipt.sourceCandidateSha256, candidateComparison.sha256);
+  assert.equal(receipt.predecessorSourceCandidateSha256, predecessorComparison.sha256);
   console.log('WINDOWS_FROZEN_FINAL_UPGRADE_QUALIFIED');
 }
-try { await main(); }
-catch (error) {
-  console.error(/^ELECTRON_WINDOWS_[A-Z_]+$/u.test(error?.code ?? '') ? error.code : 'WINDOWS_FROZEN_INSTALLED_FAILED');
-  process.exitCode = 1;
+if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+  try { await main(); }
+  catch (error) {
+    console.error(/^ELECTRON_WINDOWS_[A-Z_]+$/u.test(error?.code ?? '') ? error.code : 'WINDOWS_FROZEN_INSTALLED_FAILED');
+    process.exitCode = 1;
+  }
 }
