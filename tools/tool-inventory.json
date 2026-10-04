@@ -1885,7 +1885,8 @@
       "callers": [
         ".github/workflows/linux-portability.yml",
         "test/linux-portability-workflow.test.js",
-        ".github/workflows/electron-linux-production-package.yml"
+        ".github/workflows/electron-linux-production-package.yml",
+        ".github/workflows/electron-linux-appimage-mount-diagnosis.yml"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2148,7 +2149,8 @@
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-startup-diagnostics.test.mjs",
-        "test/electron-linux-packaged-container.test.js"
+        "test/electron-linux-packaged-container.test.js",
+        "scripts/diagnose-electron-linux-appimage-mount.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2962,7 +2964,8 @@
         "scripts/qualify-electron-linux-installed-lifecycle.mjs",
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-installed-lifecycle.test.js",
-        "test/electron-linux-installed-files.test.mjs"
+        "test/electron-linux-installed-files.test.mjs",
+        "scripts/diagnose-electron-linux-appimage-mount.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -2980,7 +2983,8 @@
         ".github/workflows/electron-linux-final-qualification.yml",
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-installed-files.test.mjs",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "scripts/diagnose-electron-linux-appimage-mount.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3035,10 +3039,27 @@
         "test/electron-linux-startup-diagnostics.test.mjs",
         "test/electron-linux-packaged-container.test.js",
         "containers/electron-linux/Dockerfile",
-        "containers/electron-linux-amd64/Dockerfile"
+        "containers/electron-linux-amd64/Dockerfile",
+        "scripts/diagnose-electron-linux-appimage-mount.mjs"
       ],
       "decision": "retain_as_internal_linux_qualification_support",
       "provenance": ".github/workflows/electron-linux-final-qualification.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/diagnose-electron-linux-appimage-mount.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private exact-byte AppImage mount diagnosis under the existing disposable Linux qualification boundary; never launches Electron or qualifies a release.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
+        "test/electron-linux-appimage-mount-diagnosis.test.mjs"
+      ],
+      "decision": "retain_as_internal_linux_qualification_support",
+      "provenance": ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
       "provenanceReason": null,
       "legacyPaths": []
     }

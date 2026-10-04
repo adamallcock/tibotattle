@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 170 records / 171 executable paths: release-documentation, Codex contract,
+  // 171 records / 172 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -336,9 +336,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // allowlist and an independently held artifact coordination owner.
   // The historical Sol helper owns the retained-parser installed proof within
   // the existing disposable Mac credential journey.
-  // The content-free Linux startup diagnostic helper has its own tool owner.
-  assert.equal(result.records, 170);
-  assert.equal(result.candidates.length, 171);
+  // The content-free Linux startup diagnostic helper and the separate exact-byte
+  // mount-only diagnostic each have an explicit owner; neither qualifies a release.
+  assert.equal(result.records, 171);
+  assert.equal(result.candidates.length, 172);
   assert.ok(result.aliases >= 25);
 });
 
