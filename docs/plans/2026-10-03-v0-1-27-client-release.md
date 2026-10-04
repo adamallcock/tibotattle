@@ -402,7 +402,24 @@ model-performance page check with
 `ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE`.
 Its fixed receipt confirms owned-profile and firewall cleanup; subsequent
 journey claims remain false. The page selectors still exist and the preceding
-local performance API proof passed. A worker and independent reviewer are
-investigating the remaining rendered-view predicate before merge or final tag.
-The failed receipt and log are preserved locally; no weakened assertion or
+local performance API proof passed. The failed receipt and log are preserved locally; no weakened assertion or
 product-correctness claim follows from the passing source tests.
+
+A diagnostic-only rerun at `9406e7b3` confirmed the selected seven-day Standard
+view remained Updating with no model tabs, while navigation and visibility were
+correct. An actual controller/worker reproduction isolated the cause: the browser
+registers four periods across three speed modes, but both pinned-window bounds
+still retained only eight. Repeated preloading evicted the default view before
+it could be consumed.
+
+The independently reviewed correction at `5a3b9688` derives the bound from the
+canonical period/mode roster and shares it between worker, controller and
+snapshot storage. All 36 owning tests pass, including the actual worker reaching
+ready for all twelve exact windows, byte-preserving restoration of prior
+eight-window receipts, restart, bounded thirteenth-window eviction and refusal
+of oversized saved sets. The disk-size/privacy envelope is unchanged, as are the
+Windows ready predicate and deadline. R7 and temporary dependency-exception
+inputs are unchanged. Integrated validation passed 407 companion tests, 45
+model-performance and retained-R7 checks, 997 UI tests, documentation governance
+and 20 preflight tests. Fresh native Windows/Linux qualification is required
+before treating the packaged runtime failure as resolved.
