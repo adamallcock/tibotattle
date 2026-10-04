@@ -423,3 +423,30 @@ inputs are unchanged. Integrated validation passed 407 companion tests, 45
 model-performance and retained-R7 checks, 997 UI tests, documentation governance
 and 20 preflight tests. Fresh native Windows/Linux qualification is required
 before treating the packaged runtime failure as resolved.
+
+The [fresh native runtime run](https://github.com/adamallcock/tibotattle/actions/runs/37180647427)
+then passed on Windows and Linux at `88cabd0b308ae1aae4ecf313cc0dcf52b62c0050`.
+The small retained receipts were downloaded and matched their GitHub artifact
+SHA-256 digests. Windows completed the unchanged model-performance assertion,
+synthetic ingestion, project/thread and total retention across restart, settings,
+opt-out, firewall and profile cleanup. Linux completed packaged credential and
+normal-startup checks, its genuine private AppImage update/restart, and cleanup.
+Both receipts retain candidate-only scope and `productionReady: false`; they do
+not qualify the future signed installers. All four ordinary PR checks also pass
+at that source. The packaged performance regression is resolved for this
+preparation checkpoint.
+
+Both immutable published 0.1.26 Mac DMGs were downloaded, hash-verified and
+inspected read-only. Code signatures, Gatekeeper, source, build, bundle version
+and architecture passed. Their ASAR hashes match the two public native-feed
+predecessor manifests. No app was launched or installed. Exact preimages of all
+four stable Electron YAML feeds and both native appcasts are retained privately;
+they still advertise 0.1.26 and must be freshly compared before publication. The
+closed Windows predecessor intake and RSA-4096 diagnostic public-key workflow
+inputs are also prepared; no signing material was printed.
+
+The remaining release gates are unchanged: Apple developer agreement acceptance,
+qualified live hosted compatibility, actual UTC release-date/source/tag freeze,
+four final artifacts, signed installed journeys, canonical publication evidence,
+publication and live updater/site/tap readback. Preparation merge does not satisfy
+those gates or publish version 0.1.27.
