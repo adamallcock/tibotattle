@@ -567,6 +567,7 @@ function alertPolicy(desired, id, { severity, summary, conditions, notificationC
       },
       userLabels: { "managed-by": "tibotattle-ops-5", severity, environment: desired.environment },
       severity: API_SEVERITY[severity],
+      enabled: true,
       combiner: "OR",
       conditions,
       notificationChannels: notificationChannel === null ? [] : [notificationChannel],

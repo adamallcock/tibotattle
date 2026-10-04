@@ -4,11 +4,13 @@ This is the runbook that every alert policy links to. Each policy's
 documentation links to `#<policy id>` here. The policies are code in
 `scripts/gcp-ops-monitoring-policies.mjs` (OPS-5, E-OPS5).
 `scripts/gcp-monitoring.mjs` renders them, reads them back and plans them,
-and finds or creates the plane's one email notification channel.
+and can apply eligible creates/updates under an exact approved plan digest.
+The email channel remains a separate creation command.
 
-**Status (2026-10-02):** the policies have been rendered, planned and
-tested offline only. Nothing has been created in any project, and no apply
-command exists yet. The PromQL names of log-based metrics and the shape of
+**Source status:** render, readback, plan and protected apply have offline
+synthetic validation. This source evidence does not establish provider
+installation, metric ingestion, probe behavior or notification delivery.
+The PromQL names of log-based metrics and the shape of
 Cloud Scheduler's attempt log are assumptions until the first readback
 against the test project. Until a notification channel is passed to render
 and plan (OWN-5c), every alert policy is deferred with
@@ -22,6 +24,9 @@ the production channel is a PROD-1 step.
 node scripts/gcp-monitoring.mjs render --environment=staging [--notification-channel=projects/<p>/notificationChannels/<n>]
 node scripts/gcp-monitoring.mjs readback --environment=staging
 node scripts/gcp-monitoring.mjs plan --environment=staging [--notification-channel=...]
+node scripts/gcp-monitoring.mjs apply --environment=staging [--notification-channel=...]
+# Separately approved, freshly recomputed digest; committed desired state only:
+node scripts/gcp-monitoring.mjs apply --environment=staging [--notification-channel=...] --execute=true --authorize=<planDigest>
 node scripts/gcp-monitoring.mjs origin-lock-probe --environment=staging
 node scripts/gcp-monitoring.mjs notification-channel --environment=staging --email-file=<abs path> [--authorize=<planDigest>]
 ```
@@ -31,8 +36,65 @@ node scripts/gcp-monitoring.mjs notification-channel --environment=staging --ema
   uptime checks and alert policies.
 - **origin-lock-probe** sends one unauthenticated request. The CLI never
   prints the channel's value.
-- **notification-channel** issues one list call. It is the only command that
-  can write, and only with `--authorize`.
+- **notification-channel** creates only the email channel, under its own
+  `--authorize` digest. Monitoring apply never creates or modifies channels.
+- **apply** is dry unless both protected flags are present. Its initial
+  readback recomputes the approved plan; an old supplied JSON plan is never
+  execution authority.
+
+## Protected monitoring apply
+
+Render, plan and dry apply may inspect a reviewed `--desired-state` draft.
+Protected execution requires the committed environment input; any override
+refuses before a provider call. Commit the operational desired-state change,
+then re-plan with the exact actual channel name before seeking approval.
+Readback/plan schema v2 binds the canonical desired-state digest, complete
+render digest, fresh managed readback including resource IDs and raw object
+digests, and each desired body digest. Older v1 plan digests are not reusable.
+The channel is printed only as assigned/unassigned; addresses and tokens
+never enter monitoring summaries or receipts.
+
+The executor accepts only its recomputed rendered metric/check/policy
+create/update rows. It refuses deletes, duplicate/foreign IDs, unmanaged
+collisions and any refused row before the first write. Resource ownership
+requires the rendered name plus the maintained metric description, uptime
+host/project binding, or policy management/environment labels respectively.
+It skips deferred and unchanged rows; cadence, PAUSED-trigger condition
+omissions and the absent unseen-token producer remain source-owned.
+Policy enabled state and auto-close/documentation fields participate in
+readback comparison; updates preserve server-assigned surviving condition IDs.
+An assigned channel must exist, be enabled, have the plane's email display
+name/type and be unambiguous. Recipient approval remains the separate channel
+workflow; this check does not prove delivery.
+
+Before each serial mutation it reloads committed desired state and checks
+fresh readback against the expected prior state. Writes use exact rendered
+JSON through [Logging create/update](https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/projects.metrics/update)
+and Monitoring [uptime patches](https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.uptimeCheckConfigs/patch)
+and [policy patches](https://docs.cloud.google.com/monitoring/api/ref_v3/rest/v3/projects.alertPolicies/patch),
+with explicit field masks for patches. Update masks preserve unmanaged fields;
+raw digests detect their intervening changes. Monitoring names and condition
+IDs are explicit readback bindings rather than desired API body values.
+Logging PUT is an API upsert; Google exposes no resource-version precondition
+in these operations. The final read/write race remains: fresh prechecks are
+not a transaction or a provider compare-and-swap guarantee.
+
+Each gcloud read/token call has a 30-second forced-kill timeout. REST writes
+have a 30-second abort signal, a 2 MiB response cap, no redirects/retries,
+and redacted errors. The access token is obtained only after protected
+admission, kept in memory and never passed as an argv value. Read/token/channel
+calls disable gcloud file and HTTP logging. Managed readback excludes raw
+provider bodies and channel/address values.
+
+A completed row requires a valid same-project response and matching fresh
+post-write readback; unrelated concurrent changes stop the pass. A partial
+receipt contains confirmed IDs, one failed/unconfirmed ID and its stage,
+unattempted IDs and a fresh readback digest/plan when available. `applied`
+means at least one confirmed row; a failed write can still have changed the
+provider. There is no implicit rollback, delete or retry. Preserve the receipt,
+inspect/re-plan fresh state and approve a new digest before continuing.
+Provider installation, live thresholds, probes, logs and delivery require
+separate operational evidence after the exact authorized apply.
 
 ## Email notification channel (OWN-5c)
 

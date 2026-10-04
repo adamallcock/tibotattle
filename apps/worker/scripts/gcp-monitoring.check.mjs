@@ -86,7 +86,7 @@ test("arguments are closed", () => {
     authorize: null });
   for (const [argv, code] of [
     [[], "GCP_MONITORING_COMMAND_INVALID"],
-    [["apply", "--environment=staging"], "GCP_MONITORING_COMMAND_INVALID"],
+    [["apply", "--environment=staging", "--execute=true"], "MONITORING_EXECUTION_AUTHORIZATION_REQUIRED"],
     [["delete", "--environment=staging"], "GCP_MONITORING_COMMAND_INVALID"],
     [["plan"], "GCP_MONITORING_ARGUMENT_MISSING"],
     [["plan", "--environment=test"], "GCP_MONITORING_ENVIRONMENT_INVALID"],
@@ -163,7 +163,7 @@ test("the plan is deterministic, never applies, defers what waits and refuses de
   const empty = JSON.parse((await run(["plan", "--environment=staging"])).out);
   // Six metrics and two uptime checks (origin-lock, edge-health) are creates; the thirteen policies wait.
   assert.deepEqual(empty.summary, { create: 8, update: 0, unchanged: 0, deferred: 13, refused: 0 });
-  assert.match(empty.apply, /^not available/u);
+  assert.match(empty.apply, /^dry by default/u);
   assert.equal(empty.notificationChannel, "unassigned");
   const again = JSON.parse((await run(["plan", "--environment=staging"])).out);
   assert.equal(again.planDigest, empty.planDigest);
@@ -467,4 +467,140 @@ test("the default runner spawns gcloud under the inherited environment, with the
       else process.env[name] = value;
     }
   }
+});
+
+// Protected monitoring executor: every mutation and token acquisition is synthetic.
+const { applyMonitoring, monitoringMutationRequest } = await import("./gcp-monitoring.mjs");
+function mutableMonitoring(seed = {}, { beforeRead = () => {}, failWrite = null, failReadFrom = null, badResponse = false } = {}) {
+  const state = { metrics: structuredClone(seed.metrics ?? []), uptime: structuredClone(seed.uptime ?? []), policies: structuredClone(seed.policies ?? []) };
+  let cycles = 0, writes = 0; const requests = [], calls = [];
+  const runner = (argv, options) => {
+    calls.push({ argv, options });
+    if (argv.slice(0,4).join(" ") === "beta monitoring channels list") return {status:0,stdout:JSON.stringify([{name:CHANNEL,type:"email",displayName:emailChannelDisplayName(STAGING),enabled:true,labels:{email_address:SYNTHETIC_EMAIL}}])};
+    if (argv[0] === "auth") return { status: 0, stdout: "synthetic-token-12345678901234567890\n" };
+    const shape = argv.slice(0, 3).join(" ");
+    if (shape === "logging metrics list") { cycles++; beforeRead(cycles, state); }
+    if (failReadFrom !== null && cycles >= failReadFrom) return { status: 1, stdout: "PRIVATE_READ_MARKER" };
+    const field = { "logging metrics list": "metrics", "monitoring uptime list-configs": "uptime", "monitoring policies list": "policies" }[shape];
+    return field ? { status: 0, stdout: JSON.stringify(state[field]) } : { status: 1, stdout: "PRIVATE_UNKNOWN_COMMAND" };
+  };
+  const transport = async (request) => {
+    requests.push(structuredClone(request)); writes++;
+    if (writes === failWrite) throw new Error("PRIVATE_WRITE_MARKER");
+    const body = structuredClone(request.body), type = request.url.includes("/metrics") ? "metrics" : request.url.includes("/uptimeCheckConfigs") ? "uptime" : "policies";
+    if (type !== "metrics" && request.method === "POST") body.name = `projects/${PROJECT}/${type === "uptime" ? "uptimeCheckConfigs" : "alertPolicies"}/${writes}`;
+    if (type === "policies") body.conditions = body.conditions.map((c, index) => ({ ...c, name: c.name ?? `${body.name}/conditions/${index}` }));
+    if (request.method === "POST") state[type].push(body);
+    else { const index = state[type].findIndex((e) => e.name === body.name); assert.ok(index >= 0); state[type][index] = body; }
+    return badResponse ? { ...body, name: `projects/foreign-proj1/alertPolicies/99` } : body;
+  };
+  return { state, runner, transport, requests, calls, get cycles() { return cycles; } };
+}
+function admittedPlan(fake, channel = null) { return planMonitoring(renderMonitoring(STAGING, { notificationChannel: channel }), readbackMonitoring(STAGING, { runner: fake.runner })); }
+async function execute(fake, options = {}) { return applyMonitoring(STAGING, { execute: true, authorize: admittedPlan(fake, options.notificationChannel).planDigest,
+  runner: fake.runner, transport: fake.transport, ...options }); }
+
+test("apply is dry by default; protected flags are paired; draft writes refuse before any call", async () => {
+  const fake = mutableMonitoring();
+  const dry = await applyMonitoring(STAGING, { runner: fake.runner, transport: () => assert.fail("dry write") });
+  assert.equal(dry.status, "dry"); assert.equal(dry.execute, false); assert.equal(dry.applied, false);
+  assert.deepEqual(dry.plan.summary, { create: 8, update: 0, unchanged: 0, deferred: 13, refused: 0 });
+  assert.equal(fake.calls.length, 3); assert.equal(fake.calls.some((c) => c.argv[0] === "auth"), false);
+  for (const argv of [["apply", "--environment=staging", "--execute=true"], ["apply", "--environment=staging", `--authorize=${"1".repeat(64)}`]]) {
+    assert.throws(() => parseGcpMonitoringArgs(argv), { code: "MONITORING_EXECUTION_AUTHORIZATION_REQUIRED" });
+  }
+  const out=[],err=[];fake.calls.length=0;
+  const code=await main(["apply","--environment=staging","--desired-state=/private/tmp/unused-draft.json","--execute=true",`--authorize=${"1".repeat(64)}`],{runner:fake.runner,stdout:t=>out.push(t),stderr:t=>err.push(t)});
+  assert.equal(code,1);assert.equal(JSON.parse(err.join("")).code,"MONITORING_COMMITTED_DESIRED_STATE_REQUIRED");assert.deepEqual(fake.calls,[]);
+});
+
+test("the plan binds exact desired, rendered, readback identities/body hashes and changes on drift", async () => {
+  const fake=mutableMonitoring(),p=admittedPlan(fake);assert.match(p.readbackDigest,/^[0-9a-f]{64}$/u);
+  assert.ok(p.operations.every(o=>typeof o.bodyDigest==="string"));
+  fake.state.metrics.push({...renderMonitoring(STAGING).metrics[0].body,filter:'severity="ERROR"'});
+  const changed=admittedPlan(fake);assert.notEqual(changed.planDigest,p.planDigest);assert.notEqual(changed.readbackDigest,p.readbackDigest);
+  await assert.rejects(applyMonitoring(STAGING,{execute:true,authorize:p.planDigest,runner:fake.runner,transport:fake.transport}),{code:"MONITORING_AUTHORIZATION_MISMATCH"});assert.equal(fake.requests.length,0);
+});
+
+test("eligible creates converge; all thirteen deferred policies and channel creation stay untouched", async () => {
+  const fake=mutableMonitoring(),result=await execute(fake);
+  assert.equal(result.status,"applied");assert.equal(result.completed.length,8);assert.equal(result.failed,null);assert.deepEqual(result.unattempted,[]);
+  assert.equal(fake.state.metrics.length,6);assert.equal(fake.state.uptime.length,2);assert.equal(fake.state.policies.length,0);
+  assert.equal(fake.calls.some(c=>c.argv.includes("channels")),false);assert.equal(fake.requests.some(r=>r.method==="DELETE"),false);
+  assert.equal(result.readback.plan.summary.unchanged,8);assert.equal(result.readback.plan.summary.deferred,13);
+  const again=await execute(fake);assert.equal(again.completed.length,0);assert.equal(fake.requests.length,8,"converged execution makes no extra write");
+});
+
+test("managed updates preserve resource IDs/condition IDs and use exact narrow patch masks", async () => {
+  const rendered=renderMonitoring(STAGING,{notificationChannel:CHANNEL}),fake=mutableMonitoring(liveFrom(rendered));
+  fake.state.metrics[0].filter+=' AND severity="ERROR"';fake.state.uptime[0].period="600s";
+  const policy=fake.state.policies.find(p=>p.displayName.endsWith("-sql-cpu"));const ids=policy.conditions.map(c=>c.name);policy.enabled=false;
+  const result=await execute(fake,{notificationChannel:CHANNEL});assert.equal(result.status,"applied");assert.equal(result.completed.length,3);
+  assert.equal(fake.requests[0].method,"PUT");assert.equal(fake.requests[1].method,"PATCH");assert.ok(fake.requests[1].url.includes("updateMask="));
+  const request=fake.requests[2];assert.equal(request.method,"PATCH");assert.equal(request.body.name,policy.name);
+  assert.deepEqual(request.body.conditions.map(c=>c.name),ids);assert.equal(request.body.enabled,true);
+  assert.ok(request.url.includes("enabled"));assert.equal(fake.requests.some(r=>r.method==="POST"),false);
+});
+
+test("cross-project identity, duplicate targets, unmanaged collisions and refused delete stop before writes", async () => {
+  const rendered=renderMonitoring(STAGING);
+  for(const seed of [
+    {uptime:[{...rendered.uptimeChecks[0].body,name:"projects/foreign-proj1/uptimeCheckConfigs/1"}]},
+    {metrics:[rendered.metrics[0].body,rendered.metrics[0].body]},
+    {metrics:[{...rendered.metrics[0].body,description:"unmanaged collision"}]},
+    {uptime:[{...rendered.uptimeChecks[0].body,name:`projects/${PROJECT}/uptimeCheckConfigs/1`,monitoredResource:{type:"uptime_url",labels:{project_id:PROJECT,host:"unmanaged.invalid"}}}]},
+    {policies:[{name:`projects/${PROJECT}/alertPolicies/99`,displayName:"tibotattle-staging-stray",conditions:[]}]},
+  ]) { const fake=mutableMonitoring(seed);await assert.rejects(execute(fake));assert.equal(fake.requests.length,0); }
+  const fake=mutableMonitoring(liveFrom(renderMonitoring(STAGING,{notificationChannel:CHANNEL})));
+  fake.state.policies.find(p=>p.displayName.endsWith("-sql-cpu")).userLabels={};await assert.rejects(execute(fake,{notificationChannel:CHANNEL}));assert.equal(fake.requests.length,0);
+});
+
+test("unknown/altered/deferred and duplicate generated operations cannot become requests", () => {
+  const fake=mutableMonitoring(),rendered=renderMonitoring(STAGING),readback=readbackMonitoring(STAGING,{runner:fake.runner}),plan=planMonitoring(rendered,readback);
+  for(const op of [{...plan.operations[0],name:"unmanaged"},{...plan.operations[0],action:"delete"},{...plan.operations[0],extra:true},plan.operations.find(o=>o.deferred)]) {
+    assert.throws(()=>monitoringMutationRequest(rendered,readback,op),{code:"MONITORING_OPERATION_FORBIDDEN"});
+  }
+  const duplicate=structuredClone(rendered);duplicate.metrics.push(duplicate.metrics[0]);assert.throws(()=>planMonitoring(duplicate,readback),{code:"MONITORING_OPERATION_AMBIGUOUS"});
+  assert.throws(()=>planMonitoring(rendered,{...readback,project:"foreign-proj1"}),{code:"MONITORING_PLAN_READBACK_INVALID"});
+  assert.throws(()=>planMonitoring(rendered,{...readback,environment:"production"}),{code:"MONITORING_PLAN_READBACK_INVALID"});
+});
+
+test("mid-pass state drift stops before the next mutation and preserves the first confirmed create", async () => {
+  const fake=mutableMonitoring({}, {beforeRead:(cycle,state)=>{if(cycle===5)state.metrics[0].filter+=' AND severity="ERROR"';}});
+  // execute helper's plan read iscycle1; executorinitial2/pre3/post4/nextpre5.
+  const result=await execute(fake);assert.equal(result.status,"partial");assert.equal(result.completed.length,1);
+  assert.equal(result.failed.stage,"precondition");assert.equal(result.failed.mutationAttempted,false);assert.equal(result.failed.code,"MONITORING_READBACK_DRIFT");
+  assert.equal(fake.requests.length,1);assert.equal(result.unattempted.length,6);assert.equal(result.readback.status,"ok");assert.equal(fake.state.metrics.length,1);
+});
+
+test("failure after one write records only confirmed work; no rollback/retry or leaked provider body", async () => {
+  const fake=mutableMonitoring({}, {failWrite:2}),result=await execute(fake);
+  assert.equal(result.status,"partial");assert.equal(result.completed.length,1);assert.equal(result.failed.stage,"write");assert.equal(result.failed.mutationAttempted,true);
+  assert.equal(result.unattempted.length,6);assert.equal(fake.requests.length,2);assert.equal(fake.state.metrics.length,1);
+  assert.equal(JSON.stringify(result).includes("PRIVATE_WRITE_MARKER"),false);assert.equal(result.atomic,false);
+});
+
+test("post-write readback failure or wrong response identity remains explicitly unconfirmed", async () => {
+  const fake=mutableMonitoring({}, {failReadFrom:4}),result=await execute(fake);
+  assert.equal(result.status,"partial");assert.equal(result.completed.length,0);assert.equal(result.failed.stage,"readback");assert.equal(result.failed.mutationAttempted,true);
+  assert.equal(result.readback.status,"unconfirmed");assert.equal(fake.state.metrics.length,1);assert.equal(fake.requests.length,1);
+  assert.equal(JSON.stringify(result).includes("PRIVATE_READ_MARKER"),false);
+  const other=mutableMonitoring({}, {badResponse:true}),bad=await execute(other);assert.equal(bad.status,"partial");assert.equal(bad.completed.length,0);assert.equal(other.requests.length,1);
+});
+
+test("desired-state drift and a noncommitted direct input refuse before mutation", async () => {
+  const fake=mutableMonitoring(),changed=structuredClone(STAGING);changed.service.maxInstances=STAGING.service.maxInstances+1;
+  const result=await execute(fake,{reloadDesired:()=>changed});assert.equal(result.status,"partial");assert.equal(result.failed.code,"MONITORING_DESIRED_STATE_DRIFT");assert.equal(fake.requests.length,0);
+  await assert.rejects(applyMonitoring(changed,{execute:true,authorize:"1".repeat(64),runner:fake.runner,transport:fake.transport}),{code:"MONITORING_COMMITTED_DESIRED_STATE_REQUIRED"});
+});
+
+test("default admitted REST adapter keeps token in memory, restricts requests, bounds/redacts failures", async () => {
+  const fake=mutableMonitoring(),p=admittedPlan(fake),headers=[];
+  const fetchImpl=async(url,options)=>{headers.push(options.headers);assert.equal(options.redirect,"error");assert.equal(options.credentials,"omit");assert.ok(options.signal instanceof AbortSignal);
+    const result=await fake.transport({url,method:options.method,body:JSON.parse(options.body)});return new Response(JSON.stringify(result),{status:200});};
+  const result=await applyMonitoring(STAGING,{execute:true,authorize:p.planDigest,runner:fake.runner,fetchImpl});assert.equal(result.status,"applied");
+  const auth=fake.calls.filter(c=>c.argv[0]==="auth");assert.equal(auth.length,1);assert.ok(auth[0].argv.includes(`--project=${PROJECT}`));assert.deepEqual(auth[0].options.env,CHANNEL_GCLOUD_ENV);
+  assert.equal(JSON.stringify(result).includes("synthetic-token"),false);assert.ok(headers.every(h=>h.authorization.startsWith("Bearer synthetic-token")));
+  const bad=mutableMonitoring(),badPlan=admittedPlan(bad);const failure=await applyMonitoring(STAGING,{execute:true,authorize:badPlan.planDigest,runner:bad.runner,
+    fetchImpl:async()=>new Response("PRIVATE_HTTP_MARKER",{status:403})});assert.equal(failure.status,"partial");assert.equal(failure.failed.code,"MONITORING_API_FAILED");assert.equal(JSON.stringify(failure).includes("PRIVATE_HTTP_MARKER"),false);
 });

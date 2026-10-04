@@ -3,10 +3,10 @@
 /**
  * Operator CLI for monitoring and alerting as code (OPS-5, E-OPS5): render,
  * readback and plan for the metrics, uptime checks and policies, and the one
- * email notification channel (OWN-5c). The only write is notification-channel
- * creating that channel under its plan digest; nothing here changes or
- * deletes a monitoring resource, and applying the policies is a later,
- * separately authorized stream.
+ * email notification channel (OWN-5c). Metric/check/policy apply is dry by
+ * default; exact --execute=true plus --authorize=<fresh planDigest> admits
+ * eligible creates/updates only. Channel creation remains a separate command.
+ * No deletes, implicit rollback, retries, cadence or probe producer changes.
  *
  *   render  (--environment=<production|staging> | --desired-state=<abs path>)
  *           [--notification-channel=projects/<project>/notificationChannels/<id>]
@@ -20,6 +20,9 @@
  *     Readback plus the deterministic plan (create, update, unchanged,
  *     deferred, and live plane resources the render does not name, which an
  *     apply would refuse to delete) and its planDigest.
+ *   apply   (--environment | --desired-state) [--notification-channel=...]
+ *     Dry by default. Writes need --execute=true --authorize=<fresh planDigest>,
+ *     committed desired state only; sequential readback-confirmed creates/updates.
  *   origin-lock-probe (--environment | --desired-state)
  *     One unauthenticated GET of https://<service host>/api/health. Exit 0
  *     only for exactly Google's front-end 403 (status 403, no origin marker
@@ -72,8 +75,8 @@ import {
   renderedDigest,
 } from "./gcp-ops-monitoring-policies.mjs";
 
-export const GCP_MONITORING_READBACK_SCHEMA = "tibotattle-gcp-monitoring-readback-v1";
-export const GCP_MONITORING_PLAN_SCHEMA = "tibotattle-gcp-monitoring-plan-v1";
+export const GCP_MONITORING_READBACK_SCHEMA = "tibotattle-gcp-monitoring-readback-v2";
+export const GCP_MONITORING_PLAN_SCHEMA = "tibotattle-gcp-monitoring-plan-v2";
 export const GCP_MONITORING_ORIGIN_LOCK_SCHEMA = "tibotattle-gcp-monitoring-origin-lock-v1";
 export const GCP_MONITORING_CHANNEL_SCHEMA = "tibotattle-gcp-monitoring-channel-v1";
 /**
@@ -119,6 +122,7 @@ const COMMANDS = Object.freeze({
   render: Object.freeze([...SOURCE, "--notification-channel"]),
   readback: Object.freeze([...SOURCE]),
   plan: Object.freeze([...SOURCE, "--notification-channel"]),
+  apply: Object.freeze([...SOURCE, "--notification-channel", "--execute", "--authorize"]),
   "origin-lock-probe": Object.freeze([...SOURCE]),
   "notification-channel": Object.freeze([...SOURCE, "--email-file", "--authorize"]),
 });
@@ -152,7 +156,13 @@ export function parseGcpMonitoringArgs(argv) {
     if (!isAbsolute(emailFile)) fail("GCP_MONITORING_EMAIL_FILE_PATH_INVALID");
     if (authorize !== null && !/^[0-9a-f]{64}$/u.test(authorize)) fail("GCP_MONITORING_AUTHORIZE_INVALID");
   }
+  if (argv[0] === "apply") {
+    if (values.has("--execute") && values.get("--execute") !== "true") fail("GCP_MONITORING_EXECUTE_INVALID");
+    if (values.has("--execute") !== values.has("--authorize")) fail("MONITORING_EXECUTION_AUTHORIZATION_REQUIRED");
+    if (authorize !== null && !/^[0-9a-f]{64}$/u.test(authorize)) fail("GCP_MONITORING_AUTHORIZE_INVALID");
+  }
   return Object.freeze({
+    ...(argv[0] === "apply" ? { execute: values.has("--execute") } : {}),
     command: argv[0],
     desiredStatePath: desiredStatePath === null ? null : resolve(desiredStatePath),
     environment,
@@ -171,7 +181,7 @@ export function parseGcpMonitoringArgs(argv) {
  */
 export function defaultMonitoringRunner(argv, { env = {}, spawn = spawnSync } = {}) {
   const result = spawn("gcloud", argv, {
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: GCLOUD_MAX_BUFFER_BYTES, windowsHide: true,
+    timeout: 30_000, killSignal: "SIGKILL", encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: GCLOUD_MAX_BUFFER_BYTES, windowsHide: true,
     env: { ...process.env, ...env },
   });
   return { status: result.status, stdout: result.stdout, error: result.error };
@@ -201,7 +211,7 @@ export function guardedMonitoringGcloud(runner, project) {
     const what = shapeOf(argv).replaceAll(" ", "-");
     let result;
     try {
-      result = runner([...argv]);
+      result = runner([...argv], { env: { ...CHANNEL_GCLOUD_ENV } });
     } catch {
       fail(`GCLOUD_CALL_FAILED:${what}`);
     }
@@ -233,6 +243,11 @@ function planeOwns(desired, name, separator) {
 export function metricView(metric) {
   return {
     filter: metric?.filter ?? null,
+    description: metric?.description ?? null,
+    disabled: metric?.disabled === true,
+    metricKind: metric?.metricDescriptor?.metricKind ?? null,
+    unit: metric?.metricDescriptor?.unit ?? null,
+    labelValueTypes: (metric?.metricDescriptor?.labels ?? []).map((l) => ({ key: l.key, valueType: l.valueType ?? "STRING" })).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
     labelExtractors: isRecord(metric?.labelExtractors) ? metric.labelExtractors : {},
     labels: (Array.isArray(metric?.metricDescriptor?.labels) ? metric.metricDescriptor.labels : [])
       .map((label) => label?.key ?? null).sort(),
@@ -269,59 +284,90 @@ export function policyView(policy) {
     }),
     combiner: policy?.combiner ?? null,
     documentation: policy?.documentation?.content ?? null,
+    documentationMimeType: policy?.documentation?.mimeType ?? null,
     userLabels: isRecord(policy?.userLabels) ? policy.userLabels : {},
     severity: policy?.severity ?? null,
+    enabled: policy?.enabled !== false,
+    alertStrategy: policy?.alertStrategy ?? null,
     channelsDigest: sha256Hex(canonicalJson(channels)),
   };
 }
 
-/** Reads the plane's monitoring resources: three list calls, managed fields only. */
+const KINDS = Object.freeze({ "log-metric": "metrics", "uptime-check": "uptimeChecks", "alert-policy": "policies" });
+const VIEWS = Object.freeze({ "log-metric": metricView, "uptime-check": uptimeView, "alert-policy": policyView });
+function resourceIdentity(kind, entry, project) {
+  if (kind === "log-metric") {
+    const name = entry?.name;
+    if (typeof name !== "string") fail("MONITORING_RESOURCE_IDENTITY_INVALID");
+    if (/^[a-z][a-z0-9_]{1,127}$/u.test(name)) return `projects/${project}/metrics/${name}`;
+    if (new RegExp(`^projects/${project}/metrics/[a-z][a-z0-9_]{1,127}$`, "u").test(name)) return name;
+  } else {
+    const type = kind === "uptime-check" ? "uptimeCheckConfigs" : "alertPolicies";
+    if (typeof entry?.name === "string" && new RegExp(`^projects/${project}/${type}/[A-Za-z0-9_-]{1,128}$`, "u").test(entry.name)) return entry.name;
+  }
+  fail("MONITORING_RESOURCE_IDENTITY_INVALID");
+}
+function managedResource(kind, entry, expected, desired) {
+  if (!expected) return false;
+  if (kind === "log-metric") return entry.description === expected.body.description;
+  if (kind === "alert-policy") return entry.userLabels?.["managed-by"] === "tibotattle-ops-5"
+    && entry.userLabels?.environment === desired.environment;
+  return canonicalJson(entry.monitoredResource) === canonicalJson(expected.body.monitoredResource);
+}
+/** Three project-scoped lists. Identity, duplicate and ownership evidence participates in admission. */
 export function readbackMonitoring(desired, { runner = defaultMonitoringRunner } = {}) {
-  const call = guardedMonitoringGcloud(runner, desired.project);
-  const project = `--project=${desired.project}`;
-  const metrics = call(["logging", "metrics", "list", project, "--format=json"])
-    .filter((entry) => typeof entry?.name === "string" && planeOwns(desired, tail(entry.name), "_"));
-  const uptime = call(["monitoring", "uptime", "list-configs", project, "--format=json"])
-    .filter((entry) => typeof entry?.displayName === "string" && planeOwns(desired, entry.displayName, "-"));
-  const policies = call(["monitoring", "policies", "list", project, "--format=json"])
-    .filter((entry) => typeof entry?.displayName === "string" && planeOwns(desired, entry.displayName, "-"));
-  const by = (entries, key, view) => Object.fromEntries(entries.map((entry) => [key(entry), view(entry)])
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)));
-  return deepFreeze({
-    schema: GCP_MONITORING_READBACK_SCHEMA,
-    environment: desired.environment,
-    project: desired.project,
-    metrics: by(metrics, (entry) => tail(entry.name), metricView),
-    uptimeChecks: by(uptime, (entry) => entry.displayName, uptimeView),
-    policies: by(policies, (entry) => entry.displayName, policyView),
-  });
+  const call = guardedMonitoringGcloud(runner, desired.project), project = `--project=${desired.project}`;
+  const expected = renderMonitoring(desired), bindings = {}, values = {};
+  for (const [kind, command, separator] of [["log-metric", ["logging", "metrics", "list"], "_"],
+    ["uptime-check", ["monitoring", "uptime", "list-configs"], "-"], ["alert-policy", ["monitoring", "policies", "list"], "-"]]) {
+    const field = KINDS[kind], live = {}, identities = {}, own = new Map(expected[field].map((e) => [e.name, e]));
+    for (const entry of call([...command, project, "--format=json"])) {
+      const identity = resourceIdentity(kind, entry, desired.project);
+      const name = kind === "log-metric" ? tail(entry.name) : entry.displayName;
+      if (typeof name !== "string") fail("MONITORING_RESOURCE_IDENTITY_INVALID");
+      if (!planeOwns(desired, name, separator)) continue;
+      if (Object.hasOwn(live, name)) fail("MONITORING_RESOURCE_AMBIGUOUS");
+      live[name] = VIEWS[kind](entry);
+      const conditionNames = kind === "alert-policy" ? (entry.conditions ?? []).map((c) => ({ displayName: c.displayName, name: c.name ?? null })) : [];
+      if (conditionNames.some((c) => typeof c.displayName !== "string" || typeof c.name !== "string" || !new RegExp(`^${identity}/conditions/[A-Za-z0-9_-]{1,128}$`, "u").test(c.name))
+          || new Set(conditionNames.map((c) => c.displayName)).size !== conditionNames.length) fail("MONITORING_CONDITION_IDENTITY_INVALID");
+      identities[name] = { resourceName: identity, managed: managedResource(kind, entry, own.get(name), desired),
+        // No raw provider body/channel values leave the reader. The whole object binds unmanaged fields too.
+        rawDigest: sha256Hex(canonicalJson(entry)), conditionNames };
+    }
+    const sorted = (v) => Object.fromEntries(Object.entries(v).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+    values[field] = sorted(live); bindings[field] = sorted(identities);
+  }
+  return deepFreeze({ schema: GCP_MONITORING_READBACK_SCHEMA, environment: desired.environment, project: desired.project, ...values, bindings });
 }
 
 // ---------------------------------------------------------------------------
 // Plan
 
-function compare(kind, rendered, live, view) {
+function compare(kind, rendered, live, view, bindings) {
   return rendered.map((entry) => {
     const deferred = {
       ...(entry.deferred === undefined ? {} : { deferred: entry.deferred }),
       ...(entry.deferredConditions === undefined ? {} : { deferredConditions: entry.deferredConditions }),
     };
-    if (!Object.hasOwn(live, entry.name)) return { id: `${kind}:create:${entry.id}`, kind, name: entry.name, action: "create", ...deferred };
+    const binding = bindings[entry.name];
+    const proof = { bodyDigest: sha256Hex(canonicalJson(entry.body)), resourceName: binding?.resourceName ?? null, priorRawDigest: binding?.rawDigest ?? null };
+    if (!Object.hasOwn(live, entry.name)) return { ...proof, id: `${kind}:create:${entry.id}`, kind, name: entry.name, action: "create", ...deferred };
     const same = canonicalJson(view(entry.body)) === canonicalJson(live[entry.name]);
-    return { id: `${kind}:${same ? "unchanged" : "update"}:${entry.id}`, kind, name: entry.name,
+    return { ...proof, ...(binding?.managed === true ? {} : { refused: "MONITORING_UNMANAGED_TARGET" }), id: `${kind}:${same ? "unchanged" : "update"}:${entry.id}`, kind, name: entry.name,
       action: same ? "unchanged" : "update", ...deferred };
   });
 }
 
 /** The deterministic plan for a render and a readback. */
 export function planMonitoring(rendered, readback) {
-  if (readback?.schema !== GCP_MONITORING_READBACK_SCHEMA || readback.project !== rendered.project) {
+  if (readback?.schema !== GCP_MONITORING_READBACK_SCHEMA || readback.project !== rendered.project || readback.environment !== rendered.environment || !isRecord(readback.bindings)) {
     fail("MONITORING_PLAN_READBACK_INVALID");
   }
   const operations = [
-    ...compare("log-metric", rendered.metrics, readback.metrics, metricView),
-    ...compare("uptime-check", rendered.uptimeChecks, readback.uptimeChecks, uptimeView),
-    ...compare("alert-policy", rendered.policies, readback.policies, policyView),
+    ...compare("log-metric", rendered.metrics, readback.metrics, metricView, readback.bindings.metrics),
+    ...compare("uptime-check", rendered.uptimeChecks, readback.uptimeChecks, uptimeView, readback.bindings.uptimeChecks),
+    ...compare("alert-policy", rendered.policies, readback.policies, policyView, readback.bindings.policies),
   ];
   const named = new Set([...rendered.metrics, ...rendered.uptimeChecks, ...rendered.policies].map(({ name }) => name));
   for (const [kind, live] of [["log-metric", readback.metrics], ["uptime-check", readback.uptimeChecks],
@@ -330,12 +376,14 @@ export function planMonitoring(rendered, readback) {
       operations.push({ id: `${kind}:delete:${name}`, kind, name, action: "delete", refused: "MONITORING_DELETE_REFUSED" });
     }
   }
+  if (new Set(operations.map((o) => o.id)).size !== operations.length) fail("MONITORING_OPERATION_AMBIGUOUS");
   const body = {
     schema: GCP_MONITORING_PLAN_SCHEMA,
     environment: rendered.environment,
     project: rendered.project,
     desiredStateDigest: rendered.desiredStateDigest,
     renderedDigest: renderedDigest(rendered),
+    readbackDigest: sha256Hex(canonicalJson(readback)),
     notificationChannel: rendered.notificationChannel,
     operations,
     summary: {
@@ -345,9 +393,173 @@ export function planMonitoring(rendered, readback) {
       deferred: operations.filter(({ deferred }) => deferred !== undefined).length,
       refused: operations.filter(({ refused }) => refused !== undefined).length,
     },
-    apply: "not available: E-OPS5 renders, reads back and plans only",
+    apply: "dry by default; eligible create/update only with --execute=true and exact --authorize",
   };
   return deepFreeze({ ...body, planDigest: sha256Hex(canonicalJson(body)) });
+}
+
+// ---------------------------------------------------------------------------
+// Protected metric/check/policy create/update
+
+const APPLY_SCHEMA = "tibotattle-gcp-monitoring-apply-v1";
+const API_TIMEOUT_MS = 30_000;
+const API_BODY_LIMIT = 2 * 1024 * 1024;
+const digest = (value) => sha256Hex(canonicalJson(value));
+function renderedEntry(rendered, operation) {
+  const field = KINDS[operation?.kind];
+  if (!field || !["create", "update"].includes(operation.action) || operation.deferred !== undefined || operation.refused !== undefined) {
+    fail("MONITORING_OPERATION_FORBIDDEN");
+  }
+  const entries = rendered[field].filter((e) => e.name === operation.name && operation.id === `${e.kind}:${operation.action}:${e.id}`);
+  if (entries.length !== 1 || entries[0].deferred !== undefined) fail("MONITORING_OPERATION_FORBIDDEN");
+  return entries[0];
+}
+/** Only a canonical operation recomputed from this exact render/readback can become an API request. */
+export function monitoringMutationRequest(rendered, readback, operation) {
+  const fresh = planMonitoring(rendered, readback);
+  if (fresh.summary.refused > 0) fail(fresh.operations.some((o) => o.action === "delete") ? "MONITORING_DELETE_REFUSED" : "MONITORING_UNMANAGED_TARGET");
+  if (fresh.operations.filter((o) => canonicalJson(o) === canonicalJson(operation)).length !== 1) fail("MONITORING_OPERATION_FORBIDDEN");
+  const entry = renderedEntry(rendered, operation), field = KINDS[operation.kind];
+  const binding = readback.bindings[field][entry.name];
+  if (operation.action === "update" && binding?.managed !== true) fail("MONITORING_UNMANAGED_TARGET");
+  const body = structuredClone(entry.body), project = `projects/${rendered.project}`;
+  let method, url;
+  if (operation.kind === "log-metric") {
+    if (body.name !== entry.name) fail("MONITORING_RESOURCE_IDENTITY_INVALID");
+    method = operation.action === "create" ? "POST" : "PUT";
+    url = `https://logging.googleapis.com/v2/${project}/metrics${operation.action === "create" ? "" : `/${entry.name}`}`;
+  } else {
+    const type = operation.kind === "uptime-check" ? "uptimeCheckConfigs" : "alertPolicies";
+    method = operation.action === "create" ? "POST" : "PATCH";
+    url = `https://monitoring.googleapis.com/v3/${project}/${type}`;
+    if (operation.action === "update") {
+      body.name = binding.resourceName;
+      // Keep identities for surviving conditions; new condition names are assigned by Google.
+      if (operation.kind === "alert-policy") {
+        for (const condition of body.conditions) {
+          const existing = binding.conditionNames.find((c) => c.displayName === condition.displayName);
+          if (existing?.name) condition.name = existing.name;
+        }
+      }
+      const fields = Object.keys(entry.body).sort().join(",");
+      url = `https://monitoring.googleapis.com/v3/${binding.resourceName}?updateMask=${encodeURIComponent(fields)}`;
+    }
+  }
+  if (operation.action === "update") {
+    const identity = resourceIdentity(operation.kind, operation.kind === "log-metric" ? { name: entry.name } : body, rendered.project);
+    if (identity !== binding.resourceName) fail("MONITORING_RESOURCE_IDENTITY_INVALID");
+  }
+  return deepFreeze({ method, url, body });
+}
+
+/** Bound to the admitted exact requests, no generic HTTP or caller-selected endpoint. */
+function admittedMonitoringTransport(project, requests, { runner, fetchImpl = globalThis.fetch } = {}) {
+  const allowed = new Set(requests.map(canonicalJson)); let token = null;
+  return async (request) => {
+    const key = canonicalJson(request);
+    if (!allowed.delete(key)) fail("MONITORING_TRANSPORT_FORBIDDEN");
+    if (token === null) {
+      let result;
+      try { result = runner(["auth", "print-access-token", `--project=${project}`, "--quiet"], { env: { ...CHANNEL_GCLOUD_ENV } }); } catch { fail("MONITORING_AUTH_FAILED"); }
+      if (!isRecord(result) || result.status !== 0 || result.error || typeof result.stdout !== "string"
+          || !/^[A-Za-z0-9._~-]{20,8192}$/u.test(result.stdout.trim())) fail("MONITORING_AUTH_FAILED");
+      token = result.stdout.trim(); // memory only: never argv, disk, receipt, or error output
+    }
+    let response;
+    try { response = await fetchImpl(request.url, { method: request.method, redirect: "error", credentials: "omit",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(request.body), signal: AbortSignal.timeout(API_TIMEOUT_MS) }); } catch { fail("MONITORING_API_FAILED"); }
+    if (response.status < 200 || response.status >= 300) { try { await response.body?.cancel(); } catch { /* no response logging */ } fail("MONITORING_API_FAILED"); }
+    let text = "", bytes = 0; const decoder = new TextDecoder("utf-8", { fatal: true });
+    try {
+      // Limit allocation while reading, not after response.text() has materialized it.
+      for await (const chunk of response.body) {
+        bytes += chunk.byteLength; if (bytes > API_BODY_LIMIT) fail("MONITORING_API_OUTPUT_INVALID");
+        text += decoder.decode(chunk, { stream: true });
+      }
+      return JSON.parse(text + decoder.decode());
+    } catch { fail("MONITORING_API_OUTPUT_INVALID"); }
+  };
+}
+
+function applyChannelBinding(desired, channel, runner) {
+  if (channel === null) return null;
+  const listed = guardedChannelGcloud(runner, desired.project)(["beta", "monitoring", "channels", "list", `--project=${desired.project}`, "--format=json"]);
+  if (!Array.isArray(listed)) fail("MONITORING_APPLY_CHANNEL_UNCONFIRMED");
+  const selected = listed.filter((c) => c?.name === channel);
+  if (selected.length !== 1 || listed.filter((c) => c?.displayName === emailChannelDisplayName(desired)).length !== 1 || selected[0].type !== "email" || selected[0].enabled === false
+      || selected[0].displayName !== emailChannelDisplayName(desired)) fail("MONITORING_APPLY_CHANNEL_UNCONFIRMED");
+  return digest({ name: channel, type: selected[0].type, displayName: selected[0].displayName, enabled: true });
+}
+
+function assertOperationResult(rendered, operation, result, after) {
+  const entry = renderedEntry(rendered, operation), field = KINDS[operation.kind];
+  const identity = resourceIdentity(operation.kind, result, rendered.project);
+  const expectedName = operation.kind === "log-metric" ? tail(result.name) : result.displayName;
+  if (expectedName !== entry.name || after.bindings[field][entry.name]?.resourceName !== identity
+      || after.bindings[field][entry.name]?.managed !== true
+      || canonicalJson(VIEWS[operation.kind](result)) !== canonicalJson(VIEWS[operation.kind](entry.body))
+      || canonicalJson(after[field][entry.name]) !== canonicalJson(VIEWS[operation.kind](entry.body))) fail("MONITORING_WRITE_UNCONFIRMED");
+}
+
+/** Fresh deterministic plan; writes require the digest and explicit execute, with no implicit retry/rollback. */
+export async function applyMonitoring(desired, { notificationChannel = null, execute = false, authorize = null,
+  runner = defaultMonitoringRunner, transport, fetchImpl = globalThis.fetch, reloadDesired,
+  committedDesired = () => loadCommittedDesiredState(desired.environment) } = {}) {
+  if (typeof execute !== "boolean" || execute !== (authorize !== null) || (authorize !== null && !/^[0-9a-f]{64}$/u.test(authorize))) {
+    fail("MONITORING_EXECUTION_AUTHORIZATION_REQUIRED");
+  }
+  if (execute && digest(desired) !== digest(committedDesired())) fail("MONITORING_COMMITTED_DESIRED_STATE_REQUIRED");
+  const rendered = renderMonitoring(desired, { notificationChannel });
+  const initial = readbackMonitoring(desired, { runner }), plan = planMonitoring(rendered, initial);
+  const candidates = plan.operations.filter((o) => ["create", "update"].includes(o.action) && o.deferred === undefined);
+  const body = { schema: APPLY_SCHEMA, environment: desired.environment, project: desired.project, planDigest: plan.planDigest,
+    desiredStateDigest: plan.desiredStateDigest, renderedDigest: plan.renderedDigest, readbackDigest: plan.readbackDigest,
+    execute, applied: false, atomic: false, plan, completed: [], failed: null, unattempted: candidates.map((o) => o.id) };
+  if (!execute) return deepFreeze({ ...body, status: "dry" });
+  if (authorize !== plan.planDigest) fail("MONITORING_AUTHORIZATION_MISMATCH");
+  if (plan.summary.refused > 0) fail(plan.operations.some((o) => o.action === "delete") ? "MONITORING_DELETE_REFUSED" : "MONITORING_UNMANAGED_TARGET");
+  // Validate every eligible target before the first write; supplied/mutated operations never form authority.
+  const channelBinding = applyChannelBinding(desired, notificationChannel, runner);
+  const requests = candidates.map((o) => monitoringMutationRequest(rendered, initial, o));
+  const call = transport ?? admittedMonitoringTransport(desired.project, requests, { runner, fetchImpl });
+  if (typeof call !== "function") fail("MONITORING_TRANSPORT_INVALID");
+  let expected = initial, completed = [], failed = null, stage = "precondition", attempted = false;
+  for (let index = 0; index < candidates.length; index++) {
+    const operation = candidates[index]; stage = "precondition"; attempted = false;
+    try {
+      if (digest(renderMonitoring((reloadDesired ?? committedDesired)(), { notificationChannel })) !== digest(rendered)) fail("MONITORING_DESIRED_STATE_DRIFT");
+      if (applyChannelBinding(desired, notificationChannel, runner) !== channelBinding) fail("MONITORING_APPLY_CHANNEL_DRIFT");
+      const current = readbackMonitoring(desired, { runner });
+      if (digest(current) !== digest(expected)) fail("MONITORING_READBACK_DRIFT");
+      // Rebuild from the current checked live state, not from a caller-supplied plan JSON.
+      const request = monitoringMutationRequest(rendered, current, operation);
+      if (canonicalJson(request) !== canonicalJson(requests[index])) fail("MONITORING_REQUEST_DRIFT");
+      stage = "write"; attempted = true; const result = await call(request);
+      stage = "readback"; const after = readbackMonitoring(desired, { runner });
+      assertOperationResult(rendered, operation, result, after);
+      // Only the admitted target may change between the pre/post snapshots.
+      const isolated = structuredClone(after), field = KINDS[operation.kind];
+      if (Object.hasOwn(current[field], operation.name)) {
+        isolated[field][operation.name] = current[field][operation.name]; isolated.bindings[field][operation.name] = current.bindings[field][operation.name];
+      } else { delete isolated[field][operation.name]; delete isolated.bindings[field][operation.name]; }
+      if (digest(isolated) !== digest(current)) fail("MONITORING_READBACK_DRIFT");
+      completed.push(operation.id); expected = after;
+    } catch (error) {
+      failed = { id: operation.id, stage, mutationAttempted: attempted,
+        code: error instanceof GcpOpsInfraError ? error.code : "MONITORING_APPLY_FAILED" };
+      break;
+    }
+  }
+  let readback = null;
+  try {
+    const final = readbackMonitoring(desired, { runner });
+    readback = { status: "ok", digest: digest(final), plan: planMonitoring(rendered, final) };
+    if (failed === null && digest(final) !== digest(expected)) failed = { id: null, stage: "final-readback", mutationAttempted: false, code: "MONITORING_READBACK_DRIFT" };
+  } catch { readback = { status: "unconfirmed" }; if (failed === null) failed = { id: null, stage: "final-readback", mutationAttempted: false, code: "MONITORING_FINAL_READBACK_FAILED" }; }
+  return deepFreeze({ ...body, status: failed === null ? "applied" : "partial", applied: completed.length > 0,
+    completed, failed, unattempted: candidates.filter((o) => !completed.includes(o.id) && o.id !== failed?.id).map((o) => o.id), readback,
+    note: "No rollback or retry. Unknown write outcomes remain unconfirmed; inspect/re-plan fresh state before another admission." });
 }
 
 // ---------------------------------------------------------------------------
@@ -580,12 +792,14 @@ export async function main(argv = process.argv.slice(2), {
   readSource,
   now,
   readEmailFile = readAlertEmailFile,
+  transport,
   stdout = (text) => process.stdout.write(text),
   stderr = (text) => process.stderr.write(text),
 } = {}) {
   const print = (value) => stdout(`${JSON.stringify(value, null, 2)}\n`);
   try {
     const config = parseGcpMonitoringArgs(argv);
+    if (config.command === "apply" && config.execute && config.desiredStatePath !== null) fail("MONITORING_COMMITTED_DESIRED_STATE_REQUIRED");
     const sources = { ...(readFile === undefined ? {} : { readFile }), ...(readSource === undefined ? {} : { readSource }) };
     let desired;
     if (config.desiredStatePath === null) {
@@ -614,6 +828,16 @@ export async function main(argv = process.argv.slice(2), {
       print({ ...rendered, policies: rendered.policies.map((policy) => ({ ...policy,
         body: { ...policy.body, notificationChannels: policy.body.notificationChannels.map(() => "<assigned>") } })) });
       return 0;
+    }
+    if (config.command === "apply") {
+      const reloadDesired = () => config.desiredStatePath === null ? loadCommittedDesiredState(config.environment, sources)
+        : (config.environment === null ? readDesiredStateFile(config.desiredStatePath, sources)
+          : requireEnvironment(readDesiredStateFile(config.desiredStatePath, sources), config.environment));
+      const result = await applyMonitoring(desired, { notificationChannel: config.notificationChannel, runner,
+        execute: config.execute, authorize: config.authorize, reloadDesired, fetchImpl,
+        committedDesired: () => loadCommittedDesiredState(desired.environment, sources),
+        ...(transport === undefined ? {} : { transport }) });
+      print(result); return result.status === "partial" || result.plan.summary.refused > 0 ? 2 : 0;
     }
     const plan = planMonitoring(rendered, readbackMonitoring(desired, { runner }));
     print(plan);
