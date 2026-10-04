@@ -796,7 +796,7 @@ export function mountModelPerformance(options = {}) {
       return;
     }
     // Every exact period/mode window shares the same timing worker. Register
-    // them together so one background history pass can fill all eight views.
+    // them together so one background history pass can fill every period/mode view.
     await Promise.all(preloadTargets().map(target => preloadPeriod(target, runLifecycle, runScope)));
   }
   function preload() {

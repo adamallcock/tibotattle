@@ -25,8 +25,8 @@ versioning, and retirement rules.
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
 | Public model identity mirror | `packages/telemetry-contract/src/model-catalog.js` only | `apps/web/public/model-catalog.generated.js`; excludes telemetry and admin-history contracts | `npm run telemetry:browser:check` and browser parity/public-asset isolation tests |
 | Reviewed model identities and admin history | `packages/telemetry-contract/src/model-catalog.js` and `admin-model-history.js` | Public package exports and the telemetry browser mirror; closed export/upload model enums checked against the catalog | Catalog tests, `npm run telemetry:check`, browser and upload mirror checks |
-| Export set v0.1/v0.2 | `schemas/export-set-v0.1/` and `schemas/export-set-v0.2/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
-| Export deletion v0.1 | `schemas/export-deletion-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Export deletion tests |
+| Export set v0.1/v0.2/v0.3 | `schemas/export-set-v0.1/`, `schemas/export-set-v0.2/` and `schemas/export-set-v0.3/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
+| Export deletion | `schemas/export-deletion-v0.1/` and `schemas/export-deletion-v0.2/journal.schema.json` | v0.2 journal admits the current manifest; retained preflight, commit marker and receipt stay v0.1. | Export deletion tests |
 | Workspace discard v0.1 | `schemas/export-workspace-discard-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Workspace discard tests |
 | Product synthetic v0.1 | `schemas/product-synthetic-v0.1/` | Contribution and encrypted envelope schemas. | Worker/local acceptance tests |
 | Provider accounting snapshot | `schemas/provider-accounting-snapshot-v0.1.schema.json` | None. | Accounting/export tests |
@@ -51,9 +51,9 @@ The root schema families are grouped as follows:
 | `telemetry-contribution-v1.1/` | 8 | Generated attribution, usage, quota, session, chunk, envelope, day-manifest and complete-domain-manifest contracts. |
 | `telemetry-contribution-v1.2/` | 8 | Independently authorized successor with nullable continuity and non-additive cache-write TTL detail; hosted runtime starts staged. |
 | `telemetry-performance-v1/` | 2 | Independent staged daily measurement and histogram contracts; not a v1.2 usage stream. |
-| `export-deletion-v0.1/` | 4 | Recoverable deletion preflight/journal/commit/receipt. |
+| `export-deletion-v0.1/`, `export-deletion-v0.2/` | 5 | Recoverable deletion preflight/commit/receipt and both immutable journal versions. |
 | `export-workspace-discard-v0.1/` | 4 | Recoverable workspace-discard preflight/journal/commit/receipt. |
-| `export-set-v0.1/`, `export-set-v0.2/` | 2 | Versioned export-set manifests. |
+| `export-set-v0.1/`, `export-set-v0.2/`, `export-set-v0.3/` | 3 | Versioned export-set manifests. |
 | `product-synthetic-v0.1/` | 2 | Synthetic contribution and encrypted envelope. |
 | Claude, provider accounting, release manifest, R7 release, R7 resource | 5 | One schema per listed family. |
 
@@ -170,6 +170,28 @@ A version change includes:
 Do not weaken a schema or test to accept an already-invalid payload. Fix the
 producer or introduce an explicit reviewed version transition.
 
+### Local export manifest v0.3
+
+New local sets use `usage-export-set-manifest-v0.3`, with its own schema digest,
+contract and manifest receipt version. Its source-file ceiling is 100,000,
+matching the existing runtime policy across the combined Codex and supplemental
+source plans. The v0.1/v0.2 schema bytes and 5,000-file ceiling remain unchanged;
+an oversized old-version manifest remains invalid. All byte, record, chunk,
+workspace, time and memory limits are unchanged. Packing, gzip representation,
+chunk identities and telemetry compatibility tuples are unchanged.
+
+Current readers still validate and verify both retained versions under their
+existing compatibility checks. A completed v0.2 set can be retried without
+rewriting it only when its manifest and receipt validate and every field other
+than the version-specific manifest header exactly matches the recomputed set.
+Incomplete compressed output resumes to v0.3; plain v0.1 rematerialization still
+fails closed rather than mixing representations. New deletion plans use journal
+v0.2, which explicitly admits the three supported manifest versions. Committed
+v0.1 deletion journals retain their original validator and canonical hash checks,
+so recovery does not restamp or reinterpret their bytes. Unknown versions fail
+closed. This local-only transition does not change hosted contribution contracts
+or qualify the protected R7 release evidence.
+
 ### Staged account/plan attribution contract
 
 v1.1 adds a closed `accountPlanAttribution` object with account basis,
@@ -198,14 +220,20 @@ The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
 
-The source-verified `promax` identifier is accepted by local v0.1 export and
-staged v1.1/v1.2 schemas. The frozen v0.2
+The source- and binary-verified `promax` identifier is accepted by local v0.1
+export and staged v1.1/v1.2 schemas. The frozen v0.2
 contribution schema retains its original vocabulary: its local projection
 writes `unknown` for this value, while v1.1/v1.2 can retain the exact identifier.
-The reviewed installed-binary evidence does not yet cover `promax`. Product
-policy names `pro` Pro 10x and `promax` Pro Max 25x, without changing the
-existing `pro` identity or discarding its history. Provider allowance and
-window semantics remain unverified; the release contract check stays blocked.
+On 2026-10-04 UTC, reviewed ChatGPT-bundled and PATH `codex-cli 0.160.0` each
+generated `promax` among 18 `PlanType` values. The
+[Codex 0.160.0 source](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/protocol/src/auth.rs)
+also confirms its raw value and display name. The ledger marks the identifier
+active, records path-free binary provenance, and passes the required-binary
+contract check. Product expectations name `pro` Pro 10x and `promax` Pro Max
+25x, without changing the existing `pro` identity or discarding its history.
+These ratios are product expectations; provider-authoritative allowance and
+window semantics remain unverified. Enum verification does not establish those
+capacities or qualify a TiboTattle release artifact.
 
 ## Staged continuity successor v1.2
 

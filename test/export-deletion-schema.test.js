@@ -13,7 +13,11 @@ import {
   EXPORT_DELETION_CONFIRMATION_TOKEN_PATTERN,
   EXPORT_DELETION_INVENTORY_ROLES,
   EXPORT_DELETION_JOURNAL_SCHEMA_SHA256,
+  EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_1,
+  EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_2,
   EXPORT_DELETION_JOURNAL_VERSION,
+  EXPORT_DELETION_JOURNAL_VERSION_V0_1,
+  EXPORT_DELETION_JOURNAL_VERSION_V0_2,
   EXPORT_DELETION_ORDER_VERSION,
   EXPORT_DELETION_PLAN_VERSION,
   EXPORT_DELETION_PREFLIGHT_SCHEMA_SHA256,
@@ -22,6 +26,8 @@ import {
   EXPORT_DELETION_RECEIPT_VERSION,
   exportDeletionCommitMarkerSchema,
   exportDeletionJournalSchema,
+  exportDeletionJournalSchemaV0_1,
+  exportDeletionJournalSchemaV0_2,
   exportDeletionPreflightSchema,
   exportDeletionReceiptSchema,
   MAXIMUM_EXPORT_DELETION_INVENTORY_ROWS,
@@ -84,7 +90,7 @@ function journal(chunkCount = 2, sidecars = []) {
     schemaVersion: EXPORT_DELETION_JOURNAL_VERSION,
     planVersion: EXPORT_DELETION_PLAN_VERSION,
     deletionOrderVersion: EXPORT_DELETION_ORDER_VERSION,
-    exportSetManifestVersion: "usage-export-set-manifest-v0.2",
+    exportSetManifestVersion: "usage-export-set-manifest-v0.3",
     directoryIdentities: {
       workspace: { device: 44, inode: 900 },
       output: { device: 44, inode: 901 },
@@ -141,7 +147,7 @@ function receipt() {
 test("deletion v0.1 schemas are immutable and inventory bounds track the export-set ceiling", async () => {
   const contracts = [
     ["preflight-summary.schema.json", exportDeletionPreflightSchema, EXPORT_DELETION_PREFLIGHT_SCHEMA_SHA256],
-    ["journal.schema.json", exportDeletionJournalSchema, EXPORT_DELETION_JOURNAL_SCHEMA_SHA256],
+    ["journal.schema.json", exportDeletionJournalSchemaV0_1, EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_1],
     ["commit-marker.schema.json", exportDeletionCommitMarkerSchema, EXPORT_DELETION_COMMIT_MARKER_SCHEMA_SHA256],
     ["receipt.schema.json", exportDeletionReceiptSchema, EXPORT_DELETION_RECEIPT_SCHEMA_SHA256],
   ];
@@ -304,5 +310,38 @@ test("commit marker and final receipt cannot claim transport, network use, or se
   for (const [value, validate, mutate] of cases) {
     mutate(value);
     assert.equal(validate(value).valid, false);
+  }
+});
+
+
+test("deletion journal v0.2 has a distinct schema and retains the unchanged v0.1 validator", async () => {
+  assert.equal(EXPORT_DELETION_JOURNAL_VERSION, EXPORT_DELETION_JOURNAL_VERSION_V0_2);
+  assert.equal(EXPORT_DELETION_JOURNAL_SCHEMA_SHA256, EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_2);
+  assert.equal(exportDeletionJournalSchema, exportDeletionJournalSchemaV0_2);
+  assert.equal(EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_1, "8088522cbfa5083cb9766721bdbdd9b8f39685d7eade2a3f6b6b6c79f256dd68");
+  const bytes = await readFile(new URL("../schemas/export-deletion-v0.2/journal.schema.json", import.meta.url));
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), EXPORT_DELETION_JOURNAL_SCHEMA_SHA256_V0_2);
+  const expected = structuredClone(exportDeletionJournalSchemaV0_1);
+  expected.$id = "https://app-usagemonitor.local/schemas/export-deletion-v0.2/journal.schema.json";
+  expected.title = "Usage monitor durable local export deletion journal v0.2";
+  expected.properties.schemaVersion.const = EXPORT_DELETION_JOURNAL_VERSION_V0_2;
+  expected.properties.exportSetManifestVersion.enum.push("usage-export-set-manifest-v0.3");
+  assert.deepEqual(exportDeletionJournalSchemaV0_2, expected);
+});
+
+test("journal dispatch preserves old bounds and admits only the reviewed manifest versions", () => {
+  for (const schemaVersion of [EXPORT_DELETION_JOURNAL_VERSION_V0_1, EXPORT_DELETION_JOURNAL_VERSION_V0_2]) {
+    for (const exportSetManifestVersion of [
+      "usage-export-set-manifest-v0.1", "usage-export-set-manifest-v0.2", "usage-export-set-manifest-v0.3",
+    ]) {
+      const value = { ...journal(), schemaVersion, exportSetManifestVersion };
+      assert.equal(validateExportDeletionJournal(value).valid,
+        schemaVersion === EXPORT_DELETION_JOURNAL_VERSION_V0_2 || !exportSetManifestVersion.endsWith("v0.3"));
+    }
+    const value = { ...journal(), schemaVersion, exportSetManifestVersion: "usage-export-set-manifest-v0.4" };
+    assert.equal(validateExportDeletionJournal(value).valid, false);
+  }
+  for (const schemaVersion of [null, "usage-export-deletion-journal-v0.3", "unknown-v0.2"]) {
+    assert.equal(validateExportDeletionJournal({ ...journal(), schemaVersion }).valid, false);
   }
 });

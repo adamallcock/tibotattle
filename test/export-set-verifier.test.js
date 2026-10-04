@@ -18,10 +18,14 @@ import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import {
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3,
   EXPORT_SET_CONTRACT_VERSION_V0_1,
+  EXPORT_SET_CONTRACT_VERSION_V0_2,
   EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1,
+  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
   EXPORT_SET_MANIFEST_VERSION_V0_1,
   EXPORT_SET_MANIFEST_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_3,
   EXPORT_SET_PACKING_VERSION_V0_1,
   exportSetChunkBasenames,
 } from "../src/export-set-schema.js";
@@ -122,9 +126,11 @@ async function localSet() {
 function receiptForManifest(text) {
   const manifest = JSON.parse(text);
   return stableJson({
-    schemaVersion: manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
-      ? EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2
-      : EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1,
+    schemaVersion: new Map([
+      [EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1],
+      [EXPORT_SET_MANIFEST_VERSION_V0_2, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2],
+      [EXPORT_SET_MANIFEST_VERSION_V0_3, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3],
+    ]).get(manifest.schemaVersion),
     manifestSha256: createHash("sha256").update(text).digest("hex"),
     manifestBytes: Buffer.byteLength(text),
     transportReady: false,
@@ -179,7 +185,7 @@ test("set verifier accepts a complete deterministic multi-chunk set", async () =
   try {
     const result = await verifyLocalExportSet({ directory: value.output });
     assert.equal(result.verdict, "passed");
-    assert.equal(result.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_2);
+    assert.equal(result.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_3);
     assert.equal(result.chunkCount, 2);
     assert.deepEqual(result.recordCounts, { usageEvents: 2, quotaSnapshots: 0, activityMarkers: 0 });
     assert.equal(result.bundleBytes, value.manifest.totals.decodedBundleBytes);
@@ -716,6 +722,30 @@ test("verification preserves reviewed bundle-verification failures", async () =>
         && !error.message.includes(canary)
         && !error.message.includes(value.output),
     );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+
+test("set verifier retains compressed v0.2 bytes and version-specific receipts", async () => {
+  const value = await localSet();
+  try {
+    await rewriteManifest(value, (manifest) => {
+      manifest.schemaVersion = EXPORT_SET_MANIFEST_VERSION_V0_2;
+      manifest.manifestContract.version = EXPORT_SET_CONTRACT_VERSION_V0_2;
+      manifest.manifestContract.schemaSha256 = EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2;
+    });
+    const result = await verifyLocalExportSet({ directory: value.output });
+    assert.equal(result.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_2);
+    assert.equal(result.verdict, "passed");
+    assert.equal(result.encodedArtifactBytes, value.manifest.totals.encodedArtifactBytes);
+    const receiptPath = join(value.output, EXPORT_SET_MANIFEST_RECEIPT_BASENAME);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.schemaVersion, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2);
+    receipt.schemaVersion = EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3;
+    await writeFile(receiptPath, stableJson(receipt), { mode: 0o600 });
+    await assert.rejects(verifyLocalExportSet({ directory: value.output }), { code: "export_set_verify_manifest_receipt" });
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

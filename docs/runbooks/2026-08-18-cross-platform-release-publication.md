@@ -550,6 +550,56 @@ sign nested executables and the final package with Authenticode, and use a
 trusted SHA-256 timestamp. Add the native finalizer and manifest entry only
 after those checks pass. Microsoft Store output is a separate subject.
 
+#### Final signed installer upgrade
+
+The signing workflow and the default frozen-installer qualification prove a
+fresh installed journey. For 0.1.27, also run the separate installer-upgrade
+mode of `electron-windows-installer-diagnostic.yml` against the exact final
+signing artifact. Select a reviewed runner ref and provide `qualify_installed`
+and `qualify_upgrade` as `true`, the exact `source_revision`, `signing_run_id`,
+`artifact_id`, `installer_sha256`, and a `predecessor_intake` JSON object matching
+`WINDOWS_FINAL_UPGRADE_PREDECESSOR` in
+`scripts/smoke-electron-windows-final-upgrade.mjs`. Omit the upgrade mode and
+predecessor intake for the retained diagnostic/fresh-install lanes.
+
+The predecessor is the immutable published
+[0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26).
+The closed intake pins its source revision, manifest digest, installer digest,
+size, version and target; it accepts no caller-selected URL or stable-feed
+substitution. The wrapper verifies the immutable GitHub release and pinned
+public manifest before downloading its fixed Windows installer. Native
+Authenticode checks require the expected publisher and timestamp before either
+installer is extracted or executed. Extracted comparison stages are explicitly
+marked as such; they are not independent pre-signing evidence or rebuilt apps.
+
+The native Windows x64 lane installs 0.1.26 into a new owned NSIS directory and
+creates one isolated synthetic profile. Its normal rendered journey ingests
+representative history/projects, sets a preference and verifies durable opt-out.
+The lane proves exit of the predecessor's observed main/companion process tree
+using retained process identities, then runs the exact signed 0.1.27 installer
+into the same owned installation without recreating or reseeding the profile.
+It requires profile byte equality across the installer operation. Afterward,
+normal runtime migration/cache updates are allowed: two successor launches
+must instead prove retained history, project/thread views, settings, opt-out,
+local refresh, clean quit and cold restart, bound to the successor's exact
+ASAR, executable, source metadata and native closure.
+
+Retain `frozen-reference.json`, `frozen-predecessor-reference.json` and
+`windows-final-upgrade.json`. Success requires the owned successor uninstall,
+registry absence, app-process quiescence, firewall removal and profile cleanup.
+An unsettled installer, live descendant or unproven ownership refuses cleanup
+and fails the disposable run. The separate fresh-install receipt remains the
+source of `cleanInstallSmokePassed`; do not add a manifest assurance merely
+because this additional gate exists.
+
+This proves replacement by the signed NSIS installer. Automatic updater
+feed/download/replacement, general existing-credential continuity and physical
+desktop notification behavior remain unqualified. The receipt retains
+`automaticUpdaterReplacement: not_exercised`,
+`credentialPersistence: not_requalified_by_this_normal_journey` and
+`productionReady: false`. A passing portable harness test is not a native
+installed result.
+
 #### Source-bound Azure builder preflight
 
 For the canonical prepared Windows source candidate, the no-write preflight is:
@@ -658,6 +708,48 @@ missing, failed or differently bound smoke evidence refuses final qualification.
 This proves the extracted application's runtime only. AppImage mounting/launcher
 integration, physical desktop behavior and replacement of the older public
 release remain separate observations; the receipt explicitly leaves them open.
+
+The separate manual `electron-linux-final-qualification.yml` lane consumes the
+already built final package; it never rebuilds a private current/next pair. Its
+closed intake binds the reviewed runner revision, frozen application revision,
+unchanged `production-source-candidate.json`, successful production packaging
+run, package-receipt digest, final AppImage size/digest, and executable/ASAR
+digests. The application revision must be an ancestor of the runner, with the
+same package version. For 0.1.27 the predecessor is the immutable public
+[0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26);
+its manifest and AppImage digests are pinned in
+`scripts/lib/linux-final-artifact-intake.mjs`. Earlier owner acceptance is not
+reused for the new bytes.
+
+Dispatch `mode=plan` first with the reviewed intake. Both modes install the
+locked verifier dependencies; plan stops before artifact downloads or application
+execution. `mode=execute` also requires
+`RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE`. The owning preparation entrypoint is
+`scripts/qualify-electron-linux-installed-lifecycle.mjs` (`--preflight`,
+`--acquire`, then `--prepare`); downloads require the workflow's read-only token.
+It rejects other workflow sources, incomplete runs, unexpected ZIP members,
+links, changed receipts and different artifact bytes. Extraction establishes
+comparison hashes only and is never counted as installed execution.
+
+The native x64 job requires `/dev/fuse`, the scoped `SYS_ADMIN` capability and
+FUSE device, an ordinary AppImage launcher, enabled Chromium sandbox, Xvfb and
+an isolated Secret Service. There is no extract-and-run fallback, external
+network, host profile mount, system credential access, signing or publication.
+`scripts/smoke-electron-linux-final-lifecycle.mjs` binds kernel FUSE mounts,
+process start identities, running executable and ASAR hashes to the installed
+image. It observes a fresh synthetic profile, local refresh and credential
+access, rejection of an intentionally mismatched feed checksum without replacing
+the predecessor, the public predecessor's real Settings download/install/restart,
+exact-byte replacement, settings/opt-out/source and credential continuity,
+cold restart, no-update behavior, owned uninstall and process/mount cleanup.
+The fixed production feed URL is served only inside the network-none container.
+
+Retain the pair and `installed-lifecycle.json` with the package receipts. Only a
+passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
+missing FUSE, failed sandbox or incomplete cleanup is a failed gate. The receipt
+keeps `physicalDesktop: not_qualified`, and the isolated feed does not prove
+production updater publication. Review that scope when preparing release
+assurances; do not broaden it into a physical-desktop claim.
 
 ### Stores and updater channels
 

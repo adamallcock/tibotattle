@@ -37,19 +37,24 @@ const SCHEMA_EXPORTS = Object.freeze([
   "EXPORT_SET_CONTRACT_VERSION",
   "EXPORT_SET_CONTRACT_VERSION_V0_1",
   "EXPORT_SET_CONTRACT_VERSION_V0_2",
+  "EXPORT_SET_CONTRACT_VERSION_V0_3",
   "EXPORT_SET_MANIFEST_RECEIPT_VERSION",
   "EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1",
   "EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2",
+  "EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3",
   "EXPORT_SET_MANIFEST_SCHEMA_SHA256",
   "EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1",
   "EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2",
+  "EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_3",
   "EXPORT_SET_MANIFEST_VERSION",
   "EXPORT_SET_MANIFEST_VERSION_V0_1",
   "EXPORT_SET_MANIFEST_VERSION_V0_2",
+  "EXPORT_SET_MANIFEST_VERSION_V0_3",
   "EXPORT_SET_ORDER_VERSION",
   "EXPORT_SET_PACKING_VERSION",
   "EXPORT_SET_PACKING_VERSION_V0_1",
   "EXPORT_SET_PACKING_VERSION_V0_2",
+  "EXPORT_SET_PACKING_VERSION_V0_3",
   "MAXIMUM_EXPORT_SET_CHUNKS",
   "assertValidExportSetManifest",
   "exportSetChunkBasenames",
@@ -58,6 +63,8 @@ const SCHEMA_EXPORTS = Object.freeze([
   "exportSetManifestSchema",
   "exportSetManifestSchemaV0_1",
   "exportSetManifestSchemaV0_2",
+  "exportSetManifestSchemaV0_3",
+  "isCompressedExportSetManifestVersion",
   "validateExportSetManifest",
 ]);
 const COMPRESSION_EXPORTS = Object.freeze([
@@ -80,7 +87,7 @@ test("export-set schema owner and compatibility API are exact identities", () =>
   }
   assert.equal(
     schemaOwner.exportSetManifestSchema,
-    schemaOwner.exportSetManifestSchemaV0_2,
+    schemaOwner.exportSetManifestSchemaV0_3,
   );
   const candidate = {
     schemaVersion: "invalid",

@@ -12,6 +12,13 @@ import {
 } from "../src/export-compression.js";
 import {
   combinedSourcePlanCommitment,
+  EXPORT_SET_CONTRACT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_3,
+  stableJson,
+  createExportResourceGuard,
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
   ExportSetError,
@@ -24,6 +31,17 @@ import {
   localExportSourcePipeline,
   localExportWorkspace,
 } from "../src/local-node-runtime.js";
+
+import {
+  createLocalExportArtifactStorageContext,
+  createLocalExportSetMaterializationContext,
+} from "../src/application/index.js";
+import {
+  createOwnerOnlyExportArtifactStorageContext,
+  deriveExportPseudonym,
+  deriveParticipantId,
+} from "../src/platform/index.js";
+import { exportCompatibilityTuple } from "../src/export-contract.js";
 
 const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
 const { materializeLocalExportSet } = localExportSetMaterialization;
@@ -646,4 +664,140 @@ test("a later chunk resource refusal survives the batch facade with its exact er
     await assert.rejects(stat(join(value.output, EXPORT_SET_MANIFEST_BASENAME)), { code: "ENOENT" });
     await assert.rejects(stat(join(value.output, ".app-usagemonitor-export-transactions")), { code: "ENOENT" });
   } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+
+async function retainAsV02(value, mutate = () => {}, mutateReceipt = () => {}) {
+  const manifestPath = join(value.output, EXPORT_SET_MANIFEST_BASENAME);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.schemaVersion = EXPORT_SET_MANIFEST_VERSION_V0_2;
+  manifest.manifestContract = {
+    version: EXPORT_SET_CONTRACT_VERSION_V0_2,
+    schemaSha256: EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
+  };
+  mutate(manifest);
+  const text = stableJson(manifest);
+  const receipt = {
+    schemaVersion: EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+    manifestSha256: sha256(text), manifestBytes: Buffer.byteLength(text), transportReady: false,
+  };
+  mutateReceipt(receipt);
+  await writeFile(manifestPath, text, { mode: 0o600 });
+  await writeFile(join(value.output, EXPORT_SET_MANIFEST_RECEIPT_BASENAME), stableJson(receipt), { mode: 0o600 });
+  const workspace = await openExportWorkspace({ directory: value.workspace });
+  try {
+    workspace.markManifestComplete({ exportSetId: manifest.exportSetId,
+      manifestSha256: sha256(text), manifestBytes: Buffer.byteLength(text), chunkCount: manifest.chunks.length });
+  } finally {
+    workspace.close();
+  }
+  return { manifest, receipt, text };
+}
+
+test("current writer emits v0.3 while an exact completed v0.2 retry retains every artifact byte", async () => {
+  const value = await fixture();
+  try {
+    const options = { workspaceDirectory: value.workspace, outputDirectory: value.output, secret: SECRET };
+    const current = await materializeLocalExportSet(options);
+    assert.equal(current.manifest.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_3);
+    const retained = await retainAsV02(value);
+    const paths = [EXPORT_SET_MANIFEST_BASENAME, EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
+      ...retained.manifest.chunks.flatMap((entry) => Object.values(exportSetChunkBasenames(entry.index)))];
+    const before = await Promise.all(paths.map(async (name) => [name, await readFile(join(value.output, name))]));
+    const repeated = await materializeLocalExportSet(options);
+    assert.deepEqual(repeated.manifest, retained.manifest);
+    assert.deepEqual(repeated.manifestReceipt, retained.receipt);
+    assert.equal((await verifyLocalExportSet({ directory: value.output })).schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_2);
+    for (const [name, bytes] of before) assert.deepEqual(await readFile(join(value.output, name)), bytes, name);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("retained v0.2 retry refuses semantic, schema, receipt and source-commitment drift without rewriting output", async () => {
+  const changes = [
+    ["compatibility", (value) => { value.compatibility.implementation.packageVersion = "0.1.26"; }],
+    ["records", (value) => { value.totals.logicalRecordsSha256 = "0".repeat(64); }],
+    ["chunk identity", (value) => { value.chunks[0].bundleId = `bundle:v1:${"0".repeat(64)}`; }],
+    ["chunk digest", (value) => { value.chunks[0].bundleSha256 = "0".repeat(64); }],
+    ["source count", (value) => { value.sourcePlan.sourceFiles += 1; }],
+    ["source digest", (value) => { value.sourcePlan.sha256 = "0".repeat(64); }],
+    ["old source ceiling", (value) => { value.sourcePlan.sourceFiles = 5001; }],
+    ["extra field", (value) => { value.extra = "FORBIDDEN_RETAINED_MANIFEST_CANARY"; }],
+    ["schema digest", (value) => { value.manifestContract.schemaSha256 = "0".repeat(64); }],
+    ["unknown version", (value) => { value.schemaVersion = "usage-export-set-manifest-v0.4"; }],
+    ["receipt digest", () => {}, (value) => { value.manifestSha256 = "0".repeat(64); }],
+    ["receipt version", () => {}, (value) => { value.schemaVersion = "export-set-manifest-receipt-v0.3"; }],
+    ["receipt extra field", () => {}, (value) => { value.extra = "FORBIDDEN_RETAINED_MANIFEST_CANARY"; }],
+  ];
+  for (const [label, mutate, mutateReceipt] of changes) {
+    const value = await fixture();
+    try {
+      const options = { workspaceDirectory: value.workspace, outputDirectory: value.output, secret: SECRET };
+      await materializeLocalExportSet(options);
+      const retained = await retainAsV02(value, mutate, mutateReceipt);
+      await assert.rejects(materializeLocalExportSet(options), (error) => {
+        assert.equal(error.code, "export_set_manifest_conflict", label);
+        assert.equal(error.message.includes("FORBIDDEN"), false);
+        return true;
+      });
+      assert.equal(await readFile(join(value.output, EXPORT_SET_MANIFEST_BASENAME), "utf8"), retained.text, label);
+      assert.equal(await readFile(join(value.output, EXPORT_SET_MANIFEST_RECEIPT_BASENAME), "utf8"), stableJson(retained.receipt), label);
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+
+test("current writer and verifier roundtrip aggregate source counts beyond the retained v0.2 ceiling", async () => {
+  for (const sourceFiles of [5000, 5001, 5281, 100000]) {
+    const value = await fixture({ empty: true });
+    try {
+      // Exercise the application boundary with synthetic aggregate summaries,
+      // without manufacturing thousands of files or accessing private sources.
+      const workspace = {
+        ...localExportWorkspace,
+        async openExportWorkspace(options) {
+          const handle = await openExportWorkspace(options);
+          const descriptor = handle.getDescriptor();
+          return {
+            ...handle,
+            getDescriptor() {
+              return {
+                ...descriptor,
+                sourcePlan: { ...descriptor.sourcePlan, sourceFiles: sourceFiles - 1 },
+                supplementalSourcePlan: { ...descriptor.supplementalSourcePlan, sourceFiles: 1 },
+              };
+            },
+          };
+        },
+      };
+      const materializer = createLocalExportSetMaterializationContext({
+        workspace,
+        destination: createLocalExportArtifactStorageContext({
+          createStorage: createOwnerOnlyExportArtifactStorageContext,
+          activityMarkerFile: () => null,
+        }),
+        identity: { deriveExportPseudonym, deriveParticipantId },
+        resource: { createGuard: (options) => createExportResourceGuard({
+          ...options, clock: () => Date.now(), rss: () => process.memoryUsage().rss,
+        }) },
+        bundleVerification: { loadVerifiedLocalMetadataBundleBytes },
+        compatibilityTuple: exportCompatibilityTuple,
+        sha256Hex: sha256,
+      });
+      const result = await materializer.materializeLocalExportSet({
+        workspaceDirectory: value.workspace, outputDirectory: value.output, secret: SECRET,
+      });
+      assert.equal(result.manifest.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_3);
+      assert.equal(result.manifest.sourcePlan.sourceFiles, sourceFiles);
+      const verified = await verifyLocalExportSet({ directory: value.output });
+      assert.equal(verified.verdict, "passed");
+      assert.equal(verified.schemaVersion, EXPORT_SET_MANIFEST_VERSION_V0_3);
+      assert.deepEqual(verified.recordCounts, { usageEvents: 0, quotaSnapshots: 0, activityMarkers: 0 });
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
 });

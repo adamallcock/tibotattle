@@ -18,8 +18,8 @@ export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 // openai/codex codex-rs/protocol/src/auth.rs (KnownPlan). "unknown" is our
 // sentinel for a plan Codex has not (yet) named. Product allowance ratios and
 // display labels are separate policy; renaming Pro does not change this identity.
-// promax is source-verified but remains provisional until binary and allowance
-// semantics are reviewed for release.
+// promax is verified in reviewed source and installed binary plan vocabulary.
+// Provider allowance and window semantics remain unverified.
 export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "free",
   "go",

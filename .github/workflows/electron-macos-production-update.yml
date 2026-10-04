@@ -21,7 +21,7 @@ on:
         type: string
         required: true
       identity_json:
-        description: Exact candidate source/version/bundle/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON plus sourceCandidate from production-source-candidate.json; directory is supplied by the workflow
+        description: Closed intake v1 (020 predecessor) or v2 (026 to 027), exact candidate/source/feed and predecessor ASAR hashes, plus unchanged sourceCandidate receipt; directory is supplied by the workflow
         type: string
         required: true
       confirmation:

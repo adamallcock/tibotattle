@@ -3,8 +3,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { createValidatedSnapshotStore } from '../../src/platform/index.js';
 
 export const MODEL_PERFORMANCE_PERIODS = Object.freeze(['1', '7', '30', 'all']);
-export const MODEL_PERFORMANCE_MAX_WINDOWS = 8;
 export const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(['standard', 'fast', 'ultrafast']);
+// The shared dashboard preloads one exact window for every period/mode pair.
+export const MODEL_PERFORMANCE_MAX_WINDOWS = MODEL_PERFORMANCE_PERIODS.length * MODEL_PERFORMANCE_SPEED_MODES.length;
 export const modelPerformanceSnapshotKey = (period, speedMode) => `${period}:${speedMode}`;
 const DAY = 86_400_000;
 const MODEL_NAMES = Object.freeze({

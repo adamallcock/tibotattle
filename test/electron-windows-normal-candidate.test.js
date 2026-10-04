@@ -78,6 +78,8 @@ import {
   validateWindowsNormalCandidateSmokeMetadata,
   verifyWindowsNormalCandidateSyntheticIngestion,
   verifyWindowsNormalCandidateModelPerformance,
+  inspectWindowsNormalCandidatePerformancePage,
+  normalizeWindowsNormalCandidatePerformancePageDiagnostic,
   verifyWindowsNormalCandidateProjectsAndThreads,
   inspectWindowsNormalCandidateProjectsAndThreads,
   verifyWindowsNormalCandidateOptOut,
@@ -147,6 +149,126 @@ test("packaged Windows timing smoke requires a complete ready source scan", () =
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "loading" }), "LOADING");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready" }), "INCOMPLETE");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unexpected" }), "INVALID");
+});
+
+function performanceRendererFixture() {
+  const element = (attributes = {}, dataset = {}) => ({
+    attributes, dataset, getAttribute(name) { return this.attributes[name] ?? null; },
+  });
+  const navigation = element({ "aria-current": "page" });
+  const period = element({ "aria-pressed": "true" }, { period: "7d" });
+  const provider = { textContent: "Synthetic provider label" };
+  const status = element({}, { state: "ready" });
+  const mode = element({ "aria-pressed": "true" }, { performanceFocus: "mode-standard" });
+  const model = element({ "aria-selected": "true" });
+  const panel = element({ "aria-labelledby": "performance-tab-gpt-5.6-sol" });
+  const section = element({ "aria-hidden": "false" });
+  section.inert = false;
+  section.inactive = false;
+  section.classList = { contains: value => value === "dashboard-page-inactive" && section.inactive };
+  const sectionSelectors = new Map([
+    [".performance-provider", provider], [".performance-status", status],
+    ['.performance-modes [aria-pressed="true"]', mode],
+    ['[data-performance-focus="model-gpt-5.6-sol"]', model],
+    ["#performance-model-panel", panel],
+  ]);
+  const documentSelectors = new Map([
+    ["#performance", section], ['[data-nav="performance"]', navigation],
+    ['#reporting-period-controls [aria-pressed="true"]', period],
+  ]);
+  section.querySelector = selector => sectionSelectors.get(selector) ?? null;
+  section.querySelectorAll = selector => selector === '.performance-models [role="tab"]' ? [model] : [];
+  panel.querySelectorAll = selector => selector === '.performance-card svg[role="group"]' ? [{}, {}] : [];
+  const document = { hidden: false, querySelector: selector => documentSelectors.get(selector) ?? null };
+  return { navigation, period, provider, status, mode, model, panel, section, document,
+    sectionSelectors, documentSelectors,
+    inspect: () => inspectWindowsNormalCandidatePerformancePage({
+      evaluate: expression => runInNewContext(expression, { document }),
+    }),
+  };
+}
+
+test("Windows performance page diagnostics preserve the existing ready predicate", async () => {
+  const f = performanceRendererFixture();
+  const result = await f.inspect();
+  assert.equal(result.ready, true);
+  assert.deepEqual(result.diagnostic, {
+    navigationPresent: true, navigationCurrent: true,
+    sectionPresent: true, sectionInert: false, sectionAriaHidden: false, sectionInactive: false,
+    documentHidden: false, providerPresent: true, providerNonempty: true, statusState: "ready",
+    staleStatusPresent: false, reportingPeriod: "7d", speedMode: "standard",
+    modelTabCountCapped16: 1, expectedModelTabPresent: true, expectedModelTabSelected: true,
+    modelPanelPresent: true, expectedModelPanelLinked: true, chartCountCapped8: 2, emptyStatePresent: false,
+  });
+  for (const change of [
+    item => item.documentSelectors.delete("#performance"),
+    item => { item.section.inert = true; },
+    item => { item.section.attributes["aria-hidden"] = "true"; },
+    item => item.sectionSelectors.delete(".performance-provider"),
+    item => { item.provider.textContent = " "; },
+    item => item.sectionSelectors.delete(".performance-status"),
+    item => { item.status.dataset.state = "updating"; },
+  ]) {
+    const blocked = performanceRendererFixture(); change(blocked);
+    assert.equal((await blocked.inspect()).ready, false);
+  }
+  // Context fields are observations, not additional acceptance or bypass conditions.
+  f.document.hidden = true; f.section.inactive = true;
+  f.navigation.attributes["aria-current"] = null;
+  f.sectionSelectors.delete('[data-performance-focus="model-gpt-5.6-sol"]');
+  f.sectionSelectors.delete("#performance-model-panel");
+  assert.equal((await f.inspect()).ready, true);
+});
+
+test("Windows performance page diagnostics classify loading and strip unknown DOM values", async () => {
+  const f = performanceRendererFixture();
+  for (const state of ["cancelled", "error", "unavailable", "loading", "updating", "ready", "waiting"]) {
+    f.status.dataset.state = state;
+    const observation = await f.inspect();
+    assert.equal(observation.diagnostic.statusState, state);
+    assert.equal(observation.ready, state === "ready");
+  }
+  f.status.dataset.state = "private-status";
+  f.period.dataset.period = "private-period";
+  f.mode.dataset.performanceFocus = "private-mode";
+  f.provider.textContent = "private-provider";
+  f.section.querySelectorAll = () => Array(30).fill({});
+  f.panel.querySelectorAll = () => Array(30).fill({});
+  const result = await f.inspect();
+  assert.equal(result.ready, false);
+  assert.equal(result.diagnostic.statusState, "other");
+  assert.equal(result.diagnostic.reportingPeriod, "other");
+  assert.equal(result.diagnostic.speedMode, "other");
+  assert.equal(result.diagnostic.modelTabCountCapped16, 16);
+  assert.equal(result.diagnostic.chartCountCapped8, 8);
+  assert.doesNotMatch(JSON.stringify(result), /private/u);
+});
+
+test("Windows performance page diagnostic normalization closes arbitrary receipt inputs", () => {
+  for (const value of [null, undefined, [], "private"]) {
+    assert.equal(normalizeWindowsNormalCandidatePerformancePageDiagnostic(value), null);
+  }
+  const diagnostic = normalizeWindowsNormalCandidatePerformancePageDiagnostic({
+    navigationPresent: "private", sectionInert: {}, providerNonempty: 1,
+    statusState: "private", reportingPeriod: "private", speedMode: "private",
+    modelTabCountCapped16: Number.MAX_SAFE_INTEGER, chartCountCapped8: -1,
+    privateText: "private", privatePath: "C:\\private\\profile", toJSON: () => "private",
+  });
+  assert.equal(diagnostic.navigationPresent, null);
+  assert.equal(diagnostic.sectionInert, null);
+  assert.equal(diagnostic.providerNonempty, null);
+  assert.equal(diagnostic.statusState, "other");
+  assert.equal(diagnostic.reportingPeriod, "other");
+  assert.equal(diagnostic.speedMode, "other");
+  assert.equal(diagnostic.modelTabCountCapped16, 16);
+  assert.equal(diagnostic.chartCountCapped8, null);
+  for (const count of ["private", Infinity, NaN, 1.5, -1]) {
+    assert.equal(normalizeWindowsNormalCandidatePerformancePageDiagnostic({
+      modelTabCountCapped16: count,
+    }).modelTabCountCapped16, null);
+  }
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private/u);
+  assert.equal(Object.isFrozen(diagnostic), true);
 });
 
 test("packaged Windows projects proof requires saved task name inside the actual project", () => {
@@ -2463,6 +2585,48 @@ test("normal candidate receipt retains completed dashboard proof when Settings f
   assert.equal(receipt.durableContributionOptOutRetained, false);
   assert.equal(receipt.loopbackJourneyVerified, false);
   assert.equal(receipt.errorCode, errorCode);
+});
+
+test("normal candidate failure receipt preserves only closed performance page diagnostics", async () => {
+  let receipt = null;
+  const errorCode = "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE";
+  const f = performanceRendererFixture(); f.status.dataset.state = "loading";
+  const diagnostic = (await f.inspect()).diagnostic;
+  await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
+    platform: "win32", architecture: "x64",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\runner\temp` },
+    ensureReceiptParent: async () => {},
+    reserveReceipt: async () => ({
+      writeFile: async value => { receipt = JSON.parse(value); },
+      sync: async () => {}, close: async () => {},
+    }),
+    verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
+    createRoot: async () => String.raw`C:\runner\temp\owned`,
+    prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
+    seedCodexFixture: async () => {}, seedProfile: async () => ({ shareBackend: {} }),
+    assertProcessAbsence: async () => true, installFirewall: async () => FIREWALL_RULE,
+    launchJourney: async ({ candidateState }) => {
+      candidateState.dashboardRendered = true;
+      candidateState.localRefreshObserved = true;
+      candidateState.localRefreshTerminal = "succeeded";
+      candidateState.startupPhase = "model_performance";
+      candidateState.quiescent = true;
+      throw Object.assign(new Error("private renderer error"), {
+        code: errorCode, performancePageDiagnostic: { ...diagnostic, rawText: "private", toJSON: () => "private" },
+      });
+    },
+    verifyOptOut: async () => true, removeFirewall: async () => true, removeProfile: async () => {},
+  }), { code: errorCode });
+  assert.deepEqual(receipt.performancePageDiagnostic, diagnostic);
+  assert.equal(receipt.errorCode, errorCode);
+  assert.equal(receipt.startupPhase, "model_performance");
+  assert.equal(receipt.status, "failed");
+  assert.equal(receipt.packagedElectronExecutionVerified, false);
+  assert.equal(receipt.syntheticFixtureIngestionVerified, false);
+  assert.equal(receipt.outboundFirewallRuleRemoved, true);
+  assert.equal(receipt.ownedProfileRemoved, true);
+  assert.equal(receipt.productionReady, false);
+  assert.doesNotMatch(JSON.stringify(receipt), /private/u);
 });
 
 test("normal candidate runner retains the outbound block and profile when process cleanup is uncertain", async () => {

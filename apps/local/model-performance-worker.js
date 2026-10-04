@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { canonicalTelemetryPerformanceJson } from '@app-usagemonitor/telemetry-contract';
+import { MODEL_PERFORMANCE_MAX_WINDOWS } from './model-performance-snapshots.js';
 import { openTimingStore, ingestTimingFile, readTimingRows } from '../../src/platform/index.js';
 import {
   createModelPerformanceContext,
@@ -97,7 +98,7 @@ async function run() {
       && ['standard', 'fast', 'ultrafast'].includes(message.speedMode)
       && message.requestKey === `${message.period}:${message.speedMode}:${message.end}`) {
       windows.set(message.requestKey, message); windowsChanged = true;
-      while (windows.size > 8) windows.delete(windows.keys().next().value);
+      while (windows.size > MODEL_PERFORMANCE_MAX_WINDOWS) windows.delete(windows.keys().next().value);
     } else if (message?.type === 'performance-day') {
       if (!store) {
         if (pendingPerformanceRequests.length < 2) pendingPerformanceRequests.push(message);

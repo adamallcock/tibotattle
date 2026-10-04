@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import {
   copyFile,
   link,
@@ -20,9 +21,18 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   localExportSetMaterialization,
+  localExportSetVerification,
   localExportSourcePipeline,
 } from "../src/local-node-runtime.js";
-import { exportSetChunkBasenames } from "../src/export-set-schema.js";
+import {
+  EXPORT_SET_CONTRACT_VERSION_V0_1, EXPORT_SET_CONTRACT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1, EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
+  EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_MANIFEST_VERSION_V0_2, EXPORT_SET_MANIFEST_VERSION_V0_3,
+  exportSetChunkBasenames,
+} from "../src/export-set-schema.js";
+import { decompressExportBytes } from "../src/export-compression.js";
+import { EXPORT_DELETION_JOURNAL_VERSION_V0_1, EXPORT_DELETION_JOURNAL_VERSION_V0_2 } from "../src/export/index.js";
 import { buildLocalExportDeletionPlan, planLocalExportDeletion } from "../src/export-deletion.js";
 import {
   deleteLocalExport,
@@ -47,7 +57,7 @@ function usage(tokens) {
   };
 }
 
-async function fixture({ maximumRecordsPerChunk, includeSidecar = false } = {}) {
+async function fixture({ maximumRecordsPerChunk, includeSidecar = false, manifestVersion = EXPORT_SET_MANIFEST_VERSION_V0_3 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-delete-executor-"));
   const home = join(root, "codex-home");
   const workspace = join(root, "workspace");
@@ -99,6 +109,9 @@ async function fixture({ maximumRecordsPerChunk, includeSidecar = false } = {}) 
     secret,
     ...(maximumRecordsPerChunk ? { maximumRecordsPerChunk } : {}),
   });
+  if (manifestVersion !== EXPORT_SET_MANIFEST_VERSION_V0_3) {
+    await makeRetainedSet({ workspace, output }, manifestVersion);
+  }
   if (includeSidecar) {
     await writeFile(join(workspace, "workspace.sqlite3-journal"), "closed-sidecar-preserved-until-delete", { mode: 0o600 });
   }
@@ -690,6 +703,126 @@ test("recovery refuses symlink and hardlink substitutions without removing their
       );
       assert.equal(await readFile(foreign, "utf8"), "foreign survives");
       assert.equal((await stat(foreign)).isFile(), true);
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+
+async function makeRetainedSet(value, manifestVersion) {
+  const plain = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_1;
+  assert.ok(plain || manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2);
+  const manifestPath = join(value.output, "export-set-manifest.json");
+  const receiptPath = join(value.output, "export-set-manifest.privacy-receipt.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const compressedFields = ["contentEncoding", "compressionProfile", "artifactSha256", "artifactBytes"];
+  if (plain) {
+    for (const entry of manifest.chunks) {
+      const currentName = exportSetChunkBasenames(entry.index).bundle;
+      const plainName = exportSetChunkBasenames(entry.index, manifestVersion).bundle;
+      const bytes = decompressExportBytes(await readFile(join(value.output, currentName)), {
+        maximumEncodedBytes: entry.artifactBytes, maximumDecodedBytes: entry.bundleBytes,
+      });
+      await writeFile(join(value.output, plainName), bytes, { mode: 0o600 });
+      await unlink(join(value.output, currentName));
+      for (const field of compressedFields) delete entry[field];
+    }
+    delete manifest.compressionRuntime;
+    delete manifest.chunking.maximumEncodedArtifactBytes;
+    manifest.totals.bundleBytes = manifest.totals.decodedBundleBytes;
+    delete manifest.totals.decodedBundleBytes;
+    delete manifest.totals.encodedArtifactBytes;
+  }
+  manifest.schemaVersion = manifestVersion;
+  manifest.manifestContract = {
+    version: plain ? EXPORT_SET_CONTRACT_VERSION_V0_1 : EXPORT_SET_CONTRACT_VERSION_V0_2,
+    schemaSha256: plain ? EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1 : EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
+  };
+  const text = stableJson(manifest);
+  const receipt = {
+    schemaVersion: plain ? EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1 : EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
+    manifestSha256: createHash("sha256").update(text).digest("hex"),
+    manifestBytes: Buffer.byteLength(text), transportReady: false,
+  };
+  await writeFile(manifestPath, text, { mode: 0o600 });
+  await writeFile(receiptPath, stableJson(receipt), { mode: 0o600 });
+  // Construct a retained synthetic workspace under its original representation.
+  // Production never rewrites these metadata rows during a version transition.
+  const database = new DatabaseSync(join(value.workspace, "workspace.sqlite3"));
+  try {
+    if (plain) {
+      for (const row of database.prepare("SELECT chunk_index, metadata_json FROM chunks").all()) {
+        const metadata = JSON.parse(row.metadata_json);
+        for (const field of compressedFields) delete metadata[field];
+        database.prepare("UPDATE chunks SET metadata_json = ? WHERE chunk_index = ?")
+          .run(stableJson(metadata), row.chunk_index);
+      }
+    }
+    database.prepare("UPDATE workspace_meta SET value_json = ? WHERE key = 'manifest'").run(stableJson({
+      exportSetId: manifest.exportSetId, manifestSha256: receipt.manifestSha256,
+      manifestBytes: receipt.manifestBytes, chunkCount: manifest.chunks.length,
+    }));
+  } finally {
+    database.close();
+  }
+}
+
+test("current deletion planner verifies and removes retained v0.1 and v0.2 sets with a new journal", async () => {
+  for (const manifestVersion of [EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_MANIFEST_VERSION_V0_2]) {
+    const value = await fixture({ manifestVersion });
+    try {
+      const verification = await localExportSetVerification.verifyLocalExportSet({ directory: value.output });
+      assert.equal(verification.schemaVersion, manifestVersion);
+      assert.equal(verification.verdict, "passed");
+      const plan = await buildLocalExportDeletionPlan({ workspaceDirectory: value.workspace, outputDirectory: value.output });
+      assert.equal(plan.journal.schemaVersion, EXPORT_DELETION_JOURNAL_VERSION_V0_2);
+      assert.equal(plan.journal.exportSetManifestVersion, manifestVersion);
+      const receipt = await deleteLocalExport({
+        workspaceDirectory: value.workspace, outputDirectory: value.output,
+        confirmationToken: plan.summary.confirmationToken,
+      });
+      assert.equal(receipt.logicalRemovalConfirmed, true);
+      await assertDeletedState(value);
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("recovery validates and retains committed v0.1 journal bytes for both retained set formats", async () => {
+  for (const manifestVersion of [EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_MANIFEST_VERSION_V0_2]) {
+    const value = await fixture({ manifestVersion });
+    try {
+      const options = { workspaceDirectory: value.workspace, outputDirectory: value.output };
+      const plan = await planLocalExportDeletion(options);
+      await assert.rejects(deleteLocalExport({
+        ...options, confirmationToken: plan.confirmationToken,
+        failpoint(stage) { if (stage === "after_journal_commit") throw new Error("fixture committed controls"); },
+      }), /fixture committed controls/);
+      const journalPath = join(value.output, ".app-usagemonitor-deletion-journal.json");
+      const markerPath = join(value.output, ".app-usagemonitor-deletion-commit.json");
+      const journal = JSON.parse(await readFile(journalPath, "utf8"));
+      journal.schemaVersion = EXPORT_DELETION_JOURNAL_VERSION_V0_1;
+      const { planSha256: ignored, ...journalCore } = journal;
+      journal.planSha256 = createHash("sha256").update(stableJson({
+        domain: "app-usagemonitor/export-deletion-plan/v1", journal: journalCore,
+      })).digest("hex");
+      const text = stableJson(journal);
+      const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      marker.planSha256 = journal.planSha256;
+      marker.journalSha256 = createHash("sha256").update(text).digest("hex");
+      await writeFile(journalPath, text, { mode: 0o600 });
+      await writeFile(markerPath, stableJson(marker), { mode: 0o600 });
+      await assert.rejects(recoverLocalExportDeletion({
+        ...options,
+        failpoint(stage) { if (stage === "after_inventory_unlink") throw new Error("fixture partial recovery"); },
+      }), /fixture partial recovery/);
+      assert.equal(await readFile(journalPath, "utf8"), text);
+      assert.equal(await readFile(markerPath, "utf8"), stableJson(marker));
+      const receipt = await recoverLocalExportDeletion(options);
+      assert.equal(receipt.logicalRemovalConfirmed, true);
+      await assertDeletedState(value);
     } finally {
       await rm(value.root, { recursive: true, force: true });
     }

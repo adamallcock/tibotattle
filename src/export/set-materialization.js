@@ -7,8 +7,11 @@ import {
   assertValidExportSetManifest,
   EXPORT_SET_CONTRACT_VERSION,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION,
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
   EXPORT_SET_MANIFEST_SCHEMA_SHA256,
   EXPORT_SET_MANIFEST_VERSION,
+  EXPORT_SET_MANIFEST_VERSION_V0_2,
+  isCompressedExportSetManifestVersion,
   EXPORT_SET_ORDER_VERSION,
   EXPORT_SET_PACKING_VERSION,
 } from "./set-schema.js";
@@ -144,8 +147,33 @@ function assertVerifiedChunk(verified, expected) {
       || verified.bundleSha256 !== expected.bundleSha256 || verified.bundleBytes.length !== expected.bundleBytes
       || verified.receiptSha256 !== expected.receiptSha256 || verified.receiptBytes.length !== expected.receiptBytes) fail("chunk_conflict");
 }
-function manifestReceipt(manifestText) {
-  return { schemaVersion: EXPORT_SET_MANIFEST_RECEIPT_VERSION, manifestSha256: sha256(manifestText), manifestBytes: Buffer.byteLength(manifestText), transportReady: false };
+function manifestReceipt(manifestText, manifestVersion = EXPORT_SET_MANIFEST_VERSION) {
+  if (!isCompressedExportSetManifestVersion(manifestVersion)) fail("manifest_conflict");
+  const schemaVersion = manifestVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    ? EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2 : EXPORT_SET_MANIFEST_RECEIPT_VERSION;
+  return { schemaVersion, manifestSha256: sha256(manifestText), manifestBytes: Buffer.byteLength(manifestText), transportReady: false };
+}
+
+function retainMatchingManifest(currentManifest, manifestText, receiptText) {
+  try {
+    const retained = JSON.parse(manifestText);
+    assertValidExportSetManifest(retained);
+    if (!isCompressedExportSetManifestVersion(retained.schemaVersion)
+        || stableJson(retained) !== manifestText) fail("manifest_conflict");
+    const receipt = manifestReceipt(manifestText, retained.schemaVersion);
+    if (receiptText !== stableJson(receipt)) fail("manifest_conflict");
+    // An existing version keeps its bytes, receipt and historical source ceiling.
+    // Only its validated version-specific header may differ from this replay.
+    const expected = {
+      ...currentManifest,
+      schemaVersion: retained.schemaVersion,
+      manifestContract: retained.manifestContract,
+    };
+    if (stableJson(expected) !== manifestText) fail("manifest_conflict");
+    return { manifest: retained, manifestText, manifestReceipt: receipt };
+  } catch {
+    fail("manifest_conflict");
+  }
 }
 
 /** Content-only contract. Durable workspace and artifact capabilities remain application concerns. */
@@ -170,7 +198,7 @@ export function createExportSetMaterializationContract(configuration = {}) {
       deterministicSetId(deriveExportPseudonym, secret, descriptor, logicalRecordsSha256, chunking),
     deterministicBundleId: (secret, exportSetId, index) =>
       deterministicBundleId(deriveExportPseudonym, secret, exportSetId, index),
-    chooseLargestFittingPrefix, assertVerifiedChunk, manifestReceipt, loadVerifiedLocalMetadataBundleBytes,
+    chooseLargestFittingPrefix, assertVerifiedChunk, manifestReceipt, retainMatchingManifest, loadVerifiedLocalMetadataBundleBytes,
     decompressExportBytes, verifyPrivacySafeBundle, assertValidExportSetManifest,
     EXPORT_GZIP_PROFILE, EXPORT_SET_PACKING_VERSION, EXPORT_SET_CONTRACT_VERSION,
     EXPORT_SET_MANIFEST_SCHEMA_SHA256, EXPORT_SET_MANIFEST_VERSION,

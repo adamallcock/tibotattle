@@ -4,33 +4,47 @@ import { safeValidationErrors } from "./safe-validation-errors.js";
 import compatibilitySchema from "../../schemas/telemetry-v0.1/compatibility.schema.json" with { type: "json" };
 import manifestSchemaV0_1 from "../../schemas/export-set-v0.1/manifest.schema.json" with { type: "json" };
 import manifestSchemaV0_2 from "../../schemas/export-set-v0.2/manifest.schema.json" with { type: "json" };
+import manifestSchemaV0_3 from "../../schemas/export-set-v0.3/manifest.schema.json" with { type: "json" };
 
 export const EXPORT_SET_MANIFEST_VERSION_V0_1 =
   "usage-export-set-manifest-v0.1";
 export const EXPORT_SET_MANIFEST_VERSION_V0_2 =
   "usage-export-set-manifest-v0.2";
-export const EXPORT_SET_MANIFEST_VERSION = EXPORT_SET_MANIFEST_VERSION_V0_2;
+export const EXPORT_SET_MANIFEST_VERSION_V0_3 =
+  "usage-export-set-manifest-v0.3";
+export const EXPORT_SET_MANIFEST_VERSION = EXPORT_SET_MANIFEST_VERSION_V0_3;
 export const EXPORT_SET_CONTRACT_VERSION_V0_1 = "export-set-contract-v0.1";
 export const EXPORT_SET_CONTRACT_VERSION_V0_2 = "export-set-contract-v0.2";
-export const EXPORT_SET_CONTRACT_VERSION = EXPORT_SET_CONTRACT_VERSION_V0_2;
+export const EXPORT_SET_CONTRACT_VERSION_V0_3 = "export-set-contract-v0.3";
+export const EXPORT_SET_CONTRACT_VERSION = EXPORT_SET_CONTRACT_VERSION_V0_3;
 export const EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1 =
   "export-set-manifest-receipt-v0.1";
 export const EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2 =
   "export-set-manifest-receipt-v0.2";
+export const EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3 =
+  "export-set-manifest-receipt-v0.3";
 export const EXPORT_SET_MANIFEST_RECEIPT_VERSION =
-  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2;
+  EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_3;
 export const EXPORT_SET_ORDER_VERSION = "record-family-time-id-v1";
 export const EXPORT_SET_PACKING_VERSION_V0_1 = "greedy-canonical-bundle-v1";
 export const EXPORT_SET_PACKING_VERSION_V0_2 = "greedy-canonical-bundle-v1";
-export const EXPORT_SET_PACKING_VERSION = EXPORT_SET_PACKING_VERSION_V0_2;
+export const EXPORT_SET_PACKING_VERSION_V0_3 = "greedy-canonical-bundle-v1";
+export const EXPORT_SET_PACKING_VERSION = EXPORT_SET_PACKING_VERSION_V0_3;
 export const EXPORT_SET_CHUNK_BASENAME_WIDTH = 6;
 export const MAXIMUM_EXPORT_SET_CHUNKS = 512;
 export const EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_1 =
   "35eba5664079c36ac2b04a33df994a0c0b2230d31d11902516df47a1245cbc0e";
 export const EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2 =
   "6f46ca81c32f9ed14cfd47ec5a376961a07f1bf0d14a7adc7413def7c80da4c0";
+export const EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_3 =
+  "9b5ec76bb4ec796a502b4550416a3c93e5e3172bfb33361ef492854837706582";
 export const EXPORT_SET_MANIFEST_SCHEMA_SHA256 =
-  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2;
+  EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_3;
+
+export function isCompressedExportSetManifestVersion(version) {
+  return version === EXPORT_SET_MANIFEST_VERSION_V0_2
+    || version === EXPORT_SET_MANIFEST_VERSION_V0_3;
+}
 
 function invariant(path, name) {
   return { path, keyword: "invariant", schemaPath: `#/x-invariant/${name}` };
@@ -117,7 +131,7 @@ function semanticErrors(
       errors.push(invariant(`${path}/bundleBytes`, "chunk-bundle-limit"));
     }
     if (
-      manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+      isCompressedExportSetManifestVersion(manifest.schemaVersion)
       && chunk.artifactBytes > manifest.chunking.maximumEncodedArtifactBytes
     ) {
       errors.push(invariant(`${path}/artifactBytes`, "chunk-artifact-limit"));
@@ -131,7 +145,7 @@ function semanticErrors(
     totals.quotaSnapshots += chunk.recordCounts.quotaSnapshots;
     totals.activityMarkers += chunk.recordCounts.activityMarkers;
     decodedBundleBytes += chunk.bundleBytes;
-    if (manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2) {
+    if (isCompressedExportSetManifestVersion(manifest.schemaVersion)) {
       encodedArtifactBytes += chunk.artifactBytes;
     }
     receiptBytes += chunk.receiptBytes;
@@ -152,18 +166,18 @@ function semanticErrors(
     ));
   }
   const decodedTotalPath =
-    manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    isCompressedExportSetManifestVersion(manifest.schemaVersion)
       ? "/totals/decodedBundleBytes"
       : "/totals/bundleBytes";
   const declaredDecodedBundleBytes =
-    manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    isCompressedExportSetManifestVersion(manifest.schemaVersion)
       ? manifest.totals.decodedBundleBytes
       : manifest.totals.bundleBytes;
   if (decodedBundleBytes !== declaredDecodedBundleBytes) {
     errors.push(invariant(decodedTotalPath, "aggregate-bundle-bytes"));
   }
   if (
-    manifest.schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+    isCompressedExportSetManifestVersion(manifest.schemaVersion)
     && encodedArtifactBytes !== manifest.totals.encodedArtifactBytes
   ) {
     errors.push(invariant(
@@ -191,6 +205,7 @@ function createExportSetSchemaContext() {
   ajv.addSchema(compatibilitySchema);
   ajv.addSchema(manifestSchemaV0_1);
   ajv.addSchema(manifestSchemaV0_2);
+  ajv.addSchema(manifestSchemaV0_3);
   const validateSchemaByVersion = new Map([
     [
       EXPORT_SET_MANIFEST_VERSION_V0_1,
@@ -199,6 +214,10 @@ function createExportSetSchemaContext() {
     [
       EXPORT_SET_MANIFEST_VERSION_V0_2,
       ajv.getSchema(manifestSchemaV0_2.$id),
+    ],
+    [
+      EXPORT_SET_MANIFEST_VERSION_V0_3,
+      ajv.getSchema(manifestSchemaV0_3.$id),
     ],
   ]);
   const schemaDigestByVersion = new Map([
@@ -210,10 +229,15 @@ function createExportSetSchemaContext() {
       EXPORT_SET_MANIFEST_VERSION_V0_2,
       EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
     ],
+    [
+      EXPORT_SET_MANIFEST_VERSION_V0_3,
+      EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_3,
+    ],
   ]);
   const packingVersionByManifestVersion = new Map([
     [EXPORT_SET_MANIFEST_VERSION_V0_1, EXPORT_SET_PACKING_VERSION_V0_1],
     [EXPORT_SET_MANIFEST_VERSION_V0_2, EXPORT_SET_PACKING_VERSION_V0_2],
+    [EXPORT_SET_MANIFEST_VERSION_V0_3, EXPORT_SET_PACKING_VERSION_V0_3],
   ]);
 
   function validateExportSetManifest(value) {
@@ -259,9 +283,10 @@ function createExportSetSchemaContext() {
 
   return Object.freeze({
     assertValidExportSetManifest,
-    exportSetManifestSchema: manifestSchemaV0_2,
+    exportSetManifestSchema: manifestSchemaV0_3,
     exportSetManifestSchemaV0_1: manifestSchemaV0_1,
     exportSetManifestSchemaV0_2: manifestSchemaV0_2,
+    exportSetManifestSchemaV0_3: manifestSchemaV0_3,
     validateExportSetManifest,
   });
 }
@@ -271,6 +296,7 @@ export const {
   exportSetManifestSchema,
   exportSetManifestSchemaV0_1,
   exportSetManifestSchemaV0_2,
+  exportSetManifestSchemaV0_3,
   validateExportSetManifest,
 } = createExportSetSchemaContext();
 
@@ -294,10 +320,11 @@ export function exportSetChunkBundleBasename(
   if (![
     EXPORT_SET_MANIFEST_VERSION_V0_1,
     EXPORT_SET_MANIFEST_VERSION_V0_2,
+    EXPORT_SET_MANIFEST_VERSION_V0_3,
   ].includes(schemaVersion)) {
     throw new RangeError("Unsupported export-set manifest version");
   }
-  const suffix = schemaVersion === EXPORT_SET_MANIFEST_VERSION_V0_2
+  const suffix = isCompressedExportSetManifestVersion(schemaVersion)
     ? ".bundle.json.gz"
     : ".bundle.json";
   return `chunk-${String(index).padStart(

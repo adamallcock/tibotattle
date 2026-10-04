@@ -34,10 +34,10 @@ const WIRE_CAPABILITIES = new Set(
 
 // KEYCHAIN_LOCKED, KEYCHAIN_DENIED, and KEYCHAIN_MIGRATION_REQUIRED are the
 // exact fixed codes the export-identity backend classifies. Migration remains
-// distinct so the product can direct the user to the native Secure upgrade
-// review after bounded silent retries. Only deliberate native approval may
-// enable a prompt; the companion cannot approve or reset the retry budget.
-// Credential reset is not migration recovery.
+// distinct for fixed, content-free support guidance. The current Electron
+// release has no credential migration approval entrypoint; the companion
+// cannot approve migration, enable a prompt, or reset the retry budget.
+// Preserve legacy credentials and app data. Credential reset is not recovery.
 // Other broker failures collapse to the existing credential-unavailable
 // surface.
 const ERROR_CODES = new Set([

@@ -1,0 +1,12 @@
+*
+!scripts/
+!scripts/**
+!test/
+!test/fixtures/
+!test/fixtures/linux-packaged-codex/
+!test/fixtures/linux-packaged-codex/codex
+!.release-build/
+!.release-build/linux-final-qualification/
+!.release-build/linux-final-qualification/pair.json
+!.release-build/linux-final-qualification/current.AppImage
+!.release-build/linux-final-qualification/next.AppImage

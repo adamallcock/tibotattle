@@ -90,6 +90,18 @@ Display windows do not delete older local history. The dashboard may show a
 shorter horizon while the local index retains the evidence needed for replay,
 corrections, and longer-term views.
 
+Historical model identification and pricing updates require a completed main
+**Refresh**. Desktop startup requests this refresh once local analysis is
+allowed. Retained session and archived-session logs let the app correct earlier
+unrecognized GPT-6.1 Sol records without changing token totals. An exact stored
+model identity can also be repriced from sufficient preserved token, context
+and time evidence. If a record's model became `unknown` and its original log is
+gone, the app cannot safely reconstruct that identity; missing evidence and
+unsupported historical prices remain explicit. These are local analysis
+updates. A repaired model identity does not automatically replace an already
+accepted hosted contribution; hosted synchronization requires a compatible
+correction contract.
+
 When local history contains more than one plan, **Allowance** separates the
 plans instead of averaging Plus and Pro reset estimates together. The plan
 selector keeps the headline, history, range, pace and share card on the same
@@ -208,12 +220,12 @@ measurements are ready. Browser results stay in memory only; restarting the app
 starts a fresh page cache. Speculative requests pause while the app document is
 hidden.
 
-If approved performance sharing is paused, **Community → Review performance
-sharing again** lets you review and renew its independent authorization. A valid
-renewal can resume an earlier authorization or response-version rejection while
-preserving upload progress. Opt-outs, disconnections and invalid measurements
-remain protected. Accountless sharing rechecks its protected preference and
-current hosted grant when the client restarts or that preference changes.
+Accountless performance sharing rechecks its protected sharing preference and
+current hosted grant when the desktop restarts or that preference changes. A
+current grant can resume an earlier authorization or response-version rejection
+while preserving acknowledged upload progress. Ordinary polling does not retry
+a terminal rejection. Recorded opt-outs and invalid measurements remain
+protected; local Model performance analysis is independent of hosted sharing.
 
 **Output speed** includes response-timed measurements plus eligible tool-free
 turn estimates from older logs. Each turn contributes once: covered response
@@ -477,16 +489,17 @@ is performed against a copy before replacing durable state.
 
 ### Secure upgrade
 
-In builds with the [native migration change](./decisions/2026-08-31-silent-keychain-migration.md),
-TiboTattle first tries to preserve older saved keys silently, up to three times.
-If it cannot finish, **Secure upgrade** appears quietly in **Settings… →
-General**. Choose **Review migration…** when ready. The explanation tells you
-why access is needed before **Approve migration** can open a macOS Keychain
-dialog. Enter a password only in that macOS dialog; TiboTattle does not receive
-it. Cancel leaves migration pending, and approval changes neither key values
-nor contribution consent. Do not reset keys or delete local history to resolve
-this state. The linked decision records qualification; this is not a claim
-that an older installed app already has the new flow.
+If Electron cannot read a preserved legacy credential, startup can stop with
+**Unable to prepare secure storage** and support code
+`SECURE_STORAGE_MIGRATION_REQUIRED`. The credential remains preserved. Choose
+**Quit** and follow [SUPPORT.md](../SUPPORT.md) with the support code. Do not
+delete or reset Keychain items or TiboTattle data.
+
+The current Electron app has no self-service credential migration or approval
+control. **Retry** repeats the silent readiness check; it does not migrate the
+credential. The [native migration decision](./decisions/2026-08-31-silent-keychain-migration.md)
+records the older AppKit app's approval flow, not a Settings control available
+in the current Electron app.
 
 ## Optional community contribution
 
@@ -507,9 +520,10 @@ if support is needed.
 
 ### Stop sharing from this Mac
 
-Turn off **Share usage measurements** in Community or Settings to stop future
-accountless uploads and save your choice across restart. This preserves accepted
-hosted history, local analysis and the existing enrollment.
+Turn off **Share usage measurements** in Community to stop future accountless
+uploads and save your choice across restart. You can also reach Community through
+**Settings… → Data & privacy → Community sharing → Manage sharing**. This
+preserves accepted hosted history, local analysis and the existing enrollment.
 
 Older clients may offer **Disconnect this Mac** with a confirmation. It revokes
 this Mac's hosted contribution authority, clears its local device credential

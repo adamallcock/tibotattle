@@ -47,8 +47,9 @@ Electron startup preflights `account_observation` and `contribution_device`,
 the currently active desktop paths. `export_identity` remains an on-demand
 legacy path and `claude_session_pseudonym` remains reserved for the optional
 Claude provider. They retain the same read, store, and migration-required
-guards at first use: a required export migration must be approved through the
-released native application's local approval flow. The main-only
+guards at first use. The current Electron release has no credential migration
+approval entrypoint. A `migration_required` outcome preserves the legacy
+credential and blocks the affected path. The main-only
 `accountless_installation` path is checked only when sharing requires it.
 
 Startup maps credential readiness to fixed, content-free reasons: locked,
@@ -56,7 +57,11 @@ denied, migration required, timeout, invalid credential, adapter-integrity
 failure, or Security-framework unavailability. A blocked launch offers a
 user-driven Retry and the safe Quit default. Retry repeats the silent read; it
 does not enable Keychain interaction, create a replacement, change an ACL, or
-start the companion. When accountless sharing is active, Electron also reads
+start the companion. For `migration_required`, quit and contact support with
+`SECURE_STORAGE_MIGRATION_REQUIRED`. Preserve the legacy credential and app
+data; do not delete or reset credentials or app data. The blocked startup
+cannot open Settings, and neither Retry nor reinstalling this release performs
+a credential migration. When accountless sharing is active, Electron also reads
 and immediately clears the main-only `accountless_installation` value before
 the companion can start. A saved opt-out performs no accountless credential
 read.
@@ -98,7 +103,8 @@ conditional operations as its only mutation surface.
 
 A locked accountless item is reported as explicitly retryable availability and
 does not create, replace, or delete an identity. Denial and required legacy
-recovery remain terminal until the owner takes the corresponding local action.
+recovery remain terminal; a migration-required outcome does not authorize a new
+identity or an automatic migration.
 
 The Electron production composition reads the old encrypted
 `accountless-installation-credential-v1.json` only as bounded ciphertext

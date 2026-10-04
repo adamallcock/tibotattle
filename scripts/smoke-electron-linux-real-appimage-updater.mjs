@@ -18,7 +18,7 @@ const HOST = "updates.tibotattle.com";
 const FEED = `https://${HOST}/electron/stable/linux-x64`;
 const fail = (code) => { throw Object.assign(new Error(code), { code: `LINUX_REAL_APPIMAGE_${code}` }); };
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
-async function waitFor(read, timeout = 60000) {
+export async function waitFor(read, timeout = 60000) {
   const until = Date.now() + timeout;
   while (Date.now() < until) { const value = await read(); if (value) return value; await delay(200); }
   fail("TIMEOUT");
@@ -87,7 +87,7 @@ async function targets(port) {
   try { const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) }); return await r.json(); }
   catch { return []; }
 }
-async function connectPage(port, predicate) {
+export async function connectPage(port, predicate) {
   return waitFor(async () => {
     const rows = await targets(port);
     const page = rows.find((row) => row.type === "page" && predicate(row.url)
@@ -140,7 +140,7 @@ async function processIdentityDiagnostics() {
   }
   return result;
 }
-async function processHealth(pid) {
+export async function processHealth(pid) {
   // Read only socket identities for this process and its children; never
   // probe unrelated ports or export command lines/environment material.
   const pids = new Set([pid]);

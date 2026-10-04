@@ -1,13 +1,4 @@
 {
-  "schemaVersion": "codex-contract-ledger-v0.1",
-  "source": {
-    "repository": "openai/codex",
-    "branch": "main",
-    "path": "codex-rs/protocol/src/auth.rs",
-    "reviewedRevision": "b1e72963c3b71a9265a551e54beff078384efed9",
-    "reviewedOn": "2026-09-29",
-    "sourceSha256": "0ab901e92eaaa9ac87d1aa5ba94c1bdc72696e922062f318e2c8e308462a3856"
-  },
   "binaryChannels": [
     {
       "id": "environment_override",
@@ -30,155 +21,176 @@
       "locator": "latest @openai/codex release"
     }
   ],
-  "plans": [
-    {
-      "rawValue": "free",
-      "displayName": "Free",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "go",
-      "displayName": "Go",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "plus",
-      "displayName": "Plus",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "pro",
-      "displayName": "Pro (More)",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "prolite",
-      "displayName": "Pro",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "promax",
-      "displayName": "Pro (Max)",
-      "lifecycle": "provisional",
-      "firstReviewedOn": "2026-09-24",
-      "note": "The raw value and display name match openai/codex KnownPlan at the reviewed source revision. No reviewed installed binary exposes the value yet. Product policy uses Pro Max 25x; provider allowance and window semantics remain unverified."
-    },
-    {
-      "rawValue": "team",
-      "displayName": "Team",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "self_serve_business_prolite",
-      "displayName": "Self Serve Business ProLite",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "self_serve_business_usage_based",
-      "displayName": "Self Serve Business Usage Based",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "business",
-      "displayName": "Business",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "ent26",
-      "displayName": "Enterprise",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "enterprise_cbp_automation",
-      "displayName": "Enterprise (Automation)",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "enterprise_cbp_usage_based",
-      "displayName": "Enterprise CBP Usage Based",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "enterprise",
-      "displayName": "Enterprise",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "edu",
-      "displayName": "Edu",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "edu_plus",
-      "displayName": "Edu Plus",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    },
-    {
-      "rawValue": "edu_pro",
-      "displayName": "Edu Pro",
-      "lifecycle": "active",
-      "firstReviewedOn": "2026-08-25"
-    }
-  ],
   "marketingSeats": [
     {
-      "id": "business-standard",
-      "product": "chatgpt_business",
       "displayName": "Standard",
-      "lifecycle": "active",
       "firstReviewedOn": "2026-08-26",
+      "id": "business-standard",
+      "lifecycle": "active",
       "nameEvidence": [
         "https://openai.com/index/premium-seats-chatgpt-business/"
-      ]
+      ],
+      "product": "chatgpt_business"
     },
     {
-      "id": "business-premium",
-      "product": "chatgpt_business",
       "displayName": "Premium",
-      "lifecycle": "active",
       "firstReviewedOn": "2026-08-26",
+      "id": "business-premium",
+      "lifecycle": "active",
       "nameEvidence": [
         "https://openai.com/index/premium-seats-chatgpt-business/"
-      ]
+      ],
+      "product": "chatgpt_business"
     }
   ],
+  "plans": [
+    {
+      "displayName": "Free",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "free"
+    },
+    {
+      "displayName": "Go",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "go"
+    },
+    {
+      "displayName": "Plus",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "plus"
+    },
+    {
+      "displayName": "Pro (More)",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "pro"
+    },
+    {
+      "displayName": "Pro",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "prolite"
+    },
+    {
+      "displayName": "Pro (Max)",
+      "firstReviewedOn": "2026-09-24",
+      "lifecycle": "active",
+      "note": "The KnownPlan raw value and display name are source-verified, and reviewed ChatGPT-bundled and PATH codex-cli 0.160.0 generate promax in PlanType. Product expectations remain Pro 10x for pro and Pro Max 25x for promax; provider allowance and window semantics remain unverified.",
+      "rawValue": "promax"
+    },
+    {
+      "displayName": "Team",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "team"
+    },
+    {
+      "displayName": "Self Serve Business ProLite",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "self_serve_business_prolite"
+    },
+    {
+      "displayName": "Self Serve Business Usage Based",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "self_serve_business_usage_based"
+    },
+    {
+      "displayName": "Business",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "business"
+    },
+    {
+      "displayName": "Enterprise",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "ent26"
+    },
+    {
+      "displayName": "Enterprise (Automation)",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "enterprise_cbp_automation"
+    },
+    {
+      "displayName": "Enterprise CBP Usage Based",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "enterprise_cbp_usage_based"
+    },
+    {
+      "displayName": "Enterprise",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "enterprise"
+    },
+    {
+      "displayName": "Edu",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "edu"
+    },
+    {
+      "displayName": "Edu Plus",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "edu_plus"
+    },
+    {
+      "displayName": "Edu Pro",
+      "firstReviewedOn": "2026-08-25",
+      "lifecycle": "active",
+      "rawValue": "edu_pro"
+    }
+  ],
+  "schemaVersion": "codex-contract-ledger-v0.1",
   "seatMappings": [
     {
       "id": "business-premium-candidate",
-      "wirePlanType": "self_serve_business_prolite",
-      "marketingSeatId": "business-premium",
-      "status": "unverified_candidate",
       "mappingEvidence": [],
-      "note": "The seat name is official, but no published or observed wire mapping currently establishes that this planType means Business Premium."
+      "marketingSeatId": "business-premium",
+      "note": "The seat name is official, but no published or observed wire mapping currently establishes that this planType means Business Premium.",
+      "status": "unverified_candidate",
+      "wirePlanType": "self_serve_business_prolite"
     }
   ],
+  "source": {
+    "branch": "main",
+    "path": "codex-rs/protocol/src/auth.rs",
+    "repository": "openai/codex",
+    "reviewedOn": "2026-10-04",
+    "reviewedRevision": "550eb50545a78468a09ce86b82426338640ef22d",
+    "sourceSha256": "0ab901e92eaaa9ac87d1aa5ba94c1bdc72696e922062f318e2c8e308462a3856"
+  },
   "verifiedContracts": [
     {
       "channel": "chatgpt_bundled",
-      "version": "codex-cli 0.149.0-alpha.4.1",
+      "planTypesSha256": "047598fd5356ff5c75b0f73274bcc679aaaac4a1844d5a6e896f557063f08bec",
       "verifiedOn": "2026-08-25",
-      "planTypesSha256": "047598fd5356ff5c75b0f73274bcc679aaaac4a1844d5a6e896f557063f08bec"
+      "version": "codex-cli 0.149.0-alpha.4.1"
     },
     {
       "channel": "chatgpt_bundled",
-      "version": "codex-cli 0.150.0-alpha.8",
+      "planTypesSha256": "047598fd5356ff5c75b0f73274bcc679aaaac4a1844d5a6e896f557063f08bec",
       "verifiedOn": "2026-08-26",
-      "planTypesSha256": "047598fd5356ff5c75b0f73274bcc679aaaac4a1844d5a6e896f557063f08bec"
+      "version": "codex-cli 0.150.0-alpha.8"
+    },
+    {
+      "channel": "chatgpt_bundled",
+      "planTypesSha256": "e38cfbb49d6aebb3ff41369320c11d2975b0597078f8290236a460351a0350f7",
+      "verifiedOn": "2026-10-04",
+      "version": "codex-cli 0.160.0"
+    },
+    {
+      "channel": "path",
+      "planTypesSha256": "e38cfbb49d6aebb3ff41369320c11d2975b0597078f8290236a460351a0350f7",
+      "verifiedOn": "2026-10-04",
+      "version": "codex-cli 0.160.0"
     }
   ]
 }

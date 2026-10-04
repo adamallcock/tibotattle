@@ -10,29 +10,47 @@ on:
     - cron: "23 4 * * 1"
   workflow_dispatch:
 
-# The scanner reports in the job log and fails on vulnerabilities. SARIF
-# upload stays disabled via the upload-sarif input, but the called reusable
-# workflow DECLARES actions:read + security-events:write at its top level,
-# and GitHub refuses at startup ("No jobs were run") when a caller grants
-# less than the callee declares — every run since this file landed failed
-# that way. The grants below match the declaration; with upload-sarif false
-# nothing is ever written to security-events.
+# No SARIF upload or external writes. Proof refusal and vulnerability reporting
+# fail the same check; expiry must never turn into a successful skipped scan.
 permissions:
-  actions: read
   contents: read
-  security-events: write
 
 jobs:
   osv:
     name: Scan committed dependency locks
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    runs-on: ubuntu-latest
     permissions:
-      actions: read
       contents: read
-      security-events: write
-    with:
-      upload-sarif: false
-      fail-on-vuln: true
-      scan-args: |-
-        --recursive
-        ./
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+      - name: Install exact locked dependencies without scripts
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Refuse expired or changed temporary exception
+        run: |
+          node scripts/check-http-cache-exception.mjs
+          node --test test/http-cache-semantics-security.test.js test/electron-windows-production-signing.test.js test/http-cache-exception.test.js test/http-cache-exception-workflow.test.mjs
+      # The reviewed binary digest fixes executable bytes. Direct invocation
+      # preserves vulnerability, no-package, config and operational failures.
+      - name: Run scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          scanner="${RUNNER_TEMP}/osv-scanner-2.5.1"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 \
+            https://github.com/google/osv-scanner/releases/download/v2.5.1/osv-scanner_linux_amd64 \
+            --output "$scanner"
+          printf '%s  %s\n' 'f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be' "$scanner" | sha256sum --check --strict
+          chmod 0700 "$scanner"
+          "$scanner" scan source --all-vulns --recursive ./

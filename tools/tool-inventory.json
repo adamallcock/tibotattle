@@ -462,6 +462,23 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/check-http-cache-exception.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The OSV workflow invokes this temporary exact-source, advisory-status and expiry guard directly; it is not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/osv-scanner.yml",
+        "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+        "test/http-cache-exception.test.js"
+      ],
+      "decision": "retain_until_reviewed_exception_removal",
+      "provenance": "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "local_review_release",
       "canonicalPath": "scripts/check-local-review-signing-readiness.js",
       "stableAlias": null,
@@ -644,7 +661,8 @@
         "scripts/smoke-electron-windows-nsis-lifecycle.mjs",
         "test/electron-windows-accountless-smoke.test.js",
         "test/electron-windows-normal-candidate.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -942,7 +960,8 @@
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "test/electron-macos-qualification-identity.test.mjs",
         "docs/runbooks/macos-stable-release-runbook.md",
-        "scripts/lib/macos-credential-qualification-intake.mjs"
+        "scripts/lib/macos-credential-qualification-intake.mjs",
+        "scripts/smoke-electron-macos-production-update.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -969,7 +988,8 @@
         "scripts/smoke-electron-macos-sparkle-transition.mjs",
         "scripts/lib/electron-macos-qualification-identity.mjs",
         "scripts/lib/macos-credential-qualification-intake.mjs",
-        "scripts/lib/sparkle-remote-inspection.mjs"
+        "scripts/lib/sparkle-remote-inspection.mjs",
+        "test/electron-macos-qualification-identity.test.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -1957,7 +1977,8 @@
         "scripts/run-linux-secret-service-qualification.mjs",
         "test/linux-secret-service-qualification.test.js",
         "scripts/smoke-electron-linux-packaged.mjs",
-        "scripts/smoke-electron-linux-secret-service.mjs"
+        "scripts/smoke-electron-linux-secret-service.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2009,7 +2030,9 @@
         "test/electron-linux-normal-packaged-smoke.test.js",
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
         "scripts/qualify-electron-linux-final-appimage.mjs",
-        ".github/workflows/electron-linux-production-package.yml"
+        ".github/workflows/electron-linux-production-package.yml",
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2042,7 +2065,8 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-windows-normal-candidate.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2060,7 +2084,9 @@
         ".github/workflows/electron-development-packages.yml",
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "test/electron-windows-nsis-lifecycle.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs",
+        "scripts/qualify-electron-windows-frozen-installer.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2111,7 +2137,8 @@
         "scripts/smoke-electron-linux-packaged.mjs",
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "test/electron-linux-normal-packaged-smoke.test.js",
-        "scripts/smoke-electron-linux-real-appimage-updater.mjs"
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2264,7 +2291,10 @@
         "test/electron-stable-publication.test.js",
         "test/electron-stable-writer.test.js",
         "scripts/qualify-electron-linux-final-appimage.mjs",
-        "test/electron-linux-final-appimage.test.js"
+        "test/electron-linux-final-appimage.test.js",
+        "scripts/lib/linux-final-artifact-intake.mjs",
+        "test/electron-linux-installed-lifecycle.test.js",
+        "test/electron-linux-installed-files.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2425,7 +2455,8 @@
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
         ".github/workflows/electron-linux-production-package.yml",
         "scripts/qualify-electron-linux-final-appimage.mjs",
-        "test/electron-linux-final-appimage.test.js"
+        "test/electron-linux-final-appimage.test.js",
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2441,7 +2472,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/electron-linux-real-appimage-updater.test.js"
+        "test/electron-linux-real-appimage-updater.test.js",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2477,7 +2509,8 @@
       "callers": [
         ".github/workflows/electron-windows-signing.yml",
         "test/electron-windows-signed-installed.test.js",
-        "scripts/qualify-electron-windows-frozen-installer.mjs"
+        "scripts/qualify-electron-windows-frozen-installer.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2624,7 +2657,8 @@
       "stableAliasReason": "Restricted disposable Windows qualification of an exact previously signed installer; does not rebuild, sign, or publish it.",
       "additionalAliases": [],
       "callers": [
-        ".github/workflows/electron-windows-installer-diagnostic.yml"
+        ".github/workflows/electron-windows-installer-diagnostic.yml",
+        "test/electron-windows-final-upgrade.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-windows-installer-diagnostic.yml",
@@ -2851,6 +2885,76 @@
       ],
       "decision": "retain_read_only_incoming_sparkle_inspection",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-final-artifact-intake.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Closed final Linux package and runner admission; internal qualification support only.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-installed-lifecycle.test.js",
+        "test/electron-linux-installed-files.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Manual final-artifact acquisition and preparation with a closed intake; never rebuilds or publishes an application.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-final-qualification.yml",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-installed-files.test.mjs",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-linux-final-lifecycle.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Native x64 FUSE installed lifecycle against exact public predecessor and final candidate bytes; isolated manual workflow only.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-final-qualification.yml",
+        "containers/electron-linux-installed/Dockerfile",
+        "test/electron-linux-installed-lifecycle.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-final-upgrade.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact signed public predecessor to final signed installer qualification is restricted to one disposable Windows installation/profile; it does not qualify automatic updater replacement.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-electron-windows-frozen-installer.mjs",
+        "test/electron-windows-final-upgrade.test.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
     }

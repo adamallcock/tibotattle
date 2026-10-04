@@ -235,12 +235,16 @@ breakdowns normalize to `null` while All models remains available. An empty
 array means no eligible same-configuration models were found.
 
 When contribution preparation encounters a preserved legacy export identity
-whose bounded silent migration has not completed, it returns the fixed
-`identity_migration_required` code. The dashboard directs the user to native
-**Settings… → General → Secure upgrade → Review migration…**, then **Check
-again**. Only a separate, explained native approval can enable a Keychain
-prompt. The dashboard offers neither approval authority nor identity reset,
-deletion, or rotation as migration recovery.
+without a usable modern credential, it returns the fixed
+`identity_migration_required` code. This request does not migrate or replace the
+identity. Quit TiboTattle and contact support with this code. Preserve the legacy
+credential and app data; do not delete or reset credentials or app data. The
+current Electron release has no credential migration approval entrypoint.
+Startup blocked by required credential migration instead reports
+`SECURE_STORAGE_MIGRATION_REQUIRED` before Settings is available. Retry only
+repeats the silent readiness check; neither Retry nor reinstalling this release
+performs a credential migration. The dashboard offers no approval authority,
+identity reset, deletion, or rotation as migration recovery.
 
 ### Fixed report pages
 
@@ -666,7 +670,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
-| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then bounded reporting-window requests or a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for four periods and at most eight pinned windows, or a fixed unavailable indication; original timing and independent tool-free supplement, no accounting/contribution data flow |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then bounded reporting-window requests or a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for four periods across three speed modes and at most twelve pinned windows, or a fixed unavailable indication; original timing and independent tool-free supplement, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -795,8 +799,8 @@ around one generated or compiled authority.
 | [`schemas/product-synthetic-v0.1`](../../schemas/product-synthetic-v0.1) | Synthetic product contribution and encrypted envelope |
 | [`schemas/claude-statusline-v0.2`](../../schemas/claude-statusline-v0.2) | Minimized Claude status-line record |
 | [`schemas/provider-accounting-snapshot-v0.1.schema.json`](../../schemas/provider-accounting-snapshot-v0.1.schema.json) | Cross-provider accounting snapshot |
-| [`schemas/export-set-v0.1`](../../schemas/export-set-v0.1), [`v0.2`](../../schemas/export-set-v0.2) | Export-set manifests and evolution |
-| [`schemas/export-deletion-v0.1`](../../schemas/export-deletion-v0.1) | Deletion preflight, journal, commit marker, and receipt |
+| [`schemas/export-set-v0.1`](../../schemas/export-set-v0.1), [`v0.2`](../../schemas/export-set-v0.2), [`v0.3`](../../schemas/export-set-v0.3) | Export-set manifests and evolution; current v0.3 admits the existing 100,000-source runtime ceiling |
+| [`schemas/export-deletion-v0.1`](../../schemas/export-deletion-v0.1), [`v0.2 journal`](../../schemas/export-deletion-v0.2/journal.schema.json) | Retained deletion preflight, journals, commit marker, and receipt; v0.2 journal admits manifest v0.3 |
 | [`schemas/export-workspace-discard-v0.1`](../../schemas/export-workspace-discard-v0.1) | Workspace-discard preflight, journal, commit marker, and receipt |
 | [`schemas/release-evidence-v1`](../../schemas/release-evidence-v1) | Nullable cross-platform release-evidence manifest |
 | [`schemas/r7-release-evidence-v0.1`](../../schemas/r7-release-evidence-v0.1) | R7 release qualification receipt |

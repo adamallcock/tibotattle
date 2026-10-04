@@ -125,12 +125,13 @@ function privacyReceipt() {
   };
 }
 
-test("compatibility admits the current export tuple and refuses stale or unknown parser and registry versions", () => {
+test("compatibility admits the current export tuple and refuses stale or unknown parser, registry, and package versions", () => {
   const current = exportCompatibilityTuple();
   assert.equal(validateExportRecord("compatibility", current).valid, true);
   for (const [path, stale] of [
     [["implementation", "checkpointParserVersion"], "codex-checkpoint-state-v0.2"],
     [["implementation", "checkpointScanVersion"], "codex-export-checkpoint-scan-v0.5"],
+    [["implementation", "packageVersion"], "0.1.26"],
     [["providerAdapters", "openaiCodex", "sourceFormats", "rollout", "parserVersion"], "codex-log-scan-v9"],
     [["registry", "version"], "telemetry-v0.1-registry-2026-09-22.1"],
   ]) {

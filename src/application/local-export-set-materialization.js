@@ -109,7 +109,7 @@ function addCounts(target, value) {
 export function createLocalExportSetMaterialization(configuration = {}) {
   const contract = snapshotPorts(configuration, "contract", [
     "sha256", "fail", "stableJson", "buildChunkBundle", "compressChunkBundle", "deterministicSetId",
-    "deterministicBundleId", "chooseLargestFittingPrefix", "assertVerifiedChunk", "manifestReceipt",
+    "deterministicBundleId", "chooseLargestFittingPrefix", "assertVerifiedChunk", "manifestReceipt", "retainMatchingManifest",
     "loadVerifiedLocalMetadataBundleBytes", "decompressExportBytes", "verifyPrivacySafeBundle",
     "assertValidExportSetManifest", "computeWorkspaceLogicalRecordsSha256", "combinedSourcePlanCommitment",
   ]);
@@ -272,17 +272,21 @@ export function createLocalExportSetMaterialization(configuration = {}) {
             recordEndExclusive: metadata.recordEndExclusive, recordCounts: metadata.recordCounts });
           addCounts(totals.recordCounts, metadata.recordCounts); totals.decodedBundleBytes += metadata.bundleBytes; totals.encodedArtifactBytes += metadata.artifactBytes; totals.receiptBytes += metadata.receiptBytes; recordOffset += selectedCount; carry = carry.slice(selectedCount); carryBytes = carry.reduce((sum, row) => sum + row.recordBytes, 0); chunkIndex += 1; if (emptySet) break;
         }
-        const manifest = { schemaVersion: manifestVersion, manifestContract: { version: contractVersion, schemaSha256 }, compatibility: structuredClone(descriptor.compatibility), exportSetId, participantId: descriptor.participantId, createdAt: descriptor.createdAt, coveredAt: structuredClone(descriptor.coveredAt), sourceProviders: [...descriptor.sourceProviders], clientPlatform: descriptor.clientPlatform, transportReady: false, completionStatus: "complete", compressionRuntime: { nodeVersion: process.versions.node, zlibVersion: process.versions.zlib }, sourcePlan: { sha256: combinedSourcePlan.sha256, sourceFiles: combinedSourcePlan.sourceFiles, sourceBytes: combinedSourcePlan.sourceBytes }, chunking, totals, chunks };
-        contract.assertValidExportSetManifest(manifest); const manifestText = contract.stableJson(manifest); resourceGuard.observeManifest(Buffer.byteLength(manifestText)); const manifestReceipt = contract.manifestReceipt(manifestText);
+        let manifest = { schemaVersion: manifestVersion, manifestContract: { version: contractVersion, schemaSha256 }, compatibility: structuredClone(descriptor.compatibility), exportSetId, participantId: descriptor.participantId, createdAt: descriptor.createdAt, coveredAt: structuredClone(descriptor.coveredAt), sourceProviders: [...descriptor.sourceProviders], clientPlatform: descriptor.clientPlatform, transportReady: false, completionStatus: "complete", compressionRuntime: { nodeVersion: process.versions.node, zlibVersion: process.versions.zlib }, sourcePlan: { sha256: combinedSourcePlan.sha256, sourceFiles: combinedSourcePlan.sourceFiles, sourceBytes: combinedSourcePlan.sourceBytes }, chunking, totals, chunks };
+        contract.assertValidExportSetManifest(manifest); let manifestText = contract.stableJson(manifest); resourceGuard.observeManifest(Buffer.byteLength(manifestText)); let manifestReceipt = contract.manifestReceipt(manifestText);
         const existingManifest = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes });
         const existingReceipt = await destination.readOwnerOnlyExportArtifactIfPresent(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 });
         if ((existingManifest.status === "present") !== (existingReceipt.status === "present")) contract.fail("manifest_conflict");
         if (existingManifest.status === "present") {
-          try { if (existingManifest.bytes.toString("utf8") !== manifestText || contract.stableJson(JSON.parse(existingReceipt.bytes.toString("utf8"))) !== contract.stableJson(manifestReceipt)) contract.fail("manifest_conflict"); }
-          catch (error) {
+          try {
+            ({ manifest, manifestText, manifestReceipt } = contract.retainMatchingManifest(
+              manifest, existingManifest.bytes.toString("utf8"), existingReceipt.bytes.toString("utf8"),
+            ));
+          } catch (error) {
             if (exactError(error, ExportSetError, "export_set_manifest_conflict")) throw error;
             contract.fail("artifact_read");
           }
+          resourceGuard.observeManifest(Buffer.byteLength(manifestText));
         } else { await destination.writeOwnerOnlyPairNoClobberForDestination(destinationCapability, { firstBasename: manifestBasename, firstContent: manifestText, secondBasename: manifestReceiptBasename, secondContent: contract.stableJson(manifestReceipt) }); await failpoint("after_manifest_publish", null); }
         localWorkspace.markManifestComplete({ exportSetId, manifestSha256: manifestReceipt.manifestSha256, manifestBytes: manifestReceipt.manifestBytes, chunkCount: chunks.length }); resourceGuard.observeWorkspace(await localWorkspace.storageBytes());
         return { manifest, manifestReceipt, manifestFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestBasename, maximumBytes: resourceGuard.limits.maximumManifestBytes }), manifestReceiptFile: await destination.projectOwnerOnlyExportArtifactPath(destinationCapability, { basename: manifestReceiptBasename, maximumBytes: 1024 * 1024 }), resourceUsage: resourceGuard.snapshot() };

@@ -18,13 +18,13 @@ import { validateProductionDistributionMetadata } from '../apps/electron/desktop
 import { macOSCredentialApplicationVerificationArguments } from '../apps/electron/desktop-macos-keychain.js';
 import { inspectNativeElectronHandoverCompletion } from '../apps/electron/desktop-native-migration.js';
 import { compareAppleMacOSBundleVersions, resolveSignedMacOSBundleVersion } from './macos-bundle-version.js';
+import { resolveMacOSProductionUpdatePredecessor } from './lib/electron-macos-qualification-identity.mjs';
 
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA = 'tibotattle-signed-macos-production-update-v1';
-export const ELECTRON_020_SOURCE = 'f518126a05a6d165b9617f6417a87219d7047273';
-export const ELECTRON_020_DMG = Object.freeze({
-  'darwin-arm64': '50a1b89aff696ef3323ab48284aa820af7aad504397fbe88831c29ace2479f30',
-  'darwin-x64': 'a63ec06036ddbc5a0e70dc59c6520a8ad5baa8c7a3a0fc4d3713a7f1f1523ecd',
-});
+export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 = 'tibotattle-signed-macos-production-update-v2';
+const ELECTRON_020 = resolveMacOSProductionUpdatePredecessor({ schemaVersion: 'tibotattle-production-electron-update-intake-v1' });
+export const ELECTRON_020_SOURCE = ELECTRON_020.sourceRevision;
+export const ELECTRON_020_DMG = ELECTRON_020.dmgSha256;
 const require = createRequire(import.meta.url), SHA = /^[0-9a-f]{64}$/u;
 const fail = stage => { throw Object.assign(new Error('SIGNED_PRODUCTION_UPDATE_REFUSED'), { updateStage: stage }); };
 const hash = (bytes, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(bytes).digest(encoding);
@@ -50,7 +50,6 @@ export function validateProductionUpdateIntake(value) {
     'dmgSha256', 'asarSha256', 'zipSha256', 'feedSha256', 'predecessorAsarSha256', 'directory'];
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).sort().join('|') !== keys.sort().join('|')
-    || value.schemaVersion !== 'tibotattle-production-electron-update-intake-v1'
     || !Object.hasOwn(ELECTRON_020_DMG, value.target)
     || typeof value.bundleVersion !== 'string' || value.bundleVersion !== resolveSignedMacOSBundleVersion(value.version, 'stable')
     || compareAppleMacOSBundleVersions('1026', value.bundleVersion) !== -1
@@ -58,13 +57,16 @@ export function validateProductionUpdateIntake(value) {
     || typeof value.buildNumber !== 'string' || !/^[1-9][0-9]{0,9}$/u.test(value.buildNumber)
     || !['dmgSha256', 'asarSha256', 'zipSha256', 'feedSha256', 'predecessorAsarSha256'].every(k => typeof value[k] === 'string' && SHA.test(value[k]))
     || !isAbsolute(value.directory ?? '') || /[\0\r\n]/u.test(value.directory)) fail('intake');
+  let predecessor;
+  try { predecessor = resolveMacOSProductionUpdatePredecessor(value); } catch { fail('intake'); }
+  if (predecessor.successorVersion && compareAppleMacOSBundleVersions(predecessor.bundleVersion, value.bundleVersion) !== -1) fail('intake');
   const architecture = value.target === 'darwin-arm64' ? 'arm64' : 'x64';
   const feedBase = 'https://updates.tibotattle.com/electron/stable/' + value.target;
   const file = version => 'TiboTattle-' + version + '-mac-' + architecture;
   return { ...value, architecture, directory: resolve(value.directory), feedBase,
     feedUrl: feedBase + '/latest-mac.yml', zipFileName: file(value.version) + '.zip',
-    dmgFileName: file(value.version) + '.dmg', predecessorDmgSha256: ELECTRON_020_DMG[value.target],
-    predecessorUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.20/' + file('0.1.20') + '.dmg',
+    dmgFileName: file(value.version) + '.dmg', predecessorDmgSha256: predecessor.dmgSha256[value.target],
+    predecessorUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v' + predecessor.version + '/' + file(predecessor.version) + '.dmg',
     candidateUrl: 'https://github.com/adamallcock/tibotattle/releases/download/v' + value.version + '/' + file(value.version) + '.dmg' };
 }
 export function validateProductionMacUpdateFeed(input, manifest, zip, dmg) {
@@ -125,11 +127,29 @@ export function selectProductionUpdateSuccessor(rows, executable, predecessorPid
   if (rows.some(row => row.pid === predecessorPid)) return null;
   return selectMacTransitionApplicationProcess(rows.filter(row => !predecessorProcesses.has(row.pid)), executable);
 }
-function productionUpdateProcesses() {
+export function selectCurrentProductionUpdateSuccessor(rows, executable, predecessorPid, predecessorProcesses) {
+  if (!(predecessorProcesses instanceof Map) || !predecessorProcesses.has(predecessorPid)
+    || [...predecessorProcesses].some(([pid, fingerprint]) => !Number.isSafeInteger(pid) || pid < 2
+      || typeof fingerprint !== 'string' || !fingerprint.includes('\n') || fingerprint.endsWith('\n'))) fail('predecessor_process_identity');
+  // Wait for every captured predecessor identity, including an orphaned old
+  // companion, to exit naturally. Cleanup is not an updater success observation.
+  for (const row of rows) if (predecessorProcesses.has(row.pid)) {
+    if (typeof row.startedAt !== 'string' || !row.startedAt
+      || predecessorProcesses.get(row.pid).split('\n').at(-1) === row.startedAt) return null;
+  }
+  return selectProductionUpdateSuccessor(rows.filter(row => !predecessorProcesses.has(row.pid)), executable,
+    predecessorPid, new Set(predecessorProcesses.keys()));
+}
+function productionUpdateProcesses(predecessorProcesses = null) {
   return command('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,comm=']).split('\n').map(line => {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
     if (!match) fail('process_inventory');
-    return { pid: +match[1], parent: +match[2], group: +match[3], command: match[4] };
+    const row = { pid: +match[1], parent: +match[2], group: +match[3], command: match[4] };
+    if (predecessorProcesses?.has(row.pid)) {
+      try { row.startedAt = command('/bin/ps', ['-p', String(row.pid), '-o', 'lstart=']); }
+      catch { row.startedAt = null; } // An indeterminate identity must be observed again.
+    }
+    return row;
   });
 }
 export function refreshProductionUpdateArchiveIndex(appPath) {
@@ -139,7 +159,7 @@ export function refreshProductionUpdateArchiveIndex(appPath) {
   if (typeof api.uncache !== 'function') fail('archive_cache_api');
   api.uncache(join(appPath, 'Contents', 'Resources', 'app.asar'));
 }
-export async function verifyPredecessor(input, appPath) {
+async function verifyPinnedPredecessor(input, appPath, predecessor) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
   if (hash(await bytes(asar, 512 * 1024 ** 2)) !== input.predecessorAsarSha256) fail('predecessor_asar');
   command('/usr/bin/codesign', macOSCredentialApplicationVerificationArguments(appPath));
@@ -147,15 +167,29 @@ export async function verifyPredecessor(input, appPath) {
   const loaded = createRequire(require.resolve('electron-builder'))('@electron/asar'), api = loaded?.default ?? loaded;
   if (api.statFile(asar, 'package.json').size > 128 * 1024) fail('predecessor_metadata');
   const pkg = JSON.parse(api.extractFile(asar, 'package.json').toString('utf8'));
-  const distribution = validateProductionDistributionMetadata(pkg.tibotattleDistribution, { platform: 'darwin', architecture: input.architecture });
   const plist = JSON.parse(command('/usr/bin/plutil', ['-convert', 'json', '-o', '-', join(appPath, 'Contents', 'Info.plist')]));
-  if (pkg.name !== 'app-usagemonitor' || pkg.version !== '0.1.20' || distribution.sourceRevision !== ELECTRON_020_SOURCE
-    || distribution.buildNumber !== '2026091104' || distribution.target !== input.target || distribution.channel !== 'stable'
-    || plist.CFBundleIdentifier !== 'com.usagemonitor.local' || plist.CFBundleShortVersionString !== '0.1.20'
-    || plist.CFBundleVersion !== '2026091104') fail('predecessor_identity');
+  const distribution = validatePinnedPredecessorMetadata(input, pkg, plist, predecessor);
   const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
   if (command('/usr/bin/lipo', ['-archs', executable]) !== (input.architecture === 'arm64' ? 'arm64' : 'x86_64')) fail('predecessor_architecture');
   return { appPath, executable, distribution };
+}
+function validatePinnedPredecessorMetadata(input, pkg, plist, predecessor) {
+  const distribution = validateProductionDistributionMetadata(pkg?.tibotattleDistribution, { platform: 'darwin', architecture: input.architecture });
+  if (pkg.name !== 'app-usagemonitor' || pkg.version !== predecessor.version || distribution.sourceRevision !== predecessor.sourceRevision
+    || distribution.buildNumber !== predecessor.buildNumber || distribution.target !== input.target || distribution.channel !== 'stable'
+    || plist?.CFBundleIdentifier !== 'com.usagemonitor.local' || plist.CFBundleShortVersionString !== predecessor.version
+    || plist.CFBundleVersion !== predecessor.bundleVersion) fail('predecessor_identity');
+  return distribution;
+}
+// Retained public helper: the separate credential v1 lane still binds 0.1.20.
+export async function verifyPredecessor(input, appPath) {
+  return verifyPinnedPredecessor(input, appPath, ELECTRON_020);
+}
+export function validateProductionUpdatePredecessorMetadata(input, pkg, plist) {
+  return validatePinnedPredecessorMetadata(input, pkg, plist, resolveMacOSProductionUpdatePredecessor(input));
+}
+export async function verifyProductionUpdatePredecessor(input, appPath) {
+  return verifyPinnedPredecessor(input, appPath, resolveMacOSProductionUpdatePredecessor(input));
 }
 async function copyPredecessor(dmg, app, mount) {
   await mkdir(mount, { mode: 0o700 });
@@ -175,6 +209,12 @@ export async function runProductionUpdate(options) {
   let input, app, active, stage = 'intake'; const knownProcesses = new Map();
   try {
     input = validateProductionUpdateIntake(JSON.parse(await bytes(options.intakePath, 16384)));
+    if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v2') {
+      const predecessor = resolveMacOSProductionUpdatePredecessor(input);
+      Object.assign(proof, { schemaVersion: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, predecessorVersion: predecessor.version,
+        predecessorBundleVersion: predecessor.bundleVersion, predecessorBuildNumber: predecessor.buildNumber,
+        predecessorSourceRevision: predecessor.sourceRevision, predecessorProcessesExitedNaturally: false });
+    }
     for (const key of ['target', 'sourceRevision', 'version', 'buildNumber', 'bundleVersion', 'dmgSha256', 'asarSha256',
       'zipSha256', 'feedSha256', 'predecessorAsarSha256', 'predecessorDmgSha256']) proof[key] = input[key];
     if (!options.execute) return { ...proof, status: 'planned' };
@@ -207,7 +247,7 @@ export async function runProductionUpdate(options) {
     if (folder.uid !== process.getuid() || (folder.mode & 0o022)) fail('application_location');
     await copyPredecessor(predecessorDmg, app, join(input.directory, 'install-mount'));
     await assertExtractedSignedMacBundle(predecessorDmg, app, join(input.directory, 'predecessor-verification-mount'));
-    const verified = await verifyPredecessor(input, app); proof.signedArtifactVerified = true;
+    const verified = await verifyProductionUpdatePredecessor(input, app); proof.signedArtifactVerified = true;
     command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', app]);
     await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
     const seeded = await seedSignedReplacementNativeState(native, codex);
@@ -252,16 +292,20 @@ export async function runProductionUpdate(options) {
     if (hash(await fetchBytes(input.feedUrl, 65536)) !== input.feedSha256) fail('production_feed_changed');
     stage = 'install_update'; const oldPid = active.pid;
     captureMacTransitionProcesses(app, oldPid, knownProcesses);
-    const predecessorProcesses = new Set(knownProcesses.keys());
+    const currentRoute = input.schemaVersion === 'tibotattle-production-electron-update-intake-v2';
+    const predecessorProcesses = currentRoute ? new Map(knownProcesses) : new Set(knownProcesses.keys());
     // The call can lose its CDP response when the updater exits the predecessor.
     const request = active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()');
     proof.installUpdateInvoked = true; request.catch(() => {});
     stage = 'successor_process_poll';
     const successor = await until(() => {
       captureMacTransitionProcesses(app, oldPid, knownProcesses);
-      return selectProductionUpdateSuccessor(productionUpdateProcesses(), verified.executable, oldPid, predecessorProcesses)?.pid ?? null;
+      const rows = productionUpdateProcesses(currentRoute ? predecessorProcesses : null);
+      return (currentRoute ? selectCurrentProductionUpdateSuccessor : selectProductionUpdateSuccessor)(
+        rows, verified.executable, oldPid, predecessorProcesses)?.pid ?? null;
     }, 180000, 'updater_relaunch');
     proof.successorPIDObserved = true; proof.successorWasPreexistingProcess = predecessorProcesses.has(successor);
+    if (currentRoute) proof.predecessorProcessesExitedNaturally = true;
     stage = 'successor_archive_verification';
     input.candidateCodeDirectoryHash = await assertExtractedSignedMacBundle(candidateDmg, app, join(input.directory, 'successor-verification-mount'));
     stage = 'successor_signed_verification';
@@ -293,7 +337,7 @@ export async function runProductionUpdate(options) {
           verifyApp: async path => {
             refreshProductionUpdateArchiveIndex(path);
             try { return await verifySparkleTransitionCandidate(input, path); }
-            catch { return verifyPredecessor(input, path); }
+            catch { return verifyProductionUpdatePredecessor(input, path); }
           } });
       } catch (error) { proof.ownedProcessesStopped = false; proof.status = 'failed'; proof.failureStage ??= 'cleanup'; proof.cleanupFailureClassification = classifyProductionUpdateFailure(error); }
     }

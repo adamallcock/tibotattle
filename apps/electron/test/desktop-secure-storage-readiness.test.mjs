@@ -38,6 +38,22 @@ test("secure storage failures keep a closed content-free reason and support code
   }
 });
 
+test("migration-required guidance preserves legacy state and offers no unavailable recovery flow", () => {
+  const dialog = createDesktopSecureStorageDialog("migration_required");
+  assert.equal(dialog.message, "An existing TiboTattle credential requires migration.");
+  assert.match(dialog.detail, /Quit and contact support with the support code below/u);
+  assert.match(dialog.detail, /The legacy credential is preserved\./u);
+  assert.match(dialog.detail, /Do not delete or reset credentials or app data\./u);
+  assert.match(dialog.detail, /Retry only repeats the secure credential check/u);
+  assert.match(dialog.detail, /neither Retry nor reinstalling this release migrates the credential\./u);
+  assert.match(dialog.detail, /No credential was created, replaced, or deleted\./u);
+  assert.match(dialog.detail, /Support code: SECURE_STORAGE_MIGRATION_REQUIRED\.$/u);
+  assert.doesNotMatch(dialog.detail, /Secure upgrade|Review migration|Approve migration|Settings/u);
+  assert.deepEqual(dialog.buttons, ["Quit", "Retry"]);
+  assert.equal(dialog.defaultId, 0);
+  assert.equal(dialog.cancelId, 0);
+});
+
 test("unknown or hostile failures collapse to security unavailable", () => {
   const hostile = new Proxy({}, { get() { throw new Error("private detail"); } });
   for (const value of [undefined, null, {}, hostile]) {

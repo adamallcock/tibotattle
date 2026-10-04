@@ -23,8 +23,9 @@ export const MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES = Object.freeze([
 // composition activates: account observation and the contribution-device
 // bridge. Export identity is a legacy, on-demand path and the Claude
 // pseudonym is reserved for the optional Claude provider. Their read, store,
-// and migration-required guards stay active when either path is requested;
-// an export migration still requires the released native approval route.
+// and migration-required guards stay active when either path is requested.
+// The current Electron composition has no migration approval entrypoint and
+// preserves legacy credentials instead of replacing them.
 // Accountless installation enrollment remains main-process-only and is
 // deliberately checked only when sharing needs it.
 export const MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES = Object.freeze([

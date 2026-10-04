@@ -136,7 +136,7 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
-| `inference-timing-v2/model-performance-snapshot.json` | At most eight rolling period/mode and eight exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v5 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier mixed-mode receipts are preserved and refused until mode-separated reconstruction produces a v5 replacement. Unknown and mixed-mode turns are excluded from both selectable modes. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
+| `inference-timing-v2/model-performance-snapshot.json` | At most twelve rolling period/mode and twelve exact-window completed timing projections, fixed model IDs and numeric bins; 4 MiB owner-only, schema/digest-checked v5 envelope bound to the configured Codex source. | Uses the same atomic snapshot transport as Overview. Earlier mixed-mode receipts are preserved and refused until mode-separated reconstruction produces a v5 replacement. Unknown and mixed-mode turns are excluded from all selectable modes. Restored measurements keep their observation date while background scanning runs or fails; incomplete scans cannot replace them. First result saves immediately, then hourly, with latest completed results flushed on clean shutdown. |
 | `inference-timing-v2/source-<Codex-home digest>/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB per selected source; parser method 2 and SQLite user version 4. The forward migration retains existing TPS/TTFT, adds nullable completion/mode fields and source revision counters, and fences older writers. The legacy unscoped sidecar is preserved without reading or migrating its unknown source provenance; first use rebuilds measurements from retained source logs. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
 | `inference-timing-v2/source-<Codex-home digest>/tool-free-v1/timing-experiment.sqlite` (development source) | Independent supplement for reconciled single-response turns without tools, plus its own source cursors and bounded scalar pending state. Shares the original private timing correlation key for local joins only. | Maximum 256 MiB; parser method 3 and SQLite user version 5. Its forward migration preserves previous supplement measurements and fences older writers; the original primary store remains separate. An incompatible or unavailable supplement does not hide original measurements. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
@@ -176,18 +176,23 @@ native Keychain broker. A content-free binding/renewal record lives under Applic
 Support; it is not the credential. Keys are intentionally separate so one
 identity namespace cannot be joined to another by accident.
 
-The [silent native migration change](../decisions/2026-08-31-silent-keychain-migration.md)
-adds a narrow compatibility helper for existing legacy keys. It authenticates
-its native parent, accepts only fixed capabilities, and passes the unchanged
-value over a private descriptor for app-owned storage and exact readback. It
-adds no network destination, diagnostic field, consent, or uploaded data. The
-legacy recovery copy is retained during migration. Automatic attempts cannot
-open a Keychain prompt; only an explained native approval can do so. An explicit
-credential reset removes that capability's legacy copy before its modern copy,
-and waits for retiring companion writers before deletion. A failed deletion
-does not authorize a new identity or inferred success. Signed synthetic
-qualification is recorded in that decision; this source description does not
-qualify an installed upgrade.
+The [silent native migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+records the retired AppKit shell's compatibility helper for existing legacy
+keys. That helper authenticated its native parent, accepted fixed capabilities,
+and passed the unchanged value over a private descriptor for app-owned storage
+and exact readback. The legacy recovery copy was retained during migration.
+Automatic attempts could not open a Keychain prompt; the older shell's separate,
+explained approval could allow an interactive read. Its explicit credential
+reset and synthetic qualification are historical native evidence, not current
+Electron recovery controls or installed-upgrade proof.
+
+Current Electron has no credential migration approval entrypoint. Its
+noninteractive adapter preserves a legacy credential and blocks the affected
+path when migration is required. A required startup credential blocks before
+Settings and reports `SECURE_STORAGE_MIGRATION_REQUIRED`; quit and contact
+support with that code. Preserve the legacy credential and app data; do not
+delete or reset credentials or app data. Retry only repeats the silent readiness
+check, and reinstalling this release does not perform a credential migration.
 
 The Electron macOS production source serves the four legacy broker capabilities
 through its signed main process and the inherited FD4 channel. A fifth,

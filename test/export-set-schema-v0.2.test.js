@@ -5,21 +5,15 @@ import { readFile } from "node:fs/promises";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 import {
   assertValidExportSetManifest,
-  EXPORT_SET_CONTRACT_VERSION,
   EXPORT_SET_CONTRACT_VERSION_V0_2,
-  EXPORT_SET_MANIFEST_RECEIPT_VERSION,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
-  EXPORT_SET_MANIFEST_SCHEMA_SHA256,
   EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2,
-  EXPORT_SET_MANIFEST_VERSION,
   EXPORT_SET_MANIFEST_VERSION_V0_2,
   EXPORT_SET_ORDER_VERSION,
-  EXPORT_SET_PACKING_VERSION,
   EXPORT_SET_PACKING_VERSION_V0_1,
   EXPORT_SET_PACKING_VERSION_V0_2,
   exportSetChunkBasenames,
   exportSetChunkBundleBasename,
-  exportSetManifestSchema,
   exportSetManifestSchemaV0_2,
   validateExportSetManifest,
 } from "../src/export-set-schema.js";
@@ -51,7 +45,7 @@ function manifest() {
     sourcePlan: { sha256: "c".repeat(64), sourceFiles: 2, sourceBytes: 2000 },
     chunking: {
       orderingVersion: EXPORT_SET_ORDER_VERSION,
-      packingVersion: EXPORT_SET_PACKING_VERSION,
+      packingVersion: EXPORT_SET_PACKING_VERSION_V0_2,
       maximumRecordsPerChunk: 2,
       maximumCanonicalBundleBytes: 4096,
       maximumEncodedArtifactBytes: 4608,
@@ -98,20 +92,22 @@ function manifest() {
   };
 }
 
-test("v0.2 current aliases bind the exact immutable compressed manifest schema", async () => {
-  assert.equal(EXPORT_SET_MANIFEST_VERSION, EXPORT_SET_MANIFEST_VERSION_V0_2);
-  assert.equal(EXPORT_SET_CONTRACT_VERSION, EXPORT_SET_CONTRACT_VERSION_V0_2);
-  assert.equal(EXPORT_SET_MANIFEST_RECEIPT_VERSION, EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2);
-  assert.equal(EXPORT_SET_MANIFEST_SCHEMA_SHA256, EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2);
-  assert.equal(EXPORT_SET_PACKING_VERSION, EXPORT_SET_PACKING_VERSION_V0_2);
+test("v0.2 retains its immutable compressed manifest schema and packing", async () => {
   assert.equal(EXPORT_SET_PACKING_VERSION_V0_1, "greedy-canonical-bundle-v1");
   assert.equal(EXPORT_SET_PACKING_VERSION_V0_2, "greedy-canonical-bundle-v1");
   assert.equal(EXPORT_SET_PACKING_VERSION_V0_2, EXPORT_SET_PACKING_VERSION_V0_1);
-  assert.equal(exportSetManifestSchema, exportSetManifestSchemaV0_2);
-  assert.equal(exportSetManifestSchema.$id, "https://app-usagemonitor.local/schemas/export-set-v0.2/manifest.schema.json");
-
+  assert.equal(exportSetManifestSchemaV0_2.$id, "https://app-usagemonitor.local/schemas/export-set-v0.2/manifest.schema.json");
   const bytes = await readFile(new URL("../schemas/export-set-v0.2/manifest.schema.json", import.meta.url));
   assert.equal(createHash("sha256").update(bytes).digest("hex"), EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2);
+  assert.equal(EXPORT_SET_MANIFEST_SCHEMA_SHA256_V0_2, "6f46ca81c32f9ed14cfd47ec5a376961a07f1bf0d14a7adc7413def7c80da4c0");
+});
+
+test("v0.2 keeps its 5000-source boundary even after the current writer advances", () => {
+  for (const [sourceFiles, expected] of [[5000, true], [5001, false], [100000, false]]) {
+    const value = manifest();
+    value.sourcePlan.sourceFiles = sourceFiles;
+    assert.equal(validateExportSetManifest(value).valid, expected, String(sourceFiles));
+  }
 });
 
 test("v0.2 accepts the exact encoded and decoded artifact contract", () => {
@@ -204,9 +200,9 @@ test("v0.2 independently aggregates decoded artifacts, encoded artifacts, and re
   }
 });
 
-test("v0.2 derives compressed basenames by default and rejects unsupported versions", () => {
-  assert.equal(exportSetChunkBundleBasename(0), "chunk-000000.bundle.json.gz");
-  assert.deepEqual(exportSetChunkBasenames(7), {
+test("v0.2 derives compressed basenames and rejects unsupported versions", () => {
+  assert.equal(exportSetChunkBundleBasename(0, EXPORT_SET_MANIFEST_VERSION_V0_2), "chunk-000000.bundle.json.gz");
+  assert.deepEqual(exportSetChunkBasenames(7, EXPORT_SET_MANIFEST_VERSION_V0_2), {
     bundle: "chunk-000007.bundle.json.gz",
     receipt: "chunk-000007.receipt.json",
   });

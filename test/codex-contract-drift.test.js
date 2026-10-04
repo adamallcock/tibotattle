@@ -123,25 +123,48 @@ test("checked-in Codex contract ledger is valid and matches the product registry
   assert.deepEqual(premium.mappingEvidence, []);
 });
 
-test("Pro Max 25x is explicit and blocks release qualification", async () => {
+test("Pro Max vocabulary is binary-verified while allowance semantics remain unverified", async () => {
   const ledger = validateCodexContractLedger(await fixtureLedger());
   const candidate = ledger.plans.find((plan) => plan.rawValue === "promax");
-  assert.equal(candidate.lifecycle, "provisional");
+  assert.equal(candidate.lifecycle, "active");
   assert.equal(candidate.displayName, "Pro (Max)");
-  assert.match(candidate.note, /source revision/u);
-  const result = await checkCodexContractDrift({
-    binaries: [{ binaryPath: "/not/reported", channel: "fixture" }],
-    inspectBinary: async ({ channel }) => ({
-      channel,
-      generatorMode: "stable",
-      planTypes: TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax"),
-      planTypesSha256: planTypesSha256(TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax")),
-      version: "codex-cli 1.2.3",
-    }),
-    requireBinary: true,
-  });
-  assert.equal(result.result.ok, false);
-  assert.equal(result.result.issues.some((entry) => entry.code === "provisional_plan_unverified_for_release"), true);
+  assert.match(candidate.note, /provider allowance and window semantics remain unverified/u);
+  for (const channel of ["chatgpt_bundled", "path"]) {
+    const contract = ledger.verifiedContracts.find((entry) => (
+      entry.channel === channel && entry.version === "codex-cli 0.160.0"
+    ));
+    assert.equal(contract.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES));
+  }
+});
+
+test("provisional plans still block release despite an observed binary enum", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-provisional-release-test-"));
+  const ledgerFile = join(root, "ledger.json");
+  const ledger = await fixtureLedger();
+  ledger.plans.find((plan) => plan.rawValue === "promax").lifecycle = "provisional";
+  await writeFile(ledgerFile, `${JSON.stringify(ledger, null, 2)}\n`, "utf8");
+  try {
+    const result = await checkCodexContractDrift({
+      binaries: [{ binaryPath: "/not/reported", channel: "fixture" }],
+      inspectBinary: async ({ channel }) => ({
+        channel,
+        generatorMode: "stable",
+        planTypes: TELEMETRY_PLAN_TYPES,
+        planTypesSha256: planTypesSha256(TELEMETRY_PLAN_TYPES),
+        version: "codex-cli 1.2.3",
+      }),
+      ledgerFile,
+      requireBinary: true,
+    });
+    assert.equal(result.result.ok, false);
+    assert.equal(result.result.checks.releasedBinaries, true);
+    assert.deepEqual(
+      result.result.issues.map((entry) => entry.code),
+      ["provisional_plan_unverified_for_release"],
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
 });
 
 test("source fixture yields the current exhaustive raw/display plan pairs", async () => {
@@ -193,12 +216,24 @@ test("deprecated historical values may disappear without weakening telemetry acc
   assert.deepEqual(compareUpstreamPlanRegistry(ledger, pairs), {
     issues: [],
     ok: true,
+    warnings: [],
+  });
+  assert.equal(TELEMETRY_PLAN_TYPES.includes("go"), true);
+});
+
+test("source observation does not activate a provisional plan", async () => {
+  const ledger = validateCodexContractLedger(await fixtureLedger());
+  ledger.plans.find((plan) => plan.rawValue === "promax").lifecycle = "provisional";
+  const pairs = parseKnownPlanSource(await fixtureText(SOURCE_FIXTURE));
+  assert.deepEqual(compareUpstreamPlanRegistry(ledger, pairs), {
+    issues: [],
+    ok: true,
     warnings: [{
       code: "provisional_plan_observed",
       message: "Provisional plan promax is present upstream; resolve remaining release gates before activation",
     }],
   });
-  assert.equal(TELEMETRY_PLAN_TYPES.includes("go"), true);
+  assert.equal(ledger.plans.find((plan) => plan.rawValue === "promax").lifecycle, "provisional");
 });
 
 test("generated PlanType parser accepts only a literal union", async () => {

@@ -183,6 +183,17 @@ export function validateSignedInstalledNormalReceipt(receipt, sourceRevision) {
   return receipt;
 }
 
+// Shared exact-byte and owned NSIS predicates for the separate final-upgrade
+// runner. Exporting these does not widen the fresh-install entrypoint.
+export {
+  safePath as assertWindowsSignedInstalledPath,
+  boundedEvidence as readWindowsSignedInstalledEvidence,
+  digest as digestWindowsSignedInstalledFile,
+  verifySignature as verifyWindowsSignedInstalledSignature,
+  registry as inspectWindowsSignedInstalledRegistry,
+  cleanUninstallerResidue as cleanWindowsSignedInstalledUninstallerResidue,
+};
+
 export async function runWindowsSignedInstalled(options, {
   platform = process.platform, architecture = process.arch, environment = process.env,
   runProgram = runWindowsNsisLifecycleProgram, runNormal = runWindowsNormalCandidateSmoke,

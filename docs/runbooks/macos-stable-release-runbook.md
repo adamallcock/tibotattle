@@ -73,6 +73,53 @@ compatibility value; it does not run a second updater.
    `electron-macos-production-update.yml` from the pinned released Electron
    predecessor. Keep test and production receipts distinct.
 
+## Current Electron production-update acceptance
+
+After the exact 0.1.27 GitHub artifacts and ordinary Electron stable feeds are
+published, run `electron-macos-production-update.yml` in `plan` then `execute`
+mode for **both** `darwin-arm64` and `darwin-x64`. Use
+`tibotattle-production-electron-update-intake-v2` in `identity_json`, together
+with the unchanged candidate `sourceCandidate` receipt. Its closed fields are
+`schemaVersion`, `target`, `sourceRevision`, `buildNumber`, `version`,
+`bundleVersion`, `dmgSha256`, `asarSha256`, `zipSha256`, `feedSha256`, and
+`predecessorAsarSha256`; the workflow supplies `directory`. V2 admits only
+0.1.26 → 0.1.27 (bundle 1034 → 1035). The source receipt independently binds
+0.1.27's source and provenance build. No predecessor or feed URL override is
+accepted. Execute retains `RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE`.
+
+The immutable [0.1.26 manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json)
+(SHA-256 `be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc`)
+binds source `acfc385c95b49b8e1040cedfa857659b49a61d8d` and these predecessor
+DMGs:
+
+| Architecture | DMG SHA-256 |
+| --- | --- |
+| Apple silicon | `7b5f66d91c9f1b8c1537505da860c67177d2b489ee6fb90d445d97c7e46cc9ec` |
+| Intel | `3806a1ce2650350b69faff759287c08a5f146acfb9c26e3b3b04abb5cf8896c3` |
+
+The runner verifies those downloaded bytes, signed bundle, architecture,
+0.1.26 package/source, provenance build `2026092701`, and bundle version `1034`
+before launching the predecessor. The public manifest does not publish an ASAR
+hash: derive `predecessorAsarSha256` from the exact pinned DMG and retain that
+inspection; the runner compares the installed archive with it. A supplied hash
+or planned receipt alone is not artifact verification.
+
+The ordinary Settings check/download/install/restart path must replace the
+app with the exact published candidate and preserve rows, settings, salt and
+recorded opt-out. V2 requires every captured predecessor process identity,
+including an orphaned companion, to exit before accepting the updater-created
+successor; later cleanup cannot satisfy that observation. Retain the separate
+`tibotattle-signed-macos-production-update-v2` receipt for each architecture.
+It keeps `existingCredentialFixture: false`: the signed credential fixture is
+still a distinct gate. The historical intake/receipt v1 and its 0.1.20
+predecessor verifier remain unchanged for their existing workflows.
+
+This is post-activation acceptance of the real production feed. It does not
+create a prepublication updater lane, rewrite signed apps, change feed URLs,
+or substitute plan/source tests for installed evidence. The workflow runner
+revision must descend from the frozen application source at the same package
+version; the app source and original candidate receipt are never rewritten.
+
 ## Native Keychain migration gate
 
 The [handover runbook](./2026-09-07-macos-native-to-electron-handover.md) owns
