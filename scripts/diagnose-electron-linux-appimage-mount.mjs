@@ -15,7 +15,7 @@ import { LINUX_FINAL_CONFIRMATION, LINUX_FINAL_INPUT, exactKeys, preflightLinuxF
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXEC = '/opt/tibotattle-updater-exec', IMAGE = `${EXEC}/TiboTattle.AppImage`;
 const SCRIPT = 'scripts/diagnose-electron-linux-appimage-mount.mjs';
-export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v1';
+export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v2';
 export const LINUX_MOUNT_DIAGNOSIS_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS';
 const UNKNOWN = 'unavailable', ROLES = ['current', 'next'];
 const ERRORS = new Set(['none', 'container_failed', 'probe_failed', 'cleanup_failed']);
@@ -25,6 +25,25 @@ const ERROR_PATTERNS = Object.freeze({
   notImplemented: /Function not implemented/iu, invalidArgument: /Invalid argument/iu,
   busy: /Device or resource busy/iu, ioError: /Input\/output error/iu,
 });
+// Recognize these upstream C-locale templates only; this does not identify the
+// runtime embedded in either AppImage. No captured text is retained.
+// https://github.com/libfuse/libfuse/blob/d04687923194d906fe5ad82dcd546c9807bf15b6/lib/mount.c
+// https://github.com/libfuse/libfuse/blob/d04687923194d906fe5ad82dcd546c9807bf15b6/util/fusermount.c
+// https://github.com/AppImage/AppImageKit/blob/8bbf694455d00f48d835f56afaa1dabcd9178ba6/src/runtime.c
+// The AppImageKit source is a template reference, not embedded-byte proof.
+const FAILURE_STAGES = Object.freeze({
+  directFuseMount: /^fuse: mount failed: ([^\r\n]+)$/u,
+  fusermountExec: /^fuse: failed to exec fusermount: ([^\r\n]+)$/u,
+  fusermountMount: /^fusermount: mount failed: ([^\r\n]+)$/u,
+  runtimeMountDirectoryOpen: /^open dir error: ([^\r\n]+)$/u,
+});
+const STAGE_ERRNOS = new Map([['Permission denied', 'EACCES'], ['Operation not permitted', 'EPERM'], ['No such file or directory', 'ENOENT']]);
+const STAGE_VALUES = new Set(['not_observed', 'EACCES', 'EPERM', 'ENOENT', 'other', 'ambiguous']);
+const READER_REASONS = new Set(['none', 'kmsg_open_denied', 'kmsg_open_unavailable', 'reader_timeout', 'reader_failed', 'stream_incomplete']);
+const AUDIT_REASONS = new Set(['not_started', 'not_evaluated', 'observer_start_failed', ...READER_REASONS.values(),
+  'profile_unavailable', 'probe_identity_unavailable', 'audit_window_incomplete', 'no_observed_mount_denial',
+  'no_correlated_mount_denial', 'owned_target_source_unrecognized', 'owned_actor_not_correlated', 'match_ambiguous', 'owned_mount_denial']);
+AUDIT_REASONS.delete('none');
 const booleanOrUnknown = value => typeof value === 'boolean' || value === UNKNOWN;
 const fail = () => { throw new Error('LINUX_MOUNT_DIAGNOSIS_REFUSED'); };
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -65,9 +84,16 @@ export function normalizeLinuxMountPolicy({ status, appArmor }) {
 }
 export function createLinuxMountErrorClassifier() {
   const flags = Object.fromEntries([...Object.keys(ERROR_PATTERNS), 'unknown', 'truncated'].map(key => [key, false]));
+  const stages = Object.fromEntries(Object.keys(FAILURE_STAGES).map(key => [key, 'not_observed']));
   let used = 0, pending = '', length = 0, discard = false;
   const line = text => {
     if (!text.trim()) return;
+    for (const [stage, pattern] of Object.entries(FAILURE_STAGES)) {
+      const match = pattern.exec(text);
+      if (match === null) continue;
+      const errno = STAGE_ERRNOS.get(match[1]) ?? 'other';
+      stages[stage] = stages[stage] === 'not_observed' || stages[stage] === errno ? errno : 'ambiguous';
+    }
     let matched = false;
     for (const [key, pattern] of Object.entries(ERROR_PATTERNS)) if (pattern.test(text)) { flags[key] = true; matched = true; }
     if (!matched) flags.unknown = true;
@@ -85,7 +111,9 @@ export function createLinuxMountErrorClassifier() {
         else { pending += char; length += size; }
       }
     }
-  }, finish() { if (!discard) line(pending); pending = ''; return { ...flags }; } };
+    // Do not classify a line whose unseen suffix was cut by the total budget.
+    if (bytes.length > count && pending.length) { pending = ''; length = 0; discard = true; flags.unknown = true; }
+  }, finish() { if (!discard) line(pending); pending = ''; return { ...flags, stages: { ...stages } }; } };
 }
 export function selectLinuxMountProbeMount(text, temporary) {
   if (typeof text !== 'string' || Buffer.byteLength(text) > 262144
@@ -127,8 +155,10 @@ function validFacts(value) {
 function validProbe(value) {
   return exactKeys(value, ['environment', 'startup', 'mount', 'launcherErrors', 'cleanup']) && validFacts(value.environment)
     && validateLinuxStartupDiagnostic(value.startup) !== null && ['observed', 'not_observed', 'ambiguous', UNKNOWN].includes(value.mount)
-    && exactKeys(value.launcherErrors, [...Object.keys(ERROR_PATTERNS), 'unknown', 'truncated'])
-    && Object.values(value.launcherErrors).every(item => typeof item === 'boolean')
+    && exactKeys(value.launcherErrors, [...Object.keys(ERROR_PATTERNS), 'unknown', 'truncated', 'stages'])
+    && [...Object.keys(ERROR_PATTERNS), 'unknown', 'truncated'].every(key => typeof value.launcherErrors[key] === 'boolean')
+    && exactKeys(value.launcherErrors.stages, Object.keys(FAILURE_STAGES))
+    && Object.values(value.launcherErrors.stages).every(item => STAGE_VALUES.has(item))
     && exactKeys(value.cleanup, ['childGone', 'mountGone']) && Object.values(value.cleanup).every(booleanOrUnknown);
 }
 export function validateLinuxMountDiagnosis(value) {
@@ -137,11 +167,12 @@ export function validateLinuxMountDiagnosis(value) {
     || !['runnerRevision', 'sourceRevision'].every(key => /^[a-f0-9]{40}$/u.test(value[key] ?? ''))
     || !Array.isArray(value.cases) || value.cases.length < 1 || value.cases.length > 2) return null;
   for (const [index, row] of value.cases.entries()) {
-    if (!exactKeys(row, ['role', 'artifactSha256', 'artifactBytes', 'probe', 'errorCode', 'appArmorMountDenial', 'containerRemoved', 'observerStopped'])
+    if (!exactKeys(row, ['role', 'artifactSha256', 'artifactBytes', 'probe', 'errorCode', 'appArmorMountDenial', 'appArmorAuditReason', 'containerRemoved', 'observerStopped'])
       || row.role !== ROLES[index] || !/^[a-f0-9]{64}$/u.test(row.artifactSha256 ?? '')
       || !Number.isSafeInteger(row.artifactBytes) || row.artifactBytes < 4096 || row.artifactBytes > 1024 ** 3
       || row.probe !== null && !validProbe(row.probe) || !ERRORS.has(row.errorCode)
-      || !booleanOrUnknown(row.appArmorMountDenial) || typeof row.containerRemoved !== 'boolean' || typeof row.observerStopped !== 'boolean'
+      || ![true, UNKNOWN].includes(row.appArmorMountDenial) || !AUDIT_REASONS.has(row.appArmorAuditReason)
+      || (row.appArmorMountDenial === true) !== (row.appArmorAuditReason === 'owned_mount_denial') || typeof row.containerRemoved !== 'boolean' || typeof row.observerStopped !== 'boolean'
       || row.errorCode === 'none' && (row.probe === null || !row.containerRemoved || !row.observerStopped)
       || index > 0 && (!value.cases[index - 1].containerRemoved || !value.cases[index - 1].observerStopped)) return null;
   }
@@ -243,10 +274,11 @@ async function runInside() {
 // collected. Sequence gaps, continuation records, overflow and access failures
 // all make the stream incomplete. Raw kernel records stay in this private pipe.
 export const LINUX_MOUNT_KMSG_READER = String.raw`
-import json, os, re, select, sys, time
+import errno, json, os, re, select, sys, time
 fd = None
 start = time.monotonic_ns() // 1000
 complete = True
+reader_reason = 'none'
 last = None
 used = 0
 profile = None
@@ -255,6 +287,10 @@ probe = None
 pending = ''
 def emit(value):
     print(json.dumps(value, separators=(',', ':')), flush=True)
+def incomplete(reason):
+    global complete, reader_reason
+    complete = False
+    if reader_reason == 'none': reader_reason = reason
 def read(path, limit=16384):
     with open(path, 'r', encoding='utf-8') as handle:
         value = handle.read(limit + 1)
@@ -312,7 +348,11 @@ try:
         match = re.fullmatch(r'([^\n()]+) \(enforce\)\n?', raw_profile)
         if match: profile = match[1]
     except Exception: pass
-    fd = os.open('/dev/kmsg', os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fd = os.open('/dev/kmsg', os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as error:
+        incomplete('kmsg_open_denied' if error.errno in (errno.EACCES, errno.EPERM) else 'kmsg_open_unavailable')
+        raise
     os.lseek(fd, 0, os.SEEK_END)
     start = time.monotonic_ns() // 1000
     emit({'kind': 'ready', 'start': start})
@@ -333,33 +373,33 @@ try:
         while True:
             try: record = os.read(fd, 65536)
             except BlockingIOError: break
-            except OSError:
-                complete = False
+            except OSError as error:
+                incomplete('stream_incomplete' if error.errno == errno.EPIPE else 'reader_failed')
                 stopping = True
                 break
             used += len(record)
             if not record or used > 262144:
-                complete = False
+                incomplete('stream_incomplete')
                 stopping = True
                 break
             try:
                 header, message = record.decode('utf-8', 'strict').split(';', 1)
                 priority, sequence, timestamp, flags = header.split(',')
                 priority, sequence, timestamp = int(priority), int(sequence), int(timestamp)
-                if last is not None and sequence != last + 1: complete = False
+                if last is not None and sequence != last + 1: incomplete('stream_incomplete')
                 last = sequence
-                if flags != '-' or message.count('\n') != 1 or not message.endswith('\n'): complete = False
+                if flags != '-' or message.count('\n') != 1 or not message.endswith('\n'): incomplete('stream_incomplete')
                 if priority >> 3 == 0 and 'apparmor="DENIED"' in message and 'operation="mount"' in message:
                     emit({'kind': 'entry', 'time': timestamp, 'message': message.rstrip('\n')})
-            except Exception: complete = False
+            except Exception: incomplete('stream_incomplete')
         if stopping: break
-    else: complete = False
+    else: incomplete('reader_timeout')
 except Exception:
-    complete = False
+    incomplete('reader_failed')
 finally:
     if fd is not None: os.close(fd)
     emit({'kind': 'closed', 'start': start, 'end': time.monotonic_ns() // 1000,
-        'complete': complete, 'profile': profile, 'observations': list(observations.values())})
+        'complete': complete, 'readerReason': reader_reason, 'profile': profile, 'observations': list(observations.values())})
 `;
 function collectLines(stream, callback, maximum = 262144) {
   let pending = '', size = 0, valid = true;
@@ -375,21 +415,30 @@ function collectLines(stream, callback, maximum = 262144) {
   });
   return () => valid && pending === '';
 }
+export function linuxMountAuditReaderReason({ spawnFailed, stopped, exitCode, valid, ready, closed, complete, readerReason }) {
+  if (spawnFailed) return 'observer_start_failed';
+  if (!stopped || exitCode === 124) return 'reader_timeout';
+  if (!valid) return 'reader_failed';
+  if (!closed) return ready ? 'reader_failed' : 'observer_start_failed';
+  if (exitCode !== 0 || !READER_REASONS.has(readerReason)) return 'reader_failed';
+  if (readerReason !== 'none') return readerReason;
+  return ready && complete ? 'none' : 'reader_failed';
+}
 function beginKernelObserver(initPid) {
   if (!Number.isSafeInteger(initPid) || initPid < 1) fail();
   // A root-owned timeout bounds and reaps the read-only observer even if its
   // controller is interrupted. Docker itself remains unprivileged here.
   const child = spawn('sudo', ['-n', 'timeout', '--signal=TERM', '--kill-after=2s', '32s',
     'python3', '-u', '-c', LINUX_MOUNT_KMSG_READER, String(initPid)], { shell: false, stdio: ['pipe', 'pipe', 'ignore'] });
-  const state = { ready: false, closed: false, complete: false, start: 0, end: 0, records: [], profile: null, observations: [] };
-  let exited = false, exitCode = null;
-  child.on('error', () => {}); child.on('close', code => { exited = true; exitCode = code; });
+  const state = { ready: false, closed: false, complete: false, start: 0, end: 0, records: [], profile: null, observations: [], readerReason: 'none' };
+  let exited = false, exitCode = null, spawnFailed = false;
+  child.on('error', () => { spawnFailed = true; }); child.on('close', code => { exited = true; exitCode = code; });
   child.stdin.on('error', () => {});
   const valid = collectLines(child.stdout, row => {
     if (row.kind === 'ready' && exactKeys(row, ['kind', 'start']) && Number.isSafeInteger(row.start) && !state.ready) { state.ready = true; state.start = row.start; }
     else if (row.kind === 'entry' && exactKeys(row, ['kind', 'time', 'message']) && Number.isSafeInteger(row.time) && typeof row.message === 'string' && row.message.length <= 65536) state.records.push(row);
-    else if (row.kind === 'closed' && exactKeys(row, ['kind', 'start', 'end', 'complete', 'profile', 'observations'])
-      && Number.isSafeInteger(row.start) && Number.isSafeInteger(row.end) && typeof row.complete === 'boolean'
+    else if (row.kind === 'closed' && exactKeys(row, ['kind', 'start', 'end', 'complete', 'readerReason', 'profile', 'observations'])
+      && Number.isSafeInteger(row.start) && Number.isSafeInteger(row.end) && typeof row.complete === 'boolean' && READER_REASONS.has(row.readerReason)
       && (row.profile === null || typeof row.profile === 'string' && row.profile.length <= 256)
       && Array.isArray(row.observations) && row.observations.length <= 128 && row.observations.every(item =>
         exactKeys(item, ['pid', 'start', 'ambiguous', 'first', 'last']) && Number.isSafeInteger(item.pid) && item.pid > 0
@@ -400,8 +449,9 @@ function beginKernelObserver(initPid) {
     child.stdin.end('stop\n');
     // A JSON footer is evidence, not proof the privileged observer has exited.
     const stopped = await waitUntil(() => exited, 35000);
-    state.complete = stopped && exitCode === 0 && state.ready && state.closed && state.complete && valid();
-    return { ...state, stopped };
+    const reason = linuxMountAuditReaderReason({ ...state, spawnFailed, stopped, exitCode, valid: valid() });
+    state.complete = stopped && exitCode === 0 && state.ready && state.closed && state.complete && valid() && reason === 'none';
+    return { ...state, stopped, reason };
   } };
 }
 function statIdentity(text) {
@@ -419,13 +469,20 @@ export async function linuxMountOwnedProcessGone(identity, { read = boundedRead 
 }
 
 export function correlateLinuxMountAudit({ audit, profile, observations, temporary, start, end }) {
-  if (!audit?.ready || !audit.closed || !audit.complete || !profile || !Number.isSafeInteger(start) || !Number.isSafeInteger(end)
-    || audit.start > start || audit.end < end || start >= end || !(observations instanceof Map)
-    || !new RegExp(`^${EXEC}/tmp/[a-f0-9]{32}$`, 'u').test(temporary)) return UNKNOWN;
+  const unavailable = reason => ({ denial: UNKNOWN, reason });
+  if (!audit?.ready || !audit.closed || !audit.complete || audit.reason !== 'none') return unavailable(
+    ['observer_start_failed', ...READER_REASONS].includes(audit?.reason) && audit.reason !== 'none' ? audit.reason : 'reader_failed');
+  if (!profile) return unavailable('profile_unavailable');
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || audit.start > start || audit.end < end || start >= end
+    || !new RegExp(`^${EXEC}/tmp/[a-f0-9]{32}$`, 'u').test(temporary)) return unavailable('audit_window_incomplete');
+  if (!(observations instanceof Map) || !observations.size) return unavailable('probe_identity_unavailable');
+  let recordObserved = false, actorUncorrelated = false, sourceUnrecognized = false, ambiguous = false;
   for (const record of audit.records) {
-    if (record.time < start || record.time > end || typeof record.message !== 'string' || record.message.includes('\\')) continue;
+    if (record.time < start || record.time > end) continue;
+    recordObserved = true;
+    if (typeof record.message !== 'string' || record.message.includes('\\')) { ambiguous = true; continue; }
     const prefix = /^(?:audit: )?type=1400 audit\([0-9.]+:[0-9]+\): /u.exec(record.message);
-    if (!prefix) continue;
+    if (!prefix) { ambiguous = true; continue; }
     const body = record.message.slice(prefix[0].length), fields = {};
     const expression = /([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"\\\n]*)"|([^\s"\\=]+))(?: |$)/uy;
     let offset = 0, malformed = false;
@@ -435,25 +492,28 @@ export function correlateLinuxMountAudit({ audit, profile, observations, tempora
       if (!match || Object.hasOwn(fields, match[1])) { malformed = true; break; }
       fields[match[1]] = match[2] ?? match[3]; offset = expression.lastIndex;
     }
-    if (malformed || fields.apparmor !== 'DENIED' || fields.operation !== 'mount' || fields.profile !== profile
-      || !(fields.fstype === 'fuse.squashfuse' && fields.srcname === 'squashfuse'
-        || ['fuse.TiboTattle.AppImage', 'fuse'].includes(fields.fstype) && [IMAGE, 'TiboTattle.AppImage'].includes(fields.srcname))
+    if (malformed) { ambiguous = true; continue; }
+    if (fields.apparmor !== 'DENIED' || fields.operation !== 'mount' || fields.profile !== profile
       || !fields.name?.startsWith(`${temporary}/`) || !/^\.mount_[A-Za-z0-9._-]+\/?$/u.test(fields.name.slice(temporary.length + 1))
       || !/^[1-9][0-9]*$/u.test(fields.pid ?? '')) continue;
     const owned = observations.get(Number(fields.pid));
-    if (owned && owned.ambiguous === false && /^[0-9]+$/u.test(owned.start ?? '')
+    if (!(owned && owned.ambiguous === false && /^[0-9]+$/u.test(owned.start ?? '')
       && Number.isSafeInteger(owned.first) && Number.isSafeInteger(owned.last)
-      && owned.first <= record.time && owned.last >= record.time) return true;
+      && owned.first <= record.time && owned.last >= record.time)) { actorUncorrelated = true; continue; }
+    if (!(fields.fstype === 'fuse.squashfuse' && fields.srcname === 'squashfuse'
+      || ['fuse.TiboTattle.AppImage', 'fuse'].includes(fields.fstype) && [IMAGE, 'TiboTattle.AppImage'].includes(fields.srcname))) { sourceUnrecognized = true; continue; }
+    return { denial: true, reason: 'owned_mount_denial' };
   }
   // Sampling cannot prove all fork/exit events or that audit generation was
   // enabled. Even a complete read window with no match is not negative proof.
-  return UNKNOWN;
+  return unavailable(sourceUnrecognized ? 'owned_target_source_unrecognized' : actorUncorrelated ? 'owned_actor_not_correlated'
+    : ambiguous ? 'match_ambiguous' : recordObserved ? 'no_correlated_mount_denial' : 'no_observed_mount_denial');
 }
 async function runHostProbe(role, expected) {
   const run = process.env.GITHUB_RUN_ID;
   if (!/^[1-9][0-9]{0,14}$/u.test(run ?? '')) fail();
   const name = `tibotattle-mount-diagnosis-${role}-${run}`, nonce = randomBytes(16).toString('hex'), temporary = `${EXEC}/tmp/${nonce}`;
-  const row = { role, artifactSha256: expected.sha256, artifactBytes: expected.bytes, probe: null, errorCode: 'container_failed', appArmorMountDenial: UNKNOWN, containerRemoved: false, observerStopped: true };
+  const row = { role, artifactSha256: expected.sha256, artifactBytes: expected.bytes, probe: null, errorCode: 'container_failed', appArmorMountDenial: UNKNOWN, appArmorAuditReason: 'not_started', containerRemoved: false, observerStopped: true };
   let id = null, child = null, audit = null, initIdentity = null, initPid = null;
   try {
     if (command('docker', ['ps', '-aq', '--filter', `name=^/${name}$`])) fail();
@@ -473,11 +533,12 @@ async function runHostProbe(role, expected) {
     if (!Number.isSafeInteger(initPid) || initPid < 1) fail();
     initIdentity = statIdentity(await optionalRead(`/proc/${initPid}/stat`, 4096));
     if (initIdentity === null) fail();
-    audit = beginKernelObserver(initPid); row.observerStopped = false; await waitUntil(() => audit.state.ready || audit.state.closed, 2000);
+    audit = beginKernelObserver(initPid); row.observerStopped = false; row.appArmorAuditReason = 'not_evaluated'; await waitUntil(() => audit.state.ready || audit.state.closed, 2000);
     const start = monotonic(); child.stdin.on('error', () => {}); child.stdin.write('go\n');
     await waitUntil(() => result !== null || exited, 18000);
     const end = monotonic(), kernel = await audit.stop(); row.observerStopped = kernel.stopped; audit = null;
-    row.appArmorMountDenial = correlateLinuxMountAudit({ audit: kernel, profile: kernel.profile, observations: new Map(kernel.observations.map(item => [item.pid, item])), temporary, start, end });
+    const attribution = correlateLinuxMountAudit({ audit: kernel, profile: kernel.profile, observations: new Map(kernel.observations.map(item => [item.pid, item])), temporary, start, end });
+    row.appArmorMountDenial = attribution.denial; row.appArmorAuditReason = attribution.reason;
     if (result === null || !valid()) { row.errorCode = 'probe_failed'; }
     else { row.probe = result; row.errorCode = 'none'; }
   } catch { /* Only the closed row leaves this process. */ }
