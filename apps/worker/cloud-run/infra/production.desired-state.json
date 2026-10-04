@@ -74,7 +74,7 @@
     "maxInstances": 4,
     "rolloutOverlapInstances": 4,
     "audience": "tibotattle-edge-origin",
-    "telemetryStorageNamespace": null
+    "telemetryStorageNamespace": "d1:e2b732e7-456a-4472-b556-937bc4a195b4"
   },
   "jobs": {
     "production-migrate": {

@@ -310,8 +310,21 @@ Authorizations: the typed fenced deploy, and the EP-8 apply. `owner`.
    the fence applied: public `GET /api/health` in barrier mode carrying the
    deployed commit, and one dynamic `/api/` probe answering
    `503 MUTATION_BARRIER_ACTIVE` with `no-store` and `retry-after: 300`. The
-   seal consumes it. No command in the repository produces the file; the
-   operator writes it from the responses. `owner`.
+   seal consumes it. The bounded capture tool reads the verified fence receipt,
+   checks the deployed commit, and publishes a private, no-clobber proof. First
+   run its offline preflight, then obtain owner authorization for the explicit
+   remote read before adding the execution flags:
+
+   ```bash
+   node scripts/cutover-barrier-capture.mjs capture --origin https://tibotattle.com \
+     --fence-receipt <absolute verified fence receipt> --fence-sha256 <receipt sha256> \
+     --owner-dir <absolute private empty proof directory>
+   # Owner-authorized read only: repeat with --execute --remote --owner-read-only.
+   ```
+
+   The directory must satisfy the existing owner-directory guard. The tool
+   persists only validated barrier fields to `barrier-proof.json`; it does not
+   fence, deploy or restore the edge. `built; owner-authorized capture`.
 
 Stranding risk. From the fenced deploy until `verify` writes its receipt, the
 public edge is fenced and there is no typed way back to worker mode, because
