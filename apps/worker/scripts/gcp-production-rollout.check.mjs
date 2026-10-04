@@ -233,6 +233,7 @@ function fakeEstate({
   executions = (job) => [completed(job)],
   servedCommit = null,
   // BUILD-SOURCE: <project>_cloudbuild as OPS-2 leaves it, with the builder's read binding.
+  enabledServices = [{ config: { name: "containeranalysis.googleapis.com" }, state: "ENABLED" }],
   sourceBucket = { name: `${target.project}_cloudbuild`, projectNumber: target.projectNumber, location: "US-EAST1" },
   sourcePolicy = { bindings: [{ role: "roles/storage.objectViewer",
     members: [`serviceAccount:${target.builderServiceAccount}`] }] },
@@ -274,6 +275,7 @@ function fakeEstate({
         return ok(JSON.stringify(executions(job, scheduledReads)));
       }
       if (args.slice(0, 2).join(" ") === "auth print-identity-token") return ok(`${TOKEN}\n`);
+      if (args.slice(0, 2).join(" ") === "services list") return ok(JSON.stringify(enabledServices));
       if (step === "storage buckets describe") {
         return sourceBucket === null || args[3] !== `gs://${target.project}_cloudbuild` ? { status: 1, stdout: "" }
           : ok(JSON.stringify(sourceBucket));
@@ -644,6 +646,7 @@ test("a dry run validates and prints argv only: no gcloud, no node, no request, 
   // BUILD-SOURCE: the read-only source-bucket checks precede the archive, and the
   // submit stages explicitly in <project>_cloudbuild/source, the bucket OPS-2 grants.
   assert.deepEqual(build.steps.map(({ argv }) => argv), [ROLLOUT_ARGV.gitStatus(), ROLLOUT_ARGV.gitHead(),
+    ROLLOUT_ARGV.enabledServices(TARGET),
     ["gcloud", "storage", "buckets", "describe", `gs://${PROJECT}_cloudbuild`, `--project=${PROJECT}`, "--raw",
       "--format=json"],
     ["gcloud", "storage", "buckets", "get-iam-policy", `gs://${PROJECT}_cloudbuild`, `--project=${PROJECT}`,
@@ -1325,7 +1328,8 @@ test("BUILD-SOURCE: build refuses an absent, foreign, public or unreadable sourc
       assert.deepEqual(lock.events, [], "refused before the lock");
       assert.equal(estate.calls.some((argv) => argv.join(" ").includes("builds submit")
         || argv[1] === "scripts/cloud-run-build-archive.mjs"), false, "nothing archived or uploaded");
-      assert.ok(estate.calls.every((argv) => argv[0] === "git" || ["describe", "get-iam-policy"].includes(argv[3])));
+      assert.ok(estate.calls.every((argv) => argv[0] === "git" || JSON.stringify(argv) === JSON.stringify(ROLLOUT_ARGV.enabledServices(TARGET))
+        || ["describe", "get-iam-policy"].includes(argv[3])));
     }
     // The shared check: only an unconditional builder read and no public member qualify.
     assert.deepEqual(buildSourcePolicyProblems({ bindings: [viewer([builder])] }, builder), []);
@@ -1956,3 +1960,21 @@ test("capture-edge from the command line: a dry run over a real owner-private in
     assert.equal(`${dry.stdout}${refused.stderr}`.includes(ACCOUNT_ID), false);
     assert.equal(await absent(space.output), true);
   });
+
+test("Container Analysis prerequisite fails read-only before lock, archive, upload or build", async () => {
+  const argv = ["build", "--environment=production", `--commit=${COMMIT}`, `--authorize=build:production:${COMMIT}`, "--execute"];
+  for (const [options, code] of [
+    [{ enabledServices: [] }, "ROLLOUT_BUILD_REQUIRED_API_DISABLED"],
+    [{ enabledServices: [{ config: { name: "cloudbuild.googleapis.com" }, state: "ENABLED" }] }, "ROLLOUT_BUILD_REQUIRED_API_DISABLED"],
+    [{ enabledServices: [{ config: { name: "containeranalysis.googleapis.com" }, state: "DISABLED" }] }, "ROLLOUT_BUILD_REQUIRED_APIS_UNAVAILABLE"],
+    [{ enabledServices: null }, "ROLLOUT_BUILD_REQUIRED_APIS_UNAVAILABLE"],
+    [{ fail: "services list" }, "ROLLOUT_BUILD_REQUIRED_APIS_UNAVAILABLE"],
+  ]) {
+    const estate = fakeEstate(options), lock = fakeLock();
+    await assert.rejects(runRollout(argv, dependencies(estate, lock)), isCode(code));
+    assert.deepEqual(lock.events, []);
+    assert.deepEqual(estate.calls, [ROLLOUT_ARGV.gitStatus(), ROLLOUT_ARGV.gitHead(), ROLLOUT_ARGV.enabledServices(TARGET)]);
+    assert.equal(estate.calls.some((command) => command.includes("enable") || command.includes("submit")
+      || command[1] === "scripts/cloud-run-build-archive.mjs"), false);
+  }
+});

@@ -115,6 +115,7 @@ import {
   buildSourcePolicyProblems,
   buildSourceStagingDir,
 } from "./gcp-build-source-bucket.mjs";
+import { GCP_OPS_BUILD_REQUIRED_SERVICES } from "./gcp-build-required-services.mjs";
 import { GCP_PRIVATE_TEST_TARGET } from "./gcp-test-project.mjs";
 import {
   createGcloudIdentityTokenSource,
@@ -412,6 +413,7 @@ const scope = (target) => [`--project=${target.project}`, `--region=${target.reg
 export const imageReference = (target, digest) => `${target.imageRepository}@${digest}`;
 
 export const ROLLOUT_ARGV = Object.freeze({
+  enabledServices: (target) => ["gcloud", "services", "list", "--enabled", `--project=${target.project}`, "--format=json", "--quiet"],
   gitStatus: () => ["git", "status", "--porcelain=v1", "--untracked-files=all"],
   gitHead: () => ["git", "rev-parse", "--verify", "HEAD"],
   gitBlob: (commit, path) => ["git", "rev-parse", "--verify", "--quiet", `${commit}:${path}`],
@@ -1517,6 +1519,17 @@ function checkBuildSource(context, target) {
   }
 }
 
+/** Read only: API prerequisites must be explicitly enabled by the operator. */
+function checkBuildRequiredServices(context, target) {
+  const unavailable = "ROLLOUT_BUILD_REQUIRED_APIS_UNAVAILABLE";
+  const services = parseJson(runChecked(context, ROLLOUT_ARGV.enabledServices(target), unavailable), unavailable);
+  if (!Array.isArray(services) || services.some((service) => !isRecord(service)
+      || !isRecord(service.config) || typeof service.config.name !== "string" || service.state !== "ENABLED")) fail(unavailable);
+  for (const name of GCP_OPS_BUILD_REQUIRED_SERVICES) {
+    if (services.filter((service) => service.config.name === name).length !== 1) fail("ROLLOUT_BUILD_REQUIRED_API_DISABLED");
+  }
+}
+
 async function build(context, args, target) {
   const configText = await readFile(join(WORKER_ROOT, BUILD_CONFIG_PATH), "utf8");
   const rendered = renderBuildConfig(configText, target, args.commit);
@@ -1525,6 +1538,7 @@ async function build(context, args, target) {
     return dryRunResult(args, target, [
       ROLLOUT_ARGV.gitStatus(),
       ROLLOUT_ARGV.gitHead(),
+      ROLLOUT_ARGV.enabledServices(target),
       ROLLOUT_ARGV.buildSourceDescribe(target),
       ROLLOUT_ARGV.buildSourcePolicy(target),
       ROLLOUT_ARGV.buildArchive(`<build-dir>/${BUILD_ARCHIVE_NAME}`),
@@ -1534,6 +1548,7 @@ async function build(context, args, target) {
       sourceDir: buildSourceStagingDir(target.project) } });
   }
   checkCheckout(context, args.commit);
+  checkBuildRequiredServices(context, target);
   // Before the lock: an unusable source bucket stops the build with nothing uploaded or pushed.
   checkBuildSource(context, target);
   // A build replaces nothing that is deployed; its lock record names the commit it builds.

@@ -117,12 +117,14 @@ Expect `874229235044 ACTIVE` and `True`. Stop on anything else.
 gcloud services enable iam.googleapis.com iamcredentials.googleapis.com \
   cloudresourcemanager.googleapis.com sqladmin.googleapis.com run.googleapis.com \
   artifactregistry.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com \
-  cloudbuild.googleapis.com storage.googleapis.com logging.googleapis.com \
+  cloudbuild.googleapis.com containeranalysis.googleapis.com storage.googleapis.com logging.googleapis.com \
   monitoring.googleapis.com --project=tibotattle-prod
 ```
 
 Then rerun the services list. Every name above should be enabled. Enabling an
-API that is already on is a no-op. Google adds its own service agents; OPS-2
+API that is already on is a no-op. The typed build preflight refuses a missing
+Container Analysis API before source upload or the deployment lock; it never
+enables the API implicitly. Google adds its own service agents; OPS-2
 reads only the plane's members, so they are not drift.
 
 ## 3. Plan (read-only)

@@ -118,6 +118,8 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export const GCP_OPS_INFRA_DESIRED_STATE_SCHEMA = "tibotattle-gcp-ops-infra-desired-state-v2";
 export const GCP_OPS_INFRA_ENVIRONMENTS = Object.freeze(["production", "staging"]);
+// Shared read-only prerequisite policy; keep rollout independent of manifest initialization.
+export { GCP_OPS_BUILD_REQUIRED_SERVICES } from "./gcp-build-required-services.mjs";
 
 /**
  * The committed desired state of each environment, relative to apps/worker.
