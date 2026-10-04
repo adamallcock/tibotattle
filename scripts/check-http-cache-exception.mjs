@@ -35,7 +35,8 @@ export const PUBLISHED_VERSIONS = Object.freeze([
   "4.1.1",
   "4.2.0",
   "4.2.0-beta.1",
-  "4.2.0-beta.2"
+  "4.2.0-beta.2",
+  "4.3.0"
 ]);
 export const CONFIG = '# Approved temporary exact-patch exception; see dated decision.\n[[IgnoredVulns]]\nid = "GHSA-ch52-4w7c-c8xp"\nignoreUntil = 2026-10-10\nreason = "Reviewed upstream max-stale patch 14a8c2ad; exact-byte CI gate; expires 2026-10-10 UTC."\n';
 const FILES = {
@@ -45,7 +46,7 @@ const FILES = {
   "config/patches/app-builder-lib@26.15.7.patch": "5821cdf7573fa16696c7b0440c919f360393e91520a42fd81360eb6a5de555b8",
   "test/http-cache-semantics-security.test.js": "68f186a52a2e31e68893ae449d5dd70f03663bb02d8fe30f5ed1149d47b28b1d",
   "test/electron-windows-production-signing.test.js": "0c21f98c9abf9708b57c1683618e5535f64a9be2823e90b533d4413bf0e395c9",
-  "test/http-cache-exception.test.js": "7b308dc14ac36127549412cadad60d1199b0e9d9afc873fcff544cbc348ab38d",
+  "test/http-cache-exception.test.js": "3100277de1ca6eeb52c1e11c09de504e104354d9543a6579acdd45136f9fd28d",
   "test/http-cache-exception-workflow.test.mjs": "5a5ed4205d562e8157ba7a50f06ddc3979e6f601f57ef968730198146e5e5e60",
   ".github/workflows/osv-scanner.yml": "9b0442d67f7dbe8a57f0b4534a3dcfb40e99ba6512ec21766fa3a04d54a908a9",
   "scripts/check-root-workspace-hygiene.mjs": "8f769ccded081318b187dbdadf84064e4d6247e29b4aaeae981ae1216810aa5f"
@@ -93,7 +94,7 @@ const digest = bytes => createHash("sha256").update(bytes).digest("hex");
 export function checkStatus({ now, latest, registry, advisory }) {
   assert.ok(Number.isFinite(now.getTime()) && now >= new Date("2026-10-03T00:00:00Z") && now < new Date(EXPIRES), "Exception expired or clock invalid");
   assert.equal(latest.name, "http-cache-semantics");
-  assert.equal(latest.version, "4.2.0", "New published release requires fresh review and removal decision");
+  assert.equal(latest.version, "4.3.0", "New published release requires fresh review and removal decision");
   assert.deepEqual(Object.keys(registry.versions).sort(), PUBLISHED_VERSIONS, "Published version inventory changed; fresh review and removal decision required");
   assert.equal(advisory.ghsa_id, "GHSA-ch52-4w7c-c8xp");
   assert.equal(advisory.withdrawn_at, null, "Withdrawn advisory requires exception removal");

@@ -22,7 +22,7 @@ lock's GHSA-ch52-4w7c-c8xp and its CVE alias; child locks and unrelated findings
 remain outside scope. This decision defines only the security exception. Artifact qualification and
 publication remain separate gates under the owner's approved release route.
 
-## Current official status
+## Initial official-status snapshot
 
 Fresh read-only npm registry and GitHub API checks at 2026-10-04T02:12Z confirmed
 [npm latest](https://registry.npmjs.org/http-cache-semantics/latest) remains 4.2.0;
@@ -32,6 +32,61 @@ its full published version list has no later release. The active
 2026-10-02T22:36:44Z. [Upstream PR #58](https://github.com/kornelski/http-cache-semantics/pull/58)
 is open and unmerged at `14a8c2ad51740dc39bf3e8f1a11c845a5003f217`.
 No compatible published fix is available in this checked package inventory.
+
+## Technical retention review after 4.3.0 publication
+
+The first hosted OSV check on release source `745a631f` refused the exception
+before tests or scanning because the official publication inventory changed.
+Fresh read-only review on 2026-10-04 confirmed npm published
+[4.3.0](https://registry.npmjs.org/http-cache-semantics/4.3.0) at
+**2026-10-04T02:56:05.593Z**, and latest now points to 4.3.0. The official
+tarball passed its registry SHA-512 integrity check:
+`sha512-M5t5LlJpS1UHMjvwRQVdFHvPISGeLAxNcrWuJkeGh0KxsqCHZ1O3NXZU/8x7cD0BDcGW8kapxMKTvwlqrNkHkA==`.
+Its `index.js` SHA-256 is
+`ede1cc404a492fa348eb9d97a3007a0d72aa717bd22cd86a56bd0824c19729ca`,
+from package git head
+[`b1d4bd682fbab0252985de45219f4e7497c0067c`](https://github.com/kornelski/http-cache-semantics/commit/b1d4bd682fbab0252985de45219f4e7497c0067c).
+
+Five bounded, synthetic probes loaded those verified published bytes in memory
+and exercised the existing max-stale regression cases. For shared cookie,
+`proxy-revalidate`, `no-cache`, `no-store` and `private` responses, 4.3.0 returned
+both `satisfiesWithoutRevalidation: true` and a reusable response. The installed,
+exact patched 4.2.0 source returned false and no reusable response for every
+case. These are synthetic package-policy checks, not an application exploit or
+native packaging claim. The published release changes Vary/status behavior and
+does not satisfy the approved mitigation's security regressions.
+
+The official advisory still states `<= 4.2.0`, no first patched version, and the
+same update timestamp. Upstream PR #58 is now closed and unmerged with unchanged
+head `14a8c2ad51740dc39bf3e8f1a11c845a5003f217`. Neither a new version number nor
+the advisory's unchanged range establishes a compatible published fix.
+
+Technical retention review therefore preserves the owner's already approved
+exact patched 4.2.0 build chain, root-only advisory scope, disabled downloader
+HTTP cache and **2026-10-10T00:00:00Z** expiry. It changes only the reviewed
+official-status snapshot and its proof fixture, with no dependency, patch,
+config or mitigation-test identity change. The original decision requires
+removal or replacement review after official-state drift; it does not require
+fresh human approval for this review within the authorized release route.
+This record does not claim a new owner approval or renew the exception.
+
+The guard now pins the reviewed 30-version inventory and latest 4.3.0. Every
+subsequent added or removed version, latest-tag change, advisory scope/fix or
+withdrawal change still refuses the exception and requires another review.
+The proof fixture additionally covers an inventory removal, next regular/beta
+publication with latest unchanged, and latest-tag rollback.
+
+Focused validation of this three-file repair passed the live exact-source/status
+guard and all 10 tests in `test/http-cache-exception.test.js` plus
+`test/http-cache-semantics-security.test.js`, with no skips. Node syntax checks
+and whitespace checks passed. The public R7 workload-provenance function returned
+452 files and SHA-256
+`5a24910c95dc84f98837982d753d0e767b47c705067ca4022fadc718ae7949d9`
+both before and after the repair. These three files are outside that workload
+closure; no package, lock, workspace, runtime or receipt input changed.
+No full suite, dependency installation, heavy build or protected R7 operation
+was started by this review. Hosted CI on the reviewed repair remains a separate
+gate.
 
 ## Preapproval local mitigation evidence
 
@@ -95,9 +150,9 @@ Accepted expiry is **2026-10-10T00:00:00Z**, without automatic renewal. The exac
 integrated guard refuses invalid/backdated clocks, expiry, expanded config,
 additional root locks, changed lock/workspace/patch/test bytes, installed source
 drift or enabled got cache defaults. Fresh official npm/advisory reads are
-required; the complete reviewed 29-version npm publication inventory is pinned,
-including existing beta/next releases. Any added, removed or changed version key
-refuses the exception even when the latest tag remains 4.2.0; unavailable status, a new published release, a declared fixed version,
+required; the current reviewed 30-version npm publication inventory is pinned,
+including existing beta/next releases and reviewed 4.3.0. Any added, removed or changed version key
+refuses the exception even when the latest tag remains 4.3.0; unavailable status, a new published release, a declared fixed version,
 withdrawal or advisory scope change refuse the exception and require removal or
 replacement review. Root-local config applies to root locks, with no global
 `--config` and no child-lock inheritance.
@@ -175,4 +230,5 @@ installation and publication remain separate gates.
 The integrated guard also pins both exception proof files, the actual OSV
 workflow and the root-hygiene contract, alongside every earlier approved source,
 patch, lock and compatibility identity. The publication-inventory regressions
-cover latest remaining 4.2.0 while a new regular or beta version appears.
+cover latest remaining 4.3.0 while a new regular or beta version appears,
+published-version removal, and latest-tag rollback.
