@@ -73,10 +73,32 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
   if (environment.APPIMAGE_EXTRACT_AND_RUN !== undefined) fail('FUSE_EXTRACTION_MODE_FORBIDDEN');
   return { mount, type: selected.type };
 }
-export function linuxFinalSandboxStatus({ commandLine, status }) {
-  const args = commandLine.split('\0');
-  return args.includes('--type=renderer') && !args.includes('--no-sandbox')
-    && !args.includes('--disable-setuid-sandbox') && /^NoNewPrivs:\s+1$/mu.test(status)
+/** Chromium can expose one space-joined process title instead of NUL argv.
+ * This parser only excludes child roles and checks renderer sandbox flags;
+ * it never replaces the browser's mandatory environment or artifact checks. */
+function linuxFinalProcessCommandLineFacts({ commandLine, executable }) {
+  if (typeof commandLine !== 'string' || commandLine.length > 65536 || !commandLine.endsWith('\0')
+    || typeof executable !== 'string' || executable.length === 0 || /[\s\0]/u.test(executable)) return null;
+  const fields = commandLine.slice(0, -1).split('\0');
+  let encodedArguments, boundary;
+  if (fields.length > 1 || fields[0] === executable) {
+    if (fields[0] !== executable || fields.some(field => field.length === 0 || /\s/u.test(field))) return null;
+    encodedArguments = fields.slice(1).join('\0'); boundary = '\\0';
+  } else {
+    if (!fields[0].startsWith(`${executable} `)) return null;
+    encodedArguments = fields[0].slice(executable.length + 1); boundary = ' ';
+    if (encodedArguments.length === 0 || /[^\S ]/u.test(encodedArguments)
+      || encodedArguments.startsWith(' ') || encodedArguments.endsWith(' ') || encodedArguments.includes('  ')) return null;
+  }
+  const roles = [...encodedArguments.matchAll(new RegExp(`(?:^|${boundary})--type=([^${boundary}]*)(?=${boundary}|$)`, 'gu'))];
+  if (roles.length > 1 || roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility'].includes(roles[0][1])) return null;
+  if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return null;
+  const sandboxBypass = new RegExp(`(?:^|${boundary})--(?:no-sandbox|disable-setuid-sandbox)(?:=|${boundary}|$)`, 'u').test(encodedArguments);
+  return { role: roles[0]?.[1] ?? null, sandboxBypass };
+}
+export function linuxFinalSandboxStatus({ commandLine, executable, status }) {
+  const facts = linuxFinalProcessCommandLineFacts({ commandLine, executable });
+  return facts?.role === 'renderer' && !facts.sandboxBypass && /^NoNewPrivs:\s+1$/mu.test(status)
     && /^Seccomp:\s+2$/mu.test(status);
 }
 function startTime(stat) {
@@ -101,6 +123,9 @@ export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary,
   // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
   if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
   if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_ROLE_INVALID');
+  const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable });
+  if (facts === null) fail('PROCESS_ROLE_INVALID');
+  if (facts.role !== null) return null;
   const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await read(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary });
   if (await hash(executable) !== expected.executableSha256
     || await hash(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
@@ -153,9 +178,9 @@ async function assertRendererSandbox(browser) {
       try {
         const status = await readFile(`/proc/${name}/status`, 'utf8');
         const args = await readFile(`/proc/${name}/cmdline`, 'utf8');
-        if (!linuxFinalSandboxStatus({ commandLine: args, status })) continue;
         const executable = await readlink(`/proc/${name}/exe`);
         if (executable !== browser.executable) continue;
+        if (!linuxFinalSandboxStatus({ commandLine: args, executable, status })) continue;
         return true;
       } catch { /* Exited or unrelated. */ }
     }

@@ -223,12 +223,79 @@ test('browser identity keeps both pinned digests, stable process identity and lo
 });
 
 test('a native renderer must retain Chromium sandbox kernel controls', () => {
-  const value = { commandLine: 'tibotattle\0--type=renderer\0', status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' };
+  const value = { executable: 'tibotattle', commandLine: 'tibotattle\0--type=renderer\0', status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' };
   assert.equal(linuxFinalSandboxStatus(value), true);
   for (const changed of [{ ...value, commandLine: `${value.commandLine}--no-sandbox\0` },
     { ...value, commandLine: `${value.commandLine}--disable-setuid-sandbox\0` },
     { ...value, status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' }, { ...value, status: 'NoNewPrivs:\t1\nSeccomp:\t0\n' },
     { ...value, commandLine: 'tibotattle\0' }]) assert.equal(linuxFinalSandboxStatus(changed), false);
+});
+
+test('Chromium child roles are excluded in NUL argv and the exact executable-prefixed title form', async () => {
+  for (const separator of ['\0', ' ']) {
+    for (const role of ['renderer', 'zygote', 'gpu-process', 'utility']) {
+      const value = appProcess(); value.files.environ = '';
+      value.files.cmdline = [value.value.executable, `--type=${role}`, '--lang=en-US'].join(separator) + '\0';
+      assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
+      assert.ok(!value.reads.includes('mountinfo')); assert.deepEqual(value.hashes, []);
+    }
+    // Even an empty, unknown or repeated role can never fall through to browser
+    // admission. Preserve the base NUL exclusion and refuse malformed titles.
+    for (const roles of [['--type='], ['--type=unknown'], ['--type=renderer', '--type=utility']]) {
+      const value = appProcess();
+      value.files.cmdline = [value.value.executable, ...roles].join(separator) + '\0';
+      if (separator === '\0') {
+        assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
+      } else {
+        await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /PROCESS_ROLE_INVALID/u);
+      }
+      assert.deepEqual(value.hashes, []);
+    }
+  }
+});
+
+test('both browser command forms still require exact APPIMAGE and APPDIR before pinned byte admission', async () => {
+  for (const separator of ['\0', ' ']) {
+    const value = appProcess();
+    value.files.cmdline = [value.value.executable, '--remote-debugging-port=12345'].join(separator) + '\0';
+    assert.equal((await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io)).pid, value.pid);
+    assert.deepEqual(value.hashes, [value.value.executable, `${mount}/resources/app.asar`]);
+    for (const [key, missing, mismatch] of [
+      ['APPIMAGE', 'FUSE_APPIMAGE_ENV_MISSING', 'FUSE_APPIMAGE_ENV_MISMATCH'],
+      ['APPDIR', 'FUSE_APPDIR_ENV_MISSING', 'FUSE_APPDIR_ENV_MISMATCH'],
+    ]) {
+      for (const observed of [undefined, '', '/synthetic/wrong']) {
+        const environment = { ...value.environment };
+        if (observed === undefined) delete environment[key]; else environment[key] = observed;
+        value.files.environ = Object.entries(environment).map(([name, item]) => `${name}=${item}\0`).join('');
+        value.hashes.length = 0;
+        await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), {
+          code: `LINUX_FINAL_LIFECYCLE_${observed === undefined ? missing : mismatch}`,
+        });
+        assert.deepEqual(value.hashes, []);
+      }
+    }
+  }
+});
+
+test('renderer title parsing cannot hide sandbox bypass flags or ambiguous child roles', () => {
+  const executable = `${mount}/tibotattle`, status = 'NoNewPrivs:\t1\nSeccomp:\t2\n';
+  for (const separator of ['\0', ' ']) {
+    const command = args => [executable, ...args].join(separator) + '\0';
+    assert.equal(linuxFinalSandboxStatus({ commandLine: command(['--type=renderer']), executable, status }), true);
+    for (const flags of [['--no-sandbox'], ['--no-sandbox=1'], ['--disable-setuid-sandbox'], ['--disable-setuid-sandbox=1'],
+      ['--type=utility'], ['--type='], ['--type'], ['--type=unknown']]) {
+      assert.equal(linuxFinalSandboxStatus({ commandLine: command(['--type=renderer', ...flags]), executable, status }), false);
+    }
+    for (const altered of ['NoNewPrivs:\t0\nSeccomp:\t2\n', 'NoNewPrivs:\t1\nSeccomp:\t0\n']) {
+      assert.equal(linuxFinalSandboxStatus({ commandLine: command(['--type=renderer']), executable, status: altered }), false);
+    }
+  }
+  for (const commandLine of [`${executable} --type=renderer`, `${executable}  --type=renderer\0`,
+    `${executable}\t--type=renderer\0`, `${executable} --type=renderer \0`, `${executable} --type=renderer\0\0`,
+    `/synthetic/other --type=renderer\0`, `${executable}\0--type=renderer --no-sandbox\0`]) {
+    assert.equal(linuxFinalSandboxStatus({ commandLine, executable, status }), false);
+  }
 });
 test('manual lifecycle lane preserves byte, network, sandbox, FUSE and publication boundaries', async () => {
   const workflow = await readFile(new URL('../.github/workflows/electron-linux-final-qualification.yml', import.meta.url), 'utf8');
