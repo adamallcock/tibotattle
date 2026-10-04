@@ -11,7 +11,8 @@ import { LINUX_MOUNT_DIAGNOSIS_SCHEMA, LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, LINUX
 import { LINUX_APPARMOR_COMPARISON_SCHEMA, LINUX_APPARMOR_COMPARISON_CONFIRMATION, LINUX_APPARMOR_TEMPLATE_SHA256,
   LINUX_APPARMOR_DAEMON_READER, LINUX_APPARMOR_PROFILE_ACTORS, normalizeLinuxAppArmorMountTuple, validateLinuxAppArmorMountTuple,
   linuxAppArmorProfileName, renderLinuxAppArmorBasis, linuxAppArmorMountRule, deriveLinuxAppArmorProfile,
-  validateLinuxAppArmorComparison, runLinuxAppArmorComparison, linuxAppArmorRemovalAllowed, linuxAppArmorPrivilegedArguments } from '../scripts/lib/linux-apparmor-mount-profile.mjs';
+  validateLinuxAppArmorComparison, runLinuxAppArmorComparison, linuxAppArmorRemovalAllowed, linuxAppArmorPrivilegedArguments,
+  readLinuxAppArmorRootImport, readLinuxAppArmorImportBinding, withLinuxAppArmorImportBinding, linuxAppArmorImportFailure } from '../scripts/lib/linux-apparmor-mount-profile.mjs';
 
 const temporary = '/opt/tibotattle-updater-exec/tmp/' + 'a'.repeat(32);
 const image = '/opt/tibotattle-updater-exec/TiboTattle.AppImage';
@@ -295,6 +296,7 @@ test('diagnostic Docker security arguments match the existing lifecycle and keep
 });
 
 const tuple = () => ({ type: 'squashfuse', source: 'squashfuse', options: ['ro', 'nosuid', 'nodev'] });
+const importBinding = () => ({ parserConfigSha256: '8'.repeat(64), abi40Sha256: '9'.repeat(64) });
 const ownedName = stage => linuxAppArmorProfileName({ run: '12345', nonce: 'a'.repeat(32), stage });
 const validateRow = value => validateLinuxMountDiagnosis({ schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA,
   purpose: 'diagnostic_only', qualifiesRelease: false, runnerRevision: pair.intake.runnerRevision,
@@ -302,7 +304,7 @@ const validateRow = value => validateLinuxMountDiagnosis({ schemaVersion: LINUX_
 function basis() {
   return { dockerVersion: '28.0.4', parserVersion: '4.0.1', parserSha256: '1'.repeat(64),
     templateSha256: LINUX_APPARMOR_TEMPLATE_SHA256, renderedSha256: '2'.repeat(64), expandedSha256: '3'.repeat(64),
-    daemonProfileSha256: '4'.repeat(64), globalImport: true, baseImport: true, loadedDefaultPolicyVerified: false };
+    daemonProfileSha256: '4'.repeat(64), globalImport: true, baseImport: true, imports: importBinding(), loadedDefaultPolicyVerified: false };
 }
 function comparisonResult(stage, role) {
   const value = row(role, { appArmorMountDenial: stage === 'candidate' ? 'unavailable' : true,
@@ -491,15 +493,16 @@ test('comparison workflow retains only closed JSON and add-only policy ownership
 });
 
 test('profile removal requires the exact successful add marker, source digest, owner and no active actor', () => {
-  const owner = { run: '12345', runner: 'b'.repeat(40), nonce: 'a'.repeat(32), parserSha256: 'c'.repeat(64), baselineName: ownedName('baseline') };
-  const marker = { ...owner, stage: 'baseline', name: ownedName('baseline'), sha256: 'd'.repeat(64) };
+  const owner = { run: '12345', runner: 'b'.repeat(40), nonce: 'a'.repeat(32), parserSha256: 'c'.repeat(64), baselineName: ownedName('baseline'), imports: importBinding() };
+  const marker = structuredClone({ ...owner, stage: 'baseline', name: ownedName('baseline'), sha256: 'd'.repeat(64) });
   const expected = { run: owner.run, runner: owner.runner, parserSha256: owner.parserSha256, stage: 'baseline' };
   const input = { owner, marker, profileSha256: marker.sha256, currentState: 'enforce', actorsGone: true };
   assert.equal(linuxAppArmorRemovalAllowed(input, expected), true);
   for (const mutate of [v => { v.marker = null; }, v => { v.marker.name = 'docker-default'; },
     v => { v.marker.run = '12346'; }, v => { v.owner.runner = 'e'.repeat(40); }, v => { v.profileSha256 = 'f'.repeat(64); },
     v => { v.currentState = 'complain'; }, v => { v.actorsGone = false; }, v => { v.actorsGone = 'unavailable'; },
-    v => { v.marker.path = '/private/profile'; }]) {
+    v => { v.marker.path = '/private/profile'; }, v => { v.marker.imports.abi40Sha256 = 'e'.repeat(64); },
+    v => { delete v.owner.imports; }]) {
     const changed = structuredClone(input); mutate(changed); assert.equal(linuxAppArmorRemovalAllowed(changed, expected), false);
   }
 });
@@ -523,4 +526,173 @@ test('each fixed privileged operation has its own root deadline inside the contr
     assert.deepEqual(linuxAppArmorPrivilegedArguments(args), ['-n', 'timeout', '--signal=TERM', '--kill-after=2s', '10s', ...args.slice(1)]);
   }
   for (const args of [null, [], ['-i', 'python3'], ['-n', 'bash'], ['-n', 'rm']]) assert.throws(() => linuxAppArmorPrivilegedArguments(args));
+});
+
+
+const importRefusal = reason => error => error.code === 'imports_unavailable' && error.importFailure === reason
+  && error.message === 'LINUX_APPARMOR_COMPARISON_REFUSED';
+
+test('flattened standard imports preserve the canonical ABI directive and identical duplicates byte for byte', async () => {
+  const template = await readFile(new URL('../scripts/assets/moby-apparmor-v28.0.4-template.txt', import.meta.url), 'utf8');
+  const name = ownedName('baseline');
+  const rendered = renderLinuxAppArmorBasis(template, { name, daemonProfile: 'unconfined', globalImport: false, baseImport: false });
+  // Minimal synthetic preprocessed abstraction: ABI remains inside the profile.
+  const flattened = rendered.replace('  network,', '  # flattened abstraction\n  abi <abi/4.0>,\n  /usr/lib/synthetic/** mr,\n\tabi <abi/4.0>,\n  network,');
+  for (const stage of ['baseline', 'candidate']) {
+    const result = deriveLinuxAppArmorProfile(flattened, { baselineName: name, name: ownedName(stage), stage,
+      tuple: tuple(), nonce: 'a'.repeat(32), imports: importBinding() });
+    assert.equal(result, flattened.replaceAll(name, ownedName(stage)).replace('  deny mount,',
+      stage === 'baseline' ? '  audit deny mount,' : linuxAppArmorMountRule(tuple(), 'a'.repeat(32))));
+    assert.equal(result.split('abi <abi/4.0>,').length, 3);
+  }
+  assert.throws(() => deriveLinuxAppArmorProfile(flattened, { baselineName: name, name, stage: 'baseline' }), importRefusal('abi_missing'));
+  for (const directive of ['abi <abi/3.0>,', 'abi <kernel>,', 'abi<abi/3.0>,', 'abi "/private/abi-marker",', 'abi <abi/4.0>, abi <abi/3.0>,', 'audit { abi <abi/4.0>, }']) {
+    assert.throws(() => deriveLinuxAppArmorProfile(flattened.replace('abi <abi/4.0>,', directive),
+      { baselineName: name, name, stage: 'baseline', imports: importBinding() }), importRefusal('abi_directive_unsupported'));
+  }
+  for (const [extra, reason] of [['#include <unexpanded>', 'include_remaining'], ['# include <unexpanded>', 'include_remaining'], ['audit { mount, }', 'mount_rule_unsupported'],
+    ['allow { remount, }', 'mount_rule_unsupported'], ['audit { all, }', 'all_permission_unsupported'], ['profile another {}', 'profile_shape_unsupported']]) {
+    assert.throws(() => deriveLinuxAppArmorProfile(`${flattened}\n${extra}\n`,
+      { baselineName: name, name, stage: 'baseline', imports: importBinding() }), importRefusal(reason));
+  }
+});
+
+function rootImportFixture({ kind = 'abi', contents = Buffer.from('synthetic-feature-set\n'), change = () => {} } = {}) {
+  const path = kind === 'abi' ? '/etc/apparmor.d/abi/4.0' : '/etc/apparmor/parser.conf';
+  const file = { uid: 0n, mode: 0o100644n, nlink: 1n, size: BigInt(contents.length), dev: 1n, ino: 2n, mtimeNs: 3n, ctimeNs: 4n,
+    isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false };
+  const directory = { ...file, mode: 0o40755n, isFile: () => false, isDirectory: () => true };
+  const calls = []; let reads = 0;
+  return { calls, io: {
+    async lstat(value) { calls.push(['stat', value]); const stat = { ...(value === path ? file : directory) }; change(stat, value === path ? 'path' : 'parent', reads); return stat; },
+    async realpath(value) { return value; },
+    async open(value, flags) {
+      calls.push(['open', value, flags]);
+      return {
+        async stat() { const stat = { ...file }; change(stat, 'handle', reads); return stat; },
+        async read(buffer, offset, length, position) { reads++; assert.equal(position, 0); assert.equal(length, 65537); contents.copy(buffer, offset); return { bytesRead: contents.length }; },
+        async close() { calls.push(['close']); },
+      };
+    },
+  } };
+}
+
+test('canonical ABI reads refuse ownership, path, size, link and mutation ambiguity without retaining raw bytes in evidence', async () => {
+  const fixture = rootImportFixture();
+  const contents = await readLinuxAppArmorRootImport('abi', fixture.io);
+  assert.equal(contents.toString('utf8'), 'synthetic-feature-set\n'); assert.equal(fixture.calls.at(-1)[0], 'close');
+  for (const change of [stat => { stat.uid = 1000n; }, stat => { stat.mode |= 0o020n; },
+    (stat, at) => { if (at === 'path') stat.nlink = 2n; }, (stat, at) => { if (at === 'path') stat.size = 65537n; },
+    (stat, at) => { if (at === 'path') stat.isSymbolicLink = () => true; },
+    (stat, at, reads) => { if (at === 'handle' && reads) stat.ino++; },
+    (stat, at, reads) => { if (at === 'path' && reads) stat.ctimeNs++; },
+    (stat, at) => { if (at === 'parent') stat.mode |= 0o002n; }]) {
+    await assert.rejects(readLinuxAppArmorRootImport('abi', rootImportFixture({ change }).io), importRefusal('abi_unsafe'));
+  }
+  const redirected = rootImportFixture(); redirected.io.realpath = async () => '/private/redirect-marker';
+  await assert.rejects(readLinuxAppArmorRootImport('abi', redirected.io), importRefusal('abi_unsafe'));
+  for (const code of ['ENOENT', 'EACCES']) {
+    const missing = rootImportFixture(); const stat = missing.io.lstat;
+    missing.io.lstat = async path => { if (path.endsWith('/4.0')) throw Object.assign(new Error('private-file-marker'), { code }); return stat(path); };
+    if (code === 'ENOENT') assert.equal(await readLinuxAppArmorRootImport('abi', missing.io), null);
+    else await assert.rejects(readLinuxAppArmorRootImport('abi', missing.io), importRefusal('abi_unavailable'));
+    assert.ok(!missing.calls.some(call => call[0] === 'open'));
+  }
+  await assert.rejects(readLinuxAppArmorRootImport('abi', rootImportFixture({ contents: Buffer.alloc(0) }).io), importRefusal('abi_unsafe'));
+  assert.equal((await readLinuxAppArmorRootImport('parser_config', rootImportFixture({ kind: 'parser_config', contents: Buffer.alloc(0) }).io)).length, 0);
+});
+
+test('only default parser configuration is admitted and receipts bind exact config and ABI bytes', async () => {
+  const abi = Buffer.from('synthetic-feature-set\n');
+  for (const config of [null, Buffer.alloc(0), Buffer.from('# Include /private/comment-only-marker\n \t# policy-features=example\n\n'), Buffer.from('#' + ' '.repeat(253) + '\n')]) {
+    const calls = [];
+    const binding = await readLinuxAppArmorImportBinding({ read: async kind => { calls.push(kind); return kind === 'abi' ? abi : config; } });
+    assert.deepEqual(calls, ['parser_config', 'abi']);
+    assert.deepEqual(binding, { parserConfigSha256: config === null ? null : createHash('sha256').update(config).digest('hex'),
+      abi40Sha256: createHash('sha256').update(abi).digest('hex') });
+    assert.doesNotMatch(JSON.stringify(binding), /private|Include|feature-set|\/etc/u);
+  }
+  for (const option of ['Include /private/search-marker', 'base=/private/base-marker', 'override-policy-abi=/private/abi-marker',
+    'policy-features=/private/abi-marker', 'config-file=/private/config-marker', 'Complain', 'write-cache', '\0',
+    '#' + ' '.repeat(254) + 'Include /private/synthetic', '#' + '😀'.repeat(64)]) {
+    let abiRead = false;
+    await assert.rejects(readLinuxAppArmorImportBinding({ read: async kind => {
+      if (kind === 'abi') { abiRead = true; return abi; } return Buffer.from(`# comment\n${option}\n`);
+    } }), importRefusal('parser_config_unsupported'));
+    assert.equal(abiRead, false);
+  }
+  assert.deepEqual(await readLinuxAppArmorImportBinding({ read: async () => null }), { parserConfigSha256: null, abi40Sha256: null });
+});
+
+test('parser operations are bracketed by both bindings, including missing files and successful-add ownership before post-check refusal', async () => {
+  const expected = importBinding(); const events = [];
+  let absentInvoked = false;
+  await assert.rejects(withLinuxAppArmorImportBinding({ ...expected, abi40Sha256: null }, () => { absentInvoked = true; },
+    { read: async () => expected }), importRefusal('abi_changed'));
+  assert.equal(absentInvoked, false);
+  assert.equal(await withLinuxAppArmorImportBinding(expected, async () => { events.push('operation'); return 'done'; },
+    { read: async () => { events.push('binding'); return structuredClone(expected); } }), 'done');
+  assert.deepEqual(events, ['binding', 'operation', 'binding']);
+  for (const [field, reason] of [['parserConfigSha256', 'parser_config_changed'], ['abi40Sha256', 'abi_changed']]) {
+    for (const next of [null, 'f'.repeat(64)]) {
+      let invoked = false;
+      await assert.rejects(withLinuxAppArmorImportBinding(expected, () => { invoked = true; },
+        { read: async () => ({ ...expected, [field]: next }) }), importRefusal(reason));
+      assert.equal(invoked, false);
+      let reads = 0, journaled = false;
+      await assert.rejects(withLinuxAppArmorImportBinding(expected, async () => { journaled = true; },
+        { read: async () => ++reads === 1 ? expected : { ...expected, [field]: next } }), importRefusal(reason));
+      assert.equal(reads, 2); assert.equal(journaled, true);
+    }
+  }
+  const failed = [];
+  await assert.rejects(withLinuxAppArmorImportBinding(expected, () => { failed.push('operation'); throw new Error('synthetic failure'); },
+    { read: async () => { failed.push('binding'); return expected; } }), /synthetic failure/u);
+  assert.deepEqual(failed, ['binding', 'operation', 'binding']);
+});
+
+test('comparison v2 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
+  for (const [provided, expected] of [['abi_missing', 'abi_missing'], ['abi_unsafe', 'abi_unsafe'], ['preprocess_failed', 'preprocess_failed'],
+    ['include_remaining', 'include_remaining'], ['parser_config_changed', 'parser_config_changed'], ['private-error-marker', 'unknown'], [undefined, 'unknown']]) {
+    const harness = comparisonHarness();
+    harness.adapters.prepareProfiles = async () => { throw Object.assign(new Error('/private/error-marker'), { code: 'imports_unavailable', importFailure: provided }); };
+    const result = await runLinuxAppArmorComparison(pair, harness.adapters);
+    assert.equal(result.basisFailure, 'imports_unavailable'); assert.equal(result.importFailure, expected);
+    assert.equal(result.basis, null); assert.equal(result.cases.length, 0); assert.equal(result.profilesRemoved, true);
+    assert.equal(validateLinuxAppArmorComparison(result, validateRow), result);
+    assert.doesNotMatch(JSON.stringify(result), /private|error-marker/u);
+    for (const mutate of [v => { v.importFailure = 'none'; }, v => { v.importFailure = '/private/error-marker'; },
+      v => { v.basisFailure = 'docker_version_unmatched'; }]) {
+      const changed = structuredClone(result); mutate(changed); assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);
+    }
+  }
+  assert.equal(linuxAppArmorImportFailure({ code: 'parser_unavailable', importFailure: 'abi_missing' }), 'none');
+  const complete = await runLinuxAppArmorComparison(pair, comparisonHarness().adapters);
+  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v2'); assert.equal(complete.importFailure, 'none');
+  for (const mutate of [v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v1'; }, v => { delete v.basis.imports; },
+    v => { v.basis.imports.path = '/private/abi-marker'; }, v => { v.basis.imports.abi40Sha256 = 'invalid'; },
+    v => { v.importFailure = 'abi_missing'; }]) {
+    const changed = structuredClone(complete); mutate(changed); assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);
+  }
+});
+
+
+test('import changes during load or cleanup remain precise failures without losing owned-profile evidence', async () => {
+  const error = Object.assign(new Error('private-changed-import-marker'), { code: 'imports_unavailable', importFailure: 'abi_changed' });
+  const added = { profileSha256: '5'.repeat(64), profileNameSha256: '6'.repeat(64), loaded: true, removed: false };
+  const profiles = { basis: basis(), evidence: { baseline: added, candidate: null },
+    async load() { throw error; }, async remove(stage) { if (stage === 'baseline') throw error; return true; } };
+  const result = await runLinuxAppArmorComparison(pair, { prepareProfiles: async () => profiles, runProbe: async () => assert.fail('must not probe'), validateRow });
+  assert.equal(result.outcome, 'cleanup_failed'); assert.equal(result.basisFailure, 'imports_unavailable'); assert.equal(result.importFailure, 'abi_changed');
+  assert.equal(result.profiles.baseline.loaded, true); assert.equal(result.profiles.baseline.removed, false); assert.equal(result.profilesRemoved, false);
+  assert.doesNotMatch(JSON.stringify(result), /private-changed-import-marker/u);
+  const harness = comparisonHarness();
+  const prepare = harness.adapters.prepareProfiles;
+  harness.adapters.prepareProfiles = async () => {
+    const owned = await prepare(); const remove = owned.remove;
+    owned.remove = async (stage, gone) => { if (owned.evidence.candidate !== null) throw error; return remove(stage, gone); };
+    return owned;
+  };
+  const cleanup = await runLinuxAppArmorComparison(pair, harness.adapters);
+  assert.equal(cleanup.outcome, 'cleanup_failed'); assert.equal(cleanup.importFailure, 'abi_changed'); assert.equal(cleanup.profilesRemoved, false);
 });
