@@ -149,6 +149,7 @@ test('the actual kernel trace parser projects closed actor events and refuses un
   const result = syntheticObserver(['trace_line'], String.raw`
 rows = []
 events = 0
+exit_format = 'legacy'
 emit = rows.append
 prefix = 'synthetic-76 [001] .... 1.000001: sched_process_'
 trace_line(prefix + 'exec: filename=/opt/tibotattle-updater-exec/TiboTattle.AppImage pid=76 old_pid=76', {1})
@@ -204,6 +205,159 @@ print(json.dumps(results))
   assert.deepEqual(result[5], { error: null, completeLine: false, rows: [] });
   assert.equal(result[6].error, 'incomplete');
   assert.doesNotMatch(JSON.stringify(result), /filename|comm|\/opt\//u);
+});
+
+test('trace buffer setup admits kernel-rounded 63 KiB only on the bound 4 KiB layout and original cap', () => {
+  const result = syntheticObserver(['configure_trace_buffer'], String.raw`
+def scenario(change):
+    global os, control, local_read
+    writes = []; values = {}; subbuf_reads = [0]
+    os = types.SimpleNamespace(sysconf=lambda name: change.get('page', 4096) if name == 'SC_PAGE_SIZE' else None)
+    def write(name, value):
+        if name != 'buffer_size_kb': raise ValueError()
+        writes.append([name, value])
+        # Actual reviewed kernel rounding: 4080-byte payload per 4096-byte page.
+        pages = (int(value) * 1024 + 4079) // 4080
+        values['buffer_size_kb'] = str((pages * 4080) >> 10)
+        values['buffer_total_size_kb'] = str(int(values['buffer_size_kb']) * change.get('cpus', 4))
+    def read(name):
+        if name == 'buffer_subbuf_size_kb':
+            subbuf_reads[0] += 1
+            return '8' if change.get('drift') and subbuf_reads[0] > 1 else change.get('subbuf', '4')
+        return change.get(name, values[name])
+    control = write; local_read = read
+    try: configure_trace_buffer(); admitted = True
+    except Exception: admitted = False
+    return {'admitted': admitted, 'writes': writes}
+changes = [{}, {'cpus': 8}, {'page': 8192}, {'subbuf': '8'}, {'subbuf': 'synthetic-private-layout'},
+    {'buffer_size_kb': '67'}, {'buffer_size_kb': '64'}, {'buffer_total_size_kb': '513'},
+    {'buffer_total_size_kb': '0'}, {'buffer_total_size_kb': '-1'}, {'buffer_total_size_kb': 'synthetic-private-layout'}, {'drift': True}]
+print(json.dumps([scenario(change) for change in changes]))
+`);
+  const write = [['buffer_size_kb', '63\n']];
+  assert.deepEqual(result.slice(0, 2), [{ admitted: true, writes: write }, { admitted: true, writes: write }]);
+  for (const row of result.slice(2)) assert.equal(row.admitted, false);
+  for (const row of result.slice(2, 5)) assert.deepEqual(row.writes, []);
+  for (const row of result.slice(5)) assert.deepEqual(row.writes, write);
+  assert.doesNotMatch(JSON.stringify(result), /private|layout/u);
+});
+
+const traceEventFixture = String.raw`
+def configure(shape='legacy', changes=None, denied=None):
+    global local_read, control, setup_reason
+    changes = changes or {}; writes = []
+    formats = {'fork': 'comm=%s pid=%d child_comm=%s child_pid=%d',
+        'exec': 'filename=%s pid=%d old_pid=%d', 'exit': 'comm=%s pid=%d prio=%d'}
+    arguments = {'fork': 'REC->parent_comm, REC->parent_pid, REC->child_comm, REC->child_pid',
+        'exec': '__get_str(filename), REC->pid, REC->old_pid', 'exit': 'REC->comm, REC->pid, REC->prio'}
+    if shape == 'group_dead':
+        formats['exit'] += ' group_dead=%s'
+        arguments['exit'] += ', REC->group_dead ? "true" : "false"'
+    def read(name):
+        match = re.fullmatch(r'events/sched/sched_process_(fork|exec|exit)/(format|filter|trigger|enable)', name)
+        if not match: raise ValueError()
+        kind, field = match.groups()
+        if denied == (kind, 'enable_readback' if field == 'enable' else field): raise PermissionError()
+        defaults = {'format': 'name: sched_process_' + kind + '\nID: 42\nformat:\n\nprint fmt: "' + formats[kind] + '", ' + arguments[kind] + '\n',
+            'filter': 'none\n', 'trigger': '# Available triggers:\n# traceon traceoff snapshot\n', 'enable': '1\n' if kind in writes else '0\n'}
+        return changes.get(kind + '/' + field, defaults[field])
+    def write(name, value):
+        match = re.fullmatch(r'events/sched/sched_process_(fork|exec|exit)/enable', name)
+        if not match or value != '1\n': raise ValueError()
+        if denied == (match[1], 'enable_write'): raise PermissionError()
+        writes.append(match[1])
+    local_read = read; control = write
+    try: configure_trace_events(); admitted = True
+    except Exception: admitted = False
+    return {'admitted': admitted, 'reason': None if admitted else setup_reason, 'selector': exit_format, 'writes': writes}
+`;
+
+test('live event admission binds exit parsing to exactly the legacy or group-dead format', () => {
+  const result = syntheticObserver(['configure_trace_events', 'trace_line'], traceEventFixture + String.raw`
+results = []
+prefix = 'private-marker-76 [001] .... 1.000001: sched_process_exit: comm=private-marker pid=76 prio=120'
+for shape in ('legacy', 'group_dead'):
+    admission = configure(shape)
+    rows = []; events = 0; emit = rows.append
+    accepted = [prefix] if shape == 'legacy' else [prefix + ' group_dead=true', prefix + ' group_dead=false']
+    for line in accepted: trace_line(line, {1})
+    invalid = ([prefix + ' group_dead=true', prefix + ' group_dead=false'] if shape == 'legacy' else [prefix]) + [
+        prefix + ' group_dead=1', prefix + ' group_dead=True', prefix + ' group_dead=unknown',
+        prefix + ' group_dead=true trailing', prefix + ' group_dead=true group_dead=false', prefix + ' trailing',
+        accepted[0] + ' ', accepted[0].replace('pid=76', 'pid=75')]
+    refused = []
+    for line in invalid:
+        try: trace_line(line, {1}); refused.append(False)
+        except ValueError: refused.append(True)
+    results.append({'admission': admission, 'rows': rows, 'refused': refused})
+# A second setup that fails must clear the previous successful selector.
+failed = configure('legacy', {'exit/filter': 'pid == 76\n'})
+try: trace_line(prefix, {1}); refused_after_failure = False
+except ValueError: refused_after_failure = True
+print(json.dumps({'results': results, 'failed': failed, 'refusedAfterFailure': refused_after_failure}))
+`);
+  for (const [index, selector] of ['legacy', 'group_dead'].entries()) {
+    const value = result.results[index];
+    assert.deepEqual(value.admission, { admitted: true, reason: null, selector, writes: ['fork', 'exec', 'exit'] });
+    assert.deepEqual(value.rows, Array(index + 1).fill({ kind: 'actor', event: { type: 'exit', pid: 76 } }));
+    assert.deepEqual(value.refused, Array(index === 0 ? 10 : 9).fill(true));
+  }
+  assert.deepEqual(result.failed, { admitted: false, reason: 'trace_exit_filter_unavailable', selector: null, writes: ['fork', 'exec'] });
+  assert.equal(result.refusedAfterFailure, true);
+  assert.doesNotMatch(JSON.stringify(result), /private|comm|prio|true trailing|filename/u);
+});
+
+test('event setup refuses unknown or ambiguous formats and identifies each exact failed operation', () => {
+  const result = syntheticObserver(['configure_trace_events'], traceEventFixture + String.raw`
+legacy = 'print fmt: "comm=%s pid=%d prio=%d", REC->comm, REC->pid, REC->prio\n'
+modern = 'print fmt: "comm=%s pid=%d prio=%d group_dead=%s", REC->comm, REC->pid, REC->prio, REC->group_dead ? "true" : "false"\n'
+formats = ['', 'private-format-marker\n', legacy + legacy, legacy + modern,
+    legacy.replace('prio=%d"', 'prio=%d extra=%s"'), modern.replace('group_dead=%s', 'group_dead=%d'),
+    legacy.replace('print fmt:', 'print fmt :'), legacy.rstrip() + ' PRIVATE\nprint fmt: broken\n']
+refused_formats = [configure('legacy', {'exit/format': value}) for value in formats]
+boundaries = []
+for kind in ('fork', 'exec', 'exit'):
+    for operation in ('format', 'filter', 'trigger', 'enable_write', 'enable_readback'):
+        denied = (kind, operation) if operation == 'enable_write' else None
+        values = {'format': 'print fmt: "private-format-marker", REC->pid\n', 'filter': 'pid == 76\n',
+            'trigger': '# Available triggers:\ntraceon:unlimited\n', 'enable_readback': '1*\n'}
+        field = 'enable' if operation == 'enable_readback' else operation
+        changes = {} if denied else {kind + '/' + field: values[operation]}
+        boundaries.append(configure('group_dead', changes, denied))
+# A read failure also stays at its own operation rather than becoming a format guess.
+denied_read = configure('legacy', denied=('exec', 'filter'))
+print(json.dumps({'formats': refused_formats, 'boundaries': boundaries, 'deniedRead': denied_read}))
+`);
+  for (const value of result.formats) {
+    assert.deepEqual(value, { admitted: false, reason: 'trace_exit_format_unavailable', selector: null, writes: ['fork', 'exec'] });
+  }
+  const operations = ['format', 'filter', 'trigger', 'enable_write', 'enable_readback'];
+  for (const [index, value] of result.boundaries.entries()) {
+    const eventIndex = Math.floor(index / operations.length), operation = operations[index % operations.length];
+    const writes = ['fork', 'exec', 'exit'].slice(0, eventIndex + Number(operation === 'enable_readback'));
+    assert.deepEqual(value, { admitted: false, reason: `trace_${['fork', 'exec', 'exit'][eventIndex]}_${operation}_unavailable`, selector: null, writes });
+  }
+  assert.deepEqual(result.deniedRead, { admitted: false, reason: 'trace_exec_filter_unavailable', selector: null, writes: ['fork'] });
+  assert.doesNotMatch(JSON.stringify(result), /private|PRIVATE|REC|pid ==|traceon|1\*/u);
+});
+
+test('every trace setup boundary has a fixed closed refusal reason without exposing native readbacks', () => {
+  const reasons = ['trace_instance_setup_unavailable', 'trace_initial_controls_unavailable', 'trace_cpu_layout_unavailable',
+    'trace_buffer_layout_unavailable', 'trace_options_unavailable', 'trace_clock_unavailable',
+    ...['fork', 'exec', 'exit'].flatMap(event => ['format', 'filter', 'trigger', 'enable_write', 'enable_readback'].map(operation => `trace_${event}_${operation}_unavailable`)),
+    'trace_pid_filter_unavailable', 'trace_pipe_unavailable', 'trace_gate_recheck_unavailable', 'trace_start_unavailable'];
+  assert.match(LINUX_MOUNT_KMSG_READER, /        configure_trace_events\(\)\n        setup_reason = 'trace_pid_filter_unavailable'/u);
+  assert.match(LINUX_MOUNT_KMSG_READER, /except Exception: incomplete\(setup_reason, True\); raise/u);
+  for (const reason of reasons) {
+    const graph = buildLinuxAppImageActorGraph({ complete: false, reason });
+    assert.deepEqual(graph, { complete: false, reason, actors: new Map() });
+    const value = { schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
+      ...pair.intake, cases: [row('current', { probe: null, errorCode: 'container_failed', appArmorAuditReason: 'reader_failed',
+        actorTrace: { complete: false, reason, instanceRemoved: true } })] };
+    assert.equal(validateLinuxMountDiagnosis(value), value);
+    value.cases[0].actorTrace.reason += '/synthetic-private-readback';
+    assert.equal(validateLinuxMountDiagnosis(value), null);
+  }
 });
 
 test('the actual trace completeness check refuses loss, missing counters, CPU drift and undrained events', () => {
@@ -442,7 +596,7 @@ test('serial exact-byte comparison stops before the second image when owned cont
   assert.equal(observer.cases.length, 1);
   await assert.rejects(runLinuxMountSequence(pair, async role => row(role, { artifactSha256: 'f'.repeat(64) })), /REFUSED/u);
   for (const mutate of [
-    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v2'; },
+    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v2'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v3'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v4'; },
     v => { v.cases[0].probe.environment.appArmor.profile = 'private-profile-marker'; },
     v => { v.cases[0].actorTrace.pid = 77; }, v => { v.cases[0].actorTrace.reason = '/private/trace-marker'; },
     v => { v.cases[0].actorTrace.instanceRemoved = false; }, v => { v.cases[0].actorTrace = { complete: false, reason: 'trace_stream_incomplete', instanceRemoved: true }; },
@@ -701,6 +855,43 @@ test('comparison preserves cleanup and cancellation gates without turning a fail
   assert.doesNotMatch(JSON.stringify(missingBasis), /private-host-details/u);
 });
 
+function failedSetupResult(result) {
+  result.row.probe = null; result.row.errorCode = 'container_failed'; result.tuple = null;
+  result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'reader_failed';
+  result.row.actorTrace = { complete: false, reason: 'trace_buffer_layout_unavailable', instanceRemoved: true };
+}
+
+test('a failed setup can remove its owned profile after host closure without qualifying the probe', async () => {
+  const harness = comparisonHarness({ mutate: failedSetupResult });
+  const result = await runLinuxAppArmorComparison(pair, harness.adapters);
+  assert.equal(result.outcome, 'baseline_failed'); assert.equal(result.cases.length, 1); assert.equal(result.cases[0].row.probe, null);
+  assert.equal(result.profilesRemoved, true); assert.equal(result.profiles.baseline.removed, true); assert.equal(result.qualifiesRelease, false);
+  assert.ok(harness.calls.includes('remove:baseline:true')); assert.ok(!harness.calls.includes('load:candidate'));
+  assert.equal(validateLinuxAppArmorComparison(result, validateRow), result);
+  const incomplete = comparisonHarness({ mutate: result => { result.row.probe.cleanup.childGone = false; } });
+  const unqualified = await runLinuxAppArmorComparison(pair, incomplete.adapters);
+  assert.equal(unqualified.outcome, 'baseline_failed'); assert.equal(unqualified.cases.length, 1); assert.equal(unqualified.profilesRemoved, true);
+  assert.ok(!incomplete.calls.includes('load:candidate'));
+  const removalFailed = comparisonHarness({ mutate: failedSetupResult, failedCleanup: true });
+  const failed = await runLinuxAppArmorComparison(pair, removalFailed.adapters);
+  assert.equal(failed.outcome, 'cleanup_failed'); assert.equal(failed.profilesRemoved, false);
+});
+
+test('absent or unknown host closure never authorizes a profile-removal attempt after setup failure', async () => {
+  for (const field of ['containerRemoved', 'observerStopped', 'instanceRemoved']) for (const value of [false, null, 'unavailable', undefined]) {
+    const harness = comparisonHarness({ mutate: result => {
+      failedSetupResult(result);
+      const target = field === 'instanceRemoved' ? result.row.actorTrace : result.row;
+      if (value === undefined) delete target[field]; else target[field] = value;
+      if (field === 'instanceRemoved') result.row.observerStopped = false;
+    } });
+    const result = await runLinuxAppArmorComparison(pair, harness.adapters);
+    assert.equal(result.outcome, 'cleanup_failed'); assert.equal(result.profilesRemoved, false);
+    assert.ok(harness.calls.includes('remove:baseline:false')); assert.ok(!harness.calls.includes('remove:baseline:true'));
+    assert.ok(!harness.calls.includes('load:candidate'));
+  }
+});
+
 test('comparison changes only the explicit AppArmor selector among container security arguments', () => {
   const base = { role: 'current', nonce: 'a'.repeat(32), runnerRevision: 'b'.repeat(40) };
   const original = linuxMountContainerArguments({ ...base, name: 'tibotattle-mount-diagnosis-current-12345' });
@@ -893,7 +1084,7 @@ test('parser operations are bracketed by both bindings, including missing files 
   assert.deepEqual(failed, ['binding', 'operation', 'binding']);
 });
 
-test('comparison v3 keeps precise import refusals closed and cannot mislabel an unrelated failure or v1 receipt', async () => {
+test('comparison v5 keeps precise import refusals closed and cannot mislabel an unrelated failure or older receipt', async () => {
   for (const [provided, expected] of [['abi_missing', 'abi_missing'], ['abi_unsafe', 'abi_unsafe'], ['preprocess_failed', 'preprocess_failed'],
     ['include_remaining', 'include_remaining'], ['parser_config_changed', 'parser_config_changed'], ['private-error-marker', 'unknown'], [undefined, 'unknown']]) {
     const harness = comparisonHarness();
@@ -910,9 +1101,11 @@ test('comparison v3 keeps precise import refusals closed and cannot mislabel an 
   }
   assert.equal(linuxAppArmorImportFailure({ code: 'parser_unavailable', importFailure: 'abi_missing' }), 'none');
   const complete = await runLinuxAppArmorComparison(pair, comparisonHarness().adapters);
-  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v3'); assert.equal(complete.importFailure, 'none');
+  assert.equal(complete.schemaVersion, 'tibotattle-linux-apparmor-mount-comparison-v5'); assert.equal(complete.importFailure, 'none');
   for (const mutate of [v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v1'; },
-    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v2'; }, v => { delete v.basis.imports; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v2'; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v3'; },
+    v => { v.schemaVersion = 'tibotattle-linux-apparmor-mount-comparison-v4'; }, v => { delete v.basis.imports; },
     v => { v.basis.imports.path = '/private/abi-marker'; }, v => { v.basis.imports.abi40Sha256 = 'invalid'; },
     v => { v.importFailure = 'abi_missing'; }]) {
     const changed = structuredClone(complete); mutate(changed); assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);
