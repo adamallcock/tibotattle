@@ -1,0 +1,108 @@
+name: Linux exact AppImage mount diagnosis
+run-name: Linux mount-only diagnosis (${{ github.sha }})
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Validate intake or diagnose mounting exact images without launching Electron
+        type: choice
+        options: [plan, execute]
+        default: plan
+        required: true
+      intake:
+        description: Closed final-artifact intake with exact successful package and predecessor identities
+        type: string
+        required: true
+      confirmation:
+        description: Execute requires RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: electron-linux-final-qualification
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      LINUX_FINAL_INTAKE: ${{ inputs.intake }}
+      SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Check out exact reviewed diagnostic runner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up pinned native Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Require native x64 and an actual FUSE device
+        if: inputs.mode == 'execute'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -c /dev/fuse
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
+      - name: Install only locked verification dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Admit diagnostic confirmation and exact artifact intake
+        run: node scripts/diagnose-electron-linux-appimage-mount.mjs --preflight
+      - name: Check closed diagnostic, intake, workflow and tool ownership contracts
+        if: inputs.mode == 'execute'
+        run: node --test --test-concurrency=1 test/electron-linux-appimage-mount-diagnosis.test.mjs test/electron-linux-installed-lifecycle.test.js test/electron-linux-installed-files.test.mjs test/tool-inventory.test.js test/release-workflow-policy.test.js
+      - name: Download exact immutable predecessor and final package
+        if: inputs.mode == 'execute'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/diagnose-electron-linux-appimage-mount.mjs --acquire
+      - name: Inspect final bytes without rebuilding application source
+        if: inputs.mode == 'execute'
+        run: node scripts/diagnose-electron-linux-appimage-mount.mjs --prepare
+      - name: Build the unchanged isolated qualification environment
+        if: inputs.mode == 'execute'
+        env:
+          QUALIFICATION_RUNNER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node scripts/build-electron-linux-container.mjs --architecture amd64
+          docker build --platform=linux/amd64 --file containers/electron-linux-installed/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$QUALIFICATION_RUNNER" \
+            --tag tibotattle-electron-linux-installed:test .
+      - name: Diagnose predecessor then final mount with the existing container security boundary
+        if: inputs.mode == 'execute'
+        run: |
+          set -euo pipefail
+          umask 077
+          timeout 180s node scripts/diagnose-electron-linux-appimage-mount.mjs --execute
+      - name: Remove only recorded owned diagnostic containers after interruption
+        if: always() && inputs.mode == 'execute'
+        run: timeout 60s node scripts/diagnose-electron-linux-appimage-mount.mjs --cleanup
+      - name: Retain only closed diagnostic evidence
+        if: always() && inputs.mode == 'execute'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-linux-appimage-mount-diagnosis-${{ github.run_id }}
+          path: |
+            .release-build/linux-final-qualification/pair.json
+            .release-build/linux-final-qualification/mount-diagnosis.json
+          if-no-files-found: error
+          retention-days: 14
