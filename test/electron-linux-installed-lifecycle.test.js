@@ -99,10 +99,14 @@ const fuseRefusals = [
   ['FUSE_MOUNT_ROOT_INVALID', m => { m.mountinfo = m.mountinfo.replace('0:82 / ', '0:82 /subdir '); }],
   ['FUSE_MOUNT_READ_ONLY_REQUIRED', m => { m.mountinfo = m.mountinfo.replace('ro,nosuid', 'rw,nosuid'); }],
   ['FUSE_MOUNT_UID_INVALID', m => { m.mountinfo = m.mountinfo.replace('user_id=1000', 'user_id=0'); }],
-  ['FUSE_APPIMAGE_ENV_INVALID', m => { m.environment.APPIMAGE = '/tmp/other.AppImage'; }],
-  ['FUSE_APPIMAGE_ENV_INVALID', m => { delete m.environment.APPIMAGE; }],
-  ['FUSE_APPDIR_ENV_INVALID', m => { m.environment.APPDIR = '/tmp/other'; }],
-  ['FUSE_APPDIR_ENV_INVALID', m => { delete m.environment.APPDIR; }],
+  ['FUSE_APPIMAGE_ENV_MISMATCH', m => { m.environment.APPIMAGE = '/tmp/other.AppImage'; }],
+  ['FUSE_APPIMAGE_ENV_MISMATCH', m => { m.environment.APPIMAGE = ''; }],
+  ['FUSE_APPIMAGE_ENV_MISMATCH', m => { m.environment.APPIMAGE = null; }],
+  ['FUSE_APPIMAGE_ENV_MISSING', m => { delete m.environment.APPIMAGE; }],
+  ['FUSE_APPDIR_ENV_MISMATCH', m => { m.environment.APPDIR = '/tmp/other'; }],
+  ['FUSE_APPDIR_ENV_MISMATCH', m => { m.environment.APPDIR = ''; }],
+  ['FUSE_APPDIR_ENV_MISMATCH', m => { m.environment.APPDIR = null; }],
+  ['FUSE_APPDIR_ENV_MISSING', m => { delete m.environment.APPDIR; }],
   ['FUSE_EXTRACTION_MODE_FORBIDDEN', m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = '1'; }],
   ['FUSE_EXTRACTION_MODE_FORBIDDEN', m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = ''; }],
 ];
@@ -153,7 +157,7 @@ test('ordinary Node companion sharing the mounted executable is not mistaken for
   const node = appProcess('node');
   assert.equal(node.files.cmdline.split('\0').some(arg => arg.startsWith('--type=')), false);
   // The previous candidate path reached this strict FUSE check and aborted.
-  assert.throws(() => selectLinuxFinalFuseMount({ ...node.value, environment: node.environment }), /FUSE_APPIMAGE_ENV_INVALID/u);
+  assert.throws(() => selectLinuxFinalFuseMount({ ...node.value, environment: node.environment }), /FUSE_APPIMAGE_ENV_MISSING/u);
   assert.equal(await readLinuxFinalAppProcessIdentity(node.pid, node.expected, temporary, node.io), null);
   assert.ok(node.reads.includes('environ')); assert.ok(!node.reads.includes('mountinfo'));
   assert.deepEqual(node.hashes, []);
@@ -180,8 +184,12 @@ test('Node-mode markers can exclude a candidate but cannot qualify a browser or 
 
 test('real browser candidates still refuse wrong FUSE identity, extraction mode and credentials', async () => {
   for (const [code, alter] of [
-    ['FUSE_APPDIR_ENV_INVALID', v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; }],
-    ['FUSE_APPIMAGE_ENV_INVALID', v => { v.files.environ = `APPDIR=${mount}\0`; }],
+    ['FUSE_APPDIR_ENV_MISSING', v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; }],
+    ['FUSE_APPIMAGE_ENV_MISSING', v => { v.files.environ = `APPDIR=${mount}\0`; }],
+    ['FUSE_APPIMAGE_ENV_MISMATCH', v => { v.files.environ = `APPIMAGE=\0APPDIR=${mount}\0`; }],
+    ['FUSE_APPIMAGE_ENV_MISMATCH', v => { v.files.environ = `APPIMAGE=/tmp/other.AppImage\0APPDIR=${mount}\0`; }],
+    ['FUSE_APPDIR_ENV_MISMATCH', v => { v.files.environ = 'APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0APPDIR=\0'; }],
+    ['FUSE_APPDIR_ENV_MISMATCH', v => { v.files.environ = 'APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0APPDIR=/tmp/other\0'; }],
     ['FUSE_EXTRACTION_MODE_FORBIDDEN', v => { v.files.environ += 'APPIMAGE_EXTRACT_AND_RUN=1\0'; }],
     ['FUSE_MOUNT_TYPE_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('fuse.TiboTattle.AppImage', 'tmpfs'); }],
     ['FUSE_MOUNT_UID_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('user_id=1000', 'user_id=0'); }],
