@@ -208,12 +208,12 @@ measurements are ready. Browser results stay in memory only; restarting the app
 starts a fresh page cache. Speculative requests pause while the app document is
 hidden.
 
-If approved performance sharing is paused, **Community → Review performance
-sharing again** lets you review and renew its independent authorization. A valid
-renewal can resume an earlier authorization or response-version rejection while
-preserving upload progress. Opt-outs, disconnections and invalid measurements
-remain protected. Accountless sharing rechecks its protected preference and
-current hosted grant when the client restarts or that preference changes.
+Accountless performance sharing rechecks its protected sharing preference and
+current hosted grant when the desktop restarts or that preference changes. A
+current grant can resume an earlier authorization or response-version rejection
+while preserving acknowledged upload progress. Ordinary polling does not retry
+a terminal rejection. Recorded opt-outs and invalid measurements remain
+protected; local Model performance analysis is independent of hosted sharing.
 
 **Output speed** includes response-timed measurements plus eligible tool-free
 turn estimates from older logs. Each turn contributes once: covered response

@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { assertMacOSQualificationIdentity, deriveMacOSQualificationIdentity,
   parseMacOSQualificationEnvelope, preflightMacOSQualification } from '../scripts/lib/electron-macos-qualification-identity.mjs';
+import { resolveSignedMacOSBundleVersion } from '../scripts/macos-bundle-version.js';
 
 const sourceRevision = 'a'.repeat(40);
 const identity = { version: '0.1.24', bundleVersion: '1031', buildNumber: '2026091501',
@@ -33,6 +34,24 @@ test('future successor derives from package version and reviewed allocation with
   }
   assert.throws(() => deriveMacOSQualificationIdentity({ ...context(identity), resolveBundleVersion: () => null }),
     { reason: 'bundle_allocation' });
+});
+
+test('0.1.27 admission binds the reviewed allocation and independent provenance on both Mac architectures', () => {
+  for (const target of ['darwin-arm64', 'darwin-x64']) {
+    const selected = { ...identity, target, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' };
+    const selectedContext = { ...context(selected), packageVersion: '0.1.27', sourceVersion: '0.1.27',
+      resolveBundleVersion: resolveSignedMacOSBundleVersion };
+    assert.deepEqual(deriveMacOSQualificationIdentity(selectedContext), selected);
+    assert.deepEqual(assertMacOSQualificationIdentity(selected, selectedContext), selected);
+    for (const patch of [{ version: '0.1.26' }, { bundleVersion: '1034' },
+      { bundleVersion: selected.buildNumber }, { buildNumber: '2026092701' }]) {
+      assert.throws(() => assertMacOSQualificationIdentity({ ...selected, ...patch }, selectedContext));
+    }
+    assert.throws(() => deriveMacOSQualificationIdentity({ ...selectedContext,
+      packageVersion: '0.1.26' }), { reason: 'version' });
+    assert.throws(() => deriveMacOSQualificationIdentity({ ...selectedContext,
+      resolveBundleVersion: () => null }), { reason: 'bundle_allocation' });
+  }
 });
 
 test('stale intake version, allocation, source, build and target fail against independent candidate identity', () => {

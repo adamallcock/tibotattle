@@ -41,6 +41,9 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   // Owner-selected successor after the held 0.1.25 candidate. Allocation is
   // not signed, installed, or published release evidence.
   "0.1.26": Object.freeze({ stable: "1034" }),
+  // Successor to the published 0.1.26 release on both Mac architectures.
+  // Allocation remains separate from candidate provenance and release proof.
+  "0.1.27": Object.freeze({ stable: "1035" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

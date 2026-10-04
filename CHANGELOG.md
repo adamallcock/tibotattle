@@ -36,7 +36,27 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No changes yet.
+**Candidate notes:** [0.1.27](./release-notes/0.1.27.md)
+
+These changes are integrated in the 0.1.27 source candidate. They do not imply
+a signed installer, installed update, hosted activation, or public release.
+
+- Add distinct GPT-6.1 Sol recognition and supported API-equivalent prices.
+  Keep observed Ultrafast usage separate from Fast; unsupported model and speed
+  combinations remain explicitly unpriced. See [PR #257](https://github.com/adamallcock/tibotattle/pull/257).
+- Use Pro 10× and Pro Max 25× labels and configured expected allowance ratios,
+  preserving the existing Pro identity and history. Align Worker publication
+  normalization with that reference in [PR #258](https://github.com/adamallcock/tibotattle/pull/258);
+  hosted migration, activation, and production qualification remain separate.
+- Recheck performance-sharing authorization after restart or a sharing-preference
+  change, preserving acknowledged upload progress when recovering from a rejected
+  grant. The protected choice and current hosted grant still gate uploads.
+- Remove obsolete account, profile, and social controls from the shared dashboard
+  while retaining Electron desktop controls. Split project token mix into
+  separate input and output bars. See [PR #259](https://github.com/adamallcock/tibotattle/pull/259)
+  and [PR #260](https://github.com/adamallcock/tibotattle/pull/260).
+- Update Electron to 43.5.0 and refresh affected transitive dependencies for
+  security advisories.
 
 ## [0.1.26](./release-notes/0.1.26.md) - 2026-09-27
 
