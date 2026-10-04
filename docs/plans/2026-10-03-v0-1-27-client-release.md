@@ -39,9 +39,9 @@ remain separately gated; credentials do not authorize them.
 | Scope | Dashboard reader deferred; delivery answer pending | Exact client scope and publication boundary recorded |
 | Pro Max release contract | Passed source/released/installed vocabulary checks and focused tests | Current released/installed binary and upstream evidence reviewed; ledger lifecycle/provenance agree; required-binary contract check passes without claiming authoritative allowance/window capacities |
 | Packaging dependencies | Exact mitigation installed and tested; temporary exception remains inactive pending owner decision | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
-| Version/build allocation | Passed allocation/admission/export version and release-note checks: 0.1.27 / 1035 / 2026100301 | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
+| Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Confirmed old Worker rejects Pro Max; publication held for compatible hosted path | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
-| Source freeze | Reviewed client source frozen locally; pending exception activation is outside the R7 workload closure | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
+| Source freeze | Final runtime manifest alignment reviewed; freeze renewed before candidate staging and R7 | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Pinned environment ready; coordinating a window around the GCP owner's heavy local run | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Pending frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
 | Production candidates | Pending source and evidence gates | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
@@ -147,3 +147,18 @@ includes Pro Max intake, exact price cards, four-plan normalization and
 public/admin publication compatibility. The optional desktop dashboard reader
 deferral does not defer the separately owned website reader prerequisite.
 R7 remains held until the owner releases the local resource slot after seed.
+
+## Runtime version closure
+
+Actual production-source preparation at `0547e06f` refused the accounting
+workspace manifest: the root release was 0.1.27 while four coupled runtime
+packages still declared 0.1.26. No candidate receipt or runtime manifest was
+created. The existing deterministic runtime-staging regression reproduced this
+refusal, then passed after all four manifests advanced to 0.1.27. Independent
+i18n and Worker versions remain unchanged; the frozen lockfile did not change.
+
+Six focused package and staging suites passed 44/44, canonical telemetry and
+whitespace checks passed, and direct workspace runtime capture now returns all
+four packages at 0.1.27. This changes protected R7 workload inputs, so receipt
+regeneration must use the final manifest-aligned source. Successful production
+preparation and native installed qualification remain separate pending gates.
