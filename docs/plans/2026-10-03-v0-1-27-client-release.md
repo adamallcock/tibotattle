@@ -42,13 +42,13 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 |---|---|---|
 | Scope | Full four-platform release authorized; dashboard reader remains deferred | Exact client scope and publication boundary recorded |
 | Pro Max release contract | Passed source/released/installed vocabulary checks and focused tests | Current released/installed binary and upstream evidence reviewed; ledger lifecycle/provenance agree; required-binary contract check passes without claiming authoritative allowance/window capacities |
-| Packaging dependencies | Exact mitigation installed and tested; owner approved temporary exception, activation and fresh integrated proof in progress | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
+| Packaging dependencies | Approved exception active at bdc56099; independent review, live guard, recursive OSV and focused negative tests passed | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
-| Source freeze | Final runtime manifest alignment reviewed; freeze renewed before candidate staging and R7 | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
-| Retained R7 evidence | Pinned environment ready; coordinating a window around the GCP owner's heavy local run | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
-| Complete source/surface gates | Pending frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Both Mac source candidates staged at b2cefc8d; native, signed and installed artifact gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Source freeze | Initial freeze bdc56099 encountered the R7 manifest failure; additive export format fix required before final freeze | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
+| Retained R7 evidence | First protected attempt failed at a confirmed historical manifest-capacity mismatch; additive repair and full fresh retry required | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
+| Complete source/surface gates | Focused client/shared gates passed; complete gates pending repaired frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
+| Production candidates | Earlier Mac source stages retained; Apple notarization blocked by an unsigned/expired developer agreement; new-byte native gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
@@ -90,9 +90,10 @@ new execution; the earlier review is a dated snapshot, not release proof.
   adapter tests. Fresh OSV proves only the selected root advisory remains and
   that a root exception does not suppress an identical child-lock finding.
   The [security decision packet](../decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md)
-  was approved by the user for this candidate on October 3. Its workflow
-  verifies fixed scanner bytes and retains direct scanner failures; activation
-  and fresh integrated proof are proceeding under that approval.
+  was approved by the user for this candidate on October 3 and activated at
+  `bdc56099`. Independent review, the live guard, focused negative tests and a
+  fresh recursive OSV scan passed. Hosted Ubuntu workflow execution remains
+  a separate PR-CI gate.
 - Paused-sharing copy is cause-neutral in all three locales, because the
   renderer receives no cause. Both Community and Settings have focused
   rendering coverage; canonical i18n checks pass. Native rendering is pending.
@@ -151,7 +152,8 @@ R-MERGE lane, without a qualified live successor yet. Required hosted readback
 includes Pro Max intake, exact price cards, four-plan normalization and
 public/admin publication compatibility. The optional desktop dashboard reader
 deferral does not defer the separately owned website reader prerequisite.
-R7 remains held until the owner releases the local resource slot after seed.
+The hosted owner released the local resource slot and retained it for the complete
+R7 diagnosis and retry, with a 24 GiB free-disk floor and no heavy benchmark overlap.
 
 ## Runtime version closure
 
@@ -223,3 +225,34 @@ copy guards passed. Worker lock metadata is also aligned for the three local
 packages without changing external dependency resolutions; the root lockfile
 remains unchanged. Final release evidence requires the approved exception
 activation, R7 resource slot, hosted compatibility and remaining artifact gates.
+
+## October 4 execution update
+
+The first protected R7 attempt started at 02:34 UTC on clean `bdc56099`.
+All six synthetic runtime/profile runs passed. The first real-history lifecycle
+stopped at `internal_export_set_manifest_validation`; no complete receipt set
+was installed. The generator completed its owned cleanup, its journal was absent,
+and the driver had exited. The tracked source remained clean.
+
+An aggregate-only run through the same bounded source-plan API confirmed 5,281
+source files for the frozen 31-day selection. The reviewed runtime permits
+100,000, but the immutable export-set v0.2 manifest permits only 5,000. A tiny
+synthetic manifest reproduces the exact failure at 5,001. The mismatch dates to
+PR #39's runtime capacity increase, rather than the 0.1.27 compatibility tuple.
+The repair must add export-set v0.3 for the existing runtime capacity, preserve
+v0.1/v0.2 schema bytes and readers, and qualify verification, receipts, deletion
+and resume. Do not change resource ceilings, shorten the historical interval or
+reuse partial R7 results. A complete fresh matrix follows the reviewed repair.
+
+Apple's existing notarization profile returns HTTP 403 because a required
+developer legal agreement is missing or expired. The owner has been asked to
+review and accept it on return. Signing preparation, Windows/Linux source work
+and other independent checks continue; no notarization or publication is claimed.
+
+The hosted correction owner confirmed no concrete client wire/source prerequisite
+for the bounded server-only repair. Tagging can proceed after the local source
+gates; hosted implementation and unchanged-client-flow qualification still block
+publication. Separately, a reviewed Linux runner is being prepared to exercise
+the ordinary final AppImage FUSE launcher and exact published 0.1.26 replacement.
+It must prove the full native lifecycle before asserting clean-install success,
+while retaining the separate unqualified physical-desktop scope.
