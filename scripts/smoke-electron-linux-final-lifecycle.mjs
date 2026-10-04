@@ -249,6 +249,36 @@ export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
     ? errorCode : 'LINUX_FINAL_LIFECYCLE_RUNTIME_FAILED',
   ...(diagnostic === null ? {} : { startupDiagnostic: diagnostic }) };
 }
+/** The shared smoke retains its late-network stage while beforeQuit runs. Keep
+ * failures from these final-lifecycle checks distinct, after its cleanup runs. */
+export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSandbox, preferences, noUpdate, preserveState = null }) {
+  if (![run, readIdentity, assertSandbox, preferences, noUpdate].every(value => typeof value === 'function')
+    || preserveState !== null && typeof preserveState !== 'function') fail('NORMAL_HOOK_INVALID');
+  let hookFailure = null, entered = false, completed = false, identity;
+  const check = async (code, action) => {
+    try { return await action(); }
+    catch { hookFailure = code; fail(code); }
+  };
+  try {
+    await run(async context => {
+      if (entered) { hookFailure = 'NORMAL_HOOK_INVALID'; fail(hookFailure); }
+      entered = true;
+      identity = await check('NORMAL_APP_IDENTITY_FAILED', readIdentity);
+      await check('NORMAL_RENDERER_SANDBOX_FAILED', () => assertSandbox(identity));
+      await check('NORMAL_PREFERENCES_FAILED', () => preferences(context));
+      await check('NORMAL_NO_UPDATE_FAILED', () => noUpdate(context, identity));
+      if (preserveState !== null) await check('NORMAL_LOCAL_STATE_FAILED', preserveState);
+      completed = true;
+    });
+  } catch (error) {
+    if (hookFailure !== null) fail(hookFailure);
+    throw error;
+  }
+  // An adapter may not turn a swallowed or omitted hook into qualification.
+  if (hookFailure !== null) fail(hookFailure);
+  if (!completed) fail('NORMAL_HOOK_UNPROVEN');
+  return identity;
+}
 export async function runLinuxFinalLifecycle() {
   const contract = assertContainerContract();
   const nonce = process.env.TIBOTATTLE_LINUX_FINAL_NONCE, temporary = linuxFinalTemporary(nonce);
@@ -309,19 +339,18 @@ export async function runLinuxFinalLifecycle() {
     stage = 'fresh_final_install';
     const clean = await fixtureWithDefaultProfile(); owned.push(clean);
     await trustFixture(clean, cert); await installImage(join(inputs, 'next.AppImage'), pair.images.next);
-    let cleanIdentity;
     const identity = { sourceRevision: pair.intake.runnerRevision, artifactSha256: pair.images.next.asarSha256 };
-    const runNormal = (fixture, beforeQuit) => runOneNormalApp(identity, {
-      appPath: IMAGE, environment: launchEnvironment(fixture, cert, temporary), fixture,
-      preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
-      run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
-        onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
+    const runNormal = (fixture, preferences, preserveState = null) => runLinuxFinalNormalJourney({
+      run: beforeQuit => runOneNormalApp(identity, {
+        appPath: IMAGE, environment: launchEnvironment(fixture, cert, temporary), fixture,
+        preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
+        run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
+          onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
+      }),
+      readIdentity: () => currentApp(pair.images.next, temporary), assertSandbox: assertRendererSandbox,
+      preferences, noUpdate: (context, browser) => proveNoUpdate(context.cdp, context.dashboardOrigin, browser), preserveState,
     });
-    await runNormal(clean, async context => {
-      cleanIdentity = await currentApp(pair.images.next, temporary); await assertRendererSandbox(cleanIdentity);
-      await persistLinuxNormalPackagedRestartPreferences(context);
-      await proveNoUpdate(context.cdp, context.dashboardOrigin, cleanIdentity);
-    });
+    const cleanIdentity = await runNormal(clean, persistLinuxNormalPackagedRestartPreferences);
     await assertNoOwnedMounts(temporary);
     if (await alive(cleanIdentity)) fail('CLEAN_QUIT_FAILED');
     await checkedCheckpoint(clean);
@@ -400,10 +429,7 @@ export async function runLinuxFinalLifecycle() {
     receipt.publicPredecessorUpdate = 'exact_published_0.1.26_to_final_0.1.27';
     receipt.replacementAndAutomaticRestartVerified = true;
     stage = 'cold_restart_no_update';
-    await runNormal(upgradeFixture, async context => {
-      const restarted = await currentApp(pair.images.next, temporary); await assertRendererSandbox(restarted);
-      await verifyLinuxNormalPackagedRestartPreferences(context);
-      await proveNoUpdate(context.cdp, context.dashboardOrigin, restarted);
+    await runNormal(upgradeFixture, verifyLinuxNormalPackagedRestartPreferences, async () => {
       if (!isDeepStrictEqual(beforeScope, await checkedCheckpoint(upgradeFixture)) || await digest(rawFixture) !== rawBefore) fail('LOCAL_STATE_NOT_PRESERVED');
     });
     await assertNoOwnedMounts(temporary);

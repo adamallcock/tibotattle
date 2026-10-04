@@ -6,7 +6,8 @@ import { productionElectronCandidatePlan } from '../scripts/package-electron-pro
 import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
-  linuxFinalTemporary, assertLinuxFinalOwnedPolicy } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
 function fixture() {
@@ -158,4 +159,97 @@ test('wrong-checksum observation requires a completed transfer, download failure
   for (const change of [{ completedTransfers: 0 }, { installedSha256: 'b'.repeat(64) },
     { update: { ...value.update, canInstall: true } }, { update: { ...value.update, error: 'check_failed' } },
     { update: { ...value.update, status: 'downloaded' } }]) assert.throws(() => assertLinuxFinalChecksumRejection({ ...value, ...change }), /CHECKSUM_REFUSAL_UNPROVEN/u);
+});
+
+function normalJourney({ failureAt = null, smokeFailure = null, preserveState = true } = {}) {
+  const events = [], identity = Object.freeze({ pid: 50, startTime: '100' });
+  const context = Object.freeze({ cdp: {}, dashboardOrigin: 'http://127.0.0.1:12345', fixture: {} });
+  const action = name => {
+    events.push(name);
+    if (failureAt === name) throw Object.assign(new Error('synthetic detail must remain private'), { code: 'PRIVATE_SYNTHETIC_DETAIL' });
+  };
+  const run = beforeQuit => runOneNormalApp({ sourceRevision: revision, artifactSha256: 'a'.repeat(64) }, {
+    appPath: '/synthetic/TiboTattle.AppImage', environment: {}, service: 'available', beforeQuit,
+    run: async options => {
+      let stage = 'renderer_late_network';
+      try {
+        if (smokeFailure === 'network') throw new Error('synthetic network refusal');
+        await options.beforeQuit(context);
+        stage = 'quit_cleanup';
+        if (smokeFailure === 'cleanup') throw new Error('synthetic cleanup refusal');
+        return { status: 'passed' };
+      } catch (error) { options.onFailureStage(stage); throw error; }
+      finally { events.push('cleanup'); }
+    },
+  });
+  return { events, identity, context, run, options: {
+    run,
+    readIdentity: async () => { action('identity'); return identity; },
+    assertSandbox: async value => { assert.equal(value, identity); action('sandbox'); },
+    preferences: async value => { assert.equal(value, context); action('preferences'); },
+    noUpdate: async (value, browser) => { assert.equal(value, context); assert.equal(browser, identity); action('no_update'); },
+    preserveState: preserveState ? async () => { action('state'); } : null,
+  } };
+}
+
+test('final lifecycle reports the actual hook substep after shared smoke cleanup instead of its stale network stage', async () => {
+  const original = normalJourney();
+  await assert.rejects(original.run(async () => { throw new Error('synthetic identity refusal'); }), {
+    code: 'ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_LATE_NETWORK_FAILED',
+  });
+  assert.deepEqual(original.events, ['cleanup']);
+  const steps = ['identity', 'sandbox', 'preferences', 'no_update', 'state'];
+  const codes = ['NORMAL_APP_IDENTITY_FAILED', 'NORMAL_RENDERER_SANDBOX_FAILED', 'NORMAL_PREFERENCES_FAILED',
+    'NORMAL_NO_UPDATE_FAILED', 'NORMAL_LOCAL_STATE_FAILED'];
+  for (const [index, failureAt] of steps.entries()) {
+    const value = normalJourney({ failureAt });
+    await assert.rejects(runLinuxFinalNormalJourney(value.options), error => {
+      const errorCode = `LINUX_FINAL_LIFECYCLE_${codes[index]}`;
+      assert.equal(error.code, errorCode); assert.equal(error.message, errorCode);
+      assert.deepEqual(linuxFinalFailureDetails(error.code, null), { errorCode });
+      assert.doesNotMatch(JSON.stringify(error), /synthetic detail|PRIVATE_SYNTHETIC_DETAIL/u);
+      assert.deepEqual(value.events, [...steps.slice(0, index + 1), 'cleanup']);
+      return true;
+    });
+  }
+});
+
+test('both final normal journeys retain identity, sandbox, preferences and no-update checks before clean completion', async () => {
+  for (const preserveState of [false, true]) {
+    const value = normalJourney({ preserveState });
+    assert.equal(await runLinuxFinalNormalJourney(value.options), value.identity);
+    assert.deepEqual(value.events, ['identity', 'sandbox', 'preferences', 'no_update', ...(preserveState ? ['state'] : []), 'cleanup']);
+  }
+});
+
+test('final hook diagnostics do not relabel genuine network or subsequent cleanup failures', async () => {
+  for (const [smokeFailure, code, expected] of [
+    ['network', 'RENDERER_LATE_NETWORK', ['cleanup']],
+    ['cleanup', 'QUIT_CLEANUP', ['identity', 'sandbox', 'preferences', 'no_update', 'state', 'cleanup']],
+  ]) {
+    const value = normalJourney({ smokeFailure });
+    await assert.rejects(runLinuxFinalNormalJourney(value.options), {
+      code: `ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_${code}_FAILED`,
+    });
+    assert.deepEqual(value.events, expected);
+  }
+});
+
+test('final normal journey refuses omitted, swallowed, repeated or invalid hooks', async () => {
+  const omitted = normalJourney();
+  await assert.rejects(runLinuxFinalNormalJourney({ ...omitted.options, run: async () => {} }), /NORMAL_HOOK_UNPROVEN/u);
+  assert.deepEqual(omitted.events, []);
+  const swallowed = normalJourney({ failureAt: 'sandbox' });
+  await assert.rejects(runLinuxFinalNormalJourney({ ...swallowed.options, run: async hook => {
+    try { await hook(swallowed.context); } catch { /* Simulate a faulty adapter. */ }
+  } }), /NORMAL_RENDERER_SANDBOX_FAILED/u);
+  assert.deepEqual(swallowed.events, ['identity', 'sandbox']);
+  const repeated = normalJourney();
+  await assert.rejects(runLinuxFinalNormalJourney({ ...repeated.options, run: async hook => {
+    await hook(repeated.context); await hook(repeated.context);
+  } }), /NORMAL_HOOK_INVALID/u);
+  assert.deepEqual(repeated.events, ['identity', 'sandbox', 'preferences', 'no_update', 'state']);
+  for (const key of ['run', 'readIdentity', 'assertSandbox', 'preferences', 'noUpdate', 'preserveState']) {
+    await assert.rejects(runLinuxFinalNormalJourney({ ...normalJourney().options, [key]: 'invalid' }), /NORMAL_HOOK_INVALID/u);
+  }
 });
