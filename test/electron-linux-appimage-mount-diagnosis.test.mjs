@@ -5,7 +5,7 @@ import test from 'node:test';
 import { LINUX_MOUNT_DIAGNOSIS_SCHEMA, LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, LINUX_MOUNT_KMSG_READER,
   normalizeLinuxMountPolicy, createLinuxMountErrorClassifier, selectLinuxMountProbeMount,
   validateLinuxMountDiagnosis, runLinuxMountSequence, linuxMountPreflightEnvironment,
-  linuxMountContainerArguments, linuxMountCleanupArguments, linuxMountOwnedProcessGone, correlateLinuxMountAudit } from '../scripts/diagnose-electron-linux-appimage-mount.mjs';
+  linuxMountContainerArguments, linuxMountCleanupArguments, linuxMountOwnedProcessGone, linuxMountAuditReaderReason, correlateLinuxMountAudit } from '../scripts/diagnose-electron-linux-appimage-mount.mjs';
 
 const temporary = '/opt/tibotattle-updater-exec/tmp/' + 'a'.repeat(32);
 const image = '/opt/tibotattle-updater-exec/TiboTattle.AppImage';
@@ -26,11 +26,11 @@ function probe() {
 const pair = { intake: { runnerRevision: 'b'.repeat(40), sourceRevision: 'c'.repeat(40) },
   images: { current: { sha256: 'd'.repeat(64), bytes: 8192 }, next: { sha256: 'e'.repeat(64), bytes: 8193 } } };
 function row(role, changes = {}) { return { role, artifactSha256: pair.images[role].sha256, artifactBytes: pair.images[role].bytes,
-  probe: probe(), errorCode: 'none', appArmorMountDenial: 'unavailable', containerRemoved: true, observerStopped: true, ...changes }; }
+  probe: probe(), errorCode: 'none', appArmorMountDenial: 'unavailable', appArmorAuditReason: 'no_observed_mount_denial', containerRemoved: true, observerStopped: true, ...changes }; }
 function auditFixture() {
   return { profile: 'docker-default', temporary, start: 100, end: 200,
     observations: new Map([[77, { start: '123', ambiguous: false, first: 120, last: 180 }]]),
-    audit: { ready: true, closed: true, complete: true, start: 90, end: 210, records: [
+    audit: { ready: true, closed: true, complete: true, reason: 'none', start: 90, end: 210, records: [
       { time: 150, message: `audit: type=1400 audit(1790000000.123:44): apparmor="DENIED" operation="mount" profile="docker-default" name="${target}/" pid=77 comm="fusermount" srcname="${image}" fstype="fuse" flags="rw, nosuid, nodev"` },
     ] } };
 }
@@ -69,11 +69,66 @@ test('actual capability bits and policy availability remain independent of reque
 test('C-locale error classes span chunks but never retain private stderr or classify discarded text', () => {
   const classifier = createLinuxMountErrorClassifier(); classifier.feed('fusermount: mount failed: Operation not '); classifier.feed('permitted\nprivate-command-marker\n');
   const result = classifier.finish(); assert.equal(result.operationNotPermitted, true); assert.equal(result.unknown, true);
-  assert.doesNotMatch(JSON.stringify(result), /private-command-marker|fusermount|Operation not/u);
+  assert.doesNotMatch(JSON.stringify(result), /private-command-marker|fusermount:|Operation not/u);
   for (const text of ['x'.repeat(2047) + '😀Operation not permitted\n', 'x'.repeat(65536) + '\nPermission denied\n']) {
     const bounded = createLinuxMountErrorClassifier(); bounded.feed(text); const result = bounded.finish();
     assert.equal(result.operationNotPermitted, false); assert.equal(result.permissionDenied, false); assert.equal(result.truncated, true);
   }
+});
+
+test('known C-locale templates pair the originating component with its own errno across every chunk split', () => {
+  const templates = {
+    directFuseMount: 'fuse: mount failed: ', fusermountExec: 'fuse: failed to exec fusermount: ',
+    fusermountMount: 'fusermount: mount failed: ', runtimeMountDirectoryOpen: 'open dir error: ',
+  };
+  for (const [stage, prefix] of Object.entries(templates)) {
+    for (const [text, expected] of [['Permission denied', 'EACCES'], ['Operation not permitted', 'EPERM'], ['No such file or directory', 'ENOENT'], ['Bad file descriptor', 'other']]) {
+      const line = `${prefix}${text}\n`;
+      for (let boundary = 1; boundary < line.length; boundary++) {
+        const classifier = createLinuxMountErrorClassifier();
+        classifier.feed(Buffer.from(line.slice(0, boundary))); classifier.feed(Buffer.from(line.slice(boundary)));
+        assert.deepEqual(classifier.finish().stages, Object.fromEntries(Object.keys(templates).map(key => [key, key === stage ? expected : 'not_observed'])));
+      }
+    }
+  }
+});
+
+test('identical generic flags remain distinguishable without mistaking secondary directory failure for mount errno', () => {
+  const classify = prefix => {
+    const classifier = createLinuxMountErrorClassifier();
+    classifier.feed(`${prefix}Permission denied\nopen dir error: No such file or directory\n`);
+    return classifier.finish();
+  };
+  const direct = classify('fuse: mount failed: '), exec = classify('fuse: failed to exec fusermount: ');
+  for (const value of [direct, exec]) {
+    assert.equal(value.permissionDenied, true); assert.equal(value.missingFile, true);
+    assert.equal(value.stages.runtimeMountDirectoryOpen, 'ENOENT');
+    assert.equal(value.stages.fusermountMount, 'not_observed');
+  }
+  assert.equal(direct.stages.directFuseMount, 'EACCES'); assert.equal(direct.stages.fusermountExec, 'not_observed');
+  assert.equal(exec.stages.fusermountExec, 'EACCES'); assert.equal(exec.stages.directFuseMount, 'not_observed');
+  const repeated = createLinuxMountErrorClassifier();
+  repeated.feed('fuse: mount failed: Operation not permitted\nfuse: mount failed: Operation not permitted\n');
+  assert.equal(repeated.finish().stages.directFuseMount, 'EPERM');
+  repeated.feed('fuse: mount failed: Permission denied\nfuse: mount failed: Operation not permitted\n');
+  assert.equal(repeated.finish().stages.directFuseMount, 'ambiguous');
+});
+
+test('stage recognition refuses unrelated, incomplete, oversized or over-budget templates and retains no captures', () => {
+  for (const text of ['prefix fuse: mount failed: Permission denied\n', 'fuse: failed to exec /private/helper-marker: Permission denied\n',
+    'fuse: mount failed:\nPermission denied\n', 'open dir error:\nNo such file or directory\n',
+    'x'.repeat(2047) + '😀fuse: mount failed: Permission denied\n', '\n'.repeat(65536) + 'fuse: mount failed: Permission denied\n']) {
+    const classifier = createLinuxMountErrorClassifier(); classifier.feed(text);
+    const result = classifier.finish();
+    assert.ok(Object.values(result.stages).every(value => value === 'not_observed'));
+    assert.doesNotMatch(JSON.stringify(result), /private|helper-marker|Permission denied|No such file/u);
+  }
+  const suffix = 'fuse: mount failed: Permission denied', cut = createLinuxMountErrorClassifier();
+  cut.feed('\n'.repeat(65536 - Buffer.byteLength(suffix)) + suffix + ' private-unseen-tail\n');
+  assert.equal(cut.finish().stages.directFuseMount, 'not_observed'); assert.equal(cut.finish().truncated, true);
+  const unknown = createLinuxMountErrorClassifier(); unknown.feed('fuse: mount failed: private-errno-marker\n');
+  const result = unknown.finish(); assert.equal(result.stages.directFuseMount, 'other'); assert.equal(result.unknown, true);
+  assert.doesNotMatch(JSON.stringify(result), /private-errno-marker/u);
 });
 
 test('only one exact owned nonce-directory FUSE mount can be selected for cleanup', () => {
@@ -88,11 +143,11 @@ test('only one exact owned nonce-directory FUSE mount can be selected for cleanu
 });
 
 test('an AppArmor positive requires an owned PID identity, bounded window, active profile and exact nonce/source', () => {
-  assert.equal(correlateLinuxMountAudit(auditFixture()), true);
+  assert.deepEqual(correlateLinuxMountAudit(auditFixture()), { denial: true, reason: 'owned_mount_denial' });
   for (const [fstype, source] of [['fuse.squashfuse', 'squashfuse'], ['fuse.TiboTattle.AppImage', 'TiboTattle.AppImage']]) {
     const input = auditFixture();
     input.audit.records[0].message = input.audit.records[0].message.replace('fstype="fuse"', `fstype="${fstype}"`).replace(`srcname="${image}"`, `srcname="${source}"`);
-    assert.equal(correlateLinuxMountAudit(input), true);
+    assert.equal(correlateLinuxMountAudit(input).denial, true);
   }
   for (const mutate of [
     v => { v.audit.ready = false; }, v => { v.audit.closed = false; }, v => { v.audit.complete = false; },
@@ -107,7 +162,43 @@ test('an AppArmor positive requires an owned PID identity, bounded window, activ
     v => { v.audit.records[0].message = v.audit.records[0].message.replace('srcname="' + image, 'srcname="/unrelated.AppImage'); },
     v => { v.audit.records[0].message = v.audit.records[0].message.replace(temporary, temporary.replace(/a/gu, 'b')); },
     v => { v.audit.records[0].message = v.audit.records[0].message.replace('.mount_TiboTa123456', '.mount_TiboTa\\040123456'); },
-  ]) { const input = auditFixture(); mutate(input); assert.equal(correlateLinuxMountAudit(input), 'unavailable'); }
+  ]) { const input = auditFixture(); mutate(input); assert.equal(correlateLinuxMountAudit(input).denial, 'unavailable'); }
+});
+
+test('reader failure reasons come from concrete closed observer boundaries and cannot report raw failures', () => {
+  const base = { spawnFailed: false, stopped: true, exitCode: 0, valid: true, ready: true, closed: true, complete: true, readerReason: 'none' };
+  assert.equal(linuxMountAuditReaderReason(base), 'none');
+  for (const [changes, expected] of [
+    [{ spawnFailed: true }, 'observer_start_failed'], [{ stopped: false }, 'reader_timeout'],
+    [{ exitCode: 124 }, 'reader_timeout'], [{ exitCode: 137 }, 'reader_failed'],
+    [{ valid: false }, 'reader_failed'], [{ closed: false }, 'reader_failed'],
+    [{ ready: false, closed: false }, 'observer_start_failed'], [{ exitCode: 1 }, 'reader_failed'],
+    [{ complete: false }, 'reader_failed'], [{ readerReason: 'private-reader-marker' }, 'reader_failed'],
+  ]) assert.equal(linuxMountAuditReaderReason({ ...base, ...changes }), expected);
+  for (const reason of ['kmsg_open_denied', 'kmsg_open_unavailable', 'reader_failed', 'reader_timeout', 'stream_incomplete']) {
+    assert.equal(linuxMountAuditReaderReason({ ...base, ready: false, complete: false, readerReason: reason }), reason);
+  }
+});
+
+test('unavailable audit reasons preserve uncertainty and require actor ownership before naming unknown source shape', () => {
+  for (const [mutate, expected] of [
+    [v => { v.audit.ready = false; v.audit.complete = false; v.audit.reason = 'kmsg_open_denied'; }, 'kmsg_open_denied'],
+    [v => { v.audit.complete = false; v.audit.reason = 'stream_incomplete'; }, 'stream_incomplete'],
+    [v => { v.audit.reason = 'reader_failed'; }, 'reader_failed'],
+    [v => { v.profile = null; }, 'profile_unavailable'],
+    [v => { v.observations.clear(); }, 'probe_identity_unavailable'],
+    [v => { v.audit.start = 101; }, 'audit_window_incomplete'],
+    [v => { v.audit.records = []; }, 'no_observed_mount_denial'],
+    [v => { v.profile = 'unrelated-profile'; }, 'no_correlated_mount_denial'],
+    [v => { v.observations.get(77).first = 151; }, 'owned_actor_not_correlated'],
+    [v => { v.audit.records[0].message = v.audit.records[0].message.replace(image, '/private/source-marker'); }, 'owned_target_source_unrecognized'],
+    [v => { v.observations.get(77).first = 151; v.audit.records[0].message = v.audit.records[0].message.replace(image, '/private/source-marker'); }, 'owned_actor_not_correlated'],
+    [v => { v.audit.records[0].message += ' pid=77'; }, 'match_ambiguous'],
+  ]) {
+    const input = auditFixture(); mutate(input); const result = correlateLinuxMountAudit(input);
+    assert.deepEqual(result, { denial: 'unavailable', reason: expected });
+    assert.doesNotMatch(JSON.stringify(result), /private|unrelated-profile|docker-default|\.mount_|\/opt\/|"pid"|"start"/u);
+  }
 });
 
 test('serial exact-byte comparison stops before the second image when owned container cleanup is unproven', async () => {
@@ -121,11 +212,14 @@ test('serial exact-byte comparison stops before the second image when owned cont
   assert.equal(observer.cases.length, 1);
   await assert.rejects(runLinuxMountSequence(pair, async role => row(role, { artifactSha256: 'f'.repeat(64) })), /REFUSED/u);
   for (const mutate of [
-    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; },
+    v => { v.qualifiesRelease = true; }, v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-v1'; }, v => { v.schemaVersion = 'tibotattle-linux-appimage-mount-diagnosis-v1'; },
     v => { v.cases[0].probe.environment.appArmor.profile = 'private-profile-marker'; },
     v => { v.cases[0].probe.environment.pid = 77; }, v => { v.cases[0].probe.mount = target; },
     v => { v.cases[0].probe.launcherErrors.raw = 'private-stderr-marker'; }, v => { v.cases[0].probe.startup.process.pid = 77; },
-    v => { v.cases[0].appArmorMountDenial = 'possibly'; }, v => { v.cases[0].containerRemoved = false; }, v => { v.cases[0].observerStopped = false; },
+    v => { v.cases[0].appArmorMountDenial = 'possibly'; }, v => { v.cases[0].appArmorMountDenial = false; },
+    v => { v.cases[0].appArmorAuditReason = 'private-audit-marker'; }, v => { v.cases[0].appArmorAuditReason = 'owned_mount_denial'; },
+    v => { v.cases[0].probe.launcherErrors.stages.fusermountExec = 'private-error-marker'; },
+    v => { v.cases[0].probe.launcherErrors.stages.path = '/private/unowned'; }, v => { v.cases[0].containerRemoved = false; }, v => { v.cases[0].observerStopped = false; },
   ]) { const changed = structuredClone(result); mutate(changed); assert.equal(validateLinuxMountDiagnosis(changed), null); }
   assert.doesNotMatch(JSON.stringify(result), /private-profile-marker|private-stderr-marker|\.mount_|\/opt\/|"pid"|"start"|comm|nonce/u);
 });
@@ -179,12 +273,13 @@ test('diagnostic Docker security arguments match the existing lifecycle and keep
   assert.match(source, /LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C'/u);
   assert.doesNotMatch(source, /--appimage-extract|--no-sandbox|--disable-setuid-sandbox|apparmor=unconfined|seccomp=unconfined/u);
   assert.match(source, /'--cidfile'/u);
+  assert.match(source, /audit = beginKernelObserver\(initPid\); row\.observerStopped = false; row\.appArmorAuditReason = 'not_evaluated'/u);
   assert.match(source, /const stopped = await waitUntil\(\(\) => exited, 35000\)/u);
   assert.match(source, /copyFile\(source, IMAGE, constants\.COPYFILE_EXCL\)/u);
   assert.match(source, /installed\.sha256 !== expected\.sha256 \|\| installed\.bytes !== expected\.bytes/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /os\.O_RDONLY \| os\.O_NONBLOCK/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /os\.lseek\(fd, 0, os\.SEEK_END\)/u);
-  assert.match(LINUX_MOUNT_KMSG_READER, /sequence != last \+ 1: complete = False/u);
+  assert.match(LINUX_MOUNT_KMSG_READER, /sequence != last \+ 1: incomplete\('stream_incomplete'\)/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /used > 262144/u);
   assert.match(LINUX_MOUNT_KMSG_READER, /priority >> 3 == 0/u);
   const workflow = await readFile(new URL('../.github/workflows/electron-linux-appimage-mount-diagnosis.yml', import.meta.url), 'utf8');
