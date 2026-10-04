@@ -45,7 +45,7 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 | Packaging dependencies | Approved exception active; newly published 4.3.0 reviewed at 4b43f2ae without changing the mitigation; fresh hosted OSV passed | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
-| Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
+| Source freeze | Reviewed source and R7 runtime inputs frozen; final documentation prepared for October 5 UTC; tag and exact final builds still pending | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Complete protected retry finished at 04:28:59 UTC; all ten receipts validated and both exact-runtime freshness checks passed | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Complete client/shared suite passed 5,885 tests with zero failures and 44 existing skips; Worker dry packaging and staging checks passed | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
 | Production candidates | Four-target unsigned preparation verified; private signed ARM 104d39b1 passed hosted clean-install, credential and native Sparkle journeys; final dated artifacts remain | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
@@ -554,3 +554,26 @@ value failures. They are added to the existing read-only hosted release checks;
 local execution remains deferred while the hosted seed owns the Mac resources.
 Source review and hosted test/native results are recorded separately as they
 complete. Final signed bytes still require their own qualification.
+
+## October 4 source and build scheduling
+
+Final source preparation targets publication on October 5, 2026 UTC. This is a
+planned publication day, not a claim that publication or hosted qualification
+has completed. It supersedes the earlier operational choice to await a firm
+hosted window before freezing client source. The maintained release order permits
+final dated notes, annotated source tag and native builds ahead of backend
+qualification; the final public GitHub publication day must still match the
+frozen changelog. Do not move a frozen tag or relabel artifact evidence if that
+day is missed.
+
+The existing hosted owner confirmed no new client runtime prerequisite for the
+server correction. Its bootstrap and rehearsal registration are covered by the
+user's end-to-end release and deployment approvals. Final publication remains
+held on actual hosted compatibility, final native artifact qualification and
+release evidence. Remote platform preparation can proceed in parallel; local
+Mac packaging and signing require a coordinated resource window.
+
+The signed pre-tag ARM candidate passed installed historical unknown-to-Sol
+repair, exact pricing, repeat refresh and two-restart retention in hosted run
+37205229391. Independent receipt review passed. This is evidence for that exact
+candidate only; final source and artifact bytes require their own qualification.

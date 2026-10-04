@@ -36,10 +36,13 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**Candidate notes:** [0.1.27](./release-notes/0.1.27.md)
+No unreleased changes.
 
-These changes are integrated in the 0.1.27 source candidate. They do not imply
-a signed installer, installed update, hosted activation, or public release.
+## [0.1.27](./release-notes/0.1.27.md) - 2026-10-05
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.27) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.27) ·
+[changes since v0.1.26](https://github.com/adamallcock/tibotattle/compare/v0.1.26...v0.1.27)
 
 - Add distinct GPT-6.1 Sol recognition and supported API-equivalent prices.
   Keep observed Ultrafast usage separate from Fast; unsupported model and speed
