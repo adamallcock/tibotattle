@@ -14,6 +14,8 @@ import { verifyPredecessor, refreshProductionUpdateArchiveIndex } from './smoke-
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp, signedStagingFixture } from './run-signed-electron-staging.mjs';
 import { CREDENTIAL_FIXTURE_CASES, CREDENTIAL_FIXTURE_REQUIREMENT } from './prepare-electron-macos-credential-fixture.mjs';
 import { activateMacOSCredentialPfGuard, MACOS_PF_CREDENTIAL_MODE } from './lib/macos-pf-credential-qualification.mjs';
+import { prepareHistoricalSolFixture, observeHistoricalSolPass,
+  historicalSolQualificationReceipt, readHistoricalSolRefreshId } from './lib/macos-historical-sol-qualification.mjs';
 import { desktopFirstRunDialogCopy } from '../apps/electron/desktop-first-run.js';
 
 export { MAC_CREDENTIAL_CONFIRMATION, validateMacCredentialIntake, parseMacCredentialArguments } from './lib/macos-credential-qualification-intake.mjs';
@@ -395,7 +397,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     predecessorFirstRunCompleted: false,
     predecessorKeychainIdentity: null,
     predecessorCredentialAudit: null,
-    applicationBytesUnchanged: false, cases: [], fixtureScopes: [], failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
+    applicationBytesUnchanged: false, cases: [], fixtureScopes: [], historicalSolUpgrade: null,
+    failureStage: null, failurePhase: null, failureDiagnostics: null, fixtureFailure: null,
     nativeLegacyMigrationQualified: false, hostedUploadQualified: false, timeoutQualified: false,
     lockedStoreQualified: false, deniedStoreQualified: false, legacyOnlyQualified: false,
     nativeCleanQuitQualified: false, partialMigrationQualified: false,
@@ -500,6 +503,8 @@ export async function runMacCredentialQualification({ intake, execute = false })
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
     proof.predecessorKeychainIdentity.afterOptOut = await sameKeychain();
+    const predecessorRefreshId = input.version === '0.1.27'
+      ? await readHistoricalSolRefreshId(active.dashboard) : null;
     await stopOwnedMacSharingApp(active); active = null;
     proof.predecessorKeychainIdentity.afterStop = await sameKeychain();
     proof.predecessorCredentialAudit.afterStop = (await fixture.request('audit')).audit;
@@ -508,6 +513,16 @@ export async function runMacCredentialQualification({ intake, execute = false })
     }
     await fixture.request('attest');
     if (JSON.stringify(validateCredentialSnapshot(await fixture.request('snapshot'), 'modern')) !== JSON.stringify(before)) fail('predecessor_credential_changed');
+    // This release's domain proof uses only a second synthetic source in the
+    // already-admitted disposable profile. The predecessor is stopped before
+    // current tooling creates the retained v18 unknown facts; credentials and
+    // the original known source are untouched. Older intake contracts retain
+    // their original credential-only journey.
+    let historicalSol = null, historicalGeneration = null;
+    if (input.version === '0.1.27') {
+      stage = 'historical_sol_seed';
+      historicalSol = await prepareHistoricalSolFixture({ home, profile, codexHome: codex, predecessorRefreshId });
+    }
     stage = 'installed_replacement';
     // Preserve the old signed app, never recursively delete or overwrite it.
     await rename(installed, join(dirname(installed), 'TiboTattle-credential-predecessor.app'));
@@ -521,7 +536,21 @@ export async function runMacCredentialQualification({ intake, execute = false })
       active = await launchCredential(verified, launchOptions);
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
-      if (pass === 0) await exerciseCredentialRefresh(active.dashboard);
+      if (historicalSol) {
+        // Preserve the startup repair before the explicit detailed repeat
+        // replaces its result. A quick restart proves retained Usage before
+        // the existing user detailed action re-establishes current authority.
+        stage = 'historical_sol_candidate_' + pass;
+        const observed = await observeHistoricalSolPass({ dashboard: active.dashboard,
+          context: historicalSol, phase: pass === 0 ? 'repair' : 'restart',
+          previousGeneration: historicalGeneration, refreshDetailed: exerciseCredentialRefresh });
+        historicalGeneration = observed.generation;
+      }
+      if (pass === 0) {
+        await exerciseCredentialRefresh(active.dashboard);
+        if (historicalSol) await observeHistoricalSolPass({ dashboard: active.dashboard,
+          context: historicalSol, phase: 'repeat', previousGeneration: historicalGeneration });
+      }
       await until(async () => (await active.readSharing())?.enabled === (pass === 1), 'sharing_restart_preference');
       if (pass === 0) await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(true)');
       if (pass === 1) await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
@@ -533,6 +562,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     proof.cases.push({ scenario: 'modern', status: 'passed', sameIdentityInstalledUpgrade: true,
       existingKeysUnchanged: true, aclUnchanged: true, controlledRestart: true, sharingEnabledRestart: true,
       localRefreshCompleted: true });
+    if (historicalSol) proof.historicalSolUpgrade = historicalSolQualificationReceipt(historicalSol);
     await fixture.request('restore'); await fixture.request('cleanup'); await fixture.close(); fixture = null;
     for (const scenario of CREDENTIAL_FIXTURE_CASES.filter(v => v !== 'modern')) {
       stage = scenario; fixture = await fixtureSession(input, helper, scenario, environment);

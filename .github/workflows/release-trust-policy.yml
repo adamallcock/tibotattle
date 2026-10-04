@@ -9,6 +9,12 @@ on:
       - "release-notes/**"
       - "scripts/check-release-notes.mjs"
       - "scripts/lib/electron-macos-qualification-identity.mjs"
+      - "scripts/smoke-electron-macos-credentials.mjs"
+      - "scripts/lib/macos-historical-sol-qualification.mjs"
+      - "test/smoke-electron-macos-credentials.test.mjs"
+      - "test/macos-historical-sol-qualification.test.mjs"
+      - "tools/tool-inventory.json"
+      - "test/tool-inventory.test.js"
       - "scripts/macos-bundle-version.js"
       - "config/macos-bundle-version-plan.cjs"
       - "config/electron-production-distribution.cjs"
@@ -47,6 +53,12 @@ on:
       - "release-notes/**"
       - "scripts/check-release-notes.mjs"
       - "scripts/lib/electron-macos-qualification-identity.mjs"
+      - "scripts/smoke-electron-macos-credentials.mjs"
+      - "scripts/lib/macos-historical-sol-qualification.mjs"
+      - "test/smoke-electron-macos-credentials.test.mjs"
+      - "test/macos-historical-sol-qualification.test.mjs"
+      - "tools/tool-inventory.json"
+      - "test/tool-inventory.test.js"
       - "scripts/macos-bundle-version.js"
       - "config/macos-bundle-version-plan.cjs"
       - "config/electron-production-distribution.cjs"
@@ -124,6 +136,12 @@ jobs:
 
       - name: Test future-release Mac qualification admission
         run: node --test test/electron-macos-qualification-identity.test.mjs
+
+      - name: Check qualification dependency boundaries
+        run: npm run architecture:check
+
+      - name: Test signed Mac historical repair and credential qualification
+        run: node --test --test-concurrency=1 test/macos-historical-sol-qualification.test.mjs test/smoke-electron-macos-credentials.test.mjs test/tool-inventory.test.js
 
       - name: Check the checked-in Codex contract
         run: npm run codex:contract:check

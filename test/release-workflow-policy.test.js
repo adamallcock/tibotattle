@@ -80,6 +80,27 @@ test("the release trust job installs only its pinned locked dependency graph", a
   assert.match(workflow, /pnpm install --frozen-lockfile --ignore-scripts/u);
 });
 
+test("historical Mac repair inputs trigger read-only qualification tests on PRs and main", async () => {
+  const workflow = await readFile(new URL(
+    "../.github/workflows/release-trust-policy.yml",
+    import.meta.url,
+  ), "utf8");
+  const events = workflow.split("  workflow_dispatch:", 1)[0];
+  for (const path of [
+    "scripts/smoke-electron-macos-credentials.mjs",
+    "scripts/lib/macos-historical-sol-qualification.mjs",
+    "test/smoke-electron-macos-credentials.test.mjs",
+    "test/macos-historical-sol-qualification.test.mjs",
+  ]) {
+    assert.equal(events.split(`- "${path}"`).length - 1, 2,
+      `${path} must trigger both PR and main validation`);
+  }
+  assert.match(workflow, /^permissions:\n  contents: read$/mu);
+  assert.doesNotMatch(workflow, /^\s+[a-z-]+: write$/mu);
+  assert.match(workflow,
+    /run: node --test --test-concurrency=1 test\/macos-historical-sol-qualification\.test\.mjs test\/smoke-electron-macos-credentials\.test\.mjs test\/tool-inventory\.test\.js/u);
+});
+
 test("workflow policy accepts local actions and full immutable action SHAs", () => {
   assert.deepEqual(inspectWorkflowSource(`
 steps:
