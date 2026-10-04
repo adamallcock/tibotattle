@@ -30,6 +30,7 @@ SCANNER
 `, { mode: 0o700 });
     await writeFile(join(root, "sha256sum"), `#!/bin/bash
 printf 'checksum\\n' >> "$TRACE_FILE"
+cat >/dev/null
 exit "$CHECKSUM_RESULT"
 `, { mode: 0o700 });
     for (const [download, checksum, scanner, expected, events] of [

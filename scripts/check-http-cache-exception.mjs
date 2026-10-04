@@ -47,7 +47,7 @@ const FILES = {
   "test/http-cache-semantics-security.test.js": "68f186a52a2e31e68893ae449d5dd70f03663bb02d8fe30f5ed1149d47b28b1d",
   "test/electron-windows-production-signing.test.js": "0c21f98c9abf9708b57c1683618e5535f64a9be2823e90b533d4413bf0e395c9",
   "test/http-cache-exception.test.js": "3100277de1ca6eeb52c1e11c09de504e104354d9543a6579acdd45136f9fd28d",
-  "test/http-cache-exception-workflow.test.mjs": "5a5ed4205d562e8157ba7a50f06ddc3979e6f601f57ef968730198146e5e5e60",
+  "test/http-cache-exception-workflow.test.mjs": "3b7610f4fe25d67c0cac589e2b64fb13587b28df7b97f03ab46a058212b1e6b6",
   ".github/workflows/osv-scanner.yml": "9b0442d67f7dbe8a57f0b4534a3dcfb40e99ba6512ec21766fa3a04d54a908a9",
   "scripts/check-root-workspace-hygiene.mjs": "8f769ccded081318b187dbdadf84064e4d6247e29b4aaeae981ae1216810aa5f"
 };
