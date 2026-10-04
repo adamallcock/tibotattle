@@ -339,9 +339,9 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // The content-free Linux startup diagnostic helper and the separate exact-byte
   // mount-only diagnostic each have an explicit owner; neither qualifies a release.
   // The controlled AppArmor comparison helper owns exact-profile generation and
-  // cleanup without changing ordinary lifecycle qualification.
-  assert.equal(result.records, 172);
-  assert.equal(result.candidates.length, 173);
+  // cleanup; the final host owns the same-profile installed lifecycle handoff.
+  assert.equal(result.records, 173);
+  assert.equal(result.candidates.length, 174);
   assert.ok(result.aliases >= 25);
 });
 

@@ -5,7 +5,8 @@ import test from 'node:test';
 import { productionElectronCandidatePlan } from '../scripts/package-electron-production.mjs';
 import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
-import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
+  linuxFinalTemporary, assertLinuxFinalOwnedPolicy } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
 function fixture() {
@@ -69,9 +70,10 @@ test('receipt and final pair cannot relabel prebuilt source or reuse another can
   }
   assert.throws(() => validateLinuxFinalPair(pair, revision));
 });
-const mount = '/opt/tibotattle-updater-exec/tmp/.mount_TiboTa123456';
+const nonce = 'a'.repeat(32), temporary = linuxFinalTemporary(nonce);
+const mount = `${temporary}/.mount_TiboTa123456`;
 function mounted() {
-  return { executable: `${mount}/tibotattle`,
+  return { temporary, executable: `${mount}/tibotattle`,
     mountinfo: `91 40 0:82 / ${mount} ro,nosuid,nodev,relatime - fuse.squashfuse squashfuse ro,user_id=1000,group_id=1000\n`,
     environment: { APPIMAGE: '/opt/tibotattle-updater-exec/TiboTattle.AppImage', APPDIR: mount } };
 }
@@ -86,6 +88,8 @@ test('kernel FUSE mount plus image runtime identity is required; extracted paths
     m => { m.mountinfo += m.mountinfo; }, m => { m.environment.APPIMAGE_EXTRACT_AND_RUN = '1'; },
     m => { m.environment.APPIMAGE = '/tmp/other.AppImage'; }, m => { m.environment.APPDIR = '/tmp/other'; },
     m => { m.executable = `${mount}/../tibotattle`; },
+    m => { m.temporary = linuxFinalTemporary('b'.repeat(32)); },
+    m => { delete m.temporary; },
   ]) { const value = mounted(); alter(value); assert.throws(() => selectLinuxFinalFuseMount(value)); }
 });
 test('a native renderer must retain Chromium sandbox kernel controls', () => {
@@ -99,8 +103,9 @@ test('a native renderer must retain Chromium sandbox kernel controls', () => {
 test('manual lifecycle lane preserves byte, network, sandbox, FUSE and publication boundaries', async () => {
   const workflow = await readFile(new URL('../.github/workflows/electron-linux-final-qualification.yml', import.meta.url), 'utf8');
   for (const required of ['workflow_dispatch:', 'fetch-depth: 0', 'persist-credentials: false', 'actions: read',
-    '--preflight', '--acquire', '--prepare', 'test -c /dev/fuse', '--device /dev/fuse', '--cap-add=SYS_ADMIN',
-    '--network none', '--add-host updates.tibotattle.com:127.0.0.1', 'timeout 900s docker run', 'if-no-files-found: error']) assert.ok(workflow.includes(required), required);
+    '--preflight', '--acquire', '--prepare', 'test -c /dev/fuse', '--kill-after=90s 1260s',
+    'run-electron-linux-final-lifecycle.mjs --execute', 'run-electron-linux-final-lifecycle.mjs --cleanup',
+    'receipts/host-lifecycle.json', 'apparmor-comparison.json', 'if-no-files-found: error']) assert.ok(workflow.includes(required), required);
   assert.ok(workflow.indexOf('Install only locked verification dependencies') < workflow.indexOf('Admit exact source package'));
   assert.ok(workflow.indexOf('Admit exact source package') < workflow.indexOf('Download exact public predecessor'));
   assert.doesNotMatch(workflow, /build-linux-updater-rehearsal|electron-builder|--privileged|--no-sandbox|seccomp=unconfined|apparmor=unconfined|--(?:volume|mount)\b|permissions:\s*write-all|contents: write/u);
@@ -109,6 +114,25 @@ test('manual lifecycle lane preserves byte, network, sandbox, FUSE and publicati
   const docker = await readFile(new URL('../containers/electron-linux-installed/Dockerfile', import.meta.url), 'utf8');
   assert.match(docker, /libfuse2 fuse openssl libnss3-tools procps/u); assert.match(docker, /USER node/u);
   assert.match(docker, /dbus-run-session/u);
+});
+
+test('the exact nonce and enforced profile retain FUSE privileges without granting them to the app', () => {
+  const name = `tibotattle-mount-candidate-12345-${nonce}`;
+  const input = { nonce, name, profileText: `${name} (enforce)\n`, facts: {
+    appArmor: { profile: 'other', enforcement: 'enforce' }, seccomp: 'filter', noNewPrivileges: false,
+    sysAdmin: { effective: false, permitted: false, bounding: true },
+    fuseDevice: { characterDevice: true, readable: true, writable: true },
+    fusermount: { present: true, regular: true, rootOwned: true, setuid: true, executable: true } } };
+  assertLinuxFinalOwnedPolicy(input);
+  for (const change of [v => { v.nonce = 'b'.repeat(32); }, v => { v.name = 'unconfined'; },
+    v => { v.profileText = `${name} (complain)\n`; }, v => { v.profileText = `other (enforce)\n`; },
+    v => { v.facts.seccomp = 'disabled'; }, v => { v.facts.noNewPrivileges = true; },
+    v => { v.facts.sysAdmin.effective = true; }, v => { v.facts.sysAdmin.permitted = true; },
+    v => { v.facts.sysAdmin.bounding = false; }, v => { v.facts.fusermount.setuid = false; },
+    v => { v.facts.fusermount.rootOwned = false; }, v => { v.facts.fuseDevice.writable = false; }]) {
+    const altered = structuredClone(input); change(altered); assert.throws(() => assertLinuxFinalOwnedPolicy(altered));
+  }
+  for (const bad of ['', null, '../other', 'a'.repeat(31), 'A'.repeat(32), `${nonce}/child`]) assert.throws(() => linuxFinalTemporary(bad));
 });
 
 test('the loopback feed accepts only the pinned updater cache-busting query', () => {

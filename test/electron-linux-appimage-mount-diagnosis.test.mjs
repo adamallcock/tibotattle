@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { linuxFinalHostContainerArguments } from '../scripts/run-electron-linux-final-lifecycle.mjs';
 import { LINUX_MOUNT_DIAGNOSIS_SCHEMA, LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, LINUX_MOUNT_KMSG_READER,
   normalizeLinuxMountPolicy, createLinuxMountErrorClassifier, selectLinuxMountProbeMount, buildLinuxAppImageActorGraph, linuxAppImageGateArguments,
   validateLinuxMountDiagnosis, runLinuxMountSequence, linuxMountPreflightEnvironment,
@@ -645,12 +646,13 @@ test('interruption cleanup requires the recorded created ID and all exact owners
 });
 
 test('diagnostic Docker security arguments match the existing lifecycle and keep its container source closure', async () => {
-  const normal = await readFile(new URL('../.github/workflows/electron-linux-final-qualification.yml', import.meta.url), 'utf8');
-  const words = normal.slice(normal.indexOf('timeout 900s docker run'), normal.indexOf('> .release-build')).replace(/\\\n/gu, '').split(/\s+/u);
+  const profile = `tibotattle-mount-candidate-12345-${'a'.repeat(32)}`;
+  const words = linuxFinalHostContainerArguments({ run: '12345', runner: 'b'.repeat(40), nonce: 'a'.repeat(32),
+    profile, profileSha256: 'f'.repeat(64), profileNameSha256: createHash('sha256').update(profile).digest('hex') });
   const diagnostic = linuxMountContainerArguments({ name: 'tibotattle-mount-diagnosis-current-12345', role: 'current', nonce: 'a'.repeat(32), runnerRevision: 'b'.repeat(40) });
   const select = args => args.flatMap((word, index) => /^(?:--init|--platform=|--cap-add=|--shm-size=)/u.test(word) ? [word]
     : ['--device', '--network', '--add-host', '--tmpfs'].includes(word) ? [`${word} ${args[index + 1]}`]
-      : word === '--env' && !args[index + 1].startsWith('TIBOTATTLE_MOUNT_PROBE_') ? [`--env ${args[index + 1]}`] : []).sort();
+      : word === '--env' && !/^(?:TIBOTATTLE_MOUNT_PROBE_|TIBOTATTLE_LINUX_FINAL_)/u.test(args[index + 1]) ? [`--env ${args[index + 1]}`] : []).sort();
   assert.deepEqual(select(diagnostic), select(words));
   assert.doesNotMatch(diagnostic.join(' '), /--privileged|--security-opt|--user\b|--entrypoint|--volume|--mount\b|--no-sandbox|unconfined/u);
   assert.deepEqual(diagnostic.slice(-3), ['node', 'scripts/diagnose-electron-linux-appimage-mount.mjs', '--inside']);
@@ -718,19 +720,94 @@ function comparisonHarness({ mutate = () => {}, failedCleanup = false } = {}) {
       evidence[stage] = { profileSha256: '5'.repeat(64), profileNameSha256: stage === 'baseline' ? '6'.repeat(64) : '7'.repeat(64), loaded: true, removed: false };
       return { name: ownedName(stage), evidence: evidence[stage] };
     },
+    async candidateCheckpoint() {
+      calls.push('checkpoint:candidate');
+      return { name: ownedName('candidate'), nonce: 'a'.repeat(32),
+        profileSha256: evidence.candidate.profileSha256, profileNameSha256: evidence.candidate.profileNameSha256,
+        tuple: tuple(), basis: basis() };
+    },
     async remove(stage, containersGone) {
       calls.push(`remove:${stage}:${containersGone}`);
       if (!containersGone || failedCleanup) return false;
       if (evidence[stage]) evidence[stage].removed = true;
       return true;
     } };
-  return { calls, adapters: { prepareProfiles: async () => profiles, validateRow,
+  return { calls, profiles, adapters: { prepareProfiles: async () => profiles, validateRow,
     runProbe: async (stage, role, expected, name) => {
       calls.push(`probe:${stage}:${role}`);
       assert.equal(expected, pair.images[role]); assert.equal(name, ownedName(stage === 'baseline' ? 'baseline' : 'candidate'));
       const result = comparisonResult(stage, role); mutate(result, stage, role); return result;
     } } };
 }
+
+test('verified candidate handoff is immutable, serial, and bracketed by live ownership rechecks', async () => {
+  const { calls, adapters } = comparisonHarness();
+  const result = await runLinuxAppArmorComparison(pair, { ...adapters, onCandidateVerified: async checkpoint => {
+    calls.push('lifecycle');
+    assert.equal(checkpoint.name, ownedName('candidate')); assert.deepEqual(checkpoint.tuple, tuple());
+    assert.ok(Object.isFrozen(checkpoint)); assert.ok(Object.isFrozen(checkpoint.basis));
+    assert.ok(Object.isFrozen(checkpoint.tuple.options));
+    assert.throws(() => { checkpoint.name = 'unconfined'; }, TypeError);
+    assert.throws(() => { checkpoint.tuple.options.push('rw'); }, TypeError);
+    return { containerRemoved: true };
+  } });
+  assert.equal(result.outcome, 'compared'); assert.equal(result.qualifiesRelease, false);
+  assert.deepEqual(calls.slice(calls.indexOf('probe:negative:current')), [
+    'probe:negative:current', 'checkpoint:candidate', 'lifecycle', 'checkpoint:candidate',
+    'remove:candidate:true', 'remove:baseline:true']);
+  const active = structuredClone(result);
+  active.profilesRemoved = false; active.profiles.candidate.removed = false;
+  assert.equal(validateLinuxAppArmorComparison(active, validateRow), null);
+  assert.doesNotMatch(JSON.stringify(result), /"nonce"|"name"|lifecycle|\/opt\//u);
+});
+
+test('any incomplete causal case prevents lifecycle handoff even when host cleanup succeeds', async () => {
+  for (const mutate of [
+    (result, stage) => { if (stage === 'baseline') result.tuple = null; },
+    (result, stage) => { if (stage === 'candidate') result.row.probe.startup.fuseMount.nosuid = false; },
+    (result, stage) => { if (stage === 'negative') { result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'no_observed_mount_denial'; } },
+    result => { result.row.probe.environment.sysAdmin.effective = true; },
+    result => { result.row.actorTrace.complete = false; result.row.actorTrace.reason = 'trace_stream_incomplete'; result.row.errorCode = 'probe_failed'; },
+    result => { result.row.artifactSha256 = '0'.repeat(64); },
+  ]) {
+    const { adapters } = comparisonHarness({ mutate }); let called = false;
+    const result = await runLinuxAppArmorComparison(pair, { ...adapters, onCandidateVerified: async () => { called = true; return { containerRemoved: true }; } });
+    assert.equal(called, false); assert.notEqual(result.outcome, 'compared');
+  }
+});
+
+test('candidate ownership drift or cancellation refuses handoff without inventing a completed comparison', async () => {
+  for (const when of ['before', 'after']) {
+    const { adapters, profiles } = comparisonHarness(); let reads = 0, called = 0;
+    const original = profiles.candidateCheckpoint;
+    profiles.candidateCheckpoint = async () => {
+      reads++;
+      if (reads === (when === 'before' ? 1 : 2)) throw Object.assign(new Error('private-marker'), { code: 'basis_unavailable' });
+      return original();
+    };
+    const result = await runLinuxAppArmorComparison(pair, { ...adapters, onCandidateVerified: async () => { called++; return { containerRemoved: true }; } });
+    assert.equal(called, when === 'before' ? 0 : 1); assert.equal(result.outcome, 'candidate_failed');
+    assert.equal(result.profilesRemoved, true); assert.doesNotMatch(JSON.stringify(result), /private-marker/u);
+  }
+  const { adapters, calls } = comparisonHarness();
+  const result = await runLinuxAppArmorComparison(pair, { ...adapters,
+    interrupted: () => calls.includes('probe:negative:current'), onCandidateVerified: () => assert.fail('must not hand off') });
+  assert.equal(result.outcome, 'interrupted'); assert.equal(result.profilesRemoved, true);
+});
+
+test('throwing or unclosed lifecycle use prevents profile removal authorization', async () => {
+  for (const callback of [async () => { throw new Error('private-failure'); }, async () => null,
+    async () => ({ containerRemoved: false }), async () => ({ containerRemoved: 'true' }),
+    async () => ({ containerRemoved: true, unexpected: true })]) {
+    const { adapters, calls } = comparisonHarness();
+    const result = await runLinuxAppArmorComparison(pair, { ...adapters, onCandidateVerified: callback });
+    assert.equal(result.outcome, 'cleanup_failed'); assert.equal(result.profilesRemoved, false);
+    assert.ok(calls.includes('remove:candidate:false')); assert.doesNotMatch(JSON.stringify(result), /private-failure/u);
+  }
+  const { adapters, calls } = comparisonHarness();
+  await assert.rejects(runLinuxAppArmorComparison(pair, { ...adapters, onCandidateVerified: true }), /REFUSED/u);
+  assert.deepEqual(calls, []);
+});
 
 test('comparison has a distinct explicit confirmation and closed selection', () => {
   const input = { SELECTED_MODE: 'execute', SELECTED_POLICY: 'apparmor-comparison', SELECTED_CONFIRMATION: LINUX_APPARMOR_COMPARISON_CONFIRMATION };

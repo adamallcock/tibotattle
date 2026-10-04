@@ -744,8 +744,33 @@ exact-byte replacement, settings/opt-out/source and credential continuity,
 cold restart, no-update behavior, owned uninstall and process/mount cleanup.
 The fixed production feed URL is served only inside the network-none container.
 
-Retain the pair and `installed-lifecycle.json` with the package receipts. Only a
-passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
+The host entrypoint `scripts/run-electron-linux-final-lifecycle.mjs` performs a
+fresh five-case causal AppArmor comparison in the same job: baseline denials for
+both exact images, permitted mounts for both under the one narrow owned
+candidate profile, and an outside-nonce negative control. Only after all five
+cases pass may the ordinary lifecycle use that exact still-loaded profile and
+nonce. Profile definition, successful-add ownership, parser/import bindings and
+enforce state are rechecked before and after use. No prior run's randomly named
+profile is treated as equivalent to this one. The diagnostic CLI remains
+mount-only, and its comparison receipt remains diagnostic-only.
+
+The host allows removal only after recorded container closure and the helper's
+independent absence-of-profile-actors check. Its `--cleanup` recovery command
+binds the recorded container ID, run/runner labels, image revision and profile;
+it never removes a container by name alone. A failed lifecycle can retain valid
+causal diagnosis while still failing host qualification.
+
+Retain the original pair, `apparmor-comparison.json`, `installed-lifecycle.json`
+and `host-lifecycle.json` with the package receipts and successful workflow/run
+and ZIP provenance. The host receipt binds all three original JSON digests and
+the exact candidate-profile identity, while the lifecycle keeps its established
+v1 schema and assertions. Acceptance must require the host's passed status,
+comparison/lifecycle success, no interruption and both container/profile cleanup
+before using the runtime receipt for `cleanInstallSmokePassed`. Merely uploading
+extra proof files does not update a downstream admission allowlist: update that
+consumer explicitly and verify every original-file binding.
+
+Only a passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
 missing FUSE, failed sandbox or incomplete cleanup is a failed gate. The receipt
 keeps `physicalDesktop: not_qualified`, and the isolated feed does not prove
 production updater publication. Review that scope when preparing release

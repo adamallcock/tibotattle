@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// A mount-only comparison of exact prebuilt images. This never runs AppRun or
-// Electron and never supplies installed-lifecycle or release qualification.
+// A mount-only CLI for exact prebuilt images. Its shared comparison adapters
+// support a separately owned lifecycle callback; diagnostic receipts never
+// supply installed-lifecycle or release qualification.
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { closeSync, constants, openSync, writeSync } from 'node:fs';
@@ -147,7 +148,11 @@ export function projectLinuxMountProbeFacts(text, temporary) {
   return classifyLinuxStartupFuseMount(line.replace(`${temporary}/`, `${EXEC}/tmp/`));
 }
 async function mountFacts(temporary) { return selectLinuxMountProbeMount(await optionalRead('/proc/self/mountinfo', 262144), temporary); }
-async function runtimeFacts() {
+export async function sampleLinuxMountProbeFacts(temporary) {
+  if (!new RegExp(`^${EXEC}/tmp/[a-f0-9]{32}$`, 'u').test(temporary ?? '')) fail();
+  return projectLinuxMountProbeFacts(await optionalRead('/proc/self/mountinfo', 262144), temporary);
+}
+export async function readLinuxMountRuntimeFacts() {
   const policy = normalizeLinuxMountPolicy({ status: await optionalRead('/proc/self/status'), appArmor: await optionalRead('/proc/self/attr/current', 256) });
   const can = async (path, mode) => { try { await access(path, mode); return true; } catch (error) { return ['EACCES', 'EPERM', 'ENOENT'].includes(error.code) ? false : UNKNOWN; } };
   let device = UNKNOWN, helper = { present: UNKNOWN, regular: UNKNOWN, rootOwned: UNKNOWN, setuid: UNKNOWN, executable: UNKNOWN };
@@ -270,7 +275,7 @@ async function runInside() {
   if (installed.sha256 !== expected.sha256 || installed.bytes !== expected.bytes) fail();
   await mkdir(`${EXEC}/tmp`, { mode: 0o700 });
   const temporary = `${EXEC}/tmp/${nonce}`; await mkdir(temporary, { mode: 0o700 });
-  const environment = await runtimeFacts();
+  const environment = await readLinuxMountRuntimeFacts();
   const send = value => process.stdout.write(`${JSON.stringify(value)}\n`);
   let input = '', go = false, invalidInput = false;
   process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { if (invalidInput) return; input += chunk; if (input.length > 16) { input = ''; invalidInput = true; } go = input === 'go\n'; });
@@ -1005,7 +1010,8 @@ export function linuxMountCleanupArguments({ markerId, inspected }, { role, run,
     || stage !== 'default' && inspected.labels?.['io.tibotattle.mount-diagnosis.stage'] !== stage) fail();
   return ['rm', '--force', markerId];
 }
-async function cleanupRecordedContainers() {
+export async function cleanupLinuxMountDiagnosis({ removeProfiles = true } = {}) {
+  if (typeof removeProfiles !== 'boolean') fail();
   const run = process.env.GITHUB_RUN_ID, runner = process.env.GITHUB_SHA;
   if (!/^[1-9][0-9]{0,14}$/u.test(run ?? '') || !/^[a-f0-9]{40}$/u.test(runner ?? '')) fail();
   for (const stage of PROBE_STAGES) for (const role of ROLES) {
@@ -1033,13 +1039,30 @@ async function cleanupRecordedContainers() {
     if (command('docker', ['ps', '-aq', '--filter', `id=${id}`])) fail();
     if (!cleanupActorTrace(traceContext({ role, stage, id }))) fail();
   }
-  if (!await cleanupLinuxAppArmorProfiles({ directory: join(ROOT, LINUX_FINAL_INPUT), run, runner, containersGone: true })) fail();
+  if (removeProfiles && !await cleanupLinuxAppArmorProfiles({ directory: join(ROOT, LINUX_FINAL_INPUT), run, runner, containersGone: true })) fail();
+}
+/** Native adapters are shared with the host lifecycle wrapper. The diagnostic
+ * CLI supplies no callback and remains mount-only; the comparison receipt never
+ * becomes lifecycle or release qualification. */
+export async function runLinuxNativeAppArmorComparison(pair, { interrupted = () => false, onCandidateVerified = null } = {}) {
+  validateLinuxFinalPair(pair, process.env.GITHUB_SHA);
+  if (typeof interrupted !== 'function' || onCandidateVerified !== null && typeof onCandidateVerified !== 'function') fail();
+  const nonce = randomBytes(16).toString('hex'), outsideNonce = randomBytes(16).toString('hex');
+  if (nonce === outsideNonce) fail();
+  const directory = join(ROOT, LINUX_FINAL_INPUT), intake = pair.intake;
+  return runLinuxAppArmorComparison(pair, {
+    prepareProfiles: () => prepareLinuxAppArmorProfiles({ root: ROOT, directory, run: process.env.GITHUB_RUN_ID, runner: intake.runnerRevision, nonce }),
+    runProbe: (stage, role, expected, profile) => runHostProbe(role, expected, { stage, profile, nonce: stage === 'negative' ? outsideNonce : nonce }),
+    validateRow: row => validateLinuxMountDiagnosis({ schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
+      runnerRevision: intake.runnerRevision, sourceRevision: intake.sourceRevision, cases: [{ ...row, role: 'current' }] }) !== null,
+    interrupted, onCandidateVerified,
+  });
 }
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   try {
     const [mode, ...rest] = process.argv.slice(2);
     if (rest.length || !['--preflight', '--acquire', '--prepare', '--execute', '--inside', '--gate', '--cleanup'].includes(mode)) fail();
-    if (mode === '--cleanup') { await cleanupRecordedContainers(); process.stdout.write('Owned diagnostic container cleanup complete.\n'); }
+    if (mode === '--cleanup') { await cleanupLinuxMountDiagnosis(); process.stdout.write('Owned diagnostic container cleanup complete.\n'); }
     else if (mode === '--inside') await runInside();
     else if (mode === '--gate') runGate();
     else {
@@ -1053,16 +1076,10 @@ if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
         let interrupted = false;
         const cancel = () => { interrupted = true; };
         if (comparison) { process.on('SIGTERM', cancel); process.on('SIGINT', cancel); }
-        const nonce = randomBytes(16).toString('hex'), outsideNonce = randomBytes(16).toString('hex');
         let receipt;
         try {
-          receipt = comparison ? await runLinuxAppArmorComparison(pair, {
-            prepareProfiles: () => prepareLinuxAppArmorProfiles({ root: ROOT, directory, run: process.env.GITHUB_RUN_ID, runner: intake.runnerRevision, nonce }),
-            runProbe: (stage, role, expected, profile) => runHostProbe(role, expected, { stage, profile, nonce: stage === 'negative' ? outsideNonce : nonce }),
-            validateRow: row => validateLinuxMountDiagnosis({ schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
-              runnerRevision: intake.runnerRevision, sourceRevision: intake.sourceRevision, cases: [{ ...row, role: 'current' }] }) !== null,
-            interrupted: () => interrupted,
-          }) : await runLinuxMountSequence(pair, runHostProbe);
+          receipt = comparison ? await runLinuxNativeAppArmorComparison(pair, { interrupted: () => interrupted })
+            : await runLinuxMountSequence(pair, runHostProbe);
         } finally { if (comparison) { process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); } }
         const handle = await open(join(directory, comparison ? 'apparmor-comparison.json' : 'mount-diagnosis.json'), 'wx', 0o600);
         try { await handle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); }

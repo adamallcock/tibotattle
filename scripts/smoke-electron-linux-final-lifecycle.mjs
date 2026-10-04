@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES } from './smoke-electron-linux.mjs';
-import { createLinuxStartupDiagnostics, sampleLinuxStartupFuseMount,
+import { createLinuxStartupDiagnostics,
   validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
 import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment, runOneNormalApp, normalPackagedSmokeFailureStageCode,
   persistLinuxNormalPackagedRestartPreferences, verifyLinuxNormalPackagedRestartPreferences } from './smoke-electron-linux-packaged.mjs';
@@ -19,23 +19,38 @@ import { prepareLinuxUpdaterDownload, realUpdaterFeed, isLinuxUpdaterSettingsURL
 import { proveLinuxSecretServiceContainerIsolation, startLinuxSecretServiceDaemon } from './qualify-linux-secret-service.mjs';
 import { readLocalCollectorCheckpoint } from '../src/local-collector-state.js';
 import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
+import { readLinuxMountRuntimeFacts, sampleLinuxMountProbeFacts } from './diagnose-electron-linux-appimage-mount.mjs';
 import { LINUX_FINAL_INPUT, LINUX_FINAL_FEED, validateLinuxFinalPair, linuxFinalFailure as fail } from './lib/linux-final-artifact-intake.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const LINUX_FINAL_EXEC = '/opt/tibotattle-updater-exec';
-const IMAGE = `${LINUX_FINAL_EXEC}/TiboTattle.AppImage`, TEMP = `${LINUX_FINAL_EXEC}/tmp`;
+const IMAGE = `${LINUX_FINAL_EXEC}/TiboTattle.AppImage`, TEMP_ROOT = `${LINUX_FINAL_EXEC}/tmp`;
 const HOST = 'updates.tibotattle.com';
 const wait = waitForUpdater;
 const digest = async path => (await fingerprintLinuxFinalFile(path)).sha256;
 const unescapeMount = text => text.replace(/\\(040|011|012|134)/gu, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
+export function linuxFinalTemporary(nonce) {
+  if (!/^[a-f0-9]{32}$/u.test(nonce ?? '')) fail('FUSE_IDENTITY_INVALID');
+  return `${TEMP_ROOT}/${nonce}`;
+}
+export function assertLinuxFinalOwnedPolicy({ nonce, name, profileText, facts }) {
+  linuxFinalTemporary(nonce);
+  if (typeof name !== 'string' || !new RegExp(`^tibotattle-mount-candidate-[1-9][0-9]{0,14}-${nonce}$`, 'u').test(name)
+    || typeof profileText !== 'string' || profileText.length > 256 || profileText.trim() !== `${name} (enforce)`
+    || !isDeepStrictEqual(facts, { appArmor: { profile: 'other', enforcement: 'enforce' }, seccomp: 'filter',
+      noNewPrivileges: false, sysAdmin: { effective: false, permitted: false, bounding: true },
+      fuseDevice: { characterDevice: true, readable: true, writable: true },
+      fusermount: { present: true, regular: true, rootOwned: true, setuid: true, executable: true } })) fail('ISOLATION_REQUIRED');
+}
 
 /** A path alone never proves FUSE. Bind the kernel mount table and the runtime's
  * environment to the installed image. SquashFS file uid is not the app uid. */
-export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE }) {
+export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE, temporary }) {
+  if (typeof temporary !== 'string' || temporary !== linuxFinalTemporary(temporary.slice(TEMP_ROOT.length + 1))) fail('FUSE_IDENTITY_INVALID');
   if (image !== IMAGE || typeof executable !== 'string' || posix.resolve(executable) !== executable
     || posix.basename(executable) !== 'tibotattle') fail('FUSE_IDENTITY_INVALID');
   const mount = posix.dirname(executable);
-  if (!new RegExp(`^${TEMP}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_IDENTITY_INVALID');
+  if (!new RegExp(`^${temporary}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_IDENTITY_INVALID');
   const rows = mountinfo.split('\n').filter(Boolean).map(line => {
     const parts = line.split(' - '); if (parts.length !== 2) return null;
     const before = parts[0].split(' '), after = parts[1].split(' ');
@@ -65,36 +80,36 @@ function startTime(stat) {
   if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_IDENTITY_INVALID');
   return value;
 }
-async function processIdentity(pid, expected) {
+async function processIdentity(pid, expected, temporary) {
   const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
   const args = (await readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
   if (args.some(arg => arg.startsWith('--type='))) return null;
   const executable = await readlink(`/proc/${pid}/exe`); // No argv fallback in this lane.
-  if (!executable.startsWith(`${TEMP}/.mount_`) || basename(executable) !== 'tibotattle') return null;
+  if (!executable.startsWith(`${temporary}/.mount_`) || basename(executable) !== 'tibotattle') return null;
   const status = await readFile(`/proc/${pid}/status`, 'utf8');
   if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_IDENTITY_INVALID');
   const entries = (await readFile(`/proc/${pid}/environ`, 'utf8')).split('\0');
   const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN)=/u.test(item)).map(item => {
     const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
   }));
-  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await readFile(`/proc/${pid}/mountinfo`, 'utf8'), environment });
+  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await readFile(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary });
   if (await digest(executable) !== expected.executableSha256
     || await digest(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
   if (startTime(await readFile(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
   return { pid, startTime: startTime(stat), mount: mounted.mount, executable };
 }
-async function ownedApps(expected) {
+async function ownedApps(expected, temporary) {
   const found = [];
   for (const name of await readdir('/proc')) {
     if (!/^[0-9]+$/u.test(name)) continue;
-    try { const identity = await processIdentity(Number(name), expected); if (identity) found.push(identity); }
+    try { const identity = await processIdentity(Number(name), expected, temporary); if (identity) found.push(identity); }
     catch (error) { if (error.code?.startsWith('LINUX_FINAL_LIFECYCLE_')) throw error; /* Exited or unrelated. */ }
   }
   return found;
 }
-async function currentApp(expected) {
+async function currentApp(expected, temporary) {
   return wait(async () => {
-    const found = await ownedApps(expected); if (found.length > 1) fail('MULTIPLE_APPS');
+    const found = await ownedApps(expected, temporary); if (found.length > 1) fail('MULTIPLE_APPS');
     return found[0] ?? null;
   }, 60000);
 }
@@ -102,9 +117,9 @@ async function alive(identity) {
   try { return startTime(await readFile(`/proc/${identity.pid}/stat`, 'utf8')) === identity.startTime; }
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
-async function assertNoOwnedMounts() {
+async function assertNoOwnedMounts(temporary) {
   await wait(async () => !(await readFile('/proc/self/mountinfo', 'utf8')).split('\n')
-    .some(line => line.split(' ')[4]?.startsWith(`${TEMP}/.mount_`)), 15000);
+    .some(line => line.split(' ')[4]?.startsWith(`${temporary}/.mount_`)), 15000);
 }
 async function descendants(browser) {
   const found = [browser];
@@ -144,11 +159,11 @@ export async function assertLinuxFinalProcessTreeGone(identities, { readAlive = 
     || identities.some(row => !Number.isSafeInteger(row.pid) || row.pid < 1 || !/^[0-9]+$/u.test(row.startTime))) fail('PROCESS_IDENTITY_INVALID');
   await waiter(async () => (await Promise.all(identities.map(readAlive))).every(value => value === false), 15000);
 }
-async function stopOwned(identity) {
+async function stopOwned(identity, temporary) {
   const children = await descendants(identity);
   if (await alive(identity)) process.kill(identity.pid, 'SIGUSR2');
   await assertLinuxFinalProcessTreeGone(children);
-  await assertNoOwnedMounts();
+  await assertNoOwnedMounts(temporary);
 }
 function command(name, args) {
   const result = spawnSync(name, args, { shell: false, stdio: 'ignore', timeout: 15000 });
@@ -165,10 +180,10 @@ async function trustFixture(fixture, cert) {
   command('certutil', ['-N', '--empty-password', '-d', `sql:${nss}`]);
   command('certutil', ['-A', '-d', `sql:${nss}`, '-n', 'TiboTattle disposable loopback CA', '-t', 'C,,', '-i', cert]);
 }
-function launchEnvironment(fixture, cert) {
+function launchEnvironment(fixture, cert, temporary) {
   const environment = { ...normalPackagedSmokeEnvironment({ fixture, service: 'available' }),
     XDG_CONFIG_HOME: join(fixture.home, '.config'), XDG_CACHE_HOME: join(fixture.home, '.cache'),
-    XDG_DATA_HOME: join(fixture.home, '.local/share'), TMPDIR: TEMP, NODE_EXTRA_CA_CERTS: cert };
+    XDG_DATA_HOME: join(fixture.home, '.local/share'), TMPDIR: temporary, NODE_EXTRA_CA_CERTS: cert };
   for (const key of ['APPIMAGE', 'APPDIR', 'APPIMAGE_EXTRACT_AND_RUN', 'APPIMAGE_EXTRACT_AND_RUN_CLEANUP']) delete environment[key];
   return environment;
 }
@@ -213,8 +228,8 @@ async function installImage(source, expected) {
   await copyFile(source, IMAGE, constants.COPYFILE_EXCL); await chmod(IMAGE, 0o700);
   if (await digest(IMAGE) !== expected.sha256) fail('INSTALLED_BYTES_INVALID');
 }
-async function uninstallImage(expected, preservedFixture = null) {
-  await assertNoOwnedMounts();
+async function uninstallImage(expected, preservedFixture, temporary) {
+  await assertNoOwnedMounts(temporary);
   const stat = await lstat(IMAGE);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== 1000
     || await digest(IMAGE) !== expected.sha256) fail('UNINSTALL_TARGET_INVALID');
@@ -236,6 +251,10 @@ export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
 }
 export async function runLinuxFinalLifecycle() {
   const contract = assertContainerContract();
+  const nonce = process.env.TIBOTATTLE_LINUX_FINAL_NONCE, temporary = linuxFinalTemporary(nonce);
+  const sampleLinuxStartupFuseMount = () => sampleLinuxMountProbeFacts(temporary);
+  assertLinuxFinalOwnedPolicy({ nonce, name: process.env.TIBOTATTLE_LINUX_FINAL_PROFILE,
+    profileText: await readFile('/proc/self/attr/current', 'utf8'), facts: await readLinuxMountRuntimeFacts() });
   if (process.arch !== 'x64' || process.getuid() !== 1000 || process.version !== 'v26.2.0'
     || process.env.ELECTRON_DISABLE_SANDBOX !== '0' || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
     || (await lookup(HOST)).address !== '127.0.0.1'
@@ -251,7 +270,8 @@ export async function runLinuxFinalLifecycle() {
     if (file.sha256 !== pair.images[role].sha256 || file.bytes !== pair.images[role].bytes) fail('INPUT_CHANGED');
   }
   if (startLinuxSecretServiceDaemon().status !== 'started') fail('SECRET_SERVICE_UNAVAILABLE');
-  await mkdir(TEMP, { mode: 0o700 });
+  await mkdir(TEMP_ROOT, { mode: 0o700 });
+  await mkdir(temporary, { mode: 0o700 });
   const key = join(LINUX_FINAL_EXEC, 'loopback.key'), cert = join(LINUX_FINAL_EXEC, 'loopback.crt');
   command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', `/CN=${HOST}`,
     '-addext', `subjectAltName=DNS:${HOST}`, '-keyout', key, '-out', cert]);
@@ -292,27 +312,27 @@ export async function runLinuxFinalLifecycle() {
     let cleanIdentity;
     const identity = { sourceRevision: pair.intake.runnerRevision, artifactSha256: pair.images.next.asarSha256 };
     const runNormal = (fixture, beforeQuit) => runOneNormalApp(identity, {
-      appPath: IMAGE, environment: launchEnvironment(fixture, cert), fixture,
+      appPath: IMAGE, environment: launchEnvironment(fixture, cert, temporary), fixture,
       preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
       run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
         onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
     });
     await runNormal(clean, async context => {
-      cleanIdentity = await currentApp(pair.images.next); await assertRendererSandbox(cleanIdentity);
+      cleanIdentity = await currentApp(pair.images.next, temporary); await assertRendererSandbox(cleanIdentity);
       await persistLinuxNormalPackagedRestartPreferences(context);
       await proveNoUpdate(context.cdp, context.dashboardOrigin, cleanIdentity);
     });
-    await assertNoOwnedMounts();
+    await assertNoOwnedMounts(temporary);
     if (await alive(cleanIdentity)) fail('CLEAN_QUIT_FAILED');
     await checkedCheckpoint(clean);
     receipt.cleanInstallSmokePassed = true; receipt.localRefreshAndCredentialAccess = true;
     receipt.chromiumRendererSandboxVerified = true;
-    await uninstallImage(pair.images.next, clean);
+    await uninstallImage(pair.images.next, clean, temporary);
     receipt.cleanUninstallPreservedLocalState = true;
     stage = 'public_predecessor_install';
     upgradeFixture = await fixtureWithDefaultProfile(); owned.push(upgradeFixture);
     await trustFixture(upgradeFixture, cert); await installImage(join(inputs, 'current.AppImage'), pair.images.current);
-    const environment = launchEnvironment(upgradeFixture, cert);
+    const environment = launchEnvironment(upgradeFixture, cert, temporary);
     const port = await freeTcpPort();
     child = spawn(IMAGE, [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
       { env: environment, shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -321,7 +341,7 @@ export async function runLinuxFinalLifecycle() {
     child.stderr.on('data', predecessorStartupDiagnostics.feed);
     dashboard = await connectUpdaterPage(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
     await wait(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
-    const previous = await currentApp(pair.images.current); await assertRendererSandbox(previous);
+    const previous = await currentApp(pair.images.current, temporary); await assertRendererSandbox(previous);
     await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
     await persistLinuxNormalPackagedRestartPreferences({ cdp: dashboard });
     // Ordinary startup refresh must have reached the persisted keyed observation.
@@ -366,7 +386,7 @@ export async function runLinuxFinalLifecycle() {
     await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
     await wait(async () => { try { return await digest(IMAGE) === pair.images.next.sha256; } catch { return false; } }, 60000);
     stage = 'automatic_restart';
-    const successor = await currentApp(pair.images.next);
+    const successor = await currentApp(pair.images.next, temporary);
     if (successor.pid === previous.pid && successor.startTime === previous.startTime) fail('RESTART_IDENTITY_INVALID');
     await wait(() => updaterProcessHealth(successor.pid), 60000);
     await assertLinuxFinalProcessTreeGone(previousTree);
@@ -374,23 +394,23 @@ export async function runLinuxFinalLifecycle() {
     if (await digest(rawFixture) !== rawBefore) fail('SOURCE_STATE_CHANGED');
     const persisted = JSON.parse(await readFile(join(upgradeFixture.userData, 'desktop-settings/desktop-settings-v1.json'), 'utf8'));
     if ((persisted.settings ?? persisted).refreshIntervalSeconds !== 900) fail('SETTINGS_NOT_PRESERVED');
-    await stopOwned(successor);
+    await stopOwned(successor, temporary);
     if (child) { await terminateLinuxSmokeChild(child).catch(() => {}); child = null; }
     dashboard.close(); dashboard = null; settings.close(); settings = null;
     receipt.publicPredecessorUpdate = 'exact_published_0.1.26_to_final_0.1.27';
     receipt.replacementAndAutomaticRestartVerified = true;
     stage = 'cold_restart_no_update';
     await runNormal(upgradeFixture, async context => {
-      const restarted = await currentApp(pair.images.next); await assertRendererSandbox(restarted);
+      const restarted = await currentApp(pair.images.next, temporary); await assertRendererSandbox(restarted);
       await verifyLinuxNormalPackagedRestartPreferences(context);
       await proveNoUpdate(context.cdp, context.dashboardOrigin, restarted);
       if (!isDeepStrictEqual(beforeScope, await checkedCheckpoint(upgradeFixture)) || await digest(rawFixture) !== rawBefore) fail('LOCAL_STATE_NOT_PRESERVED');
     });
-    await assertNoOwnedMounts();
+    await assertNoOwnedMounts(temporary);
     receipt.coldRestartSettingsAndOptOutVerified = true;
     receipt.credentialAndSourceStatePreserved = true; receipt.noUpdateVerified = true;
     stage = 'owned_uninstall';
-    await uninstallImage(pair.images.next, upgradeFixture);
+    await uninstallImage(pair.images.next, upgradeFixture, temporary);
     for (const fixture of owned) await rm(fixture.root, { recursive: true });
     owned.length = 0;
     receipt.ownedUninstallAndAppCleanupVerified = true;
@@ -409,7 +429,7 @@ export async function runLinuxFinalLifecycle() {
     // Stop only hash- and start-time-bound app processes. Container destruction
     // is the outer cleanup boundary if an app or mount cannot be proved gone.
     for (const expected of Object.values(pair.images)) {
-      for (const identity of await ownedApps(expected).catch(() => [])) await stopOwned(identity).catch(() => {});
+      for (const identity of await ownedApps(expected, temporary).catch(() => [])) await stopOwned(identity, temporary).catch(() => {});
     }
     if (child) await terminateLinuxSmokeChild(child).catch(() => {});
     server.closeAllConnections(); if (server.listening) await new Promise(done => server.close(done));
