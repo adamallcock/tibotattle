@@ -2035,6 +2035,7 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-normal-packaged-smoke.test.js",
+        "test/electron-linux-installed-lifecycle.test.js",
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
         "scripts/qualify-electron-linux-final-appimage.mjs",
         ".github/workflows/electron-linux-production-package.yml",
