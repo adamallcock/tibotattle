@@ -27,6 +27,9 @@ import {
   readCutoverInventory,
   readCutoverSeal,
   runCutoverSeal,
+  finalizeCutoverSeal,
+  sha256Hex,
+  idDigest,
   splitSqlStatements,
   tableLayouts,
   validateCutoverInventory,
@@ -37,6 +40,7 @@ import {
   SYNTHETIC_D1,
   SYNTHETIC_DATABASE_NAMES,
   writeInventoryFixture,
+  writeBarrierProofFixture,
 } from "../postgres-test/fixtures/w2-seal/fence-fixtures.mjs";
 import {
   createFakeWranglerProviderSpawn,
@@ -713,4 +717,63 @@ test("the restore-base layout seals the restore-era ledger and refuses every oth
   const foreign = await sealWorld({ ...world, inventory });
   await assert.rejects(foreign.run(), isCode("CUTOVER_SOURCE_NOT_ALLOWED"));
   assert.equal(foreign.calls.length, 0);
+});
+
+import { writeCaptureProofFixture, captureProofInstant } from '../postgres-test/fixtures/w2-seal/capture-proof-fixtures.mjs';
+
+test('fixed seal creates a non-admissible draft and finalizes only after covered successor proof', async t => {
+  const fresh = await prepareSealWorld({ commit: COMMIT });
+  const ecosystem = await writeCaptureProofFixture({ d1: fresh.fence.receipt.d1,
+    accountSha256: idDigest('account', fresh.inventory.inventory.accountId) });
+  t.after(() => ecosystem.dispose());
+  const barrierDir = await privateDirectory('seal-fixed-barrier-');
+  const barrier = await writeBarrierProofFixture({ directory: barrierDir, observedAtMs: Date.parse(captureProofInstant(20)) });
+  let tick = 40;
+  const staged = await sealWorld({ ...fresh, fence: ecosystem.original, proof: barrier },
+    { overrides: { now: () => new Date(captureProofInstant(tick++)) } });
+  const result = await staged.run();
+  assert.equal(result.mode, 'draft');
+  assert.equal(await readFile(result.manifestPath, 'utf8').then(text => JSON.parse(text).schema), 'tibotattle-cutover-capture-draft-v1');
+  await assert.rejects(readCutoverSeal({ manifestPath: result.manifestPath, expectedSealId: result.sealId }), isCode('CUTOVER_SEAL_MANIFEST_INVALID'));
+  const args = { draftPath: result.manifestPath, draftSha256: result.manifestSha256,
+    originalFenceReceiptPath: ecosystem.original.path, successorFenceReceiptPath: ecosystem.original.path,
+    successorFenceReceiptSha256: ecosystem.original.sha256, ownerDirectory: staged.out, execute: true };
+  await assert.rejects(finalizeCutoverSeal(args), isCode('CUTOVER_CAPTURE_PROOF_INVALID'));
+  assert.ok(!(await listing(staged.out)).includes('seal-manifest.json'));
+  const final = await finalizeCutoverSeal({ ...args, successorFenceReceiptPath: ecosystem.successor.path,
+    successorFenceReceiptSha256: ecosystem.successor.sha256 });
+  const read = await readCutoverSeal({ manifestPath: final.manifestPath, expectedSealId: final.sealId,
+    originalFenceReceiptPath: ecosystem.original.path });
+  assert.equal(read.manifest.captureProof.successorFenceReceiptSha256, ecosystem.successor.sha256);
+  await assert.rejects(finalizeCutoverSeal({ ...args, successorFenceReceiptPath: ecosystem.successor.path,
+    successorFenceReceiptSha256: ecosystem.successor.sha256 }), isCode('CUTOVER_OUTPUT_EXISTS'));
+  await ecosystem.release();
+  await assert.rejects(readCutoverSeal({ manifestPath: final.manifestPath, expectedSealId: final.sealId,
+    originalFenceReceiptPath: ecosystem.original.path }));
+});
+
+test('guarded timestamp selection forwards exact ISO and refuses malformed options before transport', async () => {
+  const inventory = await readCutoverInventory(world.inventory.path);
+  const selections = [];
+  const guarded = guardCutoverTransport({ bookmark: async (source, selection) => {
+    selections.push(selection); return SYNTHETIC_BOOKMARKS[source.role]; }, query: async () => [] }, inventory);
+  await guarded.bookmark(inventory.sources.ingestion, { timestamp: captureProofInstant(40) });
+  assert.deepEqual(selections, [{ timestamp: captureProofInstant(40) }]);
+  for (const options of [{ timestamp: '2026-01-01' }, { timestamp: captureProofInstant(40), extra: true }, { timestamp: '2026-02-30T00:00:00.000Z' }])
+    await assert.rejects(guarded.bookmark(inventory.sources.ingestion, options), isCode('CUTOVER_ARGUMENT_INVALID'));
+  assert.equal(selections.length, 1);
+});
+
+test('Wrangler fixed selection uses its exact timestamp argument and legacy selection omits it', async () => {
+  const inventory = await readCutoverInventory(world.inventory.path);
+  const directory = await privateDirectory('seal-timestamp-cli-');
+  const args = [];
+  const transport = createWranglerCutoverTransport({ inventory, transportDirectory: directory,
+    remote: true, ownerReadOnly: true, environment: {}, spawn: (_command, arguments_) => {
+      args.push(arguments_); return { status: 0, stdout: JSON.stringify({ bookmark: SYNTHETIC_BOOKMARKS.ingestion }) }; } });
+  await transport.bookmark(inventory.sources.ingestion, { timestamp: captureProofInstant(40) });
+  await transport.bookmark(inventory.sources.ingestion);
+  assert.equal(args[0][args[0].indexOf('--timestamp') + 1], captureProofInstant(40));
+  assert.ok(!args[1].includes('--timestamp'));
+  await transport.dispose();
 });

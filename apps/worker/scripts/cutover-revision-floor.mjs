@@ -74,8 +74,15 @@
 // Reloading the identical floor is a no-op that writes nothing; any other
 // floor is REVISION_FLOOR_CONFLICT.
 
+// EP-8 v3 fixed-timestamp capture is staged: fresh timestamp-selected B0/B1
+// must literally match the original pin, and capture writes a private draft.
+// `finalize` admits a v2 artifact only after a reader-valid same-lineage EP-8
+// successor's zero-event analytics window covers the entire capture interval.
+// Drafts are never admitted by the artifact readers. Legacy EP-8 paths retain
+// their strict current-bookmark v1 contracts described above.
+
 import { lstat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fencedAnalyticsEntry, readCutoverAnalyticsSource } from "./cutover-admin-history-export.mjs";
 import {
@@ -97,7 +104,12 @@ import {
   writePrivateFileOnce,
 } from "./cutover-source-seal.mjs";
 
+import { readCaptureAnchor, beginCapture, finishCapture, createCaptureDraft, validateCaptureDraft,
+  finalizeCaptureDraft, validateCaptureProof, revalidateCaptureProof } from "./cutover-capture-proof.mjs";
+
 export const CUTOVER_REVISION_FLOOR_SCHEMA = "tibotattle-cutover-revision-floor-v1";
+export const CUTOVER_REVISION_FLOOR_FINAL_SCHEMA = "tibotattle-cutover-revision-floor-v2";
+export const CUTOVER_REVISION_FLOOR_DRAFT_FILE = "revision-floor-draft.json";
 export const CUTOVER_REVISION_FLOOR_FILE = "revision-floor.json";
 export const REVISION_FLOOR_PROVENANCES = Object.freeze(["captured", "synthetic"]);
 /** ANALYTICS_V2_MAX_REVISION_SEED (store-run.ts) and the migration's CHECK. */
@@ -203,7 +215,10 @@ const CAPTURE_KEYS = Object.freeze(["analyticsDatabaseIdSha256", "analyticsBookm
 
 /** Validate a parsed floor body (closed keys and types). Returns it frozen. */
 export function validateRevisionFloorBody(value) {
-  if (!exactKeys(value, BODY_KEYS) || value.schema !== CUTOVER_REVISION_FLOOR_SCHEMA
+  const finalized = value?.schema === CUTOVER_REVISION_FLOOR_FINAL_SCHEMA;
+  if (!exactKeys(value, [...BODY_KEYS, ...(finalized ? ["captureProof"] : [])])
+      || (!finalized && value.schema !== CUTOVER_REVISION_FLOOR_SCHEMA)
+      || (finalized && value.provenance !== "captured")
       || !REVISION_FLOOR_PROVENANCES.includes(value.provenance)
       || ![value.sealId, value.fenceReceiptSha256].every(item => typeof item === "string" && SHA256.test(item))
       || typeof value.sourceCommit !== "string" || !COMMIT.test(value.sourceCommit)
@@ -218,6 +233,15 @@ export function validateRevisionFloorBody(value) {
     }
   } else if (value.capture !== null) {
     floorFail("REVISION_FLOOR_FILE_INVALID");
+  }
+  if (finalized) {
+    const { captureProof, ...body } = value;
+    try { validateCaptureProof(captureProof, body); } catch { floorFail("REVISION_FLOOR_FILE_INVALID"); }
+    const roles = captureProof.capture.roles;
+    if (captureProof.kind !== "revision-floor" || captureProof.originalFenceReceiptSha256 !== value.fenceReceiptSha256
+        || roles.length !== 1 || roles[0].label !== "analytics" || roles[0].role !== CUTOVER_ANALYTICS_FLOOR_ROLE
+        || roles[0].databaseIdSha256 !== value.capture.analyticsDatabaseIdSha256
+        || roles[0].bookmarkSha256 !== value.capture.analyticsBookmarkSha256) floorFail("REVISION_FLOOR_FILE_INVALID");
   }
   const days = validateRevisionFloorDays(value.days);
   const maxRevision = Math.max(...days.map(([, revision]) => revision));
@@ -341,11 +365,20 @@ export function assertRevisionFloorProvenance(floor, { fencedAnalytics, syntheti
  * consumer-side reader, which also refuses a released fence
  * (CUTOVER_FENCE_RECEIPT_INVALID). Read-only.
  */
-export async function checkRevisionFloorProvenance({ floor, fenceReceiptPath, fenceReceiptSha256, syntheticAdmitted } = {}) {
+export async function checkRevisionFloorProvenance({ floor, fenceReceiptPath, fenceReceiptSha256, syntheticAdmitted, successorFenceReceiptPath } = {}) {
   if (typeof fenceReceiptPath !== "string" || typeof fenceReceiptSha256 !== "string" || !SHA256.test(fenceReceiptSha256)) {
     floorFail("REVISION_FLOOR_USAGE");
   }
   const fencedAnalytics = await fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256);
+  if (floor.schema === CUTOVER_REVISION_FLOOR_FINAL_SCHEMA) {
+    const { captureProof, floorSha256: _digest, ...body } = floor;
+    validateRevisionFloorBody({ ...body, captureProof });
+    await revalidateCaptureProof({ proof: captureProof, body, originalFenceReceiptPath: fenceReceiptPath,
+      successorFenceReceiptPath: successorFenceReceiptPath ?? join(dirname(fenceReceiptPath),
+        `fence-${captureProof.successorFenceReceiptSha256}.json`) });
+  } else if (fencedAnalytics.receipt.schema === "cloudflare-writer-fence-receipt-v3" && floor.provenance === "captured") {
+    floorFail("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH");
+  }
   return assertRevisionFloorProvenance(floor, { fencedAnalytics, syntheticAdmitted });
 }
 
@@ -396,7 +429,7 @@ export async function loadRevisionFloorInTransaction({ client, schema, floor } =
       || !record(floor) || typeof floor.floorSha256 !== "string" || !SHA256.test(floor.floorSha256)) {
     floorFail("REVISION_FLOOR_USAGE");
   }
-  const valid = validateRevisionFloorBody(Object.fromEntries(BODY_KEYS.map(key => [key, floor[key]])));
+  const valid = validateRevisionFloorBody(Object.fromEntries([...BODY_KEYS, ...(floor.schema === CUTOVER_REVISION_FLOOR_FINAL_SCHEMA ? ["captureProof"] : [])].map(key => [key, floor[key]])));
   const quoted = quoteIdentifier(schema);
   const table = name => `${quoted}.${quoteIdentifier(name)}`;
   const present = await query(client, `SELECT to_regclass($1) IS NOT NULL AS floor, to_regclass($2) IS NOT NULL AS source,
@@ -485,7 +518,7 @@ export async function captureRevisionFloor({
 } = {}) {
   const inventory = await readCutoverInventory(inventoryPath);
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
-  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
+  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId, originalFenceReceiptPath: fenceReceiptPath });
   if (seal.manifest.inventorySha256 !== inventory.inventorySha256) cutoverFail("CUTOVER_SEAL_MANIFEST_INVALID");
   const facts = revisionFloorSealFacts(seal);
   if (!SHA256.test(facts.fenceReceiptSha256)) cutoverFail("CUTOVER_SEAL_MANIFEST_INVALID");
@@ -500,7 +533,9 @@ export async function captureRevisionFloor({
       analyticsDatabaseIdSha256: analytics.databaseIdSha256, statementSha256: CUTOVER_REVISION_FLOOR_STATEMENT_SHA256 });
   }
   if (remote !== true || ownerReadOnly !== true) cutoverFail("CUTOVER_REMOTE_NOT_AUTHORIZED");
-  const path = join(directory, CUTOVER_REVISION_FLOOR_FILE);
+  const anchor = await readCaptureAnchor({ fenceReceiptPath, fenceReceiptSha256: facts.fenceReceiptSha256 });
+  if (anchor.fixed && anchor.receipt.accountSha256 !== sha256Hex(`account:${inventory.accountId}`)) cutoverFail("CUTOVER_FENCE_SOURCE_MISMATCH");
+  const path = join(directory, anchor.fixed ? CUTOVER_REVISION_FLOOR_DRAFT_FILE : CUTOVER_REVISION_FLOOR_FILE);
   await refuseExisting(path);
   // The transport sees only this one D1, as the pinned read role.
   const source = Object.freeze({ ...analytics, role: CUTOVER_ANALYTICS_FLOOR_ROLE });
@@ -512,15 +547,18 @@ export async function captureRevisionFloor({
       inventory: scope, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
     }) : null;
     const guarded = guardCutoverTransport(transport ?? ownedTransport, scope);
-    const b0 = await guarded.bookmark(source);
+    const context = anchor.fixed ? await beginCapture({ anchor,
+      sources: [{ fenceLabel: "analytics", source }], guarded, now }) : null;
+    const b0 = context ? fenced.bookmark : await guarded.bookmark(source);
     if (b0 !== fenced.bookmark) cutoverFail("CUTOVER_SOURCE_BOOKMARK_DRIFT");
     const days = floorRows(await guarded.query(source, CUTOVER_REVISION_FLOOR_STATEMENT));
-    const b1 = await guarded.bookmark(source);
+    const captureProofDraft = context ? await finishCapture(context, { now }) : null;
+    const b1 = context ? b0 : await guarded.bookmark(source);
     if (b1 !== b0) cutoverFail("CUTOVER_SOURCE_BOOKMARK_DRIFT");
     await ownedTransport?.dispose();
-    const capturedAt = new Date(now().getTime()).toISOString();
-    const { text, floorSha256 } = renderRevisionFloorFile({
-      schema: CUTOVER_REVISION_FLOOR_SCHEMA,
+    const capturedAt = captureProofDraft?.completedAt ?? new Date(now().getTime()).toISOString();
+    const body = {
+      schema: anchor.fixed ? CUTOVER_REVISION_FLOOR_FINAL_SCHEMA : CUTOVER_REVISION_FLOOR_SCHEMA,
       provenance: "captured",
       ...facts,
       capturedAt,
@@ -529,11 +567,16 @@ export async function captureRevisionFloor({
       days,
       dayCount: days.length,
       maxRevision: Math.max(...days.map(([, revision]) => revision)),
-    });
+    };
+    const output = context ? createCaptureDraft({ kind: "revision-floor", body, anchor, capture: captureProofDraft }) : body;
+    const text = `${canonicalJson(output)}\n`;
+    const floorSha256 = sha256Hex(text);
+    if (!context) validateRevisionFloorBody(body);
     if (containsSignedUrl(text)) cutoverFail("CUTOVER_SECRET_IN_OUTPUT");
     const written = await writePrivateFileOnce(path, text, 0o400);
     if (written !== floorSha256) cutoverFail("CUTOVER_OWNER_DIRECTORY_UNSAFE");
-    return Object.freeze({ mode: "captured", path, floorSha256, dayCount: days.length,
+    return Object.freeze({ mode: context ? "draft" : "captured", path, floorSha256,
+      ...(context ? { draftSha256: floorSha256 } : {}), dayCount: days.length,
       maxRevision: Math.max(...days.map(([, revision]) => revision)), firstDay: days[0][0], lastDay: days.at(-1)[0] });
   } catch (error) {
     await ownedTransport?.dispose().catch(() => {});
@@ -602,7 +645,7 @@ export async function checkRevisionFloor({ floorPath, floorSha256, manifestPath,
   if (typeof fenceReceiptPath !== "string" || fenceReceiptPath.length === 0 || typeof syntheticAdmitted !== "boolean") {
     floorFail("REVISION_FLOOR_USAGE");
   }
-  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
+  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId, originalFenceReceiptPath: fenceReceiptPath });
   const facts = revisionFloorSealFacts(seal);
   const floor = assertRevisionFloorBinding(await readRevisionFloorFile({ path: floorPath, expectedSha256: floorSha256 }),
     facts);
@@ -611,10 +654,33 @@ export async function checkRevisionFloor({ floorPath, floorSha256, manifestPath,
   return Object.freeze({ mode: "check", ...revisionFloorSummary(floor), fenceBound: provenance.fenceBound });
 }
 
+/** Finalize a private pinned draft after successor analytics cover its full capture. */
+export async function finalizeRevisionFloor({ draftPath, draftSha256, fenceReceiptPath,
+  successorFenceReceiptPath, successorFenceReceiptSha256, ownerDirectory, forbiddenRoots } = {}) {
+  const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
+  const bytes = await readPrivateFile(draftPath, MAX_FILE_BYTES, "CUTOVER_ARGUMENT_INVALID");
+  if (!SHA256.test(draftSha256 ?? "") || sha256Hex(bytes) !== draftSha256) floorFail("REVISION_FLOOR_FILE_INVALID");
+  let draft;
+  try { draft = JSON.parse(bytes.toString("utf8")); validateCaptureDraft(draft); } catch { floorFail("REVISION_FLOOR_FILE_INVALID"); }
+  if (`${canonicalJson(draft)}\n` !== bytes.toString("utf8") || draft.kind !== "revision-floor"
+      || draft.body?.schema !== CUTOVER_REVISION_FLOOR_FINAL_SCHEMA) floorFail("REVISION_FLOOR_FILE_INVALID");
+  const { body, proof } = await finalizeCaptureDraft({ draft, originalFenceReceiptPath: fenceReceiptPath,
+    successorFenceReceiptPath, successorFenceReceiptSha256 });
+  const { text, floorSha256 } = renderRevisionFloorFile({ ...body, captureProof: proof });
+  if (Buffer.byteLength(text) > MAX_FILE_BYTES) floorFail("REVISION_FLOOR_FILE_INVALID");
+  if (containsSignedUrl(text)) cutoverFail("CUTOVER_SECRET_IN_OUTPUT");
+  const path = join(directory, CUTOVER_REVISION_FLOOR_FILE);
+  await writePrivateFileOnce(path, text, 0o400);
+  return Object.freeze({ mode: "finalized", path, floorSha256, dayCount: body.dayCount, maxRevision: body.maxRevision });
+}
+
 // ---------------------------------------------------------------------------
 // CLI.
 
 const COMMANDS = Object.freeze({
+  finalize: { values: { "--draft": "draftPath", "--draft-sha256": "draftSha256",
+    "--fence-receipt": "fenceReceiptPath", "--successor-fence-receipt": "successorFenceReceiptPath",
+    "--successor-fence-sha256": "successorFenceReceiptSha256", "--out": "ownerDirectory" }, switches: {} },
   capture: {
     values: { "--inventory": "inventoryPath", "--seal": "manifestPath", "--seal-id": "sealId",
       "--analytics-source": "analyticsSourcePath", "--fence-receipt": "fenceReceiptPath", "--out": "ownerDirectory" },
@@ -662,7 +728,9 @@ export function parseRevisionFloorArguments(argv) {
 async function main(argv) {
   const options = parseRevisionFloorArguments(argv);
   let result;
-  if (options.command === "capture") {
+  if (options.command === "finalize") {
+    result = await finalizeRevisionFloor(options);
+  } else if (options.command === "capture") {
     result = await captureRevisionFloor({
       inventoryPath: resolve(options.inventoryPath), manifestPath: resolve(options.manifestPath), sealId: options.sealId,
       analyticsSourcePath: resolve(options.analyticsSourcePath), fenceReceiptPath: resolve(options.fenceReceiptPath),

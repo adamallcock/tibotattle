@@ -42,9 +42,16 @@
 // runOperationalHistoryProduction (postgres-legacy-contribution-transfer.mjs)
 // reads it back with readCutoverAdminHistoryExport and maps it.
 
+// EP-8 v3 fixed-timestamp capture is staged: fresh timestamp-selected B0/B1
+// must literally match the original pin, and capture writes a private draft.
+// `finalize` admits a v2 artifact only after a reader-valid same-lineage EP-8
+// successor's zero-event analytics window covers the entire capture interval.
+// Drafts are never admitted by the artifact readers. Legacy EP-8 paths retain
+// their strict current-bookmark v1 contracts described above.
+
 import { execFileSync } from "node:child_process";
 import { lstat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readCloudflareWriterFenceReceipt } from "./cloudflare-writer-fence.mjs";
 import {
@@ -65,7 +72,12 @@ import {
   writePrivateFileOnce,
 } from "./cutover-source-seal.mjs";
 
+import { readCaptureAnchor, beginCapture, finishCapture, createCaptureDraft, validateCaptureDraft,
+  finalizeCaptureDraft, validateCaptureProof, revalidateCaptureProof } from "./cutover-capture-proof.mjs";
+
 export const CUTOVER_ADMIN_HISTORY_EXPORT_SCHEMA = "tibotattle-cutover-admin-history-v1";
+export const CUTOVER_ADMIN_HISTORY_FINAL_SCHEMA = "tibotattle-cutover-admin-history-v2";
+export const CUTOVER_ADMIN_HISTORY_DRAFT_FILE = "admin-history-export-draft.json";
 export const CUTOVER_ANALYTICS_SOURCE_SCHEMA = "tibotattle-cutover-analytics-source-v1";
 export const CUTOVER_ADMIN_HISTORY_EXPORT_FILE = "admin-history-export.json";
 export const ADMIN_HISTORY_ANALYTICS_BINDING = "ANALYTICS_DB";
@@ -261,7 +273,7 @@ export async function fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256)
   if (entries.length !== 1 || !SHA256.test(entries[0].idSha256 ?? "") || !OPAQUE.test(entries[0].bookmark ?? "")) {
     cutoverFail("CUTOVER_FENCE_RECEIPT_INVALID");
   }
-  return Object.freeze({ idSha256: entries[0].idSha256, bookmark: entries[0].bookmark });
+  return Object.freeze({ idSha256: entries[0].idSha256, bookmark: entries[0].bookmark, receipt });
 }
 
 // ---------------------------------------------------------------------------
@@ -336,11 +348,12 @@ export async function exportCutoverAdminHistory({
   environment = undefined,
   repositoryRoot = REPOSITORY_ROOT,
   git = defaultGit,
+  now = () => new Date(),
   forbiddenRoots = undefined,
 } = {}) {
   const inventory = await readCutoverInventory(inventoryPath);
   const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
-  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
+  const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId, originalFenceReceiptPath: fenceReceiptPath });
   if (seal.manifest.inventorySha256 !== inventory.inventorySha256) cutoverFail("CUTOVER_SEAL_MANIFEST_INVALID");
   const fenceReceiptSha256 = seal.manifest.fence?.fenceReceiptSha256;
   if (typeof fenceReceiptSha256 !== "string" || !SHA256.test(fenceReceiptSha256)) cutoverFail("CUTOVER_SEAL_MANIFEST_INVALID");
@@ -350,6 +363,8 @@ export async function exportCutoverAdminHistory({
   }
   const fenced = await fencedAnalyticsEntry(fenceReceiptPath, fenceReceiptSha256);
   if (fenced.idSha256 !== source.databaseIdSha256) cutoverFail("CUTOVER_FENCE_SOURCE_MISMATCH");
+  const anchor = await readCaptureAnchor({ fenceReceiptPath, fenceReceiptSha256 });
+  if (anchor.fixed && anchor.receipt.accountSha256 !== sha256Hex(`account:${inventory.accountId}`)) cutoverFail("CUTOVER_FENCE_SOURCE_MISMATCH");
   const sourceId = await sealedSourceIdOf(seal);
   const migrationSha256 = expectedAdminHistoryMigrationSha256({ commit: inventory.expectedSourceCommit, repositoryRoot, git });
   if (execute !== true) {
@@ -357,7 +372,7 @@ export async function exportCutoverAdminHistory({
       migrationSha256 });
   }
   if (remote !== true || ownerReadOnly !== true) cutoverFail("CUTOVER_REMOTE_NOT_AUTHORIZED");
-  const path = join(directory, CUTOVER_ADMIN_HISTORY_EXPORT_FILE);
+  const path = join(directory, anchor.fixed ? CUTOVER_ADMIN_HISTORY_DRAFT_FILE : CUTOVER_ADMIN_HISTORY_EXPORT_FILE);
   try {
     await lstat(path);
     cutoverFail("CUTOVER_OUTPUT_EXISTS");
@@ -374,7 +389,9 @@ export async function exportCutoverAdminHistory({
       inventory: scope, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
     }) : null;
     const guarded = guardCutoverTransport(transport ?? ownedTransport, scope);
-    const b0 = await guarded.bookmark(source);
+    const context = anchor.fixed ? await beginCapture({ anchor,
+      sources: [{ fenceLabel: ADMIN_HISTORY_FENCE_LABEL, source }], guarded, now }) : null;
+    const b0 = anchor.fixed ? fenced.bookmark : await guarded.bookmark(source);
     if (b0 !== fenced.bookmark) cutoverFail("CUTOVER_SOURCE_BOOKMARK_DRIFT");
     const ledger = await guarded.query(source, `SELECT name,sha256 FROM d1_storage_migrations WHERE name='${ADMIN_HISTORY_MIGRATION.name}'`);
     if (ledger.length !== 1 || !exactKeys(ledger[0], ["name", "sha256"]) || ledger[0].name !== ADMIN_HISTORY_MIGRATION.name
@@ -382,11 +399,12 @@ export async function exportCutoverAdminHistory({
       cutoverFail("CUTOVER_LEDGER_MISMATCH");
     }
     const { snapshots, otherSourceRows } = await readRemoteSnapshots(guarded, source, sourceId);
-    const b1 = await guarded.bookmark(source);
+    const capture = context ? await finishCapture(context, { now }) : null;
+    const b1 = context ? b0 : await guarded.bookmark(source);
     if (b1 !== b0) cutoverFail("CUTOVER_SOURCE_BOOKMARK_DRIFT");
     await ownedTransport?.dispose();
     const body = {
-      schema: CUTOVER_ADMIN_HISTORY_EXPORT_SCHEMA,
+      schema: anchor.fixed ? CUTOVER_ADMIN_HISTORY_FINAL_SCHEMA : CUTOVER_ADMIN_HISTORY_EXPORT_SCHEMA,
       sealId,
       inventorySha256: inventory.inventorySha256,
       fenceReceiptSha256,
@@ -397,12 +415,14 @@ export async function exportCutoverAdminHistory({
       snapshotsSha256: snapshotsDigest(snapshots),
       otherSourceRows,
     };
-    const text = `${canonicalJson(body)}\n`;
+    const output = anchor.fixed ? createCaptureDraft({ kind: "admin-history", body, anchor, capture }) : body;
+    const text = `${canonicalJson(output)}\n`;
     if (Buffer.byteLength(text) > ADMIN_HISTORY_MAX_EXPORT_BYTES) historyFail("CUTOVER_ADMIN_HISTORY_TOO_LARGE");
     if (containsSignedUrl(text)) cutoverFail("CUTOVER_SECRET_IN_OUTPUT");
     const exportSha256 = await writePrivateFileOnce(path, text, 0o400);
     return Object.freeze({
-      mode: "exported",
+      mode: anchor.fixed ? "draft" : "exported",
+      ...(anchor.fixed ? { draftSha256: exportSha256 } : {}),
       path,
       exportSha256,
       snapshots: snapshots.length,
@@ -428,7 +448,7 @@ export async function exportCutoverAdminHistory({
  * sourceIdSha256 with its own seal. Any defect is
  * CUTOVER_ADMIN_HISTORY_EXPORT_INVALID.
  */
-export async function readCutoverAdminHistoryExport({ path, expectedSha256 } = {}) {
+export async function readCutoverAdminHistoryExport({ path, expectedSha256, originalFenceReceiptPath, successorFenceReceiptPath } = {}) {
   if (typeof expectedSha256 !== "string" || !SHA256.test(expectedSha256)) historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
   let bytes;
   try {
@@ -443,10 +463,33 @@ export async function readCutoverAdminHistoryExport({ path, expectedSha256 } = {
   } catch {
     historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
   }
+  if (`${canonicalJson(value)}\n` !== bytes.toString("utf8")) historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+  validateAdminHistoryBody(value);
+  const finalized = value?.schema === CUTOVER_ADMIN_HISTORY_FINAL_SCHEMA;
+  if (originalFenceReceiptPath !== undefined) {
+    const anchor = await readCaptureAnchor({ fenceReceiptPath: originalFenceReceiptPath, fenceReceiptSha256: value.fenceReceiptSha256 });
+    if (anchor.fixed && !finalized) historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+  }
+  if (finalized && originalFenceReceiptPath !== undefined) {
+    const { captureProof, ...body } = value;
+    await revalidateCaptureProof({ proof: captureProof, body, originalFenceReceiptPath,
+      successorFenceReceiptPath: successorFenceReceiptPath ?? join(dirname(originalFenceReceiptPath),
+        `fence-${captureProof.successorFenceReceiptSha256}.json`) });
+  }
+  return Object.freeze({
+    ...value,
+    analytics: Object.freeze({ ...value.analytics }),
+    snapshots: Object.freeze(value.snapshots.map(entry => Object.freeze([...entry]))),
+    exportSha256: expectedSha256,
+  });
+}
+
+function validateAdminHistoryBody(value) {
   const invalid = () => historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+  const finalized = value?.schema === CUTOVER_ADMIN_HISTORY_FINAL_SCHEMA;
   if (!exactKeys(value, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "analytics", "sourceIdSha256",
-    "snapshots", "snapshotsSha256", "otherSourceRows"])
-      || value.schema !== CUTOVER_ADMIN_HISTORY_EXPORT_SCHEMA
+    "snapshots", "snapshotsSha256", "otherSourceRows", ...(finalized ? ["captureProof"] : [])])
+      || (!finalized && value.schema !== CUTOVER_ADMIN_HISTORY_EXPORT_SCHEMA)
       || ![value.sealId, value.inventorySha256, value.fenceReceiptSha256, value.sourceIdSha256, value.snapshotsSha256]
         .every(item => typeof item === "string" && SHA256.test(item))
       || !exactKeys(value.analytics, ["databaseIdSha256", "bookmark", "migration", "migrationSha256"])
@@ -454,8 +497,17 @@ export async function readCutoverAdminHistoryExport({ path, expectedSha256 } = {
       || value.analytics.migration !== ADMIN_HISTORY_MIGRATION.name || !SHA256.test(value.analytics.migrationSha256 ?? "")
       || !Number.isSafeInteger(value.otherSourceRows) || value.otherSourceRows < 0
       || !Array.isArray(value.snapshots) || value.snapshots.length > ADMIN_HISTORY_MAX_SNAPSHOTS
-      || `${canonicalJson(value)}\n` !== bytes.toString("utf8")) {
+) {
     invalid();
+  }
+  if (finalized) {
+    const { captureProof, ...body } = value;
+    try { validateCaptureProof(captureProof, body); } catch { invalid(); }
+    const role = captureProof.capture.roles;
+    if (captureProof.kind !== "admin-history" || captureProof.originalFenceReceiptSha256 !== value.fenceReceiptSha256
+        || role.length !== 1 || role[0].label !== ADMIN_HISTORY_FENCE_LABEL || role[0].role !== ADMIN_HISTORY_FENCE_LABEL
+        || role[0].databaseIdSha256 !== value.analytics.databaseIdSha256
+        || role[0].bookmarkSha256 !== sha256Hex(value.analytics.bookmark)) invalid();
   }
   let after = null;
   for (const entry of value.snapshots) {
@@ -466,12 +518,28 @@ export async function readCutoverAdminHistoryExport({ path, expectedSha256 } = {
     after = entry[0];
   }
   if (snapshotsDigest(value.snapshots) !== value.snapshotsSha256) invalid();
-  return Object.freeze({
-    ...value,
-    analytics: Object.freeze({ ...value.analytics }),
-    snapshots: Object.freeze(value.snapshots.map(entry => Object.freeze([...entry]))),
-    exportSha256: expectedSha256,
-  });
+  return value;
+}
+
+/** Finalize a pinned draft only after a same-lineage successor covers its complete capture. */
+export async function finalizeCutoverAdminHistory({ draftPath, draftSha256, fenceReceiptPath,
+  successorFenceReceiptPath, successorFenceReceiptSha256, ownerDirectory, forbiddenRoots } = {}) {
+  const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
+  const bytes = await readPrivateFile(draftPath, ADMIN_HISTORY_MAX_EXPORT_BYTES, "CUTOVER_ARGUMENT_INVALID");
+  if (!SHA256.test(draftSha256 ?? "") || sha256Hex(bytes) !== draftSha256) historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+  let draft;
+  try { draft = JSON.parse(bytes.toString("utf8")); validateCaptureDraft(draft); } catch { historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID"); }
+  if (`${canonicalJson(draft)}\n` !== bytes.toString("utf8") || draft.kind !== "admin-history"
+      || draft.body?.schema !== CUTOVER_ADMIN_HISTORY_FINAL_SCHEMA) historyFail("CUTOVER_ADMIN_HISTORY_EXPORT_INVALID");
+  const { body, proof } = await finalizeCaptureDraft({ draft, originalFenceReceiptPath: fenceReceiptPath,
+    successorFenceReceiptPath, successorFenceReceiptSha256 });
+  const final = validateAdminHistoryBody({ ...body, captureProof: proof });
+  const text = `${canonicalJson(final)}\n`;
+  if (Buffer.byteLength(text) > ADMIN_HISTORY_MAX_EXPORT_BYTES) historyFail("CUTOVER_ADMIN_HISTORY_TOO_LARGE");
+  if (containsSignedUrl(text)) cutoverFail("CUTOVER_SECRET_IN_OUTPUT");
+  const path = join(directory, CUTOVER_ADMIN_HISTORY_EXPORT_FILE);
+  const exportSha256 = await writePrivateFileOnce(path, text, 0o400);
+  return Object.freeze({ mode: "finalized", path, exportSha256, snapshots: body.snapshots.length });
 }
 
 // ---------------------------------------------------------------------------
@@ -479,10 +547,12 @@ export async function readCutoverAdminHistoryExport({ path, expectedSha256 } = {
 
 function parseArguments(argv) {
   const [command, ...rest] = argv;
-  if (command !== "export") cutoverFail("CUTOVER_ARGUMENT_INVALID");
-  const values = { "--inventory": "inventoryPath", "--seal": "manifestPath", "--seal-id": "sealId",
+  if (!["export", "finalize"].includes(command)) cutoverFail("CUTOVER_ARGUMENT_INVALID");
+  const values = command === "finalize" ? { "--draft": "draftPath", "--draft-sha256": "draftSha256",
+    "--fence-receipt": "fenceReceiptPath", "--successor-fence-receipt": "successorFenceReceiptPath",
+    "--successor-fence-sha256": "successorFenceReceiptSha256", "--out": "ownerDirectory" } : { "--inventory": "inventoryPath", "--seal": "manifestPath", "--seal-id": "sealId",
     "--analytics-source": "analyticsSourcePath", "--fence-receipt": "fenceReceiptPath", "--out": "ownerDirectory" };
-  const switches = { "--remote": "remote", "--owner-read-only": "ownerReadOnly", "--execute": "execute" };
+  const switches = command === "finalize" ? {} : { "--remote": "remote", "--owner-read-only": "ownerReadOnly", "--execute": "execute" };
   const options = {};
   for (let index = 0; index < rest.length; index += 1) {
     const flag = rest[index];
@@ -502,12 +572,12 @@ function parseArguments(argv) {
   for (const key of Object.values(values)) {
     if (options[key] === undefined) cutoverFail("CUTOVER_ARGUMENT_INVALID");
   }
-  return options;
+  return { command, ...options };
 }
 
 async function main(argv) {
   const options = parseArguments(argv);
-  const result = await exportCutoverAdminHistory({
+  const result = options.command === "finalize" ? await finalizeCutoverAdminHistory(options) : await exportCutoverAdminHistory({
     inventoryPath: resolve(options.inventoryPath),
     manifestPath: resolve(options.manifestPath),
     sealId: options.sealId,
@@ -519,7 +589,7 @@ async function main(argv) {
     ownerReadOnly: options.ownerReadOnly === true,
   });
   const { path: _path, ...printable } = result;
-  process.stdout.write(`${JSON.stringify({ command: "export", ...printable })}\n`);
+  process.stdout.write(`${JSON.stringify({ command: options.command, ...printable })}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

@@ -346,6 +346,74 @@ the typed deploy operation record. Abort: [Abort A](#abort-a-before-any-gcp-mode
 
 Authorization: the D1 seal export, a read-only production operation. `owner`.
 
+### Fixed-timestamp capture and finalization
+
+With an EP-8 v3 receipt, `seal`, admin-history `export`, revision-floor
+`capture`, and `verify-unchanged` produce private, non-admissible drafts.
+Legacy receipts retain their strict original workflow. Fixed captures reread
+the original fixed pin and select fresh internal timestamps before and after
+all reads. Cloudflare returns the nearest available bookmark, without a
+freshness bound; literal equality alone cannot establish current quiescence
+([Cloudflare bookmark contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/subresources/time_travel/methods/get_bookmark/)).
+A same-lineage successor EP-8 verification must also cover every capture through
+its completion with the existing zero-write, zero-invocation, inventory,
+source/history, R2, schedule and queue guards. No caller timestamp is accepted.
+
+After a capture completes, wait at least the five-minute analytics margin plus
+an operator margin, then run the original EP-8 `verify` again using the original
+plan and observation pins. Require its `bookmarkTimestamp` and analytics end to
+be at or after the draft's `capture.completedAt`; do not create a new baseline
+or change the plan. Preserve the original and successor receipt files together
+in their private receipts directory. Finalization performs local reads only:
+
+```bash
+node scripts/cloudflare-writer-fence.mjs verify --plan=<private fence plan> \
+  --receipts=<private receipts directory> --fence=<plan receipt sha256> \
+  --observation=<original observation sha256>
+node scripts/cutover-source-seal.mjs finalize --draft <owner dir>/seal-draft.json \
+  --draft-sha256 <draft file sha256> --fence-receipt <original EP-8 receipt> \
+  --successor-fence-receipt <successor EP-8 receipt> --successor-fence-sha256 <successor sha256> \
+  --out <owner dir>
+```
+
+The finalized manifest is `seal-manifest.json`, schema v2. Its stable `sealId`
+pins the complete immutable core; its capture proof separately pins that core
+and the successor receipt. Keep the returned manifest file digest as well.
+Only the finalized seal may supply projections or later captures. Run the
+admin-history and revision-floor captures consecutively, then obtain one
+successor covering both completion times and finalize each:
+
+```bash
+node scripts/cutover-admin-history-export.mjs finalize --draft <owner dir>/admin-history-export-draft.json \
+  --draft-sha256 <history draft sha256> --fence-receipt <original EP-8 receipt> \
+  --successor-fence-receipt <covering successor receipt> --successor-fence-sha256 <successor sha256> --out <owner dir>
+node scripts/cutover-revision-floor.mjs finalize --draft <owner dir>/revision-floor-draft.json \
+  --draft-sha256 <floor draft sha256> --fence-receipt <original EP-8 receipt> \
+  --successor-fence-receipt <covering successor receipt> --successor-fence-sha256 <successor sha256> --out <owner dir>
+```
+
+These emit the normal final filenames with v2 finalized schemas. Likewise,
+H.4 `verify-unchanged` emits `flip-evidence-draft.json`; wait for a new successor
+covering those checks and finalize it in the same fresh flip directory:
+
+```bash
+node scripts/cutover-source-fence.mjs finalize-flip-evidence --draft <flip dir>/flip-evidence-draft.json \
+  --draft-sha256 <flip draft sha256> --fence-receipt <original EP-8 receipt> \
+  --successor-fence-receipt <covering successor receipt> --successor-fence-sha256 <successor sha256> --out <flip dir>
+```
+
+For v3 flip evidence, `release-controls` and `flip-gate` additionally take
+`--successor-fence-receipt <that proof's successor receipt>`. Both reopen the
+original and successor lineage. Repeat the read-only capture and coverage
+sequence after release for flip-2: a later finalization time cannot qualify
+reads captured before release. A prior successor never covers later reads or
+the actual flip. Drafts are rejected by downstream readers; final files are
+never overwritten. Cancellation or a failed finalization preserves the draft
+and immutable artifacts for a pinned retry. A failed capture cleans up only
+its owned outputs. Changed artifacts, missing coverage, different lineage or
+a released fence refuse; use a fresh directory for a new capture.
+
+
 1. **Preflight, read-only.** From `apps/worker`, compute the expected
    migration ledgers from Git objects at P:
 
@@ -392,7 +460,8 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    nothing. The seal reads one bookmark before and after the export, rebuilds
    the dump into one `0400` SQLite file, checks integrity, schema, ledgers,
    sequences and per-table aggregates against the remote, and deletes the dump.
-   On any failure it deletes every artifact of the run and writes no manifest.
+   On any capture failure it deletes every artifact of the run and writes no manifest.
+   EP-8 v3 success writes the draft described above; finalize it before step 4.
    The manifest's `sealId` is the sha256 of its canonical body; `seal` prints it
    with the manifest's sha256, and every later command that reads the seal takes
    it as `--seal-id`. `built`;
@@ -438,7 +507,8 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    nothing. Both bookmarks it reads must equal the fence receipt's analytics
    bookmark. It checks the `0016_admin_metrics_history.sql` ledger row against
    Git at P, reads every snapshot of the sealed source id in pages, and writes
-   `admin-history-export.json` (`0400`, never overwritten). It prints the
+   `admin-history-export.json` (`0400`, never overwritten) for legacy receipts;
+   EP-8 v3 writes its inadmissible draft first and requires finalization above. It prints the
    export's sha256, the snapshot count, the first and last capture instants and
    the row count of any other source id; no id. The post-import step of H.4
    requires the file and its sha256. `built` (D-PT4X); the provider has never
@@ -464,7 +534,7 @@ Authorization: the D1 seal export, a read-only production operation. `owner`.
    largest revision per day over `analytics_community_daily_heads` and
    `analytics_community_daily_publications`, every source id, withheld days
    included). Both bookmarks it reads must equal the fence receipt's analytics
-   bookmark. It writes `revision-floor.json` (`0400`, never overwritten:
+   bookmark. With legacy receipts it writes `revision-floor.json` (`0400`, never overwritten:
    schema `tibotattle-cutover-revision-floor-v1`, days and integers, the seal
    id, the fence receipt's sha256, the source commit and the sha256 of the
    bookmark) and prints the file's sha256 (the `floorSha256` the inputs pin),
@@ -608,7 +678,7 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
      (`CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED`), it reads the analytics D1's
      bookmark before the first sealed read and again after the last, and both
      must equal the fence receipt's analytics pin, the bookmark the revision
-     floor's capture started from. It writes `flip-evidence.json` (`0400`,
+     floor's capture started from. With legacy receipts it writes `flip-evidence.json` (`0400`,
      never overwritten; schema `tibotattle-cutover-flip-evidence-v2`, which
      adds the analytics D1's id digest and re-read bookmark) or fails
      `CUTOVER_SOURCE_CHANGED_AFTER_SEAL` (a sealed source moved) or

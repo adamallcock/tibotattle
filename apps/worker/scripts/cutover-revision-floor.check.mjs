@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { chmod, lstat, readFile, readdir, writeFile } from "node:fs/promises";
+import { copyFile, chmod, lstat, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, test } from "node:test";
@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import {
   CUTOVER_REVISION_FLOOR_FILE,
   CUTOVER_REVISION_FLOOR_SCHEMA,
+  CUTOVER_REVISION_FLOOR_FINAL_SCHEMA,
+  finalizeRevisionFloor,
   REVISION_FLOOR_DRESS_REHEARSAL_SWITCH,
   REVISION_FLOOR_MAX_DAYS,
   REVISION_FLOOR_TABLES,
@@ -543,4 +545,98 @@ test("the CLI: a content-free dry run, an offline check, and closed flags", asyn
     [storeRun, "revisionFloorSource", REVISION_FLOOR_TABLES.source], [contract, "publishedDaily", REVISION_FLOOR_TABLES.published]]) {
     assert.match(text, new RegExp(`\\b${key}: "${table}",`, "u"), key);
   }
+});
+
+
+test("fixed floor drafts cannot be loaded or checked before a covering successor finalizes them", async () => {
+  const { writeCaptureProofFixture, captureProofInstant } = await import("../postgres-test/fixtures/w2-seal/capture-proof-fixtures.mjs");
+  const { readCaptureAnchor, createCaptureDraft } = await import("./cutover-capture-proof.mjs");
+  const fixture = await writeCaptureProofFixture({ sourceCommit: COMMIT });
+  try {
+    const pin = fixture.original.receipt.d1.find(item => item.label === "analytics");
+    const anchor = await readCaptureAnchor({ fenceReceiptPath: fixture.original.path, fenceReceiptSha256: fixture.original.sha256 });
+    const captured = body(EXPECTED_DAYS, { schema: CUTOVER_REVISION_FLOOR_FINAL_SCHEMA, provenance: "captured",
+      fenceReceiptSha256: fixture.original.sha256, capture: { analyticsDatabaseIdSha256: pin.idSha256,
+        analyticsBookmarkSha256: sha256Hex(pin.bookmark), statementSha256: CUTOVER_REVISION_FLOOR_STATEMENT_SHA256 } });
+    const capture = { startedAt: captureProofInstant(40), endpointTimestamp: captureProofInstant(41), completedAt: captureProofInstant(42),
+      roles: [{ role: CUTOVER_ANALYTICS_FLOOR_ROLE, label: "analytics", databaseIdSha256: pin.idSha256, bookmarkSha256: sha256Hex(pin.bookmark) }] };
+    const draft = createCaptureDraft({ kind: "revision-floor", body: captured, anchor, capture });
+    const out = await privateDirectory("floor-proof-check-");
+    const draftPath = join(out, "draft.json"), text = `${canonicalJson(draft)}\n`, draftSha256 = sha256Hex(text);
+    await writeFile(draftPath, text, { mode: 0o400 });
+    await assert.rejects(readRevisionFloorFile({ path: draftPath, expectedSha256: draftSha256 }), isCode("REVISION_FLOOR_FILE_INVALID"));
+    const args = { draftPath, draftSha256, fenceReceiptPath: fixture.original.path, ownerDirectory: out };
+    await assert.rejects(finalizeRevisionFloor({ ...args, successorFenceReceiptPath: fixture.original.path,
+      successorFenceReceiptSha256: fixture.original.sha256 }), isCode("CUTOVER_CAPTURE_PROOF_INVALID"));
+    const result = await finalizeRevisionFloor({ ...args, successorFenceReceiptPath: fixture.successor.path,
+      successorFenceReceiptSha256: fixture.successor.sha256 });
+    await assert.rejects(finalizeRevisionFloor({ ...args, successorFenceReceiptPath: fixture.successor.path,
+      successorFenceReceiptSha256: fixture.successor.sha256 }), isCode("CUTOVER_OUTPUT_EXISTS"));
+    const final = await readRevisionFloorFile({ path: result.path, expectedSha256: result.floorSha256 });
+    assert.equal(final.schema, CUTOVER_REVISION_FLOOR_FINAL_SCHEMA);
+    const downgraded = { ...captured, schema: CUTOVER_REVISION_FLOOR_SCHEMA };
+    renderRevisionFloorFile(downgraded);
+    await assert.rejects(checkRevisionFloorProvenance({ floor: downgraded, fenceReceiptPath: fixture.original.path,
+      fenceReceiptSha256: fixture.original.sha256, syntheticAdmitted: false }), isCode("REVISION_FLOOR_CAPTURE_FENCE_MISMATCH"));
+    await checkRevisionFloorProvenance({ floor: final, fenceReceiptPath: fixture.original.path,
+      fenceReceiptSha256: fixture.original.sha256, syntheticAdmitted: false });
+    await fixture.release();
+    await assert.rejects(checkRevisionFloorProvenance({ floor: final, fenceReceiptPath: fixture.original.path,
+      fenceReceiptSha256: fixture.original.sha256, syntheticAdmitted: false }));
+  } finally { await fixture.dispose(); }
+});
+
+
+test("fixed capture uses only explicit timestamps and account mismatch refuses before transport", async () => {
+  const { writeCaptureProofFixture, captureProofInstant } = await import("../postgres-test/fixtures/w2-seal/capture-proof-fixtures.mjs");
+  const fixture = await writeCaptureProofFixture({ d1: world.fence.receipt.d1,
+    accountSha256: sha256Hex(`account:${SYNTHETIC_ACCOUNT_ID}`) });
+  try {
+    const legacy = await readCutoverSeal({ manifestPath: seal.manifestPath, expectedSealId: seal.sealId });
+    const out = await privateDirectory("analytics-fixed-capture-");
+    const { readCaptureAnchor, createCaptureDraft, finalizeCaptureDraft } = await import("./cutover-capture-proof.mjs");
+    const { sealId: _old, ...base } = legacy.manifest;
+    async function writeFixedSeal(receipts, name) {
+      const manifestBody = { ...base, schema: "tibotattle-cutover-seal-v2",
+        fence: { ...base.fence, fenceReceiptSha256: receipts.original.sha256 } };
+      const nextSealId = sha256Hex(canonicalJson(manifestBody));
+      const body = { ...manifestBody, sealId: nextSealId };
+      const anchor = await readCaptureAnchor({ fenceReceiptPath: receipts.original.path, fenceReceiptSha256: receipts.original.sha256 });
+      const draft = createCaptureDraft({ kind: "seal", body, anchor, capture: { startedAt: captureProofInstant(31),
+        endpointTimestamp: captureProofInstant(32), completedAt: captureProofInstant(33), roles: body.sources.map(source => ({
+          role: source.role, label: source.role, databaseIdSha256: source.databaseIdSha256,
+          bookmarkSha256: sha256Hex(receipts.original.receipt.d1.find(pin => pin.label === source.role).bookmark) })) } });
+      const { proof } = await finalizeCaptureDraft({ draft, originalFenceReceiptPath: receipts.original.path,
+        successorFenceReceiptPath: receipts.successor.path, successorFenceReceiptSha256: receipts.successor.sha256 });
+      const manifestPath = join(out, name);
+      await writeFile(manifestPath, `${canonicalJson({ ...body, captureProof: proof })}\n`, { mode: 0o400 });
+      return { manifestPath, nextSealId };
+    }
+    const { manifestPath, nextSealId } = await writeFixedSeal(fixture, "seal-manifest.json");
+    for (const source of Object.values(legacy.sources)) {
+      await copyFile(source.path, join(out, source.sealedFile));
+      await chmod(join(out, source.sealedFile), 0o400);
+    }
+    const timestamps = [];
+    const fake = createFakeCutoverTransport({ sources: { [CUTOVER_ANALYTICS_FLOOR_ROLE]: analyticsPath }, bookmarks: { [CUTOVER_ANALYTICS_FLOOR_ROLE]: SYNTHETIC_BOOKMARKS.analytics } });
+    const transport = { ...fake, bookmark: async (source, options) => {
+      assert.equal(typeof options?.timestamp, "string"); timestamps.push(options.timestamp); return fake.bookmark(source);
+    } };
+    const args = { inventoryPath: world.inventory.path, manifestPath, sealId: nextSealId, analyticsSourcePath,
+      fenceReceiptPath: fixture.original.path, execute: true, remote: true, ownerReadOnly: true, transport,
+      now: () => new Date(captureProofInstant(40)) };
+    const draftOut = await privateDirectory("floor-fixed-out-");
+    const result = await captureRevisionFloor({ ...args, ownerDirectory: draftOut });
+    assert.equal(result.mode, "draft");
+    assert.deepEqual(timestamps, [captureProofInstant(30), captureProofInstant(40), captureProofInstant(40)]);
+    await assert.rejects(readRevisionFloorFile({ path: result.path, expectedSha256: result.floorSha256 }), isCode("REVISION_FLOOR_FILE_INVALID"));
+    const wrong = await writeCaptureProofFixture({ d1: world.fence.receipt.d1 });
+    try {
+      const { manifestPath: wrongPath, nextSealId: wrongId } = await writeFixedSeal(wrong, "wrong-seal.json");
+      const callsBefore = timestamps.length;
+      await assert.rejects(captureRevisionFloor({ ...args, manifestPath: wrongPath, sealId: wrongId,
+        fenceReceiptPath: wrong.original.path, ownerDirectory: await privateDirectory("wrong-account-out-") }), isCode("CUTOVER_FENCE_SOURCE_MISMATCH"));
+      assert.equal(timestamps.length, callsBefore);
+    } finally { await wrong.dispose(); }
+  } finally { await fixture.dispose(); }
 });

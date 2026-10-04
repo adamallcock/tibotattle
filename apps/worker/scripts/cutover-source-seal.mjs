@@ -52,6 +52,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import providerSchemas from "../src/d1-provider-schema.json" with { type: "json" };
 import { createWranglerQueryInvocation } from "./wrangler-query-launcher.mjs";
 
+import { readCaptureAnchor, beginCapture, finishCapture, createCaptureDraft, validateCaptureDraft,
+  finalizeCaptureDraft, validateCaptureProof, revalidateCaptureProof } from './cutover-capture-proof.mjs';
+export const CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA = 'tibotattle-cutover-seal-v2';
 export const CUTOVER_SEAL_MANIFEST_SCHEMA = "tibotattle-cutover-seal-v1";
 export const CUTOVER_INVENTORY_SCHEMA = "tibotattle-cutover-inventory-v1";
 export const CUTOVER_EXPECTED_LEDGER_SCHEMA = "tibotattle-cutover-expected-ledger-v1";
@@ -167,6 +170,7 @@ export const CUTOVER_ERROR_CODES = Object.freeze([
   "CUTOVER_AGGREGATE_MISMATCH",
   "CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE",
   "CUTOVER_ARGUMENT_INVALID",
+  "CUTOVER_CAPTURE_PROOF_INVALID",
   "CUTOVER_BARRIER_PROOF_INVALID",
   "CUTOVER_BOOKMARK_ROLE_QUERY_REFUSED",
   "CUTOVER_ERASED_PARTICIPANT_PRESENT",
@@ -922,17 +926,27 @@ export function assertPinnedRoleStatement(role, sql) {
  * read role runs only its pinned statement, and every response is checked
  * before use.
  */
+function bookmarkSelection(options) {
+  if (options === undefined) return undefined;
+  if (!record(options) || Object.keys(options).join(",") !== "timestamp"
+      || typeof options.timestamp !== "string" || !INSTANT.test(options.timestamp)) fail("CUTOVER_ARGUMENT_INVALID");
+  const milliseconds = Date.parse(options.timestamp);
+  if (!Number.isSafeInteger(milliseconds) || new Date(milliseconds).toISOString() !== options.timestamp) fail("CUTOVER_ARGUMENT_INVALID");
+  return Object.freeze({ timestamp: options.timestamp });
+}
+
 export function guardCutoverTransport(transport, inventory) {
   if (!record(transport) || typeof transport.bookmark !== "function" || typeof transport.query !== "function") {
     fail("CUTOVER_ARGUMENT_INVALID");
   }
   const target = (source) => allowedCutoverSource(inventory, { role: source?.role, databaseId: source?.databaseId });
   return Object.freeze({
-    async bookmark(source) {
+    async bookmark(source, options) {
       const allowed = target(source);
+      const selection = bookmarkSelection(options);
       let value;
       try {
-        value = await transport.bookmark(allowed);
+        value = await transport.bookmark(allowed, selection);
       } catch (error) {
         if (error instanceof CutoverSourceError) throw error;
         fail("CUTOVER_REMOTE_RESPONSE_INVALID", { role: allowed.role });
@@ -1025,12 +1039,13 @@ export function createWranglerCutoverTransport({
     return stdout;
   };
   return Object.freeze({
-    async bookmark(source) {
+    async bookmark(source, options) {
+      const selection = bookmarkSelection(options);
       const config = await pinnedConfig(source);
       const logPath = join(transportDirectory, `${source.role}.bookmark-${sequence++}.log`);
       try {
         const stdout = run(process.execPath, [cliPath, "d1", "time-travel", "info", source.databaseName, "--json",
-          "--config", config], logPath);
+          "--config", config, ...(selection === undefined ? [] : ["--timestamp", selection.timestamp])], logPath);
         if (stdout === null) fail("CUTOVER_REMOTE_RESPONSE_INVALID", { role: source.role });
         let parsed;
         try { parsed = JSON.parse(stdout); } catch { fail("CUTOVER_REMOTE_RESPONSE_INVALID", { role: source.role }); }
@@ -1626,7 +1641,9 @@ export async function runCutoverSeal({
     });
   }
   if (remote !== true || ownerReadOnly !== true) fail("CUTOVER_REMOTE_NOT_AUTHORIZED");
-  const manifestPath = join(directory, "seal-manifest.json");
+  const anchor = await readCaptureAnchor({ fenceReceiptPath, fenceReceiptSha256 });
+  if (anchor.fixed && anchor.receipt.accountSha256 !== idDigest("account", inventory.accountId)) fail("CUTOVER_FENCE_SOURCE_MISMATCH");
+  const manifestPath = join(directory, anchor.fixed ? "seal-draft.json" : "seal-manifest.json");
   if (await exists(manifestPath)) fail("CUTOVER_OUTPUT_EXISTS");
   const created = [];
   const previousUmask = process.umask(0o077);
@@ -1638,6 +1655,8 @@ export async function runCutoverSeal({
       inventory, transportDirectory: directory, cliPath, spawn, environment, remote, ownerReadOnly,
     }) : null;
     const guarded = guardCutoverTransport(transport ?? ownedTransport, inventory);
+    const captureContext = anchor.fixed ? await beginCapture({ anchor, guarded, now,
+      sources: CUTOVER_SOURCE_ROLES.map(role => ({ source: inventory.sources[role], fenceLabel: CUTOVER_SEALABLE_SOURCES[role].fenceLabel })) }) : null;
     const sealedSources = [];
     for (const role of CUTOVER_SOURCE_ROLES) {
       const source = inventory.sources[role];
@@ -1648,7 +1667,7 @@ export async function runCutoverSeal({
       }
       created.push(configPath);
       const fenced = fence.sources[role];
-      const b0 = await guarded.bookmark(source);
+      const b0 = await guarded.bookmark(source, captureContext === null ? undefined : { timestamp: captureContext.startedAt });
       if (b0 !== fenced.bookmark) fail("CUTOVER_SOURCE_BOOKMARK_DRIFT", { role });
       const remoteFacts = await readRemoteSourceFacts(guarded, source);
       created.push(paths.dump, paths.log, paths.rebuild, paths.sealed);
@@ -1659,7 +1678,7 @@ export async function runCutoverSeal({
         accountId: inventory.accountId, environment, directory });
       await removeIfPresent(paths.log);
       if (!exported) fail("CUTOVER_EXPORT_FAILED", { role });
-      const b1 = await guarded.bookmark(source);
+      const b1 = await guarded.bookmark(source, captureContext === null ? undefined : { timestamp: now().toISOString() });
       if (b1 !== b0) fail("CUTOVER_SOURCE_BOOKMARK_DRIFT", { role });
       await assertPrivateExportFile(paths.dump, role);
       if (await scanFileForSecrets(paths.dump)) fail("CUTOVER_SECRET_IN_OUTPUT", { role });
@@ -1707,11 +1726,12 @@ export async function runCutoverSeal({
       }));
       await removeIfPresent(configPath);
     }
+    const capture = captureContext === null ? null : await finishCapture(captureContext, { now });
     await ownedTransport?.dispose();
     const createdAt = now().toISOString();
     if (!INSTANT.test(createdAt)) fail("CUTOVER_ARGUMENT_INVALID");
     const body = {
-      schema: CUTOVER_SEAL_MANIFEST_SCHEMA,
+      schema: anchor.fixed ? CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA : CUTOVER_SEAL_MANIFEST_SCHEMA,
       createdAt,
       inventorySha256: inventory.inventorySha256,
       expectedSourceCommit: inventory.expectedSourceCommit,
@@ -1720,11 +1740,13 @@ export async function runCutoverSeal({
     };
     const sealId = sha256Hex(canonicalJson(body));
     const manifest = { ...body, sealId };
-    const text = `${canonicalJson(manifest)}\n`;
+    const draft = anchor.fixed ? createCaptureDraft({ kind: "seal", body: manifest, anchor, capture }) : null;
+    const text = `${canonicalJson(draft ?? manifest)}\n`;
     if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
     created.push(manifestPath);
     const manifestSha256 = await writePrivateFileOnce(manifestPath, text, 0o400);
-    return Object.freeze({ mode: "sealed", manifestPath, manifestSha256, sealId, manifest });
+    return Object.freeze({ mode: anchor.fixed ? "draft" : "sealed", manifestPath, manifestSha256, sealId, manifest,
+      ...(anchor.fixed ? { draftPath: manifestPath, draftSha256: manifestSha256 } : {}) });
   } catch (error) {
     await cleanupArtifacts(created);
     await ownedTransport?.dispose().catch(() => {});
@@ -1735,13 +1757,41 @@ export async function runCutoverSeal({
   }
 }
 
+export async function finalizeCutoverSeal({ draftPath, draftSha256, originalFenceReceiptPath,
+  successorFenceReceiptPath, successorFenceReceiptSha256, ownerDirectory, execute = false } = {}) {
+  const directory = await assertOwnerDirectory(ownerDirectory);
+  if (resolve(draftPath) !== join(directory, 'seal-draft.json') || !SHA256.test(draftSha256 ?? '')) fail('CUTOVER_ARGUMENT_INVALID');
+  const bytes = await readPrivateFile(draftPath, MAX_MANIFEST_BYTES, 'CUTOVER_CAPTURE_PROOF_INVALID');
+  if (sha256Hex(bytes) !== draftSha256) fail('CUTOVER_CAPTURE_PROOF_INVALID');
+  let draft;
+  try { draft = JSON.parse(bytes.toString('utf8')); } catch { fail('CUTOVER_CAPTURE_PROOF_INVALID'); }
+  validateCaptureDraft(draft);
+  if (draft.kind !== 'seal' || draft.body.schema !== CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA) fail('CUTOVER_CAPTURE_PROOF_INVALID');
+  const { body, proof } = await finalizeCaptureDraft({ draft, originalFenceReceiptPath, successorFenceReceiptPath,
+    successorFenceReceiptSha256 });
+  const manifest = { ...body, captureProof: proof };
+  validateManifest(manifest);
+  for (const source of manifest.sources) {
+    const facts = await sealedFileFacts(join(directory, source.sealedFile));
+    if (facts.sha256 !== source.sealedSha256) fail('CUTOVER_SEALED_SOURCE_CHANGED');
+  }
+  const manifestPath = join(directory, 'seal-manifest.json');
+  if (await exists(manifestPath)) fail('CUTOVER_OUTPUT_EXISTS');
+  if (execute !== true) return Object.freeze({ mode: 'dry-run', sealId: manifest.sealId });
+  const text = `${canonicalJson(manifest)}\n`;
+  if (containsSignedUrl(text)) fail('CUTOVER_SECRET_IN_OUTPUT');
+  const manifestSha256 = await writePrivateFileOnce(manifestPath, text, 0o400);
+  return Object.freeze({ mode: 'sealed', manifestPath, manifestSha256, sealId: manifest.sealId, manifest });
+}
+
 // ---------------------------------------------------------------------------
 // Reading a seal back.
 
 function validateManifest(value) {
-  exactKeys(value, ["schema", "createdAt", "inventorySha256", "expectedSourceCommit", "fence", "sources", "sealId"],
+  exactKeys(value, ["schema", "createdAt", "inventorySha256", "expectedSourceCommit", "fence", "sources", "sealId",
+    ...(value.schema === CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA ? ["captureProof"] : [])],
     "CUTOVER_SEAL_MANIFEST_INVALID");
-  if (value.schema !== CUTOVER_SEAL_MANIFEST_SCHEMA || typeof value.createdAt !== "string" || !INSTANT.test(value.createdAt)
+  if (![CUTOVER_SEAL_MANIFEST_SCHEMA, CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA].includes(value.schema) || typeof value.createdAt !== "string" || !INSTANT.test(value.createdAt)
       || !SHA256.test(value.inventorySha256 ?? "") || !COMMIT.test(value.expectedSourceCommit ?? "")
       || !SHA256.test(value.sealId ?? "") || !Array.isArray(value.sources)
       || value.sources.length !== CUTOVER_SOURCE_ROLES.length) {
@@ -1755,7 +1805,14 @@ function validateManifest(value) {
       fail("CUTOVER_SEAL_MANIFEST_INVALID");
     }
   });
-  const { sealId, ...body } = value;
+  const { captureProof, ...manifestBody } = value;
+  if (value.schema === CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA) {
+    validateCaptureProof(captureProof, manifestBody);
+    if (captureProof.kind !== "seal" || captureProof.originalFenceReceiptSha256 !== value.fence.fenceReceiptSha256
+        || canonicalJson(captureProof.capture.roles.map(item => ({ role: item.role, databaseIdSha256: item.databaseIdSha256 })))
+          !== canonicalJson(value.sources.map(item => ({ role: item.role, databaseIdSha256: item.databaseIdSha256 })))) fail("CUTOVER_SEAL_MANIFEST_INVALID");
+  }
+  const { sealId, ...body } = manifestBody;
   if (sha256Hex(canonicalJson(body)) !== sealId) fail("CUTOVER_SEAL_MANIFEST_INVALID");
   return value;
 }
@@ -1764,7 +1821,7 @@ function validateManifest(value) {
  * Read a seal manifest (0400 or 0600, owner-owned) beside its sealed files.
  * expectedSealId pins it; sources resolve to absolute sealed paths.
  */
-export async function readCutoverSeal({ manifestPath, expectedSealId } = {}) {
+export async function readCutoverSeal({ manifestPath, expectedSealId, originalFenceReceiptPath, successorFenceReceiptPath } = {}) {
   if (typeof expectedSealId !== "string" || !SHA256.test(expectedSealId)) fail("CUTOVER_ARGUMENT_INVALID");
   const bytes = await readPrivateFile(manifestPath, MAX_MANIFEST_BYTES, "CUTOVER_SEAL_MANIFEST_INVALID");
   let parsed;
@@ -1774,6 +1831,15 @@ export async function readCutoverSeal({ manifestPath, expectedSealId } = {}) {
     fail("CUTOVER_SEAL_MANIFEST_INVALID");
   }
   const manifest = validateManifest(parsed);
+  if (originalFenceReceiptPath !== undefined) {
+    const anchored = await readCaptureAnchor({ fenceReceiptPath: originalFenceReceiptPath, fenceReceiptSha256: manifest.fence.fenceReceiptSha256 });
+    if (anchored.fixed !== (manifest.schema === CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA)) fail("CUTOVER_SEAL_MANIFEST_INVALID");
+  }
+  if (manifest.schema === CUTOVER_FIXED_SEAL_MANIFEST_SCHEMA && originalFenceReceiptPath !== undefined) {
+    const { captureProof, ...body } = manifest;
+    await revalidateCaptureProof({ proof: captureProof, body, originalFenceReceiptPath,
+      successorFenceReceiptPath: successorFenceReceiptPath ?? join(dirname(originalFenceReceiptPath), `fence-${captureProof.successorFenceReceiptSha256}.json`) });
+  }
   if (manifest.sealId !== expectedSealId) fail("CUTOVER_SEAL_MANIFEST_INVALID");
   const directory = dirname(manifestPath);
   const sources = Object.fromEntries(manifest.sources.map(source => [source.role, Object.freeze({
@@ -1791,8 +1857,8 @@ export async function openSealedSourceFromSeal(seal, role) {
 }
 
 /** Recompute the remote aggregates and bookmark of one sealed source (verify-unchanged). */
-export async function readRemoteUnchangedFacts(guarded, source, sealedSource) {
-  const bookmark = await guarded.bookmark(source);
+export async function readRemoteUnchangedFacts(guarded, source, sealedSource, bookmarkOptions = undefined) {
+  const bookmark = await guarded.bookmark(source, bookmarkOptions);
   const remote = await readRemoteSourceFacts(guarded, source);
   return Object.freeze({
     bookmark,
@@ -1809,9 +1875,11 @@ export async function readRemoteUnchangedFacts(guarded, source, sealedSource) {
 
 function parseArguments(argv) {
   const [command, ...rest] = argv;
-  if (!["expected-ledger", "seal"].includes(command)) fail("CUTOVER_ARGUMENT_INVALID");
+  if (!["expected-ledger", "seal", "finalize"].includes(command)) fail("CUTOVER_ARGUMENT_INVALID");
   const values = { "--inventory": "inventoryPath", "--fence-receipt": "fenceReceiptPath",
-    "--fence-sha256": "fenceReceiptSha256", "--barrier-proof": "barrierProofPath", "--out": "ownerDirectory" };
+    "--fence-sha256": "fenceReceiptSha256", "--barrier-proof": "barrierProofPath", "--out": "ownerDirectory",
+    "--draft": "draftPath", "--draft-sha256": "draftSha256",
+    "--successor-fence-receipt": "successorFenceReceiptPath", "--successor-fence-sha256": "successorFenceReceiptSha256" };
   const switches = { "--remote": "remote", "--owner-read-only": "ownerReadOnly", "--execute": "execute" };
   const options = { command };
   for (let index = 0; index < rest.length; index += 1) {
@@ -1829,12 +1897,22 @@ function parseArguments(argv) {
     options[key] = value;
     index += 1;
   }
-  if (!options.inventoryPath) fail("CUTOVER_ARGUMENT_INVALID");
+  const finalKeys = ['draftPath', 'draftSha256', 'successorFenceReceiptPath', 'successorFenceReceiptSha256'];
+  if (command !== 'finalize' && finalKeys.some(key => options[key] !== undefined)) fail('CUTOVER_ARGUMENT_INVALID');
+  if (command === 'finalize' && Object.keys(options).some(key => !['command', ...finalKeys, 'fenceReceiptPath', 'ownerDirectory'].includes(key))) fail('CUTOVER_ARGUMENT_INVALID');
+  if (command !== "finalize" && !options.inventoryPath) fail("CUTOVER_ARGUMENT_INVALID");
   return options;
 }
 
 async function main(argv) {
   const options = parseArguments(argv);
+  if (options.command === "finalize") {
+    const result = await finalizeCutoverSeal({ ...options,
+      originalFenceReceiptPath: options.fenceReceiptPath, execute: true });
+    process.stdout.write(`${JSON.stringify({ command: 'finalize', mode: result.mode, sealId: result.sealId,
+      manifestSha256: result.manifestSha256 })}\n`);
+    return;
+  }
   if (options.command === "expected-ledger") {
     const inventory = await readCutoverInventory(resolve(options.inventoryPath));
     const ledgers = CUTOVER_SOURCE_ROLES.map(role => {
@@ -1855,8 +1933,9 @@ async function main(argv) {
     remote: options.remote === true,
     ownerReadOnly: options.ownerReadOnly === true,
   });
-  const summary = result.mode === "sealed"
-    ? { command: "seal", mode: result.mode, sealId: result.sealId, manifestSha256: result.manifestSha256 }
+  const summary = result.mode === "draft"
+    ? { command: "seal", mode: result.mode, sealId: result.sealId, draftSha256: result.draftSha256 }
+    : result.mode === "sealed" ? { command: "seal", mode: result.mode, sealId: result.sealId, manifestSha256: result.manifestSha256 }
     : { command: "seal", mode: result.mode, sources: result.sources };
   process.stdout.write(`${JSON.stringify(summary)}\n`);
 }

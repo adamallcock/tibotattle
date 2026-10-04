@@ -7,6 +7,7 @@ import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   CUTOVER_BARRIER_ERROR_CODE,
+  finalizeCutoverFlipEvidence,
   validateBarrierProof,
   verifyCutoverFence,
   verifyCutoverUnchanged,
@@ -352,4 +353,131 @@ test("verify-unchanged refuses a moved bookmark, a changed aggregate, a changed 
     transport: createFakeCutoverTransport({ sources: world.remotePaths, bookmarks: SYNTHETIC_UNCHANGED_BOOKMARKS, calls }) })),
   isCode("CUTOVER_SEALED_SOURCE_CHANGED"));
   assert.equal(calls.length, 0);
+});
+
+
+test("fixed flip drafts cannot enter admission until successor coverage is reopened", async () => {
+  const { writeCaptureProofFixture, captureProofInstant } = await import("../postgres-test/fixtures/w2-seal/capture-proof-fixtures.mjs");
+  const { readCaptureAnchor, createCaptureDraft } = await import("./cutover-capture-proof.mjs");
+  const { validateFlipEvidence } = await import("./postgres-production-transfer.mjs");
+  const fixture = await writeCaptureProofFixture();
+  try {
+    const anchor = await readCaptureAnchor({ fenceReceiptPath: fixture.original.path, fenceReceiptSha256: fixture.original.sha256 });
+    const sourceRoles = ["ingestion", "deletion-ledger"];
+    const sources = sourceRoles.map(role => {
+      const pin = anchor.receipt.d1.find(item => item.label === role);
+      return { role, databaseIdSha256: pin.idSha256, bookmark: pin.bookmark,
+        schemaSha256: "1".repeat(64), aggregatesSha256: "2".repeat(64), sealedSha256: "3".repeat(64) };
+    });
+    const analytics = anchor.receipt.d1.find(item => item.label === "analytics");
+    const body = { schema: "tibotattle-cutover-flip-evidence-v3", sealId: "5".repeat(64),
+      inventorySha256: "4".repeat(64), fenceReceiptSha256: fixture.original.sha256,
+      verifiedAt: captureProofInstant(52), sources,
+      analytics: { databaseIdSha256: analytics.idSha256, bookmark: analytics.bookmark } };
+    const roles = [...sources.map(source => ({ role: source.role, label: source.role, databaseIdSha256: source.databaseIdSha256,
+      bookmarkSha256: sha256Hex(source.bookmark) })), { role: "analytics-bookmark", label: "analytics",
+      databaseIdSha256: analytics.idSha256, bookmarkSha256: sha256Hex(analytics.bookmark) }];
+    const draft = createCaptureDraft({ kind: "flip-evidence", body, anchor,
+      capture: { startedAt: captureProofInstant(50), endpointTimestamp: captureProofInstant(51), completedAt: captureProofInstant(52), roles } });
+    const draftPin = await fixture.save("flip-draft.json", draft);
+    const canonicalDraft = `${canonicalJson(draft)}\n`;
+    await writeFile(draftPin.path, canonicalDraft, { mode: 0o600 });
+    draftPin.sha256 = sha256Hex(canonicalDraft);
+    const fakeSeal = { manifest: { sealId: body.sealId, inventorySha256: body.inventorySha256,
+      fence: { fenceReceiptSha256: fixture.original.sha256 }, sources } };
+    const parserArgs = { afterMs: Date.parse(captureProofInstant(49)), fencedAnalytics: { ...analytics, receipt: anchor.receipt },
+      originalFenceReceiptPath: fixture.original.path, successorFenceReceiptPath: fixture.successor.path };
+    await assert.rejects(validateFlipEvidence(draftPin.path, fakeSeal, parserArgs));
+    const downgraded = await fixture.save("downgraded-flip.json", { ...body, schema: "tibotattle-cutover-flip-evidence-v2" });
+    await assert.rejects(validateFlipEvidence(downgraded.path, fakeSeal, parserArgs),
+      error => error.code === "CUTOVER_FLIP_EVIDENCE_INVALID");
+    const out = await privateDirectory("flip-fixed-finalized-");
+    const args = { draftPath: draftPin.path, draftSha256: draftPin.sha256, fenceReceiptPath: fixture.original.path,
+      successorFenceReceiptPath: fixture.successor.path, successorFenceReceiptSha256: fixture.successor.sha256, ownerDirectory: out };
+    const malformedDraft = createCaptureDraft({ kind: "flip-evidence", body: { ...body, unexpected: 1 }, anchor, capture: draft.capture });
+    const malformedPin = await fixture.save("malformed-flip-draft.json", malformedDraft);
+    const malformedBytes = `${canonicalJson(malformedDraft)}\n`;
+    await writeFile(malformedPin.path, malformedBytes, { mode: 0o600 });
+    await assert.rejects(finalizeCutoverFlipEvidence({ ...args, draftPath: malformedPin.path, draftSha256: sha256Hex(malformedBytes) }));
+    assert.deepEqual(await readdir(out), []);
+    const noncanonical = await fixture.save("noncanonical-flip-draft.json", draft);
+    await assert.rejects(finalizeCutoverFlipEvidence({ ...args, draftPath: noncanonical.path, draftSha256: noncanonical.sha256 }));
+    assert.deepEqual(await readdir(out), []);
+    const short = await fixture.fence(55);
+    await assert.rejects(finalizeCutoverFlipEvidence({ ...args, successorFenceReceiptPath: short.path,
+      successorFenceReceiptSha256: short.sha256 }));
+    assert.deepEqual(await readdir(out), []);
+    const finalized = await finalizeCutoverFlipEvidence(args);
+    assert.equal((await lstat(finalized.path)).mode & 0o777, 0o400);
+    const valid = await validateFlipEvidence(finalized.path, fakeSeal, parserArgs);
+    assert.equal(valid.sha256, finalized.flipEvidenceSha256);
+    await assert.rejects(validateFlipEvidence(finalized.path, fakeSeal, { ...parserArgs,
+      afterMs: Date.parse(captureProofInstant(50)) }), error => error.code === "CUTOVER_FLIP_EVIDENCE_STALE");
+    await assert.rejects(validateFlipEvidence(finalized.path, fakeSeal, { ...parserArgs, successorFenceReceiptPath: short.path }));
+    await fixture.release();
+    await assert.rejects(validateFlipEvidence(finalized.path, fakeSeal, parserArgs));
+  } finally { await fixture.dispose(); }
+});
+
+test("fixed verify-unchanged selects common fresh endpoints and emits only a draft", async () => {
+  const { writeCaptureProofFixture, captureProofInstant } = await import("../postgres-test/fixtures/w2-seal/capture-proof-fixtures.mjs");
+  const freshWorld = await prepareSealWorld({ commit: COMMIT });
+  const freshRun = await sealWorld(freshWorld);
+  await freshRun.run();
+  const freshPaths = outputPathsOf(freshRun.out);
+  const fixture = await writeCaptureProofFixture({ accountSha256: sha256Hex(`account:${(await readCutoverInventory(freshWorld.inventory.path)).accountId}`),
+    sourceCommit: SYNTHETIC_SOURCE_COMMIT, d1: ["ingestion", "analytics", "deletion-ledger", "catchup-control"].map(label => ({
+    label, idSha256: sha256Hex(`d1:${SYNTHETIC_D1[label]}`), bookmark: SYNTHETIC_BOOKMARKS[label] })) });
+  try {
+    const body = JSON.parse(await readFile(freshPaths.manifest, "utf8"));
+    const { readCaptureAnchor, createCaptureDraft, finalizeCaptureDraft } = await import("./cutover-capture-proof.mjs");
+    async function pinManifest(manifest, pinFixture) {
+      manifest.schema = "tibotattle-cutover-seal-v2";
+      manifest.fence.fenceReceiptSha256 = pinFixture.original.sha256;
+      const { sealId, captureProof, ...unsigned } = manifest;
+      manifest.sealId = sha256Hex(canonicalJson(unsigned));
+      const anchor = await readCaptureAnchor({ fenceReceiptPath: pinFixture.original.path, fenceReceiptSha256: pinFixture.original.sha256 });
+      const draft = createCaptureDraft({ kind: "seal", body: manifest, anchor,
+        capture: { startedAt: captureProofInstant(40), endpointTimestamp: captureProofInstant(41), completedAt: captureProofInstant(42),
+          roles: manifest.sources.map(source => ({ role: source.role, label: source.role, databaseIdSha256: source.databaseIdSha256,
+            bookmarkSha256: sha256Hex(source.bookmark) })) } });
+      const finalized = await finalizeCaptureDraft({ draft, originalFenceReceiptPath: pinFixture.original.path,
+        successorFenceReceiptPath: pinFixture.successor.path, successorFenceReceiptSha256: pinFixture.successor.sha256 });
+      return { ...finalized.body, captureProof: finalized.proof };
+    }
+    const pinnedBody = await pinManifest(body, fixture);
+    const manifestPath = join(dirname(freshPaths.manifest), "fixed-flip-test-manifest.json");
+    await writeFile(manifestPath, JSON.stringify(pinnedBody), { mode: 0o600 });
+    const out = await privateDirectory("flip-fixed-capture-");
+    const calls = [];
+    const transport = createFakeCutoverTransport({ sources: freshWorld.remotePaths, bookmarks: SYNTHETIC_UNCHANGED_BOOKMARKS });
+    const bookmark = transport.bookmark.bind(transport);
+    transport.bookmark = async (source, selection) => { calls.push({ role: source.role, timestamp: selection?.timestamp });
+      return bookmark(source, selection); };
+    const times = [50, 51, 52, 53];
+    const result = await verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: out, manifestPath, sealId: body.sealId, inventoryPath: freshWorld.inventory.path, analyticsSourcePath: freshWorld.analyticsSource,
+      fenceReceiptPath: fixture.original.path, transport, now: () => new Date(captureProofInstant(times.shift())) }));
+    assert.equal(result.mode, "draft");
+    assert.deepEqual(await readdir(out), ["flip-evidence-draft.json"]);
+    assert.equal(result.evidence.capture.startedAt, captureProofInstant(50));
+    assert.equal(result.evidence.capture.completedAt, captureProofInstant(52));
+    assert.ok(calls.every(call => typeof call.timestamp === "string"));
+    const wrongAccount = await writeCaptureProofFixture({ sourceCommit: SYNTHETIC_SOURCE_COMMIT, d1: fixture.original.receipt.d1 });
+    try {
+      const wrongBody = await pinManifest(structuredClone(body), wrongAccount);
+      const wrongManifest = join(dirname(manifestPath), "wrong-account-flip-test-manifest.json");
+      await writeFile(wrongManifest, JSON.stringify(wrongBody), { mode: 0o600 });
+      const badOut = await privateDirectory("flip-fixed-wrong-account-");
+      const beforeCalls = calls.length;
+      await assert.rejects(verifyCutoverUnchanged(unchangedArgs({ ownerDirectory: badOut, manifestPath: wrongManifest,
+        sealId: wrongBody.sealId, inventoryPath: freshWorld.inventory.path, analyticsSourcePath: freshWorld.analyticsSource,
+        fenceReceiptPath: wrongAccount.original.path, transport })), isCode("CUTOVER_FENCE_SOURCE_MISMATCH"));
+      assert.equal(calls.length, beforeCalls);
+      assert.deepEqual(await readdir(badOut), []);
+    } finally { await wrongAccount.dispose(); }
+    for (const timestamp of [30, 50, 51].map(captureProofInstant)) {
+      assert.deepEqual([...new Set(calls.filter(call => call.timestamp === timestamp).map(call => call.role))],
+        ["ingestion", "deletion-ledger", "analytics-bookmark"]);
+    }
+  } finally { await fixture.dispose(); await freshWorld.dispose(); }
 });

@@ -108,7 +108,8 @@ import {
   sha256Hex,
   writePrivateFileOnce,
 } from "./cutover-source-seal.mjs";
-import { CUTOVER_FLIP_EVIDENCE_SCHEMA } from "./cutover-source-fence.mjs";
+import { revalidateCaptureProof, validateCaptureProof } from "./cutover-capture-proof.mjs";
+import { CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA, CUTOVER_FLIP_EVIDENCE_SCHEMA } from "./cutover-source-fence.mjs";
 import { fencedAnalyticsEntry } from "./cutover-admin-history-export.mjs";
 import {
   countSealedParticipantDeletionMatches,
@@ -336,6 +337,8 @@ export const PRODUCTION_TRANSFER_ERROR_CODES = Object.freeze([
   "CUTOVER_CONTROLS_DEGRADE_IMPOSSIBLE",
   "CUTOVER_ERASED_PARTICIPANT_PRESENT",
   "CUTOVER_EXECUTE_REQUIRED",
+  "CUTOVER_CAPTURE_PROOF_INVALID",
+  "CUTOVER_SOURCE_BOOKMARK_DRIFT",
   "CUTOVER_FLIP_EVIDENCE_INVALID",
   "CUTOVER_FLIP_EVIDENCE_STALE",
   "CUTOVER_IDENTITY_LINK_VERSION_MISMATCH",
@@ -670,7 +673,8 @@ async function step(context, name, details = {}) {
 // The seal (public seal exports only) and the target handle.
 
 async function openSeal(context) {
-  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
+  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId,
+    originalFenceReceiptPath: context.inputs.fenceReceiptPath });
   const sources = {};
   try {
     for (const role of CUTOVER_SOURCE_ROLES) {
@@ -1241,7 +1245,8 @@ export async function runPreflight(context) {
     checks.P14 = Object.freeze({ unexpiredAtSeal: sparkleNonceCount(ingestion, Date.parse(seal.manifest.createdAt) / 1000) });
     checks.P15 = await checkAdminHistoryExportBinding({ seal, database: ingestion,
       adminHistoryExportPath: context.inputs.adminHistoryExport.path,
-      adminHistoryExportSha256: context.inputs.adminHistoryExport.sha256 });
+      adminHistoryExportSha256: context.inputs.adminHistoryExport.sha256,
+      originalFenceReceiptPath: context.inputs.fenceReceiptPath });
     // P16 the revision floor (REV-SEED): pinned, bound to this seal, and at or
     // above every frozen-read revision; the stage loads it.
     checks.P16 = (await revisionFloorCheck(context, seal)).receipt;
@@ -1838,16 +1843,19 @@ export async function runImport(context, { execute = false, confirm = undefined,
  * pin from the inputs' fence receipt; check 'analytics'). `after` is the
  * instant its verifiedAt must follow (CUTOVER_FLIP_EVIDENCE_STALE).
  */
-export async function validateFlipEvidence(path, seal, { afterMs, fencedAnalytics }) {
+export async function validateFlipEvidence(path, seal, { afterMs, fencedAnalytics, originalFenceReceiptPath, successorFenceReceiptPath }) {
   if (!record(fencedAnalytics) || typeof fencedAnalytics.idSha256 !== "string" || !SHA256.test(fencedAnalytics.idSha256)
       || typeof fencedAnalytics.bookmark !== "string" || fencedAnalytics.bookmark.length === 0) {
     fail("CUTOVER_ARGUMENT_INVALID");
   }
   const { value, sha256 } = await readOwnerJson(absolutePath(path, "CUTOVER_FLIP_EVIDENCE_INVALID"), "CUTOVER_FLIP_EVIDENCE_INVALID");
-  exactKeys(value, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "verifiedAt", "sources", "analytics"],
+  const fixed = value.schema === CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA;
+  if (fencedAnalytics.receipt?.schema === "cloudflare-writer-fence-receipt-v3" && !fixed)
+    fail("CUTOVER_FLIP_EVIDENCE_INVALID");
+  exactKeys(value, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "verifiedAt", "sources", "analytics", ...(fixed ? ["captureProof"] : [])],
     "CUTOVER_FLIP_EVIDENCE_INVALID");
   const manifest = seal.manifest;
-  if (value.schema !== CUTOVER_FLIP_EVIDENCE_SCHEMA || value.sealId !== manifest.sealId
+  if ((!fixed && value.schema !== CUTOVER_FLIP_EVIDENCE_SCHEMA) || value.sealId !== manifest.sealId
       || value.inventorySha256 !== manifest.inventorySha256 || value.fenceReceiptSha256 !== manifest.fence?.fenceReceiptSha256
       || !Array.isArray(value.sources) || value.sources.length !== CUTOVER_SOURCE_ROLES.length) {
     fail("CUTOVER_FLIP_EVIDENCE_INVALID");
@@ -1869,7 +1877,22 @@ export async function validateFlipEvidence(path, seal, { afterMs, fencedAnalytic
   }
   const verifiedMs = instantMs(value.verifiedAt);
   if (verifiedMs === null) fail("CUTOVER_FLIP_EVIDENCE_INVALID");
-  if (!Number.isFinite(afterMs) || verifiedMs <= afterMs) fail("CUTOVER_FLIP_EVIDENCE_STALE");
+  let freshnessMs = verifiedMs;
+  if (fixed) {
+    const { captureProof, ...body } = value;
+    validateCaptureProof(captureProof, body);
+    if (captureProof.kind !== "flip-evidence" || captureProof.originalFenceReceiptSha256 !== manifest.fence.fenceReceiptSha256)
+      fail("CUTOVER_FLIP_EVIDENCE_INVALID");
+    const expectedRoles = [...manifest.sources.map(source => ({ role: source.role, label: source.role,
+      databaseIdSha256: source.databaseIdSha256, bookmarkSha256: sha256Hex(source.bookmark) })),
+      { role: "analytics-bookmark", label: "analytics", databaseIdSha256: fencedAnalytics.idSha256,
+        bookmarkSha256: sha256Hex(fencedAnalytics.bookmark) }];
+    if (canonicalJson(captureProof.capture.roles) !== canonicalJson(expectedRoles)) fail("CUTOVER_FLIP_EVIDENCE_INVALID");
+    await revalidateCaptureProof({ proof: captureProof, body, originalFenceReceiptPath, successorFenceReceiptPath });
+    freshnessMs = instantMs(captureProof.capture.startedAt);
+    if (verifiedMs < instantMs(captureProof.capture.completedAt)) fail("CUTOVER_FLIP_EVIDENCE_INVALID");
+  }
+  if (!Number.isFinite(afterMs) || freshnessMs <= afterMs) fail("CUTOVER_FLIP_EVIDENCE_STALE");
   return Object.freeze({ sha256, verifiedAt: value.verifiedAt });
 }
 
@@ -1903,12 +1926,14 @@ async function databaseInstantAfterCommit(handle) {
   }, { readOnly: true });
 }
 
-export async function releaseControls(context, { flipEvidencePath, execute = false, confirm = undefined } = {}) {
-  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
+export async function releaseControls(context, { flipEvidencePath, successorFenceReceiptPath, execute = false, confirm = undefined } = {}) {
+  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId,
+    originalFenceReceiptPath: context.inputs.fenceReceiptPath });
   const { handle, run, released, flipGate } = await finalizeFacts(context);
   assertStepOrder("release-controls", { runState: run?.state ?? null, released, flipGate });
   const evidence = await validateFlipEvidence(flipEvidencePath, seal, { afterMs: Date.parse(run.verifiedAt),
-    fencedAnalytics: await flipFencedAnalytics(context, seal) });
+    fencedAnalytics: await flipFencedAnalytics(context, seal), originalFenceReceiptPath: context.inputs.fenceReceiptPath,
+    successorFenceReceiptPath });
   // A rerun must name the same flip-1 evidence; it then restores the same
   // values again and keeps the first release instant, so the receipt is equal.
   const prior = released ? (await readRelease(context, run)).release : null;
@@ -1941,14 +1966,16 @@ async function readRelease(context, run) {
   return { release: value, releaseSha256: sha256 };
 }
 
-async function flipGateBody(context, handle, run, flipEvidencePath) {
-  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId });
+async function flipGateBody(context, handle, run, flipEvidencePath, successorFenceReceiptPath) {
+  const seal = await readCutoverSeal({ manifestPath: context.inputs.sealManifestPath, expectedSealId: context.inputs.sealId,
+    originalFenceReceiptPath: context.inputs.fenceReceiptPath });
   const { release, releaseSha256 } = await readRelease(context, run);
   // E2 must be fresh evidence taken after the release (F2): later than the
   // recorded release instant (and so than E1), and never E1 again.
   const evidence = await validateFlipEvidence(flipEvidencePath, seal,
     { afterMs: Math.max(instantMs(release.releasedAt), instantMs(release.flipEvidenceVerifiedAt)),
-      fencedAnalytics: await flipFencedAnalytics(context, seal) });
+      fencedAnalytics: await flipFencedAnalytics(context, seal), originalFenceReceiptPath: context.inputs.fenceReceiptPath,
+      successorFenceReceiptPath });
   if (evidence.sha256 === release.flipEvidenceSha256) fail("CUTOVER_FLIP_EVIDENCE_STALE");
   // The frozen read must be the export post-import loaded (post-import.json,
   // bound to the committed stage receipt), not merely some row with id = 1.
@@ -1996,10 +2023,10 @@ async function flipGateBody(context, handle, run, flipEvidencePath) {
   };
 }
 
-export async function flipGate(context, { flipEvidencePath } = {}) {
+export async function flipGate(context, { flipEvidencePath, successorFenceReceiptPath } = {}) {
   const { handle, run, released, flipGate: gated } = await finalizeFacts(context);
   assertStepOrder("flip-gate", { runState: run?.state ?? null, released, flipGate: gated });
-  const body = await flipGateBody(context, handle, run, flipEvidencePath);
+  const body = await flipGateBody(context, handle, run, flipEvidencePath, successorFenceReceiptPath);
   const flipGateSha256 = await writeReceiptOnce(context.path("flipGate"), body);
   await journal(context, "flip-gate", "ready", { flipGateSha256 });
   return Object.freeze({ step: "flip-gate", ready: true, flipGateSha256, flipEvidenceSha256: body.flipEvidence2Sha256,
@@ -2133,9 +2160,9 @@ const COMMANDS = Object.freeze({
   preflight: { values: ["--owner-dir", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
   run: { values: ["--owner-dir", "--confirm", "--confirm-identity-rotation", "--pg-socket", "--pg-port", "--pg-user",
     "--pg-database"], switches: ["--execute"] },
-  "release-controls": { values: ["--owner-dir", "--flip-evidence", "--confirm", "--pg-socket", "--pg-port", "--pg-user",
+  "release-controls": { values: ["--owner-dir", "--flip-evidence", "--successor-fence-receipt", "--confirm", "--pg-socket", "--pg-port", "--pg-user",
     "--pg-database"], switches: ["--execute"] },
-  "flip-gate": { values: ["--owner-dir", "--flip-evidence", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
+  "flip-gate": { values: ["--owner-dir", "--flip-evidence", "--successor-fence-receipt", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
   "mark-live": { values: ["--owner-dir", "--flip-evidence-sha256", "--confirm", "--pg-socket", "--pg-port", "--pg-user",
     "--pg-database"], switches: ["--execute"] },
   "post-live-check": { values: ["--owner-dir", "--pg-socket", "--pg-port", "--pg-user", "--pg-database"], switches: [] },
@@ -2244,8 +2271,8 @@ async function main(argv, { stdin = process.stdin, stdout = process.stdout } = {
       preflight: () => runPreflight(context),
       run: () => runImport(context, { ...authorization,
         confirmIdentityRotation: options["--confirm-identity-rotation"] }),
-      "release-controls": () => releaseControls(context, { flipEvidencePath: resolve(options["--flip-evidence"]), ...authorization }),
-      "flip-gate": () => flipGate(context, { flipEvidencePath: resolve(options["--flip-evidence"]) }),
+      "release-controls": () => releaseControls(context, { flipEvidencePath: resolve(options["--flip-evidence"]), successorFenceReceiptPath: options["--successor-fence-receipt"] === undefined ? undefined : resolve(options["--successor-fence-receipt"]), ...authorization }),
+      "flip-gate": () => flipGate(context, { flipEvidencePath: resolve(options["--flip-evidence"]), successorFenceReceiptPath: options["--successor-fence-receipt"] === undefined ? undefined : resolve(options["--successor-fence-receipt"]) }),
       "mark-live": () => markLiveStep(context, { flipEvidenceSha256: options["--flip-evidence-sha256"], ...authorization }),
       "post-live-check": () => postLiveCheck(context),
       report: () => writeReport(context),

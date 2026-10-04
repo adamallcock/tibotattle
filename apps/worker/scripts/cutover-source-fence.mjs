@@ -22,12 +22,18 @@
 //                     CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE (R19 hardening (c),
 //                     REV-SEED design step 4).
 //
+// Fixed-timestamp EP-8 receipts select fresh common timestamps for all source
+// and analytics reads. They emit a non-admissible flip-evidence-draft.json;
+// finalize-flip-evidence requires a pinned same-lineage successor receipt whose
+// zero-event coverage extends through capture completion. Legacy v2 is unchanged.
+//
 // Every output is content-free: digests, bookmarks (opaque provider tokens
 // the fence receipt already pins), counts, roles and table names.
 
 import { resolve, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
+import { beginCapture, finishCapture, readCaptureAnchor, createCaptureDraft, finalizeCaptureDraft, validateCaptureDraft } from "./cutover-capture-proof.mjs";
 import { readCloudflareWriterFenceReceipt } from "./cloudflare-writer-fence.mjs";
 import { fencedAnalyticsEntry, readCutoverAnalyticsSource } from "./cutover-admin-history-export.mjs";
 import {
@@ -54,10 +60,12 @@ export const CUTOVER_BARRIER_PROOF_SCHEMA = "tibotattle-cutover-barrier-proof-v1
 export const CUTOVER_FENCE_VERIFICATION_SCHEMA = "tibotattle-cutover-fence-verification-v1";
 /** v2 (R19 hardening (c)): the evidence also carries the analytics D1's fenced bookmark, re-read. */
 export const CUTOVER_FLIP_EVIDENCE_SCHEMA = "tibotattle-cutover-flip-evidence-v2";
+export const CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA = "tibotattle-cutover-flip-evidence-v3";
 export const CUTOVER_BARRIER_RETRY_AFTER = "300";
 export const CUTOVER_BARRIER_ERROR_CODE = "MUTATION_BARRIER_ACTIVE";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+const OPAQUE = /^[A-Za-z0-9-]{8,128}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -273,6 +281,11 @@ export async function verifyCutoverUnchanged({
   const seal = await readCutoverSeal({ manifestPath, expectedSealId: sealId });
   if (seal.manifest.inventorySha256 !== inventory.inventorySha256) fail("CUTOVER_SEAL_MANIFEST_INVALID");
   const analytics = await fencedAnalyticsSource({ inventory, seal, analyticsSourcePath, fenceReceiptPath });
+  const anchor = await readCaptureAnchor({ fenceReceiptPath, fenceReceiptSha256: seal.manifest.fence.fenceReceiptSha256 });
+  await readCutoverSeal({ manifestPath, expectedSealId: sealId, originalFenceReceiptPath: fenceReceiptPath });
+  if (anchor.fixed && (anchor.receipt.accountSha256 !== sha256Hex(`account:${inventory.accountId}`)
+      || anchor.receipt.productionWorker.sourceCommit !== seal.manifest.fence.sourceCommit))
+    fail("CUTOVER_FENCE_SOURCE_MISMATCH");
   for (const role of CUTOVER_SOURCE_ROLES) {
     const sealed = await openSealedSourceFromSeal(seal, role);
     try {
@@ -294,14 +307,18 @@ export async function verifyCutoverUnchanged({
       inventory: scope, transportDirectory: directory, spawn, cliPath, environment, remote, ownerReadOnly,
     }) : null;
     const guarded = guardCutoverTransport(transport ?? ownedTransport, scope);
-    const analyticsBefore = await guarded.bookmark(analytics.source);
+    const captureContext = anchor.fixed ? await beginCapture({ anchor, guarded, now,
+      sources: [...CUTOVER_SOURCE_ROLES.map(role => ({ fenceLabel: role, source: inventory.sources[role] })),
+        { fenceLabel: "analytics", source: analytics.source }] }) : null;
+    const analyticsBefore = anchor.fixed ? analytics.fenced.bookmark : await guarded.bookmark(analytics.source);
     if (analyticsBefore !== analytics.fenced.bookmark) fail("CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE");
     const sources = [];
     for (const role of CUTOVER_SOURCE_ROLES) {
       const sealedSource = seal.sources[role];
       let facts;
       try {
-        facts = await readRemoteUnchangedFacts(guarded, inventory.sources[role], sealedSource);
+        facts = await readRemoteUnchangedFacts(guarded, inventory.sources[role], sealedSource,
+          anchor.fixed ? { timestamp: captureContext.startedAt } : undefined);
       } catch (error) {
         if (error instanceof CutoverSourceError && error.code === "CUTOVER_REMOTE_SQL_NOT_SELECT") throw error;
         if (error instanceof CutoverSourceError && error.code === "CUTOVER_SOURCE_NOT_ALLOWED") throw error;
@@ -318,12 +335,13 @@ export async function verifyCutoverUnchanged({
         sealedSha256: sealedSource.sealedSha256,
       }));
     }
-    const analyticsAfter = await guarded.bookmark(analytics.source);
+    const capture = anchor.fixed ? await finishCapture(captureContext, { now }) : null;
+    const analyticsAfter = anchor.fixed ? analytics.fenced.bookmark : await guarded.bookmark(analytics.source);
     if (analyticsAfter !== analyticsBefore) fail("CUTOVER_ANALYTICS_CHANGED_AFTER_FENCE");
     await ownedTransport?.dispose();
     const verifiedAt = now().toISOString();
     const evidence = {
-      schema: CUTOVER_FLIP_EVIDENCE_SCHEMA,
+      schema: anchor.fixed ? CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA : CUTOVER_FLIP_EVIDENCE_SCHEMA,
       sealId,
       inventorySha256: inventory.inventorySha256,
       fenceReceiptSha256: seal.manifest.fence.fenceReceiptSha256,
@@ -331,17 +349,70 @@ export async function verifyCutoverUnchanged({
       sources,
       analytics: Object.freeze({ databaseIdSha256: analytics.fenced.idSha256, bookmark: analyticsAfter }),
     };
-    const text = `${canonicalJson(evidence)}\n`;
+    const output = anchor.fixed ? createCaptureDraft({ kind: "flip-evidence", body: evidence, anchor, capture }) : evidence;
+    const text = `${canonicalJson(output)}\n`;
     if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
     // One verification per owner directory: an existing flip-evidence.json
     // is CUTOVER_OUTPUT_EXISTS, never overwritten.
-    const path = join(directory, "flip-evidence.json");
+    const path = join(directory, anchor.fixed ? "flip-evidence-draft.json" : "flip-evidence.json");
     const flipEvidenceSha256 = await writePrivateFileOnce(path, text, 0o400);
-    return Object.freeze({ mode: "verified", path, flipEvidenceSha256, evidence: Object.freeze(evidence) });
+    return Object.freeze({ mode: anchor.fixed ? "draft" : "verified", path, flipEvidenceSha256, ...(anchor.fixed ? { draftSha256: flipEvidenceSha256 } : {}), evidence: Object.freeze(output) });
   } catch (error) {
     await ownedTransport?.dispose().catch(() => {});
     throw error;
   }
+}
+
+/** Closed content-free final body validation before publishing an immutable artifact. */
+function validateFixedFlipBody(body, proof) {
+  const invalid = () => fail("CUTOVER_CAPTURE_PROOF_INVALID");
+  const closed = (value, keys) => {
+    if (!record(value) || Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) invalid();
+  };
+  closed(body, ["schema", "sealId", "inventorySha256", "fenceReceiptSha256", "verifiedAt", "sources", "analytics"]);
+  if (body.schema !== CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA
+      || [body.sealId, body.inventorySha256, body.fenceReceiptSha256].some(value => typeof value !== "string" || !SHA256.test(value))
+      || body.fenceReceiptSha256 !== proof.originalFenceReceiptSha256
+      || instantMs(body.verifiedAt) === null || instantMs(body.verifiedAt) < instantMs(proof.capture.completedAt)
+      || !Array.isArray(body.sources) || body.sources.length !== CUTOVER_SOURCE_ROLES.length) invalid();
+  for (const [index, source] of body.sources.entries()) {
+    closed(source, ["role", "databaseIdSha256", "bookmark", "schemaSha256", "aggregatesSha256", "sealedSha256"]);
+    if (source.role !== CUTOVER_SOURCE_ROLES[index] || typeof source.bookmark !== "string" || !OPAQUE.test(source.bookmark)
+        || [source.databaseIdSha256, source.schemaSha256, source.aggregatesSha256, source.sealedSha256]
+          .some(value => typeof value !== "string" || !SHA256.test(value))) invalid();
+  }
+  closed(body.analytics, ["databaseIdSha256", "bookmark"]);
+  if (typeof body.analytics.databaseIdSha256 !== "string" || !SHA256.test(body.analytics.databaseIdSha256)
+      || typeof body.analytics.bookmark !== "string" || !OPAQUE.test(body.analytics.bookmark)) invalid();
+  const roles = [...body.sources.map(source => ({ role: source.role, label: source.role,
+    databaseIdSha256: source.databaseIdSha256, bookmarkSha256: sha256Hex(source.bookmark) })),
+    { role: CUTOVER_ANALYTICS_BOOKMARK_ROLE, label: "analytics", databaseIdSha256: body.analytics.databaseIdSha256,
+      bookmarkSha256: sha256Hex(body.analytics.bookmark) }];
+  if (canonicalJson(roles) !== canonicalJson(proof.capture.roles)) invalid();
+}
+
+/** Finalize a prospective draft only after a same-lineage EP-8 successor covers all reads. */
+export async function finalizeCutoverFlipEvidence({ draftPath, draftSha256, fenceReceiptPath,
+  successorFenceReceiptPath, successorFenceReceiptSha256, ownerDirectory, forbiddenRoots = undefined } = {}) {
+  if (!SHA256.test(draftSha256 ?? "") || !SHA256.test(successorFenceReceiptSha256 ?? "")) fail("CUTOVER_ARGUMENT_INVALID");
+  const directory = await assertOwnerDirectory(ownerDirectory, forbiddenRoots === undefined ? {} : { forbiddenRoots });
+  const bytes = await readPrivateFile(draftPath, 1024 * 1024, "CUTOVER_CAPTURE_PROOF_INVALID");
+  if (sha256Hex(bytes) !== draftSha256) fail("CUTOVER_CAPTURE_PROOF_INVALID");
+  let draft;
+  try { draft = JSON.parse(bytes.toString("utf8")); } catch { fail("CUTOVER_CAPTURE_PROOF_INVALID"); }
+  validateCaptureDraft(draft);
+  if (!bytes.equals(Buffer.from(`${canonicalJson(draft)}\n`))) fail("CUTOVER_CAPTURE_PROOF_INVALID");
+  if (draft.kind !== "flip-evidence" || draft.body?.schema !== CUTOVER_FLIP_FIXED_EVIDENCE_SCHEMA)
+    fail("CUTOVER_CAPTURE_PROOF_INVALID");
+  const { body, proof } = await finalizeCaptureDraft({ draft, originalFenceReceiptPath: fenceReceiptPath,
+    successorFenceReceiptPath, successorFenceReceiptSha256 });
+  validateFixedFlipBody(body, proof);
+  const evidence = { ...body, captureProof: proof };
+  const text = `${canonicalJson(evidence)}\n`;
+  if (containsSignedUrl(text)) fail("CUTOVER_SECRET_IN_OUTPUT");
+  const path = join(directory, "flip-evidence.json");
+  const flipEvidenceSha256 = await writePrivateFileOnce(path, text, 0o400);
+  return Object.freeze({ mode: "verified", path, flipEvidenceSha256, evidence: Object.freeze(evidence) });
 }
 
 // ---------------------------------------------------------------------------
@@ -349,10 +420,11 @@ export async function verifyCutoverUnchanged({
 
 function parseArguments(argv) {
   const [command, ...rest] = argv;
-  if (!["verify-fence", "verify-unchanged"].includes(command)) fail("CUTOVER_ARGUMENT_INVALID");
+  if (!["verify-fence", "verify-unchanged", "finalize-flip-evidence"].includes(command)) fail("CUTOVER_ARGUMENT_INVALID");
   const values = { "--inventory": "inventoryPath", "--fence-receipt": "fenceReceiptPath",
     "--fence-sha256": "fenceReceiptSha256", "--barrier-proof": "barrierProofPath", "--seal": "manifestPath",
-    "--seal-id": "sealId", "--analytics-source": "analyticsSourcePath", "--out": "ownerDirectory" };
+    "--draft": "draftPath", "--draft-sha256": "draftSha256", "--successor-fence-receipt": "successorFenceReceiptPath",
+    "--successor-fence-sha256": "successorFenceReceiptSha256", "--seal-id": "sealId", "--analytics-source": "analyticsSourcePath", "--out": "ownerDirectory" };
   const switches = { "--remote": "remote", "--owner-read-only": "ownerReadOnly", "--execute": "execute" };
   const options = { command };
   for (let index = 0; index < rest.length; index += 1) {
@@ -370,12 +442,24 @@ function parseArguments(argv) {
     options[key] = value;
     index += 1;
   }
-  if (!options.inventoryPath) fail("CUTOVER_ARGUMENT_INVALID");
+  const finalKeys = ["draftPath", "draftSha256", "successorFenceReceiptPath", "successorFenceReceiptSha256"];
+  if (command !== "finalize-flip-evidence" && finalKeys.some(key => options[key] !== undefined)) fail("CUTOVER_ARGUMENT_INVALID");
+  if (command === "finalize-flip-evidence" && Object.keys(options).some(key => !["command", ...finalKeys, "fenceReceiptPath", "ownerDirectory"].includes(key))) fail("CUTOVER_ARGUMENT_INVALID");
+  if (command !== "finalize-flip-evidence" && !options.inventoryPath) fail("CUTOVER_ARGUMENT_INVALID");
   return options;
 }
 
 async function main(argv) {
   const options = parseArguments(argv);
+  if (options.command === "finalize-flip-evidence") {
+    const result = await finalizeCutoverFlipEvidence({ ...options,
+      draftPath: options.draftPath === undefined ? undefined : resolve(options.draftPath),
+      fenceReceiptPath: options.fenceReceiptPath === undefined ? undefined : resolve(options.fenceReceiptPath),
+      successorFenceReceiptPath: options.successorFenceReceiptPath === undefined ? undefined : resolve(options.successorFenceReceiptPath),
+      ownerDirectory: options.ownerDirectory === undefined ? undefined : resolve(options.ownerDirectory) });
+    process.stdout.write(`${JSON.stringify({ command: options.command, mode: result.mode, flipEvidenceSha256: result.flipEvidenceSha256 })}\n`);
+    return;
+  }
   if (options.command === "verify-fence") {
     const inventory = await readCutoverInventory(resolve(options.inventoryPath));
     const result = await verifyCutoverFence({ inventory, fenceReceiptPath: options.fenceReceiptPath,
@@ -395,8 +479,9 @@ async function main(argv) {
     remote: options.remote === true,
     ownerReadOnly: options.ownerReadOnly === true,
   });
-  process.stdout.write(`${JSON.stringify(result.mode === "verified"
-    ? { command: options.command, mode: result.mode, flipEvidenceSha256: result.flipEvidenceSha256 }
+  process.stdout.write(`${JSON.stringify(result.mode === "draft"
+    ? { command: options.command, mode: result.mode, draftSha256: result.draftSha256 }
+    : result.mode === "verified" ? { command: options.command, mode: result.mode, flipEvidenceSha256: result.flipEvidenceSha256 }
     : { command: options.command, mode: result.mode })}\n`);
 }
 
