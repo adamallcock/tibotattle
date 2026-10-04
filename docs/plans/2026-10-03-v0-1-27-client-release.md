@@ -45,8 +45,8 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 | Packaging dependencies | Approved exception active at bdc56099; independent review, live guard, recursive OSV and focused negative tests passed | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
-| Source freeze | Initial freeze bdc56099 encountered the R7 manifest failure; additive export format fix required before final freeze | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
-| Retained R7 evidence | First protected attempt failed at a confirmed historical manifest-capacity mismatch; additive repair and full fresh retry required | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
+| Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
+| Retained R7 evidence | Additive manifest v0.3 and deletion-journal v0.2 repair reviewed; complete fresh protected retry ready | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Focused client/shared gates passed; complete gates pending repaired frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
 | Production candidates | Earlier Mac source stages retained; Apple notarization blocked by an unsigned/expired developer agreement; new-byte native gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
@@ -286,3 +286,21 @@ reader must ship before the new backend response contracts and client publicatio
 qualification. The current live reader retains activity but cannot retain all
 new allowance/model/plan breakdowns. This sequence does not block the independent
 client source freeze or tag, and does not authorize changing the parity cutover.
+
+
+The reviewed export repair is integrated at `ad51936f`: manifest v0.3 admits
+only the existing 100,000-source runtime limit, old schema bytes and limits remain
+unchanged, and retained verification/deletion/recovery/retry checks pass. The
+packaged local-review runtime passed all 12 lifecycle invocations with no covered
+network attempts and byte-identical same-epoch builds. The subsequent full root
+suite recorded 5,874 passes, 44 existing skips and only the two expected stale-R7
+failures. Worker script lanes and all 2,019 Vitest tests passed; the final local
+dry-run staging step needs the missing generated public release site. No service
+was deployed. The complete R7 retry starts only after these test processes exit.
+
+The hosted owner confirmed four independent human decisions still precede cloud
+measurement; the Sunday-night parity target is conditional, and post-cutover
+contract/correction qualification has no committed release window. Final release
+notes must match the actual UTC publication date. Preserve the clean reviewed
+client source and complete local evidence now; do not guess that date or reserve
+an immutable final tag before Apple and hosted prerequisites establish the window.
