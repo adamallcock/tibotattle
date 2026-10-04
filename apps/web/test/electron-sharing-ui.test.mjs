@@ -7,6 +7,8 @@ import {
   normalizeElectronSharingPreference,
 } from "../public/electron-settings.js";
 
+import { translate } from "../public/i18n.generated.js";
+
 const APP_SOURCE_URL = new URL("../public/app.js", import.meta.url);
 
 function extractFunction(source, name) {
@@ -134,6 +136,69 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(settingsSource, /void invoke\("downloadUpdate"\)/u);
   assert.match(settingsSource, /void invoke\("installUpdateAndRestart"\)/u);
   assert.match(settingsSource, /void invoke\("setAutomaticDownload", event\.target\.checked === true\)/u);
+});
+
+test("paused sharing stays cause-neutral in Community and Settings in every locale", async () => {
+  const [appSource, settingsSource] = await Promise.all([
+    readFile(APP_SOURCE_URL, "utf8"),
+    readFile(new URL("../public/electron-settings.js", import.meta.url), "utf8"),
+  ]);
+  const preference = normalizeElectronSharingPreference(validProjection({
+    enabled: true,
+    state: "enabled",
+    basis: "user_choice",
+    transportStatus: "paused",
+  }));
+  // The bridge projects only the paused state. It does not provide enough
+  // evidence to distinguish server rejection from an authorization pause.
+  assert.equal(Object.hasOwn(preference, "pausedReason"), false);
+  for (const [locale, expected] of [
+    ["en-US", "Sharing is paused. Local analysis remains available."],
+    ["zh-Hans", "共享已暂停。本地分析仍可使用。"],
+    ["es", "La compartición está en pausa. El análisis local sigue disponible."],
+  ]) {
+    const communityElements = new Map([
+      "#electron-accountless-community", "#electron-accountless-community-state",
+      "#electron-accountless-community-transport", "#electron-accountless-sharing-enabled",
+      "#electron-accountless-sharing-error",
+    ].map((key) => [key, { hidden: false, checked: false, disabled: false, textContent: "" }]));
+    const renderCommunity = new Function(
+      "$", "electronSharingPreference", "setLocalizedText",
+      `const electronSharingBridge = () => ({});
+       const electronSharingBusy = false;
+       const electronSharingNoticeAckError = false;
+       ${extractFunction(appSource, "electronSharingStateMessageKey")}
+       ${extractFunction(appSource, "electronSharingTransportMessageKey")}
+       ${extractFunction(appSource, "renderElectronAccountlessCommunity")}
+       return renderElectronAccountlessCommunity;`,
+    )(
+      (key) => communityElements.get(key),
+      preference,
+      (element, key) => { element.textContent = translate(key, {}, { locale }); },
+    );
+    renderCommunity();
+    assert.equal(communityElements.get("#electron-accountless-community-transport").textContent, expected);
+    assert.equal(communityElements.get("#electron-accountless-sharing-enabled").checked, true);
+    assert.equal(communityElements.get("#electron-accountless-sharing-enabled").disabled, false);
+
+    const settingsElements = new Map([
+      "#settings-sharing-state", "#settings-sharing-transport",
+    ].map((key) => [key, { textContent: "" }]));
+    const renderSettings = new Function(
+      "translateSettingsMessage",
+      `${extractFunction(settingsSource, "sharingStateMessageKey")}
+       ${extractFunction(settingsSource, "sharingTransportMessageKey")}
+       ${extractFunction(settingsSource, "renderSharingPreference")}
+       return renderSharingPreference;`,
+    )((localizer, key, values = {}) => localizer.t(key, values));
+    renderSettings(
+      { querySelector: (key) => settingsElements.get(key) },
+      preference,
+      true,
+      { t: (key, values) => translate(key, values, { locale }) },
+    );
+    assert.equal(settingsElements.get("#settings-sharing-transport").textContent, expected);
+  }
 });
 
 test("Community sharing confirms saved state and restores it after a rejected change", async () => {
