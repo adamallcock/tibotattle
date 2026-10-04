@@ -12,6 +12,38 @@ const plain = value => value !== null && typeof value === 'object' && !Array.isA
   && Object.getPrototypeOf(value) === Object.prototype;
 const fail = reason => { throw Object.assign(new Error('MACOS_QUALIFICATION_IDENTITY_REFUSED'), { reason }); };
 
+// Historical v1 remains the 0.1.20 route, including the signed credential lane.
+// v2 is a separately reviewed, exact 0.1.26 -> 0.1.27 production-feed route.
+// 0.1.26 DMGs/source are pinned by the immutable published manifest:
+// https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json
+// SHA-256 be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc.
+// Bundle/build metadata is also checked inside the signed, digest-verified DMG.
+const PRODUCTION_UPDATE_PREDECESSORS = Object.freeze({
+  'tibotattle-production-electron-update-intake-v1': Object.freeze({
+    version: '0.1.20', sourceRevision: 'f518126a05a6d165b9617f6417a87219d7047273',
+    buildNumber: '2026091104', bundleVersion: '2026091104',
+    dmgSha256: Object.freeze({
+      'darwin-arm64': '50a1b89aff696ef3323ab48284aa820af7aad504397fbe88831c29ace2479f30',
+      'darwin-x64': 'a63ec06036ddbc5a0e70dc59c6520a8ad5baa8c7a3a0fc4d3713a7f1f1523ecd',
+    }),
+  }),
+  'tibotattle-production-electron-update-intake-v2': Object.freeze({
+    version: '0.1.26', sourceRevision: 'acfc385c95b49b8e1040cedfa857659b49a61d8d',
+    buildNumber: '2026092701', bundleVersion: '1034', successorVersion: '0.1.27',
+    dmgSha256: Object.freeze({
+      'darwin-arm64': '7b5f66d91c9f1b8c1537505da860c67177d2b489ee6fb90d445d97c7e46cc9ec',
+      'darwin-x64': '3806a1ce2650350b69faff759287c08a5f146acfb9c26e3b3b04abb5cf8896c3',
+    }),
+  }),
+});
+
+export function resolveMacOSProductionUpdatePredecessor({ schemaVersion, version } = {}) {
+  if (typeof schemaVersion !== 'string' || !Object.hasOwn(PRODUCTION_UPDATE_PREDECESSORS, schemaVersion)) fail('update_profile');
+  const predecessor = PRODUCTION_UPDATE_PREDECESSORS[schemaVersion];
+  if (predecessor.successorVersion && version !== predecessor.successorVersion) fail('update_profile');
+  return predecessor;
+}
+
 /** Use the existing source-preparation receipt; never allocate a build here. */
 export function deriveMacOSQualificationIdentity({ sourceCandidate, sourceRevision, target,
   packageVersion, sourceVersion, resolveBundleVersion = resolveSignedMacOSBundleVersion } = {}) {
@@ -97,7 +129,7 @@ export function preflightMacOSQualificationEnvironment(lane, environment = proce
     lane === 'empty-profile' ? environment.EMPTY_PROFILE_INTAKE : environment.SELECTED_IDENTITY);
   if (Object.keys(identity).length !== keys.length || !keys.every(key => typeof identity[key] === 'string')
     || Object.entries(identity).some(([key, value]) => key.endsWith('Sha256') && !/^[a-f0-9]{64}$/u.test(value))) fail('intake');
-  if (lane === 'production-update' && identity.schemaVersion !== 'tibotattle-production-electron-update-intake-v1') fail('intake');
+  if (lane === 'production-update') resolveMacOSProductionUpdatePredecessor(identity);
   const runnerRevision = lane === 'empty-profile' ? identity.runnerRevision : environment.SELECTED_RUNNER;
   const sourceRevision = lane === 'sparkle' ? environment.SELECTED_SOURCE : identity.sourceRevision;
   if (runnerRevision !== environment.GITHUB_SHA) fail('runner_revision');

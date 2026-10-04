@@ -959,7 +959,8 @@
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "test/electron-macos-qualification-identity.test.mjs",
         "docs/runbooks/macos-stable-release-runbook.md",
-        "scripts/lib/macos-credential-qualification-intake.mjs"
+        "scripts/lib/macos-credential-qualification-intake.mjs",
+        "scripts/smoke-electron-macos-production-update.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",

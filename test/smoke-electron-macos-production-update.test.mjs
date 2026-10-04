@@ -7,6 +7,7 @@ import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
+import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 const hash = (b, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(b).digest(encoding);
 const fixture = (target = 'darwin-arm64') => ({ schemaVersion: 'tibotattle-production-electron-update-intake-v1',
   target, sourceRevision: 'a'.repeat(40), buildNumber: '2026091106', version: '0.1.22', bundleVersion: '1029',
@@ -36,10 +37,63 @@ test('both targets bind immutable 020 and explicit allocated successors to fixed
     { version: '0.1.17', bundleVersion: '1024' }, { version: ['0.1.23'], bundleVersion: '1030' },
     { version: '0.1.23', bundleVersion: 1030 }]) assert.throws(() => runner.validateProductionUpdateIntake({ ...fixture(), ...bad }));
 });
+const currentFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
+  schemaVersion: 'tibotattle-production-electron-update-intake-v2', version: '0.1.27',
+  buildNumber: '2026100301', bundleVersion: '1035' });
+test('v2 binds only the immutable 026 predecessor and 027 successor on both architectures', () => {
+  const expected = { 'darwin-arm64': '7b5f66d91c9f1b8c1537505da860c67177d2b489ee6fb90d445d97c7e46cc9ec',
+    'darwin-x64': '3806a1ce2650350b69faff759287c08a5f146acfb9c26e3b3b04abb5cf8896c3' };
+  for (const target of Object.keys(expected)) {
+    const input = runner.validateProductionUpdateIntake(currentFixture(target));
+    assert.equal(input.predecessorDmgSha256, expected[target]);
+    assert.equal(input.predecessorUrl, 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/TiboTattle-0.1.26-mac-' + input.architecture + '.dmg');
+    assert.equal(input.candidateUrl, 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.27/TiboTattle-0.1.27-mac-' + input.architecture + '.dmg');
+    assert.equal(input.feedUrl, 'https://updates.tibotattle.com/electron/stable/' + target + '/latest-mac.yml');
+    const historical = runner.validateProductionUpdateIntake({ ...currentFixture(target), schemaVersion: fixture().schemaVersion });
+    assert.equal(historical.predecessorDmgSha256, runner.ELECTRON_020_DMG[target]);
+    assert.match(historical.predecessorUrl, /download\/v0\.1\.20\/TiboTattle-0\.1\.20-/u);
+  }
+  for (const key of Object.keys(currentFixture())) {
+    const bad = currentFixture(); delete bad[key]; assert.throws(() => runner.validateProductionUpdateIntake(bad));
+  }
+  for (const patch of [{ schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, { schemaVersion: 'toString' },
+    { version: '0.1.26', bundleVersion: '1034' }, { version: '0.1.28', bundleVersion: '1036' }, { bundleVersion: '1034' },
+    { predecessorVersion: '0.1.20' }, { predecessorDmgSha256: runner.ELECTRON_020_DMG['darwin-arm64'] },
+    { predecessorUrl: 'https://example.invalid/old.dmg' }, { feedUrl: 'https://example.invalid/feed.yml' },
+    { feedScope: 'isolated_test_feed' }, { target: 'linux-x64' }, { predecessorAsarSha256: 'F'.repeat(64) }]) {
+    assert.throws(() => runner.validateProductionUpdateIntake({ ...currentFixture(), ...patch }));
+  }
+});
+test('predecessor metadata refuses mixed source, build, bundle, architecture and historical version identities', () => {
+  for (const target of ['darwin-arm64', 'darwin-x64']) for (const legacy of [false, true]) {
+    const input = runner.validateProductionUpdateIntake(legacy ? fixture(target) : currentFixture(target));
+    const predecessor = legacy ? { version: '0.1.20', sourceRevision: runner.ELECTRON_020_SOURCE,
+      buildNumber: '2026091104', bundleVersion: '2026091104' }
+      : { version: '0.1.26', sourceRevision: 'acfc385c95b49b8e1040cedfa857659b49a61d8d', buildNumber: '2026092701', bundleVersion: '1034' };
+    const pkg = { name: 'app-usagemonitor', version: predecessor.version,
+      tibotattleDistribution: createProductionDistributionMetadata({ ...predecessor, target }) };
+    const plist = { CFBundleIdentifier: 'com.usagemonitor.local', CFBundleShortVersionString: predecessor.version,
+      CFBundleVersion: predecessor.bundleVersion };
+    assert.deepEqual(runner.validateProductionUpdatePredecessorMetadata(input, pkg, plist), pkg.tibotattleDistribution);
+    for (const change of [p => p.name = 'unrelated-app', p => p.version = legacy ? '0.1.26' : '0.1.20',
+      p => p.tibotattleDistribution.sourceRevision = 'b'.repeat(40), p => p.tibotattleDistribution.buildNumber = '2026091106',
+      p => p.tibotattleDistribution.target = target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64',
+      p => p.tibotattleDistribution.channel = 'preview', p => p.tibotattleDistribution.updateFeed = 'https://example.invalid']) {
+      const bad = structuredClone(pkg); change(bad);
+      assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, bad, plist));
+    }
+    for (const patch of [{ CFBundleIdentifier: 'unrelated-app' }, { CFBundleShortVersionString: '0.1.22' },
+      { CFBundleVersion: legacy ? '1034' : '2026092701' }]) {
+      assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, pkg, { ...plist, ...patch }));
+    }
+    assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(
+      runner.validateProductionUpdateIntake(legacy ? currentFixture(target) : fixture(target)), pkg, plist));
+  }
+});
 test('live feed must bind both exact artifacts and cannot redirect the updater', () => {
-  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030']]) {
+  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030'], ['0.1.27', '1035']]) {
     const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
-    const input = runner.validateProductionUpdateIntake({ ...fixture(), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
+    const input = runner.validateProductionUpdateIntake({ ...(version === '0.1.27' ? currentFixture() : fixture()), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
     const manifest = { version, files: [[input.zipFileName, zip], [input.dmgFileName, dmg]].map(([url, b]) => ({ url, size: b.length, sha512: hash(b, 'sha512', 'base64') })),
       path: input.zipFileName, sha512: hash(zip, 'sha512', 'base64') };
     assert.equal(runner.validateProductionMacUpdateFeed(input, manifest, zip, dmg), true);
@@ -60,6 +114,27 @@ test('plan reads intake only and makes no artifact, feed, process or signed-app 
     assert.equal(result.status, 'planned');
     for (const key of ['sourceRevision', 'version', 'bundleVersion', 'buildNumber']) assert.equal(result[key], identity[key]);
     for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified', 'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped']) assert.equal(result[key], false);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+test('v2 plan identifies 026 provenance while leaving native and credential assertions unqualified', async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-update-plan-v2-')));
+  try {
+    for (const target of ['darwin-arm64', 'darwin-x64']) {
+      const identity = currentFixture(target), intakePath = join(directory, target + '.json');
+      await writeFile(intakePath, JSON.stringify(identity), { mode: 0o600 });
+      const result = await runner.runProductionUpdate({ execute: false, intakePath });
+      assert.equal(result.status, 'planned');
+      assert.equal(result.schemaVersion, 'tibotattle-signed-macos-production-update-v2');
+      assert.equal(result.predecessorVersion, '0.1.26');
+      assert.equal(result.predecessorSourceRevision, 'acfc385c95b49b8e1040cedfa857659b49a61d8d');
+      assert.equal(result.predecessorBuildNumber, '2026092701');
+      assert.equal(result.predecessorBundleVersion, '1034');
+      assert.equal(result.predecessorProcessesExitedNaturally, false);
+      for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified',
+        'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped', 'existingCredentialFixture', 'feedOverrideApplied']) {
+        assert.equal(result[key], false, key);
+      }
+    }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 test('runner leaves the signed application and production feed under their actual owners', async () => {
@@ -116,6 +191,27 @@ test('updater successor excludes an orphaned old companion but keeps new main an
   assert.throws(() => runner.selectProductionUpdateSuccessor([row(200,1)],executable,100,new Set()));
 });
 
+test('v2 requires every old process identity to exit before successor acceptance', () => {
+  const executable = '/qualified/TiboTattle.app/Contents/MacOS/TiboTattle', helper = '/qualified/companion';
+  const startedAt = 'Sun Oct 4 02:00:00 2026';
+  const row = (pid, parent, command = executable, start = startedAt) => ({ pid, parent, group: pid, command, startedAt: start });
+  const old = new Map([[100, executable + '\n' + startedAt], [101, helper + '\n' + startedAt]]);
+  const select = rows => runner.selectCurrentProductionUpdateSuccessor(rows, executable, 100, old);
+  assert.equal(select([row(100, 1), row(200, 1)]), null, 'old main still alive');
+  assert.equal(select([row(101, 1, helper), row(200, 1)]), null, 'orphaned old companion still alive');
+  assert.equal(select([row(101, 1, '/qualified/exec-replacement'), row(200, 1)]), null,
+    'exec does not retire the same PID and start-time identity');
+  assert.equal(select([row(101, 1, helper, null), row(200, 1)]), null, 'unknown start time is not proof of exit');
+  assert.equal(select([row(200, 1), row(201, 200)]).pid, 200);
+  assert.equal(select([row(101, 1, helper, 'Sun Oct 4 03:00:00 2026'), row(200, 1)]).pid, 200,
+    'reused PID with a different start time is not the captured predecessor');
+  assert.equal(select([row(100, 1, executable, 'Sun Oct 4 03:00:00 2026')]), null,
+    'a previously captured PID never becomes the accepted successor');
+  assert.throws(() => select([row(200, 1), row(300, 1)]), 'independent new roots remain ambiguous');
+  for (const processes of [new Set([100]), new Map(), new Map([[100, null]]), new Map([[100, executable + '\n']])]) {
+    assert.throws(() => runner.selectCurrentProductionUpdateSuccessor([row(200, 1)], executable, 100, processes));
+  }
+});
 test('replacement verification refreshes the real ASAR path cache after an updater swaps bytes', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-asar-replacement-')));
   const app = join(directory, 'TiboTattle.app'), resource = join(app, 'Contents', 'Resources');

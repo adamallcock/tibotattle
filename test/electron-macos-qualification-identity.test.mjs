@@ -99,7 +99,7 @@ test('source receipt is required, bounded, and stripped without creating qualifi
     ['buildNumber', 'bundleVersion', 'sourceRevision', 'target', 'version']);
 });
 
-async function repository() {
+async function repository({ version = identity.version, bundleVersion = identity.bundleVersion } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'mac-release-admission-'));
   for (const path of ['scripts/lib/electron-macos-qualification-identity.mjs', 'scripts/macos-bundle-version.js',
     'config/electron-production-distribution.cjs', 'config/macos-bundle-version-plan.cjs']) {
@@ -108,8 +108,8 @@ async function repository() {
   }
   // A synthetic future allocation exists only in this disposable checkout.
   await writeFile(join(root, 'config/macos-bundle-version-plan.cjs'),
-    'module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN: { "0.1.24": { stable: "1031" } } };\n');
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version: '0.1.24' }));
+    'module.exports = ' + JSON.stringify({ SIGNED_MACOS_BUNDLE_VERSION_PLAN: { [version]: { stable: bundleVersion } } }) + ';\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version }));
   const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, GIT_AUTHOR_NAME: 'Synthetic', GIT_AUTHOR_EMAIL: 'synthetic@example.invalid',
       GIT_COMMITTER_NAME: 'Synthetic', GIT_COMMITTER_EMAIL: 'synthetic@example.invalid' } }).trim();
@@ -156,6 +156,36 @@ test('all six actual workflow admissions accept a synthetic future release and r
       assert.throws(() => run({}, {}, receipt({ ...selected, buildNumber: '2026091401' })));
       assert.equal(await readFile(output, 'utf8'), `identity=${JSON.stringify(intake)}\n`, 'refusals do not emit intake');
     }
+  }
+});
+
+test('both production-update workflow admissions accept only the closed 026 to 027 v2 route', async t => {
+  const fixture = await repository({ version: '0.1.27', bundleVersion: '1035' });
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+  const workflow = await readFile(new URL('../.github/workflows/electron-macos-production-update.yml', import.meta.url), 'utf8');
+  const admissions = [...workflow.matchAll(/node --input-type=module <<'ADMISSION'\n([\s\S]*?)          ADMISSION/gu)];
+  assert.equal(admissions.length, 2);
+  for (const [index, target] of ['darwin-arm64', 'darwin-x64'].entries()) {
+    const selected = { version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301', sourceRevision: fixture.revision, target };
+    const intake = { ...selected, schemaVersion: 'tibotattle-production-electron-update-intake-v2',
+      dmgSha256: 'b'.repeat(64), asarSha256: 'c'.repeat(64), zipSha256: 'd'.repeat(64),
+      feedSha256: 'e'.repeat(64), predecessorAsarSha256: 'f'.repeat(64) };
+    const output = join(fixture.root, target + '-v2-admission.txt');
+    const run = (patch = {}, sourceCandidate = receipt(selected)) => execFileSync(process.execPath,
+      ['--input-type=module', '-'], { cwd: fixture.root, input: admissions[index][1].replace(/^          /gmu, ''),
+        encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env,
+          GITHUB_SHA: fixture.revision, GITHUB_OUTPUT: output, SELECTED_RUNNER: fixture.revision, SELECTED_TARGET: target,
+          SELECTED_IDENTITY: JSON.stringify({ ...intake, ...patch, sourceCandidate }) } });
+    run();
+    assert.equal(await readFile(output, 'utf8'), `identity=${JSON.stringify(intake)}\n`);
+    for (const patch of [{ schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, { schemaVersion: 'toString' },
+      { version: '0.1.26', bundleVersion: '1034' }, { version: '0.1.28', bundleVersion: '1036' }, { bundleVersion: '1034' },
+      { buildNumber: '2026092701' }, { sourceRevision: 'f'.repeat(40) }, { predecessorVersion: '0.1.20' },
+      { predecessorUrl: 'https://example.invalid/old.dmg' }, { feedUrl: 'https://example.invalid/feed.yml' },
+      { predecessorAsarSha256: 'private-value' }, { predecessorAsarSha256: undefined }]) assert.throws(() => run(patch));
+    assert.throws(() => run({}, receipt({ ...selected, sourceRevision: 'f'.repeat(40) })));
+    assert.throws(() => run({}, receipt({ ...selected, target: target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64' })));
+    assert.equal(await readFile(output, 'utf8'), `identity=${JSON.stringify(intake)}\n`, 'refusals do not emit intake');
   }
 });
 
