@@ -462,6 +462,23 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/check-http-cache-exception.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The OSV workflow invokes this temporary exact-source, advisory-status and expiry guard directly; it is not a supported npm command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/osv-scanner.yml",
+        "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+        "test/http-cache-exception.test.js"
+      ],
+      "decision": "retain_until_reviewed_exception_removal",
+      "provenance": "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "local_review_release",
       "canonicalPath": "scripts/check-local-review-signing-readiness.js",
       "stableAlias": null,
@@ -969,7 +986,8 @@
         "scripts/smoke-electron-macos-sparkle-transition.mjs",
         "scripts/lib/electron-macos-qualification-identity.mjs",
         "scripts/lib/macos-credential-qualification-intake.mjs",
-        "scripts/lib/sparkle-remote-inspection.mjs"
+        "scripts/lib/sparkle-remote-inspection.mjs",
+        "test/electron-macos-qualification-identity.test.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",

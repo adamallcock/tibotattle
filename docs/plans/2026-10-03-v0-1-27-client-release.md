@@ -256,3 +256,10 @@ publication. Separately, a reviewed Linux runner is being prepared to exercise
 the ordinary final AppImage FUSE launcher and exact published 0.1.26 replacement.
 It must prove the full native lifecycle before asserting clean-install success,
 while retaining the separate unqualified physical-desktop scope.
+
+The full baseline client/shared suite at `6e2e7a5f` recorded 5,847 passes,
+47 existing skips and four failures: two stale-R7 assertions and two tool
+inventory omissions. The missing temporary exception-guard entry and Mac
+qualification caller are now registered, with exact inventory totals retained;
+all six inventory tests pass. The complete source gate must still run against
+the repaired format and fresh R7 receipts.
