@@ -10,6 +10,16 @@ on:
         required: true
         default: false
         type: boolean
+      qualify_upgrade:
+        description: Replace the pinned published predecessor with these exact final signed bytes
+        required: false
+        default: false
+        type: boolean
+      predecessor_intake:
+        description: Closed reviewed published predecessor JSON; required only for qualify_upgrade
+        required: false
+        default: ''
+        type: string
       source_revision:
         description: Exact signed application source revision
         required: true
@@ -39,11 +49,14 @@ jobs:
   diagnose:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
     env:
+      QUALIFY_INSTALLED: ${{ inputs.qualify_installed }}
+      QUALIFY_UPGRADE: ${{ inputs.qualify_upgrade }}
+      PREDECESSOR_INTAKE: ${{ inputs.predecessor_intake }}
       SOURCE_REVISION: ${{ inputs.source_revision }}
       SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
       ARTIFACT_ID: ${{ inputs.artifact_id }}
@@ -59,6 +72,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:SOURCE_REVISION -cnotmatch '^[0-9a-f]{40}$' -or $env:INSTALLER_SHA256 -cnotmatch '^[0-9a-f]{64}$' -or $env:SIGNING_RUN_ID -notmatch '^[1-9][0-9]+$' -or $env:ARTIFACT_ID -notmatch '^[1-9][0-9]+$') { throw 'DIAGNOSTIC_INPUT_INVALID' }
+          if ($env:QUALIFY_UPGRADE -eq 'true') {
+            if ($env:QUALIFY_INSTALLED -ne 'true' -or [string]::IsNullOrWhiteSpace($env:PREDECESSOR_INTAKE) -or $env:PREDECESSOR_INTAKE.Length -gt 4096) { throw 'UPGRADE_INPUT_INVALID' }
+          } elseif (-not [string]::IsNullOrEmpty($env:PREDECESSOR_INTAKE)) { throw 'UPGRADE_INPUT_INVALID' }
           $run = gh api "repos/adamallcock/tibotattle/actions/runs/$env:SIGNING_RUN_ID" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -cne $env:SOURCE_REVISION -or $run.event -ne 'workflow_dispatch' -or $run.path -ne '.github/workflows/electron-windows-signing.yml') { throw 'DIAGNOSTIC_SOURCE_RUN_INVALID' }
           $artifact = gh api "repos/adamallcock/tibotattle/actions/artifacts/$env:ARTIFACT_ID" | ConvertFrom-Json
@@ -103,6 +119,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'QUALIFICATION_DEPENDENCIES_FAILED' }
       - name: Qualify the existing signed installer without rebuilding
         if: inputs.qualify_installed == true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           node scripts/qualify-electron-windows-frozen-installer.mjs

@@ -1408,7 +1408,7 @@ async function assertCandidateProcessProof({
   return tracked;
 }
 
-async function assertCandidateProcessAbsence({
+export async function assertCandidateProcessAbsence({
   appPath,
   environment,
   tracked = null,

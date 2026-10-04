@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 165 records / 166 executable paths: release-documentation, Codex contract,
+  // 166 records / 167 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -330,8 +330,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // The prior five are the macOS credential qualification set: the fixture
   // preparer, the credentials smoke, and the loopback/intake/PF-guard helpers.
   // The temporary HTTP cache advisory guard is an owned, expiry-bound OSV gate.
-  assert.equal(result.records, 165);
-  assert.equal(result.candidates.length, 166);
+  // The Windows final-upgrade tool binds the public predecessor and final signed
+  // installer to one owned profile without qualifying automatic updater delivery.
+  assert.equal(result.records, 166);
+  assert.equal(result.candidates.length, 167);
   assert.ok(result.aliases >= 25);
 });
 

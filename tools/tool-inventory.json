@@ -661,7 +661,8 @@
         "scripts/smoke-electron-windows-nsis-lifecycle.mjs",
         "test/electron-windows-accountless-smoke.test.js",
         "test/electron-windows-normal-candidate.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2064,7 +2065,8 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-windows-normal-candidate.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2082,7 +2084,9 @@
         ".github/workflows/electron-development-packages.yml",
         "scripts/smoke-electron-windows-normal-candidate.mjs",
         "test/electron-windows-nsis-lifecycle.test.js",
-        "scripts/smoke-electron-windows-signed-installed.mjs"
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs",
+        "scripts/qualify-electron-windows-frozen-installer.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2505,7 +2509,8 @@
       "callers": [
         ".github/workflows/electron-windows-signing.yml",
         "test/electron-windows-signed-installed.test.js",
-        "scripts/qualify-electron-windows-frozen-installer.mjs"
+        "scripts/qualify-electron-windows-frozen-installer.mjs",
+        "scripts/smoke-electron-windows-final-upgrade.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2652,7 +2657,8 @@
       "stableAliasReason": "Restricted disposable Windows qualification of an exact previously signed installer; does not rebuild, sign, or publish it.",
       "additionalAliases": [],
       "callers": [
-        ".github/workflows/electron-windows-installer-diagnostic.yml"
+        ".github/workflows/electron-windows-installer-diagnostic.yml",
+        "test/electron-windows-final-upgrade.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-windows-installer-diagnostic.yml",
@@ -2930,6 +2936,22 @@
         "containers/electron-linux-installed/Dockerfile",
         "test/electron-linux-installed-lifecycle.test.js",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-final-upgrade.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact signed public predecessor to final signed installer qualification is restricted to one disposable Windows installation/profile; it does not qualify automatic updater replacement.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-electron-windows-frozen-installer.mjs",
+        "test/electron-windows-final-upgrade.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
