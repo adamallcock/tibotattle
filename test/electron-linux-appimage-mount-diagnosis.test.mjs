@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { LINUX_MOUNT_DIAGNOSIS_SCHEMA, LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, LINUX_MOUNT_KMSG_READER,
   normalizeLinuxMountPolicy, createLinuxMountErrorClassifier, selectLinuxMountProbeMount,
   validateLinuxMountDiagnosis, runLinuxMountSequence, linuxMountPreflightEnvironment,
-  linuxMountContainerArguments, linuxMountCleanupArguments, linuxMountOwnedProcessGone, linuxMountAuditReaderReason, correlateLinuxMountAudit } from '../scripts/diagnose-electron-linux-appimage-mount.mjs';
+  linuxMountContainerArguments, linuxMountCleanupArguments, linuxMountOwnedProcessGone, linuxMountAuditReaderReason, correlateLinuxMountAudit, projectLinuxMountProbeFacts } from '../scripts/diagnose-electron-linux-appimage-mount.mjs';
+
+import { LINUX_APPARMOR_COMPARISON_SCHEMA, LINUX_APPARMOR_COMPARISON_CONFIRMATION, LINUX_APPARMOR_TEMPLATE_SHA256,
+  LINUX_APPARMOR_DAEMON_READER, LINUX_APPARMOR_PROFILE_ACTORS, normalizeLinuxAppArmorMountTuple, validateLinuxAppArmorMountTuple,
+  linuxAppArmorProfileName, renderLinuxAppArmorBasis, linuxAppArmorMountRule, deriveLinuxAppArmorProfile,
+  validateLinuxAppArmorComparison, runLinuxAppArmorComparison, linuxAppArmorRemovalAllowed, linuxAppArmorPrivilegedArguments } from '../scripts/lib/linux-apparmor-mount-profile.mjs';
 
 const temporary = '/opt/tibotattle-updater-exec/tmp/' + 'a'.repeat(32);
 const image = '/opt/tibotattle-updater-exec/TiboTattle.AppImage';
@@ -286,4 +292,235 @@ test('diagnostic Docker security arguments match the existing lifecycle and keep
   for (const required of ['workflow_dispatch:', 'group: electron-linux-final-qualification', 'persist-credentials: false', 'actions: read',
     LINUX_MOUNT_DIAGNOSIS_CONFIRMATION, 'timeout 180s', 'mount-diagnosis.json', '--test-concurrency=1', 'test/tool-inventory.test.js', 'test/release-workflow-policy.test.js', '--cleanup']) assert.ok(workflow.includes(required), required);
   assert.doesNotMatch(workflow, /contents: write|permissions:\s*write-all|--privileged|--no-sandbox|unconfined|mount-diagnosis-\*|receipts\/\*\.json/u);
+});
+
+const tuple = () => ({ type: 'squashfuse', source: 'squashfuse', options: ['ro', 'nosuid', 'nodev'] });
+const ownedName = stage => linuxAppArmorProfileName({ run: '12345', nonce: 'a'.repeat(32), stage });
+const validateRow = value => validateLinuxMountDiagnosis({ schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA,
+  purpose: 'diagnostic_only', qualifiesRelease: false, runnerRevision: pair.intake.runnerRevision,
+  sourceRevision: pair.intake.sourceRevision, cases: [{ ...value, role: 'current' }] }) !== null;
+function basis() {
+  return { dockerVersion: '28.0.4', parserVersion: '4.0.1', parserSha256: '1'.repeat(64),
+    templateSha256: LINUX_APPARMOR_TEMPLATE_SHA256, renderedSha256: '2'.repeat(64), expandedSha256: '3'.repeat(64),
+    daemonProfileSha256: '4'.repeat(64), globalImport: true, baseImport: true, loadedDefaultPolicyVerified: false };
+}
+function comparisonResult(stage, role) {
+  const value = row(role, { appArmorMountDenial: stage === 'candidate' ? 'unavailable' : true,
+    appArmorAuditReason: stage === 'candidate' ? 'no_observed_mount_denial' : 'owned_mount_denial' });
+  value.probe.environment.appArmor = { profile: 'other', enforcement: 'enforce' };
+  value.probe.launcherErrors.stages.directFuseMount = stage === 'candidate' ? 'not_observed' : 'EACCES';
+  if (stage === 'candidate') {
+    value.probe.mount = 'observed';
+    value.probe.startup.fuseMount = { state: 'observed', type: 'squashfuse', uid: 1000, readOnly: true, nosuid: true, nodev: true, noexec: false };
+  }
+  return { row: value, tuple: stage === 'candidate' ? null : tuple(), profileApplied: true };
+}
+function comparisonHarness({ mutate = () => {}, failedCleanup = false } = {}) {
+  const calls = [], evidence = { baseline: null, candidate: null };
+  const profiles = { basis: basis(), evidence,
+    async load(stage) {
+      calls.push(`load:${stage}`);
+      evidence[stage] = { profileSha256: '5'.repeat(64), profileNameSha256: stage === 'baseline' ? '6'.repeat(64) : '7'.repeat(64), loaded: true, removed: false };
+      return { name: ownedName(stage), evidence: evidence[stage] };
+    },
+    async remove(stage, containersGone) {
+      calls.push(`remove:${stage}:${containersGone}`);
+      if (!containersGone || failedCleanup) return false;
+      if (evidence[stage]) evidence[stage].removed = true;
+      return true;
+    } };
+  return { calls, adapters: { prepareProfiles: async () => profiles, validateRow,
+    runProbe: async (stage, role, expected, name) => {
+      calls.push(`probe:${stage}:${role}`);
+      assert.equal(expected, pair.images[role]); assert.equal(name, ownedName(stage === 'baseline' ? 'baseline' : 'candidate'));
+      const result = comparisonResult(stage, role); mutate(result, stage, role); return result;
+    } } };
+}
+
+test('comparison has a distinct explicit confirmation and closed selection', () => {
+  const input = { SELECTED_MODE: 'execute', SELECTED_POLICY: 'apparmor-comparison', SELECTED_CONFIRMATION: LINUX_APPARMOR_COMPARISON_CONFIRMATION };
+  assert.equal(linuxMountPreflightEnvironment(input).SELECTED_CONFIRMATION, 'RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE');
+  for (const changed of [{ ...input, SELECTED_POLICY: 'arbitrary' }, { ...input, SELECTED_POLICY: 'default' },
+    { ...input, SELECTED_CONFIRMATION: LINUX_MOUNT_DIAGNOSIS_CONFIRMATION }]) assert.throws(() => linuxMountPreflightEnvironment(changed));
+});
+
+test('exact owned audit tuples reject every wider or unknown source, type and option set', () => {
+  const fields = { fstype: 'fuse.squashfuse', srcname: 'squashfuse', flags: 'ro, nosuid, nodev' };
+  assert.deepEqual(normalizeLinuxAppArmorMountTuple(fields), tuple());
+  assert.deepEqual(normalizeLinuxAppArmorMountTuple({ ...fields, flags: 'nodev,ro,nosuid' }), tuple());
+  for (const flags of ['rw,nosuid,nodev', 'ro,suid,nodev', 'ro,nosuid,dev', 'ro,nosuid,nodev,noexec',
+    'ro,nosuid,nodev,relatime', 'ro,nosuid,nodev,nodev', 'ro,nosuid', 'private-option-marker']) {
+    assert.equal(normalizeLinuxAppArmorMountTuple({ ...fields, flags }), null);
+  }
+  for (const changed of [{ ...fields, fstype: 'tmpfs' }, { ...fields, srcname: '/private/source-marker' },
+    { ...fields, fstype: 'fuse', srcname: 'squashfuse' }]) assert.equal(normalizeLinuxAppArmorMountTuple(changed), null);
+  for (const changed of [{ ...tuple(), extra: true }, { ...tuple(), source: 'image_absolute' }, { ...tuple(), options: ['rw', 'nosuid', 'nodev'] }]) {
+    assert.equal(validateLinuxAppArmorMountTuple(changed), null);
+    assert.throws(() => linuxAppArmorMountRule(changed, 'a'.repeat(32)));
+  }
+});
+
+test('the owned audit tuple keeps exact actor correlation and refuses conflicting observed flags', () => {
+  const input = auditFixture(); input.collectTuple = true;
+  input.audit.records[0].message = input.audit.records[0].message.replace('flags="rw, nosuid, nodev"', 'flags="ro, nosuid, nodev"');
+  const expected = { type: 'fuse', source: 'image_absolute', options: ['ro', 'nosuid', 'nodev'] };
+  assert.deepEqual(correlateLinuxMountAudit(input), { denial: true, reason: 'owned_mount_denial', tuple: expected });
+  input.audit.records.push({ ...input.audit.records[0], message: input.audit.records[0].message.replace('ro, nosuid, nodev', 'rw, nosuid, nodev') });
+  assert.equal(correlateLinuxMountAudit(input).tuple, null);
+  input.observations.get(77).last = 149;
+  assert.deepEqual(correlateLinuxMountAudit(input), { denial: 'unavailable', reason: 'owned_actor_not_correlated', tuple: null });
+});
+
+test('profile generation retains the same Moby policy and changes only identity plus one exact mount rule', async () => {
+  const template = await readFile(new URL('../scripts/assets/moby-apparmor-v28.0.4-template.txt', import.meta.url), 'utf8');
+  assert.equal(createHash('sha256').update(template).digest('hex'), LINUX_APPARMOR_TEMPLATE_SHA256);
+  const name = ownedName('baseline');
+  const rendered = renderLinuxAppArmorBasis(template, { name, daemonProfile: 'unconfined', globalImport: false, baseImport: false });
+  assert.match(rendered, /@\{PROC\}=\/proc\//u); assert.doesNotMatch(rendered, /#include|\{\{/u);
+  const baseline = deriveLinuxAppArmorProfile(rendered, { baselineName: name, name, stage: 'baseline' });
+  const candidate = deriveLinuxAppArmorProfile(rendered, { baselineName: name, name: ownedName('candidate'), stage: 'candidate', tuple: tuple(), nonce: 'a'.repeat(32) });
+  assert.equal(baseline, rendered.replace('  deny mount,', '  audit deny mount,'));
+  assert.equal(candidate, rendered.replaceAll(name, ownedName('candidate')).replace('  deny mount,', linuxAppArmorMountRule(tuple(), 'a'.repeat(32))));
+  assert.match(candidate, /mount fstype=fuse\.squashfuse options=\(ro,nosuid,nodev\) "squashfuse" -> "\/opt\/tibotattle-updater-exec\/tmp\/a{32}\/\.mount_\*\/",/u);
+  assert.doesNotMatch(candidate, /deny mount|options in|fstype=\*|--privileged|complain|default_allow/u);
+  for (const bad of [rendered.replace('  deny mount,', '  mount,'), rendered + '\nmount /unowned,\n',
+    rendered.replace('  file,', '  file, mount,'), rendered.replace('  file,', '  audit { mount, }'),
+    rendered.replace('  file,', '  allow { mount, }'), rendered.replace('  file,', '  all,'),
+    rendered.replace('  file,', '  audit { all, }'), rendered + '\n#include <private>\n']) {
+    assert.throws(() => deriveLinuxAppArmorProfile(bad, { baselineName: name, name, stage: 'baseline' }));
+  }
+  assert.throws(() => renderLinuxAppArmorBasis(template + '\n', { name, daemonProfile: 'unconfined', globalImport: false, baseImport: false }));
+  assert.throws(() => renderLinuxAppArmorBasis(template, { name, daemonProfile: 'x,\nmount,', globalImport: false, baseImport: false }));
+  assert.throws(() => linuxAppArmorMountRule(tuple(), '../unowned'));
+});
+
+test('comparison mount sampling retains only closed flag facts for the exact owned nonce', () => {
+  assert.deepEqual(projectLinuxMountProbeFacts(mountinfo, temporary), { state: 'observed', type: 'squashfuse', uid: 1000,
+    readOnly: true, nosuid: true, nodev: true, noexec: false });
+  assert.equal(projectLinuxMountProbeFacts(mountinfo + mountinfo, temporary).state, 'ambiguous');
+  assert.equal(projectLinuxMountProbeFacts(null, temporary).state, 'unavailable');
+  assert.doesNotMatch(JSON.stringify(projectLinuxMountProbeFacts(mountinfo, temporary)), /\/opt\/|\.mount_|a{32}/u);
+});
+
+test('one serial baseline/candidate comparison includes both exact images and a negative outside-target probe', async () => {
+  const { calls, adapters } = comparisonHarness();
+  const result = await runLinuxAppArmorComparison(pair, adapters);
+  assert.equal(result.schemaVersion, LINUX_APPARMOR_COMPARISON_SCHEMA); assert.equal(result.outcome, 'compared');
+  assert.equal(result.qualifiesRelease, false); assert.equal(result.basis.loadedDefaultPolicyVerified, false);
+  assert.deepEqual(calls.filter(call => call.startsWith('probe:')), [
+    'probe:baseline:current', 'probe:baseline:next', 'probe:candidate:current', 'probe:candidate:next', 'probe:negative:current']);
+  assert.ok(calls.indexOf('remove:baseline:true') < calls.indexOf('load:candidate'));
+  assert.equal(result.profilesRemoved, true);
+  assert.equal(validateLinuxAppArmorComparison(result, validateRow), result);
+  assert.doesNotMatch(JSON.stringify(result), /\/opt\/|\.mount_|unconfined|private|"name"|"pid"|"nonce"|"flags"/u);
+  for (const mutate of [v => { v.qualifiesRelease = true; }, v => { v.basis.loadedDefaultPolicyVerified = true; },
+    v => { v.basis.templateSha256 = 'f'.repeat(64); }, v => { v.basis.path = '/private/profile'; },
+    v => { v.cases[0].tuple.options = ['rw', 'nosuid', 'nodev']; }, v => { v.cases[2].row.probe.startup.fuseMount.nosuid = false; },
+    v => { v.cases[4].profileApplied = false; }, v => { v.profiles.candidate.removed = false; }]) {
+    const altered = structuredClone(result); mutate(altered); assert.equal(validateLinuxAppArmorComparison(altered, validateRow), null);
+  }
+});
+
+test('missing audit, fast unsampled actors and tuple disagreement stop before candidate policy is loaded', async () => {
+  for (const mutate of [
+    result => { result.tuple = null; result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'no_observed_mount_denial'; },
+    result => { result.tuple = null; result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'owned_actor_not_correlated'; },
+    (result, stage, role) => { if (role === 'next') result.tuple = { type: 'fuse', source: 'image_absolute', options: ['ro', 'nosuid', 'nodev'] }; },
+  ]) {
+    const { calls, adapters } = comparisonHarness({ mutate });
+    const result = await runLinuxAppArmorComparison(pair, adapters);
+    assert.equal(result.outcome, 'tuple_unavailable'); assert.equal(result.cases.length, 2);
+    assert.ok(!calls.includes('load:candidate')); assert.equal(result.profilesRemoved, true);
+  }
+});
+
+test('comparison preserves cleanup and cancellation gates without turning a failed candidate or negative into proof', async () => {
+  for (const [mutate, outcome, count] of [
+    [(result, stage) => { if (stage === 'candidate') result.row.probe.startup.fuseMount.readOnly = false; }, 'candidate_failed', 3],
+    [(result, stage) => { if (stage === 'candidate') result.row.probe.environment.sysAdmin.effective = true; }, 'candidate_failed', 3],
+    [(result, stage) => { if (stage === 'negative') { result.row.appArmorMountDenial = 'unavailable'; result.row.appArmorAuditReason = 'no_observed_mount_denial'; } }, 'negative_unproven', 5],
+  ]) {
+    const { adapters } = comparisonHarness({ mutate }); const result = await runLinuxAppArmorComparison(pair, adapters);
+    assert.equal(result.outcome, outcome); assert.equal(result.cases.length, count); assert.equal(result.profilesRemoved, true);
+  }
+  const unclean = comparisonHarness({ mutate: result => { result.row.containerRemoved = false; result.row.errorCode = 'cleanup_failed'; } });
+  const stopped = await runLinuxAppArmorComparison(pair, unclean.adapters);
+  assert.equal(stopped.outcome, 'cleanup_failed'); assert.equal(stopped.cases.length, 1); assert.equal(stopped.profilesRemoved, false);
+  assert.ok(!unclean.calls.includes('load:candidate'));
+  const cancelled = comparisonHarness();
+  cancelled.adapters.interrupted = () => true;
+  const interrupted = await runLinuxAppArmorComparison(pair, cancelled.adapters);
+  assert.equal(interrupted.outcome, 'interrupted'); assert.ok(!cancelled.calls.some(call => call.startsWith('load:')));
+  const missingBasis = await runLinuxAppArmorComparison(pair, { ...comparisonHarness().adapters,
+    prepareProfiles: async () => { throw Object.assign(new Error('private-host-details'), { code: 'docker_version_unmatched' }); } });
+  assert.equal(missingBasis.outcome, 'basis_unavailable'); assert.equal(missingBasis.basisFailure, 'docker_version_unmatched'); assert.equal(missingBasis.basis, null);
+  assert.doesNotMatch(JSON.stringify(missingBasis), /private-host-details/u);
+});
+
+test('comparison changes only the explicit AppArmor selector among container security arguments', () => {
+  const base = { role: 'current', nonce: 'a'.repeat(32), runnerRevision: 'b'.repeat(40) };
+  const original = linuxMountContainerArguments({ ...base, name: 'tibotattle-mount-diagnosis-current-12345' });
+  const comparison = linuxMountContainerArguments({ ...base, name: 'tibotattle-mount-diagnosis-baseline-current-12345', stage: 'baseline', profile: ownedName('baseline') });
+  assert.deepEqual(comparison.slice(comparison.indexOf('--cap-add=SYS_ADMIN')), original.slice(original.indexOf('--cap-add=SYS_ADMIN')));
+  assert.equal(comparison[comparison.indexOf('--security-opt') + 1], `apparmor=${ownedName('baseline')}`);
+  for (const profile of ['unconfined', 'docker-default', ownedName('candidate'), ownedName('baseline') + ',unconfined']) {
+    assert.throws(() => linuxMountContainerArguments({ ...base, name: 'tibotattle-mount-diagnosis-baseline-current-12345', stage: 'baseline', profile }));
+  }
+});
+
+test('the exact profile identity readers compile without any process or policy access', () => {
+  for (const reader of [LINUX_APPARMOR_DAEMON_READER, LINUX_APPARMOR_PROFILE_ACTORS]) {
+    const result = spawnSync('python3', ['-c', "import sys; compile(sys.stdin.buffer.read(), '<profile-reader>', 'exec')"], {
+      input: reader, stdio: ['pipe', 'ignore', 'ignore'], timeout: 3000, maxBuffer: 4096,
+    });
+    assert.equal(result.status, 0); assert.equal(result.signal, null); assert.equal(result.error, undefined);
+  }
+});
+
+test('comparison workflow retains only closed JSON and add-only policy ownership cleanup', async () => {
+  const source = await readFile(new URL('../scripts/lib/linux-apparmor-mount-profile.mjs', import.meta.url), 'utf8');
+  assert.match(source, /dockerVersion !== LINUX_APPARMOR_DOCKER_VERSION/u);
+  assert.match(source, /\['--preprocess', '--skip-cache'\]/u);
+  assert.match(source, /PARSER, '--add', '--skip-cache'/u); assert.match(source, /PARSER, '--remove', '--skip-cache'/u);
+  assert.doesNotMatch(source, /PARSER, '--replace'|--Complain|--privileged|seccomp=unconfined|apparmor=unconfined/u);
+  assert.match(source, /if \(!containersGone\) return false/u); assert.match(source, /!profileActorsGone\(entry.name\)/u);
+  const workflow = await readFile(new URL('../.github/workflows/electron-linux-appimage-mount-diagnosis.yml', import.meta.url), 'utf8');
+  for (const value of ['options: [default, apparmor-comparison]', LINUX_APPARMOR_COMPARISON_CONFIRMATION,
+    'SELECTED_POLICY: ${{ inputs.policy }}', '--kill-after=90s 360s', 'apparmor-comparison.json']) assert.ok(workflow.includes(value), value);
+  assert.doesNotMatch(workflow, /\.mount-apparmor|\.profile\s*$|contents: write|--privileged|apparmor=unconfined/mu);
+});
+
+test('profile removal requires the exact successful add marker, source digest, owner and no active actor', () => {
+  const owner = { run: '12345', runner: 'b'.repeat(40), nonce: 'a'.repeat(32), parserSha256: 'c'.repeat(64), baselineName: ownedName('baseline') };
+  const marker = { ...owner, stage: 'baseline', name: ownedName('baseline'), sha256: 'd'.repeat(64) };
+  const expected = { run: owner.run, runner: owner.runner, parserSha256: owner.parserSha256, stage: 'baseline' };
+  const input = { owner, marker, profileSha256: marker.sha256, currentState: 'enforce', actorsGone: true };
+  assert.equal(linuxAppArmorRemovalAllowed(input, expected), true);
+  for (const mutate of [v => { v.marker = null; }, v => { v.marker.name = 'docker-default'; },
+    v => { v.marker.run = '12346'; }, v => { v.owner.runner = 'e'.repeat(40); }, v => { v.profileSha256 = 'f'.repeat(64); },
+    v => { v.currentState = 'complain'; }, v => { v.actorsGone = false; }, v => { v.actorsGone = 'unavailable'; },
+    v => { v.marker.path = '/private/profile'; }]) {
+    const changed = structuredClone(input); mutate(changed); assert.equal(linuxAppArmorRemovalAllowed(changed, expected), false);
+  }
+});
+
+test('enforcement drift and an unresolved negative deny never satisfy the comparison receipt', async () => {
+  const complete = await runLinuxAppArmorComparison(pair, comparisonHarness().adapters);
+  for (const enforcement of ['complain', 'unconfined', 'unavailable']) {
+    const changed = structuredClone(complete); changed.cases[2].row.probe.environment.appArmor.enforcement = enforcement;
+    assert.equal(validateLinuxAppArmorComparison(changed, validateRow), null);
+  }
+  const { calls, adapters } = comparisonHarness({ failedCleanup: true });
+  const result = await runLinuxAppArmorComparison(pair, adapters);
+  assert.equal(result.outcome, 'cleanup_failed'); assert.equal(result.profilesRemoved, false);
+  assert.ok(!calls.includes('load:candidate'));
+});
+
+
+test('each fixed privileged operation has its own root deadline inside the controller timeout', () => {
+  for (const args of [['-n', '/usr/sbin/apparmor_parser', '--add', '--skip-cache'], ['-n', '/usr/sbin/apparmor_parser', '--remove', '--skip-cache'],
+    ['-n', 'python3', '-c', 'synthetic'], ['-n', 'cat', '/sys/kernel/security/apparmor/profiles']]) {
+    assert.deepEqual(linuxAppArmorPrivilegedArguments(args), ['-n', 'timeout', '--signal=TERM', '--kill-after=2s', '10s', ...args.slice(1)]);
+  }
+  for (const args of [null, [], ['-i', 'python3'], ['-n', 'bash'], ['-n', 'rm']]) assert.throws(() => linuxAppArmorPrivilegedArguments(args));
 });
