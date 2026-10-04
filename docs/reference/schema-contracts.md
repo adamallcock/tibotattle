@@ -198,14 +198,20 @@ The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
 allowance remains explicitly conditional even when a record has an account
 pseudonym. This is not a provider-authoritative account billing contract.
 
-The source-verified `promax` identifier is accepted by local v0.1 export and
-staged v1.1/v1.2 schemas. The frozen v0.2
+The source- and binary-verified `promax` identifier is accepted by local v0.1
+export and staged v1.1/v1.2 schemas. The frozen v0.2
 contribution schema retains its original vocabulary: its local projection
 writes `unknown` for this value, while v1.1/v1.2 can retain the exact identifier.
-The reviewed installed-binary evidence does not yet cover `promax`. Product
-policy names `pro` Pro 10x and `promax` Pro Max 25x, without changing the
-existing `pro` identity or discarding its history. Provider allowance and
-window semantics remain unverified; the release contract check stays blocked.
+On 2026-10-04 UTC, reviewed ChatGPT-bundled and PATH `codex-cli 0.160.0` each
+generated `promax` among 18 `PlanType` values. The
+[Codex 0.160.0 source](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/protocol/src/auth.rs)
+also confirms its raw value and display name. The ledger marks the identifier
+active, records path-free binary provenance, and passes the required-binary
+contract check. Product expectations name `pro` Pro 10x and `promax` Pro Max
+25x, without changing the existing `pro` identity or discarding its history.
+These ratios are product expectations; provider-authoritative allowance and
+window semantics remain unverified. Enum verification does not establish those
+capacities or qualify a TiboTattle release artifact.
 
 ## Staged continuity successor v1.2
 
