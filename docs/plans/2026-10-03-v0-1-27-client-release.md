@@ -47,8 +47,8 @@ lane; this approval does not transfer ownership or waive its compatibility proof
 | Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
 | Source freeze | Reviewed export repair integrated at ad51936f; R7 runtime inputs frozen; final dated publication source/tag await a concrete release window | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Complete protected retry finished at 04:28:59 UTC; all ten receipts validated and both exact-runtime freshness checks passed | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
-| Complete source/surface gates | Only two stale-R7 root assertions remain; UI, companion, Worker tests and Mac transition lanes passed; final local asset dry run pending | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Earlier Mac source stages retained; Apple notarization blocked by an unsigned/expired developer agreement; new-byte native gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Complete source/surface gates | Complete client/shared suite passed 5,885 tests with zero failures and 44 existing skips; Worker dry packaging and staging checks passed | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
+| Production candidates | Four-target unsigned CI source preparation and downloaded artifact identities verified at 744390a9; final signed-byte gates await Apple agreement and publication window | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | End-to-end publication authorized; required compatibility and final-byte gates remain | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
@@ -92,8 +92,8 @@ new execution; the earlier review is a dated snapshot, not release proof.
   The [security decision packet](../decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md)
   was approved by the user for this candidate on October 3 and activated at
   `bdc56099`. Independent review, the live guard, focused negative tests and a
-  fresh recursive OSV scan passed. Hosted Ubuntu workflow execution remains
-  a separate PR-CI gate.
+  fresh recursive OSV scan passed. The hosted Ubuntu OSV check also passed
+  on the integrated preparation head `744390a9`.
 - Paused-sharing copy is cause-neutral in all three locales, because the
   renderer receives no cause. Both Community and Settings have focused
   rendering coverage; canonical i18n checks pass. Native rendering is pending.
@@ -111,8 +111,9 @@ new execution; the earlier review is a dated snapshot, not release proof.
   window for R7; no remote writes were requested or performed by this task.
 
 Delivery scope and the exact temporary security exception are approved.
-R7 regeneration, broad source/surface gates, final packages, installed native
-journeys, hosted compatibility and publication/readback remain outstanding.
+R7 and the complete client/shared source gate now pass. Final dated source,
+signed packages, installed native journeys, hosted compatibility and
+publication/readback remain outstanding.
 
 ## Historical Sol 6.1 upgrade acceptance
 
@@ -152,8 +153,9 @@ R-MERGE lane, without a qualified live successor yet. Required hosted readback
 includes Pro Max intake, exact price cards, four-plan normalization and
 public/admin publication compatibility. The optional desktop dashboard reader
 deferral does not defer the separately owned website reader prerequisite.
-The hosted owner released the local resource slot and retained it for the complete
-R7 diagnosis and retry, with a 24 GiB free-disk floor and no heavy benchmark overlap.
+The hosted owner reserved the local resource slot for the complete R7 diagnosis
+and retry with a 24 GiB free-disk floor. The later disclosed contention and its
+evidence limits are recorded below.
 
 ## Runtime version closure
 
@@ -223,8 +225,9 @@ notarization, installation or publication occurred. Worker copied workspace
 packages were refreshed through the owning npm install and all three exact
 copy guards passed. Worker lock metadata is also aligned for the three local
 packages without changing external dependency resolutions; the root lockfile
-remains unchanged. Final release evidence requires the approved exception
-activation, R7 resource slot, hosted compatibility and remaining artifact gates.
+remains unchanged. This was intermediate staging evidence; the later integrated
+source checks below supersede that preparation status. Hosted compatibility and
+final artifact gates remain separate.
 
 ## October 4 execution update
 
@@ -353,7 +356,9 @@ resource-ceiling decisions remain unresolved, as required by the retained-eviden
 test; no resource-ceiling promotion is claimed.
 
 The hosted owner disclosed a competing 182.20-second synthetic native/compose
-gate during part of this run. Contemporaneous CPU/RSS attribution was unavailable.
+gate. Its Vitest start timestamp maps to 04:27:06 UTC; the final log write was
+04:30:08 UTC, without a wrapper-recorded exact process-exit timestamp. It overlapped
+R7 through 04:28:59 UTC. Contemporaneous CPU/RSS attribution was unavailable.
 The maintained R7 contract treats these measurements as environment-sensitive and
 does not require an exclusive host for freshness/correctness. Retain the observed
 metrics honestly, with no isolated-timing, comparative-speed or zero-impact claim.
@@ -363,8 +368,41 @@ production-update v2 is integrated at `8de0e48c`: exact signed 0.1.26 to 0.1.27,
 both architectures, with old owned process identities required to exit before
 success. The old 0.1.20 updater and credential fixture remain available. This is
 source and portable-test evidence; actual production-feed execution follows
-publication. A separate Windows final-installer upgrade runner is under review
-because the maintained publication runbook requires installer upgrade coverage.
-It must preserve one profile across signed 0.1.26 and 0.1.27 without reseeding;
-automatic Windows updater replacement and general credential continuity remain
-outside its claimed scope.
+publication. The independently reviewed Windows final-installer upgrade runner
+is integrated at `744390a9`. It binds installed ASAR/executable hashes to the
+verified signed installers and preserves one profile across 0.1.26 and 0.1.27
+without reseeding. Automatic Windows updater replacement and general credential
+continuity remain outside its claimed scope. Combined Windows/Mac/R7/inventory
+integration passed 59/59 tests.
+
+
+## Integrated preparation gates
+
+At `744390a937361605f18e975daaff522ecfcfeab3`, the complete client/shared suite
+passed 5,885 of 5,929 tests, with zero failures and 44 existing skips. The previous
+R7 failures are resolved. The full Worker script and 2,019-test lanes plus the
+remaining production dry-package and staging-check commands now pass; both
+Wrangler invocations exited without deployment.
+
+[Four-target unsigned preparation](https://github.com/adamallcock/tibotattle/actions/runs/37178169786)
+passed on native Windows, Linux, Apple-silicon Mac and Intel Mac runners. All four
+small retained archives were downloaded and their GitHub SHA-256 digests matched.
+Each source receipt and staged package agree on version 0.1.27, build 2026100301,
+its target and the exact preparation revision. Runtime manifests are present.
+These are unsigned source artifacts; final dated source still requires fresh
+final-byte packaging.
+
+[Disposable Windows/Linux runtime checks](https://github.com/adamallcock/tibotattle/actions/runs/37178314630)
+used that same revision and synthetic disposable profiles. Linux passed its
+packaged credential, restart/settings, opt-out and private AppImage updater
+lanes. The small normal-runtime receipt was independently hash-verified.
+
+Windows rendered its dashboard and began local refresh but failed during the
+model-performance page check with
+`ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_LOCAL_MODEL_PERFORMANCE_PAGE_UNAVAILABLE`.
+Its fixed receipt confirms owned-profile and firewall cleanup; subsequent
+journey claims remain false. The page selectors still exist and the preceding
+local performance API proof passed. A worker and independent reviewer are
+investigating the remaining rendered-view predicate before merge or final tag.
+The failed receipt and log are preserved locally; no weakened assertion or
+product-correctness claim follows from the passing source tests.
