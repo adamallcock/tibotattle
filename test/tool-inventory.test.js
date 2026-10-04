@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 171 records / 172 executable paths: release-documentation, Codex contract,
+  // 172 records / 173 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -338,8 +338,10 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // the existing disposable Mac credential journey.
   // The content-free Linux startup diagnostic helper and the separate exact-byte
   // mount-only diagnostic each have an explicit owner; neither qualifies a release.
-  assert.equal(result.records, 171);
-  assert.equal(result.candidates.length, 172);
+  // The controlled AppArmor comparison helper owns exact-profile generation and
+  // cleanup without changing ordinary lifecycle qualification.
+  assert.equal(result.records, 172);
+  assert.equal(result.candidates.length, 173);
   assert.ok(result.aliases >= 25);
 });
 

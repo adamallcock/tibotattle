@@ -8,9 +8,12 @@ import { access, chmod, copyFile, lstat, mkdir, open, readdir, realpath } from '
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertContainerContract } from './smoke-electron-linux.mjs';
-import { createLinuxStartupDiagnostics, validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
+import { createLinuxStartupDiagnostics, validateLinuxStartupDiagnostic, classifyLinuxStartupFuseMount } from './lib/linux-startup-diagnostics.mjs';
 import { acquireLinuxFinalArtifacts, prepareLinuxFinalArtifacts, fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
 import { LINUX_FINAL_CONFIRMATION, LINUX_FINAL_INPUT, exactKeys, preflightLinuxFinalIntake, validateLinuxFinalPair } from './lib/linux-final-artifact-intake.mjs';
+
+import { LINUX_APPARMOR_COMPARISON_CONFIRMATION, normalizeLinuxAppArmorMountTuple, prepareLinuxAppArmorProfiles,
+  cleanupLinuxAppArmorProfiles, runLinuxAppArmorComparison } from './lib/linux-apparmor-mount-profile.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const EXEC = '/opt/tibotattle-updater-exec', IMAGE = `${EXEC}/TiboTattle.AppImage`;
@@ -18,6 +21,7 @@ const SCRIPT = 'scripts/diagnose-electron-linux-appimage-mount.mjs';
 export const LINUX_MOUNT_DIAGNOSIS_SCHEMA = 'tibotattle-linux-appimage-mount-diagnosis-v2';
 export const LINUX_MOUNT_DIAGNOSIS_CONFIRMATION = 'RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS';
 const UNKNOWN = 'unavailable', ROLES = ['current', 'next'];
+const PROBE_STAGES = ['default', 'baseline', 'candidate', 'negative'];
 const ERRORS = new Set(['none', 'container_failed', 'probe_failed', 'cleanup_failed']);
 const ERROR_PATTERNS = Object.freeze({
   permissionDenied: /Permission denied/iu, operationNotPermitted: /Operation not permitted/iu,
@@ -129,6 +133,12 @@ export function selectLinuxMountProbeMount(text, temporary) {
     || !after[2]?.split(',').includes('user_id=1000')) return { state: 'ambiguous', mount: null };
   return { state: 'observed', mount: target };
 }
+export function projectLinuxMountProbeFacts(text, temporary) {
+  const selected = selectLinuxMountProbeMount(text, temporary);
+  if (selected.state !== 'observed') return { ...classifyLinuxStartupFuseMount(''), state: selected.state };
+  const line = text.split('\n').find(value => value.split(' ')[4] === selected.mount);
+  return classifyLinuxStartupFuseMount(line.replace(`${temporary}/`, `${EXEC}/tmp/`));
+}
 async function mountFacts(temporary) { return selectLinuxMountProbeMount(await optionalRead('/proc/self/mountinfo', 262144), temporary); }
 async function runtimeFacts() {
   const policy = normalizeLinuxMountPolicy({ status: await optionalRead('/proc/self/status'), appArmor: await optionalRead('/proc/self/attr/current', 256) });
@@ -192,8 +202,10 @@ export async function runLinuxMountSequence(pair, runProbe) {
   return receipt;
 }
 export function linuxMountPreflightEnvironment(environment) {
-  if (!['plan', 'execute'].includes(environment.SELECTED_MODE)
-    || environment.SELECTED_CONFIRMATION !== (environment.SELECTED_MODE === 'execute' ? LINUX_MOUNT_DIAGNOSIS_CONFIRMATION : '')) fail();
+  const policy = environment.SELECTED_POLICY ?? 'default';
+  const confirmation = policy === 'apparmor-comparison' ? LINUX_APPARMOR_COMPARISON_CONFIRMATION : LINUX_MOUNT_DIAGNOSIS_CONFIRMATION;
+  if (!['default', 'apparmor-comparison'].includes(policy) || !['plan', 'execute'].includes(environment.SELECTED_MODE)
+    || environment.SELECTED_CONFIRMATION !== (environment.SELECTED_MODE === 'execute' ? confirmation : '')) fail();
   return { ...environment, SELECTED_CONFIRMATION: environment.SELECTED_MODE === 'execute' ? LINUX_FINAL_CONFIRMATION : '' };
 }
 function command(executable, args, maximum = 131072, timeout = 20000) {
@@ -201,10 +213,17 @@ function command(executable, args, maximum = 131072, timeout = 20000) {
   if (result.error || result.signal || result.status !== 0) fail();
   return result.stdout.trim();
 }
-export function linuxMountContainerArguments({ name, role, nonce, runnerRevision }) {
-  if (!/^tibotattle-mount-diagnosis-(current|next)-[1-9][0-9]{0,14}$/u.test(name) || !ROLES.includes(role) || !/^[a-f0-9]{32}$/u.test(nonce) || !/^[a-f0-9]{40}$/u.test(runnerRevision ?? '')) fail();
+function caseSuffix(stage, role) { return `${stage === 'default' ? '' : `${stage}-`}${role}`; }
+export function linuxMountContainerArguments({ name, role, nonce, runnerRevision, stage = 'default', profile = null }) {
+  const run = name?.split('-').at(-1);
+  if (!PROBE_STAGES.includes(stage) || !ROLES.includes(role) || !/^[1-9][0-9]{0,14}$/u.test(run ?? '')
+    || name !== `tibotattle-mount-diagnosis-${caseSuffix(stage, role)}-${run}` || !/^[a-f0-9]{32}$/u.test(nonce)
+    || !/^[a-f0-9]{40}$/u.test(runnerRevision ?? '') || (stage === 'default' ? profile !== null
+      : !new RegExp(`^tibotattle-mount-${stage === 'baseline' ? 'baseline' : 'candidate'}-${run}-[a-f0-9]{32}$`, 'u').test(profile ?? ''))) fail();
   return ['create', '--interactive', '--init', '--platform=linux/amd64', '--name', name,
-    '--cidfile', join(ROOT, LINUX_FINAL_INPUT, `.mount-diagnosis-${role}.container`),
+    '--cidfile', join(ROOT, LINUX_FINAL_INPUT, `.mount-diagnosis-${caseSuffix(stage, role)}.container`),
+    ...(stage === 'default' ? [] : ['--security-opt', `apparmor=${profile}`, '--label', `io.tibotattle.mount-diagnosis.stage=${stage}`,
+      '--env', 'TIBOTATTLE_MOUNT_PROBE_COMPARISON=1']),
     '--label', `io.tibotattle.mount-diagnosis.run=${name.split('-').at(-1)}`,
     '--label', `io.tibotattle.mount-diagnosis.runner=${runnerRevision}`, '--label', `io.tibotattle.mount-diagnosis.role=${role}`,
     '--cap-add=SYS_ADMIN', '--device', '/dev/fuse', '--network', 'none', '--add-host', 'updates.tibotattle.com:127.0.0.1', '--shm-size=512m',
@@ -248,7 +267,9 @@ async function runInside() {
   if (!await waitUntil(() => go || invalidInput, 10000) || invalidInput) fail();
   const child = spawn(IMAGE, ['--appimage-mount'], { shell: false, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, TMPDIR: temporary, LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C' } });
-  const startup = createLinuxStartupDiagnostics({ child }), errors = createLinuxMountErrorClassifier();
+  const sampleMount = process.env.TIBOTATTLE_MOUNT_PROBE_COMPARISON === '1'
+    ? async () => projectLinuxMountProbeFacts(await optionalRead('/proc/self/mountinfo', 262144), temporary) : null;
+  const startup = createLinuxStartupDiagnostics({ child, sampleMount }), errors = createLinuxMountErrorClassifier();
   child.stdout.resume(); child.stderr.on('data', chunk => { startup.feed(chunk); errors.feed(chunk); });
   send({ kind: 'child', pid: child.pid ?? null });
   let selected = { state: 'not_observed', mount: null }, exited = false;
@@ -468,8 +489,8 @@ export async function linuxMountOwnedProcessGone(identity, { read = boundedRead 
   } catch (error) { return error.code === 'ENOENT' ? true : UNKNOWN; }
 }
 
-export function correlateLinuxMountAudit({ audit, profile, observations, temporary, start, end }) {
-  const unavailable = reason => ({ denial: UNKNOWN, reason });
+export function correlateLinuxMountAudit({ audit, profile, observations, temporary, start, end, collectTuple = false }) {
+  const unavailable = reason => ({ denial: UNKNOWN, reason, ...(collectTuple ? { tuple: null } : {}) });
   if (!audit?.ready || !audit.closed || !audit.complete || audit.reason !== 'none') return unavailable(
     ['observer_start_failed', ...READER_REASONS].includes(audit?.reason) && audit.reason !== 'none' ? audit.reason : 'reader_failed');
   if (!profile) return unavailable('profile_unavailable');
@@ -477,6 +498,7 @@ export function correlateLinuxMountAudit({ audit, profile, observations, tempora
     || !new RegExp(`^${EXEC}/tmp/[a-f0-9]{32}$`, 'u').test(temporary)) return unavailable('audit_window_incomplete');
   if (!(observations instanceof Map) || !observations.size) return unavailable('probe_identity_unavailable');
   let recordObserved = false, actorUncorrelated = false, sourceUnrecognized = false, ambiguous = false;
+  let matched = false, tuple = null, tupleAmbiguous = false;
   for (const record of audit.records) {
     if (record.time < start || record.time > end) continue;
     recordObserved = true;
@@ -502,22 +524,26 @@ export function correlateLinuxMountAudit({ audit, profile, observations, tempora
       && owned.first <= record.time && owned.last >= record.time)) { actorUncorrelated = true; continue; }
     if (!(fields.fstype === 'fuse.squashfuse' && fields.srcname === 'squashfuse'
       || ['fuse.TiboTattle.AppImage', 'fuse'].includes(fields.fstype) && [IMAGE, 'TiboTattle.AppImage'].includes(fields.srcname))) { sourceUnrecognized = true; continue; }
-    return { denial: true, reason: 'owned_mount_denial' };
+    if (!collectTuple) return { denial: true, reason: 'owned_mount_denial' };
+    const next = normalizeLinuxAppArmorMountTuple(fields);
+    if (next === null || matched && JSON.stringify(next) !== JSON.stringify(tuple)) tupleAmbiguous = true;
+    matched = true; tuple = next;
   }
+  if (matched) return { denial: true, reason: 'owned_mount_denial', tuple: tupleAmbiguous || sourceUnrecognized ? null : tuple };
   // Sampling cannot prove all fork/exit events or that audit generation was
   // enabled. Even a complete read window with no match is not negative proof.
   return unavailable(sourceUnrecognized ? 'owned_target_source_unrecognized' : actorUncorrelated ? 'owned_actor_not_correlated'
     : ambiguous ? 'match_ambiguous' : recordObserved ? 'no_correlated_mount_denial' : 'no_observed_mount_denial');
 }
-async function runHostProbe(role, expected) {
+async function runHostProbe(role, expected, { stage = 'default', nonce = randomBytes(16).toString('hex'), profile = null } = {}) {
   const run = process.env.GITHUB_RUN_ID;
   if (!/^[1-9][0-9]{0,14}$/u.test(run ?? '')) fail();
-  const name = `tibotattle-mount-diagnosis-${role}-${run}`, nonce = randomBytes(16).toString('hex'), temporary = `${EXEC}/tmp/${nonce}`;
+  const name = `tibotattle-mount-diagnosis-${caseSuffix(stage, role)}-${run}`, temporary = `${EXEC}/tmp/${nonce}`;
   const row = { role, artifactSha256: expected.sha256, artifactBytes: expected.bytes, probe: null, errorCode: 'container_failed', appArmorMountDenial: UNKNOWN, appArmorAuditReason: 'not_started', containerRemoved: false, observerStopped: true };
-  let id = null, child = null, audit = null, initIdentity = null, initPid = null;
+  let id = null, child = null, audit = null, initIdentity = null, initPid = null, tuple = null, profileApplied = false;
   try {
     if (command('docker', ['ps', '-aq', '--filter', `name=^/${name}$`])) fail();
-    id = command('docker', linuxMountContainerArguments({ name, role, nonce, runnerRevision: process.env.GITHUB_SHA }));
+    id = command('docker', linuxMountContainerArguments({ name, role, nonce, runnerRevision: process.env.GITHUB_SHA, stage, profile }));
     if (!/^[a-f0-9]{64}$/u.test(id)) fail();
     child = spawn('docker', ['start', '--attach', '--interactive', id], { cwd: ROOT, shell: false, stdio: ['pipe', 'pipe', 'ignore'] });
     let ready = false, result = null, childSeen = false, exited = false;
@@ -529,6 +555,7 @@ async function runHostProbe(role, expected) {
       else fail();
     }, 65536);
     if (!await waitUntil(() => ready || exited, 10000) || !ready || !valid()) fail();
+    const configuredProfile = stage === 'default' ? null : command('docker', ['inspect', '--format', '{{.AppArmorProfile}}', id]);
     initPid = Number(command('docker', ['inspect', '--format', '{{.State.Pid}}', id]));
     if (!Number.isSafeInteger(initPid) || initPid < 1) fail();
     initIdentity = statIdentity(await optionalRead(`/proc/${initPid}/stat`, 4096));
@@ -537,7 +564,9 @@ async function runHostProbe(role, expected) {
     const start = monotonic(); child.stdin.on('error', () => {}); child.stdin.write('go\n');
     await waitUntil(() => result !== null || exited, 18000);
     const end = monotonic(), kernel = await audit.stop(); row.observerStopped = kernel.stopped; audit = null;
-    const attribution = correlateLinuxMountAudit({ audit: kernel, profile: kernel.profile, observations: new Map(kernel.observations.map(item => [item.pid, item])), temporary, start, end });
+    const attribution = correlateLinuxMountAudit({ audit: kernel, profile: kernel.profile, observations: new Map(kernel.observations.map(item => [item.pid, item])), temporary, start, end, collectTuple: stage !== 'default' });
+    profileApplied = stage !== 'default' && configuredProfile === profile && kernel.profile === profile;
+    tuple = profileApplied ? attribution.tuple ?? null : null;
     row.appArmorMountDenial = attribution.denial; row.appArmorAuditReason = attribution.reason;
     if (result === null || !valid()) { row.errorCode = 'probe_failed'; }
     else { row.probe = result; row.errorCode = 'none'; }
@@ -555,22 +584,23 @@ async function runHostProbe(role, expected) {
     child?.kill('SIGTERM');
     if (!row.containerRemoved || !row.observerStopped) row.errorCode = 'cleanup_failed';
   }
-  return row;
+  return stage === 'default' ? row : { row, tuple, profileApplied };
 }
-export function linuxMountCleanupArguments({ markerId, inspected }, { role, run, runner }) {
-  if (!ROLES.includes(role) || !/^[1-9][0-9]{0,14}$/u.test(run ?? '') || !/^[a-f0-9]{40}$/u.test(runner ?? '')
+export function linuxMountCleanupArguments({ markerId, inspected }, { role, run, runner, stage = 'default' }) {
+  if (!PROBE_STAGES.includes(stage) || !ROLES.includes(role) || !/^[1-9][0-9]{0,14}$/u.test(run ?? '') || !/^[a-f0-9]{40}$/u.test(runner ?? '')
     || !/^[a-f0-9]{64}$/u.test(markerId ?? '') || !exactKeys(inspected, ['id', 'name', 'labels'])
-    || inspected.id !== markerId || inspected.name !== `/tibotattle-mount-diagnosis-${role}-${run}`
+    || inspected.id !== markerId || inspected.name !== `/tibotattle-mount-diagnosis-${caseSuffix(stage, role)}-${run}`
     || inspected.labels?.['io.tibotattle.mount-diagnosis.run'] !== run
     || inspected.labels?.['io.tibotattle.mount-diagnosis.runner'] !== runner
-    || inspected.labels?.['io.tibotattle.mount-diagnosis.role'] !== role) fail();
+    || inspected.labels?.['io.tibotattle.mount-diagnosis.role'] !== role
+    || stage !== 'default' && inspected.labels?.['io.tibotattle.mount-diagnosis.stage'] !== stage) fail();
   return ['rm', '--force', markerId];
 }
 async function cleanupRecordedContainers() {
   const run = process.env.GITHUB_RUN_ID, runner = process.env.GITHUB_SHA;
   if (!/^[1-9][0-9]{0,14}$/u.test(run ?? '') || !/^[a-f0-9]{40}$/u.test(runner ?? '')) fail();
-  for (const role of ROLES) {
-    const marker = join(ROOT, LINUX_FINAL_INPUT, `.mount-diagnosis-${role}.container`);
+  for (const stage of PROBE_STAGES) for (const role of ROLES) {
+    const marker = join(ROOT, LINUX_FINAL_INPUT, `.mount-diagnosis-${caseSuffix(stage, role)}.container`);
     let stat;
     try { stat = await lstat(marker); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     if (stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) fail();
@@ -579,9 +609,10 @@ async function cleanupRecordedContainers() {
     if (!command('docker', ['ps', '-aq', '--filter', `id=${id}`])) continue;
     const inspected = JSON.parse(command('docker', ['inspect', '--format',
       '{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Config.Labels}}}', id]));
-    command('docker', linuxMountCleanupArguments({ markerId: id, inspected }, { role, run, runner }));
+    command('docker', linuxMountCleanupArguments({ markerId: id, inspected }, { role, run, runner, stage }));
     if (command('docker', ['ps', '-aq', '--filter', `id=${id}`])) fail();
   }
+  if (!await cleanupLinuxAppArmorProfiles({ directory: join(ROOT, LINUX_FINAL_INPUT), run, runner, containersGone: true })) fail();
 }
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   try {
@@ -596,11 +627,25 @@ if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
         process.umask(0o077);
         const directory = join(ROOT, LINUX_FINAL_INPUT);
         const pair = validateLinuxFinalPair(JSON.parse((await fingerprintLinuxFinalFile(join(directory, 'pair.json'), 131072, true)).contents), intake.runnerRevision);
-        const receipt = await runLinuxMountSequence(pair, runHostProbe);
-        const handle = await open(join(directory, 'mount-diagnosis.json'), 'wx', 0o600);
+        const comparison = process.env.SELECTED_POLICY === 'apparmor-comparison';
+        let interrupted = false;
+        const cancel = () => { interrupted = true; };
+        if (comparison) { process.on('SIGTERM', cancel); process.on('SIGINT', cancel); }
+        const nonce = randomBytes(16).toString('hex'), outsideNonce = randomBytes(16).toString('hex');
+        let receipt;
+        try {
+          receipt = comparison ? await runLinuxAppArmorComparison(pair, {
+            prepareProfiles: () => prepareLinuxAppArmorProfiles({ root: ROOT, directory, run: process.env.GITHUB_RUN_ID, runner: intake.runnerRevision, nonce }),
+            runProbe: (stage, role, expected, profile) => runHostProbe(role, expected, { stage, profile, nonce: stage === 'negative' ? outsideNonce : nonce }),
+            validateRow: row => validateLinuxMountDiagnosis({ schemaVersion: LINUX_MOUNT_DIAGNOSIS_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
+              runnerRevision: intake.runnerRevision, sourceRevision: intake.sourceRevision, cases: [{ ...row, role: 'current' }] }) !== null,
+            interrupted: () => interrupted,
+          }) : await runLinuxMountSequence(pair, runHostProbe);
+        } finally { if (comparison) { process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); } }
+        const handle = await open(join(directory, comparison ? 'apparmor-comparison.json' : 'mount-diagnosis.json'), 'wx', 0o600);
         try { await handle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`); await handle.sync(); } finally { await handle.close(); }
         process.stdout.write('Linux mount-only diagnostic retained; lifecycle qualification remains separate.\n');
-        if (receipt.cases.length !== 2 || receipt.cases.some(row => row.errorCode !== 'none')) process.exitCode = 1;
+        if (comparison ? receipt.outcome !== 'compared' : receipt.cases.length !== 2 || receipt.cases.some(row => row.errorCode !== 'none')) process.exitCode = 1;
       } else {
         if (mode === '--acquire') await acquireLinuxFinalArtifacts(intake);
         if (mode === '--prepare') await prepareLinuxFinalArtifacts(intake);

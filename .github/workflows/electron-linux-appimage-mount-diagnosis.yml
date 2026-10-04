@@ -9,12 +9,18 @@ on:
         options: [plan, execute]
         default: plan
         required: true
+      policy:
+        description: Keep the existing policy or compare two reviewed, owned AppArmor profiles
+        type: choice
+        options: [default, apparmor-comparison]
+        default: default
+        required: true
       intake:
         description: Closed final-artifact intake with exact successful package and predecessor identities
         type: string
         required: true
       confirmation:
-        description: Execute requires RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS
+        description: Default requires RUN_DISPOSABLE_LINUX_APPIMAGE_MOUNT_DIAGNOSIS; comparison requires RUN_DISPOSABLE_LINUX_APPARMOR_MOUNT_COMPARISON
         type: string
 permissions:
   contents: read
@@ -35,6 +41,7 @@ jobs:
     env:
       LINUX_FINAL_INTAKE: ${{ inputs.intake }}
       SELECTED_MODE: ${{ inputs.mode }}
+      SELECTED_POLICY: ${{ inputs.policy }}
       SELECTED_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
       - name: Check out exact reviewed diagnostic runner
@@ -88,12 +95,18 @@ jobs:
             --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$QUALIFICATION_RUNNER" \
             --tag tibotattle-electron-linux-installed:test .
       - name: Diagnose predecessor then final mount with the existing container security boundary
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' && inputs.policy == 'default'
         run: |
           set -euo pipefail
           umask 077
           timeout 180s node scripts/diagnose-electron-linux-appimage-mount.mjs --execute
-      - name: Remove only recorded owned diagnostic containers after interruption
+      - name: Compare audited baseline and a strictly observed AppArmor allowance
+        if: inputs.mode == 'execute' && inputs.policy == 'apparmor-comparison'
+        run: |
+          set -euo pipefail
+          umask 077
+          timeout --signal=TERM --kill-after=90s 360s node scripts/diagnose-electron-linux-appimage-mount.mjs --execute
+      - name: Remove only recorded owned diagnostic containers and profiles after interruption
         if: always() && inputs.mode == 'execute'
         run: timeout 60s node scripts/diagnose-electron-linux-appimage-mount.mjs --cleanup
       - name: Retain only closed diagnostic evidence
@@ -104,5 +117,6 @@ jobs:
           path: |
             .release-build/linux-final-qualification/pair.json
             .release-build/linux-final-qualification/mount-diagnosis.json
+            .release-build/linux-final-qualification/apparmor-comparison.json
           if-no-files-found: error
           retention-days: 14

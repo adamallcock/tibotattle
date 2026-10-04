@@ -2984,7 +2984,8 @@
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-installed-files.test.mjs",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
-        "scripts/diagnose-electron-linux-appimage-mount.mjs"
+        "scripts/diagnose-electron-linux-appimage-mount.mjs",
+        "scripts/lib/linux-apparmor-mount-profile.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3056,6 +3057,22 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
+        "test/electron-linux-appimage-mount-diagnosis.test.mjs"
+      ],
+      "decision": "retain_as_internal_linux_qualification_support",
+      "provenance": ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-apparmor-mount-profile.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private exact-source AppArmor profile generator and owned cleanup for a diagnostic-only, immutable-AppImage comparison; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/diagnose-electron-linux-appimage-mount.mjs",
         "test/electron-linux-appimage-mount-diagnosis.test.mjs"
       ],
       "decision": "retain_as_internal_linux_qualification_support",
