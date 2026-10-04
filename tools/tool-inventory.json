@@ -2751,7 +2751,8 @@
         ".github/workflows/electron-macos-sparkle-transition.yml",
         "scripts/smoke-electron-macos-production-update.mjs",
         "test/smoke-electron-macos-sparkle-transition.test.mjs",
-        "scripts/smoke-electron-macos-credentials.mjs"
+        "scripts/smoke-electron-macos-credentials.mjs",
+        "scripts/lib/macos-historical-sol-qualification.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-macos-sparkle-transition.yml",

@@ -537,8 +537,9 @@ export async function runMacCredentialQualification({ intake, execute = false })
       if (dialog(active.pid, 'inspect') !== 'no_secure_storage_dialog') fail('unexpected_security_ui');
       await exerciseEmptyProfileSettings(active.settings);
       if (historicalSol) {
-        // Startup may do the repair. Preserve that completed detailed-refresh
-        // observation before the explicit repeat replaces its controller result.
+        // Preserve the startup repair before the explicit detailed repeat
+        // replaces its result. Fresh later restarts intentionally use a quick
+        // quota pass; their retained Usage evidence is checked independently.
         stage = 'historical_sol_candidate_' + pass;
         const observed = await observeHistoricalSolPass({ dashboard: active.dashboard,
           context: historicalSol, phase: pass === 0 ? 'repair' : 'restart',

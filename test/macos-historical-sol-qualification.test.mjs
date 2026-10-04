@@ -56,7 +56,7 @@ test('fixed historical fixture is Standard short context at the reviewed effecti
   assert.notEqual(priceCodexUsageEvent({ ...event, totalInputContextTokens: 272_001 }).totalUsd, '0.129');
 });
 
-test('actual public detailed-refresh and overview APIs repair the retained unknown once and conserve the original known fixture', async t => {
+test('actual public APIs repair once, replay safely and preserve priced history through fresh quick restarts', async t => {
   const value = await profile(t), context = await prepare(value);
   await assert.rejects(readHistoricalSolState(context), refused('repair_missing'));
   assert.throws(() => historicalSolQualificationReceipt(context), refused('proof_incomplete'));
@@ -76,10 +76,13 @@ test('actual public detailed-refresh and overview APIs repair the retained unkno
     },
     refreshAccounting: options => refreshReplaySafeAccountingCache({ ...options, rebuildIsolation: 'in_process' }),
   });
-  const dataStore = new LocalCompanionDataStore({ builder: options => buildLocalCompanionSnapshot({ ...options,
+  const createDataStore = () => new LocalCompanionDataStore({ snapshotFile: value.authoritativeDashboardSnapshotFile,
+    snapshotNow: now, builder: options => buildLocalCompanionSnapshot({ ...options,
     root: value.home, codexHome: value.codexHome, collectorStateFile: value.collectorStateFile,
     unifiedIndexFile: value.unifiedIndexFile, accountingSourceMode: 'unified',
+    unifiedProjectionMode: ['startup', 'quick'].includes(options?.purpose) ? 'deferred' : 'full',
     allowDevelopmentArtifactFallback: false, now }) });
+  const dataStore = createDataStore();
   const controller = new LocalCompanionRefreshController({ runner, dataStore, clock: now, createRefreshId: () => NEW_ID });
   assert.equal(controller.start({ mode: 'detailed' }), true);
   const refresh = await waitForHistoricalSolRefresh(() => controller.getStatus(), OLD_ID, { timeoutMs: 30_000 });
@@ -89,11 +92,11 @@ test('actual public detailed-refresh and overview APIs repair the retained unkno
   assert.equal(assertHistoricalSolAccounting({ refresh, overview, state }), true);
   // Only the DOM adapter is synthetic here; refresh/overview/state assertions
   // still consume the owning APIs. Real rendering belongs to the installed gate.
-  const dashboardFor = current => ({ async evaluate(script) {
+  const dashboardFor = (current, store = dataStore) => ({ async evaluate(script) {
     if (script.includes("fetch('/api/local/refresh'")) return current.getStatus();
-    if (script.includes("fetch('/api/local/overview'")) return dataStore.getOverview();
+    if (script.includes("fetch('/api/local/overview'")) return store.getOverview();
     if (script.includes('[data-nav="method"]')) return true;
-    const row = dataStore.getOverview().accounting.periods.find(period => period.periodId === 'history')
+    const row = store.getOverview().accounting.periods.find(period => period.periodId === 'history')
       .modelUsage.find(model => model.model === HISTORICAL_SOL_FIXTURE.model);
     return { period: 'all', pageVisible: true, modelRows: 1, model: row.model,
       label: HISTORICAL_SOL_FIXTURE.label, events: String(row.events), totalTokens: String(row.totalTokens),
@@ -127,10 +130,27 @@ test('actual public detailed-refresh and overview APIs repair the retained unkno
   assert.throws(() => assertHistoricalSolAccounting({ refresh: replayed, overview: dataStore.getOverview(), state: retained,
     repeat: true, previousGeneration: state.generation }), refused('replay_changed'));
   for (const suffix of ['021', '022']) {
-    const restarted = new LocalCompanionRefreshController({ runner, dataStore, clock: now,
+    // Match the composition root: a new store restores the persisted full
+    // snapshot, startup/quick reloads defer broad projection, and the fresh
+    // renderer requests only a quick quota refresh. No fabricated index or
+    // accounting result is supplied for this mode.
+    const restartedStore = createDataStore();
+    await restartedStore.initialize({ purpose: 'startup' });
+    assert.equal(restartedStore.getOverview().accounting.generationMatched, true);
+    const restarted = new LocalCompanionRefreshController({ runner, dataStore: restartedStore, clock: now,
       createRefreshId: () => `71000000-0000-4000-8000-000000000${suffix}` });
-    assert.equal(restarted.start({ mode: 'detailed' }), true);
-    await observeHistoricalSolPass({ dashboard: dashboardFor(restarted), context, phase: 'restart', previousGeneration: state.generation });
+    assert.equal(restarted.start({ mode: 'quick' }), true);
+    await observeHistoricalSolPass({ dashboard: dashboardFor(restarted, restartedStore), context,
+      phase: 'restart', previousGeneration: state.generation });
+    const quick = restarted.getStatus();
+    assert.equal(quick.mode, 'quick');
+    assert.equal(Object.hasOwn(quick.result, 'unifiedIndex'), false);
+    assert.equal(Object.hasOwn(quick.result, 'accounting'), false);
+    assert.equal(passes.length, 2, 'quick startup does not ingest or reparse');
+    assert.throws(() => assertHistoricalSolAccounting({ refresh: quick, overview: restartedStore.getOverview(), state }),
+      refused('accounting_invalid'), 'quick completion cannot prove initial repair');
+    assert.throws(() => assertHistoricalSolAccounting({ refresh: quick, overview: restartedStore.getOverview(),
+      state, repeat: true, restart: true, previousGeneration: state.generation + 1 }), refused('replay_changed'));
   }
   assert.deepEqual(historicalSolQualificationReceipt(context), {
     schemaVersion: 'tibotattle-historical-sol-installed-v1', observedAt: '2026-09-29T12:00:01.000Z', reportingPeriod: 'all',
@@ -192,6 +212,12 @@ test('distinct detailed completion waits through stale predecessor/restart succe
   const result = await waitForHistoricalSolRefresh(() => sequence[reads++], OLD_ID,
     { now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1_000 });
   assert.equal(result, sequence[3]); assert.equal(reads, 4);
+  const quickSequence = [{ refreshId: OLD_ID, mode: 'detailed', status: 'succeeded' },
+    { refreshId: NEW_ID, mode: 'quick', status: 'running' },
+    { refreshId: NEW_ID, mode: 'quick', status: 'succeeded' }];
+  reads = 0;
+  assert.equal(await waitForHistoricalSolRefresh(() => quickSequence[reads++], OLD_ID,
+    { now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1_000, allowQuick: true }), quickSequence[2]);
   await assert.rejects(waitForHistoricalSolRefresh(() => sequence[0], OLD_ID,
     { now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 200 }), refused('refresh_timeout'));
   await assert.rejects(waitForHistoricalSolRefresh(() => ({ refreshId: NEW_ID, mode: 'detailed', status: 'failed' }), OLD_ID),
