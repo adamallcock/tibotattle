@@ -40,11 +40,11 @@ remain separately gated; credentials do not authorize them.
 | Pro Max release contract | Passed source/released/installed vocabulary checks and focused tests | Current released/installed binary and upstream evidence reviewed; ledger lifecycle/provenance agree; required-binary contract check passes without claiming authoritative allowance/window capacities |
 | Packaging dependencies | Exact mitigation installed and tested; temporary exception remains inactive pending owner decision | Prefer a compatible published fix; otherwise review the exact patch and narrow temporary exception with owner authorization; focused negative tests and fresh dependency proof pass |
 | Version/build allocation | Passed allocation/admission/export checks; four coupled runtime manifests also aligned to 0.1.27 after actual staging exposed drift | Product 0.1.27, unique valid Mac allocation, separate provenance build number and truthful release notes; version/admission tests pass |
-| Hosted compatibility | Confirmed old Worker rejects Pro Max; publication held for compatible hosted path | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
+| Hosted compatibility | Pro Max admission and unknown-model correction gaps confirmed; publication held for qualified post-cutover alignment | Local-only functionality and old/new hosted protocol behavior qualified; new performance activation is not inferred from a merge or health response |
 | Source freeze | Final runtime manifest alignment reviewed; freeze renewed before candidate staging and R7 | Scoped diff reviewed and committed; candidate HEAD and dependencies clean and pinned |
 | Retained R7 evidence | Pinned environment ready; coordinating a window around the GCP owner's heavy local run | Complete protected dual-runtime matrix regenerated locally against final source/lockfiles; all ten receipts and their freshness tests validated; unresolved historical resource decisions remain explicit |
 | Complete source/surface gates | Pending frozen inputs | Owning client/shared/release gates run; failures fixed without weakening tests; broad gate limitations reported exactly |
-| Production candidates | Pending source and evidence gates | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
+| Production candidates | Both Mac source candidates staged at ac2c0a57; native, signed and installed artifact gates pending | Exact Node 26.2.0 staging receipts, fresh packaged inspection and target-specific installer/updater/credential qualification |
 | Delivery | Pending user answer and final-byte gates | Candidate handoff or authorized exact four-platform publication/readback; source, signed artifact, installed result and public availability remain distinct |
 
 ## Invariants and decision limits
@@ -160,5 +160,61 @@ i18n and Worker versions remain unchanged; the frozen lockfile did not change.
 Six focused package and staging suites passed 44/44, canonical telemetry and
 whitespace checks passed, and direct workspace runtime capture now returns all
 four packages at 0.1.27. This changes protected R7 workload inputs, so receipt
-regeneration must use the final manifest-aligned source. Successful production
-preparation and native installed qualification remain separate pending gates.
+regeneration must use the final manifest-aligned source. Production-source
+preparation subsequently passed for both Mac architectures; native installed
+qualification remains pending.
+
+## Hosted historical model correction
+
+The follow-up upload audit found a separate contract gap. Local parser repair
+preserves occurrence identities and historical day changes trigger manifest
+revalidation and reupload; a lost activation response or replay does not itself
+duplicate usage. This does not establish that repaired model identities can
+activate on the server.
+
+The current accountless composition prefers v1.2 when separately authorized
+and can fall back to v1.1. The closed v1.1 compatibility contract allows the
+reviewed null-to-known total repair, but a stable occurrence's model change is
+rejected atomically with `TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE`. The
+previous accepted generation remains active. There is no unknown-model
+exemption. Existing v1.1 correction tests cover model-change refusal and
+preservation of the prior head. In contrast, v1.2 can activate a complete
+successor through its separate CAS/head contract; retained-generation effective
+readers still treat the changed model as conflicting evidence. Upload acceptance
+is therefore distinct from corrected analytical selection.
+
+Legacy v1 chunk replacement has different mutation semantics. When its typed
+correction runtime is active, correction archives and effective readers
+reconcile original assertions, and the model participates in their base digest. Unknown-to-Sol
+assertions become one `base_conflict` occurrence with no effective analytical
+record, rather than newest-wins precedence or two counted occurrences.
+
+Executed evidence includes 12 focused local parser/sync/publication checks and
+28 Worker correction-admission/reconciliation/effective-reader tests. An exact
+synthetic unknown-to-`gpt-6.1-sol` reducer probe covered all three wire families,
+both arrival orders, replay and streaming; root additionally held the provider
+constant and changed only the model, with the same conflict result. These are
+source/synthetic proofs, not live submission or published-result qualification.
+
+The GCP owner acknowledged this dependency and retains the hosted remediation
+in the separate post-cutover alignment lane. Preserve accepted occurrences,
+original assertions and current cutover parity. A future bounded correction
+contract needs matching activation and effective-reader rules, provenance and
+compatibility proof, unknown-to-known positive tests, known-to-known and
+contradictory-evidence negative tests, replay/order/account-scope coverage,
+atomic failure/head preservation, and qualified hosted/public readback. Do not
+broaden acceptance or replace contributions in the client release lane.
+
+The owner reports production website source `94a9b9d7` now supplies the tolerant
+reader, while hosted intake/pricing retain old semantics. That scoped website
+publication does not release the client compatibility hold. Candidate notes and
+user help must separate local repair from hosted synchronization.
+
+Both Mac architectures successfully completed unsigned production-source
+preparation at `ac2c0a57f49bfb9cee1e55b6ba750aefbb20f515`. No signing,
+notarization, installation or publication occurred. Worker copied workspace
+packages were refreshed through the owning npm install and all three exact
+copy guards passed. Worker lock metadata is also aligned for the three local
+packages without changing external dependency resolutions; the root lockfile
+remains unchanged. Final release evidence remains held for the security
+decision, R7 resource slot and remaining artifact gates.

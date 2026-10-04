@@ -97,7 +97,10 @@ unrecognized GPT-6.1 Sol records without changing token totals. An exact stored
 model identity can also be repriced from sufficient preserved token, context
 and time evidence. If a record's model became `unknown` and its original log is
 gone, the app cannot safely reconstruct that identity; missing evidence and
-unsupported historical prices remain explicit.
+unsupported historical prices remain explicit. These are local analysis
+updates. A repaired model identity does not automatically replace an already
+accepted hosted contribution; hosted synchronization requires a compatible
+correction contract.
 
 When local history contains more than one plan, **Allowance** separates the
 plans instead of averaging Plus and Pro reset estimates together. The plan
