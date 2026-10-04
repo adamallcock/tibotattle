@@ -5,7 +5,7 @@ import { constants, createReadStream } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, readlink, rename, rm, unlink } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { lookup } from 'node:dns/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild } from './smoke-electron-linux.mjs';
@@ -29,9 +29,9 @@ const unescapeMount = text => text.replace(/\\(040|011|012|134)/gu, (_, octal) =
 /** A path alone never proves FUSE. Bind the kernel mount table and the runtime's
  * environment to the installed image. SquashFS file uid is not the app uid. */
 export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE }) {
-  if (image !== IMAGE || typeof executable !== 'string' || resolve(executable) !== executable
-    || basename(executable) !== 'tibotattle') fail('FUSE_IDENTITY_INVALID');
-  const mount = dirname(executable);
+  if (image !== IMAGE || typeof executable !== 'string' || posix.resolve(executable) !== executable
+    || posix.basename(executable) !== 'tibotattle') fail('FUSE_IDENTITY_INVALID');
+  const mount = posix.dirname(executable);
   if (!new RegExp(`^${TEMP}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_IDENTITY_INVALID');
   const rows = mountinfo.split('\n').filter(Boolean).map(line => {
     const parts = line.split(' - '); if (parts.length !== 2) return null;
@@ -43,7 +43,7 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
   if (rows.length !== 1) fail('FUSE_IDENTITY_INVALID');
   const selected = rows[0];
   const fuse = selected.type === 'fuse.squashfuse' && selected.source === 'squashfuse'
-    || ['fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type) && [image, basename(image)].includes(selected.source);
+    || ['fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type) && [image, posix.basename(image)].includes(selected.source);
   if (!fuse || selected.root !== '/' || !selected.options.includes('ro')
     || !selected.superOptions.includes('user_id=1000')
     || environment.APPIMAGE !== image || environment.APPDIR !== mount
