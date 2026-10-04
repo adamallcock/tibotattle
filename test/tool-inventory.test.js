@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 162 records / 163 executable paths: release-documentation, Codex contract,
+  // 165 records / 166 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -325,11 +325,13 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // journeys, and qualification of an already signed Windows installer.
   // The final Linux AppImage qualifier binds the unchanged normal runtime
   // journey to final package bytes without rebuilding or publishing them.
-  // The last five are the macOS credential qualification set: the fixture
+  // The three final Linux tools admit exact package bytes and qualify the
+  // ordinary FUSE launcher and public-predecessor installed lifecycle.
+  // The prior five are the macOS credential qualification set: the fixture
   // preparer, the credentials smoke, and the loopback/intake/PF-guard helpers.
   // The temporary HTTP cache advisory guard is an owned, expiry-bound OSV gate.
-  assert.equal(result.records, 162);
-  assert.equal(result.candidates.length, 163);
+  assert.equal(result.records, 165);
+  assert.equal(result.candidates.length, 166);
   assert.ok(result.aliases >= 25);
 });
 

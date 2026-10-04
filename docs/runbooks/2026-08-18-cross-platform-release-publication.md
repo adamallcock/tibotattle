@@ -659,6 +659,46 @@ This proves the extracted application's runtime only. AppImage mounting/launcher
 integration, physical desktop behavior and replacement of the older public
 release remain separate observations; the receipt explicitly leaves them open.
 
+The separate manual `electron-linux-final-qualification.yml` lane consumes the
+already built final package; it never rebuilds a private current/next pair. Its
+closed intake binds the reviewed runner revision, frozen application revision,
+unchanged `production-source-candidate.json`, successful production packaging
+run, package-receipt digest, final AppImage size/digest, and executable/ASAR
+digests. The application revision must be an ancestor of the runner, with the
+same package version. For 0.1.27 the predecessor is the immutable public
+[0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26);
+its manifest and AppImage digests are pinned in
+`scripts/lib/linux-final-artifact-intake.mjs`. Earlier owner acceptance is not
+reused for the new bytes.
+
+Dispatch `mode=plan` first with the reviewed intake. `mode=execute` also requires
+`RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE`. The owning preparation entrypoint is
+`scripts/qualify-electron-linux-installed-lifecycle.mjs` (`--preflight`,
+`--acquire`, then `--prepare`); downloads require the workflow's read-only token.
+It rejects other workflow sources, incomplete runs, unexpected ZIP members,
+links, changed receipts and different artifact bytes. Extraction establishes
+comparison hashes only and is never counted as installed execution.
+
+The native x64 job requires `/dev/fuse`, the scoped `SYS_ADMIN` capability and
+FUSE device, an ordinary AppImage launcher, enabled Chromium sandbox, Xvfb and
+an isolated Secret Service. There is no extract-and-run fallback, external
+network, host profile mount, system credential access, signing or publication.
+`scripts/smoke-electron-linux-final-lifecycle.mjs` binds kernel FUSE mounts,
+process start identities, running executable and ASAR hashes to the installed
+image. It observes a fresh synthetic profile, local refresh and credential
+access, rejection of an intentionally mismatched feed checksum without replacing
+the predecessor, the public predecessor's real Settings download/install/restart,
+exact-byte replacement, settings/opt-out/source and credential continuity,
+cold restart, no-update behavior, owned uninstall and process/mount cleanup.
+The fixed production feed URL is served only inside the network-none container.
+
+Retain the pair and `installed-lifecycle.json` with the package receipts. Only a
+passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
+missing FUSE, failed sandbox or incomplete cleanup is a failed gate. The receipt
+keeps `physicalDesktop: not_qualified`, and the isolated feed does not prove
+production updater publication. Review that scope when preparing release
+assurances; do not broaden it into a physical-desktop claim.
+
 ### Stores and updater channels
 
 Store submissions must record their own provider/listing, publisher/build/
