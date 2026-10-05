@@ -7,7 +7,8 @@ import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, 
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
-  readLinuxFinalAppProcessIdentity } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  readLinuxFinalAppProcessIdentity, linuxFinalBrowserCommandLineMatches, readLinuxFinalKnownAppProcessIdentity,
+  currentLinuxFinalApp, stopLinuxFinalOwnedApp } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
@@ -74,6 +75,7 @@ test('receipt and final pair cannot relabel prebuilt source or reuse another can
 });
 const nonce = 'a'.repeat(32), temporary = linuxFinalTemporary(nonce);
 const mount = `${temporary}/.mount_TiboTa123456`;
+const installedImage = '/opt/tibotattle-updater-exec/TiboTattle.AppImage';
 function mounted() {
   return { temporary, executable: `${mount}/tibotattle`,
     mountinfo: `91 40 0:82 / ${mount} ro,nosuid,nodev,relatime - fuse.squashfuse squashfuse ro,user_id=1000,group_id=1000\n`,
@@ -125,7 +127,7 @@ test('kernel FUSE mount plus image runtime identity is required; extracted paths
 function appProcess(role = 'browser') {
   const value = mounted(), pid = 50, reads = [], hashes = [];
   value.mountinfo = value.mountinfo.replace('fuse.squashfuse squashfuse', 'fuse.TiboTattle.AppImage TiboTattle.AppImage');
-  const expected = { executableSha256: 'a'.repeat(64), asarSha256: 'b'.repeat(64) };
+  const expected = { executableSha256: 'a'.repeat(64), asarSha256: 'b'.repeat(64), sha256: 'd'.repeat(64) };
   const fields = Array(20).fill('0'); fields[0] = 'S'; fields[19] = '100';
   const environment = role === 'node'
     ? { TMPDIR: temporary, ELECTRON_RUN_AS_NODE: '1', USAGE_MONITOR_PARENT_PID: '49' }
@@ -139,6 +141,7 @@ function appProcess(role = 'browser') {
     mountinfo: value.mountinfo,
   };
   const io = {
+    expectedArguments: ['--remote-debugging-port=12345'],
     read: async path => {
       assert.ok(path.startsWith(`/proc/${pid}/`)); const name = path.slice(`/proc/${pid}/`.length);
       reads.push(name); assert.ok(Object.hasOwn(files, name)); return files[name];
@@ -146,8 +149,8 @@ function appProcess(role = 'browser') {
     link: async path => { assert.equal(path, `/proc/${pid}/exe`); reads.push('exe'); return value.executable; },
     hash: async path => {
       hashes.push(path);
-      assert.ok([value.executable, `${mount}/resources/app.asar`].includes(path));
-      return path === value.executable ? expected.executableSha256 : expected.asarSha256;
+      assert.ok([value.executable, `${mount}/resources/app.asar`, installedImage].includes(path));
+      return path === value.executable ? expected.executableSha256 : path === installedImage ? expected.sha256 : expected.asarSha256;
     },
   };
   return { value, pid, expected, environment, files, io, reads, hashes };
@@ -165,7 +168,7 @@ test('ordinary Node companion sharing the mounted executable is not mistaken for
   assert.deepEqual(await readLinuxFinalAppProcessIdentity(browser.pid, browser.expected, temporary, browser.io), {
     pid: browser.pid, startTime: '100', mount, executable: browser.value.executable,
   });
-  assert.deepEqual(browser.hashes, [browser.value.executable, `${mount}/resources/app.asar`]);
+  assert.deepEqual(browser.hashes, [browser.value.executable, `${mount}/resources/app.asar`, installedImage]);
   assert.equal(browser.reads.filter(name => name === 'stat').length, 2);
   const chromium = appProcess('chromium');
   assert.equal(await readLinuxFinalAppProcessIdentity(chromium.pid, chromium.expected, temporary, chromium.io), null);
@@ -184,8 +187,6 @@ test('Node-mode markers can exclude a candidate but cannot qualify a browser or 
 
 test('real browser candidates still refuse wrong FUSE identity, extraction mode and credentials', async () => {
   for (const [code, alter] of [
-    ['FUSE_APPDIR_ENV_MISSING', v => { v.files.environ = `APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0`; }],
-    ['FUSE_APPIMAGE_ENV_MISSING', v => { v.files.environ = `APPDIR=${mount}\0`; }],
     ['FUSE_APPIMAGE_ENV_MISMATCH', v => { v.files.environ = `APPIMAGE=\0APPDIR=${mount}\0`; }],
     ['FUSE_APPIMAGE_ENV_MISMATCH', v => { v.files.environ = `APPIMAGE=/tmp/other.AppImage\0APPDIR=${mount}\0`; }],
     ['FUSE_APPDIR_ENV_MISMATCH', v => { v.files.environ = 'APPIMAGE=/opt/tibotattle-updater-exec/TiboTattle.AppImage\0APPDIR=\0'; }],
@@ -202,11 +203,13 @@ test('real browser candidates still refuse wrong FUSE identity, extraction mode 
   await assert.rejects(readLinuxFinalAppProcessIdentity(uid.pid, uid.expected, temporary, uid.io), /PROCESS_UID_INVALID/u);
 });
 
-test('browser identity keeps both pinned digests, stable process identity and loud file failures', async () => {
+test('browser identity keeps all three pinned digests, stable process identity and loud file failures', async () => {
   for (const key of ['executableSha256', 'asarSha256']) {
     const value = appProcess(), expected = { ...value.expected, [key]: 'c'.repeat(64) };
     assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, expected, temporary, value.io), null);
   }
+  const installed = appProcess();
+  await assert.rejects(readLinuxFinalAppProcessIdentity(installed.pid, { ...installed.expected, sha256: 'c'.repeat(64) }, temporary, installed.io), /INSTALLED_BYTES_INVALID/u);
   const changed = appProcess(); let statReads = 0;
   await assert.rejects(readLinuxFinalAppProcessIdentity(changed.pid, changed.expected, temporary, {
     ...changed.io, read: async path => {
@@ -254,28 +257,194 @@ test('Chromium child roles are excluded in NUL argv and the exact executable-pre
   }
 });
 
-test('both browser command forms still require exact APPIMAGE and APPDIR before pinned byte admission', async () => {
+test('both exact browser command forms bind absent environment to image-named FUSE and all three byte identities', async () => {
   for (const separator of ['\0', ' ']) {
-    const value = appProcess();
-    value.files.cmdline = [value.value.executable, '--remote-debugging-port=12345'].join(separator) + '\0';
-    assert.equal((await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io)).pid, value.pid);
-    assert.deepEqual(value.hashes, [value.value.executable, `${mount}/resources/app.asar`]);
-    for (const [key, missing, mismatch] of [
-      ['APPIMAGE', 'FUSE_APPIMAGE_ENV_MISSING', 'FUSE_APPIMAGE_ENV_MISMATCH'],
-      ['APPDIR', 'FUSE_APPDIR_ENV_MISSING', 'FUSE_APPDIR_ENV_MISMATCH'],
-    ]) {
-      for (const observed of [undefined, '', '/synthetic/wrong']) {
-        const environment = { ...value.environment };
-        if (observed === undefined) delete environment[key]; else environment[key] = observed;
-        value.files.environ = Object.entries(environment).map(([name, item]) => `${name}=${item}\0`).join('');
-        value.hashes.length = 0;
+    for (const absent of [[], ['APPIMAGE'], ['APPDIR'], ['APPIMAGE', 'APPDIR']]) {
+      const value = appProcess();
+      value.files.cmdline = [value.value.executable, ...value.io.expectedArguments].join(separator) + '\0';
+      const environment = { ...value.environment };
+      for (const key of absent) delete environment[key];
+      value.files.environ = Object.entries(environment).map(([name, item]) => `${name}=${item}\0`).join('');
+      assert.equal((await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io)).pid, value.pid);
+      assert.deepEqual(value.hashes, [value.value.executable, `${mount}/resources/app.asar`, installedImage]);
+    }
+    for (const [key, mismatch] of [['APPIMAGE', 'FUSE_APPIMAGE_ENV_MISMATCH'], ['APPDIR', 'FUSE_APPDIR_ENV_MISMATCH']]) {
+      for (const observed of ['', '/synthetic/wrong']) {
+        const value = appProcess();
+        value.files.cmdline = [value.value.executable, ...value.io.expectedArguments].join(separator) + '\0';
+        // A defined mismatch is refused even when the other entry is absent.
+        value.files.environ = `${key}=${observed}\0`;
         await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), {
-          code: `LINUX_FINAL_LIFECYCLE_${observed === undefined ? missing : mismatch}`,
+          code: `LINUX_FINAL_LIFECYCLE_${mismatch}`,
         });
         assert.deepEqual(value.hashes, []);
       }
     }
   }
+});
+
+test('browser launch proof compares complete canonical argv without tokenization, trimming or prefix matching', () => {
+  const executable = `${mount}/tibotattle`;
+  const expectedArguments = ['--user-data-dir=/synthetic/profile', '--remote-debugging-port=12345',
+    '--remote-debugging-address=127.0.0.1', '--disable-gpu'];
+  const matches = commandLine => linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments });
+  for (const separator of ['\0', ' ']) {
+    const command = args => [executable, ...args].join(separator) + '\0';
+    assert.equal(matches(command(expectedArguments)), true);
+    for (const args of [[], expectedArguments.slice(1), expectedArguments.slice(0, -1), [...expectedArguments].reverse(),
+      [...expectedArguments, '--extra'], expectedArguments.map(arg => arg.replace('12345', '12346')),
+      [...expectedArguments, '--no-sandbox'], [...expectedArguments, '--disable-setuid-sandbox=1'],
+      [...expectedArguments, '--type=renderer']]) assert.equal(matches(command(args)), false);
+  }
+  const title = [executable, ...expectedArguments].join(' ') + '\0';
+  for (const commandLine of ['', null, title.slice(0, -1), `${title}\0`, ` ${title}`, title.replace(' ', '  '),
+    title.replace(' ', '\t'), `${executable} ${expectedArguments.join(' ')} \0`,
+    title.replace(executable, `${executable}-other`), `${executable}\0${expectedArguments.join(' ')}\0`,
+    title.replace(executable, `${executable} (deleted)`)]) assert.equal(matches(commandLine), false);
+  for (const expected of [undefined, null, {}, [''], ['a b'], ['a\tb'], ['a\0b'], ['a\u0007b'],
+    ['x'.repeat(4097)], Array(9).fill('--disable-gpu'), ['--type='], ['--type=renderer'], ['--no-sandbox'], ['--disable-setuid-sandbox=1']]) {
+    assert.throws(() => linuxFinalBrowserCommandLineMatches({ commandLine: title, executable, expectedArguments: expected }), /PROCESS_LAUNCH_ARGUMENTS_INVALID/u);
+  }
+});
+
+test('missing environment never turns a generic mount, unknown launch or wrong byte identity into a browser', async () => {
+  for (const separator of ['\0', ' ']) {
+    for (const [code, alter] of [
+      ['PROCESS_LAUNCH_ARGUMENTS_INVALID', v => { v.io.expectedArguments = undefined; }],
+      ['PROCESS_LAUNCH_ARGUMENTS_INVALID', v => { v.files.cmdline = [v.value.executable, '--remote-debugging-port=12346'].join(separator) + '\0'; }],
+      ['PROCESS_LAUNCH_ARGUMENTS_INVALID', v => { v.files.cmdline = [v.value.executable, ...v.io.expectedArguments, '--no-sandbox'].join(separator) + '\0'; }],
+      ['FUSE_MOUNT_SOURCE_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('fuse.TiboTattle.AppImage TiboTattle.AppImage', 'fuse.squashfuse squashfuse'); }],
+      ['FUSE_MOUNT_SOURCE_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('TiboTattle.AppImage ro,user', 'other.AppImage ro,user'); }],
+      ['FUSE_MOUNT_READ_ONLY_REQUIRED', v => { v.files.mountinfo = v.files.mountinfo.replace(' ro,nosuid', ' rw,nosuid'); }],
+      ['FUSE_MOUNT_UID_INVALID', v => { v.files.mountinfo = v.files.mountinfo.replace('user_id=1000', 'user_id=0'); }],
+      ['FUSE_MOUNT_AMBIGUOUS', v => { v.files.mountinfo += v.files.mountinfo; }],
+      ['PROCESS_UID_INVALID', v => { v.files.status = 'Uid:\t1000\t0\t1000\t1000\n'; }],
+      ['FUSE_EXTRACTION_MODE_FORBIDDEN', v => { v.files.environ = 'APPIMAGE_EXTRACT_AND_RUN=\0'; }],
+    ]) {
+      const value = appProcess(); value.files.environ = '';
+      value.files.cmdline = [value.value.executable, ...value.io.expectedArguments].join(separator) + '\0';
+      alter(value);
+      await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), { code: `LINUX_FINAL_LIFECYCLE_${code}` });
+      assert.deepEqual(value.hashes, []);
+    }
+    for (const key of ['executableSha256', 'asarSha256', 'sha256']) {
+      const value = appProcess(); value.files.environ = '';
+      value.files.cmdline = [value.value.executable, ...value.io.expectedArguments].join(separator) + '\0';
+      const pending = readLinuxFinalAppProcessIdentity(value.pid, { ...value.expected, [key]: 'c'.repeat(64) }, temporary, value.io);
+      if (key === 'sha256') await assert.rejects(pending, /INSTALLED_BYTES_INVALID/u);
+      else assert.equal(await pending, null);
+    }
+    const unstable = appProcess(); unstable.files.environ = ''; let reads = 0;
+    unstable.files.cmdline = [unstable.value.executable, ...unstable.io.expectedArguments].join(separator) + '\0';
+    await assert.rejects(readLinuxFinalAppProcessIdentity(unstable.pid, unstable.expected, temporary, {
+      ...unstable.io, read: async path => {
+        const value = await unstable.io.read(path);
+        return path.endsWith('/stat') && ++reads > 1 ? value.replace(/100$/u, '101') : value;
+      },
+    }), /PROCESS_BYTES_CHANGED/u);
+    for (const path of [`${temporary}/appimage_extracted_example/tibotattle`, '/tmp/.mount_other/tibotattle']) {
+      const unowned = appProcess(); unowned.files.environ = '';
+      unowned.files.cmdline = [path, ...unowned.io.expectedArguments].join(separator) + '\0';
+      assert.equal(await readLinuxFinalAppProcessIdentity(unowned.pid, unowned.expected, temporary, { ...unowned.io, link: async () => path }), null);
+      assert.deepEqual(unowned.hashes, []);
+    }
+  }
+});
+
+test('the updater successor admits only its known empty argument vector with complete image proof', async () => {
+  const value = appProcess(); value.files.environ = '';
+  value.io.expectedArguments = []; value.files.cmdline = `${value.value.executable}\0`;
+  const identity = await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io);
+  assert.equal(identity.pid, value.pid);
+  assert.deepEqual(value.hashes, [value.value.executable, `${mount}/resources/app.asar`, installedImage]);
+  for (const commandLine of [`${value.value.executable}\0--remote-debugging-port=12345\0`,
+    `${value.value.executable} --remote-debugging-port=12345\0`]) {
+    value.files.cmdline = commandLine; value.hashes.length = 0;
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /PROCESS_LAUNCH_ARGUMENTS_INVALID/u);
+    assert.deepEqual(value.hashes, []);
+  }
+});
+
+function ownedLaunchVectors() {
+  return [
+    ['--user-data-dir=/synthetic/fresh', '--remote-debugging-port=12345', '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
+    ['--remote-debugging-port=12346', '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
+    [],
+    ['--user-data-dir=/synthetic/upgrade', '--remote-debugging-port=12347', '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
+  ];
+}
+const oneProcessPoll = async predicate => { const value = await predicate(); if (!value) throw new Error('SYNTHETIC_TIMEOUT'); return value; };
+
+test('all four retained launches are discoverable while each lifecycle stage requires its own unique browser', async () => {
+  const vectors = ownedLaunchVectors();
+  for (const separator of ['\0', ' ']) {
+    for (const [index, args] of vectors.entries()) {
+      const value = appProcess(); value.files.environ = '';
+      value.files.cmdline = [value.value.executable, ...args].join(separator) + '\0';
+      const found = await readLinuxFinalKnownAppProcessIdentity(value.pid, value.expected, temporary, vectors, value.io);
+      assert.equal(found.argumentIndex, index); assert.equal(found.identity.pid, value.pid);
+      const find = async (expected, actualTemporary, actualVectors) => {
+        assert.equal(expected, value.expected); assert.equal(actualTemporary, temporary); assert.equal(actualVectors, vectors);
+        return [found];
+      };
+      assert.equal(await currentLinuxFinalApp(value.expected, temporary, args, vectors, { find, waiter: oneProcessPoll }), found.identity);
+      await assert.rejects(currentLinuxFinalApp(value.expected, temporary, vectors[(index + 1) % 4], vectors, { find, waiter: oneProcessPoll }), /SYNTHETIC_TIMEOUT/u);
+      await assert.rejects(currentLinuxFinalApp(value.expected, temporary, args, vectors, {
+        find: async () => [found, { identity: { ...found.identity, pid: 52 }, argumentIndex: (index + 1) % 4 }], waiter: oneProcessPoll,
+      }), /MULTIPLE_APPS/u);
+    }
+  }
+  const unknown = appProcess(); unknown.files.cmdline = `${unknown.value.executable}\0--arbitrary\0`;
+  await assert.rejects(readLinuxFinalKnownAppProcessIdentity(unknown.pid, unknown.expected, temporary, vectors, unknown.io), /PROCESS_LAUNCH_ARGUMENTS_INVALID/u);
+  const mismatch = appProcess(); mismatch.files.cmdline = [mismatch.value.executable, ...vectors[3]].join(' ') + '\0';
+  mismatch.files.environ = 'APPIMAGE=/synthetic/wrong\0';
+  await assert.rejects(readLinuxFinalKnownAppProcessIdentity(mismatch.pid, mismatch.expected, temporary, vectors, mismatch.io), /FUSE_APPIMAGE_ENV_MISMATCH/u);
+  const node = appProcess('node');
+  assert.equal(await readLinuxFinalKnownAppProcessIdentity(node.pid, node.expected, temporary, vectors, node.io), null);
+  for (const invalid of [[], [...vectors, []], [null]]) {
+    await assert.rejects(readLinuxFinalKnownAppProcessIdentity(node.pid, node.expected, temporary, invalid, node.io), /PROCESS_LAUNCH_ARGUMENTS_INVALID/u);
+  }
+});
+
+test('owned shutdown signals authenticated browsers and proves every captured companion gone before mount cleanup', async () => {
+  const vectors = ownedLaunchVectors();
+  for (const args of vectors) {
+    const value = appProcess(); value.files.environ = '';
+    value.files.cmdline = [value.value.executable, ...args].join(' ') + '\0';
+    const { identity } = await readLinuxFinalKnownAppProcessIdentity(value.pid, value.expected, temporary, vectors, value.io);
+    const tree = [identity, { pid: 51, startTime: '101' }], events = [];
+    let exited = false;
+    await stopLinuxFinalOwnedApp(identity, temporary, {
+      readDescendants: async browser => { assert.equal(browser, identity); events.push('capture_tree'); return tree; },
+      readAlive: async browser => { assert.equal(browser, identity); events.push('stable_identity'); return true; },
+      signal: (pid, signal) => { assert.equal(pid, identity.pid); assert.equal(signal, 'SIGUSR2'); events.push('signal'); exited = true; },
+      waitForTreeGone: async captured => {
+        assert.equal(captured, tree); events.push('tree_gone');
+        await assertLinuxFinalProcessTreeGone(captured, { waiter: oneProcessPoll, readAlive: async child => {
+          assert.ok(tree.includes(child)); return !exited;
+        } });
+      },
+      waitForMountsGone: async path => { assert.equal(path, temporary); events.push('mounts_gone'); },
+    });
+    assert.deepEqual(events, ['capture_tree', 'stable_identity', 'signal', 'tree_gone', 'mounts_gone']);
+  }
+  const identity = { pid: 50, startTime: '100' }, tree = [identity, { pid: 51, startTime: '101' }];
+  const events = [];
+  await assert.rejects(stopLinuxFinalOwnedApp(identity, temporary, {
+    readDescendants: async () => tree, readAlive: async () => true,
+    signal: () => { events.push('signal'); },
+    waitForTreeGone: captured => assertLinuxFinalProcessTreeGone(captured, {
+      waiter: oneProcessPoll, readAlive: async child => child.pid === 51,
+    }),
+    waitForMountsGone: async () => { events.push('mounts_gone'); },
+  }), /SYNTHETIC_TIMEOUT/u);
+  assert.deepEqual(events, ['signal']); // A reparented Node companion still blocks cleanup.
+  await stopLinuxFinalOwnedApp(identity, temporary, {
+    readDescendants: async () => tree, readAlive: async () => false,
+    signal: () => assert.fail('A reused or exited PID must never be signalled'),
+    waitForTreeGone: captured => assertLinuxFinalProcessTreeGone(captured, { waiter: oneProcessPoll, readAlive: async () => false }),
+    waitForMountsGone: async () => {},
+  });
 });
 
 test('renderer title parsing cannot hide sandbox bypass flags or ambiguous child roles', () => {
@@ -476,6 +645,8 @@ test('every FUSE predicate remains a distinct closed identity cause through the 
 test('process role, UID, start-time and safe-file failures keep only fixed identity causes after cleanup', async () => {
   for (const [code, alter] of [
     ['PROCESS_ROLE_INVALID', v => { v.files.environ += 'ELECTRON_RUN_AS_NODE=invalid\0'; }],
+    ['PROCESS_LAUNCH_ARGUMENTS_INVALID', v => { v.io.expectedArguments = []; }],
+    ['INSTALLED_BYTES_INVALID', v => { v.io.hash = async path => path === installedImage ? 'c'.repeat(64) : path === v.value.executable ? v.expected.executableSha256 : v.expected.asarSha256; }],
     ['PROCESS_UID_INVALID', v => { v.files.status = 'Uid:\t0\t0\t0\t0\n'; }],
     ['PROCESS_START_TIME_INVALID', v => { v.files.stat = v.files.stat.replace(/100$/u, 'invalid'); }],
   ]) {
