@@ -8,7 +8,7 @@ import { lookup } from 'node:dns/promises';
 import { basename, dirname, join, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
+import { assertContainerContract, isLinuxSandboxEnvironmentClean, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES } from './smoke-electron-linux.mjs';
 import { createLinuxStartupDiagnostics,
   validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
@@ -447,7 +447,7 @@ export async function runLinuxFinalLifecycle() {
   assertLinuxFinalOwnedPolicy({ nonce, name: process.env.TIBOTATTLE_LINUX_FINAL_PROFILE,
     profileText: await readFile('/proc/self/attr/current', 'utf8'), facts: await readLinuxMountRuntimeFacts() });
   if (process.arch !== 'x64' || process.getuid() !== 1000 || process.version !== 'v26.2.0'
-    || process.env.ELECTRON_DISABLE_SANDBOX !== '0' || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
+    || !isLinuxSandboxEnvironmentClean(process.env) || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
     || (await lookup(HOST)).address !== '127.0.0.1'
     || !((await lstat('/dev/fuse')).isCharacterDevice())
     || proveLinuxSecretServiceContainerIsolation().status !== 'isolated') fail('ISOLATION_REQUIRED');

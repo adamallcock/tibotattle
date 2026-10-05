@@ -1144,12 +1144,22 @@ function isLoopbackAddress(value) {
     || (family === 6 && address === "::1");
 }
 
+/** Electron 43.5.0 checks HasVar, not a boolean value; Chromium also tries the
+ * lowercase spelling. Reject own or inherited presence, including false-looking values.
+ * https://github.com/electron/electron/blob/v43.5.0/shell/app/electron_main_delegate.cc */
+export function isLinuxSandboxEnvironmentClean(environment) {
+  return environment !== null && typeof environment === "object" && !Array.isArray(environment)
+    && !("ELECTRON_DISABLE_SANDBOX" in environment)
+    && !("electron_disable_sandbox" in environment);
+}
+
 /**
  * Validate the runtime boundary independently of Docker's command line.
  * `networkInterfacesImpl` is injectable so the contract can prove both the
  * loopback-only and external-interface cases without depending on the host.
  */
 export function assertContainerContract({
+  environment = process.env,
   platform = process.platform,
   architecture = process.arch,
   imagePlatform = process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
@@ -1159,6 +1169,9 @@ export function assertContainerContract({
 } = {}) {
   if (platform !== "linux") {
     fail("Linux smoke must run in a Linux container");
+  }
+  if (!isLinuxSandboxEnvironmentClean(environment)) {
+    fail("Linux smoke requires the Electron sandbox override to be absent");
   }
   if (!Object.hasOwn(PLATFORM_ARCHITECTURES, imagePlatform)
       || PLATFORM_ARCHITECTURES[imagePlatform] !== architecture) {
@@ -2096,6 +2109,7 @@ export async function runSmoke({
     fail("Electron Linux smoke launch configuration is invalid");
   }
   if (!environment || typeof environment !== "object" || Array.isArray(environment)
+      || !isLinuxSandboxEnvironmentClean(environment)
       || !Array.isArray(argumentsForLaunch)
       || argumentsForLaunch.some((value) => typeof value !== "string" || value.length === 0)) {
     await rm(fixture.root, { recursive: true, force: true }).catch(() => {});

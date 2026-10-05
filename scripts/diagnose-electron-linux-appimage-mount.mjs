@@ -8,7 +8,7 @@ import { closeSync, constants, openSync, writeSync } from 'node:fs';
 import { access, chmod, copyFile, lstat, mkdir, open, readdir, realpath } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertContainerContract } from './smoke-electron-linux.mjs';
+import { assertContainerContract, isLinuxSandboxEnvironmentClean } from './smoke-electron-linux.mjs';
 import { createLinuxStartupDiagnostics, validateLinuxStartupDiagnostic, classifyLinuxStartupFuseMount } from './lib/linux-startup-diagnostics.mjs';
 import { acquireLinuxFinalArtifacts, prepareLinuxFinalArtifacts, fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
 import { LINUX_FINAL_CONFIRMATION, LINUX_FINAL_INPUT, exactKeys, preflightLinuxFinalIntake, validateLinuxFinalPair } from './lib/linux-final-artifact-intake.mjs';
@@ -260,7 +260,7 @@ async function waitUntil(predicate, timeout) {
 async function runInside() {
   const contract = assertContainerContract(), role = process.env.TIBOTATTLE_MOUNT_PROBE_ROLE, nonce = process.env.TIBOTATTLE_MOUNT_PROBE_NONCE;
   if (process.arch !== 'x64' || process.getuid() !== 1000 || process.version !== 'v26.2.0'
-    || process.env.ELECTRON_DISABLE_SANDBOX !== '0' || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
+    || !isLinuxSandboxEnvironmentClean(process.env) || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
     || !ROLES.includes(role) || !/^[a-f0-9]{32}$/u.test(nonce ?? '')) fail();
   const execution = await lstat(EXEC);
   if (!execution.isDirectory() || execution.isSymbolicLink() || execution.uid !== 1000
@@ -323,7 +323,7 @@ export function linuxAppImageGateArguments(environment) {
   const nonce = environment.TIBOTATTLE_MOUNT_PROBE_NONCE;
   if (!/^[a-f0-9]{32}$/u.test(nonce ?? '') || environment.TMPDIR !== `${EXEC}/tmp/${nonce}`
     || !['LC_ALL', 'LANG', 'LANGUAGE'].every(key => environment[key] === 'C')
-    || environment.APPIMAGE_EXTRACT_AND_RUN !== undefined || environment.ELECTRON_DISABLE_SANDBOX !== '0') fail();
+    || environment.APPIMAGE_EXTRACT_AND_RUN !== undefined || !isLinuxSandboxEnvironmentClean(environment)) fail();
   return [IMAGE, '--appimage-mount'];
 }
 function runGate() {

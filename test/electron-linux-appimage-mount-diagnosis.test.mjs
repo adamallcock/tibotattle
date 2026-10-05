@@ -120,12 +120,19 @@ test('actor graph bounds and incomplete capture never turn into a complete owner
 
 test('the stopped launcher replaces itself with exactly the unchanged mount-only image and C environment', () => {
   const environment = { TIBOTATTLE_MOUNT_PROBE_NONCE: 'a'.repeat(32), TMPDIR: temporary,
-    LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C', ELECTRON_DISABLE_SANDBOX: '0' };
+    LC_ALL: 'C', LANG: 'C', LANGUAGE: 'C' };
   assert.deepEqual(linuxAppImageGateArguments(environment), [image, '--appimage-mount']);
   for (const change of [{ TMPDIR: '/private/synthetic-other' }, { TIBOTATTLE_MOUNT_PROBE_NONCE: 'b'.repeat(32) },
     { LC_ALL: 'en_US.UTF-8' }, { LANG: 'en_US.UTF-8' }, { LANGUAGE: 'en_US.UTF-8' },
-    { APPIMAGE_EXTRACT_AND_RUN: '1' }, { ELECTRON_DISABLE_SANDBOX: '1' }]) {
+    { APPIMAGE_EXTRACT_AND_RUN: '1' },
+    ...['ELECTRON_DISABLE_SANDBOX', 'electron_disable_sandbox'].flatMap(key => ['0', '1', '', 'false', undefined, null].map(value => ({ [key]: value })))]) {
     assert.throws(() => linuxAppImageGateArguments({ ...environment, ...change }), /^Error: LINUX_MOUNT_DIAGNOSIS_REFUSED$/u);
+  }
+  for (const key of ['ELECTRON_DISABLE_SANDBOX', 'electron_disable_sandbox']) {
+    for (const value of ['0', '1', '', 'false', undefined, null]) {
+      const inherited = Object.assign(Object.create({ [key]: value }), environment);
+      assert.throws(() => linuxAppImageGateArguments(inherited), /^Error: LINUX_MOUNT_DIAGNOSIS_REFUSED$/u);
+    }
   }
 });
 

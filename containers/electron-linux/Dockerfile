@@ -10,8 +10,8 @@ FROM node:26.2.0-bookworm-slim@sha256:445b8cda0ec3563106c5a62b4663b3831314ecc81d
 
 ARG TIBOTATTLE_QUALIFICATION_REVISION
 LABEL org.opencontainers.image.revision="${TIBOTATTLE_QUALIFICATION_REVISION}"
+# Electron checks presence, so even "0" disables its sandbox. Keep the override absent.
 ENV CI=1 \
-    ELECTRON_DISABLE_SANDBOX=0 \
     TIBOTATTLE_IMAGE_SOURCE_REVISION="${TIBOTATTLE_QUALIFICATION_REVISION}" \
     npm_config_update_notifier=false \
     npm_config_fund=false \
