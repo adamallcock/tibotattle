@@ -8,7 +8,7 @@ import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, 
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
   readLinuxFinalAppProcessIdentity, linuxFinalBrowserCommandLineMatches, readLinuxFinalKnownAppProcessIdentity,
-  currentLinuxFinalApp, stopLinuxFinalOwnedApp } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  currentLinuxFinalApp, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
@@ -466,6 +466,133 @@ test('renderer title parsing cannot hide sandbox bypass flags or ambiguous child
     assert.equal(linuxFinalSandboxStatus({ commandLine, executable, status }), false);
   }
 });
+function rendererProbe(children = [{}]) {
+  const browser = { pid: 50, startTime: '100', executable: `${mount}/tibotattle` }, events = [];
+  const renderer = { pid: 51, startTime: '101', executable: browser.executable,
+    commandLine: `${browser.executable}\0--type=renderer\0`, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' };
+  const rows = [ { ...browser, commandLine: `${browser.executable}\0--remote-debugging-port=12345\0`, status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' },
+    ...children.map((value, index) => ({ ...renderer, pid: 51 + index, ...value })) ];
+  const lookup = path => { const [, pid, field] = /^\/proc\/(\d+)\/(status|cmdline|exe)$/u.exec(path); return { row: rows.find(value => value.pid === Number(pid)), field }; };
+  const options = {
+    readDescendants: async identity => { assert.equal(identity, browser); events.push('descendants'); return rows; },
+    read: async path => {
+      const { row, field } = lookup(path); events.push(field);
+      const value = row[field === 'cmdline' ? 'commandLine' : field]; if (value instanceof Error) throw value; return value;
+    },
+    link: async path => { const { row } = lookup(path); events.push('exe'); if (row.executable instanceof Error) throw row.executable; return row.executable; },
+    waiter: async (predicate, timeout) => {
+      assert.equal(timeout, 10000);
+      if (await predicate() !== true) throw Object.assign(new Error('private synthetic timeout'), { code: 'LINUX_REAL_APPIMAGE_TIMEOUT' });
+    },
+  };
+  return { browser, rows, options, events };
+}
+async function expectRendererObservation(value, code) {
+  await assert.rejects(assertLinuxFinalRendererSandbox(value.browser, value.options), error => {
+    const expected = `LINUX_FINAL_LIFECYCLE_RENDERER_SANDBOX_OBSERVED_${code}`;
+    assert.equal(error.code, expected); assert.equal(error.message, expected);
+    assert.deepEqual(Object.keys(error), ['code']);
+    assert.doesNotMatch(JSON.stringify(error), /private|synthetic|\/proc\//u);
+    return true;
+  });
+}
+
+test('renderer diagnostics preserve success while distinguishing each denied, vanished and unavailable proc read', async () => {
+  const success = rendererProbe(); await assertLinuxFinalRendererSandbox(success.browser, success.options);
+  for (const [field, stage] of [['status', 'STATUS'], ['commandLine', 'COMMAND_LINE'], ['executable', 'TITLE_RENDERER_EXECUTABLE']]) {
+    for (const [errno, outcome] of [['ENOENT', 'VANISHED'], ['ESRCH', 'VANISHED'], ['EACCES', 'DENIED'], ['EPERM', 'DENIED'], ['EIO', 'UNAVAILABLE'], ['PRIVATE_UNKNOWN', 'UNAVAILABLE']]) {
+      const failure = Object.assign(new Error('private synthetic detail'), { code: errno, path: '/synthetic/private', pid: 999 });
+      await expectRendererObservation(rendererProbe([{ [field]: failure }]), `${stage}_READ_${outcome}`);
+    }
+  }
+  const noTitle = rendererProbe([{ commandLine: 'unrecognized\0', executable: Object.assign(new Error('private'), { code: 'EACCES' }) }]);
+  await expectRendererObservation(noTitle, 'EXECUTABLE_READ_DENIED');
+});
+
+test('renderer diagnostics distinguish absent candidates, unreadable title, unrelated executable and title-only mismatch', async () => {
+  const exe = `${mount}/tibotattle`;
+  for (const [children, code] of [
+    [[], 'NO_DESCENDANTS'],
+    [[{ commandLine: `${exe}\0--type=utility\0` }], 'ROLE_UNOBSERVED'],
+    [[{ commandLine: `${exe}  --type=renderer\0` }], 'COMMAND_LINE_INVALID'],
+    [[{ commandLine: 'unknown-title\0' }], 'COMMAND_LINE_INVALID'],
+    [[{ commandLine: '/synthetic/other\0', executable: '/synthetic/other' }], 'UNRELATED_EXECUTABLE'],
+    [[{ executable: '/synthetic/other' }], 'TITLE_RENDERER_EXECUTABLE_MISMATCH'],
+  ]) await expectRendererObservation(rendererProbe(children), code);
+});
+
+test('renderer-specific observations separate bypass flags, explicitly refused kernel controls and unknown status', async () => {
+  const exe = `${mount}/tibotattle`;
+  for (const separator of ['\0', ' ']) {
+    const commandLine = [exe, '--type=renderer'].join(separator) + '\0';
+    for (const [change, code] of [
+      [{ commandLine: [exe, '--type=renderer', '--no-sandbox'].join(separator) + '\0' }, 'BYPASS_FLAGS_PRESENT'],
+      [{ commandLine: [exe, '--type=renderer', '--disable-setuid-sandbox=1'].join(separator) + '\0' }, 'BYPASS_FLAGS_PRESENT'],
+      [{ status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' }, 'NO_NEW_PRIVS_DISABLED'],
+      [{ status: 'Seccomp:\t2\n' }, 'NO_NEW_PRIVS_UNKNOWN'],
+      [{ status: 'NoNewPrivs:\tinvalid\nSeccomp:\t2\n' }, 'NO_NEW_PRIVS_UNKNOWN'],
+      [{ status: 'NoNewPrivs:\t0\nNoNewPrivs:\t0\nSeccomp:\t2\n' }, 'NO_NEW_PRIVS_UNKNOWN'],
+      [{ status: 'NoNewPrivs:\t1\nSeccomp:\t0\n' }, 'SECCOMP_NOT_FILTERING'],
+      [{ status: 'NoNewPrivs:\t1\nSeccomp:\t1\n' }, 'SECCOMP_NOT_FILTERING'],
+      [{ status: 'NoNewPrivs:\t1\n' }, 'SECCOMP_UNKNOWN'],
+      [{ status: 'NoNewPrivs:\t1\nSeccomp:\tinvalid\n' }, 'SECCOMP_UNKNOWN'],
+      [{ status: 'NoNewPrivs:\t1\nSeccomp:\t0\nSeccomp:\t1\n' }, 'SECCOMP_UNKNOWN'],
+    ]) await expectRendererObservation(rendererProbe([{ commandLine, ...change }]), code);
+  }
+});
+
+test('renderer observation priority keeps complete child witnesses without combining facts or hiding later success', async () => {
+  const exe = `${mount}/tibotattle`, denied = Object.assign(new Error('private'), { code: 'EACCES' });
+  const blocked = { executable: denied };
+  for (const children of [[blocked, { commandLine: `${exe}\0--type=utility\0` }, { commandLine: 'unknown-title\0' }],
+    [{ commandLine: 'unknown-title\0' }, blocked]]) {
+    await expectRendererObservation(rendererProbe(children), 'TITLE_RENDERER_EXECUTABLE_READ_DENIED');
+  }
+  await expectRendererObservation(rendererProbe([blocked, { status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' }]), 'NO_NEW_PRIVS_DISABLED');
+  await expectRendererObservation(rendererProbe([blocked, { executable: '/synthetic/other' }]), 'TITLE_RENDERER_EXECUTABLE_MIXED');
+  await expectRendererObservation(rendererProbe([{ status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' },
+    { status: 'NoNewPrivs:\t1\nSeccomp:\t0\n' }]), 'SECCOMP_NOT_FILTERING');
+  // No child's complete role/exe/control chain passes; facts cannot be combined.
+  await expectRendererObservation(rendererProbe([{ commandLine: `${exe}\0--type=utility\0` },
+    { status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' }]), 'NO_NEW_PRIVS_DISABLED');
+  await expectRendererObservation(rendererProbe([{ status: 'NoNewPrivs:\t0\nSeccomp:\t2\n' },
+    { status: 'Seccomp:\t2\n' }]), 'NO_NEW_PRIVS_MIXED');
+  const succeeds = rendererProbe([blocked, {}]);
+  await assertLinuxFinalRendererSandbox(succeeds.browser, succeeds.options);
+  const later = rendererProbe([blocked]); let polls = 0;
+  later.options.waiter = async (predicate, timeout) => {
+    assert.equal(timeout, 10000); assert.equal(await predicate(), false); polls++;
+    later.rows[1].executable = exe;
+    assert.equal(await predicate(), true); polls++;
+  };
+  await assertLinuxFinalRendererSandbox(later.browser, later.options); assert.equal(polls, 2);
+});
+
+test('renderer enumeration, timeout and hook diagnostics expose only their exact closed observation contract', async () => {
+  for (const [underlying, expected] of [['LINUX_FINAL_LIFECYCLE_PROCESS_TREE_UNBOUNDED', 'TREE_UNBOUNDED'], ['PRIVATE_UNKNOWN', 'ENUMERATION_FAILED']]) {
+    const value = rendererProbe(); value.options.readDescendants = async () => { throw Object.assign(new Error('private'), { code: underlying }); };
+    await assert.rejects(assertLinuxFinalRendererSandbox(value.browser, value.options), { code: `LINUX_FINAL_LIFECYCLE_RENDERER_${expected}` });
+  }
+  const denied = rendererProbe([{ executable: Object.assign(new Error('private'), { code: 'EACCES' }) }]);
+  const journey = normalJourney();
+  journey.options.assertSandbox = () => assertLinuxFinalRendererSandbox(denied.browser, denied.options);
+  await assert.rejects(runLinuxFinalNormalJourney(journey.options), error => {
+    const code = 'LINUX_FINAL_LIFECYCLE_NORMAL_RENDERER_SANDBOX_OBSERVED_TITLE_RENDERER_EXECUTABLE_READ_DENIED';
+    assert.equal(error.code, code); assert.equal(error.message, code);
+    assert.match(code, /^LINUX_FINAL_LIFECYCLE_[A-Z_]{1,100}$/u);
+    assert.deepEqual(Object.keys(error), ['code']);
+    assert.deepEqual(linuxFinalFailureDetails(error.code, null), { errorCode: code });
+    return true;
+  });
+  assert.deepEqual(journey.events, ['identity', 'cleanup']);
+  for (const code of ['PRIVATE_UNKNOWN', 'LINUX_FINAL_LIFECYCLE_RENDERER_SANDBOX_OBSERVED_PRIVATE_UNKNOWN']) {
+    const probe = rendererProbe(); probe.options.waiter = async () => { throw Object.assign(new Error('private'), { code }); };
+    const value = normalJourney(); value.options.assertSandbox = () => assertLinuxFinalRendererSandbox(probe.browser, probe.options);
+    await assert.rejects(runLinuxFinalNormalJourney(value.options), { code: 'LINUX_FINAL_LIFECYCLE_NORMAL_RENDERER_SANDBOX_FAILED' });
+    assert.deepEqual(value.events, ['identity', 'cleanup']);
+  }
+});
+
 test('manual lifecycle lane preserves byte, network, sandbox, FUSE and publication boundaries', async () => {
   const workflow = await readFile(new URL('../.github/workflows/electron-linux-final-qualification.yml', import.meta.url), 'utf8');
   for (const required of ['workflow_dispatch:', 'fetch-depth: 0', 'persist-credentials: false', 'actions: read',

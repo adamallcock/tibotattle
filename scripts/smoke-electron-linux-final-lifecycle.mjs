@@ -218,21 +218,81 @@ async function descendants(browser) {
   }
   fail('PROCESS_TREE_UNBOUNDED');
 }
-async function assertRendererSandbox(browser) {
-  await wait(async () => {
-    for (const child of await descendants(browser)) {
-      const name = String(child.pid);
-      try {
-        const status = await readFile(`/proc/${name}/status`, 'utf8');
-        const args = await readFile(`/proc/${name}/cmdline`, 'utf8');
-        const executable = await readlink(`/proc/${name}/exe`);
-        if (executable !== browser.executable) continue;
-        if (!linuxFinalSandboxStatus({ commandLine: args, executable, status })) continue;
-        return true;
-      } catch { /* Exited or unrelated. */ }
-    }
-    return false;
-  }, 10000);
+const RENDERER_READ_OUTCOMES = ['VANISHED', 'DENIED', 'UNAVAILABLE'];
+const RENDERER_OBSERVATION_GROUPS = [
+  ['NO_DESCENDANTS'], ['ROLE_UNOBSERVED', 'UNRELATED_EXECUTABLE'],
+  RENDERER_READ_OUTCOMES.map(outcome => `STATUS_READ_${outcome}`),
+  RENDERER_READ_OUTCOMES.map(outcome => `COMMAND_LINE_READ_${outcome}`),
+  [...RENDERER_READ_OUTCOMES.map(outcome => `EXECUTABLE_READ_${outcome}`), 'COMMAND_LINE_INVALID'],
+  [...RENDERER_READ_OUTCOMES.map(outcome => `TITLE_RENDERER_EXECUTABLE_READ_${outcome}`), 'TITLE_RENDERER_EXECUTABLE_MISMATCH'],
+  ['BYPASS_FLAGS_PRESENT'], ['NO_NEW_PRIVS_DISABLED', 'NO_NEW_PRIVS_UNKNOWN'],
+  ['SECCOMP_NOT_FILTERING', 'SECCOMP_UNKNOWN'],
+];
+const RENDERER_MIXED_OBSERVATIONS = ['NO_DESCENDANTS', 'CANDIDATES_UNCONFIRMED', 'STATUS_READ_MIXED',
+  'COMMAND_LINE_READ_MIXED', 'EXECUTABLE_IDENTITY_MIXED', 'TITLE_RENDERER_EXECUTABLE_MIXED',
+  'BYPASS_FLAGS_PRESENT', 'NO_NEW_PRIVS_MIXED', 'SECCOMP_MIXED'];
+const RENDERER_OBSERVATION_PROGRESS = new Map(RENDERER_OBSERVATION_GROUPS.flatMap((codes, progress) => codes.map(code => [code, progress])));
+function rendererReadOutcome(error) {
+  return ['ENOENT', 'ESRCH'].includes(error?.code) ? 'VANISHED'
+    : ['EACCES', 'EPERM'].includes(error?.code) ? 'DENIED' : 'UNAVAILABLE';
+}
+function rendererStatusObservation(status, field, refusedValues) {
+  const values = [...status.matchAll(new RegExp(`^${field}:\\s+([0-9]+)$`, 'gmu'))];
+  return values.length === 1 && refusedValues.includes(values[0][1]);
+}
+/** Diagnostics describe one child's observed progress, not the timeout's cause.
+ * The acceptance predicate and wait remain unchanged. No raw proc data is kept. */
+export async function assertLinuxFinalRendererSandbox(browser, { readDescendants = descendants,
+  read = readFile, link = readlink, waiter = wait } = {}) {
+  let progress = 0, observations = new Set(['NO_DESCENDANTS']);
+  const observe = code => {
+    const next = RENDERER_OBSERVATION_PROGRESS.get(code);
+    if (next > progress) { progress = next; observations = new Set([code]); }
+    else if (next === progress) observations.add(code);
+  };
+  try {
+    await waiter(async () => {
+      let children;
+      try { children = await readDescendants(browser); }
+      catch (error) { fail(error?.code === 'LINUX_FINAL_LIFECYCLE_PROCESS_TREE_UNBOUNDED'
+        ? 'RENDERER_TREE_UNBOUNDED' : 'RENDERER_ENUMERATION_FAILED'); }
+      for (const child of children) {
+        const name = String(child.pid), isDescendant = child.pid !== browser.pid;
+        let readStage = 'STATUS', titleRenderer = false;
+        const note = code => { if (isDescendant) observe(code); };
+        try {
+          const status = await read(`/proc/${name}/status`, 'utf8');
+          readStage = 'COMMAND_LINE';
+          const args = await read(`/proc/${name}/cmdline`, 'utf8');
+          // This is only a title candidate until the exact kernel exe is read.
+          titleRenderer = linuxFinalProcessCommandLineFacts({ commandLine: args, executable: browser.executable })?.role === 'renderer';
+          readStage = 'EXECUTABLE';
+          const executable = await link(`/proc/${name}/exe`);
+          if (executable !== browser.executable) {
+            note(titleRenderer ? 'TITLE_RENDERER_EXECUTABLE_MISMATCH' : 'UNRELATED_EXECUTABLE'); continue;
+          }
+          if (!linuxFinalSandboxStatus({ commandLine: args, executable, status })) {
+            const facts = linuxFinalProcessCommandLineFacts({ commandLine: args, executable });
+            if (facts === null) note('COMMAND_LINE_INVALID');
+            else if (facts.role !== 'renderer') note('ROLE_UNOBSERVED');
+            else if (facts.sandboxBypass) note('BYPASS_FLAGS_PRESENT');
+            else if (!/^NoNewPrivs:\s+1$/mu.test(status)) note(rendererStatusObservation(status, 'NoNewPrivs', ['0'])
+              ? 'NO_NEW_PRIVS_DISABLED' : 'NO_NEW_PRIVS_UNKNOWN');
+            else note(rendererStatusObservation(status, 'Seccomp', ['0', '1']) ? 'SECCOMP_NOT_FILTERING' : 'SECCOMP_UNKNOWN');
+            continue;
+          }
+          return true;
+        } catch (error) {
+          note(`${titleRenderer && readStage === 'EXECUTABLE' ? 'TITLE_RENDERER_' : ''}${readStage}_READ_${rendererReadOutcome(error)}`);
+        }
+      }
+      return false;
+    }, 10000);
+  } catch (error) {
+    if (error?.code !== 'LINUX_REAL_APPIMAGE_TIMEOUT') throw error;
+    const observation = observations.size === 1 ? [...observations][0] : RENDERER_MIXED_OBSERVATIONS[progress];
+    fail(`RENDERER_SANDBOX_OBSERVED_${observation}`);
+  }
 }
 export async function assertLinuxFinalProcessTreeGone(identities, { readAlive = alive, waiter = wait } = {}) {
   if (!Array.isArray(identities) || identities.length < 1 || identities.length > 1024
@@ -342,6 +402,11 @@ const IDENTITY_HOOK_FAILURES = new Map([
   'FILE_UNSAFE', 'FILE_CHANGED', 'PROCESS_LAUNCH_ARGUMENTS_INVALID', 'INSTALLED_BYTES_INVALID',
 ].map(code => [`LINUX_FINAL_LIFECYCLE_${code}`, `NORMAL_APP_IDENTITY_${code}`]));
 IDENTITY_HOOK_FAILURES.set('LINUX_REAL_APPIMAGE_TIMEOUT', 'NORMAL_APP_IDENTITY_TIMEOUT');
+const SANDBOX_HOOK_FAILURES = new Map([...new Set([...RENDERER_OBSERVATION_PROGRESS.keys(), ...RENDERER_MIXED_OBSERVATIONS])]
+  .map(code => [`LINUX_FINAL_LIFECYCLE_RENDERER_SANDBOX_OBSERVED_${code}`, `NORMAL_RENDERER_SANDBOX_OBSERVED_${code}`]));
+for (const code of ['ENUMERATION_FAILED', 'TREE_UNBOUNDED']) {
+  SANDBOX_HOOK_FAILURES.set(`LINUX_FINAL_LIFECYCLE_RENDERER_${code}`, `NORMAL_RENDERER_SANDBOX_${code}`);
+}
 export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSandbox, preferences, noUpdate, preserveState = null }) {
   if (![run, readIdentity, assertSandbox, preferences, noUpdate].every(value => typeof value === 'function')
     || preserveState !== null && typeof preserveState !== 'function') fail('NORMAL_HOOK_INVALID');
@@ -350,7 +415,8 @@ export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSand
     try { return await action(); }
     catch (error) {
       // Never retain arbitrary error codes, messages, paths or other properties.
-      hookFailure = code === 'NORMAL_APP_IDENTITY_FAILED' ? IDENTITY_HOOK_FAILURES.get(error?.code) ?? code : code;
+      hookFailure = code === 'NORMAL_APP_IDENTITY_FAILED' ? IDENTITY_HOOK_FAILURES.get(error?.code) ?? code
+        : code === 'NORMAL_RENDERER_SANDBOX_FAILED' ? SANDBOX_HOOK_FAILURES.get(error?.code) ?? code : code;
       fail(hookFailure);
     }
   };
@@ -456,7 +522,7 @@ export async function runLinuxFinalLifecycle() {
           const browser = await currentLinuxFinalApp(pair.images.next, temporary, launch.args, argumentVectors);
           verifiedApps.push(browser); return browser;
         },
-        assertSandbox: assertRendererSandbox, preferences,
+        assertSandbox: assertLinuxFinalRendererSandbox, preferences,
         noUpdate: context => proveNoUpdate(context.cdp, context.dashboardOrigin, launch.port), preserveState,
       });
     };
@@ -482,7 +548,7 @@ export async function runLinuxFinalLifecycle() {
     dashboard = await connectUpdaterPage(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
     await wait(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
     const previous = await currentLinuxFinalApp(pair.images.current, temporary, predecessorArguments, argumentVectors);
-    verifiedApps.push(previous); await assertRendererSandbox(previous);
+    verifiedApps.push(previous); await assertLinuxFinalRendererSandbox(previous);
     await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
     await persistLinuxNormalPackagedRestartPreferences({ cdp: dashboard });
     // Ordinary startup refresh must have reached the persisted keyed observation.
@@ -535,7 +601,7 @@ export async function runLinuxFinalLifecycle() {
     if (successor.pid === previous.pid && successor.startTime === previous.startTime) fail('RESTART_IDENTITY_INVALID');
     await wait(() => updaterProcessHealth(successor.pid), 60000);
     await assertLinuxFinalProcessTreeGone(previousTree);
-    await assertRendererSandbox(successor);
+    await assertLinuxFinalRendererSandbox(successor);
     if (await digest(rawFixture) !== rawBefore) fail('SOURCE_STATE_CHANGED');
     const persisted = JSON.parse(await readFile(join(upgradeFixture.userData, 'desktop-settings/desktop-settings-v1.json'), 'utf8'));
     if ((persisted.settings ?? persisted).refreshIntervalSeconds !== 900) fail('SETTINGS_NOT_PRESERVED');
