@@ -284,6 +284,11 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
     operations: Object.freeze(["drop"]),
     reason: "the only DROP is DROP DEFAULT on the manifest_version columns this migration adds to the seven stamped analytics_v2 tables (the default stamps rows written before it as manifest 1 without an UPDATE, so 0059's forward-only trigger never fires); it also adds the append-only analytics_v2_kernels table, nullable kernel_id and compatibility and exclusions digest columns, and NOT VALID checks that leave earlier rows unattributed, and it aborts with nothing changed unless every stored run is mode full. After it every insert or update of a stamped row must name kernel_id and manifest_version. The only writer of those tables is the analytics refresh Job's single write transaction (src/analytics-v2/store.ts); a previous image's refresh run between migrate and roll omits both, is refused by the manifest_version NOT NULL (or the kernel check) and rolls back with nothing written, and the next run of the rolled image writes. The origin, the admin preview, the ops probe and the interim public read loader only read these tables, by named columns. On production, staging and scratch targets the whole tail including this migration lands in the first migrate onto an empty schema; a previous revision behind an exact-history receipt fence still refuses the migrated schema until the roll (module header)",
   }),
+  "0075_github_distribution_manifest_visibility.sql": Object.freeze({
+    sha256: "cd275a68f686c0b369a8919d45cddc2083cf7b617bbd18ac5b883f25b8df9ddd",
+    operations: Object.freeze(["drop"]),
+    reason: "drops only 0022's release observed_at foreign key to the completed distribution manifest; the maintained source writes retained releases and assets before inserting that manifest last, and all dashboard readers select dates through completed manifests. No rows, primary keys or asset-to-release foreign key change. A previous revision behind the exact-history receipt fence refuses storage-gated routes after migration until the matching image rolls",
+  }),
 });
 
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;
