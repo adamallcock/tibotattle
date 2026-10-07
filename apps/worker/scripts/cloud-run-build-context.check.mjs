@@ -19,7 +19,7 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     assert.equal(generated.status, 0, generated.stderr);
     const receipt = JSON.parse(generated.stdout);
     assert.equal(receipt.mode, "create");
-    assert.equal(receipt.primaryMigrations, 74);
+    assert.equal(receipt.primaryMigrations, 75);
     const runtime = ["analytics-refresh-profile.mjs", "analytics-refresh-worker-profile.mjs", "analytics-refresh-allocation-profile.mjs", "analytics-refresh-memory-profile.mjs"];
     for (const name of runtime) assert.deepEqual(await readFile(join(cloud, name)), await readFile(join(WORKER, "cloud-run", name)), name);
     const fixtures = ["analytics-refresh-profile.check.mjs", "analytics-refresh-worker-profile.check.mjs", "analytics-refresh-allocation-profile.check.mjs",
@@ -51,8 +51,8 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     const migrations = await benchmark.readPostgresCommunityGraphBenchmarkMigrations({
       readMigrations: ({ role }) => readPostgresMigrations({ role, rootDirectory: join(output, "apps/worker/postgres/migrations") }),
     });
-    assert.equal(migrations.length, 74);
-    assert.equal(migrations.at(-1).name, "0074_analytics_v2_pricing_classes.sql");
+    assert.equal(migrations.length, 75);
+    assert.equal(migrations.at(-1).name, "0075_github_distribution_manifest_visibility.sql");
     console.log(JSON.stringify({ contextFiles: receipt.fileCount, sourceContentDigest: receipt.sourceContentDigest,
       runtimeProfilerFiles: runtime.length, excludedProfilerFixtures: fixtures.length, builtEntries: entries.length,
       diagnosticCloudRefusal: true, actualContextBuild: true }));
