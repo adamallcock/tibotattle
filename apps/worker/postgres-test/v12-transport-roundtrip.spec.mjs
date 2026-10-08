@@ -757,7 +757,7 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
   }
 });
 
-test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict desktop client", {
+test("PostgreSQL v1.2 reconciles imported staged replays for the strict desktop client through integrity checks", {
   skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
   timeout: 60_000,
 }, async () => {
@@ -777,6 +777,8 @@ test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict deskt
       server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom", logLevel: "silent" });
     const modules = {
       ...await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
+      ...await vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
+      ...await vite.ssrLoadModule("/src/crypto.ts"),
       ...await vite.ssrLoadModule("/src/constants.ts"),
     };
     const nowEpoch = Date.now();
@@ -802,13 +804,13 @@ test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict deskt
     const calls = [];
     // Capabilities and activation are synthetic fixtures; manifest registration
     // is the real PostgreSQL transaction and the client retains every validator.
-    const result = await runTelemetryV12Sync({
+    const sync = (dayPrepared) => runTelemetryV12Sync({
       serverBaseUrl: origin, deviceAuthorization: owner.authorization,
       authorization: { schemaVersion: "accountless-upload-owner-v1.2",
         policyVersion: "accountless-telemetry-v1.2-policy-v1", authorizationBasis: "accountless-policy-v1.2",
         telemetrySchemaVersion: "telemetry-contribution-v1.2" },
-      laboratory: true, days: [DAY], readDay: () => prepared, clock: () => nowEpoch,
-      createEnvelope: () => assert.fail("empty days never create an envelope"),
+      laboratory: true, days: [DAY], readDay: () => dayPrepared, clock: () => nowEpoch,
+      createEnvelope: () => assert.fail("complete imported days never create an envelope"),
       fetchImpl: async (url, init) => {
         const path = new URL(url).pathname;
         calls.push(path);
@@ -825,10 +827,20 @@ test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict deskt
           legacyFingerprint: "b".repeat(64), fromDay: DAY, throughDay: DAY,
           expiresAt: new Date(nowEpoch + 3_600_000).toISOString(),
         };
-        else if (path.endsWith("/day-manifests")) value = {
-          ...await modules.registerPostgresTypedV12DayManifest(pool, owner.principal, JSON.parse(init.body), nowEpoch, options),
-          stagedChunks: [],
-        };
+        else if (path.endsWith("/day-manifests")) {
+          let candidate;
+          try {
+            candidate = await modules.registerPostgresTypedV12DayManifest(
+              pool, owner.principal, JSON.parse(init.body), nowEpoch, options);
+          } catch (error) {
+            assert.ok(Number.isSafeInteger(error.status) && typeof error.code === "string");
+            return Response.json({ error: { code: error.code, requestId: randomUUID() } },
+              { status: error.status, headers: { "cache-control": "no-store" } });
+          }
+          const vector = await pool.query(`SELECT chunk_id AS "chunkId", chunk_digest AS "chunkDigest", record_count AS "recordCount"
+            FROM ${q(schema, "telemetry_v12_chunks")} WHERE manifest_id=$1 ORDER BY stream, chunk_seq`, [candidate.manifestId]);
+          value = { ...candidate, stagedChunks: vector.rows };
+        }
         else if (path.endsWith("/domain-activate")) value = {
           schemaVersion: "telemetry-domain-activation-v1.2", generationId: randomUUID(),
           manifestDigest: JSON.parse(init.body).manifestDigest, fromDay: DAY, throughDay: DAY, replay: false,
@@ -837,6 +849,7 @@ test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict deskt
         return Response.json(value, { status: 201, headers: { "cache-control": "no-store" } });
       },
     });
+    const result = await sync(prepared);
     assert.equal(result.status, "complete", JSON.stringify(result.failure));
     assert.equal(calls.at(-1), "/api/v1/me/telemetry-v12/domain-activate");
     const ready = await stored(importedId);
@@ -867,6 +880,135 @@ test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict deskt
       { participantId: owner.principal.participantId, deviceId: other.principal.deviceId }, prepared.manifest, nowEpoch, options),
     { code: "DEVICE_AUTH_INVALID" });
     assert.deepEqual(await stored(foreignId), { state: "staged", ready_at: null });
+
+    // Model the normalized transfer representation: admit a valid source day,
+    // then copy its typed parent/child into an independently staged candidate
+    // through live guards. No trigger disabling or ready-to-staged downgrade.
+    const digest = (value) => createHash("sha256").update(value).digest("hex");
+    function usageDay(parserVersion) {
+      const records = [usageRecord(`event:v2:${"d".repeat(64)}`, `${DAY}T12:05:00.000Z`)];
+      const chunkDigest = digest(canonicalTelemetryV12Json(records));
+      const manifest = { ...prepared.manifest, parserVersion,
+        chunks: [{ chunkId: `usage:${DAY}:0`, chunkDigest, recordCount: 1 }] };
+      manifest.manifestDigest = digest(telemetryV12DayManifestDigestInput(manifest));
+      return { manifest, chunks: [{ schemaVersion: "telemetry-contribution-v1.2", manifestDigest: manifest.manifestDigest,
+        chunkId: `usage:${DAY}:0`, chunkRevision: 1, chunkDigest, parserVersion,
+        consent: manifest.consent, records }] };
+    }
+    async function chunkAuthority() {
+      const grant = await seedUploadGrant({ pool, schema, device: owner, nowEpoch, modules });
+      const claim = await modules.claimPostgresDeviceUploadAuthorization(pool, grant.authorization, {
+        envelopeDigest: grant.envelopeDigest, bodyBytes: grant.bodyBytes, contentType: "application/json",
+      }, { ...options, nowEpoch, accountlessAuthorizationVersion: "v1.2" });
+      const metadata = { chunkRowId: `chunk:${randomUUID()}`, r2Key: `synthetic/replay-${randomUUID()}`,
+        envelopeDigest: grant.envelopeDigest, deviceUploadAuthorizationId: claim.authorizationId };
+      await pool.query(`INSERT INTO ${q(schema, "pending_objects")} (contribution_id, object_key, object_kind)
+        VALUES ($1,$2,'telemetry_v12')`, [metadata.chunkRowId, metadata.r2Key]);
+      return metadata;
+    }
+    const source = usageDay("synthetic-admitted-replay-source");
+    await modules.registerPostgresTypedV12DayManifest(pool, owner.principal, source.manifest, nowEpoch, options);
+    const sourceMetadata = await chunkAuthority();
+    await modules.persistPostgresTypedV12StagedChunk(pool, owner.principal, source.chunks[0], sourceMetadata, nowEpoch, options);
+    const sourceRecordId = (await pool.query(`SELECT id FROM ${q(schema, "telemetry_v12_typed_records")}
+      WHERE chunk_id=$1`, [sourceMetadata.chunkRowId])).rows[0].id;
+    async function completeStaged(label, { chunkId, chunkDigest, copyParent = true, copyChild = true,
+      canonicalDigest = null, recordIndex = 0, canonical = null, storedExpectedChunks = null, storedParser = null,
+      rawRecord = false } = {}) {
+      const dayPrepared = usageDay(`synthetic-complete-replay-${label}`);
+      const manifestId = await imported(dayPrepared.manifest, owner, canonical ?? canonicalTelemetryV12Json(dayPrepared.manifest));
+      const metadata = await chunkAuthority();
+      await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_chunks")} (
+        id, manifest_id, participant_id, device_id, stream, chunk_day, chunk_seq, chunk_id,
+        chunk_digest, envelope_digest, parser_version, record_count, r2_key, device_upload_authorization_id, created_at
+      ) VALUES ($1,$2,$3,$4,'usage',$5,$6,$7,$8,$9,$10,1,$11,$12,$13)`,
+      [metadata.chunkRowId, manifestId, owner.principal.participantId, owner.principal.deviceId, DAY,
+        chunkId ? 1 : 0, chunkId ?? dayPrepared.chunks[0].chunkId, chunkDigest ?? dayPrepared.chunks[0].chunkDigest,
+        metadata.envelopeDigest, dayPrepared.manifest.parserVersion, metadata.r2Key,
+        metadata.deviceUploadAuthorizationId, new Date(nowEpoch).toISOString()]);
+      if (copyParent) {
+        const recordId = (await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_typed_records")} (
+          chunk_id, manifest_id, stream, record_index, occurrence_id, observed_at_ms, observed_day, provider_id, canonical_digest
+        ) SELECT $1,$2,stream,$3,occurrence_id,observed_at_ms,observed_day,provider_id,COALESCE($4::bytea,canonical_digest)
+          FROM ${q(schema, "telemetry_v12_typed_records")} WHERE id=$5 RETURNING id`,
+        [metadata.chunkRowId, manifestId, recordIndex, canonicalDigest, sourceRecordId])).rows[0].id;
+        if (copyChild) await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_typed_usage")} (
+          record_id, session_id, model_id, speed_mode_id, api_service_tier_id, surface_id, billing_surface_id,
+          reasoning_effort_id, agent_scope_id, outcome_id, attribution_id, total_input_context_tokens,
+          input_uncached_tokens, input_cache_read_tokens, input_cache_write_tokens, output_text_tokens,
+          output_reasoning_tokens, output_combined_tokens, boundary_flags, tie_order,
+          cache_write_ttl_five_minute_tokens, cache_write_ttl_one_hour_tokens
+        ) SELECT $1,session_id,model_id,speed_mode_id,api_service_tier_id,surface_id,billing_surface_id,
+          reasoning_effort_id,agent_scope_id,outcome_id,attribution_id,total_input_context_tokens,
+          input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,output_text_tokens,
+          output_reasoning_tokens,output_combined_tokens,boundary_flags,tie_order,
+          cache_write_ttl_five_minute_tokens,cache_write_ttl_one_hour_tokens
+          FROM ${q(schema, "telemetry_v12_typed_usage")} WHERE record_id=$2`, [recordId, sourceRecordId]);
+      }
+      if (storedExpectedChunks !== null || storedParser !== null) await pool.query(
+        `UPDATE ${q(schema, "telemetry_v12_day_manifests")}
+          SET expected_chunk_count=COALESCE($2,expected_chunk_count), parser_version=COALESCE($3,parser_version)
+          WHERE id=$1`, [manifestId, storedExpectedChunks, storedParser]);
+      if (rawRecord) await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_records")} (
+        chunk_id, manifest_id, stream, occurrence_id, observed_at, record_json
+      ) VALUES ($1,$2,'usage',$3,$4,$5)`, [metadata.chunkRowId, manifestId, source.chunks[0].records[0].eventId,
+        source.chunks[0].records[0].eventTime, canonicalTelemetryV12Json(source.chunks[0].records[0])]);
+      return { ...dayPrepared, manifestId };
+    }
+    const complete = await completeStaged("valid");
+    const counts = async () => (await pool.query(`SELECT
+      (SELECT count(*) FROM ${q(schema, "telemetry_v12_day_manifests")}) AS manifests,
+      (SELECT count(*) FROM ${q(schema, "telemetry_v12_chunks")}) AS chunks,
+      (SELECT count(*) FROM ${q(schema, "telemetry_v12_typed_records")}) AS records`)).rows[0];
+    const beforeCounts = await counts();
+    const createdAt = (await pool.query(`SELECT created_at FROM ${q(schema, "telemetry_v12_day_manifests")} WHERE id=$1`,
+      [complete.manifestId])).rows[0].created_at;
+    const completeResult = await sync({ manifest: complete.manifest, chunks: complete.chunks });
+    assert.equal(completeResult.status, "complete", JSON.stringify(completeResult.failure));
+    const completeReady = await stored(complete.manifestId);
+    assert.equal(completeReady.state, "ready");
+    assert.equal(completeReady.ready_at.toISOString(), new Date(nowEpoch).toISOString());
+    assert.deepEqual(await counts(), beforeCounts, "reconciliation changes state only");
+    assert.deepEqual((await pool.query(`SELECT created_at FROM ${q(schema, "telemetry_v12_day_manifests")} WHERE id=$1`,
+      [complete.manifestId])).rows[0].created_at, createdAt);
+    const completeReplays = await Promise.all([1, 2].map((offset) => modules.registerPostgresTypedV12DayManifest(
+      pool, owner.principal, complete.manifest, nowEpoch + offset, options)));
+    assert.ok(completeReplays.every((candidate) => candidate.manifestId === complete.manifestId && candidate.state === "ready"));
+    assert.deepEqual(await stored(complete.manifestId), completeReady);
+
+    for (const [label, changes, code] of [
+      ["membership", { chunkId: `usage:${DAY}:1` }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["chunk-digest", { chunkDigest: "e".repeat(64) }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["record-digest", { canonicalDigest: Buffer.from("f".repeat(64), "hex") }, "BACKEND_STORAGE_UNAVAILABLE"],
+      ["record-index", { recordIndex: 1 }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["missing-child", { copyChild: false }, "BACKEND_STORAGE_UNAVAILABLE"],
+      ["missing-record", { copyParent: false }, "TELEMETRY_MANIFEST_INCOMPLETE"],
+      ["stored-count", { storedExpectedChunks: 2 }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["stored-parser", { storedParser: "synthetic-mismatched-parser" }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["stored-canonical", { canonical: canonicalTelemetryV12Json(prepared.manifest) }, "TELEMETRY_MANIFEST_CONFLICT"],
+      ["raw-only", { copyParent: false, rawRecord: true }, "TELEMETRY_MANIFEST_INCOMPLETE"],
+      ["mixed-storage", { rawRecord: true }, "TELEMETRY_MANIFEST_CONFLICT"],
+    ]) {
+      const rejected = await completeStaged(label, changes);
+      await assert.rejects(modules.registerPostgresTypedV12DayManifest(
+        pool, owner.principal, rejected.manifest, nowEpoch, options), { code });
+      assert.deepEqual(await stored(rejected.manifestId), { state: "staged", ready_at: null }, label);
+      if (label === "missing-record" || label === "raw-only") {
+        const refused = await sync({ manifest: rejected.manifest, chunks: rejected.chunks });
+        assert.equal(refused.status, "failed");
+        assert.deepEqual({ code: refused.failure.code, retryable: refused.failure.retryable },
+          { code: "revision_conflict", retryable: true });
+        assert.deepEqual(await stored(rejected.manifestId), { state: "staged", ready_at: null });
+      }
+    }
+    const unowned = await completeStaged("authority-refused");
+    await assert.rejects(modules.registerPostgresTypedV12DayManifest(pool, owner.principal,
+      { ...unowned.manifest, manifestDigest: "0".repeat(64) }, nowEpoch, options), { code: "CHUNK_DIGEST_MISMATCH" });
+    assert.deepEqual(await stored(unowned.manifestId), { state: "staged", ready_at: null });
+    await assert.rejects(modules.registerPostgresTypedV12DayManifest(pool,
+      { participantId: other.principal.participantId, deviceId: owner.principal.deviceId }, unowned.manifest, nowEpoch, options),
+    { code: "DEVICE_AUTH_INVALID" });
+    assert.deepEqual(await stored(unowned.manifestId), { state: "staged", ready_at: null });
   } finally {
     if (created) await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
     await pool.end();

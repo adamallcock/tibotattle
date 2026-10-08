@@ -397,19 +397,34 @@ export async function registerPostgresTypedV12DayManifest(
     return await withPostgresMutation(pool, async (client) => {
       await assertWriteAllowed(client, schema, principal, now);
       async function registeredCandidate(row: ManifestRow): Promise<PostgresTypedV12DayCandidate> {
-        if (row.manifest_json !== canonical) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
-        // Imported staged empty days and insertion-race replays are complete
-        // too. Reconcile the locked stored row, never just a proposed insert id.
-        if (manifest.chunks.length === 0 && row.expected_chunk_count === 0 && row.state === "staged") {
-          const promoted = await client.query<ManifestRow>(
-            `UPDATE ${table(schema, "telemetry_v12_day_manifests")}
-                SET state = 'ready', ready_at = $2
-              WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0
-              RETURNING id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at`,
-            [row.id, now],
+        if (row.manifest_json !== canonical || row.parser_version !== manifest.parserVersion
+            || integer(row.expected_chunk_count, 0, MAX_TELEMETRY_V12_DAY_CHUNKS) !== manifest.chunks.length) {
+          throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+        }
+        // Imported staged candidates can already hold their complete typed
+        // record vector. Use the admission integrity checks and ready trigger;
+        // matching chunk counts alone never justify a ready receipt.
+        if (row.state === "staged") {
+          await readyManifestIfComplete(client, schema, row, now);
+          const reconciled = await client.query<ManifestRow & { stored_chunk_count: number | string }>(
+            `SELECT id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at,
+                    (SELECT count(*) FROM ${table(schema, "telemetry_v12_chunks")} WHERE manifest_id = $1) AS stored_chunk_count
+               FROM ${table(schema, "telemetry_v12_day_manifests")}
+              WHERE id = $1 AND participant_id = $2 AND device_id = $3
+              FOR UPDATE`,
+            [row.id, principal.participantId, principal.deviceId],
           );
-          if (!promoted.rows[0]) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-          return manifestCandidate(promoted.rows[0]);
+          if (!reconciled.rows[0] || reconciled.rows[0].manifest_json !== canonical) {
+            throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+          }
+          // A full vector with unproven records must be a retryable refusal,
+          // never a successful staged/full receipt the strict client rejects.
+          if (reconciled.rows[0].state === "staged"
+              && integer(reconciled.rows[0].stored_chunk_count, 0, MAX_TELEMETRY_V12_DAY_CHUNKS)
+                >= row.expected_chunk_count) {
+            throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+          }
+          return manifestCandidate(reconciled.rows[0]);
         }
         return manifestCandidate(row);
       }
