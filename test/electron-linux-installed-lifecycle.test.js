@@ -866,12 +866,11 @@ test('predecessor connection, evaluation and readiness timeout failures expose o
   }
 });
 
-test('predecessor readiness keeps exact CDP failure classes fatal without retaining arbitrary error data', async () => {
+test('predecessor readiness keeps other exact CDP failure classes fatal without retaining arbitrary error data', async () => {
   const recognized = [
     ['CDP Runtime.evaluate timed out', 'CDP_TIMEOUT'],
     ['renderer evaluation failed', 'EVALUATION_FAILED'],
     ['CDP connection closed', 'CONNECTION_CLOSED'],
-    ['Cannot find default execution context', 'DEFAULT_CONTEXT_MISSING'],
     ['Cannot find context with specified id', 'CONTEXT_MISSING'],
     ['Execution context was destroyed.', 'CONTEXT_DESTROYED'],
     ['Inspected target navigated or closed', 'TARGET_CHANGED_OR_CLOSED'],
@@ -901,6 +900,70 @@ test('predecessor readiness keeps exact CDP failure classes fatal without retain
     });
     assert.equal(calls, 1, 'recognized context loss and all other failures remain fatal');
     assert.equal(closes, 0, 'the caller retains cleanup ownership');
+  }
+});
+
+test('initial missing default context and false readiness use the original polling interval until actual readiness', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 0 });
+  const calls = []; let completed = false, closes = 0;
+  const dashboard = { evaluate: async expression => {
+    assert.equal(expression, "document.documentElement?.dataset?.localDashboardReady === 'true'");
+    calls.push(Date.now());
+    if (calls.length === 1) throw new Error('Cannot find default execution context');
+    return calls.length === 3;
+  }, close: () => { closes++; } };
+  const pending = waitForLinuxFinalPredecessorDashboard(dashboard).then(value => { completed = true; return value; });
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, [0]); assert.equal(completed, false);
+  t.mock.timers.tick(199); await new Promise(setImmediate);
+  assert.deepEqual(calls, [0]); assert.equal(completed, false);
+  t.mock.timers.tick(1); await new Promise(setImmediate);
+  assert.deepEqual(calls, [0, 200]); assert.equal(completed, false);
+  t.mock.timers.tick(200);
+  assert.equal(await pending, true);
+  assert.deepEqual(calls, [0, 200, 400]); assert.equal(closes, 0);
+});
+
+test('a continuously missing default context fails at the unchanged original readiness deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 0 });
+  let calls = 0, closes = 0;
+  const dashboard = { evaluate: async () => {
+    calls++; throw new Error('Cannot find default execution context');
+  }, close: () => { closes++; } };
+  const pending = assert.rejects(waitForLinuxFinalPredecessorDashboard(dashboard), error => {
+    const code = 'LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_READY_POLL_TIMEOUT';
+    assert.equal(error.code, code); assert.equal(error.message, code);
+    assert.deepEqual(Object.keys(error), ['code']); assert.equal(error.cause, undefined);
+    assert.deepEqual(linuxFinalFailureDetails(error.code, null), { errorCode: code });
+    return true;
+  });
+  for (let poll = 0; poll < 300; poll++) {
+    await new Promise(setImmediate);
+    assert.equal(calls, poll + 1);
+    t.mock.timers.tick(200);
+  }
+  await pending;
+  assert.equal(Date.now(), 60000); assert.equal(calls, 300); assert.equal(closes, 0);
+});
+
+test('default-context near matches and malformed or coded errors remain fatal without a second poll', async () => {
+  const message = 'Cannot find default execution context';
+  for (const error of [new Error(`${message}.`), new Error(`${message} private detail`), new Error(` ${message}`),
+    new Error(message.toUpperCase()), { message }, message, null, undefined,
+    Object.assign(new Error(message), { code: 'ECONNRESET', privateField: 'PRIVATE_DETAIL' }),
+    Object.assign(new Error(message), { name: 'InvalidStateError', privateField: 'PRIVATE_DETAIL' })]) {
+    let calls = 0;
+    await assert.rejects(waitForLinuxFinalPredecessorDashboard({ evaluate: async () => { calls++; throw error; } }, {
+      waiter: predicate => predicate(),
+    }), failure => {
+      const code = error?.message === message ? 'LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_READY_DEFAULT_CONTEXT_MISSING'
+        : 'LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_READY_FAILED';
+      assert.equal(failure.code, code); assert.equal(failure.message, code);
+      assert.deepEqual(Object.keys(failure), ['code']); assert.equal(failure.cause, undefined);
+      assert.doesNotMatch(JSON.stringify(failure), /ECONNRESET|PRIVATE_DETAIL|private detail|InvalidStateError/u);
+      return true;
+    });
+    assert.equal(calls, 1);
   }
 });
 

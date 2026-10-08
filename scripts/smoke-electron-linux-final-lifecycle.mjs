@@ -400,9 +400,19 @@ export async function connectLinuxFinalPredecessorDashboard(port, { connect = co
   catch { fail('PREDECESSOR_DASHBOARD_CONNECT_FAILED'); }
 }
 export async function waitForLinuxFinalPredecessorDashboard(dashboard, { waiter = wait } = {}) {
-  try { return await waiter(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'")); }
+  try { return await waiter(async () => {
+    try { return await dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"); }
+    catch (error) {
+      // CDP can expose the page before V8 has its default context. Only this
+      // observed initialization response means not ready yet; the same waiter
+      // retains its original deadline and polling interval.
+      if (error instanceof Error && error.name === 'Error' && error.code === undefined
+        && error.message === 'Cannot find default execution context') return false;
+      throw error;
+    }
+  }); }
   catch (error) {
-    // These are diagnostic distinctions only: every failure remains fatal.
+    // All errors escaping the readiness predicate remain fatal.
     // waitFor (real-appimage-updater) and connectCdp (smoke-electron-linux)
     // supply the fixed local errors; V8 Inspector supplies the context errors
     // and Chromium DevToolsSession supplies the target-change error.
