@@ -401,7 +401,23 @@ export async function connectLinuxFinalPredecessorDashboard(port, { connect = co
 }
 export async function waitForLinuxFinalPredecessorDashboard(dashboard, { waiter = wait } = {}) {
   try { return await waiter(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'")); }
-  catch { fail('PREDECESSOR_DASHBOARD_READY_FAILED'); }
+  catch (error) {
+    // These are diagnostic distinctions only: every failure remains fatal.
+    // waitFor (real-appimage-updater) and connectCdp (smoke-electron-linux)
+    // supply the fixed local errors; V8 Inspector supplies the context errors
+    // and Chromium DevToolsSession supplies the target-change error.
+    if (error?.code === 'LINUX_REAL_APPIMAGE_TIMEOUT') fail('PREDECESSOR_DASHBOARD_READY_POLL_TIMEOUT');
+    switch (error?.message) {
+      case 'CDP Runtime.evaluate timed out': fail('PREDECESSOR_DASHBOARD_READY_CDP_TIMEOUT'); break;
+      case 'renderer evaluation failed': fail('PREDECESSOR_DASHBOARD_READY_EVALUATION_FAILED'); break;
+      case 'CDP connection closed': fail('PREDECESSOR_DASHBOARD_READY_CONNECTION_CLOSED'); break;
+      case 'Cannot find default execution context': fail('PREDECESSOR_DASHBOARD_READY_DEFAULT_CONTEXT_MISSING'); break;
+      case 'Cannot find context with specified id': fail('PREDECESSOR_DASHBOARD_READY_CONTEXT_MISSING'); break;
+      case 'Execution context was destroyed.': fail('PREDECESSOR_DASHBOARD_READY_CONTEXT_DESTROYED'); break;
+      case 'Inspected target navigated or closed': fail('PREDECESSOR_DASHBOARD_READY_TARGET_CHANGED_OR_CLOSED'); break;
+      default: fail('PREDECESSOR_DASHBOARD_READY_FAILED');
+    }
+  }
 }
 /** Preserve only the maintained smoke-stage code and closed startup evidence. */
 export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {

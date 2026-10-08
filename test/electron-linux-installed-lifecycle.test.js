@@ -852,7 +852,8 @@ test('predecessor connection, evaluation and readiness timeout failures expose o
       } });
     await assert.rejects(action, error => {
       const operation = failure === 'connect' ? 'CONNECT' : 'READY';
-      const code = `LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_${operation}_FAILED`;
+      const code = failure === 'timeout' ? 'LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_READY_POLL_TIMEOUT'
+        : `LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_${operation}_FAILED`;
       assert.equal(error.code, code); assert.equal(error.message, code);
       assert.deepEqual(Object.keys(error), ['code']);
       assert.equal(error.cause, undefined);
@@ -862,6 +863,44 @@ test('predecessor connection, evaluation and readiness timeout failures expose o
     });
     assert.equal(attempts, 1, 'an operation failure does not retry');
     assert.equal(closes, 0, 'the caller retains connection cleanup after failure');
+  }
+});
+
+test('predecessor readiness keeps exact CDP failure classes fatal without retaining arbitrary error data', async () => {
+  const recognized = [
+    ['CDP Runtime.evaluate timed out', 'CDP_TIMEOUT'],
+    ['renderer evaluation failed', 'EVALUATION_FAILED'],
+    ['CDP connection closed', 'CONNECTION_CLOSED'],
+    ['Cannot find default execution context', 'DEFAULT_CONTEXT_MISSING'],
+    ['Cannot find context with specified id', 'CONTEXT_MISSING'],
+    ['Execution context was destroyed.', 'CONTEXT_DESTROYED'],
+    ['Inspected target navigated or closed', 'TARGET_CHANGED_OR_CLOSED'],
+  ];
+  for (const [message, expected] of [...recognized, ...recognized.flatMap(([message]) => [
+    [`${message} private detail`, 'FAILED'], [` ${message}`, 'FAILED'], [message.toUpperCase(), 'FAILED'],
+  ]), ['CDP websocket error', 'FAILED'],
+  ['synthetic private transport error', 'FAILED'], ['', 'FAILED']]) {
+    let calls = 0, closes = 0;
+    const error = Object.assign(new Error(message), { code: 'PRIVATE_CODE', path: '/synthetic/private',
+      cause: new Error('PRIVATE_CAUSE'), extra: 'PRIVATE_EXTRA' });
+    const dashboard = { evaluate: async expression => {
+      calls++;
+      assert.equal(expression, "document.documentElement?.dataset?.localDashboardReady === 'true'");
+      throw error;
+    }, close: () => { closes++; } };
+    await assert.rejects(waitForLinuxFinalPredecessorDashboard(dashboard, { waiter: async (...args) => {
+      assert.equal(args.length, 1); return args[0]();
+    } }), failure => {
+      const code = `LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_READY_${expected}`;
+      assert.equal(failure.code, code); assert.equal(failure.message, code);
+      assert.deepEqual(Object.keys(failure), ['code']);
+      assert.equal(failure.cause, undefined);
+      assert.deepEqual(linuxFinalFailureDetails(failure.code, null), { errorCode: code });
+      assert.doesNotMatch(JSON.stringify(failure), /PRIVATE|synthetic|transport|context was|timed out/u);
+      return true;
+    });
+    assert.equal(calls, 1, 'recognized context loss and all other failures remain fatal');
+    assert.equal(closes, 0, 'the caller retains cleanup ownership');
   }
 });
 
