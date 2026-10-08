@@ -11,8 +11,12 @@ generated from them. Apply the repository root guidance first.
 - Keep object schemas closed and recursively reject prompt/response content,
   commands, URLs, paths, credentials, raw account/scope identifiers, arbitrary
   metadata, and unbounded text in both keys and values.
-- Unknown upstream fields are omitted. Unknown model values follow the current
-  fingerprint/unknown policy; they are not exported as convenient free text.
+- Unknown upstream fields are omitted. Model, provider, speed, tier and plan
+  names are vocabulary, not raw account/scope identifiers: a reviewed contract
+  change may pass an unknown name as plain text only inside the wire grammar
+  `[A-Za-z0-9._:-]{1,64}`, else as `unrecognized`
+  (`docs/decisions/2026-10-02-catalog-vocabulary-plain-text.md`). Until that
+  change ships, unknown models follow the current fingerprint/unknown policy.
 - Privacy contracts are versioned. Do not broaden, rename, pseudonymize, or remove
   a field ad hoc, even when a change appears more private: consent, clients,
   Worker validation, stored data, deletion, and migration may depend on its exact
