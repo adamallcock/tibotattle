@@ -35,7 +35,7 @@
  * replaced, wherever table content is served or bound.
  *   - readCatalogPricingRegistry: the price cards and registry identity for
  *     the pinned version (intake pricing). With no catalog table, no loaded
- *     manifest or none active yet, it returns the compiled d43c8f92 baseline,
+ *     manifest or none active yet, it returns this build's compiled registry,
  *     stamped manifest version 1.
  *   - readCatalogForAnalytics: what an analytics run stamps and binds. At
  *     cutover the kernels stay on the compiled registry (owner decision round
@@ -49,6 +49,7 @@
  * Every table is schema-qualified: origin pools set no search_path.
  */
 
+import frozenBaselineManifest from "../catalog/manifest-0001.json";
 import {
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
@@ -69,7 +70,6 @@ import {
   assertCatalogManifestSuccessor,
   canonicalCatalogPayloadText,
   catalogCardDigest,
-  projectCatalogManifest,
   verifyCatalogEnvelope,
   webCryptoSha256Hex,
   type CatalogDigest,
@@ -135,9 +135,8 @@ const LOCK_TIMEOUT_MILLISECONDS = 5_000;
 
 /**
  * The compiled inputs of this build: the Worker's installed workspace
- * packages, which the GCP line holds at the d43c8f92 bytes (the same bytes
- * the vendored kernels carry; test/catalog-manifest.spec.ts proves both
- * project to the committed baseline).
+ * packages. These may advance with a new kernel independently of the
+ * immutable version-1 catalog and its public model presentation.
  */
 export const COMPILED_CATALOG_INPUTS: Readonly<CompiledCatalogInputs> = Object.freeze({
   priceCards: APP_OFFICIAL_PRICE_CARDS as unknown as readonly PriceCard[],
@@ -151,12 +150,12 @@ export const COMPILED_CATALOG_INPUTS: Readonly<CompiledCatalogInputs> = Object.f
   fastModeAssumedMultiplier: FAST_MODE_ASSUMED_MULTIPLIER,
 });
 
-/** Manifest version 1: the compiled baseline projection. */
+/** Immutable cutover manifest 1; new compiled contracts never relabel it. */
 export function compiledBaselineCatalogManifest(): CatalogManifest {
-  return projectCatalogManifest(COMPILED_CATALOG_INPUTS, CATALOG_BASELINE_RELEASE);
+  return JSON.parse(JSON.stringify(frozenBaselineManifest)) as CatalogManifest;
 }
 
-/** sha256 of this build's compiled projection; equal to CATALOG_BASELINE_DIGEST at d43c8f92. */
+/** sha256 of the immutable cutover manifest, always CATALOG_BASELINE_DIGEST. */
 export async function compiledBaselineDigest(): Promise<string> {
   return webCryptoSha256Hex(canonicalCatalogPayloadText(compiledBaselineCatalogManifest()));
 }
@@ -641,7 +640,8 @@ export interface CatalogAnalyticsBinding {
  * Analytics: the stamp and binding for one refresh run.
  *
  * `compiled_registry` (the cutover default, owner decision round 7) stamps
- * version 1, which is the compiled registry by definition, and refuses a
+ * version 1 for the retained catalog binding, while the kernel identity names
+ * its compiled price registry. It refuses a
  * frozen pin on any other version so a frozen deployment never runs on prices
  * it was not frozen to. The table is otherwise report-only: a tampered row, a
  * row whose key is no longer pinned or a pin on a version not yet active is

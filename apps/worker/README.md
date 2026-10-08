@@ -398,7 +398,10 @@ or combined performance; those remain integrator gates.
 
 The source contract accepts known `promax` plan attribution and the reviewed
 `gpt-6.1-sol` identity. This intake contract does not change the public allowance
-normalization or qualify installed-client uploads.
+normalization or qualify installed-client uploads. The immutable catalog
+`catalog/manifest-0001.json` and its public model roster stay at their original
+identity; kernel11 and intake use the separately identified compiled v0.9 price
+registry. No catalog successor is loaded or activated by this change.
 
 Primary migration `0076_classification_correction_links.sql` follows the existing
 `0075_github_distribution_manifest_visibility.sql` without changing its bytes.

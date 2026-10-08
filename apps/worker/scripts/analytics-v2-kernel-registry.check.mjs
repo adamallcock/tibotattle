@@ -80,6 +80,8 @@ const REGISTRY_PINS = Object.freeze([
   "ac773e95cf827e171023e6545ec6cb70c35a6fd4f248aa61bde63ef90f2dca37",
   // Kernel 10: set-based v1.1 candidate completeness and pair eligibility.
   "bfc68ed47745b2aa4dac9c47640a31fa522f8dd5dff28a14233243ccba951077",
+  // Kernel 11: reviewed client catalog/pricing and additive classification overlays.
+  "610be70b21a3c5c6fe52ba0a90907954e48d109507a3d4bd5d72c6e9899cc8ea",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -251,7 +253,7 @@ async function revendoredIdentity({ commit, facade = (text) => text, files = {} 
     }
     if (path === FACADE_FILE) {
       assert.ok(text().includes(current.slice(0, 8)), "the facade names its vendored commit");
-      return Buffer.from(facade(text().replaceAll(current.slice(0, 8), commit.slice(0, 8))), "utf8");
+      return Buffer.from(facade(text().replaceAll(current, commit).replaceAll(current.slice(0, 8), commit.slice(0, 8))), "utf8");
     }
     return Object.hasOwn(files, path) ? Buffer.from(files[path](text()), "utf8") : bytes;
   });

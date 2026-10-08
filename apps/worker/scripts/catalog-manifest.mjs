@@ -7,14 +7,14 @@
  * baseline manifest (version 1): a projection of the compiled d43c8f92 price
  * registry, reviewed model catalog, plan roster and Fast assumption, read
  * from the vendored kernels' own copies (vendor/analytics-d43c8f92). It is
- * generator-owned: change the compiled sources, then run `write`. Later
+ * immutable after cutover: `write` is restricted to its original source. Later
  * versions are reviewed data files of the same schema, checked for
  * append-only continuity against their predecessor with `--previous`.
  *
  * MODES (one JSON receipt line on stdout; one JSON error line on stderr):
  *   check   [--data F]                  Offline. F (default the baseline) must
  *           validate and, for version 1, equal the projection byte for byte.
- *   write                               Regenerate the baseline data file.
+ *   write                               Regenerate the baseline at its original source only.
  *   build   --data F --out P [--previous Q]
  *           Validate F (and its continuity from the canonical payload Q),
  *           then write the canonical payload bytes P, the bytes that are signed.
@@ -44,6 +44,7 @@
  * carry a closed code and a structural path, never a value or key material.
  */
 
+import frozenBaselineManifest from "../catalog/manifest-0001.json" with { type: "json" };
 import { lstat, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,7 +65,6 @@ import {
 } from "../vendor/analytics-d43c8f92/packages/telemetry-contract/src/constants.js";
 import {
   CATALOG_BASELINE_DIGEST,
-  CATALOG_BASELINE_RELEASE,
   CATALOG_BASELINE_SOURCE_COMMIT,
   CatalogManifestError,
   assertCatalogCompiledAssertions,
@@ -72,7 +72,6 @@ import {
   canonicalCatalogPayloadText,
   decodeBase64,
   parseCanonicalCatalogPayload,
-  projectCatalogManifest,
   signCatalogPayload,
   validateCatalogManifest,
   verifyCatalogEnvelope,
@@ -105,7 +104,7 @@ function usage(detail) {
   throw new CatalogToolError("CATALOG_TOOL_USAGE", detail, 2);
 }
 
-/** The compiled d43c8f92 inputs, from the vendored kernels' own modules. */
+/** This build's compiled inputs, from the vendored kernels' own modules. */
 export const VENDORED_COMPILED_INPUTS = Object.freeze({
   priceCards: APP_OFFICIAL_PRICE_CARDS,
   registryVersion: APP_PRICE_REGISTRY_VERSION,
@@ -119,7 +118,7 @@ export const VENDORED_COMPILED_INPUTS = Object.freeze({
 });
 
 export function projectBaselineManifest() {
-  return projectCatalogManifest(VENDORED_COMPILED_INPUTS, CATALOG_BASELINE_RELEASE);
+  return JSON.parse(JSON.stringify(frozenBaselineManifest));
 }
 
 /** The reviewed data file's bytes: two-space JSON plus one newline. */
@@ -166,7 +165,6 @@ export async function checkCatalogData(manifestValue) {
   const payloadText = canonicalCatalogPayloadText(manifest);
   const digest = await webCryptoSha256Hex(payloadText);
   if (manifest.version === 1) {
-    await assertVendoredBaselineCommit();
     if (payloadText !== canonicalCatalogPayloadText(projectBaselineManifest()) || digest !== CATALOG_BASELINE_DIGEST) {
       throw new CatalogToolError("CATALOG_TOOL_BASELINE_DRIFT", "data");
     }

@@ -24,6 +24,7 @@ import {
   isCatalogToken,
   parseCanonicalCatalogPayload,
   parseCatalogEnvelope,
+  projectCatalogManifest,
   signCatalogPayload,
   validateCatalogManifest,
   validateCatalogManifestPayload,
@@ -38,6 +39,8 @@ import {
   compiledBaselineCatalogManifest,
   compiledBaselineDigest,
 } from "../src/postgres-catalog-store";
+import { analyticsV2PublicModelMetadata } from "../src/analytics-v2/community-daily-route";
+import { buildPublicModelMetadata } from "../src/analytics-v2/public-allowance-breakdowns-v13";
 import { priceTelemetryUsageEvent } from "../src/server-pricing";
 import type { TelemetryUsageEvent } from "../src/telemetry-validation";
 
@@ -90,31 +93,48 @@ function syntheticCard(model = "synthetic-unseen-model-km1"): PriceCard {
 }
 
 describe("baseline projection (manifest version 1)", () => {
-  it("projects the Worker packages and the vendored d43c8f92 modules to the committed data file", async () => {
+  it("preserves the immutable cutover file while current Worker and vendored packages agree", async () => {
     const fromPackages = compiledBaselineCatalogManifest();
     expect(canonicalCatalogPayloadText(fromPackages)).toBe(JSON.stringify(committedBaseline));
     expect(JSON.stringify(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS)).toBe(JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
     expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
     expect(fromPackages.version).toBe(CATALOG_BASELINE_RELEASE.version);
     expect(fromPackages.projectedFromCommit).toBe("d43c8f92a059d9c577776f7eca8a331eb305b8a6");
-    // The pinned version-1 digest is this build's compiled projection; if the
-    // compiled registry moves, this fails rather than mislabel the fallback.
+    // Current compiled packages may advance; version 1 never changes identity.
     expect(await compiledBaselineDigest()).toBe(CATALOG_BASELINE_DIGEST);
     expect(await webCryptoSha256Hex(JSON.stringify(committedBaseline))).toBe(CATALOG_BASELINE_DIGEST);
   });
 
-  it("reproduces the compiled registry SHA from the manifest cards", async () => {
+  it("reproduces the historical v0.8 registry SHA without relabeling current v0.9", async () => {
     const manifest = await validateCatalogManifest(clone(committedBaseline), webCryptoSha256Hex);
-    expect(manifest.compat.registrySha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
+    expect(manifest.compat.registrySha256).toBe("48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
     expect(await webCryptoSha256Hex(JSON.stringify(activeCatalogPriceCards(manifest))))
-      .toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
-    expect(manifest.compat.registryVersion).toBe(APP_PRICE_REGISTRY_MANIFEST.version);
+      .toBe(manifest.compat.registrySha256);
+    expect(manifest.compat.registryVersion).toBe("app-official-api-prices-v0.8");
+    expect(APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.9");
+    expect(APP_PRICE_REGISTRY_MANIFEST.sha256).not.toBe(manifest.compat.registrySha256);
     assertCatalogCompiledAssertions(manifest, COMPILED_CATALOG_INPUTS);
   });
 
-  it("prices byte-identically to the compiled registry through a signed round trip", async () => {
+  it("keeps the public roster on immutable manifest 1", () => {
+    const baseline = compiledBaselineCatalogManifest();
+    expect(analyticsV2PublicModelMetadata()).toEqual(buildPublicModelMetadata(baseline));
+    expect(analyticsV2PublicModelMetadata().map((model) => model.id)).not.toContain("gpt-6.1-sol");
+    baseline.models[0]!.label = "Mutated copy";
+    expect(compiledBaselineCatalogManifest()).toEqual(committedBaseline);
+  });
+
+  it("prices current compiled inputs byte-identically through a synthetic successor signed round trip", async () => {
+    const current = projectCatalogManifest(COMPILED_CATALOG_INPUTS, {
+      ...CATALOG_BASELINE_RELEASE, version: 2, previousVersion: 1, previousDigest: CATALOG_BASELINE_DIGEST,
+      publishedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt, activateAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+      projectedFromCommit: null,
+    });
+    expect(current.compat.registrySha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
+    expect(current.models.some((model) => model.id === "gpt-6.1-sol")).toBe(true);
+    expect(current.plans.some((plan) => plan.id === "promax")).toBe(true);
     const signer = await syntheticSigner();
-    const { envelopeText } = await signer.sign(compiledBaselineCatalogManifest());
+    const { envelopeText } = await signer.sign(current);
     const verified = await verifyCatalogEnvelope(envelopeText, { trustedKeys: signer.trustedKeys });
     const manifestCards = activeCatalogPriceCards(verified.manifest) as unknown as readonly AccountingPriceCard[];
     expect(manifestCards).not.toBe(APP_OFFICIAL_PRICE_CARDS);
@@ -289,7 +309,7 @@ describe("closed schema", () => {
 
   it("refuses a plan the compiled roster lacks", () => {
     const manifest = compiledBaselineCatalogManifest();
-    manifest.plans.push({ id: "promax", label: "Pro Max" });
+    manifest.plans.push({ id: "synthetic-unreviewed-plan", label: "Synthetic unreviewed plan" });
     expect(() => assertCatalogCompiledAssertions(manifest, COMPILED_CATALOG_INPUTS)).toThrow(CatalogManifestError);
   });
 });

@@ -147,6 +147,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/ops-probe-job.check.mjs", destination: "apps/worker/cloud-run/ops-probe-job.check.mjs" }),
   Object.freeze({ source: "cloud-run/ops-backup-horizon.mjs", destination: "apps/worker/cloud-run/ops-backup-horizon.mjs" }),
   Object.freeze({ source: "src", destination: "apps/worker/src" }),
+  Object.freeze({ source: "catalog/manifest-0001.json", destination: "apps/worker/catalog/manifest-0001.json" }),
   // The d43c8f92 analytics kernels and their vendored packages; the
   // analytics-refresh entry and the community-daily route bundle them.
   Object.freeze({ source: "vendor", destination: "apps/worker/vendor" }),

@@ -20,6 +20,9 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     const receipt = JSON.parse(generated.stdout);
     assert.equal(receipt.mode, "create");
     assert.equal(receipt.primaryMigrations, 76);
+    assert.deepEqual(await readFile(join(output, "apps/worker/catalog/manifest-0001.json")),
+      await readFile(join(WORKER, "catalog/manifest-0001.json")));
+    await assert.rejects(access(join(output, "apps/worker/catalog/manifest-0002.json")), { code: "ENOENT" });
     const runtime = ["analytics-refresh-profile.mjs", "analytics-refresh-worker-profile.mjs", "analytics-refresh-allocation-profile.mjs", "analytics-refresh-memory-profile.mjs"];
     for (const name of runtime) assert.deepEqual(await readFile(join(cloud, name)), await readFile(join(WORKER, "cloud-run", name)), name);
     const fixtures = ["analytics-refresh-profile.check.mjs", "analytics-refresh-worker-profile.check.mjs", "analytics-refresh-allocation-profile.check.mjs",

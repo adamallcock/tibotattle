@@ -25,6 +25,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
+import frozenBaselineManifest from "../catalog/manifest-0001.json" with { type: "json" };
 import pg from "pg";
 import { createServer } from "vite";
 import { APP_OFFICIAL_PRICE_CARDS, priceUsageEvent } from "@app-usagemonitor/accounting";
@@ -37,6 +38,7 @@ import {
 } from "./staged-migrations-harness.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const BASELINE_PRICE_CARDS = frozenBaselineManifest.priceCards;
 const CATALOG_SUFFIX = "_catalog_manifest_store.sql";
 const NOW_MS = Date.parse("2026-10-02T12:00:00.000Z");
 const KEY_ID = "catalog-test-km-core";
@@ -95,7 +97,7 @@ async function successorOf(held, edit = () => {}) {
 }
 
 function syntheticCard(model) {
-  const card = clone(APP_OFFICIAL_PRICE_CARDS.find((entry) => entry.provider === "openai"
+  const card = clone(BASELINE_PRICE_CARDS.find((entry) => entry.provider === "openai"
     && entry.metadata?.total_input_context_band == null && entry.aliases === undefined
     && entry.service_tier === "standard"));
   // The id is a digest slug, so only the model token can be out of grammar.
@@ -178,7 +180,7 @@ async function counts(schema) {
 function assertPricingIdentical(priceCards) {
   const context = { priceEpochBasis: "event_time_when_registry_has_effective_evidence" };
   let priced = 0;
-  for (const card of APP_OFFICIAL_PRICE_CARDS) {
+  for (const card of BASELINE_PRICE_CARDS) {
     const band = card.metadata?.total_input_context_band ?? null;
     const bound = card.components[0]?.conditions;
     const totalInputContextTokens = band === "short" ? bound.max_total_input_tokens
@@ -193,7 +195,7 @@ function assertPricingIdentical(priceCards) {
           : { inputUncachedTokens: 1234, inputCacheReadTokens: 5678, inputCacheWrite5mTokens: 91,
             inputCacheWrite1hTokens: 17, outputCombinedTokens: 3023 },
       };
-      const compiled = priceUsageEvent(event, { priceCards: APP_OFFICIAL_PRICE_CARDS, pricingContext: context });
+      const compiled = priceUsageEvent(event, { priceCards: BASELINE_PRICE_CARDS, pricingContext: context });
       const fromTable = priceUsageEvent(event, { priceCards, pricingContext: context });
       assert.equal(JSON.stringify(fromTable), JSON.stringify(compiled));
       if (compiled.coverageStatus !== "unpriced") priced += 1;
@@ -239,13 +241,15 @@ test("the staged migration is purely additive: no contract operation", { skip },
   }
 });
 
-test("before any load the read APIs serve the compiled baseline, stamped version 1", { skip }, async () => {
+test("before any load the read APIs serve current compiled pricing with the retained manifest stamp", { skip }, async () => {
   const schema = await createSchema();
   const pricing = await readPricing(schema);
   assert.equal(pricing.source, "compiled_baseline");
   assert.equal(pricing.manifestVersion, 1);
   assert.equal(pricing.manifestDigest, null);
   assert.equal(JSON.stringify(pricing.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+  assert.equal(pricing.registrySha256, store.COMPILED_CATALOG_INPUTS.registrySha256);
+  assert.notEqual(pricing.registrySha256, frozenBaselineManifest.compat.registrySha256);
   const analytics = await readAnalytics(schema);
   assert.equal(analytics.kernelBinding, "compiled_registry");
   assert.equal(analytics.stampManifestVersion, 1);
@@ -298,24 +302,24 @@ test("the signed baseline loads once, idempotently, and prices byte-identically"
   const receipt = await load(schema, envelope);
   assert.equal(receipt.status, "loaded");
   assert.equal(receipt.version, 1);
-  assert.equal(receipt.cardsAdded, APP_OFFICIAL_PRICE_CARDS.length);
+  assert.equal(receipt.cardsAdded, BASELINE_PRICE_CARDS.length);
   assert.equal(receipt.digest, await contract.webCryptoSha256Hex(contract.canonicalCatalogPayloadText(baseline)));
   assert.equal((await load(schema, envelope)).status, "already_loaded");
-  assert.deepEqual(await counts(schema), { manifests: 1, cards: APP_OFFICIAL_PRICE_CARDS.length, retractions: 0 });
+  assert.deepEqual(await counts(schema), { manifests: 1, cards: BASELINE_PRICE_CARDS.length, retractions: 0 });
 
   // Card numbers follow manifest order, and each digest is its canonical bytes.
   const cards = await pool.query(`SELECT card_no, card_id, card_digest FROM ${q(schema, "catalog_cards")}
     ORDER BY card_no`);
-  assert.deepEqual(cards.rows.map((row) => row.card_id), APP_OFFICIAL_PRICE_CARDS.map((card) => card.id));
+  assert.deepEqual(cards.rows.map((row) => row.card_id), BASELINE_PRICE_CARDS.map((card) => card.id));
   assert.equal(cards.rows[0].card_digest,
-    await contract.webCryptoSha256Hex(JSON.stringify(APP_OFFICIAL_PRICE_CARDS[0])));
+    await contract.webCryptoSha256Hex(JSON.stringify(BASELINE_PRICE_CARDS[0])));
 
   const pricing = await readPricing(schema);
   assert.equal(pricing.source, "catalog_table");
   assert.equal(pricing.manifestVersion, 1);
   assert.equal(pricing.manifestDigest, receipt.digest);
-  assert.equal(pricing.registrySha256, store.COMPILED_CATALOG_INPUTS.registrySha256);
-  assert.equal(JSON.stringify(pricing.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+  assert.equal(pricing.registrySha256, frozenBaselineManifest.compat.registrySha256);
+  assert.equal(JSON.stringify(pricing.priceCards), JSON.stringify(BASELINE_PRICE_CARDS));
   assertPricingIdentical(pricing.priceCards);
 });
 
@@ -388,7 +392,7 @@ test("successors append; edits, removals, regressions and gaps are refused", { s
   assert.equal(await refusal(async () => load(schema, await signer.sign(brokenChain))), "CATALOG_CHAIN_MISMATCH");
   // Reloading an older loaded version is a no-op, not a regression.
   assert.equal((await load(schema, await signer.sign(baseline))).status, "already_loaded");
-  assert.deepEqual(await counts(schema), { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 1 });
+  assert.deepEqual(await counts(schema), { manifests: 2, cards: BASELINE_PRICE_CARDS.length + 1, retractions: 1 });
 
   // The database refuses the same outside the loader.
   for (const statement of [
@@ -411,7 +415,7 @@ test("successors append; edits, removals, regressions and gaps are refused", { s
     SELECT 4, 3, digest, digest, key_id, envelope_text, published_at, activate_at
     FROM ${q(schema, "catalog_manifests")} WHERE version = 2`;
   assert.equal(await databaseRefusal(() => pool.query(gap)), "catalog_manifests_version_gap");
-  assert.deepEqual(await counts(schema), { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 1 });
+  assert.deepEqual(await counts(schema), { manifests: 2, cards: BASELINE_PRICE_CARDS.length + 1, retractions: 1 });
 });
 
 test("an out-of-grammar token is refused by the loader and by the table", { skip }, async () => {
@@ -503,7 +507,7 @@ test("pins choose the read version; staged activation; the cutover analytics bin
   await pin(schema, "pinned", 1, "rollback");
   const pinned = await readPricing(schema);
   assert.deepEqual([pinned.manifestVersion, pinned.pin.mode], [1, "pinned"]);
-  assert.equal(JSON.stringify(pinned.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+  assert.equal(JSON.stringify(pinned.priceCards), JSON.stringify(BASELINE_PRICE_CARDS));
   await pin(schema, "pinned", 3, "staging");
   assert.equal(await refusal(() => readPricing(schema)), "CATALOG_PIN_NOT_ACTIVE");
   assert.equal(await refusal(() => readAnalytics(schema, "manifest")), "CATALOG_PIN_NOT_ACTIVE");
@@ -574,7 +578,7 @@ test("forged card and retraction rows are refused at the next load, never truste
   await load(ahead, await signer.sign(baseline));
   await forgeCard(ahead, introduced, { digest: "0".repeat(64), model: "some-other-model", firstVersion: 1 });
   assert.equal(await refusal(() => load(ahead, v2Envelope)), "CATALOG_STORE_TAMPERED");
-  assert.deepEqual(await counts(ahead), { manifests: 1, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 0 });
+  assert.deepEqual(await counts(ahead), { manifests: 1, cards: BASELINE_PRICE_CARDS.length + 1, retractions: 0 });
 
   // 2. The same card with its true bytes but written ahead of its manifest
   //    still claims a version that never carried it: refused.
@@ -600,7 +604,7 @@ test("forged card and retraction rows are refused at the next load, never truste
   await pool.query(`UPDATE ${cardsTable(edited)} SET model = 'some-other-model' WHERE card_no = 1`);
   await pool.query(`ALTER TABLE ${cardsTable(edited)} ENABLE TRIGGER catalog_cards_append_only`);
   assert.equal(await refusal(() => load(edited, v2Envelope)), "CATALOG_STORE_TAMPERED");
-  assert.deepEqual(await counts(edited), { manifests: 1, cards: APP_OFFICIAL_PRICE_CARDS.length, retractions: 0 });
+  assert.deepEqual(await counts(edited), { manifests: 1, cards: BASELINE_PRICE_CARDS.length, retractions: 0 });
 
   // 5. A retraction written ahead of the manifest that retracts the card.
   //    Before this check it would have broken the legitimate load on the
@@ -618,7 +622,7 @@ test("forged card and retraction rows are refused at the next load, never truste
   await forgeRetraction(retraction, retracted.id, 2, "price_correction");
   assert.equal(await refusal(async () => load(retraction, await signer.sign(v3))), "CATALOG_STORE_TAMPERED");
   assert.deepEqual(await counts(retraction),
-    { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length + 1, retractions: 1 });
+    { manifests: 2, cards: BASELINE_PRICE_CARDS.length + 1, retractions: 1 });
   //    A retraction can only be written under the head version as well.
   assert.equal(await databaseRefusal(() => forgeRetraction(retraction, introduced.id, 1, "withdrawn")),
     "catalog_vocabulary_not_head_version");
@@ -644,7 +648,7 @@ test("forged card and retraction rows are refused at the next load, never truste
   const firstVersions = await pool.query(`SELECT first_version, count(*)::int AS cards
     FROM ${cardsTable(clean)} GROUP BY first_version ORDER BY first_version`);
   assert.deepEqual(firstVersions.rows, [
-    { first_version: 1, cards: APP_OFFICIAL_PRICE_CARDS.length }, { first_version: 2, cards: 1 },
+    { first_version: 1, cards: BASELINE_PRICE_CARDS.length }, { first_version: 2, cards: 1 },
   ]);
 });
 
@@ -673,7 +677,7 @@ test("a successor may not activate before its predecessor, in the loader or the 
     VALUES (3, 2, $1, $2, $3, $4, $5::timestamptz, $6::timestamptz)`,
   [early.previousDigest, digest, KEY_ID, earlyEnvelope, early.publishedAt, early.activateAt])),
   "catalog_manifests_activation_regression");
-  assert.deepEqual(await counts(schema), { manifests: 2, cards: APP_OFFICIAL_PRICE_CARDS.length, retractions: 0 });
+  assert.deepEqual(await counts(schema), { manifests: 2, cards: BASELINE_PRICE_CARDS.length, retractions: 0 });
 
   // Activating with or after v2 loads; both go live together on v2's date.
   const together = await successorOf(v2, (manifest) => {

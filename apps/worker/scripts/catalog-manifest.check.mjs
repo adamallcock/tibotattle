@@ -33,6 +33,7 @@ import {
   catalogTrustedKeys,
 } from "../src/catalog-manifest-keys.ts";
 import {
+  CATALOG_BASELINE_DIGEST,
   canonicalCatalogPayloadText,
   decodeBase64,
   encodeBase64,
@@ -74,17 +75,18 @@ after(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-test("the committed baseline is exactly the d43c8f92 projection and reproduces the registry SHA", async () => {
+test("the immutable d43c8f92 baseline stays distinct from current compiled inputs", async () => {
   const committed = await readFile(CATALOG_BASELINE_DATA_FILE, "utf8");
   assert.equal(committed, dataFileText(projectBaselineManifest()));
   const receipt = await runCatalogManifestTool(["check"]);
   assert.equal(receipt.version, 1);
-  assert.equal(receipt.registrySha256, VENDORED_COMPILED_INPUTS.registrySha256);
-  // The price cards are the compiled cards byte for byte, so their digest is
-  // the compiled APP_PRICE_REGISTRY_SHA256 literal.
+  assert.equal(receipt.digest, CATALOG_BASELINE_DIGEST);
+  assert.equal(receipt.registrySha256, "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
   const parsed = JSON.parse(committed);
-  assert.equal(JSON.stringify(parsed.priceCards), JSON.stringify(VENDORED_COMPILED_INPUTS.priceCards));
-  assert.equal(await webCryptoSha256Hex(JSON.stringify(parsed.priceCards)), VENDORED_COMPILED_INPUTS.registrySha256);
+  assert.equal(parsed.compat.registryVersion, "app-official-api-prices-v0.8");
+  assert.equal(await webCryptoSha256Hex(JSON.stringify(parsed.priceCards)), receipt.registrySha256);
+  assert.equal(VENDORED_COMPILED_INPUTS.registryVersion, "app-official-api-prices-v0.9");
+  assert.notEqual(VENDORED_COMPILED_INPUTS.registrySha256, receipt.registrySha256);
 });
 
 test("check refuses a baseline that drifts from the compiled projection", async () => {

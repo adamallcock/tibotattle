@@ -9,6 +9,7 @@ COPY apps/worker/cloud-run ./
 RUN mkdir -p assets
 RUN ln -s /app/apps/worker/cloud-run/node_modules /app/node_modules
 COPY apps/worker/src /app/apps/worker/src
+COPY apps/worker/catalog/manifest-0001.json /app/apps/worker/catalog/manifest-0001.json
 COPY apps/worker/postgres/migrations /app/apps/worker/postgres/migrations
 COPY apps/worker/scripts/postgres-migrations.mjs /app/apps/worker/scripts/postgres-migrations.mjs
 COPY apps/worker/vendor /app/apps/worker/vendor
