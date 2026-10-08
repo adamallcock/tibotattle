@@ -7,6 +7,7 @@ import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, 
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
+  connectLinuxFinalPredecessorDashboard, waitForLinuxFinalPredecessorDashboard,
   readLinuxFinalAppProcessIdentity, linuxFinalBrowserCommandLineMatches, readLinuxFinalKnownAppProcessIdentity,
   currentLinuxFinalApp, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox, linuxFinalProcessCommandLineFacts } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
@@ -803,6 +804,65 @@ test('wrong-checksum observation requires a completed transfer, download failure
   for (const change of [{ completedTransfers: 0 }, { installedSha256: 'b'.repeat(64) },
     { update: { ...value.update, canInstall: true } }, { update: { ...value.update, error: 'check_failed' } },
     { update: { ...value.update, status: 'downloaded' } }]) assert.throws(() => assertLinuxFinalChecksumRejection({ ...value, ...change }), /CHECKSUM_REFUSAL_UNPROVEN/u);
+});
+
+test('predecessor startup retains the exact dashboard target, readiness expression and caller-owned connection', async () => {
+  const events = [], values = [false, true];
+  const dashboard = { evaluate: async expression => {
+    assert.equal(expression, "document.documentElement?.dataset?.localDashboardReady === 'true'");
+    events.push('evaluate'); return values.shift();
+  }, close: () => { events.push('close'); } };
+  const connected = await connectLinuxFinalPredecessorDashboard(12345, { connect: async (port, predicate) => {
+    assert.equal(port, 12345); events.push('connect');
+    assert.equal(predicate('http://127.0.0.1:54321/'), true);
+    for (const url of ['http://localhost:54321/', 'https://127.0.0.1:54321/',
+      'http://127.0.0.1:54321/electron-settings.html', 'http://127.0.0.1:54321/?extra=1',
+      'http://127.0.0.1:54321/#extra', 'http://127.0.0.1:54321', 'http://127.0.0.1:54321/extra']) {
+      assert.equal(predicate(url), false);
+    }
+    return dashboard;
+  } });
+  assert.equal(connected, dashboard);
+  assert.equal(await waitForLinuxFinalPredecessorDashboard(connected, { waiter: async (...args) => {
+    // Preserve the original waiter's default timeout, including false polling.
+    assert.equal(args.length, 1); const [predicate] = args;
+    assert.equal(await predicate(), false); return predicate();
+  } }), true);
+  assert.deepEqual(events, ['connect', 'evaluate', 'evaluate']);
+  connected.close(); assert.deepEqual(events, ['connect', 'evaluate', 'evaluate', 'close']);
+});
+
+test('predecessor connection, evaluation and readiness timeout failures expose only fixed operation codes', async () => {
+  const privateError = code => Object.assign(new Error('synthetic detail must remain private'), {
+    code, path: '/synthetic/private', privateField: 'PRIVATE_SYNTHETIC_DETAIL',
+  });
+  for (const failure of ['connect', 'evaluate', 'timeout']) {
+    let attempts = 0, closes = 0;
+    const dashboard = { evaluate: async () => {
+      attempts++;
+      if (failure === 'evaluate') throw privateError('PRIVATE_EVALUATE');
+      return false;
+    }, close: () => { closes++; } };
+    const action = failure === 'connect'
+      ? () => connectLinuxFinalPredecessorDashboard(12345, { connect: async () => {
+        attempts++; throw privateError('PRIVATE_CONNECT');
+      } })
+      : () => waitForLinuxFinalPredecessorDashboard(dashboard, { waiter: async predicate => {
+        assert.equal(await predicate(), false); throw privateError('LINUX_REAL_APPIMAGE_TIMEOUT');
+      } });
+    await assert.rejects(action, error => {
+      const operation = failure === 'connect' ? 'CONNECT' : 'READY';
+      const code = `LINUX_FINAL_LIFECYCLE_PREDECESSOR_DASHBOARD_${operation}_FAILED`;
+      assert.equal(error.code, code); assert.equal(error.message, code);
+      assert.deepEqual(Object.keys(error), ['code']);
+      assert.equal(error.cause, undefined);
+      assert.deepEqual(linuxFinalFailureDetails(error.code, null), { errorCode: code });
+      assert.doesNotMatch(JSON.stringify(error), /synthetic detail|PRIVATE_SYNTHETIC_DETAIL|PRIVATE_CONNECT|PRIVATE_EVALUATE|synthetic\/private/u);
+      return true;
+    });
+    assert.equal(attempts, 1, 'an operation failure does not retry');
+    assert.equal(closes, 0, 'the caller retains connection cleanup after failure');
+  }
 });
 
 function normalJourney({ failureAt = null, smokeFailure = null, preserveState = true } = {}) {

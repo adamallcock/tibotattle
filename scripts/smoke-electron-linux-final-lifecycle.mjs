@@ -393,6 +393,16 @@ async function uninstallImage(expected, preservedFixture, temporary) {
   try { await lstat(IMAGE); fail('UNINSTALL_FAILED'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (preservedFixture && !isDeepStrictEqual(before, await checkedCheckpoint(preservedFixture))) fail('UNINSTALL_STATE_CHANGED');
 }
+/** Keep predecessor startup failures content-free without changing its CDP
+ * target, readiness condition, waits or the caller's connection ownership. */
+export async function connectLinuxFinalPredecessorDashboard(port, { connect = connectUpdaterPage } = {}) {
+  try { return await connect(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url)); }
+  catch { fail('PREDECESSOR_DASHBOARD_CONNECT_FAILED'); }
+}
+export async function waitForLinuxFinalPredecessorDashboard(dashboard, { waiter = wait } = {}) {
+  try { return await waiter(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'")); }
+  catch { fail('PREDECESSOR_DASHBOARD_READY_FAILED'); }
+}
 /** Preserve only the maintained smoke-stage code and closed startup evidence. */
 export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
   const smokeCode = typeof errorCode === 'string' && ELECTRON_LINUX_SMOKE_FAILURE_STAGES.some(stage => {
@@ -563,8 +573,8 @@ export async function runLinuxFinalLifecycle() {
     child.on('error', () => {});
     predecessorStartupDiagnostics = createLinuxStartupDiagnostics({ child, sampleMount: sampleLinuxStartupFuseMount });
     child.stderr.on('data', predecessorStartupDiagnostics.feed);
-    dashboard = await connectUpdaterPage(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
-    await wait(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
+    dashboard = await connectLinuxFinalPredecessorDashboard(port);
+    await waitForLinuxFinalPredecessorDashboard(dashboard);
     const previous = await currentLinuxFinalApp(pair.images.current, temporary, predecessorArguments, argumentVectors);
     verifiedApps.push(previous); await assertLinuxFinalRendererSandbox(previous);
     await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
