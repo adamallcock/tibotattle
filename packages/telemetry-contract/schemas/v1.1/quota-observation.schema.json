@@ -41,6 +41,7 @@
         "plus",
         "pro",
         "prolite",
+        "promax",
         "team",
         "self_serve_business_prolite",
         "self_serve_business_usage_based",
@@ -119,6 +120,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "free"
@@ -139,6 +141,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "go"
@@ -159,6 +162,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "plus"
@@ -179,6 +183,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "pro"
@@ -199,9 +204,31 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "prolite"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "promax"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "promax"
               }
             }
           }
@@ -219,6 +246,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "team"
@@ -239,6 +267,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "self_serve_business_prolite"
@@ -259,6 +288,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "self_serve_business_usage_based"
@@ -279,6 +309,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "business"
@@ -299,6 +330,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "ent26"
@@ -319,6 +351,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise_cbp_automation"
@@ -339,6 +372,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise_cbp_usage_based"
@@ -359,6 +393,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise"
@@ -379,6 +414,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu"
@@ -399,6 +435,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu_plus"
@@ -419,6 +456,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu_pro"
@@ -439,6 +477,7 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "unknown"

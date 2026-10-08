@@ -66,7 +66,7 @@ function pgFixture(database) {
 }
 
 test('forward migration changes exactly one named FK and requires its reviewed byte pin',async()=>{
- const migrations=await readPostgresMigrations({role:'primary'}),last=migrations.at(-1);
+ const migrations=await readPostgresMigrations({role:'primary'}),last=migrations.find(m=>m.version===75);
  assert.equal(last.name,migrationName);assert.equal(last.version,75);
  assert.equal(migrations.find(m=>m.version===22).sha256,'412b3555bd2b1aff5b667c92499cadca8d0abbdd0111fbac50a3f0eba65841e6');
  const statements=last.sql.replace(/--[^\n]*/gu,'').trim();

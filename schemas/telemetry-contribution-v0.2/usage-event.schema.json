@@ -94,7 +94,8 @@
         "claude-opus-5",
         "claude-opus-5-5",
         "claude-sonnet-4-6",
-        "claude-sonnet-5"
+        "claude-sonnet-5",
+        "gpt-6.1-sol"
       ]
     },
     "modelRecognition": {
@@ -123,6 +124,7 @@
       "enum": [
         "standard",
         "fast",
+        "ultrafast",
         "unknown",
         "other"
       ]
@@ -131,6 +133,7 @@
       "enum": [
         "standard",
         "priority",
+        "ultrafast",
         "flex",
         "batch",
         "unknown",

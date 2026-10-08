@@ -1,3 +1,5 @@
+import { preparePostgresClassificationActivation, postgresClassificationLinkPredicate } from "./postgres-classification-links";
+import { PostgresClassificationCorrectionError } from "./postgres-classification-correction";
 import {
   canonicalTelemetryV12Json,
   MAX_TELEMETRY_V12_DOMAIN_DAYS,
@@ -124,6 +126,7 @@ async function assertSameDaySuccessorClosure(
   principal: PostgresTypedV12Principal,
   previous: DomainDayReference,
   successor: DomainDayReference,
+  activationDigest: string,
 ): Promise<void> {
   for (const day of [previous, successor]) {
     const manifest = await client.query<{ expected_chunk_count: number }>(
@@ -170,10 +173,11 @@ async function assertSameDaySuccessorClosure(
            WHERE new_record.manifest_id = $2
              AND new_record.stream = old_record.stream
              AND new_record.occurrence_id = old_record.occurrence_id
-             AND new_record.canonical_digest = old_record.canonical_digest
+             AND (new_record.canonical_digest = old_record.canonical_digest
+               OR ${postgresClassificationLinkPredicate(schema,"old_record.id","new_record.id",12,12,"$3::text")})
         )
       LIMIT 1`,
-    [previous.manifestId, successor.manifestId],
+    [previous.manifestId, successor.manifestId,activationDigest],
   );
   if (missing.rows.length !== 0) throw conflict();
 }
@@ -449,13 +453,6 @@ export function createPostgresTypedV12Domain(
           || !manifest.days.some((day) => day.day === item.day))) {
           throw conflict();
         }
-        for (const previous of existingDays as DomainDayReference[]) {
-          const successor = manifest.days.find((day) => day.day === previous.day)!;
-          if (previous.manifestId !== successor.manifestId
-              || previous.manifestDigest !== successor.manifestDigest) {
-            await assertSameDaySuccessorClosure(client, schema, principal, previous, successor);
-          }
-        }
         const desiredIds = manifest.days.map((day) => day.manifestId);
         const ready = await client.query<ReadyManifestRow>(
           `SELECT id, to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day, manifest_digest
@@ -472,6 +469,24 @@ export function createPostgresTypedV12Domain(
           throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
         }
         const generationId = crypto.randomUUID();
+        try {
+          await preparePostgresClassificationActivation(client,schema,{
+            participantId:principal.participantId,deviceId:principal.deviceId,format:12,
+            previousGenerationId:predecessor.previous_generation_id,generationId,
+            predecessorTokenHash:tokenHash,inputRevision:revision(predecessor.input_revision),
+            manifestDigest:manifest.manifestDigest,days:manifest.days,predecessorDays:existingDays as DomainDayReference[],
+          });
+        } catch(error) {
+          if(error instanceof PostgresClassificationCorrectionError) throw conflict();
+          throw error;
+        }
+        for (const previous of existingDays as DomainDayReference[]) {
+          const successor = manifest.days.find((day) => day.day === previous.day)!;
+          if (previous.manifestId !== successor.manifestId
+              || previous.manifestDigest !== successor.manifestDigest) {
+            await assertSameDaySuccessorClosure(client, schema, principal, previous, successor,manifest.manifestDigest);
+          }
+        }
         const committedAt = actualNow.toISOString();
         await client.query(
           `INSERT INTO ${table(schema, "telemetry_v12_domains")} (

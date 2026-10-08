@@ -173,8 +173,16 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
   const registry = exportRegistrySnapshot();
   assert.deepEqual(
     exportSchemas.usageEvent.properties.modelId.enum,
-    ["unknown", ...registry.providers.openai_codex.modelIds, ...registry.providers.anthropic_claude_code.modelIds],
+    // New export identities append to the combined vocabulary so existing
+    // Claude enum positions survive the addition of another Codex model.
+    [
+      "unknown",
+      ...registry.providers.openai_codex.modelIds.filter((model) => model !== "gpt-6.1-sol"),
+      ...registry.providers.anthropic_claude_code.modelIds,
+      "gpt-6.1-sol",
+    ],
   );
+  assert.ok(registry.providers.openai_codex.modelIds.includes("gpt-6.1-sol"));
   assert.deepEqual(
     exportSchemas.quotaSnapshot.properties.limitId.enum,
     ["unknown", ...registry.providers.openai_codex.limitIds],

@@ -4,9 +4,13 @@ import {
   FAST_MODE_ASSUMED_MULTIPLIER,
   fastModeQuotaMultiplier,
   priceUsageEvent,
+  speedModeApiMultiplier,
 } from "@app-usagemonitor/accounting";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
 
+// v0.6 (2026-09-29): Ultrafast uses exact published cards; unsupported
+// combinations remain unpriced. These dollars do not represent included
+// subscription allowance, whose published Fast/Ultrafast factors differ.
 // v0.5 (2026-09-06): Fail closed for unsupported providers; the stored-record
 // adapter preserves unknown input context and recognizes known-zero cache writes.
 // v0.4 (2026-08-30): Codex subscription Fast events are priced at the
@@ -14,8 +18,9 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
 // by the exact model's eligible Priority/Standard price ratio (proven uniform per
 // component by the accounting package), or by the disclosed assumed 2x when
 // no Priority rate is published. Standard and unknown speed stay the plain
-// Standard counterfactual, as does every claude_subscription event.
-export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.5";
+// Standard counterfactual. Claude subscription modes retain their existing
+// Standard comparison, except unsupported Ultrafast must remain unpriced.
+export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.6";
 
 type PricingStatus = "fully_priced" | "partially_priced" | "unpriced";
 export type ServerPriceBasis = "historical_api_prices" | "unpriced";
@@ -37,10 +42,10 @@ export interface ServerPricingResult {
   priceBasis: ServerPriceBasis;
   priceEventTime: string | null;
   priceEpochBasis: ServerPriceEpochBasis;
-  apiServiceTier: "standard" | "priority" | "flex" | "batch" | "unknown";
+  apiServiceTier: "standard" | "priority" | "ultrafast" | "flex" | "batch" | "unknown";
   tierBasis: "subscription_standard_counterfactual" | "observed_api_service_tier"
     | "api_service_tier_unavailable" | "subscription_speed_priority_price_ratio"
-    | "subscription_speed_assumed_priority_ratio";
+    | "subscription_speed_assumed_priority_ratio" | "subscription_speed_exact_ultrafast_card";
   subscriptionSpeedMode: TelemetryUsageEvent["speedMode"];
   // The Priority/Standard price ratio applied on top of the Standard-card
   // cost for a Codex subscription Fast event; null when no ratio applied.
@@ -108,7 +113,21 @@ function tierForEvent(row: TelemetryUsageEvent): {
   const subscription = row.billingSurface === "chatgpt_subscription"
     || row.billingSurface === "claude_subscription";
   if (subscription) {
-    // Codex Fast is the API Priority tier. Standard cards still perform the
+    if (row.speedMode === "ultrafast") {
+      if (row.provider !== "openai_codex" || row.billingSurface !== "chatgpt_subscription") {
+        return {
+          apiServiceTier: "unknown",
+          tierBasis: "api_service_tier_unavailable",
+          speedMultiplier: null,
+        };
+      }
+      return {
+        apiServiceTier: "ultrafast",
+        tierBasis: "subscription_speed_exact_ultrafast_card",
+        speedMultiplier: null,
+      };
+    }
+    // The Codex Fast API comparison uses Priority prices. Standard cards perform
     // selection - they are the only tier with complete coverage - and the
     // published Priority/Standard price ratio (or the disclosed assumed 2x)
     // scales the result to the Priority rate. Selecting exact Priority cards
@@ -134,9 +153,9 @@ function tierForEvent(row: TelemetryUsageEvent): {
     };
   }
   if (row.billingSurface === "openai_api"
-      && ["standard", "priority", "flex", "batch"].includes(row.apiServiceTier)) {
+      && ["standard", "priority", "ultrafast", "flex", "batch"].includes(row.apiServiceTier)) {
     return {
-      apiServiceTier: row.apiServiceTier as "standard" | "priority" | "flex" | "batch",
+      apiServiceTier: row.apiServiceTier as "standard" | "priority" | "ultrafast" | "flex" | "batch",
       tierBasis: "observed_api_service_tier",
       speedMultiplier: null,
     };
@@ -237,6 +256,17 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
       && row.totalInputContextTokens === null) {
     return failClosed(row, "total_input_context_missing", tier);
   }
+  if (tier.apiServiceTier === "ultrafast"
+      && speedModeApiMultiplier(row.modelId, "ultrafast", {
+        eventTime: row.eventTime,
+        totalInputContextTokens: row.totalInputContextTokens,
+      }) === null) {
+    // Zero observed units can bypass card selection in the generic ledger.
+    // An unpublished model/date/context is still unknown, never a supported
+    // zero-cost Ultrafast event. The multiplier proves eligibility only; the
+    // exact Ultrafast card below computes the money once.
+    return failClosed(row, "service_tier_exact_card_missing", tier);
+  }
 
   const provider = row.provider === "openai_codex" ? "openai" : "anthropic";
   const surface = provider === "openai" ? "openai.responses" : "anthropic.messages";
@@ -288,7 +318,9 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
 
   // The speed ratio scales the Standard-card total to the Priority (Fast)
   // rate. An unpriced result carries no cost to scale, and the ratio is not
-  // applied to it so the zero stays an honest zero.
+  // applied to it. A zero cost with unpriced coverage is not evidence of free
+  // usage. Ultrafast already selected its exact card and is never multiplied
+  // here a second time.
   const speedMultiplier = priced.coverageStatus === "unpriced"
     ? null
     : tier.speedMultiplier;

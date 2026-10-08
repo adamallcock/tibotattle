@@ -233,11 +233,11 @@ const RECORD_SCHEMA = {
       then: { properties: { speedModeSource: { const: "mixed" } } },
     },
     {
-      if: { properties: { speedMode: { enum: ["fast", "standard", "other"] } } },
+      if: { properties: { speedMode: { enum: ["fast", "standard", "ultrafast", "other"] } } },
       then: {
         properties: {
           speedModeSource: {
-            enum: ["rollout_thread_settings", "lineage_inherited"],
+            enum: ["rollout_thread_settings", "turn_context_service_tier", "lineage_inherited"],
           },
         },
       },

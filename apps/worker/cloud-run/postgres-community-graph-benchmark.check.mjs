@@ -104,7 +104,7 @@ function validEnv(profileName = "10k", overrides = {}) {
 }
 
 function fakeMigrations() {
-  return Array.from({ length: 75 }, (_, index) => ({
+  return Array.from({ length: 76 }, (_, index) => ({
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_${index === 38
       ? "analytics_applied_projection_v1" : index === 39
@@ -132,7 +132,8 @@ function fakeMigrations() {
                                                   ? "analytics_v2_price_cards" : index === 72
                                                     ? "analytics_v2_owner_sets" : index === 73
                                                       ? "analytics_v2_pricing_classes" : index === 74
-                                                        ? "github_distribution_manifest_visibility" : `test_${index + 1}`}.sql`,
+                                                        ? "github_distribution_manifest_visibility" : index === 75
+                                                          ? "classification_correction_links" : `test_${index + 1}`}.sql`,
     sha256: (index + 1).toString(16).padStart(64, "0"),
   }));
 }
@@ -439,8 +440,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const receipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pool, POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].schema, migrations,
   );
-  assert.equal(receipt.count, 75);
-  assert.equal(receipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(receipt.count, 76);
+  assert.equal(receipt.tail, "0076_classification_correction_links.sql");
   assert.match(receipt.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(pool.releases, 1);
   assert.ok(pool.statements.some((sql) => sql.includes('ORDER BY version')));
@@ -450,8 +451,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const insightsReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     insightsPool, insightsSchema, migrations,
   );
-  assert.equal(insightsReceipt.count, 75);
-  assert.equal(insightsReceipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(insightsReceipt.count, 76);
+  assert.equal(insightsReceipt.tail, "0076_classification_correction_links.sql");
   assert.match(insightsReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const pagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-paged"].schema;
@@ -459,31 +460,31 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const pagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pagedPool, pagedSchema, migrations,
   );
-  assert.equal(pagedReceipt.count, 75);
-  assert.equal(pagedReceipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(pagedReceipt.count, 76);
+  assert.equal(pagedReceipt.tail, "0076_classification_correction_links.sql");
   const readpagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readpaged"].schema;
   const readpagedPool = migrationPool(rows, readpagedSchema);
   const readpagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     readpagedPool, readpagedSchema, migrations,
   );
-  assert.equal(readpagedReceipt.count, 75);
-  assert.equal(readpagedReceipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(readpagedReceipt.count, 76);
+  assert.equal(readpagedReceipt.tail, "0076_classification_correction_links.sql");
   assert.match(readpagedReceipt.sha256, /^[a-f0-9]{64}$/u);
   const readindexedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readindexed"].schema;
   const readindexedPool = migrationPool(rows, readindexedSchema);
   const readindexedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     readindexedPool, readindexedSchema, migrations,
   );
-  assert.equal(readindexedReceipt.count, 75);
-  assert.equal(readindexedReceipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(readindexedReceipt.count, 76);
+  assert.equal(readindexedReceipt.tail, "0076_classification_correction_links.sql");
   assert.match(readindexedReceipt.sha256, /^[a-f0-9]{64}$/u);
   const batchedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-batched"].schema;
   const batchedPool = migrationPool(rows, batchedSchema);
   const batchedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     batchedPool, batchedSchema, migrations,
   );
-  assert.equal(batchedReceipt.count, 75);
-  assert.equal(batchedReceipt.tail, "0075_github_distribution_manifest_visibility.sql");
+  assert.equal(batchedReceipt.count, 76);
+  assert.equal(batchedReceipt.tail, "0076_classification_correction_links.sql");
   assert.match(batchedReceipt.sha256, /^[a-f0-9]{64}$/u);
   assert.match(pagedReceipt.sha256, /^[a-f0-9]{64}$/u);
 
@@ -502,7 +503,7 @@ test("bundled migration loader pins the image migration directory", async () => 
   const migrations = await readPostgresCommunityGraphBenchmarkMigrations({
     async readMigrations(actual) { options = actual; return fakeMigrations(); },
   });
-  assert.equal(migrations.length, 75);
+  assert.equal(migrations.length, 76);
   assert.deepEqual(options, {
     role: "primary",
     rootDirectory: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT,

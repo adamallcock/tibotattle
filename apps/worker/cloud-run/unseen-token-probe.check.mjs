@@ -54,7 +54,7 @@ const SAMPLE_ROWS = Object.freeze([
 test("held listing: counts only, no token text, the verdict unchanged", () => {
   const catalog = bundledTokenCatalog();
   assert.ok(catalog.model.has("gpt-5.5") && catalog.model.has("unknown"));
-  assert.ok(catalog.plan.has("prolite") && !catalog.plan.has("promax"));
+  assert.ok(catalog.plan.has("prolite") && catalog.plan.has("promax"));
   const report = unseenTokenReport(SAMPLE_ROWS, { day: DAY, catalog, listing: "held" });
   assert.deepEqual([report.schema, report.listing, report.verdict, report.catalogVersion],
     [UNSEEN_TOKEN_PROBE_SCHEMA, "held", "unseen", catalog.version]);

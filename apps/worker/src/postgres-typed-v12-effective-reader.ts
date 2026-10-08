@@ -1,6 +1,4 @@
 import {
-  canonicalTelemetryV11Json,
-  parseTelemetryV11Record,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
   TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
@@ -8,11 +6,13 @@ import {
   MAX_TELEMETRY_V12_DAY_CANONICAL_BYTES,
   MAX_TELEMETRY_V12_DAY_CHUNKS,
   MAX_TELEMETRY_V12_CHUNK_RECORDS,
-  type TelemetryV11Record,
   type TelemetryV12Record,
   type TelemetryV12Stream,
 } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "./crypto";
+import { telemetryV12AnalyticalProjection } from "./telemetry-v12-compatibility";
+import { applyPostgresClassificationOverlays } from "./postgres-classification-links";
+import { readPostgresClassificationRecords } from "./postgres-classification-records";
 import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
@@ -39,6 +39,8 @@ export interface PostgresTelemetryV12EffectiveRecord {
   readonly occurrenceId: string;
   readonly observedAt: string;
   readonly observedAtMs: number;
+  /** Full v1.2 analytical bytes after accepted classification overlays;
+   * sourceRecordKey continues to name the immutable original physical row. */
   readonly sourceRecordJson: string;
   readonly recordJson: string;
   readonly sourceRecordKey: string;
@@ -189,23 +191,8 @@ function nullableInteger(value: unknown, maximum = 1_000_000_000_000): number | 
 }
 
 function normalizeV12Record(streamName: PostgresTelemetryV12EffectiveStream, value: TelemetryV12Record): string {
-  let projected: Record<string, unknown>;
-  if (streamName === "usage") {
-    projected = { ...(value as unknown as Record<string, unknown>), schemaVersion: "usage-event-v1.1" };
-    delete projected.boundaryFlags;
-    delete projected.tieOrder;
-    delete projected.cacheWriteTtl;
-  } else if (streamName === "quota") {
-    projected = { ...(value as unknown as Record<string, unknown>), schemaVersion: "quota-observation-v1.1" };
-  } else {
-    projected = { ...(value as unknown as Record<string, unknown>), schemaVersion: "session-dimension-v1.1" };
-  }
-  try {
-    const parsed = parseTelemetryV11Record(streamName, projected) as TelemetryV11Record;
-    return canonicalTelemetryV11Json(parsed);
-  } catch {
-    throw unavailable();
-  }
+  try { return telemetryV12AnalyticalProjection(streamName, value); }
+  catch { throw unavailable(); }
 }
 
 interface StorageRow extends TelemetryV12TypedRecordRow {
@@ -294,6 +281,36 @@ async function decodedRow(
     recordJson: normalizeV12Record(streamName, sourceRecord),
     sourceRecordKey: `v12:record:${recordId}`,
   });
+}
+
+/** Keep original physical provenance while resolving analytical classification
+ * in the same read snapshot. Quota has no classification overlay contract. */
+async function decodedRows(client: PostgresClient, schema: string, participantId: string,
+  streamName: PostgresTelemetryV12EffectiveStream, rows: readonly StorageRow[]):
+  Promise<PostgresTelemetryV12EffectiveRecord[]> {
+  const output: PostgresTelemetryV12EffectiveRecord[] = [];
+  for (let offset = 0; offset < rows.length; offset += MAX_OCCURRENCE_IDS) {
+    const page = rows.slice(offset, offset + MAX_OCCURRENCE_IDS);
+    const decoded = await Promise.all(page.map(row => decodedRow(streamName, row)));
+    if (streamName !== "quota") {
+      const original = await readPostgresClassificationRecords(client, schema, 12,
+        page.map(row => integer(row.storage_row_id, 1).toString()));
+      const overlaid = await applyPostgresClassificationOverlays(client, schema, participantId, streamName, [...original.values()]);
+      const analytical = new Map(overlaid.map(record => [record.recordId, record]));
+      for (let index = 0; index < decoded.length; index++) {
+        const record = decoded[index]!;
+        const id = integer(page[index]!.storage_row_id, 1).toString();
+        const source = original.get(id), overlay = analytical.get(id);
+        if (!source || !overlay || source.recordJson !== record.sourceRecordJson
+            || source.stream !== streamName || source.occurrenceId !== record.occurrenceId
+            || source.observedAtMs !== record.observedAtMs || overlay.format !== 12) throw unavailable();
+        decoded[index] = Object.freeze({ ...record, sourceRecordJson: overlay.recordJson,
+          recordJson: normalizeV12Record(streamName, JSON.parse(overlay.recordJson) as TelemetryV12Record) });
+      }
+    }
+    output.push(...decoded);
+  }
+  return output;
 }
 
 function BufferHex(value: unknown): string {
@@ -682,7 +699,7 @@ export async function readPostgresTelemetryV12EffectivePage(
         [requestedDay, streamName, participantId, cursor.observedAtMs,
           cursor.occurrenceId, pageLimit + 1],
       );
-      const parsed = await Promise.all(query.rows.slice(0, pageLimit).map((row) => decodedRow(streamName, row)));
+      const parsed = await decodedRows(client, schema, participantId, streamName, query.rows.slice(0, pageLimit));
       if (parsed.some((record) => record.observedAt.slice(0, 10) !== requestedDay)) throw unavailable();
       // The cursor names an instant and an id. A next record with both of the
       // last record's could not be addressed, so refuse rather than skip it.
@@ -784,7 +801,7 @@ export async function readPostgresTelemetryV12EffectiveOccurrences(
         [JSON.stringify(encodedIds), streamName, participantId, MAX_VARIANT_ROWS + 1],
       );
       if (query.rows.length > MAX_VARIANT_ROWS) throw unavailable();
-      const records = await Promise.all(query.rows.map((row) => decodedRow(streamName, row)));
+      const records = await decodedRows(client, schema, participantId, streamName, query.rows);
       if (new Set(records.map((record) => record.sourceRecordKey)).size !== records.length) throw unavailable();
       return { available: true, records: Object.freeze(records) };
     }, { operation: "typed_v12.effective_occurrences", statementTimeoutMilliseconds: 10_000, lockTimeoutMilliseconds: 5_000 });

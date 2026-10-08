@@ -1,3 +1,5 @@
+import { preparePostgresClassificationActivation, postgresClassificationLinkPredicate } from "./postgres-classification-links";
+import { PostgresClassificationCorrectionError } from "./postgres-classification-correction";
 /**
  * Live v1.1 telemetry admission on PostgreSQL (GCP fast path, IN-2).
  *
@@ -1831,8 +1833,19 @@ export function createPostgresTelemetryV11Domain(
               requestedManifestDigest: manifest.manifestDigest,
             });
           }
-          await assertDomainClosure(client, s, principal, manifest, predecessor);
           const generationId = crypto.randomUUID();
+          try {
+            await preparePostgresClassificationActivation(client,s,{
+              participantId:principal.participantId,deviceId:principal.deviceId,format:11,
+              previousGenerationId:predecessor.previous_generation_id,generationId,
+              predecessorTokenHash:tokenHash,inputRevision:count(predecessor.input_revision),
+              manifestDigest:manifest.manifestDigest,days:manifest.days,
+            });
+          } catch(error) {
+            if(error instanceof PostgresClassificationCorrectionError) throw new DomainRefusal("compatibility_unproven");
+            throw error;
+          }
+          await assertDomainClosure(client, s, principal, manifest, predecessor);
           await client.query(
             `INSERT INTO ${t(s, "telemetry_v11_domains")} (
                id, participant_id, device_id, predecessor_token_hash, previous_generation_id,
@@ -1959,6 +1972,7 @@ async function assertTypedV1Transition(
   principal: PostgresTelemetryV11Principal,
   predecessor: PredecessorRow,
   candidateDays: string,
+  activationDigest: string,
 ): Promise<void> {
   const present = await client.query<{ present: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM ${t(s, "typed_v1_admission_state")}) AS present`,
@@ -2013,9 +2027,10 @@ async function assertTypedV1Transition(
              WHERE successor.manifest_id = candidate.manifest_id AND successor.stream = c.stream
                AND successor.legacy_occurrence_id = ${t(s, "typed_legacy_admission_decode_id")}(r.occurrence_id)
                AND (successor.legacy_digest = r.canonical_digest
-                 OR ${correctedUsageEquivalent(s, "r.id", "successor.typed_record_id")})))
+                 OR ${correctedUsageEquivalent(s, "r.id", "successor.typed_record_id")}
+                 OR ${postgresClassificationLinkPredicate(s,"r.id","successor.typed_record_id",10,11,"$4::text")})))
       LIMIT 1`,
-    [principal.participantId, predecessor.winners_json, candidateDays],
+    [principal.participantId, predecessor.winners_json, candidateDays,activationDigest],
   );
   if (uncovered.rows.length) throw new DomainRefusal("compatibility_unproven");
 }
@@ -2036,7 +2051,7 @@ async function assertDomainClosure(
 ): Promise<void> {
   const days = manifest.days;
   const candidateDays = JSON.stringify(days.map((entry) => ({ day: entry.day, manifest_id: entry.manifestId })));
-  await assertTypedV1Transition(client, s, principal, predecessor, candidateDays);
+  await assertTypedV1Transition(client, s, principal, predecessor, candidateDays,manifest.manifestDigest);
   const compatibility = await client.query<{ typed: boolean; raw: boolean }>(
     `SELECT EXISTS (SELECT 1 FROM ${t(s, "typed_v11_admission_state")} WHERE id = 1) AS typed,
             EXISTS (SELECT 1 FROM ${t(s, "telemetry_v11_records")}) AS raw`,
@@ -2107,9 +2122,12 @@ async function assertDomainClosure(
           SELECT 1 FROM ${t(s, "typed_v11_record_admissions")} new_row
            WHERE new_row.manifest_id = candidate.manifest_id AND new_row.stream = old_row.stream
              AND new_row.legacy_occurrence_id = old_row.occurrence_id
-             AND new_row.legacy_digest = old_proof.canonical_digest))
+             AND (new_row.legacy_digest = old_proof.canonical_digest OR EXISTS (
+               SELECT 1 FROM ${t(s,"typed_telemetry_records")} old_typed
+                WHERE old_typed.format=10 AND old_typed.source_row_id=old_row.id
+                  AND ${postgresClassificationLinkPredicate(s,"old_typed.id","new_row.typed_record_id",10,11,"$4::text")}))))
       LIMIT 1`,
-    [principal.participantId, predecessor.winners_json, candidateDays],
+    [principal.participantId, predecessor.winners_json, candidateDays,manifest.manifestDigest],
   );
   if (legacyGap.rows.length) throw new DomainRefusal("compatibility_unproven");
   // Every admitted row of the previous generation must survive: the same
@@ -2127,9 +2145,10 @@ async function assertDomainClosure(
            WHERE new_row.manifest_id = candidate.manifest_id AND new_row.stream = old_row.stream
              AND new_row.occurrence_id = old_row.occurrence_id
              AND (new_row.base_digest = old_row.base_digest
-               OR ${correctedUsageEquivalent(s, "old_row.typed_record_id", "new_row.typed_record_id")})))
+               OR ${correctedUsageEquivalent(s, "old_row.typed_record_id", "new_row.typed_record_id")}
+               OR ${postgresClassificationLinkPredicate(s,"old_row.typed_record_id","new_row.typed_record_id",11,11,"$3::text")})))
         LIMIT 1`,
-      [manifest.predecessor.previousGenerationId, candidateDays],
+      [manifest.predecessor.previousGenerationId, candidateDays,manifest.manifestDigest],
     );
     if (previousGap.rows.length) throw new DomainRefusal("compatibility_unproven");
   }

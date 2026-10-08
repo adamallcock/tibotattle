@@ -17,7 +17,9 @@
  *     source with a different event time is folded into the same group.
  *  3. Groups are reconciled with the vendored d43c8f92 reconcileGroups (usage,
  *     correction-aware) and genericOccurrence/genericRecordJson (quota and
- *     session), unchanged.
+ *     session), unchanged. Accepted PostgreSQL classification links overlay
+ *     only exact usage/session source variants before reconciliation. Physical
+ *     provenance and retained total-fact audit metadata remain original.
  *
  * Corrections never move an event across days: an event-time disagreement
  * makes the occurrence a conflict (eventTime null, status 'conflict') on
@@ -39,14 +41,15 @@
 
 import {
   canonicalTelemetryV11Json,
-  parseTelemetryV11Record,
   type TelemetryV11Attribution,
-  type TelemetryV11Record,
   type TelemetryV12Record,
 } from "@app-usagemonitor/telemetry-contract";
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
+import { telemetryV12AnalyticalProjection } from "../telemetry-v12-compatibility";
 import type { PostgresClient } from "../postgres-client";
+import { applyPostgresClassificationOverlays, postgresClassificationEvidenceIdentities } from "../postgres-classification-links";
+import { readPostgresClassificationRecords, type PostgresClassificationRecord } from "../postgres-classification-records";
 import { decodeTelemetryV12Record, type TelemetryV12TypedRecordRow } from "../telemetry-v12-typed-codec";
 import { prepareAnalyticsReplayUsageCorrectionAssertion } from "../telemetry-usage-reconciliation";
 import {
@@ -996,20 +999,8 @@ function v12OccurrencesSql(s: string): string {
 
 /** d43c8f92 telemetry-v12-effective-reader.ts normalizeV12Record. */
 function v12AnalyticalRecord(stream: EffectiveTelemetryStream, value: TelemetryV12Record): string {
-  const projected: Record<string, unknown> = { ...(value as unknown as Record<string, unknown>) };
-  if (stream === "usage") {
-    projected.schemaVersion = "usage-event-v1.1";
-    delete projected.boundaryFlags;
-    delete projected.tieOrder;
-    delete projected.cacheWriteTtl;
-  } else {
-    projected.schemaVersion = stream === "quota" ? "quota-observation-v1.1" : "session-dimension-v1.1";
-  }
-  try {
-    return canonicalTelemetryV11Json(parseTelemetryV11Record(stream, projected) as TelemetryV11Record);
-  } catch {
-    return sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-  }
+  try { return telemetryV12AnalyticalProjection(stream, value); }
+  catch { return sourceFail("ANALYTICS_V2_SOURCE_CONFLICT"); }
 }
 
 type V12StorageRow = Record<string, unknown>;
@@ -1349,15 +1340,61 @@ function pushSource<T>(target: Map<string, T[]>, id: string, value: T): void {
   if (group) group.push(value); else target.set(id, [value]);
 }
 
-/** Pure decode/verify seam: no driver, transaction or platform operations. */
-async function assembleRawExpansion(raw: RawExpansionBatch, scope: OwnerScope, ownerDigest: string,
-  stream: EffectiveTelemetryStream, target: ExpandedSources): Promise<void> {
+/** Fetch exact physical variants in bounded pages. Archived total facts can
+ * outlive their original row; absence preserves their existing evidence. */
+async function classificationVariants(client: PostgresClient, s: string, participantId: string,
+  stream: "usage" | "session", format: 10 | 11 | 12, ids: readonly string[], retained = false):
+  Promise<Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>> {
+  const output = new Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>();
+  for (const page of chunks([...new Set(ids)], EXPANSION_BATCH)) {
+    let selected = page;
+    if (retained) {
+      const present = await client.query<{ id: string }>(
+        `SELECT id::text FROM ${s}.typed_telemetry_records WHERE format=$1 AND id=ANY($2::bigint[]) ORDER BY id LIMIT 201`,
+        [format, page]);
+      if (present.rows.length > EXPANSION_BATCH) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+      selected = present.rows.map(row => row.id);
+    }
+    if (!selected.length) continue;
+    const original = await readPostgresClassificationRecords(client, s, format, selected);
+    const analytical = await applyPostgresClassificationOverlays(client, s, participantId, stream, [...original.values()]);
+    if (analytical.length !== original.size) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    for (const row of analytical) {
+      const source = original.get(row.recordId);
+      if (!source || source.stream !== stream || row.format !== source.format
+          || row.occurrenceId !== source.occurrenceId || row.observedAtMs !== source.observedAtMs) {
+        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      }
+      output.set(row.recordId, { original: source, analytical: row });
+    }
+  }
+  return output;
+}
+
+/** Verify original bytes before presenting an analytical classification. */
+async function assembleRawExpansion(client: PostgresClient, s: string, raw: RawExpansionBatch,
+  scope: OwnerScope, ownerDigest: string, stream: EffectiveTelemetryStream, target: ExpandedSources): Promise<void> {
   const requested = new Set(raw.ids);
   const legacy = raw.legacy;
   if (legacy.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
   const decoded: TypedTelemetryCompatibilityRecord[] = [];
   for (const row of legacy) decoded.push(await decodeLegacyRow(row, scope.participantId,
     scope.v1Namespace ?? scope.v11Namespace ?? "", stream));
+  if (stream !== "quota") {
+    for (const format of [10, 11] as const) {
+      const variants = await classificationVariants(client, s, scope.participantId, stream, format,
+        legacy.filter(row => Number(row.format) === format).map(row => String(safeInteger(row.storage_row_id, 1))));
+      for (let index = 0; index < legacy.length; index++) {
+        if (Number(legacy[index]!.format) !== format) continue;
+        const row = decoded[index]!;
+        const variant = variants.get(String(safeInteger(legacy[index]!.storage_row_id, 1)));
+        if (!variant || variant.original.recordJson !== row.record_json
+            || variant.original.sourceNamespace !== row.source_namespace
+            || variant.original.deviceId !== row.device_id) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+        decoded[index] = Object.freeze({ ...row, record_json: variant.analytical.recordJson });
+      }
+    }
+  }
   const physical = new Map(legacy.map((row, index) => [decoded[index]!, safeInteger(row.storage_row_id, 1)]));
   decoded.sort((left, right) => compareText(left.occurrence_id, right.occurrence_id)
     || physical.get(left)! - physical.get(right)!);
@@ -1367,19 +1404,50 @@ async function assembleRawExpansion(raw: RawExpansionBatch, scope: OwnerScope, o
   }
   const v12 = raw.v12;
   if (v12.length > MAX_BATCH_V12_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  const v12Variants = stream === "quota" ? null : await classificationVariants(client, s, scope.participantId,
+    stream, 12, v12.map(row => String(safeInteger(row.storage_row_id, 1))));
   for (const row of v12) {
-    const record = await decodeV12Row(stream, row);
+    let record = await decodeV12Row(stream, row);
     if (!requested.has(record.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    if (v12Variants) {
+      const variant = v12Variants.get(String(safeInteger(row.storage_row_id, 1)));
+      if (!variant || variant.original.recordJson !== record.sourceRecordJson) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+      record = Object.freeze({ ...record, sourceRecordJson: variant.analytical.recordJson,
+        recordJson: v12AnalyticalRecord(stream, JSON.parse(variant.analytical.recordJson) as TelemetryV12Record) });
+    }
     pushSource(target.v12, record.occurrenceId, record);
   }
   const facts = raw.facts;
   if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  const parsedFacts: TelemetryUsageCorrectionFactRow[] = [];
   for (const row of facts) {
     const fact = await parseCorrectionFact(row);
     if (fact.ownerDigest !== ownerDigest || fact.participantId !== scope.participantId
         || !requested.has(fact.source.occurrenceId)) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-    pushSource(target.facts, fact.source.occurrenceId, fact);
+    parsedFacts.push(fact);
   }
+  if (stream === "usage") {
+    for (const format of [10, 11] as const) {
+      const sourceFormat = format === 10 ? "v1" : "v11";
+      const variants = await classificationVariants(client, s, scope.participantId, stream, format,
+        parsedFacts.filter(fact => fact.source.format === sourceFormat).map(fact => String(fact.source.storageRowId)), true);
+      for (let index = 0; index < parsedFacts.length; index++) {
+        const fact = parsedFacts[index]!;
+        if (fact.source.format !== sourceFormat) continue;
+        const variant = variants.get(String(fact.source.storageRowId));
+        // Total facts have their own immutable canonical variant. A link for a
+        // nullable-total sibling must never reclassify or suppress this fact.
+        if (variant && variant.original.recordJson === fact.recordJson
+            && variant.original.occurrenceId === fact.source.occurrenceId
+            && variant.original.observedAtMs === Date.parse(fact.source.eventTime)) {
+          // Audit digests still describe the validated original fact. The
+          // vendored reconciler consumes only this analytical recordJson.
+          parsedFacts[index] = Object.freeze({ ...fact, recordJson: variant.analytical.recordJson });
+        }
+      }
+    }
+  }
+  for (const fact of parsedFacts) pushSource(target.facts, fact.source.occurrenceId, fact);
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,7 +1563,7 @@ export async function readOwnerOccurrences(
     if (occurrenceIds.length > 0) await withGenericPlans(client, async () => {
       for await (const raw of fetchRawExpansion(client, s, now, scope, ownerDigest, stream,
         occurrenceIds, corrections, expandV12)) {
-        await assembleRawExpansion(raw, scope, ownerDigest, stream, { direct, v12, facts });
+        await assembleRawExpansion(client, s, raw, scope, ownerDigest, stream, { direct, v12, facts });
       }
     });
 
@@ -1864,7 +1932,8 @@ function canonicalRow(row: Record<string, unknown>): Array<[string, unknown]> {
  * id and interval, exclusions.ts), which decide whether the owner's d enters
  * the community aggregates. It runs exactly the reader's statements (the same
  * candidate SQL and the same prepared expansion statements) and skips
- * decoding and reconciliation, so an unchanged F(o,d) means
+ * decoding and reconciliation, while validating accepted per-occurrence
+ * classification-link proof identities. An unchanged F(o,d) means
  * readOwnerOccurrences returns the same occurrences for (o, d), and so the
  * same analyticsV2DayDigest, and the same exclusion of (o, d): the reader's
  * output is a pure function of the scope, the candidates and those rows. A day absent
@@ -1910,8 +1979,13 @@ export async function readOwnerDayFingerprints(
           const facts = raw.facts;
           if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
           for (const row of facts) keyed(row.occurrence_id).facts.push(canonicalRow(row));
+          const classification = stream === "quota" ? null : await postgresClassificationEvidenceIdentities(
+            client, s, scope.participantId, stream, raw.ids);
           for (const [id, sources] of byOccurrence) {
-            sourceDigests.set(id, await sha256Hex(canonicalJson([sources.legacy, sources.v12, sources.facts])));
+            const evidence: unknown[] = [sources.legacy, sources.v12, sources.facts];
+            // Preserve unchanged identities where this occurrence has no links.
+            if (classification?.has(id)) evidence.push(classification.get(id)!);
+            sourceDigests.set(id, await sha256Hex(canonicalJson(evidence)));
           }
         }
       });

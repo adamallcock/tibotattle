@@ -393,3 +393,24 @@ combined kernel 5 after all selected changes with
 the owning kernel and analytics gates on the merged tree. This fix branch's
 focused checks do not qualify its retained branch-local kernel closure, deployment
 or combined performance; those remain integrator gates.
+
+## Client classification compatibility
+
+The source contract accepts known `promax` plan attribution and the reviewed
+`gpt-6.1-sol` identity. This intake contract does not change the public allowance
+normalization or qualify installed-client uploads.
+
+Primary migration `0076_classification_correction_links.sql` follows the existing
+`0075_github_distribution_manifest_visibility.sql` without changing its bytes.
+The normal v1.1/v1.2 domain activation transaction can append an authenticated
+unknown-to-known classification link for the same owner, device, occurrence and
+clock. Nonclassification quantities and original typed rows stay immutable;
+effective readers validate the link and its activation receipt, and replay
+converges on the existing head. A differing quantity remains a conflict.
+
+The PostgreSQL synthetic gate is `node --test
+postgres-test/classification-correction.spec.mjs` with an owned local
+`PG_TEST_SOCKET`/`PG_TEST_PORT`. It checks correction atomicity, variants,
+whole-session provider closure, replay and the populated migration75-to76
+receipt fence. Migration, image rollout and installed-client acceptance remain
+separate operational gates. GCP performance admission stays retired.

@@ -176,6 +176,9 @@ export function createFastTelemetryUsagePricer(): FastTelemetryUsagePricer {
       const descriptor = Object.getOwnPropertyDescriptor(row, name);
       if (!descriptor || !("value" in descriptor)) return fallback(row);
     }
+    // Ultrafast has distinct rates and eligibility. Keep it outside the
+    // Standard/Fast cache and let the pinned oracle select its complete contract.
+    if (row.speedMode === "ultrafast") return fallback(row);
     const openai = row.provider === "openai_codex";
     if ((!openai && row.provider !== "anthropic_claude_code")
       || row.modelRecognition !== "recognized" || row.modelId === "unknown"
@@ -204,8 +207,8 @@ export function createFastTelemetryUsagePricer(): FastTelemetryUsagePricer {
     }
     const fast = row.billingSurface === "chatgpt_subscription" && row.speedMode === "fast";
     const contextBucket = context === null ? 0 : bucket(context, CONTEXT_BOUNDARIES) + 1;
-    // All selection inputs occur in this key. Speed modes other than Codex Fast
-    // do not affect prices; the returned speed mode always comes from this row.
+    // All specialized selection inputs occur in this key. Ultrafast already
+    // falls back above; the returned speed mode always comes from this row.
     const key = (((((openai ? 1 : 0) * 2 + (subscription ? 1 : 0)) * 4 + tier) * 2 + (fast ? 1 : 0))
       * (TIME_BOUNDARIES.length + 1) + bucket(epoch, TIME_BOUNDARIES)) * (CONTEXT_BOUNDARIES.length + 2) + contextBucket;
     let byCell = plans.get(row.modelId);
