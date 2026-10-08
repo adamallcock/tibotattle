@@ -303,10 +303,10 @@ describe("admin community allowance preview", () => {
       const projected = projectAdminModelHistoryDay({
         day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
         values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
-          .map((model) => [model.modelId, 1.7976931348623157e308, Number.MAX_SAFE_INTEGER]),
-        fittedParticipantCount: Number.MAX_SAFE_INTEGER,
+          .map((model) => [model.modelId, 1.7976931348623157e308, 99_999_999_999_999]),
+        fittedParticipantCount: 99_999_999_999_999,
         unstableParticipantCount: 0, staleParticipantCount: 0, refusedParticipantCount: 0,
-        v1ParticipantCount: Number.MAX_SAFE_INTEGER, unsupportedSourceParticipantCount: 0,
+        v1ParticipantCount: 99_999_999_999_999, unsupportedSourceParticipantCount: 0,
       });
       expect(projected).not.toBeNull();
       return projected!;

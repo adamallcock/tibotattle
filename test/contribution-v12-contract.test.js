@@ -301,3 +301,15 @@ test("generated v1.2 schemas match runtime keys and enforce closed shape", () =>
     Object.fromEntries(Object.entries(telemetryV12RequiredConsent()).map(([key, value]) => [key, { const: value }])),
   );
 });
+
+
+test("known Pro Max quota and account-plan records retain the existing v1.2 dictionary", () => {
+  const consent=telemetryV12RequiredConsent();
+  assert.equal(consent.fieldDictionaryVersion,"telemetry-v1.2-registry-2026-09-20.1");
+  const record=quota();
+  record.planType="promax";
+  record.accountPlanAttribution={...record.accountPlanAttribution,planType:"promax",planBasis:"same_source_occurrence"};
+  assert.equal(parseTelemetryV12Record("quota",record),record);
+  assert.equal(parseTelemetryV12Attribution(record.accountPlanAttribution),record.accountPlanAttribution);
+  assert.throws(()=>parseTelemetryV12Record("quota",{...record,planType:"synthetic-unreviewed-plan"}));
+});

@@ -1,69 +1,47 @@
-// Codex subscription speed ("Fast") quota accounting.
+// API-price-equivalent accounting for observed Codex speed modes. Published
+// Fast/Priority and Ultrafast API ratios are proved against exact token cards,
+// then qualified by event date and context. These are comparison prices, not
+// subscription allowance consumption: the separately documented included-
+// allowance factors (Fast 2.5x and Astra Ultrafast 8x) do not belong in this
+// money series. Historical API-equivalent prices retain their original meaning.
 //
-// SOURCE OF THE MULTIPLIERS
-// -------------------------
-// Codex Fast mode IS the API's Priority processing tier: the toggle writes
-// `service_tier: "priority"`, and the official pricing page labels the
-// Priority tier's tab "Fast mode". Fast usage is therefore priced at the
-// vendor's published Priority API rates. Every published Priority row is an
-// exact uniform multiple of its Standard row on every token component - a
-// relationship deriveFastModePriorityRatiosFromRegistry() re-verifies against
-// the shipped price registry on load - so applying that per-family ratio to a
-// Standard-priced amount equals pricing the same tokens on an eligible Priority card,
-// including the GPT-5.6 long-context band whose Priority rows the registry
-// carries. This replaced the vendor's credit-rate statement (which claimed
-// 2.5x for GPT-5.6) on 2026-08-30: the published Priority price for the
-// GPT-5.6 family is 2x Standard, and the price registry is the single source
-// of truth. Multipliers are derived, never fitted from this monitor's own
-// calibration.
-//
-// WHAT THE LOGS ACTUALLY OBSERVE
-// ------------------------------
-// Codex records the speed mode as an `event_msg` whose payload type is
-// `thread_settings_applied`, carrying `thread_settings.service_tier`
-// ("priority" = Fast, "default" = Standard). That event fires only when the
-// setting is APPLIED OR CHANGED - never at session start - and neither
-// `session_meta` nor `turn_context` carries a tier. So every tier change is
-// observable and forward-fills from the moment it is seen, but the session
-// BASELINE is never written to the rollout log. A session where the mode was
-// chosen up front and never switched contains no tier evidence at all.
-//
-// The provider log parser already models this exactly: it forward-fills from
-// the tier timeline and reports `tierSource: "unobserved"` before the first
-// observation, which reaches accounting as `codexSpeedMode: "unknown"`. A
-// partial known-speed fraction is therefore a faithful measurement, not a
-// defect. The declared preference below exists only to attribute that
-// pre-first-observation remainder: observation always wins, and anything still
-// unattributed stays an explicit unknown rather than a silent 1.0.
+// Supported rollouts can record tier changes in thread_settings_applied and
+// a per-turn service_tier in turn_context. Older logs may omit the baseline;
+// absence alone does not explain why evidence is missing. Parsers own version,
+// timeline, turn-override and lineage semantics. This module receives the
+// resulting observation or a timestamp-covered config declaration. Only the
+// remaining unknown events use the explicit Standard/Fast sensitivity choice.
 import {
   APP_PRICE_REGISTRY_VERSION,
   OPENAI_OFFICIAL_PRICE_CARDS,
 } from "./price-registry.js";
 
 const FAST_MODE_MULTIPLIER_RECORDED_AT = "2026-08-30";
+const API_TIER_BY_SPEED_MODE = Object.freeze({ fast: "priority", ultrafast: "ultrafast" });
 
 export const FAST_MODE_MULTIPLIER_SOURCE = Object.freeze({
   publisher: "openai",
-  basis: "published_priority_api_price_ratio_relative_to_standard",
+  basis: "published_api_speed_price_ratio_relative_to_standard",
   statement:
-    "Codex Fast mode is the API Priority processing tier. Published Priority/Standard ratios are derived for exact registered models and reviewed aliases, then checked against the event's context and price epoch. A model or event context without an eligible Priority card uses a disclosed assumed 2x, never a nearby model or an unavailable rate.",
-  recordedAt: FAST_MODE_MULTIPLIER_RECORDED_AT,
+    "Published Fast/Priority and Ultrafast API ratios are derived for exact registered models and reviewed aliases, then checked against the event's context and price epoch. Fast without an eligible Priority card retains its disclosed assumed 2x. Ultrafast without an eligible card remains unweighted. These API-equivalent comparisons do not measure included subscription allowance consumption.",
+  recordedAt: "2026-09-29",
   priceRegistryVersion: APP_PRICE_REGISTRY_VERSION,
-  appliesTo: "codex_subscription_quota_and_api_price_equivalent",
-  // Tier changes are observable; the session baseline is not.
-  observability: "rollout_thread_settings_changes_only_no_session_baseline",
+  appliesTo: "api_price_equivalent_only",
+  observability: "rollout_thread_settings_and_supported_turn_context",
 });
 
 // What a Codex rollout log can and cannot prove about the speed mode. Shared
 // so every surface states the same thing instead of re-deriving it.
 export const CODEX_SPEED_MODE_OBSERVABILITY = Object.freeze({
   recordedEvent: "event_msg.payload.thread_settings_applied.service_tier",
-  observedValues: Object.freeze({ priority: "fast", default: "standard" }),
-  firesOn: "settings_applied_or_changed",
+  recordedTurnContext: "turn_context.payload.service_tier",
+  observedValues: Object.freeze({ priority: "fast", fast: "fast", default: "standard", standard: "standard", ultrafast: "ultrafast" }),
+  firesOn: "settings_applied_or_changed_and_supported_turn_context",
+  // No guaranteed session_meta baseline; supported turn contexts can carry it.
   sessionBaselineRecorded: false,
-  resolution: "forward_filled_from_first_observation_in_the_session",
+  resolution: "observed_thread_settings_with_supported_per_turn_overrides",
   unobservedMeans:
-    "the mode was set before the session began and never switched, so the log holds no tier for those turns",
+    "no supported tier observation covers these turns; older logs may omit the baseline",
 });
 
 function decimalRational(amount) {
@@ -73,7 +51,7 @@ function decimalRational(amount) {
   return { digits: BigInt(match[1] + fraction), scale: fraction.length };
 }
 
-// priority/standard as an exact rational; equality is checked by
+// Premium/Standard as an exact rational; equality is checked by
 // cross-multiplication so decimal string scales never introduce float error.
 function ratioPair(priorityAmount, standardAmount) {
   const priority = decimalRational(priorityAmount);
@@ -123,22 +101,27 @@ function effectiveRangesOverlap(left, right) {
 }
 
 /**
- * Canonical model -> published Priority (Fast) API price relative to Standard,
+ * Canonical model -> published Fast or Ultrafast API price relative to Standard,
  * proven uniform across every token component, eligible context band, and
  * dated price epoch of that exact model before it is used. A non-uniform registry
  * throws here rather than shipping a wrong multiplier.
  */
-export function deriveFastModePriorityRatiosFromRegistry(
+export function deriveSpeedModeApiRatiosFromRegistry(
+  mode,
   cards = OPENAI_OFFICIAL_PRICE_CARDS,
 ) {
+  if (!Object.hasOwn(API_TIER_BY_SPEED_MODE, mode)) {
+    throw new TypeError("Unsupported API speed mode.");
+  }
+  const serviceTier = API_TIER_BY_SPEED_MODE[mode];
   const ratios = {};
   const openAiCards = cards.filter((card) => card.provider === "openai");
   const priorityModels = [...new Set(openAiCards.filter(
-    (card) => card.service_tier === "priority",
+    (card) => card.service_tier === serviceTier,
   ).map((card) => card.model))].sort();
   for (const model of priorityModels) {
     const priorityCards = openAiCards.filter(
-      (card) => card.model === model && card.service_tier === "priority",
+      (card) => card.model === model && card.service_tier === serviceTier,
     );
     let reference = null;
     let referenceLabel = null;
@@ -155,7 +138,7 @@ export function deriveFastModePriorityRatiosFromRegistry(
       ));
       if (standardCards.length === 0) {
         throw new TypeError(
-          `Priority card ${priorityCard.id} has no overlapping Standard card.`,
+          `${serviceTier} card ${priorityCard.id} has no overlapping Standard card.`,
         );
       }
       for (const standardCard of standardCards) {
@@ -197,7 +180,7 @@ export function deriveFastModePriorityRatiosFromRegistry(
             referenceLabel = `${priorityCard.id}/${component.usage_component}`;
           } else if (!sameRatio(reference, pair)) {
             throw new TypeError(
-              `Priority/Standard price ratio is not uniform for ${model}: `
+              `${serviceTier}/Standard price ratio is not uniform for ${model}: `
               + `${referenceLabel} vs ${priorityCard.id}/${component.usage_component}.`,
             );
           }
@@ -209,10 +192,18 @@ export function deriveFastModePriorityRatiosFromRegistry(
   return Object.freeze(ratios);
 }
 
+export function deriveFastModePriorityRatiosFromRegistry(cards = OPENAI_OFFICIAL_PRICE_CARDS) {
+  return deriveSpeedModeApiRatiosFromRegistry("fast", cards);
+}
+
 // Canonical model -> published Priority (Fast) API price ratio over Standard,
 // derived from the price registry on load. Any family absent from this map
 // is priced with the disclosed assumed multiplier below, never a silent 1.0.
 export const FAST_MODE_QUOTA_MULTIPLIERS = deriveFastModePriorityRatiosFromRegistry();
+export const SPEED_MODE_API_MULTIPLIERS = Object.freeze({
+  fast: FAST_MODE_QUOTA_MULTIPLIERS,
+  ultrafast: deriveSpeedModeApiRatiosFromRegistry("ultrafast"),
+});
 
 // Owner-approved default for Fast usage on a model without a published
 // Priority rate: include it at 2x Standard and disclose the assumption. 2x
@@ -229,22 +220,28 @@ export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE = Object.freeze({
 
 // Fixed bucket keys for the Standard-priced cost crossing that feeds the
 // weighting. Canonical models are a closed registry-derived set; aliases fold
-// into their reviewed target, not a prefix family. "unsupported" is the
-// explicit assumed-rate bucket, including uncovered event contexts/epochs.
+// into their reviewed target, not a prefix family. "unsupported" identifies
+// uncovered models, event contexts, or epochs: Fast uses its disclosed assumed
+// rate there; Ultrafast remains unweighted.
 export const FAST_MODE_MODEL_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_QUOTA_MULTIPLIERS),
+  "unsupported",
+]);
+export const SPEED_MODE_MODEL_FAMILY_KEYS = Object.freeze([
+  ...new Set(Object.values(SPEED_MODE_API_MULTIPLIERS).flatMap(Object.keys)),
   "unsupported",
 ]);
 
 export const OBSERVED_SPEED_MODE_KEYS = Object.freeze([
   "standard",
   "fast",
+  "ultrafast",
   "unknown",
 ]);
 
 // What the Codex configuration file can and cannot prove about the baseline.
 // `~/.codex/config.toml` holds a top-level `service_tier` key with the CURRENT
-// setting - the only place a session baseline exists at all. The Codex UI
+// setting. A supported turn context can independently record its own tier. The Codex UI
 // rewrites that file on every toggle, so the key proves the value at READ TIME
 // and nothing more. It is therefore recorded as a timestamped observation and
 // resolved only over the interval it covers; it never backfills history and
@@ -278,6 +275,7 @@ export const SPEED_MODE_PROVENANCE_VALUES = Object.freeze([
 // scenario attributes them to Standard; the fast scenario re-attributes the
 // same residual to Fast so fit couplings can quote both directions. The
 // scenario never overrides an observation or a covering declaration.
+// These are sensitivities, not bounds: an unobserved turn could be Ultrafast.
 export const UNRESOLVED_SPEED_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast",
@@ -294,7 +292,7 @@ export const QUOTA_WEIGHTED_API_PRICE_METRIC = Object.freeze({
   standardMetricKey: "apiPriceEquivalentUsd",
   standardMetricLabel: "Standard-rate API-price equivalent",
   explainer:
-    "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.",
+    "Standard-rate API prices, with Fast and Ultrafast priced at the published API rate for the exact model, context, and date. Fast without an eligible Priority rate uses a disclosed assumed 2x; unsupported Ultrafast remains unweighted. This is an API comparison, not a bill or included-allowance formula.",
 });
 
 // Named thresholds for the secondary residual inference. Every one of these is
@@ -306,7 +304,8 @@ export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS = Object.freeze({
   minimumUniquePercentageBoundaries: 4,
   minimumObservedSpanPercentagePoints: 5,
   // A Standard reference is only formed from windows whose observed speed
-  // evidence is both present and overwhelmingly Standard.
+  // evidence is both present and overwhelmingly Standard. The legacy Fast
+  // threshold now limits the combined Fast and Ultrafast fraction.
   minimumReferenceKnownSpeedFraction: 0.6,
   maximumReferenceFastFractionOfKnown: 0.05,
   minimumReferenceWindows: 3,
@@ -327,12 +326,14 @@ export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES = Object.freeze([
 const REGISTERED_MODEL_NAMES = new Map();
 const REGISTERED_STANDARD_CARDS = new Map();
 const REGISTERED_STANDARD_CARDS_BY_MODEL = new Map();
-const REGISTERED_PRIORITY_CARDS = new Map();
+const REGISTERED_SPEED_CARDS = Object.fromEntries(
+  Object.keys(API_TIER_BY_SPEED_MODE).map((mode) => [mode, new Map()]),
+);
 for (const card of OPENAI_OFFICIAL_PRICE_CARDS) {
   for (const name of [card.model, ...(card.aliases ?? [])]) {
     const prior = REGISTERED_MODEL_NAMES.get(name);
     if (prior !== undefined && prior !== card.model) {
-      throw new TypeError(`Ambiguous registered Priority model name: ${name}.`);
+      throw new TypeError(`Ambiguous registered speed model name: ${name}.`);
     }
     REGISTERED_MODEL_NAMES.set(name, card.model);
   }
@@ -342,10 +343,11 @@ for (const card of OPENAI_OFFICIAL_PRICE_CARDS) {
     cards.push(card);
     REGISTERED_STANDARD_CARDS_BY_MODEL.set(card.model, cards);
   }
-  if (card.service_tier === "priority") {
-    const cards = REGISTERED_PRIORITY_CARDS.get(card.model) ?? [];
+  for (const [mode, tier] of Object.entries(API_TIER_BY_SPEED_MODE)) {
+    if (card.service_tier !== tier) continue;
+    const cards = REGISTERED_SPEED_CARDS[mode].get(card.model) ?? [];
     cards.push(card);
-    REGISTERED_PRIORITY_CARDS.set(card.model, cards);
+    REGISTERED_SPEED_CARDS[mode].set(card.model, cards);
   }
 }
 
@@ -378,14 +380,15 @@ function median(values) {
 
 /**
  * The exact registered model (including reviewed aliases), or null when no
- * Priority card supports it. With event evidence, a published classification
+ * card supports the requested premium mode. With event evidence, classification
  * additionally requires an eligible context and effective date. Omitting
  * evidence is a model-capability lookup only, not event-pricing authority.
  */
-export function fastModeModelFamily(model, evidence = undefined) {
-  if (typeof model !== "string") return null;
+function speedModeModelFamily(model, mode, evidence = undefined) {
+  if (typeof model !== "string"
+      || !Object.hasOwn(SPEED_MODE_API_MULTIPLIERS, mode)) return null;
   const canonicalModel = REGISTERED_MODEL_NAMES.get(model);
-  if (!Object.hasOwn(FAST_MODE_QUOTA_MULTIPLIERS, canonicalModel ?? "")) return null;
+  if (!Object.hasOwn(SPEED_MODE_API_MULTIPLIERS[mode], canonicalModel ?? "")) return null;
   if (evidence === undefined) return canonicalModel;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)
       || Object.keys(evidence).some((key) => ![
@@ -411,7 +414,7 @@ export function fastModeModelFamily(model, evidence = undefined) {
       && (conditions?.max_total_input_tokens === undefined || context <= Number(conditions.max_total_input_tokens))
     ));
   };
-  const priorityCards = REGISTERED_PRIORITY_CARDS.get(canonicalModel).filter(coversDay);
+  const speedCards = REGISTERED_SPEED_CARDS[mode].get(canonicalModel).filter(coversDay);
   if (evidence.standardPriceCardIds !== undefined) {
     const ids = evidence.standardPriceCardIds;
     if (!Array.isArray(ids) || ids.length === 0 || ids.length > 8) return null;
@@ -419,16 +422,47 @@ export function fastModeModelFamily(model, evidence = undefined) {
       const standard = REGISTERED_STANDARD_CARDS.get(id);
       if (!standard || standard.model !== canonicalModel || !coversDay(standard)
           || (contextProvided && !matchingBand(standard))
-          || !priorityCards.some((priority) => matchingContext(standard, priority))) {
+          || !speedCards.some((card) => matchingContext(standard, card))) {
         return null;
       }
     }
     return canonicalModel;
   }
-  return priorityCards.some((priority) => matchingBand(priority)
+  return speedCards.some((card) => matchingBand(card)
     && REGISTERED_STANDARD_CARDS_BY_MODEL.get(canonicalModel).some(
-      (standard) => coversDay(standard) && matchingContext(standard, priority),
+      (standard) => coversDay(standard) && matchingContext(standard, card),
     )) ? canonicalModel : null;
+}
+
+export function fastModeModelFamily(model, evidence = undefined) {
+  return speedModeModelFamily(model, "fast", evidence);
+}
+
+/**
+ * API ratio, never an included-allowance weight. Omitting evidence only looks
+ * up model capability. Event pricing must supply a date and eligible context
+ * (or the exact Standard card ids already used to price that event).
+ */
+export function speedModeApiMultiplier(model, mode, evidence = undefined) {
+  if (mode === "standard") return 1;
+  const family = speedModeModelFamily(model, mode, evidence);
+  return family === null ? null : SPEED_MODE_API_MULTIPLIERS[mode][family];
+}
+
+/**
+ * Crossings must use the effective observed or covering declared mode for both
+ * their observed and declared cells. Only eligible Ultrafast events enter its
+ * published model bucket; all others stay explicitly unsupported. Unresolved
+ * cells retain Fast eligibility for the existing Standard/Fast sensitivities.
+ */
+export function speedModeModelFamilyKey(model, mode, evidence = undefined) {
+  if (mode === "ultrafast") {
+    return speedModeModelFamily(model, mode, evidence) ?? "unsupported";
+  }
+  if (mode === "standard" || mode === "fast" || mode === "unknown") {
+    return fastModeModelFamilyKey(model, evidence);
+  }
+  return "unsupported";
 }
 
 /**
@@ -436,8 +470,7 @@ export function fastModeModelFamily(model, evidence = undefined) {
  * when supplied, its event evidence), or null. Null is never silently 1.
  */
 export function fastModeQuotaMultiplier(model, evidence = undefined) {
-  const family = fastModeModelFamily(model, evidence);
-  return family === null ? null : FAST_MODE_QUOTA_MULTIPLIERS[family];
+  return speedModeApiMultiplier(model, "fast", evidence);
 }
 
 export function fastModeModelFamilyKey(model, evidence = undefined) {
@@ -446,12 +479,12 @@ export function fastModeModelFamilyKey(model, evidence = undefined) {
 
 /**
  * Resolution order, strongest evidence first:
- *   1. observed          - the rollout log carried a `thread_settings_applied`
- *                          tier at or before this turn. This ALWAYS wins;
+ *   1. observed          - a supported rollout settings or per-turn tier
+ *                          observation covers this turn. This ALWAYS wins;
  *                          nothing below can overwrite or bypass it.
  *   2. declared_codex_config - the Codex configuration's `service_tier` key was
  *                          read at a moment that covers this turn. It recovers
- *                          the session baseline the log never writes, but only
+ *                          a baseline absent from the log, but only
  *                          forward from the reading; callers must not pass a
  *                          declaration for a turn the reading does not cover.
  *   3. assumed_standard_default - no log tier and no covering reading. The
@@ -467,10 +500,10 @@ export function resolveEffectiveSpeedMode({
   declaredMode = "unknown",
   unresolvedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO,
 } = {}) {
-  if (observedMode === "standard" || observedMode === "fast") {
+  if (["standard", "fast", "ultrafast"].includes(observedMode)) {
     return Object.freeze({ mode: observedMode, provenance: "observed" });
   }
-  if (declaredMode === "standard" || declaredMode === "fast") {
+  if (["standard", "fast", "ultrafast"].includes(declaredMode)) {
     return Object.freeze({
       mode: declaredMode,
       provenance: "declared_codex_config",
@@ -489,10 +522,11 @@ export function resolveEffectiveSpeedMode({
 }
 
 /**
- * Speed-priced API-price equivalent for one Standard-priced amount. A Fast
- * amount on a model without a published Priority rate is included at the
- * disclosed assumed multiplier rather than excluded; an unknown mode is still
- * an explicit unknown, never a silent Standard.
+ * Speed-priced API-price equivalent for one Standard-priced token amount.
+ * Fixed provider tool-call prices are separate and must not be multiplied.
+ * A Fast amount on a model without a published Priority rate is included at the
+ * disclosed assumed multiplier rather than excluded. Ultrafast requires an
+ * eligible published card; an unknown mode is never a silent Standard.
  */
 export function quotaWeightedApiPriceEquivalent({
   apiPriceEquivalentUsd,
@@ -516,13 +550,20 @@ export function quotaWeightedApiPriceEquivalent({
       status: "standard_rate",
     });
   }
-  if (mode !== "fast") {
+  if (mode !== "fast" && mode !== "ultrafast") {
     return Object.freeze({ usd: null, multiplier: null, status: "unknown_mode" });
   }
-  const multiplier = fastModeQuotaMultiplier(model, {
+  const multiplier = speedModeApiMultiplier(model, mode, {
     eventTime, totalInputContextTokens, standardPriceCardIds,
   });
   if (multiplier === null) {
+    if (mode === "ultrafast") {
+      return Object.freeze({
+        usd: null,
+        multiplier: null,
+        status: "ultrafast_price_unavailable",
+      });
+    }
     return Object.freeze({
       usd: roundUsd(apiPriceEquivalentUsd * FAST_MODE_ASSUMED_MULTIPLIER),
       multiplier: FAST_MODE_ASSUMED_MULTIPLIER,
@@ -532,14 +573,14 @@ export function quotaWeightedApiPriceEquivalent({
   return Object.freeze({
     usd: roundUsd(apiPriceEquivalentUsd * multiplier),
     multiplier,
-    status: "fast_weighted",
+    status: mode === "ultrafast" ? "ultrafast_weighted" : "fast_weighted",
   });
 }
 
 export function emptySpeedWeightingCrossing() {
   return Object.fromEntries(OBSERVED_SPEED_MODE_KEYS.map((speed) => [
     speed,
-    Object.fromEntries(FAST_MODE_MODEL_FAMILY_KEYS.map((family) => [
+    Object.fromEntries(SPEED_MODE_MODEL_FAMILY_KEYS.map((family) => [
       family,
       { events: 0, apiPriceEquivalentUsd: 0 },
     ])),
@@ -548,7 +589,7 @@ export function emptySpeedWeightingCrossing() {
 
 function crossingCell(crossing, speed, family) {
   const row = crossing?.[OBSERVED_SPEED_MODE_KEYS.includes(speed) ? speed : "unknown"];
-  const cell = row?.[FAST_MODE_MODEL_FAMILY_KEYS.includes(family) ? family : "unsupported"];
+  const cell = row?.[SPEED_MODE_MODEL_FAMILY_KEYS.includes(family) ? family : "unsupported"];
   return {
     events: Number.isSafeInteger(cell?.events) && cell.events >= 0
       ? cell.events
@@ -577,7 +618,7 @@ function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
   const parts = [];
   let events = 0;
   let usd = 0;
-  for (const mode of ["standard", "fast"]) {
+  for (const mode of ["standard", "fast", "ultrafast"]) {
     const cell = crossingCell(declaredSpeedWeighting, mode, family);
     if (cell.events === 0 && cell.apiPriceEquivalentUsd === 0) continue;
     parts.push({ cell, mode });
@@ -602,8 +643,9 @@ function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
 }
 
 /**
- * Fold a Standard-priced speed x model-family crossing into the quota-weighted
- * metric plus an honest coverage split.
+ * Fold a Standard-priced token-cost speed x model-family crossing into the
+ * legacy quota-weighted metric plus an honest coverage split. Independently
+ * priced provider tool units must stay outside this crossing.
  *
  * `declaredSpeedWeighting` is the same crossing shape, holding only the
  * unobserved events a timestamped `service_tier` reading actually covers. The
@@ -613,9 +655,8 @@ function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
  * `inferredFastEvents` is a secondary, window-level count. It reports an
  * overlapping subset of the events whose individual mode remains unknown; it
  * does not reclassify events out of `unknown` or change the coverage
- * partition. A window-level signal cannot be attributed to an individual
- * event without the mode field the provider stopped emitting, so it never
- * changes the weighted total.
+ * partition. A window-level signal cannot prove an individual event's mode,
+ * so it never changes the weighted total.
  */
 export function summarizeQuotaWeightedAccounting({
   speedWeighting,
@@ -630,6 +671,8 @@ export function summarizeQuotaWeightedAccounting({
   let standardApiPriceEquivalentUsd = 0;
   let weightedUsd = 0;
   let unweightedUnknownUsd = 0;
+  let hasWeightedAmount = false;
+  let hasUnweightedAmount = false;
   let assumedRatioStandardUsd = 0;
   let totalEvents = 0;
   let observedEvents = 0;
@@ -650,13 +693,15 @@ export function summarizeQuotaWeightedAccounting({
       assumedEvents += cell.events;
     } else unknownEvents += cell.events;
     if (resolved.mode === "standard") {
+      hasWeightedAmount = true;
       weightedUsd += cell.apiPriceEquivalentUsd;
       return;
     }
     if (resolved.mode === "fast") {
+      hasWeightedAmount = true;
       const multiplier = family === "unsupported"
         ? null
-        : FAST_MODE_QUOTA_MULTIPLIERS[family];
+        : FAST_MODE_QUOTA_MULTIPLIERS[family] ?? null;
       if (multiplier === null) {
         // No published Priority rate for this model family: include the Fast
         // amount at the disclosed assumed multiplier and report it apart,
@@ -670,11 +715,21 @@ export function summarizeQuotaWeightedAccounting({
       weightedUsd += cell.apiPriceEquivalentUsd * multiplier;
       return;
     }
+    if (resolved.mode === "ultrafast") {
+      const multiplier = SPEED_MODE_API_MULTIPLIERS.ultrafast[family] ?? null;
+      if (multiplier !== null) {
+        hasWeightedAmount = true;
+        appliedMultipliers[`ultrafast:${family}`] = multiplier;
+        weightedUsd += cell.apiPriceEquivalentUsd * multiplier;
+        return;
+      }
+    }
+    hasUnweightedAmount = true;
     unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
   };
 
   for (const speed of OBSERVED_SPEED_MODE_KEYS) {
-    for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
+    for (const family of SPEED_MODE_MODEL_FAMILY_KEYS) {
       const cell = crossingCell(speedWeighting, speed, family);
       if (speed !== "unknown") {
         // An observed tier is decided by the log alone; no declaration is even
@@ -709,9 +764,9 @@ export function summarizeQuotaWeightedAccounting({
       && inferredFastEvents > 0
     ? Math.min(inferredFastEvents, assumedEvents + unknownEvents)
     : 0;
-  const weightingStatus = unweightedUnknownUsd === 0
+  const weightingStatus = !hasUnweightedAmount
     ? "complete"
-    : weightedUsd === 0 ? "unknown" : "partial";
+    : hasWeightedAmount ? "partial" : "unknown";
 
   return Object.freeze({
     metric: QUOTA_WEIGHTED_API_PRICE_METRIC,
@@ -781,13 +836,17 @@ function scorableWindow(window) {
 
 function referenceWindow(window) {
   const thresholds = FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS;
+  // Old windows predate Ultrafast and omit this field. A supplied unknown or
+  // invalid fraction cannot establish a Standard reference.
+  const ultrafastFraction = window.ultrafastFractionOfKnown === undefined
+    ? 0 : window.ultrafastFractionOfKnown;
   return scorableWindow(window)
     && typeof window.knownSpeedFraction === "number"
     && Number.isFinite(window.knownSpeedFraction)
     && window.knownSpeedFraction >= thresholds.minimumReferenceKnownSpeedFraction
-    && typeof window.fastFractionOfKnown === "number"
-    && Number.isFinite(window.fastFractionOfKnown)
-    && window.fastFractionOfKnown
+    && finiteNonNegative(window.fastFractionOfKnown)
+    && finiteNonNegative(ultrafastFraction)
+    && window.fastFractionOfKnown + ultrafastFraction
       <= thresholds.maximumReferenceFastFractionOfKnown;
 }
 
@@ -804,13 +863,12 @@ function matchedMultiples(ratio) {
  * windows.
  *
  * Each window's calibration fit yields the Standard-priced USD that maps to a
- * full allowance in that window. A window that actually ran in Fast burns the
- * allowance faster per Standard-priced dollar, so its fitted capacity is the
- * Standard reference divided by the Fast multiple. The ratio
- * `reference / window` is therefore the window's observed quota movement
- * expressed as a multiple of its Standard-priced prediction. When that ratio
- * sits inside a narrow band around a published multiple - and only one
- * published multiple matches - the window is marked inferred Fast.
+ * full allowance in that window. The `reference / window` ratio is compared
+ * with the existing published Fast API multiples as a diagnostic correlation.
+ * These API multiples are not included-allowance weights, so a match does not
+ * prove a provider quota formula or the actual speed of any event. Only one
+ * matching multiple produces the legacy inferred Fast label; Ultrafast is
+ * never inferred from this correlation.
  *
  * This never overrides an observed value or a stated preference: callers apply
  * it only after `resolveEffectiveSpeedMode` has exhausted both.

@@ -1025,12 +1025,28 @@ test("regenerating the committed commit into a scratch directory reproduces the 
   });
 });
 
+// Historical transition/negative regressions retain the exact c766 historical facade.
+// Current identity and regeneration checks above continue to use CURRENT.
+const historicalDirectory = mkdtempSync(join(tmpdir(), "vendor-historical-regressions-"));
+symlinkSync(join(WORKER_ROOT, "node_modules"), join(historicalDirectory, "node_modules"), "dir");
+const historicalAuthored = join(historicalDirectory, "authored");
+mkdirSync(historicalAuthored);
+const HISTORICAL_FACADE_COMMIT = "c766235a0345bf4e3474559a9aee69b4dfb0e34d";
+for (const file of AUTHORED_FILES) writeFileSync(join(historicalAuthored, file),
+  git(["show", `${HISTORICAL_FACADE_COMMIT}:apps/worker/${STABLE_VENDOR_RELATIVE}/${file}`]));
+const historicalOut = join(historicalDirectory, "out");
+mkdirSync(historicalOut);
+const historicalGeneration = runGenerator([`--commit=${COMMIT}`, `--out-root=${historicalOut}`, `--authored-from=${historicalAuthored}`]);
+assert.equal(historicalGeneration.status, 0, historicalGeneration.stderr);
+const HISTORICAL_LAYOUT = vendorLayout({commit: COMMIT, outRoot: historicalOut});
+test.after(() => rmSync(historicalDirectory, {recursive: true, force: true}));
+
 /** A reviewed facade for another commit: d43c8f92's, with its provenance text pointed at that commit. */
 function placeFacadeFor(layout) {
   mkdirSync(layout.vendorRoot, { recursive: true });
   writeFileSync(join(layout.vendorRoot, "entry.ts"),
-    readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8").replaceAll(COMMIT.slice(0, 8), layout.short));
-  writeFileSync(join(layout.vendorRoot, "tsconfig.json"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json")));
+    readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts"), "utf8").replaceAll(COMMIT.slice(0, 8), layout.short));
+  writeFileSync(join(layout.vendorRoot, "tsconfig.json"), readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "tsconfig.json")));
 }
 
 /**
@@ -1046,16 +1062,16 @@ const TREE_SHAKEN_MODULES = ["analytics-delivery", "d1-invocation-budget", "v11-
 
 /** d43c8f92's facade with its provenance text pointed at `short`, or naming no commit when `short` is null. */
 function facadeText(short) {
-  const text = readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8");
+  const text = readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts"), "utf8");
   return short === null ? text.replaceAll(`commit ${COMMIT.slice(0, 8)}`, "the vendored commit").replaceAll(COMMIT.slice(0, 8), "the vendored commit")
     : text.replaceAll(COMMIT.slice(0, 8), short);
 }
 
 test("another commit replaces the one the stable directory holds only after its facade is reviewed, and passes every per-tree assertion", async () => {
   assert.notEqual(OTHER_COMMIT, COMMIT);
-  assert.equal(CURRENT, COMMIT, "this test starts from the d43c8f92 tree; after a re-vendor, point it at the new commit's predecessor");
+  assert.equal(JSON.parse(readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, MANIFEST_FILE))).sourceCommit, COMMIT);
   await withWorkspace(async (out) => {
-    const seeded = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    const seeded = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${HISTORICAL_LAYOUT.vendorRoot}`]);
     assert.equal(seeded.status, 0, seeded.stderr);
     const layout = vendorLayout({ commit: OTHER_COMMIT, outRoot: out });
     const facade = join(layout.vendorRoot, "entry.ts");
@@ -1071,7 +1087,7 @@ test("another commit replaces the one the stable directory holds only after its 
     const unnamed = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(unnamed.status, 1);
     assert.match(unnamed.stderr, new RegExp(`^VENDOR_TRANSITION_FACADE_UNREVIEWED: vendor/analytics-d43c8f92 holds ${COMMIT}`));
-    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    writeFileSync(facade, readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts")));
     assertSameFiles(snapshot(out), before, "after refused transitions");
 
     // Reviewed: the facade names the other commit. It replaces d43c8f92 in place.
@@ -1081,8 +1097,8 @@ test("another commit replaces the one the stable directory holds only after its 
     const logged = JSON.parse(run.stdout);
     assert.equal(logged.replaced, COMMIT);
     assert.deepEqual(logged.verified, { standaloneBundle: true, closureModules: logged.verified.closureModules, load: true, typecheck: true, vocabularies: true });
-    assert.equal(layout.vendorRelative, DEFAULT_LAYOUT.vendorRelative);
-    assert.equal(layout.parityRelative, DEFAULT_LAYOUT.parityRelative);
+    assert.equal(layout.vendorRelative, HISTORICAL_LAYOUT.vendorRelative);
+    assert.equal(layout.parityRelative, HISTORICAL_LAYOUT.parityRelative);
     assert.deepEqual(readdirSync(join(out, "vendor")), [STABLE_VENDOR_RELATIVE.split("/")[1]]);
     assert.deepEqual(readdirSync(join(out, "analytics-v2-test")), [STABLE_PARITY_RELATIVE.split("/")[1]]);
     const manifest = JSON.parse(readFileSync(join(layout.vendorRoot, MANIFEST_FILE), "utf8"));
@@ -1105,7 +1121,7 @@ test("another commit replaces the one the stable directory holds only after its 
     // The vocabularies were regenerated for the commit the tree now holds.
     await assertVocabulariesGenerated(tree);
     assert.match(readFileSync(layout.vocabularyPath, "utf8"), new RegExp(`SOURCE_COMMIT = "${OTHER_COMMIT}"`));
-    assert.ok(readFileSync(join(layout.vendorRoot, "tsconfig.json")).equals(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json"))));
+    assert.ok(readFileSync(join(layout.vendorRoot, "tsconfig.json")).equals(readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "tsconfig.json"))));
 
     // The regression: those modules are in the closure as files, not stubs, and
     // they are exactly what an output-based closure misses at this commit.
@@ -1119,7 +1135,7 @@ test("another commit replaces the one the stable directory holds only after its 
     const shaken = byEntry.kernel.filter((input) => !outputInputs.kernel.includes(input)).map((input) => input.slice(`${layout.vendorRelative}/`.length));
     assert.ok(TREE_SHAKEN_MODULES.every((path) => shaken.includes(path)), `expected ${TREE_SHAKEN_MODULES.join(", ")} to be parsed but not in the bundle's outputs; got ${shaken.join(", ")}`);
     // d43c8f92 itself keeps no such module, so this commit really does differ.
-    const base = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+    const base = JSON.parse(readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
     assert.notDeepEqual(manifest.files.map((file) => file.path), base.files.map((file) => file.path));
 
     const first = snapshot(out);
@@ -1131,11 +1147,11 @@ test("another commit replaces the one the stable directory holds only after its 
     // And back: restoring d43c8f92's reviewed facade and vendoring d43c8f92 again
     // reproduces the committed tree, parity specs and vocabularies byte for byte,
     // with nothing left over from the other commit.
-    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    writeFileSync(facade, readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts")));
     const back = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`]);
     assert.equal(back.status, 0, back.stderr);
     assert.equal(JSON.parse(back.stdout).replaced, OTHER_COMMIT);
-    assertSameOutput(vendorLayout({ commit: COMMIT, outRoot: out }), DEFAULT_LAYOUT, "round trip");
+    assertSameOutput(vendorLayout({ commit: COMMIT, outRoot: out }), HISTORICAL_LAYOUT, "round trip");
   });
 });
 
@@ -1147,19 +1163,19 @@ test("the generator never overwrites reviewed files, and never replaces a commit
     const missingSource = runGenerator([`--out-root=${out}`, `--authored-from=${join(out, "nowhere")}`]);
     assert.match(missingSource.stderr, /^AUTHORED_FILE_MISSING: /);
     assert.deepEqual(readdirSync(out), []);
-    assert.equal(runGenerator([`--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]).status, 0);
+    assert.equal(runGenerator([`--out-root=${out}`, `--authored-from=${HISTORICAL_LAYOUT.vendorRoot}`]).status, 0);
     const before = snapshot(out);
-    const reseed = runGenerator([`--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    const reseed = runGenerator([`--out-root=${out}`, `--authored-from=${HISTORICAL_LAYOUT.vendorRoot}`]);
     assert.equal(reseed.status, 1);
     assert.match(reseed.stderr, /^AUTHORED_FILES_EXIST: /);
     assertSameFiles(snapshot(out), before, "after a refused reseed");
   });
   withScratch((out) => {
     // The stable directory holds another commit, and the facade beside it names none.
-    const dir = join(out, DEFAULT_LAYOUT.vendorRelative);
+    const dir = join(out, HISTORICAL_LAYOUT.vendorRelative);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "entry.ts"), facadeText(null));
-    writeFileSync(join(dir, "tsconfig.json"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "tsconfig.json")));
+    writeFileSync(join(dir, "tsconfig.json"), readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "tsconfig.json")));
     const foreign = { schemaVersion: MANIFEST_SCHEMA, sourceCommit: OTHER_COMMIT, files: [{ path: "apps/worker/src/keep.ts" }] };
     writeFileSync(join(dir, MANIFEST_FILE), JSON.stringify(foreign));
     mkdirSync(join(dir, "apps/worker/src"), { recursive: true });
@@ -1171,7 +1187,7 @@ test("the generator never overwrites reviewed files, and never replaces a commit
     assertSameFiles(snapshot(out), before, "after a refused transition");
     // A manifest of a schema this generator does not know is never replaced.
     writeFileSync(join(dir, MANIFEST_FILE), JSON.stringify({ ...foreign, schemaVersion: "analytics-kernel-vendor-manifest-v0" }));
-    writeFileSync(join(dir, "entry.ts"), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    writeFileSync(join(dir, "entry.ts"), readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts")));
     const unknown = runGenerator([`--out-root=${out}`]);
     assert.equal(unknown.status, 1);
     assert.match(unknown.stderr, /^MANIFEST_SCHEMA_UNKNOWN: /);
@@ -1209,7 +1225,7 @@ test("the closure keeps a module used only from dead code and drops a type-only 
 /** One regeneration of d43c8f92 into a scratch workspace, copied per case. */
 function withGeneratedBase(fn) {
   return withWorkspace(async (out) => {
-    const run = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    const run = runGenerator([`--commit=${COMMIT}`, `--out-root=${out}`, `--authored-from=${HISTORICAL_LAYOUT.vendorRoot}`]);
     assert.equal(run.status, 0, run.stderr);
     return fn(out);
   });
@@ -1226,7 +1242,7 @@ test("the generator refuses a facade that re-exports a name its module no longer
     assert.equal(run.status, 1);
     assert.match(run.stderr, /^VENDORED_TREE_TYPECHECK_FAILED: .*TS2305.*noSuchExportAnywhere/);
     assert.equal(run.stdout, "");
-    writeFileSync(facade, readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts")));
+    writeFileSync(facade, readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts")));
     assertSameFiles(snapshot(out), before, "after a refused run");
   });
 });
@@ -1300,14 +1316,14 @@ test("the commits a facade names are found by the word commit or by a hex run th
 
 test("a facade that names another commit is refused, whether seeded or already in place, and nothing is written", () => {
   withScratch((out) => {
-    const seeded = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`, `--authored-from=${DEFAULT_LAYOUT.vendorRoot}`]);
+    const seeded = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`, `--authored-from=${HISTORICAL_LAYOUT.vendorRoot}`]);
     assert.equal(seeded.status, 1);
     assert.match(seeded.stderr, new RegExp(`^AUTHORED_PROVENANCE_MISMATCH: .*names commit ${COMMIT.slice(0, 8)}, not ${OTHER_COMMIT.slice(0, 8)}`));
     assert.equal(seeded.stdout, "");
     assert.deepEqual(readdirSync(out), []);
     const layout = vendorLayout({ commit: OTHER_COMMIT, outRoot: out });
     mkdirSync(layout.vendorRoot, { recursive: true });
-    for (const file of AUTHORED_FILES) writeFileSync(join(layout.vendorRoot, file), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file)));
+    for (const file of AUTHORED_FILES) writeFileSync(join(layout.vendorRoot, file), readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, file)));
     const before = snapshot(out);
     const placed = runGenerator([`--commit=${OTHER_COMMIT}`, `--out-root=${out}`]);
     assert.equal(placed.status, 1);
@@ -1366,8 +1382,8 @@ test("every vendored-tree path named outside the trees names a tree that exists"
 test("the report resolves the patches at a commit, names drifted files, builds the tree on its own and writes nothing", async () => {
   const porcelain = () => git(["status", "--porcelain", "--untracked-files=all", "--", "."]);
   const before = porcelain();
-  const reference = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
-  const report = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: DEFAULT_LAYOUT.vendorRoot });
+  const reference = JSON.parse(readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+  const report = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: HISTORICAL_LAYOUT.vendorRoot });
   assert.equal(report.ok, true);
   assert.equal(report.patchesOk, true);
   assert.deepEqual(report.patches.map(({ path, line, symbol, original }) => ({ path, line, symbol, original })), PINNED_EXPORT_PATCHES);
@@ -1389,7 +1405,7 @@ test("the report resolves the patches at a commit, names drifted files, builds t
   assert.equal(drifted.drift.changed.length, reference.files.length);
   assert.equal(drifted.facade, null);
   assert.equal(drifted.provenance, null);
-  const run = runGenerator(["--report"]);
+  const run = runGenerator(["--report", `--reference=${join(HISTORICAL_LAYOUT.vendorRoot, MANIFEST_FILE)}`]);
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(run.stdout).ok, true);
   const missing = runGenerator(["--report", `--reference=${join(tmpdir(), "no-such-manifest.json")}`]);
@@ -1400,9 +1416,9 @@ test("the report resolves the patches at a commit, names drifted files, builds t
 });
 
 test("the report is never ok for a facade it cannot build with, one that names another commit, or one whose imports are gone", async () => {
-  const reference = JSON.parse(readFileSync(join(DEFAULT_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
+  const reference = JSON.parse(readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, MANIFEST_FILE), "utf8"));
   // Another commit with d43c8f92's facade: everything builds, but the provenance text would be false there.
-  const other = await reportAtCommit({ commit: OTHER_COMMIT, reference, referenceDirectory: DEFAULT_LAYOUT.vendorRoot });
+  const other = await reportAtCommit({ commit: OTHER_COMMIT, reference, referenceDirectory: HISTORICAL_LAYOUT.vendorRoot });
   assert.equal(other.patchesOk, true);
   assert.equal(other.generation.status, "passed");
   assert.deepEqual(other.provenance.foreign, [COMMIT.slice(0, 8)]);
@@ -1415,14 +1431,14 @@ test("the report is never ok for a facade it cannot build with, one that names a
   assert.equal(bare.ok, false);
   // A facade that imports a module the commit does not have.
   await withScratchAsync(async (dir) => {
-    for (const file of AUTHORED_FILES) writeFileSync(join(dir, file), readFileSync(join(DEFAULT_LAYOUT.vendorRoot, file)));
+    for (const file of AUTHORED_FILES) writeFileSync(join(dir, file), readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, file)));
     writeFileSync(join(dir, "entry.ts"), `${readFileSync(join(dir, "entry.ts"), "utf8")}\nexport { nothing } from "./apps/worker/src/no-such-module";\n`);
     const gone = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: dir });
     assert.deepEqual(gone.facade.unresolved, ["apps/worker/src/no-such-module"]);
     assert.equal(gone.generation.status, "skipped");
     assert.equal(gone.ok, false);
     // A facade the commit's files satisfy, with a rename the facade did not follow: the build says so.
-    writeFileSync(join(dir, "entry.ts"), `${readFileSync(join(DEFAULT_LAYOUT.vendorRoot, "entry.ts"), "utf8")}\nexport { missingFromModule } from "./apps/worker/src/cache-retention-values";\n`);
+    writeFileSync(join(dir, "entry.ts"), `${readFileSync(join(HISTORICAL_LAYOUT.vendorRoot, "entry.ts"), "utf8")}\nexport { missingFromModule } from "./apps/worker/src/cache-retention-values";\n`);
     const renamed = await reportAtCommit({ commit: COMMIT, reference, referenceDirectory: dir });
     assert.deepEqual(renamed.facade.unresolved, []);
     assert.equal(renamed.generation.status, "refused");

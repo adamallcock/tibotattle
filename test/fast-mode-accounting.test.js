@@ -99,7 +99,7 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
   assert.equal(FAST_MODE_ASSUMED_MULTIPLIER_SOURCE.recordedAt, "2026-08-30");
   assert.equal(
     FAST_MODE_MULTIPLIER_SOURCE.observability,
-    "rollout_thread_settings_changes_only_no_session_baseline",
+    "rollout_thread_settings_and_supported_turn_context",
   );
   // The log proves tier CHANGES, never the session baseline. Any surface that
   // claims the mode is wholly unrecorded is wrong.
@@ -110,7 +110,10 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
   );
   assert.deepEqual({ ...CODEX_SPEED_MODE_OBSERVABILITY.observedValues }, {
     priority: "fast",
+    fast: "fast",
     default: "standard",
+    standard: "standard",
+    ultrafast: "ultrafast",
   });
   assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /exact registered models/u);
 });

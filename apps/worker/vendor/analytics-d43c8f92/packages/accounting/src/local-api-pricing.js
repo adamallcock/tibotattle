@@ -5,7 +5,7 @@ import {
   APP_PRICE_REGISTRY_OBSERVED_AT,
 } from "./price-registry.js";
 
-export const LOCAL_API_PRICING_METHOD_VERSION = "provider-neutral-api-price-equivalent-v0.2";
+export const LOCAL_API_PRICING_METHOD_VERSION = "provider-neutral-api-price-equivalent-v0.3";
 
 const CODEX_TOOL_UNIT_MAPPING = Object.freeze({
   responses_web_search_call: Object.freeze({ name: "web_search_units", unit: "search" }),
@@ -72,6 +72,9 @@ export function priceCodexUsageEvent(event, {
   if (!event || typeof event !== "object") throw new TypeError("Codex usage event is required");
   const registry = priceCardsAndManifest(priceCards);
   const epoch = priceEpoch({ eventTime: event.timestamp, priceEpochBasis });
+  const rawInputContext = event.rawAvailability === undefined || event.rawAvailability?.input_tokens === true
+    ? event.raw?.input_tokens
+    : undefined;
   const result = priceUsageEvent({
     provider: "openai",
     model: event.model,
@@ -79,7 +82,7 @@ export function priceCodexUsageEvent(event, {
     apiTier: apiServiceTier,
     pricedAt: epoch.pricedAt,
     ...(region ? { region } : {}),
-    totalInputContextTokens: event.totalInputContextTokens ?? event.raw?.input_tokens,
+    totalInputContextTokens: event.totalInputContextTokens ?? rawInputContext,
     components: event.components,
     componentAvailability: event.componentAvailability,
   }, {

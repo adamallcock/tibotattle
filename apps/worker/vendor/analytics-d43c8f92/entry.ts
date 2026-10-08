@@ -1,14 +1,14 @@
 // The one import surface for the production analytics kernels on the GCP line.
 //
-// Every other source file in this directory is a byte copy of commit d43c8f92
-// (the production Worker), written by scripts/vendor-analytics-kernels.mjs and
+// Every other source file in this directory is a byte copy of commit 62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a
+// (the reviewed historical-kernel client-compatibility source), written by scripts/vendor-analytics-kernels.mjs and
 // verified by scripts/vendor-analytics-kernels.check.mjs against MANIFEST.json.
 // The only edits are six `export ` tokens and the reviewed, semantics-preserving
 // source patches (SOURCE_PATCHES in the generator) that MANIFEST.json lists. The
 // apps/worker/src/*.d.ts files (MANIFEST.json typeStubs) are tsc declarations of
-// d43c8f92 modules the copies import only for types; they keep tsc-checked
+// 62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a modules the copies import only for types; they keep tsc-checked
 // consumers compiling and are never loaded at runtime. The three
-// workspace packages are vendored at d43c8f92 too: tsconfig.json `paths` (for
+// workspace packages are vendored at 62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a too: tsconfig.json `paths` (for
 // esbuild) and vitest.analytics-v2.config.mjs (for Vitest) resolve
 // @app-usagemonitor/* imports made inside this directory to those copies, so
 // the kernels never run against the GCP line's own packages.

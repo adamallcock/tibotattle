@@ -36,17 +36,17 @@ const SYNTHETIC_ARN = "arn:aws:bedrock:us-east-1:000000000000:inference-profile/
 const SYNTHETIC_EMAIL = "synthetic@example.invalid";
 const SAMPLE_ROWS = Object.freeze([
   { dimension: "model", token: "gpt-5.5", records: 40 },
-  { dimension: "model", token: "gpt-6.1-sol", records: 7 },
+  { dimension: "model", token: "synthetic-unseen-model", records: 7 },
   { dimension: "model", token: "unknown", records: 3 },
   { dimension: "model", token: "arn:aws:bedrock:us-east-1:000000000000:synthetic", records: 2 },
   { dimension: "model", token: SYNTHETIC_ARN, records: 6 },
   { dimension: "model", token: SYNTHETIC_EMAIL, records: 1 },
   { dimension: "speed", token: "standard", records: 30 },
   { dimension: "speed", token: "other", records: 12 },
-  { dimension: "speed", token: "ultrafast", records: 5 },
+  { dimension: "speed", token: "synthetic-unseen-speed", records: 5 },
   { dimension: "tier", token: "priority", records: 9 },
   { dimension: "plan", token: "pro", records: 20 },
-  { dimension: "plan", token: "promax", records: 1 },
+  { dimension: "plan", token: "synthetic-unseen-plan", records: 1 },
   { dimension: "plan", token: "has space", records: 4 },
   { dimension: "plan", token: "a+b=c", records: 2 },
 ]);
@@ -54,12 +54,12 @@ const SAMPLE_ROWS = Object.freeze([
 test("held listing: counts only, no token text, the verdict unchanged", () => {
   const catalog = bundledTokenCatalog();
   assert.ok(catalog.model.has("gpt-5.5") && catalog.model.has("unknown"));
-  assert.ok(catalog.plan.has("prolite") && catalog.plan.has("promax"));
+  assert.ok(catalog.plan.has("prolite") && catalog.plan.has("promax") && catalog.model.has("gpt-6.1-sol") && catalog.speed.has("ultrafast"));
   const report = unseenTokenReport(SAMPLE_ROWS, { day: DAY, catalog, listing: "held" });
   assert.deepEqual([report.schema, report.listing, report.verdict, report.catalogVersion],
     [UNSEEN_TOKEN_PROBE_SCHEMA, "held", "unseen", catalog.version]);
   const text = JSON.stringify(report);
-  for (const token of ["gpt-6.1-sol", "ultrafast", "promax", "arn:", "synthetic", "@", "has space", "a+b=c"]) {
+  for (const token of ["synthetic-unseen-model", "synthetic-unseen-speed", "synthetic-unseen-plan", "arn:", "synthetic", "@", "has space", "a+b=c"]) {
     assert.equal(text.includes(token), false, `${token} is never printed while listing is held`);
   }
   for (const entry of Object.values(report.dimensions)) {
@@ -93,7 +93,7 @@ test("the name guard is exactly the v1.x wire grammar: an ARN with '/' or an ema
     "quote\"", "émoji"]) {
     assert.equal(UNSEEN_TOKEN_GRAMMAR.test(token), false, JSON.stringify(token));
   }
-  for (const token of ["gpt-6.1-sol", "Claude-Opus_5.5", "arn:aws:bedrock:us-east-1:000000000000:synthetic", "a".repeat(64)]) {
+  for (const token of ["synthetic-unseen-model", "Claude-Opus_5.5", "arn:aws:bedrock:us-east-1:000000000000:synthetic", "a".repeat(64)]) {
     assert.equal(UNSEEN_TOKEN_GRAMMAR.test(token), true, token);
   }
   // The default lists in-grammar unseen tokens (owner, round 11); only
@@ -102,12 +102,12 @@ test("the name guard is exactly the v1.x wire grammar: an ARN with '/' or an ema
   const report = unseenTokenReport(SAMPLE_ROWS, { day: DAY });
   assert.deepEqual(unseenTokenReport(SAMPLE_ROWS, { day: DAY, listing: "plain" }), report);
   assert.equal(report.listing, "plain");
-  assert.deepEqual(report.dimensions.model.unseen, [{ token: "gpt-6.1-sol", records: 7 },
+  assert.deepEqual(report.dimensions.model.unseen, [{ token: "synthetic-unseen-model", records: 7 },
     { token: "arn:aws:bedrock:us-east-1:000000000000:synthetic", records: 2 }]);
   assert.deepEqual([report.dimensions.model.unrecognized, report.dimensions.model.unrecognizedRecords], [2, 7]);
-  assert.deepEqual(report.dimensions.speed.unseen, [{ token: "ultrafast", records: 5 }]);
+  assert.deepEqual(report.dimensions.speed.unseen, [{ token: "synthetic-unseen-speed", records: 5 }]);
   assert.deepEqual(report.dimensions.tier.unseen, []);
-  assert.deepEqual(report.dimensions.plan.unseen, [{ token: "promax", records: 1 }]);
+  assert.deepEqual(report.dimensions.plan.unseen, [{ token: "synthetic-unseen-plan", records: 1 }]);
   const text = JSON.stringify(report);
   for (const token of [SYNTHETIC_ARN, SYNTHETIC_EMAIL, "inference-profile", "@", "has space", "a+b=c"]) {
     assert.equal(text.includes(token), false, `${token} is counted, never printed`);
