@@ -8,7 +8,7 @@ import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, 
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
   readLinuxFinalAppProcessIdentity, linuxFinalBrowserCommandLineMatches, readLinuxFinalKnownAppProcessIdentity,
-  currentLinuxFinalApp, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  currentLinuxFinalApp, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox, linuxFinalProcessCommandLineFacts } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
@@ -181,7 +181,8 @@ test('Node-mode markers can exclude a candidate but cannot qualify a browser or 
   assert.deepEqual(node.hashes, []);
   for (const mode of ['', '0', 'true', '2']) {
     const value = appProcess(); value.files.environ += `ELECTRON_RUN_AS_NODE=${mode}\0`;
-    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /PROCESS_ROLE_INVALID/u);
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), { code: 'LINUX_FINAL_LIFECYCLE_PROCESS_NODE_MODE_INVALID' });
+    assert.deepEqual(value.hashes, []);
   }
 });
 
@@ -244,13 +245,115 @@ test('Chromium child roles are excluded in NUL argv and the exact executable-pre
     }
     // Even an empty, unknown or repeated role can never fall through to browser
     // admission. Preserve the base NUL exclusion and refuse malformed titles.
-    for (const roles of [['--type='], ['--type=unknown'], ['--type=renderer', '--type=utility']]) {
+    for (const [roles, reason] of [[['--type='], 'PROCESS_ROLE_EMPTY'], [['--type=unknown'], 'PROCESS_ROLE_UNKNOWN'],
+      [['--type=renderer', '--type=utility'], 'PROCESS_ROLE_MULTIPLE']]) {
       const value = appProcess();
       value.files.cmdline = [value.value.executable, ...roles].join(separator) + '\0';
       if (separator === '\0') {
         assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
       } else {
-        await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), /PROCESS_ROLE_INVALID/u);
+        await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), { code: `LINUX_FINAL_LIFECYCLE_${reason}` });
+      }
+      assert.deepEqual(value.hashes, []);
+    }
+  }
+});
+
+function commandLineRefusals(executable) {
+  return [
+    ['PROCESS_COMMAND_LINE_TOO_LONG', `${executable}\0${'x'.repeat(65536)}\0`],
+    ['PROCESS_COMMAND_LINE_TERMINATOR_MISSING', `${executable}\0--flag`],
+    ['PROCESS_ARGV_ZERO_MISMATCH', `${executable}-other\0--flag\0`],
+    ['PROCESS_ARGV_EMPTY_FIELD', `${executable}\0\0`],
+    ['PROCESS_ARGV_WHITESPACE', `${executable}\0--flag=two words\0`],
+    ['PROCESS_TITLE_PREFIX_MISMATCH', `${executable}-other --flag\0`],
+    ['PROCESS_TITLE_SPACING_INVALID', `${executable} \0`],
+    ['PROCESS_TITLE_SPACING_INVALID', `${executable}  --flag\0`],
+    ['PROCESS_TITLE_SPACING_INVALID', `${executable} --flag \0`],
+    ['PROCESS_TITLE_SPACING_INVALID', `${executable} --flag\tvalue\0`],
+    ['PROCESS_ROLE_MULTIPLE', `${executable} --type=renderer --type=utility\0`],
+    ['PROCESS_ROLE_EMPTY', `${executable} --type=\0`],
+    ['PROCESS_ROLE_UNKNOWN', `${executable} --type=synthetic-unknown\0`],
+    ['PROCESS_ROLE_BARE', `${executable} --type\0`],
+  ];
+}
+
+test('one command parser preserves facts or null while observing only the first fixed refusal', () => {
+  const executable = `${mount}/tibotattle`, refusals = commandLineRefusals(executable)
+    .map(([reason, commandLine]) => [reason, { commandLine, executable }]);
+  for (const commandLine of [null, undefined, 1]) refusals.push(['PROCESS_COMMAND_LINE_TYPE_INVALID', { commandLine, executable }]);
+  for (const invalidExecutable of [null, undefined, '', `${mount}/two words`, `${executable}\0`]) {
+    refusals.push(['PROCESS_EXECUTABLE_FORM_INVALID', { commandLine: `${executable}\0`, executable: invalidExecutable }]);
+  }
+  // Multiple simultaneous failures keep the original first-predicate order.
+  refusals.push(['PROCESS_COMMAND_LINE_TYPE_INVALID', { commandLine: null, executable: null }],
+    ['PROCESS_COMMAND_LINE_TOO_LONG', { commandLine: 'x'.repeat(65537), executable: null }],
+    ['PROCESS_COMMAND_LINE_TERMINATOR_MISSING', { commandLine: '', executable: null }],
+    ['PROCESS_ARGV_ZERO_MISMATCH', { commandLine: `other\0\0`, executable }],
+    ['PROCESS_ARGV_WHITESPACE', { commandLine: `${executable}\0two words\0\0`, executable }],
+    ['PROCESS_ROLE_MULTIPLE', { commandLine: `${executable} --type= --type=unknown --type\0`, executable }],
+    ['PROCESS_ROLE_UNKNOWN', { commandLine: `${executable} --type=unknown --type\0`, executable }]);
+  for (const [reason, value] of refusals) {
+    const observed = [];
+    assert.equal(linuxFinalProcessCommandLineFacts(value), null);
+    assert.equal(linuxFinalProcessCommandLineFacts(value, code => observed.push(code)), null);
+    assert.deepEqual(observed, [reason]);
+    assert.equal(linuxFinalSandboxStatus({ ...value, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' }), false);
+  }
+  for (const separator of ['\0', ' ']) {
+    for (const role of [null, 'renderer', 'zygote', 'gpu-process', 'utility']) {
+      for (const flag of [null, '--no-sandbox', '--disable-setuid-sandbox=1']) {
+        const args = [...(role ? [`--type=${role}`] : []), ...(flag ? [flag] : [])];
+        const value = { executable, commandLine: [executable, ...args].join(separator) + '\0' }, observed = [];
+        const facts = { role, sandboxBypass: flag !== null };
+        assert.deepEqual(linuxFinalProcessCommandLineFacts(value), facts);
+        assert.deepEqual(linuxFinalProcessCommandLineFacts(value, code => observed.push(code)), facts);
+        assert.deepEqual(observed, []);
+      }
+    }
+  }
+});
+
+test('identity parser refusals retain exact closed causes through real smoke cleanup without extra process reads', async () => {
+  for (const [reason, commandLine] of commandLineRefusals(`${mount}/tibotattle`)) {
+    const value = appProcess(); value.files.cmdline = commandLine;
+    await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), reason);
+    assert.deepEqual(value.reads, ['stat', 'cmdline', 'exe', 'status', 'environ']);
+    assert.deepEqual(value.hashes, []);
+  }
+  const malformedExecutable = appProcess();
+  malformedExecutable.value.executable = `${temporary}/.mount_two words/tibotattle`;
+  await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(malformedExecutable.pid, malformedExecutable.expected, temporary,
+    malformedExecutable.io), 'PROCESS_EXECUTABLE_FORM_INVALID');
+  assert.deepEqual(malformedExecutable.hashes, []);
+  for (const mode of ['', '0', 'false', 'invalid']) {
+    const value = appProcess(); value.files.environ += `ELECTRON_RUN_AS_NODE=${mode}\0`;
+    await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), 'PROCESS_NODE_MODE_INVALID');
+    assert.deepEqual(value.reads, ['stat', 'cmdline', 'exe', 'status', 'environ']);
+    assert.deepEqual(value.hashes, []);
+  }
+});
+
+test('only exact pinned broker title forms get the unsupported diagnostic and none becomes an admitted browser', async () => {
+  const exact = ['broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'];
+  const near = ['brokers', 'Renderer-broker', 'gpu-process-brokers', 'renderer-broker-extra', 'utility-broker=1', 'broker-broker', 'synthetic-broker'];
+  for (const role of [...exact, ...near]) {
+    const reason = exact.includes(role) ? 'PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED' : 'PROCESS_ROLE_UNKNOWN';
+    for (const separator of ['\0', ' ']) {
+      const value = appProcess(), observed = [];
+      value.files.cmdline = [value.value.executable, `--type=${role}`].join(separator) + '\0';
+      const parsed = { commandLine: value.files.cmdline, executable: value.value.executable };
+      assert.equal(linuxFinalProcessCommandLineFacts(parsed), null);
+      assert.equal(linuxFinalProcessCommandLineFacts(parsed, code => observed.push(code)), null);
+      assert.deepEqual(observed, [reason]);
+      assert.equal(linuxFinalSandboxStatus({ ...parsed, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' }), false);
+      if (separator === '\0') {
+        // Preserve the existing early NUL child exclusion, even for unknown roles.
+        assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
+        assert.deepEqual(value.reads, ['stat', 'cmdline']);
+      } else {
+        await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), reason);
+        assert.deepEqual(value.reads, ['stat', 'cmdline', 'exe', 'status', 'environ']);
       }
       assert.deepEqual(value.hashes, []);
     }
@@ -771,7 +874,7 @@ test('every FUSE predicate remains a distinct closed identity cause through the 
 
 test('process role, UID, start-time and safe-file failures keep only fixed identity causes after cleanup', async () => {
   for (const [code, alter] of [
-    ['PROCESS_ROLE_INVALID', v => { v.files.environ += 'ELECTRON_RUN_AS_NODE=invalid\0'; }],
+    ['PROCESS_NODE_MODE_INVALID', v => { v.files.environ += 'ELECTRON_RUN_AS_NODE=invalid\0'; }],
     ['PROCESS_LAUNCH_ARGUMENTS_INVALID', v => { v.io.expectedArguments = []; }],
     ['INSTALLED_BYTES_INVALID', v => { v.io.hash = async path => path === installedImage ? 'c'.repeat(64) : path === v.value.executable ? v.expected.executableSha256 : v.expected.asarSha256; }],
     ['PROCESS_UID_INVALID', v => { v.files.status = 'Uid:\t0\t0\t0\t0\n'; }],
@@ -805,7 +908,8 @@ test('process role, UID, start-time and safe-file failures keep only fixed ident
 
 test('identity diagnostics refuse unknown, private or oversized codes and do not cross hook boundaries', async () => {
   for (const code of [undefined, null, 1, 'PRIVATE_SYNTHETIC_DETAIL', 'LINUX_FINAL_LIFECYCLE_PRIVATE_SYNTHETIC_DETAIL',
-    'LINUX_FINAL_LIFECYCLE_FILE_UNSAFE_PRIVATE_SYNTHETIC_DETAIL', `LINUX_FINAL_LIFECYCLE_${'A'.repeat(101)}`]) {
+    'LINUX_FINAL_LIFECYCLE_FILE_UNSAFE_PRIVATE_SYNTHETIC_DETAIL', 'LINUX_FINAL_LIFECYCLE_PROCESS_ROLE_UNKNOWN_PRIVATE_SYNTHETIC_DETAIL',
+    `LINUX_FINAL_LIFECYCLE_${'A'.repeat(101)}`]) {
     await assertIdentityCause(() => { throw Object.assign(new Error('synthetic detail'), { code }); }, 'FAILED');
   }
   const value = normalJourney();

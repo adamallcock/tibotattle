@@ -103,23 +103,37 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
 /** Chromium can expose one space-joined process title instead of NUL argv.
  * This parser only excludes child roles and checks renderer sandbox flags;
  * it never admits a browser without the separate exact launch and artifact proof. */
-function linuxFinalProcessCommandLineFacts({ commandLine, executable }) {
-  if (typeof commandLine !== 'string' || commandLine.length > 65536 || !commandLine.endsWith('\0')
-    || typeof executable !== 'string' || executable.length === 0 || /[\s\0]/u.test(executable)) return null;
+export function linuxFinalProcessCommandLineFacts({ commandLine, executable }, observeRefusal = null) {
+  const refuse = code => { observeRefusal?.(code); return null; };
+  if (typeof commandLine !== 'string') return refuse('PROCESS_COMMAND_LINE_TYPE_INVALID');
+  if (commandLine.length > 65536) return refuse('PROCESS_COMMAND_LINE_TOO_LONG');
+  if (!commandLine.endsWith('\0')) return refuse('PROCESS_COMMAND_LINE_TERMINATOR_MISSING');
+  if (typeof executable !== 'string' || executable.length === 0 || /[\s\0]/u.test(executable)) return refuse('PROCESS_EXECUTABLE_FORM_INVALID');
   const fields = commandLine.slice(0, -1).split('\0');
   let encodedArguments, boundary;
   if (fields.length > 1 || fields[0] === executable) {
-    if (fields[0] !== executable || fields.some(field => field.length === 0 || /\s/u.test(field))) return null;
+    if (fields[0] !== executable) return refuse('PROCESS_ARGV_ZERO_MISMATCH');
+    const invalidField = fields.find(field => field.length === 0 || /\s/u.test(field));
+    if (invalidField !== undefined) return refuse(invalidField.length === 0 ? 'PROCESS_ARGV_EMPTY_FIELD' : 'PROCESS_ARGV_WHITESPACE');
     encodedArguments = fields.slice(1).join('\0'); boundary = '\\0';
   } else {
-    if (!fields[0].startsWith(`${executable} `)) return null;
+    if (!fields[0].startsWith(`${executable} `)) return refuse('PROCESS_TITLE_PREFIX_MISMATCH');
     encodedArguments = fields[0].slice(executable.length + 1); boundary = ' ';
     if (encodedArguments.length === 0 || /[^\S ]/u.test(encodedArguments)
-      || encodedArguments.startsWith(' ') || encodedArguments.endsWith(' ') || encodedArguments.includes('  ')) return null;
+      || encodedArguments.startsWith(' ') || encodedArguments.endsWith(' ') || encodedArguments.includes('  ')) return refuse('PROCESS_TITLE_SPACING_INVALID');
   }
   const roles = [...encodedArguments.matchAll(new RegExp(`(?:^|${boundary})--type=([^${boundary}]*)(?=${boundary}|$)`, 'gu'))];
-  if (roles.length > 1 || roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility'].includes(roles[0][1])) return null;
-  if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return null;
+  if (roles.length > 1) return refuse('PROCESS_ROLE_MULTIPLE');
+  if (roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility'].includes(roles[0][1])) {
+    if (roles[0][1] === '') return refuse('PROCESS_ROLE_EMPTY');
+    // Diagnostic only: pinned Chromium sandbox_linux.cc updates broker titles.
+    // These exact forms remain refused, as does every other unknown role.
+    if (['broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'].includes(roles[0][1])) {
+      return refuse('PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED');
+    }
+    return refuse('PROCESS_ROLE_UNKNOWN');
+  }
+  if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return refuse('PROCESS_ROLE_BARE');
   const sandboxBypass = new RegExp(`(?:^|${boundary})--(?:no-sandbox|disable-setuid-sandbox)(?:=|${boundary}|$)`, 'u').test(encodedArguments);
   return { role: roles[0]?.[1] ?? null, sandboxBypass };
 }
@@ -149,9 +163,10 @@ export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary,
   // The ordinary companion uses this same executable in Node mode. Its closed
   // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
   if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
-  if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_ROLE_INVALID');
-  const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable });
-  if (facts === null) fail('PROCESS_ROLE_INVALID');
+  if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_NODE_MODE_INVALID');
+  let roleFailure = 'PROCESS_ROLE_INVALID';
+  const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable }, code => { roleFailure = code; });
+  if (facts === null) fail(roleFailure);
   if (facts.role !== null) return null;
   const commandLine = args.join('\0');
   if (!linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments })) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
@@ -399,6 +414,10 @@ const IDENTITY_HOOK_FAILURES = new Map([
   'FUSE_MOUNT_READ_ONLY_REQUIRED', 'FUSE_MOUNT_UID_INVALID', 'FUSE_APPIMAGE_ENV_MISSING', 'FUSE_APPIMAGE_ENV_MISMATCH',
   'FUSE_APPDIR_ENV_MISSING', 'FUSE_APPDIR_ENV_MISMATCH', 'FUSE_EXTRACTION_MODE_FORBIDDEN', 'PROCESS_START_TIME_INVALID',
   'PROCESS_UID_INVALID', 'PROCESS_ROLE_INVALID', 'PROCESS_BYTES_CHANGED', 'MULTIPLE_APPS',
+  'PROCESS_NODE_MODE_INVALID', 'PROCESS_COMMAND_LINE_TYPE_INVALID', 'PROCESS_COMMAND_LINE_TOO_LONG',
+  'PROCESS_COMMAND_LINE_TERMINATOR_MISSING', 'PROCESS_EXECUTABLE_FORM_INVALID', 'PROCESS_ARGV_ZERO_MISMATCH',
+  'PROCESS_ARGV_EMPTY_FIELD', 'PROCESS_ARGV_WHITESPACE', 'PROCESS_TITLE_PREFIX_MISMATCH', 'PROCESS_TITLE_SPACING_INVALID',
+  'PROCESS_ROLE_MULTIPLE', 'PROCESS_ROLE_EMPTY', 'PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED', 'PROCESS_ROLE_UNKNOWN', 'PROCESS_ROLE_BARE',
   'FILE_UNSAFE', 'FILE_CHANGED', 'PROCESS_LAUNCH_ARGUMENTS_INVALID', 'INSTALLED_BYTES_INVALID',
 ].map(code => [`LINUX_FINAL_LIFECYCLE_${code}`, `NORMAL_APP_IDENTITY_${code}`]));
 IDENTITY_HOOK_FAILURES.set('LINUX_REAL_APPIMAGE_TIMEOUT', 'NORMAL_APP_IDENTITY_TIMEOUT');
