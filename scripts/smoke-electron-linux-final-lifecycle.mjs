@@ -124,13 +124,12 @@ export function linuxFinalProcessCommandLineFacts({ commandLine, executable }, o
   }
   const roles = [...encodedArguments.matchAll(new RegExp(`(?:^|${boundary})--type=([^${boundary}]*)(?=${boundary}|$)`, 'gu'))];
   if (roles.length > 1) return refuse('PROCESS_ROLE_MULTIPLE');
-  if (roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility'].includes(roles[0][1])) {
+  // Chromium 150 sandbox_linux.cc rewrites forked broker titles to these
+  // exact child roles. They may exclude a browser candidate only after the
+  // complete grammar below; they never satisfy the exact renderer predicate.
+  if (roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility',
+    'broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'].includes(roles[0][1])) {
     if (roles[0][1] === '') return refuse('PROCESS_ROLE_EMPTY');
-    // Diagnostic only: pinned Chromium sandbox_linux.cc updates broker titles.
-    // These exact forms remain refused, as does every other unknown role.
-    if (['broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'].includes(roles[0][1])) {
-      return refuse('PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED');
-    }
     return refuse('PROCESS_ROLE_UNKNOWN');
   }
   if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return refuse('PROCESS_ROLE_BARE');

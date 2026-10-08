@@ -334,30 +334,79 @@ test('identity parser refusals retain exact closed causes through real smoke cle
   }
 });
 
-test('only exact pinned broker title forms get the unsupported diagnostic and none becomes an admitted browser', async () => {
+test('exact pinned broker child forms never qualify a browser or renderer', async () => {
   const exact = ['broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'];
   const near = ['brokers', 'Renderer-broker', 'gpu-process-brokers', 'renderer-broker-extra', 'utility-broker=1', 'broker-broker', 'synthetic-broker'];
   for (const role of [...exact, ...near]) {
-    const reason = exact.includes(role) ? 'PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED' : 'PROCESS_ROLE_UNKNOWN';
     for (const separator of ['\0', ' ']) {
-      const value = appProcess(), observed = [];
-      value.files.cmdline = [value.value.executable, `--type=${role}`].join(separator) + '\0';
-      const parsed = { commandLine: value.files.cmdline, executable: value.value.executable };
-      assert.equal(linuxFinalProcessCommandLineFacts(parsed), null);
-      assert.equal(linuxFinalProcessCommandLineFacts(parsed, code => observed.push(code)), null);
-      assert.deepEqual(observed, [reason]);
-      assert.equal(linuxFinalSandboxStatus({ ...parsed, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' }), false);
-      if (separator === '\0') {
-        // Preserve the existing early NUL child exclusion, even for unknown roles.
-        assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
-        assert.deepEqual(value.reads, ['stat', 'cmdline']);
-      } else {
-        await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), reason);
-        assert.deepEqual(value.reads, ['stat', 'cmdline', 'exe', 'status', 'environ']);
+      for (const bypass of ['', '--no-sandbox', '--disable-setuid-sandbox=1']) {
+        const value = appProcess(), observed = [];
+        value.files.cmdline = [value.value.executable, `--type=${role}`, ...(bypass ? [bypass] : [])].join(separator) + '\0';
+        const parsed = { commandLine: value.files.cmdline, executable: value.value.executable };
+        const facts = exact.includes(role) ? { role, sandboxBypass: bypass !== '' } : null;
+        assert.deepEqual(linuxFinalProcessCommandLineFacts(parsed), facts);
+        assert.deepEqual(linuxFinalProcessCommandLineFacts(parsed, code => observed.push(code)), facts);
+        assert.deepEqual(observed, exact.includes(role) ? [] : ['PROCESS_ROLE_UNKNOWN']);
+        assert.equal(linuxFinalSandboxStatus({ ...parsed, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' }), false);
+        if (separator === '\0' || exact.includes(role)) {
+          // Preserve the existing early NUL exclusion even for unknown roles.
+          assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
+        } else {
+          await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), 'PROCESS_ROLE_UNKNOWN');
+        }
+        assert.deepEqual(value.reads, separator === '\0' ? ['stat', 'cmdline'] : ['stat', 'cmdline', 'exe', 'status', 'environ']);
+        assert.deepEqual(value.hashes, []);
       }
+    }
+  }
+});
+
+test('broker exclusion still requires complete unambiguous command grammar', async () => {
+  for (const role of ['broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker']) {
+    for (const separator of ['\0', ' ']) {
+      for (const [extra, reason] of [[['--type'], 'PROCESS_ROLE_BARE'],
+        [[`--type=${role}`], 'PROCESS_ROLE_MULTIPLE'], [['--type=renderer'], 'PROCESS_ROLE_MULTIPLE']]) {
+        const value = appProcess(), observed = [];
+        value.files.cmdline = [value.value.executable, `--type=${role}`, ...extra].join(separator) + '\0';
+        const parsed = { commandLine: value.files.cmdline, executable: value.value.executable };
+        assert.equal(linuxFinalProcessCommandLineFacts(parsed, code => observed.push(code)), null);
+        assert.deepEqual(observed, [reason]);
+        assert.equal(linuxFinalSandboxStatus({ ...parsed, status: 'NoNewPrivs:\t1\nSeccomp:\t2\n' }), false);
+        if (separator === ' ') await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), reason);
+        else assert.equal(await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), null);
+        assert.deepEqual(value.hashes, []);
+      }
+    }
+    const executable = `${mount}/tibotattle`;
+    for (const [commandLine, reason] of [[`${executable} --type=${role}`, 'PROCESS_COMMAND_LINE_TERMINATOR_MISSING'],
+      [`${executable}  --type=${role}\0`, 'PROCESS_TITLE_SPACING_INVALID'],
+      [`${executable} --type=${role} \0`, 'PROCESS_TITLE_SPACING_INVALID'],
+      [`${executable}-other --type=${role}\0`, 'PROCESS_TITLE_PREFIX_MISMATCH']]) {
+      const value = appProcess(), observed = []; value.files.cmdline = commandLine;
+      assert.equal(linuxFinalProcessCommandLineFacts({ commandLine, executable }, code => observed.push(code)), null);
+      assert.deepEqual(observed, [reason]);
+      await assertIdentityCause(() => readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io), reason);
       assert.deepEqual(value.hashes, []);
     }
   }
+});
+
+test('broker-only discovery cannot produce a browser and retained broker identity still blocks cleanup', async () => {
+  const value = appProcess(); value.files.cmdline = `${value.value.executable} --type=utility-broker\0`;
+  const args = value.io.expectedArguments;
+  await assert.rejects(currentLinuxFinalApp(value.expected, temporary, args, [args], {
+    find: async () => {
+      const identity = await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, value.io);
+      return identity ? [{ identity, argumentIndex: 0 }] : [];
+    },
+    waiter: async predicate => { const result = await predicate(); if (!result) throw new Error('BROWSER_UNAVAILABLE'); return result; },
+  }), /BROWSER_UNAVAILABLE/u);
+  assert.deepEqual(value.hashes, []);
+  const broker = { pid: value.pid, startTime: '100' }, browser = { pid: value.pid + 1, startTime: '101' };
+  await assert.rejects(assertLinuxFinalProcessTreeGone([browser, broker], {
+    readAlive: async identity => identity.pid === broker.pid,
+    waiter: async predicate => { if (await predicate() !== true) throw new Error('BROKER_STILL_ALIVE'); },
+  }), /BROKER_STILL_ALIVE/u);
 });
 
 test('both exact browser command forms bind absent environment to image-named FUSE and all three byte identities', async () => {
