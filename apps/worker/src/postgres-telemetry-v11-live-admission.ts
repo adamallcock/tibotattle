@@ -451,10 +451,25 @@ export async function registerPostgresTelemetryV11DayManifest(
   try {
     return await withPostgresMutation(pool, async (client) => {
       await assertV11WriteAllowed(client, principal, config, nowEpoch);
-      const existing = await manifestByDigest(client, s, principal, manifest.day, manifest.manifestDigest, "FOR SHARE");
+      async function registeredCandidate(row: ManifestRow): Promise<PostgresTelemetryV11DayCandidate> {
+        if (row.manifest_json !== canonical) throw manifestConflict();
+        // Reconcile the locked stored candidate on imports and replays as well
+        // as new inserts. Nonempty candidates still require chunk admission.
+        if (manifest.chunks.length === 0 && row.expected_chunk_count === 0 && row.state === "staged") {
+          const promoted = await client.query<ManifestRow>(
+            `UPDATE ${t(s, "telemetry_v11_day_manifests")} SET state = 'ready', ready_at = $2
+              WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0
+              RETURNING ${MANIFEST_COLUMNS}`,
+            [row.id, now],
+          );
+          if (!promoted.rows[0]) throw unavailable();
+          return candidate(promoted.rows[0]);
+        }
+        return candidate(row);
+      }
+      const existing = await manifestByDigest(client, s, principal, manifest.day, manifest.manifestDigest, "FOR UPDATE");
       if (existing) {
-        if (existing.manifest_json !== canonical) throw manifestConflict();
-        return candidate(existing);
+        return registeredCandidate(existing);
       }
       // D1 0058: at most 8192 manifests per device and UTC creation day. D1
       // counts inside its single-writer batch; here concurrent registrations
@@ -483,14 +498,9 @@ export async function registerPostgresTelemetryV11DayManifest(
         [id, principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest,
           manifest.parserVersion, canonical, manifest.chunks.length, now],
       );
-      await client.query(
-        `UPDATE ${t(s, "telemetry_v11_day_manifests")} SET state = 'ready', ready_at = $2
-          WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0`,
-        [id, now],
-      );
-      const stored = await manifestByDigest(client, s, principal, manifest.day, manifest.manifestDigest, "FOR SHARE");
+      const stored = await manifestByDigest(client, s, principal, manifest.day, manifest.manifestDigest, "FOR UPDATE");
       if (!stored || stored.manifest_json !== canonical) throw manifestConflict();
-      return candidate(stored);
+      return registeredCandidate(stored);
     }, { operation: "telemetry.v11.manifest", preserveSafeError: admissionError });
   } catch (error) {
     storageFailure(error);

@@ -396,16 +396,32 @@ export async function registerPostgresTypedV12DayManifest(
   try {
     return await withPostgresMutation(pool, async (client) => {
       await assertWriteAllowed(client, schema, principal, now);
+      async function registeredCandidate(row: ManifestRow): Promise<PostgresTypedV12DayCandidate> {
+        if (row.manifest_json !== canonical) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+        // Imported staged empty days and insertion-race replays are complete
+        // too. Reconcile the locked stored row, never just a proposed insert id.
+        if (manifest.chunks.length === 0 && row.expected_chunk_count === 0 && row.state === "staged") {
+          const promoted = await client.query<ManifestRow>(
+            `UPDATE ${table(schema, "telemetry_v12_day_manifests")}
+                SET state = 'ready', ready_at = $2
+              WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0
+              RETURNING id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at`,
+            [row.id, now],
+          );
+          if (!promoted.rows[0]) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+          return manifestCandidate(promoted.rows[0]);
+        }
+        return manifestCandidate(row);
+      }
       const existing = await client.query<ManifestRow>(
         `SELECT id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at
            FROM ${table(schema, "telemetry_v12_day_manifests")}
           WHERE participant_id = $1 AND device_id = $2 AND chunk_day = $3 AND manifest_digest = $4
-          FOR SHARE`,
+          FOR UPDATE`,
         [principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest],
       );
       if (existing.rows[0]) {
-        if (existing.rows[0].manifest_json !== canonical) throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
-        return manifestCandidate(existing.rows[0]);
+        return registeredCandidate(existing.rows[0]);
       }
       const id = crypto.randomUUID();
       await client.query(
@@ -417,23 +433,17 @@ export async function registerPostgresTypedV12DayManifest(
         [id, principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest,
           manifest.parserVersion, canonical, manifest.chunks.length, now],
       );
-      await client.query(
-        `UPDATE ${table(schema, "telemetry_v12_day_manifests")}
-            SET state = 'ready', ready_at = $2
-          WHERE id = $1 AND state = 'staged' AND expected_chunk_count = 0`,
-        [id, now],
-      );
       const stored = await client.query<ManifestRow>(
         `SELECT id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at
            FROM ${table(schema, "telemetry_v12_day_manifests")}
           WHERE participant_id = $1 AND device_id = $2 AND chunk_day = $3 AND manifest_digest = $4
-          FOR SHARE`,
+          FOR UPDATE`,
         [principal.participantId, principal.deviceId, manifest.day, manifest.manifestDigest],
       );
       if (!stored.rows[0] || stored.rows[0].manifest_json !== canonical) {
         throw new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
       }
-      return manifestCandidate(stored.rows[0]);
+      return registeredCandidate(stored.rows[0]);
     }, { operation: "typed_v12.manifest", preserveSafeError: safeStorageError });
   } catch (error) {
     stagingError(error);

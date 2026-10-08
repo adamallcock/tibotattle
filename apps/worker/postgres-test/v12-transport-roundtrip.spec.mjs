@@ -15,6 +15,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { createTelemetryV12Day, runTelemetryV12Sync } from "../../../src/contribution/index.js";
 
 const PG_TEST_HOST = process.env.PG_TEST_HOST;
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -753,5 +754,122 @@ test("PostgreSQL v1.2 authenticates a device and atomically claims a bounded one
     }
     if (pool) await pool.end();
     if (vite) await vite.close();
+  }
+});
+
+test("PostgreSQL v1.2 reconciles imported empty-day replays for the strict desktop client", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 60_000,
+}, async () => {
+  const endpoint = await localEndpoint();
+  const pool = new pg.Pool({ ...endpoint, user: PG_TEST_USER, database: PG_TEST_DATABASE,
+    password: PG_TEST_PASSWORD ?? "synthetic-local-only", ssl: false, max: 4, connectionTimeoutMillis: 3_000 });
+  const schema = `v12_empty_replay_${randomBytes(6).toString("hex")}`;
+  let created = false;
+  let vite;
+  try {
+    const server = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    created = true;
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    vite = await createServer({ root: WORKER_ROOT, configFile: false,
+      server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom", logLevel: "silent" });
+    const modules = {
+      ...await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
+      ...await vite.ssrLoadModule("/src/constants.ts"),
+    };
+    const nowEpoch = Date.now();
+    await seedDevice({ pool, schema, nowEpoch, modules }); // Activate both runtime mirrors.
+    const owner = await seedAccountlessDevice({ pool, schema, nowEpoch, modules });
+    const other = await seedAccountlessDevice({ pool, schema, nowEpoch, modules });
+    const options = { schema: { primarySchema: schema } };
+    const prepared = createTelemetryV12Day({ day: DAY, parserVersion: "synthetic-empty-replay", recordsByStream: {} });
+    async function imported(manifest, device = owner, canonical = canonicalTelemetryV12Json(manifest)) {
+      const id = randomUUID();
+      await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_day_manifests")} (
+        id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+        manifest_json, expected_chunk_count, state, created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',$9)`,
+      [id, device.principal.participantId, device.principal.deviceId, manifest.day, manifest.manifestDigest,
+        manifest.parserVersion, canonical, manifest.chunks.length, new Date(nowEpoch).toISOString()]);
+      return id;
+    }
+    const stored = async (id) => (await pool.query(`SELECT state, ready_at FROM ${q(schema, "telemetry_v12_day_manifests")} WHERE id=$1`, [id])).rows[0];
+    const importedId = await imported(prepared.manifest);
+    const foreignId = await imported(prepared.manifest, other);
+    const origin = "http://127.0.0.1:8787";
+    const calls = [];
+    // Capabilities and activation are synthetic fixtures; manifest registration
+    // is the real PostgreSQL transaction and the client retains every validator.
+    const result = await runTelemetryV12Sync({
+      serverBaseUrl: origin, deviceAuthorization: owner.authorization,
+      authorization: { schemaVersion: "accountless-upload-owner-v1.2",
+        policyVersion: "accountless-telemetry-v1.2-policy-v1", authorizationBasis: "accountless-policy-v1.2",
+        telemetrySchemaVersion: "telemetry-contribution-v1.2" },
+      laboratory: true, days: [DAY], readDay: () => prepared, clock: () => nowEpoch,
+      createEnvelope: () => assert.fail("empty days never create an envelope"),
+      fetchImpl: async (url, init) => {
+        const path = new URL(url).pathname;
+        calls.push(path);
+        let value;
+        if (path.endsWith("/sync-capabilities-v1.2")) value = {
+          schemaVersion: "device-sync-capabilities-v1.2", destinationOrigin: origin,
+          enrollmentNamespace: "a".repeat(64), identityVersion: "account-track-v2", authorityKind: "accountless",
+          successor: { schemaVersion: "telemetry-contribution-v1.2", envelopeSchemaVersion: "telemetry-envelope-v1.2",
+            lifecycle: "accepted", requiredConsent: telemetryV12RequiredConsent(), consentCurrent: false,
+            authorizationCurrent: true, activationTime: "2026-09-01T00:00:00.000Z" },
+        };
+        else if (path.endsWith("/domain-predecessor")) value = {
+          schemaVersion: "telemetry-domain-predecessor-v1.2", token: randomUUID(), previousGenerationId: null,
+          legacyFingerprint: "b".repeat(64), fromDay: DAY, throughDay: DAY,
+          expiresAt: new Date(nowEpoch + 3_600_000).toISOString(),
+        };
+        else if (path.endsWith("/day-manifests")) value = {
+          ...await modules.registerPostgresTypedV12DayManifest(pool, owner.principal, JSON.parse(init.body), nowEpoch, options),
+          stagedChunks: [],
+        };
+        else if (path.endsWith("/domain-activate")) value = {
+          schemaVersion: "telemetry-domain-activation-v1.2", generationId: randomUUID(),
+          manifestDigest: JSON.parse(init.body).manifestDigest, fromDay: DAY, throughDay: DAY, replay: false,
+        };
+        else assert.fail("unexpected synthetic route");
+        return Response.json(value, { status: 201, headers: { "cache-control": "no-store" } });
+      },
+    });
+    assert.equal(result.status, "complete", JSON.stringify(result.failure));
+    assert.equal(calls.at(-1), "/api/v1/me/telemetry-v12/domain-activate");
+    const ready = await stored(importedId);
+    assert.equal(ready.state, "ready");
+    assert.equal(ready.ready_at.toISOString(), new Date(nowEpoch).toISOString());
+    assert.deepEqual(await stored(foreignId), { state: "staged", ready_at: null });
+    const replays = await Promise.all([1, 2].map((offset) => modules.registerPostgresTypedV12DayManifest(
+      pool, owner.principal, prepared.manifest, nowEpoch + offset, options)));
+    assert.ok(replays.every((candidate) => candidate.manifestId === importedId && candidate.state === "ready"));
+    assert.deepEqual(await stored(importedId), ready, "replays preserve the first ready timestamp");
+
+    const fresh = createTelemetryV12Day({ day: DAY, parserVersion: "synthetic-new-empty", recordsByStream: {} });
+    const inserted = await Promise.all([1, 2].map(() => modules.registerPostgresTypedV12DayManifest(
+      pool, owner.principal, fresh.manifest, nowEpoch, options)));
+    assert.equal(inserted[0].manifestId, inserted[1].manifestId);
+    assert.ok(inserted.every((candidate) => candidate.state === "ready" && candidate.expectedChunks === 0));
+
+    const incomplete = { ...prepared.manifest, chunks: [{ chunkId: `usage:${DAY}:0`, chunkDigest: "c".repeat(64), recordCount: 1 }] };
+    incomplete.manifestDigest = createHash("sha256").update(telemetryV12DayManifestDigestInput(incomplete)).digest("hex");
+    const incompleteId = await imported(incomplete);
+    for (let replay = 0; replay < 2; replay += 1) {
+      const candidate = await modules.registerPostgresTypedV12DayManifest(pool, owner.principal, incomplete, nowEpoch, options);
+      assert.deepEqual({ id: candidate.manifestId, state: candidate.state, count: candidate.expectedChunks },
+        { id: incompleteId, state: "staged", count: 1 });
+    }
+    assert.deepEqual(await stored(incompleteId), { state: "staged", ready_at: null });
+    await assert.rejects(modules.registerPostgresTypedV12DayManifest(pool,
+      { participantId: owner.principal.participantId, deviceId: other.principal.deviceId }, prepared.manifest, nowEpoch, options),
+    { code: "DEVICE_AUTH_INVALID" });
+    assert.deepEqual(await stored(foreignId), { state: "staged", ready_at: null });
+  } finally {
+    if (created) await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+    await pool.end();
+    await vite?.close();
   }
 });

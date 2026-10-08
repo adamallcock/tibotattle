@@ -1406,6 +1406,68 @@ async function grantV11ConsentRow(pool, primarySchema, owner) {
   );
 }
 
+test("v1.1 registration repairs only the owned canonical staged empty candidate on replay", {
+  skip: endpoint === null,
+  timeout: 60_000,
+}, async () => {
+  const { primaryPool, schema, close } = await openSchemas("emptyreplay", [STAGED]);
+  try {
+    const { live, constants } = await loadModules();
+    const options = { schema, sourceNamespace: SOURCE_NAMESPACE };
+    const table = q(schema.primarySchema, "telemetry_v11_day_manifests");
+    await primaryPool.query(`UPDATE ${q(schema.primarySchema, "telemetry_transport_formats")}
+      SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'`);
+    await live.initializePostgresTypedV11Admission(primaryPool, options);
+    const owner = await seedSocialOwner(primaryPool, schema.primarySchema, constants);
+    const other = await seedSocialOwner(primaryPool, schema.primarySchema, constants);
+    const day = new Date().toISOString().slice(0, 10);
+    const empty = makeV11Day(day, {}, "synthetic-empty-replay").manifest;
+    const nowEpoch = Date.now();
+    async function imported(manifest, device = owner) {
+      const id = randomUUID();
+      await primaryPool.query(`INSERT INTO ${table} (
+        id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+        manifest_json, expected_chunk_count, state, created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'staged',$9)`,
+      [id, device.participantId, device.deviceId, manifest.day, manifest.manifestDigest,
+        manifest.parserVersion, canonicalTelemetryV11Json(manifest), manifest.chunks.length, new Date(nowEpoch).toISOString()]);
+      return id;
+    }
+    const stored = async (id) => (await primaryPool.query(`SELECT state, ready_at FROM ${table} WHERE id=$1`, [id])).rows[0];
+    const importedId = await imported(empty);
+    const foreignId = await imported(empty, other);
+    const registrations = await Promise.all([1, 2].map(() => live.registerPostgresTelemetryV11DayManifest(
+      primaryPool, owner.principal, empty, nowEpoch, options)));
+    assert.ok(registrations.every((candidate) => candidate.manifestId === importedId
+      && candidate.state === "ready" && candidate.expectedChunks === 0));
+    const ready = await stored(importedId);
+    assert.equal(ready.ready_at.toISOString(), new Date(nowEpoch).toISOString());
+    await live.registerPostgresTelemetryV11DayManifest(primaryPool, owner.principal, empty, nowEpoch + 1_000, options);
+    assert.deepEqual(await stored(importedId), ready, "replays preserve ready_at");
+    assert.deepEqual(await stored(foreignId), { state: "staged", ready_at: null });
+    await assert.rejects(live.registerPostgresTelemetryV11DayManifest(primaryPool,
+      { participantId: owner.participantId, deviceId: other.deviceId }, empty, nowEpoch, options),
+    { code: "DEVICE_AUTH_INVALID" });
+    assert.deepEqual(await stored(foreignId), { state: "staged", ready_at: null });
+
+    const fresh = makeV11Day(day, {}, "synthetic-new-empty").manifest;
+    const inserted = await Promise.all([1, 2].map(() => live.registerPostgresTelemetryV11DayManifest(
+      primaryPool, owner.principal, fresh, nowEpoch, options)));
+    assert.equal(inserted[0].manifestId, inserted[1].manifestId);
+    assert.ok(inserted.every((candidate) => candidate.state === "ready"));
+    const incomplete = makeV11Day(day, { usage: [fixture.records.usage[0]] }, "synthetic-incomplete-replay").manifest;
+    const incompleteId = await imported(incomplete);
+    for (let replay = 0; replay < 2; replay += 1) {
+      const candidate = await live.registerPostgresTelemetryV11DayManifest(primaryPool, owner.principal, incomplete, nowEpoch, options);
+      assert.deepEqual({ id: candidate.manifestId, state: candidate.state, count: candidate.expectedChunks },
+        { id: incompleteId, state: "staged", count: 1 });
+    }
+    assert.deepEqual(await stored(incompleteId), { state: "staged", ready_at: null });
+  } finally {
+    await close();
+  }
+});
+
 /** One chunk through the production claim, object journal and persist, as the envelope handler runs them. */
 async function persistDirect(modules, pool, schema, owner, chunk, options) {
   const authorizationId = randomUUID();
