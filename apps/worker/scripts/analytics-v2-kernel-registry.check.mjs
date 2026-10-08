@@ -78,6 +78,8 @@ const REGISTRY_PINS = Object.freeze([
   "174ae7da2b2870ab3d8ae73fda5b5345699f077059a2a67bda2f409a18a1a509",
   // Kernel 9: v1 candidate selection, terminal expansion timeouts and closed failure diagnostics.
   "ac773e95cf827e171023e6545ec6cb70c35a6fd4f248aa61bde63ef90f2dca37",
+  // Kernel 10: set-based v1.1 candidate completeness and pair eligibility.
+  "bfc68ed47745b2aa4dac9c47640a31fa522f8dd5dff28a14233243ccba951077",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

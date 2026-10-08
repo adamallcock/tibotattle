@@ -416,8 +416,9 @@ function legacyV11CompleteSql(alias: string): string {
 /**
  * Selection-only v1.1 eligibility. Every join below the record proof is a
  * function of its (chunk_key, manifest_key) pair and the binds. The final
- * candidate grouping is insensitive to the multiplicity EXISTS removes.
- * Expansion retains its existing builders and row multiplicity.
+ * candidate grouping is insensitive to authority-join multiplicity. Candidate
+ * eligibility joins the complete-chunk set once; expansion retains its existing
+ * correlated SQL, builders and row multiplicity.
  */
 function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: string): string {
   return `selection_pairs AS MATERIALIZED (
@@ -439,10 +440,15 @@ function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: 
              ON reach_allocation.namespace_id=reach_chunk.namespace_id
             AND reach_allocation.chunk_original=reach_chunk.original_id)
        GROUP BY count_allocation.chunk_id
-
+    ), selection_complete_chunks AS MATERIALIZED (
+      SELECT chunk.id AS chunk_id FROM selection_chunk_proofs complete
+        JOIN ${s}.telemetry_v11_chunks chunk
+          ON (chunk.id,chunk.record_count::bigint)=(complete.chunk_id,complete.proof_count)
     ), ` : ""}selection_pairs_ok AS MATERIALIZED (
-      SELECT pairs.chunk_key,pairs.manifest_key FROM selection_pairs pairs
-       WHERE EXISTS (SELECT 1 FROM ${s}.typed_telemetry_chunks proof_chunk
+      SELECT ${completenessCte === undefined ? "DISTINCT " : ""}pairs.chunk_key,pairs.manifest_key FROM selection_pairs pairs
+       ${completenessCte === undefined
+         ? `JOIN ${s}.typed_telemetry_chunks proof_chunk ON proof_chunk.id=pairs.chunk_key`
+         : `WHERE EXISTS (SELECT 1 FROM ${s}.typed_telemetry_chunks proof_chunk`}
           JOIN ${s}.typed_v11_chunk_allocations allocation ON allocation.namespace_id=proof_chunk.namespace_id
            AND allocation.chunk_original=proof_chunk.original_id
           JOIN ${s}.typed_v11_manifest_memberships admitted_manifest
@@ -460,9 +466,11 @@ function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: 
            AND event.input_revision=generation.input_revision
           JOIN ${s}.device_credentials generation_device ON generation_device.id=generation.device_id
            AND generation_device.participant_id=generation.participant_id
-         WHERE proof_chunk.id=pairs.chunk_key
+         ${completenessCte === undefined
+           ? `JOIN selection_complete_chunks complete ON complete.chunk_id=chunk.id`
+           : `WHERE proof_chunk.id=pairs.chunk_key
            AND (chunk.id,chunk.record_count::bigint) IN (
-             SELECT complete.chunk_id,complete.proof_count FROM ${completenessCte ?? "selection_chunk_proofs"} complete))
+             SELECT complete.chunk_id,complete.proof_count FROM ${completenessCte} complete))`}
     )`;
 }
 

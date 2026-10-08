@@ -22,5 +22,5 @@ export const READ_PLAN_CONJUNCTS = Object.freeze([
   ["generation_device.id=generation.device_id", "generation_device"],
   ["generation_device.participant_id=generation.participant_id", "device_participant"],
   ["proof_chunk.id=pairs.chunk_key", "chunk"],
-  ["(chunk.id,chunk.record_count::bigint) IN (\n             SELECT complete.chunk_id,complete.proof_count FROM selection_chunk_proofs complete)", "chunk"],
+  ["(chunk.id,chunk.record_count::bigint)=(complete.chunk_id,complete.proof_count)", "chunk"],
 ]);

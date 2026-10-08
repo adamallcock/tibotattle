@@ -151,6 +151,56 @@ test("v1 multi-record chunks preserve complete-admission gates and exact candida
     }
   });
 
+test("v1.1 set eligibility preserves complete multi-record chunks, authority multiplicity and oracle errors",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const schema = `analytics_v2_v11_set_${randomBytes(6).toString("hex")}`;
+    schemas.push(schema);
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    const modules = {
+      codec: await vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
+      v12codec: await vite.ssrLoadModule("/src/telemetry-v12-typed-codec.ts"),
+      reconciliation: await vite.ssrLoadModule("/src/telemetry-usage-reconciliation.ts"),
+      sha256Hex: (await vite.ssrLoadModule("/src/crypto.ts")).sha256Hex,
+    };
+    const fixture = { schema, ...await seedAnalyticsV2Fixture({ pool, schema, modules,
+      correctionRuntime: "active", denseLegacy: { days: 2, usagePerDay: 401 } }) };
+    const owner = fixture.owners.kilo;
+    const compare = async () => snapshot(fixture, async (context) => {
+      const planned = await outcome(() => head.readOwnerEvidencePlan(context, planOptions(owner.ownerDigest)));
+      for (const [fromDay, throughDay] of [[D2, D3], [D2, D2], [D3, D3]]) {
+        const options = { ownerDigest: owner.ownerDigest, stream: "usage", fromDay, throughDay };
+        for (const method of ["countOwnerOccurrences", "readOwnerOccurrences"]) {
+          assert.deepEqual(await outcome(() => head[method](context, options)),
+            await outcome(() => oracle[method](context, options)));
+        }
+        assert.deepEqual(await outcome(() => head.countOwnerEvidencePlanRange(context, planned.value, options)),
+          await outcome(() => oracle.countOwnerOccurrences(context, options)));
+      }
+      return head.countOwnerOccurrences(context, { ownerDigest: owner.ownerDigest, stream: "usage", fromDay: D2, throughDay: D3 });
+    });
+    const before = await compare();
+    assert.equal([...before.values()].reduce((sum, count) => sum + count, 0), 802);
+    const chunk = (await pool.query(`SELECT id FROM "${schema}".telemetry_v11_chunks
+      WHERE participant_id=$1 AND record_count=200 ORDER BY id LIMIT 1`, [owner.participantId])).rows[0];
+    assert.ok(chunk);
+    const changeCount = async (count) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL session_replication_role=replica");
+        await client.query(`UPDATE "${schema}".telemetry_v11_chunks SET record_count=$2 WHERE id=$1`, [chunk.id, count]);
+        await client.query("COMMIT");
+      } finally { client.release(); }
+    };
+    await changeCount(199);
+    try {
+      const after = await compare();
+      assert.equal([...after.values()].reduce((sum, count) => sum + count, 0), 602,
+        "one physically incomplete chunk rejects all 200 candidates, retaining both other chunks");
+    } finally { await changeCount(200); }
+  });
+
 test("negative corrections retain count partition refusals, lower-bound exclusion, FLOOR and future filtering",
   { skip: SKIP, timeout: 120_000 }, async () => {
     const fixture = fixtures.active;
@@ -267,7 +317,7 @@ test("every non-redundant pair eligibility conjunct is killed by an adversarial 
       } catch (error) { await client.query("ROLLBACK"); throw error; }
       finally { client.release(); }
     };
-    const pairStart = selectedSql.indexOf("selection_pairs_ok AS MATERIALIZED");
+    const pairStart = selectedSql.indexOf("selection_complete_chunks AS MATERIALIZED");
     const pairEnd = selectedSql.indexOf(", direct AS (", pairStart);
     const pairSql = selectedSql.slice(pairStart, pairEnd);
     for (const [predicate, update, redundant] of READ_PLAN_CONJUNCTS) {
