@@ -349,6 +349,8 @@ Analytics A-1 readers use read-only repeatable-read transactions with a fixed
 3,600,000-ms per-statement timeout and a 5,000-ms lock timeout. Only the exact
 `analytics_v2.read` operation in read-only mode admits the longer statement
 bound; other operations and all lock timeouts retain the 600,000-ms ceiling.
+Grouped source expansion never retries query cancellation or lock timeout;
+other SQL failures retain the granular fallback used to preserve source-refusal order.
 Shared defaults remain 10,000 ms for statements and 5,000 ms for locks.
 SQLSTATE `57014` and `55P03` become the content-free fatal codes
 `ANALYTICS_V2_READ_STATEMENT_TIMEOUT` and `ANALYTICS_V2_READ_LOCK_TIMEOUT`, with

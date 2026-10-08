@@ -158,6 +158,11 @@
  * /private/tmp/tibotattle-pg-* socket directory) or a loopback PG_TEST_HOST,
  * with PG_TEST_PORT.
  *
+ * A failed receipt optionally includes `readFailures`: bounded counts and
+ * elapsed milliseconds of failed snapshot calls, grouped by closed statement
+ * family and SQLSTATE (57014, 55P03, or other). These concurrent observations
+ * do not identify a final cause. No query, bind or driver error is retained.
+ *
  * Output: one content-free JSON receipt line on stdout (counts and calendar
  * days only), or one JSON error line with a closed code on stderr (a deadline
  * or output-budget refusal adds its content-free figures). Exit 0 for
@@ -1503,6 +1508,7 @@ export async function runAnalyticsRefresh({
   let discard = false;
   let receipt;
   let failure;
+  let readLedger = null;
   let profiler = null;
   let workerProfiles = null;
   let mainCapture = null;
@@ -1615,6 +1621,7 @@ export async function runAnalyticsRefresh({
       // server's execution and planning time for the same families when
       // pg_stat_statements is readable (snapshots on their own connection).
       const ledger = createAnalyticsRefreshStatementLedger();
+      readLedger = ledger;
       const serverBefore = await readAnalyticsRefreshServerStatements(pool);
       const readPool = createSnapshotReadPool(pool, snapshot, { ledger });
       if (parsed.workers > 1) {
@@ -1737,6 +1744,8 @@ export async function runAnalyticsRefresh({
     discard = true;
     // A store error carries sqlState; a driver error carries its SQLSTATE as code.
     const sqlState = typeof error?.sqlState === "string" ? error.sqlState : error?.code;
+    let readFailures = null;
+    try { readFailures = readLedger?.failureSummary() ?? null; } catch { /* retain the original failure */ }
     failure = Object.assign(new Error(safeCode(error, "ANALYTICS_V2_REFRESH_FAILED")), {
       code: safeCode(error, "ANALYTICS_V2_REFRESH_FAILED"),
       phase,
@@ -1745,6 +1754,7 @@ export async function runAnalyticsRefresh({
         ? { field: error.field } : {}),
       ...(error?.usage === true ? { usage: true } : {}),
       ...refusalFigures(error),
+      ...(readFailures === null ? {} : { readFailures }),
     });
   } finally {
     if (ownerPool !== undefined) {
@@ -1796,6 +1806,22 @@ export async function runAnalyticsRefresh({
   return receipt;
 }
 
+/** The final content-free failed receipt; successful receipts have their own projection. */
+export function analyticsRefreshFailureReceipt(error) {
+  return Object.freeze({
+    schemaVersion: ANALYTICS_REFRESH_RECEIPT_VERSION,
+    status: "failed",
+    code: safeCode(error, "ANALYTICS_V2_REFRESH_FAILED"),
+    phase: typeof error?.phase === "string" ? error.phase : "configuration",
+    ...(typeof error?.sqlState === "string" ? { sqlState: error.sqlState } : {}),
+    ...(error?.readFailures === undefined ? {} : { readFailures: error.readFailures }),
+    ...(typeof error?.field === "string" ? { field: error.field } : {}),
+    ...(error?.deadline !== null && typeof error?.deadline === "object" ? { deadline: error.deadline } : {}),
+    ...(error?.outputAccount !== null && typeof error?.outputAccount === "object"
+      ? { outputAccount: error.outputAccount } : {}),
+  });
+}
+
 async function main() {
   try {
     const receipt = await runAnalyticsRefresh();
@@ -1805,17 +1831,7 @@ async function main() {
     }
     process.stdout.write(`${JSON.stringify(receipt)}\n`);
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({
-      schemaVersion: ANALYTICS_REFRESH_RECEIPT_VERSION,
-      status: "failed",
-      code: safeCode(error, "ANALYTICS_V2_REFRESH_FAILED"),
-      phase: typeof error?.phase === "string" ? error.phase : "configuration",
-      ...(typeof error?.sqlState === "string" ? { sqlState: error.sqlState } : {}),
-      ...(typeof error?.field === "string" ? { field: error.field } : {}),
-      ...(error?.deadline !== null && typeof error?.deadline === "object" ? { deadline: error.deadline } : {}),
-      ...(error?.outputAccount !== null && typeof error?.outputAccount === "object"
-        ? { outputAccount: error.outputAccount } : {}),
-    })}\n`);
+    process.stderr.write(`${JSON.stringify(analyticsRefreshFailureReceipt(error))}\n`);
     process.exitCode = error?.usage === true ? 2 : 1;
   }
 }

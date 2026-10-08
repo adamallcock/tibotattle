@@ -466,28 +466,62 @@ function legacySelectionPairCtesSql(s: string, fence: string, completenessCte?: 
     )`;
 }
 
-/** Selection over a fenced id CTE; the v1 arm keeps its original LATERAL. */
-function legacySelectionSql(s: string, fence: string, filter: string): string {
+/**
+ * Candidate-only v1 selection. Resolve membership/runtime once, then count
+ * every admission of each reached chunk once before selecting its records.
+ * The old per-record LATERAL repeated these checks (and its chunk count) for
+ * every owned record, including records of the v1.1 arm. Expansion keeps its
+ * existing multiplicity and builders; candidate grouping ignores duplicate
+ * event-source evidence, so the eligible chunk/device keys are a set.
+ */
+function legacyV1SelectionCtesSql(s: string, fence: string): string {
   const v1Device = typedIdTextSql("typed_device.original_id");
-  return `SELECT eligible.* FROM ${fence} CROSS JOIN LATERAL (
-      SELECT record.observed_day,record.occurrence_id,record.observed_at_ms
+  return `selection_v1_memberships AS MATERIALIZED (
+      SELECT membership.namespace_id,membership.owner_id,membership.participant_id,v1.source_namespace
         FROM ${s}.typed_telemetry_owner_memberships membership
         JOIN ${s}.typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
          AND v1.source_namespace=membership.source_namespace AND v1.namespace_id=membership.namespace_id
-        JOIN ${s}.typed_telemetry_records record ON record.namespace_id=membership.namespace_id
-         AND record.owner_id=membership.owner_id AND record.format=10 AND record.stream=$3
+       WHERE membership.participant_id=$2 AND membership.source_format=10
+    ), selection_v1_records AS MATERIALIZED (
+      SELECT record.id,record.namespace_id,record.device_id,record.observed_day,record.occurrence_id,
+             record.observed_at_ms,admission.chunk_id
+        FROM ${fence}
+        JOIN ${s}.typed_telemetry_records record ON record.id=${fence}.id AND record.format=10 AND record.stream=$3
+        JOIN selection_v1_memberships membership ON membership.namespace_id=record.namespace_id
+         AND membership.owner_id=record.owner_id
+        JOIN ${s}.typed_v1_record_admissions admission ON admission.typed_record_id=record.id
+    ), selection_v1_devices AS MATERIALIZED (
+      SELECT DISTINCT typed_device.id,typed_device.namespace_id,typed_device.original_id
+        FROM selection_v1_records record
         JOIN ${s}.typed_telemetry_devices typed_device ON typed_device.id=record.device_id
          AND typed_device.namespace_id=record.namespace_id
-        JOIN ${s}.typed_v1_record_admissions admission ON admission.typed_record_id=record.id
-        JOIN ${s}.telemetry_v1_chunks chunk ON chunk.id=admission.chunk_id
-         AND chunk.participant_id=membership.participant_id AND chunk.device_id=(${v1Device})
+    ), selection_v1_chunk_counts AS MATERIALIZED (
+      SELECT complete.chunk_id,count(*) AS admission_count
+        FROM ${s}.typed_v1_record_admissions complete
+        JOIN (SELECT DISTINCT chunk_id FROM selection_v1_records) reached ON reached.chunk_id=complete.chunk_id
+       GROUP BY complete.chunk_id
+    ), selection_v1_chunks_ok AS MATERIALIZED (
+      SELECT DISTINCT chunk.id AS chunk_id,typed_device.id AS device_id,typed_device.namespace_id
+        FROM selection_v1_chunk_counts complete
+        JOIN ${s}.telemetry_v1_chunks chunk ON chunk.id=complete.chunk_id
          AND chunk.stream=$4 AND chunk.superseded_at IS NULL AND chunk.accepted_record_count=chunk.record_count
-         AND chunk.record_count=(SELECT count(*) FROM ${s}.typed_v1_record_admissions complete
-           WHERE complete.chunk_id=chunk.id)
+         AND chunk.record_count=complete.admission_count
+        JOIN selection_v1_memberships membership ON membership.participant_id=chunk.participant_id
+        JOIN selection_v1_devices typed_device ON typed_device.namespace_id=membership.namespace_id
+         AND chunk.device_id=(${v1Device})
         JOIN ${s}.typed_v1_event_sources event ON event.chunk_id=chunk.id AND event.owner_digest=$1
-         AND event.source_namespace=v1.source_namespace
-       WHERE membership.participant_id=$2 AND membership.source_format=10 AND record.id=${fence}.id AND ${filter}
-      OFFSET 0) eligible
+         AND event.source_namespace=membership.source_namespace
+    )`;
+}
+
+/** Selection over a fenced id CTE and the candidate-only eligibility sets. */
+function legacySelectionSql(s: string, fence: string, filter: string): string {
+  return `
+      SELECT record.observed_day,record.occurrence_id,record.observed_at_ms
+        FROM selection_v1_records record
+        JOIN selection_v1_chunks_ok chunk ON chunk.chunk_id=record.chunk_id AND chunk.device_id=record.device_id
+         AND chunk.namespace_id=record.namespace_id
+       WHERE ${filter}
     UNION ALL
     SELECT record.observed_day,record.occurrence_id,record.observed_at_ms
       FROM ${fence}
@@ -514,7 +548,7 @@ function legacyCandidatesSql(s: string): string {
          AND owned_record.observed_at_ms>=$5::integer::bigint*${DAY_MS}
          AND owned_record.observed_at_ms<($6::integer::bigint+1)*${DAY_MS}
        WHERE owned_membership.participant_id=$2 AND owned_membership.source_format IN (10,11)
-    ), ${legacySelectionPairCtesSql(s, "owned")}, direct AS (
+    ), ${legacyV1SelectionCtesSql(s, "owned")}, ${legacySelectionPairCtesSql(s, "owned")}, direct AS (
       ${legacySelectionSql(s, "owned", "record.observed_day BETWEEN $5::integer AND $6::integer")}
     )
     SELECT observed_day,occurrence_id,min(observed_at_ms)::text AS observed_at_ms
@@ -1262,13 +1296,14 @@ async function* fetchRawExpansion(client: PostgresClient, s: string, now: string
         await client.query(analyticsV2Statement("snapshot.control", "RELEASE SAVEPOINT analytics_v2_expansion"));
       }
       if (queryFailure !== undefined && savepoint) {
-        // SQL row defects and statement timeouts can belong to a later batch.
-        // Re-run the original logical granularity before decoding/refusing.
-        // Explicit query cancellation is terminal and is never retried.
-        const cancelled = queryFailure as { code?: unknown; message?: unknown };
-        if (cancelled?.code === "57014" && cancelled.message === "canceling statement due to user request") {
+        // Cancellation and lock timeouts are operational failures, not source
+        // defects. Preserve them without starting another bounded SQL attempt.
+        const cancelled = queryFailure as { code?: unknown };
+        if (cancelled?.code === "57014" || cancelled?.code === "55P03") {
           throw queryFailure;
         }
+        // Other SQL defects can belong to a later batch. Re-run the original
+        // logical granularity before decoding/refusing.
         singleBatch = true;
         continue;
       }

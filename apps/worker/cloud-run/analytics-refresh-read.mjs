@@ -52,6 +52,20 @@ const SET_LOCAL_STATEMENT = /^\s*SET\s+LOCAL\s+(?:statement_timeout|lock_timeout
 /** A statement without a family tag (counted, never named by its text). */
 const UNTAGGED_FAMILY = "untagged";
 const MAX_FAMILIES = 64;
+// Failure diagnostics are a separate closed projection: never copy an unknown
+// tag into a failed receipt, even when it happens to match STATEMENT_TAG.
+// Keep this mirror aligned with owners.ts ANALYTICS_V2_STATEMENT_FAMILIES.
+const FAILURE_FAMILIES = new Set([
+  "snapshot.control", "snapshot.read_only", "snapshot.plan_cache", "owners.runtime", "owners.roster",
+  "occurrences.scope", "occurrences.legacy_candidates", "occurrences.v12_candidates",
+  "occurrences.correction_candidates", "occurrences.legacy_sources", "occurrences.v12_sources",
+  "occurrences.correction_sources", "occurrences.counts", "occurrences.first_evidence", "occurrences.watermark",
+  "devices.count", "queued_days.page", "exclusions.read", "owner_sets.read", "owner_sets.values", "owner_sets.frozen",
+]);
+const FAILURE_SQL_STATES = new Set(["57014", "55P03"]);
+const boundedAdd = (left, right) => Math.min(Number.MAX_SAFE_INTEGER, left + right);
+const failureDuration = (value) => Number.isFinite(value) && value >= 0
+  ? Math.min(Number.MAX_SAFE_INTEGER, Math.round(value)) : 0;
 const NAMED_STATEMENT = /^a2_[a-z0-9_]{1,80}$/u;
 
 /** The family of one statement text: its tag, or "untagged". Never its text. */
@@ -70,6 +84,7 @@ export function analyticsRefreshStatementFamily(text) {
  */
 export function createAnalyticsRefreshStatementLedger({ clock = () => performance.now() } = {}) {
   const families = new Map();
+  const failures = new Map();
   let bytesKnown = true;
   const entry = (family) => {
     let value = families.get(family);
@@ -89,6 +104,37 @@ export function createAnalyticsRefreshStatementLedger({ clock = () => performanc
       value.rows += Number.isSafeInteger(rows) && rows >= 0 ? rows : 0;
       if (Number.isSafeInteger(bytes) && bytes >= 0) value.bytes += bytes;
       else bytesKnown = false;
+    },
+    /** Failed round trips only; concurrent failures are aggregated, not ranked as a cause. */
+    recordFailure(family, wallMs, sqlState) {
+      // If timing itself failed, omit that observation rather than claim zero elapsed.
+      if (!Number.isFinite(wallMs) || wallMs < 0) return;
+      const closedFamily = FAILURE_FAMILIES.has(family) ? family : UNTAGGED_FAMILY;
+      const state = FAILURE_SQL_STATES.has(sqlState) ? sqlState : "other";
+      const value = failures.get(closedFamily) ?? { calls: 0, wallMs: 0, maxWallMs: 0, sqlStates: {} };
+      const duration = failureDuration(wallMs);
+      value.calls = boundedAdd(value.calls, 1);
+      value.wallMs = boundedAdd(value.wallMs, duration);
+      value.maxWallMs = Math.max(value.maxWallMs, duration);
+      value.sqlStates[state] = boundedAdd(value.sqlStates[state] ?? 0, 1);
+      failures.set(closedFamily, value);
+    },
+    /** Separate from summary(), so successful receipt contracts remain unchanged. */
+    failureSummary() {
+      if (failures.size === 0) return null;
+      let calls = 0;
+      let wallMs = 0;
+      let maxWallMs = 0;
+      const byFamily = {};
+      for (const [family, value] of [...failures].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
+        calls = boundedAdd(calls, value.calls);
+        wallMs = boundedAdd(wallMs, value.wallMs);
+        maxWallMs = Math.max(maxWallMs, value.maxWallMs);
+        byFamily[family] = Object.freeze({ calls: value.calls, wallMs: value.wallMs, maxWallMs: value.maxWallMs,
+          sqlStates: Object.freeze(Object.fromEntries(Object.entries(value.sqlStates).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)))) });
+      }
+      return Object.freeze({ model: "analytics-refresh-read-failures-v1", calls, wallMs, maxWallMs,
+        families: Object.freeze(byFamily) });
     },
     /** The ledger as receipt data: families sorted by name, durations in whole milliseconds. */
     summary() {
@@ -224,12 +270,28 @@ export function createSnapshotReadPool(pool, snapshotId, { ledger = null } = {})
   // Every round trip goes through `send`, so the ledger sees each one once.
   const send = async (client, family, query) => {
     if (ledger === null) return query();
-    const counter = socketBytes(client);
-    const before = counter?.received ?? 0;
-    const started = ledger.clock();
-    const result = await query();
-    ledger.record(family, ledger.clock() - started, Array.isArray(result?.rows) ? result.rows.length : 0,
-      counter === null ? null : counter.received - before);
+    let counter = null;
+    let before = 0;
+    let started = null;
+    try {
+      counter = socketBytes(client);
+      before = counter?.received ?? 0;
+      started = ledger.clock();
+    } catch { /* diagnostics must not prevent the query */ }
+    let result;
+    try {
+      result = await query();
+    } catch (error) {
+      try {
+        if (Number.isFinite(started)) ledger.recordFailure(family, ledger.clock() - started,
+          typeof error?.sqlState === "string" ? error.sqlState : error?.code);
+      } catch { /* preserve the exact query failure, including when diagnostics fail */ }
+      throw error;
+    }
+    try {
+      if (Number.isFinite(started)) ledger.record(family, ledger.clock() - started,
+        Array.isArray(result?.rows) ? result.rows.length : 0, counter === null ? null : counter.received - before);
+    } catch { /* diagnostics must not turn a successful query into a failure */ }
     return result;
   };
   const control = (client, text) => send(client, CONTROL_FAMILY, () => client.query(text));

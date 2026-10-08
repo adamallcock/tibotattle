@@ -57,7 +57,8 @@ before(async () => {
     await pool.query(`CREATE SCHEMA "${schema}"`);
     await applyPostgresMigrations({ role: "primary", schema, pool });
     fixtures[correctionRuntime] = { schema, ...await seedAnalyticsV2Fixture({ pool, schema, modules: seed,
-      correctionRuntime, legacyScope: true, v12Scope: true }) };
+      correctionRuntime, legacyScope: true, v12Scope: true,
+      denseLegacy: { days: 2, usagePerDay: 10, v1PerDay: 201 } }) };
   }
 });
 after(async () => {
@@ -116,6 +117,39 @@ for (const runtime of ["active", "staged"]) {
       });
     });
 }
+
+test("v1 multi-record chunks preserve complete-admission gates and exact candidate coordinates",
+  { skip: SKIP, timeout: 120_000 }, async () => {
+    const fixture = fixtures.active;
+    const schema = `"${fixture.schema}"`;
+    const ownerDigest = fixture.owners.kilo.ownerDigest;
+    const compare = async () => snapshot(fixture, async (context) => {
+      for (const [fromDay, throughDay] of [[D2, D3], [D2, D2], [D3, D3]]) {
+        const options = { ownerDigest, stream: "usage", fromDay, throughDay };
+        for (const method of ["countOwnerOccurrences", "readOwnerOccurrences"]) {
+          assert.deepEqual(await head[method](context, options), await oracle[method](context, options));
+        }
+        const plan = await head.readOwnerEvidencePlan(context, planOptions(ownerDigest));
+        assert.deepEqual(await head.countOwnerEvidencePlanRange(context, plan, options),
+          await oracle.countOwnerOccurrences(context, options));
+      }
+      return head.countOwnerOccurrences(context, { ownerDigest, stream: "usage", fromDay: D2, throughDay: D3 });
+    });
+    const before = await compare();
+    const chunk = (await pool.query(`SELECT id FROM ${schema}.telemetry_v1_chunks
+      WHERE participant_id=$1 AND record_count=1 ORDER BY id LIMIT 1`, [fixture.owners.kilo.participantId])).rows[0];
+    assert.ok(chunk, "a partially filled second chunk is required");
+    // Both transport counters still agree: only the all-admissions completeness
+    // gate can reject this chunk. The other 200-record chunk must remain whole.
+    await pool.query(`UPDATE ${schema}.telemetry_v1_chunks SET record_count=2,accepted_record_count=2 WHERE id=$1`, [chunk.id]);
+    try {
+      const after = await compare();
+      assert.equal([...before.values()].reduce((sum, value) => sum + value, 0)
+        - [...after.values()].reduce((sum, value) => sum + value, 0), 1);
+    } finally {
+      await pool.query(`UPDATE ${schema}.telemetry_v1_chunks SET record_count=1,accepted_record_count=1 WHERE id=$1`, [chunk.id]);
+    }
+  });
 
 test("negative corrections retain count partition refusals, lower-bound exclusion, FLOOR and future filtering",
   { skip: SKIP, timeout: 120_000 }, async () => {
