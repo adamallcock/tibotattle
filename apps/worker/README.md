@@ -343,6 +343,19 @@ npm run docs:check
 ```
 
 
+## GCP analytics read bounds
+
+Analytics A-1 readers use read-only repeatable-read transactions with a fixed
+3,600,000-ms per-statement timeout and a 5,000-ms lock timeout. Only the exact
+`analytics_v2.read` operation in read-only mode admits the longer statement
+bound; other operations and all lock timeouts retain the 600,000-ms ceiling.
+Shared defaults remain 10,000 ms for statements and 5,000 ms for locks.
+SQLSTATE `57014` and `55P03` become the content-free fatal codes
+`ANALYTICS_V2_READ_STATEMENT_TIMEOUT` and `ANALYTICS_V2_READ_LOCK_TIMEOUT`, with
+only their SQLSTATE retained. Operational failures never enter the `SOURCE_*`
+unread-owner publication fallback. A read-phase failure reaches no analytics
+output writes. These bounds do not guarantee that a full-history query finishes.
+
 ## GCP fast-pricer validation
 
 `npm run analytics-v2:pricer:check` compares the independently bundled pinned

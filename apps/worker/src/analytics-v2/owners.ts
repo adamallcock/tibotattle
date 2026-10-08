@@ -72,7 +72,19 @@ export interface AnalyticsV2SnapshotContext extends AnalyticsV2ReadContext {
   readonly client?: PostgresClient;
 }
 
-const READ_TIMEOUT_MS = 300_000;
+const READ_TIMEOUT_MS = 3_600_000;
+
+/** Operational read failures stay fatal, outside the SOURCE_* publication fallback. */
+class AnalyticsV2ReadTimeoutError extends Error {
+  readonly code: "ANALYTICS_V2_READ_STATEMENT_TIMEOUT" | "ANALYTICS_V2_READ_LOCK_TIMEOUT";
+
+  constructor(readonly sqlState: "57014" | "55P03") {
+    const code = sqlState === "57014" ? "ANALYTICS_V2_READ_STATEMENT_TIMEOUT" : "ANALYTICS_V2_READ_LOCK_TIMEOUT";
+    super(code);
+    this.name = "AnalyticsV2ReadTimeoutError";
+    this.code = code;
+  }
+}
 
 /**
  * The closed statement families of the A-1 readers (K-PGSTAT). Every reader
@@ -206,7 +218,17 @@ export function quotedSchema(schema: unknown): string {
 }
 
 function preserve(error: unknown): Error | null {
-  return error instanceof AnalyticsV2SourceError ? error : null;
+  if (error instanceof AnalyticsV2SourceError || error instanceof AnalyticsV2ReadTimeoutError) return error;
+  if (error === null || typeof error !== "object") return null;
+  try {
+    const code = Reflect.get(error, "code");
+    const state = typeof code === "string" ? code : Reflect.get(error, "sqlState");
+    // Match the reviewed ops-probe classification; query cancellation currently
+    // has no separate caller path. Never copy a driver message, cause or stack.
+    return state === "57014" || state === "55P03" ? new AnalyticsV2ReadTimeoutError(state) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function assertReadOnly(client: PostgresClient, configure = false): Promise<void> {

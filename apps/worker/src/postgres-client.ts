@@ -185,9 +185,9 @@ function operationLabel(value: unknown): string {
   return value;
 }
 
-function timeoutMilliseconds(value: unknown, fallback: number): number {
+function timeoutMilliseconds(value: unknown, fallback: number, maximum = 600_000): number {
   const timeout = value === undefined ? fallback : value;
-  if (!Number.isSafeInteger(timeout) || (timeout as number) < 1 || (timeout as number) > 600_000) {
+  if (!Number.isSafeInteger(timeout) || (timeout as number) < 1 || (timeout as number) > maximum) {
     throw new TypeError("invalid PostgreSQL transaction timeout");
   }
   return timeout as number;
@@ -203,22 +203,25 @@ interface NormalizedPostgresTransactionOptions {
 }
 
 function transactionOptions(options: PostgresTransactionOptions): NormalizedPostgresTransactionOptions {
+  const readOnly = options.readOnly ?? false;
+  const operation = operationLabel(options.operation);
   const isolationLevel = options.isolationLevel ?? "read_committed";
   if (isolationLevel !== "read_committed" && isolationLevel !== "repeatable_read") {
     throw new TypeError("invalid PostgreSQL isolation level");
   }
   return {
-    readOnly: options.readOnly ?? false,
+    readOnly,
     isolationLevel,
     statementTimeoutMilliseconds: timeoutMilliseconds(
       options.statementTimeoutMilliseconds,
       DEFAULT_POSTGRES_TRANSACTION_OPTIONS.statementTimeoutMilliseconds,
+      readOnly === true && operation === "analytics_v2.read" ? 3_600_000 : 600_000,
     ),
     lockTimeoutMilliseconds: timeoutMilliseconds(
       options.lockTimeoutMilliseconds,
       DEFAULT_POSTGRES_TRANSACTION_OPTIONS.lockTimeoutMilliseconds,
     ),
-    operation: operationLabel(options.operation),
+    operation,
     preserveSafeError: options.preserveSafeError,
   };
 }

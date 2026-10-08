@@ -2669,6 +2669,79 @@ test("default wiring: cache history starts at the first evidence day, older than
     { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
 });
 
+test("default wiring: operational timeouts and other driver failures remain fatal for a non-effective owner", async () => {
+  for (const upstreamCode of ["57014", "55P03", "ECONNRESET"]) {
+    const { modules } = wiringModules();
+    const privateFragment = "synthetic-private-SQL-and-session";
+    const client = {
+      async query() { return { rows: [{ read_only: "on" }] }; },
+      release() {},
+    };
+    const safeFailure = await a1.owners.withAnalyticsV2ReadSnapshot({ pool: { async connect() { return client; } },
+      schema: "synthetic", nowMs: WIRING_NOW_MS }, async () => {
+      throw Object.assign(new Error(privateFragment), { code: upstreamCode, detail: privateFragment });
+    }).catch((error) => error);
+    const original = modules.occurrences.readOwnerOccurrences;
+    modules.occurrences.readOwnerOccurrences = async (context, options) => {
+      if (options.ownerDigest === OWNER_B) throw safeFailure;
+      return original(context, options);
+    };
+    await assert.rejects(job.createAnalyticsV2Pipeline(modules).read({ pool: {}, schema: "s",
+      nowMs: WIRING_NOW_MS, state: WIRING_STATE }), (error) => {
+      assert.equal(error, safeFailure, "the failure must not become unread publication fallback");
+      assert.equal(JSON.stringify(error).includes(privateFragment), false);
+      return true;
+    });
+  }
+});
+
+test("refresh read timeout preserves its closed failure and SQLSTATE without compute or writes", async () => {
+  for (const [sqlState, reason] of [["57014", "STATEMENT"], ["55P03", "LOCK"]]) {
+    const sent = [];
+    let computed = 0;
+    let written = 0;
+    const client = {
+      async query(text) {
+        sent.push(text);
+        if (text.includes("pg_try_advisory_lock")) return { rows: [{ acquired: true }] };
+        if (text.includes("pg_advisory_unlock")) return { rows: [{ released: true }] };
+        if (text.includes("pg_export_snapshot")) return { rows: [{ snapshot: "00000003-0000001B-1" }] };
+        if (text.includes("transaction_read_only")) return { rows: [{ read_only: "on" }] };
+        return { rows: [] };
+      },
+      release() {},
+    };
+    const pool = { async connect() { return client; }, async end() {} };
+    const privateFragment = "synthetic-private-SQL-and-session";
+    const pipeline = {
+        async read({ pool: readPool, schema, nowMs }) {
+          return a1.owners.withAnalyticsV2ReadSnapshot({ pool: readPool, schema, nowMs }, async () => {
+            throw Object.assign(new Error(privateFragment), { code: sqlState, query: privateFragment });
+          });
+        },
+        async compute() { computed += 1; },
+    };
+    await assert.rejects(job.runAnalyticsRefresh({ argv: ["--mode=full", "--schema=synthetic"],
+      env: jobEnvironment({ PG_TEST_HOST: "127.0.0.1" }), dependencies: { createPool: () => pool, kernelIdentity,
+        modules: { pipeline, store: { ...store,
+          async readAnalyticsV2RefreshState() { return WIRING_STATE; },
+          async proveAnalyticsV2PriceTransitions() { return []; },
+          async writeRunOutputs() { written += 1; throw new Error("unexpected write"); },
+        } } } }), (error) => {
+      assert.equal(error.phase, "read");
+      assert.equal(error.code, `ANALYTICS_V2_READ_${reason}_TIMEOUT`);
+      assert.equal(error.sqlState, sqlState);
+      assert.equal(JSON.stringify(error).includes(privateFragment), false);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+    assert.equal(computed, 0);
+    assert.equal(written, 0);
+    assert.ok(sent.includes("ROLLBACK"));
+    assert.equal(sent.some((text) => /^\s*(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/iu.test(text)), false);
+  }
+});
+
 test("default wiring: an unlinked typed owner blocks every queued day; a non-effective source refusal fails closed", async () => {
   const unlinked = [
     { participantId: "participant-unlinked-legacy", hasV1: false, hasV11: false, hasV12: false, hasLegacy: true,
