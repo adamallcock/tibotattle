@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { parseSignedReplacementArguments, seedSignedReplacementNativeState,
   readSignedReplacementState, assertSignedReplacementContinuity } from '../scripts/smoke-electron-macos-replacement.mjs';
 import { validateCanaryHost } from '../scripts/run-signed-electron-production-canary.mjs';
-import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
+import * as currentIndex from '../src/local-unified-index.js';
+const { openLocalUnifiedIndex } = currentIndex;
 
 const args = ['--app', '/tmp/TiboTattle.app', '--archive', '/tmp/reviewed.zip', '--archive-sha256', 'a'.repeat(64),
   '--source-revision', 'b'.repeat(40), '--asar-sha256', 'c'.repeat(64)];
@@ -65,4 +66,27 @@ test('real native SQLite fixture has retained usage/quota rows and continuity ca
   assert.notEqual((await readSignedReplacementState(native)).saltDigest, before.saltDigest);
   const optout = JSON.parse(await readFile(join(native, 'private', 'automatic-contribution-v0.1.json'), 'utf8'));
   assert.equal(optout.enabled, false);
+});
+
+test('the selected index API owns fixture writing and every baseline read remains read-only', async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'signed-replacement-index-api-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const opens = [], ordinals = [], writers = [];
+  const index = { ...currentIndex,
+    openLocalUnifiedIndex(path, options) { opens.push(options); return currentIndex.openLocalUnifiedIndex(path, options); },
+    createUnifiedIndexWriter(database, options) { writers.push(options); return currentIndex.createUnifiedIndexWriter(database, options); },
+    outcomeOrdinal(value) { ordinals.push(['outcome', value]); return currentIndex.outcomeOrdinal(value); },
+    reasoningEffortOrdinal(value) { ordinals.push(['effort', value]); return currentIndex.reasoningEffortOrdinal(value); },
+  };
+  const native = join(root, 'native'), database = join(native, 'local-unified-index-v1.sqlite');
+  const seeded = await seedSignedReplacementNativeState(native, join(root, 'codex'), index);
+  const before = await readFile(database);
+  assert.deepEqual(await readSignedReplacementState(native, index), seeded);
+  assert.deepEqual(await readFile(database), before);
+  assert.deepEqual(opens, [{ create: true }, { readOnly: true }, { readOnly: true }]);
+  assert.deepEqual(writers, [{ contractVersion: 'telemetry-contribution-v0.1' }]);
+  assert.deepEqual(ordinals, [['effort', 'medium'], ['outcome', 'unknown'], ['effort', 'medium'], ['outcome', 'unknown']]);
+  assert.equal(seeded.usageRows, 2);
+  assert.equal(seeded.quotaRows, 2);
+  assert.equal(seeded.tokensInUncached, 203);
 });

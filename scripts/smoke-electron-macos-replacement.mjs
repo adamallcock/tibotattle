@@ -83,7 +83,9 @@ export async function verifySignedReplacementArtifact(options) {
 }
 
 // Typed, content-free records exercise the real SQLite schema, not a file named .sqlite.
-export async function seedSignedReplacementNativeState(nativeRoot, codexHome) {
+export async function seedSignedReplacementNativeState(nativeRoot, codexHome, index = {
+  openLocalUnifiedIndex, createUnifiedIndexWriter, outcomeOrdinal, reasoningEffortOrdinal,
+}) {
   await mkdir(nativeRoot, { mode: 0o700 });
   await mkdir(join(nativeRoot, 'private'), { mode: 0o700 });
   const files = {
@@ -93,8 +95,8 @@ export async function seedSignedReplacementNativeState(nativeRoot, codexHome) {
     'private/automatic-contribution-v0.1.json': JSON.stringify({ schemaVersion: 'automatic-contribution-settings-v0.1', enabled: false }) + '\n',
   };
   for (const [name, bytes] of Object.entries(files)) await writeFile(join(nativeRoot, name), bytes, { mode: 0o600, flag: 'wx' });
-  const database = openLocalUnifiedIndex(join(nativeRoot, INDEX), { create: true });
-  const writer = createUnifiedIndexWriter(database, { contractVersion: 'telemetry-contribution-v0.1' });
+  const database = index.openLocalUnifiedIndex(join(nativeRoot, INDEX), { create: true });
+  const writer = index.createUnifiedIndexWriter(database, { contractVersion: 'telemetry-contribution-v0.1' });
   const accountScopeId = writer.internAccountScope({ status: 'unavailable', reason: 'missing_account', planType: null, scopeLocal: null });
   const modelId = writer.internModel('gpt-5.6-sol', 'recognized');
   const tierId = writer.internTier({ apiServiceTier: 'unknown', billingSurface: 'chatgpt_subscription', codexSpeedMode: 'standard', tierSource: 'rollout_thread_settings', providerTierRaw: 'default' });
@@ -105,17 +107,17 @@ export async function seedSignedReplacementNativeState(nativeRoot, codexHome) {
     const observedAtMs = Date.parse('2026-08-01T00:00:00Z') + i * 1000;
     const quotaObservationId = writer.internQuota({ observedAtMs, limitId: 'codex', slot: 'primary', planType: 'plus', usedPercent: 40 + i, resetsAtMs: Date.parse('2026-08-02T00:00:00Z'), durationMins: 300 });
     writer.writeUsageEvent({ eventKey: Buffer.alloc(32, i), observedAtMs, sessionLocal, accountScopeId, modelId, tierId, surfaceId, quotaObservationId,
-      reasoningEffort: reasoningEffortOrdinal('medium'), outcome: outcomeOrdinal('unknown'),
+      reasoningEffort: index.reasoningEffortOrdinal('medium'), outcome: index.outcomeOrdinal('unknown'),
       tokensInUncached: 100 + i, tokensInCacheRead: 200, tokensInCacheWrite: null, tokensInCacheWrite5m: null,
       tokensInCacheWrite1h: null, tokensOutText: 5, tokensOutReasoning: 2, tokensOutCombined: null, totalInputContext: null });
   }
   await writer.close({ integrityCheck: true, fsyncPath: null });
   await chmod(join(nativeRoot, INDEX), 0o600);
-  return readSignedReplacementState(nativeRoot);
+  return readSignedReplacementState(nativeRoot, index);
 }
 
-export async function readSignedReplacementState(root) {
-  const database = openLocalUnifiedIndex(join(root, INDEX), { readOnly: true });
+export async function readSignedReplacementState(root, index = { openLocalUnifiedIndex }) {
+  const database = index.openLocalUnifiedIndex(join(root, INDEX), { readOnly: true });
   let rows;
   try {
     if (database.prepare('PRAGMA quick_check').get().quick_check !== 'ok') fail('database_integrity');

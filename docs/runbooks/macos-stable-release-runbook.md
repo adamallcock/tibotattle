@@ -106,6 +106,14 @@ hash: derive `predecessorAsarSha256` from the exact pinned DMG and retain that
 inspection; the runner compares the installed archive with it. A supplied hash
 or planned receipt alone is not artifact verification.
 
+Before launching the predecessor, the runner snapshots that verified archive
+into private scratch and uses its public local-index API to create synthetic
+retained state and read the baseline. This keeps 0.1.26 state at format 11 until
+the installed successor performs the real forward migration to format 12.
+Post-update reads use the current API; neither database version labels nor the
+signed application are modified to make the predecessor accept newer state.
+The scratch snapshot is removed after baseline inspection, including on failure.
+
 The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and
 recorded opt-out. V2 and V3 require every captured predecessor process identity,

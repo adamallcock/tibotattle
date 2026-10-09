@@ -2,11 +2,11 @@
 // Post-activation acceptance only. No feed overrides, signing changes or candidate installation by this runner.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, lstat, readFile, writeFile, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, lstat, readFile, writeFile, realpath, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateSparkleTransitionHost, captureMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment,
   selectMacTransitionApplicationProcess } from './smoke-electron-macos-sparkle-transition.mjs';
@@ -37,6 +37,13 @@ export function classifyProductionUpdateFailure(error) {
   const exitCode = Number.isInteger(error?.status) && error.status >= 0 && error.status <= 255 ? error.status : null;
   const signal = ['SIGTERM', 'SIGKILL', 'SIGABRT'].includes(error?.signal) ? error.signal : null;
   return { code, exitCode, signal, kind: code ? 'system_error' : exitCode !== null ? 'command_exit' : signal ? 'command_signal' : 'unclassified' };
+}
+export function productionUpdateFailureStage(error, stage) {
+  const launchStages = ['process_group', 'native_intro', 'owned_debugger', 'dashboard_target', 'dashboard_ready', 'settings_target', 'settings_ready'];
+  if (['predecessor_baseline', 'controlled_restart'].includes(stage) && launchStages.includes(error?.signedLaunchStage)) {
+    return stage + '_' + error.signedLaunchStage;
+  }
+  return error?.updateStage ?? error?.transitionStage ?? stage;
 }
 
 const command = (file, args, timeout = 30000) => execFileSync(file, args,
@@ -162,6 +169,54 @@ export function refreshProductionUpdateArchiveIndex(appPath) {
   if (typeof api.uncache !== 'function') fail('archive_cache_api');
   api.uncache(join(appPath, 'Contents', 'Resources', 'app.asar'));
 }
+// Call only after signed predecessor verification. Snapshot the same pinned ASAR
+// before importing its public API; native/unpacked bytes are never sourced from
+// beside the archive. If that API needs them, importing must fail closed.
+export async function withProductionUpdatePredecessorIndex(input, appPath, useIndex) {
+  if (!SHA.test(input.predecessorAsarSha256) || typeof useIndex !== 'function') fail('predecessor_fixture');
+  await safePath(input.directory);
+  const parent = await lstat(input.directory);
+  if (!parent.isDirectory() || parent.uid !== process.getuid() || (parent.mode & 0o022)) fail('predecessor_fixture_location');
+  const archiveBytes = await bytes(join(appPath, 'Contents', 'Resources', 'app.asar'), 512 * 1024 ** 2);
+  if (hash(archiveBytes) !== input.predecessorAsarSha256) fail('predecessor_asar');
+  const scratch = await mkdtemp(join(input.directory, 'predecessor-index-'));
+  const owned = await lstat(scratch), archive = join(scratch, 'predecessor.asar'), extracted = join(scratch, 'app');
+  const loaded = createRequire(require.resolve('electron-builder'))('@electron/asar'), api = loaded?.default ?? loaded;
+  try {
+    await writeFile(archive, archiveBytes, { flag: 'wx', mode: 0o600 });
+    await mkdir(extracted, { mode: 0o700 });
+    const entries = api.listPackage(archive);
+    if (entries.length > 50000) fail('predecessor_fixture_archive');
+    let total = 0;
+    for (const entry of entries) {
+      const name = entry.slice(1), parts = name.split('/');
+      if (!entry.startsWith('/') || parts.some(part => !part || part === '.' || part === '..')
+        || /[\\\0\r\n]/u.test(name)) fail('predecessor_fixture_archive');
+      const item = api.statFile(archive, name, false);
+      if (Object.hasOwn(item, 'link')) fail('predecessor_fixture_archive');
+      if (item.unpacked) continue;
+      const path = join(extracted, ...parts);
+      if (Object.hasOwn(item, 'files')) await mkdir(path, { mode: 0o700 });
+      else {
+        if (!Number.isSafeInteger(item.size) || item.size < 0 || (total += item.size) > 512 * 1024 ** 2) fail('predecessor_fixture_archive');
+        const content = api.extractFile(archive, name, false);
+        if (content.length !== item.size) fail('predecessor_fixture_archive');
+        await writeFile(path, content, { flag: 'wx', mode: 0o600 });
+      }
+    }
+    const index = await import(pathToFileURL(join(extracted, 'src', 'local-unified-index.js')).href);
+    if (!['openLocalUnifiedIndex', 'createUnifiedIndexWriter', 'outcomeOrdinal', 'reasoningEffortOrdinal']
+      .every(name => typeof index[name] === 'function')) fail('predecessor_fixture_api');
+    return await useIndex(index);
+  } finally {
+    api.uncache(archive);
+    await safePath(scratch);
+    const current = await lstat(scratch);
+    if (!current.isDirectory() || current.ino !== owned.ino || current.dev !== owned.dev
+      || current.uid !== process.getuid() || (current.mode & 0o077)) fail('predecessor_fixture_cleanup');
+    await rm(scratch, { recursive: true });
+  }
+}
 async function verifyPinnedPredecessor(input, appPath, predecessor) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
   if (hash(await bytes(asar, 512 * 1024 ** 2)) !== input.predecessorAsarSha256) fail('predecessor_asar');
@@ -252,24 +307,28 @@ export async function runProductionUpdate(options) {
     await copyPredecessor(predecessorDmg, app, join(input.directory, 'install-mount'));
     await assertExtractedSignedMacBundle(predecessorDmg, app, join(input.directory, 'predecessor-verification-mount'));
     const verified = await verifyProductionUpdatePredecessor(input, app); proof.signedArtifactVerified = true;
-    command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', app]);
-    await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
-    const seeded = await seedSignedReplacementNativeState(native, codex);
-    for (const [key, kind, value] of [['tibotattle.language-preference.v1', '-string', 'es'],
-      ['tibotattle.appearance.v1', '-string', 'dark'], ['tibotattle.refresh-interval.v1', '-int', '900']]) {
-      command('/usr/bin/defaults', ['write', 'com.usagemonitor.local', key, kind, value]);
-    }
-    const temporary = join(input.directory, 'runtime'); await mkdir(temporary, { mode: 0o700 });
-    const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: temporary });
-    stage = 'predecessor_baseline';
-    active = await launchVerifiedMacSharingApp(verified, environment, { launchServices: true });
-    captureMacTransitionProcesses(app, active.pid, knownProcesses);
-    await until(async () => (await inspectNativeElectronHandoverCompletion({ userDataRoot: profile })).status === 'completed', 120000, 'predecessor_migration');
-    const stateRoot = join(profile, 'companion-state'), settingsFile = join(profile, 'desktop-settings', 'desktop-settings-v1.json');
-    const sharing = await until(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'sharing');
-    const before = await readSignedReplacementState(stateRoot);
-    assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
-    await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
+    stage = 'predecessor_fixture';
+    const { before, environment, stateRoot, settingsFile, sharing } = await withProductionUpdatePredecessorIndex(input, app, async index => {
+      command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', app]);
+      await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
+      const seeded = await seedSignedReplacementNativeState(native, codex, index);
+      for (const [key, kind, value] of [['tibotattle.language-preference.v1', '-string', 'es'],
+        ['tibotattle.appearance.v1', '-string', 'dark'], ['tibotattle.refresh-interval.v1', '-int', '900']]) {
+        command('/usr/bin/defaults', ['write', 'com.usagemonitor.local', key, kind, value]);
+      }
+      const temporary = join(input.directory, 'runtime'); await mkdir(temporary, { mode: 0o700 });
+      const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: temporary });
+      stage = 'predecessor_baseline';
+      active = await launchVerifiedMacSharingApp(verified, environment, { launchServices: true });
+      captureMacTransitionProcesses(app, active.pid, knownProcesses);
+      await until(async () => (await inspectNativeElectronHandoverCompletion({ userDataRoot: profile })).status === 'completed', 120000, 'predecessor_migration');
+      const stateRoot = join(profile, 'companion-state'), settingsFile = join(profile, 'desktop-settings', 'desktop-settings-v1.json');
+      const sharing = await until(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'sharing');
+      const before = await readSignedReplacementState(stateRoot, index);
+      assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
+      await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
+      return { before, environment, stateRoot, settingsFile, sharing };
+    });
     // Invoke the ordinary Settings APIs; only the signed main process owns the updater/feed.
     stage = 'check_update';
     const ready = await until(async () => {
@@ -332,7 +391,13 @@ export async function runProductionUpdate(options) {
     await stopOwnedMacSharingApp(active); active = null;
     Object.assign(proof, { retainedRowsPreserved: true, saltPreserved: true, preferencesPreserved: true,
       optOutPreserved: true, restartNoDuplicates: true, status: 'passed' });
-  } catch (error) { proof.failureStage = error?.updateStage ?? error?.transitionStage ?? stage; proof.failureClassification = classifyProductionUpdateFailure(error); }
+  } catch (error) {
+    proof.failureStage = productionUpdateFailureStage(error, stage);
+    proof.failureClassification = classifyProductionUpdateFailure(error);
+    if (['predecessor_baseline', 'controlled_restart'].includes(stage) && error?.ownedMacProcessesStopped === true) {
+      proof.ownedProcessesStopped = true;
+    }
+  }
   finally {
     if (active) { try { await stopOwnedMacSharingApp(active); } catch (error) { proof.status = 'failed'; proof.failureStage ??= 'cleanup'; proof.cleanupFailureClassification = classifyProductionUpdateFailure(error); } }
     if (app && input && knownProcesses.size) {

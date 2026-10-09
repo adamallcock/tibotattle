@@ -3,9 +3,10 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile, readdir, lstat, symlink, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 const hash = (b, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(b).digest(encoding);
@@ -197,6 +198,16 @@ test('failure classification emits fixed content-free fields and preserves comma
   assert.deepEqual(runner.classifyProductionUpdateFailure({code:'/secret',status:'1',signal:'private'}),
     {code:null,exitCode:null,signal:null,kind:'unclassified'});
 });
+test('launch substages survive through the existing failure field without emitting arbitrary diagnostics', () => {
+  for (const stage of ['predecessor_baseline', 'controlled_restart']) {
+    assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: 'dashboard_target', stage: '/private/path' }, stage),
+      stage + '_dashboard_target');
+    assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: '/private/path', stage: 'startup' }, stage), stage);
+  }
+  assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: 'dashboard_target' }, 'fixed_production_feed'), 'fixed_production_feed');
+  assert.equal(runner.productionUpdateFailureStage({ updateStage: 'production_feed_digest' }, 'fixed_production_feed'), 'production_feed_digest');
+  assert.equal(runner.productionUpdateFailureStage({ transitionStage: 'process_identity' }, 'successor_process_capture'), 'process_identity');
+});
 
 test('updater successor excludes an orphaned old companion but keeps new main and descendant semantics', () => {
   const executable = '/qualified/TiboTattle.app/Contents/MacOS/TiboTattle';
@@ -259,4 +270,86 @@ test('replacement verification refreshes the real ASAR path cache after an updat
     assert.equal(JSON.parse(api.extractFile(archive,'package.json').toString()).version, '0.1.22');
     assert.equal(hash(await readFile(archive)), signedBytesBefore);
   } finally { api.uncache(archive); await rm(directory, { recursive:true, force:true }); }
+});
+
+const fixtureIndexSource = `import { value } from './fixture-value.js';
+export const openLocalUnifiedIndex = () => value;
+export const createUnifiedIndexWriter = () => {};
+export const outcomeOrdinal = () => 0;
+export const reasoningEffortOrdinal = () => 0;
+export const moduleUrl = import.meta.url;
+`;
+async function predecessorArchiveFixture(t, { source = fixtureIndexSource, link = false, unpacked = false } = {}) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-predecessor-api-')));
+  const app = join(directory, 'TiboTattle.app'), archive = join(app, 'Contents', 'Resources', 'app.asar');
+  const tree = join(directory, 'source');
+  const req = createRequire(import.meta.url), loaded = createRequire(req.resolve('electron-builder'))('@electron/asar');
+  const api = loaded.default ?? loaded;
+  t.after(async () => { api.uncache(archive); await rm(directory, { recursive: true, force: true }); });
+  await mkdir(dirname(archive), { recursive: true });
+  await mkdir(join(tree, 'src'), { recursive: true });
+  await writeFile(join(tree, 'package.json'), JSON.stringify({ type: 'module' }));
+  await writeFile(join(tree, 'src', 'local-unified-index.js'), source);
+  await writeFile(join(tree, 'src', 'fixture-value.js'), 'export const value = "pinned predecessor";');
+  if (link) await symlink('fixture-value.js', join(tree, 'src', 'fixture-link.js'));
+  if (unpacked) await writeFile(join(tree, 'native.node'), 'unbound native bytes');
+  await api.createPackageWithOptions(tree, archive, unpacked ? { unpack: '*.node' } : {});
+  const input = { directory, predecessorAsarSha256: hash(await readFile(archive)) };
+  return { directory, app, archive, input };
+}
+const scratchNames = async directory => (await readdir(directory)).filter(name => name.startsWith('predecessor-index-'));
+
+test('predecessor API loads exact packed archive bytes with private permissions and removes owned scratch', async t => {
+  const { directory, app, archive, input } = await predecessorArchiveFixture(t, { unpacked: true });
+  const before = await readFile(archive);
+  const result = await runner.withProductionUpdatePredecessorIndex(input, app, async index => {
+    const module = fileURLToPath(index.moduleUrl), extracted = dirname(dirname(module));
+    assert.equal(index.openLocalUnifiedIndex(), 'pinned predecessor');
+    assert.equal((await lstat(module)).mode & 0o777, 0o600);
+    assert.equal((await lstat(extracted)).mode & 0o777, 0o700);
+    assert.equal((await lstat(dirname(extracted))).mode & 0o777, 0o700);
+    assert.deepEqual(await readFile(join(dirname(extracted), 'predecessor.asar')), before);
+    await assert.rejects(lstat(join(extracted, 'native.node')), { code: 'ENOENT' });
+    assert.equal((await scratchNames(directory)).length, 1);
+    return 'accepted';
+  });
+  assert.equal(result, 'accepted');
+  assert.deepEqual(await readFile(archive), before);
+  assert.deepEqual(await scratchNames(directory), []);
+});
+
+test('predecessor scratch is removed when baseline observation or API admission fails', async t => {
+  const good = await predecessorArchiveFixture(t);
+  const interrupted = new Error('synthetic baseline interruption');
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(good.input, good.app, async () => { throw interrupted; }),
+    error => error === interrupted);
+  assert.deepEqual(await scratchNames(good.directory), []);
+  const missing = await predecessorArchiveFixture(t, { source: 'export const openLocalUnifiedIndex = () => {};' });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(missing.input, missing.app, () => assert.fail('not admitted')),
+    error => error.updateStage === 'predecessor_fixture_api');
+  assert.deepEqual(await scratchNames(missing.directory), []);
+  const dependency = await predecessorArchiveFixture(t, { source: "import './absent.js';\n" + fixtureIndexSource });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(dependency.input, dependency.app, () => assert.fail('not admitted')),
+    { code: 'ERR_MODULE_NOT_FOUND' });
+  assert.deepEqual(await scratchNames(dependency.directory), []);
+});
+
+test('predecessor extraction refuses digest drift, linked paths, archive links and writable scratch parents', async t => {
+  const fixture = await predecessorArchiveFixture(t);
+  const callback = () => assert.fail('unsafe predecessor must never be imported');
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...fixture.input, predecessorAsarSha256: '0'.repeat(64) }, fixture.app, callback),
+    error => error.updateStage === 'predecessor_asar');
+  assert.deepEqual(await scratchNames(fixture.directory), []);
+  const linked = join(fixture.directory, 'linked'); await symlink(fixture.directory, linked);
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...fixture.input, directory: linked }, fixture.app, callback),
+    error => error.updateStage === 'unsafe_path');
+  await chmod(fixture.directory, 0o777);
+  try {
+    await assert.rejects(runner.withProductionUpdatePredecessorIndex(fixture.input, fixture.app, callback),
+      error => error.updateStage === 'predecessor_fixture_location');
+  } finally { await chmod(fixture.directory, 0o700); }
+  const archiveLink = await predecessorArchiveFixture(t, { link: true });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(archiveLink.input, archiveLink.app, callback),
+    error => error.updateStage === 'predecessor_fixture_archive');
+  assert.deepEqual(await scratchNames(archiveLink.directory), []);
 });
