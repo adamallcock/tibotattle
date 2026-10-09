@@ -8,6 +8,14 @@ import { join } from "node:path";
 import { createAccountlessContributionScheduler } from "../src/application/index.js";
 import { attachAccountlessParentChannel, createAccountlessChildChannel } from "../src/platform/index.js";
 import { ensureContributionDeviceCapability } from "../src/contribution-device-capability.js";
+import { runAccountlessContributionSyncOnce } from "../src/contribution-accountless-client.js";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "../src/contribution/index.js";
 import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
 import { createDesktopMacOSAccountlessCredentialBackend } from "../apps/electron/desktop-macos-keychain.js";
 import { createCompanionSupervisor } from "../apps/electron/companion-supervisor.js";
@@ -416,6 +424,173 @@ test("a status update is accepted while a credential read is pending", async () 
   } finally {
     client.dispose();
     host.dispose();
+  }
+});
+
+test("busy private-channel refusals are retryable known non-mutations", async () => {
+  const { parent, child } = channels();
+  let beginRead;
+  let finishRead;
+  const started = new Promise((resolve) => { beginRead = resolve; });
+  const finish = new Promise((resolve) => { finishRead = resolve; });
+  let mutations = 0;
+  const host = attachAccountlessParentChannel({ channel: parent,
+    readPreference: async () => ready,
+    backend: {
+      async read() { beginRead(); await finish; return null; },
+      async createIfMissing() { mutations++; return "created"; },
+      async deleteExact() { mutations++; return "deleted"; },
+    } });
+  const client = createAccountlessChildChannel({ channel: child });
+  const secret = Buffer.alloc(32, 7);
+  const read = client.backend.read({});
+  try {
+    await started;
+    for (const operation of [
+      () => client.readPreference(),
+      () => client.backend.read({}),
+      () => client.backend.createIfMissing({}, secret),
+      () => client.backend.deleteExact({}, secret),
+    ]) {
+      await assert.rejects(operation(), (error) => error.code === "contribution_device_credential_unavailable"
+        && error.retryable === true);
+    }
+    assert.equal(mutations, 0);
+    for (const [operation, value] of [["preference", true], ["read", "invalid"], ["create", null], ["delete", "invalid"]]) {
+      const response = new Promise((resolve) => child.once("message", resolve));
+      parent.emit("message", { schemaVersion: "accountless-process-v1", kind: "request", id: 100,
+        operation, value });
+      assert.deepEqual(await response, { schemaVersion: "accountless-process-v1", kind: "response",
+        id: 100, ok: false, value: null });
+    }
+    assert.equal(mutations, 0);
+    finishRead();
+    assert.equal(await read, null);
+    assert.deepEqual(await client.readPreference(), ready);
+  } finally {
+    finishRead();
+    await read.catch(() => {});
+    secret.fill(0);
+    client.dispose();
+    host.dispose();
+  }
+});
+
+test("channel contention before enrollment schedules a bounded retry that completes after release", { timeout: 5_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-accountless-contention-"));
+  const { parent, child } = channels();
+  const clock = timers();
+  const initialNow = Date.parse("2026-09-04T00:00:00.000Z");
+  let now = initialNow;
+  let holdPreference = false;
+  let beginHold;
+  let finishHold;
+  const holding = new Promise((resolve) => { beginHold = resolve; });
+  const finish = new Promise((resolve) => { finishHold = resolve; });
+  const storage = vault();
+  const backendCalls = { read: 0, create: 0, delete: 0 };
+  const host = attachAccountlessParentChannel({ channel: parent,
+    readPreference: async () => {
+      if (holdPreference) { beginHold(); await finish; }
+      return ready;
+    },
+    backend: {
+      async read() { backendCalls.read++; return storage.read(); },
+      async createIfMissing(value) { backendCalls.create++; return storage.createIfMissing(value); },
+      async deleteExact(value) { backendCalls.delete++; return storage.deleteExact(value); },
+    } });
+  const bridge = createAccountlessChildChannel({ channel: child });
+  let overlapOnce = true;
+  let competingPreference;
+  let passes = 0;
+  let capabilityCalls = 0;
+  let syncCalls = 0;
+  let lastResult;
+  const requests = [];
+  const deviceId = "11111111-1111-4111-8111-111111111111";
+  const response = (path) => new Response(JSON.stringify({
+    schemaVersion: path.endsWith("/enrollment") ? "accountless-enrollment-v0.1" : ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    state: "existing", deviceId, expiresAt: "2026-09-28T00:00:00.000Z",
+    policyVersion: path.endsWith("/enrollment") ? "accountless-opt-out-v1" : ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: path.endsWith("/enrollment") ? "accountless-policy-v1" : ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    scope: path.endsWith("/enrollment") ? "enrollment_only" : ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+    ...(path.endsWith("/enrollment") ? {} : { telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION }),
+  }), { headers: { "Cache-Control": "no-store", "Content-Type": "application/json" } });
+  const scheduler = createAccountlessContributionScheduler({ origin, ...clock, now: () => now,
+    readPreference: async () => {
+      const preference = await bridge.readPreference();
+      if (overlapOnce) {
+        overlapOnce = false;
+        holdPreference = true;
+        competingPreference = bridge.readPreference();
+        await holding;
+      }
+      return preference;
+    },
+    runner: async ({ signal }) => {
+      passes++;
+      lastResult = await runAccountlessContributionSyncOnce({ laboratory: true, origin,
+        stateFile: join(root, "binding.json"), indexFile: join(root, "unused-index.sqlite"),
+        backend: bridge.backend, readPreference: bridge.readPreference, signal, now: () => now,
+        ensureCapability: async (options) => {
+          capabilityCalls++;
+          return ensureContributionDeviceCapability({ ...options,
+            generateDeviceId: () => deviceId, generateSecret: () => Buffer.alloc(32, 7), clock: () => now });
+        },
+        fetchImpl: async (url) => {
+          const path = new URL(url).pathname;
+          assert.ok(["/api/v1/accountless/enrollment", "/api/v1/accountless/ownership"].includes(path));
+          requests.push(path);
+          return response(path);
+        },
+        runIncrementalSync: async () => { syncCalls++; return { status: "complete", chunksUploaded: 1 }; },
+      });
+      return lastResult;
+    } });
+  try {
+    scheduler.start();
+    await scheduler.runNow();
+    assert.deepEqual(lastResult.failure, { code: "preference_unavailable", retryable: true,
+      deviceUnavailable: false, retryAfterMilliseconds: null });
+    assert.equal(lastResult.networkActivity, false);
+    assert.deepEqual(scheduler.inspectDiagnostics(), { state: "retry_wait",
+      lastAttemptAt: new Date(initialNow).toISOString(), lastSuccessfulSyncAt: null,
+      lastAcceptedAt: null, nextAttemptAt: new Date(initialNow + 60_000).toISOString(),
+      lastFailureCode: "transient_failure" });
+    assert.equal(passes, 1);
+    assert.equal(capabilityCalls, 0);
+    assert.equal(syncCalls, 0);
+    assert.deepEqual(requests, []);
+    assert.deepEqual(backendCalls, { read: 0, create: 0, delete: 0 });
+    const [scheduled] = [...clock.pending.values()];
+    assert.equal(clock.pending.size, 1);
+    assert.equal(scheduled.delay, 60_000);
+    holdPreference = false;
+    finishHold();
+    assert.deepEqual(await competingPreference, ready);
+    now += scheduled.delay;
+    scheduled.fn();
+    // Observe the pass already started by its timer; runNow remains single-flight.
+    await scheduler.runNow();
+    assert.equal(passes, 2);
+    assert.equal(capabilityCalls, 1);
+    assert.equal(syncCalls, 1);
+    assert.deepEqual(requests, ["/api/v1/accountless/enrollment", "/api/v1/accountless/ownership"]);
+    assert.equal(backendCalls.create, 1);
+    assert.equal(backendCalls.delete, 0);
+    assert.equal(lastResult.status, "complete");
+    assert.equal(scheduler.inspect().state, "up_to_date");
+    assert.equal(scheduler.inspectDiagnostics().lastFailureCode, null);
+    assert.equal(scheduler.inspectDiagnostics().lastSuccessfulSyncAt, new Date(now).toISOString());
+    assert.equal(scheduler.inspect().lastAcceptedAt, new Date(now).toISOString());
+  } finally {
+    holdPreference = false;
+    finishHold();
+    await scheduler.stop();
+    await competingPreference?.catch(() => {});
+    bridge.dispose();
+    host.dispose();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
