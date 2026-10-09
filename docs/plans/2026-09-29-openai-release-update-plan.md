@@ -29,6 +29,17 @@ remain separate outcomes.
 - Repository paths and line references below describe the audit baseline,
   unless explicitly marked as this worktree or the draft PR.
 
+## Client release closeout — October 9, 2026
+
+The shared four-platform client changes are included in the published
+[0.1.28 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28),
+alongside the explicitly approved auto-review changes. Version 0.1.27 was never
+published, and the optional dashboard reader remains deferred. See
+[current status](../current-status.md) for installed, updater and publication
+evidence. This closes the client-publication portion only; historical hosted
+corrections, full activation and public recalculation retain their separate
+evidence boundaries. Earlier sections and receipts below remain dated records.
+
 ## Client PR boundary
 
 The client PR contains local ingestion, valuation, plan labels/ratios, timing,

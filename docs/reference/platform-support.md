@@ -1,29 +1,28 @@
 ---
 title: Platform support and qualification
-date: 2026-09-27
+date: 2026-10-09
 type: reference
 status: maintained
 ---
 
 # Platform support and qualification
 
-The released Electron application is **0.1.26** across macOS Apple silicon,
+The released Electron application is **0.1.28** across macOS Apple silicon,
 macOS Intel, Windows x64 and Linux x64. See [current status](../current-status.md)
 for the source, updater, Homebrew and hosted boundaries, and the
-[public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json)
+[public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
 for exact artifact hashes and recorded assurances.
 
 ## Status matrix
 
 | Platform | Current distribution | Proven final-artifact boundary | Acceptance limits |
 |---|---|---|---|
-| macOS 14+ arm64 | Supported; 0.1.26 DMG | Developer ID signing, notarization, stapling, Gatekeeper, clean-install smoke, production Sparkle transition and installed Electron updater on the exact signed candidate | Existing-credential continuity passed its named older-app scenarios; full failure matrix remains unqualified |
-| macOS 14+ x86_64 | Supported; separate 0.1.26 Intel DMG | Separate native trust, clean-install, production Sparkle transition and installed Electron updater | Existing-credential upgrade was not exercised on Intel; full failure matrix remains unqualified |
-| Windows x64 | Released; 0.1.26 signed installer | Authenticode signature, timestamp and hosted installed journey on the exact candidate | Existing-install updater replacement and every physical desktop integration are not qualified |
-| Linux x86_64 | Released; 0.1.26 AppImage | Exact artifact integrity and hosted extracted-app startup, refresh, credential-service, settings, opt-out and cold restart | Physical desktop launch, AppImage/FUSE mounting and replacement were not tested; the owner accepted publication with `cleanInstallSmokePassed: false` |
+| macOS 14+ arm64 | Supported; 0.1.28 DMG | Developer ID signing, notarization, stapling, Gatekeeper, clean install, named existing-credential fixtures and production native Sparkle upgrade on the exact signed candidate | Electron 0.1.26 installed updater check is pending; complete credential failure matrix remains unqualified |
+| macOS 14+ x86_64 | Supported; separate 0.1.28 Intel DMG | Separate native trust, clean install and production native Sparkle upgrade | Electron 0.1.26 installed updater check is pending; existing-credential upgrade was not exercised on Intel; full failure matrix remains unqualified |
+| Windows x64 | Released; 0.1.28 signed installer | Authenticode signature, timestamp and fresh-VM installer replacement of 0.1.26, retaining synthetic history, settings and opt-out through cold restart | Automatic updater was not exercised; credential persistence, hosted enrollment and notification delivery are not qualified by this journey |
+| Linux x86_64 | Released; 0.1.28 AppImage | Exact artifact integrity and native x64 Xvfb/FUSE clean install, isolated 0.1.26 update, sandbox, refresh, credentials, settings, opt-out, restart and cleanup | Physical desktop behavior and production-feed installed updating remain unqualified; no native-signing claim |
 
-The 2026-09-27 Linux owner acceptance applies to the exact published AppImage
-and its listed missing observations. It is not a passing physical install test.
+These receipts qualify the named final artifacts and bounded environments.
 Windows ARM, Linux ARM64 and unlisted operating-system or package variants are
 not covered. Shared application source does not make platform-specific trust,
 credential or installed-lifecycle evidence interchangeable.
@@ -50,50 +49,66 @@ or updater integrity.
 
 ## macOS
 
-Both Mac installers use bundle version `1034` and build number
-`2026092701`. The signed [Apple silicon clean-install](https://github.com/adamallcock/tibotattle/actions/runs/36349376027)
-and [Intel clean-install](https://github.com/adamallcock/tibotattle/actions/runs/36349377398)
-runs passed. The native Sparkle-to-Electron upgrade passed against the
-production feeds on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/36350924405)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/36350929763).
-The separate Electron 0.1.20-to-0.1.26 updater passed on
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/36351718654)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/36351723582);
-those receipts verified retained rows, settings, salt, opt-out and restart.
+Both Mac installers use bundle version `1036` and build number
+`2026100901`. The signed [Apple silicon clean-install](https://github.com/adamallcock/tibotattle/actions/runs/37881967388)
+and [Intel clean-install](https://github.com/adamallcock/tibotattle/actions/runs/37882729563)
+runs passed. The native Sparkle 0.1.18-to-0.1.28 upgrade passed through the
+production feeds on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37931481287)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37932090365).
+These journeys exercised the updater, relaunch and migration; preserved rows,
+preferences, salt and opt-out; and passed restart without duplicates while
+leaving the native source untouched and stopping owned processes. Neither used
+a feed override, a runner-copied candidate or an existing-credential fixture.
 
-The signed Apple silicon existing-Keychain-credential upgrade cases passed from
-[0.1.24](https://github.com/adamallcock/tibotattle/actions/runs/36349405714)
-and [0.1.20](https://github.com/adamallcock/tibotattle/actions/runs/36349407322)
-with modern, invalid and locked fixtures. The complete credential failure
-matrix is still unqualified. Unexpected automatic Keychain prompts remain a
-release blocker; do not weaken credential protection to avoid them. Use the
+All four Electron stable feeds and both native Sparkle feeds advertise 0.1.28
+with exact public readback. The separate Electron 0.1.26-to-0.1.28 installed
+updater qualification remains pending on both architectures. Its first
+[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37931476122)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37931485225)
+attempts stopped at the predecessor baseline before invoking any updater action.
+The runner fixture mismatch is being repaired; these results do not establish
+a released-app defect or an installed Electron updater success.
+
+The signed [Apple silicon existing-Keychain-credential run](https://github.com/adamallcock/tibotattle/actions/runs/37882400348)
+passed 0.1.20-to-0.1.28 modern, invalid and locked fixtures, preserving items,
+values and access controls. It also verified local synthetic historical Sol
+repair through parser 20 with token and replay conservation. Intel existing
+credentials and the complete credential failure matrix remain unqualified.
+Unexpected automatic Keychain prompts remain a release blocker; do not weaken
+credential protection to avoid them. Use the
 [Mac release runbook](../runbooks/macos-stable-release-runbook.md) for the exact
 migration and updater contracts.
 
-The [Homebrew cask workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/36351745490)
-passed and the first-party cask resolves 0.1.26 with the exact published arm64
-and x64 DMG hashes. Cask resolution is separate from an installed upgrade.
+The [Homebrew cask workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
+passed all four jobs. The exact cask readback resolves 0.1.28 with the published
+arm64 and x64 DMG hashes. Cask resolution is separate from an installed upgrade.
 
 ## Windows
 
-The 0.1.26 installer is signed and timestamped. Its
-[hosted installed journey](https://github.com/adamallcock/tibotattle/actions/runs/36347063769)
-qualifies the exact signed candidate. It does not establish every existing
-installation's updater replacement, retained credentials or physical desktop
-notification behavior. Do not promote earlier unsigned or source-only Windows
-tests into final-artifact evidence.
+The 0.1.28 installer is signed and timestamped. Its
+[fresh-VM installer-upgrade journey](https://github.com/adamallcock/tibotattle/actions/runs/37880387839)
+installed the exact signed 0.1.26 predecessor, ran the exact 0.1.28 installer,
+and preserved synthetic history, projects, threads, settings and durable opt-out
+through the successor journey and cold restart. Uninstall and owned cleanup
+passed. Automatic updater replacement was not exercised; this normal journey
+does not requalify credential persistence, hosted enrollment or notification
+delivery. Earlier unsigned or source-only Windows tests are not final-artifact
+evidence.
 
 ## Linux
 
 The released x86_64 AppImage has no native signing claim. The
-[hosted extracted-app run](https://github.com/adamallcock/tibotattle/actions/runs/36347037857)
-passed startup, refresh, credential-service, settings, opt-out and cold restart
-against the final artifact. It did not mount the AppImage through FUSE, launch
-it on a physical desktop or replace 0.1.24. The
-[manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json)
-keeps `cleanInstallSmokePassed: false` and records the owner's explicit
-acceptance of those limits. No update or desktop-integration claim follows from
-the extracted runtime result.
+[native x64 Xvfb/FUSE run](https://github.com/adamallcock/tibotattle/actions/runs/37879713389)
+used the ordinary AppImage launcher and disposable Secret Service. It passed
+clean install, local refresh, credential access, Chromium sandbox checks,
+checksum-mismatch refusal, replacement of the exact public 0.1.26 predecessor,
+automatic restart, settings and opt-out continuity, cold restart and owned cleanup.
+The production feed URL was simulated locally with external networking disabled.
+The [manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
+records `cleanInstallSmokePassed: true`; the original receipt retains
+`physicalDesktop: not_qualified`. Neither this bounded result nor public feed
+readback establishes production-feed installed updating or physical desktop
+integration.
 
 ## Maintenance rule
 
