@@ -86,19 +86,26 @@ tooltips and the scrollable narrow table. The primary fixture remains $12.89
 and 2,600,000 tokens; three auto-review rows display $0.00* and Spark withholds
 the comparison. This is source/browser evidence, not installed qualification.
 
-Documentation, preflight and architecture checks pass. The R7 freshness gate
-correctly reports stale workload-source digests. Regenerate all ten receipts
-once on the final integrated source and dependency closure, then run the broad
-root gate. The first broad run completed 6,057 tests: 5,999 passed, 47 existing
-platform/environment checks skipped, nine stale current-version/API assertions
-failed, and the two expected R7 freshness tests failed. The nine assertions now
-pass in their complete owning suites without production-reader changes. CI also
-identified the historical Sol qualifier still requiring parser19; its explicit
-parser20 successor and distinct v2 repair receipt pass all 38 owning tests.
-The integrated 0.1.28 runtime manifests and generated export compatibility are
-aligned, and all 148 staging/admission checks pass with owned dependencies.
-Fresh four-platform artifacts, signatures, native upgrade checks, installed
-behavior and publication remain required.
+Documentation, preflight and architecture checks pass. The protected R7
+regeneration completed on October 9 with exact Node 24.14.0 and 26.2.0. All ten
+receipts validate against the integrated workload, their two-pass comparisons
+match, and independent review found no receipt-integrity or privacy issue.
+Materialized coverage remains partial; the `release_open` result and unresolved
+resource ceilings are unchanged. This does not establish new resource limits.
+
+The complete root suite now passes: 6,058 tests, 6,014 passed, no failures and
+44 existing platform/environment skips. The earlier stale version/API assertions
+were corrected without changing production readers. The historical Sol
+qualifier now requires parser20 and its distinct v2 repair receipt; all 38
+owning tests pass. Integrated runtime manifests and generated export
+compatibility are aligned, all 148 staging/admission checks pass with owned
+dependencies, and the full Worker gate passes 2,019 tests plus both deployment
+dry checks. No server deployment is part of this release-source validation.
+
+The 0.1.28 source freeze includes the reviewed auto-review, sharing-startup,
+build-dependency and qualification-route changes. Fresh four-platform artifacts,
+signatures, native upgrade checks, installed behavior and publication remain
+required. The source tag records this candidate boundary, not publication.
 
 ## Historical paused checkpoint — October 7, 2026
 

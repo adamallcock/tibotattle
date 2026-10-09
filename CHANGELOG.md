@@ -8,8 +8,8 @@ version labels; it does not imply API stability before 1.0.
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
   date on which the public GitHub Release was published, except the explicitly
-  marked, unpublished 0.1.25 and 0.1.27 tagged candidates, whose dates are their
-  source freezes.
+  marked, unpublished 0.1.25, 0.1.27 and 0.1.28 tagged candidates, whose dates
+  are their source freezes.
 - Every released entry links to the public GitHub Release, its exact source
   revision, and the comparison with the preceding release source. Stable tags
   are annotated except for the protected historical v0.1.10 anomaly recorded
@@ -37,9 +37,18 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-[0.1.28 candidate notes](./release-notes/0.1.28.md) cover the complete change
-from the published 0.1.26 release. Publication is pending all four platform
-artifacts and their qualification.
+## [0.1.28](./release-notes/0.1.28.md) - 2026-10-09
+
+**Status:** Tagged candidate; publication pending. Fresh macOS ARM, macOS Intel,
+Windows and Linux artifacts and their qualification are required together.
+
+**Provenance:** [GitHub release location (unpublished)](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.28) ·
+[changes since the v0.1.27 tagged candidate](https://github.com/adamallcock/tibotattle/compare/v0.1.27...v0.1.28) ·
+[changes since the last public v0.1.26 release](https://github.com/adamallcock/tibotattle/compare/v0.1.26...v0.1.28)
+
+Version 0.1.27 was tagged and signed but never published. Version 0.1.28
+carries those changes forward from the last public 0.1.26 release.
 
 - Carry forward GPT-6.1 Sol, Ultrafast, Pro 10× and Pro Max 25× support from
   the unpublished 0.1.27 candidate.
