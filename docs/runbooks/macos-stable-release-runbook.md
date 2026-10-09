@@ -135,7 +135,11 @@ The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and
 recorded opt-out. V2 and V3 require every captured predecessor process identity,
 including an orphaned companion, to exit before accepting the updater-created
-successor; later cleanup cannot satisfy that observation. Retain the separate
+successor; later cleanup cannot satisfy that observation. Capture binds each
+process command and start time from one bounded inventory sample. The complete
+predecessor snapshot must validate before Install is invoked; an unresolved
+live identity fails closed and cannot overwrite a previously verified identity.
+Retain the separate
 `tibotattle-signed-macos-production-update-v3` receipt for each architecture.
 It keeps `existingCredentialFixture: false`: the signed credential fixture is
 still a distinct gate. The historical intake/receipt v1 (0.1.20 predecessor)

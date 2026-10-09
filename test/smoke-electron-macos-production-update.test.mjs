@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
+import { captureMacTransitionProcesses, readMacTransitionProcesses } from '../scripts/smoke-electron-macos-sparkle-transition.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from '../scripts/smoke-electron-macos-replacement.mjs';
@@ -259,6 +260,67 @@ test('v2 requires every old process identity to exit before successor acceptance
   assert.throws(() => select([row(200, 1), row(300, 1)]), 'independent new roots remain ambiguous');
   for (const processes of [new Set([100]), new Map(), new Map([[100, null]]), new Map([[100, executable + '\n']])]) {
     assert.throws(() => runner.selectCurrentProductionUpdateSuccessor([row(200, 1)], executable, 100, processes));
+  }
+});
+
+test('actual capture produces a detached valid snapshot before Install even when a descendant disappears', () => {
+  const appPath = '/synthetic/TiboTattle.app', executable = appPath + '/Contents/MacOS/TiboTattle';
+  const start = 'Sun Oct 4 02:00:00 2026', helper = '/synthetic/helper';
+  const row = (pid, parent, command = executable, startedAt = start) => ({ pid, parent, group: pid, command, startedAt });
+  for (const currentRoute of [false, true]) {
+    const knownProcesses = new Map();
+    captureMacTransitionProcesses(appPath, 100, knownProcesses, { readProcesses: () => [row(100, 1), row(101, 100, helper)] });
+    let calls = 0;
+    const snapshot = runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100, knownProcesses, currentRoute,
+      install: () => { calls += 1; return Promise.resolve(); } }, {
+      readProcesses: () => readMacTransitionProcesses({ run: () => ` 100 1 100 Sun Oct  4 02:00:00 2026     ${executable}\n` }),
+    });
+    assert.equal(calls, 1);
+    assert.notEqual(snapshot, knownProcesses);
+    assert.deepEqual([...snapshot.keys()], [100, 101]);
+    knownProcesses.set(300, executable + '\n' + start);
+    assert.equal(snapshot.has(300), false, 'later cleanup capture cannot change predecessor evidence');
+    if (!currentRoute) { assert.ok(snapshot instanceof Set); continue; }
+    assert.equal(snapshot.get(101), helper + '\n' + start);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper), row(200, 1)], executable, 100, snapshot), null);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper, '  Sun Oct  4 02:00:00 2026  '), row(200, 1)], executable, 100, snapshot), null,
+      'timestamp padding cannot create false natural-exit evidence');
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper, null), row(200, 1)], executable, 100, snapshot), null);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, '/synthetic/unrelated', 'Sun Oct 4 03:00:00 2026'), row(200, 1)], executable, 100, snapshot).pid, 200);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(100, 1, executable, 'Sun Oct 4 03:00:00 2026')], executable, 100, snapshot), null);
+  }
+});
+
+test('unresolved live captures and failed resamples prevent Install without poisoning valid history', () => {
+  const appPath = '/synthetic/TiboTattle.app', executable = appPath + '/Contents/MacOS/TiboTattle';
+  const start = 'Sun Oct 4 02:00:00 2026';
+  const row = (pid, parent, startedAt = start) => ({ pid, parent, group: pid, command: executable, startedAt });
+  const samples = [
+    () => [row(100, 1), row(101, 100, null), row(102, 101)],
+    () => [row(100, 1), row(101, 100, ''), row(102, 101)],
+    () => [row(100, 1, '')],
+    () => [row(100, 1, 'Sun Oct 4 03:00:00 2026')],
+    () => [],
+    () => { throw new Error('private inventory failure'); },
+  ];
+  for (const readProcesses of samples) {
+    const knownProcesses = new Map();
+    captureMacTransitionProcesses(appPath, 100, knownProcesses, { readProcesses: () => [row(100, 1), row(101, 100)] });
+    const before = new Map(knownProcesses);
+    let installed = false;
+    assert.throws(() => runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100, knownProcesses, currentRoute: true,
+      install: () => { installed = true; return Promise.resolve(); } }, { readProcesses }),
+    error => error.updateStage === 'predecessor_process_identity' && error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED');
+    assert.equal(installed, false);
+    assert.deepEqual(knownProcesses, before);
+  }
+  for (const fingerprint of [null, executable + '\n', executable + '\nprivate invalid time']) {
+    let installed = false;
+    assert.throws(() => runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100,
+      knownProcesses: new Map([[100, fingerprint]]), currentRoute: true,
+      install: () => { installed = true; return Promise.resolve(); } }, { readProcesses: () => [row(100, 1)] }),
+    error => error.updateStage === 'predecessor_process_identity');
+    assert.equal(installed, false, 'unsafe historical entries are refused, never filtered');
   }
 });
 test('replacement verification refreshes the real ASAR path cache after an updater swaps bytes', async () => {
