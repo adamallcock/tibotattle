@@ -9,7 +9,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateSparkleTransitionHost, captureMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment,
-  selectMacTransitionApplicationProcess } from './smoke-electron-macos-sparkle-transition.mjs';
+  selectMacTransitionApplicationProcess, readMacTransitionProcesses, macTransitionProcessFingerprint,
+  normalizeMacTransitionProcessStart } from './smoke-electron-macos-sparkle-transition.mjs';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp } from './run-signed-electron-staging.mjs';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from './smoke-electron-macos-replacement.mjs';
@@ -198,27 +199,35 @@ export function selectProductionUpdateSuccessor(rows, executable, predecessorPid
 export function selectCurrentProductionUpdateSuccessor(rows, executable, predecessorPid, predecessorProcesses) {
   if (!(predecessorProcesses instanceof Map) || !predecessorProcesses.has(predecessorPid)
     || [...predecessorProcesses].some(([pid, fingerprint]) => !Number.isSafeInteger(pid) || pid < 2
-      || typeof fingerprint !== 'string' || !fingerprint.includes('\n') || fingerprint.endsWith('\n'))) fail('predecessor_process_identity');
+      || typeof fingerprint !== 'string' || fingerprint.split('\n').length !== 2
+      || macTransitionProcessFingerprint({ command: fingerprint.split('\n')[0], startedAt: fingerprint.split('\n')[1] }) !== fingerprint)) fail('predecessor_process_identity');
   // Wait for every captured predecessor identity, including an orphaned old
   // companion, to exit naturally. Cleanup is not an updater success observation.
   for (const row of rows) if (predecessorProcesses.has(row.pid)) {
-    if (typeof row.startedAt !== 'string' || !row.startedAt
-      || predecessorProcesses.get(row.pid).split('\n').at(-1) === row.startedAt) return null;
+    const startedAt = normalizeMacTransitionProcessStart(row.startedAt);
+    if (startedAt === null || predecessorProcesses.get(row.pid).split('\n')[1] === startedAt) return null;
   }
   return selectProductionUpdateSuccessor(rows.filter(row => !predecessorProcesses.has(row.pid)), executable,
     predecessorPid, new Set(predecessorProcesses.keys()));
 }
-function productionUpdateProcesses(predecessorProcesses = null) {
-  return command('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,comm=']).split('\n').map(line => {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
-    if (!match) fail('process_inventory');
-    const row = { pid: +match[1], parent: +match[2], group: +match[3], command: match[4] };
-    if (predecessorProcesses?.has(row.pid)) {
-      try { row.startedAt = command('/bin/ps', ['-p', String(row.pid), '-o', 'lstart=']); }
-      catch { row.startedAt = null; } // An indeterminate identity must be observed again.
-    }
-    return row;
-  });
+const productionUpdateProcesses = () => readMacTransitionProcesses();
+export function requestProductionUpdateInstall({ appPath, predecessorPid, knownProcesses, currentRoute, install }, {
+  readProcesses = productionUpdateProcesses,
+} = {}) {
+  let captured;
+  try { captured = captureMacTransitionProcesses(appPath, predecessorPid, knownProcesses, { readProcesses }); }
+  catch { fail('predecessor_process_identity'); }
+  const main = captured.find(row => row.pid === predecessorPid);
+  if (!main || main.command !== join(appPath, 'Contents', 'MacOS', 'TiboTattle')
+    || macTransitionProcessFingerprint(main) !== knownProcesses.get(predecessorPid)) fail('predecessor_process_identity');
+  // Detached from subsequent cleanup captures. Validate the entire snapshot
+  // before Install, so an unresolved identity cannot initiate an update.
+  const predecessorProcesses = currentRoute ? new Map(knownProcesses) : new Set(knownProcesses.keys());
+  if (currentRoute) selectCurrentProductionUpdateSuccessor(captured, main.command, predecessorPid, predecessorProcesses);
+  else selectProductionUpdateSuccessor(captured, main.command, predecessorPid, predecessorProcesses);
+  const request = install();
+  request.catch(() => {}); // The predecessor can exit before its CDP response.
+  return predecessorProcesses;
 }
 // v3 only: the verified 026 reader can admit its exact live v11 while the
 // successor migrates a staging clone. The runner never opens a writable handle.
@@ -261,7 +270,7 @@ export async function waitForProductionUpdateSuccessorState({ stateRoot, predece
   const assertIdentity = async () => {
     onStage('successor_state_process_identity');
     const rows = (await readProcesses(identity)).filter(row => row.pid === successorPid);
-    if (rows.length !== 1 || rows[0].command + '\n' + rows[0].startedAt !== successorFingerprint) {
+    if (rows.length !== 1 || macTransitionProcessFingerprint(rows[0]) !== successorFingerprint) {
       fail('successor_state_process_identity');
     }
   };
@@ -480,12 +489,10 @@ export async function runProductionUpdate(options) {
     // A changed production feed invalidates this exact-candidate acceptance before installation.
     if (hash(await fetchBytes(input.feedUrl, 65536)) !== input.feedSha256) fail('production_feed_changed');
     stage = 'install_update'; const oldPid = active.pid;
-    captureMacTransitionProcesses(app, oldPid, knownProcesses);
     const currentRoute = currentProductionUpdateRoute(input);
-    const predecessorProcesses = currentRoute ? new Map(knownProcesses) : new Set(knownProcesses.keys());
-    // The call can lose its CDP response when the updater exits the predecessor.
-    const request = active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()');
-    proof.installUpdateInvoked = true; request.catch(() => {});
+    const predecessorProcesses = requestProductionUpdateInstall({ appPath: app, predecessorPid: oldPid, knownProcesses, currentRoute,
+      install: () => active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()') });
+    proof.installUpdateInvoked = true;
     stage = 'successor_process_poll';
     const successor = await until(() => {
       captureMacTransitionProcesses(app, oldPid, knownProcesses);
