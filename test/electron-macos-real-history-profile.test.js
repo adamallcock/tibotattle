@@ -8,7 +8,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { openLocalCollectorStateSession } from "../src/local-collector-state.js";
-import { openLocalUnifiedIndex } from "../src/local-unified-index.js";
+import {
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+  openLocalUnifiedIndex,
+} from "../src/local-unified-index.js";
 import {
   REAL_HISTORY_PROFILE_SCHEMA_VERSION,
   parseRealHistoryProfileArguments,
@@ -303,7 +306,10 @@ test("a recognized pre-current index migrates only inside the private profile", 
   source.close();
   await prepareRealHistoryProfile(fixture);
   const profile = await validateRealHistoryProfile(fixture.profilePath);
-  assert.equal(profile.receipt.nativeState.unifiedIndex.userVersion, 11);
+  assert.equal(
+    profile.receipt.nativeState.unifiedIndex.userVersion,
+    LOCAL_UNIFIED_INDEX_USER_VERSION,
+  );
   const sourceAfter = new DatabaseSync(fixture.indexFile, { readOnly: true });
   assert.equal(sourceAfter.prepare("PRAGMA user_version").get()?.user_version, 8);
   sourceAfter.close();

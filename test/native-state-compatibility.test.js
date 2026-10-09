@@ -4,7 +4,11 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { openLocalUnifiedIndex, validateRetainedNativeState } from '../src/local-unified-index.js';
+import {
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+  openLocalUnifiedIndex,
+  validateRetainedNativeState,
+} from '../src/local-unified-index.js';
 
 async function fixture(run) {
   const stateRoot = await mkdtemp(join(tmpdir(), 'native-compatibility-test-'));
@@ -86,7 +90,10 @@ test('actual native 0.1.16 physical schema migrates forward with retained record
     assert.deepEqual(await snapshot(stateRoot), before);
     const upgraded = openLocalUnifiedIndex(indexFile);
     try {
-      assert.equal(upgraded.prepare('PRAGMA user_version').get().user_version, 11);
+      assert.equal(
+        upgraded.prepare('PRAGMA user_version').get().user_version,
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
+      );
       assert.equal(upgraded.prepare("SELECT value FROM meta WHERE key='native_retained_marker'").get().value, 'preserved');
     } finally { upgraded.close(); }
   });

@@ -14,7 +14,9 @@ const SESSION = '71000000-0000-4000-8000-000000000061';
 const SOURCE = `rollout-2026-09-29T12-00-00-${SESSION}.jsonl`;
 const KNOWN_SOURCE = 'rollout-credential-synthetic.jsonl';
 const OLD_PARSER = 'unified-rollout-typed-v18';
-const CURRENT_PARSER = 'unified-rollout-typed-v19';
+// Qualification admits only the reviewed successor. A future parser needs a
+// separate review; importing its label alone must not silently advance proof.
+const CURRENT_PARSER = 'unified-rollout-typed-v20';
 const REFRESH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const contexts = new WeakMap();
 const fail = stage => { throw Object.assign(new Error('MAC_HISTORICAL_SOL_QUALIFICATION_REFUSED'),
@@ -24,7 +26,7 @@ const fail = stage => { throw Object.assign(new Error('MAC_HISTORICAL_SOL_QUALIF
 // Context 100,000 <= 272,000; 10,000*2 + 90,000*.1 + 10,000*10 per million
 // yields exactly .129 USD, which the ordinary table visibly rounds to .13 USD.
 export const HISTORICAL_SOL_FIXTURE = Object.freeze({
-  schemaVersion: 'tibotattle-historical-sol-installed-v1', model: 'gpt-6.1-sol',
+  schemaVersion: 'tibotattle-historical-sol-installed-v2', model: 'gpt-6.1-sol',
   label: 'GPT-6.1 Sol', observedAt: '2026-09-29T12:00:01.000Z',
   window: Object.freeze({ period: 'all', startAt: '2026-09-29T12:00:00.000Z', endAt: '2026-09-29T12:00:02.000Z' }),
   events: 1, totalTokens: 110_000, totalInputContext: 100_000,
@@ -342,7 +344,7 @@ export function historicalSolQualificationReceipt(context) {
   if (!retained?.repairObserved || !retained.repeatObserved || retained.restartsObserved !== 2) fail('proof_incomplete');
   return { schemaVersion: HISTORICAL_SOL_FIXTURE.schemaVersion,
     observedAt: HISTORICAL_SOL_FIXTURE.observedAt, reportingPeriod: 'all',
-    preUpgradeUnknownSeeded: true, parser18To19Repair: true,
+    preUpgradeUnknownSeeded: true, parser18To20Repair: true,
     sourceOccurrenceIdentityPreserved: true, tokenTotalsPreserved: true,
     existingKnownFixturePreserved: true, currentAccountingGenerationMatched: true,
     exactApiPriceEquivalentUsd: HISTORICAL_SOL_FIXTURE.apiPriceEquivalentUsdExact,

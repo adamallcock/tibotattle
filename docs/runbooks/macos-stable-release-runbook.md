@@ -135,6 +135,12 @@ journey retains the synthetic historical unknown → Sol 6.1 repair, repeat and
 restart checks introduced for 0.1.27. It uses the existing disposable credential
 predecessor and requires new receipts for the exact replacement bytes; the
 production-update predecessor above does not change that fixture contract.
+The nested historical repair receipt is `tibotattle-historical-sol-installed-v2`
+with `parser18To20Repair: true`: historical unknown/parser18 evidence must
+become exact current/parser20 evidence while preserving occurrence identity,
+tokens and the known fixture. Stale, future and partial parser stamps refuse
+qualification. Frozen v1/parser18-to-19 receipts retain their old meaning and
+cannot qualify the replacement.
 Signing-key access on the release machine is a separate owner provisioning
 step; it does not authorize routine app Keychain prompts.
 

@@ -89,8 +89,16 @@ the comparison. This is source/browser evidence, not installed qualification.
 Documentation, preflight and architecture checks pass. The R7 freshness gate
 correctly reports stale workload-source digests. Regenerate all ten receipts
 once on the final integrated source and dependency closure, then run the broad
-root gate. Fresh four-platform artifacts, signatures, native upgrade checks,
-installed behavior and publication remain required.
+root gate. The first broad run completed 6,057 tests: 5,999 passed, 47 existing
+platform/environment checks skipped, nine stale current-version/API assertions
+failed, and the two expected R7 freshness tests failed. The nine assertions now
+pass in their complete owning suites without production-reader changes. CI also
+identified the historical Sol qualifier still requiring parser19; its explicit
+parser20 successor and distinct v2 repair receipt pass all 38 owning tests.
+The integrated 0.1.28 runtime manifests and generated export compatibility are
+aligned, and all 148 staging/admission checks pass with owned dependencies.
+Fresh four-platform artifacts, signatures, native upgrade checks, installed
+behavior and publication remain required.
 
 ## Historical paused checkpoint — October 7, 2026
 

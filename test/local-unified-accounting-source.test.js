@@ -396,7 +396,7 @@ test("exact occurrence plans survive canonical collisions and dual quota windows
     assert.deepEqual(unchanged.prepare(
       "SELECT * FROM usage_event ORDER BY event_key",
     ).all(), before);
-    assert.equal(unchanged.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(unchanged.prepare("PRAGMA user_version").get().user_version, 12);
     unchanged.close();
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -661,7 +661,7 @@ test("attribution reads remain deterministic across interleaved long sources and
     assert.doesNotMatch(plans, /USE TEMP B-TREE/u,
       "ordered predecessor seeks must not sort an entire source/session per usage");
     assert.deepEqual(readUnifiedIndexGenerationDescriptor(database), before);
-    assert.equal(database.prepare("PRAGMA user_version").get().user_version, 11);
+    assert.equal(database.prepare("PRAGMA user_version").get().user_version, 12);
     database.exec("ROLLBACK");
   } finally {
     database.close();
@@ -1418,7 +1418,8 @@ test("unsupported mixed parser stamps stay blocked even alongside an attested so
         `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-partial-cache-write-zero`,
         `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION}-cache-write-zero`,
         "unified-rollout-typed-v15-cache-write-zero",
-        "unified-rollout-typed-v20-cache-write-zero",
+        "unified-rollout-typed-v19-cache-write-zero",
+        "unified-rollout-typed-v21-cache-write-zero",
         `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero-unknown`,
         "unknown-parser-cache-write-zero",
       ]) {
@@ -1485,7 +1486,7 @@ test("mixed parser rows are reported without pretending to have one parser", asy
     assert.deepEqual(result.compatibility.parserVersions, [
       LOCAL_UNIFIED_INDEX_PARSER_VERSION,
       "unified-rollout-typed-v2",
-    ]);
+    ].sort());
   } finally {
     await rm(root, { recursive: true, force: true });
   }
