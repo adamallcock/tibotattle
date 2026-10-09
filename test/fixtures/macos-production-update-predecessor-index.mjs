@@ -4,14 +4,18 @@
 // Verifies but never launches or installs the app; retains only synthetic state.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { validateProductionUpdateIntake, verifyProductionUpdatePredecessor,
-  withProductionUpdatePredecessorIndex, readProductionUpdateSuccessorState } from '../../scripts/smoke-electron-macos-production-update.mjs';
-import { seedSignedReplacementNativeState, readSignedReplacementState,
+  withProductionUpdatePredecessorIndex, readProductionUpdateSuccessorState,
+  seedProductionUpdateRetainedNativeState } from '../../scripts/smoke-electron-macos-production-update.mjs';
+import { readSignedReplacementState,
   assertSignedReplacementContinuity } from '../../scripts/smoke-electron-macos-replacement.mjs';
-import { openLocalUnifiedIndex, readLocalUnifiedIndexCompatibility } from '../../src/local-unified-index.js';
+import { openLocalUnifiedIndex, readLocalUnifiedIndexCompatibility, LOCAL_UNIFIED_INDEX_PARSER_VERSION } from '../../src/local-unified-index.js';
+import { inspectLocalOnboarding } from '../../src/local-installation-diagnostics.js';
+import { createLocalCollectorRefreshRunner } from '../../src/local-companion-refresh.js';
+import { ingestLocalUnifiedIndexOffMain } from '../../src/local-unified-index-off-main.js';
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 function inspectSchema(path) {
@@ -36,11 +40,30 @@ try {
   await mkdir(directory, { mode: 0o700 }); // Refuse an existing profile/output.
   const archive = join(app, 'Contents', 'Resources', 'app.asar');
   const archiveBefore = digest(await readFile(archive));
-  const predecessor = await withProductionUpdatePredecessorIndex({ ...input, directory }, app, async index => index);
+  const codexHome = join(directory, 'synthetic-codex'), native = join(directory, 'synthetic-native');
+  await mkdir(codexHome, { mode: 0o700 }); await mkdir(join(codexHome, 'sessions'), { mode: 0o700 });
+  const { predecessor, seeded } = await withProductionUpdatePredecessorIndex({ ...input, directory }, app, async (index, ingest) => {
+    const seeded = await seedProductionUpdateRetainedNativeState(native, codexHome, index, ingest);
+    // Model another ordinary predecessor refresh before the app baseline.
+    const repeated = await ingest({ codexHome, indexFile: join(native, 'local-unified-index-v1.sqlite'),
+      secretFile: join(native, 'local-unified-index-device-salt-v1'), contractVersion: 'telemetry-contribution-v0.1' });
+    assert.equal(repeated.status, 'ingested');
+    assert.equal(repeated.unchanged, true);
+    assert.equal(repeated.insertedUsageEvents, 0);
+    assert.equal(repeated.generation.status, 'complete');
+    assert.deepEqual(await readSignedReplacementState(native, index), seeded);
+    return { predecessor: index, seeded };
+  });
   assert.equal((await readdir(directory)).some(name => name.startsWith('predecessor-index-')), false);
   const result = await (async () => {
-    const native = join(directory, 'synthetic-native'), database = join(native, 'local-unified-index-v1.sqlite');
-    const seeded = await seedSignedReplacementNativeState(native, join(directory, 'synthetic-codex'), predecessor);
+    const database = join(native, 'local-unified-index-v1.sqlite');
+    const onboarding = await inspectLocalOnboarding({ codexHome, stateRoot: native });
+    assert.equal(onboarding.status, 'ready');
+    assert.equal(onboarding.source.rolloutFilesPresent, true);
+    assert.equal(onboarding.source.rolloutFilesObserved, 1);
+    const sourceNames = await readdir(join(codexHome, 'sessions'));
+    assert.deepEqual(sourceNames, ['rollout-2026-08-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl']);
+    const source = join(codexHome, 'sessions', sourceNames[0]), sourceBefore = digest(await readFile(source));
     const seededDigest = digest(await readFile(database)), beforeSchema = inspectSchema(database);
     assert.equal(beforeSchema.compatibility.userVersion, 11);
     assert.equal(beforeSchema.compatibility.formatUserVersion, 11);
@@ -61,24 +84,59 @@ try {
     assert.throws(() => openLocalUnifiedIndex(database, { readOnly: true }),
       error => error.code === 'local_unified_index_schema_invalid');
     assert.equal(digest(await readFile(database)), seededDigest);
-    const migrated = openLocalUnifiedIndex(database, { readOnly: false }); migrated.close();
-    const afterSchema = inspectSchema(database), after = await readSignedReplacementState(native);
-    assert.deepEqual(await readProductionUpdateSuccessorState(native, predecessor), after);
+    const successor = join(directory, 'synthetic-successor'), successorDatabase = join(successor, 'local-unified-index-v1.sqlite');
+    await cp(native, successor, { recursive: true, errorOnExist: true, force: false });
+    // The actual companion composition owns migration. The injected collector
+    // has no provider/credential effects; real detailed ingestion runs off-main.
+    const createRefresh = () => createLocalCollectorRefreshRunner({ codexHome, environment: {},
+      accountingSourceMode: 'unified', unifiedIndexFile: successorDatabase,
+      unifiedIndexSecretFile: join(successor, 'local-unified-index-device-salt-v1'),
+      selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+      runCollector: async () => ({ rolloutRecordsWritten: 0, filesDiscovered: 1 }),
+      refreshUnifiedIndex: options => ingestLocalUnifiedIndexOffMain({ ...options, contractVersion: 'telemetry-contribution-v0.1' }),
+    });
+    let refresh = createRefresh();
+    const refreshes = [];
+    for (let pass = 0; pass < 3; pass += 1) {
+      if (pass === 2) refresh = createRefresh(); // New companion refresh lifetime.
+      const { unifiedIndex } = await refresh({ mode: 'detailed' });
+      assert.equal(unifiedIndex.status, 'ingested');
+      assert.equal(unifiedIndex.unchanged, pass > 0);
+      assert.equal(unifiedIndex.insertedUsageEvents, 0);
+      assert.equal(unifiedIndex.totalUsageEvents, 2);
+      assert.equal(unifiedIndex.generation.status, 'partial');
+      assert.equal(unifiedIndex.generation.blockReason, 'tool_provenance_incomplete');
+      assert.equal(unifiedIndex.generation.discoveredSourceCount, 1);
+      assert.equal(unifiedIndex.generation.indexedSourceCount, 2);
+      assert.equal(unifiedIndex.generation.quotaOccurrences, 2);
+      assert.equal(unifiedIndex.generation.toolProvenanceComplete, false);
+      for (const key of ['discoveryComplete', 'diagnosticsComplete', 'usageProvenanceComplete',
+        'sourceOrderComplete', 'quotaProvenanceComplete']) assert.equal(unifiedIndex.generation[key], true);
+      const after = await readSignedReplacementState(successor);
+      assertSignedReplacementContinuity(baseline, after,
+        { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false },
+        { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' });
+      refreshes.push({ unchanged: unifiedIndex.unchanged, insertedUsageEvents: unifiedIndex.insertedUsageEvents,
+        generationStatus: unifiedIndex.generation.status, blockReason: unifiedIndex.generation.blockReason });
+    }
+    assert.equal(digest(await readFile(database)), seededDigest);
+    assert.equal(digest(await readFile(source)), sourceBefore);
+    const afterSchema = inspectSchema(successorDatabase), after = await readSignedReplacementState(successor);
+    assert.deepEqual(await readProductionUpdateSuccessorState(successor, predecessor), after);
     assert.equal(afterSchema.compatibility.userVersion, 12);
     assert.equal(afterSchema.compatibility.formatUserVersion, 12);
     assert.equal(afterSchema.compatibility.minimumReaderUserVersion, 12);
     assert.equal(afterSchema.compatibility.minimumWriterUserVersion, 12);
-    assert.deepEqual(afterSchema.parsers, beforeSchema.parsers);
-    assertSignedReplacementContinuity(baseline, after,
-      { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false },
-      { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' });
-    const migratedDigest = digest(await readFile(database));
+    assert.deepEqual(afterSchema.parsers, [...beforeSchema.parsers, LOCAL_UNIFIED_INDEX_PARSER_VERSION].sort());
+    const migratedDigest = digest(await readFile(successorDatabase));
     for (const readOnly of [true, false]) {
-      assert.throws(() => predecessor.openLocalUnifiedIndex(database, { readOnly }),
+      assert.throws(() => predecessor.openLocalUnifiedIndex(successorDatabase, { readOnly }),
         error => error.code === 'local_unified_index_schema_newer');
-      assert.equal(digest(await readFile(database)), migratedDigest);
+      assert.equal(digest(await readFile(successorDatabase)), migratedDigest);
     }
     return { beforeSchema, afterSchema, seededDigest, migratedDigest, retained: after,
+      predecessorRepeatedRefreshUnchanged: true, onboardingWithSourceReady: true, refreshes,
+      syntheticPredecessorCopyUnchanged: true, syntheticSourceUnchanged: true,
       baselineReadUnchanged: true, currentReaderRefusedUnmigratedSchema: true,
       predecessorReaderAndWriterRefusedNewerSchemaWithoutMutation: true };
   })();
