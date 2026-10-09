@@ -65,7 +65,7 @@ jobs:
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-development-darwin-arm64-${{ github.sha }}
           path: .release-build/electron-candidates/${{ github.sha }}/darwin-arm64/distribution/
@@ -111,7 +111,7 @@ jobs:
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-development-darwin-x64-${{ github.sha }}
           path: .release-build/electron-candidates/${{ github.sha }}/darwin-x64/distribution/
@@ -307,7 +307,7 @@ jobs:
       - name: Retain verified Windows package, staging tree, and receipts
         if: ${{ !cancelled() && steps.validate-win32-retained-inputs.outcome == 'success' }}
         id: retain-win32-development
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-development-win32-x64-${{ github.sha }}
           # Keep the exact staged tree with the package receipt. The isolated
@@ -401,7 +401,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_SMOKE_FAILED' }
       - name: Retain only the Windows normal-candidate receipt
         if: ${{ !cancelled() && hashFiles('.release-build/electron-windows-normal-candidate/normal-candidate-smoke.json') != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-windows-normal-candidate-${{ github.sha }}
           path: .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
@@ -451,7 +451,7 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts
           if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
       - name: Download the exact retained Windows package inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.win32-x64.outputs.development-artifact-id }}
           path: .release-build
@@ -473,7 +473,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NSIS_LIFECYCLE_SMOKE_FAILED' }
       - name: Retain Windows NSIS lifecycle receipt
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-development-win32-x64-nsis-lifecycle-${{ github.sha }}
           path: .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/nsis-lifecycle-smoke.json
@@ -695,7 +695,7 @@ jobs:
             node scripts/smoke-electron-linux-real-appimage-updater.mjs > "$host_receipt"
       - name: Retain only the Linux normal-candidate receipt
         if: ${{ !cancelled() && hashFiles(format('.release-build/electron-candidates/{0}/linux-x64/distribution/normal-packaged-smoke.json', github.sha)) != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-linux-normal-candidate-${{ github.sha }}
           path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/normal-packaged-smoke.json
@@ -703,7 +703,7 @@ jobs:
           retention-days: 14
       - name: Retain verified development packages and receipts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: electron-development-linux-x64-${{ github.sha }}
           path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/
