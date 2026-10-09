@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, realpath, cp, readFile, access, rm, symlink } from "node:fs/promises";
+import { mkdtemp, realpath, cp, readFile, access, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -55,17 +55,45 @@ test("generated context carries profiler and reprice runtime closure, excludes f
       assert.equal(help.stdout, source[usage], name);
       assert.equal(help.stderr, "", name);
     }
-    // The Docker CLI's --check-source intentionally uses /app. Exercise its
-    // exported reader against the actual copied migrations through the existing adapter.
+    // Exercise the Docker RUN's actual built CLI and validation, not just its
+    // loader. The production /app root remains pinned. This local-only adapter
+    // maps precisely its migration reads to the actual generated context.
+    const imagePathAdapter = join(root, "image-migration-path-adapter.mjs");
+    const imageMigrationRoot = "/app/apps/worker/postgres/migrations";
+    await writeFile(imagePathAdapter, `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const imageRoot = ${JSON.stringify(imageMigrationRoot)};
+const localRoot = ${JSON.stringify(join(output, "apps/worker/postgres/migrations"))};
+const mapped = path => typeof path === "string" && (path === imageRoot || path.startsWith(imageRoot + "/"))
+  ? localRoot + path.slice(imageRoot.length) : path;
+for (const name of ["lstat", "readdir", "readFile"]) {
+  const original = fs[name];
+  fs[name] = (path, ...args) => original(mapped(path), ...args);
+}
+syncBuiltinESMExports();
+`, { flag: "wx" });
+    const checked = invoke(["--import", imagePathAdapter, "dist/postgres-community-graph-benchmark.mjs", "--check-source"], cloud);
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.equal(checked.stderr, "");
+    const sourceCheck = JSON.parse(checked.stdout);
+    assert.deepEqual(Object.keys(sourceCheck).sort(), ["schemaVersion", "status", "migrationCount", "migrationTail", "migrationDigest"].sort());
+    assert.equal(sourceCheck.schemaVersion, "postgres-community-graph-cloud-run-benchmark-build-check-v1");
+    assert.equal(sourceCheck.status, "ok");
+    assert.equal(sourceCheck.migrationCount, 77);
+    assert.equal(sourceCheck.migrationTail, "0077_analytics_v2_reprice.sql");
+    assert.match(sourceCheck.migrationDigest, /^[0-9a-f]{64}$/u);
+    const dockerfile = await readFile(join(cloud, "Dockerfile"), "utf8");
+    for (const name of entries) assert.ok(dockerfile.includes(`test -s dist/${name}.mjs`), `${name} is required by Docker RUN`);
     const benchmark = await import(pathToFileURL(join(cloud, "dist/postgres-community-graph-benchmark.mjs")));
     const { readPostgresMigrations } = await import(pathToFileURL(join(output, "apps/worker/scripts/postgres-migrations.mjs")));
     const migrations = await benchmark.readPostgresCommunityGraphBenchmarkMigrations({
       readMigrations: ({ role }) => readPostgresMigrations({ role, rootDirectory: join(output, "apps/worker/postgres/migrations") }),
     });
     assert.equal(migrations.length, 77);
+    assert.equal(migrations.at(-2).name, "0076_classification_correction_links.sql");
     assert.equal(migrations.at(-1).name, "0077_analytics_v2_reprice.sql");
     console.log(JSON.stringify({ contextFiles: receipt.fileCount, sourceContentDigest: receipt.sourceContentDigest,
       runtimeFiles: runtime.length, excludedFixtures: fixtures.length, builtEntries: entries.length,
-      diagnosticCloudRefusal: true, actualContextBuild: true }));
+      diagnosticCloudRefusal: true, actualContextBuild: true, actualBuiltMigrationSourceCheck: sourceCheck }));
   } finally { await rm(root, { recursive: true, force: true }); }
 });

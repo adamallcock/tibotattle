@@ -80,8 +80,9 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
   }),
 });
 
-const MIGRATION_COUNT = 76;
-const MIGRATION_TAIL = "0076_classification_correction_links.sql";
+const MIGRATION_COUNT = 77;
+const MIGRATION_PREFIX_TAIL = "0076_classification_correction_links.sql";
+const MIGRATION_TAIL = "0077_analytics_v2_reprice.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";
@@ -402,6 +403,7 @@ export async function readAttachedCommunityGraphBenchmarkServiceAccount({
 
 function migrationManifestReceipt(migrations) {
   if (!Array.isArray(migrations) || migrations.length !== MIGRATION_COUNT
+      || migrations.at(-2)?.name !== MIGRATION_PREFIX_TAIL
       || migrations.at(-1)?.name !== MIGRATION_TAIL) {
     fail("POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_SOURCE_INVALID");
   }
