@@ -35,11 +35,11 @@ Native Mac version 0.1.18 retains its default-off, review-and-send behavior.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
-- **Fast-mode pricing** — API-price-equivalent estimates for Codex Fast turns
-  use the provider's published Priority (Fast) API rates: 2x Standard for
-  GPT-6 Astra, Sol and Luna and the GPT-5.6 and GPT-5.4 families, 2.5x for
-  GPT-5.5, and a clearly disclosed assumed 2x for models with no published
-  Priority rate. These estimates are not subscription charges or quota formulas.
+- **Speed-mode pricing** — reports distinguish observed Standard, Fast and
+  Ultrafast usage. Supported API-equivalent prices include GPT-6.1 Sol;
+  unsupported model and speed combinations remain explicitly unpriced. These
+  estimates are not subscription charges or quota formulas. See the
+  [0.1.28 release notes](release-notes/0.1.28.md) for the model and plan changes.
   Codex records the speed mode only when it is applied or
   changed, so turns before the first change in a session are attributed to
   Standard as a visible assumption unless a timestamped configuration reading
@@ -79,6 +79,11 @@ or the developer section below to build from source.
 See [Verify a TiboTattle release](docs/verify-release.md) to check the downloaded
 bytes, Apple signature and notarization, and any non-null release-specific
 GitHub provenance evidence yourself.
+
+For Windows x64 or Linux x86_64, download the matching signed Windows installer
+or Linux AppImage from the [latest release](https://github.com/adamallcock/tibotattle/releases/latest).
+See [platform qualification](docs/reference/platform-support.md) for the tested
+installation and upgrade paths and their remaining limits.
 
 ## Build from source (developers)
 
@@ -210,11 +215,11 @@ Despite the name, `local-review/` is committed developer tooling that builds a
 reproducible standalone review artifact — no local user data is tracked there.
 
 The hosted community-aggregate service at
-[tibotattle.com](https://tibotattle.com) is operated by the maintainer, and
-the deploy scripts in this repository target the owner's Cloudflare account.
-Forks that want their own hosted service must provision their own resources
-per `apps/worker/wrangler.jsonc`; the local app never requires the hosted
-service.
+[tibotattle.com](https://tibotattle.com) is operated by the maintainer. See the
+[current status](docs/current-status.md) and
+[production operations](docs/runbooks/production-operations.md) for the observed
+deployment and its operating boundaries. Forks must provision their own hosted
+resources; the local app never requires the hosted service.
 
 For the complete engineering map of loopback and hosted HTTP routes, native
 bridges, child-process protocols, Cloudflare bindings, workspace package APIs,
@@ -237,9 +242,10 @@ pnpm container:portable:build
 pnpm container:portable:test
 ```
 
-These commands are preparation evidence only. The shipping application remains
-macOS-only. See the [current status matrix](docs/current-status.md) for the
-separate source, native, installed, release, updater, and platform gates.
+These commands are preparation evidence only. The released desktop app has
+macOS Apple silicon, macOS Intel, Windows x64 and Linux x64 installers. See the
+[current status matrix](docs/current-status.md) for the separate source, native,
+installed, release, updater and platform qualification.
 
 ```bash
 npm run product:check

@@ -8,7 +8,7 @@ version labels; it does not imply API stability before 1.0.
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
   date on which the public GitHub Release was published, except the explicitly
-  marked, unpublished 0.1.25, 0.1.27 and 0.1.28 tagged candidates, whose dates
+  marked, unpublished 0.1.25 and 0.1.27 tagged candidates, whose dates
   are their source freezes.
 - Every released entry links to the public GitHub Release, its exact source
   revision, and the comparison with the preceding release source. Stable tags
@@ -39,10 +39,8 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [0.1.28](./release-notes/0.1.28.md) - 2026-10-09
 
-**Status:** Tagged candidate; publication pending. Fresh macOS ARM, macOS Intel,
-Windows and Linux artifacts and their qualification are required together.
-
-**Provenance:** [GitHub release location (unpublished)](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28) ·
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28) ·
+[exact application source](https://github.com/adamallcock/tibotattle/commit/bf84bc6c04372bb2cee64ef4a4f29981432fc3eb) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.28) ·
 [changes since the v0.1.27 tagged candidate](https://github.com/adamallcock/tibotattle/compare/v0.1.27...v0.1.28) ·
 [changes since the last public v0.1.26 release](https://github.com/adamallcock/tibotattle/compare/v0.1.26...v0.1.28)

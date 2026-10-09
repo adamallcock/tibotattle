@@ -1,6 +1,6 @@
 ---
 title: User guide
-date: 2026-09-23
+date: 2026-10-09
 type: guide
 status: maintained
 ---
@@ -102,6 +102,13 @@ updates. A repaired model identity does not automatically replace an already
 accepted hosted contribution; hosted synchronization requires a compatible
 correction contract.
 
+Explicitly identified auto-review usage from October 6, 2026 (UTC) appears
+separately from the main Codex allowance after a completed detailed refresh.
+Its `$0.00*` value describes the main-allowance charge; recorded tokens and
+API-price evidence remain available. Earlier usage keeps its previous
+treatment, missing metadata remains unknown, and Spark retains its own
+measured allowance and timeline.
+
 When local history contains more than one plan, **Allowance** separates the
 plans instead of averaging Plus and Pro reset estimates together. The plan
 selector keeps the headline, history, range, pace and share card on the same
@@ -141,8 +148,12 @@ These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-The Aggregate and By model community views use a Pro 10x-equivalent weekly
-basis. By plan charts each plan's own weekly API-price value on its own scale;
+The current client/source contract uses a Pro 10x-equivalent weekly basis for
+the Aggregate and By model community views. The deployed public website still
+uses the older Pro 20x-equivalent reference as of October 9, 2026; its migration
+is separate from this client release. See [current status](./current-status.md)
+for the observed publication boundary. By plan charts each plan's own weekly
+API-price value on its own scale;
 the card shows that value first and the Pro 10x equivalent underneath. The
 plan value is the reference estimate divided by 1 for Pro 10x, 2 for Pro 5x,
 0.4 for Pro Max 25x, or 10 for Plus. The Pro Max 25x factor assumes the
@@ -562,6 +573,11 @@ transition to Electron on Apple silicon or Intel.
 A temporary network failure should leave the installed app usable; it does not
 prove an update exists or failed to
 publish. Verify the current release independently if an update looks stale.
+
+A known 0.1.28 upgrade limitation affects 0.1.26 installations with saved
+history but no remaining Codex logs: the history view can be unavailable because
+the stored index is not migrated. Keep the existing app data when reporting
+this. See the [macOS qualification details](./reference/platform-support.md#macos).
 
 For bugs, diagnostics, privacy questions, and security reporting, start at
 [SUPPORT.md](../SUPPORT.md). Security-sensitive reports follow

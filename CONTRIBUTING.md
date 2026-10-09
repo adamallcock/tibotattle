@@ -1,7 +1,7 @@
 # Contributing to TiboTattle
 
 Thanks for your interest in improving TiboTattle. This repository is the
-source of truth for the local macOS app, the browser dashboard, and the
+source of truth for the shared desktop app, the browser dashboard, and the
 optional hosted contribution service. Contributions are welcome, but the
 project's privacy boundaries and verification gates are non-negotiable, so
 please read this page before opening an issue or pull request.
@@ -9,7 +9,8 @@ please read this page before opening an issue or pull request.
 ## Developer prerequisites
 
 Just installing the app? Use the [installation instructions](README.md#install-macos-apple-silicon-or-intel)
-for Apple silicon or Intel Macs. The published app bundles its runtime and does
+for Apple silicon or Intel Macs, or the [platform guide](docs/reference/platform-support.md)
+for Windows x64 and Linux x64. The published app bundles its runtime and does
 not require the development tools below.
 
 - **Node.js ≥ 22.13** for repository tooling and tests.

@@ -1,16 +1,19 @@
 ---
-title: Auto-review separate allowance for the next client
+title: Auto-review separate allowance in client 0.1.28
 date: 2026-10-07
 type: plan
-status: in-progress
+status: implemented
 ---
 
-Implement the owner's October 7 request for auto-review usage from October 6,
-2026 onward to appear in the existing separate-allowance category and show $0
-against the main allowance. The owner has resumed the client release and explicitly
-included these auto-review changes in the replacement candidate. The October 7
-pause below is historical. No hosted deployment or provider migration belongs
-to this local classification change.
+The owner's October 7 request is implemented in the published
+[0.1.28 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28):
+explicitly identified auto-review usage from October 6, 2026 UTC appears in the
+existing separate-allowance category and shows $0 against the main allowance,
+while retaining tokens and API-price evidence. The optional dashboard reader
+remains deferred. The October 7 pause and source checkpoints below are historical;
+[current status](../current-status.md) records updater and hosted closeout.
+No hosted deployment or provider migration belongs to this local classification
+change.
 
 ## Contract and evidence
 
@@ -56,16 +59,15 @@ Base: `297b12ef4b29135e37310481d675f0bb4303f817`, isolated branch
 `codex/autoreview-separate-allowance`. The frozen 0.1.27 artifacts do not contain
 this feature. Their prior signatures and qualification receipts cannot qualify
 new bytes. The replacement is 0.1.28, build 2026100901, with macOS bundle
-version 1036. A new candidate build and all native/hosted release gates remain
-outstanding. The replacement also includes the reviewed
-sharing-startup retry fix and build dependency remediation. Do not rewrite the
-existing tag; all four shared Electron targets must be rebuilt and qualified.
+version 1036. Fresh artifacts for all four shared Electron targets were
+qualified and published on October 9, 2026 from source
+`bf84bc6c04372bb2cee64ef4a4f29981432fc3eb`. The replacement also includes the
+reviewed sharing-startup retry fix and build dependency remediation. The prior
+tag, artifacts and receipts remain unchanged. Installed production updater and
+website results are recorded separately in current status.
 
-Implementation, validation and rendered evidence will be recorded here as each
-step completes.
 
-
-## Active checkpoint — October 9, 2026 UTC
+## Source checkpoint — October 9, 2026 UTC
 
 The owner explicitly included auto-review in the replacement client release.
 The source slices are complete: ingestion 375 tests (plus the final 18-test
@@ -102,10 +104,11 @@ compatibility are aligned, all 148 staging/admission checks pass with owned
 dependencies, and the full Worker gate passes 2,019 tests plus both deployment
 dry checks. No server deployment is part of this release-source validation.
 
-The 0.1.28 source freeze includes the reviewed auto-review, sharing-startup,
-build-dependency and qualification-route changes. Fresh four-platform artifacts,
-signatures, native upgrade checks, installed behavior and publication remain
-required. The source tag records this candidate boundary, not publication.
+At the 0.1.28 source freeze, the reviewed auto-review, sharing-startup,
+build-dependency and qualification-route changes were complete. Fresh
+four-platform artifacts, signatures, native checks, installed behavior and
+publication were separate requirements at that checkpoint; the tag alone was
+not publication evidence. The later release is recorded above.
 
 ## Historical paused checkpoint — October 7, 2026
 

@@ -2,10 +2,24 @@
 title: TiboTattle 0.1.27 client release qualification
 date: 2026-10-03
 type: plan
-status: in-progress
+status: superseded
 ---
 
 # TiboTattle 0.1.27 client release qualification
+
+## Superseded by the published 0.1.28 release
+
+Version 0.1.27 was tagged and signed but never published. The replacement
+[0.1.28 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28)
+was published on October 9, 2026 from fresh four-platform artifacts and includes
+the reviewed auto-review, sharing-startup and dependency changes. The optional
+dashboard reader remains deferred. See [current status](../current-status.md)
+for publication, updater, hosted and platform qualification.
+
+The remaining sections retain the earlier candidate's dated decisions and proof,
+including its temporary dependency exception and then-open gates. They do not
+authorize new builds or describe the current release. Its source, artifacts and
+original receipts remain unchanged.
 
 ## Scope and authorization
 

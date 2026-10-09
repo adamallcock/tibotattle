@@ -1,87 +1,126 @@
 ---
 title: Current product and release status
-date: 2026-09-27
+date: 2026-10-09
 type: status
 status: current
-source_commit: 1114fff4843b81e08637f22ed79bcfda605319a8
-observation_date: 2026-09-27
+source_commit: bf84bc6c04372bb2cee64ef4a4f29981432fc3eb
+observation_date: 2026-10-09
 ---
 
 # Current product and release status
 
-[TiboTattle 0.1.26](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26)
-is the published Electron release for macOS Apple silicon, macOS Intel, Windows
-x64 and Linux x64. The installers, updater feeds, Homebrew cask and public
-website have been published. Their qualification remains platform-specific;
-the [platform authority](./reference/platform-support.md) names the limits.
+[TiboTattle 0.1.28](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28)
+is the published shared Electron release for macOS Apple silicon, macOS Intel,
+Windows x64 and Linux x64. The installers, all six stable updater feeds,
+Homebrew cask and website downloads have been published and verified. Both native
+Sparkle production upgrades passed. Electron 0.1.26-to-0.1.28 production
+updates also passed on both Mac architectures with discoverable Codex logs.
+Qualification is platform-specific; the
+[platform authority](./reference/platform-support.md) names the limits.
+
+The release includes GPT-6.1 Sol, Ultrafast, Pro 10× and Pro Max 25× support,
+explicit auto-review allowance separation, sharing-startup retry and build
+dependency remediation. Auto-review classification applies to explicitly
+identified usage from October 6, 2026 UTC; token and API-price evidence remain.
+The optional Codex dashboard reader is deferred. Version 0.1.27 was tagged and
+signed but never published; 0.1.28 carries its client changes forward from the
+last public 0.1.26 release. See the [release notes](../release-notes/0.1.28.md).
 
 ## Signed release
 
-The immutable GitHub release was published on **2026-09-27 at 21:02:49 UTC**.
-Its 20 assets and [canonical release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json)
-were read back and hash-verified. The manifest SHA-256 is
-`be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc`;
+The immutable GitHub release was published on **2026-10-09 at 12:19:26 UTC**.
+Its 20 assets and [canonical release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
+were read back and hash-verified; GitHub latest resolves to this release.
+The manifest SHA-256 is
+`459b89538461b4249dc38e9bbcb5f7c6eb8f49b202856f3cc4f1db8a57650f89`;
 all four installers bind to tagged source
-`acfc385c95b49b8e1040cedfa857659b49a61d8d`, merged to main in
-[PR #238](https://github.com/adamallcock/tibotattle/pull/238).
-The Mac bundle version is `1034`, distinct from build number `2026092701`.
+`bf84bc6c04372bb2cee64ef4a4f29981432fc3eb`, merged to main in
+[PR #281](https://github.com/adamallcock/tibotattle/pull/281).
+The Mac bundle version is `1036`, distinct from build number `2026100901`.
 The manifest leaves SBOM and provenance fields null.
 
 | Published target | Exact final-artifact evidence | Remaining boundary |
 |---|---|---|
-| macOS 14+ Apple silicon | Developer ID signed, hardened, notarized, stapled and Gatekeeper-verified DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/36349376027) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/36350924405) passed | Full credential-failure matrix is not qualified |
-| macOS 14+ Intel | Separate signed, notarized and stapled DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/36349377398) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/36350929763) passed | Existing-credential upgrade was not exercised on Intel; full failure matrix is not qualified |
-| Windows x64 | Authenticode signed and timestamped installer; [hosted signed installed journey](https://github.com/adamallcock/tibotattle/actions/runs/36347063769) passed | Existing-install upgrade and every physical desktop integration are not qualified |
-| Linux x64 AppImage | Exact published hash and [hosted extracted-app runtime](https://github.com/adamallcock/tibotattle/actions/runs/36347037857) passed | Physical desktop launch, AppImage/FUSE mounting and replacement were not tested; owner accepted publication with `cleanInstallSmokePassed: false` |
+| macOS 14+ Apple silicon | Developer ID signed, hardened, notarized, stapled and Gatekeeper-verified DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37881967388), [credential upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37882400348) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37931481287) passed; [production Electron upgrade with discoverable Codex logs](https://github.com/adamallcock/tibotattle/actions/runs/37942774119) passed | See the retained-history limitation below; full credential-failure matrix is not qualified |
+| macOS 14+ Intel | Separate signed, notarized and stapled DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37882729563) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37932090365) passed; [production Electron upgrade with discoverable Codex logs](https://github.com/adamallcock/tibotattle/actions/runs/37949180932) passed | See the retained-history limitation below; existing-credential upgrade was not exercised on Intel; full failure matrix is not qualified |
+| Windows x64 | Authenticode signed and timestamped installer; [fresh-VM installer upgrade from 0.1.26](https://github.com/adamallcock/tibotattle/actions/runs/37880387839) passed | Automatic updater was not exercised; this journey does not requalify credential persistence, hosted enrollment or notification delivery |
+| Linux x64 AppImage | Exact artifact integrity and [native x64 Xvfb/FUSE lifecycle](https://github.com/adamallcock/tibotattle/actions/runs/37879713389) passed, including clean install and isolated update from 0.1.26 | Physical desktop behavior and production-feed installed updating remain unqualified; no native-signing claim |
 
-The signed Apple silicon existing-Keychain-credential upgrades passed from both
-[0.1.24](https://github.com/adamallcock/tibotattle/actions/runs/36349405714)
-and [0.1.20](https://github.com/adamallcock/tibotattle/actions/runs/36349407322),
-including modern, invalid and locked cases in those runs. These receipts close
-the earlier 0.1.25 credential-continuity gap for their named scenarios, not the
-entire failure matrix. The separate production Electron updater also replaced
-0.1.20 with 0.1.26 on
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/36351718654)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/36351723582),
-preserving rows, settings, salt and opt-out through relaunch and restart.
+The signed Apple silicon existing-Keychain-credential run qualified its
+0.1.20-to-0.1.28 modern, invalid and locked fixtures. It preserved credential
+items, values and access controls, and verified synthetic historical Sol repair
+from parser 18 to 20 without changing tokens or duplicating replayed usage.
+This is local installed evidence, not a hosted historical correction result or
+the complete credential-failure matrix.
 
-All four stable Electron feeds and both native Sparkle feeds advertise 0.1.26
-with exact public readback. The
-[first-party Homebrew update](https://github.com/adamallcock/homebrew-tap/actions/runs/36351745490)
-passed; its 0.1.26 cask hashes match the published Mac DMGs. Feed metadata,
-installed updater runs and cask resolution are distinct evidence.
+All four stable Electron feeds advertise 0.1.28; their fourteen immutable and
+feed objects passed public readback at **12:26:55 UTC**. Both native Sparkle
+feeds and their DMGs passed public readback by **12:29:31 UTC**. The native
+Sparkle 0.1.18-to-0.1.28 journeys then passed through both production feeds,
+including update, relaunch, migration, retained rows, preferences, salt, opt-out
+and restart without duplicates. Neither used a feed override or a runner-copied
+candidate; these journeys did not include an existing-credential fixture.
+
+The production Electron 0.1.26-to-0.1.28 updates passed on
+[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37942774119)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37949180932),
+using authentic predecessor fixtures with discoverable Codex logs. Both
+installed and relaunched the exact released app automatically, observed the
+predecessor exit naturally, preserved rows, preferences, salt and opt-out, and
+passed restart without duplicates and cleanup. Neither used a feed override,
+a runner-copied candidate or an existing-credential fixture.
+
+The [earlier failed attempts](./reference/platform-support.md#macos) remain
+separate evidence. Baseline and process-observation failures left continuity
+unqualified; other runs timed out after installation and relaunch. The earlier
+R2 failures' exact cause remains unproven. Those failed receipts do not establish
+data loss.
+
+Source review of released 0.1.28 identifies a separate retained-history
+limitation. When a 0.1.26 format-11 index remains but no Codex rollout files
+survive, ordinary Refresh, startup refresh and automatic cadence do not start
+its migration. The current reader rejects that old index, leaving its unified
+history projection unavailable; cached summaries may remain. This is not proof
+of deleted rows. The passed journeys with discoverable logs do not resolve
+this case.
+
+The [Homebrew update](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
+passed all four jobs and its exact 0.1.28 cask readback matches the published Mac
+DMG hashes. Feed metadata, installed updater runs and cask resolution remain
+distinct evidence.
 
 ## Hosted and website boundary
 
-The [public website](https://tibotattle.com/) serves the 0.1.26 four-platform
-download page. Its [site manifest](https://tibotattle.com/release-site-manifest.json)
-has SHA-256
-`676ddc42654eb4a44bffd59c3b45862f430a6e9e266f4211dc7610eaeac47c1c`.
-The 2026-09-27 website-only follow-up put localized navigation on a full row at
-narrow widths; the generated site changed only its stylesheet and manifest.
-Cache-busted public readback matched the new stylesheet and manifest, while the
-other generated files retained their launch-release bytes. The share image is
-PNG at 1200×630. The live Spanish page showed the full Docs link at 390 px,
-and the link opened Docs; the rendered page also exposed the published installers
-and live community aggregates.
+The owner-installed 0.1.28 app completed its local refresh and displayed Sol 6.1
+and separate auto-review allowance correctly. Ordinary sharing received accepted
+upload chunks. These observations do not establish completion of the retained
+backlog, full hosted activation, public graph recalculation, or a complete
+unknown-to-Sol historical correction transition.
 
-The production Worker health endpoint names web-only source
-`ae637aa7c38febf97bd15ae4ad79d020aaa5d3f7`, a descendant of the
-previous deployed web-only source `19f2459754a4a5393d3ba0804e7b293dbe7924c8`.
-The guarded typed-storage website deploy preserved the live bindings and
-qualified all three database roles. The 0.1.26 tag's separate analytics
-migration `0027_admin_metrics_history_publications.sql` and its associated
-Worker runtime changes are **not deployed**; they remain a separate reviewed
-migration and deployment operation. Website publication does not prove hosted
-runtime or schema activation.
+The [public website](https://tibotattle.com/) deployment completed at
+**2026-10-09 12:42:44 UTC** from source
+`24411d5c318e593bfe4c0f8b2066cb6a9a313002`. Its
+[site manifest](https://tibotattle.com/release-site-manifest.json) has SHA-256
+`f92d441537ad52365dcf4dbe3e0ea271b331a19f4c50f26de61cecefd2d2c86c`,
+independently read back at 12:47:23 UTC. All four download targets resolve to
+0.1.28. Desktop and Spanish 390 px rendering were inspected, the Windows selector
+was verified, and Open Graph and Twitter use the same crawler-accessible
+1200×630 PNG with successful image readback.
+
+The website update changed installer discovery only. The verified GCP origin was at
+source `dec6d4f3f3f29921eefec3b2d44da525411141d5`, image SHA-256
+`1b5ddeebe8fa4bd4adcfefa4c204728619fd0a016a5132411ed279835c2359d3`.
+The public readback showed October 5 and the older Pro 20×-equivalent
+reference, with repricing pending at that observation. Full historical activation, repricing and
+public-reference migration remain separately owned server work. The client
+release does not establish deployment of every cross-surface product change.
 
 Local analysis remains independent of hosted availability. Sharing and public
 source eligibility follow the maintained
 [sharing policy](./decisions/2026-09-04-accountless-sharing-policy.md) and
 [public-source decision](./decisions/2026-09-11-public-contribution-sources.md).
 An installation or provider-account source is not a verified person. A healthy
-Worker is not proof of complete public calculations. The independent
-GCP/PostgreSQL experiment is outside this release scope.
+service or an accepted upload chunk is not proof of complete public calculations.
 
 ## Maintaining this snapshot
 
