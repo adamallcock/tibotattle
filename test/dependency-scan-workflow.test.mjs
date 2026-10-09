@@ -5,14 +5,14 @@ import { readFile, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Executable shell proof for the Ubuntu OSV job. Platform-neutral exception
-// contracts remain in http-cache-exception.test.js and the root test suite.
+// Executable shell proof for the Ubuntu OSV job. Platform-neutral dependency
+// contracts remain in build-download-dependencies.test.js and the root suite.
 test("scanner shell retains download, checksum and direct scanner failure status", async () => {
   const workflow = await readFile(new URL("../.github/workflows/osv-scanner.yml", import.meta.url), "utf8");
   const match = workflow.match(/      - name: Run scanner\n        shell: bash\n        run: \|\n((?:          .*\n)+)/);
   assert.ok(match, "direct scanner run block must exist");
   const script = match[1].replace(/^ {10}/gm, "");
-  const root = await mkdtemp(join(tmpdir(), "http-cache-scanner-shell-test-"));
+  const root = await mkdtemp(join(tmpdir(), "dependency-scanner-shell-test-"));
   const trace = join(root, "trace");
   try {
     await writeFile(join(root, "curl"), `#!/bin/bash

@@ -94,6 +94,10 @@ new execution; the earlier review is a dated snapshot, not release proof.
   `bdc56099`. Independent review, the live guard, focused negative tests and a
   fresh recursive OSV scan passed. The hosted Ubuntu OSV check also passed
   on the integrated preparation head `744390a9`.
+  This is historical evidence for that preparation. The later
+  [build dependency removal](../decisions/2026-10-09-build-downloader-dependency-remediation.md)
+  retires the exception in replacement source; new artifacts require their own
+  exact-source scan and qualification.
 - Paused-sharing copy is cause-neutral in all three locales, because the
   renderer receives no cause. Both Community and Settings have focused
   rendering coverage; canonical i18n checks pass. Native rendering is pending.
