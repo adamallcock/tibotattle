@@ -114,6 +114,15 @@ Post-update continuity reads use the current API; neither database version label
 signed application are modified to make the predecessor accept newer state.
 The scratch snapshot is removed after baseline inspection, including on failure.
 
+For v3, the verified predecessor's normal ingestion API builds the retained
+index from a synthetic usage source. The fixture then retires only that owned
+source and keeps a separate metadata-only rollout discoverable. This makes
+ordinary startup refresh eligible without adding usage or quota observations.
+The artifact regression checks repeated predecessor and successor refreshes,
+including retained rows and the explicit partial-provenance state. This journey
+qualifies an upgrade with a discoverable source; profiles with no surviving
+source files require separate qualification.
+
 For v3, the runner passively waits for the updater-created successor to publish
 format 12 before checking first-launch continuity. An intact format-11 baseline
 can remain visible while ordinary refresh migrates a staging copy. Each poll

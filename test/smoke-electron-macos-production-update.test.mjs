@@ -11,7 +11,12 @@ import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from '../scripts/smoke-electron-macos-replacement.mjs';
+import * as currentIndex from '../src/local-unified-index.js';
 import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
+import { ingestLocalUnifiedIndexIncrement } from '../src/local-unified-index-ingest.js';
+import { extractRolloutUsage, rolloutContentQuarantineReason } from '../src/local-unified-index-extract.js';
+import { inspectLocalOnboarding } from '../src/local-installation-diagnostics.js';
+import { localCodexLogScanner } from '../src/local-node-runtime.js';
 const hash = (b, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(b).digest(encoding);
 const fixture = (target = 'darwin-arm64') => ({ schemaVersion: 'tibotattle-production-electron-update-intake-v1',
   target, sourceRevision: 'a'.repeat(40), buildNumber: '2026091106', version: '0.1.22', bundleVersion: '1029',
@@ -290,7 +295,8 @@ export const reasoningEffortOrdinal = () => 0;
 export const readLocalUnifiedIndexCompatibility = () => {};
 export const moduleUrl = import.meta.url;
 `;
-async function predecessorArchiveFixture(t, { source = fixtureIndexSource, link = false, unpacked = false } = {}) {
+async function predecessorArchiveFixture(t, { source = fixtureIndexSource,
+  ingest = 'export const ingestLocalUnifiedIndexIncrement = () => "pinned ingestion";', link = false, unpacked = false } = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-predecessor-api-')));
   const app = join(directory, 'TiboTattle.app'), archive = join(app, 'Contents', 'Resources', 'app.asar');
   const tree = join(directory, 'source');
@@ -301,6 +307,7 @@ async function predecessorArchiveFixture(t, { source = fixtureIndexSource, link 
   await mkdir(join(tree, 'src'), { recursive: true });
   await writeFile(join(tree, 'package.json'), JSON.stringify({ type: 'module' }));
   await writeFile(join(tree, 'src', 'local-unified-index.js'), source);
+  await writeFile(join(tree, 'src', 'local-unified-index-ingest.js'), ingest);
   await writeFile(join(tree, 'src', 'fixture-value.js'), 'export const value = "pinned predecessor";');
   if (link) await symlink('fixture-value.js', join(tree, 'src', 'fixture-link.js'));
   if (unpacked) await writeFile(join(tree, 'native.node'), 'unbound native bytes');
@@ -327,6 +334,90 @@ test('predecessor API loads exact packed archive bytes with private permissions 
   assert.equal(result, 'accepted');
   assert.deepEqual(await readFile(archive), before);
   assert.deepEqual(await scratchNames(directory), []);
+});
+
+test('only v3 loads and requires the verified predecessor public ingestion API', async t => {
+  const valid = await predecessorArchiveFixture(t);
+  const result = await runner.withProductionUpdatePredecessorIndex({ ...valid.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, valid.app, (_index, ingest) => ingest());
+  assert.equal(result, 'pinned ingestion');
+  assert.deepEqual(await scratchNames(valid.directory), []);
+  const missing = await predecessorArchiveFixture(t, { ingest: 'export const unrelated = true;' });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...missing.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, missing.app, () => assert.fail('not admitted')),
+  error => error.updateStage === 'predecessor_fixture_api');
+  for (const schemaVersion of ['tibotattle-production-electron-update-intake-v1', 'tibotattle-production-electron-update-intake-v2']) {
+    await runner.withProductionUpdatePredecessorIndex({ ...missing.input, schemaVersion }, missing.app, (_index, ingest) => assert.equal(ingest, null));
+  }
+  assert.deepEqual(await scratchNames(missing.directory), []);
+});
+
+test('retained-source fixture uses real ingestion and leaves one discoverable content-free zero-usage rollout', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-retained-fixture-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const codexHome = join(directory, 'codex'), native = join(directory, 'native');
+  await mkdir(codexHome, { mode: 0o700 });
+  await mkdir(join(codexHome, 'sessions'), { mode: 0o700 });
+  const passes = [];
+  const seeded = await runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, async options => {
+    const result = await ingestLocalUnifiedIndexIncrement(options);
+    passes.push(result);
+    return result;
+  });
+  assert.equal(seeded.usageRows, 2);
+  assert.equal(seeded.quotaRows, 2);
+  assert.equal(seeded.tokensInUncached, 203);
+  assert.deepEqual(passes.map(result => [result.generation.status, result.generation.discoveredSourceCount,
+    result.generation.indexedSourceCount, result.generation.usageEvents, result.generation.quotaOccurrences]),
+  [['complete', 2, 2, 2, 2], ['complete', 1, 2, 2, 2]]);
+  const onboarding = await inspectLocalOnboarding({ codexHome, stateRoot: native });
+  assert.equal(onboarding.status, 'ready');
+  assert.equal(onboarding.source.rolloutFilesPresent, true);
+  assert.equal(onboarding.source.rolloutFilesObserved, 1);
+  const infos = await localCodexLogScanner.discoverCodexRolloutInfos({ codexHome, startAt: '1970-01-01T00:00:00.000Z' });
+  assert.equal(infos.length, 1);
+  const names = await readdir(join(codexHome, 'sessions'));
+  assert.deepEqual(names, ['rollout-2026-08-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl']);
+  const source = join(codexHome, 'sessions', names[0]), content = await readFile(source, 'utf8');
+  assert.equal(content, JSON.stringify({ timestamp: '2026-08-01T00:00:00.000Z', type: 'session_meta',
+    payload: { id: '22222222-2222-4222-8222-222222222222' } }) + '\n');
+  assert.equal((await lstat(source)).mode & 0o777, 0o600);
+  const events = [], boundaries = [], tools = [];
+  const extracted = await extractRolloutUsage(source, { size: Buffer.byteLength(content),
+    onEvent: event => events.push(event), onBoundary: event => boundaries.push(event), onTool: event => tools.push(event) });
+  assert.equal(extracted.diagnostics.sessionMetaRecords, 1);
+  assert.equal(rolloutContentQuarantineReason(extracted), null);
+  assert.deepEqual({ events, boundaries, tools }, { events: [], boundaries: [], tools: [] });
+  for (let pass = 0; pass < 2; pass += 1) {
+    const result = await ingestLocalUnifiedIndexIncrement({ codexHome, indexFile: join(native, 'local-unified-index-v1.sqlite'),
+      secretFile: join(native, 'local-unified-index-device-salt-v1'), contractVersion: 'telemetry-contribution-v0.1' });
+    assert.equal(result.unchanged, true);
+    assert.equal(result.insertedUsageEvents, 0);
+    assert.deepEqual(await readSignedReplacementState(native), seeded);
+  }
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement), { code: 'EEXIST' });
+  assert.equal(await readFile(source, 'utf8'), content);
+  assert.deepEqual(await readSignedReplacementState(native), seeded);
+});
+
+test('retained-source fixture refuses unsafe directories and never retires a changed usage source', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-retained-refusal-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const codexHome = join(directory, 'codex'), sessions = join(codexHome, 'sessions'), native = join(directory, 'native');
+  await mkdir(codexHome, { mode: 0o700 }); await mkdir(sessions, { mode: 0o700 });
+  await chmod(sessions, 0o755);
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement),
+    error => error.updateStage === 'predecessor_fixture_location');
+  await assert.rejects(lstat(native), { code: 'ENOENT' });
+  await chmod(sessions, 0o700);
+  let changed;
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, async options => {
+    const result = await ingestLocalUnifiedIndexIncrement(options);
+    changed = join(sessions, (await readdir(sessions)).find(name => name.includes('11111111')));
+    await writeFile(changed, 'changed synthetic source\n');
+    return result;
+  }), error => error.updateStage === 'predecessor_fixture_source');
+  assert.equal(await readFile(changed, 'utf8'), 'changed synthetic source\n');
 });
 
 test('predecessor scratch is removed when baseline observation or API admission fails', async t => {

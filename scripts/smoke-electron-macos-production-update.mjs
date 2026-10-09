@@ -110,6 +110,61 @@ async function bytes(path, limit = 1024 ** 3) {
   if (!s.isFile() || s.nlink !== 1 || s.uid !== process.getuid() || s.size < 1 || s.size > limit) fail('unsafe_file');
   return readFile(path);
 }
+// v3 seeds real predecessor ingestion provenance before any app launch. The
+// retired usage source exercises retained history; the metadata-only source
+// keeps ordinary local analysis available without adding usage or quota facts.
+export async function seedProductionUpdateRetainedNativeState(nativeRoot, codexHome, index, ingest) {
+  if (typeof ingest !== 'function') fail('predecessor_fixture_api');
+  const sessions = join(codexHome, 'sessions');
+  await safePath(sessions);
+  for (const path of [codexHome, sessions]) {
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) fail('predecessor_fixture_location');
+  }
+  const preliminary = await seedSignedReplacementNativeState(nativeRoot, codexHome, index);
+  const stamp = offset => new Date(Date.parse('2026-08-01T00:00:00Z') + offset * 1000).toISOString();
+  const metadata = id => ({ timestamp: stamp(0), type: 'session_meta', payload: { id } });
+  const source = join(sessions, 'rollout-2026-08-01T00-00-00-11111111-1111-4111-8111-111111111111.jsonl');
+  const sentinel = join(sessions, 'rollout-2026-08-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl');
+  const totals = { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0,
+    output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 };
+  const rows = [metadata('11111111-1111-4111-8111-111111111111'),
+    { timestamp: stamp(0), type: 'turn_context', payload: { model: 'gpt-5.6-sol', effort: 'medium' } }];
+  for (let i = 1; i <= 2; i += 1) {
+    const usage = { input_tokens: 300 + i, cached_input_tokens: 200, cache_write_input_tokens: 0,
+      output_tokens: 7, reasoning_output_tokens: 2, total_tokens: 307 + i };
+    for (const key of Object.keys(totals)) totals[key] += usage[key];
+    rows.push({ timestamp: stamp(i), type: 'event_msg', payload: { type: 'token_count',
+      info: { total_token_usage: { ...totals }, last_token_usage: usage },
+      rate_limits: { limit_id: 'codex', plan_type: 'plus', primary: { used_percent: 40 + i,
+        window_minutes: 300, resets_at: Date.parse('2026-08-02T00:00:00Z') / 1000 } } } });
+  }
+  const sourceBytes = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+  await writeFile(source, sourceBytes, { flag: 'wx', mode: 0o600 });
+  const owned = await lstat(source);
+  await writeFile(sentinel, JSON.stringify(metadata('22222222-2222-4222-8222-222222222222')) + '\n', { flag: 'wx', mode: 0o600 });
+  const options = { codexHome, indexFile: join(nativeRoot, 'local-unified-index-v1.sqlite'),
+    secretFile: join(nativeRoot, 'local-unified-index-device-salt-v1'), contractVersion: 'telemetry-contribution-v0.1' };
+  const assertGeneration = (result, discoveredSourceCount) => {
+    const generation = result?.generation;
+    if (result?.status !== 'ingested' || generation?.status !== 'complete' || generation.blockReason !== null
+      || generation.discoveredSourceCount !== discoveredSourceCount || generation.indexedSourceCount !== 2
+      || generation.usageEvents !== 2 || generation.quotaOccurrences !== 2
+      || !['discoveryComplete', 'diagnosticsComplete', 'usageProvenanceComplete', 'sourceOrderComplete',
+        'quotaProvenanceComplete', 'toolProvenanceComplete'].every(key => generation[key] === true)) fail('predecessor_fixture_generation');
+  };
+  assertGeneration(await ingest(options), 2);
+  const before = await readSignedReplacementState(nativeRoot, index);
+  if (before.usageRows !== 2 || before.quotaRows !== 2 || before.tokensInUncached !== 203
+    || before.saltDigest !== preliminary.saltDigest || before.optOutDigest !== preliminary.optOutDigest) fail('predecessor_fixture_state');
+  const current = await lstat(source);
+  if (current.ino !== owned.ino || current.dev !== owned.dev || hash(await bytes(source, 4096)) !== hash(sourceBytes)) fail('predecessor_fixture_source');
+  await rm(source); // Only this freshly created, unchanged synthetic source.
+  assertGeneration(await ingest(options), 1);
+  const retained = await readSignedReplacementState(nativeRoot, index);
+  if (Object.keys(before).some(key => retained[key] !== before[key])) fail('predecessor_fixture_state');
+  return retained;
+}
 async function fetchBytes(url, limit, github = false) {
   let selected = new URL(url);
   for (let redirect = 0; redirect < 4; redirect++) {
@@ -268,7 +323,13 @@ export async function withProductionUpdatePredecessorIndex(input, appPath, useIn
     const required = ['openLocalUnifiedIndex', 'createUnifiedIndexWriter', 'outcomeOrdinal', 'reasoningEffortOrdinal'];
     if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v3') required.push('readLocalUnifiedIndexCompatibility');
     if (!required.every(name => typeof index[name] === 'function')) fail('predecessor_fixture_api');
-    return await useIndex(index);
+    let ingest = null;
+    if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v3') {
+      const source = await import(pathToFileURL(join(extracted, 'src', 'local-unified-index-ingest.js')).href);
+      ingest = source.ingestLocalUnifiedIndexIncrement;
+      if (typeof ingest !== 'function') fail('predecessor_fixture_api');
+    }
+    return await useIndex(index, ingest);
   } finally {
     api.uncache(archive);
     await safePath(scratch);
@@ -369,10 +430,12 @@ export async function runProductionUpdate(options) {
     await assertExtractedSignedMacBundle(predecessorDmg, app, join(input.directory, 'predecessor-verification-mount'));
     const verified = await verifyProductionUpdatePredecessor(input, app); proof.signedArtifactVerified = true;
     stage = 'predecessor_fixture';
-    const { before, environment, stateRoot, settingsFile, sharing, predecessorIndex } = await withProductionUpdatePredecessorIndex(input, app, async index => {
+    const { before, environment, stateRoot, settingsFile, sharing, predecessorIndex } = await withProductionUpdatePredecessorIndex(input, app, async (index, ingest) => {
       command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', app]);
       await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
-      const seeded = await seedSignedReplacementNativeState(native, codex, index);
+      const seeded = input.schemaVersion === 'tibotattle-production-electron-update-intake-v3'
+        ? await seedProductionUpdateRetainedNativeState(native, codex, index, ingest)
+        : await seedSignedReplacementNativeState(native, codex, index);
       for (const [key, kind, value] of [['tibotattle.language-preference.v1', '-string', 'es'],
         ['tibotattle.appearance.v1', '-string', 'dark'], ['tibotattle.refresh-interval.v1', '-int', '900']]) {
         command('/usr/bin/defaults', ['write', 'com.usagemonitor.local', key, kind, value]);
