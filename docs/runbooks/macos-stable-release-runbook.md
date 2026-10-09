@@ -139,6 +139,10 @@ successor; later cleanup cannot satisfy that observation. Capture binds each
 process command and start time from one bounded inventory sample. The complete
 predecessor snapshot must validate before Install is invoked; an unresolved
 live identity fails closed and cannot overwrite a previously verified identity.
+After Install, unresolved process observations stay pending within the existing
+fixed deadline. Newly unresolved descendants remain pending through orphaning
+until absence or proven ownership; uncertainty cannot establish exit or admit
+a successor. Malformed inventory and cleanup identity failures remain fatal.
 Retain the separate
 `tibotattle-signed-macos-production-update-v3` receipt for each architecture.
 It keeps `existingCredentialFixture: false`: the signed credential fixture is

@@ -282,47 +282,69 @@ export function sparkleTransitionDiagnosticScript(pid) {
     '}',
   ].join('\n');
 }
-export function captureMacTransitionProcesses(appPath, verifiedPid, registry, { readProcesses = processes } = {}) {
+export function observeMacTransitionProcesses(appPath, verifiedPid, registry, {
+  readProcesses = processes, unresolvedPids = new Set(),
+} = {}) {
   if ((verifiedPid !== null && (!Number.isSafeInteger(verifiedPid) || verifiedPid < 2))
+    || !(unresolvedPids instanceof Set) || [...unresolvedPids].some(pid => !Number.isSafeInteger(pid) || pid < 2)
     || !(registry instanceof Map) || [...registry].some(([pid, fingerprint]) => !Number.isSafeInteger(pid) || pid < 2
     || typeof fingerprint !== 'string' || fingerprint.split('\n').length !== 2
     || macTransitionProcessFingerprint({ command: fingerprint.split('\n')[0], startedAt: fingerprint.split('\n')[1] }) !== fingerprint)) fail('process_identity');
   let rows;
   try { rows = readProcesses(); } catch { fail('process_inventory'); }
   if (!Array.isArray(rows) || rows.some(row => !Number.isSafeInteger(row?.pid) || row.pid < 0
-    || !Number.isSafeInteger(row.parent) || row.parent < 0 || typeof row.command !== 'string' || !row.command)
+    || !Number.isSafeInteger(row.parent) || row.parent < 0 || typeof row.command !== 'string' || !row.command
+    || /[\0\r\n]/u.test(row.command) || (row.startedAt !== null && typeof row.startedAt !== 'string'))
     || new Set(rows.map(row => row.pid)).size !== rows.length) fail('process_inventory');
   const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
-  let unresolved = false;
+  const livePids = new Set(rows.map(row => row.pid));
+  for (const pid of unresolvedPids) if (!livePids.has(pid)) unresolvedPids.delete(pid);
   if (verifiedPid !== null) {
     const main = rows.find((row) => row.pid === verifiedPid && row.command === executable);
     if (main && !registry.has(main.pid)) {
       const fingerprint = macTransitionProcessFingerprint(main);
-      if (fingerprint === null) unresolved = true;
+      if (fingerprint === null) unresolvedPids.add(main.pid);
       else registry.set(main.pid, fingerprint);
     }
   }
   const owned = new Set();
   for (const row of rows) if (registry.has(row.pid)) {
     const expected = registry.get(row.pid), fingerprint = macTransitionProcessFingerprint(row);
-    if (fingerprint === expected) owned.add(row.pid);
+    if (fingerprint === expected) { owned.add(row.pid); unresolvedPids.delete(row.pid); }
     else if (fingerprint === null || normalizeMacTransitionProcessStart(row.startedAt) === expected.split('\n')[1]) {
       // Keep the prior proven identity. An incomplete sample or an exec of the
       // same live identity cannot establish exit or authorize its descendants.
-      unresolved = true;
+      unresolvedPids.add(row.pid);
     }
+    // A changed start excludes ordinary PID reuse from ownership. If this PID
+    // was already an unresolved new descendant, reuse does not clear that
+    // uncertainty: only absence or independently proven ownership may do so.
   }
   let changed = true;
   while (changed) {
     changed = false;
     for (const row of rows) if (!owned.has(row.pid) && owned.has(row.parent)) {
       const fingerprint = macTransitionProcessFingerprint(row);
-      if (fingerprint === null || registry.has(row.pid)) { unresolved = true; continue; }
-      registry.set(row.pid, fingerprint); owned.add(row.pid); changed = true;
+      if (fingerprint === null || registry.has(row.pid)) { unresolvedPids.add(row.pid); continue; }
+      registry.set(row.pid, fingerprint); owned.add(row.pid); unresolvedPids.delete(row.pid); changed = true;
     }
   }
-  if (unresolved) fail('process_identity');
-  return rows.filter(row => owned.has(row.pid));
+  // This sidecar records uncertainty only, never authority to signal or admit
+  // a process. Remember observed children too, so orphaning an unproven branch
+  // cannot silently turn one of its survivors into an updater successor.
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) if (!owned.has(row.pid) && !unresolvedPids.has(row.pid) && unresolvedPids.has(row.parent)) {
+      unresolvedPids.add(row.pid); changed = true;
+    }
+  }
+  return { rows, owned: rows.filter(row => owned.has(row.pid)), pending: unresolvedPids.size > 0 };
+}
+export function captureMacTransitionProcesses(appPath, verifiedPid, registry, options) {
+  const observation = observeMacTransitionProcesses(appPath, verifiedPid, registry, options);
+  if (observation.pending) fail('process_identity');
+  return observation.owned;
 }
 export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcesses, verifyApp }) {
   const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');

@@ -323,6 +323,116 @@ test('unresolved live captures and failed resamples prevent Install without pois
     assert.equal(installed, false, 'unsafe historical entries are refused, never filtered');
   }
 });
+
+const pollingApp = '/synthetic/TiboTattle.app', pollingExecutable = pollingApp + '/Contents/MacOS/TiboTattle';
+const pollingStart = 'Sun Oct 4 02:00:00 2026';
+const pollingRow = (pid, parent, command = pollingExecutable, startedAt = pollingStart) => ({ pid, parent, group: pid, command, startedAt });
+function pollingFixture(currentRoute = true, initialRows = [pollingRow(100, 1)]) {
+  const knownProcesses = new Map();
+  const predecessorProcesses = runner.requestProductionUpdateInstall({ appPath: pollingApp, predecessorPid: 100,
+    knownProcesses, currentRoute, install: () => Promise.resolve() }, { readProcesses: () => initialRows });
+  return { appPath: pollingApp, predecessorPid: 100, knownProcesses, predecessorProcesses, currentRoute };
+}
+
+test('post-Install observer waits for same-start exec, zombie or unknown start to exit before selecting from that same sample', async () => {
+  for (const currentRoute of [false, true]) {
+    const input = pollingFixture(currentRoute), before = new Map(input.knownProcesses);
+    const samples = [
+      [pollingRow(100, 1, '/synthetic/exec-replacement'), pollingRow(200, 1)],
+      [pollingRow(100, 1, '<defunct>'), pollingRow(200, 1)],
+      [pollingRow(100, 1, pollingExecutable, null), pollingRow(200, 1)],
+      [pollingRow(200, 1)],
+    ];
+    let reads = 0, elapsed = 0;
+    const selected = await runner.waitForProductionUpdateSuccessor(input, {
+      readProcesses: () => { assert.ok(reads < samples.length, 'one inventory per observation and selection'); return samples[reads++]; },
+      now: () => elapsed, sleep: async milliseconds => { assert.equal(milliseconds, 300); elapsed += milliseconds; },
+    });
+    assert.equal(selected, 200);
+    assert.equal(reads, 4);
+    assert.equal(elapsed, 900);
+    assert.deepEqual(input.knownProcesses, before, 'transitional rows never replace the proven identity or own the successor');
+  }
+});
+
+test('post-Install unknown descendant remains pending through orphaning and timestamp recovery until observed exit', async () => {
+  const input = pollingFixture(), before = new Map(input.knownProcesses);
+  const samples = [
+    [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, ''), pollingRow(102, 101), pollingRow(200, 1)],
+    [pollingRow(101, 1), pollingRow(102, 101), pollingRow(200, 1)],
+    [pollingRow(102, 1), pollingRow(200, 1)],
+    [pollingRow(200, 1)],
+  ];
+  let reads = 0, elapsed = 0;
+  assert.equal(await runner.waitForProductionUpdateSuccessor(input, {
+    readProcesses: () => { assert.ok(reads < samples.length); return samples[reads++]; },
+    now: () => elapsed, sleep: async milliseconds => {
+      elapsed += milliseconds;
+      assert.deepEqual(input.knownProcesses, before, 'neither the unknown parent nor its descendants acquire ownership');
+    },
+  }), 200);
+  assert.equal(reads, 4);
+  assert.equal(elapsed, 900);
+  assert.deepEqual(input.knownProcesses, before);
+});
+
+test('an unresolved new descendant reusing a historical PID stays pending after orphaning with a different start', async () => {
+  const input = pollingFixture(true, [pollingRow(100, 1), pollingRow(101, 100)]);
+  const before = new Map(input.knownProcesses);
+  const samples = [
+    [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, null), pollingRow(200, 1)],
+    [pollingRow(101, 1, pollingExecutable, 'Sun Oct 4 03:00:00 2026'), pollingRow(200, 1)],
+    [pollingRow(200, 1)],
+  ];
+  let reads = 0, elapsed = 0;
+  assert.equal(await runner.waitForProductionUpdateSuccessor(input, {
+    readProcesses: () => { assert.ok(reads < samples.length); return samples[reads++]; },
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; },
+  }), 200);
+  assert.equal(reads, 3, 'the orphaned reused PID cannot be silently dropped from pending');
+  assert.equal(elapsed, 600);
+  assert.deepEqual(input.knownProcesses, before);
+});
+
+test('persistent post-Install uncertainty exhausts the original fixed 180-second timeout', async () => {
+  for (const unresolved of ['exec', 'orphan']) {
+    const input = pollingFixture(), before = new Map(input.knownProcesses);
+    let elapsed = 0, reads = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessor(input, {
+      readProcesses: () => {
+        reads += 1;
+        if (unresolved === 'exec') return [pollingRow(100, 1, '<defunct>'), pollingRow(200, 1)];
+        return reads === 1
+          ? [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, null), pollingRow(200, 1)]
+          : [pollingRow(101, 1), pollingRow(200, 1)];
+      },
+      now: () => elapsed, sleep: async milliseconds => { assert.equal(milliseconds, 300); elapsed += milliseconds; },
+    }), error => error.updateStage === 'updater_relaunch' && error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED');
+    assert.equal(elapsed, 180000);
+    assert.equal(reads, 600);
+    assert.deepEqual(input.knownProcesses, before);
+  }
+});
+
+test('post-Install malformed evidence and inventory failures remain fatal without entering the pending timer', async () => {
+  const cases = [
+    { knownProcesses: new Map([[100, null]]) },
+    { predecessorProcesses: new Map([[100, null]]) },
+    { readProcesses: () => [pollingRow(100, 1), pollingRow(100, 1)] },
+    { readProcesses: () => [{ ...pollingRow(100, 1), parent: null }] },
+    { readProcesses: () => [pollingRow(100, 1, 'malformed\0command')] },
+    { readProcesses: () => [pollingRow(100, 1, pollingExecutable, {})] },
+    { readProcesses: () => { throw new Error('private unexpected inventory failure'); } },
+  ];
+  for (const { readProcesses = () => [pollingRow(100, 1)], ...patch } of cases) {
+    let sleeps = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessor({ ...pollingFixture(), ...patch }, {
+      readProcesses, now: () => 0, sleep: async () => { sleeps += 1; assert.fail('fatal state must not wait'); },
+    }), error => ['process_identity', 'process_inventory', 'predecessor_process_identity'].includes(error.transitionStage ?? error.updateStage)
+      && !error.message.includes('private'));
+    assert.equal(sleeps, 0);
+  }
+});
 test('replacement verification refreshes the real ASAR path cache after an updater swaps bytes', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-asar-replacement-')));
   const app = join(directory, 'TiboTattle.app'), resource = join(app, 'Contents', 'Resources');

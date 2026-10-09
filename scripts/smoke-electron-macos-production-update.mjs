@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validateSparkleTransitionHost, captureMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
+import { validateSparkleTransitionHost, captureMacTransitionProcesses, observeMacTransitionProcesses, stopVerifiedMacTransitionProcesses,
   assertExtractedSignedMacBundle, verifySparkleTransitionCandidate, signedMacTransitionEnvironment,
   selectMacTransitionApplicationProcess, readMacTransitionProcesses, macTransitionProcessFingerprint,
   normalizeMacTransitionProcessStart } from './smoke-electron-macos-sparkle-transition.mjs';
@@ -183,9 +183,9 @@ async function fetchBytes(url, limit, github = false) {
   }
   fail('download_redirect');
 }
-async function until(check, timeout, stage) {
-  const deadline = Date.now() + timeout;
-  do { const result = await check(); if (result) return result; await new Promise(r => setTimeout(r, 300)); } while (Date.now() < deadline);
+async function until(check, timeout, stage, { now = Date.now, sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)) } = {}) {
+  const deadline = now() + timeout;
+  do { const result = await check(); if (result) return result; await sleep(300); } while (now() < deadline);
   fail(stage);
 }
 export function selectProductionUpdateSuccessor(rows, executable, predecessorPid, predecessorProcesses) {
@@ -228,6 +228,19 @@ export function requestProductionUpdateInstall({ appPath, predecessorPid, knownP
   const request = install();
   request.catch(() => {}); // The predecessor can exit before its CDP response.
   return predecessorProcesses;
+}
+export async function waitForProductionUpdateSuccessor({ appPath, predecessorPid, knownProcesses, predecessorProcesses, currentRoute }, {
+  readProcesses = productionUpdateProcesses, now = Date.now, sleep,
+} = {}) {
+  const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
+  const select = currentRoute ? selectCurrentProductionUpdateSuccessor : selectProductionUpdateSuccessor;
+  select([], executable, predecessorPid, predecessorProcesses); // Malformed frozen evidence is fatal even while observation is pending.
+  const unresolvedPids = new Set();
+  return until(() => {
+    const observation = observeMacTransitionProcesses(appPath, predecessorPid, knownProcesses, { readProcesses, unresolvedPids });
+    if (observation.pending) return null;
+    return select(observation.rows, executable, predecessorPid, predecessorProcesses)?.pid ?? null;
+  }, 180000, 'updater_relaunch', { now, sleep });
 }
 // v3 only: the verified 026 reader can admit its exact live v11 while the
 // successor migrates a staging clone. The runner never opens a writable handle.
@@ -494,12 +507,7 @@ export async function runProductionUpdate(options) {
       install: () => active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()') });
     proof.installUpdateInvoked = true;
     stage = 'successor_process_poll';
-    const successor = await until(() => {
-      captureMacTransitionProcesses(app, oldPid, knownProcesses);
-      const rows = productionUpdateProcesses(currentRoute ? predecessorProcesses : null);
-      return (currentRoute ? selectCurrentProductionUpdateSuccessor : selectProductionUpdateSuccessor)(
-        rows, verified.executable, oldPid, predecessorProcesses)?.pid ?? null;
-    }, 180000, 'updater_relaunch');
+    const successor = await waitForProductionUpdateSuccessor({ appPath: app, predecessorPid: oldPid, knownProcesses, predecessorProcesses, currentRoute });
     proof.successorPIDObserved = true; proof.successorWasPreexistingProcess = predecessorProcesses.has(successor);
     if (currentRoute) proof.predecessorProcessesExitedNaturally = true;
     stage = 'successor_archive_verification';
