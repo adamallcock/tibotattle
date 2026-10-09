@@ -458,8 +458,16 @@ async function readEligiblePreference(readPreference, origin) {
   let value;
   try {
     value = await readPreference();
-  } catch {
-    fail("preference_unavailable");
+  } catch (error) {
+    // A protected preference read can overlap another channel operation. Only
+    // its explicit availability failure requests a later pass; missing policy,
+    // permanent refusals and unknown errors still stop this pass permanently.
+    let retryable = false;
+    try {
+      retryable = error?.code === "contribution_device_credential_unavailable"
+        && error?.retryable === true;
+    } catch { /* Unknown error accessors cannot grant retryability. */ }
+    fail("preference_unavailable", { retryable });
   }
   assertEligiblePreference(value, origin);
 }
