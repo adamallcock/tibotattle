@@ -584,49 +584,53 @@ function microsecondsOf(value: unknown, nullable: boolean): number | null {
  * receipt except counts.
  */
 export async function readAnalyticsV2Exclusions(context: AnalyticsV2SnapshotContext): Promise<AnalyticsV2Exclusions> {
-  const s = quotedSchema(context.schema);
-  return onReadSnapshot(context, async (client) => {
-    const present = await client.query<{ present: unknown }>(analyticsV2Statement("exclusions.read",
-      "SELECT to_regclass($1) IS NOT NULL AS present"), [`${s}.community_aggregate_exclusions`]);
-    if (present.rows[0]?.present !== true) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
-    const result = await client.query<Record<string, unknown>>(analyticsV2Statement("exclusions.read",
-      `SELECT exclusion_id, participant_id, scope, state,
-              (extract(epoch FROM effective_at) * 1000000)::bigint::text AS effective_at_us,
-              (extract(epoch FROM expires_at) * 1000000)::bigint::text AS expires_at_us
-         FROM ${s}.community_aggregate_exclusions
-        ORDER BY exclusion_id COLLATE "C" LIMIT $1`), [MAX_ANALYTICS_V2_EXCLUSIONS + 1]);
-    if (result.rows.length > MAX_ANALYTICS_V2_EXCLUSIONS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
-    const rows: AnalyticsV2ExclusionRow[] = [];
-    const activeByParticipant = new Map<string, AnalyticsV2ExclusionInterval[]>();
-    for (const row of result.rows) {
-      if (typeof row.exclusion_id !== "string" || !EXCLUSION_ID.test(row.exclusion_id)
-          || typeof row.participant_id !== "string" || row.participant_id.length === 0
-          || row.participant_id.length > 200) {
-        sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
-      }
-      if (row.scope !== ANALYTICS_V2_EXCLUSION_SCOPE
-          || !(ANALYTICS_V2_EXCLUSION_STATES as readonly unknown[]).includes(row.state)) {
-        sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-      }
-      const effectiveAtUs = microsecondsOf(row.effective_at_us, false)!;
-      const expiresAtUs = microsecondsOf(row.expires_at_us, true);
-      if (expiresAtUs !== null && expiresAtUs <= effectiveAtUs) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-      rows.push(Object.freeze({ exclusionId: row.exclusion_id as string, participantId: row.participant_id as string,
-        scope: row.scope as string, state: row.state as string, effectiveAtUs, expiresAtUs }));
-      if (row.state !== "active") continue;
-      const intervals = activeByParticipant.get(row.participant_id as string) ?? [];
-      intervals.push(Object.freeze({ effectiveAtUs, expiresAtUs }));
-      activeByParticipant.set(row.participant_id as string, intervals);
+  return onReadSnapshot(context, client => readAnalyticsV2ExclusionsFromClient(client, context.schema));
+}
+
+/** The same validated reader on an already-open read snapshot; never opens a second transaction. */
+export async function readAnalyticsV2ExclusionsFromClient(client: PostgresClient,
+  schema: string): Promise<AnalyticsV2Exclusions> {
+  const s = quotedSchema(schema);
+  const present = await client.query<{ present: unknown }>(analyticsV2Statement("exclusions.read",
+    "SELECT to_regclass($1) IS NOT NULL AS present"), [`${s}.community_aggregate_exclusions`]);
+  if (present.rows[0]?.present !== true) sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
+  const result = await client.query<Record<string, unknown>>(analyticsV2Statement("exclusions.read",
+    `SELECT exclusion_id, participant_id, scope, state,
+            (extract(epoch FROM effective_at) * 1000000)::bigint::text AS effective_at_us,
+            (extract(epoch FROM expires_at) * 1000000)::bigint::text AS expires_at_us
+       FROM ${s}.community_aggregate_exclusions
+      ORDER BY exclusion_id COLLATE "C" LIMIT $1`), [MAX_ANALYTICS_V2_EXCLUSIONS + 1]);
+  if (result.rows.length > MAX_ANALYTICS_V2_EXCLUSIONS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
+  const rows: AnalyticsV2ExclusionRow[] = [];
+  const activeByParticipant = new Map<string, AnalyticsV2ExclusionInterval[]>();
+  for (const row of result.rows) {
+    if (typeof row.exclusion_id !== "string" || !EXCLUSION_ID.test(row.exclusion_id)
+        || typeof row.participant_id !== "string" || row.participant_id.length === 0
+        || row.participant_id.length > 200) {
+      sourceFail("ANALYTICS_V2_SOURCE_UNAVAILABLE");
     }
-    if (new Set(rows.map((row) => row.exclusionId)).size !== rows.length) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
-    const frozen = new Map<string, readonly AnalyticsV2ExclusionInterval[]>();
-    for (const [participantId, intervals] of activeByParticipant) frozen.set(participantId, Object.freeze(intervals));
-    return Object.freeze({
-      rows: rows.length,
-      active: rows.filter((row) => row.state === "active").length,
-      sha256: await analyticsV2ExclusionsSha256(rows),
-      activeByParticipant: frozen,
-    });
+    if (row.scope !== ANALYTICS_V2_EXCLUSION_SCOPE
+        || !(ANALYTICS_V2_EXCLUSION_STATES as readonly unknown[]).includes(row.state)) {
+      sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    }
+    const effectiveAtUs = microsecondsOf(row.effective_at_us, false)!;
+    const expiresAtUs = microsecondsOf(row.expires_at_us, true);
+    if (expiresAtUs !== null && expiresAtUs <= effectiveAtUs) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+    rows.push(Object.freeze({ exclusionId: row.exclusion_id as string, participantId: row.participant_id as string,
+      scope: row.scope as string, state: row.state as string, effectiveAtUs, expiresAtUs }));
+    if (row.state !== "active") continue;
+    const intervals = activeByParticipant.get(row.participant_id as string) ?? [];
+    intervals.push(Object.freeze({ effectiveAtUs, expiresAtUs }));
+    activeByParticipant.set(row.participant_id as string, intervals);
+  }
+  if (new Set(rows.map((row) => row.exclusionId)).size !== rows.length) sourceFail("ANALYTICS_V2_SOURCE_CONFLICT");
+  const frozen = new Map<string, readonly AnalyticsV2ExclusionInterval[]>();
+  for (const [participantId, intervals] of activeByParticipant) frozen.set(participantId, Object.freeze(intervals));
+  return Object.freeze({
+    rows: rows.length,
+    active: rows.filter((row) => row.state === "active").length,
+    sha256: await analyticsV2ExclusionsSha256(rows),
+    activeByParticipant: frozen,
   });
 }
 

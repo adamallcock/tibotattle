@@ -20,7 +20,8 @@
  *   BACKEND_STORAGE_UNAVAILABLE;
  * - each payload is served in production's canonical key order with
  *   capacityByPlanType removed, apiEquivalentSpend removed unless it is
- *   current-price evidence matching totals.usageEvents, and allowance always
+ *   current-price evidence matching totals.usageEvents or the exact kernel-10
+ *   historical publication contract described below, and allowance always
  *   removed (typed storage never has a current daily allowance publication);
  * - allowanceBreakdowns is the vendored projectPublicAllowanceGraph over the
  *   stored admin preview, served as community-allowance-breakdowns-v1.3
@@ -67,6 +68,12 @@
  * origin mode, and construction throws in every other mode.
  *
  * This module never logs, and its responses carry aggregates only.
+ * Historical spend continuity preserves the published v0.5 amount, registry,
+ * date and revision. Its manifest-1 kernel-10 head must reference a completed
+ * matching run and the bundled exact kernel identity. The run's exclusion
+ * digest must match the validated current exclusions in this same snapshot.
+ * Unknown or unavailable proof withholds the old block; it never makes it
+ * current pricing or changes the stored publication or membership.
  */
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
@@ -99,6 +106,9 @@ import {
 } from "./cache-windows-sql";
 import { compiledBaselineCatalogManifest } from "../postgres-catalog-store";
 import { ANALYTICS_V2_SINGLETON_ID, ANALYTICS_V2_TABLES, type OriginRouteModule } from "./contract";
+import { analyticsV2KernelRegistry } from "./kernel";
+import { readAnalyticsV2ExclusionsFromClient } from "./owners";
+import { isKernel10PublishedDailyPayload } from "./published-spend-compatibility";
 import {
   INTERIM_PUBLIC_READ_ROW_ID,
   INTERIM_PUBLIC_READ_TABLE,
@@ -180,6 +190,7 @@ interface StoredDailyRow {
 
 interface StoredRead {
   readonly rows: readonly StoredDailyRow[];
+  readonly historicalSpendDays: ReadonlySet<string>;
   /** The preview's jsonb text, null when absent, or undefined when its read failed. */
   readonly previewText: string | null | undefined;
   /** The cache windows, or null when their read failed. */
@@ -336,7 +347,7 @@ async function readStored(
     if (interim !== null) {
       // The frozen answer is the export alone: this line's own preview and
       // cache bands are not mixed into it.
-      return { rows: daily.rows, previewText: null, cacheWindows: null, interim };
+      return { rows: daily.rows, historicalSpendDays: new Set<string>(), previewText: null, cacheWindows: null, interim };
     }
     const preview = await optionalRead(client, "analytics_v2_preview_read", async () => {
       const result = await client.query<{ preview_text: unknown }>(previewSql(schema));
@@ -347,8 +358,36 @@ async function readStored(
     });
     const cacheWindows = await optionalRead(client, "analytics_v2_cache_read",
       () => readAnalyticsV2CacheWindowRows(client, schema, nowMs));
+    // Only the pinned historical shape needs this optional proof. A failure
+    // withholds that old block without changing the strict current-price path.
+    const historicalDays = daily.rows.filter(row => {
+      try { return typeof row.payload_text === "string" && isKernel10PublishedDailyPayload(JSON.parse(row.payload_text)); }
+      catch { return false; }
+    }).map(row => row.day);
+    const historicalSpendDays = historicalDays.length === 0 ? undefined
+      : await optionalRead(client, "analytics_v2_historical_spend", async () => {
+        const kernel = analyticsV2KernelRegistry()[9]!;
+        const heads = await client.query<{ day: string; exclusions_sha256: unknown }>(
+          `SELECT to_char(p.day, 'YYYY-MM-DD') AS day, r.exclusions_sha256::text AS exclusions_sha256
+             FROM ${table(schema, ANALYTICS_V2_TABLES.publishedDaily)} p
+             JOIN ${table(schema, ANALYTICS_V2_TABLES.runs)} r ON r.run_id = p.run_id
+             JOIN ${table(schema, ANALYTICS_V2_TABLES.kernels)} k ON k.kernel_id = p.kernel_id
+            WHERE p.day = ANY($1::date[]) AND p.kernel_id = 10 AND p.manifest_version = 1
+              AND r.state = 'complete' AND r.kernel_id = 10 AND r.manifest_version = 1
+              AND k.production_commit = $2 AND k.vendor_manifest_sha256 = $3
+              AND k.compute_closure_sha256 = $4 AND k.price_registry_sha256 = $5
+              AND k.price_registry_version = $6 AND k.method_version = $7
+            ORDER BY p.day LIMIT $8`,
+          [historicalDays, kernel.productionCommit, kernel.vendorManifestSha256, kernel.computeClosureSha256,
+            kernel.priceRegistrySha256, kernel.priceRegistryVersion, kernel.methodVersion,
+            ANALYTICS_V2_COMMUNITY_DAILY_MAX_RANGE_DAYS + 1]);
+        if (heads.rows.length > ANALYTICS_V2_COMMUNITY_DAILY_MAX_RANGE_DAYS) throw new Error("historical spend shape");
+        const exclusions = await readAnalyticsV2ExclusionsFromClient(client, schema);
+        return new Set(heads.rows.filter(row => row.exclusions_sha256 === exclusions.sha256).map(row => row.day));
+      });
     return {
       rows: daily.rows,
+      historicalSpendDays: historicalSpendDays ?? new Set<string>(),
       previewText: preview,
       cacheWindows: cacheWindows ?? null,
       interim: null,
@@ -455,8 +494,8 @@ function composedCacheRetention(windows: readonly AnalyticsV2CacheWindowRows[] |
   }
 }
 
-/** Remove the private and non-current fields exactly as production does. */
-function publicDayPayload(day: PublishedDay): void {
+/** Remove private fields; retain current spend or independently proven historical spend. */
+function publicDayPayload(day: PublishedDay, historicalSpendDays: ReadonlySet<string>): void {
   if (typeof day.payload !== "object" || day.payload === null || Array.isArray(day.payload)) return;
   const publicPayload = { ...day.payload as Record<string, unknown> };
   // The old diagnostic shape remains private. Only the separate validated
@@ -466,7 +505,9 @@ function publicDayPayload(day: PublishedDay): void {
   const totals = publicPayload.totals;
   if (!isCurrentCommunityDailySpend(spend) || !totals || typeof totals !== "object"
       || Array.isArray(totals) || (totals as Record<string, unknown>).usageEvents !== spend.usageEvents) {
-    delete publicPayload.apiEquivalentSpend;
+    if (!historicalSpendDays.has(day.day) || !isKernel10PublishedDailyPayload(day.payload)) {
+      delete publicPayload.apiEquivalentSpend;
+    }
   }
   // Typed storage carries no current daily allowance publication, so the
   // per-day allowance block is never public (production dailyAllowanceReady
@@ -588,7 +629,7 @@ export function createAnalyticsV2CommunityDailyRoute(
     const allowanceState = graph !== null ? "ready" : "updating";
     const allowanceBreakdowns = graph === null ? null
       : wrapPublicAllowanceBreakdownsV13(graph.breakdowns, modelMetadata);
-    for (const day of days) publicDayPayload(day);
+    for (const day of days) publicDayPayload(day, read.historicalSpendDays);
     const cacheRetention = publishableAnalyticsV2CacheRetentionSeries(
       composedCacheRetention(read.cacheWindows),
     );

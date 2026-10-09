@@ -207,6 +207,20 @@ of retained-data eligibility. See the
 for source identity, overlap and activation gates. Legacy sealed weekly
 snapshots keep their original transport and cohort policy.
 
+The GCP analytics-v2 daily reader also preserves previously published spend
+under one pinned historical contract: kernel 10, manifest 1, aggregate and
+policy v1.0, pricing method `server-api-price-equivalent-v0.5`, and registry
+`48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9`.
+The block retains its original amount, versions, publication date and revision;
+it is historical pricing pending a separate membership-preserving repricing
+workflow. Closed fields, count conservation, coverage and cost semantics,
+the payload digest, the exact registered kernel identity and the head's own
+completed run are required. That run's exclusion digest must match validated
+current exclusions in the same repeatable-read snapshot. Missing or conflicting
+proof withholds historical spend. The strict current-price validator and its
+read path are unchanged. This compatibility path does not publish, recompute,
+restamp or modify any stored head, contribution, membership or exclusion.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,
