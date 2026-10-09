@@ -10,7 +10,7 @@ on:
         default: plan
         required: true
       intake:
-        description: Closed final-artifact intake including original sourceCandidate and exact successful package run and byte identities
+        description: Closed intake v1 (027) or v2 (028), with original sourceCandidate and exact successful package run and byte identities
         type: string
         required: true
       confirmation:

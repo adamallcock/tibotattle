@@ -10,7 +10,7 @@ import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-li
 import { cleanupLinuxMountDiagnosis, runLinuxNativeAppArmorComparison } from './diagnose-electron-linux-appimage-mount.mjs';
 import { validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
 import { LINUX_FINAL_INPUT, exactKeys, preflightLinuxFinalIntake, validateLinuxFinalPair,
-  linuxFinalFailure as fail, sha256 } from './lib/linux-final-artifact-intake.mjs';
+  linuxFinalFailure as fail, resolveLinuxFinalRelease, sha256 } from './lib/linux-final-artifact-intake.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const INPUT = join(ROOT, LINUX_FINAL_INPUT), RECEIPTS = join(INPUT, 'receipts');
@@ -58,10 +58,11 @@ export function linuxFinalHostCleanupArguments({ id, inspected }, owner) {
   return ['rm', '--force', id];
 }
 
-/** Admit only the established runtime schema, preserving its original bytes.
+/** Admit only the runtime schema bound to this release, preserving original bytes.
  * Host/comparison closure is separate; it cannot fill missing runtime flags. */
 export function validateLinuxFinalLifecycleReceipt(value, pair) {
-  const required = { schemaVersion: 'tibotattle-linux-final-installed-lifecycle-v1',
+  let release; try { release = resolveLinuxFinalRelease(pair?.intake); } catch { return null; }
+  const required = { schemaVersion: release.lifecycleSchema,
     sourceRevision: pair.intake.sourceRevision, workflowRunnerRevision: pair.intake.runnerRevision,
     sourceCandidateSha256: pair.intake.sourceCandidateSha256, packageReceiptSha256: pair.intake.packageReceiptSha256,
     packageRunId: pair.intake.packageRunId, version: pair.intake.version, buildNumber: pair.intake.buildNumber,
@@ -76,7 +77,7 @@ export function validateLinuxFinalLifecycleReceipt(value, pair) {
     || !Object.entries(required).every(([key, expected]) => isDeepStrictEqual(value[key], expected))
     || !['passed', 'failed'].includes(value.status)
     || lifecycleFlags.some(key => Object.hasOwn(value, key) && typeof value[key] !== 'boolean')) return null;
-  if (Object.hasOwn(value, 'publicPredecessorUpdate') && value.publicPredecessorUpdate !== 'exact_published_0.1.26_to_final_0.1.27') return null;
+  if (Object.hasOwn(value, 'publicPredecessorUpdate') && value.publicPredecessorUpdate !== release.publicPredecessorUpdate) return null;
   if (Object.hasOwn(value, 'updateInitiation') && (!exactKeys(value.updateInitiation, ['check', 'download'])
     || !Object.values(value.updateInitiation).every(item => ['automatic', 'settings_button'].includes(item)))) return null;
   if (['feedRequests', 'imageRequests'].some(key => Object.hasOwn(value, key)
@@ -84,7 +85,7 @@ export function validateLinuxFinalLifecycleReceipt(value, pair) {
   if (Object.hasOwn(value, 'startupDiagnostic') && validateLinuxStartupDiagnostic(value.startupDiagnostic) === null) return null;
   if (value.status === 'passed') {
     if (!lifecycleFlags.every(key => value[key] === true) || !value.updateInitiation
-      || value.publicPredecessorUpdate !== 'exact_published_0.1.26_to_final_0.1.27'
+      || value.publicPredecessorUpdate !== release.publicPredecessorUpdate
       || !(value.feedRequests >= 1) || !(value.imageRequests >= 2)
       || ['stage', 'errorCode', 'startupDiagnostic'].some(key => Object.hasOwn(value, key))) return null;
   } else if (!lifecycleStages.has(value.stage)

@@ -11,7 +11,7 @@ on:
         default: false
         type: boolean
       qualify_upgrade:
-        description: Replace the pinned published predecessor with these exact final signed bytes
+        description: Replace pinned 0.1.26 with exact signed 0.1.27 (2026100301) or 0.1.28 (2026100901) bytes
         required: false
         default: false
         type: boolean

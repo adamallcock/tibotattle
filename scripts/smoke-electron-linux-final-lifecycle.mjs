@@ -20,7 +20,7 @@ import { proveLinuxSecretServiceContainerIsolation, startLinuxSecretServiceDaemo
 import { readLocalCollectorCheckpoint } from '../src/local-collector-state.js';
 import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
 import { readLinuxMountRuntimeFacts, sampleLinuxMountProbeFacts } from './diagnose-electron-linux-appimage-mount.mjs';
-import { LINUX_FINAL_INPUT, LINUX_FINAL_FEED, validateLinuxFinalPair, linuxFinalFailure as fail } from './lib/linux-final-artifact-intake.mjs';
+import { LINUX_FINAL_INPUT, LINUX_FINAL_FEED, validateLinuxFinalPair, resolveLinuxFinalRelease, linuxFinalFailure as fail } from './lib/linux-final-artifact-intake.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const LINUX_FINAL_EXEC = '/opt/tibotattle-updater-exec';
@@ -538,7 +538,8 @@ export async function runLinuxFinalLifecycle() {
     }
     unexpectedRequests++; response.writeHead(404).end();
   });
-  const receipt = { schemaVersion: 'tibotattle-linux-final-installed-lifecycle-v1',
+  const release = resolveLinuxFinalRelease(pair.intake);
+  const receipt = { schemaVersion: release.lifecycleSchema,
     sourceRevision: pair.intake.sourceRevision, workflowRunnerRevision: pair.intake.runnerRevision,
     sourceCandidateSha256: pair.intake.sourceCandidateSha256, packageReceiptSha256: pair.intake.packageReceiptSha256,
     packageRunId: pair.intake.packageRunId, version: pair.intake.version, buildNumber: pair.intake.buildNumber,
@@ -662,7 +663,7 @@ export async function runLinuxFinalLifecycle() {
     await stopLinuxFinalOwnedApp(successor, temporary);
     if (child) { await terminateLinuxSmokeChild(child).catch(() => {}); child = null; }
     dashboard.close(); dashboard = null; settings.close(); settings = null;
-    receipt.publicPredecessorUpdate = 'exact_published_0.1.26_to_final_0.1.27';
+    receipt.publicPredecessorUpdate = release.publicPredecessorUpdate;
     receipt.replacementAndAutomaticRestartVerified = true;
     stage = 'cold_restart_no_update';
     await runNormal(upgradeFixture, verifyLinuxNormalPackagedRestartPreferences, async () => {

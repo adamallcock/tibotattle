@@ -44,6 +44,9 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   // Successor to the published 0.1.26 release on both Mac architectures.
   // Allocation remains separate from candidate provenance and release proof.
   "0.1.27": Object.freeze({ stable: "1035" }),
+  // Replacement includes new source and dependency fixes; never reuse 0.1.27
+  // artifacts or receipts. Timestamp provenance remains independently bound.
+  "0.1.28": Object.freeze({ stable: "1036" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

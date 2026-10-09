@@ -14,7 +14,7 @@ import { runWindowsSignedInstalled, assertWindowsSignedInstalledPath,
   verifyWindowsSignedInstalledSignature } from './smoke-electron-windows-signed-installed.mjs';
 import { runWindowsNsisLifecycleProgram } from './smoke-electron-windows-nsis-lifecycle.mjs';
 import { WINDOWS_FINAL_UPGRADE_PREDECESSOR_FILE, parseWindowsFinalUpgradeMode,
-  validateWindowsFinalUpgradePredecessorManifest, runWindowsFinalUpgrade } from './smoke-electron-windows-final-upgrade.mjs';
+  validateWindowsFinalUpgradePredecessorManifest, resolveWindowsFinalUpgradeSuccessor, runWindowsFinalUpgrade } from './smoke-electron-windows-final-upgrade.mjs';
 
 const env = process.env;
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -109,7 +109,7 @@ async function main() {
     assert.equal(receipt.sourceCandidateSha256, candidateComparison.sha256);
     console.log('WINDOWS_FROZEN_INSTALLED_QUALIFIED'); return;
   }
-  assert.equal(candidate.version, '0.1.27');
+  resolveWindowsFinalUpgradeSuccessor(candidate);
   const predecessorRoot = join(scratch, 'predecessor'); await mkdir(predecessorRoot);
   // Read-only immutable GitHub release verification is separate from native
   // Authenticode. No stable feed, caller URL, rebuild or signature replacement.

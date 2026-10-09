@@ -8,7 +8,8 @@ version labels; it does not imply API stability before 1.0.
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
   date on which the public GitHub Release was published, except the explicitly
-  marked, unpublished 0.1.25 tagged candidate, whose date is its source freeze.
+  marked, unpublished 0.1.25 and 0.1.27 tagged candidates, whose dates are their
+  source freezes.
 - Every released entry links to the public GitHub Release, its exact source
   revision, and the comparison with the preceding release source. Stable tags
   are annotated except for the protected historical v0.1.10 anomaly recorded
@@ -36,11 +37,28 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No unreleased changes.
+[0.1.28 candidate notes](./release-notes/0.1.28.md) cover the complete change
+from the published 0.1.26 release. Publication is pending all four platform
+artifacts and their qualification.
 
-## [0.1.27](./release-notes/0.1.27.md) - 2026-10-05
+- Carry forward GPT-6.1 Sol, Ultrafast, Pro 10× and Pro Max 25× support from
+  the unpublished 0.1.27 candidate.
+- Separate explicitly identified auto-review usage from the main allowance
+  from October 6, 2026 (UTC), preserving earlier charges, token counts,
+  API-price evidence and Spark's own measured allowance.
+- Preserve absent archive evidence and stable replay identities during the
+  local parser upgrade; admit the new local format in the attribution reader.
+- Retry temporary startup sharing contention and remove obsolete build
+  download dependencies.
 
-**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.27) ·
+
+## [0.1.27](./release-notes/0.1.27.md) - 2026-10-04
+
+**Status:** Tagged and signed candidate only. No public GitHub Release or
+stable update was published. Its source and artifact evidence remain frozen;
+0.1.28 carries its changes forward from the published 0.1.26 release.
+
+**Provenance:** [GitHub release location (unpublished)](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.27) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.27) ·
 [changes since v0.1.26](https://github.com/adamallcock/tibotattle/compare/v0.1.26...v0.1.27)
 

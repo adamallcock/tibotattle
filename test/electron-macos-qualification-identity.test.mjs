@@ -36,10 +36,11 @@ test('future successor derives from package version and reviewed allocation with
     { reason: 'bundle_allocation' });
 });
 
-test('0.1.27 admission binds the reviewed allocation and independent provenance on both Mac architectures', () => {
+for (const [version, bundleVersion, buildNumber] of [['0.1.27', '1035', '2026100301'],
+  ['0.1.28', '1036', '2026100901']]) test(`${version} admission binds reviewed allocation and independent provenance on both Mac architectures`, () => {
   for (const target of ['darwin-arm64', 'darwin-x64']) {
-    const selected = { ...identity, target, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' };
-    const selectedContext = { ...context(selected), packageVersion: '0.1.27', sourceVersion: '0.1.27',
+    const selected = { ...identity, target, version, bundleVersion, buildNumber };
+    const selectedContext = { ...context(selected), packageVersion: version, sourceVersion: version,
       resolveBundleVersion: resolveSignedMacOSBundleVersion };
     assert.deepEqual(deriveMacOSQualificationIdentity(selectedContext), selected);
     assert.deepEqual(assertMacOSQualificationIdentity(selected, selectedContext), selected);
@@ -159,15 +160,18 @@ test('all six actual workflow admissions accept a synthetic future release and r
   }
 });
 
-test('both production-update workflow admissions accept only the closed 026 to 027 v2 route', async t => {
-  const fixture = await repository({ version: '0.1.27', bundleVersion: '1035' });
+for (const [schemaVersion, version, bundleVersion, buildNumber] of [
+  ['tibotattle-production-electron-update-intake-v2', '0.1.27', '1035', '2026100301'],
+  ['tibotattle-production-electron-update-intake-v3', '0.1.28', '1036', '2026100901'],
+]) test(`both production-update workflow admissions bind the closed ${schemaVersion} route`, async t => {
+  const fixture = await repository({ version, bundleVersion });
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
   const workflow = await readFile(new URL('../.github/workflows/electron-macos-production-update.yml', import.meta.url), 'utf8');
   const admissions = [...workflow.matchAll(/node --input-type=module <<'ADMISSION'\n([\s\S]*?)          ADMISSION/gu)];
   assert.equal(admissions.length, 2);
   for (const [index, target] of ['darwin-arm64', 'darwin-x64'].entries()) {
-    const selected = { version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301', sourceRevision: fixture.revision, target };
-    const intake = { ...selected, schemaVersion: 'tibotattle-production-electron-update-intake-v2',
+    const selected = { version, bundleVersion, buildNumber, sourceRevision: fixture.revision, target };
+    const intake = { ...selected, schemaVersion,
       dmgSha256: 'b'.repeat(64), asarSha256: 'c'.repeat(64), zipSha256: 'd'.repeat(64),
       feedSha256: 'e'.repeat(64), predecessorAsarSha256: 'f'.repeat(64) };
     const output = join(fixture.root, target + '-v2-admission.txt');
@@ -178,8 +182,9 @@ test('both production-update workflow admissions accept only the closed 026 to 0
           SELECTED_IDENTITY: JSON.stringify({ ...intake, ...patch, sourceCandidate }) } });
     run();
     assert.equal(await readFile(output, 'utf8'), `identity=${JSON.stringify(intake)}\n`);
-    for (const patch of [{ schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, { schemaVersion: 'toString' },
-      { version: '0.1.26', bundleVersion: '1034' }, { version: '0.1.28', bundleVersion: '1036' }, { bundleVersion: '1034' },
+    for (const patch of [{ schemaVersion: version === '0.1.27' ? 'tibotattle-production-electron-update-intake-v3' : 'tibotattle-production-electron-update-intake-v2' },
+      { schemaVersion: 'toString' }, { version: '0.1.26', bundleVersion: '1034' },
+      { version: version === '0.1.27' ? '0.1.28' : '0.1.27', bundleVersion: version === '0.1.27' ? '1036' : '1035' }, { bundleVersion: '1034' },
       { buildNumber: '2026092701' }, { sourceRevision: 'f'.repeat(40) }, { predecessorVersion: '0.1.20' },
       { predecessorUrl: 'https://example.invalid/old.dmg' }, { feedUrl: 'https://example.invalid/feed.yml' },
       { predecessorAsarSha256: 'private-value' }, { predecessorAsarSha256: undefined }]) assert.throws(() => run(patch));

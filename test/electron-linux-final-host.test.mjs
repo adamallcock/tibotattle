@@ -8,7 +8,7 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const profile = `tibotattle-mount-candidate-12345-${'a'.repeat(32)}`;
 const owner = { run: '12345', runner: 'b'.repeat(40), nonce: 'a'.repeat(32), profile,
   profileSha256: 'c'.repeat(64), profileNameSha256: hash(profile) };
-const pair = { intake: { sourceRevision: 'd'.repeat(40), runnerRevision: owner.runner,
+const pair = { intake: { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v1', sourceRevision: 'd'.repeat(40), runnerRevision: owner.runner,
   sourceCandidateSha256: 'e'.repeat(64), packageReceiptSha256: 'f'.repeat(64), packageRunId: '12340', version: '0.1.27', buildNumber: '2026100301' },
   images: { current: { sha256: '1'.repeat(64) }, next: { sha256: '2'.repeat(64) } } };
 const flags = ['cleanInstallSmokePassed', 'localRefreshAndCredentialAccess', 'chromiumRendererSandboxVerified',
@@ -75,6 +75,27 @@ test('only the original fully bound lifecycle v1 assertions can establish runtim
   assert.equal(validateLinuxFinalLifecycleReceipt(failed, pair), failed);
   assert.equal(failed.status, 'failed');
   assert.equal(validateLinuxFinalLifecycleReceipt({ ...failed, errorCode: 'private error message' }, pair), null);
+});
+
+test('028 lifecycle v2 requires its exact route and cannot consume or relabel a 027 v1 receipt', () => {
+  const selected = structuredClone(pair);
+  Object.assign(selected.intake, { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v2',
+    version: '0.1.28', buildNumber: '2026100901' });
+  const original = receipt();
+  assert.equal(validateLinuxFinalLifecycleReceipt(original, selected), null);
+  const replacement = { ...original, schemaVersion: 'tibotattle-linux-final-installed-lifecycle-v2',
+    version: '0.1.28', buildNumber: '2026100901', publicPredecessorUpdate: 'exact_published_0.1.26_to_final_0.1.28' };
+  assert.equal(validateLinuxFinalLifecycleReceipt(replacement, selected), replacement);
+  assert.equal(validateLinuxFinalLifecycleReceipt(replacement, pair), null);
+  for (const patch of [{ schemaVersion: original.schemaVersion }, { version: original.version },
+    { buildNumber: original.buildNumber }, { publicPredecessorUpdate: original.publicPredecessorUpdate },
+    { replacementAndAutomaticRestartVerified: false }, { physicalDesktop: 'qualified' }]) {
+    assert.equal(validateLinuxFinalLifecycleReceipt({ ...replacement, ...patch }, selected), null);
+  }
+  for (const patch of [{ schemaVersion: pair.intake.schemaVersion }, { version: '0.1.29' }, { buildNumber: '2026100902' }]) {
+    assert.equal(validateLinuxFinalLifecycleReceipt(replacement, { ...selected, intake: { ...selected.intake, ...patch } }), null);
+  }
+  assert.equal(validateLinuxFinalLifecycleReceipt(original, pair), original);
 });
 
 function hostHarness({ outcome = 'compared', lifecycleResult = null, handoff = true } = {}) {

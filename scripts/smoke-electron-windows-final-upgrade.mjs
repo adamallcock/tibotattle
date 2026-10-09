@@ -46,6 +46,18 @@ export const WINDOWS_FINAL_UPGRADE_PREDECESSOR = Object.freeze({
 });
 export const WINDOWS_FINAL_UPGRADE_PREDECESSOR_FILE = 'TiboTattle-0.1.26-Windows-x64.exe';
 const PREDECESSOR_RELEASE = 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/';
+const FINAL_SUCCESSORS = Object.freeze({
+  '0.1.27': Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
+    receiptSchema: 'tibotattle-windows-final-upgrade-v1' }),
+  '0.1.28': Object.freeze({ version: '0.1.28', buildNumber: '2026100901',
+    receiptSchema: 'tibotattle-windows-final-upgrade-v2' }),
+});
+export function resolveWindowsFinalUpgradeSuccessor({ version, buildNumber } = {}) {
+  const successor = typeof version === 'string' && Object.hasOwn(FINAL_SUCCESSORS, version)
+    ? FINAL_SUCCESSORS[version] : null;
+  if (!successor || buildNumber !== successor.buildNumber) fail('SUCCESSOR_INTAKE_INVALID');
+  return successor;
+}
 
 /** Caller-supplied URLs, alternative releases, extra fields and inferred versions
  * are not intake. A new predecessor needs its own reviewed public evidence. */
@@ -224,11 +236,13 @@ export async function runWindowsFinalUpgrade(options, {
     fail('DISPOSABLE_WINDOWS_REQUIRED');
   }
   const intake = validateOptions(options);
+  const successor = resolveWindowsFinalUpgradeSuccessor(options.candidate);
   await safePath(environment.RUNNER_TEMP, true);
   await safePath(win32.dirname(options.receiptPath), true);
   validateWindowsFinalUpgradePredecessorManifest(await boundedEvidence(options.predecessorManifestPath, 64 * 1024), intake);
   const receiptHandle = await open(options.receiptPath, 'wx', 0o600);
-  const receipt = { schemaVersion: 'tibotattle-windows-final-upgrade-v1', status: 'failed',
+  const receipt = { schemaVersion: successor.receiptSchema, status: 'failed',
+    ...(successor.version === '0.1.28' ? { version: successor.version, buildNumber: successor.buildNumber } : {}),
     sourceRevision: options.candidate.sourceRevision, installerSha256: options.candidate.installerSha256,
     predecessor: intake, referenceOrigin: 'extracted_from_exact_signed_installers',
     independentPreSigningStage: false, rebuilt: false, resigned: false, published: false,
@@ -265,7 +279,8 @@ export async function runWindowsFinalUpgrade(options, {
     for (const [key, selected] of [['predecessor', options.predecessor], ['candidate', options.candidate]]) {
       sourceBytes.set(key, await boundedEvidence(selected.sourceCandidatePath, 128 * 1024));
       const staged = JSON.parse((await boundedEvidence(win32.join(selected.stagedAppPath, 'package.json'), 128 * 1024)).toString('utf8'));
-      if (staged.version !== (key === 'predecessor' ? '0.1.26' : '0.1.27')
+      if (staged.version !== (key === 'predecessor' ? intake.version : successor.version)
+          || (key === 'candidate' && staged.tibotattleDistribution?.buildNumber !== successor.buildNumber)
           || staged.tibotattleDistribution?.sourceRevision !== selected.sourceRevision
           || staged.tibotattleDistribution?.target !== 'win32-x64') fail('PAIR_INVALID');
       if (await digest(selected.installerPath) !== selected.installerSha256) fail('INSTALLER_HASH_MISMATCH');

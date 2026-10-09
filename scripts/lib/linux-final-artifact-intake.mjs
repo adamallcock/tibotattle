@@ -8,6 +8,15 @@ import { productionElectronCandidatePlan } from '../package-electron-production.
 
 export const LINUX_FINAL_CONFIRMATION = 'RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE';
 export const LINUX_FINAL_SCHEMA = 'tibotattle-linux-final-lifecycle-intake-v1';
+export const LINUX_FINAL_SCHEMA_V2 = 'tibotattle-linux-final-lifecycle-intake-v2';
+const FINAL_RELEASES = Object.freeze({
+  [LINUX_FINAL_SCHEMA]: Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v1',
+    publicPredecessorUpdate: 'exact_published_0.1.26_to_final_0.1.27' }),
+  [LINUX_FINAL_SCHEMA_V2]: Object.freeze({ version: '0.1.28', buildNumber: '2026100901',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v2',
+    publicPredecessorUpdate: 'exact_published_0.1.26_to_final_0.1.28' }),
+});
 export const LINUX_FINAL_INPUT = '.release-build/linux-final-qualification';
 export const LINUX_FINAL_PREDECESSOR = Object.freeze({
   version: '0.1.26', sourceRevision: 'acfc385c95b49b8e1040cedfa857659b49a61d8d',
@@ -23,19 +32,31 @@ export const exactKeys = (value, keys) => value !== null && typeof value === 'ob
   && Object.keys(value).sort().join() === [...keys].sort().join();
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 
+/** Each intake and lifecycle schema retains its original release meaning. */
+export function resolveLinuxFinalRelease({ schemaVersion, version, buildNumber } = {}) {
+  const release = typeof schemaVersion === 'string' && Object.hasOwn(FINAL_RELEASES, schemaVersion)
+    ? FINAL_RELEASES[schemaVersion] : null;
+  if (!release || version !== release.version || buildNumber !== release.buildNumber) fail('INTAKE_INVALID');
+  return release;
+}
 export function validateLinuxFinalIntake(value) {
   const keys = ['schemaVersion', 'runnerRevision', 'sourceRevision', 'version', 'buildNumber',
     'packageRunId', 'packageRunnerRevision', 'sourceCandidateSha256', 'packageReceiptSha256',
     'artifactSha256', 'artifactBytes', 'asarSha256', 'executableSha256', 'sourceCandidate'];
-  if (!exactKeys(value, keys) || value.schemaVersion !== LINUX_FINAL_SCHEMA
-    || value.version !== '0.1.27' || value.buildNumber !== '2026100301'
+  if (!exactKeys(value, keys)
     || !['runnerRevision', 'sourceRevision', 'packageRunnerRevision'].every(k => SHA.test(value[k] ?? ''))
     || !['sourceCandidateSha256', 'packageReceiptSha256', 'artifactSha256', 'asarSha256', 'executableSha256'].every(k => HASH.test(value[k] ?? ''))
     || typeof value.packageRunId !== 'string' || !/^[1-9][0-9]{0,14}$/u.test(value.packageRunId)
     || !Number.isSafeInteger(value.artifactBytes) || value.artifactBytes < 4096 || value.artifactBytes > 1024 ** 3) fail('INTAKE_INVALID');
+  const release = resolveLinuxFinalRelease(value);
   const plan = productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision: value.sourceRevision,
     buildNumber: value.buildNumber, hostPlatform: 'linux', hostArchitecture: 'x64' });
-  if (!isDeepStrictEqual(value.sourceCandidate, { ...plan, status: 'production_source_staged',
+  // The closed historical route must not inherit the running checkout's newer
+  // marketing version. This only constructs the expected shape; no receipt is
+  // changed, and execute preflight still requires both Git manifests to match.
+  if (!isDeepStrictEqual(value.sourceCandidate, { ...plan, version: release.version,
+    builderEnvironment: { ...plan.builderEnvironment, TIBOTATTLE_ELECTRON_VERSION: release.version },
+    status: 'production_source_staged',
     stagedManifest: 'app/package.json', runtimeManifest: 'app/electron-runtime-manifest.json' })) fail('SOURCE_CANDIDATE_INVALID');
   return value;
 }

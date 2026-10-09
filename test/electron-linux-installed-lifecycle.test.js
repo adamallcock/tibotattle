@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { productionElectronCandidatePlan } from '../scripts/package-electron-production.mjs';
-import { LINUX_FINAL_SCHEMA, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
+import { LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
   validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
@@ -13,19 +13,21 @@ import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedReque
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
-function fixture() {
-  const source = { ...productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision: revision,
-    buildNumber: '2026100301', hostPlatform: 'linux', hostArchitecture: 'x64' }),
+function fixture({ schemaVersion = LINUX_FINAL_SCHEMA, version = '0.1.27', buildNumber = '2026100301' } = {}) {
+  const plan = productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision: revision,
+    buildNumber, hostPlatform: 'linux', hostArchitecture: 'x64' });
+  const source = { ...plan, version,
+    builderEnvironment: { ...plan.builderEnvironment, TIBOTATTLE_ELECTRON_VERSION: version },
     status: 'production_source_staged', stagedManifest: 'app/package.json', runtimeManifest: 'app/electron-runtime-manifest.json' };
   const sourceBytes = Buffer.from(JSON.stringify(source) + '\n');
-  const intake = { schemaVersion: LINUX_FINAL_SCHEMA, runnerRevision: runner, sourceRevision: revision,
-    packageRunId: '12345', packageRunnerRevision: packageRunner, version: '0.1.27', buildNumber: '2026100301',
+  const intake = { schemaVersion, runnerRevision: runner, sourceRevision: revision,
+    packageRunId: '12345', packageRunnerRevision: packageRunner, version, buildNumber,
     sourceCandidate: source, sourceCandidateSha256: hash(sourceBytes), packageReceiptSha256: 'd'.repeat(64),
     artifactSha256: 'e'.repeat(64), artifactBytes: 8192, asarSha256: 'f'.repeat(64), executableSha256: '1'.repeat(64) };
-  const artifact = { file: 'TiboTattle-0.1.27-linux-x86_64.AppImage', bytes: 8192,
+  const artifact = { file: `TiboTattle-${version}-linux-x86_64.AppImage`, bytes: 8192,
     sha256: intake.artifactSha256, sha512: Buffer.alloc(64, 1).toString('base64') };
   const receipt = { schemaVersion: 'tibotattle-linux-production-package-v1', workflowRunnerRevision: packageRunner,
-    sourceRevision: revision, version: '0.1.27', buildNumber: '2026100301', target: 'linux-x64',
+    sourceRevision: revision, version, buildNumber, target: 'linux-x64',
     sourceCandidateSha256: intake.sourceCandidateSha256, appUpdate: {}, artifact, manifest: {},
     signingRequired: false, published: false, nativeRuntimeQualification: 'separate_evidence_required' };
   const pair = { schemaVersion: 'tibotattle-linux-final-artifact-pair-v1', intake,
@@ -50,6 +52,25 @@ test('final-artifact intake binds an unchanged production source candidate and a
   ]) { const changed = structuredClone(intake); alter(changed); assert.throws(() => validateLinuxFinalIntake(changed)); }
   assert.throws(() => parseLinuxFinalIntake(' '.repeat(65537)));
 });
+test('replacement intake v2 binds only 028 and never relabels historical source or package evidence', () => {
+  const current = fixture({ schemaVersion: LINUX_FINAL_SCHEMA_V2, version: '0.1.28', buildNumber: '2026100901' });
+  const historical = fixture();
+  assert.equal(validateLinuxFinalIntake(current.intake), current.intake);
+  validateLinuxFinalPackageReceipt(current.receipt, current.intake, current.sourceBytes);
+  validateLinuxFinalPair(current.pair, runner);
+  for (const patch of [{ schemaVersion: LINUX_FINAL_SCHEMA }, { schemaVersion: 'toString' },
+    { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v3' }, { version: '0.1.27' },
+    { version: '0.1.29' }, { buildNumber: '2026100301' }, { buildNumber: '2026100902' },
+    { sourceCandidate: historical.intake.sourceCandidate }]) {
+    assert.throws(() => validateLinuxFinalIntake({ ...current.intake, ...patch }));
+  }
+  assert.throws(() => validateLinuxFinalIntake({ ...historical.intake, schemaVersion: LINUX_FINAL_SCHEMA_V2 }));
+  assert.throws(() => validateLinuxFinalPackageReceipt(historical.receipt, current.intake, historical.sourceBytes));
+  const changed = structuredClone(current.pair); changed.images.next.version = '0.1.27';
+  assert.throws(() => validateLinuxFinalPair(changed, runner));
+  assert.equal(validateLinuxFinalIntake(historical.intake), historical.intake);
+});
+
 test('only the exact successful same-repository manual packaging workflow is admitted', () => {
   const { intake } = fixture();
   const run = { id: 12345, event: 'workflow_dispatch', path: '.github/workflows/electron-linux-production-package.yml',

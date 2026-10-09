@@ -75,17 +75,19 @@ compatibility value; it does not run a second updater.
 
 ## Current Electron production-update acceptance
 
-After the exact 0.1.27 GitHub artifacts and ordinary Electron stable feeds are
+After the exact 0.1.28 GitHub artifacts and ordinary Electron stable feeds are
 published, run `electron-macos-production-update.yml` in `plan` then `execute`
 mode for **both** `darwin-arm64` and `darwin-x64`. Use
-`tibotattle-production-electron-update-intake-v2` in `identity_json`, together
+`tibotattle-production-electron-update-intake-v3` in `identity_json`, together
 with the unchanged candidate `sourceCandidate` receipt. Its closed fields are
 `schemaVersion`, `target`, `sourceRevision`, `buildNumber`, `version`,
 `bundleVersion`, `dmgSha256`, `asarSha256`, `zipSha256`, `feedSha256`, and
-`predecessorAsarSha256`; the workflow supplies `directory`. V2 admits only
-0.1.26 → 0.1.27 (bundle 1034 → 1035). The source receipt independently binds
-0.1.27's source and provenance build. No predecessor or feed URL override is
-accepted. Execute retains `RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE`.
+`predecessorAsarSha256`; the workflow supplies `directory`. V3 admits only
+0.1.26 → 0.1.28 (bundle 1034 → 1036), with provenance build `2026100901`.
+The source receipt independently binds 0.1.28's source and that build. No
+predecessor or feed URL override is accepted. Execute retains
+`RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE`. Historical v2 remains exclusively
+0.1.26 → 0.1.27; its artifacts and receipts do not qualify the replacement.
 
 The immutable [0.1.26 manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json)
 (SHA-256 `be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc`)
@@ -106,13 +108,13 @@ or planned receipt alone is not artifact verification.
 
 The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and
-recorded opt-out. V2 requires every captured predecessor process identity,
+recorded opt-out. V2 and V3 require every captured predecessor process identity,
 including an orphaned companion, to exit before accepting the updater-created
 successor; later cleanup cannot satisfy that observation. Retain the separate
-`tibotattle-signed-macos-production-update-v2` receipt for each architecture.
+`tibotattle-signed-macos-production-update-v3` receipt for each architecture.
 It keeps `existingCredentialFixture: false`: the signed credential fixture is
-still a distinct gate. The historical intake/receipt v1 and its 0.1.20
-predecessor verifier remain unchanged for their existing workflows.
+still a distinct gate. The historical intake/receipt v1 (0.1.20 predecessor)
+and v2 (0.1.26 → 0.1.27) retain their existing meanings.
 
 This is post-activation acceptance of the real production feed. It does not
 create a prepublication updater lane, rewrite signed apps, change feed URLs,
@@ -128,7 +130,11 @@ state recovery, helper behavior and preserved sharing choice. The
 and `electron-macos-credentials.yml` exercise existing credentials on a signed
 installed Electron replacement. A passing synthetic journey does not prove all
 failure paths or every user Keychain state. Unexpected Keychain prompts block
-release; do not broaden key access or automate approval.
+release; do not broaden key access or automate approval. The 0.1.28 credential
+journey retains the synthetic historical unknown → Sol 6.1 repair, repeat and
+restart checks introduced for 0.1.27. It uses the existing disposable credential
+predecessor and requires new receipts for the exact replacement bytes; the
+production-update predecessor above does not change that fixture contract.
 Signing-key access on the release machine is a separate owner provisioning
 step; it does not authorize routine app Keychain prompts.
 
