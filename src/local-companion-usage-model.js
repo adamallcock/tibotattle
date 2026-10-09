@@ -14,9 +14,9 @@ import {
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import {
-  codexModelAllowanceTrack,
   codexModelApiPriceEquivalentApplicable,
   codexModelPricingStatus,
+  codexUsageAllowanceTrack,
   OPENAI_CODEX_SPARK_MODEL_ID,
   recognizedCodexModelId,
 } from "./export/index.js";
@@ -315,6 +315,10 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
       costUsd: item.costUsd,
     }))
     : [];
+  const allowanceTrack = codexUsageAllowanceTrack(record.model, {
+    observedAt: record.observedAt,
+    threadSource: record.surfaceClassification?.threadSource,
+  });
   return {
     model,
     fastModeFamily: speedModeModelFamilyKey(model, ["standard", "fast", "ultrafast"].includes(record.tierSemantics?.codexSpeedMode)
@@ -323,9 +327,11 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
       standardPriceCardIds: priceCardIds,
     }),
     modelPricingStatus: modelPricingStatus(record.model),
-    modelAllowanceTrack: codexModelAllowanceTrack(record.model),
+    modelAllowanceTrack: allowanceTrack,
     modelApiPriceEquivalentApplicable:
-      codexModelApiPriceEquivalentApplicable(record.model),
+      allowanceTrack === "primary"
+        && codexModelApiPriceEquivalentApplicable(record.model),
+    isSeparateAllowance: allowanceTrack !== "primary",
     isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
@@ -393,7 +399,7 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
     },
   };
   if (includeSpark) {
-    period.spark = newUsagePeriod("spark", "Spark allowance", {
+    period.spark = newUsagePeriod("spark", "Separate allowance", {
       includeSpark: false,
     });
   }
@@ -465,8 +471,11 @@ function addDimension(dimension, key, projection) {
 
 export function addUsageToPeriod(period, projection) {
   if (projection === null) return;
-  if (projection.isSpark) {
-    addUsageToPeriod(period.spark, { ...projection, isSpark: false });
+  if (projection.isSeparateAllowance) {
+    addUsageToPeriod(period.spark, {
+      ...projection,
+      isSeparateAllowance: false,
+    });
     return;
   }
   period.events += 1;
@@ -592,7 +601,7 @@ export function finalizeUsagePeriod(period) {
   };
   if (period.spark) finalized.spark = finalizeUsagePeriod(period.spark);
   // One list covering every allowance track. `byModel` stays aligned with the
-  // period's own totals, which exclude the separately metered Spark track.
+  // period's own totals, which exclude usage on separate allowance tracks.
   finalized.modelUsage = [
     ...finalized.byModel,
     ...(finalized.spark?.byModel ?? []),

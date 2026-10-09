@@ -34,7 +34,7 @@ import { stableJson } from "./export/index.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
-  "local-analysis-index-v5";
+  "local-analysis-index-v6";
 const { discoverCodexRolloutInfos } = localCodexLogScanner;
 // Bumped when extraction or index semantics change. v3 gated quota admission;
 // v4 stops the chunk reader from rebuilding a record out of a reused buffer, so
@@ -43,12 +43,16 @@ const { discoverCodexRolloutInfos } = localCodexLogScanner;
 // window identity and refuses out-of-range cached quota facts; v6 preserves the
 // reviewed Spark and Codex auto-review model identities instead of collapsing
 // them into "unknown" (every index built before it stored those events under
-// the unrecognised label, so it has to be rebuilt, not migrated).
+// the unrecognised label, so it has to be rebuilt, not migrated); v7 retains
+// the exact reviewed auto-review source markers as a separate local source
+// classification without changing token accounting, surface or agent scope.
 export const LOCAL_ANALYSIS_INDEX_PARSER_VERSION =
-  "parallel-jsonl-accounting-v6";
+  "parallel-jsonl-accounting-v7";
 
 const INDEX_APPLICATION_ID = 0x554d4149;
-const INDEX_USER_VERSION = 5;
+const INDEX_USER_VERSION = 6;
+const PREVIOUS_INDEX_SCHEMA_VERSION = "local-analysis-index-v5";
+const PREVIOUS_INDEX_PARSER_VERSION = "parallel-jsonl-accounting-v6";
 const DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_WORKERS = 10;
 const BOUNDARY_BYTES = 4 * 1024;
@@ -719,12 +723,20 @@ async function projectSources(
       keyBySession.set(source.info.lineage.sessionId, source.sourceKey);
     }
   }
-  const sources = complete.map((source, ordinal) => {
+  // Preserve retained ordinals: they participate in local occurrence identity.
+  // Newly discovered sources receive the next unused ordinal, never an absent
+  // source's number.
+  let nextOrdinal = 0;
+  for (const source of existingByKey.values()) {
+    nextOrdinal = Math.max(nextOrdinal, source.ordinal + 1);
+  }
+  const sources = complete.map((source) => {
     const parentId = source.info.lineage?.parentId;
     const classification = source.info.lineage?.surfaceClassification ?? {};
     return {
       ...source,
-      ordinal,
+      ordinal: existingByKey.get(source.sourceKey)?.ordinal ?? nextOrdinal++,
+      parserVersion: LOCAL_ANALYSIS_INDEX_PARSER_VERSION,
       parentSourceKey: typeof parentId === "string"
         ? (keyBySession.get(parentId) ?? null)
         : null,
@@ -838,6 +850,8 @@ function initializeSchema(database) {
     ) STRICT;
     CREATE TABLE sources (
       source_key TEXT PRIMARY KEY CHECK(length(source_key) = 64),
+      parser_version TEXT NOT NULL CHECK(parser_version IN (
+        'parallel-jsonl-accounting-v6', 'parallel-jsonl-accounting-v7')),
       parent_source_key TEXT REFERENCES sources(source_key)
         ON DELETE CASCADE,
       ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -937,23 +951,41 @@ function initializeSchema(database) {
   `);
 }
 
-function validateDatabase(database, { requireComplete = true } = {}) {
+function validateDatabase(database, {
+  requireComplete = true,
+  allowPreviousParser = false,
+} = {}) {
   const applicationId = Number(
     database.prepare("PRAGMA application_id").get().application_id,
   );
   const userVersion = Number(
     database.prepare("PRAGMA user_version").get().user_version,
   );
+  if (applicationId === INDEX_APPLICATION_ID
+      && Number.isSafeInteger(userVersion) && userVersion > INDEX_USER_VERSION) {
+    throw fixedError("local_analysis_index_schema_newer");
+  }
   if (applicationId !== INDEX_APPLICATION_ID
-      || userVersion !== INDEX_USER_VERSION) {
+      || (userVersion !== INDEX_USER_VERSION
+        && !(allowPreviousParser && userVersion === 5))) {
     throw fixedError("local_analysis_index_schema_invalid");
   }
   const meta = Object.fromEntries(
     [...database.prepare("SELECT key, value FROM meta").iterate()]
       .map((row) => [row.key, row.value]),
   );
-  if (meta.schema_version !== LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION
-      || meta.parser_version !== LOCAL_ANALYSIS_INDEX_PARSER_VERSION
+  const parserNumber = /^parallel-jsonl-accounting-v([1-9][0-9]*)$/u
+    .exec(meta.parser_version)?.[1];
+  if (parserNumber !== undefined && Number(parserNumber) > 7) {
+    throw fixedError("local_analysis_index_parser_newer");
+  }
+  const current = userVersion === INDEX_USER_VERSION
+    && meta.schema_version === LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION
+    && meta.parser_version === LOCAL_ANALYSIS_INDEX_PARSER_VERSION;
+  const reviewedPredecessor = allowPreviousParser && userVersion === 5
+    && meta.schema_version === PREVIOUS_INDEX_SCHEMA_VERSION
+    && meta.parser_version === PREVIOUS_INDEX_PARSER_VERSION;
+  if ((!current && !reviewedPredecessor)
       || !["partial", "complete"].includes(meta.status)
       || (requireComplete && meta.status !== "complete")) {
     throw fixedError("local_analysis_index_schema_invalid");
@@ -963,7 +995,10 @@ function validateDatabase(database, { requireComplete = true } = {}) {
 
 function openExistingIndex(
   indexFile,
-  { readOnly = true, staging = false, requireComplete = true } = {},
+  {
+    readOnly = true, staging = false, requireComplete = true,
+    allowPreviousParser = false,
+  } = {},
 ) {
   let database;
   try {
@@ -972,7 +1007,7 @@ function openExistingIndex(
       timeout: 5_000,
     });
     configureDatabase(database, { readOnly, staging });
-    const meta = validateDatabase(database, { requireComplete });
+    const meta = validateDatabase(database, { requireComplete, allowPreviousParser });
     return { database, meta };
   } catch (error) {
     if (database?.isOpen) database.close();
@@ -992,9 +1027,11 @@ function createFreshIndex(indexFile) {
   return database;
 }
 
-function readStoredSources(database) {
+function readStoredSources(database, { previousParser = false } = {}) {
   return new Map([...database.prepare(`
-    SELECT source_key, parent_source_key, ordinal, is_fork, parent_missing,
+    SELECT source_key, ${previousParser
+      ? "'parallel-jsonl-accounting-v6'" : "parser_version"} AS parser_version,
+           parent_source_key, ordinal, is_fork, parent_missing,
            CAST(device AS TEXT) AS device_text,
            CAST(inode AS TEXT) AS inode_text,
            birthtime_ms, file_size, prefix_bytes, mtime_ms,
@@ -1005,6 +1042,7 @@ function readStoredSources(database) {
     FROM sources
   `).iterate()].map((row) => [row.source_key, {
     sourceKey: row.source_key,
+    parserVersion: row.parser_version,
     parentSourceKey: row.parent_source_key,
     ordinal: Number(row.ordinal),
     isFork: row.is_fork === 1,
@@ -1195,7 +1233,7 @@ function planIndexBatch({
   let scheduledSources = 0;
   let scheduledBytes = 0;
   for (const source of sources) {
-    if (!needsScan.has(source.sourceKey)) continue;
+    if (source.retained === true || !needsScan.has(source.sourceKey)) continue;
     if (source.parentSourceKey !== null
         && !completeKeys.has(source.parentSourceKey)) {
       // A fork cannot be replay-safe until its parent snapshot set is fully
@@ -1387,12 +1425,13 @@ function detachExtractedShards(database, schemas) {
 function insertOrUpdateSources(database, sources) {
   const upsert = database.prepare(`
     INSERT INTO sources(
-      source_key, parent_source_key, ordinal, is_fork, parent_missing,
+      source_key, parser_version, parent_source_key, ordinal, is_fork, parent_missing,
       device, inode, birthtime_ms, file_size, prefix_bytes, mtime_ms,
       ctime_ms, ctime_ns, boundary_start, boundary_hmac, surface, thread_source,
       agent_scope, lineage_disposition
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(source_key) DO UPDATE SET
+      parser_version=excluded.parser_version,
       parent_source_key=excluded.parent_source_key,
       ordinal=excluded.ordinal,
       is_fork=excluded.is_fork,
@@ -1415,6 +1454,7 @@ function insertOrUpdateSources(database, sources) {
   for (const source of sources) {
     upsert.run(
       source.sourceKey,
+      source.parserVersion,
       source.parentSourceKey,
       source.ordinal,
       source.isFork ? 1 : 0,
@@ -2549,7 +2589,9 @@ export async function refreshLocalAnalysisIndex({
   });
   let existing = null;
   try {
-    existing = openExistingIndex(indexFile, { requireComplete: false });
+    existing = openExistingIndex(indexFile, {
+      requireComplete: false, allowPreviousParser: true,
+    });
   } catch (error) {
     if (![
       "local_analysis_index_unavailable",
@@ -2558,28 +2600,46 @@ export async function refreshLocalAnalysisIndex({
   }
   const existingByKey = existing === null
     ? new Map()
-    : readStoredSources(existing.database);
+    : readStoredSources(existing.database, {
+      previousParser: existing.meta.parser_version === PREVIOUS_INDEX_PARSER_VERSION,
+    });
+  const parserUpgrade = existing?.meta.parser_version === PREVIOUS_INDEX_PARSER_VERSION;
   existing?.database.close();
-  const { sources, reusedCount: sourceProjectionReusedCount } =
+  const { sources: presentSources, reusedCount: sourceProjectionReusedCount } =
     await projectSources(infos, secret, signal, existingByKey);
   phaseWallMs.discoveryProjection =
     performance.now() - discoveryStartedAt;
-  const currentByKey = new Map(sources.map((source) => [
+  const currentByKey = new Map(presentSources.map((source) => [
     source.sourceKey,
     source,
   ]));
 
-  const removed = new Set(
-    [...existingByKey.keys()].filter((key) => !currentByKey.has(key)),
-  );
+  // Discovery is not retention authority. Keep closed facts and their parser
+  // provenance when a raw source is absent; only present sources can supply
+  // the new guardian markers or be reparsed under the new policy.
+  const retainedSources = [...existingByKey.values()]
+    .filter((source) => !currentByKey.has(source.sourceKey))
+    .map((source) => ({ ...source, retained: true }));
+  // Discovery already orders present parents before children. Preserve that
+  // processing order independently of the stable occurrence ordinals.
+  const sources = [...presentSources, ...retainedSources];
   const resetInitial = new Set();
   const append = new Set();
-  for (const source of sources) {
+  for (const source of presentSources) {
     const prior = existingByKey.get(source.sourceKey);
     if (!prior) {
       resetInitial.add(source.sourceKey);
     } else if (exactSourceState(prior, source)) {
-      // Reuse the complete durable prefix.
+      // An absent parent still has a retained, source-bound snapshot set.
+      // Exact byte/identity proof preserves the child's prior parent link.
+      if (source.parentMissing && prior.parentSourceKey !== null
+          && existingByKey.has(prior.parentSourceKey)) {
+        source.parentSourceKey = prior.parentSourceKey;
+        source.parentMissing = prior.parentMissing;
+      }
+      if (prior.parserVersion !== LOCAL_ANALYSIS_INDEX_PARSER_VERSION) {
+        resetInitial.add(source.sourceKey);
+      }
     } else if (sameIdentity(prior, source)
         // Appending must advance at least one observed byte boundary. A
         // same-size rewrite is never an append, even if its terminal boundary
@@ -2592,7 +2652,16 @@ export async function refreshLocalAnalysisIndex({
           source.info.path,
           prior.prefixBytes,
         )).boundaryHmac) {
-      append.add(source.sourceKey);
+      if (source.parentMissing && prior.parentSourceKey !== null
+          && existingByKey.has(prior.parentSourceKey)) {
+        source.parentSourceKey = prior.parentSourceKey;
+        source.parentMissing = prior.parentMissing;
+      }
+      if (prior.parserVersion !== LOCAL_ANALYSIS_INDEX_PARSER_VERSION) {
+        resetInitial.add(source.sourceKey);
+      } else {
+        append.add(source.sourceKey);
+      }
     } else {
       resetInitial.add(source.sourceKey);
     }
@@ -2602,7 +2671,7 @@ export async function refreshLocalAnalysisIndex({
     ...currentByKey,
   ]);
   const resetKeys = descendantsOf(
-    new Set([...removed, ...resetInitial]),
+    resetInitial,
     combinedForInvalidation,
   );
   for (const key of resetKeys) append.delete(key);
@@ -2610,7 +2679,7 @@ export async function refreshLocalAnalysisIndex({
     ...[...resetKeys].filter((key) => currentByKey.has(key)),
     ...append,
   ]);
-  // With a verified complete index and no changed, appended, or removed
+  // With a verified complete index and no changed or appended present
   // sources, copying a potentially large SQLite file just to record a
   // zero-byte refresh provides no new durable fact. Leave the complete,
   // verified generation in place and return the same indexed result.
@@ -2621,8 +2690,8 @@ export async function refreshLocalAnalysisIndex({
   });
   if (existing !== null
       && existing.meta.status === "complete"
+      && !parserUpgrade
       && changedKeys.size === 0
-      && removed.size === 0
       && allSourcesAlreadyComplete) {
     const sourceBytes = sources.reduce(
       (sum, source) => sum + source.prefixBytes,
@@ -2673,16 +2742,27 @@ export async function refreshLocalAnalysisIndex({
         readOnly: false,
         staging: true,
         requireComplete: false,
+        allowPreviousParser: true,
       }).database;
+      if (parserUpgrade) {
+        // Migrate only the staged copy. Existing facts keep the exact parser
+        // that produced them until their present source is reparsed.
+        database.exec(`
+          BEGIN IMMEDIATE;
+          ALTER TABLE sources ADD COLUMN parser_version TEXT NOT NULL
+            DEFAULT 'parallel-jsonl-accounting-v6'
+            CHECK(parser_version IN (
+              'parallel-jsonl-accounting-v6', 'parallel-jsonl-accounting-v7'));
+          PRAGMA user_version=${INDEX_USER_VERSION};
+          DELETE FROM projections;
+          COMMIT;
+        `);
+      }
     }
     failurePhase = "source_update";
     database.exec("BEGIN IMMEDIATE");
     try {
-      const deleteSource = database.prepare(
-        "DELETE FROM sources WHERE source_key = ?",
-      );
-      for (const key of removed) deleteSource.run(key);
-      insertOrUpdateSources(database, sources);
+      insertOrUpdateSources(database, presentSources);
       resetSources(
         database,
         [...resetKeys].filter((key) => currentByKey.has(key)),
@@ -2861,8 +2941,7 @@ export async function refreshLocalAnalysisIndex({
     return {
       status: existing === null
         ? "built"
-        : changedKeys.size === 0
-            && removed.size === 0
+        : !parserUpgrade && changedKeys.size === 0
             && batch.selectedKeys.size === 0
           ? "reused"
           : "updated",

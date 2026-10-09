@@ -146,7 +146,11 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // reviewed catalog and retain explicit turn-context service tiers. Present
 // sources are reparsed, while absent sources retain
 // their original unknown identity and provenance. Physical schema is unchanged.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v19";
+// v20 (2026-10-07): exact retained guardian-review metadata establishes the
+// closed local auto_review thread source. Other classification dimensions and
+// token/replay semantics stay independent. Reparse present sources only;
+// absent sources retain their original facts and parser provenance.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v20";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -157,21 +161,21 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v19-partial";
+  "unified-rollout-typed-v20-partial";
 
 // Per-row provenance variants retain the inherited-model assumption without
-// changing the physical schema. Ingest cursors keep the base v19 stamp.
+// changing the physical schema. Ingest cursors keep the base v20 stamp.
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
-  "unified-rollout-typed-v19-parent-model";
+  "unified-rollout-typed-v20-parent-model";
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v19-parent-model-partial";
+  "unified-rollout-typed-v20-parent-model-partial";
 
 // Cache continuity and dormant successor preparation both accept these exact
-// row-level provenance variants. Keep the reviewed v15-v18 families readable after a
-// v19 reparse; future parser labels remain unsupported until their semantics
+// row-level provenance variants. Keep the reviewed v15-v19 families readable after a
+// v20 reparse; future parser labels remain unsupported until their semantics
 // are reviewed explicitly.
 const QUALIFIED_LOCAL_PARSER_VERSIONS = new Set([
-  ...["unified-rollout-typed-v15", "unified-rollout-typed-v16", "unified-rollout-typed-v17", "unified-rollout-typed-v18"].flatMap((version) =>
+  ...["unified-rollout-typed-v15", "unified-rollout-typed-v16", "unified-rollout-typed-v17", "unified-rollout-typed-v18", "unified-rollout-typed-v19"].flatMap((version) =>
     [version, `${version}-partial`, `${version}-parent-model`, `${version}-parent-model-partial`]),
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
@@ -203,15 +207,19 @@ const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 // Version 11 (2026-08-28) makes the source- and quota-keyed usage indexes
 // required schema. Runtime quarantine cleanup needs both to remain bounded
 // after a deferred-index cold load.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 11;
+// Version 12 (2026-10-07) fences auto-review allowance interpretation from
+// older readers/writers. The existing surface_class.thread_source TEXT column
+// already represents the value: no physical column or fact changes are needed.
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 12;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 // Compatibility is persisted separately from PRAGMA user_version so a newer
 // writer can describe the oldest reader and writer that understand its
-// semantics. The current format intentionally requires v11 for both: cleanup
-// query-plan bounds are part of safe staged publication, not optional tuning.
-export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 11;
-export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 11;
+// semantics. The current format intentionally requires v12 for both: earlier
+// apps must refuse the index rather than silently restore ordinary allowance
+// treatment for reviewed auto-review usage.
+export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 12;
+export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 12;
 const COMPATIBILITY_META_KEYS = Object.freeze({
   formatUserVersion: "compatibility_format_user_version",
   minimumReaderUserVersion: "compatibility_minimum_reader_user_version",

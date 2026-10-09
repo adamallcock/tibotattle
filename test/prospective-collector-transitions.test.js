@@ -203,6 +203,23 @@ test("builds deterministic account-local adjacent transitions with marginal usag
   assert.equal(first.transitions[1].aggregateToolClassMix.subagent, 1);
 });
 
+test("the closed local auto-review classification remains valid prospective evidence", () => {
+  const event = usage({
+    eventKey: "2".repeat(64),
+    observedAt: "2026-07-25T00:02:00.000Z",
+    usedPercent: 11,
+  });
+  event.surfaceClassification.threadSource = "auto_review";
+  const result = buildProspectiveCollectorTransitions([
+    quota({ eventKey: "1".repeat(64), observedAt: "2026-07-25T00:01:00.000Z", usedPercent: 10 }),
+    event,
+  ], { priceUsage: () => 1 });
+  assert.equal(result.diagnostics.exclusions.malformed, 0);
+  assert.equal(result.transitions.length, 1);
+  assert.equal(result.transitions[0].marginalUsageEventCount, 1);
+  assert.equal(result.transitions[0].marginalComponents.input_uncached_tokens, 10);
+});
+
 test("never pools switched accounts and removes duplicate event keys deterministically", () => {
   const aPrior = quota({
     eventKey: "1".repeat(64),

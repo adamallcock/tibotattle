@@ -247,6 +247,7 @@ async function* usageBatches(database, includeWorkUsage = false) {
            t.codex_speed_mode AS codex_speed_mode,
            t.api_service_tier AS api_service_tier,
            s.surface AS surface,
+           s.thread_source AS thread_source,
            s.agent_scope AS agent_scope,
            s.lineage_disposition AS lineage_disposition,
            a.status AS scope_status,
@@ -307,6 +308,7 @@ function recordShape(row) {
     },
     surfaceClassification: {
       surface: row.surface,
+      threadSource: row.thread_source,
       agentScope: row.agent_scope,
       lineageDisposition: row.lineage_disposition,
     },
@@ -572,11 +574,13 @@ export async function readLocalUnifiedCompanionProjection({
             addUsageToPeriod(period.summary, projection);
           }
         }
-        addTimelineUsage(
-          projection.isSpark ? sparkTimelineBuckets : timelineBuckets,
-          observedMs,
-          projection,
-        );
+        if (!projection.isSeparateAllowance || projection.isSpark) {
+          addTimelineUsage(
+            projection.isSpark ? sparkTimelineBuckets : timelineBuckets,
+            observedMs,
+            projection,
+          );
+        }
       }
     }
     if (workCollector) {

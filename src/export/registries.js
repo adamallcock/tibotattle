@@ -17,8 +17,9 @@ export const OPENAI_CODEX_MODEL_IDS = REVIEWED_CODEX_MODEL_IDS;
 export const OPENAI_CODEX_UNPRICED_MODEL_IDS = Object.freeze([
   // `codex-auto-review` is no longer here: it is now priced as an alias of
   // gpt-5.4 by owner direction, with the assumption and its known limits
-  // recorded in OPENAI_ALIAS_ASSUMPTIONS. It draws on the ordinary Codex
-  // allowance, so an API-equivalent figure for it is comparable.
+  // recorded in OPENAI_ALIAS_ASSUMPTIONS. API pricing remains unchanged;
+  // the event-time allowance policy below separately handles explicit
+  // auto-review usage from October 6, 2026 onward.
   // Spark is metered against its own subscription allowance, so it is not
   // merely unpriced - an API-equivalent figure for it is not comparable with
   // the primary pool at all.
@@ -116,6 +117,47 @@ export function codexModelAllowanceTrack(value) {
 // substitutable for the primary pool, so no dollar comparison is honest.
 export function codexModelApiPriceEquivalentApplicable(value) {
   return codexModelAllowanceTrack(value) !== "spark";
+}
+
+// Owner-directed allowance policy, using the existing inclusive UTC event-time
+// convention. This is not an API price change or a provider rollout-time claim.
+export const CODEX_AUTO_REVIEW_SEPARATE_ALLOWANCE_START_AT =
+  "2026-10-06T00:00:00.000Z";
+const AUTO_REVIEW_SEPARATE_ALLOWANCE_START_MS =
+  Date.parse(CODEX_AUTO_REVIEW_SEPARATE_ALLOWANCE_START_AT);
+const EXPLICIT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+function autoReviewUsageInstantMs(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && Math.abs(value) <= 8.64e15
+      ? value
+      : Number.NaN;
+  }
+  if (typeof value !== "string" || !EXPLICIT_INSTANT.test(value)) return Number.NaN;
+  const at = Date.parse(value);
+  if (!Number.isFinite(at)) return Number.NaN;
+  // Date.parse normalizes invalid calendar dates and 24:00 into another day.
+  // An exemption needs the stated instant itself to be valid, not a repair.
+  const wallTime = value.slice(0, 19);
+  const wallAt = Date.parse(`${wallTime}Z`);
+  return Number.isFinite(wallAt)
+      && new Date(wallAt).toISOString().slice(0, 19) === wallTime
+    ? at
+    : Number.NaN;
+}
+
+/** Classify local usage, without equating the auto-review and Spark pools.
+ * `threadSource` is the closed classification derived from both exact guardian
+ * session markers. A model name, missing marker, or ambiguous date cannot
+ * establish an exemption. Raw token and API-price evidence stays unchanged.
+ */
+export function codexUsageAllowanceTrack(model, { observedAt, threadSource } = {}) {
+  if (codexModelAllowanceTrack(model) === "spark") return "spark";
+  if (threadSource !== "auto_review") return "primary";
+  const at = autoReviewUsageInstantMs(observedAt);
+  return Number.isFinite(at) && at >= AUTO_REVIEW_SEPARATE_ALLOWANCE_START_MS
+    ? "separate"
+    : "primary";
 }
 
 /**

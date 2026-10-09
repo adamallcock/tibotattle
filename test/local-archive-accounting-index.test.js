@@ -9,6 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
   ARCHIVE_INDEX_DEEP_READ_BUDGET_BYTES,
@@ -25,6 +26,10 @@ import {
   REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
   buildReplaySafeAccountingPeriod,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  readLocalAnalysisIndexProjection,
+  writeLocalAnalysisIndexProjection,
+} from "../src/local-analysis-index.js";
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
 const PRIVATE_CANARY = "PRIVATE_ARCHIVE_INDEX_CANARY";
@@ -34,6 +39,10 @@ async function fixture({
   model = "gpt-5.6-sol",
   secondModel = null,
   includeUsage = false,
+  threadSource = null,
+  source = null,
+  firstAt = "2026-07-24T12:00:00.000Z",
+  secondAt = "2026-07-24T12:02:00.000Z",
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-archive-index-"));
   const codexHome = join(root, "codex-home");
@@ -45,7 +54,11 @@ async function fixture({
       JSON.stringify({
         timestamp,
         type: "session_meta",
-        payload: { id: sessionId },
+        payload: {
+          id: sessionId,
+          ...(threadSource === null ? {} : { thread_source: threadSource }),
+          ...(source === null ? {} : { source }),
+        },
       }),
       JSON.stringify({
         timestamp: `${timestamp.slice(0, -5)}.010Z`,
@@ -88,13 +101,13 @@ async function fixture({
   await writeRollout(
     join(sessions, "rollout-2026-07-24T12-00-00-archive.jsonl"),
     PRIVATE_CANARY,
-    "2026-07-24T12:00:00.000Z",
+    firstAt,
   );
   if (includeSecondSource) {
     await writeRollout(
       join(sessions, "rollout-2026-07-24T12-02-00-second.jsonl"),
       "SECOND_ARCHIVE_SOURCE",
-      "2026-07-24T12:02:00.000Z",
+      secondAt,
       secondModel ?? model,
     );
   }
@@ -345,14 +358,14 @@ function modelUsageState(period) {
   }));
 }
 
-test("Codex auto-review is priced as a gpt-5.4 alias on the primary allowance", async () => {
+test("historical Codex auto-review without source metadata stays priced on the primary allowance", async () => {
   const period = await archiveModelUsage({
     model: "codex-auto-review",
     secondModel: "gpt-5.6-sol",
   });
-  // Both events stay on the primary track: auto-review is billed from the
-  // ordinary Codex allowance. It used to carry no price at all; by owner
-  // direction it is now an alias of gpt-5.4 and is priced at those rates.
+  // These July events predate the explicit-source cutoff and stay primary.
+  // The alias alone is not source evidence. Its API quote is still priced
+  // at the reviewed gpt-5.4 alias rates.
   // The alias is an assumption rather than a published mapping - OpenAI does
   // not disclose what the managed alias resolves to - so the reasoning and its
   // known limits live in OPENAI_ALIAS_ASSUMPTIONS beside the rates.
@@ -380,6 +393,63 @@ test("Codex auto-review is priced as a gpt-5.4 alias on the primary allowance", 
     period.modelUsage.some((row) => row.model === "unknown"),
     false,
   );
+});
+
+test("archive replays split one model at the source cutoff and rebuild obsolete projections", async () => {
+  const { root, codexHome } = await fixture({
+    model: "codex-auto-review",
+    includeSecondSource: true,
+    includeUsage: true,
+    threadSource: "guardian_review",
+    source: { subagent: { other: "guardian" } },
+    firstAt: "2026-10-05T23:59:59.000Z",
+    secondAt: "2026-10-06T00:00:00.000Z",
+  });
+  const indexFile = join(root, "archive.sqlite");
+  const options = {
+    indexFile,
+    secretFile: join(root, "archive-secret"),
+    codexHome,
+    now: () => Date.parse("2026-10-07T12:00:00.000Z"),
+    workerCount: 1,
+  };
+  try {
+    const refreshed = await refreshLocalArchiveAccountingIndex(options);
+    assert.equal(refreshed.status, "complete");
+    const projection = await readLocalArchiveAccountingPeriod({ indexFile });
+    assert.equal(projection.status, "available");
+    const { period } = projection;
+    assert.equal(period.events, 1);
+    assert.equal(period.spark.events, 1);
+    assert.equal(period.totalTokens + period.spark.totalTokens, 200);
+    assert.equal(period.spark.apiPriceEquivalentUsd, period.apiPriceEquivalentUsd);
+    assert.ok(period.spark.apiPriceEquivalentUsd > 0);
+    assert.deepEqual(period.spark.priceCardIds, period.priceCardIds);
+    assert.deepEqual(modelUsageState(period).map((row) => [
+      row.model, row.allowanceTrack, row.apiPriceEquivalentApplicable,
+    ]).sort(), [
+      ["codex-auto-review", "primary", true],
+      ["codex-auto-review", "separate", false],
+    ]);
+    const stored = await readLocalAnalysisIndexProjection({
+      indexFile,
+      kind: "archive_accounting_period",
+      schemaVersion: "local-archive-accounting-projection-v3",
+    });
+    assert.equal(stored.status, "available");
+    await writeLocalAnalysisIndexProjection({
+      indexFile,
+      kind: "archive_accounting_period",
+      schemaVersion: "local-archive-accounting-projection-v2",
+      generatedAt: stored.generatedAt,
+      value: stored.value,
+    });
+    assert.equal((await readLocalArchiveAccountingPeriod({ indexFile })).status, "unavailable");
+    assert.equal((await refreshLocalArchiveAccountingIndex(options)).projectionStatus, "available");
+    assert.deepEqual((await readLocalArchiveAccountingPeriod({ indexFile })).period, period);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Spark reaches the renderer as its own allowance with no API equivalent", async () => {
@@ -540,6 +610,69 @@ test("archive indexing distinguishes unavailable disk measurements from low disk
     assert.equal(paused.status, "partial");
     assert.equal(paused.errorCode, "archive_storage_unavailable");
     assert.equal(paused.scanBytes, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("archive parser upgrades preserve absent-source facts without inferring an auto-review exemption", async () => {
+  const { root, codexHome } = await fixture({
+    model: "codex-auto-review",
+    includeSecondSource: true,
+    includeUsage: true,
+    threadSource: "guardian_review",
+    source: { subagent: { other: "guardian" } },
+    firstAt: "2026-10-06T00:00:00.000Z",
+    secondAt: "2026-10-06T00:02:00.000Z",
+  });
+  const indexFile = join(root, "archive.sqlite");
+  const options = {
+    indexFile,
+    secretFile: join(root, "archive-secret"),
+    codexHome,
+    now: () => Date.parse("2026-10-07T12:00:00.000Z"),
+    workerCount: 1,
+  };
+  try {
+    assert.equal((await refreshLocalArchiveAccountingIndex(options)).status, "complete");
+    const initial = (await readLocalArchiveAccountingPeriod({ indexFile })).period;
+    assert.equal(initial.spark.events, 2);
+    const previous = new DatabaseSync(indexFile);
+    try {
+      previous.exec("ALTER TABLE sources DROP COLUMN parser_version; PRAGMA user_version=5;");
+      previous.prepare("UPDATE meta SET value = 'local-analysis-index-v5' WHERE key = 'schema_version'").run();
+      previous.prepare("UPDATE meta SET value = 'parallel-jsonl-accounting-v6' WHERE key = 'parser_version'").run();
+      previous.prepare("UPDATE sources SET thread_source = 'unknown'").run();
+    } finally {
+      previous.close();
+    }
+    await rm(join(codexHome, "sessions", "rollout-2026-07-24T12-02-00-second.jsonl"));
+
+    assert.equal((await refreshLocalArchiveAccountingIndex(options)).projectionStatus, "available");
+    const projection = await readLocalArchiveAccountingPeriod({ indexFile });
+    assert.equal(projection.status, "available");
+    const { period } = projection;
+    assert.equal(period.events, 1, "absent-source evidence retains its prior unknown classification");
+    assert.equal(period.spark.events, 1, "present guardian evidence is reparsed and classified separately");
+    assert.equal(period.totalTokens + period.spark.totalTokens, initial.spark.totalTokens);
+    assert.equal(period.apiPriceEquivalentUsd + period.spark.apiPriceEquivalentUsd, initial.spark.apiPriceEquivalentUsd);
+    assert.deepEqual(modelUsageState(period).map((row) => [row.allowanceTrack, row.events]).sort(), [
+      ["primary", 1], ["separate", 1],
+    ]);
+    const current = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(current.prepare("SELECT COUNT(*) AS count FROM usage_facts").get().count, 2);
+      assert.deepEqual(current.prepare("SELECT thread_source, parser_version FROM sources ORDER BY thread_source").all()
+        .map((row) => [row.thread_source, row.parser_version]), [
+          ["auto_review", "parallel-jsonl-accounting-v7"],
+          ["unknown", "parallel-jsonl-accounting-v6"],
+        ]);
+    } finally {
+      current.close();
+    }
+    assert.equal((await refreshLocalArchiveAccountingIndex(options)).projectionStatus, "available");
+    assert.deepEqual((await readLocalArchiveAccountingPeriod({ indexFile })).period, period);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

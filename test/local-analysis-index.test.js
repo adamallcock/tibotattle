@@ -496,7 +496,7 @@ test("local index keeps quota durations distinct and relays a valid generic wind
   );
   assert.equal(
     (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
-    "local-analysis-index-v5",
+    "local-analysis-index-v6",
   );
 });
 
@@ -592,7 +592,156 @@ test("recognized Spark survives worker extraction and rebuilds a pre-Spark index
   assert.equal(rebuilt.usageRows.some((row) => row.model === "unknown"), false);
   const inspected = await inspectLocalAnalysisIndex({ indexFile });
   assert.equal(inspected.parserVersion, LOCAL_ANALYSIS_INDEX_PARSER_VERSION);
-  assert.equal(inspected.parserVersion, "parallel-jsonl-accounting-v6");
+  assert.equal(inspected.parserVersion, "parallel-jsonl-accounting-v7");
+});
+
+test("legacy v6 archive sources reclassify exact guardian metadata under v7 without changing accounting", async () => {
+  const { root, codexHome, parentPath } = await fixture();
+  const indexFile = join(root, "local-analysis-review.sqlite");
+  const secretFile = join(root, "local-analysis-review-secret");
+  try {
+    const lines = (await readFile(parentPath, "utf8")).trimEnd().split("\n");
+    const metadata = JSON.parse(lines[0]);
+    metadata.payload.thread_source = "guardian_review";
+    metadata.payload.source = { subagent: { other: "guardian" } };
+    lines[0] = JSON.stringify(metadata);
+    await writeFile(parentPath, `${lines.join("\n")}\n`);
+    const sourceBefore = await readFile(parentPath);
+    const scan = createIndexedCodexLogScan({ indexFile, secretFile, workerCount: 1, chunkBytes: CHUNK_BYTES });
+    const initial = await receipt(scan, codexHome);
+    const old = new DatabaseSync(indexFile);
+    try {
+      assert.equal(old.prepare("SELECT COUNT(*) AS count FROM sources WHERE thread_source = 'auto_review'").get().count, 1);
+      old.exec(`
+        ALTER TABLE sources DROP COLUMN parser_version;
+        PRAGMA user_version=5;
+        UPDATE meta SET value='local-analysis-index-v5' WHERE key='schema_version';
+        UPDATE meta SET value='parallel-jsonl-accounting-v6' WHERE key='parser_version';
+      `);
+      old.prepare("UPDATE sources SET thread_source = 'unknown' WHERE thread_source = 'auto_review'").run();
+    } finally {
+      old.close();
+    }
+    const refreshed = await receipt(scan, codexHome);
+    assert.deepEqual(refreshed, initial);
+    const current = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(current.prepare("SELECT value FROM meta WHERE key = 'parser_version'").get().value, "parallel-jsonl-accounting-v7");
+      const sources = current.prepare("SELECT thread_source, surface, agent_scope, lineage_disposition FROM sources ORDER BY thread_source").all();
+      assert.equal(sources.filter((source) => source.thread_source === "auto_review").length, 1);
+      assert.equal(sources.find((source) => source.thread_source === "auto_review").surface, "local_rollout_unclassified");
+      assert.equal(sources.find((source) => source.thread_source === "auto_review").agent_scope, "unknown");
+    } finally {
+      current.close();
+    }
+    assert.deepEqual(await receipt(scan, codexHome), initial);
+    assert.deepEqual(await readFile(parentPath), sourceBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("v6 archive migration is atomic and retains absent-parent facts, lineage and occurrence identity", async () => {
+  const { root, codexHome, parentPath, childPath } = await fixture();
+  const indexFile = join(root, "local-analysis-retained-parent.sqlite");
+  const secretFile = join(root, "local-analysis-retained-parent-secret");
+  const options = { indexFile, secretFile, codexHome, startAt: START_AT, endAt: END_AT,
+    workerCount: 1, chunkBytes: CHUNK_BYTES };
+  const snapshot = (database) => database.prepare(`SELECT source_key, source_offset,
+    timestamp_ms, model, input_uncached_tokens, output_text_tokens
+    FROM usage_facts ORDER BY source_key, source_offset`).all().map((row) => ({ ...row }));
+  try {
+    for (const path of [parentPath, childPath]) {
+      const lines = (await readFile(path, "utf8")).trimEnd().split("\n");
+      const header = JSON.parse(lines[0]);
+      header.payload.thread_source = "guardian_review";
+      header.payload.source = { subagent: { other: "guardian" } };
+      lines[0] = JSON.stringify(header);
+      await writeFile(path, `${lines.join("\n")}\n`);
+    }
+    await refreshLocalAnalysisIndex(options);
+    const previous = new DatabaseSync(indexFile);
+    const originalFacts = snapshot(previous);
+    const originalOrdinals = previous.prepare("SELECT source_key, ordinal FROM sources ORDER BY ordinal").all();
+    previous.exec(`
+      ALTER TABLE sources DROP COLUMN parser_version;
+      PRAGMA user_version=5;
+      UPDATE meta SET value='local-analysis-index-v5' WHERE key='schema_version';
+      UPDATE meta SET value='parallel-jsonl-accounting-v6' WHERE key='parser_version';
+      UPDATE sources SET thread_source='unknown';
+      CREATE TRIGGER reject_review_classification
+        BEFORE UPDATE OF thread_source ON sources
+        WHEN NEW.thread_source='auto_review'
+        BEGIN SELECT RAISE(ABORT, 'synthetic classification failure'); END;
+    `);
+    previous.close();
+    await rm(parentPath);
+    const priorBytes = await readFile(indexFile);
+    await assert.rejects(refreshLocalAnalysisIndex(options), {
+      code: "local_analysis_index_failed", failurePhase: "source_update",
+    });
+    assert.deepEqual(await readFile(indexFile), priorBytes,
+      "a failed staged migration must leave the prior schema and evidence intact");
+    const recoverable = new DatabaseSync(indexFile);
+    assert.equal(recoverable.prepare("PRAGMA user_version").get().user_version, 5);
+    assert.deepEqual(snapshot(recoverable), originalFacts);
+    recoverable.exec("DROP TRIGGER reject_review_classification");
+    recoverable.close();
+
+    const migrated = await refreshLocalAnalysisIndex(options);
+    assert.equal(migrated.status, "updated");
+    assert.equal(migrated.coverage.status, "complete");
+    assert.equal(migrated.sourceCount, 2);
+    const current = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(current.prepare("PRAGMA user_version").get().user_version, 6);
+      assert.deepEqual(snapshot(current), originalFacts);
+      assert.deepEqual(current.prepare("SELECT source_key, ordinal FROM sources ORDER BY ordinal").all(), originalOrdinals);
+      const sources = current.prepare(`SELECT parser_version, thread_source,
+        parent_source_key, parent_missing FROM sources ORDER BY ordinal`).all();
+      assert.equal(sources[0].parser_version, "parallel-jsonl-accounting-v6");
+      assert.equal(sources[0].thread_source, "unknown");
+      assert.equal(sources[1].parser_version, "parallel-jsonl-accounting-v7");
+      assert.equal(sources[1].thread_source, "auto_review");
+      assert.equal(sources[1].parent_source_key, originalOrdinals[0].source_key);
+      assert.equal(sources[1].parent_missing, 0);
+      assert.deepEqual(current.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally { current.close(); }
+    const repeated = await refreshLocalAnalysisIndex(options);
+    assert.equal(repeated.status, "reused");
+    assert.equal(repeated.scanBytes, 0);
+    // Losing the final raw file is still not permission to discard history.
+    await rm(childPath);
+    const absent = await refreshLocalAnalysisIndex(options);
+    assert.equal(absent.status, "reused");
+    assert.equal(absent.sourceCount, 2);
+    const retained = new DatabaseSync(indexFile, { readOnly: true });
+    try { assert.deepEqual(snapshot(retained), originalFacts); } finally { retained.close(); }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("archive readers and refresh refuse newer physical or semantic state without mutation", async () => {
+  for (const format of ["physical", "parser"]) {
+    const { root, codexHome } = await fixture();
+    const indexFile = join(root, "local-analysis-future.sqlite");
+    const options = { indexFile, secretFile: join(root, "local-analysis-future-secret"),
+      codexHome, startAt: START_AT, endAt: END_AT, workerCount: 1, chunkBytes: CHUNK_BYTES };
+    try {
+      await refreshLocalAnalysisIndex(options);
+      const newer = new DatabaseSync(indexFile);
+      if (format === "physical") newer.exec("PRAGMA user_version=7");
+      else newer.prepare("UPDATE meta SET value='parallel-jsonl-accounting-v8' WHERE key='parser_version'").run();
+      newer.close();
+      const before = await readFile(indexFile);
+      const code = format === "physical"
+        ? "local_analysis_index_schema_newer" : "local_analysis_index_parser_newer";
+      await assert.rejects(inspectLocalAnalysisIndex({ indexFile }), { code });
+      await assert.rejects(refreshLocalAnalysisIndex(options), { code });
+      assert.deepEqual(await readFile(indexFile), before);
+    } finally { await rm(root, { recursive: true }); }
+  }
 });
 
 test("local index rebuilds a prior semantic generation from source logs", async () => {
@@ -644,7 +793,7 @@ test("local index rebuilds a prior semantic generation from source logs", async 
   assert.equal((await stat(parentPath)).size, sourceBytesBefore);
   assert.equal(
     (await inspectLocalAnalysisIndex({ indexFile })).schemaVersion,
-    "local-analysis-index-v5",
+    "local-analysis-index-v6",
   );
 });
 

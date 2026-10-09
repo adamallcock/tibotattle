@@ -9,6 +9,8 @@ export {
   TELEMETRY_V01_REGISTRY_VERSION,
   TELEMETRY_PROVIDER_IDS,
   TELEMETRY_V01_REVIEWED_AT,
+  CODEX_AUTO_REVIEW_SEPARATE_ALLOWANCE_START_AT,
+  codexUsageAllowanceTrack,
   codexModelAllowanceTrack,
   codexModelApiPriceEquivalentApplicable,
   codexModelPricingStatus,

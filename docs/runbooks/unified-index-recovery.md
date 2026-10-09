@@ -34,11 +34,15 @@ Quit TiboTattle and confirm no companion or rebuild process still owns the
 state root. Do not kill a process while it is publishing unless it is truly
 stuck; the normal cancellation path preserves completed checkpoints.
 
-For an installed app, the expected state root is:
+For the current Electron app, the expected companion state root is:
 
 ```text
-~/Library/Application Support/Usage Monitor
+~/Library/Application Support/TiboTattle/companion-state
 ```
+
+Older native installations used `~/Library/Application Support/Usage Monitor`.
+Preserve both roots if a transition has left both present; use the failing
+runtime's selected root, not whichever directory appears newer.
 
 Standalone developer/CLI runs may use a configured root or the platform
 `app-usagemonitor` default. Resolve the exact path from the failing runtime;
@@ -68,8 +72,11 @@ PRAGMA query_only = ON;
 PRAGMA quick_check;
 PRAGMA application_id;
 PRAGMA user_version;
-SELECT value FROM meta WHERE key = 'schema_version';
-SELECT value FROM meta WHERE key = 'status';
+SELECT key, value FROM meta WHERE key IN (
+  'schema_version', 'status', 'compatibility_format_user_version',
+  'compatibility_minimum_reader_user_version',
+  'compatibility_minimum_writer_user_version'
+);
 ```
 
 Record exact output. `quick_check = ok` proves page-level consistency, not
@@ -78,13 +85,19 @@ semantic compatibility or complete source coverage.
 Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
-- `user_version` 11;
-- parser `unified-rollout-typed-v18`; and
+- `user_version`, format, minimum reader and minimum writer versions 12;
+- parser `unified-rollout-typed-v20`; and
 - source identity `codex-immutable-rollout-v1`.
 
-A physical schema-11 index can still need older-parser sources reparsed under
-v18. Still-present sources are rescanned; facts whose sources have rotated away
-retain their original parser provenance. Parser v12 preserves missing counters
+Version 12 is a forward-only interpretation fence: it changes no columns or
+tables, but older applications must refuse the new semantics. Recognized
+versions 10 and 11 migrate on a staged copy. Still-present older-parser sources
+are rescanned under v20; facts whose sources have rotated away retain their
+original classification and parser provenance. A matching format does not prove
+a completed parser refresh.
+
+Historical parser changes remain relevant when interpreting retained facts.
+Parser v12 preserves missing counters
 as unknown rather than zero, and v13 recognizes ordinal-bearing compaction
 headers. Parser v14 prevents paginated resets or unknown physical-base settings
 from inheriting a logical parent's later model, effort or speed. Parser v15
@@ -119,13 +132,20 @@ provenance; absent historical sources keep their existing stamps. Do not edit
 parser metadata to force recovery, reset accepted hosted facts, or rewrite timing
 stores. A successful local rehearsal is not proof of an installed app update.
 
-These interpretation changes do not change the physical schema or the
-`codex-immutable-rollout-v1` source-identity contract; never relabel retained
-facts to the new parser.
+Parser v19 adds the reviewed GPT-6.1 Sol identity and explicit Standard, Fast
+and Ultrafast tier evidence. Parser v20 adds auto-review classification only
+from the paired retained guardian metadata. Its local allowance rule uses each
+event's timestamp, inclusive from `2026-10-06T00:00:00.000Z`; that UTC boundary
+is a product convention. Tokens and API-price evidence remain retained. Missing
+source metadata cannot retroactively prove separate-allowance eligibility.
+
+These parser changes preserve the `codex-immutable-rollout-v1` source-identity
+contract. The separate format-12 fence prevents older readers from silently
+reinterpreting auto-review; never relabel retained facts to the new parser.
 
 The companion grants the bounded four-hour cold-refresh deadline only to the
-reviewed published v10/v11/v12/v13/v14/v15/v16/v17-to-v18 parser transitions. The target is pinned
-to v18; a future parser must review its predecessor set explicitly. Physical
+reviewed published v10 through v19 to v20 parser transitions. The target is
+pinned to v20; a future parser must review its predecessor set explicitly. Physical
 schema, reader/writer compatibility, source identity, and telemetry contracts
 must match, and the published generation must be complete or one of the
 already supported quarantine/tool-provenance partial states. Only the current
@@ -164,7 +184,7 @@ success.
 | Observation | Classification | Next action |
 | --- | --- | --- |
 | Integrity passes; version is newer than this reader | Reader downgrade/mismatch | Install or build the newer compatible reader. Do not change the database. |
-| Integrity passes; version 1-9 and legacy family is recognized | Supported forward migration | Rehearse the current reader against a second copy, then inspect generation/coverage before considering live recovery. |
+| Integrity passes; version 1–11, family and compatibility header are recognized | Supported forward migration | Rehearse the current reader against a second copy; versions through 9 need the staged cold rebuild, while 10 and 11 migrate additively. Inspect generation/coverage before considering live recovery. |
 | Integrity passes; version/family/application id is unexpected | Wrong file, unsupported format, or metadata corruption | Preserve and escalate. Do not relabel. |
 | Integrity fails | Physical corruption | Preserve original and all sidecars; attempt extraction or rebuild only into separate candidates. |
 | Schema opens but generation is partial/incomplete | Source/provenance problem | Inspect generation issues and retained last-good facts; do not equate it with database corruption. |
@@ -178,8 +198,8 @@ not already exist. Start with the non-writing path check:
 
 ```bash
 npm run index:rebuild -- \
-  --index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
-  --recovery-dir "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS" \
+  --index "/absolute/path/to/selected-companion-state/local-unified-index-v1.sqlite" \
+  --recovery-dir "/absolute/path/to/selected-companion-state/recovery-YYYYMMDD-HHMMSS" \
   --codex-home "/absolute/path/to/the/selected/codex-home" \
   --workers 1 \
   --dry-run
@@ -212,10 +232,10 @@ exact `applyCommand` emitted by preparation:
 
 ```bash
 npm run index:rebuild -- --apply \
-  --index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
-  --candidate "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS/candidate.sqlite" \
-  --receipt "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS/receipt.json" \
-  --confirm-index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
+  --index "/absolute/path/to/selected-companion-state/local-unified-index-v1.sqlite" \
+  --candidate "/absolute/path/to/selected-companion-state/recovery-YYYYMMDD-HHMMSS/candidate.sqlite" \
+  --receipt "/absolute/path/to/selected-companion-state/recovery-YYYYMMDD-HHMMSS/receipt.json" \
+  --confirm-index "/absolute/path/to/selected-companion-state/local-unified-index-v1.sqlite" \
   --confirm-app-stopped
 ```
 

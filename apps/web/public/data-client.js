@@ -2308,7 +2308,10 @@ const LOCAL_MODEL_PRICING_STATUSES = new Set([
   "known_unpriced",
   "unrecognized"
 ]);
-const LOCAL_MODEL_ALLOWANCE_TRACKS = new Set(["primary", "spark"]);
+const LOCAL_MODEL_ALLOWANCE_TRACKS = new Set(["primary", "spark", "separate"]);
+// A model can have primary history and later separate-allowance usage. Bound
+// the list by its closed identity/track vocabulary, not by a single-pool count.
+const LOCAL_MODEL_USAGE_ROW_LIMIT = LOCAL_MODELS.size * LOCAL_MODEL_ALLOWANCE_TRACKS.size;
 const LOCAL_REASONING_EFFORTS = new Set([
   "none",
   "minimal",
@@ -4572,7 +4575,7 @@ function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
  * is a different and untrue claim.
  */
 function normalizeLocalModelUsage(rows) {
-  return array(rows).slice(0, 32).flatMap((row) => {
+  return array(rows).slice(0, LOCAL_MODEL_USAGE_ROW_LIMIT).flatMap((row) => {
     if (!LOCAL_MODELS.has(row?.model)) return [];
     const allowanceTrack = LOCAL_MODEL_ALLOWANCE_TRACKS.has(row.allowanceTrack)
       ? row.allowanceTrack
@@ -4587,10 +4590,10 @@ function normalizeLocalModelUsage(rows) {
         : (row.model === "unknown" ? "unrecognized" : "priced"),
       allowanceTrack,
       // A separate allowance is not substitutable for the primary pool, so no
-      // dollar comparison against it is honest. Only an explicit `false` or a
-      // Spark row withholds the figure.
+      // dollar comparison against it is honest. Keep the raw API quote while
+      // withholding its comparison for Spark and date-qualified auto-review.
       apiPriceEquivalentApplicable:
-        row.apiPriceEquivalentApplicable !== false && allowanceTrack !== "spark",
+        row.apiPriceEquivalentApplicable !== false && allowanceTrack === "primary",
       components: normalizeLocalModelComponents(row.components),
       componentCosts: normalizeLocalModelComponentCosts(row.componentCosts)
     }];
@@ -5502,9 +5505,8 @@ function normalizeLocalAccounting(value = {}, {
   allowImplicitDemoProjection = false
 } = {}) {
   const models = normalizeLocalModelUsage(value.byModel);
-  // Both allowance tracks in one list, each row stating which track it belongs
-  // to. The local report already publishes this; dropping it here is what left
-  // the separately metered Spark allowance invisible on the model table.
+  // All allowance tracks in one list, each row stating which track it belongs
+  // to. Separate-allowance rows retain their evidence beside primary history.
   const modelUsage = Array.isArray(value.modelUsage)
     ? normalizeLocalModelUsage(value.modelUsage)
     : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];

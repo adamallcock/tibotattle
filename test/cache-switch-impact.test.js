@@ -696,14 +696,14 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(switched.coveredSubtotal, null);
 });
 
-test("retained v15/v16/v17 parser suffixes retain cache continuity coverage after the v18 classification upgrade", () => {
+test("retained v15 through v19 parser suffixes retain cache continuity coverage after the v20 classification upgrade", () => {
   const retainedV15 = [
     "unified-rollout-typed-v15",
     "unified-rollout-typed-v15-partial",
     "unified-rollout-typed-v15-parent-model",
     "unified-rollout-typed-v15-parent-model-partial",
   ];
-  const currentV18 = [
+  const currentV20 = [
     LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
     LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
@@ -713,8 +713,10 @@ test("retained v15/v16/v17 parser suffixes retain cache continuity coverage afte
   const retainedV16 = retainedV15.map((version) => version.replace("v15", "v16"))
     .flatMap((version) => [version, `${version}-cache-write-zero`]);
   const retainedV17 = retainedV16.map((version) => version.replace("v16", "v17"));
+  const retainedV18 = retainedV17.map((version) => version.replace("v17", "v18"));
+  const retainedV19 = retainedV18.map((version) => version.replace("v18", "v19"));
   for (const parserVersion of [...retainedV15, ...retainedV16, ...retainedV17,
-    ...currentV18.flatMap((version) => [version, `${version}-cache-write-zero`])]) {
+    ...retainedV18, ...retainedV19, ...currentV20.flatMap((version) => [version, `${version}-cache-write-zero`])]) {
     const continuity = analyzeCacheContinuityRows([continuityRow({
       parser_version: parserVersion,
       previous_parser_version: parserVersion,
@@ -736,8 +738,8 @@ test("retained v15/v16/v17 parser suffixes retain cache continuity coverage afte
   }
 
   for (const parserVersion of [
-    "unified-rollout-typed-v20",
-    "unified-rollout-typed-v20-partial",
+    "unified-rollout-typed-v21",
+    "unified-rollout-typed-v21-partial",
     "unified-rollout-typed-v17-future",
   ]) {
     const continuity = analyzeCacheContinuityRows([continuityRow({

@@ -142,3 +142,86 @@ test("shared model icons preserve established aliases without inventing unknown 
   assert.equal(modelUsagePresentation("codex-auto-review").theme, "review");
   assert.equal(modelThemeIcon(documentRef, "review").tag, "svg");
 });
+
+
+test("auto-review separate rows display the main-allowance zero without merging historical rows or changing Spark", async () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const { render, body, t } = await modelTable(locale);
+    const usage = [
+      { model: "codex-auto-review", allowanceTrack: "primary", apiPriceEquivalentApplicable: true, apiPriceEquivalentUsd: 3 },
+      { model: "codex-auto-review", allowanceTrack: "separate", apiPriceEquivalentApplicable: false, apiPriceEquivalentUsd: 7 },
+      { model: "gpt-5.3-codex-spark", allowanceTrack: "spark", apiPriceEquivalentApplicable: false, apiPriceEquivalentUsd: 0 },
+    ].map(row => ({ pricingStatus: "priced", events: 1, totalTokens: 10, components: { input_cache_read_tokens: 10 }, ...row }));
+    const accounting = { modelUsage: usage, totalTokens: 10, apiPriceEquivalentUsd: 3 };
+    render(accounting);
+    const modelRows = () => body.children.filter(row => !row.dataset.componentOf);
+    const [historical, separate, spark] = modelRows();
+    assert.equal(contents(historical.children[4]), "$3.00");
+    assert.equal(contents(historical.children[5]), "100.0%");
+    assert.equal(contents(separate.children[4]), "$0.00*");
+    assert.equal(separate.children[4].title, t("accounting.model.separateMainAllowanceTitle"));
+    assert.equal(separate.attributes["aria-describedby"], "accounting-model-allowance-footnote");
+    assert.equal(separate.attributes["aria-label"], t("accounting.model.expand", {
+      model: t("accounting.model.separateMainAllowanceLabel", { model: "Codex Auto Review" }),
+    }));
+    assert.notEqual(separate.attributes["aria-label"], historical.attributes["aria-label"]);
+    const separateComponent = body.children[body.children.indexOf(separate) + 1];
+    assert.equal(separateComponent.children[4].title, t("accounting.model.separateMainAllowanceTitle"));
+    assert.equal(contents(separateComponent.children[4]), t("accounting.model.componentCostWithheld"));
+    assert.equal(contents(separateComponent.children[3]), t("accounting.model.shareWithheld"));
+    assert.equal(contents(separate.children[3]), t("accounting.model.shareWithheld"));
+    assert.equal(contents(separate.children[5]), t("accounting.model.shareWithheld"));
+    assert.equal(contents(spark.children[4]), t("accounting.model.separateAllowance"));
+    assert.equal(usage[1].apiPriceEquivalentUsd, 7, "rendering must preserve the retained API quote");
+    separate.listeners.click();
+    render(accounting);
+    assert.equal(modelRows()[0].attributes["aria-expanded"], "false");
+    assert.equal(modelRows()[1].attributes["aria-expanded"], "true");
+    assert.equal(modelRows()[2].attributes["aria-expanded"], "false");
+    assert.equal(modelRows()[1].attributes["aria-label"], t("accounting.model.collapse", {
+      model: t("accounting.model.separateMainAllowanceLabel", { model: "Codex Auto Review" }),
+    }));
+  }
+});
+
+
+test("metadata-qualified unknown models show main-allowance zero without inventing API-price evidence", async () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const { render, body, t } = await modelTable(locale);
+    const usage = ["primary", "separate"].map(allowanceTrack => ({
+      model: "unknown", pricingStatus: "unrecognized", allowanceTrack,
+      apiPriceEquivalentApplicable: allowanceTrack === "primary",
+      apiPriceEquivalentUsd: null, events: 1, totalTokens: 10,
+      components: { input_cache_read_tokens: 10 }, componentCosts: null,
+    }));
+    render({ modelUsage: usage, events: 1, totalTokens: 10, apiPriceEquivalentUsd: 0 });
+    const [ordinary, review] = body.children.filter(row => !row.dataset.componentOf);
+    assert.equal(contents(ordinary.children[4]), t("accounting.model.notPricedUnknown"));
+    assert.equal(contents(review.children[4]), "$0.00*");
+    assert.equal(contents(review.children[0]).replace("*", ""), t("accounting.model.identityUnavailable"));
+    assert.equal(contents(review.children[3]), t("accounting.model.shareWithheld"));
+    assert.equal(contents(review.children[5]), t("accounting.model.shareWithheld"));
+    assert.equal(usage[1].apiPriceEquivalentUsd, null);
+    assert.equal(usage[1].componentCosts, null);
+    const component = body.children[body.children.indexOf(review) + 1];
+    assert.equal(contents(component.children[4]), t("accounting.model.componentCostWithheld"));
+    assert.equal(component.children[4].title, t("accounting.model.separateMainAllowanceTitle"));
+  }
+});
+
+test("the shared separate-allowance explanation is localized and linked from accessible rows", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /id="accounting-model-allowance-footnote"[^>]+data-i18n="accounting.model.separateAllowanceFootnote"/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const key of [
+      "accounting.model.separateMainAllowanceTitle",
+      "accounting.model.separateMainAllowanceLabel",
+      "accounting.model.separateAllowanceFootnote",
+    ]) {
+      const text = translate(key, { model: "GPT-6.1 Sol" }, locale);
+      assert.notEqual(text, key);
+      assert.ok(text.length > 0);
+      if (key.endsWith("Title")) assert.match(text, /2026.*UTC/u);
+    }
+  }
+});

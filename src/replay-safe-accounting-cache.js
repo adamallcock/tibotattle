@@ -28,9 +28,9 @@ import {
 } from "./codex-transition-miner.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 import {
-  codexModelAllowanceTrack,
   codexModelApiPriceEquivalentApplicable,
   codexModelPricingStatus,
+  codexUsageAllowanceTrack,
   OPENAI_CODEX_SPARK_MODEL_ID,
   recognizedCodexModelId,
 } from "./export/index.js";
@@ -147,8 +147,11 @@ import {
 // v0.18: preserve unavailable context/components and derive fast-plan context
 // bands from reviewed cards. Rebuild prior totals rather than treating unknown
 // context as zero or reusing a short-context plan above a model's threshold.
+// v0.19: classify explicit auto-review source events by their observed instant
+// and keep separate-allowance usage out of primary periods and calibration.
+// Prior aggregates lack the event metadata needed to recover this distinction.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.18";
+  "local-replay-safe-accounting-v0.19";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -1129,7 +1132,7 @@ function newPeriod(id, label, { includeSpark = true } = {}) {
     declaredSpeedWeighting: emptySpeedWeightingCrossing(),
   };
   if (includeSpark) {
-    period.spark = newPeriod("spark", "Spark allowance", {
+    period.spark = newPeriod("spark", "Separate allowance", {
       includeSpark: false,
     });
   }
@@ -1470,6 +1473,10 @@ function eventProjection(event, price) {
     };
   }
   const cost = Number(priced.totalUsd);
+  const allowanceTrack = codexUsageAllowanceTrack(event.model, {
+    observedAt: event.timestamp,
+    threadSource: event.surfaceClassification?.threadSource,
+  });
   return {
     timestamp: event.timestamp,
     model,
@@ -1478,9 +1485,11 @@ function eventProjection(event, price) {
       standardPriceCardIds: priced.selectedPriceCardIds ?? [],
     }),
     modelPricingStatus: codexModelPricingStatus(event.model),
-    modelAllowanceTrack: codexModelAllowanceTrack(event.model),
+    modelAllowanceTrack: allowanceTrack,
     modelApiPriceEquivalentApplicable:
-      codexModelApiPriceEquivalentApplicable(event.model),
+      allowanceTrack === "primary"
+        && codexModelApiPriceEquivalentApplicable(event.model),
+    isSeparateAllowance: allowanceTrack !== "primary",
     isSpark: model === SPARK_MODEL,
     components,
     totalTokens,
@@ -2267,8 +2276,8 @@ function compactSpeedWeighting(crossing) {
 }
 
 function addEvent(period, event) {
-  if (event.isSpark) {
-    addEvent(period.spark, { ...event, isSpark: false });
+  if (event.isSeparateAllowance) {
+    addEvent(period.spark, { ...event, isSeparateAllowance: false });
     return;
   }
   period.events += 1;
@@ -2392,10 +2401,10 @@ function modelUsageRowSort(left, right) {
     || left.model.localeCompare(right.model);
 }
 
-// One row per model identity across every allowance track, for surfaces that
+// One row per model identity and allowance track, for surfaces that
 // render a single "model usage" table. `byModel` deliberately covers only the
 // primary allowance, because the period's own event/token/cost totals exclude
-// the separately metered Spark track and the two must stay reconcilable. A
+// separate allowance tracks and the two must stay reconcilable. A
 // renderer that wants every model on one list needs this instead, and each
 // row states which track it belongs to and whether an API-price equivalent is
 // a meaningful figure for it at all.
@@ -3829,7 +3838,7 @@ async function openUnifiedIndexCalibrationCorpus({
   const tokenValue = (value) => nullableTokenValue(value) ?? 0;
   // Mirrors exactly the rows the priced projection below retains, without
   // paying for pricing: eventProjection returns null only for an all-zero
-  // component total, and Spark rows are excluded from the calibration corpus.
+  // component total, and separate-allowance rows are excluded from calibration.
   // The discovery pass and the re-read streams share this predicate, so they
   // can never disagree about which rows the corpus contains.
   const retainedByLightFilter = (row) => {
@@ -3840,16 +3849,19 @@ async function openUnifiedIndexCalibrationCorpus({
       || tokenValue(row.tokens_out_text) > 0
       || tokenValue(row.tokens_out_reasoning) > 0
       || tokenValue(row.tokens_out_combined) > 0;
-    return anyTokens && safeModel(row.model_id) !== SPARK_MODEL;
+    return anyTokens && codexUsageAllowanceTrack(row.model_id, {
+      observedAt: Number(row.observed_at_ms),
+      threadSource: row.thread_source,
+    }) === "primary";
   };
   // The priced compact projection, identical to the windowed scan's retention
   // shape. Returns null for exactly the rows retainedByLightFilter refuses.
   const projectUsageRow = (row, position) => {
     const observedMs = Number(row.observed_at_ms);
     if (!Number.isSafeInteger(observedMs)) return null;
-    // Refuse the rows the discovery pass refused (zero-token, Spark) BEFORE
-    // deriving attribution: the memo is keyed by retained position, and a
-    // refused row would otherwise be derived and remembered under the
+    // Refuse the rows the discovery pass refused (zero-token or separate
+    // allowance) before deriving attribution: the memo is keyed by retained
+    // position; a refused row would otherwise be derived and remembered under the
     // position of the retained row that follows it.
     if (!retainedByLightFilter(row)) return null;
     projectedRows += 1;
@@ -3875,11 +3887,12 @@ async function openUnifiedIndexCalibrationCorpus({
         codexSpeedMode: row.codex_speed_mode,
         apiServiceTier: row.api_service_tier,
       },
+      surfaceClassification: { threadSource: row.thread_source },
     };
     const event = eventProjection(rawEvent, price);
     // The calibration corpus mirrors the scan retention exactly: no
-    // zero-token rows, and no separately metered Spark rows.
-    if (event === null || event.isSpark) return null;
+    // zero-token rows, and no separate-allowance rows.
+    if (event === null || event.isSeparateAllowance) return null;
     event.declaredSpeed = event.speed === "unknown"
       ? declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown"
       : "unknown";
@@ -3895,6 +3908,7 @@ async function openUnifiedIndexCalibrationCorpus({
              m.model_id AS model_id,
              t.codex_speed_mode AS codex_speed_mode,
              t.api_service_tier AS api_service_tier,
+             s.thread_source AS thread_source,
              u.tokens_in_uncached AS tokens_in_uncached,
              u.tokens_in_cache_read AS tokens_in_cache_read,
              u.tokens_in_cache_write AS tokens_in_cache_write,
@@ -3904,7 +3918,8 @@ async function openUnifiedIndexCalibrationCorpus({
              u.total_input_context AS total_input_context
       FROM usage_event u
       JOIN model m ON m.id = u.model_id
-      JOIN tier_semantics t ON t.id = u.tier_id`;
+      JOIN tier_semantics t ON t.id = u.tier_id
+      JOIN surface_class s ON s.id = u.surface_id`;
   try {
     verifyGeneration();
     if (generationId !== null) {
@@ -4003,13 +4018,9 @@ async function openUnifiedIndexCalibrationCorpus({
       afterRowId = Number(batch.at(-1).row_id);
       if (batch.length < UNIFIED_CALIBRATION_READ_BATCH_ROWS) break;
     }
-    if (retainedUsageEvents === 0) {
-      dispose();
-      return null;
-    }
     const usageMs = stampedMs.subarray(0, retainedUsageEvents);
     const usageRowid = stampedRowid.subarray(0, retainedUsageEvents);
-    const firstUsageMs = usageMs[0];
+    const firstUsageMs = usageMs[0] ?? null;
     const memoBytes = retainedUsageEvents * STREAMED_USAGE_MEMO_BYTES;
     if (stampBytes + memoBytes > limits.retainedBytes) {
       throw fixedError("accounting_transition_memory_budget_exceeded");
@@ -4160,9 +4171,11 @@ async function openUnifiedIndexCalibrationCorpus({
     }
     throwIfAborted(signal);
     checkRuntimeMemory();
-    const coveredStartMs = firstSnapshotMs === null
-      ? firstUsageMs
-      : Math.min(firstUsageMs, firstSnapshotMs);
+    const coveredStartMs = firstUsageMs === null
+      ? firstSnapshotMs
+      : firstSnapshotMs === null
+        ? firstUsageMs
+        : Math.min(firstUsageMs, firstSnapshotMs);
     verifyGeneration();
     let openMetadata;
     try {
@@ -4196,6 +4209,9 @@ async function openUnifiedIndexCalibrationCorpus({
         throw fixedError("accounting_calibration_corpus_unavailable");
       }
       verifyGeneration();
+      // A corpus containing only separate-allowance events has no primary
+      // usage to fit. Preserve its quota evidence as an empty valid corpus.
+      if (low === high) return;
       const endBoundMs = usageMs[high - 1];
       const endBoundRowid = usageRowid[high - 1];
       let cursorMs = usageMs[low];
@@ -4488,7 +4504,7 @@ export async function buildReplaySafeAccountingCache({
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
   const windowedPlanEvidence = calibrationPlanEvidence({ maximum: limits.weeklySnapshots });
-  let retainedSparkUsageEvents = 0;
+  let retainedSeparateAllowanceUsageEvents = 0;
   let retainedSparkSnapshotInputs = 0;
   const price = createAccountingPricer();
   let retainedTransitionBytes = 0;
@@ -4504,7 +4520,7 @@ export async function buildReplaySafeAccountingCache({
     }
   };
   const reserveTransitionInput = (kind) => {
-    const usageCount = rawUsageEvents.length + retainedSparkUsageEvents;
+    const usageCount = rawUsageEvents.length + retainedSeparateAllowanceUsageEvents;
     const snapshotCount = weeklyRateLimitSnapshots.length
       + retainedSparkSnapshotInputs;
     const combinedCount = usageCount + snapshotCount;
@@ -4616,12 +4632,12 @@ export async function buildReplaySafeAccountingCache({
         } else {
           observeUnretainedCalibrationInput();
         }
-        if (event.isSpark) {
-          if (retainWindowedCalibrationInputs) retainedSparkUsageEvents += 1;
+        if (event.isSeparateAllowance) {
+          if (retainWindowedCalibrationInputs) retainedSeparateAllowanceUsageEvents += 1;
           for (const [id, period] of periods) {
             if (observedMs >= starts[id]) addEvent(period, event);
           }
-          addTimelineEvent(sparkTimeline, event);
+          if (event.isSpark) addTimelineEvent(sparkTimeline, event);
           return;
         }
         if (retainWindowedCalibrationInputs) {
@@ -4833,7 +4849,7 @@ export async function buildReplaySafeAccountingCache({
   let compositionFitFailure = null;
   let transitionSeries;
   const retainedUsageEvents = retainWindowedCalibrationInputs
-    ? rawUsageEvents.length + retainedSparkUsageEvents
+    ? rawUsageEvents.length + retainedSeparateAllowanceUsageEvents
     : calibrationCorpus.retainedUsageEvents;
   const retainedWeeklySnapshots = retainWindowedCalibrationInputs
     ? weeklyRateLimitSnapshots.length + retainedSparkSnapshotInputs
