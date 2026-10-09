@@ -67,6 +67,8 @@ const PINNED_PATCH_SPECS = [
  * file, id, hunk count and sha256 of their exact [find, replace] texts.
  */
 const PINNED_SOURCE_PATCHES = [
+  ["apps/worker/src/admin-community-allowance.ts", "historical-preview-catalog-compatibility", 4,
+    "934d6837a8420c6f85d001e0b906726834783156e9bfed610e2bfffa00621fbe"],
   ["apps/worker/src/telemetry-usage-reconciliation.ts", "internal-analytics-json-replay", 9,
     "6120ad25ec598168134ac9d22806bd9655c9f6992b1c930e1b44da74e7ea552f"],
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "internal-analytics-json-composition", 3,

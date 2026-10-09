@@ -28,8 +28,8 @@
 // vendored files cannot do without). Each module is then written byte-for-byte
 // from its git blob. The three workspace packages are vendored whole
 // (package.json, index.js, index.d.ts and src/**). The only edits are the
-// `export ` tokens that EXPORT_PATCHES adds and the reviewed, semantics-
-// preserving SOURCE_PATCHES hunks (exact text, located by text, reversible,
+// `export ` tokens that EXPORT_PATCHES adds and the reviewed, reviewed
+// SOURCE_PATCHES hunks (exact text, located by text, reversible,
 // recorded in MANIFEST.json). Type-only imports are erased by
 // esbuild and are deliberately not vendored; for the few Worker modules that
 // vendored files name only for types, tsc emits declaration stubs from the
@@ -170,10 +170,13 @@ assertPatchSpecs(EXPORT_PATCHES);
 
 /**
  * Reviewed source patches: the only edits to vendored bytes beyond the export
- * tokens. Each changes how fast a kernel computes, never what it computes, and
- * carries its own argument for that in the patched text; the refresh's output
- * parity with the unpatched kernels (every analytics_v2 table digest and the
- * served body) is the acceptance gate, recorded with the change that adds one.
+ * tokens. Compute patches change how fast a kernel computes, never what it computes.
+ * The historical-preview compatibility patch changes only admission of one
+ * reviewed retained publication, preserving its values and evidence dates.
+ * Compute patches prove refresh-output parity with the unpatched kernels
+ * (every analytics_v2 table digest and the served body). The historical read
+ * patch instead proves exact catalog admission and unchanged publication values.
+ * Both gates are recorded with the change that adds the patch.
  *
  * A patch names a vendored Worker file, an id and its hunks. A hunk is an
  * exact `find` text and its `replace` text. Hunks are applied in order to the
@@ -184,6 +187,47 @@ assertPatchSpecs(EXPORT_PATCHES);
  * refuses the run (SOURCE_PATCH_UNRESOLVED): a re-vendor reviews them again.
  */
 export const SOURCE_PATCHES = Object.freeze([
+  {
+    id: "historical-preview-catalog-compatibility",
+    path: "apps/worker/src/admin-community-allowance.ts",
+    // Owner-approved retained-publication continuity and reviewed catalog
+    // prefix compatibility. No computed values or cached bytes are rewritten.
+    hunks: [
+      { find: `  if (!Array.isArray(models.modelConfig)
+      || models.modelConfig.length !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) {
+    return false;
+  }
+  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {`,
+        replace: `  if (!Array.isArray(models.modelConfig)) return false;
+  // The reviewed September 23 catalog is the exact 42-row predecessor of
+  // September 29: only GPT-6.1 Sol was appended. This is one known historical
+  // publication shape, never permission to accept an arbitrary roster prefix.
+  const historicalCatalog = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
+    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 43
+    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol"
+    && models.modelConfig.length === 42;
+  const expectedModels = historicalCatalog
+    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, 42)
+    : ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
+  if (models.modelConfig.length !== expectedModels.length) return false;
+  for (const [index, expected] of expectedModels.entries()) {` },
+      { find: `        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
+        || model.allowanceTrack !== expected.allowanceTrack`,
+        replace: `        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
+        || (historicalCatalog && model.label !== expected.label)
+        || model.allowanceTrack !== expected.allowanceTrack` },
+      { find: `    if (!validModelCompositionDay(candidate)) return false;
+    if (candidate.day <= previousDay`,
+        replace: `    if (!validModelCompositionDay(candidate)
+        // A predecessor roster cannot claim the appended model was observed.
+        // The shared reader still admits only its exact frozen older catalogs.
+        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) return false;
+    if (candidate.day <= previousDay` },
+      { find: `  return { ...parsed, models: { ...parsed.models, modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG } };`,
+        replace: `  return { ...parsed, models: { ...parsed.models,
+    modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, parsed.models.modelConfig.length) } };` },
+    ],
+  },
   {
     id: "internal-analytics-json-replay",
     path: "apps/worker/src/telemetry-usage-reconciliation.ts",

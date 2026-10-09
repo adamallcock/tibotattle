@@ -71,6 +71,12 @@
   ],
   "sourcePatches": [
     {
+      "path": "apps/worker/src/admin-community-allowance.ts",
+      "id": "historical-preview-catalog-compatibility",
+      "hunks": 4,
+      "sha256": "934d6837a8420c6f85d001e0b906726834783156e9bfed610e2bfffa00621fbe"
+    },
+    {
       "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
       "id": "internal-analytics-json-replay",
       "hunks": 9,
@@ -115,8 +121,8 @@
     "package": 40,
     "exportPatched": 6,
     "exportPatchedFiles": 3,
-    "sourcePatched": 6,
-    "sourcePatchedFiles": 5,
+    "sourcePatched": 7,
+    "sourcePatchedFiles": 6,
     "typeStubs": 3,
     "parityTests": 10
   },
@@ -145,8 +151,8 @@
     {
       "path": "apps/worker/src/admin-community-allowance.ts",
       "blob": "c836c294112eda15e11bb9f9a81f24bbafcb135c",
-      "sha256": "62f60992584e7716cf898ff9f90bb65c77991b021a2cda0a1553437aeb82fb9f",
-      "patch": "none",
+      "sha256": "ae4f2216a79e430efbff045afdb3b71515ad66676f3d9aefdbc8e8a9b992d00b",
+      "patch": "source",
       "reach": "kernel"
     },
     {

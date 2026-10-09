@@ -215,16 +215,25 @@ function validAdminCommunityAllowanceModels(
       || models.gate !== ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE) {
     return false;
   }
-  if (!Array.isArray(models.modelConfig)
-      || models.modelConfig.length !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) {
-    return false;
-  }
-  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {
+  if (!Array.isArray(models.modelConfig)) return false;
+  // The reviewed September 23 catalog is the exact 42-row predecessor of
+  // September 29: only GPT-6.1 Sol was appended. This is one known historical
+  // publication shape, never permission to accept an arbitrary roster prefix.
+  const historicalCatalog = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
+    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 43
+    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol"
+    && models.modelConfig.length === 42;
+  const expectedModels = historicalCatalog
+    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, 42)
+    : ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
+  if (models.modelConfig.length !== expectedModels.length) return false;
+  for (const [index, expected] of expectedModels.entries()) {
     const model = record(models.modelConfig[index]);
     if (model === null
         || !exactKeys(model, ["modelId", "label", "allowanceTrack", "pricingStatus"])
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
+        || (historicalCatalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       return false;
@@ -236,7 +245,10 @@ function validAdminCommunityAllowanceModels(
   }
   let previousDay = "";
   for (const candidate of models.days) {
-    if (!validModelCompositionDay(candidate)) return false;
+    if (!validModelCompositionDay(candidate)
+        // A predecessor roster cannot claim the appended model was observed.
+        // The shared reader still admits only its exact frozen older catalogs.
+        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) return false;
     if (candidate.day <= previousDay || candidate.day > latestAllowedDay) {
       return false;
     }
@@ -925,7 +937,8 @@ export async function readCachedAdminCommunityAllowancePreview(
   }
   // Display copy is not analytical identity. Never echo a stored label when a
   // reviewed catalog rename can supply the current content-free presentation.
-  return { ...parsed, models: { ...parsed.models, modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG } };
+  return { ...parsed, models: { ...parsed.models,
+    modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, parsed.models.modelConfig.length) } };
 }
 
 export interface AdminCommunityAllowancePreviewCacheResult {
