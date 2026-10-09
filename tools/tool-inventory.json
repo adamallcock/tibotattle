@@ -2720,6 +2720,7 @@
       "stableAliasReason": "Explicit disposable post-activation acceptance of the pinned production update journey; does not publish a feed or install the candidate itself.",
       "additionalAliases": [],
       "callers": [
+        "test/fixtures/macos-production-update-predecessor-index.mjs",
         ".github/workflows/electron-macos-production-update.yml",
         "test/smoke-electron-macos-production-update.test.mjs",
         "scripts/smoke-electron-macos-credentials.mjs"
@@ -2737,6 +2738,7 @@
       "stableAliasReason": "Explicit disposable signed replacement qualification with synthetic native state; never uses an existing user profile.",
       "additionalAliases": [],
       "callers": [
+        "test/fixtures/macos-production-update-predecessor-index.mjs",
         ".github/workflows/electron-macos-replacement.yml",
         "scripts/smoke-electron-macos-production-update.mjs",
         "scripts/smoke-electron-macos-sparkle-transition.mjs",
