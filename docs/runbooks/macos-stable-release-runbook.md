@@ -110,9 +110,17 @@ Before launching the predecessor, the runner snapshots that verified archive
 into private scratch and uses its public local-index API to create synthetic
 retained state and read the baseline. This keeps 0.1.26 state at format 11 until
 the installed successor performs the real forward migration to format 12.
-Post-update reads use the current API; neither database version labels nor the
+Post-update continuity reads use the current API; neither database version labels nor the
 signed application are modified to make the predecessor accept newer state.
 The scratch snapshot is removed after baseline inspection, including on failure.
+
+For v3, the runner passively waits for the updater-created successor to publish
+format 12 before checking first-launch continuity. An intact format-11 baseline
+can remain visible while ordinary refresh migrates a staging copy. Each poll
+checks the same successor process identity; current-format read failures, an
+invalid predecessor index, a changed process or an expired deadline fail the
+check. The runner never migrates the database, forces refresh, or restarts the
+app to manufacture first-launch readiness.
 
 The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and

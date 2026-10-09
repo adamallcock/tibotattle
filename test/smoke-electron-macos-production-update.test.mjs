@@ -9,6 +9,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
+import { seedSignedReplacementNativeState, readSignedReplacementState,
+  assertSignedReplacementContinuity } from '../scripts/smoke-electron-macos-replacement.mjs';
+import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
 const hash = (b, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(b).digest(encoding);
 const fixture = (target = 'darwin-arm64') => ({ schemaVersion: 'tibotattle-production-electron-update-intake-v1',
   target, sourceRevision: 'a'.repeat(40), buildNumber: '2026091106', version: '0.1.22', bundleVersion: '1029',
@@ -207,6 +210,13 @@ test('launch substages survive through the existing failure field without emitti
   assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: 'dashboard_target' }, 'fixed_production_feed'), 'fixed_production_feed');
   assert.equal(runner.productionUpdateFailureStage({ updateStage: 'production_feed_digest' }, 'fixed_production_feed'), 'production_feed_digest');
   assert.equal(runner.productionUpdateFailureStage({ transitionStage: 'process_identity' }, 'successor_process_capture'), 'process_identity');
+  for (const replacementStage of ['database_integrity', 'retained_state_changed', 'preferences_changed', 'opt_out_changed',
+    'unsafe_path', 'unsafe_file', 'changed_file']) {
+    assert.equal(runner.productionUpdateFailureStage({ replacementStage }, 'successor_continuity'),
+      'successor_continuity_' + replacementStage);
+  }
+  assert.equal(runner.productionUpdateFailureStage({ replacementStage: '/private/secret', message: 'private row' }, 'successor_state_read'),
+    'successor_state_read');
 });
 
 test('updater successor excludes an orphaned old companion but keeps new main and descendant semantics', () => {
@@ -277,6 +287,7 @@ export const openLocalUnifiedIndex = () => value;
 export const createUnifiedIndexWriter = () => {};
 export const outcomeOrdinal = () => 0;
 export const reasoningEffortOrdinal = () => 0;
+export const readLocalUnifiedIndexCompatibility = () => {};
 export const moduleUrl = import.meta.url;
 `;
 async function predecessorArchiveFixture(t, { source = fixtureIndexSource, link = false, unpacked = false } = {}) {
@@ -328,6 +339,13 @@ test('predecessor scratch is removed when baseline observation or API admission 
   await assert.rejects(runner.withProductionUpdatePredecessorIndex(missing.input, missing.app, () => assert.fail('not admitted')),
     error => error.updateStage === 'predecessor_fixture_api');
   assert.deepEqual(await scratchNames(missing.directory), []);
+  const compatibility = await predecessorArchiveFixture(t, {
+    source: fixtureIndexSource.replace('export const readLocalUnifiedIndexCompatibility = () => {};\n', ''),
+  });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...compatibility.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, compatibility.app, () => assert.fail('not admitted')),
+  error => error.updateStage === 'predecessor_fixture_api');
+  assert.deepEqual(await scratchNames(compatibility.directory), []);
   const dependency = await predecessorArchiveFixture(t, { source: "import './absent.js';\n" + fixtureIndexSource });
   await assert.rejects(runner.withProductionUpdatePredecessorIndex(dependency.input, dependency.app, () => assert.fail('not admitted')),
     { code: 'ERR_MODULE_NOT_FOUND' });
@@ -352,4 +370,141 @@ test('predecessor extraction refuses digest drift, linked paths, archive links a
   await assert.rejects(runner.withProductionUpdatePredecessorIndex(archiveLink.input, archiveLink.app, callback),
     error => error.updateStage === 'predecessor_fixture_archive');
   assert.deepEqual(await scratchNames(archiveLink.directory), []);
+});
+
+const successorPid = 200, successorCommand = '/synthetic/TiboTattle.app/Contents/MacOS/TiboTattle';
+const successorStartedAt = 'Mon Oct 12 01:02:03 2026';
+const successorFingerprint = successorCommand + '\n' + successorStartedAt;
+const successorProcess = () => [{ pid: successorPid, command: successorCommand, startedAt: successorStartedAt }];
+const predecessorCompatibility = { applicationId: 1431131465, userVersion: 11, formatUserVersion: 11,
+  minimumReaderUserVersion: 11, minimumWriterUserVersion: 11, metadataPresent: true,
+  metadataPartial: false, metadataMalformed: false };
+function newerStateError(patch = {}) {
+  return Object.assign(new Error('local_unified_index_schema_newer'), { code: 'local_unified_index_schema_newer',
+    compatibility: { accessMode: 'read', supportedUserVersion: 11, databaseUserVersion: 12, formatUserVersion: 12,
+      minimumReaderUserVersion: 12, minimumWriterUserVersion: 12, requiredUserVersion: 12, ...patch } });
+}
+function predecessorProbe({ compatibility = predecessorCompatibility, schema = 'local-unified-index-v2', integrity = 'ok' } = {}) {
+  const observations = { opens: [], closes: 0 };
+  return { observations,
+    openLocalUnifiedIndex(_path, options) {
+      observations.opens.push(options);
+      return { close() { observations.closes++; }, prepare(sql) {
+        if (sql === "SELECT value FROM meta WHERE key = 'schema_version'") return { get: () => ({ value: schema }) };
+        assert.equal(sql, 'PRAGMA quick_check');
+        return { get: () => ({ quick_check: integrity }) };
+      } };
+    },
+    readLocalUnifiedIndexCompatibility() { return compatibility; },
+  };
+}
+async function successorStateFixture(t) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-successor-state-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateRoot = join(directory, 'synthetic-state');
+  const before = await seedSignedReplacementNativeState(stateRoot, join(directory, 'synthetic-codex'));
+  return { stateRoot, before, database: join(stateRoot, 'local-unified-index-v1.sqlite') };
+}
+
+test('only exact predecessor v11 with intact compatibility metadata is pending, through read-only handles', async () => {
+  const predecessor = predecessorProbe();
+  assert.equal(await runner.readProductionUpdateSuccessorState('/synthetic/state', predecessor), null);
+  assert.deepEqual(predecessor.observations, { opens: [{ readOnly: true }], closes: 1 });
+  for (const patch of [{ applicationId: 0 }, { userVersion: 10 }, { userVersion: 12 }, { formatUserVersion: 10 },
+    { minimumReaderUserVersion: 10 }, { minimumWriterUserVersion: 12 }, { metadataPresent: false },
+    { metadataPartial: true }, { metadataMalformed: true }]) {
+    const bad = predecessorProbe({ compatibility: { ...predecessorCompatibility, ...patch } });
+    await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', bad),
+      error => error.updateStage === 'successor_state_schema');
+    assert.equal(bad.observations.closes, 1);
+  }
+  await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', predecessorProbe({ schema: 'unknown' })),
+    error => error.updateStage === 'successor_state_schema');
+  await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', predecessorProbe({ integrity: 'private corruption detail' })),
+    error => error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED' && error.updateStage === 'successor_state_database_integrity');
+});
+
+test('successor readiness waits for v11 pending admission then returns real current state without writing', async t => {
+  const { stateRoot, before, database } = await successorStateFixture(t), bytesBefore = await readFile(database);
+  const pending = predecessorProbe();
+  let elapsed = 0, probes = 0, identityChecks = 0;
+  const stages = [];
+  const predecessorIndex = { ...pending, openLocalUnifiedIndex(path, options) {
+    if (++probes < 3) return pending.openLocalUnifiedIndex(path, options);
+    assert.deepEqual(options, { readOnly: true }); throw newerStateError();
+  } };
+  const state = await runner.waitForProductionUpdateSuccessorState({ stateRoot, predecessorIndex, successorPid, successorFingerprint }, {
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; assert.deepEqual(await readFile(database), bytesBefore); },
+    readProcesses: identity => { identityChecks++; assert.equal(identity.get(successorPid), successorFingerprint); return successorProcess(); },
+    onStage: stage => stages.push(stage),
+  });
+  assert.deepEqual(state, before);
+  assert.equal(probes, 3);
+  assert.equal(identityChecks, 6);
+  assert.equal(elapsed, 600);
+  assert.equal(stages.filter(stage => stage === 'successor_state_readiness').length, 2);
+  assert.deepEqual(await readFile(database), bytesBefore);
+});
+
+test('endless v11 remains pending until the fixed timeout and never becomes acceptance', async () => {
+  let elapsed = 0, probes = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; }, readProcesses: successorProcess,
+    readState: async () => { probes++; return null; },
+  }), error => error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED' && error.updateStage === 'successor_state_timeout');
+  assert.equal(elapsed, 120000);
+  assert.equal(probes, 400);
+});
+
+test('dead, replaced or unidentifiable successor processes fail before another state observation', async () => {
+  for (const replacement of [[], [{ pid: successorPid, command: successorCommand, startedAt: 'different start' }],
+    [{ pid: successorPid, command: '/synthetic/replaced-process', startedAt: successorStartedAt }],
+    [{ pid: successorPid, command: successorCommand, startedAt: null }]]) {
+    let probes = 0, identities = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+      readProcesses: () => ++identities === 1 ? successorProcess() : replacement,
+      readState: async () => { probes++; return null; }, sleep: async () => assert.fail('must not wait after identity loss'),
+    }), error => error.updateStage === 'successor_state_process_identity');
+    assert.equal(probes, 1);
+  }
+  let reads = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    readProcesses: () => [], readState: async () => { reads++; return {}; },
+  }), error => error.updateStage === 'successor_state_process_identity');
+  assert.equal(reads, 0);
+  let readyChecks = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    readProcesses: () => ++readyChecks === 1 ? successorProcess() : [], readState: async () => ({ usageRows: 2 }),
+  }), error => error.updateStage === 'successor_state_process_identity');
+});
+
+test('malformed current v12 and unknown errors fail immediately without waiting or mutating state', async t => {
+  const { stateRoot, database } = await successorStateFixture(t);
+  const corrupt = openLocalUnifiedIndex(database, { readOnly: false });
+  corrupt.prepare("UPDATE meta SET value = 'unknown' WHERE key = 'schema_version'").run(); corrupt.close();
+  const bytesBefore = await readFile(database);
+  let probes = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot, successorPid, successorFingerprint,
+    predecessorIndex: { openLocalUnifiedIndex() { probes++; throw newerStateError(); } } }, {
+    readProcesses: successorProcess, sleep: async () => assert.fail('current schema errors are terminal'),
+  }), error => error.code === 'local_unified_index_schema_invalid');
+  assert.equal(probes, 1);
+  assert.deepEqual(await readFile(database), bytesBefore);
+  for (const error of [newerStateError({ databaseUserVersion: 13 }), newerStateError({ minimumReaderUserVersion: 13 }),
+    Object.assign(new Error('private diagnostic'), { code: 'local_unified_index_schema_invalid' })]) {
+    await assert.rejects(runner.readProductionUpdateSuccessorState(stateRoot, { openLocalUnifiedIndex() { throw error; } }),
+      failure => failure.updateStage === 'successor_state_schema' || failure === error);
+  }
+});
+
+test('current v12 continuity failures remain fatal after readiness succeeds', async t => {
+  const { stateRoot, before, database } = await successorStateFixture(t);
+  const writer = openLocalUnifiedIndex(database, { readOnly: false });
+  writer.prepare('UPDATE usage_event SET tokens_in_uncached = tokens_in_uncached + 1').run(); writer.close();
+  const after = await runner.readProductionUpdateSuccessorState(stateRoot, { openLocalUnifiedIndex() { throw newerStateError(); } });
+  assert.deepEqual(after, await readSignedReplacementState(stateRoot));
+  assert.throws(() => assertSignedReplacementContinuity(before, after,
+    { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false },
+    { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' }),
+  error => runner.productionUpdateFailureStage(error, 'successor_continuity') === 'successor_continuity_retained_state_changed');
 });

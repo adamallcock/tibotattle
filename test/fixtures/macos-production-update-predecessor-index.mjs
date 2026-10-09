@@ -8,7 +8,7 @@ import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { validateProductionUpdateIntake, verifyProductionUpdatePredecessor,
-  withProductionUpdatePredecessorIndex } from '../../scripts/smoke-electron-macos-production-update.mjs';
+  withProductionUpdatePredecessorIndex, readProductionUpdateSuccessorState } from '../../scripts/smoke-electron-macos-production-update.mjs';
 import { seedSignedReplacementNativeState, readSignedReplacementState,
   assertSignedReplacementContinuity } from '../../scripts/smoke-electron-macos-replacement.mjs';
 import { openLocalUnifiedIndex, readLocalUnifiedIndexCompatibility } from '../../src/local-unified-index.js';
@@ -36,7 +36,9 @@ try {
   await mkdir(directory, { mode: 0o700 }); // Refuse an existing profile/output.
   const archive = join(app, 'Contents', 'Resources', 'app.asar');
   const archiveBefore = digest(await readFile(archive));
-  const result = await withProductionUpdatePredecessorIndex({ ...input, directory }, app, async predecessor => {
+  const predecessor = await withProductionUpdatePredecessorIndex({ ...input, directory }, app, async index => index);
+  assert.equal((await readdir(directory)).some(name => name.startsWith('predecessor-index-')), false);
+  const result = await (async () => {
     const native = join(directory, 'synthetic-native'), database = join(native, 'local-unified-index-v1.sqlite');
     const seeded = await seedSignedReplacementNativeState(native, join(directory, 'synthetic-codex'), predecessor);
     const seededDigest = digest(await readFile(database)), beforeSchema = inspectSchema(database);
@@ -52,11 +54,16 @@ try {
     assert.deepEqual(baseline, seeded);
     assert.deepEqual(inspectSchema(database), beforeSchema);
     assert.equal(digest(await readFile(database)), seededDigest);
+    // Match the production lifetime: the authentic namespace probes pending
+    // v11 after its owned extraction directory has already been removed.
+    assert.equal(await readProductionUpdateSuccessorState(native, predecessor), null);
+    assert.equal(digest(await readFile(database)), seededDigest);
     assert.throws(() => openLocalUnifiedIndex(database, { readOnly: true }),
       error => error.code === 'local_unified_index_schema_invalid');
     assert.equal(digest(await readFile(database)), seededDigest);
     const migrated = openLocalUnifiedIndex(database, { readOnly: false }); migrated.close();
     const afterSchema = inspectSchema(database), after = await readSignedReplacementState(native);
+    assert.deepEqual(await readProductionUpdateSuccessorState(native, predecessor), after);
     assert.equal(afterSchema.compatibility.userVersion, 12);
     assert.equal(afterSchema.compatibility.formatUserVersion, 12);
     assert.equal(afterSchema.compatibility.minimumReaderUserVersion, 12);
@@ -74,7 +81,7 @@ try {
     return { beforeSchema, afterSchema, seededDigest, migratedDigest, retained: after,
       baselineReadUnchanged: true, currentReaderRefusedUnmigratedSchema: true,
       predecessorReaderAndWriterRefusedNewerSchemaWithoutMutation: true };
-  });
+  })();
   assert.equal(digest(await readFile(archive)), archiveBefore);
   assert.equal((await readdir(directory)).some(name => name.startsWith('predecessor-index-')), false);
   const report = { status: 'passed', target: input.target, predecessorAsarSha256: archiveBefore,

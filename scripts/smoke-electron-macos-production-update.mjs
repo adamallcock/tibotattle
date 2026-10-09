@@ -43,6 +43,9 @@ export function productionUpdateFailureStage(error, stage) {
   if (['predecessor_baseline', 'controlled_restart'].includes(stage) && launchStages.includes(error?.signedLaunchStage)) {
     return stage + '_' + error.signedLaunchStage;
   }
+  const replacementStages = ['database_integrity', 'retained_state_changed', 'preferences_changed', 'opt_out_changed',
+    'unsafe_path', 'unsafe_file', 'changed_file'];
+  if (replacementStages.includes(error?.replacementStage)) return stage + '_' + error.replacementStage;
   return error?.updateStage ?? error?.transitionStage ?? stage;
 }
 
@@ -99,8 +102,8 @@ async function safePath(path) {
   }
   if (await realpath(path) !== resolve(path)) fail('unsafe_path');
 }
-async function absent(path) {
-  try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return; throw error; } fail('preexisting_state');
+async function absent(path, stage = 'preexisting_state') {
+  try { await lstat(path); } catch (error) { if (error.code === 'ENOENT') return; throw error; } fail(stage);
 }
 async function bytes(path, limit = 1024 ** 3) {
   await safePath(path); const s = await lstat(path);
@@ -162,6 +165,63 @@ function productionUpdateProcesses(predecessorProcesses = null) {
     return row;
   });
 }
+// v3 only: the verified 026 reader can admit its exact live v11 while the
+// successor migrates a staging clone. The runner never opens a writable handle.
+export async function readProductionUpdateSuccessorState(stateRoot, predecessorIndex) {
+  let database;
+  try {
+    database = predecessorIndex.openLocalUnifiedIndex(join(stateRoot, 'local-unified-index-v1.sqlite'), { readOnly: true });
+  } catch (error) {
+    if (error?.code !== 'local_unified_index_schema_newer') throw error;
+    const compatibility = error.compatibility;
+    if (compatibility?.accessMode !== 'read' || compatibility.supportedUserVersion !== 11
+      || compatibility.databaseUserVersion !== 12 || compatibility.formatUserVersion !== 12
+      || compatibility.minimumReaderUserVersion !== 12 || compatibility.minimumWriterUserVersion !== 12
+      || compatibility.requiredUserVersion !== 12) fail('successor_state_schema');
+    // Every current-schema read, shape or integrity failure is terminal.
+    return readSignedReplacementState(stateRoot);
+  }
+  try {
+    const compatibility = predecessorIndex.readLocalUnifiedIndexCompatibility(database);
+    if (compatibility.applicationId !== 1431131465 || compatibility.userVersion !== 11
+      || compatibility.formatUserVersion !== 11 || compatibility.minimumReaderUserVersion !== 11
+      || compatibility.minimumWriterUserVersion !== 11 || compatibility.metadataPresent !== true
+      || compatibility.metadataPartial !== false || compatibility.metadataMalformed !== false
+      || database.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value !== 'local-unified-index-v2') {
+      fail('successor_state_schema');
+    }
+    if (database.prepare('PRAGMA quick_check').get()?.quick_check !== 'ok') fail('successor_state_database_integrity');
+    return null;
+  } finally { database.close(); }
+}
+export async function waitForProductionUpdateSuccessorState({ stateRoot, predecessorIndex, successorPid, successorFingerprint }, {
+  readProcesses = productionUpdateProcesses, readState = readProductionUpdateSuccessorState,
+  now = Date.now, sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)), onStage = () => {},
+} = {}) {
+  if (!Number.isSafeInteger(successorPid) || successorPid < 2 || typeof successorFingerprint !== 'string'
+    || successorFingerprint.split('\n').length !== 2 || successorFingerprint.split('\n').some(part => !part)) {
+    fail('successor_state_process_identity');
+  }
+  const identity = new Map([[successorPid, successorFingerprint]]), deadline = now() + 120000;
+  const assertIdentity = async () => {
+    onStage('successor_state_process_identity');
+    const rows = (await readProcesses(identity)).filter(row => row.pid === successorPid);
+    if (rows.length !== 1 || rows[0].command + '\n' + rows[0].startedAt !== successorFingerprint) {
+      fail('successor_state_process_identity');
+    }
+  };
+  while (now() < deadline) {
+    await assertIdentity();
+    onStage('successor_state_read');
+    const state = await readState(stateRoot, predecessorIndex);
+    await assertIdentity();
+    if (now() >= deadline) fail('successor_state_timeout');
+    if (state !== null) return state;
+    onStage('successor_state_readiness');
+    await sleep(Math.max(0, Math.min(300, deadline - now())));
+  }
+  fail('successor_state_timeout');
+}
 export function refreshProductionUpdateArchiveIndex(appPath) {
   const loaded = createRequire(require.resolve('electron-builder'))('@electron/asar'), api = loaded?.default ?? loaded;
   // ASAR 3.4.1 caches headers by pathname. An in-place updater replaces this
@@ -205,8 +265,9 @@ export async function withProductionUpdatePredecessorIndex(input, appPath, useIn
       }
     }
     const index = await import(pathToFileURL(join(extracted, 'src', 'local-unified-index.js')).href);
-    if (!['openLocalUnifiedIndex', 'createUnifiedIndexWriter', 'outcomeOrdinal', 'reasoningEffortOrdinal']
-      .every(name => typeof index[name] === 'function')) fail('predecessor_fixture_api');
+    const required = ['openLocalUnifiedIndex', 'createUnifiedIndexWriter', 'outcomeOrdinal', 'reasoningEffortOrdinal'];
+    if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v3') required.push('readLocalUnifiedIndexCompatibility');
+    if (!required.every(name => typeof index[name] === 'function')) fail('predecessor_fixture_api');
     return await useIndex(index);
   } finally {
     api.uncache(archive);
@@ -308,7 +369,7 @@ export async function runProductionUpdate(options) {
     await assertExtractedSignedMacBundle(predecessorDmg, app, join(input.directory, 'predecessor-verification-mount'));
     const verified = await verifyProductionUpdatePredecessor(input, app); proof.signedArtifactVerified = true;
     stage = 'predecessor_fixture';
-    const { before, environment, stateRoot, settingsFile, sharing } = await withProductionUpdatePredecessorIndex(input, app, async index => {
+    const { before, environment, stateRoot, settingsFile, sharing, predecessorIndex } = await withProductionUpdatePredecessorIndex(input, app, async index => {
       command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', app]);
       await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
       const seeded = await seedSignedReplacementNativeState(native, codex, index);
@@ -327,7 +388,9 @@ export async function runProductionUpdate(options) {
       const before = await readSignedReplacementState(stateRoot, index);
       assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
       await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
-      return { before, environment, stateRoot, settingsFile, sharing };
+      // The namespace's static dependencies remain loaded after owned scratch
+      // removal; the v3 readiness probe uses only its read-only public API.
+      return { before, environment, stateRoot, settingsFile, sharing, predecessorIndex: index };
     });
     // Invoke the ordinary Settings APIs; only the signed main process owns the updater/feed.
     stage = 'check_update';
@@ -376,11 +439,27 @@ export async function runProductionUpdate(options) {
     await verifySparkleTransitionCandidate(input, app);
     stage = 'successor_process_capture';
     captureMacTransitionProcesses(app, successor, knownProcesses);
+    const successorFingerprint = knownProcesses.get(successor);
     proof.updaterRelaunchedCandidate = true;
+    stage = 'successor_session_detach';
     for (const session of active.sessions) { try { session.close(); } catch {} } active = null;
     // The updater-created launch must preserve state before any controlled restart.
-    assertSignedReplacementContinuity(before, await readSignedReplacementState(stateRoot), JSON.parse(await readFile(settingsFile)), sharing);
-    await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
+    let successorState;
+    if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v3') {
+      stage = 'successor_state_readiness';
+      successorState = await waitForProductionUpdateSuccessorState({ stateRoot, predecessorIndex, successorPid: successor, successorFingerprint },
+        { onStage: value => { stage = value; } });
+    } else {
+      stage = 'successor_state_read';
+      successorState = await readSignedReplacementState(stateRoot);
+    }
+    stage = 'successor_settings_read';
+    const successorSettings = JSON.parse(await readFile(settingsFile));
+    stage = 'successor_continuity';
+    assertSignedReplacementContinuity(before, successorState, successorSettings, sharing);
+    stage = 'successor_binding_absence';
+    await absent(join(stateRoot, 'accountless-device-binding-v1.json'), 'successor_binding_present');
+    stage = 'successor_cleanup';
     await stopVerifiedMacTransitionProcesses({ appPath: app, knownProcesses, verifyApp: path => verifySparkleTransitionCandidate(input, path) });
     stage = 'controlled_restart';
     active = await launchVerifiedMacSharingApp(await verifySparkleTransitionCandidate(input, app), environment, { launchServices: true });
