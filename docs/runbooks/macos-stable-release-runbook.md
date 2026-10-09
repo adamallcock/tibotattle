@@ -106,11 +106,44 @@ hash: derive `predecessorAsarSha256` from the exact pinned DMG and retain that
 inspection; the runner compares the installed archive with it. A supplied hash
 or planned receipt alone is not artifact verification.
 
+Before launching the predecessor, the runner snapshots that verified archive
+into private scratch and uses its public local-index API to create synthetic
+retained state and read the baseline. This keeps 0.1.26 state at format 11 until
+the installed successor performs the real forward migration to format 12.
+Post-update continuity reads use the current API; neither database version labels nor the
+signed application are modified to make the predecessor accept newer state.
+The scratch snapshot is removed after baseline inspection, including on failure.
+
+For v3, the verified predecessor's normal ingestion API builds the retained
+index from a synthetic usage source. The fixture then retires only that owned
+source and keeps a separate metadata-only rollout discoverable. This makes
+ordinary startup refresh eligible without adding usage or quota observations.
+The artifact regression checks repeated predecessor and successor refreshes,
+including retained rows and the explicit partial-provenance state. This journey
+qualifies an upgrade with a discoverable source; profiles with no surviving
+source files require separate qualification.
+
+For v3, the runner passively waits for the updater-created successor to publish
+format 12 before checking first-launch continuity. An intact format-11 baseline
+can remain visible while ordinary refresh migrates a staging copy. Each poll
+checks the same successor process identity; current-format read failures, an
+invalid predecessor index, a changed process or an expired deadline fail the
+check. The runner never migrates the database, forces refresh, or restarts the
+app to manufacture first-launch readiness.
+
 The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and
 recorded opt-out. V2 and V3 require every captured predecessor process identity,
 including an orphaned companion, to exit before accepting the updater-created
-successor; later cleanup cannot satisfy that observation. Retain the separate
+successor; later cleanup cannot satisfy that observation. Capture binds each
+process command and start time from one bounded inventory sample. The complete
+predecessor snapshot must validate before Install is invoked; an unresolved
+live identity fails closed and cannot overwrite a previously verified identity.
+After Install, unresolved process observations stay pending within the existing
+fixed deadline. Newly unresolved descendants remain pending through orphaning
+until absence or proven ownership; uncertainty cannot establish exit or admit
+a successor. Malformed inventory and cleanup identity failures remain fatal.
+Retain the separate
 `tibotattle-signed-macos-production-update-v3` receipt for each architecture.
 It keeps `existingCredentialFixture: false`: the signed credential fixture is
 still a distinct gate. The historical intake/receipt v1 (0.1.20 predecessor)

@@ -3,11 +3,21 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile, readdir, lstat, symlink, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
+import { captureMacTransitionProcesses, readMacTransitionProcesses } from '../scripts/smoke-electron-macos-sparkle-transition.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
+import { seedSignedReplacementNativeState, readSignedReplacementState,
+  assertSignedReplacementContinuity } from '../scripts/smoke-electron-macos-replacement.mjs';
+import * as currentIndex from '../src/local-unified-index.js';
+import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
+import { ingestLocalUnifiedIndexIncrement } from '../src/local-unified-index-ingest.js';
+import { extractRolloutUsage, rolloutContentQuarantineReason } from '../src/local-unified-index-extract.js';
+import { inspectLocalOnboarding } from '../src/local-installation-diagnostics.js';
+import { localCodexLogScanner } from '../src/local-node-runtime.js';
 const hash = (b, algorithm = 'sha256', encoding = 'hex') => createHash(algorithm).update(b).digest(encoding);
 const fixture = (target = 'darwin-arm64') => ({ schemaVersion: 'tibotattle-production-electron-update-intake-v1',
   target, sourceRevision: 'a'.repeat(40), buildNumber: '2026091106', version: '0.1.22', bundleVersion: '1029',
@@ -197,6 +207,23 @@ test('failure classification emits fixed content-free fields and preserves comma
   assert.deepEqual(runner.classifyProductionUpdateFailure({code:'/secret',status:'1',signal:'private'}),
     {code:null,exitCode:null,signal:null,kind:'unclassified'});
 });
+test('launch substages survive through the existing failure field without emitting arbitrary diagnostics', () => {
+  for (const stage of ['predecessor_baseline', 'controlled_restart']) {
+    assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: 'dashboard_target', stage: '/private/path' }, stage),
+      stage + '_dashboard_target');
+    assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: '/private/path', stage: 'startup' }, stage), stage);
+  }
+  assert.equal(runner.productionUpdateFailureStage({ signedLaunchStage: 'dashboard_target' }, 'fixed_production_feed'), 'fixed_production_feed');
+  assert.equal(runner.productionUpdateFailureStage({ updateStage: 'production_feed_digest' }, 'fixed_production_feed'), 'production_feed_digest');
+  assert.equal(runner.productionUpdateFailureStage({ transitionStage: 'process_identity' }, 'successor_process_capture'), 'process_identity');
+  for (const replacementStage of ['database_integrity', 'retained_state_changed', 'preferences_changed', 'opt_out_changed',
+    'unsafe_path', 'unsafe_file', 'changed_file']) {
+    assert.equal(runner.productionUpdateFailureStage({ replacementStage }, 'successor_continuity'),
+      'successor_continuity_' + replacementStage);
+  }
+  assert.equal(runner.productionUpdateFailureStage({ replacementStage: '/private/secret', message: 'private row' }, 'successor_state_read'),
+    'successor_state_read');
+});
 
 test('updater successor excludes an orphaned old companion but keeps new main and descendant semantics', () => {
   const executable = '/qualified/TiboTattle.app/Contents/MacOS/TiboTattle';
@@ -235,6 +262,177 @@ test('v2 requires every old process identity to exit before successor acceptance
     assert.throws(() => runner.selectCurrentProductionUpdateSuccessor([row(200, 1)], executable, 100, processes));
   }
 });
+
+test('actual capture produces a detached valid snapshot before Install even when a descendant disappears', () => {
+  const appPath = '/synthetic/TiboTattle.app', executable = appPath + '/Contents/MacOS/TiboTattle';
+  const start = 'Sun Oct 4 02:00:00 2026', helper = '/synthetic/helper';
+  const row = (pid, parent, command = executable, startedAt = start) => ({ pid, parent, group: pid, command, startedAt });
+  for (const currentRoute of [false, true]) {
+    const knownProcesses = new Map();
+    captureMacTransitionProcesses(appPath, 100, knownProcesses, { readProcesses: () => [row(100, 1), row(101, 100, helper)] });
+    let calls = 0;
+    const snapshot = runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100, knownProcesses, currentRoute,
+      install: () => { calls += 1; return Promise.resolve(); } }, {
+      readProcesses: () => readMacTransitionProcesses({ run: () => ` 100 1 100 Sun Oct  4 02:00:00 2026     ${executable}\n` }),
+    });
+    assert.equal(calls, 1);
+    assert.notEqual(snapshot, knownProcesses);
+    assert.deepEqual([...snapshot.keys()], [100, 101]);
+    knownProcesses.set(300, executable + '\n' + start);
+    assert.equal(snapshot.has(300), false, 'later cleanup capture cannot change predecessor evidence');
+    if (!currentRoute) { assert.ok(snapshot instanceof Set); continue; }
+    assert.equal(snapshot.get(101), helper + '\n' + start);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper), row(200, 1)], executable, 100, snapshot), null);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper, '  Sun Oct  4 02:00:00 2026  '), row(200, 1)], executable, 100, snapshot), null,
+      'timestamp padding cannot create false natural-exit evidence');
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, helper, null), row(200, 1)], executable, 100, snapshot), null);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(101, 1, '/synthetic/unrelated', 'Sun Oct 4 03:00:00 2026'), row(200, 1)], executable, 100, snapshot).pid, 200);
+    assert.equal(runner.selectCurrentProductionUpdateSuccessor([row(100, 1, executable, 'Sun Oct 4 03:00:00 2026')], executable, 100, snapshot), null);
+  }
+});
+
+test('unresolved live captures and failed resamples prevent Install without poisoning valid history', () => {
+  const appPath = '/synthetic/TiboTattle.app', executable = appPath + '/Contents/MacOS/TiboTattle';
+  const start = 'Sun Oct 4 02:00:00 2026';
+  const row = (pid, parent, startedAt = start) => ({ pid, parent, group: pid, command: executable, startedAt });
+  const samples = [
+    () => [row(100, 1), row(101, 100, null), row(102, 101)],
+    () => [row(100, 1), row(101, 100, ''), row(102, 101)],
+    () => [row(100, 1, '')],
+    () => [row(100, 1, 'Sun Oct 4 03:00:00 2026')],
+    () => [],
+    () => { throw new Error('private inventory failure'); },
+  ];
+  for (const readProcesses of samples) {
+    const knownProcesses = new Map();
+    captureMacTransitionProcesses(appPath, 100, knownProcesses, { readProcesses: () => [row(100, 1), row(101, 100)] });
+    const before = new Map(knownProcesses);
+    let installed = false;
+    assert.throws(() => runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100, knownProcesses, currentRoute: true,
+      install: () => { installed = true; return Promise.resolve(); } }, { readProcesses }),
+    error => error.updateStage === 'predecessor_process_identity' && error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED');
+    assert.equal(installed, false);
+    assert.deepEqual(knownProcesses, before);
+  }
+  for (const fingerprint of [null, executable + '\n', executable + '\nprivate invalid time']) {
+    let installed = false;
+    assert.throws(() => runner.requestProductionUpdateInstall({ appPath, predecessorPid: 100,
+      knownProcesses: new Map([[100, fingerprint]]), currentRoute: true,
+      install: () => { installed = true; return Promise.resolve(); } }, { readProcesses: () => [row(100, 1)] }),
+    error => error.updateStage === 'predecessor_process_identity');
+    assert.equal(installed, false, 'unsafe historical entries are refused, never filtered');
+  }
+});
+
+const pollingApp = '/synthetic/TiboTattle.app', pollingExecutable = pollingApp + '/Contents/MacOS/TiboTattle';
+const pollingStart = 'Sun Oct 4 02:00:00 2026';
+const pollingRow = (pid, parent, command = pollingExecutable, startedAt = pollingStart) => ({ pid, parent, group: pid, command, startedAt });
+function pollingFixture(currentRoute = true, initialRows = [pollingRow(100, 1)]) {
+  const knownProcesses = new Map();
+  const predecessorProcesses = runner.requestProductionUpdateInstall({ appPath: pollingApp, predecessorPid: 100,
+    knownProcesses, currentRoute, install: () => Promise.resolve() }, { readProcesses: () => initialRows });
+  return { appPath: pollingApp, predecessorPid: 100, knownProcesses, predecessorProcesses, currentRoute };
+}
+
+test('post-Install observer waits for same-start exec, zombie or unknown start to exit before selecting from that same sample', async () => {
+  for (const currentRoute of [false, true]) {
+    const input = pollingFixture(currentRoute), before = new Map(input.knownProcesses);
+    const samples = [
+      [pollingRow(100, 1, '/synthetic/exec-replacement'), pollingRow(200, 1)],
+      [pollingRow(100, 1, '<defunct>'), pollingRow(200, 1)],
+      [pollingRow(100, 1, pollingExecutable, null), pollingRow(200, 1)],
+      [pollingRow(200, 1)],
+    ];
+    let reads = 0, elapsed = 0;
+    const selected = await runner.waitForProductionUpdateSuccessor(input, {
+      readProcesses: () => { assert.ok(reads < samples.length, 'one inventory per observation and selection'); return samples[reads++]; },
+      now: () => elapsed, sleep: async milliseconds => { assert.equal(milliseconds, 300); elapsed += milliseconds; },
+    });
+    assert.equal(selected, 200);
+    assert.equal(reads, 4);
+    assert.equal(elapsed, 900);
+    assert.deepEqual(input.knownProcesses, before, 'transitional rows never replace the proven identity or own the successor');
+  }
+});
+
+test('post-Install unknown descendant remains pending through orphaning and timestamp recovery until observed exit', async () => {
+  const input = pollingFixture(), before = new Map(input.knownProcesses);
+  const samples = [
+    [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, ''), pollingRow(102, 101), pollingRow(200, 1)],
+    [pollingRow(101, 1), pollingRow(102, 101), pollingRow(200, 1)],
+    [pollingRow(102, 1), pollingRow(200, 1)],
+    [pollingRow(200, 1)],
+  ];
+  let reads = 0, elapsed = 0;
+  assert.equal(await runner.waitForProductionUpdateSuccessor(input, {
+    readProcesses: () => { assert.ok(reads < samples.length); return samples[reads++]; },
+    now: () => elapsed, sleep: async milliseconds => {
+      elapsed += milliseconds;
+      assert.deepEqual(input.knownProcesses, before, 'neither the unknown parent nor its descendants acquire ownership');
+    },
+  }), 200);
+  assert.equal(reads, 4);
+  assert.equal(elapsed, 900);
+  assert.deepEqual(input.knownProcesses, before);
+});
+
+test('an unresolved new descendant reusing a historical PID stays pending after orphaning with a different start', async () => {
+  const input = pollingFixture(true, [pollingRow(100, 1), pollingRow(101, 100)]);
+  const before = new Map(input.knownProcesses);
+  const samples = [
+    [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, null), pollingRow(200, 1)],
+    [pollingRow(101, 1, pollingExecutable, 'Sun Oct 4 03:00:00 2026'), pollingRow(200, 1)],
+    [pollingRow(200, 1)],
+  ];
+  let reads = 0, elapsed = 0;
+  assert.equal(await runner.waitForProductionUpdateSuccessor(input, {
+    readProcesses: () => { assert.ok(reads < samples.length); return samples[reads++]; },
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; },
+  }), 200);
+  assert.equal(reads, 3, 'the orphaned reused PID cannot be silently dropped from pending');
+  assert.equal(elapsed, 600);
+  assert.deepEqual(input.knownProcesses, before);
+});
+
+test('persistent post-Install uncertainty exhausts the original fixed 180-second timeout', async () => {
+  for (const unresolved of ['exec', 'orphan']) {
+    const input = pollingFixture(), before = new Map(input.knownProcesses);
+    let elapsed = 0, reads = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessor(input, {
+      readProcesses: () => {
+        reads += 1;
+        if (unresolved === 'exec') return [pollingRow(100, 1, '<defunct>'), pollingRow(200, 1)];
+        return reads === 1
+          ? [pollingRow(100, 1), pollingRow(101, 100, pollingExecutable, null), pollingRow(200, 1)]
+          : [pollingRow(101, 1), pollingRow(200, 1)];
+      },
+      now: () => elapsed, sleep: async milliseconds => { assert.equal(milliseconds, 300); elapsed += milliseconds; },
+    }), error => error.updateStage === 'updater_relaunch' && error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED');
+    assert.equal(elapsed, 180000);
+    assert.equal(reads, 600);
+    assert.deepEqual(input.knownProcesses, before);
+  }
+});
+
+test('post-Install malformed evidence and inventory failures remain fatal without entering the pending timer', async () => {
+  const cases = [
+    { knownProcesses: new Map([[100, null]]) },
+    { predecessorProcesses: new Map([[100, null]]) },
+    { readProcesses: () => [pollingRow(100, 1), pollingRow(100, 1)] },
+    { readProcesses: () => [{ ...pollingRow(100, 1), parent: null }] },
+    { readProcesses: () => [pollingRow(100, 1, 'malformed\0command')] },
+    { readProcesses: () => [pollingRow(100, 1, pollingExecutable, {})] },
+    { readProcesses: () => { throw new Error('private unexpected inventory failure'); } },
+  ];
+  for (const { readProcesses = () => [pollingRow(100, 1)], ...patch } of cases) {
+    let sleeps = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessor({ ...pollingFixture(), ...patch }, {
+      readProcesses, now: () => 0, sleep: async () => { sleeps += 1; assert.fail('fatal state must not wait'); },
+    }), error => ['process_identity', 'process_inventory', 'predecessor_process_identity'].includes(error.transitionStage ?? error.updateStage)
+      && !error.message.includes('private'));
+    assert.equal(sleeps, 0);
+  }
+});
 test('replacement verification refreshes the real ASAR path cache after an updater swaps bytes', async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-asar-replacement-')));
   const app = join(directory, 'TiboTattle.app'), resource = join(app, 'Contents', 'Resources');
@@ -259,4 +457,317 @@ test('replacement verification refreshes the real ASAR path cache after an updat
     assert.equal(JSON.parse(api.extractFile(archive,'package.json').toString()).version, '0.1.22');
     assert.equal(hash(await readFile(archive)), signedBytesBefore);
   } finally { api.uncache(archive); await rm(directory, { recursive:true, force:true }); }
+});
+
+const fixtureIndexSource = `import { value } from './fixture-value.js';
+export const openLocalUnifiedIndex = () => value;
+export const createUnifiedIndexWriter = () => {};
+export const outcomeOrdinal = () => 0;
+export const reasoningEffortOrdinal = () => 0;
+export const readLocalUnifiedIndexCompatibility = () => {};
+export const moduleUrl = import.meta.url;
+`;
+async function predecessorArchiveFixture(t, { source = fixtureIndexSource,
+  ingest = 'export const ingestLocalUnifiedIndexIncrement = () => "pinned ingestion";', link = false, unpacked = false } = {}) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-predecessor-api-')));
+  const app = join(directory, 'TiboTattle.app'), archive = join(app, 'Contents', 'Resources', 'app.asar');
+  const tree = join(directory, 'source');
+  const req = createRequire(import.meta.url), loaded = createRequire(req.resolve('electron-builder'))('@electron/asar');
+  const api = loaded.default ?? loaded;
+  t.after(async () => { api.uncache(archive); await rm(directory, { recursive: true, force: true }); });
+  await mkdir(dirname(archive), { recursive: true });
+  await mkdir(join(tree, 'src'), { recursive: true });
+  await writeFile(join(tree, 'package.json'), JSON.stringify({ type: 'module' }));
+  await writeFile(join(tree, 'src', 'local-unified-index.js'), source);
+  await writeFile(join(tree, 'src', 'local-unified-index-ingest.js'), ingest);
+  await writeFile(join(tree, 'src', 'fixture-value.js'), 'export const value = "pinned predecessor";');
+  if (link) await symlink('fixture-value.js', join(tree, 'src', 'fixture-link.js'));
+  if (unpacked) await writeFile(join(tree, 'native.node'), 'unbound native bytes');
+  await api.createPackageWithOptions(tree, archive, unpacked ? { unpack: '*.node' } : {});
+  const input = { directory, predecessorAsarSha256: hash(await readFile(archive)) };
+  return { directory, app, archive, input };
+}
+const scratchNames = async directory => (await readdir(directory)).filter(name => name.startsWith('predecessor-index-'));
+
+test('predecessor API loads exact packed archive bytes with private permissions and removes owned scratch', async t => {
+  const { directory, app, archive, input } = await predecessorArchiveFixture(t, { unpacked: true });
+  const before = await readFile(archive);
+  const result = await runner.withProductionUpdatePredecessorIndex(input, app, async index => {
+    const module = fileURLToPath(index.moduleUrl), extracted = dirname(dirname(module));
+    assert.equal(index.openLocalUnifiedIndex(), 'pinned predecessor');
+    assert.equal((await lstat(module)).mode & 0o777, 0o600);
+    assert.equal((await lstat(extracted)).mode & 0o777, 0o700);
+    assert.equal((await lstat(dirname(extracted))).mode & 0o777, 0o700);
+    assert.deepEqual(await readFile(join(dirname(extracted), 'predecessor.asar')), before);
+    await assert.rejects(lstat(join(extracted, 'native.node')), { code: 'ENOENT' });
+    assert.equal((await scratchNames(directory)).length, 1);
+    return 'accepted';
+  });
+  assert.equal(result, 'accepted');
+  assert.deepEqual(await readFile(archive), before);
+  assert.deepEqual(await scratchNames(directory), []);
+});
+
+test('only v3 loads and requires the verified predecessor public ingestion API', async t => {
+  const valid = await predecessorArchiveFixture(t);
+  const result = await runner.withProductionUpdatePredecessorIndex({ ...valid.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, valid.app, (_index, ingest) => ingest());
+  assert.equal(result, 'pinned ingestion');
+  assert.deepEqual(await scratchNames(valid.directory), []);
+  const missing = await predecessorArchiveFixture(t, { ingest: 'export const unrelated = true;' });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...missing.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, missing.app, () => assert.fail('not admitted')),
+  error => error.updateStage === 'predecessor_fixture_api');
+  for (const schemaVersion of ['tibotattle-production-electron-update-intake-v1', 'tibotattle-production-electron-update-intake-v2']) {
+    await runner.withProductionUpdatePredecessorIndex({ ...missing.input, schemaVersion }, missing.app, (_index, ingest) => assert.equal(ingest, null));
+  }
+  assert.deepEqual(await scratchNames(missing.directory), []);
+});
+
+test('retained-source fixture uses real ingestion and leaves one discoverable content-free zero-usage rollout', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-retained-fixture-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const codexHome = join(directory, 'codex'), native = join(directory, 'native');
+  await mkdir(codexHome, { mode: 0o700 });
+  await mkdir(join(codexHome, 'sessions'), { mode: 0o700 });
+  const passes = [];
+  const seeded = await runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, async options => {
+    const result = await ingestLocalUnifiedIndexIncrement(options);
+    passes.push(result);
+    return result;
+  });
+  assert.equal(seeded.usageRows, 2);
+  assert.equal(seeded.quotaRows, 2);
+  assert.equal(seeded.tokensInUncached, 203);
+  assert.deepEqual(passes.map(result => [result.generation.status, result.generation.discoveredSourceCount,
+    result.generation.indexedSourceCount, result.generation.usageEvents, result.generation.quotaOccurrences]),
+  [['complete', 2, 2, 2, 2], ['complete', 1, 2, 2, 2]]);
+  const onboarding = await inspectLocalOnboarding({ codexHome, stateRoot: native });
+  assert.equal(onboarding.status, 'ready');
+  assert.equal(onboarding.source.rolloutFilesPresent, true);
+  assert.equal(onboarding.source.rolloutFilesObserved, 1);
+  const infos = await localCodexLogScanner.discoverCodexRolloutInfos({ codexHome, startAt: '1970-01-01T00:00:00.000Z' });
+  assert.equal(infos.length, 1);
+  const names = await readdir(join(codexHome, 'sessions'));
+  assert.deepEqual(names, ['rollout-2026-08-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl']);
+  const source = join(codexHome, 'sessions', names[0]), content = await readFile(source, 'utf8');
+  assert.equal(content, JSON.stringify({ timestamp: '2026-08-01T00:00:00.000Z', type: 'session_meta',
+    payload: { id: '22222222-2222-4222-8222-222222222222' } }) + '\n');
+  assert.equal((await lstat(source)).mode & 0o777, 0o600);
+  const events = [], boundaries = [], tools = [];
+  const extracted = await extractRolloutUsage(source, { size: Buffer.byteLength(content),
+    onEvent: event => events.push(event), onBoundary: event => boundaries.push(event), onTool: event => tools.push(event) });
+  assert.equal(extracted.diagnostics.sessionMetaRecords, 1);
+  assert.equal(rolloutContentQuarantineReason(extracted), null);
+  assert.deepEqual({ events, boundaries, tools }, { events: [], boundaries: [], tools: [] });
+  for (let pass = 0; pass < 2; pass += 1) {
+    const result = await ingestLocalUnifiedIndexIncrement({ codexHome, indexFile: join(native, 'local-unified-index-v1.sqlite'),
+      secretFile: join(native, 'local-unified-index-device-salt-v1'), contractVersion: 'telemetry-contribution-v0.1' });
+    assert.equal(result.unchanged, true);
+    assert.equal(result.insertedUsageEvents, 0);
+    assert.deepEqual(await readSignedReplacementState(native), seeded);
+  }
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement), { code: 'EEXIST' });
+  assert.equal(await readFile(source, 'utf8'), content);
+  assert.deepEqual(await readSignedReplacementState(native), seeded);
+});
+
+test('retained-source fixture refuses unsafe directories and never retires a changed usage source', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-retained-refusal-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const codexHome = join(directory, 'codex'), sessions = join(codexHome, 'sessions'), native = join(directory, 'native');
+  await mkdir(codexHome, { mode: 0o700 }); await mkdir(sessions, { mode: 0o700 });
+  await chmod(sessions, 0o755);
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement),
+    error => error.updateStage === 'predecessor_fixture_location');
+  await assert.rejects(lstat(native), { code: 'ENOENT' });
+  await chmod(sessions, 0o700);
+  let changed;
+  await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, async options => {
+    const result = await ingestLocalUnifiedIndexIncrement(options);
+    changed = join(sessions, (await readdir(sessions)).find(name => name.includes('11111111')));
+    await writeFile(changed, 'changed synthetic source\n');
+    return result;
+  }), error => error.updateStage === 'predecessor_fixture_source');
+  assert.equal(await readFile(changed, 'utf8'), 'changed synthetic source\n');
+});
+
+test('predecessor scratch is removed when baseline observation or API admission fails', async t => {
+  const good = await predecessorArchiveFixture(t);
+  const interrupted = new Error('synthetic baseline interruption');
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(good.input, good.app, async () => { throw interrupted; }),
+    error => error === interrupted);
+  assert.deepEqual(await scratchNames(good.directory), []);
+  const missing = await predecessorArchiveFixture(t, { source: 'export const openLocalUnifiedIndex = () => {};' });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(missing.input, missing.app, () => assert.fail('not admitted')),
+    error => error.updateStage === 'predecessor_fixture_api');
+  assert.deepEqual(await scratchNames(missing.directory), []);
+  const compatibility = await predecessorArchiveFixture(t, {
+    source: fixtureIndexSource.replace('export const readLocalUnifiedIndexCompatibility = () => {};\n', ''),
+  });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...compatibility.input,
+    schemaVersion: 'tibotattle-production-electron-update-intake-v3' }, compatibility.app, () => assert.fail('not admitted')),
+  error => error.updateStage === 'predecessor_fixture_api');
+  assert.deepEqual(await scratchNames(compatibility.directory), []);
+  const dependency = await predecessorArchiveFixture(t, { source: "import './absent.js';\n" + fixtureIndexSource });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(dependency.input, dependency.app, () => assert.fail('not admitted')),
+    { code: 'ERR_MODULE_NOT_FOUND' });
+  assert.deepEqual(await scratchNames(dependency.directory), []);
+});
+
+test('predecessor extraction refuses digest drift, linked paths, archive links and writable scratch parents', async t => {
+  const fixture = await predecessorArchiveFixture(t);
+  const callback = () => assert.fail('unsafe predecessor must never be imported');
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...fixture.input, predecessorAsarSha256: '0'.repeat(64) }, fixture.app, callback),
+    error => error.updateStage === 'predecessor_asar');
+  assert.deepEqual(await scratchNames(fixture.directory), []);
+  const linked = join(fixture.directory, 'linked'); await symlink(fixture.directory, linked);
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex({ ...fixture.input, directory: linked }, fixture.app, callback),
+    error => error.updateStage === 'unsafe_path');
+  await chmod(fixture.directory, 0o777);
+  try {
+    await assert.rejects(runner.withProductionUpdatePredecessorIndex(fixture.input, fixture.app, callback),
+      error => error.updateStage === 'predecessor_fixture_location');
+  } finally { await chmod(fixture.directory, 0o700); }
+  const archiveLink = await predecessorArchiveFixture(t, { link: true });
+  await assert.rejects(runner.withProductionUpdatePredecessorIndex(archiveLink.input, archiveLink.app, callback),
+    error => error.updateStage === 'predecessor_fixture_archive');
+  assert.deepEqual(await scratchNames(archiveLink.directory), []);
+});
+
+const successorPid = 200, successorCommand = '/synthetic/TiboTattle.app/Contents/MacOS/TiboTattle';
+const successorStartedAt = 'Mon Oct 12 01:02:03 2026';
+const successorFingerprint = successorCommand + '\n' + successorStartedAt;
+const successorProcess = () => [{ pid: successorPid, command: successorCommand, startedAt: successorStartedAt }];
+const predecessorCompatibility = { applicationId: 1431131465, userVersion: 11, formatUserVersion: 11,
+  minimumReaderUserVersion: 11, minimumWriterUserVersion: 11, metadataPresent: true,
+  metadataPartial: false, metadataMalformed: false };
+function newerStateError(patch = {}) {
+  return Object.assign(new Error('local_unified_index_schema_newer'), { code: 'local_unified_index_schema_newer',
+    compatibility: { accessMode: 'read', supportedUserVersion: 11, databaseUserVersion: 12, formatUserVersion: 12,
+      minimumReaderUserVersion: 12, minimumWriterUserVersion: 12, requiredUserVersion: 12, ...patch } });
+}
+function predecessorProbe({ compatibility = predecessorCompatibility, schema = 'local-unified-index-v2', integrity = 'ok' } = {}) {
+  const observations = { opens: [], closes: 0 };
+  return { observations,
+    openLocalUnifiedIndex(_path, options) {
+      observations.opens.push(options);
+      return { close() { observations.closes++; }, prepare(sql) {
+        if (sql === "SELECT value FROM meta WHERE key = 'schema_version'") return { get: () => ({ value: schema }) };
+        assert.equal(sql, 'PRAGMA quick_check');
+        return { get: () => ({ quick_check: integrity }) };
+      } };
+    },
+    readLocalUnifiedIndexCompatibility() { return compatibility; },
+  };
+}
+async function successorStateFixture(t) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-successor-state-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateRoot = join(directory, 'synthetic-state');
+  const before = await seedSignedReplacementNativeState(stateRoot, join(directory, 'synthetic-codex'));
+  return { stateRoot, before, database: join(stateRoot, 'local-unified-index-v1.sqlite') };
+}
+
+test('only exact predecessor v11 with intact compatibility metadata is pending, through read-only handles', async () => {
+  const predecessor = predecessorProbe();
+  assert.equal(await runner.readProductionUpdateSuccessorState('/synthetic/state', predecessor), null);
+  assert.deepEqual(predecessor.observations, { opens: [{ readOnly: true }], closes: 1 });
+  for (const patch of [{ applicationId: 0 }, { userVersion: 10 }, { userVersion: 12 }, { formatUserVersion: 10 },
+    { minimumReaderUserVersion: 10 }, { minimumWriterUserVersion: 12 }, { metadataPresent: false },
+    { metadataPartial: true }, { metadataMalformed: true }]) {
+    const bad = predecessorProbe({ compatibility: { ...predecessorCompatibility, ...patch } });
+    await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', bad),
+      error => error.updateStage === 'successor_state_schema');
+    assert.equal(bad.observations.closes, 1);
+  }
+  await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', predecessorProbe({ schema: 'unknown' })),
+    error => error.updateStage === 'successor_state_schema');
+  await assert.rejects(runner.readProductionUpdateSuccessorState('/synthetic/state', predecessorProbe({ integrity: 'private corruption detail' })),
+    error => error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED' && error.updateStage === 'successor_state_database_integrity');
+});
+
+test('successor readiness waits for v11 pending admission then returns real current state without writing', async t => {
+  const { stateRoot, before, database } = await successorStateFixture(t), bytesBefore = await readFile(database);
+  const pending = predecessorProbe();
+  let elapsed = 0, probes = 0, identityChecks = 0;
+  const stages = [];
+  const predecessorIndex = { ...pending, openLocalUnifiedIndex(path, options) {
+    if (++probes < 3) return pending.openLocalUnifiedIndex(path, options);
+    assert.deepEqual(options, { readOnly: true }); throw newerStateError();
+  } };
+  const state = await runner.waitForProductionUpdateSuccessorState({ stateRoot, predecessorIndex, successorPid, successorFingerprint }, {
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; assert.deepEqual(await readFile(database), bytesBefore); },
+    readProcesses: identity => { identityChecks++; assert.equal(identity.get(successorPid), successorFingerprint); return successorProcess(); },
+    onStage: stage => stages.push(stage),
+  });
+  assert.deepEqual(state, before);
+  assert.equal(probes, 3);
+  assert.equal(identityChecks, 6);
+  assert.equal(elapsed, 600);
+  assert.equal(stages.filter(stage => stage === 'successor_state_readiness').length, 2);
+  assert.deepEqual(await readFile(database), bytesBefore);
+});
+
+test('endless v11 remains pending until the fixed timeout and never becomes acceptance', async () => {
+  let elapsed = 0, probes = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    now: () => elapsed, sleep: async milliseconds => { elapsed += milliseconds; }, readProcesses: successorProcess,
+    readState: async () => { probes++; return null; },
+  }), error => error.message === 'SIGNED_PRODUCTION_UPDATE_REFUSED' && error.updateStage === 'successor_state_timeout');
+  assert.equal(elapsed, 120000);
+  assert.equal(probes, 400);
+});
+
+test('dead, replaced or unidentifiable successor processes fail before another state observation', async () => {
+  for (const replacement of [[], [{ pid: successorPid, command: successorCommand, startedAt: 'different start' }],
+    [{ pid: successorPid, command: '/synthetic/replaced-process', startedAt: successorStartedAt }],
+    [{ pid: successorPid, command: successorCommand, startedAt: null }]]) {
+    let probes = 0, identities = 0;
+    await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+      readProcesses: () => ++identities === 1 ? successorProcess() : replacement,
+      readState: async () => { probes++; return null; }, sleep: async () => assert.fail('must not wait after identity loss'),
+    }), error => error.updateStage === 'successor_state_process_identity');
+    assert.equal(probes, 1);
+  }
+  let reads = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    readProcesses: () => [], readState: async () => { reads++; return {}; },
+  }), error => error.updateStage === 'successor_state_process_identity');
+  assert.equal(reads, 0);
+  let readyChecks = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot: '/synthetic/state', successorPid, successorFingerprint }, {
+    readProcesses: () => ++readyChecks === 1 ? successorProcess() : [], readState: async () => ({ usageRows: 2 }),
+  }), error => error.updateStage === 'successor_state_process_identity');
+});
+
+test('malformed current v12 and unknown errors fail immediately without waiting or mutating state', async t => {
+  const { stateRoot, database } = await successorStateFixture(t);
+  const corrupt = openLocalUnifiedIndex(database, { readOnly: false });
+  corrupt.prepare("UPDATE meta SET value = 'unknown' WHERE key = 'schema_version'").run(); corrupt.close();
+  const bytesBefore = await readFile(database);
+  let probes = 0;
+  await assert.rejects(runner.waitForProductionUpdateSuccessorState({ stateRoot, successorPid, successorFingerprint,
+    predecessorIndex: { openLocalUnifiedIndex() { probes++; throw newerStateError(); } } }, {
+    readProcesses: successorProcess, sleep: async () => assert.fail('current schema errors are terminal'),
+  }), error => error.code === 'local_unified_index_schema_invalid');
+  assert.equal(probes, 1);
+  assert.deepEqual(await readFile(database), bytesBefore);
+  for (const error of [newerStateError({ databaseUserVersion: 13 }), newerStateError({ minimumReaderUserVersion: 13 }),
+    Object.assign(new Error('private diagnostic'), { code: 'local_unified_index_schema_invalid' })]) {
+    await assert.rejects(runner.readProductionUpdateSuccessorState(stateRoot, { openLocalUnifiedIndex() { throw error; } }),
+      failure => failure.updateStage === 'successor_state_schema' || failure === error);
+  }
+});
+
+test('current v12 continuity failures remain fatal after readiness succeeds', async t => {
+  const { stateRoot, before, database } = await successorStateFixture(t);
+  const writer = openLocalUnifiedIndex(database, { readOnly: false });
+  writer.prepare('UPDATE usage_event SET tokens_in_uncached = tokens_in_uncached + 1').run(); writer.close();
+  const after = await runner.readProductionUpdateSuccessorState(stateRoot, { openLocalUnifiedIndex() { throw newerStateError(); } });
+  assert.deepEqual(after, await readSignedReplacementState(stateRoot));
+  assert.throws(() => assertSignedReplacementContinuity(before, after,
+    { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false },
+    { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' }),
+  error => runner.productionUpdateFailureStage(error, 'successor_continuity') === 'successor_continuity_retained_state_changed');
 });

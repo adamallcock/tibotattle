@@ -73,6 +73,136 @@ test('same-executable companions belong to one app; independent app roots remain
   assert.throws(() => runner.selectMacTransitionApplicationProcess([process(30, 31), process(31, 30)], executable));
 });
 
+const processApp = '/synthetic/TiboTattle.app';
+const processExecutable = processApp + '/Contents/MacOS/TiboTattle';
+const processStart = 'Sun Oct 4 02:00:00 2026';
+const processRow = (pid, parent, command = processExecutable, startedAt = processStart) => ({ pid, parent, group: pid, command, startedAt });
+const psLine = (pid, parent, command = processExecutable, startedAt = 'Sun Oct  4 02:00:00 2026') =>
+  ` ${pid} ${parent} ${pid} ${startedAt.padEnd(24)}     ${command}\n`;
+
+test('one bounded ps sample binds command and canonical start time without per-PID reads', () => {
+  let calls = 0;
+  const rows = runner.readMacTransitionProcesses({ run(file, args, options) {
+    calls += 1;
+    assert.equal(file, '/bin/ps');
+    assert.deepEqual(args, ['-axo', 'pid=,ppid=,pgid=,lstart=,comm=']);
+    assert.equal(options.timeout, 30000);
+    assert.equal(options.maxBuffer, 4 * 1024 ** 2);
+    assert.equal(options.env.LC_ALL, 'C');
+    assert.deepEqual(options.stdio, ['ignore', 'pipe', 'ignore']);
+    return psLine(30, 1) + psLine(31, 30, '/synthetic/helper with spaces');
+  } });
+  assert.equal(calls, 1);
+  assert.deepEqual(rows, [processRow(30, 1), processRow(31, 30, '/synthetic/helper with spaces')]);
+  assert.equal(runner.macTransitionProcessFingerprint(rows[0]), processExecutable + '\n' + processStart);
+  assert.equal(runner.macTransitionProcessFingerprint({ ...rows[0], startedAt: '  Sun  Oct  4 02:00:00 2026  ' }),
+    runner.macTransitionProcessFingerprint(rows[0]));
+  const incomplete = runner.readMacTransitionProcesses({ run: () => psLine(31, 30, '/synthetic/helper', '') });
+  assert.equal(incomplete[0].startedAt, null);
+  assert.equal(runner.macTransitionProcessFingerprint(incomplete[0]), null);
+  for (const output of ['', psLine(30, 1) + psLine(30, 1), 'unparseable row\n']) {
+    assert.throws(() => runner.readMacTransitionProcesses({ run: () => output }),
+      error => error.transitionStage === 'process_inventory');
+  }
+  assert.throws(() => runner.readMacTransitionProcesses({ run: () => { throw new Error('private command output'); } }),
+    error => error.transitionStage === 'process_inventory' && error.message === 'SIGNED_SPARKLE_TRANSITION_REFUSED');
+});
+
+test('actual capture preserves proven disappearing descendants and excludes reused PIDs from traversal', () => {
+  const known = new Map();
+  let samples = 0;
+  const readProcesses = () => {
+    samples += 1;
+    return runner.readMacTransitionProcesses({ run: () => psLine(30, 1) + psLine(31, 30, '/synthetic/helper') });
+  };
+  assert.deepEqual(runner.captureMacTransitionProcesses(processApp, 30, known, { readProcesses }).map(row => row.pid), [30, 31]);
+  assert.equal(samples, 1);
+  const before = new Map(known);
+  assert.deepEqual(runner.captureMacTransitionProcesses(processApp, 30, known, {
+    readProcesses: () => [processRow(30, 1)],
+  }).map(row => row.pid), [30]);
+  assert.deepEqual(known, before, 'an absent descendant leaves a valid historical fingerprint');
+  assert.deepEqual(runner.captureMacTransitionProcesses(processApp, null, known, {
+    readProcesses: () => [processRow(31, 1, '/synthetic/unrelated', 'Sun Oct 4 03:00:00 2026'), processRow(32, 31)],
+  }), []);
+  assert.deepEqual(known, before, 'a reused PID does not overwrite history or prove ownership of children');
+  assert.deepEqual(runner.captureMacTransitionProcesses(processApp, null, known, {
+    readProcesses: () => [processRow(31, 1, '/synthetic/helper')],
+  }).map(row => row.pid), [31], 'a surviving orphan remains owned by its complete fingerprint');
+});
+
+test('failed and incomplete captures preserve valid history and never traverse an unknown parent', () => {
+  const known = new Map();
+  runner.captureMacTransitionProcesses(processApp, 30, known, { readProcesses: () => [processRow(30, 1), processRow(31, 30)] });
+  const before = new Map(known);
+  assert.throws(() => runner.captureMacTransitionProcesses(processApp, 30, known, {
+    readProcesses: () => { throw new Error('private resample failure'); },
+  }), error => error.transitionStage === 'process_inventory' && error.message === 'SIGNED_SPARKLE_TRANSITION_REFUSED');
+  assert.deepEqual(known, before);
+  for (const startedAt of [null, '', '   ', 'private invalid time']) {
+    assert.throws(() => runner.captureMacTransitionProcesses(processApp, 30, known, {
+      readProcesses: () => [processRow(30, 1), processRow(31, 30, processExecutable, startedAt), processRow(32, 31)],
+    }), error => error.transitionStage === 'process_identity');
+    assert.deepEqual(known, before);
+    assert.equal(known.has(32), false);
+  }
+  const fresh = new Map();
+  assert.throws(() => runner.captureMacTransitionProcesses(processApp, 30, fresh, {
+    readProcesses: () => [processRow(30, 1), processRow(31, 30, processExecutable, ''), processRow(32, 31)],
+  }), error => error.transitionStage === 'process_identity');
+  assert.deepEqual([...fresh.keys()], [30], 'neither the unknown parent nor its child is admitted');
+  assert.throws(() => runner.captureMacTransitionProcesses(processApp, null, known, {
+    readProcesses: () => [processRow(31, 1, '/synthetic/exec-replacement')],
+  }), error => error.transitionStage === 'process_identity');
+  assert.deepEqual(known, before, 'an exec with unchanged start time is unresolved, not evidence of exit');
+});
+
+test('passive observation retains unresolved orphan branches without granting ownership', () => {
+  const known = new Map([[30, processExecutable + '\n' + processStart]]), before = new Map(known);
+  const unresolvedPids = new Set();
+  let rows = [processRow(30, 1), processRow(31, 30, processExecutable, ''), processRow(32, 31)];
+  const observe = () => runner.observeMacTransitionProcesses(processApp, 30, known, { unresolvedPids, readProcesses: () => rows });
+  let result = observe();
+  assert.equal(result.rows, rows, 'selection receives the exact sampled inventory');
+  assert.equal(result.pending, true);
+  assert.deepEqual(result.owned.map(row => row.pid), [30]);
+  assert.deepEqual([...unresolvedPids], [31, 32]);
+  assert.deepEqual(known, before, 'uncertain descendants are not ownership entries');
+  rows = [processRow(31, 1), processRow(32, 31)];
+  result = observe();
+  assert.equal(result.pending, true);
+  assert.deepEqual(result.owned, []);
+  assert.deepEqual(known, before, 'a complete timestamp after orphaning does not prove ancestry');
+  rows = [processRow(32, 1)];
+  assert.equal(observe().pending, true);
+  assert.deepEqual([...unresolvedPids], [32], 'a surviving grandchild retains uncertainty after its parent exits');
+  rows = [];
+  assert.equal(observe().pending, false);
+  assert.equal(unresolvedPids.size, 0);
+  assert.deepEqual(known, before);
+});
+
+test('passive uncertainty resolves only through a complete proven identity or absence; strict capture still refuses it', () => {
+  const known = new Map([[30, processExecutable + '\n' + processStart]]), unresolvedPids = new Set();
+  let rows = [processRow(30, 1), processRow(31, 30, processExecutable, null), processRow(32, 31)];
+  const readProcesses = () => rows;
+  assert.equal(runner.observeMacTransitionProcesses(processApp, 30, known, { readProcesses, unresolvedPids }).pending, true);
+  assert.equal(known.has(31), false);
+  assert.throws(() => runner.captureMacTransitionProcesses(processApp, 30, known, { readProcesses }),
+    error => error.transitionStage === 'process_identity');
+  rows = [processRow(30, 1), processRow(31, 30), processRow(32, 31)];
+  const admitted = runner.observeMacTransitionProcesses(processApp, 30, known, { readProcesses, unresolvedPids });
+  assert.equal(admitted.pending, false);
+  assert.deepEqual(admitted.owned.map(row => row.pid), [30, 31, 32]);
+  assert.equal(unresolvedPids.size, 0);
+  for (const malformed of [new Map([[30, null]]), new Map([[30, processExecutable + '\n']])]) {
+    assert.throws(() => runner.observeMacTransitionProcesses(processApp, 30, malformed, { readProcesses }),
+      error => error.transitionStage === 'process_identity');
+  }
+  assert.throws(() => runner.observeMacTransitionProcesses(processApp, 30, known, { readProcesses, unresolvedPids: new Set([null]) }),
+    error => error.transitionStage === 'process_identity');
+});
+
 test('intake binds the architecture, exact native predecessor and closed feed scope', () => {
   for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
     const value = intake(target, scope), result = runner.validateSparkleTransitionIntake(value);

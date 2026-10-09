@@ -124,13 +124,38 @@ function command(file, args, timeout = 30000) {
 function plist(app) {
   return JSON.parse(command('/usr/bin/plutil', ['-convert', 'json', '-o', '-', join(app, 'Contents', 'Info.plist')]));
 }
-function processes() {
-  return command('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,comm=']).split('\n').map((line) => {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
-    if (!m) fail('process_inventory');
-    return { pid: +m[1], parent: +m[2], group: +m[3], command: m[4] };
-  });
+export function normalizeMacTransitionProcessStart(value) {
+  if (typeof value !== 'string' || /[\0\r\n]/u.test(value)) return null;
+  const normalized = value.trim().replace(/[ \t]+/gu, ' ');
+  return /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[1-9]|[12][0-9]|3[01]) (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] [1-9][0-9]{3}$/u.test(normalized)
+    ? normalized : null;
 }
+export function macTransitionProcessFingerprint(row) {
+  const startedAt = normalizeMacTransitionProcessStart(row?.startedAt);
+  return startedAt !== null && typeof row?.command === 'string' && row.command.length > 0
+    && !/[\0\r\n]/u.test(row.command) ? row.command + '\n' + startedAt : null;
+}
+export function readMacTransitionProcesses({ run = execFileSync } = {}) {
+  let output;
+  try {
+    // One bounded sample binds command and start time to the same ps row.
+    // C locale fixes lstart's 24-character field, including its padded day.
+    output = run('/bin/ps', ['-axo', 'pid=,ppid=,pgid=,lstart=,comm='], {
+      encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 ** 2,
+      env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch { fail('process_inventory'); }
+  if (typeof output !== 'string' || !output.trim()) fail('process_inventory');
+  const rows = output.trimEnd().split('\n').map(line => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+) (.{24}) +(.+)$/u.exec(line);
+    if (!match) fail('process_inventory');
+    return { pid: +match[1], parent: +match[2], group: +match[3],
+      startedAt: normalizeMacTransitionProcessStart(match[4]), command: match[5] };
+  });
+  if (new Set(rows.map(row => row.pid)).size !== rows.length) fail('process_inventory');
+  return rows;
+}
+const processes = () => readMacTransitionProcesses();
 export function selectMacTransitionApplicationProcess(rows, executable) {
   const inventory = new Map(rows.map(row => [row.pid, row]));
   if (inventory.size !== rows.length) fail('process_inventory');
@@ -257,25 +282,69 @@ export function sparkleTransitionDiagnosticScript(pid) {
     '}',
   ].join('\n');
 }
-function processFingerprint(row) {
-  try { return row.command + '\n' + command('/bin/ps', ['-p', String(row.pid), '-o', 'lstart=']); }
-  catch { return null; }
-}
-export function captureMacTransitionProcesses(appPath, verifiedPid, registry) {
-  const rows = processes(), executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
+export function observeMacTransitionProcesses(appPath, verifiedPid, registry, {
+  readProcesses = processes, unresolvedPids = new Set(),
+} = {}) {
+  if ((verifiedPid !== null && (!Number.isSafeInteger(verifiedPid) || verifiedPid < 2))
+    || !(unresolvedPids instanceof Set) || [...unresolvedPids].some(pid => !Number.isSafeInteger(pid) || pid < 2)
+    || !(registry instanceof Map) || [...registry].some(([pid, fingerprint]) => !Number.isSafeInteger(pid) || pid < 2
+    || typeof fingerprint !== 'string' || fingerprint.split('\n').length !== 2
+    || macTransitionProcessFingerprint({ command: fingerprint.split('\n')[0], startedAt: fingerprint.split('\n')[1] }) !== fingerprint)) fail('process_identity');
+  let rows;
+  try { rows = readProcesses(); } catch { fail('process_inventory'); }
+  if (!Array.isArray(rows) || rows.some(row => !Number.isSafeInteger(row?.pid) || row.pid < 0
+    || !Number.isSafeInteger(row.parent) || row.parent < 0 || typeof row.command !== 'string' || !row.command
+    || /[\0\r\n]/u.test(row.command) || (row.startedAt !== null && typeof row.startedAt !== 'string'))
+    || new Set(rows.map(row => row.pid)).size !== rows.length) fail('process_inventory');
+  const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
+  const livePids = new Set(rows.map(row => row.pid));
+  for (const pid of unresolvedPids) if (!livePids.has(pid)) unresolvedPids.delete(pid);
   if (verifiedPid !== null) {
     const main = rows.find((row) => row.pid === verifiedPid && row.command === executable);
-    if (main) registry.set(main.pid, processFingerprint(main));
+    if (main && !registry.has(main.pid)) {
+      const fingerprint = macTransitionProcessFingerprint(main);
+      if (fingerprint === null) unresolvedPids.add(main.pid);
+      else registry.set(main.pid, fingerprint);
+    }
   }
-  const owned = new Set(rows.filter((row) => registry.has(row.pid)
-    && registry.get(row.pid) !== null && registry.get(row.pid) === processFingerprint(row)).map((row) => row.pid));
+  const owned = new Set();
+  for (const row of rows) if (registry.has(row.pid)) {
+    const expected = registry.get(row.pid), fingerprint = macTransitionProcessFingerprint(row);
+    if (fingerprint === expected) { owned.add(row.pid); unresolvedPids.delete(row.pid); }
+    else if (fingerprint === null || normalizeMacTransitionProcessStart(row.startedAt) === expected.split('\n')[1]) {
+      // Keep the prior proven identity. An incomplete sample or an exec of the
+      // same live identity cannot establish exit or authorize its descendants.
+      unresolvedPids.add(row.pid);
+    }
+    // A changed start excludes ordinary PID reuse from ownership. If this PID
+    // was already an unresolved new descendant, reuse does not clear that
+    // uncertainty: only absence or independently proven ownership may do so.
+  }
   let changed = true;
   while (changed) {
     changed = false;
     for (const row of rows) if (!owned.has(row.pid) && owned.has(row.parent)) {
-      registry.set(row.pid, processFingerprint(row)); owned.add(row.pid); changed = true;
+      const fingerprint = macTransitionProcessFingerprint(row);
+      if (fingerprint === null || registry.has(row.pid)) { unresolvedPids.add(row.pid); continue; }
+      registry.set(row.pid, fingerprint); owned.add(row.pid); unresolvedPids.delete(row.pid); changed = true;
     }
   }
+  // This sidecar records uncertainty only, never authority to signal or admit
+  // a process. Remember observed children too, so orphaning an unproven branch
+  // cannot silently turn one of its survivors into an updater successor.
+  changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) if (!owned.has(row.pid) && !unresolvedPids.has(row.pid) && unresolvedPids.has(row.parent)) {
+      unresolvedPids.add(row.pid); changed = true;
+    }
+  }
+  return { rows, owned: rows.filter(row => owned.has(row.pid)), pending: unresolvedPids.size > 0 };
+}
+export function captureMacTransitionProcesses(appPath, verifiedPid, registry, options) {
+  const observation = observeMacTransitionProcesses(appPath, verifiedPid, registry, options);
+  if (observation.pending) fail('process_identity');
+  return observation.owned;
 }
 export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcesses, verifyApp }) {
   const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
@@ -286,8 +355,7 @@ export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcess
     captureMacTransitionProcesses(appPath, current.pid, knownProcesses);
     try { ui(executable, current.pid, 'quit'); } catch { /* Controlled owned-process cleanup follows. */ }
   } else captureMacTransitionProcesses(appPath, null, knownProcesses);
-  const remaining = () => processes().filter((row) => knownProcesses.has(row.pid)
-    && knownProcesses.get(row.pid) !== null && knownProcesses.get(row.pid) === processFingerprint(row));
+  const remaining = () => captureMacTransitionProcesses(appPath, null, knownProcesses);
   for (const signal of ['SIGTERM', 'SIGKILL']) {
     for (const row of remaining()) {
       try { process.kill(row.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
@@ -552,7 +620,7 @@ export async function runSparkleTransition(options) {
       proof.uiState = collectMacOSTransitionUIDiagnostics({ pid: ownedPid, verifyOwnedProcess: pid => {
         const expected = knownProcesses.get(pid);
         const row = processes().find(p => p.pid === pid && p.command === installedExecutable);
-        return typeof expected === 'string' && Boolean(row) && processFingerprint(row) === expected;
+        return typeof expected === 'string' && Boolean(row) && macTransitionProcessFingerprint(row) === expected;
       } });
     }
     try {
