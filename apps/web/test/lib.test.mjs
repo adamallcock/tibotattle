@@ -9933,3 +9933,67 @@ test("local accounting preserves distinct subscription and API Ultrafast dimensi
   assert.deepEqual(result.accounting.byApiServiceTier.ultrafast, row);
   assert.equal(Object.hasOwn(result.accounting.byApiServiceTier, "private_canary"), false);
 });
+
+
+test("local model usage retains mixed primary and separate auto-review rows and the raw API quote", () => {
+  const common = {
+    model: "codex-auto-review", pricingStatus: "priced", events: 1, totalTokens: 120,
+    components: { input_uncached_tokens: 100, output_text_tokens: 20 },
+    componentCosts: { input_uncached_tokens: { tokens: 100, costUsd: 2 }, output_text_tokens: { tokens: 20, costUsd: 2 } },
+  };
+  const result = normalizeDashboardPayload({ mode: "real_local_evidence", accounting: {
+    modelUsage: [
+      { ...common, allowanceTrack: "primary", apiPriceEquivalentUsd: 2 },
+      { ...common, allowanceTrack: "separate", apiPriceEquivalentUsd: 4 },
+    ],
+    events: 1, totalTokens: 120, apiPriceEquivalentUsd: 2,
+  } });
+  assert.equal(result.accounting.modelUsage.length, 2);
+  assert.deepEqual(result.accounting.modelUsage.map(row => [row.allowanceTrack, row.apiPriceEquivalentApplicable, row.apiPriceEquivalentUsd]), [
+    ["primary", true, 2], ["separate", false, 4],
+  ]);
+  assert.equal(result.accounting.totalTokens, 120);
+  assert.equal(result.accounting.apiPriceEquivalentUsd, 2);
+  const separate = result.accounting.modelUsage[1];
+  assert.equal(separate.events, 1);
+  assert.equal(separate.totalTokens, 120);
+  assert.equal(separate.components.input_uncached_tokens, 100);
+  assert.equal(separate.components.output_text_tokens, 20);
+  assert.equal(separate.componentCosts.input_uncached_tokens.costUsd, 2);
+  assert.equal(separate.componentCosts.output_text_tokens.costUsd, 2);
+});
+
+
+test("local model normalization keeps the reviewed roster across allowance tracks without an unbounded list", async () => {
+  const { REVIEWED_CODEX_MODEL_IDS } = await import("../public/telemetry-shared.generated.js");
+  const identities = [...REVIEWED_CODEX_MODEL_IDS.filter(id => id !== "gpt-5.3-codex-spark"), "unknown"];
+  const modelUsage = identities.flatMap(model => ["primary", "separate"].map(allowanceTrack => ({
+    model, allowanceTrack, events: 1, totalTokens: 10, apiPriceEquivalentUsd: 1,
+  })));
+  modelUsage.push({ model: "gpt-5.3-codex-spark", allowanceTrack: "spark", events: 1, totalTokens: 10 });
+  const normalize = rows => normalizeDashboardPayload({
+    mode: "real_local_evidence", accounting: { modelUsage: rows },
+  }).accounting.modelUsage;
+  const rows = normalize(modelUsage);
+  assert.equal(rows.length, modelUsage.length);
+  assert.deepEqual(rows.map(row => [row.model, row.allowanceTrack]), modelUsage.map(row => [row.model, row.allowanceTrack]));
+  assert.equal(rows.reduce((sum, row) => sum + row.totalTokens, 0), modelUsage.length * 10);
+  assert.equal(rows.at(-1).allowanceTrack, "spark");
+  assert.equal(rows.at(-1).apiPriceEquivalentApplicable, false);
+  assert.equal(normalize(Array(1_000).fill(modelUsage[0])).length, (REVIEWED_CODEX_MODEL_IDS.length + 1) * 3);
+});
+
+test("fallback model rows preserve separate allowance while unrecognized tracks cannot manufacture a zero", () => {
+  const result = normalizeDashboardPayload({ mode: "real_local_evidence", accounting: {
+    byModel: [{ model: "codex-auto-review", allowanceTrack: "unreviewed_allowance", apiPriceEquivalentUsd: null }],
+    spark: { byModel: [
+      { model: "unknown", allowanceTrack: "separate", pricingStatus: "unrecognized", apiPriceEquivalentUsd: null },
+      { model: "gpt-5.3-codex-spark", allowanceTrack: "spark", pricingStatus: "known_unpriced", apiPriceEquivalentUsd: null },
+    ] },
+  } });
+  assert.deepEqual(result.accounting.modelUsage.map(row => [row.model, row.allowanceTrack, row.apiPriceEquivalentApplicable, row.apiPriceEquivalentUsd]), [
+    ["codex-auto-review", "primary", true, null],
+    ["unknown", "separate", false, null],
+    ["gpt-5.3-codex-spark", "spark", false, null],
+  ]);
+});

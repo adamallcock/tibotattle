@@ -25,6 +25,7 @@ import {
   ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   assertContainerContract,
+  isLinuxSandboxEnvironmentClean,
   runSmoke,
   terminateLinuxSmokeChild,
   validateRendererReadinessDiagnostics,
@@ -607,6 +608,7 @@ export function normalPackagedSmokeEnvironment({ environment = process.env, fixt
   const home = absolutePath(fixture.home);
   const codexHome = absolutePath(fixture.codexHome);
   if (home === null || codexHome !== join(home, ".codex")) fail("FIXTURE_INVALID");
+  if (!isLinuxSandboxEnvironmentClean(environment)) fail("CONTAINER_INVALID");
   const selected = { ...environment };
   for (const key of BLOCKED_ENVIRONMENT) delete selected[key];
   for (const key of ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"]) {

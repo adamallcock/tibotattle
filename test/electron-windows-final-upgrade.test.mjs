@@ -6,7 +6,7 @@ import { join, win32 } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   WINDOWS_FINAL_UPGRADE_PREDECESSOR as predecessor,
-  validateWindowsFinalUpgradePredecessor, parseWindowsFinalUpgradeMode,
+  validateWindowsFinalUpgradePredecessor, parseWindowsFinalUpgradeMode, resolveWindowsFinalUpgradeSuccessor,
   validateWindowsFinalUpgradePredecessorManifest, snapshotWindowsFinalUpgradeProfile,
   runWindowsFinalUpgradeContinuity, runWindowsFinalUpgrade,
 } from '../scripts/smoke-electron-windows-final-upgrade.mjs';
@@ -59,6 +59,19 @@ function fixture(overrides = {}) {
         assert.equal(candidateState.quiescent, true); calls.push('replace'); replaced = true;
       } } };
 }
+
+test('only the two explicitly allocated signed successor identities select final upgrade receipts', () => {
+  const historical = { version: '0.1.27', buildNumber: '2026100301' };
+  const replacement = { version: '0.1.28', buildNumber: '2026100901' };
+  assert.deepEqual(resolveWindowsFinalUpgradeSuccessor(historical), { ...historical, receiptSchema: 'tibotattle-windows-final-upgrade-v1' });
+  assert.deepEqual(resolveWindowsFinalUpgradeSuccessor(replacement), { ...replacement, receiptSchema: 'tibotattle-windows-final-upgrade-v2' });
+  for (const value of [{}, { version: '0.1.28' }, { version: '0.1.27', buildNumber: replacement.buildNumber },
+    { version: '0.1.28', buildNumber: historical.buildNumber }, { version: '0.1.28', buildNumber: '2026100902' },
+    { version: '0.1.26', buildNumber: '2026092701' }, { version: '0.1.29', buildNumber: replacement.buildNumber },
+    { version: 'toString', buildNumber: replacement.buildNumber }, { ...replacement, buildNumber: 2026100901 }]) {
+    assert.throws(() => resolveWindowsFinalUpgradeSuccessor(value), /SUCCESSOR_INTAKE_INVALID/u);
+  }
+});
 
 test('upgrade mode is explicit and preserves empty historical clean/diagnostic intakes', () => {
   assert.equal(parseWindowsFinalUpgradeMode({}), null);

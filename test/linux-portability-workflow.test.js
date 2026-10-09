@@ -156,7 +156,7 @@ test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Ser
   assert.match(dockerfile, /printf 'electron' > \/workspace\/node_modules\/electron\/path\.txt/u);
   assert.doesNotMatch(dockerfile, /printf 'electron\\n'/u);
   assert.doesNotMatch(dockerfile, /node node_modules\/electron\/install\.js/u);
-  assert.match(dockerfile, /ELECTRON_DISABLE_SANDBOX=0/u);
+  assert.doesNotMatch(dockerfile, /(?:ELECTRON_DISABLE_SANDBOX|electron_disable_sandbox)\s*=/u);
   assert.match(dockerfile, /chmod 4755[\s\S]*chrome-sandbox/u);
   assert.match(dockerfile, /USER node/u);
   assert.match(dockerfile, /xvfb-run/u);

@@ -503,7 +503,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     stage = 'predecessor_opt_out'; await active.settings.evaluate('globalThis.tibotattleDesktop.setSharingEnabled(false)');
     await until(async () => (await active.readSharing())?.enabled === false, 'predecessor_opt_out');
     proof.predecessorKeychainIdentity.afterOptOut = await sameKeychain();
-    const predecessorRefreshId = input.version === '0.1.27'
+    const predecessorRefreshId = ['0.1.27', '0.1.28'].includes(input.version)
       ? await readHistoricalSolRefreshId(active.dashboard) : null;
     await stopOwnedMacSharingApp(active); active = null;
     proof.predecessorKeychainIdentity.afterStop = await sameKeychain();
@@ -519,7 +519,7 @@ export async function runMacCredentialQualification({ intake, execute = false })
     // the original known source are untouched. Older intake contracts retain
     // their original credential-only journey.
     let historicalSol = null, historicalGeneration = null;
-    if (input.version === '0.1.27') {
+    if (['0.1.27', '0.1.28'].includes(input.version)) {
       stage = 'historical_sol_seed';
       historicalSol = await prepareHistoricalSolFixture({ home, profile, codexHome: codex, predecessorRefreshId });
     }

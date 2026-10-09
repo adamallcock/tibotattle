@@ -29,24 +29,28 @@ test('ZIP extraction refuses unexpected, duplicate and symlink entries before wr
   }
 });
 
-test('runner admission proves ancestry and same-version source while plan mode cannot imply execution', async t => {
-  const { preflightLinuxFinalIntake, LINUX_FINAL_SCHEMA, LINUX_FINAL_CONFIRMATION } = await import('../scripts/lib/linux-final-artifact-intake.mjs');
+for (const [route, version, buildNumber] of [['v1', '0.1.27', '2026100301'], ['v2', '0.1.28', '2026100901']])
+  test(`${version} runner admission proves ancestry and same-version source without implying execution`, async t => {
+  const { preflightLinuxFinalIntake, LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_CONFIRMATION } = await import('../scripts/lib/linux-final-artifact-intake.mjs');
   const { productionElectronCandidatePlan } = await import('../scripts/package-electron-production.mjs');
+  const schemaVersion = route === 'v1' ? LINUX_FINAL_SCHEMA : LINUX_FINAL_SCHEMA_V2;
   const root = await mkdtemp(join(await realpath(tmpdir()), 'linux-final-ancestry-')); t.after(() => rm(root, { recursive: true, force: true }));
   const git = args => {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     assert.equal(result.status, 0); return result.stdout.trim();
   };
   git(['init', '-b', 'main']); git(['config', 'user.name', 'Synthetic fixture']); git(['config', 'user.email', 'synthetic@example.test']);
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version: '0.1.27' }) + '\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version }) + '\n');
   git(['add', 'package.json']); git(['commit', '-m', 'Synthetic frozen application']); const sourceRevision = git(['rev-parse', 'HEAD']);
   await writeFile(join(root, 'runner'), 'qualification only'); git(['add', 'runner']); git(['commit', '-m', 'Synthetic qualification runner']);
   const runnerRevision = git(['rev-parse', 'HEAD']);
-  const sourceCandidate = { ...productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision,
-    buildNumber: '2026100301', hostPlatform: 'linux', hostArchitecture: 'x64' }), status: 'production_source_staged',
+  const plan = productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision,
+    buildNumber, hostPlatform: 'linux', hostArchitecture: 'x64' });
+  const sourceCandidate = { ...plan, version, builderEnvironment: { ...plan.builderEnvironment, TIBOTATTLE_ELECTRON_VERSION: version },
+    status: 'production_source_staged',
     stagedManifest: 'app/package.json', runtimeManifest: 'app/electron-runtime-manifest.json' };
-  const intake = { schemaVersion: LINUX_FINAL_SCHEMA, sourceRevision, runnerRevision, sourceCandidate,
-    packageRunId: '12345', packageRunnerRevision: sourceRevision, version: '0.1.27', buildNumber: '2026100301',
+  const intake = { schemaVersion, sourceRevision, runnerRevision, sourceCandidate,
+    packageRunId: '12345', packageRunnerRevision: sourceRevision, version, buildNumber,
     sourceCandidateSha256: 'a'.repeat(64), packageReceiptSha256: 'b'.repeat(64), artifactSha256: 'c'.repeat(64),
     artifactBytes: 8192, asarSha256: 'd'.repeat(64), executableSha256: 'e'.repeat(64) };
   const environment = { LINUX_FINAL_INTAKE: JSON.stringify(intake), GITHUB_SHA: runnerRevision, SELECTED_MODE: 'plan', SELECTED_CONFIRMATION: '' };
@@ -54,7 +58,7 @@ test('runner admission proves ancestry and same-version source while plan mode c
   assert.throws(() => preflightLinuxFinalIntake({ ...environment, SELECTED_MODE: 'execute' }, { repositoryRoot: root }), /CONFIRMATION_INVALID/u);
   assert.deepEqual(preflightLinuxFinalIntake({ ...environment, SELECTED_MODE: 'execute', SELECTED_CONFIRMATION: LINUX_FINAL_CONFIRMATION }, { repositoryRoot: root }), intake);
   assert.throws(() => preflightLinuxFinalIntake({ ...environment, GITHUB_SHA: sourceRevision }, { repositoryRoot: root }), /CONFIRMATION_INVALID/u);
-  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version: '0.1.28' }) + '\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'app-usagemonitor', type: 'module', version: version === '0.1.27' ? '0.1.28' : '0.1.27' }) + '\n');
   assert.throws(() => preflightLinuxFinalIntake(environment, { repositoryRoot: root }), /VERSION_INVALID/u);
   git(['restore', 'package.json']); git(['checkout', '--orphan', 'unrelated']); git(['add', 'package.json', 'runner']); git(['commit', '-m', 'Unrelated synthetic runner']);
   const unrelated = git(['rev-parse', 'HEAD']);

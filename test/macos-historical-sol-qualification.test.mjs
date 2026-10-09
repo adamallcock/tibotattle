@@ -10,7 +10,7 @@ import { HISTORICAL_SOL_FIXTURE, assertHistoricalSolAccounting, assertHistorical
   readHistoricalSolState, waitForHistoricalSolRefresh } from '../scripts/lib/macos-historical-sol-qualification.mjs';
 import { signedStagingFixture } from '../scripts/run-signed-electron-staging.mjs';
 import { ingestLocalUnifiedIndexIncrement } from '../src/local-unified-index-ingest.js';
-import { openLocalUnifiedIndex } from '../src/local-unified-index.js';
+import { LOCAL_UNIFIED_INDEX_PARSER_VERSION, openLocalUnifiedIndex } from '../src/local-unified-index.js';
 import { localCompanionStatePaths } from '../src/local-installation-diagnostics.js';
 import { createLocalCollectorRefreshRunner, LocalCompanionRefreshController } from '../src/local-companion-refresh.js';
 import { buildLocalCompanionSnapshot, LocalCompanionDataStore } from '../src/local-companion-data.js';
@@ -42,6 +42,8 @@ const ingest = value => ingestLocalUnifiedIndexIncrement({ codexHome: value.code
   contractVersion: TELEMETRY_SCHEMA_VERSION });
 
 test('fixed historical fixture is Standard short context at the reviewed effective interval and has visible nonzero cost', () => {
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, 'unified-rollout-typed-v20',
+    'advancing the qualification successor requires explicit review');
   const components = { input_uncached_tokens: 10_000, input_cache_read_tokens: 90_000,
     input_cache_write_tokens: 0, output_text_tokens: 10_000, output_reasoning_tokens: 0 };
   const event = { timestamp: HISTORICAL_SOL_FIXTURE.observedAt, model: HISTORICAL_SOL_FIXTURE.model,
@@ -59,6 +61,19 @@ test('fixed historical fixture is Standard short context at the reviewed effecti
 
 test('actual public APIs repair once, replay safely and preserve priced history through fresh quick restarts', async t => {
   const value = await profile(t), context = await prepare(value);
+  const seeded = openLocalUnifiedIndex(value.unifiedIndexFile, { readOnly: true });
+  try {
+    const rows = seeded.prepare(`SELECT m.model_id AS model, p.parser_version AS parser,
+      cp.parser_version AS cursorParser FROM usage_event u JOIN model m ON m.id=u.model_id
+      JOIN parser_version p ON p.id=u.parser_version_id
+      JOIN source_cursor c ON c.source_local=u.source_local JOIN ingest_run r ON r.id=c.ingest_run_id
+      JOIN parser_version cp ON cp.id=r.parser_version_id ORDER BY m.model_id`).all();
+    assert.deepEqual(rows.map(row => ({ ...row })), [
+      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v20', cursorParser: 'unified-rollout-typed-v20' },
+      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v20', cursorParser: 'unified-rollout-typed-v20' },
+      { model: 'unknown', parser: 'unified-rollout-typed-v18', cursorParser: 'unified-rollout-typed-v18' },
+    ]);
+  } finally { seeded.close(); }
   await assert.rejects(readHistoricalSolState(context), refused('repair_missing'));
   assert.throws(() => historicalSolQualificationReceipt(context), refused('proof_incomplete'));
   const now = () => Date.parse('2026-10-04T00:00:00.000Z');
@@ -180,8 +195,8 @@ test('actual public APIs repair once, replay safely and preserve priced history 
     assert.equal(restartedStore.getOverview().accounting.generationMatched, true);
   }
   assert.deepEqual(historicalSolQualificationReceipt(context), {
-    schemaVersion: 'tibotattle-historical-sol-installed-v1', observedAt: '2026-09-29T12:00:01.000Z', reportingPeriod: 'all',
-    preUpgradeUnknownSeeded: true, parser18To19Repair: true, sourceOccurrenceIdentityPreserved: true,
+    schemaVersion: 'tibotattle-historical-sol-installed-v2', observedAt: '2026-09-29T12:00:01.000Z', reportingPeriod: 'all',
+    preUpgradeUnknownSeeded: true, parser18To20Repair: true, sourceOccurrenceIdentityPreserved: true,
     tokenTotalsPreserved: true, existingKnownFixturePreserved: true, currentAccountingGenerationMatched: true,
     exactApiPriceEquivalentUsd: '0.129', renderedModel: 'gpt-6.1-sol', renderedUsd: '0.13',
     repeatedRefreshWithoutDuplicatesOrReparse: true, retainedAcrossTwoRestarts: true,
@@ -193,7 +208,7 @@ test('persisted occurrence identity, token totals and parser repair are mandator
   await ingest(value);
   const database = openLocalUnifiedIndex(value.unifiedIndexFile);
   try {
-    const selected = database.prepare(`SELECT u.event_key,u.tokens_in_uncached,u.source_offset FROM usage_event u
+    const selected = database.prepare(`SELECT u.event_key,u.tokens_in_uncached,u.source_offset,u.source_local,u.parser_version_id FROM usage_event u
       JOIN model m ON m.id=u.model_id WHERE m.model_id='gpt-6.1-sol'`).get();
     database.prepare('UPDATE usage_event SET tokens_in_uncached=tokens_in_uncached+1 WHERE event_key=?').run(selected.event_key);
     await assert.rejects(readHistoricalSolState(context), refused('identity_or_totals_changed'));
@@ -201,6 +216,25 @@ test('persisted occurrence identity, token totals and parser repair are mandator
       .run(selected.tokens_in_uncached, selected.event_key);
     await assert.rejects(readHistoricalSolState(context), refused('identity_or_totals_changed'));
     database.prepare('UPDATE usage_event SET source_offset=? WHERE event_key=?').run(selected.source_offset, selected.event_key);
+    const cursor = database.prepare('SELECT ingest_run_id FROM source_cursor WHERE source_local=?').get(selected.source_local);
+    for (const parser of ['unified-rollout-typed-v18', 'unified-rollout-typed-v19',
+      'unified-rollout-typed-v21', 'unified-rollout-typed-v20-partial']) {
+      database.prepare('INSERT OR IGNORE INTO parser_version(parser_version,contract_version) VALUES (?,?)')
+        .run(parser, TELEMETRY_SCHEMA_VERSION);
+      const parserId = database.prepare('SELECT id FROM parser_version WHERE parser_version=? AND contract_version=?')
+        .get(parser, TELEMETRY_SCHEMA_VERSION).id;
+      database.prepare('UPDATE usage_event SET parser_version_id=? WHERE event_key=?').run(parserId, selected.event_key);
+      await assert.rejects(readHistoricalSolState(context), refused('repair_missing'), `row parser ${parser} cannot prove repair`);
+      database.prepare('UPDATE usage_event SET parser_version_id=? WHERE event_key=?')
+        .run(selected.parser_version_id, selected.event_key);
+      const run = database.prepare('INSERT INTO ingest_run(received_at_ms,parser_version_id) VALUES (?,?)')
+        .run(Date.parse(HISTORICAL_SOL_FIXTURE.observedAt), parserId).lastInsertRowid;
+      database.prepare('UPDATE source_cursor SET ingest_run_id=? WHERE source_local=?').run(run, selected.source_local);
+      await assert.rejects(readHistoricalSolState(context), refused('repair_missing'), `cursor parser ${parser} cannot prove repair`);
+      database.prepare('UPDATE source_cursor SET ingest_run_id=? WHERE source_local=?')
+        .run(cursor.ingest_run_id, selected.source_local);
+    }
+    assert.equal((await readHistoricalSolState(context)).events, 3, 'only the exact current row and cursor parser qualify');
     database.prepare(`UPDATE usage_event SET model_id=(SELECT id FROM model WHERE model_id='unknown') WHERE event_key=?`)
       .run(selected.event_key);
     await assert.rejects(readHistoricalSolState(context), refused('repair_missing'));

@@ -35,7 +35,7 @@ an informal archive.
 | Usage coaching | [Usage explainer agent protocol](./reference/usage-explainer-agent-protocol.md) | Maintained plan selection, pagination, evidence lookup, model-synthesis, and claim boundaries for agents |
 | Codex plugin | [Codex plugin and installed agent interface](./reference/codex-plugin.md) | Self-contained skill, local MCP tools, installed Electron agent protocol, and confirmation-bound macOS installation |
 | Schemas | [Schema and contract lifecycle](./reference/schema-contracts.md) | Canonical owners, mirrors, generators, versioning, and retirement |
-| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules; includes the accepted schema-11 cleanup indexes |
+| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current format-12 compatibility fence, parser-v20 semantics, retained schema-11 cleanup indexes, tables, generation, and migration rules |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.26 across four targets, exact artifact assurances and the accepted Linux physical-test gap |
@@ -46,7 +46,7 @@ an informal archive.
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
-| 0.1.27 build dependency exception | [Temporary HTTP cache advisory exception](./decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md) | Owner-approved root-lock-only exact-patch exception for GHSA-ch52-4w7c-c8xp; fails closed at 2026-10-10T00:00Z, with source/status and child-lock boundaries |
+| Build downloader dependencies | [Remove the legacy downloader chains](./decisions/2026-10-09-build-downloader-dependency-remediation.md) | Stable-builder transport backport, recursive dependency-absence guard and unsuppressed scanner; earlier artifact exceptions do not authorize replacement builds |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
 | macOS release | [macOS Electron release and native upgrade feeds](./runbooks/macos-stable-release-runbook.md) | Installed transition qualification, both retained Sparkle feeds and exact-byte publication gates |
 | Production operation recovery | [Production operation ownership](./runbooks/agent-release-operations.md) | Shared production ownership and explicit recovery; not publication authorization |

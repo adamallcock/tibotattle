@@ -127,6 +127,9 @@ export const WEB_MESSAGES = Object.freeze({
       || key.startsWith("performanceConsent.")
       || key === "dashboard.pricing.speedNote"
       || key === "accounting.pricingDisclosure"
+      || key === "accounting.model.separateMainAllowanceTitle"
+      || key === "accounting.model.separateMainAllowanceLabel"
+      || key === "accounting.model.separateAllowanceFootnote"
       || key.startsWith("appearance.")
       || key.startsWith("site.features.")
       || key.startsWith("accounting.cacheContinuity.matrix.")
@@ -1890,7 +1893,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Each model consumes the weekly allowance at its own rate, so the headline blends these over your recent mix.": ["每个模型以各自的速率消耗每周额度，因此标题按你近期的模型组合对这些费率加权混合。", "Cada modelo consume la asignación semanal a su propia tasa, así que el titular las combina según tu mezcla reciente."],
   "Indexed history": ["已索引历史", "Historial indexado"],
   "Model usage": ["模型使用情况", "Uso por modelo"],
-  "A model on a separate allowance is listed on its own row and carries no API equivalent, because that figure cannot be compared with the main allowance.": ["使用独立额度的模型会单独列为一行，并且不显示 API 等价值，因为该数值无法与主额度比较。", "Un modelo con una cuota independiente aparece en su propia fila y no lleva equivalente de API, porque esa cifra no se puede comparar con la cuota principal."],
   "Replay-safe usage grouped by model, across every allowance. Each model expands into its token components as rows of the same table.": ["按模型分组的可安全重放使用情况，涵盖所有额度。每个模型可展开为同一表格中的令牌组成行。", "Uso seguro para reproducción agrupado por modelo, en todas las cuotas. Cada modelo se expande en sus componentes de tokens como filas de la misma tabla."],
   "Review before sending": ["发送前审阅", "Revisar antes de enviar"],
   "Prepare and review a contribution": ["准备并审阅贡献", "Preparar y revisar una contribución"],

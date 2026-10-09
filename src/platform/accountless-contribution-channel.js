@@ -91,7 +91,16 @@ export function attachAccountlessParentChannel({ channel, readPreference, backen
       reply(message.id, null);
       return;
     }
-    if (busy) { reply(message.id, null, false); return; }
+    // A concurrent request has not entered authorization or the backend. Its
+    // known non-mutation refusal is temporary, unlike an accepted operation
+    // whose outcome may become uncertain after channel loss.
+    if (busy) {
+      const validValue = ["preference", "read"].includes(message.operation)
+        ? message.value === null
+        : typeof message.value === "string" && SECRET.test(message.value);
+      reply(message.id, validValue ? RETRYABLE_CREDENTIAL_UNAVAILABLE : null, false);
+      return;
+    }
     busy = true;
     const epoch = generation;
     let bytes = null;

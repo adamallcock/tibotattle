@@ -12,7 +12,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   runTelemetryV11Sync,
 } from "../src/contribution/index.js";
-import { beginUnifiedIndexGeneration, openLocalUnifiedIndex } from "../src/local-unified-index.js";
+import { beginUnifiedIndexGeneration, openLocalUnifiedIndex, LOCAL_UNIFIED_INDEX_USER_VERSION } from "../src/local-unified-index.js";
 import {
   ATTRIBUTION_FIXTURE_BINDING as binding, ATTRIBUTION_FIXTURE_START as start,
   attributionFixtureMarker, writeAttributionFixture,
@@ -121,7 +121,7 @@ test("real local hydration and public runner activate mixed-plan history without
   assert.equal(service.calls.some((call) => call.path.includes("device-telemetry-consents")), false);
   assert.doesNotMatch(JSON.stringify(records()), /sourceLocal|source_local|sourceOffset|source_offset|scopeId|enrollmentNamespace|\/Users\//u);
   const database = openLocalUnifiedIndex(options.indexFile, { readOnly: true });
-  assert.equal(database.prepare("PRAGMA user_version").get().user_version, 11);
+  assert.equal(database.prepare("PRAGMA user_version").get().user_version, LOCAL_UNIFIED_INDEX_USER_VERSION);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM usage_event").get().count, 2);
   database.close();
 });

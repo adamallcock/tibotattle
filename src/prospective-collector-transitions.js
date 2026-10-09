@@ -39,7 +39,7 @@ const SURFACES = new Set([
   "local_interactive_unclassified",
   "local_rollout_unclassified",
 ]);
-const THREAD_SOURCES = new Set(["user", "subagent", "automation", "unknown"]);
+const THREAD_SOURCES = new Set(["user", "subagent", "automation", "unknown", "auto_review"]);
 const AGENT_SCOPES = new Set(["root", "subagent", "automation", "unknown"]);
 const LINEAGE_DISPOSITIONS = new Set(["standalone", "forked", "parent_linked"]);
 

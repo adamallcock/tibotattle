@@ -153,6 +153,6 @@ test('startup capture precedes cleanup and success remains outside the diagnosti
   assert.match(final, /run: options => runSmoke\(\{ \.\.\.options, sampleStartupMount: sampleLinuxStartupFuseMount/u);
   const launch = final.slice(final.indexOf('child = spawn(IMAGE'), final.indexOf("child.on('error'"));
   assert.doesNotMatch(launch, /--no-sandbox|--disable-setuid-sandbox/u);
-  assert.match(final, /!args\.includes\('--no-sandbox'\)/u);
+  assert.match(final, /return facts\?\.role === 'renderer' && !facts\.sandboxBypass/u);
   assert.doesNotMatch(final, /APPIMAGE_EXTRACT_AND_RUN:\s*['"]1['"]/u);
 });

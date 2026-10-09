@@ -1,4 +1,4 @@
-const THREAD_SOURCES = new Set(["user", "subagent", "automation", "unknown"]);
+const THREAD_SOURCES = new Set(["user", "subagent", "automation", "unknown", "auto_review"]);
 const SURFACES = new Set([
   "scheduled_task",
   "subagent",
@@ -99,6 +99,14 @@ function classifyThreadSource(words) {
   return "unknown";
 }
 
+function isAutoReview(payload) {
+  return ownDataValue(payload, "thread_source") === "guardian_review"
+    && ownDataValue(
+      ownDataValue(ownDataValue(payload, "source"), "subagent"),
+      "other",
+    ) === "guardian";
+}
+
 function classifySurface(words, threadSource) {
   if (threadSource === "automation" || hasAny(words, AUTOMATION_WORDS)) return "scheduled_task";
   if (threadSource === "subagent" || hasAny(words, SUBAGENT_WORDS)) return "subagent";
@@ -120,12 +128,17 @@ function classifyAgentScope(words, threadSource) {
  * The returned object intentionally excludes all raw metadata, including IDs,
  * parent/fork references, paths, titles, source labels, and nested objects.
  */
-export function classifySessionSurface(payload) {
+function sessionSurfaceClassification(payload, recognizeAutoReview) {
   const safePayload = payload && typeof payload === "object" ? payload : null;
   const words = collectSourceWords(safePayload);
-  const threadSource = classifyThreadSource(words);
-  const surface = classifySurface(words, threadSource);
-  const agentScope = classifyAgentScope(words, threadSource);
+  // Auto-review is a local usage classification, independent of the existing
+  // surface/scope evidence. Exact own data markers are required; normalized
+  // words, model names and inherited/accessor metadata cannot establish it.
+  const genericThreadSource = classifyThreadSource(words);
+  const threadSource = recognizeAutoReview && isAutoReview(safePayload)
+    ? "auto_review" : genericThreadSource;
+  const surface = classifySurface(words, genericThreadSource);
+  const agentScope = classifyAgentScope(words, genericThreadSource);
   const lineageDisposition = hasOwnPresentValue(safePayload, PARENT_KEYS)
     ? "forked"
     : hasOwnPresentValue(safePayload, LINKED_PARENT_KEYS)
@@ -145,4 +158,15 @@ export function classifySessionSurface(payload) {
     throw new Error("surface classification invariant failed");
   }
   return result;
+}
+
+export function classifySessionSurface(payload) {
+  return sessionSurfaceClassification(payload, true);
+}
+
+// Collector occurrence hashes predate auto-review allowance semantics. Keep
+// this closed taxonomy fixed for identity while reporting the new source
+// classification separately; a replay must not become a new usage event.
+export function classifySessionSurfaceForOccurrenceIdentity(payload) {
+  return sessionSurfaceClassification(payload, false);
 }

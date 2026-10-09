@@ -551,6 +551,43 @@ test("normal packaged Linux smoke uses an image-owned codex fixture and strips i
   ]) assert.equal(Object.hasOwn(selected, key), false, key);
 });
 
+test("normal packaged app environment rejects every sandbox override while preserving ordinary launch arguments", async () => {
+  const fixture = { home: "/synthetic/home", codexHome: "/synthetic/home/.codex", root: "/synthetic/root",
+    claudeHome: "/synthetic/claude", userData: "/synthetic/profile", stateFile: "/synthetic/state",
+    unavailableBusAddress: "unix:path=/synthetic/absent-bus" };
+  const environment = { PATH: "/usr/bin", HOME: "/synthetic/home", XDG_CONFIG_HOME: "/synthetic/config",
+    XDG_CACHE_HOME: "/synthetic/cache", XDG_DATA_HOME: "/synthetic/data", XDG_RUNTIME_DIR: "/synthetic/runtime" };
+  const selected = normalPackagedSmokeEnvironment({ fixture, service: "unavailable", environment });
+  assert.equal(Object.hasOwn(selected, "ELECTRON_DISABLE_SANDBOX"), false);
+  assert.equal(Object.hasOwn(selected, "electron_disable_sandbox"), false);
+  for (const key of ["ELECTRON_DISABLE_SANDBOX", "electron_disable_sandbox"]) {
+    for (const value of ["0", "1", "", "false", undefined, null]) {
+      for (const injected of [{ ...environment, [key]: value }, Object.assign(Object.create({ [key]: value }), environment)]) {
+        assert.throws(() => normalPackagedSmokeEnvironment({ fixture, service: "unavailable", environment: injected }), {
+          code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_CONTAINER_INVALID",
+        });
+        assert.equal(key in injected, true);
+      }
+    }
+  }
+  const result = await runOneNormalApp({ sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 }, {
+    appPath: APP_PATH, fixture, environment, service: "unavailable", readState: async () => null,
+    run: async options => {
+      assert.equal(await options.fixtureFactory(), fixture);
+      assert.deepEqual(options.launchArguments({ fixture, port: 12345 }), [
+        "--user-data-dir=/synthetic/profile", "--remote-debugging-port=12345",
+        "--remote-debugging-address=127.0.0.1", "--disable-gpu",
+      ]);
+      const launch = options.environmentFactory({ fixture });
+      assert.equal(Object.hasOwn(launch, "ELECTRON_DISABLE_SANDBOX"), false);
+      assert.equal(Object.hasOwn(launch, "electron_disable_sandbox"), false);
+      await options.afterRefresh({ fixture });
+      return { status: "passed" };
+    },
+  });
+  assert.equal(result, "unavailable");
+});
+
 test("normal packaged Linux smoke fixture keeps raw input private and the app-server dependency image-owned", async () => {
   const runtime = await mkdtemp(join(tmpdir(), "tibotattle-linux-normal-packaged-test-"));
   try {

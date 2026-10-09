@@ -29,8 +29,6 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "README.md",
     "SECURITY.md",
     "SUPPORT.md",
-    // Owner-approved, root-lock-only temporary advisory exception.
-    "osv-scanner.toml",
     "package.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",

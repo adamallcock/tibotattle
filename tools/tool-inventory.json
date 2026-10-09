@@ -467,17 +467,17 @@
     {
       "classification": "build_release_operation",
       "owner": "repository_operations",
-      "canonicalPath": "scripts/check-http-cache-exception.mjs",
+      "canonicalPath": "scripts/check-build-download-dependencies.mjs",
       "stableAlias": null,
-      "stableAliasReason": "The OSV workflow invokes this temporary exact-source, advisory-status and expiry guard directly; it is not a supported npm command.",
+      "stableAliasReason": "The OSV workflow invokes the root downloader dependency guard directly; it is not a supported npm command.",
       "additionalAliases": [],
       "callers": [
         ".github/workflows/osv-scanner.yml",
-        "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
-        "test/http-cache-exception.test.js"
+        "docs/decisions/2026-10-09-build-downloader-dependency-remediation.md",
+        "test/build-download-dependencies.test.js"
       ],
-      "decision": "retain_until_reviewed_exception_removal",
-      "provenance": "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+      "decision": "retain_as_build_dependency_regression_gate",
+      "provenance": "docs/decisions/2026-10-09-build-downloader-dependency-remediation.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -2035,6 +2035,7 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-normal-packaged-smoke.test.js",
+        "test/electron-linux-installed-lifecycle.test.js",
         "scripts/smoke-electron-linux-real-appimage-updater.mjs",
         "scripts/qualify-electron-linux-final-appimage.mjs",
         ".github/workflows/electron-linux-production-package.yml",
@@ -2965,7 +2966,8 @@
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-installed-lifecycle.test.js",
         "test/electron-linux-installed-files.test.mjs",
-        "scripts/diagnose-electron-linux-appimage-mount.mjs"
+        "scripts/diagnose-electron-linux-appimage-mount.mjs",
+        "scripts/run-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -2985,7 +2987,8 @@
         "test/electron-linux-installed-files.test.mjs",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
         "scripts/diagnose-electron-linux-appimage-mount.mjs",
-        "scripts/lib/linux-apparmor-mount-profile.mjs"
+        "scripts/lib/linux-apparmor-mount-profile.mjs",
+        "scripts/run-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3004,7 +3007,8 @@
         "containers/electron-linux-installed/Dockerfile",
         "test/electron-linux-installed-lifecycle.test.js",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
-        "test/electron-linux-startup-diagnostics.test.mjs"
+        "test/electron-linux-startup-diagnostics.test.mjs",
+        "test/electron-linux-final-host.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
@@ -3041,7 +3045,8 @@
         "test/electron-linux-packaged-container.test.js",
         "containers/electron-linux/Dockerfile",
         "containers/electron-linux-amd64/Dockerfile",
-        "scripts/diagnose-electron-linux-appimage-mount.mjs"
+        "scripts/diagnose-electron-linux-appimage-mount.mjs",
+        "scripts/run-electron-linux-final-lifecycle.mjs"
       ],
       "decision": "retain_as_internal_linux_qualification_support",
       "provenance": ".github/workflows/electron-linux-final-qualification.yml",
@@ -3053,11 +3058,14 @@
       "owner": "electron_packaging",
       "canonicalPath": "scripts/diagnose-electron-linux-appimage-mount.mjs",
       "stableAlias": null,
-      "stableAliasReason": "Private exact-byte AppImage mount diagnosis under the existing disposable Linux qualification boundary; never launches Electron or qualifies a release.",
+      "stableAliasReason": "Private exact-byte mount-only diagnostic CLI and shared native comparison adapters; a separately owned host callback may qualify the ordinary lifecycle without changing the diagnostic receipt purpose.",
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
-        "test/electron-linux-appimage-mount-diagnosis.test.mjs"
+        "test/electron-linux-appimage-mount-diagnosis.test.mjs",
+        "scripts/run-electron-linux-final-lifecycle.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-final-host.test.mjs"
       ],
       "decision": "retain_as_internal_linux_qualification_support",
       "provenance": ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
@@ -3069,7 +3077,7 @@
       "owner": "electron_packaging",
       "canonicalPath": "scripts/lib/linux-apparmor-mount-profile.mjs",
       "stableAlias": null,
-      "stableAliasReason": "Private exact-source AppArmor profile generator and owned cleanup for a diagnostic-only, immutable-AppImage comparison; not a product command.",
+      "stableAliasReason": "Private exact-source AppArmor policy, causal comparison, immutable candidate handoff and owned cleanup; not a product command.",
       "additionalAliases": [],
       "callers": [
         "scripts/diagnose-electron-linux-appimage-mount.mjs",
@@ -3077,6 +3085,24 @@
       ],
       "decision": "retain_as_internal_linux_qualification_support",
       "provenance": ".github/workflows/electron-linux-appimage-mount-diagnosis.yml",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/run-electron-linux-final-lifecycle.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit same-job causal comparison and owned final Linux lifecycle host; consumes immutable prebuilt images and never publishes.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-linux-final-qualification.yml",
+        "test/electron-linux-final-host.test.mjs",
+        "test/electron-linux-appimage-mount-diagnosis.test.mjs",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": ".github/workflows/electron-linux-final-qualification.yml",
       "provenanceReason": null,
       "legacyPaths": []
     }

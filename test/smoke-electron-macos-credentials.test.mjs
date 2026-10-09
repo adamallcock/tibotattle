@@ -136,8 +136,9 @@ test('plan and compilation plan remain inert and every physical qualification st
   }
 });
 
-test('0.1.27 credential planning cannot claim historical Sol repair or native execution', async () => {
-  const successor = { ...intake, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' };
+for (const [version, bundleVersion, buildNumber] of [['0.1.27', '1035', '2026100301'],
+  ['0.1.28', '1036', '2026100901']]) test(`${version} credential planning cannot claim historical Sol repair or native execution`, async () => {
+  const successor = { ...intake, version, bundleVersion, buildNumber };
   const plan = await runMacCredentialQualification({ intake: successor });
   assert.equal(plan.status, 'planned');
   assert.equal(plan.historicalSolUpgrade, null);
@@ -158,7 +159,8 @@ test('historical repair stays between predecessor attestation and modern-case co
   const replacement = modern.indexOf("stage = 'installed_replacement'");
   assert.ok(predecessorStop >= 0 && audit > predecessorStop && attest > audit
     && seed > attest && replacement > seed, 'synthetic seed follows stopped/audited predecessor, before replacement');
-  assert.match(modern.slice(attest, seed), /if \(input\.version === '0\.1\.27'\)/u);
+  assert.match(modern.slice(attest, seed), /if \(\['0\.1\.27', '0\.1\.28'\]\.includes\(input\.version\)\)/u);
+  assert.match(modern.slice(0, predecessorStop), /const predecessorRefreshId = \['0\.1\.27', '0\.1\.28'\]\.includes\(input\.version\)/u);
   const startupProof = modern.indexOf('await observeHistoricalSolPass(');
   const manualRefresh = modern.indexOf('await exerciseCredentialRefresh(active.dashboard)');
   const repeatProof = modern.indexOf('await observeHistoricalSolPass(', startupProof + 1);
@@ -175,7 +177,8 @@ test('historical repair stays between predecessor attestation and modern-case co
 });
 
 test('execute refuses a non-hosted account before downloads, profiles, installation or Keychain operations', async () => {
-  for (const selected of [intake, { ...intake, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' }]) {
+  for (const selected of [intake, { ...intake, version: '0.1.27', bundleVersion: '1035', buildNumber: '2026100301' },
+    { ...intake, version: '0.1.28', bundleVersion: '1036', buildNumber: '2026100901' }]) {
     const script = `import {runMacCredentialQualification} from './scripts/smoke-electron-macos-credentials.mjs';
 globalThis.fetch=()=>{throw new Error('unexpected network')};
 process.stdout.write(JSON.stringify(await runMacCredentialQualification({execute:true,intake:${JSON.stringify(selected)}})));`;

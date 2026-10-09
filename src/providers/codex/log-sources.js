@@ -3,7 +3,10 @@ import {
   throwIfAborted,
   validAbortSignal,
 } from "./log-normalization.js";
-import { classifySessionSurface } from "./surface-classification.js";
+import {
+  classifySessionSurface,
+  classifySessionSurfaceForOccurrenceIdentity,
+} from "./surface-classification.js";
 
 const MAXIMUM_ACTIVE_APPEND_PROOF_BYTES = 8 * 1024 * 1024;
 const MAXIMUM_ROLLOUT_LINEAGE_BYTES = 1024 * 1024;
@@ -554,6 +557,7 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           startOrdinal: startOrdinalValid ? record.ordinal : 0,
           startOrdinalValid,
           surfaceClassification,
+          occurrenceSurfaceClassification: classifySessionSurfaceForOccurrenceIdentity(record.payload),
         };
       } catch {
         // A malformed metadata line is handled by the main parser diagnostics.
@@ -569,6 +573,7 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       startOrdinal: 0,
       startOrdinalValid: false,
       surfaceClassification: classifySessionSurface(null),
+      occurrenceSurfaceClassification: classifySessionSurfaceForOccurrenceIdentity(null),
     };
   }
 

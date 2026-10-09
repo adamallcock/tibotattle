@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import {
   appendFile,
   mkdir,
@@ -36,6 +37,7 @@ import {
   readLocalCollectorState,
 } from "../src/local-collector-state.js";
 import { createResetEventClassifier } from "@app-usagemonitor/quota-analysis";
+import { stableJson } from "../src/storage.js";
 
 const virtualCollectorStatePaths = new Map();
 
@@ -333,6 +335,168 @@ test("run-once restarts from byte checkpoints without duplicate records", async 
     assert.equal((await readLines(fixture.dataFile)).length, 2);
     assert.equal((await stat(fixture.dataFile)).mode & 0o777, 0o600);
     assert.equal((await stat(fixture.checkpointFile)).mode & 0o777, 0o600);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("legacy surface checkpoints refresh exact auto-review metadata once without replaying usage", async () => {
+  const fixture = await collectorFixture([
+    JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "session_meta", payload: {
+      id: "synthetic-review", thread_source: "guardian_review",
+      source: { subagent: { other: "guardian" }, client: { type: "cli" } },
+    } }),
+    JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "turn_context", payload: { model: "gpt-test" } }),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:01:00.000Z");
+  const options = { ...fixture, refreshStale: false, backfill: true, clock };
+  try {
+    assert.equal((await runCollectorOnce(options)).rolloutRecordsWritten, 1);
+    const legacy = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [key, state] = Object.entries(legacy.files)[0];
+    delete state.surfaceClassificationVersion;
+    state.surfaceClassification.threadSource = "unknown";
+    await commitLocalCollectorState({ stateFile: fixture.stateFile, checkpoint: legacy, records: [], clock });
+    const recordsBefore = await readLines(fixture.dataFile);
+    const stateBefore = structuredClone(state);
+    const sourceBytes = (await stat(fixture.rollout)).size;
+
+    const paused = await runCollectorOnce({ ...options, maximumRecentRunBytes: sourceBytes - 1 });
+    assert.equal(paused.pauseReason, "collector_resource_source_bytes_limit_exceeded");
+    assert.equal(paused.rolloutRecordsWritten, 0);
+    assert.deepEqual(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).files[key], stateBefore);
+
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await ingestRolloutUpdates({
+      codexHome: fixture.codexHome,
+      checkpoint: legacy,
+      clock,
+      rollouts: await discoverCollectorRollouts(fixture.codexHome),
+      signal: controller.signal,
+      commitRecordBatch: async () => assert.fail("cancelled refresh cannot commit records"),
+    });
+    assert.equal(cancelled.aborted, true);
+    assert.deepEqual(legacy.files[key], stateBefore);
+
+    const refreshed = await runCollectorOnce({ ...options, maximumRecentRunBytes: sourceBytes });
+    assert.equal(refreshed.rolloutRecordsWritten, 0);
+    const current = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.deepEqual(current.files[key], {
+      ...stateBefore,
+      surfaceClassification: { ...stateBefore.surfaceClassification, threadSource: "auto_review" },
+      surfaceClassificationVersion: "auto-review-v1",
+    });
+    assert.deepEqual(current.recentEventKeys, legacy.recentEventKeys);
+    assert.deepEqual(await readLines(fixture.dataFile), recordsBefore);
+    const warm = await runCollectorOnce({ ...options, maximumRecentRunBytes: 1 });
+    assert.equal(warm.status, "complete", "a refreshed header must not consume the next run's read budget");
+    assert.equal(warm.rolloutRecordsWritten, 0);
+
+    await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), 2)}\n`);
+    assert.equal((await runCollectorOnce(options)).rolloutRecordsWritten, 1);
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.length, 2);
+    assert.equal(records[1].surfaceClassification.threadSource, "auto_review");
+    assert.equal(records[1].surfaceClassification.surface, "cli_exec");
+    assert.equal(records.reduce((sum, record) => sum + record.components.input_uncached_tokens, 0), 20);
+    assert.equal(new Set(records.map((record) => record.eventKey)).size, 2);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+for (const threadSource of ["unknown", "user", "subagent", "automation"]) {
+test(`auto-review classification preserves ${threadSource} passive occurrence keys across truncation and aliases`, async () => {
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "session_meta", payload: {
+      id: "synthetic-review-replay", thread_source: "guardian_review", originator: threadSource,
+      source: { subagent: { other: "guardian" } },
+    } }),
+    JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "turn_context", payload: { model: "gpt-test" } }),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ];
+  const fixture = await collectorFixture([
+    ...lines, JSON.stringify({ type: "event_msg", payload: { type: "ignored_fixture_padding" } }),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:01:00.000Z");
+  const options = { ...fixture, refreshStale: false, backfill: true, clock };
+  try {
+    await runCollectorOnce(options);
+    let checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [legacy] = await readLines(fixture.dataFile);
+    // Reconstruct the exact pre-upgrade record/checkpoint shape. The former
+    // classifier ignored both guardian labels and used other source metadata.
+    legacy.surfaceClassification.threadSource = threadSource;
+    delete legacy.eventKey;
+    legacy.eventKey = createHash("sha256").update(stableJson({
+      ...legacy, receivedAt: undefined, stalenessMs: undefined,
+    })).digest("hex");
+    checkpoint.recentEventKeys = [legacy.eventKey];
+    for (const state of Object.values(checkpoint.files)) {
+      state.surfaceClassification.threadSource = threadSource;
+      delete state.surfaceClassificationVersion;
+      delete state.occurrenceSurfaceClassification;
+    }
+    const records = [legacy];
+    const ingest = async () => {
+      // Rehydrate the closed checkpoint as a process restart would.
+      checkpoint = structuredClone(checkpoint);
+      return ingestRolloutUpdates({
+        codexHome: fixture.codexHome, checkpoint, clock,
+        commitRecordBatch: async (batch) => records.push(...batch),
+      });
+    };
+
+    // A shortened same-inode file forces a replay after the header refresh.
+    await writeFile(fixture.rollout, `${lines.join("\n")}\n`);
+    const replayed = await ingest();
+    assert.equal(replayed.recordsWritten, 0);
+    assert.deepEqual(records, [legacy]);
+    const refreshed = checkpoint;
+    assert.equal(Object.values(refreshed.files)[0].surfaceClassification.threadSource, "auto_review");
+    assert.deepEqual(refreshed.recentEventKeys, [legacy.eventKey]);
+
+    // A second physical file with the same logical event must use the same
+    // occurrence key even though it has no previous classification checkpoint.
+    await writeFile(join(fixture.sessions, "rollout-2026-07-23T00-00-00-alias.jsonl"), `${lines.join("\n")}\n`);
+    assert.equal((await ingest()).recordsWritten, 0);
+    assert.deepEqual(records, [legacy]);
+    await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), 2)}\n`);
+    assert.equal((await ingest()).recordsWritten, 1);
+    const settled = records;
+    assert.equal(settled.length, 2);
+    assert.equal(settled[1].surfaceClassification.threadSource, "auto_review");
+    assert.equal(settled.reduce((sum, row) => sum + row.components.input_uncached_tokens, 0), 20);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+}
+
+test("missing header evidence cannot give a memoized collector source an auto-review exemption", async () => {
+  const fixture = await collectorFixture([
+    JSON.stringify({ timestamp: "2026-07-23T00:00:00.000Z", type: "turn_context", payload: { model: "gpt-5.6-auto-review" } }),
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:01:00.000Z");
+  const options = { ...fixture, refreshStale: false, backfill: true, clock };
+  try {
+    await runCollectorOnce(options);
+    const legacy = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const [key, state] = Object.entries(legacy.files)[0];
+    delete state.surfaceClassificationVersion;
+    state.surfaceClassification.threadSource = "user";
+    const stateBefore = structuredClone(state);
+    await commitLocalCollectorState({ stateFile: fixture.stateFile, checkpoint: legacy, records: [], clock });
+    await runCollectorOnce(options);
+    assert.deepEqual(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).files[key], {
+      ...stateBefore, surfaceClassificationVersion: "auto-review-v1",
+    });
+    await rm(fixture.rollout);
+    assert.equal((await runCollectorOnce(options)).rolloutRecordsWritten, 0);
+    assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).files[key].surfaceClassification.threadSource, "user");
   } finally {
     await rm(fixture.root, { recursive: true });
   }
@@ -2869,7 +3033,7 @@ test("idle reconciliation does not rewrite the full checkpoint every cycle", asy
 });
 
 
-test("inline fork replay stays out of the ledger and the baseline rebases across a resume", async () => {
+test("inline fork replay stays out of the ledger across an auto-review classification upgrade and resume", async () => {
   const fixture = await collectorFixture([
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
   ]);
@@ -2878,7 +3042,10 @@ test("inline fork replay stays out of the ledger and the baseline rebases across
   const meta = JSON.stringify({
     timestamp: "2026-07-23T00:05:00.000Z",
     type: "session_meta",
-    payload: { id: "fork-child", forked_from_id: "vanished-parent" },
+    payload: {
+      id: "fork-child", forked_from_id: "vanished-parent",
+      thread_source: "guardian_review", source: { subagent: { other: "guardian" } },
+    },
   });
   const tool = JSON.stringify({
     timestamp: "2026-07-23T00:05:00.500Z",
@@ -2914,6 +3081,12 @@ test("inline fork replay stays out of the ledger and the baseline rebases across
         && row.components.input_uncached_tokens > 10).length,
       0,
     );
+    const legacy = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    const legacyFork = Object.values(legacy.files).find((state) => state.isInlineFork === true);
+    assert.equal(legacyFork.ownTurnContextSeen, false);
+    delete legacyFork.surfaceClassificationVersion;
+    legacyFork.surfaceClassification.threadSource = "unknown";
+    await commitLocalCollectorState({ stateFile: fixture.stateFile, checkpoint: legacy, records: [], clock });
 
     // The fork's first genuine turn arrives after a restart. Its delta must
     // be measured from the replayed baseline (400 - 300 = its own 100), not
@@ -2937,6 +3110,8 @@ test("inline fork replay stays out of the ledger and the baseline rebases across
     const forkUsage = usageRecords.filter((row) => row.model === "gpt-test");
     assert.equal(forkUsage.length, 1);
     assert.equal(forkUsage[0].components.input_uncached_tokens, 100);
+    assert.equal(forkUsage[0].surfaceClassification.threadSource, "auto_review");
+    assert.equal(forkUsage[0].surfaceClassification.lineageDisposition, "forked");
     assert.equal(
       records.filter((row) => row.kind === "codex_tool_class_event"
         && row.toolClass !== undefined

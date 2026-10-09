@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  mkdtemp,
   readFile,
   rm,
   stat,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { validateDesktopFirstRunReceipt } from "../apps/electron/desktop-first-run.js";
 import {
   assertContainerContract,
+  isLinuxSandboxEnvironmentClean,
   createLinuxResourceDiagnostics,
   validateLinuxResourceDiagnostic,
   classifyAutomaticStartupRefreshReceipt,
@@ -478,7 +482,7 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.doesNotMatch(dockerfile, /node node_modules\/electron\/install\.js/u);
   assert.match(dockerfile, /xvfb-run/u);
   assert.match(dockerfile, /-nolisten tcp/u);
-  assert.match(dockerfile, /ELECTRON_DISABLE_SANDBOX=0/u);
+  assert.doesNotMatch(dockerfile, /(?:ELECTRON_DISABLE_SANDBOX|electron_disable_sandbox)\s*=/u);
   assert.match(dockerfile, /USER node/u);
   assert.doesNotMatch(dockerignore, /!patches\//u);
   const readyWait = source.indexOf("const ready = await waitFor");
@@ -1024,8 +1028,63 @@ test("Linux Electron smoke refuses an unbounded host checkout", () => {
   assert.doesNotMatch(result.stderr, /(?:file:|workspace|rollout-linux-smoke)/iu);
 });
 
+test("Linux sandbox environment requires absence of either Electron override spelling, never a false-looking value", () => {
+  const common = {
+    platform: "linux", architecture: "arm64", imagePlatform: "linux/arm64",
+    sourceRevision: "1234567890abcdef1234567890abcdef12345678", networkBoundary: "network-none",
+    networkInterfacesImpl: () => ({ lo: [{ address: "127.0.0.1", internal: true }] }),
+  };
+  assert.equal(isLinuxSandboxEnvironmentClean({}), true);
+  assert.equal(assertContainerContract({ ...common, environment: {} }).networkBoundaryEvidence, "loopback-only");
+  for (const key of ["ELECTRON_DISABLE_SANDBOX", "electron_disable_sandbox"]) {
+    for (const value of ["0", "1", "", "false", undefined, null]) {
+      for (const environment of [{ [key]: value }, Object.create({ [key]: value })]) {
+        assert.equal(isLinuxSandboxEnvironmentClean(environment), false);
+        assert.throws(() => assertContainerContract({ ...common, environment }), /sandbox override to be absent/u);
+        assert.equal(key in environment, true); // No silent environment rewriting.
+      }
+    }
+  }
+  for (const environment of [null, undefined, [], ""]) assert.equal(isLinuxSandboxEnvironmentClean(environment), false);
+});
+
+test("shared smoke refuses an injected sandbox-disabling launch environment before spawning and cleans its owned fixture", async () => {
+  for (const key of ["ELECTRON_DISABLE_SANDBOX", "electron_disable_sandbox"]) {
+    for (const value of ["0", "1", "", "false"]) {
+      const root = await mkdtemp(join(tmpdir(), "tibotattle-sandbox-environment-"));
+      try {
+        await assert.rejects(runSmoke({
+          binary: "/synthetic/not-an-executable",
+          readContainerContract: () => ({ sourceRevision: "a".repeat(40) }),
+          fixtureFactory: async () => ({ root }),
+          environmentFactory: () => ({ [key]: value }),
+          launchArguments: () => [],
+        }), /Electron Linux smoke launch configuration is invalid/u);
+        await assert.rejects(stat(root), { code: "ENOENT" });
+      } finally { await rm(root, { recursive: true, force: true }); }
+    }
+  }
+});
+
+test("shared launch absence admission also rejects inherited override names without relying on later own-key normalization", async () => {
+  for (const key of ["ELECTRON_DISABLE_SANDBOX", "electron_disable_sandbox"]) {
+    const root = await mkdtemp(join(tmpdir(), "tibotattle-sandbox-inherited-"));
+    try {
+      await assert.rejects(runSmoke({
+        binary: "/synthetic/not-an-executable",
+        readContainerContract: () => ({ sourceRevision: "a".repeat(40) }),
+        fixtureFactory: async () => ({ root }),
+        environmentFactory: () => Object.create({ [key]: "0" }),
+        launchArguments: () => [],
+      }), /Electron Linux smoke launch configuration is invalid/u);
+      await assert.rejects(stat(root), { code: "ENOENT" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
 test("Linux Electron smoke proves the network boundary from runtime interfaces", () => {
   const common = {
+    environment: {},
     platform: "linux",
     architecture: "arm64",
     imagePlatform: "linux/arm64",

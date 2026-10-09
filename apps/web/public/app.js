@@ -10660,13 +10660,11 @@ function renderAccounting(data) {
 }
 
 /**
- * Every model identity observed in the period, across both allowance tracks.
+ * Every model identity observed in the period, across all allowance tracks.
  *
- * `byModel` describes the primary Codex pool only, because the separately
- * metered Spark allowance is kept out of that pool's own totals. `modelUsage`
- * is the combined list, each row carrying its own allowance track. Reading
- * only `byModel` is what previously left Spark usage invisible, or collapsed
- * into "Unrecognized model".
+ * `byModel` describes the primary Codex pool only. `modelUsage` also includes
+ * Spark and date-qualified auto-review, each row carrying its own track.
+ * Separate rows preserve their evidence without entering the primary totals.
  */
 function modelUsageRows(accounting) {
   const combined = Array.isArray(accounting?.modelUsage)
@@ -10688,6 +10686,7 @@ function modelUsageRows(accounting) {
 
 function modelRowIsSeparateAllowance(row) {
   return row?.allowanceTrack === "spark"
+    || row?.allowanceTrack === "separate"
     || row?.apiPriceEquivalentApplicable === false;
 }
 
@@ -10696,9 +10695,9 @@ function modelRowIsSeparateAllowance(row) {
  * situations. They are not the same fact and a reader has to be able to tell
  * them apart:
  *
- *   separate allowance - Spark is metered against its own pool, so an
- *                        API-price equivalent is not a meaningful figure at
- *                        all, as opposed to a missing one.
+ *   separate allowance - Spark withholds the API comparison. Date-qualified
+ *                        auto-review shows a marked zero against the main
+ *                        allowance while preserving its API-price evidence.
  *   no published price - a recognised model OpenAI publishes no price card
  *                        for. Deliberately not priced; not an error.
  *   not priced         - an identifier this build has never reviewed. No
@@ -10727,8 +10726,16 @@ function modelHasComparableCost(row) {
 function modelApiEquivalentCell(row) {
   const cell = node("td", "model-api-equivalent data-value-unavailable");
   if (modelRowIsSeparateAllowance(row)) {
-    setLocalizedText(cell, "accounting.model.separateAllowance");
-    cell.title = t("accounting.model.separateAllowanceTitle");
+    if (row.allowanceTrack === "separate") {
+      // The API quote remains in the local evidence. This explicit zero is
+      // the main-allowance charge for date-qualified auto-review usage.
+      setRawText(cell, `${formatApiMoney(0)}*`);
+      cell.className = "model-api-equivalent";
+      cell.title = t("accounting.model.separateMainAllowanceTitle");
+    } else {
+      setLocalizedText(cell, "accounting.model.separateAllowance");
+      cell.title = t("accounting.model.separateAllowanceTitle");
+    }
     return cell;
   }
   if (row?.pricingStatus === "known_unpriced") {
@@ -10842,7 +10849,9 @@ function modelComponentRow(model, key, labelKey, totals) {
     );
     costCell.title = t(
       modelRowIsSeparateAllowance(model)
-        ? "accounting.model.separateAllowanceTitle"
+        ? model.allowanceTrack === "separate"
+          ? "accounting.model.separateMainAllowanceTitle"
+          : "accounting.model.separateAllowanceTitle"
         : model.pricingStatus === "known_unpriced"
           ? "accounting.model.noPublishedPriceTitle"
           : model.pricingStatus === "unrecognized"
@@ -10951,12 +10960,15 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
       // sentence as its expansion and pointing at the standing footnote under
       // the table, says it without competing with the figures.
       const marker = rawNode("abbr", "model-allowance-marker", "*");
-      marker.title = t("accounting.model.separateAllowanceTitle");
+      marker.title = t(model.allowanceTrack === "separate"
+        ? "accounting.model.separateMainAllowanceTitle"
+        : "accounting.model.separateAllowanceTitle");
       identity.append(marker);
     }
     // One formatter for both count columns. Compact notation put "154.9K"
     // beside "74" in the same column, which no reader can compare by eye.
     const separate = modelRowIsSeparateAllowance(model);
+    if (separate) row.setAttribute("aria-describedby", "accounting-model-allowance-footnote");
     row.append(
       identity,
       rawNode(
@@ -10988,23 +11000,29 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
         .map(([key, labelKey]) => modelComponentRow(model, key, labelKey, totals));
 
     if (componentRows.length > 0) {
-      const expanded = accountingExpandedModels.has(model.model);
+      // One model may have primary history and later separate-allowance usage.
+      // Their component expansion state must not merge on a re-render.
+      const expansionKey = separate ? `${model.model}:${model.allowanceTrack}` : model.model;
+      const expanded = accountingExpandedModels.has(expansionKey);
       row.classList.add("model-row-expandable");
       row.tabIndex = 0;
       row.setAttribute("role", "button");
       row.setAttribute("aria-expanded", String(expanded));
       const describe = () => {
+        const name = model.model === "unknown"
+          ? t("accounting.model.identityUnavailable")
+          : model.pricingStatus === "unrecognized"
+            ? t("accounting.model.unrecognized")
+            : formatModelName(model.model);
         row.setAttribute(
           "aria-label",
           t(
             row.getAttribute("aria-expanded") === "true"
               ? "accounting.model.collapse"
               : "accounting.model.expand",
-            { model: model.model === "unknown"
-              ? t("accounting.model.identityUnavailable")
-              : model.pricingStatus === "unrecognized"
-                ? t("accounting.model.unrecognized")
-                : formatModelName(model.model) },
+            { model: model.allowanceTrack === "separate"
+              ? t("accounting.model.separateMainAllowanceLabel", { model: name })
+              : name },
           ),
         );
       };
@@ -11014,8 +11032,8 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
       const toggle = () => {
         const open = row.getAttribute("aria-expanded") === "true";
         row.setAttribute("aria-expanded", String(!open));
-        if (open) accountingExpandedModels.delete(model.model);
-        else accountingExpandedModels.add(model.model);
+        if (open) accountingExpandedModels.delete(expansionKey);
+        else accountingExpandedModels.add(expansionKey);
         for (const componentRow of componentRows) componentRow.hidden = open;
         describe();
       };

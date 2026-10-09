@@ -19,6 +19,8 @@ import * as legacyResourcePolicy from "../src/export-resource-policy.js";
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REGISTRY_EXPORTS = Object.freeze([
   "ANTHROPIC_CLAUDE_MODEL_IDS",
+  // Reviewed event-time policy; model identity alone never grants exemption.
+  "CODEX_AUTO_REVIEW_SEPARATE_ALLOWANCE_START_AT",
   "EXPORT_DIAGNOSTIC_CODES",
   "OPENAI_CODEX_LIMIT_IDS",
   "OPENAI_CODEX_MODEL_IDS",
@@ -35,6 +37,7 @@ const REGISTRY_EXPORTS = Object.freeze([
   "codexModelAllowanceTrack",
   "codexModelApiPriceEquivalentApplicable",
   "codexModelPricingStatus",
+  "codexUsageAllowanceTrack",
   "exportLimitProvider",
   "exportModelProvider",
   "exportRegistrySnapshot",

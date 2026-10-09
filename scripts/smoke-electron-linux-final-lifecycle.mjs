@@ -8,9 +8,9 @@ import { lookup } from 'node:dns/promises';
 import { basename, dirname, join, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { assertContainerContract, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
+import { assertContainerContract, isLinuxSandboxEnvironmentClean, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES } from './smoke-electron-linux.mjs';
-import { createLinuxStartupDiagnostics, sampleLinuxStartupFuseMount,
+import { createLinuxStartupDiagnostics,
   validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
 import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment, runOneNormalApp, normalPackagedSmokeFailureStageCode,
   persistLinuxNormalPackagedRestartPreferences, verifyLinuxNormalPackagedRestartPreferences } from './smoke-electron-linux-packaged.mjs';
@@ -19,23 +19,58 @@ import { prepareLinuxUpdaterDownload, realUpdaterFeed, isLinuxUpdaterSettingsURL
 import { proveLinuxSecretServiceContainerIsolation, startLinuxSecretServiceDaemon } from './qualify-linux-secret-service.mjs';
 import { readLocalCollectorCheckpoint } from '../src/local-collector-state.js';
 import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
-import { LINUX_FINAL_INPUT, LINUX_FINAL_FEED, validateLinuxFinalPair, linuxFinalFailure as fail } from './lib/linux-final-artifact-intake.mjs';
+import { readLinuxMountRuntimeFacts, sampleLinuxMountProbeFacts } from './diagnose-electron-linux-appimage-mount.mjs';
+import { LINUX_FINAL_INPUT, LINUX_FINAL_FEED, validateLinuxFinalPair, resolveLinuxFinalRelease, linuxFinalFailure as fail } from './lib/linux-final-artifact-intake.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const LINUX_FINAL_EXEC = '/opt/tibotattle-updater-exec';
-const IMAGE = `${LINUX_FINAL_EXEC}/TiboTattle.AppImage`, TEMP = `${LINUX_FINAL_EXEC}/tmp`;
+const IMAGE = `${LINUX_FINAL_EXEC}/TiboTattle.AppImage`, TEMP_ROOT = `${LINUX_FINAL_EXEC}/tmp`;
 const HOST = 'updates.tibotattle.com';
 const wait = waitForUpdater;
 const digest = async path => (await fingerprintLinuxFinalFile(path)).sha256;
 const unescapeMount = text => text.replace(/\\(040|011|012|134)/gu, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
+export function linuxFinalTemporary(nonce) {
+  if (!/^[a-f0-9]{32}$/u.test(nonce ?? '')) fail('FUSE_TEMPORARY_INVALID');
+  return `${TEMP_ROOT}/${nonce}`;
+}
+export function assertLinuxFinalOwnedPolicy({ nonce, name, profileText, facts }) {
+  linuxFinalTemporary(nonce);
+  if (typeof name !== 'string' || !new RegExp(`^tibotattle-mount-candidate-[1-9][0-9]{0,14}-${nonce}$`, 'u').test(name)
+    || typeof profileText !== 'string' || profileText.length > 256 || profileText.trim() !== `${name} (enforce)`
+    || !isDeepStrictEqual(facts, { appArmor: { profile: 'other', enforcement: 'enforce' }, seccomp: 'filter',
+      noNewPrivileges: false, sysAdmin: { effective: false, permitted: false, bounding: true },
+      fuseDevice: { characterDevice: true, readable: true, writable: true },
+      fusermount: { present: true, regular: true, rootOwned: true, setuid: true, executable: true } })) fail('ISOLATION_REQUIRED');
+}
+
+function checkedLaunchArguments(value) {
+  if (!Array.isArray(value) || value.length > 8 || value.some(argument => typeof argument !== 'string'
+    || argument.length === 0 || argument.length > 4096 || /[\s\u0000-\u001f\u007f]/u.test(argument)
+    || /^--(?:type|no-sandbox|disable-setuid-sandbox)(?:=|$)/u.test(argument))) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+  return value;
+}
+/** Whole-value equality only; never split/trim a title to admit a browser. */
+export function linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments }) {
+  const argv = [executable, ...checkedLaunchArguments(expectedArguments)];
+  return typeof commandLine === 'string' && typeof executable === 'string' && executable.length > 0
+    && !/[\s\u0000-\u001f\u007f]/u.test(executable)
+    && (commandLine === `${argv.join('\0')}\0` || commandLine === `${argv.join(' ')}\0`);
+}
+function rememberLaunchArguments(argumentVectors, argumentsForLaunch) {
+  checkedLaunchArguments(argumentsForLaunch);
+  if (argumentVectors.length >= 4) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+  const frozen = Object.freeze([...argumentsForLaunch]); argumentVectors.push(frozen); return frozen;
+}
 
 /** A path alone never proves FUSE. Bind the kernel mount table and the runtime's
  * environment to the installed image. SquashFS file uid is not the app uid. */
-export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE }) {
-  if (image !== IMAGE || typeof executable !== 'string' || posix.resolve(executable) !== executable
-    || posix.basename(executable) !== 'tibotattle') fail('FUSE_IDENTITY_INVALID');
+export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, image = IMAGE, temporary, commandLine, expectedArguments }) {
+  if (typeof temporary !== 'string' || temporary !== linuxFinalTemporary(temporary.slice(TEMP_ROOT.length + 1))) fail('FUSE_TEMPORARY_INVALID');
+  if (image !== IMAGE) fail('FUSE_IMAGE_PATH_INVALID');
+  if (typeof executable !== 'string' || posix.resolve(executable) !== executable
+    || posix.basename(executable) !== 'tibotattle') fail('FUSE_EXECUTABLE_PATH_INVALID');
   const mount = posix.dirname(executable);
-  if (!new RegExp(`^${TEMP}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_IDENTITY_INVALID');
+  if (!new RegExp(`^${temporary}/\\.mount_[A-Za-z0-9._-]+$`, 'u').test(mount)) fail('FUSE_MOUNT_LOCATION_INVALID');
   const rows = mountinfo.split('\n').filter(Boolean).map(line => {
     const parts = line.split(' - '); if (parts.length !== 2) return null;
     const before = parts[0].split(' '), after = parts[1].split(' ');
@@ -43,68 +78,143 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
       options: (before[5] ?? '').split(','), type: after[0], source: unescapeMount(after[1] ?? ''),
       superOptions: (after[2] ?? '').split(',') };
   }).filter(row => row?.mount === mount);
-  if (rows.length !== 1) fail('FUSE_IDENTITY_INVALID');
+  if (rows.length === 0) fail('FUSE_MOUNT_MISSING');
+  if (rows.length !== 1) fail('FUSE_MOUNT_AMBIGUOUS');
   const selected = rows[0];
-  const fuse = selected.type === 'fuse.squashfuse' && selected.source === 'squashfuse'
-    || ['fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type) && [image, posix.basename(image)].includes(selected.source);
-  if (!fuse || selected.root !== '/' || !selected.options.includes('ro')
-    || !selected.superOptions.includes('user_id=1000')
-    || environment.APPIMAGE !== image || environment.APPDIR !== mount
-    || environment.APPIMAGE_EXTRACT_AND_RUN !== undefined) fail('FUSE_IDENTITY_INVALID');
+  if (!['fuse.squashfuse', 'fuse.TiboTattle.AppImage', 'fuse'].includes(selected.type)) fail('FUSE_MOUNT_TYPE_INVALID');
+  if (!(selected.type === 'fuse.squashfuse' ? selected.source === 'squashfuse'
+    : [image, posix.basename(image)].includes(selected.source))) fail('FUSE_MOUNT_SOURCE_INVALID');
+  if (selected.root !== '/') fail('FUSE_MOUNT_ROOT_INVALID');
+  if (!selected.options.includes('ro')) fail('FUSE_MOUNT_READ_ONLY_REQUIRED');
+  if (!selected.superOptions.includes('user_id=1000')) fail('FUSE_MOUNT_UID_INVALID');
+  if (environment.APPIMAGE !== undefined && environment.APPIMAGE !== image) fail('FUSE_APPIMAGE_ENV_MISMATCH');
+  if (environment.APPDIR !== undefined && environment.APPDIR !== mount) fail('FUSE_APPDIR_ENV_MISMATCH');
+  if (environment.APPIMAGE_EXTRACT_AND_RUN !== undefined) fail('FUSE_EXTRACTION_MODE_FORBIDDEN');
+  if (environment.APPIMAGE === undefined || environment.APPDIR === undefined) {
+    // Pinned Chromium can clear the original /proc environment. This is only
+    // provisional mount selection; the caller must still authenticate all bytes
+    // and the stable process before admitting a browser.
+    const exactLaunch = expectedArguments !== undefined && linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments });
+    if (!exactLaunch) fail(environment.APPIMAGE === undefined ? 'FUSE_APPIMAGE_ENV_MISSING' : 'FUSE_APPDIR_ENV_MISSING');
+    if (selected.type === 'fuse.squashfuse' || ![image, posix.basename(image)].includes(selected.source)) fail('FUSE_MOUNT_SOURCE_INVALID');
+  }
   return { mount, type: selected.type };
 }
-export function linuxFinalSandboxStatus({ commandLine, status }) {
-  const args = commandLine.split('\0');
-  return args.includes('--type=renderer') && !args.includes('--no-sandbox')
-    && !args.includes('--disable-setuid-sandbox') && /^NoNewPrivs:\s+1$/mu.test(status)
+/** Chromium can expose one space-joined process title instead of NUL argv.
+ * This parser only excludes child roles and checks renderer sandbox flags;
+ * it never admits a browser without the separate exact launch and artifact proof. */
+export function linuxFinalProcessCommandLineFacts({ commandLine, executable }, observeRefusal = null) {
+  const refuse = code => { observeRefusal?.(code); return null; };
+  if (typeof commandLine !== 'string') return refuse('PROCESS_COMMAND_LINE_TYPE_INVALID');
+  if (commandLine.length > 65536) return refuse('PROCESS_COMMAND_LINE_TOO_LONG');
+  if (!commandLine.endsWith('\0')) return refuse('PROCESS_COMMAND_LINE_TERMINATOR_MISSING');
+  if (typeof executable !== 'string' || executable.length === 0 || /[\s\0]/u.test(executable)) return refuse('PROCESS_EXECUTABLE_FORM_INVALID');
+  const fields = commandLine.slice(0, -1).split('\0');
+  let encodedArguments, boundary;
+  if (fields.length > 1 || fields[0] === executable) {
+    if (fields[0] !== executable) return refuse('PROCESS_ARGV_ZERO_MISMATCH');
+    const invalidField = fields.find(field => field.length === 0 || /\s/u.test(field));
+    if (invalidField !== undefined) return refuse(invalidField.length === 0 ? 'PROCESS_ARGV_EMPTY_FIELD' : 'PROCESS_ARGV_WHITESPACE');
+    encodedArguments = fields.slice(1).join('\0'); boundary = '\\0';
+  } else {
+    if (!fields[0].startsWith(`${executable} `)) return refuse('PROCESS_TITLE_PREFIX_MISMATCH');
+    encodedArguments = fields[0].slice(executable.length + 1); boundary = ' ';
+    if (encodedArguments.length === 0 || /[^\S ]/u.test(encodedArguments)
+      || encodedArguments.startsWith(' ') || encodedArguments.endsWith(' ') || encodedArguments.includes('  ')) return refuse('PROCESS_TITLE_SPACING_INVALID');
+  }
+  const roles = [...encodedArguments.matchAll(new RegExp(`(?:^|${boundary})--type=([^${boundary}]*)(?=${boundary}|$)`, 'gu'))];
+  if (roles.length > 1) return refuse('PROCESS_ROLE_MULTIPLE');
+  // Chromium 150 sandbox_linux.cc rewrites forked broker titles to these
+  // exact child roles. They may exclude a browser candidate only after the
+  // complete grammar below; they never satisfy the exact renderer predicate.
+  if (roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility',
+    'broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'].includes(roles[0][1])) {
+    if (roles[0][1] === '') return refuse('PROCESS_ROLE_EMPTY');
+    return refuse('PROCESS_ROLE_UNKNOWN');
+  }
+  if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return refuse('PROCESS_ROLE_BARE');
+  const sandboxBypass = new RegExp(`(?:^|${boundary})--(?:no-sandbox|disable-setuid-sandbox)(?:=|${boundary}|$)`, 'u').test(encodedArguments);
+  return { role: roles[0]?.[1] ?? null, sandboxBypass };
+}
+export function linuxFinalSandboxStatus({ commandLine, executable, status }) {
+  const facts = linuxFinalProcessCommandLineFacts({ commandLine, executable });
+  return facts?.role === 'renderer' && !facts.sandboxBypass && /^NoNewPrivs:\s+1$/mu.test(status)
     && /^Seccomp:\s+2$/mu.test(status);
 }
 function startTime(stat) {
   const close = stat.lastIndexOf(')');
   const value = stat.slice(close + 2).split(' ')[19];
-  if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_IDENTITY_INVALID');
+  if (!/^[0-9]+$/u.test(value ?? '')) fail('PROCESS_START_TIME_INVALID');
   return value;
 }
-async function processIdentity(pid, expected) {
-  const stat = await readFile(`/proc/${pid}/stat`, 'utf8');
-  const args = (await readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
+export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary, { expectedArguments, read = readFile, link = readlink, hash = digest } = {}) {
+  const stat = await read(`/proc/${pid}/stat`, 'utf8');
+  const args = (await read(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
   if (args.some(arg => arg.startsWith('--type='))) return null;
-  const executable = await readlink(`/proc/${pid}/exe`); // No argv fallback in this lane.
-  if (!executable.startsWith(`${TEMP}/.mount_`) || basename(executable) !== 'tibotattle') return null;
-  const status = await readFile(`/proc/${pid}/status`, 'utf8');
-  if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_IDENTITY_INVALID');
-  const entries = (await readFile(`/proc/${pid}/environ`, 'utf8')).split('\0');
-  const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN)=/u.test(item)).map(item => {
+  const executable = await link(`/proc/${pid}/exe`); // No argv fallback in this lane.
+  if (!executable.startsWith(`${temporary}/.mount_`) || basename(executable) !== 'tibotattle') return null;
+  const status = await read(`/proc/${pid}/status`, 'utf8');
+  if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_UID_INVALID');
+  const entries = (await read(`/proc/${pid}/environ`, 'utf8')).split('\0');
+  const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN|ELECTRON_RUN_AS_NODE)=/u.test(item)).map(item => {
     const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
   }));
-  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await readFile(`/proc/${pid}/mountinfo`, 'utf8'), environment });
-  if (await digest(executable) !== expected.executableSha256
-    || await digest(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
-  if (startTime(await readFile(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
+  // The ordinary companion uses this same executable in Node mode. Its closed
+  // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
+  if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
+  if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_NODE_MODE_INVALID');
+  let roleFailure = 'PROCESS_ROLE_INVALID';
+  const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable }, code => { roleFailure = code; });
+  if (facts === null) fail(roleFailure);
+  if (facts.role !== null) return null;
+  const commandLine = args.join('\0');
+  if (!linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments })) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await read(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary, commandLine, expectedArguments });
+  if (await hash(executable) !== expected.executableSha256
+    || await hash(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
+  if (await hash(IMAGE) !== expected.sha256) fail('INSTALLED_BYTES_INVALID');
+  if (startTime(await read(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
   return { pid, startTime: startTime(stat), mount: mounted.mount, executable };
 }
-async function ownedApps(expected) {
+export async function readLinuxFinalKnownAppProcessIdentity(pid, expected, temporary, argumentVectors, io = {}) {
+  if (!Array.isArray(argumentVectors) || argumentVectors.length < 1 || argumentVectors.length > 4) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+  for (const args of argumentVectors) checkedLaunchArguments(args);
+  let mismatch;
+  for (let index = 0; index < argumentVectors.length; index++) {
+    try {
+      const identity = await readLinuxFinalAppProcessIdentity(pid, expected, temporary, { ...io, expectedArguments: argumentVectors[index] });
+      return identity === null ? null : { identity, argumentIndex: index };
+    } catch (error) {
+      if (error?.code !== 'LINUX_FINAL_LIFECYCLE_PROCESS_LAUNCH_ARGUMENTS_INVALID') throw error;
+      mismatch = error;
+    }
+  }
+  throw mismatch;
+}
+async function ownedApps(expected, temporary, argumentVectors) {
   const found = [];
   for (const name of await readdir('/proc')) {
     if (!/^[0-9]+$/u.test(name)) continue;
-    try { const identity = await processIdentity(Number(name), expected); if (identity) found.push(identity); }
+    try { const identity = await readLinuxFinalKnownAppProcessIdentity(Number(name), expected, temporary, argumentVectors); if (identity) found.push(identity); }
     catch (error) { if (error.code?.startsWith('LINUX_FINAL_LIFECYCLE_')) throw error; /* Exited or unrelated. */ }
   }
   return found;
 }
-async function currentApp(expected) {
-  return wait(async () => {
-    const found = await ownedApps(expected); if (found.length > 1) fail('MULTIPLE_APPS');
-    return found[0] ?? null;
+export async function currentLinuxFinalApp(expected, temporary, expectedArguments, argumentVectors, { find = ownedApps, waiter = wait } = {}) {
+  const argumentIndex = argumentVectors.indexOf(expectedArguments);
+  if (argumentIndex < 0) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+  return waiter(async () => {
+    const found = await find(expected, temporary, argumentVectors); if (found.length > 1) fail('MULTIPLE_APPS');
+    return found[0]?.argumentIndex === argumentIndex ? found[0].identity : null;
   }, 60000);
 }
 async function alive(identity) {
   try { return startTime(await readFile(`/proc/${identity.pid}/stat`, 'utf8')) === identity.startTime; }
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
-async function assertNoOwnedMounts() {
+async function assertNoOwnedMounts(temporary) {
   await wait(async () => !(await readFile('/proc/self/mountinfo', 'utf8')).split('\n')
-    .some(line => line.split(' ')[4]?.startsWith(`${TEMP}/.mount_`)), 15000);
+    .some(line => line.split(' ')[4]?.startsWith(`${temporary}/.mount_`)), 15000);
 }
 async function descendants(browser) {
   const found = [browser];
@@ -122,21 +232,81 @@ async function descendants(browser) {
   }
   fail('PROCESS_TREE_UNBOUNDED');
 }
-async function assertRendererSandbox(browser) {
-  await wait(async () => {
-    for (const child of await descendants(browser)) {
-      const name = String(child.pid);
-      try {
-        const status = await readFile(`/proc/${name}/status`, 'utf8');
-        const args = await readFile(`/proc/${name}/cmdline`, 'utf8');
-        if (!linuxFinalSandboxStatus({ commandLine: args, status })) continue;
-        const executable = await readlink(`/proc/${name}/exe`);
-        if (executable !== browser.executable) continue;
-        return true;
-      } catch { /* Exited or unrelated. */ }
-    }
-    return false;
-  }, 10000);
+const RENDERER_READ_OUTCOMES = ['VANISHED', 'DENIED', 'UNAVAILABLE'];
+const RENDERER_OBSERVATION_GROUPS = [
+  ['NO_DESCENDANTS'], ['ROLE_UNOBSERVED', 'UNRELATED_EXECUTABLE'],
+  RENDERER_READ_OUTCOMES.map(outcome => `STATUS_READ_${outcome}`),
+  RENDERER_READ_OUTCOMES.map(outcome => `COMMAND_LINE_READ_${outcome}`),
+  [...RENDERER_READ_OUTCOMES.map(outcome => `EXECUTABLE_READ_${outcome}`), 'COMMAND_LINE_INVALID'],
+  [...RENDERER_READ_OUTCOMES.map(outcome => `TITLE_RENDERER_EXECUTABLE_READ_${outcome}`), 'TITLE_RENDERER_EXECUTABLE_MISMATCH'],
+  ['BYPASS_FLAGS_PRESENT'], ['NO_NEW_PRIVS_DISABLED', 'NO_NEW_PRIVS_UNKNOWN'],
+  ['SECCOMP_NOT_FILTERING', 'SECCOMP_UNKNOWN'],
+];
+const RENDERER_MIXED_OBSERVATIONS = ['NO_DESCENDANTS', 'CANDIDATES_UNCONFIRMED', 'STATUS_READ_MIXED',
+  'COMMAND_LINE_READ_MIXED', 'EXECUTABLE_IDENTITY_MIXED', 'TITLE_RENDERER_EXECUTABLE_MIXED',
+  'BYPASS_FLAGS_PRESENT', 'NO_NEW_PRIVS_MIXED', 'SECCOMP_MIXED'];
+const RENDERER_OBSERVATION_PROGRESS = new Map(RENDERER_OBSERVATION_GROUPS.flatMap((codes, progress) => codes.map(code => [code, progress])));
+function rendererReadOutcome(error) {
+  return ['ENOENT', 'ESRCH'].includes(error?.code) ? 'VANISHED'
+    : ['EACCES', 'EPERM'].includes(error?.code) ? 'DENIED' : 'UNAVAILABLE';
+}
+function rendererStatusObservation(status, field, refusedValues) {
+  const values = [...status.matchAll(new RegExp(`^${field}:\\s+([0-9]+)$`, 'gmu'))];
+  return values.length === 1 && refusedValues.includes(values[0][1]);
+}
+/** Diagnostics describe one child's observed progress, not the timeout's cause.
+ * The acceptance predicate and wait remain unchanged. No raw proc data is kept. */
+export async function assertLinuxFinalRendererSandbox(browser, { readDescendants = descendants,
+  read = readFile, link = readlink, waiter = wait } = {}) {
+  let progress = 0, observations = new Set(['NO_DESCENDANTS']);
+  const observe = code => {
+    const next = RENDERER_OBSERVATION_PROGRESS.get(code);
+    if (next > progress) { progress = next; observations = new Set([code]); }
+    else if (next === progress) observations.add(code);
+  };
+  try {
+    await waiter(async () => {
+      let children;
+      try { children = await readDescendants(browser); }
+      catch (error) { fail(error?.code === 'LINUX_FINAL_LIFECYCLE_PROCESS_TREE_UNBOUNDED'
+        ? 'RENDERER_TREE_UNBOUNDED' : 'RENDERER_ENUMERATION_FAILED'); }
+      for (const child of children) {
+        const name = String(child.pid), isDescendant = child.pid !== browser.pid;
+        let readStage = 'STATUS', titleRenderer = false;
+        const note = code => { if (isDescendant) observe(code); };
+        try {
+          const status = await read(`/proc/${name}/status`, 'utf8');
+          readStage = 'COMMAND_LINE';
+          const args = await read(`/proc/${name}/cmdline`, 'utf8');
+          // This is only a title candidate until the exact kernel exe is read.
+          titleRenderer = linuxFinalProcessCommandLineFacts({ commandLine: args, executable: browser.executable })?.role === 'renderer';
+          readStage = 'EXECUTABLE';
+          const executable = await link(`/proc/${name}/exe`);
+          if (executable !== browser.executable) {
+            note(titleRenderer ? 'TITLE_RENDERER_EXECUTABLE_MISMATCH' : 'UNRELATED_EXECUTABLE'); continue;
+          }
+          if (!linuxFinalSandboxStatus({ commandLine: args, executable, status })) {
+            const facts = linuxFinalProcessCommandLineFacts({ commandLine: args, executable });
+            if (facts === null) note('COMMAND_LINE_INVALID');
+            else if (facts.role !== 'renderer') note('ROLE_UNOBSERVED');
+            else if (facts.sandboxBypass) note('BYPASS_FLAGS_PRESENT');
+            else if (!/^NoNewPrivs:\s+1$/mu.test(status)) note(rendererStatusObservation(status, 'NoNewPrivs', ['0'])
+              ? 'NO_NEW_PRIVS_DISABLED' : 'NO_NEW_PRIVS_UNKNOWN');
+            else note(rendererStatusObservation(status, 'Seccomp', ['0', '1']) ? 'SECCOMP_NOT_FILTERING' : 'SECCOMP_UNKNOWN');
+            continue;
+          }
+          return true;
+        } catch (error) {
+          note(`${titleRenderer && readStage === 'EXECUTABLE' ? 'TITLE_RENDERER_' : ''}${readStage}_READ_${rendererReadOutcome(error)}`);
+        }
+      }
+      return false;
+    }, 10000);
+  } catch (error) {
+    if (error?.code !== 'LINUX_REAL_APPIMAGE_TIMEOUT') throw error;
+    const observation = observations.size === 1 ? [...observations][0] : RENDERER_MIXED_OBSERVATIONS[progress];
+    fail(`RENDERER_SANDBOX_OBSERVED_${observation}`);
+  }
 }
 export async function assertLinuxFinalProcessTreeGone(identities, { readAlive = alive, waiter = wait } = {}) {
   if (!Array.isArray(identities) || identities.length < 1 || identities.length > 1024
@@ -144,11 +314,13 @@ export async function assertLinuxFinalProcessTreeGone(identities, { readAlive = 
     || identities.some(row => !Number.isSafeInteger(row.pid) || row.pid < 1 || !/^[0-9]+$/u.test(row.startTime))) fail('PROCESS_IDENTITY_INVALID');
   await waiter(async () => (await Promise.all(identities.map(readAlive))).every(value => value === false), 15000);
 }
-async function stopOwned(identity) {
-  const children = await descendants(identity);
-  if (await alive(identity)) process.kill(identity.pid, 'SIGUSR2');
-  await assertLinuxFinalProcessTreeGone(children);
-  await assertNoOwnedMounts();
+export async function stopLinuxFinalOwnedApp(identity, temporary, { readDescendants = descendants, readAlive = alive,
+  signal = (pid, value) => process.kill(pid, value), waitForTreeGone = assertLinuxFinalProcessTreeGone,
+  waitForMountsGone = assertNoOwnedMounts } = {}) {
+  const children = await readDescendants(identity);
+  if (await readAlive(identity)) signal(identity.pid, 'SIGUSR2');
+  await waitForTreeGone(children);
+  await waitForMountsGone(temporary);
 }
 function command(name, args) {
   const result = spawnSync(name, args, { shell: false, stdio: 'ignore', timeout: 15000 });
@@ -165,10 +337,10 @@ async function trustFixture(fixture, cert) {
   command('certutil', ['-N', '--empty-password', '-d', `sql:${nss}`]);
   command('certutil', ['-A', '-d', `sql:${nss}`, '-n', 'TiboTattle disposable loopback CA', '-t', 'C,,', '-i', cert]);
 }
-function launchEnvironment(fixture, cert) {
+function launchEnvironment(fixture, cert, temporary) {
   const environment = { ...normalPackagedSmokeEnvironment({ fixture, service: 'available' }),
     XDG_CONFIG_HOME: join(fixture.home, '.config'), XDG_CACHE_HOME: join(fixture.home, '.cache'),
-    XDG_DATA_HOME: join(fixture.home, '.local/share'), TMPDIR: TEMP, NODE_EXTRA_CA_CERTS: cert };
+    XDG_DATA_HOME: join(fixture.home, '.local/share'), TMPDIR: temporary, NODE_EXTRA_CA_CERTS: cert };
   for (const key of ['APPIMAGE', 'APPDIR', 'APPIMAGE_EXTRACT_AND_RUN', 'APPIMAGE_EXTRACT_AND_RUN_CLEANUP']) delete environment[key];
   return environment;
 }
@@ -178,11 +350,9 @@ async function checkedCheckpoint(fixture) {
   if (scope?.status !== 'available' || scope.version !== 'openai-account-v1' || !/^openai-account:v1:[A-Za-z0-9_-]{43}$/u.test(scope.scopeId ?? '')) fail('CREDENTIAL_ACCESS_UNPROVEN');
   return scope;
 }
-async function proveNoUpdate(cdp, origin, browser) {
+async function proveNoUpdate(cdp, origin, port) {
   await cdp.evaluate('globalThis.tibotattleDesktop.openSettings()');
-  // Reuse the owned CDP port selected by the caller's app; no arbitrary URL.
-  const args = (await readFile(`/proc/${browser.pid}/cmdline`, 'utf8')).split('\0');
-  const port = Number(args.find(arg => /^--remote-debugging-port=[0-9]+$/u.test(arg))?.split('=')[1]);
+  // The port is captured from the exact admitted normal launch vector.
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) fail('DEBUGGER_IDENTITY_INVALID');
   const settings = await connectUpdaterPage(port, url => isLinuxUpdaterSettingsURL(url, origin));
   try {
@@ -213,8 +383,8 @@ async function installImage(source, expected) {
   await copyFile(source, IMAGE, constants.COPYFILE_EXCL); await chmod(IMAGE, 0o700);
   if (await digest(IMAGE) !== expected.sha256) fail('INSTALLED_BYTES_INVALID');
 }
-async function uninstallImage(expected, preservedFixture = null) {
-  await assertNoOwnedMounts();
+async function uninstallImage(expected, preservedFixture, temporary) {
+  await assertNoOwnedMounts(temporary);
   const stat = await lstat(IMAGE);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== 1000
     || await digest(IMAGE) !== expected.sha256) fail('UNINSTALL_TARGET_INVALID');
@@ -222,6 +392,42 @@ async function uninstallImage(expected, preservedFixture = null) {
   await unlink(IMAGE);
   try { await lstat(IMAGE); fail('UNINSTALL_FAILED'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (preservedFixture && !isDeepStrictEqual(before, await checkedCheckpoint(preservedFixture))) fail('UNINSTALL_STATE_CHANGED');
+}
+/** Keep predecessor startup failures content-free without changing its CDP
+ * target, readiness condition, waits or the caller's connection ownership. */
+export async function connectLinuxFinalPredecessorDashboard(port, { connect = connectUpdaterPage } = {}) {
+  try { return await connect(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url)); }
+  catch { fail('PREDECESSOR_DASHBOARD_CONNECT_FAILED'); }
+}
+export async function waitForLinuxFinalPredecessorDashboard(dashboard, { waiter = wait } = {}) {
+  try { return await waiter(async () => {
+    try { return await dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"); }
+    catch (error) {
+      // CDP can expose the page before V8 has its default context. Only this
+      // observed initialization response means not ready yet; the same waiter
+      // retains its original deadline and polling interval.
+      if (error instanceof Error && error.name === 'Error' && error.code === undefined
+        && error.message === 'Cannot find default execution context') return false;
+      throw error;
+    }
+  }); }
+  catch (error) {
+    // All errors escaping the readiness predicate remain fatal.
+    // waitFor (real-appimage-updater) and connectCdp (smoke-electron-linux)
+    // supply the fixed local errors; V8 Inspector supplies the context errors
+    // and Chromium DevToolsSession supplies the target-change error.
+    if (error?.code === 'LINUX_REAL_APPIMAGE_TIMEOUT') fail('PREDECESSOR_DASHBOARD_READY_POLL_TIMEOUT');
+    switch (error?.message) {
+      case 'CDP Runtime.evaluate timed out': fail('PREDECESSOR_DASHBOARD_READY_CDP_TIMEOUT'); break;
+      case 'renderer evaluation failed': fail('PREDECESSOR_DASHBOARD_READY_EVALUATION_FAILED'); break;
+      case 'CDP connection closed': fail('PREDECESSOR_DASHBOARD_READY_CONNECTION_CLOSED'); break;
+      case 'Cannot find default execution context': fail('PREDECESSOR_DASHBOARD_READY_DEFAULT_CONTEXT_MISSING'); break;
+      case 'Cannot find context with specified id': fail('PREDECESSOR_DASHBOARD_READY_CONTEXT_MISSING'); break;
+      case 'Execution context was destroyed.': fail('PREDECESSOR_DASHBOARD_READY_CONTEXT_DESTROYED'); break;
+      case 'Inspected target navigated or closed': fail('PREDECESSOR_DASHBOARD_READY_TARGET_CHANGED_OR_CLOSED'); break;
+      default: fail('PREDECESSOR_DASHBOARD_READY_FAILED');
+    }
+  }
 }
 /** Preserve only the maintained smoke-stage code and closed startup evidence. */
 export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
@@ -234,10 +440,68 @@ export function linuxFinalFailureDetails(errorCode, startupDiagnostic) {
     ? errorCode : 'LINUX_FINAL_LIFECYCLE_RUNTIME_FAILED',
   ...(diagnostic === null ? {} : { startupDiagnostic: diagnostic }) };
 }
+/** The shared smoke retains its late-network stage while beforeQuit runs. Keep
+ * failures from these final-lifecycle checks distinct, after its cleanup runs. */
+const IDENTITY_HOOK_FAILURES = new Map([
+  'FUSE_TEMPORARY_INVALID', 'FUSE_IMAGE_PATH_INVALID', 'FUSE_EXECUTABLE_PATH_INVALID',
+  'FUSE_MOUNT_LOCATION_INVALID', 'FUSE_MOUNT_MISSING', 'FUSE_MOUNT_AMBIGUOUS',
+  'FUSE_MOUNT_TYPE_INVALID', 'FUSE_MOUNT_SOURCE_INVALID', 'FUSE_MOUNT_ROOT_INVALID',
+  'FUSE_MOUNT_READ_ONLY_REQUIRED', 'FUSE_MOUNT_UID_INVALID', 'FUSE_APPIMAGE_ENV_MISSING', 'FUSE_APPIMAGE_ENV_MISMATCH',
+  'FUSE_APPDIR_ENV_MISSING', 'FUSE_APPDIR_ENV_MISMATCH', 'FUSE_EXTRACTION_MODE_FORBIDDEN', 'PROCESS_START_TIME_INVALID',
+  'PROCESS_UID_INVALID', 'PROCESS_ROLE_INVALID', 'PROCESS_BYTES_CHANGED', 'MULTIPLE_APPS',
+  'PROCESS_NODE_MODE_INVALID', 'PROCESS_COMMAND_LINE_TYPE_INVALID', 'PROCESS_COMMAND_LINE_TOO_LONG',
+  'PROCESS_COMMAND_LINE_TERMINATOR_MISSING', 'PROCESS_EXECUTABLE_FORM_INVALID', 'PROCESS_ARGV_ZERO_MISMATCH',
+  'PROCESS_ARGV_EMPTY_FIELD', 'PROCESS_ARGV_WHITESPACE', 'PROCESS_TITLE_PREFIX_MISMATCH', 'PROCESS_TITLE_SPACING_INVALID',
+  'PROCESS_ROLE_MULTIPLE', 'PROCESS_ROLE_EMPTY', 'PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED', 'PROCESS_ROLE_UNKNOWN', 'PROCESS_ROLE_BARE',
+  'FILE_UNSAFE', 'FILE_CHANGED', 'PROCESS_LAUNCH_ARGUMENTS_INVALID', 'INSTALLED_BYTES_INVALID',
+].map(code => [`LINUX_FINAL_LIFECYCLE_${code}`, `NORMAL_APP_IDENTITY_${code}`]));
+IDENTITY_HOOK_FAILURES.set('LINUX_REAL_APPIMAGE_TIMEOUT', 'NORMAL_APP_IDENTITY_TIMEOUT');
+const SANDBOX_HOOK_FAILURES = new Map([...new Set([...RENDERER_OBSERVATION_PROGRESS.keys(), ...RENDERER_MIXED_OBSERVATIONS])]
+  .map(code => [`LINUX_FINAL_LIFECYCLE_RENDERER_SANDBOX_OBSERVED_${code}`, `NORMAL_RENDERER_SANDBOX_OBSERVED_${code}`]));
+for (const code of ['ENUMERATION_FAILED', 'TREE_UNBOUNDED']) {
+  SANDBOX_HOOK_FAILURES.set(`LINUX_FINAL_LIFECYCLE_RENDERER_${code}`, `NORMAL_RENDERER_SANDBOX_${code}`);
+}
+export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSandbox, preferences, noUpdate, preserveState = null }) {
+  if (![run, readIdentity, assertSandbox, preferences, noUpdate].every(value => typeof value === 'function')
+    || preserveState !== null && typeof preserveState !== 'function') fail('NORMAL_HOOK_INVALID');
+  let hookFailure = null, entered = false, completed = false, identity;
+  const check = async (code, action) => {
+    try { return await action(); }
+    catch (error) {
+      // Never retain arbitrary error codes, messages, paths or other properties.
+      hookFailure = code === 'NORMAL_APP_IDENTITY_FAILED' ? IDENTITY_HOOK_FAILURES.get(error?.code) ?? code
+        : code === 'NORMAL_RENDERER_SANDBOX_FAILED' ? SANDBOX_HOOK_FAILURES.get(error?.code) ?? code : code;
+      fail(hookFailure);
+    }
+  };
+  try {
+    await run(async context => {
+      if (entered) { hookFailure = 'NORMAL_HOOK_INVALID'; fail(hookFailure); }
+      entered = true;
+      identity = await check('NORMAL_APP_IDENTITY_FAILED', readIdentity);
+      await check('NORMAL_RENDERER_SANDBOX_FAILED', () => assertSandbox(identity));
+      await check('NORMAL_PREFERENCES_FAILED', () => preferences(context));
+      await check('NORMAL_NO_UPDATE_FAILED', () => noUpdate(context, identity));
+      if (preserveState !== null) await check('NORMAL_LOCAL_STATE_FAILED', preserveState);
+      completed = true;
+    });
+  } catch (error) {
+    if (hookFailure !== null) fail(hookFailure);
+    throw error;
+  }
+  // An adapter may not turn a swallowed or omitted hook into qualification.
+  if (hookFailure !== null) fail(hookFailure);
+  if (!completed) fail('NORMAL_HOOK_UNPROVEN');
+  return identity;
+}
 export async function runLinuxFinalLifecycle() {
   const contract = assertContainerContract();
+  const nonce = process.env.TIBOTATTLE_LINUX_FINAL_NONCE, temporary = linuxFinalTemporary(nonce);
+  const sampleLinuxStartupFuseMount = () => sampleLinuxMountProbeFacts(temporary);
+  assertLinuxFinalOwnedPolicy({ nonce, name: process.env.TIBOTATTLE_LINUX_FINAL_PROFILE,
+    profileText: await readFile('/proc/self/attr/current', 'utf8'), facts: await readLinuxMountRuntimeFacts() });
   if (process.arch !== 'x64' || process.getuid() !== 1000 || process.version !== 'v26.2.0'
-    || process.env.ELECTRON_DISABLE_SANDBOX !== '0' || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
+    || !isLinuxSandboxEnvironmentClean(process.env) || process.env.APPIMAGE_EXTRACT_AND_RUN !== undefined
     || (await lookup(HOST)).address !== '127.0.0.1'
     || !((await lstat('/dev/fuse')).isCharacterDevice())
     || proveLinuxSecretServiceContainerIsolation().status !== 'isolated') fail('ISOLATION_REQUIRED');
@@ -251,7 +515,8 @@ export async function runLinuxFinalLifecycle() {
     if (file.sha256 !== pair.images[role].sha256 || file.bytes !== pair.images[role].bytes) fail('INPUT_CHANGED');
   }
   if (startLinuxSecretServiceDaemon().status !== 'started') fail('SECRET_SERVICE_UNAVAILABLE');
-  await mkdir(TEMP, { mode: 0o700 });
+  await mkdir(TEMP_ROOT, { mode: 0o700 });
+  await mkdir(temporary, { mode: 0o700 });
   const key = join(LINUX_FINAL_EXEC, 'loopback.key'), cert = join(LINUX_FINAL_EXEC, 'loopback.crt');
   command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', `/CN=${HOST}`,
     '-addext', `subjectAltName=DNS:${HOST}`, '-keyout', key, '-out', cert]);
@@ -273,7 +538,8 @@ export async function runLinuxFinalLifecycle() {
     }
     unexpectedRequests++; response.writeHead(404).end();
   });
-  const receipt = { schemaVersion: 'tibotattle-linux-final-installed-lifecycle-v1',
+  const release = resolveLinuxFinalRelease(pair.intake);
+  const receipt = { schemaVersion: release.lifecycleSchema,
     sourceRevision: pair.intake.sourceRevision, workflowRunnerRevision: pair.intake.runnerRevision,
     sourceCandidateSha256: pair.intake.sourceCandidateSha256, packageReceiptSha256: pair.intake.packageReceiptSha256,
     packageRunId: pair.intake.packageRunId, version: pair.intake.version, buildNumber: pair.intake.buildNumber,
@@ -283,45 +549,61 @@ export async function runLinuxFinalLifecycle() {
     credentialScope: 'disposable_Secret_Service', rebuilt: false, published: false };
   let child = null, dashboard = null, settings = null, upgradeFixture = null;
   let startupDiagnostic = null, predecessorStartupDiagnostics = null;
-  const owned = [];
+  const owned = [], argumentVectors = [], verifiedApps = [];
   try {
     await new Promise((done, reject) => { server.once('error', reject); server.listen(443, '127.0.0.1', done); });
     stage = 'fresh_final_install';
     const clean = await fixtureWithDefaultProfile(); owned.push(clean);
     await trustFixture(clean, cert); await installImage(join(inputs, 'next.AppImage'), pair.images.next);
-    let cleanIdentity;
     const identity = { sourceRevision: pair.intake.runnerRevision, artifactSha256: pair.images.next.asarSha256 };
-    const runNormal = (fixture, beforeQuit) => runOneNormalApp(identity, {
-      appPath: IMAGE, environment: launchEnvironment(fixture, cert), fixture,
-      preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
-      run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
-        onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
-    });
-    await runNormal(clean, async context => {
-      cleanIdentity = await currentApp(pair.images.next); await assertRendererSandbox(cleanIdentity);
-      await persistLinuxNormalPackagedRestartPreferences(context);
-      await proveNoUpdate(context.cdp, context.dashboardOrigin, cleanIdentity);
-    });
-    await assertNoOwnedMounts();
+    const runNormal = (fixture, preferences, preserveState = null) => {
+      let launch = null;
+      return runLinuxFinalNormalJourney({
+        run: beforeQuit => runOneNormalApp(identity, {
+          appPath: IMAGE, environment: launchEnvironment(fixture, cert, temporary), fixture,
+          preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
+          run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
+            launchArguments: context => {
+              if (launch !== null) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+              const args = rememberLaunchArguments(argumentVectors, options.launchArguments(context));
+              if (!Number.isSafeInteger(context.port) || context.port < 1 || context.port > 65535
+                || !args.includes(`--remote-debugging-port=${context.port}`)) fail('DEBUGGER_IDENTITY_INVALID');
+              launch = { args, port: context.port }; return args;
+            },
+            onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
+        }),
+        readIdentity: async () => {
+          if (launch === null) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+          const browser = await currentLinuxFinalApp(pair.images.next, temporary, launch.args, argumentVectors);
+          verifiedApps.push(browser); return browser;
+        },
+        assertSandbox: assertLinuxFinalRendererSandbox, preferences,
+        noUpdate: context => proveNoUpdate(context.cdp, context.dashboardOrigin, launch.port), preserveState,
+      });
+    };
+    const cleanIdentity = await runNormal(clean, persistLinuxNormalPackagedRestartPreferences);
+    await assertNoOwnedMounts(temporary);
     if (await alive(cleanIdentity)) fail('CLEAN_QUIT_FAILED');
     await checkedCheckpoint(clean);
     receipt.cleanInstallSmokePassed = true; receipt.localRefreshAndCredentialAccess = true;
     receipt.chromiumRendererSandboxVerified = true;
-    await uninstallImage(pair.images.next, clean);
+    await uninstallImage(pair.images.next, clean, temporary);
     receipt.cleanUninstallPreservedLocalState = true;
     stage = 'public_predecessor_install';
     upgradeFixture = await fixtureWithDefaultProfile(); owned.push(upgradeFixture);
     await trustFixture(upgradeFixture, cert); await installImage(join(inputs, 'current.AppImage'), pair.images.current);
-    const environment = launchEnvironment(upgradeFixture, cert);
+    const environment = launchEnvironment(upgradeFixture, cert, temporary);
     const port = await freeTcpPort();
-    child = spawn(IMAGE, [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--disable-gpu'],
-      { env: environment, shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
+    const predecessorArguments = rememberLaunchArguments(argumentVectors,
+      [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--disable-gpu']);
+    child = spawn(IMAGE, predecessorArguments, { env: environment, shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
     child.on('error', () => {});
     predecessorStartupDiagnostics = createLinuxStartupDiagnostics({ child, sampleMount: sampleLinuxStartupFuseMount });
     child.stderr.on('data', predecessorStartupDiagnostics.feed);
-    dashboard = await connectUpdaterPage(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
-    await wait(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
-    const previous = await currentApp(pair.images.current); await assertRendererSandbox(previous);
+    dashboard = await connectLinuxFinalPredecessorDashboard(port);
+    await waitForLinuxFinalPredecessorDashboard(dashboard);
+    const previous = await currentLinuxFinalApp(pair.images.current, temporary, predecessorArguments, argumentVectors);
+    verifiedApps.push(previous); await assertLinuxFinalRendererSandbox(previous);
     await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
     await persistLinuxNormalPackagedRestartPreferences({ cdp: dashboard });
     // Ordinary startup refresh must have reached the persisted keyed observation.
@@ -363,34 +645,35 @@ export async function runLinuxFinalLifecycle() {
     stage = 'settings_install';
     const previousTree = await descendants(previous);
     if (previousTree.length < 2) fail('PREDECESSOR_CHILDREN_UNPROVEN');
+    // Pinned electron-updater 6.8.9 AppImageUpdater spawns the successor with [].
+    // Register before the click so a restart during an error remains owned.
+    const successorArguments = rememberLaunchArguments(argumentVectors, []);
     await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
     await wait(async () => { try { return await digest(IMAGE) === pair.images.next.sha256; } catch { return false; } }, 60000);
     stage = 'automatic_restart';
-    const successor = await currentApp(pair.images.next);
+    const successor = await currentLinuxFinalApp(pair.images.next, temporary, successorArguments, argumentVectors);
+    verifiedApps.push(successor);
     if (successor.pid === previous.pid && successor.startTime === previous.startTime) fail('RESTART_IDENTITY_INVALID');
     await wait(() => updaterProcessHealth(successor.pid), 60000);
     await assertLinuxFinalProcessTreeGone(previousTree);
-    await assertRendererSandbox(successor);
+    await assertLinuxFinalRendererSandbox(successor);
     if (await digest(rawFixture) !== rawBefore) fail('SOURCE_STATE_CHANGED');
     const persisted = JSON.parse(await readFile(join(upgradeFixture.userData, 'desktop-settings/desktop-settings-v1.json'), 'utf8'));
     if ((persisted.settings ?? persisted).refreshIntervalSeconds !== 900) fail('SETTINGS_NOT_PRESERVED');
-    await stopOwned(successor);
+    await stopLinuxFinalOwnedApp(successor, temporary);
     if (child) { await terminateLinuxSmokeChild(child).catch(() => {}); child = null; }
     dashboard.close(); dashboard = null; settings.close(); settings = null;
-    receipt.publicPredecessorUpdate = 'exact_published_0.1.26_to_final_0.1.27';
+    receipt.publicPredecessorUpdate = release.publicPredecessorUpdate;
     receipt.replacementAndAutomaticRestartVerified = true;
     stage = 'cold_restart_no_update';
-    await runNormal(upgradeFixture, async context => {
-      const restarted = await currentApp(pair.images.next); await assertRendererSandbox(restarted);
-      await verifyLinuxNormalPackagedRestartPreferences(context);
-      await proveNoUpdate(context.cdp, context.dashboardOrigin, restarted);
+    await runNormal(upgradeFixture, verifyLinuxNormalPackagedRestartPreferences, async () => {
       if (!isDeepStrictEqual(beforeScope, await checkedCheckpoint(upgradeFixture)) || await digest(rawFixture) !== rawBefore) fail('LOCAL_STATE_NOT_PRESERVED');
     });
-    await assertNoOwnedMounts();
+    await assertNoOwnedMounts(temporary);
     receipt.coldRestartSettingsAndOptOutVerified = true;
     receipt.credentialAndSourceStatePreserved = true; receipt.noUpdateVerified = true;
     stage = 'owned_uninstall';
-    await uninstallImage(pair.images.next, upgradeFixture);
+    await uninstallImage(pair.images.next, upgradeFixture, temporary);
     for (const fixture of owned) await rm(fixture.root, { recursive: true });
     owned.length = 0;
     receipt.ownedUninstallAndAppCleanupVerified = true;
@@ -408,8 +691,13 @@ export async function runLinuxFinalLifecycle() {
     dashboard?.close(); settings?.close();
     // Stop only hash- and start-time-bound app processes. Container destruction
     // is the outer cleanup boundary if an app or mount cannot be proved gone.
+    for (const identity of verifiedApps) {
+      if (await alive(identity).catch(() => false)) await stopLinuxFinalOwnedApp(identity, temporary).catch(() => {});
+    }
     for (const expected of Object.values(pair.images)) {
-      for (const identity of await ownedApps(expected).catch(() => [])) await stopOwned(identity).catch(() => {});
+      for (const { identity } of await ownedApps(expected, temporary, argumentVectors).catch(() => [])) {
+        await stopLinuxFinalOwnedApp(identity, temporary).catch(() => {});
+      }
     }
     if (child) await terminateLinuxSmokeChild(child).catch(() => {});
     server.closeAllConnections(); if (server.listening) await new Promise(done => server.close(done));

@@ -40,6 +40,26 @@ test('both targets bind immutable 020 and explicit allocated successors to fixed
 const currentFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
   schemaVersion: 'tibotattle-production-electron-update-intake-v2', version: '0.1.27',
   buildNumber: '2026100301', bundleVersion: '1035' });
+const replacementFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
+  schemaVersion: 'tibotattle-production-electron-update-intake-v3', version: '0.1.28',
+  buildNumber: '2026100901', bundleVersion: '1036' });
+test('v3 binds the replacement identity to unchanged 026 predecessor bytes without widening v2', () => {
+  for (const target of ['darwin-arm64', 'darwin-x64']) {
+    const old = runner.validateProductionUpdateIntake(currentFixture(target));
+    const input = runner.validateProductionUpdateIntake(replacementFixture(target));
+    assert.equal(input.predecessorDmgSha256, old.predecessorDmgSha256);
+    assert.equal(input.predecessorUrl, old.predecessorUrl);
+    assert.equal(input.feedUrl, old.feedUrl);
+    assert.equal(input.candidateUrl, 'https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/TiboTattle-0.1.28-mac-' + input.architecture + '.dmg');
+    for (const patch of [{ schemaVersion: currentFixture().schemaVersion }, { schemaVersion: 'toString' },
+      { schemaVersion: 'tibotattle-production-electron-update-intake-v4' }, { version: '0.1.27', bundleVersion: '1035' },
+      { version: '0.1.29', bundleVersion: '1037' }, { bundleVersion: '1035' }, { buildNumber: '2026100301' },
+      { buildNumber: '2026100902' }, { feedUrl: 'https://example.invalid/feed.yml' }, { predecessorVersion: '0.1.27' }]) {
+      assert.throws(() => runner.validateProductionUpdateIntake({ ...replacementFixture(target), ...patch }));
+    }
+  }
+});
+
 test('v2 binds only the immutable 026 predecessor and 027 successor on both architectures', () => {
   const expected = { 'darwin-arm64': '7b5f66d91c9f1b8c1537505da860c67177d2b489ee6fb90d445d97c7e46cc9ec',
     'darwin-x64': '3806a1ce2650350b69faff759287c08a5f146acfb9c26e3b3b04abb5cf8896c3' };
@@ -65,8 +85,9 @@ test('v2 binds only the immutable 026 predecessor and 027 successor on both arch
   }
 });
 test('predecessor metadata refuses mixed source, build, bundle, architecture and historical version identities', () => {
-  for (const target of ['darwin-arm64', 'darwin-x64']) for (const legacy of [false, true]) {
-    const input = runner.validateProductionUpdateIntake(legacy ? fixture(target) : currentFixture(target));
+  for (const target of ['darwin-arm64', 'darwin-x64']) for (const make of [fixture, currentFixture, replacementFixture]) {
+    const legacy = make === fixture;
+    const input = runner.validateProductionUpdateIntake(make(target));
     const predecessor = legacy ? { version: '0.1.20', sourceRevision: runner.ELECTRON_020_SOURCE,
       buildNumber: '2026091104', bundleVersion: '2026091104' }
       : { version: '0.1.26', sourceRevision: 'acfc385c95b49b8e1040cedfa857659b49a61d8d', buildNumber: '2026092701', bundleVersion: '1034' };
@@ -91,9 +112,9 @@ test('predecessor metadata refuses mixed source, build, bundle, architecture and
   }
 });
 test('live feed must bind both exact artifacts and cannot redirect the updater', () => {
-  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030'], ['0.1.27', '1035']]) {
+  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030'], ['0.1.27', '1035'], ['0.1.28', '1036']]) {
     const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
-    const input = runner.validateProductionUpdateIntake({ ...(version === '0.1.27' ? currentFixture() : fixture()), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
+    const input = runner.validateProductionUpdateIntake({ ...(version === '0.1.28' ? replacementFixture() : version === '0.1.27' ? currentFixture() : fixture()), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
     const manifest = { version, files: [[input.zipFileName, zip], [input.dmgFileName, dmg]].map(([url, b]) => ({ url, size: b.length, sha512: hash(b, 'sha512', 'base64') })),
       path: input.zipFileName, sha512: hash(zip, 'sha512', 'base64') };
     assert.equal(runner.validateProductionMacUpdateFeed(input, manifest, zip, dmg), true);
@@ -116,15 +137,17 @@ test('plan reads intake only and makes no artifact, feed, process or signed-app 
     for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified', 'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped']) assert.equal(result[key], false);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
-test('v2 plan identifies 026 provenance while leaving native and credential assertions unqualified', async () => {
+for (const [make, schema] of [[currentFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2],
+  [replacementFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3]]) test(`${schema} plan retains unqualified native and credential assertions`, async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-update-plan-v2-')));
   try {
     for (const target of ['darwin-arm64', 'darwin-x64']) {
-      const identity = currentFixture(target), intakePath = join(directory, target + '.json');
+      const identity = make(target), intakePath = join(directory, target + '.json');
       await writeFile(intakePath, JSON.stringify(identity), { mode: 0o600 });
       const result = await runner.runProductionUpdate({ execute: false, intakePath });
       assert.equal(result.status, 'planned');
-      assert.equal(result.schemaVersion, 'tibotattle-signed-macos-production-update-v2');
+      assert.equal(result.schemaVersion, schema);
+      for (const key of ['version', 'buildNumber', 'bundleVersion', 'sourceRevision']) assert.equal(result[key], identity[key]);
       assert.equal(result.predecessorVersion, '0.1.26');
       assert.equal(result.predecessorSourceRevision, 'acfc385c95b49b8e1040cedfa857659b49a61d8d');
       assert.equal(result.predecessorBuildNumber, '2026092701');

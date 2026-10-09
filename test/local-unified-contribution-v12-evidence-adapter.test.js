@@ -97,7 +97,7 @@ test("local evidence accepts retained variants but withholds unknown provenance"
     row("unknown", {
       eventTime: `${DAY}T12:01:00.000Z`,
       sourceOffset: 200,
-      parserVersion: "unified-rollout-typed-v20",
+      parserVersion: "unified-rollout-typed-v21",
       boundary: boundary(1),
     }),
     row("bad-boundary", {
@@ -208,8 +208,8 @@ test("an incomplete boundary join keeps missing relations unknown", () => {
 });
 
 
-test("v18 boundary evidence keeps reviewed v17/v18 provenance coherent without relabeling rows", () => {
-  for (const version of [17, 18]) {
+test("boundary evidence keeps reviewed v17 through v20 provenance coherent without relabeling rows", () => {
+  for (const version of [17, 18, 19, 20]) {
     for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
       for (const assumption of ["", "-cache-write-zero"]) {
         const parserVersion = `unified-rollout-typed-v${version}${suffix}${assumption}`;
@@ -221,13 +221,34 @@ test("v18 boundary evidence keeps reviewed v17/v18 provenance coherent without r
       }
     }
   }
-  const previous = row("previous", { sourceOffset: 100,
-    parserVersion: "unified-rollout-typed-v17",
-    boundary: boundary(1, { parserVersion: "unified-rollout-typed-v17" }) });
-  const current = row("current", { sourceOffset: 101,
-    parserVersion: "unified-rollout-typed-v18",
-    boundary: boundary(2, { parserVersion: "unified-rollout-typed-v18" }) });
-  const adapter = complete([current, previous]);
-  assert.deepEqual(evidence(adapter, previous), { boundaryFlags: 1, tieOrder: 0 });
-  assert.deepEqual(evidence(adapter, current), { boundaryFlags: 2, tieOrder: 1 });
+  for (const [previousVersion, currentVersion] of [[17, 18], [19, 20]]) {
+    const previousParser = `unified-rollout-typed-v${previousVersion}`;
+    const currentParser = `unified-rollout-typed-v${currentVersion}`;
+    const previous = row("previous", { sourceOffset: 100,
+      parserVersion: previousParser,
+      boundary: boundary(1, { parserVersion: previousParser }) });
+    const current = row("current", { sourceOffset: 101,
+      parserVersion: currentParser,
+      boundary: boundary(2, { parserVersion: currentParser }) });
+    const adapter = complete([current, previous]);
+    assert.deepEqual(evidence(adapter, previous), { boundaryFlags: 1, tieOrder: 0 });
+    assert.deepEqual(evidence(adapter, current), { boundaryFlags: 2, tieOrder: 1 });
+  }
+});
+
+test("boundary evidence withholds unsupported old, future, and unknown parser variants", () => {
+  for (const parserVersion of [
+    "unified-rollout-typed-v14",
+    "unified-rollout-typed-v15-cache-write-zero",
+    "unified-rollout-typed-v20-cache-write-zero-unknown",
+    "unified-rollout-typed-v21",
+    "unified-rollout-typed-v21-cache-write-zero",
+    "unknown-parser-cache-write-zero",
+  ]) {
+    const value = row("unsupported", { parserVersion,
+      boundary: boundary(3, { parserVersion }) });
+    assert.equal(isTelemetryV12BoundaryParserVersion(parserVersion), false, parserVersion);
+    assert.deepEqual(evidence(complete([value]), value),
+      { boundaryFlags: null, tieOrder: null }, parserVersion);
+  }
 });

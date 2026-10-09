@@ -273,7 +273,7 @@ export async function prepareLinuxAppArmorProfiles({ root, directory, run, runne
     if (names.trim() !== name) refused('template_invalid');
     // --add refuses an existing profile; --replace is intentionally absent.
     const row = { profileSha256: sha256(text), profileNameSha256: sha256(name), loaded: false, removed: false };
-    evidence[stage] = row; loaded.set(stage, { name, text, evidence: row });
+    evidence[stage] = row; loaded.set(stage, { name, text, evidence: row, tuple: stage === 'candidate' ? structuredClone(tuple) : null });
     await withLinuxAppArmorImportBinding(imports, async () => {
       invoke('sudo', ['-n', PARSER, '--add', '--skip-cache'], { input: text });
       row.loaded = true;
@@ -282,6 +282,21 @@ export async function prepareLinuxAppArmorProfiles({ root, directory, run, runne
     });
     if (profileState(name) !== 'enforce') refused('basis_unavailable');
     return { name, evidence: row };
+  }, async candidateCheckpoint() {
+    const entry = loaded.get('candidate');
+    if (!entry || !entry.evidence.loaded || entry.evidence.removed || !validateLinuxAppArmorMountTuple(entry.tuple)) refused('basis_unavailable');
+    return withLinuxAppArmorImportBinding(imports, async () => {
+      const saved = await ownedFile(join(privateDirectory, 'candidate.profile'));
+      const marker = JSON.parse((await ownedFile(join(privateDirectory, 'candidate.loaded.json'), 4096)).contents);
+      // Handoff requires the same exact add ownership, live enforce state and
+      // actor absence used for removal. This does not reload or regenerate it.
+      if (!linuxAppArmorRemovalAllowed({ owner, marker, profileSha256: saved.sha256,
+        currentState: profileState(entry.name), actorsGone: profileActorsGone(entry.name) },
+      { run, runner, parserSha256: (await parserIdentity()).sha256, stage: 'candidate' })
+        || saved.sha256 !== entry.evidence.profileSha256) refused('basis_unavailable');
+      return immutableCheckpoint({ name: entry.name, nonce, profileSha256: saved.sha256,
+        profileNameSha256: sha256(entry.name), tuple: entry.tuple, basis });
+    });
   }, async remove(stage, containersGone) {
     if (!containersGone) return false;
     const entry = loaded.get(stage);
@@ -386,7 +401,7 @@ function negativeMount(result, tuple) {
   return successfulProbe(result) && result.row.probe.mount === 'not_observed' && result.row.appArmorMountDenial === true
     && result.row.probe.launcherErrors.stages.directFuseMount === 'EACCES' && sameTuple(result.tuple, tuple);
 }
-export function validateLinuxAppArmorComparison(value, validateRow) {
+function validateComparisonPhase(value, validateRow, activeCandidate = false) {
   if (!exact(value, ['schemaVersion', 'purpose', 'qualifiesRelease', 'runnerRevision', 'sourceRevision',
     'outcome', 'basisFailure', 'importFailure', 'basis', 'profiles', 'cases', 'profilesRemoved'])
     || value.schemaVersion !== LINUX_APPARMOR_COMPARISON_SCHEMA || value.purpose !== 'diagnostic_only' || value.qualifiesRelease !== false
@@ -418,8 +433,9 @@ export function validateLinuxAppArmorComparison(value, validateRow) {
   if (value.cases.length > 4 && !value.cases.slice(2, 4).every(result => positiveMount(result, value.cases[0]?.tuple))) return null;
   if (value.outcome === 'compared') {
     const tuple = value.cases[0]?.tuple;
-    if (!value.basis || value.basisFailure !== 'none' || !value.profilesRemoved || value.cases.length !== 5
-      || !stages.every(stage => value.profiles[stage]?.loaded === true && value.profiles[stage].removed === true)
+    if (!value.basis || value.basisFailure !== 'none' || value.profilesRemoved !== !activeCandidate || value.cases.length !== 5
+      || !stages.every(stage => value.profiles[stage]?.loaded === true
+        && value.profiles[stage].removed === (stage === 'baseline' || !activeCandidate))
       || !value.cases.every(result => JSON.stringify(result.row.probe.environment) === JSON.stringify(value.cases[0].row.probe.environment))
       || !value.cases.slice(0, 2).every(result => negativeMount(result, tuple))
       || !value.cases.slice(2, 4).every(result => positiveMount(result, tuple)) || !negativeMount(value.cases[4], tuple)) return null;
@@ -427,11 +443,23 @@ export function validateLinuxAppArmorComparison(value, validateRow) {
   if (value.profilesRemoved && stages.some(stage => value.profiles[stage] !== null && !value.profiles[stage].removed)) return null;
   return value;
 }
-export async function runLinuxAppArmorComparison(pair, { prepareProfiles, runProbe, validateRow, interrupted = () => false }) {
+export function validateLinuxAppArmorComparison(value, validateRow) {
+  return validateComparisonPhase(value, validateRow);
+}
+function immutableCheckpoint(value) {
+  const freeze = item => {
+    if (item !== null && typeof item === 'object') { Object.values(item).forEach(freeze); Object.freeze(item); }
+    return item;
+  };
+  return freeze(structuredClone(value));
+}
+export async function runLinuxAppArmorComparison(pair, { prepareProfiles, runProbe, validateRow,
+  interrupted = () => false, onCandidateVerified = null }) {
+  if (onCandidateVerified !== null && typeof onCandidateVerified !== 'function') refused('basis_unavailable');
   const receipt = { schemaVersion: LINUX_APPARMOR_COMPARISON_SCHEMA, purpose: 'diagnostic_only', qualifiesRelease: false,
     runnerRevision: pair.intake.runnerRevision, sourceRevision: pair.intake.sourceRevision, outcome: 'basis_unavailable', basisFailure: 'none', importFailure: 'none',
     basis: null, profiles: { baseline: null, candidate: null }, cases: [], profilesRemoved: true };
-  let profiles = null, probePending = false;
+  let profiles = null, probePending = false, candidateUsePending = false;
   try {
     try { profiles = await prepareProfiles(); receipt.basis = profiles.basis; }
     catch (error) { receipt.basisFailure = linuxAppArmorBasisFailure(error); receipt.importFailure = linuxAppArmorImportFailure(error); return receipt; }
@@ -473,16 +501,38 @@ export async function runLinuxAppArmorComparison(pair, { prepareProfiles, runPro
     const negative = await probe('negative', 'current', candidate.name);
     if (negative !== null && negativeMount(negative, tuple)
       && JSON.stringify(negative.row.probe.environment) === JSON.stringify(receipt.cases[0].row.probe.environment)) receipt.outcome = 'compared';
+    if (receipt.outcome === 'compared' && onCandidateVerified !== null) {
+      if (interrupted()) { receipt.outcome = 'interrupted'; return receipt; }
+      // This is an active checkpoint, never a public completed comparison.
+      // Public validation below continues to require actual profile removal.
+      if (validateComparisonPhase(receipt, validateRow, true) === null || probePending) refused('basis_unavailable');
+      const checkpoint = await profiles.candidateCheckpoint();
+      if (!exact(checkpoint, ['name', 'nonce', 'profileSha256', 'profileNameSha256', 'tuple', 'basis'])
+        || checkpoint.name !== candidate.name || !token(checkpoint.nonce)
+        || checkpoint.profileSha256 !== candidate.evidence.profileSha256
+        || checkpoint.profileNameSha256 !== candidate.evidence.profileNameSha256
+        || !sameTuple(checkpoint.tuple, tuple) || JSON.stringify(checkpoint.basis) !== JSON.stringify(receipt.basis)) refused('basis_unavailable');
+      if (interrupted()) { receipt.outcome = 'interrupted'; return receipt; }
+      candidateUsePending = true;
+      const closure = await onCandidateVerified(immutableCheckpoint(checkpoint));
+      if (!exact(closure, ['containerRemoved']) || closure.containerRemoved !== true) refused('basis_unavailable');
+      candidateUsePending = false;
+      // Recheck source, add marker, parser/imports, enforce state and absence of
+      // actors after the host proved closure, before the guaranteed removal.
+      const after = await profiles.candidateCheckpoint();
+      if (JSON.stringify(after) !== JSON.stringify(checkpoint)) refused('basis_unavailable');
+    }
     return receipt;
   } catch (error) {
+    if (receipt.outcome === 'compared' && onCandidateVerified !== null) receipt.outcome = 'candidate_failed';
     if (error?.code === 'imports_unavailable') { receipt.basisFailure = linuxAppArmorBasisFailure(error); receipt.importFailure = linuxAppArmorImportFailure(error); }
     return receipt;
   } finally {
     if (profiles) {
       receipt.profiles = profiles.evidence;
-      let removed = !probePending;
+      let removed = !probePending && !candidateUsePending;
       for (const stage of [...stages].reverse()) {
-        try { if (!await profiles.remove(stage, !probePending)) removed = false; }
+        try { if (!await profiles.remove(stage, !probePending && !candidateUsePending)) removed = false; }
         catch (error) {
           removed = false;
           if (receipt.importFailure === 'none' && error?.code === 'imports_unavailable') {

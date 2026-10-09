@@ -10,8 +10,8 @@ on:
     - cron: "23 4 * * 1"
   workflow_dispatch:
 
-# No SARIF upload or external writes. Proof refusal and vulnerability reporting
-# fail the same check; expiry must never turn into a successful skipped scan.
+# No SARIF upload or external writes. Dependency proof refusal and vulnerability
+# reporting fail the same check; no advisory suppression or successful skip.
 permissions:
   contents: read
 
@@ -37,10 +37,10 @@ jobs:
           corepack prepare pnpm@11.9.0 --activate
           test "$(pnpm --version)" = "11.9.0"
           pnpm install --frozen-lockfile --ignore-scripts
-      - name: Refuse expired or changed temporary exception
+      - name: Verify the reviewed downloader and removed dependency chains
         run: |
-          node scripts/check-http-cache-exception.mjs
-          node --test test/http-cache-semantics-security.test.js test/electron-windows-production-signing.test.js test/http-cache-exception.test.js test/http-cache-exception-workflow.test.mjs
+          node scripts/check-build-download-dependencies.mjs
+          node --test --test-concurrency=1 test/build-download-dependencies.test.js test/electron-build-downloader.test.js test/electron-windows-production-signing.test.js test/dependency-scan-workflow.test.mjs
       # The reviewed binary digest fixes executable bytes. Direct invocation
       # preserves vulnerability, no-package, config and operational failures.
       - name: Run scanner

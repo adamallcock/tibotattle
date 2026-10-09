@@ -22,6 +22,9 @@ import { resolveMacOSProductionUpdatePredecessor } from './lib/electron-macos-qu
 
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA = 'tibotattle-signed-macos-production-update-v1';
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 = 'tibotattle-signed-macos-production-update-v2';
+export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3 = 'tibotattle-signed-macos-production-update-v3';
+const currentProductionUpdateRoute = input => ['tibotattle-production-electron-update-intake-v2',
+  'tibotattle-production-electron-update-intake-v3'].includes(input.schemaVersion);
 const ELECTRON_020 = resolveMacOSProductionUpdatePredecessor({ schemaVersion: 'tibotattle-production-electron-update-intake-v1' });
 export const ELECTRON_020_SOURCE = ELECTRON_020.sourceRevision;
 export const ELECTRON_020_DMG = ELECTRON_020.dmgSha256;
@@ -209,9 +212,10 @@ export async function runProductionUpdate(options) {
   let input, app, active, stage = 'intake'; const knownProcesses = new Map();
   try {
     input = validateProductionUpdateIntake(JSON.parse(await bytes(options.intakePath, 16384)));
-    if (input.schemaVersion === 'tibotattle-production-electron-update-intake-v2') {
+    if (currentProductionUpdateRoute(input)) {
       const predecessor = resolveMacOSProductionUpdatePredecessor(input);
-      Object.assign(proof, { schemaVersion: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, predecessorVersion: predecessor.version,
+      Object.assign(proof, { schemaVersion: input.schemaVersion === 'tibotattle-production-electron-update-intake-v3'
+        ? ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3 : ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, predecessorVersion: predecessor.version,
         predecessorBundleVersion: predecessor.bundleVersion, predecessorBuildNumber: predecessor.buildNumber,
         predecessorSourceRevision: predecessor.sourceRevision, predecessorProcessesExitedNaturally: false });
     }
@@ -292,7 +296,7 @@ export async function runProductionUpdate(options) {
     if (hash(await fetchBytes(input.feedUrl, 65536)) !== input.feedSha256) fail('production_feed_changed');
     stage = 'install_update'; const oldPid = active.pid;
     captureMacTransitionProcesses(app, oldPid, knownProcesses);
-    const currentRoute = input.schemaVersion === 'tibotattle-production-electron-update-intake-v2';
+    const currentRoute = currentProductionUpdateRoute(input);
     const predecessorProcesses = currentRoute ? new Map(knownProcesses) : new Set(knownProcesses.keys());
     // The call can lose its CDP response when the updater exits the predecessor.
     const request = active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()');

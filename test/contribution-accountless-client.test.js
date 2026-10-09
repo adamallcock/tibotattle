@@ -565,6 +565,77 @@ test("the accountless runner retries only explicit temporary credential availabi
   });
 });
 
+test("preference availability retries only an explicit temporary protected-channel failure", async () => {
+  const permanent = Object.assign(new Error("synthetic permanent refusal"), {
+    code: "contribution_device_credential_unavailable", retryable: false,
+  });
+  const transient = Object.assign(new Error("synthetic temporary refusal"), {
+    code: "contribution_device_credential_unavailable", retryable: true,
+  });
+  for (const [failure, retryable] of [
+    [transient, true], [permanent, false],
+    [Object.assign(new Error("unknown provider failure"), { code: "unknown_failure", retryable: true }), false],
+    [Object.assign(new Error("untyped retry request"), { retryable: true }), false],
+    [Object.assign(new Error("mutation uncertainty is not a preference failure"), {
+      code: "contribution_device_credential_mutation_uncertain", retryable: true,
+    }), false],
+    [{ get code() { throw new Error("unavailable accessor"); }, retryable: true }, false],
+  ]) {
+    const result = await runAccountlessContributionSyncOnce({ laboratory: true,
+      origin: LABORATORY_ORIGIN, indexFile: "/synthetic/index.sqlite", backend: { laboratory: true },
+      readPreference: async () => { throw failure; },
+      ensureCapability: async () => assert.fail("refused preference must not load a credential"),
+      fetchImpl: async () => assert.fail("refused preference must not reach transport"),
+    });
+    assert.deepEqual(result.failure, { code: "preference_unavailable", retryable,
+      deviceUnavailable: false, retryAfterMilliseconds: null });
+    assert.equal(result.networkActivity, false);
+  }
+});
+
+test("temporary preference failure remains retryable at each pre-enrollment transport fence", async () => {
+  for (const refusedRead of [1, 2, 3, 4]) {
+    let reads = 0;
+    let capabilityCalls = 0;
+    const result = await runAccountlessContributionSyncOnce({ laboratory: true,
+      origin: LABORATORY_ORIGIN, indexFile: "/synthetic/index.sqlite", backend: { laboratory: true },
+      readPreference: async () => {
+        if (++reads === refusedRead) throw Object.assign(new Error("synthetic temporary channel failure"), {
+          code: "contribution_device_credential_unavailable", retryable: true,
+        });
+        return preference({ destinationOrigin: LABORATORY_ORIGIN });
+      },
+      ensureCapability: async () => { capabilityCalls++; return capability({ origin: LABORATORY_ORIGIN }); },
+      fetchImpl: async () => assert.fail("a refused preference fence must not reach transport"),
+    });
+    assert.equal(reads, refusedRead);
+    assert.equal(capabilityCalls, refusedRead >= 3 ? 1 : 0);
+    assert.deepEqual(result.failure, { code: "preference_unavailable", retryable: true,
+      deviceUnavailable: false, retryAfterMilliseconds: null });
+    assert.equal(result.networkActivity, false);
+  }
+});
+
+test("unavailable or ineligible preference values remain permanent refusals", async () => {
+  for (const [changes, code] of [
+    [{ available: false }, "preference_unavailable"],
+    [{ current: false }, "preference_ineligible"],
+    [{ enabled: false }, "preference_ineligible"],
+    [{ policyVersion: "accountless-opt-out-v0" }, "preference_ineligible"],
+    [{ destinationOrigin: "https://other.example" }, "preference_ineligible"],
+  ]) {
+    const result = await runAccountlessContributionSyncOnce({ laboratory: true,
+      origin: LABORATORY_ORIGIN, indexFile: "/synthetic/index.sqlite", backend: { laboratory: true },
+      readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN, ...changes }),
+      ensureCapability: async () => assert.fail("ineligible preference must not load a credential"),
+      fetchImpl: async () => assert.fail("ineligible preference must not reach transport"),
+    });
+    assert.deepEqual(result.failure, { code, retryable: false,
+      deviceUnavailable: false, retryAfterMilliseconds: null });
+    assert.equal(result.networkActivity, false);
+  }
+});
+
 test("the accountless runner retries an explicitly unavailable private credential channel", async () => {
   let networkCalls = 0;
   const result = await runAccountlessContributionSyncOnce({

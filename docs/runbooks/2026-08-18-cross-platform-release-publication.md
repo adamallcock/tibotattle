@@ -553,14 +553,18 @@ after those checks pass. Microsoft Store output is a separate subject.
 #### Final signed installer upgrade
 
 The signing workflow and the default frozen-installer qualification prove a
-fresh installed journey. For 0.1.27, also run the separate installer-upgrade
+fresh installed journey. For 0.1.28, also run the separate installer-upgrade
 mode of `electron-windows-installer-diagnostic.yml` against the exact final
 signing artifact. Select a reviewed runner ref and provide `qualify_installed`
 and `qualify_upgrade` as `true`, the exact `source_revision`, `signing_run_id`,
 `artifact_id`, `installer_sha256`, and a `predecessor_intake` JSON object matching
 `WINDOWS_FINAL_UPGRADE_PREDECESSOR` in
 `scripts/smoke-electron-windows-final-upgrade.mjs`. Omit the upgrade mode and
-predecessor intake for the retained diagnostic/fresh-install lanes.
+predecessor intake for the retained diagnostic/fresh-install lanes. The
+replacement successor is explicitly 0.1.28 with provenance build `2026100901`;
+its `tibotattle-windows-final-upgrade-v2` receipt records both fields. The
+historical 0.1.27 / `2026100301` route keeps its v1 receipt. Neither route accepts
+another version/build pair or reuses installed proof from the other.
 
 The predecessor is the immutable published
 [0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26).
@@ -576,7 +580,7 @@ The native Windows x64 lane installs 0.1.26 into a new owned NSIS directory and
 creates one isolated synthetic profile. Its normal rendered journey ingests
 representative history/projects, sets a preference and verifies durable opt-out.
 The lane proves exit of the predecessor's observed main/companion process tree
-using retained process identities, then runs the exact signed 0.1.27 installer
+using retained process identities, then runs the exact signed 0.1.28 installer
 into the same owned installation without recreating or reseeding the profile.
 It requires profile byte equality across the installer operation. Afterward,
 normal runtime migration/cache updates are allowed: two successor launches
@@ -715,7 +719,8 @@ closed intake binds the reviewed runner revision, frozen application revision,
 unchanged `production-source-candidate.json`, successful production packaging
 run, package-receipt digest, final AppImage size/digest, and executable/ASAR
 digests. The application revision must be an ancestor of the runner, with the
-same package version. For 0.1.27 the predecessor is the immutable public
+same package version. The explicit v2 intake admits only 0.1.28 with provenance
+build `2026100901`; v1 retains 0.1.27 / `2026100301`. Both use the immutable public
 [0.1.26 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.26);
 its manifest and AppImage digests are pinned in
 `scripts/lib/linux-final-artifact-intake.mjs`. Earlier owner acceptance is not
@@ -744,8 +749,36 @@ exact-byte replacement, settings/opt-out/source and credential continuity,
 cold restart, no-update behavior, owned uninstall and process/mount cleanup.
 The fixed production feed URL is served only inside the network-none container.
 
-Retain the pair and `installed-lifecycle.json` with the package receipts. Only a
-passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
+The host entrypoint `scripts/run-electron-linux-final-lifecycle.mjs` performs a
+fresh five-case causal AppArmor comparison in the same job: baseline denials for
+both exact images, permitted mounts for both under the one narrow owned
+candidate profile, and an outside-nonce negative control. Only after all five
+cases pass may the ordinary lifecycle use that exact still-loaded profile and
+nonce. Profile definition, successful-add ownership, parser/import bindings and
+enforce state are rechecked before and after use. No prior run's randomly named
+profile is treated as equivalent to this one. The diagnostic CLI remains
+mount-only, and its comparison receipt remains diagnostic-only.
+
+The host allows removal only after recorded container closure and the helper's
+independent absence-of-profile-actors check. Its `--cleanup` recovery command
+binds the recorded container ID, run/runner labels, image revision and profile;
+it never removes a container by name alone. A failed lifecycle can retain valid
+causal diagnosis while still failing host qualification.
+
+Retain the original pair, `apparmor-comparison.json`, `installed-lifecycle.json`
+and `host-lifecycle.json` with the package receipts and successful workflow/run
+and ZIP provenance. The host receipt binds all three original JSON digests and
+the exact candidate-profile identity. The replacement uses
+`tibotattle-linux-final-installed-lifecycle-v2` with
+`publicPredecessorUpdate: exact_published_0.1.26_to_final_0.1.28`; the historical
+v1 receipt keeps its 0.1.27 route. Both require the same lifecycle assertions.
+Acceptance must require the host's passed status,
+comparison/lifecycle success, no interruption and both container/profile cleanup
+before using the runtime receipt for `cleanInstallSmokePassed`. Merely uploading
+extra proof files does not update a downstream admission allowlist: update that
+consumer explicitly and verify every original-file binding.
+
+Only a passing run with all lifecycle assertions supports `cleanInstallSmokePassed`;
 missing FUSE, failed sandbox or incomplete cleanup is a failed gate. The receipt
 keeps `physicalDesktop: not_qualified`, and the isolated feed does not prove
 production updater publication. Review that scope when preparing release

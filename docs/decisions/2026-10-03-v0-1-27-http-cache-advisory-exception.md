@@ -2,8 +2,14 @@
 title: 0.1.27 HTTP cache advisory exception decision
 date: 2026-10-03
 type: decision-record
-status: accepted
+status: superseded-in-source
 ---
+
+This retained decision records the earlier exact-source exception and its
+original expiry. The [October 9 dependency removal](2026-10-09-build-downloader-dependency-remediation.md)
+retires this exception for replacement source by removing the affected build
+dependency chains. Earlier frozen artifacts and their approval remain a
+separate evidence lane; this historical record does not authorize new builds.
 
 ## Accepted boundary
 

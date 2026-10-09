@@ -1,5 +1,0 @@
-# Approved temporary exact-patch exception; see dated decision.
-[[IgnoredVulns]]
-id = "GHSA-ch52-4w7c-c8xp"
-ignoreUntil = 2026-10-10
-reason = "Reviewed upstream max-stale patch 14a8c2ad; exact-byte CI gate; expires 2026-10-10 UTC."
