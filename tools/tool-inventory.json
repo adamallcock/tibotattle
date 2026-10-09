@@ -467,17 +467,17 @@
     {
       "classification": "build_release_operation",
       "owner": "repository_operations",
-      "canonicalPath": "scripts/check-http-cache-exception.mjs",
+      "canonicalPath": "scripts/check-build-download-dependencies.mjs",
       "stableAlias": null,
-      "stableAliasReason": "The OSV workflow invokes this temporary exact-source, advisory-status and expiry guard directly; it is not a supported npm command.",
+      "stableAliasReason": "The OSV workflow invokes the root downloader dependency guard directly; it is not a supported npm command.",
       "additionalAliases": [],
       "callers": [
         ".github/workflows/osv-scanner.yml",
-        "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
-        "test/http-cache-exception.test.js"
+        "docs/decisions/2026-10-09-build-downloader-dependency-remediation.md",
+        "test/build-download-dependencies.test.js"
       ],
-      "decision": "retain_until_reviewed_exception_removal",
-      "provenance": "docs/decisions/2026-10-03-v0-1-27-http-cache-advisory-exception.md",
+      "decision": "retain_as_build_dependency_regression_gate",
+      "provenance": "docs/decisions/2026-10-09-build-downloader-dependency-remediation.md",
       "provenanceReason": null,
       "legacyPaths": []
     },

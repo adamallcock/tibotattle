@@ -421,3 +421,167 @@ index bee12b6..244353d 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/out/util/electronGet.js b/out/util/electronGet.js
+--- a/out/util/electronGet.js
++++ b/out/util/electronGet.js
+@@ -8,7 +8,7 @@
+ exports.downloadElectronArtifactZip = downloadElectronArtifactZip;
+ exports.downloadElectronArtifact = downloadElectronArtifact;
+ exports.getBinariesMirrorUrl = getBinariesMirrorUrl;
+-const get = require("@electron/get");
++const get = require("./electronDownloadTransport");
+ const get_1 = require("@electron/get");
+ const builder_util_1 = require("builder-util");
+ const _7zip_1 = require("../toolsets/7zip");
+@@ -289,7 +289,7 @@
+     const downloadOptions = {
+         timeout: { request: 10 * 60 * 1000 }, // prevent indefinite hang on stalled connections
+         ...config.downloadOptions,
+-        agent: (_b = (_a = config.downloadOptions) === null || _a === void 0 ? void 0 : _a.agent) !== null && _b !== void 0 ? _b : (0, builder_util_1.buildGotProxyAgent)(),
++        ...(config.downloader != null ? { agent: config.downloadOptions?.agent ?? (0, builder_util_1.buildGotProxyAgent)() } : {}),
+         getProgressCallback: info => {
+             // @electron/get passes downloadOptions (including this callback) to its internal
+             // SHASUMS256.txt validation download. That file is tiny (<1 MB) and fires at 100%
+@@ -325,16 +325,7 @@
+                 retries: 3,
+                 interval: 2000,
+                 backoff: 2000,
+-                shouldRetry: (e) => {
+-                    var _a;
+-                    if (e instanceof builder_util_runtime_1.HttpError) {
+-                        return e.isServerError();
+-                    }
+-                    if (typeof ((_a = e === null || e === void 0 ? void 0 : e.response) === null || _a === void 0 ? void 0 : _a.statusCode) === "number") {
+-                        return e.response.statusCode >= 500;
+-                    }
+-                    return typeof (e === null || e === void 0 ? void 0 : e.code) === "string" && ["ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EPIPE", "ENOENT"].includes(e.code);
+-                },
++                shouldRetry: error => !config.downloadOptions?.signal?.aborted && get.shouldRetryDownloadError(error),
+             });
+         }
+         catch (err) {
+diff --git a/out/binDownload.js b/out/binDownload.js
+--- a/out/binDownload.js
++++ b/out/binDownload.js
+@@ -19,7 +19,8 @@
+         // Callers should supply a checksum whenever possible.
+         builder_util_1.log.warn({ url }, "downloading without an integrity checksum — the download is not verified against a known-good hash");
+     }
+-    const { downloadArtifact, ElectronDownloadCacheMode } = await (0, dynamicImport_1.dynamicImport)("@electron/get");
++    const { ElectronDownloadCacheMode } = await (0, dynamicImport_1.dynamicImport)("@electron/get");
++    const { downloadArtifact } = require("./util/electronDownloadTransport");
+     const downloadedFile = await downloadArtifact({
+         version: "9.9.9",
+         artifactName: filenameWithExt,
+diff --git a/out/util/electronDownloadTransport.js b/out/util/electronDownloadTransport.js
+new file mode 100644
+--- /dev/null
++++ b/out/util/electronDownloadTransport.js
+@@ -0,0 +1,107 @@
++"use strict";
++// Narrow get v5 transport backport from electron-builder 27.0.0-alpha.10.
++// Keep the stable builder's archive/checksum/locking behavior unchanged.
++const get = require("@electron/get");
++const { createRequire } = require("node:module");
++const { HttpError } = require("builder-util-runtime");
++const fetchOptionKeys = new Set([
++    "method", "headers", "body", "signal", "credentials", "cache", "redirect",
++    "referrer", "referrerPolicy", "integrity", "keepalive", "mode", "duplex",
++    "dispatcher", "quiet", "getProgressCallback", "timeout", "https",
++]);
++const tlsKeys = Object.freeze({
++    rejectUnauthorized: "rejectUnauthorized", certificateAuthority: "ca",
++    certificate: "cert", key: "key", pfx: "pfx", passphrase: "passphrase",
++});
++const transientCodes = new Set([
++    "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN",
++    "EPIPE", "ENOENT", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
++]);
++
++function shouldRetryDownloadError(error) {
++    if (error == null || error.name === "AbortError") return false;
++    if (error instanceof HttpError) return error.isServerError();
++    if (error instanceof get.HTTPError || error.name === "HTTPError") {
++        const status = error.response?.status;
++        return typeof status === "number" && (status >= 500 || status === 429);
++    }
++    if (typeof error.response?.statusCode === "number") return error.response.statusCode >= 500;
++    if (error.name === "TimeoutError") return true;
++    return transientCodes.has(error.code ?? error.cause?.code);
++}
++
++function requestTimeout(value) {
++    if (value === undefined) return 10 * 60 * 1000;
++    if (value && typeof value === "object" && !Array.isArray(value)) {
++        if (Object.keys(value).some(key => key !== "request")) {
++            throw new Error("Unsupported legacy download timeout; use a request deadline or AbortSignal");
++        }
++        value = value.request ?? 0;
++    }
++    if (!Number.isSafeInteger(value) || value < 0 || value > 2147483647) {
++        throw new Error("Invalid download request timeout");
++    }
++    return value;
++}
++
++async function downloadArtifact(config) {
++    // A caller-provided downloader owns its own option contract, as in get v3.
++    if (config.downloader != null) {
++        if (typeof config.downloader.download !== "function") throw new Error("Invalid custom downloader");
++        return get.downloadArtifact(config);
++    }
++    const options = config.downloadOptions ?? {};
++    if (typeof options !== "object" || Array.isArray(options)) {
++        throw new Error("Invalid download options");
++    }
++    for (const key of Object.keys(options)) {
++        if (!fetchOptionKeys.has(key)) {
++            throw new Error("Unsupported legacy download option; use get v5 fetch options or a custom downloader");
++        }
++    }
++    const { timeout, https, ...downloadOptions } = options;
++    const deadline = requestTimeout(timeout);
++    const signals = [];
++    if (downloadOptions.signal !== undefined) {
++        if (!(downloadOptions.signal instanceof AbortSignal)) throw new Error("Invalid download AbortSignal");
++        signals.push(downloadOptions.signal);
++    }
++    // Create each deadline inside the attempt, not outside the retry loop.
++    if (deadline > 0) signals.push(AbortSignal.timeout(deadline));
++    if (signals.length) downloadOptions.signal = AbortSignal.any(signals);
++    downloadOptions.signal?.throwIfAborted();
++    let tls;
++    if (https !== undefined) {
++        if (!https || typeof https !== "object" || Array.isArray(https)) throw new Error("Invalid download HTTPS options");
++        tls = {};
++        for (const [key, value] of Object.entries(https)) {
++            if (!Object.hasOwn(tlsKeys, key)) throw new Error("Unsupported legacy download HTTPS option");
++            tls[tlsKeys[key]] = value;
++        }
++        if (Object.hasOwn(tls, "rejectUnauthorized") && typeof tls.rejectUnauthorized !== "boolean") {
++            throw new Error("Invalid download TLS verification option");
++        }
++        if (downloadOptions.dispatcher !== undefined) throw new Error("Unsupported combined HTTPS options and custom dispatcher");
++    }
++    let ownedDispatcher;
++    try {
++        if (downloadOptions.dispatcher === undefined) {
++            // Resolve the reviewed optional proxy dependency through get's actual
++            // package boundary. Missing proxy support must fail, not go direct.
++            const getRequire = createRequire(require.resolve("@electron/get"));
++            const { EnvHttpProxyAgent } = getRequire("undici");
++            ownedDispatcher = new EnvHttpProxyAgent(tls ? { connect: tls, requestTls: tls } : {});
++            downloadOptions.dispatcher = ownedDispatcher;
++        }
++        const result = await get.downloadArtifact({ ...config, downloadOptions });
++        downloadOptions.signal?.throwIfAborted();
++        return result;
++    }
++    finally {
++        // Also closes a stalled/cancelled socket. Never close a caller's dispatcher.
++        await ownedDispatcher?.destroy();
++    }
++}
++
++exports.downloadArtifact = downloadArtifact;
++exports.shouldRetryDownloadError = shouldRetryDownloadError;
