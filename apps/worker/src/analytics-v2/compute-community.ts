@@ -47,21 +47,23 @@
 import { canonicalJson } from "../canonical-json";
 import { sha256Hex } from "../crypto";
 import {
-  ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
-  ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
-  ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
-  buildAdminCommunityAllowancePreview,
   buildCommunityDailyPayload,
-  buildCommunityModelCompositionDay,
   publicInputs,
-  validCachedAdminCommunityAllowancePreview,
   validateV11DailyProjectionValues,
-  type AdminCommunityModelCompositionDay,
   type CachedCommunityModelCompositions,
   type CommunityAllowanceFit,
   type V11DailyProjectionValues,
   type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
+import {
+  ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+  buildAdminCommunityAllowancePreview,
+  buildCommunityModelCompositionDay,
+  validCachedAdminCommunityAllowancePreview,
+  type AdminCommunityModelCompositionDay,
+} from "./allowance-projection";
 import {
   ANALYTICS_V2_OWNER_SET_PROVENANCE,
   type AnalyticsV2DailyCandidate,

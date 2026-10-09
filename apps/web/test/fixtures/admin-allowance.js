@@ -64,3 +64,20 @@ export function createAdminAllowancePreviewPayload() {
     },
   };
 }
+
+// The next exact producer contract. Values/dates stay identical to the old
+// fixture so a basis label change cannot hide a reader-side rescaling.
+export function createAdminPro10AllowancePreviewPayload() {
+  const preview = createAdminAllowancePreviewPayload();
+  preview.schemaVersion = "admin-community-allowance-preview-v0.4";
+  preview.basis = "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview";
+  preview.models.basis = "seven_day_codex_pro10x_equivalent_per_model_composition";
+  preview.plans = [
+    { planType: "pro", label: "Pro 10x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 2 },
+    { planType: "promax", label: "Pro Max 25x", multiplier: 0.4 },
+    { planType: "plus", label: "Plus", multiplier: 10 },
+  ];
+  for (const day of preview.days) day.byPlanType.promax = structuredClone(day.byPlanType.pro);
+  return preview;
+}

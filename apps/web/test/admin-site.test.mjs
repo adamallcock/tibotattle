@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 import { formatReportingTime } from "../public/ui-format.js";
 import { ADMIN_MODEL_CONFIG } from "../public/telemetry-shared.generated.js";
-import { createAdminAllowancePreviewPayload } from "./fixtures/admin-allowance.js";
+import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
@@ -2320,5 +2320,68 @@ test("distribution quality summary labels retained evidence after a failed refre
     failed = false;
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => !documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
+  });
+});
+
+
+test("admin v0.4 renders declared Pro10 reference values and correct own-plan values without changing old v0.3", async () => {
+  for (const [preview, reference, labels, ownValues] of [
+    [createAdminAllowancePreviewPayload(), "Pro 20×", ["Pro 20×", "Pro 5×", "Plus"], ["$2,119", "$479", "$95"]],
+    [createAdminPro10AllowancePreviewPayload(), "Pro 10×", ["Pro 10×", "Pro 5×", "Pro Max 25×", "Plus"], ["$2,119", "$959", "$5,298", "$190"]],
+  ]) {
+    await withAllowancePage(preview, async documentRef => {
+      assert.equal(documentRef.byId.get("admin-community-basis-heading").textContent, `${reference}-equivalent allowance`);
+      assert.equal(allowanceNodes(documentRef, ".admin-allowance-unit")[0].textContent, `API-equivalent USD / ${reference} week`);
+      assert.equal(allowanceNodes(documentRef, ".admin-allowance-value")[0].textContent, "$2,169");
+      for (const mode of ["plans", "models"]) {
+        selectAllowanceControl(documentRef, "admin-community-mode-controls", `button[data-allowance-mode="${mode}"]`);
+        const svg = allowanceNodes(documentRef, 'svg[role="img"]')[0];
+        assert.match(svg.getAttribute("aria-description"), new RegExp(`${reference} basis`, "u"));
+        assert.ok(svg.getAttribute("aria-label").includes(`${reference}-equivalent`));
+        assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent, `API-equivalent USD / ${reference} week`);
+        assert.ok(allowanceNodes(documentRef, ".admin-allowance-dot").every(dot => dot.getAttribute("aria-label").includes(`/${reference} week`)));
+        if (mode === "models") {
+          const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+          assert.equal(cards.find(card => card.querySelector("h3").textContent === "GPT-5.6 Sol").querySelector(".allowance-summary-value").textContent, "$2,469");
+          continue;
+        }
+        const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+        assert.deepEqual(cards.map(card => card.querySelector("h3").textContent), labels);
+        assert.deepEqual(cards.map(card => card.querySelector(".allowance-plan-value").textContent), ownValues.map(value => `This plan: ${value}/week at API prices`));
+        assert.deepEqual(cards.map(card => card.querySelector(".allowance-summary-value").textContent),
+          preview.plans.map(plan => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(preview.days.at(-1).byPlanType[plan.planType].centralUsd)));
+        const text = descendantNodes(documentRef.byId.get("admin-community-allowance-result")).map(node => node.textContent).join(" ");
+        assert.ok(text.includes(`Chart scaled to ${reference}`));
+        if (preview.schemaVersion.endsWith("v0.4")) {
+          assert.ok(cards[2].classList.contains("allowance-series-3"), "Pro Max has an existing distinct reviewed color");
+          assert.match(text, /Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10/u);
+          assert.doesNotMatch(text, /Pro 20[×x]/u);
+          const container = documentRef.byId.get("admin-community-allowance-result");
+          const legend = container.querySelector('button[data-allowance-plan="promax"]');
+          container.listeners.get("click")({ target: legend });
+          assert.equal(container.querySelector('button[data-allowance-plan="promax"]').getAttribute("aria-pressed"), "true");
+          assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 30);
+          assert.equal(container.querySelector(".admin-allowance-dot").getAttribute("aria-label").includes("Pro Max 25×"), true);
+          assert.ok(container.querySelectorAll(".admin-allowance-dot").at(-1).getAttribute("aria-label").includes("$2,119/Pro 10× week"), "chart retains the published reference amount, separate from the $5,298 own-plan card value");
+        }
+      }
+    });
+  }
+});
+
+
+test("admin v0.4 leaves unavailable Pro Max evidence explicit without an invented own-plan value", async () => {
+  const preview = createAdminPro10AllowancePreviewPayload();
+  for (const day of preview.days) day.byPlanType.promax = {
+    fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null,
+  };
+  await withAllowancePage(preview, async documentRef => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const card = allowanceNodes(documentRef, ".admin-allowance-plan-summary")[2];
+    assert.equal(card.querySelector("h3").textContent, "Pro Max 25×");
+    assert.equal(card.querySelector(".allowance-summary-value").textContent, "—");
+    assert.equal(card.querySelector(".allowance-plan-value"), null);
+    assert.match(descendantNodes(card).map(node => node.textContent).join(" "), /No qualifying fits/u);
+    assert.equal(allowanceNodes(documentRef, ".admin-allowance-dot").some(dot => dot.classList.contains("allowance-series-3")), false);
   });
 });

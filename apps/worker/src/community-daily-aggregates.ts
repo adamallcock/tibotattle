@@ -3,6 +3,7 @@ import { readCommunityRefreshLane, recordCommunityRefreshLane,
   type CommunityRefreshLanePin } from "./community-refresh-lanes";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   collectCommunityAllowanceFits,
@@ -938,7 +939,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
   let allowanceReadState: PublishedCommunityDailyRead["allowanceReadState"] = "confirmed";
   try {
     const previewStatement = db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
-      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION);
     const results = await db.batch<PublishedCommunityDailyQueryRow | PublicAllowanceBreakdownsCacheRow>([
       dailyStatement,
       previewStatement,

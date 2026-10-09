@@ -1,7 +1,7 @@
 // A-2 analytics-refresh compute core: computeAnalyticsV2 over synthetic,
-// content-free effective occurrences, using only the vendored d43c8f92
-// kernels. The compose-parity case rebuilds the public read envelope from the
-// outputs exactly as compose-proof.spec.ts does and requires its pinned bytes.
+// content-free effective occurrences. Raw owner kernels remain vendored; the
+// cross-owner projection uses the current Pro 10x facade. The retained legacy
+// compose oracle remains independently pinned in compose-proof.spec.ts.
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalJson } from "../src/canonical-json";
@@ -33,18 +33,17 @@ import {
   CACHE_RETENTION_WINDOWS,
   isCurrentCommunityDailySpend,
   mergeCacheRetentionBands,
-  projectPublicAllowanceGraph,
   publicCacheRetentionWindow,
-  validCachedAdminCommunityAllowancePreview,
-  type AdminCommunityAllowancePreview,
   type CacheRetentionBandRow,
 } from "../vendor/analytics-d43c8f92/entry";
+import { validCachedAdminCommunityAllowancePreview } from "../src/analytics-v2/allowance-projection";
+import type { AdminCommunityAllowancePreview } from "../src/admin-community-allowance";
+import { projectPublicAllowanceGraph } from "../src/public-allowance-breakdowns";
+// The frozen normalizer remains a daily-data compatibility check.
 // The website's own normalizer at d43c8f92, unchanged.
 import { normalizeCommunityDailySeries } from "../vendor/analytics-d43c8f92/apps/web/public/community-data.js";
 import {
   addDays,
-  COMPOSED_PREVIEW_SHA256,
-  COMPOSED_RESPONSE_SHA256,
   composeFacts,
   composeProofCorpus,
   conflictFacts,
@@ -150,7 +149,7 @@ const refusalsOf = (outputs: AnalyticsV2ComputeOutputs, ownerDigest: string) =>
 const fitOwners = (outputs: AnalyticsV2ComputeOutputs) => outputs.ownerFits.map((row) => row.ownerDigest);
 
 describe("computeAnalyticsV2 (A-2)", () => {
-  it("(a) reproduces the compose proof exactly and (f) emits a valid, projectable preview", async () => {
+  it("(a) preserves raw compose evidence and (f) emits a valid current Pro 10x preview", async () => {
     const corpus = composeProofCorpus();
     const outputs = await computeAnalyticsV2(inputFor(corpus, corpus.publishedDays));
     expect(outputs.refusals).toEqual([]);
@@ -187,9 +186,13 @@ describe("computeAnalyticsV2 (A-2)", () => {
       state: normalized.state,
     }).toEqual({ publishedDays: 7, fits: 21, modelDays: 70, breakdownDays: 5, cacheBandRows: 210, state: "published" });
     expect(cacheRetention!.windows.length).toBe(4);
-    // Byte-identical to the compose proof's pinned envelope and preview.
-    expect(sha(JSON.stringify(response))).toBe(COMPOSED_RESPONSE_SHA256);
-    expect(sha(JSON.stringify(preview))).toBe(COMPOSED_PREVIEW_SHA256);
+    // The new projection has an explicitly changed unit and plan roster. Raw
+    // owner results keep their existing separate pinned parity evidence.
+    expect(preview.schemaVersion).toBe("admin-community-allowance-preview-v0.4");
+    expect(graph!.breakdowns.schemaVersion).toBe("community-allowance-breakdowns-v1.2");
+    expect(Object.keys(preview.days.at(-1)!.byPlanType)).toEqual(["pro", "prolite", "promax", "plus"]);
+    expect(sha(JSON.stringify(response))).toBe("ec959e16133ddc9e95cdf7f07a4a48751c036f0edea8e6975e61a09b3289fa5f");
+    expect(sha(JSON.stringify(preview))).toBe("8fd1aff6a455a6bba2c533fcba9f55f719234190a2ecd28a87e5f2c559dc4ec8");
 
     // Content identity excludes only the revision stamp; a restamp keeps it.
     const first = outputs.dailyCandidates[0]!;

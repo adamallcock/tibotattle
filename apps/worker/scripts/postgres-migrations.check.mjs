@@ -22,7 +22,7 @@ test("loads a contiguous primary-only migration manifest", async () => {
     manifest.roles.primary.map(({ version, name }) => [version, name]),
     expectedPrimary.map(({ version, name }) => [version, name]),
   );
-  assert.equal(manifest.roles.primary.at(-1).name, "0076_classification_correction_links.sql");
+  assert.equal(manifest.roles.primary.at(-1).name, "0077_analytics_v2_reprice.sql");
   for (const migration of manifest.roles.primary) {
     assert.match(migration.sha256, /^[0-9a-f]{64}$/u);
   }

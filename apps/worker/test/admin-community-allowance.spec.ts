@@ -15,6 +15,7 @@ import {
 } from "../src/admin-community-allowance";
 import {
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
   readCachedCommunityAllowanceCorpus,
   readCachedCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
@@ -303,10 +304,10 @@ describe("admin community allowance preview", () => {
       const projected = projectAdminModelHistoryDay({
         day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
         values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
-          .map((model) => [model.modelId, 1.7976931348623157e308, Number.MAX_SAFE_INTEGER]),
-        fittedParticipantCount: Number.MAX_SAFE_INTEGER,
+          .map((model) => [model.modelId, 1.7976931348623157e308, 99_999_999_999_999]),
+        fittedParticipantCount: 99_999_999_999_999,
         unstableParticipantCount: 0, staleParticipantCount: 0, refusedParticipantCount: 0,
-        v1ParticipantCount: Number.MAX_SAFE_INTEGER, unsupportedSourceParticipantCount: 0,
+        v1ParticipantCount: 99_999_999_999_999, unsupportedSourceParticipantCount: 0,
       });
       expect(projected).not.toBeNull();
       return projected!;
@@ -369,8 +370,8 @@ describe("admin community allowance preview", () => {
     expect(latest.combined).toEqual({
       fitCount: 4,
       participantCount: 3,
-      centralUsd: 2_000,
-      band80Usd: { lowerUsd: 2_000, upperUsd: 2_280 },
+      centralUsd: 1_100,
+      band80Usd: { lowerUsd: 1_000, upperUsd: 1_760 },
     });
     expect(latest.byPlanType.pro).toMatchObject({
       fitCount: 1,
@@ -378,14 +379,15 @@ describe("admin community allowance preview", () => {
       centralUsd: 2_000,
       band80Usd: null,
     });
-    expect(latest.byPlanType.prolite.centralUsd).toBe(2_000);
+    expect(latest.byPlanType.prolite.centralUsd).toBe(1_000);
+    expect(latest.byPlanType.promax).toMatchObject({ fitCount: 0, participantCount: 0, centralUsd: null });
     expect(latest.byPlanType.plus).toMatchObject({
       fitCount: 2,
       participantCount: 2,
-      centralUsd: 2_200,
+      centralUsd: 1_100,
       band80Usd: null,
     });
-    expect(Object.keys(latest.byPlanType)).toEqual(["pro", "prolite", "plus"]);
+    expect(Object.keys(latest.byPlanType)).toEqual(["pro", "prolite", "promax", "plus"]);
     const publicSummary = summarizeCommunityAllowanceDay(fits, "2026-08-23");
     expect(latest.combined).toEqual({
       fitCount: publicSummary.fitCount,
@@ -617,7 +619,7 @@ describe("admin community allowance preview", () => {
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
-    expect(bindings).toEqual([[256 * 1_024, COMMUNITY_ATTRIBUTION_METHOD_VERSION]]);
+    expect(bindings).toEqual([[256 * 1_024, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION]]);
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
@@ -733,7 +735,7 @@ describe("admin community allowance preview", () => {
     expect(current.statements[1]).not.toMatch(/payload_json|telemetry_|\b(?:INSERT|UPDATE|DELETE)\b/u);
     expect(current.statements[1]).toContain("ORDER BY day DESC LIMIT ?4");
     expect(current.bindings[1]).toEqual(["2026-06-15", "2026-08-23",
-      COMMUNITY_ATTRIBUTION_METHOD_VERSION, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS]);
+      COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS]);
   });
 
   it("reports scheduled source and write failures without throwing", async () => {

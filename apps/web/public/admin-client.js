@@ -47,6 +47,23 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
+const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
+  [ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION]: Object.freeze({
+    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    plans: ADMIN_ALLOWANCE_PREVIEW_PLANS,
+    modelBasis: ADMIN_ALLOWANCE_MODELS_BASIS,
+  }),
+  "admin-community-allowance-preview-v0.4": Object.freeze({
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+      Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
+    ]),
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  }),
+});
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -625,10 +642,10 @@ function projectAllowancePreviewSummary(value) {
   });
 }
 
-function projectAllowanceModels(value, latestAllowedDay) {
+function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const models = record(value, code);
-  if (models.basis !== ADMIN_ALLOWANCE_MODELS_BASIS
+  if (models.basis !== modelBasis
       || models.gate !== ADMIN_ALLOWANCE_MODELS_GATE) {
     invalid(code);
   }
@@ -661,21 +678,23 @@ function projectAllowanceModels(value, latestAllowedDay) {
   if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);
   return Object.freeze({
     modelConfig: Object.freeze(modelConfig),
-    basis: ADMIN_ALLOWANCE_MODELS_BASIS,
+    basis: modelBasis,
     gate: ADMIN_ALLOWANCE_MODELS_GATE,
     days: Object.freeze(days),
   });
 }
 
 /**
- * Fail-closed projection for the owner-only merge trial. The public client does
- * not understand this schema and remains pinned to the published Pro cohort.
+ * Fail-closed projection for the owner-only preview. Version and declared
+ * basis select one exact plan/model contract; published amounts are preserved.
  */
 export function projectAdminAllowancePreview(value) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const preview = record(value, code);
-  if (preview.schemaVersion !== ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
-      || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
+  const contract = Object.hasOwn(ADMIN_ALLOWANCE_PREVIEW_CONTRACTS, preview.schemaVersion)
+    ? ADMIN_ALLOWANCE_PREVIEW_CONTRACTS[preview.schemaVersion] : null;
+  if (contract === null
+      || preview.basis !== contract.basis
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
       || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
@@ -686,7 +705,7 @@ export function projectAdminAllowancePreview(value) {
   const to = calendarDay(preview.to, code);
   const plans = array(preview.plans, code).map((value, index) => {
     const plan = record(value, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_PLANS[index];
+    const expected = contract.plans[index];
     if (!expected
         || plan.planType !== expected.planType
         || plan.label !== expected.label
@@ -695,8 +714,8 @@ export function projectAdminAllowancePreview(value) {
     }
     return expected;
   });
-  if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
-  const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
+  if (plans.length !== contract.plans.length) invalid(code);
+  const expectedPlanKeys = contract.plans
     .map((plan) => plan.planType)
     .sort();
   const days = array(preview.days, code).map((value, index) => {
@@ -714,7 +733,7 @@ export function projectAdminAllowancePreview(value) {
       day: dayValue,
       combined: projectAllowancePreviewSummary(day.combined),
       byPlanType: Object.freeze(Object.fromEntries(
-        ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
+        contract.plans.map((plan) => [
           plan.planType,
           projectAllowancePreviewSummary(byPlanType[plan.planType]),
         ]),
@@ -727,19 +746,19 @@ export function projectAdminAllowancePreview(value) {
     invalid(code);
   }
   return Object.freeze({
-    schemaVersion: ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+    schemaVersion: preview.schemaVersion,
     generatedAt: string(preview.generatedAt, code),
     from,
     to,
-    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    basis: contract.basis,
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: 40,
+    spanFloorPp: preview.schemaVersion === ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION ? 40 : preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
-    models: projectAllowanceModels(preview.models, to),
+    models: projectAllowanceModels(preview.models, to, contract.modelBasis),
   });
 }
 

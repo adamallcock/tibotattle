@@ -118,6 +118,8 @@ export { ANALYTICS_V2_PRICING_CLASS_TABLES, ANALYTICS_V2_PRICING_CLASS_COLUMNS,
 export type { AnalyticsV2PriceTransitions, AnalyticsV2PriceWriteSummary } from "./store-run";
 // E-OWNERSET: the contribution digests (the published revision is nextPublishedRevision above).
 export { analyticsV2ContributionDigests } from "./owner-sets";
+export { ANALYTICS_V2_REPRICE_AUDIT_TABLES,ANALYTICS_V2_REPRICE_AUDIT_COLUMNS,
+  ANALYTICS_V2_REPRICE_AUDIT_PRIMARY_KEYS } from "./reprice";
 export {
   ANALYTICS_V2_CACHE_BANDS,
   ANALYTICS_V2_DAILY_REVISION_FIELDS,

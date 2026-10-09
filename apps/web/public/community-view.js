@@ -6,7 +6,8 @@ export { allowanceModelPresentation, modelThemeIcon } from "./model-visuals.js";
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd,
+  COMMUNITY_ALLOWANCE_NORMALIZATION, COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION } from "./community-data.js";
 import {
   compact,
   compactPrecise,
@@ -351,6 +352,20 @@ export const COMMUNITY_ALLOWANCE_CHART_HEIGHT = 320;
  * range carries an estimate; the caller distinguishes those two states from
  * the series itself.
  */
+// A chart follows the source of the selected values. A v1.0 aggregate uses
+// daily blocks; later envelopes own their combined estimate. The historical
+// normalized shape has no extra basis fields and retains its exact Pro 20x meaning.
+function allowanceNormalization(series, view = "aggregate") {
+  if (series?.breakdowns && (view !== "aggregate" || series.breakdowns.hasCombined)) {
+    return series.breakdowns.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION;
+  }
+  return series?.days?.findLast(day => day.allowance != null)?.allowance.normalization
+    ?? COMMUNITY_ALLOWANCE_NORMALIZATION;
+}
+function sameAllowanceBasis(allowance, normalization) {
+  return allowance != null && (allowance.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION) === normalization;
+}
+
 function buildCommunityAllowanceSingleChartModel(series, {
   rangeDays = null,
   width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
@@ -360,8 +375,10 @@ function buildCommunityAllowanceSingleChartModel(series, {
   if (!series || series.state !== "published" || series.days.length === 0) {
     return null;
   }
+  const normalization = allowanceNormalization(series);
   let candidates = series.days.filter((day) => (
-    day.allowance !== null
+    sameAllowanceBasis(day.allowance, normalization)
+    && day.allowance !== null
     && day.allowance !== undefined
     && day.allowance.centralUsd !== null
   ));
@@ -524,17 +541,21 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     ? communityDayStartMs(anchor) - (rangeDays - 1) * MILLISECONDS_PER_DAY : -Infinity;
   const rangeDaysWithActivity = series.days.filter(day => day.day <= anchor && communityDayStartMs(day.day) >= cutoff);
   if (rangeDaysWithActivity.length === 0) return null;
+  const normalization = allowanceNormalization(series, view);
+  const pro10 = normalization === COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION;
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
-    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
-      key, label, view: "plans", className: `allowance-series-${index}`,
+    ...[ ["pro", pro10 ? "Pro 10×" : "Pro 20×", 0], ["prolite", "Pro 5×", 1],
+      ...(pro10 ? [["promax", "Pro 25×", 3]] : []), ["plus", "Plus", 2] ].map(([key, label, color]) => ({
+      key, label, view: "plans", className: `allowance-series-${color}`,
     })),
     ...modelDefinitions(series.breakdowns.modelConfig),
   ];
   const summaryFor = (day, definition) => {
     const breakdown = breakdownDays.get(day.day);
-    if (definition.view === "aggregate") return series.breakdowns.hasCombined ? breakdown?.combined : day.allowance;
+    if (definition.view === "aggregate") return series.breakdowns.hasCombined ? breakdown?.combined
+      : sameAllowanceBasis(day.allowance, normalization) ? day.allowance : null;
     if (definition.view === "plans") return breakdown?.byPlanType[definition.key];
     const value = breakdown?.models.find(([id]) => id === definition.key);
     return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
@@ -552,17 +573,17 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     days = days.slice(first, last + 1);
   }
   // A plan series is plotted at ITS OWN week at API prices, matching the value
-  // its card leads with. `centralUsd` is the Pro 20x equivalent, so the inverse
+  // its card leads with. `centralUsd` is in the declared reference basis, so the inverse
   // of the published normalization is applied per series; every other view is
   // already in reference terms and passes through unchanged.
   // Applied only when a single series is requested — the small-multiples path.
   // The whole-view model still carries reference-normalized values, because the
   // summary cards derive the plan's own week from them themselves; scaling here
-  // too would divide twice and show a Pro 5x week as a quarter of itself.
+  // too would divide twice and scale an already converted plan week again.
   const seriesScale = (value, definition) => {
     if (value == null) return null;
     if (seriesKeys === null || definition.view !== "plans") return value;
-    const own = planWeeklyApiEquivalentUsd(value, definition.key);
+    const own = planWeeklyApiEquivalentUsd(value, definition.key, normalization);
     return own === null ? value : own;
   };
   // Dollar axes stay comparable across tabs, so the bound is every definition,
@@ -1177,7 +1198,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t, inspe
     "aria-label": t(model.view === "models" ? "community.allowance.modelChartLabel"
       : model.view === "plans" ? "community.allowance.planChartLabel" : "community.allowance.chartLabel"),
     "aria-description": t(model.view === "models" ? "community.allowance.modelChartDescription"
-      : model.view === "plans" ? "community.allowance.planChartDescription" : "community.allowance.chartDescription"),
+      : model.view === "plans" ? "community.allowance.planOwnWeekChartDescription" : "community.allowance.chartDescription"),
   });
   svg.setAttribute("data-i18n-skip", "");
   const seriesMarks = [];
@@ -1530,6 +1551,8 @@ export function renderCommunityAllowanceSection({
   documentRef,
   container,
   stateNode = null,
+  headingNode = null,
+  heroNode = null,
   payload,
   rangeDays = null,
   view = "aggregate",
@@ -1537,15 +1560,24 @@ export function renderCommunityAllowanceSection({
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
-  const t = (key, values = {}) => translate(key, values, locale);
+  const series = normalizeCommunityDailySeries(payload, { retained: cache !== null && cache !== undefined });
+  const normalization = allowanceNormalization(series, view);
+  const pro10 = normalization === COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION;
+  const basisKeys = new Set(["heading", "heroCopy", "chartDescription",
+    "modelChartDescription", "modelMethod", "planMethod", "cardsCaption", "referenceEquivalent", "methodNote"]);
+  const basisKey = key => pro10 && basisKeys.has(key.replace("community.allowance.", ""))
+    ? key.replace("community.allowance.", "community.allowance.pro10.") : key;
+  const t = (key, values = {}) => translate(basisKey(key), values, locale);
+  for (const [element, key] of [[headingNode, "community.allowance.heading"], [heroNode, "community.allowance.heroCopy"]]) {
+    if (element === null) continue;
+    element.textContent = t(key);
+    element.setAttribute?.("data-i18n", basisKey(key));
+  }
   const plural = (key, count) => translatePlural(key, count, {}, locale);
   const previousInspection = allowanceInspectionByContainer.get(container)?.();
   const inspection = previousInspection?.view === view ? previousInspection : null;
   allowanceInspectionByContainer.delete(container);
   clear(container);
-  // A payload handed over with retained provenance came out of this browser's
-  // own store, and only such a payload may carry the stored-copy counters.
-  const series = normalizeCommunityDailySeries(payload, { retained: cache !== null && cache !== undefined });
   const retained = cachedEvidence(cache);
   const setChip = (labelKey, published) => {
     if (!stateNode) return;
@@ -1585,6 +1617,12 @@ export function renderCommunityAllowanceSection({
   const unrecognizedModelNotice = () => view === "models"
     && (series.breakdowns?.unrecognizedModelTuples ?? 0) > 0
     ? [node("p", "snapshot-disclosure", t("community.allowance.unrecognizedModels"))] : [];
+  if (view === "aggregate" && !series.breakdowns?.hasCombined
+      && series.days.some(day => day.allowance != null && !sameAllowanceBasis(day.allowance, normalization))) {
+    container.append(node("p", "snapshot-disclosure", t("community.allowance.basisTransition", {
+      basis: pro10 ? "Pro 10×" : "Pro 20×",
+    })));
+  }
   const model = buildCommunityAllowanceChartModel(series, { rangeDays, view });
   if (model === null) {
     const anyEstimate = buildCommunityAllowanceChartModel(series, { view }) !== null;
@@ -1604,7 +1642,8 @@ export function renderCommunityAllowanceSection({
   const dollars = usdFormatter();
   container.append(sourceDisclosureDetails(node, t, ["community.allowance.smallSampleDisclosure"]));
   if (view !== "aggregate") {
-    container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
+    container.append(node("p", "allowance-summary-caption", t(view === "plans"
+      ? "community.allowance.planOwnWeekCaption" : "community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
     for (const latest of model.latestSummaries) {
       const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
@@ -1613,9 +1652,10 @@ export function renderCommunityAllowanceSection({
       const icon = modelThemeIcon(documentRef, latest.seriesTheme);
       if (icon) heading.append(icon);
       // A plan cohort leads with ITS OWN week at API prices, because that is
-      // the number a reader on that plan is asking about. The Pro 20x
-      // equivalent stays underneath as the comparable figure the basis names.
-      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+      // the number a reader on that plan is asking about. The declared
+      // reference equivalent stays underneath as the comparable figure.
+      const planUsd = view === "plans" && latest !== null
+        ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey, normalization) : null;
       card.append(heading,
         node("strong", "allowance-summary-value",
           dollars.format(planUsd === null ? latest.centralUsd : planUsd)));
@@ -1628,7 +1668,7 @@ export function renderCommunityAllowanceSection({
     }
     container.append(cards);
     if (view === "plans") {
-      // Small multiples. Three plans whose own weeks span roughly twentyfold
+      // Small multiples. Plans whose own weeks span a wide range
       // cannot share a linear axis — the smallest is pinned to the baseline and
       // its band becomes a sliver. One panel per plan gives each its own value
       // axis and full vertical resolution, and it removes the need to explain a

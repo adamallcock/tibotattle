@@ -23,16 +23,15 @@
  *   current-price evidence matching totals.usageEvents or the exact kernel-10
  *   historical publication contract described below, and allowance always
  *   removed (typed storage never has a current daily allowance publication);
- * - allowanceBreakdowns is the vendored projectPublicAllowanceGraph over the
- *   stored admin preview, served as community-allowance-breakdowns-v1.3
- *   (KM-7, owner decision round 7): the vendored v1.1 block relabelled, with
- *   the closed model-metadata block of the catalog baseline (manifest_version
- *   1) appended by the GCP-owned wrapper public-allowance-breakdowns-v13.ts.
- *   That relabel and block are the DECLARED parity difference from d43c8f92;
- *   every other byte is the vendored projection's. allowanceReadState is
+ * - allowanceBreakdowns projects the stored preview under its declared basis:
+ *   legacy v0.3 as community-allowance-breakdowns-v1.3 and current v0.4 as v1.4
+ *   with the same closed catalog model-metadata block. The legacy projection
+ *   retains its frozen 20x arithmetic; v1.4 uses the reviewed four-plan 10x
+ *   normalization. Historical values are never relabelled as a new basis.
+ *   allowanceReadState is
  *   `temporarily_unavailable`
  *   whenever the preview is absent, unreadable, oversized or fails the
- *   vendored cache validation, and allowanceState is `ready` exactly when the
+ *   declared-version cache validation, and allowanceState is `ready` exactly when the
  *   projection yields at least one closed published day;
  * - cacheRetention is composed at request time from analytics_v2_cache_bands
  *   (cache-windows-sql.ts), omitted when no window has evidence or the read
@@ -90,13 +89,11 @@ import {
   CACHE_RETENTION_PUBLIC_SCHEMA_VERSION,
   CACHE_RETENTION_WINDOWS,
   isCurrentCommunityDailySpend,
-  projectPublicAllowanceGraph,
-  validCachedAdminCommunityAllowancePreview,
   type PublicAllowanceBreakdownsCacheRow,
   type PublicCacheRetentionSeries,
 } from "../../vendor/analytics-d43c8f92/entry";
-// Not re-exported by the vendor facade (entry.ts); the same vendored d43c8f92
-// module projectPublicAllowanceGraph and the cache validator read it from.
+// The legacy and current preview contracts retain the same byte bound.
+// Read the reviewed frozen bound directly; it is not re-exported by entry.ts.
 import { PREVIEW_CACHE_JSON_LIMIT_BYTES } from "../../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
 import {
   ANALYTICS_V2_CACHE_RETENTION_BAND_IDS,
@@ -106,7 +103,10 @@ import {
 } from "./cache-windows-sql";
 import { compiledBaselineCatalogManifest } from "../postgres-catalog-store";
 import { ANALYTICS_V2_SINGLETON_ID, ANALYTICS_V2_TABLES, type OriginRouteModule } from "./contract";
-import { analyticsV2KernelRegistry } from "./kernel";
+import { analyticsV2BaselineRunStamp, analyticsV2BundledKernelIdentity,
+  analyticsV2KernelRegistry, resolveAnalyticsV2Kernel } from "./kernel";
+import { readAnalyticsV2RepriceEquivalences } from "./reprice-read";
+import { ANALYTICS_V2_REPRICE_LIMITS } from "./reprice";
 import { readAnalyticsV2ExclusionsFromClient } from "./owners";
 import { isKernel10PublishedDailyPayload } from "./published-spend-compatibility";
 import {
@@ -118,9 +118,9 @@ import {
 } from "./interim-public-read";
 import {
   buildPublicModelMetadata,
-  wrapPublicAllowanceBreakdownsV13,
   type PublicModelMetadataEntry,
 } from "./public-allowance-breakdowns-v13";
+import { projectPublicAllowanceGraphForGcp, validReadableAdminCommunityAllowancePreview } from "./allowance-projection";
 
 export const ANALYTICS_V2_COMMUNITY_DAILY_PATH = "/api/v1/community/daily" as const;
 export const ANALYTICS_V2_COMMUNITY_DAILY_SCHEMA_VERSION = "community-daily-read-v1.0" as const;
@@ -188,9 +188,12 @@ interface StoredDailyRow {
   readonly payload_sha256: unknown;
 }
 
+type SpendEquivalence = { readonly registrySha256: string; readonly pricingMethodVersion: string };
+
 interface StoredRead {
   readonly rows: readonly StoredDailyRow[];
   readonly historicalSpendDays: ReadonlySet<string>;
+  readonly spendEquivalences: ReadonlyMap<string, SpendEquivalence>;
   /** The preview's jsonb text, null when absent, or undefined when its read failed. */
   readonly previewText: string | null | undefined;
   /** The cache windows, or null when their read failed. */
@@ -347,7 +350,7 @@ async function readStored(
     if (interim !== null) {
       // The frozen answer is the export alone: this line's own preview and
       // cache bands are not mixed into it.
-      return { rows: daily.rows, historicalSpendDays: new Set<string>(), previewText: null, cacheWindows: null, interim };
+      return { rows: daily.rows, historicalSpendDays: new Set<string>(), spendEquivalences: new Map(), previewText: null, cacheWindows: null, interim };
     }
     const preview = await optionalRead(client, "analytics_v2_preview_read", async () => {
       const result = await client.query<{ preview_text: unknown }>(previewSql(schema));
@@ -385,9 +388,36 @@ async function readStored(
         const exclusions = await readAnalyticsV2ExclusionsFromClient(client, schema);
         return new Set(heads.rows.filter(row => row.exclusions_sha256 === exclusions.sha256).map(row => row.day));
       });
+    // Stamp-only equivalence is optional. It never rewrites a publication and
+    // is accepted only for this bundle's registered target in this same snapshot.
+    const spendEquivalences = await optionalRead(client, "analytics_v2_spend_equivalence", async () => {
+      const output = new Map<string, SpendEquivalence>();
+      const identity = analyticsV2BundledKernelIdentity();
+      if (identity === null) return output;
+      const stamp = analyticsV2BaselineRunStamp(resolveAnalyticsV2Kernel(identity), identity.computeSha256 ?? null);
+      const heads = daily.rows.flatMap(row => {
+        if (typeof row.day !== "string" || typeof row.revision !== "string"
+          || !DECIMAL_REVISION.test(row.revision) || !Number.isSafeInteger(Number(row.revision))
+          || typeof row.payload_sha256 !== "string" || !SHA256_PATTERN.test(row.payload_sha256)
+          || typeof row.payload_text !== "string") return [];
+        try {
+          const payload = JSON.parse(row.payload_text);
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)
+            || !payload.apiEquivalentSpend || isCurrentCommunityDailySpend(payload.apiEquivalentSpend)) return [];
+          return [{ day: row.day, revision: Number(row.revision), payloadSha256: row.payload_sha256 }];
+        } catch { return []; }
+      });
+      for (let start = 0; start < heads.length; start += ANALYTICS_V2_REPRICE_LIMITS.days) {
+        const proof = await readAnalyticsV2RepriceEquivalences(client, { schema, stamp,
+          heads: heads.slice(start, start + ANALYTICS_V2_REPRICE_LIMITS.days) });
+        for (const [day, equivalent] of proof) output.set(day, equivalent);
+      }
+      return output;
+    });
     return {
       rows: daily.rows,
       historicalSpendDays: historicalSpendDays ?? new Set<string>(),
+      spendEquivalences: spendEquivalences ?? new Map(),
       previewText: preview,
       cacheWindows: cacheWindows ?? null,
       interim: null,
@@ -447,7 +477,7 @@ async function publishedDay(row: StoredDailyRow, from: string, to: string): Prom
 /**
  * The stored preview as production's typed-storage graph read returns it: a
  * cache row only when the canonical payload is within the byte limit and
- * passes the vendored cache validation at nowMs, else null.
+ * passes its own version's cache validation at nowMs, else null.
  */
 function previewCacheRow(previewText: string | null | undefined, nowMs: number): PublicAllowanceBreakdownsCacheRow | null {
   if (typeof previewText !== "string") return null;
@@ -462,7 +492,7 @@ function previewCacheRow(previewText: string | null | undefined, nowMs: number):
   if (typeof generatedAt !== "string") return null;
   const payloadJson = canonicalJson(preview);
   if (new TextEncoder().encode(payloadJson).byteLength > PREVIEW_CACHE_JSON_LIMIT_BYTES) return null;
-  if (!validCachedAdminCommunityAllowancePreview(JSON.parse(payloadJson), generatedAt, nowMs)) return null;
+  if (!validReadableAdminCommunityAllowancePreview(JSON.parse(payloadJson), generatedAt, nowMs)) return null;
   return { payload_json: payloadJson, generated_at: generatedAt };
 }
 
@@ -495,14 +525,26 @@ function composedCacheRetention(windows: readonly AnalyticsV2CacheWindowRows[] |
 }
 
 /** Remove private fields; retain current spend or independently proven historical spend. */
-function publicDayPayload(day: PublishedDay, historicalSpendDays: ReadonlySet<string>): void {
+function publicDayPayload(day: PublishedDay, historicalSpendDays: ReadonlySet<string>,
+  spendEquivalences: ReadonlyMap<string, SpendEquivalence>): void {
   if (typeof day.payload !== "object" || day.payload === null || Array.isArray(day.payload)) return;
   const publicPayload = { ...day.payload as Record<string, unknown> };
   // The old diagnostic shape remains private. Only the separate validated
   // allowanceBreakdowns contract exposes plan/model dollar estimates.
   delete publicPayload.capacityByPlanType;
-  const spend = publicPayload.apiEquivalentSpend;
+  let spend = publicPayload.apiEquivalentSpend;
   const totals = publicPayload.totals;
+  const equivalent = spendEquivalences.get(day.day);
+  if (equivalent && spend && typeof spend === "object" && !Array.isArray(spend)) {
+    const candidate = { ...spend as Record<string, unknown>, ...equivalent };
+    if (isCurrentCommunityDailySpend(candidate) && totals && typeof totals === "object"
+      && !Array.isArray(totals) && (totals as Record<string, unknown>).usageEvents === candidate.usageEvents) {
+      // Only the two identity stamps change. Amounts, coverage, non-spend
+      // content and the original revision/date are preserved byte-for-byte.
+      spend = candidate;
+      publicPayload.apiEquivalentSpend = candidate;
+    }
+  }
   if (!isCurrentCommunityDailySpend(spend) || !totals || typeof totals !== "object"
       || Array.isArray(totals) || (totals as Record<string, unknown>).usageEvents !== spend.usageEvents) {
     if (!historicalSpendDays.has(day.day) || !isKernel10PublishedDailyPayload(day.payload)) {
@@ -623,13 +665,12 @@ export function createAnalyticsV2CommunityDailyRoute(
 
     const cache = previewCacheRow(read.previewText, nowMs);
     const allowanceReadState = cache === null ? "temporarily_unavailable" : "confirmed";
-    const graph = projectPublicAllowanceGraph(cache, {
+    const graph = projectPublicAllowanceGraphForGcp(cache, {
       publishedDays: days.map((day) => day.day), nowMs,
-    });
+    }, modelMetadata);
     const allowanceState = graph !== null ? "ready" : "updating";
-    const allowanceBreakdowns = graph === null ? null
-      : wrapPublicAllowanceBreakdownsV13(graph.breakdowns, modelMetadata);
-    for (const day of days) publicDayPayload(day, read.historicalSpendDays);
+    const allowanceBreakdowns = graph?.breakdowns ?? null;
+    for (const day of days) publicDayPayload(day, read.historicalSpendDays, read.spendEquivalences);
     const cacheRetention = publishableAnalyticsV2CacheRetentionSeries(
       composedCacheRetention(read.cacheWindows),
     );

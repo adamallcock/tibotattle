@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import {
   ANALYTICS_REFRESH_WORKER_ENTRY,
+  ANALYTICS_REPRICE_JOB_ENTRY,
   analyticsKernelDefines,
   computeAnalyticsKernelIdentity,
   resolveAnalyticsKernelRegistryEntry,
@@ -43,6 +44,7 @@ const options = {
     "postgres-community-graph-benchmark": COMMUNITY_GRAPH_BENCHMARK_ENTRY,
     "postgres-community-graph-readback-diagnostic": COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY,
     "analytics-refresh": ANALYTICS_REFRESH_ENTRY,
+    "analytics-reprice": ANALYTICS_REPRICE_JOB_ENTRY,
     // K-PAR: the compute Worker the refresh Job spawns (dist/ beside it).
     "analytics-refresh-worker": ANALYTICS_REFRESH_WORKER_ENTRY,
     "production-migrations": PRODUCTION_MIGRATIONS_ENTRY,
@@ -70,9 +72,9 @@ const options = {
 };
 
 // Every entry whose bundle must hash through node-host-primitives.mjs: the
-// refresh Job and its compute Worker (stored digests) and the server (auth and
+// refresh/reprice Jobs and the compute Worker (stored digests), and the server (auth and
 // session digests). assertNodeHostAlias refuses the build otherwise.
-const NODE_HOST_REQUIRED_ENTRIES = Object.freeze([ENTRY, ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY]);
+const NODE_HOST_REQUIRED_ENTRIES = Object.freeze([ENTRY, ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY]);
 
 /**
  * Refuse a bundle in which a vendored kernel file imports a workspace package
@@ -139,7 +141,7 @@ if (kernelClosureOnly) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "check",
-    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
+    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "analytics-reprice.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
     kernel,
   }));
 } else {
@@ -152,7 +154,7 @@ if (kernelClosureOnly) {
   console.log(JSON.stringify({
     status: "ok",
     mode: "build",
-    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/analytics-reprice.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
     kernel,
   }));
 }

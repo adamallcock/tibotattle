@@ -3,7 +3,7 @@ import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { readAdminGraphRefreshProgress, readAdminPreparationProgress } from "../src/admin-graph-refresh-progress";
 import { readCommunityRefreshLane, recordCommunityRefreshLane } from "../src/community-refresh-lanes";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
+import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
 import { seedModelHistoryFixture, MODEL_HISTORY_TEST_PARTICIPANT, MODEL_HISTORY_TEST_DAY } from "./helpers/model-history";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { ensurePreparedV1Window } from "../src/prepared-v1-evidence";
@@ -106,7 +106,7 @@ describe("independent owner refresh progress", () => {
     await recordCommunityRefreshLane(db(), pin, true, NOW);
     await db().prepare(`INSERT INTO admin_community_allowance_preview_cache
       (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch) VALUES(1,?,'{}',?,?)`)
-      .bind(new Date(NOW).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION, epoch).run();
+      .bind(new Date(NOW).toISOString(), COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, epoch).run();
     const before = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
     expect(before.publication).toMatchObject({ state: "ready", requestedGeneration: epoch, preparedGeneration: null, publishedGeneration: epoch });
     await db().prepare(`UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1,
@@ -118,6 +118,22 @@ describe("independent owner refresh progress", () => {
     expect((await readAdminGraphRefreshProgress(db(), NOW, "paused")).publication)
       .toMatchObject({ state: "invalidated", publishedGeneration: null });
     expect((await readAdminGraphRefreshProgress(db(), NOW, "paused")).work.state).toBe("paused");
+  });
+
+  it("does not report a calculation-stamped preview as a current derived publication", async () => {
+    const pin = await readCommunityRefreshLane(db(), "current", NOW), epoch = pin.sourceEpoch;
+    await recordCommunityRefreshLane(db(), pin, true, NOW);
+    const laneBefore = await readCommunityRefreshLane(db(), "current", NOW);
+    await db().prepare(`INSERT INTO admin_community_allowance_preview_cache
+      (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch) VALUES(1,?,'{}',?,?)`)
+      .bind(new Date(NOW).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION, epoch).run();
+    expect((await readAdminGraphRefreshProgress(db(), NOW, "resumable")).publication)
+      .toMatchObject({ state: "invalidated", publishedGeneration: null, publishedAt: null });
+    await db().prepare("UPDATE admin_community_allowance_preview_cache SET attribution_method_version=? WHERE singleton=1")
+      .bind(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
+    expect((await readAdminGraphRefreshProgress(db(), NOW, "resumable")).publication)
+      .toMatchObject({ state: "ready", publishedGeneration: epoch, publishedAt: new Date(NOW).toISOString() });
+    expect(await readCommunityRefreshLane(db(), "current", NOW)).toEqual(laneBefore);
   });
 
   it("separates transient storage errors and refuses pre-migration data", async () => {
@@ -139,7 +155,7 @@ describe("independent owner refresh progress", () => {
             const epoch=(await readCommunityRefreshLane(base,"current",NOW)).sourceEpoch;
             await base.prepare(`INSERT INTO admin_community_allowance_preview_cache
               (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch)
-              VALUES(1,?,'{}',?,?)`).bind(new Date(NOW).toISOString(),COMMUNITY_ATTRIBUTION_METHOD_VERSION,epoch).run();
+              VALUES(1,?,'{}',?,?)`).bind(new Date(NOW).toISOString(),COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,epoch).run();
             return inner.first();
           };
           const value=Reflect.get(inner,property,inner);return typeof value==="function"?value.bind(inner):value;

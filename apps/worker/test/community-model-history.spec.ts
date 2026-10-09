@@ -1,9 +1,11 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { warmCommunityModelHistory, COMMUNITY_MODEL_HISTORY_METHOD, MODEL_HISTORY_CENSUS_SQL } from "../src/community-model-history";
+import { warmCommunityModelHistory, readCommunityModelHistoryProgress,
+  COMMUNITY_MODEL_HISTORY_METHOD, MODEL_HISTORY_CENSUS_SQL } from "../src/community-model-history";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, validCompleteCachedComposition } from "../src/community-allowance";
+import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
+  validCompleteCachedComposition } from "../src/community-allowance";
 import { MODEL_HISTORY_METHOD_VERSION, type V1ModelComposition } from "../src/quota-analysis-v1";
 import { createV11DeviceFixture, makeV11Day, stageV11Day } from "./helpers/telemetry-v11";
 import { MODEL_HISTORY_TEST_DAY, seedModelHistoryFixture, insertModelHistoryRecords, modelHistorySourceInput } from "./helpers/model-history";
@@ -111,7 +113,7 @@ async function snapshot(day = DAY, history: string | null = COMMUNITY_MODEL_HIST
   await db().prepare(`INSERT INTO community_model_composition_days
     (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch,history_method_version)
     VALUES(?,?,?, ?, (SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id=1), ?)`)
-    .bind(day, payload, TIME, COMMUNITY_ATTRIBUTION_METHOD_VERSION, history).run();
+    .bind(day, payload, TIME, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, history).run();
 }
 
 async function dayRow(day = DAY) {
@@ -171,7 +173,7 @@ describe("historical model warmer and retrospective publication", () => {
     await db().prepare(`INSERT INTO community_model_composition_days
       (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch)
       VALUES(?,'{"synthetic":"pre-migration-forward"}',?,?,0)`)
-      .bind(DAY, TIME, COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+      .bind(DAY, TIME, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).run();
     const forward = await dayRow();
     const before = await currentCaches();
     const run = await warm();
@@ -204,6 +206,21 @@ describe("historical model warmer and retrospective publication", () => {
     expect(complete.observation.queries.some(sql => sql.includes("telemetry_v1_records"))).toBe(false);
     expect(row!.payload_json).not.toContain("history-a");
     expect(row!.payload_json).not.toContain("history-b");
+  });
+
+  it("recomputes a calculation-stamped model day before counting it as the current projection", async () => {
+    await participant("history-projection-method"); await cache("history-projection-method");
+    await snapshot(DAY, COMMUNITY_MODEL_HISTORY_METHOD, '{"synthetic":"obsolete-projection"}');
+    await db().prepare("UPDATE community_model_composition_days SET attribution_method_version=? WHERE day=?")
+      .bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION, DAY).run();
+    expect(await readCommunityModelHistoryProgress(db(), NOW)).toMatchObject({ resolvedDays: 0, activeDay: DAY });
+    const run = await warm(40);
+    expect(run.progress).toMatchObject({ day: DAY, requiredAccounts: 1, resolvedAccounts: 1, publishedDays: 1 });
+    const row = await db().prepare("SELECT attribution_method_version,payload_json FROM community_model_composition_days WHERE day=?")
+      .bind(DAY).first<{ attribution_method_version: string; payload_json: string }>();
+    expect(row?.attribution_method_version).toBe(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION);
+    expect(JSON.parse(row!.payload_json)).toMatchObject({ day: DAY, values: [["gpt-6-astra", 1000, 1]], fittedParticipantCount: 1 });
+    expect(await readCommunityModelHistoryProgress(db(), NOW)).toMatchObject({ resolvedDays: 1 });
   });
 
   it("does not let unrelated physical participants exhaust the contributor census", async () => {

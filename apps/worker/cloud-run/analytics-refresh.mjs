@@ -204,7 +204,7 @@
 import { readWorkerProfileSettings, createWorkerProfileCoordinator, startWorkerProfile, PROFILE_WORK_PHASES } from "./analytics-refresh-worker-profile.mjs";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getHeapStatistics } from "node:v8";
 import { Connector } from "@google-cloud/cloud-sql-connector";
@@ -1836,4 +1836,7 @@ async function main() {
   }
 }
 
-if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) await main();
+// An imported entry is bundled at the importing Job's URL. Its helpers must
+// not start a second CLI when, for example, analytics-reprice runs.
+if (basename(fileURLToPath(import.meta.url)) === `${ANALYTICS_REFRESH_ENTRY}.mjs`
+    && resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) await main();

@@ -4,7 +4,7 @@
  * Build the audited Cloud Run host context. The host is a Node composition
  * root around the existing Worker handlers; it must never be built from the
  * dirty repository root. Only the host, Worker source, the vendored d43c8f92
- * analytics kernels and the analytics-refresh Job, the MP-2-lite maintenance
+ * analytics kernels, the analytics-refresh and saved-cohort reprice Jobs, the MP-2-lite maintenance
  * Job and the production configuration it reads, the CR-6/CR-7 production
  * host composition, the route-family contract the admin route modules
  * import, canonical migrations,
@@ -40,8 +40,8 @@ const SECRET_PATH_PARTS = new Set([
   "credentials.json",
   "service-account.json",
 ]);
-const EXPECTED_PRIMARY_MIGRATION_COUNT = 76;
-const EXPECTED_PRIMARY_MIGRATION_TAIL = "0076_classification_correction_links.sql";
+const EXPECTED_PRIMARY_MIGRATION_COUNT = 77;
+const EXPECTED_PRIMARY_MIGRATION_TAIL = "0077_analytics_v2_reprice.sql";
 const SKIPPED_DIRECTORY_NAMES = new Set([
   ".git",
   ".wrangler",
@@ -110,6 +110,7 @@ const BASE_ALLOWLIST = Object.freeze([
   Object.freeze({ source: "cloud-run/owner-bootstrap.mjs", destination: "apps/worker/cloud-run/owner-bootstrap.mjs" }),
   Object.freeze({ source: "cloud-run/request-boundary.mjs", destination: "apps/worker/cloud-run/request-boundary.mjs" }),
   Object.freeze({ source: "cloud-run/analytics-refresh.mjs", destination: "apps/worker/cloud-run/analytics-refresh.mjs" }),
+  Object.freeze({ source: "cloud-run/analytics-reprice.mjs", destination: "apps/worker/cloud-run/analytics-reprice.mjs" }),
   // K-CORE-A: the refresh Job's read side (K-SPLIT), its compute Worker pool
   // and Worker entry (K-PAR), and the build-time kernel identity (K-STAMP).
   Object.freeze({ source: "cloud-run/analytics-refresh-read.mjs", destination: "apps/worker/cloud-run/analytics-refresh-read.mjs" }),

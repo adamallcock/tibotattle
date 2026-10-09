@@ -225,6 +225,26 @@ export async function writeAnalyticsV2OwnerSets(client: PostgresClient, schema: 
                 price_basis_id integer, price_kernel_id smallint, first_revision integer, run_id uuid,
                 kernel_id smallint, manifest_version integer)`,
     contributionRows, "dailyContributions");
+  // Preserve only genuine same-run/kernel input associations when this
+  // publication appends a version. A legacy caller without a price row
+  // cannot invent one from daily sums; later repricing explicitly refuses it.
+  if (contributionRows.length > 0) {
+    await client.query(`INSERT INTO ${relation(schema, "analytics_v2_contribution_price_inputs")}
+      (day,owner_digest,version,values_sha256,projection_version,codec,inputs,inputs_sha256,
+       source_inputs_sha256,input_events,run_id,kernel_id)
+      SELECT c.day,c.owner_digest,c.version,c.values_sha256,p.projection_version,p.codec,p.inputs,p.inputs_sha256,
+        p.inputs_sha256,p.input_events,c.run_id,c.price_kernel_id
+      FROM ${relation(schema,tables.dailyContributions)} c
+      JOIN ${relation(schema,tables.ownerDayPrice)} p ON p.day=c.day AND p.owner_digest=c.owner_digest
+        AND p.run_id=c.run_id AND p.kernel_id=c.price_kernel_id
+      WHERE c.run_id=$1::uuid
+        AND EXISTS(SELECT 1 FROM jsonb_to_recordset($2::jsonb) AS key(day date,owner_digest text,version integer)
+          WHERE key.day=c.day AND key.owner_digest=c.owner_digest AND key.version=c.version)
+      ON CONFLICT DO NOTHING`, [runId,JSON.stringify(contributionRows.map((raw) => {
+        const row = raw as { day: string; owner_digest: string; version: number };
+        return { day: row.day,owner_digest: row.owner_digest,version: row.version };
+      }))]);
+  }
   return Object.freeze({
     ...fold,
     membersAdded: setRows.length,

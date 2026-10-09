@@ -1,4 +1,4 @@
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, communityAnalysisCacheVersion } from "./community-allowance";
+import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, communityAnalysisCacheVersion } from "./community-allowance";
 import { readCommunityModelHistoryProgress } from "./community-model-history";
 import { communityRefreshLaneMethod } from "./community-refresh-lanes";
 import { ApiError } from "./errors";
@@ -58,7 +58,7 @@ export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: numbe
         AND p.source_mutation_epoch<=s.mutation_epoch
       LEFT JOIN community_refresh_lanes c ON c.lane='current'
       LEFT JOIN community_refresh_lanes d ON d.lane='daily'
-      WHERE s.singleton_id=1`).bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION).first<{
+      WHERE s.singleton_id=1`).bind(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION).first<{
         mutation_epoch: number; graph_invalidation_epoch: number;
         graph_last_change_reason: string | null; graph_last_change_at: string | null; graph_last_invalidated_at: string | null;
         source_mutation_epoch: number | null; generated_at: string | null;
@@ -74,7 +74,7 @@ export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: numbe
       FROM community_snapshot_mutation_control s LEFT JOIN admin_community_allowance_preview_cache p ON p.singleton=1
         AND p.attribution_method_version=?1 AND p.source_mutation_epoch>=s.graph_invalidation_epoch
         AND p.source_mutation_epoch<=s.mutation_epoch WHERE s.singleton_id=1`)
-      .bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+      .bind(COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION)
       .first<{ mutation_epoch: number; source_mutation_epoch: number | null; generated_at: string | null }>();
     if (!history || after?.mutation_epoch !== row.mutation_epoch
       || after.source_mutation_epoch !== row.source_mutation_epoch || after.generated_at !== row.generated_at) {

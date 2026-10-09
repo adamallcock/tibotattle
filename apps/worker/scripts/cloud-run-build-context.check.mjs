@@ -11,7 +11,7 @@ const WORKER = resolve(import.meta.dirname, "..");
 const NODE = process.execPath;
 const invoke = (args, cwd) => spawnSync(NODE, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 1024 * 1024 });
 
-test("generated context carries profiler runtime closure, excludes its fixtures and builds all actual entries", { timeout: 90_000 }, async () => {
+test("generated context carries profiler and reprice runtime closure, excludes fixtures and builds all actual entries", { timeout: 90_000 }, async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-profiler-context-check-")));
   const output = join(root, "context"), cloud = join(output, "apps/worker/cloud-run");
   try {
@@ -19,14 +19,14 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     assert.equal(generated.status, 0, generated.stderr);
     const receipt = JSON.parse(generated.stdout);
     assert.equal(receipt.mode, "create");
-    assert.equal(receipt.primaryMigrations, 76);
+    assert.equal(receipt.primaryMigrations, 77);
     assert.deepEqual(await readFile(join(output, "apps/worker/catalog/manifest-0001.json")),
       await readFile(join(WORKER, "catalog/manifest-0001.json")));
     await assert.rejects(access(join(output, "apps/worker/catalog/manifest-0002.json")), { code: "ENOENT" });
-    const runtime = ["analytics-refresh-profile.mjs", "analytics-refresh-worker-profile.mjs", "analytics-refresh-allocation-profile.mjs", "analytics-refresh-memory-profile.mjs"];
+    const runtime = ["analytics-refresh-profile.mjs", "analytics-refresh-worker-profile.mjs", "analytics-refresh-allocation-profile.mjs", "analytics-refresh-memory-profile.mjs", "analytics-reprice.mjs"];
     for (const name of runtime) assert.deepEqual(await readFile(join(cloud, name)), await readFile(join(WORKER, "cloud-run", name)), name);
     const fixtures = ["analytics-refresh-profile.check.mjs", "analytics-refresh-worker-profile.check.mjs", "analytics-refresh-allocation-profile.check.mjs",
-      "analytics-refresh-allocation-conformance.mjs", "analytics-refresh-memory-profile.check.mjs", "analytics-refresh-allocation-integration.check.mjs"];
+      "analytics-refresh-allocation-conformance.mjs", "analytics-refresh-memory-profile.check.mjs", "analytics-refresh-allocation-integration.check.mjs", "analytics-reprice.check.mjs"];
     for (const name of fixtures) await assert.rejects(access(join(cloud, name)), { code: "ENOENT" });
     const { readWorkerProfileSettings } = await import(pathToFileURL(join(cloud, "analytics-refresh-worker-profile.mjs")));
     for (const mode of [null, "ALLOCATION", "MEMORY"]) {
@@ -42,11 +42,19 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     const built = invoke(["build.mjs"], cloud);
     assert.equal(built.status, 0, built.stderr);
     const entries = ["server", "oauth-gateway", "test-migrations", "test-activation", "postgres-community-graph-benchmark",
-      "postgres-community-graph-readback-diagnostic", "analytics-refresh", "analytics-refresh-worker", "production-migrations",
+      "postgres-community-graph-readback-diagnostic", "analytics-refresh", "analytics-refresh-worker", "analytics-reprice", "production-migrations",
       "postgres-maintenance-job", "ops-runtime-probe-job", "ops-backup-audit-job"];
     for (const name of entries) assert.ok((await readFile(join(cloud, "dist", `${name}.mjs`))).length > 0, name);
-    const help = invoke(["dist/analytics-refresh.mjs", "--help"], cloud);
-    assert.equal(help.status, 0, help.stderr);
+    // Bundling an imported CLI must not also run its main function. Compare exact
+    // output, so refresh help plus reprice help cannot pass on exit status alone.
+    for (const [name, usage] of [["analytics-refresh", "ANALYTICS_REFRESH_USAGE"],
+      ["analytics-reprice", "ANALYTICS_REPRICE_USAGE"]]) {
+      const source = await import(pathToFileURL(join(cloud, `${name}.mjs`)));
+      const help = invoke([`dist/${name}.mjs`, "--help"], cloud);
+      assert.equal(help.status, 0, help.stderr);
+      assert.equal(help.stdout, source[usage], name);
+      assert.equal(help.stderr, "", name);
+    }
     // The Docker CLI's --check-source intentionally uses /app. Exercise its
     // exported reader against the actual copied migrations through the existing adapter.
     const benchmark = await import(pathToFileURL(join(cloud, "dist/postgres-community-graph-benchmark.mjs")));
@@ -54,10 +62,10 @@ test("generated context carries profiler runtime closure, excludes its fixtures 
     const migrations = await benchmark.readPostgresCommunityGraphBenchmarkMigrations({
       readMigrations: ({ role }) => readPostgresMigrations({ role, rootDirectory: join(output, "apps/worker/postgres/migrations") }),
     });
-    assert.equal(migrations.length, 76);
-    assert.equal(migrations.at(-1).name, "0076_classification_correction_links.sql");
+    assert.equal(migrations.length, 77);
+    assert.equal(migrations.at(-1).name, "0077_analytics_v2_reprice.sql");
     console.log(JSON.stringify({ contextFiles: receipt.fileCount, sourceContentDigest: receipt.sourceContentDigest,
-      runtimeProfilerFiles: runtime.length, excludedProfilerFixtures: fixtures.length, builtEntries: entries.length,
+      runtimeFiles: runtime.length, excludedFixtures: fixtures.length, builtEntries: entries.length,
       diagnosticCloudRefusal: true, actualContextBuild: true }));
   } finally { await rm(root, { recursive: true, force: true }); }
 });

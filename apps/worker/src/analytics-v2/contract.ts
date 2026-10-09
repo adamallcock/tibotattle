@@ -82,6 +82,7 @@ export const ANALYTICS_V2_TABLES = Object.freeze({
   // frozen-window bootstrap receipt (owner-set-contract below).
   dailyOwnerSets: "analytics_v2_daily_owner_sets",
   dailyContributions: "analytics_v2_daily_contributions",
+  contributionPriceInputs: "analytics_v2_contribution_price_inputs",
   ownerSetBootstrap: "analytics_v2_daily_owner_set_bootstrap",
 } as const);
 export type AnalyticsV2TableKey = keyof typeof ANALYTICS_V2_TABLES;
@@ -148,6 +149,10 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
     "stable_values_sha256", "devices", "price_basis_id", "price_kernel_id", "first_revision", "run_id",
     "kernel_id", "manifest_version",
   ] as const),
+  contributionPriceInputs: Object.freeze([
+    "day", "owner_digest", "version", "values_sha256", "projection_version", "codec", "inputs",
+    "inputs_sha256", "source_inputs_sha256", "input_events", "run_id", "kernel_id",
+  ] as const),
   ownerSetBootstrap: Object.freeze([
     "day", "provenance", "set_size", "frozen_participants", "frozen_export_sha256", "frozen_from_day",
     "frozen_through_day", "first_revision", "run_id", "kernel_id", "manifest_version",
@@ -174,13 +179,15 @@ export const ANALYTICS_V2_PRIMARY_KEYS = Object.freeze({
   transitionStale: Object.freeze(["transition_id", "owner_digest", "day"] as const),
   dailyOwnerSets: Object.freeze(["day", "owner_digest"] as const),
   dailyContributions: Object.freeze(["day", "owner_digest", "version"] as const),
+  contributionPriceInputs: Object.freeze(["day", "owner_digest", "version"] as const),
   ownerSetBootstrap: Object.freeze(["day"] as const),
 } as const satisfies Record<AnalyticsV2TableKey, readonly string[]>);
 
 /**
  * The offline owner purge's analytics_v2 inventory: every table that holds
  * an owner's rows, keyed by its owner_digest column, in the order the purge
- * deletes them (a contribution before its set row, which it references). The
+ * deletes them (archived inputs before their contribution, and a contribution
+ * before its set row, which it references). The
  * running service never removes an owner (owner decision D2, Variant B): it
  * replaces only a computed owner's derived rows inside the run's horizon
  * (store-derived.ts), and never deletes a saved set or contribution. The
@@ -203,6 +210,7 @@ export const ANALYTICS_V2_OWNER_SCOPED_TABLES = Object.freeze([
   "cacheBands",
   "ownerFits",
   "ownerModelDates",
+  "contributionPriceInputs",
   "dailyContributions",
   "dailyOwnerSets",
 ] as const satisfies readonly AnalyticsV2TableKey[]);

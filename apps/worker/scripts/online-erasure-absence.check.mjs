@@ -46,12 +46,14 @@ const NOT_PRODUCTION = /(?:\.(?:check|spec|test)\.[cm]?[jt]s|\.d\.ts)$/u;
 export const OFFLINE_PURGE_SETTING = "analytics_v2_offline_purge";
 /**
  * The tables only the offline purge deletes from, with their contract.ts
- * ANALYTICS_V2_TABLES keys: the saved owner sets and contributions (the
- * setting's trigger) and the per-day receipt (never deleted).
+ * ANALYTICS_V2_TABLES keys: the saved owner sets, contributions and archived
+ * contribution pricing inputs (the setting's trigger), and the per-day
+ * receipt (never deleted).
  */
 export const PURGE_ONLY_TABLES = Object.freeze({
   dailyOwnerSets: "analytics_v2_daily_owner_sets",
   dailyContributions: "analytics_v2_daily_contributions",
+  contributionPriceInputs: "analytics_v2_contribution_price_inputs",
   ownerSetBootstrap: "analytics_v2_daily_owner_set_bootstrap",
 });
 const PURGE_INVENTORY = "ANALYTICS_V2_OWNER_SCOPED_TABLES";
@@ -276,6 +278,8 @@ if (process.argv.includes("--print")) {
       'await client.query(`DELETE FROM "s".analytics_v2_daily_owner_sets WHERE day = $1`);',
       "for (const key of ANALYTICS_V2_OWNER_SCOPED_TABLES) await client.query(`delete from ${relation(schema, key)}`);",
       "const table = tables.ownerSetBootstrap; await client.query(`DELETE FROM ${table}`);",
+      "await client.query(`DELETE FROM ${relation(schema, tables.contributionPriceInputs)} WHERE owner_digest = $1`);",
+      'await client.query(`DELETE FROM "s".analytics_v2_contribution_price_inputs WHERE owner_digest = $1`);',
     ]) {
       const path = "src/analytics-v2/retire.ts";
       assert.deepEqual(purge(path, text)[path], { "saved-set delete": 1 }, text);
@@ -326,6 +330,22 @@ if (process.argv.includes("--print")) {
     for (const [key, table] of Object.entries(PURGE_ONLY_TABLES)) {
       assert.match(contract, new RegExp(String.raw`\b${key}: "${table}"`, "u"), key);
     }
+  });
+
+  test("archived contribution inputs have the offline-only delete guard and precede contributions in the purge", async () => {
+    const sql = await readFile(join(WORKER_ROOT, "postgres", "migrations", "primary",
+      "0077_analytics_v2_reprice.sql"), "utf8");
+    const table = PURGE_ONLY_TABLES.contributionPriceInputs;
+    assert.match(sql, new RegExp(String.raw`BEFORE UPDATE OR DELETE\s+ON ${table}\s+FOR EACH ROW EXECUTE FUNCTION analytics_v2_owner_sets_append_only\(\)`, "u"));
+    assert.match(sql, new RegExp(String.raw`BEFORE TRUNCATE\s+ON ${table}\s+FOR EACH STATEMENT EXECUTE FUNCTION analytics_v2_owner_sets_no_truncate\(\)`, "u"));
+    assert.match(sql, /FOREIGN KEY\s*\(day,\s*owner_digest,\s*version\) REFERENCES analytics_v2_daily_contributions\(day,\s*owner_digest,\s*version\)\s+ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED/u);
+    const contract = await readFile(join(WORKER_ROOT, "src", "analytics-v2", "contract.ts"), "utf8");
+    const inventory = contract.match(/ANALYTICS_V2_OWNER_SCOPED_TABLES = Object\.freeze\(\[([\s\S]*?)\]/u)?.[1];
+    assert.ok(inventory, "shared owner-scoped inventory exists");
+    const ordered = [...inventory.matchAll(/"(\w+)"/gu)].map(([, key]) => key);
+    assert.equal(ordered.filter((key) => key === "contributionPriceInputs").length, 1);
+    assert.ok(ordered.indexOf("contributionPriceInputs") < ordered.indexOf("dailyContributions"),
+      "archive is purged before its referenced contribution");
   });
 
   test("the scan reads a temporary copy", async () => {

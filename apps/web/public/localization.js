@@ -115,7 +115,11 @@ function interpolate(message, values = {}) {
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
-    .filter((key) => key.startsWith("allowance.")
+    .filter((key) => key.startsWith("community.allowance.pro10.")
+      || key === "community.allowance.planOwnWeekCaption"
+      || key === "community.allowance.planOwnWeekChartDescription"
+      || key === "community.allowance.basisTransition"
+      || key.startsWith("allowance.")
       || key.startsWith("trends.")
       || key.startsWith("contribution.")
       || key.startsWith("continuityConsent.")

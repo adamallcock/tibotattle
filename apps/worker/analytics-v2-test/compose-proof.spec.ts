@@ -1,7 +1,8 @@
 // Composition proof: every public /api/v1/community/daily output can be built
-// from effective occurrences in ONE Node process using only the vendored
-// d43c8f92 kernels (through vendor/analytics-d43c8f92/entry.ts), with no D1 and
-// no Worker runtime, and the website's own d43c8f92 normalizer accepts it.
+// from effective occurrences in ONE Node process using the reviewed vendored
+// kernels (stable path vendor/analytics-d43c8f92/entry.ts), with no D1 or
+// Worker runtime. The frozen website normalizer accepts the legacy allowance
+// wire contract; current pricing identity is checked separately below.
 // Synthetic, content-free owners only.
 import { createHash } from "node:crypto";
 import { canonicalTelemetryV11Json as gcpLineCanonicalJson } from "@app-usagemonitor/telemetry-contract";
@@ -50,8 +51,11 @@ const CALENDAR_DAYS = 170;
 const MODEL_DATES = 70;
 const ACTIVE_DAYS_BACK = [0, 1, 2, 9, 20, 45, 80];
 /** sha256 of JSON.stringify of the composed envelope and preview for this corpus. */
-const COMPOSED_RESPONSE_SHA256 = "2737d60661d0392b19ccc368b62bdb7ba3c8f14ead2241a28d30d6914ee84390";
-const COMPOSED_PREVIEW_SHA256 = "f04259f71d4e2a34bddaa92f306687d051fd8c3ac082f012dcec80e8fd7af6d2";
+const HISTORICAL_RESPONSE_SHA256 = "2737d60661d0392b19ccc368b62bdb7ba3c8f14ead2241a28d30d6914ee84390";
+const COMPOSED_RESPONSE_SHA256 = "1428371ee626e14f63e2d57720712fdad8dd7221f81888e521ce356e61963d80";
+const HISTORICAL_REGISTRY_SHA256 = "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9";
+const HISTORICAL_PREVIEW_SHA256 = "f04259f71d4e2a34bddaa92f306687d051fd8c3ac082f012dcec80e8fd7af6d2";
+const COMPOSED_PREVIEW_SHA256 = "188d462a76d1f909d0d875ba62e12aceb88e5505f2e990ff42c5cedea82f7913";
 const stamp = (at: number) => new Date(at).toISOString();
 const label = (at: number) => stamp(at).slice(0, 10);
 const dayMs = (day: string) => Date.parse(`${day}T00:00:00.000Z`);
@@ -230,7 +234,7 @@ async function compose() {
   return { calendar, publishedDays, fits, modelDays, preview, graph, bandRows, cacheRetention, response };
 }
 
-describe("one-process composition over the vendored d43c8f92 kernels", () => {
+describe("one-process composition over the reviewed vendored kernels", () => {
   it("resolves the kernels' packages to the d43c8f92 copies, not this checkout's", () => {
     // entry.ts re-exports the vendored telemetry-contract; this spec's own import
     // resolves normally. One module instance would mean the vendor scoping failed.
@@ -266,7 +270,34 @@ describe("one-process composition over the vendored d43c8f92 kernels", () => {
     const second = await compose();
     expect(digest(second.response)).toBe(digest(response));
     expect(digest(second.preview)).toBe(digest(preview));
+    // The reviewed re-vendor changed pricing identity from kernel10/v0.5 to
+    // v0.6. This standard-speed corpus keeps its exact previous dollar values:
+    // restoring ONLY the two historical price stamps must reproduce the whole
+    // original envelope pin. Numeric pricing, coverage and non-spend changes
+    // cannot pass this assertion by merely replacing the current digest.
+    const historicalIdentity = structuredClone(response);
+    for (const day of historicalIdentity.days) {
+      const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
+      expect(spend.pricingMethodVersion).toBe("server-api-price-equivalent-v0.6");
+      expect(spend.registrySha256).toBe("d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d");
+      spend.pricingMethodVersion = "server-api-price-equivalent-v0.5";
+      spend.registrySha256 = HISTORICAL_REGISTRY_SHA256;
+    }
+    expect(digest(historicalIdentity)).toBe(HISTORICAL_RESPONSE_SHA256);
     expect(digest(response)).toBe(COMPOSED_RESPONSE_SHA256);
+    // The same reviewed re-vendor appended Sol to the model catalog. Restoring
+    // only the exact old 42-model prefix/catalog stamp must preserve every
+    // original estimate, supporting count, date and plan normalization byte.
+    expect(preview.models.modelConfig).toHaveLength(43);
+    expect(preview.models.modelConfig[42]!.modelId).toBe("gpt-6.1-sol");
+    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-09-29.1"
+      && day.values.every(([modelId]) => modelId !== "gpt-6.1-sol"))).toBe(true);
+    const historicalCatalog = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 42),
+      days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-23.1" })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(historicalCatalog, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(digest(historicalCatalog)).toBe(HISTORICAL_PREVIEW_SHA256);
     expect(digest(preview)).toBe(COMPOSED_PREVIEW_SHA256);
     console.log(JSON.stringify({ composeProof: { responseSha256: digest(response), previewSha256: digest(preview),
       responseBytes: JSON.stringify(response).length } }));

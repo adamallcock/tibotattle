@@ -11,7 +11,7 @@
 //
 // Schema: the full promoted primary chain through the production runner,
 // which carries A-3's 0059_analytics_v2.sql and ends at the promoted tail
-// 0073_analytics_v2_owner_sets.sql (both asserted). 0059 keeps
+// 0077_analytics_v2_reprice.sql (both asserted). 0059 keeps
 // published heads append-only, so published rows are seeded once and never
 // updated or deleted; scenarios vary only the preview and cache rows.
 //
@@ -29,10 +29,15 @@ import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { defaultAnalyticsV2FixtureStamps, postgresTestEndpoint } from "./staged-migrations-harness.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "../cloud-run/origin-route-modules.mjs";
 import { VENDORED_PACKAGE_ENTRIES, usesVendoredPackages } from "../vitest.analytics-v2.config.mjs";
+import { dayMs, quota, syntheticOwner } from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const A3_MIGRATION = "0059_analytics_v2.sql";
-const PRIMARY_TAIL = "0073_analytics_v2_owner_sets.sql";
+const PRIMARY_TAIL = "0077_analytics_v2_reprice.sql";
+// Genuine registered build identity for the optional completed-equivalence
+// read. Unbundled production sources correctly withhold that proof.
+const BUNDLED_KERNEL = JSON.parse(readFileSync(resolve(WORKER_ROOT,
+  "src/analytics-v2/kernel-registry.json"), "utf8")).kernels.at(-1);
 
 const NOW_MS = Date.parse("2026-10-01T12:00:00.000Z");
 const GENERATED_AT = "2026-10-01T12:00:00.000Z";
@@ -68,6 +73,10 @@ async function loadModules() {
     server: { middlewareMode: true },
     appType: "custom",
     logLevel: "silent",
+    define: {
+      __ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__: JSON.stringify(BUNDLED_KERNEL.computeClosureSha256),
+      __ANALYTICS_V2_VENDOR_MANIFEST_SHA256__: JSON.stringify(BUNDLED_KERNEL.vendorManifestSha256),
+    },
     plugins: [{
       name: "analytics-v2-vendored-packages",
       enforce: "pre",
@@ -83,12 +92,19 @@ async function loadModules() {
   return {
     route: await vite.ssrLoadModule("/src/analytics-v2/community-daily-route.ts"),
     v13: await vite.ssrLoadModule("/src/analytics-v2/public-allowance-breakdowns-v13.ts"),
+    v14: await vite.ssrLoadModule("/src/analytics-v2/public-allowance-breakdowns-v14.ts"),
+    projection: await vite.ssrLoadModule("/src/analytics-v2/allowance-projection.ts"),
+    kernel: await vite.ssrLoadModule("/src/analytics-v2/kernel.ts"),
+    repriceRead: await vite.ssrLoadModule("/src/analytics-v2/reprice-read.ts"),
+    repriceStore: await vite.ssrLoadModule("/src/analytics-v2/reprice-store.ts"),
+    ownerSets: await vite.ssrLoadModule("/src/analytics-v2/owner-sets.ts"),
     cacheWindows: await vite.ssrLoadModule("/src/analytics-v2/cache-windows-sql.ts"),
     canonical: await vite.ssrLoadModule("/src/canonical-json.ts"),
     routeRegistry: await vite.ssrLoadModule("/src/route-registry.ts"),
     kernels: await vite.ssrLoadModule("/vendor/analytics-d43c8f92/entry.ts"),
     cacheValues: await vite.ssrLoadModule("/vendor/analytics-d43c8f92/apps/worker/src/cache-retention-values.ts"),
     contract: await vite.ssrLoadModule("/vendor/analytics-d43c8f92/packages/telemetry-contract/index.js"),
+    currentContract: await vite.ssrLoadModule("@app-usagemonitor/telemetry-contract"),
   };
 }
 
@@ -136,9 +152,9 @@ async function seedRun() {
   return id;
 }
 
-async function insert(table, row) {
+async function insert(table, row, client = pool) {
   const names = Object.keys(row);
-  await pool.query(`INSERT INTO ${q(table)} (${names.map((name) => `"${name}"`).join(", ")})
+  await client.query(`INSERT INTO ${q(table)} (${names.map((name) => `"${name}"`).join(", ")})
     VALUES (${names.map((_, index) => `$${index + 1}`).join(", ")})`, Object.values(row));
 }
 
@@ -226,10 +242,10 @@ function publishedRows() {
   ].map(({ corrupt, ...spec }) => ({ ...spec, corrupt, payload: dailyPayload(spec) }));
 }
 
-function modelDay(day, values) {
-  const value = modules.contract.projectAdminModelHistoryDay({
+function modelDay(day, values, contract = modules.contract) {
+  const value = contract.projectAdminModelHistoryDay({
     day,
-    catalogVersion: modules.contract.ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    catalogVersion: contract.ADMIN_MODEL_HISTORY_CATALOG_VERSION,
     values,
     fittedParticipantCount: 1,
     unstableParticipantCount: 0,
@@ -257,6 +273,26 @@ function preview() {
     days: [
       modelDay("2026-09-29", [["gpt-6-sol", 900, 1]]),
       modelDay("2026-09-30", [["gpt-6-astra", 1_166, 1], ["gpt-6-sol", 1_000, 1]]),
+    ],
+  });
+}
+
+/** The same raw owner fits, projected by the current Pro10x contract. */
+function currentPreview() {
+  const { projection } = modules;
+  return projection.buildAdminCommunityAllowancePreview([
+    { participantId: "synthetic-participant-pro", planType: "pro",
+      capacityNanousd: 1_200_000_000_000, lastObservedAt: "2026-09-30T12:00:00.000Z" },
+    { participantId: "synthetic-participant-plus", planType: "plus",
+      capacityNanousd: 60_000_000_000, lastObservedAt: "2026-09-29T12:00:00.000Z" },
+  ], NOW_MS, undefined, {
+    modelConfig: projection.ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+    basis: projection.ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+    gate: projection.ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+    days: [
+      // Model tuples are explicit already-normalized synthetic values.
+      modelDay("2026-09-29", [["gpt-6-sol", 900, 1]], modules.currentContract),
+      modelDay("2026-09-30", [["gpt-6-astra", 1_166, 1], ["gpt-6-sol", 1_000, 1]], modules.currentContract),
     ],
   });
 }
@@ -508,6 +544,28 @@ function expectedAllowanceBreakdowns() {
   };
 }
 
+/** Hand-derived current contract; the legacy expected HTTP bytes stay frozen. */
+function expectedCurrentAllowanceBreakdowns() {
+  const legacy = expectedAllowanceBreakdowns();
+  return {
+    ...legacy,
+    schemaVersion: "community-allowance-breakdowns-v1.4",
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
+    normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+    days: legacy.days.map((day, index) => ({
+      ...day,
+      combined: index === 0 ? EMPTY_SUMMARY : { ...day.combined, centralUsd: index === 1 ? 600 : 900 },
+      byPlanType: {
+        pro: day.byPlanType.pro,
+        prolite: EMPTY_SUMMARY,
+        promax: EMPTY_SUMMARY,
+        plus: index === 0 ? EMPTY_SUMMARY : { ...day.byPlanType.plus, centralUsd: 600 },
+      },
+    })),
+  };
+}
+
 /** Production's served payload: canonical key order, private and stale fields removed. */
 function expectedDay(row, { keepSpend }) {
   const payload = { ...row.payload };
@@ -652,6 +710,48 @@ test("breakdowns v1.3: only the declared relabel and catalog-baseline block diff
   assert.ok([...servedIds].every((id) => named.has(id)));
   assert.equal(named.has("gpt-5.3-codex-spark"), false);
   assert.equal(named.has("gpt-5.5"), false);
+});
+
+test("breakdowns v1.4: real current preview changes plan amounts and preserves the other HTTP bytes", { skip }, async () => {
+  await reseed({ previewValue: currentPreview() });
+  const { response, text } = await get(`?from=${FROM}&to=${TO}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "public, max-age=300");
+  const expected = { ...expectedResponse(), allowanceBreakdowns: expectedCurrentAllowanceBreakdowns() };
+  assert.equal(text, JSON.stringify(expected));
+  const { base, metadata } = modules.v14.reducePublicAllowanceBreakdownsV14(JSON.parse(text).allowanceBreakdowns);
+  assert.deepEqual(metadata, expectedModelConfig());
+  assert.equal(base.schemaVersion, "community-allowance-breakdowns-v1.2");
+  assert.deepEqual(base.days[2].byPlanType.promax, EMPTY_SUMMARY);
+  for (const secret of [OWNER_A, OWNER_B, "synthetic-participant", "capacityByPlanType"]) {
+    assert.equal(text.includes(secret), false, secret);
+  }
+});
+
+test("mixed or malformed preview meaning withholds breakdowns while preserving published days", { skip }, async () => {
+  const legacy = preview(), current = currentPreview();
+  const malformed = structuredClone(current);
+  malformed.days.at(-1).combined.centralUsd = -1;
+  for (const previewValue of [
+    { ...current, schemaVersion: legacy.schemaVersion },
+    { ...current, basis: legacy.basis },
+    { ...legacy, schemaVersion: current.schemaVersion },
+    { ...legacy, plans: current.plans },
+    { ...current, participantId: "synthetic-private-field" },
+    malformed,
+  ]) {
+    await reseed({ previewValue });
+    const { response, text } = await get(`?from=${FROM}&to=${TO}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = JSON.parse(text);
+    assert.equal(body.allowanceReadState, "temporarily_unavailable");
+    assert.equal(body.allowanceState, "updating");
+    assert.equal("allowanceBreakdowns" in body, false);
+    assert.deepEqual(body.days, expectedResponse().days);
+    assert.deepEqual(body.cacheRetention, expectedCacheRetention());
+    assert.equal(text.includes("synthetic-private-field"), false);
+  }
 });
 
 test("(b) bad parameters are 400 BODY_INVALID in the production error envelope", { skip }, async () => {
@@ -881,4 +981,112 @@ test("the all window has no lower bound: a band 400 days old counts there and no
   assert.equal(/WHERE/u.test(allSql), false, "the all-window aggregate reads every stored day");
   assert.equal(modules.cacheWindows.analyticsV2CacheWindowFromDay(NOW_MS, null), null);
   await reseed();
+});
+
+test("completed repricing equivalence restores only spend stamps; source/exclusion drift withholds it", { skip }, async () => {
+  // A quota-only saved member needs no price input document. This still goes
+  // through the real bounded plan/execute store and its completed SQL receipt.
+  const day = "2026-09-26", releasedAt = "2026-09-27T03:00:00.000Z";
+  const owner = syntheticOwner(3), historicalRegistry = "a".repeat(64);
+  const record = JSON.parse(quota(owner, 1, dayMs(day) + 1000, 20,
+    dayMs(day) + 7 * 86_400_000).recordJson);
+  const values = modules.kernels.foldV11DailyProjectionValues(
+    modules.kernels.createV11DailyProjectionValues(day), [record]);
+  const payload = modules.kernels.buildCommunityDailyPayload({ day, revision: 1, releasedAt,
+    ...modules.kernels.publicInputs([values], [1]) });
+  payload.apiEquivalentSpend = { ...payload.apiEquivalentSpend,
+    registrySha256: historicalRegistry, pricingMethodVersion: "server-api-price-equivalent-v0.1" };
+  const hashes = await modules.ownerSets.analyticsV2ContributionDigests(values);
+  await insert("participants", { id: owner.participant, created_at: GENERATED_AT });
+  await insert("storage_v11_owner_links", { participant_id: owner.participant,
+    owner_digest: owner.digest, state: "active" });
+  const seedClient = await pool.connect();
+  try {
+    await seedClient.query("BEGIN");
+    await insert("analytics_v2_daily_owner_sets", { day, owner_digest: owner.digest, first_revision: 1,
+      provenance: 1, run_id: runId, kernel_id: 1, manifest_version: 1 }, seedClient);
+    await insert("analytics_v2_daily_contributions", { day, owner_digest: owner.digest, version: 1,
+      daily_values: JSON.stringify(values), values_schema: values.schemaVersion,
+      values_sha256: hashes.valuesSha256, stable_values_sha256: hashes.stableValuesSha256,
+      devices: 1, price_kernel_id: 1, first_revision: 1, run_id: runId, kernel_id: 1, manifest_version: 1 }, seedClient);
+    await insert("analytics_v2_daily_owner_set_bootstrap", { day, provenance: 1, set_size: 1,
+      first_revision: 1, run_id: runId, kernel_id: 1, manifest_version: 1 }, seedClient);
+    await insert("analytics_v2_published_daily", { day, revision: 1, released_at: releasedAt,
+      payload: JSON.stringify(payload), payload_sha256: contentSha256(payload), run_id: runId }, seedClient);
+    await seedClient.query("COMMIT");
+  } catch (error) {
+    await seedClient.query("ROLLBACK");
+    throw error;
+  } finally { seedClient.release(); }
+  await reseed();
+  const query = `?from=${day}&to=${day}`;
+  const served = async () => JSON.parse((await get(query)).text).days[0];
+  assert.equal("apiEquivalentSpend" in (await served()).payload, false, "no completed proof yet");
+  const identity = modules.kernel.analyticsV2BundledKernelIdentity();
+  assert.notEqual(identity, null, "Vite uses the genuine registered fixture build defines");
+  const stamp = modules.kernel.analyticsV2BaselineRunStamp(modules.kernel.resolveAnalyticsV2Kernel(identity));
+  assert.equal(stamp.kernel.kernelId, BUNDLED_KERNEL.kernelId);
+  const options = { schema, stamp, bounds: { fromDay: day, throughDay: day,
+    maxDays: 1, maxMembers: 1, maxInputBytes: 64 * 1024 } };
+  const plan = await modules.repriceStore.planAnalyticsV2Reprice(pool, options);
+  assert.deepEqual(plan.caps, { heads: false, members: false, inputBytes: false });
+  const execution = { ...options, runId: "00000000-0000-4000-8000-00000000ee01",
+    expectedPlanSha256: plan.planSha256, nowMs: NOW_MS };
+  const receipt = await modules.repriceStore.executeAnalyticsV2Reprice(pool, execution);
+  assert.deepEqual(receipt.counts, { planned: 1, changed: 0, equivalent: 1, unchanged: 0,
+    refused: 0, contributionVersions: 0 });
+  assert.equal(receipt.status, "complete");
+  assert.equal((await modules.repriceStore.executeAnalyticsV2Reprice(pool, execution)).replayed, true);
+  const target = modules.repriceRead.analyticsV2RepriceTarget(stamp);
+  const heads = [{ day, revision: 1, payloadSha256: contentSha256(payload) }];
+  const proof = await modules.repriceRead.readAnalyticsV2RepriceEquivalences(pool, { schema, stamp, heads });
+  assert.deepEqual([...proof], [[day, { registrySha256: target.registrySha256,
+    pricingMethodVersion: target.pricingMethodVersion }]]);
+  assert.equal((await modules.repriceRead.readAnalyticsV2RepriceEquivalences(pool,
+    { schema, stamp: { ...stamp, manifestVersion: stamp.manifestVersion + 1 }, heads })).size, 0,
+  "proof from another manifest cannot authorize the current head");
+  assert.equal((await modules.repriceRead.readAnalyticsV2RepriceEquivalences(pool,
+    { schema, stamp, heads: [{ ...heads[0], payloadSha256: "f".repeat(64) }] })).size, 0,
+  "proof must bind the exact original payload digest");
+  const current = await served();
+  const expectedPayload = { ...payload, apiEquivalentSpend: { ...payload.apiEquivalentSpend,
+    registrySha256: target.registrySha256, pricingMethodVersion: target.pricingMethodVersion } };
+  delete expectedPayload.allowance;
+  delete expectedPayload.capacityByPlanType;
+  assert.deepEqual(current, { day, revision: 1, releasedAt, payload: sortKeys(expectedPayload) });
+  const stored = await pool.query(`SELECT payload,revision FROM ${q("analytics_v2_published_daily")} WHERE day=$1`, [day]);
+  assert.deepEqual(stored.rows[0].payload, payload, "the original publication stays immutable");
+  assert.equal(stored.rows[0].revision, 1);
+
+  // Owner identity itself is immutable; use a legitimate additive source
+  // version below for the drift case rather than weakening that guard.
+  await assert.rejects(pool.query(`UPDATE ${q("storage_v11_owner_links")} SET owner_digest=$1 WHERE participant_id=$2`,
+    ["d".repeat(64), owner.participant]), (error) => error?.code === "P1005");
+  assert.deepEqual(await served(), current);
+
+  // Missing proof storage is optional: preserve the day, withhold stale spend.
+  await pool.query(`ALTER TABLE ${q("analytics_v2_price_equivalences")} RENAME TO analytics_v2_price_equivalences_hidden`);
+  try { assert.equal("apiEquivalentSpend" in (await served()).payload, false); }
+  finally { await pool.query(`ALTER TABLE ${q("analytics_v2_price_equivalences_hidden")} RENAME TO analytics_v2_price_equivalences`); }
+  assert.deepEqual(await served(), current);
+  assert.equal(JSON.stringify(current).includes(owner.participant), false);
+  assert.equal(JSON.stringify(current).includes(owner.digest), false);
+  await insert("analytics_v2_daily_contributions", { day, owner_digest: owner.digest, version: 2,
+    daily_values: JSON.stringify(values), values_schema: values.schemaVersion,
+    values_sha256: hashes.valuesSha256, stable_values_sha256: hashes.stableValuesSha256,
+    devices: 1, price_kernel_id: 1, first_revision: 2, run_id: runId, kernel_id: 1, manifest_version: 1 });
+  assert.equal("apiEquivalentSpend" in (await served()).payload, false,
+    "a new saved source version cannot reuse the old exact equivalence proof");
+  const nextPlan = await modules.repriceStore.planAnalyticsV2Reprice(pool, options);
+  const nextReceipt = await modules.repriceStore.executeAnalyticsV2Reprice(pool, {
+    ...execution, runId: "00000000-0000-4000-8000-00000000ee03", expectedPlanSha256: nextPlan.planSha256,
+  });
+  assert.equal(nextReceipt.counts.equivalent, 1);
+  assert.deepEqual(await served(), current, "a genuine new proof restores the exact public stamps");
+  await insert("community_aggregate_exclusions", { exclusion_id: "synthetic-route-reprice-exclusion",
+    participant_id: owner.participant, scope: "community_weekly", reason_code: "manual_review", state: "active",
+    effective_at: `${day}T00:00:00.000Z`, created_at: GENERATED_AT, created_by_digest: OWNER_A });
+  assert.equal("apiEquivalentSpend" in (await served()).payload, false, "current exclusion digest differs");
+  await assert.rejects(pool.query(`DELETE FROM ${q("community_aggregate_exclusions")} WHERE exclusion_id=$1`,
+    ["synthetic-route-reprice-exclusion"]), (error) => error?.code === "P1005");
 });

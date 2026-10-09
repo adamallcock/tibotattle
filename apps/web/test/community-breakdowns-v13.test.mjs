@@ -191,10 +191,9 @@ test("a malformed v1.3 block is ignored whole and reported, and the rest of the 
   }
 });
 
-test("a newer breakdown version is refused whole, v1.4 included, and activity is never hidden", () => {
-  // v1.4 is the post-cutover release (a new normalization plus metadata). It
-  // needs a reader change first, so this reader must not guess at it, whichever
-  // basis it claims.
+test("crossed v1.4 claims and unreadable versions are refused whole while activity stays visible", () => {
+  // v1.4 is now readable only with its exact Pro10 four-plan contract.
+  // Relabelling legacy claims or row shapes never makes them that contract.
   const shared = () => {
     const payload = publicAllowanceFixture(NOW);
     payload.allowanceBreakdowns.modelConfig = SIX_MODELS.map(model => ({ ...model }));
@@ -204,8 +203,8 @@ test("a newer breakdown version is refused whole, v1.4 included, and activity is
     ["v1.4 on the v1.3 legacy basis", () => legacyFixture("community-allowance-breakdowns-v1.4")],
     ["v1.4 on the shared fixture", () => { const p = shared(); p.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.4"; return p; }],
     ["v1.5", () => legacyFixture("community-allowance-breakdowns-v1.5")],
-    // These carry the v1.0 row shape, so the row check would accept them. Only
-    // the accepted-version list refuses them, which is what they pin.
+    // New v1.4 requires combined rows and the exact current basis/wrapper;
+    // unrecognized versions are refused independently of their row shape.
     ["v1.4 in the v1.0 row shape, without combined", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.4"))],
     ["v1.4 in the v1.0 row shape, without combined or block", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.4", null))],
     ["v1.5 in the v1.0 row shape, without combined", () => withoutCombined(legacyFixture("community-allowance-breakdowns-v1.5"))],
@@ -227,17 +226,17 @@ test("a newer breakdown version is refused whole, v1.4 included, and activity is
   }
 });
 
-test("the accepted-version list is exactly v1.0, v1.1 and v1.3, and the v1.0 row shape is accepted only as v1.0", () => {
+test("the accepted-version list is exactly v1.0, v1.1, v1.3 and v1.4, and legacy v1.0 rows remain readable", () => {
   // Pinned at the list itself, so adding a version without reading it cannot
   // pass on the side effect of a row shape.
   assert.deepEqual([...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS], [
     "community-allowance-breakdowns-v1.0",
     "community-allowance-breakdowns-v1.1",
     "community-allowance-breakdowns-v1.3",
+    "community-allowance-breakdowns-v1.4",
   ]);
   assert.ok(Object.isFrozen(COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS));
-  // Control: the shape the refused cases use is a readable v1.0 payload, so those
-  // cases are refused for their version and for nothing else.
+  // Control: the legacy v1.0 row shape remains readable under its own version.
   const v10 = series(withoutCombined(legacyFixture("community-allowance-breakdowns-v1.0", null)));
   assert.notEqual(v10.breakdowns, null);
   assert.equal(v10.breakdowns.hasCombined, false);
@@ -301,4 +300,61 @@ test("a retained v1.3 payload re-reads as the same series, and the cache identit
   assert.equal(open(before).resolve({ payload: null, failure }).state, "cached", "the same deploy still serves its copy");
   assert.equal(open(COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY).resolve({ payload: null, failure }).state, "unavailable",
     "the previous deploy's copy is not served under this deploy's meanings");
+});
+
+
+function v14() {
+  const payload = v13();
+  Object.assign(payload.allowanceBreakdowns, {
+    schemaVersion: "community-allowance-breakdowns-v1.4",
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
+    normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  });
+  for (const day of payload.allowanceBreakdowns.days) {
+    day.byPlanType.promax = structuredClone(day.byPlanType.pro);
+  }
+  // The GCP daily route omits per-day allowance; declared combined values
+  // remain the source for the current aggregate.
+  for (const day of payload.days) delete day.payload.allowance;
+  return payload;
+}
+
+test("v1.4's exact four-plan Pro10 wrapper preserves raw amounts and dates and cannot cache as Pro20", () => {
+  const payload = v14();
+  const normalized = series(payload);
+  assert.equal(normalized.state, "published");
+  assert.equal(normalized.breakdowns.normalization, payload.allowanceBreakdowns.normalization);
+  assert.equal(normalized.breakdowns.basis, payload.allowanceBreakdowns.basis);
+  assert.equal(normalized.breakdowns.modelMetadata, "applied");
+  assert.equal(normalized.breakdowns.hasCombined, true);
+  assert.deepEqual(normalized.breakdowns.days.map(day => [day.day, day.combined, day.byPlanType]),
+    payload.allowanceBreakdowns.days.map(day => [day.day, day.combined, day.byPlanType]), "the reader never rescales published reference values");
+  const shown = render(payload, "plans");
+  assert.equal(shown.state, "published");
+  assert.match(shown.text, /Pro 10[×x]/u);
+  assert.match(shown.text, /Pro 25×/u);
+  assert.doesNotMatch(shown.text, /Pro 20[×x]/u);
+  const stored = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+  assert.equal(stored.allowanceBreakdowns.schemaVersion, "community-allowance-breakdowns-v1.4");
+  assert.equal(stored.allowanceBreakdowns.basis, payload.allowanceBreakdowns.basis);
+  assert.equal(stored.allowanceBreakdowns.normalization, payload.allowanceBreakdowns.normalization);
+  assert.deepEqual(normalizeCommunityDailySeries(stored, { nowMs: NOW, retained: true }).breakdowns, normalized.breakdowns);
+});
+
+test("v1.4 refuses a missing wrapper, crossed claims or missing four-plan evidence without hiding activity", () => {
+  for (const mutate of [
+    payload => { delete payload.allowanceBreakdowns.modelConfig; },
+    payload => { payload.allowanceBreakdowns.schemaVersion = V13; },
+    payload => { payload.allowanceBreakdowns.normalization = "pro_x1_prolite_x4_plus_x20"; },
+    payload => { payload.allowanceBreakdowns.modelBasis = "seven_day_codex_pro20x_equivalent_per_model_composition"; },
+    payload => { delete payload.allowanceBreakdowns.days[0].byPlanType.promax; },
+    payload => { delete payload.allowanceBreakdowns.days[0].combined; },
+  ]) {
+    const payload = v14(); mutate(payload);
+    const normalized = series(payload);
+    assert.equal(normalized.breakdowns, null, mutate.toString());
+    assert.equal(normalized.state, "published");
+    assert.equal(normalized.days.length, payload.days.length);
+  }
 });

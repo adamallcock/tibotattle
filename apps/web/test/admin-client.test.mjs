@@ -1,3 +1,4 @@
+import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -1568,4 +1569,53 @@ test("version totals validate OS coverage, counts and unavailable states without
     mutate(invalid.distribution.cloudflare.observedTotals);
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
   }
+});
+
+
+test("admin preview exact v0.3/v0.4 dispatch preserves reference amounts, dates and model metadata", () => {
+  for (const [payload, factors] of [
+    [createAdminAllowancePreviewPayload(), [["pro", 1], ["prolite", 4], ["plus", 20]]],
+    [createAdminPro10AllowancePreviewPayload(), [["pro", 1], ["prolite", 2], ["promax", 0.4], ["plus", 10]]],
+  ]) {
+    const projected = projectAdminAllowancePreview(payload);
+    assert.equal(projected.schemaVersion, payload.schemaVersion);
+    assert.equal(projected.basis, payload.basis);
+    assert.equal(projected.models.basis, payload.models.basis);
+    assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.multiplier]), factors);
+    assert.deepEqual(projected.days, payload.days, "published reference values and bands are never rescaled");
+    assert.equal(projected.models.days.at(-1).day, payload.models.days.at(-1).day);
+    assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd, payload.models.days.at(-1).values[0][1]);
+    assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
+    if (payload.schemaVersion.endsWith("v0.4")) assert.equal(projected.spanFloorPp, 25);
+  }
+});
+
+test("admin preview refuses crossed v0.3/v0.4 claims, plan sets, factors and mandatory model metadata", () => {
+  const old = createAdminAllowancePreviewPayload();
+  const current = createAdminPro10AllowancePreviewPayload();
+  for (const source of [old, current]) {
+    const other = source === old ? current : old;
+    for (const mutate of [
+      value => { value.schemaVersion = other.schemaVersion; },
+      value => { value.schemaVersion = "admin-community-allowance-preview-v0.5"; },
+      value => { value.basis = other.basis; },
+      value => { value.models.basis = other.models.basis; },
+      value => { value.models.gate = "unknown"; },
+      value => { value.plans = structuredClone(other.plans); },
+      value => { value.plans[1].multiplier = other.plans[1].multiplier; },
+      value => { value.plans[0].label = other.plans[0].label; },
+      value => { value.spanFloorPp = 40; },
+      value => { value.qualification = "unknown"; },
+      value => { delete value.days.at(-1).byPlanType.plus; },
+      value => { value.days.at(-1).byPlanType.unknown = structuredClone(value.days.at(-1).combined); },
+      value => { delete value.models; },
+      value => { delete value.models.modelConfig; },
+      value => { value.models.modelConfig[0].allowanceTrack = "unknown"; },
+    ]) {
+      const invalid = structuredClone(source); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+  const missingProMax = structuredClone(current); delete missingProMax.days[0].byPlanType.promax;
+  assert.throws(() => projectAdminAllowancePreview(missingProMax), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
 });

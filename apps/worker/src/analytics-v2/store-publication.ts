@@ -74,7 +74,7 @@ export function nextPublishedRevision(input: {
  * absent when the day had no head).
  */
 export async function writeAnalyticsV2PublishedDaily(client: PostgresClient, schema: string,
-  prepared: PreparedOutputs, runId: string, releasedAt: string, stamp: AnalyticsV2RunStamp): Promise<{
+  prepared: Pick<PreparedOutputs, "dailyCandidates" | "revisionSeed">, runId: string, releasedAt: string, stamp: AnalyticsV2RunStamp): Promise<{
     readonly published: AnalyticsV2Day[]; readonly unchanged: AnalyticsV2Day[];
     readonly revisions: ReadonlyMap<AnalyticsV2Day, number>;
     readonly priorRevisions: ReadonlyMap<AnalyticsV2Day, number>;

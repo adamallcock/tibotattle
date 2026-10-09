@@ -944,8 +944,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 74,
-      "the 74-migration primary chain, 0059, the run stamps, the revision floor, the price cards and the owner sets staged or promoted");
+    assert.equal(stock.length + stagedCount, 77,
+      "the 77-migration primary chain including immutable repricing proofs and input associations");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -959,7 +959,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     // names (it decides no kernel value, so it stays out of contract.ts).
     assert.deepEqual(tables.rows.map((row) => row.name), [...Object.values(contract.ANALYTICS_V2_TABLES),
       ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES),
-      ...Object.values(store.ANALYTICS_V2_PRICING_CLASS_TABLES)].sort());
+      ...Object.values(store.ANALYTICS_V2_PRICING_CLASS_TABLES),
+      ...Object.values(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES)].sort());
     const described = [
       ...Object.entries(contract.ANALYTICS_V2_TABLES).map(([key, table]) => [table,
         contract.ANALYTICS_V2_COLUMNS[key], contract.ANALYTICS_V2_PRIMARY_KEYS[key]]),
@@ -968,6 +969,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     ];
     described.push(...Object.entries(store.ANALYTICS_V2_PRICING_CLASS_TABLES).map(([key, table]) => [table,
       store.ANALYTICS_V2_PRICING_CLASS_COLUMNS[key], store.ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS[key]]));
+    described.push(...Object.entries(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES).map(([key,table]) => [table,
+      store.ANALYTICS_V2_REPRICE_AUDIT_COLUMNS[key],store.ANALYTICS_V2_REPRICE_AUDIT_PRIMARY_KEYS[key]]));
     for (const [table, expectedColumns, expectedKey] of described) {
       const columns = await pool.query(
         `SELECT column_name::text AS name FROM information_schema.columns

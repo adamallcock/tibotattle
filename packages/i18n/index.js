@@ -20,6 +20,18 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 ]);
 
 export const EN_US_CATALOG = Object.freeze({
+  "community.allowance.planOwnWeekCaption": "API-equivalent USD / each plan's own week",
+  "community.allowance.planOwnWeekChartDescription": "Each plan's own weekly API-equivalent estimate. Shading shows the middle 80% of qualified reset fits when available. Missing days remain gaps. Arrow keys inspect individual points.",
+  "community.allowance.pro10.heading": "Pro 10x-equivalent allowance",
+  "community.allowance.pro10.heroCopy": "API-price value of a Pro 10x-equivalent week: overall, by plan or by model.",
+  "community.allowance.pro10.chartDescription": "Combined Pro 10x-equivalent seven-day allowance value in API-equivalent dollars per published day: a central line, a shaded middle-80% range where published, and dots sized by the number of qualifying reset fits. Days without estimates appear as gaps.",
+  "community.allowance.pro10.modelChartDescription": "A separate full-week Pro 10×-equivalent estimate for each identified model. Dot size reflects contribution sources, not reset fits. No uncertainty band is available. Missing days remain gaps. Arrow keys inspect individual points.",
+  "community.allowance.pro10.modelMethod": "A full Pro 10× week spent on one model, at API prices. Only stable, identified fits appear; counts are contribution sources, not reset fits. History uses evidence through each day; missing or unstable estimates stay gaps. Model availability is not implied.",
+  "community.allowance.pro10.cardsCaption": "API-equivalent USD / Pro 10× week",
+  "community.allowance.pro10.referenceEquivalent": "Pro 10x-equivalent: {value}/week",
+  "community.allowance.pro10.planMethod": "Each plan is charted at its own week at API prices, on its own scale. Card values repeat that figure, with the Pro 10× equivalent beneath it. Shading: middle 80% of qualifying reset fits. Missing days stay gaps.",
+  "community.allowance.pro10.methodNote": "Each point combines qualifying reset fits from the trailing 30 days after normalizing supported personal plans to a Pro 10x equivalent (Pro 10x ×1, Pro 5x ×2, Pro 25x ×0.4, Plus ×10). The line is the median, the range is the middle 80%, and every fit passes the shared calibration gates including the 25-point observed-span floor. Unsupported plans are excluded; late data republishes the day.",
+  "community.allowance.basisTransition": "The chart shows the declared {basis} basis. Estimates using another basis remain gaps.",
   "continuityConsent.title": "Turn boundaries and cache details",
   "continuityConsent.description": "This optional update adds turn starts, preceding compaction, same-time event order and reported cache-write lifetimes. It requires a new review and approval.",
   "continuityConsent.reviewTitle": "Review turn and cache contribution",
@@ -904,6 +916,18 @@ export const EN_US_CATALOG = Object.freeze({
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
+  "community.allowance.planOwnWeekCaption": "API 等值美元 / 各方案自身的周额度",
+  "community.allowance.planOwnWeekChartDescription": "各方案自身的周额度 API 等值估计。有足够数据时，阴影显示合格重置拟合的中间 80% 范围。缺失日期保持为空缺。使用方向键查看各点。",
+  "community.allowance.pro10.heading": "Pro 10x 等值额度",
+  "community.allowance.pro10.heroCopy": "Pro 10x 等值周额度的 API 价格价值：汇总、按方案或按模型比较。",
+  "community.allowance.pro10.chartDescription": "每个已发布日期的合并 Pro 10x 等值七天额度价值（API 等价美元）：一条中心线、发布时的中间 80% 阴影范围，以及按合格重置拟合数量确定大小的圆点。没有估计的日期显示为空缺。",
+  "community.allowance.pro10.modelChartDescription": "每个可识别模型单独显示完整一周的 Pro 10× 等值估计。点的大小表示贡献来源数，而非重置拟合数。不提供不确定性区间。缺失日期保持为空缺。使用方向键查看各点。",
+  "community.allowance.pro10.modelMethod": "将完整的 Pro 10× 周额度用于单一模型，按 API 价格计值。仅展示稳定且可识别的拟合；计数为贡献来源数，并非重置拟合数。历史仅使用截至当日的证据；缺失或不稳定的估计保持为空缺。不表示模型当前可用。",
+  "community.allowance.pro10.cardsCaption": "API 等值美元 / Pro 10× 周额度",
+  "community.allowance.pro10.referenceEquivalent": "Pro 10x 等效：每周 {value}",
+  "community.allowance.pro10.planMethod": "每个方案均按其自身每周 API 价格绘制，各自使用独立刻度。卡片数值与之相同，下方为 Pro 10× 等效值。阴影：合格重置拟合的中间 80%。缺失日期保持为空隙。",
+  "community.allowance.pro10.methodNote": "每个点都汇总过去 30 天内的合格重置拟合，并将支持的个人方案换算为 Pro 10x 等值（Pro 10x ×1、Pro 5x ×2、Pro 25x ×0.4、Plus ×10）。折线为中位数，区间为中间 80%；每个拟合均通过共享校准门槛，包括 25 个百分点的观测跨度下限。不支持的方案会被排除；迟到的数据会重新发布对应日期。",
+  "community.allowance.basisTransition": "图表显示声明的 {basis} 基准。使用其他基准的估计保持为空缺。",
   "continuityConsent.title": "轮次边界与缓存详情",
   "continuityConsent.description": "此可选更新新增轮次起点、此前的压缩、同一时间事件顺序和已报告的缓存写入有效期，需要重新审阅和核准。",
   "continuityConsent.reviewTitle": "审阅轮次与缓存贡献",
@@ -1788,6 +1812,18 @@ export const ZH_HANS_CATALOG = Object.freeze({
 });
 
 export const ES_CATALOG = Object.freeze({
+  "community.allowance.planOwnWeekCaption": "USD equivalentes de API / semana propia de cada plan",
+  "community.allowance.planOwnWeekChartDescription": "La estimación semanal equivalente de API propia de cada plan. El sombreado muestra el 80% central de los ajustes válidos cuando está disponible. Los días ausentes quedan vacíos. Las flechas recorren los puntos.",
+  "community.allowance.pro10.heading": "Asignación equivalente a Pro 10x",
+  "community.allowance.pro10.heroCopy": "Valor a precios de API de una semana equivalente a Pro 10x: global, por plan o modelo.",
+  "community.allowance.pro10.chartDescription": "Valor combinado equivalente a Pro 10x de la asignación de siete días en dólares equivalentes de API por día publicado: una línea central, un rango sombreado del 80 % central donde se publicó y puntos cuyo tamaño refleja el número de ajustes de restablecimiento válidos. Los días sin estimaciones aparecen como huecos.",
+  "community.allowance.pro10.modelChartDescription": "Una estimación semanal completa equivalente a Pro 10× por modelo identificado. El tamaño del punto indica fuentes de contribución, no ajustes de reinicio. No hay banda de incertidumbre. Los días ausentes quedan vacíos. Las flechas recorren los puntos.",
+  "community.allowance.pro10.modelMethod": "Una semana Pro 10× completa en un modelo, a precios de API. Solo ajustes estables e identificados; se cuentan fuentes de contribución, no ajustes de reinicio. El historial usa evidencia hasta cada fecha; las estimaciones ausentes o inestables dejan huecos. No implica disponibilidad del modelo.",
+  "community.allowance.pro10.cardsCaption": "USD equivalentes de API / semana Pro 10×",
+  "community.allowance.pro10.referenceEquivalent": "Equivalente Pro 10x: {value}/semana",
+  "community.allowance.pro10.planMethod": "Cada plan se representa con su propia semana a precios de API y su propia escala. Las tarjetas repiten esa cifra, con el equivalente Pro 10× debajo. Sombreado: 80% central de los ajustes de reinicio válidos. Los días ausentes quedan como huecos.",
+  "community.allowance.pro10.methodNote": "Cada punto combina los ajustes de restablecimiento válidos de los últimos 30 días tras normalizar los planes personales compatibles a un equivalente de Pro 10x (Pro 10x ×1, Pro 5x ×2, Pro 25x ×0.4 y Plus ×10). La línea es la mediana, el rango es el 80 % central y cada ajuste supera las puertas de calibración compartidas, incluido el mínimo de 25 puntos de amplitud observada. Los planes no compatibles se excluyen; los datos tardíos vuelven a publicar el día.",
+  "community.allowance.basisTransition": "El gráfico muestra la base declarada {basis}. Las estimaciones con otra base quedan como huecos.",
   "continuityConsent.title": "Límites de turnos y detalles de caché",
   "continuityConsent.description": "Esta actualización opcional añade inicios de turnos, compactación previa, orden de eventos simultáneos y duraciones de escritura de caché. Requiere una nueva revisión y aprobación.",
   "continuityConsent.reviewTitle": "Revisar contribución de turnos y caché",

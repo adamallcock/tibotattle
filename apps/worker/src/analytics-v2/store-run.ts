@@ -1082,7 +1082,12 @@ export async function registerAnalyticsV2RunKernel(client: PostgresClient, schem
     fail("ANALYTICS_V2_KERNEL_CONFLICT");
   }
   const newest = rowsOf<{ newest: unknown }>(await client.query(
-    `SELECT max(kernel_id)::integer AS newest FROM ${relation(schema, ANALYTICS_V2_TABLES.runs)}`,
+    // Repricing is a separate completed-run family. A later ordinary refresh
+    // must not move the price/compute identity backwards after it publishes.
+    `SELECT max(kernel_id)::integer AS newest FROM (
+       SELECT kernel_id FROM ${relation(schema, ANALYTICS_V2_TABLES.runs)}
+       UNION ALL SELECT kernel_id FROM ${relation(schema, "analytics_v2_reprice_runs")}
+     ) completed_kernel_runs`,
   ), "ANALYTICS_V2_WRITE_FAILED")[0]?.newest;
   if (newest !== null && newest !== undefined && (typeof newest !== "number" || newest > kernel.kernelId)) {
     fail("ANALYTICS_V2_KERNEL_REGRESSION");

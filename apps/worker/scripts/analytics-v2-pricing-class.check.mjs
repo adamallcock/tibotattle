@@ -212,12 +212,17 @@ test("an edit of any pricing input changes the pricing class (negative tests aga
   }
   // The pricing method version is read from the pricer's own source.
   const pricing = join(VENDOR_ROOT, "apps", "worker", "src", "server-pricing.ts");
+  const nextMethodVersion = `${baseline.pricingMethodVersion}-mutation`;
   const renamed = await identityWith(async (path, ...rest) => {
     const bytes = await readFile(path, ...rest);
-    return path === pricing ? Buffer.from(Buffer.from(bytes).toString("utf8")
-      .replace("server-api-price-equivalent-v0.5", "server-api-price-equivalent-v0.6"), "utf8") : bytes;
+    if (path !== pricing) return bytes;
+    const text = Buffer.from(bytes).toString("utf8");
+    const declaration = `export const SERVER_PRICING_METHOD_VERSION = "${baseline.pricingMethodVersion}";`;
+    assert.equal(text.split(declaration).length - 1, 1, "the current method declaration is present exactly once");
+    return Buffer.from(text.replace(declaration,
+      `export const SERVER_PRICING_METHOD_VERSION = "${nextMethodVersion}";`), "utf8");
   });
-  assert.equal(renamed.pricingMethodVersion, "server-api-price-equivalent-v0.6");
+  assert.equal(renamed.pricingMethodVersion, nextMethodVersion);
   assert.notEqual(renamed.pricerSha256, baseline.pricerSha256);
 });
 
@@ -282,7 +287,11 @@ test("a non-pricing kernel edit keeps the pricing class and moves the compute cl
       return Buffer.from(`${JSON.stringify({ ...JSON.parse(Buffer.from(bytes).toString("utf8")), sourceCommit: next }, null, 2)}\n`);
     }
     if (path === join(VENDOR_ROOT, "entry.ts")) {
-      return Buffer.from(Buffer.from(bytes).toString("utf8").replaceAll(current.slice(0, 8), next.slice(0, 8)));
+      const text = Buffer.from(bytes).toString("utf8");
+      assert.ok(text.includes(current.slice(0, 8)), "the facade names the current vendored commit");
+      const moved = text.replaceAll(current, next).replaceAll(current.slice(0, 8), next.slice(0, 8));
+      assert.equal(moved.includes(current.slice(0, 8)), false, "both full and short provenance forms move");
+      return Buffer.from(moved, "utf8");
     }
     return bytes;
   });

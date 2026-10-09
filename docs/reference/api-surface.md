@@ -135,9 +135,27 @@ days its active exclusions do not cover, where d43c8f92 withholds every day
 (round 19). The frozen interim export, served before GCP's first
 publication, keeps the breakdown version Cloudflare published.
 
-All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
-Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
-excluded. Model values require the existing composition identification gate;
+The post-cutover GCP projection serves `community-allowance-breakdowns-v1.4`
+from a newly computed `admin-community-allowance-preview-v0.4`, following the
+2026-10-02 round-9 decision. Its canonical base is v1.2; v1.2 remains reserved
+for the separate, never-deployed main release. v1.4 appends the same closed
+`modelConfig` metadata envelope. Its exact basis is
+`seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25`,
+normalization is `pro_x1_prolite_x2_promax_x0_4_plus_x10`, and model basis is
+`seven_day_codex_pro10x_equivalent_per_model_composition`. Its four reviewed
+plans normalize raw fits and model capacities as Pro 10x ×1, Pro 5x ×2,
+Pro Max 25x ×0.4 and Plus ×10 before cohort summaries are computed. The
+Pro Max multiplier is a normalization assumption against the common personal
+plan baseline, not a provider-authoritative entitlement claim.
+
+Retained v0.3 previews continue to validate against their frozen contract and
+project as v1.3, with the original Pro 20x ×1, Pro 5x ×4 and Plus ×20 values.
+Neither schema relabelling nor dividing an old combined median converts it to
+the new meaning. Raw `pro` fits and history remain continuous; normalization
+joins the derived projection identity, while the raw fit identity is unchanged.
+A new kernel and completed preview recomputation are required before new
+values can be served. This source contract does not claim a production rollout.
+Unknown plans and separate-track Spark estimates remain excluded. Model values require the existing composition identification gate;
 historical values are never carried backward from today's fit.
 
 The daily range/state and cached preview are read in one two-statement

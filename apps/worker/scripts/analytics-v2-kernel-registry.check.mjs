@@ -84,6 +84,8 @@ const REGISTRY_PINS = Object.freeze([
   "610be70b21a3c5c6fe52ba0a90907954e48d109507a3d4bd5d72c6e9899cc8ea",
   // Kernel 12: retained publication reader compatibility; pricing identity unchanged.
   "a5e06ca4657eda0b6ee412fdfd0c40dec0664c3834b86780cff4e00216525c1e",
+  // Kernel 13: bounded saved-cohort repricing and genuine four-plan Pro 10x projection.
+  "1efa523ef3859e11d04f4b9e59651b384bb03b5724d2d93bb3a20472082e7e5b",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -188,6 +190,8 @@ test("the closure holds every module that decides a stored value and no I/O plum
     "apps/worker/src/analytics-v2/occurrence-source.ts", "apps/worker/src/analytics-v2/owners.ts",
     "apps/worker/src/analytics-v2/devices.ts", "apps/worker/src/analytics-v2/queued-days.ts",
     "apps/worker/src/analytics-v2/owner-sets.ts",
+    "apps/worker/src/analytics-v2/reprice.ts", "apps/worker/src/analytics-v2/reprice-read.ts",
+    "apps/worker/src/analytics-v2/reprice-store.ts", "apps/worker/src/analytics-v2/store-owner-sets.ts",
     "apps/worker/src/telemetry-usage-reconciliation.ts", "apps/worker/src/typed-telemetry-codec.ts",
     "apps/worker/src/telemetry-v12-typed-codec.ts", "apps/worker/cloud-run/analytics-refresh-read.mjs",
     "apps/worker/cloud-run/analytics-refresh-worker.mjs", "packages/telemetry-contract/index.js",
@@ -202,6 +206,23 @@ test("the closure holds every module that decides a stored value and no I/O plum
   }
   // Names never carry where an install put a module.
   assert.equal(report.names.some((name) => name.includes("node_modules")), false);
+});
+
+test("saved-cohort repricing decisions change the compute class without changing the pricing class", async () => {
+  const identity = await identityWith();
+  for (const module of ["reprice.ts", "reprice-read.ts", "reprice-store.ts", "store-owner-sets.ts"]) {
+    const target = join(WORKER_ROOT, "src", "analytics-v2", module);
+    assert.ok(identity.names.includes(`apps/worker/src/analytics-v2/${module}`), `${module} decides stored values`);
+    const mutated = await identityWith(async (path, ...rest) => {
+      const bytes = await readFile(path, ...rest);
+      return path === target ? Buffer.concat([Buffer.from(bytes), Buffer.from("\n// reprice decision mutation\n")]) : bytes;
+    });
+    assert.notEqual(mutated.computeClosureSha256, identity.computeClosureSha256, module);
+    assert.notEqual(mutated.computeSha256, identity.computeSha256, module);
+    assert.equal(mutated.pricerSha256, identity.pricerSha256, `${module} is outside the pure pricing class`);
+    assert.equal(mutated.pricingMethodVersion, identity.pricingMethodVersion);
+    await assert.rejects(entryFor(mutated), { code: "CLOUD_RUN_BUILD_KERNEL_UNREGISTERED" });
+  }
 });
 
 test("a change to the community fold, the occurrence reader or the owner-set reader is a closure no entry names, and the build refuses it", async () => {

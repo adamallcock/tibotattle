@@ -1,5 +1,5 @@
 /**
- * The analytics-v2 kernel identity a build stamps into the refresh bundles
+ * The analytics-v2 kernel identity a build stamps into the refresh and reprice bundles
  * (K-STAMP). Build-time only: build.mjs computes it and passes it to esbuild
  * as two defines; nothing at runtime imports this module.
  *
@@ -8,8 +8,8 @@
  * - computeClosureSha256: the compute class (owner decision round 7: the
  *   compatibility class includes the GCP compute closure), a sha256 over every
  *   module that decides a stored analytics_v2 value, each as (name, sha256 of
- *   its bytes), sorted by name. The modules are those the refresh Job and its
- *   compute Worker bundle that are reachable from ANALYTICS_KERNEL_CLOSURE_ROOTS
+ *   its bytes), sorted by name. The modules are those reachable from ANALYTICS_KERNEL_CLOSURE_ROOTS
+ *   in the refresh Job, its compute Worker and the reprice Job bundles
  *   (the A-1 readers with their decode and reconcile code, the A-2 compute
  *   core with the community fold, the Job's read and compute composition, the
  *   Worker shell, the vendored kernels and every module they import), walking
@@ -128,9 +128,11 @@ const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 export const ANALYTICS_REFRESH_JOB_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-refresh.mjs");
 /** The compute Worker entry (K-PAR). */
 export const ANALYTICS_REFRESH_WORKER_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-refresh-worker.mjs");
+/** The bounded saved-cohort reprice Job entry. */
+export const ANALYTICS_REPRICE_JOB_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-reprice.mjs");
 /**
  * The modules that decide stored analytics_v2 values (repository paths). The
- * closure is everything the two refresh bundles reach from these without
+ * closure is everything the refresh and reprice bundles reach from these without
  * entering ANALYTICS_KERNEL_CLOSURE_PLUMBING.
  */
 export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
@@ -153,14 +155,22 @@ export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
   "apps/worker/src/analytics-v2/price-transition.ts",
   // E-OWNERSET: the saved owner sets, stored contributions and frozen counts a fold reads.
   "apps/worker/src/analytics-v2/owner-sets.ts",
+  // OAI-5: saved-cohort eligibility, pricing/fold decisions and atomic publication equivalence.
+  "apps/worker/src/analytics-v2/reprice.ts",
+  "apps/worker/src/analytics-v2/reprice-read.ts",
+  "apps/worker/src/analytics-v2/reprice-store.ts",
+  // The writer binds archived pricing inputs to exact contribution versions.
+  "apps/worker/src/analytics-v2/store-owner-sets.ts",
 ]);
 /**
  * I/O plumbing (repository paths): never in the closure and never walked
- * through. Each must be in the refresh bundle, so a renamed module cannot
+ * through. Each must be in the refresh or reprice bundles, so a renamed module cannot
  * silently move into the closure or out of this list.
  */
 export const ANALYTICS_KERNEL_CLOSURE_PLUMBING = Object.freeze([
   "apps/worker/cloud-run/analytics-refresh.mjs",
+  // Transport, protected target resolution and CLI dispatch; value decisions are domain roots.
+  "apps/worker/cloud-run/analytics-reprice.mjs",
   "apps/worker/cloud-run/analytics-refresh-pool.mjs",
   "apps/worker/src/postgres-client.ts",
   "apps/worker/src/analytics-v2/store.ts",
@@ -394,7 +404,7 @@ async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }
 
 /**
  * The identity of the kernels `build(options)` would bundle into the refresh
- * Job and its compute Worker. `build` is esbuild's; `options` are the
+ * Job, its compute Worker and the saved-cohort reprice Job. `build` is esbuild's; `options` are the
  * cloud-run build options (bundle, platform, externals); `vendorRoot` is the
  * vendored kernel directory. Returns the two digests and the closure's names
  * in hash order (`names`; `inputs` is their count), and the pricer's digest,
@@ -409,7 +419,7 @@ export async function computeAnalyticsKernelIdentity({ build, options, vendorRoo
   const { define: _define, entryPoints: _entryPoints, outdir: _outdir, entryNames: _entryNames, ...shared } = options;
   // The metafile's paths are relative to esbuild's working directory: `cwd`.
   const result = await build({ ...shared, absWorkingDir: cwd,
-    entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY], write: false, metafile: true,
+    entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY], write: false, metafile: true,
     outdir: resolve(CLOUD_RUN_ROOT, "dist") });
   assertAnalyticsFastPricerBinding(result.metafile, cwd);
   assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT, cwd,

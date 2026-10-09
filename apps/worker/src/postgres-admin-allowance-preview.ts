@@ -9,11 +9,11 @@
  * null, which the route answers 503 ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE.
  *
  * On GCP the analytics-refresh job writes that same preview (built by the
- * vendored d43c8f92 buildAdminCommunityAllowancePreview) to the
+ * current authored cross-owner buildAdminCommunityAllowancePreview) to the
  * analytics_v2_preview singleton, or NULL when a run could not build one.
  * This reader applies the same acceptance as the public community-daily
  * route's preview read (src/analytics-v2/community-daily-route.ts): canonical
- * JSON within the byte limit, the vendored d43c8f92 validator at nowMs, and
+ * JSON within the byte limit, the exact current or frozen legacy validator at nowMs, and
  * the payload returned in canonical key order (production stores and serves
  * canonicalJson(preview); jsonb does not keep key order).
  *
@@ -33,7 +33,7 @@ import {
   withPostgresRead,
   type PostgresPool,
 } from "./postgres-client";
-import { validCachedAdminCommunityAllowancePreview } from "../vendor/analytics-d43c8f92/entry";
+import { validReadableAdminCommunityAllowancePreview } from "./analytics-v2/allowance-projection";
 // Not re-exported by the vendor facade; the same vendored module the
 // validator and the public route read it from.
 import { PREVIEW_CACHE_JSON_LIMIT_BYTES } from "../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
@@ -102,6 +102,6 @@ export async function readPostgresAdminAllowancePreview(
   const payloadJson = canonicalJson(preview);
   if (new TextEncoder().encode(payloadJson).byteLength > PREVIEW_CACHE_JSON_LIMIT_BYTES) return null;
   const served: unknown = JSON.parse(payloadJson);
-  if (!validCachedAdminCommunityAllowancePreview(served, generatedAt, nowMs)) return null;
+  if (!validReadableAdminCommunityAllowancePreview(served, generatedAt, nowMs)) return null;
   return JSON.parse(payloadJson) as Record<string, unknown>;
 }

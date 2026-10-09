@@ -3,7 +3,9 @@ import { ADMIN_MODEL_CONFIG, expandAdminModelHistoryDay,
   projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 import * as canonical from "../src/admin-community-allowance";
 import * as vendored from "../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
-import { projectPublicAllowanceGraph as canonicalGraph } from "../src/public-allowance-breakdowns";
+import { projectPublicAllowanceGraphForGcp, validReadableAdminCommunityAllowancePreview }
+  from "../src/analytics-v2/allowance-projection";
+import { reducePublicAllowanceBreakdownsV13 } from "../src/analytics-v2/public-allowance-breakdowns-v13";
 import { projectPublicAllowanceGraph as vendoredGraph } from "../vendor/analytics-d43c8f92/apps/worker/src/public-allowance-breakdowns";
 import { normalizePublicAllowanceBreakdowns } from "../../web/public/community-data.js";
 
@@ -14,9 +16,13 @@ const HISTORICAL_CATALOG = "reviewed-model-catalog-2026-09-23.1";
 
 // Synthetic values matching the known kernel10 42-model catalog shape.
 // No production payload, participant, input evidence or private diagnostic.
-function historicalPreview(api: typeof canonical) {
-  const built = structuredClone(api.buildAdminCommunityAllowancePreview([
+function historicalPreview() {
+  // The retained DTO was published under Pro 20x v0.3. A current builder would
+  // create v0.4/Pro 10x values and no longer exercise historical compatibility.
+  const built = structuredClone(vendored.buildAdminCommunityAllowancePreview([
     { participantId: "synthetic-preview-owner", planType: "pro",
+      capacityNanousd: 1_200_000_000_000, lastObservedAt: `${DAY}T12:00:00.000Z` },
+    { participantId: "synthetic-preview-plus", planType: "plus",
       capacityNanousd: 1_200_000_000_000, lastObservedAt: `${DAY}T12:00:00.000Z` },
   ], GENERATED));
   const preview = { ...built, models: { ...built.models,
@@ -31,17 +37,24 @@ function historicalPreview(api: typeof canonical) {
   return preview;
 }
 
-for (const [name, api, graph] of [
-  ["canonical", canonical, canonicalGraph], ["vendored", vendored, vendoredGraph],
+const metadata = [{ id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 }];
+for (const [name, api, validHistorical, graph] of [
+  ["GCP compatibility", canonical, validReadableAdminCommunityAllowancePreview,
+    (row: Parameters<typeof vendoredGraph>[0], options: Parameters<typeof vendoredGraph>[1]) =>
+      projectPublicAllowanceGraphForGcp(row, options, metadata)],
+  ["vendored kernel10", vendored, vendored.validCachedAdminCommunityAllowancePreview, vendoredGraph],
 ] as const) describe(`${name} historical preview compatibility`, () => {
   it("retains the exact known kernel10 publication and leaves new Sol unobserved", async () => {
-    const preview = historicalPreview(api);
+    const preview = historicalPreview();
     const before = JSON.stringify(preview);
-    expect(api.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW)).toBe(true);
+    expect(validHistorical(preview, preview.generatedAt, NOW)).toBe(true);
     const db = { prepare: () => ({ bind: () => ({ first: async () => ({
       generated_at: preview.generatedAt, payload_json: before,
     }) }) }) } as unknown as D1Database;
-    const read = await api.readCachedAdminCommunityAllowancePreview(db, NOW);
+    const read = await vendored.readCachedAdminCommunityAllowancePreview(db, NOW);
+    expect(preview.schemaVersion).toBe("admin-community-allowance-preview-v0.3");
+    // The current producer contract must not silently relabel retained units.
+    expect(canonical.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW)).toBe(false);
     expect(read).toEqual(preview);
     expect(JSON.stringify(preview)).toBe(before);
     expect(expandAdminModelHistoryDay(read.models.days[0])?.byModel["gpt-6.1-sol"])
@@ -50,14 +63,25 @@ for (const [name, api, graph] of [
       { nowMs: NOW, publishedDays: [DAY] });
     expect(published?.breakdowns.generatedAt).toBe(preview.generatedAt);
     expect(published?.breakdowns.days[0]?.models).toEqual([["gpt-6-astra", 1_166, 1]]);
-    expect(normalizePublicAllowanceBreakdowns(published?.breakdowns, [DAY], NOW)).not.toBeNull();
+    const legacy = vendoredGraph({ generated_at: preview.generatedAt, payload_json: before },
+      { nowMs: NOW, publishedDays: [DAY] })!;
+    expect(legacy.breakdowns.days[0]!.byPlanType.plus.centralUsd).toBe(24_000);
+    if (published?.breakdowns.schemaVersion === "community-allowance-breakdowns-v1.3") {
+      expect(reducePublicAllowanceBreakdownsV13(published.breakdowns).base).toEqual(legacy.breakdowns);
+    } else {
+      expect(published).toEqual(legacy);
+    }
+    const normalized = normalizePublicAllowanceBreakdowns(published?.breakdowns, [DAY], NOW);
+    expect(normalized).not.toBeNull();
+    expect(normalized?.days[0]?.byPlanType.plus.centralUsd).toBe(24_000);
+    expect(JSON.stringify(preview)).toBe(before);
     expect(JSON.stringify(published)).not.toMatch(/synthetic-preview-owner|participantId|coverage|catalogVersion/);
   });
 
   it("accepts the known empty historical model series without inventing points", () => {
-    const preview = historicalPreview(api);
+    const preview = historicalPreview();
     preview.models.days = [];
-    expect(api.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW)).toBe(true);
+    expect(validHistorical(preview, preview.generatedAt, NOW)).toBe(true);
   });
 
   it("rejects arbitrary, reordered, edited, unknown or inconsistent historical catalogs", () => {
@@ -74,15 +98,15 @@ for (const [name, api, graph] of [
       p => { p.models.days[0] = { ...p.models.days[0]!, fittedParticipantCount: 2 }; },
     ];
     for (const change of changes) {
-      const preview = historicalPreview(api);
+      const preview = historicalPreview();
       change(preview);
-      expect(api.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW)).toBe(false);
+      expect(validHistorical(preview, preview.generatedAt, NOW)).toBe(false);
     }
   });
 
   it("keeps current builders and current-catalog publications valid", () => {
     const preview = api.buildAdminCommunityAllowancePreview([], NOW);
     expect(preview.models.modelConfig).toEqual(ADMIN_MODEL_CONFIG);
-    expect(api.validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, NOW)).toBe(true);
+    expect(validHistorical(preview, preview.generatedAt, NOW)).toBe(true);
   });
 });
