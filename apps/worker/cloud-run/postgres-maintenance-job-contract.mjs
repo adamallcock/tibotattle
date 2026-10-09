@@ -17,8 +17,8 @@ export const POSTGRES_MAINTENANCE_JOB_POOL_MAX = 2;
 /** Cycles are whole UTC minutes, the Worker cron's scheduledTime granularity. */
 export const POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS = 60_000;
 export const POSTGRES_MAINTENANCE_JOB_APPLICATION_NAME = "tibotattle-maintenance-job";
-/** The trigger schedule the D-OPS4 Scheduler must use: every minute, as the Worker cron. */
-export const POSTGRES_MAINTENANCE_JOB_SCHEDULE = "* * * * *";
+/** GCP cost-control cadence: one bounded pass every five minutes; Worker cron is separate. */
+export const POSTGRES_MAINTENANCE_JOB_SCHEDULE = "*/5 * * * *";
 /** Variables the job refuses even when empty, and the code each gives. */
 export const POSTGRES_MAINTENANCE_JOB_FORBIDDEN_VARIABLES = Object.freeze({
   HOST_MODE: "POSTGRES_MAINTENANCE_JOB_HOST_MODE_FORBIDDEN",

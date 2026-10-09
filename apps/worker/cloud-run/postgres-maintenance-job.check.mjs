@@ -466,7 +466,7 @@ test("the pass result and code vocabularies are closed", () => {
   assert.ok(Object.isFrozen(pass.POSTGRES_APPEND_ONLY_NOT_APPLICABLE));
 });
 
-test("throughput and schedule match the Worker: 100 registrations per execution, every minute", async () => {
+test("GCP cadence is five minutes while batches, cycle identity and Worker cron remain unchanged", async () => {
   // The d43c8f92 Worker reconciles one batch of QUARANTINE_RECONCILIATION_BATCH_SIZE
   // per scheduled run, and every Worker environment's cron runs every minute.
   const worker = await readFile(join(WORKER_ROOT, "src", "quarantine-reconciliation.ts"), "utf8");
@@ -480,9 +480,12 @@ test("throughput and schedule match the Worker: 100 registrations per execution,
   const wrangler = await readFile(join(WORKER_ROOT, "wrangler.jsonc"), "utf8");
   const crons = [...wrangler.matchAll(/"crons":\s*\[([^\]]*)\]/gu)].map((match) => match[1].trim());
   assert.ok(crons.length >= 3, "development, staging and production crons");
-  assert.deepEqual(new Set(crons), new Set([JSON.stringify(job.POSTGRES_MAINTENANCE_JOB_SCHEDULE)]));
-  assert.equal(job.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "* * * * *");
-  assert.match(job.POSTGRES_MAINTENANCE_JOB_USAGE, /every minute \(\* \* \* \* \*\)/u);
+  assert.deepEqual(new Set(crons), new Set([JSON.stringify("* * * * *")]), "separate Worker cron is unchanged");
+  assert.equal(job.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "*/5 * * * *");
+  assert.equal(job.POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS, 60_000);
+  const constants = await vite.ssrLoadModule("/src/constants.ts");
+  assert.equal(constants.BACKEND_LIFECYCLE_STALE_MILLISECONDS, 2 * 60 * 60 * 1000);
+  assert.match(job.POSTGRES_MAINTENANCE_JOB_USAGE, /every five minutes \(\*\/5 \* \* \* \*\)/u);
 });
 
 test("the image builds dist/postgres-maintenance-job.mjs and the bundle answers its contract", async () => {

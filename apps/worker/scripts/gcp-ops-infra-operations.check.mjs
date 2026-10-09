@@ -249,7 +249,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
   // Exactly the three fast-path jobs, all created; only the refresh trigger
   // waits, for the owner's cadence, and with it the scheduler's executor grant
-  // on the refresh job. The maintenance trigger has its own: every minute.
+  // on the refresh job. The maintenance trigger has its own: every five minutes.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
     ["run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance"]);
   const maintenance = JSON.parse(byId.get("run-job:create:maintenance").file.content);
@@ -261,7 +261,7 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(maintenance.spec.template.spec.template.spec.serviceAccountName, desired.serviceAccounts.runtime.email);
   assert.deepEqual(byId.get("scheduler:create:maintenance").argv, ["scheduler", "jobs", "create", "http",
     "synthetic-maintenance-trigger", ...manifest.schedulerFlags(desired, "maintenance")]);
-  assert.ok(byId.get("scheduler:create:maintenance").argv.includes("--schedule=* * * * *"));
+  assert.ok(byId.get("scheduler:create:maintenance").argv.includes("--schedule=*/5 * * * *"));
   assert.equal(byId.get("scheduler:create:maintenance").deferred, undefined);
   assert.deepEqual(byId.get("scheduler:pause:maintenance").argv, ["scheduler", "jobs", "pause",
     "synthetic-maintenance-trigger", "--project=synthetic-ops-project", "--location=us-east1"]);
@@ -448,7 +448,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   // Both triggers were created and then paused; apply never resumes either.
   assert.equal(trigger(world).state, "PAUSED");
   assert.equal(maintenanceTrigger(world).state, "PAUSED");
-  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
+  assert.equal(maintenanceTrigger(world).schedule, "*/5 * * * *");
   assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
   // A second apply of the now-empty plan changes nothing.
   gcloud.calls.length = 0;
@@ -1119,7 +1119,7 @@ test("the committed staging desired state plans only its own new resources in th
 });
 
 // ---------------------------------------------------------------------------
-// D-OPS4: the maintenance job and its every-minute trigger
+// D-OPS4: the maintenance job and its five-minute trigger
 
 test("the maintenance job is created from the contract, its trigger is created paused at the pinned cadence, and apply converges without a resume", () => {
   const desired = desiredState({ synthetic: false });
@@ -1136,7 +1136,7 @@ test("the maintenance job is created from the contract, its trigger is created p
   assert.ok(at(executor) > at("scheduler:pause:maintenance"));
   assert.ok(ops(result, (entry) => /maintenance/u.test(entry.id)).every((entry) => entry.deferred === undefined));
   const created = ops(result, (entry) => entry.id === "scheduler:create:maintenance")[0].argv;
-  assert.ok(created.includes("--schedule=* * * * *"));
+  assert.ok(created.includes("--schedule=*/5 * * * *"));
   assert.ok(created.includes("--max-retry-attempts=0"));
   assert.ok(created.includes("--time-zone=Etc/UTC"));
   assert.ok(created.includes(`--uri=https://run.googleapis.com/v2/projects/${desired.project}/locations/us-east1/jobs/synthetic-maintenance:run`));
@@ -1147,7 +1147,7 @@ test("the maintenance job is created from the contract, its trigger is created p
     ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);
   assert.equal(live.spec.template.spec.template.spec.serviceAccountName, desired.serviceAccounts.runtime.email);
   assert.equal(maintenanceTrigger(world).state, "PAUSED");
-  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
+  assert.equal(maintenanceTrigger(world).schedule, "*/5 * * * *");
   assert.equal(gcloud.calls.some((argv) => argv.includes("resume")), false);
   assert.equal(JSON.stringify(world.jobPolicies["synthetic-maintenance"]).includes(desired.serviceAccounts.scheduler.member), true);
   // Converged: nothing left, clean for OPS-10 (the paused trigger is committed PAUSED).
@@ -1323,13 +1323,35 @@ test("the planned trigger update cannot clear a stray header or body, so the pla
   assert.deepEqual(maintenanceTrigger(world).httpTarget.headers, INJECTED_SCHEDULER_HEADERS);
 });
 
+test("SQL downsizing and maintenance cadence preserve serving and Job runtime specs", () => {
+  const desired = desiredState({ synthetic: false, mutate: value => { value.cloudSql.tier = "db-custom-2-12288"; } });
+  const world = convergedWorld(desired, UNDEFERRED);
+  world.sqlInstances[0].settings.tier = "db-custom-4-16384";
+  maintenanceTrigger(world).schedule = "* * * * *";
+  const jobsBefore = structuredClone(world.jobs);
+  const gcloud = fake(desired, world);
+  const result = plan(desired, gcloud.runner, UNDEFERRED);
+  const executable = result.operations.filter(entry => entry.deferred === undefined);
+  assert.deepEqual(executable.map(entry => entry.id), ["cloud-sql:update", "scheduler:update:maintenance"]);
+  assert.ok(executable[0].argv.includes("--tier=db-custom-2-12288"));
+  assert.equal(executable[0].reason, "tier");
+  assert.equal(executable[0].argv.some(arg => arg.startsWith("--storage-size")), false);
+  assert.ok(executable[1].argv.includes("--schedule=*/5 * * * *"));
+  operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
+    createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
+  assert.deepEqual(world.jobs, jobsBefore, "runtime images, source commits and profiles stay exact");
+  assert.equal(world.sqlInstances[0].settings.tier, "db-custom-2-12288");
+  assert.equal(maintenanceTrigger(world).schedule, "*/5 * * * *");
+  assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
+});
+
 test("a drifted maintenance job or trigger is set back, apply keeps the live image and commit, and a running trigger is paused", () => {
   const desired = desiredState({ synthetic: false });
   const world = convergedWorld(desired, UNDEFERRED);
   const liveJob = () => world.jobs.find((job) => job.metadata.name === "synthetic-maintenance");
   assert.ok(liveJob().spec.template.spec.template.spec.containers[0].image.endsWith(LIVE_IMAGE.imageDigest));
   liveJob().spec.template.spec.template.spec.timeoutSeconds = "900";
-  maintenanceTrigger(world).schedule = "*/5 * * * *";
+  maintenanceTrigger(world).schedule = "* * * * *";
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, UNDEFERRED);
   // (The refresh trigger still waits for the owner's cadence, a deferral that is not drift.)
@@ -1340,10 +1362,10 @@ test("a drifted maintenance job or trigger is set back, apply keeps the live ima
   assert.equal(update.spec.template.spec.template.spec.timeoutSeconds, "300");
   assert.equal(container.image, `${desired.artifactRegistry.imageRepository}@sha256:${LIVE_IMAGE.imageDigest}`);
   assert.equal(container.env.find((entry) => entry.name === "DEPLOYMENT_SOURCE_COMMIT").value, LIVE_IMAGE.sourceCommit);
-  assert.ok(executable[1].argv.includes("--schedule=* * * * *"));
+  assert.ok(executable[1].argv.includes("--schedule=*/5 * * * *"));
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
-  assert.equal(maintenanceTrigger(world).schedule, "* * * * *");
+  assert.equal(maintenanceTrigger(world).schedule, "*/5 * * * *");
   assert.equal(plan(desired, gcloud.runner, UNDEFERRED).summary.executable, 0);
   // A drifted env value (the proof of another bucket) is set back too; a different secret version likewise.
   const env = liveJob().spec.template.spec.template.spec.containers[0].env;

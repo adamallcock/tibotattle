@@ -99,7 +99,7 @@
     },
     "maintenance": {
       "name": "tibotattle-staging-maintenance-trigger",
-      "schedule": "* * * * *",
+      "schedule": "*/5 * * * *",
       "state": "PAUSED"
     }
   },

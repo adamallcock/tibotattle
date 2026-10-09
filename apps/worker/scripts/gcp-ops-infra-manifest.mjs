@@ -46,8 +46,9 @@
  * MEAS-3), and the MP-2-lite maintenance job (MAINTENANCE_JOB_CONTRACT, D-OPS4).
  * Two jobs have a Cloud Scheduler trigger. The analytics-refresh cadence is
  * the owner's (decision D3; there is no default). The maintenance cadence is
- * the Worker cron's, every minute, and the validator pins it
- * (PINNED_SCHEDULER_CADENCES): a slower trigger leaves /api/ready not_ready.
+ * every five minutes for GCP cost control, independent of the Worker cron;
+ * the validator pins it (PINNED_SCHEDULER_CADENCES). The fixed per-pass batch
+ * can leave /api/ready not_ready while due work is backlogged.
  * Every trigger's state is closed: created and paused in one apply, and
  * resumed only explicitly (OPS-3). The OPS-4 probe jobs (cloud-run/
  * ops-probe-contract.mjs OPS_PROBE_JOBS), restore-verify, ledger and
@@ -158,14 +159,12 @@ export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh
 /** Jobs a Cloud Scheduler trigger runs. production-migrate is manual (OPS-10). */
 export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh", "maintenance"]);
 /**
- * Triggers whose cadence is not the owner's to choose, by job. The maintenance
- * pass reconciles at most 100 quarantine registrations per execution, the
- * Worker's batch, so the trigger must run every minute, the cron of every
- * d43c8f92 Worker environment: a slower trigger, or a sustained due rate above
- * 100 a minute, leaves /api/ready not_ready and lets pending_objects grow. The
- * value is the job's own contract constant
- * (postgres-maintenance-job-contract.mjs). The validator refuses any other
- * schedule, and a null one, for these (SCHEDULER_CADENCE_MISMATCH:<job>).
+ * The reviewed GCP maintenance cadence is one bounded pass every five minutes.
+ * A pass retains the 100-registration batch and safety windows; due work above
+ * 20 registrations/minute on average may backlog and make /api/ready not_ready.
+ * The two-hour lifecycle freshness threshold and separate Worker cron are
+ * unchanged. Single-sourced from postgres-maintenance-job-contract.mjs; any
+ * other cadence, including null, refuses (SCHEDULER_CADENCE_MISMATCH:<job>).
  */
 export const PINNED_SCHEDULER_CADENCES = Object.freeze({
   maintenance: POSTGRES_MAINTENANCE_JOB_SCHEDULE,

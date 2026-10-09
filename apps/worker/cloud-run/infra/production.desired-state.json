@@ -54,7 +54,7 @@
   },
   "cloudSql": {
     "instance": "tibotattle-primary",
-    "tier": "db-custom-4-16384",
+    "tier": "db-custom-2-12288",
     "storageSizeGb": 50,
     "backupStartTime": "07:00",
     "maxConnections": 100,
@@ -98,7 +98,7 @@
     },
     "maintenance": {
       "name": "tibotattle-maintenance-trigger",
-      "schedule": "* * * * *",
+      "schedule": "*/5 * * * *",
       "state": "PAUSED"
     }
   },

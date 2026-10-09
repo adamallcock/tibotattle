@@ -180,7 +180,7 @@ test("render makes no call and shows the estate", async () => {
   // The refresh trigger waits for the owner's cadence; the maintenance trigger's is pinned, so its flags render.
   assert.deepEqual(Object.keys(rendered.scheduler), ["analytics-refresh", "maintenance"]);
   assert.deepEqual(rendered.scheduler["analytics-refresh"], { unavailable: "SCHEDULER_CADENCE_UNSET" });
-  assert.ok(rendered.scheduler.maintenance.includes("--schedule=* * * * *"));
+  assert.ok(rendered.scheduler.maintenance.includes("--schedule=*/5 * * * *"));
   assert.ok(rendered.scheduler.maintenance.includes("--max-retry-attempts=0"));
   assert.deepEqual(Object.keys(rendered.jobs), ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual(rendered.verifierIam, { account: "synthetic-verifier@synthetic-ops-project.iam.gserviceaccount.com",
@@ -433,10 +433,10 @@ test("the committed desired states render offline: staging's and production's wa
   assert.equal(prod.jobs["analytics-refresh"].metadata.name, "tibotattle-analytics-refresh");
   // Round 15 (C3): the owner decides the refresh cadence after the production-scale
   // measurement, so the committed schedule is null and the trigger is not rendered.
-  // D-OPS4's maintenance trigger has its pinned every-minute cadence, so its flags render.
+  // D-OPS4's maintenance trigger has its pinned five-minute cadence, so its flags render.
   assert.deepEqual(Object.keys(prod.scheduler), ["analytics-refresh", "maintenance"]);
   assert.deepEqual(prod.scheduler["analytics-refresh"], { unavailable: "SCHEDULER_CADENCE_UNSET" });
-  assert.ok(prod.scheduler.maintenance.includes("--schedule=* * * * *"));
+  assert.ok(prod.scheduler.maintenance.includes("--schedule=*/5 * * * *"));
   assert.ok(prod.scheduler.maintenance.includes(
     "--uri=https://run.googleapis.com/v2/projects/tibotattle-prod/locations/us-east1/jobs/tibotattle-maintenance:run"));
   // The maintenance job reads the telemetry storage namespace, which this unpinned file leaves unassigned.

@@ -183,17 +183,17 @@ test("the fast path renders exactly three jobs: one owner-cadenced trigger and o
   }
 });
 
-test("the maintenance trigger's cadence is the job's own contract: every minute, never null, never another", () => {
+test("the maintenance trigger's cadence is the job's own contract: every five minutes, never null, never another", () => {
   // Single-sourced from the job's contract leaf (D-OPS4), not restated.
-  assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "* * * * *");
-  assert.deepEqual({ ...manifest.PINNED_SCHEDULER_CADENCES }, { maintenance: "* * * * *" });
+  assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE, "*/5 * * * *");
+  assert.deepEqual({ ...manifest.PINNED_SCHEDULER_CADENCES }, { maintenance: "*/5 * * * *" });
   assert.equal(manifest.MAINTENANCE_JOB_CONTRACT.schedule, maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE);
   assert.equal(Object.hasOwn(manifest.PINNED_SCHEDULER_CADENCES, "analytics-refresh"), false, "the refresh cadence is the owner's");
   const valid = manifest.validateDesiredState(fixture());
-  assert.deepEqual({ ...valid.scheduler.maintenance }, { name: "synthetic-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
+  assert.deepEqual({ ...valid.scheduler.maintenance }, { name: "synthetic-maintenance-trigger", schedule: "*/5 * * * *", state: "PAUSED" });
   assert.equal(valid.jobs.maintenance.maxConnections, 2);
-  // A slower trigger leaves /api/ready not_ready; no other cadence validates, and a bad cron is invalid first.
-  for (const schedule of [null, "0 * * * *", "*/5 * * * *", "*/2 * * * *", "* * * * 1", "15 3 * * *", "* * * 1 *"]) {
+  // Only the reviewed five-minute cadence validates; a bad cron is invalid first.
+  for (const schedule of [null, "0 * * * *", "* * * * *", "*/15 * * * *", "*/2 * * * *", "* * * * 1", "15 3 * * *", "* * * 1 *"]) {
     refused((value) => { value.scheduler.maintenance.schedule = schedule; }, "SCHEDULER_CADENCE_MISMATCH:maintenance");
   }
   for (const schedule of ["", "daily", "* * * *", "60 * * * *", "* * * * * *"]) {
@@ -220,6 +220,22 @@ test("the maintenance trigger's cadence is the job's own contract: every minute,
     assert.equal(raw.scheduler.maintenance.state, "PAUSED", environment);
     assert.equal(raw.jobs.maintenance.maxConnections, 2, environment);
   }
+});
+
+test("production cost controls change only SQL tier and the pinned maintenance cadence", () => {
+  const production = JSON.parse(COMMITTED.production);
+  const staging = JSON.parse(COMMITTED.staging);
+  assert.equal(production.cloudSql.tier, "db-custom-2-12288");
+  assert.equal(staging.cloudSql.tier, "db-custom-4-16384", "staging SQL capacity is unchanged");
+  const sqlTarget = manifest.validateDesiredState(fixture(value => { value.cloudSql.tier = production.cloudSql.tier; }));
+  assert.ok(manifest.cloudSqlCreateArgs(sqlTarget).includes("--tier=db-custom-2-12288"));
+  for (const raw of [production, staging]) {
+    assert.equal(raw.scheduler.maintenance.schedule, "*/5 * * * *");
+    assert.equal(raw.cloudSql.storageSizeGb, 50);
+    assert.equal(raw.jobs.maintenance.maxConnections, 2);
+  }
+  assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_CYCLE_MILLISECONDS, 60_000,
+    "cycle IDs remain minute-grained; cadence does not change replay identity");
 });
 
 test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENABLED without a cadence", () => {
@@ -511,11 +527,11 @@ test("the maintenance job renders C-MAINT's job contract, and CR-3's maintenance
   assert.throws(() => manifest.jobDefinition(pinned, "analytics-delivery"), { code: "JOB_NAME_UNKNOWN" });
   assert.throws(() => manifest.jobRenderBlocker(pinned, "analytics-delivery"), { code: "JOB_NAME_UNKNOWN" });
 
-  // Its trigger runs the job through the Cloud Run Admin API, in UTC, with no retry, every minute.
+  // Its trigger runs the job through the Cloud Run Admin API, in UTC, with no retry, every five minutes.
   assert.deepEqual([...manifest.schedulerFlags(pinned, "maintenance")], [
     `--project=${UNMARKED_PROJECT}`,
     "--location=us-east1",
-    "--schedule=* * * * *",
+    "--schedule=*/5 * * * *",
     "--time-zone=Etc/UTC",
     `--uri=https://run.googleapis.com/v2/projects/${UNMARKED_PROJECT}/locations/us-east1/jobs/synthetic-maintenance:run`,
     "--http-method=POST",
@@ -1389,7 +1405,7 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
   }
   assert.deepEqual([...manifest.deployedJobNames(desired)], ["production-migrate", "analytics-refresh", "maintenance"]);
   assert.deepEqual(desired.scheduler.maintenance, {
-    name: "tibotattle-staging-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
+    name: "tibotattle-staging-maintenance-trigger", schedule: "*/5 * * * *", state: "PAUSED" });
   // Its refresh job is the entry's production job, and the entry accepts its staging names.
   await assertRefreshRenderIsProductionJob(manifest.renderJob(desired, "analytics-refresh", IMAGE), desired);
 });

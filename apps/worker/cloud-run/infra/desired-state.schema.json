@@ -691,8 +691,8 @@
               "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
             },
             "schedule": {
-              "const": "* * * * *",
-              "description": "Pinned to the maintenance job's own cadence (POSTGRES_MAINTENANCE_JOB_SCHEDULE): every minute, as the d43c8f92 Worker cron; any other value, and null, is refused (SCHEDULER_CADENCE_MISMATCH)"
+              "const": "*/5 * * * *",
+              "description": "Pinned to the maintenance job's own cadence (POSTGRES_MAINTENANCE_JOB_SCHEDULE): every five minutes for the GCP maintenance pass; the Worker cron is separate; any other value, and null, is refused (SCHEDULER_CADENCE_MISMATCH)"
             },
             "state": {
               "enum": [

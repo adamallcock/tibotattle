@@ -720,7 +720,7 @@ tokens and every refusal, is [the orchestrator section](#h4-reference-the-pt-8-l
    equal), then resume the maintenance trigger under
    [GCP scheduler resume](./gcp-scheduler-resume.md). The job is `built`
    (C-MAINT); its trigger is in the committed desired state, created paused at
-   `* * * * *` (D-OPS4). After
+   `*/5 * * * *` (D-OPS4). After
    H.8, `node $S report` writes `pt8-report.json`. It refuses
    `CUTOVER_POST_LIVE_NOT_READY` until `post-live-check.json` exists.
 

@@ -23,6 +23,23 @@ H.8), [GCP origin rollout](./gcp-rollout.md) (pause before and resume after each
 roll), [GCP brake and incidents](./gcp-brake-and-incidents.md), and the
 [infrastructure desired state](../../apps/worker/cloud-run/infra/README.md).
 
+## Schedule-only cost control
+
+The GCP maintenance contract is now every five minutes. A schedule-only update
+preserves the trigger's observed enabled/paused state, authentication target,
+retry settings and the analytics-refresh trigger's separate cadence. It does
+not rebuild or replace any deployed origin or Job image. Bind the exact current
+runtime profiles from readback; origin and Jobs may deliberately have different
+source/image identities. The committed `PAUSED` desired state remains the
+bootstrap/resume policy, not an instruction to pause an already authorized live
+trigger as part of this narrow change. Use a reviewed targeted scheduler update
+rather than applying the whole estate for a cadence-only operation.
+
+The bounded cleanup batch, both 24-hour orphan safety windows, auth expiry and
+two-hour readiness freshness stay unchanged. Lower examination capacity can
+leave reconciliation backlogged; readiness still refuses incomplete cleanup.
+The separate Worker cron remains at one minute.
+
 ## Status and claim boundary
 
 - **Basis.** The fast-path line `claude/gcp-fastpath-final` at `c80f99b9`, whose
@@ -34,7 +51,7 @@ roll), [GCP brake and incidents](./gcp-brake-and-incidents.md), and the
   probe assumes that pausing a trigger updates its `userUpdateTime`; the first
   owner-run readback must confirm that after a real pause. The refresh
   cadence and the measured run time of the production-scale refresh are
-  undecided. The maintenance trigger's cadence is not: it is every minute,
+  undecided. The maintenance trigger's cadence is not: it is every five minutes,
   pinned to the job's contract (D-OPS4).
 - **Decisions encoded.**
   - Explicit resume only. Apply never resumes a trigger.
@@ -48,7 +65,7 @@ roll), [GCP brake and incidents](./gcp-brake-and-incidents.md), and the
 
 | Piece | State |
 |---|---|
-| Triggers in the committed desired state | `built`: one per scheduled job, `analytics-refresh` (the owner's cadence, `null` until decided) and `maintenance` (every minute, pinned, D-OPS4). The migration job is manual and has no trigger |
+| Triggers in the committed desired state | `built`: one per scheduled job, `analytics-refresh` (the owner's cadence, `null` until decided) and `maintenance` (every five minutes, pinned, D-OPS4). The migration job is manual and has no trigger |
 | Apply creates a trigger and pauses it in the same apply, then grants the scheduler account `roles/run.jobsExecutor` on the job | `built`. A trigger whose pause failed cannot start the job: apply stops at the failed pause before the grant, a job's grant is withheld while its cadence is unset, and a grant already live blocks the create (`SCHEDULER_CREATE_EXECUTOR_BOUND:<job>`) |
 | `gcp-infra.mjs readback --require-clean --require-cadence` refuses an unset cadence | `built`. The cutover's scheduler gate; the rollout's `--require-clean` still accepts it, because the cadence is measured on the rolled image |
 | Apply never resumes. It pauses a live trigger that runs while `PAUSED` is committed | `built` |
@@ -236,7 +253,7 @@ periodically and it notifies no one.
 | Gap | State |
 |---|---|
 | OPS-3 `pause-all` and `resume-all`, ordered, with explicit authorization | `not built` (D-OPS3). Requirement: `resume-all` resumes only triggers in this plane's committed desired state with state `ENABLED` that were live `ENABLED` before the pause, never the roll receipt's `pausedTriggers` and never another estate's triggers |
-| The maintenance job and its trigger in the desired state, with a cadence | `built` (D-OPS4): job `maintenance`, trigger `scheduler.maintenance`, `* * * * *`, committed `PAUSED`. Open: the first apply, and the resume (OPS-3) |
+| The maintenance job and its trigger in the desired state, with a cadence | `built` (D-OPS4): job `maintenance`, trigger `scheduler.maintenance`, `*/5 * * * *`, committed `PAUSED`. Open: the first apply, and the resume (OPS-3) |
 | The refresh cadence | Decided after the production-scale measurement (owner decisions round 15, C3). Production commits `schedule: null`, so pass 1 of the production apply creates no trigger (`SCHEDULER_CADENCE_UNSET`) and plans no pause. When the owner supplies the cadence it is committed, and a later plan creates the trigger `PAUSED` under its own digest (`docs/runbooks/gcp-production-apply.md`). The task timeout is 86,400 s (24 h, round 17); the run time comes from the production-tier measurement (`docs/receipts/2026-10-03-gcp-kpar-mem.md` for the local figures), daily if it allows, otherwise every two days. The advisory lock refuses an overlapping run. Staging has none. No default |
 | Confirmation that a pause updates `userUpdateTime` | Open (OPS2-READ). Pause a staging trigger and read it back before the 6 hour threshold is relied on |
 | Periodic probe runner and notification target; alert on a refresh that exits 0 as `LOCK_HELD` or has no completed run | `not built` (E-OPS5) |

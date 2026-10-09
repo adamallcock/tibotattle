@@ -29,8 +29,9 @@
  *     batch per one-minute cron), so a backlog of up to 100 due registrations
  *     completes in one pass, as it does on the Worker. The page is complete
  *     when nothing due remains beyond it and no candidate was deferred.
- *     Throughput parity needs the trigger to run every minute, like the
- *     Worker cron;
+ *     GCP schedules this bounded batch every five minutes for cost control;
+ *     the Worker cron remains every minute. Safety windows and replay identity
+ *     are unchanged, while GCP steady examination capacity is 20/minute;
  *   - purges (MAINT-PURGE): the identity and device-lifecycle purges of the
  *     scheduled slice (src/postgres-maintenance.ts), which the Worker's
  *     scheduled handler runs every invocation: one bounded page each of

@@ -32,7 +32,7 @@ const EXECUTOR = "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serv
   + "tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|";
 const MAINTENANCE_EXECUTOR = "run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:"
   + "tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|";
-// D-OPS4's maintenance job and its pinned every-minute trigger, committed PAUSED.
+// D-OPS4's maintenance job and its pinned five-minute trigger, committed PAUSED.
 const MAINTENANCE_TRIGGER = "tibotattle-maintenance-trigger";
 /** Whether the scheduler account holds run.jobsExecutor on the named job. */
 const executorOn = (world, job) => JSON.stringify(world.jobPolicies[job] ?? {}).includes("roles/run.jobsExecutor");

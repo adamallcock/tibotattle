@@ -57,6 +57,15 @@ production estate reads unclean until that instance is deleted.
   see [Build-source bucket](#build-source-bucket-build-source)). It is the one
   bucket a plane names that is not plane-named: it belongs to the project.
 
+The production SQL desired tier is `db-custom-2-12288` (2 vCPU, 12 GiB RAM);
+staging keeps its existing tier. This desired change does not alter storage,
+backup/PITR policy, origin or Job resource profiles, images or source bindings.
+Provider application and resulting availability are separate operational gates. A schedule-only
+change preserves the observed trigger state and all runtime image/source pins;
+origin and Jobs may deliberately differ. The committed `PAUSED` state is the
+bootstrap policy. Use a reviewed narrow scheduler update for an existing live
+trigger rather than a whole-estate apply that can reconcile unrelated drift.
+
 ## Maintenance job and its trigger (D-OPS4)
 
 The desired state names three Cloud Run Jobs, and two have a Cloud Scheduler
@@ -66,17 +75,20 @@ trigger:
 |---|---|
 | `production-migrate` (OPS-10, manual) | none |
 | `analytics-refresh` | `scheduler.analytics-refresh`: the owner's cadence (decision D3), `null` until decided |
-| `maintenance` | `scheduler.maintenance`: **every minute, `* * * * *`**, pinned |
+| `maintenance` | `scheduler.maintenance`: **every five minutes, `*/5 * * * *`**, pinned |
 
 The maintenance job runs C-MAINT's MP-2-lite lifecycle pass
 (`dist/postgres-maintenance-job.mjs --profile=maintenance-job`, built by the
 same image) as the runtime account, with one primary pool of 2
 (`jobs.maintenance.maxConnections`, at least the job's own
 `POSTGRES_MAINTENANCE_JOB_POOL_MAX`). Each execution reconciles at most 100
-due quarantine registrations, the d43c8f92 Worker's batch, so the trigger must
-run every minute: a slower trigger, or a sustained due rate above 100 a minute,
-leaves `/api/ready` not_ready and lets `pending_objects` grow. The validator
-therefore pins the cadence to the job's contract constant
+due quarantine registrations, the d43c8f92 Worker's batch. GCP runs this bounded
+pass every five minutes for cost control; the separate Worker cron stays at one
+minute. Examination capacity is now 1,200 registrations/hour. A due backlog
+above the fixed page leaves `/api/ready` not_ready until later passes drain it.
+The lifecycle freshness limit remains two hours; auth expiry and both 24-hour
+orphan safety windows remain unchanged. The validator pins the cadence to the
+job's contract constant
 (`cloud-run/postgres-maintenance-job-contract.mjs`) and refuses any other
 schedule, and `null`, as `SCHEDULER_CADENCE_MISMATCH:maintenance`.
 
