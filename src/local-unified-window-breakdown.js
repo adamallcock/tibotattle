@@ -59,7 +59,7 @@ function recordFromRow(row) {
       codexSpeedMode: row.codex_speed_mode,
       apiServiceTier: row.api_service_tier,
     },
-    surfaceClassification: {},
+    surfaceClassification: { threadSource: row.thread_source },
     // Rollout logs carry no account identity; the projection treats that as
     // unattributed, which is exactly what a repricing figure needs.
     accountScope: { status: "unavailable" },
@@ -73,9 +73,9 @@ function nullableTokenCount(value) {
 /**
  * Reprice an iterable of unified-index usage rows and group the priced result
  * by model and by observed speed. Pure over its input: the same rows always
- * produce the same breakdown, and Spark is separated out exactly as the main
- * projection separates it, because Spark meters against its own allowance and
- * an API-equivalent figure for it is not comparable with the primary pool.
+ * produce the same breakdown. Separate-allowance usage is excluded from the
+ * primary-pool breakdown exactly as it is in the main projection, retaining
+ * its API price in the existing separate-allowance carrier.
  *
  * @param {Iterable} rows  Rows shaped like the unified-index usage SELECT
  *   (`observed_at_ms`, `model_id`, `codex_speed_mode`, `api_service_tier`, and
@@ -96,17 +96,17 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
   let fastEvents = 0;
   let ultrafastEvents = 0;
   let ultrafastCostUsd = 0;
-  let sparkEvents = 0;
-  let sparkCostUsd = 0;
+  let separateAllowanceEvents = 0;
+  let separateAllowanceCostUsd = 0;
 
   for (const row of rows) {
     const record = recordFromRow(row);
     const projection = usageProjection(record, "unknown", pricer);
     if (projection === null) continue;
     events += 1;
-    if (projection.isSpark) {
-      sparkEvents += 1;
-      sparkCostUsd += projection.apiPriceEquivalentUsd;
+    if (projection.isSeparateAllowance) {
+      separateAllowanceEvents += 1;
+      separateAllowanceCostUsd += projection.apiPriceEquivalentUsd;
       continue;
     }
     mainEvents += 1;
@@ -205,8 +205,8 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
         .map((rowValue) => [rowValue.speed, rowValue]),
     ),
     spark: {
-      events: sparkEvents,
-      costUsd: roundUsd(sparkCostUsd),
+      events: separateAllowanceEvents,
+      costUsd: roundUsd(separateAllowanceCostUsd),
     },
   };
 }
@@ -223,6 +223,7 @@ const USAGE_WINDOW_SELECT = `
          m.model_id AS model_id,
          t.codex_speed_mode AS codex_speed_mode,
          t.api_service_tier AS api_service_tier,
+         s.thread_source AS thread_source,
          u.total_input_context AS total_input_context,
          u.tokens_in_uncached AS tokens_in_uncached,
          u.tokens_in_cache_read AS tokens_in_cache_read,
@@ -233,6 +234,7 @@ const USAGE_WINDOW_SELECT = `
   FROM usage_event u
   JOIN model m ON m.id = u.model_id
   JOIN tier_semantics t ON t.id = u.tier_id
+  JOIN surface_class s ON s.id = u.surface_id
   WHERE u.observed_at_ms >= ? AND u.observed_at_ms <= ?`;
 
 /**

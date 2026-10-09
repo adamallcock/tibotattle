@@ -240,7 +240,8 @@ export async function readLocalCollectorProjection(
           for (const period of periods) {
             if (observedMs >= period.start) addUsageToPeriod(period.summary, projection);
           }
-          if (observedMs >= recentStartMs) {
+          if (observedMs >= recentStartMs && projection !== null
+              && (!projection.isSeparateAllowance || projection.isSpark)) {
             addTimelineUsage(
               projection?.isSpark ? sparkTimelineBuckets : timelineBuckets,
               observedMs,

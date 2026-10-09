@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   beginUnifiedIndexGeneration, createUnifiedIndexWriter, openLocalUnifiedIndex,
-  LOCAL_UNIFIED_INDEX_PARSER_VERSION, outcomeName, reasoningEffortName,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION, LOCAL_UNIFIED_INDEX_USER_VERSION, outcomeName, reasoningEffortName,
 } from "../src/local-unified-index.js";
 import { compactQuotaPlanEvidence, createLocalUnifiedTelemetryV11Reader } from "../src/local-unified-contribution-attribution.js";
 import { createLocalUnifiedUsageAttributionReader } from "../src/local-unified-accounting-source.js";
@@ -185,6 +185,37 @@ test("exact historical plans survive canonical collisions while usage/session id
   ]);
   assert.deepEqual(reader.days(), [DAY]);
   assert.deepEqual(project(reader.readDay(DAY)), result);
+});
+
+test("attribution readers accept the reviewed v12 index and refuse older or future physical formats", async (t) => {
+  assert.equal(LOCAL_UNIFIED_INDEX_USER_VERSION, 12,
+    "another format change must explicitly review the attribution reader contract");
+  const { file } = await writeFixture(t, { records: [{ id: 1, quotas: [{ plan: "pro" }] }] });
+  const { database, reader } = readFixture(t, file, {}, false);
+  const accepted = project(reader.readDay(DAY));
+  assert.equal(stream(accepted, "usage").length, 1);
+  assert.equal(reader.readDayWithV12Evidence(DAY).telemetryV12Evidence.boundaryLookupComplete, true);
+  for (const version of [11, 13]) {
+    database.exec(`
+      PRAGMA user_version=${version};
+      UPDATE meta SET value='${version}' WHERE key IN (
+        'compatibility_format_user_version', 'compatibility_minimum_reader_user_version',
+        'compatibility_minimum_writer_user_version');
+    `);
+    for (const read of [() => reader.days(), () => reader.readDay(DAY),
+      () => reader.readDayWithV12Evidence(DAY), () => reader.projectionEvidence({ binding })]) {
+      assert.throws(read, { code: "local_telemetry_v11_index_unavailable" });
+    }
+    assert.equal(database.prepare("PRAGMA user_version").get().user_version, version);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM usage_event").get().count, 1);
+  }
+  database.exec(`
+    PRAGMA user_version=12;
+    UPDATE meta SET value='12' WHERE key IN (
+      'compatibility_format_user_version', 'compatibility_minimum_reader_user_version',
+      'compatibility_minimum_writer_user_version');
+  `);
+  assert.deepEqual(project(reader.readDay(DAY)), accepted);
 });
 
 test("source cursor ordinal mismatch withholds local order while preserving a proven boundary absence", async (t) => {
@@ -535,7 +566,7 @@ test("acquisition bounds fail closed without dropping records or mutating the in
   assert.throws(() => reader.readDay(DAY), { code: "local_telemetry_v11_day_limit_exceeded" });
   assert.throws(() => reader.readDayWithV12Evidence(DAY), { code: "local_telemetry_v11_day_limit_exceeded" });
   assert.deepEqual(database.prepare("SELECT * FROM usage_event ORDER BY event_key").all(), before);
-  assert.equal(database.prepare("PRAGMA user_version").get().user_version, 11);
+  assert.equal(database.prepare("PRAGMA user_version").get().user_version, LOCAL_UNIFIED_INDEX_USER_VERSION);
   assert.throws(() => reader.readDay("2026-02-30"), { code: "local_telemetry_v11_invalid_day" });
   assert.throws(() => createLocalUnifiedTelemetryV11Reader(database, { ...codecs, limits: { dayRows: Infinity } }), {
     code: "local_telemetry_v11_invalid_limits",

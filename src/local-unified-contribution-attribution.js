@@ -17,6 +17,7 @@ import { exportLimitProvider } from "./export/index.js";
 import { createLocalUnifiedUsageAttributionReader } from "./local-unified-accounting-source.js";
 import {
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
   readUnifiedIndexGenerationDescriptor,
 } from "./local-unified-index.js";
 import { sanitizeAccountScope } from "./providers/codex/account.js";
@@ -242,7 +243,7 @@ function contextFor(provider) {
 }
 
 /**
- * Local composition port. It reads only schema-11 content-free indexed facts;
+ * Local composition port. It reads only current-schema content-free indexed facts;
  * callers inject codecs and optional already-captured account markers. It does
  * not read auth, enrollment, secrets, session files, or the collector checkpoint.
  */
@@ -368,7 +369,7 @@ export function createLocalUnifiedTelemetryV11Reader(database, {
       const before = readUnifiedIndexGenerationDescriptor(database);
       if (before === null || !["complete", "partial"].includes(before.status)
           || before.schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
-          || database.prepare("PRAGMA user_version").get().user_version !== 11) fail("index_unavailable");
+          || database.prepare("PRAGMA user_version").get().user_version !== LOCAL_UNIFIED_INDEX_USER_VERSION) fail("index_unavailable");
       const beforeChanges = changes();
       const dataVersion = database.prepare("PRAGMA data_version").get().data_version;
       const key = `${before.fingerprint}:${dataVersion}:${beforeChanges}`;

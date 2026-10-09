@@ -59,6 +59,7 @@ import {
   beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexRecoveryLockPath,
   inspectLocalUnifiedIndex,
+  isLocalUnifiedIndexBoundaryParserVersion,
   LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -320,7 +321,7 @@ function jsonlBytes(lines) {
   return Buffer.byteLength(`${lines.join("\n")}\n`);
 }
 
-function sessionMeta(sessionId, { parentId = null, threadSource = "user" } = {}) {
+function sessionMeta(sessionId, { parentId = null, threadSource = "user", source } = {}) {
   return JSON.stringify({
     timestamp: "2026-07-25T00:00:00.000Z",
     type: "session_meta",
@@ -329,6 +330,7 @@ function sessionMeta(sessionId, { parentId = null, threadSource = "user" } = {})
       session_id: sessionId,
       ...(parentId === null ? {} : { forked_from_id: parentId, parent_thread_id: parentId }),
       thread_source: threadSource,
+      ...(source === undefined ? {} : { source }),
       originator: "codex_cli_rs",
       cwd: "/Users/nobody/project",
     },
@@ -1179,7 +1181,7 @@ test("deferred secondary indexes preserve logical facts and are present before p
   }
 });
 
-test("v11 predecessor indexes are additive writable maintenance and read-only opens preserve older v11 files", async () => {
+test("predecessor indexes are additive writable maintenance and read-only opens preserve their absence", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-attribution-index.jsonl": [
       sessionMeta("session-attribution-index"),
@@ -1202,7 +1204,7 @@ test("v11 predecessor indexes are additive writable maintenance and read-only op
     const facts = logicalProjection(old);
     const generation = readUnifiedIndexGenerationDescriptor(old);
     assert.deepEqual(secondaryIndexNames(old), [...SECONDARY_INDEX_NAMES].sort());
-    assert.equal(Number(old.prepare("PRAGMA user_version").get().user_version), 11);
+    assert.equal(Number(old.prepare("PRAGMA user_version").get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
     old.exec(`
       DROP INDEX usage_event_source_predecessor;
       DROP INDEX usage_event_session_predecessor;
@@ -1226,13 +1228,13 @@ test("v11 predecessor indexes are additive writable maintenance and read-only op
       assert.deepEqual(secondaryIndexNames(upgraded), [...SECONDARY_INDEX_NAMES].sort());
       assert.deepEqual(logicalProjection(upgraded), facts);
       assert.deepEqual(readUnifiedIndexGenerationDescriptor(upgraded), generation);
-      assert.equal(Number(upgraded.prepare("PRAGMA user_version").get().user_version), 11);
+      assert.equal(Number(upgraded.prepare("PRAGMA user_version").get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
       assert.deepEqual(Object.fromEntries(upgraded.prepare(`
         SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
       `).all().map((row) => [row.key, row.value])), {
-        compatibility_format_user_version: "11",
-        compatibility_minimum_reader_user_version: "11",
-        compatibility_minimum_writer_user_version: "11",
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version: String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version: String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
       });
     } finally {
       upgraded.close();
@@ -2141,7 +2143,7 @@ for (const history of ["reset", "anchored-null"]) {
             FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
             WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
           assert.equal(stamp.parser_version, history === "reset"
-            ? "unified-rollout-typed-v19-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+            ? `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-parent-model` : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
         } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
@@ -5322,7 +5324,7 @@ test("a fork created after its parent was indexed still suppresses replay", asyn
   }
 });
 
-test("a version-1 index can be opened through the additive v11 schema migration", async () => {
+test("a version-1 index can be opened through the additive v12 schema migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -5389,7 +5391,7 @@ test("a version-1 index can be opened through the additive v11 schema migration"
   }
 });
 
-test("the schema-8 index shipped by v0.1.16 migrates transactionally to v11", async () => {
+test("the schema-8 index shipped by v0.1.16 migrates transactionally to v12", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v016-schema8.jsonl": [
       sessionMeta("session-v016-schema8"),
@@ -5530,7 +5532,7 @@ test("the schema-8 index shipped by v0.1.16 migrates transactionally to v11", as
   }
 });
 
-test("a version-9 index migrates transactionally to v11 with compatibility metadata", async () => {
+test("a version-9 index migrates transactionally to v12 with compatibility metadata", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v9.jsonl": [
       sessionMeta("session-v9"),
@@ -5602,7 +5604,7 @@ test("a version-9 index migrates transactionally to v11 with compatibility metad
   }
 });
 
-test("normal ingest cold-rebuilds recognized v8 and v9 indexes atomically into v11", async (t) => {
+test("normal ingest cold-rebuilds recognized v8 and v9 indexes atomically into v12", async (t) => {
   for (const userVersion of [8, 9]) {
     await t.test(`physical schema ${userVersion}`, async () => {
       const { root } = await corpus({
@@ -5749,7 +5751,7 @@ test("normal ingest cold-rebuilds recognized v8 and v9 indexes atomically into v
   }
 });
 
-test("a version-10 index migrates transactionally to v11 cleanup indexes", async () => {
+test("a version-10 index migrates transactionally to v12 with cleanup indexes", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v10-transition.jsonl": [
       sessionMeta("session-v10-transition"),
@@ -5803,9 +5805,9 @@ test("a version-10 index migrates transactionally to v11 cleanup indexes", async
       assert.deepEqual(Object.fromEntries(writable.prepare(`
         SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
       `).all().map((row) => [row.key, row.value])), {
-        compatibility_format_user_version: "11",
-        compatibility_minimum_reader_user_version: "11",
-        compatibility_minimum_writer_user_version: "11",
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version: String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version: String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
       });
     } finally {
       writable.close();
@@ -5913,12 +5915,12 @@ test("a failed staged v10 migration leaves the live index byte-identical", async
         'compatibility_format_user_version',
         'compatibility_minimum_reader_user_version',
         'compatibility_minimum_writer_user_version');
-      CREATE TRIGGER reject_v11_compatibility_stamp
+      CREATE TRIGGER reject_current_compatibility_stamp
       BEFORE UPDATE OF value ON meta
       WHEN OLD.key = 'compatibility_format_user_version'
-        AND NEW.value = '11'
+        AND NEW.value = '${LOCAL_UNIFIED_INDEX_USER_VERSION}'
       BEGIN
-        SELECT RAISE(ABORT, 'fixture rejects v11 compatibility stamp');
+        SELECT RAISE(ABORT, 'fixture rejects current compatibility stamp');
       END;
       PRAGMA user_version=10;
       COMMIT;
@@ -6184,6 +6186,74 @@ test("a symlinked parent directory is never traversed for index opens or creatio
         lstat(realNewFile),
         (error) => error?.code === "ENOENT",
       );
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the v11 to v12 semantics migration preserves every table and row and fences v11 access", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v11-semantics.jsonl": [
+      sessionMeta("synthetic-v11-source"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10), { usedPercent: 12 }),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  function retainedTables(database) {
+    return database.prepare(`SELECT name, sql FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all()
+      .map(({ name, sql }) => ({
+        name,
+        sql,
+        rows: database.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all()
+          .filter((row) => name !== "meta" || !row.key.startsWith("compatibility_")),
+      }));
+  }
+  try {
+    await build(root);
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      UPDATE meta SET value = '11' WHERE key LIKE 'compatibility_%';
+      UPDATE parser_version SET parser_version = 'unified-rollout-typed-v19';
+      PRAGMA user_version=11;
+    `);
+    const tablesBefore = retainedTables(old);
+    old.close();
+    const migrated = openLocalUnifiedIndex(indexFile);
+    try {
+      assert.equal(migrated.prepare("PRAGMA user_version").get().user_version, 12);
+      assert.deepEqual(retainedTables(migrated), tablesBefore);
+      assert.deepEqual(migrated.prepare(`SELECT value FROM meta
+        WHERE key LIKE 'compatibility_%' ORDER BY key`).all().map((row) => row.value), ["12", "12", "12"]);
+      assert.equal(migrated.prepare("PRAGMA quick_check").get().quick_check, "ok");
+      assert.deepEqual(migrated.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      migrated.close();
+    }
+
+    // Exercise the unchanged reader/writer preflight with the previous
+    // reader's fixed v11 capability. Only the three version constants differ;
+    // the fixture imports the same platform guard and cannot mutate the file.
+    let legacyReaderSource = await readFile(new URL("../src/local-unified-index.js", import.meta.url), "utf8");
+    let changedConstants = 0;
+    legacyReaderSource = legacyReaderSource.replace(
+      /export const (LOCAL_UNIFIED_INDEX_(?:USER_VERSION|MINIMUM_READER_USER_VERSION|MINIMUM_WRITER_USER_VERSION)) = 12;/gu,
+      (_match, name) => { changedConstants += 1; return `export const ${name} = 11;`; },
+    ).replace('"./platform/index.js"', JSON.stringify(new URL("../src/platform/index.js", import.meta.url).href));
+    assert.equal(changedConstants, 3);
+    const legacyReader = await import(`data:text/javascript;base64,${Buffer.from(legacyReaderSource).toString("base64")}`);
+    const bytesBeforeRefusal = await readFile(indexFile);
+    for (const readOnly of [true, false]) {
+      assert.throws(() => legacyReader.openLocalUnifiedIndex(indexFile, { readOnly }), (error) => {
+        assert.equal(error.code, "local_unified_index_schema_newer");
+        assert.equal(error.compatibility.supportedUserVersion, 11);
+        assert.equal(error.compatibility.requiredUserVersion, 12);
+        assert.equal(error.compatibility.accessMode, readOnly ? "read" : "write");
+        return true;
+      });
+      assert.deepEqual(await readFile(indexFile), bytesBeforeRefusal);
     }
   } finally {
     await rm(root, { recursive: true });
@@ -6870,6 +6940,94 @@ test("a v5 development cursor cold-rebuilds into v10 rollout identity", async ()
   } finally {
     await rm(root, { recursive: true });
   }
+});
+
+test("v20 reclassifies present guardian sources once while absent v19 facts and tokens remain intact", async () => {
+  const presentName = "rollout-2026-07-25T00-00-00-present-review.jsonl";
+  const absentName = "rollout-2026-07-25T01-00-00-absent-review.jsonl";
+  const guardianSource = { threadSource: "guardian_review", source: { subagent: { other: "guardian" } } };
+  const { root, sessions } = await corpus({
+    [presentName]: [
+      sessionMeta("synthetic-present-review", guardianSource),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10), { usedPercent: 10 }),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20), { usedPercent: 12 }),
+    ],
+    [absentName]: [
+      sessionMeta("synthetic-absent-review", guardianSource),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-auto-review"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5), { usedPercent: 13 }),
+    ],
+    "rollout-2026-07-25T02-00-00-ordinary-model.jsonl": [
+      sessionMeta("synthetic-ordinary-model"),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-auto-review"),
+      tokenCount("2026-07-25T02:00:01.000Z", usage(70, 7), usage(70, 7), { usedPercent: 14 }),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root, indexFile, secretFile: join(root, "salt"), contractVersion: CONTRACT,
+  });
+  const facts = (database) => database.prepare(`SELECT hex(u.event_key) AS event_key,
+    u.observed_at_ms, u.tokens_in_uncached, u.tokens_out_text,
+    s.thread_source, s.surface, s.agent_scope, s.lineage_disposition, p.parser_version
+    FROM usage_event u JOIN surface_class s ON s.id = u.surface_id
+    JOIN parser_version p ON p.id = u.parser_version_id ORDER BY u.observed_at_ms`).all()
+    .map((row) => ({ ...row }));
+  try {
+    await ingest();
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      UPDATE surface_class SET thread_source = 'unknown' WHERE thread_source = 'auto_review';
+      UPDATE parser_version SET parser_version = 'unified-rollout-typed-v19';
+      UPDATE meta SET value = '11' WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=11;
+    `);
+    const oldFacts = facts(old);
+    assert.equal(oldFacts.length, 4);
+    old.close();
+    const sourceBefore = await readFile(join(sessions, presentName));
+    await rm(join(sessions, absentName));
+
+    const upgraded = await ingest();
+    assert.equal(upgraded.rebuilt, undefined, "v11 keeps its additive staged migration");
+    assert.equal(upgraded.sourcesReparsedForParserVersion, 2);
+    assert.equal(upgraded.totalUsageEvents, 4);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    let upgradedFacts;
+    try {
+      assert.equal(database.prepare("PRAGMA user_version").get().user_version, 12);
+      upgradedFacts = facts(database);
+      assert.deepEqual(upgradedFacts, oldFacts.map((row, index) => ({
+        ...row,
+        thread_source: index < 2 ? "auto_review" : row.thread_source,
+        parser_version: index === 2 ? "unified-rollout-typed-v19" : LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      })));
+      assert.equal(upgradedFacts.reduce((sum, row) => sum + row.tokens_in_uncached, 0), 420);
+      assert.equal(upgradedFacts.reduce((sum, row) => sum + row.tokens_out_text, 0), 42);
+    } finally {
+      database.close();
+    }
+    const repeated = await ingest();
+    assert.equal(repeated.sourcesReparsedForParserVersion, 0);
+    assert.equal(repeated.insertedUsageEvents, 0);
+    assert.equal(repeated.totalUsageEvents, 4);
+    const settled = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try { assert.deepEqual(facts(settled), upgradedFacts); } finally { settled.close(); }
+    assert.deepEqual(await readFile(join(sessions, presentName)), sourceBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("v19 parser provenance variants remain qualified after the v20 upgrade", () => {
+  for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
+    for (const assumption of ["", "-cache-write-zero"]) {
+      assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v19${suffix}${assumption}`), true);
+      assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v20${suffix}${assumption}`), true);
+    }
+  }
+  assert.equal(isLocalUnifiedIndexBoundaryParserVersion("unified-rollout-typed-v21"), false);
 });
 
 test("a parser-version bump heals unchanged content and dependent lineage quarantines exactly once", async () => {

@@ -19,7 +19,7 @@ export function attributionFixtureMarker(overrides = {}) {
   };
 }
 
-/** Synthetic, content-free schema-11 publication through the real writer. */
+/** Synthetic, content-free current-schema publication through the real writer. */
 export async function writeAttributionFixture(
   file,
   { plans = ["pro", "plus"], publish = true, observedAtMs = ATTRIBUTION_FIXTURE_START, boundaryFlags = [] } = {},

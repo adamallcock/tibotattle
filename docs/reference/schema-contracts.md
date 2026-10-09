@@ -144,7 +144,7 @@ objects are closed; producer, consumer, consent, storage, relay, public
 projection, and deletion/export paths must declare the same transition.
 
 Local API valuation methodology is `provider-neutral-api-price-equivalent-v0.3`
-and replay materialization is `local-replay-safe-accounting-v0.18`. Current
+and replay materialization is `local-replay-safe-accounting-v0.19`. Current
 companion readers and writers require `source_native` context behavior: absent
 context remains unavailable rather than becoming observed zero. An inferred
 input total is usable only when its component observations are complete; known
@@ -154,6 +154,16 @@ to the full ledger for incomplete evidence. Old materialization is withheld for
 rebuild; an explicitly requested `legacy_zero` compatibility adapter retains its
 original meaning rather than becoming the current default. This does not
 rewrite stored source observations or alter retained price-card evidence.
+
+The v0.19 materialization separates explicitly classified auto-review events
+from the primary allowance beginning at the inclusive UTC policy boundary
+`2026-10-06T00:00:00.000Z`. Its local archive accounting projection is
+`local-archive-accounting-projection-v3`. Earlier materializations are not
+current results; an existing explicitly stale projection may remain visible
+until a complete replacement is published. Tokens, components, exact API-price
+evidence and source provenance are preserved. Spark retains its distinct
+usage/quota series. This local policy does not widen the hosted telemetry
+vocabulary or change the provider-neutral API valuation methodology.
 
 A version change includes:
 

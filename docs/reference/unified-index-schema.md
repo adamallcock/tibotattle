@@ -30,8 +30,8 @@ one another:
 | --- | --- | --- |
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
-| SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v19` | Meaning and provenance of facts extracted from rollout sources, including reviewed GPT-6.1 Sol identity refresh and Standard/Fast/Ultrafast turn-context tier observations, structural record classification, a 512 KiB default line cap, paginated history boundaries, and exact selected input/output totals. |
+| SQLite `PRAGMA user_version` | `12` | Table/index/migration and interpretation compatibility generation. |
+| Parser version | `unified-rollout-typed-v20` | Meaning and provenance of facts extracted from rollout sources, including exact guardian auto-review classification, reviewed GPT-6.1 Sol identity and Standard/Fast/Ultrafast tier observations, structural record classification, paginated history boundaries, and exact selected input/output totals. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -54,17 +54,18 @@ open.
 | 9 | Stable thread identity separated from immutable rollout identity; rollout-scoped keys and paginated history-base boundaries. | Primary-key semantics changed, so ingest performs a cold staged rebuild rather than mixing v8/v9 facts. |
 | 10 | One opened physical source snapshot per scan; source dev/inode/time identity and quarantine of malformed accounting or unfinished tails. | Changed damaged sources retry from byte zero; unchanged quarantined sources terminate cheaply. |
 | 11 | Required source- and quota-keyed usage indexes. | Schema 10 migrates additively on a staged copy; the indexes bound late source quarantine and orphan quota cleanup. |
+| 12 | Forward-only compatibility fence for local auto-review allowance interpretation. | No physical columns or tables change. The transactional migration preserves existing rows and sets format, minimum reader, and minimum writer versions to 12 so older applications refuse the database. |
 
-The format layer can migrate physical versions 1 through 10 forward to 11.
+The format layer can migrate versions 1 through 11 forward to 12.
 Normal ingestion cold-rebuilds versions through 9 because their fact or source
-identity semantics differ; schema 10 can take the additive staged migration.
+identity semantics differ; schemas 10 and 11 take the additive staged migration.
 A newer version is not safe for an older reader. Migrations are transactional
 and forward-only; there is no supported in-place downgrade.
 
 Account/plan attribution does not require a new physical schema or relabeling
-an existing database. Current writable v11 opens also ensure compatible read
+an existing database. Current writable v12 opens also ensure compatible read
 indexes for exact source/offset/time quota lookup and same-session counter
-predecessors. Read-only v11 inspection never adds indexes or mutates the file.
+predecessors. Read-only v12 inspection never adds indexes or mutates the file.
 These indexes change query cost, not retained fact meanings or parser identity.
 
 Parser v11 is independent of the physical v11 index layout. It withholds an
@@ -106,7 +107,7 @@ Tier, effort, cumulative counters and replay admission are unchanged.
 
 Parser v15 introduced the per-event `-parent-model` and
 `-parent-model-partial` suffixes to record the inherited assumption;
-other records use the base and `-partial` stamps. Parsers v16, v17, and v18 retain these
+other records use the base and `-partial` stamps. Parsers v16 through v20 retain these
 suffixes with their own version prefixes. They do not reclassify legacy inline
 inheritance. These are local provenance variants, not new physical schemas or
 telemetry fields. Cursor/generation stamps use the base parser version so warm refresh does not
@@ -152,9 +153,41 @@ new facts acquire v18 provenance; changing a stored parser label is not recovery
 
 Parser v19 recognizes the reviewed GPT-6.1 Sol identity and explicit Standard, Fast and Ultrafast `turn_context.service_tier` evidence. Sparse omission preserves the preceding setting; explicit null clears it. Present sources reparse through the existing staged generation boundary without changing physical schema 11 or source identity. Absent sources retain their prior facts and parser provenance.
 
+Parser v20 recognizes local `threadSource = auto_review` only when a retained
+`session_meta` payload has both exact own data markers:
+`thread_source === 'guardian_review'` and
+`source.subagent.other === 'guardian'`. Inherited properties, accessors, near
+strings and model names cannot establish this category. The classifier remains
+date-independent and preserves the existing surface, agent-scope and lineage
+calculations. The separate local allowance policy applies to event times from
+`2026-10-06T00:00:00.000Z`; earlier events retain their former treatment.
+Classification never deletes token or API-price-equivalent facts.
+
+The existing `surface_class.thread_source` TEXT column stores the new closed
+value. Physical columns do not change, but schema/minimum reader/minimum writer
+version 12 prevents older applications from misinterpreting the retained
+classification. Migration preserves every table and fact; present sources then
+reparse through the staged generation boundary. Absent sources retain their
+original classification and parser stamps, including all qualified v19 variants.
+The legacy archive parser advances to `parallel-jsonl-accounting-v7`. Archive
+format/schema version 6 adds per-source `parser_version` provenance. The
+reviewed format/schema-5, parser-v6 predecessor migrates on a staged copy:
+present sources reparse under v7, while absent sources retain their existing
+facts, classification, source ordinals and v6 parser stamp. It never fabricates
+new guardian evidence for a source that has disappeared. Unreviewed older
+archive formats retain their existing rebuild behavior.
+
+Passive collector checkpoints refresh only the newly reviewed classification
+from one bounded, cancellable header read per tracked source and preserve
+offsets, cumulative counters and replay state. Occurrence keys continue to use
+the pre-auto-review taxonomy from that same header so a classification refresh
+cannot turn replayed usage into a new event. Missing metadata cannot fabricate
+an exemption. Safe exports continue to omit `threadSource`; no hosted telemetry
+vocabulary is widened.
+
 The opt-in local contribution reader `readDayWithV12Evidence(day)` derives
 successor boundary masks and same-session/millisecond ranks from these existing
-index facts; it adds no physical columns. It uses the same exact v15/v16/v17/v18 boundary
+index facts; it adds no physical columns. It uses the same exact v15 through v20 boundary
 parser qualification as local cache analysis. A completed event-key boundary
 join can prove absence; an unavailable join cannot. Source generation/cursor
 ambiguity withholds order. This reader supplies evidence to dormant preparation
@@ -190,8 +223,8 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12/v13/v14/v15/v16/v17-to-v18
-parser upgrades as cold work even when the physical schema is already 11. The
+The foreground companion treats verified published v10 through v19 to v20
+parser upgrades as cold work even when the format version is already 12. The
 target and predecessor set are deliberately closed; current, unknown, malformed
 and future parser evidence cannot obtain a longer deadline. That run receives
 the same bounded four-hour deadline as an absent or supported older-schema
@@ -344,7 +377,8 @@ content-free. The framing implementation follows the [Zstandard format](https://
 A schema or parser change requires, in one change:
 
 - a new parser version when extraction meaning changes, and a new
-  `user_version` when the physical format changes;
+  `user_version` when the physical format changes or older readers/writers
+  cannot safely interpret the new semantics;
 - transactional migration and forward/older-reader failure tests;
 - schema, writer, reader, projection, generated contract, and fixture updates;
 - exact recovery implications in
