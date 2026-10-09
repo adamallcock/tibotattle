@@ -17,8 +17,8 @@ for exact artifact hashes and recorded assurances.
 
 | Platform | Current distribution | Proven final-artifact boundary | Acceptance limits |
 |---|---|---|---|
-| macOS 14+ arm64 | Supported; 0.1.28 DMG | Developer ID signing, notarization, stapling, Gatekeeper, clean install, named existing-credential fixtures and production native Sparkle upgrade on the exact signed candidate | Electron 0.1.26 installed updater check is pending; complete credential failure matrix remains unqualified |
-| macOS 14+ x86_64 | Supported; separate 0.1.28 Intel DMG | Separate native trust, clean install and production native Sparkle upgrade | Electron 0.1.26 installed updater check is pending; existing-credential upgrade was not exercised on Intel; full failure matrix remains unqualified |
+| macOS 14+ arm64 | Supported; 0.1.28 DMG | Developer ID signing, notarization, stapling, Gatekeeper, clean install, named existing-credential fixtures and production native Sparkle upgrade on the exact signed candidate; production Electron upgrade with discoverable Codex logs | See the retained-history limitation below; complete credential failure matrix remains unqualified |
+| macOS 14+ x86_64 | Supported; separate 0.1.28 Intel DMG | Separate native trust, clean install and production native Sparkle upgrade; production Electron upgrade with discoverable Codex logs | See the retained-history limitation below; existing-credential upgrade was not exercised on Intel; full failure matrix remains unqualified |
 | Windows x64 | Released; 0.1.28 signed installer | Authenticode signature, timestamp and fresh-VM installer replacement of 0.1.26, retaining synthetic history, settings and opt-out through cold restart | Automatic updater was not exercised; credential persistence, hosted enrollment and notification delivery are not qualified by this journey |
 | Linux x86_64 | Released; 0.1.28 AppImage | Exact artifact integrity and native x64 Xvfb/FUSE clean install, isolated 0.1.26 update, sandbox, refresh, credentials, settings, opt-out, restart and cleanup | Physical desktop behavior and production-feed installed updating remain unqualified; no native-signing claim |
 
@@ -61,13 +61,44 @@ leaving the native source untouched and stopping owned processes. Neither used
 a feed override, a runner-copied candidate or an existing-credential fixture.
 
 All four Electron stable feeds and both native Sparkle feeds advertise 0.1.28
-with exact public readback. The separate Electron 0.1.26-to-0.1.28 installed
-updater qualification remains pending on both architectures. Its first
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37931476122)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37931485225)
-attempts stopped at the predecessor baseline before invoking any updater action.
-The runner fixture mismatch is being repaired; these results do not establish
-a released-app defect or an installed Electron updater success.
+with exact public readback. Production Electron 0.1.26-to-0.1.28 updates passed
+on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37942774119)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37949180932),
+using authentic predecessor fixtures with discoverable Codex logs. Both
+installed and relaunched the exact released app automatically, observed the
+predecessor exit naturally, preserved rows, preferences, salt and opt-out, and
+passed restart without duplicates and cleanup. Neither used a feed override,
+a runner-copied candidate or an existing-credential fixture.
+
+Earlier failed attempts remain distinct evidence:
+
+- The initial [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37931476122)
+  and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37931485225)
+  attempts stopped at the predecessor baseline before invoking an updater action.
+- The R2 [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37935683930)
+  and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37935688350)
+  attempts installed and relaunched 0.1.28 but failed before continuity
+  qualification; their exact cause remains unproven.
+- The R4 [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37939063066)
+  and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37939068480)
+  runs verified automatic installation, exact released-app relaunch and cleanup,
+  then failed at `successor_state_timeout` before continuity qualification.
+- The [Intel R5 attempt](https://github.com/adamallcock/tibotattle/actions/runs/37942780042)
+  stopped at `predecessor_process_identity`; the [Intel R6 attempt](https://github.com/adamallcock/tibotattle/actions/runs/37946253256)
+  stopped after Install at `process_identity`. Both completed cleanup but did
+  not qualify the successor or continuity. These observation failures do not
+  establish an application-level upgrade failure.
+
+The failed receipts do not identify lost rows or establish data loss; their
+false continuity flags record incomplete qualification.
+
+Released 0.1.28 also has a source-confirmed limitation when only a retained
+0.1.26 format-11 index remains and no Codex rollout files survive. Ordinary
+Refresh, startup refresh and automatic cadence do not trigger migration, and
+the current reader rejects the old index. Its unified history projection is
+therefore unavailable, although cached summaries may remain. No row deletion
+has been proved. The passed journeys with discoverable logs do not close
+this separate limitation.
 
 The signed [Apple silicon existing-Keychain-credential run](https://github.com/adamallcock/tibotattle/actions/runs/37882400348)
 passed 0.1.20-to-0.1.28 modern, invalid and locked fixtures, preserving items,

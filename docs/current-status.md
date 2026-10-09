@@ -13,8 +13,9 @@ observation_date: 2026-10-09
 is the published shared Electron release for macOS Apple silicon, macOS Intel,
 Windows x64 and Linux x64. The installers, all six stable updater feeds,
 Homebrew cask and website downloads have been published and verified. Both native
-Sparkle production upgrades passed; the two Electron 0.1.26-to-0.1.28 installed
-updater checks remain pending. Qualification is platform-specific; the
+Sparkle production upgrades passed. Electron 0.1.26-to-0.1.28 production
+updates also passed on both Mac architectures with discoverable Codex logs.
+Qualification is platform-specific; the
 [platform authority](./reference/platform-support.md) names the limits.
 
 The release includes GPT-6.1 Sol, Ultrafast, Pro 10× and Pro Max 25× support,
@@ -40,8 +41,8 @@ The manifest leaves SBOM and provenance fields null.
 
 | Published target | Exact final-artifact evidence | Remaining boundary |
 |---|---|---|
-| macOS 14+ Apple silicon | Developer ID signed, hardened, notarized, stapled and Gatekeeper-verified DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37881967388), [credential upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37882400348) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37931481287) passed | Electron 0.1.26 installed updater check is pending; full credential-failure matrix is not qualified |
-| macOS 14+ Intel | Separate signed, notarized and stapled DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37882729563) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37932090365) passed | Electron 0.1.26 installed updater check is pending; existing-credential upgrade was not exercised on Intel; full failure matrix is not qualified |
+| macOS 14+ Apple silicon | Developer ID signed, hardened, notarized, stapled and Gatekeeper-verified DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37881967388), [credential upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37882400348) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37931481287) passed; [production Electron upgrade with discoverable Codex logs](https://github.com/adamallcock/tibotattle/actions/runs/37942774119) passed | See the retained-history limitation below; full credential-failure matrix is not qualified |
+| macOS 14+ Intel | Separate signed, notarized and stapled DMG; [clean install](https://github.com/adamallcock/tibotattle/actions/runs/37882729563) and [production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/37932090365) passed; [production Electron upgrade with discoverable Codex logs](https://github.com/adamallcock/tibotattle/actions/runs/37949180932) passed | See the retained-history limitation below; existing-credential upgrade was not exercised on Intel; full failure matrix is not qualified |
 | Windows x64 | Authenticode signed and timestamped installer; [fresh-VM installer upgrade from 0.1.26](https://github.com/adamallcock/tibotattle/actions/runs/37880387839) passed | Automatic updater was not exercised; this journey does not requalify credential persistence, hosted enrollment or notification delivery |
 | Linux x64 AppImage | Exact artifact integrity and [native x64 Xvfb/FUSE lifecycle](https://github.com/adamallcock/tibotattle/actions/runs/37879713389) passed, including clean install and isolated update from 0.1.26 | Physical desktop behavior and production-feed installed updating remain unqualified; no native-signing claim |
 
@@ -60,13 +61,30 @@ including update, relaunch, migration, retained rows, preferences, salt, opt-out
 and restart without duplicates. Neither used a feed override or a runner-copied
 candidate; these journeys did not include an existing-credential fixture.
 
-The first production Electron 0.1.26-to-0.1.28 attempts on
-[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37931476122)
-and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37931485225)
-stopped at the predecessor baseline before invoking an updater action. A
-deterministic runner fixture mismatch is being repaired. These results leave
-that installed qualification pending; they do not establish a released-app
-defect. The [Homebrew update](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
+The production Electron 0.1.26-to-0.1.28 updates passed on
+[Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37942774119)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37949180932),
+using authentic predecessor fixtures with discoverable Codex logs. Both
+installed and relaunched the exact released app automatically, observed the
+predecessor exit naturally, preserved rows, preferences, salt and opt-out, and
+passed restart without duplicates and cleanup. Neither used a feed override,
+a runner-copied candidate or an existing-credential fixture.
+
+The [earlier failed attempts](./reference/platform-support.md#macos) remain
+separate evidence. Baseline and process-observation failures left continuity
+unqualified; other runs timed out after installation and relaunch. The earlier
+R2 failures' exact cause remains unproven. Those failed receipts do not establish
+data loss.
+
+Source review of released 0.1.28 identifies a separate retained-history
+limitation. When a 0.1.26 format-11 index remains but no Codex rollout files
+survive, ordinary Refresh, startup refresh and automatic cadence do not start
+its migration. The current reader rejects that old index, leaving its unified
+history projection unavailable; cached summaries may remain. This is not proof
+of deleted rows. The passed journeys with discoverable logs do not resolve
+this case.
+
+The [Homebrew update](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
 passed all four jobs and its exact 0.1.28 cask readback matches the published Mac
 DMG hashes. Feed metadata, installed updater runs and cask resolution remain
 distinct evidence.
@@ -89,11 +107,11 @@ independently read back at 12:47:23 UTC. All four download targets resolve to
 was verified, and Open Graph and Twitter use the same crawler-accessible
 1200×630 PNG with successful image readback.
 
-The website update changed installer discovery only. The GCP origin remains at
+The website update changed installer discovery only. The verified GCP origin was at
 source `dec6d4f3f3f29921eefec3b2d44da525411141d5`, image SHA-256
 `1b5ddeebe8fa4bd4adcfefa4c204728619fd0a016a5132411ed279835c2359d3`.
-The public graph still reports October 5 and the older Pro 20×-equivalent
-reference, with repricing pending. Full historical activation, repricing and
+The public readback showed October 5 and the older Pro 20×-equivalent
+reference, with repricing pending at that observation. Full historical activation, repricing and
 public-reference migration remain separately owned server work. The client
 release does not establish deployment of every cross-surface product change.
 

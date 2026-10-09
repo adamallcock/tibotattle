@@ -574,6 +574,11 @@ A temporary network failure should leave the installed app usable; it does not
 prove an update exists or failed to
 publish. Verify the current release independently if an update looks stale.
 
+A known 0.1.28 upgrade limitation affects 0.1.26 installations with saved
+history but no remaining Codex logs: the history view can be unavailable because
+the stored index is not migrated. Keep the existing app data when reporting
+this. See the [macOS qualification details](./reference/platform-support.md#macos).
+
 For bugs, diagnostics, privacy questions, and security reporting, start at
 [SUPPORT.md](../SUPPORT.md). Security-sensitive reports follow
 [SECURITY.md](../SECURITY.md). Do not attach raw session files, databases,
