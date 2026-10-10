@@ -121,6 +121,7 @@ import {
   type PublicModelMetadataEntry,
 } from "./public-allowance-breakdowns-v13";
 import { projectPublicAllowanceGraphForGcp, validReadableAdminCommunityAllowancePreview } from "./allowance-projection";
+import { withCurrentPublicModelMetadata } from "./public-model-metadata-current";
 
 export const ANALYTICS_V2_COMMUNITY_DAILY_PATH = "/api/v1/community/daily" as const;
 export const ANALYTICS_V2_COMMUNITY_DAILY_SCHEMA_VERSION = "community-daily-read-v1.0" as const;
@@ -564,7 +565,8 @@ function publicDayPayload(day: PublishedDay, historicalSpendDays: ReadonlySet<st
  * projection; owner decision round 7 keeps the compiled registry at cutover),
  * which is exactly the six models the d43c8f92 public page charts and never a
  * model the owner's selected comparison hides. Binding a later manifest here
- * is the post-cutover KM-4 change.
+ * is the post-cutover KM-4 change. Current v1.4 response metadata is bound
+ * separately to the current preview catalog after the validated projection.
  */
 export function analyticsV2PublicModelMetadata(): readonly PublicModelMetadataEntry[] {
   return buildPublicModelMetadata(compiledBaselineCatalogManifest());
@@ -665,9 +667,9 @@ export function createAnalyticsV2CommunityDailyRoute(
 
     const cache = previewCacheRow(read.previewText, nowMs);
     const allowanceReadState = cache === null ? "temporarily_unavailable" : "confirmed";
-    const graph = projectPublicAllowanceGraphForGcp(cache, {
+    const graph = withCurrentPublicModelMetadata(projectPublicAllowanceGraphForGcp(cache, {
       publishedDays: days.map((day) => day.day), nowMs,
-    }, modelMetadata);
+    }, modelMetadata));
     const allowanceState = graph !== null ? "ready" : "updating";
     const allowanceBreakdowns = graph?.breakdowns ?? null;
     for (const day of days) publicDayPayload(day, read.historicalSpendDays, read.spendEquivalences);

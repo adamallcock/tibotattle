@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { buildAdminCommunityAllowancePreview, buildCommunityModelCompositionDay,
-  projectPublicAllowanceGraphForGcp, validReadableAdminCommunityAllowancePreview,
-  validCachedAdminCommunityAllowancePreview } from "../src/analytics-v2/allowance-projection";
+  projectPublicAllowanceGraphForGcp as projectBaseGraph, validReadableAdminCommunityAllowancePreview,
+  validCachedAdminCommunityAllowancePreview, ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS, ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE } from "../src/analytics-v2/allowance-projection";
 import { normalizeCommunityModelCompositionForDay } from "../src/admin-community-allowance";
 import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_NORMALIZATION } from "../src/community-allowance";
@@ -11,6 +12,8 @@ import { reducePublicAllowanceBreakdownsV13 } from "../src/analytics-v2/public-a
 import { reducePublicAllowanceBreakdownsV14, wrapPublicAllowanceBreakdownsV14 } from "../src/analytics-v2/public-allowance-breakdowns-v14";
 import { readPostgresAdminAllowancePreview } from "../src/postgres-admin-allowance-preview";
 import type { PostgresPool } from "../src/postgres-client";
+import { buildCurrentPublicModelMetadata, withCurrentPublicModelMetadata } from "../src/analytics-v2/public-model-metadata-current";
+const projectPublicAllowanceGraphForGcp = (...args: Parameters<typeof projectBaseGraph>) => withCurrentPublicModelMetadata(projectBaseGraph(...args));
 const NOW = Date.parse("2026-10-09T12:00:00.000Z"), DAY = "2026-10-08";
 const options = { publishedDays: [DAY], nowMs: NOW };
 const metadata = [{ id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 }];
@@ -46,10 +49,34 @@ describe("GCP current Pro 10x and retained legacy projection", () => {
     expect(graph.breakdowns.schemaVersion).toBe("community-allowance-breakdowns-v1.4");
     expect(graph.breakdowns.normalization).toBe("pro_x1_prolite_x2_promax_x0_4_plus_x10");
     expect(graph.breakdowns.days[0]!.byPlanType.plus.centralUsd).toBe(10000); expect(graph.breakdowns.days[0]!.models).toEqual([]);
-    expect(reducePublicAllowanceBreakdownsV14(graph.breakdowns).metadata).toEqual(metadata); expect(graph.breakdowns.days).toHaveLength(1);
+    expect(reducePublicAllowanceBreakdownsV14(graph.breakdowns).metadata).toEqual(buildCurrentPublicModelMetadata()); expect(graph.breakdowns.days).toHaveLength(1);
     expect(JSON.stringify(graph)).not.toContain("synthetic-owner");
     const absent = projectPublicAllowanceGraphForGcp(row(buildAdminCommunityAllowancePreview([], NOW)), options, metadata)!;
     expect(absent.breakdowns.days[0]!.combined.centralUsd).toBeNull(); expect(absent.breakdowns.days[0]!.byPlanType.plus.centralUsd).toBeNull();
+  });
+  it("names current reviewed models without changing a published GPT-6.1 Sol tuple", () => {
+    const currentMetadata = buildCurrentPublicModelMetadata();
+    expect(currentMetadata.map(entry => entry.id)).toEqual([
+      "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+      "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
+    ]);
+    expect(currentMetadata[1]).toEqual({ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 });
+    const raw = composition("pro"); raw.composition.fit.capacityUsdByModel = { "gpt-6.1-sol": 123.45 };
+    const modelDay = buildCommunityModelCompositionDay({ compositions: [raw], v1ParticipantCount: 1,
+      refusedParticipantCount: 0, unsupportedSourceParticipantCount: 0 }, DAY);
+    const preview = buildAdminCommunityAllowancePreview(fits, NOW, fits.map(fit => fit.participantId), {
+      modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+      gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, days: [modelDay],
+    });
+    const before = structuredClone(preview);
+    const graph = projectPublicAllowanceGraphForGcp(row(preview), options, metadata)!;
+    expect(graph.breakdowns.days[0]!.models).toEqual([["gpt-6.1-sol", 123.45, 1]]);
+    expect(graph.breakdowns.modelConfig).toEqual(currentMetadata); expect(preview).toEqual(before);
+    expect(projectPublicAllowanceGraphForGcp(row(preview), { ...options, publishedDays: [] }, metadata)).toBeNull();
+    const missing = projectPublicAllowanceGraphForGcp(row(buildAdminCommunityAllowancePreview(fits, NOW)), options, metadata)!;
+    expect(missing.breakdowns.days[0]!.models).toEqual([]);
+    const legacy = projectPublicAllowanceGraphForGcp(row(buildLegacyPreview(fits, NOW)), options, metadata)!;
+    expect(legacy.breakdowns.modelConfig).toEqual(metadata);
   });
   it("keeps retained v0.3 values byte equivalent to the v1.1 oracle under v1.3", () => {
     const preview = buildLegacyPreview(fits, NOW);
