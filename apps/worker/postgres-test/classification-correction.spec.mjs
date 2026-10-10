@@ -42,6 +42,8 @@ let pool;
 let vite;
 let modules;
 const databaseFailures = [];
+// Statement texts, recorded only while a test sets it to an array.
+let statementLog = null;
 
 after(async () => { await pool?.end(); await vite?.close(); });
 const sha256Hex = value => createHash("sha256").update(value).digest("hex");
@@ -65,6 +67,7 @@ async function setup() {
     const query = client.query.bind(client);
     client.query = (...args) => {
       const caller = new Error().stack.split("\n").slice(2, 5);
+      statementLog?.push(typeof args[0] === "string" ? args[0] : args[0]?.text ?? "");
       const result = query(...args);
       if (!result?.catch) return result;
       return result.catch(error => {
@@ -657,6 +660,33 @@ async function seedTypedV1Chunk(modules, pool, primarySchema, owner, { day, stre
   }
   return { chunkRowId, admit };
 }
+
+test("v12 activation runs its whole-domain classification proof under the 60 s statement budget", {
+  skip: !PG_TEST_SOCKET, timeout: 120_000,
+}, async () => {
+  await withSchema(async context => {
+    const participant = await seedParticipant(context, "activation-budget");
+    const principal = await seedDevice(context, participant, "activation-budget");
+    const accepted = await stage(context, principal, DAY_ONE, "usage", usage({
+      eventTime: `${DAY_ONE}T12:05:00.000Z`, provider: "openai_codex",
+    }));
+    const manifest = await prepared(context, principal, [accepted]);
+    statementLog = [];
+    let activation;
+    try {
+      activation = await context.domain.activate(principal, manifest);
+    } finally {
+      const issued = statementLog;
+      statementLog = null;
+      const begin = issued.lastIndexOf("BEGIN");
+      const transaction = issued.slice(begin);
+      assert.equal(transaction[1], "SET LOCAL statement_timeout='60000ms'");
+      assert.ok(transaction.some(sql => sql.includes("candidate AS MATERIALIZED")),
+        "the classification proof runs inside the budgeted activation transaction");
+    }
+    assert.equal(activation.replay, false);
+  });
+});
 
 test("exact current-predecessor READY unknown evidence corrects in one activation without a prior domain", {
   skip: !PG_TEST_SOCKET, timeout: 120_000,

@@ -42,6 +42,10 @@ const DAY_MS = 86_400_000;
 const PREDECESSOR_TTL_MS = 24 * 60 * 60 * 1_000;
 // Must match the D1 V12_DOMAIN_METHOD_VERSION: both pin predecessor state only.
 const DOMAIN_METHOD_VERSION = "v12-complete-domain-2";
+// The classification proof reads the whole domain: 2026-10-10 production
+// measured single statements of 10.6-15.4 s for 128- and 238-day domains, so
+// the 10 s default refused every such activation. Same budget as v1.1.
+const ACTIVATION_STATEMENT_TIMEOUT_MS = 60_000;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -536,7 +540,11 @@ export function createPostgresTypedV12Domain(
           from_day: manifest.fromDay,
           through_day: manifest.throughDay,
         }, false);
-      }, { operation: "telemetry.v12.domain.activate", preserveSafeError }).catch(async (error) => {
+      }, {
+        operation: "telemetry.v12.domain.activate",
+        statementTimeoutMilliseconds: ACTIVATION_STATEMENT_TIMEOUT_MS,
+        preserveSafeError,
+      }).catch(async (error) => {
         // A concurrent replay can commit while this transaction waits on the
         // predecessor lock. Prove the active head after rollback, without
         // treating any other storage failure as a successful activation.
