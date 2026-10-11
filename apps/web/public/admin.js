@@ -9,7 +9,9 @@ import {
   projectAdminMetricsHistory,
   projectAdminOverview,
   projectAdminDatabaseHealth,
+  projectAdminPerformanceIntake,
   projectAdminReconstructionProgress,
+  ADMIN_PERFORMANCE_SLOT_KEYS,
   projectV11EvidenceAdoption,
   V11_ADOPTION_OUTCOMES,
 } from "./admin-client.js";
@@ -21,6 +23,9 @@ const state = {
   csrfToken: "",
   overview: null,
   databaseHealth: null,
+  performanceIntake: null,
+  performanceIntakeHealth: "loading",
+  performanceIntakeFailure: null,
   loading: false,
   overviewUnavailable: true,
   sourceHealth: { history: "loading", allowance: "loading", progress: "loading", database: "loading" },
@@ -450,6 +455,55 @@ function v11AdoptionAuditPresentation(outcome, details) {
   };
 }
 
+const PERFORMANCE_ACTIVATION_AUDIT_ACTION = Object.freeze({
+  label: "Model performance activation",
+  explanation: "The owner-only maintenance task that moves the model performance intake from staged to active. It runs from the production operations runbook; this page has no control for it.",
+});
+const PERFORMANCE_ACTIVATION_FIELD_LABELS = Object.freeze({
+  state: "Runtime state",
+  expectedRevision: "Expected policy revision",
+});
+
+/**
+ * Whether an audit row records a model-performance runtime activation. The
+ * maintenance task name is shared with the usage_v12 and usage_correction
+ * activations, so the target must say "performance"; rows for other targets
+ * keep the generic maintenance presentation.
+ */
+function isPerformanceActivationAudit(item) {
+  const details = plainRecord(item?.details);
+  return item?.action === "run_maintenance"
+    && details?.task === "telemetry_runtime_activation"
+    && details?.target === "performance";
+}
+
+function performanceActivationAuditPresentation(outcome, details) {
+  if (outcome === "started") {
+    return {
+      result: auditResult("Started, no result", "warning", "The activation was recorded as started without a final result."),
+      summary: "An activation started without a recorded result. While the runtime stays staged, retrying this key answers TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED; follow the runbook with a new idempotency key.",
+    };
+  }
+  if (outcome === "failure") {
+    return {
+      result: auditResult("Failed", "failure", "The activation did not change the runtime."),
+      summary: details?.code
+        ? `The activation failed with result code ${details.code}.`
+        : "The activation failed before it produced a usable result.",
+    };
+  }
+  if (outcome === "success") {
+    return {
+      result: auditResult("Activated", "success", "The model performance runtime is active."),
+      summary: `Model performance intake activated: policy revision ${auditCount(details?.fromRevision)} to ${auditCount(details?.toRevision)}${details?.reconciled === true ? ", finished by reconciliation" : ""}.`,
+    };
+  }
+  return {
+    result: auditResult(humanizeToken(outcome), "warning", "This is the outcome stored by the service for the activation."),
+    summary: `The service recorded a ${humanizeToken(outcome).toLowerCase()} activation outcome.`,
+  };
+}
+
 function maintenancePresentation(outcome, details) {
   const code = details?.code;
   if (outcome === "started") {
@@ -605,12 +659,16 @@ function collectionControlPresentation(outcome, details) {
 function auditPresentation(item) {
   const details = plainRecord(item.details);
   const adoption = item.action === "run_maintenance" && details?.task === "v11_evidence_adoption";
-  const action = adoption ? V11_ADOPTION_AUDIT_ACTION : AUDIT_ACTIONS[item.action] ?? {
-    label: humanizeToken(item.action),
-    explanation: "An owner control action recorded by the service.",
-  };
+  const activation = isPerformanceActivationAudit(item);
+  const action = adoption ? V11_ADOPTION_AUDIT_ACTION : activation ? PERFORMANCE_ACTIVATION_AUDIT_ACTION
+    : AUDIT_ACTIONS[item.action] ?? {
+      label: humanizeToken(item.action),
+      explanation: "An owner control action recorded by the service.",
+    };
   const presentation = adoption
     ? v11AdoptionAuditPresentation(item.outcome, details)
+    : activation
+    ? performanceActivationAuditPresentation(item.outcome, details)
     : item.action === "run_maintenance"
     ? maintenancePresentation(item.outcome, details)
     : item.action === "set_collection_controls"
@@ -636,7 +694,8 @@ function auditPresentation(item) {
       hint: "The exact machine-readable outcome retained in the audit record.",
       value: text(item.outcome),
     },
-    ...flattenAuditDetails(item.details),
+    ...flattenAuditDetails(item.details).map(field => activation && PERFORMANCE_ACTIVATION_FIELD_LABELS[field.key]
+      ? { ...field, label: PERFORMANCE_ACTIVATION_FIELD_LABELS[field.key] } : field),
   ];
   return { action, fields, ...presentation };
 }
@@ -1377,6 +1436,330 @@ function renderDatabaseHealth() {
   ])));
 }
 
+// Model performance intake (admin-performance-intake-v0.1). Read-only: this
+// page has no activation control (gate answer 23). Activation is the
+// owner-only runtime activation maintenance task, run from the
+// production operations runbook. Every count names its unit and UTC basis,
+// and a block the host does not supply reads as unavailable, never as 0.
+const PERFORMANCE_DICTIONARY_PREFIX = "telemetry-performance-registry-";
+const PERFORMANCE_SPEED_MODE_LABELS = Object.freeze({
+  standard: "Standard", fast: "Fast", ultrafast: "Ultrafast",
+  unknown: "Unknown (never published)", mixed: "Mixed (never published)", other: "Other (never published)",
+});
+const PERFORMANCE_PERIOD_LABELS = Object.freeze({ 1: "1 day", 7: "7 days", 30: "30 days", all: "All time" });
+const PERFORMANCE_ROUTE_LABELS = Object.freeze({
+  accountless_telemetry_performance_authorization: "Grant",
+  telemetry_performance_capabilities: "Capabilities",
+  telemetry_performance_reports: "Reports",
+});
+const PERFORMANCE_BASIS_LABELS = Object.freeze({
+  v12_parser_inference: "inferred from the v1.2 parser",
+  default_no_manifest: "default, no v1.2 manifest",
+  client_declared: "declared by the client",
+});
+const PERFORMANCE_WITHHELD_LABELS = Object.freeze({
+  ANALYTICS_V2_PERFORMANCE_CAPACITY: "the publication would exceed its capacity",
+  ANALYTICS_V2_PERFORMANCE_RECORD_INVALID: "an included record failed validation",
+  ANALYTICS_V2_PERFORMANCE_MODELS_EXCEEDED: "too many models for one slot",
+  ANALYTICS_V2_PERFORMANCE_POINTS_EXCEEDED: "too many points for one slot",
+});
+// A 409 the report parser refused for its dictionary, or a 403 on reports
+// while the runtime is active: the origin answers a report whose dictionary
+// differs from the device's capability 403 TELEMETRY_TRANSPORT_BLOCKED, the
+// same closed code as any other fence refusal, so that row is "possible".
+const PERFORMANCE_DICTIONARY_REFUSAL_CODES = new Set([
+  "TELEMETRY_RECORD_INVALID_DICTIONARY_UNACCEPTED", "TELEMETRY_RECORD_INVALID_SCHEME_MISMATCH",
+]);
+// Owner-access refusals clear every private section. Any other 403 on this
+// read (for example a route this host does not serve) is unavailable here.
+const ADMIN_ACCESS_REFUSAL_CODES = new Set(["ACCESS_REQUIRED", "ADMIN_REQUIRED", "ADMIN_DENIED", "CSRF_INVALID", "HTTP_403"]);
+const PERFORMANCE_NO_REPORT_ATTENTION_MILLISECONDS = 48 * 60 * 60 * 1_000;
+const PERFORMANCE_UNAVAILABLE = "Unavailable on this host";
+const PERFORMANCE_FAILURE_TEXT = Object.freeze({
+  404: "This host does not serve the performance intake view (404).",
+  403: "This host refused the performance intake view (403); owner access itself is unaffected.",
+  503: "The origin could not read the performance intake (503).",
+});
+
+function isOwnerAccessRefusal(error) {
+  if ([401, 410].includes(error?.httpStatus)) return true;
+  return error?.httpStatus === 403 && ADMIN_ACCESS_REFUSAL_CODES.has(error.code);
+}
+
+function performanceBlock(snapshot, name) {
+  const value = snapshot?.[name];
+  return value && !Array.isArray(value) && value.status === "unavailable" ? null : value ?? null;
+}
+
+function performanceCount(value, unit) {
+  return value === null || value === undefined ? PERFORMANCE_UNAVAILABLE : `${formatNumber(value)} ${unit}`;
+}
+
+function performanceDictionaryLabel(version) {
+  return version.startsWith(PERFORMANCE_DICTIONARY_PREFIX) ? version.slice(PERFORMANCE_DICTIONARY_PREFIX.length) : version;
+}
+
+function performanceSlotLabel(key) {
+  const [period, speedMode] = key.split(":");
+  return `${PERFORMANCE_PERIOD_LABELS[period] ?? period} · ${PERFORMANCE_SPEED_MODE_LABELS[speedMode] ?? speedMode}`;
+}
+
+function performanceArrivals(reports, fromDay) {
+  const rows = reports.byArrivalDay.filter(row => row.day >= fromDay);
+  return {
+    accepted: rows.reduce((total, row) => total + row.accepted, 0),
+    replaced: rows.reduce((total, row) => total + row.replaced, 0),
+  };
+}
+
+function performanceCard(label, value, detail, explanation) {
+  const card = document.createElement("div");
+  card.className = "admin-card admin-metric";
+  const number = document.createElement("strong");
+  number.textContent = value;
+  const caption = document.createElement("small");
+  caption.textContent = detail;
+  card.append(labelWithInfo(label, explanation), number, caption);
+  return card;
+}
+
+function performanceTable(rowsId, emptyId, rows, emptyText) {
+  $(`#${rowsId}`).replaceChildren(...rows.map(tableRow));
+  const empty = $(`#${emptyId}`);
+  empty.hidden = rows.length > 0;
+  empty.textContent = emptyText;
+}
+
+/** The newest model-performance activation audit row in the overview, if any. */
+function latestPerformanceActivationAudit() {
+  const rows = (state.overview?.audit ?? []).filter(isPerformanceActivationAudit);
+  return rows.reduce((latest, item) => latest === null
+    || Date.parse(item.createdAt) > Date.parse(latest.createdAt) ? item : latest, null);
+}
+
+/** A started activation with no result while the runtime is still staged. */
+export function performanceActivationNeedsReconcile(runtime, audit) {
+  return runtime?.state === "staged" && audit?.outcome === "started";
+}
+
+function renderPerformanceIntake() {
+  if (!isAdminPage) return;
+  const snapshot = state.performanceIntake;
+  const health = state.performanceIntakeHealth;
+  const runtime = performanceBlock(snapshot, "runtime");
+  const dictionaries = performanceBlock(snapshot, "dictionaries");
+  const grants = performanceBlock(snapshot, "grants");
+  const capabilities = performanceBlock(snapshot, "capabilities");
+  const reports = performanceBlock(snapshot, "reports");
+  const cohorts = performanceBlock(snapshot, "cohorts");
+  const refusals = performanceBlock(snapshot, "refusals");
+  const publication = performanceBlock(snapshot, "publication");
+  const badge = $("#performance-intake-status");
+  badge.className = `admin-source-badge ${health === "available" && snapshot ? "admin-source-available" : "admin-source-partial"}`;
+  badge.textContent = health === "stale" ? "Refresh failed · previous intake view"
+    : snapshot ? runtime === null ? "Runtime state unavailable on this host"
+      : runtime.state === "active" ? "Intake active · accepting reports" : "Intake staged · not accepting reports"
+    : health === "loading" ? "Waiting for the performance intake view" : "Performance intake unavailable on this host";
+  $("#performance-intake-freshness").textContent = snapshot
+    ? `Observed ${formatTime(snapshot.generatedAt)}. Per-day tables cover the ${formatNumber(snapshot.windows.days)} UTC days ${snapshot.windows.from} to ${snapshot.windows.through}; rolling counts end at the observation.${health === "stale" ? " These are previous results, not the current intake." : ""}`
+    : state.performanceIntakeFailure ?? "No usable intake view loaded. Refresh to retry.";
+  const audit = latestPerformanceActivationAudit();
+  const reconcile = $("#performance-intake-reconcile");
+  reconcile.hidden = !performanceActivationNeedsReconcile(runtime, audit);
+  reconcile.textContent = reconcile.hidden ? "" : `Activation needs reconciliation: an activation started ${formatTime(audit.createdAt)} has no recorded result and the runtime is still staged. Retrying that idempotency key answers TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED; follow the runbook and use a new key.`;
+
+  if (!snapshot) {
+    for (const id of [
+      "performance-intake-cards", "performance-intake-runtime", "performance-intake-last-run",
+      "performance-evidence-rows", "performance-arrival-rows", "performance-dictionary-rows",
+      "performance-cohort-rows", "performance-refusal-rows", "performance-slot-rows",
+    ]) $(`#${id}`).replaceChildren();
+    for (const id of [
+      "performance-evidence-empty", "performance-arrival-empty", "performance-dictionary-empty",
+      "performance-cohort-empty", "performance-refusal-empty", "performance-slot-empty",
+    ]) {
+      $(`#${id}`).hidden = false;
+      $(`#${id}`).textContent = "No intake view loaded.";
+    }
+    $("#performance-intake-window").textContent = "";
+    return;
+  }
+
+  const last24 = reports ? performanceArrivals(reports, snapshot.windows.last24HoursFrom.slice(0, 10)) : null;
+  const last7 = reports ? performanceArrivals(reports, snapshot.windows.last7DaysFrom.slice(0, 10)) : null;
+  $("#performance-intake-cards").replaceChildren(
+    performanceCard("Runtime", runtime === null ? PERFORMANCE_UNAVAILABLE : runtime.state === "active" ? "Active" : "Staged",
+      runtime === null ? "Not supplied by this host." : `Policy revision ${formatNumber(runtime.policyRevision)} · updated ${formatTime(runtime.updatedAt)}`),
+    performanceCard("Active grants", performanceCount(grants?.active, "grant rows"),
+      grants === null ? "Not supplied by this host." : `${formatNumber(grants.expired)} expired · ${formatNumber(grants.revoked)} revoked · ${formatNumber(grants.authorizedLast24Hours)} grant rows authorized in the last 24 h, ${formatNumber(grants.authorizedLast7Days)} in 7 days`,
+      "The newest grant row per enrollment that is active and unexpired. Counted by row: a grant behind a revoked enrollment still counts, so this is not the number of devices able to report."),
+    performanceCard("Active capabilities", performanceCount(capabilities?.active, "device capabilities"),
+      capabilities === null ? "Not supplied by this host." : `${formatNumber(capabilities.expired)} expired · ${formatNumber(capabilities.revoked)} revoked (newest capability per device)`),
+    performanceCard("Reports received, last 24 h", last24 === null ? PERFORMANCE_UNAVAILABLE : `${formatNumber(last24.accepted + last24.replaced)} reports`,
+      last24 === null ? "Not supplied by this host." : `${formatNumber(last24.accepted)} accepted + ${formatNumber(last24.replaced)} replacements, by arrival · whole UTC days, so up to about 48 h`,
+      "Admitted reports by the UTC day they arrived. The day rows are whole UTC days overlapping the last 24 hours, so this is an upper bound. Idempotent replays are not counted."),
+    performanceCard("Reports received, last 7 days", last7 === null ? PERFORMANCE_UNAVAILABLE : `${formatNumber(last7.accepted + last7.replaced)} reports`,
+      last7 === null ? "Not supplied by this host." : `${formatNumber(last7.accepted)} accepted + ${formatNumber(last7.replaced)} replacements, by arrival · whole UTC days, so up to 8 days`),
+    performanceCard("Latest evidence day", reports === null ? PERFORMANCE_UNAVAILABLE : reports.latestReportDay ?? "None yet",
+      reports === null ? "Not supplied by this host." : `Newest current report day (UTC)${reports.latestReportDay !== null && reports.latestReportDay > snapshot.windows.through ? ", after the observation day" : ""} · latest acceptance ${reports.latestAcceptedAt === null ? "none recorded" : formatTime(reports.latestAcceptedAt)}`),
+    performanceCard("Refusals, last 24 h", performanceCount(refusals?.last24Hours, "refused requests"),
+      refusals === null ? "Not supplied by this host." : "After device authentication · whole UTC-day counters, an upper bound covering up to about 48 h",
+      "Every refusal after a device authenticated adds to a per-day counter by route, status and closed code. The 24-hour figure sums the whole UTC days it overlaps, so it can cover up to about 48 hours. While the runtime is staged, every capability poll is refused 403."),
+  );
+
+  const routeLine = snapshot.routes.length === 0 ? "None reported"
+    : snapshot.routes.map(route => `${route.routeId} (${route.routeClass})`).join(", ");
+  $("#performance-intake-runtime").replaceChildren(
+    statusLine("Runtime state", runtime === null ? PERFORMANCE_UNAVAILABLE : runtime.state === "active" ? "Active" : "Staged"),
+    statusLine("Policy revision", runtime === null ? PERFORMANCE_UNAVAILABLE : formatNumber(runtime.policyRevision)),
+    statusLine("Method", runtime === null ? PERFORMANCE_UNAVAILABLE : `${runtime.methodVersion} · ${runtime.schemaVersion}`),
+    statusLine("Deployed source commit", snapshot.deployment.sourceCommit ?? "Not recorded by this deployment"),
+    statusLine("Migration history digest", snapshot.deployment.historySha256),
+    statusLine("Origin route classes", routeLine),
+  );
+
+  const lastRun = publication?.lastRun ?? null;
+  $("#performance-intake-last-run").replaceChildren(...(publication === null
+    ? [statusLine("Last publication run", PERFORMANCE_UNAVAILABLE)]
+    : lastRun === null
+      ? [statusLine("Last publication run", "No completed run has carried a performance block")]
+      : [
+          statusLine("Last publication run", formatTime(lastRun.finishedAt)),
+          statusLine("Published", lastRun.published.length === 0 ? "No slot" : lastRun.published.map(performanceSlotLabel).join(", ")),
+          statusLine("Unchanged", lastRun.unchanged.length === 0 ? "No slot" : lastRun.unchanged.map(performanceSlotLabel).join(", ")),
+          statusLine("Withheld", lastRun.withheld === null ? "No"
+            : `Yes: ${PERFORMANCE_WITHHELD_LABELS[lastRun.withheld]} (${lastRun.withheld})`),
+          statusLine("Deferred while empty", lastRun.deferredEmpty
+            ? "Yes: nothing publishes until a run includes a record" : "No"),
+        ]));
+
+  const unavailableRows = (rowsId, emptyId) => performanceTable(rowsId, emptyId, [], PERFORMANCE_UNAVAILABLE);
+  if (reports === null) {
+    unavailableRows("performance-evidence-rows", "performance-evidence-empty");
+    unavailableRows("performance-arrival-rows", "performance-arrival-empty");
+  } else {
+    performanceTable("performance-evidence-rows", "performance-evidence-empty", reports.byEvidenceDay.slice().reverse().map(row => [
+      row.day, formatNumber(row.current), formatNumber(row.superseded), formatNumber(row.records),
+    ]), "No report has an evidence day inside the window.");
+    performanceTable("performance-arrival-rows", "performance-arrival-empty", reports.byArrivalDay.slice().reverse().map(row => [
+      row.day, formatNumber(row.accepted), formatNumber(row.replaced),
+    ]), "No report arrived inside the window.");
+  }
+  if (dictionaries === null) unavailableRows("performance-dictionary-rows", "performance-dictionary-empty");
+  else {
+    performanceTable("performance-dictionary-rows", "performance-dictionary-empty", dictionaries.map(row => {
+      const bases = grants?.activeByDictionary.filter(entry => entry.fieldDictionaryVersion === row.fieldDictionaryVersion) ?? null;
+      const reportRow = reports?.byDictionary.find(entry => entry.fieldDictionaryVersion === row.fieldDictionaryVersion) ?? null;
+      return [
+        performanceDictionaryLabel(row.fieldDictionaryVersion), row.bucketSchemeVersion, humanizeToken(row.contractState),
+        bases === null ? PERFORMANCE_UNAVAILABLE : bases.length === 0 ? "None"
+          : bases.map(entry => `${formatNumber(entry.devices)} ${PERFORMANCE_BASIS_LABELS[entry.dictionaryBasis]}`).join("; "),
+        reports === null ? PERFORMANCE_UNAVAILABLE : formatNumber(reportRow?.current ?? 0),
+        reports === null ? PERFORMANCE_UNAVAILABLE : formatNumber(reportRow?.superseded ?? 0),
+        reports === null ? PERFORMANCE_UNAVAILABLE : formatNumber(reportRow?.records ?? 0),
+      ];
+    }), "The origin's dictionary registry is empty.");
+  }
+  if (cohorts === null) unavailableRows("performance-cohort-rows", "performance-cohort-empty");
+  else {
+    performanceTable("performance-cohort-rows", "performance-cohort-empty", cohorts.byModel.map(row => [
+      row.provider, row.modelId, PERFORMANCE_SPEED_MODE_LABELS[row.speedMode],
+      formatNumber(row.cohorts), formatNumber(row.turns),
+    ]), "No current report inside the window has a cohort.");
+  }
+  if (refusals === null) unavailableRows("performance-refusal-rows", "performance-refusal-empty");
+  else {
+    performanceTable("performance-refusal-rows", "performance-refusal-empty", refusals.byDay.slice().reverse().map(row => [
+      row.day, PERFORMANCE_ROUTE_LABELS[row.routeId], String(row.status), row.code, formatNumber(row.refusals),
+    ]), "No refusal was counted inside the window.");
+  }
+  if (publication === null) unavailableRows("performance-slot-rows", "performance-slot-empty");
+  else {
+    const stored = new Map(publication.slots.map(slot => [`${slot.period}:${slot.speedMode}`, slot]));
+    performanceTable("performance-slot-rows", "performance-slot-empty", ADMIN_PERFORMANCE_SLOT_KEYS.map(key => {
+      const slot = stored.get(key);
+      const [period, speedMode] = key.split(":");
+      return slot === undefined
+        ? [PERFORMANCE_PERIOD_LABELS[period], PERFORMANCE_SPEED_MODE_LABELS[speedMode], "Not published", "—", "—", "—", "—"]
+        : [PERFORMANCE_PERIOD_LABELS[period], PERFORMANCE_SPEED_MODE_LABELS[speedMode], "Published",
+            formatNumber(slot.revision), formatTime(slot.releasedAt), slot.end, formatNumber(slot.kernelId)];
+    }), "");
+  }
+
+  const notes = [];
+  if (reports !== null) {
+    const outside = reports.outsideWindow;
+    notes.push(`Reports by evidence day outside the window: ${formatNumber(outside.evidenceBefore)} before, ${formatNumber(outside.evidenceAfter)} after (future-dated). Arrivals outside: ${formatNumber(outside.arrivalBefore)} before, ${formatNumber(outside.arrivalAfter)} after.`);
+    notes.push(`All time: ${formatNumber(reports.current)} current and ${formatNumber(reports.superseded)} superseded reports from ${formatNumber(reports.contributors)} contributors on ${formatNumber(reports.devices)} devices.`);
+  }
+  if (refusals !== null) {
+    notes.push(`Refusals outside the window: ${formatNumber(refusals.outsideWindow.before)} before, ${formatNumber(refusals.outsideWindow.after)} after.`);
+  }
+  if (cohorts !== null) {
+    notes.push(`${formatNumber(cohorts.excludedFromPublicationTurns)} turns inside the window have an unknown, mixed or other speed mode and are never published.`);
+  }
+  $("#performance-intake-window").textContent = notes.join(" ");
+}
+
+function collectPerformanceAttention(items) {
+  const snapshot = state.performanceIntake;
+  if (!isAdminPage || !snapshot) return;
+  const runtime = performanceBlock(snapshot, "runtime");
+  const reports = performanceBlock(snapshot, "reports");
+  const refusals = performanceBlock(snapshot, "refusals");
+  const publication = performanceBlock(snapshot, "publication");
+  const target = "#performance-intake-title";
+  const observed = `Observed ${formatTime(snapshot.generatedAt)}.`;
+  if (runtime?.state === "active" && reports !== null && (reports.latestAcceptedAt === null
+      || Date.parse(snapshot.generatedAt) - Date.parse(reports.latestAcceptedAt) > PERFORMANCE_NO_REPORT_ATTENTION_MILLISECONDS)) {
+    addAttentionItem(items, "performance-no-reports", "evidence", "warning",
+      "Model performance intake is active but accepted no report in 48 hours",
+      `${observed} Latest acceptance: ${reports.latestAcceptedAt === null ? "none recorded" : formatTime(reports.latestAcceptedAt)}. Check refusals and client grants; clients re-grant on restart.`,
+      target, "Review intake");
+  }
+  if (refusals !== null && refusals.last24Hours > 0) {
+    addAttentionItem(items, "performance-refusals", "collection", "warning",
+      "Model performance intake refused requests in the last 24 hours",
+      `${formatNumber(refusals.last24Hours)} refused requests (whole UTC-day counters, so an upper bound covering up to about 48 h). ${runtime?.state === "staged" ? "The runtime is staged, so capability polls are refused 403 until activation." : "Review the refusal codes by route."}`,
+      target, "Review refusals");
+  }
+  if (refusals !== null) {
+    const fromDay = snapshot.windows.last7DaysFrom.slice(0, 10);
+    const rows = refusals.byDay.filter(row => row.day >= fromDay);
+    const definite = rows.filter(row => PERFORMANCE_DICTIONARY_REFUSAL_CODES.has(row.code))
+      .reduce((total, row) => total + row.refusals, 0);
+    const possible = runtime?.state === "active" ? rows.filter(row => row.routeId === "telemetry_performance_reports"
+      && row.status === 403 && row.code === "TELEMETRY_TRANSPORT_BLOCKED").reduce((total, row) => total + row.refusals, 0) : 0;
+    if (definite + possible > 0) {
+      addAttentionItem(items, "performance-dictionary-refusals", "collection", "warning",
+        "Model performance reports were refused for their field dictionary",
+        `In the UTC days overlapping the last 7 days: ${formatNumber(definite)} reports refused for an unaccepted dictionary or bucket scheme, and ${formatNumber(possible)} report refusals 403 that can be a dictionary differing from the device's capability (the same code covers other fence refusals).`,
+        target, "Review refusals");
+    }
+  }
+  if (publication?.lastRun?.withheld) {
+    addAttentionItem(items, "performance-withheld", "evidence", "warning",
+      "The last community model performance publication was withheld",
+      `Run finished ${formatTime(publication.lastRun.finishedAt)}: ${PERFORMANCE_WITHHELD_LABELS[publication.lastRun.withheld]} (${publication.lastRun.withheld}). Review the refresh receipt before the next scheduled run.`,
+      target, "Review publication");
+  }
+  const audit = latestPerformanceActivationAudit();
+  if (performanceActivationNeedsReconcile(runtime, audit)) {
+    addAttentionItem(items, "performance-activation-reconcile", "maintenance", "warning",
+      "Model performance activation needs reconciliation",
+      `An activation started ${formatTime(audit.createdAt)} has no recorded result while the runtime is still staged. Follow the runbook with a new idempotency key.`,
+      target, "Review intake");
+  }
+}
+
+function performanceFailureText(error) {
+  if (error?.code === "ADMIN_PERFORMANCE_INTAKE_INVALID") {
+    return "The performance intake response was malformed and is not shown (ADMIN_PERFORMANCE_INTAKE_INVALID). The rest of this page is unaffected.";
+  }
+  return PERFORMANCE_FAILURE_TEXT[error?.httpStatus]
+    ?? `The performance intake view could not be read (${error?.code ?? "UNEXPECTED_ERROR"}). Refresh to retry.`;
+}
+
 function refreshAttention() {
   if (!state.overview || state.overviewUnavailable) return;
   notifyAttention(renderAttention(state.overview));
@@ -1410,6 +1793,7 @@ function collectAttentionItems(overview) {
       "At least one required database could not be read, or the storage configuration is invalid. Review each role and check Cloudflare D1 before retrying.",
       "#database-health-title", "Review databases");
   }
+  collectPerformanceAttention(items);
   const collection = overview.collection;
   const lifecycle = overview.lifecycle;
   const reconciliation = overview.reconciliation;
@@ -3848,6 +4232,7 @@ function render(overview) {
   renderErrors(overview.errors);
   renderAudit(overview.audit);
   renderCurrentReconstructionProgress();
+  renderPerformanceIntake();
   $("#last-refresh").textContent = formatTime(overview.generatedAt);
   $("#service-state").textContent = `${overview.service.environment} · ${overview.collection.state}`;
   notifyAttention(attention);
@@ -3892,6 +4277,10 @@ function refuseAdminAccess(error) {
   state.controlsRevision = null;
   state.sourceHealth = { history: "unavailable", allowance: "unavailable", progress: "unavailable", database: "unavailable" };
   renderDatabaseHealth();
+  state.performanceIntake = null;
+  state.performanceIntakeHealth = "unavailable";
+  state.performanceIntakeFailure = "Owner access is unavailable. Sign in again, then refresh.";
+  renderPerformanceIntake();
   state.overviewReadSucceeded = false;
   state.metricsHistory = null;
   state.allowancePreview = null;
@@ -3935,6 +4324,28 @@ const adminReadLanes = {
       if (!retained) state.databaseHealth = null;
       updateSourceHealth("database", retained ? "stale" : "unavailable");
       renderDatabaseHealth();
+    },
+  }),
+  performance: createAdminReadLane({
+    read: async ({ signal }) => projectAdminPerformanceIntake(
+      await request("/api/v1/admin/performance-intake", { signal })),
+    publish: snapshot => {
+      state.performanceIntake = snapshot;
+      state.performanceIntakeHealth = "available";
+      state.performanceIntakeFailure = null;
+      renderPerformanceIntake();
+      refreshAttention();
+    },
+    failed: error => {
+      // Only an owner-access refusal clears the page; 404, any other 403 and
+      // 503 (ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE) mean this host has no view.
+      if (isOwnerAccessRefusal(error) && refuseAdminAccess(error)) return;
+      const retained = isTransientAdminReadError(error) && state.performanceIntake !== null;
+      if (!retained) state.performanceIntake = null;
+      state.performanceIntakeHealth = retained ? "stale" : "unavailable";
+      state.performanceIntakeFailure = performanceFailureText(error);
+      renderPerformanceIntake();
+      refreshAttention();
     },
   }),
   overview: createAdminReadLane({
@@ -4036,6 +4447,7 @@ async function load() {
   if (isAdminPage) {
     void adminReadLanes.progress.run();
     void adminReadLanes.database.run();
+    void adminReadLanes.performance.run();
   }
   try {
     // No app session on the admin host: authentication is Cloudflare Access and

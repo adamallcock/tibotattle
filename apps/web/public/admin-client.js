@@ -258,6 +258,397 @@ export function projectAdminDatabaseHealth(value) {
     storageMode, status, databases };
 }
 
+/*
+ * admin-performance-intake-v0.1: the origin's read-only owner view of the
+ * accountless model-performance intake (GET /api/v1/admin/performance-intake;
+ * docs/runbooks/production-operations.md, "Model performance intake"). Counts, UTC days,
+ * instants and closed labels only: no participant, device, report or
+ * enrollment id ever reaches this page. Every key set is closed, and every
+ * enum is written out here because this line's telemetry mirror predates the
+ * performance dictionaries. A data block may instead be exactly
+ * { status: "unavailable" } (a host without that source). Any other shape or
+ * contradiction between the counts is ADMIN_PERFORMANCE_INTAKE_INVALID: the
+ * section then reads as unavailable, and nothing is clamped or inferred.
+ */
+const ADMIN_PERFORMANCE_INTAKE_SCHEMA_VERSION = "admin-performance-intake-v0.1";
+const ADMIN_PERFORMANCE_INTAKE_MAX_WINDOW_DAYS = 400;
+const ADMIN_PERFORMANCE_DICTIONARY_PATTERN =
+  /^telemetry-performance-registry-[0-9]{4}-[0-9]{2}-[0-9]{2}[.][0-9]{1,3}$/u;
+const ADMIN_PERFORMANCE_BUCKET_SCHEMES = new Set(["performance-histogram-v1", "performance-histogram-v2"]);
+const ADMIN_PERFORMANCE_RUNTIME_STATES = new Set(["staged", "active"]);
+const ADMIN_PERFORMANCE_RUNTIME_SCHEMA_VERSION = "model-performance-daily-v1";
+const ADMIN_PERFORMANCE_RUNTIME_PRIVACY_CONTRACT_VERSION = "privacy-safe-model-performance-v1";
+const ADMIN_PERFORMANCE_RUNTIME_METHOD_VERSION = "performance-daily-histogram-v1";
+const ADMIN_PERFORMANCE_DICTIONARY_BASES = new Set([
+  "v12_parser_inference", "default_no_manifest", "client_declared",
+]);
+/** Every cohort speed mode the intake stores; only the first three are ever published. */
+export const ADMIN_PERFORMANCE_PUBLISHED_SPEED_MODES = Object.freeze(["standard", "fast", "ultrafast"]);
+const ADMIN_PERFORMANCE_UNPUBLISHED_SPEED_MODES = Object.freeze(["unknown", "mixed", "other"]);
+const ADMIN_PERFORMANCE_COHORT_SPEED_MODES = new Set([
+  ...ADMIN_PERFORMANCE_PUBLISHED_SPEED_MODES, ...ADMIN_PERFORMANCE_UNPUBLISHED_SPEED_MODES,
+]);
+export const ADMIN_PERFORMANCE_PERIODS = Object.freeze(["1", "7", "30", "all"]);
+/** The twelve publication slots, period-major, as the origin keys them. */
+export const ADMIN_PERFORMANCE_SLOT_KEYS = Object.freeze(ADMIN_PERFORMANCE_PERIODS.flatMap(period =>
+  ADMIN_PERFORMANCE_PUBLISHED_SPEED_MODES.map(speedMode => `${period}:${speedMode}`)));
+export const ADMIN_PERFORMANCE_REFUSAL_ROUTE_IDS = Object.freeze([
+  "accountless_telemetry_performance_authorization",
+  "telemetry_performance_capabilities",
+  "telemetry_performance_reports",
+]);
+const ADMIN_PERFORMANCE_WITHHELD_CODES = new Set([
+  "ANALYTICS_V2_PERFORMANCE_CAPACITY",
+  "ANALYTICS_V2_PERFORMANCE_RECORD_INVALID",
+  "ANALYTICS_V2_PERFORMANCE_MODELS_EXCEEDED",
+  "ANALYTICS_V2_PERFORMANCE_POINTS_EXCEEDED",
+]);
+const ADMIN_PERFORMANCE_UNAVAILABLE_BLOCKS = Object.freeze([
+  "runtime", "dictionaries", "grants", "capabilities", "reports", "cohorts", "refusals", "publication",
+]);
+const ADMIN_PERFORMANCE_MODEL_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
+const ADMIN_PERFORMANCE_REFUSAL_CODE = /^[A-Z][A-Z0-9_]{1,63}$/u;
+const ADMIN_PERFORMANCE_ROUTE_ID = /^[a-z][a-z0-9_]{0,63}$/u;
+const ADMIN_PERFORMANCE_ROUTE_CLASS = /^[a-z][a-z0-9_-]{0,63}$/u;
+const ADMIN_PERFORMANCE_CONTRACT_STATE = /^[a-z][a-z_]{0,31}$/u;
+const ADMIN_PERFORMANCE_COMMIT = /^[0-9a-f]{40}$/u;
+const ADMIN_PERFORMANCE_SHA256 = /^[0-9a-f]{64}$/u;
+const ADMIN_PERFORMANCE_MAX_ROUTES = 64;
+const ADMIN_PERFORMANCE_MAX_DICTIONARIES = 64;
+const ADMIN_PERFORMANCE_MAX_MODEL_ROWS = 2_048;
+const ADMIN_PERFORMANCE_MAX_REFUSAL_ROWS = 4_096;
+const DAY_MILLISECONDS = 86_400_000;
+
+export function projectAdminPerformanceIntake(value) {
+  const code = "ADMIN_PERFORMANCE_INTAKE_INVALID";
+  const closed = (candidate, keys) => {
+    const result = record(candidate, code);
+    const actual = Object.keys(result);
+    if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) invalid(code);
+    return result;
+  };
+  const instant = candidate => {
+    const result = isoTimestamp(candidate, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableInstant = candidate => candidate === null ? null : instant(candidate);
+  const day = candidate => calendarDay(candidate, code);
+  const token = (candidate, pattern) => {
+    if (typeof candidate !== "string" || !pattern.test(candidate)) invalid(code);
+    return candidate;
+  };
+  const exact = (candidate, expected) => {
+    if (candidate !== expected) invalid(code);
+    return expected;
+  };
+  const rows = (candidate, maximum, project) => {
+    const list = array(candidate, code);
+    if (list.length > maximum) invalid(code);
+    return Object.freeze(list.map(project));
+  };
+  const unique = (list, key) => {
+    const keys = list.map(key);
+    if (new Set(keys).size !== keys.length) invalid(code);
+  };
+  const ascending = (list, key, strict) => {
+    for (let index = 1; index < list.length; index += 1) {
+      const previous = key(list[index - 1]);
+      const current = key(list[index]);
+      if (strict ? previous >= current : previous > current) invalid(code);
+    }
+  };
+  const sum = (list, field) => list.reduce((total, row) => total + row[field], 0);
+  const block = (candidate, project) => isUnavailableBlock(candidate) ? UNAVAILABLE_BLOCK : project(candidate);
+  const available = candidate => candidate !== UNAVAILABLE_BLOCK;
+
+  const source = closed(value, [
+    "schemaVersion", "generatedAt", "windows", "routes", "deployment", ...ADMIN_PERFORMANCE_UNAVAILABLE_BLOCKS,
+  ]);
+  if (source.schemaVersion !== ADMIN_PERFORMANCE_INTAKE_SCHEMA_VERSION) invalid(code);
+  const generatedAt = instant(source.generatedAt);
+  const generatedEpoch = Date.parse(generatedAt);
+
+  // The per-day window ends on the snapshot's UTC day; the rolling bounds are exact.
+  const windowSource = closed(source.windows, ["days", "from", "through", "last24HoursFrom", "last7DaysFrom"]);
+  const windows = Object.freeze({
+    days: positiveInteger(windowSource.days, code),
+    from: day(windowSource.from),
+    through: day(windowSource.through),
+    last24HoursFrom: instant(windowSource.last24HoursFrom),
+    last7DaysFrom: instant(windowSource.last7DaysFrom),
+  });
+  if (windows.days > ADMIN_PERFORMANCE_INTAKE_MAX_WINDOW_DAYS
+      || windows.through !== generatedAt.slice(0, 10)
+      || (Date.parse(`${windows.through}T00:00:00.000Z`) - Date.parse(`${windows.from}T00:00:00.000Z`))
+        / DAY_MILLISECONDS + 1 !== windows.days
+      || Date.parse(windows.last24HoursFrom) !== generatedEpoch - DAY_MILLISECONDS
+      || Date.parse(windows.last7DaysFrom) !== generatedEpoch - 7 * DAY_MILLISECONDS) invalid(code);
+  const inWindow = candidate => candidate >= windows.from && candidate <= windows.through;
+  const last24HoursFromDay = windows.last24HoursFrom.slice(0, 10);
+
+  const routes = rows(source.routes, ADMIN_PERFORMANCE_MAX_ROUTES, item => {
+    const route = closed(item, ["routeId", "routeClass"]);
+    return Object.freeze({
+      routeId: token(route.routeId, ADMIN_PERFORMANCE_ROUTE_ID),
+      routeClass: token(route.routeClass, ADMIN_PERFORMANCE_ROUTE_CLASS),
+    });
+  });
+  ascending(routes, route => route.routeId, true);
+  const deploymentSource = closed(source.deployment, ["sourceCommit", "historySha256"]);
+  const deployment = Object.freeze({
+    sourceCommit: deploymentSource.sourceCommit === null ? null
+      : token(deploymentSource.sourceCommit, ADMIN_PERFORMANCE_COMMIT),
+    historySha256: token(deploymentSource.historySha256, ADMIN_PERFORMANCE_SHA256),
+  });
+
+  const runtime = block(source.runtime, candidate => {
+    const item = closed(candidate, [
+      "state", "policyRevision", "schemaVersion", "privacyContractVersion", "methodVersion", "updatedAt",
+    ]);
+    return Object.freeze({
+      state: enumValue(item.state, ADMIN_PERFORMANCE_RUNTIME_STATES, code),
+      policyRevision: positiveInteger(item.policyRevision, code),
+      schemaVersion: exact(item.schemaVersion, ADMIN_PERFORMANCE_RUNTIME_SCHEMA_VERSION),
+      privacyContractVersion: exact(item.privacyContractVersion, ADMIN_PERFORMANCE_RUNTIME_PRIVACY_CONTRACT_VERSION),
+      methodVersion: exact(item.methodVersion, ADMIN_PERFORMANCE_RUNTIME_METHOD_VERSION),
+      updatedAt: instant(item.updatedAt),
+    });
+  });
+
+  const dictionaries = block(source.dictionaries, candidate => {
+    const list = rows(candidate, ADMIN_PERFORMANCE_MAX_DICTIONARIES, item => {
+      const row = closed(item, ["fieldDictionaryVersion", "bucketSchemeVersion", "contractState"]);
+      return Object.freeze({
+        fieldDictionaryVersion: token(row.fieldDictionaryVersion, ADMIN_PERFORMANCE_DICTIONARY_PATTERN),
+        bucketSchemeVersion: enumValue(row.bucketSchemeVersion, ADMIN_PERFORMANCE_BUCKET_SCHEMES, code),
+        contractState: token(row.contractState, ADMIN_PERFORMANCE_CONTRACT_STATE),
+      });
+    });
+    ascending(list, row => row.fieldDictionaryVersion, true);
+    return list;
+  });
+  const knownDictionary = version => {
+    const valid = token(version, ADMIN_PERFORMANCE_DICTIONARY_PATTERN);
+    if (available(dictionaries) && !dictionaries.some(row => row.fieldDictionaryVersion === valid)) invalid(code);
+    return valid;
+  };
+
+  const grants = block(source.grants, candidate => {
+    const item = closed(candidate, [
+      "active", "expired", "revoked", "total", "authorizedLast24Hours", "authorizedLast7Days", "activeByDictionary",
+    ]);
+    const projected = Object.freeze({
+      active: count(item.active, code),
+      expired: count(item.expired, code),
+      revoked: count(item.revoked, code),
+      total: count(item.total, code),
+      authorizedLast24Hours: count(item.authorizedLast24Hours, code),
+      authorizedLast7Days: count(item.authorizedLast7Days, code),
+      activeByDictionary: rows(item.activeByDictionary, ADMIN_PERFORMANCE_MAX_DICTIONARIES * 3, entry => {
+        const row = closed(entry, ["fieldDictionaryVersion", "dictionaryBasis", "devices"]);
+        return Object.freeze({
+          fieldDictionaryVersion: knownDictionary(row.fieldDictionaryVersion),
+          dictionaryBasis: enumValue(row.dictionaryBasis, ADMIN_PERFORMANCE_DICTIONARY_BASES, code),
+          devices: positiveInteger(row.devices, code),
+        });
+      }),
+    });
+    unique(projected.activeByDictionary, row => `${row.fieldDictionaryVersion}\0${row.dictionaryBasis}`);
+    if (projected.active + projected.expired + projected.revoked !== projected.total
+        || projected.authorizedLast24Hours > projected.authorizedLast7Days
+        || sum(projected.activeByDictionary, "devices") !== projected.active) invalid(code);
+    return projected;
+  });
+
+  const capabilities = block(source.capabilities, candidate => {
+    const item = closed(candidate, ["active", "expired", "revoked"]);
+    return Object.freeze({
+      active: count(item.active, code),
+      expired: count(item.expired, code),
+      revoked: count(item.revoked, code),
+    });
+  });
+
+  const reports = block(source.reports, candidate => {
+    const item = closed(candidate, [
+      "current", "superseded", "contributors", "devices", "latestReportDay", "latestAcceptedAt",
+      "byEvidenceDay", "byArrivalDay", "byDictionary", "outsideWindow",
+    ]);
+    const outside = closed(item.outsideWindow, ["evidenceBefore", "evidenceAfter", "arrivalBefore", "arrivalAfter"]);
+    const projected = Object.freeze({
+      current: count(item.current, code),
+      superseded: count(item.superseded, code),
+      contributors: count(item.contributors, code),
+      devices: count(item.devices, code),
+      latestReportDay: item.latestReportDay === null ? null : day(item.latestReportDay),
+      latestAcceptedAt: nullableInstant(item.latestAcceptedAt),
+      byEvidenceDay: rows(item.byEvidenceDay, windows.days, entry => {
+        const row = closed(entry, ["day", "current", "superseded", "records"]);
+        const projectedRow = Object.freeze({
+          day: day(row.day),
+          current: count(row.current, code),
+          superseded: count(row.superseded, code),
+          records: count(row.records, code),
+        });
+        if (!inWindow(projectedRow.day) || projectedRow.current + projectedRow.superseded === 0) invalid(code);
+        return projectedRow;
+      }),
+      byArrivalDay: rows(item.byArrivalDay, windows.days, entry => {
+        const row = closed(entry, ["day", "accepted", "replaced"]);
+        const projectedRow = Object.freeze({
+          day: day(row.day),
+          accepted: count(row.accepted, code),
+          replaced: count(row.replaced, code),
+        });
+        if (!inWindow(projectedRow.day) || projectedRow.accepted + projectedRow.replaced === 0) invalid(code);
+        return projectedRow;
+      }),
+      byDictionary: rows(item.byDictionary, ADMIN_PERFORMANCE_MAX_DICTIONARIES, entry => {
+        const row = closed(entry, ["fieldDictionaryVersion", "current", "superseded", "records"]);
+        return Object.freeze({
+          fieldDictionaryVersion: knownDictionary(row.fieldDictionaryVersion),
+          current: count(row.current, code),
+          superseded: count(row.superseded, code),
+          records: count(row.records, code),
+        });
+      }),
+      outsideWindow: Object.freeze({
+        evidenceBefore: count(outside.evidenceBefore, code),
+        evidenceAfter: count(outside.evidenceAfter, code),
+        arrivalBefore: count(outside.arrivalBefore, code),
+        arrivalAfter: count(outside.arrivalAfter, code),
+      }),
+    });
+    ascending(projected.byEvidenceDay, row => row.day, true);
+    ascending(projected.byArrivalDay, row => row.day, true);
+    ascending(projected.byDictionary, row => row.fieldDictionaryVersion, true);
+    const inside = sum(projected.byEvidenceDay, "current") + sum(projected.byEvidenceDay, "superseded");
+    if (projected.devices < projected.contributors || projected.current < projected.devices
+        || (projected.current === 0) !== (projected.latestReportDay === null)
+        || sum(projected.byDictionary, "current") !== projected.current
+        || sum(projected.byDictionary, "superseded") !== projected.superseded
+        || inside + projected.outsideWindow.evidenceBefore + projected.outsideWindow.evidenceAfter
+          !== projected.current + projected.superseded) invalid(code);
+    return projected;
+  });
+
+  const cohorts = block(source.cohorts, candidate => {
+    const item = closed(candidate, ["bySpeedMode", "byModel", "excludedFromPublicationTurns"]);
+    const cohortRow = (row, keys) => {
+      const result = closed(row, keys);
+      return {
+        speedMode: enumValue(result.speedMode, ADMIN_PERFORMANCE_COHORT_SPEED_MODES, code),
+        cohorts: positiveInteger(result.cohorts, code),
+        turns: positiveInteger(result.turns, code),
+      };
+    };
+    const projected = Object.freeze({
+      bySpeedMode: rows(item.bySpeedMode, ADMIN_PERFORMANCE_COHORT_SPEED_MODES.size,
+        entry => Object.freeze(cohortRow(entry, ["speedMode", "cohorts", "turns"]))),
+      byModel: rows(item.byModel, ADMIN_PERFORMANCE_MAX_MODEL_ROWS, entry => {
+        const row = record(entry, code);
+        const counts = cohortRow(entry, ["provider", "modelId", "speedMode", "cohorts", "turns"]);
+        return Object.freeze({
+          provider: token(row.provider, ADMIN_PERFORMANCE_MODEL_TOKEN),
+          modelId: token(row.modelId, ADMIN_PERFORMANCE_MODEL_TOKEN),
+          ...counts,
+        });
+      }),
+      excludedFromPublicationTurns: count(item.excludedFromPublicationTurns, code),
+    });
+    // Order is the database collation's; only uniqueness and the totals are checked.
+    unique(projected.bySpeedMode, row => row.speedMode);
+    unique(projected.byModel, row => `${row.provider}\0${row.modelId}\0${row.speedMode}`);
+    for (const mode of projected.bySpeedMode) {
+      const models = projected.byModel.filter(row => row.speedMode === mode.speedMode);
+      if (sum(models, "cohorts") !== mode.cohorts || sum(models, "turns") !== mode.turns) invalid(code);
+    }
+    if (projected.byModel.some(row => !projected.bySpeedMode.some(mode => mode.speedMode === row.speedMode))
+        || sum(projected.bySpeedMode.filter(row => ADMIN_PERFORMANCE_UNPUBLISHED_SPEED_MODES.includes(row.speedMode)),
+          "turns") !== projected.excludedFromPublicationTurns) invalid(code);
+    return projected;
+  });
+
+  const refusals = block(source.refusals, candidate => {
+    const item = closed(candidate, ["last24Hours", "byDay", "outsideWindow"]);
+    const outside = closed(item.outsideWindow, ["before", "after"]);
+    const projected = Object.freeze({
+      last24Hours: count(item.last24Hours, code),
+      byDay: rows(item.byDay, ADMIN_PERFORMANCE_MAX_REFUSAL_ROWS, entry => {
+        const row = closed(entry, ["day", "routeId", "code", "status", "refusals"]);
+        const projectedRow = Object.freeze({
+          day: day(row.day),
+          routeId: enumValue(row.routeId, new Set(ADMIN_PERFORMANCE_REFUSAL_ROUTE_IDS), code),
+          code: token(row.code, ADMIN_PERFORMANCE_REFUSAL_CODE),
+          status: count(row.status, code),
+          refusals: positiveInteger(row.refusals, code),
+        });
+        if (!inWindow(projectedRow.day) || projectedRow.status < 400 || projectedRow.status > 599) invalid(code);
+        return projectedRow;
+      }),
+      outsideWindow: Object.freeze({ before: count(outside.before, code), after: count(outside.after, code) }),
+    });
+    ascending(projected.byDay, row => row.day, false);
+    unique(projected.byDay, row => `${row.day}\0${row.routeId}\0${row.code}\0${row.status}`);
+    // The 24-hour figure is the sum of the whole UTC-day rows it overlaps.
+    if (sum(projected.byDay.filter(row => row.day >= last24HoursFromDay), "refusals")
+        !== projected.last24Hours) invalid(code);
+    return projected;
+  });
+
+  const publication = block(source.publication, candidate => {
+    const item = closed(candidate, ["slots", "lastRun"]);
+    const slots = rows(item.slots, ADMIN_PERFORMANCE_SLOT_KEYS.length, entry => {
+      const row = closed(entry, ["period", "speedMode", "revision", "releasedAt", "end", "kernelId"]);
+      return Object.freeze({
+        period: enumValue(row.period, new Set(ADMIN_PERFORMANCE_PERIODS), code),
+        speedMode: enumValue(row.speedMode, new Set(ADMIN_PERFORMANCE_PUBLISHED_SPEED_MODES), code),
+        revision: positiveInteger(row.revision, code),
+        releasedAt: instant(row.releasedAt),
+        end: day(row.end),
+        kernelId: positiveInteger(row.kernelId, code),
+      });
+    });
+    ascending(slots, slot => ADMIN_PERFORMANCE_SLOT_KEYS.indexOf(`${slot.period}:${slot.speedMode}`), true);
+    let lastRun = null;
+    if (item.lastRun !== null) {
+      const run = closed(item.lastRun, ["finishedAt", "published", "unchanged", "withheld", "deferredEmpty"]);
+      const slotKeys = list => {
+        const keys = rows(list, ADMIN_PERFORMANCE_SLOT_KEYS.length,
+          key => enumValue(key, new Set(ADMIN_PERFORMANCE_SLOT_KEYS), code));
+        unique(keys, key => key);
+        return keys;
+      };
+      lastRun = Object.freeze({
+        finishedAt: instant(run.finishedAt),
+        published: slotKeys(run.published),
+        unchanged: slotKeys(run.unchanged),
+        withheld: run.withheld === null ? null : enumValue(run.withheld, ADMIN_PERFORMANCE_WITHHELD_CODES, code),
+        deferredEmpty: boolean(run.deferredEmpty, code),
+      });
+      if (lastRun.published.some(key => lastRun.unchanged.includes(key))) invalid(code);
+    }
+    return Object.freeze({ slots, lastRun });
+  });
+
+  return Object.freeze({
+    schemaVersion: ADMIN_PERFORMANCE_INTAKE_SCHEMA_VERSION,
+    generatedAt,
+    windows,
+    routes,
+    deployment,
+    runtime,
+    dictionaries,
+    grants,
+    capabilities,
+    reports,
+    cohorts,
+    refusals,
+    publication,
+  });
+}
+
 /** Closed, aggregate-only owner progress. It describes recorded work and
  * publication generations, never estimates remaining time or missing counts. */
 export function projectAdminReconstructionProgress(value) {

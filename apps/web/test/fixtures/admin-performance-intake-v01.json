@@ -1,0 +1,326 @@
+{
+  "schemaVersion": "admin-performance-intake-v0.1",
+  "generatedAt": "2035-06-15T12:00:00.000Z",
+  "windows": {
+    "days": 400,
+    "from": "2034-05-12",
+    "through": "2035-06-15",
+    "last24HoursFrom": "2035-06-14T12:00:00.000Z",
+    "last7DaysFrom": "2035-06-08T12:00:00.000Z"
+  },
+  "routes": [
+    {
+      "routeId": "accountless_telemetry_performance_authorization",
+      "routeClass": "performance"
+    },
+    {
+      "routeId": "community_model_performance",
+      "routeClass": "scope"
+    },
+    {
+      "routeId": "telemetry_performance_capabilities",
+      "routeClass": "performance"
+    },
+    {
+      "routeId": "telemetry_performance_reports",
+      "routeClass": "performance"
+    }
+  ],
+  "deployment": {
+    "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+    "historySha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "runtime": {
+    "state": "active",
+    "policyRevision": 2,
+    "schemaVersion": "model-performance-daily-v1",
+    "privacyContractVersion": "privacy-safe-model-performance-v1",
+    "methodVersion": "performance-daily-histogram-v1",
+    "updatedAt": "2035-06-05T12:00:00.000Z"
+  },
+  "dictionaries": [
+    {
+      "fieldDictionaryVersion": "telemetry-performance-registry-2026-09-21.1",
+      "bucketSchemeVersion": "performance-histogram-v1",
+      "contractState": "accepted"
+    },
+    {
+      "fieldDictionaryVersion": "telemetry-performance-registry-2026-09-29.1",
+      "bucketSchemeVersion": "performance-histogram-v1",
+      "contractState": "accepted"
+    },
+    {
+      "fieldDictionaryVersion": "telemetry-performance-registry-2026-10-10.1",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "contractState": "accepted"
+    }
+  ],
+  "grants": {
+    "active": 2,
+    "expired": 2,
+    "revoked": 1,
+    "total": 5,
+    "authorizedLast24Hours": 2,
+    "authorizedLast7Days": 4,
+    "activeByDictionary": [
+      {
+        "fieldDictionaryVersion": "telemetry-performance-registry-2026-09-21.1",
+        "dictionaryBasis": "v12_parser_inference",
+        "devices": 1
+      },
+      {
+        "fieldDictionaryVersion": "telemetry-performance-registry-2026-10-10.1",
+        "dictionaryBasis": "client_declared",
+        "devices": 1
+      }
+    ]
+  },
+  "capabilities": {
+    "active": 2,
+    "expired": 2,
+    "revoked": 1
+  },
+  "reports": {
+    "current": 9,
+    "superseded": 1,
+    "contributors": 5,
+    "devices": 5,
+    "latestReportDay": "2035-06-16",
+    "latestAcceptedAt": "2035-06-15T12:00:00.001Z",
+    "byEvidenceDay": [
+      {
+        "day": "2034-05-12",
+        "current": 1,
+        "superseded": 0,
+        "records": 1
+      },
+      {
+        "day": "2035-06-10",
+        "current": 1,
+        "superseded": 0,
+        "records": 1
+      },
+      {
+        "day": "2035-06-12",
+        "current": 1,
+        "superseded": 0,
+        "records": 1
+      },
+      {
+        "day": "2035-06-13",
+        "current": 1,
+        "superseded": 0,
+        "records": 1
+      },
+      {
+        "day": "2035-06-14",
+        "current": 1,
+        "superseded": 1,
+        "records": 2
+      },
+      {
+        "day": "2035-06-15",
+        "current": 2,
+        "superseded": 0,
+        "records": 3
+      }
+    ],
+    "byArrivalDay": [
+      {
+        "day": "2035-06-13",
+        "accepted": 1,
+        "replaced": 0
+      },
+      {
+        "day": "2035-06-14",
+        "accepted": 1,
+        "replaced": 0
+      },
+      {
+        "day": "2035-06-15",
+        "accepted": 5,
+        "replaced": 1
+      }
+    ],
+    "byDictionary": [
+      {
+        "fieldDictionaryVersion": "telemetry-performance-registry-2026-09-21.1",
+        "current": 5,
+        "superseded": 0,
+        "records": 4
+      },
+      {
+        "fieldDictionaryVersion": "telemetry-performance-registry-2026-09-29.1",
+        "current": 2,
+        "superseded": 1,
+        "records": 2
+      },
+      {
+        "fieldDictionaryVersion": "telemetry-performance-registry-2026-10-10.1",
+        "current": 2,
+        "superseded": 0,
+        "records": 5
+      }
+    ],
+    "outsideWindow": {
+      "evidenceBefore": 1,
+      "evidenceAfter": 1,
+      "arrivalBefore": 1,
+      "arrivalAfter": 1
+    }
+  },
+  "cohorts": {
+    "bySpeedMode": [
+      {
+        "speedMode": "fast",
+        "cohorts": 2,
+        "turns": 7
+      },
+      {
+        "speedMode": "mixed",
+        "cohorts": 1,
+        "turns": 6
+      },
+      {
+        "speedMode": "other",
+        "cohorts": 1,
+        "turns": 2
+      },
+      {
+        "speedMode": "standard",
+        "cohorts": 3,
+        "turns": 8
+      },
+      {
+        "speedMode": "ultrafast",
+        "cohorts": 1,
+        "turns": 4
+      },
+      {
+        "speedMode": "unknown",
+        "cohorts": 1,
+        "turns": 7
+      }
+    ],
+    "byModel": [
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "fast",
+        "cohorts": 1,
+        "turns": 5
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "mixed",
+        "cohorts": 1,
+        "turns": 6
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "other",
+        "cohorts": 1,
+        "turns": 2
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "standard",
+        "cohorts": 3,
+        "turns": 8
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "ultrafast",
+        "cohorts": 1,
+        "turns": 4
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-5.5",
+        "speedMode": "unknown",
+        "cohorts": 1,
+        "turns": 7
+      },
+      {
+        "provider": "openai_codex",
+        "modelId": "gpt-6.1-sol",
+        "speedMode": "fast",
+        "cohorts": 1,
+        "turns": 2
+      }
+    ],
+    "excludedFromPublicationTurns": 15
+  },
+  "refusals": {
+    "last24Hours": 9,
+    "byDay": [
+      {
+        "day": "2034-05-12",
+        "routeId": "telemetry_performance_capabilities",
+        "code": "TELEMETRY_TRANSPORT_BLOCKED",
+        "status": 403,
+        "refusals": 1
+      },
+      {
+        "day": "2035-06-13",
+        "routeId": "accountless_telemetry_performance_authorization",
+        "code": "TELEMETRY_CONSENT_INVALID",
+        "status": 403,
+        "refusals": 1
+      },
+      {
+        "day": "2035-06-14",
+        "routeId": "telemetry_performance_reports",
+        "code": "TELEMETRY_RECORD_INVALID_SHAPE",
+        "status": 409,
+        "refusals": 2
+      },
+      {
+        "day": "2035-06-15",
+        "routeId": "telemetry_performance_capabilities",
+        "code": "TELEMETRY_TRANSPORT_BLOCKED",
+        "status": 403,
+        "refusals": 7
+      }
+    ],
+    "outsideWindow": {
+      "before": 4,
+      "after": 3
+    }
+  },
+  "publication": {
+    "slots": [
+      {
+        "period": "1",
+        "speedMode": "standard",
+        "revision": 2,
+        "releasedAt": "2035-06-13T12:00:00.000Z",
+        "end": "2035-06-13",
+        "kernelId": 1
+      },
+      {
+        "period": "7",
+        "speedMode": "fast",
+        "revision": 3,
+        "releasedAt": "2035-06-14T12:00:00.000Z",
+        "end": "2035-06-13",
+        "kernelId": 1
+      }
+    ],
+    "lastRun": {
+      "finishedAt": "2035-06-14T12:00:00.000Z",
+      "published": [
+        "7:fast"
+      ],
+      "unchanged": [
+        "1:standard"
+      ],
+      "withheld": null,
+      "deferredEmpty": false
+    }
+  }
+}

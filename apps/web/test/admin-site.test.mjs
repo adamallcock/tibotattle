@@ -314,7 +314,14 @@ async function waitFor(predicate) {
   assert.fail("timed out waiting for the admin view to render");
 }
 
-async function withAdminPage(fetchResponse, check, preferences = {}, databaseResponse = null) {
+// The performance intake has its own route; hosts that predate it answer 404,
+// which is the default here so the other tests see that host.
+const PERFORMANCE_INTAKE_PATH = "/api/v1/admin/performance-intake";
+function notFoundResponse() {
+  return { ok: false, status: 404, async json() { return { error: { code: "NOT_FOUND" } }; } };
+}
+
+async function withAdminPage(fetchResponse, check, preferences = {}, databaseResponse = null, performanceResponse = null) {
   const databaseFixture = await fixture("admin-database-health-valid.json");
   const documentRef = fakeDocument();
   const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
@@ -341,7 +348,9 @@ async function withAdminPage(fetchResponse, check, preferences = {}, databaseRes
     document: documentRef,
     fetch: async (path, options) => path === "/api/v1/admin/database-health"
       ? databaseResponse ? databaseResponse(options) : response(databaseFixture)
-      : fetchResponse(path, options),
+      : path === PERFORMANCE_INTAKE_PATH
+        ? performanceResponse ? performanceResponse(options) : notFoundResponse()
+        : fetchResponse(path, options),
     window: { innerHeight: 844, innerWidth: 390, addEventListener(name, listener) { windowListeners.set(name, listener); } },
     localStorage: {
       getItem: (key) => storedPreferences.get(key) ?? null,
@@ -2351,4 +2360,358 @@ test("distribution quality summary labels retained evidence after a failed refre
     await documentRef.byId.get("refresh").listeners.get("click")();
     await waitFor(() => !documentRef.byId.get("distribution-source-summary").textContent.startsWith("Refresh failed"));
   });
+});
+
+// Model performance intake (admin-performance-intake-v0.1): its own read lane,
+// read-only, with every count labelled and no activation control.
+const PERFORMANCE_CARD_LABELS = [
+  "Runtime", "Active grants", "Active capabilities", "Reports received, last 24 h",
+  "Reports received, last 7 days", "Latest evidence day", "Refusals, last 24 h",
+];
+const PERFORMANCE_TABLES = [
+  "performance-evidence-rows", "performance-arrival-rows", "performance-dictionary-rows",
+  "performance-cohort-rows", "performance-refusal-rows", "performance-slot-rows",
+];
+
+function performanceStatus(documentRef) {
+  return documentRef.byId.get("performance-intake-status").textContent;
+}
+
+function performanceSectionText(documentRef) {
+  return ["performance-intake-cards", "performance-intake-runtime", "performance-intake-last-run",
+    ...PERFORMANCE_TABLES, "performance-intake-window"].map(id => allText(documentRef.byId.get(id))).join(" ");
+}
+
+function performanceSparse(base) {
+  const sparse = structuredClone(base);
+  Object.assign(sparse.runtime, { state: "staged", policyRevision: 1 });
+  sparse.grants = {
+    active: 0, expired: 0, revoked: 0, total: 0, authorizedLast24Hours: 0, authorizedLast7Days: 0,
+    activeByDictionary: [],
+  };
+  sparse.capabilities = { active: 0, expired: 0, revoked: 0 };
+  sparse.reports = {
+    current: 0, superseded: 0, contributors: 0, devices: 0, latestReportDay: null, latestAcceptedAt: null,
+    byEvidenceDay: [], byArrivalDay: [], byDictionary: [],
+    outsideWindow: { evidenceBefore: 0, evidenceAfter: 0, arrivalBefore: 0, arrivalAfter: 0 },
+  };
+  sparse.cohorts = { bySpeedMode: [], byModel: [], excludedFromPublicationTurns: 0 };
+  sparse.refusals = { last24Hours: 0, byDay: [], outsideWindow: { before: 0, after: 0 } };
+  sparse.publication = { slots: [], lastRun: null };
+  return sparse;
+}
+
+function errorResponse(status, code) {
+  return { ok: false, status, async json() { return { error: { code } }; } };
+}
+
+test("the performance intake section renders every card, table and slot from the origin's fixture", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  const methods = [];
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    assert.match(documentRef.byId.get("performance-intake-freshness").textContent,
+      /400 UTC days 2034-05-12 to 2035-06-15/u);
+    const cards = metricTexts(documentRef, "performance-intake-cards");
+    assert.deepEqual(cards.map(([label]) => label), PERFORMANCE_CARD_LABELS);
+    assert.deepEqual(cards.map(([, value]) => value), [
+      "Active", "2 grant rows", "2 device capabilities", "7 reports", "8 reports", "2035-06-16", "9 refused requests",
+    ]);
+    assert.match(cards[0][2], /Policy revision 2/u);
+    assert.equal(cards[1][2], "2 expired · 1 revoked · 2 grant rows authorized in the last 24 h, 4 in 7 days");
+    assert.match(cards[3][2], /^6 accepted \+ 1 replacements, by arrival · whole UTC days, so up to about 48 h$/u);
+    assert.match(cards[5][2], /after the observation day/u);
+    assert.match(cards[6][2], /upper bound covering up to about 48 h/u);
+    const cardNodes = documentRef.byId.get("performance-intake-cards").children;
+    assertInfoHint(cardNodes[1].children[0], "Active grants");
+    assert.match(cardNodes[1].children[0].children[1].children[1].textContent, /not the number of devices able to report/u);
+    assertInfoHint(cardNodes[6].children[0], "Refusals, last 24 h");
+    assert.deepEqual(statusTexts(documentRef, "performance-intake-runtime").slice(0, 5), [
+      ["Runtime state: ", "Active"],
+      ["Policy revision: ", "2"],
+      ["Method: ", "performance-daily-histogram-v1 · model-performance-daily-v1"],
+      ["Deployed source commit: ", intake.deployment.sourceCommit],
+      ["Migration history digest: ", intake.deployment.historySha256],
+    ]);
+    assert.deepEqual(statusTexts(documentRef, "performance-intake-last-run"), [
+      ["Last publication run: ", formatReportingTime(intake.publication.lastRun.finishedAt)],
+      ["Published: ", "7 days · Fast"],
+      ["Unchanged: ", "1 day · Standard"],
+      ["Withheld: ", "No"],
+      ["Deferred while empty: ", "No"],
+    ]);
+    const evidence = tableTexts(documentRef, "performance-evidence-rows");
+    assert.equal(evidence.length, 6);
+    assert.deepEqual(evidence[0], ["2035-06-15", "2", "0", "3"], "newest evidence day first");
+    assert.deepEqual(evidence.at(-1), ["2034-05-12", "1", "0", "1"]);
+    assert.deepEqual(tableTexts(documentRef, "performance-arrival-rows")[0], ["2035-06-15", "5", "1"]);
+    assert.deepEqual(tableTexts(documentRef, "performance-dictionary-rows"), [
+      ["2026-09-21.1", "performance-histogram-v1", "Accepted", "1 inferred from the v1.2 parser", "5", "0", "4"],
+      ["2026-09-29.1", "performance-histogram-v1", "Accepted", "None", "2", "1", "2"],
+      ["2026-10-10.1", "performance-histogram-v2", "Accepted", "1 declared by the client", "2", "0", "5"],
+    ]);
+    const cohorts = tableTexts(documentRef, "performance-cohort-rows");
+    assert.equal(cohorts.length, 7);
+    assert.deepEqual(cohorts[0], ["openai_codex", "gpt-5.5", "Fast", "1", "5"]);
+    assert.deepEqual(cohorts[1], ["openai_codex", "gpt-5.5", "Mixed (never published)", "1", "6"]);
+    assert.deepEqual(tableTexts(documentRef, "performance-refusal-rows")[0],
+      ["2035-06-15", "Capabilities", "403", "TELEMETRY_TRANSPORT_BLOCKED", "7"]);
+    const slots = tableTexts(documentRef, "performance-slot-rows");
+    assert.equal(slots.length, 12, "every slot has a row; unpublished ones say so");
+    assert.deepEqual(slots[0], ["1 day", "Standard", "Published", "2",
+      formatReportingTime("2035-06-13T12:00:00.000Z"), "2035-06-13", "1"]);
+    assert.deepEqual(slots[1], ["1 day", "Fast", "Not published", "—", "—", "—", "—"]);
+    assert.equal(slots[4][2], "Published");
+    for (const id of ["performance-evidence-empty", "performance-slot-empty", "performance-cohort-empty"]) {
+      assert.equal(documentRef.byId.get(id).hidden, true, id);
+    }
+    const window = documentRef.byId.get("performance-intake-window").textContent;
+    assert.match(window, /outside the window: 1 before, 1 after \(future-dated\)/u);
+    assert.match(window, /Refusals outside the window: 4 before, 3 after/u);
+    assert.match(window, /15 turns inside the window have an unknown, mixed or other speed mode/u);
+    assert.equal(documentRef.byId.get("performance-intake-reconcile").hidden, true);
+    assert.doesNotMatch(performanceSectionText(documentRef), /Unavailable on this host/u);
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "Review · 1");
+    assert.match(allText(documentRef.byId.get("operator-attention")),
+      /Model performance intake refused requests in the last 24 hours.*9 refused requests/u);
+  }, {}, null, options => {
+    methods.push(options?.method ?? "GET");
+    return response(structuredClone(intake));
+  });
+  assert.deepEqual(methods, ["GET"], "one read, never a write");
+});
+
+test("the performance intake section is read-only: no activation control or write path", async () => {
+  const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
+  const section = html.match(/<section[^>]*aria-labelledby="performance-intake-title"[\s\S]*?<\/section>/u)?.[0];
+  assert.ok(section, "the section exists");
+  assert.doesNotMatch(section, /<(button|form|input|select|textarea)\b/u);
+  assert.match(section, /no activation control/u);
+  const script = await readFile(new URL("../public/admin.js", import.meta.url), "utf8");
+  assert.doesNotMatch(script, /telemetryRuntimeActivation|activate_telemetry_performance_runtime/u);
+  assert.equal([...script.matchAll(/performance-intake"/gu)].length, 1, "one GET route reference");
+});
+
+test("a sparse staged intake and unavailable blocks never read as zero", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  let reply = performanceSparse(intake);
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake staged · not accepting reports");
+    const cards = metricTexts(documentRef, "performance-intake-cards");
+    assert.deepEqual(cards.map(([, value]) => value), [
+      "Staged", "0 grant rows", "0 device capabilities", "0 reports", "0 reports", "None yet", "0 refused requests",
+    ], "a recorded zero is shown as a zero with its unit");
+    assert.match(cards[5][2], /latest acceptance none recorded/u);
+    assert.equal(tableTexts(documentRef, "performance-evidence-rows").length, 0);
+    assert.equal(documentRef.byId.get("performance-evidence-empty").hidden, false);
+    assert.match(documentRef.byId.get("performance-evidence-empty").textContent, /No report has an evidence day/u);
+    assert.ok(tableTexts(documentRef, "performance-slot-rows").every(row => row[2] === "Not published"));
+    assert.deepEqual(statusTexts(documentRef, "performance-intake-last-run"),
+      [["Last publication run: ", "No completed run has carried a performance block"]]);
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "No action indicated");
+
+    reply = structuredClone(intake);
+    for (const name of ["grants", "reports", "refusals", "publication"]) reply[name] = { status: "unavailable" };
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => metricTexts(documentRef, "performance-intake-cards")[1][1] === "Unavailable on this host");
+    const partial = metricTexts(documentRef, "performance-intake-cards");
+    assert.deepEqual(partial.map(([, value]) => value), [
+      "Active", "Unavailable on this host", "2 device capabilities", "Unavailable on this host",
+      "Unavailable on this host", "Unavailable on this host", "Unavailable on this host",
+    ]);
+    assert.ok(partial.every(([, value]) => !/^0\b/u.test(value)), "no missing value reads as 0");
+    assert.equal(documentRef.byId.get("performance-evidence-empty").textContent, "Unavailable on this host");
+    assert.equal(tableTexts(documentRef, "performance-dictionary-rows")[0][3], "Unavailable on this host");
+    assert.equal(tableTexts(documentRef, "performance-dictionary-rows")[0][4], "Unavailable on this host");
+    assert.equal(documentRef.byId.get("performance-slot-empty").textContent, "Unavailable on this host");
+    assert.deepEqual(statusTexts(documentRef, "performance-intake-last-run"),
+      [["Last publication run: ", "Unavailable on this host"]]);
+    assert.equal(tableTexts(documentRef, "performance-cohort-rows").length, 7, "available blocks still render");
+  }, {}, null, () => response(structuredClone(reply)));
+});
+
+test("404, other 403s, 503 and malformed intake views are unavailable without touching the overview", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  const malformed = structuredClone(intake);
+  malformed.grants.total = 99;
+  const cases = [
+    [() => errorResponse(404, "NOT_FOUND"), /does not serve the performance intake view \(404\)/u],
+    [() => errorResponse(403, "TELEMETRY_TRANSPORT_BLOCKED"), /refused the performance intake view \(403\)/u],
+    [() => errorResponse(503, "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE"), /could not read the performance intake \(503\)/u],
+    [() => response(malformed), /malformed and is not shown \(ADMIN_PERFORMANCE_INTAKE_INVALID\)/u],
+  ];
+  let reply = () => response(structuredClone(intake));
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    for (const [next, explanation] of cases) {
+      reply = next;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await waitFor(() => performanceStatus(documentRef) === "Performance intake unavailable on this host");
+      assert.match(documentRef.byId.get("performance-intake-freshness").textContent, explanation);
+      for (const id of PERFORMANCE_TABLES) assert.equal(tableTexts(documentRef, id).length, 0, id);
+      assert.equal(documentRef.byId.get("performance-intake-cards").children.length, 0);
+      assert.ok(documentRef.byId.get("counts").children.length > 0, "the overview stays rendered");
+      assert.equal(documentRef.byId.get("notice").hidden, true, "no owner-access notice");
+      assert.doesNotMatch(allText(documentRef.byId.get("operator-attention")), /performance/iu,
+        "an absent view is not an attention item");
+      reply = () => response(structuredClone(intake));
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    }
+  }, {}, null, options => reply(options));
+});
+
+test("a transient intake failure keeps the previous dated view labelled stale", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  let fail = false;
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    fail = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => performanceStatus(documentRef) === "Refresh failed · previous intake view");
+    assert.match(documentRef.byId.get("performance-intake-freshness").textContent,
+      /These are previous results, not the current intake/u);
+    assert.equal(tableTexts(documentRef, "performance-evidence-rows").length, 6);
+    assert.equal(metricTexts(documentRef, "performance-intake-cards")[1][1], "2 grant rows");
+    fail = false;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+  }, {}, null, () => {
+    if (fail) throw new TypeError("network down");
+    return response(structuredClone(intake));
+  });
+});
+
+test("an owner-access refusal on the intake read or the overview clears the section", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  let refuse = false;
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    refuse = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => performanceStatus(documentRef) === "Performance intake unavailable on this host");
+    for (const id of PERFORMANCE_TABLES) assert.equal(tableTexts(documentRef, id).length, 0, id);
+    assert.equal(documentRef.byId.get("performance-intake-cards").children.length, 0);
+    assert.equal(documentRef.byId.get("performance-intake-runtime").children.length, 0);
+    assert.match(documentRef.byId.get("notice").textContent, /Owner access is unavailable/u);
+    assert.equal(documentRef.byId.get("counts").children.length, 0, "every private section is cleared");
+  }, {}, null, () => refuse ? errorResponse(403, "ACCESS_REQUIRED") : response(structuredClone(intake)));
+
+  let overviewRefused = false;
+  await withAdminPage(async path => overviewRefused && path === ADMIN_READ_PATHS[0]
+    ? errorResponse(401, "AUTH_REQUIRED") : healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    overviewRefused = true;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => documentRef.byId.get("performance-intake-cards").children.length === 0);
+    assert.equal(performanceStatus(documentRef), "Performance intake unavailable on this host");
+    assert.equal(tableTexts(documentRef, "performance-slot-rows").length, 0);
+  }, {}, null, () => response(structuredClone(intake)));
+});
+
+test("a started activation while staged shows the reconcile-required state; the audit names the result", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  const staged = performanceSparse(intake);
+  const details = {
+    schemaVersion: "postgres-telemetry-runtime-activation-v1", task: "telemetry_runtime_activation",
+    target: "performance", idempotencyKey: "synthetic-activation-key-0001", expectedRevision: 1,
+    deployment: { historySha256: intake.deployment.historySha256, sourceCommit: intake.deployment.sourceCommit },
+  };
+  overview.audit = [
+    { action: "run_maintenance", outcome: "started", details, createdAt: "2026-08-17T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "success",
+      details: { ...details, fromRevision: 1, toRevision: 2, state: "active", reconciled: true },
+      createdAt: "2026-08-16T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "failure",
+      details: { task: "telemetry_runtime_activation", target: "performance", code: "ADMIN_ACTION_CONFLICT" },
+      createdAt: "2026-08-15T11:00:00.000Z" },
+  ];
+  let intakeReply = staged;
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    const reconcile = documentRef.byId.get("performance-intake-reconcile");
+    await waitFor(() => reconcile.hidden === false);
+    assert.match(reconcile.textContent, /Activation needs reconciliation/u);
+    assert.match(reconcile.textContent, /TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED/u);
+    assert.doesNotMatch(reconcile.textContent, /synthetic-activation-key/u, "the key stays in the audit details");
+    await waitFor(() => /needs reconciliation/u.test(allText(documentRef.byId.get("operator-attention"))));
+    const rows = documentRef.byId.get("audit-rows").children;
+    assertInfoHint(rows[0].children[0].children[0], "Model performance activation");
+    assert.deepEqual(rows.map(row => [
+      row.children[1].children[0].children[0].textContent, row.children[2].children[0].textContent,
+    ]), [
+      ["Started, no result", "An activation started without a recorded result. While the runtime stays staged, retrying this key answers TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED; follow the runbook with a new idempotency key."],
+      ["Activated", "Model performance intake activated: policy revision 1 to 2, finished by reconciliation."],
+      ["Failed", "The activation failed with result code ADMIN_ACTION_CONFLICT."],
+    ]);
+    assert.match(allText(rows[1]), /Runtime state/u);
+    assert.doesNotMatch(allText(rows[1]), /Collection state/u);
+    // Once the runtime reads active, the started row is history, not a reconcile state.
+    intakeReply = structuredClone(intake);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => performanceStatus(documentRef) === "Intake active · accepting reports");
+    assert.equal(reconcile.hidden, true);
+    assert.doesNotMatch(allText(documentRef.byId.get("operator-attention")), /needs reconciliation/u);
+  }, {}, null, () => response(structuredClone(intakeReply)));
+});
+
+test("usage_v12 and usage_correction activation rows are not model performance activations", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  const staged = performanceSparse(intake);
+  const usageDetails = target => ({
+    schemaVersion: "telemetry-runtime-activation-v1", task: "telemetry_runtime_activation",
+    target, idempotencyKey: `synthetic-${target}-key-0001`, expectedRevision: 1,
+  });
+  overview.audit = [
+    { action: "run_maintenance", outcome: "started", details: usageDetails("usage_v12"),
+      createdAt: "2026-08-17T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "started", details: usageDetails("usage_correction"),
+      createdAt: "2026-08-16T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "success",
+      details: { ...usageDetails("usage_v12"), fromRevision: 1, toRevision: 2, state: "active" },
+      createdAt: "2026-08-15T11:00:00.000Z" },
+  ];
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("audit-rows").children.length === 3);
+    await waitFor(() => documentRef.byId.get("performance-intake-cards").children.length > 0);
+    assert.equal(documentRef.byId.get("performance-intake-reconcile").hidden, true,
+      "a started usage activation is not a performance reconcile state");
+    assert.doesNotMatch(allText(documentRef.byId.get("operator-attention")), /needs reconciliation/u);
+    const rows = documentRef.byId.get("audit-rows").children;
+    for (const row of rows) {
+      assertInfoHint(row.children[0].children[0], "Maintenance pass");
+      assert.doesNotMatch(allText(row), /Model performance/u);
+      assert.doesNotMatch(allText(row), /Runtime state/u);
+    }
+    const results = rows.map(row => row.children[1].children[0].children[0].textContent);
+    assert.deepEqual(results.slice(0, 2), ["In progress", "In progress"]);
+    assert.notEqual(results[2], "Activated");
+    assert.doesNotMatch(allText(rows[2]), /policy revision 1 to 2/u);
+  }, {}, null, () => response(structuredClone(staged)));
+});
+
+test("silence, dictionary refusals and a withheld publication reach attention", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  intake.reports.latestAcceptedAt = "2035-06-12T11:59:59.999Z";
+  intake.refusals.byDay.splice(2, 0,
+    { day: "2035-06-13", routeId: "telemetry_performance_reports", code: "TELEMETRY_RECORD_INVALID_DICTIONARY_UNACCEPTED", status: 409, refusals: 3 },
+    { day: "2035-06-13", routeId: "telemetry_performance_reports", code: "TELEMETRY_TRANSPORT_BLOCKED", status: 403, refusals: 2 });
+  intake.publication.lastRun.withheld = "ANALYTICS_V2_PERFORMANCE_POINTS_EXCEEDED";
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("operator-attention-badge").textContent === "Review · 4");
+    const attention = allText(documentRef.byId.get("operator-attention"));
+    assert.match(attention, /Model performance intake is active but accepted no report in 48 hours/u);
+    assert.match(attention, /Model performance reports were refused for their field dictionary/u);
+    assert.match(attention, /3 reports refused for an unaccepted dictionary or bucket scheme, and 2 report refusals 403/u);
+    assert.match(attention, /The last community model performance publication was withheld/u);
+    assert.match(attention, /ANALYTICS_V2_PERFORMANCE_POINTS_EXCEEDED/u);
+    assert.match(statusTexts(documentRef, "performance-intake-last-run")[3][1], /^Yes: too many points for one slot/u);
+  }, {}, null, () => response(structuredClone(intake)));
 });

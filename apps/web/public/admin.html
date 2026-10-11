@@ -27,7 +27,7 @@
         <a href="#growth-title">Activity</a><a href="#storage-safety-title">Storage</a>
         <a href="#distribution-title">Apps &amp; updates</a><a href="#admin-community-title">Allowance</a>
         <a href="#controls-title">Controls</a><a href="#ingress-title">Ingress</a>
-        <a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
+        <a href="#performance-intake-title">Performance</a><a href="#database-health-title">Databases</a><a href="#readiness-title">Readiness</a><a href="#errors-title">Failures</a><a href="#audit-title">Audit</a>
       </nav>
       <div class="page-heading admin-heading">
         <div>
@@ -366,6 +366,84 @@
           cap, remaining start tokens, and content-free denial counters. Denials are cumulative for the budget state, not a last-24-hour error rate.
         </p>
         <div class="admin-card" id="ingress-status" aria-live="polite"></div>
+      </section>
+
+      <section class="admin-section" aria-labelledby="performance-intake-title">
+        <p class="eyebrow">Accountless model speed</p>
+        <h2 id="performance-intake-title">Model performance intake</h2>
+        <p class="admin-copy">Read-only view of the origin&rsquo;s accountless model performance intake and its community publication: counts, UTC days and closed codes only, never a contributor, device or report identifier. Grants and capabilities are counted by row, so active grants are not the number of devices able to report. Every count names its unit; a value this host does not supply reads as unavailable, never as 0.</p>
+        <p class="admin-copy">This page has no activation control. Activation is the owner-only maintenance task in the production operations runbook; compare the deployed commit and migration history digest below with the rollout receipt before running it.</p>
+        <p id="performance-intake-status" class="admin-source-badge" aria-live="polite">Waiting for the performance intake view</p>
+        <p id="performance-intake-freshness" class="admin-copy">No intake view loaded.</p>
+        <p id="performance-intake-reconcile" class="notice notice-warning admin-performance-reconcile" role="status" hidden></p>
+        <div class="admin-card-grid" id="performance-intake-cards" aria-live="polite"></div>
+        <div class="admin-two-column admin-performance-status">
+          <div class="admin-card" id="performance-intake-runtime"></div>
+          <div class="admin-card" id="performance-intake-last-run"></div>
+        </div>
+        <div class="admin-two-column admin-performance-tables">
+          <div class="admin-card admin-table-wrap">
+            <h3>Reports by evidence day</h3>
+            <div class="admin-table-scroll admin-performance-scroll" tabindex="0" role="region" aria-label="Performance reports by evidence day table">
+              <table>
+                <thead><tr><th>Evidence day (UTC)</th><th>Current reports</th><th>Superseded reports</th><th>Records in current reports</th></tr></thead>
+                <tbody id="performance-evidence-rows"></tbody>
+              </table>
+            </div>
+            <p class="admin-empty" id="performance-evidence-empty">No intake view loaded.</p>
+          </div>
+          <div class="admin-card admin-table-wrap">
+            <h3>Reports by arrival day</h3>
+            <div class="admin-table-scroll admin-performance-scroll" tabindex="0" role="region" aria-label="Performance reports by arrival day table">
+              <table>
+                <thead><tr><th>Arrival day (UTC)</th><th>Accepted reports</th><th>Replacement reports</th></tr></thead>
+                <tbody id="performance-arrival-rows"></tbody>
+              </table>
+            </div>
+            <p class="admin-empty" id="performance-arrival-empty">No intake view loaded.</p>
+          </div>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <h3>Field dictionary and bucket scheme mix</h3>
+          <div class="admin-table-scroll" tabindex="0" role="region" aria-label="Performance field dictionary table">
+            <table>
+              <thead><tr><th>Field dictionary</th><th>Bucket scheme</th><th>Contract state</th><th>Active grant rows by basis</th><th>Current reports</th><th>Superseded reports</th><th>Records in current reports</th></tr></thead>
+              <tbody id="performance-dictionary-rows"></tbody>
+            </table>
+          </div>
+          <p class="admin-empty" id="performance-dictionary-empty">No intake view loaded.</p>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <h3>Cohorts by model and speed mode</h3>
+          <div class="admin-table-scroll admin-performance-scroll" tabindex="0" role="region" aria-label="Performance cohorts by model table">
+            <table>
+              <thead><tr><th>Provider</th><th>Model</th><th>Speed mode</th><th>Cohorts</th><th>Turns</th></tr></thead>
+              <tbody id="performance-cohort-rows"></tbody>
+            </table>
+          </div>
+          <p class="admin-empty" id="performance-cohort-empty">No intake view loaded.</p>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <h3>Refusals by day, route and code</h3>
+          <div class="admin-table-scroll admin-performance-scroll" tabindex="0" role="region" aria-label="Performance refusals table">
+            <table>
+              <thead><tr><th>Day (UTC)</th><th>Route</th><th>HTTP status</th><th>Code</th><th>Refused requests</th></tr></thead>
+              <tbody id="performance-refusal-rows"></tbody>
+            </table>
+          </div>
+          <p class="admin-empty" id="performance-refusal-empty">No intake view loaded.</p>
+        </div>
+        <div class="admin-card admin-table-wrap">
+          <h3>Community publication slots</h3>
+          <div class="admin-table-scroll" tabindex="0" role="region" aria-label="Performance publication slots table">
+            <table>
+              <thead><tr><th>Period</th><th>Speed mode</th><th>State</th><th>Revision</th><th>Released</th><th>Window end (UTC)</th><th>Kernel</th></tr></thead>
+              <tbody id="performance-slot-rows"></tbody>
+            </table>
+          </div>
+          <p class="admin-empty" id="performance-slot-empty">No intake view loaded.</p>
+        </div>
+        <p id="performance-intake-window" class="admin-copy"></p>
       </section>
 
       <section class="admin-section" aria-labelledby="database-health-title">
