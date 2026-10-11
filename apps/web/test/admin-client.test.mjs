@@ -15,8 +15,10 @@ import {
   projectAdminMetricsHistory,
   projectAdminOverview,
   projectAdminDatabaseHealth,
+  projectAdminPerformanceIntake,
   projectAdminReconstructionProgress,
   projectV11EvidenceAdoption,
+  ADMIN_PERFORMANCE_SLOT_KEYS,
 } from "../public/admin-client.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
@@ -1568,4 +1570,142 @@ test("version totals validate OS coverage, counts and unavailable states without
     mutate(invalid.distribution.cloudflare.observedTotals);
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
   }
+});
+
+
+// admin-performance-intake-v0.1, copied from the GCP origin's contract fixture
+// (postgres-test/postgres-admin-performance-intake.spec.mjs, SPD-A1).
+const PERFORMANCE_INTAKE_INVALID = { message: "ADMIN_PERFORMANCE_INTAKE_INVALID" };
+const PERFORMANCE_DATA_BLOCKS = [
+  "runtime", "dictionaries", "grants", "capabilities", "reports", "cohorts", "refusals", "publication",
+];
+
+function sparsePerformanceIntake(base) {
+  const sparse = structuredClone(base);
+  Object.assign(sparse.runtime, { state: "staged", policyRevision: 1 });
+  sparse.grants = {
+    active: 0, expired: 0, revoked: 0, total: 0, authorizedLast24Hours: 0, authorizedLast7Days: 0,
+    activeByDictionary: [],
+  };
+  sparse.capabilities = { active: 0, expired: 0, revoked: 0 };
+  sparse.reports = {
+    current: 0, superseded: 0, contributors: 0, devices: 0, latestReportDay: null, latestAcceptedAt: null,
+    byEvidenceDay: [], byArrivalDay: [], byDictionary: [],
+    outsideWindow: { evidenceBefore: 0, evidenceAfter: 0, arrivalBefore: 0, arrivalAfter: 0 },
+  };
+  sparse.cohorts = { bySpeedMode: [], byModel: [], excludedFromPublicationTurns: 0 };
+  sparse.refusals = { last24Hours: 0, byDay: [], outsideWindow: { before: 0, after: 0 } };
+  sparse.publication = { slots: [], lastRun: null };
+  return sparse;
+}
+
+test("performance intake projects the origin's v0.1 contract fixture exactly", async () => {
+  const input = await fixture("admin-performance-intake-v01.json");
+  const projected = projectAdminPerformanceIntake(input);
+  assert.deepEqual(projected, input);
+  assert.equal(JSON.stringify(projected), JSON.stringify(input), "key order is the origin's");
+  assert.ok(Object.isFrozen(projected) && Object.isFrozen(projected.reports.byEvidenceDay));
+  assert.equal(ADMIN_PERFORMANCE_SLOT_KEYS.length, 12);
+  assert.deepEqual(ADMIN_PERFORMANCE_SLOT_KEYS.slice(0, 4), ["1:standard", "1:fast", "1:ultrafast", "7:standard"]);
+  const sparse = sparsePerformanceIntake(input);
+  assert.deepEqual(projectAdminPerformanceIntake(sparse), sparse, "an empty staged intake is valid, not missing");
+  const nullCommit = structuredClone(input);
+  nullCommit.deployment.sourceCommit = null;
+  assert.equal(projectAdminPerformanceIntake(nullCommit).deployment.sourceCommit, null);
+});
+
+test("performance intake refuses unknown keys, open enums and contradicting counts", async () => {
+  const input = await fixture("admin-performance-intake-v01.json");
+  for (const alter of [
+    x => { x.schemaVersion = "admin-performance-intake-v0.2"; },
+    x => { x.participantId = "must-not-pass"; },
+    x => { x.grants.activeByDictionary[0].deviceId = "must-not-pass"; },
+    x => { x.reports.byEvidenceDay[0].reportId = "must-not-pass"; },
+    x => { delete x.cohorts; },
+    x => { x.generatedAt = "2035-06-15T12:00:00Z"; },
+    x => { x.windows.days = 401; },
+    x => { x.windows.through = "2035-06-14"; },
+    x => { x.windows.from = "2034-05-13"; },
+    x => { x.windows.last24HoursFrom = "2035-06-14T13:00:00.000Z"; },
+    x => { x.routes.reverse(); },
+    x => { x.routes[0].routeClass = "Performance"; },
+    x => { x.deployment.sourceCommit = "0123456789ABCDEF0123456789abcdef01234567"; },
+    x => { x.deployment.historySha256 = "abab"; },
+    x => { x.runtime.state = "paused"; },
+    x => { x.runtime.policyRevision = 0; },
+    x => { x.runtime.methodVersion = "performance-daily-histogram-v2"; },
+    x => { x.dictionaries[0].fieldDictionaryVersion = "telemetry-performance-registry-2026-9-21.1"; },
+    x => { x.dictionaries[2].bucketSchemeVersion = "performance-histogram-v3"; },
+    x => { x.dictionaries[1] = { ...x.dictionaries[0] }; },
+    x => { x.grants.total = 6; },
+    x => { x.grants.authorizedLast24Hours = 5; },
+    x => { x.grants.activeByDictionary[0].devices = 2; },
+    x => { x.grants.activeByDictionary[0].dictionaryBasis = "guessed"; },
+    x => { x.grants.activeByDictionary[0].fieldDictionaryVersion = "telemetry-performance-registry-2027-01-01.1"; },
+    x => { x.capabilities.active = -1; },
+    x => { x.reports.devices = 4; },
+    x => { x.reports.byDictionary[0].current = 4; },
+    x => { x.reports.byEvidenceDay[0].day = "2034-05-11"; },
+    x => { x.reports.byEvidenceDay.reverse(); },
+    x => { x.reports.latestReportDay = null; },
+    x => { x.reports.outsideWindow.evidenceAfter = 2; },
+    x => { x.reports.byArrivalDay[0].accepted = 0; },
+    x => { x.reports.latestAcceptedAt = "yesterday"; },
+    x => { x.cohorts.excludedFromPublicationTurns = 14; },
+    x => { x.cohorts.byModel[0].speedMode = "turbo"; },
+    x => { x.cohorts.byModel[0].turns = 6; },
+    x => { x.cohorts.byModel[1] = { ...x.cohorts.byModel[0] }; },
+    x => { x.cohorts.byModel[0].modelId = "gpt/5.5"; },
+    x => { x.cohorts.bySpeedMode[0].cohorts = 0; },
+    x => { x.refusals.last24Hours = 8; },
+    x => { x.refusals.byDay[1].status = 302; },
+    x => { x.refusals.byDay[1].routeId = "community_daily"; },
+    x => { x.refusals.byDay[1].code = "consent_invalid"; },
+    x => { x.refusals.byDay.reverse(); },
+    x => { x.refusals.byDay[0].day = "2035-06-16"; },
+    x => { x.publication.slots.reverse(); },
+    x => { x.publication.slots[0].period = "14"; },
+    x => { x.publication.slots[0].speedMode = "mixed"; },
+    x => { x.publication.lastRun.unchanged.push("7:fast"); },
+    x => { x.publication.lastRun.published.push("1:mixed"); },
+    x => { x.publication.lastRun.withheld = "SOMETHING_ELSE"; },
+    x => { x.publication.lastRun.deferredEmpty = "no"; },
+  ]) {
+    const bad = structuredClone(input); alter(bad);
+    assert.throws(() => projectAdminPerformanceIntake(bad), PERFORMANCE_INTAKE_INVALID, alter.toString());
+  }
+  for (const value of [null, [], "text", 7]) {
+    assert.throws(() => projectAdminPerformanceIntake(value), PERFORMANCE_INTAKE_INVALID);
+  }
+});
+
+test("performance intake accepts exact unavailable blocks and nothing looser", async () => {
+  const input = await fixture("admin-performance-intake-v01.json");
+  for (const name of PERFORMANCE_DATA_BLOCKS) {
+    const partial = structuredClone(input);
+    partial[name] = { status: "unavailable" };
+    const projected = projectAdminPerformanceIntake(partial);
+    assert.deepEqual(projected[name], { status: "unavailable" }, name);
+    for (const other of PERFORMANCE_DATA_BLOCKS.filter(block => block !== name)) {
+      assert.deepEqual(projected[other], input[other], `${name} leaves ${other} intact`);
+    }
+    for (const loose of [{ status: "unavailable", reason: "x" }, { status: "available" }, {}, null]) {
+      const bad = structuredClone(input);
+      bad[name] = loose;
+      assert.throws(() => projectAdminPerformanceIntake(bad), PERFORMANCE_INTAKE_INVALID, `${name} ${JSON.stringify(loose)}`);
+    }
+  }
+  for (const name of ["windows", "routes", "deployment"]) {
+    const bad = structuredClone(input);
+    bad[name] = { status: "unavailable" };
+    assert.throws(() => projectAdminPerformanceIntake(bad), PERFORMANCE_INTAKE_INVALID, name);
+  }
+  // Without the registry, a dictionary is still pattern-checked but not cross-checked.
+  const unlisted = structuredClone(input);
+  unlisted.dictionaries = { status: "unavailable" };
+  unlisted.grants.activeByDictionary[0].fieldDictionaryVersion = "telemetry-performance-registry-2027-01-01.1";
+  assert.equal(projectAdminPerformanceIntake(unlisted).grants.activeByDictionary[0].fieldDictionaryVersion,
+    "telemetry-performance-registry-2027-01-01.1");
+  unlisted.grants.activeByDictionary[0].fieldDictionaryVersion = "registry-2027";
+  assert.throws(() => projectAdminPerformanceIntake(unlisted), PERFORMANCE_INTAKE_INVALID);
 });
