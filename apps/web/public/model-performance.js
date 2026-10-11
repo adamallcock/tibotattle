@@ -1,4 +1,4 @@
-import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { modelUsagePresentation, modelThemeIcon, compareModelPresentation } from "./model-visuals.js";
 import { formatModelName } from "./ui-format.js";
 import {
   REPORTING_PERIODS,
@@ -16,17 +16,17 @@ const STANDALONE_PERIODS = ["7", "30", "all"];
 // The shared dashboard can request the 24-hour backend period (`1`), while
 // the standalone controls intentionally expose only the standard periods.
 const PRELOAD_PERIODS = STANDALONE_PERIODS;
-const MAX_READY_PERIODS = 8;
+const MAX_READY_PERIODS = 12;
 // Keep the in-memory period cache useful across quick switches while ensuring
 // each entry is eventually revalidated. The cache holds at most the four
-// shared periods in two speed modes; it never persists measurements in browser storage.
+// shared periods in three speed modes; it never persists measurements in browser storage.
 const PERIOD_CACHE_TTL_MS = 60_000;
 // A first history pass can take minutes. Continue bounded background retries
 // while the document is visible instead of giving up after ten seconds.
 const PRELOAD_MAX_ATTEMPTS = 24;
 const preloadRetryDelay = attempt => Math.min(30_000, 5_000 * 2 ** attempt);
 const SPEED_METHOD = "speed";
-const SPEED_MODES = ["standard", "fast"];
+const SPEED_MODES = ["standard", "fast", "ultrafast"];
 const MODEL_NAMES = Object.freeze({
   "gpt-6-astra": "Astra", "gpt-6-sol": "GPT-6 Sol", "gpt-6-luna": "GPT-6 Luna",
   "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol", "gpt-5.6-luna": "Luna",
@@ -168,6 +168,10 @@ export function performanceHoverBin(fraction, { start, end }, interval) {
 }
 
 export function mountModelPerformance(options = {}) {
+  // The community variant is a separate, closed path. Local DTOs never pass
+  // through it, and estimated community histograms never pass through here.
+  if (options.source === "community") return mountCommunityModelPerformance(options);
+  if (options.source !== undefined && options.source !== "local") throw new RangeError("Unsupported model performance source");
   const { root, client, t, locale = () => "en-US", windowRef = globalThis.window } = options;
   if (!root) return {
     render() {},
@@ -505,7 +509,7 @@ export function mountModelPerformance(options = {}) {
       });
       modes.append(button);
     }
-    modeControls.append(modes, element("p", "performance-mode-note", translate(speedMode === "fast" ? "fastNote" : "standardNote")));
+    modeControls.append(modes, element("p", "performance-mode-note", translate(`${speedMode}Note`)));
     root.append(modeControls);
     if (payload?.excludedUnknownTurns) root.append(element("p", "performance-mode-note", translate("unknownMode", { count: number(payload.excludedUnknownTurns) })));
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
@@ -795,7 +799,7 @@ export function mountModelPerformance(options = {}) {
       return;
     }
     // Every exact period/mode window shares the same timing worker. Register
-    // them together so one background history pass can fill all eight views.
+    // them together so one background history pass can fill every period/mode view.
     await Promise.all(preloadTargets().map(target => preloadPeriod(target, runLifecycle, runScope)));
   }
   function preload() {
@@ -990,6 +994,683 @@ export function mountModelPerformance(options = {}) {
       foregroundKey = null;
       request++;
       windowRef.clearTimeout(timer);
+      documentRef.removeEventListener("visibilitychange", documentVisibilityChanged);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Community display variant.
+//
+// Input is the closed output of community-data.js's
+// normalizeCommunityModelPerformance (SPD-W1a). The adapter below re-checks
+// that shape and produces a separate display contract: estimates keep their
+// conservative bounds, latency is converted from milliseconds to seconds,
+// and day strings become UTC epochs. It never produces, or flows through, the
+// exact local DTO above.
+const COMMUNITY_SCHEMA_VERSION = "community-model-performance-v1";
+const COMMUNITY_METHOD_VERSION = "performance-histogram-pool-type7-bounds-v1";
+const COMMUNITY_POPULATION = "reported_samples";
+const COMMUNITY_PERIODS = Object.freeze(["1", "7", "30", "all"]);
+// One closed publication per slot is refreshed at most every five minutes,
+// sharing the public per-client budget. Other periods are never warmed.
+const COMMUNITY_REFRESH_INTERVAL_MS = 300_000;
+const COMMUNITY_REQUEST_TIMEOUT_MS = 15_000;
+const COMMUNITY_MAX_MODELS = 64;
+const COMMUNITY_MAX_POINTS = 600;
+const COMMUNITY_MAX_SLOTS = COMMUNITY_PERIODS.length * SPEED_MODES.length;
+const COMMUNITY_PERCENTILES = Object.freeze(["p10", "p25", "median", "p75", "p90"]);
+const COMMUNITY_PUBLISHED_KEYS = Object.freeze([
+  "state", "schemaVersion", "methodVersion", "population", "approximate", "revision",
+  "generatedAt", "period", "interval", "start", "end", "speedMode",
+  "excludedUnknownTurns", "contributors", "devices", "reports", "models", "omittedModels",
+]);
+const COMMUNITY_MODEL_KEYS = Object.freeze([
+  "provider", "modelId", "turns", "speedTurns", "ttftTurns", "timedResponses",
+  "toolFreeTurns", "contributors", "devices", "speed", "ttft", "label",
+]);
+const COMMUNITY_SERIES = Object.freeze([
+  Object.freeze({ metric: "speed", unit: "tokens_per_second", divisor: 1 }),
+  Object.freeze({ metric: "ttft", unit: "milliseconds", divisor: 1000 }),
+]);
+const COMMUNITY_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
+const COMMUNITY_DAY = /^\d{4}-\d\d-\d\d$/u;
+// Copy that differs in community mode; every other key keeps its shared text.
+const COMMUNITY_COPY_SCOPE = Object.freeze({
+  provider: "community.provider", subtitle: "community.subtitle", turns: "community.turns",
+  point: "community.point", methodology: "community.methodology", variance: "community.variance",
+});
+const communityDayEpoch = (value) => {
+  if (typeof value !== "string" || !COMMUNITY_DAY.test(value)) return null;
+  const epoch = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(epoch) && new Date(epoch).toISOString().slice(0, 10) === value ? epoch : null;
+};
+const communityInstant = (value) => typeof value === "string" && value.length <= 32
+  && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString() === value;
+const communityValue = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1e12;
+
+function communityQuantile(value, divisor) {
+  if (!exact(value, ["estimate", "lower", "upper"])
+      || ![value.estimate, value.lower, value.upper].every(communityValue)
+      || value.lower > value.estimate || value.estimate > value.upper) return null;
+  return { estimate: value.estimate / divisor, lower: value.lower / divisor, upper: value.upper / divisor };
+}
+
+function communityPoint(value, metric, divisor) {
+  if (!exact(value, ["day", "n", "unresolved", ...COMMUNITY_PERCENTILES])) return null;
+  const at = communityDayEpoch(value.day);
+  if (at === null || !count(value.n) || value.n < 1 || !count(value.unresolved)
+      || value.unresolved > value.n || (metric !== "speed" && value.unresolved !== 0)) return null;
+  // The under-five rule: a sparse point keeps only its median, with bounds.
+  const banded = value.n >= 5;
+  const point = { at, n: value.n, unresolved: value.unresolved };
+  for (const key of COMMUNITY_PERCENTILES) {
+    if (value[key] === null) {
+      if (banded || key === "median") return null;
+      point[key] = null;
+      continue;
+    }
+    if (!banded && key !== "median") return null;
+    const quantile = communityQuantile(value[key], divisor);
+    if (!quantile) return null;
+    point[key] = quantile;
+  }
+  return point;
+}
+
+function communitySeries(value, { metric, unit, divisor }, interval, start, endDay) {
+  if (!exact(value, ["unit", "points"]) || value.unit !== unit
+      || !Array.isArray(value.points) || value.points.length > COMMUNITY_MAX_POINTS) return null;
+  const points = [];
+  let previous = -Infinity, samples = 0;
+  for (const candidate of value.points) {
+    const point = communityPoint(candidate, metric, divisor);
+    // Week bins are named by their Monday and may begin before the window.
+    if (!point || point.at <= previous || point.at > endDay
+        || (interval === "day" && point.at < start)
+        || (interval === "week" && (new Date(point.at).getUTCDay() !== 1 || point.at + 6 * DAY < start))) return null;
+    previous = point.at;
+    samples += point.n;
+    points.push(point);
+  }
+  return Number.isSafeInteger(samples) ? { points, samples } : null;
+}
+
+/**
+ * Display adapter for one published community slot. Returns null for any
+ * other state or for a value that is not the closed normalized shape, so a
+ * raw or partially trusted body can never render.
+ */
+export function normalizeCommunityPerformanceDisplay(value) {
+  if (!exact(value, COMMUNITY_PUBLISHED_KEYS) || value.state !== "published"
+      || value.schemaVersion !== COMMUNITY_SCHEMA_VERSION || value.methodVersion !== COMMUNITY_METHOD_VERSION
+      || value.population !== COMMUNITY_POPULATION || value.approximate !== true
+      || !count(value.revision) || value.revision < 1 || !communityInstant(value.generatedAt)
+      || !COMMUNITY_PERIODS.includes(value.period) || !["day", "week"].includes(value.interval)
+      || (value.period !== "all" && value.interval !== "day")
+      || !SPEED_MODES.includes(value.speedMode)
+      || ![value.excludedUnknownTurns, value.contributors, value.devices, value.reports].every(count)
+      || value.devices < value.contributors || value.reports < value.devices
+      || !exact(value.omittedModels, ["models", "turns"])
+      || !count(value.omittedModels.models) || !count(value.omittedModels.turns)
+      || !Array.isArray(value.models) || value.models.length > COMMUNITY_MAX_MODELS) return null;
+  const start = communityDayEpoch(value.start), endDay = communityDayEpoch(value.end);
+  if (start === null || endDay === null || start > endDay
+      || (value.period !== "all" && endDay - start !== (Number(value.period) - 1) * DAY)) return null;
+  const seen = new Set(), models = [];
+  let samples = value.omittedModels.turns;
+  for (const model of value.models) {
+    if (!exact(model, COMMUNITY_MODEL_KEYS) || typeof model.provider !== "string" || !COMMUNITY_TOKEN.test(model.provider)
+        || typeof model.modelId !== "string" || !COMMUNITY_TOKEN.test(model.modelId) || seen.has(model.modelId)
+        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 64
+        || ![model.turns, model.speedTurns, model.ttftTurns, model.timedResponses, model.toolFreeTurns,
+          model.contributors, model.devices].every(count)
+        || model.turns < 1 || model.contributors < 1 || model.devices < model.contributors
+        || model.contributors > value.contributors || model.devices > value.devices
+        || model.speedTurns > model.turns || model.ttftTurns > model.turns
+        || model.toolFreeTurns > model.speedTurns) return null;
+    const [speed, ttft] = COMMUNITY_SERIES.map(shape => communitySeries(model[shape.metric], shape, value.interval, start, endDay));
+    if (!speed || !ttft || speed.samples !== model.speedTurns || ttft.samples !== model.ttftTurns) return null;
+    seen.add(model.modelId);
+    samples += model.turns;
+    models.push({
+      id: model.modelId, label: model.label,
+      turns: model.turns, speedTurns: model.speedTurns, ttftTurns: model.ttftTurns,
+      timedResponses: model.timedResponses, toolFreeTurns: model.toolFreeTurns,
+      contributors: model.contributors, devices: model.devices,
+      unresolved: speed.points.reduce((sum, point) => sum + point.unresolved, 0),
+      speed: speed.points, ttft: ttft.points,
+    });
+  }
+  if (!Number.isSafeInteger(samples)) return null;
+  const omittedModels = { models: value.omittedModels.models, turns: value.omittedModels.turns };
+  return {
+    period: value.period, interval: value.interval, speedMode: value.speedMode,
+    // Day epochs for the window; the end is the last millisecond of its UTC day.
+    start, end: endDay + DAY - 1,
+    excludedUnknownTurns: value.excludedUnknownTurns,
+    evidence: {
+      contributors: value.contributors, devices: value.devices, reports: value.reports,
+      samples, revision: value.revision, generatedAt: value.generatedAt, omittedModels,
+    },
+    omittedModels,
+    models: models.sort((a, b) => compareModelPresentation(a.id, b.id) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+  };
+}
+
+/** All-time focuses the measured era; one closed UTC day is centred on its bin. */
+function communityDomain(display, model) {
+  if (display.period === "1") return { start: display.start - DAY / 2, end: display.start + DAY / 2 };
+  let start = display.start;
+  const first = Math.min(model.speed[0]?.at ?? Infinity, model.ttft[0]?.at ?? Infinity);
+  if (display.period === "all" && Number.isFinite(first)) start = first;
+  else if (Number.isFinite(first)) start = Math.min(start, first);
+  return { start, end: display.end };
+}
+
+function mountCommunityModelPerformance(options) {
+  const { root, client, t, locale = () => "en-US", windowRef = globalThis.window } = options;
+  const inert = {
+    render() {}, refresh() {}, preload: () => Promise.resolve(false),
+    setReportingWindow() { return false; }, cancel() {}, destroy() {},
+  };
+  if (!root) return inert;
+  if (options.sharedReporting === true || Object.hasOwn(options, "reportingWindow"))
+    throw new TypeError("Community model performance has no shared reporting window");
+  const refreshIntervalMs = options.refreshIntervalMs ?? COMMUNITY_REFRESH_INTERVAL_MS;
+  if (!Number.isSafeInteger(refreshIntervalMs) || refreshIntervalMs < 1_000)
+    throw new RangeError("Unsupported community refresh interval");
+  const documentRef = root.ownerDocument;
+  let period = COMMUNITY_PERIODS.includes(options.period) ? options.period : "all";
+  let speedMode = SPEED_MODES.includes(options.speedMode) ? options.speedMode : "standard";
+  let modelId = null, display = null, slotState = null;
+  let loading = false, failed = false, cancelled = false, destroyed = false;
+  let request = 0, lifecycle = 0, timer = null, pending = null;
+  let aboutOpen = false, chartCursors = [], selectedInterval = null;
+  // In-memory only, bounded to the twelve slots; nothing enters browser storage.
+  const slots = new Map();
+  const slotKey = () => `${speedMode}::${period}`;
+  const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
+  const translate = (key, values) => t(`performance.${COMMUNITY_COPY_SCOPE[key] ?? key}`, values);
+  const reportTranslate = (key, values) => t(`reporting.${key}`, values);
+  let formatterLocale, numberFormat, integerFormat, fullDateFormat, dateTimeFormat;
+  function formatters() {
+    const selectedLocale = locale();
+    if (formatterLocale !== selectedLocale) {
+      formatterLocale = selectedLocale;
+      numberFormat = new Intl.NumberFormat(selectedLocale, { maximumFractionDigits: 1 });
+      integerFormat = new Intl.NumberFormat(selectedLocale, { maximumFractionDigits: 0 });
+      fullDateFormat = new Intl.DateTimeFormat(selectedLocale, { dateStyle: "medium", timeZone: "UTC" });
+      dateTimeFormat = new Intl.DateTimeFormat(selectedLocale, { dateStyle: "medium", timeStyle: "short" });
+    }
+  }
+  const number = (value) => { formatters(); return integerFormat.format(value); };
+  const metricNumber = (value, metric) => { formatters(); return (metric === "latency" ? numberFormat : integerFormat).format(value); };
+  const fullDate = (value) => { formatters(); return fullDateFormat.format(value); };
+  const visible = () => !root.classList.contains("dashboard-page-inactive") && !documentRef.hidden;
+  const element = (name, className, text) => {
+    const node = documentRef.createElement(name);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const svgElement = (name, attributes = {}, text) => {
+    const node = documentRef.createElementNS("http://www.w3.org/2000/svg", name);
+    for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const evidenceRow = (kind, label, value) => {
+    const row = element("div", "performance-evidence-row");
+    row.dataset.evidence = kind;
+    row.append(element("dt", "performance-evidence-label", label), element("dd", "performance-evidence-value", value));
+    return row;
+  };
+  const unitFor = metric => translate(metric === "latency" ? "latencyShortUnit" : "speedShortUnit");
+  const estimateValue = (quantile, metric) => translate("community.estimateValue", {
+    estimate: metricNumber(quantile.estimate, metric), lower: metricNumber(quantile.lower, metric),
+    upper: metricNumber(quantile.upper, metric), unit: unitFor(metric),
+  });
+  // Every estimate is shown with its bounds, for example "P50 62 (58-66) tokens/s".
+  const estimateText = (label, quantile, metric) => translate("community.estimate", { label, value: estimateValue(quantile, metric) });
+  const PERCENTILE_LABELS = [["median", "P50"], ["p10", "P10"], ["p25", "P25"], ["p75", "P75"], ["p90", "P90"]];
+  const pointValues = (point, metric) => PERCENTILE_LABELS
+    .filter(([key]) => point[key] !== null).map(([key, label]) => estimateText(label, point[key], metric)).join(" · ");
+  const formatPoint = (point, metric) => {
+    const text = translate("point", { date: fullDate(point.at), method: translate(metric), values: pointValues(point, metric), count: number(point.n) });
+    return point.unresolved ? `${text} · ${translate("community.pointUnresolved", { count: number(point.unresolved) })}` : text;
+  };
+  const periodLabel = value => value === "1" ? translate("community.latestDay") : translate(value === "all" ? "all" : `days${value}`);
+  function appendEvidence(container) {
+    const { evidence } = display;
+    const range = display.period === "1" ? fullDate(display.start)
+      : display.period === "all" ? reportTranslate("allThrough", { end: fullDate(display.end) })
+        : reportTranslate("range", { start: fullDate(display.start), end: fullDate(display.end) });
+    formatters();
+    const omitted = evidence.omittedModels.turns
+      ? translate("community.omittedValue", { models: number(evidence.omittedModels.models), samples: number(evidence.omittedModels.turns) })
+      : number(evidence.omittedModels.models);
+    container.append(
+      evidenceRow("period", reportTranslate("period"), `${periodLabel(display.period)} · ${range}`),
+      evidenceRow("contributors", translate("community.contributors"), number(evidence.contributors)),
+      evidenceRow("installations", translate("community.installations"), number(evidence.devices)),
+      evidenceRow("reports", translate("community.reports"), number(evidence.reports)),
+      evidenceRow("samples", translate("turns"), number(evidence.samples)),
+      evidenceRow("revision", translate("community.revision"), number(evidence.revision)),
+      evidenceRow("updated", translate("community.updated"), dateTimeFormat.format(new Date(evidence.generatedAt))),
+      evidenceRow("omitted", translate("community.omitted"), omitted),
+    );
+  }
+  function plot(points, metric, color, domain, suffix) {
+    const holder = element("div", "performance-plot");
+    if (!points.length) { holder.append(element("p", "performance-empty", translate(metric === "speed" ? "combinedSpeedEmpty" : "ttftEmpty"))); return holder; }
+    const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric) });
+    formatters();
+    const { start, end } = domain;
+    const estimate = (point, key) => point[key].estimate;
+    // The scale holds every drawn mark: the P90 estimate and the median bound whisker.
+    const scale = performanceYScale(points.flatMap(point => [point.p90?.estimate ?? point.median.estimate, point.median.upper]));
+    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: metric === "latency" ? Math.min(20, scale.digits) : 0 });
+    const plotLeft = 52, plotRight = 708, plotWidth = plotRight - plotLeft;
+    const x = value => plotLeft + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * plotWidth;
+    const y = value => 214 - value / scale.maximum * 190;
+    const curve = (a, b, key, reverse = false) => {
+      const ax = x(a.at), ay = y(estimate(a, key)), bx = x(b.at), by = y(estimate(b, key)), control = (bx - ax) / 3;
+      return reverse
+        ? `M${bx},${by} C${bx - control},${by} ${ax + control},${ay} ${ax},${ay}`
+        : `M${ax},${ay} C${ax + control},${ay} ${bx - control},${by} ${bx},${by}`;
+    };
+    const band = (a, b, low, high) => `${curve(a, b, low)} L${x(b.at)},${y(estimate(b, high))} ${curve(a, b, high, true).slice(1)} Z`;
+    for (const value of scale.ticks) {
+      svg.append(svgElement("line", { x1: plotLeft, x2: plotRight, y1: y(value), y2: y(value), class: "performance-grid" }),
+        svgElement("text", { x: 42, y: y(value) + 4, "text-anchor": "end", class: "performance-axis" }, axisNumber.format(value)));
+    }
+    const tickDate = new Intl.DateTimeFormat(locale(), { month: "short", ...(end - start > 730 * DAY ? { year: "numeric" } : { day: "numeric" }), timeZone: "UTC" });
+    for (const at of performanceDateTicks(domain)) {
+      const px = x(at);
+      svg.append(svgElement("line", { x1: px, x2: px, y1: 24, y2: 214, class: "performance-grid performance-date-grid" }),
+        svgElement("text", { x: px, y: 244, "text-anchor": px < 80 ? "start" : px > plotRight - 30 ? "end" : "middle", class: "performance-axis" }, tickDate.format(at)));
+    }
+    svg.append(svgElement("path", { d: `M${plotLeft} 24V214H${plotRight}`, class: "performance-axis-line", fill: "none" }));
+    const readout = element("p", "sr-only performance-readout", "");
+    readout.setAttribute("aria-live", "polite");
+    const tooltip = element("div", "performance-tooltip"); tooltip.hidden = true;
+    tooltip.setAttribute("aria-hidden", "true");
+    const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
+    const defs = svgElement("defs");
+    for (const [name, middleOpacity] of [["outer", .12], ["inner", .22]]) {
+      const gradient = svgElement("linearGradient", { id: `performance-community-${name}-${suffix}`, x1: 0, y1: 0, x2: 0, y2: 1 });
+      gradient.append(svgElement("stop", { offset: "0%", "stop-color": color, "stop-opacity": .035 }),
+        svgElement("stop", { offset: "50%", "stop-color": color, "stop-opacity": middleOpacity }),
+        svgElement("stop", { offset: "100%", "stop-color": color, "stop-opacity": .035 }));
+      defs.append(gradient);
+    }
+    svg.append(defs);
+    for (const segment of performanceSegments(points, display.interval)) {
+      const a = segment.from, b = segment.to;
+      if (!segment.dashed && a.p10 !== null && b.p10 !== null) {
+        svg.append(svgElement("path", { d: band(a, b, "p10", "p90"), fill: `url(#performance-community-outer-${suffix})`, class: "performance-percentile-band performance-percentile-band-outer" }),
+          svgElement("path", { d: band(a, b, "p25", "p75"), fill: `url(#performance-community-inner-${suffix})`, class: "performance-percentile-band performance-percentile-band-inner" }));
+        for (const key of ["p10", "p25", "p75", "p90"]) svg.append(svgElement("path", {
+          d: curve(a, b, key), fill: "none", stroke: color, class: `performance-percentile-line performance-percentile-line-${key}`,
+        }));
+      }
+      svg.append(svgElement("path", { d: curve(a, b, "median"), fill: "none", stroke: color,
+        class: `performance-median-line${segment.dashed ? " performance-median-line-gap" : ""}` }));
+    }
+    const markers = [];
+    for (const point of points) {
+      const cx = x(point.at), cy = y(point.median.estimate);
+      if (point.p10 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p10.estimate), y2: y(point.p90.estimate), stroke: color, class: "performance-percentile-range" }),
+        svgElement("line", { x1: cx, x2: cx, y1: y(point.p25.estimate), y2: y(point.p75.estimate), stroke: color, class: "performance-quartile-range" }));
+      // Every point, including one below five samples, shows its median bounds.
+      const whisker = svgElement("g", { class: "performance-bound-whisker", "aria-hidden": "true" });
+      whisker.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.median.lower), y2: y(point.median.upper), stroke: color }),
+        svgElement("line", { x1: cx - 5, x2: cx + 5, y1: y(point.median.lower), y2: y(point.median.lower), stroke: color }),
+        svgElement("line", { x1: cx - 5, x2: cx + 5, y1: y(point.median.upper), y2: y(point.median.upper), stroke: color }));
+      svg.append(whisker);
+      const marker = svgElement("g", { tabindex: -1, role: "img", "aria-label": formatPoint(point, metric), class: "performance-point" });
+      marker.dataset.performanceFocus = `point-${metric}-${point.at}`;
+      marker.append(svgElement("circle", { cx, cy, r: 14, fill: "transparent", class: "performance-hit-target" }),
+        svgElement("circle", { cx, cy, r: 4, fill: point.n < 5 ? "var(--surface-raised)" : color, stroke: color, "stroke-width": 1.8 }));
+      marker.addEventListener("focus", () => {
+        for (const entry of markers) entry.node.setAttribute("tabindex", entry.node === marker ? "0" : "-1");
+        showInterval(point.at);
+      });
+      marker.addEventListener("keydown", event => {
+        if (event.key === "Escape") { showInterval(null); return; }
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        const index = markers.findIndex(entry => entry.node === marker);
+        const next = event.key === "Home" ? 0 : event.key === "End" ? markers.length - 1 : Math.max(0, Math.min(markers.length - 1, index + (event.key === "ArrowRight" ? 1 : -1)));
+        event.preventDefault(); markers[next]?.node.focus();
+      });
+      markers.push({ node: marker, at: point.at }); svg.append(marker);
+    }
+    markers[0]?.node.setAttribute("tabindex", "0");
+    const latest = [...points].reverse().find(point => point.p10 !== null);
+    if (latest) {
+      const unit = unitFor(metric);
+      const labels = [["p90", "P90"], ["p75", "P75"], ["median", "P50"], ["p25", "P25"], ["p10", "P10"]]
+        .map(([key, label]) => ({ key, label, actualY: y(estimate(latest, key)), labelY: y(estimate(latest, key)) }))
+        .sort((a, b) => a.labelY - b.labelY);
+      for (let i = 1; i < labels.length; i++) labels[i].labelY = Math.max(labels[i].labelY, labels[i - 1].labelY + 13);
+      const overflow = Math.max(0, labels.at(-1).labelY - 210);
+      if (overflow) for (const label of labels) label.labelY -= overflow;
+      const underflow = Math.max(0, 28 - labels[0].labelY);
+      if (underflow) for (const label of labels) label.labelY += underflow;
+      for (const label of labels) {
+        svg.append(svgElement("line", { x1: x(latest.at) + 3, y1: label.actualY, x2: 717, y2: label.labelY, stroke: color, class: "performance-endpoint-leader", "aria-hidden": "true" }),
+          svgElement("circle", { cx: x(latest.at), cy: label.actualY, r: label.key === "median" ? 3.2 : 2.4, fill: color, class: "performance-endpoint-dot", "aria-hidden": "true" }),
+          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ${metricNumber(estimate(latest, label.key), metric)} ${unit}`));
+      }
+    }
+    const highlight = svgElement("circle", { r: 8, fill: "none", stroke: color, "stroke-width": 2.5, visibility: "hidden", class: "performance-highlight" });
+    svg.append(cursor, highlight);
+    const byDate = new Map(points.map(point => [point.at, point]));
+    chartCursors.push(at => {
+      tooltip.hidden = at === null;
+      cursor.setAttribute("visibility", at === null ? "hidden" : "visible");
+      highlight.setAttribute("visibility", "hidden");
+      if (at === null) { readout.textContent = ""; return; }
+      cursor.setAttribute("x1", x(at)); cursor.setAttribute("x2", x(at));
+      const point = byDate.get(at);
+      tooltip.replaceChildren(element("strong", "performance-tooltip-date", fullDate(at)));
+      readout.textContent = point ? formatPoint(point, metric) : `${fullDate(at)} · ${translate("noBin")}`;
+      if (!point) tooltip.append(element("p", "", translate("noBin")));
+      else {
+        highlight.setAttribute("cx", x(at)); highlight.setAttribute("cy", y(point.median.estimate)); highlight.setAttribute("visibility", "visible");
+        const row = element("div", "performance-tooltip-row");
+        row.append(element("span", "performance-tooltip-method", metric === "latency" ? translate("latency") : translate("medianP50")),
+          element("strong", "performance-tooltip-value", estimateText("P50", point.median, metric)));
+        const distribution = element("div", "performance-tooltip-percentiles");
+        if (point.p10 === null) distribution.append(element("span", "performance-tooltip-detail", translate("community.percentilesUnavailable")));
+        else for (const [key, label] of [["p90", "P90"], ["p75", "P75"], ["p25", "P25"], ["p10", "P10"]]) {
+          distribution.append(element("span", "", label), element("strong", "", estimateValue(point[key], metric)));
+        }
+        row.append(distribution, element("span", "performance-tooltip-detail", `${translate("turns")}: ${number(point.n)}`));
+        if (point.unresolved) row.append(element("span", "performance-tooltip-detail performance-tooltip-unresolved", translate("community.pointUnresolved", { count: number(point.unresolved) })));
+        tooltip.append(row);
+      }
+      const anchorY = point ? y(point.median.estimate) : 24;
+      const bounds = svg.getBoundingClientRect();
+      const anchorXCss = x(at) / 800 * bounds.width;
+      const anchorYCss = anchorY / 256 * bounds.height;
+      const tooltipHeight = tooltip.offsetHeight || 180;
+      const vertical = bounds.top + anchorYCss >= tooltipHeight + 12 ? "above" : "below";
+      const horizontal = anchorXCss >= bounds.width / 2 ? "before" : "after";
+      tooltip.className = `performance-tooltip performance-tooltip-${horizontal} performance-tooltip-${vertical}`;
+      tooltip.style.setProperty("--performance-tooltip-x", `${anchorXCss}px`);
+      tooltip.style.setProperty("--performance-tooltip-y", `${anchorYCss}px`);
+    });
+    const sweep = event => {
+      const bounds = svg.getBoundingClientRect();
+      if (!bounds.width || !bounds.height) return;
+      const px = (event.clientX - bounds.left) * 800 / bounds.width;
+      const py = (event.clientY - bounds.top) * 256 / bounds.height;
+      if (px < plotLeft || px > plotRight || py < 24 || py > 214) { showInterval(null); return; }
+      showInterval(performanceHoverBin((px - plotLeft) / plotWidth, domain, display.interval));
+    };
+    svg.addEventListener("pointermove", sweep);
+    svg.addEventListener("pointerdown", sweep);
+    svg.addEventListener("pointerleave", () => { showInterval(null); });
+    svg.addEventListener("focusout", event => { if (!svg.contains(event.relatedTarget)) showInterval(null); });
+    holder.append(svg, tooltip, readout);
+    return holder;
+  }
+  function render() {
+    const activeFocus = documentRef.activeElement?.dataset?.performanceFocus;
+    const restoreFocus = () => {
+      if (activeFocus) [...root.querySelectorAll("[data-performance-focus]")]
+        .find((node) => node.dataset.performanceFocus === activeFocus)?.focus({ preventScroll: true });
+    };
+    chartCursors = []; selectedInterval = null;
+    root.replaceChildren();
+    root.dataset.performanceSource = "community";
+    const heading = element("div", "dashboard-page-header");
+    const title = element("div");
+    const h2 = element("h2", "", translate("title")); h2.id = "performance-title";
+    h2.tabIndex = -1; h2.dataset.performanceFocus = "heading";
+    title.append(h2, element("p", "page-description", translate("subtitle")));
+    const periods = element("div", "segmented-control performance-periods"); periods.setAttribute("aria-label", translate("period")); periods.setAttribute("role", "group");
+    for (const value of COMMUNITY_PERIODS) {
+      const button = element("button", value === period ? "active" : "", periodLabel(value));
+      button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
+      button.addEventListener("click", () => { if (period !== value) { period = value; selectSlot(); } });
+      periods.append(button);
+    }
+    heading.append(title, periods);
+    root.append(heading, element("p", "performance-provider", translate("provider")));
+    if (period === "1") root.append(element("p", "performance-mode-note performance-period-note", translate("community.latestDayNote")));
+    const modeControls = element("div", "performance-mode-controls");
+    const modes = element("div", "segmented-control performance-modes");
+    modes.setAttribute("role", "group"); modes.setAttribute("aria-label", translate("mode"));
+    for (const value of SPEED_MODES) {
+      const button = element("button", value === speedMode ? "active" : "", translate(value));
+      button.type = "button"; button.setAttribute("aria-pressed", String(speedMode === value));
+      button.dataset.performanceFocus = `mode-${value}`;
+      button.addEventListener("click", () => { if (speedMode !== value) { speedMode = value; selectSlot(); } });
+      modes.append(button);
+    }
+    modeControls.append(modes, element("p", "performance-mode-note", translate(`${speedMode}Note`)));
+    root.append(modeControls);
+    if (display?.excludedUnknownTurns) root.append(element("p", "performance-mode-note", translate("unknownMode", { count: number(display.excludedUnknownTurns) })));
+    const status = element("p", "performance-status"); status.setAttribute("role", "status");
+    const statusState = cancelled ? "cancelled" : failed ? "error" : loading && slotState === null ? "loading"
+      : slotState === "none" ? "none" : slotState === "unsupported" ? "unsupported" : slotState === "published" ? "ready" : "";
+    status.dataset.state = statusState;
+    status.textContent = ({
+      cancelled: translate("cancelled"), error: translate("community.failed"), loading: translate("community.loading"),
+      none: translate("community.none"), unsupported: translate("community.unsupported"),
+    })[statusState] ?? "";
+    const actions = element("div", "dashboard-actions performance-actions");
+    actions.append(status);
+    root.append(actions);
+    if (loading) {
+      const cancel = element("button", "button button-secondary compact", translate("cancel")); cancel.type = "button"; cancel.dataset.performanceFocus = "cancel"; cancel.addEventListener("click", cancelRefresh); actions.append(cancel);
+    } else if (failed || slotState === "unsupported") {
+      const retry = element("button", "button button-secondary compact", translate("retry")); retry.type = "button"; retry.dataset.performanceFocus = "retry"; retry.addEventListener("click", refresh); actions.append(retry);
+    }
+    if (!display) { restoreFocus(); return; }
+    const evidence = element("dl", "performance-evidence performance-community-evidence");
+    appendEvidence(evidence);
+    root.append(evidence);
+    const models = display.models;
+    if (!models.length) {
+      const empty = element("p", "performance-empty", translate("modeEmpty", { mode: translate(speedMode) }));
+      empty.dataset.state = "empty";
+      root.append(empty);
+      restoreFocus();
+      return;
+    }
+    if (!models.some((model) => model.id === modelId)) modelId = models[0].id;
+    const tabs = element("div", "performance-models"); tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", translate("models"));
+    models.forEach((model, index) => {
+      const presentation = modelUsagePresentation(model.id);
+      const button = element("button", `performance-model ${presentation.className}`); button.type = "button";
+      const icon = modelThemeIcon(documentRef, presentation.theme);
+      if (icon) { icon.setAttribute("class", `allowance-model-icon performance-model-icon ${presentation.className}`); button.append(icon); }
+      button.append(element("span", "", model.label));
+      button.setAttribute("aria-label", model.label);
+      button.setAttribute("role", "tab"); button.setAttribute("aria-selected", String(model.id === modelId)); button.setAttribute("aria-controls", "performance-model-panel"); button.tabIndex = model.id === modelId ? 0 : -1;
+      button.id = `performance-tab-${index}`; button.dataset.performanceFocus = `model-${model.id}`;
+      button.addEventListener("click", () => { modelId = model.id; render(); });
+      button.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? models.length - 1 : (index + (event.key === "ArrowRight" ? 1 : models.length - 1)) % models.length;
+        modelId = models[next].id; render(); documentRef.getElementById?.(`performance-tab-${next}`)?.focus();
+      });
+      tabs.append(button);
+    });
+    root.append(tabs);
+    const selectedIndex = models.findIndex((model) => model.id === modelId), selected = models[selectedIndex];
+    const selectedPresentation = modelUsagePresentation(selected.id);
+    const domain = communityDomain(display, selected);
+    const panel = element("div", `performance-model-panel ${selectedPresentation.className}`); panel.id = "performance-model-panel"; panel.setAttribute("role", "tabpanel"); panel.setAttribute("aria-labelledby", `performance-tab-${selectedIndex}`);
+    const subheading = element("div", "performance-model-heading"), identity = element("h3", "performance-model-identity");
+    const selectedIcon = modelThemeIcon(documentRef, selectedPresentation.theme);
+    if (selectedIcon) { selectedIcon.setAttribute("class", `allowance-model-icon performance-model-icon ${selectedPresentation.className}`); identity.append(selectedIcon); }
+    identity.append(element("span", "", selected.label));
+    subheading.append(identity, element("span", "", translate(display.interval))); panel.append(subheading);
+    const sources = element("p", "performance-unit performance-model-sources", translate("community.modelSources", { contributors: number(selected.contributors), devices: number(selected.devices) }));
+    panel.append(sources);
+    for (const metric of ["speed", "latency"]) {
+      const card = element("article", "performance-card chart-card");
+      const cardHeading = element("div", "performance-card-heading chart-card-header"), cardTitle = element("div");
+      const summary = metric === "speed"
+        ? translate("community.speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns), estimates: number(selected.toolFreeTurns) })
+        : translate("community.latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
+      const coverage = element("p", "performance-unit", summary);
+      coverage.dataset.state = (metric === "speed" ? selected.speedTurns : selected.ttftTurns) < selected.turns ? "partial" : "complete";
+      cardTitle.append(element("h4", "chart-card-title", translate(metric)), coverage);
+      if (metric === "speed" && selected.unresolved > 0)
+        cardTitle.append(element("p", "performance-method-note performance-unresolved-note", translate("community.unresolved", { count: number(selected.unresolved) })));
+      const legend = element("div", "performance-legend chart-card-legend");
+      for (const method of ["outerBand", "innerBand", "medianP50", "community.bounds"]) {
+        const entry = element("span", "performance-legend-item");
+        const color = "var(--allowance-color)";
+        const swatch = svgElement("svg", { width: method === "outerBand" || method === "innerBand" ? 22 : 24, height: 16, viewBox: "0 0 24 16", "aria-hidden": "true" });
+        if (method === "community.bounds") {
+          swatch.append(svgElement("path", { d: "M12 2V14M8 2H16M8 14H16", fill: "none", stroke: color, "stroke-width": 1.6 }));
+        } else swatch.append(svgElement(method === "medianP50" ? "line" : "rect", {
+          ...(method === "medianP50" ? { x1: 1, y1: 8, x2: 23, y2: 8 } : { x: 1, y: method === "outerBand" ? 3 : 5, width: 22, height: method === "outerBand" ? 10 : 6, rx: 3 }),
+          fill: color, stroke: color, opacity: method === "outerBand" ? .1 : method === "innerBand" ? .22 : 1,
+          "stroke-width": method === "medianP50" ? 2.6 : 0,
+        }));
+        entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
+      }
+      cardHeading.append(cardTitle);
+      card.append(cardHeading, legend, plot(metric === "speed" ? selected.speed : selected.ttft, metric, "var(--allowance-color)", domain, `${metric}-${selectedIndex}`));
+      panel.append(card);
+    }
+    const aboutSummary = element("summary", "", translate("about")); aboutSummary.dataset.performanceFocus = "about";
+    const about = element("details", "performance-details"); about.open = aboutOpen;
+    about.append(aboutSummary, element("p", "", translate("methodology")), element("p", "", translate("variance")));
+    about.addEventListener("toggle", () => { aboutOpen = about.open; });
+    panel.append(about);
+    root.append(panel);
+    restoreFocus();
+  }
+  const abortPending = () => { pending?.abort(); pending = null; };
+  const schedule = (delay) => {
+    windowRef.clearTimeout(timer); timer = null;
+    if (!destroyed && visible()) timer = windowRef.setTimeout(refresh, Math.max(0, delay));
+  };
+  // A slot answers with its own normalized state; anything else is refused.
+  function outcomeFor(result, slot) {
+    if (!result || typeof result !== "object" || result.period !== slot.period || result.speedMode !== slot.speedMode) return { state: "unsupported" };
+    if (result.state === "published") {
+      const next = normalizeCommunityPerformanceDisplay(result);
+      return next && next.period === slot.period && next.speedMode === slot.speedMode
+        ? { state: "published", display: next } : { state: "unsupported" };
+    }
+    if (result.state === "none_published") return { state: "none" };
+    if (result.state === "service_unavailable") return { state: "failed" };
+    return { state: "unsupported" };
+  }
+  function apply(outcome) {
+    if (outcome.state === "failed") { failed = true; return; }
+    slotState = outcome.state;
+    display = outcome.state === "published" ? outcome.display : null;
+  }
+  function remember(key, outcome) {
+    slots.delete(key);
+    slots.set(key, { outcome, cachedAt: Date.now() });
+    while (slots.size > COMMUNITY_MAX_SLOTS) slots.delete(slots.keys().next().value);
+  }
+  async function refresh() {
+    if (!visible() || destroyed) return;
+    const current = ++request, startedLifecycle = lifecycle;
+    const slot = { period, speedMode }, key = slotKey();
+    windowRef.clearTimeout(timer); timer = null;
+    abortPending();
+    const hadFailure = failed;
+    loading = true; failed = false; cancelled = false;
+    // A shown slot stays visible while its replacement is fetched.
+    if (!display || hadFailure) render();
+    const controller = new AbortController();
+    let timedOut = false;
+    const deadline = windowRef.setTimeout(() => { timedOut = true; controller.abort(); }, COMMUNITY_REQUEST_TIMEOUT_MS);
+    pending = controller;
+    let outcome;
+    try {
+      outcome = outcomeFor(await client.modelPerformance(slot.period, { signal: controller.signal, speedMode: slot.speedMode }), slot);
+      // A client that ignores AbortSignal may resolve late; that answer is not fresh.
+      if (controller.signal.aborted) outcome = timedOut ? { state: "failed" } : null;
+    } catch {
+      outcome = controller.signal.aborted && !timedOut ? null : { state: "failed" };
+    } finally {
+      windowRef.clearTimeout(deadline);
+      if (pending === controller) pending = null;
+    }
+    if (request !== current || lifecycle !== startedLifecycle || destroyed || outcome === null) return;
+    loading = false;
+    if (outcome.state === "published" || outcome.state === "none") remember(key, outcome);
+    apply(outcome);
+    render();
+    schedule(refreshIntervalMs);
+  }
+  // Switching slots shows a cached answer for that slot only; it never warms others.
+  function selectSlot() {
+    request++;
+    abortPending();
+    windowRef.clearTimeout(timer); timer = null;
+    loading = false; failed = false; cancelled = false;
+    const cached = slots.get(slotKey());
+    display = null; slotState = null;
+    if (cached) apply(cached.outcome);
+    render();
+    const age = cached ? Date.now() - cached.cachedAt : Infinity;
+    if (age < refreshIntervalMs) schedule(refreshIntervalMs - age);
+    else void refresh();
+  }
+  function resume() {
+    if (loading || destroyed || !visible()) return;
+    const cached = slots.get(slotKey());
+    const age = cached ? Date.now() - cached.cachedAt : Infinity;
+    if (age < refreshIntervalMs && slotState !== null && !failed) schedule(refreshIntervalMs - age);
+    else void refresh();
+  }
+  function suspend() {
+    windowRef.clearTimeout(timer); timer = null;
+    request++;
+    abortPending();
+    loading = false;
+  }
+  function cancelRefresh() {
+    if (!loading) return;
+    request++;
+    abortPending();
+    windowRef.clearTimeout(timer); timer = null;
+    loading = false; failed = false; cancelled = true;
+    render();
+  }
+  const rootVisibilityChanged = () => { if (visible()) resume(); else suspend(); };
+  const documentVisibilityChanged = () => {
+    if (documentRef.hidden) { lifecycle++; suspend(); }
+    else resume();
+  };
+  const observer = new windowRef.MutationObserver(rootVisibilityChanged);
+  observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+  documentRef.addEventListener("visibilitychange", documentVisibilityChanged);
+  render();
+  if (visible()) void refresh();
+  return {
+    render,
+    refresh,
+    // Only the selected slot is ever requested; there is nothing to warm.
+    preload: () => Promise.resolve(false),
+    setReportingWindow() { return false; },
+    cancel: cancelRefresh,
+    destroy() {
+      destroyed = true;
+      lifecycle++;
+      slots.clear();
+      display = null;
+      observer.disconnect();
+      abortPending();
+      request++;
+      windowRef.clearTimeout(timer); timer = null;
       documentRef.removeEventListener("visibilitychange", documentVisibilityChanged);
     },
   };
