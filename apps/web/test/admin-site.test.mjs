@@ -2629,7 +2629,8 @@ test("a started activation while staged shows the reconcile-required state; the 
       details: { ...details, fromRevision: 1, toRevision: 2, state: "active", reconciled: true },
       createdAt: "2026-08-16T11:00:00.000Z" },
     { action: "run_maintenance", outcome: "failure",
-      details: { task: "telemetry_runtime_activation", code: "ADMIN_ACTION_CONFLICT" }, createdAt: "2026-08-15T11:00:00.000Z" },
+      details: { task: "telemetry_runtime_activation", target: "performance", code: "ADMIN_ACTION_CONFLICT" },
+      createdAt: "2026-08-15T11:00:00.000Z" },
   ];
   let intakeReply = staged;
   await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
@@ -2657,6 +2658,42 @@ test("a started activation while staged shows the reconcile-required state; the 
     assert.equal(reconcile.hidden, true);
     assert.doesNotMatch(allText(documentRef.byId.get("operator-attention")), /needs reconciliation/u);
   }, {}, null, () => response(structuredClone(intakeReply)));
+});
+
+test("usage_v12 and usage_correction activation rows are not model performance activations", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const intake = await fixture("admin-performance-intake-v01.json");
+  const staged = performanceSparse(intake);
+  const usageDetails = target => ({
+    schemaVersion: "telemetry-runtime-activation-v1", task: "telemetry_runtime_activation",
+    target, idempotencyKey: `synthetic-${target}-key-0001`, expectedRevision: 1,
+  });
+  overview.audit = [
+    { action: "run_maintenance", outcome: "started", details: usageDetails("usage_v12"),
+      createdAt: "2026-08-17T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "started", details: usageDetails("usage_correction"),
+      createdAt: "2026-08-16T11:00:00.000Z" },
+    { action: "run_maintenance", outcome: "success",
+      details: { ...usageDetails("usage_v12"), fromRevision: 1, toRevision: 2, state: "active" },
+      createdAt: "2026-08-15T11:00:00.000Z" },
+  ];
+  await withAdminPage(async path => healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("audit-rows").children.length === 3);
+    await waitFor(() => documentRef.byId.get("performance-intake-cards").children.length > 0);
+    assert.equal(documentRef.byId.get("performance-intake-reconcile").hidden, true,
+      "a started usage activation is not a performance reconcile state");
+    assert.doesNotMatch(allText(documentRef.byId.get("operator-attention")), /needs reconciliation/u);
+    const rows = documentRef.byId.get("audit-rows").children;
+    for (const row of rows) {
+      assertInfoHint(row.children[0].children[0], "Maintenance pass");
+      assert.doesNotMatch(allText(row), /Model performance/u);
+      assert.doesNotMatch(allText(row), /Runtime state/u);
+    }
+    const results = rows.map(row => row.children[1].children[0].children[0].textContent);
+    assert.deepEqual(results.slice(0, 2), ["In progress", "In progress"]);
+    assert.notEqual(results[2], "Activated");
+    assert.doesNotMatch(allText(rows[2]), /policy revision 1 to 2/u);
+  }, {}, null, () => response(structuredClone(staged)));
 });
 
 test("silence, dictionary refusals and a withheld publication reach attention", async () => {

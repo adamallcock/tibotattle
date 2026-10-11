@@ -464,6 +464,19 @@ const PERFORMANCE_ACTIVATION_FIELD_LABELS = Object.freeze({
   expectedRevision: "Expected policy revision",
 });
 
+/**
+ * Whether an audit row records a model-performance runtime activation. The
+ * maintenance task name is shared with the usage_v12 and usage_correction
+ * activations, so the target must say "performance"; rows for other targets
+ * keep the generic maintenance presentation.
+ */
+function isPerformanceActivationAudit(item) {
+  const details = plainRecord(item?.details);
+  return item?.action === "run_maintenance"
+    && details?.task === "telemetry_runtime_activation"
+    && details?.target === "performance";
+}
+
 function performanceActivationAuditPresentation(outcome, details) {
   if (outcome === "started") {
     return {
@@ -646,7 +659,7 @@ function collectionControlPresentation(outcome, details) {
 function auditPresentation(item) {
   const details = plainRecord(item.details);
   const adoption = item.action === "run_maintenance" && details?.task === "v11_evidence_adoption";
-  const activation = item.action === "run_maintenance" && details?.task === "telemetry_runtime_activation";
+  const activation = isPerformanceActivationAudit(item);
   const action = adoption ? V11_ADOPTION_AUDIT_ACTION : activation ? PERFORMANCE_ACTIVATION_AUDIT_ACTION
     : AUDIT_ACTIONS[item.action] ?? {
       label: humanizeToken(item.action),
@@ -1519,8 +1532,7 @@ function performanceTable(rowsId, emptyId, rows, emptyText) {
 
 /** The newest model-performance activation audit row in the overview, if any. */
 function latestPerformanceActivationAudit() {
-  const rows = (state.overview?.audit ?? []).filter(item => item.action === "run_maintenance"
-    && plainRecord(item.details)?.task === "telemetry_runtime_activation");
+  const rows = (state.overview?.audit ?? []).filter(isPerformanceActivationAudit);
   return rows.reduce((latest, item) => latest === null
     || Date.parse(item.createdAt) > Date.parse(latest.createdAt) ? item : latest, null);
 }

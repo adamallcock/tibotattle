@@ -602,8 +602,10 @@ Activation is the owner-only `run_maintenance` runtime activation task, a
 production write that needs explicit authorization and its own runbook step.
 Before running it, compare the section's deployed source commit and migration
 history digest with the rollout receipt. The audit list names each activation
-result. A started row with no result while the runtime stays staged is the
-reconcile-required state: retrying that idempotency key answers
+result. Only rows whose target is `performance` count; `usage_v12` and
+`usage_correction` activations share the task name and keep the generic
+maintenance presentation. A started performance row with no result while the
+runtime stays staged is the reconcile-required state: retrying that idempotency key answers
 `TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED`, so use a new key.
 
 **Deploy coupling.** The admin console is served from the Worker bundle
