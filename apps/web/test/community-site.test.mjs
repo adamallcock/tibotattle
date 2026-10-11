@@ -3,15 +3,24 @@ import { test } from "node:test";
 import { readFile } from "node:fs/promises";
 
 import {
+  COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY,
   COMMUNITY_DAILY_READ_SCHEMA_VERSION,
   COMMUNITY_DAILY_WINDOW_DAYS,
+  COMMUNITY_MODEL_PERFORMANCE_PERIODS,
+  COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION,
+  COMMUNITY_MODEL_PERFORMANCE_SPEED_MODES,
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
   PublicCommunityClient,
   communityDailyWindow,
   normalizeCommunityDailySeries,
+  normalizeCommunityModelPerformance,
   projectCommunityDailyPayloadForCache,
   normalizeCommunitySnapshot,
 } from "../public/community-data.js";
+import {
+  REVIEWED_MODEL_CATALOG,
+  REVIEWED_MODEL_CATALOG_VERSION,
+} from "../public/model-catalog.generated.js";
 import {
   buildCommunityAllowanceChartModel,
   buildCommunityDailyChartModel,
@@ -45,6 +54,7 @@ const VERIFY_RELEASE = new URL("../../../docs/verify-release.md", import.meta.ur
 const PRIVACY_HTML = new URL("../public/privacy.html", import.meta.url);
 const APP_HTML = new URL("../public/index.html", import.meta.url);
 const APP_SOURCE = new URL("../public/app.js", import.meta.url);
+const COMMUNITY_DATA_SOURCE = new URL("../public/community-data.js", import.meta.url);
 
 /**
  * The smallest element shape the two shared renderers actually use. Keeping it
@@ -442,12 +452,13 @@ test("the public site presents only the install call to action and the community
   }
 });
 
-test("the public community client exposes only the read-only daily request", async () => {
+test("the public community client exposes only the read-only public requests", async () => {
   // The legacy weekly snapshot request left with the snapshot presentation:
-  // the public site reads the day-partitioned series and nothing else.
+  // the public site reads the day-partitioned series and the published
+  // model-performance slots, and nothing else.
   assert.deepEqual(
     Object.getOwnPropertyNames(PublicCommunityClient.prototype).sort(),
-    ["communityDaily", "constructor"],
+    ["communityDaily", "communityModelPerformance", "constructor"],
   );
 
   const requestId = "12345678-1234-4123-8123-123456789abc";
@@ -3133,4 +3144,768 @@ test("community findings precede app examples and closing steps lead to the down
   assert.match(html, /class="model-performance" data-speeds-demo/u);
   assert.ok(html.indexOf('id="how-it-works"') < html.indexOf('<section class="tour-cta">'));
   assert.match(html, /src="\.\/feature-value\.png" width="988" height="1007"/u);
+});
+
+// A contract-built community-model-performance-v1 slot (synthetic samples).
+// The client-line parity suite proves these point shapes against the telemetry
+// contract; the copied parity fixtures below hold this reader to the same answers.
+function publishedModelPerformance() {
+  const sparse = {
+    day: "2026-10-10", n: 2, unresolved: 1,
+    p10: null, p25: null,
+    median: { estimate: 83.25, lower: 80.5, upper: 86 },
+    p75: null, p90: null,
+  };
+  const banded = {
+    day: "2026-10-08", n: 5, unresolved: 0,
+    p10: { estimate: 878.2, lower: 830, upper: 926.4 },
+    p25: { estimate: 940, lower: 875, upper: 1005 },
+    median: { estimate: 940, lower: 875, upper: 1005 },
+    p75: { estimate: 1081, lower: 1006, upper: 1156 },
+    p90: { estimate: 1139.5, lower: 1096.6, upper: 1182.4 },
+  };
+  const otherProviderSpeed = {
+    day: "2026-10-09", n: 3, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 31, lower: 30, upper: 32 },
+    p75: null, p90: null,
+  };
+  return {
+    schemaVersion: "community-model-performance-v1",
+    methodVersion: "performance-histogram-pool-type7-bounds-v1",
+    population: "reported_samples",
+    approximate: true,
+    revision: 2,
+    generatedAt: "2026-10-11T03:00:00.000Z",
+    period: "7",
+    interval: "day",
+    start: "2026-10-04",
+    end: "2026-10-10",
+    speedMode: "fast",
+    excludedUnknownTurns: 1,
+    contributors: 2,
+    devices: 2,
+    reports: 5,
+    models: [
+      {
+        provider: "openai_codex", modelId: "gpt-5.6-luna",
+        turns: 6, speedTurns: 2, ttftTurns: 5, timedResponses: 5, toolFreeTurns: 0,
+        contributors: 2, devices: 2,
+        speed: { unit: "tokens_per_second", points: [sparse] },
+        ttft: { unit: "milliseconds", points: [banded] },
+      },
+      {
+        provider: "anthropic_claude_code", modelId: "claude-fable-5",
+        turns: 4, speedTurns: 3, ttftTurns: 0, timedResponses: 3, toolFreeTurns: 1,
+        contributors: 1, devices: 1,
+        speed: { unit: "tokens_per_second", points: [otherProviderSpeed] },
+        ttft: { unit: "milliseconds", points: [] },
+      },
+    ],
+  };
+}
+
+const PERFORMANCE_SLOT = { period: "7", speedMode: "fast" };
+
+test("the model performance client requests exactly one closed, same-origin slot", async () => {
+  const calls = [];
+  const payload = publishedModelPerformance();
+  const client = new PublicCommunityClient({
+    fetchImpl: async (...args) => {
+      calls.push(args);
+      return { ok: true, status: 200, json: async () => payload };
+    },
+  });
+  assert.equal(await client.communityModelPerformance(PERFORMANCE_SLOT), payload);
+  assert.deepEqual(calls, [[
+    "/api/v1/community/model-performance?period=7&speedMode=fast",
+    { headers: { Accept: "application/json" }, cache: "no-cache" },
+  ]]);
+
+  // Every slot is one of twelve fixed relative paths.
+  calls.length = 0;
+  for (const period of COMMUNITY_MODEL_PERFORMANCE_PERIODS) {
+    for (const speedMode of COMMUNITY_MODEL_PERFORMANCE_SPEED_MODES) {
+      await client.communityModelPerformance({ period, speedMode });
+    }
+  }
+  assert.deepEqual(COMMUNITY_MODEL_PERFORMANCE_PERIODS, ["1", "7", "30", "all"]);
+  assert.deepEqual(COMMUNITY_MODEL_PERFORMANCE_SPEED_MODES, ["standard", "fast", "ultrafast"]);
+  assert.equal(calls.length, 12);
+  for (const [path] of calls) {
+    assert.match(path, /^\/api\/v1\/community\/model-performance\?period=(?:1|7|30|all)&speedMode=(?:standard|fast|ultrafast)$/u);
+  }
+
+  // The request is abortable: the caller's signal reaches fetch unchanged.
+  calls.length = 0;
+  const controller = new AbortController();
+  await client.communityModelPerformance({ ...PERFORMANCE_SLOT, signal: controller.signal });
+  assert.equal(calls[0][1].signal, controller.signal);
+  const aborting = new PublicCommunityClient({
+    fetchImpl: async (_path, { signal }) => {
+      signal.throwIfAborted();
+      throw new Error("unreachable");
+    },
+  });
+  controller.abort();
+  await assert.rejects(
+    aborting.communityModelPerformance({ ...PERFORMANCE_SLOT, signal: controller.signal }),
+    error => error?.name === "AbortError",
+  );
+});
+
+test("the model performance client refuses anything but the enum parameters", async () => {
+  let fetched = 0;
+  const client = new PublicCommunityClient({
+    fetchImpl: async () => {
+      fetched += 1;
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  for (const slot of [
+    undefined,
+    {},
+    { period: "90", speedMode: "fast" },
+    { period: 7, speedMode: "fast" },
+    { period: "7&speedMode=fast", speedMode: "fast" },
+    { period: "7", speedMode: "Fast" },
+    { period: "7", speedMode: "fast&debug=1" },
+    { period: "7", speedMode: "unknown" },
+    { period: "../daily", speedMode: "fast" },
+  ]) {
+    await assert.rejects(client.communityModelPerformance(slot), RangeError, JSON.stringify(slot));
+  }
+  assert.equal(fetched, 0, "no request leaves for a refused slot");
+});
+
+test("model performance failures map to honest states without leaking error bodies", async () => {
+  const requestId = "12345678-1234-4123-8123-123456789abc";
+  const failureFor = async (status, body) => {
+    const client = new PublicCommunityClient({
+      fetchImpl: async () => ({ ok: false, status, json: async () => body }),
+    });
+    try {
+      await client.communityModelPerformance(PERFORMANCE_SLOT);
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected a failure");
+  };
+
+  const unpublished = await failureFor(404, {
+    error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", requestId, privateDetail: "must not escape" },
+  });
+  assert.equal(unpublished.code, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED");
+  assert.equal(unpublished.requestId, requestId);
+  assert.equal(Object.hasOwn(unpublished, "privateDetail"), false);
+  assert.deepEqual(
+    normalizeCommunityModelPerformance(null, { ...PERFORMANCE_SLOT, failure: unpublished }),
+    { state: "none_published", period: "7", speedMode: "fast", models: [], omittedModels: null },
+  );
+  // A route that is not deployed yet reads as nothing published, not an outage.
+  const unknownRoute = await failureFor(404, { error: { code: "NOT_FOUND", requestId } });
+  assert.equal(
+    normalizeCommunityModelPerformance(null, { ...PERFORMANCE_SLOT, failure: unknownRoute }).state,
+    "none_published",
+  );
+  for (const [status, body] of [
+    [404, { error: { code: "DEVICE_NOT_FOUND" } }],
+    [404, null],
+    [503, { error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED" } }],
+    [429, { error: { code: "RATE_LIMITED" } }],
+    [500, { error: { code: "not a safe code" } }],
+  ]) {
+    const failure = await failureFor(status, body);
+    assert.equal(
+      normalizeCommunityModelPerformance(null, { ...PERFORMANCE_SLOT, failure }).state,
+      "service_unavailable",
+      `${status} ${JSON.stringify(body)}`,
+    );
+  }
+  assert.equal(
+    normalizeCommunityModelPerformance(null, { ...PERFORMANCE_SLOT, failure: new TypeError("offline") }).state,
+    "service_unavailable",
+  );
+  assert.equal(normalizeCommunityModelPerformance(null, PERFORMANCE_SLOT).state, "service_unavailable");
+  assert.equal(normalizeCommunityModelPerformance(undefined, PERFORMANCE_SLOT).state, "service_unavailable");
+});
+
+test("the model performance normalizer rebuilds a closed shape and counts omitted models", () => {
+  const payload = publishedModelPerformance();
+  const result = normalizeCommunityModelPerformance(payload, PERFORMANCE_SLOT);
+  assert.equal(result.state, "published");
+  assert.deepEqual(Object.keys(result).sort(), [
+    "approximate", "contributors", "devices", "end", "excludedUnknownTurns", "generatedAt",
+    "interval", "methodVersion", "models", "omittedModels", "period", "population", "reports",
+    "revision", "schemaVersion", "speedMode", "start", "state",
+  ]);
+  // The other provider's model is validated, then dropped and counted.
+  assert.deepEqual(result.omittedModels, { models: 1, turns: 4 });
+  assert.deepEqual(result.models.map(model => [model.provider, model.modelId, model.label]), [
+    ["openai_codex", "gpt-5.6-luna", "GPT-5.6 Luna"],
+  ]);
+  const [model] = result.models;
+  assert.deepEqual(Object.keys(model).sort(), [
+    "contributors", "devices", "label", "modelId", "provider", "speed", "speedTurns",
+    "timedResponses", "toolFreeTurns", "ttft", "ttftTurns", "turns",
+  ]);
+  // The under-five rule survives: a sparse point keeps only its median.
+  assert.deepEqual(model.speed.points[0], payload.models[0].speed.points[0]);
+  assert.equal(model.speed.points[0].p10, null);
+  assert.equal(model.ttft.points[0].p90.upper, 1182.4);
+
+  // A fresh rebuild: later changes to the response cannot reach the result.
+  assert.notEqual(model, payload.models[0]);
+  assert.notEqual(model.ttft.points[0], payload.models[0].ttft.points[0]);
+  payload.models[0].ttft.points[0].p90.upper = 1e9;
+  payload.models[0].speed.points[0].diagnostic = "late";
+  assert.equal(model.ttft.points[0].p90.upper, 1182.4);
+  assert.equal(Object.hasOwn(model.speed.points[0], "diagnostic"), false);
+
+  // Every model omitted is still a publication, with the count explicit.
+  const onlyOther = publishedModelPerformance();
+  onlyOther.models.shift();
+  onlyOther.contributors = 1;
+  onlyOther.devices = 1;
+  const allOmitted = normalizeCommunityModelPerformance(onlyOther, PERFORMANCE_SLOT);
+  assert.equal(allOmitted.state, "published");
+  assert.deepEqual(allOmitted.models, []);
+  assert.deepEqual(allOmitted.omittedModels, { models: 1, turns: 4 });
+});
+
+test("unknown fields refuse the model performance slot instead of reaching the page", () => {
+  const additions = [
+    value => { value.diagnostics = { tracing: true }; },
+    value => { value.models[0].contributorIds = ["a"]; },
+    value => { value.models[0].speed.points[0].devices = 1; },
+    value => { value.models[0].ttft.points[0].median.source = "x"; },
+    value => { value.models[1].note = "x"; },
+  ];
+  for (const add of additions) {
+    const payload = publishedModelPerformance();
+    add(payload);
+    assert.deepEqual(normalizeCommunityModelPerformance(payload, PERFORMANCE_SLOT), {
+      state: "unsupported_schema", period: "7", speedMode: "fast", models: [], omittedModels: null,
+    }, add.toString());
+  }
+});
+
+test("the model performance privacy canary refuses identifiers and local content", () => {
+  const leaks = [
+    value => { value.models[1].modelId = "participant:01234567-89ab-cdef-0123-456789abcdef"; },
+    value => { value.models[1].modelId = "um_session_7"; },
+    value => { value.models[0].modelId = "accountScopeId"; },
+    value => { value.generatedAt = "/Users/someone/Desktop"; },
+    value => { value.start = "file://private"; },
+    value => { value.models[0].speed.unit = "https://example.invalid"; },
+    value => { value.models[0].provider = "C:\\private"; },
+    value => { value.population = "someone@example.com"; },
+  ];
+  for (const leak of leaks) {
+    const payload = publishedModelPerformance();
+    leak(payload);
+    assert.equal(
+      normalizeCommunityModelPerformance(payload, PERFORMANCE_SLOT).state,
+      "unsupported_schema",
+      leak.toString(),
+    );
+  }
+});
+
+test("model performance stays outside the app-only mirror and the daily cache identity", async () => {
+  const source = await readFile(COMMUNITY_DATA_SOURCE, "utf8");
+  assert.equal(source.includes("telemetry-shared"), false, "the public reader never names the app-only mirror");
+  const imports = [...source.matchAll(/^import\s[^;]*?from\s+"([^"]+)";/gmu)].map(match => match[1]);
+  assert.deepEqual(imports, ["./model-catalog.generated.js"]);
+  assert.equal(COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY.includes("model-performance"), false);
+  assert.equal(COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY.includes("performance"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Copied accept/reject fixtures for community-model-performance-v1.
+//
+// This site line has no community contract to compare against, so the
+// fixtures below are verbatim JSON copies of the client line's parity suite
+// (apps/web/test/community-model-performance-contract.test.mjs), where the
+// telemetry contract's own builders and parser prove every literal and every
+// accept/reject answer. Keep them byte-identical to that suite: this reader
+// must give the same answer for each case. The two bounds are the contract's
+// MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS and _BYTES, copied as literals.
+const MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS = 600;
+const MAX_COMMUNITY_MODEL_PERFORMANCE_BYTES = 16 * 1024 * 1024;
+
+const POINTS = {
+  dailySpeedBanded: {
+    day: "2026-10-08", n: 6, unresolved: 0,
+    p10: { estimate: 42, lower: 41, upper: 43 },
+    p25: { estimate: 43.5, lower: 42.5, upper: 44.5 },
+    median: { estimate: 46, lower: 45, upper: 47 },
+    p75: { estimate: 48.5, lower: 47.5, upper: 49.5 },
+    p90: { estimate: 49.5, lower: 49, upper: 50 },
+  },
+  dailySpeedSparseUnresolved: {
+    day: "2026-10-10", n: 2, unresolved: 1,
+    p10: null, p25: null,
+    median: { estimate: 83.25, lower: 80.5, upper: 86 },
+    p75: null, p90: null,
+  },
+  dailyTtftBanded: {
+    day: "2026-10-08", n: 5, unresolved: 0,
+    p10: { estimate: 878.2, lower: 830, upper: 926.4 },
+    p25: { estimate: 940, lower: 875, upper: 1005 },
+    median: { estimate: 940, lower: 875, upper: 1005 },
+    p75: { estimate: 1081, lower: 1006, upper: 1156 },
+    p90: { estimate: 1139.5, lower: 1096.6, upper: 1182.4 },
+  },
+  dailyTtftSparse: {
+    day: "2026-10-09", n: 1, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 700, lower: 700, upper: 700 },
+    p75: null, p90: null,
+  },
+  sparkSpeedMixed: {
+    day: "2026-10-09", n: 5, unresolved: 0,
+    p10: { estimate: 104.9, lower: 104.2, upper: 105.6 },
+    p25: { estimate: 119, lower: 118, upper: 120 },
+    median: { estimate: 255, lower: 250, upper: 260 },
+    p75: { estimate: 370.875, lower: 345, upper: 396.75 },
+    p90: { estimate: 390.375, lower: 376.05, upper: 404.7 },
+  },
+  fableSpeed: {
+    day: "2026-10-09", n: 3, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 31, lower: 30, upper: 32 },
+    p75: null, p90: null,
+  },
+  fableTtft: {
+    day: "2026-10-09", n: 2, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 1539.75, lower: 1515, upper: 1564.5 },
+    p75: null, p90: null,
+  },
+  weekSpeedStraddle: {
+    day: "2026-01-05", n: 6, unresolved: 1,
+    p10: { estimate: 54, lower: 53, upper: 55 },
+    p25: { estimate: 56.5, lower: 55.5, upper: 57.5 },
+    median: { estimate: 63, lower: 62, upper: 64 },
+    p75: { estimate: 69.5, lower: 68.5, upper: 70.5 },
+    p90: { estimate: 95.75, lower: 95, upper: 96.5 },
+  },
+  weekSpeedLate: {
+    day: "2026-10-05", n: 1, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 44, lower: 44, upper: 44 },
+    p75: null, p90: null,
+  },
+  weekTtft: {
+    day: "2026-10-05", n: 5, unresolved: 0,
+    p10: { estimate: 630.5, lower: 600, upper: 661 },
+    p25: { estimate: 630.5, lower: 600, upper: 661 },
+    median: { estimate: 940, lower: 875, upper: 1005 },
+    p75: { estimate: 940, lower: 875, upper: 1005 },
+    p90: { estimate: 1113.1, lower: 1044.2, upper: 1182 },
+  },
+  oneSpeed: {
+    day: "2026-10-10", n: 6, unresolved: 0,
+    p10: { estimate: 190, lower: 185, upper: 195 },
+    p25: { estimate: 197.5, lower: 192.5, upper: 202.5 },
+    median: { estimate: 210, lower: 205, upper: 215 },
+    p75: { estimate: 222.5, lower: 217.5, upper: 227.5 },
+    p90: { estimate: 227.5, lower: 225, upper: 230 },
+  },
+  oneTtft: {
+    day: "2026-10-10", n: 3, unresolved: 0,
+    p10: null, p25: null,
+    median: { estimate: 440, lower: 400, upper: 480 },
+    p75: null, p90: null,
+  },
+};
+
+const HEADER = {
+  schemaVersion: "community-model-performance-v1",
+  methodVersion: "performance-histogram-pool-type7-bounds-v1",
+  population: "reported_samples",
+  approximate: true,
+  revision: 3,
+  generatedAt: "2026-10-11T01:00:00.000Z",
+};
+
+// Seven days, Standard, daily. Two nameable Codex models (one with an empty
+// latency series) and one reviewed model of another provider, which the
+// browser omits and counts.
+const DAILY = {
+  ...HEADER,
+  period: "7", interval: "day", start: "2026-10-04", end: "2026-10-10", speedMode: "standard",
+  excludedUnknownTurns: 4, contributors: 3, devices: 4, reports: 9,
+  models: [
+    {
+      provider: "openai_codex", modelId: "gpt-5.6-luna",
+      turns: 9, speedTurns: 8, ttftTurns: 6, timedResponses: 7, toolFreeTurns: 1,
+      contributors: 2, devices: 2,
+      speed: { unit: "tokens_per_second", points: [POINTS.dailySpeedBanded, POINTS.dailySpeedSparseUnresolved] },
+      ttft: { unit: "milliseconds", points: [POINTS.dailyTtftBanded, POINTS.dailyTtftSparse] },
+    },
+    {
+      provider: "openai_codex", modelId: "gpt-5.3-codex-spark",
+      turns: 5, speedTurns: 5, ttftTurns: 0, timedResponses: 5, toolFreeTurns: 5,
+      contributors: 1, devices: 1,
+      speed: { unit: "tokens_per_second", points: [POINTS.sparkSpeedMixed] },
+      ttft: { unit: "milliseconds", points: [] },
+    },
+    {
+      provider: "anthropic_claude_code", modelId: "claude-fable-5",
+      turns: 4, speedTurns: 3, ttftTurns: 2, timedResponses: 3, toolFreeTurns: 0,
+      contributors: 1, devices: 1,
+      speed: { unit: "tokens_per_second", points: [POINTS.fableSpeed] },
+      ttft: { unit: "milliseconds", points: [POINTS.fableTtft] },
+    },
+  ],
+};
+
+// All time, Fast, weekly. The first bin's Monday precedes the window start.
+const WEEK = {
+  ...HEADER,
+  period: "all", interval: "week", start: "2026-01-07", end: "2026-10-10", speedMode: "fast",
+  excludedUnknownTurns: 0, contributors: 1, devices: 2, reports: 3,
+  models: [{
+    provider: "openai_codex", modelId: "gpt-6-sol",
+    turns: 8, speedTurns: 7, ttftTurns: 5, timedResponses: 6, toolFreeTurns: 2,
+    contributors: 1, devices: 2,
+    speed: { unit: "tokens_per_second", points: [POINTS.weekSpeedStraddle, POINTS.weekSpeedLate] },
+    ttft: { unit: "milliseconds", points: [POINTS.weekTtft] },
+  }],
+};
+
+// One day, Ultrafast, resolved above 120 tokens/second by v2 buckets.
+const ONE_DAY = {
+  ...HEADER,
+  period: "1", interval: "day", start: "2026-10-10", end: "2026-10-10", speedMode: "ultrafast",
+  excludedUnknownTurns: 1, contributors: 1, devices: 1, reports: 2,
+  models: [{
+    provider: "openai_codex", modelId: "gpt-5.3-codex-spark",
+    turns: 6, speedTurns: 6, ttftTurns: 3, timedResponses: 6, toolFreeTurns: 0,
+    contributors: 1, devices: 1,
+    speed: { unit: "tokens_per_second", points: [POINTS.oneSpeed] },
+    ttft: { unit: "milliseconds", points: [POINTS.oneTtft] },
+  }],
+};
+
+// Thirty days, Standard, an empty slot that replaced a stale head.
+const EMPTY = {
+  ...HEADER,
+  period: "30", interval: "day", start: "2026-09-11", end: "2026-10-10", speedMode: "standard",
+  excludedUnknownTurns: 0, contributors: 0, devices: 0, reports: 0, models: [],
+};
+
+const BASES = { DAILY, WEEK, ONE_DAY, EMPTY };
+
+// Declarative mutations: ["set", path, value], ["delete", path] (splices an
+// array element),
+// ["copy", fromPath, toPath], ["reverse", path], ["fill", path, count, fromPath].
+function getAt(value, path) {
+  return path.reduce((current, key) => current[key], value);
+}
+
+function applyOps(base, ops) {
+  const value = JSON.parse(JSON.stringify(base));
+  for (const [op, path, ...rest] of ops) {
+    const parent = getAt(value, path.slice(0, -1));
+    const key = path.at(-1);
+    if (op === "set") parent[key] = rest[0];
+    else if (op === "delete") {
+      if (Array.isArray(parent)) parent.splice(key, 1);
+      else delete parent[key];
+    }
+    else if (op === "copy") {
+      const [toPath] = rest;
+      getAt(value, toPath.slice(0, -1))[toPath.at(-1)] = structuredClone(getAt(value, path));
+    } else if (op === "reverse") parent[key].reverse();
+    else if (op === "fill") {
+      const [count, fromPath] = rest;
+      const source = getAt(value, fromPath);
+      parent[key] = Array.from({ length: count }, () => structuredClone(source));
+    } else throw new Error(`unknown op ${op}`);
+  }
+  return value;
+}
+
+const M0 = ["models", 0];
+const M1 = ["models", 1];
+const M2 = ["models", 2];
+const SPEED0 = [...M0, "speed", "points"];
+const TTFT0 = [...M0, "ttft", "points"];
+
+const VALID_VARIANTS = [
+  ["DAILY", "as published", []],
+  ["WEEK", "as published", []],
+  ["ONE_DAY", "as published", []],
+  ["EMPTY", "as published", []],
+  ["DAILY", "all-time daily window", [["set", ["period"], "all"], ["set", ["start"], "2026-10-01"]]],
+  ["DAILY", "fast mode", [["set", ["speedMode"], "fast"]]],
+  ["DAILY", "a later revision", [["set", ["revision"], 41]]],
+  ["DAILY", "turns above timed counts", [["set", [...M0, "turns"], 12]]],
+  ["WEEK", "single-day all-time window", [["set", ["start"], "2026-10-10"], ["delete", [...M0, "speed", "points", 0]],
+    ["set", [...M0, "speedTurns"], 1], ["set", [...M0, "toolFreeTurns"], 1]]],
+  ["DAILY", "only the omitted provider", [["delete", M1], ["delete", M0]]],
+];
+
+const INVALID_MUTATIONS = [
+  // Publication header.
+  ["DAILY", "extra top-level key", [["set", ["extra"], 1]]],
+  ["DAILY", "missing top-level key", [["delete", ["excludedUnknownTurns"]]]],
+  ["DAILY", "future schema version", [["set", ["schemaVersion"], "community-model-performance-v2"]]],
+  ["DAILY", "different method", [["set", ["methodVersion"], "performance-histogram-pool-type7-bounds-v2"]]],
+  ["DAILY", "claims exact values", [["set", ["approximate"], false]]],
+  ["DAILY", "approximate as text", [["set", ["approximate"], "true"]]],
+  ["DAILY", "different population", [["set", ["population"], "unique_turns"]]],
+  ["DAILY", "zero revision", [["set", ["revision"], 0]]],
+  ["DAILY", "fractional revision", [["set", ["revision"], 1.5]]],
+  ["DAILY", "revision as text", [["set", ["revision"], "3"]]],
+  ["DAILY", "non-canonical generatedAt", [["set", ["generatedAt"], "2026-10-11T01:00:00Z"]]],
+  ["DAILY", "generatedAt not an instant", [["set", ["generatedAt"], "yesterday"]]],
+  ["DAILY", "unknown period", [["set", ["period"], "90"]]],
+  ["DAILY", "numeric period", [["set", ["period"], 7]]],
+  ["DAILY", "unknown interval", [["set", ["interval"], "month"]]],
+  ["DAILY", "weekly bins outside all-time", [["set", ["interval"], "week"]]],
+  ["DAILY", "window one day too long", [["set", ["start"], "2026-10-03"]]],
+  ["DAILY", "impossible start day", [["set", ["start"], "2026-02-30"]]],
+  ["DAILY", "unknown speed mode", [["set", ["speedMode"], "unknown"]]],
+  ["DAILY", "negative excluded turns", [["set", ["excludedUnknownTurns"], -1]]],
+  ["DAILY", "contributors as text", [["set", ["contributors"], "3"]]],
+  ["DAILY", "devices below contributors", [["set", ["devices"], 2]]],
+  ["DAILY", "reports below devices", [["set", ["reports"], 3]]],
+  ["DAILY", "models not an array", [["set", ["models"], {}]]],
+  ["DAILY", "models null", [["set", ["models"], null]]],
+  ["WEEK", "start after end", [["set", ["start"], "2026-10-11"]]],
+  ["ONE_DAY", "one-day window spans two days", [["set", ["start"], "2026-10-09"]]],
+  ["EMPTY", "empty slot with devices below contributors", [["set", ["contributors"], 1]]],
+  // Models.
+  ["DAILY", "provider not a token", [["set", [...M0, "provider"], "openai codex"]]],
+  ["DAILY", "model id longer than a token", [["set", [...M0, "modelId"], "g".repeat(65)]]],
+  ["DAILY", "extra model key", [["set", [...M0, "label"], "GPT"]]],
+  ["DAILY", "missing model key", [["delete", [...M0, "toolFreeTurns"]]]],
+  ["DAILY", "zero turns", [["set", [...M1, "turns"], 0]]],
+  ["DAILY", "speed turns above turns", [["set", [...M0, "turns"], 7]]],
+  ["DAILY", "latency turns above turns", [["set", [...M1, "ttftTurns"], 6]]],
+  ["DAILY", "tool-free above speed turns", [["set", [...M0, "toolFreeTurns"], 9]]],
+  ["DAILY", "model without contributors", [["set", [...M0, "contributors"], 0]]],
+  ["DAILY", "model devices below contributors", [["set", [...M0, "devices"], 1]]],
+  ["DAILY", "duplicate model", [["copy", M0, ["models", 3]]]],
+  ["DAILY", "model above publication totals", [["set", [...M0, "contributors"], 4], ["set", [...M0, "devices"], 4]]],
+  ["DAILY", "speed sample count mismatch", [["set", [...M0, "speedTurns"], 7]]],
+  ["DAILY", "latency sample count mismatch", [["set", [...M0, "ttftTurns"], 5]]],
+  ["DAILY", "wrong latency unit", [["set", [...M0, "ttft", "unit"], "seconds"]]],
+  ["DAILY", "wrong speed unit", [["set", [...M0, "speed", "unit"], "tokens_per_minute"]]],
+  ["DAILY", "extra series key", [["set", [...M0, "speed", "extra"], 1]]],
+  ["DAILY", "points not an array", [["set", SPEED0, {}]]],
+  ["DAILY", "omitted model is still validated", [["set", [...M2, "speedTurns"], 2]]],
+  // Points and the under-five rule.
+  ["DAILY", "sparse point carries a band", [["set", [...SPEED0, 1, "p10"], { estimate: 1, lower: 1, upper: 1 }]]],
+  ["DAILY", "banded point misses a band", [["set", [...SPEED0, 0, "p90"], null]]],
+  ["DAILY", "sparse point misses its median", [["set", [...SPEED0, 1, "median"], null]]],
+  ["DAILY", "estimate outside bounds", [["set", [...SPEED0, 0, "median", "estimate"], 1e6]]],
+  ["DAILY", "upper below estimate", [["set", [...SPEED0, 0, "p25", "upper"], 43]]],
+  ["DAILY", "negative bound", [["set", [...SPEED0, 0, "p10", "lower"], -1]]],
+  ["DAILY", "bounds descend across percentiles", [["set", [...SPEED0, 0, "p90"], { estimate: 1, lower: 1, upper: 1 }]]],
+  ["DAILY", "lower bounds descend", [["set", [...SPEED0, 0, "p75", "lower"], 44]]],
+  ["DAILY", "extra quantile key", [["set", [...SPEED0, 0, "median", "extra"], 1]]],
+  ["DAILY", "estimate as text", [["set", [...SPEED0, 0, "median", "estimate"], "46"]]],
+  ["DAILY", "unresolved latency", [["set", [...TTFT0, 0, "unresolved"], 1]]],
+  ["DAILY", "unresolved above n", [["set", [...SPEED0, 1, "unresolved"], 3]]],
+  ["DAILY", "negative unresolved", [["set", [...SPEED0, 0, "unresolved"], -1]]],
+  ["DAILY", "unordered days", [["reverse", SPEED0]]],
+  ["DAILY", "duplicate day", [["set", [...SPEED0, 1, "day"], "2026-10-08"]]],
+  ["DAILY", "day before the window", [["set", [...SPEED0, 0, "day"], "2026-10-01"]]],
+  ["DAILY", "day after the window", [["set", [...SPEED0, 1, "day"], "2026-10-11"]]],
+  ["DAILY", "malformed day", [["set", [...SPEED0, 0, "day"], "2026-10-8"]]],
+  ["DAILY", "zero-sample point", [["set", [...TTFT0, 1, "n"], 0]]],
+  ["DAILY", "fractional n", [["set", [...TTFT0, 0, "n"], 5.5]]],
+  ["DAILY", "extra point key", [["set", [...SPEED0, 0, "contributor"], "a"]]],
+  ["WEEK", "weekly bin not on a Monday", [["set", [...SPEED0, 0, "day"], "2026-01-06"]]],
+  ["WEEK", "weekly bin ends before the window", [["set", [...SPEED0, 0, "day"], "2025-12-29"]]],
+  ["WEEK", "weekly bin after the window", [["set", [...SPEED0, 1, "day"], "2026-10-12"]]],
+  // Privacy canary and bounds.
+  ["DAILY", "local path in a string", [["set", ["generatedAt"], "/Users/someone/private"]]],
+  ["DAILY", "participant identifier as an omitted model id",
+    [["set", [...M2, "modelId"], "participant:01234567-89ab-cdef-0123-456789abcdef"]]],
+  ["DAILY", "session marker as a model id", [["set", [...M1, "modelId"], "um_session_1"]]],
+  ["DAILY", "too many points", [["fill", SPEED0, MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS + 1, [...SPEED0, 1]]]],
+  ["DAILY", "too many models", [["fill", ["models"], 65, M0]]],
+];
+
+// The one documented difference: the contract refuses a model the reviewed
+// catalog cannot name, while the browser drops and counts it.
+const OMIT_AND_COUNT = [
+  ["DAILY", "unreviewed Codex model id", [["set", [...M0, "modelId"], "gpt-private-preview"]],
+    { kept: ["gpt-5.3-codex-spark"], omitted: { models: 2, turns: 13 } }],
+  ["DAILY", "Codex id under another provider", [["set", [...M1, "provider"], "anthropic_claude_code"]],
+    { kept: ["gpt-5.6-luna"], omitted: { models: 2, turns: 9 } }],
+];
+
+function browserState(value) {
+  return normalizeCommunityModelPerformance(value, { period: value?.period, speedMode: value?.speedMode });
+}
+
+test("the copied performance fixtures are plain JSON in the shapes the contract builds", () => {
+  assert.equal(HEADER.schemaVersion, COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION);
+  for (const [name, base] of Object.entries(BASES)) {
+    assert.deepEqual(JSON.parse(JSON.stringify(base)), base, `${name} is JSON-serialisable`);
+  }
+  // The fixtures cover the cases the parity claim depends on.
+  const points = Object.values(POINTS);
+  assert.ok(points.some(point => point.n < 5), "a sparse point");
+  assert.ok(points.some(point => point.n >= 5), "a banded point");
+  assert.ok(points.some(point => point.unresolved > 0), "unresolved speed mass");
+  assert.equal(WEEK.interval, "week");
+  assert.equal(VALID_VARIANTS.length, 10);
+  assert.equal(INVALID_MUTATIONS.length, 76);
+  assert.equal(OMIT_AND_COUNT.length, 2);
+  // Every Codex model the fixtures keep is one this site's catalog can name.
+  const named = new Set(REVIEWED_MODEL_CATALOG
+    .filter(model => model.provider === "openai_codex")
+    .map(model => model.id));
+  for (const base of Object.values(BASES)) {
+    for (const model of base.models) {
+      if (model.provider === "openai_codex") assert.ok(named.has(model.modelId), model.modelId);
+    }
+  }
+});
+
+test("every copied valid publication is accepted and rebuilt field for field", () => {
+  for (const [baseName, label, ops] of VALID_VARIANTS) {
+    const value = applyOps(BASES[baseName], ops);
+    const name = `${baseName}: ${label}`;
+    const result = browserState(value);
+    assert.equal(result.state, "published", `browser accepts ${name}`);
+    const nameable = value.models.filter(model => model.provider === "openai_codex");
+    const omitted = value.models.filter(model => model.provider !== "openai_codex");
+    assert.deepEqual(result.models.map(({ label: modelLabel, ...model }) => {
+      assert.equal(typeof modelLabel, "string", name);
+      assert.ok(modelLabel.length > 0, name);
+      return model;
+    }), nameable, `${name}: kept models are rebuilt field for field`);
+    assert.deepEqual(result.omittedModels, {
+      models: omitted.length,
+      turns: omitted.reduce((sum, model) => sum + model.turns, 0),
+    }, `${name}: omitted models are counted`);
+    for (const key of ["revision", "generatedAt", "period", "interval", "start", "end", "speedMode",
+      "excludedUnknownTurns", "contributors", "devices", "reports"]) {
+      assert.equal(result[key], value[key], `${name}: ${key}`);
+    }
+    assert.equal(result.schemaVersion, "community-model-performance-v1");
+    assert.equal(result.methodVersion, "performance-histogram-pool-type7-bounds-v1");
+    assert.equal(result.population, "reported_samples");
+    assert.equal(result.approximate, true);
+  }
+});
+
+test("every copied invalid mutation refuses the whole slot", () => {
+  const labels = new Set();
+  for (const [baseName, label, ops] of INVALID_MUTATIONS) {
+    const name = `${baseName}: ${label}`;
+    assert.equal(labels.has(name), false, `unique label ${name}`);
+    labels.add(name);
+    const value = applyOps(BASES[baseName], ops);
+    const result = browserState(value);
+    assert.equal(result.state, "unsupported_schema", `browser refuses ${name}`);
+    assert.deepEqual(result.models, [], name);
+    assert.equal(result.omittedModels, null, name);
+    assert.equal(Object.hasOwn(result, "contributors"), false, name);
+  }
+});
+
+test("models this site cannot name are omitted and counted, never fatal", () => {
+  // The only documented divergence from the contract, which refuses these.
+  for (const [baseName, label, ops, expected] of OMIT_AND_COUNT) {
+    const value = applyOps(BASES[baseName], ops);
+    const result = browserState(value);
+    assert.equal(result.state, "published", `browser keeps ${label}`);
+    assert.deepEqual(result.models.map(model => model.modelId), expected.kept, label);
+    assert.deepEqual(result.omittedModels, expected.omitted, label);
+  }
+
+  // A newer Codex model the client line names but this site's catalog slice may
+  // not (reviewed-model-catalog-2026-09-23.1 has no gpt-6.1-sol). Its reported
+  // samples count toward omittedModels instead of refusing the slot.
+  const sitesNamesSol = REVIEWED_MODEL_CATALOG
+    .some(model => model.provider === "openai_codex" && model.id === "gpt-6.1-sol");
+  if (REVIEWED_MODEL_CATALOG_VERSION === "reviewed-model-catalog-2026-09-23.1") {
+    assert.equal(sitesNamesSol, false, "the 2026-09-23.1 slice cannot name gpt-6.1-sol");
+  }
+  const sol = applyOps(DAILY, [["set", [...M0, "modelId"], "gpt-6.1-sol"]]);
+  const solResult = browserState(sol);
+  assert.equal(solResult.state, "published");
+  if (sitesNamesSol) {
+    assert.deepEqual(solResult.models.map(model => model.modelId), ["gpt-6.1-sol", "gpt-5.3-codex-spark"]);
+    assert.deepEqual(solResult.omittedModels, { models: 1, turns: 4 });
+  } else {
+    assert.deepEqual(solResult.models.map(model => model.modelId), ["gpt-5.3-codex-spark"]);
+    assert.deepEqual(solResult.omittedModels, { models: 2, turns: 13 });
+  }
+
+  // Omission never relaxes validation: an unnameable model is checked first.
+  const brokenSol = applyOps(sol, [["set", [...M0, "speedTurns"], 7]]);
+  assert.equal(browserState(brokenSol).state, "unsupported_schema");
+});
+
+test("shared object references refuse the performance slot", () => {
+  // JSON never shares objects, but a caller could. Equal values, one object.
+  const value = applyOps(DAILY, [["set", [...M1, "speed", "points", 0, "p10"], { estimate: 119, lower: 118, upper: 120 }]]);
+  assert.equal(browserState(value).state, "published");
+  value.models[1].speed.points[0].p10 = value.models[1].speed.points[0].p25;
+  assert.equal(browserState(value).state, "unsupported_schema");
+});
+
+test("the serialized performance byte bound is enforced", () => {
+  const days = Array.from({ length: MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS }, (_, index) => (
+    new Date(Date.UTC(2024, 0, 1 + index)).toISOString().slice(0, 10)
+  ));
+  const build = (count) => {
+    const models = REVIEWED_MODEL_CATALOG.map(({ provider, id }) => ({
+      provider,
+      modelId: id,
+      turns: count * 5,
+      speedTurns: count * 5,
+      ttftTurns: count * 5,
+      timedResponses: count * 5,
+      toolFreeTurns: 0,
+      contributors: 1,
+      devices: 1,
+      speed: { unit: "tokens_per_second", points: days.slice(0, count).map(day => ({ ...POINTS.sparkSpeedMixed, day })) },
+      ttft: { unit: "milliseconds", points: days.slice(0, count).map(day => ({ ...POINTS.dailyTtftBanded, day })) },
+    }));
+    return JSON.parse(JSON.stringify({
+      ...HEADER, period: "all", interval: "day", start: days[0], end: days.at(-1), speedMode: "standard",
+      excludedUnknownTurns: 0, contributors: 1, devices: 1, reports: 1, models,
+    }));
+  };
+  const oversized = build(MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS);
+  assert.ok(new TextEncoder().encode(JSON.stringify(oversized)).byteLength > MAX_COMMUNITY_MODEL_PERFORMANCE_BYTES);
+  assert.equal(browserState(oversized).state, "unsupported_schema");
+  const within = build(400);
+  assert.ok(new TextEncoder().encode(JSON.stringify(within)).byteLength < MAX_COMMUNITY_MODEL_PERFORMANCE_BYTES);
+  const result = browserState(within);
+  assert.equal(result.state, "published");
+  const otherProviders = REVIEWED_MODEL_CATALOG.filter(model => model.provider !== "openai_codex").length;
+  assert.equal(result.models.length, REVIEWED_MODEL_CATALOG.length - otherProviders);
+  assert.deepEqual(result.omittedModels, { models: otherProviders, turns: otherProviders * 2000 });
+});
+
+test("the requested performance slot binds the payload", () => {
+  assert.equal(normalizeCommunityModelPerformance(DAILY, { period: "7", speedMode: "standard" }).state, "published");
+  for (const slot of [
+    { period: "30", speedMode: "standard" },
+    { period: "7", speedMode: "fast" },
+    { period: "all", speedMode: "standard" },
+  ]) {
+    const result = normalizeCommunityModelPerformance(DAILY, slot);
+    assert.equal(result.state, "unsupported_schema", JSON.stringify(slot));
+    assert.equal(result.period, slot.period);
+    assert.equal(result.speedMode, slot.speedMode);
+  }
+  for (const slot of [{}, { period: 7, speedMode: "standard" }, { period: "7", speedMode: "Standard" }]) {
+    assert.deepEqual(normalizeCommunityModelPerformance(DAILY, slot), {
+      state: "unsupported_schema", period: null, speedMode: null, models: [], omittedModels: null,
+    });
+  }
 });
