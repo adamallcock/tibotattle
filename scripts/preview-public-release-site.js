@@ -4,9 +4,12 @@
 //
 // This deliberately builds the same closed public-site output used for a
 // release, then serves that ephemeral output on loopback. In its default mode
-// it reads the *already public* homepage metadata and aggregate community
-// series from the reviewed public origin for visual comparison only. It never
-// sends cookies, credentials, local dashboard data, or write requests upstream.
+// it reads the *already public* homepage metadata, aggregate community series
+// and community model-performance slots from the reviewed public origin for
+// visual comparison only. It never sends cookies, credentials, local dashboard
+// data, or write requests upstream. Offline mode reads nothing remote; it
+// answers the model-performance read with a labelled synthetic fixture so the
+// layout can be reviewed without inventing release metadata or daily figures.
 
 import { createServer } from "node:http";
 import {
@@ -31,7 +34,19 @@ const PREVIEW_ROOT_PREFIX = "tibotattle-public-preview-";
 const MAXIMUM_REMOTE_RESPONSE_BYTES = 2 * 1024 * 1024;
 const REMOTE_FETCH_TIMEOUT_MS = 10_000;
 const COMMUNITY_DAILY_PATH = "/api/v1/community/daily";
+const COMMUNITY_MODEL_PERFORMANCE_PATH = "/api/v1/community/model-performance";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+// The closed, enum-only query of the public model-performance read: one slot
+// per request. Anything else is answered locally and never forwarded.
+const MODEL_PERFORMANCE_PERIODS = Object.freeze(["1", "7", "30", "all"]);
+const MODEL_PERFORMANCE_SPEED_MODES = Object.freeze(["standard", "fast", "ultrafast"]);
+// Statuses the model-performance read may legitimately answer with a JSON body
+// the page renders: a published slot, or an explicit unpublished/unknown slot.
+const MODEL_PERFORMANCE_PASSTHROUGH_STATUSES = new Set([404]);
+export const SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER =
+  "x-tibotattle-preview-fixture";
+export const SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_LABEL =
+  "synthetic-community-model-performance";
 const ENTRY_PAGE_FILES = new Set(["index.html", "community.html", "404.html"]);
 const MIME_TYPES = Object.freeze({
   ".css": "text/css; charset=utf-8",
@@ -84,9 +99,11 @@ function usage() {
     "  npm run product:release-site:preview -- --offline",
     "  npm run product:release-site:preview -- --upstream https://tibotattle.com",
     "",
-    "The default mode fetches only published homepage metadata and the",
-    "published aggregate daily community endpoint. --offline serves the",
-    "generated site without either remote input.",
+    "The default mode fetches only published homepage metadata, the",
+    "published aggregate daily community endpoint and the published",
+    "community model-performance endpoint. --offline serves the generated",
+    "site without any remote input, and answers model performance with a",
+    "labelled synthetic fixture.",
   ].join("\n");
 }
 
@@ -437,7 +454,13 @@ async function readBoundedBody(response, maximumBytes, label) {
   return Buffer.concat(chunks, bytes);
 }
 
-async function fetchBounded(fetchImpl, url, accept, label) {
+async function fetchBounded(
+  fetchImpl,
+  url,
+  accept,
+  label,
+  passthroughStatuses = new Set(),
+) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REMOTE_FETCH_TIMEOUT_MS);
   try {
@@ -447,7 +470,7 @@ async function fetchBounded(fetchImpl, url, accept, label) {
       redirect: "error",
       signal: controller.signal,
     });
-    if (!response.ok) {
+    if (!response.ok && !passthroughStatuses.has(response.status)) {
       throw new Error(`${label} request returned HTTP ${response.status}`);
     }
     return {
@@ -595,6 +618,213 @@ async function proxyCommunityDaily({
   }
 }
 
+function writePreviewJson(response, mode, status, value, method, extraHeaders = {}) {
+  writeResponse(
+    response,
+    status,
+    { ...responseHeaders(mode, "application/json; charset=utf-8"), ...extraHeaders },
+    JSON.stringify(value),
+    method,
+  );
+}
+
+/**
+ * Accept exactly one `period` and one `speedMode`, each a reviewed enum value.
+ * The returned object is rebuilt in canonical order, so the forwarded query
+ * never carries a caller-chosen spelling, order, or extra parameter.
+ */
+export function safeModelPerformanceQuery(url) {
+  const names = [...url.searchParams.keys()];
+  if (names.length !== 2
+      || url.searchParams.getAll("period").length !== 1
+      || url.searchParams.getAll("speedMode").length !== 1) {
+    return null;
+  }
+  const period = url.searchParams.get("period");
+  const speedMode = url.searchParams.get("speedMode");
+  return MODEL_PERFORMANCE_PERIODS.includes(period)
+      && MODEL_PERFORMANCE_SPEED_MODES.includes(speedMode)
+    ? { period, speedMode }
+    : null;
+}
+
+const SYNTHETIC_END_DAY = "2026-10-10";
+const SYNTHETIC_ALL_START_DAY = "2026-07-06";
+const SYNTHETIC_GENERATED_AT = "2026-10-11T03:00:00.000Z";
+const DAY_MS = 86_400_000;
+const SYNTHETIC_PERCENTILE_FACTORS = Object.freeze([
+  ["p10", 0.7],
+  ["p25", 0.85],
+  ["median", 1],
+  ["p75", 1.15],
+  ["p90", 1.3],
+]);
+// Reviewed public-catalogue identities only; the numbers are invented and
+// scale with the selected speed mode so each slot looks visibly different.
+const SYNTHETIC_MODELS = Object.freeze([
+  Object.freeze({ modelId: "gpt-5.5", sparse: false, speed: 62, ttft: 900 }),
+  Object.freeze({ modelId: "gpt-5.4", sparse: true, speed: 48, ttft: 1200 }),
+]);
+const SYNTHETIC_SPEED_MODE_SCALE = Object.freeze({
+  standard: Object.freeze({ speed: 1, ttft: 1 }),
+  fast: Object.freeze({ speed: 1.8, ttft: 0.7 }),
+  ultrafast: Object.freeze({ speed: 3.2, ttft: 0.5 }),
+});
+
+function utcDay(epoch) {
+  return new Date(epoch).toISOString().slice(0, 10);
+}
+
+function round3(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function syntheticPoint(day, n, unresolved, median) {
+  const point = { day, n, unresolved };
+  for (const [name, factor] of SYNTHETIC_PERCENTILE_FACTORS) {
+    // The under-five rule: a small point keeps only its median.
+    if (n < 5 && name !== "median") {
+      point[name] = null;
+      continue;
+    }
+    const estimate = round3(median * factor);
+    point[name] = {
+      estimate,
+      lower: round3(estimate * 0.9),
+      upper: round3(estimate * 1.1),
+    };
+  }
+  return point;
+}
+
+/**
+ * A deterministic, content-free `community-model-performance-v1` slot used only
+ * by the offline preview. It names no contributor or device and is labelled by
+ * the SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER response header; it is never a
+ * claim about published community figures.
+ */
+export function syntheticCommunityModelPerformance({ period, speedMode }) {
+  if (!MODEL_PERFORMANCE_PERIODS.includes(period)
+      || !MODEL_PERFORMANCE_SPEED_MODES.includes(speedMode)) {
+    throw new TypeError("Synthetic model performance needs a reviewed period and speed mode");
+  }
+  const endEpoch = Date.parse(`${SYNTHETIC_END_DAY}T00:00:00.000Z`);
+  const interval = period === "all" ? "week" : "day";
+  const startEpoch = period === "all"
+    ? Date.parse(`${SYNTHETIC_ALL_START_DAY}T00:00:00.000Z`)
+    : endEpoch - (Number(period) - 1) * DAY_MS;
+  const step = interval === "week" ? 7 * DAY_MS : DAY_MS;
+  const days = [];
+  for (let epoch = startEpoch; epoch <= endEpoch; epoch += step) days.push(utcDay(epoch));
+  const scale = SYNTHETIC_SPEED_MODE_SCALE[speedMode];
+  const models = SYNTHETIC_MODELS.map((model, modelIndex) => {
+    const speedPoints = [];
+    const ttftPoints = [];
+    days.forEach((day, dayIndex) => {
+      if (model.sparse && dayIndex % 2 === 1) return;
+      const wave = 1 + ((dayIndex % 5) - 2) * 0.04;
+      const n = model.sparse ? 3 : (interval === "week" ? 70 : 10) + (dayIndex % 4);
+      speedPoints.push(syntheticPoint(
+        day, n, !model.sparse && dayIndex % 3 === 0 ? 1 : 0,
+        model.speed * scale.speed * wave,
+      ));
+      ttftPoints.push(syntheticPoint(
+        day, Math.max(1, n - 1), 0, model.ttft * scale.ttft / wave,
+      ));
+    });
+    const speedTurns = speedPoints.reduce((total, point) => total + point.n, 0);
+    const ttftTurns = ttftPoints.reduce((total, point) => total + point.n, 0);
+    return {
+      provider: "openai_codex",
+      modelId: model.modelId,
+      turns: speedTurns + 2,
+      speedTurns,
+      ttftTurns,
+      timedResponses: speedTurns + 1,
+      toolFreeTurns: Math.floor(speedTurns / 2),
+      contributors: 2 - modelIndex,
+      devices: 3 - modelIndex,
+      speed: { unit: "tokens_per_second", points: speedPoints },
+      ttft: { unit: "milliseconds", points: ttftPoints },
+    };
+  });
+  return {
+    schemaVersion: "community-model-performance-v1",
+    methodVersion: "performance-histogram-pool-type7-bounds-v1",
+    population: "reported_samples",
+    approximate: true,
+    revision: 1,
+    generatedAt: SYNTHETIC_GENERATED_AT,
+    period,
+    interval,
+    start: utcDay(startEpoch),
+    end: SYNTHETIC_END_DAY,
+    speedMode,
+    excludedUnknownTurns: 4,
+    contributors: 2,
+    devices: 3,
+    reports: 5,
+    models,
+  };
+}
+
+async function proxyCommunityModelPerformance({
+  fetchImpl,
+  mode,
+  request,
+  requestUrl,
+  response,
+  upstream,
+}) {
+  if (!requestMethodAllowed(request, response, mode)) return;
+  const query = safeModelPerformanceQuery(requestUrl);
+  if (query === null) {
+    writePreviewJson(
+      response, mode, 400, { error: { code: "INVALID_PREVIEW_QUERY" } }, request.method,
+    );
+    return;
+  }
+  if (mode === "generated-source-offline") {
+    writePreviewJson(
+      response,
+      mode,
+      200,
+      syntheticCommunityModelPerformance(query),
+      request.method,
+      { [SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER]: SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_LABEL },
+    );
+    return;
+  }
+  const target = new URL(COMMUNITY_MODEL_PERFORMANCE_PATH, upstream);
+  target.search = new URLSearchParams([
+    ["period", query.period],
+    ["speedMode", query.speedMode],
+  ]).toString();
+  try {
+    const remote = await fetchBounded(
+      fetchImpl,
+      target,
+      "application/json",
+      "Published community model performance",
+      MODEL_PERFORMANCE_PASSTHROUGH_STATUSES,
+    );
+    if (!/^application\/json(?:;|$)/iu.test(remote.contentType)) {
+      throw new Error("Published community model performance did not return JSON");
+    }
+    writeResponse(
+      response,
+      remote.status,
+      responseHeaders(mode, "application/json; charset=utf-8"),
+      remote.body,
+      request.method,
+    );
+  } catch {
+    writePreviewJson(
+      response, mode, 502, { error: { code: "PREVIEW_UPSTREAM_UNAVAILABLE" } }, request.method,
+    );
+  }
+}
+
 function closeServer(server) {
   server.closeIdleConnections?.();
   server.closeAllConnections?.();
@@ -680,6 +910,17 @@ export async function startPublicReleaseSitePreview({
         });
         return;
       }
+      if (requestUrl.pathname === COMMUNITY_MODEL_PERFORMANCE_PATH) {
+        await proxyCommunityModelPerformance({
+          fetchImpl,
+          mode,
+          request,
+          requestUrl,
+          response,
+          upstream: selectedUpstream,
+        });
+        return;
+      }
       if (!requestMethodAllowed(request, response, mode)) return;
       const filename = cleanRelativeAsset(requestUrl.pathname, allowedFiles);
       if (filename === null) {
@@ -752,6 +993,9 @@ async function runCli() {
       `Preview ready: ${preview.url}`,
       `Mode: ${preview.mode}`,
       "This is generated local source; live public metadata and aggregate data are visual-review inputs, not release proof.",
+      ...(preview.mode === "generated-source-offline"
+        ? ["Offline model performance is a labelled synthetic fixture, not community data."]
+        : []),
       "Press Ctrl+C to stop and remove the temporary output.",
     ].join("\n") + "\n",
   );
