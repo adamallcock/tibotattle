@@ -176,6 +176,13 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     authority: "admin",
   },
   {
+    // Owner-decided 2026-10-10: read-only performance-intake visibility.
+    pathname: "/api/v1/admin/performance-intake",
+    id: "admin_performance_intake",
+    methods: ["GET"],
+    authority: "admin",
+  },
+  {
     pathname: "/api/v1/me/security-reset",
     id: "security_reset",
     methods: ["POST"],
@@ -337,6 +344,14 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   {
     pathname: "/api/v1/community/daily",
     id: "community_daily",
+    methods: ["GET"],
+    authority: "public",
+  },
+  {
+    // Owner-decided 2026-10-10: one published community model-performance
+    // slot per request (period × speedMode).
+    pathname: "/api/v1/community/model-performance",
+    id: "community_model_performance",
     methods: ["GET"],
     authority: "public",
   },

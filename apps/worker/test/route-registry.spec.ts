@@ -153,6 +153,12 @@ const EXACT_ROUTES = [
     authority: "admin",
   },
   {
+    pathname: "/api/v1/admin/performance-intake",
+    id: "admin_performance_intake",
+    methods: ["GET"],
+    authority: "admin",
+  },
+  {
     pathname: "/api/v1/me/security-reset",
     id: "security_reset",
     methods: ["POST"],
@@ -314,11 +320,18 @@ const EXACT_ROUTES = [
     methods: ["GET"],
     authority: "public",
   },
+  {
+    pathname: "/api/v1/community/model-performance",
+    id: "community_model_performance",
+    methods: ["GET"],
+    authority: "public",
+  },
 ] as const satisfies readonly WorkerRouteDefinition[];
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(51);
+    // d43c8f92's 51 routes plus the two owner-decided routes of 2026-10-10.
+    expect(EXACT_ROUTES).toHaveLength(53);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {
@@ -393,6 +406,8 @@ describe("Worker route registry", () => {
       "/api/v1/device/telemetry/v1.1/day-manifests/",
       "/api/v1/me/telemetry-v11/domain-predecessor/",
       "/api/v1/me/telemetry-v11/domain-activate/",
+      "/api/v1/community/model-performance/",
+      "/api/v1/admin/performance-intake/",
     ]) {
       expect(matchWorkerRoute(pathname), pathname).toEqual({
         kind: "unknown_api",
