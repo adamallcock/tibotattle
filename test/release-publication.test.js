@@ -503,6 +503,10 @@ test("real feed and website adapters delegate current guarded entrypoint contrac
   assert.ok(siteCalls[0].confirmation.includes("PRODUCTION"));
   await writeFile(f.plan.targets[1].feedManifest.path, "changed local feed manifest");
   await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 2);
+  // The real website entrypoint passes no typed pins, so it is refused before
+  // the receipt or any deploy: it would render the checked-in env.production.
+  const guarded = createPublicationAdapters({ publishFeed: async () => assert.fail("no feed write") });
+  await assert.rejects(guarded.publishWebsite(prepared), { code: "PRODUCTION_UNTYPED_DEPLOY_REFUSED" });
 });
 
 test("website readback checks every prepared file and current healthy deployment source", async (t) => {

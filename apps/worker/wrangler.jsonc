@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "app-usagemonitor-synthetic",
-  "main": "src/index.ts",
+  "main": "src/cloudflare-entry.ts",
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
   "cache": {

@@ -1,0 +1,168 @@
+{
+  "schemaVersion": "analytics-v2-kernel-registry-v1",
+  "rule": "Append-only. Each entry is one kernel: the vendored kernels (vendorManifestSha256, from productionCommit), the GCP compute closure (computeClosureSha256, cloud-run/analytics-kernel-closure.mjs) and the orchestration method (methodVersion). Ids are assigned here, never by a database, so they are identical in every environment. Never edit or remove an entry: a changed closure, vendor manifest or method is a new entry with the next id. scripts/analytics-v2-kernel-registry.check.mjs pins every entry and refuses a closure no entry names; cloud-run/build.mjs refuses to build one (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED).",
+  "kernels": [
+    {
+      "kernelId": 1,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "97acb9afc16e5cf18c11e2c33d18e60e38b46484ace3a9df4fa5a85d6b52ef66",
+      "computeClosureSha256": "71ac8d242c8a521077641cbda2d8bbfa35315950b8fca6e0d20e52c0d6b42388",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v1"
+    },
+    {
+      "kernelId": 2,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "b40d075f06380d6a83ac0dbf77183c90ce7e522e6613048c966860394ef6eb6e",
+      "computeClosureSha256": "de143e6a09303448146e70c63a9bdf13ed1e9256fc92640c41363a901d781c15",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v1"
+    },
+    {
+      "kernelId": 3,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "b40d075f06380d6a83ac0dbf77183c90ce7e522e6613048c966860394ef6eb6e",
+      "computeClosureSha256": "f8a1d5eb2f3e9e36db81671b06c020fa2e38488e50aa42b487cec9835842ebc7",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v1"
+    },
+    {
+      "kernelId": 4,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "b40d075f06380d6a83ac0dbf77183c90ce7e522e6613048c966860394ef6eb6e",
+      "computeClosureSha256": "febd0ae0f599ccfb9cff3a3864703450b94de46051237042e39930bba3c98d38",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 5,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "85e919a6f439ff351c37d5df373d2d7299dafa1d4cac2359de9b580f151d7241",
+      "computeClosureSha256": "e022061bb1bccd6e3906fcbf5dc49edec1a06dbee63e70a74a8df22b1e1d9156",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 6,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "424029091301630c4ae3d66244302a102fa30053540e9c530e349eb52a00bdae",
+      "computeClosureSha256": "9b87afb4e6770de9d9b06e34a01869c1c665e7ce8347d74d12294c4c5345a388",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 7,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "5bea68323c31ed3d567b7ce606e3c6b84568038e27efffed56366ae8e4a002aa",
+      "computeClosureSha256": "98bd3be1fbcf141f38ccc7e9a5fdfaeefa7969df9b81779b646ae533cca5512c",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 8,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "5bea68323c31ed3d567b7ce606e3c6b84568038e27efffed56366ae8e4a002aa",
+      "computeClosureSha256": "b4696cbc204168e0ef96166bc87d3c87d48c42e2697fa87640a1aef7ee121fd2",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 9,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "5bea68323c31ed3d567b7ce606e3c6b84568038e27efffed56366ae8e4a002aa",
+      "computeClosureSha256": "52fa97da36b950076700b7e5d447da41089a007c894ac8db9444e228f7bb8717",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 10,
+      "productionCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+      "vendorManifestSha256": "5bea68323c31ed3d567b7ce606e3c6b84568038e27efffed56366ae8e4a002aa",
+      "computeClosureSha256": "026f50be7ac127e2d61f7bb0c902bf4e32ec374ca8b5573e67baeb12060d3c74",
+      "priceRegistrySha256": "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+      "priceRegistryVersion": "app-official-api-prices-v0.8",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 11,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "c05832941a3fe1b3c9058524610d0d652401ea9c770049fbb7b5ec62fe260772",
+      "computeClosureSha256": "d2dd4592b89a2594df08a47a45ad7c8e765cb32ef9f1b23c51518329ce01f474",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 12,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "b51a695a2bae8857b03a46933a6626a42d294dab85586293f5a9f63d04f76aef",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 13,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "4d88f2bcee4f3703bb84b30a219217fc50ebb046e74f945bc74c944882b15aa8",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 14,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "1b72d339b44de64fd612250b879689831b594c5d98121cd4db10b98a83c649b2",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 15,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "1c7ea52deade4cbe0109d718ab0a5eb49ddafbddb1a9eecfed6a1a029a1a44d7",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 16,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "d2e867213fe9656f6edf91d0ac991cb293a323f3b2cd84af7d79c0ac431f39f4",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 17,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "15edc0eadef165fd646bac3cb91fd347347a623348d0332e6b9944671dbac283",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 18,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "4b6662dd166ace0c5045f0ceefb9b972c8b067fa3b9ba268bfd4a9871daeb736",
+      "computeClosureSha256": "dba4d19350081bbdcb78e153f9b1fa17f33416a4e5b8ed445c53e1ca28fdc380",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    }
+  ]
+}

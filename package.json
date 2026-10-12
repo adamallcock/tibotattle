@@ -145,6 +145,7 @@
   },
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {
+    "@babel/parser": "7.29.9",
     "electron": "43.5.0",
     "electron-builder": "26.15.7",
     "es-module-lexer": "2.3.1",

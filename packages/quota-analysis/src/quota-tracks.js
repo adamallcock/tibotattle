@@ -221,6 +221,38 @@ function cumulativeCostAt(usage, firstObservedMs, timestampMs) {
   }, 0);
 }
 
+function cumulativeCostCursor(usage, firstObservedMs) {
+  const observedTimes = usage.map((row) => Date.parse(row.observedAt));
+  const usageIsChronological = observedTimes.every((observedMs, index) => (
+    index === 0 || observedMs >= observedTimes[index - 1]
+  ));
+  let index = 0;
+  let total = 0;
+  let lastTimestampMs = Number.NEGATIVE_INFINITY;
+  let useLegacyReduction = !usageIsChronological;
+  return (timestampMs) => {
+    // `usage` is ordered by observedAt and eventId, and buildOneReset asks for
+    // boundaries in nondecreasing timestamp order. Advance once so every
+    // matched event is added once, in the same order as the previous
+    // per-boundary reduction. Extended ISO years are accepted by input
+    // validation but do not sort chronologically as strings; retain the exact
+    // reduction path if either source or boundary order is not chronological.
+    if (useLegacyReduction || timestampMs < lastTimestampMs) {
+      useLegacyReduction = true;
+      return cumulativeCostAt(usage, firstObservedMs, timestampMs);
+    }
+    lastTimestampMs = timestampMs;
+    while (index < usage.length) {
+      const row = usage[index];
+      const observedMs = observedTimes[index];
+      if (observedMs > timestampMs) break;
+      index += 1;
+      if (observedMs > firstObservedMs) total += row.costNanousd;
+    }
+    return total;
+  };
+}
+
 function orderedRefusals(values) {
   const unique = new Set(values);
   return REFUSAL_ORDER.filter((code) => unique.has(code));
@@ -313,6 +345,7 @@ function buildOneReset(ordered, allUsage, datasetStatus) {
     left.observedAt.localeCompare(right.observedAt)
     || left.eventId.localeCompare(right.eventId)
   ));
+  const cumulativeCostAt = cumulativeCostCursor(matchedUsage, firstObservedMs);
   const refusals = [];
   if (first.accountTrackId === "unattributed") refusals.push("unattributed_account");
 
@@ -390,13 +423,9 @@ function buildOneReset(ordered, allUsage, datasetStatus) {
       boundaries.push({
         usedPercent: current.usedPercent,
         lowerCostNanousd: cumulativeCostAt(
-          matchedUsage,
-          firstObservedMs,
           Date.parse(prior.observedAt),
         ),
         upperCostNanousd: cumulativeCostAt(
-          matchedUsage,
-          firstObservedMs,
           Date.parse(current.observedAt),
         ),
         observedAt: current.observedAt,

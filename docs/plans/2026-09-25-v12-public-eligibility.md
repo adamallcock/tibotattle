@@ -129,6 +129,30 @@ through the same atomic import, then deploy the main Worker.
   succeeded at 2026-09-23T23:56Z. That cause is still being established from
   the server's rejection codes.
 
+## Diagnosis of the v1.2 upload defect (local source, 2026-09-25)
+
+Reproduced on the GCP parity branch with the shipped client driving the real
+Worker routes; no production data was read.
+
+- The client asks for its domain predecessor before it registers any day. The
+  predecessor refused a device with no ready v1.2 manifest (`409
+  TELEMETRY_MANIFEST_INCOMPLETE`), which the client treats as a retryable
+  conflict, so a never-uploaded install stopped before staging anything on
+  every pass. The predecessor now seeds that first range with the current UTC
+  day (v1.1 parity), in D1 and PostgreSQL.
+- The predecessor fingerprint also hashed the device's ready manifests. A
+  client with a progress journal (the desktop) re-reads the predecessor after
+  staging its own days and stops when the fingerprint moves, so a pass that
+  made any new day ready failed that check and discarded its journal. The
+  fingerprint now pins only the prior
+  head and input revision (`v12-complete-domain-2`); activation still has to
+  cover every ready day.
+- A complete v1.2 domain includes days without records, and the client
+  registers one for every day in its range, but the D1 schema (`0008`)
+  required `expected_chunk_count >= 1`, so an empty day was refused with a
+  retryable `503` on every pass. Isolation 0012 (above) fixes it on D1;
+  PostgreSQL already allowed the empty day and registers it as ready.
+
 ## Open follow-ups
 
 - The graph readiness hint omits v1.2-only members. Publication's full member

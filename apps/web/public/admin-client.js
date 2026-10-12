@@ -1,9 +1,27 @@
 import {
   ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.5";
+/**
+ * The Google Cloud origin's overview (owner round 12, 2026-10-02): v0.5 plus
+ * an explicit { status: "unavailable" } for a block with no source there. The
+ * Cloudflare Worker keeps serving v0.5 until the switch; both are read.
+ */
+const ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION = "admin-overview-v0.6";
+const ADMIN_OVERVIEW_SCHEMA_VERSIONS = new Set([
+  ADMIN_OVERVIEW_SCHEMA_VERSION, ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION,
+]);
+/**
+ * admin-database-health-v0.1 is the Worker's; v0.2 is the Google Cloud
+ * origin's, where the removed deletion ledger is always not_applicable.
+ */
+const ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION = "admin-database-health-v0.2";
+const ADMIN_DATABASE_HEALTH_SCHEMA_VERSIONS = new Set([
+  "admin-database-health-v0.1", ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION,
+]);
 const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
 const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
 const ADMIN_RECONSTRUCTION_MODES = new Set([
@@ -14,23 +32,49 @@ const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
 ]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.4";
+  "admin-community-allowance-preview-v0.5";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
-  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview";
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
 const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.3";
 const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
 const ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS = 400;
 const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
 const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
-  Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
-  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
-  Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
-  Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
+  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+  Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.8 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
-  "seven_day_codex_pro10x_equivalent_per_model_composition";
+  "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
+const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
+  [ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION]: Object.freeze({
+    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    plans: ADMIN_ALLOWANCE_PREVIEW_PLANS,
+    modelBasis: ADMIN_ALLOWANCE_MODELS_BASIS,
+  }),
+  "admin-community-allowance-preview-v0.4": Object.freeze({
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+      Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
+    ]),
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  }),
+  "admin-community-allowance-preview-v0.3": Object.freeze({
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+    ]),
+    modelBasis: "seven_day_codex_pro20x_equivalent_per_model_composition",
+  }),
+});
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -214,7 +258,8 @@ function isoTimestamp(value, code) {
 export function projectAdminDatabaseHealth(value) {
   const code = "ADMIN_DATABASE_HEALTH_INVALID";
   const source = record(value, code);
-  if (source.schemaVersion !== "admin-database-health-v0.1") invalid(code);
+  if (!ADMIN_DATABASE_HEALTH_SCHEMA_VERSIONS.has(source.schemaVersion)) invalid(code);
+  const ledgerless = source.schemaVersion === ADMIN_DATABASE_HEALTH_LEDGERLESS_SCHEMA_VERSION;
   const storageMode = enumValue(source.storageMode, new Set(["json", "typed", "unknown"]), code);
   const roles = ["primary", "deletion_ledger", "analytics"];
   const rows = array(source.databases, code);
@@ -225,7 +270,8 @@ export function projectAdminDatabaseHealth(value) {
     const status = enumValue(row.status, new Set([
       "reachable", "unavailable", "timeout", "not_configured", "not_applicable",
     ]), code);
-    const unused = row.role === "analytics" && storageMode === "json";
+    const unused = (row.role === "analytics" && storageMode === "json")
+      || (ledgerless && row.role === "deletion_ledger");
     if ((status === "not_applicable") !== unused) invalid(code);
     if (status !== "reachable" && (row.responseMs !== null || row.databaseBytes !== null)) invalid(code);
     if (status === "reachable" && row.responseMs === null) invalid(code);
@@ -259,6 +305,7 @@ export function projectAdminReconstructionProgress(value) {
   const nullableCount = value => value === null ? null : count(value, code);
   const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
   const candidate = record(value, code);
+  if (candidate.schemaVersion === 4) return projectFullRefreshProgress(candidate, code, closed, nullableTime);
   if (![1, 2, 3].includes(candidate.schemaVersion)) invalid(code);
   // v3 keeps every v2 key and adds `graph`; `preparation` becomes optional
   // there, so a v2 payload relabelled as v3 still fails the closed-key check.
@@ -338,6 +385,68 @@ export function projectAdminReconstructionProgress(value) {
       : {}),
     ...(hasPipeline ? { pipeline: projectPipeline(progress.pipeline, code, closed, nullableTime) } : {}),
   });
+}
+
+/** Full-refresh origin evidence. Unobserved execution and incremental counters
+ * have closed unavailable states; missing cursors and bounded totals are null. */
+function projectFullRefreshProgress(candidate, code, closed, nullableTime) {
+  const nullableCount = value => value === null ? null : count(value, code);
+  const nullableDay = value => value === null ? null : calendarDay(value, code);
+  const unavailable = value => {
+    if (closed(value, ["status"]).status !== "unavailable") invalid(code);
+    return Object.freeze({ status: "unavailable" });
+  };
+  const progress = closed(candidate, ["schemaVersion", "generatedAt", "pipeline", "publication", "work", "history", "graph"]);
+  const pipeline = closed(progress.pipeline, ["ingestion", "delivery", "daily"]);
+  const ingestion = closed(pipeline.ingestion, ["journalHead", "latestRecordedAt", "v12Heads", "v12Days", "pendingActivations"]);
+  const delivery = closed(pipeline.delivery, ["appliedSequence", "pendingChanges", "pendingOwnerActivations", "current"]);
+  const daily = closed(pipeline.daily, ["queuedDays", "oldestQueuedDay", "newestQueuedDay", "lastReleasedAt", "releasedLastHour"]);
+  const publication = closed(progress.publication, ["publishedDays", "latestEvidenceDay", "preview"]);
+  const preview = closed(publication.preview, ["state", "computedAt"]);
+  const work = closed(progress.work, ["currentState", "lastRun", "nextScheduledAt", "scheduleState"]);
+  if (work.currentState !== "unavailable" || work.scheduleState !== "unavailable") invalid(code);
+  let lastRun = null;
+  if (work.lastRun !== null) {
+    const run = closed(work.lastRun, ["state", "startedAt", "finishedAt", "kernelId", "owners", "ownerDays"]);
+    lastRun = Object.freeze({
+      state: enumValue(run.state, new Set(["complete", "failed"]), code),
+      startedAt: nullableTime(run.startedAt), finishedAt: nullableTime(run.finishedAt),
+      kernelId: run.kernelId === null ? null : positiveInteger(run.kernelId, code),
+      owners: count(run.owners, code), ownerDays: count(run.ownerDays, code),
+    });
+    if (lastRun.startedAt === null || lastRun.finishedAt === null || lastRun.finishedAt < lastRun.startedAt) invalid(code);
+  }
+  const projected = Object.freeze({
+    schemaVersion: 4, generatedAt: nullableTime(progress.generatedAt),
+    pipeline: Object.freeze({
+      ingestion: Object.freeze({ journalHead: nullableCount(ingestion.journalHead), latestRecordedAt: nullableTime(ingestion.latestRecordedAt),
+        v12Heads: nullableCount(ingestion.v12Heads), v12Days: nullableCount(ingestion.v12Days), pendingActivations: nullableCount(ingestion.pendingActivations) }),
+      delivery: Object.freeze({ appliedSequence: nullableCount(delivery.appliedSequence), pendingChanges: nullableCount(delivery.pendingChanges),
+        pendingOwnerActivations: nullableCount(delivery.pendingOwnerActivations), current: unavailable(delivery.current) }),
+      daily: Object.freeze({ queuedDays: nullableCount(daily.queuedDays), oldestQueuedDay: nullableDay(daily.oldestQueuedDay),
+        newestQueuedDay: nullableDay(daily.newestQueuedDay), lastReleasedAt: nullableTime(daily.lastReleasedAt), releasedLastHour: count(daily.releasedLastHour, code) }),
+    }),
+    publication: Object.freeze({ publishedDays: count(publication.publishedDays, code), latestEvidenceDay: nullableDay(publication.latestEvidenceDay),
+      preview: Object.freeze({ state: enumValue(preview.state, new Set(["recorded", "unavailable", "not_recorded"]), code), computedAt: nullableTime(preview.computedAt) }) }),
+    work: Object.freeze({ currentState: "unavailable", lastRun, nextScheduledAt: nullableTime(work.nextScheduledAt), scheduleState: "unavailable" }),
+    history: unavailable(progress.history), graph: unavailable(progress.graph),
+  });
+  const { ingestion: head, delivery: sent, daily: queue } = projected.pipeline;
+  const previewRead = projected.publication.preview;
+  if (projected.generatedAt === null || projected.work.nextScheduledAt === null
+      || projected.work.nextScheduledAt <= projected.generatedAt
+      || (head.journalHead === null) !== (head.latestRecordedAt === null)
+      || (sent.appliedSequence !== null && sent.appliedSequence > (head.journalHead ?? 0))
+      || (sent.appliedSequence === null && (sent.pendingChanges !== null || queue.queuedDays !== null))
+      || (sent.pendingChanges === null) !== (sent.pendingOwnerActivations === null)
+      || (sent.pendingChanges === null && queue.queuedDays !== null)
+      || (sent.pendingChanges !== null && sent.pendingOwnerActivations > sent.pendingChanges)
+      || ((queue.queuedDays === null || queue.queuedDays === 0) !== (queue.oldestQueuedDay === null))
+      || (queue.oldestQueuedDay === null) !== (queue.newestQueuedDay === null)
+      || (queue.oldestQueuedDay !== null && queue.oldestQueuedDay > queue.newestQueuedDay)
+      || (projected.publication.publishedDays === 0) !== (projected.publication.latestEvidenceDay === null)
+      || (previewRead.state === "not_recorded") !== (previewRead.computedAt === null)) invalid(code);
+  return projected;
 }
 
 /** Where analytics processing stands, as counts, UTC days and instants only.
@@ -607,19 +716,30 @@ function projectAllowancePreviewSummary(value) {
   });
 }
 
-function projectAllowanceModels(value, latestAllowedDay) {
+function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const models = record(value, code);
-  if (models.basis !== ADMIN_ALLOWANCE_MODELS_BASIS
+  if (models.basis !== modelBasis
       || models.gate !== ADMIN_ALLOWANCE_MODELS_GATE) {
     invalid(code);
   }
-  const modelConfig = array(models.modelConfig, code).map((entry, index) => {
+  const candidates = array(models.modelConfig, code);
+  // Only the exact September 23 predecessor may omit the later GPT-6.1 Sol
+  // catalog entry. A shorter arbitrary roster cannot declare newer coverage.
+  const historicalCatalog = ADMIN_MODEL_HISTORY_CATALOG_VERSION === "reviewed-model-catalog-2026-09-29.1"
+    && ADMIN_ALLOWANCE_PREVIEW_MODELS.length === 43
+    && ADMIN_ALLOWANCE_PREVIEW_MODELS[42]?.modelId === "gpt-6.1-sol"
+    && candidates.length === 42;
+  const expectedModels = historicalCatalog
+    ? ADMIN_ALLOWANCE_PREVIEW_MODELS.slice(0, 42)
+    : ADMIN_ALLOWANCE_PREVIEW_MODELS;
+  const modelConfig = candidates.map((entry, index) => {
     const model = record(entry, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
+    const expected = expectedModels[index];
     if (!expected
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
+        || (historicalCatalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
@@ -628,14 +748,15 @@ function projectAllowanceModels(value, latestAllowedDay) {
     // catalog label without discarding otherwise compatible results.
     return expected;
   });
-  if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
+  if (modelConfig.length !== expectedModels.length) invalid(code);
   let previousDay = "";
   const days = boundedArray(models.days, ADMIN_ALLOWANCE_PREVIEW_DAYS, code).map((entry) => {
     const day = record(entry, code);
     const dayValue = calendarDay(day.day, code);
     if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
     previousDay = dayValue;
-    if (day.catalogVersion === undefined) invalid(code);
+    if (day.catalogVersion === undefined
+        || (historicalCatalog && day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) invalid(code);
     const projected = expandAdminModelHistoryDay(day);
     if (projected === null) invalid(code);
     return projected;
@@ -643,32 +764,41 @@ function projectAllowanceModels(value, latestAllowedDay) {
   if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);
   return Object.freeze({
     modelConfig: Object.freeze(modelConfig),
-    basis: ADMIN_ALLOWANCE_MODELS_BASIS,
+    basis: modelBasis,
     gate: ADMIN_ALLOWANCE_MODELS_GATE,
     days: Object.freeze(days),
   });
 }
 
 /**
- * Fail-closed projection for the owner-only merge trial. The public client does
- * not understand this schema and remains pinned to the published Pro cohort.
+ * Fail-closed projection for the owner-only preview. Version and declared
+ * basis select one exact plan/model contract; published amounts are preserved.
  */
 export function projectAdminAllowancePreview(value) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const preview = record(value, code);
-  if (preview.schemaVersion !== ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
-      || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
+  const contract = Object.hasOwn(ADMIN_ALLOWANCE_PREVIEW_CONTRACTS, preview.schemaVersion)
+    ? ADMIN_ALLOWANCE_PREVIEW_CONTRACTS[preview.schemaVersion] : null;
+  // The v0.3 producer retained its identity when the reviewed span floor
+  // changed. Accept only its two authored qualification/span pairs, without
+  // relabelling the published gate. Later identities use the 25pp gate only.
+  const qualified = (preview.qualification === "shared_reset_fit_gates_25pp_span_floor"
+      && preview.spanFloorPp === 25)
+    || (preview.schemaVersion === "admin-community-allowance-preview-v0.3"
+      && preview.qualification === "shared_reset_fit_gates_40pp_span_floor"
+      && preview.spanFloorPp === 40);
+  if (contract === null
+      || preview.basis !== contract.basis
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
-      || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
-      || preview.spanFloorPp !== 25) {
+      || !qualified) {
     invalid(code);
   }
   const from = calendarDay(preview.from, code);
   const to = calendarDay(preview.to, code);
   const plans = array(preview.plans, code).map((value, index) => {
     const plan = record(value, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_PLANS[index];
+    const expected = contract.plans[index];
     if (!expected
         || plan.planType !== expected.planType
         || plan.label !== expected.label
@@ -677,8 +807,8 @@ export function projectAdminAllowancePreview(value) {
     }
     return expected;
   });
-  if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
-  const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
+  if (plans.length !== contract.plans.length) invalid(code);
+  const expectedPlanKeys = contract.plans
     .map((plan) => plan.planType)
     .sort();
   const days = array(preview.days, code).map((value, index) => {
@@ -696,7 +826,7 @@ export function projectAdminAllowancePreview(value) {
       day: dayValue,
       combined: projectAllowancePreviewSummary(day.combined),
       byPlanType: Object.freeze(Object.fromEntries(
-        ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
+        contract.plans.map((plan) => [
           plan.planType,
           projectAllowancePreviewSummary(byPlanType[plan.planType]),
         ]),
@@ -709,11 +839,11 @@ export function projectAdminAllowancePreview(value) {
     invalid(code);
   }
   return Object.freeze({
-    schemaVersion: ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+    schemaVersion: preview.schemaVersion,
     generatedAt: string(preview.generatedAt, code),
     from,
     to,
-    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    basis: contract.basis,
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
@@ -721,7 +851,7 @@ export function projectAdminAllowancePreview(value) {
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
-    models: projectAllowanceModels(preview.models, to),
+    models: projectAllowanceModels(preview.models, to, contract.modelBasis),
   });
 }
 
@@ -1059,6 +1189,14 @@ function projectDailyPublication(value) {
     ),
   });
 }
+
+/** The closed state of a v0.6 overview block that has no source on the origin. */
+function isUnavailableBlock(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === 1 && value.status === "unavailable";
+}
+
+const UNAVAILABLE_BLOCK = Object.freeze({ status: "unavailable" });
 
 function projectHistoricalPublication(value) {
   if (value === null) return null;
@@ -1806,9 +1944,10 @@ function projectErrors(value) {
  */
 export function projectAdminOverview(value) {
   const overview = record(value, "ADMIN_OVERVIEW_INVALID");
-  if (overview.schemaVersion !== ADMIN_OVERVIEW_SCHEMA_VERSION) {
+  if (!ADMIN_OVERVIEW_SCHEMA_VERSIONS.has(overview.schemaVersion)) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
+  const unavailableAllowed = overview.schemaVersion === ADMIN_OVERVIEW_UNAVAILABLE_SCHEMA_VERSION;
   const service = record(overview.service, "ADMIN_OVERVIEW_INVALID");
   const storageMode = enumValue(service.telemetryStorageMode, new Set(["json", "typed"]), "ADMIN_OVERVIEW_INVALID");
   const typed = storageMode === "typed";
@@ -1838,8 +1977,11 @@ export function projectAdminOverview(value) {
       createdAt: string(item.createdAt, "ADMIN_OVERVIEW_INVALID"),
     });
   });
+  // v0.6 only: a typed origin with no historical source says so explicitly.
   const historicalPublication = typed
-    ? projectHistoricalPublication(overview.historicalPublication)
+    ? unavailableAllowed && isUnavailableBlock(overview.historicalPublication)
+      ? UNAVAILABLE_BLOCK
+      : projectHistoricalPublication(overview.historicalPublication)
     : null;
   if (typed && historicalPublication === null) {
     invalid("ADMIN_OVERVIEW_INVALID");

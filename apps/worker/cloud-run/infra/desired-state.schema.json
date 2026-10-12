@@ -1,0 +1,761 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tibotattle:gcp-ops-infra-desired-state:v2",
+  "title": "TiboTattle GCP infrastructure desired state (v2)",
+  "description": "Editor and review aid for the committed desired-state files. scripts/gcp-ops-infra-manifest.mjs validateDesiredState is authoritative and also enforces the name, plane, budget, secret-material and placeholder rules this schema cannot express; its check holds this schema's closed key sets to DESIRED_STATE_SHAPE.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "environment",
+    "projectTenancy",
+    "project",
+    "projectNumber",
+    "region",
+    "artifactRegistry",
+    "serviceAccounts",
+    "customRole",
+    "secrets",
+    "cloudSql",
+    "bucket",
+    "buildSource",
+    "service",
+    "jobs",
+    "scheduler",
+    "stagingOrigin"
+  ],
+  "allOf": [
+    {
+      "description": "Staging names every CR-3 secret: only production may leave out PRODUCTION_OMITTABLE_SECRET_NAMES.",
+      "if": {
+        "required": [
+          "environment"
+        ],
+        "properties": {
+          "environment": {
+            "const": "staging"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "secrets": {
+            "required": [
+              "DISTRIBUTION_GITHUB_API_TOKEN"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "tibotattle-gcp-ops-infra-desired-state-v2"
+    },
+    "environment": {
+      "enum": [
+        "production",
+        "staging"
+      ]
+    },
+    "projectTenancy": {
+      "enum": [
+        "dedicated",
+        "shared"
+      ],
+      "description": "shared: the plane lives in a project it shares with other resources, which are never managed or removed; production is always dedicated"
+    },
+    "project": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$",
+      "description": "null is an owner placeholder (OWN-5); the validator refuses it"
+    },
+    "projectNumber": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[1-9][0-9]{5,19}$",
+      "description": "null is an owner placeholder (OWN-5)"
+    },
+    "region": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z]+-[a-z]+[0-9]{1,2}$",
+      "description": "null is an owner placeholder (OWN-5)"
+    },
+    "artifactRegistry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "imageName"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "imageName": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+        }
+      }
+    },
+    "serviceAccounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "migrator",
+        "scheduler",
+        "builder",
+        "edgeInvoker",
+        "verifier"
+      ],
+      "properties": {
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "migrator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "scheduler": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "builder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "edgeInvoker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "accountId",
+            "projectRoles"
+          ],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+            },
+            "projectRoles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "verifier": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "accountId",
+                "projectRoles",
+                "tokenCreators"
+              ],
+              "properties": {
+                "accountId": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+                },
+                "projectRoles": {
+                  "type": "array",
+                  "maxItems": 0
+                },
+                "tokenCreators": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 4,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^(?:user|group|serviceAccount):[A-Za-z0-9._%+-]{1,64}@[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.[a-z]{2,}$"
+                      }
+                    }
+                  ],
+                  "description": "Principals granted roles/iam.serviceAccountTokenCreator on the verifier account only (OD-CR-7); null until the owner names the operator"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "customRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "permissions"
+      ],
+      "properties": {
+        "id": {
+          "const": "tibotattleQuarantineStore"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-zA-Z0-9]*(?:\\.[a-zA-Z0-9]+){2}$"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "CR-3's secret names. Production may omit DISTRIBUTION_GITHUB_API_TOKEN because public GitHub inventory needs no credential (PRODUCTION_OMITTABLE_SECRET_NAMES), as the committed file does. A future pinned token mounts only on maintenance; the production service omits it. Staging names every container (the root allOf). Google and Apple sign-in secrets are retired and refused (SECRET_UNKNOWN).",
+      "required": [
+        "IDENTITY_LINK_SECRET",
+        "POSTGRES_RATE_LIMIT_SECRET",
+        "ENVELOPE_PUBLIC_JWK",
+        "ENVELOPE_PRIVATE_JWK"
+      ],
+      "properties": {
+        "IDENTITY_LINK_SECRET": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:IDENTITY_LINK_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "POSTGRES_RATE_LIMIT_SECRET": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:POSTGRES_RATE_LIMIT_SECRET|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "ENVELOPE_PUBLIC_JWK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:ENVELOPE_PUBLIC_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "ENVELOPE_PRIVATE_JWK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:ENVELOPE_PRIVATE_JWK|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        },
+        "DISTRIBUTION_GITHUB_API_TOKEN": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "secretName",
+            "version"
+          ],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "pattern": "^(?:DISTRIBUTION_GITHUB_API_TOKEN|tibotattle-[a-z0-9]+(?:-[a-z0-9]+)*)$",
+              "maxLength": 255,
+              "description": "The Secret Manager secret id, never a value. Production: the variable name or a tibotattle- id; staging: a tibotattle-staging- id"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[1-9][0-9]{0,9}$",
+              "description": "The pinned version number; null until populated"
+            }
+          }
+        }
+      }
+    },
+    "cloudSql": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance",
+        "tier",
+        "storageSizeGb",
+        "backupStartTime",
+        "maxConnections",
+        "database",
+        "schema"
+      ],
+      "properties": {
+        "instance": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,96}[a-z0-9])?$"
+        },
+        "tier": {
+          "type": "string",
+          "pattern": "^db-custom-([1-9][0-9]?)-([1-9][0-9]{2,6})$"
+        },
+        "storageSizeGb": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 65536
+        },
+        "backupStartTime": {
+          "type": "string",
+          "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+        },
+        "maxConnections": {
+          "type": "integer",
+          "minimum": 25,
+          "maximum": 10000
+        },
+        "database": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        },
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+        }
+      }
+    },
+    "bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "location",
+        "proof"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$"
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Z]+-[A-Z]+[0-9]{1,2}$",
+          "description": "The region in upper case; null is an owner placeholder (OWN-5)"
+        },
+        "proof": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "bucketGeneration",
+                "bucketMetageneration"
+              ],
+              "properties": {
+                "bucketGeneration": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,18}$"
+                },
+                "bucketMetageneration": {
+                  "type": "string",
+                  "pattern": "^[1-9][0-9]{0,18}$"
+                }
+              }
+            }
+          ],
+          "description": "The bucket-birth receipt's proof; null until the bucket is born"
+        }
+      }
+    },
+    "buildSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bucket"
+      ],
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]_cloudbuild$",
+          "description": "BUILD-SOURCE: the project's default Cloud Build bucket, always <project>_cloudbuild (the validator refuses any other name: BUILD_SOURCE_BUCKET_NAME_INVALID). OPS-2 binds roles/storage.objectViewer on it for the builder alone (bucket-level, never a project role) and creates it, with uniform bucket-level access and public access prevention enforced, when it is absent; OPS-10's build verb stages its source archive in gs://<bucket>/source"
+        }
+      },
+      "description": "BUILD-SOURCE (scripts/gcp-build-source-bucket.mjs): the bucket only; the builder's role on it is not the desired state's to choose"
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "maxInstances",
+        "rolloutOverlapInstances",
+        "audience",
+        "telemetryStorageNamespace"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+        },
+        "maxInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "rolloutOverlapInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "audience": {
+          "type": "string",
+          "pattern": "^[!-~](?:[ -~]{0,254}[!-~])?$"
+        },
+        "telemetryStorageNamespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._:-]{1,256}$",
+          "description": "The namespace the imported data carries; null until assigned, and the service cannot render without it"
+        }
+      }
+    },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "production-migrate",
+        "analytics-refresh",
+        "maintenance"
+      ],
+      "properties": {
+        "production-migrate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          }
+        },
+        "analytics-refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          }
+        },
+        "maintenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 50
+            }
+          }
+        }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analytics-refresh",
+        "maintenance"
+      ],
+      "properties": {
+        "analytics-refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "schedule",
+            "state"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "schedule": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "Five-field cron in Etc/UTC; null until the owner sets the cadence (D3)"
+            },
+            "state": {
+              "enum": [
+                "PAUSED",
+                "ENABLED"
+              ],
+              "description": "PAUSED until OPS-3 resumes the trigger; apply never resumes"
+            }
+          }
+        },
+        "maintenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "schedule",
+            "state"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "schedule": {
+              "const": "* * * * *",
+              "description": "Pinned to the maintenance job's own cadence (POSTGRES_MAINTENANCE_JOB_SCHEDULE): every minute, as the d43c8f92 Worker cron (owner restored 2026-10-10); any other value, and null, is refused (SCHEDULER_CADENCE_MISMATCH)"
+            },
+            "state": {
+              "enum": [
+                "PAUSED",
+                "ENABLED"
+              ],
+              "description": "PAUSED until OPS-3 resumes the trigger; apply never resumes"
+            }
+          }
+        }
+      }
+    },
+    "stagingOrigin": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "publicOrigin",
+            "accessTeamDomain",
+            "accessAud",
+            "accessAdminEmail",
+            "identityLinkSecretVersion",
+            "admissionMode"
+          ],
+          "properties": {
+            "publicOrigin": {
+              "type": "string",
+              "pattern": "^https://[a-z0-9.-]+$",
+              "description": "The staging edge's public https origin; its host carries the staging token and is never an admin or run.app host"
+            },
+            "accessTeamDomain": {
+              "type": "string",
+              "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.cloudflareaccess\\.com$"
+            },
+            "accessAud": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[a-f0-9]{64}$",
+              "description": "The staging admin Access application's AUD tag; null until the owner creates it, and the service cannot render without it"
+            },
+            "accessAdminEmail": {
+              "type": "string"
+            },
+            "identityLinkSecretVersion": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            },
+            "admissionMode": {
+              "enum": [
+                "closed",
+                "synthetic-rehearsal"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "STG-PREP: the staging service's own non-secret settings; null in production, and in staging until chosen (the service cannot render without them)"
+    }
+  }
+}

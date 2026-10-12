@@ -33,28 +33,50 @@ the schema digest, so exact provider-owned metadata is excluded while a shadow
 object remains visible as drift.
 
 Usage activation requires the common primary forward rows through
-`0008_telemetry_v12.sql` and the final typed v1/v1.1 and successor usage
-objects. The independent `0009_performance_reports.sql` migration, performance
-tables, and histogram bucket checks may be absent or remain staged. Performance
-activation requires the complete primary prefix through `0009`, the exact
-`0013_performance_ultrafast.sql` ledger pin, every pinned performance object,
-and the exact report bucket and measurement checks. The additional migration
-SHA-256 is `88ac498493c869009e322e029ccff805236afd8d08ef299c39a3befda72d4aad`;
+`0008_telemetry_v12.sql`, the exact
+`0013_v12_quarantine_admission.sql` ledger pin and
+`telemetry_v12_chunk_quarantine_admission` trigger, and the final typed v1/v1.1
+and successor usage objects. The usage gate does not inspect the independent
+performance tables or histogram bucket contract; the performance runtime may
+remain staged.
+
+Performance activation requires the complete primary prefix through `0009`,
+the exact `0013_performance_ultrafast.sql` ledger pin, every pinned performance
+object, and the exact report bucket and measurement checks. The additional
+migration SHA-256 is
+`88ac498493c869009e322e029ccff805236afd8d08ef299c39a3befda72d4aad`;
 required objects include `telemetry_performance_cohort_dictionary_insert` and
 `telemetry_performance_cohort_dictionary_update`. Missing or changed migration
 evidence or either missing trigger refuses performance activation without
 blocking independent usage activation. Both targets require typed storage,
-the same valid source namespace for v1 and v1.1,
-and enabled upload registration and processing controls.
+the same valid source namespace for v1 and v1.1, and enabled upload
+registration and processing controls.
 
-Migration `0013` preserves the runtime state and advances its existing
-`policy_revision` by one. A fresh staged fixture advances from 1 to 2 before
+Migration application and runtime activation are separate gates. The ordered
+D1 stream places `0009_performance_reports.sql`,
+`0010_accountless_v12_renewal.sql`, `0011_v12_public_eligibility.sql`,
+`0012_v12_empty_day_manifests.sql` and `0013_performance_ultrafast.sql` before
+`0013_v12_quarantine_admission.sql`; applying that complete stream does not
+activate performance. The two reviewed `0013` migrations retain their original
+full bare filenames as D1 ledger identities and their pinned bytes; the numeric
+prefix alone is not a migration identity. This is the only permitted prefix
+collision. A source sequence check does not prove that either migration has
+executed in the production ledger.
+
+The historical existing-role operator described in the production runbook is source-pinned through `0009`; it applies none of the
+later rows. Later forward application requires its own owner-authorized,
+reviewed plan, rehearsal and receipt before activation. The
+[v1.2 public eligibility plan](../plans/2026-09-25-v12-public-eligibility.md)
+records the separate accountless renewal, eligibility and empty-day work.
+
+Migration `0013_performance_ultrafast.sql` preserves the runtime state and
+advances its existing `policy_revision` by one. A fresh staged fixture advances from 1 to 2 before
 activation, then activation advances 2 to 3; these are synthetic fixture values,
 not revisions to assume for an existing environment. Already-active rows remain
 active. Historical September 21 reports and grants remain retained, while new September 29
 dictionary writes require matching new authorization. The historical forward
-operator retains its closed pins through `0009`; applying `0013` therefore needs
-a reviewed environment-specific migration plan and rehearsal before using this
+operator retains its closed pins through `0009`; applying the later migrations
+therefore needs a reviewed environment-specific migration plan and rehearsal before using this
 activation sequence. Do not broaden those operator pins as an implicit upgrade.
 
 The runtime row must still be `staged`. Record its current `policy_revision`

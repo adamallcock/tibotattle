@@ -1,0 +1,86 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-run-cost-v1",
+ "note": "wall-clock measurements of this run on its host; not reproducible and never compared",
+ "runtime": {
+  "node": "v26.2.0",
+  "sqlite": "3.53.1",
+  "adapter": "cloud-run/sealed-sqlite-d1-adapter.mjs"
+ },
+ "seedMs": 135390,
+ "tierN": {
+  "ticks": 185,
+  "elapsedMs": 4819139,
+  "laneMs": {
+   "analytics": 1413344,
+   "publication": 3235207,
+   "cache": 167462
+  },
+  "laneStats": {
+   "storage_analytics_schedule:progress:step_limit": 306,
+   "storage_analytics_long_schedule:deferred:query_budget": 36,
+   "storage_analytics_schedule:deferred:query_budget": 27,
+   "storage_analytics_schedule:idle:complete": 1
+  },
+  "slowestLane": {
+   "ms": 16726,
+   "tick": 152,
+   "lane": "analytics"
+  },
+  "publicationPasses": 4,
+  "resumedFrom": "a prior run of the same corpus and cadence (--resume)"
+ },
+ "direct": {
+  "total": {
+   "ms": 4147432,
+   "jobs": 12,
+   "statements": 3276985,
+   "steps": 227110,
+   "taskMs": 46701583
+  },
+  "owners": {
+   "a": {
+    "ms": 1062661,
+    "fitsMs": 15179,
+    "maxModelMs": 16939
+   },
+   "b": {
+    "ms": 988393,
+    "fitsMs": 8963,
+    "maxModelMs": 16767
+   },
+   "c": {
+    "ms": 750008,
+    "fitsMs": 10662,
+    "maxModelMs": 12276
+   },
+   "d": {
+    "ms": 1036880,
+    "fitsMs": 15096,
+    "maxModelMs": 18960
+   },
+   "e": {
+    "ms": 42863641,
+    "fitsMs": 1319309,
+    "maxModelMs": 1310235
+   }
+  }
+ },
+ "cache": {
+  "settledLaneMs": {
+   "enabled": 155666,
+   "disabled": 121110
+  },
+  "reference": {
+   "ms": 636005,
+   "jobs": 12,
+   "tasks": 850,
+   "taskMs": 7413401
+  }
+ },
+ "windowRoutingNote": "window routing time is in oracle.log (window-routing)",
+ "tierF": {
+  "scope": "none",
+  "total": null,
+  "owners": {}
+ }
+}

@@ -13,6 +13,7 @@ import {
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import {
   persistTelemetryV12StagedChunk,
   registerTelemetryV12DayManifest,
@@ -132,9 +133,17 @@ async function uploadDay(
     const claimed = await claimDeviceUploadAuthorization(db(), "Upload " + upload.uploadAuthorization, {
       envelopeDigest, bodyBytes: 4096, contentType: "application/json",
     });
+    const chunkRowId = "chunk:" + crypto.randomUUID();
+    const r2Key = "telemetry/v12-reader/" + crypto.randomUUID();
+    await putTrackedQuarantineObject(db(), bindings.QUARANTINE, {
+      contributionId: chunkRowId,
+      objectKind: "telemetry",
+      r2Key,
+      registeredAt: new Date().toISOString(),
+    }, "synthetic v1.2 bytes");
     await persistTelemetryV12StagedChunk(db(), fixture, chunk, {
-      chunkRowId: "chunk:" + crypto.randomUUID(), r2Key: "synthetic/v12-reader/" + crypto.randomUUID(),
-      envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
+      chunkRowId, r2Key, envelopeDigest,
+      deviceUploadAuthorizationId: claimed.authorizationId,
     });
   }
   return { manifestId: candidate.manifestId, manifestDigest: manifest.manifestDigest };

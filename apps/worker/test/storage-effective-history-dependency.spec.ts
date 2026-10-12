@@ -23,6 +23,7 @@ import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggr
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import { registerTelemetryV11DayManifest } from "../src/telemetry-v11-repository";
 import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
 import { canonicalJson } from "../src/canonical-json";
 import { sha256Hex } from "../src/crypto";
@@ -143,10 +144,17 @@ async function stageV12Day(fixture: Fixture, observedDay: string,
   const claimed = await claimDeviceUploadAuthorization(db(), `Upload ${upload.uploadAuthorization}`, {
     envelopeDigest, bodyBytes: 4096, contentType: "application/json",
   });
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = `telemetry/effective-history-v12/${crypto.randomUUID()}`;
+  await putTrackedQuarantineObject(db(), b.QUARANTINE, {
+    contributionId: chunkRowId,
+    objectKind: "telemetry",
+    r2Key,
+    registeredAt: new Date().toISOString(),
+  }, "synthetic v1.2 bytes");
   await persistTelemetryV12StagedChunk(db(), fixture, chunk, {
-    chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: `synthetic/effective-history-v12/${crypto.randomUUID()}`,
-    envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
+    chunkRowId, r2Key, envelopeDigest,
+    deviceUploadAuthorizationId: claimed.authorizationId,
   });
   return registerTelemetryV12DayManifest(db(), fixture, manifest);
 }

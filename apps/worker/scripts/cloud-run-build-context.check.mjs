@@ -1,0 +1,99 @@
+/** Actual local build-context regression; no Docker, service, database or network. */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, realpath, cp, readFile, access, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const WORKER = resolve(import.meta.dirname, "..");
+const NODE = process.execPath;
+const invoke = (args, cwd) => spawnSync(NODE, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 1024 * 1024 });
+
+test("generated context carries profiler and reprice runtime closure, excludes fixtures and builds all actual entries", { timeout: 90_000 }, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "tibotattle-profiler-context-check-")));
+  const output = join(root, "context"), cloud = join(output, "apps/worker/cloud-run");
+  try {
+    const generated = invoke([join(WORKER, "scripts/cloud-run-build-context.mjs"), `--output=${output}`], WORKER);
+    assert.equal(generated.status, 0, generated.stderr);
+    const receipt = JSON.parse(generated.stdout);
+    assert.equal(receipt.mode, "create");
+    assert.equal(receipt.primaryMigrations, 78);
+    assert.deepEqual(await readFile(join(output, "apps/worker/catalog/manifest-0001.json")),
+      await readFile(join(WORKER, "catalog/manifest-0001.json")));
+    await assert.rejects(access(join(output, "apps/worker/catalog/manifest-0002.json")), { code: "ENOENT" });
+    const runtime = ["analytics-refresh-profile.mjs", "analytics-refresh-worker-profile.mjs", "analytics-refresh-allocation-profile.mjs", "analytics-refresh-memory-profile.mjs", "analytics-reprice.mjs"];
+    for (const name of runtime) assert.deepEqual(await readFile(join(cloud, name)), await readFile(join(WORKER, "cloud-run", name)), name);
+    const fixtures = ["analytics-refresh-profile.check.mjs", "analytics-refresh-worker-profile.check.mjs", "analytics-refresh-allocation-profile.check.mjs",
+      "analytics-refresh-allocation-conformance.mjs", "analytics-refresh-memory-profile.check.mjs", "analytics-refresh-allocation-integration.check.mjs", "analytics-reprice.check.mjs"];
+    for (const name of fixtures) await assert.rejects(access(join(cloud, name)), { code: "ENOENT" });
+    const { readWorkerProfileSettings } = await import(pathToFileURL(join(cloud, "analytics-refresh-worker-profile.mjs")));
+    for (const mode of [null, "ALLOCATION", "MEMORY"]) {
+      const env = { ANALYTICS_V2_LOCAL_WORKER_PROFILE_DIR: join(root, "never-created"), ANALYTICS_V2_LOCAL_WORKER_PROFILE_SOURCE: "a".repeat(40),
+        ...(mode === null ? {} : { [`ANALYTICS_V2_LOCAL_WORKER_PROFILE_${mode}`]: "1" }) };
+      for (const target of ["production", "staging"]) assert.throws(() => readWorkerProfileSettings(env, { target }), { code: "WORKER_PROFILE_FORBIDDEN" });
+      assert.throws(() => readWorkerProfileSettings({ ...env, CLOUD_RUN_JOB: "synthetic-job" }), { code: "WORKER_PROFILE_FORBIDDEN" });
+    }
+    // Dependencies are existing local installed copies, never downloaded or added to the audited source inventory.
+    await cp(join(WORKER, "cloud-run/node_modules"), join(cloud, "node_modules"), { recursive: true, verbatimSymlinks: true });
+    // Match Dockerfile build-stage resolution from /app/node_modules.
+    await symlink(join(cloud, "node_modules"), join(output, "node_modules"), "dir");
+    const built = invoke(["build.mjs"], cloud);
+    assert.equal(built.status, 0, built.stderr);
+    const entries = ["server", "oauth-gateway", "test-migrations", "test-activation", "postgres-community-graph-benchmark",
+      "postgres-community-graph-readback-diagnostic", "analytics-refresh", "analytics-refresh-worker", "analytics-reprice", "production-migrations",
+      "postgres-maintenance-job", "ops-runtime-probe-job", "ops-backup-audit-job"];
+    for (const name of entries) assert.ok((await readFile(join(cloud, "dist", `${name}.mjs`))).length > 0, name);
+    // Bundling an imported CLI must not also run its main function. Compare exact
+    // output, so refresh help plus reprice help cannot pass on exit status alone.
+    for (const [name, usage] of [["analytics-refresh", "ANALYTICS_REFRESH_USAGE"],
+      ["analytics-reprice", "ANALYTICS_REPRICE_USAGE"]]) {
+      const source = await import(pathToFileURL(join(cloud, `${name}.mjs`)));
+      const help = invoke([`dist/${name}.mjs`, "--help"], cloud);
+      assert.equal(help.status, 0, help.stderr);
+      assert.equal(help.stdout, source[usage], name);
+      assert.equal(help.stderr, "", name);
+    }
+    // Exercise the Docker RUN's actual built CLI and validation, not just its
+    // loader. The production /app root remains pinned. This local-only adapter
+    // maps precisely its migration reads to the actual generated context.
+    const imagePathAdapter = join(root, "image-migration-path-adapter.mjs");
+    const imageMigrationRoot = "/app/apps/worker/postgres/migrations";
+    await writeFile(imagePathAdapter, `import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const imageRoot = ${JSON.stringify(imageMigrationRoot)};
+const localRoot = ${JSON.stringify(join(output, "apps/worker/postgres/migrations"))};
+const mapped = path => typeof path === "string" && (path === imageRoot || path.startsWith(imageRoot + "/"))
+  ? localRoot + path.slice(imageRoot.length) : path;
+for (const name of ["lstat", "readdir", "readFile"]) {
+  const original = fs[name];
+  fs[name] = (path, ...args) => original(mapped(path), ...args);
+}
+syncBuiltinESMExports();
+`, { flag: "wx" });
+    const checked = invoke(["--import", imagePathAdapter, "dist/postgres-community-graph-benchmark.mjs", "--check-source"], cloud);
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.equal(checked.stderr, "");
+    const sourceCheck = JSON.parse(checked.stdout);
+    assert.deepEqual(Object.keys(sourceCheck).sort(), ["schemaVersion", "status", "migrationCount", "migrationTail", "migrationDigest"].sort());
+    assert.equal(sourceCheck.schemaVersion, "postgres-community-graph-cloud-run-benchmark-build-check-v1");
+    assert.equal(sourceCheck.status, "ok");
+    assert.equal(sourceCheck.migrationCount, 78);
+    assert.equal(sourceCheck.migrationTail, "0078_classification_link_lookup_indexes.sql");
+    assert.match(sourceCheck.migrationDigest, /^[0-9a-f]{64}$/u);
+    const dockerfile = await readFile(join(cloud, "Dockerfile"), "utf8");
+    for (const name of entries) assert.ok(dockerfile.includes(`test -s dist/${name}.mjs`), `${name} is required by Docker RUN`);
+    const benchmark = await import(pathToFileURL(join(cloud, "dist/postgres-community-graph-benchmark.mjs")));
+    const { readPostgresMigrations } = await import(pathToFileURL(join(output, "apps/worker/scripts/postgres-migrations.mjs")));
+    const migrations = await benchmark.readPostgresCommunityGraphBenchmarkMigrations({
+      readMigrations: ({ role }) => readPostgresMigrations({ role, rootDirectory: join(output, "apps/worker/postgres/migrations") }),
+    });
+    assert.equal(migrations.length, 78);
+    assert.equal(migrations.at(-2).name, "0077_analytics_v2_reprice.sql");
+    assert.equal(migrations.at(-1).name, "0078_classification_link_lookup_indexes.sql");
+    console.log(JSON.stringify({ contextFiles: receipt.fileCount, sourceContentDigest: receipt.sourceContentDigest,
+      runtimeFiles: runtime.length, excludedFixtures: fixtures.length, builtEntries: entries.length,
+      diagnosticCloudRefusal: true, actualContextBuild: true, actualBuiltMigrationSourceCheck: sourceCheck }));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

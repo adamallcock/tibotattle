@@ -70,8 +70,12 @@ function adminHistoryExactKeys(value, keys) {
     && actual.every((key, index) => key === expected[index]);
 }
 
+// Resource bound: at most 14 decimal digits in the bounded 70-day preview.
+// This is a wire-size ceiling, not a population estimate or a clamping rule.
+const ADMIN_PREVIEW_COUNT_MAX = 99_999_999_999_999;
+
 function adminHistoryCount(value) {
-  return Number.isSafeInteger(value) && value >= 0;
+  return Number.isSafeInteger(value) && value >= 0 && value <= ADMIN_PREVIEW_COUNT_MAX;
 }
 
 function adminHistoryDay(value) {

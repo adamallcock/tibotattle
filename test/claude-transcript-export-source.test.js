@@ -349,6 +349,50 @@ test("Claude transcript frozen prefixes ignore later complete appends and reject
   }
 });
 
+test("Claude transcript export skips and counts oversized lines that cannot carry usage, and refuses oversized usage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-transcript-oversized-"));
+  const limits = { maximumLineBytes: 4096 };
+  try {
+    // A tool result far over the line limit whose text quotes "usage": inside a
+    // JSON string the quotes are escaped, so it cannot be a usage key.
+    const quiet = JSON.stringify({ type: "user", timestamp: "2026-07-24T12:11:00.000Z", message: {
+      content: [{ type: "tool_result", content: `"usage" ${PRIVATE.repeat(300)}` }] } });
+    assert.ok(Buffer.byteLength(quiet) > limits.maximumLineBytes);
+    await writeFile(join(root, "mixed.jsonl"), `${JSON.stringify(assistant("2026-07-24T12:10:00.000Z"))}\n${quiet}\n${
+      JSON.stringify(assistant("2026-07-24T12:12:00.000Z"))}\n`);
+    const planGuard = guard(limits);
+    const plan = await createClaudeTranscriptExportSourcePlan({
+      projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET, resourceGuard: planGuard,
+    });
+    assert.equal(planGuard.snapshot().counters.oversizedIrrelevantLines, 1);
+    const [source] = plan.sources;
+    const scanGuard = guard(limits);
+    const scanned = await scanClaudeTranscriptExportSource(plan, source.sourceKey, {
+      secret: SECRET,
+      cursor: createClaudeTranscriptExportCursor(plan, source.sourceKey, { secret: SECRET }),
+      maximumCandidateRecords: 10,
+      resourceGuard: scanGuard,
+    });
+    assert.equal(scanned.complete, true);
+    assert.equal(scanned.candidates.length, 2, "both usage rows around the skipped line are exported");
+    assert.equal(scanGuard.snapshot().counters.oversizedIrrelevantLines, 1);
+    assert.equal(JSON.stringify(scanned).includes(PRIVATE), false);
+
+    // An oversized line that can carry usage still fails closed at the limit.
+    const heavy = assistant("2026-07-24T12:13:00.000Z");
+    heavy.message.content[1].text = PRIVATE.repeat(300);
+    await writeFile(join(root, "heavy.jsonl"), `${JSON.stringify(heavy)}\n`);
+    await assert.rejects(
+      createClaudeTranscriptExportSourcePlan({
+        projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET, resourceGuard: guard(limits),
+      }),
+      (error) => error.code === "export_resource_line_bytes",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Claude transcript planning rejects hard links and oversized unterminated structured lines", async () => {
   const linked = await fixture();
   try {

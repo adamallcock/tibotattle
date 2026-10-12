@@ -1,0 +1,26 @@
+{
+  // E12 local end-to-end: the bundle-only config for the edge entry.
+  //
+  // edge-bundle.mjs passes this to `wrangler deploy --dry-run --outdir`, so
+  // wrangler builds the module the production edge deploys (src/edge-entry.ts)
+  // and uploads nothing. It names no account, no route, no custom domain and
+  // no binding: edge-instances.mjs supplies every binding to Miniflare per
+  // instance. compatibility_date and compatibility_flags are copied from
+  // ../../wrangler.jsonc, and harness.check.mjs fails if they drift. The
+  // Durable Object class is declared so the bundle keeps the
+  // UploadIngressBudget export the worker-mode reference binds.
+  "name": "app-usagemonitor-edge-e2e",
+  "main": "../../src/edge-entry.ts",
+  "compatibility_date": "2026-07-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [
+      { "name": "UPLOAD_INGRESS_BUDGET", "class_name": "UploadIngressBudget" }
+    ]
+  },
+  "migrations": [
+    { "tag": "upload-ingress-budget-v1", "new_sqlite_classes": ["UploadIngressBudget"] }
+  ]
+}

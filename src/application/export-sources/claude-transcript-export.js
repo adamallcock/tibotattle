@@ -32,6 +32,14 @@ const CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION = "claude-transcript-plan-checkp
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const MAXIMUM_SESSION_ID_BYTES = 4096;
+// A line over the line limit can matter only if it can become a usage row:
+// rowIdentity keeps assistant records whose message carries `usage`. JSON
+// escapes every quote inside a string, so the unescaped `"usage"` token
+// appears only as a key (or a bare "usage" value). A line without it cannot
+// produce a row; the bounded reader skips it and the resource guard counts it
+// as an oversized irrelevant line instead of failing the whole export. A line
+// that may carry usage still fails closed at the limit.
+const OVERSIZED_RELEVANCE_NEEDLES = Object.freeze(['"usage"']);
 const SAFE_CODES = new Set([
   "configuration", "root_unsafe", "source_unsafe", "source_changed", "source_prefix",
   "source_bound", "plan_invalid", "cursor_invalid", "record_invalid",
@@ -566,7 +574,7 @@ async function canonicalSelections(sources, bounds, secret, resourceGuard) {
           maximumTotalBytes: source.prefixBytes,
           startByte: 0,
           startLineOrdinal: 1,
-          oversizedIrrelevantNeedles: ["{"],
+          oversizedIrrelevantNeedles: OVERSIZED_RELEVANCE_NEEDLES,
           resourceGuard,
         })) {
           prefixLineCounts.set(source.sourceKey, entry.lineOrdinal);
@@ -1026,7 +1034,7 @@ async function scanClaudeTranscriptExportSource(plan, sourceKeyValue, {
         maximumTotalBytes: source.prefixBytes,
         startByte: next.nextByte,
         startLineOrdinal: next.nextLineOrdinal,
-        oversizedIrrelevantNeedles: ["{"],
+        oversizedIrrelevantNeedles: OVERSIZED_RELEVANCE_NEEDLES,
         resourceGuard,
       })) {
         const selection = selections.get(entry.lineOrdinal);

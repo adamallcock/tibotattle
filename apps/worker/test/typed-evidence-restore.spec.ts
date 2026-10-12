@@ -20,6 +20,7 @@ import { registerTelemetryV12DayManifest, persistTelemetryV12StagedChunk } from 
 import { admitTelemetryPerformanceReport, readTelemetryPerformanceReports } from "../src/telemetry-performance-repository";
 import { initializeStorageAnalyticsRuntime } from "../src/storage-analytics-runtime";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 interface Bindings extends Env {
   STORAGE_ANALYTICS_DB: D1Database;
   TEST_ANALYTICS_MIGRATIONS: D1Migration[];
@@ -177,8 +178,17 @@ async function seedSuccessorStreams() {
   const upload = await createDeviceUploadAuthorization(source(), principal, envelopeDigest, 22);
   const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
     { envelopeDigest, bodyBytes: 22, contentType: "application/json" });
-  await persistTelemetryV12StagedChunk(source(), fixture, chunk, { chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: "synthetic/typed-restore-v12", envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
+  const chunkRowId = `chunk:${crypto.randomUUID()}`;
+  const r2Key = "telemetry/synthetic-typed-restore-v12";
+  await putTrackedQuarantineObject(source(), bindings.QUARANTINE, {
+    contributionId: chunkRowId,
+    objectKind: "telemetry",
+    r2Key,
+    registeredAt: new Date().toISOString(),
+  }, "synthetic v1.2 bytes");
+  await persistTelemetryV12StagedChunk(source(), fixture, chunk, {
+    chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId,
+  });
   await source().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
   await source().prepare(`INSERT INTO telemetry_performance_device_capabilities (
     participant_id, device_id, schema_version, field_dictionary_version, privacy_contract_version,
@@ -244,14 +254,14 @@ it("typed snapshot preserves dictionary ids, active correction facts and source 
   Reflect.set(runtime, "TELEMETRY_STORAGE_MODE", "typed");
   Reflect.set(runtime, "TELEMETRY_STORAGE_NAMESPACE", sourceNamespace);
   Reflect.set(runtime, "ANALYTICS_DB", bindings.STORAGE_ANALYTICS_DB);
-  await bindings.QUARANTINE.put("synthetic/typed-restore-v12", "synthetic ciphertext");
+  await bindings.QUARANTINE.put("telemetry/synthetic-typed-restore-v12", "synthetic ciphertext");
   for (const participantId of [fact.participantId, successor.fixture.participantId]) {
     expect(await eraseParticipantAsOwner(runtime, "synthetic-admin", participantId)).toMatchObject({ deleted: true });
   }
   expect(await target().prepare("SELECT count(*) n FROM telemetry_usage_correction_history").first("n")).toBe(0);
   expect(await target().prepare("SELECT count(*) n FROM telemetry_v12_records").first("n")).toBe(0);
   expect(await target().prepare("SELECT count(*) n FROM telemetry_performance_reports").first("n")).toBe(0);
-  expect(await bindings.QUARANTINE.head("synthetic/typed-restore-v12")).toBeNull();
+  expect(await bindings.QUARANTINE.head("telemetry/synthetic-typed-restore-v12")).toBeNull();
   await expect(registerTelemetryV12DayManifest(target(), successor.fixture, successor.manifest)).rejects.toThrow();
   await expect(admitTelemetryPerformanceReport(target(), successor.fixture, successor.report, successor.authorization, "d".repeat(64))).rejects.toThrow();
 }, 120_000);

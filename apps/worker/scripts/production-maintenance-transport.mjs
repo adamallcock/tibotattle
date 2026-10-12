@@ -25,7 +25,7 @@ export function createMaintenanceTransport({plan,operationDirectory,cliPath,fetc
     try{while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>2_000_000)fail('RESPONSE_TOO_LARGE');parts.push(value);}}finally{await reader.cancel().catch(()=>{});}
     return Buffer.concat(parts);
   };
-  const api=async(path,body,{mutation=false}={})=>{
+  const read=async(path,body,{mutation=false,deploymentLimit=null}={})=>{
     if(typeof mutation!=='boolean'||mutation&&!body)fail('REQUEST_INVALID');
     if(typeof token!=='string'||token.length<16)fail('CREDENTIAL_REQUIRED');
     if(++requests>600||!path.startsWith(account+'/'))fail('READ_BUDGET');
@@ -34,9 +34,31 @@ export function createMaintenanceTransport({plan,operationDirectory,cliPath,fetc
     await receipt({kind:'provider-read',method:body?(mutation?'POST_WRITE_QUERY':'POST_READ_QUERY'):'GET',pathSha256:hash(path),status:response.status,bytes:bytes.length,sha256:hash(bytes)});
     let json;try{json=JSON.parse(bytes);}catch{fail('RESPONSE_INVALID');}
     if(!response.ok||json.success!==true)fail('READ_REFUSED');
+    if(deploymentLimit!==null){
+      const rows=json.result?.deployments, info=json.result_info;
+      if(!Array.isArray(rows)||rows.length>deploymentLimit)fail('DEPLOYMENT_PAGE_INVALID');
+      // A first-page claim must carry coherent pagination evidence.
+      {
+        if(!info||typeof info!=='object'||Array.isArray(info)||info.page!==1||info.per_page!==deploymentLimit
+          ||!Number.isSafeInteger(info.count)||info.count!==rows.length
+          ||!Number.isSafeInteger(info.total_count)||info.total_count<info.count
+          ||!Number.isSafeInteger(info.total_pages)||info.total_pages<0
+          ||(info.total_pages!==Math.ceil(info.total_count/deploymentLimit)&&!(info.total_count===0&&info.total_pages===1))
+          ||info.cursor||info.has_more!==undefined)fail('DEPLOYMENT_PAGE_INVALID');
+        if(rows.length!==Math.min(deploymentLimit,info.total_count))fail('DEPLOYMENT_PAGE_INVALID');
+      }
+      return json.result;
+    }
     if(json.result_info?.total_pages>1||json.result_info?.has_more===true||json.result_info?.cursor||Number.isSafeInteger(json.result_info?.total_count)&&Number.isSafeInteger(json.result_info?.count)&&json.result_info.total_count>json.result_info.count)fail('INVENTORY_UNBOUNDED');
     return json.result;
   };
+  // Only this closed endpoint may read an authoritative newest prefix.
+  // Account scripts/queues and all other callers retain complete-inventory refusal.
+  const deploymentPage=async(scriptName,limit)=>{
+    if(typeof scriptName!=='string'||! /^[A-Za-z0-9_-]{1,63}$/.test(scriptName)||![1,25].includes(limit))fail('REQUEST_INVALID');
+    return read(`${account}/workers/scripts/${scriptName}/deployments?page=1&per_page=${limit}`,undefined,{deploymentLimit:limit});
+  };
+  const api=(path,body,options)=>read(path,body,options&&{mutation:options.mutation});
   const publicRead=async url=>{let response;try{response=await fetcher(url,{redirect:'manual',signal:AbortSignal.timeout(20000),headers:{'cache-control':'no-cache'}});}catch{fail('PUBLIC_READ_FAILED');}const bytes=await responseBytes(response);return {response,bytes};};
   const run=async({step,args,config,directory,dry=false})=>{
     validation.verifyCli(cliPath,plan.wranglerSha256);
@@ -50,5 +72,5 @@ export function createMaintenanceTransport({plan,operationDirectory,cliPath,fetc
     if(r.error||r.status!==0)fail('COMMAND_UNCERTAIN');
     return {};
   };
-  return {api,receipt,publicRead,run};
+  return {api,deploymentPage,receipt,publicRead,run};
 }

@@ -1,0 +1,186 @@
+{
+  "commit": "d43c8f92",
+  "note": "git blob ids at d43c8f92 of the production code and D1 schema the IN-3 legacy admission oracle runs (local path relative to apps/worker -> production path). postgres-legacy-contribution-admission.spec.mjs refuses any drift.",
+  "sources": {
+    "src/typed-v1-admission.ts": {
+      "production": "apps/worker/src/typed-v1-admission.ts",
+      "blob": "db661dd4b7004bfad7bd5b3e78affb1c5ff7fb0a"
+    },
+    "src/telemetry-v1-repository.ts": {
+      "production": "apps/worker/src/telemetry-v1-repository.ts",
+      "blob": "ce812ccdf34461849ae3a28126b0458a512dce36"
+    },
+    "src/typed-telemetry-repository.ts": {
+      "production": "apps/worker/src/typed-telemetry-repository.ts",
+      "blob": "2d0ad5621b7b9e982085fdcd309f43f9e93c7d96"
+    },
+    "src/telemetry-v1.ts": {
+      "production": "apps/worker/src/telemetry-v1.ts",
+      "blob": "62eabd530b9fad9712808d79de90f3ca28b02e17"
+    },
+    "src/telemetry-transport-policy.ts": {
+      "production": "apps/worker/src/telemetry-transport-policy.ts",
+      "blob": "5bad30d1e1c71233bc5d4c56975b90307ca53141"
+    },
+    "src/telemetry-repository.ts": {
+      "production": "apps/worker/src/telemetry-repository.ts",
+      "blob": "3296a1b422b9ea21b326f79c9f9fb1488d0fa86c"
+    },
+    "src/telemetry-validation.ts": {
+      "production": "apps/worker/src/telemetry-validation.ts",
+      "blob": "5311dd7d1691f7a53765f697413bcc64b05f08cb"
+    },
+    "src/server-pricing.ts": {
+      "production": "apps/worker/src/server-pricing.ts",
+      "blob": "19c42635234bc3a1f5bfb27ae1e813b6900bc4a7"
+    },
+    "src/device-auth.ts": {
+      "production": "apps/worker/src/device-auth.ts",
+      "blob": "b21ad7007f4377dab496d39af3369cab7a86ae9d"
+    },
+    "src/telemetry-storage-mode.ts": {
+      "production": "apps/worker/src/telemetry-storage-mode.ts",
+      "blob": "fe5799b01406bf969460268b26b156e590be9ee2"
+    },
+    "src/telemetry-usage-correction-repository.ts": {
+      "production": "apps/worker/src/telemetry-usage-correction-repository.ts",
+      "blob": "d9daf8a0bc6c6b6adda8774d183370cd17f54517"
+    },
+    "src/telemetry-usage-reconciliation.ts": {
+      "production": "apps/worker/src/telemetry-usage-reconciliation.ts",
+      "blob": "bd511909d1fe7122e088f639acee4d8cf2eba723"
+    },
+    "src/strict-json.ts": {
+      "production": "apps/worker/src/strict-json.ts",
+      "blob": "13cfb22c057c07d2394717922d59569ee1d508e1"
+    },
+    "migrations/0014_bounded_contribution_admission.sql": {
+      "production": "apps/worker/migrations/0014_bounded_contribution_admission.sql",
+      "blob": "040e6aef1d44dab8a5f0c8e2ca06a12f5ffb4953"
+    },
+    "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql": {
+      "production": "apps/worker/typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
+      "blob": "3e71132d54d2f3af3a75a2f0fcde729c9ba7f306"
+    },
+    "ingestion-isolation-migrations/0003_v1_append_classification.sql": {
+      "production": "apps/worker/ingestion-isolation-migrations/0003_v1_append_classification.sql",
+      "blob": "14902b62b254a8ea8dbbce8ecd00d58eba1bdaf2"
+    },
+    "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql": {
+      "production": "apps/worker/ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
+      "blob": "9e606cbd6a64f724b4326cb581eb685d5e2f2e9d"
+    },
+    "ingestion-isolation-migrations/0006_usage_correction_facts.sql": {
+      "production": "apps/worker/ingestion-isolation-migrations/0006_usage_correction_facts.sql",
+      "blob": "aa8fa3aa2da5c90106ff448e36ab2cadb859681f"
+    },
+    "typed-ingestion-migrations/0001_typed_telemetry.sql": {
+      "production": "apps/worker/typed-ingestion-migrations/0001_typed_telemetry.sql",
+      "blob": "e6c938446cbdf2d6394696a04106d3529a622254"
+    },
+    "typed-ingestion-migrations/0002_delivery_journal.sql": {
+      "production": "apps/worker/typed-ingestion-migrations/0002_delivery_journal.sql",
+      "blob": "6adfcec59fd285cf270e8c1d607cd8f0ed869f44"
+    },
+    "node_modules/@app-usagemonitor/accounting/index.js": {
+      "production": "packages/accounting/index.js",
+      "blob": "fd2f4365a843da7c609ae8e1ef1cb118ba710b5b"
+    },
+    "node_modules/@app-usagemonitor/accounting/src/cost-ledger.js": {
+      "production": "packages/accounting/src/cost-ledger.js",
+      "blob": "5a500675260c9ca79c9f8148bc38886e435f114a"
+    },
+    "node_modules/@app-usagemonitor/accounting/src/local-api-pricing.js": {
+      "production": "packages/accounting/src/local-api-pricing.js",
+      "blob": "b2d35f378eac72a0f65b1dc20bdc9434ad615178"
+    },
+    "node_modules/@app-usagemonitor/accounting/src/price-registry.js": {
+      "production": "packages/accounting/src/price-registry.js",
+      "blob": "f134a490f0dd81962a7974070bdc7c0f0470d551"
+    },
+    "node_modules/@app-usagemonitor/accounting/src/subscription-speed.js": {
+      "production": "packages/accounting/src/subscription-speed.js",
+      "blob": "a226588462c8b220e2b012a395bafbef2b1f8577"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/index.js": {
+      "production": "packages/telemetry-contract/index.js",
+      "blob": "e9fcb569c38e20f851eeb2c697819392d5e4f8bd"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/admin-model-history.js": {
+      "production": "packages/telemetry-contract/src/admin-model-history.js",
+      "blob": "d1536fdf5a0e0d004afee2333f5d5d60a44aa079"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/constants.js": {
+      "production": "packages/telemetry-contract/src/constants.js",
+      "blob": "228daf81c7c869452094a8bf9b691e5315fac21f"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/envelope.js": {
+      "production": "packages/telemetry-contract/src/envelope.js",
+      "blob": "6ec82a937cb0e6f29a22eb2b3c00568fe47599be"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/errors.js": {
+      "production": "packages/telemetry-contract/src/errors.js",
+      "blob": "281b464a08a0ef19184e6654c8d3a15f30777de3"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/model-catalog-contract.js": {
+      "production": "packages/telemetry-contract/src/model-catalog-contract.js",
+      "blob": "039ef0c20b4e7856b6025e0005a7163fb00e4047"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/model-catalog.js": {
+      "production": "packages/telemetry-contract/src/model-catalog.js",
+      "blob": "875ea365b2f5d93419eb66746eff3827f5008a93"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/performance-histogram.js": {
+      "production": "packages/telemetry-contract/src/performance-histogram.js",
+      "blob": "7b53c9b14410968e1b3661a3c30f81285654f4f4"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/primitives.js": {
+      "production": "packages/telemetry-contract/src/primitives.js",
+      "blob": "80d47d2e8c4c557ef180cb707f6244f4f4c5e340"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-performance-v1-schemas.js": {
+      "production": "packages/telemetry-contract/src/telemetry-performance-v1-schemas.js",
+      "blob": "b8e505b8c5b3cb27650fc7492886a90297e8b6da"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-performance-v1.js": {
+      "production": "packages/telemetry-contract/src/telemetry-performance-v1.js",
+      "blob": "622aa2a06ca1ef63707b8b39d7aeef8563bd204e"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v0.1.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v0.1.js",
+      "blob": "ad3c475e70aab61cea10601920208f0cd1aeb4a8"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v0.2.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v0.2.js",
+      "blob": "0fa03b0c982f0d6b0b55d9c37e40d37d9c1c3422"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.1-domain.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.1-domain.js",
+      "blob": "c10da9b5ac8000e7f03e14c8f391d4e77441bdcc"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.1-schemas.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.1-schemas.js",
+      "blob": "56f5efb6b2d4192ca429d0cccd1e7fa37c57299d"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.1.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.1.js",
+      "blob": "d22f74679c864fd89d88a210ddff3f9505bbb15f"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.2-domain.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.2-domain.js",
+      "blob": "7679a2eb6eb7dbcc6091f762d6cc9b7d5a3fcfdc"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.2-schemas.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.2-schemas.js",
+      "blob": "94f6df4cfa89e8ee8ebc16073ecf871d73d7a56c"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/telemetry-v1.2.js": {
+      "production": "packages/telemetry-contract/src/telemetry-v1.2.js",
+      "blob": "801cbc2ff5a0d0f462e76790e2cb23a23253a988"
+    },
+    "node_modules/@app-usagemonitor/telemetry-contract/src/upload.js": {
+      "production": "packages/telemetry-contract/src/upload.js",
+      "blob": "c630a12e85472ffbf4f8f1bde5d3470276814e28"
+    }
+  }
+}

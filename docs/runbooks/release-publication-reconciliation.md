@@ -152,7 +152,11 @@ not yet visible. It does not dispatch repeatedly. Once the cask is verified,
 ownership is released before the existing website deployment wrapper acquires
 the same lock for its own guarded operation. Website health, schema, source,
 asset and post-deployment gates remain in force; pending migrations are not
-implicitly approved.
+implicitly approved. The website step passes no typed pins, so its deploy is
+refused before anything runs (`PRODUCTION_UNTYPED_DEPLOY_REFUSED`); publish
+the website through the typed
+[web-only release](./2026-08-17-web-only-release.md#4-deploy-only-after-explicit-production-authorization)
+path instead.
 
 Final reconciliation reads every surface again. A complete fresh rerun performs
 no uploads, dispatches, deployments, lock changes or journal writes. During a

@@ -6,6 +6,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "./crypto";
 import { parseStrictJson } from "./strict-json";
+import { ApiError, type ErrorCode } from "./errors";
 import {
   encodeTypedTelemetryRecord,
   typedTelemetryCanonicalRecords,
@@ -82,11 +83,28 @@ function qualify(total: number | null, components: readonly (number | null)[]): 
     ? "inconsistent" : "reported";
 }
 
-function parseUsage(input: UsageCorrectionInput): { canonical: string; legacy: TelemetryV1UsageEvent } {
+/** Explicit Node/GCP replay composition; raw admission defaults stay strict. */
+export interface UsageCorrectionParsingOptions {
+  readonly jsonParsing?: "internal_analytics_replay";
+}
+
+function parseInternalAnalyticsJson(raw: string, errorCode: ErrorCode = "BODY_INVALID"): unknown {
+  if (typeof raw !== "string") throw new TypeError("raw must be a string");
+  try { return JSON.parse(raw) as unknown; }
+  catch { throw new ApiError(400, errorCode); }
+}
+
+function recordJsonParser(options?: UsageCorrectionParsingOptions): typeof parseStrictJson {
+  if (options?.jsonParsing === undefined) return parseStrictJson;
+  if (options.jsonParsing === "internal_analytics_replay") return parseInternalAnalyticsJson;
+  return fail();
+}
+
+function parseUsage(input: UsageCorrectionInput, parseRecordJson = parseStrictJson): { canonical: string; legacy: TelemetryV1UsageEvent } {
   if (typeof input !== "object" || input === null || Array.isArray(input)) fail();
   recordBytes(input.recordJson);
   try {
-    const value = parseStrictJson(input.recordJson);
+    const value = parseRecordJson(input.recordJson);
     if (input.format === "v12") {
       const row = parseTelemetryV12Record("usage", value) as TelemetryV12UsageEvent;
       const { accountPlanAttribution: _attribution, boundaryFlags: _boundary,
@@ -107,8 +125,8 @@ function parseUsage(input: UsageCorrectionInput): { canonical: string; legacy: T
   }
 }
 
-async function prepare(input: UsageCorrectionInput) {
-  const parsed = parseUsage(input);
+async function prepare(input: UsageCorrectionInput, parseRecordJson = parseStrictJson) {
+  const parsed = parseUsage(input, parseRecordJson);
   const row = parsed.legacy;
   // Every other shared field participates, including outcome and all splits.
   // Removing just these two totals makes null-to-known repair comparable.
@@ -159,6 +177,11 @@ function snapshotUsageCorrectionPage(
  */
 export async function prepareUsageCorrectionAssertion(input: UsageCorrectionInput): Promise<UsageCorrectionAssertion> {
   return (await prepare(input)).assertion;
+}
+
+/** Internal reconstructed analytics records only; never the raw admission API. */
+export async function prepareAnalyticsReplayUsageCorrectionAssertion(input: UsageCorrectionInput): Promise<UsageCorrectionAssertion> {
+  return (await prepare(input, parseInternalAnalyticsJson)).assertion;
 }
 
 export interface ReconciledUsageTotal {
@@ -295,6 +318,7 @@ function freezeLegacyTemplate(row: TelemetryV1UsageEvent): TelemetryV1UsageEvent
 }
 
 class UsageCorrectionOccurrenceAccumulatorImpl {
+  readonly #parseRecordJson: typeof parseStrictJson;
   readonly #ownerScope: string;
   readonly #occurrenceId: string;
   #baseDigest: string | null = null;
@@ -311,6 +335,7 @@ class UsageCorrectionOccurrenceAccumulatorImpl {
   constructor(options: UsageCorrectionOccurrenceAccumulatorOptions) {
     assertOwnerScope(options?.ownerScope);
     assertOccurrenceId(options?.occurrenceId);
+    this.#parseRecordJson = recordJsonParser(options);
     this.#ownerScope = options.ownerScope;
     this.#occurrenceId = options.occurrenceId;
   }
@@ -326,7 +351,7 @@ class UsageCorrectionOccurrenceAccumulatorImpl {
       const snapshots = snapshotUsageCorrectionPage(this.#ownerScope, page);
       const prepared: PreparedUsageCorrection[] = [];
       for (const source of snapshots) {
-        const row = await prepare(source);
+        const row = await prepare(source, this.#parseRecordJson);
         if (row.assertion.occurrenceId !== this.#occurrenceId) {
           fail("USAGE_CORRECTION_OCCURRENCE_MISMATCH");
         }
@@ -394,7 +419,7 @@ class UsageCorrectionOccurrenceAccumulatorImpl {
   }
 }
 
-export interface UsageCorrectionOccurrenceAccumulatorOptions {
+export interface UsageCorrectionOccurrenceAccumulatorOptions extends UsageCorrectionParsingOptions {
   readonly ownerScope: string;
   readonly occurrenceId: string;
 }

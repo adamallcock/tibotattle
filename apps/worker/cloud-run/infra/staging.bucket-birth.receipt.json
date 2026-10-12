@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "tibotattle-gcp-bucket-birth-v1",
+  "source": "storage.buckets.insert",
+  "project": "tibotattle",
+  "projectNumber": "806510610397",
+  "bucket": "tibotattle-staging-quarantine",
+  "creationRequestSha256": "dfb0b3fd05e3057f72c9ddfb6d5c682037522136f83223d69f714137f4fd87f4",
+  "creationResponse": {
+    "bucket": "tibotattle-staging-quarantine",
+    "projectNumber": "806510610397",
+    "location": "US-EAST1",
+    "storageClass": "STANDARD",
+    "timeCreated": "2026-10-02T16:52:56.562Z",
+    "bucketGeneration": "1790959976328966167",
+    "bucketMetageneration": "1",
+    "softDeleteRetentionDurationSeconds": "0",
+    "uniformBucketLevelAccess": true,
+    "publicAccessPrevention": "enforced",
+    "versioningEnabled": false
+  },
+  "creationResponseSha256": "a138d5a7b1984b48e707c8398dd5d2ec6c6486daadff70c99289d42489a79e72",
+  "proof": {
+    "bucket": "tibotattle-staging-quarantine",
+    "bucketGeneration": "1790959976328966167",
+    "bucketMetageneration": "1",
+    "softDeleteRetentionDurationSeconds": "0"
+  }
+}

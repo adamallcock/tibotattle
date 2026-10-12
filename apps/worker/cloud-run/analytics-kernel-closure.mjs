@@ -1,0 +1,569 @@
+/**
+ * The analytics-v2 kernel identity a build stamps into the refresh and reprice bundles
+ * (K-STAMP). Build-time only: build.mjs computes it and passes it to esbuild
+ * as two defines; nothing at runtime imports this module.
+ *
+ * - vendorManifestSha256: sha256 of the vendored kernels' MANIFEST.json bytes,
+ *   which lists every vendored file's digest (the price registry included).
+ * - computeClosureSha256: the compute class (owner decision round 7: the
+ *   compatibility class includes the GCP compute closure), a sha256 over every
+ *   module that decides a stored analytics_v2 value, each as (name, sha256 of
+ *   its bytes), sorted by name. The modules are those reachable from ANALYTICS_KERNEL_CLOSURE_ROOTS
+ *   in the refresh Job, its compute Worker and the reprice Job bundles
+ *   (the A-1 readers with their decode and reconcile code, the A-2 compute
+ *   core with the community fold, the Job's read and compute composition, the
+ *   Worker shell, the vendored kernels and every module they import), walking
+ *   esbuild's import graph without entering ANALYTICS_KERNEL_CLOSURE_PLUMBING
+ *   (the Job shell, the Worker pool, the database client, the store and the
+ *   kernel identity itself). A change to any module in it, comments included,
+ *   is a new class and needs a new src/analytics-v2/kernel-registry.json entry
+ *   before a bundle built from it can stamp rows (the Job refuses
+ *   ANALYTICS_V2_KERNEL_UNREGISTERED). `node cloud-run/build.mjs
+ *   --kernel-closure` prints the closure's names.
+ *
+ * Names are independent of where a build runs, so a local build and the image
+ * build (/app/apps/worker/...) compute the same digest:
+ * - a repository file is named by its repository-relative path;
+ * - a workspace package (@app-usagemonitor/<name>) is named by its repository
+ *   path, packages/<name>/<path>. The image installs it as a link to
+ *   /app/packages/<name>, so esbuild reads the repository file; a checkout
+ *   installs a copy under node_modules, which must equal the repository file
+ *   byte for byte (ANALYTICS_KERNEL_CLOSURE_WORKSPACE_COPY_STALE otherwise:
+ *   a stale copy would register a closure the image never builds);
+ * - any other third-party module (the vendored kernels' `runcost`) is named
+ *   by package, version and path inside the package, never by where the
+ *   install put it (apps/worker/node_modules locally, cloud-run/node_modules
+ *   in the image).
+ *
+ * - computeSha256 (K-PERCARD, engine v2 section 5.3): the compute class, the
+ *   same digest over the closure's inputs WITHOUT the vendored price registry
+ *   (ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT: its cards and manifest), and with
+ *   the vendored source commit masked in the authored facade's line comments
+ *   (ANALYTICS_KERNEL_FACADE_INPUT, analyticsKernelFacadeComputeText). A price
+ *   change reaches the GCP line only by re-vendoring a new production commit,
+ *   and the vendoring workflow requires the facade's provenance text to name
+ *   that commit (scripts/vendor-analytics-kernels.mjs); without the mask
+ *   every re-vendor would be a new class and no transition could ever be
+ *   compatible. Only a hex run of 7 to 40 digits that starts MANIFEST.json's
+ *   sourceCommit, on a line that is a `//` comment, is masked: the same
+ *   commit named in code, another commit, or any other edit of the facade
+ *   is still a new class. Kernels with equal compute classes differ at most
+ *   in their price cards and the commit their facade names, and the
+ *   refresh's transition proof reprices the cards exactly. It is stamped
+ *   through a third define; it is not a registry key (the closure digest
+ *   pins it).
+ *
+ * - pricerSha256 and pricingMethodVersion (W1E, refresh optimization program
+ *   section 3.2.1): the pricer, the code that turns one stored usage row into
+ *   its price, which with the price-input projection version and the cards
+ *   digest is the PRICING CLASS a row's price is cached under (owner decision
+ *   round 18: price each row once per pricing version, cached forever). It
+ *   is deliberately narrower than the compute class, so a kernel bump that
+ *   changes no pricing code keeps every stored price. It is computed from a
+ *   second, tree-shaken esbuild pass (analyticsPricerBundleOptions) whose
+ *   entry exports only the pricing functions (ANALYTICS_PRICER_ENTRY): the
+ *   pricer is every input that pass's output lists, the modules contributing
+ *   code AND the re-export barrels that contribute none but decide which
+ *   declaration a pricing import binds (the facade entry.ts and the vendored
+ *   packages' index.js files). The pass marks every module side-effect free,
+ *   so a module is in only when a pricing function reaches its code or its
+ *   re-exports; the pricing-class check
+ *   (scripts/analytics-v2-pricing-class.check.mjs) proves that nothing the
+ *   pass leaves out can affect a price: no module it drops runs a top-level
+ *   statement that writes or calls into another module outside a reviewed
+ *   allowlist, and the pure bundle prices a synthetic battery that selects
+ *   every card exactly as the full module graph does. A module the pass loads
+ *   but its output does not list could still decide a binding through a star
+ *   re-export or a value through a TypeScript enum (which esbuild inlines
+ *   across modules), so the pass refuses either
+ *   (ANALYTICS_PRICER_UNTRACKED_BINDING). Dynamic imports are left external,
+ *   and a pricer that still reaches one is refused
+ *   (ANALYTICS_PRICER_DYNAMIC_IMPORT_REACHED). Every pricer input must be a
+ *   closure input (ANALYTICS_PRICER_OUTSIDE_CLOSURE) and is hashed by its
+ *   closure name and the digest the compute class hashes it by (the facade
+ *   with its provenance commit masked; the price registry included; a
+ *   third-party package by each bundled file, as the closure names it), so
+ *   the pricer digest is a function of the compute closure's digests and the
+ *   module set the pure pass selects from them (esbuild's tree shaking, under
+ *   the lockfile's esbuild): no file outside the closure moves it, and two
+ *   builds of one kernel-registry entry state one pricing class. A build
+ *   that still states another class for a registered kernel is refused at
+ *   its first write (ANALYTICS_V2_PRICING_CLASS_CONFLICT, store-price.ts),
+ *   never trusted. It is never hand-listed.
+ *   The pricing method version is the vendored SERVER_PRICING_METHOD_VERSION,
+ *   read from the pricer's own source. Over-inclusion only costs a full
+ *   reprice on a kernel bump: an edit of the facade, which REFRESH-OPT d1 and
+ *   d5 both made, is a new pricing class even when no pricing export moves.
+ *
+ * The build refuses an identity no kernel-registry.json entry names
+ * (resolveAnalyticsKernelRegistryEntry, CLOUD_RUN_BUILD_KERNEL_UNREGISTERED),
+ * so an image built from unregistered code fails its build (the Dockerfile
+ * runs `npm run build`) instead of deploying a Job that refuses every run.
+ * Only `--kernel-closure` skips that check: it is how a new entry's digests
+ * are found.
+ */
+
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { dirname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Script } from "node:vm";
+import { assertAnalyticsFastPricerBinding, FAST_PRICER_BINDING_POLICY } from "./analytics-fast-pricer-binding.mjs";
+import { assertTelemetryByteBoundsBinding, TELEMETRY_BYTE_BOUNDS_POLICY, telemetryByteBoundsSource } from "./telemetry-byte-bounds-binding.mjs";
+
+export const ANALYTICS_KERNEL_CLOSURE_VERSION = "analytics-v2-compute-closure-v2";
+/** The compute class's digest method (computeSha256). v2 masks the facade's provenance commit. */
+export const ANALYTICS_KERNEL_COMPUTE_CLASS_VERSION = "analytics-v2-compute-class-v2";
+/** The vendored price registry, relative to the vendored kernel root: outside the compute class. */
+export const ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT = "packages/accounting/src/price-registry.js";
+/** The authored facade, relative to the vendored kernel root: in the compute class with its provenance commit masked. */
+export const ANALYTICS_KERNEL_FACADE_INPUT = "entry.ts";
+/** What stands in the compute class for the vendored source commit a facade comment names. */
+export const ANALYTICS_KERNEL_FACADE_COMMIT_MASK = "<vendored-source-commit>";
+const SOURCE_COMMIT = /^[0-9a-f]{40}$/u;
+const CLOUD_RUN_ROOT = dirname(fileURLToPath(import.meta.url));
+const WORKER_ROOT = resolve(CLOUD_RUN_ROOT, "..");
+const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
+/** The refresh Job entry (the read side and the inline compute path). */
+export const ANALYTICS_REFRESH_JOB_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-refresh.mjs");
+/** The compute Worker entry (K-PAR). */
+export const ANALYTICS_REFRESH_WORKER_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-refresh-worker.mjs");
+/** The bounded saved-cohort reprice Job entry. */
+export const ANALYTICS_REPRICE_JOB_ENTRY = resolve(CLOUD_RUN_ROOT, "analytics-reprice.mjs");
+/**
+ * The modules that decide stored analytics_v2 values (repository paths). The
+ * closure is everything the refresh and reprice bundles reach from these without
+ * entering ANALYTICS_KERNEL_CLOSURE_PLUMBING.
+ */
+export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
+  // The compute Worker shell: one admitted owner (compute-owner.ts).
+  "apps/worker/cloud-run/analytics-refresh-worker.mjs",
+  // The Job's read and compute composition: publication days, the cache and
+  // occurrence horizons, read spans, the exclusion mapping.
+  "apps/worker/cloud-run/analytics-refresh-read.mjs",
+  // A-2: the plan, the merge, the refusals, the community fold (compute-community.ts).
+  "apps/worker/src/analytics-v2/compute.ts",
+  // A-1: the occurrence reader with its decode and reconcile code.
+  "apps/worker/src/analytics-v2/occurrence-source.ts",
+  // A-1: the owner roster, the source routing and the community aggregate exclusions.
+  "apps/worker/src/analytics-v2/owners.ts",
+  // A-1: contributing devices and the queued days.
+  "apps/worker/src/analytics-v2/devices.ts",
+  "apps/worker/src/analytics-v2/queued-days.ts",
+  // K-PERCARD: the kernel-transition proof and stale set (the price
+  // attribution is reached from compute-owner.ts).
+  "apps/worker/src/analytics-v2/price-transition.ts",
+  // E-OWNERSET: the saved owner sets, stored contributions and frozen counts a fold reads.
+  "apps/worker/src/analytics-v2/owner-sets.ts",
+  // OAI-5: saved-cohort eligibility, pricing/fold decisions and atomic publication equivalence.
+  "apps/worker/src/analytics-v2/reprice.ts",
+  "apps/worker/src/analytics-v2/reprice-read.ts",
+  "apps/worker/src/analytics-v2/reprice-store.ts",
+  // The writer binds archived pricing inputs to exact contribution versions.
+  "apps/worker/src/analytics-v2/store-owner-sets.ts",
+]);
+/**
+ * I/O plumbing (repository paths): never in the closure and never walked
+ * through. Each must be in the refresh or reprice bundles, so a renamed module cannot
+ * silently move into the closure or out of this list.
+ */
+export const ANALYTICS_KERNEL_CLOSURE_PLUMBING = Object.freeze([
+  "apps/worker/cloud-run/analytics-refresh.mjs",
+  // Transport, protected target resolution and CLI dispatch; value decisions are domain roots.
+  "apps/worker/cloud-run/analytics-reprice.mjs",
+  "apps/worker/cloud-run/analytics-refresh-pool.mjs",
+  "apps/worker/src/postgres-client.ts",
+  "apps/worker/src/analytics-v2/store.ts",
+  "apps/worker/src/analytics-v2/store-run.ts",
+  "apps/worker/src/analytics-v2/store-derived.ts",
+  "apps/worker/src/analytics-v2/store-publication.ts",
+  "apps/worker/src/analytics-v2/store-price.ts",
+  "apps/worker/src/analytics-v2/kernel.ts",
+  "apps/worker/src/analytics-v2/kernel-registry.json",
+]);
+/** The esbuild defines the identity is stamped through (src/analytics-v2/kernel.ts reads them). */
+export const ANALYTICS_KERNEL_DEFINES = Object.freeze({
+  computeClosureSha256: "__ANALYTICS_V2_COMPUTE_CLOSURE_SHA256__",
+  vendorManifestSha256: "__ANALYTICS_V2_VENDOR_MANIFEST_SHA256__",
+  computeSha256: "__ANALYTICS_V2_COMPUTE_SHA256__",
+  pricerSha256: "__ANALYTICS_V2_PRICER_SHA256__",
+  pricingMethodVersion: "__ANALYTICS_V2_PRICING_METHOD_VERSION__",
+});
+/** The pricer digest's method (pricerSha256). v2 hashes every input of the pure pass by its closure digest. */
+export const ANALYTICS_PRICER_CLASS_VERSION = "analytics-v2-pricer-v2";
+/**
+ * The pricer: the functions that price one stored usage row, by module
+ * (repository paths; `vendor:` paths are relative to the vendored kernel
+ * root). price-attribution.ts projects a record onto what the pricer reads
+ * and prices that projection (the K-PERCARD inputs and their transition
+ * proof); the vendored priceChunkUsageRecord is the kernel's own per-row
+ * price (the daily fold and the model windows), so a cached price stands in
+ * for either.
+ */
+export const ANALYTICS_PRICER_ENTRY = Object.freeze([
+  Object.freeze({ module: "apps/worker/src/analytics-v2/price-attribution.ts",
+    exports: Object.freeze(["analyticsV2PriceInput", "priceAnalyticsV2Input", "sameAnalyticsV2Price"]) }),
+  Object.freeze({ module: "vendor:apps/worker/src/quota-analysis-v1.ts",
+    exports: Object.freeze(["priceChunkUsageRecord"]) }),
+]);
+/** The vendored module declaring the pricing method version (relative to the vendored kernel root). */
+export const ANALYTICS_PRICER_METHOD_INPUT = "apps/worker/src/server-pricing.ts";
+const PRICING_METHOD_VERSION = /^export const SERVER_PRICING_METHOD_VERSION = "([A-Za-z0-9._:-]{1,64})";$/mu;
+/** The pricer pass's stdin entry (not a file; never an input). */
+const PRICER_ENTRY_NAME = "<analytics-v2-pricer-entry>";
+/** A star re-export or a TypeScript enum declaration, at the start of a line (see pricerIdentity). */
+const UNTRACKED_BINDING = /^[ \t]*(?:export[ \t]*\*|(?:export[ \t]+)?(?:declare[ \t]+)?(?:const[ \t]+)?enum[ \t]+[A-Za-z_$][\w$]*[ \t]*\{)/mu;
+/** What a dynamic import becomes in the pricer pass: external, and refused if the pricer still reaches it. */
+const PRICER_DYNAMIC_IMPORT = "analytics-v2-pricer-dynamic-import:";
+const WORKSPACE_SCOPE = "@app-usagemonitor";
+
+function fail(code, extra = {}) {
+  throw Object.assign(new Error(code), { code, ...extra });
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** The package an absolute node_modules path belongs to: its name parts and the path inside it. */
+function packageOf(absolute) {
+  const parts = absolute.split(sep);
+  const at = parts.lastIndexOf("node_modules");
+  const scoped = parts[at + 1]?.startsWith("@");
+  const nameParts = parts.slice(at + 1, at + (scoped ? 3 : 2));
+  if (nameParts.length !== (scoped ? 2 : 1) || nameParts.some((part) => !part)) fail("ANALYTICS_KERNEL_CLOSURE_PACKAGE_INVALID");
+  const inside = parts.slice(at + 1 + nameParts.length);
+  if (inside.length === 0) fail("ANALYTICS_KERNEL_CLOSURE_PACKAGE_INVALID");
+  return { nameParts, root: parts.slice(0, at + 1 + nameParts.length).join(sep), inside };
+}
+
+/**
+ * The closure name of one bundled input and the digest of the bytes it is
+ * hashed by (see the module comment). `read` is fs readFile (a check may
+ * substitute it).
+ */
+async function closureEntry(absolute, read) {
+  if (!absolute.split(sep).includes("node_modules")) {
+    const fromRoot = relative(REPOSITORY_ROOT, absolute);
+    if (fromRoot.startsWith("..")) fail("ANALYTICS_KERNEL_CLOSURE_OUTSIDE_SOURCES");
+    return [fromRoot.split(sep).join("/"), sha256(await read(absolute))];
+  }
+  const { nameParts, root, inside } = packageOf(absolute);
+  if (nameParts[0] === WORKSPACE_SCOPE) {
+    // A workspace package copy: named and verified as the repository file.
+    const input = `${nameParts.join("/")}/${inside.join("/")}`;
+    let copy;
+    let source;
+    try {
+      [copy, source] = await Promise.all([read(absolute), read(resolve(REPOSITORY_ROOT, "packages", nameParts[1], ...inside))]);
+    } catch {
+      fail("ANALYTICS_KERNEL_CLOSURE_WORKSPACE_COPY_STALE", { input });
+    }
+    if (!Buffer.from(copy).equals(Buffer.from(source))) fail("ANALYTICS_KERNEL_CLOSURE_WORKSPACE_COPY_STALE", { input });
+    return [["packages", nameParts[1], ...inside].join("/"), sha256(source)];
+  }
+  let version;
+  try {
+    version = JSON.parse(await read(`${root}${sep}package.json`, "utf8")).version;
+  } catch {
+    fail("ANALYTICS_KERNEL_CLOSURE_PACKAGE_INVALID");
+  }
+  if (typeof version !== "string" || !/^[0-9A-Za-z.+-]{1,64}$/u.test(version)) fail("ANALYTICS_KERNEL_CLOSURE_PACKAGE_INVALID");
+  return [`npm:${nameParts.join("/")}@${version}/${inside.join("/")}`, sha256(await read(absolute))];
+}
+
+/**
+ * The facade text the compute class hashes (see the module comment): on each
+ * line that is a `//` comment, every hex run of 7 to 40 digits that starts
+ * `sourceCommit` (the vendor workflow's own "names the commit" rule) is
+ * replaced by ANALYTICS_KERNEL_FACADE_COMMIT_MASK. Code lines, other commits
+ * and every other character are kept.
+ */
+export function analyticsKernelFacadeComputeText(text, sourceCommit) {
+  if (typeof text !== "string" || typeof sourceCommit !== "string" || !SOURCE_COMMIT.test(sourceCommit)) {
+    fail("ANALYTICS_KERNEL_CLOSURE_FACADE_INVALID");
+  }
+  return text.split("\n").map((line) => (/^\s*\/\//u.test(line)
+    ? line.replace(/\b[0-9a-f]{7,40}\b/giu, (token) => (sourceCommit.startsWith(token.toLowerCase())
+      ? ANALYTICS_KERNEL_FACADE_COMMIT_MASK : token))
+    : line)).join("\n");
+}
+
+/** The pricer pass's stdin entry: ANALYTICS_PRICER_ENTRY's exports, by absolute path. */
+function pricerEntryText(vendorRoot) {
+  return ANALYTICS_PRICER_ENTRY.map(({ module, exports }) => {
+    const absolute = module.startsWith("vendor:") ? resolve(vendorRoot, ...module.slice("vendor:".length).split("/"))
+      : resolve(REPOSITORY_ROOT, ...module.split("/"));
+    return `export { ${exports.join(", ")} } from ${JSON.stringify(absolute)};`;
+  }).join("\n");
+}
+
+/**
+ * The pricer pass's resolution: a dynamic import stays external under a
+ * marker (the pass refuses a pricer whose output still holds one), and with
+ * `pure` every other module is resolved as esbuild would and marked
+ * side-effect free, so it is bundled only for code a pricing function reaches.
+ */
+function pricerPlugin(pure) {
+  return {
+    name: "analytics-v2-pricer",
+    setup(pass) {
+      pass.onResolve({ filter: /.*/ }, async (args) => {
+        if (args.kind === "dynamic-import") return { path: `${PRICER_DYNAMIC_IMPORT}${args.path}`, external: true };
+        if (!pure || args.kind === "entry-point" || args.pluginData?.analyticsV2PricerResolved === true) return undefined;
+        const resolved = await pass.resolve(args.path, { kind: args.kind, importer: args.importer,
+          resolveDir: args.resolveDir, ...(args.with === undefined ? {} : { with: args.with }),
+          pluginData: { analyticsV2PricerResolved: true } });
+        if (resolved.errors.length > 0) return { errors: resolved.errors };
+        return { path: resolved.path, external: resolved.external, namespace: resolved.namespace, suffix: resolved.suffix,
+          pluginData: resolved.pluginData, sideEffects: false };
+      });
+    },
+  };
+}
+
+/**
+ * The esbuild options of the pricer pass: the cloud-run build's own options
+ * (platform, target, externals), one stdin entry exporting ANALYTICS_PRICER_ENTRY,
+ * a metafile and no output written. `pure` (the default, the pass the class
+ * is computed from) marks every module side-effect free; the pricing-class
+ * check also builds it with `pure` false (the module graph's real semantics)
+ * to prove the two price alike.
+ */
+export function analyticsPricerBundleOptions({ options, vendorRoot, cwd = process.cwd(), pure = true }) {
+  if (options === null || typeof options !== "object" || typeof vendorRoot !== "string" || typeof pure !== "boolean") {
+    fail("ANALYTICS_PRICER_INVALID");
+  }
+  const { define: _define, entryPoints: _entryPoints, outdir: _outdir, entryNames: _entryNames,
+    outExtension: _outExtension, metafile: _metafile, plugins = [], ...shared } = options;
+  return { ...shared, absWorkingDir: cwd, bundle: true, write: false, metafile: true, format: "esm",
+    stdin: { contents: pricerEntryText(vendorRoot), resolveDir: REPOSITORY_ROOT, sourcefile: PRICER_ENTRY_NAME,
+      loader: "js" },
+    outfile: resolve(CLOUD_RUN_ROOT, "dist", "analytics-v2-pricer.mjs"),
+    plugins: [...plugins, pricerPlugin(pure)] };
+}
+
+/**
+ * The pricer's identity (see the module comment), from the pure pricer pass.
+ * `closure` maps each closure input name to the digest the compute class
+ * hashes it by (the facade masked); every input the pass lists, with or
+ * without bytes in its output, must be one of them and is hashed by it.
+ */
+async function pricerIdentity({ build, options, vendorRoot, cwd, read, closure }) {
+  const result = await build(analyticsPricerBundleOptions({ options, vendorRoot, cwd }));
+  const outputs = Object.values(result?.metafile?.outputs ?? {});
+  if (outputs.length !== 1 || !Array.isArray(result.outputFiles) || result.outputFiles.length !== 1) {
+    fail("ANALYTICS_PRICER_INVALID");
+  }
+  if (result.outputFiles[0].text.includes(PRICER_DYNAMIC_IMPORT)) fail("ANALYTICS_PRICER_DYNAMIC_IMPORT_REACHED");
+  const inputs = new Map();
+  let codeInputs = 0;
+  const entry = resolve(REPOSITORY_ROOT, PRICER_ENTRY_NAME);
+  // The output's input list names every module whose code or re-exports a pricing function reaches. A module the
+  // pass loads but leaves out of it could still decide a binding through a star re-export, or a value through a
+  // TypeScript enum (inlined across modules): the pass refuses both rather than let such a module stay unhashed.
+  for (const path of Object.keys(result.metafile.inputs ?? {})) {
+    const absolute = resolve(cwd, path);
+    if (absolute === entry) continue;
+    if (UNTRACKED_BINDING.test(Buffer.from(await read(absolute)).toString("utf8"))) {
+      fail("ANALYTICS_PRICER_UNTRACKED_BINDING", { name: (await closureEntry(absolute, read))[0] });
+    }
+  }
+  for (const [path, input] of Object.entries(outputs[0].inputs ?? {})) {
+    const absolute = resolve(cwd, path);
+    if (absolute === entry) continue;
+    // A re-export barrel adds no bytes but decides which declaration an import binds: it is hashed like the rest.
+    const [name] = await closureEntry(absolute, read);
+    if (!closure.has(name)) fail("ANALYTICS_PRICER_OUTSIDE_CLOSURE", { name });
+    inputs.set(name, closure.get(name));
+    if (input?.bytesInOutput > 0) codeInputs += 1;
+  }
+  // This source transformation decides accepted pricing inputs only when the
+  // transformed module contributes to pricing. Hash its exact policy then.
+  const [boundsSourceName] = await closureEntry(telemetryByteBoundsSource(WORKER_ROOT), read);
+  if (inputs.has(boundsSourceName)) {
+    const [policyName] = await closureEntry(TELEMETRY_BYTE_BOUNDS_POLICY, read);
+    if (!closure.has(policyName)) fail("ANALYTICS_PRICER_OUTSIDE_CLOSURE", { name: policyName });
+    inputs.set(policyName, closure.get(policyName));
+  }
+  const methodInput = relative(REPOSITORY_ROOT, resolve(vendorRoot, ...ANALYTICS_PRICER_METHOD_INPUT.split("/")))
+    .split(sep).join("/");
+  if (!inputs.has(methodInput)) fail("ANALYTICS_PRICER_METHOD_VERSION_MISSING");
+  const pricingMethodVersion = PRICING_METHOD_VERSION.exec(Buffer.from(
+    await read(resolve(vendorRoot, ...ANALYTICS_PRICER_METHOD_INPUT.split("/")))).toString("utf8"))?.[1];
+  if (pricingMethodVersion === undefined) fail("ANALYTICS_PRICER_METHOD_VERSION_MISSING");
+  const sorted = [...inputs].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return Object.freeze({
+    pricerSha256: sha256(JSON.stringify([ANALYTICS_PRICER_CLASS_VERSION, ANALYTICS_PRICER_ENTRY, sorted])),
+    pricingMethodVersion,
+    pricerInputs: sorted.length,
+    pricerCodeInputs: codeInputs,
+    pricerNames: Object.freeze(sorted.map(([name]) => name)),
+  });
+}
+
+/**
+ * The identity of the kernels `build(options)` would bundle into the refresh
+ * Job, its compute Worker and the saved-cohort reprice Job. `build` is esbuild's; `options` are the
+ * cloud-run build options (bundle, platform, externals); `vendorRoot` is the
+ * vendored kernel directory. Returns the two digests and the closure's names
+ * in hash order (`names`; `inputs` is their count), and the pricer's digest,
+ * method version and input names (`pricerNames`; `pricerInputs` their count).
+ */
+export async function computeAnalyticsKernelIdentity({ build, options, vendorRoot, cwd = process.cwd(),
+  read = readFile }) {
+  if (typeof build !== "function" || options === null || typeof options !== "object" || typeof vendorRoot !== "string"
+      || typeof read !== "function") {
+    fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  }
+  const { define: _define, entryPoints: _entryPoints, outdir: _outdir, entryNames: _entryNames, ...shared } = options;
+  // The metafile's paths are relative to esbuild's working directory: `cwd`.
+  const result = await build({ ...shared, absWorkingDir: cwd,
+    entryPoints: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY], write: false, metafile: true,
+    outdir: resolve(CLOUD_RUN_ROOT, "dist") });
+  assertAnalyticsFastPricerBinding(result.metafile, cwd);
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT, cwd,
+    requiredEntries: [ANALYTICS_REFRESH_JOB_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
+  const graph = new Map();
+  for (const [path, input] of Object.entries(result.metafile.inputs)) {
+    graph.set(resolve(cwd, path), (input.imports ?? []).filter((imported) => !imported.external)
+      .map((imported) => resolve(cwd, imported.path)));
+  }
+  const fromRepository = (path) => resolve(REPOSITORY_ROOT, ...path.split("/"));
+  const plumbing = new Set(ANALYTICS_KERNEL_CLOSURE_PLUMBING.map(fromRepository));
+  for (const path of plumbing) {
+    if (!graph.has(path)) fail("ANALYTICS_KERNEL_CLOSURE_PLUMBING_MISSING", { path: relative(REPOSITORY_ROOT, path) });
+  }
+  const roots = ANALYTICS_KERNEL_CLOSURE_ROOTS.map(fromRepository);
+  for (const path of roots) {
+    if (!graph.has(path)) fail("ANALYTICS_KERNEL_CLOSURE_ROOT_MISSING", { path: relative(REPOSITORY_ROOT, path) });
+  }
+  const reached = new Set();
+  const stack = [...roots];
+  while (stack.length > 0) {
+    const path = stack.pop();
+    if (reached.has(path) || plumbing.has(path)) continue;
+    if (!graph.has(path)) fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+    reached.add(path);
+    stack.push(...graph.get(path));
+  }
+  if (![...reached].some((path) => path.startsWith(`${resolve(vendorRoot)}${sep}`))) {
+    fail("ANALYTICS_KERNEL_CLOSURE_KERNELS_MISSING");
+  }
+  // A workspace package reached both through a checkout's copy and through
+  // its repository path is one module (the image links it, so it bundles it
+  // once): equal entries collapse, and one name with two digests is refused.
+  const byName = new Map();
+  for (const path of reached) {
+    const [name, digest] = await closureEntry(path, read);
+    if (byName.has(name) && byName.get(name) !== digest) fail("ANALYTICS_KERNEL_CLOSURE_NAME_COLLISION", { name });
+    byName.set(name, digest);
+  }
+  // This build-time resolution policy decides which pricer the compute
+  // closure executes. Hash it even though runtime code never imports tooling.
+  const [policyName, policyDigest] = await closureEntry(FAST_PRICER_BINDING_POLICY, read);
+  byName.set(policyName, policyDigest);
+  const [boundsPolicyName, boundsPolicyDigest] = await closureEntry(TELEMETRY_BYTE_BOUNDS_POLICY, read);
+  byName.set(boundsPolicyName, boundsPolicyDigest);
+  const inputs = [...byName].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  // The compute class: every input but the vendored price registry, which
+  // must be one, with the facade (which must be one too) hashed with its
+  // provenance commit masked (analyticsKernelFacadeComputeText).
+  const vendored = (input) => relative(REPOSITORY_ROOT, resolve(vendorRoot, ...input.split("/"))).split(sep).join("/");
+  const priceRegistry = vendored(ANALYTICS_KERNEL_PRICE_REGISTRY_INPUT);
+  if (!byName.has(priceRegistry)) fail("ANALYTICS_KERNEL_CLOSURE_PRICE_REGISTRY_MISSING");
+  const facade = vendored(ANALYTICS_KERNEL_FACADE_INPUT);
+  if (!byName.has(facade)) fail("ANALYTICS_KERNEL_CLOSURE_FACADE_MISSING");
+  const manifestBytes = await read(resolve(vendorRoot, "MANIFEST.json"));
+  let sourceCommit;
+  try {
+    sourceCommit = JSON.parse(Buffer.from(manifestBytes).toString("utf8")).sourceCommit;
+  } catch {
+    fail("ANALYTICS_KERNEL_CLOSURE_MANIFEST_INVALID");
+  }
+  if (typeof sourceCommit !== "string" || !SOURCE_COMMIT.test(sourceCommit)) fail("ANALYTICS_KERNEL_CLOSURE_MANIFEST_INVALID");
+  const facadeBytes = Buffer.from(await read(resolve(vendorRoot, ANALYTICS_KERNEL_FACADE_INPUT)));
+  // The facade is the file the closure hashed, and text that survives a UTF-8 round trip (nothing hidden from the mask).
+  const facadeText = facadeBytes.toString("utf8");
+  if (sha256(facadeBytes) !== byName.get(facade) || !Buffer.from(facadeText, "utf8").equals(facadeBytes)) {
+    fail("ANALYTICS_KERNEL_CLOSURE_FACADE_INVALID");
+  }
+  const facadeCompute = sha256(Buffer.from(analyticsKernelFacadeComputeText(facadeText, sourceCommit), "utf8"));
+  // W1E: the pricer, from its own pure pass over the same build options.
+  const pricer = await pricerIdentity({ build, options, vendorRoot, cwd, read,
+    closure: new Map(inputs.map(([name, digest]) => [name, name === facade ? facadeCompute : digest])) });
+  return Object.freeze({
+    computeClosureSha256: sha256(JSON.stringify([ANALYTICS_KERNEL_CLOSURE_VERSION, inputs])),
+    computeSha256: sha256(JSON.stringify([ANALYTICS_KERNEL_COMPUTE_CLASS_VERSION,
+      inputs.filter(([name]) => name !== priceRegistry).map(([name, digest]) => [name, name === facade ? facadeCompute : digest])])),
+    vendorManifestSha256: sha256(manifestBytes),
+    inputs: inputs.length,
+    names: Object.freeze(inputs.map(([name]) => name)),
+    ...pricer,
+  });
+}
+
+/** The esbuild `define` map that stamps `identity` into a bundle. */
+export function analyticsKernelDefines(identity) {
+  return Object.freeze({
+    [ANALYTICS_KERNEL_DEFINES.computeClosureSha256]: JSON.stringify(identity.computeClosureSha256),
+    [ANALYTICS_KERNEL_DEFINES.vendorManifestSha256]: JSON.stringify(identity.vendorManifestSha256),
+    // An identity without a compute class (a mutation in a check) stamps none: no compatibility claim.
+    [ANALYTICS_KERNEL_DEFINES.computeSha256]: typeof identity.computeSha256 === "string"
+      ? JSON.stringify(identity.computeSha256) : "undefined",
+    // W1E: an identity without a pricer stamps none: an unknown pricing class, never a cached-price claim.
+    [ANALYTICS_KERNEL_DEFINES.pricerSha256]: typeof identity.pricerSha256 === "string"
+      ? JSON.stringify(identity.pricerSha256) : "undefined",
+    [ANALYTICS_KERNEL_DEFINES.pricingMethodVersion]: typeof identity.pricingMethodVersion === "string"
+      ? JSON.stringify(identity.pricingMethodVersion) : "undefined",
+  });
+}
+
+/** The module that resolves a bundle's identity to its registry entry (the Job's own resolver). */
+export const ANALYTICS_KERNEL_REGISTRY_MODULE = resolve(WORKER_ROOT, "src", "analytics-v2", "kernel.ts");
+
+/**
+ * The kernel-registry.json entry naming `identity`, resolved exactly as the
+ * refresh Job resolves its bundle: src/analytics-v2/kernel.ts and the
+ * registry are bundled with `identity`'s defines (analyticsKernelDefines) and
+ * resolveAnalyticsV2Kernel(analyticsV2BundledKernelIdentity()) runs on that
+ * bundle, so the method version is the code's own. The bundle (this
+ * repository's kernel.ts and its imports, nothing else) is evaluated in a
+ * fresh context holding only the globals it needs, never imported.
+ * Refuses CLOUD_RUN_BUILD_KERNEL_UNREGISTERED, carrying the two digests,
+ * when no entry names it, and CLOUD_RUN_BUILD_KERNEL_REGISTRY_INVALID for a
+ * malformed registry. `build` and `options` are as for
+ * computeAnalyticsKernelIdentity.
+ */
+export async function resolveAnalyticsKernelRegistryEntry({ build, options, identity, cwd = process.cwd() }) {
+  if (typeof build !== "function" || options === null || typeof options !== "object" || identity === null
+      || typeof identity !== "object" || typeof identity.computeClosureSha256 !== "string"
+      || typeof identity.vendorManifestSha256 !== "string") {
+    fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  }
+  const { define: _define, entryPoints: _entryPoints, outdir: _outdir, entryNames: _entryNames,
+    outExtension: _outExtension, metafile: _metafile, external: _external, ...shared } = options;
+  // Self-contained (no externals; packages' ESM entries, which make no
+  // dynamic require) and one script, so it loads nothing at run time.
+  const result = await build({ ...shared, absWorkingDir: cwd, entryPoints: [ANALYTICS_KERNEL_REGISTRY_MODULE],
+    write: false, external: [], mainFields: ["module", "main"], format: "iife", globalName: "analyticsV2Kernel",
+    define: analyticsKernelDefines(identity) });
+  if (!Array.isArray(result.outputFiles) || result.outputFiles.length !== 1) fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  const context = { TextEncoder, TextDecoder, crypto: globalThis.crypto };
+  new Script(result.outputFiles[0].text, { filename: "analytics-v2-kernel-registry.js" }).runInNewContext(context);
+  const kernel = context.analyticsV2Kernel;
+  if (typeof kernel?.resolveAnalyticsV2Kernel !== "function"
+      || typeof kernel?.analyticsV2BundledKernelIdentity !== "function") {
+    fail("ANALYTICS_KERNEL_CLOSURE_INVALID");
+  }
+  try {
+    return kernel.resolveAnalyticsV2Kernel(kernel.analyticsV2BundledKernelIdentity());
+  } catch (error) {
+    if (error?.code === "ANALYTICS_V2_KERNEL_UNREGISTERED") {
+      fail("CLOUD_RUN_BUILD_KERNEL_UNREGISTERED", { computeClosureSha256: identity.computeClosureSha256,
+        vendorManifestSha256: identity.vendorManifestSha256 });
+    }
+    if (error?.code === "ANALYTICS_V2_KERNEL_REGISTRY_INVALID") fail("CLOUD_RUN_BUILD_KERNEL_REGISTRY_INVALID");
+    throw error;
+  }
+}

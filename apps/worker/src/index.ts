@@ -1,4 +1,6 @@
 import { readAdminDatabaseHealth } from "./admin-database-health";
+import { isPostgresWorkerRequestPathSupported } from "./backend-composition";
+export { isPostgresWorkerRequestPathSupported } from "./backend-composition";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
@@ -292,7 +294,6 @@ import {
 
 // Wrangler discovers Durable Object classes through the Worker module's named
 // exports. The class itself owns only opaque short-lived admission leases.
-export { UploadIngressBudget } from "./ingress-budget";
 
 const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
 const EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
@@ -397,6 +398,8 @@ import { CACHE_RETENTION_BAND_IDS, CACHE_RETENTION_METHOD,
 import { captureStorageCommunityAuthority } from "./storage-community-authority";
 import { readPublishedStorageCommunityDaily } from "./storage-community-daily";
 import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
+import { wrapPublicAllowanceBreakdownsV15 } from "./analytics-v2/public-allowance-breakdowns-v15";
+import { buildCurrentPublicModelMetadata } from "./analytics-v2/public-model-metadata-current";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -617,8 +620,10 @@ const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
  * Reject requests that cannot possibly be a contribution before spending a
  * Rate Limit key or shared ingress slot. The bound reader rechecks these
  * fields before consuming the body; this is a cheap pre-body fence only.
+ * Exported for the thin edge (edge-entry.ts), which runs it before its own
+ * address-keyed admission so a refused request spends no edge budget.
  */
-function contributionRequestPreflight(request: Request): string {
+export function contributionRequestPreflight(request: Request): string {
   if (hasSessionCookie(request.headers.get("cookie"))) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
@@ -4019,9 +4024,23 @@ async function handleCommunityDaily(
   ).toISOString().slice(0, 10);
   // The read has already fenced the snapshot against hard invalidation. New
   // append-only inputs can leave it visible while the next calculation runs.
-  const graph = projectPublicAllowanceGraph(read.allowanceBreakdownsCache, {
+  const projected = projectPublicAllowanceGraph(read.allowanceBreakdownsCache, {
     publishedDays: read.rows.map((row) => row.day), nowMs,
   });
+  // The current base envelope already carries the public v1.5 label, which
+  // the public reader accepts only with its closed model metadata block, so
+  // this path never emits it bare. Only a current (v0.5) preview projects
+  // here; a stored retained preview is refused, never relabelled. Catalog
+  // drift in the current metadata withholds the breakdowns (updating) rather
+  // than failing the whole daily response, as the base build did.
+  let graph: { breakdowns: ReturnType<typeof wrapPublicAllowanceBreakdownsV15> } | null = null;
+  if (projected !== null) {
+    try {
+      graph = { breakdowns: wrapPublicAllowanceBreakdownsV15(projected.breakdowns, buildCurrentPublicModelMetadata()) };
+    } catch {
+      graph = null;
+    }
+  }
   const dailyAllowanceReady = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs);
   const allowanceState = graph !== null || dailyAllowanceReady
     ? "ready"
@@ -4350,6 +4369,13 @@ export async function handleRequest(
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
+  if (Object.prototype.hasOwnProperty.call(env, "POSTGRES_WORKER_BACKEND")
+      && !isPostgresWorkerRequestPathSupported()) {
+    return noStore(errorResponse(
+      new ApiError(503, "POSTGRES_REQUEST_PATH_UNSUPPORTED"),
+      requestId,
+    ));
+  }
   const configuredAdminHostname = adminHostname(env);
   const adminSurface = isAdminSurfacePath(url.pathname)
     || configuredAdminHostname === url.hostname;

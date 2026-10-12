@@ -1,0 +1,36 @@
+-- telemetry_v12_manifests_ready_at: bound the OPS-4 newest-ready-manifest read (D-OPS4).
+--
+-- The runtime liveness probe (cloud-run/ops-runtime-probe-job.mjs) reports
+-- v12_newest_ready_manifest_age_seconds from
+--   SELECT max(ready_at) FROM telemetry_v12_day_manifests WHERE state = 'ready'
+-- every five minutes. Ready manifests are retained source (0035), so the set
+-- only grows, and nothing indexed ready_at or led with a global time: the two
+-- existing time indexes lead with participant_id (and PostgreSQL 17 has no
+-- skip scan), so no walk of an existing index can answer "newest ready_at
+-- overall". The read was a sequential scan bounded only by the probe's 2000 ms
+-- statement timeout, which would turn the signal into an honest but useless
+-- STATEMENT_TIMEOUT as the table grows.
+--
+-- The index is partial on the ready rows the probe reads, and keyed on
+-- ready_at, so the aggregate becomes one backward index step. The read stays
+-- read only and the probe's SQL does not change.
+--
+-- NUMBER. Primary 0068, assigned by the integrator at the D-OPS4 follow-up
+-- merge (2026-10-02), right after pending_object_transfer_holds (0067). Until
+-- then it was staged as staged-migrations/primary/0921_v12_ready_manifest_
+-- ready_at_index.sql (a placeholder number); ops-runtime-probe.spec.mjs finds
+-- it by its name suffix. The migration is purely additive (one index), so it
+-- needs no CONTRACT_MIGRATIONS entry and drops, rewrites and constrains nothing.
+--
+-- COST. CREATE INDEX takes a SHARE lock on telemetry_v12_day_manifests for the
+-- build, so writers to that table wait while it runs; the runner's 5 s lock
+-- timeout and 30 s statement timeout bound it and a failure rolls the whole
+-- migration back. CREATE INDEX CONCURRENTLY cannot run inside the runner's
+-- transaction. The build scans the table heap once (the large manifest_json
+-- column is normally stored out of line and is not read), and it belongs in a
+-- window with no upload traffic: on the first roll, before the edge switch. A
+-- ready transition (state and ready_at change once per manifest) is no longer
+-- eligible for a heap-only update, so each manifest costs one extra index entry.
+CREATE INDEX telemetry_v12_manifests_ready_at
+  ON telemetry_v12_day_manifests (ready_at)
+  WHERE state = 'ready';

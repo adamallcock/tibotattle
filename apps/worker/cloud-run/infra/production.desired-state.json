@@ -1,0 +1,106 @@
+{
+  "schemaVersion": "tibotattle-gcp-ops-infra-desired-state-v2",
+  "environment": "production",
+  "projectTenancy": "dedicated",
+  "project": "tibotattle-prod",
+  "projectNumber": "874229235044",
+  "region": "us-east1",
+  "artifactRegistry": {
+    "repository": "tibotattle-images",
+    "imageName": "tibotattle-host"
+  },
+  "serviceAccounts": {
+    "runtime": {
+      "accountId": "tibotattle-runtime",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "migrator": {
+      "accountId": "tibotattle-migrator",
+      "projectRoles": ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]
+    },
+    "scheduler": {
+      "accountId": "tibotattle-scheduler",
+      "projectRoles": []
+    },
+    "builder": {
+      "accountId": "tibotattle-builder",
+      "projectRoles": ["roles/logging.logWriter"]
+    },
+    "edgeInvoker": {
+      "accountId": "tibotattle-edge-invoker",
+      "projectRoles": []
+    },
+    "verifier": {
+      "accountId": "tibotattle-verifier",
+      "projectRoles": [],
+      "tokenCreators": ["user:adamallcock@gmail.com"]
+    }
+  },
+  "customRole": {
+    "id": "tibotattleQuarantineStore",
+    "permissions": [
+      "storage.buckets.get",
+      "storage.objects.create",
+      "storage.objects.delete",
+      "storage.objects.get",
+      "storage.objects.list"
+    ]
+  },
+  "secrets": {
+    "IDENTITY_LINK_SECRET": { "secretName": "IDENTITY_LINK_SECRET", "version": "1" },
+    "POSTGRES_RATE_LIMIT_SECRET": { "secretName": "POSTGRES_RATE_LIMIT_SECRET", "version": "1" },
+    "ENVELOPE_PUBLIC_JWK": { "secretName": "ENVELOPE_PUBLIC_JWK", "version": "1" },
+    "ENVELOPE_PRIVATE_JWK": { "secretName": "ENVELOPE_PRIVATE_JWK", "version": "1" }
+  },
+  "cloudSql": {
+    "instance": "tibotattle-primary",
+    "tier": "db-custom-2-12288",
+    "storageSizeGb": 50,
+    "backupStartTime": "07:00",
+    "maxConnections": 100,
+    "database": "tibotattle_primary",
+    "schema": "tibotattle_primary"
+  },
+  "bucket": {
+    "name": "tibotattle-quarantine",
+    "location": "US-EAST1",
+    "proof": { "bucketGeneration": "1790991062981114944", "bucketMetageneration": "1" }
+  },
+  "buildSource": {
+    "bucket": "tibotattle-prod_cloudbuild"
+  },
+  "service": {
+    "name": "tibotattle-origin",
+    "maxInstances": 4,
+    "rolloutOverlapInstances": 4,
+    "audience": "tibotattle-edge-origin",
+    "telemetryStorageNamespace": "d1:e2b732e7-456a-4472-b556-937bc4a195b4"
+  },
+  "jobs": {
+    "production-migrate": {
+      "name": "tibotattle-migrate",
+      "maxConnections": 1
+    },
+    "analytics-refresh": {
+      "name": "tibotattle-analytics-refresh",
+      "maxConnections": 4
+    },
+    "maintenance": {
+      "name": "tibotattle-maintenance",
+      "maxConnections": 2
+    }
+  },
+  "scheduler": {
+    "analytics-refresh": {
+      "name": "tibotattle-analytics-refresh-trigger",
+      "schedule": "0 3 * * *",
+      "state": "PAUSED"
+    },
+    "maintenance": {
+      "name": "tibotattle-maintenance-trigger",
+      "schedule": "* * * * *",
+      "state": "PAUSED"
+    }
+  },
+  "stagingOrigin": null
+}

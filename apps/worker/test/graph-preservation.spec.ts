@@ -10,7 +10,8 @@ import {
   ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, buildAdminCommunityAllowancePreview,
   readCachedAdminCommunityAllowancePreview, warmAdminCommunityAllowancePreviewCache,
 } from "../src/admin-community-allowance";
-import { COMMUNITY_ALLOWANCE_BASIS, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION } from "../src/community-allowance";
+import { COMMUNITY_ALLOWANCE_BASIS, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION } from "../src/community-allowance";
 import { warmCommunityAnalysisCaches } from "../src/community-analysis-warmer";
 import { readPublishedCommunityDailyAggregatesWithAllowanceState } from "../src/community-daily-aggregates";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
@@ -188,6 +189,19 @@ describe("preserved graph publication on local D1", () => {
     expect(await readCachedAdminCommunityAllowancePreview(db(), later)).toEqual(published.value);
     expect((await publicGraph(later)).graph).toEqual(original.graph);
     expect((await publicGraph(later)).graph?.breakdowns.generatedAt).toBe(published.value.generatedAt);
+  });
+
+  it("refuses a calculation-stamped preview without relabeling its stored projection", async () => {
+    await seedInput(); await seedPublication();
+    await db().prepare("UPDATE admin_community_allowance_preview_cache SET attribution_method_version=? WHERE singleton=1")
+      .bind(COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+    const previous = await cache();
+    await expect(readCachedAdminCommunityAllowancePreview(db(), NOW))
+      .rejects.toMatchObject({ code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" });
+    const read = await publicGraph();
+    expect(read.graph).toBeNull(); expect(read.read.allowanceBreakdownsCache).toBeNull();
+    expect(read.read.rows).toHaveLength(1);
+    expect(await cache()).toEqual(previous);
   });
 
   it("repository replay lookup and rejected duplicate insertion do not change the publication, epoch, or records", async () => {
@@ -451,6 +465,7 @@ describe("preserved graph successor publisher on local D1", () => {
   it.each([
     ["outside the preview", "2026-06-01", COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION],
     ["on the still-open day", "2026-09-07", COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION],
+    ["with only the calculation method", "2026-09-05", COMMUNITY_ATTRIBUTION_METHOD_VERSION],
     ["from an obsolete method", "2026-09-05", "synthetic-obsolete-attribution"],
   ])("keeps unchanged publications throttled for a date %s without needing source caches", async (_label, day, method) => {
     await seedInput(); await seedPublication(); await seedModelDay();

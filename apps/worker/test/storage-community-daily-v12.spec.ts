@@ -13,6 +13,7 @@ import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import { grantTelemetryV12AccountlessAuthorization, grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { advanceNextStorageCommunityDaily, advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -118,8 +119,13 @@ async function uploadV12Day(principal: Principal, eventNumbers: readonly number[
   const upload = await createDeviceUploadAuthorization(source(), device, envelopeDigest, 4096);
   const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
     { envelopeDigest, bodyBytes: 4096, contentType: "application/json" });
-  await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId: `chunk:${crypto.randomUUID()}`,
-    r2Key: `synthetic/v12-daily/${crypto.randomUUID()}`, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
+  // The upload route's order: register and store the object, then admit the
+  // chunk (isolation 0013 refuses a chunk without its registration).
+  const chunkRowId = `chunk:${crypto.randomUUID()}`, r2Key = `telemetry/v12-daily/${crypto.randomUUID()}`;
+  await putTrackedQuarantineObject(source(), b.QUARANTINE, { contributionId: chunkRowId, objectKind: "telemetry", r2Key,
+    registeredAt: new Date().toISOString() }, "synthetic v1.2 bytes");
+  await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId,
+    r2Key, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
   const predecessor = await createTelemetryV12DomainPredecessor(source(), principal);
   const domain = { schemaVersion: "telemetry-domain-manifest-v1.2" as const, fromDay: day, throughDay: day,
     predecessor: { token: predecessor.token, previousGenerationId: predecessor.previousGenerationId,

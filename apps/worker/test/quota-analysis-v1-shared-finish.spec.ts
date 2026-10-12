@@ -5,6 +5,7 @@ import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import {
   accountScopedQuotaAnalysisV1, accountScopedModelCompositionV1, accountScopedQuotaAnalysisV1FullReferenceForTest,
   finishAccountScopedAnalysesV1, finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1,
+  finishProviderEffectiveModelComposition, finishProviderEffectiveQuotaAnalysis,
   V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, V1_USAGE_PAGE_AT_TIME_SQL, V1_USAGE_PAGE_AFTER_TIME_SQL,
   QUOTA_DOWNSAMPLE_SQL, v1QuotaFinishQueryReserve, priceChunkUsageRecord, type V1AcquiredQuotaEvidence,
   type V1PreparedFinishEvidence, type WindowedUsageRow, type V1PreparedUsageFragment,
@@ -120,7 +121,7 @@ function preparedUsage(rows: Usage[], sourceFingerprint: string): V1PreparedFini
 }
 const newMethod = (analysis: object) => Object.hasOwn(analysis, "attributionMethod")
   ? { ...analysis, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } : analysis;
-function resetFits(analysis: object): object[] {
+function resetFits(analysis: object): Record<string, unknown>[] {
   const tracks = Reflect.get(analysis, "tracks") as { calibration: { tracks: { resets: Record<string, unknown>[] }[] } }[];
   return tracks.flatMap(track => track.calibration.tracks.flatMap(value => value.resets.map(reset => ({
     status: reset.status, capacityNanousd: reset.capacityNanousd, displayedSpanPp: reset.displayedSpanPp,
@@ -162,6 +163,141 @@ function compositionOracle(rows: Usage[], quota: readonly V1AcquiredQuotaRow[]) 
 }
 
 describe("shared acquired v1 finish", () => {
+  it("runs valid v1.2 effective usage and quota through the existing model kernel", () => {
+    const quotaRows = Array.from({ length: 34 }, (_, i) => ({
+      occurrenceId: `quota:v12:${String(i).padStart(4, "0")}`,
+      observedAt: at(i / 2), provider: PROVIDER, planType: "pro", planVariant: "unknown",
+      limitId: "codex", slot: "seven_day", usedPercent: i / 2 * 5,
+      windowDurationMinutes: 10_080, resetsAt: at(168),
+    }));
+    const usageRows = Array.from({ length: 33 }, (_, i) => ({
+      occurrenceId: `event:v12:${String(i).padStart(4, "0")}`,
+      observedAt: at(i / 2 + 0.25), provider: PROVIDER,
+      recordJson: JSON.stringify({
+        schemaVersion: "usage-event-v1.2",
+        eventId: `event:v12:${String(i).padStart(4, "0")}`,
+        eventTime: at(i / 2 + 0.25), sessionUuid: `session:v12:${String(i).padStart(4, "0")}`,
+        provider: PROVIDER, modelId: i % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra",
+        speedMode: "fast", apiServiceTier: "priority", surface: "api",
+        billingSurface: "chatgpt_subscription", reasoningEffort: "none", agentScope: "local", outcome: "success",
+        totalInputContextTokens: 10_000,
+        components: { inputUncachedTokens: 1_000, inputCacheReadTokens: 9_000,
+          inputCacheWriteTokens: 0, outputTextTokens: 1_000, outputReasoningTokens: 0,
+          outputCombinedTokens: 1_000 },
+        accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null,
+          planBasis: "same_source_occurrence", planType: "pro", planEraId: null },
+        boundaryFlags: null, tieOrder: i, cacheWriteTtl: null,
+      }),
+    }));
+    const result = finishProviderEffectiveModelComposition({
+      sourceGroups: [{ kind: "modern", datasetId: `dataset:v1:${"a".repeat(64)}`,
+        accountTrackId: `account-track:v2:${"b".repeat(64)}`, policyEpoch: "effective-v1",
+        completeWindow: true, quotaRows, usageRows, }],
+      sourceFingerprint: "a".repeat(64),
+    });
+    expect(result).toMatchObject({ status: "ready", attributionStatus: "effective_source",
+      attributionMethod: "telemetry-effective-source-v1:model", usageEventCount: 33,
+      fit: { observationCount: expect.any(Number) }, });
+  });
+
+  it("runs source-owned effective quota evidence through the shared reset-fit kernel", () => {
+    const quotaRows = Array.from({ length: 34 }, (_, i) => ({
+      occurrenceId: `quota:effective:${String(i).padStart(4, "0")}`,
+      observedAt: at(i / 2), provider: PROVIDER, planType: "pro", planVariant: "unknown",
+      limitId: "codex", slot: "seven_day", usedPercent: i / 2 * 5,
+      windowDurationMinutes: 10_080, resetsAt: at(168),
+    }));
+    const usageRows = Array.from({ length: 33 }, (_, i) => ({
+      occurrenceId: `usage:effective:${String(i).padStart(4, "0")}`,
+      observedAt: at(i / 2 + 0.25), provider: PROVIDER, recordJson: recordJson(),
+    }));
+    const result = finishProviderEffectiveQuotaAnalysis({
+      sourceFingerprint: "b".repeat(64),
+      sourceGroups: [{ kind: "modern",
+        datasetId: `dataset:v1:${"c".repeat(64)}`,
+        accountTrackId: `account-track:v2:${"d".repeat(64)}`,
+        policyEpoch: "effective-v1", completeWindow: true, quotaRows, usageRows,
+      }],
+    });
+    expect(result).toMatchObject({ status: "ready",
+      attributionMethod: "telemetry-effective-source-v1:quota",
+      inputFingerprint: "b".repeat(64), });
+    const fits = resetFits(result);
+    expect(fits.some((fit) => fit.status === "conditional_estimate"
+      && Number(fit.capacityNanousd) > 0 && Number(fit.displayedSpanPp) >= 25)).toBe(true);
+  });
+
+  it("refuses incomplete or ambiguous effective source evidence without inferring continuity", () => {
+    const row = { occurrenceId: "quota:effective:0000", observedAt: at(0), provider: PROVIDER,
+      planType: "pro", planVariant: "unknown", limitId: "codex", slot: "seven_day",
+      usedPercent: 0, windowDurationMinutes: 10_080, resetsAt: at(168) };
+    const base = { sourceFingerprint: "e".repeat(64), sourceGroups: [{ kind: "modern" as const,
+      datasetId: `dataset:v1:${"f".repeat(64)}`,
+      accountTrackId: `account-track:v2:${"1".repeat(64)}`, policyEpoch: "effective-v1",
+      completeWindow: false, quotaRows: [row], usageRows: [], }] };
+    expect(finishProviderEffectiveQuotaAnalysis(base)).toMatchObject({
+      status: "not_testable", reason: "incomplete_dataset" });
+    expect(finishProviderEffectiveQuotaAnalysis({ ...base, sourceGroups: [{ ...base.sourceGroups[0]!,
+      completeWindow: true,
+      quotaRows: [row, { ...row, occurrenceId: "quota:effective:0001", observedAt: at(1), planVariant: "other" }],
+    }] })).toMatchObject({
+      status: "not_testable", reason: "effective_usage_attribution_unavailable" });
+    expect(finishProviderEffectiveQuotaAnalysis({ ...base, sourceGroups: [{ ...base.sourceGroups[0]!,
+      completeWindow: true, accountTrackId: "participant-derived",
+    }] })).toMatchObject({ status: "not_testable", reason: "effective_account_attribution_unavailable" });
+  });
+
+  it("keeps legacy rows in an explicit excluded lane and refuses unsafe modern rows", () => {
+    const quota = { occurrenceId: "quota:modern:0000", observedAt: at(0), provider: PROVIDER,
+      planType: "pro", planVariant: "unknown", limitId: "codex", slot: "seven_day",
+      usedPercent: 0, windowDurationMinutes: 10_080, resetsAt: at(168) };
+    const usage = { occurrenceId: "usage:modern:0000", observedAt: at(0.25), provider: PROVIDER,
+      recordJson: recordJson() };
+    const modern = { kind: "modern" as const, datasetId: `dataset:v1:${"a".repeat(64)}`,
+      accountTrackId: `account-track:v2:${"b".repeat(64)}`, policyEpoch: "effective-v1",
+      completeWindow: true, quotaRows: [quota], usageRows: [usage] };
+    const legacyQuota = { ...quota, occurrenceId: "quota:legacy:0000" };
+    const legacyUsage = { ...usage, occurrenceId: "usage:legacy:0000" };
+    expect(finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "c".repeat(64), sourceGroups: [
+      modern,
+      { kind: "legacy", datasetId: `dataset:v1:${"d".repeat(64)}`, accountTrackId: null,
+        policyEpoch: "legacy-v1", completeWindow: true, quotaRows: [legacyQuota], usageRows: [legacyUsage] },
+    ] })).toMatchObject({ status: "ready", legacyQuotaRowsExcluded: 1, legacyUsageRowsExcluded: 1 });
+
+    expect(finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "c".repeat(64), sourceGroups: [{
+      ...modern, usageRows: [{ ...usage, recordJson: "{}" }],
+    }] })).toMatchObject({ status: "not_testable", reason: "effective_usage_pricing_unavailable" });
+    expect(finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "c".repeat(64), sourceGroups: [{
+      ...modern, usageRows: [
+        { ...usage, recordJson: "{}" },
+        { ...usage, recordJson: recordJson() },
+      ],
+    }] })).toMatchObject({ status: "not_testable", reason: "effective_usage_rows_duplicate" });
+    expect(finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "c".repeat(64), sourceGroups: [{
+      ...modern, quotaRows: [{ ...quota, windowDurationMinutes: Number.NaN }],
+    }] })).toMatchObject({ status: "not_testable", reason: "effective_quota_rows_invalid" });
+    expect(() => finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "c".repeat(64),
+      maxQuotaRows: 60_001, sourceGroups: [modern] })).toThrow("effective quota bounds invalid");
+  });
+
+  it("retains separate supported windows for one provider and reuses only source attribution", () => {
+    const quota = (occurrenceId: string, observedAt: string, windowDurationMinutes: number, resetsAt: string) => ({
+      occurrenceId, observedAt, provider: PROVIDER, planType: "pro", planVariant: "unknown",
+      limitId: "codex", slot: "primary", usedPercent: 10, windowDurationMinutes, resetsAt,
+    });
+    const result = finishProviderEffectiveQuotaAnalysis({ sourceFingerprint: "f".repeat(64), sourceGroups: [{
+      kind: "modern", datasetId: `dataset:v1:${"0".repeat(64)}`,
+      accountTrackId: `account-track:v2:${"1".repeat(64)}`, policyEpoch: "effective-v1",
+      completeWindow: true,
+      quotaRows: [quota("quota:five-hour:0000", at(0), 300, at(5)),
+        quota("quota:seven-day:0000", at(6), 10_080, at(174))],
+      usageRows: [{ occurrenceId: "usage:dual-window:0000", observedAt: at(0.25), provider: PROVIDER,
+        recordJson: recordJson() }],
+    }] });
+    expect(result).toMatchObject({ status: "ready" });
+    expect((result.tracks as unknown[]).length).toBe(2);
+  });
+
   it("matches the raw global-bin oracle across page seams, late poison, and distinct future bins", async () => {
     const rows = Array.from({ length: 33 }, (_, i) => usage(i + 1, i / 2 + 0.25));
     rows.push(...Array.from({ length: 5001 }, (_, i) => usage(i + 100, 1.75, {

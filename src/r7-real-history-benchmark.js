@@ -292,10 +292,14 @@ async function runMeasuredWorker(root, config, {
     },
   });
   if (filesystem.outcome !== "completed") {
-    throw new Error(
+    const error = new Error(
       `R7 real-history ${config.operation} filesystem sampling stopped: ${filesystem.outcome}`
         + (operationError === null ? "" : `: ${operationError.message}`),
     );
+    if (operationError?.r7WorkerDiagnostic !== undefined) {
+      Object.defineProperty(error, "r7WorkerDiagnostic", { value: operationError.r7WorkerDiagnostic });
+    }
+    throw error;
   }
   return aggregateMeasuredOperation(requireCompleted(operation), filesystem);
 }
@@ -571,10 +575,14 @@ export async function runR7RealHistoryEvidence({
         // A cleanup failure must never replace the benchmark's own error:
         // that masking is how a failed pass used to surface only as
         // "temporary inventory contained a symlink".
-        operativeError = operativeError === null ? cleanupError : new AggregateError(
-          [operativeError, cleanupError],
+        const benchmarkError = operativeError;
+        operativeError = benchmarkError === null ? cleanupError : new AggregateError(
+          [benchmarkError, cleanupError],
           "R7 real-history cleanup failed after a benchmark error",
         );
+        if (benchmarkError?.r7WorkerDiagnostic !== undefined) {
+          Object.defineProperty(operativeError, "r7WorkerDiagnostic", { value: benchmarkError.r7WorkerDiagnostic });
+        }
       }
     }
   }

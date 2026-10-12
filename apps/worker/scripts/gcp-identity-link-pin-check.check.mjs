@@ -1,0 +1,336 @@
+/**
+ * The production identity-link continuity check (gcp-identity-link-pin-check.mjs):
+ * its fingerprint is the Worker's, it reads only the pinned version through
+ * one read-only gcloud call, it names mismatches without content, and its
+ * output never carries the value, the payload or a fingerprint. Every value
+ * here is synthetic.
+ */
+
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
+import {
+  PRODUCTION_IDENTITY_LINK_SECRET_VERSION,
+  PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
+} from "../cloud-run/postgres-production-configuration.mjs";
+import { IDENTITY_LINK_CONSUMER_ROUTE_IDS } from "../cloud-run/postgres-production-registry.mjs";
+import * as check from "./gcp-identity-link-pin-check.mjs";
+import * as manifest from "./gcp-ops-infra-manifest.mjs";
+import { buildIdentityLinkRotation } from "./postgres-identity-link-pin.mjs";
+import { PRODUCTION_IDENTITY_LINK_ROTATION_LABELS } from "./postgres-production-transfer.mjs";
+import { unpinnedProductionText } from "./fixtures/gcp-ops-infra/production-unfilled.mjs";
+
+process.env.PATH = "/nonexistent-gcloud-guard";
+
+const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const SECRET = "synthetic-identity-link-secret-value-0000000001";
+const OTHER = "synthetic-identity-link-secret-value-0000000002";
+/**
+ * Round 16: the origin runs the rotated label; Cloudflare's D1 pin carries the
+ * retired one, so a pin read from production's D1 never matches the new
+ * secret (the cutover rotates the imported pin; see the E-PT8 orchestrator).
+ */
+const CURRENT_LABEL = PRODUCTION_IDENTITY_LINK_SECRET_VERSION;
+const RETIRED_LABEL = PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS[0];
+const SECRETS = Object.freeze([SECRET, `${SECRET}\n`, "s".repeat(32), `${"long-synthetic-key-".repeat(9)}é`, "﻿synthetic-bom-led-identity-link-0001"]);
+
+async function workerFingerprint() {
+  const bundle = await build({
+    entryPoints: [join(WORKER_ROOT, "src/identity-link-configuration.ts")],
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    write: false,
+    logLevel: "silent",
+  });
+  const source = Buffer.from(bundle.outputFiles[0].text).toString("base64");
+  return (await import(`data:text/javascript;base64,${source}`)).identityLinkSecretFingerprint;
+}
+
+function desired(version = "1") {
+  const value = JSON.parse(unpinnedProductionText());
+  value.secrets.IDENTITY_LINK_SECRET.version = version;
+  return manifest.validateDesiredState(value);
+}
+
+function pinFor(secret, keyVersion = CURRENT_LABEL) {
+  return { keyVersion, secretFingerprint: check.identityLinkSecretFingerprint(secret) };
+}
+
+function d1Output(row) {
+  return JSON.stringify([{ results: [row], success: true, meta: { rows_read: 1 } }]);
+}
+
+/** A fake spawn that answers `gcloud secrets versions access` with a synthetic value. */
+function fakeGcloud(value, { status = 0, name, encode = (bytes) => bytes.toString("base64") } = {}) {
+  const calls = [];
+  const spawn = (command, argv, options) => {
+    calls.push({ command, argv, options });
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+    const response = {
+      name: name ?? `projects/874229235044/secrets/IDENTITY_LINK_SECRET/versions/${argv[3]}`,
+      payload: { data: encode(bytes), dataCrc32c: "1" },
+    };
+    return { status, stdout: status === 0 ? JSON.stringify(response) : "", stderr: status === 0 ? "" : "ERROR: synthetic" };
+  };
+  return { spawn, calls };
+}
+
+async function run(argv, { value = SECRET, pin = d1Output({ key_version: CURRENT_LABEL,
+  secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }), rotation, desiredState = desired(), gcloud } = {}) {
+  const fake = gcloud ?? fakeGcloud(value);
+  const out = [];
+  const err = [];
+  const code = await check.main(argv, {
+    spawn: fake.spawn,
+    readPin: (path) => (path === "rotation.json" ? rotation : pin),
+    loadDesiredState: () => desiredState,
+    stdout: (text) => out.push(text),
+    stderr: (text) => err.push(text),
+  });
+  return { code, stdout: out.join(""), stderr: err.join(""), calls: fake.calls };
+}
+
+function assertContentFree(text, secret = SECRET) {
+  assert.equal(text.includes(secret.trim()), false);
+  assert.equal(text.includes(Buffer.from(secret).toString("base64").slice(0, 16)), false);
+  assert.doesNotMatch(text, /[0-9a-f]{64}/u);
+}
+
+test("the fingerprint is the Worker's identityLinkSecretFingerprint", async () => {
+  const worker = await workerFingerprint();
+  for (const secret of SECRETS) assert.equal(check.identityLinkSecretFingerprint(secret), await worker(secret), secret.length);
+  assert.notEqual(check.identityLinkSecretFingerprint(SECRET), check.identityLinkSecretFingerprint(`${SECRET}\n`));
+});
+
+test("the pin comes from a wrangler d1 --json SELECT or PT-3's identityLinkPin, with exactly one row", () => {
+  const fingerprint = check.identityLinkSecretFingerprint(SECRET);
+  const expected = { keyVersion: "production-v1", secretFingerprint: fingerprint };
+  assert.deepEqual({ ...check.parseIdentityLinkPin(d1Output({ key_version: "production-v1", secret_fingerprint: fingerprint })) },
+    expected);
+  assert.deepEqual({ ...check.parseIdentityLinkPin(JSON.stringify(expected)) }, expected);
+  for (const text of [
+    "not json",
+    "[]",
+    JSON.stringify([{ results: [] }]),
+    JSON.stringify([{ results: [{ key_version: "production-v1", secret_fingerprint: fingerprint }], success: false }]),
+    JSON.stringify([{ results: [{ key_version: "production-v1", secret_fingerprint: fingerprint },
+      { key_version: "production-v1", secret_fingerprint: fingerprint }] }]),
+    d1Output({ key_version: "production-v1", secret_fingerprint: fingerprint, recorded_at: "2026-01-01" }),
+    d1Output({ key_version: "production-v1", secret_fingerprint: fingerprint.toUpperCase() }),
+    d1Output({ key_version: "production v1", secret_fingerprint: fingerprint }),
+    JSON.stringify({ ...expected, extra: 1 }),
+    JSON.stringify({ keyVersion: "production-v1", secretFingerprint: fingerprint.slice(1) }),
+  ]) {
+    assert.throws(() => check.parseIdentityLinkPin(text), { code: "PIN_CHECK_PIN_INVALID" }, text);
+  }
+});
+
+test("the target is the committed production IDENTITY_LINK_SECRET version, or --version before the pin", () => {
+  assert.deepEqual({ ...check.pinCheckTarget(desired("3"), undefined) }, { project: "tibotattle-prod",
+    projectNumber: "874229235044", secretName: "IDENTITY_LINK_SECRET", version: "3", versionPinned: true });
+  assert.equal(check.pinCheckTarget(desired("3"), "3").version, "3");
+  assert.throws(() => check.pinCheckTarget(desired("3"), "4"), { code: "PIN_CHECK_VERSION_NOT_THE_PINNED_VERSION" });
+  const unpinned = desired(null);
+  assert.throws(() => check.pinCheckTarget(unpinned, undefined), { code: "PIN_CHECK_VERSION_REQUIRED" });
+  assert.deepEqual([check.pinCheckTarget(unpinned, "2").version, check.pinCheckTarget(unpinned, "2").versionPinned],
+    ["2", false]);
+  // The committed file loads as the production plane the check reads.
+  assert.equal(manifest.loadCommittedDesiredState("production").secrets.IDENTITY_LINK_SECRET.secretName,
+    check.IDENTITY_LINK_SECRET_NAME);
+  for (const argv of [[], ["--environment=staging", "--pin-file=x"], ["--environment=production"],
+    ["--environment=production", "--pin-file=x", "--version=latest"], ["--environment=production", "--pin-file=x", "extra"],
+    ["--environment=production", "--pin-file=x", "--project=other"]]) {
+    assert.throws(() => check.parsePinCheckArgs(argv), (error) => error.code?.startsWith("PIN_CHECK_"), argv.join(" "));
+  }
+});
+
+test("a match reads the pinned version once, read-only, without a shell or HTTP logging, and prints no content", async () => {
+  const result = await run(["--environment=production", "--pin-file=pin.json"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.calls.length, 1);
+  const [call] = result.calls;
+  assert.equal(call.command, "gcloud");
+  assert.deepEqual(call.argv, ["secrets", "versions", "access", "1", "--secret=IDENTITY_LINK_SECRET",
+    "--project=tibotattle-prod", "--format=json", "--no-log-http"]);
+  assert.equal(call.options.shell, false);
+  assert.deepEqual(call.options.stdio, ["ignore", "pipe", "pipe"]);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual(report, { schema: check.IDENTITY_LINK_PIN_CHECK_SCHEMA, environment: "production",
+    project: "tibotattle-prod", secret: "IDENTITY_LINK_SECRET", version: "1", versionPinned: true,
+    expectedKeyVersion: CURRENT_LABEL, outcome: "match", reasons: [] });
+  assertContentFree(result.stdout);
+  assert.equal(result.stderr, "");
+  // gcloud's base64url alphabet and a project-id response name are accepted too.
+  const urlSafe = fakeGcloud("??>>synthetic-identity-link-secret-url-safe-01", {
+    name: "projects/tibotattle-prod/secrets/IDENTITY_LINK_SECRET/versions/1",
+    encode: (bytes) => bytes.toString("base64url"),
+  });
+  const safe = await run(["--environment=production", "--pin-file=pin.json"], { gcloud: urlSafe,
+    pin: JSON.stringify(pinFor("??>>synthetic-identity-link-secret-url-safe-01")) });
+  assert.equal(safe.code, 0, safe.stderr);
+});
+
+test("a mismatch names its reasons without content, including the trailing-newline slips", async () => {
+  const cases = [
+    [`${SECRET}\n`, pinFor(SECRET), ["FINGERPRINT_MISMATCH", "MATCHES_WITHOUT_TRAILING_NEWLINE"]],
+    [`${SECRET}\r\n`, pinFor(SECRET), ["FINGERPRINT_MISMATCH", "MATCHES_WITHOUT_TRAILING_NEWLINE"]],
+    [SECRET, pinFor(`${SECRET}\n`), ["FINGERPRINT_MISMATCH", "MATCHES_WITH_TRAILING_NEWLINE"]],
+    [OTHER, pinFor(SECRET), ["FINGERPRINT_MISMATCH"]],
+    [SECRET, pinFor(SECRET, RETIRED_LABEL), ["KEY_VERSION_MISMATCH"]],
+    // Round 16: the rotated secret against Cloudflare's D1 pin (the lost secret, the retired label).
+    [SECRET, pinFor(OTHER, RETIRED_LABEL), ["KEY_VERSION_MISMATCH", "FINGERPRINT_MISMATCH"]],
+    ["short-synthetic", pinFor("short-synthetic"), ["SECRET_TOO_SHORT"]],
+  ];
+  for (const [value, pin, reasons] of cases) {
+    const result = await run(["--environment=production", "--pin-file=pin.json"], { value, pin: JSON.stringify(pin) });
+    assert.equal(result.code, 2, reasons.join());
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.outcome, "mismatch");
+    assert.deepEqual(report.reasons, reasons);
+    assertContentFree(result.stdout, value);
+  }
+});
+
+test("refusals are named codes on stderr, never echo gcloud or the value, and a bad pin calls nothing", async () => {
+  const argv = ["--environment=production", "--pin-file=pin.json"];
+  const badPin = await run(argv, { pin: "{}" });
+  assert.deepEqual([badPin.code, badPin.calls.length, JSON.parse(badPin.stderr)],
+    [1, 0, { status: "error", code: "PIN_CHECK_PIN_INVALID" }]);
+  const cases = [
+    [fakeGcloud(SECRET, { status: 1 }), "PIN_CHECK_SECRET_ACCESS_FAILED"],
+    [fakeGcloud(SECRET, { name: "projects/874229235044/secrets/IDENTITY_LINK_SECRET/versions/2" }),
+      "PIN_CHECK_SECRET_RESPONSE_INVALID"],
+    [fakeGcloud(SECRET, { name: "projects/874229235044/secrets/OTHER_SECRET/versions/1" }),
+      "PIN_CHECK_SECRET_RESPONSE_INVALID"],
+    [fakeGcloud(SECRET, { encode: () => "not base64!" }), "PIN_CHECK_SECRET_RESPONSE_INVALID"],
+    [fakeGcloud(Buffer.from([0xff, 0xfe, 0x41])), "PIN_CHECK_SECRET_NOT_UTF8"],
+    [{ calls: [], spawn: () => ({ status: 0, stdout: `{"payload":"${SECRET}"` }) }, "PIN_CHECK_SECRET_RESPONSE_INVALID"],
+    [{ calls: [], spawn: () => ({ error: new Error(SECRET) }) }, "PIN_CHECK_SECRET_ACCESS_FAILED"],
+  ];
+  for (const [gcloud, code] of cases) {
+    const result = await run(argv, { gcloud });
+    assert.equal(result.code, 1, code);
+    assert.deepEqual(JSON.parse(result.stderr), { status: "error", code }, code);
+    assert.equal(result.stdout, "");
+    assertContentFree(result.stderr);
+  }
+  const unpinned = await run(argv, { desiredState: desired(null) });
+  assert.deepEqual([unpinned.code, unpinned.calls.length, JSON.parse(unpinned.stderr).code],
+    [1, 0, "PIN_CHECK_VERSION_REQUIRED"]);
+});
+
+test("the CLI entry runs as a subprocess and refuses a non-production environment", () => {
+  const result = spawnSync(process.execPath, [join(WORKER_ROOT, "scripts/gcp-identity-link-pin-check.mjs"),
+    "--environment=staging", "--pin-file=pin.json"], { encoding: "utf8", env: { PATH: "/nonexistent-gcloud-guard" } });
+  assert.equal(result.status, 1, result.stderr);
+  assert.deepEqual(JSON.parse(result.stderr), { status: "error", code: "PIN_CHECK_ENVIRONMENT_INVALID" });
+  assert.equal(result.stdout, "");
+});
+
+/**
+ * Round 16's rotation document, as `identity-rotate-pin` builds it: from
+ * Cloudflare's D1 pin (the retired label and the lost secret, OTHER here) to
+ * the newly generated secret mounted under the label the origin runs.
+ */
+function rotationFor({ secret = SECRET, lost = OTHER, secretName = "IDENTITY_LINK_SECRET", secretVersion = "1" } = {}) {
+  return buildIdentityLinkRotation({
+    secret,
+    sealedPin: { keyVersion: RETIRED_LABEL, secretFingerprint: check.identityLinkSecretFingerprint(lost) },
+    fromKeyVersion: RETIRED_LABEL,
+    toKeyVersion: CURRENT_LABEL,
+    secretName,
+    secretVersion,
+    consumerRouteIds: IDENTITY_LINK_CONSUMER_ROUTE_IDS,
+    computedAt: "2026-10-03T00:00:00.000Z",
+    labels: PRODUCTION_IDENTITY_LINK_ROTATION_LABELS,
+  }).rotation;
+}
+
+const ROTATED_ARGV = Object.freeze(["--environment=production", "--pin-file=pin.json", "--rotation-file=rotation.json"]);
+/** Cloudflare's D1 pin: the retired label and the lost secret's fingerprint. */
+const D1_PIN = d1Output({ key_version: RETIRED_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(OTHER) });
+
+test("rotated mode: a newly generated mount passes against the D1 pin only through the rotation document", async () => {
+  assert.deepEqual({ ...PRODUCTION_IDENTITY_LINK_ROTATION_LABELS, retiredKeyVersions: [...PRODUCTION_IDENTITY_LINK_ROTATION_LABELS.retiredKeyVersions] },
+    { currentKeyVersion: "production-v2", retiredKeyVersions: ["production-v1"] });
+  assert.equal(CURRENT_LABEL, "production-v2");
+  const rotation = JSON.stringify(rotationFor());
+  const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.calls.length, 1, "one read-only access, as in continuity mode");
+  assert.deepEqual(JSON.parse(result.stdout), { schema: check.IDENTITY_LINK_PIN_CHECK_SCHEMA, environment: "production",
+    project: "tibotattle-prod", secret: "IDENTITY_LINK_SECRET", version: "1", versionPinned: true,
+    expectedKeyVersion: "production-v2", rotation: { fromKeyVersion: "production-v1", toKeyVersion: "production-v2" },
+    outcome: "match", reasons: [] });
+  assertContentFree(result.stdout);
+  assertContentFree(result.stdout, OTHER);
+  // The same mount and D1 pin without the flag still exit 2: continuity mode never passes a rotated mount.
+  const plain = await run(["--environment=production", "--pin-file=pin.json"], { pin: D1_PIN });
+  assert.equal(plain.code, 2);
+  assert.deepEqual(JSON.parse(plain.stdout).reasons, ["KEY_VERSION_MISMATCH", "FINGERPRINT_MISMATCH"]);
+  assert.equal(Object.hasOwn(JSON.parse(plain.stdout), "rotation"), false);
+});
+
+test("rotated mode: each binding that fails is a named, content-free mismatch", async () => {
+  const cases = [
+    // The mount is not the rotation's target, or carries the usual custody slip.
+    [{ value: OTHER }, ["FINGERPRINT_MISMATCH"]],
+    [{ value: `${SECRET}\n` }, ["FINGERPRINT_MISMATCH", "MATCHES_WITHOUT_TRAILING_NEWLINE"]],
+    [{ value: "short-synthetic" }, ["SECRET_TOO_SHORT", "FINGERPRINT_MISMATCH"]],
+    // The D1 pin is not the rotation's source (another fingerprint, or already the rotated label).
+    [{ pin: d1Output({ key_version: RETIRED_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(SECRET) }) },
+      ["ROTATION_SOURCE_MISMATCH"]],
+    [{ pin: d1Output({ key_version: CURRENT_LABEL, secret_fingerprint: check.identityLinkSecretFingerprint(OTHER) }) },
+      ["ROTATION_SOURCE_MISMATCH"]],
+    // The rotation names another secret id or version than the one mounted.
+    [{ rotation: JSON.stringify(rotationFor({ secretVersion: "2" })) }, ["ROTATION_SECRET_VERSION_MISMATCH"]],
+    [{ rotation: JSON.stringify(rotationFor({ secretName: "OTHER_SECRET" })) }, ["ROTATION_SECRET_NAME_MISMATCH"]],
+  ];
+  for (const [options, reasons] of cases) {
+    const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation: JSON.stringify(rotationFor()), ...options });
+    assert.equal(result.code, 2, reasons.join());
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.outcome, "mismatch");
+    assert.deepEqual(report.reasons, reasons);
+    assertContentFree(result.stdout, options.value ?? SECRET);
+  }
+  // The comparison alone, with the label rule's last guard: a rotation that does not land on the running label.
+  const rotation = rotationFor();
+  const target = { secretName: "IDENTITY_LINK_SECRET", version: "1" };
+  const pin = { keyVersion: RETIRED_LABEL, secretFingerprint: check.identityLinkSecretFingerprint(OTHER) };
+  assert.deepEqual([...check.checkRotatedIdentityLinkPin(SECRET, pin, rotation, target,
+    { expectedKeyVersion: "production-v3" }).reasons], ["KEY_VERSION_MISMATCH"]);
+});
+
+test("rotated mode: an invalid rotation document or label pair is refused before any gcloud call", async () => {
+  const valid = rotationFor();
+  const mutated = (mutate) => {
+    const value = structuredClone(valid);
+    mutate(value);
+    return JSON.stringify(value);
+  };
+  const cases = [
+    ["not json", "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.extra = 1; }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.reason = "routine"; }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.retiredConsumerRoutes = value.retiredConsumerRoutes.slice(1); }), "PIN_CHECK_ROTATION_INVALID"],
+    [mutated((value) => { value.to.secretFingerprint = value.from.secretFingerprint; }), "PIN_CHECK_ROTATION_INVALID"],
+    // Well-formed, but not production's labels: another plane's, the wrong direction, or an unknown retired label.
+    [mutated((value) => { value.to.keyVersion = "staging-gcp-v1"; }), "PIN_CHECK_ROTATION_LABELS_INVALID"],
+    [mutated((value) => { value.from.keyVersion = "production-v2"; value.to.keyVersion = "production-v1"; }),
+      "PIN_CHECK_ROTATION_LABELS_INVALID"],
+    [mutated((value) => { value.from.keyVersion = "production-v0"; }), "PIN_CHECK_ROTATION_LABELS_INVALID"],
+  ];
+  for (const [rotation, code] of cases) {
+    const result = await run(ROTATED_ARGV, { pin: D1_PIN, rotation });
+    assert.deepEqual([result.code, result.calls.length, JSON.parse(result.stderr)], [1, 0, { status: "error", code }], code);
+    assert.equal(result.stdout, "");
+  }
+  assert.throws(() => check.parsePinCheckArgs(["--environment=production", "--pin-file=x", "--rotation-file="]),
+    { code: "PIN_CHECK_ARGUMENT_INVALID" });
+  assert.equal(check.parsePinCheckArgs(["--environment=production", "--pin-file=x"]).rotationFile, null);
+});

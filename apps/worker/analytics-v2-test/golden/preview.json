@@ -1,0 +1,4102 @@
+{
+ "basis": "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+ "coverage": {
+  "cachedParticipantCount": 4,
+  "mergeEligibleParticipantCount": 4,
+  "noQualifyingFitParticipantCount": 0,
+  "noRecentFitParticipantCount": 0,
+  "recentFittedParticipantCount": 4,
+  "unsupportedPlanParticipantCount": 0,
+  "uploadingParticipantCount": 4
+ },
+ "days": [
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 135.1507,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.7332,
+      "upperUsd": 170.4962
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 7,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7594,
+      "upperUsd": 103.7422
+     },
+     "centralUsd": 100.6601,
+     "fitCount": 3,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.8159,
+     "upperUsd": 168.3179
+    },
+    "centralUsd": 131.0975,
+    "fitCount": 14,
+    "participantCount": 4
+   },
+   "day": "2026-07-24"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 135.1507,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.7332,
+      "upperUsd": 170.4962
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 7,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.3675,
+     "upperUsd": 168.1185
+    },
+    "centralUsd": 127.9879,
+    "fitCount": 15,
+    "participantCount": 4
+   },
+   "day": "2026-07-25"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 135.1507,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3427,
+      "upperUsd": 170.1012
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.4163,
+     "upperUsd": 167.9192
+    },
+    "centralUsd": 131.0975,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-07-26"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 135.1507,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3427,
+      "upperUsd": 170.1012
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.4163,
+     "upperUsd": 167.9192
+    },
+    "centralUsd": 131.0975,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-07-27"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 126.0514,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 137.3524,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3427,
+      "upperUsd": 170.1012
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.465,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 127.9879,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-07-28"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 126.0514,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 137.3524,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3427,
+      "upperUsd": 170.1012
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.465,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 127.9879,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-07-29"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 125.6357,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3925,
+      "upperUsd": 169.7061
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.465,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-07-30"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 125.6357,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3925,
+      "upperUsd": 169.7061
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 99.7257,
+      "upperUsd": 103.357
+     },
+     "centralUsd": 100.4163,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 100.465,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-07-31"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 125.6357,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.853,
+      "upperUsd": 170.1012
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 102.9717
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-01"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 125.6357,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3925,
+      "upperUsd": 173.7646
+     },
+     "centralUsd": 166.5077,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 102.9717
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.981,
+     "upperUsd": 170.1012
+    },
+    "centralUsd": 124.3011,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-08-02"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 125.6357,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 138.9496,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.3925,
+      "upperUsd": 173.7646
+     },
+     "centralUsd": 166.5077,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 103.2107
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 170.4962
+    },
+    "centralUsd": 127.9879,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-03"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 137.3524,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.853,
+      "upperUsd": 171.4479
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 103.2107
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-04"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 137.3524,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.853,
+      "upperUsd": 171.4479
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 103.2107
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-05"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 133.3897,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.7392,
+      "upperUsd": 170.6039
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 103.2107
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-06"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 133.3897,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 111.7392,
+      "upperUsd": 170.6039
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 103.2107
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-07"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 133.3897,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 171.4479
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 106.4283
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 167.7198
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-08"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 133.3897,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 166.5077,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 106.4283
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.981,
+     "upperUsd": 171.4479
+    },
+    "centralUsd": 123.4234,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-08-09"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 147.4095
+     },
+     "centralUsd": 133.3897,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 166.5077,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 105.4455
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 172.2919
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-10"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 132.0192,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 105.4455
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-11"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 146.4291
+     },
+     "centralUsd": 132.0192,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 147.2478,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 105.4455
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-12"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 144.8512
+     },
+     "centralUsd": 129.1258,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 105.4455
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-13"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 144.8512
+     },
+     "centralUsd": 129.1258,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 127.9879,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.8306,
+      "upperUsd": 105.4455
+     },
+     "centralUsd": 99.8534,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-14"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 144.8512
+     },
+     "centralUsd": 129.1258,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 143.9887,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 105.364
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.9172,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 120.6143,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-15"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 144.8512
+     },
+     "centralUsd": 129.1258,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5026,
+      "upperUsd": 105.364
+     },
+     "centralUsd": 100.1725,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.981,
+     "upperUsd": 170.0525
+    },
+    "centralUsd": 121.042,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-08-16"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 144.8512
+     },
+     "centralUsd": 129.1258,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.0221,
+      "upperUsd": 105.9493
+     },
+     "centralUsd": 101.0122,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 171.0959
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-17"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 143.018
+     },
+     "centralUsd": 128.933,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 140.3689,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.0221,
+      "upperUsd": 105.9493
+     },
+     "centralUsd": 101.0122,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 170.847
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-18"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 143.018
+     },
+     "centralUsd": 128.933,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 140.3689,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.0221,
+      "upperUsd": 105.9493
+     },
+     "centralUsd": 101.0122,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 170.847
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-19"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 131.0933
+     },
+     "centralUsd": 127.5827,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.0221,
+      "upperUsd": 105.9493
+     },
+     "centralUsd": 101.0122,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 170.847
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-20"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 131.0933
+     },
+     "centralUsd": 127.5827,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 177.4892
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.0221,
+      "upperUsd": 105.9493
+     },
+     "centralUsd": 101.0122,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 170.847
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-21"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 131.0933
+     },
+     "centralUsd": 127.5827,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 177.5558
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.7579,
+      "upperUsd": 105.6042
+     },
+     "centralUsd": 101.8518,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.1801,
+     "upperUsd": 170.847
+    },
+    "centralUsd": 121.4697,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-22"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 131.0933
+     },
+     "centralUsd": 127.5827,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.7579,
+      "upperUsd": 105.6042
+     },
+     "centralUsd": 101.8518,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.348,
+     "upperUsd": 177.5558
+    },
+    "centralUsd": 121.796,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-08-23"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.2997,
+      "upperUsd": 131.0933
+     },
+     "centralUsd": 127.5827,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.3082,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5259,
+      "upperUsd": 106.1295
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-24"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 131.0123
+     },
+     "centralUsd": 128.933,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5259,
+      "upperUsd": 106.1295
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-25"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 122.8615,
+      "upperUsd": 131.0123
+     },
+     "centralUsd": 128.933,
+     "fitCount": 5,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 113.2266,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5259,
+      "upperUsd": 106.1295
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-26"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6956,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5259,
+      "upperUsd": 106.1295
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-27"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6956,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 95.5259,
+      "upperUsd": 106.1295
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-28"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6905,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 96.4296,
+      "upperUsd": 105.9376
+     },
+     "centralUsd": 102.4524,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-29"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6956,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 96.4296,
+      "upperUsd": 105.9376
+     },
+     "centralUsd": 102.4524,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2722,
+     "upperUsd": 177.5558
+    },
+    "centralUsd": 124.1773,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-08-30"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6956,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 102.032,
+      "upperUsd": 106.3795
+     },
+     "centralUsd": 102.8691,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.9524,
+     "upperUsd": 177.6224
+    },
+    "centralUsd": 126.2324,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-08-31"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6905,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 102.032,
+      "upperUsd": 106.3795
+     },
+     "centralUsd": 102.8691,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.8691,
+     "upperUsd": 169.5047
+    },
+    "centralUsd": 124.1773,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-01"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.0426,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 112.6905,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 102.032,
+      "upperUsd": 106.3795
+     },
+     "centralUsd": 102.8691,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.8691,
+     "upperUsd": 169.5047
+    },
+    "centralUsd": 124.1773,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-02"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 129.0468,
+      "upperUsd": 131.5158
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.6875,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 102.032,
+      "upperUsd": 106.3795
+     },
+     "centralUsd": 102.8691,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.635,
+     "upperUsd": 169.5047
+    },
+    "centralUsd": 121.796,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-03"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 129.0468,
+      "upperUsd": 131.5158
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.6875,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 102.032,
+      "upperUsd": 106.3795
+     },
+     "centralUsd": 102.8691,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.635,
+     "upperUsd": 169.5047
+    },
+    "centralUsd": 121.796,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-04"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 129.0468,
+      "upperUsd": 131.5158
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 180.0232
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7818,
+      "upperUsd": 105.9376
+     },
+     "centralUsd": 102.4524,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 169.5047
+    },
+    "centralUsd": 121.796,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-05"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 129.0468,
+      "upperUsd": 131.5158
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7818,
+      "upperUsd": 105.9376
+     },
+     "centralUsd": 102.4524,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.2122,
+     "upperUsd": 172.3012
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-09-06"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 129.0468,
+      "upperUsd": 131.5158
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 179.3561
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7701,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 173.2547
+    },
+    "centralUsd": 125.5276,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-07"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.937,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 173.3488
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7701,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 164.7373
+    },
+    "centralUsd": 124.8162,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-08"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.937,
+      "upperUsd": 131.2641
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 173.3488
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7701,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 164.7373
+    },
+    "centralUsd": 124.8162,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-09"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7947,
+      "upperUsd": 129.3883
+     },
+     "centralUsd": 128.933,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 171.7283
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7701,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 164.7373
+    },
+    "centralUsd": 121.796,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-10"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7947,
+      "upperUsd": 129.3883
+     },
+     "centralUsd": 128.933,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 171.7283
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 101.7701,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.1521,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.1521,
+     "upperUsd": 164.7373
+    },
+    "centralUsd": 121.796,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-11"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7947,
+      "upperUsd": 129.3883
+     },
+     "centralUsd": 128.933,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 173.3488
+     },
+     "centralUsd": 140.6951,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 98.3422,
+      "upperUsd": 102.9524
+     },
+     "centralUsd": 101.8518,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.7935,
+     "upperUsd": 164.7373
+    },
+    "centralUsd": 118.043,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-12"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7947,
+      "upperUsd": 129.3883
+     },
+     "centralUsd": 128.933,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 173.2103
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 98.3422,
+      "upperUsd": 102.9524
+     },
+     "centralUsd": 101.8518,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 101.8051,
+     "upperUsd": 169.2282
+    },
+    "centralUsd": 122.1222,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-09-13"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7947,
+      "upperUsd": 129.3883
+     },
+     "centralUsd": 128.933,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 173.2103
+     },
+     "centralUsd": 159.268,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 97.7768,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.0937,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.0937,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 124.8162,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-14"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.937,
+      "upperUsd": 130.2995
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 174.6456
+     },
+     "centralUsd": 141.5548,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 97.7768,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.0937,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.0937,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 124.8162,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-15"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.937,
+      "upperUsd": 130.2995
+     },
+     "centralUsd": 129.2175,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 174.6456
+     },
+     "centralUsd": 141.5548,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 97.7768,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.0937,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.0937,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 124.8162,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-16"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.9085,
+      "upperUsd": 130.4134
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 173.2103
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 97.7768,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.0937,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.0937,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 119.8216,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-17"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.9085,
+      "upperUsd": 130.4134
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 173.2103
+     },
+     "centralUsd": 122.1222,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 97.7768,
+      "upperUsd": 103.0358
+     },
+     "centralUsd": 102.0937,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 102.0937,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 119.8216,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-18"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.9085,
+      "upperUsd": 130.4134
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 174.6456
+     },
+     "centralUsd": 139.2541,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.9585,
+      "upperUsd": 102.9524
+     },
+     "centralUsd": 101.7351,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 115.7423,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-19"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.9085,
+      "upperUsd": 130.4134
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 175.0128
+     },
+     "centralUsd": 160.9873,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.9585,
+      "upperUsd": 102.9524
+     },
+     "centralUsd": 101.7351,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 99.4732,
+     "upperUsd": 171.241
+    },
+    "centralUsd": 117.5209,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-09-20"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.9085,
+      "upperUsd": 130.4134
+     },
+     "centralUsd": 129.5021,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 110.7281,
+      "upperUsd": 175.0128
+     },
+     "centralUsd": 160.9873,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.7715,
+      "upperUsd": 102.8206
+     },
+     "centralUsd": 98.9077,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 171.4664
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-21"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.8407,
+      "upperUsd": 130.2995
+     },
+     "centralUsd": 129.057,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 171.0157
+     },
+     "centralUsd": 139.2541,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.7715,
+      "upperUsd": 102.8206
+     },
+     "centralUsd": 98.9077,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-22"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.8407,
+      "upperUsd": 130.2995
+     },
+     "centralUsd": 129.057,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.7393,
+      "upperUsd": 171.0157
+     },
+     "centralUsd": 139.2541,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.7715,
+      "upperUsd": 102.8206
+     },
+     "centralUsd": 98.9077,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-23"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7305,
+      "upperUsd": 130.2354
+     },
+     "centralUsd": 128.6119,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.2748,
+      "upperUsd": 170.7904
+     },
+     "centralUsd": 117.5209,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.7715,
+      "upperUsd": 102.8206
+     },
+     "centralUsd": 98.9077,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 115.7423,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-24"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7305,
+      "upperUsd": 130.2354
+     },
+     "centralUsd": 128.6119,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.2748,
+      "upperUsd": 170.7904
+     },
+     "centralUsd": 117.5209,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.7715,
+      "upperUsd": 102.8206
+     },
+     "centralUsd": 98.9077,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 98.9077,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 115.7423,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-25"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7305,
+      "upperUsd": 130.2354
+     },
+     "centralUsd": 128.6119,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 108.4677,
+      "upperUsd": 171.0157
+     },
+     "centralUsd": 139.2541,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.5185,
+      "upperUsd": 102.6655
+     },
+     "centralUsd": 96.0804,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.5303,
+     "upperUsd": 169.4135
+    },
+    "centralUsd": 115.7423,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-26"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7305,
+      "upperUsd": 130.2354
+     },
+     "centralUsd": 128.6119,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.2748,
+      "upperUsd": 170.7904
+     },
+     "centralUsd": 160.9873,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.5185,
+      "upperUsd": 102.6655
+     },
+     "centralUsd": 96.0804,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.6403,
+     "upperUsd": 169.9784
+    },
+    "centralUsd": 117.5209,
+    "fitCount": 17,
+    "participantCount": 4
+   },
+   "day": "2026-09-27"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.7305,
+      "upperUsd": 130.2354
+     },
+     "centralUsd": 128.6119,
+     "fitCount": 3,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 109.2748,
+      "upperUsd": 170.7904
+     },
+     "centralUsd": 160.9873,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.4415,
+      "upperUsd": 100.0387
+     },
+     "centralUsd": 95.5303,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.5303,
+     "upperUsd": 170.0387
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-28"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.8407,
+      "upperUsd": 131.9674
+     },
+     "centralUsd": 129.6266,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 108.4677,
+      "upperUsd": 171.0157
+     },
+     "centralUsd": 143.0041,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.4415,
+      "upperUsd": 100.0387
+     },
+     "centralUsd": 95.5303,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.5303,
+     "upperUsd": 170.0387
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-29"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.8407,
+      "upperUsd": 131.9674
+     },
+     "centralUsd": 129.6266,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 108.4677,
+      "upperUsd": 171.0157
+     },
+     "centralUsd": 143.0041,
+     "fitCount": 8,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.4415,
+      "upperUsd": 100.0387
+     },
+     "centralUsd": 95.5303,
+     "fitCount": 4,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.5303,
+     "upperUsd": 170.0387
+    },
+    "centralUsd": 122.5155,
+    "fitCount": 16,
+    "participantCount": 4
+   },
+   "day": "2026-09-30"
+  },
+  {
+   "byPlanType": {
+    "plus": {
+     "band80Usd": {
+      "lowerUsd": 127.8407,
+      "upperUsd": 131.9674
+     },
+     "centralUsd": 129.6266,
+     "fitCount": 4,
+     "participantCount": 1
+    },
+    "pro": {
+     "band80Usd": {
+      "lowerUsd": 105.5016,
+      "upperUsd": 170.7904
+     },
+     "centralUsd": 117.5209,
+     "fitCount": 9,
+     "participantCount": 2
+    },
+    "prolite": {
+     "band80Usd": {
+      "lowerUsd": 94.5185,
+      "upperUsd": 100.1582
+     },
+     "centralUsd": 96.0804,
+     "fitCount": 5,
+     "participantCount": 1
+    }
+   },
+   "combined": {
+    "band80Usd": {
+     "lowerUsd": 95.7503,
+     "upperUsd": 169.9182
+    },
+    "centralUsd": 115.7423,
+    "fitCount": 18,
+    "participantCount": 4
+   },
+   "day": "2026-10-01"
+  }
+ ],
+ "from": "2026-07-24",
+ "generatedAt": "2026-10-01T12:00:00.000Z",
+ "models": {
+  "basis": "seven_day_codex_pro20x_equivalent_per_model_composition",
+  "days": [
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-07",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-08",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.5",
+      86.2,
+      1
+     ],
+     [
+      "gpt-5.6-sol",
+      157.48,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      51.68,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-09",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.5",
+      86.2,
+      1
+     ],
+     [
+      "gpt-5.6-sol",
+      157.48,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      51.68,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-10",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.5",
+      87.68,
+      1
+     ],
+     [
+      "gpt-5.6-sol",
+      151.64,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      53.88,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-11",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.5",
+      87.68,
+      1
+     ],
+     [
+      "gpt-5.6-sol",
+      151.64,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      53.88,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-12",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-13",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-14",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-15",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-16",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-17",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-18",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-19",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-20",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-21",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-22",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-23",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-24",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-25",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-26",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-27",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-28",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-29",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-30",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-08-31",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-01",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-02",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-03",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-04",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-05",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-06",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-07",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      111.4,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.85,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-08",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-09",
+    "fittedParticipantCount": 0,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 4,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": []
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-10",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      112.02,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.75,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-11",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      112.02,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.75,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-12",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      112.02,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.75,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-13",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.23,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.71,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-14",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      113.49,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.29,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-15",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      113.49,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.29,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-16",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      113.49,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.29,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-17",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      113.49,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.29,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-18",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      113.49,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      67.29,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-19",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      120.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      66.27,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-20",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      116.94,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      66.39,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-21",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-22",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-23",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-24",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-25",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-26",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-27",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      115.68,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      68.92,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-28",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      122.82,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      71.24,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-29",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      122.82,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      71.24,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-09-30",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      122.82,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      71.24,
+      1
+     ]
+    ]
+   },
+   {
+    "catalogVersion": "reviewed-model-catalog-2026-09-23.1",
+    "day": "2026-10-01",
+    "fittedParticipantCount": 1,
+    "refusedParticipantCount": 0,
+    "staleParticipantCount": 0,
+    "unstableParticipantCount": 3,
+    "unsupportedSourceParticipantCount": 0,
+    "v1ParticipantCount": 4,
+    "values": [
+     [
+      "gpt-5.6-sol",
+      121.07,
+      1
+     ],
+     [
+      "gpt-5.6-terra",
+      71.52,
+      1
+     ]
+    ]
+   }
+  ],
+  "gate": "shared_composition_kernel_identification",
+  "modelConfig": [
+   {
+    "allowanceTrack": "primary",
+    "label": "Codex Auto-review",
+    "modelId": "codex-auto-review",
+    "pricingStatus": "assumed_alias"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4 Turbo (2024-04-09)",
+    "modelId": "gpt-4-turbo-2024-04-09",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4.1",
+    "modelId": "gpt-4.1",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4.1 Mini",
+    "modelId": "gpt-4.1-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4.1 Nano",
+    "modelId": "gpt-4.1-nano",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4o",
+    "modelId": "gpt-4o",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4o (2024-05-13)",
+    "modelId": "gpt-4o-2024-05-13",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-4o Mini",
+    "modelId": "gpt-4o-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5",
+    "modelId": "gpt-5",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5 Codex",
+    "modelId": "gpt-5-codex",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5 Mini",
+    "modelId": "gpt-5-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5 Nano",
+    "modelId": "gpt-5-nano",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5 Pro",
+    "modelId": "gpt-5-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.1",
+    "modelId": "gpt-5.1",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.1 Codex",
+    "modelId": "gpt-5.1-codex",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.1 Codex Mini",
+    "modelId": "gpt-5.1-codex-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.2",
+    "modelId": "gpt-5.2",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.2 Codex",
+    "modelId": "gpt-5.2-codex",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.2 Pro",
+    "modelId": "gpt-5.2-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.3 Codex",
+    "modelId": "gpt-5.3-codex",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "spark",
+    "label": "GPT-5.3 Codex Spark",
+    "modelId": "gpt-5.3-codex-spark",
+    "pricingStatus": "unpriced"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.4",
+    "modelId": "gpt-5.4",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.4 Mini",
+    "modelId": "gpt-5.4-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.4 Nano",
+    "modelId": "gpt-5.4-nano",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.4 Pro",
+    "modelId": "gpt-5.4-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.5",
+    "modelId": "gpt-5.5",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.5 Codex",
+    "modelId": "gpt-5.5-codex",
+    "pricingStatus": "assumed_alias"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.5 Pro",
+    "modelId": "gpt-5.5-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.6 Luna",
+    "modelId": "gpt-5.6-luna",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.6 Sol",
+    "modelId": "gpt-5.6-sol",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.6 Sol Work Mode",
+    "modelId": "gpt-5.6-sol-wm",
+    "pricingStatus": "assumed_alias"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-5.6 Terra",
+    "modelId": "gpt-5.6-terra",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-6 Astra",
+    "modelId": "gpt-6-astra",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o1",
+    "modelId": "o1",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o1 Pro",
+    "modelId": "o1-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o3",
+    "modelId": "o3",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o3 Mini",
+    "modelId": "o3-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o3 Pro",
+    "modelId": "o3-pro",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "o4 Mini",
+    "modelId": "o4-mini",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-6 Sol",
+    "modelId": "gpt-6-sol",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-6 Luna",
+    "modelId": "gpt-6-luna",
+    "pricingStatus": "published"
+   },
+   {
+    "allowanceTrack": "primary",
+    "label": "GPT-6.1 Astra (forecast)",
+    "modelId": "gpt-6.1-astra",
+    "pricingStatus": "unpriced"
+   }
+  ]
+ },
+ "plans": [
+  {
+   "label": "Pro 20x",
+   "multiplier": 1,
+   "planType": "pro"
+  },
+  {
+   "label": "Pro 5x",
+   "multiplier": 4,
+   "planType": "prolite"
+  },
+  {
+   "label": "Plus",
+   "multiplier": 20,
+   "planType": "plus"
+  }
+ ],
+ "qualification": "shared_reset_fit_gates_25pp_span_floor",
+ "referencePlanType": "pro",
+ "schemaVersion": "admin-community-allowance-preview-v0.3",
+ "spanFloorPp": 25,
+ "to": "2026-10-01",
+ "trailingDays": 30
+}

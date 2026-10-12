@@ -304,10 +304,10 @@ describe("admin community allowance preview", () => {
       const projected = projectAdminModelHistoryDay({
         day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
         values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
-          .map((model) => [model.modelId, 1.7976931348623157e308, Number.MAX_SAFE_INTEGER]),
-        fittedParticipantCount: Number.MAX_SAFE_INTEGER,
+          .map((model) => [model.modelId, 1.7976931348623157e308, 99_999_999_999_999]),
+        fittedParticipantCount: 99_999_999_999_999,
         unstableParticipantCount: 0, staleParticipantCount: 0, refusedParticipantCount: 0,
-        v1ParticipantCount: Number.MAX_SAFE_INTEGER, unsupportedSourceParticipantCount: 0,
+        v1ParticipantCount: 99_999_999_999_999, unsupportedSourceParticipantCount: 0,
       });
       expect(projected).not.toBeNull();
       return projected!;
@@ -367,11 +367,13 @@ describe("admin community allowance preview", () => {
     expect(preview.from).toBe("2026-06-15");
     expect(preview.to).toBe("2026-08-23");
     const latest = preview.days.at(-1)!;
+    // Pro 20x B' restores the pre-2026-10-09 Pro 20x values for these
+    // Pro Max-free fits exactly; Pro Max stays an explicit empty summary.
     expect(latest.combined).toEqual({
       fitCount: 4,
       participantCount: 3,
-      centralUsd: 1_100,
-      band80Usd: { lowerUsd: 1_000, upperUsd: 1_760 },
+      centralUsd: 2_000,
+      band80Usd: { lowerUsd: 2_000, upperUsd: 2_280 },
     });
     expect(latest.byPlanType.pro).toMatchObject({
       fitCount: 1,
@@ -379,12 +381,12 @@ describe("admin community allowance preview", () => {
       centralUsd: 2_000,
       band80Usd: null,
     });
-    expect(latest.byPlanType.prolite.centralUsd).toBe(1_000);
-    expect(latest.byPlanType.promax).toMatchObject({ fitCount: 0, participantCount: 0, centralUsd: null });
+    expect(latest.byPlanType.prolite.centralUsd).toBe(2_000);
+    expect(latest.byPlanType.promax).toEqual({ fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null });
     expect(latest.byPlanType.plus).toMatchObject({
       fitCount: 2,
       participantCount: 2,
-      centralUsd: 1_100,
+      centralUsd: 2_200,
       band80Usd: null,
     });
     expect(Object.keys(latest.byPlanType)).toEqual(["pro", "prolite", "promax", "plus"]);

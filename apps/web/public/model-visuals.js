@@ -9,15 +9,26 @@ const MODEL_PRESENTATION_THEMES = Object.freeze([
   "astra", "sol", "sol", "sol", "terra", "luna", "luna", "classic",
 ]);
 
+// Families a published model-metadata block may name. A family outside this
+// closed set draws with the generic series colours instead of an invented icon,
+// so a model from a family the page has never seen still appears.
+const FAMILY_THEMES = Object.freeze({
+  astra: "astra", sol: "sol", terra: "terra", luna: "luna", classic: "classic",
+});
+
 // Shared visual identity only. Admin retains its private preview contract and
 // renderer; both surfaces use the same ordering, colours and decorative icons.
-export function allowanceModelPresentation(modelId, catalogIndex = 0) {
+// `family` is the optional published family of a model the hand roster above
+// does not list; a roster model always keeps its own identity.
+export function allowanceModelPresentation(modelId, catalogIndex = 0, family = null) {
   const preferred = MODEL_PRESENTATION_ORDER.indexOf(modelId);
+  const theme = preferred >= 0 ? MODEL_PRESENTATION_THEMES[preferred]
+    : typeof family === "string" && Object.prototype.hasOwnProperty.call(FAMILY_THEMES, family)
+      ? FAMILY_THEMES[family] : null;
   return {
     order: preferred < 0 ? MODEL_PRESENTATION_ORDER.length + catalogIndex : preferred,
-    theme: preferred < 0 ? null : MODEL_PRESENTATION_THEMES[preferred],
-    className: preferred < 0 ? `allowance-series-${catalogIndex % 8}`
-      : `allowance-model-${MODEL_PRESENTATION_THEMES[preferred]}`,
+    theme,
+    className: theme === null ? `allowance-series-${catalogIndex % 8}` : `allowance-model-${theme}`,
   };
 }
 

@@ -398,7 +398,11 @@ export async function runR7BenchmarkWorker(config, {
     },
   });
   if (watchdog.outcome !== "completed" || workerResult === null) {
-    throw new Error(`R7 operation worker stopped: ${watchdog.outcome}`);
+    const error = new Error(`R7 operation worker stopped: ${watchdog.outcome}`);
+    // Owner-private callers may inspect this closed projection explicitly. It
+    // is not logged, serialized with the error, or added to successful receipts.
+    Object.defineProperty(error, "r7WorkerDiagnostic", { value: watchdog.failureDiagnostic });
+    throw error;
   }
   return {
     ...workerResult,

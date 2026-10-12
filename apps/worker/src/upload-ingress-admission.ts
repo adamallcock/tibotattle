@@ -5,7 +5,7 @@ import {
   type UploadIngressBudgetDecision,
   type UploadIngressBudgetPolicy,
   type UploadIngressBudgetStatus,
-} from "./ingress-budget";
+} from "./ingress-budget-policy";
 import { assertDeferredUploadQueueIngress } from "./queue-ingress-stub";
 
 export const UPLOAD_INGRESS_BUDGET_OBJECT_NAME = "upload-ingress-budget-v0.1";

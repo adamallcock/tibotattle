@@ -2067,6 +2067,8 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   }));
   assert.equal(published.state, "published");
   assert.deepEqual(published.days[0].allowance, {
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    normalization: "pro_x1_prolite_x4_plus_x20",
     fitCount: 5,
     participantCount: 1,
     centralUsd: 1879,
@@ -2083,6 +2085,8 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
     }))],
   }));
   assert.deepEqual(empty.days[0].allowance, {
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    normalization: "pro_x1_prolite_x4_plus_x20",
     fitCount: 0,
     participantCount: 0,
     centralUsd: null,
@@ -2124,6 +2128,8 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
     }))],
   }));
   assert.deepEqual(bandless.days[0].allowance, {
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    normalization: "pro_x1_prolite_x4_plus_x20",
     fitCount: 2,
     participantCount: 1,
     centralUsd: 1879,
@@ -2137,7 +2143,20 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   const currentOnly = normalizeCommunityDailySeries(publishedDailySeries({
     days: [allowanceDay("2026-08-06", current)],
   }));
-  assert.equal(currentOnly.allowanceIsCurrent, true);
+  assert.equal(currentOnly.allowanceIsCurrent, false, "retained Pro 10x values are not relabelled as the current producer");
+  assert.equal(currentOnly.days[0].allowance.basis, current.basis);
+  assert.equal(currentOnly.days[0].allowance.normalization, current.normalization);
+  const currentPro20 = allowanceBlock({
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25",
+    normalization: "pro_x1_prolite_x4_promax_x0_8_plus_x20",
+  });
+  const currentPublication = normalizeCommunityDailySeries(publishedDailySeries({
+    days: [allowanceDay("2026-08-06", currentPro20)],
+  }));
+  assert.equal(currentPublication.allowanceIsCurrent, true);
+  assert.equal(currentPublication.days[0].allowance.basis, currentPro20.basis);
+  assert.equal(currentPublication.days[0].allowance.normalization, currentPro20.normalization);
+  assert.equal(currentPublication.days[0].allowance.centralUsd, currentPro20.centralUsd);
   const mixed = normalizeCommunityDailySeries(publishedDailySeries({
     days: [allowanceDay("2026-08-06", allowanceBlock()), allowanceDay("2026-08-07", current)],
   }));

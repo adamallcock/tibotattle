@@ -172,6 +172,101 @@ test("extracts static, dynamic, and export-from imports without reading prose as
   );
 });
 
+test("retains TypeScript dependency syntax and exact source positions", async () => {
+  const source = [
+    'import type { Input } from "./input.ts";',
+    'export type { Output } from "./output.ts";',
+    'export * as namespace from "./namespace.ts";',
+    'type Nested = import("./nested.ts").Nested;',
+    'import legacy = require("./legacy.cts");',
+    'class Service { constructor(private input: Input) {} }',
+    'const amount = centralUsd! / 0.8;',
+    'const lazy = import("./lazy.ts");',
+    'const computed = import(runtimePath);',
+    'const template = import(`./template.ts`);',
+    'const computedTemplate = import(`./${runtimePath}.ts`);',
+    'const metadata = import.meta.url;',
+    'const prose = "import(\\\"./not-code.ts\\\")";',
+    '// import "./comment.ts";',
+  ].join("\n");
+  for (const extension of ["ts", "mts", "cts"]) {
+    const imports = await extractEsmImports(source, {
+      sourceName: `typed-dependencies.${extension}`,
+    });
+    assert.deepEqual(imports.map(({ kind, line, specifier }) => ({ kind, line, specifier })), [
+      { kind: "import", line: 1, specifier: "./input.ts" },
+      { kind: "export-from", line: 2, specifier: "./output.ts" },
+      { kind: "export-from", line: 3, specifier: "./namespace.ts" },
+      { kind: "import", line: 4, specifier: "./nested.ts" },
+      { kind: "import", line: 5, specifier: "./legacy.cts" },
+      { kind: "dynamic-import", line: 8, specifier: "./lazy.ts" },
+      { kind: "dynamic-import", line: 9, specifier: null },
+      { kind: "dynamic-import", line: 10, specifier: "./template.ts" },
+      { kind: "dynamic-import", line: 11, specifier: null },
+    ]);
+    for (const { statementStart, statementEnd } of imports) {
+      assert.match(source.slice(statementStart, statementEnd), /^(?:import|export)/u);
+    }
+  }
+});
+
+test("TypeScript dynamic-import literals match the JavaScript lexer", async () => {
+  const source = [
+    'const string = import("./string.ts");',
+    'const template = import(`./template.ts`);',
+    'const escaped = import(`./escaped\\u002ets`);',
+    'const computed = import(`./${runtimePath}.ts`);',
+    'const parenthesized = import(("./parenthesized.ts"));',
+  ].join("\n");
+  const dependencyEdges = (imports) => imports.map(({ kind, line, specifier }) => ({ kind, line, specifier }));
+  const javascript = dependencyEdges(await extractEsmImports(source, { sourceName: "dynamic-imports.js" }));
+  assert.deepEqual(javascript, [
+    { kind: "dynamic-import", line: 1, specifier: "./string.ts" },
+    { kind: "dynamic-import", line: 2, specifier: "./template.ts" },
+    { kind: "dynamic-import", line: 3, specifier: "./escaped.ts" },
+    { kind: "dynamic-import", line: 4, specifier: null },
+    { kind: "dynamic-import", line: 5, specifier: null },
+  ]);
+  for (const extension of ["ts", "mts", "cts"]) {
+    assert.deepEqual(
+      dependencyEdges(await extractEsmImports(source, { sourceName: `dynamic-imports.${extension}` })),
+      javascript,
+    );
+  }
+});
+
+test("inspects declaration-file imports without erasing their type dependencies", async () => {
+  for (const extension of ["ts", "mts", "cts"]) {
+    const source = [
+      'import type { Input } from "./input.ts";',
+      'export type { Output } from "./output.ts";',
+      'declare module "virtual" { export type Result = import("./nested.ts").Result; }',
+    ].join("\n");
+    const imports = await extractEsmImports(source, {
+      sourceName: `typed-dependencies.d.${extension}`,
+    });
+    assert.deepEqual(imports.map(({ kind, line, specifier }) => ({ kind, line, specifier })), [
+      { kind: "import", line: 1, specifier: "./input.ts" },
+      { kind: "export-from", line: 2, specifier: "./output.ts" },
+      { kind: "import", line: 3, specifier: "./nested.ts" },
+    ]);
+  }
+});
+
+test("import inspection reports named parse failures instead of hiding invalid typed sources", async () => {
+  for (const sourceName of ["invalid.ts", "invalid.mts", "invalid.cts", "invalid.d.ts", "invalid.js"]) {
+    await assert.rejects(
+      extractEsmImports('import { broken from "./invalid.ts";', { sourceName }),
+      (error) => {
+        assert.ok(error instanceof SyntaxError);
+        assert.ok(error.message.startsWith(`Unable to inspect ESM imports in ${sourceName}: `));
+        assert.ok(error.cause instanceof Error);
+        return true;
+      },
+    );
+  }
+});
+
 test("permits supported dependency directions and ignores tests and tooling", async () => {
   await withFixtureTree(
     {

@@ -279,24 +279,30 @@ export function communityDailyWindow(nowMs = Date.now()) {
 
 // The allowance block is additive on community-daily-aggregate-v1.0. Only the
 // exact merged methodology is interpreted: supported personal-plan fits are
-// normalized into one Pro 10x-equivalent summary before the median and range
-// are calculated. Old Pro-only blocks and any future methodology are per-day
-// absent, never silently relabelled under the merged copy.
+// normalized into their declared reference summary before the median and range
+// are calculated. Only the exact Pro 20x and Pro 10x claims below are accepted;
+// their values retain their original basis, including in stored copies.
 export const COMMUNITY_ALLOWANCE_BASIS =
-  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25";
 export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_NORMALIZATION =
-  "pro_x1_prolite_x2_promax_x0_4_plus_x10";
+  "pro_x1_prolite_x4_promax_x0_8_plus_x20";
 const LEGACY_COMMUNITY_ALLOWANCE_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
 const LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION = "pro_x1_prolite_x4_plus_x20";
 
 // Inverse of the validated reference-plan display basis, not a pricing model
 // or a new allowance fit. Convert the unrounded estimate before formatting.
-const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 2, promax: 0.4, plus: 10 });
+export const COMMUNITY_ALLOWANCE_PRO10_BASIS =
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
+export const COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION =
+  "pro_x1_prolite_x2_promax_x0_4_plus_x10";
+const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, promax: 0.8, plus: 20 });
+const PRO10_PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 2, promax: 0.4, plus: 10 });
 const LEGACY_PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, plus: 20 });
 export function planWeeklyApiEquivalentUsd(referenceUsd, planType, normalization = COMMUNITY_ALLOWANCE_NORMALIZATION) {
   const multipliers = normalization === COMMUNITY_ALLOWANCE_NORMALIZATION ? PLAN_REFERENCE_MULTIPLIERS
+    : normalization === COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION ? PRO10_PLAN_REFERENCE_MULTIPLIERS
     : normalization === LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION ? LEGACY_PLAN_REFERENCE_MULTIPLIERS : null;
   if (typeof referenceUsd !== "number" || !Number.isFinite(referenceUsd) || referenceUsd < 0
       || typeof planType !== "string"
@@ -323,6 +329,31 @@ const PUBLIC_ALLOWANCE_MODEL_IDS = new Set([
 ]);
 const LEGACY_PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
 const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "promax", "plus"]);
+// An allowance-breakdown day carries one tuple per identified model. A server
+// that knows a newer model than this page does is expected, so the tuple count
+// is bounded by a fixed sanity cap rather than by this build's catalog size.
+const PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX = 256;
+const PUBLIC_BREAKDOWN_DAYS_MAX = 70;
+// A retained copy states how many tuples it left out as two content-free
+// integers. They can never exceed what a live payload could have carried.
+const RETAINED_UNRECOGNIZED_KEYS = Object.freeze(["tuples", "models"]);
+const RETAINED_UNRECOGNIZED_TUPLES_MAX = PUBLIC_BREAKDOWN_DAYS_MAX * PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX;
+
+// Optional, additive model metadata on the breakdown block. It lets the server
+// name and order models this build's catalog has never seen. Closed on every
+// axis: exact keys, bounded count, token grammars and an integer order. The id
+// is only ever a join key; what the page may print is the validated label.
+export const PUBLIC_MODEL_METADATA_MAX_ENTRIES = 128;
+const PUBLIC_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$/u;
+const PUBLIC_MODEL_LABEL_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} .+_()×·/:-]{0,79}$/u;
+const PUBLIC_MODEL_FAMILY_PATTERN = /^[a-z][a-z0-9-]{0,23}$/u;
+const PUBLIC_MODEL_ORDER_MAX = 9999;
+// Reviewed identities that are deliberately not on the primary comparison
+// (a separate allowance track, or another provider). A metadata block cannot
+// promote them; the catalog's own classification wins.
+const PUBLIC_MODEL_CATALOG_EXCLUDED_IDS = new Set(REVIEWED_MODEL_CATALOG
+  .filter(model => model.provider !== "openai_codex" || model.allowanceTrack !== "primary")
+  .map(model => model.id));
 const exactObject = (value, keys) => value !== null && typeof value === "object"
   && !Array.isArray(value) && Object.keys(value).length === keys.length
   && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
@@ -351,34 +382,153 @@ function publicAllowanceSummary(value) {
     fitCount: value.fitCount, band80Usd };
 }
 
+/**
+ * The optional published model-metadata block, or null when any part of it is
+ * outside the closed contract. All-or-nothing: a partly valid block is never
+ * partly trusted. Returns a map of model id to its validated presentation.
+ */
+function publicModelMetadata(value) {
+  if (!Array.isArray(value) || value.length > PUBLIC_MODEL_METADATA_MAX_ENTRIES) return null;
+  const entries = new Map();
+  for (const entry of value) {
+    if (!exactObject(entry, ["id", "label", "family", "order"])
+        || typeof entry.id !== "string" || !PUBLIC_MODEL_ID_PATTERN.test(entry.id)
+        || PUBLIC_MODEL_CATALOG_EXCLUDED_IDS.has(entry.id) || entries.has(entry.id)
+        || typeof entry.label !== "string" || !PUBLIC_MODEL_LABEL_PATTERN.test(entry.label)
+        || typeof entry.family !== "string" || !PUBLIC_MODEL_FAMILY_PATTERN.test(entry.family)
+        || !Number.isSafeInteger(entry.order) || entry.order < 0
+        || entry.order > PUBLIC_MODEL_ORDER_MAX) return null;
+    entries.set(entry.id, { label: entry.label, family: entry.family, order: entry.order });
+  }
+  return entries;
+}
+
+/**
+ * The drawable models for one publication: this build's reviewed catalog in
+ * catalog order, then any metadata-only models in published order. Metadata
+ * replaces the catalog's label and adds a family and order; it never removes a
+ * catalog model. Without metadata this is exactly the catalog roster.
+ */
+function publicModelConfig(metadata) {
+  const config = new Map(PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => [model.modelId, model]));
+  for (const [modelId, { label, family, order }] of metadata ?? []) {
+    config.set(modelId, Object.freeze({ modelId, label, family, order }));
+  }
+  return [...config.values()];
+}
+
 // The published breakdown contract versions this reader honours, and the two
 // fixed method claims inside them. Named because the cache projection has to
 // rebuild the exact wire shape it accepted, and a second spelling of a claim
 // is a second thing that can drift.
+//
+// v1.3 retains this baseline's Pro 20x meaning and metadata compatibility.
+// v1.4 uses the genuine four-plan Pro 10x basis with required metadata.
+// Version, basis, normalization and plan set are dispatched together; crossed
+// claims are refused rather than rescaling published estimates.
 export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
   "community-allowance-breakdowns-v1.0",
   "community-allowance-breakdowns-v1.1",
   "community-allowance-breakdowns-v1.2",
+  "community-allowance-breakdowns-v1.3",
+  "community-allowance-breakdowns-v1.4",
+  "community-allowance-breakdowns-v1.5",
 ]);
 const COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION =
   "community-allowance-breakdowns-v1.1";
+const COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION =
+  "community-allowance-breakdowns-v1.3";
 const COMMUNITY_ALLOWANCE_MODEL_BASIS =
-  "seven_day_codex_pro10x_equivalent_per_model_composition";
+  "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
 const LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS =
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION = "community-allowance-breakdowns-v1.4";
 const COMMUNITY_ALLOWANCE_MODEL_GATE =
   "shared_composition_kernel_identification";
 
+// Every historical wire version keeps its published basis and plan set.
+// In particular, main's v1.2 and GCP's v1.4 remain Pro 10x; current v1.5
+// describes a four-plan Pro 20x publication and cannot relabel those values.
+const PUBLIC_BREAKDOWN_CONTRACTS = Object.freeze(Object.fromEntries([
+  ["community-allowance-breakdowns-v1.0", "legacy", false, "optional"],
+  ["community-allowance-breakdowns-v1.1", "legacy", true, "optional"],
+  ["community-allowance-breakdowns-v1.2", "pro10", true, "forbidden"],
+  ["community-allowance-breakdowns-v1.3", "legacy", true, "optional"],
+  ["community-allowance-breakdowns-v1.4", "pro10", true, "required"],
+  ["community-allowance-breakdowns-v1.5", "current", true, "required"],
+].map(([version, reference, combined, metadata]) => [version, Object.freeze({
+  basis: reference === "current" ? COMMUNITY_ALLOWANCE_BASIS
+    : reference === "pro10" ? COMMUNITY_ALLOWANCE_PRO10_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
+  normalization: reference === "current" ? COMMUNITY_ALLOWANCE_NORMALIZATION
+    : reference === "pro10" ? COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
+  modelBasis: reference === "current" ? COMMUNITY_ALLOWANCE_MODEL_BASIS
+    : reference === "pro10" ? COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS : LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS,
+  planIds: reference === "legacy" ? LEGACY_PUBLIC_ALLOWANCE_PLAN_IDS : PUBLIC_ALLOWANCE_PLAN_IDS,
+  combined, metadata,
+})])));
+
+const PUBLIC_BREAKDOWN_ENVELOPE_KEYS = Object.freeze(["schemaVersion", "basis",
+  "referencePlanType", "normalization", "modelBasis", "modelGate", "generatedAt", "days"]);
+
+/**
+ * The count a retained copy carries for the tuples its projection left out, or
+ * null when it is malformed. Two bounded integers and nothing else: a retained
+ * copy has to keep saying that a gap exists, and no id ever reaches storage.
+ */
+function retainedUnrecognizedCounts(value) {
+  if (!exactObject(value, RETAINED_UNRECOGNIZED_KEYS)
+      || !Number.isSafeInteger(value.tuples) || value.tuples < 1
+      || value.tuples > RETAINED_UNRECOGNIZED_TUPLES_MAX
+      || !Number.isSafeInteger(value.models) || value.models < 1
+      || value.models > value.tuples) return null;
+  return { tuples: value.tuples, models: value.models };
+}
+
 /** New public contract, never the private preview. Invalid optional breakdowns
- * cannot hide the separately validated daily activity or aggregate estimates. */
-export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now()) {
-  if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
-    "modelBasis", "modelGate", "generatedAt", "days"])
+ * cannot hide the separately validated daily activity or aggregate estimates.
+ *
+ * Model identity is tolerant in one way only. A tuple whose model id is not
+ * known (to this build's catalog, or to a valid `modelConfig` block) is skipped
+ * and counted, so a model newer than this page costs its own series instead of
+ * every breakdown. The skip is for identities this page has never heard of: an
+ * id outside the id grammar, a repeated id, and an id the catalog reviewed and
+ * kept off the primary comparison (a separate allowance track, or another
+ * provider) are producer faults that refuse the block, exactly as for a known
+ * id. The tuple's numbers must still be valid, the id is never retained or
+ * rendered, and every other part of the contract stays closed.
+ *
+ * `retained` is true only for a payload this browser stored itself. Its
+ * projection leaves the skipped tuples out and records how many as
+ * `retainedUnrecognizedModels`, so a cached render still states the gap. A live
+ * payload carrying that key is not on the wire contract and is refused. */
+export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now(), { retained = false } = {}) {
+  const isRecord = value !== null && typeof value === "object" && !Array.isArray(value);
+  const contract = isRecord && typeof value.schemaVersion === "string"
+    && Object.prototype.hasOwnProperty.call(PUBLIC_BREAKDOWN_CONTRACTS, value.schemaVersion)
+    ? PUBLIC_BREAKDOWN_CONTRACTS[value.schemaVersion] : undefined;
+  const { basis, normalization, modelBasis, planIds } = contract ?? {};
+  const hasMetadataBlock = isRecord && Object.prototype.hasOwnProperty.call(value, "modelConfig");
+  const hasRetainedCounts = retained && isRecord
+    && Object.prototype.hasOwnProperty.call(value, "retainedUnrecognizedModels");
+  const carried = hasRetainedCounts ? retainedUnrecognizedCounts(value.retainedUnrecognizedModels) : null;
+  if (hasRetainedCounts && carried === null) return null;
+  if (!exactObject(value, [
+    ...PUBLIC_BREAKDOWN_ENVELOPE_KEYS,
+    ...(hasMetadataBlock ? ["modelConfig"] : []),
+    ...(hasRetainedCounts ? ["retainedUnrecognizedModels"] : []),
+  ])
       || !COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS.includes(value.schemaVersion)
-      || value.referencePlanType !== "pro"
+      || contract === undefined
+      || (contract.metadata === "required" && !hasMetadataBlock)
+      || (contract.metadata === "forbidden" && hasMetadataBlock)
+      || value.basis !== basis || value.referencePlanType !== "pro"
+      || value.normalization !== normalization
+      || value.modelBasis !== modelBasis
       || value.modelGate !== COMMUNITY_ALLOWANCE_MODEL_GATE
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
-      || !Array.isArray(value.days) || value.days.length > 70) return null;
+      || !Array.isArray(value.days) || value.days.length > PUBLIC_BREAKDOWN_DAYS_MAX) return null;
   const generatedMs = Date.parse(value.generatedAt);
   // Keep the publication's actual dates; only the server can invalidate its
   // source. An ordinary refresh does not expire a previously published graph.
@@ -390,18 +540,21 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
   const allowedDays = new Set(publishedDays);
   const days = [];
-  const isCurrent = value.schemaVersion === "community-allowance-breakdowns-v1.2";
-  if (value.modelBasis !== (isCurrent ? COMMUNITY_ALLOWANCE_MODEL_BASIS : LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS)
-      || value.basis !== (isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS)
-      || value.normalization !== (isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION)) return null;
-  const planIds = isCurrent ? PUBLIC_ALLOWANCE_PLAN_IDS : LEGACY_PUBLIC_ALLOWANCE_PLAN_IDS;
-  const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION || isCurrent;
+  const hasCombined = contract.combined;
+  // A malformed block is ignored whole and reported, never partly trusted: the
+  // page then draws exactly what it would have drawn without one.
+  const metadata = hasMetadataBlock ? publicModelMetadata(value.modelConfig) : null;
+  const modelMetadata = !hasMetadataBlock ? "absent" : metadata === null ? "rejected" : "applied";
+  const modelConfig = publicModelConfig(metadata);
+  const knownModelIds = new Set([...PUBLIC_ALLOWANCE_MODEL_IDS, ...modelConfig.map(model => model.modelId)]);
+  let unrecognizedModelTuples = 0;
+  const unrecognizedModelIds = new Set();
   for (const row of value.days) {
     if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
         || (days.length > 0 && row.day <= days.at(-1).day)
         || !exactObject(row.byPlanType, planIds)
-        || !Array.isArray(row.models) || row.models.length > PUBLIC_ALLOWANCE_MODEL_IDS.size) return null;
+        || !Array.isArray(row.models) || row.models.length > PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX) return null;
     const byPlanType = {};
     for (const id of planIds) {
       const summary = publicAllowanceSummary(row.byPlanType[id]);
@@ -411,31 +564,58 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     const models = [];
     const seen = new Set();
     for (const tuple of row.models) {
-      if (!Array.isArray(tuple) || tuple.length !== 3
-          || !PUBLIC_ALLOWANCE_MODEL_IDS.has(tuple[0]) || seen.has(tuple[0])
+      // The shape and numbers are validated for every tuple, known or not. Only
+      // the identity is tolerant, and only to the extent of leaving the tuple out.
+      if (!Array.isArray(tuple) || tuple.length !== 3 || typeof tuple[0] !== "string"
           || !publicDollars(tuple[1]) || !publicCount(tuple[2]) || tuple[2] < 1) return null;
+      const known = knownModelIds.has(tuple[0]);
+      // An identity this page does not know may be skipped, but only if it is
+      // shaped like a model id at all. A reviewed identity kept off the primary
+      // comparison is not "newer than this page": it is a producer fault.
+      if (!known && (!PUBLIC_MODEL_ID_PATTERN.test(tuple[0])
+          || PUBLIC_MODEL_CATALOG_EXCLUDED_IDS.has(tuple[0]))) return null;
+      // One tuple per model per day, known or not.
+      if (seen.has(tuple[0])) return null;
       seen.add(tuple[0]);
+      if (!known) {
+        unrecognizedModelTuples += 1;
+        unrecognizedModelIds.add(tuple[0]);
+        continue;
+      }
       models.push([tuple[0], tuple[1], tuple[2]]);
     }
     const combined = hasCombined ? publicAllowanceSummary(row.combined) : null;
     if (hasCombined && combined === null) return null;
     days.push({ day: row.day, ...(hasCombined ? { combined } : {}), byPlanType, models });
   }
-  return { generatedAt: value.generatedAt, hasCombined, isCurrent, normalization: value.normalization, planIds, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
+  // A stored copy's projection never keeps a skipped tuple, so a copy that
+  // both carries a count and still holds one contradicts itself: refuse it.
+  if (carried !== null && unrecognizedModelTuples > 0) return null;
+  return {
+    schemaVersion: value.schemaVersion, generatedAt: value.generatedAt, hasCombined, modelConfig, days,
+    basis, normalization, planIds, modelBasis, isCurrent: value.schemaVersion === "community-allowance-breakdowns-v1.5",
+    // Counts only. An unrecognized id is dropped before it reaches this value.
+    unrecognizedModelTuples: unrecognizedModelTuples + (carried?.tuples ?? 0),
+    unrecognizedModelCount: unrecognizedModelIds.size + (carried?.models ?? 0),
+    modelMetadata,
+  };
 }
 
 function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
   }
-  const isCurrent = candidate.basis === COMMUNITY_ALLOWANCE_BASIS
+  const current = candidate.basis === COMMUNITY_ALLOWANCE_BASIS
     && candidate.normalization === COMMUNITY_ALLOWANCE_NORMALIZATION;
-  const isLegacy = candidate.basis === LEGACY_COMMUNITY_ALLOWANCE_BASIS
+  const legacy = candidate.basis === LEGACY_COMMUNITY_ALLOWANCE_BASIS
     && candidate.normalization === LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION;
-  if ((!isCurrent && !isLegacy)
+  const pro10 = candidate.basis === COMMUNITY_ALLOWANCE_PRO10_BASIS
+    && candidate.normalization === COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION;
+  if ((!current && !legacy && !pro10)
       || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE) {
     return null;
   }
+  const declaredBasis = { basis: candidate.basis, normalization: candidate.normalization };
   const fitCount = finite(candidate.fitCount, null);
   const participantCount = finite(candidate.participantCount, null);
   if (!Number.isSafeInteger(fitCount)
@@ -449,7 +629,7 @@ function normalizedDailyAllowance(candidate) {
     if (candidate.centralUsd !== null || candidate.band80Usd !== null) {
       return null;
     }
-    return { fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
+    return { ...declaredBasis, fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
   }
   const centralUsd = finite(candidate.centralUsd, null);
   if (centralUsd === null || centralUsd <= 0) return null;
@@ -467,7 +647,7 @@ function normalizedDailyAllowance(candidate) {
     }
     band80Usd = { lowerUsd, upperUsd };
   }
-  return { fitCount, participantCount, centralUsd, band80Usd };
+  return { ...declaredBasis, fitCount, participantCount, centralUsd, band80Usd };
 }
 
 function normalizedDailyTotals(candidate) {
@@ -719,7 +899,7 @@ function normalizedDailyDay(candidate) {
  * out-of-order series — collapses to `unsupported_schema` rather than a
  * partially trusted render.
  */
-export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = {}) {
+export function normalizeCommunityDailySeries(payload, { nowMs = Date.now(), retained = false } = {}) {
   if (!payload) return { state: "service_unavailable", days: [] };
   const from = dayString(payload.from);
   const to = dayString(payload.to);
@@ -760,7 +940,7 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
     allowanceState: payload.allowanceState,
     allowanceIsCurrent,
     breakdowns: payload.allowanceState === "ready"
-      ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs) : null,
+      ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs, { retained }) : null,
     // Community-wide, not per-day: the lane measures gaps between consecutive
     // requests across the whole published window.
     cacheRetention: normalizedCacheRetention(payload.cacheRetention),
@@ -779,6 +959,10 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
   COMMUNITY_DAILY_POLICY_VERSION,
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ALLOWANCE_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PRO10_BASIS,
+  COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+  LEGACY_COMMUNITY_ALLOWANCE_BASIS,
+  LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
   COMMUNITY_DAILY_SPEND_BASIS,
   ...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS,
 ].join("|");
@@ -786,9 +970,9 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
 function cachedAllowanceBlock(allowance, isCurrent) {
   if (allowance === null) return null;
   return {
-    basis: isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
+    basis: allowance.basis ?? COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
+    normalization: allowance.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION,
     fitCount: allowance.fitCount,
     participantCount: allowance.participantCount,
     centralUsd: allowance.centralUsd,
@@ -799,20 +983,35 @@ function cachedAllowanceBlock(allowance, isCurrent) {
 }
 
 function cachedBreakdowns(breakdowns) {
+  const requiresMetadata = PUBLIC_BREAKDOWN_CONTRACTS[breakdowns.schemaVersion]?.metadata === "required";
   return {
-    schemaVersion: breakdowns.isCurrent
-      ? COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[2]
-      : breakdowns.hasCombined
-        ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-        : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
-    basis: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_BASIS : LEGACY_COMMUNITY_ALLOWANCE_BASIS,
+    schemaVersion: breakdowns.schemaVersion,
+    basis: breakdowns.basis,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_NORMALIZATION : LEGACY_COMMUNITY_ALLOWANCE_NORMALIZATION,
-    modelBasis: breakdowns.isCurrent ? COMMUNITY_ALLOWANCE_MODEL_BASIS : LEGACY_COMMUNITY_ALLOWANCE_MODEL_BASIS,
+    normalization: breakdowns.normalization,
+    modelBasis: breakdowns.modelBasis,
     modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
     generatedAt: breakdowns.generatedAt,
-    // `modelConfig` is this build's reviewed catalog, not published data, so
-    // it is never stored: the reader supplies it again on the way back out.
+    // This build's reviewed catalog is not published data, so it is never
+    // stored: the reader supplies it again on the way back out. A published
+    // metadata block IS data the stored tuples depend on (a model only it
+    // names would otherwise be dropped on the way back in), so exactly the
+    // entries it supplied are rebuilt, in the closed wire shape.
+    // v1.4 cannot be relabelled as the Pro 20x v1.1 cache shape. A rejected
+    // metadata block remains explicitly rejected under its original contract.
+    ...(requiresMetadata && breakdowns.modelMetadata !== "applied" ? { modelConfig: null } : {}),
+    ...(breakdowns.modelMetadata === "applied" ? {
+      modelConfig: breakdowns.modelConfig.filter(model => model.order !== undefined)
+        .map(model => ({ id: model.modelId, label: model.label, family: model.family, order: model.order })),
+    } : {}),
+    // Tuples this page could not name are left out above, and the gap is not:
+    // two content-free integers keep a cached render saying what the live one
+    // said. Absent when nothing was left out.
+    ...(breakdowns.unrecognizedModelTuples > 0 ? {
+      retainedUnrecognizedModels: {
+        tuples: breakdowns.unrecognizedModelTuples, models: breakdowns.unrecognizedModelCount,
+      },
+    } : {}),
     days: breakdowns.days.map(row => ({
       day: row.day,
       ...(breakdowns.hasCombined ? { combined: row.combined } : {}),
@@ -855,9 +1054,11 @@ function cachedDay(day, allowanceIsCurrent) {
  * allowance breakdown that failed its checks, is absent here exactly as it
  * was absent from the render; it is never repaired or filled in.
  *
- * The result re-normalizes to the same series the original did, which is what
- * makes a cached render identical to the live one rather than a second,
- * looser interpretation. Re-normalizing later only ever gets stricter: the
+ * The result re-normalizes (as retained) to the same series the original did,
+ * which is what makes a cached render identical to the live one rather than a
+ * second, looser interpretation. That includes the gap: tuples for models this
+ * page could not name are never stored, but how many were left out is, as two
+ * integers, so a cached render states the same omission a live one does. Re-normalizing later only ever gets stricter: the
  * breakdown checks that depend on the current day move against acceptance,
  * never towards it, so time cannot promote a refused payload.
  *

@@ -65,7 +65,7 @@ test("owner Worker config is local, one-owner-only and excludes hosted environme
   assert.equal(config.vars.ENVIRONMENT, "local-development");
   assert.equal(config.vars.ENROLLMENT_MODE, "local_open");
   assert.equal(Object.hasOwn(config, "env"), false);
-  assert.equal(config.main, join(workerDirectory, "src/index.ts"));
+  assert.equal(config.main, join(workerDirectory, "src/cloudflare-entry.ts"));
   assert.equal(config.d1_databases[0].migrations_dir, join(workerDirectory, "migrations"));
   for (const config of [
     { ...baseConfig, name: "production" },

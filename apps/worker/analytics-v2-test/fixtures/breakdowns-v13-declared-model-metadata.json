@@ -1,0 +1,38 @@
+[
+  {
+    "id": "gpt-5.6-luna",
+    "label": "GPT-5.6 Luna",
+    "family": "luna",
+    "order": 5
+  },
+  {
+    "id": "gpt-5.6-sol",
+    "label": "GPT-5.6 Sol",
+    "family": "sol",
+    "order": 4
+  },
+  {
+    "id": "gpt-5.6-terra",
+    "label": "GPT-5.6 Terra",
+    "family": "terra",
+    "order": 3
+  },
+  {
+    "id": "gpt-6-astra",
+    "label": "GPT-6 Astra",
+    "family": "astra",
+    "order": 0
+  },
+  {
+    "id": "gpt-6-sol",
+    "label": "GPT-6 Sol",
+    "family": "sol",
+    "order": 1
+  },
+  {
+    "id": "gpt-6-luna",
+    "label": "GPT-6 Luna",
+    "family": "luna",
+    "order": 2
+  }
+]

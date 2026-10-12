@@ -17,6 +17,9 @@ import {
 } from "../packages/accounting/src/price-registry.js";
 import { sha256Json } from "./helpers/pricing-hash.js";
 
+// Check the reviewed Anthropic additions independently of legacy-card hashes.
+const LATEST_ANTHROPIC_MODELS = ["claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5", "claude-opus-5-5"];
+
 function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", components, totalInputTokens }) {
   return calculateCost({
     usageLedger: {
@@ -82,6 +85,33 @@ test("registry validates and preserves exact decimal strings and provenance", ()
     ].includes(card.model))),
     "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac",
   );
+});
+
+test("the four latest Anthropic cards retain exact rates, validity and independent provenance", () => {
+  const expected = [
+    ["claude-fable-5-1", "2026-09-01", ["10", "12.5", "20", "0.25", "50"]],
+    ["claude-mythos-5-1", "2026-09-01", ["10", "12.5", "20", "0.25", "50"]],
+    ["claude-opus-5", "2026-07-24", ["5", "6.25", "10", "0.5", "25"]],
+    ["claude-opus-5-5", "2026-09-22", ["4", "5", "8", "0.2", "20"]],
+  ];
+  const names = ["input_uncached_tokens", "input_cache_write_tokens", "input_cache_write_1h_tokens", "input_cache_read_tokens", "output_text_tokens"];
+  assert.deepEqual(ANTHROPIC_OFFICIAL_PRICE_CARDS.filter((card) => LATEST_ANTHROPIC_MODELS.includes(card.model)).map((card) => card.model),
+    LATEST_ANTHROPIC_MODELS);
+  for (const [model, from, rates] of expected) {
+    const card = ANTHROPIC_OFFICIAL_PRICE_CARDS.find((item) => item.model === model);
+    assert.equal(card.service_tier, "standard");
+    assert.deepEqual(card.effective, { from });
+    assert.equal(card.source.retrieved_at, "2026-09-23T14:52:10Z");
+    for (const [index, name] of names.entries()) {
+      const priced = price({ provider: "anthropic", model, pricedAt: from, components: { [name]: 1_000_000 } });
+      assert.equal(priced.total, rates[index], `${model}/${name}`);
+      assert.deepEqual(priced.warnings, []);
+    }
+    const priorDay = new Date(Date.parse(from) - 86_400_000).toISOString().slice(0, 10);
+    assert.notEqual(price({ provider: "anthropic", model, pricedAt: priorDay, components: { input_uncached_tokens: 1 } }).warnings.length, 0);
+  }
+  assert.equal(sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.anthropicLatest),
+    APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.evidenceVersion === "anthropic-latest-model-pricing-reviewed-2026-09-23").evidenceSha256);
 });
 
 test("Astra retains eight original cards with a strict above-272K boundary and independent release provenance", () => {

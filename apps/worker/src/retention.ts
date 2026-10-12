@@ -43,6 +43,9 @@ interface QuarantineObjectRow {
   r2_key: string;
 }
 
+// v1.2 is deliberately outside age-based quarantine retention for now: its
+// immutable chunk table has no quarantine_deleted_at marker, and no v1.2 age
+// retention policy has been approved. Owner erasure remains a separate path.
 const QUARANTINE_SOURCE_TABLES: Record<
   QuarantineObjectRow["source"],
   string
@@ -589,6 +592,9 @@ async function dueQuarantineObjects(
   db: D1Database,
   cutoffAt: string,
 ): Promise<QuarantineObjectRow[]> {
+  // Keep source enumeration aligned with QUARANTINE_SOURCE_TABLES. In
+  // particular, do not add telemetry_v12_chunks without a schema and policy
+  // change; the v1.2 lifecycle currently retains those objects by age.
   const result = await db.prepare(
     `SELECT 'synthetic' AS source, id, r2_key
        FROM contributions

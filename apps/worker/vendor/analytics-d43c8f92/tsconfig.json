@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "allowJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2024"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2024",
+    "types": [],
+    "paths": {
+      "@app-usagemonitor/accounting": ["./packages/accounting"],
+      "@app-usagemonitor/quota-analysis": ["./packages/quota-analysis"],
+      "@app-usagemonitor/telemetry-contract": ["./packages/telemetry-contract"]
+    }
+  },
+  "files": ["entry.ts"]
+}

@@ -1,0 +1,848 @@
+{
+  "schemaVersion": "community-authority-owner-page-oracle-v1",
+  "authority": "D1 V12_RETAINED_AUTHORIZATION_SCOPE and readStorageCommunityOwnerPage after the full source migration chain",
+  "day": "2026-09-20",
+  "cases": [
+    {
+      "name": "social-v12-accepted-linked",
+      "participants": [
+        {
+          "id": "authority-01a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 1,
+          "deviceId": "0d000000-0000-4000-8000-000000000161",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d312d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d312d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "accepted",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000161",
+            "manifestId": "0e120000-0000-4000-8000-000000000161",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-v12-revoked-linked",
+      "participants": [
+        {
+          "id": "authority-02a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 2,
+          "deviceId": "0d000000-0000-4000-8000-000000000261",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d322d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d322d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "revoked",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000261",
+            "manifestId": "0e120000-0000-4000-8000-000000000261",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-v12-accepted-unlinked",
+      "participants": [
+        {
+          "id": "authority-03a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 3,
+          "deviceId": "0d000000-0000-4000-8000-000000000361",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d332d61",
+          "ownerDigest": null,
+          "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "accepted",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000361",
+            "manifestId": "0e120000-0000-4000-8000-000000000361",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-v12-revoked-unlinked",
+      "participants": [
+        {
+          "id": "authority-04a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 4,
+          "deviceId": "0d000000-0000-4000-8000-000000000461",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d342d61",
+          "ownerDigest": null,
+          "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "revoked",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000461",
+            "manifestId": "0e120000-0000-4000-8000-000000000461",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-v12-staged-manifest",
+      "participants": [
+        {
+          "id": "authority-05a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 5,
+          "deviceId": "0d000000-0000-4000-8000-000000000561",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d352d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d352d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "accepted",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000561",
+            "manifestId": "0e120000-0000-4000-8000-000000000561",
+            "manifestState": "staged"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-v1-and-v11",
+      "participants": [
+        {
+          "id": "authority-06a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 6,
+          "deviceId": "0d000000-0000-4000-8000-000000000661",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d362d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d362d61",
+          "ownerRevision": 2,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": "0a110000-0000-4000-8000-000000000661",
+          "v12Domain": null,
+          "v1Chunks": [
+            {
+              "id": "authority-chunk-6-a-0",
+              "authorizationId": "0b100000-0000-4000-8000-000000006061",
+              "chunkSeq": 0,
+              "acceptedRecordCount": 1,
+              "superseded": false
+            },
+            {
+              "id": "authority-chunk-6-a-1",
+              "authorizationId": "0b100000-0000-4000-8000-000000006161",
+              "chunkSeq": 1,
+              "acceptedRecordCount": 1,
+              "superseded": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "social-v1-unaccepted-and-superseded",
+      "participants": [
+        {
+          "id": "authority-07a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 7,
+          "deviceId": "0d000000-0000-4000-8000-000000000761",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d372d61",
+          "ownerDigest": null,
+          "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": [
+            {
+              "id": "authority-chunk-7-a-0",
+              "authorizationId": "0b100000-0000-4000-8000-000000007061",
+              "chunkSeq": 0,
+              "acceptedRecordCount": 0,
+              "superseded": false
+            },
+            {
+              "id": "authority-chunk-7-a-1",
+              "authorizationId": "0b100000-0000-4000-8000-000000007161",
+              "chunkSeq": 1,
+              "acceptedRecordCount": 1,
+              "superseded": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "social-deleting",
+      "participants": [
+        {
+          "id": "authority-08a",
+          "ownerKind": "social",
+          "state": "deleting",
+          "inputRevision": 8,
+          "deviceId": "0d000000-0000-4000-8000-000000000861",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d382d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d382d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": "accepted",
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000861",
+            "manifestId": "0e120000-0000-4000-8000-000000000861",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-exact",
+      "participants": [
+        {
+          "id": "authority-09a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 9,
+          "deviceId": "0d000000-0000-4000-8000-000000000961",
+          "secretHash": "000000000000000000000000617574686f726974792d7365637265742d392d61",
+          "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d392d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "owner": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "markerRetainedAt": null
+          },
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000961",
+            "manifestId": "0e120000-0000-4000-8000-000000000961",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-expired",
+      "participants": [
+        {
+          "id": "authority-10a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 10,
+          "deviceId": "0d000000-0000-4000-8000-000000000a61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31302d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31302d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "owner": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "markerRetainedAt": null
+          },
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000a61",
+            "manifestId": "0e120000-0000-4000-8000-000000000a61",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-expired-unlinked",
+      "participants": [
+        {
+          "id": "authority-11a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 11,
+          "deviceId": "0d000000-0000-4000-8000-000000000b61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31312d61",
+          "ownerDigest": null,
+          "ownerRevision": null,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "owner": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "markerRetainedAt": null
+          },
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000b61",
+            "manifestId": "0e120000-0000-4000-8000-000000000b61",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-opt-out-retained",
+      "participants": [
+        {
+          "id": "authority-12a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 12,
+          "deviceId": "0d000000-0000-4000-8000-000000000c61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31322d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31322d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "markerRetainedAt": "2026-09-20T12:00:00.000Z"
+          },
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000c61",
+            "manifestId": "0e120000-0000-4000-8000-000000000c61",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-security-reset",
+      "participants": [
+        {
+          "id": "authority-13a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 13,
+          "deviceId": "0d000000-0000-4000-8000-000000000d61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31332d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31332d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "security_reset"
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "security_reset"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "security_reset"
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "security_reset"
+            },
+            "markerRetainedAt": null
+          },
+          "v11GenerationId": null,
+          "v12Domain": {
+            "generationId": "0a120000-0000-4000-8000-000000000d61",
+            "manifestId": "0e120000-0000-4000-8000-000000000d61",
+            "manifestState": "ready"
+          },
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "accountless-v11-exact",
+      "participants": [
+        {
+          "id": "authority-14a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "inputRevision": 14,
+          "deviceId": "0d000000-0000-4000-8000-000000000e61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31342d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31342d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": {
+            "ledger": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "owner": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Grant": {
+              "issuedAt": "2098-12-02T00:00:00.000Z",
+              "expiresAt": "2099-01-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": null,
+            "markerRetainedAt": null
+          },
+          "v11GenerationId": "0a110000-0000-4000-8000-000000000e61",
+          "v12Domain": null,
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-owner-head-withdrawn",
+      "participants": [
+        {
+          "id": "authority-15a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 15,
+          "deviceId": "0d000000-0000-4000-8000-000000000f61",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31352d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31352d61",
+          "ownerRevision": 2,
+          "ownerHeadState": "withdrawn",
+          "legacyContribution": null,
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": []
+        }
+      ]
+    },
+    {
+      "name": "social-legacy-contributions",
+      "participants": [
+        {
+          "id": "authority-16a",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 16,
+          "deviceId": "0d000000-0000-4000-8000-000000001061",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31362d61",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d61",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": "v0.2",
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": []
+        },
+        {
+          "id": "authority-16b",
+          "ownerKind": "social",
+          "state": "active",
+          "inputRevision": 16,
+          "deviceId": "0d000000-0000-4000-8000-000000001062",
+          "secretHash": "0000000000000000000000617574686f726974792d7365637265742d31362d62",
+          "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d62",
+          "ownerRevision": 1,
+          "ownerHeadState": "active",
+          "legacyContribution": "v0.1",
+          "capability": null,
+          "accountless": null,
+          "v11GenerationId": null,
+          "v12Domain": null,
+          "v1Chunks": []
+        }
+      ]
+    }
+  ],
+  "retainedScope": [
+    {
+      "participant_id": "authority-01a",
+      "device_id": "0d000000-0000-4000-8000-000000000161"
+    },
+    {
+      "participant_id": "authority-02a",
+      "device_id": "0d000000-0000-4000-8000-000000000261"
+    },
+    {
+      "participant_id": "authority-03a",
+      "device_id": "0d000000-0000-4000-8000-000000000361"
+    },
+    {
+      "participant_id": "authority-05a",
+      "device_id": "0d000000-0000-4000-8000-000000000561"
+    },
+    {
+      "participant_id": "authority-09a",
+      "device_id": "0d000000-0000-4000-8000-000000000961"
+    },
+    {
+      "participant_id": "authority-10a",
+      "device_id": "0d000000-0000-4000-8000-000000000a61"
+    },
+    {
+      "participant_id": "authority-12a",
+      "device_id": "0d000000-0000-4000-8000-000000000c61"
+    }
+  ],
+  "ownerPage": [
+    {
+      "participantId": "authority-01a",
+      "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d312d61",
+      "inputRevision": 1,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-02a",
+      "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d322d61",
+      "inputRevision": 2,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-03a",
+      "ownerDigest": null,
+      "inputRevision": 3,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-04a",
+      "ownerDigest": null,
+      "inputRevision": 4,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-05a",
+      "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d352d61",
+      "inputRevision": 5,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-06a",
+      "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d362d61",
+      "inputRevision": 6,
+      "ownerRevision": 2,
+      "authorityEpoch": 1,
+      "hasV1": true,
+      "hasV11": true,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-07a",
+      "ownerDigest": null,
+      "inputRevision": 7,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-09a",
+      "ownerDigest": "00000000000000000000000000617574686f726974792d6f776e65722d392d61",
+      "inputRevision": 9,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-10a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31302d61",
+      "inputRevision": 10,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-11a",
+      "ownerDigest": null,
+      "inputRevision": 11,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-12a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31322d61",
+      "inputRevision": 12,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": true,
+      "hasEffective": true,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-14a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31342d61",
+      "inputRevision": 14,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": true,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-15a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31352d61",
+      "inputRevision": 15,
+      "ownerRevision": 0,
+      "authorityEpoch": 0,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    },
+    {
+      "participantId": "authority-16a",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d61",
+      "inputRevision": 16,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": true
+    },
+    {
+      "participantId": "authority-16b",
+      "ownerDigest": "000000000000000000000000617574686f726974792d6f776e65722d31362d62",
+      "inputRevision": 16,
+      "ownerRevision": 1,
+      "authorityEpoch": 1,
+      "hasV1": false,
+      "hasV11": false,
+      "hasV12": false,
+      "hasEffective": false,
+      "hasLegacy": false
+    }
+  ]
+}

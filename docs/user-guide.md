@@ -148,20 +148,35 @@ These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-The current client/source contract uses a Pro 10x-equivalent weekly basis for
-the Aggregate and By model community views. The deployed public website still
-uses the older Pro 20x-equivalent reference as of October 9, 2026; its migration
-is separate from this client release. See [current status](./current-status.md)
-for the observed publication boundary. By plan charts each plan's own weekly
-API-price value on its own scale;
-the card shows that value first and the Pro 10x equivalent underneath. The
-plan value is the reference estimate divided by 1 for Pro 10x, 2 for Pro 5x,
-0.4 for Pro Max 25x, or 10 for Plus. The Pro Max 25x factor assumes the
-same Plus baseline as the existing tiers and awaits provider confirmation.
-The Pro 10x rename retains the existing Pro history; it does not start a new
-account or discard earlier evidence.
-This is an estimated API value, not the subscription price, and does not authorize
-mixing personal Plus and Pro allowance histories.
+The published Electron 0.1.28 client uses a Pro 10x-equivalent community
+contract. The public website readback recorded on October 9, 2026 showed the
+older Pro 20x-equivalent reference; that dated observation does not establish
+the state of later deployments. This source candidate's hosted writer and
+browser reader support the current four-plan Pro 20x publication
+(`community-allowance-breakdowns-v1.5` and
+`admin-community-allowance-preview-v0.5`). Source support does not establish a
+production rollout, completed recalculation or installed-client qualification.
+See [current status](./current-status.md) for dated publication evidence and the
+[API reference](./reference/api-surface.md#public-allowance-breakdowns) for the
+source contracts.
+
+Each publication keeps its declared reference and numerical values. Historical
+public v1.2 and v1.4 publications retain their four-plan Pro 10x meaning; earlier
+three-plan Pro 20x publications retain their original meaning. A basis change
+does not convert or relabel stored historical estimates. The existing raw Pro
+history remains continuous; a reference label does not start a new account or
+discard earlier evidence.
+
+**By plan** charts each plan's own weekly API-price value on its own scale. The
+card shows that value first and the publication's reference estimate underneath.
+The plan value is the reference estimate divided by that publication's factor:
+for the four-plan Pro 10x basis, divide by 1 for Pro 10x, 2 for Pro 5x, 0.4 for
+Pro Max 25x or 10 for Plus; for the current four-plan Pro 20x basis, divide by
+1 for Pro 20x, 4 for Pro 5x, 0.8 for Pro Max 25x or 20 for Plus. These are
+normalization assumptions against a common personal-plan baseline, including
+the Pro Max factor, rather than provider-confirmed allowance entitlements.
+This is an estimated API value, not the subscription price, and does not
+authorize mixing personal Plus and Pro allowance histories.
 
 Switching and cache-drop overheads estimate the API-equivalent premium in
 observed comparisons, not a proven cause or a bill. A labelled covered subtotal

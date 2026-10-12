@@ -415,6 +415,47 @@ function pinnedSourceDigest({ repositoryRoot, sourceCommit, path }) {
   });
 }
 
+/**
+ * Prove that a pinned commit produced a served release manifest: the bytes
+ * must be a release manifest whose source provenance matches that commit's
+ * public source files, read from Git. A changed-site production deploy uses
+ * it for the live site it replaces, on the bytes it has just fetched and
+ * matched to their pinned sha256. Throws on an unresolvable commit, malformed
+ * bytes or any provenance mismatch.
+ */
+export async function verifyPinnedPublicReleaseManifestSource({
+  repositoryRoot = REPOSITORY_ROOT,
+  sourceCommit,
+  manifestBytes,
+  git = runGit,
+} = {}) {
+  const publicSourceCommit = pinnedSourceCommit(repositoryRoot, sourceCommit, git);
+  if (!Buffer.isBuffer(manifestBytes) || manifestBytes.length < 1) {
+    throw new Error("The served public release manifest bytes are unavailable.");
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(manifestBytes.toString("utf8"));
+  } catch {
+    throw new Error("The served public release manifest is not valid JSON.");
+  }
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)
+      || manifest.schemaVersion !== PUBLIC_RELEASE_MANIFEST_SCHEMA) {
+    throw new Error("The served public release manifest has an unsupported shape.");
+  }
+  await verifyPublicReleaseSourceProvenance({
+    repositoryRoot,
+    expectedSourceCommit: publicSourceCommit,
+    provenance: manifest.source,
+    sourceReader: ({ path }) => pinnedSourceDigest({
+      repositoryRoot,
+      sourceCommit: publicSourceCommit,
+      path,
+    }),
+  });
+  return Object.freeze({ publicSourceCommit });
+}
+
 async function replaceGeneratedDirectory(destination, temporaryDirectory) {
   let existing;
   try {

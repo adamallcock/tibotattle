@@ -14,7 +14,7 @@ import {
   V11_ADOPTION_OUTCOMES,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
-import { planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION, planWeeklyApiEquivalentUsd } from "./community-data.js";
 import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js";
 
 const state = {
@@ -83,12 +83,12 @@ const V11_ADOPTION_MAX_PAGES = 200;
 const V11_ADOPTION_PREVIEW_TTL_MILLISECONDS = 15 * 60 * 1_000;
 const V11_ADOPTION_ROWS = Object.freeze([
   ["adopted", "Activated"],
-  ["adoptable", "Can be activated"],
+  ["adoptable", "Eligible for activation checks"],
   ["unchanged", "Already current"],
   ["client_syncing", "Syncing now, left to the app"],
   ["successor_active", "On v1.2, left to the app"],
   ["authority_unavailable", "No current sharing authority"],
-  ["unsupported_history", "Older upload history, not supported"],
+  ["unsupported_history", "History outside this recovery scope"],
   ["no_contiguous_days", "No complete consecutive days"],
   ["refused", "Refused by database checks"],
 ]);
@@ -1365,9 +1365,15 @@ function renderDatabaseHealth() {
     : "No usable database check loaded. Refresh to retry; older deployments may not provide this endpoint.";
   const labels = { primary: "Primary service and telemetry", deletion_ledger: "Deletion ledger", analytics: "Separate analytics" };
   const statuses = { reachable: "Readable", unavailable: "Read failed", timeout: "Timed out (5 seconds)", not_configured: "Binding unavailable", not_applicable: "Not used in JSON mode" };
+  // The removed ledger (admin-database-health-v0.2) is not a JSON-mode role.
+  const statusLabel = row => row.role === "deletion_ledger" && row.status === "not_applicable"
+    ? "Removed (append-only)" : statuses[row.status];
+  const measurement = (row, value) => row.status === "not_applicable" ? "Not applicable"
+    : value === null ? "Unavailable" : value;
   $("#database-health-rows").replaceChildren(...(snapshot?.databases ?? []).map(row => tableRow([
-    labels[row.role], statuses[row.status], row.responseMs === null ? "Unavailable" : `${formatNumber(row.responseMs)} ms`,
-    row.databaseBytes === null ? "Unavailable" : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`,
+    labels[row.role], statusLabel(row),
+    measurement(row, row.responseMs === null ? null : `${formatNumber(row.responseMs)} ms`),
+    measurement(row, row.databaseBytes === null ? null : `${formatNumber(row.databaseBytes / (1024 * 1024), { maximumFractionDigits: 2 })} MiB`),
   ])));
 }
 
@@ -1403,6 +1409,11 @@ function collectAttentionItems(overview) {
     addAttentionItem(items, "database-health", "evidence", "warning", "Database checks need attention",
       "At least one required database could not be read, or the storage configuration is invalid. Review each role and check Cloudflare D1 before retrying.",
       "#database-health-title", "Review databases");
+  }
+  if (state.reconstructionProgress?.schemaVersion === 4 && state.reconstructionProgress.work.lastRun?.state === "failed") {
+    addAttentionItem(items, "full-refresh-failed", "maintenance", "warning", "Last recorded analytics refresh failed",
+      "Current execution and unrecorded failures are unavailable.",
+      "#admin-reconstruction-title", "Review refresh");
   }
   const collection = overview.collection;
   const lifecycle = overview.lifecycle;
@@ -2167,7 +2178,10 @@ function renderOperational(overview) {
   const reconciliation = overview.reconciliation;
   const daily = overview.dailyPublication;
   const historical = overview.historicalPublication;
-  const publicationRows = historical
+  const historicalUnavailable = historical?.status === "unavailable";
+  const publicationRows = historicalUnavailable
+    ? [["Historical model publication", "unavailable on this host (no source yet)"]]
+    : historical
     ? [
       ["Historical model days", count(
         historical.publishedDays,
@@ -2547,11 +2561,20 @@ const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 10×", className: "allowance-series-0" }),
+  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
   prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
   promax: Object.freeze({ label: "Pro Max 25×", className: "allowance-series-2" }),
   plus: Object.freeze({ label: "Plus", className: "allowance-series-3" }),
 });
+
+function adminAllowanceReference(preview) {
+  return preview.basis === "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview"
+    ? "Pro 10×" : "Pro 20×";
+}
+
+function adminAllowancePlanLabel(plan) {
+  return plan.label.replace(/x$/u, "×");
+}
 
 function adminAllowanceTickStep(span, target = 4) {
   if (!Number.isFinite(span) || span <= 0) return 1;
@@ -2587,7 +2610,7 @@ function adminAllowanceSegments(points) {
 
 /**
  * Pure geometry for the admin-only merge preview. Every line shares the same
- * UTC date and Pro-10x-equivalent dollar axes, so switching views changes the
+ * UTC date and declared reference-equivalent dollar axes, so switching views changes the
  * evidence shown rather than the meaning of the scale.
  */
 export function adminAllowanceChartModel(preview, {
@@ -2615,6 +2638,7 @@ export function adminAllowanceChartModel(preview, {
   const planSeries = preview.plans.map((plan) => ({
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+    label: adminAllowancePlanLabel(plan),
   }));
   const modelDayByDay = new Map(
     (preview.models?.days ?? []).map((day) => [day.day, day]),
@@ -2925,6 +2949,7 @@ function appendAdminAllowanceChart(container, preview) {
     container.append(empty);
     return;
   }
+  const reference = adminAllowanceReference(preview);
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
   if (model.activeSeriesKey !== null) {
@@ -2935,14 +2960,14 @@ function appendAdminAllowanceChart(container, preview) {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     tabindex: 0,
-    "aria-description": "Weekly API-equivalent USD on a Pro 10× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
+    "aria-description": `Weekly API-equivalent USD on a ${reference} basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.`,
     "aria-label": state.allowanceMode === "combined"
-      ? "Combined Pro 10x-equivalent community allowance by day"
+      ? `Combined ${reference}-equivalent community allowance by day`
       : state.allowanceMode === "models"
-        ? "Pro 10x-equivalent per-model allowance by day"
+        ? `${reference}-equivalent per-model allowance by day`
         : model.activePlanFilter === null
-          ? "Pro 10x-equivalent community allowance by plan and day"
-          : `${model.series[0].label} Pro 10x-equivalent community allowance by day`,
+          ? `${reference}-equivalent community allowance by plan and day`
+          : `${model.series[0].label} ${reference}-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -3018,7 +3043,7 @@ function appendAdminAllowanceChart(container, preview) {
     }
     const markers = new Set(series.markerPoints);
     for (const point of series.points) {
-      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 10× week at API prices`
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/${reference} week at API prices`
         + ` · ${allowanceCountLabel(point.participantCount, "account")}`
         + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
@@ -3064,7 +3089,7 @@ function appendAdminAllowanceChart(container, preview) {
   if (model.mode === "plans") {
     const method = document.createElement("p");
     method.className = "admin-allowance-meta";
-    method.textContent = "Chart scaled to Pro 10×: Pro 10× ×1, Pro 5× ×2, Pro Max 25× ×0.4, Plus ×10."
+    method.textContent = `Chart scaled to ${reference}: ${preview.plans.map(plan => `${adminAllowancePlanLabel(plan)} ×${plan.multiplier}`).join(", ")}.`
       + " Smaller card values show each plan’s own week at API prices."
       + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
     container.append(method);
@@ -3081,7 +3106,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "API-equivalent USD / Pro 10× week";
+  unit.textContent = `API-equivalent USD / ${adminAllowanceReference(preview)} week`;
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -3108,7 +3133,7 @@ function appendCombinedAllowanceSummary(container, preview) {
 }
 
 function appendPlanAllowanceSummaries(container, preview) {
-  appendAllowanceCardsCaption(container);
+  appendAllowanceCardsCaption(container, preview);
   const list = document.createElement("div");
   list.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const plan of preview.plans) {
@@ -3120,7 +3145,7 @@ function appendPlanAllowanceSummaries(container, preview) {
       item.classList.add("admin-allowance-plan-summary-selected");
     }
     const label = document.createElement("h3");
-    label.textContent = style.label;
+    label.textContent = adminAllowancePlanLabel(plan);
     const value = document.createElement("strong");
     value.className = "allowance-summary-value";
     value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
@@ -3134,7 +3159,8 @@ function appendPlanAllowanceSummaries(container, preview) {
       ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
       : "Middle 80% unavailable";
     item.append(label, value);
-    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType);
+    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType,
+      adminAllowanceReference(preview) === "Pro 10×" ? COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION : undefined);
     if (planUsd !== null) {
       const actual = document.createElement("p");
       actual.className = "allowance-plan-value";
@@ -3147,10 +3173,10 @@ function appendPlanAllowanceSummaries(container, preview) {
   container.append(list);
 }
 
-function appendAllowanceCardsCaption(container) {
+function appendAllowanceCardsCaption(container, preview) {
   const caption = document.createElement("p");
   caption.className = "allowance-summary-caption";
-  caption.textContent = "API-equivalent USD / Pro 10× week";
+  caption.textContent = `API-equivalent USD / ${adminAllowanceReference(preview)} week`;
   container.append(caption);
 }
 
@@ -3232,7 +3258,7 @@ function appendModelAllowanceSummaries(container, preview) {
       + " Qualified historical points fill in as background calculations complete.";
     container.append(empty);
   }
-  appendAllowanceCardsCaption(container);
+  appendAllowanceCardsCaption(container, preview);
   const grid = document.createElement("div");
   grid.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const model of modelConfig) {
@@ -3295,6 +3321,9 @@ function renderAdminCommunityAllowance(preview) {
   const badge = $("#admin-community-status");
   if (!container || !badge) return;
   container.replaceChildren();
+  const heading = $("#admin-community-basis-heading");
+  if (heading) heading.textContent = preview === null
+    ? "Allowance estimates" : `${adminAllowanceReference(preview)}-equivalent allowance`;
   if (preview === null) {
     badge.className = "admin-source-badge admin-source-partial";
     badge.textContent = "Preview unavailable";
@@ -3639,12 +3668,12 @@ function pipelineAge(instant, nowMs) {
   return hours < 48 ? `${formatNumber(hours)} h ago` : `${formatNumber(Math.round(hours / 24))} days ago`;
 }
 
-function pipelineCard(label, value, lines, tone) {
+function pipelineCard(label, value, lines, tone, explanation = INFO_HINTS[label]) {
   const card = document.createElement("div");
   card.className = `admin-card admin-metric admin-pipeline-stage admin-pipeline-${tone}`;
   const number = document.createElement("strong");
   number.textContent = value;
-  card.append(labelWithInfo(label), number, ...lines.filter(Boolean).map((line) => {
+  card.append(labelWithInfo(label, explanation), number, ...lines.filter(Boolean).map((line) => {
     const caption = document.createElement("small");
     caption.textContent = line;
     return caption;
@@ -3659,6 +3688,17 @@ function renderPipeline(progress, { stale = false } = {}) {
   const stages = $("#pipeline-stages");
   const badge = $("#pipeline-badge");
   if (!stages || !badge) return;
+  const description = $("#pipeline-description");
+  if (description) {
+    description.dataset.incrementalCopy ??= description.textContent;
+    description.textContent = progress?.schemaVersion === 4
+      ? "Accepted changes are recorded in the ingestion journal. One full analytics refresh consumes the journal cursor and rebuilds daily publication and the graph. The cards show recorded source counts and journaled rebuilds. Current execution and incremental progress are unavailable."
+      : description.dataset.incrementalCopy;
+  }
+  if (progress?.schemaVersion === 4) {
+    renderFullRefreshPipeline(progress, stages, badge, stale);
+    return;
+  }
   const pipeline = progress?.schemaVersion === 3 ? progress.pipeline : undefined;
   if (!pipeline) {
     stages.replaceChildren();
@@ -3728,6 +3768,76 @@ function renderPipeline(progress, { stale = false } = {}) {
   }
 }
 
+function renderFullRefreshPipeline(progress, stages, badge, stale) {
+  const { ingestion, delivery, daily } = progress.pipeline;
+  const number = value => value === null ? "Unavailable" : formatNumber(value);
+  state.pipelineObservation = null;
+  stages.replaceChildren(
+    pipelineCard("Ingestion journal", ingestion.journalHead === null ? "Not recorded" : number(ingestion.journalHead), [
+      "Latest recorded change sequence",
+      ingestion.latestRecordedAt === null ? "No journal head recorded" : `Latest ${formatReportingTime(ingestion.latestRecordedAt)}`,
+      `${number(ingestion.v12Heads)} v1.2 heads · ${number(ingestion.v12Days)} stored source days`,
+      ingestion.pendingActivations === null ? "Activation authorization count unavailable"
+        : countWith(ingestion.pendingActivations, "unconsumed activation authorization"),
+    ], "clear"),
+    pipelineCard("Delivery into analytics", number(delivery.pendingChanges), [
+      "journal changes after the refresh cursor",
+      delivery.appliedSequence === null ? "Delivery cursor unavailable" : `Applied through change ${formatNumber(delivery.appliedSequence)}`,
+      delivery.pendingOwnerActivations === null ? "Journaled owner activation count unavailable"
+        : `${countWith(delivery.pendingOwnerActivations, "journaled owner activation")} pending`,
+      "Incremental delivery position unavailable on this service.",
+    ], delivery.pendingChanges === null ? "waiting" : delivery.pendingChanges === 0 ? "clear" : "busy",
+    "Journal changes after the last full refresh's recorded cursor. The full refresh consumes this backlog; incremental delivery and active execution are unavailable."),
+    pipelineCard("Daily publication", number(daily.queuedDays), [
+      daily.queuedDays === null ? "Queued days unavailable: cursor unknown or read bound reached"
+        : `${countWith(daily.queuedDays, "publication rebuild")} queued`,
+      daily.oldestQueuedDay === null ? null : `${pipelineDay(daily.oldestQueuedDay)} – ${pipelineDay(daily.newestQueuedDay)}`,
+      daily.lastReleasedAt === null ? "No publication recorded" : `Last published ${formatReportingTime(daily.lastReleasedAt)}`,
+      `${countWith(daily.releasedLastHour, "published head")} released in the last hour`,
+      "Journaled days are rebuilt by the full analytics refresh.",
+    ], daily.queuedDays === null ? "waiting" : daily.queuedDays === 0 ? "clear" : "busy",
+    "Distinct days named by journal changes after the refresh cursor, including replaced source days. They are rebuilt by a full refresh. An unknown cursor or exceeded read bound leaves the count unavailable."),
+  );
+  badge.textContent = stale ? "Stale · the latest read failed"
+    : delivery.appliedSequence === null ? "Snapshot available · cursor unavailable" : "Snapshot available";
+}
+
+function renderFullRefreshReconstruction(progress, panel, badge, details) {
+  const { work, publication } = progress;
+  const run = work.lastRun;
+  panel.className = "admin-reconstruction";
+  const heading = $("#admin-reconstruction-title");
+  if (heading) heading.textContent = "Graph reconstruction";
+  badge.className = `admin-source-badge admin-source-${run?.state === "complete" ? "available" : "partial"}`;
+  badge.textContent = run === null ? "No refresh recorded" : run.state === "complete" ? "Last recorded refresh complete" : "Last recorded refresh failed";
+  const grid = document.createElement("dl");
+  grid.className = "admin-reconstruction-grid";
+  const metric = (label, text) => {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = text;
+    group.append(term, description);
+    grid.append(group);
+  };
+  metric("Refresh started", run === null ? "Not recorded" : formatReportingTime(run.startedAt));
+  metric("Refresh finished", run === null ? "Not recorded" : formatReportingTime(run.finishedAt));
+  metric("Refresh kernel", run?.kernelId == null ? "Unavailable" : formatNumber(run.kernelId));
+  metric("Recorded owners / owner-days", run === null ? "Unavailable" : `${formatNumber(run.owners)} / ${formatNumber(run.ownerDays)}`);
+  metric("Published daily heads", `${formatNumber(publication.publishedDays)}${publication.latestEvidenceDay === null ? "" : ` · latest ${publication.latestEvidenceDay}`}`);
+  const preview = publication.preview;
+  metric("Graph preview", preview.state === "recorded" ? `Recorded · computed ${formatReportingTime(preview.computedAt)}`
+    : preview.state === "not_recorded" ? "Not recorded" : `Unavailable · computed ${formatReportingTime(preview.computedAt)}`);
+  metric("Current execution", "Unavailable · active runs and unrecorded failures have no database source");
+  metric("Next nominal refresh slot", `${formatReportingTime(work.nextScheduledAt)} · daily at 03:00 UTC; scheduler state unavailable`);
+  metric("Incremental graph / history counters", "Unavailable · this service records full refreshes");
+  const freshness = document.createElement("p");
+  freshness.className = "admin-reconstruction-freshness";
+  freshness.textContent = `${state.reconstructionProgressFailed ? "Progress read unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}. Last recorded work does not establish current execution. No time estimate is available.`;
+  details.replaceChildren(grid, freshness);
+}
+
 function renderCurrentReconstructionProgress() {
   const progress = state.reconstructionProgress;
   if (progress === null) {
@@ -3738,6 +3848,10 @@ function renderCurrentReconstructionProgress() {
   const badge = $("#admin-reconstruction-status");
   const details = $("#admin-reconstruction-details");
   if (!panel || !badge || !details) return;
+  if (progress.schemaVersion === 4) {
+    renderFullRefreshReconstruction(progress, panel, badge, details);
+    return;
+  }
   if (progress.schemaVersion === 3 && progress.graph) {
     renderGraphRebuild(progress, panel, badge, details);
     return;
@@ -4120,6 +4234,7 @@ async function runV11Adoption(dryRun, onProgress) {
     refusals: {}, daysCovered: 0, newDays: 0, keptAcceptedDays: 0,
   };
   let after = null;
+  const seenCursors = new Set();
   try {
     do {
       const page = projectV11EvidenceAdoption(await request("/api/v1/admin/action", {
@@ -4139,10 +4254,14 @@ async function runV11Adoption(dryRun, onProgress) {
       total.daysCovered += page.daysCovered;
       total.newDays += page.newDays;
       total.keptAcceptedDays += page.keptAcceptedDays;
-      // The service pages by strictly increasing participant. Anything else
-      // would repeat or skip devices, so stop instead of following it.
-      if (page.nextAfterParticipantId !== null && after !== null && page.nextAfterParticipantId <= after) {
-        throw new AdminResponseError("ADMIN_ACTION_INVALID");
+      // PostgreSQL cursors are opaque capabilities, so ciphertext has no
+      // lexical ordering. Retain the D1 ordering guard and reject repetitions
+      // in both modes; the existing page cap also bounds any cursor cycle.
+      if (page.nextAfterParticipantId !== null) {
+        if (seenCursors.has(page.nextAfterParticipantId)
+            || (after !== null && !page.nextAfterParticipantId.startsWith("pg1.")
+              && page.nextAfterParticipantId <= after)) throw new AdminResponseError("ADMIN_ACTION_INVALID");
+        seenCursors.add(page.nextAfterParticipantId);
       }
       after = page.nextAfterParticipantId;
       onProgress(total);
@@ -4366,7 +4485,7 @@ if (isAdminPage) {
       if (adoptable > 0) $("#apply-v11-adoption").textContent = `Activate ${countWith(adoptable, "device")}`;
       $("#v11-adoption-status").textContent = [
         adoptable > 0
-          ? `Preview: ${countWith(adoptable, "device")} can be activated, adding ${countWith(total.newDays, "new day")}.`
+          ? `Preview: ${countWith(adoptable, "device")} eligible for activation checks, with ${countWith(total.newDays, "new day")}.`
           : "Preview: nothing to activate.",
         total.truncated ? `The preview stopped after ${countWith(total.pages, "page")}.` : "",
         "Nothing was changed.",

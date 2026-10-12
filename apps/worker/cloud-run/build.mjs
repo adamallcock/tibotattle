@@ -1,0 +1,160 @@
+#!/usr/bin/env node
+
+import { mkdir } from "node:fs/promises";
+import { dirname, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
+import {
+  ANALYTICS_REFRESH_WORKER_ENTRY,
+  ANALYTICS_REPRICE_JOB_ENTRY,
+  analyticsKernelDefines,
+  computeAnalyticsKernelIdentity,
+  resolveAnalyticsKernelRegistryEntry,
+} from "./analytics-kernel-closure.mjs";
+import { assertNodeHostAlias, cloudRunBuildPlugins } from "./node-host-build.mjs";
+import { assertTelemetryByteBoundsBinding } from "./telemetry-byte-bounds-binding.mjs";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)));
+const ENTRY = resolve(ROOT, "server.mjs");
+const OAUTH_GATEWAY_ENTRY = resolve(ROOT, "oauth-gateway.mjs");
+const MIGRATIONS_ENTRY = resolve(ROOT, "test-migrations.mjs");
+const ACTIVATION_ENTRY = resolve(ROOT, "test-activation.mjs");
+const COMMUNITY_GRAPH_BENCHMARK_ENTRY = resolve(ROOT, "postgres-community-graph-benchmark.mjs");
+const COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY = resolve(ROOT, "postgres-community-graph-readback-diagnostic.mjs");
+const ANALYTICS_REFRESH_ENTRY = resolve(ROOT, "analytics-refresh.mjs");
+const PRODUCTION_MIGRATIONS_ENTRY = resolve(ROOT, "postgres-production-migrations.mjs");
+const MAINTENANCE_JOB_ENTRY = resolve(ROOT, "postgres-maintenance-job.mjs");
+const OPS_RUNTIME_PROBE_ENTRY = resolve(ROOT, "ops-runtime-probe-job.mjs");
+const OPS_BACKUP_AUDIT_ENTRY = resolve(ROOT, "ops-backup-audit-job.mjs");
+const OUTDIR = resolve(ROOT, "dist");
+// The vendored d43c8f92 kernels resolve @app-usagemonitor/* to the packages
+// vendored beside them through vendor/analytics-d43c8f92/tsconfig.json
+// `paths`, found by esbuild's per-directory tsconfig discovery. Passing a
+// tsconfig or tsconfigRaw here would override that discovery and silently
+// bundle this checkout's packages under the vendored kernels instead.
+const VENDOR_ROOT = resolve(ROOT, "../vendor/analytics-d43c8f92");
+const VENDORED_PACKAGES = resolve(VENDOR_ROOT, "packages");
+const WORKER_ROOT = resolve(ROOT, "..");
+const options = {
+  entryPoints: {
+    server: ENTRY,
+    "oauth-gateway": OAUTH_GATEWAY_ENTRY,
+    "test-migrations": MIGRATIONS_ENTRY,
+    "test-activation": ACTIVATION_ENTRY,
+    "postgres-community-graph-benchmark": COMMUNITY_GRAPH_BENCHMARK_ENTRY,
+    "postgres-community-graph-readback-diagnostic": COMMUNITY_GRAPH_READBACK_DIAGNOSTIC_ENTRY,
+    "analytics-refresh": ANALYTICS_REFRESH_ENTRY,
+    "analytics-reprice": ANALYTICS_REPRICE_JOB_ENTRY,
+    // K-PAR: the compute Worker the refresh Job spawns (dist/ beside it).
+    "analytics-refresh-worker": ANALYTICS_REFRESH_WORKER_ENTRY,
+    "production-migrations": PRODUCTION_MIGRATIONS_ENTRY,
+    "postgres-maintenance-job": MAINTENANCE_JOB_ENTRY,
+    "ops-runtime-probe-job": OPS_RUNTIME_PROBE_ENTRY,
+    "ops-backup-audit-job": OPS_BACKUP_AUDIT_ENTRY,
+  },
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  outdir: OUTDIR,
+  entryNames: "[name]",
+  outExtension: { ".js": ".mjs" },
+  sourcemap: false,
+  external: ["@google-cloud/cloud-sql-connector", "google-auth-library", "jsonc-parser", "pg"],
+  logLevel: "silent",
+  metafile: true,
+  // Wave 1A: node:crypto's synchronous SHA-256 and Buffer hex behind both
+  // sha256Hex implementations (src/host-primitives.ts and the vendored
+  // crypto.ts resolve to node-host-primitives.mjs; the vendored file stays
+  // byte-identical). It decides the import graph, so every in-repo esbuild of
+  // these entries takes the same list from node-host-build.mjs.
+  plugins: cloudRunBuildPlugins(WORKER_ROOT),
+};
+
+// Every entry whose bundle must hash through node-host-primitives.mjs: the
+// refresh/reprice Jobs and the compute Worker (stored digests), and the server (auth and
+// session digests). assertNodeHostAlias refuses the build otherwise.
+const NODE_HOST_REQUIRED_ENTRIES = Object.freeze([ENTRY, ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY, ANALYTICS_REPRICE_JOB_ENTRY]);
+
+/**
+ * Refuse a bundle in which a vendored kernel file imports a workspace package
+ * that did not resolve inside the vendor tree. Code outside the vendor tree
+ * keeps this checkout's packages by design.
+ */
+function assertVendoredPackageResolution(metafile) {
+  const cwd = process.cwd();
+  const absolute = (path) => resolve(cwd, path);
+  const insideVendor = (path) => absolute(path).startsWith(`${VENDOR_ROOT}${sep}`);
+  let vendoredInputs = 0;
+  for (const [path, input] of Object.entries(metafile.inputs)) {
+    if (!insideVendor(path)) continue;
+    vendoredInputs += 1;
+    for (const imported of input.imports ?? []) {
+      if (typeof imported.original !== "string" || !imported.original.startsWith("@app-usagemonitor/")) continue;
+      if (imported.external || !absolute(imported.path).startsWith(`${VENDORED_PACKAGES}${sep}`)) {
+        throw Object.assign(new Error("CLOUD_RUN_BUILD_VENDORED_PACKAGE_UNRESOLVED"), {
+          code: "CLOUD_RUN_BUILD_VENDORED_PACKAGE_UNRESOLVED",
+          input: relative(ROOT, absolute(path)),
+          imported: imported.original,
+        });
+      }
+    }
+  }
+  const refreshOutput = Object.entries(metafile.outputs)
+    .find(([, output]) => output.entryPoint !== undefined && absolute(output.entryPoint) === ANALYTICS_REFRESH_ENTRY);
+  if (refreshOutput === undefined
+      || !Object.keys(refreshOutput[1].inputs).some((path) => insideVendor(path))) {
+    throw Object.assign(new Error("CLOUD_RUN_BUILD_ANALYTICS_REFRESH_KERNELS_MISSING"), {
+      code: "CLOUD_RUN_BUILD_ANALYTICS_REFRESH_KERNELS_MISSING",
+    });
+  }
+  return vendoredInputs;
+}
+// K-STAMP: the kernel identity (vendored manifest and compute closure) every
+// bundle carries; src/analytics-v2/kernel.ts reads it, the Job refuses a
+// bundle whose identity has no kernel-registry.json entry.
+const kernelIdentity = await computeAnalyticsKernelIdentity({ build, options, vendorRoot: VENDOR_ROOT });
+options.define = { ...(options.define ?? {}), ...analyticsKernelDefines(kernelIdentity) };
+const kernel = { computeClosureSha256: kernelIdentity.computeClosureSha256,
+  vendorManifestSha256: kernelIdentity.vendorManifestSha256, closureInputs: kernelIdentity.inputs,
+  // K-PERCARD: the compute class (the closure without the vendored price registry).
+  computeSha256: kernelIdentity.computeSha256 };
+const kernelClosureOnly = process.argv.includes("--kernel-closure");
+// Refuse to build (or check) a bundle no kernel-registry.json entry names
+// (CLOUD_RUN_BUILD_KERNEL_UNREGISTERED), before anything is bundled: the image
+// build runs this, so an unregistered compute closure fails the image rather
+// than deploying a Job that refuses every run. The entry's id is reported with
+// the digests. --kernel-closure skips it: that is how a new entry's digests
+// are found.
+if (!kernelClosureOnly) {
+  kernel.kernelId = (await resolveAnalyticsKernelRegistryEntry({ build, options, identity: kernelIdentity })).kernelId;
+}
+if (kernelClosureOnly) {
+  // Every input of the compute class, by the name it is hashed under (K-STAMP).
+  console.log(JSON.stringify({ status: "ok", mode: "kernel-closure", kernel, names: kernelIdentity.names }));
+} else if (process.argv.includes("--check")) {
+  const result = await build({ ...options, write: false });
+  assertVendoredPackageResolution(result.metafile);
+  assertNodeHostAlias(result.metafile, { workerRoot: WORKER_ROOT, requiredEntries: NODE_HOST_REQUIRED_ENTRIES });
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT,
+    requiredEntries: [ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: "check",
+    entries: ["server.mjs", "oauth-gateway.mjs", "test-migrations.mjs", "test-activation.mjs", "postgres-community-graph-benchmark.mjs", "postgres-community-graph-readback-diagnostic.mjs", "analytics-refresh.mjs", "analytics-refresh-worker.mjs", "analytics-reprice.mjs", "postgres-production-migrations.mjs", "postgres-maintenance-job.mjs", "ops-runtime-probe-job.mjs", "ops-backup-audit-job.mjs"],
+    kernel,
+  }));
+} else {
+  await mkdir(OUTDIR, { recursive: true });
+  const result = await build(options);
+  assertVendoredPackageResolution(result.metafile);
+  assertNodeHostAlias(result.metafile, { workerRoot: WORKER_ROOT, requiredEntries: NODE_HOST_REQUIRED_ENTRIES });
+  assertTelemetryByteBoundsBinding(result.metafile, { workerRoot: WORKER_ROOT,
+    requiredEntries: [ANALYTICS_REFRESH_ENTRY, ANALYTICS_REFRESH_WORKER_ENTRY] });
+  console.log(JSON.stringify({
+    status: "ok",
+    mode: "build",
+    outputs: ["dist/server.mjs", "dist/oauth-gateway.mjs", "dist/test-migrations.mjs", "dist/test-activation.mjs", "dist/postgres-community-graph-benchmark.mjs", "dist/postgres-community-graph-readback-diagnostic.mjs", "dist/analytics-refresh.mjs", "dist/analytics-refresh-worker.mjs", "dist/analytics-reprice.mjs", "dist/production-migrations.mjs", "dist/postgres-maintenance-job.mjs", "dist/ops-runtime-probe-job.mjs", "dist/ops-backup-audit-job.mjs"],
+    kernel,
+  }));
+}

@@ -8,6 +8,7 @@ import { canonicalTelemetryV12Json, telemetryV12DayManifestDigestInput, telemetr
   telemetryV12RequiredConsent, type TelemetryV12Chunk, type TelemetryV12DayManifest, type TelemetryV12Record } from "@app-usagemonitor/telemetry-contract";
 import { grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -267,8 +268,12 @@ async function v12Fixture(id=participantId){
   const grant=await createDeviceUploadAuthorization(typed(),device,digest,4096);
   const claim=await claimDeviceUploadAuthorization(typed(),`Upload ${grant.uploadAuthorization}`,
    {envelopeDigest:digest,bodyBytes:4096,contentType:'application/json'});
-  await persistTelemetryV12StagedChunk(typed(),f,chunk,{chunkRowId:`chunk:${crypto.randomUUID()}`,
-   r2Key:`synthetic/${crypto.randomUUID()}`,envelopeDigest:digest,deviceUploadAuthorizationId:claim.authorizationId});
+  // Upload-route order: the object is registered before isolation 0013 admits its chunk.
+  const chunkRowId=`chunk:${crypto.randomUUID()}`,r2Key=`telemetry/v12-graph/${crypto.randomUUID()}`;
+  await putTrackedQuarantineObject(typed(),b.QUARANTINE,{contributionId:chunkRowId,objectKind:'telemetry',r2Key,
+   registeredAt:new Date().toISOString()},'synthetic v1.2 bytes');
+  await persistTelemetryV12StagedChunk(typed(),f,chunk,{chunkRowId,
+   r2Key,envelopeDigest:digest,deviceUploadAuthorizationId:claim.authorizationId});
  }
  const prior=await createTelemetryV12DomainPredecessor(typed(),f);
  const domain={schemaVersion:'telemetry-domain-manifest-v1.2' as const,fromDay:day(),throughDay:day(),
@@ -360,8 +365,13 @@ describe('isolated allowance graph publication',()=>{
   expect(await b.STORAGE_ANALYTICS_DB.prepare('SELECT method FROM analytics_community_model_publications').first('method'))
     .toBe(STORAGE_GRAPH_PROJECTION_METHOD);
   const preview=await readPublishedStorageCommunityAdminPreview(bindings());
+  expect(preview).toMatchObject({
+    schemaVersion:'admin-community-allowance-preview-v0.5',
+    basis:'seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview',
+    models:{basis:'seven_day_codex_pro20x_equivalent_per_model_composition_promax25'},
+  });
   expect(preview?.plans.map(plan=>[plan.planType,plan.multiplier])).toEqual([
-    ['pro',1],['prolite',2],['promax',0.4],['plus',10]]);
+    ['pro',1],['prolite',4],['promax',0.8],['plus',20]]);
  });
  it('fits allowance for an owner who has only ever uploaded v1.2',async()=>{
   const f=await v12Fixture();

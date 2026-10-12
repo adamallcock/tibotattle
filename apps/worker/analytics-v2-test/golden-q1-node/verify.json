@@ -1,0 +1,22 @@
+{
+ "community-daily-response.json": true,
+ "preview.json": true,
+ "publishedRowDigests": {
+  "analytics_cache_retention_day_bands": true,
+  "analytics_cache_retention_day_values": true,
+  "analytics_community_daily_publications": true,
+  "analytics_community_graph_previews": true,
+  "analytics_community_graph_publication_state": true,
+  "analytics_community_model_publications": true
+ },
+ "sourceDumpShape": {
+  "tables": true,
+  "rows": true,
+  "schemaSha256": true,
+  "rowCountsSha256": true
+ },
+ "modelPublications": true,
+ "cacheMarks": true,
+ "cacheWindowAdjacencies": true,
+ "previewRow": true
+}

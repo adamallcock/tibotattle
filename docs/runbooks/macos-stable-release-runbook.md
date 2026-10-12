@@ -209,3 +209,11 @@ GitHub assets, both native appcasts, Electron feeds, tap and website. Its defaul
 mode is read-only; remote writes remain separate protected operations. A
 successful source test, prepared plan or saved operation journal is not proof
 that those surfaces are live or synchronized.
+
+Follow the [cross-platform release publication runbook](2026-08-18-cross-platform-release-publication.md)
+for immutable GitHub publication and fresh release-asset verification before
+publishing downstream surfaces. Verify delivered installer bytes against the
+canonical manifest, including after publication; a version label, digest-named
+URL or successful response alone does not prove the delivered content. Use
+fresh reads for the native feeds, tap and website so cached metadata cannot
+stand in for the current release.

@@ -15,15 +15,25 @@ const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 function usage() {
   return [
-    "Usage:",
+    "Usage (typed only; from P1 on use production:deploy with --edge-mode):",
     "  node scripts/deploy-web-release.js \\",
     "    --receipt /absolute/repository/.release-build/web-release-receipt.json \\",
     `    --confirm ${PRODUCTION_DEPLOY_CONFIRMATION} \\`,
-    "    [--confirm-migrations BINDING:0000_name.sql,...]",
-    "    [--operation /absolute/private/new-operation-directory]",
-    "    [--inventory PRIVATE_JSON --inventory-sha256 SHA256",
-    "     --retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256]",
+    "    [--operation /absolute/private/new-operation-directory] \\",
+    "    --inventory PRIVATE_JSON --inventory-sha256 SHA256 \\",
+    "    --retained-public-source FULL_SHA --expected-live-manifest-sha256 SHA256",
   ].join("\n");
+}
+
+// The untyped form renders the checked-in env.production: on this line the
+// JSON storage layout without the edge entry. Over typed production or a live
+// edge it would replace the Worker and skip every edge gate, so it is refused
+// before the receipt is read (the same code as production:deploy).
+function untypedDeployRefused() {
+  return Object.assign(
+    new TypeError(`PRODUCTION_UNTYPED_DEPLOY_REFUSED: a web-only release deploy needs the private inventory and live-site pins\n${usage()}`),
+    { code: "PRODUCTION_UNTYPED_DEPLOY_REFUSED" },
+  );
 }
 
 export function parseDeployWebReleaseArgs(argv) {
@@ -71,22 +81,25 @@ export function parseDeployWebReleaseArgs(argv) {
   }
   const typedFields = ["inventoryPath", "inventorySha256", "retainedPublicSourceCommit", "expectedLiveManifestSha256"];
   const typedCount = typedFields.filter((field) => parsed[field] !== null).length;
-  if (typedCount !== 0 && typedCount !== typedFields.length) {
+  if (typedCount === 0) throw untypedDeployRefused();
+  if (typedCount !== typedFields.length) {
     throw new TypeError(`Typed production deployment requires every inventory and public-site pin\n${usage()}`);
   }
-  if (typedCount > 0 && (parsed.confirmedMigrations !== null
+  if (parsed.confirmedMigrations !== null
       || !/^[a-f0-9]{64}$/u.test(parsed.inventorySha256)
       || !/^[a-f0-9]{40}$/u.test(parsed.retainedPublicSourceCommit)
-      || !/^[a-f0-9]{64}$/u.test(parsed.expectedLiveManifestSha256))) {
+      || !/^[a-f0-9]{64}$/u.test(parsed.expectedLiveManifestSha256)) {
     throw new TypeError(`Typed production deployment pins are invalid\n${usage()}`);
   }
   return parsed;
 }
 
 /**
- * The only production entry point for a prepared web-only release. It checks
- * the receipt and committed scope again, then delegates to the existing
- * immutable-snapshot Worker deployment guard with the receipt's exact SHA.
+ * The production entry point for a prepared web-only release before P1. It
+ * refuses the untyped form, checks the receipt and committed scope again, then
+ * delegates to the typed immutable-snapshot Worker deployment guard with the
+ * receipt's exact SHA. From P1 on the guard refuses it too
+ * (EDGE_MODE_REQUIRED_FOR_EDGE_LIVE): it has no edge mode.
  */
 export async function deployWebRelease({
   repositoryRoot = REPOSITORY_ROOT,
@@ -100,6 +113,7 @@ export async function deployWebRelease({
   runProduction = runProductionDeployment,
   verifyReceipt = verifyWebReleaseReceipt,
 }) {
+  if (!typedProduction || typeof typedProduction !== "object") throw untypedDeployRefused();
   const repository = resolve(repositoryRoot);
   const verification = await verifyReceipt({
     repositoryRoot: repository,
@@ -112,14 +126,10 @@ export async function deployWebRelease({
     ".bin",
     process.platform === "win32" ? "wrangler.cmd" : "wrangler",
   );
-  if (typedProduction === null && (retainedPublicSourceCommit !== null
-      || expectedLiveManifestSha256 !== null)) {
-    throw new TypeError("Typed web release pins require a private production inventory.");
-  }
-  if (typedProduction !== null && (confirmedMigrations !== null
+  if (confirmedMigrations !== null
       || !/^[a-f0-9]{40}$/u.test(retainedPublicSourceCommit ?? "")
       || !/^[a-f0-9]{64}$/u.test(expectedLiveManifestSha256 ?? "")
-      || !/^[a-f0-9]{64}$/u.test(verification.receipt?.site?.manifestSha256 ?? ""))) {
+      || !/^[a-f0-9]{64}$/u.test(verification.receipt?.site?.manifestSha256 ?? "")) {
     throw new TypeError("Typed web release requires a verified candidate manifest and complete live pins.");
   }
   const deployment = await runProduction({
@@ -130,12 +140,10 @@ export async function deployWebRelease({
     workerDirectory,
     wrangler,
     ...(operationDirectory === null ? {} : { operationDirectory }),
-    ...(typedProduction === null ? {} : {
-      typedProduction,
-      retainedPublicSourceCommit,
-      expectedLiveManifestSha256,
-      candidatePublicManifestSha256: verification.receipt.site.manifestSha256,
-    }),
+    typedProduction,
+    retainedPublicSourceCommit,
+    expectedLiveManifestSha256,
+    candidatePublicManifestSha256: verification.receipt.site.manifestSha256,
   });
   return Object.freeze({
     deployment,
@@ -147,7 +155,7 @@ export async function deployWebRelease({
 async function main() {
   try {
     const parsed = parseDeployWebReleaseArgs(process.argv.slice(2));
-    const inventory = parsed.inventoryPath === null ? null : await readPrivateProductionInventory(
+    const inventory = await readPrivateProductionInventory(
       parsed.inventoryPath,
       parsed.inventorySha256,
     );
@@ -156,17 +164,15 @@ async function main() {
       confirmedMigrations: parsed.confirmedMigrations,
       receiptPath: resolve(parsed.receiptPath),
       operationDirectory: parsed.operationDirectory,
-      ...(inventory === null ? {} : {
-        typedProduction: {
-          inventory,
-          provider: createProductionLiveProvider({
-            accountId: inventory.accountId,
-            workerName: inventory.workerName,
-          }),
-        },
-        retainedPublicSourceCommit: parsed.retainedPublicSourceCommit,
-        expectedLiveManifestSha256: parsed.expectedLiveManifestSha256,
-      }),
+      typedProduction: {
+        inventory,
+        provider: createProductionLiveProvider({
+          accountId: inventory.accountId,
+          workerName: inventory.workerName,
+        }),
+      },
+      retainedPublicSourceCommit: parsed.retainedPublicSourceCommit,
+      expectedLiveManifestSha256: parsed.expectedLiveManifestSha256,
     });
     process.stdout.write(`${JSON.stringify(result.deployment, null, 2)}\n`);
     process.exitCode = result.deployment?.ok === true ? 0 : 1;

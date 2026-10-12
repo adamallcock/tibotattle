@@ -1,0 +1,29 @@
+# Production image build for the Cloud Run origin and its jobs.
+#
+# It builds the same Dockerfile with the same pinned builder image and options
+# as the test build in cloudbuild.yaml, which stays unchanged. Only the
+# builder service account and the Artifact Registry image differ, and both
+# are placeholders. The production build tooling renders PROJECT, BUILDER_SA,
+# IMAGE_REPOSITORY and SOURCE_COMMIT before submission and never submits this
+# file unrendered; _IMAGE remains a Cloud Build substitution. The production
+# repository uses immutable tags, so each source commit gets its own tag, and
+# every deployment references the pushed image by digest.
+#
+# scripts/cloud-run-production-configuration.check.mjs pins this file to the
+# test build line for line, apart from those two placeholder lines.
+steps:
+  - name: gcr.io/cloud-builders/docker@sha256:bbb3d633c5c2813b2ce5245852979e1d637768f4acfc504d8ece288f91e9b60f
+    args:
+      - build
+      - --file=apps/worker/cloud-run/Dockerfile
+      - --tag=${_IMAGE}
+      - .
+images:
+  - ${_IMAGE}
+options:
+  logging: CLOUD_LOGGING_ONLY
+  sourceProvenanceHash: [SHA256]
+  requestedVerifyOption: VERIFIED
+serviceAccount: projects/${PROJECT}/serviceAccounts/${BUILDER_SA}
+substitutions:
+  _IMAGE: ${IMAGE_REPOSITORY}:source-${SOURCE_COMMIT}

@@ -121,7 +121,7 @@
           </div>
           <span class="admin-source-badge" id="pipeline-badge">Checking progress…</span>
         </div>
-        <p class="admin-copy">
+        <p class="admin-copy" id="pipeline-description">
           Every accepted change is written to the ingestion journal, then delivered into analytics in order.
           A device activation is folded in day by day. A day's public figures republish only after every public
           owner's latest change has been delivered. The allowance graph is rebuilt separately. Counts only; the
@@ -263,7 +263,7 @@
             <div class="community-allowance">
               <div class="activity-heading">
                 <div>
-                  <h3>Pro 10x-equivalent allowance</h3>
+                  <h3 id="admin-community-basis-heading">Allowance estimates</h3>
                   <p>Compare aggregate, plan and model estimates on the same weekly basis.</p>
                 </div>
                 <div class="admin-allowance-controls">
@@ -339,17 +339,17 @@
         <p class="eyebrow">Stranded uploads</p>
         <h2 id="v11-adoption-title">Activate stranded v1.1 uploads</h2>
         <p class="admin-copy">
-          Some Macs uploaded complete v1.1 days that never became public. Their app stopped before
-          activating them, or a newer build re-sent an accepted day with a record missing. This activates
-          each device's own complete, consecutive days through the normal database checks. It leaves alone
-          devices that are syncing right now, devices already on v1.2 and devices without current sharing
-          authority. Preview changes nothing. Activation is audited and safe to repeat.
+          Some devices uploaded complete v1.1 days that never became public. Preview checks which
+          consecutive days are eligible; activation rechecks the current evidence through the normal
+          database proofs. The PostgreSQL recovery keeps accepted days and excludes replacements of
+          covered days, devices syncing now, devices with v1.2 activity and devices without current
+          sharing authority. Preview changes nothing. Activation is audited and safe to repeat.
         </p>
         <div class="admin-control-actions">
           <button class="button button-secondary" id="preview-v11-adoption" type="button" disabled>Preview</button>
           <button class="button button-primary" id="apply-v11-adoption" type="button" disabled>Activate previewed devices</button>
         </div>
-        <p class="admin-result" id="v11-adoption-status" role="status">Preview to see which devices can be activated.</p>
+        <p class="admin-result" id="v11-adoption-status" role="status">Preview to see which days are eligible for activation checks.</p>
         <div class="admin-table-wrap admin-adoption-summary" id="v11-adoption-summary" hidden>
           <table>
             <caption class="sr-only">Stranded v1.1 upload counts from the latest preview or activation</caption>

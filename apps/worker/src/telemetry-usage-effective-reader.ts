@@ -18,6 +18,7 @@ import {
 } from "./typed-telemetry-compatibility";
 import {
   createUsageCorrectionOccurrenceAccumulator,
+  type UsageCorrectionParsingOptions,
   type UsageCorrectionFormat,
   type UsageCorrectionSource,
 } from "./telemetry-usage-reconciliation";
@@ -635,6 +636,7 @@ async function reconcileGroups(
   direct: readonly TypedTelemetryCompatibilityRecord[],
   v12: readonly V12SourceRow[],
   facts: readonly TelemetryUsageCorrectionFactRow[],
+  parsing?: UsageCorrectionParsingOptions,
 ): Promise<readonly EffectiveUsageOccurrence[]> {
   const selectedIds = new Set(ordered.map((row) => row.occurrence_id));
   const sources = new Map<string, ReconciledSourceEntry[]>();
@@ -662,7 +664,7 @@ async function reconcileGroups(
     const group = sources.get(candidate.occurrence_id)!;
     const all = group;
     if (!all.length) fail("EFFECTIVE_USAGE_SOURCE_CONFLICT");
-    const accumulator = createUsageCorrectionOccurrenceAccumulator({ ownerScope, occurrenceId: candidate.occurrence_id });
+    const accumulator = createUsageCorrectionOccurrenceAccumulator({ ownerScope, occurrenceId: candidate.occurrence_id, jsonParsing: parsing?.jsonParsing });
     for (let offset = 0; offset < all.length; offset += 200) {
       await accumulator.append(all.slice(offset, offset + 200).map((entry) => entry.source));
     }

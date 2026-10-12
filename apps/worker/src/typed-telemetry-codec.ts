@@ -13,6 +13,7 @@ import {
   type TelemetryV1Record,
   type TelemetryV1Stream,
 } from "./telemetry-v1";
+import { hostBytesHex } from "./host-primitives";
 import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 
 /** A storage format, not a new upload or consent contract. */
@@ -49,6 +50,15 @@ const ID_FORMS = [
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const ID_TOKEN = /^[A-Za-z0-9._:-]{1,256}$/u;
+const BYTE_HEX = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, "0"));
+
+/** Lowercase hex of a tagged ID's body (every byte after the tag): Buffer's encoder on Cloud Run (host-primitives.ts), a byte table elsewhere. */
+function bytesHex(value: Uint8Array): string {
+  if (hostBytesHex !== null) return hostBytesHex(value, 1, value.byteLength);
+  let hex = "";
+  for (let index = 1; index < value.byteLength; index += 1) hex += BYTE_HEX[value[index]!];
+  return hex;
+}
 
 export function encodeTypedTelemetryId(value: string): Uint8Array {
   if (typeof value !== "string" || !ID_TOKEN.test(value)) invalid();
@@ -75,17 +85,21 @@ export function encodeTypedTelemetryId(value: string): Uint8Array {
 export function decodeTypedTelemetryId(value: Uint8Array): string {
   if (!(value instanceof Uint8Array) || value.byteLength < 2 || value.byteLength > 257) invalid();
   const tag = value[0]!;
-  let result: string;
-  if (tag === 0) {
-    try { result = decoder.decode(value.subarray(1)); } catch { invalid(); }
-  } else {
+  if (tag !== 0) {
     const form = ID_FORMS[tag - 1];
     if (!form || value.byteLength !== form.bytes + 1) invalid();
-    const hex = Array.from(value.subarray(1), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    result = form.prefix + (form.uuid
+    const hex = bytesHex(value);
+    // No re-encode check here: it is tautological for tags 1-11. The result
+    // is the form's prefix plus lowercase hex (dashed for a UUID form), which
+    // ID_TOKEN admits, which no earlier form's prefix and body pattern match,
+    // and which this form re-encodes to exactly these bytes
+    // (analytics-v2-test/typed-id-codec.spec.ts proves it for every form).
+    return form.prefix + (form.uuid
       ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
       : hex);
   }
+  let result: string;
+  try { result = decoder.decode(value.subarray(1)); } catch { invalid(); }
   // Reject alternate byte spellings of the same ID, including a compressed ID
   // stored under the raw tag. Unique BLOB indexes then mean unique original IDs.
   const canonical = encodeTypedTelemetryId(result);

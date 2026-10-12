@@ -1,0 +1,894 @@
+{
+  "schemaVersion": "community-public-source-owners-oracle-v1",
+  "authority": "D1 community_public_source_owners after the full source migration chain (ingestion-isolation 0011 definition)",
+  "cases": [
+    {
+      "name": "social-active",
+      "participants": [
+        {
+          "id": "oracle-01a",
+          "ownerKind": "social",
+          "state": "active",
+          "accountless": null
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-01a",
+          "owner_kind": "social",
+          "device_id": null
+        }
+      ]
+    },
+    {
+      "name": "social-deleting",
+      "participants": [
+        {
+          "id": "oracle-02a",
+          "ownerKind": "social",
+          "state": "deleting",
+          "accountless": null
+        }
+      ],
+      "rows": []
+    },
+    {
+      "name": "accountless-v11-active",
+      "participants": [
+        {
+          "id": "oracle-03a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000361",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d332d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000361",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": null
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-03a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000361"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v11-expired",
+      "participants": [
+        {
+          "id": "oracle-04a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000461",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d342d61",
+            "ledger": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000461",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": null
+          }
+        },
+        {
+          "id": "oracle-04b",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000462",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d342d62",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 1,
+              "renewedAt": "2026-09-25T00:00:00.000Z"
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000462",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": null
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-04a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000461"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v11-opt-out-retained",
+      "participants": [
+        {
+          "id": "oracle-05a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000561",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d352d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out",
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000561",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": {
+              "lineage": "v1.1",
+              "retainedAt": "2026-09-20T12:00:00.000Z"
+            }
+          }
+        },
+        {
+          "id": "oracle-05b",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000562",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d352d62",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out",
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:01.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000562",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": {
+              "lineage": "v1.1",
+              "retainedAt": "2026-09-20T12:00:00.000Z"
+            }
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-05a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000561"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-active",
+      "participants": [
+        {
+          "id": "oracle-06a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000661",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d362d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000661",
+              "head": true
+            },
+            "marker": null
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-06a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000661"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-expired",
+      "participants": [
+        {
+          "id": "oracle-07a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000761",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d372d61",
+            "ledger": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-06-01T00:00:00.000Z",
+              "expiresAt": "2026-07-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000761",
+              "head": true
+            },
+            "marker": null
+          }
+        },
+        {
+          "id": "oracle-07b",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000762",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d372d62",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 1,
+              "renewedAt": "2026-09-25T00:00:00.000Z"
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-25T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000762",
+              "head": true
+            },
+            "marker": null
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-07a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000761"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-retained",
+      "participants": [
+        {
+          "id": "oracle-08a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000861",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d382d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out",
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000861",
+              "head": true
+            },
+            "marker": {
+              "lineage": "v1.2",
+              "retainedAt": "2026-09-20T12:00:00.000Z"
+            }
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-08a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000861"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-opt-out-without-marker",
+      "participants": [
+        {
+          "id": "oracle-09a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000961",
+            "secretHash": "000000000000000000000000000000000000000000007365637265742d392d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out",
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "revoked",
+              "revokedAt": "2026-09-20T12:00:00.000Z",
+              "revocationReason": "user_opt_out"
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000961",
+              "head": true
+            },
+            "marker": null
+          }
+        }
+      ],
+      "rows": []
+    },
+    {
+      "name": "accountless-v11-and-v12-domains",
+      "participants": [
+        {
+          "id": "oracle-10a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000a61",
+            "secretHash": "0000000000000000000000000000000000000000007365637265742d31302d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000a61",
+              "head": true
+            },
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000a61",
+              "head": true
+            },
+            "marker": null
+          }
+        },
+        {
+          "id": "oracle-10b",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000a62",
+            "secretHash": "0000000000000000000000000000000000000000007365637265742d31302d62",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000a62",
+              "head": false
+            },
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000a62",
+              "head": true
+            },
+            "marker": null
+          }
+        }
+      ],
+      "rows": [
+        {
+          "participant_id": "oracle-10a",
+          "owner_kind": "accountless",
+          "device_id": "0d000000-0000-4000-8000-000000000a61"
+        }
+      ]
+    },
+    {
+      "name": "accountless-v12-mismatched-constant",
+      "participants": [
+        {
+          "id": "oracle-11a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000b61",
+            "secretHash": "0000000000000000000000000000000000000000007365637265742d31312d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.2",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000b61",
+              "head": true
+            },
+            "marker": null
+          }
+        },
+        {
+          "id": "oracle-11b",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000b62",
+            "secretHash": "0000000000000000000000000000000000000000007365637265742d31312d62",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1.2",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": null
+            },
+            "v11Grant": null,
+            "v12Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v11Domain": null,
+            "v12Domain": {
+              "generationId": "0a120000-0000-4000-8000-000000000b62",
+              "head": true
+            },
+            "marker": null
+          }
+        }
+      ],
+      "rows": []
+    },
+    {
+      "name": "accountless-paired-device",
+      "participants": [
+        {
+          "id": "oracle-12a",
+          "ownerKind": "accountless",
+          "state": "active",
+          "accountless": {
+            "deviceId": "0d000000-0000-4000-8000-000000000c61",
+            "secretHash": "0000000000000000000000000000000000000000007365637265742d31322d61",
+            "ledger": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null,
+              "schemaVersion": "accountless-enrollment-v0.1",
+              "policyVersion": "accountless-opt-out-v1",
+              "authorizationBasis": "accountless-policy-v1",
+              "renewalGeneration": 0,
+              "renewedAt": null
+            },
+            "owner": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "device": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "socialVerifiedAt": "2026-09-02T00:00:00.000Z"
+            },
+            "v11Grant": {
+              "issuedAt": "2026-09-01T00:00:00.000Z",
+              "expiresAt": "2026-10-01T00:00:00.000Z",
+              "state": "active",
+              "revokedAt": null,
+              "revocationReason": null
+            },
+            "v12Grant": null,
+            "v11Domain": {
+              "generationId": "0a110000-0000-4000-8000-000000000c61",
+              "head": true
+            },
+            "v12Domain": null,
+            "marker": null
+          }
+        }
+      ],
+      "rows": []
+    }
+  ]
+}

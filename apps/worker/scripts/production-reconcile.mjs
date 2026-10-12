@@ -11,6 +11,9 @@ import { buildTypedProductionExpectedSchemas } from './production-typed-schema.m
 import { runTypedProductionPreflight, TYPED_PRODUCTION_ROLE_BINDINGS } from './production-typed-preflight.mjs';
 
 const sha256 = value => createHash('sha256').update(value).digest('hex');
+// Edge-mode support loads only when --edge-mode is given, so an ordinary
+// inspection keeps today's module graph.
+const loadEdgeMode = () => import('./production-edge-mode.mjs');
 const fail = code => { const error = new Error(code); error.code = code; throw error; };
 
 /** Inspection only. This operation has no Wrangler deployment, migration,
@@ -23,22 +26,35 @@ export async function reconcileProductionCandidate({
   inspectTyped = runTypedProductionPreflight,
   configTools = { createSnapshot: createProductionLiveConfigSnapshot,
     render: renderProductionLiveConfig, verify: verifyProductionLiveConfig },
+  edgeMode = undefined, edgePlan = undefined,
 }) {
   if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? '')
       || !/^[a-f0-9]{40}$/.test(expectedPreviousSourceCommit ?? '')
       || typeof sourceClean !== 'boolean') fail('PRODUCTION_RECONCILE_SOURCE_INVALID');
+  // --edge-mode inspects the candidate an edge deploy would install: the EP-9
+  // overlay on the typed render, verified against the expected post-deploy
+  // snapshot, with no typed storage reads in gcp mode (no role is bound).
+  let edge = null;
+  if (edgeMode !== undefined || edgePlan !== undefined) {
+    const edgeModule = await loadEdgeMode();
+    const { mode, plan, overlaySha256 } = edgeModule.resolveEdgeModeRequest({ edgeMode, edgePlan });
+    edge = { mode, overlaySha256,
+      tools: edgeModule.createEdgeModeConfigTools({ mode, plan, trackedConfig, base: configTools }),
+      inspect: edgeModule.edgeModeTypedInspector({ mode, inspectTyped }) };
+  }
+  const renderTools = edge?.tools ?? configTools;
   const baseline = configTools.createSnapshot(inventory);
   if (baseline.sourceCommit !== expectedPreviousSourceCommit) fail('PRODUCTION_RECONCILE_PREDECESSOR_MISMATCH');
   const currentInventory = await provider.capture();
   const current = configTools.createSnapshot(currentInventory);
   if (current.versionId !== baseline.versionId || current.sourceCommit !== baseline.sourceCommit
       || current.fingerprint !== baseline.fingerprint) fail('PRODUCTION_RECONCILE_LIVE_CHANGED');
-  const candidateConfig = configTools.render({ trackedConfig, snapshot: current, sourceCommit });
-  const preservation = configTools.verify({ snapshot: current, candidateConfig, sourceCommit });
+  const candidateConfig = renderTools.render({ trackedConfig, snapshot: current, sourceCommit });
+  const preservation = renderTools.verify({ snapshot: current, candidateConfig, sourceCommit });
   if (!preservation.ok) fail('PRODUCTION_RECONCILE_CONFIG_UNVERIFIED');
   const expected = await buildSchemas({ workerDirectory });
   const production = candidateConfig.env.production;
-  const typed = await inspectTyped({
+  const typed = await (edge?.inspect ?? inspectTyped)({
     roles: Object.entries(TYPED_PRODUCTION_ROLE_BINDINGS).map(([role, binding]) => ({ role, binding })),
     expectedSchemas: expected.expectedSchemas,
     config: { mode: production.vars.TELEMETRY_STORAGE_MODE,
@@ -63,22 +79,30 @@ export async function reconcileProductionCandidate({
     deploymentPerformed: false,
     deploymentQualified: false,
     remainingGate: 'Guarded deployment integration, immutable candidate and owning surface qualification',
+    ...(edge === null ? {} : { edge: { edgeMode: edge.mode, edgeOverlaySha256: edge.overlaySha256,
+      expectedLiveConfigurationFingerprint: edge.tools.expectedSnapshot(current).fingerprint } }),
   };
   return { report, candidateConfig };
 }
+
+// Optional edge inspection arguments: --edge-mode MODE [--edge-plan PRIVATE_JSON] (gcp).
+const EDGE_FIELDS = new Map([['--edge-mode', 'edgeMode'], ['--edge-plan', 'edgePlanPath']]);
 
 export function parseProductionReconciliationArgs(args) {
   const fields = new Map([['--inventory', 'inventoryPath'], ['--inventory-sha256', 'inventorySha256'],
     ['--expected-previous-source', 'expectedPreviousSourceCommit'], ['--output-directory', 'outputDirectory']]);
   const result = {};
   for (let index = 0; index < args.length; index += 1) {
-    const key = fields.get(args[index]);
+    const key = fields.get(args[index]) ?? EDGE_FIELDS.get(args[index]);
     const value = args[++index];
     if (!key || key in result || !value || value.startsWith('--') || value.includes('\0')) fail('PRODUCTION_RECONCILE_ARGUMENTS_INVALID');
     result[key] = value;
   }
-  if (Object.keys(result).length !== fields.size || !/^[a-f0-9]{64}$/.test(result.inventorySha256)
+  const edgeKeys = [...EDGE_FIELDS.values()].filter(key => key in result);
+  if (Object.keys(result).length - edgeKeys.length !== fields.size || !/^[a-f0-9]{64}$/.test(result.inventorySha256)
       || !/^[a-f0-9]{40}$/.test(result.expectedPreviousSourceCommit)) fail('PRODUCTION_RECONCILE_ARGUMENTS_INVALID');
+  if (edgeKeys.length > 0 && (!['worker', 'fenced', 'gcp'].includes(result.edgeMode)
+      || (result.edgeMode === 'gcp') !== ('edgePlanPath' in result))) fail('PRODUCTION_RECONCILE_ARGUMENTS_INVALID');
   return result;
 }
 
@@ -125,8 +149,15 @@ async function main() {
     const trackedConfig = parse(await readFile(join(workerDirectory, 'wrangler.jsonc'), 'utf8'), parseErrors);
     if (parseErrors.length) fail('PRODUCTION_RECONCILE_CONFIG_INVALID');
     const provider = createProductionLiveProvider({ accountId: inventory.accountId, workerName: inventory.workerName });
+    const edgeOptions = options.edgeMode === undefined ? {} : {
+      edgeMode: options.edgeMode,
+      ...(options.edgePlanPath === undefined
+        ? {}
+        : { edgePlan: await (await loadEdgeMode()).readEdgeModePlan(options.edgePlanPath) }),
+    };
     const { report, candidateConfig } = await reconcileProductionCandidate({ inventory, trackedConfig, sourceCommit,
-      expectedPreviousSourceCommit: options.expectedPreviousSourceCommit, workerDirectory, sourceClean, provider });
+      expectedPreviousSourceCommit: options.expectedPreviousSourceCommit, workerDirectory, sourceClean, provider,
+      ...edgeOptions });
     if (git(['rev-parse', 'HEAD']) !== sourceCommit
       || (git(['status', '--porcelain', '--untracked-files=all']) === '') !== sourceClean) fail('PRODUCTION_RECONCILE_SOURCE_CHANGED');
     // Exclusive creation preserves existing evidence; config contains private
@@ -137,7 +168,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     process.exitCode = report.state === 'compatible' ? 0 : 1;
   } catch (error) {
-    const code = /^(?:PRODUCTION|TYPED_PREFLIGHT)_[A-Z_]+$/.test(error?.code ?? '')
+    const code = /^(?:PRODUCTION|TYPED_PREFLIGHT|EDGE)_[A-Z_]+$/.test(error?.code ?? '')
       ? error.code : 'PRODUCTION_RECONCILE_FAILED';
     process.stdout.write(`${JSON.stringify({ state: 'blocked', code, productionWritesPerformed: false })}\n`);
     process.exitCode = 1;

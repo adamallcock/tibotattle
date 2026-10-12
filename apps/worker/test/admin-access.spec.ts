@@ -455,13 +455,14 @@ describe("admin surface hostname gating", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(response.json()).resolves.toMatchObject({
-      schemaVersion: "admin-community-allowance-preview-v0.4",
+      schemaVersion: "admin-community-allowance-preview-v0.5",
+      basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview",
       referencePlanType: "pro",
       plans: [
-        { planType: "pro", multiplier: 1 },
-        { planType: "prolite", multiplier: 2 },
-        { planType: "promax", multiplier: 0.4 },
-        { planType: "plus", multiplier: 10 },
+        { planType: "pro", label: "Pro 20x", multiplier: 1 },
+        { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+        { planType: "promax", label: "Pro Max 25x", multiplier: 0.8 },
+        { planType: "plus", label: "Plus", multiplier: 20 },
       ],
     });
   });

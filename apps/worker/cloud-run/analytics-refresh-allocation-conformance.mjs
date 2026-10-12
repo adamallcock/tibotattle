@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { Session } from 'node:inspector';
+assert.equal(process.versions.node,'22.16.0'); assert.equal(typeof global.gc,'function');
+function session() { const s=new Session();s.connect();return s; }
+function post(s,m,p={}) { let done=false,result,error;s.post(m,p,(e,v)=>{done=true;error=e;result=v;});assert.ok(done);if(error)throw error;return result; }
+const recognized={};
+for(const flag of ['includeObjectsCollectedByMinorGC','includeObjectsCollectedByMajorGC']) { const s=session();try { post(s,'HeapProfiler.enable'); assert.throws(()=>post(s,'HeapProfiler.startSampling',{samplingInterval:131072,[flag]:'invalid-boolean'}));recognized[flag]=true; } finally { try{post(s,'HeapProfiler.disable');}catch{}s.disconnect(); } }
+function transientBatch() { global.syntheticTransient=Array.from({length:250000},(_,i)=>({a:i,b:i+1,c:i+2,d:i+3,e:i+4}));global.syntheticChecksum=global.syntheticTransient[100].a;global.syntheticTransient=null; }
+function capture(include) {global.gc();const s=session();post(s,'HeapProfiler.enable');post(s,'HeapProfiler.startSampling',{samplingInterval:131072,includeObjectsCollectedByMinorGC:include,includeObjectsCollectedByMajorGC:include});for(let i=0;i<4;i++){transientBatch();global.gc();}const {profile}=post(s,'HeapProfiler.stopSampling');post(s,'HeapProfiler.disable');s.disconnect();let bytes=0,nodes=0;const stack=[profile.head];while(stack.length){const n=stack.pop();bytes+=n.selfSize;nodes++;stack.push(...n.children);}return{estimatedSampleWeightBytes:bytes,nodes}; }
+const liveOnly=capture(false),includingCollected=capture(true);assert.ok(includingCollected.estimatedSampleWeightBytes>liveOnly.estimatedSampleWeightBytes+16*1024*1024);console.log(JSON.stringify({node:process.version,samplingIntervalBytes:131072,typedFlagsRecognized:recognized,liveOnly,includingCollected,semantics:'statistical estimated JS allocation weights; not exact allocations or retained heap',forcedGC:'synthetic conformance only; runtime helper does not force GC'}));

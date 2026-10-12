@@ -124,7 +124,7 @@ interface GithubReleaseInventoryRecord {
   readonly assets: readonly GithubAsset[];
 }
 
-interface GithubInventory {
+export interface GithubInventory {
   readonly releases: readonly GithubReleaseInventoryRecord[];
 }
 
@@ -158,7 +158,7 @@ interface GithubSnapshotReleaseRow {
   readonly release_prerelease: number;
 }
 
-class GithubInventoryError extends Error {
+export class GithubInventoryError extends Error {
   readonly code: "GITHUB_RELEASES_BOUNDED" | "GITHUB_UNAVAILABLE";
 
   constructor(code: "GITHUB_RELEASES_BOUNDED" | "GITHUB_UNAVAILABLE") {
@@ -295,7 +295,11 @@ function parseRelease(value: unknown): GithubReleaseInventoryRecord | null {
   if (boolean(release.draft)) {
     return null;
   }
-  const assets = array(release.assets).map(parseAsset);
+  const assetValues = array(release.assets);
+  if (assetValues.length > MAX_GITHUB_ASSETS_PER_RELEASE) {
+    throw new GithubInventoryError("GITHUB_RELEASES_BOUNDED");
+  }
+  const assets = assetValues.map(parseAsset);
   return {
     id: count(release.id),
     tag: string(release.tag_name),
@@ -324,6 +328,9 @@ async function readAdditionalReleaseAssets(
     if (!response.ok) throw new GithubInventoryError("GITHUB_UNAVAILABLE");
     const pageAssets = array(await boundedJson(response)).map(parseAsset);
     assets.push(...pageAssets);
+    if (assets.length > MAX_GITHUB_ASSETS_PER_RELEASE) {
+      throw new GithubInventoryError("GITHUB_RELEASES_BOUNDED");
+    }
     const next = hasNextPage(response);
     if (!next) return assets;
     if (assets.length >= MAX_GITHUB_ASSETS_PER_RELEASE
@@ -334,7 +341,7 @@ async function readAdditionalReleaseAssets(
   throw new GithubInventoryError("GITHUB_RELEASES_BOUNDED");
 }
 
-async function readGithubInventory(
+async function readGithubInventoryPages(
   apiToken: string | null,
   fetcher: typeof fetch,
 ): Promise<GithubInventory> {
@@ -367,6 +374,48 @@ async function readGithubInventory(
     }
   }
   return { releases };
+}
+
+/** Closed source failures; arbitrary fetch/driver messages never cross this boundary. */
+export function githubInventoryFailureCode(error: unknown): "GITHUB_RELEASES_BOUNDED" | "GITHUB_UNAVAILABLE" {
+  return error instanceof GithubInventoryError && error.code === "GITHUB_RELEASES_BOUNDED"
+    ? "GITHUB_RELEASES_BOUNDED" : "GITHUB_UNAVAILABLE";
+}
+
+export const GITHUB_INVENTORY_TIMEOUT_MILLISECONDS = 20_000;
+
+/**
+ * Complete public inventory for either persistence adapter. The deadline covers
+ * all pages and body reads, in addition to each request's eight-second timeout.
+ * A timed-out read can never hand a partial inventory to a snapshot writer.
+ */
+export async function readGithubInventory(
+  githubApiToken: unknown,
+  fetcher: typeof fetch = fetch,
+): Promise<GithubInventory> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new GithubInventoryError("GITHUB_UNAVAILABLE"));
+    }, GITHUB_INVENTORY_TIMEOUT_MILLISECONDS);
+  });
+  const boundedFetcher: typeof fetch = (input, init) => fetcher(input, {
+    ...init,
+    signal: init?.signal
+      ? AbortSignal.any([init.signal, controller.signal])
+      : controller.signal,
+  });
+  try {
+    return await Promise.race([
+      readGithubInventoryPages(configuredString(githubApiToken), boundedFetcher),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
 }
 
 function releaseSummary(release: GithubReleaseInventoryRecord): GithubDistributionRelease {
@@ -587,7 +636,7 @@ type SnapshotAssetBinding = readonly [
   number,
 ];
 
-function releaseSnapshotRows(
+export function releaseSnapshotRows(
   inventory: GithubInventory,
   observedAt: string,
 ): SnapshotReleaseBinding[] {
@@ -600,7 +649,7 @@ function releaseSnapshotRows(
   ]);
 }
 
-function assetSnapshotRows(
+export function assetSnapshotRows(
   inventory: GithubInventory,
   observedAt: string,
 ): SnapshotAssetBinding[] {
@@ -995,3 +1044,6 @@ export async function readGithubDistributionSnapshot(
 
 export const GITHUB_DISTRIBUTION_SNAPSHOT_INTERVAL_MILLISECONDS =
   SNAPSHOT_INTERVAL_MILLISECONDS;
+export const GITHUB_DISTRIBUTION_FORCED_SYNC_COOLDOWN_MILLISECONDS =
+  FORCED_SYNC_COOLDOWN_MILLISECONDS;
+export const GITHUB_DISTRIBUTION_SYNC_LEASE_MILLISECONDS = SYNC_LEASE_MILLISECONDS;

@@ -1,3 +1,4 @@
+import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -25,6 +26,60 @@ const fixture = async (name) => JSON.parse(await readFile(
 ));
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+
+test("full-refresh progress preserves recorded evidence and unavailable counters", async () => {
+  const body = await fixture("admin-reconstruction-full-refresh-valid.json");
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.work.lastRun.state = "failed";
+  body.work.lastRun.kernelId = null;
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.pipeline.delivery.appliedSequence = null;
+  body.pipeline.delivery.pendingChanges = null;
+  body.pipeline.delivery.pendingOwnerActivations = null;
+  body.pipeline.daily.queuedDays = null;
+  body.pipeline.daily.oldestQueuedDay = null;
+  body.pipeline.daily.newestQueuedDay = null;
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.work.lastRun = null;
+  body.pipeline.ingestion.journalHead = null;
+  body.pipeline.ingestion.latestRecordedAt = null;
+  body.publication.preview = { state: "not_recorded", computedAt: null };
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+});
+
+test("full-refresh projection rejects extra keys, guessed execution and contradictory evidence", async () => {
+  const original = await fixture("admin-reconstruction-full-refresh-valid.json");
+  const edits = [
+    body => { body.ownerId = "synthetic"; },
+    body => { body.graph.owners = 0; },
+    body => { body.history.status = "idle"; },
+    body => { body.work.currentState = "running"; },
+    body => { body.work.scheduleState = "enabled"; },
+    body => { body.work.lastRun.state = "running"; },
+    body => { body.work.lastRun.startedAt = null; },
+    body => { body.work.lastRun.finishedAt = "2026-10-10T00:00:00.000Z"; },
+    body => { body.work.lastRun.kernelId = 0; },
+    body => { body.work.lastRun.runId = "synthetic"; },
+    body => { body.work.nextScheduledAt = body.generatedAt; },
+    body => { body.generatedAt = null; },
+    body => { body.pipeline.ingestion.journalHead = null; },
+    body => { body.pipeline.delivery.appliedSequence = 13; },
+    body => { body.pipeline.delivery.appliedSequence = null; },
+    body => { body.pipeline.delivery.pendingChanges = null; },
+    body => { body.pipeline.delivery.pendingOwnerActivations = 3; },
+    body => { body.pipeline.delivery.current = null; },
+    body => { body.pipeline.daily.queuedDays = 0; },
+    body => { body.pipeline.daily.queuedDays = null; },
+    body => { body.pipeline.daily.oldestQueuedDay = "2026-10-11"; },
+    body => { body.publication.publishedDays = 0; },
+    body => { body.publication.preview.state = "not_recorded"; },
+  ];
+  for (const edit of edits) {
+    const body = structuredClone(original);
+    edit(body);
+    assert.throws(() => projectAdminReconstructionProgress(body), { code: "ADMIN_RECONSTRUCTION_PROGRESS_INVALID" });
+  }
+});
 
 test("admin read lanes are independent, single-flight, and reuse a pending request", async () => {
   let completeSlow;
@@ -892,7 +947,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
 
 test("expanded overview uses a new schema and requires an explicit recognized storage mode", async () => {
   const payload = await fixture("admin-overview-valid.json");
-  for (const version of ["admin-overview-v0.3", "admin-overview-v0.4", "admin-overview-v0.6"]) {
+  for (const version of ["admin-overview-v0.3", "admin-overview-v0.4", "admin-overview-v0.7", undefined]) {
     assert.throws(() => projectAdminOverview({ ...payload, schemaVersion: version }), /ADMIN_OVERVIEW_INVALID/u);
   }
   for (const mode of [undefined, "unknown"]) {
@@ -930,6 +985,53 @@ test("typed admin overview projects target publication evidence without a legacy
     const invalid = structuredClone(payload);
     mutate(invalid);
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
+  }
+});
+
+function typedOverviewPayload(payload) {
+  payload.service.telemetryStorageMode = "typed";
+  payload.snapshots = [];
+  payload.pendingHistoricalRebuilds = null;
+  payload.pendingHistoricalRebuildsBounded = null;
+  payload.historicalPublication = {
+    publishedDays: 69,
+    publishedDaysBounded: false,
+    latestEvidenceDay: "2026-08-16",
+    latestComputedAt: "2026-08-17T11:55:00.000Z",
+    previewState: "current",
+    previewGeneratedAt: "2026-08-17T11:56:00.000Z",
+  };
+  return payload;
+}
+
+test("round 12: the Google Cloud origin's v0.6 overview reads an explicit unavailable block, never a value", async () => {
+  const v05 = typedOverviewPayload(await fixture("admin-overview-valid.json"));
+  v05.schemaVersion = "admin-overview-v0.5";
+  // A v0.6 body whose blocks all have a source projects exactly as v0.5 does.
+  const sourced = { ...structuredClone(v05), schemaVersion: "admin-overview-v0.6" };
+  assert.deepEqual(projectAdminOverview(sourced), projectAdminOverview(v05));
+  // With no source the origin says so; the projection keeps only that state.
+  const unavailable = structuredClone(sourced);
+  unavailable.historicalPublication = { status: "unavailable" };
+  unavailable.deletionLedger = { status: "unavailable" };
+  unavailable.counts.contributions.synthetic = { status: "unavailable" };
+  const projected = projectAdminOverview(unavailable);
+  assert.deepEqual(projected.historicalPublication, { status: "unavailable" });
+  assert.equal(Object.isFrozen(projected.historicalPublication), true);
+  assert.equal("publishedDays" in projected.historicalPublication, false, "no invented count");
+  assert.deepEqual({ ...projected, historicalPublication: null }, { ...projectAdminOverview(v05), historicalPublication: null });
+  // v0.5 (the Worker's) never carries the unavailable state, and v0.6's is closed.
+  for (const [version, block] of [
+    ["admin-overview-v0.5", { status: "unavailable" }],
+    ["admin-overview-v0.6", { status: "unavailable", publishedDays: 0 }],
+    ["admin-overview-v0.6", { status: "not_applicable" }],
+    ["admin-overview-v0.6", { status: "available" }],
+    ["admin-overview-v0.6", null],
+  ]) {
+    const invalid = structuredClone(unavailable);
+    invalid.schemaVersion = version;
+    invalid.historicalPublication = block;
+    assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u, `${version} ${JSON.stringify(block)}`);
   }
 });
 
@@ -1460,6 +1562,38 @@ test("database health projects only closed, consistent role evidence", async () 
 });
 
 
+test("round 12: database health v0.2 reports the removed deletion ledger not_applicable, closed", async () => {
+  const v01 = await fixture("admin-database-health-valid.json");
+  const input = structuredClone(v01);
+  input.schemaVersion = "admin-database-health-v0.2";
+  input.databases[1] = { role: "deletion_ledger", status: "not_applicable", responseMs: null, databaseBytes: null };
+  const projected = projectAdminDatabaseHealth(input);
+  assert.equal(projected.schemaVersion, "admin-database-health-v0.2");
+  assert.deepEqual(projected.databases[1], input.databases[1]);
+  assert.equal(projected.status, "available", "two reachable roles and the removed ledger are a healthy console");
+  // The Worker's v0.1 is still read as before, and v0.1 never admits a not_applicable ledger.
+  assert.equal(projectAdminDatabaseHealth(v01).status, "available");
+  const v01Ledgerless = structuredClone(input);
+  v01Ledgerless.schemaVersion = "admin-database-health-v0.1";
+  assert.throws(() => projectAdminDatabaseHealth(v01Ledgerless), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  for (const alter of [
+    x => { x.databases[1] = { ...v01.databases[1] }; },
+    x => { x.databases[1].status = "not_configured"; },
+    x => { x.databases[1].responseMs = 0; },
+    x => { x.databases[1].databaseBytes = 0; },
+    x => { x.schemaVersion = "admin-database-health-v0.3"; },
+    x => { x.status = "degraded"; },
+  ]) {
+    const bad = structuredClone(input); alter(bad);
+    assert.throws(() => projectAdminDatabaseHealth(bad), { message: "ADMIN_DATABASE_HEALTH_INVALID" });
+  }
+  // In json mode the analytics role is not_applicable too, as in v0.1.
+  const json = structuredClone(input);
+  json.storageMode = "json";
+  json.databases[2] = { role: "analytics", status: "not_applicable", responseMs: null, databaseBytes: null };
+  assert.equal(projectAdminDatabaseHealth(json).status, "available");
+});
+
 test("version totals validate OS coverage, counts and unavailable states without inferring legacy totals", async () => {
   const payload = await fixture("admin-overview-valid.json");
   assert.equal(projectAdminOverview(payload).distribution.cloudflare.observedTotals, null);
@@ -1498,5 +1632,170 @@ test("version totals validate OS coverage, counts and unavailable states without
     const invalid = structuredClone(payload);
     mutate(invalid.distribution.cloudflare.observedTotals);
     assert.throws(() => projectAdminOverview(invalid), /ADMIN_OVERVIEW_INVALID/u);
+  }
+});
+
+
+// Explicit synthetic historical/current identities; keep the shared main
+// fixture's immutable v0.4 Pro10 contract unchanged.
+function createAdminLegacyAllowancePreviewPayload(spanFloorPp = 25) {
+  const preview = createAdminAllowancePreviewPayload();
+  preview.schemaVersion = "admin-community-allowance-preview-v0.3";
+  preview.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
+  preview.models.basis = "seven_day_codex_pro20x_equivalent_per_model_composition";
+  preview.qualification = `shared_reset_fit_gates_${spanFloorPp}pp_span_floor`;
+  preview.spanFloorPp = spanFloorPp;
+  preview.plans = [
+    { planType: "pro", label: "Pro 20x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+    { planType: "plus", label: "Plus", multiplier: 20 },
+  ];
+  for (const day of preview.days) delete day.byPlanType.promax;
+  return preview;
+}
+
+function createAdminPro20AllowancePreviewPayload() {
+  const preview = createAdminPro10AllowancePreviewPayload();
+  preview.schemaVersion = "admin-community-allowance-preview-v0.5";
+  preview.basis = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview";
+  preview.models.basis = "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
+  preview.plans = [
+    { planType: "pro", label: "Pro 20x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+    { planType: "promax", label: "Pro Max 25x", multiplier: 0.8 },
+    { planType: "plus", label: "Plus", multiplier: 20 },
+  ];
+  return preview;
+}
+
+test("admin preview exact v0.3/v0.4 dispatch preserves reference amounts, dates and model metadata", () => {
+  for (const [payload, factors] of [
+    [createAdminLegacyAllowancePreviewPayload(), [["pro", 1], ["prolite", 4], ["plus", 20]]],
+    [createAdminPro10AllowancePreviewPayload(), [["pro", 1], ["prolite", 2], ["promax", 0.4], ["plus", 10]]],
+  ]) {
+    const projected = projectAdminAllowancePreview(payload);
+    assert.equal(projected.schemaVersion, payload.schemaVersion);
+    assert.equal(projected.basis, payload.basis);
+    assert.equal(projected.models.basis, payload.models.basis);
+    assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.multiplier]), factors);
+    assert.deepEqual(projected.days, payload.days, "published reference values and bands are never rescaled");
+    assert.equal(projected.models.days.at(-1).day, payload.models.days.at(-1).day);
+    assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd, payload.models.days.at(-1).values[0][1]);
+    assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
+    if (payload.schemaVersion.endsWith("v0.4")) assert.equal(projected.spanFloorPp, 25);
+  }
+});
+
+test("admin preview refuses crossed v0.3/v0.4 claims, plan sets, factors and mandatory model metadata", () => {
+  const old = createAdminLegacyAllowancePreviewPayload();
+  const current = createAdminPro10AllowancePreviewPayload();
+  for (const source of [old, current]) {
+    const other = source === old ? current : old;
+    for (const mutate of [
+      value => { value.schemaVersion = other.schemaVersion; },
+      value => { value.schemaVersion = "admin-community-allowance-preview-v0.5"; },
+      value => { value.basis = other.basis; },
+      value => { value.models.basis = other.models.basis; },
+      value => { value.models.gate = "unknown"; },
+      value => { value.plans = structuredClone(other.plans); },
+      value => { value.plans[1].multiplier = other.plans[1].multiplier; },
+      value => { value.plans[0].label = other.plans[0].label; },
+      value => { value.spanFloorPp = 40; },
+      value => { value.qualification = "unknown"; },
+      value => { delete value.days.at(-1).byPlanType.plus; },
+      value => { value.days.at(-1).byPlanType.unknown = structuredClone(value.days.at(-1).combined); },
+      value => { delete value.models; },
+      value => { delete value.models.modelConfig; },
+      value => { value.models.modelConfig[0].allowanceTrack = "unknown"; },
+    ]) {
+      const invalid = structuredClone(source); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+  const missingProMax = structuredClone(current); delete missingProMax.days[0].byPlanType.promax;
+  assert.throws(() => projectAdminAllowancePreview(missingProMax), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+});
+
+
+test("current admin v0.5 preserves the declared Pro20 four-plan publication", () => {
+  const payload = createAdminPro20AllowancePreviewPayload();
+  const projected = projectAdminAllowancePreview(payload);
+  assert.equal(projected.schemaVersion, "admin-community-allowance-preview-v0.5");
+  assert.equal(projected.basis, "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview");
+  assert.equal(projected.models.basis, "seven_day_codex_pro20x_equivalent_per_model_composition_promax25");
+  assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.label, plan.multiplier]), [
+    ["pro", "Pro 20x", 1], ["prolite", "Pro 5x", 4],
+    ["promax", "Pro Max 25x", 0.8], ["plus", "Plus", 20],
+  ]);
+  assert.equal(projected.qualification, "shared_reset_fit_gates_25pp_span_floor");
+  assert.equal(projected.spanFloorPp, 25);
+  assert.deepEqual(projected.days, payload.days, "the reader never rescales published reference amounts or bands");
+  assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
+  assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd,
+    payload.models.days.at(-1).values[0][1]);
+});
+
+test("current admin v0.5 refuses historical identities, crossed factors and unsupported gates", () => {
+  const payload = createAdminPro20AllowancePreviewPayload();
+  const pro10 = createAdminPro10AllowancePreviewPayload();
+  const legacy = createAdminLegacyAllowancePreviewPayload();
+  for (const mutate of [
+    value => { value.schemaVersion = pro10.schemaVersion; },
+    value => { value.schemaVersion = legacy.schemaVersion; },
+    value => { value.schemaVersion = "admin-community-allowance-preview-v0.6"; },
+    value => { value.basis = pro10.basis; },
+    value => { value.models.basis = pro10.models.basis; },
+    value => { value.models.basis = legacy.models.basis; },
+    value => { value.plans = structuredClone(pro10.plans); },
+    value => { value.plans = structuredClone(legacy.plans); },
+    value => { value.plans[2].multiplier = 0.4; },
+    value => { value.plans[0].label = "Pro 10x"; },
+    value => { value.qualification = "shared_reset_fit_gates_40pp_span_floor"; value.spanFloorPp = 40; },
+    value => { value.qualification = "shared_reset_fit_gates"; },
+    value => { delete value.days.at(-1).byPlanType.promax; },
+    value => { value.days.at(-1).byPlanType.unknown = structuredClone(value.days.at(-1).combined); },
+  ]) {
+    const invalid = structuredClone(payload); mutate(invalid);
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+  }
+});
+
+test("legacy admin v0.3 preserves both authored qualification/span pairs and refuses crossed pairs", () => {
+  for (const spanFloorPp of [25, 40]) {
+    const payload = createAdminLegacyAllowancePreviewPayload(spanFloorPp);
+    const projected = projectAdminAllowancePreview(payload);
+    assert.equal(projected.spanFloorPp, spanFloorPp);
+    assert.equal(projected.qualification, payload.qualification);
+    assert.deepEqual(projected.days, payload.days);
+    for (const mutate of [
+      value => { value.spanFloorPp = spanFloorPp === 25 ? 40 : 25; },
+      value => { value.qualification = `shared_reset_fit_gates_${spanFloorPp === 25 ? 40 : 25}pp_span_floor`; },
+      value => { value.qualification = "shared_reset_fit_gates"; },
+    ]) {
+      const invalid = structuredClone(payload); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+});
+
+test("admin preview retains the exact September23 model roster without declaring new model coverage", () => {
+  const payload = createAdminPro10AllowancePreviewPayload();
+  assert.equal(ADMIN_MODEL_CONFIG.length, 43);
+  assert.equal(ADMIN_MODEL_CONFIG[42].modelId, "gpt-6.1-sol");
+  payload.models.modelConfig = payload.models.modelConfig.slice(0, 42);
+  for (const day of payload.models.days) day.catalogVersion = "reviewed-model-catalog-2026-09-23.1";
+  const projected = projectAdminAllowancePreview(payload);
+  assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG.slice(0, 42));
+  assert.equal(projected.models.days.at(-1).byModel["gpt-6.1-sol"].capacityUsd, null);
+  assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd,
+    payload.models.days.at(-1).values[0][1]);
+  for (const mutate of [
+    value => { value.models.days[0].catalogVersion = "reviewed-model-catalog-2026-09-29.1"; },
+    value => { value.models.modelConfig.pop(); },
+    value => { value.models.modelConfig[0].modelId = "gpt-6.1-sol"; },
+    value => { value.models.modelConfig[0].label = "unreviewed historical label"; },
+  ]) {
+    const invalid = structuredClone(payload); mutate(invalid);
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
   }
 });

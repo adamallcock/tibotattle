@@ -1,0 +1,21 @@
+-- typed_telemetry_owner_occurrence: gated owner-level source expansion probe.
+--
+-- NUMBER. Staged placeholder 0981; only the integrator assigns a primary
+-- number. Purely additive, without a CONTRACT_MIGRATIONS entry. Readers use
+-- it only when its table/schema, key shape, indisvalid and indisready match.
+--
+-- COST. CREATE INDEX takes a SHARE lock on typed_telemetry_records; intake
+-- writers wait during the build. The stock runner uses a 5 s lock timeout
+-- and a 30 s statement timeout, rolling the migration back on failure.
+-- DB-READ's synthetic full-corpus prototype measured approximately 449 MB
+-- and an 11.5 s build; these are historical measurements, not a prediction
+-- or qualification of production. Each inserted typed record now needs one
+-- extra index entry, increasing storage and intake write amplification.
+--
+-- PRODUCTION DECISION. CREATE INDEX CONCURRENTLY cannot run within the stock
+-- runner's transaction. Production requires an owner-approved concurrent
+-- build outside the runner, with validity/readiness checked after completion,
+-- or an explicitly approved no-intake window for the transactional build.
+-- This staged file selects neither option and authorizes no promotion/write.
+CREATE INDEX typed_telemetry_owner_occurrence
+  ON typed_telemetry_records (owner_id, stream, occurrence_id);

@@ -21,6 +21,8 @@ an informal archive.
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
 | Electron sharing policy | [Accountless sharing defaults](./decisions/2026-09-04-accountless-sharing-policy.md) | Accepted fresh-install default-on and three-notice existing-install transition; persistent opt-out, no sign-in, and distinct source/release gates |
+| GCP contributions and erasure | [Append-only contributions on the Google Cloud service](./decisions/2026-09-26-append-only-contributions.md) | Accepted 2026-09-30 for the GCP target only, from an authorized cutover: revocation stops uploads without withdrawal, Variant B offline owner erasure, deferred database scaling, Cloudflare edge and release hosting; current Cloudflare behavior unchanged |
+| Catalog vocabulary | [Catalog vocabulary passes as plain text within the wire grammar](./decisions/2026-10-02-catalog-vocabulary-plain-text.md) | Accepted 2026-10-02: model, provider, speed, tier and plan names are vocabulary, not account identifiers; plain text inside the v1.x wire grammar, otherwise `unrecognized`; server manifest guard implemented on the GCP line, client pass-through and privacy wording pending |
 | Electron crash doctor | [Opt-in crash capture and support doctor](./decisions/2026-09-21-opt-in-crash-doctor.md) | Reviewed support projection, off-by-default local macOS Crashpad capture, and explicit owner-only private evidence export; no automatic upload or installed-release claim |
 | Electron refresh resilience | [Observable self-healing refresh leases](./decisions/2026-09-21-electron-refresh-resilience.md) | Accepted renderer/preload/IPC lease, heartbeat, watchdog, live-freshness and content-free diagnostics contract; source and release evidence remain separate |
 | Electron startup status | [Start-at-login status and refresh](./decisions/2026-09-21-electron-start-at-login-status.md) | Accepted source behavior for automatic status reads, error retry, and exact Linux XDG ownership; installed-platform qualification remains separate |
@@ -40,7 +42,9 @@ an informal archive.
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.28 across four targets, exact artifact assurances and platform-specific qualification limits |
 | Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
+| Production edge modes | [Production edge modes](./runbooks/production-edge-modes.md) | Maintained; not yet operational until P1, the first typed worker-mode edge deploy. Until then Production service operations governs Cloudflare. Follows the accepted edge-proxy decision; grants no deploy, fence or cutover authority |
 | Telemetry activation | [Protected telemetry runtime activation](./runbooks/2026-09-22-telemetry-runtime-activation.md) | Migration, reconciliation, deploy, post-deploy verification, and owner-only independent usage/performance activation |
+| Historical spend repricing | [Bounded historical spend repricing](./runbooks/2026-10-09-historical-spend-repricing.md) | Implemented candidate: explicit bounded plan/execute, saved-cohort input association, immutable equivalence and same-operation replay; not deployed or live qualified |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Contribution diagnosis | [Contribution completion funnel](./runbooks/2026-09-22-contribution-completion-funnel.md) | Aggregate-only receipt, activation, projection and publication queries; schema-qualified, read-only plans |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
@@ -59,6 +63,24 @@ an informal archive.
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
 | Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; current release support is defined by the platform authority |
 | R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
+
+## Pending decisions and in-progress plans
+
+These entries are listed for discovery. They are not current authorities until
+their status changes; current Cloudflare behavior follows the authorities above.
+
+| Area | Document | Status | Boundary |
+|---|---|---|---|
+| Stranded telemetry recovery | [Recovery without a desktop release](./runbooks/2026-10-11-stranded-telemetry-recovery.md) | Source candidate | Guarded PostgreSQL owner adoption and aggregate activation observations; origin and admin asset release, production preview, repair writes and publication postcheck require their separate gates |
+| GCP fast path | [GCP fast path](./plans/2026-10-01-gcp-fastpath.md) | In progress | Analytics-refresh architecture, redesign register mapping, local synthetic parity rehearsal, sized cutover backlog and alignment with the OpenAI September 29 release; no production change |
+| GCP replay parsing | [Internal analytics JSON replay](./decisions/2026-10-03-internal-analytics-json-replay.md) | Accepted internal last-value-wins decision; isolated source candidate | Native parsing is explicit at two GCP reconstruction callsites; raw ingress and default correction callers remain strict; integration and performance qualification pending |
+| GCP edge proxy | [Thin Worker edge proxy](./decisions/2026-10-01-thin-worker-edge-proxy.md) | Accepted 2026-10-02; implementation and cutover pending | Production Worker as a thin edge (worker, fenced, gcp) in front of an IAM-private Cloud Run origin, from an owner-authorized cutover; current Cloudflare behavior unchanged; no readiness claim |
+| GCP cutover window | [GCP cutover window](./runbooks/gcp-cutover-window.md) | Draft | Steps H.1 to H.8 with preconditions, attestations, abort path and tooling status; not operational and authorizes nothing |
+| GCP origin rollout | [GCP origin rollout](./runbooks/gcp-rollout.md) | Draft | Preflight, build, migrate and roll with the accepted per-migration write outage and an explicit scheduler pause and resume; forward only |
+| GCP scheduler resume | [GCP scheduler resume](./runbooks/gcp-scheduler-resume.md) | Draft | Triggers created paused and resumed only explicitly; state model, pause and resume steps; pause and resume tooling not built |
+| GCP ops probes | [GCP ops probes](./runbooks/gcp-ops-probes.md) | Draft | The content-free runtime liveness probe, the backup-audit probe and the log-redaction marker; line contract, unavailable reasons, open owner decisions; not registered or run in any project |
+| GCP brake and incidents | [GCP brake and incidents](./runbooks/gcp-brake-and-incidents.md) | Draft | Brake to fenced only, then fix forward; incident classes; brake thresholds and escalation not recorded |
+| GCP catalog signing | [GCP catalog manifest signing, key custody and rotation](./runbooks/gcp-catalog-manifest-signing.md) | Draft | Owner-run signing with the Keychain `secret` helper, never in CI or Secret Manager; the four round-11 keys pinned; rotation through the next slot; no manifest published or loaded |
 
 ## Lifecycle evidence
 

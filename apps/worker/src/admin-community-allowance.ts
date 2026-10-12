@@ -5,6 +5,7 @@ import {
 } from "@app-usagemonitor/telemetry-contract";
 import {
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
+  COMMUNITY_ALLOWANCE_PRO10_PLAN_CONFIG,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
@@ -33,10 +34,22 @@ export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
 // publication. Elapsed time alone neither expires nor rebuilds a snapshot.
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
+/** The current (B', Pro 20x-equivalent four-plan) preview identity. The
+ * builder emits only this contract. */
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.4";
+  "admin-community-allowance-preview-v0.5";
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview";
+
+/** Frozen retained Pro 10x identity (2026-10-09). Nothing builds it any more;
+ * a stored v0.4 preview is validated against exactly these literals and keeps
+ * its v1.4 public meaning, never relabelled as the current basis. */
+export const ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_SCHEMA_VERSION =
+  "admin-community-allowance-preview-v0.4";
+export const ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_BASIS =
   "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview";
+export const ADMIN_COMMUNITY_ALLOWANCE_PRO10_MODELS_BASIS =
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
 
 /**
  * The v1 analyzer exposes a trailing 100-day fit corpus. Each historical point
@@ -49,27 +62,38 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
+const ADMIN_COMMUNITY_ALLOWANCE_PLAN_MULTIPLIER_BY_TYPE: ReadonlyMap<string, number> = new Map(
+  ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [plan.planType, plan.multiplier] as const),
+);
 
 // Visibility is not fit eligibility or availability. Raw/custom model strings
 // cannot enter the dashboard through this shared reviewed identity catalog.
 export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;
 
+// The per-model view uses the current plan roster: values are in Pro 20x-week
+// units and Pro Max 25x participants enter at x0.8. This is not the v0.3
+// per-model basis (which counted Pro Max unstable), so it carries its own name.
 export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS =
-  "seven_day_codex_pro10x_equivalent_per_model_composition";
+  "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
 export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 
 export type AdminCommunityModelCompositionDay =
   NonNullable<ReturnType<typeof projectAdminModelHistoryDay>>;
 
-export interface AdminCommunityAllowanceModels {
+interface AdminCommunityAllowanceModelsFor<Basis extends string> {
   readonly modelConfig: typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
-  readonly basis: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS;
+  readonly basis: Basis;
   readonly gate: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE;
   /** Ascending, at most the preview horizon. Forward snapshots are preserved;
    * missing earlier dates may be independently reconstructed by the scheduler. */
   readonly days: readonly AdminCommunityModelCompositionDay[];
 }
+
+export type AdminCommunityAllowanceModels =
+  AdminCommunityAllowanceModelsFor<typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS>;
+export type RetainedPro10AdminCommunityAllowanceModels =
+  AdminCommunityAllowanceModelsFor<typeof ADMIN_COMMUNITY_ALLOWANCE_PRO10_MODELS_BASIS>;
 
 type AdminCommunityAllowancePlanType =
   (typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG)[number]["planType"];
@@ -103,22 +127,60 @@ export interface AdminCommunityAllowanceCoverage {
   readonly unsupportedPlanParticipantCount: number;
 }
 
-export interface AdminCommunityAllowancePreview {
-  readonly schemaVersion:
-    typeof ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION;
+interface AdminCommunityAllowancePreviewFor<
+  SchemaVersion extends string, Basis extends string, Plans, Models,
+> {
+  readonly schemaVersion: SchemaVersion;
   readonly generatedAt: string;
   readonly from: string;
   readonly to: string;
-  readonly basis: typeof ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS;
+  readonly basis: Basis;
   readonly referencePlanType: "pro";
   readonly trailingDays: typeof COMMUNITY_ALLOWANCE_TRAILING_DAYS;
   readonly qualification: typeof COMMUNITY_ALLOWANCE_QUALIFICATION;
   readonly spanFloorPp: typeof COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP;
-  readonly plans: typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG;
+  readonly plans: Plans;
   readonly coverage: AdminCommunityAllowanceCoverage;
   readonly days: readonly AdminCommunityAllowancePreviewDay[];
-  readonly models: AdminCommunityAllowanceModels;
+  readonly models: Models;
 }
+
+/** The current (v0.5) preview, the only shape the builder emits. */
+export type AdminCommunityAllowancePreview = AdminCommunityAllowancePreviewFor<
+  typeof ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+  typeof ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
+  typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG,
+  AdminCommunityAllowanceModels>;
+
+/** A stored, retained Pro 10x (v0.4) preview: read-only, never built. */
+export type RetainedPro10AdminCommunityAllowancePreview = AdminCommunityAllowancePreviewFor<
+  typeof ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_SCHEMA_VERSION,
+  typeof ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_BASIS,
+  typeof COMMUNITY_ALLOWANCE_PRO10_PLAN_CONFIG,
+  RetainedPro10AdminCommunityAllowanceModels>;
+
+/** One exact preview contract: every literal a stored preview must carry.
+ * Each contract matches only its own schemaVersion, so they never overlap. */
+interface AdminCommunityAllowancePreviewContract {
+  readonly schemaVersion: string;
+  readonly basis: string;
+  readonly modelsBasis: string;
+  readonly plans: readonly { readonly planType: string; readonly label: string; readonly multiplier: number }[];
+}
+
+const CURRENT_PREVIEW_CONTRACT: AdminCommunityAllowancePreviewContract = Object.freeze({
+  schemaVersion: ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+  basis: ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
+  modelsBasis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+  plans: ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG,
+});
+
+const RETAINED_PRO10_PREVIEW_CONTRACT: AdminCommunityAllowancePreviewContract = Object.freeze({
+  schemaVersion: ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_SCHEMA_VERSION,
+  basis: ADMIN_COMMUNITY_ALLOWANCE_PRO10_PREVIEW_BASIS,
+  modelsBasis: ADMIN_COMMUNITY_ALLOWANCE_PRO10_MODELS_BASIS,
+  plans: COMMUNITY_ALLOWANCE_PRO10_PLAN_CONFIG,
+});
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -202,27 +264,37 @@ function validModelCompositionDay(
 function validAdminCommunityAllowanceModels(
   value: unknown,
   latestAllowedDay: string,
-): value is AdminCommunityAllowanceModels {
+  expectedBasis: string,
+): boolean {
   const models = record(value);
   if (models === null || !exactKeys(models, [
     "modelConfig",
     "basis",
     "gate",
     "days",
-  ]) || models.basis !== ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS
+  ]) || models.basis !== expectedBasis
       || models.gate !== ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE) {
     return false;
   }
-  if (!Array.isArray(models.modelConfig)
-      || models.modelConfig.length !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) {
-    return false;
-  }
-  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {
+  if (!Array.isArray(models.modelConfig)) return false;
+  // The reviewed September 23 catalog is the exact 42-row predecessor of
+  // September 29: only GPT-6.1 Sol was appended. This is one known historical
+  // publication shape, never permission to accept an arbitrary roster prefix.
+  const historicalCatalog = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
+    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 43
+    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol"
+    && models.modelConfig.length === 42;
+  const expectedModels = historicalCatalog
+    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, 42)
+    : ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
+  if (models.modelConfig.length !== expectedModels.length) return false;
+  for (const [index, expected] of expectedModels.entries()) {
     const model = record(models.modelConfig[index]);
     if (model === null
         || !exactKeys(model, ["modelId", "label", "allowanceTrack", "pricingStatus"])
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
+        || (historicalCatalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       return false;
@@ -234,7 +306,10 @@ function validAdminCommunityAllowanceModels(
   }
   let previousDay = "";
   for (const candidate of models.days) {
-    if (!validModelCompositionDay(candidate)) return false;
+    if (!validModelCompositionDay(candidate)
+        // A predecessor roster cannot claim the appended model was observed.
+        // The shared reader still admits only its exact frozen older catalogs.
+        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) return false;
     if (candidate.day <= previousDay || candidate.day > latestAllowedDay) {
       return false;
     }
@@ -243,11 +318,34 @@ function validAdminCommunityAllowanceModels(
   return true;
 }
 
+/** The current (v0.5) contract only: the builder's output and every current
+ * storage/readiness check. A retained v0.4 or legacy v0.3 preview is false. */
 export function validCachedAdminCommunityAllowancePreview(
   value: unknown,
   storedGeneratedAt: string,
   nowEpoch: number,
 ): value is AdminCommunityAllowancePreview {
+  return validAdminCommunityAllowancePreviewFor(CURRENT_PREVIEW_CONTRACT, value, storedGeneratedAt, nowEpoch);
+}
+
+/** The frozen retained Pro 10x (v0.4) contract only, for reading stored
+ * previews published before the B' cutover. Never a current preview. */
+export function validRetainedPro10AdminCommunityAllowancePreview(
+  value: unknown,
+  storedGeneratedAt: string,
+  nowEpoch: number,
+): value is RetainedPro10AdminCommunityAllowancePreview {
+  return validAdminCommunityAllowancePreviewFor(RETAINED_PRO10_PREVIEW_CONTRACT, value, storedGeneratedAt, nowEpoch);
+}
+
+/** One validator for every authored contract, so the builder's checks and the
+ * retained reader's checks cannot drift apart. */
+function validAdminCommunityAllowancePreviewFor(
+  contract: AdminCommunityAllowancePreviewContract,
+  value: unknown,
+  storedGeneratedAt: string,
+  nowEpoch: number,
+): boolean {
   if (!Number.isFinite(nowEpoch)) return false;
   const preview = record(value);
   if (preview === null || !exactKeys(preview, [
@@ -264,10 +362,10 @@ export function validCachedAdminCommunityAllowancePreview(
     "coverage",
     "days",
     "models",
-  ]) || preview.schemaVersion !== ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION
+  ]) || preview.schemaVersion !== contract.schemaVersion
       || preview.generatedAt !== storedGeneratedAt
       || !validIsoTimestamp(preview.generatedAt)
-      || preview.basis !== ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS
+      || preview.basis !== contract.basis
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== COMMUNITY_ALLOWANCE_TRAILING_DAYS
       || preview.qualification !== COMMUNITY_ALLOWANCE_QUALIFICATION
@@ -282,10 +380,10 @@ export function validCachedAdminCommunityAllowancePreview(
   }
 
   if (!Array.isArray(preview.plans)
-      || preview.plans.length !== ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.length) {
+      || preview.plans.length !== contract.plans.length) {
     return false;
   }
-  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.entries()) {
+  for (const [index, expected] of contract.plans.entries()) {
     const plan = record(preview.plans[index]);
     if (plan === null
         || !exactKeys(plan, ["planType", "label", "multiplier"])
@@ -348,12 +446,12 @@ export function validCachedAdminCommunityAllowancePreview(
     const byPlan = record(day.byPlanType);
     if (byPlan === null || !exactKeys(
       byPlan,
-      ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => plan.planType),
+      contract.plans.map((plan) => plan.planType),
     )) {
       return false;
     }
     const summaries: AdminCommunityAllowanceSummary[] = [];
-    for (const plan of ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG) {
+    for (const plan of contract.plans) {
       const summary = byPlan[plan.planType];
       if (!validSummary(summary)) return false;
       summaries.push(summary);
@@ -378,7 +476,7 @@ export function validCachedAdminCommunityAllowancePreview(
   const latestCombined = record(latest?.combined);
   return latestCombined !== null
     && latestCombined.participantCount === eligible
-    && validAdminCommunityAllowanceModels(preview.models, preview.to as string);
+    && validAdminCommunityAllowanceModels(preview.models, preview.to as string, contract.modelsBasis);
 }
 
 function summarizeFits(
@@ -448,12 +546,89 @@ function medianOf(values: readonly number[]): number | null {
   return (ordered[lower]! + ordered[upper]!) / 2;
 }
 
+export type CommunityModelCompositionNormalization =
+  | { readonly state: "stale" }
+  | { readonly state: "unstable" }
+  | { readonly state: "fitted"; readonly values: Readonly<Record<string, number>> };
+
+export interface CommunityModelCompositionDaySummary {
+  readonly mediansByModel: ReadonlyMap<string, { readonly median: number; readonly participantCount: number }>;
+  readonly fittedParticipantCount: number;
+  readonly unstableParticipantCount: number;
+  readonly staleParticipantCount: number;
+  readonly refusedParticipantCount: number;
+  readonly v1ParticipantCount: number;
+  readonly unsupportedSourceParticipantCount: number;
+}
+
+/** Apply the public graph's day-window and plan-normalization rules to one
+ * cached owner result. The PostgreSQL publisher uses this while streaming rows
+ * into database-side exact-median aggregates. */
+export function normalizeCommunityModelCompositionForDay(
+  composition: CommunityModelComposition["composition"],
+  day: string,
+): CommunityModelCompositionNormalization {
+  const dayEndMs = Date.parse(`${day}T00:00:00.000Z`) + MILLISECONDS_PER_DAY;
+  const recencyFloorMs = dayEndMs
+    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
+  const latestMs = Date.parse(composition.latestQuotaObservedAt);
+  if (!Number.isFinite(latestMs) || latestMs <= recencyFloorMs || latestMs > dayEndMs) {
+    return { state: "stale" };
+  }
+  const multiplier = ADMIN_COMMUNITY_ALLOWANCE_PLAN_MULTIPLIER_BY_TYPE.get(composition.planType);
+  const vector = composition.fit.capacityUsdByModel;
+  if (composition.fit.status !== "fitted" || vector === null || multiplier === undefined) {
+    return { state: "unstable" };
+  }
+  const values: Record<string, number> = {};
+  for (const [model, capacity] of Object.entries(vector)) {
+    if (typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0) {
+      values[model] = capacity * multiplier;
+    }
+  }
+  return { state: "fitted", values };
+}
+
+/** Build the reviewed public graph projection from bounded aggregate
+ * statistics. `mediansByModel` can be produced by PostgreSQL's ordered-set
+ * aggregate so the application does not retain one value per participant. */
+export function buildCommunityModelCompositionDayFromSummary(
+  summary: CommunityModelCompositionDaySummary,
+  day: string,
+): AdminCommunityModelCompositionDay {
+  const values = ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG
+    .filter((model) => model.allowanceTrack === "primary")
+    .flatMap((model) => {
+      const aggregate = summary.mediansByModel.get(model.modelId);
+      if (!aggregate) return [];
+      if (!Number.isFinite(aggregate.median) || aggregate.median <= 0
+          || !Number.isSafeInteger(aggregate.participantCount) || aggregate.participantCount < 1) {
+        throw new Error("invalid admin model composition aggregate");
+      }
+      return [[model.modelId, usd4(aggregate.median), aggregate.participantCount]];
+    });
+  const result = projectAdminModelHistoryDay({
+    day,
+    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values,
+    fittedParticipantCount: summary.fittedParticipantCount,
+    unstableParticipantCount: summary.unstableParticipantCount,
+    staleParticipantCount: summary.staleParticipantCount,
+    refusedParticipantCount: summary.refusedParticipantCount,
+    v1ParticipantCount: summary.v1ParticipantCount,
+    unsupportedSourceParticipantCount: summary.unsupportedSourceParticipantCount,
+  });
+  if (result === null) throw new Error("invalid admin model composition aggregate");
+  return result;
+}
+
 /**
  * One published day of the per-model series: for each pinned model, the median
  * across identification-passing participants of that participant's fitted
- * capacity normalized to the current Pro-10x basis by their plan multiplier. A
- * participant whose plan is not in the personal-plan roster cannot normalize
- * and is counted unstable rather than silently entering unscaled.
+ * capacity normalized to the current Pro 20x basis by their plan multiplier
+ * (Pro Max 25x included at x0.8). A participant whose plan is not in the
+ * personal-plan roster cannot normalize and is counted unstable rather than
+ * silently entering unscaled.
  */
 export function buildCommunityModelCompositionDay(
   collection: {
@@ -464,16 +639,8 @@ export function buildCommunityModelCompositionDay(
   },
   day: string,
 ): AdminCommunityModelCompositionDay {
-  const planMultiplier = new Map<string, number>(
-    ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [
-      plan.planType,
-      plan.multiplier,
-    ]),
-  );
-  const dayEndMs = Date.parse(`${day}T00:00:00.000Z`) + MILLISECONDS_PER_DAY;
-  const recencyFloorMs = dayEndMs
-    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
-  const normalized: Array<Readonly<Record<string, number>>> = [];
+  const valuesByModel = new Map<string, number[]>();
+  let fittedParticipantCount = 0;
   let unstableParticipantCount = 0;
   let staleParticipantCount = 0;
   for (const { composition } of collection.compositions) {
@@ -481,53 +648,36 @@ export function buildCommunityModelCompositionDay(
     // day membership needs its own recency evidence: the same trailing
     // window the blended preview uses, against the composition's newest
     // retained quota reading.
-    const latestMs = Date.parse(composition.latestQuotaObservedAt);
-    if (!Number.isFinite(latestMs)
-        || latestMs <= recencyFloorMs
-        || latestMs > dayEndMs) {
+    const normalized = normalizeCommunityModelCompositionForDay(composition, day);
+    if (normalized.state === "stale") {
       staleParticipantCount += 1;
       continue;
     }
-    const multiplier = planMultiplier.get(composition.planType);
-    const vector = composition.fit.capacityUsdByModel;
-    if (composition.fit.status !== "fitted"
-        || vector === null
-        || multiplier === undefined) {
+    if (normalized.state === "unstable") {
       unstableParticipantCount += 1;
       continue;
     }
-    const scaled: Record<string, number> = {};
-    for (const [model, capacity] of Object.entries(vector)) {
-      if (typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0) {
-        scaled[model] = capacity * multiplier;
-      }
+    fittedParticipantCount += 1;
+    for (const [model, capacity] of Object.entries(normalized.values)) {
+      const values = valuesByModel.get(model) ?? [];
+      values.push(capacity);
+      valuesByModel.set(model, values);
     }
-    normalized.push(scaled);
   }
-  const values = ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG
-    .filter((model) => model.allowanceTrack === "primary")
-    .flatMap((model) => {
-      const values = normalized
-        .map((vector) => vector[model.modelId])
-        .filter((value): value is number => value !== undefined);
-      const central = medianOf(values);
-      if (central === null) return [];
-      return [[model.modelId, usd4(central), values.length]];
-    });
-  const result = projectAdminModelHistoryDay({
-    day,
-    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
-    values,
-    fittedParticipantCount: normalized.length,
+  const mediansByModel = new Map<string, { median: number; participantCount: number }>();
+  for (const [model, values] of valuesByModel) {
+    const median = medianOf(values);
+    if (median !== null) mediansByModel.set(model, { median, participantCount: values.length });
+  }
+  return buildCommunityModelCompositionDayFromSummary({
+    mediansByModel,
+    fittedParticipantCount,
     unstableParticipantCount,
     staleParticipantCount,
     refusedParticipantCount: collection.refusedParticipantCount,
     v1ParticipantCount: collection.v1ParticipantCount,
-    unsupportedSourceParticipantCount:
-      collection.unsupportedSourceParticipantCount,
-  });
-  if (result === null) throw new Error("invalid admin model composition aggregate");
-  return result;
+    unsupportedSourceParticipantCount: collection.unsupportedSourceParticipantCount,
+  }, day);
 }
 
 const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;
@@ -872,7 +1022,8 @@ export async function readCachedAdminCommunityAllowancePreview(
   }
   // Display copy is not analytical identity. Never echo a stored label when a
   // reviewed catalog rename can supply the current content-free presentation.
-  return { ...parsed, models: { ...parsed.models, modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG } };
+  return { ...parsed, models: { ...parsed.models,
+    modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, parsed.models.modelConfig.length) } };
 }
 
 export interface AdminCommunityAllowancePreviewCacheResult {

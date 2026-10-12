@@ -13,6 +13,7 @@ import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, claimDeviceUploadAuthorization, createDeviceUploadAuthorization } from "../src/device-auth";
 import { grantTelemetryV12AccountlessAuthorization, grantTelemetryV12Consent } from "../src/telemetry-transport-policy";
 import { persistTelemetryV12StagedChunk, registerTelemetryV12DayManifest } from "../src/telemetry-v12-repository";
+import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { activateTelemetryV12Domain, createTelemetryV12DomainPredecessor } from "../src/telemetry-v12-domain";
 import { advanceNextStorageCommunityDaily, advanceStorageCommunityDaily, readPublishedStorageCommunityDaily } from "../src/storage-community-daily";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
@@ -141,8 +142,13 @@ async function clientPass(principal: Principal, localDays: Map<string, Telemetry
       const upload = await createDeviceUploadAuthorization(source(), device, envelopeDigest, 4096);
       const claimed = await claimDeviceUploadAuthorization(source(), `Upload ${upload.uploadAuthorization}`,
         { envelopeDigest, bodyBytes: 4096, contentType: "application/json" });
-      await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId: `chunk:${crypto.randomUUID()}`,
-        r2Key: `synthetic/v12-first-sync/${crypto.randomUUID()}`, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
+      // The upload route's order: register and store the object, then admit
+      // the chunk (isolation 0013 refuses a chunk without its registration).
+      const chunkRowId = `chunk:${crypto.randomUUID()}`, r2Key = `telemetry/v12-first-sync/${crypto.randomUUID()}`;
+      await putTrackedQuarantineObject(source(), b.QUARANTINE, { contributionId: chunkRowId, objectKind: "telemetry", r2Key,
+        registeredAt: new Date().toISOString() }, "synthetic v1.2 bytes");
+      await persistTelemetryV12StagedChunk(source(), principal, chunk, { chunkRowId,
+        r2Key, envelopeDigest, deviceUploadAuthorizationId: claimed.authorizationId });
     }
     vector.push({ day, manifestId: candidate.manifestId, manifestDigest: prepared.manifest.manifestDigest });
   }

@@ -1,0 +1,1338 @@
+{
+ "schemaVersion": "gcp-fastpath-dense-oracle-manifest-v1",
+ "oracle": "production-code (d43c8f92 Worker modules bundled for Node over the sealed SQLite D1 adapter; D1 seeded through admission helpers; scheduled entry points driven to convergence; forced native references)",
+ "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+ "build": {
+  "verifiedFiles": 392,
+  "listingSha256": "6e8335b8056297b853900673ff3a58b0a20cdd595136905e1dbd6c5a7870f75a",
+  "entrySha256": "77207ea50bdb0d9d451b4b7325e5bae3ab0ebadf0a666850e59e099a9ebd208c",
+  "esbuildVersion": "0.28.1",
+  "dependencies": {
+   "jsonc-parser": "3.3.1",
+   "oauth4webapi": "3.8.6",
+   "runcost": "0.2.1"
+  }
+ },
+ "corpus": {
+  "schemaVersion": "gcp-fastpath-dense-corpus-v1",
+  "q1": {
+   "path": "apps/worker/analytics-v2-test/golden/corpus/corpus.json",
+   "sha256": "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e",
+   "recordCounts": {
+    "a": {
+     "quota": 692,
+     "session": 668,
+     "usage": 2324
+    },
+    "b": {
+     "quota": 688,
+     "session": 663,
+     "usage": 2311
+    },
+    "c": {
+     "quota": 690,
+     "session": 666,
+     "usage": 2293
+    },
+    "d": {
+     "quota": 724,
+     "session": 700,
+     "usage": 2411
+    }
+   }
+  },
+  "dense": {
+   "generator": "apps/worker/scripts/gcp-fastpath-dense-oracle/dense-corpus.mjs",
+   "scale": 1,
+   "layout": "compact",
+   "spec": {
+    "key": "e",
+    "kind": "social",
+    "format": "v12",
+    "layout": "compact",
+    "classDays": {
+     "Q": [
+      "2026-04-15"
+     ],
+     "X": [
+      "2026-09-29"
+     ],
+     "H": [
+      "2026-09-24"
+     ],
+     "M": [
+      "2026-09-10",
+      "2026-09-18"
+     ],
+     "S": [
+      "2026-08-27",
+      "2026-08-28",
+      "2026-08-29",
+      "2026-08-30",
+      "2026-08-31",
+      "2026-09-01",
+      "2026-09-02",
+      "2026-09-03",
+      "2026-09-04",
+      "2026-09-05",
+      "2026-09-06",
+      "2026-09-07",
+      "2026-09-08",
+      "2026-09-09",
+      "2026-09-11",
+      "2026-09-12",
+      "2026-09-13",
+      "2026-09-14",
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-19",
+      "2026-09-20",
+      "2026-09-21",
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-25",
+      "2026-09-26",
+      "2026-09-27",
+      "2026-09-28"
+     ]
+    },
+    "participantId": "participant:291ba2ac-c79e-4a6f-bb41-22ed1c153259",
+    "pinnedOwnerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+    "planType": "pro",
+    "accountTrackId": "account-track:v2:976cec3b27c62011487c9e31c00ce0bf1ff4e4c97ab9600aa5d029ae41d300ba",
+    "models": [
+     "gpt-5.6-sol",
+     "gpt-5.6-terra",
+     "gpt-5.5"
+    ],
+    "capacitiesUsdPerWindow": {
+     "gpt-5.6-sol": 77267.07,
+     "gpt-5.6-terra": 36057.97,
+     "gpt-5.5": 60096.61
+    },
+    "capacityScale": 85.8523,
+    "peakPercent": 80,
+    "resets": [
+     "2026-04-08T17:43:00.000Z",
+     "2026-04-15T17:43:00.000Z",
+     "2026-04-22T17:43:00.000Z",
+     "2026-04-29T17:43:00.000Z",
+     "2026-05-06T17:43:00.000Z",
+     "2026-05-13T17:43:00.000Z",
+     "2026-05-20T17:43:00.000Z",
+     "2026-05-27T17:43:00.000Z",
+     "2026-06-03T17:43:00.000Z",
+     "2026-06-10T17:43:00.000Z",
+     "2026-06-17T17:43:00.000Z",
+     "2026-06-24T17:43:00.000Z",
+     "2026-07-01T17:43:00.000Z",
+     "2026-07-08T17:43:00.000Z",
+     "2026-07-15T17:43:00.000Z",
+     "2026-07-22T17:43:00.000Z",
+     "2026-07-29T17:43:00.000Z",
+     "2026-08-05T17:43:00.000Z",
+     "2026-08-12T17:43:00.000Z",
+     "2026-08-19T17:43:00.000Z",
+     "2026-08-26T17:43:00.000Z",
+     "2026-09-01T15:43:00.000Z",
+     "2026-09-08T15:43:00.000Z",
+     "2026-09-15T15:43:00.000Z",
+     "2026-09-22T15:43:00.000Z",
+     "2026-09-29T15:43:00.000Z",
+     "2026-10-06T15:43:00.000Z"
+    ],
+    "storage": {
+     "v12": [
+      "2026-04-15",
+      "2026-10-01"
+     ]
+    },
+    "dayCount": 170,
+    "usageEvents": 294198
+   },
+   "classes": {
+    "Q": 1,
+    "X": 1,
+    "H": 1,
+    "M": 2,
+    "S": 30,
+    "L": 135
+   }
+  }
+ },
+ "nowMs": 1790858760000,
+ "now": "2026-10-01T12:46:00.000Z",
+ "pinnedNow": "2026-10-01T12:00:00.000Z",
+ "seedClock": "2026-10-01T07:26:31.714Z",
+ "correctionRuntimeState": "active",
+ "sqliteStatistics": "ANALYZE on the seeded source before analysis (query plans only; sqlite_* tables are not dumped)",
+ "topology": {
+  "analytics": {
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "enabled",
+   "PUBLICATION_LANE_EXTERNAL": "enabled"
+  },
+  "publication": {
+   "PUBLICATION_LANE": "enabled",
+   "STORAGE_ANALYTICS_SHARED_FEATURES": "enabled",
+   "STORAGE_ANALYTICS_MODEL_BLOCKS": "disabled"
+  },
+  "cache": {
+   "CACHE_RETENTION_BUILD": "enabled",
+   "CACHE_RETENTION_SHARED_FEATURES": "enabled",
+   "shards": 1
+  },
+  "graphDayProjection": "disabled (deployment default)",
+  "cadence": {
+   "lanesPerSimulatedMinute": [
+    "analytics x2",
+    "publication x4",
+    "cache"
+   ],
+   "longPassEveryMinutes": 10,
+   "clockStepMsPerMinute": 15000,
+   "q1Cadence": false
+  },
+  "basis": "Q-1's reading of the production-scheduled-analytics-deploy refresh plan at d43c8f92; not verified against live configuration"
+ },
+ "convergence": {
+  "converged": false,
+  "stoppedBy": "daily-published",
+  "scheduleErrors": 0,
+  "quietTicks": 21,
+  "rule": "stopped at the first simulated minute with every non-conflict corpus day published and nothing else queued; graph work was still in progress (graphProgress)",
+  "graphProgress": {
+   "results": 34,
+   "byOwner": {
+    "a": {
+     "fits": true,
+     "modelDates": 6
+    },
+    "b": {
+     "fits": true,
+     "modelDates": 11
+    },
+    "c": {
+     "fits": true,
+     "modelDates": 5
+    },
+    "d": {
+     "fits": true,
+     "modelDates": 8
+    },
+    "e": {
+     "fits": false,
+     "modelDates": 0
+    }
+   },
+   "publishedModelDays": 0,
+   "previewRevision": null
+  }
+ },
+ "directPublisherCalls": {
+  "preview": "deferred",
+  "modelDays": {}
+ },
+ "owners": [
+  {
+   "key": "a",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1ConflictChunk": [
+     "2026-04-17",
+     "2026-04-17"
+    ]
+   },
+   "ownerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "pinnedOwnerDigest": "f214e768a577e01681dcb70f03221c39e0715d52ff594724daf0ba76f6c6c54c",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 6
+    }
+   ]
+  },
+  {
+   "key": "b",
+   "kind": "accountless",
+   "planType": "plus",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "pinnedOwnerDigest": "b2df2e36a49340774e9550bb63a8ec9a663b5c56b63e86519a987b619c6981be",
+   "flags": {
+    "hasV1": false,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 11
+    }
+   ]
+  },
+  {
+   "key": "c",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "pinnedOwnerDigest": "77fa209ac4e4d1407b6fbe20381f67bde307e0ffc5ab47b98f3ac48caa9fc04e",
+   "flags": {
+    "hasV1": false,
+    "hasV11": false,
+    "hasV12": true,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 5
+    }
+   ]
+  },
+  {
+   "key": "d",
+   "kind": "social",
+   "planType": "prolite",
+   "storage": {
+    "v11": [
+     "2026-04-15",
+     "2026-10-01"
+    ],
+    "v1DuplicateChunk": [
+     "2026-06-30",
+     "2026-06-30"
+    ]
+   },
+   "ownerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "pinnedOwnerDigest": "8f6b06d86afa675ccb556989677ad247f687a344926347a68281cebdfe4e4007",
+   "flags": {
+    "hasV1": true,
+    "hasV11": true,
+    "hasV12": false,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": [
+    {
+     "metric": "fits",
+     "sourceKind": "effective",
+     "results": 1
+    },
+    {
+     "metric": "model",
+     "sourceKind": "effective",
+     "results": 8
+    }
+   ]
+  },
+  {
+   "key": "e",
+   "kind": "social",
+   "planType": "pro",
+   "storage": {
+    "v12": [
+     "2026-04-15",
+     "2026-10-01"
+    ]
+   },
+   "ownerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+   "pinnedOwnerDigest": "49a16990ce1ced5df1b259e629d2a70ae890bfee191b98be75e0d4e3a89b378a",
+   "flags": {
+    "hasV1": false,
+    "hasV11": false,
+    "hasV12": true,
+    "hasLegacy": false,
+    "hasEffective": true
+   },
+   "expectedSourceRouting": "effective",
+   "dailySourceFormats": [
+    {
+     "sourceFormat": "effective",
+     "days": 168
+    }
+   ],
+   "graphSources": []
+  }
+ ],
+ "routingEvidence": {
+  "sharedFeatures": [
+   {
+    "owner": "e",
+    "state": "complete",
+    "n": 163,
+    "first": "2026-04-16",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "e",
+    "state": "refused",
+    "n": 5,
+    "first": "2026-04-15",
+    "last": "2026-09-29"
+   },
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 175,
+    "first": "2026-04-08",
+    "last": "2026-10-01"
+   },
+   {
+    "owner": "a",
+    "state": "refused",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   }
+  ],
+  "sharedFeatureRefusedDays": {
+   "e": [
+    "2026-04-15",
+    "2026-09-10",
+    "2026-09-18",
+    "2026-09-24",
+    "2026-09-29"
+   ],
+   "a": [
+    "2026-04-17",
+    "2026-04-18"
+   ]
+  },
+  "sharedFeatureWindows": {
+   "rule": "storage-community-graph.ts computeEffective with shared features enabled: the owner's effective quota and usage inventory over the window, then readSharedAnalyticsFeatureWindow; 'shared-features' passes prepared features to advanceStorageEffectiveAnalysis, a refusal passes none (the direct native computation); model dates pass through model blocks first",
+   "byOwner": {
+    "a": {
+     "counts": {
+      "refused:prepared_day_refused": 4,
+      "shared-features": 66
+     },
+     "notShared": {
+      "2026-07-24": "refused:prepared_day_refused",
+      "2026-07-25": "refused:prepared_day_refused",
+      "2026-07-26": "refused:prepared_day_refused",
+      "2026-07-27": "refused:prepared_day_refused"
+     }
+    },
+    "b": {
+     "counts": {
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
+     },
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
+    },
+    "c": {
+     "counts": {
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
+     },
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
+    },
+    "d": {
+     "counts": {
+      "missing:2026-04-17": 3,
+      "missing:2026-04-18": 1,
+      "shared-features": 66
+     },
+     "notShared": {
+      "2026-07-24": "missing:2026-04-17",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18"
+     }
+    },
+    "e": {
+     "counts": {
+      "refused:prepared_day_refused": 1,
+      "missing:2026-04-17": 2,
+      "missing:2026-04-18": 1,
+      "refused:window_byte_limit": 66
+     },
+     "notShared": {
+      "2026-07-24": "refused:prepared_day_refused",
+      "2026-07-25": "missing:2026-04-17",
+      "2026-07-26": "missing:2026-04-17",
+      "2026-07-27": "missing:2026-04-18",
+      "2026-07-28": "refused:window_byte_limit",
+      "2026-07-29": "refused:window_byte_limit",
+      "2026-07-30": "refused:window_byte_limit",
+      "2026-07-31": "refused:window_byte_limit",
+      "2026-08-01": "refused:window_byte_limit",
+      "2026-08-02": "refused:window_byte_limit",
+      "2026-08-03": "refused:window_byte_limit",
+      "2026-08-04": "refused:window_byte_limit",
+      "2026-08-05": "refused:window_byte_limit",
+      "2026-08-06": "refused:window_byte_limit",
+      "2026-08-07": "refused:window_byte_limit",
+      "2026-08-08": "refused:window_byte_limit",
+      "2026-08-09": "refused:window_byte_limit",
+      "2026-08-10": "refused:window_byte_limit",
+      "2026-08-11": "refused:window_byte_limit",
+      "2026-08-12": "refused:window_byte_limit",
+      "2026-08-13": "refused:window_byte_limit",
+      "2026-08-14": "refused:window_byte_limit",
+      "2026-08-15": "refused:window_byte_limit",
+      "2026-08-16": "refused:window_byte_limit",
+      "2026-08-17": "refused:window_byte_limit",
+      "2026-08-18": "refused:window_byte_limit",
+      "2026-08-19": "refused:window_byte_limit",
+      "2026-08-20": "refused:window_byte_limit",
+      "2026-08-21": "refused:window_byte_limit",
+      "2026-08-22": "refused:window_byte_limit",
+      "2026-08-23": "refused:window_byte_limit",
+      "2026-08-24": "refused:window_byte_limit",
+      "2026-08-25": "refused:window_byte_limit",
+      "2026-08-26": "refused:window_byte_limit",
+      "2026-08-27": "refused:window_byte_limit",
+      "2026-08-28": "refused:window_byte_limit",
+      "2026-08-29": "refused:window_byte_limit",
+      "2026-08-30": "refused:window_byte_limit",
+      "2026-08-31": "refused:window_byte_limit",
+      "2026-09-01": "refused:window_byte_limit",
+      "2026-09-02": "refused:window_byte_limit",
+      "2026-09-03": "refused:window_byte_limit",
+      "2026-09-04": "refused:window_byte_limit",
+      "2026-09-05": "refused:window_byte_limit",
+      "2026-09-06": "refused:window_byte_limit",
+      "2026-09-07": "refused:window_byte_limit",
+      "2026-09-08": "refused:window_byte_limit",
+      "2026-09-09": "refused:window_byte_limit",
+      "2026-09-10": "refused:window_byte_limit",
+      "2026-09-11": "refused:window_byte_limit",
+      "2026-09-12": "refused:window_byte_limit",
+      "2026-09-13": "refused:window_byte_limit",
+      "2026-09-14": "refused:window_byte_limit",
+      "2026-09-15": "refused:window_byte_limit",
+      "2026-09-16": "refused:window_byte_limit",
+      "2026-09-17": "refused:window_byte_limit",
+      "2026-09-18": "refused:window_byte_limit",
+      "2026-09-19": "refused:window_byte_limit",
+      "2026-09-20": "refused:window_byte_limit",
+      "2026-09-21": "refused:window_byte_limit",
+      "2026-09-22": "refused:window_byte_limit",
+      "2026-09-23": "refused:window_byte_limit",
+      "2026-09-24": "refused:window_byte_limit",
+      "2026-09-25": "refused:window_byte_limit",
+      "2026-09-26": "refused:window_byte_limit",
+      "2026-09-27": "refused:window_byte_limit",
+      "2026-09-28": "refused:window_byte_limit",
+      "2026-09-29": "refused:window_byte_limit",
+      "2026-09-30": "refused:window_byte_limit",
+      "2026-10-01": "refused:window_byte_limit"
+     }
+    }
+   }
+  },
+  "checkpointHeads": {
+   "heads": 11,
+   "retired": 0
+  },
+  "checkpointParts": {
+   "parts": 143,
+   "bytes": 15368891,
+   "maxPartIndex": 35
+  },
+  "modelBlocks": [
+   {
+    "owner": "e",
+    "state": "pending",
+    "n": 1
+   },
+   {
+    "owner": "c",
+    "state": "complete",
+    "n": 1
+   },
+   {
+    "owner": "d",
+    "state": "complete",
+    "n": 1
+   },
+   {
+    "owner": "b",
+    "state": "complete",
+    "n": 1
+   },
+   {
+    "owner": "a",
+    "state": "complete",
+    "n": 1
+   }
+  ]
+ },
+ "modelPublications": {
+  "expectedDates": 70,
+  "published": 0,
+  "missing": [
+   "2026-07-24",
+   "2026-07-25",
+   "2026-07-26",
+   "2026-07-27",
+   "2026-07-28",
+   "2026-07-29",
+   "2026-07-30",
+   "2026-07-31",
+   "2026-08-01",
+   "2026-08-02",
+   "2026-08-03",
+   "2026-08-04",
+   "2026-08-05",
+   "2026-08-06",
+   "2026-08-07",
+   "2026-08-08",
+   "2026-08-09",
+   "2026-08-10",
+   "2026-08-11",
+   "2026-08-12",
+   "2026-08-13",
+   "2026-08-14",
+   "2026-08-15",
+   "2026-08-16",
+   "2026-08-17",
+   "2026-08-18",
+   "2026-08-19",
+   "2026-08-20",
+   "2026-08-21",
+   "2026-08-22",
+   "2026-08-23",
+   "2026-08-24",
+   "2026-08-25",
+   "2026-08-26",
+   "2026-08-27",
+   "2026-08-28",
+   "2026-08-29",
+   "2026-08-30",
+   "2026-08-31",
+   "2026-09-01",
+   "2026-09-02",
+   "2026-09-03",
+   "2026-09-04",
+   "2026-09-05",
+   "2026-09-06",
+   "2026-09-07",
+   "2026-09-08",
+   "2026-09-09",
+   "2026-09-10",
+   "2026-09-11",
+   "2026-09-12",
+   "2026-09-13",
+   "2026-09-14",
+   "2026-09-15",
+   "2026-09-16",
+   "2026-09-17",
+   "2026-09-18",
+   "2026-09-19",
+   "2026-09-20",
+   "2026-09-21",
+   "2026-09-22",
+   "2026-09-23",
+   "2026-09-24",
+   "2026-09-25",
+   "2026-09-26",
+   "2026-09-27",
+   "2026-09-28",
+   "2026-09-29",
+   "2026-09-30",
+   "2026-10-01"
+  ],
+  "ownersWithResultOnMissingDates": {
+   "2026-07-24": [],
+   "2026-07-25": [],
+   "2026-07-26": [],
+   "2026-07-27": [],
+   "2026-07-28": [],
+   "2026-07-29": [],
+   "2026-07-30": [],
+   "2026-07-31": [],
+   "2026-08-01": [],
+   "2026-08-02": [],
+   "2026-08-03": [],
+   "2026-08-04": [],
+   "2026-08-05": [],
+   "2026-08-06": [],
+   "2026-08-07": [],
+   "2026-08-08": [],
+   "2026-08-09": [],
+   "2026-08-10": [],
+   "2026-08-11": [],
+   "2026-08-12": [],
+   "2026-08-13": [],
+   "2026-08-14": [],
+   "2026-08-15": [],
+   "2026-08-16": [],
+   "2026-08-17": [],
+   "2026-08-18": [],
+   "2026-08-19": [],
+   "2026-08-20": [],
+   "2026-08-21": [],
+   "2026-08-22": [],
+   "2026-08-23": [],
+   "2026-08-24": [],
+   "2026-08-25": [],
+   "2026-08-26": [],
+   "2026-08-27": [],
+   "2026-08-28": [],
+   "2026-08-29": [],
+   "2026-08-30": [],
+   "2026-08-31": [],
+   "2026-09-01": [],
+   "2026-09-02": [],
+   "2026-09-03": [],
+   "2026-09-04": [],
+   "2026-09-05": [],
+   "2026-09-06": [],
+   "2026-09-07": [],
+   "2026-09-08": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-09": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-10": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-09-11": [
+    "a",
+    "b",
+    "d"
+   ],
+   "2026-09-12": [
+    "b",
+    "d"
+   ],
+   "2026-09-13": [
+    "b",
+    "d"
+   ],
+   "2026-09-14": [
+    "b"
+   ],
+   "2026-09-15": [
+    "b"
+   ],
+   "2026-09-16": [
+    "b"
+   ],
+   "2026-09-17": [],
+   "2026-09-18": [],
+   "2026-09-19": [],
+   "2026-09-20": [],
+   "2026-09-21": [],
+   "2026-09-22": [],
+   "2026-09-23": [],
+   "2026-09-24": [],
+   "2026-09-25": [],
+   "2026-09-26": [],
+   "2026-09-27": [],
+   "2026-09-28": [],
+   "2026-09-29": [],
+   "2026-09-30": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ],
+   "2026-10-01": [
+    "a",
+    "b",
+    "c",
+    "d"
+   ]
+  }
+ },
+ "conflict": {
+  "owner": "a",
+  "occurrenceId": "event:v2:d3b6ff85b08a912655697426ded4cba7bee1f0e1cf5574bc717a8c2f14eb5d5e",
+  "days": [
+   "2026-04-17",
+   "2026-04-18"
+  ],
+  "publishedDays": []
+ },
+ "duplicate": {
+  "owner": "d",
+  "occurrenceId": "event:v2:48f6e305db59186ede038b4f089191897d02f1b76941536d25f7a50b26667c5d",
+  "day": "2026-06-30",
+  "formats": [
+   "v1",
+   "v11"
+  ],
+  "v1AdmittedBeforeV11Domain": true
+ },
+ "response": {
+  "status": 200,
+  "cacheControl": "no-store",
+  "schemaVersion": "community-daily-read-v1.0",
+  "allowanceState": "updating",
+  "allowanceReadState": "temporarily_unavailable",
+  "publishedDays": 168,
+  "modelPublicationDays": 0,
+  "previewRow": null,
+  "servedFrom": "the replay's databases (community-daily-response.json)",
+  "settled": {
+   "file": "community-daily-response-settled.json",
+   "servedFrom": "the replay's databases with the settled cache-retention target (cacheRetention.settledLane)",
+   "differsFromReplayOnlyIn": [
+    "cacheRetention"
+   ]
+  }
+ },
+ "outputProvenance": {
+  "dailyPayloads": "lane replay (Tier N): production's scheduled analytics, publication and cache lanes; the daily lane had published every non-conflict day",
+  "cacheRetention": "community-daily-response.json and cache-owner-days.json: the lane replay at capture; community-daily-response-settled.json: production's lane settled without the per-pass budget (cacheRetention.settledLane) and read by the public route; cache-reference.json: production's effective day build for every owner-day with usage (cacheRetention.reference)",
+  "ownerFitsAndModelResults": "direct native calls (advanceStorageEffectiveAnalysis with an unbounded budget, direct-native.mjs); the lane replay's and the budget-sliced forced path's results are cross-checked wherever they exist (directNative.referenceAgreement)",
+  "perDateExpected": "d43c8f92's buildCommunityModelCompositionDay, projectAdminModelHistoryDay, buildAdminCommunityAllowancePreview and projectPublicAllowanceGraph over the owner results above",
+  "communityDailyResponse": "lane replay captured when delivery, daily and cache lanes stood still; its allowance fields show the graph lane's progress at capture, and per-date-expected.json is the allowance reference"
+ },
+ "directNative": {
+  "computedBy": "a direct.mjs run imported with --direct-results (directImport)",
+  "nowMs": 1790856000000,
+  "configuration": "advanceStorageEffectiveAnalysis over the read-only source with no preparedQuota, preparedUsage or preparedUsageReader (what computeEffective passes when shared features are refused or off, STORAGE_V11_PREPARED_FOLD being false at d43c8f92; also the model-block fallback), budget {remainingQueries: 1e9, deadlineMs: far future}, looping on 'deferred' with the checkpoint in memory; fits validated with validCompleteScalarAnalysis and serialized as canonicalJson(selectCommunityAllowanceAnalysisFits(ownerDigest, [{source:'v1.1', analysis}])), model validated with validCompleteCachedComposition and serialized as canonicalJson(analysis)",
+  "owners": {
+   "a": {
+    "fits": "complete",
+    "model": {
+     "failed": 4,
+     "complete": 66
+    },
+    "failures": {
+     "2026-07-24": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-25": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-26": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE",
+     "2026-07-27": "STORAGE_EFFECTIVE_HISTORY_UNAVAILABLE"
+    },
+    "work": {
+     "steps": 35525,
+     "statements": 432232,
+     "fitsSteps": 506
+    }
+   },
+   "b": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 438993,
+     "fitsSteps": 506
+    }
+   },
+   "c": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 453335,
+     "fitsSteps": 506
+    }
+   },
+   "d": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 35926,
+     "statements": 438993,
+     "fitsSteps": 506
+    }
+   },
+   "e": {
+    "fits": "complete",
+    "model": {
+     "complete": 70
+    },
+    "failures": {},
+    "work": {
+     "steps": 83807,
+     "statements": 1513432,
+     "fitsSteps": 2148
+    }
+   }
+  },
+  "referenceAgreement": {
+   "a": {
+    "directEqualsTierN": {
+     "compared": 7,
+     "equal": 7
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
+    }
+   },
+   "b": {
+    "directEqualsTierN": {
+     "compared": 12,
+     "equal": 12
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
+    }
+   },
+   "c": {
+    "directEqualsTierN": {
+     "compared": 6,
+     "equal": 6
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
+    }
+   },
+   "d": {
+    "directEqualsTierN": {
+     "compared": 9,
+     "equal": 9
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
+    }
+   },
+   "e": {
+    "directEqualsTierN": {
+     "compared": 0,
+     "equal": 0
+    },
+    "directEqualsForced": {
+     "compared": 0,
+     "equal": 0
+    }
+   }
+  },
+  "referenceMismatches": []
+ },
+ "directImport": {
+  "sha256": "c395b60d0c8f452620dc8bb432fc59f807901dc9c150be592e541c2b7c678f27",
+  "bytes": 390240,
+  "sourceDigest": "bdbec7f71134bf4b6455b9562e6c340494f2fe3e31dc9a6d8223a3c065c7804a",
+  "nowMs": 1790856000000,
+  "producerBundleSha256": "5fe400fa627fceed001c63cdc407a5b74590eac77310fc5dd678f1a490706977",
+  "recomputedInThisProcess": {
+   "scopes": 17,
+   "equal": 17,
+   "mismatched": [],
+   "denseOwnerDates": [
+    "2026-08-26"
+   ]
+  }
+ },
+ "forcedNative": null,
+ "cacheRetention": {
+  "marks": [
+   {
+    "owner": "c",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "d",
+    "source_layout": "effective",
+    "n": 1,
+    "first": "2026-04-15",
+    "last": "2026-04-15"
+   },
+   {
+    "owner": "d",
+    "source_layout": "typed-v11",
+    "n": 22,
+    "first": "2026-04-15",
+    "last": "2026-05-06"
+   },
+   {
+    "owner": "b",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "b",
+    "source_layout": "typed-v11",
+    "n": 2,
+    "first": "2026-04-17",
+    "last": "2026-04-18"
+   },
+   {
+    "owner": "a",
+    "source_layout": "effective",
+    "n": 2,
+    "first": "2026-04-15",
+    "last": "2026-04-16"
+   },
+   {
+    "owner": "a",
+    "source_layout": "typed-v11",
+    "n": 59,
+    "first": "2026-04-15",
+    "last": "2026-06-12"
+   }
+  ],
+  "windowAdjacencies": {
+   "day": 0,
+   "week": 0,
+   "month": 0,
+   "all": 36
+  },
+  "settledWindowAdjacencies": {
+   "day": 0,
+   "week": 0,
+   "month": 0,
+   "all": 1645
+  },
+  "settledLane": {
+   "lane": {
+    "calls": 67,
+    "built": 16,
+    "staged": 4,
+    "refused": 0,
+    "skipped": 332,
+    "outcome": "stalled",
+    "stalledAt": {
+     "state": "progress",
+     "reason": "day_limit"
+    },
+    "configuration": {
+     "sharedFeatures": true,
+     "maxDays": 12,
+     "maxWrites": 48,
+     "shards": 1,
+     "budget": "target, source and shared statement allowances and the deadline unbounded"
+    },
+    "cleared": {
+     "analytics_cache_retention_day_marks": 90,
+     "analytics_cache_retention_day_values": 91,
+     "analytics_cache_retention_day_bands": 910,
+     "analytics_cache_retention_day_carry": 630,
+     "analytics_cache_retention_day_progress": 1,
+     "analytics_cache_retention_owner_cursor": 1
+    },
+    "events": {
+     "cache_retention_day_skipped:owner_source_unavailable": 332
+    }
+   },
+   "modes": {
+    "enabled": {
+     "lane": {
+      "calls": 67,
+      "built": 16,
+      "staged": 4,
+      "refused": 0,
+      "skipped": 332,
+      "outcome": "stalled",
+      "stalledAt": {
+       "state": "progress",
+       "reason": "day_limit"
+      },
+      "configuration": {
+       "sharedFeatures": true,
+       "maxDays": 12,
+       "maxWrites": 48,
+       "shards": 1,
+       "budget": "target, source and shared statement allowances and the deadline unbounded"
+      },
+      "cleared": {
+       "analytics_cache_retention_day_marks": 90,
+       "analytics_cache_retention_day_values": 91,
+       "analytics_cache_retention_day_bands": 910,
+       "analytics_cache_retention_day_carry": 630,
+       "analytics_cache_retention_day_progress": 1,
+       "analytics_cache_retention_owner_cursor": 1
+      },
+      "events": {
+       "cache_retention_day_skipped:owner_source_unavailable": 332
+      }
+     },
+     "ownerDaysSha256": "82a20dd00dd0f5e3201e44c976394c278de0f00b542b4ddb1ccc6f0fc1789c03",
+     "seriesSha256": "3f256809b08aca18ce4b47e9c0ed52fb020fb0ea68385f197530c144a5a8fa8b"
+    },
+    "disabled": {
+     "lane": {
+      "calls": 67,
+      "built": 16,
+      "staged": 4,
+      "refused": 0,
+      "skipped": 332,
+      "outcome": "stalled",
+      "stalledAt": {
+       "state": "progress",
+       "reason": "day_limit"
+      },
+      "configuration": {
+       "sharedFeatures": false,
+       "maxDays": 12,
+       "maxWrites": 48,
+       "shards": 1,
+       "budget": "target, source and shared statement allowances and the deadline unbounded"
+      },
+      "cleared": {
+       "analytics_cache_retention_day_marks": 90,
+       "analytics_cache_retention_day_values": 91,
+       "analytics_cache_retention_day_bands": 910,
+       "analytics_cache_retention_day_carry": 630,
+       "analytics_cache_retention_day_progress": 1,
+       "analytics_cache_retention_owner_cursor": 1
+      },
+      "events": {
+       "cache_retention_day_skipped:owner_source_unavailable": 332
+      }
+     },
+     "ownerDaysSha256": "82a20dd00dd0f5e3201e44c976394c278de0f00b542b4ddb1ccc6f0fc1789c03",
+     "seriesSha256": "3f256809b08aca18ce4b47e9c0ed52fb020fb0ea68385f197530c144a5a8fa8b"
+    },
+    "equal": true
+   },
+   "marks": {
+    "e:effective": 2,
+    "c:effective": 2,
+    "d:effective": 2,
+    "d:typed-v11": 2,
+    "b:effective": 2,
+    "b:typed-v11": 2,
+    "a:effective": 2,
+    "a:typed-v11": 2
+   },
+   "markedDays": {
+    "a": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ],
+    "b": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ],
+    "c": [
+     "2026-04-15:effective",
+     "2026-04-16:effective"
+    ],
+    "d": [
+     "2026-04-15:effective",
+     "2026-04-16:effective",
+     "2026-04-17:typed-v11",
+     "2026-04-18:typed-v11"
+    ],
+    "e": [
+     "2026-04-15:effective",
+     "2026-04-16:effective"
+    ]
+   },
+   "unpromotedProgress": []
+  },
+  "reference": {
+   "rule": "cache-days.mjs: createCacheRetentionEffectiveDayBuild for every owner-day with effective usage, the candidate and carry digests being the source dependency digests the lane's source build proves",
+   "ownerDays": 850,
+   "outcomes": {
+    "built": 841,
+    "refused:usage_row_refused": 9
+   },
+   "notBuilt": {
+    "a:2026-04-17": "refused:usage_row_refused",
+    "a:2026-04-18": "refused:usage_row_refused",
+    "a:2026-04-19": "refused:usage_row_refused",
+    "a:2026-04-20": "refused:usage_row_refused",
+    "a:2026-04-21": "refused:usage_row_refused",
+    "a:2026-04-22": "refused:usage_row_refused",
+    "a:2026-04-23": "refused:usage_row_refused",
+    "a:2026-04-24": "refused:usage_row_refused",
+    "a:2026-04-25": "refused:usage_row_refused"
+   },
+   "withValues": 650,
+   "settledAgreement": {
+    "compared": 10,
+    "equal": 10,
+    "mismatched": []
+   }
+  }
+ },
+ "parityBasis": {
+  "runSpecificColumns": {
+   "analytics_cache_retention_day_bands": [
+    "value_key"
+   ],
+   "analytics_cache_retention_day_values": [
+    "carry_digest",
+    "mark_key",
+    "value_key"
+   ],
+   "analytics_community_graph_previews": [
+    "cohort_digest"
+   ],
+   "analytics_community_model_publications": [
+    "cohort_digest"
+   ]
+  },
+  "publishedRowDigests": {
+   "analytics_cache_retention_day_bands": {
+    "rows": 910,
+    "sha256": "05ac1f6746d7b1826650dd88ee97540b4b140a9940743db96c0852ff4bd02e0e"
+   },
+   "analytics_cache_retention_day_values": {
+    "rows": 91,
+    "sha256": "84882d96da5f125ec795645b6198b0581b26fcf55d9c420c53ad940419203551"
+   },
+   "analytics_community_daily_publications": {
+    "rows": 168,
+    "sha256": "b65607b819a4653d0be48e58d7671c9ae16b24d6f9f6cd14f31d008cb95d879f"
+   }
+  }
+ },
+ "leaseExpiryProbe": {
+  "steps": 12,
+  "stepMinutes": 10,
+  "through": "2026-10-01T14:46:00.000Z",
+  "changedOutputs": [],
+  "errors": 0
+ },
+ "sourceDump": {
+  "tables": 85,
+  "rows": 791849,
+  "schemaSha256": "f63ad44aef250a0a54aa6e4eee064a19d20ddb96ff7416535a6fc1a2410901d4",
+  "rowCountsSha256": "8ceb17bb87fdb0639aa8803d6d4effd9358bcedb8dfe841fa2a3549209afe0e8",
+  "jsonBytes": 163950762,
+  "jsonSha256": "1d0bef8ee1dab81bd33533012b8b4cbed673c9ccea22295210f7ec2336d0501a",
+  "sealedSqlite": {
+   "sha256": "cb04f41191aff1cba7873011c0a8846818027a52a3e248dd677781c0fb005ad0",
+   "bytes": 247812096,
+   "integrityCheck": "ok",
+   "sealReady": true,
+   "populatedTables": 85,
+   "missingSealedTables": [],
+   "node": "v26.2.0"
+  },
+  "sourceUnchangedByAnalysis": true,
+  "contentDigest": {
+   "sha256": "bdbec7f71134bf4b6455b9562e6c340494f2fe3e31dc9a6d8223a3c065c7804a",
+   "rule": "source-digest.mjs: every table's rows in a total order (independent of page layout)"
+  },
+  "reproduce": "node --max-old-space-size=32768 apps/worker/scripts/gcp-fastpath-dense-oracle/oracle.mjs --work-dir <dir> --corpus dense --publication-passes 4 --analytics-passes 2 --clock-step-ms 15000 --stop-when daily-published --converge-on daily --forced-native none --direct-results <direct.mjs work dir>/direct-results.json --settle-cache both"
+ }
+}

@@ -4,7 +4,8 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstatSync } from "node:fs";
+import fsPromises, { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -141,6 +142,143 @@ test("SQLite commits collector records and checkpoints atomically", async () => 
     }
   } finally {
     await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("new collector databases are owner-only before SQLite initialization and concurrent reads", async (t) => {
+  const value = await fixture();
+  const execute = DatabaseSync.prototype.exec;
+  let firstMetadata;
+  let readerResult;
+  t.mock.method(DatabaseSync.prototype, "exec", function (sql) {
+    if (firstMetadata === undefined) {
+      firstMetadata = lstatSync(value.stateFile);
+      // Start a normal reader before SQLite has initialized its schema. Its
+      // async metadata read must resume after synchronous initialization, with
+      // no intermediate public-mode database exposed by the writer.
+      readerResult = readLocalCollectorState({ stateFile: value.stateFile })
+        .then((state) => ({ state }), (error) => ({ error }));
+    }
+    return Reflect.apply(execute, this, [sql]);
+  });
+  try {
+    await commitLocalCollectorState({
+      stateFile: value.stateFile,
+      checkpoint: checkpoint(),
+      records: [record("owner-only-creation")],
+    });
+    assert.ok(firstMetadata.isFile());
+    assert.equal(firstMetadata.nlink, 1);
+    if (process.platform !== "win32") {
+      assert.equal(firstMetadata.mode & 0o777, 0o600);
+      assert.equal(firstMetadata.uid, process.getuid());
+    }
+    const observed = await readerResult;
+    assert.equal(observed.error, undefined);
+    assert.equal(observed.state.status, "available");
+    assert.deepEqual(
+      (await readLocalCollectorState({ stateFile: value.stateFile })).records,
+      [record("owner-only-creation")],
+    );
+  } finally {
+    t.mock.restoreAll();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("an exclusively created state path that races the missing check is validated without replacing its data", async (t) => {
+  const value = await fixture();
+  try {
+    await commitLocalCollectorState({
+      stateFile: value.stateFile,
+      checkpoint: checkpoint(),
+      records: [record("existing-state")],
+    });
+    const prior = await stat(value.stateFile);
+    const inspect = fsPromises.lstat;
+    let racedMissingCheck = false;
+    t.mock.method(fsPromises, "lstat", async (path, options) => {
+      if (path === value.stateFile && !racedMissingCheck) {
+        racedMissingCheck = true;
+        const error = new Error("synthetic missing-file race");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return inspect(path, options);
+    });
+    await commitLocalCollectorState({
+      stateFile: value.stateFile,
+      checkpoint: checkpoint(),
+      records: [record("next-state")],
+    });
+    assert.equal(racedMissingCheck, true);
+    const current = await stat(value.stateFile);
+    assert.equal(current.ino, prior.ino);
+    assert.equal(current.dev, prior.dev);
+    assert.equal(current.mode, prior.mode);
+    assert.deepEqual(
+      (await readLocalCollectorState({ stateFile: value.stateFile })).records,
+      [record("existing-state"), record("next-state")],
+    );
+  } finally {
+    t.mock.restoreAll();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("unsafe existing and raced-in collector database paths fail closed without permission repair", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  for (const kind of ["public-mode", "symlink", "hard-link"]) {
+    for (const racedIn of [false, true]) {
+      const value = await fixture();
+      const target = join(value.stateDirectory, "synthetic-target");
+      const payload = "synthetic database boundary canary";
+      try {
+        await writeFile(target, payload, { mode: 0o600 });
+        if (kind === "public-mode") {
+          await writeFile(value.stateFile, payload, { mode: 0o600 });
+          await chmod(value.stateFile, 0o644);
+        } else if (kind === "symlink") {
+          await symlink(target, value.stateFile);
+        } else {
+          await link(target, value.stateFile);
+        }
+        const before = lstatSync(value.stateFile);
+        if (racedIn) {
+          const inspect = fsPromises.lstat;
+          let checked = false;
+          t.mock.method(fsPromises, "lstat", async (path, options) => {
+            if (path === value.stateFile && !checked) {
+              checked = true;
+              const error = new Error("synthetic missing-file race");
+              error.code = "ENOENT";
+              throw error;
+            }
+            return inspect(path, options);
+          });
+        }
+        await assert.rejects(
+          () => commitLocalCollectorState({
+            stateFile: value.stateFile,
+            checkpoint: checkpoint(),
+            records: [record("must-not-write")],
+          }),
+          { code: "local_collector_state_unavailable" },
+          `${kind}, raced-in=${racedIn}`,
+        );
+        const after = lstatSync(value.stateFile);
+        assert.equal(after.dev, before.dev);
+        assert.equal(after.ino, before.ino);
+        assert.equal(after.mode, before.mode);
+        assert.equal(after.nlink, before.nlink);
+        assert.equal(await readFile(value.stateFile, "utf8"), payload);
+        assert.equal(await readFile(target, "utf8"), payload);
+      } finally {
+        t.mock.restoreAll();
+        await rm(value.root, { recursive: true, force: true });
+      }
+    }
   }
 });
 
