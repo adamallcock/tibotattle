@@ -1036,9 +1036,14 @@ const COMMUNITY_SERIES = Object.freeze([
 const COMMUNITY_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
 const COMMUNITY_DAY = /^\d{4}-\d\d-\d\d$/u;
 // Copy that differs in community mode; every other key keeps its shared text.
+// Shared keys that describe this device's measured turns or saved results are
+// scoped too, so pooled reported samples never borrow local wording.
 const COMMUNITY_COPY_SCOPE = Object.freeze({
   provider: "community.provider", subtitle: "community.subtitle", turns: "community.turns",
   point: "community.point", methodology: "community.methodology", variance: "community.variance",
+  standardNote: "community.standardNote", fastNote: "community.fastNote", ultrafastNote: "community.ultrafastNote",
+  unknownMode: "community.unknownMode", modeEmpty: "community.modeEmpty",
+  combinedSpeedEmpty: "community.combinedSpeedEmpty", cancelled: "community.cancelled",
 });
 const communityDayEpoch = (value) => {
   if (typeof value !== "string" || !COMMUNITY_DAY.test(value)) return null;
