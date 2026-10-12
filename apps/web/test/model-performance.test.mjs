@@ -1379,7 +1379,7 @@ test('community variant renders bound estimates, the under-five rule, unresolved
     });
     assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-evidence-row').map(row => row.children[0].textContent),
       ['Reporting period', 'Contributors', 'Installations', 'Reports', 'Reported samples', 'Revision', 'Updated', 'Models not shown']);
-    assert.ok(dom.root.all().some(node => node.textContent === 'Excluded turns (unknown or mixed speed mode): 2.'));
+    assert.ok(dom.root.all().some(node => node.textContent === 'Excluded reported samples (unknown or mixed speed mode): 2.'));
     assert.ok(dom.root.all().some(node => node.tagName === 'button' && node.attributes['aria-label'] === 'GPT-5.6 Sol' && node.all().some(child => child.textContent === 'GPT-5.6 Sol')));
     assert.ok(dom.root.all().some(node => node.className === 'performance-legend-item' && node.children[1].textContent === 'Median bounds'));
     // The copy scope swaps only the community wording.
@@ -1487,7 +1487,7 @@ test('community states stay distinct: unpublished, unreadable, unavailable and m
     assert.equal(communityStatus(dom).dataset.state, 'unsupported', 'an unnormalized body is refused');
     answer = { ...communitySlot('all'), models: [], omittedModels: { models: 2, turns: 9 } };
     await controller.refresh();
-    assert.ok(dom.root.all().some(node => node.dataset.state === 'empty' && node.textContent === 'No Standard mode measurements in this period. Try a longer period or another mode.'));
+    assert.ok(dom.root.all().some(node => node.dataset.state === 'empty' && node.textContent === 'No Standard mode reported samples in this period. Try a longer period or another mode.'));
     assert.equal(evidenceOf(dom).omitted, '2 · 9 reported samples', 'models the catalog cannot name are counted, not hidden');
   } finally { controller.destroy(); }
 });
@@ -1513,12 +1513,107 @@ test('every locale carries the community performance copy with its placeholders'
   for (const locale of SUPPORTED_LOCALES) {
     assert.deepEqual(Object.keys(CATALOGS[locale]).filter(key => key.startsWith(prefix)), keys, locale);
     const values = { date: 'D', method: 'M', values: 'V', count: '7', label: 'P50', value: 'X', estimate: '62', lower: '58', upper: '66',
-      unit: 'U', measured: '3', total: '4', estimates: '1', responses: '2', contributors: '5', devices: '6', models: '1', samples: '9' };
+      unit: 'U', measured: '3', total: '4', estimates: '1', responses: '2', contributors: '5', devices: '6', models: '1', samples: '9', mode: 'Fast' };
     for (const key of keys) {
       const copy = translate(key, values, locale);
       assert.notEqual(copy, key, `${locale}: ${key}`);
       assert.doesNotMatch(copy, /\{/u, `${locale}: ${key}`);
     }
     assert.equal(translate('performance.community.estimateValue', values, locale), '62 (58-66) U');
+  }
+});
+
+// Shared keys whose local text describes this device's measured turns or saved
+// results. Community mode scopes each one to its reported-sample variant.
+const LOCAL_ONLY_PERFORMANCE_KEYS = Object.freeze(['standardNote', 'fastNote', 'ultrafastNote', 'unknownMode', 'modeEmpty', 'combinedSpeedEmpty', 'cancelled']);
+const PERFORMANCE_MODES = Object.freeze(['standard', 'fast', 'ultrafast']);
+const renderedCopy = dom => dom.root.all().flatMap(node => [node.textContent, node.attributes?.['aria-label']])
+  .filter(text => typeof text === 'string' && text.length > 0);
+const placeholderNames = message => [...message.matchAll(/\{([A-Za-z]+)\}/gu)].map(match => match[1]).sort();
+// Every rendering of a key the view can produce: integer counts format as "2" in each supported locale.
+const filledCopy = (t, key, mode = 'standard') => t(key, { count: '2', mode: t(`performance.${mode}`) });
+
+test('community mode never renders the local measured-turn or saved-result copy in any locale', async () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const t = (key, values) => translate(key, values, locale);
+    for (const key of LOCAL_ONLY_PERFORMANCE_KEYS) {
+      assert.deepEqual(placeholderNames(CATALOGS[locale][`performance.community.${key}`]), placeholderNames(CATALOGS[locale][`performance.${key}`]), `${locale}: ${key}`);
+      assert.notEqual(filledCopy(t, `performance.community.${key}`), filledCopy(t, `performance.${key}`), `${locale}: ${key}`);
+    }
+    const local = LOCAL_ONLY_PERFORMANCE_KEYS.flatMap(key => PERFORMANCE_MODES.map(mode => filledCopy(t, `performance.${key}`, mode)));
+    const dom = focusHarness(), ultrafast = Promise.withResolvers();
+    const { client } = communityClient((period, { speedMode }) => {
+      if (speedMode === 'ultrafast') return ultrafast.promise;
+      if (speedMode === 'fast') return { ...communitySlot(period, 'fast'), models: [], omittedModels: { models: 0, turns: 0 } };
+      const slot = communitySlot(period);
+      Object.assign(slot.models[0], { speedTurns: 0, toolFreeTurns: 0, speed: { unit: 'tokens_per_second', points: [] } });
+      return slot;
+    });
+    const controller = mountModelPerformance({ ...dom, source: 'community', client, t });
+    const seen = [];
+    try {
+      dom.show(); await controller.refresh(); await settle();
+      let copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['standardNote', 'unknownMode', 'combinedSpeedEmpty'])
+        assert.ok(copy.includes(filledCopy(t, `performance.community.${key}`)), `${locale}: ${key}`);
+      dom.find('mode-fast').listeners.click(); await settle(); await settle();
+      copy = renderedCopy(dom); seen.push(...copy);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.fastNote')), locale);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.unknownMode')), locale);
+      assert.ok(dom.root.all().some(node => node.dataset.state === 'empty' && node.textContent === filledCopy(t, 'performance.community.modeEmpty', 'fast')), locale);
+      dom.find('mode-ultrafast').listeners.click(); await settle();
+      dom.find('cancel').listeners.click();
+      copy = renderedCopy(dom); seen.push(...copy);
+      assert.equal(communityStatus(dom).dataset.state, 'cancelled');
+      assert.equal(communityStatus(dom).textContent, filledCopy(t, 'performance.community.cancelled'), locale);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.ultrafastNote')), locale);
+      for (const text of seen) for (const phrase of local)
+        assert.equal(text.includes(phrase), false, `${locale}: community copy "${text}" reuses local "${phrase}"`);
+      if (locale === 'en-US') for (const text of seen)
+        assert.doesNotMatch(text, /measured turns|turns measured|Excluded turns|Saved results|single-response turn/u);
+    } finally { controller.destroy(); ultrafast.resolve(null); }
+  }
+});
+
+test('local mode keeps its measured-turn and saved-result copy byte for byte', async () => {
+  // Literal pins: scoping community copy must not change the local view's text.
+  const pinned = {
+    standardNote: 'Only Standard mode measurements.',
+    fastNote: 'Only Fast mode measurements. Coverage may be sparse; hollow points have fewer than 5 measured turns.',
+    ultrafastNote: 'Only Ultrafast mode measurements. Coverage may be sparse; hollow points have fewer than 5 measured turns.',
+    unknownMode: 'Excluded turns (unknown or mixed speed mode): 2.',
+    modeEmpty: 'No Fast mode measurements in this period. Try a longer period or another mode.',
+    combinedSpeedEmpty: 'No output-speed measurement for this model in this period. Compatible response timing or a complete single-response turn without tools is required.',
+    cancelled: 'Measurement update cancelled. Saved results remain visible when available.',
+  };
+  for (const locale of SUPPORTED_LOCALES) {
+    const t = (key, values) => translate(key, values, locale);
+    const expected = Object.fromEntries(LOCAL_ONLY_PERFORMANCE_KEYS.map(key => [key, filledCopy(t, `performance.${key}`, key === 'modeEmpty' ? 'fast' : 'standard')]));
+    if (locale === 'en-US') assert.deepEqual(expected, pinned);
+    const community = LOCAL_ONLY_PERFORMANCE_KEYS.flatMap(key => PERFORMANCE_MODES.map(mode => filledCopy(t, `performance.community.${key}`, mode)));
+    const dom = focusHarness(), ultrafast = Promise.withResolvers();
+    const { client } = performanceClient((period, { speedMode }) => {
+      if (speedMode === 'ultrafast') return ultrafast.promise;
+      if (speedMode === 'fast') return modePayload(period, speedMode, { models: [], excludedUnknownTurns: 2 });
+      const data = modePayload(period, speedMode, { excludedUnknownTurns: 2 });
+      Object.assign(data.models[0], { speedTurns: 0, speed: [] });
+      return data;
+    });
+    const controller = mountModelPerformance({ ...dom, client, t });
+    const seen = [];
+    try {
+      dom.show(); await controller.refresh(); await settle();
+      let copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['standardNote', 'unknownMode', 'combinedSpeedEmpty']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      dom.find('mode-fast').listeners.click(); await settle(); await settle();
+      copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['fastNote', 'unknownMode', 'modeEmpty']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      dom.find('mode-ultrafast').listeners.click(); await settle();
+      controller.cancel();
+      copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['ultrafastNote', 'cancelled']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      for (const text of seen) for (const phrase of community)
+        assert.equal(text.includes(phrase), false, `${locale}: local copy "${text}" borrows community "${phrase}"`);
+    } finally { controller.destroy(); ultrafast.resolve(null); }
   }
 });
