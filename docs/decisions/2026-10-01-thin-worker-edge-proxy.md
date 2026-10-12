@@ -774,9 +774,13 @@ These are deliberate and accepted with this record:
   from the live commit (recommended).
 - OD-E3: whether to authorize the optional live check against the GCP test
   project (a GCP write, with a separately authorized write tier).
-- OD-E4: the admin, export, security-reset, performance and Apple and Google
-  sign-in routes stay outside the fast path. CR-6 and CR-7 own them before any
-  gcp switch.
+- OD-E4: the admin, export, security-reset and Apple and Google sign-in
+  routes stay outside the fast path. CR-6 and CR-7 own them before any gcp
+  switch. The accountless performance intake routes (grant, capabilities and
+  reports) left this list on 2026-10-10: the owner restored them at the origin,
+  and in gcp mode the edge forwards them like every other registry route
+  ([forwarded requests](#forwarded-requests)). The performance consent route
+  stays retired at the origin.
 - OD-E5: re-derive EP-1, and `EDGE_PRE_ADMISSION_GUARDS`, if production's
   admission call sites or the request-only guards ahead of them change before
   the switch.
