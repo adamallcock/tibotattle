@@ -336,9 +336,10 @@ const CALL_SHAPES: readonly (readonly [RegExp, (match: RegExpExecArray) => strin
     (match) => `public_read public_aggregate_read null ${match[1]}`,
   ],
 ];
-// Thirteen today: eleven attempt calls (deviceSyncPrincipal counted once for
-// its twelve routes), one upload ingress call and one public read call.
-const EXPECTED_CALL_SITES = 13;
+// Fourteen today: eleven attempt calls (deviceSyncPrincipal counted once for
+// its twelve routes), one upload ingress call and two public read calls
+// (handleCommunityDaily and handleCommunityModelPerformance).
+const EXPECTED_CALL_SITES = 14;
 // Ten today: the handlers that reach assertAttemptAllowed through
 // deviceSyncPrincipal (the two domain handlers serve two route ids each).
 const EXPECTED_WRAPPER_CALL_SITES = 10;
@@ -632,7 +633,7 @@ describe("edge admission policy shape", () => {
       "upload_ingress/upload_ingress/UPLOAD_INGRESS_REQUEST_RATE_LIMIT/UPLOAD_INGRESS_CLIENT_RATE_LIMIT":
         ["contributions"],
       "public_read/public_aggregate_read/null/PUBLIC_READ_RATE_LIMIT":
-        ["community_daily"],
+        ["community_daily", "community_model_performance"],
     });
   });
 });
@@ -680,8 +681,8 @@ describe("edge admission derivation probe through handleRequest", () => {
       }
     }
     expect(mismatches).toEqual([]);
-    // 24 routes; performance reports and both day-manifest routes admit GET and POST.
-    expect(admittedPairs).toBe(27);
+    // 25 routes; performance reports and both day-manifest routes admit GET and POST.
+    expect(admittedPairs).toBe(28);
   });
 
   it("fails on a wrong client binding for an upload ingress entry and an attempt entry", async () => {
@@ -744,7 +745,7 @@ async function doctoredExtraAdmission(request: Request, env: Env): Promise<void>
 }
 `;
     expect(ratchetViolations(doctored).join("\n"))
-      .toContain(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found 14`);
+      .toContain(`expected ${EXPECTED_CALL_SITES} address-keyed helper call sites, found ${EXPECTED_CALL_SITES + 1}`);
   });
 
   it("fails on a doctored copy that changes a call-site purpose or binding", () => {
@@ -879,13 +880,22 @@ describe("evaluateEdgeAdmission", () => {
   }
 
   it("allows with the admission.ts keys for each helper", async () => {
-    for (const routeId of ["enroll", "device_sync_state", "contributions", "community_daily"]) {
+    for (const routeId of ["enroll", "device_sync_state", "contributions", "community_daily",
+      "community_model_performance"]) {
       const entry = edgeAdmissionPolicyFor(routeId)!;
       const { result, calls } = await evaluate(routeId);
       expect(result, routeId).toEqual({ purpose: entry.purpose, outcome: "allowed" });
       expect(Object.isFrozen(result), routeId).toBe(true);
       expect(calls, routeId).toEqual(await expectedKeys(entry));
     }
+  });
+
+  it("spends one per-client budget for both public reads (owner decision 2026-10-10)", async () => {
+    const daily = await evaluate("community_daily");
+    const performance = await evaluate("community_model_performance");
+    expect(performance.result).toEqual(daily.result);
+    expect(performance.calls).toEqual(daily.calls);
+    expect(performance.calls.map((call) => call.binding)).toEqual(["PUBLIC_READ_RATE_LIMIT"]);
   });
 
   it("reports a coarse limit without ever calling the client limiter", async () => {
