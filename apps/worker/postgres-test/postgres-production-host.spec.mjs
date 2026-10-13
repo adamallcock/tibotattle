@@ -31,7 +31,10 @@
 // TELEMETRY_TRANSPORT_BLOCKED on the grant, capabilities and report upload
 // while the runtime is staged (counted, never granted, never a 5xx), then,
 // after the owner-only activation task (SPD-G5) runs through the admin
-// action, a 201 grant and a 200 capability.
+// action, a 201 grant and a 200 capability; and (FIX-FUTURE-V12) the
+// released desktop client meets a v1.2 day after the server's UTC day plus
+// one as a paced 429 that its scheduler waits out without pausing, then
+// resumes from its kept journal once the day is admissible.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -44,6 +47,14 @@ import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { verifyEdgeOriginBeforeGcp } from "../scripts/production-edge-mode.mjs";
+import {
+  canonicalTelemetryV12Json,
+  telemetryV12DayManifestDigestInput,
+  telemetryV12RequiredConsent,
+} from "@app-usagemonitor/telemetry-contract";
+import { runTelemetryV12Sync } from "../test/helpers/contribution-v12-runner.js";
+import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
+import { createAccountlessContributionScheduler } from "../../../src/application/accountless-contribution-scheduler.js";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -274,8 +285,8 @@ function base64UrlJson(value) {
 }
 
 /** A signed-shape synthetic ID token; Cloud Run's front end replaces the signature. */
-function identityToken(email) {
-  const now = Math.floor(Date.now() / 1000);
+function identityToken(email, nowMs = Date.now()) {
+  const now = Math.floor(nowMs / 1000);
   return [
     base64UrlJson({ alg: "RS256", kid: "0".repeat(40), typ: "JWT" }),
     base64UrlJson({ aud: AUDIENCE, azp: "100000000000000000000", email, email_verified: true, exp: now + 3_000,
@@ -291,9 +302,10 @@ function frontEndToken(bearer) {
   return `${scheme} ${header}.${payload}.SIGNATURE_REMOVED_BY_GOOGLE`;
 }
 
-function edgeHeaders({ email = INVOKER, hostKind = "apex", admission = null, requestId = randomUUID() } = {}) {
+function edgeHeaders({ email = INVOKER, hostKind = "apex", admission = null, requestId = randomUUID(),
+  tokenNowMs = Date.now() } = {}) {
   return {
-    "x-serverless-authorization": frontEndToken(`Bearer ${identityToken(email)}`),
+    "x-serverless-authorization": frontEndToken(`Bearer ${identityToken(email, tokenNowMs)}`),
     "x-tibotattle-edge-host": hostKind,
     "x-tibotattle-edge-request-id": requestId,
     ...(admission === null ? {} : { "x-tibotattle-edge-admission": admission }),
@@ -1111,4 +1123,204 @@ test("admin run_maintenance reports and audits the folded purges under the Worke
   assert.equal(next.details.expiredIdentityHandoffsPurged, 0);
   assert.deepEqual(await countRows(), { apple: 0, google: 0, windows: 0, unused: 0 });
   assert.doesNotMatch(JSON.stringify([first, repeat, next]), /synthetic-admin-maint|owner@/u, "content-free");
+}));
+
+// FIX-FUTURE-V12 (owner decision 2026-10-12, no new client): the released
+// desktop client's own transport and accountless scheduler (origin/main =
+// v0.1.28) against the composed origin. A day later than the server's UTC day
+// plus one is the paced 429; the client classifies it as a retryable
+// service_unavailable that honours retry-after, keeps its resumable day journal
+// and the earlier staged days, and the scheduler waits instead of pausing.
+// Once the day is admissible the same journal resumes and activates.
+const DAY_MS = 86_400_000;
+const ACCOUNTLESS_V12_AUTHORIZATION = Object.freeze({
+  schemaVersion: "accountless-upload-owner-v1.2",
+  policyVersion: "accountless-telemetry-v1.2-policy-v1",
+  authorizationBasis: "accountless-policy-v1.2",
+  telemetrySchemaVersion: "telemetry-contribution-v1.2",
+});
+const PUBLIC_ORIGIN = "https://tibotattle.com";
+
+const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
+const utcDay = (epoch) => new Date(epoch).toISOString().slice(0, 10);
+
+/** One deterministic local v1.2 day in the client's wire form (edge-origin-e2e makeV12Day). */
+function releasedClientDay(day, count, parserVersion) {
+  const consent = telemetryV12RequiredConsent();
+  const records = Array.from({ length: count }, (_, index) => ({
+    schemaVersion: "usage-event-v1.2",
+    eventId: `event:v2:${sha256Hex(`future-day-bound:${parserVersion}:${day}:${index}`)}`,
+    eventTime: `${day}T12:${String(10 + index).padStart(2, "0")}:00.000Z`,
+    sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b", provider: "openai_codex", modelId: "gpt-5.6-sol",
+    speedMode: "standard", apiServiceTier: "default", surface: "local_interactive_unclassified",
+    billingSurface: "chatgpt_subscription", reasoningEffort: "high", agentScope: "root", outcome: "completed",
+    totalInputContextTokens: 1000,
+    components: { inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: 75 },
+    accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null, planBasis: "same_source_occurrence",
+      planType: "pro", planEraId: null },
+    boundaryFlags: null, tieOrder: null, cacheWriteTtl: null,
+  }));
+  const chunks = count === 0 ? [] : [{
+    schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64), chunkId: `usage:${day}:0`,
+    chunkRevision: 1, chunkDigest: sha256Hex(canonicalTelemetryV12Json(records)), parserVersion, consent, records,
+  }];
+  const manifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion, consent,
+    chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
+      recordCount: chunk.records.length })),
+    excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
+}
+
+/**
+ * The released client's fetch, delivered as the edge forwards it: the public
+ * origin to the local listener under the run.app Host, with the edge's
+ * admission outcome for the route's purpose (src/edge-admission-policy.ts)
+ * and an ID token minted at `tokenClock()`.
+ */
+function releasedClientFetch(port, log, tokenClock) {
+  const admissionFor = (path) => {
+    if (path === "/api/v1/contributions") return "v1;upload_ingress;allowed";
+    if (path === "/api/v1/accountless/telemetry-v1.2-authorization") return "v1;accountless_ownership;allowed";
+    if (["/api/v1/device/upload-authorizations", "/api/v1/envelope-key"].includes(path)) return null;
+    return "v1;device_sync;allowed";
+  };
+  return async (url, init = {}) => {
+    const target = new URL(url);
+    assert.equal(target.origin, PUBLIC_ORIGIN);
+    const headers = Object.fromEntries(new Headers(init.headers ?? {}));
+    const body = init.body === undefined ? undefined : String(init.body);
+    const answer = await send(port, { method: init.method ?? "GET", path: target.pathname + target.search, body,
+      headers: { ...headers, ...edgeHeaders({ admission: admissionFor(target.pathname), tokenNowMs: tokenClock() }),
+        ...(body === undefined ? {} : { "content-length": String(Buffer.byteLength(body)) }) } });
+    log.push({ path: target.pathname, status: answer.status });
+    return new Response([204, 205, 304].includes(answer.status) ? null : answer.text, {
+      status: answer.status,
+      headers: Object.entries(answer.headers).flatMap(([name, value]) =>
+        (Array.isArray(value) ? value : [value]).map((item) => [name, item])),
+    });
+  };
+}
+
+test("FIX-FUTURE-V12: the released client meets a future day as a paced 429, keeps its journal and resumes once admissible", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ base, t, port }) => {
+  const realNow = Date.now();
+  await base.query(`UPDATE ${t("telemetry_v12_runtime")} SET state='active', changed_at=$1 WHERE id=1`,
+    [new Date(realNow).toISOString()]);
+  await base.query(`UPDATE ${t("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`,
+    [new Date(realNow).toISOString()]);
+  // An accountless installation enrolls, binds its owner and takes the v1.2 grant, as Electron does.
+  const log = [];
+  // The edge mints its ID token on the real clock: EP-6 verifies it on the
+  // clock the origin captured at start, which the Date mock below leaves real.
+  const realClock = Date.now;
+  const fetchImpl = releasedClientFetch(port, log, realClock);
+  const deviceId = randomUUID();
+  const secret = randomBytes(32);
+  const deviceAuthorization = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
+  const post = (path, value, headers = {}) => fetchImpl(new URL(path, PUBLIC_ORIGIN), { method: "POST",
+    headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(value) });
+  const enrolled = await send(port, { method: "POST", path: "/api/v1/accountless/enrollment",
+    headers: { ...edgeHeaders({ admission: "v1;enrollment;allowed" }), "content-type": "application/json" },
+    body: JSON.stringify({ schemaVersion: "accountless-enrollment-v0.1", deviceId,
+      deviceSecretHash: deviceSecretHash(deviceId, secret).toString("hex"),
+      policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" }) });
+  assert.equal(enrolled.status, 201, enrolled.text);
+  const owned = await send(port, { method: "POST", path: "/api/v1/accountless/ownership",
+    headers: { ...edgeHeaders({ admission: "v1;accountless_ownership;allowed" }), "content-type": "application/json",
+      authorization: deviceAuthorization },
+    body: JSON.stringify({ schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" }) });
+  assert.equal(owned.status, 201, owned.text);
+  const granted = await post("/api/v1/accountless/telemetry-v1.2-authorization", ACCOUNTLESS_V12_AUTHORIZATION,
+    { authorization: deviceAuthorization });
+  assert.equal(granted.status, 201, await granted.clone().text());
+  const participantId = (await base.query(`SELECT participant_id FROM ${t("accountless_upload_owners")}
+    WHERE enrollment_device_id = $1`, [deviceId])).rows[0].participant_id;
+
+  // The local index holds yesterday, today and a day two days ahead of the server.
+  const today = utcDay(realNow);
+  const dayAt = (offset) => utcDay(Date.parse(`${today}T00:00:00.000Z`) + offset * DAY_MS);
+  const records = new Map([[dayAt(-1), 2], [dayAt(0), 1], [dayAt(2), 3]]);
+  const parserVersion = "synthetic-future-day-bound";
+  const readDay = (day) => releasedClientDay(day, records.get(day) ?? 0, parserVersion);
+  let saved = null;
+  const progressStore = { read: async () => saved, write: async (value) => { saved = value; } };
+  let envelopeKey;
+  const createEnvelope = async (chunk) => {
+    envelopeKey ??= await (await fetchImpl(new URL("/api/v1/envelope-key", PUBLIC_ORIGIN),
+      { headers: { accept: "application/json" } })).json();
+    return createTelemetryV12Envelope({ chunk, publicJwk: envelopeKey.publicJwk, keyId: envelopeKey.keyId,
+      cryptoImpl: webcrypto });
+  };
+  const sync = (clock) => runTelemetryV12Sync({
+    serverBaseUrl: PUBLIC_ORIGIN, deviceAuthorization, authorization: ACCOUNTLESS_V12_AUTHORIZATION,
+    production: true, days: [...records.keys()].sort(), readDay, createEnvelope, fetchImpl, clock,
+    progressStore, sourcePublication: { fingerprint: "synthetic-future-day-bound", parserVersion },
+    maxDurationMs: 240_000,
+  });
+  const v12State = async () => (await base.query(`SELECT
+      (SELECT COALESCE(jsonb_agg(to_char(chunk_day, 'YYYY-MM-DD') ORDER BY chunk_day), '[]'::jsonb)
+         FROM ${t("telemetry_v12_day_manifests")} WHERE participant_id = $1) AS manifests,
+      (SELECT count(*)::int FROM ${t("telemetry_v12_chunks")} WHERE participant_id = $1) AS chunks,
+      (SELECT count(*)::int FROM ${t("telemetry_v12_domains")} WHERE participant_id = $1) AS domains`,
+  [participantId])).rows[0];
+
+  // First pass on the real clock: every day through tomorrow is staged, the
+  // day two days ahead is refused, nothing activates.
+  const first = await sync(() => Date.now());
+  assert.equal(first.status, "failed", JSON.stringify(first));
+  assert.equal(first.failure.code, "service_unavailable");
+  assert.equal(first.failure.retryable, true);
+  assert.equal(first.failure.deviceUnavailable, false);
+  const admissibleAt = Date.parse(`${dayAt(1)}T00:00:00.000Z`);
+  assert.ok(Number.isSafeInteger(first.failure.retryAfterMilliseconds));
+  assert.ok(first.failure.retryAfterMilliseconds >= admissibleAt - Date.now() - 2_000
+    && first.failure.retryAfterMilliseconds <= admissibleAt - realNow + 1_000,
+  "retry-after names the instant the day becomes admissible");
+  assert.equal(first.stagedDays, 3);
+  assert.equal(first.chunksUploaded, 2);
+  assert.equal(first.domainGenerationId, null);
+  const refusal = log.filter((entry) => entry.path === "/api/v1/device/telemetry/v1.2/day-manifests"
+    && entry.status === 429);
+  assert.equal(refusal.length, 1, "one manifest refusal, and no chunk of the refused day was sent");
+  assert.deepEqual(await v12State(), { manifests: [dayAt(-1), dayAt(0), dayAt(1)], chunks: 2, domains: 0 });
+  assert.equal(saved?.days?.length, 3, "the resumable journal keeps the three staged days");
+
+  // The released accountless scheduler waits for the retry-after: no pause.
+  let scheduled = null;
+  const scheduler = createAccountlessContributionScheduler({
+    origin: PUBLIC_ORIGIN,
+    readPreference: async () => ({ available: true, current: true, enabled: true,
+      policyVersion: "accountless-opt-out-v1", destinationOrigin: PUBLIC_ORIGIN }),
+    runner: async () => first,
+    setTimer: (callback, delay) => { scheduled = delay; return { unref() {} }; },
+    clearTimer: () => {},
+  });
+  scheduler.start();
+  const waiting = await scheduler.runNow();
+  assert.equal(waiting.state, "retry_wait", "the released scheduler waits; it does not pause sharing");
+  assert.ok(scheduled >= first.failure.retryAfterMilliseconds);
+  assert.equal(scheduler.inspectDiagnostics().lastFailureCode, "transient_failure");
+  await scheduler.stop();
+
+  // Once the server's UTC day is tomorrow, the day is admissible: the same
+  // journal resumes, only the new day's chunk is uploaded, and the domain activates.
+  mock.timers.enable({ apis: ["Date"], now: admissibleAt + 30_000 });
+  try {
+    const resumed = await sync(() => Date.now());
+    assert.equal(resumed.status, "complete", JSON.stringify(resumed.failure));
+    assert.equal(resumed.chunksUploaded, 1);
+    assert.equal(resumed.acknowledgedThroughDay, dayAt(2));
+    assert.ok(resumed.domainGenerationId);
+  } finally {
+    mock.timers.reset();
+  }
+  assert.deepEqual(await v12State(),
+    { manifests: [dayAt(-1), dayAt(0), dayAt(1), dayAt(2)], chunks: 3, domains: 1 });
 }));

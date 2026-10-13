@@ -189,7 +189,9 @@
  * (`unlinkedTypedOwners`, eligible typed participants without an active owner
  * link; `unlinkedBlockedDays`, the computed days they withheld, 0 when each is
  * excluded on every such day: EXCL-UNLINKED, round 19; `terminalOwners`;
- * `nonEffectiveUnread`), and the revision floor it
+ * `nonEffectiveUnread`; `deferredFutureDays`, the queued days after the run's
+ * UTC day, which it neither plans nor publishes and carries as blocked:
+ * FIX-FUTURE-V12, 2026-10-12), and the revision floor it
  * read (REV-SEED `revisionFloor`: present, dayCount and maxRevision; 0 and 0
  * when absent), and the first-run baseline it read (R19 `baseline`: firstRun
  * and frozenInterimRead, booleans).
@@ -281,6 +283,7 @@ export {
   analyticsRefreshSlots,
   ANALYTICS_REFRESH_READ_CONCURRENCY,
   mergeAnalyticsRefreshOccurrencePart,
+  analyticsRefreshDeferFutureDays,
   analyticsRefreshPublicationDays,
   analyticsRefreshRangeChunks,
   analyticsRefreshReadSpans,
@@ -400,7 +403,7 @@ export const ANALYTICS_REFRESH_READ_CONNECTIONS = POOL_MAX - 1;
 const READ_STATEMENT_TIMEOUT_MILLISECONDS = 120_000;
 const READ_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "unlinkedBlockedDays", "terminalOwners",
-  "nonEffectiveUnread"]);
+  "nonEffectiveUnread", "deferredFutureDays"]);
 /**
  * The content-free counts of the performance stage's read and fold
  * (outputs.performance.summary): reports and cohorts read, unknown, mixed

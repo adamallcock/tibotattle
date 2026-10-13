@@ -2321,11 +2321,11 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
 function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"],
-  exclusionRead = undefined, ownerSetRead = undefined, outputsOverride = undefined } = {}) {
+  exclusionRead = undefined, ownerSetRead = undefined, outputsOverride = undefined, journalPages = undefined } = {}) {
   const calls = { owners: 0, queued: [], occurrences: [], counts: [], firstEvidence: [], devices: [], compute: null,
     loaded: new Map(), exclusions: 0 };
   const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
-  const pages = new Map([
+  const pages = journalPages ?? new Map([
     [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
     [5, { days: ["2026-03-02", "2026-09-29"], lastSequence: 9, terminalOwners: [], events: 4, complete: true }],
   ]);
@@ -2531,7 +2531,7 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual(outputs.journal, { lastSequence: 9 });
   assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2026-02-13", cacheBandsFromDay: "2026-02-20" });
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, unlinkedBlockedDays: 0, terminalOwners: 1,
-    nonEffectiveUnread: 0 });
+    nonEffectiveUnread: 0, deferredFutureDays: 0 });
   assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
   // N-EXCL: read once, unchanged and empty: nothing reaches A-2 and nothing extra is queued.
@@ -2539,6 +2539,36 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual([...calls.compute.exclusions], []);
   assert.equal(outputs.exclusionsSha256, NO_EXCLUSIONS);
   assert.deepEqual(outputs.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
+});
+
+// FIX-FUTURE-V12 (decision 2026-10-12): a queued day after the run's UTC day
+// is neither planned, read, computed nor published. It is carried as blocked
+// (with a carried and a newly journaled future day), and the read range, the
+// evidence counts and A-2's queue all end today.
+test("default wiring: queued days after today are deferred, carried as blocked and never read", async () => {
+  const journalPages = new Map([[0, { days: ["2026-09-30", "2026-10-03"], lastSequence: 4, terminalOwners: [],
+    events: 4, complete: true }]]);
+  const { calls, modules } = wiringModules({ journalPages, ownerAEvidence: ["2026-09-29", "2026-10-03"] });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const state = specState({ cursor: null, carriedBlockedDays: ["2026-10-02"], cacheFloorDay: "2026-02-20" });
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state });
+  assert.equal(utcDay(WIRING_NOW_MS), "2026-10-01");
+  assert.deepEqual(inputs.queuedDays, ["2026-09-30"]);
+  assert.deepEqual(inputs.deferredDays, ["2026-10-02", "2026-10-03"]);
+  assert.equal(inputs.occurrenceRange.throughDay, "2026-10-01", "the range ends today");
+  assert.ok(calls.counts.length > 0 && calls.counts.every((call) => call.throughDay <= "2026-10-01"));
+  assert.ok(calls.occurrences.every((call) => call.throughDay <= "2026-10-01"));
+  assert.deepEqual([...inputs.ownerEvidence.get(OWNER_A).keys()], ["2026-09-29"], "future evidence is not counted");
+  assert.deepEqual(calls.ownerSets, ["2026-09-30"]);
+  assert.deepEqual([...calls.devices[0].keys()], ["2026-09-30"]);
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 1 });
+  assert.deepEqual(calls.compute.queuedDays, ["2026-09-30"]);
+  assert.deepEqual([...calls.loaded.get(OWNER_A).keys()], ["2026-09-29"], "no future day is loaded");
+  assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-09-30"]);
+  // The stub's own blocked day stays; both future days are carried for the next run.
+  assert.deepEqual(outputs.blockedDays, ["2026-04-10", "2026-10-02", "2026-10-03"]);
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, unlinkedBlockedDays: 0, terminalOwners: 0,
+    nonEffectiveUnread: 0, deferredFutureDays: 2 });
 });
 
 test("default wiring: a linked owner's active exclusions reach A-2, and a changed table queues every published day", async () => {
@@ -2941,7 +2971,7 @@ test("default wiring: an unlinked typed owner blocks every queued day; a non-eff
   assert.deepEqual(outputs.dailyCandidates, []);
   assert.deepEqual(outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
-    nonEffectiveUnread: 1 });
+    nonEffectiveUnread: 1, deferredFutureDays: 0 });
 
   // The same refusal for an effective owner fails the run: at its count
   // (read) and, should only its read refuse, at its load (compute).
@@ -3008,7 +3038,7 @@ test("default wiring: an exclusion lifts an unlinked typed participant's block o
   assert.deepEqual(none.published, []);
   assert.deepEqual(none.outputs.blockedDays, all);
   assert.deepEqual(none.outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
-    nonEffectiveUnread: 0 });
+    nonEffectiveUnread: 0, deferredFutureDays: 0 });
   // The unlinked participant reaches no A-2 input, and no id leaves the reader.
   assert.deepEqual([...none.calls.compute.exclusions], []);
   assert.equal(JSON.stringify(none.outputs.readSummary).includes("participant"), false);
@@ -3111,6 +3141,13 @@ test("cache horizon and day spans: history is retained back to the floor; reads 
   assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published), ["2026-09-01", "2026-09-30"]);
   assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published, { exclusionsChanged: true }),
     ["2026-08-01", "2026-09-01", "2026-09-28", "2026-09-30"]);
+  // FIX-FUTURE-V12: days after today are deferred, today itself publishes.
+  assert.deepEqual(job.analyticsRefreshDeferFutureDays(["2026-09-30", "2026-10-01", "2026-10-02", "2027-01-01"],
+    "2026-10-01"), { publishable: ["2026-09-30", "2026-10-01"], deferred: ["2026-10-02", "2027-01-01"] });
+  assert.deepEqual(job.analyticsRefreshDeferFutureDays([], "2026-10-01"), { publishable: [], deferred: [] });
+  for (const [days, today] of [[["2026-10-32"], "2026-10-01"], [["2026-10-01"], "2026-10-1"], ["2026-10-01", "2026-10-01"]]) {
+    assert.throws(() => job.analyticsRefreshDeferFutureDays(days, today), { code: "ANALYTICS_V2_REFRESH_STATE_INVALID" });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -3235,6 +3272,44 @@ for (const correctionRuntime of ["active", "staged"]) {
     });
   });
 }
+
+// FIX-FUTURE-V12 (decision 2026-10-12) over the real A-1 readers and A-2
+// compute: a run on D2 neither plans nor publishes D3, carries it as blocked
+// and writes no owner-scoped row after its day; the run on D3's next day
+// publishes it normally.
+test("PG17 FIX-FUTURE-V12: a queued day after the run's UTC day is deferred, carried and published once past", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("future-days", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active",
+      legacyScope: true });
+    const pipeline = realPipeline();
+    const { D2, D3 } = seedFixture;
+    const latestOwnerDay = async () => (await pool.query(`SELECT to_char(max(day), 'YYYY-MM-DD') AS day
+      FROM ${quoted(schema, "analytics_v2_owner_day")}`)).rows[0].day;
+
+    const early = await runJob({ schema, now: `${D2}T12:00:00.000Z`, pipeline });
+    assert.equal(early.state, "complete");
+    assert.equal(early.deferredFutureDays, 1);
+    assert.equal(early.published.includes(D3), false);
+    assert.ok(early.blocked.includes(D3), "the deferred day is carried as blocked");
+    assert.equal((await publishedRows(pool, schema)).has(D3), false);
+    assert.ok((await latestOwnerDay()) <= D2, "no owner-day row after the run's day");
+    const runs = await runRows(pool, schema);
+    assert.ok(runs.at(-1).publication.blocked.includes(D3));
+
+    // The deferred day is no longer in the future: it publishes from the carry.
+    const later = await runJob({ schema, now: seedFixture.NOW, pipeline });
+    assert.equal(later.state, "complete");
+    assert.equal(later.deferredFutureDays, 0);
+    assert.ok(later.published.includes(D3), JSON.stringify(later.published));
+    assert.equal(later.blocked.includes(D3), false);
+    assert.equal((await publishedRows(pool, schema)).get(D3).revision, 1);
+    assert.equal(await latestOwnerDay(), D3);
+  });
+});
 
 // N-EXCL (round 5: "their use in GCP analytics"; D-PT4X's read contract): an
 // active community_weekly exclusion leaves its owner out of each covered day's

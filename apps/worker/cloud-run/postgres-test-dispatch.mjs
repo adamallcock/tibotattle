@@ -16,6 +16,10 @@ import {
   POSTGRES_SCHEMA_RECEIPT_MAJOR,
   readSchemaReceipt,
 } from "../src/postgres-schema-receipt.ts";
+import {
+  TELEMETRY_V12_FUTURE_DAY_REFUSAL,
+  telemetryV12FutureDayRetryAfterSeconds,
+} from "../src/telemetry-v12-day-bound.ts";
 
 const SCHEMA_IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
@@ -1631,6 +1635,14 @@ function createPostgresTestV12ContributionHandler({
     );
     const chunk = await validateTelemetryV12StagedChunk(plaintext);
     const { day } = parseTelemetryV12ChunkId(chunk.chunkId);
+    // The future-day bound (decision 2026-10-12) before any read or object
+    // write: nothing is stored, and the preamble abandons the claim.
+    const notYet = telemetryV12FutureDayRetryAfterSeconds(day, Date.now());
+    if (notYet !== null) {
+      throw Object.assign(new Error(TELEMETRY_V12_FUTURE_DAY_REFUSAL.code), {
+        ...TELEMETRY_V12_FUTURE_DAY_REFUSAL, responseHeaders: { "retry-after": String(notYet) },
+      });
+    }
     const chunkRowId = "chunk:" + crypto.randomUUID();
     const objectKey = "telemetry/v12-" + crypto.randomUUID();
     input = Object.freeze({

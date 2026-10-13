@@ -428,6 +428,24 @@ export function analyticsRefreshPublicationDays(journalDays, state, { exclusions
 }
 
 /**
+ * FIX-FUTURE-V12 (owner decision 2026-10-12,
+ * docs/decisions/2026-10-12-v12-future-day-bound.md): a run never plans or
+ * publishes a day after the server's current UTC day. `days` (ascending) is
+ * split at `today`: the publishable days, and the deferred future days, which
+ * the run reports among its blocked days (a blocked day is not consumed), so
+ * the next run queues them again until they are no longer in the future and
+ * then publishes them normally. A deferred day is never written, so a head
+ * published for it before this rule keeps its row.
+ */
+export function analyticsRefreshDeferFutureDays(days, today) {
+  if (!Array.isArray(days) || !days.every(isDay) || !isDay(today)) fail("ANALYTICS_V2_REFRESH_STATE_INVALID");
+  return Object.freeze({
+    publishable: Object.freeze(days.filter((day) => day <= today)),
+    deferred: Object.freeze(days.filter((day) => day > today)),
+  });
+}
+
+/**
  * The content-free summary of one run's community aggregate exclusions
  * (N-EXCL): rows of every state, active rows, owners of the run that have an
  * active exclusion, whether the table changed since the last completed run,
@@ -945,17 +963,23 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         .map((owner) => exclusions.activeByParticipant.get(owner.participantId)));
       const exclusionsChanged = exclusions.sha256 !== state.appliedExclusionsSha256;
       const journal = await readJournal(context, state.cursor);
-      const unchangedDays = analyticsRefreshPublicationDays(journal.days, state);
-      const days = analyticsRefreshPublicationDays(journal.days, state, { exclusionsChanged });
-      if (days.length > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
+      const queuedDays = analyticsRefreshPublicationDays(journal.days, state, { exclusionsChanged });
+      if (queuedDays.length > ANALYTICS_REFRESH_MAX_QUEUED_DAYS) fail("ANALYTICS_V2_REFRESH_QUEUE_CAPACITY_EXCEEDED");
       const today = utcDay(nowMs);
+      // FIX-FUTURE-V12: only days through today are planned, read, computed
+      // or published; later queued days are deferred and carried as blocked.
+      const { publishable: days, deferred: deferredDays } = analyticsRefreshDeferFutureDays(queuedDays, today);
+      const unchangedDays = analyticsRefreshDeferFutureDays(
+        analyticsRefreshPublicationDays(journal.days, state), today).publishable;
       const ownerList = [...listing.owners].sort(compareOwners);
       // Production has no lower bound on cache history: start at the first
       // evidence day of any effective owner, whatever the queue holds.
       let firstEvidenceDay = null;
       const effectiveList = ownerList.map((owner, ownerIndex) => ({ owner, ownerIndex }))
         .filter(({ owner }) => owner.source === "effective");
-      const planThroughDay = days.reduce((latest, day) => day > latest ? day : latest, today);
+      // Every publishable day is at most today, so the plan ends today
+      // (FIX-FUTURE-V12; it ran through the latest queued day before).
+      const planThroughDay = today;
       const ownerPlans = new Map();
       const firstDays = await analyticsRefreshForEachConcurrent(effectiveList, readConcurrency,
         async ({ owner, ownerIndex }) => {
@@ -1142,6 +1166,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         cacheFromDay,
         devicesByDay,
         queuedDays: days,
+        deferredDays,
         ownerSetState,
         loadSavedContributions,
         firstEvidenceDay,
@@ -1202,6 +1227,10 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           blockedDays: [...new Set([...outputs.blockedDays, ...withheld.map((candidate) => candidate.day)])].sort(),
         };
       }
+      // FIX-FUTURE-V12: the deferred future days are blocked, so the next run
+      // queues them again; none was computed, so none is a candidate.
+      const blockedDays = publication.blockedDays ?? outputs.blockedDays;
+      const deferredDays = inputs.deferredDays ?? [];
       // The performance stage runs after computeAnalyticsV2 returns, outside
       // it, so the daily, preview and owner outputs (and their goldens) are
       // the same with or without it. A withheld fold affects only the
@@ -1211,6 +1240,8 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       return {
         ...outputs,
         ...publication,
+        ...(deferredDays.length === 0 ? {}
+          : { blockedDays: [...new Set([...blockedDays, ...deferredDays])].sort() }),
         ...(performanceOutputs === null ? {} : { performance: performanceOutputs }),
         // The journal position is the reader's, not the pure compute core's.
         journal: { lastSequence: inputs.lastSequence },
@@ -1222,6 +1253,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           unlinkedBlockedDays,
           terminalOwners: inputs.terminalOwners,
           nonEffectiveUnread: inputs.nonEffectiveUnread,
+          deferredFutureDays: deferredDays.length,
         },
         // N-EXCL: what the run applied, for the run row and the receipt.
         exclusionsSha256: inputs.exclusionsSha256,
