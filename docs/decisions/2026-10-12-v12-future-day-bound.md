@@ -174,6 +174,18 @@ unchanged, and the
 [community model speed decision](./2026-10-10-community-model-speed.md#live-based-deploy-candidate-amendment-2026-10-12)
 records the same entry.
 
+## Persistent-skew hold accepted (2026-10-12)
+
+On 2026-10-12 the owner accepted the recommendation to keep this policy with
+the open-ended hold that [Residual cost](#residual-cost) describes. A device
+whose clock stays two or more days ahead of UTC stays held for as long as its
+clock stays wrong: it never activates, and none of its usage is published,
+including days it has already staged. The server cannot identify or release
+such a device. The exclusion of a client change stands, so no client will bound
+its own day vector. Reopening that needs a new owner decision. The
+[runbook](../runbooks/gcp-brake-and-incidents.md#future-dated-v12-days)
+signals for recognising the persistent case are unchanged.
+
 ## Gates not covered here
 
 - Origin roll, kernel 18 activation and the post-roll reprice (owner-run).
