@@ -400,9 +400,16 @@ claim is abandoned. The released client treats the answer as a retryable
 `service_unavailable`, waits for `retry-after` without pausing and keeps its
 journal. The analytics refresh never plans or publishes a day after its UTC day:
 later queued days are carried as blocked and counted in the receipt's
-`deferredFutureDays` until they are past. The
-[decision](../../docs/decisions/2026-10-12-v12-future-day-bound.md) records the
-status choice and the residual activation hold for a refused device.
+`deferredFutureDays` until they are past. The released client cannot activate
+past a refused day, because its day vector always ends at its latest local day.
+A one-off future day holds the device until that day is admissible. A device in
+use whose clock stays two or more days ahead of UTC is refused on every pass and
+never activates, so none of its usage is published, including earlier days it
+has already staged. It stays in a transient `retry_wait`, not a pause, and
+retries at each `retry-after` (at most weekly) until its clock is corrected. A
+clock one to two days ahead delays activation intermittently.
+The [decision](../../docs/decisions/2026-10-12-v12-future-day-bound.md) records
+the status choice and this residual activation hold.
 
 ## GCP analytics read bounds
 

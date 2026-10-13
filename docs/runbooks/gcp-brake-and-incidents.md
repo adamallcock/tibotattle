@@ -226,7 +226,7 @@ Classify before mutating, and use the least control that contains the harm.
 | A day stays blocked on its saved owner set: the receipt's `ownerSets.memberLinkUnavailableDays` or `memberContributionUnavailableDays` names it | A saved member off the roster has no owner link left (its participant was deleted outside the offline purge), so its exclusions cannot be read; or its stored contribution is not foldable under the run's kernel | The run row's `publication.ownerSets` (days and counts only) | The day keeps its prior head; nothing is folded blind or as zero. A missing link is resolved by the offline purge (PURGE-1, `not built`), which removes the member and republishes the day; an unfoldable contribution by the reprice path (K-REPRICE, `not built`). Saved rows cannot be edited or deleted outside the purge |
 | Days stay blocked and the refresh receipt shows `unlinkedTypedOwners` above 0 and `unlinkedBlockedDays` above 0 | An eligible participant with typed evidence has no active owner link. As at d43c8f92, it withholds every computed day, except a day an active `community_weekly` exclusion of that participant covers (owner decision round 19: it is outside that day's cohort) | The run row and receipt (counts only); `unlinkedBlockedDays` is 0 when every such participant is excluded on every computed day | Each withheld day keeps its prior head. Diagnose why the link is absent before acting; never write a link, infer a digest or drop the participant by hand. An active exclusion covering the days lifts the block for those days only, and a revoked one lifts nothing. GCP has no exclusion writer yet: the table holds the cutover import only |
 | The refresh receipt shows `deferredFutureDays` above 0, and those days stay in `blocked` | Queued days after the run's UTC day: v1.2 rows admitted before the future-day bound, or a journal event naming such a day. The refresh never plans or publishes a day after today ([decision](../decisions/2026-10-12-v12-future-day-bound.md)) | The receipt and the run row's `publication.blocked` (days only); the [future-dated aggregates](#future-dated-v12-days) | None needed: each day is carried and publishes on the first run after it is no longer in the future. A head published for it before the bound keeps its row until then. Never edit the carried days or the source rows by hand |
-| Desktop clients get `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` on v1.2 day manifests or chunks | The client sent a day later than the server's UTC day plus one: its clock or source timestamps are ahead | Origin request logs (code and route class only); the [future-dated aggregates](#future-dated-v12-days) | Expected behaviour. The released client retries at the `retry-after` without pausing and keeps its journal; it cannot activate later days until the refused day is admissible. Do not widen the bound without an owner decision |
+| Desktop clients get `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` on v1.2 day manifests or chunks | The client sent a day later than the server's UTC day plus one: its clock or source timestamps are ahead. A burst that stops after its `retry-after` is a one-off future day. Refusals that recur on successive days are a device whose clock stays ahead ([recognising persistent skew](#future-dated-v12-days)) | Origin request logs (code, status and route class only); the [future-dated aggregates](#future-dated-v12-days) | Expected behaviour, but the hold differs. A one-off day holds the device's activation until that day is admissible. A device whose clock stays two or more days ahead is refused on every pass while in use and never activates: none of its usage is published, including days it already staged. It shows a transient `retry_wait`, not a pause, and retries at each `retry-after` until its clock is corrected. Server signals cannot identify the device, and only a client change can lift the hold, which the owner excluded. Do not widen the bound without an owner decision |
 | Origin 5xx, connection errors, slow queries | Cloud SQL saturation, a long transaction, the refresh job's read snapshot holding the horizon | Instance metrics; `pg_stat_activity` classes; job executions | Pause the refresh trigger; the refresh writes in one transaction. Scale the instance only as an owner decision |
 | Admin host returns `403 ACCESS_REQUIRED` or `503 ADMIN_NOT_CONFIGURED` | The Access chokepoint refused, or the Access settings are absent from the edge | `edge_admin_chokepoint_refused` log, Access application and owner pin | Diagnose Access separately; do not widen the chokepoint |
 | An unauthenticated request to the Cloud Run URL gets anything other than Google's 403 | The origin lock is broken: ingress or invoker IAM changed | The service's IAM policy and ingress setting | Treat as a security incident. The owner removes the unexpected binding or restores the ingress setting by hand, because OPS-2 apply never deletes, then reads the estate back. Brake if exposure is confirmed |
@@ -247,6 +247,27 @@ mirroring d43c8f92) refuses every v1.2 owner without it. Production always has
 the row (the cutover's usage-correction stage requires exactly one, and a
 trigger makes it immutable); a schema built from migrations alone, such as a
 test seed, must insert it before a refresh.
+
+**Recognising persistent skew.** The released client cannot activate past a
+refused day, and its day vector always ends at its latest local day. A device
+whose clock stays two or more days ahead is therefore refused on every pass
+while it is in use. It never activates, so none of its usage is published,
+including days it already staged. The decision record's residual cost section
+has the full account. Signals are content-free and cannot name the device:
+
+- Origin request logs (`code`, `status` and `routeClass` only) show
+  `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` on route class
+  `telemetry_v12_day_manifests` recurring on successive UTC days, at intervals
+  of about a day to a week, instead of one burst that stops once its
+  `retry-after` has passed.
+- A refused day is never stored, so the aggregates below cannot show it. They
+  show only admitted rows: new admissions reach at most the day after the
+  current UTC day, and rows further ahead predate the bound.
+
+There is no server-side remedy. The device resumes from its kept journal once
+its clock is corrected. Only a client change could lift the hold, and the owner
+excluded one ("No new client"). Do not widen the bound, edit rows or relabel
+days to release such a device.
 
 To size stored future-dated rows, an owner runs these read-only statements
 through the reviewed read-only database access, never as the runtime role and

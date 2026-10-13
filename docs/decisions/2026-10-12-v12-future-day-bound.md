@@ -82,18 +82,46 @@ client's journal keeps them for the next pass.
 Every answer, 429 included, holds that device's next domain activation until
 the refused day is admissible. The released client activates one contiguous
 vector of days and needs a candidate for each day in it, so it cannot skip the
-refused day. In practice:
+refused day. Its vector always ends at the device's latest local data day:
+`src/contribution/telemetry-sync-protocol.js` takes the later of the active
+`throughDay` and the last day `reader.days()` returns, and that reader has no
+clock bound. Local days are dated from the timestamps of the device's own
+sources. Activation is reached only after every day in the vector has been
+registered. How long the hold lasts therefore depends on whether the skew is a
+one-off or persistent:
 
-- a device whose clock is correct, or ahead by less than a day, is never
-  refused;
-- a device with a day two to eight days ahead resumes once, when that day
-  becomes admissible;
-- a device with a day further ahead re-polls at most once every seven days and
-  activates nothing new until the day is admissible. Before this change it was
-  accepted and its future days were published.
+- A device whose clock is correct, or ahead by less than a day, is never
+  refused.
+- A one-off future day holds the device once, for example after a clock that
+  was briefly wrong has been corrected. If the day is two to eight days ahead,
+  the device resumes at the `retry-after`, when that day becomes admissible. If
+  it is further ahead, the device re-polls at most once every seven days until
+  then.
+- A device whose clock stays two or more days ahead of UTC is held
+  indefinitely while it is in use. Each new local day it records lies past the
+  server's UTC day plus one when it is recorded, so every pass ends in a refused
+  day and activation is never reached. None of its usage reaches publication,
+  including the earlier days it has already staged on the server. It retries at
+  each `retry-after`, which is about every (skew minus one) days: near daily
+  when the skew is about two days, and at most weekly when it is larger. Its
+  accountless scheduler shows a transient `retry_wait`, not a pause, and nothing
+  asks the user to act. The hold ends when the clock is corrected, or, while
+  the clock stays wrong, only after the device records no usage for longer than
+  about (skew minus one) days. The next pass then resumes from the kept journal
+  and activates.
+- A device whose clock stays between about one and two days ahead is held
+  intermittently. Its latest local day lies past the bound only during the part
+  of each server day when its local date is two days ahead. A pass whose vector
+  ends on an admissible day still activates, so publication is delayed rather
+  than stopped.
 
-Removing this cost needs a client that bounds its own day vector, which the
-owner excluded.
+Before this change, all of these devices' future days were accepted and
+published. Content-free server signals cannot say which device is held; the
+[runbook](../runbooks/gcp-brake-and-incidents.md#future-dated-v12-days)
+describes how to recognise the persistent case. Removing the hold needs a client
+that bounds its own day vector, which the owner excluded ("No new client"). That
+decision accepts that a persistently skewed device stays held for as long as its
+clock stays wrong, not for one retry.
 
 ## Existing rows
 
@@ -137,4 +165,4 @@ as every kernel change does.
 - Origin roll, kernel 18 activation and the post-roll reprice (owner-run).
 - Running the existing-row aggregate against production (owner-run, read-only).
 - A refused day's activation hold, described above, cannot be removed without a
-  client change.
+  client change. For a device whose clock stays ahead, the hold is open-ended.
