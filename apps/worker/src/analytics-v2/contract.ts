@@ -23,8 +23,20 @@
 
 import type { PostgresPool } from "../postgres-client";
 import type { WorkerRouteMethod } from "../route-registry";
+// Type-only (esbuild erases it): the community model performance publication's
+// shapes live with its store-side plumbing, which stays outside the kernel
+// closure (cloud-run/analytics-kernel-closure.mjs; the registry check asserts it).
+import type {
+  AnalyticsV2PerformanceOutputs,
+  AnalyticsV2PerformancePublicationSummary,
+} from "./performance-publication-contract";
 
-/** Version of this contract; bump with any name or shape change. */
+/**
+ * Version of this contract; bump with any name or shape change. The optional
+ * performance fields below (SPD-P3) are additive and leave it unchanged: the
+ * version feeds the pin fingerprint (pin.ts), and a run without performance
+ * outputs is byte-identical to one before them.
+ */
 export const ANALYTICS_V2_CONTRACT_VERSION = "analytics-v2-contract-v0.6" as const;
 
 /**
@@ -601,6 +613,12 @@ export interface AnalyticsV2PublicationSummary {
   readonly blocked: readonly AnalyticsV2Day[];
   /** What the published days recorded in their owner sets (E-OWNERSET). */
   readonly ownerSets: AnalyticsV2OwnerSetWriteSummary;
+  /**
+   * The community model performance heads' content-free outcome (slots,
+   * withhold code, deferred first publication), present only when the run
+   * carried performance outputs (AnalyticsV2RunOutputs.performance).
+   */
+  readonly performance?: AnalyticsV2PerformancePublicationSummary;
 }
 
 /** The owner-set rows one run's publications appended (counts and days only). */
@@ -658,6 +676,15 @@ export interface AnalyticsV2RunOutputs {
    * `resources` and `owners`). Optional for callers that compute no owner.
    */
   readonly resources?: AnalyticsV2RunResources;
+  /**
+   * The twelve community-model-performance-v1 candidates, or a closed
+   * withhold code, from the performance fold (compute-performance.ts). The
+   * refresh Job folds them after computeAnalyticsV2 returns, outside it, so a
+   * run without the performance stage carries none and its outputs, goldens
+   * and pin fingerprints are unchanged. The store charges the candidates to
+   * the run's output account once and records them in the run row.
+   */
+  readonly performance?: AnalyticsV2PerformanceOutputs;
 }
 
 /** analytics_v2_runs.timings.resources: the bounds one run applied. */
@@ -698,7 +725,10 @@ export interface AnalyticsV2OwnerResources {
  * outputBudgetBytes is the budget the account was held to: the configured
  * output budget, or, when the run reclaimed the unused per-owner budget,
  * that plus the memory budget less the largest admitted estimate
- * (resources.ts analyticsV2OutputBudget).
+ * (resources.ts analyticsV2OutputBudget). When the run carries performance
+ * outputs, the store charges their candidates against the same budget (their
+ * only charge: the fold runs without an account) and the run row records
+ * accountBytes with them included (store-run.ts prepareOutputs).
  */
 export interface AnalyticsV2OutputAccount {
   readonly heldInputBytes: number;

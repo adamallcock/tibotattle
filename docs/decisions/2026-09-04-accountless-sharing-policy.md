@@ -149,8 +149,12 @@ switch.
 - **Round 19 (2026-10-03): retired routes answer production's codes.** The
   owner replaced round 12's fixed answers for two retirements:
   - *Accountless performance authorization*
-    (`POST /api/v1/accountless/telemetry-performance-authorization`). The
-    origin now runs production's own checks before its terminal answer, in
+    (`POST /api/v1/accountless/telemetry-performance-authorization`).
+    *Reversed on 2026-10-10:* the grant, capability and report routes are
+    served again, and this terminal answer no longer applies; see the
+    [performance sharing amendment](#performance-sharing-amendment-2026-10-10).
+    The round 19 text is kept as the record of that date. The
+    origin then ran production's own checks before its terminal answer, in
     the order of `d43c8f92`
     `handleAccountlessTelemetryPerformanceAuthorization`. The answers are
     `401 AUTH_INVALID` for a session cookie, then the ownership-mode,
@@ -167,10 +171,11 @@ switch.
     Worker's call point. The origin differs from production in two ways:
     1. Production's `requireTelemetryPerformanceStorageMode` check, after the
        bearer, is not reproduced. It reads a D1 table PostgreSQL does not
-       have (the performance tables are not promoted). Production's deployed
-       state passes it, so its `503` never reaches a caller. The origin's
-       storage gate stands in for it, and runs before the ownership mode as
-       on every storage-gated route (OD-CR-6 (iii)). Its `503
+       have (on 2026-10-03 the performance tables were not promoted).
+       Production's deployed state passes it, so its `503` never reaches a
+       caller. The origin's storage gate stands in for it, and runs before
+       the ownership mode as on every storage-gated route (OD-CR-6 (iii)).
+       Its `503
        BACKEND_STORAGE_UNAVAILABLE` therefore comes first only while the
        origin's migration receipt is not current.
     2. Production's deletion-ledger tombstone read, after the bearer, is not
@@ -208,3 +213,38 @@ switch.
 
     The 5xx alert never excludes the two upload paths, because every live
     v1 upload shares them.
+
+## Performance sharing amendment (2026-10-10)
+
+The owner decided on 2026-10-10 that activating the accountless daily
+performance stream needs no new first-run, Settings or public privacy wording.
+The disclosure requirement above continues to govern accountless usage
+collection; it does not gate performance activation. Performance sharing still
+follows the global sharing preference and its persistent opt-out, and stays
+content-free. The
+[community model speed decision](./2026-10-10-community-model-speed.md) records
+the full set of decisions.
+
+The same decision reverses the Google Cloud cutover's retirement of the
+accountless performance routes in rounds 12 and 19:
+
+- The accountless performance grant
+  (`POST /api/v1/accountless/telemetry-performance-authorization`), the device
+  capability read and the device report routes are ported and served by the
+  origin's performance route family. The grant is no longer a terminal
+  `403 TELEMETRY_TRANSPORT_BLOCKED`. Until the owner activates the performance
+  runtime, an authenticated grant, capability read or report upload still
+  answers that 403 and nothing is granted or stored.
+- The signed-in performance consent route
+  (`POST /api/v1/me/device-telemetry-performance-consents`) stays retired with
+  social sign-in, answering `503 POSTGRES_ROUTE_NOT_PORTED`.
+- The performance tables now have a PostgreSQL target (primary migration
+  `0079_performance_telemetry.sql`), so round 19's first difference no longer
+  applies: the origin runs its own performance storage check after the bearer.
+  Round 19's second difference still applies: the origin has no deletion
+  ledger, and a deleted participant has no active device credential.
+- No new disclosure wording accompanies the restoration or the activation.
+  Rounds 12 and 16 are otherwise unchanged.
+
+This amendment is source authority for the Google Cloud origin line. It is not
+evidence that a migration, deployment or activation has happened.

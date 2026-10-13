@@ -29,7 +29,12 @@
  *      every read stays in this thread: the Workers' loads run concurrently on
  *      the snapshot connections and are streamed to them a read call at a
  *      time; either way owners are merged in digest order, so the outputs are
- *      identical. The exporting transaction stays open until the last read;
+ *      identical. Then, outside A-2 and still in the snapshot, the
+ *      community model performance stage (SPD-P3) streams the current
+ *      performance reports page by page (performance-source.ts) into the
+ *      fold (compute-performance.ts), applying the same community aggregate
+ *      exclusions; a withheld fold changes only the performance publication.
+ *      The exporting transaction stays open until the last read;
  *   4. write everything with store.ts writeRunOutputs in ONE transaction on
  *      the same session (with the price rows the prepared-day observer
  *      attributed, the kernel's price cards and the proven transitions, which
@@ -396,6 +401,13 @@ const READ_STATEMENT_TIMEOUT_MILLISECONDS = 120_000;
 const READ_LOCK_TIMEOUT_MILLISECONDS = 5_000;
 const READ_SUMMARY_KEYS = Object.freeze(["unlinkedTypedOwners", "unlinkedBlockedDays", "terminalOwners",
   "nonEffectiveUnread"]);
+/**
+ * The content-free counts of the performance stage's read and fold
+ * (outputs.performance.summary): reports and cohorts read, unknown, mixed
+ * and other turns left out, and days after the publication's end.
+ */
+const PERFORMANCE_READ_SUMMARY_KEYS = Object.freeze(["reports", "cohorts", "excludedUnknownTurns",
+  "deferredFutureDays"]);
 const MIB = 1_024 * 1_024;
 const ENV_DECIMAL = /^(?:0|[1-9]\d{0,9})$/u;
 // Cloud Run job names: a DNS label starting with a letter (CR-3's pattern).
@@ -1087,9 +1099,14 @@ async function defaultCreatePool(database, { connector }) {
 }
 
 
-/** Load the store and the default pipeline (bundled by esbuild from these literals). */
+/**
+ * Load the store and the default pipeline (bundled by esbuild from these
+ * literals), with the community model performance stage: the A-1
+ * performance reader and the fold (both kernel closure roots).
+ */
 export async function loadAnalyticsV2Modules() {
-  const [store, owners, occurrences, devices, queuedDays, compute, ownerSets] = await Promise.all([
+  const [store, owners, occurrences, devices, queuedDays, compute, ownerSets, performanceSource,
+    performanceCompute] = await Promise.all([
     import("../src/analytics-v2/store.ts"),
     import("../src/analytics-v2/owners.ts"),
     import("../src/analytics-v2/occurrence-source.ts"),
@@ -1097,10 +1114,13 @@ export async function loadAnalyticsV2Modules() {
     import("../src/analytics-v2/queued-days.ts"),
     import("../src/analytics-v2/compute.ts"),
     import("../src/analytics-v2/owner-sets.ts"),
+    import("../src/analytics-v2/performance-source.ts"),
+    import("../src/analytics-v2/compute-performance.ts"),
   ]);
   return Object.freeze({
     store,
-    pipeline: createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets }),
+    pipeline: createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets,
+      performance: { source: performanceSource, compute: performanceCompute } }),
   });
 }
 
@@ -1226,6 +1246,17 @@ export function createAnalyticsRefreshTimeGuard({ startedAtMs, taskTimeoutMs, wa
           const step = model.stepFactor * model.modelMsPerAnalysisUsage
             * analysisUsageOf(event.ownerIndex ?? ownerIndex) / 70;
           if (at + step > refuseAtMs()) refuse("ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED", at, step);
+          break;
+        }
+        case "performance": {
+          // The performance fold (after compute, before the write): a
+          // records progress mark or the start of one of its twelve slots.
+          // Optional in the time model: no measured rate projects it, so it
+          // refuses only once the refusal point has passed (checked above).
+          if (!((event.phase === "records" && Number.isSafeInteger(event.records) && event.records > 0)
+              || (event.phase === "slot" && Number.isSafeInteger(event.index) && event.index >= 0 && event.index < 12))) {
+            fail("ANALYTICS_V2_REFRESH_DEADLINE_INVALID");
+          }
           break;
         }
         default:
@@ -1361,6 +1392,29 @@ function safeCode(error, fallback) {
  */
 function defaultPeakRssBytes() {
   return process.resourceUsage().maxRSS * 1024;
+}
+
+/**
+ * The receipt's performance block (closed keys, counts, slot names and a
+ * closed code; never an id): the read and fold counts
+ * (PERFORMANCE_READ_SUMMARY_KEYS), the slots published (`period:speedMode`),
+ * the unchanged slot count, the fold's withhold code and whether the store
+ * deferred an all-empty first publication. Empty for a run without the
+ * performance stage, so its receipt is unchanged.
+ */
+function performanceReceipt(outputs, publication) {
+  if (outputs === undefined || publication === undefined || publication === null) return {};
+  const summary = outputs?.summary ?? {};
+  return {
+    performance: Object.freeze({
+      ...Object.fromEntries(PERFORMANCE_READ_SUMMARY_KEYS.map((key) => [key, summary[key]])
+        .filter(([, value]) => Number.isSafeInteger(value) && value >= 0)),
+      published: Object.freeze([...publication.published]),
+      unchanged: publication.unchanged.length,
+      withheld: publication.withheld,
+      deferredEmpty: publication.deferredEmpty,
+    }),
+  };
 }
 
 /**
@@ -1738,6 +1792,8 @@ export async function runAnalyticsRefresh({
         exclusions: exclusionSummary(outputs.exclusions),
         prices: priceSummary(written.prices),
         timeGuard: guard.summary(),
+        // SPD-P3: only when the run carried performance outputs.
+        ...performanceReceipt(outputs.performance, written.publication.performance),
       });
     }
   } catch (error) {

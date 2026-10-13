@@ -1,6 +1,6 @@
 import {
   PERFORMANCE_BUCKET_SCHEME_VERSION,
-  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21,
   PERFORMANCE_PRIVACY_CONTRACT_VERSION,
   PERFORMANCE_RECORD_SCHEMA_VERSION,
   TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
@@ -82,6 +82,14 @@ export interface TelemetryRuntimeActivationResult {
 
 const MAX_REVISION = 2_147_483_647;
 const ACTIVATION_SCHEMA_VERSION = "telemetry-runtime-activation-v1";
+// The legacy Cloudflare Worker is pinned to the dictionary and v1 bucket scheme
+// it shipped with; it does not follow the client's moving default.  On this
+// line the D1 performance schema (ingestion-isolation 0009) seeds and admits
+// 2026-09-21.1, and the SQL CHECK pinned below names performance-histogram-v1.
+const LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-21.1" =
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21;
+const LEGACY_PERFORMANCE_BUCKET_SCHEME_VERSION: "performance-histogram-v1" =
+  PERFORMANCE_BUCKET_SCHEME_VERSION;
 export const EXPECTED_PRIMARY_MIGRATIONS = Object.freeze([
   Object.freeze({
     name: "0006_usage_correction_facts.sql",
@@ -744,7 +752,7 @@ async function assertPrimarySchemaIsComplete(
         "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'telemetry_performance_reports'",
       ).first<{ sql: string }>();
       if (!performanceSql?.sql
-          || !performanceSql.sql.includes(`bucket_scheme_version TEXT NOT NULL CHECK (bucket_scheme_version = '${PERFORMANCE_BUCKET_SCHEME_VERSION}')`)
+          || !performanceSql.sql.includes(`bucket_scheme_version TEXT NOT NULL CHECK (bucket_scheme_version = '${LEGACY_PERFORMANCE_BUCKET_SCHEME_VERSION}')`)
           || !performanceSql.sql.includes("measurement_version TEXT NOT NULL CHECK (measurement_version = 'model-performance-samples-v1')")) {
         unavailableActivation();
       }
@@ -926,7 +934,7 @@ function assertUsageTuple(row: UsageRuntimeRow): void {
 
 function assertPerformanceTuple(row: PerformanceRuntimeRow): void {
   if (row.schema_version !== PERFORMANCE_RECORD_SCHEMA_VERSION
-      || row.field_dictionary_version !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || row.field_dictionary_version !== LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
       || row.privacy_contract_version !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
       || row.method_version !== "performance-daily-histogram-v1") unavailableActivation();
 }
@@ -992,7 +1000,7 @@ function activationMutation(
     now,
     input.expectedRevision,
     PERFORMANCE_RECORD_SCHEMA_VERSION,
-    PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
     PERFORMANCE_PRIVACY_CONTRACT_VERSION,
     "performance-daily-histogram-v1",
     controlsRevision,

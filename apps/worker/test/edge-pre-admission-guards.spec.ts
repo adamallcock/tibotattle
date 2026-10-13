@@ -255,8 +255,8 @@ describe("edge pre-admission guards against handleRequest", () => {
       }
     }
     expect(mismatches).toStrictEqual([]);
-    // 24 routes; performance reports and both day-manifest routes have two methods.
-    expect(comparisons).toBe(27 * VARIANTS.length);
+    // 25 routes; performance reports and both day-manifest routes have two methods.
+    expect(comparisons).toBe(28 * VARIANTS.length);
     // Every guard kind refused something, and nothing outside the map did.
     expect([...guardedLocal.keys()].sort())
       .toStrictEqual(["contribution_preflight", "same_origin", "session_cookie"]);

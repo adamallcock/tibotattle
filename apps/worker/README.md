@@ -653,4 +653,53 @@ inner side of a nested loop.
 `scripts/classification-activation-scale-bench.mjs` reports
 local, aggregate-only statement timings at synthetic scale; it is evidence, not
 a gate. Migration, image rollout and installed-client acceptance remain separate
-operational gates. GCP performance admission stays retired.
+operational gates.
+
+## GCP primary migrations 0077 to 0079
+
+The PostgreSQL primary chain continues after `0076` with three forward-only,
+additive migrations. Each is source until an owner-authorized migrate and roll
+applies it.
+
+- `0077_analytics_v2_reprice.sql` adds the bounded historical spend repricing
+  archive, run ledger, immutable price proofs and former-publication log
+  ([repricing runbook](../../docs/runbooks/2026-10-09-historical-spend-repricing.md)).
+- `0078_classification_link_lookup_indexes.sql` adds the classification-link
+  lookup indexes that domain activation probes per corrected row.
+- `0079_performance_telemetry.sql` restores the accountless daily
+  model-performance intake and adds its community publication heads (owner
+  decisions of 2026-10-10). Its number is provisional; the integrator
+  renumbers it with its pin set if the live head already holds 0079 or higher.
+
+## Community model speed on the GCP origin
+
+The [community model speed decision](../../docs/decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)
+reverses the cutover's retirement of GCP performance admission. On the origin:
+
+- The `performance` route class serves the accountless grant
+  (`POST /api/v1/accountless/telemetry-performance-authorization`), the device
+  capability read and the device report routes through
+  `cloud-run/routes/performance-telemetry.mjs`, plus the public
+  `GET /api/v1/community/model-performance` read. The signed-in consent route
+  stays retired. The admin class gains the read-only
+  `GET /api/v1/admin/performance-intake`. The origin registry holds 53 routes.
+- Until the owner activates the performance runtime (seeded `staged` by 0079),
+  authenticated intake answers `403 TELEMETRY_TRANSPORT_BLOCKED`. Activation is
+  the owner-only `run_maintenance` runtime activation task
+  ([activation runbook](../../docs/runbooks/2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation));
+  there is no admin UI control.
+- The analytics-refresh Job gains a performance stage that publishes twelve
+  `community-model-performance-v1` slots. Its fold and reader are kernel
+  closure inputs, so the stage ships under a new analytics kernel registry
+  entry, and the reprice Job runs under that kernel right after the roll
+  ([rollout](../../docs/runbooks/gcp-rollout.md#migration-0079-community-model-speed)).
+- The ops runtime probe gains `performance_newest_accepted_report_age_seconds`
+  and `community_model_performance_head_age_days`.
+
+The D1 Worker keeps its own pinned performance path and answers the two new
+routes without a PostgreSQL source: a public read that passes the method,
+public-analytics, publication-control, limiter and query gates answers
+`404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`, and the admin view answers
+`503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` on the admin host. The PostgreSQL
+performance specs run in `npm run postgres:domain:check` under the standard
+local PostgreSQL environment.

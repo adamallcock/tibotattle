@@ -64,11 +64,11 @@ test("the probe names are closed, split by job, and carry no ledger, tombstone, 
     "analytics_journal_lag_sequences", "analytics_journal_oldest_undelivered_age_seconds",
     "analytics_journal_pending_events", "analytics_refresh_completed_age_seconds", "backup_audit_level",
     "backup_last_automated_age_hours", "backup_pitr_enabled", "community_daily_head_age_days",
-    "database_conflicts_total", "database_deadlocks_total", "database_mxid_age", "database_size_bytes",
+    "community_model_performance_head_age_days", "database_conflicts_total", "database_deadlocks_total", "database_mxid_age", "database_size_bytes",
     "database_xid_age", "idle_in_transaction_sessions", "ingestion_journal_head_age_seconds",
     "ingestion_journal_head_sequence", "lock_waiting_sessions", "log_redaction_marker",
     "log_redaction_posture", "maintenance_completed_age_seconds", "oldest_transaction_age_seconds",
-    "v12_newest_ready_manifest_age_seconds",
+    "performance_newest_accepted_report_age_seconds", "v12_newest_ready_manifest_age_seconds",
   ]);
   for (const name of contract.OPS_PROBE_NAMES) {
     assert.doesNotMatch(name, /ledger|tombstone|replay|erasure|cooldown/u, name);
@@ -88,6 +88,15 @@ test("the probe names are closed, split by job, and carry no ledger, tombstone, 
     assert.equal(Object.isFrozen(frozen), true);
   }
   assert.equal(contract.OPS_BACKLOG_CAP, 10_001);
+  // The two performance liveness signals: runtime-probe gauges with no class, cap, codes or marker.
+  assert.deepEqual({ ...contract.OPS_PROBES.performance_newest_accepted_report_age_seconds }, {
+    job: "ops-runtime-probe", kind: "gauge", unit: "seconds", perClass: false, capped: false, codes: false,
+    marker: false, values: null,
+  });
+  assert.deepEqual({ ...contract.OPS_PROBES.community_model_performance_head_age_days }, {
+    job: "ops-runtime-probe", kind: "gauge", unit: "days", perClass: false, capped: false, codes: false,
+    marker: false, values: null,
+  });
 });
 
 test("the source files name no retired ledger, tombstone, replay or erasure-job signal", async () => {
@@ -435,6 +444,8 @@ function healthy(override = () => undefined, { allowed = true, sessions = [] } =
     if (text.includes('"analytics_v2_runs"')) return rows([{ age: "120" }]);
     if (text.includes('"analytics_v2_published_daily"')) return rows([{ age: "1" }]);
     if (text.includes('"telemetry_v12_day_manifests"')) return rows([{ age: "300" }]);
+    if (text.includes('"telemetry_performance_receipts"')) return rows([{ age: "180" }]);
+    if (text.includes('"analytics_v2_published_performance"')) return rows([{ heads: "12", dated: "12", age: "1" }]);
     if (text.includes("LEFT JOIN LATERAL")) {
       return rows([{ sequence: "500", recorded_ms: String(NOW - 3_000), now_ms: String(NOW) }]);
     }
@@ -477,6 +488,8 @@ test("a healthy run writes one ok line per signal, from the sources it names", a
   assert.equal(value("analytics_refresh_completed_age_seconds"), 120);
   assert.equal(value("community_daily_head_age_days"), 1);
   assert.equal(value("v12_newest_ready_manifest_age_seconds"), 300);
+  assert.equal(value("performance_newest_accepted_report_age_seconds"), 180);
+  assert.equal(value("community_model_performance_head_age_days"), 1);
   assert.equal(value("ingestion_journal_head_sequence"), 500);
   assert.equal(value("ingestion_journal_head_age_seconds"), 3);
   assert.equal(value("analytics_journal_lag_sequences"), 50);
@@ -541,7 +554,7 @@ test("every statement is a read: a read-only transaction with its two bounds, an
     }
   }
   assert.equal(open, false);
-  assert.equal(begun, 9, "one read-only transaction per group");
+  assert.equal(begun, 11, "one read-only transaction per group");
   const all = texts.join("\n");
   // Content-free: no query text, address, user, client or statement-level view, and no pg_stat_statements.
   assert.doesNotMatch(all, /\b(?:query|client_addr|client_hostname|client_port|usename|usesysid|backend_xid|backend_xmin|pg_stat_statements|pg_stat_ssl|pg_locks|pg_prepared_xacts)\b/iu);
@@ -552,7 +565,7 @@ test("every statement is a read: a read-only transaction with its two bounds, an
   assert.match(all, /LIMIT 10001\n\) bounded/u);
   // Every relation is schema-qualified with the quoted configured schema.
   for (const relation of ["retention_state", "analytics_v2_runs", "analytics_v2_published_daily", "telemetry_v12_day_manifests",
-    "storage_source_state", "storage_ingestion_changes", "analytics_v2_journal_cursor"]) {
+    "telemetry_performance_receipts", "analytics_v2_published_performance", "storage_source_state", "storage_ingestion_changes", "analytics_v2_journal_cursor"]) {
     assert.match(all, new RegExp(`"synthetic_primary"\\."${relation}"`, "u"), relation);
   }
 });
@@ -575,6 +588,8 @@ test("absent tables, missing data and a hidden stats view are unavailable with a
     if (text.includes('"analytics_v2_runs"')) return rows([]);
     if (text.includes('"analytics_v2_published_daily"')) return rows([{ age: null }]);
     if (text.includes('"telemetry_v12_day_manifests"')) throw Object.assign(new Error(SENTINEL), { code: "42703" });
+    if (text.includes('"telemetry_performance_receipts"')) return rows([{ age: null }]);
+    if (text.includes('"analytics_v2_published_performance"')) return rows([{ heads: "0", dated: "0", age: null }]);
     if (text.includes("LEFT JOIN LATERAL")) return rows([]);
     if (text.includes('"analytics_v2_journal_cursor"')) throw absent("analytics_v2_journal_cursor");
     return undefined;
@@ -590,6 +605,9 @@ test("absent tables, missing data and a hidden stats view are unavailable with a
   assert.equal(reasonOf("analytics_refresh_completed_age_seconds"), "NO_DATA");
   assert.equal(reasonOf("community_daily_head_age_days"), "NO_DATA");
   assert.equal(reasonOf("v12_newest_ready_manifest_age_seconds"), "RELATION_ABSENT:42");
+  // No receipt (a staged runtime, or no report yet) and no published head: NO_DATA, never 0.
+  assert.equal(reasonOf("performance_newest_accepted_report_age_seconds"), "NO_DATA");
+  assert.equal(reasonOf("community_model_performance_head_age_days"), "NO_DATA");
   assert.equal(reasonOf("ingestion_journal_head_sequence"), "NO_DATA");
   assert.equal(reasonOf("ingestion_journal_head_age_seconds"), "NO_DATA");
   for (const name of ["analytics_journal_lag_sequences", "analytics_journal_pending_events",
@@ -644,6 +662,93 @@ test("a cursor ahead of its journal is a fault, not a lag", async () => {
   for (const name of ["analytics_journal_lag_sequences", "analytics_journal_pending_events",
     "analytics_journal_oldest_undelivered_age_seconds"]) {
     assert.equal(map.get(name).reason, "UNEXPECTED_RESULT", name);
+  }
+});
+
+test("the performance signals: NO_DATA, RELATION_ABSENT, value parsing and malformed heads, never a false 0", async () => {
+  const run = async (receipts, heads) => byKey(await probe.collectOpsRuntimeSignals({
+    client: fakeClient(healthy((text) => {
+      if (text.includes('"telemetry_performance_receipts"')) return receipts();
+      if (text.includes('"analytics_v2_published_performance"')) return heads();
+      return undefined;
+    })),
+    schema: "synthetic_primary",
+    now: FIXED_CLOCK,
+  }));
+  const RECEIPTS = "performance_newest_accepted_report_age_seconds";
+  const HEADS = "community_model_performance_head_age_days";
+  const stateOf = (map, key) => {
+    const line = map.get(key);
+    if (line.state === "ok") return line.value;
+    assert.equal(Object.hasOwn(line, "value"), false, `${key} carries no value`);
+    return `${line.reason}${line.sqlstate_class === undefined ? "" : `:${line.sqlstate_class}`}`;
+  };
+  const absent = () => { throw Object.assign(new Error(`relation does not exist ${SENTINEL}`), { code: "42P01", detail: SENTINEL }); };
+  const cases = [
+    // Measured values pass through as whole seconds and whole days.
+    [() => rows([{ age: "0" }]), () => rows([{ heads: "12", dated: "12", age: "0" }]), 0, 0],
+    [() => rows([{ age: "86401" }]), () => rows([{ heads: "12", dated: "12", age: "3" }]), 86_401, 3],
+    // Empty sources: the receipts aggregate answers NULL, the heads count 0.
+    [() => rows([{ age: null }]), () => rows([{ heads: "0", dated: "0", age: null }]), "NO_DATA", "NO_DATA"],
+    // A result with no row at all is still NO_DATA, not 0.
+    [() => rows([]), () => rows([]), "NO_DATA", "NO_DATA"],
+    // A schema before 0079: the relation is absent, with its SQLSTATE class.
+    [absent, absent, "RELATION_ABSENT:42", "RELATION_ABSENT:42"],
+    // A receipt or an end day ahead of the database clock reads 0, never negative.
+    [() => rows([{ age: "-4" }]), () => rows([{ heads: "12", dated: "12", age: "-1" }]), 0, 0],
+    // Values the line cannot carry exactly.
+    [() => rows([{ age: "99999999999999999999" }]), () => rows([{ heads: "12", dated: "12", age: "1.5" }]),
+      "VALUE_OUT_OF_RANGE", "VALUE_OUT_OF_RANGE"],
+    // A head whose end is not a day is a fault, never skipped; a count the probe cannot read likewise.
+    [() => rows([{ age: "5" }]), () => rows([{ heads: "12", dated: "11", age: "2" }]), 5, "UNEXPECTED_RESULT"],
+    [() => rows([{ age: "5" }]), () => rows([{ heads: "twelve", dated: "12", age: "2" }]), 5, "UNEXPECTED_RESULT"],
+    [() => rows([{ age: "5" }]), () => rows([{ heads: "1", dated: null, age: null }]), 5, "UNEXPECTED_RESULT"],
+  ];
+  for (const [receipts, heads, expectedReceipts, expectedHeads] of cases) {
+    const map = await run(receipts, heads);
+    assert.equal(stateOf(map, RECEIPTS), expectedReceipts, `${RECEIPTS}: ${expectedReceipts}`);
+    assert.equal(stateOf(map, HEADS), expectedHeads, `${HEADS}: ${expectedHeads}`);
+    // Each signal is its own group: the neighbours still answer.
+    assert.equal(map.get("v12_newest_ready_manifest_age_seconds").value, 300);
+    assert.equal(map.get("ingestion_journal_head_sequence").value, 500);
+    assert.equal(JSON.stringify([...map.values()]).includes(SENTINEL), false);
+  }
+  // Timeouts are their own reasons, inside the same 2000 ms and 500 ms bounds as every other read.
+  const timed = await run(() => { throw Object.assign(new Error(SENTINEL), { code: "57014" }); },
+    () => { throw Object.assign(new Error(SENTINEL), { code: "55P03" }); });
+  assert.equal(stateOf(timed, RECEIPTS), "STATEMENT_TIMEOUT:57");
+  assert.equal(stateOf(timed, HEADS), "LOCK_TIMEOUT:55");
+});
+
+test("the performance reads are one bounded statement each: an index-only max and a scan of at most 12 heads", async () => {
+  const client = fakeClient(healthy());
+  await probe.collectOpsRuntimeSignals({ client, schema: "synthetic_primary", now: FIXED_CLOCK });
+  const texts = client.statements.map((statement) => statement.text);
+  const receipts = texts.filter((text) => text.includes("telemetry_performance_receipts"));
+  const heads = texts.filter((text) => text.includes("analytics_v2_published_performance"));
+  assert.equal(receipts.length, 1, "the receipt age is one statement");
+  assert.equal(heads.length, 1, "the head age is one statement");
+  // max(created_at) with no filter, join or ordering: PostgreSQL answers it from the last
+  // entry of telemetry_performance_receipts_accepted_at (the PostgreSQL spec proves the plan).
+  assert.match(receipts[0], /max\(created_at\)/u);
+  assert.doesNotMatch(receipts[0], /\b(?:WHERE|JOIN|ORDER BY|GROUP BY|count\()/iu);
+  // The heads are the 12 (period, speed mode) slots: one aggregate over the table, the age
+  // from the payload's end day to the UTC date, and the cast only on a day-shaped end.
+  assert.match(heads[0], /payload ->> 'end'/u);
+  assert.match(heads[0], /\(now\(\) AT TIME ZONE 'UTC'\)::date/u);
+  assert.match(heads[0], /CASE WHEN payload ->> 'end' ~ '\^\[0-9\]\{4\}-\[0-9\]\{2\}-\[0-9\]\{2\}\$' THEN/u);
+  assert.doesNotMatch(heads[0], /\b(?:JOIN|ORDER BY|GROUP BY)\b/iu);
+  // Neither read names an owner, device, report or row value.
+  for (const text of [...receipts, ...heads]) {
+    assert.doesNotMatch(text, /participant_id|device_id|report_id|envelope_digest|report_revision|payload_sha256|run_id/u);
+  }
+  // Each runs in its own read-only transaction with both bounds set first.
+  for (const read of [receipts[0], heads[0]]) {
+    const index = texts.indexOf(read);
+    assert.deepEqual(texts.slice(index - 3, index), [
+      "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ", "SET LOCAL statement_timeout = 2000", "SET LOCAL lock_timeout = 500",
+    ]);
+    assert.equal(texts[index + 1], "COMMIT");
   }
 });
 

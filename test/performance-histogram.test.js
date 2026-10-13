@@ -2,14 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PERFORMANCE_HISTOGRAM_POOL_VERSION,
   PERFORMANCE_HISTOGRAM_SCHEME_VERSION,
+  PERFORMANCE_HISTOGRAM_SCHEME_VERSION_V2,
   SPEED_BUCKET_UPPER_CENTI_TPS,
+  SPEED_BUCKET_UPPER_CENTI_TPS_V2,
   TTFT_BUCKET_UPPER_MS,
   TURN_DURATION_BUCKET_UPPER_MS,
   buildPerformanceHistogram,
   mergePerformanceHistograms,
   parsePerformanceHistogram,
+  performanceHistogramPoolQuantiles,
   performanceHistogramQuantiles,
+  poolPerformanceHistograms,
 } from "../packages/telemetry-contract/src/performance-histogram.js";
 
 function expectInvalid(callback) {
@@ -210,7 +215,7 @@ test("parser rejects unsafe, noncanonical, inconsistent, and private-shaped inpu
   const valid = buildPerformanceHistogram("speed", [1, 2]);
   const invalid = [
     { ...valid, extra: 1 },
-    { ...valid, schemaVersion: "performance-histogram-v2" },
+    { ...valid, schemaVersion: "performance-histogram-v3" },
     { ...valid, metric: "private" },
     { ...valid, buckets: { ...valid.buckets, "01": 1 } },
     { ...valid, buckets: { 0: 1, 99: 1 }, sampleCount: 2 },
@@ -316,4 +321,192 @@ test("merge rejects safe-count overflow before producing an unrepresentable tota
   });
   assert.equal(histogram.sampleCount, count);
   expectInvalid(() => mergePerformanceHistograms([histogram, histogram]));
+});
+
+const V2 = PERFORMANCE_HISTOGRAM_SCHEME_VERSION_V2;
+const PERCENTILES = [["p10", 0.1], ["p25", 0.25], ["median", 0.5], ["p75", 0.75], ["p90", 0.9]];
+
+test("v2 keeps every v1 edge and resolves speed above 120 tokens/second", () => {
+  assert.equal(V2, "performance-histogram-v2");
+  assert.equal(SPEED_BUCKET_UPPER_CENTI_TPS_V2.length, 95);
+  assert.deepEqual(SPEED_BUCKET_UPPER_CENTI_TPS_V2.slice(0, 60), SPEED_BUCKET_UPPER_CENTI_TPS);
+  assert.deepEqual(
+    SPEED_BUCKET_UPPER_CENTI_TPS_V2.slice(60, 78),
+    Array.from({ length: 18 }, (_, index) => 13_000 + index * 1_000),
+  );
+  assert.deepEqual(SPEED_BUCKET_UPPER_CENTI_TPS_V2.slice(78, 81), [34_500, 39_675, 45_627]);
+  assert.equal(SPEED_BUCKET_UPPER_CENTI_TPS_V2.at(-1), 322_838);
+  assert.ok(SPEED_BUCKET_UPPER_CENTI_TPS_V2.every((value, index) =>
+    Number.isSafeInteger(value) && (index === 0 || value > SPEED_BUCKET_UPPER_CENTI_TPS_V2[index - 1])));
+
+  const values = [119.99, 120, 129.99, 130, 299.99, 300, 345, 3228.37, 3228.38, 5000];
+  const v1 = buildPerformanceHistogram("speed", values);
+  const v2 = buildPerformanceHistogram("speed", values, V2);
+  assert.equal(v1.schemaVersion, PERFORMANCE_HISTOGRAM_SCHEME_VERSION);
+  assert.deepEqual(v1.buckets, { 59: 1, 60: 9 });
+  assert.equal(v2.schemaVersion, V2);
+  assert.deepEqual(v2.buckets, { 59: 1, 60: 2, 61: 1, 77: 1, 78: 1, 79: 1, 94: 1, 95: 2 });
+  assert.deepEqual([v1.min, v1.max], [v2.min, v2.max]);
+  for (const metric of ["ttft", "turnDuration"]) {
+    const sample = metric === "ttft" ? [0, 1, 499, 500, 1_089_812] : [1, 499, 500, 1_089_812];
+    const left = buildPerformanceHistogram(metric, sample);
+    const right = buildPerformanceHistogram(metric, sample, V2);
+    assert.deepEqual({ ...right, schemaVersion: left.schemaVersion }, left);
+  }
+  expectInvalid(() => buildPerformanceHistogram("speed", [1], "performance-histogram-v3"));
+});
+
+test("each scheme parses only its own bucket range and merges only with itself", () => {
+  const v2Top = buildPerformanceHistogram("speed", [5000], V2);
+  assert.equal(parsePerformanceHistogram(v2Top), v2Top);
+  expectInvalid(() => parsePerformanceHistogram({ ...v2Top, buckets: { 96: 1 } }));
+  expectInvalid(() => parsePerformanceHistogram({ ...v2Top, schemaVersion: PERFORMANCE_HISTOGRAM_SCHEME_VERSION, buckets: { 95: 1 } }));
+  const v1 = buildPerformanceHistogram("speed", [10, 20]);
+  const v2 = buildPerformanceHistogram("speed", [10, 20], V2);
+  expectInvalid(() => mergePerformanceHistograms([v1, v2]));
+  assert.deepEqual(mergePerformanceHistograms([v2, v2Top]).buckets, { 5: 1, 10: 1, 95: 1 });
+  // A v1 overflow singleton must stay at or above 120 tokens/second.
+  const v1Overflow = buildPerformanceHistogram("speed", [500]);
+  expectInvalid(() => parsePerformanceHistogram({ ...v1Overflow, min: 11_999, max: 11_999 }));
+});
+
+test("pools add shared buckets exactly and keep v1 overflow unresolved", () => {
+  const v1 = buildPerformanceHistogram("speed", [50, 130, 900]);
+  const v2 = buildPerformanceHistogram("speed", [50, 130, 900], V2);
+  const pool = poolPerformanceHistograms([v1, v2]);
+  assert.equal(pool.schemaVersion, PERFORMANCE_HISTOGRAM_POOL_VERSION);
+  assert.equal(pool.sampleCount, 6);
+  assert.equal(pool.unresolvedCount, 2);
+  assert.deepEqual(pool.buckets, { 25: 2, 61: 1, 85: 1 });
+  assert.deepEqual([pool.min, pool.max], [5000, 90_000]);
+  assert.deepEqual(poolPerformanceHistograms([pool]), pool);
+  const ttft = poolPerformanceHistograms([
+    buildPerformanceHistogram("ttft", [0, 700]),
+    buildPerformanceHistogram("ttft", [700], V2),
+  ]);
+  assert.equal(ttft.unresolvedCount, 0);
+  assert.deepEqual(ttft.buckets, { 0: 1, 4: 2 });
+  expectInvalid(() => poolPerformanceHistograms([v1, buildPerformanceHistogram("ttft", [1])]));
+  expectInvalid(() => poolPerformanceHistograms([]));
+  expectInvalid(() => poolPerformanceHistograms(new Array(201).fill(v2)));
+  expectInvalid(() => poolPerformanceHistograms([{ ...pool, unresolvedCount: 3 }]));
+  expectInvalid(() => poolPerformanceHistograms([{ ...ttft, unresolvedCount: 1, sampleCount: ttft.sampleCount + 1 }]));
+  expectInvalid(() => poolPerformanceHistograms([{ ...pool, extra: 1 }]));
+  expectInvalid(() => poolPerformanceHistograms([{ ...pool, buckets: { 96: 4 } }]));
+});
+
+test("pools reject extrema that disagree with their evidence", () => {
+  const pool = (overrides) => ({
+    schemaVersion: PERFORMANCE_HISTOGRAM_POOL_VERSION,
+    metric: "speed",
+    sampleCount: 5,
+    buckets: { 0: 5 },
+    unresolvedCount: 0,
+    min: 0,
+    max: 200,
+    ...overrides,
+  });
+  assert.equal(poolPerformanceHistograms([pool({})]).sampleCount, 5);
+  const forged = [
+    pool({ min: 500_000, max: 500_000 }),
+    pool({ min: 0, max: 0 }),
+    pool({ max: 201 }),
+    pool({ metric: "ttft", min: 5, max: 5 }),
+    pool({ metric: "turnDuration", buckets: { 1: 5 }, min: 0, max: 400 }),
+    pool({ sampleCount: 4, buckets: { 90: 1 }, unresolvedCount: 3, min: 0, max: 12_000 }),
+    pool({ sampleCount: 3, buckets: {}, unresolvedCount: 3, min: 11_000, max: 20_000 }),
+    pool({ sampleCount: 6, buckets: { 70: 1 }, unresolvedCount: 5, min: 100, max: 30_000 }),
+    pool({ sampleCount: 1, buckets: { 0: 1 }, min: 10, max: 150 }),
+    pool({ sampleCount: 2, buckets: { 0: 1 }, unresolvedCount: 1, min: 0, max: 11_999 }),
+  ];
+  for (const value of forged) {
+    expectInvalid(() => poolPerformanceHistograms([value]));
+    expectInvalid(() => performanceHistogramPoolQuantiles(value));
+  }
+  // Unresolved mass may supply either extreme without contradicting evidence.
+  const mixed = pool({ sampleCount: 3, buckets: { 70: 1 }, unresolvedCount: 2, min: 12_500, max: 90_000 });
+  assert.equal(poolPerformanceHistograms([mixed]).unresolvedCount, 2);
+  const quantiles = performanceHistogramPoolQuantiles(mixed);
+  assert.ok(quantiles.median.lower <= quantiles.median.upper);
+});
+
+test("pool paging is order and grouping invariant", () => {
+  const random = seededRandom(0x5eed_2026);
+  const pages = Array.from({ length: 9 }, (_, index) => buildPerformanceHistogram(
+    "speed",
+    Array.from({ length: 1 + Math.floor(random() * 20) }, () => 5 + random() * 900),
+    index % 2 === 0 ? PERFORMANCE_HISTOGRAM_SCHEME_VERSION : V2,
+  ));
+  const flat = poolPerformanceHistograms(pages);
+  const grouped = poolPerformanceHistograms([
+    poolPerformanceHistograms(pages.slice(0, 4)),
+    poolPerformanceHistograms(pages.slice(4)),
+  ]);
+  const reversed = poolPerformanceHistograms([...pages].reverse());
+  assert.deepEqual(grouped, flat);
+  assert.deepEqual(reversed, flat);
+});
+
+test("pooled quantiles equal histogram quantiles when nothing is unresolved", () => {
+  const random = seededRandom(0x2b_2026);
+  for (let size = 1; size <= 40; size += 1) {
+    const values = Array.from({ length: size }, () => 1 + random() * 2_000);
+    const histogram = buildPerformanceHistogram("speed", values, V2);
+    const pooled = performanceHistogramPoolQuantiles(poolPerformanceHistograms([histogram]));
+    const direct = performanceHistogramQuantiles(histogram);
+    assert.equal(pooled.unresolvedCount, 0);
+    for (const [name] of PERCENTILES) assert.deepEqual(pooled[name], direct[name], `${size} ${name}`);
+  }
+});
+
+test("pooled bounds contain exact Type-7 quantiles across mixed-scheme devices", () => {
+  const random = seededRandom(0xc0_ffee);
+  let checked = 0;
+  for (let cohort = 0; cohort < 400; cohort += 1) {
+    const devices = 1 + Math.floor(random() * 6);
+    const all = [];
+    const histograms = [];
+    for (let device = 0; device < devices; device += 1) {
+      const size = 1 + Math.floor(random() * 25);
+      // A mixture: ordinary speeds, a fast tail, and rare very fast turns.
+      const values = Array.from({ length: size }, () => {
+        const pick = random();
+        if (pick < 0.6) return 5 + random() * 110;
+        if (pick < 0.9) return 120 + random() * 400;
+        return 500 + random() * 4_000;
+      });
+      all.push(...values);
+      histograms.push(buildPerformanceHistogram(
+        "speed",
+        values,
+        random() < 0.5 ? PERFORMANCE_HISTOGRAM_SCHEME_VERSION : V2,
+      ));
+    }
+    const quantiles = performanceHistogramPoolQuantiles(poolPerformanceHistograms(histograms));
+    assert.equal(quantiles.sampleCount, all.length);
+    for (const [name, probability] of PERCENTILES) {
+      const band = quantiles[name];
+      if (all.length < 5 && name !== "median") {
+        assert.equal(band, null);
+        continue;
+      }
+      const exact = exactQuantile(all, probability);
+      assert.ok(band.lower <= exact + 1e-9 && exact <= band.upper + 1e-9,
+        `cohort ${cohort} ${name}: ${band.lower} <= ${exact} <= ${band.upper}`);
+      assert.ok(band.lower <= band.estimate && band.estimate <= band.upper);
+      checked += 1;
+    }
+  }
+  assert.ok(checked > 1_000);
+});
+
+test("unresolved v1 overflow widens bounds to the observed maximum instead of guessing", () => {
+  const v1 = buildPerformanceHistogram("speed", Array.from({ length: 10 }, (_, index) => 200 + index * 100));
+  const quantiles = performanceHistogramPoolQuantiles(poolPerformanceHistograms([v1]));
+  assert.equal(quantiles.unresolvedCount, 10);
+  assert.equal(quantiles.median.lower, 200);
+  assert.equal(quantiles.median.upper, 1100);
+  const v2 = buildPerformanceHistogram("speed", Array.from({ length: 10 }, (_, index) => 200 + index * 100), V2);
+  const resolved = performanceHistogramPoolQuantiles(poolPerformanceHistograms([v2]));
+  assert.ok(resolved.median.upper - resolved.median.lower < quantiles.median.upper - quantiles.median.lower);
 });

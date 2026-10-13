@@ -90,7 +90,8 @@ export function opsActivityClass(applicationName) {
  * Why a signal is unavailable. A closed set: no free text ever reaches a line.
  *
  * - NO_DATA: the relation exists but holds nothing to measure (nothing ever
- *   completed, no run, no published day, an empty journal).
+ *   completed, no run, no published day, an empty journal, no performance
+ *   report admitted yet, no community model-performance head published yet).
  * - RELATION_ABSENT: the table or column does not exist in this schema.
  * - PRIVILEGE_MISSING: the probe's role may not read the source. The activity
  *   signals need membership of pg_read_all_stats; without it other roles'
@@ -153,6 +154,11 @@ export const OPS_PROBES = Object.freeze({
   analytics_refresh_completed_age_seconds: descriptor(RUNTIME, "gauge", "seconds"),
   community_daily_head_age_days: descriptor(RUNTIME, "gauge", "days"),
   v12_newest_ready_manifest_age_seconds: descriptor(RUNTIME, "gauge", "seconds"),
+  // Accountless performance intake and its community publication (primary
+  // 0079): the newest admitted report's receipt, and the newest end day of
+  // the community-model-performance heads.
+  performance_newest_accepted_report_age_seconds: descriptor(RUNTIME, "gauge", "seconds"),
+  community_model_performance_head_age_days: descriptor(RUNTIME, "gauge", "days"),
   // The one global ingestion journal and the analytics cursor over it.
   ingestion_journal_head_sequence: descriptor(RUNTIME, "gauge", "sequence"),
   ingestion_journal_head_age_seconds: descriptor(RUNTIME, "gauge", "seconds"),

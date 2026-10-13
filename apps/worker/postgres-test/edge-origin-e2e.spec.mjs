@@ -24,6 +24,20 @@
 // D7): EDGE_E2E_PER_DATE_EXPECTED, or for the committed Q-1 golden the one
 // `npm run gcp:fastpath:rehearsal` uses.
 //
+// The community model speed decisions of 2026-10-10 add: S4, the two public
+// reads (community/daily and community/model-performance) spending one
+// per-client budget at the production limits, in either order; S9, a
+// community-model-performance-v1 head written by the store's own writer
+// served through the edge unchanged (public, max-age=300) and an unpublished
+// slot as the origin's 404 no-store; S5, this line's shipped performance
+// client (the exact grant v1 body of apps/local/accountless-contribution.js,
+// runTelemetryPerformanceSync, a v20 day manifest) granted, given a
+// 2026-09-29.1 capability, reporting and re-running idempotently through the
+// edge after the owner's activation on a production origin's admin host, then
+// the deployable refresh Job's run read back through
+// GET /api/v1/admin/performance-intake and the published slot through the
+// edge.
+//
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
 // Run it serially under the image runtime (Node 22). The fast-path test-deploy
@@ -36,11 +50,12 @@
 //     --experimental-strip-types --test --test-concurrency=1 postgres-test/edge-origin-e2e.spec.mjs
 
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, mock, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -50,8 +65,15 @@ import { Miniflare } from "miniflare";
 import pg from "pg";
 import { createServer } from "vite";
 import {
+  COMMUNITY_MODEL_PERFORMANCE_METHOD_VERSION,
+  COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  buildCommunityModelPerformancePoint,
+  buildPerformanceHistogram,
   canonicalTelemetryV11Json,
   canonicalTelemetryV12Json,
+  parseCommunityModelPerformance,
+  poolPerformanceHistograms,
   telemetryV11DayManifestDigestInput,
   telemetryV11RequiredConsent,
   telemetryV12DayManifestDigestInput,
@@ -91,15 +113,15 @@ import {
 } from "../scripts/edge-e2e/google-front-end.mjs";
 import {
   MATRIX_VALUES,
-  PUBLICATION_DISABLED_ROW,
+  PUBLICATION_DISABLED_ROWS,
   SAME_ORIGIN,
   UNKNOWN_DEVICE_BEARER,
   UNKNOWN_UPLOAD_BEARER,
   adminRows,
   admissionRows,
-  definiteSweepAnswers,
   forwardedRows,
   localRows,
+  performanceIntakeRows,
   sweepRows,
 } from "../scripts/edge-e2e/request-matrix.mjs";
 import { runTelemetryV11Sync } from "../test/helpers/contribution-v11-runner.js";
@@ -114,10 +136,23 @@ import {
   syncPreparedContributionEntryOnce,
 } from "../test/helpers/contribution-shipped-client.js";
 import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
+import { createTelemetryPerformanceEnvelope } from "../../../src/platform/telemetry-performance-envelope.js";
+import { createTelemetryPerformanceClient } from "../../../src/application/telemetry-performance-client.js";
+import {
+  prepareTelemetryPerformanceDay,
+  runTelemetryPerformanceSync,
+} from "../../../src/contribution/telemetry-performance-sync.js";
 import { liveWriteRows } from "../scripts/edge-live-check.mjs";
-import { RETIRED_DEFINITE_PREAMBLE_STEPS } from "../cloud-run/postgres-production-registry.mjs";
+import { PERFORMANCE_TELEMETRY_ROUTE_IDS } from "../cloud-run/routes/performance-telemetry.mjs";
 import { goldenSourceIdentity } from "../scripts/gcp-fastpath-seed.mjs";
-import { edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
+import { REFRESH_JOB_RESOURCES, edgeTestProductionEnv, originSourceEnv } from "../scripts/gcp-fastpath-test-deploy.mjs";
+import analyticsV2Config from "../vitest.analytics-v2.config.mjs";
+import {
+  PERFORMANCE_DICTIONARY_2026_09_29,
+  ensurePerformanceFixtureKernel,
+  seedPerformanceV12DayManifest,
+  syntheticPerformanceRecord,
+} from "./fixtures/performance-telemetry.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -322,6 +357,15 @@ async function seedSchema(base, m, schema) {
     WHERE schema_version='telemetry-contribution-v1.1'`);
   await base.query(`UPDATE ${t("telemetry_v12_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
   await base.query(`UPDATE ${t("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`, [now]);
+  // Production always holds this row (the cutover's usage-correction stage
+  // requires exactly one, and 0034's trigger keeps it immutable). The
+  // effective reader (occurrence-source.ts readOwnerScope, mirroring the
+  // d43c8f92 Worker's inner join) refuses every v1.2 owner without it, so a
+  // refresh over a schema built from migrations alone fails its read phase
+  // with ANALYTICS_V2_SOURCE_UNAVAILABLE once a v1.2 owner exists.
+  await base.query(`INSERT INTO ${t("telemetry_usage_correction_runtime")}
+      (id, schema_version, method_version, source_state, max_capture_rows, max_history_page)
+    VALUES (1, 'telemetry-usage-correction-v1', 'usage-total-correction-v1', 'active', 200, 200)`);
   return t;
 }
 
@@ -520,20 +564,6 @@ function assertUnported(answer, label) {
   assert.equal(answer.header("cache-control"), "no-store", label);
 }
 
-/**
- * A retired-definite route's answer through the edge (round 12; round 19
- * runs production's earlier answers first): the expected step's status and
- * code in the Worker envelope, no-store, and no retry-after, never the
- * unported 503.
- */
-function assertDefinite(answer, expect, label) {
-  assert.equal(answer.status, expect.status, `${label}: ${answer.text}`);
-  assert.deepEqual(errorEnvelope(answer), { keys: ["error"], errorKeys: ["code", "requestId"], code: expect.code },
-    label);
-  assert.equal(answer.header("retry-after"), null, `${label}: no retry-after`);
-  assert.equal(answer.header("cache-control"), "no-store", label);
-}
-
 function errorEnvelope(answer) {
   const value = answer.json();
   if (value === null || typeof value !== "object" || value.error === null || typeof value.error !== "object") {
@@ -723,7 +753,6 @@ async function runRow(f, row, { edge = f.edge, reference = f.reference, ip = nex
     assert.deepEqual(transparencyMismatches(f, edgeAnswer, exchanges[0]), [], `${row.id}: transparency`);
   }
   if (row.comparators.includes("unported")) assertUnported(edgeAnswer, row.id);
-  if (row.comparators.includes("definite")) assertDefinite(edgeAnswer, row.expect, row.id);
   const expect = row.expect ?? {};
   if (expect.status !== undefined) assert.equal(edgeAnswer.status, expect.status, `${row.id}: ${edgeAnswer.text.slice(0, 300)}`);
   if (expect.code !== undefined) assert.equal(errorEnvelope(edgeAnswer)?.code, expect.code, row.id);
@@ -903,7 +932,11 @@ test("S1 local: www, assets, unknown API, admin APIs on the apex, Apple, 405s an
   const disabledReference = await createReferenceInstance({ ...f.common, envelope: f.keys,
     overrides: { PUBLIC_ANALYTICS_MODE: "disabled" } });
   disposers.push(() => disabledReference.dispose());
-  await runRow(f, { ...PUBLICATION_DISABLED_ROW, stage: "S1" }, { edge: disabledEdge, reference: disabledReference });
+  // Both public reads (community/daily and the owner-decided model-performance
+  // read of 2026-10-10) answer the pre-gate locally, before any limiter.
+  for (const row of PUBLICATION_DISABLED_ROWS) {
+    await runRow(f, { ...row, stage: "S1" }, { edge: disabledEdge, reference: disabledReference });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -961,7 +994,12 @@ test("S3 forwarded: Worker-comparable refusals match, every forwarded pair is se
   const registry = f.m.registry.WORKER_ROUTE_POLICY;
   for (const row of forwardedRows({ registry })) await runRow(f, { ...row, stage: "S3" });
   for (const row of sweepRows({ registry, servedRouteIds: f.m.composition.POSTGRES_PORTED_WORKER_ROUTE_IDS,
-    definiteAnswers: definiteSweepAnswers(RETIRED_DEFINITE_PREAMBLE_STEPS) })) {
+    bearerRefusedRouteIds: PERFORMANCE_TELEMETRY_ROUTE_IDS })) {
+    await runRow(f, { ...row, stage: "S3" });
+  }
+  // Decision 1 (2026-10-10): the restored performance intake without any
+  // credential answers the unchanged Worker's 401, never a 5xx first.
+  for (const row of performanceIntakeRows({ registry, routeIds: PERFORMANCE_TELEMETRY_ROUTE_IDS })) {
     await runRow(f, { ...row, stage: "S3" });
   }
   // The verifier reads health and readiness straight through the front end.
@@ -1326,6 +1364,42 @@ test("S5 v1.1: a shipped social client and a shipped accountless client sync thr
   assert.ok(laboratory.state.originRewrites >= 2, "only the capability answers' destinationOrigin was mapped");
   assert.deepEqual(await v11Counts(f, device.participantId),
     { chunks: accountlessFirst.chunksUploaded, records: q1b.recordCount, domains: 1, head: 1 });
+});
+
+test("S5 performance: an accountless device enrolled through the edge is refused 403 while the runtime is staged", {
+  skip: SKIP, timeout: LONG,
+}, async () => {
+  const f = await fixture();
+  const log = [];
+  const fetchImpl = edgeClientFetch(f, { log });
+  const device = await accountlessEnroll(f, fetchImpl, EDGE_E2E_PUBLIC_ORIGIN);
+  // Decision 1 (2026-10-10), before the owner's activation (decision 2): the
+  // grant and the capability read pass every earlier step for a real
+  // accountless device and answer 403 TELEMETRY_TRANSPORT_BLOCKED through the
+  // edge, marked and no-store, never a storage or runtime 5xx.
+  const grant = await post(fetchImpl, EDGE_E2E_PUBLIC_ORIGIN, "/api/v1/accountless/telemetry-performance-authorization", {
+    schemaVersion: "accountless-performance-owner-v1",
+    policyVersion: "accountless-telemetry-performance-policy-v1",
+    authorizationBasis: "accountless-performance-policy-v1",
+  }, { authorization: device.deviceAuthorization });
+  const capabilities = await fetchImpl(new URL("/api/v1/device/telemetry/performance/capabilities",
+    EDGE_E2E_PUBLIC_ORIGIN), { headers: { authorization: device.deviceAuthorization } });
+  for (const [label, answer] of [["grant", grant], ["capabilities", capabilities]]) {
+    assert.equal(answer.status, 403, `${label}: ${await answer.clone().text()}`);
+    assert.equal((await answer.json()).error.code, "TELEMETRY_TRANSPORT_BLOCKED", label);
+    assert.equal(answer.headers.get("cache-control"), "no-store", label);
+    assert.equal(answer.headers.get("retry-after"), null, label);
+  }
+  for (const path of ["/api/v1/accountless/telemetry-performance-authorization",
+    "/api/v1/device/telemetry/performance/capabilities"]) {
+    assert.ok(log.some((entry) => entry.path === path && entry.status === 403), `${path} went through the edge`);
+  }
+  assert.deepEqual((await f.base.query(`SELECT state FROM ${f.t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "staged" }]);
+  assert.equal((await f.base.query(`SELECT count(*)::int AS n
+      FROM ${f.t("accountless_telemetry_performance_authorizations")} WHERE participant_id = $1`,
+  [device.participantId])).rows[0].n, 0);
+  f.rows.push({ stage: "S5", id: "performance-staged", answers: 2 });
 });
 
 test("S5 v1.2: a shipped social client and a shipped accountless client sync through the edge and re-run idempotently", {
@@ -1996,6 +2070,68 @@ test("S4 admission: every EP-1 policy route the origin serves is limited exactly
   }
   await untilLimited(f, byRoute("community_daily"), { ...pair, bound: limits.PUBLIC_READ_RATE_LIMIT + 2,
     limitedCode: "ATTEMPT_LIMIT_REACHED", expectedAllowed: limits.PUBLIC_READ_RATE_LIMIT });
+  await untilLimited(f, byRoute("community_model_performance"), { ...pair, bound: limits.PUBLIC_READ_RATE_LIMIT + 2,
+    limitedCode: "ATTEMPT_LIMIT_REACHED", expectedAllowed: limits.PUBLIC_READ_RATE_LIMIT });
+
+  // A'. Owner decision 2026-10-10: the two public reads share one per-client
+  // budget. From one address in one window, half the budget on community/daily
+  // leaves exactly the other half for community/model-performance.
+  await windowWithRoom(40_000);
+  const sharedIp = nextIp();
+  const half = Math.floor(limits.PUBLIC_READ_RATE_LIMIT / 2);
+  for (let index = 0; index < half; index += 1) {
+    const { edgeAnswer, referenceAnswer } = await pairOnce(f, byRoute("community_daily"), { ...pair, ip: sharedIp });
+    assert.deepEqual(verdictMismatches(edgeAnswer, referenceAnswer), [], `shared daily ${index + 1}`);
+    assert.notEqual(edgeAnswer.status, 429, `shared daily ${index + 1}`);
+  }
+  let sharedAllowed = 0;
+  for (let index = 0; index <= limits.PUBLIC_READ_RATE_LIMIT - half; index += 1) {
+    const { edgeAnswer, referenceAnswer } = await pairOnce(f, byRoute("community_model_performance"),
+      { ...pair, ip: sharedIp });
+    const limited = edgeAnswer.status === 429 || referenceAnswer.status === 429;
+    assert.deepEqual(limited ? workerMismatches(edgeAnswer, referenceAnswer)
+      : verdictMismatches(edgeAnswer, referenceAnswer), [], `shared model-performance ${index + 1}`);
+    if (limited) break;
+    sharedAllowed += 1;
+  }
+  assert.equal(sharedAllowed, limits.PUBLIC_READ_RATE_LIMIT - half, "the two public reads spend one budget");
+  f.rows.push({ stage: "S4", id: "public-read-shared-budget", pairs: half + sharedAllowed + 1 });
+
+  // A''. Either route counts against the same client binding, in any order:
+  // alternating the two reads from one address in a fresh window admits
+  // exactly the production budget in total (every pair equal to the Worker,
+  // every forwarded verdict naming the one public_aggregate_read purpose),
+  // and once the address is limited the other route is limited as well.
+  await windowWithRoom(40_000);
+  const alternatingIp = nextIp();
+  const inTurn = [byRoute("community_daily"), byRoute("community_model_performance")];
+  const purposeOf = (exchanges) => f.m.contract.decodeEdgeAdmission(admissionOf(exchanges) ?? "")?.purpose ?? null;
+  let alternatingAllowed = 0;
+  let limitedAt = null;
+  for (let index = 0; index <= limits.PUBLIC_READ_RATE_LIMIT; index += 1) {
+    const row = inTurn[index % 2];
+    const { edgeAnswer, referenceAnswer, exchanges } = await pairOnce(f, row, { ...pair, ip: alternatingIp });
+    const limited = edgeAnswer.status === 429 || referenceAnswer.status === 429;
+    assert.deepEqual(limited ? workerMismatches(edgeAnswer, referenceAnswer)
+      : verdictMismatches(edgeAnswer, referenceAnswer), [], `alternating ${row.routeId} ${index + 1}`);
+    assert.equal(purposeOf(exchanges), "public_aggregate_read", `alternating ${row.routeId} ${index + 1}: one purpose`);
+    if (limited) {
+      limitedAt = index;
+      break;
+    }
+    alternatingAllowed += 1;
+  }
+  assert.equal(alternatingAllowed, limits.PUBLIC_READ_RATE_LIMIT,
+    "alternating the two reads admits exactly one budget between them");
+  assert.equal(limitedAt, limits.PUBLIC_READ_RATE_LIMIT);
+  const otherRoute = inTurn[(limitedAt + 1) % 2];
+  const afterLimit = await pairOnce(f, { ...otherRoute, id: `${otherRoute.routeId} after the shared budget` },
+    { ...pair, ip: alternatingIp });
+  assert.deepEqual(workerMismatches(afterLimit.edgeAnswer, afterLimit.referenceAnswer), []);
+  assert.equal(afterLimit.edgeAnswer.status, 429, "the other read is limited on the same binding");
+  assert.equal(errorEnvelope(afterLimit.edgeAnswer)?.code, "ATTEMPT_LIMIT_REACHED");
+  assert.ok(admissionOf(afterLimit.exchanges)?.endsWith(";limited"));
+  f.rows.push({ stage: "S4", id: "public-read-shared-budget-alternating", pairs: alternatingAllowed + 2 });
 
   // B. Every other attempt-limited route: pairwise equal until the Worker limits.
   for (const row of rows) {
@@ -2405,6 +2541,649 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
       if (/^[a-z_][a-z0-9_]{0,62}$/u.test(name)) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// S9: a published community model-performance head through the edge
+//
+// This runs after S4, whose admitted model-performance pairs compare with the
+// Worker, which publishes no head: the head is written by the store's own
+// writer into the main schema and stays (the table is forward-only).
+
+const COMMUNITY_MODEL_PERFORMANCE_PATH = "/api/v1/community/model-performance";
+const PUBLIC_MODEL_PERFORMANCE_CACHE = "public, max-age=300";
+const PERFORMANCE_SLOT_KEYS = Object.freeze(["1", "7", "30", "all"]
+  .flatMap((period) => ["standard", "fast", "ultrafast"].map((speedMode) => `${period}:${speedMode}`)));
+const utcDay = (epochMs) => new Date(epochMs).toISOString().slice(0, 10);
+
+let analyticsVite = null;
+let analyticsModulesPromise = null;
+
+/** The analytics-v2 store modules as the analytics-v2 gate loads them (the vendored-kernel resolution). */
+function analyticsStoreModules() {
+  analyticsModulesPromise ??= (async () => {
+    analyticsVite = await createServer({
+      root: WORKER_ROOT,
+      configFile: false,
+      plugins: analyticsV2Config.plugins,
+      resolve: analyticsV2Config.resolve,
+      server: { middlewareMode: true, hmr: false, watch: null },
+      appType: "custom",
+      logLevel: "silent",
+    });
+    disposers.push(() => analyticsVite.close());
+    const load = (path) => analyticsVite.ssrLoadModule(path);
+    return {
+      publication: await load("/src/analytics-v2/store-publication.ts"),
+      contract: await load("/src/analytics-v2/performance-publication-contract.ts"),
+    };
+  })();
+  return analyticsModulesPromise;
+}
+
+/** One pooled point per metric through the contract's own pool and point builder. */
+function contractPoint(day, metric, values) {
+  return buildCommunityModelPerformancePoint(day, poolPerformanceHistograms([buildPerformanceHistogram(metric, values)]));
+}
+
+/** One GET through the edge, held to transparency and S7; returns the answer and its one exchange. */
+async function edgeRead(f, path, label) {
+  const ip = nextIp();
+  const mark = f.frontEnd.mark();
+  const answer = await f.edge.fetch(`${EDGE_E2E_PUBLIC_ORIGIN}${path}`, { ip });
+  const exchanges = f.frontEnd.since(mark);
+  assert.equal(exchanges.length, 1, `${label}: exactly one forwarded exchange`);
+  assert.deepEqual(transparencyMismatches(f, answer, exchanges[0]), [], `${label}: transparency`);
+  assert.deepEqual(privacyViolations(f, exchanges[0], { ip, hostKind: "apex" }), [], `${label}: S7 privacy`);
+  f.allExchanges.push({ exchange: exchanges[0], ip, row: label });
+  return { answer, exchange: exchanges[0] };
+}
+
+test("S9 model performance: a head the store wrote passes through the edge unchanged (public, max-age=300); "
+  + "an unpublished slot is 404 no-store", {
+  skip: SKIP, timeout: LONG,
+}, async () => {
+  const f = await fixture();
+  const { publication, contract } = await analyticsStoreModules();
+  const nowMs = Date.now();
+  const generatedAt = new Date(nowMs).toISOString();
+  const end = utcDay(nowMs - DAY_MS);
+  const earlier = utcDay(nowMs - 3 * DAY_MS);
+  const slot = { period: "30", speedMode: "fast" };
+  // A synthetic, content-free publication for one slot: one reviewed model,
+  // its points pooled and bounded by the contract (the under-5 rule leaves
+  // the later speed day median-only).
+  const payload = parseCommunityModelPerformance({
+    schemaVersion: COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION,
+    methodVersion: COMMUNITY_MODEL_PERFORMANCE_METHOD_VERSION,
+    population: "reported_samples",
+    approximate: true,
+    revision: 1,
+    generatedAt,
+    period: slot.period,
+    interval: "day",
+    start: utcDay(nowMs - 30 * DAY_MS),
+    end,
+    speedMode: slot.speedMode,
+    excludedUnknownTurns: 0,
+    contributors: 1,
+    devices: 1,
+    reports: 2,
+    models: [{
+      provider: "openai_codex",
+      modelId: "gpt-5.5",
+      turns: 8,
+      speedTurns: 8,
+      ttftTurns: 5,
+      timedResponses: 8,
+      toolFreeTurns: 0,
+      contributors: 1,
+      devices: 1,
+      speed: { unit: "tokens_per_second", points: [
+        contractPoint(earlier, "speed", [120, 128, 136, 144, 152, 160]),
+        contractPoint(end, "speed", [131, 188]),
+      ] },
+      ttft: { unit: "milliseconds", points: [contractPoint(earlier, "ttft", [700, 800, 900, 1000, 1100])] },
+    }],
+  });
+  const heads = f.t("analytics_v2_published_performance");
+  assert.equal((await f.base.query(`SELECT count(*)::int AS n FROM ${heads}`)).rows[0].n, 0, "nothing published yet");
+  // SPD-P1's writer, in its own transaction, under the kernel this build stamps.
+  const kernelId = await ensurePerformanceFixtureKernel(f.base, { schema: f.schema, index: -1 });
+  const client = await f.base.connect();
+  try {
+    await client.query("BEGIN");
+    const written = await publication.writeAnalyticsV2PublishedPerformance(client, {
+      schema: `"${f.schema}"`,
+      candidates: [{ ...slot, payload, payloadSha256: await contract.analyticsV2PerformanceContentSha256(payload) }],
+      releasedAt: generatedAt, seed: 0, kernelId, manifestVersion: 1, runId: randomUUID(),
+    });
+    await client.query("COMMIT");
+    assert.deepEqual(written, { published: [`${slot.period}:${slot.speedMode}`], unchanged: [], deferredEmpty: false });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  const stored = (await f.base.query(`SELECT payload::text AS payload FROM ${heads} WHERE period = $1 AND speed_mode = $2`,
+    [slot.period, slot.speedMode])).rows[0].payload;
+
+  // The published slot: the origin's 200 reaches the client unchanged, with
+  // the one publicly cacheable answer of the route.
+  const path = `${COMMUNITY_MODEL_PERFORMANCE_PATH}?period=${slot.period}&speedMode=${slot.speedMode}`;
+  const { answer } = await edgeRead(f, path, "S9 model-performance published");
+  assert.equal(answer.status, 200, answer.text.slice(0, 300));
+  assert.equal(answer.header("cache-control"), PUBLIC_MODEL_PERFORMANCE_CACHE);
+  assert.equal(answer.header("content-type"), "application/json; charset=utf-8");
+  const served = JSON.parse(answer.text);
+  assert.deepEqual(served, JSON.parse(stored), "the edge serves the head the store wrote");
+  assert.deepEqual(parseCommunityModelPerformance(served), served);
+  assert.equal(served.revision, 1);
+  assert.deepEqual(served.models.map(({ provider, modelId }) => [provider, modelId]), [["openai_codex", "gpt-5.5"]]);
+  const direct = await f.frontEnd.direct({ path, email: EDGE_E2E_INVOKER, headers: {
+    "x-tibotattle-edge-host": "apex", "x-tibotattle-edge-request-id": randomUUID(),
+    "x-tibotattle-edge-admission": "v1;public_aggregate_read;allowed" } });
+  assert.equal(direct.status, 200);
+  assert.equal(direct.headers["cache-control"], PUBLIC_MODEL_PERFORMANCE_CACHE);
+  assert.ok(answer.body.equals(direct.body), "the edge read equals a direct origin read byte for byte");
+
+  // An unpublished slot: the origin's 404, no-store, passed through as well.
+  const unpublished = await edgeRead(f, `${COMMUNITY_MODEL_PERFORMANCE_PATH}?period=1&speedMode=ultrafast`,
+    "S9 model-performance unpublished");
+  assert.equal(unpublished.answer.status, 404);
+  assert.equal(errorEnvelope(unpublished.answer)?.code, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED");
+  assert.equal(unpublished.answer.header("cache-control"), "no-store");
+  assert.equal(unpublished.answer.header("retry-after"), null);
+  f.rows.push({ stage: "S9", id: "model-performance-head", bytes: answer.body.length,
+    cacheControl: answer.header("cache-control"), unpublishedStatus: unpublished.answer.status });
+});
+
+// ---------------------------------------------------------------------------
+// S5: the shipped performance client through the edge, after the owner's
+// activation on the composed production origin's admin host
+//
+// The edge-test origin composes no admin family (OD-CR-3), so the activation
+// (owner decision 2026-10-10, decision 2) runs where it runs in production:
+// POST /api/v1/admin/action on a HOST_MODE=production origin from the same
+// dist bundle over the same schema, through the Access chokepoint and the
+// admin CSRF headers. Its Access JWKS is served by a fetch stub that answers
+// only the configured team's certs URL; nothing reaches any network.
+
+const PRODUCTION_RUN_APP_ORIGIN = "https://tibotattle-origin-e12e12e12e-ue.a.run.app";
+const PRODUCTION_AUDIENCE = "tibotattle-edge-e2e-origin-audience";
+const PRODUCTION_INVOKER = "edge-e2e-production-invoker@synthetic-edge-0.iam.gserviceaccount.com";
+const PRODUCTION_BUCKET = "synthetic-edge-e2e-production-bucket";
+const PERFORMANCE_GRANT_PATH = "/api/v1/accountless/telemetry-performance-authorization";
+const PERFORMANCE_CAPABILITIES_PATH = "/api/v1/device/telemetry/performance/capabilities";
+const PERFORMANCE_REPORTS_PATH = "/api/v1/device/telemetry/performance/reports";
+const ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
+const ADMIN_PERFORMANCE_INTAKE_PATH = "/api/v1/admin/performance-intake";
+const REPOSITORY_ROOT = resolve(WORKER_ROOT, "..", "..");
+const DIST_REFRESH = join(WORKER_ROOT, "cloud-run", "dist", "analytics-refresh.mjs");
+/** State the S5 performance flow leaves for the refresh-and-read test after it. */
+const performanceFlow = { production: null, device: null, day: null, reportRevision: null };
+let performanceLanePromise = null;
+
+/**
+ * The performance flow's own lane: a fresh seeded schema behind its own
+ * edge-test origin, Google front end and gcp edge (the same bundle, Access,
+ * Sparkle and asset fixtures, and the run's client-key secret), so the
+ * refresh Job reads only what this flow wrote. Its exchanges join the run's
+ * S7 record. The main schema keeps the other S5 flows' synthetic residue,
+ * so the lane keeps the publication's counts (one report, one contributor,
+ * one device) exact and independent of those flows and of their order.
+ *
+ * The lane was first added because the deployable refresh failed over the
+ * main schema after the S5 v1.2 flow with ANALYTICS_V2_SOURCE_UNAVAILABLE
+ * (2026-10-11). Cause (diagnosed 2026-10-12): seedSchema did not insert the
+ * telemetry_usage_correction_runtime row that production always holds, and
+ * the effective reader refuses every v1.2 owner without it. seedSchema now
+ * inserts it, so the lane is isolation, not a workaround.
+ */
+function performanceLane() {
+  performanceLanePromise ??= (async () => {
+    const f = await fixture();
+    const schema = `tibotattle_fastpath_edge_e2e_perf_${randomBytes(4).toString("hex")}`;
+    await f.base.query(`CREATE SCHEMA "${schema}"`);
+    f.created.push(schema);
+    const t = await seedSchema(f.base, f.m, schema);
+    const origin = await startOrigin({ socket: f.socket, schema, keys: f.keys, objects: new Map() });
+    disposers.push(() => origin.close());
+    const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
+      upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(origin.port) });
+    const edge = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd, invokerKeyJson: f.invoker.keyJson,
+      clientKeySecret: f.clientKeySecret });
+    disposers.push(() => edge.dispose());
+    return { ...f, schema, t, origin, frontEnd, edge };
+  })();
+  return performanceLanePromise;
+}
+
+const base64UrlJson = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+
+/** A signed-shape synthetic ID token; Cloud Run's front end replaces the signature. */
+function productionFrontEndToken(email) {
+  const now = Math.floor(Date.now() / 1000);
+  return `Bearer ${base64UrlJson({ alg: "RS256", kid: "0".repeat(40), typ: "JWT" })}.${base64UrlJson({
+    aud: PRODUCTION_AUDIENCE, azp: "100000000000000000000", email, email_verified: true, exp: now + 3_000,
+    iat: now - 60, iss: "https://accounts.google.com", sub: "100000000000000000000" })}.SIGNATURE_REMOVED_BY_GOOGLE`;
+}
+
+/** One HTTP exchange with the production origin as Cloud Run's front end delivers it. */
+function productionSend(port, { method = "GET", path, hostKind, headers = {}, body }) {
+  return new Promise((resolveSend, reject) => {
+    const request = http.request({ host: "127.0.0.1", port, method, path, agent: false, headers: {
+      host: new URL(PRODUCTION_RUN_APP_ORIGIN).host,
+      "x-serverless-authorization": productionFrontEndToken(PRODUCTION_INVOKER),
+      "x-tibotattle-edge-host": hostKind,
+      "x-tibotattle-edge-request-id": randomUUID(),
+      ...headers,
+    } });
+    const timer = setTimeout(() => request.destroy(new Error(`no answer: ${method} ${path}`)), 30_000);
+    request.on("error", (error) => { clearTimeout(timer); reject(error); });
+    request.on("response", (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        clearTimeout(timer);
+        resolveSend({ status: response.statusCode, headers: response.headers, text: Buffer.concat(chunks).toString("utf8") });
+      });
+    });
+    request.end(body);
+  });
+}
+
+/** Runs `work` with `environment` in process.env, restoring every name it or the origin harness touches. */
+async function withProductionEnvironment(environment, work) {
+  const names = [...new Set([...RUNTIME_ENVIRONMENT_NAMES, ...Object.keys(environment)])];
+  const saved = new Map(names.map((name) => [name, process.env[name]]));
+  for (const name of RUNTIME_ENVIRONMENT_NAMES) delete process.env[name];
+  for (const [name, value] of Object.entries(environment)) process.env[name] = value;
+  try {
+    return await work();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+/**
+ * A HOST_MODE=production origin from cloud-run/dist/server.mjs over the E12
+ * schema, with the owner's Access fixture: `act(body)` posts an admin action
+ * and `read(path)` an admin read, each with a fresh Access assertion of the
+ * pinned owner verified against the stubbed team JWKS.
+ */
+async function startProductionAdminOrigin(f) {
+  serverModule ??= await import(pathToFileURL(DIST_SERVER).href);
+  const configuration = await vite.ssrLoadModule("/cloud-run/postgres-production-configuration.mjs");
+  const runtimeSchema = await vite.ssrLoadModule("/src/postgres-runtime-schema.ts");
+  const activation = await vite.ssrLoadModule("/src/postgres-telemetry-runtime-activation.ts");
+  const vars = configuration.PRODUCTION_VARS;
+  const port = await freePort();
+  const pools = [];
+  const lines = [];
+  const objects = new Map();
+  const env = {
+    HOST_MODE: "production",
+    HOST: "127.0.0.1",
+    PORT: String(port),
+    K_SERVICE: "tibotattle-origin",
+    HOST_ORIGIN: PRODUCTION_RUN_APP_ORIGIN,
+    PUBLIC_ORIGIN: configuration.PRODUCTION_PUBLIC_ORIGIN,
+    EDGE_ORIGIN_MODE: "cloudflare-worker-iam",
+    EDGE_ORIGIN_AUDIENCE: PRODUCTION_AUDIENCE,
+    EDGE_INVOKER_SERVICE_ACCOUNT: PRODUCTION_INVOKER,
+    EDGE_ORIGIN_VERIFIER_SERVICE_ACCOUNTS: EDGE_E2E_VERIFIER,
+    DEPLOYMENT_SOURCE_COMMIT: EDGE_E2E_SOURCE_COMMIT,
+    TELEMETRY_STORAGE_NAMESPACE: NAMESPACE,
+    PRIMARY_INSTANCE_CONNECTION_NAME: "synthetic-project:us-east1:synthetic-edge-e2e-production",
+    PRIMARY_DATABASE: process.env.PG_TEST_DATABASE || "postgres",
+    PRIMARY_SCHEMA: f.schema,
+    POSTGRES_IAM_USER: "synthetic-edge-e2e-production@synthetic.iam",
+    GCS_BUCKET_NAME: PRODUCTION_BUCKET,
+    GCS_QUARANTINE_BUCKET_HISTORY_PROOF: JSON.stringify({ bucket: PRODUCTION_BUCKET,
+      bucketGeneration: "1700000000000001", bucketMetageneration: "1", softDeleteRetentionDurationSeconds: "0" }),
+    ENVELOPE_PUBLIC_JWK: f.keys.publicText,
+    ENVELOPE_PRIVATE_JWK: f.keys.privateText,
+    IDENTITY_LINK_SECRET: randomBytes(32).toString("hex"),
+    POSTGRES_RATE_LIMIT_SECRET: randomBytes(32).toString("hex"),
+  };
+  const sigterm = process.listeners("SIGTERM");
+  const sigint = process.listeners("SIGINT");
+  const { runtime, close } = await withProductionEnvironment(env, async () => {
+    const created = await serverModule.createRuntime({
+      dependencies: {
+        createConnector: () => ({ close() {} }),
+        async createIamPool(options) {
+          const pool = new pg.Pool(poolOptions(f.socket, options.max ?? 3, `edge-e2e-production-${options.role}`));
+          pool.on("error", () => {});
+          pools.push(pool);
+          return pool;
+        },
+        async createGoogleAccessTokenProvider() { return async () => "synthetic-access-token"; },
+        createGcsQuarantineObjectStore: () => ({
+          async head(key) { return objects.has(key) ? { key } : null; },
+          async put(key, value) { objects.set(key, value); },
+          async delete(key) { objects.delete(key); },
+        }),
+        logger: (line) => { lines.push(line); },
+      },
+    });
+    return { runtime: created, close: await serverModule.serve(created) };
+  });
+  assert.equal(runtime.hostMode, "production");
+  // The owner's Access application token, signed by one synthetic key whose
+  // JWKS only the stub serves.
+  const pair = await webcrypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048,
+    publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
+  const kid = `synthetic-access-${randomBytes(6).toString("hex")}`;
+  const jwks = JSON.stringify({ keys: [{ ...await webcrypto.subtle.exportKey("jwk", pair.publicKey), kid,
+    alg: "RS256", use: "sig" }] });
+  const certsUrl = `https://${vars.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`;
+  const fetched = [];
+  const assertion = async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const head = base64UrlJson({ alg: "RS256", kid, typ: "JWT" });
+    const claims = base64UrlJson({ aud: [vars.ACCESS_AUD], email: vars.ACCESS_ADMIN_EMAIL, exp: now + 600,
+      iat: now - 5, nbf: now - 5, iss: `https://${vars.ACCESS_TEAM_DOMAIN}`, sub: randomUUID(), type: "app" });
+    const signature = await webcrypto.subtle.sign("RSASSA-PKCS1-v1_5", pair.privateKey,
+      new TextEncoder().encode(`${head}.${claims}`));
+    return `${head}.${claims}.${Buffer.from(signature).toString("base64url")}`;
+  };
+  const withAccessKeys = async (work) => {
+    const stub = mock.method(globalThis, "fetch", async (input) => {
+      const url = String(input instanceof Request ? input.url : input);
+      fetched.push(url);
+      if (url !== certsUrl) throw new TypeError("network access refused in this spec");
+      return new Response(jwks, { status: 200, headers: { "content-type": "application/json" } });
+    });
+    try {
+      return await work();
+    } finally {
+      stub.mock.restore();
+    }
+  };
+  const adminHeaders = async () => ({ "cf-access-jwt-assertion": await assertion() });
+  const production = {
+    port,
+    lines,
+    fetched,
+    certsUrl,
+    ownerEmail: vars.ACCESS_ADMIN_EMAIL,
+    historySha256: await activation.postgresRuntimeMigrationHistorySha256(runtimeSchema.POSTGRES_RUNTIME_MIGRATIONS.primary),
+    act: (body) => withAccessKeys(async () => productionSend(port, { method: "POST", path: "/api/v1/admin/action",
+      hostKind: "admin", body, headers: { ...await adminHeaders(), "content-type": "application/json",
+        origin: configuration.PRODUCTION_ADMIN_ORIGIN, "sec-fetch-site": "same-origin", "x-usage-monitor-admin": "1" } })),
+    read: (path) => withAccessKeys(async () => productionSend(port, { path, hostKind: "admin",
+      headers: await adminHeaders() })),
+    async close() {
+      await close().catch(() => {});
+      for (const pool of pools) await pool.end().catch(() => {});
+      for (const listener of process.listeners("SIGTERM")) {
+        if (!sigterm.includes(listener)) process.removeListener("SIGTERM", listener);
+      }
+      for (const listener of process.listeners("SIGINT")) {
+        if (!sigint.includes(listener)) process.removeListener("SIGINT", listener);
+      }
+    },
+  };
+  disposers.push(() => production.close());
+  return production;
+}
+
+/**
+ * The exact grant body of this line's shipped client composition
+ * (apps/local/accountless-contribution.js PERFORMANCE_AUTHORIZATION), read
+ * from its source: the frozen literal, string values only.
+ */
+async function shippedPerformanceGrantBody() {
+  const source = await readFile(join(REPOSITORY_ROOT, "apps", "local", "accountless-contribution.js"), "utf8");
+  const literal = /const PERFORMANCE_AUTHORIZATION = Object\.freeze\(\{\n((?:  [a-zA-Z]+: "[^"\n]+",\n)+)\}\);/u
+    .exec(source);
+  assert.ok(literal, "apps/local/accountless-contribution.js names a literal PERFORMANCE_AUTHORIZATION");
+  return Object.freeze(Object.fromEntries([...literal[1].matchAll(/^ {2}([a-zA-Z]+): "([^"\n]+)",$/gmu)]
+    .map((match) => [match[1], match[2]])));
+}
+
+/** Every captured production-origin line carries none of the device's identifiers or bodies. */
+function assertProductionLinesClean(production, secrets) {
+  for (const line of production.lines) {
+    for (const secret of secrets) assert.ok(!line.includes(secret), "a production origin line carries an identifier");
+    for (const marker of ["um_device_", "ciphertext", "wrappedKey", "reportRevision", "fieldDictionaryVersion"]) {
+      assert.ok(!line.includes(marker), `a production origin line carries ${marker}`);
+    }
+  }
+}
+
+test("S5 performance flow: the shipped client is granted through the edge (201, echo), reads a 2026-09-29.1 "
+  + "capability, reports 202 and re-runs idempotently, after the owner's activation on the admin host", {
+  skip: SKIP, timeout: LONG,
+}, async () => {
+  const f = await performanceLane();
+  const runtimeRow = async () => (await f.base.query(`SELECT state, policy_revision
+    FROM ${f.t("telemetry_performance_runtime")}`)).rows;
+  assert.deepEqual(await runtimeRow(), [{ state: "staged", policy_revision: 1 }], "staged until the owner acts");
+  const refusalTotal = async () => (await f.base.query(`SELECT coalesce(sum(refusals), 0)::int AS n
+    FROM ${f.t("telemetry_performance_refusal_counts")}`)).rows[0].n;
+
+  // Decision 2: the owner's activation, on the production origin's admin host.
+  const production = await startProductionAdminOrigin(f);
+  performanceFlow.production = production;
+  const idempotencyKey = randomUUID();
+  const activated = await production.act(JSON.stringify({
+    action: "run_maintenance",
+    telemetryRuntimeActivation: {
+      confirmation: "activate_telemetry_performance_runtime",
+      deployment: { historySha256: production.historySha256, sourceCommit: EDGE_E2E_SOURCE_COMMIT },
+      expectedRevision: 1,
+      idempotencyKey,
+      target: "performance",
+    },
+  }));
+  assert.equal(activated.status, 200, activated.text.slice(0, 300));
+  assert.equal(activated.headers["cache-control"], "no-store");
+  assert.deepEqual({ ...JSON.parse(activated.text).result }, {
+    task: "telemetry_runtime_activation", operationId: idempotencyKey, target: "performance", state: "active",
+    fromRevision: 1, toRevision: 2, revision: 2, replayed: false, reconciled: false,
+  });
+  assert.deepEqual(await runtimeRow(), [{ state: "active", policy_revision: 2 }]);
+  assert.ok(production.fetched.length >= 1 && production.fetched.every((url) => url === production.certsUrl),
+    "the chokepoint fetched only the Access certs URL");
+  const refusalsBefore = await refusalTotal();
+
+  // A 0.1.27/0.1.28 device: enrolled and owned through the edge, with a v20
+  // v1.2 day manifest as its newest evidence (decision 3, GATE-Q 2: v19 or
+  // higher maps to 2026-09-29.1).
+  const log = [];
+  const fetchImpl = edgeClientFetch(f, { log });
+  const device = await accountlessEnroll(f, fetchImpl, EDGE_E2E_PUBLIC_ORIGIN);
+  const day = utcDay(Date.now() - DAY_MS);
+  await seedPerformanceV12DayManifest(f.base, { schema: f.schema, owner: device, chunkDay: day,
+    parserVersion: "unified-rollout-typed-v20" });
+  assert.equal(PERFORMANCE_FIELD_DICTIONARY_VERSION, PERFORMANCE_DICTIONARY_2026_09_29,
+    "this line's shipped client emits 2026-09-29.1");
+
+  // The composition's grant step (accountless-contribution.js readAuthorization):
+  // the exact v1 body, 200 or 201, and an echo with the same keys and values.
+  const shippedBody = await shippedPerformanceGrantBody();
+  assert.deepEqual(Object.keys(shippedBody), ["schemaVersion", "policyVersion", "authorizationBasis"]);
+  assert.equal(shippedBody.schemaVersion, "accountless-performance-owner-v1", "this line's client sends grant v1");
+  const grant = await fetchImpl(new URL(PERFORMANCE_GRANT_PATH, EDGE_E2E_PUBLIC_ORIGIN).href, {
+    method: "POST", cache: "no-store", credentials: "omit", redirect: "error",
+    headers: { Accept: "application/json", "Content-Type": "application/json", Authorization: device.deviceAuthorization },
+    body: JSON.stringify(shippedBody),
+  });
+  assert.equal(grant.status, 201);
+  assert.equal(grant.headers.get("cache-control"), "no-store");
+  const grantText = await grant.text();
+  assert.equal(grantText, JSON.stringify(shippedBody), "the origin echoes the exact body");
+  const stored = (await f.base.query(`SELECT schema_version, field_dictionary_version, dictionary_basis, state
+      FROM ${f.t("accountless_telemetry_performance_authorizations")} WHERE participant_id = $1`,
+  [device.participantId])).rows;
+  assert.deepEqual(stored, [{ schema_version: "accountless-performance-owner-v1",
+    field_dictionary_version: PERFORMANCE_DICTIONARY_2026_09_29, dictionary_basis: "v12_parser_inference",
+    state: "active" }]);
+
+  // This line's shipped transport over the edge: capability, envelope key,
+  // the encrypted report, then the same day again.
+  const capabilities = [];
+  const receipts = [];
+  const observed = async (input, init = {}) => {
+    const response = await fetchImpl(input, init);
+    const path = new URL(String(input)).pathname;
+    if (path === PERFORMANCE_CAPABILITIES_PATH && response.status === 200) capabilities.push(await response.clone().json());
+    if (path === PERFORMANCE_REPORTS_PATH && init.method === "POST") {
+      receipts.push({ status: response.status, replayed: response.headers.get("idempotency-replayed"),
+        body: response.status === 202 ? await response.clone().json() : null });
+    }
+    return response;
+  };
+  const readEnvelopeKey = async () => {
+    const response = await observed(new URL(ENVELOPE_KEY_PATH, EDGE_E2E_PUBLIC_ORIGIN).href, {
+      method: "GET", headers: { Accept: "application/json" } });
+    assert.equal(response.status, 200);
+    const value = await response.json();
+    assert.equal(value.keyId, KEY_ID);
+    return { keyId: value.keyId, publicJwk: value.publicJwk };
+  };
+  const records = [syntheticPerformanceRecord({ day, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29 })];
+  let state = null;
+  const transport = createTelemetryPerformanceClient({
+    origin: EDGE_E2E_PUBLIC_ORIGIN,
+    fetchImpl: observed,
+    readAuthorization: async () => device.deviceAuthorization,
+    readPreparedDay: async ({ day: selectedDay }) => prepareTelemetryPerformanceDay({
+      records, day: selectedDay, sourceGeneration: "timing:synthetic-edge-e2e-1",
+      sourceDigest: sha256Hex(`synthetic-edge-e2e-performance:${selectedDay}`), sourceRevision: 1,
+      parserVersion: "unified-rollout-typed-v20" }),
+    readState: async () => state,
+    saveState: async (value) => { state = value; },
+    createEnvelope: async ({ report }) => createTelemetryPerformanceEnvelope({ report, ...await readEnvelopeKey() }),
+    sync: runTelemetryPerformanceSync,
+  });
+  const firstRun = await transport.runDay({ day, nowEpoch: Date.now() });
+  assert.equal(firstRun.status, "succeeded", JSON.stringify(firstRun.state?.lastOutcome ?? null));
+  assert.equal(firstRun.state.lastOutcome.code, "accepted");
+  assert.equal(firstRun.state.cursorDay, day);
+  assert.equal(capabilities.length, 1);
+  assert.equal(capabilities[0].requiredConsent.fieldDictionaryVersion, PERFORMANCE_DICTIONARY_2026_09_29,
+    "the capability names the dictionary the grant inferred");
+  assert.equal(capabilities[0].lifecycle, "accepted");
+  assert.deepEqual(receipts.map(({ status, replayed }) => [status, replayed]), [[202, null]]);
+  assert.equal(receipts[0].body.status, "accepted");
+  assert.equal(receipts[0].body.reportRevision, firstRun.reportRevision);
+  // The next pass re-sends the same day: answered idempotently, nothing new stored.
+  const secondRun = await transport.runDay({ day, nowEpoch: Date.now() });
+  assert.equal(secondRun.status, "succeeded");
+  assert.equal(secondRun.reportRevision, firstRun.reportRevision);
+  assert.deepEqual([receipts[1].status, receipts[1].replayed, receipts[1].body.status, receipts[1].body.replayed],
+    [202, "true", "idempotent", true]);
+  const counts = (await f.base.query(`SELECT
+      (SELECT count(*)::int FROM ${f.t("telemetry_performance_reports")} WHERE participant_id = $1) AS reports,
+      (SELECT count(*)::int FROM ${f.t("telemetry_performance_receipts")} WHERE participant_id = $1) AS receipts`,
+  [device.participantId])).rows[0];
+  assert.deepEqual(counts, { reports: 1, receipts: 1 });
+  assert.equal(await refusalTotal(), refusalsBefore, "the shipped client met no refusal");
+
+  // Every exchange of the flow went through the edge, once each, transparent and S7-clean.
+  assert.deepEqual(log.filter(({ path }) => path.startsWith("/api/v1/device/telemetry/performance")
+    || path === PERFORMANCE_GRANT_PATH || path === ENVELOPE_KEY_PATH).map(({ method, path, status }) => `${method} ${path} ${status}`), [
+    `POST ${PERFORMANCE_GRANT_PATH} 201`,
+    `GET ${PERFORMANCE_CAPABILITIES_PATH} 200`,
+    `GET ${ENVELOPE_KEY_PATH} 200`,
+    `POST ${PERFORMANCE_REPORTS_PATH} 202`,
+    `GET ${PERFORMANCE_CAPABILITIES_PATH} 200`,
+    `GET ${ENVELOPE_KEY_PATH} 200`,
+    `POST ${PERFORMANCE_REPORTS_PATH} 202`,
+  ]);
+  assertProductionLinesClean(production, [device.deviceId, device.participantId, device.secret.toString("base64url"),
+    firstRun.reportRevision]);
+  Object.assign(performanceFlow, { device, day, reportRevision: firstRun.reportRevision });
+  f.rows.push({ stage: "S5", id: "performance-shipped-client", exchanges: log.length,
+    statuses: log.map(({ path, status }) => [path, status]) });
+});
+
+test("S5 performance publication: the deployable refresh Job publishes all 12 slots, the admin performance-intake "
+  + "route reads its run (RUN_PERFORMANCE_KEYS), and the edge serves the published slot", {
+  skip: SKIP, timeout: LONG,
+}, async () => {
+  const f = await performanceLane();
+  const { production, device, day } = performanceFlow;
+  assert.ok(production !== null && device !== null, "the S5 performance flow ran first");
+  assert.ok(existsSync(DIST_REFRESH), "run `node cloud-run/build.mjs` first");
+  // cloud-run/dist/analytics-refresh.mjs under the image runtime with the
+  // deployed Job's standard heap (as the rehearsal runs it), over this schema
+  // at the current instant.
+  const nowIso = new Date().toISOString();
+  let stdout = "";
+  let exitCode = 0;
+  try {
+    ({ stdout } = await execFileAsync(process.execPath, [
+      `--max-old-space-size=${REFRESH_JOB_RESOURCES.heapMiB}`, `--max-semi-space-size=${REFRESH_JOB_RESOURCES.semiSpaceMiB}`,
+      DIST_REFRESH, "--mode=full", `--now=${nowIso}`, `--schema=${f.schema}`], {
+      cwd: join(WORKER_ROOT, "cloud-run"), maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60_000,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, ANALYTICS_V2_TEST_CLOCK: "1",
+        PG_TEST_SOCKET: process.env.PG_TEST_SOCKET, PG_TEST_PORT: String(PG_TEST_PORT),
+        ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
+        ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
+    }));
+  } catch (error) {
+    stdout = String(error.stdout ?? "");
+    exitCode = typeof error.code === "number" ? error.code : 1;
+    assert.fail(`analytics-refresh exited ${exitCode}: ${String(error.stderr ?? "").trim().split("\n").at(-1)
+      ?.slice(0, 300)}`);
+  }
+  const receipt = JSON.parse(String(stdout).trim().split("\n").filter(Boolean).at(-1));
+  assert.equal(receipt.state, "complete", JSON.stringify(receipt.state));
+  assert.equal(receipt.performance.reports, 1);
+  assert.equal(receipt.performance.withheld, null);
+  assert.equal(receipt.performance.deferredEmpty, false);
+  // The first run with an included record publishes all twelve slots (GATE-Q 12).
+  assert.deepEqual(receipt.performance.published, PERFORMANCE_SLOT_KEYS);
+  const runRow = (await f.base.query(`SELECT publication -> 'performance' AS performance
+      FROM ${f.t("analytics_v2_runs")} WHERE run_id = $1::uuid`, [receipt.runId])).rows[0];
+  assert.deepEqual(Object.keys(runRow.performance).sort(), ["deferredEmpty", "published", "unchanged", "withheld"]);
+
+  // GET /api/v1/admin/performance-intake on the production admin host reads that run.
+  const intakeAnswer = await production.read(ADMIN_PERFORMANCE_INTAKE_PATH);
+  assert.equal(intakeAnswer.status, 200, intakeAnswer.text.slice(0, 300));
+  assert.equal(intakeAnswer.headers["cache-control"], "no-store");
+  const intake = JSON.parse(intakeAnswer.text);
+  assert.equal(intake.schemaVersion, "admin-performance-intake-v0.1");
+  assert.deepEqual(intake.deployment, { sourceCommit: EDGE_E2E_SOURCE_COMMIT, historySha256: production.historySha256 });
+  assert.deepEqual([intake.runtime.state, intake.runtime.policyRevision], ["active", 2]);
+  assert.deepEqual(Object.keys(intake.publication.lastRun).sort(),
+    ["deferredEmpty", "finishedAt", "published", "unchanged", "withheld"]);
+  assert.deepEqual({ ...intake.publication.lastRun, finishedAt: undefined }, {
+    finishedAt: undefined, published: PERFORMANCE_SLOT_KEYS, unchanged: [], withheld: null, deferredEmpty: false });
+  assert.deepEqual(intake.publication.slots.map(({ period, speedMode }) => `${period}:${speedMode}`),
+    PERFORMANCE_SLOT_KEYS);
+  assert.ok(intake.publication.slots.every(({ end }) => end === utcDay(Date.parse(nowIso) - DAY_MS)));
+  assert.deepEqual(intake.grants.activeByDictionary, [{ fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29,
+    dictionaryBasis: "v12_parser_inference", devices: 1 }]);
+  assert.equal(intake.reports.current, 1);
+  assert.equal(intake.reports.latestReportDay, day);
+  for (const secret of [device.deviceId, device.participantId]) {
+    assert.ok(!intakeAnswer.text.includes(secret), "the admin view carries no identifier");
+  }
+
+  // The refreshed slot through the edge: the origin's public 200, unchanged,
+  // with the device's day and model.
+  const { answer } = await edgeRead(f, `${COMMUNITY_MODEL_PERFORMANCE_PATH}?period=7&speedMode=standard`,
+    "S5 model-performance after the refresh");
+  assert.equal(answer.status, 200, answer.text.slice(0, 300));
+  assert.equal(answer.header("cache-control"), PUBLIC_MODEL_PERFORMANCE_CACHE);
+  const served = parseCommunityModelPerformance(JSON.parse(answer.text));
+  assert.deepEqual([served.period, served.speedMode, served.end], ["7", "standard", utcDay(Date.parse(nowIso) - DAY_MS)]);
+  assert.deepEqual(served.models.map(({ provider, modelId }) => [provider, modelId]), [["openai_codex", "gpt-5.5"]]);
+  assert.deepEqual([served.contributors, served.devices, served.reports], [1, 1, 1]);
+  assert.ok(served.models[0].speed.points.some((point) => point.day === day));
+  assertProductionLinesClean(production, [device.deviceId, device.participantId, device.secret.toString("base64url")]);
+  f.rows.push({ stage: "S5", id: "performance-refresh-admin-intake", published: receipt.performance.published.length,
+    adminStatus: intakeAnswer.status, publicStatus: answer.status });
 });
 
 // ---------------------------------------------------------------------------

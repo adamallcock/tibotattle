@@ -1,9 +1,17 @@
 import {
-  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21,
   PERFORMANCE_PRIVACY_CONTRACT_VERSION,
   PERFORMANCE_RECORD_SCHEMA_VERSION,
 } from "@app-usagemonitor/telemetry-contract";
 import { ApiError } from "./errors";
+
+// The legacy Cloudflare Worker is pinned to the dictionary it shipped with and
+// does not follow the client's moving emitted-dictionary default. On this line
+// that is 2026-09-21.1: its D1 schema (ingestion-isolation 0009) admits only
+// that dictionary, and this line carries no D1 Ultrafast upgrade.
+// Newer dictionaries are accepted only by the hosted origin.
+const LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-21.1" =
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21;
 
 export const TELEMETRY_PERFORMANCE_SCOPE = "model-performance-daily" as const;
 export const TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION =
@@ -45,7 +53,7 @@ export interface TelemetryPerformanceAuthorization {
 
 export interface TelemetryPerformanceRequiredConsent {
   readonly schemaVersion: typeof PERFORMANCE_RECORD_SCHEMA_VERSION;
-  readonly fieldDictionaryVersion: typeof PERFORMANCE_FIELD_DICTIONARY_VERSION;
+  readonly fieldDictionaryVersion: typeof LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION;
   readonly privacyContractVersion: typeof PERFORMANCE_PRIVACY_CONTRACT_VERSION;
   readonly scope: typeof TELEMETRY_PERFORMANCE_SCOPE;
 }
@@ -68,7 +76,7 @@ export interface TelemetryPerformanceAccountlessAuthorizationRequest {
 
 export interface TelemetryPerformanceConsent {
   readonly schemaVersion: typeof PERFORMANCE_RECORD_SCHEMA_VERSION;
-  readonly fieldDictionaryVersion: typeof PERFORMANCE_FIELD_DICTIONARY_VERSION;
+  readonly fieldDictionaryVersion: typeof LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION;
   readonly privacyContractVersion: typeof PERFORMANCE_PRIVACY_CONTRACT_VERSION;
   readonly scope: typeof TELEMETRY_PERFORMANCE_SCOPE;
 }
@@ -113,7 +121,7 @@ export function parseTelemetryPerformanceRequiredConsent(
 ): TelemetryPerformanceRequiredConsent {
   if (!exact(value, ["fieldDictionaryVersion", "privacyContractVersion", "schemaVersion", "scope"])
       || value.schemaVersion !== PERFORMANCE_RECORD_SCHEMA_VERSION
-      || value.fieldDictionaryVersion !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || value.fieldDictionaryVersion !== LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
       || value.privacyContractVersion !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
       || value.scope !== TELEMETRY_PERFORMANCE_SCOPE) {
     invalid("TELEMETRY_CONSENT_INVALID");
@@ -187,7 +195,7 @@ interface PerformanceGrantHead {
 function currentGrantContract(head: PerformanceGrantHead | null): boolean {
   return head !== null
     && head.schema_version === PERFORMANCE_RECORD_SCHEMA_VERSION
-    && head.field_dictionary_version === PERFORMANCE_FIELD_DICTIONARY_VERSION
+    && head.field_dictionary_version === LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
     && head.privacy_contract_version === PERFORMANCE_PRIVACY_CONTRACT_VERSION;
 }
 
@@ -342,7 +350,7 @@ export async function assertTelemetryPerformanceWriteAllowed(
       || row.capability_revision !== auth.capabilityRevision
       || row.authority_epoch !== auth.authorityEpoch
       || row.schema_version !== PERFORMANCE_RECORD_SCHEMA_VERSION
-      || row.field_dictionary_version !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || row.field_dictionary_version !== LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
       || row.privacy_contract_version !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
       || row.scope !== TELEMETRY_PERFORMANCE_SCOPE
       || !instant(row.issued_at) || !instant(row.expires_at)
@@ -405,7 +413,7 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
         AND r.schema_version = ? AND r.field_dictionary_version = ?
         AND r.privacy_contract_version = ?`,
   ).bind(principal.participantId, principal.deviceId, now,
-    PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    PERFORMANCE_RECORD_SCHEMA_VERSION, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
     PERFORMANCE_PRIVACY_CONTRACT_VERSION)
     .first<{ enrollment_device_id: string; expires_at: string }>();
   if (!owner) invalid();
@@ -433,7 +441,7 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
         ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
-        PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
+        PERFORMANCE_RECORD_SCHEMA_VERSION, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
         PERFORMANCE_PRIVACY_CONTRACT_VERSION, TELEMETRY_PERFORMANCE_SCOPE,
         next.capabilityRevision, next.authorityEpoch, now, owner.expires_at),
       db.prepare(
@@ -443,7 +451,7 @@ export async function grantTelemetryPerformanceAccountlessAuthorization(
           issued_at, expires_at, state, consented_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?)`,
       ).bind(principal.participantId, principal.deviceId,
-        PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
+        PERFORMANCE_RECORD_SCHEMA_VERSION, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
         PERFORMANCE_PRIVACY_CONTRACT_VERSION, TELEMETRY_PERFORMANCE_SCOPE,
         next.capabilityRevision, next.authorityEpoch, now, owner.expires_at, now),
     ]);
@@ -497,7 +505,7 @@ export async function grantTelemetryPerformanceSocialAuthorization(
         AND r.privacy_contract_version = ?
         AND d.expires_at > ?`,
   ).bind(principal.participantId, principal.deviceId,
-    PERFORMANCE_RECORD_SCHEMA_VERSION, PERFORMANCE_FIELD_DICTIONARY_VERSION,
+    PERFORMANCE_RECORD_SCHEMA_VERSION, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
     PERFORMANCE_PRIVACY_CONTRACT_VERSION, now).first<{ expires_at: string }>();
   if (!row || !instant(row.expires_at) || Date.parse(row.expires_at) <= nowEpoch) invalid("TELEMETRY_CONSENT_INVALID");
   const capabilityHead = await readPerformanceCapabilityHead(db, principal);
@@ -539,7 +547,7 @@ export function telemetryPerformanceCapabilityResponse(
 ): TelemetryPerformanceCapability {
   if (row.state !== "accepted"
       || row.schema_version !== PERFORMANCE_RECORD_SCHEMA_VERSION
-      || row.field_dictionary_version !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || row.field_dictionary_version !== LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
       || row.privacy_contract_version !== PERFORMANCE_PRIVACY_CONTRACT_VERSION) invalid();
   return Object.freeze({
     schemaVersion: TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
@@ -549,7 +557,7 @@ export function telemetryPerformanceCapabilityResponse(
     supportedSpeedMethods: TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS,
     requiredConsent: {
       schemaVersion: PERFORMANCE_RECORD_SCHEMA_VERSION,
-      fieldDictionaryVersion: PERFORMANCE_FIELD_DICTIONARY_VERSION,
+      fieldDictionaryVersion: LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION,
       privacyContractVersion: PERFORMANCE_PRIVACY_CONTRACT_VERSION,
       scope: TELEMETRY_PERFORMANCE_SCOPE,
     },

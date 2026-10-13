@@ -67,6 +67,7 @@ site.
 | `GET` | `/api/v1/admin/reconstruction-progress` | Admin application | Admin | Reads bounded refresh-generation and historical-completion metadata; never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
 | `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |
+| `GET` | `/api/v1/admin/performance-intake` | Admin application | Admin | Read-only, content-free performance-intake view (`admin-performance-intake-v0.1`): runtime state, grants, reports, dictionary mix, refusals and publication status; no activation control. The D1 Worker answers `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE`. | Operations |
 | `POST` | `/api/v1/me/security-reset` | Participant browser | Session | Rotates session/recovery state and invalidates affected credentials. | Participant account |
 | `POST` | `/api/v1/me/device-pairings` | Participant browser | Session | Creates a bounded device-pairing claim in D1. | Device lifecycle |
 | `POST` | `/api/v1/device-pairings/claim` | Native app | Pairing code | Claims the pairing and returns the device credential once. | Device lifecycle |
@@ -96,10 +97,56 @@ site.
 | `POST` | `/api/v1/contributions` | Prepared uploader | Upload | Validates and deduplicates an encrypted contribution, writes D1 state and quarantined R2 object data, and schedules aggregation. | Contribution ingestion |
 | `GET` | `/api/v1/me/export` | Participant browser | Session | Returns a bounded export of the participant's hosted data. | Participant data |
 | `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range; omits unavailable allowance evidence and stale or invalid optional API-equivalent spend. | Community publication |
+| `GET` | `/api/v1/community/model-performance` | Website | Public | Reads one published `community-model-performance-v1` slot (`period` × `speedMode`); no write. Before the first publication, and always on the D1 Worker, a valid slot is `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`. | Community publication |
 
 Production admin API and UI paths are served only on the configured admin host.
 Public-host requests to those paths are deliberately 404. Static site assets
 are not part of the API registry.
+
+### Community model performance and the PostgreSQL origin
+
+The owner decisions of 2026-10-10
+([community model speed](../decisions/2026-10-10-community-model-speed.md))
+add two routes to the 51 of the `d43c8f92` parity basis, so the registry
+holds 53. The PostgreSQL origin's route table
+(`apps/worker/cloud-run/postgres-production-registry.mjs`) classifies them, and
+its parity basis records both as owner-decided:
+
+- `GET /api/v1/community/model-performance` is in the origin's `performance`
+  class, beside the three restored accountless performance intake routes. All
+  four are ported in every origin mode. The query is exactly one `period`
+  (`1`, `7`, `30` or `all`) and one `speedMode` (`standard`, `fast` or
+  `ultrafast`), in any order; a missing, repeated or unknown key, or any other
+  value, is `400 BODY_INVALID`. The order matches `community/daily`: method,
+  then the `PUBLIC_ANALYTICS_MODE` switch (`503 PUBLICATION_DISABLED`, answered
+  at the edge without a limiter), then the publication collection control, then
+  the per-client public-read limiter, then the query. It spends the same
+  `public_aggregate_read` budget as `community/daily` (120 per 60 s per client);
+  it adds no admission purpose or edge header. The origin reads the slot's one
+  head row, verifies its digest and stamps, and answers `200` with
+  `Cache-Control: public, max-age=300`. Every other answer, the unpublished
+  `404` included, is `no-store`. The D1 Worker holds no performance
+  publication, so it always answers `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`
+  for a valid slot.
+- `GET /api/v1/admin/performance-intake` is in the origin's `admin` class, the
+  seventh admin route. Like the other admin routes it is served only on the
+  admin host, after the Access chokepoint, and it answers `400 BODY_INVALID`
+  for any query. Its source is read-only over the primary database. It has no
+  activation control; activation stays the owner-only `run_maintenance` task.
+  A source failure is `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE`, an expected
+  unavailable state that writes no diagnostic row.
+
+The origin also serves the three restored performance intake routes (owner
+decision 1 of 2026-10-10), which round 12 had retired:
+`POST /api/v1/accountless/telemetry-performance-authorization`,
+`GET /api/v1/device/telemetry/performance/capabilities` and
+`GET`/`POST /api/v1/device/telemetry/performance/reports`. They follow the
+Worker's authentication and admission order. Until the owner activates the
+performance runtime, an authenticated request answers
+`403 TELEMETRY_TRANSPORT_BLOCKED`, never the unported 503. The signed-in
+`POST /api/v1/me/device-telemetry-performance-consents` stays retired at the
+origin (`503 POSTGRES_ROUTE_NOT_PORTED`). These are source contracts; they do
+not claim a deployment or an activation.
 
 ### Public allowance breakdowns
 

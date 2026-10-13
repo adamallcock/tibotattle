@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assertOutputProvenance, collectOutputDigestEvidence, OUTPUT_DIGEST_POLICY, PRICING_CLASS_SCHEMA, semanticOutputRow } from "./output-digest-policy.mjs";
+import { assertOutputProvenance, collectOutputDigestEvidence, OUTPUT_DIGEST_POLICY, OUTPUT_DIGEST_POLICY_SHA256, PRICING_CLASS_SCHEMA, semanticOutputRow } from "./output-digest-policy.mjs";
 const binding = { kernelId: 5, computeSha256: "a".repeat(64), manifestVersion: 1 };
 const columns = Object.entries({ ...OUTPUT_DIGEST_POLICY, ...PRICING_CLASS_SCHEMA }).flatMap(([table_name, keys]) => keys.map((column_name) => ({ table_name, column_name })));
 function pool({ bad = null, catalog = columns } = {}) {
@@ -104,4 +104,30 @@ test("kernel 7 retains exact provenance and every mandatory pricing-class table"
     "first_kernel_id IS DISTINCT FROM", "state <>", "c.cards_sha256 IS DISTINCT FROM", "p.method NOT IN"])
     await assert.rejects(collectOutputDigestEvidence(pool({ bad }), "synthetic", seven),
       { code: /MEAS_OUTPUT_PROVENANCE_INVALID/u });
+});
+
+test("the community model performance heads project out only their run stamps and release instant", async () => {
+  assert.deepEqual(OUTPUT_DIGEST_POLICY.analytics_v2_published_performance,
+    ["run_id", "kernel_id", "manifest_version", "released_at"]);
+  assert.ok(Object.isFrozen(OUTPUT_DIGEST_POLICY.analytics_v2_published_performance));
+  const head = { period: "7", speed_mode: "fast", revision: 3, released_at: "2026-10-11T03:00:00.000Z",
+    payload: { models: [] }, payload_sha256: "a".repeat(64), run_id: "r", kernel_id: 15, manifest_version: 1 };
+  assert.deepEqual(semanticOutputRow("analytics_v2_published_performance", head),
+    { period: "7", speed_mode: "fast", revision: 3, payload: { models: [] }, payload_sha256: "a".repeat(64) });
+  for (const key of ["period", "speed_mode", "revision", "payload", "payload_sha256"]) {
+    assert.notDeepEqual(semanticOutputRow("analytics_v2_published_performance", head),
+      semanticOutputRow("analytics_v2_published_performance", { ...head, [key]: "changed" }), key);
+  }
+  // Its projected stamps are still proven: kernel and manifest exact, run_id linked to a completed run.
+  const valid = pool();
+  await assertOutputProvenance(valid, "synthetic", binding);
+  const fragment = 'FROM "synthetic"."analytics_v2_published_performance"';
+  for (const key of ["kernel_id", "manifest_version"]) {
+    assert.ok(valid.calls.some(([sql]) => sql.includes(fragment) && sql.includes(`"${key}" IS DISTINCT FROM`)), key);
+  }
+  assert.ok(valid.calls.some(([sql]) => sql.includes(`${fragment} t`) && sql.includes('t."run_id"')), "run_id");
+});
+
+test("the policy digest is pinned: a projection change is deliberate", () => {
+  assert.equal(OUTPUT_DIGEST_POLICY_SHA256, "0634a3098b9ff8c24abfd7538be543bf51eb8e8ad9bb3637198318e235d7cb5b");
 });

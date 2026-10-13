@@ -174,8 +174,8 @@ export const EDGE_HEALTH_OK_TEXT = '"status":"ok"';
  * not the body's code, and its URL (httpRequest) is outside the privacy
  * contract.
  * - round 12 (2026-10-02): the native social chain (Google, Apple, legacy
- *   /api/v1/enroll), security reset, and the performance device and consent
- *   routes are retired;
+ *   /api/v1/enroll), security reset, and the signed-in performance consent
+ *   route are retired;
  * - OD-CR-2 (round 1): participant export is retired;
  * - C-ADMIN: an admin task with no PostgreSQL port answers 503
  *   POSTGRES_ROUTE_NOT_PORTED on the admin action route.
@@ -188,11 +188,13 @@ export const EDGE_HEALTH_OK_TEXT = '"status":"ok"';
  * they are shared with every live v1 upload, and an exclusion keys only on
  * routeClass, status and code, never on the schema version, so excluding
  * either would hide a live upload's 5xx.
- * The accountless performance authorization is not excluded either: round
- * 19 has it answer production's sequence (a 4xx, or the Worker's own
- * configuration, containment, storage or admission 503) and then the
- * definite 403 TELEMETRY_TRANSPORT_BLOCKED, never the unported 503, so a 5xx
- * from it counts like any live route's.
+ * The restored performance intake (owner decision 2026-10-10, decision 1:
+ * the accountless performance authorization, capabilities and reports) is
+ * served by the performance family and never excluded: before the owner
+ * activates the runtime an authenticated request answers 403
+ * TELEMETRY_TRANSPORT_BLOCKED, never a 5xx, so any 5xx from these paths (the
+ * Worker's own configuration, containment, storage or admission 503s
+ * included) counts like any live route's.
  */
 export const ORIGIN_5XX_EXCLUSIONS = Object.freeze([
   ["/api/v1/enroll", "round-12"],
@@ -203,9 +205,7 @@ export const ORIGIN_5XX_EXCLUSIONS = Object.freeze([
   ["/api/v1/identity/apple/callback", "round-12"],
   ["/api/v1/identity/apple/result", "round-12"],
   ["/api/v1/me/security-reset", "round-12"],
-  ["/api/v1/device/telemetry/performance/capabilities", "round-12"],
   ["/api/v1/me/device-telemetry-performance-consents", "round-12"],
-  ["/api/v1/device/telemetry/performance/reports", "round-12"],
   ["/api/v1/me/export", "od-cr-2"],
   ["/api/v1/admin/action", "c-admin"],
 ].map(([path, decision]) => Object.freeze({
@@ -231,14 +231,16 @@ export const ORIGIN_5XX_NEVER_EXCLUDED_CODES = Object.freeze([
 /**
  * Exact paths that are never excluded, whatever the code: the two live
  * upload routes v0.x shares (a v0.x upload answers a 4xx since round 19, and
- * any 5xx on these paths stays counted), the accountless performance
- * authorization (production's answer sequence, never the unported 503;
- * round 19), and the renew and disconnect routes round 12 keeps.
+ * any 5xx on these paths stays counted), the three restored performance
+ * intake routes (decision 1, 2026-10-10: served; 403 before activation,
+ * never a 5xx), and the renew and disconnect routes round 12 keeps.
  */
 export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
   "/api/v1/contributions",
   "/api/v1/device/upload-authorizations",
   "/api/v1/accountless/telemetry-performance-authorization",
+  "/api/v1/device/telemetry/performance/capabilities",
+  "/api/v1/device/telemetry/performance/reports",
   "/api/v1/device/credential/renew",
   "/api/v1/device/disconnect",
 ]);

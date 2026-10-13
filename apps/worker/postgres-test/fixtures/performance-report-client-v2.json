@@ -1,0 +1,267 @@
+{
+  "schemaVersion": "telemetry-performance-report-v1",
+  "day": "2026-10-10",
+  "sourceGeneration": "timing:synthetic-interop-1",
+  "sourceDigest": "5555555555555555555555555555555555555555555555555555555555555555",
+  "sourceRevision": 7,
+  "methodVersion": "performance-daily-histogram-v1",
+  "parserVersion": "codex-inference-timing-v18",
+  "fieldDictionaryVersion": "telemetry-performance-registry-2026-10-10.1",
+  "privacyContractVersion": "privacy-safe-model-performance-v1",
+  "bucketSchemeVersion": "performance-histogram-v2",
+  "measurementVersion": "model-performance-samples-v1",
+  "records": [
+    {
+      "apiServiceTier": "unknown",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "completionHistogram": {
+        "buckets": {
+          "14": 1
+        },
+        "max": 3000,
+        "metric": "turnDuration",
+        "min": 3000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "completionTurns": 1,
+      "day": "2026-10-10",
+      "measurementVersion": "model-performance-samples-v1",
+      "modelId": "gpt-5.6-sol",
+      "provider": "openai_codex",
+      "reasoningEffort": "high",
+      "schemaVersion": "model-performance-daily-v1",
+      "speedDurationMs": 3000,
+      "speedHistogram": {
+        "buckets": {
+          "68": 1
+        },
+        "max": 20000,
+        "metric": "speed",
+        "min": 20000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "speedMethod": "tool_free",
+      "speedMode": "standard",
+      "speedModeSource": "rollout_thread_settings",
+      "speedTokens": 600,
+      "speedTurns": 1,
+      "timedResponses": 1,
+      "ttftHistogram": {
+        "buckets": {
+          "4": 1
+        },
+        "max": 700,
+        "metric": "ttft",
+        "min": 700,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "ttftTurns": 1,
+      "turns": 1
+    },
+    {
+      "apiServiceTier": "unknown",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "completionHistogram": {
+        "buckets": {
+          "14": 1
+        },
+        "max": 3000,
+        "metric": "turnDuration",
+        "min": 3000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "completionTurns": 1,
+      "day": "2026-10-10",
+      "measurementVersion": "model-performance-samples-v1",
+      "modelId": "gpt-5.6-terra",
+      "provider": "openai_codex",
+      "reasoningEffort": "medium",
+      "schemaVersion": "model-performance-daily-v1",
+      "speedDurationMs": 1000,
+      "speedHistogram": {
+        "buckets": {
+          "63": 1
+        },
+        "max": 15000,
+        "metric": "speed",
+        "min": 15000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "speedMethod": "legacy",
+      "speedMode": "fast",
+      "speedModeSource": "lineage_inherited",
+      "speedTokens": 150,
+      "speedTurns": 1,
+      "timedResponses": 1,
+      "ttftHistogram": {
+        "buckets": {
+          "4": 1
+        },
+        "max": 700,
+        "metric": "ttft",
+        "min": 700,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "ttftTurns": 1,
+      "turns": 1
+    },
+    {
+      "apiServiceTier": "unknown",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "completionHistogram": {
+        "buckets": {
+          "14": 1
+        },
+        "max": 3000,
+        "metric": "turnDuration",
+        "min": 3000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "completionTurns": 1,
+      "day": "2026-10-10",
+      "measurementVersion": "model-performance-samples-v1",
+      "modelId": "gpt-5.6-terra",
+      "provider": "openai_codex",
+      "reasoningEffort": "medium",
+      "schemaVersion": "model-performance-daily-v1",
+      "speedDurationMs": 2000,
+      "speedHistogram": {
+        "buckets": {
+          "87": 1
+        },
+        "max": 120000,
+        "metric": "speed",
+        "min": 120000,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "speedMethod": "receipt",
+      "speedMode": "ultrafast",
+      "speedModeSource": "turn_context_service_tier",
+      "speedTokens": 2400,
+      "speedTurns": 1,
+      "timedResponses": 1,
+      "ttftHistogram": {
+        "buckets": {
+          "0": 1
+        },
+        "max": 0,
+        "metric": "ttft",
+        "min": 0,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "ttftTurns": 1,
+      "turns": 1
+    },
+    {
+      "apiServiceTier": "unknown",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "completionHistogram": {
+        "buckets": {
+          "14": 3
+        },
+        "max": 3000,
+        "metric": "turnDuration",
+        "min": 2750,
+        "sampleCount": 3,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "completionTurns": 3,
+      "day": "2026-10-10",
+      "measurementVersion": "model-performance-samples-v1",
+      "modelId": "gpt-5.6-sol",
+      "provider": "openai_codex",
+      "reasoningEffort": "high",
+      "schemaVersion": "model-performance-daily-v1",
+      "speedDurationMs": 10000,
+      "speedHistogram": {
+        "buckets": {
+          "42": 1,
+          "60": 1,
+          "80": 1
+        },
+        "max": 40800,
+        "metric": "speed",
+        "min": 8500,
+        "sampleCount": 3,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "speedMethod": "receipt",
+      "speedMode": "standard",
+      "speedModeSource": "rollout_thread_settings",
+      "speedTokens": 1493,
+      "speedTurns": 3,
+      "timedResponses": 4,
+      "ttftHistogram": {
+        "buckets": {
+          "3": 1,
+          "4": 2
+        },
+        "max": 700,
+        "metric": "ttft",
+        "min": 640,
+        "sampleCount": 3,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "ttftTurns": 3,
+      "turns": 3
+    },
+    {
+      "apiServiceTier": "unknown",
+      "bucketSchemeVersion": "performance-histogram-v2",
+      "completionHistogram": {
+        "buckets": {
+          "17": 1
+        },
+        "max": 4100,
+        "metric": "turnDuration",
+        "min": 4100,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "completionTurns": 1,
+      "day": "2026-10-10",
+      "measurementVersion": "model-performance-samples-v1",
+      "modelId": "gpt-5.6-sol",
+      "provider": "openai_codex",
+      "reasoningEffort": "high",
+      "schemaVersion": "model-performance-daily-v1",
+      "speedDurationMs": 0,
+      "speedHistogram": {
+        "buckets": {},
+        "max": null,
+        "metric": "speed",
+        "min": null,
+        "sampleCount": 0,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "speedMethod": "unavailable",
+      "speedMode": "unknown",
+      "speedModeSource": "unobserved",
+      "speedTokens": 0,
+      "speedTurns": 0,
+      "timedResponses": 0,
+      "ttftHistogram": {
+        "buckets": {
+          "0": 1
+        },
+        "max": 0,
+        "metric": "ttft",
+        "min": 0,
+        "sampleCount": 1,
+        "schemaVersion": "performance-histogram-v2"
+      },
+      "ttftTurns": 1,
+      "turns": 1
+    }
+  ],
+  "reportRevision": "884d9419b46610e0e04203daed107510bc4fc038b22eb381c0a0a0d13533ba0f"
+}

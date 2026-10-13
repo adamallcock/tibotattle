@@ -61,6 +61,7 @@ const FAILURE_FAMILIES = new Set([
   "occurrences.correction_candidates", "occurrences.legacy_sources", "occurrences.v12_sources",
   "occurrences.correction_sources", "occurrences.counts", "occurrences.first_evidence", "occurrences.watermark",
   "devices.count", "queued_days.page", "exclusions.read", "owner_sets.read", "owner_sets.values", "owner_sets.frozen",
+  "performance.reports", "performance.cohorts",
 ]);
 const FAILURE_SQL_STATES = new Set(["57014", "55P03"]);
 const boundedAdd = (left, right) => Math.min(Number.MAX_SAFE_INTEGER, left + right);
@@ -675,7 +676,9 @@ function compareOwners(left, right) {
  * exclusions.ts's predicate): it is outside that day's cohort. Legacy-only
  * (v0.2) owners are not daily-cohort members and are not read.
  */
-export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets }) {
+export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queuedDays, compute, ownerSets,
+  // Named apart from the global `performance` (performance.now() times the reads).
+  performance: performanceStage = undefined }) {
   const listOwners = requireFunction(owners, "listAnalyticsV2Owners");
   const readQueued = requireFunction(queuedDays, "readQueuedDays");
   const readOccurrences = requireFunction(occurrences, "readOwnerOccurrences");
@@ -701,6 +704,13 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
     occurrences?.MAX_ANALYTICS_V2_OCCURRENCE_DAYS ?? DEFAULT_OCCURRENCE_CHUNK_DAYS,
     "MAX_ANALYTICS_V2_OCCURRENCE_DAYS",
   );
+  // The optional performance stage (SPD-P3): the A-1 performance reader and
+  // the performance fold, both or neither. Without it the pipeline is exactly
+  // the one before it and the run carries no performance outputs.
+  const readPerformancePage = performanceStage === undefined ? null
+    : requireFunction(performanceStage?.source, "readAnalyticsV2PerformanceSource");
+  const foldPerformance = performanceStage === undefined ? null
+    : requireFunction(performanceStage?.compute, "computeAnalyticsV2Performance");
 
   async function readJournal(context, cursor) {
     let afterSequence = cursor === null ? 0 : sequenceNumber(cursor);
@@ -800,6 +810,65 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
     }
     for (const [day, entry] of evidence) evidence.set(day, Object.freeze(entry));
     return { byStream, evidence };
+  }
+
+  /**
+   * The performance fold over the reader's pages, streamed page by page into
+   * computeAnalyticsV2Performance (no page is kept once folded). The fold
+   * runs without an output account: the store charges its candidates once,
+   * against the room computeAnalyticsV2 left, and records them. Its progress
+   * events go to the Job's checkpoint (the time guard's `performance` kind).
+   * The reader's counts must agree with the fold's (every record read is
+   * folded); the reader's deferred days, which it never yields, join the
+   * fold's summary. A published result must name a model exactly when it
+   * counted an included record (GATE-Q 12; the store defers an all-empty
+   * first publication by the models it names).
+   */
+  async function computePerformanceOutputs(inputs, { nowMs, checkpoint }) {
+    if (typeof inputs.loadPerformance !== "function" || typeof inputs.performanceExcludedOn !== "function") {
+      fail("ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE", { missing: "loadPerformance" });
+    }
+    let sourceSummary = null;
+    async function* records() {
+      let position = null;
+      for (;;) {
+        const page = await inputs.loadPerformance(position);
+        if (page === null || typeof page !== "object" || !Array.isArray(page.records)
+            || page.summary === null || typeof page.summary !== "object"
+            || (page.checkpoint !== null && typeof page.checkpoint !== "object")) {
+          fail("ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID");
+        }
+        sourceSummary = page.summary;
+        yield* page.records;
+        if (page.checkpoint === null) return;
+        position = page.checkpoint;
+      }
+    }
+    const result = await foldPerformance({
+      records: records(),
+      nowMs,
+      excludedOn: inputs.performanceExcludedOn,
+      ...(checkpoint === undefined ? {} : { checkpoint }),
+    });
+    const counted = (value) => Number.isSafeInteger(value) && value >= 0;
+    if (result === null || typeof result !== "object" || !Array.isArray(result.candidates)
+        || result.summary === null || typeof result.summary !== "object" || sourceSummary === null
+        || sourceSummary.complete !== true || !counted(sourceSummary.deferredFutureDays)
+        || sourceSummary.reports !== result.summary.reports || sourceSummary.cohorts !== result.summary.cohorts
+        || !counted(result.summary.deferredFutureDays) || !counted(result.summary.includedRecords)) {
+      fail("ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID");
+    }
+    if (result.withheld === null && (result.summary.includedRecords > 0)
+        !== result.candidates.some((candidate) => Array.isArray(candidate?.payload?.models)
+          && candidate.payload.models.length > 0)) {
+      fail("ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID");
+    }
+    return Object.freeze({
+      candidates: result.candidates,
+      summary: Object.freeze({ ...result.summary,
+        deferredFutureDays: result.summary.deferredFutureDays + sourceSummary.deferredFutureDays }),
+      withheld: result.withheld,
+    });
   }
 
   return Object.freeze({
@@ -1003,6 +1072,29 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
       // The stored values a fold needs, read during compute while the
       // snapshot is open (as the owner loads are).
       const loadSavedContributions = (keys) => readSavedValues(context, keys);
+      // The performance stage's reads, made lazily during compute while the
+      // snapshot is open (as loadSavedContributions): one keyset page per
+      // call, each in its own snapshot transaction on a read connection
+      // (every importing transaction reports the same snapshot, so a page
+      // continues the previous page's checkpoint). Reports through the
+      // latest completed UTC day are read; later days are only counted
+      // (deferredFutureDays). N-EXCL: a performance record's participant is
+      // matched by equality against the same active exclusions, per day,
+      // through analyticsV2ExcludedOn. The participant keys never leave the
+      // fold.
+      const loadPerformance = readPerformancePage === null ? null : async (checkpoint) => {
+        const reader = await pool.connect();
+        try {
+          await reader.query("BEGIN");
+          const page = await readPerformancePage(reader, { schema, throughDay: addDays(today, -1), checkpoint });
+          await reader.query("COMMIT");
+          return page;
+        } finally {
+          await reader.release();
+        }
+      };
+      const performanceExcludedOn = (participantKey, day) =>
+        excludedOn(exclusions.activeByParticipant.get(participantKey), day) === true;
 
       // One effective owner's occurrences over one A-2 segment (the whole
       // range when none is named), in spans of about the per-load chunk by
@@ -1061,6 +1153,7 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
         exclusions: exclusionsSummary(exclusions, exclusionsByOwner.size, exclusionsChanged,
           days.length - unchangedDays.length),
         ...(resources?.compute === undefined ? {} : { resources: resources.compute }),
+        ...(loadPerformance === null ? {} : { loadPerformance, performanceExcludedOn }),
       };
     },
     async compute(inputs, { nowMs, revisionSeed, memoryProbe = defaultMemoryProbe, checkpoint, ownerPool }) {
@@ -1109,9 +1202,16 @@ export function createAnalyticsV2Pipeline({ owners, occurrences, devices, queued
           blockedDays: [...new Set([...outputs.blockedDays, ...withheld.map((candidate) => candidate.day)])].sort(),
         };
       }
+      // The performance stage runs after computeAnalyticsV2 returns, outside
+      // it, so the daily, preview and owner outputs (and their goldens) are
+      // the same with or without it. A withheld fold affects only the
+      // performance publication; a reader or fold defect fails the run.
+      const performanceOutputs = foldPerformance === null ? null
+        : await computePerformanceOutputs(inputs, { nowMs, checkpoint });
       return {
         ...outputs,
         ...publication,
+        ...(performanceOutputs === null ? {} : { performance: performanceOutputs }),
         // The journal position is the reader's, not the pure compute core's.
         journal: { lastSequence: inputs.lastSequence },
         // The owner-scoped rows this run recomputes: every prepared day from the

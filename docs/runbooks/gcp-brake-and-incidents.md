@@ -302,6 +302,31 @@ credential or containing a device only stops future uploads; none withdraws
 accepted contributions. See
 [the append-only decision](../decisions/2026-09-26-append-only-contributions.md#d2-erasure-is-a-rare-manual-offline-owner-procedure-variant-b).
 
+**Performance evidence in an offline purge.** Primary migration
+`0079_performance_telemetry.sql` adds the accountless performance stream
+([community model speed](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)).
+Its effect on the offline procedure:
+
+- The performance raw tables (grants, capabilities, reports, cohorts, buckets
+  and receipts) cascade from `participants`. The purge's participant delete
+  removes the participant's performance rows with it, and a direct delete of
+  those rows is refused while the participant is active. The enrollment
+  ledger rows are kept (`ON DELETE RESTRICT`).
+- The community model-performance publication heads and the refusal counters
+  carry no participant, so they are not in the purge inventory. The next
+  analytics refresh recomputes every slot from the remaining reports and
+  revises each publication head; an empty payload replaces a stale head.
+- If that refresh withholds the performance stage, it leaves every head
+  unchanged, and the stale heads still contain the purged contributions until
+  a later run publishes. Before declaring a purge complete, confirm that the
+  first refresh after it published performance rather than withholding it:
+  the admin performance-intake view's last run finished after the purge with
+  `withheld` null (the refresh receipt's `performance.withheld` agrees), and
+  the runtime probe's `community_model_performance_head_age_days` has not
+  grown.
+- Nothing deletes performance evidence online. Revoking, disconnecting, opting
+  out or containing a device stops future grants and uploads only.
+
 ## Never
 
 - Never move authority back to Cloudflare after the switch: no `gcp` to

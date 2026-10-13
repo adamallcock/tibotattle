@@ -84,9 +84,16 @@ after(async () => {
 // ---------------------------------------------------------------------------
 // Fixture
 
-const SCOPE = () => registryModule.POSTGRES_SCOPE_ROUTE_IDS;
-const SCOPE_AND_CONTESTED = () => [...registryModule.POSTGRES_SCOPE_ROUTE_IDS,
-  ...registryModule.OD_CR_1_CONTESTED_ROUTE_IDS];
+/**
+ * The smallest ported set: scope and the performance class (the restored
+ * intake, decision 1, and the public model-performance read, decision 7).
+ */
+const SCOPE = () => [...registryModule.POSTGRES_SCOPE_ROUTE_IDS, ...registryModule.PERFORMANCE_ROUTE_IDS];
+const SCOPE_AND_CONTESTED = () => [...SCOPE(), ...registryModule.OD_CR_1_CONTESTED_ROUTE_IDS];
+/** Decision 1's intake: the performance class without the public read. */
+const PERFORMANCE = () => registryModule.PERFORMANCE_ROUTE_IDS.filter((id) => !PUBLIC_READS.includes(id));
+/** The two public reads: PUBLIC_ANALYTICS_MODE pre-gate, storage gate, 200 cache passthrough. */
+const PUBLIC_READS = Object.freeze(["community_daily", "community_model_performance"]);
 
 function envOf(overrides = {}) {
   return Object.freeze({ PUBLIC_ORIGIN, PUBLIC_ANALYTICS_MODE: "enabled", ...overrides });
@@ -96,15 +103,12 @@ function envOf(overrides = {}) {
  * A handler over stub families. families maps a route id to
  * (request, context) => Response | Promise<Response>; every other ported id
  * answers 200 JSON with a public cache-control the handler must replace.
- * preambles maps a retired-definite id to (request, context) => Response |
- * null; by default each passes (null), so the terminal answer stands.
  */
 function fixture({
   ported = SCOPE(),
   adminHostPolicy = "refuse",
   env = envOf(),
   families = {},
-  preambles = {},
   storageGate,
   logger,
   recordDiagnostic,
@@ -115,7 +119,6 @@ function fixture({
   const diagnostics = [];
   const gateCalls = [];
   const store = contextModule.createRequestContextStore();
-  const preambleCalls = [];
   const handlers = new Map(ported.map((id) => [id, async (request) => {
     const context = store.accessor(request);
     calls.push({ id, request, context });
@@ -123,14 +126,6 @@ function fixture({
     if (family !== undefined) return family(request, context);
     return Response.json({ served: id }, { headers: { "cache-control": "public, max-age=60" } });
   }]));
-  for (const id of registryModule.RETIRED_DEFINITE_ROUTE_IDS) {
-    handlers.set(id, async (request) => {
-      const context = store.accessor(request);
-      preambleCalls.push({ id, request, context });
-      const preamble = preambles[id];
-      return preamble === undefined ? null : preamble(request, context);
-    });
-  }
   const registry = registryModule.createProductionRouteRegistry({ routePolicy: policy, handlers, portedRouteIds: ported });
   const contexts = new WeakMap();
   const handler = dispatch.createProductionRequestHandler({
@@ -154,7 +149,6 @@ function fixture({
     registry,
     store,
     calls,
-    preambleCalls,
     lines,
     diagnostics,
     gateCalls,
@@ -312,8 +306,7 @@ test("createProductionRequestHandler refuses every malformed or undecided input 
   }
   const lookalike = registryModule.createProductionRouteRegistry({
     routePolicy: policy.map((route) => ({ ...route })),
-    handlers: new Map([...SCOPE(), ...registryModule.RETIRED_DEFINITE_ROUTE_IDS]
-      .map((id) => [id, async () => new Response(null)])),
+    handlers: new Map(SCOPE().map((id) => [id, async () => new Response(null)])),
     portedRouteIds: SCOPE(),
   });
   const cases = [
@@ -513,14 +506,18 @@ test("step 4: every exact route outside the admin set answers 405 with its exact
   assert.equal(f.calls.length, 0);
 });
 
-test("step 5: community_daily with publication disabled is the Worker's unlogged 503", async () => {
+test("step 5: both public reads with publication disabled are the Worker's unlogged 503", async () => {
   for (const mode of [undefined, "disabled", "ENABLED"]) {
     const f = fixture({ env: envOf({ PUBLIC_ANALYTICS_MODE: mode }) });
     await assertError(await f.handler(f.edge(request("/api/v1/community/daily?date=2026-10-01"))), 503,
       "PUBLICATION_DISABLED", String(mode), { requestId: EDGE_REQUEST_ID });
+    await assertError(await f.handler(f.edge(request("/api/v1/community/model-performance?period=7&speedMode=fast"))),
+      503, "PUBLICATION_DISABLED", `model-performance ${mode}`, { requestId: EDGE_REQUEST_ID });
     // The method envelope still comes first.
     await assertError(await f.handler(request("/api/v1/community/daily", { method: "POST" })), 405,
       "METHOD_NOT_ALLOWED", "POST", { allow: "GET" });
+    await assertError(await f.handler(request("/api/v1/community/model-performance", { method: "POST" })), 405,
+      "METHOD_NOT_ALLOWED", "model-performance POST", { allow: "GET" });
     assert.equal(f.calls.length, 0);
     assert.equal(f.gateCalls.length, 0);
     assert.equal(parsedLines(f.lines).filter((line) => line.code === "PUBLICATION_DISABLED").length, 0);
@@ -612,103 +609,67 @@ test("round 12: every retired route answers the uniform 503 with no retry-after 
   }
 });
 
-test("round 19: the accountless performance authorization runs its preamble, then answers the definite 403", async () => {
-  const id = "accountless_telemetry_performance_authorization";
-  assert.deepEqual(registryModule.RETIRED_DEFINITE_ROUTE_IDS, [id]);
+test("decision 1: the three performance routes are ported families, never the unported 503", async () => {
+  assert.deepEqual([...PERFORMANCE()], ["accountless_telemetry_performance_authorization",
+    "telemetry_performance_capabilities", "telemetry_performance_reports"]);
+  assert.deepEqual([...registryModule.PERFORMANCE_ROUTE_IDS], [...PERFORMANCE(), "community_model_performance"]);
+  // While the runtime is staged the family answers 403 TELEMETRY_TRANSPORT_BLOCKED
+  // after authentication: the root passes it through as a family answer.
+  const blocked = (_request, context) => errors.errorResponse(
+    new errors.ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED"), context.requestId);
   for (const unportedRetryAfterSeconds of [null, TEST_UNPORTED_RETRY_AFTER]) {
-    const f = fixture({ ported: SCOPE_AND_CONTESTED(), unportedRetryAfterSeconds });
-    assert.equal(f.registry.unportedRouteIds.includes(id), false);
-    // A preamble that passes (null): the d43c8f92 terminal code, with no
-    // retry-after (not even an injected one), the Worker envelope, no-store.
-    for (const init of [
-      { method: "POST", body: JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
-        policyVersion: "accountless-telemetry-performance-policy-v1",
-        authorizationBasis: "accountless-performance-policy-v1" }),
-      headers: { "content-type": "application/json", authorization: "Device synthetic.synthetic" } },
-      { method: "POST" },
-    ]) {
-      const response = await f.handler(f.edge(request(pathOf(id), init)));
-      const error = await assertError(response, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${id} ${JSON.stringify(init.headers)}`,
-        { requestId: EDGE_REQUEST_ID });
-      assert.deepEqual(Object.keys(error), ["code", "requestId"]);
+    const f = fixture({
+      ported: SCOPE_AND_CONTESTED(),
+      unportedRetryAfterSeconds,
+      families: Object.fromEntries(PERFORMANCE().map((id) => [id, blocked])),
+    });
+    for (const id of PERFORMANCE()) {
+      assert.equal(f.registry.resolve(id).disposition, "ported", id);
+      assert.equal(f.registry.unportedRouteIds.includes(id), false, id);
+      for (const method of methodsOf(id)) {
+        const response = await f.handler(f.edge(request(pathOf(id), {
+          method,
+          ...(method === "POST" ? { body: "{}", headers: { "content-type": "application/json" } } : {}),
+        })));
+        // No retry-after (not even an injected one), the Worker envelope, no-store.
+        const error = await assertError(response, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${method} ${id}`,
+          { requestId: EDGE_REQUEST_ID });
+        assert.deepEqual(Object.keys(error), ["code", "requestId"]);
+      }
+      // A wrong method keeps the registry's 405 first, before the family.
+      const wrong = id === "telemetry_performance_capabilities" ? "POST" : "DELETE";
+      await assertError(await f.handler(f.edge(request(pathOf(id), { method: wrong }))), 405, "METHOD_NOT_ALLOWED",
+        `${id} ${wrong}`, { allow: methodsOf(id).join(", "), requestId: EDGE_REQUEST_ID });
     }
-    // The preamble ran once per request, inside the context store, with the
-    // edge's request id and the route id (no admin identity), and no family ran.
-    assert.equal(f.preambleCalls.length, 2);
-    for (const call of f.preambleCalls) {
-      assert.deepEqual({ ...call.context }, { requestId: EDGE_REQUEST_ID, routeId: id });
-      assert.equal(f.store.accessor(call.request), undefined, "the context is released once the preamble settles");
+    // Each family ran once per allowed request, inside the context store, with
+    // the edge's request id and the route id (no admin identity).
+    assert.equal(f.calls.length, 4);
+    for (const call of f.calls) {
+      assert.ok(PERFORMANCE().includes(call.id), call.id);
+      assert.deepEqual({ ...call.context }, { requestId: EDGE_REQUEST_ID, routeId: call.id });
+      assert.equal(f.store.accessor(call.request), undefined, "the context is released once the family settles");
     }
-    // A wrong method keeps the registry's 405 first, as the Worker answers it, before the preamble.
-    await assertError(await f.handler(f.edge(request(pathOf(id), { method: "GET" }))), 405, "METHOD_NOT_ALLOWED",
-      `${id} GET`, { allow: "POST", requestId: EDGE_REQUEST_ID });
-    assert.equal(f.preambleCalls.length, 2);
-    assert.equal(f.calls.length, 0);
-    assert.equal(f.gateCalls.length, 0, "the handler reads no storage for it; the preamble owns its storage gate");
-    // Logged as the Worker logs a 4xx: request_failed at warn; never a sampled 5xx diagnostic.
+    assert.equal(f.gateCalls.length, 0, "the handler reads no storage for them; the family owns its storage gate");
+    // Logged as the Worker logs a 4xx: request_failed at warn; never a 5xx.
     const lines = parsedLines(f.lines).filter((line) => line.code === "TELEMETRY_TRANSPORT_BLOCKED");
-    assert.equal(lines.length, 2);
+    assert.equal(lines.length, 4);
     for (const line of lines) {
-      assert.deepEqual([line.event, line.level, line.status, line.routeClass], ["request_failed", "warn", 403, id]);
+      assert.deepEqual([line.event, line.level, line.status], ["request_failed", "warn", 403]);
+      assert.ok(PERFORMANCE().includes(line.routeClass), line.routeClass);
     }
     assert.ok(f.diagnostics.every((event) => event.status < 500));
   }
-  // A registry the root built without the definite route cannot exist: it is never portable.
+  // The signed-in consent route stays retired: the uniform 503, no family.
+  const f = fixture({ ported: SCOPE_AND_CONTESTED(), unportedRetryAfterSeconds: null });
+  await assertError(await f.handler(f.edge(request(pathOf("telemetry_performance_consent"), { method: "POST",
+    body: "{}", headers: { "content-type": "application/json" } }))), 503, "POSTGRES_ROUTE_NOT_PORTED",
+  "consent", { requestId: EDGE_REQUEST_ID });
+  assert.equal(f.calls.length, 0);
+  // A root that leaves the performance routes out cannot build a registry.
   assert.throws(() => registryModule.createProductionRouteRegistry({ routePolicy: policy,
-    portedRouteIds: [...SCOPE(), id], handlers: new Map([...SCOPE(), id].map((routeId) => [routeId, async () => null])) }),
-  { code: "PRODUCTION_ROUTE_PORT_RETIRED" });
-  // ...nor one without its preamble.
-  assert.throws(() => registryModule.createProductionRouteRegistry({ routePolicy: policy,
-    portedRouteIds: SCOPE(), handlers: new Map(SCOPE().map((routeId) => [routeId, async () => null])) }),
-  { code: "PRODUCTION_ROUTE_HANDLER_MISSING" });
-});
-
-test("round 19: a preamble refusal is the answer, logged and no-store; a non-refusal is a 500, never a grant", async () => {
-  const id = "accountless_telemetry_performance_authorization";
-  const refusals = [
-    [401, "AUTH_INVALID", {}],
-    [429, "ATTEMPT_LIMIT_REACHED", { "retry-after": "60" }],
-    [503, "ADMISSION_RATE_LIMIT_UNAVAILABLE", { "retry-after": "60" }],
-    [401, "DEVICE_AUTH_INVALID", {}],
-    [400, "BODY_INVALID", {}],
-  ];
-  let next = 0;
-  const f = fixture({
-    ported: SCOPE_AND_CONTESTED(),
-    preambles: {
-      [id]: (_request, context) => {
-        const [status, code, headers] = refusals[next];
-        next += 1;
-        return errors.errorResponse(new errors.ApiError(status, code, { responseHeaders: headers }), context.requestId);
-      },
-    },
-  });
-  for (const [status, code, headers] of refusals) {
-    const response = await f.handler(f.edge(request(pathOf(id), { method: "POST", body: "{}",
-      headers: { "content-type": "application/json" } })));
-    await assertError(response, status, code, code, { requestId: EDGE_REQUEST_ID, retryAfter: headers["retry-after"] });
-  }
-  const logged = parsedLines(f.lines);
-  assert.deepEqual(logged.map((line) => [line.code, line.status, line.event, line.level]), [
-    ["AUTH_INVALID", 401, "request_failed", "warn"],
-    ["ATTEMPT_LIMIT_REACHED", 429, "request_failed", "warn"],
-    ["ADMISSION_RATE_LIMIT_UNAVAILABLE", 503, "request_failed", "error"],
-    ["DEVICE_AUTH_INVALID", 401, "request_failed", "warn"],
-    ["BODY_INVALID", 400, "request_failed", "warn"],
-  ]);
-  assert.equal(logged.every((line) => line.routeClass === id && line.requestId === EDGE_REQUEST_ID), true);
-  // Each is offered to the diagnostic recorder, as any family's request_failed
-  // is (the recorder keeps the Worker's sampled 5xx rule).
-  assert.deepEqual(f.diagnostics.map((event) => event.code), ["AUTH_INVALID", "ATTEMPT_LIMIT_REACHED",
-    "ADMISSION_RATE_LIMIT_UNAVAILABLE", "DEVICE_AUTH_INVALID", "BODY_INVALID"]);
-  // A preamble that answers anything but an error (a 2xx, a non-Response)
-  // can never grant: the root answers 500 INTERNAL_ERROR.
-  for (const answer of [Response.json({ granted: true }, { status: 201 }), "granted", undefined, {}]) {
-    const g = fixture({ ported: SCOPE_AND_CONTESTED(), preambles: { [id]: () => answer } });
-    const response = await g.handler(g.edge(request(pathOf(id), { method: "POST", body: "{}",
-      headers: { "content-type": "application/json" } })));
-    await assertError(response, 500, "INTERNAL_ERROR", String(answer), { requestId: EDGE_REQUEST_ID });
-  }
+    portedRouteIds: [...registryModule.POSTGRES_SCOPE_ROUTE_IDS],
+    handlers: new Map(registryModule.POSTGRES_SCOPE_ROUTE_IDS.map((routeId) => [routeId, async () => null])) }),
+  { code: "PRODUCTION_ROUTE_SCOPE_INCOMPLETE" });
 });
 
 test("OD-CR-6(iv): the unported retry-after is the injected one, or none for null, at both unported sites", async () => {
@@ -743,15 +704,15 @@ test("step 7: a ported route runs its family once, inside the request context, t
     assert.equal(call.request, sent, "the family sees the exact Request object");
     assert.deepEqual({ ...call.context }, { requestId: EDGE_REQUEST_ID, routeId: id });
     assert.equal(f.store.accessor(sent), undefined, "the context is released once the family settles");
-    if (id === "community_daily") {
+    if (PUBLIC_READS.includes(id)) {
       assert.equal(response.headers.get("cache-control"), "public, max-age=60", "200 passes through");
     } else {
       assert.equal(response.headers.get("cache-control"), "no-store", id);
     }
     assert.deepEqual(await response.json(), { served: id });
   }
-  assert.equal(f.calls.length, 30);
-  assert.equal(f.gateCalls.length, 1, "only community_daily passes the storage gate here");
+  assert.equal(f.calls.length, 34, "scope 21, contested 9, performance 4");
+  assert.equal(f.gateCalls.length, 2, "only the two public reads pass the storage gate here");
   // A verifier request (no edge context) gets a fresh v4 id.
   await f.handler(request("/api/health"));
   assert.match(f.calls.at(-1).context.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
@@ -795,6 +756,40 @@ test("community_daily: storage gate first; 200 unmodified, anything else no-stor
       503, "BACKEND_STORAGE_UNAVAILABLE", `gate throws ${thrown.name}`, { requestId: EDGE_REQUEST_ID });
     assert.equal(plain.calls.length, 0);
   }
+});
+
+test("community_model_performance: storage gate first; 200 unmodified, the unpublished 404 no-store", async () => {
+  const path = "/api/v1/community/model-performance?period=all&speedMode=standard";
+  let answer = () => new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=300",
+    "content-type": "application/json; charset=utf-8" } });
+  const f = fixture({ families: { community_model_performance: () => answer() } });
+  const ok = await f.handler(f.edge(request(path)));
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("cache-control"), "public, max-age=300");
+  // The route's unpublished state is a public 404, never a 5xx, and never cacheable.
+  answer = () => Response.json({ error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", requestId: EDGE_REQUEST_ID } },
+    { status: 404, headers: { "cache-control": "public, max-age=300" } });
+  const unpublished = await f.handler(f.edge(request(path)));
+  assert.equal(unpublished.status, 404);
+  assert.equal(unpublished.headers.get("cache-control"), "no-store");
+  const unpublishedLine = parsedLines(f.lines).at(-1);
+  assert.equal(unpublishedLine.code, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED");
+  // A 4xx is logged at warn; the injected recorder keeps the Worker's sampled 5xx rule.
+  assert.equal(unpublishedLine.level, "warn");
+  assert.equal(f.gateCalls.length, 2);
+  const drift = fixture({
+    storageGate: { async assertCurrent() { throw new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE"); } },
+  });
+  await assertError(await drift.handler(drift.edge(request(path))), 503, "BACKEND_STORAGE_UNAVAILABLE",
+    "receipt drift", { requestId: EDGE_REQUEST_ID });
+  assert.equal(drift.calls.length, 0, "no route runs on a stale receipt");
+});
+
+test("ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE is an expected read-only admin state, logged unavailable", () => {
+  assert.ok(dispatch.ORIGIN_UNAVAILABLE_CODES.includes("ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE"));
+  assert.ok(dispatch.ORIGIN_ADMIN_ROUTE_IDS.includes("admin_performance_intake"));
+  assert.equal(dispatch.ORIGIN_ADMIN_ROUTE_IDS.length, 7);
+  assert.deepEqual([...dispatch.ORIGIN_PUBLIC_READ_ROUTE_IDS], [...PUBLIC_READS]);
 });
 
 // ---------------------------------------------------------------------------
@@ -958,9 +953,11 @@ test("a failing log sink or diagnostic recorder never changes the answer", async
   }
 });
 
-test("no-store on every answer except a 200 community_daily (and the Worker's 308)", async () => {
+test("no-store on every answer except a 200 public read (and the Worker's 308)", async () => {
   const f = fixture({ ported: SCOPE_AND_CONTESTED(), families: {
     community_daily: () => new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=300" } }),
+    community_model_performance: () => new Response("{}", { status: 200,
+      headers: { "cache-control": "public, max-age=300" } }),
   } });
   const samples = [];
   for (const route of policy) {
@@ -970,7 +967,7 @@ test("no-store on every answer except a 200 community_daily (and the Worker's 30
   }
   for (const path of ["/", "/api/v1/nope", "/admin"]) samples.push([path, await f.handler(f.edge(request(path)))]);
   for (const [label, response] of samples) {
-    const communityOk = label === "community_daily" && response.status === 200;
+    const communityOk = PUBLIC_READS.includes(label) && response.status === 200;
     assert.equal(response.headers.get("cache-control"), communityOk ? "public, max-age=300" : "no-store", label);
   }
 });
@@ -1020,16 +1017,20 @@ test("behind EP-6, every unported route under every admission outcome is the mar
         { retryAfter: String(TEST_UNPORTED_RETRY_AFTER), requestId: EDGE_REQUEST_ID });
     }
   }
-  // The retired-definite route, with a passing preamble stub, answers its
-  // terminal 403 under every outcome, marked. The real preamble replays the
-  // outcome at the Worker's call point (retired-performance-authorization.check.mjs).
-  for (const id of f.registry.definiteRouteIds) {
+  // The performance routes (decision 1) reach their family under every
+  // outcome, marked: the family replays the outcome at the Worker's call
+  // point (routes/performance-telemetry.check.mjs proves the real limiter).
+  for (const id of PERFORMANCE()) {
     for (const outcome of [undefined, "allowed", "limited", "unavailable"]) {
-      const response = await boundary(raw(pathOf(id), { method: "POST", outcome }));
+      const [method] = methodsOf(id);
+      const response = await boundary(raw(pathOf(id), { method, outcome }));
       assert.equal(response.headers.get("x-tibotattle-origin"), "1", `${id} ${outcome}`);
-      await assertError(response, 403, "TELEMETRY_TRANSPORT_BLOCKED", `${id} ${outcome}`, { requestId: EDGE_REQUEST_ID });
+      assert.equal(response.status, 200, `${id} ${outcome}`);
+      assert.deepEqual(await response.json(), { served: id });
     }
   }
+  const familyCalls = f.calls.length;
+  assert.equal(familyCalls, PERFORMANCE().length * 4);
   // The admin host under 'refuse', marked the same way.
   const admin = await boundary(raw("/api/v1/admin/overview", { hostKind: "admin" }));
   assert.equal(admin.headers.get("x-tibotattle-origin"), "1");
@@ -1050,8 +1051,8 @@ test("behind EP-6, every unported route under every admission outcome is the mar
   }));
   assert.equal(verified.status, 200);
   assert.equal(verified.headers.get("x-tibotattle-origin"), "1");
-  assert.equal(f.calls.length, 1);
-  assert.notEqual(f.calls[0].context.requestId, EDGE_REQUEST_ID);
+  assert.equal(f.calls.length, familyCalls + 1);
+  assert.notEqual(f.calls.at(-1).context.requestId, EDGE_REQUEST_ID);
 });
 
 // ---------------------------------------------------------------------------

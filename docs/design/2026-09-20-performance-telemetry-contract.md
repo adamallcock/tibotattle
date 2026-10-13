@@ -106,7 +106,8 @@ and provide conservative bounds for each quantile. Use the local linear
 order-statistic interpolation target `(n - 1) * p` when qualifying those
 bounds. Interpolation within a bucket is an estimate, not recovered evidence.
 Tail buckets and narrow distributions may have insufficient resolution;
-publication must expose that limitation or withhold the point estimate.
+publication must expose that limitation. The owner's 2026-10-10 decision is to
+show the conservative bounds rather than withhold the estimate.
 
 The 15% edge spacing and 2 TPS bucket width are not guaranteed relative error
 bounds on the final percentile or the width of a model's displayed band.
@@ -195,9 +196,10 @@ substitute for it; historical daily totals cannot reconstruct a completion
 histogram. Missing, zero, unsafe or inconsistent completion values remain
 unavailable. Valid zero TTFT remains a distinct supported observation.
 
-The record family has not been activated in production. Its independently
-negotiated field dictionary is now `telemetry-performance-registry-2026-09-21.1`;
-existing usage v1/v1.1/v1.2 and TPS/TTFT bucket semantics remain unchanged.
+The record family has not been activated in production. Clients emit the
+independently negotiated field dictionary `telemetry-performance-registry-2026-09-29.1`
+(0.1.24–0.1.26 emit `…2026-09-21.1`), and readers accept every dictionary
+registered below. Existing usage v1/v1.1/v1.2 semantics remain unchanged.
 
 The following priorities are proposals; they do not add fields or collection
 authority to the staged contract:
@@ -390,13 +392,90 @@ An incremental parser callback is not authority to seal a day permanently.
 5. Render hosted charts with the correct approximation and coverage semantics;
    separately qualify installed-client and deployed-service behavior.
 
-The current browser DTO accepts closed quantile points and has no representation
-for approximation bounds. Qualify a versioned presentation contract or an
-explicit companion metadata contract before publication; do not silently feed
-estimated histograms into a view that claims exact local empirical percentiles.
+The local browser DTO accepts closed quantile points and has no representation
+for approximation bounds; it remains the exact local view. Hosted publication
+uses the separate versioned `community-model-performance-v1` contract, whose
+percentiles always carry bounds. Do not feed estimated histograms into a view
+that claims exact local empirical percentiles.
 
 These are performance-stream gates, not additional prerequisites for collecting
 the already planned continuity fields.
+
+## Reader compatibility and the v2 speed scheme (2026-10-10)
+
+The [community model speed decision](../decisions/2026-10-10-community-model-speed.md)
+requires readers to accept every released dictionary, a speed layout above
+120 tokens/second, and bounded community publication without contributor
+minimums.
+
+| Dictionary | Clients | Speed modes / API tiers | Bucket scheme | State |
+| --- | --- | --- | --- | --- |
+| `…2026-09-21.1` | 0.1.24–0.1.26 | no `ultrafast` | `performance-histogram-v1` | accepted |
+| `…2026-09-29.1` | 0.1.27 onward | adds `ultrafast` | `performance-histogram-v1` | accepted |
+| `…2026-10-10.1` | none (no client release planned, 2026-10-12) | same as `…09-29.1` | `performance-histogram-v2` | accepted, unused |
+
+Each older dictionary is a strict vocabulary subset of the latest, and the
+reviewed model catalog only grows, so the reader adapter is an identity map
+after validation under the record's own dictionary. A record and its three
+histograms share one scheme. Turns that 0.1.24–0.1.26 classified as `other`
+because Ultrafast was unknown stay excluded; no adapter can recover them.
+
+`performance-histogram-v2` keeps the 60 v1 speed bins unchanged. It then adds 18
+bins of 10 tokens/second through 300, and 17 bins whose exact integer upper
+edges are `ceil(30000 * 1.15^k)` centi-tokens/second for `k = 1..17`
+(34,500 through 322,838, about 3,228 tokens/second), followed by overflow. That
+is 96 speed buckets. TTFT and turn-duration edges are identical in both schemes.
+
+Same-scheme histograms merge exactly. A pool combines v1 and v2 evidence:
+- Buckets below 120 tokens/second, and every millisecond bucket, add exactly.
+- A v1 speed overflow count becomes unresolved mass.
+
+For a rank that falls in the unresolved mass, the lower bound is
+120 tokens/second and the upper bound is the pool's observed maximum. This is a
+valid conservative envelope, because each sample's true value lies within its
+own [low, high] interval:
+- the k-th smallest value is at least the k-th smallest low;
+- the k-th smallest value is at most the k-th smallest high.
+
+The method is labelled `performance-histogram-pool-type7-bounds-v1`. With no
+unresolved mass it equals the single-scheme method on v2 edges.
+
+`community-model-performance-v1` mirrors the local view per model and speed
+mode. Each point carries its UTC day (a Monday for weekly bins), sample count,
+unresolved count and five percentiles with estimate, lower and upper bounds.
+As in the local view, a point below five samples keeps only its median. Model
+and window totals carry turns, speed, TTFT and tool-free turn counts plus
+contributor, device and report counts. Published bounds round outward to three
+decimals, and the estimate stays inside them. The shape is closed and bounded:
+64 models, 600 points per series, 16 MiB. That leaves room for 40 models of
+366 daily points per series.
+
+The adapter's output names the vocabulary its labels are read in
+(`labelVocabularyVersion`), separately from the source dictionary. The record
+keeps its bucket scheme, so it still validates and digests only under that
+source dictionary. An older dictionary's `other` can include modes it did not
+know, so `other` is never compared across source dictionaries.
+
+## Google Cloud origin status
+
+The Google Cloud origin line carries the hosted side of gates 3 to 5 in source.
+Each row is source with local PostgreSQL 17 or composed-host proof only. None
+is migrated, deployed, activated or published, and the
+[community model speed decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)
+records the contracts.
+
+| Requirement | GCP-line source status |
+| --- | --- |
+| Independent capability and grant | Built: accountless grant v1 and v2, per-device dictionary resolution (`v12_parser_inference`, `default_no_manifest`, `client_declared`) and an exact-echo capability. The signed-in consent route stays retired |
+| Encrypted delivery and typed storage | Built: primary migration `0079` with append-only reports, cohorts, buckets and receipts, an immutable dictionary registry and composite dictionary/scheme keys |
+| Idempotent per-device revisions | Built: replay writes no receipt; replacements supersede; a replacement may change dictionary; content conflicts and lower revisions answer 409 |
+| All accepted dictionaries | Built: `…2026-09-21.1`, `…2026-09-29.1` and `…2026-10-10.1` admitted; a dictionary that differs from the capability answers 403 |
+| Owner activation | Built: owner-only `run_maintenance` task in one transaction with its own audit row; no UI control. Not run against a live project |
+| Erasure | Offline owner purge only (append-only decision): participant rows cascade; publication heads are recomputed by the next refresh. No online deletion |
+| Hosted publication | Built: analytics-refresh performance stage, twelve `community-model-performance-v1` slots, the public read route and the deferred-empty first publication. No slot published |
+| Admin visibility and probes | Built: read-only `admin-performance-intake-v0.1` route and two runtime-probe gauges. The admin UI section ships from the edge-port line |
+| Restore | Follows the database restore path in [GCP brake and incidents](../runbooks/gcp-brake-and-incidents.md#database-or-data-loss), whose real-recovery tooling is not built; the do-not-restore list applies to performance rows with the rest of a participant's data |
+| Installed-client and deployed-service qualification | Open: needs the rollout and the owner activation, then reports from released clients 0.1.24–0.1.28. No client release is planned ([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)) |
 
 ## Qualification checkpoint — 2026-09-20
 
@@ -457,3 +536,18 @@ bucket merging.
 Persistent store/application integration, independent transport and report-revision
 qualification remain open. This checkpoint does not establish an installed
 client, hosted performance activation or a release.
+
+## Qualification checkpoint — 2026-10-10
+
+This checkpoint is source-only, on branch `claude/community-speed-contract-20261011`
+from `origin/main` `94ba7c8b5`. All fixtures are synthetic. No client emits the
+new dictionary or scheme, and no route, migration, deployment or activation
+changed.
+
+| Check | Result and boundary |
+| --- | --- |
+| Histogram suite | 20 passed. Includes v2 edges, scheme-exclusive parsing and merging, pool paging invariance, equality with single-scheme quantiles when nothing is unresolved, rejection of pools whose extrema contradict their evidence, and a 400-cohort mixed-scheme oracle in which every bound contains the exact Type-7 quantile. An independent review found no bound violation in 84,852 checks over 20,000 randomized pools. |
+| Contract suite | 13 passed. Covers the dictionary registry, per-dictionary validation, the identity adapter and its source-dictionary round trip, dictionary-aware canonical bytes, v2 JSON Schemas, publication validation (29 negative shapes plus weekly alignment and point bounds), outward rounding, a 40-model full-year publication within the byte bound, and browser-mirror parity. |
+| Generated artifacts | Browser mirror, 40 upload schema mirrors and the Worker admin UI mirror regenerated by their owning scripts and checked current. |
+| Worker | Installed package copy current; typecheck, scripts check and admin mirror check passed. The full suite (2,019 tests in 160 files) passed before the review fixes, which touch no Worker-used path. After them, the typecheck and the performance repository, restore and route-registry specs (27) passed again. |
+| Root | 6,073 tests: 6,024 passed, 47 skipped, 2 failed. Both failures are the retained R7 receipts' `workloadCodeSha256` pin, which any contract source change invalidates. Regenerating those receipts is a protected step and was not run. |

@@ -1,5 +1,5 @@
 /**
- * Storage-free checks of the six admin console route families and the
+ * Storage-free checks of the seven admin console route families and the
  * admin-host chokepoint on the PostgreSQL origin (GCP, C-ADMIN).
  *
  * Every storage adapter is a recording stub, so these checks prove the
@@ -95,6 +95,7 @@ function adapters(overrides = {}) {
     readOverview: record("readOverview", { schemaVersion: "admin-overview-v0.6" }),
     readAllowancePreview: record("readAllowancePreview", { schemaVersion: "preview" }),
     readDatabaseHealth: record("readDatabaseHealth", { schemaVersion: "admin-database-health-v0.2" }),
+    readPerformanceIntake: record("readPerformanceIntake", { schemaVersion: "admin-performance-intake-v0.1" }),
     setCollectionControls: record("setCollectionControls", { schemaVersion: "collection-controls-v0.1" }),
     beginAudit: record("beginAudit", "11111111-2222-4333-8444-555555555555"),
     finishAudit: record("finishAudit", undefined),
@@ -161,17 +162,19 @@ const GET_ROUTES = Object.freeze([
   ["admin_community_allowance_preview", "/api/v1/admin/community/allowance-preview"],
   ["admin_database_health", "/api/v1/admin/database-health"],
   ["admin_reconstruction_progress", "/api/v1/admin/reconstruction-progress"],
+  ["admin_performance_intake", "/api/v1/admin/performance-intake"],
 ]);
 
 // ---------------------------------------------------------------------------
 // Ratchets
 
-test("the six routes equal the registry's admin authority entries", () => {
+test("the seven routes equal the registry's admin authority entries", () => {
   const registry = routeRegistry.WORKER_ROUTE_POLICY
     .filter((route) => route.authority === "admin")
     .map((route) => ({ id: route.id, pathname: route.pathname, method: route.methods.join(",") }));
   assert.deepEqual(console_.ADMIN_CONSOLE_ROUTES.map((route) => ({ ...route })), registry);
-  assert.equal(registry.length, 6);
+  assert.equal(registry.length, 7);
+  assert.deepEqual([...console_.ADMIN_CONSOLE_ROUTE_IDS].slice(-1), ["admin_performance_intake"]);
   assert.ok(Object.isFrozen(console_.ADMIN_CONSOLE_PATHNAMES));
 });
 
@@ -552,6 +555,7 @@ test("composition refuses malformed dependencies", () => {
     { admin },
     { requestContext: () => undefined, clock: 1, admin },
     { requestContext: () => undefined, admin: { ...admin, readOverview: undefined } },
+    { requestContext: () => undefined, admin: { ...admin, readPerformanceIntake: undefined } },
     { requestContext: () => undefined, admin: { ...admin, readMetricsHistory: 1 } },
     { requestContext: () => undefined, admin: { ...admin, maintenance: { unknownTask: async () => ({}) } } },
   ]) {
@@ -661,6 +665,55 @@ test("round 12: database health is the closed v0.2 DTO, the removed ledger not_a
   const { readPostgresAdminDatabaseHealth } = await loadDatabaseHealth();
   await assert.rejects(readPostgresAdminDatabaseHealth({ env, pools: { primary, deletionLedger: reachablePool() } }),
     TypeError);
+});
+
+test("performance intake: the default adapter binds the primary-pool reader with closed inputs", async () => {
+  // The route classes are the performance routes of PRODUCTION_ROUTE_TABLE, as data.
+  assert.deepEqual({ ...console_.ADMIN_PERFORMANCE_INTAKE_ROUTE_CLASSES }, {
+    accountless_telemetry_performance_authorization: "performance",
+    admin_performance_intake: "admin",
+    telemetry_performance_capabilities: "performance",
+    telemetry_performance_consent: "retired",
+    telemetry_performance_reports: "performance",
+    community_model_performance: "performance",
+  });
+  assert.ok(Object.isFrozen(console_.ADMIN_PERFORMANCE_INTAKE_ROUTE_CLASSES));
+  // The reader validates every input before it opens a connection, so one
+  // connection proves the bound inputs (route classes, deployment, contract
+  // dictionaries, schema) are well formed; the refused connection is the
+  // route's closed 503.
+  const countingPool = () => {
+    const pool = { connects: 0, async connect() { pool.connects += 1; throw new Error("synthetic refusal"); } };
+    return pool;
+  };
+  for (const [env, connects] of [
+    [Object.freeze({}), 1],
+    [Object.freeze({ DEPLOYMENT_SOURCE_COMMIT: "0123456789abcdef0123456789abcdef01234567" }), 1],
+    // A malformed commit is refused before any connection.
+    [Object.freeze({ DEPLOYMENT_SOURCE_COMMIT: "not-a-commit" }), 0],
+  ]) {
+    const primary = countingPool();
+    const store = contextStore();
+    const map = console_.createAdminConsoleHandlers({
+      requestContext: store.accessor, clock: () => NOW_MS, env, pools: { primary },
+      schemaOptions: { primarySchema: "s" },
+    });
+    const response = await call(map, store, "admin_performance_intake",
+      adminRequest("/api/v1/admin/performance-intake"));
+    await expectError(response, 503, "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE");
+    assert.equal(primary.connects, connects, JSON.stringify(env));
+  }
+});
+
+test("performance intake: the injected source answers the DTO, read-only and query-free", async () => {
+  const { admin, calls } = adapters();
+  const { map, store } = handlers(admin);
+  await expectOk(await call(map, store, "admin_performance_intake", adminRequest("/api/v1/admin/performance-intake")),
+    { schemaVersion: "admin-performance-intake-v0.1" });
+  assert.deepEqual(calls, [{ name: "readPerformanceIntake", args: [{ nowEpoch: NOW_MS }] }]);
+  await expectError(await call(map, store, "admin_performance_intake",
+    adminRequest("/api/v1/admin/performance-intake?window=7")), 400, "BODY_INVALID");
+  assert.equal(calls.length, 1);
 });
 
 test("the single dispatcher routes by exact pathname only", async () => {

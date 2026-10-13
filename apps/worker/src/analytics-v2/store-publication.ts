@@ -28,6 +28,15 @@
  * contribution versions the same publication appends (store-owner-sets.ts,
  * first_revision, E-OWNERSET), so the floor and the seed reach all of them
  * at once.
+ *
+ * The community model performance heads (analytics_v2_published_performance,
+ * primary 0079; writeAnalyticsV2PublishedPerformance below) follow the same
+ * rules: this module is their only writer, and each changed slot publishes at
+ * nextPublishedRevision({ head, floor: null, seed }). They have no
+ * Cloudflare floor. An all-empty first publication is deferred (nothing is
+ * written until a run has any included record); once any head exists every
+ * run's candidates replace the heads they differ from, empty ones included,
+ * which is how a purge or an exclusion reaches the published slots.
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -37,6 +46,16 @@ import {
   type AnalyticsV2Day,
 } from "./contract";
 import type { AnalyticsV2RunStamp } from "./kernel";
+import { parseCommunityModelPerformance } from "@app-usagemonitor/telemetry-contract";
+import {
+  ANALYTICS_V2_MAX_PERFORMANCE_PAYLOAD_BYTES,
+  ANALYTICS_V2_PERFORMANCE_PERIODS,
+  ANALYTICS_V2_PERFORMANCE_SPEED_MODES,
+  ANALYTICS_V2_PERFORMANCE_TABLES,
+  analyticsV2PerformanceSlotKey,
+  stampAnalyticsV2PerformancePayload,
+  type AnalyticsV2PerformanceCandidate,
+} from "./performance-publication-contract";
 import {
   ANALYTICS_V2_MAX_DAILY_PAYLOAD_BYTES,
   ANALYTICS_V2_MAX_REVISION_SEED,
@@ -202,4 +221,126 @@ export async function writeAnalyticsV2Preview(client: PostgresClient, schema: st
       stamp.manifestVersion,
     ],
   );
+}
+
+interface StoredPerformanceHeadRow {
+  readonly period: unknown;
+  readonly speed_mode: unknown;
+  readonly revision: unknown;
+  readonly payload_sha256: unknown;
+}
+
+/**
+ * Publish a run's performance candidates (store-run.ts validated them: the
+ * twelve slots in slot order). Inside the run's write transaction, it reads
+ * every head FOR UPDATE, then:
+ *  - defers an all-empty first publication: with no head stored and no
+ *    candidate naming a model, it writes nothing (deferredEmpty). Under the
+ *    fold this is GATE-Q 12's measure ("nothing until the first run with
+ *    any included record", summary.includedRecords > 0): a model appears in
+ *    a candidate exactly when an included record names it, so "no candidate
+ *    names a model" equals "no included record". The refresh Job refuses a
+ *    fold result where the two disagree (cloud-run/analytics-refresh-read.mjs)
+ *    and the model-performance Job spec proves the equivalence;
+ *  - otherwise keeps each slot whose digest is unchanged and writes each
+ *    changed slot at nextPublishedRevision({ head, floor: null, seed }), with
+ *    generatedAt = releasedAt, re-validated as community-model-performance-v1,
+ *    size-checked as 0079's CHECK measures it, and upserted only over a head
+ *    with another digest and a lower revision (any shortfall refuses the run);
+ *    an empty candidate replaces a non-empty head.
+ * `schema` is the quoted schema (store-run.ts quoteSchema). Returns the
+ * published and unchanged slots (`period:speedMode`, slot order).
+ */
+export async function writeAnalyticsV2PublishedPerformance(client: PostgresClient, options: {
+  readonly schema: string;
+  readonly candidates: readonly AnalyticsV2PerformanceCandidate[];
+  readonly releasedAt: string;
+  readonly seed: number;
+  readonly kernelId: number;
+  readonly manifestVersion: number;
+  readonly runId: string;
+}): Promise<{ readonly published: string[]; readonly unchanged: string[]; readonly deferredEmpty: boolean }> {
+  const { schema, candidates, releasedAt, seed, kernelId, manifestVersion, runId } = options;
+  const performanceTables = ANALYTICS_V2_PERFORMANCE_TABLES;
+  const heads = new Map<string, { readonly revision: number; readonly payloadSha256: string }>();
+  for (const row of rowsOf<StoredPerformanceHeadRow>(await client.query(
+    `SELECT period, speed_mode, revision, payload_sha256
+       FROM ${relation(schema, performanceTables.publishedPerformance)}
+      ORDER BY period, speed_mode FOR UPDATE`,
+  ), "ANALYTICS_V2_WRITE_FAILED")) {
+    if (!(ANALYTICS_V2_PERFORMANCE_PERIODS as readonly unknown[]).includes(row.period)
+        || !(ANALYTICS_V2_PERFORMANCE_SPEED_MODES as readonly unknown[]).includes(row.speed_mode)
+        || typeof row.revision !== "number" || !Number.isSafeInteger(row.revision) || row.revision < 1
+        || typeof row.payload_sha256 !== "string") {
+      fail("ANALYTICS_V2_PERFORMANCE_STATE_INVALID", "publishedPerformance");
+    }
+    heads.set(`${row.period}:${row.speed_mode}`, { revision: row.revision, payloadSha256: row.payload_sha256 });
+  }
+  if (heads.size === 0 && candidates.every((candidate) => Array.isArray(candidate.payload.models)
+      && candidate.payload.models.length === 0)) {
+    return { published: [], unchanged: [], deferredEmpty: true };
+  }
+  const published: string[] = [];
+  const unchanged: string[] = [];
+  const publishRows: unknown[] = [];
+  for (const candidate of candidates) {
+    const slot = analyticsV2PerformanceSlotKey(candidate);
+    const head = heads.get(slot);
+    if (head !== undefined && head.payloadSha256 === candidate.payloadSha256) {
+      unchanged.push(slot);
+      continue;
+    }
+    const revision = nextPublishedRevision({ head: head?.revision, floor: null, seed });
+    const payload = stampAnalyticsV2PerformancePayload(candidate.payload, { revision, generatedAt: releasedAt });
+    try {
+      parseCommunityModelPerformance(payload);
+    } catch {
+      fail("ANALYTICS_V2_PERFORMANCE_PAYLOAD_INVALID", "performance.candidates.payload");
+    }
+    published.push(slot);
+    publishRows.push({
+      period: candidate.period,
+      speed_mode: candidate.speedMode,
+      revision,
+      released_at: releasedAt,
+      payload,
+      payload_sha256: candidate.payloadSha256,
+      run_id: runId,
+      kernel_id: kernelId,
+      manifest_version: manifestVersion,
+    });
+  }
+  // Size each payload exactly as 0079's CHECK does (its jsonb text form), so
+  // an oversized slot is refused with its own code rather than as 23514.
+  await forEachRecordsetChunk(publishRows, async (chunk) => {
+    const sizes = rowsOf<{ oversized: unknown }>(await client.query(
+      `SELECT count(*)::integer AS oversized FROM jsonb_array_elements($1::jsonb) AS item
+        WHERE octet_length((item -> 'payload')::text) > $2`,
+      [chunk, ANALYTICS_V2_MAX_PERFORMANCE_PAYLOAD_BYTES],
+    ), "ANALYTICS_V2_WRITE_FAILED");
+    if (sizes[0]?.oversized !== 0) fail("ANALYTICS_V2_PERFORMANCE_PAYLOAD_TOO_LARGE", "performance.candidates.payload");
+  });
+  // The heads are row-locked above. The upsert is still guarded (a new digest
+  // and a strictly higher revision); any shortfall refuses the whole run.
+  await insertRecordset(client,
+    `INSERT INTO ${relation(schema, performanceTables.publishedPerformance)} AS head
+       (period, speed_mode, revision, released_at, payload, payload_sha256, run_id, kernel_id, manifest_version)
+     SELECT period, speed_mode, revision, released_at, payload, payload_sha256, run_id, kernel_id, manifest_version
+       FROM jsonb_to_recordset($1::jsonb)
+         AS row(period text, speed_mode text, revision integer, released_at timestamptz, payload jsonb,
+                payload_sha256 text, run_id uuid, kernel_id smallint, manifest_version integer)
+     ON CONFLICT (period, speed_mode) DO UPDATE SET
+       revision = EXCLUDED.revision,
+       released_at = EXCLUDED.released_at,
+       payload = EXCLUDED.payload,
+       payload_sha256 = EXCLUDED.payload_sha256,
+       run_id = EXCLUDED.run_id,
+       kernel_id = EXCLUDED.kernel_id,
+       manifest_version = EXCLUDED.manifest_version
+     WHERE head.payload_sha256 <> EXCLUDED.payload_sha256
+       AND head.revision < EXCLUDED.revision`,
+    publishRows,
+    "performance.candidates",
+    "ANALYTICS_V2_PERFORMANCE_PUBLICATION_CONFLICT");
+  return { published, unchanged, deferredEmpty: false };
 }

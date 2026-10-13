@@ -31,10 +31,21 @@
  *     checking that the set the fold used is still the stored one; an
  *     unchanged head whose set was never recorded is adopted at its own
  *     revision;
- *  4. it upserts the preview, advances the journal cursor (never backwards),
- *     and inserts the run row with the refusal list, the publication
- *     summary, the kernel stamp and the digest of the community aggregate
- *     exclusions the run applied (N-EXCL).
+ *  4. it upserts the preview; when the run carries performance outputs that
+ *     the fold did not withhold, it publishes the changed community model
+ *     performance heads (store-publication.ts
+ *     writeAnalyticsV2PublishedPerformance: a deferred all-empty first
+ *     publication, then digest-guarded revisions); it advances the journal
+ *     cursor (never backwards), and inserts the run row with the refusal
+ *     list, the publication summary (plus a content-free performance block
+ *     {published, unchanged, withheld, deferredEmpty} only when the run
+ *     carried performance outputs), the kernel stamp and the digest of the
+ *     community aggregate exclusions the run applied (N-EXCL). A withheld
+ *     performance publication leaves every performance head untouched; a run
+ *     without performance outputs writes nothing of it, so stub pipelines and
+ *     goldens are unchanged. The performance candidates are charged to the
+ *     run's output account here, once (the fold runs without one), and the
+ *     run row's timings.account records accountBytes with them included.
  *
  * Any failure rolls the whole transaction back: no analytics_v2 row changes.
  *
@@ -58,7 +69,8 @@
  */
 
 import type { PostgresClient } from "../postgres-client";
-import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2PublicationSummary, type AnalyticsV2RunOutputs } from "./contract";
+import { ANALYTICS_V2_SHA256_PATTERN, type AnalyticsV2RunOutputs } from "./contract";
+import type { AnalyticsV2PerformancePublicationSummary } from "./performance-publication-contract";
 import { analyticsV2CompatibilitySha256 } from "./kernel";
 import { writeAnalyticsV2DerivedFamilies } from "./store-derived";
 import { AnalyticsV2PriceError, analyticsV2KernelPriceCards } from "./price-attribution";
@@ -71,7 +83,7 @@ import {
   writeAnalyticsV2OwnerDayPrices,
 } from "./store-price";
 import { writeAnalyticsV2OwnerSets } from "./store-owner-sets";
-import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily } from "./store-publication";
+import { writeAnalyticsV2Preview, writeAnalyticsV2PublishedDaily, writeAnalyticsV2PublishedPerformance } from "./store-publication";
 // REV-SEED: the one published-revision computation, for every publishing path.
 export { nextPublishedRevision } from "./store-publication";
 import {
@@ -92,6 +104,7 @@ import {
   validTimings,
   WRITE_LOCK_TIMEOUT_MILLISECONDS,
   WRITE_STATEMENT_TIMEOUT_MILLISECONDS,
+  type AnalyticsV2RunPublicationSummary,
   type AnalyticsV2WriteReceipt,
   type WriteAnalyticsV2RunOptions,
 } from "./store-run";
@@ -137,8 +150,29 @@ export {
   readAnalyticsV2RefreshState,
   stampAnalyticsV2DailyPayload,
 } from "./store-run";
+export {
+  ANALYTICS_V2_MAX_PERFORMANCE_PAYLOAD_BYTES,
+  ANALYTICS_V2_PERFORMANCE_COLUMNS,
+  ANALYTICS_V2_PERFORMANCE_PERIODS,
+  ANALYTICS_V2_PERFORMANCE_PRIMARY_KEYS,
+  ANALYTICS_V2_PERFORMANCE_REVISION_FIELDS,
+  ANALYTICS_V2_PERFORMANCE_SLOTS,
+  ANALYTICS_V2_PERFORMANCE_SPEED_MODES,
+  ANALYTICS_V2_PERFORMANCE_STORE_ERROR_CODES,
+  ANALYTICS_V2_PERFORMANCE_TABLES,
+  ANALYTICS_V2_PERFORMANCE_WITHHELD_CODES,
+  analyticsV2PerformanceContentSha256,
+} from "./performance-publication-contract";
+export type {
+  AnalyticsV2PerformanceCandidate,
+  AnalyticsV2PerformanceOutputs,
+  AnalyticsV2PerformancePublicationSummary,
+  AnalyticsV2PerformanceSummary,
+  AnalyticsV2PerformanceWithheld,
+} from "./performance-publication-contract";
 export type {
   AnalyticsV2RefreshState,
+  AnalyticsV2RunPublicationSummary,
   AnalyticsV2RevisionFloorSummary,
   AnalyticsV2RunHorizon,
   AnalyticsV2StoreErrorCode,
@@ -211,13 +245,28 @@ export async function writeRunOutputs(
     const ownerSets = await writeAnalyticsV2OwnerSets(client, schema, prepared.dailyCandidates,
       { revisions, priorRevisions }, prepared.ownerSets, runId, stamp);
     await writeAnalyticsV2Preview(client, schema, outputs.preview, releasedAt, runId, stamp);
+    // The performance heads (after the preview, before the cursor): only
+    // when the run carries performance outputs, and only when the fold did
+    // not withhold them; a withheld run keeps every head as it was.
+    let performance: AnalyticsV2PerformancePublicationSummary | undefined;
+    if (prepared.performance !== null) {
+      const written = prepared.performance.withheld !== null
+        ? { published: [], unchanged: [], deferredEmpty: false }
+        : await writeAnalyticsV2PublishedPerformance(client, { schema, candidates: prepared.performance.candidates,
+          releasedAt, seed: prepared.revisionSeed, kernelId: stamp.kernel.kernelId,
+          manifestVersion: stamp.manifestVersion, runId });
+      performance = Object.freeze({ published: Object.freeze([...written.published]),
+        unchanged: Object.freeze([...written.unchanged]), withheld: prepared.performance.withheld,
+        deferredEmpty: written.deferredEmpty });
+    }
     const cursor = await advanceAnalyticsV2Cursor(client, schema, storedCursor, prepared.lastSequence, runId);
 
-    const publication: AnalyticsV2PublicationSummary = {
+    const publication: AnalyticsV2RunPublicationSummary = {
       published: sortedDays(published),
       unchanged: sortedDays(unchanged),
       blocked: prepared.blockedDays,
       ownerSets,
+      ...(performance === undefined ? {} : { performance }),
     };
     const clockMs = wallClock();
     if (!Number.isSafeInteger(clockMs) || !Number.isSafeInteger(writeStartedMs)) {

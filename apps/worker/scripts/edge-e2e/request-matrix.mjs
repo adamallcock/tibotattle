@@ -22,13 +22,18 @@
 //   answer: 503 POSTGRES_ROUTE_NOT_PORTED in the Worker envelope, no-store,
 //   no retry-after (OD-CR-6 (iv)). Its body carries the request id, so the
 //   comparator reads fields, never bytes.
-// - definite: a route owner round 12 retired with a definite answer instead
-//   of the unported 503. Since round 19 it answers production's sequence
-//   before its terminal answer, so a sweep row expects the answer of the step
-//   its request stops at (definiteSweepAnswers, from the registry's
-//   RETIRED_DEFINITE_PREAMBLE_STEPS, passed in): that status and code in the
-//   Worker envelope, no-store, no retry-after. Its sweep rows also carry the
-//   worker comparator: the unchanged Worker answers the same request alike.
+//
+// The restored performance intake (owner decision 2026-10-10, decision 1) is
+// served like any other ported route; its sweep rows and its unauthenticated
+// rows (performanceIntakeRows) also carry the worker comparator and expect
+// the bearer refusal (BEARER_REFUSAL): the origin must answer what the
+// unchanged Worker answers, never a storage or runtime 5xx first (S4 parity).
+//
+// The owner-decided public community model-performance read (2026-10-10,
+// GATE-Q 5) is served too: before any publication it answers the unchanged
+// Worker's 404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED, never a 5xx; its
+// rows send the valid default slot (MATRIX_VALUES.performanceQuery). The
+// owner-decided admin view (GATE-Q 4) is an admin API id like the others.
 
 /** Fixed synthetic values the rows use; none is a real credential. */
 export const MATRIX_VALUES = Object.freeze({
@@ -37,14 +42,22 @@ export const MATRIX_VALUES = Object.freeze({
   malformedDevice: "Device not-a-device-credential",
   malformedUpload: "Upload not-an-upload-authorization",
   dailyQuery: "?from=2026-09-01&to=2026-09-02",
+  performanceQuery: "?period=7&speedMode=fast",
 });
+
+/** The valid query a forwarded or admitted request of a public read carries. */
+function defaultQuery(routeId) {
+  if (routeId === "community_daily") return MATRIX_VALUES.dailyQuery;
+  if (routeId === "community_model_performance") return MATRIX_VALUES.performanceQuery;
+  return "";
+}
 
 export const UNKNOWN_DEVICE_BEARER = "unknown_device_bearer";
 export const UNKNOWN_UPLOAD_BEARER = "unknown_upload_bearer";
 /** Resolved to the row's own host origin: a same-origin browser request. */
 export const SAME_ORIGIN = "same_origin";
 
-/** The six admin API route ids (E4's EDGE_ADMIN_API_ROUTE_IDS). */
+/** The seven admin API route ids (E4's EDGE_ADMIN_API_ROUTE_IDS). */
 export const ADMIN_API_ROUTE_IDS = Object.freeze([
   "admin_overview",
   "admin_metrics_history",
@@ -52,7 +65,14 @@ export const ADMIN_API_ROUTE_IDS = Object.freeze([
   "admin_database_health",
   "admin_reconstruction_progress",
   "admin_action",
+  "admin_performance_intake",
 ]);
+
+/**
+ * The answer a forwarded request with no or an unknown device bearer gets
+ * from a bearer-authenticated route, at the Worker and the origin alike.
+ */
+export const BEARER_REFUSAL = Object.freeze({ status: 401, code: "DEVICE_AUTH_INVALID" });
 
 /** Routes the edge answers itself in every mode; never forwarded. */
 export const EDGE_LOCAL_ROUTE_IDS = Object.freeze(["apple_domain_association", "sparkle_appcast_guard"]);
@@ -131,12 +151,25 @@ export function localRows({ registry }) {
   return Object.freeze(rows);
 }
 
-/** S1's PUBLIC_ANALYTICS_MODE=disabled row (on its own edge/reference pair). */
-export const PUBLICATION_DISABLED_ROW = row({
-  id: "community-daily-publication-disabled", routeId: "community_daily",
-  path: `/api/v1/community/daily${MATRIX_VALUES.dailyQuery}`, comparators: ["worker", "local"],
-  expect: { status: 503, code: "PUBLICATION_DISABLED" },
-});
+/** S1's PUBLIC_ANALYTICS_MODE=disabled rows (on their own edge/reference pair), one per public read. */
+export const PUBLICATION_DISABLED_ROWS = Object.freeze([
+  row({
+    id: "community-daily-publication-disabled", routeId: "community_daily",
+    path: `/api/v1/community/daily${MATRIX_VALUES.dailyQuery}`, comparators: ["worker", "local"],
+    expect: { status: 503, code: "PUBLICATION_DISABLED" },
+  }),
+  row({
+    id: "community-model-performance-publication-disabled", routeId: "community_model_performance",
+    path: `/api/v1/community/model-performance${MATRIX_VALUES.performanceQuery}`, comparators: ["worker", "local"],
+    expect: { status: 503, code: "PUBLICATION_DISABLED" },
+  }),
+  // The pre-gate answers before the query is read: an invalid slot is the same 503.
+  row({
+    id: "community-model-performance-publication-disabled-bad-query", routeId: "community_model_performance",
+    path: "/api/v1/community/model-performance?period=14", comparators: ["worker", "local"],
+    expect: { status: 503, code: "PUBLICATION_DISABLED" },
+  }),
+]);
 
 // ---------------------------------------------------------------------------
 // S2: the admin host.
@@ -152,7 +185,8 @@ export function adminRows() {
   const rows = [];
   for (const [label, token, code] of refusals) {
     for (const [path, method] of [["/admin", "GET"], ["/api/v1/admin/overview", "GET"],
-      ["/api/v1/community/daily", "GET"]]) {
+      ["/api/v1/admin/performance-intake", "GET"], ["/api/v1/community/daily", "GET"],
+      ["/api/v1/community/model-performance", "GET"]]) {
       rows.push(row({ id: `admin-${label}-${method}-${path}`, host: "admin", method, path, accessToken: token,
         comparators: ["worker", "local"], expect: { status: 403, code } }));
     }
@@ -175,6 +209,22 @@ export function adminRows() {
       row({ id: `admin-owner-daily-${carrier}`, routeId: "community_daily", host: "admin",
         path: `/api/v1/community/daily${MATRIX_VALUES.dailyQuery}`, accessToken: "owner", accessCarrier: carrier,
         comparators: ["transparency", "unported"],
+        expect: { forwardedHostKind: "admin", admission: "public_aggregate_read" } }),
+      // The owner-decided read-only performance-intake view: forwarded with the
+      // assertion (every method, as the other admin ids), answered by the
+      // edge-test origin's refused admin host.
+      row({ id: `admin-owner-performance-intake-get-${carrier}`, routeId: "admin_performance_intake", host: "admin",
+        path: "/api/v1/admin/performance-intake", accessToken: "owner", accessCarrier: carrier,
+        headers: { cookie: MATRIX_VALUES.unrelatedCookie }, comparators: ["transparency", "unported"],
+        expect: { forwardedHostKind: "admin", forwardsAccessAssertion: carrier === "header" } }),
+      row({ id: `admin-owner-performance-intake-post-${carrier}`, routeId: "admin_performance_intake", host: "admin",
+        method: "POST", path: "/api/v1/admin/performance-intake", accessToken: "owner", accessCarrier: carrier,
+        headers: { "content-type": "application/json", cookie: MATRIX_VALUES.unrelatedCookie }, body: "{}",
+        comparators: ["transparency", "unported"],
+        expect: { forwardedHostKind: "admin", forwardsAccessAssertion: carrier === "header" } }),
+      row({ id: `admin-owner-model-performance-${carrier}`, routeId: "community_model_performance", host: "admin",
+        path: `/api/v1/community/model-performance${MATRIX_VALUES.performanceQuery}`, accessToken: "owner",
+        accessCarrier: carrier, comparators: ["transparency", "unported"],
         expect: { forwardedHostKind: "admin", admission: "public_aggregate_read" } }),
     );
   }
@@ -253,6 +303,20 @@ export function forwardedRows({ registry }) {
     row({ id: "community-daily-367-days", routeId: "community_daily",
       path: "/api/v1/community/daily?from=2025-09-01&to=2026-09-02",
       comparators: ["worker", "transparency"], expect: { status: 400, code: "BODY_INVALID" } }),
+    // The owner-decided public read: strict slot validation after the
+    // limiter, exactly as the Worker; the valid slot is the unpublished 404.
+    row({ id: "community-model-performance-unknown-parameter", routeId: "community_model_performance",
+      path: "/api/v1/community/model-performance?period=7&speedMode=fast&unexpected=1",
+      comparators: ["worker", "transparency"], expect: { status: 400, code: "BODY_INVALID" } }),
+    row({ id: "community-model-performance-bad-period", routeId: "community_model_performance",
+      path: "/api/v1/community/model-performance?period=14&speedMode=fast",
+      comparators: ["worker", "transparency"], expect: { status: 400, code: "BODY_INVALID" } }),
+    row({ id: "community-model-performance-bad-speed-mode", routeId: "community_model_performance",
+      path: "/api/v1/community/model-performance?period=7&speedMode=priority",
+      comparators: ["worker", "transparency"], expect: { status: 400, code: "BODY_INVALID" } }),
+    row({ id: "community-model-performance-unpublished", routeId: "community_model_performance",
+      path: `/api/v1/community/model-performance${MATRIX_VALUES.performanceQuery}`,
+      comparators: ["worker", "transparency"], expect: { status: 404, code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED" } }),
     row({ id: "accountless-enrollment-session-cookie", routeId: "accountless_enrollment", method: "POST",
       path: "/api/v1/accountless/enrollment",
       headers: { "content-type": "application/json", cookie: MATRIX_VALUES.sessionCookie }, body: "{}",
@@ -286,30 +350,19 @@ export function forwardedRows({ registry }) {
 }
 
 /**
- * The answer a sweep row gets from each retired-definite route (round 19):
- * an allowed, same-origin, cookie-free request with a well-formed but unknown
- * device bearer passes every earlier step and stops at the device bearer.
- * preambleSteps is the registry's RETIRED_DEFINITE_PREAMBLE_STEPS (route id
- * -> [[step, status, code], ...]).
- */
-export function definiteSweepAnswers(preambleSteps) {
-  return Object.freeze(Object.fromEntries(Object.entries(preambleSteps).map(([routeId, steps]) => {
-    const step = steps.find(([name]) => name === "device_bearer");
-    if (step === undefined) throw new Error(`REQUEST_MATRIX_DEFINITE_STEP_UNKNOWN ${routeId}`);
-    return [routeId, Object.freeze({ status: step[1], code: step[2] })];
-  })));
-}
-
-/**
  * S3's sweep: one request for every forwarded (route, method) pair, each
- * expected to be served (servedRouteIds: the production ported list), to
- * answer as the Worker does at its retired-definite route (definiteAnswers:
- * route id -> {status, code}, from definiteSweepAnswers) or to answer the
- * closed unported 503, and to carry the admission header exactly when EP-1
- * names the route.
+ * expected to be served (servedRouteIds: the production ported list) or to
+ * answer the closed unported 503, and to carry the admission header exactly
+ * when EP-1 names the route. bearerRefusedRouteIds (the performance intake)
+ * are served routes whose sweep request, an unknown device bearer, must also
+ * answer as the unchanged Worker does: BEARER_REFUSAL.
  */
-export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
+export function sweepRows({ registry, servedRouteIds, bearerRefusedRouteIds = [] }) {
   const served = new Set(servedRouteIds);
+  const bearerRefused = new Set(bearerRefusedRouteIds);
+  for (const id of bearerRefused) {
+    if (!served.has(id)) throw new Error(`REQUEST_MATRIX_BEARER_ROUTE_UNSERVED ${id}`);
+  }
   const rows = [];
   for (const route of registry) {
     if (EDGE_LOCAL_ROUTE_IDS.includes(route.id) || ADMIN_API_ROUTE_IDS.includes(route.id)) continue;
@@ -320,7 +373,7 @@ export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
         id: `sweep-${route.id}-${method}`,
         routeId: route.id,
         method,
-        path: route.pathname + (route.id === "community_daily" ? MATRIX_VALUES.dailyQuery : ""),
+        path: route.pathname + defaultQuery(route.id),
         // Same-origin, with a well-formed bearer and JSON body: every
         // request-only guard the edge runs before admission admits it.
         headers: {
@@ -329,15 +382,41 @@ export function sweepRows({ registry, servedRouteIds, definiteAnswers = {} }) {
           ...(post ? { "content-type": "application/json" } : {}),
         },
         ...(post ? { body: "{}" } : {}),
-        ...(Object.hasOwn(definiteAnswers, route.id)
-          ? {
-            comparators: ["transparency", "worker", "definite"],
-            expect: { status: definiteAnswers[route.id].status, code: definiteAnswers[route.id].code },
-          }
+        ...(bearerRefused.has(route.id)
+          ? { comparators: ["transparency", "worker"], expect: { served: true, ...BEARER_REFUSAL } }
           : {
             comparators: served.has(route.id) ? ["transparency"] : ["transparency", "unported"],
             expect: { served: served.has(route.id) },
           }),
+      }));
+    }
+  }
+  return Object.freeze(rows);
+}
+
+/**
+ * The restored performance intake without a credential (decision 1): one
+ * request per (route, method) of routeIds with no authorization header,
+ * forwarded (the edge's only pre-admission guard for these routes is the
+ * grant's session cookie) and answered BEARER_REFUSAL by the origin and the
+ * unchanged Worker alike.
+ */
+export function performanceIntakeRows({ registry, routeIds }) {
+  const rows = [];
+  for (const id of routeIds) {
+    const route = routeById(registry, id);
+    if (!Array.isArray(route.methods)) throw new Error(`REQUEST_MATRIX_METHODS_UNEXPECTED ${route.id}`);
+    for (const method of route.methods) {
+      const post = method !== "GET";
+      rows.push(row({
+        id: `performance-${route.id}-${method}-no-bearer`,
+        routeId: route.id,
+        method,
+        path: route.pathname,
+        headers: post ? { "content-type": "application/json" } : {},
+        ...(post ? { body: "{}" } : {}),
+        comparators: ["transparency", "worker"],
+        expect: { served: true, ...BEARER_REFUSAL },
       }));
     }
   }
@@ -368,7 +447,7 @@ export function admissionRows({ registry, policyFor, servedRouteIds }) {
         purpose: policy.purpose,
         clientBinding: policy.clientBinding,
         coarseBinding: policy.coarseBinding,
-        path: route.pathname + (route.id === "community_daily" ? MATRIX_VALUES.dailyQuery : ""),
+        path: route.pathname + defaultQuery(route.id),
         headers: {
           authorization: ingress ? UNKNOWN_UPLOAD_BEARER : UNKNOWN_DEVICE_BEARER,
           ...(post ? { "content-type": "application/json" } : {}),

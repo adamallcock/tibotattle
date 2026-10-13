@@ -2585,6 +2585,180 @@ test("default wiring: a linked owner's active exclusions reach A-2, and a change
   }
 });
 
+// SPD-P3: the optional performance stage. Stub reader and fold modules with
+// the landed signatures (performance-source.ts readAnalyticsV2PerformanceSource,
+// compute-performance.ts computeAnalyticsV2Performance); the database case is
+// postgres-test/analytics-v2-model-performance.spec.mjs.
+const PERFORMANCE_END = "2026-09-30";
+
+/** A reader page as performance-source.ts returns it (opaque keys, content-free summary). */
+function performancePage(records, { reports, cohorts, pages, deferredFutureDays = 2, last = false }) {
+  return Object.freeze({
+    records: Object.freeze(records),
+    summary: Object.freeze({ reports, cohorts, pages, deferredFutureDays, complete: last }),
+    checkpoint: last ? null : Object.freeze({ kind: "analytics-v2-performance-source-checkpoint" }),
+  });
+}
+
+const performanceRecord = (participantKey, reportDay) => Object.freeze({ participantKey,
+  deviceKey: `${participantKey}-device`, reportKey: `${participantKey}-${reportDay}`, reportDay,
+  fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1", record: Object.freeze({ day: reportDay }) });
+
+function performanceModules({ result = undefined, pages = undefined } = {}) {
+  const calls = { pages: [], folds: [], connections: [] };
+  const owner = contractOwner(OWNER_A, "effective").participantId;
+  const sourcePages = pages ?? [
+    performancePage([performanceRecord(owner, "2026-09-29"), performanceRecord("participant-perf-b", "2026-09-29")],
+      { reports: 2, cohorts: 2, pages: 1 }),
+    performancePage([performanceRecord("participant-perf-b", PERFORMANCE_END)], { reports: 3, cohorts: 3, pages: 2,
+      last: true }),
+  ];
+  const models = (count) => Array.from({ length: count }, (_, index) => ({ modelId: `m${index}` }));
+  return {
+    calls,
+    performance: {
+      source: {
+        async readAnalyticsV2PerformanceSource(client, options) {
+          calls.pages.push({ ...options, inTransaction: client.open === true });
+          return sourcePages[calls.pages.length - 1];
+        },
+      },
+      compute: {
+        async computeAnalyticsV2Performance(input) {
+          const fold = { keys: Object.keys(input).sort(), records: [], excluded: [] };
+          calls.folds.push(fold);
+          for await (const record of input.records) {
+            fold.records.push(record.reportKey);
+            fold.excluded.push(input.excludedOn(record.participantKey, record.reportDay));
+          }
+          input.checkpoint?.({ kind: "performance", phase: "slot", index: 0 });
+          return result !== undefined ? result : { candidates: [{ period: "all", speedMode: "standard",
+            payload: { models: models(1) }, payloadSha256: "a".repeat(64) }], summary: { reports: 3, cohorts: 3,
+            includedRecords: 2, excludedRecords: 1, excludedUnknownTurns: 4, deferredFutureDays: 0, end: PERFORMANCE_END },
+          withheld: null };
+        },
+      },
+    },
+    /** A snapshot-pool stand-in: each page runs in its own BEGIN/COMMIT on a released connection. */
+    pool: {
+      async connect() {
+        const client = { open: false, released: false, async query(text) {
+          if (text === "BEGIN") client.open = true;
+          else if (text === "COMMIT") client.open = false;
+          else throw new Error("unexpected statement");
+          return { rows: [] };
+        }, async release() { client.released = true; } };
+        calls.connections.push(client);
+        return client;
+      },
+    },
+  };
+}
+
+test("default wiring (SPD-P3): the optional performance stage folds the reader's pages after compute", async () => {
+  const interval = Object.freeze({ effectiveAtUs: Date.parse("2026-09-29T00:00:00.000Z") * 1_000,
+    expiresAtUs: Date.parse("2026-09-30T00:00:00.000Z") * 1_000 });
+  const exclusionRead = { rows: 1, active: 1, sha256: NO_EXCLUSIONS, activeByParticipant: new Map([
+    [contractOwner(OWNER_A, "effective").participantId, [interval]]]) };
+  const plain = wiringModules({ exclusionRead });
+  const baseline = await job.createAnalyticsV2Pipeline(plain.modules).read({ pool: {}, schema: "s",
+    nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  // Without the module: no loader is built and the outputs carry no performance field.
+  assert.equal(baseline.loadPerformance, undefined);
+  const without = await job.createAnalyticsV2Pipeline(plain.modules).compute(baseline,
+    { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(Object.hasOwn(without, "performance"), false);
+
+  const { calls, performance, pool } = performanceModules();
+  const wired = wiringModules({ exclusionRead });
+  const pipeline = job.createAnalyticsV2Pipeline({ ...wired.modules, performance });
+  const inputs = await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  // Lazy: nothing is read before compute.
+  assert.equal(calls.pages.length, 0);
+  const events = [];
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0,
+    checkpoint: (event) => events.push(event) });
+  // The daily outputs are exactly the pipeline's without the stage.
+  const { performance: folded, ...daily } = outputs;
+  assert.deepEqual(daily, without);
+  // Pages are read through the latest completed UTC day, each in its own
+  // snapshot transaction, continuing the previous page's checkpoint.
+  assert.deepEqual(calls.pages.map(({ schema, throughDay, inTransaction }) => ({ schema, throughDay, inTransaction })), [
+    { schema: "s", throughDay: PERFORMANCE_END, inTransaction: true },
+    { schema: "s", throughDay: PERFORMANCE_END, inTransaction: true },
+  ]);
+  assert.equal(calls.pages[0].checkpoint, null);
+  assert.equal(calls.pages[1].checkpoint.kind, "analytics-v2-performance-source-checkpoint");
+  assert.ok(calls.connections.every((client) => client.released && !client.open));
+  // Every record is folded once; N-EXCL applies by participant and day; the
+  // fold gets no output account (the store charges the candidates once).
+  assert.equal(calls.folds.length, 1);
+  assert.deepEqual(calls.folds[0].keys, ["checkpoint", "excludedOn", "nowMs", "records"]);
+  assert.deepEqual(calls.folds[0].records, [`${contractOwner(OWNER_A, "effective").participantId}-2026-09-29`,
+    "participant-perf-b-2026-09-29", `participant-perf-b-${PERFORMANCE_END}`]);
+  assert.deepEqual(calls.folds[0].excluded, [true, false, false]);
+  // The fold's progress reaches the Job's checkpoint.
+  assert.deepEqual(events.filter((event) => event.kind === "performance"), [{ kind: "performance", phase: "slot", index: 0 }]);
+  // The reader's deferred days (never yielded) join the fold's summary.
+  assert.deepEqual(folded.summary, { reports: 3, cohorts: 3, includedRecords: 2, excludedRecords: 1,
+    excludedUnknownTurns: 4, deferredFutureDays: 2, end: PERFORMANCE_END });
+  assert.equal(folded.withheld, null);
+  assert.equal(folded.candidates.length, 1);
+
+  // A withheld fold passes through with its code (it affects only the performance publication).
+  const withheldResult = { candidates: [], summary: { reports: 3, cohorts: 3, includedRecords: 0, excludedRecords: 0,
+    excludedUnknownTurns: 0, deferredFutureDays: 0, end: PERFORMANCE_END }, withheld: "ANALYTICS_V2_PERFORMANCE_RECORD_INVALID" };
+  const withheldModules = performanceModules({ result: withheldResult });
+  const withheldPipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: withheldModules.performance });
+  const withheldOutputs = await withheldPipeline.compute(await withheldPipeline.read({ pool: withheldModules.pool,
+    schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(withheldOutputs.performance.withheld, "ANALYTICS_V2_PERFORMANCE_RECORD_INVALID");
+  assert.deepEqual(withheldOutputs.performance.candidates, []);
+});
+
+test("default wiring (SPD-P3): a reader or fold disagreement fails the run; a half-wired stage cannot be built", async () => {
+  const summary = { reports: 3, cohorts: 3, includedRecords: 2, excludedRecords: 0, excludedUnknownTurns: 0,
+    deferredFutureDays: 0, end: PERFORMANCE_END };
+  const named = { candidates: [{ payload: { models: [{}] } }], summary, withheld: null };
+  const empty = { candidates: [{ payload: { models: [] } }], summary, withheld: null };
+  for (const result of [
+    // Counts that differ from the reader's: a record read and not folded, or the reverse.
+    { ...named, summary: { ...summary, reports: 2 } },
+    { ...named, summary: { ...summary, cohorts: 4 } },
+    // GATE-Q 12: included records without a model, or a model without an included record.
+    empty,
+    { ...named, summary: { ...summary, includedRecords: 0 } },
+    null,
+  ]) {
+    const { performance, pool } = performanceModules({ result });
+    const pipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance });
+    const inputs = await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+    await assert.rejects(pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 }),
+      { code: "ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID" });
+  }
+  // A malformed page is refused, never read as an empty corpus.
+  const { performance, pool } = performanceModules({ pages: [{ records: null, summary: {}, checkpoint: null }] });
+  const pipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance });
+  await assert.rejects(pipeline.compute(await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS,
+    state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 }), { code: "ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID" });
+  // A reader failure (a closed source code) fails the run with that code.
+  const failing = performanceModules();
+  failing.performance.source.readAnalyticsV2PerformanceSource = async () => {
+    throw Object.assign(new Error("ANALYTICS_V2_SOURCE_UNAVAILABLE"), { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+  };
+  const failingPipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: failing.performance });
+  await assert.rejects(failingPipeline.compute(await failingPipeline.read({ pool: failing.pool, schema: "s",
+    nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 }),
+  { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+  assert.ok(failing.calls.connections.every((client) => client.released), "the page's connection is released");
+  // Both modules or neither.
+  const { source, compute } = performanceModules().performance;
+  for (const half of [{ source }, { compute }, {}, null]) {
+    assert.throws(() => job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: half }),
+      { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+  }
+});
+
 // E-OWNERSET (review): a saved member off the roster keeps its exclusions,
 // mapped through its owner link in any state; a member without a link maps
 // nothing (A-2 blocks its days); a malformed owner-set read or outputs without
@@ -4413,6 +4587,28 @@ test("time guard at the 24 h production timeout: the production-shaped roster pl
   const grown = (owner) => ({ ...owner, occurrences: owner.occurrences * 20, analysisUsage: owner.analysisUsage * 20 });
   assert.throws(() => guardAt().checkpoint({ kind: "plan", owners: owners.map(grown), workers: 4 }),
     (error) => error.code === "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" && error.deadline.taskTimeoutSeconds === 86_400);
+});
+
+test("time guard (SPD-P3): the performance fold's progress is a checkpoint kind that refuses only past the refusal point", () => {
+  const model = job.ANALYTICS_REFRESH_TIME_MODEL;
+  let clock = 1_000_000;
+  const hour = 3_600_000;
+  const guard = job.createAnalyticsRefreshTimeGuard({ startedAtMs: 1_000_000, taskTimeoutMs: hour, wallClock: () => clock });
+  const refuseAt = 1_000_000 + hour - model.exitMarginMs - model.writeFixedMs;
+  // No measured rate projects the fold: its marks pass until the refusal point.
+  clock = refuseAt - 1;
+  guard.checkpoint({ kind: "performance", phase: "records", records: 4096 });
+  for (let index = 0; index < 12; index += 1) guard.checkpoint({ kind: "performance", phase: "slot", index });
+  // Malformed marks are refused, never ignored.
+  for (const event of [{ kind: "performance" }, { kind: "performance", phase: "records", records: 0 },
+    { kind: "performance", phase: "slot", index: 12 }, { kind: "performance", phase: "slot", index: -1 },
+    { kind: "performance", phase: "other", index: 0 }]) {
+    assert.throws(() => guard.checkpoint(event), { code: "ANALYTICS_V2_REFRESH_DEADLINE_INVALID" });
+  }
+  // Past the refusal point the fold stops at its next mark, before the write.
+  clock = refuseAt + 1;
+  assert.throws(() => guard.checkpoint({ kind: "performance", phase: "slot", index: 3 }),
+    { code: "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED" });
 });
 
 test("time guard: refuses a hopeless plan, an owner that cannot finish and a step that could cross the deadline", () => {
