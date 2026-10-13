@@ -10,6 +10,7 @@ import pg from "pg";
 import { createServer } from "vite";
 import config from "../vitest.analytics-v2.config.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
+import { grantAndVerifyRuntimePrivileges } from "../cloud-run/postgres-runtime-grants.mjs";
 import { applyStockAndStagedMigrations, postgresTestEndpoint,
   NO_ANALYTICS_V2_EXCLUSIONS_SHA256 } from "./staged-migrations-harness.mjs";
 import { dayMs, syntheticOwner, usage } from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
@@ -484,4 +485,51 @@ test("PG: an unattributed pre-0069 head retains its NULL kernel in the archive a
       run_id: randomUUID(), kernel_id: null, manifest_version: 1 }),
     (error) => error.code === "23514" && error.constraint === "analytics_v2_published_daily_kernel_stamped");
   }, { beforeVersion: 69 });
+});
+
+test("PG: the runtime grant policy alone plans, executes and replays (the reprice Job's least-privilege role)", { skip: SKIP }, async () => {
+  // The production reprice Job connects as the runtime IAM database user, the
+  // refresh Job's role, whose only schema privileges are the one runtime
+  // policy (USAGE, table DML, sequence use, EXECUTE on the runtime functions).
+  // No migrator, owner or superuser privilege is needed to plan or execute.
+  const runtimeRole = `k_reprice_runtime_${randomBytes(5).toString("hex")}`;
+  await pool.query(`CREATE ROLE "${runtimeRole}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`);
+  try {
+    await withSchema(async (schema) => {
+      await infrastructure(schema);
+      await seedDay(schema, { changedCost: true });
+      await seedDay(schema, { day: NEXT_DAY, quotaOnly: true, owners: [2] });
+      await grantAndVerifyRuntimePrivileges(pool, { role: "primary", schema, runtimeRole, codePrefix: "" });
+      const roles = [];
+      const runtimePool = { connect: async () => {
+        const client = await pool.connect();
+        await client.query(`SET ROLE "${runtimeRole}"`);
+        roles.push((await client.query("SELECT current_user AS role")).rows[0].role);
+        return { query: (...args) => client.query(...args), release: async () => {
+          try { await client.query("RESET ROLE"); client.release(); } catch (error) { client.release(true); throw error; }
+        } };
+      } };
+      const denied = await pool.connect();
+      try {
+        await denied.query(`SET ROLE "${runtimeRole}"`);
+        await assert.rejects(denied.query(`CREATE TABLE ${q(schema, "synthetic_runtime_create")} (id int)`),
+          (error) => error.code === "42501", "the runtime role cannot create in the schema");
+      } finally { await denied.query("RESET ROLE"); denied.release(); }
+      const planned = await reprice.planAnalyticsV2Reprice(runtimePool, options(schema));
+      assert.deepEqual(planned.counts, { heads: 2, members: 2, inputBytes: planned.counts.inputBytes });
+      const runId = randomUUID();
+      const receipt = await reprice.executeAnalyticsV2Reprice(runtimePool, { ...options(schema), runId,
+        expectedPlanSha256: planned.planSha256, nowMs: Date.parse(NOW) });
+      assert.deepEqual(receipt.counts, { planned: 2, changed: 1, equivalent: 1, unchanged: 0, refused: 0, contributionVersions: 1 });
+      assert.equal((await headRow(schema)).revision, 5);
+      const replay = await reprice.executeAnalyticsV2Reprice(runtimePool, { ...options(schema), runId,
+        expectedPlanSha256: planned.planSha256, nowMs: Date.parse(NOW) });
+      assert.deepEqual(replay, { ...receipt, replayed: true });
+      assert.ok(roles.length >= 3);
+      assert.deepEqual([...new Set(roles)], [runtimeRole]);
+    });
+  } finally {
+    await pool.query(`DROP OWNED BY "${runtimeRole}"`);
+    await pool.query(`DROP ROLE "${runtimeRole}"`);
+  }
 });

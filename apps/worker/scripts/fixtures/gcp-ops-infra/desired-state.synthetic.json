@@ -92,6 +92,10 @@
     "maintenance": {
       "name": "synthetic-maintenance",
       "maxConnections": 2
+    },
+    "analytics-reprice": {
+      "name": "synthetic-analytics-reprice",
+      "maxConnections": 2
     }
   },
   "scheduler": {

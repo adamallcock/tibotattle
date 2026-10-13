@@ -136,12 +136,12 @@ node scripts/gcp-infra.mjs plan --environment=production > "$SCRATCH/prod-plan-0
 Expect `exit=2`, `summary.refused` 0, `blockers` exactly
 `["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"]`, `findings` exactly
 `["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED", "BUILD_SOURCE_BUCKET_ABSENT"]`, 30
-executable and 11 deferred operations. `BUILD_SOURCE_BUCKET_ABSENT` means no
+executable and 12 deferred operations. `BUILD_SOURCE_BUCKET_ABSENT` means no
 `gcloud builds submit` has run in the project yet, so the default Cloud Build
 bucket does not exist. If it does exist, the finding is absent and the plan
-binds instead of creating: 30 executable, 10 deferred, because the bind is
+binds instead of creating: 30 executable, 11 deferred, because the bind is
 executable rather than deferred. In that case pass 1 runs the bind: step 5's
-plan has no finding (30 executable, 10 deferred), its `remaining` has 0
+plan has no finding (30 executable, 11 deferred), its `remaining` has 0
 executable, step 6's reasons omit the binding, step 9's plan has 0
 executable, and pass 1b (approval 4b) is skipped. Stop on a refused
 operation, any other finding, or any live plane resource you did not expect.
@@ -199,8 +199,8 @@ node -e 'const p=require(process.argv[1]);console.log(p.planDigest, JSON.stringi
 ```
 
 Expect exit 0, `findings` exactly `["BUILD_SOURCE_BUCKET_ABSENT"]`, no
-blockers, 30 executable, 11 deferred, 0 refused. If the default Cloud Build
-bucket already exists (step 3), expect no finding, 30 executable and 10
+blockers, 30 executable, 12 deferred, 0 refused. If the default Cloud Build
+bucket already exists (step 3), expect no finding, 30 executable and 11
 deferred, with the builder's binding executable in this pass.
 The owner approves this list and its `planDigest`:
 
@@ -225,9 +225,10 @@ The owner approves this list and its `planDigest`:
 - deferred: the builder's `roles/storage.objectViewer` on that bucket
   (`BUILD_SOURCE_BUCKET_ABSENT`; the next plan binds it once readback lists
   the bucket in the project); the service and its two invoker bindings
-  (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), the migration and refresh jobs
-  and the scheduler's executor binding on the refresh job
-  (`BOOTSTRAP_IMAGE_REQUIRED`), D-OPS4's maintenance job, its every-minute
+  (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`), the migration, refresh and
+  manual reprice jobs and the scheduler's executor binding on the refresh job
+  (`BOOTSTRAP_IMAGE_REQUIRED`; the reprice job has no trigger and no
+  executor binding), D-OPS4's maintenance job, its every-minute
   trigger `tibotattle-maintenance-trigger` and the scheduler's executor
   binding on it (`TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED`: the job reads the
   namespace), and the trigger
@@ -248,7 +249,7 @@ node scripts/gcp-infra.mjs apply --environment=production --authorize=<planDiges
 ```
 
 Expect exit 0 and `remaining` with 1 executable (the builder's binding, now
-that the bucket exists) and 10 deferred. Cloud SQL
+that the bucket exists) and 11 deferred. Cloud SQL
 takes several minutes. No trigger exists, and the scheduler account has no
 executor grant, so nothing can start a job. If the bucket already existed
 (step 3), expect 0 executable remaining. Stop on the staging runbook's
@@ -467,7 +468,7 @@ Applying the alert policies is a later, separately authorized step.
 | Step | Gate |
 |---|---|
 | Bootstrap image: `node scripts/gcp-production-rollout.mjs build --environment=production --commit=<commit>`, then the same with `--authorize=build:production:<commit> --execute` | Pass 1b applied (step 9), or the binding applied in pass 1 when the bucket already existed. The dry run must show `"buildSource": { "bucket": "tibotattle-prod_cloudbuild", "sourceDir": "gs://tibotattle-prod_cloudbuild/source" }` and `--gcs-source-staging-dir=gs://tibotattle-prod_cloudbuild/source` on the submit; `build` refuses before the lock on `ROLLOUT_BUILD_SOURCE_BUCKET_*` (`docs/runbooks/gcp-rollout.md`, step 4: re-apply OPS-2 for `UNAVAILABLE` or a missing binding; escalate to the owner for `FOREIGN` or a public member). OPS-10 takes the production lock by pushing `refs/heads/codex/production-deployment-lock`, the ref the Cloudflare production deploys share. No push of it is authorized yet: the owner must authorize that push, and the build, explicitly |
-| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image and the namespace pin (step 8). Creates the migration, refresh and maintenance jobs, then D-OPS4's maintenance trigger at its pinned `* * * * *` cadence: the trigger create, its pause, and only then the scheduler's executor grant on `tibotattle-maintenance`, the order the refresh trigger follows below. The trigger stays `PAUSED` until OPS-3 resumes it at cutover. It does not grant the scheduler account `roles/run.jobsExecutor` on the refresh job: that grant waits with the refresh trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start the refresh or migration job. A new plan digest, so a new per-pass approval (C1) |
+| Pass 2: `plan` and `apply --environment=production --bootstrap-image-digest=<digest> --bootstrap-source-commit=<commit>` | The image and the namespace pin (step 8). Creates the migration, refresh, maintenance and manual reprice jobs (the reprice job gets no trigger and no executor grant; see `apps/worker/cloud-run/infra/README.md`, reprice job), then D-OPS4's maintenance trigger at its pinned `* * * * *` cadence: the trigger create, its pause, and only then the scheduler's executor grant on `tibotattle-maintenance`, the order the refresh trigger follows below. The trigger stays `PAUSED` until OPS-3 resumes it at cutover. It does not grant the scheduler account `roles/run.jobsExecutor` on the refresh job: that grant waits with the refresh trigger (`SCHEDULER_CADENCE_UNSET`), so nothing can start the refresh or migration job. A new plan digest, so a new per-pass approval (C1) |
 | The service and its invoker bindings | Created in pass 2 with the jobs: ROUTES-R12 dropped `GOOGLE_OIDC_CLIENT_SECRET` and `APPLE_PRIVATE_KEY` from CR-3 and the service template. They need the namespace pin (step 8) and the bootstrap image |
 | Migrate and roll (PROD-3) | `docs/runbooks/gcp-rollout.md`, with the image and the edge in place, and step 10 reading `match` for the pinned version |
 | Create the trigger | After the production-scale measurement the owner supplies the refresh cadence (C3). Commit it as `scheduler.analytics-refresh.schedule`, then `plan` and `apply` under a new digest and a new per-pass approval. The plan is three operations in this order: the trigger create, its pause, and then the scheduler's executor grant. Cloud Scheduler creates the trigger `ENABLED`, but the account holds no grant until the pause has succeeded, and apply stops at a failed operation, so nothing can start the job in between. Check the result with `gcloud scheduler jobs describe tibotattle-analytics-refresh-trigger --location=us-east1 --project=tibotattle-prod --format="value(state)"`, which must read `PAUSED`. If the pause fails the trigger is `ENABLED` but the account holds no grant, so it cannot run the job; re-plan, and the repair plan pauses it and then grants. If the plan blocks on `SCHEDULER_CREATE_EXECUTOR_BOUND:analytics-refresh`, the account already holds a grant on the job (an earlier pass 2 that bound it, or a trigger removed by hand), and an `ENABLED` trigger created now could start the job before its pause: stop, and the owner removes `roles/run.jobsExecutor` for the scheduler account on `tibotattle-analytics-refresh` with an exact-target `gcloud run jobs remove-iam-policy-binding`, then re-plans. Apply never removes a grant |

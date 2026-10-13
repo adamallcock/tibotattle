@@ -565,7 +565,7 @@ const SCHEDULER_NAME = /^[A-Za-z0-9_-]{1,500}$/u;
 // failure. A pre-start failure can omit the optional completionTime. Missing,
 // unknown, conflicting or malformed terminal evidence must still block a roll.
 // https://docs.cloud.google.com/run/docs/reference/rest/v1/namespaces.executions
-function executionIsTerminal(execution) {
+export function executionIsTerminal(execution) {
   const status = execution?.status;
   if (!isRecord(status)) return false;
   if (status.runningCount !== undefined && status.runningCount !== 0) return false;

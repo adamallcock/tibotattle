@@ -68,7 +68,7 @@ trigger rather than a whole-estate apply that can reconcile unrelated drift.
 
 ## Maintenance job and its trigger (D-OPS4)
 
-The desired state names three Cloud Run Jobs, and two have a Cloud Scheduler
+The desired state names four Cloud Run Jobs, and two have a Cloud Scheduler
 trigger:
 
 | Job | Trigger |
@@ -76,6 +76,7 @@ trigger:
 | `production-migrate` (OPS-10, manual) | none |
 | `analytics-refresh` | `scheduler.analytics-refresh`: **03:00 UTC, `0 3 * * *`**, committed |
 | `maintenance` | `scheduler.maintenance`: **every minute, `* * * * *`**, pinned |
+| `analytics-reprice` (OPS-REPRICE, manual) | none; see [Reprice job](#reprice-job-ops-reprice) |
 
 The maintenance job runs C-MAINT's MP-2-lite lifecycle pass
 (`dist/postgres-maintenance-job.mjs --profile=maintenance-job`, built by the
@@ -149,6 +150,66 @@ audit needs a Google Cloud account of its own (`opsBackupAudit`, with exactly
 `cloudsql.instances.get` and `cloudsql.backupRuns.list`), and the session
 signals need a role decision, both for the owner. `OPS_PROBE_JOBS` is the job
 contract a registration would render.
+
+## Reprice job (OPS-REPRICE)
+
+`jobs.analytics-reprice` is the production carrier for the bounded
+saved-cohort reprice CLI (`cloud-run/analytics-reprice.mjs`, bundled as
+`dist/analytics-reprice.mjs`; runbook
+`docs/runbooks/2026-10-09-historical-spend-repricing.md`). Every analytics
+kernel change needs a reprice after the roll, or the previous kernel's
+equivalences stay hidden (`docs/runbooks/gcp-rollout.md`, step 10). The
+contract is `ANALYTICS_REPRICE_JOB_CONTRACT` in the manifest:
+
+- **Identity and database role: the runtime account and the runtime IAM
+  database user, exactly as the refresh job.** The CLI reads the refresh
+  job's production target, so the render carries the refresh job's closed
+  environment byte for byte (`ANALYTICS_V2_MEMORY_BUDGET_MIB` is validated
+  there and unused by reprice). The reprice writes ordinary rows (new
+  contribution versions, input archives, equivalence proofs, the run ledger,
+  and published-daily updates whose former head a trigger archives), takes
+  `LOCK TABLE ... IN SHARE MODE` (needs UPDATE or DELETE on those tables) and
+  the PUBLIC advisory refresh lock. The runtime grant policy
+  (`cloud-run/postgres-runtime-grants.mjs`: schema USAGE, table DML, sequence
+  use) covers all of it. The PostgreSQL test "the runtime grant policy alone
+  plans, executes and replays" in `postgres-test/analytics-v2-reprice.spec.mjs`
+  proves that locally. The migrator role is not used, and no new account,
+  project role or database grant is added.
+- **No secret.** The CLI reads none, and the render mounts none.
+- **No default mode.** The job's own args are the entry alone, so an execution
+  without explicit arguments fails closed
+  (`ANALYTICS_V2_REPRICE_ARGUMENT_INVALID`, exit 2) before any configuration
+  or connection. The typed operator verb passes the mode and every bound per
+  execution (`gcloud run jobs execute --args`); the production target refuses
+  `--schema` and `--now`.
+- **Resources.** 2 vCPU, 4 GiB, one task, no retries and a 3,600 s task
+  timeout. These are reviewed bounds for one capped plan or execution (at most
+  32 heads, 1,000 members and 16 MiB of inputs, with 15 s and 30 s statement
+  timeouts), not a measured profile. A failed task commits nothing.
+- **No trigger and no executor grant.** The job is not in
+  `SCHEDULED_JOB_NAMES`. The scheduler account is never bound on it, and a
+  `scheduler.analytics-reprice` entry is refused (`SCHEDULER_JOBS_MISMATCH`).
+  Only the operator verb runs it, with the owner's credentials:
+  `npm run gcp:analytics:reprice` (`scripts/gcp-analytics-reprice.mjs`).
+- **Connection budget.** `maxConnections` must be at least the CLI's own pool
+  (`ANALYTICS_REPRICE_POOL_MAX`, 2, read from its source;
+  `JOB_POOL_MAX_UNDERDECLARED:analytics-reprice`). The pool connects before
+  the reprice takes the refresh lock, so it is budgeted beside the scheduled
+  jobs: (4 + 4) x 8 + (4 + 2) + 1 + 2 + 3 + 10 = 86 of 100 on both planes.
+- **The rollout moves it.** It is one of `rolloutTarget().jobNames`, so
+  OPS-10's roll moves its image and `DEPLOYMENT_SOURCE_COMMIT` with the other
+  jobs, and a reprice always runs the rolled kernel. The verb refuses a job
+  whose commit is not the one it was given.
+
+**Adding it to an estate that already exists (owner-only).** The next OPS-2
+plan creates the job. It is deferred with `BOOTSTRAP_IMAGE_REQUIRED` until
+plan and apply get `--bootstrap-image-digest` and
+`--bootstrap-source-commit`. Use an image that contains
+`dist/analytics-reprice.mjs` and whose database holds migration 0077, for
+example the digest built for the next roll. Apply it before that roll's
+preflight, because `readback --require-clean` reads the missing job as
+unclean. Applying infrastructure and executing the job are separate owner
+operations. Neither is part of a dry run or of the offline checks.
 
 ## Build-source bucket (BUILD-SOURCE)
 

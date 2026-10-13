@@ -221,7 +221,7 @@ and print the argv; they run no `gcloud` and make no request.
    - **Before pausing anything, record** for every trigger: its name, its live
      state (`gcloud scheduler jobs describe`), and its committed state in the
      environment's desired-state file. This record, not the roll receipt,
-     decides what is resumed in step 10.
+     decides what is resumed in step 11.
    - Pause each trigger that is in this plane's desired state:
 
      ```bash
@@ -288,14 +288,45 @@ and print the argv; they run no `gcloud` and make no request.
    commit), not `/api/ready`; readiness still goes stale 2 hours after the last
    pass (the roll's own pass, when the target has a maintenance job), so
    resume the maintenance trigger within that window.
-10. **Resume the triggers, explicitly and in order,** under
+10. **Reprice under the new kernel, before any trigger resumes.** Required
+    whenever the rolled commit's analytics kernel differs from the previous
+    one (compare the `kernel.kernelId` that `node cloud-run/build.mjs --check`
+    prints at each commit, or the last entry of
+    `src/analytics-v2/kernel-registry.json`). Until a reprice runs under the
+    new kernel, the equivalences the previous kernel stamped stay hidden.
+    Skip this step only when the kernel did not change. The verb is
+    `gcp:analytics:reprice` (`scripts/gcp-analytics-reprice.mjs`), and the
+    procedure, bounds and refusal codes are in
+    [Bounded historical spend repricing](./2026-10-09-historical-spend-repricing.md#production-carrier).
+    In short, from a clean checkout at `--commit`:
+
+    ```bash
+    npm run gcp:analytics:reprice -- --environment=<env> --mode=plan --commit=<commit> \
+      --expected-kernel=<new kernel id> --from-day=<first day> --through-day=<last day> \
+      --max-days=32 --max-members=1000 --max-input-bytes=16777216 \
+      --receipt-out=<new absolute path> --authorize=reprice-plan:<env>:<commit> --execute
+    npm run gcp:analytics:reprice -- --environment=<env> --mode=execute --commit=<commit> \
+      --expected-kernel=<new kernel id> --from-day=<first day> --through-day=<last day> \
+      --max-days=32 --max-members=1000 --max-input-bytes=16777216 \
+      --plan-receipt=<the plan receipt> --expected-plan-sha256=<its planSha256> --run-id=<fresh UUID> \
+      --receipt-out=<new absolute path> --authorize=reprice-execute:<env>:<planSha256> --execute
+    ```
+
+    The triggers are still paused here, so no refresh can start, and the verb
+    refuses while a refresh, reprice or migration execution is running. Each
+    `--execute` is a separate `owner` operation: an execution of a production
+    Job. The reprice Job must exist first: it is part of the committed desired
+    state and is created by an owner-applied OPS-2 plan (see the
+    [infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice)).
+    `built` (OPS-REPRICE); tested offline only, never run against a project.
+11. **Resume the triggers, explicitly and in order,** under
     [GCP scheduler resume](./gcp-scheduler-resume.md#resume-after-a-rollout).
     Resume only a trigger that is in this plane's committed desired state with
     state `ENABLED` and that your step 6 record shows live `ENABLED` before the
     pause. Never resume a trigger because it appears in `pausedTriggers`. The
     rollout never resumes a trigger. `not built` (OPS-3 `resume-all`).
-11. **Close out.** Record UTC times, the commit, the digest, the receipts'
-    digests, the outage window, the observed health, the paused and resumed
+12. **Close out.** Record UTC times, the commit, the digest, the receipts'
+    digests (the reprice receipts' `digestSha256` included), the outage window, the observed health, the paused and resumed
     triggers and any refusal, following
     [closeout evidence](./production-operations.md#closeout-evidence). Keep
     private identifiers out.
@@ -320,6 +351,7 @@ and print the argv; they run no `gcloud` and make no request.
 | `PRODUCTION_COORDINATION_*` | The shared deployment lock is held | A retained lock is a stop. Do not retry with raw tools; follow the typed reconciliation in [Production service operations](./production-operations.md#guarded-deployment-wrapper) |
 | `STAGING_COORDINATION_*` | The staging deployment lock is held, or its state is uncertain | A retained staging lock is a stop. Do not delete or move `refs/heads/codex/staging-deployment-lock` by hand; report the owner commit to the owner. The production lock is not involved |
 | `ROLLOUT_LOCK_REF_MISMATCH`, `DEPLOYMENT_COORDINATION_*` | The lock offered for this environment is not its own ref, or the environment is not in the closed mapping | Stop. Nothing was pushed. Fix the checkout; never point one environment at another's lock |
+| `REPRICE_*` (step 10) | The reprice verb refused, before or after its one execution | See the refusal table in [Bounded historical spend repricing](./2026-10-09-historical-spend-repricing.md#refusals). Do not resume the refresh trigger over an unresolved execute refusal; the roll itself stands |
 
 After a failure between `migrate` and a successful `roll`, the previous
 revision is still refusing its storage-gated routes. The priority is a
@@ -559,8 +591,8 @@ insert it before running the refresh.
 | Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
+| Reprice Job and verb (step 10) | `built` (OPS-REPRICE): the Job is in both desired states and the rollout target, and the verb is tested offline with a stubbed `gcloud`. Not applied, executed or log-parsed in any project. The first live run is staging, owner-authorized |
 | Migration 0079 rollout | Source and local PostgreSQL proof only. Not built, migrated, rolled or activated in any project |
-| Production reprice carrier | `not built`. `dist/analytics-reprice.mjs` is in the image, but no Cloud Run Job or reviewed tool runs it in production or reads its receipt back. The reprice after a kernel change is blocked until one is reviewed ([Migration 0079](#migration-0079-community-model-speed), step 3) |
 
 ## Evidence boundary
 

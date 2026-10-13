@@ -40,10 +40,13 @@
  * EP-7's template, invoked only by the edge-invoker account and the
  * read-only verifier (OD-CR-7), whose ID tokens the operator mints through a
  * roles/iam.serviceAccountTokenCreator grant on the verifier alone. The fast
- * path renders exactly three Cloud Run Jobs (JOB_NAMES): the OPS-10 production
+ * path renders exactly four Cloud Run Jobs (JOB_NAMES): the OPS-10 production
  * migration, the analytics-refresh job, in the production refresh-job
  * contract (ANALYTICS_REFRESH_JOB_CONTRACT, the dense task profile until
- * MEAS-3), and the MP-2-lite maintenance job (MAINTENANCE_JOB_CONTRACT, D-OPS4).
+ * MEAS-3), the MP-2-lite maintenance job (MAINTENANCE_JOB_CONTRACT, D-OPS4),
+ * and the manual saved-cohort reprice job (ANALYTICS_REPRICE_JOB_CONTRACT,
+ * OPS-REPRICE), which only the typed operator verb
+ * (scripts/gcp-analytics-reprice.mjs) executes, with explicit arguments.
  * Two jobs have a Cloud Scheduler trigger. The analytics-refresh cadence is
  * the owner's (decision D3; there is no default). The maintenance cadence is
  * every minute, the Worker cron's, and the validator pins it
@@ -153,9 +156,12 @@ export const OWNER_PLACEHOLDER_PATHS = Object.freeze(["project", "projectNumber"
  */
 export const PROJECT_TENANCIES = Object.freeze(["dedicated", "shared"]);
 
-/** The fast-path Cloud Run Jobs, and nothing else (OPS-3-lite). */
-export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh", "maintenance"]);
-/** Jobs a Cloud Scheduler trigger runs. production-migrate is manual (OPS-10). */
+/** The fast-path Cloud Run Jobs, and nothing else (OPS-3-lite, OPS-REPRICE). */
+export const JOB_NAMES = Object.freeze(["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
+/**
+ * Jobs a Cloud Scheduler trigger runs. production-migrate (OPS-10) and
+ * analytics-reprice (scripts/gcp-analytics-reprice.mjs) are manual.
+ */
 export const SCHEDULED_JOB_NAMES = Object.freeze(["analytics-refresh", "maintenance"]);
 /**
  * The maintenance pass reconciles at most 100 quarantine registrations per
@@ -434,6 +440,54 @@ export const MAINTENANCE_JOB_CONTRACT = Object.freeze({
   refusedPrefixes: Object.freeze(Object.keys(POSTGRES_MAINTENANCE_JOB_FORBIDDEN_PREFIXES)),
 });
 
+/**
+ * The saved-cohort reprice job's contract (OPS-REPRICE; the CLI is
+ * cloud-run/analytics-reprice.mjs, bundled as dist/analytics-reprice.mjs, and
+ * its runbook docs/runbooks/2026-10-09-historical-spend-repricing.md).
+ *
+ * - Identity and database role: the runtime account, connecting as the
+ *   runtime IAM database user, exactly as the refresh job does. The CLI
+ *   reads the refresh job's production target
+ *   (readAnalyticsRefreshProductionTarget), so its closed environment is the
+ *   refresh contract's own, ANALYTICS_V2_MEMORY_BUDGET_MIB included
+ *   (validated, unused by reprice). The runtime grant policy
+ *   (cloud-run/postgres-runtime-grants.mjs: USAGE, table DML, sequence use)
+ *   is everything plan and execute need: the writes are ordinary INSERT and
+ *   UPDATE statements, LOCK TABLE ... IN SHARE MODE needs UPDATE or DELETE on
+ *   the locked tables, and the refresh lock is a PUBLIC advisory function.
+ *   postgres-test/analytics-v2-reprice.spec.mjs proves plan, execute and
+ *   replay under that policy alone. No migrator, owner or new IAM role is
+ *   needed, and none is granted.
+ * - No secrets: the CLI reads none.
+ * - Arguments: the job's own args name only the entry, so an execution
+ *   without the operator verb's explicit override fails closed
+ *   (ANALYTICS_V2_REPRICE_ARGUMENT_INVALID, exit 2) before any configuration
+ *   or connection. Every execution supplies --mode and the bounds through
+ *   `gcloud run jobs execute --args`; --schema and --now are refused under
+ *   the production target.
+ * - Resources: one task, no retries, no trigger. The CLI holds a pool of
+ *   ANALYTICS_REPRICE_POOL_MAX (2) connections, its statements have 15 s
+ *   (plan) and 30 s (execute) timeouts, and its inputs are capped at 32 heads,
+ *   1,000 members and 16 MiB. 2 vCPU and 4 GiB with a 3,600 s task timeout
+ *   bound one plan or one execution; these are reviewed bounds, not a
+ *   measured profile. An out-of-memory or timed-out task commits nothing
+ *   (one mutation transaction) and its operation is reconciled by replaying
+ *   the same run id.
+ */
+export const ANALYTICS_REPRICE_JOB_CONTRACT = Object.freeze({
+  entry: "dist/analytics-reprice.mjs",
+  account: "runtime",
+  cpu: "2",
+  memory: "4Gi",
+  taskTimeoutSeconds: 3_600,
+  configurationEnv: ANALYTICS_REFRESH_JOB_CONTRACT.configurationEnv,
+  provenanceEnv: Object.freeze(["DEPLOYMENT_SOURCE_COMMIT"]),
+  modes: Object.freeze(["plan", "execute"]),
+  refusedArguments: Object.freeze(["--schema", "--now"]),
+  refusedEnv: ANALYTICS_REFRESH_JOB_CONTRACT.refusedEnv,
+});
+const ANALYTICS_REPRICE_SOURCE = "cloud-run/analytics-reprice.mjs";
+
 /** Cloud Run Job definitions for the fast path (rendered only; OPS-3-lite). */
 export const JOB_DEFINITIONS = Object.freeze({
   // OPS-10's PRODUCTION_MIGRATION_JOB (cloud-run/postgres-production-
@@ -475,6 +529,18 @@ export const JOB_DEFINITIONS = Object.freeze({
     memory: MAINTENANCE_JOB_CONTRACT.memory,
     env: Object.freeze([...MAINTENANCE_JOB_CONTRACT.configurationEnv, ...MAINTENANCE_JOB_CONTRACT.provenanceEnv]),
     secrets: MAINTENANCE_JOB_CONTRACT.secrets,
+  }),
+  // cloud-run/analytics-reprice.mjs: the manual saved-cohort reprice lane
+  // (ANALYTICS_REPRICE_JOB_CONTRACT). The entry alone: every execution passes
+  // its mode and bounds explicitly (scripts/gcp-analytics-reprice.mjs).
+  "analytics-reprice": Object.freeze({
+    account: ANALYTICS_REPRICE_JOB_CONTRACT.account,
+    args: Object.freeze([ANALYTICS_REPRICE_JOB_CONTRACT.entry]),
+    timeoutSeconds: ANALYTICS_REPRICE_JOB_CONTRACT.taskTimeoutSeconds,
+    cpu: ANALYTICS_REPRICE_JOB_CONTRACT.cpu,
+    memory: ANALYTICS_REPRICE_JOB_CONTRACT.memory,
+    env: Object.freeze([...ANALYTICS_REPRICE_JOB_CONTRACT.configurationEnv,
+      ...ANALYTICS_REPRICE_JOB_CONTRACT.provenanceEnv]),
   }),
 });
 
@@ -805,6 +871,17 @@ export function analyticsRefreshPoolMax({ readSource = defaultReadSource } = {})
   return Number(matches[0][1]);
 }
 
+/**
+ * analytics-reprice.mjs's own pool maximum, read from its source (the module
+ * imports the database driver, which this pure manifest does not load).
+ */
+export function analyticsRepricePoolMax({ readSource = defaultReadSource } = {}) {
+  const matches = [...readSource(ANALYTICS_REPRICE_SOURCE)
+    .matchAll(/^export const ANALYTICS_REPRICE_POOL_MAX = ([1-9][0-9]?);$/gmu)];
+  if (matches.length !== 1) fail("ANALYTICS_REPRICE_POOL_MAX_UNRESOLVED");
+  return Number(matches[0][1]);
+}
+
 // ---------------------------------------------------------------------------
 // Desired-state validation
 
@@ -1021,7 +1098,9 @@ function nameChecks(names, environment) {
 /**
  * The connection budget on the one Cloud SQL instance:
  * (maxInstances + rolloutOverlapInstances) x per-instance pools + jobBudget
- * + migration + 3 superuser-reserved + 10 headroom <= max_connections.
+ * + migration + reprice + 3 superuser-reserved + 10 headroom <= max_connections.
+ * The manual reprice job connects before it takes the refresh lock, so its
+ * pool is budgeted beside the scheduled jobs rather than in place of one.
  */
 export function connectionBudget({ service, jobs, cloudSql }) {
   const perInstance = PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE.primary;
@@ -1033,13 +1112,16 @@ export function connectionBudget({ service, jobs, cloudSql }) {
   const serviceConnections = instances * perInstance;
   const jobBudget = SCHEDULED_JOB_NAMES.reduce((sum, name) => sum + jobs[name].maxConnections, 0);
   const migration = jobs["production-migrate"].maxConnections;
-  const total = serviceConnections + jobBudget + migration + SUPERUSER_RESERVED_CONNECTIONS + CONNECTION_HEADROOM;
+  const reprice = jobs["analytics-reprice"].maxConnections;
+  const total = serviceConnections + jobBudget + migration + reprice + SUPERUSER_RESERVED_CONNECTIONS
+    + CONNECTION_HEADROOM;
   return Object.freeze({
     perInstance,
     instances,
     serviceConnections,
     jobBudget,
     migration,
+    reprice,
     superuserReserved: SUPERUSER_RESERVED_CONNECTIONS,
     headroom: CONNECTION_HEADROOM,
     total,
@@ -1235,6 +1317,9 @@ export function validateDesiredState(input, { readSource = defaultReadSource } =
   }
   if (jobs.maintenance.maxConnections < MAINTENANCE_JOB_CONTRACT.poolMax) {
     fail("JOB_POOL_MAX_UNDERDECLARED:maintenance");
+  }
+  if (jobs["analytics-reprice"].maxConnections < analyticsRepricePoolMax({ readSource })) {
+    fail("JOB_POOL_MAX_UNDERDECLARED:analytics-reprice");
   }
 
   if (!isRecord(input.scheduler)
@@ -2095,6 +2180,41 @@ export function rolloutTargetFromDesiredState(desired) {
  */
 export function rolloutTarget(environment, { readFile, readSource } = {}) {
   return rolloutTargetFromDesiredState(loadCommittedDesiredState(environment, { readFile, readSource }));
+}
+
+/** The JOB_NAMES key of the manual saved-cohort reprice job (OPS-REPRICE). */
+export const ANALYTICS_REPRICE_JOB_KEY = "analytics-reprice";
+/** The keys of the reprice verb's closed target (scripts/gcp-analytics-reprice.mjs). */
+export const ANALYTICS_REPRICE_TARGET_KEYS = Object.freeze([
+  "environment", "project", "region", "job", "refreshJob", "migrationJob", "imageRepository", "entry",
+]);
+
+/**
+ * The reprice verb's target for a validated desired state: the reprice job it
+ * executes, the jobs whose running executions it refuses to overlap (the
+ * refresh, which shares its advisory lock, and the migration), the image
+ * repository the job's image must come from and the bundled entry every
+ * execution names first. A synthetic desired state is refused, as for the
+ * rollout target, and so is a job the environment does not deploy.
+ */
+export function analyticsRepriceTargetFromDesiredState(desired) {
+  if (desired.synthetic) fail("ANALYTICS_REPRICE_TARGET_SYNTHETIC_REFUSED");
+  if (!deployedJobNames(desired).includes(ANALYTICS_REPRICE_JOB_KEY)) fail("ANALYTICS_REPRICE_TARGET_JOB_UNDEPLOYED");
+  return deepFreeze({
+    environment: desired.environment,
+    project: desired.project,
+    region: desired.region,
+    job: desired.jobs[ANALYTICS_REPRICE_JOB_KEY].name,
+    refreshJob: desired.jobs["analytics-refresh"].name,
+    migrationJob: desired.jobs["production-migrate"].name,
+    imageRepository: desired.artifactRegistry.imageRepository,
+    entry: ANALYTICS_REPRICE_JOB_CONTRACT.entry,
+  });
+}
+
+/** The reprice verb's entry point: the environment's committed desired state, and no other source. */
+export function analyticsRepriceTarget(environment, { readFile, readSource } = {}) {
+  return analyticsRepriceTargetFromDesiredState(loadCommittedDesiredState(environment, { readFile, readSource }));
 }
 
 // ---------------------------------------------------------------------------
