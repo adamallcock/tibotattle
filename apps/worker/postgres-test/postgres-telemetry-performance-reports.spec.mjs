@@ -952,11 +952,14 @@ test("read fences: 256 reports, declared bytes and records, counted cohort and b
     assert.equal(detailSelected(recorder.statements), detailRead);
   };
 
-  // 257 reports exceed the 256-report fence; 256 read.
+  // 257 reports exceed the 256-report fence; 256 read. The 257 rows are
+  // consecutive days from DAY, so the narrowed read ends at DAY + 255, which
+  // DAY's own clock decides (a fixed date would age out with DAY).
   const many = await owned(schema);
   await rawReports(many, 257, 0, 100);
   await fenced(many, 400, "SYNC_RANGE_TOO_LARGE");
-  assert.equal((await read(schema, many.owner, { throughDay: "2027-06-21" })).reports.length, 256);
+  const lastOf256 = new Date(Date.parse(`${DAY}T00:00:00.000Z`) + 255 * DAY_MS).toISOString().slice(0, 10);
+  assert.equal((await read(schema, many.owner, { throughDay: lastOf256 })).reports.length, 256);
 
   // Declared canonical bytes over 8 MiB, and declared records over 16,384.
   const bytes = await owned(schema);
