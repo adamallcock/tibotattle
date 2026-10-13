@@ -628,7 +628,7 @@ test("a non-scratch target needs the SIMP residue in the image manifest; refused
     isCode("PRODUCTION_SIMP_RESIDUE_MISSING"));
   assert.deepEqual(refused.counts, { identity: 1, manifest: 1, pools: 0, apply: 0, closes: 0 });
   assert.deepEqual(refused.events, []);
-  // The real 78-migration manifest is accepted for a non-scratch target.
+  // The real 79-migration manifest is accepted for a non-scratch target.
   const accepted = harness();
   const receipt = await runProductionMigrations({ env, dependencies: accepted.dependencies });
   assert.equal(receipt.target.kind, "environment");

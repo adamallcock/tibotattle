@@ -1655,7 +1655,7 @@ test("private health dispatch validates the current primary PostgreSQL 17 receip
         },
       },
     });
-    assert.equal(POSTGRES_RUNTIME_MIGRATIONS.primary.length, 78);
+    assert.equal(POSTGRES_RUNTIME_MIGRATIONS.primary.length, 79);
     assert.equal(JSON.stringify(health).includes(primarySchema), false);
     assert.equal(Object.hasOwn(health.checks, "database"), false);
     assert.ok(connections >= 1);
