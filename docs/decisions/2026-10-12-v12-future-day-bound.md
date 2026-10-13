@@ -160,6 +160,20 @@ The pricer is unchanged. The deployment needs the kernel 18 registry entry and
 its `REGISTRY_PINS` line, and the analytics reprice immediately after the roll,
 as every kernel change does.
 
+## Combined kernel amendment (2026-10-12)
+
+The deploy candidate is built on the live production origin (`7a4bc73eb`,
+analytics kernels through 16) together with the community model speed work,
+whose performance stage also changes compute-closure inputs. Both changes ship
+in one combined registry entry, kernel 17: one kernel bump for speed and the
+v1.2 future-day bound, so one reprice. The entry's `computeClosureSha256` is
+`11b055a6…74f2` (228 closure inputs) and its `REGISTRY_PINS` line is
+`183fde1b…5814`. Where this record says kernel 18, read kernel 17 for this
+candidate. The reasoning in [Analytics kernel](#analytics-kernel) is
+unchanged, and the
+[community model speed decision](./2026-10-10-community-model-speed.md#live-based-deploy-candidate-amendment-2026-10-12)
+records the same entry.
+
 ## Gates not covered here
 
 - Origin roll, kernel 18 activation and the post-roll reprice (owner-run).

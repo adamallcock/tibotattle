@@ -410,6 +410,44 @@ as written, except where this section says otherwise.
 This amendment is source documentation. It records no release, deployment,
 migration or activation.
 
+## Live-based deploy candidate amendment (2026-10-12)
+
+The owner authorized a deploy, so the Google Cloud origin source above was
+rebuilt on the live production origin (`7a4bc73eb`, analytics kernels through
+16, primary migrations through 0078) instead of on a release line that carries
+commits beyond it. The candidate is that live commit plus this speed work, the
+reprice Job and verb, and the
+[v1.2 future-day bound](./2026-10-12-v12-future-day-bound.md); it carries no
+other unqualified commit. This amendment narrows the implementation notes
+above; the decisions stand.
+
+- **One kernel bump for speed and the v1.2 future-day bound, so one reprice.**
+  The performance stage and the future-day refresh clamp both change analytics
+  compute-closure inputs. They share one new registry entry, kernel 17
+  (`computeClosureSha256` `11b055a6…74f2`, 228 closure inputs,
+  `REGISTRY_PINS` line `183fde1b…5814`). It replaces the GCP line's
+  provisional kernel 16 and the future-day fix's provisional kernel 18, so a
+  single reprice after the roll covers both changes. The vendored kernels,
+  prices and pricer are unchanged.
+- **Legacy Worker dictionary.** The live line's D1 schema has no
+  `0013_performance_ultrafast.sql` (its ingestion-isolation 0013 is the v1.2
+  quarantine admission), so the legacy Cloudflare Worker's performance path
+  keeps its `…2026-09-21.1` pin.
+- **Migration number.** The live primary chain ends at 0078, so
+  `0079_performance_telemetry.sql` keeps its number.
+- **Reprice carrier.** The post-roll reprice runs through the reprice Cloud
+  Run Job and the `gcp:analytics:reprice` verb
+  ([rollout sequence](../runbooks/gcp-rollout.md#sequence), step 10). An
+  owner infrastructure apply must create that Job before the roll.
+- **Monitoring.** The public model-performance read and the admin intake view
+  join the paths never excluded from the origin 5xx ratio.
+- **Client.** Unchanged. The candidate carries the shared contract pieces
+  only, and the client keeps emitting `…2026-09-29.1` with v1 buckets (the
+  [no new client amendment](#no-new-client-amendment-2026-10-12)).
+
+This amendment is source documentation. It records no release, deployment,
+migration or activation.
+
 ## Not covered
 
 This record does not authorize remote migrations, route deployment, runtime

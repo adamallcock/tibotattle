@@ -97,6 +97,17 @@ const REGISTRY_PINS = Object.freeze([
   // breakdowns v1.5) beside the retained Pro 10x v0.4 contract; pricing
   // identity unchanged.
   "871135e33844da3f2142da76da1429d0cd02a1b0544c1eba264680ce47a8447f",
+  // Kernel 17: one entry for two closure changes, so one reprice. The community
+  // model speed contract port (performance-histogram-v2, dictionary adapters,
+  // community performance shape) reaches the closure through the
+  // telemetry-contract barrel, with the performance reader and fold as closure
+  // roots; and the v1.2 future-day bound (decision 2026-10-12) makes the
+  // refresh plan through its own UTC day, deferring later queued days as
+  // blocked. errors.ts gains COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED,
+  // ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE and TELEMETRY_DAY_NOT_YET_ADMISSIBLE.
+  // Built on the live origin's kernel 16; vendor, prices and the pricer are
+  // unchanged; this source is not deployed.
+  "183fde1bb7104e12f0da61b91d4a4570940ea32a92d9e170696052c9bb065814",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
