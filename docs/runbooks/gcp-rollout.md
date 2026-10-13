@@ -442,7 +442,9 @@ fix is live and verified. Every step marked `owner` is a protected operation
 that needs its own authorization. The migration number is provisional: the
 integrator renumbers `0079_performance_telemetry.sql`, with its pin set, if the
 live primary head already holds 0079 or higher, and the steps below then apply
-to the new number.
+to the new number. This section describes the live-based deploy candidate:
+the live origin (`7a4bc73eb`) plus the community model speed work, the reprice
+Job and verb and the v1.2 future-day bound, and no other commit beyond live.
 
 What the migration does to the rollout:
 
@@ -469,50 +471,39 @@ What the migration does to the rollout:
 
 Owner order, after the general preconditions:
 
-1. **Kernel registry order.** `owner`. The live registry must already hold
-   the v1.2 activation-timeout kernel (kernel 15 in the live order), and the
-   allowance kernel 16 if it lands first. The integration branch merges the
-   activation-timeout head and appends the performance stage's entry as
-   `max(live) + 1`, which is kernel 16 on that base; if another kernel lands
-   in production first, the entry is dropped and re-appended after it, with
-   its `REGISTRY_PINS` line. `node cloud-run/build.mjs --check` must resolve
-   the commit's closure to that entry before the build
-   (`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED` otherwise).
+1. **Kernel registry order.** `owner`. The registry holds kernels 1 to 17 in
+   order. On 2026-10-12 the live origin served kernels through 16, including
+   the v1.2 activation-timeout kernel 15 and the allowance kernel 16. Kernel
+   17 is the single entry for the performance stage and the
+   [v1.2 future-day bound](../decisions/2026-10-12-v12-future-day-bound.md#combined-kernel-amendment-2026-10-12),
+   so one reprice covers both. If another kernel lands in production first,
+   kernel 17 is dropped and re-appended after it, with its `REGISTRY_PINS`
+   line. `node cloud-run/build.mjs --check` must resolve the commit's closure
+   to that entry before the build (`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED`
+   otherwise).
 2. **Build, migrate and roll** the integration commit through steps 4 to 9 of
    the [sequence](#sequence). `owner`. Keep the migrate receipt: its
    `migrations.historySha256` is the deployment digest the activation request
    names.
-3. **Resume the triggers** under steps 10 and 11 of the sequence. `owner`.
-   The maintenance trigger must resume within the 2-hour readiness window
-   that step 9 describes.
+3. **Reprice under kernel 17, then resume the triggers,** under steps 9 to 11
+   of the sequence. `owner`. The maintenance trigger resumes within the
+   2-hour readiness window that step 9 describes. The analytics-refresh
+   trigger stays paused until the step 10 reprice completes. The reprice Job
+   must exist before the roll: an owner-applied infrastructure plan creates
+   it ([preconditions](#preconditions), "Reprice Job present").
 
-   **Reprice under the new kernel: blocked, outside this window.** `owner`,
-   `not built`. The public read accepts a stored price equivalence only for
-   the serving kernel (`reprice-read.ts` matches `kernel_id` to the bundled
-   target), so equivalences stamped under the previous kernel stop applying
-   at the roll. A day that relies on one then has its historical spend block
-   withheld, never rewritten. Days already priced at the current registry are
-   not affected.
-   No record shows that the reprice lane has ever executed in production; if
-   it has not, the roll hides nothing. There is no production carrier:
-   - the image contains `dist/analytics-reprice.mjs`, but the rendered Cloud
-     Run Jobs are only `production-migrate`, `analytics-refresh` and
-     `maintenance` (`JOB_NAMES` in `scripts/gcp-ops-infra-manifest.mjs`);
-   - no reviewed tool executes the CLI in production or reads its
-     `analytics-reprice-receipt-v1` line, which carries the plan digest, back
-     from the execution log;
-   - [historical spend repricing](./2026-10-09-historical-spend-repricing.md)
-     is not live-qualified, and its templates submit no Job.
-
-   Do not improvise a carrier, for example by overriding the refresh Job's
-   arguments. Once a carrier is reviewed, the run count follows from the
-   plans, not from this runbook. Each plan selects at most 32 stale-price
-   heads (`--max-days`), 1,000 members and 16 MiB of input, and execution
-   refuses a capped plan. So more heads take several consecutive
-   date-partitioned rounds of plan, review and execute, each with a fresh
-   `--run-id`. Execution takes the shared refresh transaction lock and
-   refuses busy input, so it needs no trigger pause. Resume the triggers
-   without waiting for it, and run it outside a scheduled refresh.
+   The reprice matters because the public read accepts a stored price
+   equivalence only for the serving kernel (`reprice-read.ts` matches
+   `kernel_id` to the bundled target). Equivalences stamped under the
+   previous kernel stop applying at the roll, and a day that relies on one
+   has its historical spend block withheld, never rewritten, until a kernel
+   17 reprice restores it. Days already priced at the current registry are
+   not affected. The run count follows from the plans, not from this
+   runbook: each plan selects at most 32 stale-price heads (`--max-days`),
+   1,000 members and 16 MiB of input, and execution refuses a capped plan, so
+   more heads take several consecutive date-partitioned rounds of plan,
+   review and execute, each with a fresh `--run-id`
+   ([bounded repricing](./2026-10-09-historical-spend-repricing.md#production-carrier)).
 4. **Monitoring policy apply.** `owner`. The rendered policies changed: the
    performance capability and report paths joined the paths never excluded
    from the origin 5xx ratio, and the retired consent route is the only
@@ -580,11 +571,15 @@ of tail latency per refusal. This is not a probe signal and needs no brake.
 ### Refresh with future-dated v1.2 events
 
 The analytics-refresh Job tolerates v1.2 events and chunk days later than its
-clock. v1.2 admission has no server-clock bound: it only requires each event to
-fall on its manifest's UTC day. The refresh then completes, and its receipt
-lists any future queued days as published, because the plan runs through
-`max(queued days, today)`. The performance stage is not affected: it excludes
-report days after yesterday and counts them as `deferredFutureDays`.
+clock. Since the [v1.2 future-day bound](../decisions/2026-10-12-v12-future-day-bound.md),
+admission refuses a day manifest or chunk dated after the server's UTC day
+plus one (`429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE`), and the refresh plans only
+through its own UTC day: a queued later day stays blocked, is counted in the
+receipt's read summary as `deferredFutureDays`, and publishes once it is no
+longer in the future. Rows stored before the bound are handled the same way;
+the [incident runbook](./gcp-brake-and-incidents.md#future-dated-v12-days)
+counts them. The performance stage keeps its own rule: it excludes report days
+after yesterday and counts them in its own `deferredFutureDays`.
 
 A refresh that fails with `{"code":"ANALYTICS_V2_SOURCE_UNAVAILABLE","phase":"read"}`
 over v1.2 owners is therefore not a clock problem. First check that
