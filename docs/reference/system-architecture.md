@@ -269,6 +269,9 @@ predecessor before staging any day: a device with no ready day yet is seeded
 with the current UTC day, and the predecessor fingerprint pins only the prior
 head and input revision, so the client's own newly ready days never
 invalidate its journal. A complete domain includes days without records.
+The GCP origin refuses a v1.2 day later than its UTC day plus one with a paced
+429, and its refresh defers queued days after today, so no future day is
+published ([decision](../decisions/2026-10-12-v12-future-day-bound.md)).
 Its three usage extensions are continuity bits, same-time order and
 non-additive cache-write TTL detail. They
 are excluded from current cache arithmetic. Exact-total corrections preserve

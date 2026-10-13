@@ -201,6 +201,13 @@ the migration initializes the successor runtime as staged. Reader and production
 composition qualification is tracked in the
 [v1.2 plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
 
+The GCP origin bounds v1.2 days against its own clock: a day manifest or chunk
+later than the server's UTC day plus one is refused with
+`429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` and a `retry-after` until it is
+admissible, and the analytics refresh never plans or publishes a day after its
+UTC day. Past days stay unbounded. See the
+[future-day bound decision](../decisions/2026-10-12-v12-future-day-bound.md).
+
 Parser v17 repairs the existing exact totals while preserving parser v16's
 cache-write assumption. Ingestion-isolation migration
 `0007_usage_correction_admission.sql` preserves the predecessor, completeness,

@@ -225,11 +225,92 @@ Classify before mutating, and use the least control that contains the harm.
 | Public community reads are stale or missing | The refresh job is failing, paused or finding the lock held | The job's last executions and receipt line; `LOCK_HELD` is a no-write exit 0 | Published days stay served until republished. Fix the job forward; pause its trigger while the fix is built |
 | A day stays blocked on its saved owner set: the receipt's `ownerSets.memberLinkUnavailableDays` or `memberContributionUnavailableDays` names it | A saved member off the roster has no owner link left (its participant was deleted outside the offline purge), so its exclusions cannot be read; or its stored contribution is not foldable under the run's kernel | The run row's `publication.ownerSets` (days and counts only) | The day keeps its prior head; nothing is folded blind or as zero. A missing link is resolved by the offline purge (PURGE-1, `not built`), which removes the member and republishes the day; an unfoldable contribution by the reprice path (K-REPRICE, `not built`). Saved rows cannot be edited or deleted outside the purge |
 | Days stay blocked and the refresh receipt shows `unlinkedTypedOwners` above 0 and `unlinkedBlockedDays` above 0 | An eligible participant with typed evidence has no active owner link. As at d43c8f92, it withholds every computed day, except a day an active `community_weekly` exclusion of that participant covers (owner decision round 19: it is outside that day's cohort) | The run row and receipt (counts only); `unlinkedBlockedDays` is 0 when every such participant is excluded on every computed day | Each withheld day keeps its prior head. Diagnose why the link is absent before acting; never write a link, infer a digest or drop the participant by hand. An active exclusion covering the days lifts the block for those days only, and a revoked one lifts nothing. GCP has no exclusion writer yet: the table holds the cutover import only |
+| The refresh receipt shows `deferredFutureDays` above 0, and those days stay in `blocked` | Queued days after the run's UTC day: v1.2 rows admitted before the future-day bound, or a journal event naming such a day. The refresh never plans or publishes a day after today ([decision](../decisions/2026-10-12-v12-future-day-bound.md)) | The receipt and the run row's `publication.blocked` (days only); the [future-dated aggregates](#future-dated-v12-days) | None needed: each day is carried and publishes on the first run after it is no longer in the future. A head published for it before the bound keeps its row until then. Never edit the carried days or the source rows by hand |
+| Desktop clients get `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` on v1.2 day manifests or chunks | The client sent a day later than the server's UTC day plus one: its clock or source timestamps are ahead | Origin request logs (code and route class only); the [future-dated aggregates](#future-dated-v12-days) | Expected behaviour. The released client retries at the `retry-after` without pausing and keeps its journal; it cannot activate later days until the refused day is admissible. Do not widen the bound without an owner decision |
 | Origin 5xx, connection errors, slow queries | Cloud SQL saturation, a long transaction, the refresh job's read snapshot holding the horizon | Instance metrics; `pg_stat_activity` classes; job executions | Pause the refresh trigger; the refresh writes in one transaction. Scale the instance only as an owner decision |
 | Admin host returns `403 ACCESS_REQUIRED` or `503 ADMIN_NOT_CONFIGURED` | The Access chokepoint refused, or the Access settings are absent from the edge | `edge_admin_chokepoint_refused` log, Access application and owner pin | Diagnose Access separately; do not widen the chokepoint |
 | An unauthenticated request to the Cloud Run URL gets anything other than Google's 403 | The origin lock is broken: ingress or invoker IAM changed | The service's IAM policy and ingress setting | Treat as a security incident. The owner removes the unexpected binding or restores the ingress setting by hand, because OPS-2 apply never deletes, then reads the estate back. Brake if exposure is confirmed |
 | Release publication fails, or the update feed guard misbehaves | The guard's release-guard database, or a fenced edge | The edge mode; pending release-guard migrations | Web-only releases follow [Production edge modes, section 6](./production-edge-modes.md#6-releases-and-deploys-in-gcp-mode). Do not hand-edit signed feed bytes |
 | Wrong published number | A computation or price card error | Run stamps and the refresh receipt; compare with the source change | There is no retraction path. The refresh job republishes only days named by new evidence or left blocked, so correcting an already published day needs the republish path over each day's saved owner set. Each publication records that set and its members' contributions (E-OWNERSET, `built`); the reprice and republish path over them (K-REPRICE, OAI-5) is `not built`. Until it exists, the owner decides between disclosure and turning publication off, a reversible serving switch |
+
+### Future-dated v1.2 days
+
+The origin refuses a v1.2 day manifest or chunk whose UTC day is later than the
+server's UTC day plus one, and the refresh never plans or publishes a day after
+its own UTC day ([decision](../decisions/2026-10-12-v12-future-day-bound.md)).
+Rows admitted before that bound stay stored; their days are deferred until they
+are past. A refresh that fails with
+`{"code":"ANALYTICS_V2_SOURCE_UNAVAILABLE","phase":"read"}` over v1.2 owners is
+not a clock problem: first check that `telemetry_usage_correction_runtime` holds
+its `id = 1` row. The effective reader (`occurrence-source.ts` `readOwnerScope`,
+mirroring d43c8f92) refuses every v1.2 owner without it. Production always has
+the row (the cutover's usage-correction stage requires exactly one, and a
+trigger makes it immutable); a schema built from migrations alone, such as a
+test seed, must insert it before a refresh.
+
+To size stored future-dated rows, an owner runs these read-only statements
+through the reviewed read-only database access, never as the runtime role and
+never from an agent session against production. They return counts and days
+only: no participant, device, manifest, chunk or record identifier, digest, key
+or content. Replace `<primary_schema>` with the verified primary schema.
+
+```sql
+-- Read-only. Stored v1.2 rows whose chunk day is after the current UTC date,
+-- grouped by day. Counts only: no participant, device, manifest, chunk or
+-- record identifier, digest, key or content. Replace <primary_schema>.
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '120s';
+SET LOCAL lock_timeout = '5s';
+WITH bound AS (
+  SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date AS today
+), manifests AS (
+  SELECT m.chunk_day AS day, count(*) AS manifests,
+         count(*) FILTER (WHERE m.state = 'ready') AS ready_manifests
+    FROM "<primary_schema>".telemetry_v12_day_manifests m CROSS JOIN bound
+   WHERE m.chunk_day > bound.today
+   GROUP BY m.chunk_day
+), chunks AS (
+  SELECT c.chunk_day AS day, count(*) AS chunks, sum(c.record_count) AS declared_records
+    FROM "<primary_schema>".telemetry_v12_chunks c CROSS JOIN bound
+   WHERE c.chunk_day > bound.today
+   GROUP BY c.chunk_day
+), records AS (
+  SELECT c.chunk_day AS day, count(r.chunk_id) AS typed_records
+    FROM "<primary_schema>".telemetry_v12_chunks c CROSS JOIN bound
+    JOIN "<primary_schema>".telemetry_v12_typed_records r ON r.chunk_id = c.id
+   WHERE c.chunk_day > bound.today
+   GROUP BY c.chunk_day
+), days AS (
+  SELECT day FROM manifests UNION SELECT day FROM chunks UNION SELECT day FROM records
+)
+SELECT to_char(days.day, 'YYYY-MM-DD') AS chunk_day,
+       COALESCE(manifests.manifests, 0) AS manifests,
+       COALESCE(manifests.ready_manifests, 0) AS ready_manifests,
+       COALESCE(chunks.chunks, 0) AS chunks,
+       COALESCE(chunks.declared_records, 0) AS declared_records,
+       COALESCE(records.typed_records, 0) AS typed_records
+  FROM days
+  LEFT JOIN manifests ON manifests.day = days.day
+  LEFT JOIN chunks ON chunks.day = days.day
+  LEFT JOIN records ON records.day = days.day
+ ORDER BY days.day;
+COMMIT;
+```
+
+Published heads for days after the current UTC day (day and revision only):
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '30s';
+SELECT to_char(day, 'YYYY-MM-DD') AS day, revision
+  FROM "<primary_schema>".analytics_v2_published_daily
+ WHERE day > (statement_timestamp() AT TIME ZONE 'UTC')::date
+ ORDER BY day;
+COMMIT;
+```
+
+Record the environment, capture time and result beside the decision; do not
+publish these operational counts as community data.
 
 ### Secrets and keys
 
