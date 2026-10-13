@@ -957,11 +957,14 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
       [schema],
     );
     // The contract's tables, and REV-SEED's revision floor, which the store
-    // names (it decides no kernel value, so it stays out of contract.ts).
+    // names (it decides no kernel value, so it stays out of contract.ts), and
+    // the community model performance heads of 0079, which the store's
+    // publication contract names.
     assert.deepEqual(tables.rows.map((row) => row.name), [...Object.values(contract.ANALYTICS_V2_TABLES),
       ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES),
       ...Object.values(store.ANALYTICS_V2_PRICING_CLASS_TABLES),
-      ...Object.values(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES)].sort());
+      ...Object.values(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES),
+      ...Object.values(store.ANALYTICS_V2_PERFORMANCE_TABLES)].sort());
     const described = [
       ...Object.entries(contract.ANALYTICS_V2_TABLES).map(([key, table]) => [table,
         contract.ANALYTICS_V2_COLUMNS[key], contract.ANALYTICS_V2_PRIMARY_KEYS[key]]),
@@ -972,6 +975,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
       store.ANALYTICS_V2_PRICING_CLASS_COLUMNS[key], store.ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS[key]]));
     described.push(...Object.entries(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES).map(([key,table]) => [table,
       store.ANALYTICS_V2_REPRICE_AUDIT_COLUMNS[key],store.ANALYTICS_V2_REPRICE_AUDIT_PRIMARY_KEYS[key]]));
+    described.push(...Object.entries(store.ANALYTICS_V2_PERFORMANCE_TABLES).map(([key, table]) => [table,
+      store.ANALYTICS_V2_PERFORMANCE_COLUMNS[key], store.ANALYTICS_V2_PERFORMANCE_PRIMARY_KEYS[key]]));
     for (const [table, expectedColumns, expectedKey] of described) {
       const columns = await pool.query(
         `SELECT column_name::text AS name FROM information_schema.columns
