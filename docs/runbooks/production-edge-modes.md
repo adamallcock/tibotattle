@@ -666,10 +666,9 @@ origin and edge-port lines:
 
 The three accountless performance intake routes need no edge change; they
 were already forwarded as policy routes. Monitoring counts both new routes in
-the origin 5xx ratio. They are not on its explicit never-excluded list
-(`ORIGIN_5XX_NEVER_EXCLUDED_PATHS`), but no exclusion names either of them:
-each exclusion names one exact route and only its
-`503 POSTGRES_ROUTE_NOT_PORTED` answer.
+the origin 5xx ratio, and both are on its explicit never-excluded list
+(`ORIGIN_5XX_NEVER_EXCLUDED_PATHS`, since 2026-10-12), so no exclusion may
+name either of them.
 
 Deploy order for this change:
 

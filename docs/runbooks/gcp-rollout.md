@@ -516,8 +516,9 @@ Owner order, after the general preconditions:
 4. **Monitoring policy apply.** `owner`. The rendered policies changed: the
    performance capability and report paths joined the paths never excluded
    from the origin 5xx ratio, and the retired consent route is the only
-   performance path still excluded. The public model-performance and admin
-   intake routes are counted like every other route that is not excluded.
+   performance path still excluded. The public model-performance read and
+   the admin intake view are counted too, and are pinned never excluded (a
+   guard on the exclusion table that changes no rendered policy).
    Re-plan and apply under a fresh plan digest
    ([monitoring](../../apps/worker/cloud-run/infra/monitoring.md#protected-monitoring-apply)).
 5. **Read-only checks before the edge deploy.** While the runtime is staged,

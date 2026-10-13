@@ -233,7 +233,10 @@ export const ORIGIN_5XX_NEVER_EXCLUDED_CODES = Object.freeze([
  * upload routes v0.x shares (a v0.x upload answers a 4xx since round 19, and
  * any 5xx on these paths stays counted), the three restored performance
  * intake routes (decision 1, 2026-10-10: served; 403 before activation,
- * never a 5xx), and the renew and disconnect routes round 12 keeps.
+ * never a 5xx), the public community model-performance read and the admin
+ * performance-intake view (owner decisions 2026-10-10, pinned 2026-10-12:
+ * served; an unpublished slot is a 404 and a view the origin cannot read is a
+ * 503 that counts), and the renew and disconnect routes round 12 keeps.
  */
 export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
   "/api/v1/contributions",
@@ -241,6 +244,8 @@ export const ORIGIN_5XX_NEVER_EXCLUDED_PATHS = Object.freeze([
   "/api/v1/accountless/telemetry-performance-authorization",
   "/api/v1/device/telemetry/performance/capabilities",
   "/api/v1/device/telemetry/performance/reports",
+  "/api/v1/community/model-performance",
+  "/api/v1/admin/performance-intake",
   "/api/v1/device/credential/renew",
   "/api/v1/device/disconnect",
 ]);

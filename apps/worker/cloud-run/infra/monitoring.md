@@ -235,8 +235,10 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
   an authenticated request `403 TELEMETRY_TRANSPORT_BLOCKED` until the
   owner activates the runtime, never a 5xx; any 5xx they give is the
   Worker's own configuration, containment, storage or admission answer and
-  counts like any live route's), and the renew and disconnect routes round
-  12 keeps. It also refuses any path that is not an exact
+  counts like any live route's), the two routes of 2026-10-10 below
+  (`/api/v1/community/model-performance` and
+  `/api/v1/admin/performance-intake`, pinned 2026-10-12), and the renew and
+  disconnect routes round 12 keeps. It also refuses any path that is not an exact
   `WORKER_ROUTE_POLICY` pathname, any
   code other than `POSTGRES_ROUTE_NOT_PORTED`, and two codes by name, as a
   guard only:
@@ -268,10 +270,13 @@ query is `((errors / requests) > 0.02) and on() (errors >= 5)`, over
     which counts.
 
   Neither ever answers `POSTGRES_ROUTE_NOT_PORTED`, the only code an
-  exclusion may name, so no exclusion can apply to them. They are not in
-  `ORIGIN_5XX_NEVER_EXCLUDED_PATHS` either; the monitoring check pins the
-  exact excluded route classes and that no performance-class route is
-  excluded.
+  exclusion may name, so no exclusion can apply to them. Since 2026-10-12
+  both are also in `ORIGIN_5XX_NEVER_EXCLUDED_PATHS`, so a later exclusion
+  naming either is refused (`MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN`)
+  whatever its code. The monitoring check pins the full never-excluded list,
+  the exact excluded route classes, and that no performance-class or
+  performance-intake route is excluded. The pin changes no rendered policy:
+  it only narrows which exclusions the table may hold.
 - **v0.x uploads answer a 4xx.** Round 12 retires v0.x uploads at the
   switch, and round 19 (2026-10-03) answers them with `d43c8f92`'s definite
   `403 TELEMETRY_TRANSPORT_BLOCKED`, not the unported 503: a v0.1 or v0.2
