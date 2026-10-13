@@ -85,6 +85,7 @@ What follows from the decision:
 | Schema reviewed | `migrate` | The migrations are expand-compatible or reviewed in `CONTRACT_MIGRATIONS`, and the append-only residue migration is present (`PRODUCTION_SIMP_RESIDUE_MISSING` until it lands) |
 | Jobs quiescent | `migrate`, `roll` | Every Cloud Scheduler trigger of a Cloud Run job in the location is paused, and nothing is running (`ROLLOUT_JOBS_NOT_PAUSED`, `ROLLOUT_JOBS_RUNNING`) |
 | Lifecycle pass | `roll` | Whenever the live edge is not in `gcp` mode, `roll` checks the served commit through the verifier path, which needs `/api/ready` to read `ready`, and readiness needs a completed maintenance pass under 2 hours old. `roll` runs that pass itself: one execution of the target's maintenance job after it moves and reads back the service and jobs and before it checks the served commit (`ROLLOUT_MAINTENANCE_PASS_FAILED` unless exactly one execution succeeds; D-CRB). A target without a maintenance job (staging, which cannot deploy it yet) is refused before any write outside `gcp` mode (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). This covers every pre-switch rollout, the pre-staging one included, and every rollout while the edge is braked to `fenced` |
+| Reprice Job present | `preflight` | The reprice Job (`jobs.analytics-reprice`) is in the committed desired state and the rollout target, so the clean-estate readback refuses until an owner-applied OPS-2 plan has created it with a bootstrap image that carries `dist/analytics-reprice.mjs` ([infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice)). Create it before the first migrate or roll from a commit that declares it |
 | Edge capture | `roll` | A verified capture of the live edge, at most 15 minutes old, for this environment |
 | Contract blob | `roll` | If the live edge is in gcp mode, `apps/worker/src/edge-origin-contract.ts` has the same Git blob at `--commit` and at the live edge's commit (`EDGE_CONTRACT_DRIFT`), and the edge points at this service |
 | Lock | Every mutating verb | The environment's own coordination lock is free. Production takes the shared production deployment lock, `refs/heads/codex/production-deployment-lock`; staging takes only `refs/heads/codex/staging-deployment-lock` and never the production lock (owner decision 2026-10-02, round 9). The mapping is closed, and a dry run prints the exact ref as `lockRef` |
@@ -221,7 +222,7 @@ and print the argv; they run no `gcloud` and make no request.
    - **Before pausing anything, record** for every trigger: its name, its live
      state (`gcloud scheduler jobs describe`), and its committed state in the
      environment's desired-state file. This record, not the roll receipt,
-     decides what is resumed in step 11.
+     decides what is resumed in steps 9 and 11.
    - Pause each trigger that is in this plane's desired state:
 
      ```bash
@@ -287,8 +288,13 @@ and print the argv; they run no `gcloud` and make no request.
    the served-commit check reads only public health (status `ok` and the
    commit), not `/api/ready`; readiness still goes stale 2 hours after the last
    pass (the roll's own pass, when the target has a maintenance job), so
-   resume the maintenance trigger within that window.
-10. **Reprice under the new kernel, before any trigger resumes.** Required
+   resume the maintenance trigger within that window, here and before step 10,
+   under the same rules as step 11: it is in this plane's committed desired
+   state with state `ENABLED`, and your step 6 record shows it live `ENABLED`
+   before the pause. Do not hold it for the reprice, which can outlast the
+   window.
+10. **Reprice under the new kernel, before the analytics-refresh trigger
+    resumes.** Required
     whenever the rolled commit's analytics kernel differs from the previous
     one (compare the `kernel.kernelId` that `node cloud-run/build.mjs --check`
     prints at each commit, or the last entry of
@@ -312,19 +318,29 @@ and print the argv; they run no `gcloud` and make no request.
       --receipt-out=<new absolute path> --authorize=reprice-execute:<env>:<planSha256> --execute
     ```
 
-    The triggers are still paused here, so no refresh can start, and the verb
-    refuses while a refresh, reprice or migration execution is running. Each
+    Only the analytics-refresh trigger is held for this step. It is still
+    paused here, so no refresh can start, and the verb refuses while a
+    refresh, reprice or migration execution is running. The maintenance
+    trigger is not held: step 9 resumed it, because readiness goes stale 2
+    hours after the last pass and this step can take longer (each plan and
+    execute is one Job execution of up to 3,600 s, the verb polls for up to
+    3,900 s, and the procedure repeats per 32-day window). The verb does not
+    check maintenance executions, and the maintenance pass takes its own
+    advisory lock, not the refresh lock, so a pass may run alongside a
+    reprice. Each
     `--execute` is a separate `owner` operation: an execution of a production
     Job. The reprice Job must exist first: it is part of the committed desired
     state and is created by an owner-applied OPS-2 plan (see the
     [infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice)).
     `built` (OPS-REPRICE); tested offline only, never run against a project.
-11. **Resume the triggers, explicitly and in order,** under
+11. **Resume the remaining triggers, explicitly and in order,** under
     [GCP scheduler resume](./gcp-scheduler-resume.md#resume-after-a-rollout).
     Resume only a trigger that is in this plane's committed desired state with
     state `ENABLED` and that your step 6 record shows live `ENABLED` before the
-    pause. Never resume a trigger because it appears in `pausedTriggers`. The
-    rollout never resumes a trigger. `not built` (OPS-3 `resume-all`).
+    pause. The maintenance trigger was resumed in step 9; the analytics-refresh
+    trigger resumes only after step 10 finished or was skipped, and not over an
+    unresolved `REPRICE_*` execute refusal. Never resume a trigger because it
+    appears in `pausedTriggers`. The rollout never resumes a trigger. `not built` (OPS-3 `resume-all`).
 12. **Close out.** Record UTC times, the commit, the digest, the receipts'
     digests (the reprice receipts' `digestSha256` included), the outage window, the observed health, the paused and resumed
     triggers and any refusal, following
@@ -351,7 +367,7 @@ and print the argv; they run no `gcloud` and make no request.
 | `PRODUCTION_COORDINATION_*` | The shared deployment lock is held | A retained lock is a stop. Do not retry with raw tools; follow the typed reconciliation in [Production service operations](./production-operations.md#guarded-deployment-wrapper) |
 | `STAGING_COORDINATION_*` | The staging deployment lock is held, or its state is uncertain | A retained staging lock is a stop. Do not delete or move `refs/heads/codex/staging-deployment-lock` by hand; report the owner commit to the owner. The production lock is not involved |
 | `ROLLOUT_LOCK_REF_MISMATCH`, `DEPLOYMENT_COORDINATION_*` | The lock offered for this environment is not its own ref, or the environment is not in the closed mapping | Stop. Nothing was pushed. Fix the checkout; never point one environment at another's lock |
-| `REPRICE_*` (step 10) | The reprice verb refused, before or after its one execution | See the refusal table in [Bounded historical spend repricing](./2026-10-09-historical-spend-repricing.md#refusals). Do not resume the refresh trigger over an unresolved execute refusal; the roll itself stands |
+| `REPRICE_*` (step 10) | The reprice verb refused, before or after its one execution | See the refusal table in [Bounded historical spend repricing](./2026-10-09-historical-spend-repricing.md#refusals). Do not resume the analytics-refresh trigger over an unresolved execute refusal; the roll itself stands. The maintenance trigger is not held (step 9) |
 
 After a failure between `migrate` and a successful `roll`, the previous
 revision is still refusing its storage-gated routes. The priority is a
@@ -588,7 +604,7 @@ insert it before running the refresh.
 | Pre-migration backup expiry | The code labels them to expire in 30 days. The privacy disclosure drafted for the cutover says pre-change backups are kept at most 90 days. Reconcile before either is published |
 | First-roll ready path | `built` (D-CRB): `roll` runs one maintenance job execution before its served-commit check. Local proof only; not run in any project. Staging has no maintenance job yet, so its origin-verifier roll is refused before any write |
 | Contract-blob check on every origin deploy | The roll checks it only while the edge is in gcp mode. The all-modes check is `not built` (D-BLOB) |
-| Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Not applied or rolled in any project |
+| Maintenance job in the rollout target | `built` (D-OPS4). The production target's jobs are the migration job, the refresh job and the maintenance job, and the staging target omits the maintenance job until its staging template exists. Both targets' jobs also include the reprice job (OPS-REPRICE). Not applied or rolled in any project |
 | First live readback of the OPS-2 estate | Open (OPS2-READ) |
 | Staging migrate-and-roll proof, with its live sub-checks | Open (see [staging proof](#staging-proof)) |
 | Reprice Job and verb (step 10) | `built` (OPS-REPRICE): the Job is in both desired states and the rollout target, and the verb is tested offline with a stubbed `gcloud`. Not applied, executed or log-parsed in any project. The first live run is staging, owner-authorized |
