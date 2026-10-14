@@ -2,7 +2,7 @@ import {
   canonicalTelemetryPerformanceJson,
   parseTelemetryPerformanceRecord,
   PERFORMANCE_BUCKET_SCHEME_VERSION,
-  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29,
   PERFORMANCE_MEASUREMENT_VERSION,
   PERFORMANCE_PRIVACY_CONTRACT_VERSION,
   PERFORMANCE_RECORD_SCHEMA_VERSION,
@@ -18,11 +18,18 @@ import {
 } from "./telemetry-performance-policy";
 
 const REPORT_SCHEMA_VERSION = "telemetry-performance-report-v1";
+// The legacy Cloudflare Worker is pinned to the dictionary and v1 bucket scheme
+// it shipped with; it does not follow the client's moving default.  Its SQL
+// CHECK constraints and stored rows name performance-histogram-v1.
+const LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-29.1" =
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29;
+const LEGACY_PERFORMANCE_BUCKET_SCHEME_VERSION: "performance-histogram-v1" =
+  PERFORMANCE_BUCKET_SCHEME_VERSION;
 // Historical rows keep the dictionary under which they were authorized. This
 // read allowlist does not broaden the current parser or write authorization.
 const STORED_FIELD_DICTIONARY_VERSIONS = [
   "telemetry-performance-registry-2026-09-21.1",
-  PERFORMANCE_FIELD_DICTIONARY_VERSION,
+  "telemetry-performance-registry-2026-09-29.1",
 ] as const;
 const REPORT_KEYS = [
   "bucketSchemeVersion", "day", "fieldDictionaryVersion", "measurementVersion",
@@ -66,9 +73,9 @@ export interface TelemetryPerformanceReport {
   readonly sourceRevision: number;
   readonly methodVersion: typeof TELEMETRY_PERFORMANCE_METHOD_VERSION;
   readonly parserVersion: string;
-  readonly fieldDictionaryVersion: typeof PERFORMANCE_FIELD_DICTIONARY_VERSION;
+  readonly fieldDictionaryVersion: typeof LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION;
   readonly privacyContractVersion: typeof PERFORMANCE_PRIVACY_CONTRACT_VERSION;
-  readonly bucketSchemeVersion: typeof PERFORMANCE_BUCKET_SCHEME_VERSION;
+  readonly bucketSchemeVersion: typeof LEGACY_PERFORMANCE_BUCKET_SCHEME_VERSION;
   readonly measurementVersion: typeof PERFORMANCE_MEASUREMENT_VERSION;
   readonly records: readonly Record<string, unknown>[];
 }
@@ -231,9 +238,9 @@ export function parseTelemetryPerformanceReport(value: unknown): TelemetryPerfor
       || !integer(value.sourceRevision)
       || value.methodVersion !== TELEMETRY_PERFORMANCE_METHOD_VERSION
       || !safeString(value.parserVersion, TOKEN)
-      || value.fieldDictionaryVersion !== PERFORMANCE_FIELD_DICTIONARY_VERSION
+      || value.fieldDictionaryVersion !== LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION
       || value.privacyContractVersion !== PERFORMANCE_PRIVACY_CONTRACT_VERSION
-      || value.bucketSchemeVersion !== PERFORMANCE_BUCKET_SCHEME_VERSION
+      || value.bucketSchemeVersion !== LEGACY_PERFORMANCE_BUCKET_SCHEME_VERSION
       || value.measurementVersion !== PERFORMANCE_MEASUREMENT_VERSION
       || !Array.isArray(value.records)
       || value.records.length > MAX_REPORT_RECORDS) {
@@ -244,8 +251,10 @@ export function parseTelemetryPerformanceReport(value: unknown): TelemetryPerfor
   const seen = new Set<string>();
   const seenCohorts = new Set<string>();
   for (const record of value.records) {
-    try { parseTelemetryPerformanceRecord(record); } catch { invalid(); }
-    const canonical = canonicalTelemetryPerformanceJson(record);
+    try {
+      parseTelemetryPerformanceRecord(record, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION);
+    } catch { invalid(); }
+    const canonical = canonicalTelemetryPerformanceJson(record, LEGACY_PERFORMANCE_FIELD_DICTIONARY_VERSION);
     if (seen.has(canonical) || (previous !== "" && previous > canonical)) invalid();
     const identity = cohortIdentity(record);
     if (seenCohorts.has(identity)) invalid();

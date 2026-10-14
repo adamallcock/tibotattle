@@ -153,7 +153,10 @@
       "const": "model-performance-samples-v1"
     },
     "bucketSchemeVersion": {
-      "const": "performance-histogram-v1"
+      "enum": [
+        "performance-histogram-v1",
+        "performance-histogram-v2"
+      ]
     },
     "turns": {
       "type": "integer",
@@ -234,6 +237,74 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "bucketSchemeVersion": {
+            "const": "performance-histogram-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v1"
+              }
+            }
+          },
+          "ttftHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v1"
+              }
+            }
+          },
+          "completionHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v1"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "bucketSchemeVersion": {
+            "const": "performance-histogram-v2"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "speedHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v2"
+              }
+            }
+          },
+          "ttftHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v2"
+              }
+            }
+          },
+          "completionHistogram": {
+            "properties": {
+              "schemaVersion": {
+                "const": "performance-histogram-v2"
+              }
+            }
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -473,5 +544,5 @@
       }
     }
   ],
-  "$comment": "Provider and model IDs come from the reviewed catalog and its exact provider pairing. Runtime additionally requires speedTurns, ttftTurns, and completionTurns to be no greater than positive turns; receipt/legacy/tool_free cohorts to have speedTurns equal turns; unavailable speed cohorts to have zero speed sums and an empty speed histogram; timedResponses to be at least speedTurns; speed, TTFT, and completion histogram counts to match their eligible counts; completion observations to be positive integer milliseconds; and the ratio of summed speedTokens to speedDurationMs to lie within conservative speed extrema. Speed mode evidence and API service tier are independent dimensions."
+  "$comment": "Provider and model IDs come from the reviewed catalog and its exact provider pairing. The report's field dictionary selects the accepted subset: 2026-09-21.1 has no ultrafast and uses performance-histogram-v1, 2026-09-29.1 adds ultrafast with performance-histogram-v1, and 2026-10-10.1 uses performance-histogram-v2. Every histogram uses the record's bucket scheme. Runtime additionally requires speedTurns, ttftTurns, and completionTurns to be no greater than positive turns; receipt/legacy/tool_free cohorts to have speedTurns equal turns; unavailable speed cohorts to have zero speed sums and an empty speed histogram; timedResponses to be at least speedTurns; speed, TTFT, and completion histogram counts to match their eligible counts; completion observations to be positive integer milliseconds; and the ratio of summed speedTokens to speedDurationMs to lie within conservative speed extrema. Speed mode evidence and API service tier are independent dimensions."
 }

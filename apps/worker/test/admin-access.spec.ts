@@ -187,6 +187,7 @@ describe("admin surface hostname gating", () => {
       "/api/v1/admin/community/allowance-preview",
       "/api/v1/admin/reconstruction-progress",
       "/api/v1/admin/database-health",
+      "/api/v1/admin/performance-intake",
     ]) {
       const adminApi = await handleRequest(
         new Request(`${PUBLIC_ORIGIN}${path}`),
@@ -387,6 +388,33 @@ describe("admin surface hostname gating", () => {
     expect(statements).toHaveLength(1);
     expect(statements[0]!.trimStart()).toMatch(/^SELECT/u);
     expect(statements[0]).not.toMatch(/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b/u);
+  });
+
+  it("keeps the unavailable read-only performance-intake view out of every database path", async () => {
+    // The D1 Worker holds no PostgreSQL performance intake (owner decision
+    // 2026-10-10): after the admin envelope the view is the expected
+    // fail-closed 503, with no read and no diagnostic write.
+    const statements: string[] = [];
+    const database = new Proxy(env.USAGE_MONITOR_DB, { get(target, key) {
+      if (key === "prepare") return (sql: string) => { statements.push(sql); throw new Error("synthetic storage outage"); };
+      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const bindings = adminSurfaceBindings({ USAGE_MONITOR_DB: database });
+    const request = async (path: string, init: RequestInit = {}) => handleRequest(new Request(`${ADMIN_ORIGIN}${path}`, {
+      ...init, headers: { "cf-access-jwt-assertion": await signedAccessJwt() },
+    }), bindings);
+    const unavailable = await request("/api/v1/admin/performance-intake");
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers.get("cache-control")).toBe("no-store");
+    expect(await unavailable.json()).toMatchObject({ error: { code: "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE" } });
+    const query = await request("/api/v1/admin/performance-intake?detail=1");
+    expect(query.status).toBe(400);
+    expect(await query.json()).toMatchObject({ error: { code: "BODY_INVALID" } });
+    const post = await request("/api/v1/admin/performance-intake", { method: "POST", body: "{}" });
+    expect(post.status).toBe(405);
+    expect(post.headers.get("allow")).toBe("GET");
+    expect(post.headers.get("cache-control")).toBe("no-store");
+    expect(statements).toEqual([]);
   });
 
   it("accepts a plain string audience claim from Access", async () => {

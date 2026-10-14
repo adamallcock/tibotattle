@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 11 paths, 11 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 50 API paths, 53 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 52 API paths, 55 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, Codex plugin, companion, analysis owners ↔ child/worker | 11 explicit runtime protocol families |
@@ -374,6 +374,7 @@ Authority vocabulary:
 | `GET` | `/api/v1/admin/database-health` | Admin | Reads content-free connectivity, response time and reported size for API-bound D1 roles; no mutations or schema qualification |
 | `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations; exact optional `detail=preparation` adds a capped retained-input census as version 2, while query-free version 1 is unchanged |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
+| `GET` | `/api/v1/admin/performance-intake` | Admin | Read the content-free, read-only performance-intake view (owner decision 2026-10-10); no activation control; the D1 Worker answers `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
 | `POST` | `/api/v1/me/device-pairings` | Session | Mint a one-use pairing code for a local collector |
 | `POST` | `/api/v1/device-pairings/claim` | Pairing code | Bind a locally generated device credential hash to a participant |
@@ -403,9 +404,14 @@ Authority vocabulary:
 | `POST` | `/api/v1/contributions` | Upload | Validate and accept one encrypted contribution under device-minted, body-bound authority |
 | `GET` | `/api/v1/me/export` | Session | Stream the participant's bounded hosted-data export |
 | `GET` | `/api/v1/community/daily` | Public | Read bounded daily community series for `from` and `to` ISO-day bounds |
+| `GET` | `/api/v1/community/model-performance` | Public | Read one published community model-performance slot for exactly one `period` and one `speedMode`, under the `community/daily` public-read budget; unpublished is `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED` |
 | all | `/.well-known/apple-developer-domain-association.txt` | None | Deliberately intercepted retired path; always `404`, never SPA content |
 
 ### Lifecycle review
+
+The two owner-decided routes of 2026-10-10 and the origin's serving of the
+three restored performance intake routes are described in the entrypoint's
+[community model performance section](./api-surface.md#community-model-performance-and-the-postgresql-origin).
 
 The existing daily route also supports the closed optional
 [`community-allowance-breakdowns-v1.1` projection](./api-surface.md#public-allowance-breakdowns).

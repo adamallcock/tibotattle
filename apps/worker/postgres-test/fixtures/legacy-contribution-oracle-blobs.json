@@ -1,6 +1,6 @@
 {
   "commit": "d43c8f92",
-  "note": "git blob ids at d43c8f92 of the production code and D1 schema the IN-3 legacy admission oracle runs (local path relative to apps/worker -> production path). postgres-legacy-contribution-admission.spec.mjs refuses any drift.",
+  "note": "git blob ids at d43c8f92 of the production code and D1 schema the IN-3 legacy admission oracle runs (key: the path the oracle originally loaded, relative to apps/worker -> production repository path). The oracle now runs vendored copies (legacy-contribution-oracle-d43c8f92, by production path); postgres-legacy-contribution-admission.spec.mjs refuses any vendored byte that differs from these reviewed blobs.",
   "sources": {
     "src/typed-v1-admission.ts": {
       "production": "apps/worker/src/typed-v1-admission.ts",

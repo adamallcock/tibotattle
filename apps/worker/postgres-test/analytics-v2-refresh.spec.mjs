@@ -945,8 +945,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 78,
-      "the 78-migration primary chain including immutable repricing proofs, input associations and classification lookup indexes");
+    assert.equal(stock.length + stagedCount, 79,
+      "the 79-migration primary chain including immutable repricing proofs, input associations, classification lookup indexes and performance telemetry");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -957,11 +957,14 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
       [schema],
     );
     // The contract's tables, and REV-SEED's revision floor, which the store
-    // names (it decides no kernel value, so it stays out of contract.ts).
+    // names (it decides no kernel value, so it stays out of contract.ts), and
+    // the community model performance heads of 0079, which the store's
+    // publication contract names.
     assert.deepEqual(tables.rows.map((row) => row.name), [...Object.values(contract.ANALYTICS_V2_TABLES),
       ...Object.values(store.ANALYTICS_V2_REVISION_FLOOR_TABLES),
       ...Object.values(store.ANALYTICS_V2_PRICING_CLASS_TABLES),
-      ...Object.values(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES)].sort());
+      ...Object.values(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES),
+      ...Object.values(store.ANALYTICS_V2_PERFORMANCE_TABLES)].sort());
     const described = [
       ...Object.entries(contract.ANALYTICS_V2_TABLES).map(([key, table]) => [table,
         contract.ANALYTICS_V2_COLUMNS[key], contract.ANALYTICS_V2_PRIMARY_KEYS[key]]),
@@ -972,6 +975,8 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
       store.ANALYTICS_V2_PRICING_CLASS_COLUMNS[key], store.ANALYTICS_V2_PRICING_CLASS_PRIMARY_KEYS[key]]));
     described.push(...Object.entries(store.ANALYTICS_V2_REPRICE_AUDIT_TABLES).map(([key,table]) => [table,
       store.ANALYTICS_V2_REPRICE_AUDIT_COLUMNS[key],store.ANALYTICS_V2_REPRICE_AUDIT_PRIMARY_KEYS[key]]));
+    described.push(...Object.entries(store.ANALYTICS_V2_PERFORMANCE_TABLES).map(([key, table]) => [table,
+      store.ANALYTICS_V2_PERFORMANCE_COLUMNS[key], store.ANALYTICS_V2_PERFORMANCE_PRIMARY_KEYS[key]]));
     for (const [table, expectedColumns, expectedKey] of described) {
       const columns = await pool.query(
         `SELECT column_name::text AS name FROM information_schema.columns
@@ -2321,11 +2326,11 @@ const occurrence = (ownerDigest, day) => ({ ownerDigest, day, occurrenceId: `wir
  * 2026-03-02 and 2026-09-29, OWNER_B (v1.1, typed) on 2026-09-30.
  */
 function wiringModules({ unlinked = [], failOwner = null, ownerAEvidence = ["2026-03-02", "2026-09-29"],
-  exclusionRead = undefined, ownerSetRead = undefined, outputsOverride = undefined } = {}) {
+  exclusionRead = undefined, ownerSetRead = undefined, outputsOverride = undefined, journalPages = undefined } = {}) {
   const calls = { owners: 0, queued: [], occurrences: [], counts: [], firstEvidence: [], devices: [], compute: null,
     loaded: new Map(), exclusions: 0 };
   const evidence = new Map([[OWNER_A, ownerAEvidence], [OWNER_B, ["2026-09-30"]]]);
-  const pages = new Map([
+  const pages = journalPages ?? new Map([
     [0, { days: ["2026-09-30"], lastSequence: 5, terminalOwners: [digest("terminal")], events: 5, complete: false }],
     [5, { days: ["2026-03-02", "2026-09-29"], lastSequence: 9, terminalOwners: [], events: 4, complete: true }],
   ]);
@@ -2531,7 +2536,7 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual(outputs.journal, { lastSequence: 9 });
   assert.deepEqual(outputs.horizon, { ownerDayFromDay: "2026-02-13", cacheBandsFromDay: "2026-02-20" });
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, unlinkedBlockedDays: 0, terminalOwners: 1,
-    nonEffectiveUnread: 0 });
+    nonEffectiveUnread: 0, deferredFutureDays: 0 });
   assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-03-02", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.blockedDays, ["2026-04-10"]);
   // N-EXCL: read once, unchanged and empty: nothing reaches A-2 and nothing extra is queued.
@@ -2539,6 +2544,36 @@ test("default wiring: A-1 shapes in, one contiguous A-2 range out, non-effective
   assert.deepEqual([...calls.compute.exclusions], []);
   assert.equal(outputs.exclusionsSha256, NO_EXCLUSIONS);
   assert.deepEqual(outputs.exclusions, { rows: 0, active: 0, excludedOwners: 0, changed: false, republishedDays: 0 });
+});
+
+// FIX-FUTURE-V12 (decision 2026-10-12): a queued day after the run's UTC day
+// is neither planned, read, computed nor published. It is carried as blocked
+// (with a carried and a newly journaled future day), and the read range, the
+// evidence counts and A-2's queue all end today.
+test("default wiring: queued days after today are deferred, carried as blocked and never read", async () => {
+  const journalPages = new Map([[0, { days: ["2026-09-30", "2026-10-03"], lastSequence: 4, terminalOwners: [],
+    events: 4, complete: true }]]);
+  const { calls, modules } = wiringModules({ journalPages, ownerAEvidence: ["2026-09-29", "2026-10-03"] });
+  const pipeline = job.createAnalyticsV2Pipeline(modules);
+  const state = specState({ cursor: null, carriedBlockedDays: ["2026-10-02"], cacheFloorDay: "2026-02-20" });
+  const inputs = await pipeline.read({ pool: {}, schema: "s", nowMs: WIRING_NOW_MS, state });
+  assert.equal(utcDay(WIRING_NOW_MS), "2026-10-01");
+  assert.deepEqual(inputs.queuedDays, ["2026-09-30"]);
+  assert.deepEqual(inputs.deferredDays, ["2026-10-02", "2026-10-03"]);
+  assert.equal(inputs.occurrenceRange.throughDay, "2026-10-01", "the range ends today");
+  assert.ok(calls.counts.length > 0 && calls.counts.every((call) => call.throughDay <= "2026-10-01"));
+  assert.ok(calls.occurrences.every((call) => call.throughDay <= "2026-10-01"));
+  assert.deepEqual([...inputs.ownerEvidence.get(OWNER_A).keys()], ["2026-09-29"], "future evidence is not counted");
+  assert.deepEqual(calls.ownerSets, ["2026-09-30"]);
+  assert.deepEqual([...calls.devices[0].keys()], ["2026-09-30"]);
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 1 });
+  assert.deepEqual(calls.compute.queuedDays, ["2026-09-30"]);
+  assert.deepEqual([...calls.loaded.get(OWNER_A).keys()], ["2026-09-29"], "no future day is loaded");
+  assert.deepEqual(outputs.dailyCandidates.map((candidate) => candidate.day), ["2026-09-30"]);
+  // The stub's own blocked day stays; both future days are carried for the next run.
+  assert.deepEqual(outputs.blockedDays, ["2026-04-10", "2026-10-02", "2026-10-03"]);
+  assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 0, unlinkedBlockedDays: 0, terminalOwners: 0,
+    nonEffectiveUnread: 0, deferredFutureDays: 2 });
 });
 
 test("default wiring: a linked owner's active exclusions reach A-2, and a changed table queues every published day", async () => {
@@ -2581,6 +2616,180 @@ test("default wiring: a linked owner's active exclusions reach A-2, and a change
   for (const name of ["readAnalyticsV2Exclusions", "analyticsV2ExcludedOn"]) {
     const { owners: { [name]: _omitted, ...ownersWithout }, ...rest } = wiringModules().modules;
     assert.throws(() => job.createAnalyticsV2Pipeline({ ...rest, owners: ownersWithout }),
+      { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
+  }
+});
+
+// SPD-P3: the optional performance stage. Stub reader and fold modules with
+// the landed signatures (performance-source.ts readAnalyticsV2PerformanceSource,
+// compute-performance.ts computeAnalyticsV2Performance); the database case is
+// postgres-test/analytics-v2-model-performance.spec.mjs.
+const PERFORMANCE_END = "2026-09-30";
+
+/** A reader page as performance-source.ts returns it (opaque keys, content-free summary). */
+function performancePage(records, { reports, cohorts, pages, deferredFutureDays = 2, last = false }) {
+  return Object.freeze({
+    records: Object.freeze(records),
+    summary: Object.freeze({ reports, cohorts, pages, deferredFutureDays, complete: last }),
+    checkpoint: last ? null : Object.freeze({ kind: "analytics-v2-performance-source-checkpoint" }),
+  });
+}
+
+const performanceRecord = (participantKey, reportDay) => Object.freeze({ participantKey,
+  deviceKey: `${participantKey}-device`, reportKey: `${participantKey}-${reportDay}`, reportDay,
+  fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1", record: Object.freeze({ day: reportDay }) });
+
+function performanceModules({ result = undefined, pages = undefined } = {}) {
+  const calls = { pages: [], folds: [], connections: [] };
+  const owner = contractOwner(OWNER_A, "effective").participantId;
+  const sourcePages = pages ?? [
+    performancePage([performanceRecord(owner, "2026-09-29"), performanceRecord("participant-perf-b", "2026-09-29")],
+      { reports: 2, cohorts: 2, pages: 1 }),
+    performancePage([performanceRecord("participant-perf-b", PERFORMANCE_END)], { reports: 3, cohorts: 3, pages: 2,
+      last: true }),
+  ];
+  const models = (count) => Array.from({ length: count }, (_, index) => ({ modelId: `m${index}` }));
+  return {
+    calls,
+    performance: {
+      source: {
+        async readAnalyticsV2PerformanceSource(client, options) {
+          calls.pages.push({ ...options, inTransaction: client.open === true });
+          return sourcePages[calls.pages.length - 1];
+        },
+      },
+      compute: {
+        async computeAnalyticsV2Performance(input) {
+          const fold = { keys: Object.keys(input).sort(), records: [], excluded: [] };
+          calls.folds.push(fold);
+          for await (const record of input.records) {
+            fold.records.push(record.reportKey);
+            fold.excluded.push(input.excludedOn(record.participantKey, record.reportDay));
+          }
+          input.checkpoint?.({ kind: "performance", phase: "slot", index: 0 });
+          return result !== undefined ? result : { candidates: [{ period: "all", speedMode: "standard",
+            payload: { models: models(1) }, payloadSha256: "a".repeat(64) }], summary: { reports: 3, cohorts: 3,
+            includedRecords: 2, excludedRecords: 1, excludedUnknownTurns: 4, deferredFutureDays: 0, end: PERFORMANCE_END },
+          withheld: null };
+        },
+      },
+    },
+    /** A snapshot-pool stand-in: each page runs in its own BEGIN/COMMIT on a released connection. */
+    pool: {
+      async connect() {
+        const client = { open: false, released: false, async query(text) {
+          if (text === "BEGIN") client.open = true;
+          else if (text === "COMMIT") client.open = false;
+          else throw new Error("unexpected statement");
+          return { rows: [] };
+        }, async release() { client.released = true; } };
+        calls.connections.push(client);
+        return client;
+      },
+    },
+  };
+}
+
+test("default wiring (SPD-P3): the optional performance stage folds the reader's pages after compute", async () => {
+  const interval = Object.freeze({ effectiveAtUs: Date.parse("2026-09-29T00:00:00.000Z") * 1_000,
+    expiresAtUs: Date.parse("2026-09-30T00:00:00.000Z") * 1_000 });
+  const exclusionRead = { rows: 1, active: 1, sha256: NO_EXCLUSIONS, activeByParticipant: new Map([
+    [contractOwner(OWNER_A, "effective").participantId, [interval]]]) };
+  const plain = wiringModules({ exclusionRead });
+  const baseline = await job.createAnalyticsV2Pipeline(plain.modules).read({ pool: {}, schema: "s",
+    nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  // Without the module: no loader is built and the outputs carry no performance field.
+  assert.equal(baseline.loadPerformance, undefined);
+  const without = await job.createAnalyticsV2Pipeline(plain.modules).compute(baseline,
+    { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(Object.hasOwn(without, "performance"), false);
+
+  const { calls, performance, pool } = performanceModules();
+  const wired = wiringModules({ exclusionRead });
+  const pipeline = job.createAnalyticsV2Pipeline({ ...wired.modules, performance });
+  const inputs = await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+  // Lazy: nothing is read before compute.
+  assert.equal(calls.pages.length, 0);
+  const events = [];
+  const outputs = await pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0,
+    checkpoint: (event) => events.push(event) });
+  // The daily outputs are exactly the pipeline's without the stage.
+  const { performance: folded, ...daily } = outputs;
+  assert.deepEqual(daily, without);
+  // Pages are read through the latest completed UTC day, each in its own
+  // snapshot transaction, continuing the previous page's checkpoint.
+  assert.deepEqual(calls.pages.map(({ schema, throughDay, inTransaction }) => ({ schema, throughDay, inTransaction })), [
+    { schema: "s", throughDay: PERFORMANCE_END, inTransaction: true },
+    { schema: "s", throughDay: PERFORMANCE_END, inTransaction: true },
+  ]);
+  assert.equal(calls.pages[0].checkpoint, null);
+  assert.equal(calls.pages[1].checkpoint.kind, "analytics-v2-performance-source-checkpoint");
+  assert.ok(calls.connections.every((client) => client.released && !client.open));
+  // Every record is folded once; N-EXCL applies by participant and day; the
+  // fold gets no output account (the store charges the candidates once).
+  assert.equal(calls.folds.length, 1);
+  assert.deepEqual(calls.folds[0].keys, ["checkpoint", "excludedOn", "nowMs", "records"]);
+  assert.deepEqual(calls.folds[0].records, [`${contractOwner(OWNER_A, "effective").participantId}-2026-09-29`,
+    "participant-perf-b-2026-09-29", `participant-perf-b-${PERFORMANCE_END}`]);
+  assert.deepEqual(calls.folds[0].excluded, [true, false, false]);
+  // The fold's progress reaches the Job's checkpoint.
+  assert.deepEqual(events.filter((event) => event.kind === "performance"), [{ kind: "performance", phase: "slot", index: 0 }]);
+  // The reader's deferred days (never yielded) join the fold's summary.
+  assert.deepEqual(folded.summary, { reports: 3, cohorts: 3, includedRecords: 2, excludedRecords: 1,
+    excludedUnknownTurns: 4, deferredFutureDays: 2, end: PERFORMANCE_END });
+  assert.equal(folded.withheld, null);
+  assert.equal(folded.candidates.length, 1);
+
+  // A withheld fold passes through with its code (it affects only the performance publication).
+  const withheldResult = { candidates: [], summary: { reports: 3, cohorts: 3, includedRecords: 0, excludedRecords: 0,
+    excludedUnknownTurns: 0, deferredFutureDays: 0, end: PERFORMANCE_END }, withheld: "ANALYTICS_V2_PERFORMANCE_RECORD_INVALID" };
+  const withheldModules = performanceModules({ result: withheldResult });
+  const withheldPipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: withheldModules.performance });
+  const withheldOutputs = await withheldPipeline.compute(await withheldPipeline.read({ pool: withheldModules.pool,
+    schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 });
+  assert.equal(withheldOutputs.performance.withheld, "ANALYTICS_V2_PERFORMANCE_RECORD_INVALID");
+  assert.deepEqual(withheldOutputs.performance.candidates, []);
+});
+
+test("default wiring (SPD-P3): a reader or fold disagreement fails the run; a half-wired stage cannot be built", async () => {
+  const summary = { reports: 3, cohorts: 3, includedRecords: 2, excludedRecords: 0, excludedUnknownTurns: 0,
+    deferredFutureDays: 0, end: PERFORMANCE_END };
+  const named = { candidates: [{ payload: { models: [{}] } }], summary, withheld: null };
+  const empty = { candidates: [{ payload: { models: [] } }], summary, withheld: null };
+  for (const result of [
+    // Counts that differ from the reader's: a record read and not folded, or the reverse.
+    { ...named, summary: { ...summary, reports: 2 } },
+    { ...named, summary: { ...summary, cohorts: 4 } },
+    // GATE-Q 12: included records without a model, or a model without an included record.
+    empty,
+    { ...named, summary: { ...summary, includedRecords: 0 } },
+    null,
+  ]) {
+    const { performance, pool } = performanceModules({ result });
+    const pipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance });
+    const inputs = await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS, state: WIRING_STATE });
+    await assert.rejects(pipeline.compute(inputs, { nowMs: WIRING_NOW_MS, revisionSeed: 0 }),
+      { code: "ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID" });
+  }
+  // A malformed page is refused, never read as an empty corpus.
+  const { performance, pool } = performanceModules({ pages: [{ records: null, summary: {}, checkpoint: null }] });
+  const pipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance });
+  await assert.rejects(pipeline.compute(await pipeline.read({ pool, schema: "s", nowMs: WIRING_NOW_MS,
+    state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 }), { code: "ANALYTICS_V2_REFRESH_PERFORMANCE_INVALID" });
+  // A reader failure (a closed source code) fails the run with that code.
+  const failing = performanceModules();
+  failing.performance.source.readAnalyticsV2PerformanceSource = async () => {
+    throw Object.assign(new Error("ANALYTICS_V2_SOURCE_UNAVAILABLE"), { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+  };
+  const failingPipeline = job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: failing.performance });
+  await assert.rejects(failingPipeline.compute(await failingPipeline.read({ pool: failing.pool, schema: "s",
+    nowMs: WIRING_NOW_MS, state: WIRING_STATE }), { nowMs: WIRING_NOW_MS, revisionSeed: 0 }),
+  { code: "ANALYTICS_V2_SOURCE_UNAVAILABLE" });
+  assert.ok(failing.calls.connections.every((client) => client.released), "the page's connection is released");
+  // Both modules or neither.
+  const { source, compute } = performanceModules().performance;
+  for (const half of [{ source }, { compute }, {}, null]) {
+    assert.throws(() => job.createAnalyticsV2Pipeline({ ...wiringModules().modules, performance: half }),
       { code: "ANALYTICS_V2_REFRESH_PIPELINE_UNAVAILABLE" });
   }
 });
@@ -2767,7 +2976,7 @@ test("default wiring: an unlinked typed owner blocks every queued day; a non-eff
   assert.deepEqual(outputs.dailyCandidates, []);
   assert.deepEqual(outputs.blockedDays, ["2026-03-02", "2026-04-10", "2026-09-29", "2026-09-30"]);
   assert.deepEqual(outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
-    nonEffectiveUnread: 1 });
+    nonEffectiveUnread: 1, deferredFutureDays: 0 });
 
   // The same refusal for an effective owner fails the run: at its count
   // (read) and, should only its read refuse, at its load (compute).
@@ -2834,7 +3043,7 @@ test("default wiring: an exclusion lifts an unlinked typed participant's block o
   assert.deepEqual(none.published, []);
   assert.deepEqual(none.outputs.blockedDays, all);
   assert.deepEqual(none.outputs.readSummary, { unlinkedTypedOwners: 1, unlinkedBlockedDays: 3, terminalOwners: 1,
-    nonEffectiveUnread: 0 });
+    nonEffectiveUnread: 0, deferredFutureDays: 0 });
   // The unlinked participant reaches no A-2 input, and no id leaves the reader.
   assert.deepEqual([...none.calls.compute.exclusions], []);
   assert.equal(JSON.stringify(none.outputs.readSummary).includes("participant"), false);
@@ -2937,6 +3146,13 @@ test("cache horizon and day spans: history is retained back to the floor; reads 
   assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published), ["2026-09-01", "2026-09-30"]);
   assert.deepEqual(job.analyticsRefreshPublicationDays(["2026-09-30"], published, { exclusionsChanged: true }),
     ["2026-08-01", "2026-09-01", "2026-09-28", "2026-09-30"]);
+  // FIX-FUTURE-V12: days after today are deferred, today itself publishes.
+  assert.deepEqual(job.analyticsRefreshDeferFutureDays(["2026-09-30", "2026-10-01", "2026-10-02", "2027-01-01"],
+    "2026-10-01"), { publishable: ["2026-09-30", "2026-10-01"], deferred: ["2026-10-02", "2027-01-01"] });
+  assert.deepEqual(job.analyticsRefreshDeferFutureDays([], "2026-10-01"), { publishable: [], deferred: [] });
+  for (const [days, today] of [[["2026-10-32"], "2026-10-01"], [["2026-10-01"], "2026-10-1"], ["2026-10-01", "2026-10-01"]]) {
+    assert.throws(() => job.analyticsRefreshDeferFutureDays(days, today), { code: "ANALYTICS_V2_REFRESH_STATE_INVALID" });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -3061,6 +3277,44 @@ for (const correctionRuntime of ["active", "staged"]) {
     });
   });
 }
+
+// FIX-FUTURE-V12 (decision 2026-10-12) over the real A-1 readers and A-2
+// compute: a run on D2 neither plans nor publishes D3, carries it as blocked
+// and writes no owner-scoped row after its day; the run on D3's next day
+// publishes it normally.
+test("PG17 FIX-FUTURE-V12: a queued day after the run's UTC day is deferred, carried and published once past", {
+  skip: PG_SKIP,
+  timeout: 600_000,
+}, async () => {
+  await withDatabase("future-days", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active",
+      legacyScope: true });
+    const pipeline = realPipeline();
+    const { D2, D3 } = seedFixture;
+    const latestOwnerDay = async () => (await pool.query(`SELECT to_char(max(day), 'YYYY-MM-DD') AS day
+      FROM ${quoted(schema, "analytics_v2_owner_day")}`)).rows[0].day;
+
+    const early = await runJob({ schema, now: `${D2}T12:00:00.000Z`, pipeline });
+    assert.equal(early.state, "complete");
+    assert.equal(early.deferredFutureDays, 1);
+    assert.equal(early.published.includes(D3), false);
+    assert.ok(early.blocked.includes(D3), "the deferred day is carried as blocked");
+    assert.equal((await publishedRows(pool, schema)).has(D3), false);
+    assert.ok((await latestOwnerDay()) <= D2, "no owner-day row after the run's day");
+    const runs = await runRows(pool, schema);
+    assert.ok(runs.at(-1).publication.blocked.includes(D3));
+
+    // The deferred day is no longer in the future: it publishes from the carry.
+    const later = await runJob({ schema, now: seedFixture.NOW, pipeline });
+    assert.equal(later.state, "complete");
+    assert.equal(later.deferredFutureDays, 0);
+    assert.ok(later.published.includes(D3), JSON.stringify(later.published));
+    assert.equal(later.blocked.includes(D3), false);
+    assert.equal((await publishedRows(pool, schema)).get(D3).revision, 1);
+    assert.equal(await latestOwnerDay(), D3);
+  });
+});
 
 // N-EXCL (round 5: "their use in GCP analytics"; D-PT4X's read contract): an
 // active community_weekly exclusion leaves its owner out of each covered day's
@@ -4413,6 +4667,28 @@ test("time guard at the 24 h production timeout: the production-shaped roster pl
   const grown = (owner) => ({ ...owner, occurrences: owner.occurrences * 20, analysisUsage: owner.analysisUsage * 20 });
   assert.throws(() => guardAt().checkpoint({ kind: "plan", owners: owners.map(grown), workers: 4 }),
     (error) => error.code === "ANALYTICS_V2_REFRESH_DEADLINE_PROJECTED" && error.deadline.taskTimeoutSeconds === 86_400);
+});
+
+test("time guard (SPD-P3): the performance fold's progress is a checkpoint kind that refuses only past the refusal point", () => {
+  const model = job.ANALYTICS_REFRESH_TIME_MODEL;
+  let clock = 1_000_000;
+  const hour = 3_600_000;
+  const guard = job.createAnalyticsRefreshTimeGuard({ startedAtMs: 1_000_000, taskTimeoutMs: hour, wallClock: () => clock });
+  const refuseAt = 1_000_000 + hour - model.exitMarginMs - model.writeFixedMs;
+  // No measured rate projects the fold: its marks pass until the refusal point.
+  clock = refuseAt - 1;
+  guard.checkpoint({ kind: "performance", phase: "records", records: 4096 });
+  for (let index = 0; index < 12; index += 1) guard.checkpoint({ kind: "performance", phase: "slot", index });
+  // Malformed marks are refused, never ignored.
+  for (const event of [{ kind: "performance" }, { kind: "performance", phase: "records", records: 0 },
+    { kind: "performance", phase: "slot", index: 12 }, { kind: "performance", phase: "slot", index: -1 },
+    { kind: "performance", phase: "other", index: 0 }]) {
+    assert.throws(() => guard.checkpoint(event), { code: "ANALYTICS_V2_REFRESH_DEADLINE_INVALID" });
+  }
+  // Past the refusal point the fold stops at its next mark, before the write.
+  clock = refuseAt + 1;
+  assert.throws(() => guard.checkpoint({ kind: "performance", phase: "slot", index: 3 }),
+    { code: "ANALYTICS_V2_REFRESH_DEADLINE_EXCEEDED" });
 });
 
 test("time guard: refuses a hopeless plan, an owner that cannot finish and a step that could cross the deadline", () => {

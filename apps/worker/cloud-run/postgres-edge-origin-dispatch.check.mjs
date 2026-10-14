@@ -975,6 +975,10 @@ function routeStub(bindings, keys) {
       spied.UPLOAD_INGRESS_REQUEST_RATE_LIMIT, spied.UPLOAD_INGRESS_CLIENT_RATE_LIMIT, request, ORIGIN_ENV),
     community_daily: (request) => admissionHelpers.assertPublicAggregateReadAllowed(
       spied.PUBLIC_READ_RATE_LIMIT, request, ORIGIN_ENV),
+    // The owner-decided public read (2026-10-10) binds the same helper and
+    // binding (postgres-production-host.mjs composeOriginFamilies).
+    community_model_performance: (request) => admissionHelpers.assertPublicAggregateReadAllowed(
+      spied.PUBLIC_READ_RATE_LIMIT, request, ORIGIN_ENV),
     // The removed v1.2 divergence: an extra device_sync attempt on uploads.
     contributions_with_device_sync: async (request) => {
       await admissionHelpers.assertAttemptAllowed(
@@ -1016,6 +1020,11 @@ test("real helpers replay edge outcomes through the boundary", async () => {
     ["community_daily", "v1;public_aggregate_read;allowed", 200, null],
     ["community_daily", "v1;public_aggregate_read;limited", 429, "ATTEMPT_LIMIT_REACHED"],
     ["community_daily", "v1;public_aggregate_read;unavailable", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
+    ["community_model_performance", "v1;public_aggregate_read;allowed", 200, null],
+    ["community_model_performance", "v1;public_aggregate_read;limited", 429, "ATTEMPT_LIMIT_REACHED"],
+    ["community_model_performance", "v1;public_aggregate_read;unavailable", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
+    ["community_model_performance", null, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
+    ["community_model_performance", "v1;device_sync;allowed", 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE"],
   ];
   for (const [route, admissionHeader, status, code] of rows) {
     const headers = [["cf-connecting-ip", "203.0.113.7"], ["x-forwarded-for", "203.0.113.7"]];
@@ -1051,6 +1060,7 @@ test("50 concurrent boundary requests keep their own outcomes", async () => {
     ["device_sync_state", "device_sync"],
     ["contributions", "upload_ingress"],
     ["community_daily", "public_aggregate_read"],
+    ["community_model_performance", "public_aggregate_read"],
   ];
   const requests = Array.from({ length: 50 }, (_, index) => {
     const [route, purpose] = routes[index % routes.length];

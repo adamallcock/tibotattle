@@ -9,7 +9,7 @@ import { createServer } from "vite";
 // production and staging compose from the CR-3 configuration alone, with
 // the plane's origin-tier limits; the bind address is 0.0.0.0 only for a
 // validated Cloud Run service; refusals happen before any pool and close
-// what opened; the registry ports the production list (plus the six admin
+// what opened; the registry ports the production list (plus the seven admin
 // routes only when the composition root opens the admin host); requests
 // that need no storage (unported routes, the refused or chokepointed admin
 // host, EP-6 refusals) answer through the real EP-6 boundary and the CR-6
@@ -312,19 +312,24 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
     assert.equal(runtime.listenPort, 8080);
     assert.equal(configuration.isProductionConfiguration(runtime.configuration), true);
     // Round 12 (ADMIN-R12): the default composition opens the admin host,
-    // so the six admin routes are ported beside the production list.
+    // so the seven admin routes are ported beside the production list.
     assert.deepEqual([...runtime.registry.portedRouteIds].sort(), [
       ...composition.POSTGRES_PORTED_WORKER_ROUTE_IDS, ...composition.POSTGRES_ADMIN_HOST_ROUTE_IDS].sort());
     assert.deepEqual([...runtime.registry.unportedRouteIds], [...registry.RETIRED_ROUTE_IDS].sort());
-    assert.deepEqual([...runtime.registry.definiteRouteIds], ["accountless_telemetry_performance_authorization"]);
+    assert.equal(runtime.registry.portedRouteIds.length, 41, "scope 21, od-cr-1 9, admin 7, performance 4");
+    for (const id of ["community_model_performance", "admin_performance_intake"]) {
+      assert.equal(runtime.registry.resolve(id).disposition, "ported", id);
+    }
+    for (const id of registry.PERFORMANCE_ROUTE_IDS) {
+      assert.equal(runtime.registry.resolve(id).disposition, "ported", id);
+    }
 
     // A retired route: the closed 503 under the edge's request id, no
     // retry-after (OD-CR-6 iv), no-store, marked by EP-6. No storage is read.
     for (const [path, method] of [["/api/v1/me/export", "GET"], ["/api/v1/enroll", "POST"],
       ["/api/v1/identity/google/start", "POST"], ["/api/v1/identity/apple/start", "POST"],
-      ["/api/v1/me/security-reset", "POST"], ["/api/v1/device/telemetry/performance/capabilities", "GET"],
-      ["/api/v1/me/device-telemetry-performance-consents", "POST"],
-      ["/api/v1/device/telemetry/performance/reports", "POST"]]) {
+      ["/api/v1/me/security-reset", "POST"],
+      ["/api/v1/me/device-telemetry-performance-consents", "POST"]]) {
       const unported = await runtime.productionDispatch(invokerRequest(path, { method }));
       assert.equal(unported.status, 503, path);
       assert.deepEqual(await unported.json(), { error: { code: "POSTGRES_ROUTE_NOT_PORTED", requestId: REQUEST_ID } },
@@ -333,11 +338,11 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
       assert.equal(unported.headers.get("cache-control"), "no-store", path);
       assert.equal(unported.headers.get("x-tibotattle-origin"), "1", path);
     }
-    // The accountless performance authorization runs the composed round-19
-    // preamble (production's earlier answers): a session cookie is its first
-    // refusal, 401 AUTH_INVALID, before any read. The rest of the sequence
-    // and the terminal 403 are proved by retired-performance-authorization
-    // .check.mjs and, over PostgreSQL, postgres-production-host.spec.mjs.
+    // Decision 1 (2026-10-10): the performance grant is the composed family
+    // (routes/performance-telemetry.mjs): a session cookie is its first
+    // refusal, 401 AUTH_INVALID, before any read. The rest of the sequence is
+    // proved by routes/performance-telemetry.check.mjs and, over PostgreSQL,
+    // postgres-production-host.spec.mjs and the E12 edge-origin-e2e spec.
     assert.equal(typeof runtime.registry.resolve("accountless_telemetry_performance_authorization").handler,
       "function");
     const performance = await runtime.productionDispatch(invokerRequest(
@@ -348,15 +353,36 @@ test("HOST_MODE production composes from CR-3: three primary pools, the producti
     assert.equal(performance.headers.get("retry-after"), null);
     assert.equal(performance.headers.get("cache-control"), "no-store");
     assert.equal(performance.headers.get("x-tibotattle-origin"), "1");
+    // The device routes reach their family too, never the uniform 503: with
+    // no readable database (this offline check) the family's storage gate
+    // answers 503 BACKEND_STORAGE_UNAVAILABLE first, as for every gated route.
+    for (const [path, method] of [["/api/v1/device/telemetry/performance/capabilities", "GET"],
+      ["/api/v1/device/telemetry/performance/reports", "GET"],
+      ["/api/v1/device/telemetry/performance/reports", "POST"]]) {
+      const gated = await runtime.productionDispatch(invokerRequest(path, { method }));
+      assert.equal(gated.status, 503, path);
+      assert.deepEqual(await gated.json(), { error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: REQUEST_ID } },
+        path);
+      assert.equal(gated.headers.get("cache-control"), "no-store", path);
+    }
     // The admin host now runs the Access chokepoint first: a forged assertion
     // is the Worker's 403, before any family or read.
     const admin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview",
       { hostKind: "admin", headers: { "cf-access-jwt-assertion": "synthetic.access.jwt" } }));
     assert.equal(admin.status, 403);
     assert.equal((await admin.json()).error.code, "ACCESS_REQUIRED");
-    // The six admin ids are 404 on the apex.
+    // The seven admin ids are 404 on the apex.
     const apexAdmin = await runtime.productionDispatch(invokerRequest("/api/v1/admin/overview"));
     assert.equal(apexAdmin.status, 404);
+    const apexIntake = await runtime.productionDispatch(invokerRequest("/api/v1/admin/performance-intake"));
+    assert.equal(apexIntake.status, 404);
+    // The public model-performance read passes the storage gate first: with
+    // no database it is the gate's 503, never a family answer.
+    const read = await runtime.productionDispatch(invokerRequest(
+      "/api/v1/community/model-performance?period=7&speedMode=fast"));
+    assert.equal(read.status, 503);
+    assert.deepEqual(await read.json(), { error: { code: "BACKEND_STORAGE_UNAVAILABLE", requestId: REQUEST_ID } });
+    assert.equal(read.headers.get("cache-control"), "no-store");
     // EP-6 refuses a stranger and a verifier off its read paths: the unmarked 421.
     const stranger = await runtime.productionDispatch(new Request(`${RUN_APP_ORIGIN}/api/health`, {
       headers: { "x-serverless-authorization": token({ email: "stranger@synthetic-project.iam.gserviceaccount.com" }) },
@@ -392,7 +418,7 @@ test("OD-CR-3 'refuse' stays available to a caller that passes it: the admin hos
   }
 });
 
-test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more routes, Access before any family", async () => {
+test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): seven more routes, Access before any family", async () => {
   const seams = dependencies();
   const runtime = await host.createPostgresProductionRuntime({
     processEnv: productionEnv(), hostMode: "production",
@@ -408,6 +434,10 @@ test("OD-CR-3 'chokepoint' (the OWN-17 switch, ADMIN-R12 default): six more rout
     const action = await runtime.productionDispatch(invokerRequest("/api/v1/admin/action",
       { method: "POST", hostKind: "admin" }));
     assert.equal(action.status, 403);
+    const intake = await runtime.productionDispatch(invokerRequest("/api/v1/admin/performance-intake",
+      { hostKind: "admin" }));
+    assert.equal(intake.status, 403);
+    assert.equal((await intake.json()).error.code, "ACCESS_REQUIRED");
   } finally {
     for (const pool of runtime.pools) await pool.end();
   }
@@ -495,6 +525,132 @@ test("round 16: under the rotated identity-link label no identity-link consumer 
       (error) => error.code === "IDENTITY_LINK_ROTATION_CONSUMER_PORTED" && error.message === error.code, id);
   }
   // The production composition itself passes it (the composition test above runs under production-v2).
+});
+
+test("the performance policy binding adapts the storage switch to SPD-G2's typed mode (the G2/G4 hazard)", async () => {
+  assert.equal(host.PERFORMANCE_TELEMETRY_STORAGE_ENABLED, "enabled");
+  const policy = host.createPerformanceTelemetryPolicy({ sourceNamespace: "synthetic-namespace" });
+  assert.ok(Object.isFrozen(policy));
+  assert.deepEqual(Object.keys(policy), ["assertStorage", "parseGrantRequest", "grant", "readCapability"]);
+  const schema = Object.freeze({ primarySchema: "origin_primary" });
+  let connects = 0;
+  const statements = [];
+  const pool = (ready) => ({
+    async connect() {
+      connects += 1;
+      return {
+        async query(text) {
+          statements.push(String(text).trim().split(/\s+/u).slice(0, 2).join(" "));
+          return ready ? { rows: [{ ready: 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
+        },
+        release() {},
+      };
+    },
+  });
+  // Any switch value but 'enabled' (the parsed object G2 wants included) is
+  // the closed 503 before any connection.
+  for (const mode of [undefined, "disabled", "typed", "", { kind: "typed", sourceNamespace: "synthetic-namespace" }]) {
+    await assert.rejects(policy.assertStorage(pool(true), { schema, mode }),
+      (error) => error instanceof errors.ApiError && error.status === 503 && error.code === "BACKEND_STORAGE_UNAVAILABLE",
+      String(mode));
+  }
+  assert.equal(connects, 0, "a disabled switch reads nothing");
+  // 'enabled' (the production, staging and edge-test pin) reaches G2's
+  // runtime-row check under the composition's typed namespace: it passes
+  // when the row exists and is G2's 503 when it does not.
+  await policy.assertStorage(pool(true), { schema, mode: "enabled" });
+  assert.equal(connects, 1);
+  assert.ok(statements.some((statement) => statement === "SELECT 1"), statements.join("; "));
+  await assert.rejects(policy.assertStorage(pool(false), { schema, mode: "enabled" }),
+    (error) => error instanceof errors.ApiError && error.code === "BACKEND_STORAGE_UNAVAILABLE");
+  // A composition without a typed namespace cannot build the binding.
+  for (const sourceNamespace of [undefined, "", 7]) {
+    assert.throws(() => host.createPerformanceTelemetryPolicy({ sourceNamespace }),
+      { code: host.ORIGIN_COMPOSITION_INVALID }, String(sourceNamespace));
+  }
+  // The grant parser is G2's: the v1 wire shape parses, an extra key is 400.
+  const parsed = policy.parseGrantRequest({ schemaVersion: "accountless-performance-owner-v1",
+    policyVersion: "accountless-telemetry-performance-policy-v1",
+    authorizationBasis: "accountless-performance-policy-v1" });
+  assert.equal(parsed.declaredFieldDictionaryVersion, null);
+  assert.throws(() => policy.parseGrantRequest({ synthetic: true }),
+    (error) => error instanceof errors.ApiError && error.status === 400 && error.code === "BODY_INVALID");
+  assert.deepEqual(Object.keys(host.PERFORMANCE_TELEMETRY_REPORTS), ["admit", "read"]);
+});
+
+test("the composed families register the performance family under its three ids, before the v1.2 dispatch", () => {
+  const storageGate = { async assertCurrent() {}, probe: async () => new Response(null) };
+  const families = host.composeOriginFamilies({
+    dataPool: { async connect() { throw new Error("offline"); } },
+    primarySchema: "origin_primary",
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    admissionEnv: Object.freeze({ PERFORMANCE_TELEMETRY_STORAGE_MODE: "enabled" }),
+    storageGate,
+    dispatchOrigin: "http://127.0.0.1:43017",
+    objectStore: { async head() { return null; }, async put() {}, async delete() {} },
+    envelopePublicJwk: envelopeKeys("key:synthetic").ENVELOPE_PUBLIC_JWK,
+    envelopePrivateJwk: envelopeKeys("key:synthetic").ENVELOPE_PRIVATE_JWK,
+    requestContext: () => undefined,
+    uploadIngress: host.createUploadIngressAuthority(),
+    statusDispatchers: { health: async () => new Response(null), ready: null },
+    routeModuleContext: () => Object.freeze({}),
+    composeIntake: false,
+  });
+  for (const id of registry.PERFORMANCE_ROUTE_IDS) {
+    assert.equal(typeof families.handlers.get(id), "function", id);
+  }
+  assert.equal(families.handlers.get("telemetry_performance_consent"), undefined, "consent stays retired");
+  // The public read is the analytics-v2 route, not the intake family.
+  assert.notEqual(families.handlers.get("community_model_performance"),
+    families.handlers.get("telemetry_performance_reports"));
+  assert.equal(families.dispatchers.communityModelPerformance, families.handlers.get("community_model_performance"));
+  assert.deepEqual([...families.dispatchers.performance.pathnames], [
+    "/api/v1/accountless/telemetry-performance-authorization",
+    "/api/v1/device/telemetry/performance/capabilities",
+    "/api/v1/device/telemetry/performance/reports",
+  ]);
+  assert.equal(Object.hasOwn(families.dispatchers, "retiredPerformanceAuthorization"), false);
+});
+
+test("the composed families serve the public model-performance read through SPD-P4's route", async () => {
+  const storageGate = { async assertCurrent() {}, probe: async () => new Response(null) };
+  const contexts = [];
+  const families = host.composeOriginFamilies({
+    dataPool: { async connect() { throw new Error("offline"); } },
+    primarySchema: "origin_primary",
+    sourceIdentity: { sourceId: "synthetic-source", sourceNamespace: "synthetic-namespace" },
+    admissionEnv: Object.freeze({ PERFORMANCE_TELEMETRY_STORAGE_MODE: "enabled" }),
+    storageGate,
+    dispatchOrigin: "http://127.0.0.1:43017",
+    objectStore: { async head() { return null; }, async put() {}, async delete() {} },
+    envelopePublicJwk: envelopeKeys("key:synthetic").ENVELOPE_PUBLIC_JWK,
+    envelopePrivateJwk: envelopeKeys("key:synthetic").ENVELOPE_PRIVATE_JWK,
+    requestContext: () => undefined,
+    uploadIngress: host.createUploadIngressAuthority(),
+    statusDispatchers: { health: async () => new Response(null), ready: null },
+    routeModuleContext: (request) => {
+      contexts.push(request);
+      return Object.freeze({ requestId: "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b" });
+    },
+    composeIntake: false,
+  });
+  const handler = families.handlers.get("community_model_performance");
+  assert.equal(typeof handler, "function");
+  // The route's own 405 comes first and reads nothing; the module context
+  // carries the request id into its envelope.
+  const request = new Request("http://127.0.0.1:43017/api/v1/community/model-performance", { method: "POST", body: "{}" });
+  const refused = await handler(request);
+  assert.equal(refused.status, 405);
+  assert.equal(refused.headers.get("allow"), "GET");
+  assert.equal(refused.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await refused.json(), { error: { code: "METHOD_NOT_ALLOWED",
+    requestId: "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b" } });
+  assert.deepEqual(contexts, [request]);
+  // A GET reaches the publication control read on the pool: offline, it fails closed.
+  const offline = await handler(new Request(
+    "http://127.0.0.1:43017/api/v1/community/model-performance?period=7&speedMode=fast"));
+  assert.equal(offline.status, 503);
+  assert.equal(offline.headers.get("cache-control"), "no-store");
 });
 
 test("composeOriginFamilies refuses an incomplete dependency set", () => {
@@ -962,8 +1118,8 @@ test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health f
     const { server, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
       "import * as real from \"/cloud-run/postgres-production-registry.mjs\";",
       "export const ADMIN_HOST_ROUTE_IDS = real.ADMIN_HOST_ROUTE_IDS;",
-      // createOriginRouteRegistry hands the round-19 preambles over too.
-      "export const RETIRED_DEFINITE_ROUTE_IDS = real.RETIRED_DEFINITE_ROUTE_IDS;",
+      // composeOriginFamilies registers the performance family under these ids.
+      "export const PERFORMANCE_ROUTE_IDS = real.PERFORMANCE_ROUTE_IDS;",
       // The round-16 boot refusal (assertIdentityLinkRotationComposable) reads it too.
       "export const assertIdentityLinkConsumersRetired = real.assertIdentityLinkConsumersRetired;",
       "export function createProductionRouteRegistry(options) {",
@@ -1125,3 +1281,63 @@ test("run_maintenance over the lifecycle pass: a refused or failed pass is a fai
     const busy = scriptedPassPool({ maintenanceLock: false });
     await expectFailure(busy.pool, 409, "LIFECYCLE_STATE_CONFLICT", "skipped: MAINTENANCE_IN_PROGRESS");
   });
+
+test("admin maintenance: SPD-G5's owner-only runtime activation is the telemetryRuntimeActivation task", async () => {
+  const action = await vite.ssrLoadModule("/cloud-run/routes/admin-action.mjs");
+  const unreachable = { async connect() { throw new Error("synthetic connect failure"); } };
+  const maintenance = host.createPostgresOwnerMaintenance({
+    pool: unreachable, objectStore: { async head() { return null; }, async delete() {} },
+    primarySchema: "origin_primary", sourceCommit: COMMIT, clock: () => MAINTENANCE_NOW,
+  });
+  assert.ok(Object.isFrozen(maintenance));
+  // One owner maintenance carries every optional task: the lifecycle pass, the
+  // forced distribution sync, the v1.1 evidence adoption and this activation.
+  assert.deepEqual(Object.keys(maintenance).sort(),
+    ["runMaintenance", "syncDistribution", "telemetryRuntimeActivation", "v11EvidenceAdoption"]);
+  const contexts = new WeakMap();
+  const audits = [];
+  const dispatch = action.createAdminActionDispatch({
+    requestContext: (request) => contexts.get(request),
+    clock: () => MAINTENANCE_NOW,
+    admin: {
+      setCollectionControls: async () => { throw new Error("not reached"); },
+      beginAudit: async (input) => { audits.push(input); return "11111111-2222-4333-8444-555555555555"; },
+      finishAudit: async (input) => { audits.push(input); },
+      finishAuditBestEffort: async (input) => { audits.push(input); },
+      maintenance,
+    },
+  });
+  const send = (body) => {
+    const request = new Request(`${ADMIN_ORIGIN}/api/v1/admin/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ADMIN_ORIGIN, "sec-fetch-site": "same-origin",
+        "x-usage-monitor-admin": "1" },
+      body: JSON.stringify(body),
+    });
+    contexts.set(request, Object.freeze({ requestId: REQUEST_ID, routeId: "admin_action", adminIdentityKey: ADMIN_OWNER }));
+    return dispatch(request);
+  };
+  // A malformed activation is the task's own 400, never the unported 503.
+  const malformed = await send({ action: "run_maintenance", telemetryRuntimeActivation: { target: "performance" } });
+  assert.equal(malformed.status, 400);
+  assert.equal((await malformed.json()).error.code, "BODY_INVALID");
+  // A well-formed activation reaches the task, which reads its database in
+  // one transaction; with none reachable it answers its closed 503.
+  const wellFormed = await send({
+    action: "run_maintenance",
+    telemetryRuntimeActivation: {
+      confirmation: "activate_telemetry_performance_runtime",
+      deployment: { historySha256: "a".repeat(64), sourceCommit: COMMIT },
+      expectedRevision: 1,
+      idempotencyKey: "4f2c8a7e-1b3d-4e5f-9a6b-7c8d9e0f1a2b",
+      target: "performance",
+    },
+  });
+  const answered = await wellFormed.json();
+  assert.notEqual(answered.error?.code, "POSTGRES_ROUTE_NOT_PORTED");
+  assert.equal(wellFormed.status, 503, JSON.stringify(answered));
+  assert.equal(answered.error.code, "TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE");
+  assert.deepEqual(audits, [], "the activation task writes its own audit; the route writes none");
+  // The lifecycle pass stays the plain run_maintenance task.
+  assert.equal(typeof maintenance.runMaintenance, "function");
+});

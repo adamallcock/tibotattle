@@ -398,8 +398,7 @@ test("5xx exclusions name round 12's retired routes and the deliberate unported 
   assert.deepEqual(exclusions.map(({ routeClass }) => routeClass), [
     "enroll", "identity_google_start", "identity_google_callback", "identity_google_result",
     "identity_apple_start", "identity_apple_callback", "identity_apple_result", "security_reset",
-    "telemetry_performance_capabilities", "telemetry_performance_consent", "telemetry_performance_reports",
-    "participant_export", "admin_action",
+    "telemetry_performance_consent", "participant_export", "admin_action",
   ]);
   for (const entry of exclusions) {
     assert.equal(WORKER_ROUTE_POLICY.find(({ pathname }) => pathname === entry.path)?.id, entry.routeClass);
@@ -407,14 +406,24 @@ test("5xx exclusions name round 12's retired routes and the deliberate unported 
   }
   const paths = monitoring.ORIGIN_5XX_EXCLUSIONS.map(({ path }) => path);
   // Kept and live routes are never excluded: v0.x shares the two live upload
-  // routes (its round-19 answer is a 4xx; any 5xx there stays counted),
-  // the accountless performance authorization answers production's sequence
-  // (round 19), and round 12 keeps renew and disconnect.
+  // routes (its round-19 answer is a 4xx; any 5xx there stays counted), the
+  // restored performance intake is served (decision 1, 2026-10-10: 403
+  // before activation, never a 5xx), the public model-performance read and
+  // the admin performance-intake view are served (2026-10-10, pinned
+  // 2026-10-12), and round 12 keeps renew and disconnect.
   for (const kept of monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS) assert.equal(paths.includes(kept), false, kept);
-  for (const kept of ["/api/v1/contributions", "/api/v1/device/upload-authorizations",
+  assert.deepEqual([...monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS], ["/api/v1/contributions",
+    "/api/v1/device/upload-authorizations",
     "/api/v1/accountless/telemetry-performance-authorization",
-    "/api/v1/device/credential/renew", "/api/v1/device/disconnect"]) {
-    assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(kept), kept);
+    "/api/v1/device/telemetry/performance/capabilities", "/api/v1/device/telemetry/performance/reports",
+    "/api/v1/community/model-performance", "/api/v1/admin/performance-intake",
+    "/api/v1/device/credential/renew", "/api/v1/device/disconnect"]);
+  // Every never-excluded path is an exact served route, so the guard names a
+  // real route class rather than a stale path.
+  for (const kept of monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS) {
+    const route = matchWorkerRoute(kept);
+    assert.equal(route.kind, "exact", kept);
+    assert.equal(WORKER_ROUTE_POLICY.find(({ pathname }) => pathname === kept)?.id, route.routeClass, kept);
   }
   assert.deepEqual([...monitoring.ORIGIN_5XX_NEVER_EXCLUDED_CODES], ["POSTGRES_TEST_ROUTE_UNSUPPORTED",
     "EDGE_ORIGIN_UNAVAILABLE"]);
@@ -750,9 +759,9 @@ test("the origin request contract mirrors the origin's own log line (cloud-run/p
   assert.deepEqual({ status: Number(notPorted[1]), code: notPorted[2] }, { ...monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted });
   // Every excluded route is one round 12 retired to the uniform 503 (or the
   // admin action route, whose unported tasks answer the same code), and every
-  // such retired route is excluded; the accountless performance
-  // authorization answers production's sequence and a definite 403 instead
-  // (round 19), never the unported 503, so it is left in.
+  // such retired route is excluded; the restored performance intake
+  // (decision 1, 2026-10-10) is served, answers 403 before activation and is
+  // never excluded: only the signed-in consent route keeps its exclusion.
   const registry = await import("../cloud-run/postgres-production-registry.mjs");
   const excluded = monitoring.originFiveXxExclusions(monitoring.ORIGIN_5XX_EXCLUSIONS).map(({ routeClass }) => routeClass);
   for (const routeClass of excluded) {
@@ -760,7 +769,34 @@ test("the origin request contract mirrors the origin's own log line (cloud-run/p
       : registry.RETIRED_ROUTE_IDS.includes(routeClass), routeClass);
   }
   assert.deepEqual(registry.RETIRED_ROUTE_IDS.filter((id) => !excluded.includes(id)), []);
-  assert.deepEqual([...registry.RETIRED_DEFINITE_ROUTE_IDS], ["accountless_telemetry_performance_authorization"]);
-  assert.equal(registry.RETIRED_DEFINITE_ROUTE_IDS.some((id) => excluded.includes(id)), false);
-  assert.ok(registry.RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization.status < 500);
+  // The performance class also holds the owner-decided public model-performance
+  // read (2026-10-10), which is served and never excluded either.
+  assert.deepEqual([...registry.PERFORMANCE_ROUTE_IDS], ["accountless_telemetry_performance_authorization",
+    "telemetry_performance_capabilities", "telemetry_performance_reports", "community_model_performance"]);
+  assert.equal(registry.PERFORMANCE_ROUTE_IDS.some((id) => excluded.includes(id)), false);
+  assert.deepEqual(excluded.filter((id) => id.includes("performance")), ["telemetry_performance_consent"]);
+  for (const path of ["/api/v1/accountless/telemetry-performance-authorization",
+    "/api/v1/device/telemetry/performance/capabilities", "/api/v1/device/telemetry/performance/reports",
+    "/api/v1/community/model-performance"]) {
+    assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(path), path);
+  }
+  // The admin performance-intake view is an admin-host route, served and
+  // never excluded either.
+  assert.ok(registry.ADMIN_HOST_ROUTE_IDS.includes("admin_performance_intake"));
+  assert.equal(excluded.includes("admin_performance_intake"), false);
+  assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes("/api/v1/admin/performance-intake"));
+});
+
+test("the community model-performance read and the admin performance-intake view cannot be excluded", () => {
+  // Neither answers the unported 503 an exclusion subtracts, and both are
+  // pinned never excluded: an exclusion naming either is refused whatever
+  // its decision label, so their 5xx always count.
+  for (const [path, routeClass] of [["/api/v1/community/model-performance", "community_model_performance"],
+    ["/api/v1/admin/performance-intake", "admin_performance_intake"]]) {
+    assert.equal(matchWorkerRoute(path).routeClass, routeClass, path);
+    assert.ok(monitoring.ORIGIN_5XX_NEVER_EXCLUDED_PATHS.includes(path), path);
+    assert.throws(() => monitoring.originFiveXxExclusions([{ path, status: 503,
+      code: monitoring.ORIGIN_REQUEST_LOG_CONTRACT.notPorted.code, decision: "c-admin" }]),
+    { code: "MONITORING_5XX_EXCLUSION_PATH_FORBIDDEN" }, path);
+  }
 });

@@ -1,0 +1,708 @@
+{
+  "schemaVersion": "legacy-contribution-oracle-vendor-manifest-v1",
+  "sourceCommit": "d43c8f92a059d9c577776f7eca8a331eb305b8a6",
+  "generator": "apps/worker/scripts/vendor-legacy-contribution-oracle.mjs",
+  "check": "apps/worker/scripts/vendor-legacy-contribution-oracle.check.mjs",
+  "note": "Byte-for-byte copies of the d43c8f92 Worker modules, workspace package modules and D1 migrations the IN-3 legacy admission oracle runs; liveSeams resolve from the live tree. Generated; never edit by hand.",
+  "entryPoints": [
+    "apps/worker/src/analytics-delivery.ts",
+    "apps/worker/src/crypto.ts",
+    "apps/worker/src/device-auth.ts",
+    "apps/worker/src/errors.ts",
+    "apps/worker/src/telemetry-repository.ts",
+    "apps/worker/src/telemetry-storage-mode.ts",
+    "apps/worker/src/telemetry-transport-policy.ts",
+    "apps/worker/src/telemetry-v1-repository.ts",
+    "apps/worker/src/telemetry-v1.ts",
+    "apps/worker/src/telemetry-validation.ts",
+    "apps/worker/src/typed-v1-admission.ts"
+  ],
+  "liveSeams": [
+    "apps/worker/src/server-pricing.ts"
+  ],
+  "d1Directories": [
+    "migrations",
+    "typed-ingestion-migrations",
+    "ingestion-bridge-migrations",
+    "typed-v11-admission-migrations",
+    "typed-v1-admission-migrations",
+    "ingestion-isolation-migrations"
+  ],
+  "packageEntries": {
+    "@app-usagemonitor/quota-analysis": "packages/quota-analysis/index.js",
+    "@app-usagemonitor/telemetry-contract": "packages/telemetry-contract/index.js"
+  },
+  "externals": {
+    "jsonc-parser": "3.3.1"
+  },
+  "files": [
+    {
+      "path": "apps/worker/ingestion-bridge-migrations/0001_v11_delivery_bridge.sql",
+      "blob": "2db76b3c67dd3584b543f42c610bb45db1767204"
+    },
+    {
+      "path": "apps/worker/ingestion-bridge-migrations/0002_legacy_fit_authority.sql",
+      "blob": "f75a98f94eb48c8262d00571af046ca738e05378"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0001_separate_analytics_work.sql",
+      "blob": "2ac7b5cb8e17db0ef2d10f13ec3bbc8b03d3555f"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0002_v11_append_classification.sql",
+      "blob": "296f33b747cfdf5f81c06c45f4b477a03db4861a"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0003_v1_append_classification.sql",
+      "blob": "14902b62b254a8ea8dbbce8ecd00d58eba1bdaf2"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
+      "blob": "9e606cbd6a64f724b4326cb581eb685d5e2f2e9d"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0005_opt_out_retains_history.sql",
+      "blob": "168295c35d730d299f7cab8c284ae5466cb8f2bb"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0006_usage_correction_facts.sql",
+      "blob": "aa8fa3aa2da5c90106ff448e36ab2cadb859681f"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0007_usage_correction_admission.sql",
+      "blob": "e826bdd372c6b19e37a83bfbd5359288274700d9"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0008_telemetry_v12.sql",
+      "blob": "178401f765075b2bb6173284709a1952698c39c3"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0009_performance_reports.sql",
+      "blob": "6068085c6f69b9e30b0ba7adb665bb69391dc7c1"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0010_accountless_v12_renewal.sql",
+      "blob": "b09f1e74cfe904aea34f37c669dc9613c2b05eca"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0011_v12_public_eligibility.sql",
+      "blob": "fb09c9225aaa8d24eb2cf29cbe5a5d1096ca6ecb"
+    },
+    {
+      "path": "apps/worker/ingestion-isolation-migrations/0012_v12_empty_day_manifests.sql",
+      "blob": "426d719837068029d6983d334c533058862ab170"
+    },
+    {
+      "path": "apps/worker/migrations/0001_initial.sql",
+      "blob": "dba55814179b5a4225e20266e272d3f1d919a620"
+    },
+    {
+      "path": "apps/worker/migrations/0002_telemetry_ingest.sql",
+      "blob": "4516dd056f8798ceb07f051407192209e1bb70dc"
+    },
+    {
+      "path": "apps/worker/migrations/0003_enrollment_grants.sql",
+      "blob": "c4a506f67edacfa10c62f7c496d3ce9525b46d12"
+    },
+    {
+      "path": "apps/worker/migrations/0004_web_sessions_and_upload_authorizations.sql",
+      "blob": "f0b8c32897bd9cd16216dc64319d4c8ea20af361"
+    },
+    {
+      "path": "apps/worker/migrations/0005_community_weekly_snapshots.sql",
+      "blob": "e01929f219ecee18f8af731b23fe5836eb086353"
+    },
+    {
+      "path": "apps/worker/migrations/0006_server_pricing.sql",
+      "blob": "622f91b1d63a76cc3c3fbc93cf834602398f6db4"
+    },
+    {
+      "path": "apps/worker/migrations/0007_account_track_v0_2.sql",
+      "blob": "250d8ad0568255e724bf282a63ed2e16954b15c1"
+    },
+    {
+      "path": "apps/worker/migrations/0008_device_upload_registration.sql",
+      "blob": "0ef193aa206ab52d7ff28a57c2060ff3c0d45f5f"
+    },
+    {
+      "path": "apps/worker/migrations/0009_collection_controls.sql",
+      "blob": "c16ee9305321ac91cae776ba41225e45984c90a3"
+    },
+    {
+      "path": "apps/worker/migrations/0010_retention_lifecycle.sql",
+      "blob": "959dce7cab71a3839d878950dba77a24666333ac"
+    },
+    {
+      "path": "apps/worker/migrations/0011_account_scoped_device_consent.sql",
+      "blob": "0bcfe86eed6105241760cc7c256465eb401ff4ec"
+    },
+    {
+      "path": "apps/worker/migrations/0012_revisioned_aggregate_rebuild.sql",
+      "blob": "07da85c90d750bb4d93351f327fa37999ae8bbe5"
+    },
+    {
+      "path": "apps/worker/migrations/0013_quarantine_reconciliation.sql",
+      "blob": "dad72355bb36353a06c90275c8913c10d66e357b"
+    },
+    {
+      "path": "apps/worker/migrations/0014_bounded_contribution_admission.sql",
+      "blob": "040e6aef1d44dab8a5f0c8e2ca06a12f5ffb4953"
+    },
+    {
+      "path": "apps/worker/migrations/0015_identity_link.sql",
+      "blob": "e97c2386b840068f81f2f297dd7fb894238fc8ba"
+    },
+    {
+      "path": "apps/worker/migrations/0016_apple_signin_handoff.sql",
+      "blob": "714609ae0c77564a857a9331787779b2741d6873"
+    },
+    {
+      "path": "apps/worker/migrations/0017_google_signin_handoff.sql",
+      "blob": "53db30984819feafacdaab6286b2b816e24d0364"
+    },
+    {
+      "path": "apps/worker/migrations/0018_contribution_accepted_record_count.sql",
+      "blob": "12e5b5333dd1eafe287adddfee873ba1e0faff88"
+    },
+    {
+      "path": "apps/worker/migrations/0019_admin_operations.sql",
+      "blob": "6ba4c957d9a3d98cde47bd79fc9e566d8657d6fd"
+    },
+    {
+      "path": "apps/worker/migrations/0020_admin_operation_leases.sql",
+      "blob": "fa0b77caad985eb8b49c6e33d5a44478cb781646"
+    },
+    {
+      "path": "apps/worker/migrations/0021_replace_oidc_token_handoffs.sql",
+      "blob": "0cf271079ec4f67edd8c1b2493ef55130c95eaa5"
+    },
+    {
+      "path": "apps/worker/migrations/0022_historical_price_provenance.sql",
+      "blob": "bf2f5352649da56aaefa21ce902bc8c85c0fc533"
+    },
+    {
+      "path": "apps/worker/migrations/0023_community_aggregate_safety.sql",
+      "blob": "d520aaff9e09c6f3cbae916d8ba6601f6c9d3b0b"
+    },
+    {
+      "path": "apps/worker/migrations/0024_apple_signin_nonce_binding.sql",
+      "blob": "7ce0082e5ce7663e38543397e3e42d18347b5f68"
+    },
+    {
+      "path": "apps/worker/migrations/0025_device_lifecycle.sql",
+      "blob": "4317b73f59507902e9cafc40b61008165c937096"
+    },
+    {
+      "path": "apps/worker/migrations/0026_signin_start_admission.sql",
+      "blob": "ce4a913a76554cad16f103cb28939a4114baa4c4"
+    },
+    {
+      "path": "apps/worker/migrations/0027_identity_reenrollment_cooldown_guard.sql",
+      "blob": "36167db453e24cd862a6300ede804e7bcd7cad20"
+    },
+    {
+      "path": "apps/worker/migrations/0028_identity_link_secret_configuration.sql",
+      "blob": "2e36b4cf6a3497eea224954806a676931546b623"
+    },
+    {
+      "path": "apps/worker/migrations/0029_sparkle_appcast_guard_nonces.sql",
+      "blob": "db4f0855387b9cc1a3d40412594aac16c0852b14"
+    },
+    {
+      "path": "apps/worker/migrations/0030_deletion_cascade_child_indexes.sql",
+      "blob": "fb5f1428b5d30ae0adedf3358fbf150ac5a4a537"
+    },
+    {
+      "path": "apps/worker/migrations/0031_incremental_contribution_v1.sql",
+      "blob": "d29653c11f7e351cd250f311fd76bfa8842d63a5"
+    },
+    {
+      "path": "apps/worker/migrations/0032_signin_handoff_client_binding.sql",
+      "blob": "70c4f84b688b85e7397bf630fa839c83198c995c"
+    },
+    {
+      "path": "apps/worker/migrations/0033_signin_handoff_processing_claim.sql",
+      "blob": "cc42fe2cdfd32928d90994d2c65cd7762ce7d923"
+    },
+    {
+      "path": "apps/worker/migrations/0034_backfill_daily_allowance_revisions.sql",
+      "blob": "46ff70a1f5cfc961380516084aeac34f34ac67a7"
+    },
+    {
+      "path": "apps/worker/migrations/0035_community_allowance_fit_cache.sql",
+      "blob": "a0f8dc0badf12d7cb51e9901dfe86537a77b4c2b"
+    },
+    {
+      "path": "apps/worker/migrations/0036_v1_analysis_read_index.sql",
+      "blob": "993de40e9a8042dfc524256b45e2ffa4d3824a77"
+    },
+    {
+      "path": "apps/worker/migrations/0037_admin_distribution_history.sql",
+      "blob": "f9cc2579c6cc7bd2ff6fe63dba8e7d0a949c5c71"
+    },
+    {
+      "path": "apps/worker/migrations/0038_admin_metrics_history.sql",
+      "blob": "4c97b16cfe202f3aa6db61a5bc6c2f69d145a04d"
+    },
+    {
+      "path": "apps/worker/migrations/0039_admin_metrics_history_cache.sql",
+      "blob": "088d8fa18a4c15e41069986d6e4a8118b8602d96"
+    },
+    {
+      "path": "apps/worker/migrations/0040_community_allowance_publication_state.sql",
+      "blob": "c20359f63885ba892dc386f2d2ba4ebd15dfabc4"
+    },
+    {
+      "path": "apps/worker/migrations/0041_community_model_composition_cache.sql",
+      "blob": "c2bfe59f10ca4bef2e51ff33cb4824165fb045b0"
+    },
+    {
+      "path": "apps/worker/migrations/0042_community_model_composition.sql",
+      "blob": "7b6cd496cd011e3ad2babf9335651b5846e02dce"
+    },
+    {
+      "path": "apps/worker/migrations/0043_analytical_input_fencing.sql",
+      "blob": "c8cc002039b9af569f77531e18a52ed3ebd0d207"
+    },
+    {
+      "path": "apps/worker/migrations/0044_attribution_transport_staging.sql",
+      "blob": "59b31e0a5b739971bd9e58b48e41b896888ca727"
+    },
+    {
+      "path": "apps/worker/migrations/0045_attribution_domain_activation.sql",
+      "blob": "a3c37d0af5644afc5aea0fb5983de3ada25ae722"
+    },
+    {
+      "path": "apps/worker/migrations/0046_v1_quota_fit_projection.sql",
+      "blob": "c29a53aaf78f8bba664beb2c47d8239e161c0364"
+    },
+    {
+      "path": "apps/worker/migrations/0047_community_analysis_work.sql",
+      "blob": "d277e51bdb1f3fbf2915df236f439b526773287d"
+    },
+    {
+      "path": "apps/worker/migrations/0048_community_model_history.sql",
+      "blob": "9ffca68a07db54ab311f9e8650f90bf73ea5541a"
+    },
+    {
+      "path": "apps/worker/migrations/0049_preserve_published_graph.sql",
+      "blob": "c43360bc0482a9c61e44bb21870f1de243887718"
+    },
+    {
+      "path": "apps/worker/migrations/0050_preserve_authorized_graph_updates.sql",
+      "blob": "1a3fb271c09659d1ddd3a13705a65384ba7eb743"
+    },
+    {
+      "path": "apps/worker/migrations/0051_historical_window_dependencies.sql",
+      "blob": "f813f462407911f081b58a8391263b146f7bb1c9"
+    },
+    {
+      "path": "apps/worker/migrations/0052_prepared_source_days.sql",
+      "blob": "e0568e76c394f87cc3c1592b5c4acffe16d8fa71"
+    },
+    {
+      "path": "apps/worker/migrations/0053_refresh_lane_watermarks.sql",
+      "blob": "6779b8bbe7e173d3b7e4563e1c00d8425b7b26f1"
+    },
+    {
+      "path": "apps/worker/migrations/0054_current_analysis_queue.sql",
+      "blob": "cf848d14b76f180e185cdb4537e516b4af222127"
+    },
+    {
+      "path": "apps/worker/migrations/0055_captured_community_publication.sql",
+      "blob": "1746e912abdb27af32bd6336c2e29179dd3587d5"
+    },
+    {
+      "path": "apps/worker/migrations/0056_preparation_progress_counters.sql",
+      "blob": "2b28fb0743d29be1d5521025d7b29e795d100b2e"
+    },
+    {
+      "path": "apps/worker/migrations/0057_accountless_enrollment_ledger.sql",
+      "blob": "9ea98cefc3b772a335527a1892903da2f80542ce"
+    },
+    {
+      "path": "apps/worker/migrations/0058_accountless_upload_ownership.sql",
+      "blob": "0fe0b17aebdb94808e774cbd544366902bf8254e"
+    },
+    {
+      "path": "apps/worker/migrations/0059_accountless_upload_renewal.sql",
+      "blob": "085df4bbb92fa1eeba7d84158b06639a387b0944"
+    },
+    {
+      "path": "apps/worker/migrations/0060_public_contribution_sources.sql",
+      "blob": "e2787b34f9739342326f407a27cc08d6bc4d7500"
+    },
+    {
+      "path": "apps/worker/migrations/0061_accountless_history_retention.sql",
+      "blob": "96fdc8e3e5086531ff237c0a2378dbb26d0f0c38"
+    },
+    {
+      "path": "apps/worker/migrations/0062_v1_acquisition_vocabulary.sql",
+      "blob": "60fb2a331b4e258d5e6603e8451fe20f175d8b98"
+    },
+    {
+      "path": "apps/worker/src/accountless-enrollment.ts",
+      "blob": "5796b3bc24828b54963d18e9a3799af2672c4f6b"
+    },
+    {
+      "path": "apps/worker/src/admin-operations.ts",
+      "blob": "088bba367efa4017ea03d7f94cfffb4a02c337d8"
+    },
+    {
+      "path": "apps/worker/src/analytics-delivery.ts",
+      "blob": "637f9a069f43c476733ec5a4a998cc9b91df33ca"
+    },
+    {
+      "path": "apps/worker/src/canonical-json.ts",
+      "blob": "90aedc47f76e92a6266863801cc4d704cd4fc6fd"
+    },
+    {
+      "path": "apps/worker/src/collection-controls.ts",
+      "blob": "08385f79edb9d8a50b34f01ea464bc9ca268c800"
+    },
+    {
+      "path": "apps/worker/src/constants.ts",
+      "blob": "2345fe7bf71711311487bb6cc883602abf29d552"
+    },
+    {
+      "path": "apps/worker/src/contribution-lifecycle.ts",
+      "blob": "1a47cc308f95ec348b64473ab243add0ef7c2147"
+    },
+    {
+      "path": "apps/worker/src/crypto.ts",
+      "blob": "a8430f8d20a80e08381fc950755cd5a5e06a2a9e"
+    },
+    {
+      "path": "apps/worker/src/device-auth.ts",
+      "blob": "b21ad7007f4377dab496d39af3369cab7a86ae9d"
+    },
+    {
+      "path": "apps/worker/src/errors.ts",
+      "blob": "55f3d967d3ee45694271b3ca07df81a4844e2140"
+    },
+    {
+      "path": "apps/worker/src/model-history-window.ts",
+      "blob": "ce32d1fc804fa03d57eb68196b77827ec1f3ca5f"
+    },
+    {
+      "path": "apps/worker/src/quarantine-reconciliation.ts",
+      "blob": "a775bb6c5416d95f1c7f61582314ad4ad26d522a"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1-reader.ts",
+      "blob": "e5fb54a139d742bc44db0f5c6747eb8baaa770ee"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v1.ts",
+      "blob": "fd0240f1dece5e7826b9065af2fca3a2ca9ad471"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11-contract.ts",
+      "blob": "af5ca93df10701a24310ba203eece6396ca15704"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11-reader.ts",
+      "blob": "4bfb81df81a2b5c9c2f2be6ff74927ed6243d3d3"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis-v11.ts",
+      "blob": "a7da16db679a2b309b36121b4bda3239113f8e4c"
+    },
+    {
+      "path": "apps/worker/src/quota-analysis.ts",
+      "blob": "1dc5b020e902e414479781173f03581be9ec8ab8"
+    },
+    {
+      "path": "apps/worker/src/quota-endpoint-collapse.ts",
+      "blob": "0d9c262364c86a16e66002543f6f0bb7f6438d39"
+    },
+    {
+      "path": "apps/worker/src/storage-admin-overview.ts",
+      "blob": "2e4e83a689ad6da8e6636c20f46b195e130e4d0f"
+    },
+    {
+      "path": "apps/worker/src/storage-community-authority.ts",
+      "blob": "7bdaa8d7611b351bb1f2baccbb99c48479b40af0"
+    },
+    {
+      "path": "apps/worker/src/storage-community-daily-pending.ts",
+      "blob": "5a6ab7a7b6ed40a9fa4f5fd2f7d276cc3f4512f3"
+    },
+    {
+      "path": "apps/worker/src/storage-routing-batch-budget.ts",
+      "blob": "4417f250b1ee831b5899b491dc54163b780d1f2b"
+    },
+    {
+      "path": "apps/worker/src/stored-record.ts",
+      "blob": "80979cd36434aef15578f918a3704e63b3e0d84f"
+    },
+    {
+      "path": "apps/worker/src/strict-json.ts",
+      "blob": "13cfb22c057c07d2394717922d59569ee1d508e1"
+    },
+    {
+      "path": "apps/worker/src/telemetry-repository.ts",
+      "blob": "3296a1b422b9ea21b326f79c9f9fb1488d0fa86c"
+    },
+    {
+      "path": "apps/worker/src/telemetry-storage-mode.ts",
+      "blob": "fe5799b01406bf969460268b26b156e590be9ee2"
+    },
+    {
+      "path": "apps/worker/src/telemetry-transport-policy.ts",
+      "blob": "5bad30d1e1c71233bc5d4c56975b90307ca53141"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-correction-repository.ts",
+      "blob": "d9daf8a0bc6c6b6adda8774d183370cd17f54517"
+    },
+    {
+      "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
+      "blob": "bd511909d1fe7122e088f639acee4d8cf2eba723"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1-repository.ts",
+      "blob": "ce812ccdf34461849ae3a28126b0458a512dce36"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1-source-selection.ts",
+      "blob": "1ee5df7860f8b74017b0c7a92a851614d29ba512"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v1.ts",
+      "blob": "62eabd530b9fad9712808d79de90f3ca28b02e17"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-compatibility.ts",
+      "blob": "30f99179142595ddf1678bd2d7deda64c2d20b77"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-domain.ts",
+      "blob": "c195633c130241b43daf04d9b1d99270ddcf6f0b"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v11-repository.ts",
+      "blob": "5c6d50702d5a11f7a1ba07c5c3616559afd53b41"
+    },
+    {
+      "path": "apps/worker/src/telemetry-v12-table.ts",
+      "blob": "186674f3e4f5aae6ec54160ab134fbe0720d3b24"
+    },
+    {
+      "path": "apps/worker/src/telemetry-validation.ts",
+      "blob": "5311dd7d1691f7a53765f697413bcc64b05f08cb"
+    },
+    {
+      "path": "apps/worker/src/typed-storage-capacity.ts",
+      "blob": "afb2045799458949ae68e2249a94f3ea50b61c3b"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-codec.ts",
+      "blob": "6adfdb412af949ca0c505fb664f122fcef2649de"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-compatibility.ts",
+      "blob": "f39e89538e74d90e1f0223bfcde8729f214ffed4"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-read-layout.ts",
+      "blob": "9c3832014b7cc7cdaa9abac9c41e534ed1113c6d"
+    },
+    {
+      "path": "apps/worker/src/typed-telemetry-repository.ts",
+      "blob": "2d0ad5621b7b9e982085fdcd309f43f9e93c7d96"
+    },
+    {
+      "path": "apps/worker/src/typed-v1-admission.ts",
+      "blob": "db661dd4b7004bfad7bd5b3e78affb1c5ff7fb0a"
+    },
+    {
+      "path": "apps/worker/src/typed-v1-analysis-reader.ts",
+      "blob": "a74c4e86bd20a3327b57e577f5cc6efa0f7fcb40"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-admission.ts",
+      "blob": "5aa6c3799f7157e4da2c3f9de13d13dd7398a76b"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-analysis-reader.ts",
+      "blob": "2db88e275125e67dfb9e3536c1d8b3bb0d18f588"
+    },
+    {
+      "path": "apps/worker/src/typed-v11-quota-reader.ts",
+      "blob": "eee5b02be125a027cb939f8db58d3c4b327c22ae"
+    },
+    {
+      "path": "apps/worker/typed-ingestion-migrations/0001_typed_telemetry.sql",
+      "blob": "e6c938446cbdf2d6394696a04106d3529a622254"
+    },
+    {
+      "path": "apps/worker/typed-ingestion-migrations/0002_delivery_journal.sql",
+      "blob": "6adfcec59fd285cf270e8c1d607cd8f0ed869f44"
+    },
+    {
+      "path": "apps/worker/typed-ingestion-migrations/0003_raw_copy_checkpoints.sql",
+      "blob": "6bc80f72b7b1cbd6238a371b61bc587c694c284e"
+    },
+    {
+      "path": "apps/worker/typed-ingestion-migrations/0004_read_compatibility.sql",
+      "blob": "77a5ea37dd23e7550d61d2ad3b5714d606f886eb"
+    },
+    {
+      "path": "apps/worker/typed-ingestion-migrations/0005_owner_occurrence_lookup.sql",
+      "blob": "33ec9a85e4213afb2c13cfc792383d5559776e85"
+    },
+    {
+      "path": "apps/worker/typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
+      "blob": "3e71132d54d2f3af3a75a2f0fcde729c9ba7f306"
+    },
+    {
+      "path": "apps/worker/typed-v1-admission-migrations/0002_typed_v1_domain_preservation.sql",
+      "blob": "27ce6a4b69e3898a9394703069dd12aca7c69a0a"
+    },
+    {
+      "path": "apps/worker/typed-v1-admission-migrations/0003_typed_analytical_readers.sql",
+      "blob": "24725b780697920718e3aaf5360d8d51b30348a4"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0001_typed_chunk_admission.sql",
+      "blob": "eb30d48edc3573b643dd0326488f1537c3ac5b93"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0002_legacy_preservation_proofs.sql",
+      "blob": "cfc30b3909c0c9de62a161a2ffa6f9718b7dcdea"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0003_typed_domain_closure.sql",
+      "blob": "ddec80a0e4707e9694bc733684d15e72a5693b1f"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0004_runtime_storage_contract.sql",
+      "blob": "d0324d999b09c624b7d5317a7942064ef38766c2"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0005_typed_active_reader.sql",
+      "blob": "f59e3006bef99f832b5f88c5a3e7a3fa3230b0d8"
+    },
+    {
+      "path": "apps/worker/typed-v11-admission-migrations/0006_compact_admission_proofs.sql",
+      "blob": "6c83b9eca0d32f3613a67f1779a248b66b999ccc"
+    },
+    {
+      "path": "packages/quota-analysis/index.js",
+      "blob": "d73207b777fcc605fe6190bb875319a14d104517"
+    },
+    {
+      "path": "packages/quota-analysis/src/model-composition.js",
+      "blob": "7b63d7c0fdae0ac006ac82720b1dc32ce36c970f"
+    },
+    {
+      "path": "packages/quota-analysis/src/plan-attribution.js",
+      "blob": "752e033130daa98f610e82c153a2fcdc97238e56"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-calibration.js",
+      "blob": "e313f2489854e32405282c1d8dc911ab193827a6"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-pace-forecast.js",
+      "blob": "33dd967ef318bc78d42f41b856287eeaaf60c458"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-rolling.js",
+      "blob": "c8b2e7d63c652694987edd1ca82bcf1e1e0fd4d1"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-tracks.js",
+      "blob": "5f417a9f3b960d5ac1619ea2e357013d595d5dbd"
+    },
+    {
+      "path": "packages/quota-analysis/src/quota-windows.js",
+      "blob": "39f5d9d0b2334a1d94da91a1339515da9ee2c7aa"
+    },
+    {
+      "path": "packages/quota-analysis/src/reset-events.js",
+      "blob": "5da9937abdcaca320249480b09902a549ee15661"
+    },
+    {
+      "path": "packages/telemetry-contract/index.js",
+      "blob": "e9fcb569c38e20f851eeb2c697819392d5e4f8bd"
+    },
+    {
+      "path": "packages/telemetry-contract/src/admin-model-history.js",
+      "blob": "d1536fdf5a0e0d004afee2333f5d5d60a44aa079"
+    },
+    {
+      "path": "packages/telemetry-contract/src/constants.js",
+      "blob": "228daf81c7c869452094a8bf9b691e5315fac21f"
+    },
+    {
+      "path": "packages/telemetry-contract/src/envelope.js",
+      "blob": "6ec82a937cb0e6f29a22eb2b3c00568fe47599be"
+    },
+    {
+      "path": "packages/telemetry-contract/src/errors.js",
+      "blob": "281b464a08a0ef19184e6654c8d3a15f30777de3"
+    },
+    {
+      "path": "packages/telemetry-contract/src/model-catalog-contract.js",
+      "blob": "039ef0c20b4e7856b6025e0005a7163fb00e4047"
+    },
+    {
+      "path": "packages/telemetry-contract/src/model-catalog.js",
+      "blob": "875ea365b2f5d93419eb66746eff3827f5008a93"
+    },
+    {
+      "path": "packages/telemetry-contract/src/performance-histogram.js",
+      "blob": "7b53c9b14410968e1b3661a3c30f81285654f4f4"
+    },
+    {
+      "path": "packages/telemetry-contract/src/primitives.js",
+      "blob": "80d47d2e8c4c557ef180cb707f6244f4f4c5e340"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-performance-v1-schemas.js",
+      "blob": "b8e505b8c5b3cb27650fc7492886a90297e8b6da"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-performance-v1.js",
+      "blob": "622aa2a06ca1ef63707b8b39d7aeef8563bd204e"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v0.1.js",
+      "blob": "ad3c475e70aab61cea10601920208f0cd1aeb4a8"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v0.2.js",
+      "blob": "0fa03b0c982f0d6b0b55d9c37e40d37d9c1c3422"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1-domain.js",
+      "blob": "c10da9b5ac8000e7f03e14c8f391d4e77441bdcc"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1-schemas.js",
+      "blob": "56f5efb6b2d4192ca429d0cccd1e7fa37c57299d"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.1.js",
+      "blob": "d22f74679c864fd89d88a210ddff3f9505bbb15f"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2-domain.js",
+      "blob": "7679a2eb6eb7dbcc6091f762d6cc9b7d5a3fcfdc"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2-schemas.js",
+      "blob": "94f6df4cfa89e8ee8ebc16073ecf871d73d7a56c"
+    },
+    {
+      "path": "packages/telemetry-contract/src/telemetry-v1.2.js",
+      "blob": "801cbc2ff5a0d0f462e76790e2cb23a23253a988"
+    },
+    {
+      "path": "packages/telemetry-contract/src/upload.js",
+      "blob": "c630a12e85472ffbf4f8f1bde5d3470276814e28"
+    }
+  ]
+}

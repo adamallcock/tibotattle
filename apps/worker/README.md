@@ -377,6 +377,30 @@ storage, commands, or this README:
 npm run docs:check
 ```
 
+### IN-3 legacy admission oracle
+
+`postgres-test/postgres-legacy-contribution-admission.spec.mjs` compares the
+PostgreSQL origin's v1.0 and v0.1 admission with the d43c8f92 Worker's own
+admission on D1. The oracle runs byte-for-byte d43c8f92 copies in
+`postgres-test/fixtures/legacy-contribution-oracle-d43c8f92/` (Worker modules,
+the telemetry-contract and quota-analysis packages, and the six D1 migration
+directories), in a Vite module graph of its own. Later changes to `src/`, the
+D1 directories or the workspace packages therefore never change or break it.
+The reviewed `fixtures/legacy-contribution-oracle-blobs.json` pins, and the
+generated `MANIFEST.json`, must agree with every vendored byte.
+
+The one live module in the oracle is the server pricer (`src/server-pricing.ts`
+and the accounting package). Server repricing is current pricing policy that
+the PostgreSQL admission shares with every other path, not a legacy rule. The
+oracle therefore proves the same rows for the same prices. The spec's last test
+shows that the pricer is the only live code the oracle loads.
+
+The vendored tree is generated, never edited:
+`node scripts/vendor-legacy-contribution-oracle.mjs` writes it, and
+`npm run legacy-oracle:vendor:check` re-derives and compares it. Both need the
+d43c8f92 objects in the local repository. `scripts:check` runs the generator's
+offline tests.
+
 
 ## GCP GitHub distribution snapshots
 
@@ -408,6 +432,29 @@ Local validation (synthetic fixtures and mocked fetch only): rebuild
 --test-concurrency=1 postgres-test/postgres-github-distribution-sync.spec.mjs`.
 The [candidate handoff](../../docs/plans/2026-10-11-gcp-github-distribution-sync.md)
 records owner rollout steps and remaining production checks.
+
+## GCP v1.2 future-day bound
+
+The origin refuses a v1.2 day manifest, and a v1.2 chunk, whose UTC day is later
+than the server's UTC day plus one (`src/telemetry-v12-day-bound.ts`). The
+answer is `429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` with `retry-after` set to the
+seconds until the day is admissible, at most seven days, and no detail. Past
+days stay unbounded. A manifest is checked after the device's write authority;
+a chunk is checked before its object is written, so nothing is stored and the
+claim is abandoned. The released client treats the answer as a retryable
+`service_unavailable`, waits for `retry-after` without pausing and keeps its
+journal. The analytics refresh never plans or publishes a day after its UTC day:
+later queued days are carried as blocked and counted in the receipt's
+`deferredFutureDays` until they are past. The released client cannot activate
+past a refused day, because its day vector always ends at its latest local day.
+A one-off future day holds the device until that day is admissible. A device in
+use whose clock stays two or more days ahead of UTC is refused on every pass and
+never activates, so none of its usage is published, including earlier days it
+has already staged. It stays in a transient `retry_wait`, not a pause, and
+retries at each `retry-after` (at most weekly) until its clock is corrected. A
+clock one to two days ahead delays activation intermittently.
+The [decision](../../docs/decisions/2026-10-12-v12-future-day-bound.md) records
+the status choice and this residual activation hold.
 
 ## GCP analytics read bounds
 
@@ -674,4 +721,53 @@ inner side of a nested loop.
 `scripts/classification-activation-scale-bench.mjs` reports
 local, aggregate-only statement timings at synthetic scale; it is evidence, not
 a gate. Migration, image rollout and installed-client acceptance remain separate
-operational gates. GCP performance admission stays retired.
+operational gates.
+
+## GCP primary migrations 0077 to 0079
+
+The PostgreSQL primary chain continues after `0076` with three forward-only,
+additive migrations. Each is source until an owner-authorized migrate and roll
+applies it.
+
+- `0077_analytics_v2_reprice.sql` adds the bounded historical spend repricing
+  archive, run ledger, immutable price proofs and former-publication log
+  ([repricing runbook](../../docs/runbooks/2026-10-09-historical-spend-repricing.md)).
+- `0078_classification_link_lookup_indexes.sql` adds the classification-link
+  lookup indexes that domain activation probes per corrected row.
+- `0079_performance_telemetry.sql` restores the accountless daily
+  model-performance intake and adds its community publication heads (owner
+  decisions of 2026-10-10). Its number is provisional; the integrator
+  renumbers it with its pin set if the live head already holds 0079 or higher.
+
+## Community model speed on the GCP origin
+
+The [community model speed decision](../../docs/decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)
+reverses the cutover's retirement of GCP performance admission. On the origin:
+
+- The `performance` route class serves the accountless grant
+  (`POST /api/v1/accountless/telemetry-performance-authorization`), the device
+  capability read and the device report routes through
+  `cloud-run/routes/performance-telemetry.mjs`, plus the public
+  `GET /api/v1/community/model-performance` read. The signed-in consent route
+  stays retired. The admin class gains the read-only
+  `GET /api/v1/admin/performance-intake`. The origin registry holds 53 routes.
+- Until the owner activates the performance runtime (seeded `staged` by 0079),
+  authenticated intake answers `403 TELEMETRY_TRANSPORT_BLOCKED`. Activation is
+  the owner-only `run_maintenance` runtime activation task
+  ([activation runbook](../../docs/runbooks/2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation));
+  there is no admin UI control.
+- The analytics-refresh Job gains a performance stage that publishes twelve
+  `community-model-performance-v1` slots. Its fold and reader are kernel
+  closure inputs, so the stage ships under a new analytics kernel registry
+  entry, and the reprice Job runs under that kernel right after the roll
+  ([rollout](../../docs/runbooks/gcp-rollout.md#migration-0079-community-model-speed)).
+- The ops runtime probe gains `performance_newest_accepted_report_age_seconds`
+  and `community_model_performance_head_age_days`.
+
+The D1 Worker keeps its own pinned performance path and answers the two new
+routes without a PostgreSQL source: a public read that passes the method,
+public-analytics, publication-control, limiter and query gates answers
+`404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`, and the admin view answers
+`503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` on the admin host. The PostgreSQL
+performance specs run in `npm run postgres:domain:check` under the standard
+local PostgreSQL environment.

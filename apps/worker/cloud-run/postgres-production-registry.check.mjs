@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { after, before, test } from "node:test";
@@ -11,29 +10,28 @@ import {
   OD_CR_1_CONTESTED_ROUTE_IDS,
   ORIGIN_ROOT_ROUTE_IDS,
   ORIGIN_ROUTE_DISPOSITIONS,
+  PERFORMANCE_ROUTE_IDS,
   POSTGRES_SCOPE_ROUTE_IDS,
   PRODUCTION_ROUTE_CLASSES,
   PRODUCTION_ROUTE_PARITY_BASIS,
   PRODUCTION_ROUTE_REGISTRY_CODES,
   PRODUCTION_ROUTE_TABLE,
-  RETIRED_DEFINITE_PREAMBLE_STEPS,
-  RETIRED_DEFINITE_ROUTE_IDS,
   RETIRED_ONLINE_ERASURE_SURFACES,
-  RETIRED_ROUTE_DEFINITE_ANSWERS,
   RETIRED_ROUTE_IDS,
   assertIdentityLinkConsumersRetired,
   createProductionRouteRegistry,
   isProductionRouteRegistry,
 } from "./postgres-production-registry.mjs";
 import { createOriginRouteModuleRegistry, defineOriginRouteModule } from "./origin-route-modules.mjs";
+import { PERFORMANCE_TELEMETRY_PATHNAMES, PERFORMANCE_TELEMETRY_ROUTE_IDS } from "./routes/performance-telemetry.mjs";
 
 // CR-6 registry without a database: the pinned d43c8f92 route table against
-// the Worker's own WORKER_ROUTE_POLICY, the injected ported set (scope, the
-// OD-CR-1 contested routes and the OD-CR-2 admin routes), the round-12
-// retired routes (the uniform 503, and the one retired-definite route whose
-// preamble round 19 requires), the production
-// list in src/backend-composition.ts, the route-module fold (one registry)
-// and every closed refusal. Every handler is a synthetic stub.
+// the Worker's own WORKER_ROUTE_POLICY, the injected ported set (scope and
+// the restored performance intake, required; the OD-CR-1 contested routes
+// and the OD-CR-2 admin routes), the round-12 retired routes (the uniform
+// 503), the production list in src/backend-composition.ts, the route-module
+// fold (one registry) and every closed refusal. Every handler is a synthetic
+// stub.
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -42,6 +40,7 @@ let policy;
 let matchWorkerRoute;
 let productionPortedRouteIds;
 let productionAdminRouteIds;
+let communityModelPerformancePath;
 
 before(async () => {
   vite = await createServer({
@@ -56,6 +55,8 @@ before(async () => {
     POSTGRES_PORTED_WORKER_ROUTE_IDS: productionPortedRouteIds,
     POSTGRES_ADMIN_HOST_ROUTE_IDS: productionAdminRouteIds,
   } = await vite.ssrLoadModule("/src/backend-composition.ts"));
+  ({ ANALYTICS_V2_COMMUNITY_MODEL_PERFORMANCE_PATH: communityModelPerformancePath } = await vite.ssrLoadModule(
+    "/src/analytics-v2/community-model-performance-route.ts"));
 });
 
 after(async () => {
@@ -75,16 +76,31 @@ const BRIEF_CONTESTED = Object.freeze([
   "session", "logout", "participant_devices", "participant_device_revocation", "device_pairing",
   "device_pairing_claim", "telemetry_v12_consent", "device_disconnect", "device_credential_renew",
 ]);
-/** Owner round 12 (2026-10-02): retired at the switch, listed independently of the table. */
+/**
+ * Owner round 12 (2026-10-02) retirements that still stand, listed
+ * independently of the table: decision 1 of 2026-10-10 restored the three
+ * performance intake routes and kept the signed-in consent route retired.
+ */
 const ROUND_12_RETIRED = Object.freeze([
   "enroll", "identity_google_start", "identity_google_callback", "identity_google_result", "identity_apple_start",
   "identity_apple_callback", "identity_apple_result", "security_reset", "participant_export",
-  "telemetry_performance_capabilities", "telemetry_performance_consent", "telemetry_performance_reports",
+  "telemetry_performance_consent",
 ]);
-/** Round 12: production's definite answer, read from d43c8f92 (telemetry-performance-policy.ts invalid()). */
-const ROUND_12_DEFINITE = Object.freeze({
-  accountless_telemetry_performance_authorization: { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" },
-});
+/** Owner decision 2026-10-10 (decision 1): the restored performance intake, in Worker order. */
+const DECISION_1_PERFORMANCE = Object.freeze([
+  "accountless_telemetry_performance_authorization", "telemetry_performance_capabilities",
+  "telemetry_performance_reports",
+]);
+/**
+ * The two owner-decided routes of 2026-10-10 (decision 7 and GATE-Q 5: the
+ * public read, in the performance class; GATE-Q 4: the admin view, in the
+ * admin class), listed independently of the table.
+ */
+const OWNER_DECIDED_2026_10_10 = Object.freeze(["admin_performance_intake", "community_model_performance"]);
+/** The d43c8f92 parity basis before the owner-decided routes. */
+const D43C8F92_POLICY_SHA256 = "905a5496ff777802f05b0d6ef569d73face0a4e160be4f6dd308c26356d1943f";
+/** The smallest ported set the registry accepts: scope and performance. */
+const REQUIRED = Object.freeze([...POSTGRES_SCOPE_ROUTE_IDS, ...PERFORMANCE_ROUTE_IDS]);
 const EFFECTIVE_PAGE_PATH = "/api/v1/me/telemetry-v12/effective-page";
 
 const observedCodes = new Set();
@@ -95,12 +111,12 @@ function stub(id) {
   return handler;
 }
 
-/** The ported ids' built-ins plus every retired-definite preamble (round 19). */
+/** One built-in per ported id. */
 function handlersFor(ids) {
-  return new Map([...ids, ...RETIRED_DEFINITE_ROUTE_IDS].map((id) => [id, stub(id)]));
+  return new Map(ids.map((id) => [id, stub(id)]));
 }
 
-function build({ routePolicy = policy, portedRouteIds = POSTGRES_SCOPE_ROUTE_IDS, handlers } = {}) {
+function build({ routePolicy = policy, portedRouteIds = REQUIRED, handlers } = {}) {
   return createProductionRouteRegistry({
     routePolicy,
     portedRouteIds,
@@ -128,13 +144,24 @@ function policySha256(routePolicy) {
 // ---------------------------------------------------------------------------
 // The pinned table
 
-test("the table is the d43c8f92 policy: 51 routes in Worker order, one class each", () => {
-  assert.equal(policy.length, 51);
+test("the table is the d43c8f92 policy plus two owner-decided routes: 53 routes in Worker order, one class each", () => {
+  assert.equal(policy.length, 53);
   assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.commit, "d43c8f92");
-  assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.routeCount, 51);
+  assert.deepEqual(Object.keys(PRODUCTION_ROUTE_PARITY_BASIS), ["commit", "ownerDecidedRouteIds", "routeCount",
+    "policySha256"]);
+  assert.deepEqual([...PRODUCTION_ROUTE_PARITY_BASIS.ownerDecidedRouteIds], [...OWNER_DECIDED_2026_10_10]);
+  assert.ok(Object.isFrozen(PRODUCTION_ROUTE_PARITY_BASIS.ownerDecidedRouteIds));
+  assert.equal(PRODUCTION_ROUTE_PARITY_BASIS.routeCount, 53);
   assert.equal(policySha256(policy), PRODUCTION_ROUTE_PARITY_BASIS.policySha256,
     "src/route-registry.ts changed: re-derive the table from the new parity basis (OD-CR-9)");
-  assert.equal(PRODUCTION_ROUTE_TABLE.length, 51);
+  // Without the owner-decided routes the policy is still d43c8f92's, byte for byte and in order.
+  const d43c8f92 = policy.filter((route) => !OWNER_DECIDED_2026_10_10.includes(route.id));
+  assert.equal(d43c8f92.length, 51);
+  assert.equal(policySha256(d43c8f92), D43C8F92_POLICY_SHA256);
+  assert.deepEqual(OWNER_DECIDED_2026_10_10.map((id) => policy.findIndex((route) => route.id === id)), [24, 52]);
+  assert.equal(policy[23].id, "admin_action");
+  assert.equal(policy[51].id, "community_daily");
+  assert.equal(PRODUCTION_ROUTE_TABLE.length, 53);
   PRODUCTION_ROUTE_TABLE.forEach((route, index) => {
     assert.equal(route.workerOrder, index + 1);
     assert.equal(route.id, policy[index].id);
@@ -146,13 +173,15 @@ test("the table is the d43c8f92 policy: 51 routes in Worker order, one class eac
   const count = (routeClass) => PRODUCTION_ROUTE_TABLE.filter((route) => route.routeClass === routeClass).length;
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.SCOPE), 21);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.OD_CR_1), 9);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 6);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED), 12);
-  assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED_DEFINITE), 1);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.ADMIN), 7);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.PERFORMANCE), 4);
+  assert.equal(count(PRODUCTION_ROUTE_CLASSES.RETIRED), 10);
   assert.equal(count(PRODUCTION_ROUTE_CLASSES.ROOT), 2);
-  // Every round-12 question is answered: no route is left undecided.
+  // Every round-12 question is answered: no route is left undecided, and
+  // decision 1 (2026-10-10) moved the round-19 grant into the performance class.
   assert.deepEqual(Object.values(PRODUCTION_ROUTE_CLASSES).sort(),
-    ["admin", "od-cr-1", "retired", "retired-definite", "root", "scope"]);
+    ["admin", "od-cr-1", "performance", "retired", "root", "scope"]);
+  assert.deepEqual(Object.values(ORIGIN_ROUTE_DISPOSITIONS).sort(), ["ported", "root", "unported"]);
 });
 
 test("the class lists match the brief and the production ported list", () => {
@@ -160,28 +189,26 @@ test("the class lists match the brief and the production ported list", () => {
   assert.deepEqual([...OD_CR_1_CONTESTED_ROUTE_IDS].sort(), [...BRIEF_CONTESTED].sort());
   assert.deepEqual([...ORIGIN_ROOT_ROUTE_IDS], ["apple_domain_association", "sparkle_appcast_guard"]);
   const all = new Set([...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS,
-    ...ADMIN_HOST_ROUTE_IDS, ...RETIRED_ROUTE_IDS, ...RETIRED_DEFINITE_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
-  assert.equal(all.size, 51, "the six classes are disjoint and cover the policy");
-  // The production list (src/backend-composition.ts, OD-CR-1: all nine) is
-  // scope plus the contested routes, in Worker order; the edge-test and
-  // loopback origins serve exactly this list too.
+    ...ADMIN_HOST_ROUTE_IDS, ...PERFORMANCE_ROUTE_IDS, ...RETIRED_ROUTE_IDS, ...ORIGIN_ROOT_ROUTE_IDS]);
+  assert.equal(all.size, 53, "the six classes are disjoint and cover the policy");
+  // The production list (src/backend-composition.ts, OD-CR-1: all nine;
+  // decision 1: the performance intake; decision 7: the public model-performance
+  // read) is scope, the contested routes and performance, in Worker order;
+  // the edge-test and loopback origins serve exactly this list too.
+  assert.equal(productionPortedRouteIds.length, 34);
   assert.deepEqual([...productionPortedRouteIds],
-    policy.map((route) => route.id).filter((id) =>
-      POSTGRES_SCOPE_ROUTE_IDS.includes(id) || OD_CR_1_CONTESTED_ROUTE_IDS.includes(id)));
+    policy.map((route) => route.id).filter((id) => POSTGRES_SCOPE_ROUTE_IDS.includes(id)
+      || OD_CR_1_CONTESTED_ROUTE_IDS.includes(id) || PERFORMANCE_ROUTE_IDS.includes(id)));
   // OD-CR-2: the admin class is the policy's admin authority, as composition names it.
   const admin = policy.filter((route) => route.authority === "admin").map((route) => route.id);
   assert.deepEqual([...ADMIN_HOST_ROUTE_IDS], admin);
   assert.deepEqual([...productionAdminRouteIds], admin);
-  // Round 12: the retired routes and the one definite answer, exactly.
+  assert.ok(ADMIN_HOST_ROUTE_IDS.includes("admin_performance_intake"));
+  // Round 12's standing retirements and the performance class (decision 1's
+  // intake and the public read), exactly.
   assert.deepEqual([...RETIRED_ROUTE_IDS].sort(), [...ROUND_12_RETIRED].sort());
-  assert.deepEqual([...RETIRED_DEFINITE_ROUTE_IDS], Object.keys(ROUND_12_DEFINITE));
-  assert.deepEqual(JSON.parse(JSON.stringify(RETIRED_ROUTE_DEFINITE_ANSWERS)), ROUND_12_DEFINITE);
-  assert.deepEqual(Object.keys(RETIRED_ROUTE_DEFINITE_ANSWERS), [...RETIRED_DEFINITE_ROUTE_IDS]);
-  assert.ok(Object.isFrozen(RETIRED_ROUTE_DEFINITE_ANSWERS));
-  for (const answer of Object.values(RETIRED_ROUTE_DEFINITE_ANSWERS)) {
-    assert.ok(Object.isFrozen(answer));
-    assert.ok(answer.status >= 400 && answer.status < 500, "a definite answer is a 4xx, never retryable");
-  }
+  assert.deepEqual([...PERFORMANCE_ROUTE_IDS], [...DECISION_1_PERFORMANCE, "community_model_performance"]);
+  assert.ok(Object.isFrozen(PERFORMANCE_ROUTE_IDS));
   // Round 12 keeps credential renew, disconnect and every OD-CR-1 session-authority port.
   for (const id of ["device_credential_renew", "device_disconnect", "session", "logout", "device_pairing",
     "device_pairing_claim", "participant_devices", "participant_device_revocation", "telemetry_v12_consent"]) {
@@ -190,85 +217,27 @@ test("the class lists match the brief and the production ported list", () => {
   }
 });
 
-test("round 12: the definite answer is production's d43c8f92 code for the route", async (t) => {
-  // The Worker grants the accountless performance authorization only while
-  // telemetry_performance_runtime is 'active'; ingestion-isolation 0009 seeds
-  // it 'staged', so the grant's owner query finds no row and answers its
-  // invalid(): 403 TELEMETRY_TRANSPORT_BLOCKED. Read from the parity basis.
-  const git = (args) => new Promise((resolveGit, rejectGit) => {
-    execFile("git", args, { cwd: WORKER_ROOT, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout) => (error ? rejectGit(error) : resolveGit(stdout)));
-  });
-  const basis = PRODUCTION_ROUTE_PARITY_BASIS.commit;
-  try {
-    await git(["cat-file", "-e", `${basis}^{commit}`]);
-  } catch {
-    // A checkout without the parity basis (a shallow clone) cannot prove the
-    // answer from source: report a skip, never a pass.
-    t.skip(`parity basis ${basis} unavailable in this checkout`);
-    return;
+test("the performance class is the family's three routes and the public read; consent stays retired", () => {
+  // The registry class is the performance family's (routes/performance-
+  // telemetry.mjs) ids and pathnames plus the public read, whose pathname is
+  // the analytics-v2 route's; each pathname is the policy's.
+  assert.deepEqual([...PERFORMANCE_TELEMETRY_ROUTE_IDS],
+    PERFORMANCE_ROUTE_IDS.filter((id) => id !== "community_model_performance"));
+  for (const id of PERFORMANCE_TELEMETRY_ROUTE_IDS) {
+    const route = policy.find((entry) => entry.id === id);
+    assert.equal(PERFORMANCE_TELEMETRY_PATHNAMES[id], route.pathname, id);
+    assert.equal(matchWorkerRoute(route.pathname).id, id, id);
   }
-  // The basis is present, so every read must succeed: a missing file fails.
-  const show = (path) => git(["show", `${basis}:${path}`]);
-  const [policySource, migration, index] = await Promise.all([
-    show("apps/worker/src/telemetry-performance-policy.ts"),
-    show("apps/worker/ingestion-isolation-migrations/0009_performance_reports.sql"),
-    show("apps/worker/src/index.ts"),
-  ]);
-  assert.ok(policySource.includes("export async function grantTelemetryPerformanceAccountlessAuthorization"));
-  assert.match(policySource, /function invalid\(code: "TELEMETRY_TRANSPORT_BLOCKED"[^)]*= "TELEMETRY_TRANSPORT_BLOCKED"\): never \{\s*throw new ApiError\(403, code\);/u);
-  const grant = policySource.slice(policySource.indexOf("export async function grantTelemetryPerformanceAccountlessAuthorization"));
-  assert.match(grant, /AND r\.state = 'active'[\s\S]*?if \(!owner\) invalid\(\);/u);
-  assert.match(migration, /INSERT INTO telemetry_performance_runtime[\s\S]*?'staged', 1,/u);
-  assert.match(index, /case "accountless_telemetry_performance_authorization":\s*return handleAccountlessTelemetryPerformanceAuthorization\(request, env\);/u);
-  assert.deepEqual(RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization,
-    { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED" });
-});
-
-test("round 19: the retired-definite preamble steps are d43c8f92's, in handler order, closed and frozen", async (t) => {
-  assert.deepEqual(Object.keys(RETIRED_DEFINITE_PREAMBLE_STEPS), [...RETIRED_DEFINITE_ROUTE_IDS]);
-  assert.ok(Object.isFrozen(RETIRED_DEFINITE_PREAMBLE_STEPS));
-  const steps = RETIRED_DEFINITE_PREAMBLE_STEPS.accountless_telemetry_performance_authorization;
-  assert.ok(Object.isFrozen(steps) && steps.every((step) => Object.isFrozen(step)));
-  assert.deepEqual([...new Set(steps.map(([step]) => step))], ["session_cookie", "storage", "ownership_mode",
-    "admission_bindings", "upload_registration", "attempt_limit", "device_bearer", "body"]);
-  // Every earlier answer differs from the terminal one, so a client can tell them apart.
-  const terminal = RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization;
-  for (const [, status, code] of steps) assert.notDeepEqual([status, code], [terminal.status, terminal.code]);
-  const git = (args) => new Promise((resolveGit, rejectGit) => {
-    execFile("git", args, { cwd: WORKER_ROOT, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout) => (error ? rejectGit(error) : resolveGit(stdout)));
-  });
-  const basis = PRODUCTION_ROUTE_PARITY_BASIS.commit;
-  try {
-    await git(["cat-file", "-e", `${basis}^{commit}`]);
-  } catch {
-    t.skip(`parity basis ${basis} unavailable in this checkout`);
-    return;
-  }
-  // The handler's call order at the basis: the steps above, with the
-  // storage-mode read the origin does not reproduce (round 19 amendment).
-  const index = await git(["show", `${basis}:apps/worker/src/index.ts`]);
-  const start = index.indexOf("async function handleAccountlessTelemetryPerformanceAuthorization(");
-  const body = index.slice(start, index.indexOf("\n}\n", start));
-  const calls = ["methodNotAllowed([\"POST\"])", "hasSessionCookie(", "assertAccountlessOwnershipEnabled(env)",
-    "assertAdmissionBindings(env)", "assertCollectionControl(env.USAGE_MONITOR_DB, \"uploadRegistration\")",
-    "\"accountless_ownership\"", "authenticateDevice(", "authorization.authorityKind !== \"accountless\"",
-    "requireTelemetryPerformanceStorageMode(",
-    "readBoundedAccountlessTelemetryPerformanceAuthorizationJson(request)",
-    "grantTelemetryPerformanceAccountlessAuthorization("];
-  const positions = calls.map((call) => body.indexOf(call));
-  for (const [i, position] of positions.entries()) assert.ok(position > 0, calls[i]);
-  assert.deepEqual([...positions].sort((a, b) => a - b), positions, "d43c8f92 call order");
-  assert.match(body, /throw new ApiError\(401, "AUTH_INVALID"\)[\s\S]*throw new ApiError\(401, "DEVICE_AUTH_INVALID"\)/u);
-  // The body reader's answers are readBoundedJson's (415, 400, 413) plus the
-  // closed shape's 400, and readBoundedRequestBody's 408.
-  const reader = index.slice(index.indexOf("async function readBoundedAccountlessTelemetryPerformanceAuthorizationJson("));
-  assert.match(reader, /await readBoundedJson\(request\)[\s\S]*?throw new ApiError\(400, "BODY_INVALID"\)/u);
-  const json = index.slice(index.indexOf("async function readBoundedJson("));
-  for (const answer of ["415, \"CONTENT_TYPE_INVALID\"", "400, \"BODY_INVALID\"", "413, \"BODY_TOO_LARGE\""]) {
-    assert.ok(json.slice(0, json.indexOf("\n}\n")).includes(answer), answer);
-  }
+  const read = policy.find((entry) => entry.id === "community_model_performance");
+  assert.equal(read.pathname, communityModelPerformancePath);
+  assert.deepEqual([...read.methods], ["GET"]);
+  assert.equal(read.authority, "public");
+  assert.equal(matchWorkerRoute(communityModelPerformancePath).id, "community_model_performance");
+  // The signed-in consent route is not the family's and stays retired.
+  assert.ok(RETIRED_ROUTE_IDS.includes("telemetry_performance_consent"));
+  assert.equal(Object.hasOwn(PERFORMANCE_TELEMETRY_PATHNAMES, "telemetry_performance_consent"), false);
+  // No performance route consumes identity-link state.
+  for (const id of PERFORMANCE_ROUTE_IDS) assert.equal(IDENTITY_LINK_CONSUMER_ROUTE_IDS.includes(id), false, id);
 });
 
 test("online erasure is retired: no policy route, DELETE /api/v1/me is unknown_api", () => {
@@ -302,79 +271,70 @@ function assertCoverage(registry, portedIds) {
   assert.deepEqual([...registry.rootRouteIds], [...ORIGIN_ROOT_ROUTE_IDS]);
   const expectedUnported = policy
     .map((route) => route.id)
-    .filter((id) => !portedSet.has(id) && !ORIGIN_ROOT_ROUTE_IDS.includes(id) && !RETIRED_DEFINITE_ROUTE_IDS.includes(id))
+    .filter((id) => !portedSet.has(id) && !ORIGIN_ROOT_ROUTE_IDS.includes(id))
     .sort();
   assert.deepEqual([...registry.unportedRouteIds], expectedUnported, "sorted");
-  assert.deepEqual([...registry.definiteRouteIds], [...RETIRED_DEFINITE_ROUTE_IDS]);
-  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.definiteRouteIds.length
-    + registry.rootRouteIds.length, 51);
+  assert.deepEqual(Object.keys(registry), ["routePolicy", "parityBasis", "portedRouteIds", "portedPathnames",
+    "unportedRouteIds", "rootRouteIds", "coverage", "resolve"], "ported, unported and root only");
+  assert.equal(registry.portedRouteIds.length + registry.unportedRouteIds.length + registry.rootRouteIds.length, 53);
   for (const route of policy) {
     const resolved = registry.resolve(route.id);
     assert.ok(Object.isFrozen(resolved));
-    assert.deepEqual(Object.keys(resolved), ["disposition", "handler", "answer"]);
+    assert.deepEqual(Object.keys(resolved), ["disposition", "handler"]);
     if (ORIGIN_ROOT_ROUTE_IDS.includes(route.id)) {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.ROOT, route.id);
       assert.equal(resolved.handler, null);
-      assert.equal(resolved.answer, null);
     } else if (portedSet.has(route.id)) {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.PORTED, route.id);
       assert.equal(resolved.handler.routeId, route.id);
-      assert.equal(resolved.answer, null);
-    } else if (RETIRED_DEFINITE_ROUTE_IDS.includes(route.id)) {
-      // Round 19: its preamble, then the terminal answer.
-      assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.DEFINITE, route.id);
-      assert.equal(resolved.handler.routeId, route.id);
-      assert.equal(resolved.answer, RETIRED_ROUTE_DEFINITE_ANSWERS[route.id]);
     } else {
       assert.equal(resolved.disposition, ORIGIN_ROUTE_DISPOSITIONS.UNPORTED, route.id);
       assert.equal(resolved.handler, null);
-      assert.equal(resolved.answer, null);
     }
   }
 }
 
-test("scope only (OD-CR-1 answers none): 21 ported, 27 unported, 1 definite, 2 root", () => {
+test("scope and performance only (OD-CR-1 answers none): 25 ported, 26 unported, 2 root", () => {
   const registry = build();
-  assertCoverage(registry, POSTGRES_SCOPE_ROUTE_IDS);
-  assert.equal(registry.portedRouteIds.length, 21);
-  assert.equal(registry.unportedRouteIds.length, 27);
+  assertCoverage(registry, REQUIRED);
+  assert.equal(registry.portedRouteIds.length, 25);
+  assert.equal(registry.unportedRouteIds.length, 26);
   for (const id of OD_CR_1_CONTESTED_ROUTE_IDS) {
     assert.equal(registry.resolve(id).disposition, "unported", id);
   }
+  for (const id of PERFORMANCE_ROUTE_IDS) assert.equal(registry.resolve(id).disposition, "ported", id);
 });
 
-test("the production list (scope plus all nine contested routes): 30 ported, 18 unported, 1 definite, 2 root", () => {
+test("the production list (scope 21, contested 9, performance 4): 34 ported, 17 unported, 2 root", () => {
   const registry = build({ portedRouteIds: productionPortedRouteIds });
   assertCoverage(registry, productionPortedRouteIds);
-  assert.equal(registry.portedRouteIds.length, 30);
+  assert.equal(registry.portedRouteIds.length, 34);
   assert.deepEqual([...registry.unportedRouteIds],
     [...ADMIN_HOST_ROUTE_IDS, ...RETIRED_ROUTE_IDS].sort());
 });
 
-test("an open admin host (round 12) adds the six admin routes: 36 ported, 12 retired, 1 definite, 2 root", () => {
+test("an open admin host (round 12) adds the seven admin routes: 41 ported, 10 retired, 2 root", () => {
   const ported = [...productionPortedRouteIds, ...ADMIN_HOST_ROUTE_IDS];
   const registry = build({ portedRouteIds: ported });
   assertCoverage(registry, ported);
-  assert.equal(registry.portedRouteIds.length, 36);
+  assert.equal(registry.portedRouteIds.length, 41);
+  assert.equal(registry.resolve("admin_performance_intake").handler.routeId, "admin_performance_intake");
   assert.deepEqual([...registry.unportedRouteIds], [...RETIRED_ROUTE_IDS].sort());
-  assert.deepEqual([...registry.definiteRouteIds], ["accountless_telemetry_performance_authorization"]);
-  const definite = registry.resolve("accountless_telemetry_performance_authorization");
-  assert.deepEqual([definite.disposition, definite.handler.routeId, definite.answer],
-    ["definite", "accountless_telemetry_performance_authorization",
-      RETIRED_ROUTE_DEFINITE_ANSWERS.accountless_telemetry_performance_authorization]);
-  assert.deepEqual({ ...definite.answer }, ROUND_12_DEFINITE.accountless_telemetry_performance_authorization);
+  const grant = registry.resolve("accountless_telemetry_performance_authorization");
+  assert.deepEqual([grant.disposition, grant.handler.routeId],
+    ["ported", "accountless_telemetry_performance_authorization"]);
 });
 
-test("scope plus any single contested route, in any order of the injected list", () => {
+test("scope and performance plus any single contested route, in any order of the injected list", () => {
   for (const contested of OD_CR_1_CONTESTED_ROUTE_IDS) {
-    const ported = [contested, ...[...POSTGRES_SCOPE_ROUTE_IDS].reverse()];
+    const ported = [contested, ...[...REQUIRED].reverse()];
     assertCoverage(build({ portedRouteIds: ported }), ported);
   }
 });
 
 test("the handler map is a snapshot; the injected list order never changes Worker order", () => {
-  const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
-  const registry = createProductionRouteRegistry({ routePolicy: policy, portedRouteIds: POSTGRES_SCOPE_ROUTE_IDS, handlers });
+  const handlers = handlersFor(REQUIRED);
+  const registry = createProductionRouteRegistry({ routePolicy: policy, portedRouteIds: REQUIRED, handlers });
   const original = registry.resolve("health").handler;
   handlers.set("health", stub("replaced"));
   handlers.delete("ready");
@@ -396,12 +356,15 @@ test("only issued registries are registries", () => {
 // ---------------------------------------------------------------------------
 // Closed refusals
 
-test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 50 or 52 routes, duplicates, malformed entries", () => {
-  refused(() => build({ routePolicy: policy.slice(0, 50) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "50 routes");
+test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 52 or 54 routes, duplicates, malformed entries", () => {
+  refused(() => build({ routePolicy: policy.slice(0, 52) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "52 routes");
+  // d43c8f92's 51 routes without the owner-decided ones are no longer the basis either.
+  refused(() => build({ routePolicy: policy.filter((route) => !OWNER_DECIDED_2026_10_10.includes(route.id)) }),
+    "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "the bare d43c8f92 policy");
   refused(() => build({ routePolicy: policy.slice(1) }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "first route dropped");
   refused(() => build({ routePolicy: [...policy, Object.freeze({
     pathname: "/api/v1/synthetic", id: "synthetic", methods: Object.freeze(["GET"]), authority: "public",
-  })] }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "52 routes");
+  })] }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "54 routes");
   const duplicateId = policy.map((route, index) => index === 4 ? { ...route, id: policy[3].id } : route);
   refused(() => build({ routePolicy: duplicateId }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "duplicate id");
   const duplicatePath = policy.map((route, index) => index === 4 ? { ...route, pathname: policy[3].pathname } : route);
@@ -412,30 +375,34 @@ test("PRODUCTION_ROUTE_COVERAGE_INCOMPLETE: 50 or 52 routes, duplicates, malform
   refused(() => build({ routePolicy: relative }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "relative pathname");
   for (const routePolicy of [undefined, null, {}, "routes", policy.map(() => null)]) {
     refused(() => createProductionRouteRegistry({
-      routePolicy, portedRouteIds: POSTGRES_SCOPE_ROUTE_IDS, handlers: handlersFor(POSTGRES_SCOPE_ROUTE_IDS),
+      routePolicy, portedRouteIds: REQUIRED, handlers: handlersFor(REQUIRED),
     }), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", String(routePolicy));
   }
   refused(() => createProductionRouteRegistry(), "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", "no arguments");
   // A ported id outside the policy (a pathname, a made-up id) is not coverage.
   for (const id of [EFFECTIVE_PAGE_PATH, "telemetry_v12_effective_page", "unknown_api", "asset"]) {
-    refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
+    refused(() => build({ portedRouteIds: [...REQUIRED, id] }),
       "PRODUCTION_ROUTE_COVERAGE_INCOMPLETE", id);
   }
 });
 
-test("PRODUCTION_ROUTE_PARITY_BASIS_DRIFT: 51 routes but not the pinned ones in the pinned order", () => {
+test("PRODUCTION_ROUTE_PARITY_BASIS_DRIFT: 53 routes but not the pinned ones in the pinned order", () => {
   const swapped = [...policy];
   [swapped[1], swapped[2]] = [swapped[2], swapped[1]];
   refused(() => build({ routePolicy: swapped }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "reordered");
   const renamed = policy.map((route, index) => index === 50 ? { ...route, id: "community_daily_v2" } : route);
   refused(() => build({ routePolicy: renamed }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "renamed");
+  // The owner-decided routes keep their pinned positions.
+  const moved = [...policy];
+  [moved[51], moved[52]] = [moved[52], moved[51]];
+  refused(() => build({ routePolicy: moved }), "PRODUCTION_ROUTE_PARITY_BASIS_DRIFT", "owner-decided route moved");
 });
 
 test("PRODUCTION_ROUTE_PORTED_SET_INVALID: the ported set is required, a list of distinct ids", () => {
-  for (const portedRouteIds of [undefined, null, "health", new Set(POSTGRES_SCOPE_ROUTE_IDS),
-    [...POSTGRES_SCOPE_ROUTE_IDS, "health"], [...POSTGRES_SCOPE_ROUTE_IDS, 7]]) {
+  for (const portedRouteIds of [undefined, null, "health", new Set(REQUIRED),
+    [...REQUIRED, "health"], [...REQUIRED, 7]]) {
     refused(() => createProductionRouteRegistry({
-      routePolicy: policy, portedRouteIds, handlers: handlersFor(POSTGRES_SCOPE_ROUTE_IDS),
+      routePolicy: policy, portedRouteIds, handlers: handlersFor(REQUIRED),
     }), "PRODUCTION_ROUTE_PORTED_SET_INVALID", String(portedRouteIds));
   }
   refused(() => createProductionRouteRegistry({ routePolicy: policy, handlers: new Map() }),
@@ -444,33 +411,26 @@ test("PRODUCTION_ROUTE_PORTED_SET_INVALID: the ported set is required, a list of
 
 test("PRODUCTION_ROUTE_ROOT_CLAIMED: a root route ported or given a handler", () => {
   for (const root of ORIGIN_ROOT_ROUTE_IDS) {
-    refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, root] }),
+    refused(() => build({ portedRouteIds: [...REQUIRED, root] }),
       "PRODUCTION_ROUTE_ROOT_CLAIMED", `${root} ported`);
-    const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
+    const handlers = handlersFor(REQUIRED);
     handlers.set(root, stub(root));
     refused(() => build({ handlers }), "PRODUCTION_ROUTE_ROOT_CLAIMED", `${root} handler`);
   }
 });
 
 test("PRODUCTION_ROUTE_PORT_RETIRED: no round-12 retired route can be ported", () => {
-  assert.equal(RETIRED_ROUTE_IDS.length + RETIRED_DEFINITE_ROUTE_IDS.length, 13);
-  for (const id of [...RETIRED_ROUTE_IDS, ...RETIRED_DEFINITE_ROUTE_IDS]) {
-    refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS, id] }),
+  assert.equal(RETIRED_ROUTE_IDS.length, 10);
+  for (const id of RETIRED_ROUTE_IDS) {
+    refused(() => build({ portedRouteIds: [...REQUIRED, id] }),
       "PRODUCTION_ROUTE_PORT_RETIRED", id);
   }
   // A handler offered for a 503-retired route is refused too, even without
-  // porting it; a retired-definite route takes only its preamble (round 19),
-  // which never makes it ported.
+  // porting it.
   for (const id of RETIRED_ROUTE_IDS) {
-    const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
+    const handlers = handlersFor(REQUIRED);
     handlers.set(id, stub(id));
     refused(() => build({ handlers }), "PRODUCTION_ROUTE_HANDLER_UNEXPECTED", `${id} handler`);
-  }
-  for (const id of RETIRED_DEFINITE_ROUTE_IDS) {
-    const registry = build();
-    assert.equal(registry.resolve(id).disposition, ORIGIN_ROUTE_DISPOSITIONS.DEFINITE, id);
-    assert.equal(registry.portedRouteIds.includes(id), false, id);
-    assert.equal(registry.portedPathnames.includes(policy.find((route) => route.id === id).pathname), false, id);
   }
 });
 
@@ -492,22 +452,25 @@ test("IDENTITY_LINK_ROTATION_CONSUMER_PORTED: every identity-link consumer stays
   refused(() => assertIdentityLinkConsumersRetired([1]), "IDENTITY_LINK_ROTATION_CONSUMER_PORTED", "not ids");
 });
 
-test("PRODUCTION_ROUTE_SCOPE_INCOMPLETE: every one of the 21 scope routes is required", () => {
-  for (const id of POSTGRES_SCOPE_ROUTE_IDS) {
-    const ported = [...POSTGRES_SCOPE_ROUTE_IDS.filter((scope) => scope !== id), ...OD_CR_1_CONTESTED_ROUTE_IDS];
+test("PRODUCTION_ROUTE_SCOPE_INCOMPLETE: every scope route and every performance route is required", () => {
+  for (const id of REQUIRED) {
+    const ported = [...REQUIRED.filter((required) => required !== id), ...OD_CR_1_CONTESTED_ROUTE_IDS];
     refused(() => build({ portedRouteIds: ported }), "PRODUCTION_ROUTE_SCOPE_INCOMPLETE", id);
   }
+  // Scope alone (the pre-decision-1 minimum) no longer composes.
+  refused(() => build({ portedRouteIds: [...POSTGRES_SCOPE_ROUTE_IDS] }), "PRODUCTION_ROUTE_SCOPE_INCOMPLETE",
+    "performance absent");
   refused(() => build({ portedRouteIds: [] }), "PRODUCTION_ROUTE_SCOPE_INCOMPLETE", "empty");
 });
 
 test("PRODUCTION_ROUTE_HANDLERS_INVALID: handlers must be a Map", () => {
-  for (const handlers of [null, {}, Object.fromEntries(handlersFor(POSTGRES_SCOPE_ROUTE_IDS)),
-    [...handlersFor(POSTGRES_SCOPE_ROUTE_IDS)]]) {
+  for (const handlers of [null, {}, Object.fromEntries(handlersFor(REQUIRED)),
+    [...handlersFor(REQUIRED)]]) {
     refused(() => createProductionRouteRegistry({
-      routePolicy: policy, portedRouteIds: POSTGRES_SCOPE_ROUTE_IDS, handlers,
+      routePolicy: policy, portedRouteIds: REQUIRED, handlers,
     }), "PRODUCTION_ROUTE_HANDLERS_INVALID", String(handlers));
   }
-  refused(() => createProductionRouteRegistry({ routePolicy: policy, portedRouteIds: POSTGRES_SCOPE_ROUTE_IDS }),
+  refused(() => createProductionRouteRegistry({ routePolicy: policy, portedRouteIds: REQUIRED }),
     "PRODUCTION_ROUTE_HANDLERS_INVALID", "missing");
 });
 
@@ -522,15 +485,15 @@ test("PRODUCTION_ROUTE_HANDLER_UNEXPECTED: a handler outside the ported set", ()
     "asset",
   ];
   for (const key of extraKeys) {
-    const handlers = handlersFor(POSTGRES_SCOPE_ROUTE_IDS);
+    const handlers = handlersFor(REQUIRED);
     handlers.set(key, stub(key));
     refused(() => build({ handlers }), "PRODUCTION_ROUTE_HANDLER_UNEXPECTED", key);
   }
 });
 
-test("PRODUCTION_ROUTE_HANDLER_MISSING: every ported id has a function, every retired-definite id its preamble", () => {
-  const ported = [...POSTGRES_SCOPE_ROUTE_IDS, ...OD_CR_1_CONTESTED_ROUTE_IDS];
-  for (const id of [...ported, ...RETIRED_DEFINITE_ROUTE_IDS]) {
+test("PRODUCTION_ROUTE_HANDLER_MISSING: every ported id has a function", () => {
+  const ported = [...REQUIRED, ...OD_CR_1_CONTESTED_ROUTE_IDS];
+  for (const id of ported) {
     const handlers = handlersFor(ported);
     handlers.delete(id);
     refused(() => build({ portedRouteIds: ported, handlers }), "PRODUCTION_ROUTE_HANDLER_MISSING", `${id} absent`);

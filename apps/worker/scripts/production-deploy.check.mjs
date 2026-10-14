@@ -1730,7 +1730,7 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 16);
+  assert.equal(calls.length, 17);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/telemetry-shared.generated.js",
     PUBLIC_ROOT_URL,
@@ -1745,6 +1745,10 @@ test("production public-surface recheck requires a public root and real 404s for
   ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/api/v1/admin/reconstruction-progress",
+    PUBLIC_ROOT_URL,
+  ).href), true);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/api/v1/admin/performance-intake",
     PUBLIC_ROOT_URL,
   ).href), true);
 });

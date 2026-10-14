@@ -735,12 +735,33 @@ export function telemetryV12DomainManifestDigestInput(value: TelemetryV12DomainM
 export const PERFORMANCE_RECORD_SCHEMA_VERSION: "model-performance-daily-v1";
 export const PERFORMANCE_MEASUREMENT_VERSION: "model-performance-samples-v1";
 export const PERFORMANCE_BUCKET_SCHEME_VERSION: "performance-histogram-v1";
+export const PERFORMANCE_BUCKET_SCHEME_VERSION_V2: "performance-histogram-v2";
 export const PERFORMANCE_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-09-29.1";
+export const PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21: "telemetry-performance-registry-2026-09-21.1";
+export const PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29: "telemetry-performance-registry-2026-09-29.1";
+export const PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10: "telemetry-performance-registry-2026-10-10.1";
+export const PERFORMANCE_LATEST_FIELD_DICTIONARY_VERSION: "telemetry-performance-registry-2026-10-10.1";
+export type PerformanceFieldDictionaryVersion =
+  | typeof PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21
+  | typeof PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29
+  | typeof PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10;
+export type PerformanceHistogramSchemeVersion = "performance-histogram-v1" | "performance-histogram-v2";
+export interface PerformanceFieldDictionary {
+  readonly fieldDictionaryVersion: PerformanceFieldDictionaryVersion;
+  readonly state: "accepted" | "draft";
+  readonly bucketSchemeVersion: PerformanceHistogramSchemeVersion;
+  readonly speedModes: readonly PerformanceSpeedMode[];
+  readonly apiServiceTiers: readonly PerformanceApiServiceTier[];
+}
+export const PERFORMANCE_FIELD_DICTIONARIES: Readonly<Record<PerformanceFieldDictionaryVersion, PerformanceFieldDictionary>>;
+/** The emitted dictionary's bucket scheme; this literal moves with PERFORMANCE_FIELD_DICTIONARY_VERSION. */
+export const PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION: "performance-histogram-v1";
 export const PERFORMANCE_PRIVACY_CONTRACT_VERSION: "privacy-safe-model-performance-v1";
 export const PERFORMANCE_CONTRACT_STATE: "staged";
 export const PERFORMANCE_HISTOGRAM_SCHEMA_VERSION: "performance-histogram-v1";
 export const MAX_PERFORMANCE_RECORD_CANONICAL_BYTES: 32768;
 export const MAX_PERFORMANCE_HISTOGRAM_BUCKETS: 61;
+export const MAX_PERFORMANCE_HISTOGRAM_BUCKETS_V2: 96;
 export const MAX_PERFORMANCE_COUNT: 9007199254740991;
 export const MAX_PERFORMANCE_SPEED_CENTI_TOKENS_PER_SECOND: 9007199254740991;
 export const MAX_PERFORMANCE_TURN_DURATION_MILLISECONDS: 9007199254740991;
@@ -781,7 +802,7 @@ export type PerformanceSpeedModeSource = typeof PERFORMANCE_SPEED_MODE_SOURCES[n
 export type PerformanceApiServiceTier = typeof PERFORMANCE_API_SERVICE_TIERS[number];
 export type PerformanceHistogramMetric = "speed" | "ttft" | "turnDuration";
 export interface PerformanceHistogram {
-  schemaVersion: typeof PERFORMANCE_HISTOGRAM_SCHEMA_VERSION;
+  schemaVersion: PerformanceHistogramSchemeVersion;
   metric: PerformanceHistogramMetric;
   sampleCount: number;
   buckets: Readonly<Record<string, number>>;
@@ -804,19 +825,42 @@ export interface PerformanceHistogramQuantiles {
   p75: PerformanceHistogramQuantileBand | null;
   p90: PerformanceHistogramQuantileBand | null;
 }
+export interface PerformanceHistogramPool {
+  schemaVersion: typeof PERFORMANCE_HISTOGRAM_POOL_VERSION;
+  metric: PerformanceHistogramMetric;
+  sampleCount: number;
+  buckets: Readonly<Record<string, number>>;
+  unresolvedCount: number;
+  min: number | null;
+  max: number | null;
+}
+export interface PerformanceHistogramPoolQuantiles
+  extends Omit<PerformanceHistogramQuantiles, "methodVersion"> {
+  methodVersion: "performance-histogram-pool-type7-bounds-v1";
+  unresolvedCount: number;
+}
 export const PERFORMANCE_HISTOGRAM_SCHEME_VERSION: "performance-histogram-v1";
+export const PERFORMANCE_HISTOGRAM_SCHEME_VERSION_V2: "performance-histogram-v2";
+export const PERFORMANCE_HISTOGRAM_SCHEME_VERSIONS: readonly PerformanceHistogramSchemeVersion[];
+export const PERFORMANCE_HISTOGRAM_POOL_VERSION: "performance-histogram-pool-v1";
 export const SPEED_BUCKET_UPPER_CENTI_TPS: readonly number[];
+export const SPEED_BUCKET_UPPER_CENTI_TPS_V2: readonly number[];
 export const TTFT_BUCKET_UPPER_MS: readonly number[];
 export const TURN_DURATION_BUCKET_UPPER_MS: readonly number[];
 export function buildPerformanceHistogram(
   metric: PerformanceHistogramMetric,
   values: readonly number[],
+  schemeVersion?: PerformanceHistogramSchemeVersion,
 ): PerformanceHistogram;
 export function mergePerformanceHistograms(
   histograms: readonly PerformanceHistogram[],
 ): PerformanceHistogram;
 export function parsePerformanceHistogram(value: unknown): PerformanceHistogram;
 export function performanceHistogramQuantiles(value: unknown): PerformanceHistogramQuantiles;
+export function poolPerformanceHistograms(
+  items: readonly (PerformanceHistogram | PerformanceHistogramPool)[],
+): PerformanceHistogramPool;
+export function performanceHistogramPoolQuantiles(value: unknown): PerformanceHistogramPoolQuantiles;
 export interface TelemetryPerformanceRecord {
   schemaVersion: typeof PERFORMANCE_RECORD_SCHEMA_VERSION;
   day: string;
@@ -828,7 +872,7 @@ export interface TelemetryPerformanceRecord {
   speedModeSource: PerformanceSpeedModeSource;
   apiServiceTier: PerformanceApiServiceTier;
   measurementVersion: typeof PERFORMANCE_MEASUREMENT_VERSION;
-  bucketSchemeVersion: typeof PERFORMANCE_BUCKET_SCHEME_VERSION;
+  bucketSchemeVersion: PerformanceHistogramSchemeVersion;
   turns: number;
   speedTurns: number;
   ttftTurns: number;
@@ -841,6 +885,81 @@ export interface TelemetryPerformanceRecord {
   completionHistogram: PerformanceHistogram;
 }
 export function parseTelemetryPerformanceHistogram(value: unknown): PerformanceHistogram;
-export function parseTelemetryPerformanceRecord(value: unknown): TelemetryPerformanceRecord;
-export function canonicalTelemetryPerformanceJson(value: unknown): string;
-export function telemetryPerformanceRowDigestInput(value: TelemetryPerformanceRecord): string;
+export function parseTelemetryPerformanceRecord(
+  value: unknown,
+  fieldDictionaryVersion?: PerformanceFieldDictionaryVersion,
+): TelemetryPerformanceRecord;
+export interface AdaptedTelemetryPerformanceRecord {
+  readonly sourceFieldDictionaryVersion: PerformanceFieldDictionaryVersion;
+  readonly labelVocabularyVersion: typeof PERFORMANCE_LATEST_FIELD_DICTIONARY_VERSION;
+  readonly bucketSchemeVersion: PerformanceHistogramSchemeVersion;
+  readonly record: TelemetryPerformanceRecord;
+}
+export function adaptTelemetryPerformanceRecord(
+  value: unknown,
+  fieldDictionaryVersion: PerformanceFieldDictionaryVersion,
+): AdaptedTelemetryPerformanceRecord;
+export function canonicalTelemetryPerformanceJson(
+  value: unknown,
+  fieldDictionaryVersion?: PerformanceFieldDictionaryVersion,
+): string;
+export function telemetryPerformanceRowDigestInput(
+  value: TelemetryPerformanceRecord,
+  fieldDictionaryVersion?: PerformanceFieldDictionaryVersion,
+): string;
+export const COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION: "community-model-performance-v1";
+export const COMMUNITY_MODEL_PERFORMANCE_METHOD_VERSION: "performance-histogram-pool-type7-bounds-v1";
+export const COMMUNITY_MODEL_PERFORMANCE_POPULATION: "reported_samples";
+export const COMMUNITY_MODEL_PERFORMANCE_PERIODS: readonly ["1", "7", "30", "all"];
+export const COMMUNITY_MODEL_PERFORMANCE_INTERVALS: readonly ["day", "week"];
+export const COMMUNITY_MODEL_PERFORMANCE_SPEED_MODES: readonly ["standard", "fast", "ultrafast"];
+export const COMMUNITY_MODEL_PERFORMANCE_PERCENTILES: readonly ["p10", "p25", "median", "p75", "p90"];
+export const MAX_COMMUNITY_MODEL_PERFORMANCE_MODELS: 64;
+export const MAX_COMMUNITY_MODEL_PERFORMANCE_POINTS: 600;
+export const MAX_COMMUNITY_MODEL_PERFORMANCE_BYTES: 16777216;
+export interface CommunityModelPerformancePoint {
+  day: string;
+  n: number;
+  unresolved: number;
+  p10: PerformanceHistogramQuantileBand | null;
+  p25: PerformanceHistogramQuantileBand | null;
+  median: PerformanceHistogramQuantileBand | null;
+  p75: PerformanceHistogramQuantileBand | null;
+  p90: PerformanceHistogramQuantileBand | null;
+}
+export interface CommunityModelPerformanceModel {
+  provider: string;
+  modelId: string;
+  turns: number;
+  speedTurns: number;
+  ttftTurns: number;
+  timedResponses: number;
+  toolFreeTurns: number;
+  contributors: number;
+  devices: number;
+  speed: { unit: "tokens_per_second"; points: CommunityModelPerformancePoint[] };
+  ttft: { unit: "milliseconds"; points: CommunityModelPerformancePoint[] };
+}
+export interface CommunityModelPerformance {
+  schemaVersion: typeof COMMUNITY_MODEL_PERFORMANCE_SCHEMA_VERSION;
+  methodVersion: typeof COMMUNITY_MODEL_PERFORMANCE_METHOD_VERSION;
+  population: typeof COMMUNITY_MODEL_PERFORMANCE_POPULATION;
+  approximate: true;
+  revision: number;
+  generatedAt: string;
+  period: typeof COMMUNITY_MODEL_PERFORMANCE_PERIODS[number];
+  interval: typeof COMMUNITY_MODEL_PERFORMANCE_INTERVALS[number];
+  start: string;
+  end: string;
+  speedMode: typeof COMMUNITY_MODEL_PERFORMANCE_SPEED_MODES[number];
+  excludedUnknownTurns: number;
+  contributors: number;
+  devices: number;
+  reports: number;
+  models: CommunityModelPerformanceModel[];
+}
+export function parseCommunityModelPerformance(value: unknown): CommunityModelPerformance;
+export function buildCommunityModelPerformancePoint(
+  day: string,
+  pool: PerformanceHistogramPool,
+): CommunityModelPerformancePoint;

@@ -52,7 +52,9 @@ application name, an address or a credential. A failed run writes
 
 The signals are the age of the last completed maintenance pass and the last
 complete analytics refresh run, the age in days of the newest published
-community day, the age of the newest ready v1.2 manifest, the one global
+community day, the age of the newest ready v1.2 manifest, the age of the
+newest admitted performance report, the age in days of the newest community
+model-performance publication, the one global
 ingestion journal's head sequence and age, the lag to the analytics cursor, the
 pending journal rows (counted up to 10001, with `capped` set at that bound) and
 the age of the oldest undelivered row, the database size, transaction-id and
@@ -71,6 +73,45 @@ index the read is a table scan that grows with the table and ends as
 `STATEMENT_TIMEOUT`; migrate the database through `0068` before registering the
 probe.
 
+### Performance intake and publication signals
+
+Two runtime-probe gauges watch the accountless performance intake and its
+community publication (primary `0079_performance_telemetry.sql`). Each is one
+bounded statement in its own read-only transaction, under the same 2000 ms
+statement and 500 ms lock bounds as every other signal.
+
+| Signal | Read | `NO_DATA` means | Healthy shape |
+|---|---|---|---|
+| `performance_newest_accepted_report_age_seconds` | `max(created_at)` over `telemetry_performance_receipts`: one entry of the `telemetry_performance_receipts_accepted_at` index | No report has been admitted: the runtime is still staged, or no client has reported since activation | Grows between client uploads and drops when a report is admitted. A receipt is written per admitted report, accepted or replaced; an idempotent replay writes none |
+| `community_model_performance_head_age_days` | Today's UTC date minus the newest payload `end` day over `analytics_v2_published_performance` (at most 12 heads, one per period and speed mode) | Nothing published yet: the first refresh run with an included record has not happened | 1 after the daily refresh, because the window ends on the latest completed UTC day; 2 between UTC midnight and that day's refresh |
+
+How to read them:
+
+- Before activation both read `NO_DATA`, and that is not an alert. After
+  activation, a receipt age that keeps growing past the normal upload cadence
+  means intake has stalled silently: check the performance routes and the
+  admin performance-intake section. The refusal counters are not a probe
+  signal. While the runtime is staged, every capability poll answers 403 and
+  upserts one refusal-counter row.
+- Once the first publication exists, every refresh republishes all 12 slots,
+  empty ones included. A head age above 1 therefore means no refresh has
+  published since the last completed day. Either the refresh failed or ran
+  late (`analytics_refresh_completed_age_seconds` grows too), or the
+  publication was withheld while the run itself completed (the run receipt's
+  `performance.withheld` names the code).
+- If the performance candidates overflow the run's output budget
+  (`ANALYTICS_V2_OUTPUTS_CAPACITY_EXCEEDED`), the whole run fails. Then
+  `community_daily_head_age_days` grows alongside this signal. The payload
+  sizes make this unlikely.
+- A head whose `end` is not a `YYYY-MM-DD` day reads `UNEXPECTED_RESULT`. The
+  probe never skips it in favour of the other heads. An `end` ahead of the UTC
+  date reads 0, as the community-day signal does.
+
+The receipt read depends on the `created_at` index that `0079` creates. Without
+it, the read walks every receipt and eventually ends as `STATEMENT_TIMEOUT`.
+The PostgreSQL 17 spec proves both the plan (a backward scan of one index
+entry) and the control without the index.
+
 The backup audit writes the OPS-1 verdict as a level (0 ok, 1 warn, 2 breach)
 with its closed codes, whether point-in-time recovery is on, and the age of the
 newest successful automated backup. A fetch failure is `unavailable`, never ok
@@ -86,9 +127,11 @@ and never a breach. A restorable copy older than 365 days is level 2.
   Nothing in this change grants it.
 - **The `opsBackupAudit` account** and its two permissions, and registering the
   jobs (an image roll, two triggers created paused, the connection budget), after
-  the ready-manifest index above (primary `0068`) is applied.
+  the ready-manifest index above (primary `0068`) and the performance receipt
+  index (primary `0079`) are applied.
 - **Alerts** on these lines wait for the monitoring bundle (E-OPS5) and the
-  owner's notification channel.
+  owner's notification channel. That includes the two performance signals: no
+  threshold, alert policy or registration is defined for them here.
 
 ## Log-redaction proof
 

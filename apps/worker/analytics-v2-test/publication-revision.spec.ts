@@ -17,6 +17,11 @@
 //   EVERY non-test Worker source (src, cloud-run, scripts, migrations,
 //   vendor; tracked or untracked, never ignored output), so a purge or
 //   republish tool under scripts/ cannot write a head beside the helper.
+// - the same single-writer rule for the community model performance heads
+//   (analytics_v2_published_performance, primary 0079): a write of them and a
+//   call of stampAnalyticsV2PerformancePayload only in store-publication.ts,
+//   whose writer takes each changed slot's revision from
+//   nextPublishedRevision (no floor; the run's seed).
 // A statement whose table name is assembled at run time from a list (a
 // generic copier) escapes any static scan; the database is the authority
 // there: 0059's forward-only trigger and REV-SEED's separate
@@ -28,6 +33,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ANALYTICS_V2_TABLES } from "../src/analytics-v2/contract";
+import { ANALYTICS_V2_PERFORMANCE_TABLES } from "../src/analytics-v2/performance-publication-contract";
 import { nextPublishedRevision } from "../src/analytics-v2/store";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -96,15 +102,16 @@ function codeOf(path: string): string | null {
 }
 
 const PUBLISHED_DAILY = ANALYTICS_V2_TABLES.publishedDaily;
+const PUBLISHED_PERFORMANCE = ANALYTICS_V2_PERFORMANCE_TABLES.publishedPerformance;
 const ESCAPE = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
 /**
- * The names the published-heads table goes by across the tree: the literal,
+ * The names a published-heads table goes by across the tree: the literal,
  * every constant bound to it (as an identifier) and every property bound to
  * it (as `.name`).
  */
-function publishedDailyNames(texts: string[]): RegExp[] {
-  const literal = ESCAPE(PUBLISHED_DAILY);
+function publishedDailyNames(texts: string[], table: string = PUBLISHED_DAILY): RegExp[] {
+  const literal = ESCAPE(table);
   const constants = new Set<string>();
   const properties = new Set<string>();
   for (const text of texts) {
@@ -210,5 +217,80 @@ describe("the static ratchets: one published-revision computation, one writer of
     expect(stamps).toEqual([join("src", "analytics-v2", "store-publication.ts")]);
     const publication = readFileSync(join(WORKER_ROOT, "src", "analytics-v2", "store-publication.ts"), "utf8");
     expect(publication).toMatch(/const revision = nextPublishedRevision\(\{ head: head\?\.revision, floor: floors\.get\(candidate\.day\),/u);
+  });
+});
+
+describe("the static ratchets for the community model performance heads", () => {
+  const tree = workerSources();
+  const texts = new Map(tree.map((path) => [path, codeOf(path)] as const)
+    .filter((entry): entry is readonly [string, string] => entry[1] !== null));
+  const names = publishedDailyNames([...texts.values()], PUBLISHED_PERFORMANCE);
+  const publicationPath = join("src", "analytics-v2", "store-publication.ts");
+  const contractPath = join("src", "analytics-v2", "performance-publication-contract.ts");
+
+  it("knows the table by its literal and its contract property, and not by the daily heads' names", () => {
+    expect(PUBLISHED_PERFORMANCE).toBe("analytics_v2_published_performance");
+    expect(texts.has(contractPath)).toBe(true);
+    expect(texts.has(join("postgres", "migrations", "primary", "0079_performance_telemetry.sql"))).toBe(true);
+    const sources = names.map((name) => name.source);
+    expect(sources).toContain("\\.publishedPerformance(?![\\w$])");
+    const daily = publishedDailyNames([...texts.values()]);
+    expect(writesPublishedDaily("INSERT INTO analytics_v2_published_performance (period) VALUES ($1)", daily)).toBe(false);
+    expect(writesPublishedDaily("INSERT INTO analytics_v2_published_daily (day) VALUES ($1)", names)).toBe(false);
+  });
+
+  it("detects a performance head writer however the table is named, and only a writer", () => {
+    const known = publishedDailyNames(["const SLOTS = 'analytics_v2_published_performance';",
+      "const t = { slots: \"analytics_v2_published_performance\" };"], PUBLISHED_PERFORMANCE);
+    for (const writer of [
+      "INSERT INTO analytics_v2_published_performance (period, speed_mode) VALUES ($1, $2)",
+      "await q(`update ${s}.\"analytics_v2_published_performance\" SET revision = $1`)",
+      "`INSERT INTO\n  ${quote(schema)}.${SLOTS} (period, revision)`",
+      "`INSERT INTO ${relation(schema, t.slots)} AS head`",
+      "MERGE INTO \"x\".analytics_v2_published_performance AS head USING src ON true",
+    ]) {
+      expect(writesPublishedDaily(writer, known), writer).toBe(true);
+    }
+    for (const other of [
+      "CREATE TRIGGER t BEFORE UPDATE OR DELETE ON analytics_v2_published_performance FOR EACH ROW",
+      "CREATE FUNCTION analytics_v2_published_performance_forward_only() RETURNS trigger",
+      "SELECT period FROM analytics_v2_published_performance FOR UPDATE",
+      "INSERT INTO other_table SELECT period FROM analytics_v2_published_performance",
+      "UPDATE analytics_v2_published_performance_audit SET x = 1",
+    ]) {
+      expect(writesPublishedDaily(other, known), other).toBe(false);
+    }
+  });
+
+  it("writes and stamps the performance heads only in store-publication.ts, through nextPublishedRevision", () => {
+    const writes = [...texts].filter(([, text]) => writesPublishedDaily(text, names)).map(([path]) => path);
+    expect(writes).toEqual([publicationPath]);
+    const stamps = [...texts].filter(([, text]) => text.split("\n")
+      .some((line) => /stampAnalyticsV2PerformancePayload\(/u.test(line)
+        && !/export (async )?function stampAnalyticsV2PerformancePayload/u.test(line)))
+      .map(([path]) => path);
+    expect(stamps).toEqual([publicationPath]);
+    const publication = codeLines(join(WORKER_ROOT, publicationPath));
+    const start = publication.findIndex((line) => line.includes("export async function writeAnalyticsV2PublishedPerformance("));
+    const end = publication.findIndex((line, index) => index > start && line.trimEnd() === "}");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = publication.slice(start, end).join("\n");
+    expect(body).toMatch(/const revision = nextPublishedRevision\(\{ head: head\?\.revision, floor: null, seed \}\);/u);
+    expect(body.match(/nextPublishedRevision\(/gu)).toHaveLength(1);
+    expect(body.match(/stampAnalyticsV2PerformancePayload\(/gu)).toHaveLength(1);
+  });
+
+  it("keeps the store-side contract module free of revision arithmetic and outside the compute imports", () => {
+    const contract = codeLines(join(WORKER_ROOT, contractPath));
+    expect(contract.filter((line) => /[Rr]evision[A-Za-z]*\s*\+\s*1\b|Math\.max\(|[Rr]evision\s*\+=/u.test(line))).toEqual([]);
+    // Plumbing: it imports only the canonical JSON and SHA-256 helpers, never
+    // contract.ts or another analytics_v2 module (the fold and contract.ts
+    // take its types type-only).
+    const imports = contract.filter((line) => /^\s*import\b/u.test(line));
+    expect(imports).toEqual([
+      'import { canonicalJson } from "../canonical-json";',
+      'import { sha256Hex } from "../crypto";',
+    ]);
   });
 });

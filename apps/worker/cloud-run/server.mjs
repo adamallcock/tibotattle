@@ -385,6 +385,12 @@ export async function createRuntime({ databaseOnly = false, dependencies = {} } 
       ACCOUNTLESS_OWNERSHIP_MODE: optional("ACCOUNTLESS_OWNERSHIP_MODE", "disabled"),
       ACCOUNT_SCOPED_INGEST_MODE: "disabled",
       PUBLIC_ANALYTICS_MODE: optional("PUBLIC_ANALYTICS_MODE", "enabled"),
+      // The restored performance intake's storage switch (owner decision
+      // 2026-10-10): 'enabled', mirroring the production and staging pins
+      // (postgres-production-configuration.mjs PRODUCTION_VARS, an origin-only
+      // var with no wrangler.jsonc counterpart), so it is not read from the
+      // environment either.
+      PERFORMANCE_TELEMETRY_STORAGE_MODE: "enabled",
       // The Worker's upload-ingress policy (the shared lease and the 60 s /
       // 15 s body read) over the PostgreSQL budget, as production composes it.
       UPLOAD_INGRESS_QUEUE_MODE: "disabled",

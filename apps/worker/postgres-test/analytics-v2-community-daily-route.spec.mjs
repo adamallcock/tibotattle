@@ -11,7 +11,7 @@
 //
 // Schema: the full promoted primary chain through the production runner,
 // which carries A-3's 0059_analytics_v2.sql and ends at the promoted tail
-// 0078_classification_link_lookup_indexes.sql (both asserted). 0059 keeps
+// 0079_performance_telemetry.sql (both asserted). 0059 keeps
 // published heads append-only, so published rows are seeded once and never
 // updated or deleted; scenarios vary only the preview and cache rows.
 //
@@ -33,7 +33,7 @@ import { dayMs, quota, syntheticOwner } from "../analytics-v2-test/fixtures/synt
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const A3_MIGRATION = "0059_analytics_v2.sql";
-const PRIMARY_TAIL = "0078_classification_link_lookup_indexes.sql";
+const PRIMARY_TAIL = "0079_performance_telemetry.sql";
 // Genuine registered build identity for the optional completed-equivalence
 // read. Unbundled production sources correctly withhold that proof.
 const BUNDLED_KERNEL = JSON.parse(readFileSync(resolve(WORKER_ROOT,

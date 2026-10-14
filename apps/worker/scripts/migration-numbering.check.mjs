@@ -13,7 +13,10 @@
  *
  * Covered directories: migrations, every top-level *-migrations,
  * the staging-edge catchup stand-in migrations,
- * postgres/migrations/<role> and postgres/staged-migrations/<role>. Any other
+ * postgres/migrations/<role> and postgres/staged-migrations/<role>, and the
+ * IN-3 legacy oracle's vendored d43c8f92 D1 directories (byte-for-byte
+ * copies under postgres-test/fixtures, which must stay as numbered as they
+ * were at d43c8f92). Any other
  * directory holding .sql files fails MIGRATION_DIRECTORY_UNCOVERED, except
  * postgres/proposals, which may hold unreferenced drafts (none is tracked:
  * LEAD-SIMP deleted the erasure-transfer draft with online erasure).
@@ -27,6 +30,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { ORACLE_VENDOR_RELATIVE } from "./vendor-legacy-contribution-oracle.mjs";
 
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MIGRATION_FILE_PATTERN = /^(\d{4})_[A-Za-z0-9][A-Za-z0-9_.-]*\.sql$/u;
@@ -59,6 +63,10 @@ export async function migrationDirectories(workerRoot) {
   }
   for (const role of await subdirectories(join(workerRoot, "postgres", "staged-migrations"))) {
     directories.push(`postgres/staged-migrations/${role}`);
+  }
+  const oracleRoot = `${ORACLE_VENDOR_RELATIVE}/apps/worker`;
+  for (const name of await subdirectories(join(workerRoot, oracleRoot))) {
+    if (name === "migrations" || name.endsWith("-migrations")) directories.push(`${oracleRoot}/${name}`);
   }
   const standinRoot = "ops/staging-edge/catchup-standin";
   if ((await subdirectories(join(workerRoot, standinRoot))).includes("migrations")) {

@@ -1,5 +1,6 @@
 import { applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29 } from "@app-usagemonitor/telemetry-contract";
 import {
   activateTelemetryRuntimeAsOwner,
   canonicalTelemetryRuntimeDeploymentAttestationJson,
@@ -204,6 +205,20 @@ describe("protected telemetry runtime activation", () => {
       request("performance"), NOW_EPOCH);
     expect(performance).toMatchObject({ target: "performance", state: "active", fromRevision: 2, toRevision: 3 });
     expect(await runtimeRow("performance")).toEqual({ state: "active", policy_revision: 3 });
+  });
+
+  it("activates performance under the legacy 2026-09-29.1 tuple, not the contract's moving default", async () => {
+    // The legacy Worker's D1 runtime row admits only 2026-09-29.1 (ingestion
+    // isolation 0013, which re-seeds the staged row at revision 2), so
+    // activation names that pinned tuple through a private literal, whatever
+    // dictionary the contract emits by default.
+    await expect(activateTelemetryRuntimeAsOwner(db(), settings, ACTOR_IDENTITY_KEY,
+      request("performance"), NOW_EPOCH)).resolves.toMatchObject({
+      target: "performance", state: "active", fromRevision: 2, toRevision: 3,
+    });
+    expect(await db().prepare(
+      "SELECT state, field_dictionary_version FROM telemetry_performance_runtime WHERE id = 1",
+    ).first()).toEqual({ state: "active", field_dictionary_version: PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29 });
   });
 
   it("refuses a wrong revision and only replays an exact active operation", async () => {

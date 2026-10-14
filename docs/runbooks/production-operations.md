@@ -371,6 +371,67 @@ Start without credentials or mutations:
 Do not log credentials, cookies, Access assertions, raw participant identifiers,
 private payloads, or session content in an incident note.
 
+### Model performance intake (Google Cloud origin)
+
+The Google Cloud origin serves owner-only
+`GET /api/v1/admin/performance-intake` on the admin host
+(`admin-performance-intake-v0.1`, no query parameters), behind Cloudflare
+Access and the origin's owner check. It is the read-only view of the
+accountless model-performance intake and its community publication
+([community model speed](../decisions/2026-10-10-community-model-speed.md#admin-view-and-probes)).
+It returns counts, UTC days, instants and closed codes, never a contributor,
+device, enrollment or report identifier. Any source failure answers
+`503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` with no detail. A Cloudflare D1
+Worker built from the GCP or edge-port line answers the same route with that
+503 on the admin host and with `404` on the apex, because it holds no
+performance intake. The Worker live before the edge deploy (source
+`24411d5c3`) has no such route and answers `404 NOT_FOUND` on both hosts.
+
+The view covers the runtime state and policy revision, grant and capability
+heads by dictionary and basis, reports by evidence day and arrival day, the
+field dictionary and bucket-scheme mix, cohorts by model and speed mode,
+refusal counters by day, route and code, the twelve publication slots, the
+last publication run (published and unchanged slots, `withheld`,
+`deferredEmpty`), and what lies outside its 400-day window, counted rather
+than cut off. Read it as written:
+
+- Active grants count grant rows (the newest per enrollment), not devices able
+  to report. A grant behind a revoked enrollment still counts.
+- Arrival and refusal figures sum whole UTC-day rows that overlap the rolling
+  window, so the 24-hour figures are upper bounds covering up to about 48
+  hours.
+- While the runtime is staged, every capability poll is refused 403, so the
+  refusal counters grow until activation.
+- `deployment.sourceCommit` is the origin's `DEPLOYMENT_SOURCE_COMMIT`, or
+  null when unset. `deployment.historySha256` is the digest of the image's own
+  migration manifest, not a read of the live database. Compare it with the
+  migrate receipt before relying on it.
+- The view runs under one 10-second read-only snapshot and reads its heads and
+  totals as full scans of narrow tables. It has not been load-tested at
+  production scale.
+
+**The admin console section ships with the edge.** The browser **Model
+performance intake** section is part of the admin bundle that the edge Worker
+serves, so it reaches `admin.tibotattle.com` only through a typed edge deploy
+from the edge-port line
+([production edge modes](./production-edge-modes.md#community-model-speed-routes-2026-10-10)).
+This line's admin bundle does not contain it. The edge section's projection
+fails closed: a malformed or contradictory body reads as unavailable without
+affecting the rest of the page, and its row caps (4,096 refusal rows and 2,048
+model rows) would turn a very large history into that unavailable state.
+
+**Activation is not on this page.** The section and the route have no
+activation control. Activation is the owner-only `run_maintenance` task
+`telemetryRuntimeActivation` with target `performance`, a production write
+that needs explicit authorization. Its exact body, preconditions and replay
+rules are in
+[the activation runbook](./2026-09-22-telemetry-runtime-activation.md#google-cloud-origin-performance-activation).
+Before running it, compare the view's source commit and migration-history
+digest with the rollout receipts. A started performance activation with no
+result while the runtime stays staged is the reconcile-required state: a retry
+with that idempotency key answers
+`TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED`, so use a new key.
+
 ## Local validation before an owner deploy
 
 From the repository root, with the pinned root and Worker dependencies already

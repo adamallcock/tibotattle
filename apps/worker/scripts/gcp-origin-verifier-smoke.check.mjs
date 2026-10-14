@@ -145,8 +145,10 @@ function syntheticOrigin({
   frontEnd,
 } = {}) {
   const env = Object.freeze({ PUBLIC_ORIGIN, PUBLIC_ANALYTICS_MODE: "enabled", ENROLLMENT_MODE: "open" });
-  const families = new Map(registryModule.POSTGRES_SCOPE_ROUTE_IDS.map((id) => [id, async () =>
-    Response.json({ served: id })]));
+  // The smallest ported set: scope and the restored performance intake
+  // (owner decision 2026-10-10); the smoke reads neither performance route.
+  const ported = [...registryModule.POSTGRES_SCOPE_ROUTE_IDS, ...registryModule.PERFORMANCE_ROUTE_IDS];
+  const families = new Map(ported.map((id) => [id, async () => Response.json({ served: id })]));
   families.set("health", async () => errors.jsonResponse(healthBody ?? health.buildPostgresHealthBody({
     env,
     enrollmentMode: "open",
@@ -159,10 +161,8 @@ function syntheticOrigin({
     const result = readiness.buildPostgresReadinessBody(readinessState, NOW, { semantics: "worker-exact" });
     return errors.jsonResponse(result.body, result.httpStatus);
   });
-  // Round 19: the retired-definite route takes its preamble; the smoke never reads it.
-  for (const id of registryModule.RETIRED_DEFINITE_ROUTE_IDS) families.set(id, async () => null);
   const registry = registryModule.createProductionRouteRegistry({
-    routePolicy: policy, handlers: families, portedRouteIds: registryModule.POSTGRES_SCOPE_ROUTE_IDS,
+    routePolicy: policy, handlers: families, portedRouteIds: ported,
   });
   const handler = dispatch.createProductionRequestHandler({
     registry,

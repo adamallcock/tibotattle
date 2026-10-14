@@ -1015,3 +1015,157 @@ test("PostgreSQL v1.2 reconciles imported staged replays for the strict desktop 
     await vite?.close();
   }
 });
+
+// FIX-FUTURE-V12 (owner decision 2026-10-12): a v1.2 day manifest or chunk
+// whose UTC day is later than the server's UTC day plus one is the paced,
+// content-free 429; past days stay unbounded, tomorrow passes, and nothing is
+// written for a refused day, including the replay of a manifest stored
+// before the bound.
+test("PostgreSQL v1.2 refuses a day after the server's UTC day plus one, paced until admissible", {
+  skip: !PG_TEST_HOST && !PG_TEST_SOCKET,
+  timeout: 60_000,
+}, async () => {
+  const endpoint = await localEndpoint();
+  const pool = new pg.Pool({ ...endpoint, user: PG_TEST_USER, database: PG_TEST_DATABASE,
+    password: PG_TEST_PASSWORD ?? "synthetic-local-only", ssl: false, max: 4, connectionTimeoutMillis: 3_000 });
+  const schema = `v12_future_day_${randomBytes(6).toString("hex")}`;
+  let created = false;
+  let vite;
+  try {
+    const server = await pool.query("SELECT current_setting('server_version_num')::integer AS version");
+    assert.equal(Math.floor(server.rows[0].version / 10_000), 17);
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    created = true;
+    await applyPostgresMigrations({ role: "primary", schema, pool });
+    vite = await createServer({ root: WORKER_ROOT, configFile: false,
+      server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom", logLevel: "silent" });
+    const bound = await vite.ssrLoadModule("/src/telemetry-v12-day-bound.ts");
+    const modules = {
+      ...await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
+      ...await vite.ssrLoadModule("/src/postgres-typed-v12-transport.ts"),
+      ...await vite.ssrLoadModule("/src/crypto.ts"),
+      ...await vite.ssrLoadModule("/src/constants.ts"),
+    };
+    // The server clock: 2026-10-12 18:00 UTC. Tomorrow is the latest admissible day.
+    const nowEpoch = Date.parse("2026-10-12T18:00:00.000Z");
+    assert.equal(bound.TELEMETRY_V12_FUTURE_DAY_TOLERANCE_DAYS, 1);
+    assert.equal(bound.telemetryV12LatestAdmissibleDay(nowEpoch), "2026-10-13");
+    assert.equal(bound.telemetryV12LatestAdmissibleDay(Date.parse("2026-10-12T23:59:59.999Z")), "2026-10-13");
+    assert.equal(bound.telemetryV12LatestAdmissibleDay(Date.parse("2026-10-13T00:00:00.000Z")), "2026-10-14");
+    for (const day of ["2020-01-01", "2026-10-11", "2026-10-12", "2026-10-13"]) {
+      assert.equal(bound.telemetryV12FutureDayRetryAfterSeconds(day, nowEpoch), null, day);
+    }
+    // 2026-10-14 is admissible from 2026-10-13T00:00Z: six hours away.
+    assert.equal(bound.telemetryV12FutureDayRetryAfterSeconds("2026-10-14", nowEpoch), 6 * 3_600);
+    assert.equal(bound.telemetryV12FutureDayRetryAfterSeconds("2026-10-14", Date.parse("2026-10-12T23:59:59.500Z")), 1);
+    assert.equal(bound.telemetryV12FutureDayRetryAfterSeconds("2026-10-16", nowEpoch), 6 * 3_600 + 2 * 86_400);
+    assert.equal(bound.telemetryV12FutureDayRetryAfterSeconds("2030-01-01", nowEpoch),
+      bound.TELEMETRY_V12_FUTURE_DAY_MAX_RETRY_AFTER_SECONDS, "capped at the released client's seven days");
+    assert.equal(bound.TELEMETRY_V12_FUTURE_DAY_MAX_RETRY_AFTER_SECONDS, 7 * 86_400);
+    assert.throws(() => bound.telemetryV12FutureDayRetryAfterSeconds("2026-02-30", nowEpoch), TypeError);
+    assert.throws(() => bound.telemetryV12FutureDayRetryAfterSeconds("2026-10-14", Number.NaN), TypeError);
+
+    // The admission clock: 18:00 UTC on the real current day, so expiries the
+    // database compares with its own clock stay valid. D(n) is n days later.
+    const today = new Date().toISOString().slice(0, 10);
+    const serverNow = Date.parse(`${today}T18:00:00.000Z`);
+    const D = (offset) => new Date(Date.parse(`${today}T00:00:00.000Z`) + offset * 86_400_000).toISOString().slice(0, 10);
+    await seedDevice({ pool, schema, nowEpoch: serverNow, modules }); // Activate both runtime mirrors.
+    const owner = await seedAccountlessDevice({ pool, schema, nowEpoch: serverNow, modules });
+    const options = { schema: { primarySchema: schema } };
+    const digest = (value) => createHash("sha256").update(value).digest("hex");
+    const consent = telemetryV12RequiredConsent();
+    function usageDay(day, parserVersion = "synthetic-future-day") {
+      const records = [usageRecord(`event:v2:${digest(`future-day:${parserVersion}:${day}`)}`, `${day}T12:05:00.000Z`)];
+      const chunkDigest = digest(canonicalTelemetryV12Json(records));
+      const manifest = { schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion, consent,
+        chunks: [{ chunkId: `usage:${day}:0`, chunkDigest, recordCount: 1 }],
+        excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64) };
+      manifest.manifestDigest = digest(telemetryV12DayManifestDigestInput(manifest));
+      return { manifest, chunk: { schemaVersion: "telemetry-contribution-v1.2", manifestDigest: manifest.manifestDigest,
+        chunkId: `usage:${day}:0`, chunkRevision: 1, chunkDigest, parserVersion, consent, records } };
+    }
+    const counts = async () => (await pool.query(`SELECT
+      (SELECT count(*)::int FROM ${q(schema, "telemetry_v12_day_manifests")}) AS manifests,
+      (SELECT count(*)::int FROM ${q(schema, "telemetry_v12_chunks")}) AS chunks,
+      (SELECT count(*)::int FROM ${q(schema, "telemetry_v12_typed_records")}) AS records`)).rows[0];
+    const refused = async (promise, retryAfter) => {
+      await assert.rejects(promise, (error) => {
+        assert.equal(error.status, 429);
+        assert.equal(error.code, "TELEMETRY_DAY_NOT_YET_ADMISSIBLE");
+        assert.deepEqual(Object.fromEntries(new Headers(error.responseHeaders)), { "retry-after": String(retryAfter) });
+        assert.equal(error.publicDetails, null, "the refusal carries no detail");
+        return true;
+      });
+    };
+
+    // Past days, today and tomorrow are admitted; a year-old backfill too.
+    for (const day of [D(-365), D(-1), D(0), D(1)]) {
+      const candidate = await modules.registerPostgresTypedV12DayManifest(pool, owner.principal,
+        usageDay(day).manifest, serverNow, options);
+      assert.equal(candidate.day, day);
+    }
+    const admitted = await counts();
+    assert.deepEqual(admitted, { manifests: 4, chunks: 0, records: 0 });
+
+    // The day after tomorrow, and a far-future day: refused before any row.
+    await refused(modules.registerPostgresTypedV12DayManifest(pool, owner.principal,
+      usageDay(D(2)).manifest, serverNow, options), 6 * 3_600);
+    await refused(modules.registerPostgresTypedV12DayManifest(pool, owner.principal,
+      usageDay(D(1000)).manifest, serverNow, options), 7 * 86_400);
+    assert.deepEqual(await counts(), admitted);
+
+    // A device without write authority keeps its own answer, not the pacing one.
+    await assert.rejects(modules.registerPostgresTypedV12DayManifest(pool,
+      { participantId: owner.principal.participantId, deviceId: randomUUID() }, usageDay(D(2)).manifest,
+      serverNow, options), { code: "DEVICE_AUTH_INVALID" });
+
+    // A manifest stored before the bound (here: written directly) is refused on
+    // replay, and so is its chunk, with no chunk, record or grant consumed.
+    const early = usageDay(D(3));
+    const earlyId = randomUUID();
+    await pool.query(`INSERT INTO ${q(schema, "telemetry_v12_day_manifests")} (
+        id, participant_id, device_id, chunk_day, manifest_digest, parser_version,
+        manifest_json, expected_chunk_count, state, created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,'staged',$8)`,
+    [earlyId, owner.principal.participantId, owner.principal.deviceId, early.manifest.day,
+      early.manifest.manifestDigest, early.manifest.parserVersion, canonicalTelemetryV12Json(early.manifest),
+      new Date(serverNow).toISOString()]);
+    await refused(modules.registerPostgresTypedV12DayManifest(pool, owner.principal, early.manifest, serverNow, options),
+      6 * 3_600 + 86_400);
+    const grant = await seedUploadGrant({ pool, schema, device: owner, nowEpoch: serverNow, modules });
+    const claim = await modules.claimPostgresDeviceUploadAuthorization(pool, grant.authorization, {
+      envelopeDigest: grant.envelopeDigest, bodyBytes: grant.bodyBytes, contentType: "application/json",
+    }, { ...options, nowEpoch: serverNow, accountlessAuthorizationVersion: "v1.2" });
+    const metadata = { chunkRowId: `chunk:${randomUUID()}`, r2Key: `synthetic/future-${randomUUID()}`,
+      envelopeDigest: grant.envelopeDigest, deviceUploadAuthorizationId: claim.authorizationId };
+    await refused(modules.persistPostgresTypedV12StagedChunk(pool, owner.principal, early.chunk, metadata, serverNow,
+      options), 6 * 3_600 + 86_400);
+    assert.deepEqual(await counts(), { manifests: 5, chunks: 0, records: 0 });
+    const state = (await pool.query(`SELECT state FROM ${q(schema, "device_upload_authorizations")} WHERE id=$1`,
+      [claim.authorizationId])).rows[0].state;
+    assert.equal(state, "consuming", "the refused chunk consumed no grant");
+
+    // Two days later on the server clock the same manifest and chunk are admitted.
+    const later = Date.parse(`${D(2)}T00:00:01.000Z`);
+    const candidate = await modules.registerPostgresTypedV12DayManifest(pool, owner.principal, early.manifest, later,
+      options);
+    assert.equal(candidate.manifestId, earlyId);
+    const laterGrant = await seedUploadGrant({ pool, schema, device: owner, nowEpoch: later, modules });
+    const laterClaim = await modules.claimPostgresDeviceUploadAuthorization(pool, laterGrant.authorization, {
+      envelopeDigest: laterGrant.envelopeDigest, bodyBytes: laterGrant.bodyBytes, contentType: "application/json",
+    }, { ...options, nowEpoch: later, accountlessAuthorizationVersion: "v1.2" });
+    const laterMetadata = { chunkRowId: `chunk:${randomUUID()}`, r2Key: `synthetic/future-${randomUUID()}`,
+      envelopeDigest: laterGrant.envelopeDigest, deviceUploadAuthorizationId: laterClaim.authorizationId };
+    await pool.query(`INSERT INTO ${q(schema, "pending_objects")} (contribution_id, object_key, object_kind)
+      VALUES ($1,$2,'telemetry_v12')`, [laterMetadata.chunkRowId, laterMetadata.r2Key]);
+    const staged = await modules.persistPostgresTypedV12StagedChunk(pool, owner.principal, early.chunk, laterMetadata,
+      later, options);
+    assert.equal(staged.replay, false);
+    assert.deepEqual(await counts(), { manifests: 5, chunks: 1, records: 1 });
+  } finally {
+    if (created) await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+    await pool.end();
+    await vite?.close();
+  }
+});

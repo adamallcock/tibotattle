@@ -9,7 +9,10 @@ status: implemented-candidate-not-live-qualified
 
 The candidate implements a separate saved-cohort repricing lane. It has not
 been deployed or qualified against production. This runbook describes the
-source contract, not permission to migrate, deploy or execute a production Job.
+source contract and its production carrier (the reprice Cloud Run Job and the
+typed operator verb, OPS-REPRICE), not permission to migrate, deploy, apply
+infrastructure or execute a production Job. Each of those is an owner-only
+protected step.
 The operator retains the exact source commit, image digest, registered kernel,
 manifest version, target configuration, plan receipt and operation identity
 before any separately authorized execution.
@@ -90,8 +93,9 @@ owner-link and exclusion sources before its first snapshot read, then acquires
 the shared refresh transaction lock. Busy or changed input refuses execution.
 These are per-statement limits, not a promised whole-process deadline. The CLI
 uses a pool of at most two connections and closes pools/connector on either
-success or failure; the root-owned execution carrier sets its task/process
-budget and independently checks overlapping operations.
+success or failure. The execution carrier (see [Production carrier](#production-carrier))
+sets the task budget (one task, 3,600 s, no retries) and refuses to start while
+a refresh, reprice or migration execution is running.
 
 ## Saved membership and exact inputs
 
@@ -145,7 +149,8 @@ different binding or a changed unexecuted plan refuses. The CLI does not retry.
 
 If commit acknowledgement, receipt emission or cleanup is uncertain, retain
 the original exclusive operation record and UUID. Reconcile that same operation
-through the root-owned bounded readback; do not mint a new UUID or substitute a
+by rerunning execute with the same run id and plan receipt (see
+[Production carrier](#production-carrier)); do not mint a new UUID or substitute a
 fresh plan to conceal uncertainty. A completed ledger row permits same-operation
 replay; a closed CLI failure alone does not prove rollback. There is no separate
 `--mode=verify` or status flag.
@@ -180,5 +185,135 @@ Local source checks are
 `npx vitest run --config vitest.analytics-v2.config.mjs analytics-v2-test/reprice.spec.ts`.
 They use synthetic inputs. They do not qualify migration application, provider
 execution or the public production response. Production operations follow the
-[service operations boundary](./production-operations.md) and the reviewed
-root-owned migration/deployment carrier.
+[service operations boundary](./production-operations.md), the
+[GCP origin rollout](./gcp-rollout.md) (the reprice is step 10, after a roll
+that changes the analytics kernel) and the production carrier below.
+
+## Production carrier
+
+Status: `built`, offline only. The Job and the verb are tested with synthetic
+data and a stubbed `gcloud`. No infrastructure apply, Job execution or log read
+has happened in any project. The first live run is a staging run that the owner
+authorizes.
+
+**The Job.** `jobs.analytics-reprice` in both committed desired states
+(`tibotattle-analytics-reprice` in production, `tibotattle-staging-analytics-reprice`
+in staging). Its contract, `ANALYTICS_REPRICE_JOB_CONTRACT` in
+[`gcp-ops-infra-manifest.mjs`](../../apps/worker/scripts/gcp-ops-infra-manifest.mjs),
+is described in the
+[infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice):
+
+- It runs as the runtime account and the runtime IAM database user, with the
+  refresh Job's closed environment.
+- It has no secret, one task, no retries, no trigger and no scheduler grant.
+- Its own arguments name only the entry, so an execution without explicit
+  arguments fails closed before any connection.
+
+The roll moves it with the other Jobs, so it always runs the rolled kernel.
+It is created by an owner-applied OPS-2 plan. On an estate that already exists,
+that plan needs a bootstrap image (`--bootstrap-image-digest` and
+`--bootstrap-source-commit`) whose image contains this CLI and whose database
+holds migration 0077.
+
+**The verb.** `npm run gcp:analytics:reprice --` from `apps/worker`, which runs
+[`gcp-analytics-reprice.mjs`](../../apps/worker/scripts/gcp-analytics-reprice.mjs).
+Every invocation takes these flags:
+
+- `--environment=<production|staging>` and `--mode=<plan|execute>`;
+- `--commit=<deployed commit>`;
+- `--expected-kernel=<id>`, which must be registered in the checkout's
+  `kernel-registry.json`;
+- the inclusive day range and all three bounds, as above;
+- `--receipt-out=<new absolute path>`.
+
+Execute also takes `--plan-receipt`, `--expected-plan-sha256` and `--run-id`.
+Without `--execute`, the verb makes no call. It validates everything offline
+(the committed desired state, the registry, the plan receipt and the CLI's own
+argument parser) and prints the exact `gcloud` argv. `--execute` requires the
+authorization `reprice-plan:<env>:<commit>` or
+`reprice-execute:<env>:<planSha256>`. A supplied authorization must match in a
+dry run too.
+
+With `--execute`, the verb holds the environment's deployment coordination lock
+(the OPS-10 ref) and does the following in order:
+
+1. It reads the Job back. The Job must have exactly one container, whose image
+   comes from the plane's repository at a sha256 digest, whose
+   `DEPLOYMENT_SOURCE_COMMIT` is `--commit`, and whose own arguments are the
+   entry alone.
+2. It refuses if any execution of the reprice, refresh or migration Job has no
+   terminal evidence.
+3. It runs `gcloud run jobs execute --async --args=<entry and the CLI's
+   explicit arguments>` once, then polls the execution until it completes,
+   for at most the task timeout plus five minutes.
+4. It reads exactly one `analytics-reprice-receipt-v1` line for that execution
+   from Cloud Logging. While no line has been ingested, it retries a bounded
+   number of times.
+5. It validates the receipt with the CLI's own `validateAnalyticsRepriceResult`.
+   The receipt must name the requested mode, this environment, the wall clock,
+   the expected kernel and that kernel's registered price-registry digest.
+   Execute must also carry the reviewed plan hash.
+6. It writes a digest-sealed `tibotattle-gcp-analytics-reprice-v1` receipt,
+   owner-only, to `--receipt-out`.
+
+The verb prints only counts, cap flags, the refusal histogram, `replayed`,
+names, digests and closed codes.
+
+Execute requires the verb's own plan receipt, and that receipt must match the
+execution in every one of these ways:
+
+- the same environment, Job, commit and expected kernel;
+- the same bounds;
+- `planSha256` equal to `--expected-plan-sha256`;
+- uncapped and non-empty;
+- at most 24 hours old.
+
+The live Job's image must also still be the image the plan ran on. A roll
+between the plan and the execution makes the plan stale.
+
+**Procedure (owner-only for every `--execute`).**
+
+1. Plan over a day window. If a cap flag is set (`executable: false`), the
+   window exceeds one run's heads, members or input bytes. Narrow the window
+   and plan again. Never raise a bound beyond the CLI's hard maximum.
+2. Review the plan receipt's counts and `planSha256`. Choose a fresh run UUID
+   and record it with the receipt before executing.
+3. Execute with that plan receipt, its hash and the run UUID. A later plan of
+   the same window no longer lists the changed days. Days that were equivalent
+   or refused can still appear: an execution reports them as `unchanged` or
+   `refused` and publishes nothing new for them.
+4. Repeat for the next window until every published day since the previous
+   kernel has been planned.
+
+If the execute step's outcome is uncertain (`REPRICE_EXECUTION_TIMEOUT`,
+`REPRICE_RECEIPT_UNAVAILABLE`, or a lost terminal), rerun execute with the same
+`--run-id`, the same plan receipt and a new `--receipt-out`. Do this within the
+plan receipt's 24 hours. A committed run returns its stored result with
+`replayed: true`, and an uncommitted one runs once. Never mint a new run id to
+hide that uncertainty.
+
+### Refusals
+
+The verb's own refusals are closed `REPRICE_*` codes. A refused Job prints
+`REPRICE_JOB_REFUSED` with the CLI's closed `jobCode` and `jobPhase`, and its
+failure receipt is still written.
+
+| Code | Meaning | Action |
+|---|---|---|
+| `REPRICE_AUTHORIZATION_REQUIRED`, `REPRICE_AUTHORIZATION_MISMATCH` | `--execute` without authorization, or a token for another mode, plane, commit or plan | Obtain the owner's authorization for exactly this step |
+| `REPRICE_KERNEL_UNREGISTERED`, `REPRICE_KERNEL_UNEXPECTED` | The expected kernel is not in this checkout's registry, or the Job's receipt names another kernel or manifest version | Stop. The checkout or the rolled image is not the kernel you meant. Never substitute the receipt's kernel |
+| `REPRICE_JOB_COMMIT_MISMATCH`, `REPRICE_JOB_IMAGE_UNRECOGNIZED`, `REPRICE_JOB_UNRECOGNIZED` | The live Job is not the reviewed render at `--commit` | Nothing ran. Read back the estate (`gcp-infra.mjs readback --require-clean`) and finish the roll |
+| `REPRICE_OVERLAP_REFUSED` | A refresh, reprice or migration execution is running | Nothing ran. Wait for it. Never cancel a refresh to make room |
+| `REPRICE_PLAN_RECEIPT_REQUIRED`, `REPRICE_PLAN_RECEIPT_MISMATCH`, `REPRICE_PLAN_BOUNDS_MISMATCH`, `REPRICE_PLAN_DIGEST_MISMATCH`, `REPRICE_PLAN_CAPPED`, `REPRICE_PLAN_EMPTY`, `REPRICE_PLAN_RECEIPT_STALE`, `REPRICE_PLAN_IMAGE_MISMATCH`, `REPRICE_RECEIPT_FILE_INVALID` | Execution without a matching, sealed, fresh, uncapped and non-empty plan on the same image | Nothing ran. Plan again |
+| `REPRICE_RECEIPT_UNAVAILABLE`, `REPRICE_RECEIPT_AMBIGUOUS`, `REPRICE_RECEIPT_INVALID`, `REPRICE_EXECUTION_TIMEOUT`, `REPRICE_EXECUTION_OUTCOME_UNKNOWN` | The execution ran but its outcome is unproven | For execute, reconcile with the same run id as above. For plan, plan again |
+| `REPRICE_JOB_REFUSED` with `jobCode` `ANALYTICS_V2_REPRICE_PLAN_CHANGED` | The plan changed before execution | Plan again |
+| `REPRICE_JOB_REFUSED` with `jobCode` `ANALYTICS_V2_REPRICE_SCHEMA_UNAVAILABLE` | Migration 0077 is not applied | Stop. Migration is a separate owner step |
+| `REPRICE_JOB_REFUSED`, other `jobCode` | One of the CLI's closed refusals | Read this runbook's sections above for that code |
+| `PRODUCTION_COORDINATION_*`, `STAGING_COORDINATION_*` | The deployment lock is held | Stop, as for OPS-10 ([GCP origin rollout](./gcp-rollout.md#when-something-fails)) |
+
+The offline checks are `node --test apps/worker/scripts/gcp-analytics-reprice.check.mjs`
+(the verb, against a stubbed `gcloud`) and `npm run gcp:ops:infra:check` from
+`apps/worker` (the desired state, the render and the plan). The least-privilege
+claim is proven locally by the PostgreSQL test "the runtime grant policy alone
+plans, executes and replays" in `postgres-test/analytics-v2-reprice.spec.mjs`.
+None of these qualifies a live apply, execution or log format.

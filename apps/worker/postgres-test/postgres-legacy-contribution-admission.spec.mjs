@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
@@ -10,6 +10,17 @@ import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
+import {
+  MANIFEST_FILE as ORACLE_MANIFEST_FILE,
+  MANIFEST_SCHEMA as ORACLE_MANIFEST_SCHEMA,
+  ORACLE_COMMIT,
+  ORACLE_D1_DIRECTORIES,
+  ORACLE_ENTRY_POINTS,
+  ORACLE_EXTERNAL_PACKAGES,
+  ORACLE_LIVE_SEAMS,
+  ORACLE_PACKAGE_ENTRIES,
+  ORACLE_VENDOR_RELATIVE,
+} from "../scripts/vendor-legacy-contribution-oracle.mjs";
 import * as contributionEnvelopeSeam from "../cloud-run/contribution-envelope-registry.mjs";
 import {
   createContributionEnvelopeRegistry,
@@ -47,12 +58,22 @@ import { createUploadAuthorizationRouteModule } from "../cloud-run/routes/upload
  * (src/typed-v1-admission.ts insertTypedTelemetryV1Chunk with
  * telemetry-v1-repository.ts) and transport policy, running unmodified on an
  * in-memory node:sqlite database built from the D1 migration directories the
- * live ingestion D1 applies. fixtures/legacy-contribution-oracle-blobs.json
- * pins every oracle file to its d43c8f92 git blob, so a drift in the GCP
- * line fails here instead of silently changing the oracle. The same holds
- * for telemetry-envelope-v0.1 (handleTelemetryContribution with
+ * live ingestion D1 applied. It runs from vendored copies
+ * (fixtures/legacy-contribution-oracle-d43c8f92, written from git by
+ * scripts/vendor-legacy-contribution-oracle.mjs) in a Vite module graph of
+ * its own, so later changes to the GCP line's src/, D1 directories or
+ * workspace packages never change, or break, the oracle. One module is the
+ * line's own: the server pricer (src/server-pricing.ts and the accounting
+ * package), because server repricing is current pricing policy, which the
+ * PostgreSQL admission shares with every other path, not a legacy rule. The
+ * oracle therefore proves "d43c8f92's rows for the same prices".
+ * fixtures/legacy-contribution-oracle-blobs.json, reviewed independently,
+ * pins the oracle files to their d43c8f92 git blobs, and the first test
+ * refuses any vendored byte that differs from them. The same holds for
+ * telemetry-envelope-v0.1 (handleTelemetryContribution with
  * insertTelemetryContribution and its server repricing), which d43c8f92 has
- * not retired.
+ * not retired. The last test proves the oracle graph loaded nothing from the
+ * live tree but the pricer.
  *
  * Every upload is authorized through the IN-3 upload-authorization route
  * module (shipped v1.0 clients send three body keys) and runs through the
@@ -74,11 +95,9 @@ const PG_TEST_PASSWORD = process.env.PG_TEST_PASSWORD || "synthetic-local-only";
 const PG_TEST_DATABASE = process.env.PG_TEST_DATABASE || "postgres";
 const SKIP = !PG_TEST_HOST && !PG_TEST_SOCKET;
 const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const D1_DIRECTORIES = Object.freeze([
-  "migrations", "typed-ingestion-migrations", "ingestion-bridge-migrations",
-  "typed-v11-admission-migrations", "typed-v1-admission-migrations",
-  "ingestion-isolation-migrations",
-]);
+/** The vendored d43c8f92 tree, laid out by repository path. */
+const ORACLE_ROOT = join(WORKER_ROOT, ORACLE_VENDOR_RELATIVE);
+const ORACLE_WORKER_ROOT = join(ORACLE_ROOT, "apps", "worker");
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const PARTICIPANT_CONSENT = "privacy-safe-telemetry-v0.1";
 const PAIRING_CONSENT = "ongoing-privacy-safe-telemetry-v1.0";
@@ -93,19 +112,20 @@ const V1_CONSENT = Object.freeze({
 });
 
 /*
- * Every file whose behaviour the oracle reproduces, relative to apps/worker:
- * the Worker sources and D1 migrations the oracle loads, and the
- * @app-usagemonitor package copies vite resolves for them (server repricing
- * and the telemetry contract). The fixture pins each to its git blob id at
- * d43c8f92, so equal ids mean the oracle runs production's exact code.
+ * Every file whose behaviour the oracle reproduces, as repository paths: the
+ * Worker sources and D1 migrations the oracle loads, and the telemetry
+ * contract it resolves. The reviewed fixture pins each to its git blob id at
+ * d43c8f92, and the vendored copy must hash to that id, so equal ids mean the
+ * oracle runs production's exact code. (The vendored closure holds every
+ * module these import; MANIFEST.json lists them.)
  */
 const ORACLE_REQUIRED = Object.freeze([
   "src/typed-v1-admission.ts", "src/telemetry-v1-repository.ts", "src/typed-telemetry-repository.ts",
   "src/telemetry-v1.ts", "src/telemetry-transport-policy.ts", "src/telemetry-repository.ts",
-  "src/telemetry-validation.ts", "src/server-pricing.ts", "src/device-auth.ts", "src/telemetry-storage-mode.ts",
+  "src/telemetry-validation.ts", "src/device-auth.ts", "src/telemetry-storage-mode.ts",
   // The usage-correction capture a v1.0 correction runs while the runtime is
-  // active (typed-telemetry-compatibility.ts, its source reader, differs from
-  // d43c8f92 only by dropping an Error `cause` option, so it is not pinned).
+  // active (its source reader, typed-telemetry-compatibility.ts, is vendored
+  // with the closure and checked against MANIFEST.json, not separately pinned).
   "src/telemetry-usage-correction-repository.ts", "src/telemetry-usage-reconciliation.ts", "src/strict-json.ts",
   "migrations/0014_bounded_contribution_admission.sql",
   "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
@@ -113,21 +133,75 @@ const ORACLE_REQUIRED = Object.freeze([
   "ingestion-isolation-migrations/0004_v1_multidevice_source_update.sql",
   "ingestion-isolation-migrations/0006_usage_correction_facts.sql",
   "typed-ingestion-migrations/0001_typed_telemetry.sql", "typed-ingestion-migrations/0002_delivery_journal.sql",
-  "node_modules/@app-usagemonitor/accounting/src/price-registry.js",
-  "node_modules/@app-usagemonitor/telemetry-contract/index.js",
-]);
+].map((path) => `apps/worker/${path}`).concat(["packages/telemetry-contract/index.js"]));
 
-let vite;
-const modules = new Map();
-async function workerModule(path) {
-  vite ??= await createServer({
-    root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom", logLevel: "silent",
+/*
+ * The fixture also pins d43c8f92's pricer (server-pricing.ts and the
+ * accounting package modules), which the oracle no longer runs: the pricer
+ * seam resolves to the live pricer instead. Those pins stay as the reviewed
+ * record of what d43c8f92 priced with; they are the only pins with no
+ * vendored copy.
+ */
+const isPricerSeamPin = (production) => ORACLE_LIVE_SEAMS.includes(production)
+  || production.startsWith("packages/accounting/");
+
+function viteServer(root, options = {}) {
+  return createServer({
+    root, configFile: false, server: { middlewareMode: true }, appType: "custom", logLevel: "silent", ...options,
   });
+}
+
+/**
+ * Resolution inside the vendored tree: workspace packages to their vendored
+ * copies, and a relative import of a live seam (the pricer) to the live
+ * module. Anything a live module imports resolves normally, from the live tree.
+ */
+function oracleResolver() {
+  const packages = new Map(Object.entries(ORACLE_PACKAGE_ENTRIES)
+    .map(([specifier, entry]) => [specifier, join(ORACLE_ROOT, entry)]));
+  const seams = new Map(ORACLE_LIVE_SEAMS.map((seam) => [join(ORACLE_ROOT, seam),
+    join(WORKER_ROOT, seam.slice("apps/worker/".length))]));
+  return {
+    name: "legacy-oracle-resolver",
+    enforce: "pre",
+    resolveId(source, importer) {
+      if (typeof importer !== "string" || !importer.startsWith(`${ORACLE_ROOT}${sep}`)) return null;
+      if (packages.has(source)) return packages.get(source);
+      if (!/^\.\.?\//u.test(source)) return null;
+      const target = resolve(dirname(importer), source);
+      return seams.get(target) ?? seams.get(`${target}.ts`) ?? null;
+    },
+  };
+}
+
+/*
+ * Two module graphs. workerModule loads the GCP line's own code (the
+ * PostgreSQL origin, the route registry and client-side helpers); oracleModule
+ * loads the vendored d43c8f92 Worker, whose workspace packages resolve to the
+ * vendored package copies. They share no module, so an oracle never runs live
+ * code and a live change never reaches the oracle.
+ */
+let vite;
+let oracleVite;
+const modules = new Map();
+const oracleModules = new Map();
+async function workerModule(path) {
+  vite ??= await viteServer(WORKER_ROOT);
   if (!modules.has(path)) modules.set(path, await vite.ssrLoadModule(path));
   return modules.get(path);
 }
+async function oracleModule(path) {
+  // Workspace packages are never externalized here, so every one the oracle
+  // reaches (vendored, or live through the pricer) is a node of its graph.
+  oracleVite ??= await viteServer(ORACLE_WORKER_ROOT, {
+    plugins: [oracleResolver()], ssr: { noExternal: [/^@app-usagemonitor\//u] },
+  });
+  if (!oracleModules.has(path)) oracleModules.set(path, await oracleVite.ssrLoadModule(path));
+  return oracleModules.get(path);
+}
 after(async () => {
   if (vite) await vite.close();
+  if (oracleVite) await oracleVite.close();
 });
 
 function gitBlobId(content) {
@@ -139,10 +213,10 @@ let d1Sources;
 async function d1Oracle() {
   d1Sources ??= (async () => {
     const sources = [];
-    for (const directory of D1_DIRECTORIES) {
-      const names = (await readdir(join(WORKER_ROOT, directory)))
+    for (const directory of ORACLE_D1_DIRECTORIES) {
+      const names = (await readdir(join(ORACLE_WORKER_ROOT, directory)))
         .filter((name) => /^\d{4}_[a-z0-9_-]+\.sql$/u.test(name)).sort();
-      for (const name of names) sources.push(await readFile(join(WORKER_ROOT, directory, name), "utf8"));
+      for (const name of names) sources.push(await readFile(join(ORACLE_WORKER_ROOT, directory, name), "utf8"));
     }
     return sources;
   })();
@@ -365,8 +439,8 @@ async function socialDevice(twin, participantId, deviceId, { consent = true, sec
  * active, or null for an untransferred database) is that copied state.
  */
 async function initializeTypedTargets(twin, schema, { correctionRuntime = "staged" } = {}) {
-  const { initializeStorageSource } = await workerModule("/src/analytics-delivery.ts");
-  const { initializeTypedV1Admission } = await workerModule("/src/typed-v1-admission.ts");
+  const { initializeStorageSource } = await oracleModule("/src/analytics-delivery.ts");
+  const { initializeTypedV1Admission } = await oracleModule("/src/typed-v1-admission.ts");
   const { encodeTypedTelemetryId } = await workerModule("/src/typed-telemetry-codec.ts");
   const d1 = d1Database(twin.d1);
   await initializeStorageSource(d1, SOURCE_ID);
@@ -672,9 +746,9 @@ async function origin(pool, schemaOptions, objectStore) {
 
 /** The Worker's typed v1 admission for the same chunk, ids and clock, on D1. */
 async function oracleAdmission(twin, schema, chunkRowId, chunk, raw, supersedesId = null) {
-  const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
-  const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
-  const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
+  const { insertTypedTelemetryV1Chunk } = await oracleModule("/src/typed-v1-admission.ts");
+  const { parseTelemetryV1Chunk } = await oracleModule("/src/telemetry-v1.ts");
+  const { telemetryEnvelopeDigest } = await oracleModule("/src/telemetry-repository.ts");
   const row = (await twin.pgOnly(
     `SELECT c.*, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_iso,
             a.participant_id AS grant_participant
@@ -951,14 +1025,60 @@ async function snapshot(twin, schema, participantId) {
 
 // ---------------------------------------------------------------------------
 
-test("the oracle is production's code: every oracle source is byte-identical to its d43c8f92 blob", async () => {
+/** Every file under the vendored oracle tree, as a repository-relative POSIX path. */
+async function oracleTreeFiles(directory = ORACLE_ROOT, found = []) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    assert.ok(entry.isDirectory() || entry.isFile(), `${path} is a plain file or directory`);
+    if (entry.isDirectory()) await oracleTreeFiles(path, found);
+    else found.push(path.slice(ORACLE_ROOT.length + 1).split(sep).join("/"));
+  }
+  return found.sort();
+}
+
+async function installedVersion(name) {
+  return JSON.parse(await readFile(join(WORKER_ROOT, "node_modules", name, "package.json"), "utf8")).version;
+}
+
+test("the oracle is production's code: every vendored oracle source is byte-identical to its d43c8f92 blob", async () => {
   const pinned = JSON.parse(await readFile(join(WORKER_ROOT, "postgres-test", "fixtures",
     "legacy-contribution-oracle-blobs.json"), "utf8"));
+  const manifest = JSON.parse(await readFile(join(ORACLE_ROOT, ORACLE_MANIFEST_FILE), "utf8"));
   assert.equal(pinned.commit, "d43c8f92");
-  for (const path of ORACLE_REQUIRED) assert.ok(Object.hasOwn(pinned.sources, path), `${path} is pinned`);
-  for (const [path, { production, blob }] of Object.entries(pinned.sources)) {
-    assert.ok(production === `apps/worker/${path}` || production.startsWith("packages/"), path);
-    assert.equal(gitBlobId(await readFile(join(WORKER_ROOT, path))), blob, `${path} equals d43c8f92:${production}`);
+  assert.equal(manifest.schemaVersion, ORACLE_MANIFEST_SCHEMA);
+  assert.equal(manifest.sourceCommit, ORACLE_COMMIT);
+  assert.ok(ORACLE_COMMIT.startsWith(pinned.commit), "the vendored and pinned commits agree");
+  assert.deepEqual(manifest.entryPoints, ORACLE_ENTRY_POINTS);
+  assert.deepEqual(manifest.liveSeams, ORACLE_LIVE_SEAMS);
+  assert.deepEqual(manifest.d1Directories, ORACLE_D1_DIRECTORIES);
+  assert.deepEqual(manifest.packageEntries, ORACLE_PACKAGE_ENTRIES);
+  // The tree holds exactly the manifest's files, each equal to its d43c8f92 blob.
+  const vendored = new Map(manifest.files.map(({ path, blob }) => [path, blob]));
+  assert.equal(vendored.size, manifest.files.length, "no file is listed twice");
+  assert.deepEqual(await oracleTreeFiles(), [...vendored.keys(), ORACLE_MANIFEST_FILE].sort());
+  for (const [path, blob] of vendored) {
+    assert.equal(gitBlobId(await readFile(join(ORACLE_ROOT, path))), blob, `${path} equals d43c8f92:${path}`);
+  }
+  for (const entry of [...ORACLE_ENTRY_POINTS, ...Object.values(ORACLE_PACKAGE_ENTRIES)]) {
+    assert.ok(vendored.has(entry), `${entry} is vendored`);
+  }
+  for (const seam of ORACLE_LIVE_SEAMS) assert.equal(vendored.has(seam), false, `${seam} is the live seam`);
+  // The independently reviewed pins agree with every vendored copy they name;
+  // only the pricer seam's pins have no copy.
+  const pinnedByProduction = new Map(Object.values(pinned.sources).map(({ production, blob }) => [production, blob]));
+  for (const path of ORACLE_REQUIRED) assert.ok(pinnedByProduction.has(path), `${path} is pinned`);
+  for (const [production, blob] of pinnedByProduction) {
+    if (isPricerSeamPin(production)) {
+      assert.equal(vendored.has(production), false, `${production} belongs to the pricer seam`);
+      continue;
+    }
+    assert.equal(vendored.get(production), blob, `the vendored ${production} is the pinned d43c8f92 blob`);
+  }
+  for (const seam of ORACLE_LIVE_SEAMS) assert.ok(pinnedByProduction.has(seam), `${seam} keeps its d43c8f92 pin`);
+  // The npm module the vendored closure imports is installed at the commit's locked version.
+  assert.deepEqual(Object.keys(manifest.externals), [...ORACLE_EXTERNAL_PACKAGES]);
+  for (const [name, version] of Object.entries(manifest.externals)) {
+    assert.equal(await installedVersion(name), version, `${name} is installed at d43c8f92's locked version`);
   }
 });
 
@@ -1019,8 +1139,8 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
   skip: SKIP, timeout: 240_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
-  const worker = await workerModule("/src/telemetry-transport-policy.ts");
-  const { errorResponse, ApiError } = await workerModule("/src/errors.ts");
+  const worker = await oracleModule("/src/telemetry-transport-policy.ts");
+  const { errorResponse, ApiError } = await oracleModule("/src/errors.ts");
   const service = await origin(pool, schemaOptions, memoryObjectStore());
   const allFormats = createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
     assertTelemetryTransportWriteAllowed:
@@ -1720,9 +1840,9 @@ function v01Contribution(suffix = "a") {
 /** The Worker's insertTelemetryContribution for the same ids and clock, on D1. */
 async function oracleV01Admission(twin, schema, contributionId, raw) {
   const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
-    await workerModule("/src/telemetry-repository.ts");
-  const { validateTelemetryContribution, validateTelemetryEnvelope } = await workerModule("/src/telemetry-validation.ts");
-  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
+    await oracleModule("/src/telemetry-repository.ts");
+  const { validateTelemetryContribution, validateTelemetryEnvelope } = await oracleModule("/src/telemetry-validation.ts");
+  const { decryptSyntheticEnvelope } = await oracleModule("/src/crypto.ts");
   const keys = await envelopeKeys();
   const row = (await twin.pgOnly(
     `SELECT c.*, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_iso,
@@ -1879,7 +1999,7 @@ test("PG17 v0.1 keeps the Worker's weekly window, consent and transport refusals
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const store = memoryObjectStore();
   const service = await origin(pool, schemaOptions, store);
-  const repository = await workerModule("/src/telemetry-repository.ts");
+  const repository = await oracleModule("/src/telemetry-repository.ts");
   await socialParticipant(twin, "in3-v01-window");
   const device = await socialDevice(twin, "in3-v01-window", randomUUID(), { consent: false });
   const refused = async (principal, record) => {
@@ -1986,7 +2106,7 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
     }
     const windows = await pool.query(`SELECT window_started_at, accepted_count, last_accepted_at
       FROM "${schema}".telemetry_contribution_admission_windows ORDER BY window_started_at`);
-    const repository = await workerModule("/src/telemetry-repository.ts");
+    const repository = await oracleModule("/src/telemetry-repository.ts");
     const startOf = (value) => repository.telemetryContributionAdmissionWindow(Date.parse(value)).startsAt;
     assert.deepEqual(windows.rows.map((row) => ({
       start: row.window_started_at.toISOString(), count: row.accepted_count, last: row.last_accepted_at.toISOString(),
@@ -2022,7 +2142,7 @@ const duplicateIv = (raw) => raw.replace('"iv":', `"iv":"${"A".repeat(16)}","iv"
 
 /** The route's answer equals the Worker's errorResponse for the same code, request id aside. */
 async function assertWorkerRefusal(response, status, code, label = code) {
-  const { errorResponse, ApiError } = await workerModule("/src/errors.ts");
+  const { errorResponse, ApiError } = await oracleModule("/src/errors.ts");
   const body = await response.json();
   const expected = errorResponse(new ApiError(status, code), "request-synthetic");
   assert.equal(response.status, expected.status, label);
@@ -2037,10 +2157,10 @@ async function assertWorkerRefusal(response, status, code, label = code) {
  */
 async function d1Attempt(twin, { participantId, deviceId, chunk, raw, supersedesId = null,
   leaseExpiresAt = iso(5 * 60_000), direct = false }) {
-  const { persistTelemetryV1StorageChunk } = await workerModule("/src/telemetry-storage-mode.ts");
-  const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
-  const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
-  const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
+  const { persistTelemetryV1StorageChunk } = await oracleModule("/src/telemetry-storage-mode.ts");
+  const { insertTypedTelemetryV1Chunk } = await oracleModule("/src/typed-v1-admission.ts");
+  const { parseTelemetryV1Chunk } = await oracleModule("/src/telemetry-v1.ts");
+  const { telemetryEnvelopeDigest } = await oracleModule("/src/telemetry-repository.ts");
   const authorizationId = randomUUID();
   twin.d1Only(
     `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
@@ -2074,7 +2194,7 @@ test("PG17 the upload-authorization route module issues for shipped three-key bo
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const service = await origin(pool, schemaOptions, memoryObjectStore());
   const { WORKER_ROUTE_POLICY } = await workerModule("/src/route-registry.ts");
-  const worker = await workerModule("/src/telemetry-transport-policy.ts");
+  const worker = await oracleModule("/src/telemetry-transport-policy.ts");
 
   // It mounts on the IN-1 seam as the override of exactly this built-in.
   const mounted = createOriginRouteModuleRegistry({
@@ -2158,7 +2278,7 @@ test("PG17 an unrecordable upload receipt answers 500 INTERNAL_ERROR, as d43c8f9
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const service = await origin(pool, schemaOptions, memoryObjectStore());
   const transport = await workerModule("/src/postgres-typed-v12-transport.ts");
-  const { recordDeviceUploadReceipt } = await workerModule("/src/device-auth.ts");
+  const { recordDeviceUploadReceipt } = await oracleModule("/src/device-auth.ts");
   await socialParticipant(twin, "in3-receipt");
   const device = await socialDevice(twin, "in3-receipt", randomUUID());
   const d1 = d1Database(twin.d1);
@@ -2316,11 +2436,11 @@ test("PG17 refusals raised inside the persist transaction keep D1's codes: typed
   skip: SKIP, timeout: 300_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
-  const { TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY } = await workerModule("/src/telemetry-v1-repository.ts");
+  const { TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY } = await oracleModule("/src/telemetry-v1-repository.ts");
   const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
-    await workerModule("/src/telemetry-repository.ts");
-  const { validateTelemetryContribution } = await workerModule("/src/telemetry-validation.ts");
-  const { ApiError } = await workerModule("/src/errors.ts");
+    await oracleModule("/src/telemetry-repository.ts");
+  const { validateTelemetryContribution } = await oracleModule("/src/telemetry-validation.ts");
+  const { ApiError } = await oracleModule("/src/errors.ts");
   // The race window: between the pre-write checks and the persist, the object write runs this hook once.
   let hook = null;
   const store = memoryObjectStore({ beforePut: async () => {
@@ -2398,7 +2518,7 @@ test("PG17 refusals raised inside the persist transaction keep D1's codes: typed
   assert.deepEqual(await refusedUpload(() => service.uploadV01(leaseDevice, v01Contribution("c"))),
     { status: 500, code: "INTERNAL_ERROR", details: null });
   const keys = await envelopeKeys();
-  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
+  const { decryptSyntheticEnvelope } = await oracleModule("/src/crypto.ts");
   const v01Envelope = await encryptedEnvelope(v01Contribution("c"), TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION);
   const v01Record = validateTelemetryContribution(
     await decryptSyntheticEnvelope(v01Envelope, keys.publicText, keys.privateText));
@@ -2605,3 +2725,26 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     GROUP BY state ORDER BY state`);
   assert.deepEqual(grants.rows, [{ state: "consumed", n: 3 }, { state: "revoked", n: 1 }]);
 }));
+
+test("the oracle graph loads only vendored d43c8f92 modules and the live pricer seam", async () => {
+  for (const entry of ORACLE_ENTRY_POINTS) await oracleModule(`/${entry.slice("apps/worker/".length)}`);
+  const manifest = JSON.parse(await readFile(join(ORACLE_ROOT, ORACLE_MANIFEST_FILE), "utf8"));
+  const vendored = new Set(manifest.files.map(({ path }) => join(ORACLE_ROOT, path)));
+  const seams = ORACLE_LIVE_SEAMS.map((seam) => join(WORKER_ROOT, seam.slice("apps/worker/".length)));
+  // The pricer's own workspace package, installed in the live tree. (npm
+  // dependencies stay externalized: jsonc-parser is version-checked above and
+  // runcost is the pricer's.)
+  const installed = ["@app-usagemonitor/accounting"]
+    .map((name) => `${join(WORKER_ROOT, "node_modules", name)}${sep}`);
+  const loaded = [...oracleVite.moduleGraph.idToModuleMap.values()]
+    .map((module) => module.file).filter((file) => typeof file === "string");
+  assert.ok(loaded.length >= ORACLE_ENTRY_POINTS.length, "the oracle graph is populated");
+  for (const file of loaded) {
+    assert.ok(vendored.has(file) || seams.includes(file) || installed.some((prefix) => file.startsWith(prefix)),
+      `${file.startsWith(WORKER_ROOT) ? file.slice(WORKER_ROOT.length + 1) : "a module outside apps/worker"} is vendored or the pricer seam`);
+  }
+  for (const entry of ORACLE_ENTRY_POINTS) {
+    assert.ok(loaded.includes(join(ORACLE_ROOT, entry)), `${entry} ran from the vendored tree`);
+  }
+  for (const seam of seams) assert.ok(loaded.includes(seam), "the admission prices with the live pricer");
+});

@@ -339,6 +339,10 @@ export const POSTGRES_FASTPATH_IDENTITY_EXCLUDED_TABLES = Object.freeze({
   telemetry_transport_participant_floors: "trigger-derived-not-created",
   telemetry_transport_device_floors: "trigger-derived-not-created",
   attribution_enrollments: "trigger-derived-not-created",
+  // The two performance reasons are pinned disposition text recorded before
+  // primary 0079 created these tables (2026-10-10). They stay as written: the
+  // D1 performance rows are still never copied, and PostgreSQL starts its own
+  // performance evidence.
   telemetry_performance_device_capabilities: "no-postgresql-table-at-promoted-level (PF-1 unpromoted)",
   accountless_telemetry_performance_authorizations: "no-postgresql-table-at-promoted-level (PF-1 unpromoted)",
 });

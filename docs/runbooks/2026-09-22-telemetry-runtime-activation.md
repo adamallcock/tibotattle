@@ -15,6 +15,13 @@ The usage successor (`usage_v12`) and the model-performance stream
 staged; performance may remain staged until its histogram collection has a
 separate rollout decision.
 
+The sections up to [Failure and recovery boundary](#failure-and-recovery-boundary)
+describe the Cloudflare Worker and its D1 roles. The Google Cloud origin
+activates only the performance runtime, with a different request body and no
+reconciliation receipt; follow
+[Google Cloud origin performance activation](#google-cloud-origin-performance-activation)
+there.
+
 ## Preconditions
 
 The target primary and analytics D1 roles must have the common forward
@@ -352,3 +359,195 @@ existing collection-control containment procedure for an incident rather than
 attempting an undocumented state reversal. Cache calculations remain on their
 existing implementation until a separately approved back-catalog change.
 Performance remains independently staged by default.
+
+## Google Cloud origin performance activation
+
+The owner decided on 2026-10-10 to restore accountless performance intake on
+the Google Cloud origin and to activate it as a separate owner step
+([community model speed decision](../decisions/2026-10-10-community-model-speed.md#owner-only-activation)).
+This section is the owner sequence for that step. It is source-verified only:
+the task, its body and its refusals are proven with local PostgreSQL 17 tests
+and a composed production host, and the step has never run against a live
+project. Activation is a protected production write. It needs explicit owner
+authorization for this environment and this image, and an agent never performs
+it.
+
+On this origin only the `performance` target exists. A `usage_v12` body is
+refused with `400 BODY_INVALID`; that runtime arrived active by transfer and is
+never activated here. There is no activation control in the admin UI.
+
+### Preconditions
+
+All of these must hold, and each is checked read-only before the POST:
+
+1. **The v1.2 activation-timeout fix is live and verified** in production
+   (decision 10), and so is any kernel the live registry orders before the
+   performance kernel.
+2. **The edge is in `gcp` mode.** `admin.tibotattle.com` reaches this origin
+   only while the live edge forwards its admin routes here. In `worker` mode
+   the D1 Worker answers the admin view and the admin action itself, and in
+   `fenced` mode they answer `503 MUTATION_BARRIER_ACTIVE`; this section does
+   not apply in either.
+3. **Migration 0079 is applied and the image rolled**, through
+   [Migration 0079](./gcp-rollout.md#migration-0079-community-model-speed) in
+   the rollout runbook. Keep the migrate receipt: its
+   `migrations.historySha256` is the `deployment.historySha256` below.
+4. **The edge deploy is live** (rollout step 6; its code deploy carries the
+   admin view). The admin view that preconditions 7 and 8 read exists at the
+   edge only from that deploy:
+   before it, the live edge answers `GET /api/v1/admin/performance-intake`
+   itself with `404 NOT_FOUND` and never forwards it. No other read-only source
+   for the staged revision is built, so activation waits for this deploy. The
+   admin action route itself is already forwarded.
+5. **The storage receipt is current.** The live migration history equals the
+   image's manifest exactly, so `/api/ready` reads `ready` and the
+   storage-gated routes answer. The task re-reads the receipt itself and
+   refuses `503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE` if it is not
+   current.
+6. **Collection controls are enabled.** `uploadRegistration` and `processing`
+   must both be enabled. A disabled control refuses with its own `503`
+   (`UPLOAD_REGISTRATION_DISABLED` or `PROCESSING_DISABLED`).
+7. **The runtime is staged.** Read `GET /api/v1/admin/performance-intake` on
+   the admin host. It must show runtime `staged` and the policy revision to use
+   as `expectedRevision` (1 on a fresh migration). Do not guess the revision.
+8. **The deployment matches.** The view's `deployment.sourceCommit` must equal
+   the rolled commit, and its `deployment.historySha256` must equal the migrate
+   receipt's `migrations.historySha256`. The view's digest is computed from the
+   image's own migration manifest, not read from the live database, so check
+   it against the receipt rather than relying on the view alone. A null
+   `sourceCommit` means `DEPLOYMENT_SOURCE_COMMIT` is not set, and every
+   activation then refuses `503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE`.
+
+### The request
+
+Generate a fresh lowercase UUIDv4 idempotency key for the attempt. The body is
+exactly:
+
+```json
+{
+  "action": "run_maintenance",
+  "telemetryRuntimeActivation": {
+    "target": "performance",
+    "expectedRevision": 1,
+    "confirmation": "activate_telemetry_performance_runtime",
+    "idempotencyKey": "<lowercase uuid-v4>",
+    "deployment": {
+      "historySha256": "<migrations.historySha256 from the migrate receipt>",
+      "sourceCommit": "<the rolled 40-hex commit>"
+    }
+  }
+}
+```
+
+Replace `1` with the staged revision from precondition 7. Every key is
+required, and any other key, value or shape is `400 BODY_INVALID`.
+
+`scripts/telemetry-runtime-reconciliation.mjs` is Worker and D1 only. It builds
+the D1 body with a `reconciliation` receipt and reads D1, Cloudflare inventory
+and the Worker version. The origin refuses that body with `400 BODY_INVALID`.
+Do not use it here; no origin operator entrypoint is built.
+
+Post the body as `POST /api/v1/admin/action` on the admin host
+(`https://admin.tibotattle.com`), behind Cloudflare Access as the pinned owner.
+The admin CSRF check requires the request's `Origin` to be the admin origin,
+`Sec-Fetch-Site` absent or same-origin, and `x-usage-monitor-admin: 1`. The
+browser helper in step 6 of the Worker sequence meets these from an
+authenticated admin page. Compute the request file's SHA-256 locally and use
+it as `expectedRequestSha256`; the helper then posts the file's unchanged
+bytes.
+
+A success answers 200 with `schemaVersion: "admin-action-v0.1"` and a result
+of `task: "telemetry_runtime_activation"`, `operationId` (the idempotency
+key), `target: "performance"`, `state: "active"`, `fromRevision`,
+`toRevision`, `revision`, `replayed` and `reconciled`. Keep the response, the
+idempotency key and the UTC time with the rollout evidence.
+
+### Refusals
+
+| Answer | Meaning | Action |
+|---|---|---|
+| `400 BODY_INVALID` | The body is not the exact shape above, names `usage_v12`, or is the D1 body | Fix the body |
+| `403 ADMIN_REQUIRED`, `403 CSRF_INVALID` | Not the Access owner, or the CSRF headers are missing | Post from the owner's authenticated admin page |
+| `409 ADMIN_ACTION_CONFLICT` | The runtime is not staged at `expectedRevision`; the deployment block does not name this image; or the key was already used for another intent, a failure or another action | Re-read the admin view. Use a new key for a new intent. Never reuse a key with a changed body |
+| `503 TELEMETRY_RUNTIME_ACTIVATION_UNAVAILABLE` | The migration receipt is not current, the dictionary registry differs from the image's, the commit is unset, or the commit outcome is unknown | Resolve the cause. After an unknown outcome, resend the identical request: a committed activation replays |
+| `503 UPLOAD_REGISTRATION_DISABLED`, `503 PROCESSING_DISABLED` | A collection control is disabled | Enable it through the reviewed control path, then retry |
+| `503 TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED` | A `started` audit row exists for this intent while the runtime is still staged | See below. This key will never succeed: use a new idempotency key |
+
+Every refusal before the audit row rolls the transaction back and leaves no
+audit row.
+
+### Replay and reconcile
+
+- **Lost response.** Resend the identical request with the same key. A
+  recorded success returns the original result with `replayed: true` and
+  changes nothing. Replay identity is the key, target and expected revision;
+  the deployment block is a precondition for doing an activation, not part of
+  the intent, so a replay after a redeploy still returns the recorded result.
+- **Concurrent requests.** Two requests with the same key serialize on the
+  runtime row; the loser answers as a replay.
+- **Interrupted earlier writer.** This task never commits a `started` row,
+  because the audit row and the runtime change commit together. A `started`
+  row can only come from an interrupted earlier writer. If the runtime is
+  already active at `expectedRevision + 1`, a retry finishes that row with
+  success and answers `reconciled: true`; reconcile re-checks the receipt and
+  this image's deployment, so send the current image's commit and digest. That
+  path can record a second success row for an activation another operation
+  performed. If the runtime is still staged, the answer is
+  `503 TELEMETRY_RUNTIME_ACTIVATION_RECONCILE_REQUIRED` for every retry of that
+  key, and nothing changes. Generate a new idempotency key and send a new
+  request.
+- An active runtime is forward-only. There is no deactivation and no pause
+  state.
+
+### Verify
+
+1. Read `GET /api/v1/admin/performance-intake`: runtime `active` at policy
+   revision 2 (the expected revision plus one). The admin audit list shows one
+   `run_maintenance` row for this key finished as success.
+2. Wait for the first accepted report. Intake ramps up only as clients
+   restart or renew their sharing preference and re-grant; while the runtime
+   was staged, clients paused on their 403 answers. The admin view's
+   `reports.latestAcceptedAt` and the runtime probe's
+   `performance_newest_accepted_report_age_seconds` move off `NO_DATA` with the
+   first accepted report.
+3. The first publication follows at the next analytics refresh (daily, at
+   03:00 UTC in the committed desired state), once a report with an included
+   record exists. Until then the public read answers
+   `404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED`.
+
+### Brake
+
+There is no performance-only brake. To stop intake, use the collection
+controls through the admin action `set_collection_controls`: disabling
+`uploadRegistration` refuses new grants, and disabling `processing` refuses
+report uploads. Both controls also stop usage collection. While the
+`publication` control is disabled, the public read answers
+`503 PUBLICATION_DISABLED`. See
+[GCP brake and incidents](./gcp-brake-and-incidents.md) for the edge brake.
+
+### Operating notes
+
+- **Staged window.** Between the roll and activation, every authenticated
+  grant, capability poll and report upload answers
+  `403 TELEMETRY_TRANSPORT_BLOCKED`, and each one upserts a refusal counter
+  row. Local measurement at concurrency 24 and 64 with the production pool
+  sizes counted every refusal, with refused polls at about twice read latency
+  (p50 35–99 ms). A refusal waits up to its 1-second bound only when the
+  counter table is locked or unavailable. The admin attention item for
+  refusals in the last 24 hours fires throughout this window; that is
+  expected.
+- **Report-day window.** Once active, a new report or replacement whose day
+  falls outside the server's UTC window, from 10 days before today through
+  tomorrow, is refused `409 TELEMETRY_RECORD_INVALID` and appears in the
+  refusal counters; a few from devices with skewed clocks are expected
+  ([decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)).
+- **Admin view cost.** The view reads grant and capability heads, report
+  totals and a 400-day cohort window under one 10-second read-only snapshot,
+  mostly as full scans of narrow tables. It has not been load-tested at
+  production scale; if it starts answering
+  `503 ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE` as the corpus grows, suspect its
+  statement timeout first.
+- **Output budget.** If the twelve performance payloads ever overflowed the
+  refresh run's output budget, the whole run would fail with
+  `ANALYTICS_V2_OUTPUTS_CAPACITY_EXCEEDED`, blocking the daily publication too.
+  Payload sizes make this unlikely; the head-age probes show it.

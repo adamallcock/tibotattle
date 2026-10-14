@@ -286,6 +286,9 @@ predecessor before staging any day: a device with no ready day yet is seeded
 with the current UTC day, and the predecessor fingerprint pins only the prior
 head and input revision, so the client's own newly ready days never
 invalidate its journal. A complete domain includes days without records.
+The GCP origin refuses a v1.2 day later than its UTC day plus one with a paced
+429, and its refresh defers queued days after today, so no future day is
+published ([decision](../decisions/2026-10-12-v12-future-day-bound.md)).
 Its three usage extensions are continuity bits, same-time order and
 non-additive cache-write TTL detail. They
 are excluded from current cache arithmetic. Exact-total corrections preserve
@@ -301,6 +304,35 @@ Per-device report revisions are idempotent; pooled values describe reported
 samples and may include cross-device overlap. Timing fields do not enter usage
 events. Both new runtimes start staged, and source availability proves neither
 hosted activation nor installed-client operation.
+
+On the Google Cloud origin line, the
+[community model speed decision](../decisions/2026-10-10-community-model-speed.md#google-cloud-origin-implementation)
+restores this stream in PostgreSQL. It is source with local proof only:
+
+1. A device grants through the accountless performance route. The origin
+   stores the dictionary the device emits, declared by a v2 grant or inferred
+   from its newest v1.2 manifest parser, and the capability echoes it. A
+   registry table pins the three accepted dictionaries to their bucket
+   schemes.
+2. Encrypted daily reports are decrypted only after a current capability is
+   read. They are admitted into append-only report, cohort, bucket and receipt
+   tables (primary migration `0079`). Refusals after authentication add to
+   content-free daily counters.
+3. Nothing is admitted until the owner activates the performance runtime,
+   which is staged after migration, through the admin action route. The
+   admin UI has no control for it.
+4. The analytics-refresh Job folds current reports into twelve
+   `community-model-performance-v1` slots under the analytics kernel and
+   writes forward-only publication heads.
+   `GET /api/v1/community/model-performance` serves one verified slot, cached
+   for 300 seconds.
+5. The read-only admin route `GET /api/v1/admin/performance-intake` and two
+   runtime-probe gauges (newest accepted report age, newest publication age)
+   observe intake and publication without identifiers.
+
+The edge forwards these routes; it stores no performance state. The
+publication heads and counters carry no participant, and the offline owner
+purge removes a participant's performance rows by cascade.
 
 ## Hosted storage
 

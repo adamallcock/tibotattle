@@ -3636,6 +3636,27 @@ async function handleAdminDatabaseHealth(
   });
 }
 
+/**
+ * GET /api/v1/admin/performance-intake (owner decision 2026-10-10, GATE-Q 4).
+ * The read-only performance-intake view reads the PostgreSQL origin's
+ * telemetry_performance_* tables; this D1 Worker has none, so after the same
+ * admin envelope as the other read-only admin routes it answers 503
+ * ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE, an expected fail-closed state.
+ */
+async function handleAdminPerformanceIntake(
+  request: Request, env: Env, access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  if (new URL(request.url).search !== "") throw new ApiError(400, "BODY_INVALID");
+  throw new ApiError(503, "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE");
+}
+
 async function handleAdminReconstructionProgress(
   request: Request, env: Env, access?: { readonly identityKey: string },
 ): Promise<Response> {
@@ -4131,6 +4152,52 @@ async function handleCommunityDaily(
   );
 }
 
+// GET /api/v1/community/model-performance (owner decision 2026-10-10,
+// GATE-Q 5): one published community-model-performance-v1 slot per request.
+// The slot vocabulary is the contract's (period 1/7/30/all, speedMode
+// standard/fast/ultrafast); it is spelled here so this handler needs no
+// analytics module.
+const COMMUNITY_MODEL_PERFORMANCE_QUERY_VALUES: Readonly<Record<string, readonly string[]>> =
+  Object.freeze({
+    period: Object.freeze(["1", "7", "30", "all"]),
+    speedMode: Object.freeze(["standard", "fast", "ultrafast"]),
+  });
+
+function assertCommunityModelPerformanceQuery(url: URL): void {
+  const seen = new Set<string>();
+  for (const [name, value] of url.searchParams) {
+    const allowed = Object.hasOwn(COMMUNITY_MODEL_PERFORMANCE_QUERY_VALUES, name)
+      ? COMMUNITY_MODEL_PERFORMANCE_QUERY_VALUES[name]
+      : undefined;
+    if (allowed === undefined || seen.has(name) || !allowed.includes(value)) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    seen.add(name);
+  }
+  if (seen.size !== 2) throw new ApiError(400, "BODY_INVALID");
+}
+
+/**
+ * The Worker's request handling for the community model-performance read, in
+ * the community daily handler's order: method, public-analytics switch, publication
+ * control, the per-client public-read limiter (the budget community_daily
+ * spends), then strict query validation. This Worker holds no performance
+ * publication (only the PostgreSQL origin's analytics_v2 heads do), so a
+ * valid read is always 404 COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED, never a
+ * 5xx, with no-store.
+ */
+async function handleCommunityModelPerformance(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  assertPublicAnalyticsEnabled(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
+  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
+  assertCommunityModelPerformanceQuery(new URL(request.url));
+  throw new ApiError(404, "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED");
+}
+
 type LifecycleReadinessState =
   | "ready"
   | "never_run"
@@ -4302,6 +4369,8 @@ async function routeApi(
       return handleAdminReconstructionProgress(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
+    case "admin_performance_intake":
+      return handleAdminPerformanceIntake(request, env);
     case "security_reset":
       return handleSecurityReset(request, env);
     case "device_pairing":
@@ -4356,6 +4425,8 @@ async function routeApi(
       return handleExport(request, env);
     case "community_daily":
       return handleCommunityDaily(request, env);
+    case "community_model_performance":
+      return handleCommunityModelPerformance(request, env);
   }
   return unreachableApiRoute(routeId);
 }
@@ -4458,6 +4529,10 @@ export async function handleRequest(
           assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminReconstructionProgress(request, env, { identityKey }));
         }
+        if (route.kind === "exact" && route.id === "admin_performance_intake") {
+          assertWorkerRouteMethod(request, route);
+          return noStore(await handleAdminPerformanceIntake(request, env, { identityKey }));
+        }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
           && (route.id === "admin_overview"
@@ -4465,7 +4540,8 @@ export async function handleRequest(
             || route.id === "admin_community_allowance_preview"
             || route.id === "admin_database_health"
             || route.id === "admin_reconstruction_progress"
-            || route.id === "admin_action"))) {
+            || route.id === "admin_action"
+            || route.id === "admin_performance_intake"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
     }
@@ -4475,7 +4551,8 @@ export async function handleRequest(
       // branch, but no undocumented method can reach one of them.
       assertWorkerRouteMethod(request, route);
     }
-    if (route.id === "community_daily" && !publicAnalyticsEnabled(env)) {
+    if ((route.id === "community_daily" || route.id === "community_model_performance")
+        && !publicAnalyticsEnabled(env)) {
       return noStore(errorResponse(
         new ApiError(503, "PUBLICATION_DISABLED"),
         requestId,
@@ -4591,7 +4668,7 @@ export async function handleRequest(
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
     if (route.id !== "asset") {
       const response = await routeApi(request, env, route.id);
-      return route.id === "community_daily"
+      return route.id === "community_daily" || route.id === "community_model_performance"
         ? response
         : noStore(response);
     }
@@ -4630,6 +4707,7 @@ export async function handleRequest(
       "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
       "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
       "ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE",
+      "ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE",
     ].includes(apiError.code)) {
       // Expected fail-closed state for read-only admin aggregates. Scheduled
       // maintenance warms each cache; an interactive request never writes a

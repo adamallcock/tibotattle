@@ -404,14 +404,18 @@ limiter, the token source or the origin:
 - `unknown_api` on either host (404), including the retired
   `DELETE /api/v1/me`;
 - `apple_domain_association` (404);
-- the six admin API routes on the apex (404 `NOT_FOUND`);
+- the seven admin API routes on the apex (404 `NOT_FOUND`): `d43c8f92`'s six
+  and the owner-decided read-only `GET /api/v1/admin/performance-intake`
+  (2026-10-10);
 - an exact route with a method outside the route registry (405 with `Allow`),
-  except the six admin API routes on the admin host, which are forwarded so the
-  origin's own chokepoint answers them;
-- `community/daily` while `PUBLIC_ANALYTICS_MODE` is not `enabled`
+  except the seven admin API routes on the admin host, which are forwarded so
+  the origin's own chokepoint answers them;
+- `community/daily`, and the owner-decided `community/model-performance`
+  (2026-10-10), while `PUBLIC_ANALYTICS_MODE` is not `enabled`
   (`503 PUBLICATION_DISABLED`, `no-store`, no limiter charged). Production
   answers this in `handleRequest` before dispatch (`d43c8f92` `index.ts`
-  :4452-4457), and the origin route does not read that variable;
+  :4452-4457, extended to the new public read), and the origin routes do not
+  read that variable;
 - admin-host chokepoint failures for forwarded requests (`403 ACCESS_REQUIRED`,
   `503 ADMIN_NOT_CONFIGURED`), rendered exactly as `handleRequest`'s catch
   renders them;
@@ -484,9 +488,12 @@ The forward:
 Six Workers Rate Limiting bindings stay at the edge: `ENROLLMENT_RATE_LIMIT`,
 `RECOVERY_RATE_LIMIT`, `CLIENT_ATTEMPT_RATE_LIMIT`, `PUBLIC_READ_RATE_LIMIT`,
 `UPLOAD_INGRESS_REQUEST_RATE_LIMIT` and `UPLOAD_INGRESS_CLIENT_RATE_LIMIT`. The
-edge evaluates them with the unchanged `admission.ts` helpers, at the 13
-production call sites below, for 24 route ids (EP-1's `EDGE_ADMISSION_POLICY`).
-Line numbers are `apps/worker/src/index.ts` at `d43c8f92`.
+edge evaluates them with the unchanged `admission.ts` helpers, at the 14
+call sites below, for 25 route ids (EP-1's `EDGE_ADMISSION_POLICY`): the 13
+production call sites of `d43c8f92` and the owner-decided public
+model-performance read of 2026-10-10. Line numbers are
+`apps/worker/src/index.ts` at `d43c8f92`; the new handler has no `d43c8f92`
+line.
 
 | Line | Route ids | Helper | Purpose | Coarse binding | Client binding |
 |---|---|---|---|---|---|
@@ -503,6 +510,7 @@ Line numbers are `apps/worker/src/index.ts` at `d43c8f92`.
 | 3023 | `device_sync_state`, `device_sync_capabilities`, `device_sync_capabilities_v12`, `device_sync_manifest`, `telemetry_performance_capabilities`, `telemetry_performance_reports`, `telemetry_v11_day_manifests`, `telemetry_v12_day_manifests`, `telemetry_v11_domain_predecessor`, `telemetry_v11_domain_activate`, `telemetry_v12_domain_predecessor`, `telemetry_v12_domain_activate` | `assertAttemptAllowed`, inside `deviceSyncPrincipal` (:3016-3030; callers :3047, :3067, :3077, :3098, :3141, :3238, :3258, :3278, :3293, :3306) | `device_sync` | `RECOVERY` | `CLIENT_ATTEMPT` |
 | 3342 | `contributions` | `assertUploadIngressRequestAllowed` | `upload_ingress` | `UPLOAD_INGRESS_REQUEST` | `UPLOAD_INGRESS_CLIENT` |
 | 3979 | `community_daily` | `assertPublicAggregateReadAllowed` | `public_aggregate_read` | none | `PUBLIC_READ` |
+| new | `community_model_performance` | `assertPublicAggregateReadAllowed` (`handleCommunityModelPerformance`, the same call shape) | `public_aggregate_read` | none | `PUBLIC_READ` |
 
 Binding names in the table omit the `_RATE_LIMIT` suffix. The checked-in
 `env.production` at `d43c8f92` declares 20 per 60 s for `ENROLLMENT` and
@@ -511,9 +519,14 @@ upload binding. Live values come from the typed render, and the overlay keeps
 them unchanged. A gcp deploy requires all six edge-tier bindings to be live
 already (E10), so the switch never changes admission bindings.
 
+The new public read adds no purpose and no binding: it keys the same
+`public_aggregate_read` client subject as `community_daily`, so the two public
+reads share one 120-per-60-s budget per client, and
+`edge-origin-contract.ts` is unchanged.
+
 The edge sends only the outcome, `v1;<purpose>;allowed|limited|unavailable`.
-The remaining 27 exact routes get no admission header:
-`device_upload_authorization` uses only the origin tier below, and the other 26
+The remaining 28 exact routes get no admission header:
+`device_upload_authorization` uses only the origin tier below, and the other 27
 call no rate limiter at all.
 
 ### Origin tier
@@ -810,9 +823,13 @@ These are deliberate and accepted with this record:
   from the live commit (recommended).
 - OD-E3: whether to authorize the optional live check against the GCP test
   project (a GCP write, with a separately authorized write tier).
-- OD-E4: the admin, export, security-reset, performance and Apple and Google
-  sign-in routes stay outside the fast path. CR-6 and CR-7 own them before any
-  gcp switch.
+- OD-E4: the admin, export, security-reset and Apple and Google sign-in
+  routes stay outside the fast path. CR-6 and CR-7 own them before any gcp
+  switch. The accountless performance intake routes (grant, capabilities and
+  reports) left this list on 2026-10-10: the owner restored them at the origin,
+  and in gcp mode the edge forwards them like every other registry route
+  ([forwarded requests](#forwarded-requests)). The performance consent route
+  stays retired at the origin.
 - OD-E5: re-derive EP-1, and `EDGE_PRE_ADMISSION_GUARDS`, if production's
   admission call sites or the request-only guards ahead of them change before
   the switch.
