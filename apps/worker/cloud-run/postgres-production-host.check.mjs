@@ -574,7 +574,9 @@ test("owner recovery preview receives the origin-only cursor secret through the 
               if (sql.includes('"collection_controls"')) return { rows: [{ control_state: "operational", revision: "1",
                 enrollment_enabled: true, upload_registration_enabled: true, processing_enabled: true,
                 publication_enabled: true }], rowCount: 1 };
-              if (sql.includes("WITH candidates AS")) return { rows: [], rowCount: 0 };
+              if (sql.includes("WITH candidates AS") || sql.includes("WITH eligible_devices AS")) {
+                return { rows: [], rowCount: 0 };
+              }
               throw new Error("unexpected synthetic recovery read");
             }, release() {},
           });
@@ -596,9 +598,26 @@ test("owner recovery preview receives the origin-only cursor secret through the 
         assert.equal(body.result.task, "v11_evidence_adoption");
         assert.equal(body.result.dryRun, true);
         assert.equal(body.result.examined, 0);
+        const v12Request = new Request(invokerRequest("/api/v1/admin/action", { method: "POST", hostKind: "admin",
+          headers: { "cf-access-jwt-assertion": assertion, "x-usage-monitor-admin": "1",
+            "content-type": "application/json", origin: env.ADMIN_HOST_ORIGIN } }), {
+          body: JSON.stringify({
+            action: "run_maintenance",
+            v12DomainRecovery: { dryRun: true, maxDevices: 1 },
+          }),
+        });
+        const v12Response = await runtime.productionDispatch(v12Request);
+        const v12Body = await v12Response.json();
+        assert.equal(v12Response.status, 200,
+          `${hostMode}: configured origin secret must reach v1.2 recovery (${v12Body.error?.code ?? "success"})`);
+        assert.equal(v12Body.result.task, "v12_domain_recovery");
+        assert.equal(v12Body.result.method, "v12-owner-domain-recovery-1");
+        assert.equal(v12Body.result.dryRun, true);
+        assert.equal(v12Body.result.examined, 0);
+        assert.equal(v12Body.result.nextAfterParticipantId, null);
         assert.ok(statements.some(sql => sql.startsWith("BEGIN") && sql.includes("READ ONLY")));
         assert.ok(statements.every(sql => !/^(?:INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/u.test(sql)));
-        assert.equal(JSON.stringify(body).includes(SECRETS.POSTGRES_RATE_LIMIT_SECRET), false);
+        assert.equal(JSON.stringify([body, v12Body]).includes(SECRETS.POSTGRES_RATE_LIMIT_SECRET), false);
       } finally {
         for (const pool of runtime.pools) await pool.end();
         runtime.connector.close();

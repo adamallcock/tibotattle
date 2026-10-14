@@ -12,9 +12,9 @@
  * 4. the bounded JSON body (415, 413, 408, 400 as readBoundedJson);
  * 5. an object with a string action from the closed set (400 BODY_INVALID);
  * 6. the action:
- *    - run_maintenance checks its task keys in the Worker's order:
- *      telemetryRuntimeActivation, transportRollback, v11EvidenceAdoption,
- *      participantErasure; otherwise the body must be exactly {action} and
+ *    - run_maintenance checks the existing Worker task keys in their order,
+ *      with PostgreSQL-only v12DomainRecovery after v11EvidenceAdoption and
+ *      before closed participantErasure; otherwise the body must be exactly {action} and
  *      the maintenance pass runs between a started and a terminal audit row
  *      (MAINTENANCE_IN_PROGRESS is 409 LIFECYCLE_STATE_CONFLICT);
  *    - sync_distribution must be exactly {action}; it runs between a started
@@ -38,6 +38,10 @@
  */
 
 import { ApiError } from "../../src/errors.ts";
+import {
+  parseV12DomainRecoveryRequest,
+  parseV12DomainRecoveryResult,
+} from "../../src/v12-domain-recovery.ts";
 import { assertAdminCsrf } from "../../src/session.ts";
 import { readBoundedJsonRequest } from "../postgres-family-contract.mjs";
 import {
@@ -72,12 +76,20 @@ export const ADMIN_CONTROL_REASONS = Object.freeze([
   "maintenance",
 ]);
 
-/** The run_maintenance task keys handleAdminAction tests, in its order. */
+/**
+ * The run_maintenance task keys this PostgreSQL origin recognizes. The v12
+ * recovery task is PostgreSQL-only; it does not add a D1/Worker task path.
+ */
 export const RUN_MAINTENANCE_TASK_KEYS = Object.freeze([
   "telemetryRuntimeActivation",
   "transportRollback",
   "v11EvidenceAdoption",
+  "v12DomainRecovery",
   "participantErasure",
+]);
+
+export const POSTGRES_ORIGIN_ONLY_RUN_MAINTENANCE_TASK_KEYS = Object.freeze([
+  "v12DomainRecovery",
 ]);
 
 /** The task keys the origin closes without a port (append-only decision D2). */
@@ -129,6 +141,7 @@ function respond(action, result) {
  *   telemetryRuntimeActivation({body, identityKey}) -> result
  *   transportRollback({body, identityKey}) -> result
  *   v11EvidenceAdoption({body, identityKey}) -> result
+ *   v12DomainRecovery({body, identityKey}) -> result
  */
 export function createAdminActionDispatch(deps) {
   const route = "admin_action";
@@ -155,6 +168,7 @@ export function createAdminActionDispatch(deps) {
       maintenance.telemetryRuntimeActivation),
     transportRollback: optionalFunction(route, "transportRollback", maintenance.transportRollback),
     v11EvidenceAdoption: optionalFunction(route, "v11EvidenceAdoption", maintenance.v11EvidenceAdoption),
+    v12DomainRecovery: optionalFunction(route, "v12DomainRecovery", maintenance.v12DomainRecovery),
   });
   const clock = familyClock(deps);
 
@@ -227,7 +241,11 @@ export function createAdminActionDispatch(deps) {
         if (CLOSED_RUN_MAINTENANCE_TASK_KEYS.includes(key)) throw bodyInvalid();
         const task = tasks[key];
         if (task === undefined) throw adminTaskNotPorted();
-        return respond(action, await task({ body: value, identityKey }));
+        const v12Request = key === "v12DomainRecovery" ? parseV12DomainRecoveryRequest(value) : undefined;
+        const result = await task({ body: value, identityKey });
+        return respond(action, key === "v12DomainRecovery"
+          ? parseV12DomainRecoveryResult(result, v12Request)
+          : result);
       }
       if (Object.keys(value).length !== 1) throw bodyInvalid();
       return plainMaintenance(identityKey);

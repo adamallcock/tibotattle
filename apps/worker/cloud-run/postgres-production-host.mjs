@@ -137,6 +137,7 @@ import {
 import { assertPostgresTelemetryTransportWriteAllowed } from "../src/postgres-telemetry-format-authority.ts";
 import * as postgresTelemetryV11Live from "../src/postgres-telemetry-v11-live-admission.ts";
 import { createPostgresV11EvidenceAdoption } from "../src/postgres-v11-evidence-adoption.ts";
+import { createPostgresV12OwnerRecovery } from "../src/postgres-v12-owner-recovery.ts";
 import { createTelemetryActivationObserver, createTelemetryRequestObserver } from "../src/telemetry-activation-observation.ts";
 import * as postgresDeviceBearerAuth from "../src/postgres-device-bearer-auth.ts";
 import * as postgresTypedV12Transport from "../src/postgres-typed-v12-transport.ts";
@@ -434,11 +435,14 @@ export function createLifecyclePassMaintenance({ pool, objectStore, primarySchem
 /** The same owner maintenance composition is exercised by the PostgreSQL
  * HTTP test. Optional tasks belong inside maintenance, not route options. */
 export function createPostgresOwnerMaintenance({ pool, objectStore, primarySchema,
-  cursorSecret, clock = Date.now, observeActivation, distributionEnabled = false, fetcher = fetch } = {}) {
+  cursorSecret, clock = Date.now, observeActivation, observeV12Activation,
+  distributionEnabled = false, fetcher = fetch } = {}) {
   return Object.freeze({
     ...createLifecyclePassMaintenance({ pool, objectStore, primarySchema, distributionEnabled, fetcher, clock }),
     v11EvidenceAdoption: createPostgresV11EvidenceAdoption({ pool, schema: { primarySchema },
       cursorSecret, clock, observeActivation }),
+    v12DomainRecovery: createPostgresV12OwnerRecovery({ pool, schema: { primarySchema },
+      cursorSecret, clock, observeActivation: observeV12Activation }),
   });
 }
 
@@ -946,6 +950,7 @@ export async function createPostgresProductionRuntime({
         maintenance: createPostgresOwnerMaintenance({ pool: dataPool, objectStore, primarySchema,
           cursorSecret: keyHashSecret, clock,
           observeActivation: (invoke) => observeActivation("v1.1", invoke),
+          observeV12Activation: (invoke) => observeActivation("v1.2", invoke),
           distributionEnabled: configuration.plane === "production" }),
       })
       : null;

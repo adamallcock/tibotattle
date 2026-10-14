@@ -5,8 +5,10 @@ type: runbook
 status: source-candidate
 ---
 
-This procedure requires an origin release and an admin asset release. It does
-not require a desktop release, a new analytics kernel, or a database migration.
+Both recovery lanes require an origin release. The v1.1 controls also require
+an admin asset release; the v1.2 owner API uses the existing authenticated admin
+route and requires no asset release. Neither lane requires a desktop release,
+a new analytics kernel, or a database migration.
 Source implementation and local qualification do not establish deployment or
 production recovery. The owner must separately authorize deployment, production
 reads, and repair writes. Do not run this procedure under diagnostic-only approval.
@@ -27,8 +29,9 @@ can actually be recovered.
 The 2 successor cases have v1.2 uploads; one has a v1.2 head and one does not.
 A stationary v1.1 head during successor activity is expected: v1.2 activation
 updates its own head. Unactivated v1.2 days remain a separate coverage problem;
-older accepted evidence can still contribute. This recovery never activates v1.2
-or interprets a successor upload as proof that its new days are public.
+older accepted evidence can still contribute. The v1.1 lane never activates
+v1.2 or interprets a successor upload as proof that its new days are public.
+The separate v1.2 lane below applies the successor protocol's own proofs.
 
 The 14 incomplete cases are not 14 proven HTTP refusals. Retained non-ready
 candidates and unused tokens are incomplete evidence; the approved query did
@@ -46,7 +49,7 @@ The other 6 heads with covered-day re-identification failures are excluded.
 Their append-only refusal preserves accepted records. Their separately owned
 re-identification fold work must retain its own gates.
 
-## Source behavior
+## v1.1 source behavior
 
 `createPostgresV11EvidenceAdoption` is injected into the existing Access-owner
 `run_maintenance` action as `v11EvidenceAdoption`. The existing method, CSRF,
@@ -96,7 +99,88 @@ at most 25 devices and stop starting further proofs after a 15-second budget;
 one proof can exceed that budget. A server statement timeout is not proof of
 the desktop client's 30-second request deadline.
 
-## Qualification and release gates
+## v1.2 owner recovery source candidate
+
+`createPostgresV12OwnerRecovery` is injected into the same Access-owner,
+CSRF-protected action as `v12DomainRecovery`. It considers participants with
+READY v1.2 uploads and no accepted v1.2 head, under current participant, device,
+sharing and protocol authority. Accountless and social authority are checked
+through the ordinary v1.2 authorization path. Enabled processing is locked and
+rechecked during predecessor issuance and activation. Existing heads are left
+to the normal client protocol. For each participant, selection uses the eligible
+device with the most recent READY upload at the page-sequence cutoff, with a
+deterministic device tie-break. It makes no automatic attempt on another device
+after a refusal. The result does not claim that other devices were examined or
+that all recoverable histories were exhausted. The cutoff bounds the READY evidence used for
+candidate membership and ranking; current authority and head state are checked
+again on every page. This is not a frozen cohort snapshot: changing eligibility
+can change a selected device or leave a newly eligible earlier ordering key for
+a fresh preview. The cutoff also does not freeze the proof vector. Preview reads
+current structure, and apply captures and proves current evidence again. Newer
+uploads can therefore change a later outcome.
+
+The domain captures the ordinary earliest READY baseline and a deterministic
+latest READY candidate in one database statement after acquiring the participant
+state lock. Predecessor evidence remains the ordinary baseline; the private
+candidate is the manifest submitted to the ordinary activation proof. Both
+vectors must be contiguous, within the protocol bounds and cover the same
+required range. Recovery never substitutes a candidate after a refusal, invents
+missing days, or treats a preview as proof of closure. Public predecessor
+responses and existing client behavior remain unchanged.
+
+An unused predecessor alone is not a busy-device exclusion: stranded clients
+also retain unused predecessors. Ordinary token limits and pruning still apply.
+Each selected participant gets at most one issuance and one activation attempt
+per page. Competing client activation is resolved by the normal input-revision,
+predecessor and fresh-head checks. Rekey, classification, session and same-day
+closure proofs remain mandatory; a refused proof does not publish a head or
+append an analytical activation journal entry.
+
+Preview is read-only structural eligibility. Apply records owner intent and a
+terminal aggregate audit, and stops on storage failure or an uncertain commit
+outcome. Failure details retain confirmed completed-candidate counts and a
+closed failure stage; `predecessorIssued` records confirmed issuance for the
+current attempt, while `currentAttemptMayHaveCommitted` marks an uncertain
+predecessor or activation write separately. That current attempt is excluded
+from confirmed counts. Failure to write the best-effort terminal audit can leave
+only the durable intent, which is not proof that no activation committed.
+Results contain only the closed task/method, mode, examined count,
+outcome and refusal counts, structurally covered-day count, and an encrypted
+pagination cursor. The day count describes the preflight vector until issuance captures a current
+candidate, then that captured vector. It can include a candidate that later
+refuses; it is not a count of newly accepted days. The `v12r1` cursor is authenticated and bound to owner, schema and mode,
+expires after 30 minutes, and stays in browser memory. Do not print, persist,
+render or paste it into reports. Page size is at most 25 candidates; a 15-second
+budget stops starting new proofs, while an individual proof can run to its
+60-second statement limit. A one-second lock limit bounds contention.
+
+For the reviewed owner API caller, start with a single-candidate preview:
+
+```json
+{"action":"run_maintenance","v12DomainRecovery":{"dryRun":true,"maxDevices":1,"afterParticipantId":null}}
+```
+
+Post to `/api/v1/admin/action` from the authenticated admin origin with the
+existing `x-usage-monitor-admin: 1` header and same-origin credentials. Do not
+extract cookies, copy Access tokens, impersonate a device, or add a direct
+production SQL writer. Preview and apply start separate cursor sequences;
+apply changes only `dryRun` to `false`. Keep subsequent cursors in memory and
+retain only allowlisted aggregate results. Never retry automatically after a
+5xx or lost acknowledgement: inspect the audit and fresh eligibility first.
+The existing v1.1 UI buttons do not invoke this new lane.
+
+Qualify the exact candidate using synthetic PostgreSQL 17 tests for both
+sharing modes, current authority and processing, pre-existing tokens, latest
+candidate selection, stale or competing heads, proof refusals, cursor binding,
+rollback, and exactly one journal entry for an accepted activation. Contract and
+route checks must reject unknown result fields, raw identifiers and inconsistent
+counts. Source checks and a successful origin rollout do not establish recovery
+or a model estimate. After approved execution, verify accepted activation and
+journal outcomes, run the existing analytics refresh, and inspect the published
+model cards. Keep unavailable estimates explicit when the unchanged confidence
+rules still do not identify them.
+
+## Shared release gates and retained v1.1 qualification
 
 Use a private, disposable PostgreSQL 17 instance and synthetic fixtures. Run the
 owning v1.1 suite, v1.2 unchanged regression, production-composition/privacy
@@ -155,7 +239,7 @@ synthetic fixture, then use the owning origin release gate for its fix. A kernel
 release is required only if analytical semantics change. A migration is required
 only if durable schema changes; this candidate adds neither.
 
-## Owner execution after explicit approval
+## v1.1 owner execution after explicit approval
 
 1. Integrate and release the qualified origin and admin assets using the
    maintained rollout procedures. Deploying this candidate grants no permission
@@ -200,8 +284,8 @@ guaranteed immediate upload, add a hidden manual upload, change a durable opt-ou
 or send users unsolicited messages. A manual upload UI, shorter backoff or a
 different request deadline needs a desktop release. Credential recovery must
 use the existing authorized renewal or pairing flow; it must not extend server
-rows by hand. v1.2 stranded days need their own proof and separately approved
-recovery lane.
+rows by hand. v1.2 stranded days use the separately qualified and authorized
+owner recovery lane above; v1.1 adoption is not a substitute.
 
 ## Stop and rollback
 

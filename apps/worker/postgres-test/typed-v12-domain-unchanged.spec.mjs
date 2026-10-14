@@ -11,6 +11,9 @@ import pg from "pg";
 import { createServer } from "vite";
 import {
   canonicalTelemetryV12Json,
+  TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+  TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
   telemetryV12DayManifestDigestInput,
   telemetryV12DomainManifestDigestInput,
   telemetryV12RequiredConsent,
@@ -23,6 +26,7 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_ID = "synthetic-v12-unchanged-source";
 const DAY_ONE = "2026-09-21";
 const DAY_TWO = "2026-09-22";
+const DAY_THREE = "2026-09-23";
 const HOUR_MS = 3_600_000;
 const PREDECESSOR_TTL_MS = 24 * HOUR_MS;
 const CLIENT_PASS_INTERVAL_MS = 4 * HOUR_MS;
@@ -97,6 +101,8 @@ async function setup() {
     modules = {
       ...await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts"),
       ...await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
+      ...await vite.ssrLoadModule("/src/postgres-v12-owner-recovery.ts"),
+      ...await vite.ssrLoadModule("/src/errors.ts"),
       ...await vite.ssrLoadModule("/src/telemetry-activation-observation.ts"),
     };
   }
@@ -176,9 +182,48 @@ async function seedDevice(context, participant, label) {
   return { participantId, deviceId };
 }
 
+async function seedAccountlessDevice(context, label, { publicEligible = true } = {}) {
+  const { table } = context;
+  const nowEpoch = Date.now();
+  const now = new Date(nowEpoch).toISOString();
+  const expires = new Date(nowEpoch + 30 * 24 * HOUR_MS).toISOString();
+  const participantId = `synthetic-unchanged-accountless-${label}-${randomUUID()}`;
+  const deviceId = `synthetic-unchanged-accountless-device-${label}-${randomUUID()}`;
+  const principalId = `synthetic-install-${randomUUID()}`;
+  const deviceSecret = randomBytes(32);
+  const enrollmentSecretHash = publicEligible ? deviceSecret : randomBytes(32);
+  await pool.query(`INSERT INTO ${table("participants")}(id, owner_kind, state, consent_version, created_at)
+    VALUES ($1,'accountless','active',NULL,$2)`, [participantId, now]);
+  await pool.query(`INSERT INTO ${table("accountless_enrollment_ledger")}(
+    device_id,device_secret_hash,installation_principal_id,schema_version,policy_version,
+    authorization_basis,state,issued_at,expires_at
+  ) VALUES ($1,$2,$3,'accountless-enrollment-v0.1','accountless-opt-out-v1',
+    'accountless-policy-v1','active',$4,$5)`,
+  [deviceId, enrollmentSecretHash, principalId, now, expires]);
+  await pool.query(`INSERT INTO ${table("device_credentials")}(
+    id,participant_id,authority_kind,accountless_enrollment_device_id,secret_hash,
+    state,issued_at,expires_at,last_used_at
+  ) VALUES ($1,$2,'accountless',$1,$3,'active',$4,$5,$4)`,
+  [deviceId, participantId, deviceSecret, now, expires]);
+  await pool.query(`INSERT INTO ${table("accountless_upload_owners")}(
+    enrollment_device_id,participant_id,device_credential_id,policy_version,
+    authorization_basis,authorized_at,expires_at,state
+  ) VALUES ($1,$2,$1,'accountless-opt-out-v1','accountless-policy-v1',$3,$4,'active')`,
+  [deviceId, participantId, now, expires]);
+  await pool.query(`INSERT INTO ${table("accountless_v12_device_authorizations")}(
+    enrollment_device_id,participant_id,device_credential_id,schema_version,policy_version,
+    authorization_basis,telemetry_schema_version,field_dictionary_version,privacy_contract_version,
+    authorized_at,expires_at,state
+  ) VALUES ($1,$2,$1,'accountless-upload-owner-v1.2','accountless-telemetry-v1.2-policy-v1',
+    'accountless-policy-v1.2',$3,$4,$5,$6,$7,'active')`,
+  [deviceId, participantId, TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    TELEMETRY_V12_FIELD_DICTIONARY_VERSION, TELEMETRY_V12_PRIVACY_CONTRACT_VERSION, now, expires]);
+  return { participantId, deviceId };
+}
+
 /** A zero-chunk day registered through the real admission path, which makes
  * it ready at registration (the empty-day contract from fe58fd7a). */
-async function registerEmptyDay(context, principal, day, parserVersion = "synthetic-empty-day") {
+async function registerEmptyDay(context, principal, day, parserVersion = "synthetic-empty-day", nowEpoch = Date.now()) {
   const manifest = {
     schemaVersion: "telemetry-day-manifest-v1.2",
     day,
@@ -190,7 +235,7 @@ async function registerEmptyDay(context, principal, day, parserVersion = "synthe
   };
   manifest.manifestDigest = sha256Hex(telemetryV12DayManifestDigestInput(manifest));
   const candidate = await modules.registerPostgresTypedV12DayManifest(
-    pool, principal, manifest, Date.now(), context.options,
+    pool, principal, manifest, nowEpoch, context.options,
   );
   assert.deepEqual({ state: candidate.state, expectedChunks: candidate.expectedChunks },
     { state: "ready", expectedChunks: 0 });
@@ -198,9 +243,12 @@ async function registerEmptyDay(context, principal, day, parserVersion = "synthe
 }
 
 /** One synthetic quota observation admitted through register, stage and ready. */
-async function admitQuotaDay(context, principal, day) {
+async function admitQuotaDay(context, principal, day, {
+  registrationEpoch = Date.now(),
+  readyEpoch = registrationEpoch,
+} = {}) {
   const { table } = context;
-  const nowEpoch = Date.now();
+  const nowEpoch = registrationEpoch;
   const quotaRecord = {
     schemaVersion: "quota-observation-v1.2",
     observationId: `quota:v12:${randomUUID()}`,
@@ -252,8 +300,8 @@ async function admitQuotaDay(context, principal, day) {
   const authorizationId = `synthetic-unchanged-auth-${randomUUID()}`;
   const chunkRowId = `chunk:${randomUUID()}`;
   const r2Key = `synthetic/unchanged/${randomUUID()}`;
-  const now = new Date(nowEpoch).toISOString();
-  const expires = new Date(nowEpoch + 10 * 60_000).toISOString();
+  const now = new Date(readyEpoch).toISOString();
+  const expires = new Date(readyEpoch + 10 * 60_000).toISOString();
   await pool.query(`INSERT INTO ${table("device_upload_authorizations")}(
     id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
     body_bytes, content_type, state, issued_at, expires_at, consume_lease_expires_at
@@ -264,7 +312,7 @@ async function admitQuotaDay(context, principal, day) {
     VALUES ($1,$2,'telemetry_v12')`, [chunkRowId, r2Key]);
   await modules.persistPostgresTypedV12StagedChunk(pool, principal, chunk, {
     chunkRowId, r2Key, envelopeDigest, deviceUploadAuthorizationId: authorizationId,
-  }, nowEpoch, context.options);
+  }, readyEpoch, context.options);
   const ready = await pool.query(`SELECT state, expected_chunk_count FROM ${table("telemetry_v12_day_manifests")}
     WHERE id=$1`, [candidate.manifestId]);
   assert.deepEqual(ready.rows[0], { state: "ready", expected_chunk_count: 1 });
@@ -612,6 +660,69 @@ async function unconsumedFor(context, principal) {
     WHERE participant_id=$1 AND device_id=$2 AND consumed_at IS NULL
     ORDER BY token_hash`, [principal.participantId, principal.deviceId]);
   return result.rows.map((row) => row.token_hash);
+}
+
+function failOneSuccessAuditUpdate(basePool, schema) {
+  let failed = false;
+  const quotedAudit = `UPDATE "${schema}"."admin_action_audit"`;
+  const interceptedPool = {
+    async connect() {
+      const client = await basePool.connect();
+      return {
+        query(text, values) {
+          if (!failed && text.startsWith(quotedAudit) && values?.[0] === "success") {
+            failed = true;
+            throw new Error("synthetic terminal audit write failure");
+          }
+          return client.query(text, values);
+        },
+        release(discard) {
+          return client.release(discard);
+        },
+      };
+    },
+  };
+  return { pool: interceptedPool, wasInjected: () => failed };
+}
+
+/** Run one independent fixture change immediately after a selected query has
+ * returned but before the caller receives its rows. This models a concurrent
+ * owner/client transition between the recovery page and its fresh proof. */
+function interposeAfterQuery(basePool, matches, after) {
+  let injected = false;
+  const interceptedPool = {
+    async connect() {
+      const client = await basePool.connect();
+      return {
+        query(text, values) {
+          return client.query(text, values).then(async (result) => {
+            if (!injected && matches(text)) {
+              injected = true;
+              await after();
+            }
+            return result;
+          });
+        },
+        release(discard) {
+          return client.release(discard);
+        },
+      };
+    },
+  };
+  return { pool: interceptedPool, wasInjected: () => injected };
+}
+
+async function enableOwnerProcessing(context) {
+  await pool.query(`UPDATE ${context.table("collection_controls")}
+    SET revision=revision+1, control_state='degraded', processing_enabled=true,
+        reason_code='maintenance', updated_at=clock_timestamp() WHERE singleton=1`);
+}
+
+async function containOwnerProcessing(context) {
+  await pool.query(`UPDATE ${context.table("collection_controls")}
+    SET revision=revision+1, control_state='contained', enrollment_enabled=false,
+        upload_registration_enabled=false, processing_enabled=false, publication_enabled=false,
+        reason_code='maintenance', updated_at=clock_timestamp() WHERE singleton=1`);
 }
 
 async function devicePredecessors(context, principal) {
@@ -1294,5 +1405,631 @@ test("the eight-outstanding refusal still holds when referenced predecessors sur
     const receipt = await context.domain.activate(principal, domainManifest(fresh.at(-1), vector));
     assert.equal(receipt.unchanged, true);
     assert.equal(receipt.generationId, first.generationId);
+  });
+});
+
+test("owner recovery activates social and accountless domains at the ordinary predecessor cap", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_positive", async (context) => {
+    await enableOwnerProcessing(context);
+    const socialParticipant = await seedParticipant(context, "owner-social-positive");
+    const social = await seedDevice(context, socialParticipant, "owner-social-positive");
+    const accountless = await seedAccountlessDevice(context, "owner-positive");
+    const manifestTime = Date.now() - HOUR_MS;
+    const socialDayOneBaseline = await registerEmptyDay(context, social, DAY_ONE,
+      "synthetic-owner-social-day-one-baseline", manifestTime);
+    const socialDayOneLatest = await registerEmptyDay(context, social, DAY_ONE,
+      "synthetic-owner-social-day-one-latest", manifestTime + 30 * 60_000);
+    const socialDays = [
+      socialDayOneBaseline,
+      await registerEmptyDay(context, social, DAY_TWO, "synthetic-owner-social-day-two"),
+    ];
+    const accountlessDays = [
+      await registerEmptyDay(context, accountless, DAY_ONE, "synthetic-owner-accountless-day-one"),
+    ];
+    const clientTokens = [];
+    for (let index = 0; index < NEWEST_KEPT; index += 1) {
+      clientTokens.push(await context.domain.createPredecessor(social, Date.now() + index));
+    }
+    const sequenceBefore = await maxSequence(context);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 2 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.deepEqual(result.outcomes, {
+      activated: 2, eligible: 0, already_active: 0, authority_unavailable: 0, refused: 0,
+    });
+    assert.equal(result.examined, 2);
+    assert.equal(result.daysCovered, 3);
+    assert.equal(result.nextAfterParticipantId, null);
+    assert.ok(await head(context, socialParticipant.participantId));
+    assert.ok(await head(context, accountless.participantId));
+    for (const clientToken of clientTokens) {
+      assert.equal((await predecessorRow(context, clientToken.token)).consumed_at, null,
+        "ordinary unconsumed client predecessors remain untouched by owner recovery");
+    }
+    const socialTokens = await pool.query(`SELECT count(*) FILTER (WHERE consumed_at IS NULL)::integer AS unconsumed,
+      count(*) FILTER (WHERE consumed_at IS NOT NULL)::integer AS consumed
+      FROM ${context.table("telemetry_v12_domain_predecessors")}
+      WHERE participant_id=$1 AND device_id=$2`, [social.participantId, social.deviceId]);
+    assert.deepEqual(socialTokens.rows[0], { unconsumed: NEWEST_KEPT, consumed: 1 },
+      "the owner issue uses the ordinary cap: seven client tokens remain outstanding while its token is consumed");
+    assert.equal(await maxSequence(context), sequenceBefore + 2,
+      "both successful owner activations produce their normal source journal event");
+    const publicOwners = await pool.query(`SELECT participant_id,owner_kind,device_id
+      FROM ${context.table("community_public_source_owners")}
+      WHERE participant_id = ANY($1::text[]) ORDER BY owner_kind,participant_id`,
+    [[socialParticipant.participantId, accountless.participantId]]);
+    assert.deepEqual(publicOwners.rows, [
+      { participant_id: accountless.participantId, owner_kind: "accountless", device_id: accountless.deviceId },
+      { participant_id: socialParticipant.participantId, owner_kind: "social", device_id: null },
+    ], "both activated owners satisfy the maintained public-source eligibility contract");
+    const ownerJournalEvents = await pool.query(`SELECT receipt.participant_id,
+        count(change.sequence)::integer AS journal_events,
+        count(*) FILTER (WHERE change.kind='owner-active')::integer AS owner_active_events
+      FROM ${context.table("storage_v12_event_sources")} receipt
+      JOIN ${context.table("storage_ingestion_changes")} change
+        ON change.source_id=$2 AND change.event_digest=receipt.event_digest
+      WHERE receipt.participant_id = ANY($1::text[])
+      GROUP BY receipt.participant_id ORDER BY receipt.participant_id`,
+    [[socialParticipant.participantId, accountless.participantId], SOURCE_ID]);
+    assert.deepEqual(ownerJournalEvents.rows.map((row) => [
+      row.participant_id, row.journal_events, row.owner_active_events,
+    ]), [socialParticipant.participantId, accountless.participantId].sort().map((participantId) => [
+      participantId, 1, 1,
+    ]), "each sharing mode emits one joined owner-active source journal event");
+    const audits = await pool.query(`SELECT outcome, details_json
+      FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance' ORDER BY id`);
+    assert.equal(audits.rows.length, 1);
+    assert.equal(audits.rows[0].outcome, "success");
+    const auditDetails = JSON.parse(audits.rows[0].details_json);
+    assert.equal(auditDetails.task, "v12_domain_recovery");
+    assert.equal(auditDetails.outcomes.activated, 2);
+    assert.equal(auditDetails.daysCovered, 3);
+    assert.equal("participantId" in auditDetails, false);
+    assert.equal("deviceId" in auditDetails, false);
+    const consumedOwnerPredecessor = await pool.query(`SELECT days_json
+      FROM ${context.table("telemetry_v12_domain_predecessors")}
+      WHERE participant_id=$1 AND device_id=$2 AND consumed_at IS NOT NULL`,
+    [social.participantId, social.deviceId]);
+    assert.equal(consumedOwnerPredecessor.rows.length, 1);
+    const baselineDays = typeof consumedOwnerPredecessor.rows[0].days_json === "string"
+      ? JSON.parse(consumedOwnerPredecessor.rows[0].days_json)
+      : consumedOwnerPredecessor.rows[0].days_json;
+    assert.equal(baselineDays.find((item) => item.day === DAY_ONE)?.manifestId,
+      socialDayOneBaseline.manifestId,
+      "the issued predecessor retains the earliest READY manifest for the day");
+    const activatedDays = await pool.query(`SELECT to_char(observed_day, 'YYYY-MM-DD') AS day, manifest_id
+      FROM ${context.table("telemetry_v12_domain_days")} WHERE generation_id=$1 ORDER BY observed_day`,
+    [(await head(context, socialParticipant.participantId)).generation_id]);
+    assert.equal(activatedDays.rows.find((item) => item.day === DAY_ONE)?.manifest_id,
+      socialDayOneLatest.manifestId,
+      "activation consumes the exact latest READY manifest captured with the predecessor");
+    assert.notEqual(socialDayOneBaseline.manifestId, socialDayOneLatest.manifestId);
+    assert.deepEqual([socialDays.length, accountlessDays.length], [2, 1]);
+  });
+});
+
+test("accountless v1.2 authority without the public enrollment-secret binding stays outside the source journal", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_authority_only", async (context) => {
+    await enableOwnerProcessing(context);
+    const accountless = await seedAccountlessDevice(context, "owner-authority-only", { publicEligible: false });
+    await registerEmptyDay(context, accountless, DAY_ONE, "synthetic-owner-authority-only-day");
+    const activeAuthorization = await pool.query(`SELECT 1
+      FROM ${context.table("telemetry_v12_typed_active_authorizations")}
+      WHERE participant_id=$1 AND device_id=$2`, [accountless.participantId, accountless.deviceId]);
+    assert.equal(activeAuthorization.rows.length, 1,
+      "the exact v1.2 grant still supplies activation authority");
+    const sequenceBefore = await maxSequence(context);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.deepEqual(result.outcomes, {
+      activated: 1, eligible: 0, already_active: 0, authority_unavailable: 0, refused: 0,
+    });
+    assert.ok(await head(context, accountless.participantId), "the authority-valid domain activates");
+    const publicOwner = await pool.query(`SELECT 1 FROM ${context.table("community_public_source_owners")}
+      WHERE participant_id=$1 AND device_id=$2`, [accountless.participantId, accountless.deviceId]);
+    assert.equal(publicOwner.rows.length, 0,
+      "the mismatched enrollment secret keeps this accountless graph outside publication eligibility");
+    const receipts = await pool.query(`SELECT count(*)::integer AS n
+      FROM ${context.table("storage_v12_event_sources")} WHERE participant_id=$1`, [accountless.participantId]);
+    assert.equal(receipts.rows[0].n, 0);
+    assert.equal(await maxSequence(context), sequenceBefore,
+      "authority without the exact public-source lease does not append a journal event");
+  });
+});
+
+test("a pre-activation observer failure audits the confirmed predecessor issuance without claiming activation", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_issued_only", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-issued-only");
+    const principal = await seedDevice(context, participant, "owner-issued-only");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-issued-only");
+    let calls = 0;
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+      observeActivation: async () => {
+        calls += 1;
+        throw new modules.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+      },
+    });
+    await assert.rejects(recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    assert.equal(calls, 1);
+    assert.equal(await head(context, participant.participantId), null);
+    const issued = await devicePredecessors(context, principal);
+    assert.equal(issued.length, 1);
+    assert.equal(issued[0].consumed_at, null);
+    const audit = await pool.query(`SELECT outcome, details_json
+      FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance'`);
+    assert.equal(audit.rows[0]?.outcome, "failure");
+    const details = JSON.parse(audit.rows[0].details_json);
+    assert.equal(details.failureStage, "activation");
+    assert.equal(details.predecessorIssued, true);
+    assert.equal(details.currentAttemptMayHaveCommitted, false);
+    assert.equal(details.completed.examined, 0);
+    assert.deepEqual(Object.keys(details).sort(), [
+      "completed", "currentAttemptMayHaveCommitted", "dryRun", "failureStage",
+      "maxDevices", "method", "predecessorIssued", "task",
+    ]);
+  });
+});
+
+test("applied daysCovered follows the exact vector captured at predecessor issuance", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_fresh_vector", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-fresh-vector");
+    const principal = await seedDevice(context, participant, "owner-fresh-vector");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-fresh-vector-day-one");
+    const injected = interposeAfterQuery(pool,
+      (text) => text.includes("SELECT DISTINCT ON (chunk_day)"),
+      async () => registerEmptyDay(context, principal, DAY_TWO, "synthetic-owner-fresh-vector-day-two"));
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool: injected.pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.equal(injected.wasInjected(), true);
+    assert.equal(result.outcomes.activated, 1);
+    assert.equal(result.daysCovered, 2,
+      "the returned aggregate counts the latest vector captured after preflight, including the new ready day");
+    const activeHead = await head(context, participant.participantId);
+    const activatedDays = await pool.query(`SELECT count(*)::integer AS count
+      FROM ${context.table("telemetry_v12_domain_days")} WHERE generation_id=$1`, [activeHead.generation_id]);
+    assert.equal(activatedDays.rows[0].count, 2);
+  });
+});
+
+test("owner activation rechecks authority changed after candidate selection without issuing a token", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_authority_race", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-authority-race");
+    const principal = await seedDevice(context, participant, "owner-authority-race");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-authority-race");
+    const injected = interposeAfterQuery(pool,
+      (text) => text.includes("WITH eligible_devices AS"),
+      async () => {
+        const revoked = await pool.query(`UPDATE ${context.table("telemetry_v12_device_capabilities")}
+          SET state='revoked', revoked_at=clock_timestamp()
+          WHERE participant_id=$1 AND device_id=$2 AND state='accepted'`,
+        [principal.participantId, principal.deviceId]);
+        assert.equal(revoked.rowCount, 1);
+      });
+    const sequenceBefore = await maxSequence(context);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool: injected.pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.equal(injected.wasInjected(), true);
+    assert.equal(result.outcomes.authority_unavailable, 1);
+    assert.equal(result.outcomes.activated, 0);
+    assert.equal(await head(context, participant.participantId), null);
+    assert.equal((await devicePredecessors(context, principal)).length, 0,
+      "fresh authority proof runs before a predecessor is issued");
+    assert.equal(await maxSequence(context), sequenceBefore);
+  });
+});
+
+test("a processing-control change after selection stops preflight with no activation writes", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_processing_race", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-processing-race");
+    const principal = await seedDevice(context, participant, "owner-processing-race");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-processing-race");
+    const injected = interposeAfterQuery(pool,
+      (text) => text.includes("WITH eligible_devices AS"),
+      async () => containOwnerProcessing(context));
+    const sequenceBefore = await maxSequence(context);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool: injected.pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    await assert.rejects(recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    }), { status: 503, code: "PROCESSING_DISABLED" });
+    assert.equal(injected.wasInjected(), true);
+    assert.equal(await head(context, participant.participantId), null);
+    assert.equal((await devicePredecessors(context, principal)).length, 0);
+    assert.equal(await maxSequence(context), sequenceBefore);
+    const audit = await pool.query(`SELECT outcome, details_json
+      FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance'`);
+    assert.equal(audit.rows[0]?.outcome, "failure");
+    const details = JSON.parse(audit.rows[0].details_json);
+    assert.equal(details.failureStage, "preflight");
+    assert.equal(details.predecessorIssued, false);
+    assert.equal(details.currentAttemptMayHaveCommitted, false);
+    assert.equal(details.completed.examined, 0);
+  });
+});
+
+test("activation rechecks revoked authority after issuance and leaves its predecessor unconsumed", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_authority_activation", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-authority-activation");
+    const principal = await seedDevice(context, participant, "owner-authority-activation");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-authority-activation");
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+      observeActivation: async (invoke) => {
+        const revoked = await pool.query(`UPDATE ${context.table("telemetry_v12_device_capabilities")}
+          SET state='revoked', revoked_at=clock_timestamp()
+          WHERE participant_id=$1 AND device_id=$2 AND state='accepted'`,
+        [principal.participantId, principal.deviceId]);
+        assert.equal(revoked.rowCount, 1);
+        return invoke();
+      },
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.equal(result.outcomes.authority_unavailable, 1);
+    assert.equal(result.outcomes.activated, 0);
+    assert.equal(result.refusals.TELEMETRY_REQUIRED, undefined);
+    assert.equal(await head(context, participant.participantId), null);
+    const issued = await devicePredecessors(context, principal);
+    assert.equal(issued.length, 1);
+    assert.equal(issued[0].consumed_at, null,
+      "revocation is rechecked before activation and cannot consume the newly issued token");
+    const domains = await pool.query(`SELECT count(*)::integer AS count
+      FROM ${context.table("telemetry_v12_domains")} WHERE participant_id=$1`, [principal.participantId]);
+    assert.equal(domains.rows[0].count, 0);
+  });
+});
+
+test("a head committed after candidate selection is reported as already active, without a second receipt", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_head_race", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-head-race");
+    const principal = await seedDevice(context, participant, "owner-head-race");
+    const day = await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-head-race");
+    const sequenceBefore = await maxSequence(context);
+    const injected = interposeAfterQuery(pool,
+      (text) => text.includes("WITH eligible_devices AS"),
+      async () => {
+        const predecessor = await context.domain.createPredecessor(principal);
+        await context.domain.activate(principal, domainManifest(predecessor, [day]));
+      });
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool: injected.pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.equal(injected.wasInjected(), true);
+    assert.equal(result.outcomes.already_active, 1);
+    assert.equal(result.outcomes.activated, 0);
+    assert.equal(result.daysCovered, 0);
+    assert.ok(await head(context, participant.participantId));
+    assert.equal((await devicePredecessors(context, principal)).length, 1,
+      "the ordinary client's token is the only token; recovery did not issue another");
+    assert.equal(await maxSequence(context), sequenceBefore + 1);
+  });
+});
+
+test("owner pagination cursors are opaque and bound to the actor, schema mode, and authenticated bytes", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_cursor", async (context) => {
+    await enableOwnerProcessing(context);
+    for (const label of ["cursor-first", "cursor-second"]) {
+      const participant = await seedParticipant(context, label);
+      const principal = await seedDevice(context, participant, label);
+      await registerEmptyDay(context, principal, DAY_ONE, `synthetic-${label}`);
+    }
+    const cursorSecret = randomBytes(32).toString("hex");
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret,
+    });
+    const body = { action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1 } };
+    const identityKey = "synthetic-owner-recovery-operator";
+    const firstPage = await recover({ body, identityKey });
+    const cursor = firstPage.nextAfterParticipantId;
+    assert.equal(firstPage.examined, 1);
+    assert.match(cursor, /^v12r1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]+$/u);
+    assert.equal(cursor.includes("synthetic-"), false);
+    const secondPage = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1,
+        afterParticipantId: cursor } },
+      identityKey,
+    });
+    assert.equal(secondPage.examined, 1);
+    assert.equal(secondPage.nextAfterParticipantId, null);
+    const changedMode = { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1,
+      afterParticipantId: cursor } };
+    await assert.rejects(recover({ body: changedMode, identityKey }),
+      { status: 400, code: "BODY_INVALID" });
+    await assert.rejects(recover({ body: {
+      action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1,
+        afterParticipantId: cursor },
+    }, identityKey: `${identityKey}-different` }), { status: 400, code: "BODY_INVALID" });
+    const otherSchemaHandler = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: { primarySchema: "synthetic_other_owner_schema" },
+      cursorSecret,
+    });
+    await assert.rejects(otherSchemaHandler({ body: {
+      action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1,
+        afterParticipantId: cursor },
+    }, identityKey }), { status: 400, code: "BODY_INVALID" });
+    const last = cursor.at(-1);
+    const tampered = `${cursor.slice(0, -1)}${last === "A" ? "B" : "A"}`;
+    await assert.rejects(recover({ body: {
+      action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1,
+        afterParticipantId: tampered },
+    }, identityKey }), { status: 400, code: "BODY_INVALID" });
+  });
+});
+
+test("a later candidate failure audits only completed outcomes and marks the current activation uncertain", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_partial", async (context) => {
+    await enableOwnerProcessing(context);
+    const principals = [];
+    for (const label of ["first", "second"]) {
+      const participant = await seedParticipant(context, `owner-partial-${label}`);
+      const principal = await seedDevice(context, participant, `owner-partial-${label}`);
+      await registerEmptyDay(context, principal, DAY_ONE, `synthetic-owner-partial-${label}`);
+      principals.push({ ...principal, participantId: participant.participantId });
+    }
+    const sequenceBefore = await maxSequence(context);
+    let activationCalls = 0;
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+      observeActivation: async (invoke) => {
+        activationCalls += 1;
+        if (activationCalls === 2) {
+          await invoke();
+          throw new modules.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+        }
+        return invoke();
+      },
+    });
+    await assert.rejects(recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 2 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    assert.equal(activationCalls, 2);
+    const heads = await pool.query(`SELECT participant_id
+      FROM ${context.table("telemetry_v12_domain_heads")}`);
+    assert.equal(heads.rows.length, 2, "the first and ambiguous second activation are both durable");
+    assert.ok(heads.rows.every((row) => principals.some((candidate) => candidate.participantId === row.participant_id)));
+    assert.equal(await maxSequence(context), sequenceBefore + 2,
+      "the second activation's journal event committed before its synthetic acknowledgment was lost");
+    const audit = await pool.query(`SELECT outcome, details_json
+      FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance'`);
+    assert.equal(audit.rows.length, 1);
+    assert.equal(audit.rows[0].outcome, "failure");
+    const details = JSON.parse(audit.rows[0].details_json);
+    assert.equal(details.failureStage, "activation");
+    assert.equal(details.predecessorIssued, true);
+    assert.equal(details.currentAttemptMayHaveCommitted, true);
+    assert.deepEqual(details.completed, {
+      examined: 1,
+      outcomes: { activated: 1, eligible: 0, already_active: 0, authority_unavailable: 0, refused: 0 },
+      refusals: {},
+      daysCovered: 1,
+    });
+    assert.equal("participantId" in details, false);
+    assert.equal("deviceId" in details, false);
+    assert.equal("cursor" in details, false);
+    assert.equal("token" in details, false);
+    assert.deepEqual(Object.keys(details).sort(), [
+      "completed", "currentAttemptMayHaveCommitted", "dryRun", "failureStage",
+      "maxDevices", "method", "predecessorIssued", "task",
+    ]);
+  });
+});
+
+test("a terminal success-audit failure preserves completed activation and records no candidate uncertainty", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_audit_fail", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-audit-failure");
+    const principal = await seedDevice(context, participant, "owner-audit-failure");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-audit-failure");
+    const sequenceBefore = await maxSequence(context);
+    const injected = failOneSuccessAuditUpdate(pool, context.schema);
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool: injected.pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+    });
+    await assert.rejects(recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    assert.equal(injected.wasInjected(), true);
+    assert.ok(await head(context, participant.participantId), "the activation committed before terminal audit failed");
+    assert.equal(await maxSequence(context), sequenceBefore + 1);
+    const audit = await pool.query(`SELECT outcome, details_json
+      FROM ${context.table("admin_action_audit")} WHERE action='run_maintenance'`);
+    assert.equal(audit.rows.length, 1);
+    assert.equal(audit.rows[0].outcome, "failure");
+    const details = JSON.parse(audit.rows[0].details_json);
+    assert.equal(details.failureStage, "terminal_audit");
+    assert.equal(details.predecessorIssued, false);
+    assert.equal(details.currentAttemptMayHaveCommitted, false,
+      "the already confirmed activation is not relabeled as an uncertain candidate write");
+    assert.equal(details.completed.examined, 1);
+    assert.equal(details.completed.outcomes.activated, 1);
+    assert.equal(details.completed.daysCovered, 1);
+  });
+});
+
+test("owner recovery ranks recent devices and excludes manifests made READY after the page cutoff", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_rank", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-device-rank");
+    const lexicalFirst = await seedDevice(context, participant, "rank-a-old");
+    const recent = await seedDevice(context, participant, "rank-z-current");
+    assert.ok(lexicalFirst.deviceId < recent.deviceId,
+      "the stale device is also the old lexical-first ranking choice");
+    const nowEpoch = Date.now() + 10_000;
+    const at = (offset) => nowEpoch + offset;
+    await admitQuotaDay(context, lexicalFirst, DAY_ONE, {
+      registrationEpoch: at(-90 * 60_000), readyEpoch: at(-60 * 60_000),
+    });
+    await admitQuotaDay(context, recent, DAY_ONE, {
+      registrationEpoch: at(-5 * HOUR_MS), readyEpoch: at(-4 * HOUR_MS),
+    });
+    await admitQuotaDay(context, recent, DAY_TWO, {
+      registrationEpoch: at(-4 * HOUR_MS), readyEpoch: at(-3 * HOUR_MS),
+    });
+    await admitQuotaDay(context, recent, DAY_THREE, {
+      registrationEpoch: at(-2 * HOUR_MS), readyEpoch: at(-30 * 60_000),
+    });
+    const lateReady = await admitQuotaDay(context, lexicalFirst, DAY_TWO, {
+      registrationEpoch: nowEpoch - 20 * 60_000,
+      readyEpoch: nowEpoch + 1_000,
+    });
+    const stagedReadyTiming = await pool.query(`SELECT created_at, ready_at
+      FROM ${context.table("telemetry_v12_day_manifests")} WHERE id=$1`, [lateReady.manifestId]);
+    assert.ok(new Date(stagedReadyTiming.rows[0].created_at).getTime() <= nowEpoch);
+    assert.ok(new Date(stagedReadyTiming.rows[0].ready_at).getTime() > nowEpoch,
+      "the manifest was created before the cutoff but only became READY after it");
+    const rankedEvidence = await pool.query(`SELECT device_id, max(created_at) AS latest_created,
+      max(ready_at) AS latest_ready FROM ${context.table("telemetry_v12_day_manifests")}
+      WHERE participant_id=$1 AND state='ready' AND created_at <= $2::timestamptz
+        AND ready_at <= $2::timestamptz GROUP BY device_id`,
+    [participant.participantId, new Date(nowEpoch).toISOString()]);
+    const oldEvidence = rankedEvidence.rows.find((row) => row.device_id === lexicalFirst.deviceId);
+    const recentEvidence = rankedEvidence.rows.find((row) => row.device_id === recent.deviceId);
+    assert.ok(new Date(oldEvidence.latest_created).getTime() > new Date(recentEvidence.latest_created).getTime(),
+      "the stale device has the newer manifest creation timestamp");
+    assert.ok(new Date(oldEvidence.latest_ready).getTime() < new Date(recentEvidence.latest_ready).getTime(),
+      "the active device has the newer READY transition timestamp");
+
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+      clock: () => nowEpoch,
+    });
+    const result = await recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    });
+    assert.deepEqual(result.outcomes, {
+      activated: 0, eligible: 1, already_active: 0, authority_unavailable: 0, refused: 0,
+    });
+    assert.equal(result.daysCovered, 3,
+      "rank by READY transition, not manifest creation; also exclude a post-cutoff READY transition");
+    assert.equal(result.nextAfterParticipantId, null);
+  });
+});
+
+test("an unrecognized owner-recovery ApiError fails the page closed instead of becoming a manifest refusal", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12owner_unknown", async (context) => {
+    await enableOwnerProcessing(context);
+    const participant = await seedParticipant(context, "owner-unknown-error");
+    const principal = await seedDevice(context, participant, "owner-unknown-error");
+    await registerEmptyDay(context, principal, DAY_ONE, "synthetic-owner-unknown-error");
+    const nowEpoch = Date.now();
+    const recover = modules.createPostgresV12OwnerRecovery({
+      pool,
+      schema: context.options.schema,
+      cursorSecret: randomBytes(32).toString("hex"),
+      clock: () => nowEpoch,
+      observeActivation: async () => {
+        throw new modules.ApiError(409, "TELEMETRY_UNRECOGNIZED_SYNTHETIC_CODE");
+      },
+    });
+    await assert.rejects(recover({
+      body: { action: "run_maintenance", v12DomainRecovery: { dryRun: false, maxDevices: 1 } },
+      identityKey: "synthetic-owner-recovery-operator",
+    }), { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+    assert.equal(await head(context, participant.participantId), null,
+      "an unknown code cannot be reported as a manifest refusal or write an active head");
   });
 });
