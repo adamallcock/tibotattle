@@ -214,25 +214,32 @@ test("production renders from its committed file (PROD-PREP) and refuses one wit
   assert.deepEqual([rendered.environment, rendered.project, rendered.notificationChannel],
     ["production", "tibotattle-prod", "unassigned"]);
   const committed = JSON.parse(readFileSync(committedDesiredStatePath("production"), "utf8"));
+  assert.equal(committed.scheduler["analytics-refresh"].state, "ENABLED");
   assert.equal(committed.scheduler["analytics-refresh"].schedule, "0 3 * * *");
-  assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
+  const productionQuiet = rendered.policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(productionQuiet.deferred, "NOTIFICATION_CHANNEL_UNASSIGNED");
+  assert.equal(productionQuiet.deferredConditions, undefined);
   // An unset cadence still defers policies without inventing a schedule.
   const unset = structuredClone(committed);
   unset.scheduler["analytics-refresh"].schedule = null;
+  unset.scheduler["analytics-refresh"].state = "PAUSED";
   const unsetText = `${JSON.stringify(unset, null, 2)}\n`;
   const unscheduled = await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unsetText : readFileSync(path, "utf8")) });
   assert.equal(unscheduled.code, 0, unscheduled.err);
-  assert.deepEqual(JSON.parse(unscheduled.out).policies.find(({ id }) => id === "scheduler-quiet").deferred,
-    "SCHEDULER_CADENCE_UNSET");
-  // Once a cadence is committed, the trigger is still committed PAUSED, so the policies then wait for OPS-3.
-  // The cadence is synthetic and lives in this test only.
+  const unscheduledQuiet = JSON.parse(unscheduled.out).policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(unscheduledQuiet.deferred, "NOTIFICATION_CHANNEL_UNASSIGNED");
+  assert.deepEqual(unscheduledQuiet.deferredConditions,
+    [{ job: "analytics-refresh", deferred: "SCHEDULER_CADENCE_UNSET" }]);
+  // The synthetic cron leaves the committed active trigger schedulable; without a
+  // channel, the production policy still reports the channel as its deferral.
   const cadenced = structuredClone(committed);
   cadenced.scheduler["analytics-refresh"].schedule = "40 6 * * 2";
   const cadencedText = `${JSON.stringify(cadenced, null, 2)}\n`;
   const scheduled = JSON.parse((await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? cadencedText : readFileSync(path, "utf8")) })).out);
-  assert.deepEqual(scheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
+  assert.deepEqual(scheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred,
+    "NOTIFICATION_CHANNEL_UNASSIGNED");
   const unfilledText = unfilledProductionText();
   const unfilled = await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unfilledText : readFileSync(path, "utf8")) });

@@ -119,15 +119,21 @@ const DYNAMIC_HEADER_READS: readonly Readonly<{
     expression: "headers.get(name)",
     reason: "copies an allowlisted set of headers from a provider RESPONSE",
   },
-  ...[
-    "headers.get(`${format}:${record.recordId}`)",
-    "afterHeaders.get(`${input.format}:${newRecord.recordId}`)",
-    "headers.get(`10:${record.recordId}`)",
-  ].map((expression) => ({
+  {
     file: "../src/postgres-classification-links.ts",
-    expression,
+    expression: "headers.get(`${format}:${record.recordId}`)",
     reason: "a Map of stored classification header proofs keyed by format and record id, not an HTTP header read",
-  })),
+  },
+  {
+    file: "../src/postgres-classification-activation.ts",
+    expression: "afterHeaders.get(`${input.format}:${newRecord.recordId}`)",
+    reason: "a Map of stored classification header proofs keyed by format and record id, not an HTTP header read",
+  },
+  {
+    file: "../src/postgres-classification-activation.ts",
+    expression: "headers.get(`10:${record.recordId}`)",
+    reason: "a Map of stored classification header proofs keyed by format and record id, not an HTTP header read",
+  },
 ]);
 
 const REQUEST_HEADER_CLASSES: ReadonlySet<string> = new Set<string>([

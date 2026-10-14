@@ -97,6 +97,7 @@ async function setup() {
     modules = {
       ...await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts"),
       ...await vite.ssrLoadModule("/src/postgres-typed-v12-admission.ts"),
+      ...await vite.ssrLoadModule("/src/telemetry-activation-observation.ts"),
     };
   }
 }
@@ -296,6 +297,277 @@ async function clientPass(context, principal, days, nowEpoch = Date.now()) {
   assert.equal(renewed.previousGenerationId, before.previousGenerationId);
   const manifest = domainManifest(renewed, days);
   return { before, renewed, manifest, result: await context.domain.activate(principal, manifest) };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function rendezvous(signal, outcome, label, timeoutMs = 15_000) {
+  let timer;
+  try {
+    const result = await Promise.race([
+      signal.then((value) => ({ kind: "signal", value })),
+      outcome.then((value) => ({ kind: "outcome", value })),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ kind: "timeout" }), timeoutMs);
+      }),
+    ]);
+    assert.equal(result.kind, "signal", `${label} must arrive before operation completion`);
+    return result.value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function boundedDrain(promises, label, timeoutMs = 15_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.all(promises),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not drain`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isStateLockQuery(text) {
+  return /community_analytical_input_versions/u.test(text) && /FOR UPDATE OF v\b/u.test(text);
+}
+
+/** Wrap real pg clients only to pause at a completed state-lock query and to
+ * signal when the competing query has been sent. Every query still runs on
+ * PostgreSQL; the wrapper creates no substitute transaction behavior. */
+function interleavingPool(basePool, { afterStateLock, beforeStateLock, onConnect } = {}) {
+  let paused = false;
+  const activeClients = new Set();
+  return {
+    async connect() {
+      const client = await basePool.connect();
+      let released = false;
+      const release = (discard) => {
+        if (released) return;
+        released = true;
+        activeClients.delete(discardClient);
+        return client.release(discard);
+      };
+      const discardClient = () => release(new Error("bounded CAS test cleanup"));
+      activeClients.add(discardClient);
+      let backendPid;
+      try {
+        backendPid = Number((await client.query("SELECT pg_backend_pid() AS pid")).rows[0]?.pid);
+        onConnect?.(backendPid);
+      } catch (error) {
+        discardClient();
+        throw error;
+      }
+      return {
+        async query(text, values) {
+          if (!isStateLockQuery(text)) return client.query(text, values);
+          if (afterStateLock && !paused) {
+            paused = true;
+            const result = await client.query(text, values);
+            afterStateLock.resolve(backendPid);
+            await afterStateLock.resume;
+            return result;
+          }
+          const pending = client.query(text, values);
+          beforeStateLock?.resolve(backendPid);
+          return pending;
+        },
+        release,
+      };
+    },
+    discardActive() {
+      for (const discardClient of [...activeClients]) discardClient();
+    },
+  };
+}
+
+async function waitForStateLockWait(pid, expectedBlockerPid) {
+  // Observe PostgreSQL's actual lock wait, rather than relying on elapsed time
+  // to assume the competing stateRow statement reached the server.
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    const result = await pool.query(`SELECT state, wait_event_type, query,
+        pg_blocking_pids(pid) AS blocking_pids
+      FROM pg_stat_activity WHERE pid=$1`, [pid]);
+    const activity = result.rows[0];
+    if (activity?.wait_event_type === "Lock"
+        && activity.blocking_pids.map(Number).includes(expectedBlockerPid)) {
+      assert.equal(activity.state, "active");
+      assert.match(activity.query, /community_analytical_input_versions/u);
+      assert.match(activity.query, /FOR UPDATE OF v\b/u);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail("competing stateRow query did not wait on the first activation's state lock");
+}
+
+async function assertSerializedActivationRace(context, {
+  principal, firstManifest, secondManifest, previousGenerationId,
+}) {
+  const firstRead = deferred();
+  const releaseFirst = deferred();
+  firstRead.resume = releaseFirst.promise;
+  const secondSent = deferred();
+  const firstBackend = deferred();
+  let firstPool;
+  let secondPool;
+  const firstDomain = modules.createPostgresTypedV12Domain(firstPool = interleavingPool(pool, {
+    afterStateLock: firstRead,
+    onConnect: firstBackend.resolve,
+  }), context.options);
+  const secondDomain = modules.createPostgresTypedV12Domain(secondPool = interleavingPool(pool, {
+    beforeStateLock: secondSent,
+  }), context.options);
+  let firstOutcome;
+  let secondOutcome;
+  try {
+    const before = await snapshot(context);
+    const sequenceBefore = await maxSequence(context);
+    const inputRevisionBefore = await inputRevision(context, principal.participantId);
+    const observations = [];
+    const observe = modules.createTelemetryActivationObserver((item) => observations.push(item));
+    firstOutcome = observe("v1.2", () => firstDomain.activate(principal, firstManifest))
+      .then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+
+    const firstPid = await rendezvous(firstRead.promise, firstOutcome, "first activation state read");
+    assert.equal(firstPid, await rendezvous(firstBackend.promise, firstOutcome, "first backend connection"));
+    secondOutcome = observe("v1.2", () => secondDomain.activate(principal, secondManifest))
+      .then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
+    const secondPid = await rendezvous(secondSent.promise, secondOutcome, "competing state-lock query");
+    assert.ok(Number.isInteger(secondPid));
+    await rendezvous(waitForStateLockWait(secondPid, firstPid), secondOutcome,
+      "competing query lock wait", 10_000);
+    releaseFirst.resolve();
+
+    const [winner, loser] = await boundedDrain([firstOutcome, secondOutcome], "activation race");
+    assert.equal(winner.ok, true);
+    assert.equal(winner.value.replay, false);
+    assert.equal(loser.ok, false);
+    assert.equal(loser.error.status, 409);
+    assert.equal(loser.error.code, "TELEMETRY_MANIFEST_CONFLICT");
+
+    const refusal = observations.find((item) => item.outcome === "refused");
+    assert.deepEqual(refusal && {
+      status: refusal.status,
+      code: refusal.code,
+      refusalPhase: refusal.refusalPhase,
+    }, {
+      status: 409,
+      code: "TELEMETRY_MANIFEST_CONFLICT",
+      refusalPhase: "state",
+    });
+    assert.deepEqual(observations.filter((item) => item.outcome === "activated")
+      .map((item) => item.refusalPhase), [null]);
+
+    const winnerHead = await head(context, principal.participantId);
+    assert.deepEqual(winnerHead, {
+      generation_id: winner.value.generationId,
+      revision: previousGenerationId === null ? 1 : 2,
+    });
+    assert.equal(await maxSequence(context), sequenceBefore + 1,
+      "only the winner appends the v1.2 head journal event");
+    assert.equal(await inputRevision(context, principal.participantId), inputRevisionBefore,
+      "publishing the v1.2 head does not advance the participant input revision");
+
+    const after = await snapshot(context);
+    assert.equal(after.telemetry_v12_domains.n, before.telemetry_v12_domains.n + 1);
+    assert.equal(after.telemetry_v12_domain_days.n, before.telemetry_v12_domain_days.n + 1);
+    assert.equal(after.telemetry_v12_domain_heads.n,
+      Math.max(1, before.telemetry_v12_domain_heads.n));
+    assert.equal(after.telemetry_v12_domain_predecessors.n,
+      before.telemetry_v12_domain_predecessors.n,
+      "the losing transaction neither inserts nor deletes a predecessor");
+
+    const [firstToken, secondToken] = await Promise.all([
+      predecessorRow(context, firstManifest.predecessor.token),
+      predecessorRow(context, secondManifest.predecessor.token),
+    ]);
+    assert.notEqual(firstToken.consumed_at, null, "the winner's predecessor is consumed");
+    assert.equal(secondToken.consumed_at, null, "the stale loser's predecessor remains retryable");
+    const winnerDomain = await pool.query(`SELECT id, predecessor_token_hash
+      FROM ${context.table("telemetry_v12_domains")}
+      WHERE predecessor_token_hash = ANY($1::text[])`, [
+      [sha256Hex(firstManifest.predecessor.token), sha256Hex(secondManifest.predecessor.token)],
+    ]);
+    assert.deepEqual(winnerDomain.rows, [{
+      id: winner.value.generationId,
+      predecessor_token_hash: sha256Hex(firstManifest.predecessor.token),
+    }], "the loser leaves no committed domain row");
+
+    const receipts = await pool.query(`SELECT receipt.generation_id, receipt.previous_generation_id,
+        receipt.manifest_digest, receipt.head_revision::integer AS head_revision,
+        change.event_digest, change.kind, change.object_digest, change.content_digest
+      FROM ${context.table("storage_v12_event_sources")} receipt
+      JOIN ${context.table("storage_ingestion_changes")} change
+        ON change.source_id=$3 AND change.event_digest=receipt.event_digest
+      WHERE receipt.participant_id=$1 AND receipt.device_id=$2
+        AND receipt.manifest_digest = ANY($4::text[])
+      ORDER BY receipt.manifest_digest`, [principal.participantId, principal.deviceId, SOURCE_ID,
+      [firstManifest.manifestDigest, secondManifest.manifestDigest]]);
+    assert.equal(receipts.rows.length, 1,
+      "only the winning candidate has a receipt joined to its journal event");
+    const [receipt] = receipts.rows;
+    assert.deepEqual({
+      generation_id: receipt.generation_id,
+      previous_generation_id: receipt.previous_generation_id,
+      manifest_digest: receipt.manifest_digest,
+      head_revision: receipt.head_revision,
+      kind: receipt.kind,
+      content_digest: receipt.content_digest,
+    }, {
+      generation_id: winner.value.generationId,
+      previous_generation_id: previousGenerationId,
+      manifest_digest: firstManifest.manifestDigest,
+      head_revision: previousGenerationId === null ? 1 : 2,
+      kind: "owner-active",
+      content_digest: firstManifest.manifestDigest,
+    });
+    assert.match(receipt.event_digest, /^[0-9a-f]{64}$/u);
+    assert.equal(receipt.object_digest, receipt.event_digest);
+  } finally {
+    releaseFirst.resolve();
+    const outcomes = [firstOutcome, secondOutcome].filter(Boolean);
+    try {
+      await boundedDrain(outcomes, "activation race cleanup");
+    } catch {
+      firstPool?.discardActive();
+      secondPool?.discardActive();
+      await boundedDrain(outcomes, "discarded activation race cleanup", 5_000);
+    }
+  }
+}
+
+async function raceFixture(context, label, installInitialHead) {
+  const participant = await seedParticipant(context, label);
+  const principal = await seedDevice(context, participant, label);
+  const originalDay = await registerEmptyDay(context, principal, DAY_ONE, `${label}-base`);
+  let previousGenerationId = null;
+  if (installInitialHead) {
+    const initial = await clientPass(context, principal, [originalDay]);
+    previousGenerationId = newGeneration(initial.result, null).generationId;
+  }
+
+  const firstDay = await registerEmptyDay(context, principal, DAY_ONE, `${label}-candidate-a`);
+  const secondDay = await registerEmptyDay(context, principal, DAY_ONE, `${label}-candidate-b`);
+  const firstPredecessor = await context.domain.createPredecessor(principal);
+  const secondPredecessor = await context.domain.createPredecessor(principal);
+  assert.equal(firstPredecessor.previousGenerationId, previousGenerationId);
+  assert.equal(secondPredecessor.previousGenerationId, previousGenerationId);
+
+  return {
+    principal,
+    previousGenerationId,
+    firstManifest: domainManifest(firstPredecessor, [firstDay]),
+    secondManifest: domainManifest(secondPredecessor, [secondDay]),
+  };
 }
 
 async function snapshot(context) {
@@ -520,6 +792,27 @@ test("a changed day vector or input takes the normal path, and a stale predecess
       { generation_id: revised.generationId, revision: 4 });
     const generations = await pool.query(`SELECT count(*)::integer AS n FROM ${context.table("telemetry_v12_domains")}`);
     assert.equal(generations.rows[0].n, 4);
+  });
+});
+
+test("concurrent v1.2 activations serialize before comparing a missing head", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12cas0", async (context) => {
+    const race = await raceFixture(context, "cas-no-head", false);
+    await assertSerializedActivationRace(context, race);
+  });
+});
+
+test("concurrent v1.2 activations serialize before comparing an existing head", {
+  skip: !PG_TEST_SOCKET,
+  timeout: 180_000,
+}, async () => {
+  await withSchema("v12cas1", async (context) => {
+    const race = await raceFixture(context, "cas-existing-head", true);
+    assert.ok(race.previousGenerationId);
+    await assertSerializedActivationRace(context, race);
   });
 });
 

@@ -81,10 +81,133 @@ test("activation observations distinguish success, replay, unchanged and safe re
   assert.deepEqual(events.map(event => event.code), [null, null, null,
     "TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE", "ACTIVATION_UNAVAILABLE"]);
   for (const event of events) {
-    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "outcome", "protocol", "status"]);
+    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "outcome", "protocol",
+      "refusalPhase", "status"]);
     assert.equal(event.elapsedMs, 5);
   }
+  assert.deepEqual(events.map(event => event.refusalPhase), [null, null, null, null, null]);
   assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+});
+
+test("activation refusal phases are closed metadata and never change the public error response", async () => {
+  const { createTelemetryActivationObserver, markTelemetryActivationRefusalPhase } =
+    await vite.ssrLoadModule("/src/telemetry-activation-observation.ts");
+  const phases = ["rekey", "classification", "state", "session_closure", "closure"];
+  const events = [];
+  const observe = createTelemetryActivationObserver(event => events.push(event), () => Date.parse("2026-10-14T12:00:00Z"));
+  for (const phase of phases) {
+    const error = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT", {
+      publicDetails: { reason: "synthetic-closed-reason" }, responseHeaders: { "retry-after": "30" },
+    });
+    const plain = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT", {
+      publicDetails: { reason: "synthetic-closed-reason" }, responseHeaders: { "retry-after": "30" },
+    });
+    assert.equal(markTelemetryActivationRefusalPhase(error, phase), error);
+    assert.equal(markTelemetryActivationRefusalPhase(error, "synthetic-private-phase"), error,
+      "an invalid or later phase cannot replace the first closed tag");
+    await assert.rejects(observe("v1.2", async () => { throw error; }), actual => actual === error);
+    const [actualResponse, expectedResponse] = [errors.errorResponse(error, REQUEST_ID), errors.errorResponse(plain, REQUEST_ID)];
+    assert.equal(actualResponse.status, expectedResponse.status);
+    assert.deepEqual([...actualResponse.headers], [...expectedResponse.headers]);
+    assert.equal(await actualResponse.text(), await expectedResponse.text());
+  }
+  assert.deepEqual(events.map(event => event.refusalPhase), phases);
+  for (const event of events) {
+    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "outcome", "protocol",
+      "refusalPhase", "status"]);
+    assert.equal(event.status, 409);
+    assert.equal(event.code, "TELEMETRY_MANIFEST_CONFLICT");
+  }
+
+  const forged = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  Object.defineProperty(forged, "refusalPhase", { get() { throw new Error("synthetic-private-getter"); } });
+  markTelemetryActivationRefusalPhase(forged, "synthetic-private-phase");
+  await assert.rejects(observe("v1.2", async () => { throw forged; }), error => error === forged);
+  const hostile = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  markTelemetryActivationRefusalPhase(hostile, "state");
+  Object.defineProperty(hostile, "status", { get() { throw new Error("synthetic-private-status"); } });
+  Object.defineProperty(hostile, "code", { get() { throw new Error("synthetic-private-code"); } });
+  await assert.rejects(observe("v1.2", async () => { throw hostile; }), error => error === hostile);
+  assert.equal(events.at(-2).refusalPhase, null);
+  assert.deepEqual({ status: events.at(-1).status, code: events.at(-1).code, phase: events.at(-1).refusalPhase },
+    { status: 500, code: "ACTIVATION_UNAVAILABLE", phase: null });
+  const unavailable = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  markTelemetryActivationRefusalPhase(unavailable, "state");
+  await assert.rejects(observe("v1.2", async () => { throw unavailable; }), error => error === unavailable);
+  assert.equal(events.at(-1).outcome, "failed");
+  assert.equal(events.at(-1).refusalPhase, null);
+  const taggedV11 = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  markTelemetryActivationRefusalPhase(taggedV11, "state");
+  await assert.rejects(observe("v1.1", async () => { throw taggedV11; }), error => error === taggedV11);
+  assert.equal(events.at(-1).refusalPhase, null);
+  const nonApi = Object.assign(new Error("synthetic-private-non-api"), { refusalPhase: "state" });
+  assert.equal(markTelemetryActivationRefusalPhase(nonApi, "state"), nonApi);
+  await assert.rejects(observe("v1.2", async () => { throw nonApi; }), error => error === nonApi);
+  assert.equal(events.at(-1).refusalPhase, null);
+  assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+});
+
+test("a v1.2 predecessor-state refusal reaches the aggregate observer with its routed phase", async () => {
+  const contract = await vite.ssrLoadModule("@app-usagemonitor/telemetry-contract");
+  const crypto = await vite.ssrLoadModule("/src/crypto.ts");
+  const constants = await vite.ssrLoadModule("/src/constants.ts");
+  const { createPostgresTypedV12Domain } = await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts");
+  const { createTelemetryActivationObserver } = await vite.ssrLoadModule("/src/telemetry-activation-observation.ts");
+  const day = "2026-10-14";
+  const now = Date.parse(`${day}T12:00:00.000Z`);
+  const manifest = {
+    schemaVersion: "telemetry-domain-manifest-v1.2",
+    fromDay: day,
+    throughDay: day,
+    predecessor: { token: "11111111-1111-4111-8111-111111111111", previousGenerationId: null,
+      legacyFingerprint: "a".repeat(64) },
+    days: [{ day, manifestId: "22222222-2222-4222-8222-222222222222", manifestDigest: "b".repeat(64) }],
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await crypto.sha256Hex(contract.telemetryV12DomainManifestDigestInput(manifest));
+  const versions = {
+    schema_version: contract.TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    envelope_schema_version: contract.TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+    field_dictionary_version: contract.TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    privacy_contract_version: contract.TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+    state: "active", policy_revision: 1, max_day_chunks: contract.MAX_TELEMETRY_V12_DAY_CHUNKS,
+    max_chunk_records: contract.MAX_TELEMETRY_V12_CHUNK_RECORDS,
+    max_day_bytes: contract.MAX_TELEMETRY_V12_DAY_CANONICAL_BYTES, legacy_state: "active",
+  };
+  const client = {
+    async query(sql) {
+      if (sql.startsWith("SELECT typed.schema_version")) return { rows: [versions], rowCount: 1 };
+      if (sql.includes("FROM \"synthetic_schema\".\"participants\"")) return { rows: [{
+        owner_kind: "social", participant_consent_version: constants.TELEMETRY_CONSENT_VERSION,
+        participant_state: "active", authority_kind: "social", device_state: "active",
+        device_expires_at: new Date(now + 60_000), enrollment_device_id: null,
+      }], rowCount: 1 };
+      if (sql.includes("telemetry_v12_device_capabilities")) return { rows: [{ state: "accepted",
+        telemetry_schema_version: contract.TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+        field_dictionary_version: contract.TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+        privacy_contract_version: contract.TELEMETRY_V12_PRIVACY_CONTRACT_VERSION }], rowCount: 1 };
+      if (sql.includes("telemetry_v12_domain_heads") && sql.includes("telemetry_v12_domains")) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (sql.includes("telemetry_v12_domain_predecessors") && sql.includes("FOR UPDATE")) {
+        return { rows: [], rowCount: 0 };
+      }
+      if (sql.includes("clock_timestamp()")) return { rows: [{ now: new Date(now) }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+    release() {},
+  };
+  const pool = { async connect() { return client; } };
+  const domain = createPostgresTypedV12Domain(pool, { schema: { primarySchema: "synthetic_schema" } });
+  const events = [];
+  const observe = createTelemetryActivationObserver(event => events.push(event), () => now);
+  await assert.rejects(observe("v1.2", () => domain.activate({ participantId: "synthetic-participant",
+    deviceId: "synthetic-device" }, manifest, now)), error =>
+    error?.status === 409 && error?.code === "TELEMETRY_MANIFEST_CONFLICT");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].refusalPhase, "state");
+  assert.equal(events[0].code, "TELEMETRY_MANIFEST_CONFLICT");
+  assert.equal(JSON.stringify(events).includes("synthetic-participant"), false);
 });
 
 test("a broken or stalled observation sink cannot change activation or failure", async () => {

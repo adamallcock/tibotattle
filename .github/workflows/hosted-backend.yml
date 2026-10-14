@@ -1,7 +1,8 @@
 name: Hosted backend
 
 # Source-level CI for the hosted backend: the Worker gate, the Cloud Run host
-# check with the offline production-tooling checks, and every
+# check with the offline production-tooling checks, a separately scheduled
+# activation-producer PostgreSQL qualification, and every
 # apps/worker/postgres-test spec against PostgreSQL 17 in its routed
 # environment profile, including the edge end-to-end spec.
 #
@@ -19,7 +20,7 @@ name: Hosted backend
 # 26.2.0. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
 # workflow only.
 #
-# Dependencies: all three jobs install the root, Worker and Cloud Run lockfiles.
+# Dependencies: all four jobs install the root, Worker and Cloud Run lockfiles.
 # The Worker gate's gcp:fastpath:scripts-check imports apps/worker/cloud-run
 # modules, which need @google-cloud/cloud-sql-connector.
 #
@@ -29,7 +30,9 @@ name: Hosted backend
 # gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
 # with the SOCKET profile exported, but a skip inside those checks is reported
-# by node:test without failing the job.
+# by node:test without failing the job. The activation-producer job uses the
+# same TAP parser and skip-as-failure evaluator as the full suite for its fixed
+# source_11/source_12 producer regression files.
 #
 # The Cloud Run check also runs the offline parts of
 # gcp:production-tooling:local-check (the rollout CLI, the cutover barrier
@@ -344,6 +347,52 @@ jobs:
 
       - name: Run every PostgreSQL spec in its routed profile with zero skips
         run: node apps/worker/scripts/ci-postgres-suite.mjs
+
+      - name: Stop PostgreSQL 17
+        if: always()
+        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  activation-producer-postgres-17:
+    name: PostgreSQL 17 activation producer qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked root, Worker and Cloud Run dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm --prefix apps/worker ci
+          npm --prefix apps/worker/cloud-run ci
+
+      - name: Create the private PostgreSQL socket root
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /private/tmp
+          sudo chmod 1777 /private/tmp
+
+      - name: Start PostgreSQL 17 and export the SOCKET profile
+        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
+
+      - name: Run the activation producer PostgreSQL regressions with zero skips
+        run: node apps/worker/scripts/ci-postgres-activation-producer-suite.mjs
 
       - name: Stop PostgreSQL 17
         if: always()

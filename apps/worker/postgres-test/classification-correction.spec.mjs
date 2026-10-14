@@ -105,6 +105,7 @@ async function setup() {
     compatibility: await vite.ssrLoadModule("/src/telemetry-v11-compatibility.ts"),
     reconciliation: await vite.ssrLoadModule("/src/telemetry-usage-reconciliation.ts"),
     activation: await vite.ssrLoadModule("/src/postgres-classification-activation.ts"),
+    observation: await vite.ssrLoadModule("/src/telemetry-activation-observation.ts"),
     oracle: await vite.ssrLoadModule("/postgres-test/fixtures/classification/activation-oracle.ts"),
     closureOracle: await vite.ssrLoadModule("/postgres-test/fixtures/classification/closure-oracle.ts"),
   };
@@ -308,9 +309,15 @@ async function evidence(context, participant, days = { fromDay: DAY_ONE, through
   };
 }
 function only(map, day) { const rows = map.get(day); assert.equal(rows?.length, 1); return rows[0]; }
-async function refused(context, principal, manifest) {
+async function refused(context, principal, manifest, expectedPhase) {
   const before = await snapshot(context);
-  await assert.rejects(context.domain.activate(principal, manifest), CONFLICT);
+  const events = [];
+  const observe = modules.observation.createTelemetryActivationObserver(event => events.push(event));
+  await assert.rejects(observe("v1.2", () => context.domain.activate(principal, manifest)), CONFLICT);
+  if (expectedPhase !== undefined) {
+    assert.equal(events.length, 1, "one safe activation refusal was observed");
+    assert.equal(events[0].refusalPhase, expectedPhase, "the refusal retains its typed producer boundary");
+  }
   assert.deepEqual(await snapshot(context), before, "refusal rolls back links, head, predecessor consumption and journal");
 }
 
@@ -439,7 +446,8 @@ test("classification corrections activate atomically across session days and pre
     const knownReplacement = await stage(context, principal, DAY_TWO, "usage", { ...knownUsage, modelId: "gpt-5.6-sol" });
     await refused(context, principal, await prepared(context, principal, [knownSessionDay, knownReplacement, extraKnown]));
     const quantityChange = await stage(context, principal, DAY_TWO, "usage", { ...knownUsage, totalInputContextTokens: 1001 });
-    await refused(context, principal, await prepared(context, principal, [knownSessionDay, quantityChange, extraKnown]));
+    await refused(context, principal, await prepared(context, principal, [knownSessionDay, quantityChange, extraKnown]),
+      "classification");
     assert.deepEqual(await head(context, principal), { generation_id: final.generationId, revision: 3 });
     assert.equal((await links(context)).length, 4);
     assert.equal(await journalCount(context), initialJournal + 2);
@@ -741,7 +749,7 @@ test("exact current-predecessor READY unknown evidence corrects in one activatio
         await pool.query(`UPDATE ${context.table("telemetry_v12_domain_days")}
           SET manifest_digest=$1 WHERE manifest_id=$2`, ["f".repeat(64), accepted.manifestId]);
       } finally { await alterGuard("ENABLE"); }
-      await refused(context, principal, value);
+      await refused(context, principal, value, null);
     } finally {
       await alterGuard("DISABLE");
       try {
@@ -1358,7 +1366,27 @@ test("session closure reads every usage row of a large session in numeric order"
     assert.equal((await runProof(modules.oracle.preparePostgresClassificationActivation, context, input)).outcome, ACCEPTED,
       "edca848 accepted: its text-ordered session pages never read the unknown tail");
     assert.equal((await runProof(modules.activation.preparePostgresClassificationActivation, context, input)).outcome, REFUSED);
-    await refused(context, principal, manifest);
+    await refused(context, principal, manifest, "session_closure");
+  });
+});
+
+test("a same-day successor that drops an accepted occurrence is observed at the closure boundary", {
+  skip: !PG_TEST_SOCKET, timeout: 120_000,
+}, async () => {
+  await withSchema(async context => {
+    const participant = await seedParticipant(context, "successor-closure-phase");
+    const principal = await seedDevice(context, participant, "successor-closure-phase");
+    const first = usage({ eventId: `event:v2:${"c".repeat(64)}` });
+    const second = usage({ eventId: `event:v2:${"d".repeat(64)}`, eventTime: `${DAY_TWO}T12:06:00.000Z` });
+    const acceptedDay = await stage(context, principal, DAY_TWO, "usage", [first, second]);
+    assert.equal((await context.domain.activate(principal, await prepared(context, principal, [acceptedDay]))).replay, false);
+
+    // The later READY manifest preserves one exact row but drops the other.
+    // The predecessor still pins the earliest accepted day and must refuse
+    // before the successor can replace its complete event vector.
+    const successor = await stage(context, principal, DAY_TWO, "usage", [first]);
+    const manifest = await prepared(context, principal, [successor]);
+    await refused(context, principal, manifest, "closure");
   });
 });
 
@@ -1504,7 +1532,7 @@ test("v1.2 activation refuses a same-instant re-key of this device's accepted v1
       known({ ...legacy[2], eventId: rekeyedId("v11") }), known(v11At(today, 3))])]);
     assert.equal((await rekeyRefusal(context, 12, principal, rekeyed.manifest, rekeyed.predecessor.token, "v1.1 re-key"))
       .statement, guard);
-    await refused(context, principal, rekeyed.manifest);
+    await refused(context, principal, rekeyed.manifest, "rekey");
     assert.deepEqual((await evidence(context, participant, range)).usage, accepted.usage);
     // The same statement plans as set joins over large working sets (the
     // kept anti-join, the same-instant-and-session join and the legacy-id

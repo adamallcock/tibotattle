@@ -10,6 +10,12 @@ import {
   checkReleaseWorkflowPolicy,
   inspectWorkflowSource,
 } from "../scripts/check-release-workflow-policy.mjs";
+import {
+  ACTIVATION_PRODUCER_FILES,
+  runActivationProducerSuite,
+  selectActivationProducerPlan,
+} from "../apps/worker/scripts/ci-postgres-activation-producer-suite.mjs";
+import { planPostgresSuite } from "../apps/worker/scripts/ci-postgres-suite.mjs";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_PATH = ".github/workflows/hosted-backend.yml";
@@ -34,6 +40,7 @@ const EXPECTED_PATHS = Object.freeze([
 const START_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile";
 const STOP_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --stop";
 const SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-suite.mjs";
+const ACTIVATION_PRODUCER_SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-activation-producer-suite.mjs";
 const EDGE_SPEC = "apps/worker/postgres-test/edge-origin-e2e.spec.mjs";
 const TRANSFER_SPEC = "apps/worker/postgres-test/postgres-v12-transfer.spec.mjs";
 const TOOLCHAIN_NODE = "26.2.0";
@@ -46,6 +53,7 @@ const NODE_PLAN = Object.freeze({
   "worker-gate": Object.freeze([TOOLCHAIN_NODE]),
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
+  "activation-producer-postgres-17": Object.freeze([TOOLCHAIN_NODE]),
 });
 // The Worker gate checks out depth 1. The Cloud Run check runs the cutover
 // seal check, which reads pinned commits (the restore-base generator commit
@@ -53,7 +61,12 @@ const NODE_PLAN = Object.freeze({
 // environment gap without them. The PostgreSQL 17 suite runs the
 // READ-EXPANSION specs, which `git archive` their pinned base commit
 // (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). Both need full history.
-const FETCH_DEPTH = Object.freeze({ "worker-gate": 1, "cloud-run-check": 0, "postgres-17-suite": 0 });
+const FETCH_DEPTH = Object.freeze({
+  "worker-gate": 1,
+  "cloud-run-check": 0,
+  "postgres-17-suite": 0,
+  "activation-producer-postgres-17": 1,
+});
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -275,14 +288,25 @@ test("no run block interpolates GitHub expressions into a shell", async () => {
   }
 });
 
-test("three jobs run the Worker gate, the Cloud Run check and the routed PostgreSQL 17 suite", async () => {
+test("four jobs run the Worker gate, Cloud Run check, full PostgreSQL suite and focused producer qualification", async () => {
   const { workflow } = await loadWorkflow();
-  assert.deepEqual(Object.keys(workflow.jobs), ["worker-gate", "cloud-run-check", "postgres-17-suite"]);
-  const timeouts = { "worker-gate": 60, "cloud-run-check": 30, "postgres-17-suite": 45 };
+  assert.deepEqual(Object.keys(workflow.jobs), [
+    "worker-gate",
+    "cloud-run-check",
+    "postgres-17-suite",
+    "activation-producer-postgres-17",
+  ]);
+  const timeouts = {
+    "worker-gate": 60,
+    "cloud-run-check": 30,
+    "postgres-17-suite": 45,
+    "activation-producer-postgres-17": 30,
+  };
   const gates = {
     "worker-gate": "npm --prefix apps/worker run check",
     "cloud-run-check": "npm --prefix apps/worker/cloud-run run check",
     "postgres-17-suite": "node apps/worker/scripts/ci-postgres-suite.mjs",
+    "activation-producer-postgres-17": `node ${ACTIVATION_PRODUCER_SUITE_SCRIPT}`,
   };
   for (const [id, job] of Object.entries(workflow.jobs)) {
     assert.equal(job["runs-on"], "ubuntu-24.04", id);
@@ -323,6 +347,64 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
+  assert.equal(runs(workflow.jobs["postgres-17-suite"]).filter((command) => command === `node ${SUITE_SCRIPT}`).length, 1,
+    "the full PostgreSQL gate remains registered and unchanged");
+});
+
+test("the focused producer job is limited to registered socket-profile source regressions", async () => {
+  const { workflow } = await loadWorkflow();
+  const selected = selectActivationProducerPlan(await planPostgresSuite());
+  assert.deepEqual(selected.files.map(({ file }) => file), [
+    "postgres-test/classification-correction.spec.mjs",
+    "postgres-test/typed-v12-domain-unchanged.spec.mjs",
+    "postgres-test/typed-v12-predecessor-day-count.spec.mjs",
+  ]);
+  assert.deepEqual(ACTIVATION_PRODUCER_FILES, selected.files.map(({ file }) => file));
+  assert.ok(selected.files.every(({ runner, profile }) => runner === "node" && profile === "SOCKET"));
+
+  const job = workflow.jobs["activation-producer-postgres-17"];
+  assert.equal(runs(job).filter((command) => command === `node ${ACTIVATION_PRODUCER_SUITE_SCRIPT}`).length, 1);
+  assert.equal(job.env, undefined, "the focused job uses the exported private socket profile only");
+
+  const omitted = { ...selected, files: selected.files.slice(1) };
+  assert.throws(() => selectActivationProducerPlan(omitted), { code: "ACTIVATION_SPEC_NOT_REGISTERED" });
+  const wrongProfile = {
+    ...selected,
+    files: selected.files.map((entry, index) => index === 0 ? { ...entry, profile: "HOST" } : entry),
+  };
+  assert.throws(() => selectActivationProducerPlan(wrongProfile), { code: "ACTIVATION_SPEC_PROFILE_DRIFT" });
+});
+
+test("the focused runner reuses TAP parsing and fails when any selected PostgreSQL test skips", async () => {
+  const calls = [];
+  const skippedTap = `TAP version 13
+# Subtest: synthetic gated test
+ok 1 - synthetic gated test # SKIP
+1..1
+# tests 1
+# suites 0
+# pass 0
+# fail 0
+# cancelled 0
+# skipped 1
+# todo 0
+`;
+  const summary = await runActivationProducerSuite({
+    environment: {
+      PG_TEST_SOCKET: "/private/tmp/tibotattle-pg-focused/socket",
+      PG_TEST_PORT: "5432",
+    },
+    run: async (args, options) => {
+      calls.push({ args, cwd: options.cwd, socket: options.env.PG_TEST_SOCKET });
+      return { exitCode: 0, stdout: skippedTap };
+    },
+  });
+  assert.equal(calls.length, ACTIVATION_PRODUCER_FILES.length);
+  assert.deepEqual(calls.map(({ args }) => args.at(-1)), ACTIVATION_PRODUCER_FILES.map((file) => `./${file}`));
+  assert.ok(calls.every(({ socket }) => socket === "/private/tmp/tibotattle-pg-focused/socket"));
+  assert.equal(summary.status, "failed");
+  assert.equal(summary.skipped.length, ACTIVATION_PRODUCER_FILES.length);
+  assert.ok(summary.failures.every(({ code }) => code === "SILENTLY_SKIPPED"));
 });
 
 test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only that job does", async () => {
@@ -336,7 +418,7 @@ test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only t
     PG_TEST_TCP_HOST: "127.0.0.1",
     PG_TEST_TCP_PORT: publish[0][1],
   });
-  for (const id of ["worker-gate", "cloud-run-check"]) {
+  for (const id of ["worker-gate", "cloud-run-check", "activation-producer-postgres-17"]) {
     assert.equal(Object.keys(workflow.jobs[id].env ?? {}).some((name) => name.startsWith("PG_TEST_")), false,
       `${id} never dials the TCP pair`);
   }
@@ -913,7 +995,7 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
   }).some((failure) => failure.startsWith("POSTGRES_V12_TRANSFER_Q1_DUMP")), "wrong Q-1 dump");
 
   // The other two jobs never name the edge runtime.
-  for (const id of ["worker-gate", "cloud-run-check"]) {
+  for (const id of ["worker-gate", "cloud-run-check", "activation-producer-postgres-17"]) {
     const leaked = structuredClone(workflow);
     leaked.jobs[id].steps.splice(1, 0, { name: "leak", run: "printf 'EDGE_E2E_NODE=x\\n' >> \"$GITHUB_ENV\"" });
     assert.deepEqual(edgeRuntimeFailures(leaked, inputs), [`${id} names the edge runtime; only postgres-17-suite runs the edge spec`]);
