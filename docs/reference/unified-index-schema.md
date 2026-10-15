@@ -226,22 +226,32 @@ qualification gate, separate from catalogue recognition.
 The foreground companion treats verified published v10 through v19 to v20
 parser upgrades as cold work even when the format version is already 12. The
 target and predecessor set are deliberately closed; current, unknown, malformed
-and future parser evidence cannot obtain a longer deadline. That run receives
+and future parser evidence cannot obtain a longer deadline from that metadata
+check. That run receives
 the same bounded four-hour deadline as an absent or supported older-schema
-index; subsequent current-parser refreshes retain the normal five-minute
-deadline.
+index. Current-parser refreshes initially retain the normal five-minute deadline.
 Only the published generation selects this budget. Older parser rows retained
 for rotated sources do not keep extending ordinary refreshes. This metadata-only
 decision does not replace the worker's full compatibility, integrity, or
 publication checks.
 
+During detailed ingestion, completed non-skip source work against a validated
+current published generation can extend that run to the same four-hour total
+bound. The staged copy must match the inspected generation and provenance;
+supported terminal quarantine and tool-provenance partial states remain valid
+healing bases. Discovery, unchanged or zero-byte work, uncertain provenance,
+quick refreshes, and work after cancellation or timeout do not qualify. The
+one-time marker is private control-plane data and never enters public progress.
+
 Index and accounting validity are separate. After indexing, the authoritative
 accounting cache reader may determine that no current generation-bound cache is
 reusable (for example after a reviewed accounting-semantics version change).
-Only when the runner actually enters that full rebuild does its exact,
-count-free accounting marker extend the same run to the four-hour total bound.
-A cache hit, malformed progress, or repeated marker cannot extend the ordinary
-deadline or re-arm it indefinitely.
+Only when the runner actually enters that full rebuild can its exact,
+count-free accounting marker extend the same run to the four-hour total
+bound. Index and accounting work share one extension measured from the original
+refresh start; their markers cannot stack or rearm it. A cache hit or malformed
+progress does not qualify. Cancellation preserves the last published generation;
+the longer bound does not guarantee completion for every history.
 
 ## Current table groups
 

@@ -154,6 +154,41 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v20";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
+// Private control-plane signal. It is emitted only after a validated current
+// incremental generation has completed real non-skip source work. The
+// refresh controller consumes it to extend one run's absolute deadline; it is
+// never stored in the index or exposed as public progress.
+export const LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER =
+  Object.freeze({
+    kind: "unified_index_deadline_work",
+    status: "completed_work",
+    provenance: "validated_current_generation",
+  });
+
+export function isLocalUnifiedIndexIncrementalWorkDeadlineMarker(value) {
+  if (value === null || typeof value !== "object") {
+    return false;
+  }
+  try {
+    if (Array.isArray(value)) return false;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 3) return false;
+    for (const key of ["kind", "status", "provenance"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined
+          || descriptor.enumerable !== true
+          || !Object.hasOwn(descriptor, "value")
+          || descriptor.value
+            !== LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER[key]) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
 // `outcome` enum is fixed by the telemetry contract, so the row-level parser

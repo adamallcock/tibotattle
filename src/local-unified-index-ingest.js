@@ -40,6 +40,7 @@ import {
   beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
+  LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER,
   LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -312,6 +313,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       && coldRebuildIfMissing
     ? "missing_index"
     : null;
+  let validatedIncrementalBase = null;
   // Inspect only the SQLite header/meta needed to identify a pre-current index.
   // The normal reader intentionally rejects old source-identity contracts;
   // this narrow preflight must detect them before a device salt is created or
@@ -527,6 +529,54 @@ export async function ingestLocalUnifiedIndexIncrement({
           && descriptor.quotaProvenanceComplete === true
           && (descriptor.status !== "complete"
             || descriptor.toolProvenanceComplete === true);
+        // Terminal partials remain eligible for actual healing work when
+        // current discovery counters differ. The separate
+        // generationAuthoritative check below still requires exact counters
+        // before it can take the zero-work return.
+        const validatedIncrementalBaseProvenance = supportedPreviousStatus
+          && descriptor?.discoveryComplete === true
+          && descriptor.diagnosticsComplete === true
+          && descriptor.usageProvenanceComplete === true
+          && descriptor.sourceOrderComplete === true
+          && descriptor.quotaProvenanceComplete === true
+          && (descriptor.status !== "complete"
+            || descriptor.toolProvenanceComplete === true);
+        if (coldRebuildReason === null
+            && validatedIncrementalBaseProvenance
+            && descriptor?.parserVersion === LOCAL_UNIFIED_INDEX_PARSER_VERSION
+            && descriptor.schemaVersion === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+            && descriptor.contractVersion === contractVersion
+            && Number.isSafeInteger(descriptor.id)
+            && descriptor.id > 0
+            && Number.isSafeInteger(descriptor.completedAtMs)
+            && descriptor.completedAtMs >= 0
+            && typeof descriptor.fingerprint === "string"
+            && /^generation-v2-[0-9a-f]{64}$/u.test(descriptor.fingerprint)
+            && userVersion === LOCAL_UNIFIED_INDEX_USER_VERSION
+            && schema === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+            && storedContract === contractVersion
+            && storedSourceIdentity === LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION) {
+          validatedIncrementalBase = {
+            generationId: descriptor.id,
+            fingerprint: descriptor.fingerprint,
+            status: descriptor.status,
+            blockReason: descriptor.blockReason,
+            completedAtMs: descriptor.completedAtMs,
+            discoveredSourceCount: descriptor.discoveredSourceCount,
+            discoveredSourceBytes: descriptor.discoveredSourceBytes,
+            indexedSourceCount: descriptor.indexedSourceCount,
+            indexedSourceBytes: descriptor.indexedSourceBytes,
+            skippedSourceCount: descriptor.skippedSourceCount,
+            skippedSourceBytes: descriptor.skippedSourceBytes,
+            skippedThreadCount: descriptor.skippedThreadCount,
+            discoveryComplete: descriptor.discoveryComplete,
+            diagnosticsComplete: descriptor.diagnosticsComplete,
+            usageProvenanceComplete: descriptor.usageProvenanceComplete,
+            sourceOrderComplete: descriptor.sourceOrderComplete,
+            quotaProvenanceComplete: descriptor.quotaProvenanceComplete,
+            toolProvenanceComplete: descriptor.toolProvenanceComplete,
+          };
+        }
         const sourceSetUnchanged = descriptor?.discoveredSourceCount
             === discovery.discoveredSourceCount
           && descriptor?.discoveredSourceBytes === sourceBytes;
@@ -652,6 +702,7 @@ export async function ingestLocalUnifiedIndexIncrement({
   let database = null;
   let writer = null;
   let generation = null;
+  let incrementalWorkDeadlineMarkerAllowed = false;
   try {
     const liveExists = await assertSafeLocalUnifiedIndexTarget(
       resolvedIndexFile,
@@ -675,6 +726,60 @@ export async function ingestLocalUnifiedIndexIncrement({
       create: !liveExists,
       staging: true,
     });
+    if (liveExists && validatedIncrementalBase !== null) {
+      const stagedSchema = database.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get()?.value;
+      const stagedContract = database.prepare(
+        "SELECT value FROM meta WHERE key = 'contract_version'",
+      ).get()?.value;
+      const stagedSourceIdentity = database.prepare(
+        "SELECT value FROM meta WHERE key = 'source_identity_version'",
+      ).get()?.value;
+      const stagedUserVersion = Number(
+        database.prepare("PRAGMA user_version").get()?.user_version,
+      );
+      const stagedGeneration = readUnifiedIndexGenerationDescriptor(database);
+      incrementalWorkDeadlineMarkerAllowed = stagedSchema
+          === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+        && stagedUserVersion === LOCAL_UNIFIED_INDEX_USER_VERSION
+        && stagedContract === contractVersion
+        && stagedSourceIdentity === LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION
+        && stagedGeneration?.parserVersion === LOCAL_UNIFIED_INDEX_PARSER_VERSION
+        && stagedGeneration.schemaVersion === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+        && stagedGeneration.contractVersion === contractVersion
+        && stagedGeneration.id === validatedIncrementalBase.generationId
+        && stagedGeneration.fingerprint === validatedIncrementalBase.fingerprint
+        && stagedGeneration.status === validatedIncrementalBase.status
+        && stagedGeneration.blockReason === validatedIncrementalBase.blockReason
+        && stagedGeneration.completedAtMs === validatedIncrementalBase.completedAtMs
+        && stagedGeneration.discoveredSourceCount
+          === validatedIncrementalBase.discoveredSourceCount
+        && stagedGeneration.discoveredSourceBytes
+          === validatedIncrementalBase.discoveredSourceBytes
+        && stagedGeneration.indexedSourceCount
+          === validatedIncrementalBase.indexedSourceCount
+        && stagedGeneration.indexedSourceBytes
+          === validatedIncrementalBase.indexedSourceBytes
+        && stagedGeneration.skippedSourceCount
+          === validatedIncrementalBase.skippedSourceCount
+        && stagedGeneration.skippedSourceBytes
+          === validatedIncrementalBase.skippedSourceBytes
+        && stagedGeneration.skippedThreadCount
+          === validatedIncrementalBase.skippedThreadCount
+        && stagedGeneration.discoveryComplete
+          === validatedIncrementalBase.discoveryComplete
+        && stagedGeneration.diagnosticsComplete
+          === validatedIncrementalBase.diagnosticsComplete
+        && stagedGeneration.usageProvenanceComplete
+          === validatedIncrementalBase.usageProvenanceComplete
+        && stagedGeneration.sourceOrderComplete
+          === validatedIncrementalBase.sourceOrderComplete
+        && stagedGeneration.quotaProvenanceComplete
+          === validatedIncrementalBase.quotaProvenanceComplete
+        && stagedGeneration.toolProvenanceComplete
+          === validatedIncrementalBase.toolProvenanceComplete;
+    }
     const previousGenerationValue = database.prepare(
       "SELECT value FROM meta WHERE key = 'current_generation_id'",
     ).get()?.value;
@@ -775,6 +880,21 @@ export async function ingestLocalUnifiedIndexIncrement({
         diagnostics.peakRetainedSnapshotKeys,
         retainedSnapshotKeys,
       );
+    }
+    let incrementalWorkDeadlineMarkerEmitted = false;
+    async function publishCompletedSourceProgress() {
+      if (incrementalWorkDeadlineMarkerAllowed
+          && !incrementalWorkDeadlineMarkerEmitted
+          && signal?.aborted !== true
+          && diagnostics.sourcesResumed + diagnostics.sourcesRescanned > 0
+          && diagnostics.bytesScanned > 0) {
+        incrementalWorkDeadlineMarkerEmitted = true;
+        await onProgress?.(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+      }
+      await onProgress?.({
+        ...diagnostics,
+        usageEvents: sink.counts.usageEvents,
+      });
     }
 
     const logicalHeads = resolveLogicalRolloutHeads(infos);
@@ -1617,10 +1737,7 @@ export async function ingestLocalUnifiedIndexIncrement({
             quarantineSource(info, state, quarantineReason, {
               sourceDiagnostics,
             });
-            await onProgress?.({
-              ...diagnostics,
-              usageEvents: sink.counts.usageEvents,
-            });
+            await publishCompletedSourceProgress();
             continue;
           }
           if (info.lineage?.sessionId
@@ -1663,10 +1780,7 @@ export async function ingestLocalUnifiedIndexIncrement({
             mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
             diagnosticsComplete: true,
           });
-          await onProgress?.({
-            ...diagnostics,
-            usageEvents: sink.counts.usageEvents,
-          });
+          await publishCompletedSourceProgress();
         }
       } finally {
         snapshots.release();

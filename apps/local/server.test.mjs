@@ -27,6 +27,9 @@ import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
 import {
+  createLocalCollectorRefreshRunner,
+} from "../../src/local-companion-refresh.js";
+import {
   readLocalUnifiedCompanionProjection,
 } from "../../src/local-unified-companion-source.js";
 import {
@@ -41,6 +44,9 @@ import {
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
+  openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
+  isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
 } from "../../src/local-unified-index.js";
 import {
   LocalContributionPreparationError,
@@ -3085,6 +3091,176 @@ test("Darwin loopback stays responsive and cancels a real off-main cold ingest w
     );
   } finally {
     releaseProgress.resolve();
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Darwin loopback privately extends a real current-generation incremental pass", {
+  skip: process.platform !== "darwin",
+  timeout: 15_000,
+}, async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const markerReached = deferred();
+  const releaseMarker = deferred();
+  const indexFile = join(files.stateRoot, "local-unified-index-v1.sqlite");
+  const secretFile = join(
+    files.stateRoot,
+    "local-unified-index-device-salt-v1",
+  );
+  const sessions = join(files.codexHome, "sessions", "2026", "08", "24");
+  const rolloutFile = join(
+    sessions,
+    "rollout-2026-08-24T00-00-00-11111111-1111-4111-8111-111111111111.jsonl",
+  );
+  let app;
+  let held = false;
+  try {
+    await mkdir(files.stateRoot, { recursive: true, mode: 0o700 });
+    await mkdir(sessions, { recursive: true, mode: 0o700 });
+    await writeFile(rolloutFile, unifiedIndexRolloutFixture(), { mode: 0o600 });
+    await ingestLocalUnifiedIndexOffMain({
+      codexHome: files.codexHome,
+      indexFile,
+      secretFile,
+      contractVersion: TELEMETRY_SCHEMA_VERSION,
+    });
+    const beforeDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    let before;
+    try {
+      before = readUnifiedIndexGenerationDescriptor(beforeDatabase);
+    } finally {
+      beforeDatabase.close();
+    }
+    assert.ok(before?.id > 0);
+
+    await writeFile(rolloutFile, `${unifiedIndexRolloutFixture().trimEnd()}\n${JSON.stringify({
+      timestamp: "2026-08-24T00:00:03.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 20,
+            output_tokens: 4,
+            total_tokens: 24,
+          },
+          last_token_usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+          },
+        },
+      },
+    })}\n`, { mode: 0o600 });
+
+    const refreshRunner = createLocalCollectorRefreshRunner({
+      codexHome: files.codexHome,
+      environment: {},
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => ({
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 1,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+      }),
+      accountingSourceMode: "unified",
+      readAccountingCache: async () => ({ status: "unavailable" }),
+      refreshAccounting: async () => null,
+      unifiedIndexFile: indexFile,
+      unifiedIndexSecretFile: secretFile,
+      refreshUnifiedIndex: ({ signal, onProgress, ...options }) => (
+        ingestLocalUnifiedIndexOffMain({
+          ...options,
+          codexHome: files.codexHome,
+          indexFile,
+          secretFile,
+          contractVersion: TELEMETRY_SCHEMA_VERSION,
+          signal,
+          onProgress: async (value) => {
+            await onProgress(value);
+            if (isLocalUnifiedIndexIncrementalWorkDeadlineMarker(value)
+                && !held) {
+              held = true;
+              markerReached.resolve();
+              await releaseMarker.promise;
+            }
+          },
+        })
+      ),
+    });
+
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: store,
+      refreshTimeoutMs: 1_000,
+      refreshTimeoutMsForRun: () => 1_000,
+      refreshRunner,
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const authorizedHeaders = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await markerReached.promise;
+
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    const running = await fetch(`${base}/api/local/refresh`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(running.status, 200);
+    const runningPayload = await running.json();
+    assert.equal(runningPayload.refresh.status, "running");
+    assert.equal(runningPayload.refresh.progress.kind, "unified_index");
+    assert.equal(JSON.stringify(runningPayload).includes(
+      "unified_index_deadline_work",
+    ), false);
+
+    const cancelling = await fetch(`${base}/api/local/refresh/cancel`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(cancelling.status, 202);
+    releaseMarker.resolve();
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return payload.refresh.status === "cancelled";
+    }, 5_000);
+
+    const afterDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const after = readUnifiedIndexGenerationDescriptor(afterDatabase);
+      assert.equal(after.id, before.id);
+      assert.equal(after.fingerprint, before.fingerprint);
+    } finally {
+      afterDatabase.close();
+    }
+    assert.deepEqual(
+      (await readdir(files.stateRoot)).filter((name) => (
+        name.startsWith("local-unified-index-v1.sqlite.building-")
+        || name.startsWith("local-unified-index-v1.sqlite.incremental-")
+      )),
+      [],
+    );
+    assert.equal(store.reloads, 0);
+  } finally {
+    releaseMarker.resolve();
     await app?.close();
     await rm(files.root, { recursive: true });
   }

@@ -23,6 +23,9 @@ import {
   localCompanionStatePaths,
 } from "../src/local-installation-diagnostics.js";
 import {
+  LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER,
+} from "../src/local-unified-index.js";
+import {
   readLocalCollectorCheckpoint,
   readLocalCollectorLegacyRefreshUse,
 } from "../src/local-collector-state.js";
@@ -3061,6 +3064,179 @@ test("an exact accounting rebuild marker extends the ordinary deadline once to t
   settled.resolve({});
   await flushControllerSettlement(controller);
   assert.equal(controller.getStatus().status, "failed");
+});
+
+test("completed incremental index work extends one detailed refresh to the same total bound", async (t) => {
+  const timers = createManualTimerScheduler();
+  const entered = Promise.withResolvers();
+  const settled = Promise.withResolvers();
+  let publish;
+  let signal;
+  t.after(() => settled.resolve({}));
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ signal: activeSignal, onProgress }) => {
+      signal = activeSignal;
+      publish = onProgress;
+      entered.resolve();
+      return settled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+
+  assert.equal(controller.start({ mode: "detailed" }), true);
+  await entered.promise;
+  timers.advanceBy(900);
+  await publish(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+  assert.equal(controller.getStatus().status, "running");
+  assert.equal(controller.getStatus().progress, null);
+  timers.advanceBy(400);
+  await publish(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+  await publish({ kind: "accounting", status: "calculating" });
+  timers.advanceBy(199);
+  assert.equal(controller.getStatus().status, "running");
+  assert.equal(signal.aborted, false);
+  timers.advanceBy(1);
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+  assert.equal(signal.aborted, true);
+  settled.resolve({});
+  await flushControllerSettlement(controller);
+  assert.equal(controller.getStatus().status, "failed");
+});
+
+test("invalid index deadline markers cannot extend or enter public progress", async (t) => {
+  const timers = createManualTimerScheduler();
+  const entered = Promise.withResolvers();
+  const settled = Promise.withResolvers();
+  let publish;
+  let signal;
+  t.after(() => settled.resolve({}));
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ signal: activeSignal, onProgress }) => {
+      signal = activeSignal;
+      publish = onProgress;
+      entered.resolve();
+      return settled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+  const valid = LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER;
+  assert.equal(controller.start({ mode: "detailed" }), true);
+  await entered.promise;
+  timers.advanceBy(900);
+  for (const progress of [
+    { ...valid, extra: 1 },
+    { ...valid, status: "finished" },
+    { ...valid, provenance: "caller_claim" },
+    { kind: valid.kind, status: valid.status },
+    { get kind() { throw new Error("hostile accessor"); } },
+  ]) {
+    await publish(progress);
+    assert.equal(controller.getStatus().status, "running");
+    assert.equal(controller.getStatus().progress, null);
+  }
+  timers.advanceBy(100);
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+  assert.equal(signal.aborted, true);
+  settled.resolve({});
+  await flushControllerSettlement(controller);
+});
+
+test("index deadline markers do not extend quick, cancelled, or timed-out refreshes", async (t) => {
+  const quickTimers = createManualTimerScheduler();
+  const quickEntered = Promise.withResolvers();
+  const quickSettled = Promise.withResolvers();
+  let quickPublish;
+  t.after(() => quickSettled.resolve({}));
+  const quick = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      quickPublish = onProgress;
+      quickEntered.resolve();
+      return quickSettled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    monotonicClock: quickTimers.now,
+    setTimeoutImpl: quickTimers.setTimeout,
+    clearTimeoutImpl: quickTimers.clearTimeout,
+  });
+  assert.equal(quick.start({ mode: "quick" }), true);
+  await quickEntered.promise;
+  quickTimers.advanceBy(900);
+  await quickPublish(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+  quickTimers.advanceBy(100);
+  assert.equal(quick.getStatus().errorCode, "refresh_timed_out");
+  quickSettled.resolve({});
+  await flushControllerSettlement(quick);
+
+  const cancelledTimers = createManualTimerScheduler();
+  const cancelledEntered = Promise.withResolvers();
+  const cancelledSettled = Promise.withResolvers();
+  let cancelledPublish;
+  t.after(() => cancelledSettled.resolve({}));
+  const cancelled = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      cancelledPublish = onProgress;
+      cancelledEntered.resolve();
+      return cancelledSettled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    cancelSettlementMs: 1_000,
+    monotonicClock: cancelledTimers.now,
+    setTimeoutImpl: cancelledTimers.setTimeout,
+    clearTimeoutImpl: cancelledTimers.clearTimeout,
+  });
+  assert.equal(cancelled.start({ mode: "detailed" }), true);
+  await cancelledEntered.promise;
+  assert.equal(cancelled.cancel(), true);
+  await cancelledPublish(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+  cancelledTimers.advanceBy(1_000);
+  await flushControllerSettlement(cancelled);
+  assert.equal(cancelled.getStatus().status, "cancelled");
+  assert.equal(cancelled.getStatus().progress, null);
+  cancelledSettled.resolve({});
+  await flushControllerSettlement(cancelled);
+
+  const timedOutTimers = createManualTimerScheduler();
+  const timedOutEntered = Promise.withResolvers();
+  const timedOutSettled = Promise.withResolvers();
+  let timedOutPublish;
+  t.after(() => timedOutSettled.resolve({}));
+  const timedOut = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      timedOutPublish = onProgress;
+      timedOutEntered.resolve();
+      return timedOutSettled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    monotonicClock: timedOutTimers.now,
+    setTimeoutImpl: timedOutTimers.setTimeout,
+    clearTimeoutImpl: timedOutTimers.clearTimeout,
+  });
+  assert.equal(timedOut.start({ mode: "detailed" }), true);
+  await timedOutEntered.promise;
+  timedOutTimers.advanceBy(1_000);
+  await timedOutPublish(LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER);
+  assert.equal(timedOut.getStatus().status, "failed");
+  assert.equal(timedOut.getStatus().errorCode, "refresh_timed_out");
+  timedOutSettled.resolve({});
+  await flushControllerSettlement(timedOut);
 });
 
 test("a late accounting marker cannot extend work after cancellation", async (t) => {

@@ -151,7 +151,7 @@ must match, and the published generation must be complete or one of the
 already supported quarantine/tool-provenance partial states. Only the current
 publication selects the budget: rotated sources' older parser rows do not
 extend an ordinary refresh. Current, unknown, malformed, future, and otherwise
-uncertain parser evidence retains the five-minute deadline.
+uncertain parser evidence retains the initial five-minute deadline.
 
 An absent index or a proven supported older physical schema also qualifies
 for the bounded four-hour cold-refresh deadline. This replaces the former
@@ -161,10 +161,24 @@ relabelled to obtain that budget. If a rescan cannot finish inside its actual
 bound, preserve state and resolve the qualification gap instead of repeatedly
 restarting it.
 
+A detailed current-parser pass can earn the same four-hour total bound after
+completing non-skip source work against its validated published generation.
+The staged copy must match that generation and its provenance. Supported
+terminal quarantine and tool-provenance partial states may qualify while
+healing; discovery alone, unchanged or zero-byte work, uncertain provenance,
+and quick refreshes do not. This private progress marker grants one bounded
+extension, not a persistent checkpoint or a guarantee of completion. A cancelled
+or failed incremental pass still discards its unpublished stage and preserves
+the last good generation; do not repeatedly restart a pass that exceeds its
+actual bound.
+
 A current-parser index can also require a full accounting rebuild after the
 current cache fails its authoritative schema, generation, context, or reuse
 check. The runner emits the fixed accounting-work marker only immediately before
 that rebuild; the controller then applies the same four-hour total deadline.
+Index-work and accounting-work markers share one extension measured from the
+original refresh start, so neither repeated markers nor both stages can stack
+or rearm it. Cancellation and an already-expired deadline cannot be extended.
 Do not infer this state from displayed retained figures, edit cache metadata, or
 retry a five-minute failure in a loop: accounting has no durable mid-build
 checkpoint, so an interrupted rebuild restarts from its retained source state.

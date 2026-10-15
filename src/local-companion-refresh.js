@@ -21,6 +21,9 @@ import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
+import {
+  isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+} from "./local-unified-index.js";
 
 const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "app_server_unavailable",
@@ -1215,8 +1218,23 @@ export function createLocalCollectorRefreshRunner({
         ? null
         : async (value) => {
           if (signal?.aborted === true) return;
-          const progress = publicUnifiedIndexProgress(value);
-          if (progress !== null) await onProgress(progress);
+          let completedIncrementalIndexWork = false;
+          let progress = null;
+          try {
+            completedIncrementalIndexWork =
+              isLocalUnifiedIndexIncrementalWorkDeadlineMarker(value);
+            if (!completedIncrementalIndexWork) {
+              progress = publicUnifiedIndexProgress(value);
+            }
+          } catch {
+            // Progress is advisory; malformed internal values fail closed.
+            return;
+          }
+          if (completedIncrementalIndexWork) {
+            await onProgress(value);
+          } else if (progress !== null) {
+            await onProgress(progress);
+          }
         };
       // Leave the misleading quick-result phase as soon as deep ingestion
       // starts, even before discovery has produced its first measured count.
@@ -2015,7 +2033,7 @@ export class LocalCompanionRefreshController {
     let timedOut = false;
     let timeout;
     let cancellationSettlementTimeout;
-    let accountingDeadlineApplied = false;
+    let boundedWorkDeadlineApplied = false;
     // A successful quick-result reload already publishes the complete quick
     // snapshot for a quick-mode run. Remember that publication so terminal
     // settlement does not rebuild the same snapshot again; a failed or absent
@@ -2076,20 +2094,33 @@ export class LocalCompanionRefreshController {
           if (this.#state.refreshId !== refreshId
               || timedOut
               || !["running", "cancelling"].includes(this.#state.status)) return;
-          const projected = publicRefreshProgress(progress);
-          if (projected === null) return;
-          if (!accountingDeadlineApplied
+          let completedIncrementalIndexWork = false;
+          let projected = null;
+          try {
+            completedIncrementalIndexWork =
+              isLocalUnifiedIndexIncrementalWorkDeadlineMarker(progress);
+            projected = publicRefreshProgress(progress);
+          } catch {
+            return;
+          }
+          if (projected === null && !completedIncrementalIndexWork) return;
+          const extensionRequested = completedIncrementalIndexWork
+            ? mode === "detailed"
+            : projected?.kind === ACCOUNTING_PROGRESS_KIND;
+          if (!boundedWorkDeadlineApplied
               && !this.#cancelRequested
               && this.#state.status === "running"
-              && projected.kind === ACCOUNTING_PROGRESS_KIND
+              && extensionRequested
               && this.#accountingTimeoutMs > selectedTimeoutMs) {
-            // The runner emits this exact marker only for an actual full
-            // replay-safe rebuild. Extend once to the same four-hour total
-            // bound used by a fresh index; repeated or malformed progress
-            // cannot keep a run alive indefinitely.
-            accountingDeadlineApplied = true;
+            // Either a full replay-safe accounting rebuild or validated real
+            // incremental index work may consume the existing four-hour total
+            // budget. The shared one-shot guard prevents stacking or rearming.
+            boundedWorkDeadlineApplied = true;
             armTimeoutFromStart(this.#accountingTimeoutMs);
           }
+          // The index marker is private control-plane data, never a public
+          // refresh progress value or an HTTP-visible status field.
+          if (projected === null) return;
           let quickResultAt = this.#state.quickResultAt;
           let quickResultReloaded = false;
           if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND

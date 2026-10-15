@@ -63,7 +63,9 @@ import {
   LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
+  isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
   localDigest,
   openLocalUnifiedIndex,
   OUTCOMES,
@@ -141,6 +143,101 @@ function runWindowsPublicationChild({ failPublishedFileSync = false } = {}) {
       );
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  `;
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  });
+}
+
+function runIncrementalCopyDriftChild({
+  codexHome,
+  indexFile,
+  secretFile,
+  attemptToken,
+}) {
+  const moduleUrl = new URL(
+    "../src/local-unified-index-ingest.js",
+    import.meta.url,
+  ).href;
+  const source = `
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { resolve } from "node:path";
+    import { DatabaseSync } from "node:sqlite";
+
+    const require = createRequire(import.meta.url);
+    const promises = require("node:fs/promises");
+    const originalCopyFile = promises.copyFile;
+    const expectedStageFile = resolve(${JSON.stringify(indexFile)})
+      + ".incremental-" + process.pid + "-" + ${JSON.stringify(attemptToken)};
+    let copyCalls = 0;
+    let liveIndexCopies = 0;
+    let expectedStageCopies = 0;
+    let stagedCopies = 0;
+    promises.copyFile = async (sourcePath, destinationPath, ...options) => {
+      copyCalls += 1;
+      const result = await originalCopyFile(sourcePath, destinationPath, ...options);
+      const isLiveIndex = resolve(sourcePath) === resolve(${JSON.stringify(indexFile)});
+      const isExpectedStage = resolve(destinationPath)
+        === expectedStageFile;
+      if (isLiveIndex) liveIndexCopies += 1;
+      if (isExpectedStage) expectedStageCopies += 1;
+      if (isLiveIndex && isExpectedStage) {
+        stagedCopies += 1;
+        const staged = new DatabaseSync(destinationPath);
+        try {
+          const generationId = Number(staged.prepare(
+            "SELECT value FROM meta WHERE key = 'current_generation_id'",
+          ).get()?.value);
+          staged.prepare(
+            "UPDATE index_generation SET diagnostics_complete = 0 WHERE id = ?",
+          ).run(generationId);
+        } finally {
+          staged.close();
+        }
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+
+    try {
+      const { ingestLocalUnifiedIndexIncrement } = await import(
+        ${JSON.stringify(moduleUrl)}
+      );
+      const progress = [];
+      const result = await ingestLocalUnifiedIndexIncrement({
+        codexHome: ${JSON.stringify(codexHome)},
+        indexFile: ${JSON.stringify(indexFile)},
+        secretFile: ${JSON.stringify(secretFile)},
+        contractVersion: ${JSON.stringify(CONTRACT)},
+        attemptToken: ${JSON.stringify(attemptToken)},
+        onProgress: (value) => progress.push(value),
+      });
+      const stageRemains = await promises.lstat(expectedStageFile).then(
+        () => true,
+        (error) => error?.code === "ENOENT" ? false : true,
+      );
+      process.stdout.write(JSON.stringify({
+        copyCalls,
+        liveIndexCopies,
+        expectedStageCopies,
+        stagedCopies,
+        stageRemains,
+        sourcesResumed: result.sourcesResumed,
+        sourcesRescanned: result.sourcesRescanned,
+        markerCount: progress.filter((value) => (
+          value?.kind === "unified_index_deadline_work"
+          && value?.status === "completed_work"
+          && value?.provenance === "validated_current_generation"
+        )).length,
+        generationId: result.generation?.id ?? null,
+        generationStatus: result.generation?.status ?? null,
+        diagnosticsComplete: result.generation?.diagnosticsComplete ?? null,
+      }));
+    } catch {
+      process.stderr.write("incremental copy-drift child failed");
+      process.exitCode = 1;
     }
   `;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
@@ -969,6 +1066,337 @@ test("the enum ordinals match the telemetry contract's fixed member lists", () =
   assert.equal(reasoningEffortOrdinal("not-a-member"), REASONING_EFFORTS.length - 1);
   assert.equal(outcomeOrdinal("cancelled"), 2);
   assert.equal(outcomeOrdinal("not-a-member"), OUTCOMES.length - 1);
+});
+
+test("incremental-work deadline marker accepts only its exact private shape", () => {
+  const marker = LOCAL_UNIFIED_INDEX_INCREMENTAL_WORK_DEADLINE_MARKER;
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker(marker), true);
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker(null), false);
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker([]), false);
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker({
+    ...marker,
+    extra: true,
+  }), false);
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker({
+    ...marker,
+    provenance: "unvalidated",
+  }), false);
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker({
+    kind: marker.kind,
+    status: marker.status,
+  }), false);
+  const accessor = {
+    get kind() {
+      throw new Error("must not invoke accessors");
+    },
+    status: marker.status,
+    provenance: marker.provenance,
+  };
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker(accessor), false);
+  const hostileProxy = new Proxy({}, {
+    ownKeys() {
+      throw new Error("hostile proxy");
+    },
+  });
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker(hostileProxy), false);
+  const revokedProxy = Proxy.revocable({}, {});
+  revokedProxy.revoke();
+  assert.equal(isLocalUnifiedIndexIncrementalWorkDeadlineMarker(
+    revokedProxy.proxy,
+  ), false);
+});
+
+test("only completed work against a validated current index emits the private deadline marker", async () => {
+  const name = "rollout-2026-07-25T00-00-00-deadline-progress.jsonl";
+  const source = [
+    sessionMeta("deadline-progress"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const { root, sessions } = await corpus({ [name]: source });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  const ingest = (onProgress) => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile,
+    secretFile,
+    contractVersion: CONTRACT,
+    ...(onProgress === undefined ? {} : { onProgress }),
+  });
+  try {
+    await ingest();
+
+    // A current, unchanged generation is a zero-work return and cannot earn
+    // the longer deadline.
+    const noOpProgress = [];
+    const unchanged = await ingest((value) => noOpProgress.push(value));
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(noOpProgress.some(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ), false);
+
+    // Appending a real event resumes the selected source. The private marker
+    // follows durable source/cursor writes and appears exactly once.
+    await appendFile(join(sessions, name), `${tokenCount(
+      "2026-07-25T00:00:02.000Z", usage(160, 16), usage(60, 6),
+    )}\n`);
+    const resumedProgress = [];
+    const resumed = await ingest((value) => resumedProgress.push(value));
+    assert.equal(resumed.status, "ingested");
+    assert.equal(resumed.sourcesResumed, 1);
+    assert.equal(resumed.sourcesRescanned, 0);
+    assert.equal(resumedProgress.filter(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ).length, 1);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a stale generation parser cannot earn the incremental-work deadline", async () => {
+  const name = "rollout-2026-07-25T00-00-00-stale-parser-progress.jsonl";
+  const source = [
+    sessionMeta("stale-parser-progress"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const { root, sessions } = await corpus({ [name]: source });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    await build(root);
+    const database = new DatabaseSync(indexFile);
+    try {
+      database.prepare(`
+        INSERT INTO parser_version(parser_version, contract_version)
+        VALUES (?, ?) ON CONFLICT DO NOTHING
+      `).run("unified-rollout-typed-v19", CONTRACT);
+      const olderParserId = database.prepare(`
+        SELECT id FROM parser_version
+        WHERE parser_version = ? AND contract_version = ?
+      `).get("unified-rollout-typed-v19", CONTRACT)?.id;
+      const generationId = Number(database.prepare(
+        "SELECT value FROM meta WHERE key = 'current_generation_id'",
+      ).get()?.value);
+      assert.ok(Number.isSafeInteger(olderParserId));
+      assert.ok(Number.isSafeInteger(generationId));
+      database.prepare(`
+        UPDATE index_generation SET parser_version_id = ? WHERE id = ?
+      `).run(olderParserId, generationId);
+    } finally {
+      database.close();
+    }
+
+    await appendFile(join(sessions, name), `${tokenCount(
+      "2026-07-25T00:00:02.000Z", usage(160, 16), usage(60, 6),
+    )}\n`);
+    const progress = [];
+    const result = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+      onProgress: (value) => progress.push(value),
+    });
+    assert.equal(result.status, "ingested");
+    assert.equal(result.sourcesResumed, 1);
+    assert.equal(result.generation.parserVersion, LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+    assert.equal(progress.some(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ), false);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a staged copy with provenance drift cannot extend despite resumed work", async () => {
+  const sourceName = "rollout-2026-07-25T00-00-00-copy-drift.jsonl";
+  const { root, sessions } = await corpus({
+    [sourceName]: [
+      sessionMeta("copy-drift"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  const attemptToken = "d".repeat(32);
+  try {
+    const initial = await build(root);
+    assert.equal(initial.generation.status, "complete");
+    await appendFile(join(sessions, sourceName), `${tokenCount(
+      "2026-07-25T00:00:02.000Z", usage(160, 16), usage(60, 6),
+    )}\n`);
+
+    // The child wraps node:fs/promises.copyFile before importing ingest. It
+    // mutates only the synthetic staged copy after the exact live-index copy,
+    // modeling changed provenance between read-only preflight and clone use.
+    const child = runIncrementalCopyDriftChild({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      attemptToken,
+    });
+    assert.equal(child.status, 0, `${child.stderr}${child.stdout}`);
+    const result = JSON.parse(child.stdout);
+    assert.equal(result.copyCalls, 1);
+    assert.equal(result.liveIndexCopies, 1);
+    assert.equal(result.expectedStageCopies, 1);
+    assert.equal(result.stagedCopies, 1, JSON.stringify(result));
+    assert.equal(result.stageRemains, false);
+    assert.equal(result.sourcesResumed, 1);
+    assert.equal(result.sourcesRescanned, 0);
+    assert.equal(result.markerCount, 0);
+    assert.ok(result.generationId > initial.generation.id);
+    assert.equal(result.generationStatus, "complete");
+    assert.equal(result.diagnosticsComplete, true);
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const currentId = Number(database.prepare(
+        "SELECT value FROM meta WHERE key = 'current_generation_id'",
+      ).get()?.value);
+      const current = readUnifiedIndexGenerationDescriptor(database);
+      assert.equal(currentId, result.generationId);
+      assert.equal(current?.status, "complete");
+      assert.equal(current?.diagnosticsComplete, true);
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get()?.count), 2);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a terminal tool-partial base can resume after discovery adds a quarantine", async () => {
+  const sourceName = "rollout-2026-07-25T00-00-00-deadline-tool-partial.jsonl";
+  const quarantinedName = "rollout-2026-07-25T01-00-00-deadline-quarantine.jsonl";
+  const { root, sessions } = await corpus({
+    [sourceName]: [
+      sessionMeta("deadline-tool-partial"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      toolCall("2026-07-25T00:00:02.000Z", {
+        type: "custom_tool_call",
+        name: "exec",
+        input: `PRIVATE_TOOL_PAYLOAD_${"x".repeat(4_096)}`,
+      }),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    const terminalPartial = await build(root, { maximumLineBytes: 512 });
+    assert.equal(terminalPartial.generation.status, "partial");
+    assert.equal(
+      terminalPartial.generation.blockReason,
+      "tool_provenance_incomplete",
+    );
+    assert.equal(terminalPartial.generation.toolProvenanceComplete, false);
+
+    // A newly discovered content quarantine invalidates the old partial's
+    // exact zero-work counters. Appending to the trusted source still performs
+    // real incremental work from that terminal base and may earn the marker.
+    await appendFile(join(sessions, sourceName), `${tokenCount(
+      "2026-07-25T00:00:03.000Z", usage(160, 16), usage(60, 6),
+    )}\n`);
+    await writeFile(join(sessions, quarantinedName), [
+      sessionMeta("deadline-content-quarantine"),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      '{"timestamp":"2026-07-25T01:00:01.000Z","type":"event_msg","payload":{"type":"token_count"',
+    ].join("\n") + "\n");
+
+    const progress = [];
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+      maximumLineBytes: 512,
+      onProgress: (value) => progress.push(value),
+    });
+    assert.equal(healed.sourcesResumed, 1);
+    assert.equal(healed.generation.status, "partial");
+    assert.equal(healed.generation.blockReason, "codex_rollout_sources_quarantined");
+    assert.equal(healed.generation.skippedSourceCount, 1);
+    assert.equal(progress.filter(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ).length, 1);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a terminal quarantine-partial base can heal after quarantine counts change", async () => {
+  const validName = canonicalRolloutName("2026-07-25T00-00-02", THREAD_TWO);
+  const ambiguousA = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+  const ambiguousB = canonicalRolloutName("2026-07-25T00-00-01", THREAD_ONE);
+  const validLines = [
+    sessionMeta(THREAD_TWO),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(25, 2), usage(25, 2)),
+  ];
+  const { root, sessions } = await corpus({
+    [ambiguousA]: [sessionMeta(THREAD_ONE)],
+    [ambiguousB]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+    ],
+    [validName]: validLines,
+  });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    const terminalPartial = await build(root);
+    assert.equal(terminalPartial.generation.status, "partial");
+    assert.equal(
+      terminalPartial.generation.blockReason,
+      "codex_rollout_sources_quarantined",
+    );
+    assert.equal(terminalPartial.generation.skippedSourceCount, 2);
+
+    // Resolving the ambiguous duplicate changes the old quarantine counters;
+    // a separate appended source ensures this pass also completes real work.
+    await rm(join(sessions, ambiguousA));
+    await appendFile(join(sessions, validName), `${tokenCount(
+      "2026-07-25T00:00:02.000Z", usage(40, 4), usage(15, 1),
+    )}\n`);
+    const progress = [];
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+      onProgress: (value) => progress.push(value),
+    });
+    assert.ok(healed.sourcesResumed + healed.sourcesRescanned > 0);
+    assert.equal(healed.generation.status, "complete");
+    assert.equal(healed.generation.skippedSourceCount, 0);
+    assert.equal(progress.filter(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ).length, 1);
+
+    // A subsequent no-op remains outside the longer-work class despite the
+    // earlier terminal partial having been an eligible repair base.
+    const noOpProgress = [];
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+      onProgress: (value) => noOpProgress.push(value),
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(noOpProgress.some(
+      isLocalUnifiedIndexIncrementalWorkDeadlineMarker,
+    ), false);
+  } finally {
+    await rm(root, { recursive: true });
+  }
 });
 
 test("a model declaration separates recognized, unrecognized and never-observed", () => {

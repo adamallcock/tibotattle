@@ -147,9 +147,13 @@ exposes `quickResultAt` and the `quick_result` phase. Internal
 `bounded_pause` results continue automatically under the same user action, with
 a fixed ceiling of exactly two automatic continuations after the initial pass.
 Ordinary cache-hit work retains the server's five-minute pass ceiling. A fresh
-index, or the exact point at which the companion has authoritatively selected a
-full accounting-cache rebuild, can instead use a four-hour total cold-work
-ceiling measured from that refresh's start. Each accepted pass receives a
+index, completed incremental source work against a validated current generation
+during detailed ingestion, or the exact point at which the companion selects a
+full accounting-cache rebuild can instead use the existing four-hour total
+ceiling measured from that refresh's start. Index and accounting work share one
+extension; discovery alone, unchanged work, malformed progress and quick
+refreshes cannot earn the incremental extension. Cancellation stays available,
+and the bound does not guarantee that every history will finish. Each accepted pass receives a
 241-minute browser polling window so progress and **Cancel** remain attached to
 either server bound; the browser window does not extend the companion deadline.
 The fixed maximum remains two automatic continuations after the initial pass,
