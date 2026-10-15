@@ -15,11 +15,13 @@ import { ApiError } from "./errors";
 import { assertPostgresCollectionControl } from "./postgres-collection-controls";
 import {
   createPostgresSchemaConfig,
+  PostgresStorageError,
   quotePostgresIdentifier,
   withPostgresMutation,
   withPostgresRead,
   type PostgresClient,
   type PostgresPool,
+  type PostgresQueryResult,
   type PostgresSchemaConfig,
 } from "./postgres-client";
 import {
@@ -31,7 +33,8 @@ import {
   postgresTelemetryV12StorageFailure,
 } from "./postgres-telemetry-v12-storage-refusal";
 import {
-  markTelemetryActivationRefusalPhase, type TelemetryActivationRefusalPhase,
+  markTelemetryActivationFailureStage, markTelemetryActivationRefusalPhase,
+  type TelemetryActivationFailureStage, type TelemetryActivationRefusalPhase,
 } from "./telemetry-activation-observation";
 import type {
   TelemetryV12DomainActivation as TelemetryV12DomainActivationBase,
@@ -144,6 +147,67 @@ function conflict(phase?: TelemetryActivationRefusalPhase): ApiError {
   return phase ? markTelemetryActivationRefusalPhase(error, phase) : error;
 }
 
+/** Transaction lifecycle failures are already normalized to a safe operation
+ * label. transaction_setup means BEGIN only; SET LOCAL timeout setup runs
+ * before the callback and stays unattributed. Keep lifecycle failures separate
+ * from proof-query failures. */
+function transactionFailureStage(error: unknown, operation: string):
+  { readonly matched: false } | { readonly matched: true; readonly stage: TelemetryActivationFailureStage | null } {
+  let storageError = false;
+  try {
+    storageError = error instanceof PostgresStorageError;
+  } catch { return { matched: true, stage: null }; }
+  if (!storageError) return { matched: false };
+  try {
+    const safeOperation = (error as PostgresStorageError).operation;
+    switch (safeOperation) {
+      case operation: return { matched: false };
+      case `${operation}.connect`: return { matched: true, stage: null };
+      case `${operation}.begin`: return { matched: true, stage: "transaction_setup" };
+      case `${operation}.commit`: return { matched: true, stage: "transaction_finalization" };
+      case `${operation}.rollback`: return { matched: true, stage: "transaction_rollback" };
+      case `${operation}.release`: return { matched: true, stage: "transaction_release" };
+      default: return { matched: true, stage: null };
+    }
+  } catch { return { matched: true, stage: null }; }
+}
+
+async function queryWithFailureStage<Row extends object>(
+  client: PostgresClient,
+  stage: TelemetryActivationFailureStage,
+  onFailureStage: ((stage: TelemetryActivationFailureStage) => void) | undefined,
+  text: string,
+  values?: unknown[],
+): Promise<PostgresQueryResult<Row>> {
+  try {
+    return await client.query<Row>(text, values);
+  } catch (error) {
+    try { onFailureStage?.(stage); } catch { /* diagnostics cannot change transaction behavior */ }
+    throw error;
+  }
+}
+
+function trackActivationQueryFailures(
+  client: PostgresClient,
+  currentStage: () => TelemetryActivationFailureStage,
+  shouldTrack: () => boolean,
+  onFailureStage: (stage: TelemetryActivationFailureStage) => void,
+): PostgresClient {
+  return {
+    async query<Row extends object>(text: string, values?: unknown[]): Promise<PostgresQueryResult<Row>> {
+      try {
+        return await client.query<Row>(text, values);
+      } catch (error) {
+        if (shouldTrack()) {
+          try { onFailureStage(currentStage()); } catch { /* diagnostics cannot change transaction behavior */ }
+        }
+        throw error;
+      }
+    },
+    release: (discard?: boolean) => client.release(discard),
+  };
+}
+
 /** A changed manifest on the same day may append records, but cannot erase or
  * change an occurrence already admitted by the predecessor. Compare the
  * immutable canonical digests in SQL; never load a day's records into JS. */
@@ -154,9 +218,10 @@ async function assertSameDaySuccessorClosure(
   previous: DomainDayReference,
   successor: DomainDayReference,
   activationDigest: string,
+  onFailureStage?: (stage: TelemetryActivationFailureStage) => void,
 ): Promise<void> {
   for (const day of [previous, successor]) {
-    const manifest = await client.query<{ expected_chunk_count: number }>(
+    const manifest = await queryWithFailureStage<{ expected_chunk_count: number }>(client, "same_day_manifest", onFailureStage,
       `SELECT expected_chunk_count
          FROM ${table(schema, "telemetry_v12_day_manifests")}
         WHERE id = $1 AND participant_id = $2 AND device_id = $3
@@ -166,9 +231,9 @@ async function assertSameDaySuccessorClosure(
         day.day, day.manifestDigest],
     );
     if (manifest.rows.length !== 1) throw conflict("closure");
-    const summary = await client.query<{
+    const summary = await queryWithFailureStage<{
       chunks: string; records: string; typed_records: string; legacy_records: string;
-    }>(
+    }>(client, "same_day_summary", onFailureStage,
       `SELECT
         (SELECT count(*)::text FROM ${table(schema, "telemetry_v12_chunks")}
           WHERE manifest_id = $1) AS chunks,
@@ -191,7 +256,7 @@ async function assertSameDaySuccessorClosure(
       throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "closure");
     }
   }
-  const missing = await client.query(
+  const missing = await queryWithFailureStage<Record<string, never>>(client, "same_day_occurrence", onFailureStage,
     `SELECT 1
        FROM ${table(schema, "telemetry_v12_typed_records")} old_record
       WHERE old_record.manifest_id = $1
@@ -517,7 +582,14 @@ export function createPostgresTypedV12Domain(
         throw new ApiError(400, "CHUNK_DIGEST_MISMATCH");
       }
       const tokenHash = await sha256Hex(manifest.predecessor.token);
-      return withPostgresMutation(pool, async (client) => {
+      // Per-call state avoids any cross-talk between concurrent activations.
+      let classificationFailureStage: TelemetryActivationFailureStage | null = null;
+      let transactionQueryStage: TelemetryActivationFailureStage = "activation_preflight";
+      let preciseQueryStageActive = false;
+      const operation = ownerRecovery ? "telemetry.v12.owner_recovery.activate" : "telemetry.v12.domain.activate";
+      return withPostgresMutation(pool, async (connection) => {
+        const client = trackActivationQueryFailures(connection, () => transactionQueryStage,
+          () => !preciseQueryStageActive, (stage) => { classificationFailureStage ??= stage; });
         if (ownerRecovery) {
           await assertPostgresCollectionControl(client, config.primarySchema, "processing", { forShare: true });
         }
@@ -613,25 +685,35 @@ export function createPostgresTypedV12Domain(
           throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "state");
         }
         const generationId = crypto.randomUUID();
+        preciseQueryStageActive = true;
         try {
           await preparePostgresClassificationActivation(client,schema,{
             participantId:principal.participantId,deviceId:principal.deviceId,format:12,
             previousGenerationId:predecessor.previous_generation_id,generationId,
             predecessorTokenHash:tokenHash,inputRevision:revision(predecessor.input_revision),
             manifestDigest:manifest.manifestDigest,days:manifest.days,predecessorDays:existingDays as DomainDayReference[],
-          });
+          }, (stage) => { classificationFailureStage = stage; });
         } catch(error) {
           if(error instanceof PostgresClassificationActivationRefusalError) throw conflict(error.phase);
           if(error instanceof PostgresClassificationCorrectionError) throw conflict();
           throw error;
+        } finally {
+          preciseQueryStageActive = false;
         }
         for (const previous of existingDays as DomainDayReference[]) {
           const successor = manifest.days.find((day) => day.day === previous.day)!;
           if (previous.manifestId !== successor.manifestId
               || previous.manifestDigest !== successor.manifestDigest) {
-            await assertSameDaySuccessorClosure(client, schema, principal, previous, successor,manifest.manifestDigest);
+            preciseQueryStageActive = true;
+            try {
+              await assertSameDaySuccessorClosure(client, schema, principal, previous, successor,manifest.manifestDigest,
+                (stage) => { classificationFailureStage = stage; });
+            } finally {
+              preciseQueryStageActive = false;
+            }
           }
         }
+        transactionQueryStage = "activation_publish";
         const committedAt = actualNow.toISOString();
         await client.query(
           `INSERT INTO ${table(schema, "telemetry_v12_domains")} (
@@ -682,7 +764,7 @@ export function createPostgresTypedV12Domain(
           through_day: manifest.throughDay,
         }, false);
       }, {
-        operation: ownerRecovery ? "telemetry.v12.owner_recovery.activate" : "telemetry.v12.domain.activate",
+        operation,
         statementTimeoutMilliseconds: ACTIVATION_STATEMENT_TIMEOUT_MS,
         preserveSafeError,
       }).catch(async (error) => {
@@ -693,7 +775,10 @@ export function createPostgresTypedV12Domain(
           (client) => activeDomainByDigest(client, schema, principal, manifest.manifestDigest),
           { operation: "telemetry.v12.domain.replay" }).catch(() => null);
         if (replay) return activationResult(replay, true);
-        throw postgresTelemetryV12StorageFailure(error);
+        const lifecycle = transactionFailureStage(error, operation);
+        const failureStage = lifecycle.matched ? lifecycle.stage : classificationFailureStage;
+        const safeError = postgresTelemetryV12StorageFailure(error);
+        throw failureStage === null ? safeError : markTelemetryActivationFailureStage(safeError, failureStage);
       });
     };
 

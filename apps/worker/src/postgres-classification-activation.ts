@@ -18,6 +18,7 @@ import { PAGE, HEX, fail, t, hex, number, readLinks, resolveLinks, type LinkRow 
 // The occurrence reader's own retained v1.2 authorization scope. Importing it
 // here leaves the kernel closure unchanged: no closure file imports this module.
 import { v12RetainedAuthorizationScopeSql } from "./analytics-v2/owners";
+import type { TelemetryActivationFailureStage } from "./telemetry-activation-observation";
 
 const CLASSIFICATION_WORK_MEM = "64MB";
 
@@ -34,6 +35,40 @@ export interface PostgresClassificationActivation {
 export type PostgresClassificationActivationRefusalPhase = "rekey" | "classification" | "session_closure";
 export class PostgresClassificationActivationRefusalError extends PostgresClassificationCorrectionError {
   constructor(readonly phase: PostgresClassificationActivationRefusalPhase) { super(); }
+}
+
+type FailureStageContext = {
+  readonly client: PostgresClient;
+  run<T>(stage: TelemetryActivationFailureStage, operation: () => Promise<T>): Promise<T>;
+};
+
+/** Per-activation query-stage attribution. Only rejected SQL calls report a
+ * stage; JavaScript refusals and successful queries cannot inherit one. */
+function failureStageContext(client: PostgresClient,
+  onFailureStage?: (stage: TelemetryActivationFailureStage) => void): FailureStageContext {
+  let current: TelemetryActivationFailureStage | null = null;
+  const trackedClient: PostgresClient = {
+    query: async <Row extends object>(text: string, values?: unknown[]) => {
+      try {
+        return await client.query<Row>(text, values);
+      } catch (error) {
+        if (current !== null) {
+          try { onFailureStage?.(current); } catch { /* diagnostics cannot change the query result */ }
+        }
+        throw error;
+      }
+    },
+    release: (discard?: boolean) => client.release(discard),
+  };
+  return {
+    client: trackedClient,
+    async run<T>(stage: TelemetryActivationFailureStage, operation: () => Promise<T>): Promise<T> {
+      const previous = current;
+      current = stage;
+      try { return await operation(); }
+      finally { current = previous; }
+    },
+  };
 }
 
 function candidateSql(s: string, format: 11 | 12): string {
@@ -153,13 +188,22 @@ class ClassificationWork {
   private readonly built = new Set<WorkSet>();
   private sessionIndexed = false;
   constructor(private readonly client: PostgresClient, private readonly s: string,
-    private readonly input: PostgresClassificationActivation) {}
+    private readonly input: PostgresClassificationActivation, private readonly stages: FailureStageContext) {}
   private async records(name: WorkSet, sql: string): Promise<number> {
-    const created = await this.client.query(`CREATE TEMP TABLE ${work(name)} ON COMMIT DROP AS ${workPrelude()}
-      SELECT * FROM (${sql}) records`, [vector(this.input), this.input.participantId, this.input.deviceId]);
+    const operation = name === "candidate" ? "candidate"
+      : name === "source_10" || name === "source_11" || name === "source_12" ? name : null;
+    if (operation === null) fail();
+    const ctasStage: TelemetryActivationFailureStage = operation === "candidate" ? "candidate_ctas"
+      : operation === "source_10" ? "source_10_ctas"
+        : operation === "source_11" ? "source_11_ctas" : "source_12_ctas";
+    const analyzeStage: TelemetryActivationFailureStage = operation === "candidate" ? "candidate_analyze"
+      : operation === "source_10" ? "source_10_analyze"
+        : operation === "source_11" ? "source_11_analyze" : "source_12_analyze";
+    const created = await this.stages.run(ctasStage, () => this.client.query(`CREATE TEMP TABLE ${work(name)} ON COMMIT DROP AS ${workPrelude()}
+      SELECT * FROM (${sql}) records`, [vector(this.input), this.input.participantId, this.input.deviceId]));
     this.built.add(name);
     // Temporary tables have no autovacuum statistics; the pair joins need them.
-    await this.client.query(`ANALYZE ${work(name)}`);
+    await this.stages.run(analyzeStage, () => this.client.query(`ANALYZE ${work(name)}`));
     return number(created.rowCount);
   }
   candidate(): Promise<number> { return this.records("candidate", candidateSql(this.s, this.input.format)); }
@@ -167,8 +211,8 @@ class ClassificationWork {
     if (!this.built.has(`source_${format}`)) await this.records(`source_${format}`, oldSql(this.s, format));
     return work(`source_${format}`);
   }
-  private async setting(name: string): Promise<string> {
-    const value = (await this.client.query<{setting:string}>("SELECT current_setting($1) AS setting", [name])).rows[0]?.setting;
+  private async setting(name: string, stage: TelemetryActivationFailureStage): Promise<string> {
+    const value = (await this.stages.run(stage, () => this.client.query<{setting:string}>("SELECT current_setting($1) AS setting", [name]))).rows[0]?.setting;
     if (!value) fail();
     return value;
   }
@@ -236,10 +280,10 @@ class ClassificationWork {
     const v1 = await this.source(10), v11 = await this.source(11);
     const v12 = this.input.format === 12, columns = "id,stream,occurrence_id,observed_at_ms,observed_day,session_id";
     // The participant's other devices whose v1.2 generations the reader reads.
-    const others = v12 ? (await this.client.query<{device_id:string}>(`SELECT DISTINCT retained.device_id
+    const others = v12 ? (await this.stages.run("rekey_scope", () => this.client.query<{device_id:string}>(`SELECT DISTINCT retained.device_id
         FROM (${v12RetainedAuthorizationScopeSql(this.s, "now()", "reader")}) retained
        WHERE retained.participant_id=$1 AND retained.device_id<>$2 ORDER BY retained.device_id`,
-      [this.input.participantId, this.input.deviceId])).rows.map(row => String(row.device_id)) : [];
+      [this.input.participantId, this.input.deviceId]))).rows.map(row => String(row.device_id)) : [];
     const legacy = [`SELECT ${columns} FROM ${v1} WHERE stream IN (${V1_STABLE_STREAMS})`];
     if (v12) {
       const v12Source = await this.source(12);
@@ -247,15 +291,15 @@ class ClassificationWork {
         `SELECT ${columns} FROM ${v12Source} WHERE stream IN (1,3) AND source_device_id=ANY($2::text[])`);
     }
     const candidate = work("candidate"), pairs = work("rekey_twins");
-    const nestloop = await this.setting("enable_nestloop");
+    const nestloop = await this.setting("enable_nestloop", "rekey_planner_read");
     const planner = (value: string) => this.client.query("SELECT set_config('enable_nestloop',$1,true)", [value]);
-    await planner("off");
+    await this.stages.run("rekey_planner_disable", () => planner("off"));
     // Provisional twin pairs: same stream, day, instant and (for usage) session.
     // A usage row always has a session; a missing one compares as the empty
     // id, which no session id is (2 to 257 bytes), so the key stays hashable.
     // Quota pairs carry the dropped legacy record, session pairs its session.
     // A usage pair is final here: its token quantities are not compared.
-    let remaining = number((await this.client.query(`CREATE TEMP TABLE ${pairs} ON COMMIT DROP AS
+    let remaining = number((await this.stages.run("rekey_pairs_ctas", () => this.client.query(`CREATE TEMP TABLE ${pairs} ON COMMIT DROP AS
       WITH rekeyed_legacy AS NOT MATERIALIZED (${legacy.join(" UNION ALL ")}),
       dropped AS MATERIALIZED (SELECT DISTINCT legacy.stream,legacy.observed_day,legacy.observed_at_ms,
           COALESCE(legacy.session_id,''::bytea) AS session_key,CASE legacy.stream WHEN 2 THEN legacy.id END AS legacy_id,
@@ -266,12 +310,12 @@ class ClassificationWork {
         FROM ${candidate} twin JOIN dropped ON dropped.stream=twin.stream AND dropped.observed_day=twin.observed_day
          AND dropped.observed_at_ms=twin.observed_at_ms AND dropped.session_key=COALESCE(twin.session_id,''::bytea)
        WHERE NOT EXISTS (SELECT 1 FROM rekeyed_legacy matched WHERE matched.stream=twin.stream
-           AND matched.occurrence_id=twin.occurrence_id)`, v12 ? [this.input.deviceId, others] : [])).rowCount);
+           AND matched.occurrence_id=twin.occurrence_id)`, v12 ? [this.input.deviceId, others] : []))).rowCount);
     this.built.add("rekey_twins");
     let introduced = 0;
     if (remaining > 0) {
-      await this.client.query(`ANALYZE ${pairs}`);
-      const streams = new Set((await this.client.query<{stream:number}>(`SELECT DISTINCT stream FROM ${pairs}`))
+      await this.stages.run("rekey_pairs_analyze", () => this.client.query(`ANALYZE ${pairs}`));
+      const streams = new Set((await this.stages.run("rekey_streams", () => this.client.query<{stream:number}>(`SELECT DISTINCT stream FROM ${pairs}`)))
         .rows.map(row => Number(row.stream)));
       if (streams.has(3)) {
         // Only usage rows of the provisional sessions join, by occurrence id.
@@ -280,7 +324,7 @@ class ClassificationWork {
           usage.push(`SELECT occurrence_id,session_id FROM ${v11} WHERE stream=1`,
             `SELECT occurrence_id,session_id FROM ${work("source_12")} WHERE stream=1 AND source_device_id=ANY($1::text[])`);
         }
-        remaining -= number((await this.client.query(`WITH linked AS MATERIALIZED (
+        remaining -= number((await this.stages.run("rekey_session_links", () => this.client.query(`WITH linked AS MATERIALIZED (
             SELECT DISTINCT old_usage.session_id AS legacy_session,new_usage.session_id AS twin_session
               FROM (${usage.join(" UNION ALL ")}) old_usage
               JOIN ${candidate} new_usage ON new_usage.stream=1 AND new_usage.occurrence_id=old_usage.occurrence_id
@@ -288,35 +332,35 @@ class ClassificationWork {
                AND new_usage.session_id IN (SELECT occurrence_id FROM ${pairs} WHERE stream=3))
           DELETE FROM ${pairs} pair WHERE pair.stream=3 AND NOT EXISTS (SELECT 1 FROM linked
             WHERE linked.legacy_session=pair.legacy_session AND linked.twin_session=pair.occurrence_id)`,
-        v12 ? [others] : [])).rowCount);
+        v12 ? [others] : []))).rowCount);
       }
       // The quota lookup and the v1.2 history probe probe primary keys: the
       // planner default from here. The v1.1 probe keeps nested loops off.
-      if (v12) await planner(nestloop);
+      if (v12) await this.stages.run("rekey_nestloop_restore", () => planner(nestloop));
       if (streams.has(2)) {
         // Quota legacy is v1.1 only, so only a v1.2 activation has quota
         // pairs. Both share the v1.2 dictionary, so limit and slot ids
         // compare. A pair is dropped only when both detail rows exist and
         // differ; one missing a detail row stays a twin.
-        remaining -= number((await this.client.query(`DELETE FROM ${pairs} pair
+        remaining -= number((await this.stages.run("rekey_quota_filter", () => this.client.query(`DELETE FROM ${pairs} pair
           USING ${t(this.s,"typed_telemetry_quota")} legacy_quota,${t(this.s,"telemetry_v12_typed_quota")} twin_quota
           WHERE pair.stream=2 AND legacy_quota.record_id=pair.legacy_id AND twin_quota.record_id=pair.id
-            AND (legacy_quota.limit_id<>twin_quota.limit_id OR legacy_quota.slot_id<>twin_quota.slot_id)`)).rowCount);
+            AND (legacy_quota.limit_id<>twin_quota.limit_id OR legacy_quota.slot_id<>twin_quota.slot_id)`))).rowCount);
       }
     }
     if (remaining > 0) {
       if (!v12) {
         // A hash anti-join over the participant's accepted v1.1 set.
-        introduced = number((await this.client.query<{introduced:string}>(`SELECT count(*)::text AS introduced
+        introduced = number((await this.stages.run("rekey_v11_acceptance", () => this.client.query<{introduced:string}>(`SELECT count(*)::text AS introduced
           FROM ${pairs} twin WHERE NOT EXISTS (SELECT 1 FROM ${v11} accepted
             WHERE accepted.stream=twin.stream AND accepted.observed_day=twin.observed_day
-              AND accepted.occurrence_id=twin.occurrence_id)`)).rows[0]?.introduced);
+              AND accepted.occurrence_id=twin.occurrence_id)`))).rows[0]?.introduced);
       } else {
         // The accepted manifests of the twins' days of this device and of the
         // other retained devices, keyed, so the anti-joins below look each one
         // up rather than rescanning a set.
         const accepted = work("rekey_accepted"), v12Records = t(this.s,"telemetry_v12_typed_records");
-        await this.client.query(`CREATE TEMP TABLE ${accepted} ON COMMIT DROP AS
+        await this.stages.run("rekey_v12_acceptance_ctas", () => this.client.query(`CREATE TEMP TABLE ${accepted} ON COMMIT DROP AS
           SELECT DISTINCT (day.observed_day-DATE '1970-01-01')::integer AS observed_day,day.manifest_id
             FROM ${t(this.s,"telemetry_v12_domains")} generation
             JOIN ${t(this.s,"telemetry_v12_domain_days")} day ON day.generation_id=generation.id
@@ -325,10 +369,10 @@ class ClassificationWork {
              AND manifest.chunk_day=day.observed_day AND manifest.manifest_digest=day.manifest_digest AND manifest.state='ready'
             WHERE generation.participant_id=$1 AND generation.device_id=ANY($2::text[])
               AND (day.observed_day-DATE '1970-01-01')::integer IN (SELECT observed_day FROM ${pairs})`,
-        [this.input.participantId, [this.input.deviceId, ...others]]);
+        [this.input.participantId, [this.input.deviceId, ...others]]));
         this.built.add("rekey_accepted");
-        await this.client.query(`CREATE UNIQUE INDEX ON ${accepted} (observed_day,manifest_id)`);
-        await this.client.query(`ANALYZE ${accepted}`);
+        await this.stages.run("rekey_v12_acceptance_index", () => this.client.query(`CREATE UNIQUE INDEX ON ${accepted} (observed_day,manifest_id)`));
+        await this.stages.run("rekey_v12_acceptance_analyze", () => this.client.query(`ANALYZE ${accepted}`));
         // Each NOT EXISTS correlates only in its WHERE clause, so it plans as
         // an anti-join (a per-twin index probe or one hashed inner set), never
         // a subplan rescanning the accepted set per twin. Usage and quota ids
@@ -337,7 +381,7 @@ class ClassificationWork {
         // probe. A session's first-event instant can move, so a session twin
         // (few per day) is looked up in each accepted manifest of its day by
         // the (manifest_id, stream, occurrence_id) unique key.
-        introduced = number((await this.client.query<{introduced:string}>(`WITH twins AS MATERIALIZED (
+        introduced = number((await this.stages.run("rekey_v12_acceptance_count", () => this.client.query<{introduced:string}>(`WITH twins AS MATERIALIZED (
             SELECT DISTINCT twin.stream,twin.observed_day,twin.observed_at_ms,twin.occurrence_id FROM ${pairs} twin)
           SELECT count(*)::text AS introduced FROM (
             SELECT 1 FROM twins twin WHERE twin.stream<>3 AND NOT EXISTS (SELECT 1 FROM ${v12Records} record
@@ -347,10 +391,10 @@ class ClassificationWork {
             UNION ALL SELECT 1 FROM twins twin WHERE twin.stream=3 AND NOT EXISTS (SELECT 1 FROM ${accepted} accepted
               JOIN ${v12Records} record ON record.manifest_id=accepted.manifest_id
              WHERE accepted.observed_day=twin.observed_day AND record.stream='session'
-               AND record.occurrence_id=twin.occurrence_id)) introduced`)).rows[0]?.introduced);
+               AND record.occurrence_id=twin.occurrence_id)) introduced`))).rows[0]?.introduced);
       }
     }
-    await planner(nestloop);
+    await this.stages.run("rekey_nestloop_restore", () => planner(nestloop));
     return introduced > 0;
   }
   /** The exact pair multiset each original per-page statement joined. */
@@ -369,18 +413,21 @@ class ClassificationWork {
          WHERE old_source.source_device_id=$1 AND old_source.stream IN (1,3)
            AND (old_source.provider_id IS DISTINCT FROM candidate.provider_id
              OR (old_source.stream=1 AND old_source.model_id IS DISTINCT FROM candidate.model_id))`;
-    await this.client.query(`CREATE TEMP TABLE ${work(`${kind}_${format}`)} ON COMMIT DROP AS ${join}`, [this.input.deviceId]);
+    const createStage = `pair_${kind}_${format}_ctas` as TelemetryActivationFailureStage;
+    const indexStage = `pair_${kind}_${format}_index` as TelemetryActivationFailureStage;
+    await this.stages.run(createStage, () => this.client.query(`CREATE TEMP TABLE ${work(`${kind}_${format}`)} ON COMMIT DROP AS ${join}`, [this.input.deviceId]));
     this.built.add(`${kind}_${format}`);
-    await this.client.query(`CREATE INDEX ON ${work(`${kind}_${format}`)} (before_id,after_id)`);
+    await this.stages.run(indexStage, () => this.client.query(`CREATE INDEX ON ${work(`${kind}_${format}`)} (before_id,after_id)`));
   }
   /** Same keyset, order and 201-row page the per-page statements returned. */
   async page<T extends object>(kind: "foreign" | "exact", format: PostgresClassificationFormat, oldCursor: string,
     newCursor: string): Promise<readonly T[]> {
     // Qualified: a bare ORDER BY name would sort the text output columns.
-    return (await this.client.query<T>(`SELECT pair.before_id::text AS before_id,pair.after_id::text AS after_id
+    const stage = `pair_${kind}_page` as TelemetryActivationFailureStage;
+    return (await this.stages.run(stage, () => this.client.query<T>(`SELECT pair.before_id::text AS before_id,pair.after_id::text AS after_id
       ${kind === "exact" ? ",pair.stream" : ""} FROM ${work(`${kind}_${format}`)} pair
       WHERE (pair.before_id,pair.after_id)>($1::bigint,$2::bigint) ORDER BY pair.before_id,pair.after_id LIMIT 201`,
-    [oldCursor, newCursor])).rows;
+    [oldCursor, newCursor]))).rows;
   }
   /** The session closure's original-or-candidate usage rows for one session,
    * in numeric (format,id) order: the cursor compares bigint ids, so a bare
@@ -390,11 +437,11 @@ class ClassificationWork {
     const sources = [await this.source(10), await this.source(11), await this.source(12)];
     if (!this.sessionIndexed) {
       for (const name of ["candidate", "source_10", "source_11", "source_12"] as const) {
-        await this.client.query(`CREATE INDEX ON ${work(name)} (session_id) WHERE stream=1`);
+        await this.stages.run("session_closure_usage_index", () => this.client.query(`CREATE INDEX ON ${work(name)} (session_id) WHERE stream=1`));
       }
       this.sessionIndexed = true;
     }
-    return (await this.client.query<{format:PostgresClassificationFormat;id:string}>(`WITH
+    return (await this.stages.run("session_closure_usage_page", () => this.client.query<{format:PostgresClassificationFormat;id:string}>(`WITH
       original AS (
         SELECT 10 AS format,id,stream,session_id FROM ${sources[0]}
         UNION ALL SELECT 11,id,stream,session_id FROM ${sources[1]}
@@ -403,11 +450,11 @@ class ClassificationWork {
         UNION SELECT $2::integer,id FROM ${work("candidate")} WHERE stream=1 AND session_id=$1)
       SELECT selected.format,selected.id::text AS id FROM selected
        WHERE (selected.format,selected.id)>($3::integer,$4::bigint) ORDER BY selected.format,selected.id LIMIT 201`,
-    [sessionId, this.input.format, formatCursor, recordCursor])).rows;
+    [sessionId, this.input.format, formatCursor, recordCursor]))).rows;
   }
   async drop(): Promise<void> {
     const names = WORK_SETS.filter(name => this.built.has(name));
-    if (names.length) await this.client.query(`DROP TABLE ${names.map(work).join(",")}`);
+    if (names.length) await this.stages.run("work_cleanup", () => this.client.query(`DROP TABLE ${names.map(work).join(",")}`));
     this.built.clear();
   }
 }
@@ -415,7 +462,10 @@ class ClassificationWork {
 /** Prepare links within the caller's existing activation transaction. Nothing
  * can become visible if any later closure, head CAS or journal write refuses. */
 export async function preparePostgresClassificationActivation(client: PostgresClient, s: string,
-  input: PostgresClassificationActivation): Promise<void> {
+  input: PostgresClassificationActivation,
+  onFailureStage?: (stage: TelemetryActivationFailureStage) => void): Promise<void> {
+  const stages = failureStageContext(client, onFailureStage);
+  client = stages.client;
   // A READY predecessor is an additional bound source, never a substitute
   // for corrupt accepted-head evidence. Recheck that head in this same CAS tx.
   for(const format of [11,12] as const){
@@ -428,7 +478,7 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
       : `bound_days AS MATERIALIZED (SELECT day.generation_id,day.observed_day AS day,day.manifest_id AS "manifestId",day.manifest_digest AS "manifestDigest"
           FROM ${t(s,`${prefix}_domain_heads`)} head JOIN ${t(s,`${prefix}_domain_days`)} day ON day.generation_id=head.generation_id
           WHERE head.participant_id=$1)`;
-    const corrupt=(await client.query(`WITH ${expected}
+    const corrupt=(await stages.run(format===11?"manifest_integrity_11":"manifest_integrity_12", () => client.query(`WITH ${expected}
       SELECT 1 FROM ${t(s,`${prefix}_domain_heads`)} head
       JOIN ${t(s,`${prefix}_domains`)} domain ON domain.id=head.generation_id
       JOIN ${t(s,`${prefix}_domain_days`)} day ON day.generation_id=head.generation_id
@@ -437,15 +487,15 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
       WHERE head.participant_id=$1 AND (manifest.id IS NULL OR manifest.state<>'ready'
         OR manifest.participant_id<>head.participant_id OR manifest.device_id<>domain.device_id
         OR manifest.manifest_digest IS DISTINCT FROM bound."manifestDigest" OR manifest.chunk_day<>day.observed_day) LIMIT 1`,
-      [input.participantId])).rows;
+      [input.participantId]))).rows;
     if(corrupt.length) fail();
   }
-  const ownership=(await client.query<{owner_digest:string;revision:string;authority_epoch:string}>(
+  const ownership=(await stages.run("activation_ownership", () => client.query<{owner_digest:string;revision:string;authority_epoch:string}>(
     `SELECT link.owner_digest,owner.revision::text,owner.authority_epoch::text
        FROM ${t(s,"storage_v11_owner_links")} link
        JOIN ${t(s,"storage_source_state")} state ON state.singleton=1
        JOIN ${t(s,"analytics_owner_state")} owner ON owner.source_id=state.source_id AND owner.owner_digest=link.owner_digest
-      WHERE link.participant_id=$1 AND link.state='active' AND owner.state='active'`,[input.participantId])).rows;
+      WHERE link.participant_id=$1 AND link.state='active' AND owner.state='active'`,[input.participantId]))).rows;
   // An ordinary owner without a journal bridge may still take the exact path.
   // A differing classification can never invent an owner link.
   const owner=ownership.length===1?ownership[0]!:null;
@@ -453,17 +503,17 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
   // Multi-million-row sets otherwise hash in 4 MB batches (2026-10-11
   // production: 63 s of spill in one statement). Transaction-local, restored
   // once the proof passes; any refusal rolls the whole transaction back.
-  const workMem=(await client.query<{setting:string}>("SELECT current_setting('work_mem') AS setting")).rows[0]?.setting;
+  const workMem=(await stages.run("work_mem_read", () => client.query<{setting:string}>("SELECT current_setting('work_mem') AS setting"))).rows[0]?.setting;
   if(!workMem) fail();
-  await client.query("SELECT set_config('work_mem',$1,true)",[CLASSIFICATION_WORK_MEM]);
-  const sets=new ClassificationWork(client,s,input);
+  await stages.run("work_mem_apply", () => client.query("SELECT set_config('work_mem',$1,true)",[CLASSIFICATION_WORK_MEM]));
+  const sets=new ClassificationWork(client,s,input,stages);
   // Every pair joins a candidate row, so an empty candidate proves both pair
   // sets empty without reading history, as the per-page joins did. A
   // cross-format re-key refuses before any pair work, so it fails fast.
   if(await sets.candidate()>0){
     if(await sets.rekeyed()) throw new PostgresClassificationActivationRefusalError("rekey");
     try {
-      await prepareClassificationPairs(client,s,input,owner,sets);
+      await prepareClassificationPairs(client,s,input,owner,sets,stages);
     } catch(error) {
       if(error instanceof PostgresClassificationCorrectionError) {
         throw new PostgresClassificationActivationRefusalError("classification");
@@ -472,7 +522,7 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
     }
   }
   try {
-    await assertSessionClassificationClosure(client,s,input,sets);
+    await assertSessionClassificationClosure(client,s,input,sets,stages);
   } catch(error) {
     if(error instanceof PostgresClassificationCorrectionError) {
       throw new PostgresClassificationActivationRefusalError("session_closure");
@@ -480,11 +530,12 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
     throw error;
   }
   await sets.drop();
-  await client.query("SELECT set_config('work_mem',$1,true)",[workMem]);
+  await stages.run("work_mem_restore", () => client.query("SELECT set_config('work_mem',$1,true)",[workMem]));
 }
 
 async function prepareClassificationPairs(client: PostgresClient, s: string, input: PostgresClassificationActivation,
-  owner: {owner_digest:string;revision:string;authority_epoch:string}|null, sets: ClassificationWork): Promise<void> {
+  owner: {owner_digest:string;revision:string;authority_epoch:string}|null, sets: ClassificationWork,
+  stages: FailureStageContext): Promise<void> {
   for(const beforeFormat of [10,11,12] as const){
     if(beforeFormat>input.format) continue;
     let foreignOldCursor="0",foreignNewCursor="0";
@@ -492,12 +543,12 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
     for(;;){
       const foreign=await sets.page<{before_id:string;after_id:string}>("foreign",beforeFormat,foreignOldCursor,foreignNewCursor);
       const page=foreign.slice(0,PAGE);if(!page.length) break;
-      const before=await readPostgresClassificationRecords(client,s,beforeFormat,page.map(row=>row.before_id));
-      const after=await readPostgresClassificationRecords(client,s,input.format,page.map(row=>row.after_id));
+      const before=await stages.run("pair_record_evidence", () => readPostgresClassificationRecords(client,s,beforeFormat,page.map(row=>row.before_id)));
+      const after=await stages.run("pair_record_evidence", () => readPostgresClassificationRecords(client,s,input.format,page.map(row=>row.after_id)));
       const links:LinkRow[]=[];
       for(const stream of ["usage","session"] as const){
         const ids=[...new Set([...before.values()].filter(record=>record.stream===stream).map(record=>record.occurrenceId))];
-        if(ids.length) links.push(...await readLinks(client,s,input.participantId,stream,ids,input.generationId));
+        if(ids.length) links.push(...await stages.run("pair_link_evidence", () => readLinks(client,s,input.participantId,stream,ids,input.generationId)));
       }
       for(const pair of page){
         const original=before.get(pair.before_id),candidate=after.get(pair.after_id);if(!original||!candidate) fail();
@@ -513,19 +564,20 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
       const rows=await sets.page<{before_id:string;after_id:string;stream:number}>("exact",beforeFormat,oldCursor,newCursor);
       const page=rows.slice(0,PAGE); if(!page.length) break;
       if(!owner || !HEX.test(owner.owner_digest)) fail();
-      const before=await readPostgresClassificationRecords(client,s,beforeFormat,page.map(row=>row.before_id));
-      const after=await readPostgresClassificationRecords(client,s,input.format,page.map(row=>row.after_id));
+      const before=await stages.run("pair_record_evidence", () => readPostgresClassificationRecords(client,s,beforeFormat,page.map(row=>row.before_id)));
+      const after=await stages.run("pair_record_evidence", () => readPostgresClassificationRecords(client,s,input.format,page.map(row=>row.after_id)));
 
-      const afterHeaders=await readPostgresClassificationHeaderProofs(client,s,[...after.values()],input.participantId,input.deviceId);
+      const afterHeaders=await stages.run("pair_header_evidence", () => readPostgresClassificationHeaderProofs(client,s,[...after.values()],input.participantId,input.deviceId));
       for(const row of page){
         let oldRecord=before.get(row.before_id);const newRecord=after.get(row.after_id);
         if(!oldRecord||!newRecord||oldRecord.deviceId!==input.deviceId||newRecord.deviceId!==input.deviceId
           ||oldRecord.stream!==newRecord.stream||oldRecord.occurrenceId!==newRecord.occurrenceId
           ||oldRecord.observedAtMs!==newRecord.observedAtMs||oldRecord.stream==="quota") fail();
-        const links=await readLinks(client,s,input.participantId,oldRecord.stream,[oldRecord.occurrenceId],input.generationId);
+        const beforeStream=oldRecord.stream,beforeOccurrence=oldRecord.occurrenceId;
+        const links=await stages.run("pair_link_evidence", () => readLinks(client,s,input.participantId,beforeStream,[beforeOccurrence],input.generationId));
         const terminal=resolveLinks(oldRecord,links);
         if(terminal.recordId!==oldRecord.recordId||terminal.format!==oldRecord.format){
-          oldRecord=(await readPostgresClassificationRecords(client,s,terminal.format,[terminal.recordId])).get(terminal.recordId)!;
+          oldRecord=(await stages.run("pair_record_evidence", () => readPostgresClassificationRecords(client,s,terminal.format,[terminal.recordId]))).get(terminal.recordId)!;
           if(!oldRecord) fail();
         }
         if(oldRecord.stream==="quota") fail();
@@ -539,7 +591,7 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
           if(candidateJson!==oldRecord.recordJson) fail();
           continue;
         }
-        const oldHeader=(await readPostgresClassificationHeaderProofs(client,s,[oldRecord],input.participantId,input.deviceId)).get(`${actualBeforeFormat}:${oldRecord.recordId}`)!;
+        const oldHeader=(await stages.run("pair_header_evidence", () => readPostgresClassificationHeaderProofs(client,s,[oldRecord],input.participantId,input.deviceId))).get(`${actualBeforeFormat}:${oldRecord.recordId}`)!;
         const newHeader=afterHeaders.get(`${input.format}:${newRecord.recordId}`)!;
         const tuple=[POSTGRES_CLASSIFICATION_CORRECTION_METHOD,proof.kind,input.participantId,input.deviceId,owner.owner_digest,
           oldRecord.stream,oldRecord.occurrenceId,oldRecord.observedAtMs,actualBeforeFormat,input.format,
@@ -548,7 +600,7 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
           proof.beforeDigest,proof.afterDigest,proof.invariantDigest,number(owner.revision),number(owner.authority_epoch),
           input.predecessorTokenHash,input.previousGenerationId,input.inputRevision,input.generationId,input.manifestDigest];
         const linkDigest=await sha256Hex(canonicalTelemetryV11Json(tuple));
-        const inserted=await client.query<{link_digest:Uint8Array}>(`INSERT INTO ${t(s,"telemetry_classification_correction_links")} (
+        const inserted=await stages.run("pair_link_insert", () => client.query<{link_digest:Uint8Array}>(`INSERT INTO ${t(s,"telemetry_classification_correction_links")} (
           method_version,kind,participant_id,device_id,owner_digest,owner_revision,authority_epoch,stream,occurrence_id,observed_at_ms,
           before_format,after_format,before_record_id,after_record_id,before_namespace,after_namespace,before_chunk_id,after_chunk_id,
           before_manifest_id,after_manifest_id,before_chunk_digest,after_chunk_digest,before_manifest_digest,after_manifest_digest,
@@ -563,12 +615,12 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
             oldRecord.chunkId,newRecord.chunkId,oldRecord.manifestId,newRecord.manifestId,oldHeader.chunkDigest,newHeader.chunkDigest,
             oldHeader.manifestDigest,newHeader.manifestDigest,proof.beforeDigest,proof.afterDigest,proof.invariantDigest,linkDigest,
             proof.beforeRecordJson,proof.afterRecordJson,input.predecessorTokenHash,input.previousGenerationId,input.inputRevision,
-            input.generationId,input.manifestDigest]);
+            input.generationId,input.manifestDigest]));
         if(!inserted.rows.length){
-          const prior=(await client.query<{link_digest:Uint8Array}>(`SELECT link_digest FROM ${t(s,"telemetry_classification_correction_links")}
+          const prior=(await stages.run("pair_link_reconcile", () => client.query<{link_digest:Uint8Array}>(`SELECT link_digest FROM ${t(s,"telemetry_classification_correction_links")}
             WHERE participant_id=$1 AND device_id=$2 AND stream=$3 AND occurrence_id=$4 AND before_format=$5
               AND before_namespace=$6 AND before_digest=decode($7,'hex')`,[input.participantId,input.deviceId,oldRecord.stream,
-              encodeTypedTelemetryId(oldRecord.occurrenceId),actualBeforeFormat,oldRecord.sourceNamespace,proof.beforeDigest])).rows;
+              encodeTypedTelemetryId(oldRecord.occurrenceId),actualBeforeFormat,oldRecord.sourceNamespace,proof.beforeDigest]))).rows;
           if(prior.length!==1||hex(prior[0]!.link_digest)!==linkDigest) fail();
         }
       }
@@ -582,9 +634,9 @@ async function prepareClassificationPairs(client: PostgresClient, s: string, inp
  * exact physical canonical variant; missing or differing source evidence is
  * incomplete for a session-provider amendment, never silently known. */
 async function assertArchivedSessionProviders(client:PostgresClient,s:string,input:PostgresClassificationActivation,
- sessionId:string,providers:Set<string>):Promise<void>{
-  const runtime=(await client.query<{state:string;source_state:string}>(`SELECT state,source_state
-    FROM ${t(s,"telemetry_usage_correction_runtime")} WHERE id=1`)).rows;
+ sessionId:string,providers:Set<string>,stages:FailureStageContext):Promise<void>{
+  const runtime=(await stages.run("session_closure_runtime", () => client.query<{state:string;source_state:string}>(`SELECT state,source_state
+    FROM ${t(s,"telemetry_usage_correction_runtime")} WHERE id=1`))).rows;
   if(runtime.length!==1||runtime[0]!.state!=="staged"||!["staged","active"].includes(runtime[0]!.source_state)) fail();
   if(runtime[0]!.source_state!=="active") return;
   const columns=[
@@ -598,7 +650,7 @@ async function assertArchivedSessionProviders(client:PostgresClient,s:string,inp
   for(const name of usageColumns) columns.push([`h.${name}`,`usage.${name}`]);
   let cursor="0";
   for(;;){
-    const rows=(await client.query<{id:string;source_storage_row_id:string;record_digest:Uint8Array;base_digest:Uint8Array;
+    const rows=(await stages.run("session_closure_archive_page", () => client.query<{id:string;source_storage_row_id:string;record_digest:Uint8Array;base_digest:Uint8Array;
       source_chunk_digest:Uint8Array;exact:boolean}>(`SELECT h.id::text,h.source_storage_row_id::text,
       h.record_digest,h.base_digest,h.source_chunk_digest,
       (record.id IS NOT NULL AND record.stream=1 AND record.canonical_digest=h.record_digest
@@ -614,14 +666,14 @@ async function assertArchivedSessionProviders(client:PostgresClient,s:string,inp
       WHERE h.participant_id=$1 AND h.owner_digest=(SELECT decode(owner.owner_digest,'hex')
         FROM ${t(s,"storage_v11_owner_links")} owner WHERE owner.participant_id=$1 AND owner.state='active')
         AND session.value=$2 AND h.id>$3::bigint ORDER BY h.id LIMIT 201`,
-      [input.participantId,encodeTypedTelemetryId(sessionId),cursor])).rows;
+      [input.participantId,encodeTypedTelemetryId(sessionId),cursor]))).rows;
     const page=rows.slice(0,PAGE);if(!page.length) break;
     if(page.some(row=>row.exact!==true)) fail();
-    const records=await readPostgresClassificationRecords(client,s,10,page.map(row=>row.source_storage_row_id));
-    const links=await readLinks(client,s,input.participantId,"usage",[...new Set([...records.values()].map(record=>record.occurrenceId))],input.generationId);
+    const records=await stages.run("session_closure_archive_records", () => readPostgresClassificationRecords(client,s,10,page.map(row=>row.source_storage_row_id)));
+    const links=await stages.run("session_closure_archive_links", () => readLinks(client,s,input.participantId,"usage",[...new Set([...records.values()].map(record=>record.occurrenceId))],input.generationId));
     const headers=new Map<string,{readonly chunkDigest:string;readonly manifestDigest:string|null}>();
     for(const device of new Set([...records.values()].map(record=>record.deviceId))){
-      for(const [key,value] of await readPostgresClassificationHeaderProofs(client,s,[...records.values()].filter(record=>record.deviceId===device),input.participantId,device)) headers.set(key,value);
+      for(const [key,value] of await stages.run("session_closure_archive_headers", () => readPostgresClassificationHeaderProofs(client,s,[...records.values()].filter(record=>record.deviceId===device),input.participantId,device))) headers.set(key,value);
     }
     for(const row of page){
       const record=records.get(row.source_storage_row_id);if(!record||record.stream!=="usage") fail();
@@ -639,16 +691,16 @@ async function assertArchivedSessionProviders(client:PostgresClient,s:string,inp
 /** Unknown sessions stay pending. An attempted known session must prove the
  * complete current/candidate usage set across every day at final activation. */
 async function assertSessionClassificationClosure(client: PostgresClient,s:string,input:PostgresClassificationActivation,
- sets:ClassificationWork):Promise<void>{
+ sets:ClassificationWork,stages:FailureStageContext):Promise<void>{
   let sessionCursor="0";
   for(;;){
-    const sessions=(await client.query<{id:string}>(`SELECT DISTINCT after_record_id AS id
+    const sessions=(await stages.run("session_closure_link_page", () => client.query<{id:string}>(`SELECT DISTINCT after_record_id AS id
       FROM ${t(s,"telemetry_classification_correction_links")}
       WHERE participant_id=$1 AND device_id=$2 AND generation_id=$3 AND stream='session'
         AND after_record_id>$4::bigint ORDER BY id LIMIT 201`,
-      [input.participantId,input.deviceId,input.generationId,sessionCursor])).rows;
+      [input.participantId,input.deviceId,input.generationId,sessionCursor]))).rows;
     const sessionPage=sessions.slice(0,PAGE);if(!sessionPage.length) break;
-    const after=await readPostgresClassificationRecords(client,s,input.format,sessionPage.map(row=>row.id));
+    const after=await stages.run("session_closure_records", () => readPostgresClassificationRecords(client,s,input.format,sessionPage.map(row=>row.id)));
     for(const session of after.values()){
       let formatCursor=0,recordCursor="0";const providers=new Set<string>();
       for(;;){
@@ -656,8 +708,8 @@ async function assertSessionClassificationClosure(client: PostgresClient,s:strin
         const page=rows.slice(0,PAGE);if(!page.length) break;
         for(const format of [10,11,12] as const){
           const ids=page.filter(row=>row.format===format).map(row=>row.id);if(!ids.length) continue;
-          const records=await readPostgresClassificationRecords(client,s,format,ids);
-          const links=await readLinks(client,s,input.participantId,"usage",[...new Set([...records.values()].map(row=>row.occurrenceId))],input.generationId);
+          const records=await stages.run("session_closure_usage_records", () => readPostgresClassificationRecords(client,s,format,ids));
+          const links=await stages.run("session_closure_links", () => readLinks(client,s,input.participantId,"usage",[...new Set([...records.values()].map(row=>row.occurrenceId))],input.generationId));
           for(const record of records.values()){
             const effective=resolveLinks(record,links);
             const provider=(JSON.parse(effective.recordJson) as {provider?:unknown}).provider;
@@ -667,7 +719,7 @@ async function assertSessionClassificationClosure(client: PostgresClient,s:strin
         }
         formatCursor=page.at(-1)!.format;recordCursor=page.at(-1)!.id;if(rows.length<=PAGE) break;
       }
-      await assertArchivedSessionProviders(client,s,input,session.occurrenceId,providers);
+      await assertArchivedSessionProviders(client,s,input,session.occurrenceId,providers,stages);
       if(providers.size!==1) fail();
     }
     sessionCursor=sessionPage.at(-1)!.id;if(sessions.length<=PAGE) break;

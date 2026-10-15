@@ -221,6 +221,22 @@ refusals retain `null`; v1.1 remains unclassified. The phase is private log
 metadata and does not alter the public status, error body or headers. Its
 presence in source does not establish deployment or identify an earlier failure.
 
+Failed v1.2 activations may also carry a private `failureStage` from a closed
+allowlist. It distinguishes activation preflight and publication, temporary
+workset construction and statistics, rekey and classification proof, same-day
+closure, and transaction lifecycle failures. Query stages are recorded only
+when that invocation's query rejects; a JavaScript integrity refusal does not
+inherit the last successful query's stage. A failed rollback, commit or release
+cannot retain a proof-query attribution. Successful, replayed, unchanged,
+intentionally refused and v1.1 observations keep `failureStage: null`; unknown
+failure locations remain null. A stage identifies a code boundary, not a
+particular contributor or a cause such as a timeout. It adds no SQL, values,
+identifiers or provider error text to logs and does not alter public responses.
+`transaction_setup` identifies a failed `BEGIN`; failures in the following
+transaction timeout-setting statements remain unclassified. Connection failures
+also remain unclassified.
+Source qualification alone does not establish that a live failure was observed.
+
 The v1.2 predecessor and activation paths serialize on the participant input
 revision before reading the current head in a fresh READ COMMITTED statement.
 A competing activation that waited for that lock must compare with the newly

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { after, before, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
@@ -37,10 +38,13 @@ let errors;
 let routeRegistry;
 let runtimeSchema;
 let registry;
+let viteCacheDir;
 
 before(async () => {
+  viteCacheDir = await mkdtemp(join(tmpdir(), "tibotattle-production-host-check-"));
   vite = await createServer({
     root: WORKER_ROOT,
+    cacheDir: viteCacheDir,
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true, hmr: false, ws: false },
@@ -60,6 +64,7 @@ before(async () => {
 
 after(async () => {
   await vite?.close();
+  if (viteCacheDir) await rm(viteCacheDir, { recursive: true, force: true });
 });
 
 test("activation observations distinguish success, replay, unchanged and safe refusals without identifiers", async () => {
@@ -81,11 +86,12 @@ test("activation observations distinguish success, replay, unchanged and safe re
   assert.deepEqual(events.map(event => event.code), [null, null, null,
     "TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE", "ACTIVATION_UNAVAILABLE"]);
   for (const event of events) {
-    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "outcome", "protocol",
-      "refusalPhase", "status"]);
+    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "failureStage", "outcome",
+      "protocol", "refusalPhase", "status"]);
     assert.equal(event.elapsedMs, 5);
   }
   assert.deepEqual(events.map(event => event.refusalPhase), [null, null, null, null, null]);
+  assert.deepEqual(events.map(event => event.failureStage), [null, null, null, null, null]);
   assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
 });
 
@@ -113,8 +119,8 @@ test("activation refusal phases are closed metadata and never change the public 
   }
   assert.deepEqual(events.map(event => event.refusalPhase), phases);
   for (const event of events) {
-    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "outcome", "protocol",
-      "refusalPhase", "status"]);
+    assert.deepEqual(Object.keys(event).sort(), ["at", "code", "elapsedMs", "event", "failureStage", "outcome",
+      "protocol", "refusalPhase", "status"]);
     assert.equal(event.status, 409);
     assert.equal(event.code, "TELEMETRY_MANIFEST_CONFLICT");
   }
@@ -145,6 +151,293 @@ test("activation refusal phases are closed metadata and never change the public 
   await assert.rejects(observe("v1.2", async () => { throw nonApi; }), error => error === nonApi);
   assert.equal(events.at(-1).refusalPhase, null);
   assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+});
+
+test("activation failure stages are closed, private v1.2 failed metadata", async () => {
+  const { createTelemetryActivationObserver, markTelemetryActivationFailureStage,
+    TELEMETRY_ACTIVATION_FAILURE_STAGES } = await vite.ssrLoadModule("/src/telemetry-activation-observation.ts");
+  const events = [];
+  const observe = createTelemetryActivationObserver(event => events.push(event), () => Date.parse("2026-10-15T12:00:00Z"));
+  for (const stage of TELEMETRY_ACTIVATION_FAILURE_STAGES) {
+    const error = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE", {
+      publicDetails: { reason: "synthetic-private-error-detail" },
+    });
+    assert.equal(markTelemetryActivationFailureStage(error, stage), error);
+    assert.equal(markTelemetryActivationFailureStage(error, "synthetic-private-stage"), error,
+      "unknown stages cannot replace a first valid tag");
+    await assert.rejects(observe("v1.2", async () => { throw error; }), actual => actual === error);
+    assert.equal(events.at(-1).failureStage, stage);
+    assert.equal(JSON.stringify(events.at(-1)).includes("synthetic-private"), false);
+    assert.deepEqual(Object.keys(events.at(-1)).sort(), ["at", "code", "elapsedMs", "event", "failureStage",
+      "outcome", "protocol", "refusalPhase", "status"]);
+  }
+  const untagged = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  markTelemetryActivationFailureStage(untagged, "not-a-stage");
+  await assert.rejects(observe("v1.2", async () => { throw untagged; }), error => error === untagged);
+  assert.equal(events.at(-1).failureStage, null);
+
+  const invalidStatus = new errors.ApiError(Number.NaN, "BACKEND_STORAGE_UNAVAILABLE");
+  markTelemetryActivationFailureStage(invalidStatus, "candidate_ctas");
+  await assert.rejects(observe("v1.2", async () => { throw invalidStatus; }), error => error === invalidStatus);
+  assert.equal(events.at(-1).failureStage, null, "fallback status cannot validate an invalid status value");
+  const unknownCode = new errors.ApiError(503, "synthetic-private-code");
+  markTelemetryActivationFailureStage(unknownCode, "candidate_ctas");
+  await assert.rejects(observe("v1.2", async () => { throw unknownCode; }), error => error === unknownCode);
+  assert.equal(events.at(-1).failureStage, null, "unknown error codes cannot carry diagnostic stages");
+
+  const hostile = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  markTelemetryActivationFailureStage(hostile, "candidate_ctas");
+  Object.defineProperty(hostile, "status", { get() { throw new Error("synthetic-private-status-getter"); } });
+  await assert.rejects(observe("v1.2", async () => { throw hostile; }), error => error === hostile);
+  assert.equal(events.at(-1).failureStage, null, "a hostile error getter suppresses stage metadata");
+
+  const refusal = new errors.ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  markTelemetryActivationFailureStage(refusal, "source_11_analyze");
+  await assert.rejects(observe("v1.2", async () => { throw refusal; }), error => error === refusal);
+  assert.equal(events.at(-1).failureStage, null, "refusals remain untagged");
+  const v11 = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+  markTelemetryActivationFailureStage(v11, "candidate_ctas");
+  await assert.rejects(observe("v1.1", async () => { throw v11; }), error => error === v11);
+  assert.equal(events.at(-1).failureStage, null, "v1.1 stays unchanged");
+  const replay = await observe("v1.2", async () => ({ replay: true }));
+  assert.equal(replay.replay, true);
+  assert.equal(events.at(-1).outcome, "replayed");
+  assert.equal(events.at(-1).failureStage, null, "successful replay stays untagged");
+  assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+});
+
+test("classification proof reports the precise rejected query stage and rethrows the same error", async () => {
+  const { preparePostgresClassificationActivation } = await vite.ssrLoadModule("/src/postgres-classification-activation.ts");
+  const input = {
+    participantId: "synthetic-participant", deviceId: "synthetic-device", format: 12,
+    previousGenerationId: null, generationId: "synthetic-generation", predecessorTokenHash: "a".repeat(64),
+    inputRevision: 1, manifestDigest: "b".repeat(64), days: [], predecessorDays: [],
+  };
+  const failures = [
+    ["manifest_integrity_11", (text) => text.includes("WITH bound_days")],
+    ["manifest_integrity_12", (text, _values, index) => text.includes("WITH bound_days") && index === 2],
+    ["activation_ownership", (text) => text.includes("storage_v11_owner_links")],
+    ["work_mem_read", (text) => text === "SELECT current_setting('work_mem') AS setting"],
+    ["work_mem_apply", (text, values) => text.includes("set_config('work_mem'") && values?.[0] === "64MB"],
+    ["candidate_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_candidate")],
+    ["candidate_analyze", (text) => text.startsWith("ANALYZE") && text.includes("classification_candidate")],
+    ["source_10_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_source_10")],
+    ["source_10_analyze", (text) => text.startsWith("ANALYZE") && text.includes("classification_source_10")],
+    ["source_11_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_source_11")],
+    ["source_11_analyze", (text) => text.startsWith("ANALYZE") && text.includes("classification_source_11")],
+    ["source_12_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_source_12")],
+    ["source_12_analyze", (text) => text.startsWith("ANALYZE") && text.includes("classification_source_12")],
+    ["rekey_scope", (text) => text.includes("SELECT DISTINCT retained.device_id")],
+    ["rekey_planner_read", (text, values) => text.includes("current_setting($1)") && values?.[0] === "enable_nestloop"],
+    ["rekey_planner_disable", (text, values) => text.includes("set_config('enable_nestloop'") && values?.[0] === "off"],
+    ["rekey_pairs_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_rekey_twins")],
+    ["rekey_nestloop_restore", (text, values) => text.includes("set_config('enable_nestloop'") && values?.[0] === "on"],
+    ["pair_foreign_10_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_foreign_10")],
+    ["pair_foreign_10_index", (text) => text.startsWith("CREATE INDEX") && text.includes("classification_foreign_10")],
+    ["pair_foreign_page", (text) => text.includes("SELECT pair.before_id") && text.includes("classification_foreign_10")],
+    ["pair_exact_10_ctas", (text) => text.startsWith("CREATE TEMP TABLE") && text.includes("classification_exact_10")],
+    ["pair_exact_10_index", (text) => text.startsWith("CREATE INDEX") && text.includes("classification_exact_10")],
+    ["pair_exact_page", (text) => text.includes("SELECT pair.before_id") && text.includes("classification_exact_10")],
+    ["session_closure_link_page", (text) => text.includes("SELECT DISTINCT after_record_id AS id")],
+    ["work_cleanup", (text) => text.startsWith("DROP TABLE")],
+    ["work_mem_restore", (text, values) => text.includes("set_config('work_mem'") && values?.[0] === "4MB"],
+  ];
+
+  for (const [expectedStage, matches] of failures) {
+    const originalError = Object.assign(new Error("synthetic-private-driver-message"), { code: "57014" });
+    let queryIndex = 0;
+    let actualStage = null;
+    const client = {
+      async query(text, values) {
+        queryIndex += 1;
+        if (matches(text, values, queryIndex)) throw originalError;
+        if (text === "SELECT current_setting('work_mem') AS setting") return { rows: [{ setting: "4MB" }], rowCount: 1 };
+        if (text.includes("current_setting($1)") && values?.[0] === "enable_nestloop") return { rows: [{ setting: "on" }], rowCount: 1 };
+        if (text.startsWith('CREATE TEMP TABLE pg_temp."classification_candidate"')) return { rows: [], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      },
+      release() {},
+    };
+    let caughtError;
+    try {
+      await preparePostgresClassificationActivation(client, "synthetic_schema", input,
+        stage => { actualStage = stage; });
+    } catch (error) { caughtError = error; }
+    assert.equal(caughtError, originalError, expectedStage);
+    assert.equal(actualStage, expectedStage, `${expectedStage}: stage belongs to the rejected query`);
+  }
+
+  const firstError = Object.assign(new Error("synthetic-private-first"), { code: "57014" });
+  const secondError = Object.assign(new Error("synthetic-private-second"), { code: "57014" });
+  const first = { stage: null, client: { async query() { throw firstError; }, release() {} } };
+  let secondQuery = 0;
+  const second = { stage: null, client: { async query() {
+    secondQuery += 1;
+    if (secondQuery === 2) throw secondError;
+    return { rows: [], rowCount: 0 };
+  }, release() {} } };
+  const results = await Promise.allSettled([
+    preparePostgresClassificationActivation(first.client, "synthetic_schema", input, stage => { first.stage = stage; }),
+    preparePostgresClassificationActivation(second.client, "synthetic_schema", input, stage => { second.stage = stage; }),
+  ]);
+  assert.equal(results[0].status, "rejected");
+  assert.equal(results[0].reason, firstError);
+  assert.equal(first.stage, "manifest_integrity_11");
+  assert.equal(results[1].status, "rejected");
+  assert.equal(results[1].reason, secondError);
+  assert.equal(second.stage, "manifest_integrity_12");
+});
+
+test("a rejected v1.2 authority query is reported as preflight, without exposing driver details", async () => {
+  const contract = await vite.ssrLoadModule("@app-usagemonitor/telemetry-contract");
+  const crypto = await vite.ssrLoadModule("/src/crypto.ts");
+  const { createPostgresTypedV12Domain } = await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts");
+  const { createTelemetryActivationObserver } = await vite.ssrLoadModule("/src/telemetry-activation-observation.ts");
+  const day = "2026-10-14";
+  const now = Date.parse(`${day}T12:00:00.000Z`);
+  const manifest = {
+    schemaVersion: "telemetry-domain-manifest-v1.2",
+    fromDay: day,
+    throughDay: day,
+    predecessor: { token: "11111111-1111-4111-8111-111111111111", previousGenerationId: null,
+      legacyFingerprint: "a".repeat(64) },
+    days: [{ day, manifestId: "22222222-2222-4222-8222-222222222222", manifestDigest: "b".repeat(64) }],
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await crypto.sha256Hex(contract.telemetryV12DomainManifestDigestInput(manifest));
+  const driverError = Object.assign(new Error("synthetic-private-driver-detail"), { code: "57014" });
+  const client = {
+    async query(sql) {
+      if (sql.startsWith("SELECT d.id, d.manifest_digest")) return { rows: [], rowCount: 0 };
+      if (sql.startsWith("SELECT ") && !sql.startsWith("SELECT set_config")) throw driverError;
+      return { rows: [], rowCount: 0 };
+    },
+    release() {},
+  };
+  const domain = createPostgresTypedV12Domain({ async connect() { return client; } },
+    { schema: { primarySchema: "synthetic_schema" } });
+  const events = [];
+  const observe = createTelemetryActivationObserver(event => events.push(event), () => now);
+  await assert.rejects(observe("v1.2", () => domain.activate({ participantId: "synthetic-participant",
+    deviceId: "synthetic-device" }, manifest, now)), error =>
+    error?.status === 503 && error?.code === "BACKEND_STORAGE_UNAVAILABLE");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].failureStage, "activation_preflight");
+  assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+});
+
+test("v1.2 failure stages follow the terminal transaction lifecycle and replay remains successful", async () => {
+  const contract = await vite.ssrLoadModule("@app-usagemonitor/telemetry-contract");
+  const crypto = await vite.ssrLoadModule("/src/crypto.ts");
+  const constants = await vite.ssrLoadModule("/src/constants.ts");
+  const { createPostgresTypedV12Domain } = await vite.ssrLoadModule("/src/postgres-typed-v12-domain.ts");
+  const { createTelemetryActivationObserver } = await vite.ssrLoadModule("/src/telemetry-activation-observation.ts");
+  const day = "2026-10-14";
+  const now = Date.parse(`${day}T12:00:00.000Z`);
+  const manifest = {
+    schemaVersion: "telemetry-domain-manifest-v1.2",
+    fromDay: day,
+    throughDay: day,
+    predecessor: { token: "11111111-1111-4111-8111-111111111111", previousGenerationId: null,
+      legacyFingerprint: "a".repeat(64) },
+    days: [{ day, manifestId: "22222222-2222-4222-8222-222222222222", manifestDigest: "b".repeat(64) }],
+    manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = await crypto.sha256Hex(contract.telemetryV12DomainManifestDigestInput(manifest));
+  const activeRow = { id: "synthetic-generation", manifest_digest: manifest.manifestDigest,
+    from_day: day, through_day: day };
+  const versions = {
+    schema_version: contract.TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    envelope_schema_version: contract.TELEMETRY_V12_ENVELOPE_SCHEMA_VERSION,
+    field_dictionary_version: contract.TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    privacy_contract_version: contract.TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+    state: "active", policy_revision: 1, max_day_chunks: contract.MAX_TELEMETRY_V12_DAY_CHUNKS,
+    max_chunk_records: contract.MAX_TELEMETRY_V12_CHUNK_RECORDS,
+    max_day_bytes: contract.MAX_TELEMETRY_V12_DAY_CANONICAL_BYTES, legacy_state: "active",
+  };
+  const authority = {
+    owner_kind: "social", participant_consent_version: constants.TELEMETRY_CONSENT_VERSION,
+    participant_state: "active", authority_kind: "social", device_state: "active",
+    device_expires_at: new Date(now + 60_000), enrollment_device_id: null,
+  };
+  const capability = {
+    state: "accepted", telemetry_schema_version: contract.TELEMETRY_V12_CONTRIBUTION_SCHEMA_VERSION,
+    field_dictionary_version: contract.TELEMETRY_V12_FIELD_DICTIONARY_VERSION,
+    privacy_contract_version: contract.TELEMETRY_V12_PRIVACY_CONTRACT_VERSION,
+  };
+  const trigger = Object.assign(new Error("synthetic-private-driver-detail"), { code: "57014" });
+
+  async function runScenario(scenario) {
+    let connections = 0;
+    const makeClient = (main) => ({
+      async query(sql) {
+        if (main && scenario === "begin" && sql === "BEGIN") throw trigger;
+        if (main && (scenario === "rollback" || scenario === "release")
+            && sql.includes("SELECT typed.schema_version")) throw trigger;
+        if (main && (scenario === "commit" || scenario === "commit_replay") && sql === "COMMIT") throw trigger;
+        if (sql.startsWith("SELECT typed.schema_version")) return { rows: [versions], rowCount: 1 };
+        if (sql.includes("FROM \"synthetic_schema\".\"participants\"")) return { rows: [authority], rowCount: 1 };
+        if (sql.includes("telemetry_v12_device_capabilities")) return { rows: [capability], rowCount: 1 };
+        if (sql.startsWith("SELECT d.id, d.manifest_digest")) {
+          if (main && (scenario === "commit" || scenario === "commit_replay")) {
+            return { rows: [activeRow], rowCount: 1 };
+          }
+          if (!main && scenario === "commit_replay") return { rows: [activeRow], rowCount: 1 };
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql === "ROLLBACK" && main && scenario === "rollback") throw trigger;
+        return { rows: [], rowCount: 0 };
+      },
+      release() {
+        if (main && scenario === "release") throw new Error("synthetic-private-release-detail");
+      },
+    });
+    const pool = {
+      async connect() {
+        connections += 1;
+        if (scenario === "connect" && connections === 1) throw trigger;
+        return makeClient(connections === 1);
+      },
+    };
+    const domain = createPostgresTypedV12Domain(pool, { schema: { primarySchema: "synthetic_schema" } });
+    const events = [];
+    const observe = createTelemetryActivationObserver(event => events.push(event), () => now);
+    const activate = () => domain.activate({ participantId: "synthetic-participant",
+      deviceId: "synthetic-device" }, manifest, now);
+    if (scenario === "commit_replay") {
+      const result = await observe("v1.2", activate);
+      assert.equal(result.replay, true);
+      assert.equal(events.length, 1);
+      assert.equal(events[0].outcome, "replayed");
+      assert.equal(events[0].failureStage, null, "a recovered commit error is a successful replay, not a failure stage");
+      return;
+    }
+    let routedError;
+    await assert.rejects(observe("v1.2", activate), error => {
+      routedError = error;
+      return error?.status === 503 && error?.code === "BACKEND_STORAGE_UNAVAILABLE";
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].outcome, "failed");
+    assert.equal(events[0].failureStage, {
+      connect: null,
+      begin: "transaction_setup",
+      commit: "transaction_finalization",
+      rollback: "transaction_rollback",
+      release: "transaction_release",
+    }[scenario]);
+    const safeError = new errors.ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+    const [actualResponse, expectedResponse] = [errors.errorResponse(routedError, REQUEST_ID),
+      errors.errorResponse(safeError, REQUEST_ID)];
+    assert.equal(actualResponse.status, expectedResponse.status);
+    assert.deepEqual([...actualResponse.headers], [...expectedResponse.headers]);
+    assert.equal(await actualResponse.text(), await expectedResponse.text());
+    assert.equal(JSON.stringify(events).includes("synthetic-private"), false);
+  }
+
+  for (const scenario of ["connect", "begin", "commit", "rollback", "release", "commit_replay"]) {
+    await runScenario(scenario);
+  }
 });
 
 test("a v1.2 predecessor-state refusal reaches the aggregate observer with its routed phase", async () => {
@@ -1100,8 +1393,10 @@ test("the image runs every entry as the unprivileged node user, which owns none 
  */
 async function hostWithSubstitute(source, code) {
   const substituteId = "\0d-crb-drift-substitute.mjs";
+  const cacheDir = await mkdtemp(join(tmpdir(), "tibotattle-drift-host-check-"));
   const server = await createServer({
     root: WORKER_ROOT,
+    cacheDir,
     configFile: false,
     logLevel: "silent",
     server: { middlewareMode: true, hmr: false, ws: false },
@@ -1119,9 +1414,10 @@ async function hostWithSubstitute(source, code) {
     }],
   });
   try {
-    return { server, drifted: await server.ssrLoadModule("/cloud-run/postgres-production-host.mjs") };
+    return { server, cacheDir, drifted: await server.ssrLoadModule("/cloud-run/postgres-production-host.mjs") };
   } catch (error) {
     await server.close();
+    await rm(cacheDir, { recursive: true, force: true });
     throw error;
   }
 }
@@ -1152,7 +1448,7 @@ test("EDGE_TIER_BINDINGS_DRIFT: any of the three edge-tier lists drifting refuse
   }
   // The composed runtime makes the check itself: EP-6's replay list missing
   // one binding refuses before a connector, pool or store exists.
-  const { server, drifted } = await hostWithSubstitute("./postgres-edge-admission-limiters.mjs", [
+  const { server, cacheDir, drifted } = await hostWithSubstitute("./postgres-edge-admission-limiters.mjs", [
     "import * as real from \"/cloud-run/postgres-edge-admission-limiters.mjs\";",
     "export const createEdgeAdmissionLimiters = real.createEdgeAdmissionLimiters;",
     "export const EDGE_ADMISSION_REPLAY_BINDINGS = Object.freeze(real.EDGE_ADMISSION_REPLAY_BINDINGS.slice(1));",
@@ -1164,6 +1460,7 @@ test("EDGE_TIER_BINDINGS_DRIFT: any of the three edge-tier lists drifting refuse
     assert.deepEqual(seams.calls, [], "no connector, pool or store");
   } finally {
     await server.close();
+    await rm(cacheDir, { recursive: true, force: true });
   }
 });
 
@@ -1172,7 +1469,7 @@ test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health f
     // The registry the runtime builds, wrapped so that resolve() may claim one
     // more route ported than the list the flags came from.
     const claim = Symbol.for("d-crb.production-host.registry-claim");
-    const { server, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
+    const { server, cacheDir, drifted } = await hostWithSubstitute("./postgres-production-registry.mjs", [
       "import * as real from \"/cloud-run/postgres-production-registry.mjs\";",
       "export const ADMIN_HOST_ROUTE_IDS = real.ADMIN_HOST_ROUTE_IDS;",
       // createOriginRouteRegistry hands the round-19 preambles over too.
@@ -1210,6 +1507,7 @@ test("HEALTH_CAPABILITY_FLAGS_DRIFT: a registry that disagrees with the health f
     } finally {
       delete globalThis[claim];
       await server.close();
+      await rm(cacheDir, { recursive: true, force: true });
     }
   });
 
