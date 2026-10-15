@@ -1,4 +1,5 @@
 import { canonicalTelemetryV11Json } from '@app-usagemonitor/telemetry-contract';
+import { canonicalJson } from '../src/canonical-json';
 import { createV11DeviceFixture } from './helpers/telemetry-v11';
 import { currentTelemetryV1Chunk, type TelemetryV1ChunkInsert } from '../src/telemetry-v1-repository';
 import { telemetryV11LegacyProjection } from '../src/telemetry-v11-repository';
@@ -6,6 +7,7 @@ import { parseTelemetryV1Chunk, type TelemetryV1Record } from '../src/telemetry-
 import { insertTypedTelemetryV1Chunk } from '../src/typed-v1-admission';
 import { advanceStorageCommunityDaily, advanceNextStorageCommunityDaily, readPublishedStorageCommunityDaily, retireStorageCommunityDailyPage } from "../src/storage-community-daily";
 import { captureStorageCommunityAuthority, storageCommunityAuthorityIsCurrent, readStorageCommunityOwnerPage } from "../src/storage-community-authority";
+import { effectiveHistoryDependency } from "../src/storage-effective-history";
 import { drainCommunityPublicSourceBootstrap } from "../src/community-daily-aggregates";
 import { env, reset, applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -181,6 +183,12 @@ async function seedV1(stream: 'usage' | 'quota' | 'session' = 'usage', count = 1
     deviceUploadAuthorizationId: claimed.authorizationId, createdAt: new Date().toISOString(), supersedes: null } as TelemetryV1ChunkInsert };
 }
 
+async function seedSocialV1Owner() {
+  const seeded = await seedV1('usage', 1);
+  await insertTypedTelemetryV1Chunk(source(), seeded.insert, namespace);
+  return seeded.fixture;
+}
+
 describe('independent public daily publication',()=>{
   it('reprices an old-registry v11 day in bounded pages without replaying admission',async()=>{
     const owner=await fixture(250);await ready();
@@ -323,12 +331,49 @@ describe('independent public daily publication',()=>{
       .bind(today()).first<string>('values_json'))!).counts.usage;
     expect((await publish()).state).toBe('progress');
     expect(await count()).toBe(50);
+    const checkpoint=await target().prepare(`SELECT source_id,day,owner_digest,input_revision,owner_revision,
+      source_format,method,progress_revision,complete,fingerprint FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? ORDER BY owner_digest LIMIT 1`)
+      .bind(sourceId,today()).first<{source_id:string;day:string;owner_digest:string;input_revision:number;
+        owner_revision:number;source_format:string;method:string;progress_revision:number;complete:number;
+        fingerprint:string}>();
+    if(!checkpoint)throw new Error('expected first effective daily checkpoint');
+    expect(checkpoint.complete).toBe(0);
+    const v4Partial=JSON.parse(checkpoint.fingerprint);
+    expect(v4Partial).toMatchObject({method:'effective-daily-cursor-v4',blocked:false});
+    expect(Object.keys(v4Partial.streams).sort()).toEqual(['quota','session','usage']);
+    expect(v4Partial.streams.usage).toMatchObject({observedAtMs:expect.any(Number),occurrenceId:expect.any(String)});
+    expect(v4Partial.streams.quota).toBeNull();
+    expect(v4Partial.streams.session).toBeNull();
+    expect(v4Partial.dependencyDigest).toMatch(/^[a-f0-9]{64}$/u);
+    const v2Partial=canonicalJson({method:'effective-daily-cursor-v2',
+      dependencyDigest:v4Partial.dependencyDigest,streams:v4Partial.streams});
+    await target().prepare(`UPDATE analytics_community_daily_owners SET fingerprint=?
+      WHERE source_id=? AND day=? AND owner_digest=? AND input_revision=? AND owner_revision=?
+        AND source_format=? AND method=? AND progress_revision=? AND complete=? AND fingerprint=?`)
+      .bind(v2Partial,checkpoint.source_id,checkpoint.day,checkpoint.owner_digest,checkpoint.input_revision,
+        checkpoint.owner_revision,checkpoint.source_format,checkpoint.method,checkpoint.progress_revision,
+        checkpoint.complete,checkpoint.fingerprint).run();
+    const seeded=await target().prepare(`SELECT owner_digest,fingerprint FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND owner_digest=?`)
+      .bind(sourceId,today(),checkpoint.owner_digest).first<{owner_digest:string;fingerprint:string}>();
+    expect(seeded).toEqual({owner_digest:checkpoint.owner_digest,fingerprint:v2Partial});
+    expect(JSON.parse(seeded!.fingerprint)).toEqual({method:'effective-daily-cursor-v2',
+      dependencyDigest:v4Partial.dependencyDigest,streams:v4Partial.streams});
+
     const yesterday=new Date(Date.parse(today())-86400000).toISOString().slice(0,10);
     const outside=await seedV1('usage',1,first.fixture,1,2,yesterday);
     await insertTypedTelemetryV1Chunk(source(),outside.insert,namespace);
     await ready();
     expect((await publish()).state).toBe('progress');
     expect(await count()).toBe(100);
+    const resumed=await target().prepare(`SELECT owner_digest,complete,fingerprint FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND owner_digest=?`).bind(sourceId,today(),checkpoint.owner_digest)
+      .first<{owner_digest:string;complete:number;fingerprint:string}>();
+    expect(resumed?.owner_digest).toBe(checkpoint.owner_digest);
+    expect(resumed?.complete).toBe(0);
+    expect(JSON.parse(resumed!.fingerprint)).toMatchObject({method:'effective-daily-cursor-v4',blocked:false});
+
     const inside=await seedV1('usage',1,first.fixture,1,1);
     await insertTypedTelemetryV1Chunk(source(),inside.insert,namespace);
     await ready();
@@ -338,6 +383,16 @@ describe('independent public daily publication',()=>{
     expect(await count()).toBe(100);
     expect((await publish()).state).toBe('published');
     expect(JSON.parse((await publicRead()).rows[0]!.payload_json).totals.usageEvents).toBe(121);
+    const terminal=await target().prepare(`SELECT owner_digest,complete,fingerprint FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND owner_digest=?`).bind(sourceId,today(),checkpoint.owner_digest)
+      .first<{owner_digest:string;complete:number;fingerprint:string}>();
+    expect(terminal?.complete).toBe(1);
+    const terminalFingerprint=JSON.parse(terminal!.fingerprint);
+    expect(Object.keys(terminalFingerprint).sort()).toEqual(['dependencyDigest','method','streams']);
+    expect(terminalFingerprint.method).toBe('effective-daily-cursor-v2');
+    expect(Object.keys(terminalFingerprint.streams).sort()).toEqual(['quota','session','usage']);
+    expect(terminalFingerprint.streams).toEqual({usage:null,quota:null,session:null});
+    expect(terminalFingerprint.dependencyDigest).toMatch(/^[a-f0-9]{64}$/u);
   });
   it('never folds a valid prefix twice when a later effective page contains a conflict',async()=>{
     const first=await seedV1('usage',120);
@@ -358,11 +413,198 @@ describe('independent public daily publication',()=>{
       .bind(today()).first<string>('values_json'))!).counts.usage;
     expect((await publish()).state).toBe('progress');
     expect(await count()).toBe(50);
+    const checkpoint=await target().prepare(`SELECT complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE day=?`).bind(today())
+      .first<{complete:number;progress_revision:number;fingerprint:string;values_json:string}>();
+    expect(checkpoint).toMatchObject({complete:0});
+    const cursor=JSON.parse(checkpoint!.fingerprint);
+    expect(cursor).toMatchObject({method:'effective-daily-cursor-v4',blocked:false});
+    expect(cursor.streams.usage).toMatchObject({observedAtMs:expect.any(Number),occurrenceId:expect.any(String)});
+    const owners=await readStorageCommunityOwnerPage(source(),{limit:64});
+    const owner=owners.find(item=>item.participantId===first.fixture.participantId)!;
+    const dependency=await effectiveHistoryDependency(source(),owner,namespace,today(),today(),{includeSessions:true});
+    expect(cursor.dependencyDigest).toBe(await sha256Hex(canonicalJson(dependency)));
+    // The later-page conflict is discovered only on the next bounded pass.
+    // Persist its actual blocked marker once, then retries remain write-free.
+    expect(await publish()).toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
+    expect(await count()).toBe(50);
+    const blockedCheckpoint=await target().prepare(`SELECT complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE day=?`).bind(today())
+      .first<{complete:number;progress_revision:number;fingerprint:string;values_json:string}>();
+    expect(JSON.parse(blockedCheckpoint!.fingerprint)).toMatchObject({method:'effective-daily-cursor-v4',blocked:true});
     for(let retry=0;retry<3;retry++){
       expect(await publish()).toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
       expect(await count()).toBe(50);
+      const after=await target().prepare(`SELECT complete,progress_revision,fingerprint,values_json
+        FROM analytics_community_daily_owners WHERE day=?`).bind(today())
+        .first<{complete:number;progress_revision:number;fingerprint:string;values_json:string}>();
+      expect(after).toEqual(blockedCheckpoint);
       expect((await publicRead()).rows).toEqual([]);
     }
+  });
+  it('materializes first-page conflict identity and attempts other owners within the bound',async()=>{
+    const members=[] as Awaited<ReturnType<typeof createV11DeviceFixture>>[];
+    for(let index=0;index<3;index++)members.push(await seedSocialV1Owner());
+    await ready();
+    const ordered=await readStorageCommunityOwnerPage(source(),{limit:64});
+    expect(ordered).toHaveLength(3);
+    const blocked=members.find(item=>item.participantId===ordered[0]!.participantId)!;
+    const clear=members.find(item=>item.participantId===ordered[1]!.participantId)!;
+    const untouched=members.find(item=>item.participantId===ordered[2]!.participantId)!;
+    const blockedOwner=ordered.find(item=>item.participantId===blocked.participantId)!;
+    const clearOwner=ordered.find(item=>item.participantId===clear.participantId)!;
+    const untouchedOwner=ordered.find(item=>item.participantId===untouched.participantId)!;
+    const baseQuota=await seedV1('quota',1,blocked);
+    await insertTypedTelemetryV1Chunk(source(),baseQuota.insert,namespace);
+    const blockedDevice=await createV11DeviceFixture(source(),{participantId:blocked.participantId});
+    const duplicate=await seedV1('quota',1,blockedDevice);
+    const original=duplicate.insert.chunk.records[0]!;
+    const records=[{...original,usedPercent:0.4}];
+    const {schemaVersion,chunkId,chunkRevision,parserVersion,consent}=duplicate.insert.chunk;
+    const chunk=parseTelemetryV1Chunk({schemaVersion,chunkId,chunkRevision,parserVersion,consent,records,
+      chunkDigest:await sha256Hex(canonicalTelemetryV11Json(records))});
+    await insertTypedTelemetryV1Chunk(source(),{...duplicate.insert,chunk},namespace);
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await ready();
+
+    const result=await advanceStorageCommunityDaily({...options(),maxOwners:2});
+    expect(result).toMatchObject({state:'progress',ownersAdvanced:1});
+    const rows=(await target().prepare(`SELECT owner_digest,complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE source_id=? AND day=? ORDER BY owner_digest`)
+      .bind(sourceId,today()).all<{owner_digest:string;complete:number;progress_revision:number;fingerprint:string;values_json:string}>()).results;
+    expect(rows).toHaveLength(2);
+    const incomplete=rows.find(row=>row.owner_digest===blockedOwner.ownerDigest)!;
+    const completed=rows.find(row=>row.owner_digest===clearOwner.ownerDigest)!;
+    expect(incomplete.complete).toBe(0);
+    expect(completed.complete).toBe(1);
+    expect(rows.some(row=>row.owner_digest===untouchedOwner.ownerDigest)).toBe(false);
+    const cursor=JSON.parse(incomplete.fingerprint);
+    expect(cursor.method).toBe('effective-daily-cursor-v4');
+    expect(cursor.blocked).toBe(true);
+    expect(cursor.streams).toEqual({usage:null,quota:{state:'start'},session:{state:'start'}});
+    expect(JSON.parse(incomplete.values_json).counts).toMatchObject({usage:1,quota:0,session:0});
+    const owner=ordered.find(item=>item.ownerDigest===blockedOwner.ownerDigest)!;
+    const dependency=await effectiveHistoryDependency(source(),owner,namespace,today(),today(),{includeSessions:true});
+    expect(cursor.dependencyDigest).toBe(await sha256Hex(canonicalJson(dependency)));
+    expect((await target().prepare(`SELECT COUNT(*) n FROM analytics_community_daily_publications
+      WHERE source_id=? AND day=?`).bind(sourceId,today()).first<number>('n'))).toBe(0);
+    const replay=await advanceStorageCommunityDaily({...options(),maxOwners:2});
+    expect(replay).toMatchObject({state:'progress',reason:'projection_pending',ownersAdvanced:1});
+    const after=await target().prepare(`SELECT owner_digest,complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND owner_digest=?`)
+      .bind(sourceId,today(),blockedOwner.ownerDigest)
+      .first<{owner_digest:string;complete:number;progress_revision:number;fingerprint:string;values_json:string}>();
+    expect(after).toEqual(incomplete);
+    expect(await target().prepare(`SELECT complete FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND owner_digest=?`).bind(sourceId,today(),untouchedOwner.ownerDigest)
+      .first<number>('complete')).toBe(1);
+    expect((await publicRead()).rows).toEqual([]);
+
+    const repair=await seedV1('quota',1,blockedDevice,2);
+    repair.insert.supersedes=await currentTelemetryV1Chunk(source(),blocked.participantId,
+      blockedDevice.deviceId,'quota',today(),0);
+    await insertTypedTelemetryV1Chunk(source(),repair.insert,namespace);
+    await ready();
+    expect(await advanceStorageCommunityDaily(options())).toMatchObject({state:'published',ownersAdvanced:1});
+    const recovered=await target().prepare(`SELECT complete,fingerprint FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND owner_digest=?`).bind(sourceId,today(),blockedOwner.ownerDigest)
+      .first<{complete:number;fingerprint:string}>();
+    expect(recovered?.complete).toBe(1);
+    const terminal=JSON.parse(recovered!.fingerprint);
+    expect(Object.keys(terminal).sort()).toEqual(['dependencyDigest','method','streams']);
+    expect(terminal.method).toBe('effective-daily-cursor-v2');
+    expect(terminal.streams).toEqual({usage:null,quota:null,session:null});
+    const published=JSON.parse((await publicRead()).rows[0]!.payload_json);
+    expect(published.totals.usageEvents).toBe(3);
+    expect(published.totals.quotaObservations).toBe(1);
+  });
+  it('prioritizes unblocked owners past multiple bounded conflict markers and retries repaired owners',async()=>{
+    const members=[] as Awaited<ReturnType<typeof createV11DeviceFixture>>[];
+    for(let index=0;index<4;index++)members.push(await seedSocialV1Owner());
+    await ready();
+    const ordered=await readStorageCommunityOwnerPage(source(),{limit:64});
+    expect(ordered).toHaveLength(4);
+    const blockedOwners=ordered.slice(0,2);
+    const blockedMembers=blockedOwners.map(owner=>members.find(item=>item.participantId===owner.participantId)!);
+    const clearOwners=ordered.slice(2);
+    const devices=new Map<string,Awaited<ReturnType<typeof createV11DeviceFixture>>>();
+    for(const member of blockedMembers){
+      const baseQuota=await seedV1('quota',1,member);
+      await insertTypedTelemetryV1Chunk(source(),baseQuota.insert,namespace);
+      const device=await createV11DeviceFixture(source(),{participantId:member.participantId});
+      devices.set(member.participantId,device);
+      const duplicate=await seedV1('quota',1,device);
+      const original=duplicate.insert.chunk.records[0]!;
+      const records=[{...original,usedPercent:0.4}];
+      const {schemaVersion,chunkId,chunkRevision,parserVersion,consent}=duplicate.insert.chunk;
+      const chunk=parseTelemetryV1Chunk({schemaVersion,chunkId,chunkRevision,parserVersion,consent,records,
+        chunkDigest:await sha256Hex(canonicalTelemetryV11Json(records))});
+      await insertTypedTelemetryV1Chunk(source(),{...duplicate.insert,chunk},namespace);
+    }
+    await source().prepare("UPDATE telemetry_usage_correction_runtime SET state='active' WHERE id=1").run();
+    await ready();
+
+    // Each actual quota conflict consumes the one-owner attempt cap and stores
+    // an incomplete dependency identity. Neither attempt is reported complete.
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1}))
+      .toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1}))
+      .toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
+    const blockedRows=(await target().prepare(`SELECT owner_digest,complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE source_id=? AND day=? ORDER BY owner_digest`)
+      .bind(sourceId,today()).all<{owner_digest:string;complete:number;progress_revision:number;fingerprint:string;values_json:string}>()).results;
+    expect(blockedRows).toHaveLength(2);
+    expect(blockedRows.every(row=>row.complete===0 && JSON.parse(row.fingerprint).blocked===true)).toBe(true);
+    for(const row of blockedRows){
+      const owner=blockedOwners.find(item=>item.ownerDigest===row.owner_digest)!;
+      const cursor=JSON.parse(row.fingerprint);
+      expect(cursor.streams).toEqual({usage:null,quota:{state:'start'},session:{state:'start'}});
+      expect(cursor.dependencyDigest).toBe(await sha256Hex(canonicalJson(
+        await effectiveHistoryDependency(source(),owner,namespace,today(),today(),{includeSessions:true}))));
+      expect(JSON.parse(row.values_json).counts).toMatchObject({usage:1,quota:0,session:0});
+    }
+    expect((await publicRead()).rows).toEqual([]);
+
+    // Both missing clear owners are prioritized ahead of the known blocked
+    // rows and make one bounded unit of progress apiece.
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1}))
+      .toMatchObject({state:'progress',ownersAdvanced:1});
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1}))
+      .toMatchObject({state:'progress',ownersAdvanced:1});
+    const completedOwners=(await target().prepare(`SELECT owner_digest FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND complete=1 ORDER BY owner_digest`).bind(sourceId,today())
+      .all<{owner_digest:string}>()).results.map(row=>row.owner_digest);
+    expect(completedOwners).toEqual(clearOwners.map(owner=>owner.ownerDigest).sort());
+
+    const terminal=await advanceStorageCommunityDaily({...options(),maxOwners:1});
+    expect(terminal).toMatchObject({state:'deferred',reason:'projection_pending',ownersAdvanced:0});
+    const stable=await target().prepare(`SELECT owner_digest,complete,progress_revision,fingerprint,values_json
+      FROM analytics_community_daily_owners WHERE source_id=? AND day=? AND complete=0 ORDER BY owner_digest`)
+      .bind(sourceId,today()).all<{owner_digest:string;complete:number;progress_revision:number;fingerprint:string;values_json:string}>();
+    expect(stable.results).toEqual(blockedRows);
+    expect(await advanceStorageCommunityDaily({...options(),maxOwners:1})).toEqual(terminal);
+
+    // Same-slot quota replacement removes the obsolete current source without
+    // creating usage correction history. The changed dependency moves each
+    // owner back to priority; the real reader restarts and completes the fold.
+    for(const member of blockedMembers){
+      const device=devices.get(member.participantId)!;
+      const repair=await seedV1('quota',1,device,2);
+      repair.insert.supersedes=await currentTelemetryV1Chunk(source(),member.participantId,
+        device.deviceId,'quota',today(),0);
+      await insertTypedTelemetryV1Chunk(source(),repair.insert,namespace);
+    }
+    await ready();
+    let result:Awaited<ReturnType<typeof advanceStorageCommunityDaily>>={state:'deferred',reason:'projection_pending',ownersAdvanced:0};
+    for(let attempt=0;attempt<4&&result.state!=='published';attempt++){
+      result=await advanceStorageCommunityDaily({...options(),maxOwners:1});
+    }
+    expect(result.state).toBe('published');
+    const publication=(await publicRead()).rows;
+    expect(publication).toHaveLength(1);
+    expect(JSON.parse(publication[0]!.payload_json).totals).toMatchObject({usageEvents:4,quotaObservations:2});
+    expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_community_daily_owners
+      WHERE source_id=? AND day=? AND complete=0`).bind(sourceId,today()).first<number>('n')).toBe(0);
   });
   it('prioritizes a stale visible head without starving the durable day queue',async()=>{
     await fixture();await ready();await publish();

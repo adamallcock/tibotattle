@@ -1,7 +1,7 @@
 /** Pure owner stages. No database or hooks; emissions and terminal errors stay in date order. */
 import { CACHE_RETENTION_METHOD, modelHistoryWindow, validateV11DailyProjectionValues,
-  type CommunityAllowanceFit, type SharedAnalyticsDay, type V11DailyProjectionValues,
-  type V1ModelCompositionResult } from "../../vendor/analytics-d43c8f92/entry";
+  type CommunityAllowanceFit, type SharedAnalyticsDay, type V11DailyProjectionValues } from "../../vendor/analytics-d43c8f92/entry";
+import type { AnalyticsV2ModelCompositionResult } from "./model-era-composition";
 import { ANALYTICS_V2_CACHE_BAND_COUNTERS, type AnalyticsV2CacheBandCounter,
   type AnalyticsV2Day, type AnalyticsV2Owner, type AnalyticsV2OwnerEmission, type AnalyticsV2Refusal } from "./contract";
 import { analyticsV2CacheView, evaluateAnalyticsV2CacheDay, evaluateAnalyticsV2ModelDate,
@@ -47,7 +47,12 @@ function bandCounters(band: Record<(typeof COUNTER_FIELDS)[AnalyticsV2CacheBandC
     [counter, band[COUNTER_FIELDS[counter]]]))) as Readonly<Record<AnalyticsV2CacheBandCounter, number>>;
 }
 
-function withoutFingerprint(result: V1ModelCompositionResult): Omit<V1ModelCompositionResult, "inputFingerprint"> {
+function withoutFingerprint(result: AnalyticsV2ModelCompositionResult): object {
+  if (result.status === "partitioned") {
+    const { inputFingerprint: _fingerprint, ...stored } = result;
+    return { ...stored, candidates: result.candidates.map(candidate => ({ ...candidate,
+      composition: withoutFingerprint(candidate.composition) })) };
+  }
   if (!("inputFingerprint" in result)) return result;
   const { inputFingerprint: _fingerprint, ...stored } = result;
   return stored;
@@ -178,7 +183,7 @@ export async function evaluateScalar(input: AnalyticsV2ModelBlockInput, day: Ana
   return { emissions, fits, terminalError };
 }
 export type AnalyticsV2ModelDateUnit =
-  | { readonly day: AnalyticsV2Day; readonly emission: AnalyticsV2OwnerEmission; readonly composition: V1ModelCompositionResult | null }
+  | { readonly day: AnalyticsV2Day; readonly emission: AnalyticsV2OwnerEmission; readonly composition: AnalyticsV2ModelCompositionResult | null }
   | { readonly day: AnalyticsV2Day; readonly terminalError: unknown };
 /** Pins are lazy, in date order. Terminal errors retain every earlier date for ordered replay. */
 export async function evaluateModelBlock(input: AnalyticsV2ModelBlockInput): Promise<readonly AnalyticsV2ModelDateUnit[]> {
@@ -186,7 +191,7 @@ export async function evaluateModelBlock(input: AnalyticsV2ModelBlockInput): Pro
   for (const day of input.dates) {
     try {
       const pin = await buildAnalyticsV2Pin({ owner: input.owner, day, dayDigests: input.dayDigests });
-      const result = await evaluateAnalyticsV2ModelDate(windowInput(input, day, pin)) as V1ModelCompositionResult;
+      const result = await evaluateAnalyticsV2ModelDate(windowInput(input, day, pin));
       dates.push({ day, composition: result,
         emission: { kind: "modelDate", row: Object.freeze({ ownerDigest: input.owner.ownerDigest, day,
           result: withoutFingerprint(result) }) } });

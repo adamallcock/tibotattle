@@ -31,6 +31,9 @@ export const ACCOUNTLESS_ENROLLMENT_CLOCK_SKEW_MILLISECONDS = 5 * 60 * 1000;
 const MAXIMUM_RESPONSE_BYTES = 16_384;
 const DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 15_000;
 const MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
+// Ordinary accountless requests keep the shorter default; final v1.2 domain
+// activation may use this longer request bound within the existing pass budget.
+const DEFAULT_V12_ACTIVATION_REQUEST_TIMEOUT_MILLISECONDS = 60_000;
 const DEVICE_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SECRET_HASH_PATTERN = /^[0-9a-f]{64}$/u;
@@ -880,6 +883,7 @@ function configuredAccountlessSync(options) {
     runIncrementalSync = runIncrementalContributionSyncOnce,
     signal = undefined,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
+    activationRequestTimeoutMilliseconds = DEFAULT_V12_ACTIVATION_REQUEST_TIMEOUT_MILLISECONDS,
     maximumChunks = 500,
     maximumDurationMilliseconds = 60_000,
     now = Date.now,
@@ -904,6 +908,9 @@ function configuredAccountlessSync(options) {
       || !Number.isSafeInteger(requestTimeoutMilliseconds)
       || requestTimeoutMilliseconds < 1_000
       || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+      || !Number.isSafeInteger(activationRequestTimeoutMilliseconds)
+      || activationRequestTimeoutMilliseconds < 1_000
+      || activationRequestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
       || !Number.isSafeInteger(maximumChunks) || maximumChunks < 1 || maximumChunks > 2_000
       || !Number.isSafeInteger(maximumDurationMilliseconds)
       || maximumDurationMilliseconds < 1 || maximumDurationMilliseconds > 300_000
@@ -931,6 +938,7 @@ function configuredAccountlessSync(options) {
     runIncrementalSync,
     signal,
     requestTimeoutMilliseconds,
+    activationRequestTimeoutMilliseconds,
     maximumChunks,
     maximumDurationMilliseconds,
     now,
@@ -1009,6 +1017,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     runIncrementalSync,
     signal,
     requestTimeoutMilliseconds,
+    activationRequestTimeoutMilliseconds,
     maximumChunks,
     maximumDurationMilliseconds,
     now,
@@ -1107,6 +1116,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
       withDeviceSecret,
       maximumChunks,
       requestTimeoutMilliseconds,
+      ...(successor ? { activationRequestTimeoutMilliseconds } : {}),
       maximumDurationMilliseconds,
       now,
       readAccountMarkers,

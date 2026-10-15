@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import fsPromises, {
   chmod,
   copyFile,
@@ -152,21 +154,37 @@ function lockRow(stateFile) {
   }
 }
 
-test("run-once succeeds repeatedly with an exact large identity and releases its lock", async () => {
+test("run-once succeeds repeatedly with an exact large identity and releases its lock", async (t) => {
   const value = await fixture({ collector: true });
+  await commitLocalCollectorState({
+    stateFile: value.stateFile,
+    checkpoint: checkpoint(),
+    records: [],
+    clock: () => CLOCK_BASE,
+  });
   const originalLstat = fsPromises.lstat;
+  const originalLstatSync = fs.lstatSync;
   const verifierIdentities = [];
   const WorkerClass = workerClassWithIdentity(value.stateFile);
   let now = CLOCK_BASE;
   try {
-    fsPromises.lstat = async (path, options) => {
-      const metadata = await originalLstat(path, options);
+    t.mock.method(fsPromises, "lstat", async function (path, options) {
+      const metadata = await originalLstat.call(this, path, options);
       if (path === value.stateFile && options?.bigint === true) {
         metadata.dev = LARGE_DEVICE;
         metadata.ino = LARGE_INODE;
       }
       return metadata;
-    };
+    });
+    t.mock.method(fs, "lstatSync", function (path, options) {
+      const metadata = originalLstatSync.call(this, path, options);
+      if (path === value.stateFile && options?.bigint === true) {
+        metadata.dev = LARGE_DEVICE;
+        metadata.ino = LARGE_INODE;
+      }
+      return metadata;
+    });
+    syncBuiltinESMExports();
     const resultOptions = {
       codexHome: value.codexHome,
       stateFile: value.stateFile,
@@ -180,10 +198,10 @@ test("run-once succeeds repeatedly with an exact large identity and releases its
       },
     };
     const first = await runCollectorOnce(resultOptions);
-    const realIdentityAfterFirst = await lstat(value.stateFile, { bigint: true });
+    const realIdentityAfterFirst = await originalLstat(value.stateFile, { bigint: true });
     now += 1_000;
     const second = await runCollectorOnce(resultOptions);
-    const realIdentityAfterSecond = await lstat(value.stateFile, { bigint: true });
+    const realIdentityAfterSecond = await originalLstat(value.stateFile, { bigint: true });
 
     assert.equal(first.status, "complete");
     assert.equal(first.refresh.recordWritten, true);
@@ -206,27 +224,34 @@ test("run-once succeeds repeatedly with an exact large identity and releases its
     );
     assert.equal(lockRow(value.stateFile), null);
   } finally {
-    fsPromises.lstat = originalLstat;
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
     await rm(value.root, { recursive: true, force: true });
   }
 });
 
-test("a session identity failure releases the lock before a same-PID retry", async () => {
+test("a session identity failure after lock acquisition releases it before a same-PID retry", async () => {
   const value = await fixture({ collector: true });
+  await commitLocalCollectorState({
+    stateFile: value.stateFile,
+    checkpoint: checkpoint(),
+    records: [],
+    clock: () => CLOCK_BASE,
+  });
   const originalLstat = fsPromises.lstat;
-  const WorkerClass = workerClassWithIdentity(value.stateFile);
-  let invalidIdentity = true;
+  let identityFailureInjected = false;
+  let lockOwnerAtFailure = null;
   try {
     fsPromises.lstat = async (path, options) => {
       const metadata = await originalLstat(path, options);
-      if (path === value.stateFile && options?.bigint === true) {
-        if (invalidIdentity) {
-          metadata.dev = LARGE_DEVICE;
-          metadata.ino = -1n;
-          invalidIdentity = false;
-        } else {
-          metadata.dev = LARGE_DEVICE;
-          metadata.ino = LARGE_INODE;
+      if (path === value.stateFile
+          && options?.bigint === true
+          && !identityFailureInjected) {
+        const row = lockRow(value.stateFile);
+        if (row !== null) {
+          lockOwnerAtFailure = row.pid;
+          metadata.ino += 1n;
+          identityFailureInjected = true;
         }
       }
       return metadata;
@@ -238,14 +263,14 @@ test("a session identity failure releases the lock before a same-PID retry", asy
       staleAfterMs: -1,
       clock: () => CLOCK_BASE,
       appServerFactory: () => new MinimalClient(),
-      integrityVerifier: (verificationOptions) =>
-        verifyLocalCollectorStateIntegrityOffMain(verificationOptions, { WorkerClass }),
     };
 
     await assert.rejects(
       () => runCollectorOnce(options),
       { code: "local_collector_state_unavailable" },
     );
+    assert.equal(identityFailureInjected, true);
+    assert.equal(lockOwnerAtFailure, process.pid);
     assert.equal(lockRow(value.stateFile), null);
 
     const retried = await runCollectorOnce(options);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -161,5 +161,85 @@ test("worker reports one fixed source-integrity code for prefix mutation, trunca
         await rm(root, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test("synthetic real-history timeout preserves the frozen owner-only worker diagnostic through cleanup", {
+  timeout: 30_000,
+}, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "r7-synthetic-failure-diagnostic-")));
+  try {
+    const fixture = await createR7StructuralFixture(root);
+    await assert.rejects(runR7RealHistoryBenchmark({
+      startAt: R7_FIXTURE_START_AT, endAt: R7_FIXTURE_END_AT,
+      runtimeExecutables: [process.execPath], temporaryRoot: root,
+      timeoutMs: 100, ...fixture.paths,
+    }), (error) => {
+      assert.equal(error.message, "R7 real-history source_scan filesystem sampling stopped: deadline_exceeded: R7 operation worker stopped: timed_out");
+      const diagnostic = error.r7WorkerDiagnostic;
+      assert.equal(Object.isFrozen(diagnostic), true);
+      assert.equal(diagnostic.outcome, "timed_out");
+      assert.equal(diagnostic.processScope, "direct_child");
+      assert.equal(Number.isSafeInteger(diagnostic.elapsedMs), true);
+      assert.deepEqual(Object.keys(error), []);
+      for (const value of [root, ...Object.values(fixture.paths)]) {
+        assert.equal(JSON.stringify(diagnostic).includes(value), false);
+      }
+      return true;
+    });
+    assert.equal((await readdir(root)).some((name) => name.startsWith("usage-monitor-r7-real-history-")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("synthetic worker timeout plus cleanup refusal retains the same top-level diagnostic", {
+  timeout: 30_000,
+}, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "r7-synthetic-dual-failure-")));
+  let injection;
+  let cancelInjection = false;
+  try {
+    const fixture = await createR7StructuralFixture(root);
+    await assert.rejects(runR7RealHistoryBenchmark({
+      startAt: R7_FIXTURE_START_AT, endAt: R7_FIXTURE_END_AT,
+      runtimeExecutables: [process.execPath], temporaryRoot: root,
+      timeoutMs: 100, ...fixture.paths,
+      async afterSourcePlanFreeze() {
+        injection = (async () => {
+          // Poll only this test-owned directory; native filesystem watchers can
+          // be unavailable under supported CI/sandbox process limits.
+          for (let attempt = 0; attempt < 500 && !cancelInjection; attempt += 1) {
+            const filename = (await readdir(root)).find((name) => name.startsWith("usage-monitor-r7-real-history-"));
+            if (filename !== undefined) {
+              // The unexpected link refuses cleanup without changing the
+              // synthetic source or the measured pass root.
+              await symlink(join(root, "synthetic-missing-target"), join(root, filename, "unexpected-link"));
+              return true;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+          throw new Error("Synthetic cleanup-refusal root was not observed");
+        })();
+        void injection.catch(() => {});
+      },
+    }), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "R7 real-history cleanup failed after a benchmark error");
+      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors[0].message, "R7 real-history source_scan filesystem sampling stopped: deadline_exceeded: R7 operation worker stopped: timed_out");
+      assert.equal(error.r7WorkerDiagnostic, error.errors[0].r7WorkerDiagnostic);
+      assert.equal(Object.isFrozen(error.r7WorkerDiagnostic), true);
+      assert.equal(error.r7WorkerDiagnostic.outcome, "timed_out");
+      assert.deepEqual(Object.keys(error), []);
+      assert.equal(JSON.stringify(error.r7WorkerDiagnostic).includes(root), false);
+      return true;
+    });
+    assert.notEqual(injection, undefined);
+    assert.equal(await injection, true);
+  } finally {
+    cancelInjection = true;
+    await injection?.catch(() => {});
+    await rm(root, { recursive: true, force: true });
   }
 });

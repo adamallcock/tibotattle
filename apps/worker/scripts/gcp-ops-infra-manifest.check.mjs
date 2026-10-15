@@ -213,11 +213,11 @@ test("the maintenance trigger's cadence is the job's own contract: every minute,
   assert.equal(maintenanceContract.POSTGRES_MAINTENANCE_JOB_POOL_MAX, 2);
   refused((value) => { value.jobs.maintenance.maxConnections = 1; }, "JOB_POOL_MAX_UNDERDECLARED:maintenance");
   refused((value) => { value.jobs.maintenance.maxConnections = 0; }, "DESIRED_STATE_VALUE_INVALID:jobs.maintenance.maxConnections");
-  // Both committed files carry exactly the pinned cadence and are created paused.
+  // Both keep the pinned cadence; production records its already-resumed state.
   for (const environment of ["production", "staging"]) {
     const raw = JSON.parse(COMMITTED[environment]);
     assert.equal(raw.scheduler.maintenance.schedule, maintenanceContract.POSTGRES_MAINTENANCE_JOB_SCHEDULE, environment);
-    assert.equal(raw.scheduler.maintenance.state, "PAUSED", environment);
+    assert.equal(raw.scheduler.maintenance.state, environment === "production" ? "ENABLED" : "PAUSED", environment);
     assert.equal(raw.jobs.maintenance.maxConnections, 2, environment);
   }
 });
@@ -1423,11 +1423,12 @@ test("the committed production desired state: OWN-5 filled by PROD-PREP, and ref
   // The owner set the refresh cadence (daily 03:00 UTC); it is committed and renders.
   // A null schedule is still valid only with state PAUSED and is never created.
   assert.deepEqual(raw.scheduler["analytics-refresh"], {
-    name: "tibotattle-analytics-refresh-trigger", schedule: "0 3 * * *", state: "PAUSED" });
+    name: "tibotattle-analytics-refresh-trigger", schedule: "0 3 * * *", state: "ENABLED" });
   assert.ok(manifest.schedulerFlags(manifest.validateDesiredState(raw), "analytics-refresh")
     .includes("--schedule=0 3 * * *"));
   const unsetCadence = structuredClone(raw);
   unsetCadence.scheduler["analytics-refresh"].schedule = null;
+  unsetCadence.scheduler["analytics-refresh"].state = "PAUSED";
   assert.throws(() => manifest.schedulerFlags(manifest.validateDesiredState(unsetCadence), "analytics-refresh"),
     { code: "SCHEDULER_CADENCE_UNSET" });
   // Before the main session pins them, the only nulls are the values it pins

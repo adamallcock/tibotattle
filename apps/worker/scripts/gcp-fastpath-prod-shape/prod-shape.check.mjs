@@ -325,6 +325,66 @@ test("the production-tier script reaches only its measurement instance, through 
   if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
 });
 
+test("the production-tier child preserves inherited pipes and regular-file redirection", { timeout: 5_000 }, async () => {
+  const prerequisite = spawnSync("zsh", ["-c", "true"]);
+  assert.equal(prerequisite.error === undefined && prerequisite.status === 0, true, "MEAS_LOCAL_ZSH_REQUIRED");
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line.startsWith("child() {"));
+  const end = lines.findIndex((line, index) => index > start && line === "}");
+  assert.ok(start >= 0 && end > start, "the production child definition is present");
+  const child = lines.slice(start, end + 1).join("\n");
+  const dir = mkdtempSync(join(tmpdir(), "prodtier-descriptors-"));
+  const outFile = join(dir, "stdout"), errFile = join(dir, "stderr");
+  try {
+    for (const [scenario, destination, expectedCode] of [
+      ["inherited-pipes", "/dev/stdout /dev/stderr", 0],
+      ["regular-files", `'${outFile}' '${errFile}'`, 0],
+      ["combined-file", `'${outFile}' -`, 0],
+      ["inherited-pipes-failure", "/dev/stdout /dev/stderr", 7],
+    ]) {
+      rmSync(outFile, { force: true }); rmSync(errFile, { force: true });
+      const script = ["set -u", "CHILD=0", child,
+        `D() { print -r -- descriptor-stdout; print -u2 -r -- descriptor-stderr; return ${expectedCode}; }`,
+        `child ${destination} D`].join("\n");
+      // Match the lifecycle harness's real pipe topology, including Linux
+      // socket-backed ends: files as parent stdio would miss the regression.
+      const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "", closed = false;
+      shell.stdout.on("data", (chunk) => { stdout += chunk; });
+      shell.stderr.on("data", (chunk) => { stderr += chunk; });
+      const finished = new Promise((resolveClose, rejectClose) => {
+        shell.once("error", rejectClose);
+        shell.once("close", (code) => { closed = true; resolveClose(code); });
+      });
+      let timer;
+      try {
+        const code = await Promise.race([finished, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${scenario}: descriptor child exceeded 5 seconds`)), 5_000);
+          timer.unref();
+        })]);
+        assert.equal(code, expectedCode, `${scenario}: the waited child status is preserved`);
+        if (scenario.startsWith("inherited-pipes")) {
+          assert.equal(stdout, "descriptor-stdout\n", `${scenario}: stdout stays on the inherited pipe`);
+          assert.equal(stderr, "descriptor-stderr\n", `${scenario}: stderr stays on the inherited pipe`);
+        } else {
+          assert.equal(stdout, "", `${scenario}: stdout is redirected to the owned file`);
+          assert.equal(stderr, "", `${scenario}: stderr is redirected to the owned file`);
+          assert.equal(readFileSync(outFile, "utf8"), scenario === "combined-file"
+            ? "descriptor-stdout\ndescriptor-stderr\n" : "descriptor-stdout\n");
+          if (scenario === "regular-files") assert.equal(readFileSync(errFile, "utf8"), "descriptor-stderr\n");
+        }
+      } finally {
+        clearTimeout(timer);
+        if (!closed && shell.pid) {
+          try { process.kill(-shell.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+        }
+        await finished;
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 // MEAS-SYNTH review (2026-10-03): zsh runs a trap only once a FOREGROUND
 // child exits, so a SIGTERM to the script during the uncapped run (up to the
 // 48 h cap) left the instance running until the child ended. The script's own
@@ -394,10 +454,11 @@ test("the production-tier script's signal handling tears down at once and leaves
   const unrelated = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
   const unrelatedExit = new Promise(resolveExit => unrelated.on("exit", resolveExit));
   try {
-    for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
-      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness],
-      ["SIGTERM", rootResistantHarness], ["SIGTERM", descendantResistantHarness], [null, resistantCompletionHarness],
-      ["SIGTERM", captureFailureHarness], [null, captureCompletionFailureHarness]]) {
+    for (const [scenario, signal, script] of [["term-step", "SIGTERM", harness], ["int-step", "SIGINT", harness], ["hup-step", "SIGHUP", harness],
+      ["term-sampler", "SIGTERM", sampledHarness], ["term-racing-sampler", "SIGTERM", racingHarness], ["normal-completion", null, finishingHarness],
+      ["term-resistant-root", "SIGTERM", rootResistantHarness], ["term-resistant-descendant", "SIGTERM", descendantResistantHarness],
+      ["resistant-sampler-completion", null, resistantCompletionHarness], ["capture-refusal", "SIGTERM", captureFailureHarness],
+      ["capture-refusal-completion", null, captureCompletionFailureHarness]]) {
       rmSync(ownedFile, { force: true });
       rmSync(samplerFile, { force: true });
       const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -412,10 +473,10 @@ test("the production-tier script's signal handling tears down at once and leaves
         const captureFailed = script === captureFailureHarness || script === captureCompletionFailureHarness;
         const minimumPids = script === captureFailureHarness ? 1 : script === captureCompletionFailureHarness ? 2 : 3;
         while (ownedPids().length < minimumPids && Date.now() - started < 5_000) await delay();
-        assert.equal(ownedPids().length >= minimumPids, true, "the exact owned step started");
+        assert.equal(ownedPids().length >= minimumPids, true, `${scenario}: the exact owned step started`);
         if (script === sampledHarness) {
           while (ownedPids().length < 6 && Date.now() - started < 5_000) await delay();
-          assert.equal(ownedPids().length >= 6, true, "the exact owned sampler started");
+          assert.equal(ownedPids().length >= 6, true, `${scenario}: the exact owned sampler started`);
         }
         // A refused ps read must fail this gate, never look like successful
         // cleanup. Prove visibility and group ownership while children live.
@@ -576,6 +637,32 @@ test("matrix adapter shares effective settings with guard and all profiler proje
     "--worker-profile-source", "a".repeat(40)]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
 });
 
+test("local measurement uses the platform time format and preserves resource units and unavailable fields", async () => {
+  const { timeArguments, parseTime } = await import("./measure-local.mjs");
+  assert.deepEqual(timeArguments("darwin"), ["-l"]);
+  assert.deepEqual(timeArguments("linux"), ["-f", "meas-synth-time-v1 %M %e %U %S"]);
+  for (const platform of ["win32", "freebsd", "unknown"]) {
+    assert.throws(() => timeArguments(platform), { code: "MEAS_SYNTH_TIME_PLATFORM_UNSUPPORTED" });
+    assert.throws(() => parseTime("", platform), { code: "MEAS_SYNTH_TIME_PLATFORM_UNSUPPORTED" });
+  }
+  assert.deepEqual(parseTime("  1.25 real  0.50 user  0.25 sys\n  123456 maximum resident set size\n  120000 peak memory footprint\n", "darwin"),
+    { maxResidentSetBytes: 123456, peakMemoryFootprintBytes: 120000, realSeconds: 1.25, userSeconds: 0.5, sysSeconds: 0.25 });
+  assert.deepEqual(parseTime("job output\nmeas-synth-time-v1 123456 3600.25 12.50 1.75\n", "linux"),
+    { maxResidentSetBytes: 126418944, peakMemoryFootprintBytes: null, realSeconds: 3600.25, userSeconds: 12.5, sysSeconds: 1.75 });
+  const unavailable = { maxResidentSetBytes: null, peakMemoryFootprintBytes: null,
+    realSeconds: null, userSeconds: null, sysSeconds: null };
+  for (const platform of ["darwin", "linux"]) assert.deepEqual(parseTime("", platform), unavailable);
+  for (const rss of ["-1", "1.5", "Infinity"]) {
+    assert.deepEqual(parseTime(`meas-synth-time-v1 ${rss} 1.00 0.00 0.00\n`, "linux"), unavailable);
+  }
+  for (const text of ["123 -1 0.00 0.00", "123 NaN 0.00 0.00", "123 0.00 Infinity 0.00", "123 0.00 0.00", "123 0,25 0.00 0.00"]) {
+    assert.deepEqual(parseTime(`meas-synth-time-v1 ${text}\n`, "linux"), unavailable);
+  }
+  assert.equal(parseTime(`meas-synth-time-v1 ${Number.MAX_SAFE_INTEGER} 1.00 0.00 0.00\n`, "linux").maxResidentSetBytes, null);
+  assert.deepEqual(parseTime("meas-synth-time-v1 0 0.00 0.00 0.00\n", "linux"),
+    { maxResidentSetBytes: 0, peakMemoryFootprintBytes: null, realSeconds: 0, userSeconds: 0, sysSeconds: 0 });
+});
+
 test("matrix adapter actual refresh and guard children receive identical matrix settings and resource env", async () => {
   const { parseArguments, runRefresh, guardProbe, refreshMeasurementIdentity } = await import("./measure-local.mjs");
   const dir = mkdtempSync(join(tmpdir(), "matrix-launch-test-"));
@@ -586,7 +673,8 @@ test("matrix adapter actual refresh and guard children receive identical matrix 
     writeFileSync(probe, `#!/usr/bin/env node
 console.log(JSON.stringify({state:"complete",testArguments:process.argv.slice(2).filter(arg=>arg.startsWith("--")),
 budget:process.env.ANALYTICS_V2_MEMORY_BUDGET_MIB,timeout:process.env.ANALYTICS_V2_REFRESH_TASK_TIMEOUT_SECONDS,
-nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
+nodeOptions:process.env.NODE_OPTIONS??null}));
+console.error("test-locale:"+(process.env.LC_ALL??"null"));`, { mode: 0o700 });
     const options = parseArguments(["--corpus", "/private/tmp/synthetic-corpus", "--out", join(dir, "report.json"),
       "--profile", "dense-workers", "--workers", "7", "--model-block-size", "14", "--model-fanout", "off"]);
     const common = { node22: probe, endpoint: { host: "/private/tmp/tibotattle-pg-synthetic/socket", port: 55544 },
@@ -594,6 +682,14 @@ nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
     const refresh = await runRefresh({ ...common, outDir: dir, label: "synthetic-refresh" });
     const guard = await guardProbe({ ...common, waitMs: 5_000 });
     assert.equal(refresh.exitCode, 0, readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"));
+    assert.match(readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"), /^test-locale:C$/mu);
+    // These values come from the real platform /usr/bin/time around the real
+    // content-free child above. Parser fixtures cannot substitute for this gate.
+    assert.ok(Number.isSafeInteger(refresh.time.maxResidentSetBytes) && refresh.time.maxResidentSetBytes > 0);
+    for (const field of ["realSeconds", "userSeconds", "sysSeconds"]) {
+      assert.ok(Number.isFinite(refresh.time[field]) && refresh.time[field] >= 0, field);
+    }
+    if (process.platform === "linux") assert.equal(refresh.time.peakMemoryFootprintBytes, null);
     assert.equal(guard.exitCode, 0);
     assert.equal(guard.outcome, "exited");
     assert.deepEqual(refresh.receipt, guard.receipt);

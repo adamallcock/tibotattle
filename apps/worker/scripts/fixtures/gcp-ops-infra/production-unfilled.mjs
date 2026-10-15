@@ -7,7 +7,8 @@
  *   PROD-PREP filled them. Checks of the placeholder refusal start from it.
  * - unpinnedProductionText: the values the main session pins after an apply
  *   (secret versions, the bucket proof and the telemetry storage namespace)
- *   back to null. Checks that describe the first production plan start from it.
+ *   back to null, with both scheduler states restored to bootstrap PAUSED.
+ *   Checks that describe the first production plan start from it.
  */
 
 import { readFileSync } from "node:fs";
@@ -29,5 +30,6 @@ export function unpinnedProductionText(text = readFileSync(PRODUCTION_DESIRED_ST
   for (const secret of Object.values(value.secrets)) secret.version = null;
   value.bucket.proof = null;
   value.service.telemetryStorageNamespace = null;
+  for (const trigger of Object.values(value.scheduler)) trigger.state = "PAUSED";
   return `${JSON.stringify(value, null, 2)}\n`;
 }

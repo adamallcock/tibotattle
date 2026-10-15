@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { buildAdminCommunityAllowancePreview, buildCommunityModelCompositionDay,
+  buildAnalyticsV2ModelCompositionDay, normalizeAnalyticsV2ModelCompositionForDay,
   projectPublicAllowanceGraphForGcp as projectBaseGraph, validReadableAdminCommunityAllowancePreview,
   validCachedAdminCommunityAllowancePreview, ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
   ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS, ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE } from "../src/analytics-v2/allowance-projection";
@@ -19,6 +20,8 @@ import { readPostgresAdminAllowancePreview } from "../src/postgres-admin-allowan
 import type { PostgresPool } from "../src/postgres-client";
 import { buildCurrentPublicModelMetadata, withCurrentPublicModelMetadata } from "../src/analytics-v2/public-model-metadata-current";
 import { goldenAllowanceInputs, goldenPublishedDays } from "./fixtures/allowance-golden-inputs.mjs";
+import { ANALYTICS_V2_PLAN_ERA_COMPOSITION_VERSION,
+  type AnalyticsV2PartitionedModelComposition } from "../src/analytics-v2/model-era-composition";
 const projectPublicAllowanceGraphForGcp = (...args: Parameters<typeof projectBaseGraph>) => withCurrentPublicModelMetadata(projectBaseGraph(...args));
 const NOW = Date.parse("2026-10-09T12:00:00.000Z"), DAY = "2026-10-08";
 const options = { publishedDays: [DAY], nowMs: NOW };
@@ -45,6 +48,72 @@ function composition(planType: string): CommunityModelComposition {
   return { participantId: "synthetic-owner", composition: { status: "ready", planType,
     latestQuotaObservedAt: `${DAY}T12:00:00.000Z`, fit: { status: "fitted", capacityUsdByModel: { "gpt-6-astra": 100 } } } } as CommunityModelComposition;
 }
+
+describe("GCP isolated-era public sampling", () => {
+  const partitioned = (entries: Array<{ plan: string; at: string; values: Record<string, number>; id?: string }>):
+    AnalyticsV2PartitionedModelComposition => ({ schemaVersion: ANALYTICS_V2_PLAN_ERA_COMPOSITION_VERSION,
+    status: "partitioned", inputFingerprint: "f".repeat(64), candidates: entries.map((entry, index) => ({
+      candidateId: entry.id ?? (index + 1).toString(16).padStart(64, "0"),
+      excludedAttributionBinCount: 0, excludedBoundaryBinCount: 0,
+      composition: { ...composition(entry.plan).composition, latestQuotaObservedAt: entry.at,
+        fit: { ...composition(entry.plan).composition.fit, capacityUsdByModel: entry.values } },
+    })) });
+
+  it("normalizes before choosing the newest eligible era for each model and counts one owner", () => {
+    const result = partitioned([
+      { plan: "pro", at: `${DAY}T10:00:00.000Z`, values: { "gpt-6.1-sol": 100, "gpt-6-sol": 300 } },
+      { plan: "plus", at: `${DAY}T12:00:00.000Z`, values: { "gpt-6.1-sol": 10, "gpt-6-luna": 5 } },
+    ]);
+    expect(normalizeAnalyticsV2ModelCompositionForDay(result, DAY)).toEqual({ state: "fitted",
+      values: { "gpt-6.1-sol": 200, "gpt-6-sol": 300, "gpt-6-luna": 100 } });
+    const day = buildAnalyticsV2ModelCompositionDay([{ ownerDigest: "a".repeat(64), result }], 0, DAY);
+    expect(day.values).toEqual([["gpt-6-luna", 100, 1], ["gpt-6-sol", 300, 1], ["gpt-6.1-sol", 200, 1]]);
+    expect(day).toMatchObject({ fittedParticipantCount: 1, v1ParticipantCount: 1, refusedParticipantCount: 0 });
+    expect(JSON.stringify(day)).not.toMatch(/candidateId|inputFingerprint|account-track|plan-era|aaaaaaaa/);
+  });
+
+  it("ignores stale, future and unstable candidates without inflating coverage", () => {
+    const result = partitioned([
+      { plan: "pro", at: "2026-01-01T12:00:00.000Z", values: { "gpt-6.1-sol": 9_000 } },
+      { plan: "plus", at: "2026-10-10T12:00:00.000Z", values: { "gpt-6.1-sol": 9_000 } },
+      { plan: "team", at: `${DAY}T12:00:00.000Z`, values: { "gpt-6.1-sol": 9_000 } },
+      { plan: "pro", at: `${DAY}T11:00:00.000Z`, values: { "gpt-6.1-sol": 100 } },
+    ]);
+    expect(normalizeAnalyticsV2ModelCompositionForDay(result, DAY)).toEqual({ state: "fitted", values: { "gpt-6.1-sol": 100 } });
+    const withoutFit = { ...result, candidates: result.candidates.slice(0, 3) };
+    expect(normalizeAnalyticsV2ModelCompositionForDay(withoutFit, DAY)).toEqual({ state: "unstable" });
+    const day = buildAnalyticsV2ModelCompositionDay([{ ownerDigest: "b".repeat(64), result: withoutFit }], 2, DAY);
+    expect(day.values).toEqual([]);
+    expect(day).toMatchObject({ fittedParticipantCount: 0, unstableParticipantCount: 1,
+      staleParticipantCount: 0, refusedParticipantCount: 2, v1ParticipantCount: 3 });
+  });
+
+  it("has a deterministic tie rule and rejects duplicate identities instead of adding votes", () => {
+    const result = partitioned([
+      { plan: "pro", at: `${DAY}T12:00:00.000Z`, values: { "gpt-6.1-sol": 100 }, id: "b".repeat(64) },
+      { plan: "pro", at: `${DAY}T12:00:00.000Z`, values: { "gpt-6.1-sol": 200 }, id: "a".repeat(64) },
+    ]);
+    expect(normalizeAnalyticsV2ModelCompositionForDay(result, DAY)).toEqual({ state: "fitted", values: { "gpt-6.1-sol": 200 } });
+    expect(normalizeAnalyticsV2ModelCompositionForDay({ ...result, candidates: [...result.candidates].reverse() }, DAY))
+      .toEqual(normalizeAnalyticsV2ModelCompositionForDay(result, DAY));
+    expect(() => normalizeAnalyticsV2ModelCompositionForDay({ ...result,
+      candidates: [result.candidates[0]!, result.candidates[0]!] }, DAY)).toThrow("ANALYTICS_V2_MODEL_ERA_RESULT_INVALID");
+    const owner = { ownerDigest: "a".repeat(64), result };
+    expect(() => buildAnalyticsV2ModelCompositionDay([owner, owner], 0, DAY)).toThrow("ANALYTICS_V2_MODEL_ERA_DUPLICATE_OWNER");
+  });
+
+  it("keeps the old single-era public projection byte equivalent", () => {
+    const inputs = goldenAllowanceInputs();
+    for (const day of inputs.modelDayDates) {
+      const compositions = inputs.compositions as unknown as CommunityModelComposition[];
+      const actual = buildAnalyticsV2ModelCompositionDay(compositions.map(entry => ({
+        ownerDigest: entry.participantId, result: entry.composition })), 1, day);
+      const expected = buildCommunityModelCompositionDay({ compositions,
+        v1ParticipantCount: compositions.length + 1, refusedParticipantCount: 1, unsupportedSourceParticipantCount: 0 }, day);
+      expect(JSON.stringify(actual)).toBe(JSON.stringify(expected));
+    }
+  });
+});
 /** The retained v0.4 golden, built by the Pro 10x builder at 22d9d90f. */
 function golden() {
   const text = fixture("allowance-preview-v04.json");

@@ -94,12 +94,12 @@
     "analytics-refresh": {
       "name": "tibotattle-analytics-refresh-trigger",
       "schedule": "0 3 * * *",
-      "state": "PAUSED"
+      "state": "ENABLED"
     },
     "maintenance": {
       "name": "tibotattle-maintenance-trigger",
       "schedule": "* * * * *",
-      "state": "PAUSED"
+      "state": "ENABLED"
     }
   },
   "stagingOrigin": null

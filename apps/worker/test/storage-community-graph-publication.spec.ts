@@ -397,22 +397,37 @@ describe('isolated allowance graph publication',()=>{
   expect(await readPublishedStorageCommunityAdminPreview(bindings())).toMatchObject({models:{days:[{day:day(),values:stored.values}]}});
   expect(stored.day).toBe(day());expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'unchanged'});
  });
- it('measures both full 16-owner publications with the actual shared statement meter',async()=>{
-  for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`);
-  for(let i=0;i<16;i++){await compute('fits',today(),i);await compute('model',day(),i);}
-  const modelMeter=createD1InvocationBudget(900),previewMeter=createD1InvocationBudget(900);
-  expect(await publishStorageCommunityModelDay({...bindings(),source:modelMeter.wrap(typed()),target:modelMeter.wrap(b.STORAGE_ANALYTICS_DB)},
-   {day:day()})).toMatchObject({state:'published',memberCount:16});
-  expect(await publishStorageCommunityGraphPreview({...bindings(),source:previewMeter.wrap(typed()),target:previewMeter.wrap(b.STORAGE_ANALYTICS_DB)}))
-   .toMatchObject({state:'published',memberCount:16});
-  expect({owners:16,modelQueries:modelMeter.queriesUsed,previewQueries:previewMeter.queriesUsed}).toMatchInlineSnapshot(`
-    {
-      "modelQueries": 14,
-      "owners": 16,
-      "previewQueries": 16,
-    }
-  `);
-  expect(modelMeter.queriesUsed).toBeLessThanOrEqual(250);expect(previewMeter.queriesUsed).toBeLessThanOrEqual(250);
+ describe('16-owner publication query budget',()=>{
+  beforeEach(async()=>{
+   // Real uploads are prerequisites prepared under this hook's own timeout.
+   for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`);
+  },10_000);
+  beforeEach(async()=>{
+   // Keep the source cohort fixed while preparing target-only cache results.
+   // Each publication below still reads and authorizes the cohort afresh.
+   const owners=await readStorageCommunityOwnerPage(typed());
+   expect(owners).toHaveLength(16);
+   for(const owner of owners)for(const metric of ['fits','model'] as const){
+    const scope=await captureStorageGraphScope(typed(),{owner,day:metric==='fits'?today():day(),metric,
+     sourceId:namespace,sourceNamespace:namespace});
+    await computeStorageGraphResult(bindings(),scope);
+   }
+  },10_000);
+  it('measures both full 16-owner publications with the actual shared statement meter',async()=>{
+   const modelMeter=createD1InvocationBudget(900),previewMeter=createD1InvocationBudget(900);
+   expect(await publishStorageCommunityModelDay({...bindings(),source:modelMeter.wrap(typed()),target:modelMeter.wrap(b.STORAGE_ANALYTICS_DB)},
+    {day:day()})).toMatchObject({state:'published',memberCount:16});
+   expect(await publishStorageCommunityGraphPreview({...bindings(),source:previewMeter.wrap(typed()),target:previewMeter.wrap(b.STORAGE_ANALYTICS_DB)}))
+    .toMatchObject({state:'published',memberCount:16});
+   expect({owners:16,modelQueries:modelMeter.queriesUsed,previewQueries:previewMeter.queriesUsed}).toMatchInlineSnapshot(`
+     {
+       "modelQueries": 14,
+       "owners": 16,
+       "previewQueries": 16,
+     }
+   `);
+   expect(modelMeter.queriesUsed).toBeLessThanOrEqual(250);expect(previewMeter.queriesUsed).toBeLessThanOrEqual(250);
+  },5_000);
  });
  it('bounds publication statements across one thousand controlled owner metadata and cache fixtures',async()=>{
   // The preceding test qualifies actual uploaded owners and kernel results.

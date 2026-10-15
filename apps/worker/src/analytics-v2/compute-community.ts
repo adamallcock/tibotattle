@@ -1,8 +1,8 @@
 /**
  * analytics-v2 compute core, community outputs (K-SPLIT): the daily candidates
  * of the queued days and the admin allowance preview, folded from the
- * computed owners' results in owner-digest order. Moved out of compute.ts
- * unchanged in behaviour; compute.ts re-exports the public names.
+ * computed owners' results in owner-digest order. compute.ts re-exports the
+ * public names; the model projection also accepts isolated era candidates.
  *
  * Daily candidates are stamped with the revision a first publication gets
  * (revisionSeed + 1) and releasedAt = nowMs. `payloadSha256` identifies the
@@ -50,17 +50,16 @@ import {
   buildCommunityDailyPayload,
   publicInputs,
   validateV11DailyProjectionValues,
-  type CachedCommunityModelCompositions,
   type CommunityAllowanceFit,
   type V11DailyProjectionValues,
-  type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
+import type { AnalyticsV2ModelCompositionResult } from "./model-era-composition";
 import {
   ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
   ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
   ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
   buildAdminCommunityAllowancePreview,
-  buildCommunityModelCompositionDay,
+  buildAnalyticsV2ModelCompositionDay,
   validCachedAdminCommunityAllowancePreview,
   type AdminCommunityModelCompositionDay,
 } from "./allowance-projection";
@@ -150,7 +149,7 @@ export interface AnalyticsV2CommunityInput {
   readonly fitsByOwner: ReadonlyMap<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>;
   readonly modelDates: readonly AnalyticsV2Day[];
   readonly compositionsByDate: ReadonlyMap<AnalyticsV2Day,
-    ReadonlyArray<{ readonly ownerDigest: string; readonly result: V1ModelCompositionResult }>>;
+    ReadonlyArray<{ readonly ownerDigest: string; readonly result: AnalyticsV2ModelCompositionResult }>>;
   /**
    * model date -> effective owners whose evaluation the kernels refused, in
    * digest order. (A memory-refused owner has no fit, so the preview that
@@ -409,14 +408,7 @@ export async function buildAnalyticsV2Community(input: AnalyticsV2CommunityInput
     // no effective member at all is not published.
     const refused = input.modelRefusedByDate.get(day)!.filter((ownerDigest) => !excluded(ownerDigest, day)).length;
     if (evaluated.length === 0 && refused === 0) continue;
-    const collection: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: refused,
-      unsupportedSourceParticipantCount: 0, refusedParticipantCount: refused, storeAvailable: true };
-    for (const { ownerDigest, result } of evaluated) {
-      collection.v1ParticipantCount++;
-      if (result.status === "ready") collection.compositions.push({ participantId: ownerDigest, composition: result });
-      else collection.refusedParticipantCount++;
-    }
-    modelDays.push(buildCommunityModelCompositionDay(collection, day));
+    modelDays.push(buildAnalyticsV2ModelCompositionDay(evaluated, refused, day));
   }
   const models: Parameters<typeof buildAdminCommunityAllowancePreview>[3] = {
     modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,

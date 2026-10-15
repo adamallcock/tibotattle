@@ -2201,6 +2201,23 @@ test("a failed recorded full refresh is visible in its panel and operator attent
   });
 });
 
+test("a failed full refresh with no published evidence does not claim availability", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const progress = await fixture("admin-reconstruction-full-refresh-valid.json");
+  progress.work.lastRun.state = "failed";
+  progress.publication = { publishedDays: 0, latestEvidenceDay: null,
+    preview: { state: "not_recorded", computedAt: null } };
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? response(progress) : healthyAdminRead(path, overview), async documentRef => {
+    await waitFor(() => documentRef.byId.get("admin-reconstruction-status").textContent === "Last recorded refresh failed");
+    const attention = allText(documentRef.byId.get("operator-attention"));
+    assert.match(attention, /Last recorded analytics refresh failed/u);
+    assert.match(attention, /Current execution and unrecorded failures are unavailable/u);
+    assert.doesNotMatch(attention, /Published evidence remains visible/u);
+    assert.match(reconstructionText(documentRef), /Published daily heads 0/u);
+    assert.match(reconstructionText(documentRef), /Graph preview Not recorded/u);
+  });
+});
+
 test("healthy initial loading does not send desktop notifications before independent reads settle", async () => {
   const overview = await fixture("admin-overview-valid.json");
   const progress = await fixture("admin-reconstruction-progress-valid.json");

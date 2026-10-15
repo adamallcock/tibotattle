@@ -10,7 +10,8 @@ import { encodeTypedTelemetryId } from "./typed-telemetry-codec";
 import { telemetryV11LegacyProjection } from "./telemetry-v11-compatibility";
 import { telemetryV12AnalyticalProjection } from "./telemetry-v12-compatibility";
 import {
-  POSTGRES_CLASSIFICATION_CORRECTION_METHOD, preparePostgresClassificationCorrection, type PostgresClassificationFormat,
+  POSTGRES_CLASSIFICATION_CORRECTION_METHOD, PostgresClassificationCorrectionError,
+  preparePostgresClassificationCorrection, type PostgresClassificationFormat,
 } from "./postgres-classification-correction";
 import { readPostgresClassificationRecords, readPostgresClassificationHeaderProofs } from "./postgres-classification-records";
 import { PAGE, HEX, fail, t, hex, number, readLinks, resolveLinks, type LinkRow } from "./postgres-classification-links";
@@ -27,6 +28,12 @@ export interface PostgresClassificationActivation {
   readonly manifestDigest: string;
   readonly days: readonly { readonly day: string; readonly manifestId: string; readonly manifestDigest?: string }[];
   readonly predecessorDays?: readonly { readonly day:string;readonly manifestId:string;readonly manifestDigest:string }[];
+}
+
+/** Typed refusal boundaries translated by the owning activation domain. */
+export type PostgresClassificationActivationRefusalPhase = "rekey" | "classification" | "session_closure";
+export class PostgresClassificationActivationRefusalError extends PostgresClassificationCorrectionError {
+  constructor(readonly phase: PostgresClassificationActivationRefusalPhase) { super(); }
 }
 
 function candidateSql(s: string, format: 11 | 12): string {
@@ -454,10 +461,24 @@ export async function preparePostgresClassificationActivation(client: PostgresCl
   // sets empty without reading history, as the per-page joins did. A
   // cross-format re-key refuses before any pair work, so it fails fast.
   if(await sets.candidate()>0){
-    if(await sets.rekeyed()) fail();
-    await prepareClassificationPairs(client,s,input,owner,sets);
+    if(await sets.rekeyed()) throw new PostgresClassificationActivationRefusalError("rekey");
+    try {
+      await prepareClassificationPairs(client,s,input,owner,sets);
+    } catch(error) {
+      if(error instanceof PostgresClassificationCorrectionError) {
+        throw new PostgresClassificationActivationRefusalError("classification");
+      }
+      throw error;
+    }
   }
-  await assertSessionClassificationClosure(client,s,input,sets);
+  try {
+    await assertSessionClassificationClosure(client,s,input,sets);
+  } catch(error) {
+    if(error instanceof PostgresClassificationCorrectionError) {
+      throw new PostgresClassificationActivationRefusalError("session_closure");
+    }
+    throw error;
+  }
   await sets.drop();
   await client.query("SELECT set_config('work_mem',$1,true)",[workMem]);
 }

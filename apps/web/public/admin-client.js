@@ -1,5 +1,6 @@
 import {
   ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG,
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
@@ -726,14 +727,23 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
     invalid(code);
   }
   const suppliedModels = array(models.modelConfig, code);
-  const expectedModels = suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
-    ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_ALLOWANCE_PREVIEW_MODELS;
+  // Only the exact 42-row predecessor of the reviewed September 29 catalog
+  // may omit its appended GPT-6.1 Sol entry. Arbitrary prefixes stay invalid.
+  const historicalCatalog = ADMIN_MODEL_HISTORY_CATALOG_VERSION === "reviewed-model-catalog-2026-09-29.1"
+    && ADMIN_ALLOWANCE_PREVIEW_MODELS.length === 43
+    && ADMIN_ALLOWANCE_PREVIEW_MODELS[42]?.modelId === "gpt-6.1-sol"
+    && suppliedModels.length === 42;
+  const expectedModels = historicalCatalog
+    ? ADMIN_ALLOWANCE_PREVIEW_MODELS.slice(0, 42)
+    : suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
+      ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_ALLOWANCE_PREVIEW_MODELS;
   const modelConfig = suppliedModels.map((entry, index) => {
     const model = record(entry, code);
     const expected = expectedModels[index];
     if (!expected
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
+        || (historicalCatalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
@@ -749,7 +759,8 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
     const dayValue = calendarDay(day.day, code);
     if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
     previousDay = dayValue;
-    if (day.catalogVersion === undefined) invalid(code);
+    if (day.catalogVersion === undefined
+        || (historicalCatalog && day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) invalid(code);
     const projected = expandAdminModelHistoryDay(day);
     if (projected === null
         || projected.values.some(([modelId]) => !modelConfig.some(model => model.modelId === modelId))) invalid(code);
@@ -777,8 +788,11 @@ export function projectAdminAllowancePreview(value) {
       || preview.basis !== contract.basis
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
-      || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
-      || preview.spanFloorPp !== 25) {
+      || !((preview.spanFloorPp === 25
+          && preview.qualification === "shared_reset_fit_gates_25pp_span_floor")
+        || (preview.schemaVersion === ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
+          && preview.spanFloorPp === 40
+          && preview.qualification === "shared_reset_fit_gates_40pp_span_floor"))) {
     invalid(code);
   }
   const from = calendarDay(preview.from, code);
@@ -834,7 +848,7 @@ export function projectAdminAllowancePreview(value) {
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: preview.schemaVersion === ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION ? 40 : preview.spanFloorPp,
+    spanFloorPp: preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),

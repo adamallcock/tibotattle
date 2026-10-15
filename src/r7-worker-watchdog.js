@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import { DEFAULT_EXPORT_RESOURCE_LIMITS } from "./export-resource-policy.js";
 
 export const R7_WORKER_WATCHDOG_VERSION = "g1-r7-worker-watchdog-v0.1";
+export const R7_WORKER_FAILURE_DIAGNOSTIC_VERSION = "g1-r7-worker-failure-diagnostic-v0.1";
 export const R7_WORKER_RSS_SAMPLE_INTERVAL_MS = 100;
 export const R7_WORKER_MAXIMUM_STDOUT_BYTES = 256 * 1024;
 export const R7_WORKER_MAXIMUM_STDERR_BYTES = 256 * 1024;
@@ -77,8 +78,12 @@ function fixedResult({
   rssSampleFailureCount,
   stdoutBytes,
   stderrBytes,
+  lastCpuTimeMs = null,
+  maximumCpuTimeMs = null,
+  cpuSampleCount = 0,
+  cpuSampleFailureCount = 0,
 }) {
-  return {
+  const result = {
     watchdogVersion: R7_WORKER_WATCHDOG_VERSION,
     outcome,
     termination,
@@ -91,6 +96,22 @@ function fixedResult({
     stdoutBytes,
     stderrBytes,
   };
+  // Successful watchdog/receipt projections keep their existing shape. Only a
+  // failed operation exposes this closed, immutable, owner-local diagnostic.
+  if (outcome !== "completed") {
+    Object.defineProperty(result, "failureDiagnostic", { value: Object.freeze({
+      diagnosticVersion: R7_WORKER_FAILURE_DIAGNOSTIC_VERSION,
+      ...result,
+      processScope: "direct_child",
+      cpuMeasurementMethod: "darwin_ps_cumulative_time",
+      cpuMeasurementStatus: cpuSampleCount > 0 ? "sampled" : "unavailable",
+      lastCpuTimeMs,
+      maximumCpuTimeMs,
+      cpuSampleCount,
+      cpuSampleFailureCount,
+    }) });
+  }
+  return result;
 }
 
 function validateAbsolutePath(value, name) {
@@ -159,23 +180,39 @@ function normalizeRequest(request, hardMaximumRssBytes) {
   };
 }
 
-function sampleResult(status, rssBytes = null) {
-  return { status, rssBytes };
+function sampleResult(status, rssBytes = null, cpuTimeMs = null, includeCpu = false) {
+  return includeCpu ? { status, rssBytes, cpuTimeMs } : { status, rssBytes };
 }
 
-/**
- * Sample one direct child process on the first-release platform. `ps` reports
- * RSS in KiB on Darwin. No shell or inherited environment is involved.
- */
-export async function sampleDarwinArm64ChildRss(pid, {
+function parseCpuTimeMilliseconds(value) {
+  // Darwin TIME is accumulated user + system time. Accept only its numeric
+  // duration forms; never retain the ps row or guess from a malformed value.
+  if (typeof value !== "string" || value.length > 40) return null;
+  const matched = /^(?:(\d+)-)?(?:(\d+):)?(\d+):([0-5]\d)(?:\.(\d{1,2}))?$/u.exec(value);
+  if (matched === null) return null;
+  const days = Number(matched[1] ?? 0);
+  const hours = Number(matched[2] ?? 0);
+  const minutes = Number(matched[3]);
+  const seconds = Number(matched[4]);
+  if (matched[1] !== undefined && matched[2] === undefined) return null;
+  if ((matched[1] !== undefined && hours >= 24)
+      || (matched[2] !== undefined && minutes >= 60)) return null;
+  const milliseconds = ((days * 86_400 + hours * 3_600 + minutes * 60 + seconds) * 1_000)
+    + Number((matched[5] ?? "0").padEnd(2, "0")) * 10;
+  return Number.isSafeInteger(milliseconds) && milliseconds >= 0 ? milliseconds : null;
+}
+
+async function sampleDarwinArm64Child(pid, {
   platform = process.platform,
   architecture = process.arch,
   execFileProcess = execFile,
-} = {}) {
+} = {}, includeCpu = false) {
+  const result = (status, rssBytes = null, cpuTimeMs = null) =>
+    sampleResult(status, rssBytes, cpuTimeMs, includeCpu);
   if (platform !== "darwin" || architecture !== "arm64") {
-    return sampleResult("unsupported_platform");
+    return result("unsupported_platform");
   }
-  if (!validPid(pid)) return sampleResult("unavailable");
+  if (!validPid(pid)) return result("unavailable");
   return new Promise((resolve) => {
     let completed = false;
     const finish = (value) => {
@@ -186,7 +223,7 @@ export async function sampleDarwinArm64ChildRss(pid, {
     try {
       execFileProcess(
         "/bin/ps",
-        ["-o", "rss=", "-p", String(pid)],
+        ["-o", includeCpu ? "rss=,time=" : "rss=", "-p", String(pid)],
         {
           encoding: "utf8",
           env: fixedEnvironment(),
@@ -196,27 +233,41 @@ export async function sampleDarwinArm64ChildRss(pid, {
         },
         (error, stdout) => {
           if (error) {
-            finish(sampleResult(error?.code === 1 ? "process_missing" : "unavailable"));
+            finish(result(error?.code === 1 ? "process_missing" : "unavailable"));
             return;
           }
           const value = typeof stdout === "string" ? stdout.trim() : "";
-          if (!/^[0-9]+$/.test(value)) {
-            finish(sampleResult(value.length === 0 ? "process_missing" : "unavailable"));
+          const fields = value.split(/\s+/u);
+          if (fields.length !== (includeCpu ? 2 : 1) || !/^[0-9]+$/.test(fields[0])) {
+            finish(result(value.length === 0 ? "process_missing" : "unavailable"));
             return;
           }
-          const kibibytes = Number(value);
-          const bytes = kibibytes * 1_024;
+          const bytes = Number(fields[0]) * 1_024;
           if (!Number.isSafeInteger(bytes) || bytes < 0) {
-            finish(sampleResult("unavailable"));
+            finish(result("unavailable"));
             return;
           }
-          finish(sampleResult("sampled", bytes));
+          finish(result("sampled", bytes, includeCpu ? parseCpuTimeMilliseconds(fields[1]) : null));
         },
       );
     } catch {
-      finish(sampleResult("unavailable"));
+      finish(result("unavailable"));
     }
   });
+}
+
+/** Sample only direct-child RSS, preserving the existing sampler contract. */
+export async function sampleDarwinArm64ChildRss(pid, options = {}) {
+  return sampleDarwinArm64Child(pid, options);
+}
+
+/**
+ * Sample direct-child RSS and cumulative CPU time with one bounded Darwin ps
+ * invocation. RSS is KiB; TIME is user + system time at centisecond precision.
+ * A missing/refused CPU measurement is null, never an inferred zero.
+ */
+export async function sampleDarwinArm64ChildResourceUsage(pid, options = {}) {
+  return sampleDarwinArm64Child(pid, options, true);
 }
 
 /**
@@ -234,7 +285,7 @@ export async function runR7WorkerWatchdog(request, {
   platform = process.platform,
   architecture = process.arch,
   spawnProcess = spawn,
-  sampleRss = sampleDarwinArm64ChildRss,
+  sampleRss = sampleDarwinArm64ChildResourceUsage,
   monotonicNow = process.hrtime.bigint,
   scheduleTimeout = setTimeout,
   cancelTimeout = clearTimeout,
@@ -291,6 +342,10 @@ export async function runR7WorkerWatchdog(request, {
     let peakRssBytes = 0;
     let rssSampleCount = 0;
     let rssSampleFailureCount = 0;
+    let lastCpuTimeMs = null;
+    let maximumCpuTimeMs = null;
+    let cpuSampleCount = 0;
+    let cpuSampleFailureCount = 0;
     let sampleInFlight = null;
     let deadlineHandle = null;
     let sampleHandle = null;
@@ -311,6 +366,14 @@ export async function runR7WorkerWatchdog(request, {
       sampleInFlight = Promise.resolve()
         .then(() => sampleRss(child.pid, { platform, architecture }))
         .then((sample) => {
+          if (sample?.status === "sampled" && Number.isSafeInteger(sample.cpuTimeMs)
+              && sample.cpuTimeMs >= 0) {
+            lastCpuTimeMs = sample.cpuTimeMs;
+            maximumCpuTimeMs = Math.max(maximumCpuTimeMs ?? 0, sample.cpuTimeMs);
+            cpuSampleCount += 1;
+          } else {
+            cpuSampleFailureCount += 1;
+          }
           if (sample?.status === "sampled" && Number.isSafeInteger(sample.rssBytes)
               && sample.rssBytes >= 0) {
             rssSampleCount += 1;
@@ -323,6 +386,7 @@ export async function runR7WorkerWatchdog(request, {
           }
         }, () => {
           rssSampleFailureCount += 1;
+          cpuSampleFailureCount += 1;
         })
         .finally(() => { sampleInFlight = null; });
     };
@@ -366,6 +430,10 @@ export async function runR7WorkerWatchdog(request, {
         rssSampleFailureCount,
         stdoutBytes,
         stderrBytes,
+        lastCpuTimeMs,
+        maximumCpuTimeMs,
+        cpuSampleCount,
+        cpuSampleFailureCount,
       }));
     };
 

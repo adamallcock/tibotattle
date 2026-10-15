@@ -214,25 +214,49 @@ test("production renders from its committed file (PROD-PREP) and refuses one wit
   assert.deepEqual([rendered.environment, rendered.project, rendered.notificationChannel],
     ["production", "tibotattle-prod", "unassigned"]);
   const committed = JSON.parse(readFileSync(committedDesiredStatePath("production"), "utf8"));
+  const testChannel = `projects/${committed.project}/notificationChannels/1234567890`;
   assert.equal(committed.scheduler["analytics-refresh"].schedule, "0 3 * * *");
-  assert.deepEqual(rendered.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
-  // An unset cadence still defers policies without inventing a schedule.
+  assert.equal(committed.scheduler["analytics-refresh"].state, "ENABLED");
+  assert.equal(committed.scheduler.maintenance.state, "ENABLED");
+  const committedQuiet = rendered.policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(committedQuiet.deferred, "NOTIFICATION_CHANNEL_UNASSIGNED");
+  assert.deepEqual(committedQuiet.body.conditions.map(({ displayName }) => displayName),
+    ["analytics-refresh trigger quiet", "maintenance trigger quiet"]);
+  assert.equal(committedQuiet.deferredConditions, undefined);
+  const scheduledProduction = await run(["render", "--environment=production", `--notification-channel=${testChannel}`]);
+  assert.equal(scheduledProduction.code, 0, scheduledProduction.err);
+  const scheduledRendered = JSON.parse(scheduledProduction.out);
+  const quiet = scheduledRendered.policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(quiet.deferred, undefined);
+  assert.deepEqual(quiet.body.conditions.map(({ displayName }) => displayName),
+    ["analytics-refresh trigger quiet", "maintenance trigger quiet"]);
+  assert.equal(quiet.deferredConditions, undefined);
+  // An unset analytics cadence keeps the enabled maintenance condition live.
   const unset = structuredClone(committed);
   unset.scheduler["analytics-refresh"].schedule = null;
+  unset.scheduler["analytics-refresh"].state = "PAUSED";
   const unsetText = `${JSON.stringify(unset, null, 2)}\n`;
-  const unscheduled = await run(["render", "--environment=production"], {
+  const unscheduled = await run(["render", "--environment=production", `--notification-channel=${testChannel}`], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unsetText : readFileSync(path, "utf8")) });
   assert.equal(unscheduled.code, 0, unscheduled.err);
-  assert.deepEqual(JSON.parse(unscheduled.out).policies.find(({ id }) => id === "scheduler-quiet").deferred,
-    "SCHEDULER_CADENCE_UNSET");
-  // Once a cadence is committed, the trigger is still committed PAUSED, so the policies then wait for OPS-3.
-  // The cadence is synthetic and lives in this test only.
+  const unscheduledQuiet = JSON.parse(unscheduled.out).policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(unscheduledQuiet.deferred, undefined);
+  assert.deepEqual(unscheduledQuiet.body.conditions.map(({ displayName }) => displayName), ["maintenance trigger quiet"]);
+  assert.deepEqual(unscheduledQuiet.deferredConditions,
+    [{ job: "analytics-refresh", deferred: "SCHEDULER_CADENCE_UNSET" }]);
+  // Explicitly pause both triggers to retain the OPS-3 committed-pause warning case.
   const cadenced = structuredClone(committed);
   cadenced.scheduler["analytics-refresh"].schedule = "40 6 * * 2";
+  cadenced.scheduler["analytics-refresh"].state = "PAUSED";
+  cadenced.scheduler.maintenance.state = "PAUSED";
   const cadencedText = `${JSON.stringify(cadenced, null, 2)}\n`;
-  const scheduled = JSON.parse((await run(["render", "--environment=production"], {
+  const scheduled = JSON.parse((await run(["render", "--environment=production", `--notification-channel=${testChannel}`], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? cadencedText : readFileSync(path, "utf8")) })).out);
-  assert.deepEqual(scheduled.policies.find(({ id }) => id === "scheduler-quiet").deferred, "TRIGGER_COMMITTED_PAUSED");
+  const pausedQuiet = scheduled.policies.find(({ id }) => id === "scheduler-quiet");
+  assert.equal(pausedQuiet.deferred, "TRIGGER_COMMITTED_PAUSED");
+  assert.deepEqual(pausedQuiet.body.conditions.map(({ displayName }) => displayName),
+    ["analytics-refresh trigger quiet", "maintenance trigger quiet"]);
+  assert.equal(pausedQuiet.deferredConditions, undefined);
   const unfilledText = unfilledProductionText();
   const unfilled = await run(["render", "--environment=production"], {
     readFile: (path) => (path === committedDesiredStatePath("production") ? unfilledText : readFileSync(path, "utf8")) });

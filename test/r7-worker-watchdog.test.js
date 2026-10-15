@@ -1,9 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
   R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES,
+  R7_WORKER_FAILURE_DIAGNOSTIC_VERSION,
   R7_WORKER_MAXIMUM_STDIN_BYTES,
   R7_WORKER_MAXIMUM_STDERR_BYTES,
   R7_WORKER_MAXIMUM_STDOUT_BYTES,
@@ -11,6 +15,7 @@ import {
   R7_WORKER_WATCHDOG_VERSION,
   runR7WorkerWatchdog,
   sampleDarwinArm64ChildRss,
+  sampleDarwinArm64ChildResourceUsage,
 } from "../src/r7-worker-watchdog.js";
 
 function fakeChild(pid = 1234) {
@@ -492,4 +497,174 @@ test("spawn and worker process failures use fixed content-free classifications",
     assert.equal(result.termination, "sigkill");
     assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
   });
+});
+
+test("failed watchdog diagnostics retain only closed RSS/CPU counters and fixed classifications", async () => {
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  let now = 0n;
+  const samples = [0, 50, 30, null];
+  const promise = runR7WorkerWatchdog(request(), dependencies(child, scheduler, {
+    monotonicNow: () => now,
+    sampleRss: async () => ({
+      status: "sampled", rssBytes: 8_192, cpuTimeMs: samples.shift(),
+      privateContent: "PRIVATE_SAMPLE_CANARY",
+    }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  for (let index = 0; index < 3; index += 1) {
+    scheduler.fire(scheduler.intervals[0]);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  child.stderr.write("PRIVATE_CHILD_ERROR_CANARY");
+  now = 1_000_000_000n;
+  scheduler.fire(scheduler.timeouts[0]);
+  child.emit("close", null, "SIGKILL");
+  const result = await promise;
+  const diagnostic = result.failureDiagnostic;
+  assert.deepEqual(Object.keys(diagnostic).sort(), [
+    "diagnosticVersion", "watchdogVersion", "outcome", "termination", "elapsedMs",
+    "peakRssBytes", "rssSampleCount", "rssSampleFailureCount", "rssMeasurementStatus",
+    "rssSamplingIntervalMs", "stdoutBytes", "stderrBytes", "processScope",
+    "cpuMeasurementMethod", "cpuMeasurementStatus", "lastCpuTimeMs", "maximumCpuTimeMs",
+    "cpuSampleCount", "cpuSampleFailureCount",
+  ].sort());
+  assert.equal(diagnostic.diagnosticVersion, R7_WORKER_FAILURE_DIAGNOSTIC_VERSION);
+  assert.equal(diagnostic.outcome, "timed_out");
+  assert.equal(diagnostic.termination, "sigkill");
+  assert.equal(diagnostic.elapsedMs, 1_000);
+  assert.equal(diagnostic.peakRssBytes, 8_192);
+  assert.equal(diagnostic.rssSampleCount, 4);
+  assert.equal(diagnostic.cpuMeasurementStatus, "sampled");
+  assert.equal(diagnostic.processScope, "direct_child");
+  assert.equal(diagnostic.lastCpuTimeMs, 30);
+  assert.equal(diagnostic.maximumCpuTimeMs, 50);
+  assert.equal(diagnostic.cpuSampleCount, 3);
+  assert.equal(diagnostic.cpuSampleFailureCount, 1);
+  assert.equal(Object.isFrozen(diagnostic), true);
+  assert.equal(Object.getOwnPropertyDescriptor(result, "failureDiagnostic").enumerable, false);
+  assert.deepEqual(Object.keys(result).sort(), [
+    "watchdogVersion", "outcome", "termination", "elapsedMs", "peakRssBytes",
+    "rssSampleCount", "rssSampleFailureCount", "rssMeasurementStatus",
+    "rssSamplingIntervalMs", "stdoutBytes", "stderrBytes",
+  ].sort());
+  assert.equal(JSON.stringify(result).includes("diagnosticVersion"), false);
+  assert.equal(JSON.stringify(result).includes("cpu"), false);
+  assert.throws(() => { result.failureDiagnostic = {}; }, TypeError);
+  assert.equal(JSON.stringify(diagnostic).includes("PRIVATE"), false);
+  assert.equal(JSON.stringify(diagnostic).includes("/synthetic/"), false);
+});
+
+test("missing, refused, and failed CPU samples stay unavailable without inventing zero", async () => {
+  for (const cpuTimeMs of [undefined, null, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    const child = fakeChild();
+    const scheduler = manualScheduler();
+    const promise = runR7WorkerWatchdog(request(), dependencies(child, scheduler, {
+      sampleRss: async () => ({ status: "sampled", rssBytes: 8_192, cpuTimeMs }),
+    }));
+    child.emit("close", 2, null);
+    const { failureDiagnostic: diagnostic } = await promise;
+    assert.equal(diagnostic.cpuMeasurementStatus, "unavailable");
+    assert.equal(diagnostic.lastCpuTimeMs, null);
+    assert.equal(diagnostic.maximumCpuTimeMs, null);
+    assert.equal(diagnostic.cpuSampleCount, 0);
+    assert.equal(diagnostic.cpuSampleFailureCount, 1);
+    assert.equal(diagnostic.rssMeasurementStatus, "sampled");
+  }
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  const promise = runR7WorkerWatchdog(request(), dependencies(child, scheduler, {
+    sampleRss: async () => { throw new Error("PRIVATE_PS_FAILURE"); },
+  }));
+  child.emit("close", 2, null);
+  const { failureDiagnostic: diagnostic } = await promise;
+  assert.equal(diagnostic.cpuMeasurementStatus, "unavailable");
+  assert.equal(diagnostic.rssMeasurementStatus, "unavailable");
+  assert.equal(diagnostic.cpuSampleFailureCount, 1);
+  assert.equal(diagnostic.rssSampleFailureCount, 1);
+  assert.equal(JSON.stringify(diagnostic).includes("PRIVATE"), false);
+});
+
+test("combined sampler uses one fixed bounded ps query and numeric CPU durations", async () => {
+  let call;
+  for (const [duration, cpuTimeMs] of [
+    ["0:00.00", 0], ["0:00.01", 10], ["1:02.34", 62_340],
+    ["2:01:02.3", 7_262_300], ["3-01:02:03.45", 262_923_450],
+  ]) {
+    const result = await sampleDarwinArm64ChildResourceUsage(4321, {
+      platform: "darwin", architecture: "arm64",
+      execFileProcess(executable, argv, options, callback) {
+        call = { executable, argv, options };
+        callback(null, ` 123 ${duration}\n`, "PRIVATE_PS_STDERR");
+      },
+    });
+    assert.deepEqual(result, { status: "sampled", rssBytes: 123 * 1_024, cpuTimeMs });
+  }
+  assert.deepEqual(call, {
+    executable: "/bin/ps", argv: ["-o", "rss=,time=", "-p", "4321"],
+    options: {
+      encoding: "utf8", env: { LANG: "C", LC_ALL: "C", TZ: "UTC" },
+      maxBuffer: 1_024, timeout: 1_000, windowsHide: true,
+    },
+  });
+});
+
+test("combined sampler refuses malformed and private output and isolates unavailable CPU", async () => {
+  for (const duration of ["PRIVATE_PS_CONTENT", "-1:00.00", "1:99.00", "1:60:00.00", "1-24:00:00", "999999999999:00", "0:00.001"]) {
+    const result = await sampleDarwinArm64ChildResourceUsage(4321, {
+      platform: "darwin", architecture: "arm64",
+      execFileProcess(_executable, _argv, _options, callback) { callback(null, `123 ${duration}`, ""); },
+    });
+    assert.deepEqual(result, { status: "sampled", rssBytes: 123 * 1_024, cpuTimeMs: null });
+    assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+  }
+  for (const [stdout, status] of [["", "process_missing"], ["PRIVATE 0:00.00", "unavailable"], ["123 0:00.00 EXTRA", "unavailable"], ["123 0:00.00\n456 0:00.00", "unavailable"]]) {
+    const result = await sampleDarwinArm64ChildResourceUsage(4321, {
+      platform: "darwin", architecture: "arm64",
+      execFileProcess(_executable, _argv, _options, callback) { callback(null, stdout, ""); },
+    });
+    assert.deepEqual(result, { status, rssBytes: null, cpuTimeMs: null });
+  }
+  for (const code of [1, 99]) {
+    const result = await sampleDarwinArm64ChildResourceUsage(4321, {
+      platform: "darwin", architecture: "arm64",
+      execFileProcess(_executable, _argv, _options, callback) {
+        callback(Object.assign(new Error("PRIVATE_PS_FAILURE"), { code }), "PRIVATE", "PRIVATE");
+      },
+    });
+    assert.deepEqual(result, { status: code === 1 ? "process_missing" : "unavailable", rssBytes: null, cpuTimeMs: null });
+  }
+  let invoked = false;
+  for (const [pid, platform, status] of [[0, "darwin", "unavailable"], [1234, "linux", "unsupported_platform"]]) {
+    const result = await sampleDarwinArm64ChildResourceUsage(pid, {
+      platform, architecture: "arm64", execFileProcess() { invoked = true; },
+    });
+    assert.deepEqual(result, { status, rssBytes: null, cpuTimeMs: null });
+  }
+  assert.equal(invoked, false);
+});
+
+test("synthetic direct-child timeout retains CPU/RSS aggregates and discards output", {
+  timeout: 10_000,
+  skip: process.platform !== "darwin" || process.arch !== "arm64",
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "r7-watchdog-synthetic-timeout-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workerPath = join(root, "worker.mjs");
+  await writeFile(workerPath, 'process.stdout.write("PRIVATE_SYNTHETIC_STDOUT"); process.stderr.write("PRIVATE_SYNTHETIC_STDERR"); while (true) { Math.sqrt(2); }', { mode: 0o600 });
+  const result = await runR7WorkerWatchdog({
+    runtimeExecutable: process.execPath, workerPath, cwd: root,
+    input: "PRIVATE_SYNTHETIC_STDIN", timeoutMs: 1_000, maximumRssBytes: 256 * 1024 * 1024,
+  });
+  const diagnostic = result.failureDiagnostic;
+  assert.equal(diagnostic.outcome, "timed_out");
+  assert.equal(diagnostic.termination, "sigkill");
+  assert.equal(diagnostic.rssMeasurementStatus, "sampled");
+  assert.equal(diagnostic.rssSampleCount > 0, true);
+  assert.equal(diagnostic.cpuMeasurementStatus, "sampled");
+  assert.equal(diagnostic.cpuSampleCount > 0, true);
+  assert.equal(diagnostic.maximumCpuTimeMs > 0, true);
+  assert.equal(diagnostic.lastCpuTimeMs <= diagnostic.maximumCpuTimeMs, true);
+  assert.equal(JSON.stringify(diagnostic).includes("PRIVATE"), false);
+  assert.equal(JSON.stringify(diagnostic).includes(root), false);
 });

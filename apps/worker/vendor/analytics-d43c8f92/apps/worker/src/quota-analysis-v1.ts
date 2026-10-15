@@ -808,12 +808,10 @@ export function buildPricingEvent(
  * semantics); a record it can shape but not fully price returns its
  * (0-cost, partially_priced/unpriced) result so the reset correctly refuses.
  */
-export function priceChunkUsageRecord(
-  recordJson: string,
+export function priceParsedChunkUsageRecord(
+  rec: Record<string, unknown>,
   observedAt: string,
 ): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
-  const rec = parseStoredRecordJson(recordJson);
-  if (rec === null) return null;
   const pricingEvent = buildPricingEvent(rec, observedAt);
   if (pricingEvent === null) return null;
   const priced = priceTelemetryUsageEvent(pricingEvent);
@@ -824,6 +822,15 @@ export function priceChunkUsageRecord(
       ? rec.modelId
       : null,
   };
+}
+
+export function priceChunkUsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  return priceParsedChunkUsageRecord(rec, observedAt);
 }
 
 /**

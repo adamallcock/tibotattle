@@ -18,7 +18,11 @@ import {
   runPostgresTypedLegacyTransfer,
   typedLegacyStagingFamilyEvidenceSha256,
 } from "./postgres-typed-legacy-transfer.mjs";
-import { applyPostgresMigrations } from "./postgres-migrations.mjs";
+import {
+  applyPostgresMigrations,
+  migrationHistoryTable,
+  readPostgresMigrations,
+} from "./postgres-migrations.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -405,6 +409,21 @@ test("synthetic transfer refuses a non-rehearsal target before destination acces
   assert.equal(destinationCalls, 0);
 });
 
+test("typed legacy rehearsal pins 78 primary migrations including the reviewed classification indexes", async () => {
+  const migrations = await readPostgresMigrations({ role: "primary" });
+  assert.equal(migrations.length, 78);
+  assert.deepEqual(migrations.map(({ version }) => version),
+    Array.from({ length: 78 }, (_, index) => index + 1));
+  // GCP's additive 0078 retained every earlier full name and SQL byte. Pin the
+  // reviewed tail independently of the application receipt's observed count.
+  const { version, name, sha256 } = migrations.at(-1);
+  assert.deepEqual({ version, name, sha256 }, {
+    version: 78,
+    name: "0078_classification_link_lookup_indexes.sql",
+    sha256: "e42c24f99b027ef1f313a685a5212ec4b2a0243cc61204877d6de5a68f06054e",
+  });
+});
+
 test("PG17 typed legacy import streams bounded D1 pages, rolls back a failed page, resumes, and verifies receipts", {
   skip: !PG_TEST_SOCKET,
 }, async () => {
@@ -431,8 +450,17 @@ test("PG17 typed legacy import streams bounded D1 pages, rolls back a failed pag
     targetCreated = true;
     await pool.query(`CREATE SCHEMA ${quoted(controlSchema)}`);
     controlCreated = true;
+    const expectedMigrationPins = (await readPostgresMigrations({ role: "primary" }))
+      .map(({ version, name, sha256 }) => [version, name, sha256]);
+    assert.equal(expectedMigrationPins.length, 78);
     const migrated = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
     assert.equal(migrated.applied, 78);
+    assert.deepEqual(migrated.migrations.map(({ version, name, sha256 }) => [version, name, sha256]),
+      expectedMigrationPins);
+    const migrationHistory = await pool.query(`SELECT version,name,checksum_sha256
+      FROM ${quoted(targetSchema)}.${migrationHistoryTable()} ORDER BY version`);
+    assert.deepEqual(migrationHistory.rows.map(({ version, name, checksum_sha256 }) => [version, name, checksum_sha256]),
+      expectedMigrationPins);
 
     const fixture = syntheticRows();
     const source = syntheticD1Source({ mutableRows: fixture.rows, d1BlobArrays: true });

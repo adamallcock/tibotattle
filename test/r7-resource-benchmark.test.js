@@ -256,7 +256,19 @@ test("R7 benchmark worker enforces its terminal lifetime RSS high-water mark", {
       outputDirectory: join(tmpdir(), "usage-monitor-r7-unused-output"),
       resourceLimits: {},
     }, { maximumRssBytes: 1 }),
-    /R7 operation worker stopped: rss_limit_exceeded/,
+    (error) => {
+      assert.equal(error.message, "R7 operation worker stopped: rss_limit_exceeded");
+      const diagnostic = error.r7WorkerDiagnostic;
+      assert.equal(Object.isFrozen(diagnostic), true);
+      assert.equal(diagnostic.outcome, "rss_limit_exceeded");
+      assert.equal(diagnostic.processScope, "direct_child");
+      assert.equal(Number.isSafeInteger(diagnostic.elapsedMs), true);
+      assert.deepEqual(Object.keys(error), []);
+      assert.equal(JSON.stringify(diagnostic).includes("usage-monitor-r7"), false);
+      assert.equal(JSON.stringify(diagnostic).includes("1111111111111111"), false);
+      assert.throws(() => { error.r7WorkerDiagnostic = {}; }, TypeError);
+      return true;
+    },
   );
 });
 

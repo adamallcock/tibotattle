@@ -137,6 +137,10 @@ export const EXPORT_PATCHES = Object.freeze([
   { path: "apps/worker/src/storage-community-daily.ts", symbol: "publicInputs", declaration: "function" },
   // The per-event pricing projection GCP stores and reprices (engine v2 K-PERCARD/K-REPRICE).
   { path: "apps/worker/src/quota-analysis-v1.ts", symbol: "buildPricingEvent", declaration: "function" },
+  // Era-isolated GCP composition reuses the complete quota context and exact
+  // per-session attribution resolver; the legacy kernel itself is unchanged.
+  { path: "apps/worker/src/quota-analysis-v11.ts", symbol: "quotaContext", declaration: "async function" },
+  { path: "apps/worker/src/quota-analysis-v11.ts", symbol: "usageEvent", declaration: "async function" },
 ].map((patch) => Object.freeze(patch)));
 
 export class VendorError extends Error {
@@ -781,6 +785,230 @@ export function foldV11DailyProjectionValuesTrusted(state:V11DailyProjectionValu
   }
   validateV11DailyProjectionValues(daily);
 ` },
+    ],
+  },
+  {
+    id: "daily-values-ordered-closed-shape",
+    path: "apps/worker/src/v11-daily-projection-values.ts",
+    // Ordered own keys avoid sorting; every other shape retains the existing
+    // sorted-NUL comparison. Sort copies so TOKEN_KEYS emission order is unchanged.
+    hunks: [
+      { find: `const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
+`,
+        replace: `const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
+const PRIVATE_CLOSED_KEYS = {
+  tokens: TOKEN_KEYS,
+  token: ['knownSum','unavailable'],
+  pricing: ['knownNanousd','fullyPriced','partiallyPriced','unpriced'],
+  current: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted'],
+  counts: ['usage','quota','session'],
+  omitted: ['usageEvents','tokens','pricing'],
+  cell: ['provider','modelId','usageEvents','tokens','pricing'],
+  legacy: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells'],
+} as const;
+const PRIVATE_CLOSED_SIGNATURES = Object.fromEntries(Object.entries(PRIVATE_CLOSED_KEYS)
+  .map(([name, keys]) => [name, [...keys].sort().join('\\0')])) as { [K in keyof typeof PRIVATE_CLOSED_KEYS]: string };
+` },
+      { find: `function closed(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join('\\0') !== [...keys].sort().join('\\0')) fail();
+}`,
+        replace: `function closed(value: unknown, keys: readonly string[], expectedSortedNul: string): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail();
+  const actual = Object.keys(value);
+  if (actual.length === keys.length) {
+    let ordered = true;
+    for (let index = 0; index < keys.length; index += 1) {
+      if (actual[index] !== keys[index]) { ordered = false; break; }
+    }
+    if (ordered) return;
+  }
+  if (actual.sort().join('\\0') !== expectedSortedNul) fail();
+}` },
+      { find: `closed(value,TOKEN_KEYS)`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.tokens,PRIVATE_CLOSED_SIGNATURES.tokens)` },
+      { find: `closed(entry,['knownSum','unavailable'])`,
+        replace: `closed(entry,PRIVATE_CLOSED_KEYS.token,PRIVATE_CLOSED_SIGNATURES.token)` },
+      { find: `closed(value,['knownNanousd','fullyPriced','partiallyPriced','unpriced'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.pricing,PRIVATE_CLOSED_SIGNATURES.pricing)` },
+      { find: `closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.current,PRIVATE_CLOSED_SIGNATURES.current)` },
+      { find: `closed(value.counts,['usage','quota','session'])`,
+        replace: `closed(value.counts,PRIVATE_CLOSED_KEYS.counts,PRIVATE_CLOSED_SIGNATURES.counts)` },
+      { find: `closed(value.omitted,['usageEvents','tokens','pricing'])`,
+        replace: `closed(value.omitted,PRIVATE_CLOSED_KEYS.omitted,PRIVATE_CLOSED_SIGNATURES.omitted)` },
+      { find: `closed(entry,['provider','modelId','usageEvents','tokens','pricing'])`,
+        replace: `closed(entry,PRIVATE_CLOSED_KEYS.cell,PRIVATE_CLOSED_SIGNATURES.cell)` },
+      { find: `closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells'])`,
+        replace: `closed(value,PRIVATE_CLOSED_KEYS.legacy,PRIVATE_CLOSED_SIGNATURES.legacy)` },
+    ],
+  },
+
+  {
+    id: "price-parsed-chunk-record",
+    path: "apps/worker/src/quota-analysis-v1.ts",
+    hunks: [
+      { find: `export function priceChunkUsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  const pricingEvent = buildPricingEvent(rec, observedAt);
+  if (pricingEvent === null) return null;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return {
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: typeof rec.modelId === "string" && SAFE_TOKEN.test(rec.modelId)
+      ? rec.modelId
+      : null,
+  };
+}`,
+        replace: `export function priceParsedChunkUsageRecord(
+  rec: Record<string, unknown>,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const pricingEvent = buildPricingEvent(rec, observedAt);
+  if (pricingEvent === null) return null;
+  const priced = priceTelemetryUsageEvent(pricingEvent);
+  return {
+    costNanousd: priced.costNanousd,
+    pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: typeof rec.modelId === "string" && SAFE_TOKEN.test(rec.modelId)
+      ? rec.modelId
+      : null,
+  };
+}
+
+export function priceChunkUsageRecord(
+  recordJson: string,
+  observedAt: string,
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
+  const rec = parseStoredRecordJson(recordJson);
+  if (rec === null) return null;
+  return priceParsedChunkUsageRecord(rec, observedAt);
+}` },
+    ],
+  },
+  {
+    id: "synchronous-model-era-usage-event",
+    path: "apps/worker/src/quota-analysis-v11.ts",
+    // Keep usage-row-evidence-memo's reviewed helper replacements byte-identical.
+    // The sync path adds one private signature/price slot per Context; each
+    // returned row still owns a copied price and recomputes its own metadata.
+    hunks: [
+      { find: `  V1_ANALYSIS_WINDOW_DAYS,
+  priceChunkUsageRecord,
+} from "./quota-analysis-v1";`,
+        replace: `  V1_ANALYSIS_WINDOW_DAYS,
+  priceChunkUsageRecord,
+  priceParsedChunkUsageRecord,
+} from "./quota-analysis-v1";` },
+      { find: `    interval: { start: prior?.time ?? end, end }, priced };
+}`,
+        replace: `    interval: { start: prior?.time ?? end, end }, priced };
+}
+
+/** One private signature/pricing slot per synchronous model-era context. The
+ * row/session/era decisions remain outside this memo and are recomputed per row. */
+interface UsageEventSyncContextMemo {
+  readonly recordJson: string;
+  readonly observedAt: string;
+  readonly attribution: TelemetryV11Attribution | null;
+  priced: ReturnType<typeof priceChunkUsageRecord> | undefined;
+}
+const usageEventSyncContextMemos = new WeakMap<Context, UsageEventSyncContextMemo>();
+function copyUsageEventSyncPrice(priced: ReturnType<typeof priceChunkUsageRecord> | undefined):
+  ReturnType<typeof priceChunkUsageRecord> | undefined {
+  if (priced === undefined || priced === null) return priced;
+  return { costNanousd: priced.costNanousd, pricingStatus: priced.pricingStatus, modelId: priced.modelId };
+}
+
+/** Synchronous model-era row path. It preserves eager pricing, the
+ * session-before-price order, DROP behavior, and the refusal contract. A
+ * context gets one exact-input parse/price slot; all row-specific metadata,
+ * carry, and era decisions are recomputed on every call. */
+export function usageEventSync(context: Context, previous: Map<string, { time: number; scope: string | null }>,
+  row: UsageRow): UsageEvidence | Refusal | null {
+  if (!TOKEN.test(row.provider)) return null;
+  const known = usageRowEvidenceMemos.get(row);
+  const saved = usageEventSyncContextMemos.get(context);
+  const contextMemo = saved !== undefined && saved.recordJson === row.record_json && saved.observedAt === row.observed_at
+    ? saved : undefined;
+  let record: Record<string, unknown> | null | undefined;
+  let memo: UsageRowEvidenceMemo;
+  let privateMemo: UsageEventSyncContextMemo;
+  if (contextMemo !== undefined) {
+    if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+      memo = known;
+    } else {
+      memo = { recordJson: row.record_json, observedAt: row.observed_at,
+        attribution: contextMemo.attribution, priced: undefined };
+      usageRowEvidenceMemos.set(row, memo);
+    }
+    // Never return an exposed row-owned price when a private snapshot can
+    // supply an independent three-scalar copy.
+    memo.priced = copyUsageEventSyncPrice(contextMemo.priced);
+    privateMemo = contextMemo;
+  } else {
+    let attribution: TelemetryV11Attribution | null;
+    if (known !== undefined && known.recordJson === row.record_json && known.observedAt === row.observed_at) {
+      memo = known;
+      attribution = memo.attribution;
+      // A row memo's price may have escaped through UsageEvidence.priced. Reprice
+      // for this context slot instead of importing potentially mutated data.
+      memo.priced = undefined;
+    } else {
+      record = parseStoredRecordJson(row.record_json);
+      attribution = null;
+      if (record) {
+        try { attribution = parseTelemetryV11Attribution(record.accountPlanAttribution); }
+        catch { attribution = null; }
+      }
+      if (attribution !== null) {
+        attribution = internUsageRowValue(usageRowAttributions, JSON.stringify([attribution.accountBasis,
+          attribution.accountTrackId, attribution.planBasis, attribution.planType, attribution.planEraId]), attribution);
+      }
+      memo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+      usageRowEvidenceMemos.set(row, memo);
+    }
+    privateMemo = { recordJson: row.record_json, observedAt: row.observed_at, attribution, priced: undefined };
+    usageEventSyncContextMemos.set(context, privateMemo);
+  }
+  if (memo.attribution === null) return refused("invalid_attribution_record");
+  const attribution = memo.attribution;
+  const scope = attribution.accountBasis === "same_source" ? attribution.accountTrackId : null;
+  const end = Date.parse(row.observed_at);
+  if (!Number.isSafeInteger(end)) return refused("invalid_attribution_record");
+  const session = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+  let prior: { time: number; scope: string | null } | undefined;
+  if (session !== null) {
+    prior = previous.get(session);
+    if (!previous.has(session) && previous.size >= MAX_SESSIONS) {
+      return refused("session_interval_scope_limit_exceeded");
+    }
+    previous.set(session, { time: end, scope });
+  }
+  const accountBreak = prior !== undefined && prior.scope !== scope;
+  const eraKey = v11UsageEventEra(context.index, { provider: row.provider, accountScopeId: scope,
+    planBasis: attribution.planBasis, planType: attribution.planType, planEraId: attribution.planEraId,
+    observedAtMs: end, accountBreak, ...(prior ? { priorObservedAtMs: prior.time } : {}) });
+  if (memo.priced === undefined) {
+    if (record === undefined) record = parseStoredRecordJson(row.record_json);
+    const parsedPrice = record === null ? null : priceParsedChunkUsageRecord(record, row.observed_at);
+    const priced = parsedPrice === null || parsedPrice.modelId === null ? parsedPrice
+      : { ...parsedPrice, modelId: internUsageRowValue(usageRowModels, parsedPrice.modelId, parsedPrice.modelId) };
+    memo.priced = priced;
+    // Only a successful current-call pricing result enters the private slot.
+    // A throw leaves it undefined; DROP remains a distinct cached null result.
+    privateMemo.priced = copyUsageEventSyncPrice(priced);
+  }
+  const priced = memo.priced;
+  if (priced === null) return null;
+  return { provider: row.provider, scope, accountBreak, eraKey,
+    interval: { start: prior?.time ?? end, end }, priced };
+}` },
     ],
   },
 ].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));

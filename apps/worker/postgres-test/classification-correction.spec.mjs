@@ -7,6 +7,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "vite";
 import {
   canonicalTelemetryV11Json, canonicalTelemetryV12Json, REVIEWED_CODEX_MODEL_IDS,
@@ -105,6 +106,7 @@ async function setup() {
     compatibility: await vite.ssrLoadModule("/src/telemetry-v11-compatibility.ts"),
     reconciliation: await vite.ssrLoadModule("/src/telemetry-usage-reconciliation.ts"),
     activation: await vite.ssrLoadModule("/src/postgres-classification-activation.ts"),
+    observation: await vite.ssrLoadModule("/src/telemetry-activation-observation.ts"),
     oracle: await vite.ssrLoadModule("/postgres-test/fixtures/classification/activation-oracle.ts"),
     closureOracle: await vite.ssrLoadModule("/postgres-test/fixtures/classification/closure-oracle.ts"),
   };
@@ -308,9 +310,15 @@ async function evidence(context, participant, days = { fromDay: DAY_ONE, through
   };
 }
 function only(map, day) { const rows = map.get(day); assert.equal(rows?.length, 1); return rows[0]; }
-async function refused(context, principal, manifest) {
+async function refused(context, principal, manifest, expectedPhase) {
   const before = await snapshot(context);
-  await assert.rejects(context.domain.activate(principal, manifest), CONFLICT);
+  const events = [];
+  const observe = modules.observation.createTelemetryActivationObserver(event => events.push(event));
+  await assert.rejects(observe("v1.2", () => context.domain.activate(principal, manifest)), CONFLICT);
+  if (expectedPhase !== undefined) {
+    assert.equal(events.length, 1, "one safe activation refusal was observed");
+    assert.equal(events[0].refusalPhase, expectedPhase, "the refusal retains its typed producer boundary");
+  }
   assert.deepEqual(await snapshot(context), before, "refusal rolls back links, head, predecessor consumption and journal");
 }
 
@@ -439,7 +447,8 @@ test("classification corrections activate atomically across session days and pre
     const knownReplacement = await stage(context, principal, DAY_TWO, "usage", { ...knownUsage, modelId: "gpt-5.6-sol" });
     await refused(context, principal, await prepared(context, principal, [knownSessionDay, knownReplacement, extraKnown]));
     const quantityChange = await stage(context, principal, DAY_TWO, "usage", { ...knownUsage, totalInputContextTokens: 1001 });
-    await refused(context, principal, await prepared(context, principal, [knownSessionDay, quantityChange, extraKnown]));
+    await refused(context, principal, await prepared(context, principal, [knownSessionDay, quantityChange, extraKnown]),
+      "classification");
     assert.deepEqual(await head(context, principal), { generation_id: final.generationId, revision: 3 });
     assert.equal((await links(context)).length, 4);
     assert.equal(await journalCount(context), initialJournal + 2);
@@ -741,7 +750,7 @@ test("exact current-predecessor READY unknown evidence corrects in one activatio
         await pool.query(`UPDATE ${context.table("telemetry_v12_domain_days")}
           SET manifest_digest=$1 WHERE manifest_id=$2`, ["f".repeat(64), accepted.manifestId]);
       } finally { await alterGuard("ENABLE"); }
-      await refused(context, principal, value);
+      await refused(context, principal, value, null);
     } finally {
       await alterGuard("DISABLE");
       try {
@@ -1358,7 +1367,27 @@ test("session closure reads every usage row of a large session in numeric order"
     assert.equal((await runProof(modules.oracle.preparePostgresClassificationActivation, context, input)).outcome, ACCEPTED,
       "edca848 accepted: its text-ordered session pages never read the unknown tail");
     assert.equal((await runProof(modules.activation.preparePostgresClassificationActivation, context, input)).outcome, REFUSED);
-    await refused(context, principal, manifest);
+    await refused(context, principal, manifest, "session_closure");
+  });
+});
+
+test("a same-day successor that drops an accepted occurrence is observed at the closure boundary", {
+  skip: !PG_TEST_SOCKET, timeout: 120_000,
+}, async () => {
+  await withSchema(async context => {
+    const participant = await seedParticipant(context, "successor-closure-phase");
+    const principal = await seedDevice(context, participant, "successor-closure-phase");
+    const first = usage({ eventId: `event:v2:${"c".repeat(64)}` });
+    const second = usage({ eventId: `event:v2:${"d".repeat(64)}`, eventTime: `${DAY_TWO}T12:06:00.000Z` });
+    const acceptedDay = await stage(context, principal, DAY_TWO, "usage", [first, second]);
+    assert.equal((await context.domain.activate(principal, await prepared(context, principal, [acceptedDay]))).replay, false);
+
+    // The later READY manifest preserves one exact row but drops the other.
+    // The predecessor still pins the earliest accepted day and must refuse
+    // before the successor can replace its complete event vector.
+    const successor = await stage(context, principal, DAY_TWO, "usage", [first]);
+    const manifest = await prepared(context, principal, [successor]);
+    await refused(context, principal, manifest, "closure");
   });
 });
 
@@ -1504,7 +1533,7 @@ test("v1.2 activation refuses a same-instant re-key of this device's accepted v1
       known({ ...legacy[2], eventId: rekeyedId("v11") }), known(v11At(today, 3))])]);
     assert.equal((await rekeyRefusal(context, 12, principal, rekeyed.manifest, rekeyed.predecessor.token, "v1.1 re-key"))
       .statement, guard);
-    await refused(context, principal, rekeyed.manifest);
+    await refused(context, principal, rekeyed.manifest, "rekey");
     assert.deepEqual((await evidence(context, participant, range)).usage, accepted.usage);
     // The same statement plans as set joins over large working sets (the
     // kept anti-join, the same-instant-and-session join and the legacy-id
@@ -2286,4 +2315,439 @@ test("migration76 is a forward-only addition to the current75 ledger and fences 
     await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     await rm(prefixRoot,{recursive:true,force:true});
   }
+});
+
+
+// The real PostgreSQL proof continues after an HTTP client stops waiting, as
+// it can in the deployed origin. Exercise both a later commit and a real SQL
+// timeout/rollback; a fake successful response cannot prove either outcome.
+for (const serverOutcome of ["commit", "rollback"]) {
+  test(`client timeout during the PostgreSQL activation proof recovers once after ${serverOutcome}`, {
+    skip: !PG_TEST_SOCKET, timeout: 120_000,
+  }, async () => {
+    await withSchema(async context => {
+      const participant = await seedParticipant(context, `timeout-${serverOutcome}`);
+      const principal = await seedDevice(context, participant, `timeout-${serverOutcome}`);
+      const days = [
+        await stage(context, principal, DAY_ONE, "session", session("openai_codex")),
+        await stage(context, principal, DAY_TWO, "usage", usage({ provider: "openai_codex", modelId: MODEL })),
+      ];
+      const manifest = await prepared(context, principal, days);
+      const before = await snapshot(context);
+      const originals = await immutableOriginals(context, days);
+      const journalBefore = await journalCount(context);
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      const settled = Promise.withResolvers();
+      let paused = false;
+      const delayedPool = {
+        async connect() {
+          const client = await pool.connect();
+          return {
+            async query(text, values) {
+              // The candidate was already materialized inside the real
+              // transaction, after its authority and predecessor locks.
+              if (!paused && text === 'ANALYZE pg_temp."classification_candidate"') {
+                paused = true;
+                entered.resolve();
+                await resume.promise;
+                if (serverOutcome === "rollback") {
+                  await client.query("SET LOCAL statement_timeout='1ms'");
+                  // A PostgreSQL 57014 aborts the actual transaction. No
+                  // fabricated API result or weakened proof is involved.
+                  await client.query("SELECT pg_sleep(0.1)");
+                }
+              }
+              return client.query(text, values);
+            },
+            release(discard) { return client.release(discard); },
+          };
+        },
+      };
+      const delayedDomain = modules.createPostgresTypedV12Domain(delayedPool, context.options);
+      const server = createHttpServer((request, response) => {
+        request.resume();
+        // This loopback fixture models response loss around the reviewed
+        // domain entrypoint; production HTTP authentication is a separate gate.
+        void delayedDomain.activate(principal, manifest).then(result => {
+          settled.resolve({ status: 201, result });
+          if (!response.destroyed) {
+            response.writeHead(201, { "content-type": "application/json" });
+            response.end(JSON.stringify(result));
+          }
+        }, error => {
+          settled.resolve({ status: error.status, code: error.code });
+          if (!response.destroyed) {
+            response.writeHead(error.status ?? 500, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: { code: error.code ?? "INTERNAL_ERROR" } }));
+          }
+        });
+      });
+      const controller = new AbortController();
+      try {
+        await new Promise((resolveListen, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolveListen);
+        });
+        const address = server.address();
+        assert.ok(address && typeof address === "object" && address.address === "127.0.0.1");
+        const request = fetch(`http://127.0.0.1:${address.port}/activate`, {
+          method: "POST", body: JSON.stringify(manifest), signal: controller.signal,
+          headers: { "content-type": "application/json" },
+        }).then(() => ({ received: true }), error => ({ received: false, name: error.name }));
+        await Promise.race([entered.promise, settled.promise.then(() => {
+          throw new Error("Synthetic activation completed before reaching the proof pause");
+        })]);
+        // Expire the client only after the database proof is demonstrably in
+        // flight, avoiding a timing-dependent race with connection startup.
+        const deadline = setTimeout(() => controller.abort(new DOMException("Synthetic client deadline", "TimeoutError")), 10);
+        try {
+          assert.deepEqual(await request, { received: false, name: "TimeoutError" });
+        } finally { clearTimeout(deadline); }
+        assert.deepEqual(await snapshot(context), before, "no durable transition is visible while proof is paused");
+        resume.resolve();
+        const completed = await settled.promise;
+        if (serverOutcome === "rollback") {
+          assert.deepEqual(completed, { status: 503, code: "BACKEND_STORAGE_UNAVAILABLE" });
+          assert.deepEqual(await snapshot(context), before,
+            "SQL timeout rolls back domain, head, predecessor consumption, links and journal");
+        } else {
+          assert.equal(completed.status, 201);
+          assert.deepEqual(await head(context, principal), { generation_id: completed.result.generationId, revision: 1 });
+          assert.equal(await journalCount(context), journalBefore + 1);
+          const afterCommit = await snapshot(context);
+          const replay = await context.domain.activate(principal, manifest);
+          assert.equal(replay.replay, true);
+          assert.equal(replay.generationId, completed.result.generationId);
+          assert.deepEqual(await snapshot(context), afterCommit, "exact digest replay writes nothing");
+        }
+        // A normal later pass gets a fresh predecessor. It either commits the
+        // rolled-back request once, or receives the equivalent-vector receipt.
+        const retryManifest = await prepared(context, principal, days);
+        const beforeRetry = await snapshot(context);
+        const retried = await context.domain.activate(principal, retryManifest);
+        if (serverOutcome === "commit") {
+          assert.equal(retried.unchanged, true);
+          assert.equal(retried.requestedManifestDigest, retryManifest.manifestDigest);
+          assert.deepEqual(await snapshot(context), beforeRetry, "unchanged retry writes nothing");
+        } else {
+          assert.equal(retried.replay, false);
+        }
+        assert.deepEqual(await head(context, principal), { generation_id: retried.generationId, revision: 1 });
+        assert.equal(await journalCount(context), journalBefore + 1, "one source event across timeout and retry");
+        for (const name of ["telemetry_v12_domains", "telemetry_v12_domain_heads", "storage_v12_event_sources"]) {
+          assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM ${context.table(name)}`)).rows[0].n, 1, name);
+        }
+        assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM ${context.table("telemetry_v12_domain_predecessors")}
+          WHERE consumed_at IS NOT NULL`)).rows[0].n, 1, "exactly one predecessor consumed");
+        assert.deepEqual(await immutableOriginals(context, days), originals, "all staged immutable evidence survives");
+      } finally {
+        controller.abort();
+        resume.resolve();
+        if (paused) await settled.promise;
+        server.closeAllConnections();
+        await new Promise(resolveClose => server.close(resolveClose));
+      }
+    });
+  });
+}
+
+test("v1.1 source_11 selection preserves the pinned accepted record-id/source-device multiset", {
+  skip: !PG_TEST_SOCKET, timeout: 120_000,
+}, async () => {
+  await withSchema(async context => {
+    const options = { ...context.options, sourceNamespace: SOURCE_NAMESPACE };
+    const owner = await seedParticipant(context, "source11-selection");
+    const deviceA = await seedDevice(context, owner, "source11-a", { v12: false });
+    const deviceB = await seedDevice(context, owner, "source11-b", { v12: false });
+    const unrelatedOwner = await seedParticipant(context, "source11-unrelated");
+    const unrelatedDevice = await seedDevice(context, unrelatedOwner, "source11-unrelated", { v12: false });
+    await initializeScaleV11(modules, pool, context.schema, options);
+    for (const [participant, principal] of [[owner, deviceA], [owner, deviceB], [unrelatedOwner, unrelatedDevice]]) {
+      await grantScaleV11(modules, pool, participant, principal, options);
+    }
+    const v11Domain = modules.live.createPostgresTelemetryV11Domain(pool, options);
+    const stageV11 = async (principal, day, indexes) => {
+      const records = indexes.map(index => v11At(day, index));
+      const manifest = await stageScaleV11Day(modules, pool, context.schema, options, principal, day, records);
+      return { ...manifest, indexes: [...indexes], expectedCount: records.length };
+    };
+    const activateV11 = async (principal, days) => {
+      const predecessor = await v11Domain.createPredecessor(principal);
+      const activation = await v11Domain.activate(principal, scaleV11DomainManifest(predecessor, days));
+      assert.equal(activation.replay, false, "each fixture generation is a new accepted generation");
+      return { predecessor, activation };
+    };
+
+    // The first predecessor includes UTC today even for a fresh owner. Keep a
+    // complete daily vector through that day, using READY empty manifests as
+    // genuine empty days. A later same-day manifest preserves the original
+    // occurrence and adds a new one, leaving the first physical manifest in
+    // accepted history but outside the current head.
+    const today = new Date().toISOString().slice(0, 10);
+    const dayAt = offset => new Date(Date.parse(`${today}T00:00:00.000Z`) + offset * DAY_MS)
+      .toISOString().slice(0, 10);
+    const aDays = [-4, -3, -2, -1, 0].map(dayAt);
+    const aHistorical = await stageV11(deviceA, aDays[0], [1]);
+    const aEmptyDays = [];
+    for (const day of aDays.slice(1)) aEmptyDays.push(await stageV11(deviceA, day, []));
+    await activateV11(deviceA, [aHistorical, ...aEmptyDays]);
+
+    const aHistoricalSuccessor = await stageV11(deviceA, aDays[0], [1, 100]);
+    const aRepeated = await stageV11(deviceA, aDays[1], [2, 3]);
+    await activateV11(deviceA, [aHistoricalSuccessor, aRepeated, ...aEmptyDays.slice(1)]);
+    const aHeadNeighbor = await stageV11(deviceA, aDays[2], [4]);
+    const aNonReady = await stageV11(deviceA, aDays[3], [5]);
+    const aMissingAllocation = await stageV11(deviceA, aDays[4], [6]);
+    const aCurrentDays = [aHistoricalSuccessor, aRepeated, aHeadNeighbor, aNonReady, aMissingAllocation];
+    const aCurrentGeneration = await activateV11(deviceA, aCurrentDays);
+
+    const aHead = (await pool.query(`SELECT head.generation_id FROM ${context.table("telemetry_v11_domain_heads")} head
+      WHERE head.participant_id=$1`, [owner.participantId])).rows[0]?.generation_id;
+    assert.equal(aHead, aCurrentGeneration.activation.generationId,
+      "the participant head advances to device A's latest accepted generation");
+    const aHeadManifestIds = (await pool.query(`SELECT manifest_id FROM ${context.table("telemetry_v11_domain_days")}
+      WHERE generation_id=$1 ORDER BY observed_day`, [aHead])).rows.map(row => row.manifest_id);
+    assert.deepEqual(aHeadManifestIds, aCurrentDays.map(day => day.manifestId),
+      "the current head contains the complete successor vector");
+    assert.ok(!aHeadManifestIds.includes(aHistorical.manifestId),
+      "the historical-only physical manifest has been replaced in the current head");
+
+    // Device B's accepted generation carries every predecessor occurrence
+    // forward on B, then adds one new event. This exercises accepted rows from
+    // both devices without weakening the previous-generation closure proof.
+    const bMirrors = [];
+    for (const day of aCurrentDays.slice(0, -1)) bMirrors.push(await stageV11(deviceB, day.day, day.indexes));
+    const bAccepted = await stageV11(deviceB, aDays[4], [6, 7]);
+    await activateV11(deviceB, [...bMirrors, bAccepted]);
+    const bWrongReceipt = await stageV11(deviceB, aDays[4], [6, 7, 8]);
+    const bWrongReceiptGeneration = await activateV11(deviceB, [...bMirrors, bWrongReceipt]);
+    const unrelated = await stageV11(unrelatedDevice, today, [9]);
+    await activateV11(unrelatedDevice, [unrelated]);
+    const duplicateReachability = (await pool.query(`SELECT count(DISTINCT generation_id)::integer AS n
+      FROM ${context.table("telemetry_v11_domain_days")} WHERE manifest_id=$1`, [aRepeated.manifestId])).rows[0].n;
+    assert.equal(duplicateReachability, 2, "one accepted manifest is reachable from two historical generations");
+
+    // Derive expected physical rows directly from typed base records and the
+    // one-to-one typed manifest/device identities, independently of the
+    // typed_v11_record_admissions view exercised by both selection queries.
+    const rawRowsFor = async manifests => (await pool.query(`SELECT record.id::text AS id,
+        ${context.table("typed_legacy_admission_decode_id")}(device.original_id) AS source_device_id,
+        membership.manifest_id
+      FROM ${context.table("typed_telemetry_records")} record
+      JOIN ${context.table("typed_v11_manifest_memberships")} membership
+        ON membership.typed_manifest_id=record.manifest_id
+      JOIN ${context.table("typed_telemetry_devices")} device ON device.id=record.device_id
+      WHERE record.format=11 AND membership.manifest_id=ANY($1::text[]) ORDER BY record.id`,
+    [[...new Set(manifests.map(item => item.manifestId))]])).rows;
+    const acceptedManifests = [aHistorical, aHistoricalSuccessor, aRepeated, aHeadNeighbor, aNonReady,
+      aMissingAllocation, ...bMirrors, bAccepted, bWrongReceipt];
+    const rawAcceptedRows = await rawRowsFor(acceptedManifests);
+    assert.equal(rawAcceptedRows.length, acceptedManifests.reduce((sum, item) => sum + item.expectedCount, 0),
+      "all admitted synthetic typed records remain physically present");
+    assert.ok(rawAcceptedRows.some(row => row.source_device_id === deviceA.deviceId));
+    assert.ok(rawAcceptedRows.some(row => row.source_device_id === deviceB.deviceId),
+      "accepted source history spans multiple devices for one participant");
+    const unrelatedRawRows = await rawRowsFor([unrelated]);
+    assert.equal(unrelatedRawRows.length, unrelated.expectedCount, "the unrelated accepted owner has physical records");
+    const baseExpected = rawAcceptedRows.map(({ id, source_device_id }) => ({ id, source_device_id }));
+
+    // This is copied from oldSql(schema, 11) in the exact 396d365 preimage
+    // (SHA-256 b22fa6336fc7841472d4fefd44a98c0031555019d3202ce8ff24eb74d43cde94).
+    // Keep it independent of the live query builder so equality checks cover
+    // both record IDs and source-device identities, including multiplicity.
+    const originalSource11 = `WITH candidate_days AS MATERIALIZED (SELECT day::date,manifest_id
+        FROM jsonb_to_recordset($1::jsonb->'candidate') AS input(day text,manifest_id text)),
+      predecessor_days AS MATERIALIZED (SELECT day::date,manifest_id,manifest_digest
+        FROM jsonb_to_recordset($1::jsonb->'predecessor') AS bound(day text,manifest_id text,manifest_digest text)),
+      activation_scope AS (SELECT $2::text AS participant_id,$3::text AS device_id),
+      decoded_devices AS MATERIALIZED (SELECT id,${context.table("typed_legacy_admission_decode_id")}(original_id) AS source_device_id
+        FROM ${context.table("typed_telemetry_devices")}),
+      accepted_v11_sources AS MATERIALIZED (SELECT DISTINCT retained_day.manifest_id,receipt.device_id
+        FROM ${context.table("telemetry_v11_domain_days")} retained_day
+        JOIN ${context.table("storage_v11_event_sources")} receipt ON receipt.generation_id=retained_day.generation_id
+         AND receipt.participant_id=$2)
+      SELECT record.id::text AS id,device.source_device_id
+        FROM ${context.table("typed_telemetry_records")} record
+        JOIN ${context.table("typed_telemetry_owner_memberships")} membership ON membership.namespace_id=record.namespace_id
+          AND membership.owner_id=record.owner_id AND membership.source_format=record.format AND membership.participant_id=$2
+        JOIN decoded_devices device ON device.id=record.device_id
+        LEFT JOIN ${context.table("typed_telemetry_usage")} usage ON usage.record_id=record.id
+        LEFT JOIN ${context.table("typed_telemetry_identifiers")} session ON session.id=usage.session_id
+        JOIN ${context.table("typed_v11_record_admissions")} admission ON admission.typed_record_id=record.id
+        JOIN ${context.table("telemetry_v11_day_manifests")} retained_manifest ON retained_manifest.id=admission.manifest_id
+          AND retained_manifest.state='ready' AND retained_manifest.participant_id=$2
+       WHERE record.format=11 AND EXISTS (SELECT 1 FROM accepted_v11_sources accepted
+         WHERE accepted.manifest_id=admission.manifest_id AND accepted.device_id=device.source_device_id)`;
+
+    const candidate = await stageV11(deviceA, aDays[4], [90]);
+    const candidatePredecessor = await v11Domain.createPredecessor(deviceA);
+    const candidateDomain = scaleV11DomainManifest(candidatePredecessor, [candidate]);
+    const input = await proofInput(context, 11, deviceA, candidateDomain, candidatePredecessor.token);
+    const proof = await runProof(modules.activation.preparePostgresClassificationActivation, context, input);
+    assert.equal(proof.outcome, ACCEPTED, "the capture candidate passes the real proof");
+    const statements = proof.statements.filter(sql => /^CREATE TEMP TABLE pg_temp\."classification_source_11"/u.test(sql));
+    assert.equal(statements.length, 1, "the live proof emits exactly one source_11 selection CTAS");
+    const sourceVector = JSON.stringify({ candidate: input.days.map(day => ({ day: day.day, manifest_id: day.manifestId })),
+      predecessor: [] });
+    const values = [sourceVector, input.participantId, input.deviceId];
+    const multiset = rows => rows.map(row => JSON.stringify([String(row.id), row.source_device_id]))
+      .sort((left, right) => left.localeCompare(right, "en"));
+    const compareSelection = async (expected, label, mutate) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL statement_timeout='60000ms'");
+        if (mutate) {
+          // Fixture corruption is transaction-local and always rolled back.
+          await client.query("SET LOCAL session_replication_role='replica'");
+          await mutate(client);
+        }
+        await client.query(statements[0], values);
+        const selected = (await client.query(`SELECT id::text AS id,source_device_id
+          FROM pg_temp."classification_source_11" ORDER BY id,source_device_id`)).rows;
+        const original = (await client.query(originalSource11, values)).rows;
+        assert.deepEqual(multiset(selected), multiset(original),
+          `${label}: optimized selection equals the pinned 396d365 predicate as an ID/device multiset`);
+        assert.deepEqual(multiset(selected), multiset(expected), `${label}: expected physical rows are selected`);
+        return selected;
+      } finally {
+        await client.query("ROLLBACK");
+        client.release();
+      }
+    };
+
+    const baseline = await compareSelection(baseExpected, "historical generations, duplicate manifest reachability and two devices");
+    assert.equal(baseline.length, baseExpected.length, "duplicate manifest reachability does not multiply physical rows");
+    assert.ok(baseline.some(row => row.source_device_id === deviceA.deviceId));
+    assert.ok(baseline.some(row => row.source_device_id === deviceB.deviceId));
+    assert.ok(!baseline.some(row => unrelatedRawRows.some(unrelatedRow => unrelatedRow.id === row.id)),
+      "another participant's accepted manifest is excluded");
+
+    const excluding = manifest => baseExpected.filter(row =>
+      !rawAcceptedRows.some(raw => raw.id === row.id && raw.manifest_id === manifest.manifestId));
+    await compareSelection(excluding(bWrongReceipt), "a receipt with a different device does not authorize its records", async client => {
+      const changed = await client.query(`UPDATE ${context.table("storage_v11_event_sources")}
+        SET device_id=$3 WHERE generation_id=$1 AND participant_id=$2`,
+      [bWrongReceiptGeneration.activation.generationId, owner.participantId, deviceA.deviceId]);
+      assert.equal(changed.rowCount, 1, "the transaction changes exactly the target generation's receipt device");
+    });
+    await compareSelection(excluding(aNonReady), "a non-READY manifest is excluded", async client => {
+      const changed = await client.query(`UPDATE ${context.table("telemetry_v11_day_manifests")}
+        SET state='staged',ready_at=NULL WHERE id=$1 AND state='ready'`, [aNonReady.manifestId]);
+      assert.equal(changed.rowCount, 1);
+    });
+    await compareSelection(excluding(aHeadNeighbor), "a READY manifest owned by another participant is excluded", async client => {
+      const physicalIds = async () => (await client.query(`SELECT record.id::text AS id
+        FROM ${context.table("typed_telemetry_records")} record
+        JOIN ${context.table("typed_v11_manifest_memberships")} membership
+          ON membership.typed_manifest_id=record.manifest_id
+        WHERE record.format=11 AND membership.manifest_id=$1 ORDER BY record.id`, [aHeadNeighbor.manifestId])).rows
+        .map(row => row.id);
+      const beforeIds = await physicalIds();
+      const expectedPhysicalIds = rawAcceptedRows.filter(row => row.manifest_id === aHeadNeighbor.manifestId)
+        .map(row => row.id).sort((left, right) => left.localeCompare(right, "en"));
+      assert.deepEqual(beforeIds, expectedPhysicalIds,
+        "the accepted typed records and manifest memberships are present before corruption");
+      const changed = await client.query(`UPDATE ${context.table("telemetry_v11_day_manifests")}
+        SET participant_id=$2 WHERE id=$1 AND participant_id=$3`,
+      [aHeadNeighbor.manifestId, unrelatedOwner.participantId, owner.participantId]);
+      assert.equal(changed.rowCount, 1, "only the retained manifest owner is changed in this transaction");
+      assert.deepEqual(await physicalIds(), beforeIds, "the physical records and typed memberships remain unchanged");
+    });
+    await compareSelection(excluding(aMissingAllocation), "records without their admission allocation are excluded", async client => {
+      const physicalCount = (await client.query(`SELECT count(*)::integer AS n
+        FROM ${context.table("typed_telemetry_records")} record
+        JOIN ${context.table("typed_v11_manifest_memberships")} membership ON membership.typed_manifest_id=record.manifest_id
+        WHERE membership.manifest_id=$1 AND record.format=11`, [aMissingAllocation.manifestId])).rows[0].n;
+      assert.equal(physicalCount, aMissingAllocation.expectedCount, "typed rows remain physically present");
+      const deleted = await client.query(`DELETE FROM ${context.table("typed_v11_chunk_allocations")} allocation
+        USING ${context.table("telemetry_v11_chunks")} source_chunk
+        WHERE source_chunk.id=allocation.chunk_id AND source_chunk.manifest_id=$1`, [aMissingAllocation.manifestId]);
+      assert.ok(deleted.rowCount > 0, "the transaction removes the allocation leg only");
+      const visibleAdmissions = (await client.query(`SELECT count(*)::integer AS n
+        FROM ${context.table("typed_v11_record_admissions")} WHERE manifest_id=$1`, [aMissingAllocation.manifestId])).rows[0].n;
+      assert.equal(visibleAdmissions, 0, "the admission view no longer exposes records after allocation removal");
+    });
+
+    const sourceArtifacts = async (executor, manifestId) => {
+      const records = (await executor.query(`SELECT record.id::text AS id,
+          record.manifest_id::text AS typed_manifest_id,membership.manifest_id::text AS manifest_id
+        FROM ${context.table("typed_telemetry_records")} record
+        JOIN ${context.table("typed_v11_manifest_memberships")} membership
+          ON membership.typed_manifest_id=record.manifest_id
+        WHERE record.format=11 AND membership.manifest_id=$1 ORDER BY record.id`, [manifestId])).rows;
+      const chunks = (await executor.query(`SELECT id::text AS id,manifest_id::text AS manifest_id
+        FROM ${context.table("telemetry_v11_chunks")} WHERE manifest_id=$1 ORDER BY id`, [manifestId])).rows;
+      const memberships = (await executor.query(`SELECT manifest_id::text AS manifest_id,
+          typed_manifest_id::text AS typed_manifest_id
+        FROM ${context.table("typed_v11_manifest_memberships")} WHERE manifest_id=$1
+        ORDER BY typed_manifest_id`, [manifestId])).rows;
+      const allocations = (await executor.query(`SELECT allocation.chunk_id::text AS chunk_id
+        FROM ${context.table("typed_v11_chunk_allocations")} allocation
+        JOIN ${context.table("telemetry_v11_chunks")} source_chunk ON source_chunk.id=allocation.chunk_id
+        WHERE source_chunk.manifest_id=$1 ORDER BY allocation.chunk_id`, [manifestId])).rows;
+      const generationDays = (await executor.query(`SELECT generation_id::text AS generation_id,
+          observed_day::text AS observed_day,manifest_id::text AS manifest_id
+        FROM ${context.table("telemetry_v11_domain_days")} WHERE manifest_id=$1
+        ORDER BY generation_id,observed_day`, [manifestId])).rows;
+      return { records, chunks, memberships, allocations, generationDays };
+    };
+    const expectManifestMissingToExclude = async (manifest, label, isCurrentHead) => {
+      const manifestRow = (await pool.query(`SELECT id,participant_id,state FROM ${context.table("telemetry_v11_day_manifests")}
+        WHERE id=$1`, [manifest.manifestId])).rows[0];
+      assert.ok(manifestRow, `${label}: the retained READY manifest exists before corruption`);
+      assert.equal(manifestRow.participant_id, owner.participantId);
+      assert.equal(manifestRow.state, "ready");
+      const references = (await pool.query(`SELECT days.generation_id::text AS generation_id,
+          (head.generation_id IS NOT NULL) AS is_current_head
+        FROM ${context.table("telemetry_v11_domain_days")} days
+        LEFT JOIN ${context.table("telemetry_v11_domain_heads")} head
+          ON head.generation_id=days.generation_id
+        WHERE days.manifest_id=$1 ORDER BY days.generation_id`, [manifest.manifestId])).rows;
+      assert.ok(references.length > 0, `${label}: the accepted generation still references this day`);
+      assert.equal(references.some(row => row.is_current_head), isCurrentHead,
+        `${label}: fixture distinguishes historical-only from current-head reachability`);
+      const before = await sourceArtifacts(pool, manifest.manifestId);
+      assert.equal(before.records.length, manifest.expectedCount,
+        `${label}: typed physical records exist before manifest deletion`);
+      assert.ok(before.chunks.length > 0, `${label}: source chunks exist before manifest deletion`);
+      assert.ok(before.memberships.length > 0, `${label}: typed manifest memberships exist before deletion`);
+
+      const selected = await compareSelection(excluding(manifest), label, async client => {
+        const unchangedBefore = await sourceArtifacts(client, manifest.manifestId);
+        assert.deepEqual(unchangedBefore, before, `${label}: records, chunks, memberships, allocations and history begin intact`);
+        const deleted = await client.query(`DELETE FROM ${context.table("telemetry_v11_day_manifests")}
+          WHERE id=$1 RETURNING id`, [manifest.manifestId]);
+        assert.equal(deleted.rowCount, 1, `${label}: only the retained day-manifest row is deleted`);
+        assert.deepEqual(await sourceArtifacts(client, manifest.manifestId), before,
+          `${label}: deletion leaves typed records, chunks, memberships, allocations and domain-day links untouched`);
+        assert.equal((await client.query(`SELECT count(*)::integer AS n
+          FROM ${context.table("telemetry_v11_day_manifests")} WHERE id=$1`, [manifest.manifestId])).rows[0].n, 0,
+        `${label}: the day-manifest inner join is genuinely missing during both source queries`);
+      });
+      assert.deepEqual(multiset(selected), multiset(excluding(manifest)),
+        `${label}: the live CTAS and pinned query both exclude the deleted manifest's physical rows`);
+
+      const restored = (await pool.query(`SELECT id,participant_id,state FROM ${context.table("telemetry_v11_day_manifests")}
+        WHERE id=$1`, [manifest.manifestId])).rows[0];
+      assert.deepEqual(restored, manifestRow, `${label}: rollback restores the original day-manifest row`);
+      assert.deepEqual(await sourceArtifacts(pool, manifest.manifestId), before,
+        `${label}: rollback restores the complete synthetic fixture without losing physical evidence`);
+    };
+
+    await expectManifestMissingToExclude(aHistorical,
+      "a missing historical accepted day-manifest removes its physical records from both queries", false);
+    const finalOwnerHead = (await pool.query(`SELECT generation_id FROM ${context.table("telemetry_v11_domain_heads")}
+      WHERE participant_id=$1`, [owner.participantId])).rows[0]?.generation_id;
+    assert.equal(finalOwnerHead, bWrongReceiptGeneration.activation.generationId,
+      "the later device-B activation remains the participant's current head after unrelated-owner activation");
+    const finalOwnerHeadManifestIds = (await pool.query(`SELECT manifest_id
+      FROM ${context.table("telemetry_v11_domain_days")} WHERE generation_id=$1 ORDER BY observed_day`,
+    [finalOwnerHead])).rows.map(row => row.manifest_id);
+    assert.ok(finalOwnerHeadManifestIds.includes(bWrongReceipt.manifestId),
+      "the current-head deletion target is reachable after every fixture activation");
+    await expectManifestMissingToExclude(bWrongReceipt,
+      "a missing current-head day-manifest removes its physical records from both queries", true);
+  });
 });

@@ -52,6 +52,71 @@ test("normal local dispatcher projects v1.2 from the actual index and resumes it
   assert.ok(service.calls.every(({ path }) => !path.includes("telemetry-v11")));
 });
 
+test("local v1.2 dispatcher gives only final activation its caller-selected request bound", async (t) => {
+  const { options, service } = await fixture(t);
+  const result = await runIncrementalContributionSyncOnce({ ...options,
+    requestTimeoutMilliseconds: 1_000,
+    activationRequestTimeoutMilliseconds: 2_500,
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname.endsWith("/domain-activate")) {
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+      }
+      return options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.failure, null);
+  assert.equal(result.acknowledgedThroughDay, "2026-08-01");
+  assert.ok(service.active());
+});
+
+test("a timed-out local activation keeps its cursor for a successful retry without reupload", async (t) => {
+  const { options, service } = await fixture(t);
+  const progressPath = `${options.indexFile}.telemetry-v12-progress.json`;
+  const timedOut = await runIncrementalContributionSyncOnce({ ...options,
+    requestTimeoutMilliseconds: 1_000,
+    activationRequestTimeoutMilliseconds: 1_500,
+    fetchImpl: async (url, request) => {
+      if (!new URL(url).pathname.endsWith("/domain-activate")) return options.fetchImpl(url, request);
+      await new Promise((resolve, reject) => {
+        const finish = () => {
+          request.signal.removeEventListener("abort", abort);
+          resolve();
+        };
+        const timer = setTimeout(finish, 1_700);
+        const abort = () => {
+          clearTimeout(timer);
+          request.signal.removeEventListener("abort", abort);
+          reject(new Error("synthetic-activation-timeout"));
+        };
+        request.signal.addEventListener("abort", abort, { once: true });
+        if (request.signal.aborted) abort();
+      });
+      return options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(timedOut.status, "failed");
+  assert.equal(timedOut.failure.code, "service_unavailable");
+  assert.equal(timedOut.failure.retryable, true);
+  assert.equal(timedOut.acknowledgedThroughDay, null);
+  assert.equal(timedOut.domainGenerationId, null);
+  assert.equal(service.active(), null);
+  const saved = JSON.parse(await readFile(progressPath, "utf8"));
+  assert.equal(saved.schemaVersion, "telemetry-v12-sync-progress-v1");
+  const uploadedChunks = service.calls.filter(({ path }) => path === "/api/v1/contributions").length;
+  assert.ok(uploadedChunks > 0);
+
+  const retried = await runIncrementalContributionSyncOnce(options);
+  assert.equal(retried.status, "complete");
+  assert.equal(retried.failure, null);
+  assert.equal(retried.acknowledgedThroughDay, "2026-08-01");
+  assert.ok(service.active());
+  assert.equal(service.calls.filter(({ path }) => path === "/api/v1/contributions").length, uploadedChunks,
+    "the retry reuses the accepted chunk rather than uploading it twice");
+  assert.equal(JSON.parse(await readFile(progressPath, "utf8")), null,
+    "successful acknowledgement clears the progress cursor");
+});
+
 test("successor grants and a persisted cutoff are required before local day projection", async (t) => {
   const { options, service } = await fixture(t, { activationTime: null });
   const result = await runIncrementalContributionSyncOnce(options);

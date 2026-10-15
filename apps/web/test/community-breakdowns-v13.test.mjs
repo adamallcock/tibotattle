@@ -228,12 +228,13 @@ test("crossed v1.4 claims and unreadable versions are refused whole while activi
   }
 });
 
-test("the accepted-version list is exactly v1.0, v1.1, v1.3, v1.4 and v1.5, and legacy v1.0 rows remain readable", () => {
+test("the accepted-version list is exactly v1.0, v1.1, v1.2, v1.3, v1.4 and v1.5, and legacy v1.0 rows remain readable", () => {
   // Pinned at the list itself, so adding a version without reading it cannot
   // pass on the side effect of a row shape.
   assert.deepEqual([...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS], [
     "community-allowance-breakdowns-v1.0",
     "community-allowance-breakdowns-v1.1",
+    "community-allowance-breakdowns-v1.2",
     "community-allowance-breakdowns-v1.3",
     "community-allowance-breakdowns-v1.4",
     "community-allowance-breakdowns-v1.5",

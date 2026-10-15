@@ -295,7 +295,11 @@ function parseRelease(value: unknown): GithubReleaseInventoryRecord | null {
   if (boolean(release.draft)) {
     return null;
   }
-  const assets = array(release.assets).map(parseAsset);
+  const assetValues = array(release.assets);
+  if (assetValues.length > MAX_GITHUB_ASSETS_PER_RELEASE) {
+    throw new GithubInventoryError("GITHUB_RELEASES_BOUNDED");
+  }
+  const assets = assetValues.map(parseAsset);
   return {
     id: count(release.id),
     tag: string(release.tag_name),
@@ -324,6 +328,9 @@ async function readAdditionalReleaseAssets(
     if (!response.ok) throw new GithubInventoryError("GITHUB_UNAVAILABLE");
     const pageAssets = array(await boundedJson(response)).map(parseAsset);
     assets.push(...pageAssets);
+    if (assets.length > MAX_GITHUB_ASSETS_PER_RELEASE) {
+      throw new GithubInventoryError("GITHUB_RELEASES_BOUNDED");
+    }
     const next = hasNextPage(response);
     if (!next) return assets;
     if (assets.length >= MAX_GITHUB_ASSETS_PER_RELEASE

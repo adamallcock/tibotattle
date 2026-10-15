@@ -116,7 +116,7 @@ function optionalPool(name, value) {
  *   readMetricsHistory? (no GCP source: unavailable),
  *   readReconstructionProgress? (overrides the PostgreSQL full-refresh reader),
  *   maintenance?: {runMaintenance?, syncDistribution?, telemetryRuntimeActivation?,
- *     transportRollback?, v11EvidenceAdoption?}. Production injects lifecycle
+ *     transportRollback?, v11EvidenceAdoption?, v12DomainRecovery?}. Production injects lifecycle
  *     maintenance and forced public GitHub sync; absent tasks answer 503
  *     POSTGRES_ROUTE_NOT_PORTED.
  */

@@ -10,6 +10,18 @@ export const MAX_V11_DAILY_MODEL_CELLS = 200;
 const COMPONENTS = ['inputUncachedTokens','inputCacheReadTokens','inputCacheWriteTokens',
   'outputTextTokens','outputReasoningTokens','outputCombinedTokens'] as const;
 const TOKEN_KEYS = [...COMPONENTS,'effectiveOutput','nonOverlappingTotal'] as const;
+const PRIVATE_CLOSED_KEYS = {
+  tokens: TOKEN_KEYS,
+  token: ['knownSum','unavailable'],
+  pricing: ['knownNanousd','fullyPriced','partiallyPriced','unpriced'],
+  current: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted'],
+  counts: ['usage','quota','session'],
+  omitted: ['usageEvents','tokens','pricing'],
+  cell: ['provider','modelId','usageEvents','tokens','pricing'],
+  legacy: ['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells'],
+} as const;
+const PRIVATE_CLOSED_SIGNATURES = Object.fromEntries(Object.entries(PRIVATE_CLOSED_KEYS)
+  .map(([name, keys]) => [name, [...keys].sort().join('\0')])) as { [K in keyof typeof PRIVATE_CLOSED_KEYS]: string };
 type TokenKey = typeof TOKEN_KEYS[number];
 /** knownSum includes known portions even when some events are incomplete.
  * unavailable counts events with any unknown portion for this field.
@@ -28,9 +40,17 @@ export interface V11DailyProjectionValues {
   omitted: { usageEvents: number; tokens: Tokens; pricing: Pricing };
 }
 function fail(): never { throw new Error('V11_DAILY_PROJECTION_VALUES_INVALID'); }
-function closed(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).sort().join('\0') !== [...keys].sort().join('\0')) fail();
+function closed(value: unknown, keys: readonly string[], expectedSortedNul: string): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail();
+  const actual = Object.keys(value);
+  if (actual.length === keys.length) {
+    let ordered = true;
+    for (let index = 0; index < keys.length; index += 1) {
+      if (actual[index] !== keys[index]) { ordered = false; break; }
+    }
+    if (ordered) return;
+  }
+  if (actual.sort().join('\0') !== expectedSortedNul) fail();
 }
 function count(value: unknown, max = MAX_V11_DAILY_VALUES_RECORDS): asserts value is number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > max) fail();
@@ -62,15 +82,15 @@ function addPricing(a: Pricing, b: Pricing): Pricing {
     fullyPriced:a.fullyPriced+b.fullyPriced,partiallyPriced:a.partiallyPriced+b.partiallyPriced,unpriced:a.unpriced+b.unpriced};
 }
 function validateTokens(value: unknown, usage: number): asserts value is Tokens {
-  closed(value,TOKEN_KEYS);
+  closed(value,PRIVATE_CLOSED_KEYS.tokens,PRIVATE_CLOSED_SIGNATURES.tokens);
   for (const key of TOKEN_KEYS) {
-    const entry=value[key]; closed(entry,['knownSum','unavailable']); count(entry.unavailable,usage);
+    const entry=value[key]; closed(entry,PRIVATE_CLOSED_KEYS.token,PRIVATE_CLOSED_SIGNATURES.token); count(entry.unavailable,usage);
     const sum=decimal(entry.knownSum);
     if (sum>BigInt(usage)*BigInt(Number.MAX_SAFE_INTEGER)*5n) fail();
   }
 }
 function validatePricing(value: unknown, usage: number): asserts value is Pricing {
-  closed(value,['knownNanousd','fullyPriced','partiallyPriced','unpriced']);
+  closed(value,PRIVATE_CLOSED_KEYS.pricing,PRIVATE_CLOSED_SIGNATURES.pricing);
   count(value.fullyPriced,usage); count(value.partiallyPriced,usage); count(value.unpriced,usage);
   if(value.fullyPriced+value.partiallyPriced+value.unpriced!==usage
     ||decimal(value.knownNanousd)>BigInt(value.fullyPriced+value.partiallyPriced)*BigInt(Number.MAX_SAFE_INTEGER))fail();
@@ -80,20 +100,20 @@ const compare=(a: V11DailyModelCell,b: V11DailyModelCell)=> a.provider<b.provide
 /** Closed persisted-state validation. This is an arithmetic checkpoint, not a
  * receipt proving source identity, disjoint pages, completion or eligibility. */
 export function validateV11DailyProjectionValues(value: unknown): asserts value is V11DailyProjectionValues {
-  closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells','omitted']);
+  closed(value,PRIVATE_CLOSED_KEYS.current,PRIVATE_CLOSED_SIGNATURES.current);
   if(value.schemaVersion!==V11_DAILY_VALUES_SCHEMA || value.pricingMethodVersion!==COMMUNITY_DAILY_SPEND_PRICING_METHOD
     ||value.registrySha256!==COMMUNITY_DAILY_SPEND_REGISTRY_SHA256)fail();
-  validDay(value.day); closed(value.counts,['usage','quota','session']);
+  validDay(value.day); closed(value.counts,PRIVATE_CLOSED_KEYS.counts,PRIVATE_CLOSED_SIGNATURES.counts);
   count(value.counts.usage);count(value.counts.quota);count(value.counts.session);
   count(value.counts.usage+value.counts.quota+value.counts.session);
   validateTokens(value.tokens,value.counts.usage);validatePricing(value.pricing,value.counts.usage);
   if(!Array.isArray(value.cells)||value.cells.length>MAX_V11_DAILY_MODEL_CELLS)fail();
-  closed(value.omitted,['usageEvents','tokens','pricing']);count(value.omitted.usageEvents);
+  closed(value.omitted,PRIVATE_CLOSED_KEYS.omitted,PRIVATE_CLOSED_SIGNATURES.omitted);count(value.omitted.usageEvents);
   validateTokens(value.omitted.tokens,value.omitted.usageEvents);validatePricing(value.omitted.pricing,value.omitted.usageEvents);
   if(value.omitted.usageEvents>0&&value.cells.length!==MAX_V11_DAILY_MODEL_CELLS)fail();
   let total=value.omitted.usageEvents, sums=addTokens(zeroTokens(),value.omitted.tokens), prices=addPricing(zeroPricing(),value.omitted.pricing), previous: V11DailyModelCell|undefined;
   for(const entry of value.cells) {
-    closed(entry,['provider','modelId','usageEvents','tokens','pricing']);token(entry.provider);token(entry.modelId);
+    closed(entry,PRIVATE_CLOSED_KEYS.cell,PRIVATE_CLOSED_SIGNATURES.cell);token(entry.provider);token(entry.modelId);
     count(entry.usageEvents);if(entry.usageEvents===0)fail();
     validateTokens(entry.tokens,entry.usageEvents);validatePricing(entry.pricing,entry.usageEvents);
     const cell=entry as unknown as V11DailyModelCell;
@@ -108,7 +128,7 @@ export function validateV11DailyProjectionValues(value: unknown): asserts value 
 export function normalizeV11DailyProjectionValues(value: unknown): V11DailyProjectionValues {
   if(value&&typeof value==='object'&&!Array.isArray(value)&&'schemaVersion' in value
       &&value.schemaVersion==='v11-daily-projection-values-v1') {
-    closed(value,['schemaVersion','day','pricingMethodVersion','registrySha256','counts','tokens','pricing','cells']);
+    closed(value,PRIVATE_CLOSED_KEYS.legacy,PRIVATE_CLOSED_SIGNATURES.legacy);
     value={...value,schemaVersion:V11_DAILY_VALUES_SCHEMA,
       omitted:{usageEvents:0,tokens:zeroTokens(),pricing:zeroPricing()}};
   }

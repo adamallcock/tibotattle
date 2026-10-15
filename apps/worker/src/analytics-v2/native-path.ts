@@ -93,8 +93,11 @@ import {
   type V11QuotaPageReader,
   type V11SourcePin,
   type V11UsageReductionCheckpoint,
+  type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
 import type { AnalyticsV2DayLimits } from "./resources";
+import { evaluateAnalyticsV2PlanEraComposition, modelCompositionNeedsEraPartition,
+  type AnalyticsV2ModelCompositionResult } from "./model-era-composition";
 
 const DAY_MS = 86_400_000;
 /** d43c8f92 analytics-shared-reducers.ts PAGE_SIZE and the effective reader's page. */
@@ -489,17 +492,9 @@ Promise<V11UsageReductionCheckpoint> {
   throw new Error("ANALYTICS_V2_NATIVE_PATH_USAGE_REDUCTION_UNBOUNDED");
 }
 
-/**
- * One scalar or model analysis over a complete window, as the native path
- * computes it. The not-testable shapes are advanceStorageEffectiveAnalysis's.
- */
-export async function evaluateAnalyticsV2NativeDate(metric: "fits" | "model",
-  input: AnalyticsV2WindowInput): Promise<object> {
-  const selected = completeWindow(input.pin, input.day, input.days);
-  if (selected.some((value) => value.ownerDigest !== input.ownerDigest)) {
-    throw new SharedAnalyticsUnavailable("owner_mismatch");
-  }
-  const nowMs = Date.parse(modelHistoryWindow(input.day).fixedNow);
+/** One unchanged quota acquisition shared by legacy and partitioned model evaluation. */
+async function acquireWindowQuota(input: AnalyticsV2WindowInput,
+  selected: readonly AnalyticsV2PreparedDay[], nowMs: number) {
   const identity = createV11QuotaAcquisitionIdentity(input.pin, nowMs);
   const quotaDays = selected.filter((value) => input.quotaOccurrences(value.day).length > 0);
   for (const value of quotaDays) {
@@ -519,6 +514,21 @@ export async function evaluateAnalyticsV2NativeDate(metric: "fits" | "model",
   }
   acquired ??= await pagedQuotaAcquisition(identity, quotaDays.map((value) => value.day),
     input.quotaOccurrences, input.pin.throughDay);
+  return acquired;
+}
+
+/**
+ * One scalar or model analysis over a complete window, as the native path
+ * computes it. The not-testable shapes are advanceStorageEffectiveAnalysis's.
+ */
+export async function evaluateAnalyticsV2NativeDate(metric: "fits" | "model",
+  input: AnalyticsV2WindowInput): Promise<object> {
+  const selected = completeWindow(input.pin, input.day, input.days);
+  if (selected.some((value) => value.ownerDigest !== input.ownerDigest)) {
+    throw new SharedAnalyticsUnavailable("owner_mismatch");
+  }
+  const nowMs = Date.parse(modelHistoryWindow(input.day).fixedNow);
+  const acquired = await acquireWindowQuota(input, selected, nowMs);
   if ("status" in acquired) {
     return metric === "fits"
       ? { schemaVersion: "account-scoped-quota-analysis-v0.1", status: "not_testable", reason: acquired.reason,
@@ -561,17 +571,26 @@ Promise<{ analysis: object; selectedFits: CommunityAllowanceFit[] }> {
     [{ source: "v1.1", analysis: analysis as Parameters<typeof selectCommunityAllowanceAnalysisFits>[1][number]["analysis"] }]) };
 }
 
-/** One model-history date, with the same vendored-first rule. */
-export async function evaluateAnalyticsV2ModelDate(input: AnalyticsV2WindowInput): Promise<object> {
+/** One model-history date. Preserve every legacy answer except its global
+ * multi-era guard, where the versioned adapter can isolate safe candidates. */
+export async function evaluateAnalyticsV2ModelDate(input: AnalyticsV2WindowInput): Promise<AnalyticsV2ModelCompositionResult> {
+  let result: V1ModelCompositionResult | undefined;
   if (input.days.every(isSharedAnalyticsDay)) {
     try {
-      return await evaluateSharedModelDate({ pin: input.pin, day: input.day, ownerDigest: input.ownerDigest,
-        days: input.days });
+      result = await evaluateSharedModelDate({ pin: input.pin, day: input.day, ownerDigest: input.ownerDigest,
+        days: input.days }) as V1ModelCompositionResult;
     } catch (error) {
       if (!isRefusal(error, NATIVE_WINDOW_REASONS)) throw error;
     }
   }
-  return evaluateAnalyticsV2NativeDate("model", input);
+  result ??= await evaluateAnalyticsV2NativeDate("model", input) as V1ModelCompositionResult;
+  if (!modelCompositionNeedsEraPartition(result)) return result;
+  const selected = completeWindow(input.pin, input.day, input.days);
+  if (selected.some((value) => value.ownerDigest !== input.ownerDigest)) throw new SharedAnalyticsUnavailable("owner_mismatch");
+  const nowMs = Date.parse(modelHistoryWindow(input.day).fixedNow);
+  const acquired = await acquireWindowQuota(input, selected, nowMs);
+  if ("status" in acquired) return acquired;
+  return evaluateAnalyticsV2PlanEraComposition({ pin: input.pin, nowMs, quotaAcquisition: acquired, days: selected });
 }
 
 /**

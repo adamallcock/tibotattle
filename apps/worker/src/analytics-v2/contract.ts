@@ -400,7 +400,8 @@ export interface AnalyticsV2OwnerFitsRow {
   readonly fits: AnalyticsV2KernelValue;
 }
 
-/** analytics_v2_owner_model_dates: one evaluateSharedModelDate result. */
+/** analytics_v2_owner_model_dates: one legacy result or versioned, era-isolated
+ * GCP composition. Private input fingerprints are stripped at every depth. */
 export interface AnalyticsV2OwnerModelDateRow {
   readonly ownerDigest: AnalyticsV2OwnerDigest;
   readonly day: AnalyticsV2Day;

@@ -70,9 +70,9 @@
     },
     {
       "file": "test/local-collector-state.test.js",
-      "win32BranchCount": 2,
+      "win32BranchCount": 4,
       "classification": "windows-equivalent-needed",
-      "followUp": "Add a native Windows abrupt-process-termination SQLite recovery fixture."
+      "followUp": "Add native Windows owner-DACL and reparse-point/hard-link race coverage, plus abrupt-process-termination SQLite recovery."
     },
     {
       "file": "test/local-companion-data.test.js",

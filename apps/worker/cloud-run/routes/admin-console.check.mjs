@@ -183,7 +183,11 @@ test("handleAdminAction's task keys, actions, reasons and audit fields are porte
   assert.ok(start > 0 && end > start);
   const handler = index.slice(start, end);
   const taskKeys = [...handler.matchAll(/Object\.hasOwn\(body\.value, "([A-Za-z0-9]+)"\)/gu)].map((m) => m[1]);
-  assert.deepEqual([...action.RUN_MAINTENANCE_TASK_KEYS], taskKeys);
+  const originOnly = [...action.POSTGRES_ORIGIN_ONLY_RUN_MAINTENANCE_TASK_KEYS];
+  assert.deepEqual([...action.RUN_MAINTENANCE_TASK_KEYS].filter((key) => !originOnly.includes(key)), taskKeys);
+  assert.deepEqual(originOnly, ["v12DomainRecovery"]);
+  assert.ok(action.RUN_MAINTENANCE_TASK_KEYS.indexOf("v12DomainRecovery")
+    > action.RUN_MAINTENANCE_TASK_KEYS.indexOf("v11EvidenceAdoption"));
   const block = (name) => {
     const at = index.indexOf(`const ${name} = new Set<`);
     return [...index.slice(at, index.indexOf("]);", at)).matchAll(/"([a-z_]+)"/gu)].map((m) => m[1]);
@@ -430,6 +434,7 @@ test("unported maintenance tasks, the maintenance pass and the sync answer 503 w
     { action: "run_maintenance", telemetryRuntimeActivation: {} },
     { action: "run_maintenance", transportRollback: {} },
     { action: "run_maintenance", v11EvidenceAdoption: { dryRun: true } },
+    { action: "run_maintenance", v12DomainRecovery: { dryRun: true } },
     { action: "sync_distribution" },
   ]) {
     await expectError(await call(map, store, "admin_action", actionRequest(body)), 503, "POSTGRES_ROUTE_NOT_PORTED");
@@ -447,6 +452,19 @@ test("an injected task receives the raw body and the owner identity, in the Work
     maintenance: {
       telemetryRuntimeActivation: async (input) => { seen.push(["activation", input]); return { code: "A" }; },
       v11EvidenceAdoption: async (input) => { seen.push(["adoption", input]); return { code: "V" }; },
+      v12DomainRecovery: async (input) => {
+        seen.push(["domain-recovery", input]);
+        return {
+          task: "v12_domain_recovery",
+          method: "v12-owner-domain-recovery-1",
+          dryRun: true,
+          examined: 1,
+          outcomes: { activated: 0, eligible: 1, already_active: 0, authority_unavailable: 0, refused: 0 },
+          refusals: {},
+          daysCovered: 3,
+          nextAfterParticipantId: null,
+        };
+      },
     },
   });
   const { map, store } = handlers(admin);
@@ -461,7 +479,59 @@ test("an injected task receives the raw body and the owner identity, in the Work
     ["activation", { body: both, identityKey: OWNER }],
     ["adoption", { body: adoption, identityKey: OWNER }],
   ]);
+  const recovery = { action: "run_maintenance", v12DomainRecovery: { dryRun: true, maxDevices: 1 } };
+  await expectOk(await call(map, store, "admin_action", actionRequest(recovery)), {
+    schemaVersion: "admin-action-v0.1",
+    action: "run_maintenance",
+    result: {
+      task: "v12_domain_recovery",
+      method: "v12-owner-domain-recovery-1",
+      dryRun: true,
+      examined: 1,
+      outcomes: { activated: 0, eligible: 1, already_active: 0, authority_unavailable: 0, refused: 0 },
+      refusals: {},
+      daysCovered: 3,
+      nextAfterParticipantId: null,
+    },
+  });
+  assert.deepEqual(seen[2], ["domain-recovery", { body: recovery, identityKey: OWNER }]);
   assert.deepEqual(calls, []);
+});
+
+test("v12 domain recovery cannot return identifiers, tokens, or undeclared result fields", async () => {
+  const { admin, calls } = adapters({ maintenance: {
+    v12DomainRecovery: async () => ({
+      task: "v12_domain_recovery",
+      method: "v12-owner-domain-recovery-1",
+      dryRun: true,
+      examined: 1,
+      outcomes: { activated: 0, eligible: 1, already_active: 0, authority_unavailable: 0, refused: 0 },
+      refusals: {},
+      daysCovered: 1,
+      nextAfterParticipantId: null,
+      participantId: "synthetic-private-id",
+    }),
+  } });
+  const { map, store } = handlers(admin);
+  const response = await call(map, store, "admin_action", actionRequest({
+    action: "run_maintenance", v12DomainRecovery: { dryRun: true },
+  }));
+  assert.equal(response.status, 500);
+  assert.equal((await response.text()).includes("synthetic-private-id"), false);
+  assert.deepEqual(calls, []);
+});
+
+test("v12 domain recovery rejects raw pagination IDs before invoking the backend", async () => {
+  let invoked = false;
+  const { admin } = adapters({ maintenance: {
+    v12DomainRecovery: async () => { invoked = true; throw new Error("must not be called"); },
+  } });
+  const { map, store } = handlers(admin);
+  await expectError(await call(map, store, "admin_action", actionRequest({
+    action: "run_maintenance",
+    v12DomainRecovery: { dryRun: true, afterParticipantId: "participant-123" },
+  })), 400, "BODY_INVALID");
+  assert.equal(invoked, false);
 });
 
 test("the maintenance pass runs between a started and a terminal audit row", async () => {

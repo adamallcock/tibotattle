@@ -3,6 +3,7 @@ import { canonicalJson } from './canonical-json';
 import { sha256Hex } from './crypto';
 import { readEffectiveTelemetryOwnerDayPage, readEffectiveTelemetryOwnerDays, type EffectiveUsageReaderCursor } from './telemetry-usage-effective-reader';
 import { typedTelemetryIdSql } from './typed-telemetry-codec';
+import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from './typed-v11-chunk-completeness';
 import { advanceV11QuotaAcquisition, createV11QuotaAcquisitionCheckpoint,
   type V11QuotaAcquisitionCheckpoint, type V11CompletedQuotaAcquisition,
   type V11QuotaAcquisitionIdentity, type V11QuotaPageReader } from './quota-analysis-v11-reader';
@@ -100,6 +101,11 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
   // the stream set in the dependency identity prevents a session-enabled
   // reader from reusing a usage/quota-only checkpoint.
   const sourceStreams=includeSessions?"('usage','quota','session')":"('usage','quota')";
+  const typedStreams=includeSessions?"(1,2,3)":"(1,2)";
+  // The scope bounds are exact UTC midnights, so their epoch-day ordinals seek
+  // typed_telemetry_day before civil-date decoding. Keep observed_day as the
+  // selection fence: an event-time-only filter could hide a retained mismatch
+  // that must still participate in cross-day occurrence conflict expansion.
   const typedOccurrence=typedTelemetryIdSql('h.occurrence_id');
   const typedV12Occurrence=typedTelemetryIdSql('v12_record.occurrence_id');
   const typedV12LinkedOccurrence=typedTelemetryIdSql('r.occurrence_id');
@@ -150,11 +156,17 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
       SELECT ?,?,?,?,?,?,?
     ), ${retainedV12} selected(occurrence_id) AS MATERIALIZED (
       SELECT r.occurrence_id
-        FROM typed_telemetry_compatibility_records r
-        JOIN scope s
-        JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
+        FROM scope s
+        CROSS JOIN typed_v1_admission_state v1 ON v1.id=1 AND v1.runtime_contract_version=1
           AND v1.source_namespace=s.source_namespace
-        JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        CROSS JOIN typed_v1_owner_memberships owner_membership ON owner_membership.participant_id=s.participant_id
+        CROSS JOIN typed_telemetry_records physical_record INDEXED BY typed_telemetry_day
+          ON physical_record.namespace_id=v1.namespace_id
+         AND physical_record.owner_id=owner_membership.typed_owner_id
+         AND physical_record.format=10 AND physical_record.stream IN ${typedStreams}
+         AND physical_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
+         AND physical_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
+        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=physical_record.id
         JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
           AND typed_owner.namespace_id=v1.namespace_id
         JOIN typed_v1_record_admissions admission ON admission.typed_record_id=r.storage_row_id
@@ -172,16 +184,21 @@ async function effectiveHistoryOccurrenceLinks(source:D1Database,owner:StorageCo
          AND r.observed_day>=s.from_day AND r.observed_day<=s.through_day
       UNION
       SELECT r.occurrence_id
-        FROM typed_telemetry_compatibility_records r
-        JOIN scope s
-        JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
-        JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=r.participant_id
+        FROM scope s
+        CROSS JOIN typed_v11_admission_state v11 ON v11.id=1 AND v11.runtime_contract_version=1
+        CROSS JOIN typed_v11_owner_memberships owner_membership ON owner_membership.participant_id=s.participant_id
+        CROSS JOIN typed_telemetry_records physical_record INDEXED BY typed_telemetry_day
+          ON physical_record.namespace_id=v11.namespace_id
+         AND physical_record.owner_id=owner_membership.typed_owner_id
+         AND physical_record.format=11 AND physical_record.stream IN ${typedStreams}
+         AND physical_record.observed_day>=CAST(s.from_ms/86400000 AS INTEGER)
+         AND physical_record.observed_day<CAST(s.through_ms/86400000 AS INTEGER)
+        CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=physical_record.id
         JOIN typed_telemetry_owners typed_owner ON typed_owner.id=owner_membership.typed_owner_id
           AND typed_owner.namespace_id=v11.namespace_id
         JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
         JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
-          AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions complete
-            WHERE complete.chunk_id=chunk.id)
+          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
         JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
         JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
         JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id
@@ -240,8 +257,7 @@ ${selectedV12}    ), linked(family,occurrence_id,source_day,record_day,observed_
           AND typed_owner.namespace_id=v11.namespace_id
         JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
         JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream IN ${sourceStreams}
-          AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions complete
-            WHERE complete.chunk_id=chunk.id)
+          AND chunk.record_count=${TYPED_V11_CHUNK_PROOF_COUNT_SQL}
         JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
         JOIN telemetry_v11_day_manifests manifest ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
         JOIN typed_v11_manifest_memberships manifest_membership ON manifest_membership.manifest_id=domain_day.manifest_id

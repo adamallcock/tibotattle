@@ -151,6 +151,22 @@ async function deliverEffectiveDay(day=DAY,owner=OWNER,ownerRevision=1,
    canonicalJson({counts:{usage:1,quota:0,session:0}})).run();
 }
 
+/** A blocked effective owner/day still records the exact source dependency and
+ * cursor. Cache carry uses that identity but never selects it as a destination. */
+async function deliverIncompleteEffectiveDay(day:string,dependencyDigest:string,owner=OWNER,
+ streams:Record<string,unknown>={usage:{state:'start'},quota:{state:'start'},session:{state:'start'}},
+ blocked=true):Promise<void>{
+ await target().prepare(`INSERT INTO analytics_community_daily_owners
+  (source_id,day,owner_digest,input_revision,owner_revision,source_format,method,
+   progress_revision,next_index,fingerprint,complete,values_json)
+  VALUES(?,?,?,1,1,'effective','effective-daily-cursor-v2',1,0,?,0,?)
+  ON CONFLICT(source_id,day,owner_digest) DO UPDATE SET source_format=excluded.source_format,
+   method=excluded.method,fingerprint=excluded.fingerprint,complete=excluded.complete,
+   values_json=excluded.values_json`)
+  .bind(sourceId,day,owner,canonicalJson({method:'effective-daily-cursor-v4',dependencyDigest,streams,blocked}),
+   canonicalJson({counts:{usage:0,quota:0,session:0}})).run();
+}
+
 describe('the cache-retention method contract',()=>{
  it('names a retention curve, never a hit rate, and says what it measured',()=>{
   expect(CACHE_RETENTION_METRIC_ID).toBe('cache_retention_by_pause');
@@ -753,6 +769,162 @@ describe('the cache-retention lane',()=>{
    WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,OWNER,DAY)
    .first<number>('n')).toBe(1);
  });
+ it('uses a valid incomplete effective fingerprint as carry identity and retires its refusal on resolution',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carryDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  const blockedDigest='f'.repeat(64),resolvedDigest='e'.repeat(64);
+  await deliverIncompleteEffectiveDay(carryDay,blockedDigest);
+  const blockedCarry=await readCacheRetentionCarryDays(target(),effective);
+  expect(blockedCarry.at(-1)).toEqual({day:carryDay,manifestDigest:blockedDigest});
+  await writeCacheRetentionDayRefusal({target:target(),key:effective,carry:blockedCarry,
+   reason:'usage_row_refused'});
+  await expect(readCacheRetentionDay({target:target(),key:effective,carry:blockedCarry}))
+   .resolves.toMatchObject({status:'refused',reason:'usage_row_refused'});
+  expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle',marks:0});
+
+  // Resolving the source conflict changes its actual day dependency. The old
+  // refusal is stale under that new carry vector and can be retired safely.
+  await deliverEffectiveDay(carryDay,OWNER,1,resolvedDigest);
+  const resolvedCarry=await readCacheRetentionCarryDays(target(),effective);
+  expect(resolvedCarry.at(-1)).toEqual({day:carryDay,manifestDigest:resolvedDigest});
+  await expect(readCacheRetentionDay({target:target(),key:effective,carry:resolvedCarry}))
+   .resolves.toMatchObject({status:'absent'});
+  expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'retiring',marks:1});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(0);
+ });
+ it('refuses a malformed incomplete effective fingerprint instead of treating it as empty carry',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carryDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  await deliverIncompleteEffectiveDay(carryDay,'f'.repeat(64),OWNER,
+   {usage:{state:'start',unreviewed:true},quota:{state:'start'},session:{state:'start'}});
+  await expect(readCacheRetentionCarryDays(target(),effective))
+   .rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+ });
+ it('invalidates a current ready mark when an absent carry day becomes malformed-present',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const poisonDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  const emptyCarry=await readCacheRetentionCarryDays(target(),effective);
+  expect(emptyCarry.every(entry=>entry.manifestDigest==='')).toBe(true);
+  await writeCacheRetentionDay({target:target(),key:effective,carry:emptyCarry,aggregate:await build(effective,emptyCarry,{deadlineMs:Date.now()+30_000,remainingQueries:900})});
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).not.toEqual([]);
+  expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle',marks:0});
+
+  // A formerly absent source day is now present but malformed. Empty carry
+  // cannot continue to identify the ready mark after this new evidence.
+  await deliverIncompleteEffectiveDay(poisonDay,'f'.repeat(64),OWNER,
+   {usage:{state:'start',unreviewed:true},quota:{state:'start'},session:{state:'start'}});
+  await expect(readCacheRetentionCarryDays(target(),effective)).rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).toEqual([]);
+  const retired=await retireCacheRetentionDayPage(target(),sourceId);
+  expect(retired).toMatchObject({state:'retiring',marks:1});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(0);
+ });
+ it('invalidates a current refusal mark when an absent carry day becomes malformed-present',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const days=cacheRetentionLookbackDays(DAY),presentDay=days[0]!,poisonDay=days.at(-1)!;
+  await deliverEffectiveDay(presentDay,OWNER,1,'c'.repeat(64));
+  const refusalCarry=await readCacheRetentionCarryDays(target(),effective);
+  expect(refusalCarry.find(entry=>entry.day===presentDay)?.manifestDigest).toBe('c'.repeat(64));
+  await writeCacheRetentionDayRefusal({target:target(),key:effective,carry:refusalCarry,
+   reason:'usage_row_refused'});
+  await expect(readCacheRetentionDay({target:target(),key:effective,carry:refusalCarry}))
+   .resolves.toMatchObject({status:'refused',reason:'usage_row_refused'});
+  expect(await retireCacheRetentionDayPage(target(),sourceId)).toMatchObject({state:'idle',marks:0});
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).toEqual([]);
+
+  // The current refusal records the valid present lookback day. A different
+  // malformed present day invalidates that carry vector and permits retirement.
+  await deliverIncompleteEffectiveDay(poisonDay,'f'.repeat(64),OWNER,
+   {usage:{state:'start',unreviewed:true},quota:{state:'start'},session:{state:'start'}});
+  await expect(readCacheRetentionCarryDays(target(),effective)).rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+  expect(await readCacheRetentionCommunityBands({target:target(),sourceId})).toEqual([]);
+  const retired=await retireCacheRetentionDayPage(target(),sourceId);
+  expect(retired).toMatchObject({state:'retiring',marks:1});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(0);
+ });
+ it('rejects an oversized effective fingerprint before JSON parsing',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carryDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  await deliverIncompleteEffectiveDay(carryDay,'f'.repeat(64));
+  const oversized='{'+'x'.repeat(4096)+'}';
+  await target().prepare(`UPDATE analytics_community_daily_owners SET fingerprint=?
+   WHERE source_id=? AND owner_digest=? AND day=?`).bind(oversized,sourceId,OWNER,carryDay).run();
+  await expect(readCacheRetentionCarryDays(target(),effective)).rejects.toThrow('CACHE_RETENTION_UNAVAILABLE');
+ });
+ it('retires old carry checkpoints only after an exact-current successor and ignores a forged successor',async()=>{
+  await deliverEffectiveDay();
+  const effective:CacheRetentionDayCandidate={...key(),sourceLayout:'effective',
+   deviceId:CACHE_RETENTION_EFFECTIVE_DEVICE_ID,manifestId:CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+   manifestDigest:EFFECTIVE_DEPENDENCY_DIGEST};
+  const carryDay=cacheRetentionLookbackDays(DAY).at(-1)!;
+  await deliverIncompleteEffectiveDay(carryDay,'f'.repeat(64));
+  const carryA=await readCacheRetentionCarryDays(target(),effective);
+  const carryDigestA=await cacheRetentionCarryDigest(carryA);
+  const storageDigestA=await sha256Hex(canonicalJson({method:'cache-retention-effective-carry-v1',
+   sourceLayout:'effective',carryDigest:carryDigestA}));
+  const stage=async(storageDigest:string)=>{
+   const progressKey=await cacheRetentionDayMarkKey(effective,storageDigest);
+   await target().prepare(`INSERT INTO analytics_cache_retention_day_progress
+    (progress_key,source_id,source_layout,source_namespace,owner_digest,device_id,manifest_id,
+     manifest_digest,day,method_version,carry_digest,progress_revision,state_json,state_digest)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(progressKey,sourceId,'effective',sourceNamespace,OWNER,
+     CACHE_RETENTION_EFFECTIVE_DEVICE_ID,CACHE_RETENTION_EFFECTIVE_MANIFEST_ID,
+     EFFECTIVE_DEPENDENCY_DIGEST,DAY,CACHE_RETENTION_METHOD.version,storageDigest,1,'{}','a'.repeat(64)).run();
+   return progressKey;
+  };
+  await stage(storageDigestA);
+  // A second old checkpoint makes the existing retirement LIMIT observable.
+  await stage('9'.repeat(64));
+
+  const resolvedDigest='e'.repeat(64);
+  await deliverEffectiveDay(carryDay,OWNER,1,resolvedDigest);
+  const carryB=await readCacheRetentionCarryDays(target(),effective);
+  const carryDigestB=await cacheRetentionCarryDigest(carryB);
+  const storageDigestB=await sha256Hex(canonicalJson({method:'cache-retention-effective-carry-v1',
+   sourceLayout:'effective',carryDigest:carryDigestB}));
+
+  // Same owner/day/method/manifest but an impossible lookback fact: this is a
+  // deliberately forged, non-current refusal mark and cannot authorize cleanup.
+  const forgedCarry=carryB.map((entry,index)=>index===0?{...entry,manifestDigest:'8'.repeat(64)}:entry);
+  await writeCacheRetentionDayRefusal({target:target(),key:effective,carry:forgedCarry,
+   reason:'usage_row_refused'});
+  await retireCacheRetentionDayPage(target(),sourceId,{limit:1});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(2);
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective'`).first<number>('n')).toBe(0);
+
+  // A refusal under the actual current vector is a fully fenced successor and
+  // may retire only one old checkpoint per existing bounded page.
+  await writeCacheRetentionDayRefusal({target:target(),key:effective,carry:carryB,
+   reason:'usage_row_refused'});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_layout='effective' AND carry_digest=?`).bind(storageDigestB).first<number>('n')).toBe(1);
+  await retireCacheRetentionDayPage(target(),sourceId,{limit:1});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(1);
+  await retireCacheRetentionDayPage(target(),sourceId,{limit:1});
+  expect(await target().prepare('SELECT COUNT(*) n FROM analytics_cache_retention_day_progress')
+   .first<number>('n')).toBe(0);
+ });
  it('serves only a ready effective mark when legacy and effective rows overlap',async()=>{
   await deliverDay();
   await deliverEffectiveDay();
@@ -1241,6 +1413,12 @@ describe('the cache-retention builder over the real source readers',()=>{
   // the source rather than reusing the already-resolved factory.
   await expect(build(candidate,carry,{deadlineMs:Date.now()+60_000,remainingQueries:900}))
    .rejects.toThrow('prepared cache retention day refused');
+  const lane=await advanceCacheRetentionDayLane({target:target(),sourceId,build,fromDay:day,
+   deadlineMs:Date.now()+60_000,remainingQueries:900,sourceQueries:900});
+  expect(lane).toMatchObject({state:'progress',skipped:1,refused:0});
+  expect(await target().prepare(`SELECT COUNT(*) n FROM analytics_cache_retention_day_marks
+   WHERE source_id=? AND owner_digest=? AND day=?`).bind(sourceId,fixture.ownerDigest,day)
+   .first<number>('n')).toBe(0);
  });
 });
 

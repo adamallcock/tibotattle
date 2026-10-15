@@ -326,6 +326,9 @@ test("ledger rejects symlink, hardlink, and unsafe-mode substitutions", async ()
   });
   await withFixture(async ({ stateDirectory }) => {
     await mkdir(stateDirectory, { mode: 0o755 });
+    // The deliberately unsafe fixture must retain its mode under a restrictive umask.
+    await chmod(stateDirectory, 0o755);
+    assert.equal((await stat(stateDirectory)).mode & 0o777, 0o755);
     await assert.rejects(writeClaudeStatusSnapshot(snapshot(), { stateDirectory }), (error) => error.code === "state_directory_mode");
   });
   await withFixture(async ({ root }) => {

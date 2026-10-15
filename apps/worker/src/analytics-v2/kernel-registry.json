@@ -163,6 +163,42 @@
       "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
       "priceRegistryVersion": "app-official-api-prices-v0.9",
       "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 19,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "58f9530cc13194751d9f022ba660e70531cb77e29027338c5c543987b94acda6",
+      "computeClosureSha256": "d90c2f7f3773fd4b17af735c1a69443e8e42eb6f719de3d9d26d16a15ff6ddd1",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 20,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "f9030b9badc371488373507210dfbdab2c77fc37effc193015fc18399d93015d",
+      "computeClosureSha256": "ef73b9dbb570a42934cde70aa404aff18f56a4c4fcb60764de5444e02cccd46e",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 21,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "17fac1235531ce50a09c24fd5304e6e9fcd4a91a9783eae4954d2730b525421c",
+      "computeClosureSha256": "b1b0a51d04a92fbbb36c93b16d09714c0ae1d5d9db7ede04a15a6ea337412ca8",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 22,
+      "productionCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+      "vendorManifestSha256": "947faa8c6363c9bd6b27f5019b7a5163aa49e53fce22e13f6a0a971db95382b5",
+      "computeClosureSha256": "d6973f01447edc96cbb280310ff86408290880139ac85503b441482b610d8875",
+      "priceRegistrySha256": "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "priceRegistryVersion": "app-official-api-prices-v0.9",
+      "methodVersion": "analytics-v2-method-v2"
     }
   ]
 }

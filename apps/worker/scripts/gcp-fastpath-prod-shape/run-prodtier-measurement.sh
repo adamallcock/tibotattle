@@ -172,7 +172,10 @@ PGSTAT=1
 #   child <stdout file> <stderr file, or - for the stdout file> <command...>
 child() {
   local out=$1 err=$2; shift 2
-  if [[ $err == - ]]; then "$@" > "$out" 2>&1 & else "$@" > "$out" 2> "$err" & fi
+  # Inherited Node pipe ends may be sockets on Linux: duplicate their open
+  # descriptors instead of reopening the /dev paths as regular files.
+  if [[ $out == /dev/stdout && $err == /dev/stderr ]]; then "$@" >&1 2>&2 &
+  elif [[ $err == - ]]; then "$@" > "$out" 2>&1 & else "$@" > "$out" 2> "$err" & fi
   CHILD=$!; wait $CHILD; local rc=$?; CHILD=0; return $rc
 }
 # Freeze each owned parent before enumerating its children. Otherwise a sampler

@@ -15,6 +15,7 @@ const MAX_RESPONSE_BYTES = 32_768;
 const MAX_VECTOR_RESPONSE_BYTES = 1_250_000;
 const MAX_DAY_BYTES = 64_000_000;
 const MAX_RETRY_MS = 7 * DAY_MS;
+const MAXIMUM_ACTIVATION_REQUEST_TIMEOUT_MS = 60_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
 const DEVICE_AUTH = /^Device um_device_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
@@ -172,10 +173,11 @@ function transport(options, maxDurationMs) {
     if (left <= 0) throw new PassBudgetReached();
     return left;
   }
-  async function bounded(operation, request = false) {
+  async function bounded(operation, request = false, requestTimeoutOverrideMs = null) {
     const left = remaining();
-    const limit = Math.max(1, Math.ceil(Math.min(left, request ? requestTimeoutMs : left)));
-    const passDeadline = !request || left <= requestTimeoutMs;
+    const selectedRequestTimeoutMs = requestTimeoutOverrideMs ?? requestTimeoutMs;
+    const limit = Math.max(1, Math.ceil(Math.min(left, request ? selectedRequestTimeoutMs : left)));
+    const passDeadline = !request || left <= selectedRequestTimeoutMs;
     const controller = new AbortController();
     let timer;
     let abort;
@@ -198,7 +200,8 @@ function transport(options, maxDurationMs) {
       controller.abort();
     }
   }
-  async function request(path, { body, authorization = deviceAuthorization, maximumBytes = MAX_RESPONSE_BYTES } = {}) {
+  async function request(path, { body, authorization = deviceAuthorization, maximumBytes = MAX_RESPONSE_BYTES,
+    requestTimeoutMs: requestTimeoutOverrideMs = null } = {}) {
     return bounded(async (requestSignal) => {
       let response;
       try {
@@ -236,7 +239,7 @@ function transport(options, maxDurationMs) {
       }
       if (!response.ok) classifyResponse(response, value, clock, authorization === deviceAuthorization);
       return value;
-    }, true);
+    }, true, requestTimeoutOverrideMs);
   }
   return { origin, request, bounded, remaining, clock, networkActivity: () => networkActivity };
 }
@@ -516,12 +519,15 @@ async function runSync({
   serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, rehearsal = false, production = false, days, readDay, createEnvelope,
   fetchImpl = globalThis.fetch, signal, clock = Date.now,
   maxChunks = 500, maxDurationMs = 60_000, requestTimeoutMs = 30_000,
+  activationRequestTimeoutMs = null,
   maxDays = contract.maximumDomainDays,
   progressStore = null, sourcePublication = null, revalidateProgress = false,
   preparePublication = null,
 } = {}) {
   const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl });
   if (!integer(maxChunks, 2_000) || maxChunks < 1 || !integer(maxDurationMs, 300_000) || maxDurationMs < 1
+      || (activationRequestTimeoutMs !== null && (contract.contributionSchemaVersion !== "telemetry-contribution-v1.2"
+        || !integer(activationRequestTimeoutMs, MAXIMUM_ACTIVATION_REQUEST_TIMEOUT_MS) || activationRequestTimeoutMs < 1_000))
       || !integer(maxDays, contract.maximumDomainDays) || maxDays < 1
       || !Array.isArray(days) || days.length > maxDays || typeof readDay !== "function" || typeof createEnvelope !== "function"
       || days.some((day, index) => !dayValid(day) || (index > 0 && day <= days[index - 1]))) invalidConfiguration();
@@ -690,7 +696,9 @@ async function runSync({
     // A resumed prefix is trusted only for the pinned predecessor, not merely
     // for its date range. Re-read that state before the atomic server proof;
     // this also renews the short-lived token without persisting a capability.
-    if (progressStore !== null || Date.parse(before.expiresAt) <= clock() + requestTimeoutMs) {
+    const activationHorizonMs = activationRequestTimeoutMs === null ? requestTimeoutMs
+      : Math.min(activationRequestTimeoutMs, client.remaining());
+    if (progressStore !== null || Date.parse(before.expiresAt) <= clock() + activationHorizonMs) {
       const renewed = predecessor(await client.request(contract.predecessorPath, { body: {} }), clock);
       if (renewed.previousGenerationId !== before.previousGenerationId || renewed.legacyFingerprint !== before.legacyFingerprint
           || renewed.fromDay < fromDay || renewed.throughDay > throughDay) stop("revision_conflict", { retryable: true });
@@ -703,7 +711,8 @@ async function runSync({
     };
     manifest.manifestDigest = hash(contract.domainManifestDigestInput(manifest));
     contract.parseDomainManifest(manifest);
-    active = activation(await client.request(contract.activationPath, { body: manifest }), manifest);
+    active = activation(await client.request(contract.activationPath, { body: manifest,
+      ...(activationRequestTimeoutMs === null ? {} : { requestTimeoutMs: activationRequestTimeoutMs }) }), manifest);
     if (progressStore !== null) {
       // The verified server receipt is authoritative even if cleanup fails.
       // A leftover cursor has the old predecessor and cannot acknowledge a

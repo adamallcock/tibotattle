@@ -370,6 +370,7 @@ async function resolveExportSourcePlanBundle(bundle, {
 } = {}) {
   if (!secret || !resourceGuard?.limits) fail("configuration");
   assertBundleEnvelope(bundle);
+  const sourcePlanBundleSha256 = bundle.sourcePlanBundleSha256;
   const bounds = normalizeExportBounds(startAt, endAt);
   if (bundle.startAt !== bounds.startAt || bundle.endAt !== bounds.endAt) fail("interval");
   for (const plan of [
@@ -397,13 +398,20 @@ async function resolveExportSourcePlanBundle(bundle, {
     }
     if (bundle.claudeTranscriptPlan !== null) {
       source = "claude_transcript";
-      for (const transcriptSource of bundle.claudeTranscriptPlan.sources) {
-        await verifyClaudeTranscriptExportSource(bundle.claudeTranscriptPlan, transcriptSource.sourceKey, {
+      // Validate the aggregate plan once, then retain every source's native
+      // file-identity, frozen-prefix, and terminal-cursor verification.
+      const transcriptPlans = sliceClaudeTranscriptExportSourcePlans(bundle.claudeTranscriptPlan, { secret });
+      for (const transcriptPlan of transcriptPlans) {
+        await verifyClaudeTranscriptExportSource(transcriptPlan, transcriptPlan.sources[0].sourceKey, {
           secret,
           resourceGuard: verificationGuard,
         });
       }
     }
+    // A mutable caller must not replace the capability while its original
+    // source bindings are being verified. Projection below is synchronous.
+    assertBundleEnvelope(bundle);
+    if (bundle.sourcePlanBundleSha256 !== sourcePlanBundleSha256) fail("hash");
     source = "workspace_projection";
     const workspacePlans = derivedWorkspacePlans(bundle, secret);
     source = "totals";

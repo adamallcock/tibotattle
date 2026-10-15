@@ -132,6 +132,25 @@ function only(rows, occurrenceId) {
   return matches[0];
 }
 
+// The historical base uses the same total-fact expansion per batch without
+// WITH ORDINALITY. Classification proof reads intentionally share the tag but
+// use a different physical-record bind contract and must pass through.
+function isCorrectionFactExpansion(sql, binds, ownerDigest) {
+  if (!sql.includes("/* analytics_v2:occurrences.correction_sources */")
+      || !sql.includes("WITH requested AS MATERIALIZED")
+      || !sql.includes("telemetry_usage_correction_history")
+      || !sql.includes("telemetry_usage_correction_facts")) return false;
+  assert.match(ownerDigest, /^[0-9a-f]{64}$/u, "expected owner digest is valid");
+  assert.ok(Array.isArray(binds), "correction fact expansion has a bind array");
+  assert.equal(binds.length, 3, "correction fact expansion keeps its three-bind contract");
+  assert.equal(binds[0], ownerDigest, "correction fact expansion binds the requested owner first");
+  assert.ok(Array.isArray(binds[1]), "correction fact expansion binds occurrence ids second");
+  assert.ok(binds[1].every((id) => typeof id === "string" && /^(?:[0-9a-f]{2})+$/u.test(id)),
+    "correction fact expansion ids are encoded hexadecimal strings");
+  assert.equal(binds[2], 40001, "correction fact expansion keeps the unchanged 40,001-row source cap");
+  return true;
+}
+
 async function occurrences(runtime, ownerDigest, stream, fromDay = D1, throughDay = D3) {
   return modules.occurrences.readOwnerOccurrences(context(runtime),
     { ownerDigest, stream, fromDay, throughDay });
@@ -872,24 +891,29 @@ test("READ-EXPANSION: empty families skip only with same-snapshot proofs and set
   await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
     await snapshot.client.query("SELECT set_config('jit','on',true),set_config('work_mem','8MB',true)");
     const seen = [];
+    let expectedOwnerDigest = fixtures.active.owners.echo.ownerDigest;
     const client = { query: async (...args) => {
       const statement = typeof args[0] === "string" ? args[0] : args[0].text;
       if (/analytics_v2:occurrences\.(legacy_sources|v12_sources|correction_sources)/u.test(statement)) {
         const settings = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
         assert.deepEqual(settings, { jit: "off", mem: "64MB" });
-        seen.push(statement.match(/analytics_v2:occurrences\.([a-z_]+)/u)[1]);
+        const family = statement.match(/analytics_v2:occurrences\.([a-z_]+)/u)[1];
+        const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+        if (family !== "correction_sources"
+            || isCorrectionFactExpansion(statement, binds, expectedOwnerDigest)) seen.push(family);
       }
       return snapshot.client.query(...args);
     } };
     await modules.occurrences.readOwnerOccurrences({ ...snapshot, client }, {
-      ownerDigest: fixtures.active.owners.echo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
+      ownerDigest: expectedOwnerDigest, stream: "usage", fromDay: D1, throughDay: D3,
     });
     assert.ok(seen.includes("legacy_sources"));
     assert.equal(seen.includes("v12_sources"), false);
     assert.equal(seen.includes("correction_sources"), false);
     seen.length = 0;
+    expectedOwnerDigest = fixtures.active.owners.bravo.ownerDigest;
     await modules.occurrences.readOwnerOccurrences({ ...snapshot, client }, {
-      ownerDigest: fixtures.active.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
+      ownerDigest: expectedOwnerDigest, stream: "usage", fromDay: D1, throughDay: D3,
     });
     assert.ok(seen.includes("correction_sources"), "method-version-1 correction facts are never skipped");
     const restored = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
@@ -966,6 +990,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
       { conflict: 0, limit: 200, code: "ANALYTICS_V2_SOURCE_CONFLICT" },
       { conflict: 200, limit: 0, code: "ANALYTICS_V2_SOURCE_LIMIT" },
     ];
+    const bravoOwnerDigest = fixture.owners.bravo.ownerDigest;
     for (const scenario of refusalCases) {
       const defectClient = { query: async (...args) => {
         const result = await client.query(...args);
@@ -976,7 +1001,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
           return { ...result, rows: result.rows.map((row) => Buffer.from(row.occurrence_id).toString("hex") === encodedId(id)
             ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
         }
-        if (sql.includes("occurrences.correction_sources")) {
+        if (isCorrectionFactExpansion(sql, binds, bravoOwnerDigest)) {
           const id = target(scenario.limit);
           const ordinal = binds[1].indexOf(encodedId(id));
           if (ordinal >= 0) {
@@ -989,7 +1014,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
         }
         return result;
       } };
-      const input = { ownerDigest: fixture.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
+      const input = { ownerDigest: bravoOwnerDigest, stream: "usage", fromDay: D1, throughDay: D3 };
       for (const reader of [readers.base, readers.candidate]) {
         await assert.rejects(reader.occurrences.readOwnerOccurrences({ ...scoped, client: defectClient }, input),
           (error) => error?.code === scenario.code);
@@ -1001,10 +1026,12 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
         assert.notEqual(scenario.code, "ANALYTICS_V2_SOURCE_CONFLICT");
       }
     }
+    const alphaOwnerDigest = fixture.owners.alpha.ownerDigest;
     for (const expected of ["ANALYTICS_V2_SOURCE_CONFLICT", "ANALYTICS_V2_SOURCE_LIMIT"]) {
       const sameBatchClient = { query: async (...args) => {
         const result = await client.query(...args);
         const sql = typeof args[0] === "string" ? args[0] : args[0].text;
+        const binds = typeof args[0] === "string" ? args[1] : args[0].values;
         if (sql.includes("occurrences.legacy_sources") && expected.endsWith("CONFLICT")) {
           return { ...result, rows: result.rows.map((row, index) => index === 0
             ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
@@ -1015,13 +1042,13 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
         }
         if (sql.includes("occurrences.scope")) return { ...result,
           rows: result.rows.map((row) => ({ ...row, correction_facts_present: true })) };
-        if (sql.includes("occurrences.correction_sources")) return { ...result,
+        if (isCorrectionFactExpansion(sql, binds, alphaOwnerDigest)) return { ...result,
           rows: [{ ...factSamples[0], sub_batch: 0, record_digest: Buffer.alloc(32, 255) }] };
         return result;
       } };
       for (const reader of [readers.base, readers.candidate]) {
         await assert.rejects(reader.occurrences.readOwnerOccurrences({ ...scoped, client: sameBatchClient },
-          { ownerDigest: fixture.owners.alpha.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
+          { ownerDigest: alphaOwnerDigest, stream: "usage", fromDay: D1, throughDay: D3 }),
           (error) => error?.code === expected);
       }
     }
@@ -1035,12 +1062,13 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
           const result = await client.query(...args);
           const sql = typeof args[0] === "string" ? args[0] : args[0].text;
           if (sql.includes(`occurrences.${family}`)) {
-            assert.ok(result.rows.length > 0);
             const grouped = sql.includes("WITH ORDINALITY");
             if (family === "correction_sources") {
               const binds = typeof args[0] === "string" ? args[1] : args[0].values;
+              if (!isCorrectionFactExpansion(sql, binds, ownerDigest)) return result;
               if (!binds[1].includes(encodedId(target(0)))) return result;
             }
+            assert.ok(result.rows.length > 0);
             const leading = result.rows.filter((row) => !grouped || row.sub_batch === 0);
             const firstRow = [...leading].sort((a, b) => Number(a.storage_row_id ?? a.fact_id)
               - Number(b.storage_row_id ?? b.fact_id))[0];

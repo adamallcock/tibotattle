@@ -8,7 +8,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "check": "node --check ../scripts/gcp-test-database.mjs && node --check ../scripts/gcp-test-build-context.mjs && node ../scripts/gcp-test-build-context.mjs --check"
+    "check": "node --check ../scripts/gcp-test-database.mjs && node --check ../scripts/gcp-test-build-context.mjs && node --test ../scripts/gcp-test-build-context.check.mjs && node ../scripts/gcp-test-build-context.mjs --check"
   },
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "1.12.0",

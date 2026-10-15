@@ -685,6 +685,7 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
     cryptoImpl = globalThis.crypto, withDeviceSecret = withContributionDeviceSecret,
     openIndex = openLocalUnifiedIndex, maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
+    activationRequestTimeoutMilliseconds = null,
     maximumDurationMilliseconds = 60_000, now = Date.now,
     createV11Envelope = createTelemetryV11Envelope,
     createV12Envelope = createTelemetryV12Envelope,
@@ -712,6 +713,9 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
       || !Number.isSafeInteger(maximumChunks) || maximumChunks < 1 || maximumChunks > MAXIMUM_CHUNKS_PER_PASS
       || !Number.isSafeInteger(requestTimeoutMilliseconds) || requestTimeoutMilliseconds < 1_000
       || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+      || (activationRequestTimeoutMilliseconds !== null && (!successor
+        || !Number.isSafeInteger(activationRequestTimeoutMilliseconds)
+        || activationRequestTimeoutMilliseconds < 1_000 || activationRequestTimeoutMilliseconds > 60_000))
       || !Number.isSafeInteger(maximumDurationMilliseconds) || maximumDurationMilliseconds < 1
       || maximumDurationMilliseconds > 300_000
       || (signal !== undefined && !(signal instanceof AbortSignal))) fail("invalid_configuration");
@@ -750,6 +754,8 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
             progressStore: progress,
             maxChunks: maximumChunks, maxDurationMs: maximumDurationMilliseconds,
             requestTimeoutMs: requestTimeoutMilliseconds,
+            ...(successor && activationRequestTimeoutMilliseconds !== null
+              ? { activationRequestTimeoutMs: activationRequestTimeoutMilliseconds } : {}),
             readDay: async (day, { binding, activationTime }) => {
               onAttributionBinding?.(binding);
               try { return await preparation.readDay(day, { binding, activationTime }); }

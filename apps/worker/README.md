@@ -221,6 +221,19 @@ proof withholds historical spend. The strict current-price validator and its
 read path are unchanged. This compatibility path does not publish, recompute,
 restamp or modify any stored head, contribution, membership or exclusion.
 
+GCP model composition preserves the original single-era result. When the
+101-day owner window contains several plans, accounts or continuity eras, the
+versioned partitioned adapter fits each eligible era independently against the
+full attribution history. Ambiguous quantity intervals exclude complete model
+observations, including later quota crossings within the kernel's maximum gap;
+they are never assigned to a convenient plan or account. Public aggregation
+normalizes each fitted era to its own plan basis and takes the newest eligible
+value per owner/model, counting the owner once. Fit stability, minimum evidence,
+pricing coverage and freshness gates remain unchanged. See the
+[plan-era composition contract](../../docs/design/2026-10-13-plan-era-model-composition.md).
+This source behavior requires a newly registered analytics kernel and an
+authorized rollout; local tests do not establish production publication.
+
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
 legacy personal statistics, weekly aggregate, recovery,
@@ -288,11 +301,16 @@ The thin edge (`src/edge-entry.ts`) deploys only through the typed path with
 `--edge-mode worker|fenced|gcp`. The checked-in `wrangler.jsonc` still names
 `src/index.ts`. The edge's release-guard D1 has its own
 `release-guard-migrations/` directory, which no deploy applies.
-`npm run edge:scripts-check` runs the edge script checks, then
-`npm run edge:modes:dry-run`, the credential-free bundle of each mode, and then
-`npm run staging-edge:scripts-check`. That last script checks the typed
-staging-edge driver (`npm run staging-edge`, STG-DRV) and runs its offline
-rehearsal dry run. Every staging-edge subcommand is a dry run unless given
+The edge and staging drivers have direct script entrypoints; the former
+`edge:scripts-check`, `edge:modes:dry-run`, `staging-edge:scripts-check` and
+`staging-edge` npm aliases are not registered. From `apps/worker`, the owning
+checks are `node --test scripts/production-edge-mode.check.mjs
+scripts/edge-mode-configuration.check.mjs scripts/edge-mode-dry-run.check.mjs`
+and `node --test scripts/staging-edge-{target,storage,deploy,dry-run}.check.mjs`.
+The credential-free bundle drivers are `node scripts/edge-mode-dry-run.mjs`
+and `node scripts/staging-edge-dry-run.mjs`; STG-DRV's typed operational
+entrypoint is `node scripts/staging-edge-deploy.mjs <subcommand> ...`.
+Every staging-edge subcommand is a dry run unless given
 `--execute`. Render and deploy take the same production isolation inputs,
 including the production EP-8 fence plan, and refuse any production Worker,
 hostname, D1, bucket, rate-limit namespace or origin value. The staging
@@ -369,6 +387,34 @@ That gate checks guarded workspace-package copies, endpoint parity, generated
 types, TypeScript, operational scripts, Vitest, production asset staging, dry
 deployment, and disabled-staging configuration. It does not deploy, migrate,
 write remote state, or prove the live service.
+
+The committed Q-1 S9 rehearsal uses
+`gcp-fastpath-rehearsal.mjs --comparison-mode current-worker-d1`: it invokes
+the current Worker/D1 reference helper on the immutable synthetic corpus before
+PostgreSQL work, then requires complete public response, preview and cache
+equality plus immutable daily totals/cells conservation and the retained
+importer and replay gates. The helper requires the
+verified Node.js 26.2.0 binary for macOS arm64 or Linux x64; PostgreSQL refresh
+and the origin require the verified Node.js 22.16.0 executable for those same
+platforms and a disposable local PostgreSQL 17.
+S9 takes the absolute helper runtime from `EDGE_E2E_REHEARSAL_NODE`; a missing
+or unverified runtime refuses qualification.
+
+The existing `npm run gcp:fastpath:rehearsal` defaults to strict historical
+comparison. Add `-- --comparison-mode current-worker-d1 --out <new-report>`
+for current Q-1 qualification; an explicit new output is mandatory. Current
+mode retains the historical golden and
+per-date contract reports as separate diagnostics; the four stable daily
+families remain mandatory conservation evidence. Its output preserves the fresh
+reference, pre-execution source/corpus/migration/runtime binding, and original
+acceptance receipt without overwriting existing files. The receipt records the
+controller's direct invocation; it is an audit trail, not cryptographic
+execution attestation. The standalone `analytics-v2-parity-compare.mjs`
+current mode compares saved evidence only and cannot establish native execution
+or release readiness. Current equality covers refusal fields in the served
+DTOs. PostgreSQL kernel run/refusal history remains a distinct diagnostic;
+internal owner/refusal comparisons require the separate historical
+owner-reference protocol. Neither mode deploys or accesses private local history.
 
 Run the source-derived documentation gate after changing routes, bindings,
 storage, commands, or this README:

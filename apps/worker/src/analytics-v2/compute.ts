@@ -3,7 +3,8 @@ import { hostSha256Hex, type HostSha256Hex } from "../host-primitives";
 /**
  * analytics-v2 compute core (A-2): one pure, single-threaded full recompute of
  * every community analytics output from effective owner occurrences, using
- * only the vendored d43c8f92 kernels (vendor/analytics-d43c8f92/entry.ts).
+ * the vendored d43c8f92 kernels (vendor/analytics-d43c8f92/entry.ts) and the
+ * versioned GCP model-era composition adapter.
  *
  * It does no I/O. A-1 reads its inputs, A-3 persists its outputs in one
  * transaction, and A-4 serves them. The composition follows production
@@ -144,8 +145,8 @@ import {
   CACHE_RETENTION_METHOD,
   type CommunityAllowanceFit,
   type V11DailyProjectionValues,
-  type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
+import type { AnalyticsV2ModelCompositionResult } from "./model-era-composition";
 import {
   ANALYTICS_V2_CONTRACT_VERSION,
   ANALYTICS_V2_DAY_PATTERN,
@@ -691,7 +692,7 @@ export async function computeAnalyticsV2(input: ComputeAnalyticsV2Input): Promis
   const dailyValues = new Map<AnalyticsV2Day, Map<AnalyticsV2OwnerDigest, V11DailyProjectionValues>>(
     queued.map((day) => [day, new Map()]));
   const fitsByOwner = new Map<AnalyticsV2OwnerDigest, readonly CommunityAllowanceFit[]>();
-  const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: V1ModelCompositionResult }>>(
+  const compositionsByDate = new Map<AnalyticsV2Day, Array<{ ownerDigest: string; result: AnalyticsV2ModelCompositionResult }>>(
     modelDates.map((day) => [day, []]));
   /**
    * model date -> effective owners whose evaluation the kernels refused, in

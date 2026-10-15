@@ -19,10 +19,11 @@
 // the checked-in production limits, S5 shipped-client flows, S6 upstream
 // failures, S7 privacy on every exchange, S8 the Sparkle guard, S9 the golden
 // community/daily read and the live check's write tier on the golden-seeded
-// schema (EDGE_E2E_GOLDEN), S10 detector controls. S9 holds the golden's
-// withheld model dates to the oracle's per-date expectation (OD-12, decision
-// D7): EDGE_E2E_PER_DATE_EXPECTED, or for the committed Q-1 golden the one
-// `npm run gcp:fastpath:rehearsal` uses.
+// schema (EDGE_E2E_GOLDEN), S10 detector controls. The canonical Q-1 root needs
+// an explicit versioned mode: current-worker-d1 keeps the existing strict v2
+// gate, while current-worker-d1-d7 runs the current-source two-case v3 gate.
+// Neither current mode is inferred from the golden path. Historical goldens
+// retain their historical oracle and per-date qualification (OD-12).
 //
 // Local only: nothing is deployed, nothing reaches Cloudflare or Google, and
 // every key, token, account, address and row is synthetic and content-free.
@@ -39,12 +40,12 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, webcrypto } from "node:crypto";
-import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync } from "node:fs";
+import { chmod, lstat, mkdtemp, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Miniflare } from "miniflare";
 import pg from "pg";
@@ -58,11 +59,29 @@ import {
   telemetryV12RequiredConsent,
 } from "@app-usagemonitor/telemetry-contract";
 import {
+  compareAnalyticsV2CurrentContract,
   compareAnalyticsV2Parity,
   perDateExpectationFor,
   withheldModelDatesOf,
 } from "../scripts/analytics-v2-parity-compare.mjs";
-import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import { compareCurrentQ1D7CaseDTOs, compareCurrentQ1D7Contract } from "../scripts/analytics-v2-current-d7-compare.mjs";
+import { assessCurrentQ1D7Qualification, currentQ1D7JsonSha256, currentQ1D7PublicDays,
+  CURRENT_Q1_D7_BOUNDS,
+  validateCurrentQ1D7Binding, validateCurrentQ1D7CaseReference, validateCurrentQ1D7InputBinding,
+  validateCurrentQ1D7PerDateExpectation, validateCurrentQ1D7PgCaseInput,
+  validateCurrentQ1D7ProducerAcceptance, validateCurrentQ1D7StrictExportProof } from "./fixtures/current-q1-d7-contract.mjs";
+import { assertS9ChildCompleted, captureS9ChildCompletion, observeS9ChildProgress, ownedKeptRehearsalSchemas, readS9ChildReport, s9ControllerGoldenArguments, withS9OwnedSchemaCleanup, validateS9ProgressJournal, S9_DIAGNOSTIC_BYTES, S9_REHEARSAL_DEADLINE_MS }
+  from "../scripts/s9-rehearsal-diagnostics.mjs";
+import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
+import {
+  assertCurrentImageRuntime,
+  verifyCurrentImageRuntimePath,
+} from "../scripts/gcp-fastpath-rehearsal.mjs";
+import {
+  assertCurrentQ1TrustedRuntime,
+  assessCurrentQ1ReferenceCompleteness,
+  validateCurrentQ1ReferenceBinding,
+} from "./fixtures/current-q1-d1-reference.mjs";
 import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bundle.mjs";
 import {
   EDGE_E2E_ADMIN_ORIGIN,
@@ -2266,80 +2285,1123 @@ test("S4 ingress: a pair with 100/60 ingress limits shows the client, coarse, pr
 
 const execFileAsync = promisify(execFile);
 
-/**
- * The oracle's per-date expectation for the S9 golden (OD-12): the file
- * EDGE_E2E_PER_DATE_EXPECTED names, else for the committed Q-1 golden the
- * expectation `npm run gcp:fastpath:rehearsal` passes, else none (the withheld
- * dates' publications then stay unverified, as in the rehearsal without one).
- */
-const PER_DATE_EXPECTED = process.env.EDGE_E2E_PER_DATE_EXPECTED
-  ? resolve(process.env.EDGE_E2E_PER_DATE_EXPECTED)
-  : GOLDEN === join(WORKER_ROOT, "analytics-v2-test", "golden")
-    ? join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node", "per-date-expected.json")
-    : null;
-
 function familyTable(report) {
   return Object.fromEntries(report.families.map((entry) => [entry.family,
     { expected: entry.expected, compared: entry.compared, equal: entry.equal, diffCount: entry.diffCount }]));
 }
 
+const CURRENT_GOLDEN = join(WORKER_ROOT, "analytics-v2-test", "golden");
+const S9_MODE_BY_NPM_SCRIPT = Object.freeze({
+  "edge:e2e:current-worker-d1": "current-worker-d1",
+  "edge:e2e:current-worker-d1-d7": "current-worker-d1-d7",
+});
+const S9_COMPARISON_MODES = Object.freeze(["historical", "current-worker-d1", "current-worker-d1-d7"]);
+export function resolveS9ComparisonMode({ requested, lifecycleEvent, golden, currentGolden = CURRENT_GOLDEN }) {
+  const lifecycleMode = S9_MODE_BY_NPM_SCRIPT[lifecycleEvent] ?? null;
+  assert.ok(requested === undefined || S9_COMPARISON_MODES.includes(requested),
+    "EDGE_E2E_S9_COMPARISON_MODE must name one supported, versioned S9 contract");
+  if (requested !== undefined && lifecycleMode !== null) {
+    assert.equal(requested, lifecycleMode, "the explicit environment mode agrees with the named local gate");
+  }
+  const mode = requested ?? lifecycleMode ?? "historical";
+  if (mode === "historical") {
+    assert.notEqual(golden, currentGolden,
+      "the canonical Q-1 corpus requires explicit current-worker-d1 or current-worker-d1-d7 mode");
+  } else assert.equal(golden, currentGolden,
+    "current Worker modes require the canonical current Q-1 corpus root");
+  return mode;
+}
+const S9_COMPARISON_MODE = resolveS9ComparisonMode({ requested: process.env.EDGE_E2E_S9_COMPARISON_MODE,
+  lifecycleEvent: process.env.npm_lifecycle_event, golden: GOLDEN });
+const CURRENT_Q1 = S9_COMPARISON_MODE === "current-worker-d1";
+const CURRENT_D7 = S9_COMPARISON_MODE === "current-worker-d1-d7";
+function assertCurrentS9PostgresAvailable({ mode, socket }) {
+  if (mode !== "historical") assert.ok(typeof socket === "string" && socket.length > 0,
+    `${mode} cannot be skipped because its PostgreSQL socket profile is required`);
+}
+assertCurrentS9PostgresAvailable({ mode: S9_COMPARISON_MODE, socket: PG_TEST_SOCKET });
 /**
- * The Q-2 rehearsal on this commit, with --keep-schema: it seeds a rehearsal
- * schema from the golden (importers, then dist/analytics-refresh.mjs under
- * Node 22 at the golden's clock), reads community/daily from the plain
- * fast-path origin and reports its parity table. Its importers need a newer
- * node:sqlite than the image runtime has, so the rehearsal runs under
- * EDGE_E2E_REHEARSAL_NODE (default: `node` on PATH) and keeps this process's
- * Node 22 for its refresh and origin, as it does when run by hand.
+ * Historical/current-v2 only. D7 v3 derives its per-date expectation from the
+ * current-source two-case producer and must never inherit a saved golden file.
  */
-async function seededRehearsal() {
-  const node = process.env.EDGE_E2E_REHEARSAL_NODE || "node";
-  // The report goes to a file: the rehearsal exits right after writing it,
-  // which can cut a piped stdout short on macOS.
-  const directory = await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-"));
-  const out = join(directory, "report.json");
-  // A line whose code needs a staged (not yet promoted) primary migration
-  // rehearses with it applied, as its specs do (K-STAMP's kernel stamps).
-  const staged = (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
-    .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
+const PER_DATE_EXPECTED = CURRENT_D7 ? null : process.env.EDGE_E2E_PER_DATE_EXPECTED
+  ? resolve(process.env.EDGE_E2E_PER_DATE_EXPECTED)
+  : GOLDEN === CURRENT_GOLDEN
+    ? join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node", "per-date-expected.json")
+    : null;
+const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
+const CURRENT_HELPER_PATH = "apps/worker/postgres-test/fixtures/current-q1-d1-reference.mjs";
+const CURRENT_D7_HELPER_PATH = "apps/worker/postgres-test/fixtures/current-q1-d7-reference.mjs";
+const CURRENT_D7_REQUIRED_SOURCE_PATHS = Object.freeze(["apps/worker/postgres-test/fixtures/current-q1-d1-reference.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d1-recompute.mjs", CURRENT_D7_HELPER_PATH,
+  "apps/worker/postgres-test/fixtures/current-q1-d7-recompute.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-contract.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-native.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-native.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic-guardian.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic-child.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-diagnostic.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-producer-component.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-expectation.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-expectation.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-case-output.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-case-output.check.mjs",
+  "apps/worker/scripts/gcp-fastpath-current-corpus.mjs", "apps/worker/scripts/gcp-fastpath-current-corpus.check.mjs",
+  "apps/worker/scripts/current-q1-conflict-proof.mjs", "apps/worker/scripts/current-q1-conflict-proof.check.mjs",
+  "apps/worker/scripts/analytics-v2-current-d7-compare.mjs", "apps/worker/scripts/analytics-v2-current-d7-compare.check.mjs",
+  "apps/worker/scripts/postgres-ingestion-journal-transfer.mjs",
+  "apps/worker/scripts/postgres-ingestion-journal-transfer.check.mjs",
+  "apps/worker/scripts/gcp-fastpath-rehearsal.mjs", "apps/worker/scripts/gcp-fastpath-rehearsal.check.mjs",
+  "apps/worker/scripts/s9-rehearsal-diagnostics.mjs",
+  "apps/worker/postgres-test/edge-origin-e2e.spec.mjs",
+  "apps/worker/scripts/current-q1-d7-contract.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-expectation.check.mjs",
+  "apps/worker/postgres-test/fixtures/current-q1-d7-reference.check.mjs"]);
+const REHEARSAL_CONTROLLER_PATH = "apps/worker/scripts/gcp-fastpath-rehearsal.mjs";
+const CURRENT_MIGRATION_ORDER = Object.freeze(["migrations", "typed-ingestion-migrations",
+  "ingestion-bridge-migrations", "typed-v11-admission-migrations", "analytics-migrations",
+  "deletion-ledger-migrations", "typed-v1-admission-migrations", "ingestion-isolation-migrations"]);
+const CURRENT_GATES = Object.freeze(["importersCompleted", "refreshFirstComplete", "readStatus200",
+  "secondRunZeroNewRevisions", "currentWorkerD1ProducerAccepted", "currentWorkerD1ReferenceComplete",
+  "currentWorkerD1Equality", "currentCandidateInputsUnchanged", "immutableCorpusDailyConserved"]);
+test("S9 requires explicit current modes for the canonical corpus and never infers D7 from its path", () => {
+  assert.equal(resolveS9ComparisonMode({ requested: undefined, lifecycleEvent: "edge:e2e:current-worker-d1-d7",
+    golden: CURRENT_GOLDEN }), "current-worker-d1-d7");
+  assert.equal(resolveS9ComparisonMode({ requested: "current-worker-d1-d7", lifecycleEvent: undefined,
+    golden: CURRENT_GOLDEN }), "current-worker-d1-d7");
+  assert.equal(resolveS9ComparisonMode({ requested: undefined, lifecycleEvent: undefined,
+    golden: "/synthetic/historical-golden" }), "historical");
+  assert.throws(() => resolveS9ComparisonMode({ requested: undefined, lifecycleEvent: undefined,
+    golden: CURRENT_GOLDEN }), /canonical Q-1 corpus requires explicit/u);
+  assert.throws(() => resolveS9ComparisonMode({ requested: "current-worker-d1-d7", lifecycleEvent: undefined,
+    golden: null }), /current Q-1 corpus root/u);
+  assert.throws(() => resolveS9ComparisonMode({ requested: "historical", lifecycleEvent: undefined,
+    golden: CURRENT_GOLDEN }), /canonical Q-1 corpus requires explicit/u);
+  assert.throws(() => resolveS9ComparisonMode({ requested: "current-worker-d1-d7", lifecycleEvent: undefined,
+    golden: "/synthetic/other-golden" }), /current Worker modes require the canonical current Q-1 corpus root/u);
+  assert.throws(() => resolveS9ComparisonMode({ requested: "current-worker-d1", lifecycleEvent: "edge:e2e:current-worker-d1-d7",
+    golden: CURRENT_GOLDEN }), /agrees with the named local gate/u);
+  assert.throws(() => resolveS9ComparisonMode({ requested: "current-worker-d1-d8", lifecycleEvent: undefined,
+    golden: CURRENT_GOLDEN }), /supported, versioned S9 contract/u);
+  for (const mode of ["current-worker-d1", "current-worker-d1-d7"]) {
+    assert.throws(() => assertCurrentS9PostgresAvailable({ mode, socket: undefined }), /cannot be skipped/u);
+  }
+  assert.doesNotThrow(() => assertCurrentS9PostgresAvailable({ mode: "historical", socket: undefined }));
+});
+const SHA256 = /^[a-f0-9]{64}$/u;
+const jsonSha256 = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const CURRENT_D7_CASE_IDS = Object.freeze(["conflictPreserving", "conflictFreePositive"]);
+const CURRENT_D7_CHILD_DEADLINE_MS = 40 * 60 * 1_000;
+const CURRENT_D7_QUALIFICATION_KEYS = Object.freeze(["schemaVersion", "comparisonMode", "decisionId", "caseIds",
+  "inputBindingSha256", "inputBindingCaptureContentSha256", "bindingSha256", "referenceContentSha256", "producerAcceptanceContentSha256",
+  "contractContentSha256", "caseReceipts", "sidecars", "cleanupPending", "qualifying",
+  "establishesNativeExecution", "deadlineMs", "elapsedMs", "pgInputSnapshotsRemoved"]);
+const CURRENT_D7_SIDECAR_HASH_KEYS = Object.freeze(["inputBindingCaptureSha256", "referenceSha256", "bindingSha256", "producerAcceptanceSha256",
+  "conflictPreservingCaseSha256", "conflictFreePositiveCaseSha256", "contractSha256"]);
+const CURRENT_D7_CASE_RECEIPT_KEYS = Object.freeze(["caseId", "schemaVersion", "referenceSha256", "expectationSha256",
+  "corpusSha256", "admissionSha256", "sourceInvariantSha256", "pgInputSha256", "actualResponseSha256",
+  "bootstrapPreservationSha256", "strictExportSha256", "actualPreviewSha256", "schema", "controlSchema", "currentDay",
+  "retainedForS9Cleanup"]);
+const CURRENT_D7_CASE_OUTPUT_KEYS = Object.freeze(["schemaVersion", "caseId", "reference", "expectation", "actualResponse",
+  "actualPreview", "currentDay", "controllerReceipt"]);
+const CURRENT_D7_REFERENCE_HANDOFF_KEYS = Object.freeze(["schemaVersion", "inputBinding", "reference", "binding",
+  "acceptance", "cases", "expectations", "expectationSha256", "pgInputs"]);
+const CURRENT_D7_INPUT_BINDING_CAPTURE_KEYS = Object.freeze(["schemaVersion", "capturedBeforeProducer", "captureOrdinal",
+  "inputBindingSha256", "inputBinding"]);
+const CURRENT_D7_SIDECARS = Object.freeze({
+  inputBindingCaptureSha256: "current-d7-input-binding-capture",
+  referenceSha256: "current-d7-reference",
+  bindingSha256: "current-d7-binding",
+  producerAcceptanceSha256: "current-d7-producer-acceptance",
+  conflictPreservingCaseSha256: "current-d7-conflict-preserving-case",
+  conflictFreePositiveCaseSha256: "current-d7-conflict-free-positive-case",
+  contractSha256: "current-d7-contract",
+});
+
+function exactObjectKeys(value, keys, message) {
+  assert.ok(value !== null && typeof value === "object" && !Array.isArray(value), message);
+  assert.deepEqual(Object.keys(value).sort(), [...keys].sort(), message);
+}
+
+function validateCurrentD7InputBindingCapture(value) {
+  exactObjectKeys(value, CURRENT_D7_INPUT_BINDING_CAPTURE_KEYS,
+    "the pre-producer input binding capture has a closed schema");
+  assert.equal(value.schemaVersion, "current-q1-d7-input-binding-capture-v1");
+  assert.equal(value.capturedBeforeProducer, true,
+    "the initial source/runtime binding was captured before producer invocation");
+  assert.equal(value.captureOrdinal, 1, "the initial binding is the only accepted pre-producer capture");
+  assert.match(value.inputBindingSha256, SHA256);
+  assert.equal(value.inputBindingSha256, currentQ1D7JsonSha256(value.inputBinding),
+    "the capture receipt binds the exact initial input binding");
+  return value;
+}
+
+function validateCurrentD7QueryBudget(binding) {
+  assert.equal(CURRENT_Q1_D7_BOUNDS.nativeQueries, 900,
+    "the retained native query allowance remains 900 per graph-result invocation");
+  assert.equal(CURRENT_Q1_D7_BOUNDS.nativeQueryBudgetScope,
+    "per_compute_storage_graph_result_invocation_source_plus_target",
+    "the 900-query unit includes source and target for one graph-result invocation");
+  assert.equal(binding?.bounds?.nativeQueries, 900,
+    "the independently bound D7 input keeps the original 900-query allowance");
+  assert.equal(binding?.bounds?.nativeQueryBudgetScope,
+    "per_compute_storage_graph_result_invocation_source_plus_target",
+    "a case-wide or two-case aggregate budget cannot substitute for the invocation limit");
+}
+
+function validateCurrentD7SidecarNames(names, out) {
+  assert.ok(Array.isArray(names) && names.every((name) => typeof name === "string"),
+    "the private D7 output inventory is readable");
+  const prefix = `${basename(out)}.`;
+  const actual = names.filter((name) => name.startsWith(`${prefix}current-d7-`)).sort();
+  const expected = Object.values(CURRENT_D7_SIDECARS).map((suffix) => `${prefix}${suffix}.json`).sort();
+  assert.deepEqual(actual, expected, "the controller emits exactly the seven closed D7 sidecars");
+  return expected;
+}
+
+function currentD7SchemaPairsForCleanup(report) {
+  const receipts = report?.currentD7Qualification?.caseReceipts;
+  const declaredPairs = report?.keptSchemaPairs;
+  return CURRENT_D7_CASE_IDS.flatMap((caseId) => {
+    const receiptSchema = receipts?.[caseId]?.schema;
+    const topMatches = Array.isArray(declaredPairs)
+      ? declaredPairs.filter((entry) => entry?.caseId === caseId) : [];
+    const schema = typeof receiptSchema === "string" && /^typed_legacy_transfer_rehearsal_target_fastpath_[0-9a-f]{8}$/u.test(receiptSchema)
+      ? receiptSchema : topMatches.length === 1 ? topMatches[0].schema : null;
+    const match = typeof schema === "string"
+      ? /^typed_legacy_transfer_rehearsal_target_fastpath_([0-9a-f]{8})$/u.exec(schema) : null;
+    return match ? [{ caseId, schema, controlSchema: `typed_legacy_transfer_rehearsal_ctl_${match[1]}` }] : [];
+  });
+}
+
+/** Validate the exact two-case handoff while allowing finally to clean any
+ * individually named generated pair if another receipt field is malformed. */
+function validateCurrentD7SchemaHandoff(report, cleanupCandidates = currentD7SchemaPairsForCleanup(report)) {
+  assert.equal(report?.reusedSchema, false, "current D7 S9 owns only fresh rehearsal schemas");
+  const qualification = report?.currentD7Qualification;
+  validateCurrentD7QualificationReport(qualification);
+  exactObjectKeys(qualification?.caseReceipts, CURRENT_D7_CASE_IDS, "both current D7 case receipts are required");
+  assert.deepEqual(qualification.caseIds, CURRENT_D7_CASE_IDS, "the logical case order is fixed");
+  assert.equal(report.keptSchemaPairs?.length, 2, "the controller returns exactly two named schema pairs");
+  assert.deepEqual(report.keptSchemaPairs, cleanupCandidates.map(({ caseId, schema, controlSchema }) =>
+    ({ caseId, schema, controlSchema })), "the top-level pair projection matches the two receipts");
+  const pairs = CURRENT_D7_CASE_IDS.map((caseId) => {
+    const receipt = qualification.caseReceipts[caseId];
+    exactObjectKeys(receipt, CURRENT_D7_CASE_RECEIPT_KEYS, `${caseId} receipt has a closed schema`);
+    assert.equal(receipt.caseId, caseId);
+    assert.equal(receipt.schemaVersion, "current-q1-d7-controller-case-receipt-v1");
+    for (const key of ["referenceSha256", "expectationSha256", "corpusSha256", "admissionSha256", "sourceInvariantSha256",
+      "pgInputSha256", "bootstrapPreservationSha256", "strictExportSha256", "actualResponseSha256", "actualPreviewSha256"])
+      assert.match(receipt[key], SHA256, key);
+    assert.match(receipt.currentDay, /^\d{4}-\d{2}-\d{2}$/u);
+    assert.equal(receipt.retainedForS9Cleanup, true);
+    const candidate = cleanupCandidates.find((entry) => entry.caseId === caseId);
+    assert.ok(candidate, `${caseId} has a safely named generated target for cleanup`);
+    assert.equal(receipt.controlSchema, candidate.controlSchema);
+    const validated = ownedKeptRehearsalSchemas({ reusedSchema: false, schema: receipt.schema,
+      keptSchemas: [receipt.schema, receipt.controlSchema] });
+    assert.deepEqual(validated, [receipt.schema, receipt.controlSchema]);
+    return candidate;
+  });
+  const names = pairs.flatMap(({ schema, controlSchema }) => [schema, controlSchema]);
+  assert.equal(new Set(names).size, 4, "the two target/control pairs are disjoint");
+  assert.deepEqual(report.keptSchemas, names, "the controller exposes exactly the four owned schema names");
+  return pairs;
+}
+
+const CURRENT_D7_CONTROLLER_ERROR_CODES = new Set([
+  "REHEARSAL_ARGUMENT_INVALID",
+  "REHEARSAL_CURRENT_CANDIDATE_INPUTS_CHANGED",
+  "REHEARSAL_CURRENT_CORPUS_MISMATCH",
+  "REHEARSAL_CURRENT_D7_CASE_INCOMPLETE",
+  "REHEARSAL_CURRENT_D7_CASE_SET_INVALID",
+  "REHEARSAL_CURRENT_D7_COMPARATOR_UNAVAILABLE",
+  "REHEARSAL_CURRENT_D7_CONTRACT_NOT_ACCEPTED",
+  "REHEARSAL_CURRENT_D7_CONTROLLER_PIN_INVALID",
+  "REHEARSAL_CURRENT_D7_DEADLINE_EXHAUSTED",
+  "REHEARSAL_CURRENT_D7_DEADLINE_INVALID",
+  "REHEARSAL_CURRENT_D7_EVIDENCE_INCOMPLETE",
+  "REHEARSAL_CURRENT_D7_EVIDENCE_INVALID",
+  "REHEARSAL_CURRENT_D7_EXPECTATION_INVALID",
+  "REHEARSAL_CURRENT_D7_FAILED",
+  "REHEARSAL_CURRENT_D7_GOLDEN_INVALID",
+  "REHEARSAL_CURRENT_D7_INPUT_BINDING_CAPTURE_CHANGED",
+  "REHEARSAL_CURRENT_D7_INPUT_BINDING_INVALID",
+  "REHEARSAL_CURRENT_D7_INPUT_CHANGED",
+  "REHEARSAL_CURRENT_D7_INPUT_CLEANUP_FAILED",
+  "REHEARSAL_CURRENT_D7_INPUT_INVALID",
+  "REHEARSAL_CURRENT_D7_OUTPUT_INVALID",
+  "REHEARSAL_CURRENT_D7_PG_ADAPTER_INVALID",
+  "REHEARSAL_CURRENT_D7_PRODUCER_UNAVAILABLE",
+  "REHEARSAL_CURRENT_D7_REFERENCE_INVALID",
+  "REHEARSAL_CURRENT_D7_SCHEMA_CLEANUP_FAILED",
+  "REHEARSAL_CURRENT_D7_SCHEMA_OWNERSHIP_INVALID",
+  "REHEARSAL_CURRENT_IMAGE_RUNTIME_INVALID",
+  "REHEARSAL_CURRENT_MIGRATION_BINDING_CHANGED",
+  "REHEARSAL_CURRENT_OUTPUT_EXISTS",
+  "REHEARSAL_CURRENT_OUTPUT_UNAVAILABLE",
+  "REHEARSAL_CURRENT_REFERENCE_INCOMPLETE",
+  "REHEARSAL_CURRENT_REFERENCE_RUNTIME_INVALID",
+  "REHEARSAL_DATABASE_INVALID",
+  "REHEARSAL_DATABASE_UNCONFIGURED",
+  "REHEARSAL_DIST_MISSING",
+  "REHEARSAL_DUMP_AMBIGUOUS",
+  "REHEARSAL_DUMP_DIGEST_MISMATCH",
+  "REHEARSAL_DUMP_MISSING",
+  "REHEARSAL_DUMP_UNPINNED",
+  "REHEARSAL_GOLDEN_CLOCK_INVALID",
+  "REHEARSAL_GOLDEN_REQUIRED",
+  "REHEARSAL_IDENTIFIER_INVALID",
+  "REHEARSAL_JOURNAL_DDL_MISSING",
+  "REHEARSAL_JOURNAL_INPUT_AMBIGUOUS",
+  "REHEARSAL_JOURNAL_SOURCE_MISMATCH",
+  "REHEARSAL_JOURNAL_TABLE_MISSING",
+  "REHEARSAL_MIGRATION_INCOMPLETE",
+  "REHEARSAL_NODE22_MISSING",
+  "REHEARSAL_NODE_UNSUPPORTED",
+  "REHEARSAL_ORIGIN_CHILD_CLEANUP_FAILED",
+  "REHEARSAL_ORIGIN_CONFIG_INVALID",
+  "REHEARSAL_ORIGIN_START_FAILED",
+  "REHEARSAL_ORIGIN_START_TIMEOUT",
+  "REHEARSAL_PER_DATE_INVALID",
+  "REHEARSAL_POSTGRES_17_REQUIRED",
+  "REHEARSAL_READ_FAILED",
+  "REHEARSAL_REFRESH_FAILED",
+  "REHEARSAL_REFRESH_INCOMPLETE",
+  "REHEARSAL_REUSE_SCHEMA_MISSING",
+  "REHEARSAL_SQLITE_NOT_SEALED",
+  "REHEARSAL_SUFFIX_INVALID",
+  "REHEARSAL_TARGET_SCHEMA_INVALID",
+]);
+const CURRENT_D7_CONTROLLER_PHASES = new Set(["input_binding", "current_d1_replay", "current_d1_acceptance", "postgres",
+  "migrate", "sqlite", "importers", "refresh_first", "origin", "parity", "refresh_second", "source_recheck", "cleanup", "report"]);
+const CURRENT_D7_CHILD_SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV", "SIGBUS"]);
+const CURRENT_D7_CHILD_CODES = new Set(["ENOENT", "EACCES", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "other"]);
+
+/** Project only closed, source-verified controller and child facts into TAP diagnostics. */
+function currentD7FailureDiagnostic(report, childCompletion, lastValidatedControllerPhase) {
+  const isCurrentD7Error = report?.schemaVersion === "gcp-fastpath-current-d7-rehearsal-report-v1"
+    && report?.comparisonMode === "current-worker-d1-d7" && report?.decisionId === "D7"
+    && report?.status === "error" && report?.qualifying === false && report?.establishesNativeExecution === false;
+  const errorValue = report?.error;
+  const errorKeys = errorValue !== null && typeof errorValue === "object" && !Array.isArray(errorValue)
+    ? Object.keys(errorValue) : [];
+  const rawControllerCode = isCurrentD7Error && errorKeys.length === 1 && errorKeys[0] === "code"
+    ? errorValue.code : null;
+  const controllerErrorCode = rawControllerCode === null ? "unavailable"
+    : CURRENT_D7_CONTROLLER_ERROR_CODES.has(rawControllerCode) ? rawControllerCode : "unrecognized";
+  const childState = childCompletion?.state === "failed" || childCompletion?.state === "completed"
+    ? childCompletion.state : "unknown";
+  return {
+    schemaVersion: "current-q1-d7-s9-failure-diagnostic-v1",
+    controllerStatus: isCurrentD7Error ? "error" : "unavailable",
+    controllerErrorCode,
+    childState,
+    childExitCode: Number.isSafeInteger(childCompletion?.exitCode) && childCompletion.exitCode >= 0
+      && childCompletion.exitCode <= 255 ? childCompletion.exitCode : null,
+    childSignal: CURRENT_D7_CHILD_SIGNALS.has(childCompletion?.signal) ? childCompletion.signal : null,
+    childKilled: typeof childCompletion?.killed === "boolean" ? childCompletion.killed : null,
+    childCode: CURRENT_D7_CHILD_CODES.has(childCompletion?.childCode) ? childCompletion.childCode : "unrecognized",
+    deadlineMs: childCompletion?.deadlineMs === S9_REHEARSAL_DEADLINE_MS ? S9_REHEARSAL_DEADLINE_MS : null,
+    deadlineElapsed: typeof childCompletion?.deadlineElapsed === "boolean" ? childCompletion.deadlineElapsed : null,
+    lastValidatedControllerPhase: CURRENT_D7_CONTROLLER_PHASES.has(lastValidatedControllerPhase)
+      ? lastValidatedControllerPhase : null,
+  };
+}
+
+async function withCurrentD7OwnedSchemaCleanup(report, childCompletion, work, cleanup) {
+  const candidates = currentD7SchemaPairsForCleanup(report);
+  const verifiedCandidates = candidates.filter(({ caseId, schema, controlSchema }) => {
+    try {
+      const verified = ownedKeptRehearsalSchemas({ reusedSchema: false, schema,
+        keptSchemas: [schema, controlSchema] });
+      return verified[0] === schema && verified[1] === controlSchema && CURRENT_D7_CASE_IDS.includes(caseId);
+    } catch { return false; }
+  });
+  const names = [...new Set(verifiedCandidates.flatMap(({ schema, controlSchema }) => [schema, controlSchema]))];
   try {
-    await execFileAsync(node,
-      [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
-        ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
-        ...staged.flatMap((name) => ["--staged-primary", name])], {
-        cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
-        env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
-          PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,
-          ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
-          ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
-      }).catch(() => undefined);
-    return JSON.parse(await readFile(out, "utf8"));
+    // A failed controller has no success-only qualification handoff; surface its
+    // closed child outcome first, while finally still owns exact-pair cleanup.
+    assertS9ChildCompleted(childCompletion);
+    const pairs = validateCurrentD7SchemaHandoff(report, candidates);
+    return await work(pairs, names);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await cleanup(names);
   }
 }
 
-test("S9 golden: the community/daily read is byte-equal through the edge and reproduces the rehearsal's parity table; "
-  + "the live check's write tier completes on the seeded schema at the deploy's origin settings", {
+function validateCurrentD7QualificationReport(value) {
+  exactObjectKeys(value, CURRENT_D7_QUALIFICATION_KEYS, "current D7 qualification has a closed handoff schema");
+  assert.equal(value.schemaVersion, "current-q1-d7-controller-qualification-v1");
+  assert.equal(value.comparisonMode, "current-worker-d1-d7");
+  assert.equal(value.decisionId, "D7");
+  assert.deepEqual(value.caseIds, CURRENT_D7_CASE_IDS);
+  for (const key of ["inputBindingSha256", "bindingSha256", "referenceContentSha256",
+    "inputBindingCaptureContentSha256", "producerAcceptanceContentSha256", "contractContentSha256"])
+    assert.match(value[key], SHA256, key);
+  assert.equal(value.pgInputSnapshotsRemoved, true, "the controller removed its sealed input snapshots");
+  exactObjectKeys(value.sidecars, CURRENT_D7_SIDECAR_HASH_KEYS, "all seven D7 sidecars are bound");
+  for (const digest of Object.values(value.sidecars)) assert.match(digest, SHA256);
+  assert.equal(value.cleanupPending, true, "the child handoff stays pending until S9 cleans both pairs");
+  assert.equal(value.qualifying, false, "the child handoff is not a qualification pass");
+  assert.equal(value.establishesNativeExecution, false, "saved sidecars do not attest native execution");
+  assert.equal(value.deadlineMs, CURRENT_D7_CHILD_DEADLINE_MS, "both cases share the original child deadline");
+  assert.ok(Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0 && value.elapsedMs < value.deadlineMs);
+}
+
+async function readCurrentD7PrivateSidecar(out, suffix) {
+  const parentPath = dirname(out);
+  const parent = await lstat(parentPath);
+  assert.ok(parent.isDirectory() && !parent.isSymbolicLink() && parent.uid === process.getuid()
+    && (parent.mode & 0o777) === 0o700 && await realpath(parentPath) === parentPath,
+  "the D7 handoff directory remains owner-only and is not a symlink");
+  const path = `${out}.${suffix}.json`;
+  const info = await lstat(path);
+  assert.ok(info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && info.uid === process.getuid()
+    && (info.mode & 0o777) === 0o600 && info.size <= 64 * 1024 * 1024,
+  "current D7 sidecars remain bounded owner-private regular files");
+  const bytes = await readFile(path);
+  return { value: JSON.parse(bytes.toString("utf8")), sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+async function assertCurrentD7PgSnapshotsRemoved(pgInputs, out) {
+  const privateRoot = await realpath(dirname(out));
+  for (const caseId of CURRENT_D7_CASE_IDS) {
+    for (const role of ["ingestion", "journal"]) {
+      const path = pgInputs[caseId][role].path;
+      const child = relative(privateRoot, path);
+      assert.ok(child !== "" && child !== ".." && !child.startsWith(`..${sep}`)
+        && !isAbsolute(child), "sealed PostgreSQL snapshots stay within this run's private scratch root");
+      try {
+        await lstat(path);
+        assert.fail("the controller must remove each sealed PostgreSQL snapshot before edge assertions");
+      } catch (error) {
+        assert.equal(error?.code, "ENOENT", "snapshot absence, not an inaccessible or malformed path, is required");
+      }
+    }
+  }
+}
+
+async function readCurrentD7Evidence({ out, report, runtime, imageRuntime }) {
+  assert.equal(S9_REHEARSAL_DEADLINE_MS, CURRENT_D7_CHILD_DEADLINE_MS,
+    "the D7 consumer preserves the original single-child 40-minute deadline");
+  validateCurrentD7QualificationReport(report?.currentD7Qualification);
+  assert.equal(report.schemaVersion, "gcp-fastpath-current-d7-rehearsal-report-v1");
+  assert.equal(report.comparisonMode, "current-worker-d1-d7");
+  assert.equal(report.status, "cleanup_pending", "the controller sidecar remains pending until edge cleanup");
+  assert.equal(report.reusedSchema, false);
+  assert.equal(Object.hasOwn(report, "currentPostgresInputs"), false,
+    "owner-only PostgreSQL paths stay out of the public controller report");
+  const qualification = report.currentD7Qualification;
+  validateCurrentD7SidecarNames(await readdir(dirname(out)), out);
+  const loaded = Object.create(null);
+  const rawSidecarSha256 = Object.create(null);
+  for (const [hashKey, suffix] of Object.entries(CURRENT_D7_SIDECARS)) {
+    const sidecar = await readCurrentD7PrivateSidecar(out, suffix);
+    assert.equal(sidecar.sha256, qualification.sidecars[hashKey], `${suffix} is bound by raw file bytes`);
+    rawSidecarSha256[hashKey] = sidecar.sha256;
+    loaded[hashKey] = sidecar.value;
+  }
+  const handoff = loaded.referenceSha256;
+  exactObjectKeys(handoff, CURRENT_D7_REFERENCE_HANDOFF_KEYS, "the owner-only reference handoff has a closed schema");
+  assert.equal(handoff.schemaVersion, "current-q1-d7-controller-reference-v1");
+  exactObjectKeys(handoff.cases, CURRENT_D7_CASE_IDS, "the reference handoff contains exactly both logical cases");
+  exactObjectKeys(handoff.expectations, CURRENT_D7_CASE_IDS, "the reference handoff contains both expectations");
+  exactObjectKeys(handoff.expectationSha256, CURRENT_D7_CASE_IDS, "both expectations have bound digests");
+  exactObjectKeys(handoff.pgInputs, CURRENT_D7_CASE_IDS, "both PostgreSQL inputs are present");
+
+  const binding = loaded.bindingSha256;
+  const acceptance = loaded.producerAcceptanceSha256;
+  const contract = loaded.contractSha256;
+  assert.equal(qualification.inputBindingSha256, currentQ1D7JsonSha256(handoff.inputBinding));
+  const inputBindingCapture = validateCurrentD7InputBindingCapture(loaded.inputBindingCaptureSha256);
+  assert.deepEqual(inputBindingCapture.inputBinding, handoff.inputBinding,
+    "the post-producer handoff matches the independently preserved pre-producer capture");
+  assert.equal(qualification.inputBindingSha256, inputBindingCapture.inputBindingSha256);
+  assert.equal(qualification.bindingSha256, currentQ1D7JsonSha256(binding));
+  // Binding fields use semantic canonical-JSON hashes. These three *Content*
+  // fields intentionally alias exact sidecar-byte hashes, including newlines;
+  // keep that framing distinct from receipt JSON hashes below.
+  assert.equal(qualification.referenceContentSha256, rawSidecarSha256.referenceSha256);
+  assert.equal(qualification.inputBindingCaptureContentSha256, rawSidecarSha256.inputBindingCaptureSha256);
+  assert.equal(qualification.producerAcceptanceContentSha256, rawSidecarSha256.producerAcceptanceSha256);
+  assert.equal(qualification.contractContentSha256, rawSidecarSha256.contractSha256);
+  assert.deepEqual(handoff.binding, binding, "the independently bound handoff and binding sidecar are identical");
+  assert.deepEqual(handoff.acceptance, acceptance, "the handoff and producer-acceptance sidecar are identical");
+  validateCurrentQ1D7InputBinding(inputBindingCapture.inputBinding);
+  validateCurrentQ1D7Binding(binding, inputBindingCapture.inputBinding);
+  validateCurrentD7QueryBudget(binding);
+  assert.equal(binding.source.head, (await execFileAsync("git", ["--no-optional-locks", "-C", REPOSITORY_ROOT,
+    "rev-parse", "HEAD"], { timeout: 10_000, maxBuffer: 1_024,
+    env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } })).stdout.trim(),
+  "D7 source inputs were captured on this candidate head");
+  for (const entry of binding.source.files) await verifyCurrentFilePin(entry);
+  const pinnedPaths = new Set(binding.source.files.map(({ path }) => path));
+  for (const path of CURRENT_D7_REQUIRED_SOURCE_PATHS) assert.ok(pinnedPaths.has(path),
+    "the independently captured source closure pins every current D7 producer and reusable seam");
+  const expectedController = binding.source.files.find((entry) => entry.path === REHEARSAL_CONTROLLER_PATH);
+  assert.ok(expectedController, "the controller is in the source closure");
+  assert.equal(acceptance.controller.path, expectedController.path);
+  assert.equal(acceptance.controller.sha256, expectedController.sha256);
+  assert.deepEqual({ version: runtime.version, platform: runtime.platform, arch: runtime.arch, binarySha256: runtime.binarySha256 },
+    { version: binding.runtime.version, platform: binding.runtime.platform, arch: binding.runtime.arch,
+      binarySha256: binding.runtime.binarySha256 }, "the current reference ran under its exact retained Node runtime");
+  assertCurrentImageRuntime(imageRuntime);
+  assert.deepEqual(await verifyCurrentImageRuntimePath(process.execPath), imageRuntime,
+    "the edge and Cloud Run origin keep the original Node 22 image runtime");
+
+  const expectations = handoff.expectations;
+  const casesById = handoff.cases;
+  const pgInputs = handoff.pgInputs;
+  const references = Object.create(null);
+  for (const caseId of CURRENT_D7_CASE_IDS) {
+    references[caseId] = casesById[caseId];
+    validateCurrentQ1D7PerDateExpectation(expectations[caseId], binding,
+      { expectedSha256: handoff.expectationSha256[caseId] });
+    validateCurrentQ1D7PgCaseInput(pgInputs[caseId], binding, caseId);
+    validateCurrentQ1D7CaseReference(references[caseId], binding, {
+      expectation: expectations[caseId], expectedExpectationSha256: handoff.expectationSha256[caseId],
+    });
+    const strictExport = references[caseId].strictExport;
+    validateCurrentQ1D7StrictExportProof(strictExport, binding, caseId);
+    const negative = caseId === "conflictPreserving";
+    assert.equal(strictExport.actual, true, `${caseId} strict export was executed on the original oracle`);
+    assert.equal(strictExport.queuedRows, negative ? 2 : 0, `${caseId} strict export preserves its exact queue outcome`);
+    assert.deepEqual(strictExport.orderedQueueDays, binding.cases[caseId].conflictDays,
+      `${caseId} queue days match its independently bound source conflicts`);
+    assert.equal(strictExport.state, negative ? "expected_conflict_refusal" : "successful");
+    assert.equal(strictExport.refusalProof !== null, negative,
+      `${caseId} carries only its expected original strict-export refusal proof`);
+    assert.equal(strictExport.successProof !== null, !negative,
+      `${caseId} carries only its expected original successful-export proof`);
+  }
+  await assertCurrentD7PgSnapshotsRemoved(pgInputs, out);
+  const structural = assessCurrentQ1D7Qualification({ binding, cases: references, expectations,
+    expectationSha256: handoff.expectationSha256, pgInputs });
+  assert.deepEqual(structural, { state: "structurally_complete", establishesNativeExecution: false, reasons: [] });
+  validateCurrentQ1D7ProducerAcceptance(acceptance, { inputBinding: handoff.inputBinding, binding, cases: references, expectations,
+    expectationSha256: handoff.expectationSha256, pgInputs, expectedController });
+
+  const caseOutputs = [];
+  for (const [index, caseId] of CURRENT_D7_CASE_IDS.entries()) {
+    const hashKey = index === 0 ? "conflictPreservingCaseSha256" : "conflictFreePositiveCaseSha256";
+    const output = loaded[hashKey];
+    exactObjectKeys(output, CURRENT_D7_CASE_OUTPUT_KEYS, `${caseId} sidecar has a closed output schema`);
+    assert.equal(output.schemaVersion, "current-q1-d7-controller-case-output-v1");
+    assert.equal(output.caseId, caseId);
+    assert.deepEqual(output.reference, references[caseId]);
+    assert.deepEqual(output.expectation, expectations[caseId]);
+    const receipt = qualification.caseReceipts[caseId];
+    assert.deepEqual(output.controllerReceipt, receipt);
+    assert.equal(receipt.referenceSha256, currentQ1D7JsonSha256(references[caseId]));
+    assert.equal(receipt.expectationSha256, handoff.expectationSha256[caseId]);
+    assert.equal(receipt.corpusSha256, binding.cases[caseId].corpusSha256);
+    assert.equal(receipt.admissionSha256, binding.cases[caseId].admissionSha256);
+    assert.equal(receipt.sourceInvariantSha256, binding.cases[caseId].sourceInvariantSha256);
+    assert.equal(receipt.pgInputSha256, currentQ1D7JsonSha256(pgInputs[caseId]));
+    assert.equal(receipt.bootstrapPreservationSha256,
+      currentQ1D7JsonSha256(references[caseId].bootstrapPreservation));
+    assert.equal(receipt.strictExportSha256, currentQ1D7JsonSha256(references[caseId].strictExport));
+    assert.equal(receipt.currentDay, output.currentDay,
+      `${caseId} controller and output sidecars bind the same comparison day`);
+    assert.equal(receipt.actualResponseSha256, currentQ1D7JsonSha256(output.actualResponse));
+    assert.equal(receipt.actualPreviewSha256, currentQ1D7JsonSha256(output.actualPreview));
+    compareCurrentD7Case({ caseId, reference: output.reference, expectation: output.expectation,
+      actualResponse: output.actualResponse, actualPreview: output.actualPreview, currentDay: output.currentDay });
+    caseOutputs.push({ caseId, reference: output.reference, expectation: output.expectation,
+      actualResponse: output.actualResponse, actualPreview: output.actualPreview, currentDay: output.currentDay });
+  }
+
+  const comparison = compareCurrentQ1D7Contract({ binding, cases: caseOutputs, expectations,
+    expectationSha256: handoff.expectationSha256, pgInputs, producerAcceptance: acceptance, expectedController });
+  assert.deepEqual(contract, comparison, "the aggregate contract is independently reproduced from both output sidecars");
+  assert.equal(comparison.accepted, true);
+  assert.deepEqual(comparison.acceptedCaseIds, CURRENT_D7_CASE_IDS);
+  assert.equal(comparison.strictUnaffectedEqual, true);
+  assert.equal(comparison.exactPerDateEqual, true);
+  assert.equal(comparison.positive70DateEqual, true);
+  assert.equal(comparison.unexpectedDiffs, 0, "accepted D7 model deltas are excluded by the contract; no unexpected diff remains");
+  assert.deepEqual(comparison.nonqualifyingScopes, [], "neither case has a nonqualifying comparison scope");
+  assert.equal(comparison.perCase.length, 2);
+  assert.deepEqual(comparison.perCase.map(({ caseId, equal, strictUnaffectedEqual, exactPerDateEqual, diffCount, diffs }) =>
+    ({ caseId, equal, strictUnaffectedEqual, exactPerDateEqual, diffCount, diffs })), CURRENT_D7_CASE_IDS.map((caseId) => ({
+    caseId, equal: true, strictUnaffectedEqual: true, exactPerDateEqual: true, diffCount: 0, diffs: [],
+  })), "both cases have strict equality after only the independently accepted D7 projection");
+  assert.deepEqual(comparison.unresolved, []);
+  const expectedD7DateSet = references.conflictPreserving.publicationInventory
+    .filter(({ state }) => state === "withheld").map(({ day }) => day).sort();
+  assert.ok(expectedD7DateSet.length > 0, "the negative source witness derives at least one current withheld date");
+  assert.deepEqual(comparison.acceptedD7DateSet, expectedD7DateSet,
+    "accepted D7 dates come from the current conflict-preserving proof");
+  assert.deepEqual(references.conflictFreePositive.publicationInventory.map(({ state }) => state),
+    Array(70).fill("published"), "the positive reference publishes all 70 model dates");
+  assert.deepEqual(references.conflictPreserving.currentFits.map(({ owner }) => owner).sort(), ["a", "b", "c", "d"]);
+  assert.deepEqual(references.conflictFreePositive.currentFits.map(({ owner }) => owner).sort(), ["a", "b", "c", "d"]);
+  assert.equal(references.conflictPreserving.strictExport.state, "expected_conflict_refusal");
+  assert.equal(references.conflictFreePositive.strictExport.state, "successful");
+  assert.ok(references.conflictPreserving.conflictProofs.length > 0);
+  assert.deepEqual(references.conflictFreePositive.conflictProofs, []);
+  const currentPublicDays = currentQ1D7PublicDays(binding);
+  assert.equal(currentPublicDays.length, 69, "the current public route includes only closed model days");
+  for (const { caseId, actualResponse } of caseOutputs) {
+    assert.deepEqual(actualResponse.allowanceBreakdowns.days.map(({ day }) => day), currentPublicDays,
+      `${caseId} public response contains the exact closed current days`);
+  }
+  const descriptorPaths = CURRENT_D7_CASE_IDS.flatMap((caseId) => [pgInputs[caseId].ingestion.path, pgInputs[caseId].journal.path]);
+  const publicReport = JSON.stringify(report);
+  assert.ok(descriptorPaths.every((path) => !publicReport.includes(path)),
+    "owner-only sealed input paths never enter the controller report");
+  return { handoff, binding, acceptance, references, expectations, pgInputs, caseOutputs, contract, comparison };
+}
+
+function compareCurrentD7Case({ caseId, reference, expectation, actualResponse, actualPreview, currentDay }) {
+  const comparison = compareCurrentQ1D7CaseDTOs({ caseId, reference, expectation, actualResponse, actualPreview, currentDay });
+  assert.equal(comparison.caseId, caseId);
+  assert.equal(comparison.comparedDates, 70);
+  assert.equal(comparison.equal, true, `${caseId} exactly matches its accepted current-source contract`);
+  assert.equal(comparison.strictUnaffectedEqual, true, `${caseId} keeps every unaffected DTO field strict`);
+  assert.equal(comparison.exactPerDateEqual, true, `${caseId} has exact current per-date models`);
+  assert.equal(comparison.diffCount, 0, `${caseId} has no unexpected difference outside its accepted contract`);
+  assert.deepEqual(comparison.diffs, []);
+  return comparison;
+}
+
+test("S9 D7 owns exactly two disjoint retained schema pairs and requires both receipts", async () => {
+  const digest = "a".repeat(64);
+  const caseReceipts = Object.fromEntries(CURRENT_D7_CASE_IDS.map((caseId, index) => {
+    const suffix = index === 0 ? "00000001" : "00000002";
+    return [caseId, { caseId, schemaVersion: "current-q1-d7-controller-case-receipt-v1",
+      referenceSha256: digest, expectationSha256: digest, corpusSha256: digest, admissionSha256: digest,
+      sourceInvariantSha256: digest, pgInputSha256: digest, bootstrapPreservationSha256: digest,
+      strictExportSha256: digest, actualResponseSha256: digest,
+      actualPreviewSha256: digest,
+      schema: `typed_legacy_transfer_rehearsal_target_fastpath_${suffix}`,
+      controlSchema: `typed_legacy_transfer_rehearsal_ctl_${suffix}`, currentDay: "2026-10-01",
+      retainedForS9Cleanup: true }];
+  }));
+  const keptSchemaPairs = CURRENT_D7_CASE_IDS.map((caseId) => ({ caseId,
+    schema: caseReceipts[caseId].schema, controlSchema: caseReceipts[caseId].controlSchema }));
+  const report = { reusedSchema: false,
+    keptSchemaPairs,
+    keptSchemas: keptSchemaPairs.flatMap(({ schema, controlSchema }) => [schema, controlSchema]),
+    currentD7Qualification: { schemaVersion: "current-q1-d7-controller-qualification-v1",
+      comparisonMode: "current-worker-d1-d7", decisionId: "D7", caseIds: [...CURRENT_D7_CASE_IDS],
+      inputBindingSha256: digest, inputBindingCaptureContentSha256: digest, bindingSha256: digest, referenceContentSha256: digest,
+      producerAcceptanceContentSha256: digest, contractContentSha256: digest, caseReceipts,
+      sidecars: Object.fromEntries(CURRENT_D7_SIDECAR_HASH_KEYS.map((key) => [key, digest])),
+      cleanupPending: true, qualifying: false, establishesNativeExecution: false,
+      deadlineMs: S9_REHEARSAL_DEADLINE_MS, elapsedMs: 1, pgInputSnapshotsRemoved: true } };
+  const pairs = validateCurrentD7SchemaHandoff(report);
+  assert.deepEqual(pairs, keptSchemaPairs);
+  assert.throws(() => validateCurrentD7SchemaHandoff({ ...report, currentD7Qualification: {
+    ...report.currentD7Qualification, caseReceipts: { conflictPreserving: caseReceipts.conflictPreserving },
+  } }), /both current D7 case receipts/u);
+  assert.throws(() => validateCurrentD7SchemaHandoff({ ...report,
+    keptSchemas: [...report.keptSchemas, "typed_legacy_transfer_rehearsal_target_fastpath_ffffffff"],
+  }), /controller exposes exactly the four owned schema names/u);
+  assert.throws(() => validateCurrentD7SchemaHandoff({ ...report,
+    keptSchemaPairs: [{ ...keptSchemaPairs[0] }, { ...keptSchemaPairs[1], schema: keptSchemaPairs[0].schema }],
+  }), /top-level pair projection/u);
+  const completedChild = (await captureS9ChildCompletion(async () => ({ stdout: "", stderr: "" }))).metadata;
+  const cleaned = [];
+  await assert.rejects(withCurrentD7OwnedSchemaCleanup({ ...report,
+    keptSchemas: [...report.keptSchemas, "typed_legacy_transfer_rehearsal_target_fastpath_ffffffff"],
+  }, completedChild, async () => assert.fail("invalid extra schema names cannot enter edge assertions"), async (names) => cleaned.push(...names)),
+  /four owned schema names/u);
+  assert.deepEqual(cleaned, report.keptSchemas,
+    "an invalid extra name still cleans only the four independently validated owned schemas");
+});
+
+test("S9 D7 requires a closed input-binding capture made before producer invocation", () => {
+  const inputBinding = { binding: "synthetic-pre-producer-binding" };
+  const capture = { schemaVersion: "current-q1-d7-input-binding-capture-v1", capturedBeforeProducer: true,
+    captureOrdinal: 1, inputBindingSha256: currentQ1D7JsonSha256(inputBinding), inputBinding };
+  assert.equal(validateCurrentD7InputBindingCapture(capture), capture);
+  assert.throws(() => validateCurrentD7InputBindingCapture({ ...capture, capturedBeforeProducer: false }),
+    /captured before producer invocation/u);
+  assert.throws(() => validateCurrentD7InputBindingCapture({ ...capture, captureOrdinal: 2 }), /only accepted pre-producer/u);
+  assert.throws(() => validateCurrentD7InputBindingCapture({ ...capture, inputBindingSha256: "b".repeat(64) }),
+    /exact initial input binding/u);
+  assert.throws(() => validateCurrentD7InputBindingCapture({ ...capture, producerResponse: { private: true } }),
+    /closed schema/u);
+});
+
+test("S9 D7 keeps the 900 native query limit per graph-result invocation", () => {
+  const binding = { bounds: structuredClone(CURRENT_Q1_D7_BOUNDS) };
+  assert.doesNotThrow(() => validateCurrentD7QueryBudget(binding));
+  assert.throws(() => validateCurrentD7QueryBudget({ bounds: {
+    ...binding.bounds, nativeQueries: 899,
+  } }), /original 900-query allowance/u);
+  assert.throws(() => validateCurrentD7QueryBudget({ bounds: {
+    ...binding.bounds, nativeQueryBudgetScope: "whole_two_case_fixture",
+  } }), /case-wide or two-case aggregate budget/u);
+});
+
+test("S9 D7 consumes exactly the seven named private controller sidecars", () => {
+  const out = "/private/synthetic/report.json";
+  const expected = Object.values(CURRENT_D7_SIDECARS).map((suffix) => `report.json.${suffix}.json`);
+  assert.deepEqual(validateCurrentD7SidecarNames(expected, out), expected.sort());
+  assert.throws(() => validateCurrentD7SidecarNames([...expected, "report.json.current-d7-unbound.json"], out),
+    /exactly the seven closed D7 sidecars/u);
+  assert.throws(() => validateCurrentD7SidecarNames(expected.slice(1), out),
+    /exactly the seven closed D7 sidecars/u);
+});
+
+async function regularFileSha256(path, maximumBytes = 512 * 1024 * 1024) {
+  const metadata = await lstat(path);
+  assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= maximumBytes,
+    "a bounded regular file is required");
+  const hash = createHash("sha256");
+  for await (const bytes of createReadStream(path)) hash.update(bytes);
+  return hash.digest("hex");
+}
+
+/** Verify the retained binary before executing even its version command. */
+async function s9RehearsalNode() {
+  if (!CURRENT_Q1 && !CURRENT_D7) return { node: process.env.EDGE_E2E_REHEARSAL_NODE || "node", runtime: null };
+  assert.equal(process.version, "v22.16.0", "S9 edge and origin retain the image runtime");
+  const named = process.env.EDGE_E2E_REHEARSAL_NODE;
+  assert.ok(typeof named === "string" && isAbsolute(named),
+    "current S9 requires the retained absolute EDGE_E2E_REHEARSAL_NODE");
+  const node = await realpath(named);
+  const runtime = { version: "v26.2.0", platform: process.platform, arch: process.arch,
+    binarySha256: await regularFileSha256(node) };
+  assertCurrentQ1TrustedRuntime(runtime);
+  const { stdout } = await execFileAsync(node, ["--version"], { timeout: 10_000, maxBuffer: 1_024 });
+  assert.equal(stdout.trim(), "v26.2.0", "the allowlisted retained runtime reports its exact version");
+  assert.equal(await regularFileSha256(node), runtime.binarySha256, "the retained binary is unchanged after its version probe");
+  return { node, runtime };
+}
+
+
+async function preserveS9Artifact(suffix, value) {
+  if (!process.env.EDGE_E2E_REPORT) return;
+  await writeFile(`${resolve(process.env.EDGE_E2E_REPORT)}.${suffix}.json`, `${JSON.stringify(value, null, 2)}\n`,
+    { flag: "wx", mode: 0o600 });
+}
+
+async function verifyCurrentFilePin(entry) {
+  assert.deepEqual(Object.keys(entry).sort(), ["path", "sha256"]);
+  assert.ok(typeof entry.path === "string" && entry.path.startsWith("apps/worker/")
+    && !/[\0\r\n\\]/u.test(entry.path)
+    && entry.path.split("/").every((part) => part !== "" && part !== "." && part !== ".."));
+  assert.match(entry.sha256, SHA256);
+  assert.equal(await regularFileSha256(join(REPOSITORY_ROOT, entry.path), 32 * 1024 * 1024), entry.sha256,
+    `the named candidate input is unchanged: ${entry.path}`);
+}
+
+/** The receipt preserves the direct invocation, rather than attesting it cryptographically.
+ * Expected digests remain the controller's original pre-PG strings. */
+async function verifyCurrentS9Evidence({ report, evidence, runtime, imageRuntime, staged }) {
+  assert.ok(evidence, "current S9 requires all preserved producer sidecars");
+  const { reference, binding, acceptance } = evidence;
+  const original = report.currentReference;
+  assert.ok(original && original.qualification === "complete");
+  for (const field of ["sha256", "bindingSha256", "acceptanceSha256"]) assert.match(original[field], SHA256);
+  assert.equal(jsonSha256(reference), original.sha256, "the reference equals its original pre-PG digest");
+  assert.equal(jsonSha256(binding), original.bindingSha256, "the binding equals its original pre-PG digest");
+  assert.equal(jsonSha256(acceptance), original.acceptanceSha256, "the accepted receipt is preserved");
+  validateCurrentQ1ReferenceBinding({ reference, expected: binding });
+  assert.equal(reference.schemaVersion, "current-q1-d1-reference-v2");
+  assert.equal(binding.schemaVersion, "current-q1-d1-reference-binding-v3");
+  assert.deepEqual(assessCurrentQ1ReferenceCompleteness({ reference, corpus: binding.corpusStructure,
+    snapshotReadiness: { afterForcedRecompute: reference.afterForcedRecompute?.readiness,
+      afterNativeProbes: reference.afterNativeProbes?.readiness } }), { state: "complete", reasons: [] },
+  "the preserved current reference passes all recomputation, convergence, refusal, DTO and native gates");
+  for (const field of ["recomputation", "corpusConvergence", "strictExportRefusal"]) {
+    const digestField = `${field}Sha256`;
+    assert.match(original[digestField], SHA256);
+    assert.equal(jsonSha256(reference[field]), original[digestField], `the actual ${field} evidence is preserved`);
+    assert.equal(acceptance[digestField], original[digestField], `the controller accepted this ${field} evidence`);
+  }
+  assert.deepEqual(Object.keys(acceptance).sort(), ["schemaVersion", "evidenceScope", "cryptographicExecutionAttestation",
+    "actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted", "referenceSha256", "bindingSha256",
+    "sourceHead", "sourceSha256", "migrationSha256", "corpusSha256", "helper", "controller", "runtime",
+    "recomputationSha256", "corpusConvergenceSha256", "strictExportRefusalSha256"].sort());
+  assert.equal(acceptance.schemaVersion, "current-q1-d1-producer-acceptance-v2");
+  assert.equal(acceptance.evidenceScope, "direct-source-pinned-producer-controller");
+  assert.equal(acceptance.cryptographicExecutionAttestation, false);
+  for (const field of ["actualHelperInvocation", "resultReturnedAfterOwnedCleanup", "accepted"]) {
+    assert.equal(acceptance[field], true, `the controller's ${field} gate is closed`);
+  }
+  assert.equal(acceptance.referenceSha256, original.sha256);
+  assert.equal(acceptance.bindingSha256, original.bindingSha256);
+  assert.equal(original.schemaVersion, reference.schemaVersion);
+  assert.deepEqual(original.source, { head: binding.source.head, sha256: binding.source.sha256 });
+  assert.equal(acceptance.sourceHead, binding.source.head);
+  assert.equal(acceptance.sourceSha256, binding.source.sha256);
+  assert.equal(acceptance.migrationSha256, binding.migrationSha256);
+  assert.equal(original.migrationSha256, binding.migrationSha256);
+  assert.equal(acceptance.corpusSha256, binding.corpus.canonicalSha256);
+  assert.equal(original.corpusSha256, binding.corpus.canonicalSha256);
+  assert.deepEqual(acceptance.runtime, binding.runtime);
+  assert.deepEqual(original.runtime, binding.runtime);
+  assertCurrentQ1TrustedRuntime(binding.runtime);
+  for (const [key, value] of Object.entries(runtime)) assert.equal(binding.runtime[key], value);
+  const { stdout } = await execFileAsync("git", ["--no-optional-locks", "-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { timeout: 10_000, maxBuffer: 1_024, env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" } });
+  assert.match(stdout, /^[a-f0-9]{40}\n$/u);
+  assert.equal(binding.source.head, stdout.trim(), "the producer was born on this candidate head");
+  for (const entry of binding.source.files) await verifyCurrentFilePin(entry);
+  assert.deepEqual(acceptance.helper, binding.source.files.find((entry) => entry.path === CURRENT_HELPER_PATH));
+  assert.equal(acceptance.helper.path, CURRENT_HELPER_PATH);
+  await verifyCurrentFilePin(acceptance.helper);
+  assert.equal(acceptance.controller.path, REHEARSAL_CONTROLLER_PATH);
+  await verifyCurrentFilePin(acceptance.controller);
+  const migrationPaths = [];
+  for (const directory of CURRENT_MIGRATION_ORDER) {
+    for (const name of (await readdir(join(WORKER_ROOT, directory))).filter((name) =>
+      /^\d{4}_[a-z0-9_-]+\.sql$/u.test(name)).sort()) migrationPaths.push(`apps/worker/${directory}/${name}`);
+  }
+  assert.deepEqual(binding.migrations.map(({ path }) => path), migrationPaths,
+    "the exact current migration set and maintained apply order are preserved");
+  const corpusPaths = ["corpus.json", ...["a", "b", "c", "d"].map((key) => `corpus-owner-${key}.json`)]
+    .map((name) => `apps/worker/analytics-v2-test/golden/corpus/${name}`);
+  assert.deepEqual(binding.corpus.files.map(({ path }) => path), corpusPaths);
+  const corpus = [];
+  for (const entry of binding.corpus.files) {
+    await verifyCurrentFilePin(entry);
+    corpus.push(JSON.parse(await readFile(join(REPOSITORY_ROOT, entry.path), "utf8")));
+  }
+  assert.equal(jsonSha256(corpus), original.corpusSha256, "the immutable raw Q-1 corpus is independently bound");
+  const inputs = report.currentPostgresInputs;
+  assert.equal(inputs?.schemaVersion, "current-q1-postgres-input-binding-v1");
+  assert.deepEqual(inputs.controller, acceptance.controller);
+  assert.deepEqual(inputs.primary, (await readPostgresMigrations({ role: "primary" }))
+    .map(({ name, sha256 }) => ({ name, sha256 })));
+  assert.deepEqual(inputs.staged.map(({ name }) => name), staged);
+  for (const entry of inputs.staged) await verifyCurrentFilePin({
+    path: `apps/worker/postgres/staged-migrations/primary/${entry.name}`, sha256: entry.sha256 });
+  assert.deepEqual(inputs.bundles.map(({ path }) => path), ["analytics-refresh.mjs", "server.mjs"]
+    .map((name) => `apps/worker/cloud-run/dist/${name}`));
+  for (const entry of inputs.bundles) await verifyCurrentFilePin(entry);
+  assertCurrentImageRuntime(imageRuntime);
+  assert.deepEqual(inputs.node22, { version: imageRuntime.version, sha256: imageRuntime.binarySha256 },
+    "the original report preserves the independently verified pre-producer image runtime");
+  assert.deepEqual(await verifyCurrentImageRuntimePath(process.execPath), imageRuntime,
+    "the retained image runtime is unchanged from its pre-producer binding");
+}
+
+/** The same controller directly produces fresh D1 evidence before querying PG.
+ * It retains the image Node 22.16 for PG refresh and the origin. */
+async function seededRehearsal() {
+  if (CURRENT_D7) assert.equal(S9_REHEARSAL_DEADLINE_MS, CURRENT_D7_CHILD_DEADLINE_MS,
+    "the D7 producer keeps the original single-child 40-minute deadline");
+  const imageRuntime = CURRENT_Q1 || CURRENT_D7 ? await verifyCurrentImageRuntimePath(process.execPath) : null;
+  const { node, runtime } = await s9RehearsalNode();
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "edge-e2e-rehearsal-")));
+  await chmod(directory, 0o700);
+  const out = join(directory, "report.json");
+  let discardDirectory = false;
+  let result = null;
+  const staged = CURRENT_D7 ? [] : (await readdir(join(WORKER_ROOT, "postgres", "staged-migrations", "primary")).catch(() => []))
+    .filter((name) => /^\d{4}_[a-z][a-z0-9_-]*\.sql$/u.test(name)).sort();
+  try {
+    // This wx handle receives only parsed closed progress while the child runs.
+    const progressFile = await open(join(directory, "child-progress.jsonl"), "wx", 0o600);
+    let observer, liveProgress;
+    let completion;
+    try {
+      completion = await captureS9ChildCompletion(() => {
+        const pending = execFileAsync(node,
+          [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"),
+            ...s9ControllerGoldenArguments({ mode: S9_COMPARISON_MODE, golden: GOLDEN, workerRoot: WORKER_ROOT }),
+            "--keep-schema", "--out", out,
+            "--comparison-mode", S9_COMPARISON_MODE,
+            ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
+            ...staged.flatMap((name) => ["--staged-primary", name])], {
+            cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: S9_REHEARSAL_DEADLINE_MS,
+            env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: directory, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
+              PG_TEST_PORT: String(PG_TEST_PORT), GCP_FASTPATH_NODE22: process.execPath,
+              ...(process.env.PG_TEST_USER ? { PG_TEST_USER: process.env.PG_TEST_USER } : {}),
+              ...(process.env.PG_TEST_DATABASE ? { PG_TEST_DATABASE: process.env.PG_TEST_DATABASE } : {}) },
+          });
+        observer = observeS9ChildProgress(pending.child, (line) => progressFile.writeFile(line),
+          (line) => process.stderr.write(line));
+        return pending;
+      });
+    } finally {
+      let progressFailed = false;
+      try { liveProgress = await observer?.close(); } catch { progressFailed = true; }
+      try { await progressFile.close(); } catch { progressFailed = true; }
+      if (progressFailed) liveProgress = { records: liveProgress?.records ?? 0, bytes: liveProgress?.bytes ?? 0,
+        rejected: liveProgress?.rejected ?? 0, preserved: false };
+    }
+    // Raw child output remains solely in this owner-private local directory.
+    // Preserve failures before attempting a report; missing sidecars keep it intact.
+    let failureOutputPreserved = liveProgress?.preserved === true;
+    let lastValidatedControllerPhase = null;
+    if (completion.metadata.state === "failed") {
+      try {
+        await writeFile(join(directory, "child-completion.json"), `${JSON.stringify({ ...completion.metadata,
+          stdout: { originalBytes: completion.stdout.originalBytes, truncated: completion.stdout.truncated },
+          stderr: { originalBytes: completion.stderr.originalBytes, truncated: completion.stderr.truncated } })}\n`,
+        { flag: "wx", mode: 0o600 });
+        for (const stream of ["stdout", "stderr"]) await writeFile(join(directory, `child-${stream}.log`),
+          completion[stream].bytes, { flag: "wx", mode: 0o600 });
+      } catch { failureOutputPreserved = false; }
+    }
+    const report = await readS9ChildReport(out, completion.metadata);
+    assert.ok(report && typeof report === "object" && !Array.isArray(report), "a controller report is required");
+    if (!CURRENT_D7) ownedKeptRehearsalSchemas(report);
+    let artifactsPreserved = failureOutputPreserved;
+    // Return the parsed report even when preservation fails so the caller can
+    // close this controller's exact kept schemas before failing the test.
+    const preserve = async (suffix, value) => {
+      try { await preserveS9Artifact(suffix, value); } catch { artifactsPreserved = false; }
+    };
+    if (!CURRENT_D7) await preserve("s9-rehearsal", report);
+    await preserve("s9-child-completion", { schemaVersion: "s9-rehearsal-child-completion-v1",
+      child: completion.metadata, liveProgress });
+    try {
+      const progressPath = join(directory, "child-progress.jsonl"), metadata = await lstat(progressPath);
+      assert.ok(metadata.isFile() && !metadata.isSymbolicLink() && metadata.nlink === 1
+        && metadata.uid === process.getuid() && (metadata.mode & 0o077) === 0 && metadata.size <= S9_DIAGNOSTIC_BYTES,
+      "the bounded progress journal remains an owner-private regular file");
+      const records = validateS9ProgressJournal(await readFile(progressPath), liveProgress);
+      if (CURRENT_D7) lastValidatedControllerPhase = records.toReversed()
+        .find((record) => record.component === "controller")?.phase ?? null;
+      await preserve("s9-progress", { schemaVersion: "s9-rehearsal-progress-v1", records });
+    } catch { artifactsPreserved = false; }
+    let evidence = null;
+    if (CURRENT_Q1) {
+      // Parse and preserve the producer's original sidecars before removing the
+      // owned directory. Missing evidence cannot acquire a passing receipt.
+      const values = await Promise.allSettled(["current-reference", "current-reference-binding", "current-reference-acceptance"]
+        .map(async (suffix) => {
+          const value = JSON.parse(await readFile(`${out}.${suffix}.json`, "utf8"));
+          await preserve(suffix, value);
+          return value;
+        }));
+      if (values.every(({ status }) => status === "fulfilled")) evidence = {
+        reference: values[0].value, binding: values[1].value, acceptance: values[2].value };
+    }
+    discardDirectory = !CURRENT_D7 && completion.metadata.state === "completed" && artifactsPreserved
+      && (!CURRENT_Q1 || evidence !== null);
+    result = { report, evidence, runtime, imageRuntime, staged, artifactsPreserved,
+      childCompletion: completion.metadata, liveProgress, lastValidatedControllerPhase, temporaryOutputRemoved: false,
+      ...(CURRENT_D7 ? { privateOutputPath: out, privateOutputDirectory: directory } : {}) };
+    return result;
+  } finally {
+    // Keep the sole private diagnostic bytes if ownership or any required
+    // sidecar is unreadable, or a requested wx preservation failed. Cleanup
+    // failure returns through S9's schema cleanup rather than skipping it.
+    if (discardDirectory) {
+      try {
+        await rm(directory, { recursive: true, force: true });
+        result.temporaryOutputRemoved = true;
+      } catch { /* The caller fails inside its exact schema cleanup boundary. */ }
+    }
+  }
+}
+
+async function removeCurrentD7PrivateOutput(seeded) {
+  const directory = seeded.privateOutputDirectory;
+  assert.equal(typeof directory, "string");
+  assert.equal(dirname(directory), await realpath(tmpdir()));
+  assert.match(basename(directory), /^edge-e2e-rehearsal-/u,
+    "only the private temporary directory created by this S9 run can be removed");
+  const metadata = await lstat(directory);
+  assert.ok(metadata.isDirectory() && !metadata.isSymbolicLink() && metadata.uid === process.getuid()
+    && (metadata.mode & 0o777) === 0o700 && await realpath(directory) === directory,
+  "the retained owner-only output directory remains the exact owned target");
+  await rm(directory, { recursive: true, force: false });
+  seeded.temporaryOutputRemoved = true;
+}
+
+async function currentD7EdgeCase({ f, evidence, pair, caseOutput, dump, casesVerified }) {
+  const { caseId, reference, actualResponse: controllerResponse, actualPreview: controllerPreview, currentDay } = caseOutput;
+  const { schema, controlSchema } = pair;
+  assert.deepEqual(evidence.references[caseId], reference);
+  assert.notEqual(schema, controlSchema);
+  const from = reference.graphDays[0], to = reference.graphDays.at(-1);
+  const settings = Object.fromEntries([...originSourceEnv(goldenSourceIdentity(dump)), ...edgeTestProductionEnv()]);
+  const origin = await startOrigin({ socket: f.socket, schema, keys: f.keys,
+    nowMs: evidence.binding.runtime.pinnedNowMs, objects: new Map(), settings });
+  const frontEnd = createGoogleFrontEnd({ invoker: f.invoker, verifiers: [EDGE_E2E_VERIFIER], audience: EDGE_E2E_AUDIENCE,
+    upstreamOrigin: EDGE_E2E_UPSTREAM_ORIGIN, origin: loopbackOrigin(origin.port) });
+  let instance = null;
+  try {
+    instance = await createEdgeInstance({ ...f.common, mode: "gcp", frontEnd, invokerKeyJson: f.invoker.keyJson });
+    const path = `/api/v1/community/daily?from=${from}&to=${to}`;
+    const ip = nextIp();
+    const edgeMark = frontEnd.mark();
+    const answer = await instance.fetch(`${EDGE_E2E_PUBLIC_ORIGIN}${path}`, { ip });
+    assert.equal(answer.status, 200, answer.text.slice(0, 300));
+    const edgeExchanges = frontEnd.since(edgeMark);
+    assert.equal(edgeExchanges.length, 1, `${caseId} edge read has exactly one origin exchange`);
+    const [edgeExchange] = edgeExchanges;
+    assert.deepEqual(transparencyMismatches(f, answer, edgeExchange), [], `${caseId} edge/origin transparency`);
+
+    const directMark = frontEnd.mark();
+    const direct = await frontEnd.direct({ path, email: EDGE_E2E_INVOKER, headers: {
+      "x-tibotattle-edge-host": "apex", "x-tibotattle-edge-request-id": randomUUID(),
+      "x-tibotattle-edge-admission": "v1;public_aggregate_read;allowed" } });
+    assert.equal(direct.status, 200, `${caseId} direct origin read`);
+    assert.ok(answer.body.equals(direct.body), `${caseId} edge bytes equal direct-origin bytes`);
+    const actualResponse = JSON.parse(answer.text);
+    const directResponse = JSON.parse(direct.body.toString("utf8"));
+    const actualPreview = (await f.base.query(`SELECT preview FROM "${schema}".analytics_v2_preview WHERE id = 1`))
+      .rows[0]?.preview ?? null;
+    assert.ok(actualPreview && typeof actualPreview === "object", `${caseId} current admin preview is present`);
+    compareCurrentD7Case({ caseId, reference, expectation: evidence.expectations[caseId], actualResponse,
+      actualPreview, currentDay });
+    compareCurrentD7Case({ caseId, reference, expectation: evidence.expectations[caseId],
+      actualResponse: directResponse, actualPreview, currentDay });
+    compareCurrentD7Case({ caseId, reference, expectation: evidence.expectations[caseId],
+      actualResponse: controllerResponse, actualPreview: controllerPreview, currentDay });
+    assert.deepEqual(actualResponse.allowanceBreakdowns.days.map(({ day }) => day), currentQ1D7PublicDays(evidence.binding),
+      `${caseId} served response contains all and only closed current public days`);
+
+    assert.deepEqual(privacyViolations(f, edgeExchange, { ip }), [], `${caseId} edge S7 privacy`);
+    const directExchanges = frontEnd.since(directMark);
+    assert.equal(directExchanges.length, 1, `${caseId} direct read has exactly one origin exchange`);
+    assert.ok(directExchanges[0].originStatus === 200, `${caseId} direct-origin exchange completed`);
+    assert.deepEqual(frontEnd.refusals, [], `${caseId} edge reached no unrelated host`);
+    assert.equal(instance.refusals.length, 0, `${caseId} gcp edge had no transport refusal`);
+
+    const row = { stage: "S9", id: "current-worker-d1-d7-case", caseId, currentDay,
+      graphDays: reference.graphDays.length, currentPublicDays: currentQ1D7PublicDays(evidence.binding).length,
+      controllerResponseSha256: currentQ1D7JsonSha256(controllerResponse),
+      edgeResponseSha256: createHash("sha256").update(answer.body).digest("hex"),
+      directResponseSha256: createHash("sha256").update(direct.body).digest("hex"),
+      controllerPreviewSha256: currentQ1D7JsonSha256(controllerPreview),
+      edgePreviewSha256: currentQ1D7JsonSha256(actualPreview),
+      schemaPairSha256: currentQ1D7JsonSha256({ schema, controlSchema }),
+      edgeDirectBytesEqual: true, publicAndAdminComparisonsEqual: true };
+    casesVerified.push(row);
+    f.rows.push(row);
+
+    if (caseId === "conflictFreePositive") {
+      // Preserve the existing S9 edge write tier on the independent fully
+      // published case, after its read comparisons have completed.
+      const writes = [];
+      const writeExchangeIps = new Map();
+      const writesMark = frontEnd.mark();
+      await liveWriteRows({ publicOrigin: EDGE_E2E_PUBLIC_ORIGIN, send: async (id, writePath, init = {}) => {
+        const ip = nextIp();
+        const mark = frontEnd.mark();
+        const written = await instance.fetch(`${EDGE_E2E_PUBLIC_ORIGIN}${writePath}`, { ip, ...init });
+        for (const exchange of frontEnd.since(mark)) writeExchangeIps.set(exchange, ip);
+        writes.push({ id, path: new URL(writePath, EDGE_E2E_PUBLIC_ORIGIN).pathname, status: written.status });
+        return { answer: written, row: writes.at(-1) };
+      } });
+      assert.deepEqual(writes.slice(0, 3).map(({ status }) => status), [201, 201, 201]);
+      const capabilities = writes.filter(({ path }) => path === "/api/v1/device/sync-capabilities-v1.2");
+      assert.ok(capabilities.length >= 1 && capabilities.every(({ status }) => status === 200));
+      assert.ok(writes.some(({ path: writePath, status }) => writePath === "/api/v1/me/telemetry-v12/domain-activate" && status === 201));
+      for (const exchange of frontEnd.since(writesMark)) {
+        const requestId = exchange.requestHeaders.find(([name]) => name === "x-tibotattle-edge-request-id")?.[1];
+        assert.ok(typeof requestId === "string" && requestId.length > 0, "each positive-case write has a request id");
+        assert.deepEqual(privacyViolations(f, exchange, { ip: writeExchangeIps.get(exchange) }), [], "positive-case write S7 privacy");
+      }
+      f.rows.push({ stage: "S9", id: "current-worker-d1-d7-positive-write-tier", statuses: writes.map(({ id, status }) => [id, status]) });
+    }
+  } finally {
+    await instance?.dispose().catch(() => {});
+    await origin.close().catch(() => {});
+  }
+}
+
+async function runCurrentD7S9(f, testContext) {
+  const seeded = await seededRehearsal();
+  const rehearsal = seeded.report;
+  const casesVerified = [];
+  const dump = JSON.parse(await readFile(join(GOLDEN, "dump", "usage-monitor-db.json"), "utf8"));
+  let evidence = null;
+  try {
+    await withCurrentD7OwnedSchemaCleanup(rehearsal, seeded.childCompletion,
+      async (pairs) => {
+        evidence = await readCurrentD7Evidence({ out: seeded.privateOutputPath, report: rehearsal,
+          runtime: seeded.runtime, imageRuntime: seeded.imageRuntime });
+        await preserveS9Artifact("s9-rehearsal", rehearsal);
+        assert.equal(seeded.artifactsPreserved, true, "bounded child progress and completion records were preserved");
+        assert.equal(seeded.temporaryOutputRemoved, false, "the private sidecars remain available through edge reads and cleanup");
+        assert.deepEqual(pairs.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS);
+        const byCase = new Map(pairs.map((pair) => [pair.caseId, pair]));
+        for (const caseOutput of evidence.caseOutputs) {
+          const pair = byCase.get(caseOutput.caseId);
+          assert.ok(pair, `${caseOutput.caseId} retained pair exists`);
+          await currentD7EdgeCase({ f, evidence, pair, caseOutput, dump, casesVerified });
+        }
+        assert.deepEqual(casesVerified.map(({ caseId }) => caseId), CURRENT_D7_CASE_IDS,
+          "edge, direct origin, preview, privacy and contract checks ran for both cases");
+      },
+      async (names) => {
+        for (const name of [...names].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+        if (names.length > 0) {
+          const remaining = await f.base.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[]) ORDER BY nspname",
+            [names]);
+          assert.deepEqual(remaining.rows, [], "the exact four owned generated schemas are independently absent");
+        }
+      });
+  } catch (error) {
+    // The cleanup error may replace the failed-child rejection from the wrapper's
+    // finally block. Preserve the captured failure diagnostic without replacing
+    // whichever error actually escaped cleanup.
+    if (seeded.childCompletion?.state === "failed") {
+      testContext.diagnostic(JSON.stringify(currentD7FailureDiagnostic(rehearsal, seeded.childCompletion,
+        seeded.lastValidatedControllerPhase)));
+    }
+    throw error;
+  }
+  await removeCurrentD7PrivateOutput(seeded);
+  assert.equal(seeded.temporaryOutputRemoved, true);
+  const caseSummaries = casesVerified.map(({ caseId, currentDay, graphDays, currentPublicDays, controllerResponseSha256,
+    edgeResponseSha256, directResponseSha256, controllerPreviewSha256, edgePreviewSha256, schemaPairSha256,
+    edgeDirectBytesEqual, publicAndAdminComparisonsEqual }) => ({ caseId, currentDay, graphDays, currentPublicDays,
+    controllerResponseSha256, edgeResponseSha256, directResponseSha256, controllerPreviewSha256, edgePreviewSha256,
+    schemaPairSha256, edgeDirectBytesEqual, publicAndAdminComparisonsEqual }));
+  await preserveS9Artifact("s9-current-d7-cleanup", { schemaVersion: "current-q1-d7-s9-edge-cleanup-v1",
+    caseIds: [...CURRENT_D7_CASE_IDS], schemaPairs: 2, schemasDroppedAndVerifiedAbsent: 4,
+    acceptedD7DateSet: evidence.contract.acceptedD7DateSet, cases: caseSummaries,
+    cleanupPending: false, establishesNativeExecution: false });
+  f.rows.push({ stage: "S9", id: "current-worker-d1-d7-final-cleanup", caseCount: 2,
+    schemaCount: 4, absentAfterOwnedDrop: true, sidecarsRemoved: seeded.temporaryOutputRemoved });
+}
+
+test(CURRENT_D7
+  ? "S9 current D7: both current-source cases reproduce through edge and direct origin, with exact owned cleanup"
+  : "S9 golden: the community/daily read is byte-equal through the edge and reproduces the rehearsal's parity table; "
+    + "the live check's write tier completes on the seeded schema at the deploy's origin settings", {
   skip: SKIP || GOLDEN === null, timeout: 3_600_000,
-}, async () => {
+}, async (testContext) => {
   const f = await fixture();
+  if (CURRENT_D7) {
+    await runCurrentD7S9(f, testContext);
+    return;
+  }
   const golden = JSON.parse(await readFile(join(GOLDEN, "community-daily-response.json"), "utf8"));
   const goldenPreview = JSON.parse(await readFile(join(GOLDEN, "preview.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(GOLDEN, "manifest.json"), "utf8"));
-  const rehearsal = await seededRehearsal();
-  const kept = Array.isArray(rehearsal.keptSchemas) ? rehearsal.keptSchemas : [];
+  const seeded = await seededRehearsal();
+  const rehearsal = seeded.report;
   let origin = null;
   let instance = null;
-  try {
+  await withS9OwnedSchemaCleanup(rehearsal, async (kept) => {
+    assertS9ChildCompleted(seeded.childCompletion);
+    assert.equal(seeded.artifactsPreserved, true, "requested evidence is preserved without overwriting an existing artifact");
+    assert.equal(seeded.temporaryOutputRemoved, true, "complete producer evidence was read and owned temporary output was removed");
     assert.notEqual(rehearsal.status, "error", JSON.stringify(rehearsal.error ?? null));
+    if (CURRENT_Q1) {
+      assert.equal(rehearsal.schemaVersion, "gcp-fastpath-current-rehearsal-report-v1");
+      assert.equal(rehearsal.comparisonMode, "current-worker-d1");
+      assert.equal(rehearsal.status, "pass", "all current producer, equality, input and idempotency gates passed");
+      for (const name of CURRENT_GATES) assert.equal(rehearsal.gates?.[name], true, name);
+      assert.ok(Object.values(rehearsal.gates).every((value) => value === true), "every retained gate passed");
+      assert.equal(rehearsal.historicalComparison?.qualifying, false);
+      assert.deepEqual(rehearsal.historicalComparison.parity, rehearsal.parity);
+      assert.deepEqual(rehearsal.historicalComparison.perDate, rehearsal.perDate);
+      await verifyCurrentS9Evidence({ ...seeded, report: rehearsal });
+    }
     assert.equal(rehearsal.steps.read.status, 200);
     assert.ok(rehearsal.parity?.families, "the rehearsal produced a parity table");
     // The rehearsal keeps its one primary schema and the importers' control
     // schema; there is no deletion-ledger schema (LEAD-SIMP).
     const [schema, controlSchema] = kept;
     assert.equal(kept.length, 2, JSON.stringify(kept));
-    assert.match(controlSchema, /^typed_legacy_transfer_rehearsal_ctl_[0-9a-f]{8}$/u);
+    assert.equal(controlSchema, `typed_legacy_transfer_rehearsal_ctl_${schema.slice(-8)}`);
     assert.equal(kept.some((name) => /ledger/u.test(name)), false, "no ledger schema is created");
     // What scripts/gcp-fastpath-test-deploy.mjs gives an edge-test origin over a
     // seeded schema: the golden's source (without it every typed route of the
@@ -2368,21 +3430,60 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(answer.body.equals(direct.body), "the edge read equals a direct origin read byte for byte");
     const actualPreview = (await f.base.query(`SELECT preview FROM "${schema}".analytics_v2_preview WHERE id = 1`))
       .rows[0]?.preview ?? null;
-    // The rehearsal's own compare: the golden's withheld model dates, held to
-    // the per-date expectation when there is one.
+    const actual = JSON.parse(answer.text);
+    await preserveS9Artifact("s9-response", actual);
+    await preserveS9Artifact("s9-preview", actualPreview);
+    // Historical comparison remains byte-strict. Current qualification records
+    // its table separately and grants none of its historical waivers.
     const perDateExpected = PER_DATE_EXPECTED === null ? null
       : perDateExpectationFor(JSON.parse(await readFile(PER_DATE_EXPECTED, "utf8")), manifest);
-    const parity = compareAnalyticsV2Parity({ golden, actual: JSON.parse(answer.text), goldenPreview, actualPreview,
+    const parity = compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview,
       withheldModelDates: withheldModelDatesOf(manifest), perDateExpected });
     assert.deepEqual(familyTable(parity), familyTable(rehearsal.parity),
       "the edge read reproduces the rehearsal's parity table on this commit");
-    if (perDateExpected !== null) {
+    let currentContractParity = null;
+    if (CURRENT_Q1) {
+      // Conserve the immutable corpus independently of current D1 equality.
+      // Historical contract and cache differences retain their own diagnostics.
+      assert.ok(Array.isArray(golden.days) && golden.days.length > 0, "the immutable corpus contains daily evidence");
+      assert.deepEqual(parity.days, { golden: golden.days.length, actual: golden.days.length,
+        missingInActual: [], extraInActual: [] }, "every immutable corpus day is covered exactly");
+      for (const family of ["daily-days", "daily-totals", "daily-cells", "daily-other"]) {
+        const entries = parity.families.filter((entry) => entry.family === family);
+        assert.equal(entries.length, 1, `the immutable corpus has exactly one ${family} comparison`);
+        const expectedCount = family === "daily-days" ? 1 : golden.days.length;
+        assert.equal(entries[0].expected, false, `${family} has no historical difference waiver`);
+        assert.equal(entries[0].compared, expectedCount, `${family} compares the complete immutable corpus`);
+        assert.equal(entries[0].equal, expectedCount, `${family} conserves every compared value`);
+        assert.equal(entries[0].diffCount, 0, `the immutable corpus conserves ${family}`);
+      }
+      // Current equality includes refusals in the served response and preview.
+      // PG's internal run history remains separate diagnostic evidence.
+      currentContractParity = compareAnalyticsV2CurrentContract({ reference: seeded.evidence.reference,
+        referenceBinding: seeded.evidence.binding, referenceSha256: rehearsal.currentReference.sha256,
+        actual, actualPreview });
+      assert.deepEqual(familyTable(currentContractParity), familyTable(rehearsal.currentContractParity),
+        "the edge read reproduces the current Worker/D1 rehearsal table");
+      for (const field of ["recomputationComplete", "corpusConvergenceComplete", "strictExportRefusalVerified"]) {
+        assert.equal(currentContractParity[field], true, `the current reference preserves ${field}`);
+      }
+      for (const field of ["recomputationSha256", "corpusConvergenceSha256", "strictExportRefusalSha256"]) {
+        assert.equal(currentContractParity[field], rehearsal.currentReference[field], `the comparison binds ${field}`);
+      }
+      assert.equal(currentContractParity.equal, true, "the full current response and preview equal fresh D1");
+      assert.equal(currentContractParity.unexpectedDiffs, 0);
+    } else if (perDateExpected !== null) {
       assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation");
     }
-    f.rows.push({ stage: "S9", id: "golden", bytes: answer.body.length,
+    f.rows.push({ stage: "S9", id: "golden", comparisonMode: S9_COMPARISON_MODE, bytes: answer.body.length,
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),
-      unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies,
-      families: familyTable(parity), rehearsalStatus: rehearsal.status });
+      unexpectedDiffs: (currentContractParity ?? parity).unexpectedDiffs,
+      unexpectedFamilies: (currentContractParity ?? parity).unexpectedFamilies,
+      families: familyTable(currentContractParity ?? parity), rehearsalStatus: rehearsal.status,
+      ...(CURRENT_Q1 ? { historicalComparison: { qualifying: false, families: familyTable(parity),
+        unexpectedDiffs: parity.unexpectedDiffs, unexpectedFamilies: parity.unexpectedFamilies },
+        currentContractParity: { ...currentContractParity, families: familyTable(currentContractParity) },
+        currentReference: rehearsal.currentReference } : {}) });
 
     // The live check's write tier, unchanged, through the same edge: accountless
     // enrollment, ownership and v1.2 authorization, then one shipped-client v1.2
@@ -2398,13 +3499,16 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     assert.ok(capabilities.length >= 1 && capabilities.every(({ status }) => status === 200), JSON.stringify(writes));
     assert.ok(writes.some(({ path, status }) => path === "/api/v1/me/telemetry-v12/domain-activate" && status === 201));
     f.rows.push({ stage: "S9", id: "golden-write-tier", statuses: writes.map(({ id, status }) => [id, status]) });
-  } finally {
+  }, async (kept) => {
     await instance?.dispose().catch(() => {});
     await origin?.close().catch(() => {});
-    for (const name of [...kept].reverse()) {
-      if (/^[a-z_][a-z0-9_]{0,62}$/u.test(name)) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    for (const name of [...kept].reverse()) await f.base.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    if (kept.length > 0) {
+      const remaining = await f.base.query("SELECT nspname FROM pg_namespace WHERE nspname = ANY($1::text[]) ORDER BY nspname",
+        [kept]);
+      assert.deepEqual(remaining.rows, [], "the exact owned generated schemas are independently absent");
     }
-  }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2451,6 +3555,6 @@ test("S7 privacy over every exchange of the run; the gcp edge never touched stor
       transportRetries: f.transportRetries,
       rows: f.rows,
     };
-    await writeFile(resolve(process.env.EDGE_E2E_REPORT), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+    await writeFile(resolve(process.env.EDGE_E2E_REPORT), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   }
 });

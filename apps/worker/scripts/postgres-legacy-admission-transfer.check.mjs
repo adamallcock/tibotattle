@@ -16,7 +16,11 @@ import {
   createSyntheticLegacyAdmissionSource,
   runPostgresLegacyAdmissionTransfer,
 } from "./postgres-legacy-admission-transfer.mjs";
-import { applyPostgresMigrations } from "./postgres-migrations.mjs";
+import {
+  applyPostgresMigrations,
+  migrationHistoryTable,
+  readPostgresMigrations,
+} from "./postgres-migrations.mjs";
 import { runLegacyAdmissionTransferBench } from "./postgres-legacy-admission-transfer.bench.mjs";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
@@ -255,6 +259,21 @@ test("importer page size is bounded and benchmark is opt-in", async () => {
   await assert.rejects(runLegacyAdmissionTransferBench({ env: {} }), /BENCHMARK_EXPLICIT_OPT_IN_REQUIRED/u);
 });
 
+test("legacy admission rehearsal pins 78 primary migrations including the reviewed classification indexes", async () => {
+  const migrations = await readPostgresMigrations({ role: "primary" });
+  assert.equal(migrations.length, 78);
+  assert.deepEqual(migrations.map(({ version }) => version),
+    Array.from({ length: 78 }, (_, index) => index + 1));
+  // GCP's additive 0078 retained every earlier full name and SQL byte. Pin the
+  // reviewed tail independently of the application receipt's observed count.
+  const { version, name, sha256 } = migrations.at(-1);
+  assert.deepEqual({ version, name, sha256 }, {
+    version: 78,
+    name: "0078_classification_link_lookup_indexes.sql",
+    sha256: "e42c24f99b027ef1f313a685a5212ec4b2a0243cc61204877d6de5a68f06054e",
+  });
+});
+
 test("PG17 transfer requires both base receipts, checkpoints pages, resumes, and keeps receipt historical", { skip: !PG_TEST_SOCKET }, async () => {
   const socket = await localSocket();
   const suffix = randomBytes(6).toString("hex");
@@ -271,8 +290,17 @@ test("PG17 transfer requires both base receipts, checkpoints pages, resumes, and
     targetCreated = true;
     await pool.query(`CREATE SCHEMA ${quote(controlSchema)}`);
     controlCreated = true;
+    const expectedMigrationPins = (await readPostgresMigrations({ role: "primary" }))
+      .map(({ version, name, sha256 }) => [version, name, sha256]);
+    assert.equal(expectedMigrationPins.length, 78);
     const migration = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
     assert.equal(migration.applied, 78);
+    assert.deepEqual(migration.migrations.map(({ version, name, sha256 }) => [version, name, sha256]),
+      expectedMigrationPins);
+    const migrationHistory = await pool.query(`SELECT version,name,checksum_sha256
+      FROM ${quote(targetSchema)}.${migrationHistoryTable()} ORDER BY version`);
+    assert.deepEqual(migrationHistory.rows.map(({ version, name, checksum_sha256 }) => [version, name, checksum_sha256]),
+      expectedMigrationPins);
     await pool.query(`INSERT INTO ${quote(targetSchema)}.typed_telemetry_namespaces(id,original_id) VALUES(1,$1)`, [Buffer.from([1, 2])]);
     await pool.query(`INSERT INTO ${quote(targetSchema)}.typed_telemetry_source_family_receipts
       (source_namespace,source_format,generation,source_digest,source_row_count,membership_row_count,reconciled_at)
@@ -484,8 +512,17 @@ test("PG17 stages exact sealed headers with a replay-safe control receipt before
     targetCreated = true;
     await pool.query("CREATE SCHEMA " + quote(controlSchema));
     controlCreated = true;
+    const expectedMigrationPins = (await readPostgresMigrations({ role: "primary" }))
+      .map(({ version, name, sha256 }) => [version, name, sha256]);
+    assert.equal(expectedMigrationPins.length, 78);
     const migration = await applyPostgresMigrations({ role: "primary", schema: targetSchema, pool });
     assert.equal(migration.applied, 78);
+    assert.deepEqual(migration.migrations.map(({ version, name, sha256 }) => [version, name, sha256]),
+      expectedMigrationPins);
+    const migrationHistory = await pool.query(`SELECT version,name,checksum_sha256
+      FROM ${quote(targetSchema)}.${migrationHistoryTable()} ORDER BY version`);
+    assert.deepEqual(migrationHistory.rows.map(({ version, name, checksum_sha256 }) => [version, name, checksum_sha256]),
+      expectedMigrationPins);
     const target = quote(targetSchema);
     await pool.query("INSERT INTO " + target + ".typed_telemetry_namespaces(id,original_id) VALUES(1,$1)", [Buffer.from([1, 2])]);
     await pool.query("INSERT INTO " + target + ".typed_telemetry_source_family_receipts " +

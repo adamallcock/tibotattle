@@ -1,4 +1,6 @@
-import { preparePostgresClassificationActivation } from "./postgres-classification-activation";
+import {
+  preparePostgresClassificationActivation, PostgresClassificationActivationRefusalError,
+} from "./postgres-classification-activation";
 import { postgresClassificationLinkPredicate } from "./postgres-classification-links";
 import { PostgresClassificationCorrectionError } from "./postgres-classification-correction";
 import {
@@ -10,6 +12,7 @@ import {
 import { canonicalJson } from "./canonical-json";
 import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
+import { assertPostgresCollectionControl } from "./postgres-collection-controls";
 import {
   createPostgresSchemaConfig,
   quotePostgresIdentifier,
@@ -27,6 +30,9 @@ import {
   classifyPostgresTelemetryV12StorageError,
   postgresTelemetryV12StorageFailure,
 } from "./postgres-telemetry-v12-storage-refusal";
+import {
+  markTelemetryActivationRefusalPhase, type TelemetryActivationRefusalPhase,
+} from "./telemetry-activation-observation";
 import type {
   TelemetryV12DomainActivation as TelemetryV12DomainActivationBase,
   TelemetryV12DomainPredecessor,
@@ -62,6 +68,14 @@ interface ReadyManifestRow {
   manifest_digest: string;
 }
 
+interface ReadyManifestPairRow {
+  chunk_day: string;
+  earliest_id: string;
+  earliest_digest: string;
+  latest_id: string;
+  latest_digest: string;
+}
+
 interface ActiveDomainRow {
   id: string;
   manifest_digest: string;
@@ -80,10 +94,17 @@ interface PredecessorRow {
   consumed_at: string | Date | null;
 }
 
-interface DomainDayReference {
-  day: string;
-  manifestId: string;
-  manifestDigest: string;
+export interface TelemetryV12DomainDayReference {
+  readonly day: string;
+  readonly manifestId: string;
+  readonly manifestDigest: string;
+}
+
+type DomainDayReference = TelemetryV12DomainDayReference;
+
+export interface TelemetryV12OwnerRecoveryPredecessor {
+  readonly predecessor: TelemetryV12DomainPredecessor;
+  readonly candidateDays: readonly DomainDayReference[];
 }
 
 function table(schema: string, name: string): string {
@@ -118,8 +139,9 @@ function preserveSafeError(error: unknown): Error | null {
   return classifyPostgresTelemetryV12StorageError(error);
 }
 
-function conflict(): ApiError {
-  return new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+function conflict(phase?: TelemetryActivationRefusalPhase): ApiError {
+  const error = new ApiError(409, "TELEMETRY_MANIFEST_CONFLICT");
+  return phase ? markTelemetryActivationRefusalPhase(error, phase) : error;
 }
 
 /** A changed manifest on the same day may append records, but cannot erase or
@@ -143,7 +165,7 @@ async function assertSameDaySuccessorClosure(
       [day.manifestId, principal.participantId, principal.deviceId,
         day.day, day.manifestDigest],
     );
-    if (manifest.rows.length !== 1) throw conflict();
+    if (manifest.rows.length !== 1) throw conflict("closure");
     const summary = await client.query<{
       chunks: string; records: string; typed_records: string; legacy_records: string;
     }>(
@@ -166,7 +188,7 @@ async function assertSameDaySuccessorClosure(
         || Number(row.records) > expectedChunks * 200
         || row.records !== row.typed_records
         || row.legacy_records !== "0") {
-      throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+      throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "closure");
     }
   }
   const missing = await client.query(
@@ -184,26 +206,46 @@ async function assertSameDaySuccessorClosure(
       LIMIT 1`,
     [previous.manifestId, successor.manifestId,activationDigest],
   );
-  if (missing.rows.length !== 0) throw conflict();
+  if (missing.rows.length !== 0) throw conflict("closure");
 }
 
 async function stateRow(client: PostgresClient, schema: string, participantId: string): Promise<StateRow> {
-  const result = await client.query<StateRow>(
-    `SELECT v.revision AS input_revision, h.generation_id, d.manifest_digest
+  // Acquire the participant's serialization row before reading the head. A
+  // joined SELECT ... FOR UPDATE can wait on v while retaining the statement's
+  // earlier READ COMMITTED snapshot for h, so a later writer could otherwise
+  // compare against a stale generation and overwrite the head.
+  const version = await client.query<Pick<StateRow, "input_revision">>(
+    `SELECT v.revision AS input_revision
        FROM ${table(schema, "participants")} p
        JOIN ${table(schema, "community_analytical_input_versions")} v
          ON v.participant_id = p.id
-       LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} h
-         ON h.participant_id = p.id
-       LEFT JOIN ${table(schema, "telemetry_v12_domains")} d ON d.id = h.generation_id
       WHERE p.id = $1 AND p.state = 'active'
       FOR UPDATE OF v`,
     [participantId],
   );
-  const state = result.rows[0];
-  if (!state || result.rows.length !== 1) throw conflict();
-  revision(state.input_revision);
-  return state;
+  const locked = version.rows[0];
+  if (!locked || version.rows.length !== 1) throw conflict("state");
+
+  // This separate statement obtains a fresh READ COMMITTED snapshot after the
+  // serialization lock is held. Every predecessor issue and activation reads
+  // the head only after any earlier participant mutation has committed.
+  const head = await client.query<Pick<StateRow, "generation_id" | "manifest_digest">>(
+    `SELECT h.generation_id, d.manifest_digest
+       FROM ${table(schema, "participants")} p
+       LEFT JOIN ${table(schema, "telemetry_v12_domain_heads")} h
+         ON h.participant_id = p.id
+       LEFT JOIN ${table(schema, "telemetry_v12_domains")} d ON d.id = h.generation_id
+      WHERE p.id = $1 AND p.state = 'active'`,
+    [participantId],
+  );
+  const current = head.rows[0];
+  if (!current || head.rows.length !== 1) throw conflict("state");
+  revision(locked.input_revision);
+  return {
+    input_revision: locked.input_revision,
+    generation_id: current.generation_id,
+    manifest_digest: current.manifest_digest,
+  };
 }
 
 async function activeDomainByDigest(
@@ -244,7 +286,16 @@ export function createPostgresTypedV12Domain(
     principal: PostgresTypedV12Principal,
     nowEpoch?: number,
   ): Promise<TelemetryV12DomainPredecessor>;
+  createOwnerRecoveryPredecessor(
+    principal: PostgresTypedV12Principal,
+    nowEpoch?: number,
+  ): Promise<TelemetryV12OwnerRecoveryPredecessor>;
   activate(
+    principal: PostgresTypedV12Principal,
+    value: unknown,
+    nowEpoch?: number,
+  ): Promise<TelemetryV12DomainActivation>;
+  activateOwnerRecovery(
     principal: PostgresTypedV12Principal,
     value: unknown,
     nowEpoch?: number,
@@ -254,46 +305,119 @@ export function createPostgresTypedV12Domain(
   const schema = quotePostgresIdentifier(config.primarySchema);
   const authorityOptions = { schema: config };
 
-  return Object.freeze({
-    async createPredecessor(principal: PostgresTypedV12Principal, nowEpoch = Date.now()) {
+  const issuePredecessor = async (
+    principal: PostgresTypedV12Principal,
+    nowEpoch: number,
+    ownerRecovery: boolean,
+  ): Promise<TelemetryV12DomainPredecessor | TelemetryV12OwnerRecoveryPredecessor> => {
       const now = iso(nowEpoch);
       const expiresAt = iso(nowEpoch + PREDECESSOR_TTL_MS);
       return withPostgresMutation(pool, async (client) => {
+        if (ownerRecovery) {
+          await assertPostgresCollectionControl(client, config.primarySchema, "processing", { forShare: true });
+        }
         await assertPostgresTypedV12WriteAllowed(client, principal, nowEpoch, authorityOptions);
         const state = await stateRow(client, schema, principal.participantId);
+        if (ownerRecovery && state.generation_id !== null) throw conflict("state");
         // One row per ready day: its earliest ready manifest, as D1 reads it.
         // A device keeps every earlier ready manifest of a day (new records or
         // a parser release re-digest the day, and 0035 retains ready rows), so
         // its ready rows grow while its days do not. The bound is on days; a
         // row bound would refuse a small domain with a 400 the client treats
         // as final. COLLATE "C" keeps SQLite's BINARY tie-break on id.
-        const result = await client.query<ReadyManifestRow>(
-          `SELECT id, to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day, manifest_digest
-             FROM (
-               SELECT id, chunk_day, manifest_digest,
-                      row_number() OVER (
-                        PARTITION BY chunk_day ORDER BY created_at, id COLLATE "C"
-                      ) AS version
-                 FROM ${table(schema, "telemetry_v12_day_manifests")}
-                WHERE participant_id = $1 AND device_id = $2 AND state = 'ready'
-             ) m
-            WHERE version = 1
-            ORDER BY m.chunk_day LIMIT $3`,
-          [principal.participantId, principal.deviceId, MAX_TELEMETRY_V12_DOMAIN_DAYS + 1],
-        );
-        if (result.rows.length > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
-          throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
-        }
-        // The query yields each day once; a repeated day is storage failure.
-        const byDay = new Map<string, ReadyManifestRow>();
-        for (const row of result.rows) {
-          if (!utcDay(row.chunk_day) || !SHA256.test(row.manifest_digest)
-              || byDay.has(row.chunk_day)) {
+        let days: ReadyManifestRow[];
+        let candidateDays: TelemetryV12DomainDayReference[] | null = null;
+        if (ownerRecovery) {
+          const paired = await client.query<ReadyManifestPairRow>(
+            `SELECT to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day,
+                    max(id) FILTER (WHERE earliest_version = 1) AS earliest_id,
+                    max(manifest_digest) FILTER (WHERE earliest_version = 1) AS earliest_digest,
+                    max(id) FILTER (WHERE latest_version = 1) AS latest_id,
+                    max(manifest_digest) FILTER (WHERE latest_version = 1) AS latest_digest
+               FROM (
+                 SELECT id, chunk_day, manifest_digest,
+                        row_number() OVER (
+                          PARTITION BY chunk_day ORDER BY created_at, id COLLATE "C"
+                        ) AS earliest_version,
+                        row_number() OVER (
+                          PARTITION BY chunk_day ORDER BY created_at DESC, id COLLATE "C" DESC
+                        ) AS latest_version
+                   FROM ${table(schema, "telemetry_v12_day_manifests")}
+                  WHERE participant_id = $1 AND device_id = $2 AND state = 'ready'
+               ) ranked
+              GROUP BY chunk_day
+              ORDER BY chunk_day LIMIT $3`,
+            [principal.participantId, principal.deviceId, MAX_TELEMETRY_V12_DOMAIN_DAYS + 1],
+          );
+          if (paired.rows.length > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
+            throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
+          }
+          const earliestByDay = new Map<string, ReadyManifestRow>();
+          const latestByDay = new Map<string, ReadyManifestRow>();
+          for (const row of paired.rows) {
+            if (!utcDay(row.chunk_day) || typeof row.earliest_id !== "string"
+                || typeof row.latest_id !== "string" || !SHA256.test(row.earliest_digest)
+                || !SHA256.test(row.latest_digest) || earliestByDay.has(row.chunk_day)
+                || latestByDay.has(row.chunk_day)) {
+              throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+            }
+            earliestByDay.set(row.chunk_day, {
+              id: row.earliest_id, chunk_day: row.chunk_day, manifest_digest: row.earliest_digest,
+            });
+            latestByDay.set(row.chunk_day, {
+              id: row.latest_id, chunk_day: row.chunk_day, manifest_digest: row.latest_digest,
+            });
+          }
+          days = [...earliestByDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day));
+          candidateDays = [...latestByDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day))
+            .map((row) => ({ day: row.chunk_day, manifestId: row.id, manifestDigest: row.manifest_digest }));
+          if (days.length !== candidateDays.length || days.some((day, index) => day.chunk_day !== candidateDays![index]!.day)) {
             throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
           }
-          byDay.set(row.chunk_day, row);
+          if (candidateDays.length === 0) throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+          const probe = {
+            schemaVersion: "telemetry-domain-manifest-v1.2",
+            fromDay: candidateDays[0]!.day,
+            throughDay: candidateDays.at(-1)!.day,
+            predecessor: { token: "00000000-0000-4000-8000-000000000000",
+              previousGenerationId: null, legacyFingerprint: "0".repeat(64) },
+            days: candidateDays,
+            manifestDigest: "0".repeat(64),
+          };
+          try {
+            parseTelemetryV12DomainManifest(probe);
+          } catch {
+            throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+          }
+        } else {
+          const result = await client.query<ReadyManifestRow>(
+            `SELECT id, to_char(chunk_day, 'YYYY-MM-DD') AS chunk_day, manifest_digest
+               FROM (
+                 SELECT id, chunk_day, manifest_digest,
+                        row_number() OVER (
+                          PARTITION BY chunk_day ORDER BY created_at, id COLLATE "C"
+                        ) AS version
+                   FROM ${table(schema, "telemetry_v12_day_manifests")}
+                  WHERE participant_id = $1 AND device_id = $2 AND state = 'ready'
+               ) m
+              WHERE version = 1
+              ORDER BY m.chunk_day LIMIT $3`,
+            [principal.participantId, principal.deviceId, MAX_TELEMETRY_V12_DOMAIN_DAYS + 1],
+          );
+          if (result.rows.length > MAX_TELEMETRY_V12_DOMAIN_DAYS) {
+            throw new ApiError(400, "SYNC_RANGE_TOO_LARGE");
+          }
+          // The query yields each day once; a repeated day is storage failure.
+          const byDay = new Map<string, ReadyManifestRow>();
+          for (const row of result.rows) {
+            if (!utcDay(row.chunk_day) || !SHA256.test(row.manifest_digest)
+                || byDay.has(row.chunk_day)) {
+              throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+            }
+            byDay.set(row.chunk_day, row);
+          }
+          days = [...byDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day));
         }
-        const days = [...byDay.values()].sort((a, b) => a.chunk_day.localeCompare(b.chunk_day));
         // Same contract as the D1 predecessor: the shipped client asks for
         // this before it registers any day, so a device's first closure is
         // seeded with the current UTC day (v1.1 parity) instead of refused.
@@ -363,17 +487,26 @@ export function createPostgresTypedV12Domain(
             legacyFingerprint, revision(state.input_revision), fromDay, throughDay,
             daysJson, now, expiresAt],
         );
-        return {
+        const predecessor: TelemetryV12DomainPredecessor = {
           schemaVersion: "telemetry-domain-predecessor-v1.2" as const,
           token, previousGenerationId: state.generation_id,
           legacyFingerprint, fromDay, throughDay, expiresAt,
         };
-      }, { operation: "telemetry.v12.domain.predecessor", preserveSafeError }).catch((error) => {
+        return ownerRecovery ? { predecessor, candidateDays: candidateDays! } : predecessor;
+      }, {
+        operation: ownerRecovery ? "telemetry.v12.owner_recovery.predecessor" : "telemetry.v12.domain.predecessor",
+        preserveSafeError,
+      }).catch((error) => {
         throw postgresTelemetryV12StorageFailure(error);
       });
-    },
+    };
 
-    async activate(principal: PostgresTypedV12Principal, value: unknown, nowEpoch = Date.now()) {
+  const activateDomain = async (
+    principal: PostgresTypedV12Principal,
+    value: unknown,
+    nowEpoch: number,
+    ownerRecovery: boolean,
+  ): Promise<TelemetryV12DomainActivation> => {
       let manifest: ReturnType<typeof parseTelemetryV12DomainManifest>;
       try {
         manifest = JSON.parse(canonicalTelemetryV12Json(parseTelemetryV12DomainManifest(value)));
@@ -385,7 +518,12 @@ export function createPostgresTypedV12Domain(
       }
       const tokenHash = await sha256Hex(manifest.predecessor.token);
       return withPostgresMutation(pool, async (client) => {
+        if (ownerRecovery) {
+          await assertPostgresCollectionControl(client, config.primarySchema, "processing", { forShare: true });
+        }
         await assertPostgresTypedV12WriteAllowed(client, principal, nowEpoch, authorityOptions);
+        const ownerState = ownerRecovery ? await stateRow(client, schema, principal.participantId) : null;
+        if (ownerState && ownerState.generation_id !== null) throw conflict("state");
         const replay = await activeDomainByDigest(client, schema, principal, manifest.manifestDigest);
         if (replay) return activationResult(replay, true);
         const predecessorResult = await client.query<PredecessorRow>(
@@ -409,15 +547,16 @@ export function createPostgresTypedV12Domain(
             || predecessor.previous_generation_id !== manifest.predecessor.previousGenerationId
             || predecessor.legacy_fingerprint !== manifest.predecessor.legacyFingerprint
             || predecessor.days_json === null) {
-          throw conflict();
+          throw conflict("state");
         }
         await assertPostgresTypedV12WriteAllowed(client, principal, actualNow.getTime(), authorityOptions);
-        const state = await stateRow(client, schema, principal.participantId);
+        const state = ownerState ?? await stateRow(client, schema, principal.participantId);
         if (revision(state.input_revision) !== revision(predecessor.input_revision)
             || state.generation_id !== predecessor.previous_generation_id
+            || (ownerRecovery && state.generation_id !== null)
             || manifest.fromDay > predecessor.from_day
             || manifest.throughDay < predecessor.through_day) {
-          throw conflict();
+          throw conflict("state");
         }
         const daysJson = canonicalTelemetryV12Json(manifest.days);
         // A fresh predecessor token does not make an unchanged day vector new
@@ -456,7 +595,7 @@ export function createPostgresTypedV12Domain(
           !item || typeof item !== "object" || typeof item.day !== "string"
           || typeof item.manifestId !== "string" || typeof item.manifestDigest !== "string"
           || !manifest.days.some((day) => day.day === item.day))) {
-          throw conflict();
+          throw conflict("state");
         }
         const desiredIds = manifest.days.map((day) => day.manifestId);
         const ready = await client.query<ReadyManifestRow>(
@@ -471,7 +610,7 @@ export function createPostgresTypedV12Domain(
           const row = readyById.get(day.manifestId);
           return !row || row.chunk_day !== day.day || row.manifest_digest !== day.manifestDigest;
         })) {
-          throw new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE");
+          throw markTelemetryActivationRefusalPhase(new ApiError(409, "TELEMETRY_MANIFEST_INCOMPLETE"), "state");
         }
         const generationId = crypto.randomUUID();
         try {
@@ -482,6 +621,7 @@ export function createPostgresTypedV12Domain(
             manifestDigest:manifest.manifestDigest,days:manifest.days,predecessorDays:existingDays as DomainDayReference[],
           });
         } catch(error) {
+          if(error instanceof PostgresClassificationActivationRefusalError) throw conflict(error.phase);
           if(error instanceof PostgresClassificationCorrectionError) throw conflict();
           throw error;
         }
@@ -526,7 +666,7 @@ export function createPostgresTypedV12Domain(
           RETURNING generation_id`,
           [principal.participantId, generationId, committedAt],
         );
-        if (head.rows[0]?.generation_id !== generationId) throw conflict();
+        if (head.rows[0]?.generation_id !== generationId) throw conflict("state");
         const consumed = await client.query(
           `UPDATE ${table(schema, "telemetry_v12_domain_predecessors")}
               SET consumed_at = $1
@@ -534,7 +674,7 @@ export function createPostgresTypedV12Domain(
               AND consumed_at IS NULL AND expires_at > $1::timestamptz`,
           [committedAt, tokenHash, principal.participantId, principal.deviceId],
         );
-        if (consumed.rowCount !== 1) throw conflict();
+        if (consumed.rowCount !== 1) throw conflict("state");
         return activationResult({
           id: generationId,
           manifest_digest: manifest.manifestDigest,
@@ -542,7 +682,7 @@ export function createPostgresTypedV12Domain(
           through_day: manifest.throughDay,
         }, false);
       }, {
-        operation: "telemetry.v12.domain.activate",
+        operation: ownerRecovery ? "telemetry.v12.owner_recovery.activate" : "telemetry.v12.domain.activate",
         statementTimeoutMilliseconds: ACTIVATION_STATEMENT_TIMEOUT_MS,
         preserveSafeError,
       }).catch(async (error) => {
@@ -555,6 +695,20 @@ export function createPostgresTypedV12Domain(
         if (replay) return activationResult(replay, true);
         throw postgresTelemetryV12StorageFailure(error);
       });
+    };
+
+  return Object.freeze({
+    createPredecessor(principal, nowEpoch = Date.now()) {
+      return issuePredecessor(principal, nowEpoch, false) as Promise<TelemetryV12DomainPredecessor>;
+    },
+    createOwnerRecoveryPredecessor(principal, nowEpoch = Date.now()) {
+      return issuePredecessor(principal, nowEpoch, true) as Promise<TelemetryV12OwnerRecoveryPredecessor>;
+    },
+    activate(principal, value, nowEpoch = Date.now()) {
+      return activateDomain(principal, value, nowEpoch, false);
+    },
+    activateOwnerRecovery(principal, value, nowEpoch = Date.now()) {
+      return activateDomain(principal, value, nowEpoch, true);
     },
   });
 }

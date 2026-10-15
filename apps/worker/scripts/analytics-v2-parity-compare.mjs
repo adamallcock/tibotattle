@@ -84,13 +84,35 @@
 // per-date expectation must be for the golden's clock (nowMs). Prints one JSON
 // report; exits 0 when there is no unexpected difference, 1 otherwise, 2 on a
 // usage error. Inputs are synthetic and content-free.
+//
+// Current qualification is a separate mode, with no historical waivers:
+//   --comparison-mode current-worker-d1 --current-reference <reference.json>
+//   --current-reference-binding <binding.json> --actual <response.json>
+//   --current-reference-sha256 <accepted-json-stringify-sha256> --actual-preview <preview.json>
+// Its binding is captured independently from the candidate source/runtime and
+// immutable corpus before the reference runs. The reference digest comes from
+// the accepted D1 producer receipt, before any PG read; it is never inferred
+// from the supplied file by this comparator. It hashes UTF-8 JSON.stringify
+// bytes in producer key order, not a key-sorted encoding. A partial reference
+// cannot pass. Its v2 evidence describes corpus-specific convergence, actual
+// strict export refusal, and actual current recomputation separately. Expected
+// conflict queues never become a quiescent whole-export claim.
+// This saved-file CLI checks preservation and equality against caller-supplied
+// accepted evidence; it cannot establish that a native D1 execution occurred.
+// The qualification controller separately enforces its preserved producer receipt.
 
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import {
+  assessCurrentQ1ReferenceCompleteness,
+  validateCurrentQ1ReferenceBinding,
+} from "../postgres-test/fixtures/current-q1-d1-reference.mjs";
 
 export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v4";
+export const ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION = "analytics-v2-current-contract-report-v2";
 export const ANALYTICS_V2_PARITY_FAMILIES = Object.freeze([
   "envelope", "daily-days", "daily-totals", "daily-cells", "spend", "daily-other",
   "allowance-breakdowns", "breakdowns-v13-metadata", "model-days", "model-days-per-date", "preview",
@@ -458,15 +480,145 @@ function usageFail(message) {
   process.exit(2);
 }
 
+/** Scheduling may vary only when it is an internally consistent publication.
+ * Missing or malformed scheduling evidence is not removed before comparison. */
+function normalizeCurrentResponse(value) {
+  if (!isObject(value) || !Array.isArray(value.days)) {
+    throw new TypeError("ANALYTICS_V2_CURRENT_SCHEDULE_INVALID");
+  }
+  const days = value.days.map((entry) => {
+    const payload = entry?.payload;
+    const releasedAt = entry?.releasedAt;
+    const epoch = typeof releasedAt === "string" ? Date.parse(releasedAt) : NaN;
+    if (!isObject(entry) || !DAY_PATTERN.test(entry.day) || !isObject(payload)
+        || !Number.isSafeInteger(entry.revision) || entry.revision < 1
+        || !Number.isFinite(epoch) || new Date(epoch).toISOString() !== releasedAt
+        || payload.day !== entry.day || payload.revision !== entry.revision
+        || payload.releasedAt !== releasedAt
+        || payload.aggregateId !== `community-daily:${entry.day}:r${entry.revision}`) {
+      throw new TypeError("ANALYTICS_V2_CURRENT_SCHEDULE_INVALID");
+    }
+    return normalizeServedDay(entry);
+  });
+  return { ...value, days };
+}
+
+/** Current Worker/D1 qualification has no historical difference waivers.
+ * Its independently captured binding and complete reference are mandatory;
+ * expected values are never reconstructed from the actual PG output. The
+ * producer controller owns native execution and accepted-receipt enforcement;
+ * this pure function checks the supplied accepted evidence and DTO equality. */
+export function compareAnalyticsV2CurrentContract({ reference, referenceBinding, referenceSha256, actual, actualPreview }) {
+  let measured;
+  try { measured = createHash("sha256").update(JSON.stringify(reference) ?? "").digest("hex"); } catch {
+    throw new TypeError("ANALYTICS_V2_CURRENT_REFERENCE_DIGEST_MISMATCH");
+  }
+  if (typeof referenceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(referenceSha256) || measured !== referenceSha256) {
+    throw new TypeError("ANALYTICS_V2_CURRENT_REFERENCE_DIGEST_MISMATCH");
+  }
+  validateCurrentQ1ReferenceBinding({ reference, expected: referenceBinding });
+  const completeness = assessCurrentQ1ReferenceCompleteness({
+    reference, corpus: referenceBinding.corpusStructure,
+    snapshotReadiness: {
+      afterForcedRecompute: reference?.afterForcedRecompute?.readiness,
+      afterNativeProbes: reference?.afterNativeProbes?.readiness,
+    },
+  });
+  if (reference?.qualification !== "complete" || completeness.state !== "complete") {
+    throw new TypeError("ANALYTICS_V2_CURRENT_REFERENCE_INCOMPLETE");
+  }
+  const expected = reference.afterNativeProbes;
+  const publicResponse = family("public-response");
+  const adminPreview = family("admin-preview");
+  record(publicResponse, "$", normalizeCurrentResponse(expected.publicResponse.body), normalizeCurrentResponse(actual));
+  record(adminPreview, "preview", expected.adminPreview, actualPreview);
+  const families = [publicResponse, adminPreview];
+  const unexpectedDiffs = families.reduce((sum, entry) => sum + entry.diffCount, 0);
+  return Object.freeze({
+    schemaVersion: ANALYTICS_V2_CURRENT_CONTRACT_REPORT_VERSION,
+    comparisonMode: "current-worker-d1",
+    evidenceScope: "reference-comparison-only",
+    establishesNativeExecution: false,
+    referenceQualification: "complete",
+    referenceBound: true,
+    referenceComplete: true,
+    recomputationComplete: true,
+    corpusConvergenceComplete: true,
+    strictExportRefusalVerified: true,
+    recomputationSha256: createHash("sha256").update(JSON.stringify(reference.recomputation)).digest("hex"),
+    corpusConvergenceSha256: createHash("sha256").update(JSON.stringify(reference.corpusConvergence)).digest("hex"),
+    strictExportRefusalSha256: createHash("sha256").update(JSON.stringify(reference.strictExportRefusal)).digest("hex"),
+    referenceSha256,
+    reference: {
+      schemaVersion: reference.schemaVersion,
+      sourceHead: referenceBinding.source.head,
+      sourceSha256: referenceBinding.source.sha256,
+      migrationSha256: referenceBinding.migrationSha256,
+      corpusSha256: referenceBinding.corpus.canonicalSha256,
+      runtime: referenceBinding.runtime,
+    },
+    normalized: ["days[].revision", "days[].releasedAt", "payload.revision", "payload.releasedAt",
+      "payload.aggregateId :r<revision> suffix"],
+    equal: unexpectedDiffs === 0,
+    unexpectedDiffs,
+    unexpectedFamilies: families.filter((entry) => entry.diffCount > 0).map((entry) => entry.family),
+    families,
+  });
+}
+
+/** Closed CLI grammar. An omitted mode retains the historical comparison. */
+export function parseAnalyticsV2ParityCompareArgs(argv) {
+  const flags = new Set(["--comparison-mode", "--golden", "--actual", "--actual-preview", "--per-date-expected",
+    "--current-reference", "--current-reference-binding", "--current-reference-sha256"]);
+  const values = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index], value = argv[index + 1];
+    if (!flags.has(flag) || Object.hasOwn(values, flag) || typeof value !== "string" || value.length === 0
+        || value.startsWith("--")) throw new TypeError("ANALYTICS_V2_PARITY_ARGUMENTS_INVALID");
+    values[flag] = value;
+  }
+  const mode = values["--comparison-mode"] ?? "historical";
+  if (!["historical", "current-worker-d1"].includes(mode)) {
+    throw new TypeError("ANALYTICS_V2_PARITY_ARGUMENTS_INVALID");
+  }
+  const current = mode === "current-worker-d1";
+  const required = current ? ["--current-reference", "--current-reference-binding", "--current-reference-sha256",
+    "--actual", "--actual-preview"]
+    : ["--golden", "--actual"];
+  const incompatible = current ? ["--golden", "--per-date-expected"]
+    : ["--current-reference", "--current-reference-binding", "--current-reference-sha256"];
+  if (required.some((flag) => !Object.hasOwn(values, flag))
+      || incompatible.some((flag) => Object.hasOwn(values, flag))) {
+    throw new TypeError("ANALYTICS_V2_PARITY_ARGUMENTS_INVALID");
+  }
+  return { mode, values };
+}
+
 async function main(argv) {
-  const value = (flag) => {
-    const index = argv.indexOf(flag);
-    return index >= 0 ? argv[index + 1] : undefined;
-  };
+  let parsed;
+  try { parsed = parseAnalyticsV2ParityCompareArgs(argv); } catch { usageFail("ANALYTICS_V2_PARITY_ARGUMENTS_INVALID"); }
+  const value = (flag) => parsed.values[flag];
+  const read = async (path) => JSON.parse(await readFile(resolve(path), "utf8"));
+  if (parsed.mode === "current-worker-d1") {
+    let report;
+    try {
+      report = compareAnalyticsV2CurrentContract({
+        reference: await read(value("--current-reference")),
+        referenceBinding: await read(value("--current-reference-binding")),
+        referenceSha256: value("--current-reference-sha256"),
+        actual: await read(value("--actual")), actualPreview: await read(value("--actual-preview")),
+      });
+    } catch (error) {
+      const closed = new Set(["CURRENT_Q1_REFERENCE_BINDING_INVALID", "ANALYTICS_V2_CURRENT_REFERENCE_INCOMPLETE",
+        "ANALYTICS_V2_CURRENT_SCHEDULE_INVALID", "ANALYTICS_V2_CURRENT_REFERENCE_DIGEST_MISMATCH"]);
+      usageFail(closed.has(error?.message) ? error.message : "ANALYTICS_V2_CURRENT_INPUT_INVALID");
+    }
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    process.exitCode = report.equal ? 0 : 1;
+    return;
+  }
   const goldenDirectory = value("--golden");
   const actualPath = value("--actual");
-  if (!goldenDirectory || !actualPath) usageFail("--golden <dir> and --actual <response.json> are required");
-  const read = async (path) => JSON.parse(await readFile(resolve(path), "utf8"));
   const actualPreviewPath = value("--actual-preview");
   const perDatePath = value("--per-date-expected");
   const manifestPath = join(goldenDirectory, "manifest.json");

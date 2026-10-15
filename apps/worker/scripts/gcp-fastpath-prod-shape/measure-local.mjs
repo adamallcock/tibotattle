@@ -29,7 +29,7 @@
 //     flags. Dense inline uses heap12288MiB and semi-space64MiB; both profiles
 //     use ANALYTICS_V2_MEMORY_BUDGET_MIB=10752;
 //     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; a24h task timeout),
-//     wrapped in /usr/bin/time -l for the
+//     wrapped in /usr/bin/time (BSD -l on macOS; GNU -f on Linux) for the
 //     process's peak resident set, while the process's resident set and CPU
 //     time are sampled every 5 s (ps) for the utilisation of its threads;
 //  4. records the job's receipt (phase timings, read ledger, memory summary,
@@ -215,8 +215,30 @@ const poolFor = (endpoint, database, max = 6) => {
   return pool;
 };
 
-/** /usr/bin/time -l's peak resident set (bytes) and CPU seconds, from its stderr tail. */
-function parseTimeL(stderr) {
+const GNU_TIME_FORMAT = "meas-synth-time-v1 %M %e %U %S";
+
+/** Select the actual platform's time implementation; unsupported platforms refuse. */
+export function timeArguments(platform = process.platform) {
+  if (platform === "darwin") return ["-l"];
+  if (platform === "linux") return ["-f", GNU_TIME_FORMAT];
+  fail("MEAS_SYNTH_TIME_PLATFORM_UNSUPPORTED", platform);
+}
+
+/** Peak resident set in bytes and CPU seconds; GNU time does not report peak memory footprint. */
+export function parseTime(stderr, platform = process.platform) {
+  timeArguments(platform);
+  if (platform === "linux") {
+    // GNU %M is KiB, %e/%U/%S are seconds. The explicit format and C locale
+    // avoid localized labels and the default elapsed-time clock notation.
+    const match = /^meas-synth-time-v1 ([0-9]+) ([0-9]+(?:\.[0-9]+)?) ([0-9]+(?:\.[0-9]+)?) ([0-9]+(?:\.[0-9]+)?)$/mu.exec(String(stderr));
+    const rssBytes = match === null ? null : Number(match[1]) * 1024;
+    const seconds = (index) => {
+      const value = match === null ? null : Number(match[index]);
+      return value !== null && Number.isFinite(value) && value >= 0 ? value : null;
+    };
+    return { maxResidentSetBytes: Number.isSafeInteger(rssBytes) && rssBytes >= 0 ? rssBytes : null,
+      peakMemoryFootprintBytes: null, realSeconds: seconds(2), userSeconds: seconds(3), sysSeconds: seconds(4) };
+  }
   const text = String(stderr);
   const number = (pattern) => {
     const match = text.match(pattern);
@@ -366,13 +388,13 @@ export function workerProfileEnv({ workerProfileDir = null, workerProfileSource 
     ...(memoryProfile ? { ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY: "1" } : {}) };
 }
 
-/** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
+/** One full refresh under the platform's /usr/bin/time, measured to the end, its process sampled. */
 export async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, matrixRequested = {}, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
   let started, sampler = null, stdout = "", stderr = "";
   const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
     started = performance.now();
-    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema, matrixRequested)], {
-      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile) }),
+    const child = spawn("/usr/bin/time", [...timeArguments(), node22, ...refreshArguments(profile, schema, matrixRequested)], {
+      cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile), LC_ALL: "C" }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -403,7 +425,7 @@ export async function runRefresh({ node22, endpoint, database, schema, outDir, l
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
     measurementIdentity: refreshMeasurementIdentity(profile, matrixRequested),
-    time: parseTimeL(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
+    time: parseTime(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 

@@ -482,14 +482,16 @@ export function chartedModelsWith(published = []) {
 // rebuild the exact wire shape it accepted, and a second spelling of a claim
 // is a second thing that can drift.
 //
-// v1.3 retains v1.1's Pro 20x meaning and adds a required model-metadata
-// wrapper. v1.4 uses the genuine four-plan Pro 10x basis with that same wrapper.
+// v1.2 retains the bare four-plan Pro 10x contract. v1.3 retains v1.1's
+// Pro 20x meaning and adds a required model-metadata wrapper. v1.4 uses
+// v1.2's four-plan Pro 10x basis with that same wrapper.
 // v1.5 uses the four-plan Pro 20x basis (Pro Max 25x at x0.8), same wrapper.
 // Version, basis, normalization and plan set are dispatched together; crossed
 // claims are refused rather than rescaling published estimates.
 export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
   "community-allowance-breakdowns-v1.0",
   "community-allowance-breakdowns-v1.1",
+  "community-allowance-breakdowns-v1.2",
   "community-allowance-breakdowns-v1.3",
   "community-allowance-breakdowns-v1.4",
   "community-allowance-breakdowns-v1.5",
@@ -502,6 +504,7 @@ const COMMUNITY_ALLOWANCE_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS =
   "seven_day_codex_pro10x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_PRO10_VERSION = "community-allowance-breakdowns-v1.2";
 const COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION = "community-allowance-breakdowns-v1.4";
 const COMMUNITY_ALLOWANCE_PRO20_PROMAX_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
@@ -510,9 +513,12 @@ const COMMUNITY_ALLOWANCE_MODEL_GATE =
   "shared_composition_kernel_identification";
 // Declared four-plan contracts. Version, basis, normalization, model basis and
 // plan set are one closed claim; the reader carries them on its result and the
-// cache rebuilds the same version from them. v1.0-v1.3 keep the bare historical
-// Pro 20x shape and are not in this table.
+// cache rebuilds the same version from them. The three-plan Pro 20x contracts
+// v1.0, v1.1 and v1.3 are not in this table.
 const DECLARED_BREAKDOWN_CONTRACTS = new Map([
+  [COMMUNITY_ALLOWANCE_PRO10_VERSION, Object.freeze({
+    basis: COMMUNITY_ALLOWANCE_PRO10_BASIS, normalization: COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+    modelBasis: COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS, planIds: PUBLIC_ALLOWANCE_FOUR_PLAN_IDS })],
   [COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION, Object.freeze({
     basis: COMMUNITY_ALLOWANCE_PRO10_BASIS, normalization: COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
     modelBasis: COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS, planIds: PUBLIC_ALLOWANCE_FOUR_PLAN_IDS })],
@@ -561,8 +567,9 @@ function retainedUnrecognizedCounts(value) {
 export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now(), { retained = false } = {}) {
   const isRecord = value !== null && typeof value === "object" && !Array.isArray(value);
   const declared = isRecord ? DECLARED_BREAKDOWN_CONTRACTS.get(value.schemaVersion) ?? null : null;
-  const isMetadataVersion = isRecord && (declared !== null
-    || value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION);
+  const isMetadataVersion = isRecord && (value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION
+    || value.schemaVersion === COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION
+    || value.schemaVersion === COMMUNITY_ALLOWANCE_PRO20_PROMAX_METADATA_VERSION);
   const basis = declared?.basis ?? COMMUNITY_ALLOWANCE_BASIS;
   const normalization = declared?.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION;
   const modelBasis = declared?.modelBasis ?? COMMUNITY_ALLOWANCE_MODEL_BASIS;
@@ -598,7 +605,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   const allowedDays = new Set(publishedDays);
   const days = [];
   const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-    || isMetadataVersion;
+    || declared !== null || isMetadataVersion;
   // A malformed block is ignored whole and reported, never partly trusted: the
   // page then draws only this build's own list, minus any held-back model.
   const metadata = hasMetadataBlock ? publicModelMetadata(value.modelConfig) : null;
@@ -660,7 +667,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   // both carries a count and still holds one contradicts itself: refuse it.
   if (carried !== null && unrecognizedModelTuples > 0) return null;
   return {
-    generatedAt: value.generatedAt, hasCombined, modelConfig, days,
+    schemaVersion: value.schemaVersion, generatedAt: value.generatedAt, hasCombined, modelConfig, days,
     ...(declared !== null ? { basis, normalization, planIds, modelBasis } : {}),
     // Counts only. An unrecognized id is dropped before it reaches this value.
     unrecognizedModelTuples: unrecognizedModelTuples + (carried?.tuples ?? 0),
@@ -1041,12 +1048,14 @@ function cachedAllowanceBlock(allowance) {
 }
 
 function cachedBreakdowns(breakdowns) {
-  // A declared contract (v1.4 Pro 10x, v1.5 Pro 20x with Pro Max) is rebuilt
+  // A declared contract (v1.2/v1.4 Pro 10x, v1.5 Pro 20x with Pro Max) is rebuilt
   // under its own version, even when its metadata was rejected. Historical
   // Pro 20x copies keep the prior projection: applied metadata uses v1.3;
   // rejected metadata uses v1.1 with omitted tuples counted.
-  const [declaredVersion, declared] = [...DECLARED_BREAKDOWN_CONTRACTS]
-    .find(([, contract]) => contract.normalization === breakdowns.normalization) ?? [null, null];
+  const declared = DECLARED_BREAKDOWN_CONTRACTS.get(breakdowns.schemaVersion) ?? null;
+  const declaredVersion = declared === null ? null : breakdowns.schemaVersion;
+  const requiresMetadata = declaredVersion === COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION
+    || declaredVersion === COMMUNITY_ALLOWANCE_PRO20_PROMAX_METADATA_VERSION;
   return {
     schemaVersion: declaredVersion ?? (breakdowns.modelMetadata === "applied"
       ? COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION
@@ -1066,7 +1075,7 @@ function cachedBreakdowns(breakdowns) {
     // entries it supplied are rebuilt, in the closed wire shape.
     // v1.4/v1.5 cannot be relabelled as the Pro 20x v1.1 cache shape. A rejected
     // metadata block remains explicitly rejected under its original contract.
-    ...(declared !== null && breakdowns.modelMetadata !== "applied" ? { modelConfig: null } : {}),
+    ...(requiresMetadata && breakdowns.modelMetadata !== "applied" ? { modelConfig: null } : {}),
     ...(breakdowns.modelMetadata === "applied" ? {
       modelConfig: breakdowns.modelConfig.filter(model => model.order !== undefined)
         .map(model => ({ id: model.modelId, label: model.label, family: model.family, order: model.order })),

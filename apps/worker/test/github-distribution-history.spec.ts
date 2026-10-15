@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import {
   readGithubDistributionSnapshot,
+  readGithubInventory,
   syncGithubDistributionSnapshots,
 } from "../src/github-distribution-history";
 
@@ -65,6 +66,40 @@ function githubFetcher(body: object[], status = 200): typeof fetch {
   }) as typeof fetch;
 }
 
+function pagedGithubFetcher(embeddedCount = 100, terminalCount = 100, terminalHasNext = false): {
+  fetcher: typeof fetch;
+  requests: { kind: "releases" | "assets"; page: number }[];
+} {
+  const requests: { kind: "releases" | "assets"; page: number }[] = [];
+  const assets = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
+    id: start + index, name: `synthetic-${start + index}.bin`, digest: null, download_count: 0,
+  }));
+  const fetcher = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    const releasePath = "/repos/adamallcock/tibotattle/releases";
+    expect(url.origin).toBe("https://api.github.com");
+    expect([releasePath, `${releasePath}/12/assets`]).toContain(url.pathname);
+    expect(url.searchParams.get("per_page")).toBe("100");
+    const page = Number(url.searchParams.get("page"));
+    const assetPage = url.pathname.endsWith("/assets");
+    requests.push({ kind: assetPage ? "assets" : "releases", page });
+    if (!assetPage) {
+      expect(page).toBe(1);
+      return Response.json([{
+        id: 12, tag_name: "v0.1.12", published_at: "2026-08-15T18:00:00.000Z",
+        draft: false, prerelease: false, assets: assets(1, embeddedCount),
+      }]);
+    }
+    expect(page).toBeGreaterThanOrEqual(2);
+    expect(page).toBeLessThanOrEqual(4);
+    return Response.json(assets((page - 1) * 100 + 1, page === 4 ? terminalCount : 100), {
+      headers: page < 4 || terminalHasNext
+        ? { link: '<https://api.github.com/next>; rel="next"' } : {},
+    });
+  }) as typeof fetch;
+  return { fetcher, requests };
+}
+
 beforeEach(async () => {
   await reset();
   const bindings = env as TestBindings;
@@ -72,6 +107,29 @@ beforeEach(async () => {
 });
 
 describe("GitHub distribution snapshot history", () => {
+  it("accepts the complete terminal inventory at exactly 400 assets", async () => {
+    const { fetcher, requests } = pagedGithubFetcher();
+    const result = await readGithubInventory(null, fetcher);
+    expect(result.releases).toHaveLength(1);
+    expect(result.releases[0]?.assets).toHaveLength(400);
+    expect(requests).toEqual([
+      { kind: "releases", page: 1 }, { kind: "assets", page: 2 },
+      { kind: "assets", page: 3 }, { kind: "assets", page: 4 },
+    ]);
+  });
+
+  it.each([
+    { name: "an oversized terminal asset page", embedded: 100, terminal: 101, next: false, requests: 4 },
+    { name: "an oversized embedded asset page", embedded: 401, terminal: 100, next: false, requests: 1 },
+    { name: "a 400-asset inventory with another page", embedded: 100, terminal: 100, next: true, requests: 4 },
+  ])("refuses $name before returning an inventory", async (scenario) => {
+    const { fetcher, requests } = pagedGithubFetcher(scenario.embedded, scenario.terminal, scenario.next);
+    await expect(readGithubInventory(null, fetcher)).rejects.toMatchObject({
+      code: "GITHUB_RELEASES_BOUNDED",
+    });
+    expect(requests).toHaveLength(scenario.requests);
+  });
+
   it("widens the append-only owner audit without weakening its existing guards", async () => {
     await reset();
     const bindings = env as TestBindings;

@@ -114,6 +114,9 @@ test("automatic retirement refuses unsafe files without replacing them", async (
     try {
       if (unsafe === "mode") {
         await writeFile(settingsFile, "unsafe-mode", { mode: 0o644 });
+        // Set the deliberately unsafe mode independently of the process umask.
+        await chmod(settingsFile, 0o644);
+        assert.equal((await lstat(settingsFile)).mode & 0o777, 0o644);
       } else {
         await writeFile(target, "symlink-target", { mode: 0o600 });
         await symlink(target, settingsFile);

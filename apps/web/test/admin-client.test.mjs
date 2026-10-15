@@ -1,4 +1,4 @@
-import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload, createAdminPro20PromaxAllowancePreviewPayload, withSeptember29AdminHistory, SERVER_V05_ADMIN_ALLOWANCE_PREVIEW, serverV05AdminAllowancePreview } from "./fixtures/admin-allowance.js";
+import { createAdminAllowancePreviewPayload, createHistorical40PpAdminAllowancePreviewPayload, createHistorical42ModelAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload, createAdminPro20PromaxAllowancePreviewPayload, withSeptember29AdminHistory, SERVER_V05_ADMIN_ALLOWANCE_PREVIEW, serverV05AdminAllowancePreview } from "./fixtures/admin-allowance.js";
 import { SERVER_V15_COMMUNITY_DAILY, serverV15CommunityDailyBody } from "./fixtures/public-allowance.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -1653,7 +1653,7 @@ test("admin preview exact v0.3/v0.4 dispatch preserves reference amounts, dates 
     assert.equal(projected.models.days.at(-1).day, payload.models.days.at(-1).day);
     assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd, payload.models.days.at(-1).values[0][1]);
     assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
-    if (payload.schemaVersion.endsWith("v0.4")) assert.equal(projected.spanFloorPp, 25);
+    assert.equal(projected.spanFloorPp, payload.spanFloorPp);
   }
 });
 
@@ -1816,5 +1816,58 @@ test("the R1 server's v0.5 admin preview projects under its exact contract with 
       assert.deepEqual(preview.byPlanType[plan], day.byPlanType[plan], `${day.day} ${plan}`);
     }
     assert.deepEqual(projected.models.days.find(entry => entry.day === day.day).values, day.models, `${day.day} models`);
+  }
+});
+
+
+test("admin v0.3 retains exact authored 25pp and historical 40pp qualification pairs", () => {
+  for (const payload of [createAdminAllowancePreviewPayload(), createHistorical40PpAdminAllowancePreviewPayload()]) {
+    const projected = projectAdminAllowancePreview(payload);
+    assert.equal(projected.qualification, payload.qualification);
+    assert.equal(projected.spanFloorPp, payload.spanFloorPp);
+    assert.deepEqual(projected.days, payload.days);
+  }
+  for (const [floor, qualification] of [
+    [25, "shared_reset_fit_gates_40pp_span_floor"],
+    [40, "shared_reset_fit_gates_25pp_span_floor"],
+    [30, "shared_reset_fit_gates_25pp_span_floor"],
+  ]) {
+    const payload = createAdminAllowancePreviewPayload();
+    payload.spanFloorPp = floor; payload.qualification = qualification;
+    assert.throws(() => projectAdminAllowancePreview(payload), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+  }
+  for (const build of [createAdminPro10AllowancePreviewPayload, createAdminPro20PromaxAllowancePreviewPayload]) {
+    const payload = build();
+    payload.spanFloorPp = 40; payload.qualification = "shared_reset_fit_gates_40pp_span_floor";
+    assert.throws(() => projectAdminAllowancePreview(payload), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+  }
+});
+
+test("admin accepts only the exact ordered 42-model predecessor with frozen historical days", () => {
+  const payload = createHistorical42ModelAdminAllowancePreviewPayload();
+  const projected = projectAdminAllowancePreview(payload);
+  assert.equal(projected.models.modelConfig.length, 42);
+  assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG.slice(0, 42));
+  assert.equal(projected.spanFloorPp, 40);
+  assert.deepEqual(projected.days, payload.days);
+  assert.equal(projected.models.days.at(-1).catalogVersion, "reviewed-model-catalog-2026-09-23.1");
+  assert.deepEqual(projected.models.days.at(-1).byModel["gpt-5.6-sol"], {
+    capacityUsd: payload.models.days.at(-1).values[0][1], participantCount: 2,
+  });
+  for (const mutate of [
+    value => { value.models.modelConfig.pop(); },
+    value => { value.models.modelConfig.splice(1, 1); },
+    value => { value.models.modelConfig.reverse(); },
+    value => { value.models.modelConfig[1] = structuredClone(value.models.modelConfig[0]); },
+    value => { value.models.modelConfig[0].modelId = "gpt-7-new-fixture"; },
+    value => { value.models.modelConfig[0].label = "Changed predecessor label"; },
+    value => { value.models.modelConfig[0].allowanceTrack = "spark"; },
+    value => { value.models.modelConfig[0].pricingStatus = "unpriced"; },
+    value => { value.models.days[0].catalogVersion = SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION; },
+    value => { value.models.days[0].values.push(["gpt-6.1-sol", 1234.5, 1]); },
+    value => { delete value.models.days[0].catalogVersion; },
+  ]) {
+    const invalid = createHistorical42ModelAdminAllowancePreviewPayload(); mutate(invalid);
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
   }
 });

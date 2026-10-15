@@ -1,5 +1,7 @@
 import { ApiError } from "./errors";
 
+export type TelemetryActivationRefusalPhase = "rekey" | "classification" | "state" | "session_closure" | "closure";
+
 /** Closed aggregate-only observations. Never copy a principal, manifest,
  * generation, token, request identifier, error message or provider field. */
 export interface TelemetryActivationObservation {
@@ -8,9 +10,14 @@ export interface TelemetryActivationObservation {
   readonly outcome: "activated" | "replayed" | "unchanged" | "refused" | "failed";
   readonly status: number;
   readonly code: string | null;
+  readonly refusalPhase: TelemetryActivationRefusalPhase | null;
   readonly elapsedMs: number;
   readonly at: string;
 }
+const REFUSAL_PHASES = new Set<TelemetryActivationRefusalPhase>([
+  "rekey", "classification", "state", "session_closure", "closure",
+]);
+const REFUSAL_PHASE_BY_ERROR = new WeakMap<ApiError, TelemetryActivationRefusalPhase>();
 const REFUSALS = new Set([
   "BODY_INVALID", "CHUNK_DIGEST_MISMATCH", "DEVICE_AUTH_INVALID", "DEVICE_CONSENT_REQUIRED",
   "TELEMETRY_MANIFEST_INVALID", "TELEMETRY_MANIFEST_CONFLICT", "TELEMETRY_MANIFEST_INCOMPLETE",
@@ -18,6 +25,22 @@ const REFUSALS = new Set([
   "SYNC_RANGE_TOO_LARGE", "TELEMETRY_TRANSPORT_BLOCKED", "TELEMETRY_TRANSPORT_DOWNGRADE_BLOCKED",
   "BACKEND_STORAGE_UNAVAILABLE", "PROCESSING_DISABLED", "COLLECTION_CONTROL_UNAVAILABLE",
 ]);
+
+function isApiError(error: unknown): error is ApiError {
+  try { return error instanceof ApiError; } catch { return false; }
+}
+
+/** Attach only an allowlisted internal phase without changing the API error. */
+export function markTelemetryActivationRefusalPhase<T extends ApiError>(
+  error: T,
+  phase: unknown,
+): T {
+  if (isApiError(error) && REFUSAL_PHASES.has(phase as TelemetryActivationRefusalPhase)
+      && !REFUSAL_PHASE_BY_ERROR.has(error)) {
+    REFUSAL_PHASE_BY_ERROR.set(error, phase as TelemetryActivationRefusalPhase);
+  }
+  return error;
+}
 
 export function createTelemetryActivationObserver(
   log: (observation: TelemetryActivationObservation) => unknown,
@@ -27,12 +50,13 @@ export function createTelemetryActivationObserver(
     if (protocol !== "v1.1" && protocol !== "v1.2") return invoke();
     let start = 0;
     try { start = clock(); } catch { /* observation is best effort */ }
-    const emit = async (outcome: TelemetryActivationObservation["outcome"], status: number, code: string | null) => {
+    const emit = async (outcome: TelemetryActivationObservation["outcome"], status: number, code: string | null,
+      refusalPhase: TelemetryActivationRefusalPhase | null) => {
       try {
         const end = clock();
         const elapsedMs = Number.isFinite(end - start) ? Math.min(600_000, Math.max(0, Math.floor(end - start))) : 0;
         void Promise.resolve(log(Object.freeze({ event: "telemetry_domain_activation", protocol, outcome, status, code,
-          elapsedMs, at: new Date(end).toISOString() }))).catch(() => {});
+          refusalPhase, elapsedMs, at: new Date(end).toISOString() }))).catch(() => {});
       } catch { /* logging cannot change an activation or its refusal */ }
     };
     try {
@@ -43,14 +67,27 @@ export function createTelemetryActivationObserver(
         outcome = Reflect.get(row, "unchanged") === true ? "unchanged"
           : Reflect.get(row, "replay") === true ? "replayed" : "activated";
       } catch { /* a result accessor cannot change a successful activation */ }
-      await emit(outcome, 201, null);
+      await emit(outcome, 201, null, null);
       return result;
     } catch (error) {
-      const status = error instanceof ApiError && Number.isSafeInteger(error.status)
-        && error.status >= 400 && error.status <= 599 ? error.status : 500;
-      const code = error instanceof ApiError && REFUSALS.has(error.code) ? error.code
-        : status >= 500 ? "ACTIVATION_UNAVAILABLE" : "ACTIVATION_REFUSED";
-      await emit(status >= 500 ? "failed" : "refused", status, code);
+      const apiError = isApiError(error) ? error : null;
+      let status = 500;
+      let code: string | null = null;
+      let refusalPhase: TelemetryActivationRefusalPhase | null = null;
+      if (apiError) {
+        try {
+          const candidate = apiError.status;
+          if (Number.isSafeInteger(candidate) && candidate >= 400 && candidate <= 599) status = candidate;
+        } catch { /* hostile accessors fail closed */ }
+        try {
+          const candidate = apiError.code;
+          if (REFUSALS.has(candidate)) code = candidate;
+        } catch { /* hostile accessors fail closed */ }
+        refusalPhase = protocol === "v1.2" && status < 500
+          ? REFUSAL_PHASE_BY_ERROR.get(apiError) ?? null : null;
+      }
+      code ??= status >= 500 ? "ACTIVATION_UNAVAILABLE" : "ACTIVATION_REFUSED";
+      await emit(status >= 500 ? "failed" : "refused", status, code, refusalPhase);
       throw error;
     }
   };

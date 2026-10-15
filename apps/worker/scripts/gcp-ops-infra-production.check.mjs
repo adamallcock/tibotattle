@@ -32,7 +32,7 @@ const EXECUTOR = "run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|serv
   + "tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|";
 const MAINTENANCE_EXECUTOR = "run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:"
   + "tibotattle-scheduler@tibotattle-prod.iam.gserviceaccount.com|";
-// D-OPS4's maintenance job and its pinned five-minute trigger, committed PAUSED.
+// D-OPS4's every-minute maintenance trigger, initially created PAUSED.
 const MAINTENANCE_TRIGGER = "tibotattle-maintenance-trigger";
 /** Whether the scheduler account holds run.jobsExecutor on the named job. */
 const executorOn = (world, job) => JSON.stringify(world.jobPolicies[job] ?? {}).includes("roles/run.jobsExecutor");
@@ -321,11 +321,13 @@ test("a cadence the owner commits later (synthetic here) is created paused after
     .some((reason) => reason.endsWith(":SCHEDULER_CADENCE_UNSET")), false);
 });
 
-test("the committed production refresh cadence is the owner's daily 03:00 UTC, created paused", () => {
-  const committed = JSON.parse(unpinnedProductionText());
-  assert.deepEqual(committed.scheduler["analytics-refresh"],
-    { name: "tibotattle-analytics-refresh-trigger", schedule: "0 3 * * *", state: "PAUSED" });
-  const flags = manifest.schedulerFlags(manifest.validateDesiredState(committed), "analytics-refresh");
+test("the committed production schedulers retain the owner's enabled cadences", () => {
+  const committed = manifest.loadCommittedDesiredState("production");
+  assert.deepEqual({ ...committed.scheduler["analytics-refresh"] },
+    { name: "tibotattle-analytics-refresh-trigger", schedule: "0 3 * * *", state: "ENABLED" });
+  assert.deepEqual({ ...committed.scheduler.maintenance },
+    { name: "tibotattle-maintenance-trigger", schedule: "* * * * *", state: "ENABLED" });
+  const flags = manifest.schedulerFlags(committed, "analytics-refresh");
   assert.ok(flags.includes("--schedule=0 3 * * *"));
   assert.ok(flags.includes("--time-zone=Etc/UTC"));
 });

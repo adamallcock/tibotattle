@@ -166,6 +166,11 @@ test("the reach proof: the origin's import graph into the D1 readers equals the 
   const origin = shipped.reachByFile.get("server.mjs");
   assert.deepEqual(origin["src/postgres-legacy-contribution-admission.ts"], ["src/telemetry-repository.ts"]);
   assert.deepEqual(origin["src/telemetry-repository.ts"], ["src/quota-analysis.ts"]);
+  assert.deepEqual(origin["src/analytics-v2/allowance-projection.ts"], ["src/admin-community-allowance.ts",
+    "src/analytics-v2/public-allowance-breakdowns-v14.ts", "src/analytics-v2/public-allowance-breakdowns-v15.ts",
+    "src/public-allowance-breakdowns.ts"]);
+  assert.deepEqual(origin["src/analytics-v2/public-model-metadata-current.ts"], ["src/admin-community-allowance.ts",
+    "src/analytics-v2/public-allowance-breakdowns-v14.ts", "src/analytics-v2/public-allowance-breakdowns-v15.ts"]);
   assert.deepEqual(origin["src/analytics-v2/public-allowance-breakdowns-v15.ts"],
     ["src/admin-community-allowance.ts", "src/community-allowance.ts"]);
   assert.deepEqual(origin["cloud-run/server.mjs"], ["cloud-run/postgres-production-host.mjs", "src/analytics-v2/community-daily-route.ts"]);
@@ -215,6 +220,19 @@ test("negative: a new route that imports a D1 reader, or a member that gains an 
   assert.deepEqual(reachSlack(smaller), ["server.mjs no longer has the import src/community-refresh-lanes.ts -> src/community-allowance.ts; remove it from D1_REACH"]);
   function edgeCount(reach) {
     return Object.values(reach).reduce((count, imports) => count + imports.length, 0);
+  }
+});
+
+test("negative: the current v1.5 projection cannot gain a direct D1 receipt-reader import", async () => {
+  const shipped = await shippedReaders();
+  const real = shipped.reachByFile.get("server.mjs");
+  const projector = "src/analytics-v2/public-allowance-breakdowns-v15.ts";
+  for (const reader of D1_READER_FILES) {
+    const doctored = new Map(shipped.reachByFile).set("server.mjs", {
+      ...real, [projector]: [...real[projector], reader].sort(),
+    });
+    assert.deepEqual(reachViolations(doctored).map((line) => line.split(";")[0]),
+      [`server.mjs: ${projector} imports ${reader}, a D1 receipt reader`]);
   }
 });
 

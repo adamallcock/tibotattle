@@ -1086,6 +1086,41 @@ async function defaultCreatePool(database, { connector }) {
   return pool;
 }
 
+/**
+ * pg's pool error handler covers idle clients, not checked-out clients. Attach
+ * before its acquire event removes the idle handler; detach only after release
+ * has restored that handler (or removal has closed the client). This also
+ * covers snapshot and server-stat readers without changing their query paths.
+ */
+function observeAnalyticsRefreshClients(pool, onError) {
+  if (typeof pool?.on !== "function" || typeof pool?.off !== "function") {
+    fail("ANALYTICS_V2_REFRESH_POOL_INVALID");
+  }
+  const clients = new Set();
+  const acquire = (client) => {
+    if (clients.has(client)) return;
+    if (typeof client?.on !== "function" || typeof client?.off !== "function") {
+      onError();
+      return;
+    }
+    clients.add(client);
+    client.on("error", onError);
+  };
+  const remove = (client) => {
+    if (clients.delete(client)) client.off("error", onError);
+  };
+  const release = (_error, client) => remove(client);
+  pool.on("acquire", acquire);
+  pool.on("release", release);
+  pool.on("remove", remove);
+  return () => {
+    pool.off("acquire", acquire);
+    pool.off("release", release);
+    pool.off("remove", remove);
+    for (const client of clients) remove(client);
+  };
+}
+
 
 /** Load the store and the default pipeline (bundled by esbuild from these literals). */
 export async function loadAnalyticsV2Modules() {
@@ -1469,7 +1504,8 @@ function refusalFigures(error) {
 
 /**
  * Run one refresh. dependencies (tests and the composition root only):
- * createPool(database, {connector}), createConnector(), closeResources(),
+ * createPool(database, {connector}) (pg Pool acquire/release/remove events),
+ * createConnector(), closeResources(),
  * modules ({store, pipeline}), wallClock(), randomUUID(), heapLimitBytes, execArgv, peakRssBytes(),
  * createProfiler(options), writeProfileLine(line), profileSignals (false: no SIGTERM handler).
  * Returns the receipt; throws an error carrying a closed code and phase (and,
@@ -1508,11 +1544,29 @@ export async function runAnalyticsRefresh({
   let discard = false;
   let receipt;
   let failure;
+  let workFailure;
+  let connectionFailure;
+  let stopObservingClients;
+  let workComplete = false;
   let readLedger = null;
   let profiler = null;
   let workerProfiles = null;
   let mainCapture = null;
   let onSignal = null;
+  const assertConnection = () => {
+    if (connectionFailure !== undefined) throw connectionFailure;
+  };
+  // Never retain the driver error, throw from an EventEmitter listener, or
+  // race outstanding reads with cleanup. The existing finally path drains
+  // workers/readers before releasing the snapshot and advisory-lock session.
+  const connectionLost = () => {
+    discard = true;
+    if (workComplete || workFailure !== undefined || failure !== undefined || connectionFailure !== undefined) return;
+    connectionFailure = Object.freeze({ code: "ANALYTICS_V2_REFRESH_CONNECTION_LOST", phase });
+    try {
+      if (ownerPool !== undefined) void ownerPool.abort().catch(() => {});
+    } catch { /* the finally path retries and drains the worker pool */ }
+  };
   try {
     const production = await readAnalyticsRefreshProductionTarget(env);
     if (production !== null) base.target = production.target;
@@ -1549,7 +1603,8 @@ export async function runAnalyticsRefresh({
         process.on("SIGTERM", onSignal);
       }
     }
-    const checkpoint = profiler === null && mainCapture === null ? guard.checkpoint : (event) => {
+    const checkpoint = (event) => {
+      assertConnection();
       profiler?.checkpoint(event);
       mainCapture?.checkpoint(PROFILE_WORK_PHASES[phase] ?? PROFILE_WORK_PHASES.unknown);
       guard.checkpoint(event);
@@ -1576,14 +1631,18 @@ export async function runAnalyticsRefresh({
     phase = "connection";
     if (database.kind === "cloud-sql") connector = dependencies.createConnector?.() ?? new Connector();
     pool = await (dependencies.createPool ?? defaultCreatePool)(database, { connector });
+    stopObservingClients = observeAnalyticsRefreshClients(pool, connectionLost);
     client = await pool.connect();
+    assertConnection();
 
     phase = "lock";
     mainCapture?.checkpoint(PROFILE_WORK_PHASES.lock);
     const lock = await client.query("SELECT pg_try_advisory_lock(hashtext($1)) AS acquired",
       [ANALYTICS_REFRESH_LOCK_KEY]);
+    assertConnection();
     if (lock?.rows?.[0]?.acquired !== true) {
       receipt = Object.freeze({ ...base, status: "ok", state: "LOCK_HELD" });
+      workComplete = true;
     } else {
       locked = true;
       phase = "read";
@@ -1637,6 +1696,7 @@ export async function runAnalyticsRefresh({
       let readMs;
       let reads;
       try {
+        assertConnection();
         inputs = await pipeline.read({
           pool: readPool,
           schema: parsed.schema,
@@ -1651,6 +1711,7 @@ export async function runAnalyticsRefresh({
           readConcurrency: ANALYTICS_REFRESH_READ_CONNECTIONS,
           loadConcurrency: resources.workerPool?.loadConcurrency ?? 1,
         });
+        assertConnection();
         readMs = Math.max(0, wallClock() - readStartedMs);
         // Owners are read in the same snapshot while they are computed.
         phase = "compute";
@@ -1659,9 +1720,10 @@ export async function runAnalyticsRefresh({
           mode: parsed.mode,
           nowMs,
           revisionSeed: parsed.revisionSeed,
-          ...(guard.active || profiler !== null || mainCapture !== null ? { checkpoint } : {}),
+          checkpoint,
           ...(ownerPool === undefined ? {} : { ownerPool }),
         });
+        assertConnection();
         const statements = ledger.summary();
         const loadWallMs = typeof inputs?.loadWallMs === "function" ? inputs.loadWallMs() : 0;
         const phaseWallMs = Math.round(readMs + (Number.isFinite(loadWallMs) ? loadWallMs : 0));
@@ -1675,6 +1737,11 @@ export async function runAnalyticsRefresh({
           unattributedMs: Math.max(0, phaseWallMs - statements.wallMs),
           server: analyticsRefreshServerStatementDelta(serverBefore, await readAnalyticsRefreshServerStatements(pool)),
         });
+      } catch (error) {
+        // Preserve the first work failure before cleanup can encounter a
+        // different client error or a worker-drain failure.
+        workFailure = { cause: connectionFailure ?? error, phase: connectionFailure?.phase ?? phase };
+        throw error;
       } finally {
         // Drain streamed loads before closing their snapshot readers. An
         // aborted Worker can leave a bounded read call in flight.
@@ -1684,8 +1751,10 @@ export async function runAnalyticsRefresh({
           await readPool.close();
         }
       }
+      assertConnection();
       await client.query("COMMIT");
       readOpen = false;
+      assertConnection();
       // The stored revision fields must follow this run's flags exactly.
       if (outputs === null || typeof outputs !== "object" || outputs.mode !== parsed.mode
           || outputs.nowMs !== nowMs || outputs.revisionSeed !== parsed.revisionSeed) {
@@ -1696,6 +1765,7 @@ export async function runAnalyticsRefresh({
       mainCapture?.checkpoint(PROFILE_WORK_PHASES.write);
       guard.beforeWrite(outputs.resources?.account?.accountBytes);
       const runId = (dependencies.randomUUID ?? randomUUID)();
+      assertConnection();
       const written = await store.writeRunOutputs(client, outputs, {
         schema: parsed.schema,
         runId,
@@ -1710,6 +1780,9 @@ export async function runAnalyticsRefresh({
         exclusionsSha256: outputs.exclusionsSha256,
         priceTransitions,
       });
+      // The store has confirmed its transaction. A later connection error
+      // during release/close cannot undo that completed write.
+      workComplete = true;
       // Content-free read counts the default pipeline reports (closed keys).
       const readSummary = Object.fromEntries(READ_SUMMARY_KEYS
         .map((key) => [key, outputs.readSummary?.[key]])
@@ -1742,18 +1815,21 @@ export async function runAnalyticsRefresh({
     }
   } catch (error) {
     discard = true;
+    // Worker cancellation or a later query rejection must not hide the
+    // connection loss that caused it. Both code and phase were closed above.
+    const cause = workFailure?.cause ?? connectionFailure ?? error;
     // A store error carries sqlState; a driver error carries its SQLSTATE as code.
-    const sqlState = typeof error?.sqlState === "string" ? error.sqlState : error?.code;
+    const sqlState = typeof cause?.sqlState === "string" ? cause.sqlState : cause?.code;
     let readFailures = null;
     try { readFailures = readLedger?.failureSummary() ?? null; } catch { /* retain the original failure */ }
-    failure = Object.assign(new Error(safeCode(error, "ANALYTICS_V2_REFRESH_FAILED")), {
-      code: safeCode(error, "ANALYTICS_V2_REFRESH_FAILED"),
-      phase,
+    failure = Object.assign(new Error(safeCode(cause, "ANALYTICS_V2_REFRESH_FAILED")), {
+      code: safeCode(cause, "ANALYTICS_V2_REFRESH_FAILED"),
+      phase: workFailure?.phase ?? connectionFailure?.phase ?? phase,
       ...(typeof sqlState === "string" && SQL_STATE.test(sqlState) ? { sqlState } : {}),
-      ...(typeof error?.field === "string" && /^[A-Za-z0-9_.]{1,80}$/u.test(error.field)
-        ? { field: error.field } : {}),
-      ...(error?.usage === true ? { usage: true } : {}),
-      ...refusalFigures(error),
+      ...(typeof cause?.field === "string" && /^[A-Za-z0-9_.]{1,80}$/u.test(cause.field)
+        ? { field: cause.field } : {}),
+      ...(cause?.usage === true ? { usage: true } : {}),
+      ...refusalFigures(cause),
       ...(readFailures === null ? {} : { readFailures }),
     });
   } finally {
@@ -1782,12 +1858,20 @@ export async function runAnalyticsRefresh({
           connector,
         });
       } catch {
-        failure ??= Object.assign(new Error("ANALYTICS_V2_REFRESH_CLOSE_FAILED"), {
-          code: "ANALYTICS_V2_REFRESH_CLOSE_FAILED",
-          phase: "cleanup",
-        });
+        if (workComplete && receipt !== undefined && failure === undefined) {
+          // Cleanup cannot undo a confirmed write (or LOCK_HELD result).
+          // Keep its failure visible without misreporting the work outcome.
+          receipt = Object.freeze({ ...receipt,
+            cleanup: Object.freeze({ code: "ANALYTICS_V2_REFRESH_CLOSE_FAILED" }) });
+        } else {
+          failure ??= Object.assign(new Error("ANALYTICS_V2_REFRESH_CLOSE_FAILED"), {
+            code: "ANALYTICS_V2_REFRESH_CLOSE_FAILED",
+            phase: "cleanup",
+          });
+        }
       }
     }
+    stopObservingClients?.();
     mainCapture?.finish(failure === undefined ? "complete" : "work-failed");
     if (workerProfiles !== null) {
       try { workerProfiles.finish({ analyticsRunId: receipt?.runId ?? null }); } catch {

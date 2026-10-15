@@ -76,7 +76,12 @@ owning Worker gate, including its clean-source dry builds; the public-site lane
 also runs all UI and public-release-site tests. Only reviewed hosted source,
 migrations/configuration and public builder paths select them. Shared browser
 assets, unfamiliar scripts and shared configuration still fall back to the full
-gate. Both hosted lanes together run the Worker gate once.
+gate. Both hosted lanes together run the Worker gate once. The hosted Worker
+workflow exposes that required gate as an aggregate over foundation, runtime
+and analytics/fast-path producers. Their scripts are a complete, ordered,
+non-overlapping partition of the unchanged serial Worker check; the aggregate
+accepts only successful outputs bound to the same selected source, run and
+attempt.
 
 ```bash
 node scripts/test-lanes.mjs plan --path apps/worker/src/index.ts

@@ -47,12 +47,16 @@ interface OwnerCache {
   method: string; progress_revision: number; next_index: number; fingerprint: string|null;
   complete: number; values_json: string;
 }
+type EffectiveCursorStart = { readonly state: 'start' };
+type EffectiveCursorPosition = EffectiveUsageReaderCursor | EffectiveCursorStart | null;
 type EffectiveCursorState = {
-  usage: EffectiveUsageReaderCursor | null | undefined;
-  quota: EffectiveUsageReaderCursor | null | undefined;
-  session: EffectiveUsageReaderCursor | null | undefined;
+  usage: EffectiveCursorPosition;
+  quota: EffectiveCursorPosition;
+  session: EffectiveCursorPosition;
 };
-const EFFECTIVE_DAILY_CURSOR_METHOD = 'effective-daily-cursor-v2';
+const EFFECTIVE_DAILY_CURSOR_METHOD_V2 = 'effective-daily-cursor-v2';
+const EFFECTIVE_DAILY_CURSOR_METHOD = 'effective-daily-cursor-v4';
+const EFFECTIVE_DAILY_CURSOR_MAX_BYTES = 2048;
 const EFFECTIVE_STREAMS: readonly EffectiveTelemetryStream[] = ['usage','quota','session'];
 function usesEffectiveReader(owner: StorageCommunityOwner, effectiveEnabled: boolean): boolean {
   // A v11-only owner already has one complete immutable family and keeps the
@@ -101,17 +105,30 @@ async function assertTarget(options: StorageCommunityDailyBindings): Promise<voi
 }
 
 function emptyEffectiveCursor(): EffectiveCursorState {
-  return {usage:undefined, quota:undefined, session:undefined};
+  // An explicit start state survives JSON serialization. `null` remains the
+  // distinct, terminal state for a stream whose source page was exhausted.
+  return {usage:{state:'start'}, quota:{state:'start'}, session:{state:'start'}};
 }
 
-function readEffectiveCursor(value: string|null|undefined, dependencyDigest: string): EffectiveCursorState|null {
-  if (value === null || value === undefined) return null;
+function readEffectiveCursor(value: string|null|undefined, dependencyDigest?: string): EffectiveCursorState|null {
+  if (value === null || value === undefined || byteLength(value) > EFFECTIVE_DAILY_CURSOR_MAX_BYTES) return null;
   try {
     const parsed: unknown = JSON.parse(value);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-        || Object.keys(parsed).sort().join(',') !== 'dependencyDigest,method,streams'
-        || (parsed as {method?:unknown}).method !== EFFECTIVE_DAILY_CURSOR_METHOD
-        || (parsed as {dependencyDigest?:unknown}).dependencyDigest !== dependencyDigest) return null;
+    const method = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as {method?:unknown}).method : undefined;
+    const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? Object.keys(parsed).sort().join(',') : '';
+    const digest = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as {dependencyDigest?:unknown}).dependencyDigest : undefined;
+    const blocked = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as {blocked?:unknown}).blocked : undefined;
+    const validShape = method === EFFECTIVE_DAILY_CURSOR_METHOD_V2
+      ? keys === 'dependencyDigest,method,streams'
+      : method === EFFECTIVE_DAILY_CURSOR_METHOD
+          && keys === 'blocked,dependencyDigest,method,streams' && typeof blocked === 'boolean';
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !validShape
+        || typeof digest !== 'string' || !/^[a-f0-9]{64}$/u.test(digest)
+        || (dependencyDigest !== undefined && digest !== dependencyDigest)) return null;
     const streams = (parsed as {streams?:unknown}).streams;
     if (!streams || typeof streams !== 'object' || Array.isArray(streams)
         || Object.keys(streams).sort().join(',') !== 'quota,session,usage') return null;
@@ -119,9 +136,15 @@ function readEffectiveCursor(value: string|null|undefined, dependencyDigest: str
     for (const stream of EFFECTIVE_STREAMS) {
       const item = (streams as Record<string,unknown>)[stream];
       if (item === null) { cursor[stream] = null; continue; }
-      if (item === undefined) continue;
-      if (!item || typeof item !== 'object' || Array.isArray(item)
-          || Object.keys(item).sort().join(',') !== 'observedAtMs,occurrenceId') return null;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+      const keys = Object.keys(item).sort().join(',');
+      if (keys === 'state') {
+        if (method !== EFFECTIVE_DAILY_CURSOR_METHOD
+            || (item as {state?:unknown}).state !== 'start') return null;
+        cursor[stream] = {state:'start'};
+        continue;
+      }
+      if (keys !== 'observedAtMs,occurrenceId') return null;
       const observedAtMs = (item as {observedAtMs?:unknown}).observedAtMs;
       const occurrenceId = (item as {occurrenceId?:unknown}).occurrenceId;
       if (!Number.isSafeInteger(observedAtMs) || typeof occurrenceId !== 'string'
@@ -132,8 +155,29 @@ function readEffectiveCursor(value: string|null|undefined, dependencyDigest: str
   } catch { return null; }
 }
 
-function effectiveCursorJson(cursor: EffectiveCursorState, dependencyDigest: string): string {
-  return canonicalJson({method:EFFECTIVE_DAILY_CURSOR_METHOD,dependencyDigest,streams:cursor});
+function effectiveCursorJson(cursor: EffectiveCursorState, dependencyDigest: string, blocked: boolean): string {
+  if (!blocked && EFFECTIVE_STREAMS.every(stream => cursor[stream] === null)) {
+    // Completed effective owners retain the baseline terminal fingerprint
+    // consumed by the graph-day projection contract. Only resumable cursors
+    // need the closed v4 blocked marker.
+    return canonicalJson({method:EFFECTIVE_DAILY_CURSOR_METHOD_V2,dependencyDigest,streams:cursor});
+  }
+  return canonicalJson({method:EFFECTIVE_DAILY_CURSOR_METHOD,dependencyDigest,streams:cursor,blocked});
+}
+
+/** Stored conflict classification is only a scheduling hint. It is accepted
+ * without source reads solely for the exact closed v4 cursor shape; selected
+ * owners still pass through ownerPage and the real occurrence reader. */
+function effectiveBlockedMarker(row: OwnerCache|undefined, owner: StorageCommunityOwner,
+  effectiveEnabled: boolean): boolean {
+  return usesEffectiveReader(owner,effectiveEnabled) && row !== undefined
+    && row.input_revision === owner.inputRevision && row.owner_revision === owner.ownerRevision
+    && row.source_format === 'effective' && row.method === METHOD && row.complete === 0
+    && readEffectiveCursor(row.fingerprint) !== null
+    && (() => {
+      try { return (JSON.parse(row.fingerprint!) as {blocked?:unknown}).blocked === true; }
+      catch { return false; }
+    })();
 }
 
 /** One bounded page per stream. The occurrence reader has already selected all
@@ -148,7 +192,8 @@ async function advanceEffectiveDailyValues(options: StorageCommunityDailyBinding
     const page = await readEffectiveTelemetryOwnerDayPage(options.source, {
       sourceNamespace: options.sourceNamespace, ownerDigest: owner.ownerDigest!,
       ownerRevision: owner.ownerRevision, authorityEpoch: owner.authorityEpoch,
-      day: dayValue, stream, limit: 50, ...(after === undefined ? {} : {after}),
+      day: dayValue, stream, limit: 50,
+      ...('state' in after ? {} : {after}),
     });
     // Do not persist a folded prefix without its cursor: retrying a page that
     // contains a conflict must never count its preceding valid rows twice.
@@ -166,7 +211,7 @@ async function advanceEffectiveDailyValues(options: StorageCommunityDailyBinding
 }
 
 async function ownerPage(options: StorageCommunityDailyBindings, observedDay: string,
-  owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache): Promise<'advanced'|'deferred'> {
+  owner: StorageCommunityOwner, effectiveEnabled: boolean, old?: OwnerCache): Promise<'advanced'|'blocked'|'deferred'> {
   const {source,target,sourceId,sourceNamespace}=options, ownerDigest=owner.ownerDigest!;
   const effective = usesEffectiveReader(owner,effectiveEnabled);
   const dependencyDigest = effective ? await sha256Hex(canonicalJson(await effectiveHistoryDependency(
@@ -184,7 +229,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
   if(reuse&&retained===null)return 'deferred';
   let values = reuse ? JSON.parse(retained!) as V11DailyProjectionValues : createV11DailyProjectionValues(observedDay);
   validateV11DailyProjectionValues(values);
-  let nextIndex = 0, fingerprint: string|null = null, complete = true;
+  let nextIndex = 0, fingerprint: string|null = null, complete = true, blocked = false;
   if (usesEffectiveReader(owner,effectiveEnabled)) {
     let cursor = reuse ? oldCursor : emptyEffectiveCursor();
     if (cursor === null) {
@@ -194,10 +239,10 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
       cursor = emptyEffectiveCursor();
     }
     const advanced = await advanceEffectiveDailyValues(options, observedDay, owner, values, cursor);
-    if (advanced.blocked) return 'deferred';
     values = advanced.values;
-    fingerprint = effectiveCursorJson(cursor,dependencyDigest!);
+    fingerprint = effectiveCursorJson(cursor,dependencyDigest!,advanced.blocked);
     complete = advanced.complete;
+    blocked = advanced.blocked;
   } else if (owner.hasV11) {
     const ready = await target.prepare(`SELECT 1 AS ready FROM analytics_owner_state o
       JOIN analytics_v11_owner_heads h ON h.source_id=o.source_id AND h.owner_digest=o.owner_digest
@@ -232,6 +277,13 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     nextIndex=read.nextIndex??0; fingerprint=read.fingerprint; complete=read.nextIndex===null;
   }
   const valuesJson=canonicalJson(values);
+  // A stable conflict remains an incomplete dependency identity. Avoid turning
+  // every retry into a target write when the source, prefix and cursor did not
+  // change; the caller still counts this blocked owner attempt against its cap.
+  if (blocked && old && retained === valuesJson
+      && old.input_revision === owner.inputRevision && old.owner_revision === owner.ownerRevision
+      && old.source_format === sourceFormat(owner,effectiveEnabled) && old.method === METHOD
+      && old.next_index === nextIndex && old.fingerprint === fingerprint && old.complete === 0) return 'blocked';
   // Source changes after this read can leave a conservative cached value, but
   // the publication's complete cohort check below can never bless that value.
   const statement=target.prepare(`INSERT INTO analytics_community_daily_owners
@@ -247,7 +299,7 @@ async function ownerPage(options: StorageCommunityDailyBindings, observedDay: st
     .bind(sourceId,observedDay,ownerDigest).first<OwnerCache>();
   return receipt && current(receipt,owner,effectiveEnabled) && receipt.progress_revision===progress+1
     && receipt.next_index===nextIndex && receipt.fingerprint===fingerprint && receipt.complete===(complete?1:0)
-    && receipt.values_json===valuesJson ? 'advanced':'deferred';
+    && receipt.values_json===valuesJson ? (blocked?'blocked':'advanced'):'deferred';
 }
 
 /** `devices[i]` is the contributing-device count of the owner folded into
@@ -374,14 +426,30 @@ export async function advanceStorageCommunityDaily(options: StorageCommunityDail
     progress_revision,next_index,fingerprint,complete,'' AS values_json FROM analytics_community_daily_owners
     WHERE source_id=? AND day=? AND owner_digest IN(SELECT json_extract(value,'$.ownerDigest') FROM json_each(?))`)
     .bind(sourceId,options.day,requestJson).all<OwnerCache>()).results;
-  const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0;
+  const cache=new Map(rowset.map(row=>[row.owner_digest,row]));let ownersAdvanced=0,ownersAttempted=0,blocked=false;
+  // Known blocked rows yield bounded priority to remaining missing, stale, or
+  // compatible-partial owners. Owner metadata changes (including day-source
+  // repair) remove a row from this tail so its dependency is reread promptly.
+  // Partition once so stored-marker parsing remains linear in this bounded cohort.
+  const priorityOwners:StorageCommunityOwner[]=[],blockedOwners:StorageCommunityOwner[]=[];
   for(const owner of owners) {
+    (effectiveBlockedMarker(cache.get(owner.ownerDigest!),owner,effectiveEnabled)
+      ? blockedOwners : priorityOwners).push(owner);
+  }
+  const orderedOwners=[...priorityOwners,...blockedOwners];
+  for(const owner of orderedOwners) {
     const row=cache.get(owner.ownerDigest!);
     if(current(row,owner,effectiveEnabled)&&row.complete===1)continue;
-    if(ownersAdvanced>=maxOwners)return {state:'progress',ownersAdvanced};
-    if(await ownerPage(options,options.day,owner,effectiveEnabled,row)==='deferred')return deferred('projection_pending',ownersAdvanced);
-    ownersAdvanced++;
+    if(ownersAttempted>=maxOwners)return blocked
+      ? deferred('projection_pending',ownersAdvanced) : {state:'progress',ownersAdvanced};
+    ownersAttempted++;
+    const outcome=await ownerPage(options,options.day,owner,effectiveEnabled,row);
+    if(outcome==='deferred')return deferred('projection_pending',ownersAdvanced);
+    if(outcome==='blocked')blocked=true;else ownersAdvanced++;
   }
+  // A conflicted member contributes its actual dependency fingerprint, but
+  // its incomplete values can never enter the complete-cohort publication.
+  if(blocked)return deferred('projection_pending',ownersAdvanced);
   // Read all selected values and the queue revision in one target snapshot.
   // Values belong to exact current source revisions, not a prefix cursor.
   const result=await target.batch<OwnerCache|{revision:number}|{revision:number;cohort_digest:string}>([

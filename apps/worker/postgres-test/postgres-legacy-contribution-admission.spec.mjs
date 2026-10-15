@@ -8,6 +8,11 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import pg from "pg";
 import { createServer } from "vite";
+import {
+  createFrozenLegacyWorkerOracle,
+  frozenLegacyOracleResolutionGuard,
+  legacyOracleBlobId,
+} from "./fixtures/frozen-legacy-worker-oracle.mjs";
 import { applyPostgresMigrations, readPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { applyStockAndStagedMigrations, listStagedMigrations } from "./staged-migrations-harness.mjs";
 import * as contributionEnvelopeSeam from "../cloud-run/contribution-envelope-registry.mjs";
@@ -48,9 +53,10 @@ import { createUploadAuthorizationRouteModule } from "../cloud-run/routes/upload
  * telemetry-v1-repository.ts) and transport policy, running unmodified on an
  * in-memory node:sqlite database built from the D1 migration directories the
  * live ingestion D1 applies. fixtures/legacy-contribution-oracle-blobs.json
- * pins every oracle file to its d43c8f92 git blob, so a drift in the GCP
- * line fails here instead of silently changing the oracle. The same holds
- * for telemetry-envelope-v0.1 (handleTelemetryContribution with
+ * pins every oracle file to its d43c8f92 git blob. A private source capsule
+ * reconstructs that commit and its integrity-pinned dependency closure;
+ * evolving current GCP source never silently changes the historical oracle.
+ * The same holds for telemetry-envelope-v0.1 (handleTelemetryContribution with
  * insertTelemetryContribution and its server repricing), which d43c8f92 has
  * not retired.
  *
@@ -103,9 +109,8 @@ const ORACLE_REQUIRED = Object.freeze([
   "src/typed-v1-admission.ts", "src/telemetry-v1-repository.ts", "src/typed-telemetry-repository.ts",
   "src/telemetry-v1.ts", "src/telemetry-transport-policy.ts", "src/telemetry-repository.ts",
   "src/telemetry-validation.ts", "src/server-pricing.ts", "src/device-auth.ts", "src/telemetry-storage-mode.ts",
-  // The usage-correction capture a v1.0 correction runs while the runtime is
-  // active (typed-telemetry-compatibility.ts, its source reader, differs from
-  // d43c8f92 only by dropping an Error `cause` option, so it is not pinned).
+  // The usage-correction capture and its complete historical source-reader
+  // dependency closure are reconstructed from the same immutable commit.
   "src/telemetry-usage-correction-repository.ts", "src/telemetry-usage-reconciliation.ts", "src/strict-json.ts",
   "migrations/0014_bounded_contribution_admission.sql",
   "typed-v1-admission-migrations/0001_typed_v1_chunk_admission.sql",
@@ -119,41 +124,66 @@ const ORACLE_REQUIRED = Object.freeze([
 
 let vite;
 const modules = new Map();
-async function workerModule(path) {
+async function currentWorkerModule(path) {
   vite ??= await createServer({
     root: WORKER_ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom", logLevel: "silent",
   });
   if (!modules.has(path)) modules.set(path, await vite.ssrLoadModule(path));
   return modules.get(path);
 }
+let frozenOracle;
+let oracleVite;
+const oracleModules = new Map();
+async function oracleSource() {
+  frozenOracle ??= (async () => {
+    const pinned = JSON.parse(await readFile(join(WORKER_ROOT, "postgres-test", "fixtures",
+      "legacy-contribution-oracle-blobs.json"), "utf8"));
+    return createFrozenLegacyWorkerOracle(WORKER_ROOT, pinned);
+  })();
+  return frozenOracle;
+}
+async function oracleModule(path) {
+  const { workerRoot } = await oracleSource();
+  oracleVite ??= await createServer({
+    root: workerRoot, configFile: false, server: { middlewareMode: true }, appType: "custom", logLevel: "silent",
+    ssr: { noExternal: true }, plugins: [frozenLegacyOracleResolutionGuard(workerRoot)],
+  });
+  if (!oracleModules.has(path)) oracleModules.set(path, await oracleVite.ssrLoadModule(path));
+  return oracleModules.get(path);
+}
 after(async () => {
-  if (vite) await vite.close();
+  try {
+    await Promise.all([vite?.close(), oracleVite?.close()]);
+  } finally {
+    if (frozenOracle) await (await frozenOracle).dispose();
+  }
 });
 
-function gitBlobId(content) {
-  const body = Buffer.from(content);
-  return createHash("sha1").update(`blob ${body.byteLength}\0`).update(body).digest("hex");
-}
-
-let d1Sources;
-async function d1Oracle() {
-  d1Sources ??= (async () => {
+const d1SourceSets = new Map();
+async function d1Oracle({ current = false } = {}) {
+  const workerRoot = current ? WORKER_ROOT : (await oracleSource()).workerRoot;
+  if (!d1SourceSets.has(workerRoot)) d1SourceSets.set(workerRoot, (async () => {
     const sources = [];
     for (const directory of D1_DIRECTORIES) {
-      const names = (await readdir(join(WORKER_ROOT, directory)))
+      const names = (await readdir(join(workerRoot, directory)))
         .filter((name) => /^\d{4}_[a-z0-9_-]+\.sql$/u.test(name)).sort();
-      for (const name of names) sources.push(await readFile(join(WORKER_ROOT, directory, name), "utf8"));
+      for (const name of names) sources.push(await readFile(join(workerRoot, directory, name), "utf8"));
     }
     return sources;
-  })();
+  })());
   const database = new DatabaseSync(":memory:");
-  database.exec("PRAGMA foreign_keys=ON");
-  for (const sql of await d1Sources) {
-    database.exec("BEGIN");
-    database.exec(sql);
-    database.exec("COMMIT");
+  try {
+    database.exec("PRAGMA foreign_keys=ON");
+    for (const sql of await d1SourceSets.get(workerRoot)) {
+      database.exec("BEGIN");
+      database.exec(sql);
+      database.exec("COMMIT");
+    }
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
   }
-  return database;
 }
 
 const toSqlite = (value) => (value instanceof ArrayBuffer ? new Uint8Array(value) : value);
@@ -240,7 +270,7 @@ async function legacyAdmissionMigration() {
   return names[0];
 }
 
-async function withTwin(operation) {
+async function withTwin(operation, { currentD1Reference = false } = {}) {
   const local = await endpoint();
   const schema = `in3_legacy_${randomBytes(6).toString("hex")}`;
   const pool = new pg.Pool({
@@ -250,7 +280,9 @@ async function withTwin(operation) {
   });
   let created = false;
   const d1 = await d1Oracle();
+  let currentD1;
   try {
+    if (currentD1Reference) currentD1 = await d1Oracle({ current: true });
     const server = await pool.query(
       "SELECT current_setting('server_version_num')::integer AS version, host(inet_server_addr()) AS address",
     );
@@ -262,11 +294,14 @@ async function withTwin(operation) {
     await applyStockAndStagedMigrations({
       role: "primary", schema, pool, stagedFiles: [await legacyAdmissionMigration()],
     });
-    return await operation({ twin: new Twin(d1, pool), pool, schema, d1 });
+    return await operation({ twin: new Twin(d1, pool, currentD1), pool, schema, d1 });
   } finally {
-    if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
-    await pool.end();
-    d1.close();
+    try {
+      if (created) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {});
+      await pool.end();
+    } finally {
+      try { d1.close(); } finally { currentD1?.close(); }
+    }
   }
 }
 
@@ -281,18 +316,21 @@ const hex = (value) => (value === null || value === undefined ? null : Buffer.fr
   value instanceof ArrayBuffer ? new Uint8Array(value) : value).toString("hex"));
 
 class Twin {
-  constructor(d1, pool) {
+  constructor(d1, pool, currentD1) {
     this.d1 = d1;
     this.pool = pool;
+    this.currentD1 = currentD1;
   }
 
   async run(sql, values = []) {
     this.d1.prepare(sql).run(...values);
+    this.currentD1?.prepare(sql).run(...values);
     await this.pool.query(toPostgres(sql), values);
   }
 
   d1Only(sql, values = []) {
     this.d1.prepare(sql).run(...values);
+    this.currentD1?.prepare(sql).run(...values);
   }
 
   async pgOnly(sql, values = []) {
@@ -365,12 +403,18 @@ async function socialDevice(twin, participantId, deviceId, { consent = true, sec
  * active, or null for an untransferred database) is that copied state.
  */
 async function initializeTypedTargets(twin, schema, { correctionRuntime = "staged" } = {}) {
-  const { initializeStorageSource } = await workerModule("/src/analytics-delivery.ts");
-  const { initializeTypedV1Admission } = await workerModule("/src/typed-v1-admission.ts");
-  const { encodeTypedTelemetryId } = await workerModule("/src/typed-telemetry-codec.ts");
+  const { initializeStorageSource } = await oracleModule("/src/analytics-delivery.ts");
+  const { initializeTypedV1Admission } = await oracleModule("/src/typed-v1-admission.ts");
+  const { encodeTypedTelemetryId } = await oracleModule("/src/typed-telemetry-codec.ts");
   const d1 = d1Database(twin.d1);
   await initializeStorageSource(d1, SOURCE_ID);
   await initializeTypedV1Admission(d1, NAMESPACE);
+  if (twin.currentD1) {
+    await (await currentWorkerModule("/src/analytics-delivery.ts"))
+      .initializeStorageSource(d1Database(twin.currentD1), SOURCE_ID);
+    await (await currentWorkerModule("/src/typed-v1-admission.ts"))
+      .initializeTypedV1Admission(d1Database(twin.currentD1), NAMESPACE);
+  }
   await twin.pgOnly("INSERT INTO storage_source_state (singleton, source_id, authority_epoch) VALUES (1, ?, 0)",
     [SOURCE_ID]);
   const namespace = await twin.pgOnly(
@@ -405,8 +449,8 @@ async function envelopeKeys() {
 }
 
 async function encryptedEnvelope(plaintext, schemaVersion = TELEMETRY_V10_ENVELOPE_SCHEMA_VERSION) {
-  const { encodeBase64Url } = await workerModule("/src/crypto.ts");
-  const { canonicalJson } = await workerModule("/src/canonical-json.ts");
+  const { encodeBase64Url } = await oracleModule("/src/crypto.ts");
+  const { canonicalJson } = await oracleModule("/src/canonical-json.ts");
   const { publicJwk } = await envelopeKeys();
   const rsa = await crypto.subtle.importKey("jwk", publicJwk, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
   const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
@@ -461,7 +505,7 @@ function syntheticRecords(stream, count, seed) {
 }
 
 async function syntheticChunk({ stream = "usage", count = 1, revision = 1, seq = 0, seed = "base", digest } = {}) {
-  const { canonicalJson } = await workerModule("/src/canonical-json.ts");
+  const { canonicalJson } = await oracleModule("/src/canonical-json.ts");
   const records = syntheticRecords(stream, count, seed);
   return {
     schemaVersion: "telemetry-contribution-v1.0", chunkId: `${stream}:${day()}:${seq}`, chunkRevision: revision,
@@ -528,12 +572,12 @@ async function refusalOf(response) {
  * rules, format table, controls and authorization writes are real.
  */
 async function origin(pool, schemaOptions, objectStore) {
-  const authority = await workerModule("/src/postgres-transport-write-authority.ts");
-  const admission = await workerModule("/src/postgres-legacy-contribution-admission.ts");
-  const transport = await workerModule("/src/postgres-typed-v12-transport.ts");
-  const uploads = await workerModule("/src/postgres-upload-authorization.ts");
-  const controls = await workerModule("/src/postgres-collection-controls.ts");
-  const { readBoundedRequestBody } = await workerModule("/src/bounded-body.ts");
+  const authority = await currentWorkerModule("/src/postgres-transport-write-authority.ts");
+  const admission = await currentWorkerModule("/src/postgres-legacy-contribution-admission.ts");
+  const transport = await currentWorkerModule("/src/postgres-typed-v12-transport.ts");
+  const uploads = await currentWorkerModule("/src/postgres-upload-authorization.ts");
+  const controls = await currentWorkerModule("/src/postgres-collection-controls.ts");
+  const { readBoundedRequestBody } = await currentWorkerModule("/src/bounded-body.ts");
   const keys = await envelopeKeys();
   await enableCollection(pool, schemaOptions.primarySchema);
   const legacyFormats = legacyUploadAuthorizationFormatEntries({
@@ -672,9 +716,9 @@ async function origin(pool, schemaOptions, objectStore) {
 
 /** The Worker's typed v1 admission for the same chunk, ids and clock, on D1. */
 async function oracleAdmission(twin, schema, chunkRowId, chunk, raw, supersedesId = null) {
-  const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
-  const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
-  const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
+  const { insertTypedTelemetryV1Chunk } = await oracleModule("/src/typed-v1-admission.ts");
+  const { parseTelemetryV1Chunk } = await oracleModule("/src/telemetry-v1.ts");
+  const { telemetryEnvelopeDigest } = await oracleModule("/src/telemetry-repository.ts");
   const row = (await twin.pgOnly(
     `SELECT c.*, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_iso,
             a.participant_id AS grant_participant
@@ -956,10 +1000,48 @@ test("the oracle is production's code: every oracle source is byte-identical to 
     "legacy-contribution-oracle-blobs.json"), "utf8"));
   assert.equal(pinned.commit, "d43c8f92");
   for (const path of ORACLE_REQUIRED) assert.ok(Object.hasOwn(pinned.sources, path), `${path} is pinned`);
+  const { workerRoot } = await oracleSource();
+  assert.notEqual(workerRoot, WORKER_ROOT, "the frozen oracle cannot use current source or package copies");
   for (const [path, { production, blob }] of Object.entries(pinned.sources)) {
     assert.ok(production === `apps/worker/${path}` || production.startsWith("packages/"), path);
-    assert.equal(gitBlobId(await readFile(join(WORKER_ROOT, path))), blob, `${path} equals d43c8f92:${production}`);
+    assert.equal(legacyOracleBlobId(await readFile(join(workerRoot, path))), blob,
+      `${path} equals d43c8f92:${production}`);
   }
+  // Execute through the same loader the D1 comparisons use, including the
+  // historical accounting facade and its integrity-pinned runcost dependency.
+  const historical = await oracleModule("/src/server-pricing.ts");
+  // Resolve every historical entry point, including quota readers reached by
+  // storage-mode imports, before claiming the source closure is runnable.
+  for (const path of ["analytics-delivery", "typed-v1-admission", "typed-telemetry-codec", "crypto",
+    "canonical-json", "telemetry-v1", "telemetry-repository", "telemetry-transport-policy", "errors",
+    "telemetry-validation", "telemetry-storage-mode", "device-auth", "telemetry-v1-repository"]) {
+    await oracleModule(`/src/${path}.ts`);
+  }
+  const current = await currentWorkerModule("/src/server-pricing.ts");
+  assert.equal(historical.SERVER_PRICING_METHOD_VERSION, "server-api-price-equivalent-v0.5");
+  assert.notEqual(historical, current, "PostgreSQL target and D1 oracle keep independent module graphs");
+  assert.equal(current.SERVER_PRICING_METHOD_VERSION, "server-api-price-equivalent-v0.6");
+  assert.equal(legacyOracleBlobId(await readFile(join(WORKER_ROOT, "src", "server-pricing.ts"))),
+    "2af1cc16a46397220baf38a051059afeede5b7a5", "current D1 reference uses the reviewed v0.6 pricing source");
+  for (const path of [join(WORKER_ROOT, "../../packages/accounting/src/price-registry.js"),
+    join(WORKER_ROOT, "node_modules/@app-usagemonitor/accounting/src/price-registry.js")]) {
+    assert.equal(legacyOracleBlobId(await readFile(path)), "ed67a606e891b499ed6c277f194fd41dc80ca7d8",
+      "current D1 reference resolves the reviewed canonical v0.9 registry copy");
+  }
+});
+
+test("the frozen oracle refuses altered pins and current-source module resolution", async () => {
+  const pinned = JSON.parse(await readFile(join(WORKER_ROOT, "postgres-test", "fixtures",
+    "legacy-contribution-oracle-blobs.json"), "utf8"));
+  const altered = structuredClone(pinned);
+  altered.sources["src/server-pricing.ts"].blob = "0".repeat(40);
+  await assert.rejects(createFrozenLegacyWorkerOracle(WORKER_ROOT, altered),
+    /retains its immutable oracle pin/u);
+  const { workerRoot } = await oracleSource();
+  const guard = frozenLegacyOracleResolutionGuard(workerRoot);
+  assert.equal(guard.load(join(workerRoot, "src", "server-pricing.ts")), null);
+  assert.throws(() => guard.load(join(WORKER_ROOT, "src", "server-pricing.ts")),
+    /cannot import a current or external source file/u);
 });
 
 test("upload-authorization formats: the Worker's body check, v1.0 default and refusal codes, no database", async () => {
@@ -1019,12 +1101,12 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
   skip: SKIP, timeout: 240_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
-  const worker = await workerModule("/src/telemetry-transport-policy.ts");
-  const { errorResponse, ApiError } = await workerModule("/src/errors.ts");
+  const worker = await oracleModule("/src/telemetry-transport-policy.ts");
+  const { errorResponse, ApiError } = await oracleModule("/src/errors.ts");
   const service = await origin(pool, schemaOptions, memoryObjectStore());
   const allFormats = createUploadAuthorizationFormats(legacyUploadAuthorizationFormatEntries({
     assertTelemetryTransportWriteAllowed:
-      (await workerModule("/src/postgres-transport-write-authority.ts")).assertPostgresTelemetryTransportWriteAllowed,
+      (await currentWorkerModule("/src/postgres-transport-write-authority.ts")).assertPostgresTelemetryTransportWriteAllowed,
     schemaVersions: [...LEGACY_V1_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS, ...RETAINED_V0_UPLOAD_AUTHORIZATION_SCHEMA_VERSIONS],
   }));
   await socialParticipant(twin, "in3-social");
@@ -1052,7 +1134,7 @@ test("PG17 upload authorization: each legacy format answers as the Worker on D1,
   // where the Worker would authorize; never an authorization, never a 503.
   const retiredFormats = createUploadAuthorizationFormats(retiredUploadAuthorizationFormatEntries({
     assertTelemetryTransportWriteAllowed:
-      (await workerModule("/src/postgres-transport-write-authority.ts")).assertPostgresTelemetryTransportWriteAllowed,
+      (await currentWorkerModule("/src/postgres-transport-write-authority.ts")).assertPostgresTelemetryTransportWriteAllowed,
   }));
   const retiredAnswer = `${RETIRED_FORMAT_ANSWER.status} ${RETIRED_FORMAT_ANSWER.code}`;
   assert.equal(retiredAnswer, "403 TELEMETRY_TRANSPORT_BLOCKED");
@@ -1719,10 +1801,6 @@ function v01Contribution(suffix = "a") {
 
 /** The Worker's insertTelemetryContribution for the same ids and clock, on D1. */
 async function oracleV01Admission(twin, schema, contributionId, raw) {
-  const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
-    await workerModule("/src/telemetry-repository.ts");
-  const { validateTelemetryContribution, validateTelemetryEnvelope } = await workerModule("/src/telemetry-validation.ts");
-  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
   const keys = await envelopeKeys();
   const row = (await twin.pgOnly(
     `SELECT c.*, to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_iso,
@@ -1739,16 +1817,31 @@ async function oracleV01Admission(twin, schema, contributionId, raw) {
       Buffer.byteLength(raw), new Date(Date.parse(row.created_iso) - 1_000).toISOString(), expires]);
   twin.d1Only("UPDATE device_upload_authorizations SET state = 'consuming', consume_lease_expires_at = ? WHERE id = ?",
     [expires, row.device_upload_authorization_id]);
-  const envelope = validateTelemetryEnvelope(JSON.parse(raw));
-  const record = validateTelemetryContribution(
-    await decryptSyntheticEnvelope(envelope, keys.publicText, keys.privateText));
-  const envelopeDigest = await telemetryEnvelopeDigest(envelope);
-  const plaintextDigest = await telemetryPlaintextDigest(record);
-  assert.equal(row.envelope_digest, envelopeDigest);
-  assert.equal(row.plaintext_digest, plaintextDigest);
-  return insertTelemetryContribution(d1Database(twin.d1), row.participant_id,
-    { authorizationId: row.device_upload_authorization_id, authorizationKind: "device" },
-    contributionId, row.r2_key, envelopeDigest, plaintextDigest, record, row.created_iso);
+  const insertReference = async (loader, database) => {
+    const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
+      await loader("/src/telemetry-repository.ts");
+    const { validateTelemetryContribution, validateTelemetryEnvelope } = await loader("/src/telemetry-validation.ts");
+    const { decryptSyntheticEnvelope } = await loader("/src/crypto.ts");
+    const envelope = validateTelemetryEnvelope(JSON.parse(raw));
+    const record = validateTelemetryContribution(
+      await decryptSyntheticEnvelope(envelope, keys.publicText, keys.privateText));
+    const envelopeDigest = await telemetryEnvelopeDigest(envelope);
+    const plaintextDigest = await telemetryPlaintextDigest(record);
+    assert.equal(row.envelope_digest, envelopeDigest);
+    assert.equal(row.plaintext_digest, plaintextDigest);
+    const result = await insertTelemetryContribution(d1Database(database), row.participant_id,
+      { authorizationId: row.device_upload_authorization_id, authorizationKind: "device" },
+      contributionId, row.r2_key, envelopeDigest, plaintextDigest, record, row.created_iso);
+    return { result, record, envelope };
+  };
+  const frozen = await insertReference(oracleModule, twin.d1);
+  if (twin.currentD1) {
+    const current = await insertReference(currentWorkerModule, twin.currentD1);
+    assert.deepEqual(current.record, frozen.record, "the current and frozen references validate identical sent data");
+    assert.deepEqual(current.envelope, frozen.envelope, "the encrypted client envelope is unchanged");
+    assert.deepEqual(current.result, frozen.result, "the current and frozen D1 admission counts agree");
+  }
+  return frozen.result;
 }
 
 const V01_TIMESTAMPS = new Set(["range_start", "range_end", "created_at", "dataset_range_start", "dataset_range_end",
@@ -1761,7 +1854,7 @@ const V01_NUMBERS = new Set(["estimated_api_cost_usd", "priced_event_coverage_pe
   "output_reasoning_tokens", "output_combined_tokens", "tool_units", "total_input_context_tokens"]);
 
 async function v01Snapshot(twin, schema, participantId) {
-  const { canonicalJson } = await workerModule("/src/canonical-json.ts");
+  const { canonicalJson } = await oracleModule("/src/canonical-json.ts");
   const normalize = (row) => Object.fromEntries(Object.entries(row).filter(([key]) => key !== "id" || !("record_kind" in row))
     .map(([key, value]) => {
       if (value === null || value === undefined) return [key, null];
@@ -1808,7 +1901,29 @@ async function v01Snapshot(twin, schema, participantId) {
   };
 }
 
-test("PG17 a v0.1 contribution is admitted through the registry with the d43c8f92 rows, repriced, and replays idempotently", {
+const V01_PRICING_PROVENANCE = Object.freeze({
+  frozen: Object.freeze({
+    server_pricing_method_version: "server-api-price-equivalent-v0.5",
+    server_price_registry_version: "app-official-api-prices-v0.8",
+    server_price_registry_sha256: "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+  }),
+  current: Object.freeze({
+    server_pricing_method_version: "server-api-price-equivalent-v0.6",
+    server_price_registry_version: "app-official-api-prices-v0.9",
+    server_price_registry_sha256: "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+  }),
+});
+function frozenV01RowsWithCurrentProvenance(rows) {
+  return rows.map((row) => {
+    if (!Object.hasOwn(row, "server_pricing_method_version") || row.server_pricing_method_version === null) return row;
+    for (const [field, value] of Object.entries(V01_PRICING_PROVENANCE.frozen)) {
+      assert.equal(row[field], value, `the frozen output retains exact historical ${field}`);
+    }
+    return { ...row, ...V01_PRICING_PROVENANCE.current };
+  });
+}
+
+test("PG17 a v0.1 contribution preserves d43c8f92 admission and prices with independently verified current provenance", {
   skip: SKIP, timeout: 300_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
@@ -1839,9 +1954,19 @@ test("PG17 a v0.1 contribution is admitted through the registry with the d43c8f9
     { acceptedRecords: 1, deduplicatedRecords: 1 });
 
   const rows = await v01Snapshot(twin, schema, "in3-v01");
+  const currentRows = await v01Snapshot({ d1: twin.currentD1, pool }, schema, "in3-v01");
   for (const key of Object.keys(rows.d1)) {
-    assert.deepEqual(rows.pg[key], rows.d1[key], `${key} matches the d43c8f92 v0.1 admission`);
+    // PostgreSQL is compared against complete current-D1 rows, including all
+    // pricing fields. Separately, the frozen reference permits only the three
+    // declared provenance substitutions; exact costs, coverage and sent data
+    // remain in this full-field equality and any other drift fails here.
+    assert.deepEqual(rows.pg[key], currentRows.d1[key], `${key} matches the independently executed current D1 admission`);
+    assert.deepEqual(currentRows.d1[key], frozenV01RowsWithCurrentProvenance(rows.d1[key]),
+      `${key} changes only the explicit v0.5/v0.8 to v0.6/v0.9 provenance`);
   }
+  assert.deepEqual(rows.d1.contributions.map((row) => row.server_cost_nanousd).sort((a, b) => a - b), [0, 6_400_000],
+    "the frozen synthetic cost and deduplicated overlap stay exact");
+  assert.equal(rows.d1.records.find((row) => row.record_kind === "usage").server_pricing_coverage_percent, 100);
   assert.equal(rows.pg.contributions.length, 2);
   assert.equal(rows.pg.records.length, 3);
   assert.ok(rows.pg.records.some((row) => row.server_pricing_status !== null), "usage is server-repriced");
@@ -1871,7 +1996,7 @@ test("PG17 a v0.1 contribution is admitted through the registry with the d43c8f9
   assert.deepEqual(after.pg.records, rows.pg.records);
   assert.deepEqual(after.pg.windows, rows.pg.windows, "a replay takes no admission slot");
   assert.equal(store.objects.size, 2);
-}));
+}, { currentD1Reference: true }));
 
 test("PG17 v0.1 keeps the Worker's weekly window, consent and transport refusals", {
   skip: SKIP, timeout: 300_000,
@@ -1879,7 +2004,7 @@ test("PG17 v0.1 keeps the Worker's weekly window, consent and transport refusals
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const store = memoryObjectStore();
   const service = await origin(pool, schemaOptions, store);
-  const repository = await workerModule("/src/telemetry-repository.ts");
+  const repository = await oracleModule("/src/telemetry-repository.ts");
   await socialParticipant(twin, "in3-v01-window");
   const device = await socialDevice(twin, "in3-v01-window", randomUUID(), { consent: false });
   const refused = async (principal, record) => {
@@ -1986,7 +2111,7 @@ test("PG17 the staged migration replaces the lifetime cap with D1's weekly windo
     }
     const windows = await pool.query(`SELECT window_started_at, accepted_count, last_accepted_at
       FROM "${schema}".telemetry_contribution_admission_windows ORDER BY window_started_at`);
-    const repository = await workerModule("/src/telemetry-repository.ts");
+    const repository = await oracleModule("/src/telemetry-repository.ts");
     const startOf = (value) => repository.telemetryContributionAdmissionWindow(Date.parse(value)).startsAt;
     assert.deepEqual(windows.rows.map((row) => ({
       start: row.window_started_at.toISOString(), count: row.accepted_count, last: row.last_accepted_at.toISOString(),
@@ -2022,7 +2147,7 @@ const duplicateIv = (raw) => raw.replace('"iv":', `"iv":"${"A".repeat(16)}","iv"
 
 /** The route's answer equals the Worker's errorResponse for the same code, request id aside. */
 async function assertWorkerRefusal(response, status, code, label = code) {
-  const { errorResponse, ApiError } = await workerModule("/src/errors.ts");
+  const { errorResponse, ApiError } = await oracleModule("/src/errors.ts");
   const body = await response.json();
   const expected = errorResponse(new ApiError(status, code), "request-synthetic");
   assert.equal(response.status, expected.status, label);
@@ -2037,10 +2162,10 @@ async function assertWorkerRefusal(response, status, code, label = code) {
  */
 async function d1Attempt(twin, { participantId, deviceId, chunk, raw, supersedesId = null,
   leaseExpiresAt = iso(5 * 60_000), direct = false }) {
-  const { persistTelemetryV1StorageChunk } = await workerModule("/src/telemetry-storage-mode.ts");
-  const { insertTypedTelemetryV1Chunk } = await workerModule("/src/typed-v1-admission.ts");
-  const { parseTelemetryV1Chunk } = await workerModule("/src/telemetry-v1.ts");
-  const { telemetryEnvelopeDigest } = await workerModule("/src/telemetry-repository.ts");
+  const { persistTelemetryV1StorageChunk } = await oracleModule("/src/telemetry-storage-mode.ts");
+  const { insertTypedTelemetryV1Chunk } = await oracleModule("/src/typed-v1-admission.ts");
+  const { parseTelemetryV1Chunk } = await oracleModule("/src/telemetry-v1.ts");
+  const { telemetryEnvelopeDigest } = await oracleModule("/src/telemetry-repository.ts");
   const authorizationId = randomUUID();
   twin.d1Only(
     `INSERT INTO device_upload_authorizations (id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
@@ -2073,8 +2198,8 @@ test("PG17 the upload-authorization route module issues for shipped three-key bo
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const service = await origin(pool, schemaOptions, memoryObjectStore());
-  const { WORKER_ROUTE_POLICY } = await workerModule("/src/route-registry.ts");
-  const worker = await workerModule("/src/telemetry-transport-policy.ts");
+  const { WORKER_ROUTE_POLICY } = await currentWorkerModule("/src/route-registry.ts");
+  const worker = await oracleModule("/src/telemetry-transport-policy.ts");
 
   // It mounts on the IN-1 seam as the override of exactly this built-in.
   const mounted = createOriginRouteModuleRegistry({
@@ -2157,8 +2282,8 @@ test("PG17 an unrecordable upload receipt answers 500 INTERNAL_ERROR, as d43c8f9
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
   const service = await origin(pool, schemaOptions, memoryObjectStore());
-  const transport = await workerModule("/src/postgres-typed-v12-transport.ts");
-  const { recordDeviceUploadReceipt } = await workerModule("/src/device-auth.ts");
+  const transport = await currentWorkerModule("/src/postgres-typed-v12-transport.ts");
+  const { recordDeviceUploadReceipt } = await oracleModule("/src/device-auth.ts");
   await socialParticipant(twin, "in3-receipt");
   const device = await socialDevice(twin, "in3-receipt", randomUUID());
   const d1 = d1Database(twin.d1);
@@ -2316,11 +2441,11 @@ test("PG17 refusals raised inside the persist transaction keep D1's codes: typed
   skip: SKIP, timeout: 300_000,
 }, () => withTwin(async ({ twin, pool, schema }) => {
   const { schemaOptions } = await initializeTypedTargets(twin, schema);
-  const { TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY } = await workerModule("/src/telemetry-v1-repository.ts");
+  const { TELEMETRY_V1_LAUNCH_WEEK_CHUNKS_PER_DAY } = await oracleModule("/src/telemetry-v1-repository.ts");
   const { insertTelemetryContribution, telemetryEnvelopeDigest, telemetryPlaintextDigest } =
-    await workerModule("/src/telemetry-repository.ts");
-  const { validateTelemetryContribution } = await workerModule("/src/telemetry-validation.ts");
-  const { ApiError } = await workerModule("/src/errors.ts");
+    await oracleModule("/src/telemetry-repository.ts");
+  const { validateTelemetryContribution } = await oracleModule("/src/telemetry-validation.ts");
+  const { ApiError } = await oracleModule("/src/errors.ts");
   // The race window: between the pre-write checks and the persist, the object write runs this hook once.
   let hook = null;
   const store = memoryObjectStore({ beforePut: async () => {
@@ -2398,7 +2523,7 @@ test("PG17 refusals raised inside the persist transaction keep D1's codes: typed
   assert.deepEqual(await refusedUpload(() => service.uploadV01(leaseDevice, v01Contribution("c"))),
     { status: 500, code: "INTERNAL_ERROR", details: null });
   const keys = await envelopeKeys();
-  const { decryptSyntheticEnvelope } = await workerModule("/src/crypto.ts");
+  const { decryptSyntheticEnvelope } = await oracleModule("/src/crypto.ts");
   const v01Envelope = await encryptedEnvelope(v01Contribution("c"), TELEMETRY_V01_ENVELOPE_SCHEMA_VERSION);
   const v01Record = validateTelemetryContribution(
     await decryptSyntheticEnvelope(v01Envelope, keys.publicText, keys.privateText));
@@ -2461,14 +2586,14 @@ test("PG17 through the landed origin dispatch: a shipped client authorizes with 
     "/src/postgres-typed-v12-transport.ts", "/src/postgres-upload-authorization.ts",
     "/src/postgres-collection-controls.ts", "/src/postgres-runtime-schema.ts",
     "/src/admission.ts", "/src/crypto.ts", "/src/bounded-body.ts", "/src/route-registry.ts",
-  ].map((path) => workerModule(path)));
+  ].map((path) => currentWorkerModule(path)));
   const keys = await envelopeKeys();
   const store = memoryObjectStore();
   const allowAll = () => ({ async limit() { return { success: true }; } });
   // The contributions preamble takes the Worker's upload-ingress lease (D-CRB)
   // from the PostgreSQL budget, at wrangler.jsonc env.production's policy.
   const [ingress, ingressBudget] = await Promise.all([
-    workerModule("/src/upload-ingress-admission.ts"), workerModule("/src/postgres-ingress-budget.ts"),
+    currentWorkerModule("/src/upload-ingress-admission.ts"), currentWorkerModule("/src/postgres-ingress-budget.ts"),
   ]);
   const budget = ingressBudget.createPostgresUploadIngressBudget(pool, { primarySchema: schemaOptions.primarySchema });
   const admissionEnv = Object.freeze({

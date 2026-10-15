@@ -3,7 +3,7 @@
 // Every other source file in this directory is a byte copy of commit 62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a
 // (the reviewed historical-kernel client-compatibility source), written by scripts/vendor-analytics-kernels.mjs and
 // verified by scripts/vendor-analytics-kernels.check.mjs against MANIFEST.json.
-// The only edits are six `export ` tokens and the reviewed, semantics-preserving
+// The only edits are eight `export ` tokens and the reviewed, semantics-preserving
 // source patches (SOURCE_PATCHES in the generator) that MANIFEST.json lists. The
 // apps/worker/src/*.d.ts files (MANIFEST.json typeStubs) are tsc declarations of
 // 62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a modules the copies import only for types; they keep tsc-checked
@@ -65,8 +65,18 @@ export {
   createV11QuotaAcquisitionIdentity,
   finishV11UsageReduction,
   foldV11UsageModelReduction,
+  quotaContext,
+  usageEvent,
+  usageEventSync,
+  createV11UsageModelState,
+  reduceV11UsageModelEvent,
+  v11UsageModelHalf,
+  v11ModelCompositionFromModelHalf,
+  MAX_V11_USAGE_CHECKPOINT_BYTES,
 } from "./apps/worker/src/quota-analysis-v11";
-export type { UsageRow, V11UsageReductionCheckpoint } from "./apps/worker/src/quota-analysis-v11";
+export type { UsageRow, V11UsageReductionCheckpoint, V11UsageModelState } from "./apps/worker/src/quota-analysis-v11";
+export { MAX_WINDOWED_USAGE_ROWS } from "./apps/worker/src/quota-analysis-v1";
+export { MODEL_COMPOSITION_POLICY } from "@app-usagemonitor/quota-analysis";
 export {
   advanceV11QuotaAcquisition,
   createV11QuotaAcquisitionCheckpoint,

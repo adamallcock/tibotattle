@@ -2966,11 +2966,12 @@ test("foreground ingestion queue recovers after one transient failure", async ()
     async readAccountUsage() { return { dailyUsageBuckets: [] }; }
     close() {}
   }
+  let recoveryDeadline;
+  let recovered = false;
+  const hardStop = setTimeout(() => controller.abort(), 1_000);
   try {
-    // SQLite initialization and its first durable transaction can take longer
-    // than the old JSON checkpoint write on a cold filesystem. Leave enough
-    // time for the scheduled reconciliation to demonstrate recovery.
-    setTimeout(() => controller.abort(), 300);
+    // Bound startup separately. The 300ms recovery window starts when the
+    // transient failure occurs; successful ingestion ends the observation.
     const result = await runCollectorForeground({
       ...fixture,
       signal: controller.signal,
@@ -2980,18 +2981,26 @@ test("foreground ingestion queue recovers after one transient failure", async ()
       ingestUpdates: async (options) => {
         attempts += 1;
         if (attempts === 1) {
+          recoveryDeadline = setTimeout(() => controller.abort(), 300);
           const error = new Error("temporary fixture failure");
           error.code = "EIO";
           throw error;
         }
-        return ingestRolloutUpdates(options);
+        const result = await ingestRolloutUpdates(options);
+        recovered = true;
+        controller.abort();
+        return result;
       },
       clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
     });
     assert.equal(result.shutdown, "clean");
     assert.ok(attempts >= 2);
+    assert.equal(recovered, true);
     assert.equal(result.diagnostics.ingestionErrorCounts["rollout_ingestion:EIO"], 1);
   } finally {
+    clearTimeout(hardStop);
+    clearTimeout(recoveryDeadline);
+    controller.abort();
     await rm(fixture.root, { recursive: true });
   }
 });

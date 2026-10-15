@@ -62,8 +62,10 @@ staging keeps its existing tier. This desired change does not alter storage,
 backup/PITR policy, origin or Job resource profiles, images or source bindings.
 Provider application and resulting availability are separate operational gates. A schedule-only
 change preserves the observed trigger state and all runtime image/source pins;
-origin and Jobs may deliberately differ. The committed `PAUSED` state is the
-bootstrap policy. Use a reviewed narrow scheduler update for an existing live
+origin and Jobs may deliberately differ. Both production scheduler states are
+committed `ENABLED`, matching the live schedules recorded before the
+2026-10-13 origin hotfix rollout. New triggers still follow the bootstrap
+pause policy. Use a reviewed narrow scheduler update for an existing live
 trigger rather than a whole-estate apply that can reconcile unrelated drift.
 
 ## Maintenance job and its trigger (D-OPS4)

@@ -104,6 +104,15 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 18: classify shared proof reads in the existing correction-source
   // statement family. Query results, vendor and prices remain unchanged.
   "5f808f13dccf3aa6eb919bb56d7ca9b57b1ea2e474fc1bb5847102a73c78a5fd",
+  // Kernel 19: era-isolated model composition on the production hotfix line.
+  // Existing single-era math is unchanged; each owner votes once per model.
+  "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
+  // Kernel 20: ordered closed-shape validation; model-era composition retained.
+  "77b04b9418e2c84672eda34e44de82923511029693c96fe6615e635dace07041",
+  // Kernel 21: synchronous parse-once model-era usage; eager pricing retained.
+  "ed9a5e20c341629c46e300eea7739bc0b71a47befca56492ff97ba1dfae303b5",
+  // Kernel 22: context-local one-slot parse/price reuse; row metadata and outputs remain isolated.
+  "7171c6b04377980a39831573b0ccc0375bd16362246e09fce303034edae48d77",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
@@ -205,6 +214,7 @@ test("the closure holds every module that decides a stored value and no I/O plum
   for (const decides of [
     "apps/worker/src/analytics-v2/compute.ts", "apps/worker/src/analytics-v2/compute-owner.ts",
     "apps/worker/src/analytics-v2/compute-community.ts", "apps/worker/src/analytics-v2/native-path.ts",
+    "apps/worker/src/analytics-v2/model-era-composition.ts",
     "apps/worker/src/analytics-v2/occurrence-source.ts", "apps/worker/src/analytics-v2/owners.ts",
     "apps/worker/src/analytics-v2/devices.ts", "apps/worker/src/analytics-v2/queued-days.ts",
     "apps/worker/src/analytics-v2/owner-sets.ts",
@@ -249,7 +259,7 @@ test("the allowance projection decides the stored preview: compute class changes
   // live in these modules; each is a compute-closure input of the refresh Job.
   for (const module of ["src/admin-community-allowance.ts", "src/community-allowance.ts",
     "src/public-allowance-breakdowns.ts", "src/analytics-v2/allowance-projection.ts",
-    "src/analytics-v2/public-allowance-breakdowns-v15.ts"]) {
+    "src/analytics-v2/public-allowance-breakdowns-v15.ts", "src/analytics-v2/model-era-composition.ts"]) {
     const target = join(WORKER_ROOT, ...module.split("/"));
     assert.ok(identity.names.includes(`apps/worker/${module}`), `${module} decides the stored preview`);
     const mutated = await identityWith(async (path, ...rest) => {

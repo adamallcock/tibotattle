@@ -712,3 +712,21 @@ const SERVER_V15_COMMUNITY_DAILY_BODY = {
     },
   ],
 };
+
+// Retained bare Pro 10x producer contract, separate from every R1 served body.
+// Existing synthetic estimates are preserved; the historical wire has no metadata wrapper.
+export function retainedPro10PublicAllowanceFixture(nowMs = Date.now()) {
+  const payload = publicAllowanceFixture(nowMs);
+  const basis = "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
+  const normalization = "pro_x1_prolite_x2_promax_x0_4_plus_x10";
+  Object.assign(payload.allowanceBreakdowns, {
+    schemaVersion: "community-allowance-breakdowns-v1.2", basis, normalization,
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  });
+  for (const day of payload.allowanceBreakdowns.days) {
+    day.combined = structuredClone(day.byPlanType.pro);
+    day.byPlanType.promax = structuredClone(day.byPlanType.pro);
+  }
+  for (const day of payload.days) Object.assign(day.payload.allowance, { basis, normalization });
+  return payload;
+}

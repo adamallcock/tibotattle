@@ -1247,3 +1247,19 @@ const SERVER_V05_ADMIN_ALLOWANCE_PREVIEW_VALUE = {
   "to": "2026-10-01",
   "trailingDays": 30,
 };
+
+// Exact historical v0.3 qualification, separate from current and R1 fixtures.
+export function createHistorical40PpAdminAllowancePreviewPayload() {
+  const preview = createAdminAllowancePreviewPayload();
+  preview.qualification = "shared_reset_fit_gates_40pp_span_floor";
+  preview.spanFloorPp = 40;
+  return preview;
+}
+
+// The reviewed 42-model predecessor has its own frozen history catalog.
+export function createHistorical42ModelAdminAllowancePreviewPayload() {
+  const preview = createHistorical40PpAdminAllowancePreviewPayload();
+  preview.models.modelConfig = structuredClone(ADMIN_MODEL_CONFIG.slice(0, 42));
+  for (const day of preview.models.days) day.catalogVersion = "reviewed-model-catalog-2026-09-23.1";
+  return preview;
+}

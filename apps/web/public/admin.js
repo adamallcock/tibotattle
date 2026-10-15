@@ -1413,7 +1413,7 @@ function collectAttentionItems(overview) {
   }
   if (state.reconstructionProgress?.schemaVersion === 4 && state.reconstructionProgress.work.lastRun?.state === "failed") {
     addAttentionItem(items, "full-refresh-failed", "maintenance", "warning", "Last recorded analytics refresh failed",
-      "Published evidence remains visible. Current execution and unrecorded failures are unavailable.",
+      "Current execution and unrecorded failures are unavailable.",
       "#admin-reconstruction-title", "Review refresh");
   }
   const collection = overview.collection;

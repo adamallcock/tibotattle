@@ -119,22 +119,72 @@ export const CACHE_RETENTION_V1_MANIFEST_ID = "v1-chunk-vector";
 export const CACHE_RETENTION_EFFECTIVE_DEVICE_ID = "effective-owner";
 export const CACHE_RETENTION_EFFECTIVE_MANIFEST_ID = "effective-owner-day";
 
-const EFFECTIVE_DAILY_CURSOR_METHOD = "effective-daily-cursor-v2";
+const EFFECTIVE_DAILY_CURSOR_METHOD_V2 = "effective-daily-cursor-v2";
+const EFFECTIVE_DAILY_CURSOR_METHOD_V4 = "effective-daily-cursor-v4";
+const EFFECTIVE_DAILY_CURSOR_MAX_BYTES = 2048;
 /**
  * Extract the closed-window dependency identity materialized by the effective
  * daily projector. This is deliberately a fail-closed expression: a legacy,
  * malformed, or hand-written effective row must never become an empty digest
  * and accidentally authorize a cache aggregate.
  */
-function effectiveDependencyDigestSql(alias: string): string {
+function effectiveCursorStreamsValidSql(path: string): string {
+  // json_each visits only this bounded cursor's three stream entries. CASE
+  // keeps non-object JSON values away from the object-only field checks.
+  return `(NOT EXISTS(SELECT 1 FROM json_each(${path},'$.streams') stream
+    WHERE stream.key NOT IN ('usage','quota','session') OR
+      (CASE WHEN stream.type='null' THEN 1 WHEN stream.type='object' THEN
+        (((json_extract(${path},'$.method')='${EFFECTIVE_DAILY_CURSOR_METHOD_V4}'
+          AND (SELECT COUNT(*) FROM json_each(stream.value))=1)
+          AND (json_type(stream.value,'$.state')='text'
+            AND json_extract(stream.value,'$.state')='start'))
+        OR (((SELECT COUNT(*) FROM json_each(stream.value))=2
+          AND json_type(stream.value,'$.observedAtMs')='integer')
+          AND (json_extract(stream.value,'$.observedAtMs') BETWEEN -9007199254740991 AND 9007199254740991
+            AND json_type(stream.value,'$.occurrenceId')='text')
+          AND (length(json_extract(stream.value,'$.occurrenceId')) BETWEEN 8 AND 128
+            AND json_extract(stream.value,'$.occurrenceId') NOT GLOB '*[^A-Za-z0-9._:-]*')))
+      ELSE 0 END) IS NOT 1))`;
+}
+
+function effectiveCursorShapeValidSql(path: string): string {
+  return `((json_type(${path})='object'
+      AND ((json_extract(${path},'$.method')='${EFFECTIVE_DAILY_CURSOR_METHOD_V2}'
+          AND (SELECT COUNT(*) FROM json_each(${path}))=3)
+        OR (json_extract(${path},'$.method')='${EFFECTIVE_DAILY_CURSOR_METHOD_V4}'
+          AND (SELECT COUNT(*) FROM json_each(${path}))=4
+          AND json_type(${path},'$.blocked') IN ('true','false'))))
+      AND ((json_type(${path},'$.dependencyDigest')='text'
+        AND length(json_extract(${path},'$.dependencyDigest'))=64)
+        AND json_extract(${path},'$.dependencyDigest') NOT GLOB '*[^0-9a-f]*')
+      AND ((json_type(${path},'$.streams')='object'
+        AND (SELECT COUNT(*) FROM json_each(${path},'$.streams'))=3)
+        AND (json_type(${path},'$.streams.usage') IS NOT NULL
+          AND json_type(${path},'$.streams.quota') IS NOT NULL
+          AND json_type(${path},'$.streams.session') IS NOT NULL)))`;
+}
+
+function effectiveBoundedCursorJsonSql(alias: string): string {
   if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/u.test(alias)) throw fail();
-  const path = `${alias}.fingerprint`;
-  return `(CASE WHEN json_valid(${path})=1
-      AND json_extract(${path},'$.method')='${EFFECTIVE_DAILY_CURSOR_METHOD}'
-      AND json_type(${path},'$.dependencyDigest')='text'
-      AND length(json_extract(${path},'$.dependencyDigest'))=64
-      AND json_extract(${path},'$.dependencyDigest') NOT GLOB '*[^0-9a-f]*'
-    THEN json_extract(${path},'$.dependencyDigest') ELSE NULL END)`;
+  const raw = `${alias}.fingerprint`;
+  // Keep malformed and over-limit stored values away from every JSON function.
+  return `(CASE WHEN length(CAST(${raw} AS BLOB))<=${EFFECTIVE_DAILY_CURSOR_MAX_BYTES}
+    THEN CASE WHEN json_valid(${raw})=1 THEN ${raw} ELSE '{}' END ELSE '{}' END)`;
+}
+
+function effectiveDependencyDigestSql(alias: string): string {
+  const boundedCursor = effectiveBoundedCursorJsonSql(alias);
+  // Each materialized relation contains only this exact row's bounded cursor.
+  // Validating root and stream shapes as columns avoids expanding their JSON
+  // predicates into the surrounding mark/carry expression tree.
+  return `(WITH cursor_row AS MATERIALIZED (SELECT ${boundedCursor} AS cursor_json),
+    cursor_shape AS MATERIALIZED (SELECT
+      json_extract(cursor_row.cursor_json,'$.dependencyDigest') AS dependency_digest,
+      ${effectiveCursorShapeValidSql("cursor_row.cursor_json")} AS root_valid,
+      ${effectiveCursorStreamsValidSql("cursor_row.cursor_json")} AS streams_valid
+      FROM cursor_row)
+    SELECT CASE WHEN root_valid AND streams_valid THEN dependency_digest ELSE NULL END
+      FROM cursor_shape LIMIT 1)`;
 }
 
 /**
@@ -163,15 +213,15 @@ function effectiveMarkCurrentSql(markAlias: string, ready = false): string {
     AND (SELECT COUNT(*) FROM analytics_cache_retention_day_carry ${carryAlias}
       WHERE ${carryAlias}.mark_key=${markAlias}.mark_key)=${markAlias}.carry_days
     AND NOT EXISTS(SELECT 1 FROM analytics_cache_retention_day_carry ${carryAlias}
+      LEFT JOIN analytics_community_daily_owners ${carryDayAlias}
+        ON ${carryDayAlias}.source_id=${markAlias}.source_id
+          AND ${carryDayAlias}.owner_digest=${markAlias}.owner_digest
+          AND ${carryDayAlias}.day=${carryAlias}.day
+          AND ${carryDayAlias}.source_format='effective'
       WHERE ${carryAlias}.mark_key=${markAlias}.mark_key
-        AND ${carryAlias}.manifest_digest!=COALESCE(
-          (SELECT ${effectiveDependencyDigestSql(carryDayAlias)}
-             FROM analytics_community_daily_owners ${carryDayAlias}
-            WHERE ${carryDayAlias}.source_id=${markAlias}.source_id
-              AND ${carryDayAlias}.owner_digest=${markAlias}.owner_digest
-              AND ${carryDayAlias}.day=${carryAlias}.day
-              AND ${carryDayAlias}.source_format='effective'
-              AND ${carryDayAlias}.complete=1),''))
+        AND CASE WHEN ${carryDayAlias}.source_id IS NULL
+          THEN ${carryAlias}.manifest_digest!=''
+          ELSE ${effectiveDependencyDigestSql(carryDayAlias)} IS NOT ${carryAlias}.manifest_digest END)
     ${ready ? `AND ${markAlias}.refusal IS NULL` : ''})`;
 }
 
@@ -369,7 +419,7 @@ export async function readCacheRetentionCarryDays(target: D1Database,
     rows = (await target.prepare(`SELECT day,${effectiveDependencyDigestSql("e")} AS manifest_digest
         FROM analytics_community_daily_owners e
         WHERE e.source_id=?1 AND e.owner_digest=?2 AND e.source_format='effective'
-          AND e.complete=1 AND e.day>=?3 AND e.day<?4
+          AND e.day>=?3 AND e.day<?4
         GROUP BY e.day`)
       .bind(key.sourceId, key.ownerDigest, days[0]!, key.day)
       .all<{ day: string; manifest_digest: string | null }>()).results;
@@ -732,9 +782,9 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
       ORDER BY c.mark_key,c.day LIMIT ?2) RETURNING day`)
     .bind(sourceId, limit).all()).results.length;
   // Effective reducer checkpoints are replaceable staging. Retire an orphan
-  // when its owner is erased or its pinned owner-day revision no longer
-  // exists; a promoted mark deliberately blocks this cleanup and is cleaned
-  // transactionally by writeCacheRetentionDay instead.
+  // when its owner is erased, its pinned owner-day revision no longer exists,
+  // or an exact-current successor mark proves it was replaced by a new carry.
+  // A promoted mark for this key still blocks cleanup and is deleted first.
   try {
     await target.prepare(`DELETE FROM analytics_cache_retention_day_progress
       WHERE progress_key IN (SELECT p.progress_key FROM analytics_cache_retention_day_progress p
@@ -745,7 +795,18 @@ export async function retireCacheRetentionDayPage(target: D1Database, sourceId: 
           OR NOT EXISTS(SELECT 1 FROM analytics_community_daily_owners e
             WHERE e.source_id=p.source_id AND e.owner_digest=p.owner_digest AND e.day=p.day
               AND e.source_format='effective' AND e.complete=1
-              AND ${effectiveDependencyDigestSql("e")} = p.manifest_digest))
+              AND ${effectiveDependencyDigestSql("e")} = p.manifest_digest)
+          OR EXISTS(SELECT 1 FROM analytics_cache_retention_day_marks m
+            WHERE m.source_layout='effective' AND m.source_id=p.source_id
+              AND m.source_namespace=p.source_namespace AND m.owner_digest=p.owner_digest
+              AND m.device_id=p.device_id AND m.manifest_id=p.manifest_id
+              AND m.manifest_digest=p.manifest_digest AND m.day=p.day
+              AND m.method_version=p.method_version AND m.carry_digest!=p.carry_digest
+              AND EXISTS(SELECT 1 FROM analytics_owner_state o
+                WHERE o.source_id=m.source_id AND o.owner_digest=m.owner_digest AND o.state='active')
+              AND NOT EXISTS(SELECT 1 FROM analytics_storage_erasure_fences f
+                WHERE f.source_id=m.source_id AND f.owner_digest=m.owner_digest)
+              AND ${effectiveMarkCurrentSql("m")}))
         ORDER BY p.owner_digest,p.day LIMIT ?2)`).bind(sourceId, limit).run();
   } catch { /* Older analytics databases have no staged effective table. */ }
   return { state: marks + carry + values + bands > 0 ? "retiring" : "idle",

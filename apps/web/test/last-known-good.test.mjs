@@ -17,7 +17,7 @@ import {
   renderCommunityDailySeries,
 } from "../public/community-view.js";
 import { formatAge } from "../public/ui-format.js";
-import { publicAllowanceFixture } from "./fixtures/public-allowance.js";
+import { publicAllowanceFixture, retainedPro10PublicAllowanceFixture } from "./fixtures/public-allowance.js";
 
 // Everything below uses synthetic public aggregates only: the fixture is the
 // reviewed wire shape with invented dollar values, and no real contribution,
@@ -486,5 +486,35 @@ test("both community views label retained figures, keep the figures, and never c
     const rendered = renderBoth(broken);
     assert.equal(rendered.daily.stateNode.textContent, "Daily series available");
     assert.equal(rendered.daily.container.text.includes("last received"), false);
+  }
+});
+
+
+test("last-known-good transitions preserve bare v1.2 and wrapped v1.4 despite their shared normalization", () => {
+  const storage = fakeStorage();
+  const clock = { ms: NOW_MS };
+  const store = createLastKnownGoodStore({
+    key: "historical-pro10-contracts", schemaVersion: COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY,
+    project: payload => projectCommunityDailyPayloadForCache(payload, { nowMs: clock.ms }),
+    storage, now: () => clock.ms,
+  });
+  for (const wrapped of [false, true, false]) {
+    const payload = retainedPro10PublicAllowanceFixture(NOW_MS);
+    payload.allowanceBreakdowns.days.at(-1).models.push(["gpt-7-new-fixture", 321, 1]);
+    if (wrapped) {
+      payload.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.4";
+      payload.allowanceBreakdowns.modelConfig = [{ id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 }];
+    }
+    assert.equal(store.resolve({ payload, failure: null }).state, "live");
+    clock.ms += HOUR_MS;
+    const cached = store.resolve({ payload: null, failure: failure({ status: 503 }) });
+    assert.equal(cached.state, "cached");
+    assert.equal(cached.payload.allowanceBreakdowns.schemaVersion, wrapped
+      ? "community-allowance-breakdowns-v1.4" : "community-allowance-breakdowns-v1.2");
+    assert.equal(Object.hasOwn(cached.payload.allowanceBreakdowns, "modelConfig"), wrapped);
+    assert.deepEqual(cached.payload.allowanceBreakdowns.retainedUnrecognizedModels, { tuples: 1, models: 1 });
+    assert.doesNotMatch(JSON.stringify(cached.payload), /gpt-7-new-fixture/u);
+    assert.deepEqual(normalizeCommunityDailySeries(cached.payload, { nowMs: clock.ms, retained: true }).breakdowns,
+      normalizeCommunityDailySeries(payload, { nowMs: clock.ms }).breakdowns);
   }
 });

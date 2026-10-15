@@ -23,6 +23,8 @@ import {
   type UsageCorrectionSource,
 } from "./telemetry-usage-reconciliation";
 import { sha256Hex } from "./crypto";
+import { typedTelemetryDayNumber } from "./typed-telemetry-codec";
+import { TYPED_V11_CHUNK_PROOF_COUNT_SQL } from "./typed-v11-chunk-completeness";
 import {
   readTelemetryV12EffectiveCandidatePage,
   readTelemetryV12EffectiveOccurrences,
@@ -379,10 +381,42 @@ async function assertOwnerScopeCurrent(
  * any totals are folded. Expansion later deliberately removes the day filter
  * so a conflicting/misaligned timestamp for the same occurrence cannot become
  * an independently priced row on another day. */
-const CANDIDATE_SQL = `
-  WITH direct AS (
+const CANDIDATE_SQL_TEMPLATE = `
+  WITH selected_window(stream,stream_code,from_day,through_day,participant_id) AS MATERIALIZED (
+    SELECT ?,?,?,?,?
+  ), v1_scoped_records AS MATERIALIZED (
+    SELECT physical_record.id
+      FROM selected_window window
+      CROSS JOIN typed_v1_owner_memberships owner_membership
+       ON owner_membership.participant_id=window.participant_id
+      CROSS JOIN typed_telemetry_records physical_record INDEXED BY typed_telemetry_day
+       ON physical_record.owner_id=owner_membership.typed_owner_id
+      AND physical_record.format=10 AND physical_record.stream=window.stream_code
+      AND physical_record.observed_day>=window.from_day AND physical_record.observed_day<=window.through_day
+  ), v11_scoped_records AS MATERIALIZED (
+    SELECT physical_record.id
+      FROM selected_window window
+      CROSS JOIN typed_v11_owner_memberships owner_membership
+       ON owner_membership.participant_id=window.participant_id
+      CROSS JOIN typed_telemetry_records physical_record INDEXED BY typed_telemetry_day
+       ON physical_record.owner_id=owner_membership.typed_owner_id
+      AND physical_record.format=11 AND physical_record.stream=window.stream_code
+      AND physical_record.observed_day>=window.from_day AND physical_record.observed_day<=window.through_day
+  ), v11_candidate_chunks AS MATERIALIZED (
+    SELECT DISTINCT admission.chunk_id
+      FROM v11_scoped_records scoped
+      JOIN typed_v11_record_admissions admission ON admission.typed_record_id=scoped.id
+  ), complete_v11_chunks AS MATERIALIZED (
+    SELECT chunk.id
+      FROM v11_candidate_chunks candidate
+      JOIN telemetry_v11_chunks chunk ON chunk.id=candidate.chunk_id
+      CROSS JOIN selected_window window
+     WHERE chunk.participant_id=window.participant_id AND chunk.stream=window.stream
+       AND chunk.record_count=__V11_CHUNK_COUNT__
+  ), direct AS (
     SELECT r.occurrence_id,r.observed_at_ms
-      FROM typed_telemetry_compatibility_records r
+      FROM v1_scoped_records scoped
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped.id
       JOIN typed_v1_admission_state v1
        ON v1.id=1 AND v1.runtime_contract_version=1 AND v1.source_namespace=?
       JOIN typed_v1_owner_memberships owner_membership
@@ -403,7 +437,8 @@ const CANDIDATE_SQL = `
         AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
     UNION ALL
     SELECT r.occurrence_id,r.observed_at_ms
-      FROM typed_telemetry_compatibility_records r
+      FROM v11_scoped_records scoped
+      CROSS JOIN typed_telemetry_compatibility_records r ON r.storage_row_id=scoped.id
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
       JOIN typed_v11_owner_memberships owner_membership
@@ -413,6 +448,7 @@ const CANDIDATE_SQL = `
       AND typed_owner.namespace_id=v11.namespace_id
       JOIN typed_v11_record_admissions admission ON admission.typed_record_id=r.storage_row_id
       JOIN telemetry_v11_chunks chunk ON chunk.id=admission.chunk_id AND chunk.stream='usage'
+      JOIN complete_v11_chunks complete ON complete.id=chunk.id
       JOIN telemetry_v11_domain_days domain_day ON domain_day.manifest_id=admission.manifest_id
       JOIN telemetry_v11_day_manifests manifest
        ON manifest.id=domain_day.manifest_id AND manifest.state='ready'
@@ -432,7 +468,6 @@ const CANDIDATE_SQL = `
       WHERE v11.source_namespace=? AND r.participant_id=? AND r.source_namespace=v11.source_namespace
         AND r.namespace_id=v11.namespace_id AND r.owner_id=typed_owner.id AND r.format_code=11
         AND r.stream='usage' AND r.observed_day=?
-        AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
   ), grouped AS (
     SELECT occurrence_id,MIN(observed_at_ms) AS observed_at_ms FROM direct GROUP BY occurrence_id
   )
@@ -440,9 +475,16 @@ const CANDIDATE_SQL = `
    WHERE observed_at_ms>? OR (observed_at_ms=? AND occurrence_id>?)
    ORDER BY observed_at_ms,occurrence_id LIMIT ?`;
 
+const CANDIDATE_SQL = CANDIDATE_SQL_TEMPLATE
+  .replaceAll("__V11_CHUNK_COUNT__", TYPED_V11_CHUNK_PROOF_COUNT_SQL);
+const GENERIC_CANDIDATE_SQL = CANDIDATE_SQL
+  .replaceAll("chunk.stream='usage'", "chunk.stream=?")
+  .replaceAll("r.stream='usage'", "r.stream=?");
+
 async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: ReturnType<typeof normalizeOptions>): Promise<CandidateRow[]> {
   try {
     const rows = (await db.prepare(CANDIDATE_SQL).bind(
+      "usage", 1, typedTelemetryDayNumber(options.day), typedTelemetryDayNumber(options.day), scope.participant_id,
       options.sourceNamespace, options.ownerDigest, scope.participant_id, options.day,
       options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id, options.day,
       options.after.observedAtMs, options.after.observedAtMs, options.after.occurrenceId, options.limit + 1,
@@ -454,9 +496,9 @@ async function readDirectCandidates(db: D1Database, scope: OwnerScope, options: 
   }
 }
 
-const DIRECT_SOURCE_SQL = `
+const DIRECT_SOURCE_SQL_TEMPLATE = `
   WITH requested(occurrence_id) AS MATERIALIZED (SELECT value FROM json_each(?)),
-  direct AS (
+  v1_direct AS (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
            r.observed_at_ms,r.canonical_sha256,r.format_code
       FROM typed_telemetry_compatibility_records r
@@ -479,9 +521,9 @@ const DIRECT_SOURCE_SQL = `
         AND r.namespace_id=v1.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=10 AND r.stream='usage'
         AND chunk.record_count=(SELECT count(*) FROM typed_v1_record_admissions p WHERE p.chunk_id=chunk.id)
-    UNION
+  ), v11_direct AS MATERIALIZED (
     SELECT r.storage_row_id,r.source_namespace,r.participant_id,r.device_id,r.occurrence_id,
-           r.observed_at_ms,r.canonical_sha256,r.format_code
+           r.observed_at_ms,r.canonical_sha256,r.format_code,chunk.id AS chunk_id
       FROM typed_telemetry_compatibility_records r
       JOIN typed_v11_admission_state v11
        ON v11.id=1 AND v11.runtime_contract_version=1
@@ -512,7 +554,23 @@ const DIRECT_SOURCE_SQL = `
       WHERE v11.source_namespace=? AND r.participant_id=? AND r.source_namespace=v11.source_namespace
         AND r.namespace_id=v11.namespace_id AND r.owner_id=typed_owner.id
         AND r.format_code=11 AND r.stream='usage'
-        AND chunk.record_count=(SELECT count(*) FROM typed_v11_record_admissions p WHERE p.chunk_id=chunk.id)
+  ), v11_candidate_chunks AS MATERIALIZED (
+    SELECT DISTINCT candidate.chunk_id
+      FROM v11_direct candidate
+  ), complete_v11_chunks AS MATERIALIZED (
+    SELECT chunk.id
+      FROM v11_candidate_chunks candidate
+      JOIN telemetry_v11_chunks chunk ON chunk.id=candidate.chunk_id
+     WHERE chunk.record_count=__V11_CHUNK_COUNT__
+  ), direct AS (
+    SELECT v1_direct.storage_row_id,v1_direct.source_namespace,v1_direct.participant_id,v1_direct.device_id,
+           v1_direct.occurrence_id,v1_direct.observed_at_ms,v1_direct.canonical_sha256,v1_direct.format_code
+      FROM v1_direct
+    UNION
+    SELECT candidate.storage_row_id,candidate.source_namespace,candidate.participant_id,candidate.device_id,
+           candidate.occurrence_id,candidate.observed_at_ms,candidate.canonical_sha256,candidate.format_code
+      FROM v11_direct candidate
+      JOIN complete_v11_chunks complete ON complete.id=candidate.chunk_id
   ), grouped AS (
     /* Repeated retained revisions with identical canonical bytes are one
      * semantic source variant. Keep the earliest physical row for audit, but
@@ -525,6 +583,12 @@ const DIRECT_SOURCE_SQL = `
   )
   SELECT storage_row_id,source_namespace,participant_id,occurrence_id FROM grouped
    ORDER BY occurrence_id,storage_row_id LIMIT ?`;
+
+const DIRECT_SOURCE_SQL = DIRECT_SOURCE_SQL_TEMPLATE
+  .replaceAll("__V11_CHUNK_COUNT__", TYPED_V11_CHUNK_PROOF_COUNT_SQL);
+const GENERIC_SOURCE_SQL = DIRECT_SOURCE_SQL
+  .replaceAll("chunk.stream='usage'", "chunk.stream=?")
+  .replaceAll("r.stream='usage'", "r.stream=?");
 
 async function readDirectSourceRows(db: D1Database, scope: OwnerScope, options: ReturnType<typeof normalizeOptions>, occurrenceIds: readonly string[]): Promise<DirectSourceRow[]> {
   if (occurrenceIds.length < 1 || occurrenceIds.length > MAX_EFFECTIVE_USAGE_PAGE) return [];
@@ -752,12 +816,7 @@ export async function readEffectiveUsageOwnerDayPage(
  * ------------------------------------------------------------------------- */
 
 const EFFECTIVE_TELEMETRY_METHOD = "effective-telemetry-owner-day-v1" as const;
-const GENERIC_CANDIDATE_SQL = CANDIDATE_SQL
-  .replaceAll("chunk.stream='usage'", "chunk.stream=?")
-  .replaceAll("r.stream='usage'", "r.stream=?");
-const GENERIC_SOURCE_SQL = DIRECT_SOURCE_SQL
-  .replaceAll("chunk.stream='usage'", "chunk.stream=?")
-  .replaceAll("r.stream='usage'", "r.stream=?");
+const STREAM_CODES = Object.freeze({ usage: 1, quota: 2, session: 3 } as const);
 
 interface GenericSourceRow {
   storage_row_id: number;
@@ -775,6 +834,7 @@ async function readGenericDirectCandidates(
 ): Promise<GenericCandidateRow[]> {
   try {
     const rows = (await db.prepare(GENERIC_CANDIDATE_SQL).bind(
+      options.stream, STREAM_CODES[options.stream], typedTelemetryDayNumber(options.day), typedTelemetryDayNumber(options.day), scope.participant_id,
       options.sourceNamespace, options.stream, options.ownerDigest, scope.participant_id, options.stream, options.day,
       options.stream, options.ownerDigest, scope.participant_id, options.sourceNamespace, scope.participant_id,
       options.stream, options.day, options.after.observedAtMs, options.after.observedAtMs,
@@ -990,7 +1050,8 @@ export async function readEffectiveTelemetryOwnerDayPage(
         sourceCount: row.sourceCount, sourceFormats: row.sourceFormats, sourceRowIds: row.sourceRowIds,
         sourceRecordKeys: row.sourceRecordKeys, recordJson: row.analyticalRecordJson }))), next: page.next });
   }
-  const scope = await readOwnerScope(db, options, await readV12Availability(db));
+  const v12Available = await readV12Availability(db);
+  const scope = await readOwnerScope(db, options, v12Available);
   const directCandidates = await readGenericDirectCandidates(db, scope, options);
   const v12Candidates = await readAllV12GenericCandidates(db, scope, options);
   const byOccurrence = new Map<string, CandidateRow>();
@@ -1038,7 +1099,8 @@ export async function readEffectiveTelemetryOwnerDays(db:D1Database,input:Omit<E
     .replaceAll('SELECT r.occurrence_id,r.observed_at_ms','SELECT r.observed_day')
     .replaceAll('r.observed_day=?','r.observed_day>=? AND r.observed_day<=?');
   const rows=(await db.prepare(`${prefix}) SELECT DISTINCT observed_day FROM direct ORDER BY observed_day LIMIT 102`)
-    .bind(options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
+    .bind(options.stream,STREAM_CODES[options.stream],typedTelemetryDayNumber(fromDay),typedTelemetryDayNumber(throughDay),scope.participant_id,
+      options.sourceNamespace,options.stream,options.ownerDigest,scope.participant_id,options.stream,fromDay,throughDay,
       options.stream,options.ownerDigest,scope.participant_id,options.sourceNamespace,scope.participant_id,
       options.stream,fromDay,throughDay).all<{observed_day:string}>()).results;
   const days=new Set(rows.map(row=>validDay(row.observed_day)));

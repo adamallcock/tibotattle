@@ -38,7 +38,10 @@ import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { makeV11Day, stageV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
-async function seedAcceptedAccountlessDay(sourceDays = [DAY]) {
+async function seedAcceptedAccountlessDay(sourceDays = [DAY], options: {
+  candidateThroughEpoch?: number;
+  predecessorNowEpoch?: number;
+} = {}) {
   const deviceId = crypto.randomUUID();
   const secret = encodeBase64Url(new Uint8Array(32).fill(19));
   const authorization = `Device um_device_${deviceId}.${secret}`;
@@ -62,20 +65,33 @@ async function seedAcceptedAccountlessDay(sourceDays = [DAY]) {
     nowEpoch: Date.now(), sessionId: "", cookie: "", csrfToken: "" };
   const acceptedDays = [];
   const domainDays: string[] = [];
-  const throughDay = new Date().toISOString().slice(0,10);
-  for (let at = Date.parse(sourceDays[0]!); at <= Date.parse(throughDay); at += 86_400_000) domainDays.push(new Date(at).toISOString().slice(0,10));
+  const candidateThroughEpoch = options.candidateThroughEpoch ?? Date.now();
+  const candidateThroughDay = new Date(candidateThroughEpoch).toISOString().slice(0,10);
+  for (let at = Date.parse(sourceDays[0]!); at <= Date.parse(candidateThroughDay); at += 86_400_000) domainDays.push(new Date(at).toISOString().slice(0,10));
   for (const sourceDay of domainDays) {
     const prepared = await makeV11Day(sourceDay, sourceDays.includes(sourceDay) ? { usage: [v11UsageRecord(sourceDay, "a", { eventId: `event:v2:${await sha256Hex(sourceDay)}` })] } : {});
     acceptedDays.push(await stageV11Day(db(), fixture, prepared));
   }
-  const prior = await createTelemetryV11DomainPredecessor(db(), fixture);
+  const predecessorNowEpoch = options.predecessorNowEpoch ?? Date.now();
+  const prior = await createTelemetryV11DomainPredecessor(db(), fixture, predecessorNowEpoch);
+  const requiredDays = [...new Set([...domainDays, ...sourceDays, prior.fromDay, prior.throughDay])].sort();
+  const fromDay = requiredDays[0]!;
+  const throughDay = requiredDays.at(-1)!;
+  const acceptedByDay = new Map<string, typeof acceptedDays[number]>();
+  for (const accepted of acceptedDays) acceptedByDay.set(accepted.day, accepted);
+  const days: {day: string; manifestId: string; manifestDigest: string}[] = [];
+  for (let at = Date.parse(fromDay); at <= Date.parse(throughDay); at += 86_400_000) {
+    const day = new Date(at).toISOString().slice(0,10);
+    const accepted = acceptedByDay.get(day) ?? await stageV11Day(db(), fixture, await makeV11Day(day, {}));
+    days.push({ day: accepted.day, manifestId: accepted.manifestId, manifestDigest: accepted.manifestDigest });
+  }
   const manifest = { schemaVersion: "telemetry-domain-manifest-v1.1" as const,
-    fromDay: domainDays[0]!, throughDay: domainDays.at(-1)!,
+    fromDay, throughDay,
     predecessor: { token: prior.token, previousGenerationId: prior.previousGenerationId, legacyFingerprint: prior.legacyFingerprint },
-    days: acceptedDays.map(day => ({ day: day.day, manifestId: day.manifestId, manifestDigest: day.manifestDigest })),
+    days,
     manifestDigest: "0".repeat(64) };
   manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
-  await activateTelemetryV11Domain(db(), fixture, manifest);
+  await activateTelemetryV11Domain(db(), fixture, manifest, predecessorNowEpoch);
   return fixture;
 }
 
@@ -778,7 +794,23 @@ describe("community daily aggregate cross-device dedupe", () => {
   });
 
   it("includes genuine accountless v1.1 alongside the elected social device and withdraws it on security containment", async () => {
-    const accountless = await seedAcceptedAccountlessDay();
+    const candidateThroughEpoch = Date.parse(new Date().toISOString().slice(0, 10) + "T23:59:59.999Z");
+    const predecessorNowEpoch = candidateThroughEpoch + 1;
+    const accountless = await seedAcceptedAccountlessDay([DAY], { candidateThroughEpoch, predecessorNowEpoch });
+    const expectedThroughDay = new Date(predecessorNowEpoch).toISOString().slice(0, 10);
+    const accountlessDomain = await db().prepare(`SELECT d.from_day, d.through_day
+      FROM telemetry_v11_domain_heads h JOIN telemetry_v11_domains d ON d.id = h.generation_id
+      WHERE h.participant_id = ?`).bind(accountless.participantId)
+      .first<{from_day: string; through_day: string}>();
+    expect(accountlessDomain).toEqual({from_day: DAY, through_day: expectedThroughDay});
+    const accountlessDays = await db().prepare(`SELECT observed_day FROM telemetry_v11_domain_days
+      WHERE generation_id = (SELECT generation_id FROM telemetry_v11_domain_heads WHERE participant_id = ?)
+      ORDER BY observed_day`).bind(accountless.participantId).all<{observed_day: string}>();
+    const expectedDomainDays: string[] = [];
+    for (let at = Date.parse(`${DAY}T00:00:00.000Z`); at <= predecessorNowEpoch; at += 86_400_000) {
+      expectedDomainDays.push(new Date(at).toISOString().slice(0, 10));
+    }
+    expect(accountlessDays.results).toEqual(expectedDomainDays.map(observed_day => ({observed_day})));
     // Other required domain manifests are empty; this test isolates the target day.
     await db().prepare("DELETE FROM community_daily_aggregate_rebuilds WHERE day<>?").bind(DAY).run();
     const participantId = await seedParticipant("mixed-public");

@@ -46,19 +46,38 @@ function preparedDay(selectedDay = day, count = 1, parserVersion = "synthetic-v1
     recordsByStream: { usage: Array.from({ length: count }, (_, index) => usage(index, selectedDay)) } });
 }
 
+function abortableDelay(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new Error("synthetic-request-aborted")); return; }
+    const finish = () => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(new Error("synthetic-request-aborted"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 // The synthetic predecessor follows the Worker contract: its range is the
 // device's ready days, seeded with the current day while none is ready, and its
 // fingerprint pins only the active generation. The two legacy switches restore
 // the earlier server contract (refuse a device without a ready day; fingerprint
 // its ready days) so the client-visible consequence of each stays tested.
 function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, destinationOrigin = origin,
-  refuseWithoutReadyDay = false, fingerprintReadyDays = false } = {}) {
+  refuseWithoutReadyDay = false, fingerprintReadyDays = false, idempotentActivationReplay = false } = {}) {
   let sequence = 10;
   const manifests = new Map();
   const envelopes = new Map();
   const authorizations = new Map();
   const calls = [];
   let active = null;
+  let activeDays = null;
+  let activationCommits = 0;
   const capability = {
     schemaVersion: "device-sync-capabilities-v1.2", destinationOrigin,
     enrollmentNamespace: "synthetic_enrollment_namespace", identityVersion: "account-track-v2",
@@ -136,14 +155,23 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, de
         assert.equal(candidate.id, entry.manifestId);
         assert.equal(candidate.chunks.size, candidate.manifest.chunks.length);
       }
+      const requestedDays = body.days.map(({ day: selectedDay, manifestDigest }) => ({ day: selectedDay, manifestDigest }));
+      if (idempotentActivationReplay && active !== null
+          && active.fromDay === body.fromDay && active.throughDay === body.throughDay
+          && JSON.stringify(activeDays) === JSON.stringify(requestedDays)) {
+        return json({ ...active, replay: true, unchanged: true, requestedManifestDigest: body.manifestDigest }, 200);
+      }
       active = { schemaVersion: "telemetry-domain-activation-v1.2", generationId: uuid(sequence++),
         manifestDigest: body.manifestDigest, fromDay: body.fromDay, throughDay: body.throughDay, replay: false };
+      activeDays = requestedDays;
+      activationCommits += 1;
       return json(active, 201);
     }
     throw new Error("Unexpected synthetic route");
   };
   return {
     calls, manifests, envelopes, capability, active: () => active,
+    activationCommits: () => activationCommits,
     options: {
       serverBaseUrl: destinationOrigin, deviceAuthorization: authorization, consent: telemetryV12RequiredConsent(),
       days: [day], clock: () => now, readDay: (selectedDay) => preparedDay(selectedDay, selectedDay === day ? count : 0),
@@ -175,6 +203,118 @@ test("v1.2 stages, encrypts and acknowledges only a complete successor domain", 
   assert.equal(result.acknowledgedThroughDay, day);
   assert.ok(fixture.calls.some(({ path }) => path === "/api/v1/me/telemetry-v12/domain-activate"));
   assert.ok(fixture.calls.every(({ path }) => !path.includes("v1.1") && !path.includes("telemetry-v11")));
+});
+
+test("v1.2 activation uses its longer request bound without extending ordinary requests", async () => {
+  const fixture = server();
+  let activationDuration = 0;
+  const result = await runTelemetryV12Sync({ ...fixture.options,
+    requestTimeoutMs: 100, activationRequestTimeoutMs: 1_000, maxDurationMs: 1_500,
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-activate") {
+        const activationStart = Date.now();
+        await abortableDelay(150, request.signal);
+        activationDuration = Date.now() - activationStart;
+      }
+      return fixture.options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.failure, null);
+  assert.ok(activationDuration >= 130);
+
+  const ordinary = server();
+  let ordinaryAborted = false;
+  let prepared = false;
+  const bounded = await runTelemetryV12Sync({ ...ordinary.options,
+    requestTimeoutMs: 100, activationRequestTimeoutMs: 1_000, maxDurationMs: 1_500,
+    readDay: () => { prepared = true; return ordinary.options.readDay(day); },
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname === "/api/v1/device/sync-capabilities-v1.2") {
+        try { await abortableDelay(300, request.signal); }
+        catch { ordinaryAborted = request.signal.aborted; throw new Error("synthetic-request-aborted"); }
+      }
+      return ordinary.options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(bounded.failure.code, "service_unavailable");
+  assert.equal(bounded.failure.retryable, true);
+  assert.equal(ordinaryAborted, true);
+  assert.equal(prepared, false);
+});
+
+test("predecessor renewal covers the activation horizon but never exceeds remaining pass time", async () => {
+  for (const { maxDurationMs, expectedPredecessorReads } of [
+    { maxDurationMs: 60_000, expectedPredecessorReads: 2 },
+    { maxDurationMs: 20_000, expectedPredecessorReads: 1 },
+  ]) {
+    const fixture = server({ predecessorChange: {
+      expiresAt: new Date(now + 30_000).toISOString(),
+    } });
+    const result = await runTelemetryV12Sync({ ...fixture.options,
+      requestTimeoutMs: 15_000, activationRequestTimeoutMs: 60_000, maxDurationMs,
+    });
+    assert.equal(result.status, "complete");
+    const predecessorIndexes = fixture.calls.flatMap(({ path }, index) =>
+      path.endsWith("/domain-predecessor") ? [index] : []);
+    const activationIndex = fixture.calls.findIndex(({ path }) => path.endsWith("/domain-activate"));
+    assert.equal(predecessorIndexes.length, expectedPredecessorReads);
+    assert.ok(predecessorIndexes.at(-1) < activationIndex);
+  }
+});
+
+test("v1.2 activation still obeys the whole-pass deadline and caller cancellation", async () => {
+  const passFixture = server();
+  let passActivationStarted = false;
+  let passActivationAborted = false;
+  const passBounded = await runTelemetryV12Sync({ ...passFixture.options,
+    requestTimeoutMs: 100, activationRequestTimeoutMs: 60_000, maxDurationMs: 1_500,
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-activate") {
+        passActivationStarted = true;
+        try { await abortableDelay(5_000, request.signal); }
+        catch { passActivationAborted = request.signal.aborted; throw new Error("synthetic-request-aborted"); }
+      }
+      return passFixture.options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(passBounded.status, "partial");
+  assert.equal(passBounded.failure, null);
+  assert.equal(passBounded.acknowledgedThroughDay, null);
+  assert.equal(passActivationStarted, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(passActivationAborted, true);
+
+  const abortFixture = server();
+  const controller = new AbortController();
+  let notifyActivation;
+  const activationStarted = new Promise((resolve) => { notifyActivation = resolve; });
+  let callerAbortReachedRequest = false;
+  const pending = runTelemetryV12Sync({ ...abortFixture.options,
+    signal: controller.signal, requestTimeoutMs: 100, activationRequestTimeoutMs: 60_000, maxDurationMs: 5_000,
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-activate") {
+        notifyActivation();
+        try { await abortableDelay(5_000, request.signal); }
+        catch { callerAbortReachedRequest = request.signal.aborted; throw new Error("synthetic-request-aborted"); }
+      }
+      return abortFixture.options.fetchImpl(url, request);
+    },
+  });
+  await activationStarted;
+  controller.abort();
+  const interrupted = await pending;
+  assert.equal(interrupted.status, "partial");
+  assert.equal(interrupted.failure.code, "interrupted");
+  assert.equal(interrupted.failure.retryable, true);
+  assert.equal(interrupted.acknowledgedThroughDay, null);
+  assert.equal(callerAbortReachedRequest, true);
+});
+
+test("activation timeout overrides are bounded to v1.2 accountless request limits", async () => {
+  const fixture = server();
+  await assert.rejects(runTelemetryV12Sync({ ...fixture.options, activationRequestTimeoutMs: 60_001 }),
+    { code: "contribution_incremental_sync_invalid_configuration" });
 });
 
 test("v1.2 resumes a partial day without reposting an accepted chunk", async () => {
@@ -391,4 +531,59 @@ test("an interrupted upload acknowledgement retries through server replay withou
   assert.equal(second.acknowledgedThroughDay, day);
   assert.ok(second.chunksSkipped >= 1);
   assert.equal(fixture.calls.filter((call) => call.path === "/api/v1/contributions").length, 1);
+});
+
+test("a committed activation with a dropped receipt replays without creating another head", async () => {
+  const fixture = server({ idempotentActivationReplay: true });
+  let lostReceipt = false;
+  const fetchImpl = async (url, request) => {
+    const response = await fixture.options.fetchImpl(url, request);
+    if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-activate" && !lostReceipt) {
+      lostReceipt = true;
+      return new Response(new ReadableStream({
+        start(controller) { controller.error(new Error("synthetic-activation-connection-reset")); },
+      }), { status: response.status, headers: response.headers });
+    }
+    return response;
+  };
+  const first = await runTelemetryV12Sync({ ...fixture.options, fetchImpl });
+  assert.equal(first.failure.code, "service_unavailable");
+  assert.equal(first.failure.retryable, true);
+  assert.equal(first.acknowledgedThroughDay, null);
+  const committedGeneration = fixture.active().generationId;
+  assert.equal(fixture.activationCommits(), 1);
+
+  const second = await runTelemetryV12Sync({ ...fixture.options, fetchImpl });
+  assert.equal(second.status, "complete");
+  assert.equal(second.domainGenerationId, committedGeneration);
+  assert.equal(second.acknowledgedThroughDay, day);
+  assert.ok(second.chunksSkipped >= 1);
+  assert.equal(fixture.activationCommits(), 1);
+  assert.equal(fixture.calls.filter(({ path }) => path === "/api/v1/contributions").length, 1);
+  assert.equal(fixture.calls.filter(({ path }) => path.endsWith("/domain-activate")).length, 2);
+});
+
+test("a noncommitted activation retry preserves staged chunks and commits once", async () => {
+  const fixture = server();
+  let refusedBeforeCommit = true;
+  const first = await runTelemetryV12Sync({ ...fixture.options,
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname === "/api/v1/me/telemetry-v12/domain-activate" && refusedBeforeCommit) {
+        refusedBeforeCommit = false;
+        return json({ error: { code: "SERVICE_UNAVAILABLE" } }, 503);
+      }
+      return fixture.options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(first.failure.code, "service_unavailable");
+  assert.equal(first.failure.retryable, true);
+  assert.equal(first.chunksUploaded, 1);
+  assert.equal(fixture.active(), null);
+  assert.equal(fixture.activationCommits(), 0);
+
+  const second = await runTelemetryV12Sync(fixture.options);
+  assert.equal(second.status, "complete");
+  assert.ok(second.chunksSkipped >= 1);
+  assert.equal(fixture.activationCommits(), 1);
+  assert.equal(fixture.calls.filter(({ path }) => path === "/api/v1/contributions").length, 1);
 });

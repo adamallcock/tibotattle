@@ -1223,8 +1223,19 @@ test("new accountless client negotiates an exact successor policy before selecti
   assert.equal(result.status, "complete");
   assert.equal(selected.authorization.telemetrySchemaVersion, "telemetry-contribution-v1.2");
   assert.equal(selected.progressFile, "/synthetic/private/usage-progress.json.v12");
+  assert.equal(selected.requestTimeoutMilliseconds, 15_000, "ordinary accountless requests keep their shorter bound");
+  assert.equal(selected.activationRequestTimeoutMilliseconds, 60_000, "only successor activation receives the extended bound");
+  assert.equal(selected.maximumDurationMilliseconds, 60_000, "the whole-pass bound is unchanged");
   assert.equal(Object.hasOwn(selected, "consent"), false);
   assert.equal(calls.length, 2);
+});
+
+test("accountless v1.2 activation timeout accepts only the closed 1-to-60-second range", async () => {
+  for (const activationRequestTimeoutMilliseconds of [999, 60_001, Number.NaN]) {
+    await assert.rejects(runAccountlessContributionSyncOnce(renewalRunnerOptions({
+      activationRequestTimeoutMilliseconds,
+    })), isClientError("invalid_configuration"));
+  }
 });
 
 for (const state of ["staged", "unavailable", "malformed"]) {
@@ -1241,6 +1252,8 @@ for (const state of ["staged", "unavailable", "malformed"]) {
       },
       runIncrementalSync: async (options) => {
         assert.equal(options.authorization.telemetrySchemaVersion, "telemetry-contribution-v1.1");
+        assert.equal(Object.hasOwn(options, "activationRequestTimeoutMilliseconds"), false,
+          "a capability fallback must retain the v1.1 request policy");
         return { status: "complete" };
       },
     }));

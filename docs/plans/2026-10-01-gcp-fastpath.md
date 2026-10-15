@@ -78,7 +78,7 @@ Recorded read-only by the fast-path analysis at the start of the night:
 | OD-9 | Nothing touches production; ingestion-side D1 schema on Cloudflare stays frozen until the seal | In force |
 | OD-10 | Optional read-only export of published (day, revision) pairs so GCP revisions continue above them | Open |
 | OD-11 | Raise the GCP caps significantly and prove parity with production's native path for owners beyond them | Owner decision in chat on 2026-10-01; delivered on `claude/gcp-fp-caps` (see [Cap raise](#cap-raise-later-on-2026-10-01)) |
-| OD-12 | Model dates: production withholds a 14-date block until every member has a result, or publish per date with refused owners counted | Owner decision in chat on 2026-10-01: per-date publication is accepted. Recorded as D7 in the [decision record](../decisions/2026-09-26-append-only-contributions.md#d7-model-dates-publish-per-date-with-refused-owners-counted); the parity compare accepts exactly the oracle's withheld dates (see [Dense-owner parity](#dense-owner-parity-later-on-2026-10-01)) |
+| OD-12 | Model dates: production withholds a 14-date block until every member has a result, or publish per date with refused owners counted | Owner decision in chat on 2026-10-01: per-date publication is accepted. Recorded as D7 in the [decision record](../decisions/2026-09-26-append-only-contributions.md#d7-model-dates-publish-per-date-with-refused-owners-counted); the 2026-10-01 parity result compares against that historical oracle (see [Dense-owner parity](#dense-owner-parity-later-on-2026-10-01)). Current-source qualification is separate (see [Current-source D7 qualification](#current-source-d7-qualification)) |
 
 ## GCP-native analytics architecture
 
@@ -512,6 +512,58 @@ gates are in the
   variant bound divergence in every family, the memory estimate's growth with
   retained history, the fixed heap reserve for held outputs, the snapshot's
   xmin hold and the absence of a time guard.
+
+### Current-source D7 qualification
+
+D7 remains the accepted product policy. The 14 withheld dates recorded in the
+2026-10-01 dense-owner comparison describe that historical oracle and are not a
+current-source date allowance. A current candidate must derive any D1-missing
+model dates from its own publisher inventory and source-bound conflict proof;
+no historical date list or saved expectation supplies them.
+
+The proposed `current-worker-d1-d7` tooling qualification is a separate,
+explicitly selected current-source two-case gate with a versioned consumer and
+report contract; it does not change runtime policy or claim execution. It requires
+both the unchanged conflict-preserving negative corpus and a distinct
+conflict-free positive corpus, with all four owners, 170 source days and the
+original 14,832 total records preserved (14,830 primary records and two extra
+admissions). The negative comparison
+admits only model projection differences on dates the current D1 evidence proves
+withheld and checks those dates against an independent current-source D7
+expectation. All unaffected response and preview fields and shared dates remain
+strict. The negative case must show the native guard and source witness, plus
+an exact strict-export refusal for two queued conflict days. The positive case
+must show no conflicts, successful strict export, all 70 model dates in the
+native admin preview, 69 closed public days, all four owners and strict DTO equality.
+Both cases retain source, response, preview, direct-origin, privacy and
+owned-schema cleanup checks; either case missing or unresolved makes the
+qualification fail closed.
+
+The proposed gate keeps the 900 combined source-and-target query limit per
+native `computeStorageGraphResult` invocation, the 128-invocation and eight
+consecutive-stall limits, one 40-minute S9 child for both cases, and the
+existing three-hour complete source-check supervisor. The S9 test and hosted
+EDGE job retain their separate one-hour and 45-minute caps. The query allowance
+is not shared across the two cases. Two-case completion within that unchanged child deadline has not
+been demonstrated; a timeout or incomplete case is not a passing receipt.
+
+The S9 consumer candidate has 20 top-level tests: the original 15 plus five
+focused current-D7 selector, schema-pair, pre-producer capture, query-budget,
+and sidecar checks. The owning current-mode S9 run must require all 20 with
+zero skips. Historical/current-v2's existing 15-test evidence remains
+unchanged. The broader PostgreSQL suite derives its aggregate counts from each
+spec's TAP output, so its final expanded totals belong in the run receipt
+rather than this plan.
+
+The current D7 proposal keeps the Node 22.16 edge parent and the separately
+named Node 26.2 rehearsal runtime. Its 30-second per-diagnostic bound uses the
+frozen producer packet's fixed supervisor, guardian, and reader process boundary
+with closed IPC and read-only SQLite access; the consumer source minimum and
+Worker scripts-check register those modules and their maintained check. The
+producer packet reports 186/186 synthetic checks and 16/16 syntax checks,
+including diagnostic lifecycle checks. Those checks do not qualify a real
+two-case D7 producer, PostgreSQL candidate, or end-to-end S9 execution.
+
 - C-REFRESH (2026-10-02; [receipt](../receipts/2026-10-02-gcp-c-refresh.md))
   closed three of those: history before the analysis horizon loads in 60-day
   segments (memory model v2), held outputs are charged to an output account

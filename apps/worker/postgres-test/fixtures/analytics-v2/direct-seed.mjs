@@ -199,6 +199,24 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     return `${quoted}."${name}"`;
   };
   const q = (text, values = []) => pool.query(text, values);
+  async function insertOrderedRows(name, columns, rows, returning = "") {
+    if (rows.length === 0) return { rows: [] };
+    if (rows.length > 200 || rows.some((row) => row.length !== columns.length)) {
+      throw new Error("fixture_batch_shape_invalid");
+    }
+    if (returning && !/^[a-z_][a-z0-9_]*(?:,[a-z_][a-z0-9_]*)*$/u.test(returning)) {
+      throw new Error("fixture_batch_returning_invalid");
+    }
+    const names = columns.map(([column]) => column);
+    const arrays = columns.map((_, index) => rows.map((row) => row[index]));
+    if (arrays.some((values) => values.length !== rows.length)) throw new Error("fixture_batch_lengths_invalid");
+    const inputColumns = [...names.map((column) => `"${column}"`), "ordinality"].join(",");
+    const selected = names.map((column) => `batch_rows."${column}"`).join(",");
+    const parameters = columns.map(([, type], index) => `$${index + 1}::${type}[]`).join(",");
+    return q(`INSERT INTO ${table(name)}(${names.map((column) => `"${column}"`).join(",")})
+      SELECT ${selected} FROM UNNEST(${parameters}) WITH ORDINALITY AS batch_rows(${inputColumns})
+      ORDER BY batch_rows.ordinality${returning ? ` RETURNING ${returning}` : ""}`, arrays);
+  }
   let nextId = 1_000;
   const id = () => ++nextId;
 
@@ -387,34 +405,54 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
 
   let nextSourceRow = 1;
   /** One typed legacy record and its stream child; returns the typed record id and digest. */
-  async function typedRecord(owner, typedDeviceId, format, chunkKey, manifestKey, record) {
+  async function typedRecord(owner, typedDeviceId, format, chunkKey, manifestKey, record, batchRows = null) {
     const fields = codec.encodeTypedTelemetryRecord(format, record);
+    if (batchRows !== null && fields.stream !== "usage") throw new Error("fixture_batch_stream_unsupported");
     const canonical = codec.typedTelemetryCanonicalRecords(fields).canonicalRecord;
     const canonicalDigest = Buffer.from(await sha256Hex(canonical), "hex");
     const recordId = id();
     const sourceRowId = nextSourceRow++;
-    await q(`INSERT INTO ${table("typed_telemetry_records")}(
-        id,namespace_id,format,source_row_id,owner_id,device_id,chunk_id,manifest_id,stream,
-        occurrence_id,observed_at_ms,observed_day,provider_id,canonical_digest)
-      VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-    [recordId, format === "v1" ? 10 : 11, sourceRowId, owner.ownerId, typedDeviceId, chunkKey, manifestKey,
-      STREAM_CODE[fields.stream], Buffer.from(fields.occurrenceId), fields.observedAtMs,
-      Math.floor(fields.observedAtMs / DAY_MS), await dict(fields.provider), canonicalDigest]);
+    const providerId = await dict(fields.provider);
+    const parentValues = [recordId, 1, format === "v1" ? 10 : 11, sourceRowId, owner.ownerId, typedDeviceId, chunkKey,
+      manifestKey, STREAM_CODE[fields.stream], Buffer.from(fields.occurrenceId), fields.observedAtMs,
+      Math.floor(fields.observedAtMs / DAY_MS), providerId, canonicalDigest];
+    if (batchRows === null) {
+      await q(`INSERT INTO ${table("typed_telemetry_records")}(
+          id,namespace_id,format,source_row_id,owner_id,device_id,chunk_id,manifest_id,stream,
+          occurrence_id,observed_at_ms,observed_day,provider_id,canonical_digest)
+        VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [recordId, format === "v1" ? 10 : 11, sourceRowId, owner.ownerId, typedDeviceId, chunkKey, manifestKey,
+        STREAM_CODE[fields.stream], Buffer.from(fields.occurrenceId), fields.observedAtMs,
+        Math.floor(fields.observedAtMs / DAY_MS), providerId, canonicalDigest]);
+    } else {
+      batchRows.parentRows.push(parentValues);
+    }
     const attributionId = await legacyAttribution(owner, fields.attribution);
     if (fields.stream === "usage") {
       const usage = fields.usage;
-      await q(`INSERT INTO ${table("typed_telemetry_usage")}(
-          record_id,session_id,model_id,speed_mode_id,api_service_tier_id,surface_id,billing_surface_id,
-          reasoning_effort_id,agent_scope_id,outcome_id,attribution_id,total_input_context_tokens,
-          input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,output_text_tokens,
-          output_reasoning_tokens,output_combined_tokens)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
-      [recordId, await identifier(owner, usage.sessionId), await dict(usage.modelId), await dict(usage.speedMode),
-        await dict(usage.apiServiceTier), await dict(usage.surface), await dict(usage.billingSurface),
-        await dict(usage.reasoningEffort), await dict(usage.agentScope), await dict(usage.outcome), attributionId,
-        usage.totalInputContextTokens, usage.components.inputUncachedTokens, usage.components.inputCacheReadTokens,
-        usage.components.inputCacheWriteTokens, usage.components.outputTextTokens,
-        usage.components.outputReasoningTokens, usage.components.outputCombinedTokens]);
+      if (batchRows === null) {
+        await q(`INSERT INTO ${table("typed_telemetry_usage")}(
+            record_id,session_id,model_id,speed_mode_id,api_service_tier_id,surface_id,billing_surface_id,
+            reasoning_effort_id,agent_scope_id,outcome_id,attribution_id,total_input_context_tokens,
+            input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,output_text_tokens,
+            output_reasoning_tokens,output_combined_tokens)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        [recordId, await identifier(owner, usage.sessionId), await dict(usage.modelId), await dict(usage.speedMode),
+          await dict(usage.apiServiceTier), await dict(usage.surface), await dict(usage.billingSurface),
+          await dict(usage.reasoningEffort), await dict(usage.agentScope), await dict(usage.outcome), attributionId,
+          usage.totalInputContextTokens, usage.components.inputUncachedTokens, usage.components.inputCacheReadTokens,
+          usage.components.inputCacheWriteTokens, usage.components.outputTextTokens,
+          usage.components.outputReasoningTokens, usage.components.outputCombinedTokens]);
+      } else {
+        const childValues = [recordId, await identifier(owner, usage.sessionId), await dict(usage.modelId),
+          await dict(usage.speedMode), await dict(usage.apiServiceTier), await dict(usage.surface),
+          await dict(usage.billingSurface), await dict(usage.reasoningEffort), await dict(usage.agentScope),
+          await dict(usage.outcome), attributionId, usage.totalInputContextTokens,
+          usage.components.inputUncachedTokens, usage.components.inputCacheReadTokens,
+          usage.components.inputCacheWriteTokens, usage.components.outputTextTokens,
+          usage.components.outputReasoningTokens, usage.components.outputCombinedTokens];
+        batchRows.childRows.push(childValues);
+      }
     } else if (fields.stream === "quota") {
       const quota = fields.quota;
       await q(`INSERT INTO ${table("typed_telemetry_quota")}(
@@ -449,7 +487,10 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
   // ---- v1 chunks ------------------------------------------------------------
   let chunkSeq = 0;
   /** One fully accepted v1 chunk, admitted to typed storage and journaled for its owner. */
-  async function v1Chunk({ participantId, deviceId, ownerDigest, stream, day, records }) {
+  async function v1Chunk({ participantId, deviceId, ownerDigest, stream, day, records, batchBoundaryRows = false }) {
+    if (batchBoundaryRows && (stream !== "usage" || records.length < 1 || records.length > 200)) {
+      throw new Error("fixture_batch_shape_invalid");
+    }
     const chunkId = `chunk:${uuid(`v1-chunk:${participantId}:${deviceId}:${stream}:${day}:${chunkSeq}`)}`;
     const upload = await uploadAuthorization(participantId, deviceId, chunkId, "telemetry_v1");
     await q(`INSERT INTO ${table("telemetry_v1_chunks")}(
@@ -471,11 +512,32 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
         chunk_id,namespace_id,chunk_original,first_source_row_id,record_count) VALUES ($1,1,$2,$3,$4)`,
     [chunkId, chunkOriginal, firstSourceRow, records.length]);
     const typed = [];
+    const batchRows = batchBoundaryRows ? { parentRows: [], childRows: [] } : null;
     for (const record of records) {
-      const row = await typedRecord(owner, typedDeviceId, "v1", chunkKey, null, record);
-      await q(`INSERT INTO ${table("typed_v1_record_admissions")}(typed_record_id,chunk_id) VALUES ($1,$2)`,
-        [row.recordId, chunkId]);
+      const row = await typedRecord(owner, typedDeviceId, "v1", chunkKey, null, record, batchRows);
+      if (!batchBoundaryRows) {
+        await q(`INSERT INTO ${table("typed_v1_record_admissions")}(typed_record_id,chunk_id) VALUES ($1,$2)`,
+          [row.recordId, chunkId]);
+      }
       typed.push(row);
+    }
+    if (batchBoundaryRows) {
+      await insertOrderedRows("typed_telemetry_records", [
+        ["id", "bigint"], ["namespace_id", "bigint"], ["format", "smallint"], ["source_row_id", "bigint"],
+        ["owner_id", "bigint"], ["device_id", "bigint"], ["chunk_id", "bigint"], ["manifest_id", "bigint"],
+        ["stream", "smallint"], ["occurrence_id", "bytea"], ["observed_at_ms", "bigint"],
+        ["observed_day", "integer"], ["provider_id", "bigint"], ["canonical_digest", "bytea"],
+      ], batchRows.parentRows);
+      await insertOrderedRows("typed_telemetry_usage", [
+        ["record_id", "bigint"], ["session_id", "bigint"], ["model_id", "bigint"], ["speed_mode_id", "bigint"],
+        ["api_service_tier_id", "bigint"], ["surface_id", "bigint"], ["billing_surface_id", "bigint"],
+        ["reasoning_effort_id", "bigint"], ["agent_scope_id", "bigint"], ["outcome_id", "bigint"],
+        ["attribution_id", "bigint"], ["total_input_context_tokens", "bigint"], ["input_uncached_tokens", "bigint"],
+        ["input_cache_read_tokens", "bigint"], ["input_cache_write_tokens", "bigint"],
+        ["output_text_tokens", "bigint"], ["output_reasoning_tokens", "bigint"], ["output_combined_tokens", "bigint"],
+      ], batchRows.childRows);
+      await insertOrderedRows("typed_v1_record_admissions", [["typed_record_id", "bigint"], ["chunk_id", "text"]],
+        typed.map((row) => [row.recordId, chunkId]));
     }
     let sequence = null;
     if (ownerDigest !== null) {
@@ -612,7 +674,12 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
    * staged, then the manifest is made ready. `head` makes it the participant's
    * head, which fires the 0055 owner bridge (owner link, receipt, journal row).
    */
-  async function v12Generation({ participantId, deviceId, name, days, head }) {
+  async function v12Generation({ participantId, deviceId, name, days, head, batchBoundaryRows = false }) {
+    if (batchBoundaryRows && (!name.startsWith("boundary-v12-")
+      || days.some((entry) => entry.chunks.some((chunk) => chunk.stream !== "usage"
+        || chunk.records.length < 1 || chunk.records.length > 200)))) {
+      throw new Error("fixture_batch_shape_invalid");
+    }
     const generationId = uuid(`v12-generation:${name}`);
     const fingerprint = digest(`v12-fingerprint:${name}`);
     const token = digest(`v12-token:${name}`);
@@ -651,13 +718,28 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
           VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,'synthetic-analytics-v2',$11,$12,$13,$14)`,
         [chunk.rowId, manifestId, participantId, deviceId, chunk.stream, entry.day, index, chunk.chunkId,
           chunk.chunkDigest, upload.envelope, chunk.declaredCount, upload.objectKey, upload.authorizationId, ISSUED]);
+        const batchRows = batchBoundaryRows ? [] : null;
         for (const [recordIndex, fields] of chunk.records.entries()) {
           const recordId = id();
+          const providerId = await dict(fields.provider);
+          const parentValues = [recordId, chunk.rowId, manifestId, chunk.stream, recordIndex,
+            Buffer.from(fields.occurrenceId), fields.observedAtMs, fields.observedDay, providerId,
+            Buffer.from(fields.canonicalDigest)];
+          if (batchBoundaryRows) {
+            const usage = fields.usage;
+            const childValues = [recordId, Buffer.from(usage.sessionId), await dict(usage.model),
+              await dict(usage.speedMode), await dict(usage.apiServiceTier), await dict(usage.surface),
+              await dict(usage.billingSurface), await dict(usage.reasoningEffort), await dict(usage.agentScope),
+              await dict(usage.outcome), await v12Attribution(usage.attribution), usage.totalInputContextTokens,
+              usage.inputUncachedTokens, usage.inputCacheReadTokens, usage.inputCacheWriteTokens,
+              usage.outputTextTokens, usage.outputReasoningTokens, usage.outputCombinedTokens, usage.boundaryFlags,
+              usage.tieOrder, usage.cacheWriteTtlFiveMinuteTokens, usage.cacheWriteTtlOneHourTokens];
+            batchRows.push({ recordIndex, recordId, parentValues, childValues });
+            continue;
+          }
           await q(`INSERT INTO ${table("telemetry_v12_typed_records")}(
               id,chunk_id,manifest_id,stream,record_index,occurrence_id,observed_at_ms,observed_day,provider_id,
-              canonical_digest) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [recordId, chunk.rowId, manifestId, chunk.stream, recordIndex, Buffer.from(fields.occurrenceId),
-            fields.observedAtMs, fields.observedDay, await dict(fields.provider), Buffer.from(fields.canonicalDigest)]);
+              canonical_digest) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, parentValues);
           if (chunk.stream === "usage") {
             const usage = fields.usage;
             await q(`INSERT INTO ${table("telemetry_v12_typed_usage")}(
@@ -688,6 +770,35 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
                 VALUES ($1,$2,$3)`, [recordId, await dict(tool), count]);
             }
           }
+        }
+        if (batchBoundaryRows) {
+          const inserted = await insertOrderedRows("telemetry_v12_typed_records", [
+            ["id", "bigint"], ["chunk_id", "text"], ["manifest_id", "text"], ["stream", "text"],
+            ["record_index", "integer"], ["occurrence_id", "bytea"], ["observed_at_ms", "bigint"],
+            ["observed_day", "integer"], ["provider_id", "bigint"], ["canonical_digest", "bytea"],
+          ], batchRows.map((row) => row.parentValues), "record_index,id");
+          const recordIdByIndex = new Map();
+          for (const row of inserted.rows) {
+            const recordIndex = Number(row.record_index);
+            const recordId = Number(row.id);
+            if (recordIdByIndex.has(recordIndex)) throw new Error("fixture_batch_returning_duplicate");
+            recordIdByIndex.set(recordIndex, recordId);
+          }
+          if (recordIdByIndex.size !== batchRows.length || batchRows.some((row) =>
+            recordIdByIndex.get(row.recordIndex) !== row.recordId)) {
+            throw new Error("fixture_batch_returning_incomplete");
+          }
+          await insertOrderedRows("telemetry_v12_typed_usage", [
+            ["record_id", "bigint"], ["session_id", "bytea"], ["model_id", "bigint"],
+            ["speed_mode_id", "bigint"], ["api_service_tier_id", "bigint"], ["surface_id", "bigint"],
+            ["billing_surface_id", "bigint"], ["reasoning_effort_id", "bigint"], ["agent_scope_id", "bigint"],
+            ["outcome_id", "bigint"], ["attribution_id", "bigint"], ["total_input_context_tokens", "bigint"],
+            ["input_uncached_tokens", "bigint"], ["input_cache_read_tokens", "bigint"],
+            ["input_cache_write_tokens", "bigint"], ["output_text_tokens", "bigint"],
+            ["output_reasoning_tokens", "bigint"], ["output_combined_tokens", "bigint"],
+            ["boundary_flags", "integer"], ["tie_order", "integer"],
+            ["cache_write_ttl_five_minute_tokens", "bigint"], ["cache_write_ttl_one_hour_tokens", "bigint"],
+          ], batchRows.map((row) => [recordIdByIndex.get(row.recordIndex), ...row.childValues.slice(1)]));
         }
       }
       const incomplete = chunks.some((chunk) => chunk.declaredCount !== chunk.records.length);
@@ -1048,10 +1159,12 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
       const deviceId = await socialDevice(participantId, deviceName, { v12: format === "v12" });
       const batch = index === 200 ? records.slice(0, 1) : records;
       if (format === "v1") {
-        await v1Chunk({ participantId, deviceId, ownerDigest, stream: "usage", day: D1, records: batch });
+        await v1Chunk({ participantId, deviceId, ownerDigest, stream: "usage", day: D1, records: batch,
+          batchBoundaryRows: true });
       } else {
         await v12Generation({ participantId, deviceId, name: deviceName,
-          days: [{ day: D1, chunks: [{ stream: "usage", records: batch }] }], head: index === 0 });
+          days: [{ day: D1, chunks: [{ stream: "usage", records: batch }] }], head: index === 0,
+          batchBoundaryRows: true });
       }
       return deviceId;
     }

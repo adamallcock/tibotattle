@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync } from "node:fs";
 import fsPromises, {
   chmod,
   lstat,
@@ -327,8 +327,53 @@ async function assertExpectedStateFileIdentity(stateFile, expectedIdentity) {
 
 async function prepareStateFile(stateFile) {
   await mkdir(dirname(stateFile), { recursive: true, mode: 0o700 });
-  const existing = await assertSafeStateFile(stateFile, { allowMissing: true });
-  return existing !== null;
+  return assertSafeStateFile(stateFile, {
+    allowMissing: true,
+    exactIdentity: true,
+  });
+}
+
+function createOwnedStateFile(stateFile) {
+  let descriptor;
+  try {
+    // SQLite otherwise creates its file with 0666 masked by the process umask.
+    // Keep creation and synchronous schema initialization in the same turn,
+    // so a same-process reader cannot observe the intermediate empty file.
+    descriptor = openSync(
+      stateFile,
+      constants.O_RDWR
+        | constants.O_CREAT
+        | constants.O_EXCL
+        | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const metadata = fstatSync(descriptor, { bigint: true });
+    const named = lstatSync(stateFile, { bigint: true });
+    if (!ownerOnlyRegularFile(metadata)
+        || !ownerOnlyRegularFile(named)
+        || !sameFileIdentity(metadata, named)) {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    return { metadata, created: true };
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    // Another writer may have created the path after the initial missing-file
+    // check. Validate that file without following links or changing its mode.
+    let metadata;
+    try {
+      metadata = lstatSync(stateFile, { bigint: true });
+    } catch {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    if (!ownerOnlyRegularFile(metadata)) {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    return { metadata, created: false };
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
 function localCollectorMigrationLeasePath(stateFile) {
@@ -566,14 +611,24 @@ async function syncStateFile(stateFile) {
 }
 
 async function ensureDatabase(stateFile) {
-  const exists = await prepareStateFile(stateFile);
+  const existing = await prepareStateFile(stateFile);
+  const { metadata, created } = existing === null
+    ? createOwnedStateFile(stateFile)
+    : { metadata: existing, created: false };
   let database;
   try {
-    database = openDatabase(stateFile, { readOnly: false, create: !exists });
+    const current = lstatSync(stateFile, { bigint: true });
+    if (!ownerOnlyRegularFile(current)
+        || !sameFileIdentity(metadata, current)) {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    database = openDatabase(stateFile, { readOnly: false, create: created });
+  } catch (error) {
+    if (error?.code?.startsWith("local_collector_state_")) throw error;
+    throw fixedError("local_collector_state_unavailable");
   } finally {
     database?.close();
   }
-  await chmod(stateFile, 0o600);
   await syncStateFile(stateFile);
 }
 

@@ -24,6 +24,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { IMAGE_NODE } from "./image-node.mjs";
@@ -1568,6 +1569,44 @@ test("PG17 (d): of two concurrent invocations one completes and the other exits 
   });
 });
 
+test("PG17: a terminated snapshot session fails closed before writes and releases the run lock", {
+  skip: PG_SKIP,
+  timeout: 30_000,
+}, async () => {
+  await withDatabase("lost-snapshot", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await seedBaseCorpus(pool, schema);
+    const before = await analyticsSnapshot(pool, schema);
+    let primary;
+    const capturePool = (database) => {
+      const runPool = jobPool(database);
+      runPool.on("acquire", (client) => { primary ??= client; });
+      return runPool;
+    };
+    const pipeline = createSpecPipeline({
+      async beforeCompute() {
+        assert.ok(Number.isSafeInteger(primary.processID));
+        // Only terminate this test's checked-out snapshot session. No extra
+        // error listener masks the actual run's Client-event handling.
+        const ended = new Promise(resolve => primary.once("end", resolve));
+        assert.equal((await pool.query("SELECT pg_terminate_backend($1) AS terminated",
+          [primary.processID])).rows[0].terminated, true);
+        await ended;
+      },
+    });
+    await assert.rejects(runJob({ schema, pipeline, createPool: capturePool }), error => {
+      assert.deepEqual(job.analyticsRefreshFailureReceipt(error), {
+        schemaVersion: "analytics-refresh-receipt-v1", status: "failed",
+        code: "ANALYTICS_V2_REFRESH_CONNECTION_LOST", phase: "compute",
+      });
+      return true;
+    });
+    assert.deepEqual(await analyticsSnapshot(pool, schema), before, "the failed run persisted no output");
+    assert.equal((await runJob({ schema })).state, "complete", "a fresh session can acquire the released lock");
+    assert.equal(await count(pool, schema, "analytics_v2_runs"), 1);
+  });
+});
+
 test("PG17: the store refuses to write without the refresh lock when another session holds it", {
   skip: PG_SKIP,
   timeout: 180_000,
@@ -1641,6 +1680,8 @@ test("PG17 (e): a throw injected after half the writes leaves no analytics_v2 ch
     const failingPool = (database) => {
       const real = jobPool(database);
       return {
+        on: real.on.bind(real),
+        off: real.off.bind(real),
         async connect() {
           const client = await real.connect();
           return {
@@ -2700,18 +2741,24 @@ test("refresh read timeout preserves its closed failure and SQLSTATE without com
     const sent = [];
     let computed = 0;
     let written = 0;
-    const client = {
-      async query(text) {
-        sent.push(text);
-        if (text.includes("pg_try_advisory_lock")) return { rows: [{ acquired: true }] };
-        if (text.includes("pg_advisory_unlock")) return { rows: [{ released: true }] };
-        if (text.includes("pg_export_snapshot")) return { rows: [{ snapshot: "00000003-0000001B-1" }] };
-        if (text.includes("transaction_read_only")) return { rows: [{ read_only: "on" }] };
-        return { rows: [] };
+    const pool = Object.assign(new EventEmitter(), {
+      async connect() {
+        const client = Object.assign(new EventEmitter(), {
+          async query(text) {
+            sent.push(text);
+            if (text.includes("pg_try_advisory_lock")) return { rows: [{ acquired: true }] };
+            if (text.includes("pg_advisory_unlock")) return { rows: [{ released: true }] };
+            if (text.includes("pg_export_snapshot")) return { rows: [{ snapshot: "00000003-0000001B-1" }] };
+            if (text.includes("transaction_read_only")) return { rows: [{ read_only: "on" }] };
+            return { rows: [] };
+          },
+          release(discard) { pool.emit("release", discard, client); },
+        });
+        pool.emit("acquire", client);
+        return client;
       },
-      release() {},
-    };
-    const pool = { async connect() { return client; }, async end() {} };
+      async end() {},
+    });
     const privateFragment = "synthetic-private-SQL-and-session";
     const pipeline = {
         async read({ pool: readPool, schema, nowMs }) {

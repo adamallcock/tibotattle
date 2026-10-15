@@ -719,8 +719,8 @@ export async function grantPostgresTelemetryV12AccountlessAuthorization(
   request: TelemetryV12AccountlessAuthorizationRequest,
   options: PostgresAccountlessOptions = {},
 ): Promise<void> {
-  const nowEpoch = options.nowEpoch ?? Date.now();
-  validNow(nowEpoch);
+  const explicitNowEpoch = options.nowEpoch ?? undefined;
+  if (explicitNowEpoch !== undefined) validNow(explicitNowEpoch);
   const parsed = parseTelemetryV12AccountlessAuthorizationRequest(request);
   const schema = schemaName(options);
   try {
@@ -732,6 +732,10 @@ export async function grantPostgresTelemetryV12AccountlessAuthorization(
       // lock, so no other owner reader waits on it.
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         [`accountless-v12-grant:${schema}:${principal.participantId}`]);
+      // A waiter can observe a grant committed after its request began. Use
+      // one clock sampled after serialization for authority, issuance and replay.
+      const nowEpoch = explicitNowEpoch ?? Date.now();
+      validNow(nowEpoch);
       const authority = await client.query<V12OwnerRow>(
         `SELECT owner.enrollment_device_id, owner.participant_id,
                 owner.device_credential_id, owner.expires_at AS owner_expires_at

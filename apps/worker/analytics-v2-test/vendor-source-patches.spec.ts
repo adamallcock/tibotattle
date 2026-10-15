@@ -14,6 +14,8 @@
 //   checked fold refuses is refused the same way.
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
+import { createHash } from 'node:crypto';
+import { loadDailyValuesShapeHarness } from '../scripts/gcp-daily-values-shape-check-lib.mjs';
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   advanceV11UsageReduction,
@@ -237,6 +239,113 @@ describe("source patch daily-fold-trusted-state", () => {
     expect(() => foldV11DailyProjectionValues(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
     expect(() => foldV11DailyProjectionValuesTrusted(state, [otherDay])).toThrow("V11_DAILY_PROJECTION_VALUES_INVALID");
   });
+});
+
+
+// The retained private 900-record four-way A/B receipt is adoption evidence.
+// This permanent regression keeps the existing 900-record case unchanged and
+// exercises fresh shape/refusal/read-trace fixtures without replaying that fold.
+describe('source patch daily-values-ordered-closed-shape', () => {
+ let baselineHarness: Awaited<ReturnType<typeof loadDailyValuesShapeHarness>> | undefined;
+ let candidateHarness: Awaited<ReturnType<typeof loadDailyValuesShapeHarness>> | undefined;
+ beforeAll(async () => {
+  baselineHarness = await loadDailyValuesShapeHarness({ oracle: true });
+  try { candidateHarness = await loadDailyValuesShapeHarness(); }
+  catch (error) { await baselineHarness.close(); baselineHarness = undefined; throw error; }
+ });
+ afterAll(async () => { await Promise.all([baselineHarness?.close(), candidateHarness?.close()]); });
+ it('preserves all 262 synthetic shape outcomes, errors and input trap/read traces', (context) => {
+  expect(context.task.timeout).toBe(5000);
+  if (!baselineHarness || !candidateHarness) throw new Error('DAILY_VALUES_SHAPE_HARNESS_NOT_LOADED');
+  const baseline = baselineHarness.module, candidate = candidateHarness.module;
+  const schemaKeys = baseline.closedShapeKeys as Record<string, string[]>;
+  expect(candidate.closedShapeKeys).toEqual(schemaKeys);
+  expect(Object.keys(schemaKeys)).toHaveLength(8);
+  const rows: unknown[] = [];
+  const inspect=(make:(trace:string[])=>unknown,action:(value:unknown)=>unknown)=> {
+   const trace:string[]=[];const value=make(trace);
+   try { action(value);return {accepted:true,errorName:null,errorMessage:null,trace}; }
+   catch(error) { const e=error as Error;return {accepted:false,errorName:e.name,errorMessage:e.message,trace}; }
+  };
+  const run=(schema:string,name:string,make:(trace:string[])=>unknown)=> {
+   const a=inspect(make,value=>baseline.privateClosedShape(value,schema as never));
+   const b=inspect(make,value=>candidate.privateClosedShape(value,schema as never));
+   expect(JSON.stringify(b)).toBe(JSON.stringify(a));rows.push({schema,name,outcome:a.accepted?"accepted":"refused",traceSha256:createHash("sha256").update(JSON.stringify(a)).digest("hex")});
+  };
+   for (const [schema,keys] of Object.entries(schemaKeys)) {
+    const own=(order=keys)=>Object.fromEntries(order.map(key=>[key,0]));
+    const mutationSequence=(module:typeof baseline|typeof candidate)=> {
+     const value=own();const sequence:unknown[]=[];
+     const check=()=> {try {module.privateClosedShape(value,schema as never);sequence.push({accepted:true});}
+      catch(error) {const e=error as Error;sequence.push({accepted:false,errorName:e.name,errorMessage:e.message});}};
+     check();value.unexpected=0;check();delete value.unexpected;delete value[keys[0]!];check();value[keys[0]!]=0;check();return sequence;
+    };
+    const originalMutation=mutationSequence(baseline),newMutation=mutationSequence(candidate);
+    expect(JSON.stringify(newMutation)).toBe(JSON.stringify(originalMutation));
+    expect(originalMutation.map(v=>(v as {accepted:boolean}).accepted)).toEqual([true,false,false,true]);
+    rows.push({schema,name:"sameObjectShapeMutation",outcome:"matched",traceSha256:createHash("sha256").update(JSON.stringify(originalMutation)).digest("hex")});
+    run(schema,"ordered",()=>own());
+    run(schema,"reversed",()=>own([...keys].reverse()));
+    run(schema,"adjacentSwap",()=>own([keys[1]!,keys[0]!,...keys.slice(2)]));
+    run(schema,"unknownAdded",()=>({...own(),unexpected:0}));
+    run(schema,"requiredDeleted",()=>own(keys.slice(1)));
+    run(schema,"requiredReplacedSameLength",()=>own(["unexpected",...keys.slice(1)]));
+    run(schema,"inheritedUnknown",()=>Object.assign(Object.create({unexpected:0}),own()));
+    run(schema,"nonenumerableUnknown",()=>Object.defineProperty(own(),"unexpected",{value:0,enumerable:false}));
+    run(schema,"symbolUnknown",()=>Object.assign(own(),{[Symbol("synthetic-extra")]:0}));
+    run(schema,"requiredInherited",()=>Object.assign(Object.create({[keys[0]!]:0}),own(keys.slice(1))));
+    run(schema,"requiredNonenumerable",()=>Object.defineProperty(own(keys.slice(1)),keys[0]!,{value:0,enumerable:false}));
+    run(schema,"nullPrototype",()=>Object.assign(Object.create(null),own()));
+    run(schema,"classInstance",()=>Object.assign(new class SyntheticShape {}(),own()));
+    run(schema,"nulCollisionPreserved",()=>Object.assign(Object.create(own()),{[[...keys].sort().join("\0")]:0}));
+    run(schema,"getterNotReadByEnumeration",trace=>Object.defineProperty(own(keys.slice(1)),keys[0]!,{enumerable:true,get(){trace.push("valueGetter");throw new Error("SYNTHETIC_VALUE_GETTER_THROW");}}));
+    for (const reverse of [false,true]) {
+     run(schema,reverse?"proxyReverse":"proxyOrdered",trace=>new Proxy(own(),{
+      ownKeys(){trace.push("ownKeys");return reverse?[...keys].reverse():[...keys];},
+      getOwnPropertyDescriptor(target,key){trace.push("descriptor:"+String(key));return Reflect.getOwnPropertyDescriptor(target,key);},
+      get(target,key,receiver){trace.push("get:"+String(key));return Reflect.get(target,key,receiver);},
+     }));
+    }
+    run(schema,"ownKeysThrow",trace=>new Proxy(own(),{ownKeys(){trace.push("ownKeys");throw new Error("SYNTHETIC_OWN_KEYS_THROW");}}));
+    run(schema,"descriptorThrow",trace=>new Proxy(own(),{ownKeys(){trace.push("ownKeys");return [...keys];},getOwnPropertyDescriptor(){trace.push("descriptor");throw new Error("SYNTHETIC_DESCRIPTOR_THROW");}}));
+    run(schema,"duplicateOwnKeys",trace=>new Proxy(own(),{ownKeys(){trace.push("ownKeys");return [...keys,keys[0]!];}}));
+    run(schema,"invariantInvalidOwnKeys",trace=> {
+     const target=Object.defineProperty(own(),keys[0]!,{value:0,enumerable:true,configurable:false});
+     return new Proxy(target,{ownKeys(){trace.push("ownKeys");return keys.slice(1);}});
+    });
+    run(schema,"revokedProxy",()=> {const pair=Proxy.revocable(own(),{});pair.revoke();return pair.proxy;});
+    run(schema,"arrayTypeGuardNoEnumeration",trace=>new Proxy([],{ownKeys(){trace.push("UNEXPECTED_ARRAY_ENUMERATION");throw new Error("SYNTHETIC_ARRAY_ENUMERATION");}}));
+    for (const [name,value] of [["null",null],["undefined",undefined],["number",0],["nan",NaN],["string","synthetic"],["boolean",true],["symbol",Symbol("synthetic")],["function",()=>0]] as const) run(schema,"type:"+name,()=>value);
+   }
+   const publicRun=(name:string,make:(trace:string[])=>unknown)=> {
+    const a=inspect(make,value=>baseline.validateV11DailyProjectionValues(value));
+    const b=inspect(make,value=>candidate.validateV11DailyProjectionValues(value));
+    expect(JSON.stringify(b)).toBe(JSON.stringify(a));rows.push({schema:"publicValidator",name,outcome:a.accepted?"accepted":"refused",traceSha256:createHash("sha256").update(JSON.stringify(a)).digest("hex")});
+   };
+   publicRun("getterReadTrace",trace=> {
+    const state=baseline.createV11DailyProjectionValues(day);
+    Object.defineProperty(state.counts,"usage",{enumerable:true,get(){trace.push("get:usage");return 0;}});
+    Object.defineProperty(state.tokens.inputUncachedTokens,"knownSum",{enumerable:true,get(){trace.push("get:knownSum");return "0";}});
+    Object.defineProperty(state.tokens.inputUncachedTokens,"unavailable",{enumerable:true,get(){trace.push("get:unavailable");return 0;}});
+    return state;
+   });
+   publicRun("throwingGetterTrace",trace=> {
+    const state=baseline.createV11DailyProjectionValues(day);
+    Object.defineProperty(state.counts,"usage",{enumerable:true,get(){trace.push("get:usage");throw new Error("SYNTHETIC_USAGE_GETTER_THROW");}});
+    return state;
+   });
+   publicRun("countsNulCollisionAccepted",()=> {
+    const state=baseline.createV11DailyProjectionValues(day);
+    state.counts=Object.assign(Object.create({quota:0,session:0}),{usage:0,["quota\0session"]:0});return state;
+   });
+   publicRun("tokensPermuted",()=> {
+    const state=baseline.createV11DailyProjectionValues(day);state.tokens=Object.fromEntries(Object.entries(state.tokens).reverse()) as typeof state.tokens;return state;
+   });
+   publicRun("unknownRootKey",()=>({...baseline.createV11DailyProjectionValues(day),unexpected:0}));
+   publicRun("missingRootField",()=> {const state=baseline.createV11DailyProjectionValues(day);delete (state as Partial<typeof state>).counts;return state;});
+
+  expect(rows).toHaveLength(262);
+ });
 });
 
 // Harness-only exports and checks are built outside the production closure.

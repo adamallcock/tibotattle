@@ -29,6 +29,7 @@ let node;
 let edgeDispatch;
 let limiters;
 let contract;
+let postgresTestDispatch;
 
 before(async () => {
   vite = await createServer({
@@ -39,11 +40,12 @@ before(async () => {
     appType: "custom",
   });
   const load = (path) => vite.ssrLoadModule(path);
-  [node, edgeDispatch, limiters, contract] = await Promise.all([
+  [node, edgeDispatch, limiters, contract, postgresTestDispatch] = await Promise.all([
     load("/cloud-run/origin-node-request.mjs"),
     load("/cloud-run/postgres-edge-origin-dispatch.mjs"),
     load("/cloud-run/postgres-edge-admission-limiters.mjs"),
     load("/src/edge-origin-contract.ts"),
+    load("/cloud-run/postgres-test-dispatch.mjs"),
   ]);
 });
 
@@ -338,7 +340,11 @@ function exchange(port, { method = "GET", target = "/api/health", headers = [], 
  * adapter calls: build the Request (refusal: log + 421), run EP-6 (its
  * unmarked 421: cancel + 421), else linger and write the response.
  */
-async function withProductionServe(inner, work, { hostOrigin } = {}) {
+async function withProductionServe(inner, work, {
+  hostOrigin,
+  onResponseWrite,
+  shouldIgnoreResponseWriteError,
+} = {}) {
   const port = await freePort();
   const lines = [];
   const log = (line) => lines.push(line);
@@ -371,9 +377,16 @@ async function withProductionServe(inner, work, { hostOrigin } = {}) {
     node.lingerAfterEarlyAnswer(req);
     const headers = {};
     for (const [name, value] of response.headers) headers[name] = value;
+    onResponseWrite?.({ method: req.method, path: req.url, status: response.status });
     res.writeHead(response.status, headers);
     if (response.body === null) res.end();
-    else await pipeline(Readable.fromWeb(response.body), res);
+    else {
+      try {
+        await pipeline(Readable.fromWeb(response.body), res);
+      } catch (error) {
+        if (shouldIgnoreResponseWriteError?.({ error, request: req, response: res }) !== true) throw error;
+      }
+    }
   });
   server.listen(port, "127.0.0.1");
   await once(server, "listening");
@@ -396,6 +409,21 @@ function assertBoundaryRefusal(response, label) {
   assert.equal(response.headers.get("connection"), "close", label);
   assert.equal(response.headers.get("cache-control"), "no-store", label);
   assert.equal(response.headers.has("x-tibotattle-origin"), false, label);
+}
+
+async function waitWithin(promise, label, maximumMilliseconds = 5_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), maximumMilliseconds);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 test("real HTTP: wrong Host, absolute target and EP-6 refusals are the unmarked 421 with the body unread", async () => {
@@ -512,4 +540,194 @@ test("real HTTP: an early answer to a chunked body inner stops reading reaches t
     assert.equal(accepted.status, 200);
     assert.equal(JSON.parse(accepted.text).read, 1024 * 1024);
   });
+});
+
+test("real HTTP: a disconnected v1.2 activation keeps its in-flight domain completion singular", async () => {
+  let enterActivation;
+  const activationEntered = new Promise((resolveEntered) => { enterActivation = resolveEntered; });
+  let releaseActivation;
+  const activationGate = new Promise((resolveActivation) => { releaseActivation = resolveActivation; });
+  let finishActivation;
+  const activationFinished = new Promise((resolveFinished) => { finishActivation = resolveFinished; });
+  let forwardedRequestSignal = null;
+  let activationCalls = 0;
+  let activationCompletions = 0;
+  let domainFactoryCalls = 0;
+  let authCalls = 0;
+  let attemptChecks = 0;
+  let controlsReads = 0;
+  let clientDisconnected = false;
+  const responseWrites = [];
+  const activationManifest = {
+    schemaVersion: "telemetry-domain-manifest-v1.2",
+    fromDay: "2026-10-13",
+    throughDay: "2026-10-13",
+    predecessor: {
+      token: "10000000-0000-4000-8000-000000000001",
+      previousGenerationId: null,
+      legacyFingerprint: "1".repeat(64),
+    },
+    days: [{
+      day: "2026-10-13",
+      manifestId: "20000000-0000-4000-8000-000000000002",
+      manifestDigest: "2".repeat(64),
+    }],
+    manifestDigest: "3".repeat(64),
+  };
+  const activationResult = {
+    schemaVersion: "telemetry-domain-activation-v1.2",
+    generationId: "30000000-0000-4000-8000-000000000003",
+    manifestDigest: activationManifest.manifestDigest,
+    fromDay: activationManifest.fromDay,
+    throughDay: activationManifest.throughDay,
+    replay: false,
+  };
+  const primaryPool = {
+    async connect() {
+      return {
+        async query(sql) {
+          if (sql.includes('"collection_controls"')) {
+            controlsReads += 1;
+            return { rows: [{ revision: 1, control_state: "operational", enrollment_enabled: true,
+              upload_registration_enabled: true, processing_enabled: true, publication_enabled: true }] };
+          }
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
+  };
+  const dispatch = postgresTestDispatch.createPostgresTestV12DayManifestDispatch({
+    requestContext: () => ({ requestId: REQUEST_ID }),
+    primaryPool,
+    schemaOptions: { primarySchema: "synthetic_primary" },
+    expectedMigrations: {
+      primary: [{ version: 1, name: "0001_schema_metadata.sql", sha256: "a".repeat(64) }],
+    },
+    privateOrigin: PUBLIC_ORIGIN,
+    storageGate: { async assertCurrent() {}, async probe() { return new Response(null, { status: 200 }); } },
+    healthDispatch: async () => new Response(null, { status: 200 }),
+    admissionEnv: {},
+    assertAdmissionBindings() {},
+    assertAttemptAllowed: async () => { attemptChecks += 1; },
+    assertUploadAuthorizationBindings() {},
+    assertUploadAuthorizationAllowed: async () => {},
+    authenticatePostgresDevice: async (_pool, authorization) => {
+      authCalls += 1;
+      assert.equal(authorization, "Bearer synthetic-device-credential");
+      return { authorityKind: "social", participantId: "synthetic-participant", deviceId: "synthetic-device" };
+    },
+    disconnectPostgresAuthenticatedDevice: async () => { throw new Error("unexpected disconnect route"); },
+    readPostgresDeviceSyncState: async () => ({}),
+    readPostgresDeviceSyncCapabilities: async () => ({}),
+    readPostgresDeviceSyncV12Capabilities: async () => ({}),
+    readPostgresV12DayCandidates: async () => ({}),
+    createPostgresTypedV12Domain: () => {
+      domainFactoryCalls += 1;
+      return {
+        async createPredecessor() { throw new Error("unexpected predecessor route"); },
+        async activate(device, manifest, now) {
+          activationCalls += 1;
+          assert.deepEqual(device, {
+            authorityKind: "social", participantId: "synthetic-participant", deviceId: "synthetic-device",
+          });
+          assert.deepEqual(manifest, activationManifest);
+          assert.equal(Number.isFinite(now), true);
+          assert.equal(arguments.length, 3, "activation domain keeps its existing three-argument contract");
+          enterActivation();
+          try {
+            await activationGate;
+            activationCompletions += 1;
+            return activationResult;
+          } finally {
+            finishActivation();
+          }
+        },
+      };
+    },
+    readPostgresTelemetryV12EffectivePage: async () => ({}),
+    publicEnvelopeKey: () => ({}),
+    sourceNamespace: "synthetic-activation-source",
+    assertPostgresV12UploadAllowed: async () => {},
+    createPostgresDeviceUploadAuthorization: async () => ({}),
+    registerPostgresTypedV12DayManifest: async () => ({}),
+    claimPostgresDeviceUploadAuthorization: async () => ({}),
+    abandonPostgresDeviceUploadAuthorization: async () => {},
+    persistPostgresTypedV12StagedChunk: async () => ({}),
+    decryptSyntheticEnvelope: async () => ({}),
+    validateTelemetryV12Envelope() {},
+    validateTelemetryV12StagedChunk: async () => ({}),
+    sha256Hex: async () => "4".repeat(64),
+    objectStore: { async put() {}, async delete() {} },
+    envelopePublicJwk: "synthetic-public-key",
+    envelopePrivateJwk: "synthetic-private-key",
+    readBoundedRequestBody: async (request) => {
+      forwardedRequestSignal = request.signal;
+      assert.equal(request.url, `${PUBLIC_ORIGIN}/api/v1/me/telemetry-v12/domain-activate`);
+      return new Uint8Array(await request.arrayBuffer());
+    },
+    maxRequestBytes: 8 * 1024,
+  });
+
+  await withProductionServe(dispatch, async ({ port, host }) => {
+    const body = JSON.stringify(activationManifest);
+    const outgoing = http.request({
+      host: "127.0.0.1", port, method: "POST", path: "/api/v1/me/telemetry-v12/domain-activate", agent: false,
+      headers: {
+        host,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body),
+        authorization: "Bearer synthetic-device-credential",
+        "x-serverless-authorization": token(),
+        ...Object.fromEntries(invokerHeaders().slice(1)),
+      },
+    });
+    // The client intentionally closes after the complete declared body has
+    // reached the route but before its domain operation resolves.
+    outgoing.on("error", () => {});
+    outgoing.write(body);
+    try {
+      await waitWithin(activationEntered, "activation entry");
+      assert.ok(forwardedRequestSignal instanceof AbortSignal);
+      assert.equal(forwardedRequestSignal.aborted, false);
+      assert.equal(activationCalls, 1);
+      assert.equal(activationCompletions, 0);
+
+      const aborted = forwardedRequestSignal.aborted
+        ? Promise.resolve()
+        : new Promise((resolveAborted) => forwardedRequestSignal.addEventListener("abort", resolveAborted, { once: true }));
+      outgoing.destroy();
+      clientDisconnected = true;
+      await waitWithin(aborted, "forwarded request abort");
+
+      // The HTTP transport is gone, but the route has no domain cancellation
+      // argument: its admitted activation remains pending through this boundary.
+      assert.equal(forwardedRequestSignal.aborted, true);
+      assert.equal(activationCompletions, 0);
+      assert.equal(activationCalls, 1);
+
+      releaseActivation();
+      await waitWithin(activationFinished, "activation completion");
+      assert.equal(activationCompletions, 1);
+      assert.equal(activationCalls, 1);
+    } finally {
+      releaseActivation();
+      outgoing.destroy();
+    }
+  }, {
+    onResponseWrite: (write) => responseWrites.push(write),
+    shouldIgnoreResponseWriteError: ({ error, response }) => clientDisconnected
+      && response.destroyed
+      && ["ERR_STREAM_UNABLE_TO_PIPE", "ERR_STREAM_PREMATURE_CLOSE", "EPIPE", "ECONNRESET"].includes(error.code),
+  });
+
+  assert.equal(attemptChecks, 1);
+  assert.equal(authCalls, 1);
+  assert.equal(controlsReads, 1);
+  assert.equal(domainFactoryCalls, 1);
+  assert.equal(activationCalls, 1);
+  assert.equal(activationCompletions, 1);
+  assert.deepEqual(responseWrites, [{
+    method: "POST", path: "/api/v1/me/telemetry-v12/domain-activate", status: 201,
+  }]);
 });

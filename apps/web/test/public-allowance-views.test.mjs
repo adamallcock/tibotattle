@@ -9,7 +9,7 @@ import { COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS, COMMUNITY_DAILY_CACHE_SC
   projectCommunityDailyPayloadForCache, PUBLIC_ALLOWANCE_MODEL_CONFIG, publicAllowanceModels } from "../public/community-data.js";
 import { translate, translatePlural } from "../public/localization.js";
 import { createLastKnownGoodStore } from "../public/last-known-good.js";
-import { publicAllowanceFixture, SERVER_V15_COMMUNITY_DAILY, serverV15CommunityDailyBody } from "./fixtures/public-allowance.js";
+import { publicAllowanceFixture, retainedPro10PublicAllowanceFixture, SERVER_V15_COMMUNITY_DAILY, serverV15CommunityDailyBody } from "./fixtures/public-allowance.js";
 
 // Synthetic presentation data only; never served by a production client.
 const summary = (centralUsd, participants = 2) => ({
@@ -743,7 +743,7 @@ test("an unknown model id is skipped and counted, never stored or rendered, and 
 
 test("breakdowns v1.3 applies a valid closed modelConfig block, requires one, and older versions cannot carry one", () => {
   assert.deepEqual(COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS, ["community-allowance-breakdowns-v1.0",
-    "community-allowance-breakdowns-v1.1", "community-allowance-breakdowns-v1.3", "community-allowance-breakdowns-v1.4",
+    "community-allowance-breakdowns-v1.1", "community-allowance-breakdowns-v1.2", "community-allowance-breakdowns-v1.3", "community-allowance-breakdowns-v1.4",
     "community-allowance-breakdowns-v1.5"]);
   // The KM-V13 block names exactly the six models the page already charts, in
   // its order and with its themes, so cutover renders what v1.1 renders today.
@@ -993,7 +993,10 @@ test("the stored copy keeps an applied v1.3 block under v1.3 and never stores a 
   const reread = normalizeCommunityDailySeries(storedRejected, { nowMs: NOW, retained: true }).breakdowns;
   assert.equal(liveRejected.modelMetadata, "rejected");
   assert.equal(reread.modelMetadata, "absent");
-  assert.deepEqual({ ...reread, modelMetadata: null }, { ...liveRejected, modelMetadata: null });
+  assert.equal(liveRejected.schemaVersion, "community-allowance-breakdowns-v1.3");
+  assert.equal(reread.schemaVersion, "community-allowance-breakdowns-v1.1");
+  assert.deepEqual({ ...reread, schemaVersion: null, modelMetadata: null },
+    { ...liveRejected, schemaVersion: null, modelMetadata: null }, "the intentional legacy projection keeps every value and gap");
 
   // A rejected block with GPT-6.1 Sol tuples: the stored v1.1 copy leaves them
   // out and keeps the gap, so the cached render cannot name Sol from v1.1's roster.
@@ -1003,8 +1006,11 @@ test("the stored copy keeps an applied v1.3 block under v1.3 and never stores a 
   assert.deepEqual(storedSol.allowanceBreakdowns.retainedUnrecognizedModels, { tuples: 3, models: 1 });
   assert.doesNotMatch(JSON.stringify(storedSol), /gpt-6\.1-sol/u);
   const rereadSol = normalizeCommunityDailySeries(storedSol, { nowMs: NOW, retained: true }).breakdowns;
-  assert.deepEqual({ ...rereadSol, modelMetadata: null },
-    { ...normalizeCommunityDailySeries(rejectedSol, { nowMs: NOW }).breakdowns, modelMetadata: null });
+  const liveRejectedSol = normalizeCommunityDailySeries(rejectedSol, { nowMs: NOW }).breakdowns;
+  assert.equal(liveRejectedSol.schemaVersion, "community-allowance-breakdowns-v1.3");
+  assert.equal(rereadSol.schemaVersion, "community-allowance-breakdowns-v1.1");
+  assert.deepEqual({ ...rereadSol, schemaVersion: null, modelMetadata: null },
+    { ...liveRejectedSol, schemaVersion: null, modelMetadata: null });
   const cachedSol = renderView(storedSol, { cache: RETAINED });
   assert.deepEqual(cachedSol.cards.map(card => card.label), SIX_CARDS);
   assert.match(cachedSol.text, NEWER_MODELS);
@@ -1708,4 +1714,67 @@ test("the R1 server's v1.5 body round-trips through the cache and the last-known
   assert.deepEqual(retained.cards, renderServer(body).cards);
   assert.deepEqual(retained.cards.map(card => card.label), V15_PLAN_LABELS);
   assert.equal(retained.cards[2].value, "—");
+});
+
+
+test("retained bare v1.2 preserves its exact Pro 10x four-plan values without metadata", () => {
+  const payload = retainedPro10PublicAllowanceFixture(NOW);
+  const original = structuredClone(payload.allowanceBreakdowns);
+  const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+  const result = normalized.breakdowns;
+  assert.notEqual(result, null);
+  assert.equal(result.schemaVersion, "community-allowance-breakdowns-v1.2");
+  assert.equal(result.basis, COMMUNITY_ALLOWANCE_PRO10_BASIS);
+  assert.equal(result.normalization, COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION);
+  assert.equal(result.modelBasis, "seven_day_codex_pro10x_equivalent_per_model_composition");
+  assert.deepEqual(result.planIds, ["pro", "prolite", "promax", "plus"]);
+  assert.equal(result.hasCombined, true);
+  assert.equal(result.modelMetadata, "absent");
+  assert.deepEqual(result.days, original.days, "historical source values are preserved without conversion");
+  assert.ok(normalized.days.every((day, index) => day.allowance.centralUsd === payload.days[index].payload.allowance.centralUsd));
+  assert.deepEqual(payload.allowanceBreakdowns, original, "the reader does not mutate its source");
+});
+
+test("bare v1.2 refuses metadata, extra keys and crossed claims while retaining activity", () => {
+  for (const mutate of [
+    value => { value.modelConfig = structuredClone(SIX_MODEL_BLOCK); },
+    value => { value.modelConfig = null; },
+    value => { value.extra = true; },
+    value => { value.days[0].extra = true; },
+    value => { value.schemaVersion = "community-allowance-breakdowns-v1.4"; },
+    value => { value.schemaVersion = "community-allowance-breakdowns-v1.1"; },
+    value => { value.basis = COMMUNITY_ALLOWANCE_PRO20_PROMAX_BASIS; },
+    value => { value.normalization = COMMUNITY_ALLOWANCE_PRO20_PROMAX_NORMALIZATION; },
+    value => { value.modelBasis = "seven_day_codex_pro20x_equivalent_per_model_composition"; },
+    value => { delete value.days[0].combined; },
+    value => { delete value.days[0].byPlanType.promax; },
+    value => { value.days[0].byPlanType.unknown = summary(1); },
+    value => { value.days[0].models.push(["gpt-7-nova", 1, 1], ["gpt-7-nova", 2, 1]); },
+    value => { value.retainedUnrecognizedModels = { tuples: 1, models: 1 }; },
+  ]) {
+    const payload = retainedPro10PublicAllowanceFixture(NOW); mutate(payload.allowanceBreakdowns);
+    const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+    assert.equal(normalized.state, "published");
+    assert.equal(normalized.days.length, payload.days.length);
+    assert.equal(normalized.breakdowns, null, mutate.toString());
+    assert.equal(projectCommunityDailyPayloadForCache(payload, { nowMs: NOW }).allowanceBreakdowns, undefined);
+  }
+});
+
+test("v1.2, v1.4 and v1.5 retain distinct cache identities and closed unknown-model counts", () => {
+  for (const [build, version, metadata] of [
+    [() => retainedPro10PublicAllowanceFixture(NOW), "community-allowance-breakdowns-v1.2", false],
+    [v14Fixture, "community-allowance-breakdowns-v1.4", true],
+    [v15Fixture, "community-allowance-breakdowns-v1.5", true],
+  ]) {
+    const payload = build();
+    payload.allowanceBreakdowns.days.at(-1).models.push(["gpt-7-private-fixture", 1234.5, 1]);
+    const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+    const cached = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+    assert.equal(cached.allowanceBreakdowns.schemaVersion, version);
+    assert.equal(Object.hasOwn(cached.allowanceBreakdowns, "modelConfig"), metadata);
+    assert.deepEqual(cached.allowanceBreakdowns.retainedUnrecognizedModels, { tuples: 1, models: 1 });
+    assert.doesNotMatch(JSON.stringify(cached), /gpt-7-private-fixture/u);
+    assert.deepEqual(normalizeCommunityDailySeries(cached, { nowMs: NOW, retained: true }).breakdowns, normalized.breakdowns);
+  }
 });

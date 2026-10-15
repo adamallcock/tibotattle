@@ -4,9 +4,16 @@ import { lstat, realpath, stat } from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import pg from "pg";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
-import { COMMUNITY_ALLOWANCE_BASIS, COMMUNITY_ALLOWANCE_QUALIFICATION,
-  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS } from "../src/community-allowance.ts";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance.ts";
+import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PRO10_BASIS,
+  COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_QUALIFICATION,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+} from "../src/community-allowance.ts";
 import { finalizeCommunityDailySpend } from "../src/community-daily-spend.ts";
 import { readPostgresPublishedCommunityDaily } from "../src/postgres-community-daily.ts";
 
@@ -41,7 +48,7 @@ function allowance() {
     basis: COMMUNITY_ALLOWANCE_BASIS,
     limitId: "codex",
     referencePlanType: "pro",
-    normalization: "pro_x1_prolite_x4_plus_x20",
+    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
     windowDurationMinutes: 10_080,
     trailingDays: 30,
     qualification: COMMUNITY_ALLOWANCE_QUALIFICATION,
@@ -169,7 +176,7 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
 
   async function read(options = {}) { return readWithPool(pool, options); }
 
-  it("reads latest authorized rows, verifies payload hashes, and strips private/unknown fields", async () => {
+  async function publishCurrentAllowanceState() {
     const today = new Date(NOW_MS).toISOString().slice(0, 10);
     const safeFromDay = new Date(Date.parse(`${today}T00:00:00.000Z`)
       - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1) * 86_400_000).toISOString().slice(0, 10);
@@ -180,7 +187,11 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
       SELECT $1,$2,'ready',$3,$4,$5,$6,0,0,1,controls.revision,0,clock_timestamp()
       FROM ${sqlSchema}.collection_controls controls WHERE singleton=1`,
     [SOURCE_ID, SOURCE_NAMESPACE, COMMUNITY_ALLOWANCE_BASIS,
-      COMMUNITY_ATTRIBUTION_METHOD_VERSION, safeFromDay, today]);
+      COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, safeFromDay, today]);
+  }
+
+  it("reads latest authorized rows, verifies payload hashes, and strips private/unknown fields", async () => {
+    await publishCurrentAllowanceState();
     await publish(1);
 
     const result = await read();
@@ -202,6 +213,38 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
 
     await publish(3, dailyPayload(3, { unknownPrivateField: "must-fail-closed" }));
     await expect(read()).rejects.toMatchObject({ code: "invalid", operation: "community_daily.payload" });
+  });
+
+  it("withholds historical or mixed daily allowance identities and stale projection stamps", async () => {
+    await publishCurrentAllowanceState();
+    const incompatibleIdentities = [
+      ["old three-plan normalization", { normalization: "pro_x1_prolite_x4_plus_x20" }],
+      ["frozen Pro 10x contract", {
+        basis: COMMUNITY_ALLOWANCE_PRO10_BASIS,
+        normalization: COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+      }],
+      ["current basis with frozen normalization", { normalization: COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION }],
+      ["frozen basis with current normalization", { basis: COMMUNITY_ALLOWANCE_PRO10_BASIS }],
+    ];
+    let revision = 0;
+    for (const [description, identity] of incompatibleIdentities) {
+      await publish(++revision, dailyPayload(revision, { allowance: { ...allowance(), ...identity } }));
+      const result = await read();
+      assert.equal(result.rows.length, 1);
+      const payload = JSON.parse(result.rows[0].payload_json);
+      assert.equal(Object.hasOwn(payload, "allowance"), false, description);
+      expect(payload).toHaveProperty("apiEquivalentSpend.usageEvents", 1);
+    }
+
+    await publish(++revision);
+    const current = JSON.parse((await read()).rows[0].payload_json);
+    expect(current).toHaveProperty("allowance.normalization", COMMUNITY_ALLOWANCE_NORMALIZATION);
+    await pool.query(`UPDATE ${sqlSchema}.community_daily_allowance_publication_state
+      SET attribution_method_version=$3 WHERE source_id=$1 AND source_namespace=$2`,
+    [SOURCE_ID, SOURCE_NAMESPACE, COMMUNITY_ATTRIBUTION_METHOD_VERSION]);
+    const stale = JSON.parse((await read()).rows[0].payload_json);
+    expect(stale).not.toHaveProperty("allowance");
+    expect(stale).toHaveProperty("apiEquivalentSpend.usageEvents", 1);
   });
 
   it("does not reveal an older revision after a newer revision is withdrawn", async () => {
@@ -259,14 +302,14 @@ describe.skipIf(!PG_TEST_SOCKET)("PostgreSQL community daily publication read co
       SELECT $1,$2,'ready',$3,$4,$5,$6,0,0,1,controls.revision,0,clock_timestamp()
       FROM ${sqlSchema}.collection_controls controls WHERE singleton=1`,
     [SOURCE_ID, SOURCE_NAMESPACE, COMMUNITY_ALLOWANCE_BASIS,
-      COMMUNITY_ATTRIBUTION_METHOD_VERSION, DAY, DAY]);
+      COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, DAY, DAY]);
     await pool.query(`INSERT INTO ${sqlSchema}.community_daily_allowance_preview_cache(
       source_id,source_namespace,generated_at,payload_json,payload_sha256,
       attribution_method_version,source_authority_epoch,source_cursor_sequence,
       policy_revision,collection_revision)
       SELECT $1,$2,clock_timestamp(),$3,$4,$5,0,0,1,controls.revision
       FROM ${sqlSchema}.collection_controls controls WHERE singleton=1`,
-    [SOURCE_ID, SOURCE_NAMESPACE, preview, digest(preview), COMMUNITY_ATTRIBUTION_METHOD_VERSION]);
+    [SOURCE_ID, SOURCE_NAMESPACE, preview, digest(preview), COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION]);
 
     await pool.query(`INSERT INTO ${sqlSchema}.storage_ingestion_changes(
       source_id,sequence,event_digest,owner_digest,owner_revision,authority_epoch,kind,recorded_ms)

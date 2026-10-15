@@ -29,8 +29,8 @@
 import {
   type CommunityAllowanceFit,
   type V11DailyProjectionValues,
-  type V1ModelCompositionResult,
 } from "../../vendor/analytics-d43c8f92/entry";
+import type { AnalyticsV2ModelCompositionResult } from "./model-era-composition";
 import {
   ANALYTICS_V2_DAY_PATTERN,
   type AnalyticsV2Day,
@@ -156,7 +156,7 @@ export interface AnalyticsV2OwnerComputation {
   /** Today's selected fits, or null when the scalar fit was refused. */
   readonly fits: readonly CommunityAllowanceFit[] | null;
   /** Evaluated model dates (ascending), each with its composition result. */
-  readonly compositions: ReadonlyArray<readonly [AnalyticsV2Day, V1ModelCompositionResult]>;
+  readonly compositions: ReadonlyArray<readonly [AnalyticsV2Day, AnalyticsV2ModelCompositionResult]>;
   /** Model dates the kernels refused for this owner (ascending). */
   readonly modelRefused: readonly AnalyticsV2Day[];
   readonly heapPeakBytes: number | null;
@@ -190,7 +190,7 @@ export async function computeAnalyticsV2Owner(input: {
   const emit = hooks.emit;
   const dailyValues = new Map<AnalyticsV2Day, V11DailyProjectionValues>();
   const blocked = new Set<AnalyticsV2Day>();
-  const compositions: Array<readonly [AnalyticsV2Day, V1ModelCompositionResult]> = [];
+  const compositions: Array<readonly [AnalyticsV2Day, AnalyticsV2ModelCompositionResult]> = [];
   const modelRefused: AnalyticsV2Day[] = [];
   let fits: readonly CommunityAllowanceFit[] | null = null;
   let heapPeak: number | null = null;

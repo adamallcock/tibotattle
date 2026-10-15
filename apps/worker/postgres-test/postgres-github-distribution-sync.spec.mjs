@@ -108,7 +108,26 @@ test("due check, exact forced cooldown and later scheduled snapshot preserve the
 test("source failures are attempts; neither partial pagination nor arbitrary errors replace last good counters", { skip }, async () => {
   await run();
   const old = await read(pool, schema, NOW);
+  const release = inventory(0)[0];
+  const assets = (start, length) => Array.from({ length }, (_, index) => ({
+    ...release.assets[0], id: start + index,
+  }));
   for (const [fetch, expected] of [
+    [async (input) => {
+      const url = new URL(input);
+      if (!url.pathname.endsWith("/assets")) {
+        return Response.json([{ ...release, assets: assets(1, 100) }]);
+      }
+      const page = Number(url.searchParams.get("page"));
+      assert.ok(page >= 2 && page <= 4);
+      return Response.json(assets((page - 1) * 100 + 1, page === 4 ? 101 : 100),
+        page === 4 ? undefined : { headers: { link: '<https://api.github.com/next>; rel="next"' } });
+    }, "GITHUB_RELEASES_BOUNDED"],
+    [async (input) => {
+      assert.equal(new URL(input).pathname.endsWith("/assets"), false,
+        "oversized embedded assets are refused without another network read");
+      return Response.json([{ ...release, assets: assets(1, 401) }]);
+    }, "GITHUB_RELEASES_BOUNDED"],
     [async () => Response.json(inventory(1), { headers: { link: '<https://api.github.com/next>; rel="next"' } }), "GITHUB_RELEASES_BOUNDED"],
     [async () => { throw Object.assign(new Error("synthetic sensitive message"), { code: "UNREVIEWED_FAILURE" }); }, "GITHUB_UNAVAILABLE"],
     [async () => Response.json({ incomplete: true }), "GITHUB_UNAVAILABLE"],

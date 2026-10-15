@@ -18,7 +18,8 @@ import { parseV11EvidenceAdoptionRequest, V11_EVIDENCE_ADOPTION_METHOD,
   type V11EvidenceAdoptionOutcome, type V11EvidenceAdoptionResult } from "./v11-evidence-adoption";
 
 const DAY_MS = 86_400_000;
-const QUIET_MS = 10 * 60_000;
+// Match the executor's 24-hour ownership fence for unused client predecessors.
+const PREDECESSOR_OWNERSHIP_MS = 24 * 60 * 60 * 1_000;
 const CURSOR_MS = 30 * 60_000;
 const PAGE_BUDGET_MS = 15_000;
 const encoder = new TextEncoder();
@@ -99,7 +100,7 @@ export function createPostgresV11EvidenceAdoption(deps: {
       }
       const busy = await client.query(`SELECT 1 FROM ${t("telemetry_v11_domain_predecessors")}
         WHERE participant_id = $1 AND consumed_at IS NULL AND created_at > $2::timestamptz LIMIT 1`,
-        [principal.participantId, new Date(nowEpoch - QUIET_MS).toISOString()]);
+        [principal.participantId, new Date(nowEpoch - PREDECESSOR_OWNERSHIP_MS).toISOString()]);
       if (busy.rows.length) return { outcome: "client_syncing" };
       const state = (await client.query<State>(`SELECT h.generation_id, v.revision::text AS input_revision,
         to_char(d.from_day, 'YYYY-MM-DD') AS from_day, to_char(d.through_day, 'YYYY-MM-DD') AS through_day, d.device_id
