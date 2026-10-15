@@ -14,6 +14,16 @@ import {
 import { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";
 import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
+import {
+  createLocalCallerAuthorization,
+  LOCAL_CAPABILITY_HEADER,
+  LOCAL_OPERATION_HEADER,
+  localMethodRequiresOperation,
+} from "./transport/local-caller-authorization.js";
+import {
+  readInheritedLocalCapability,
+  writeLocalAuthorizationBootstrap,
+} from "./transport/local-authorization-bootstrap.js";
 import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
@@ -210,7 +220,6 @@ import {
 } from "./transport/participant-relay-routes.js";
 import {
   createParticipantSessionCookieBridge,
-  participantRelayPathUsesSessionCookie,
 } from "./transport/participant-session-cookie-bridge.js";
 
 const {
@@ -975,6 +984,8 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 );
 
 const API_ROUTES = new Set([
+  "/api/local/authorization",
+  "/api/local/authorization/browser-bootstrap",
   "/api/local/health",
   "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
@@ -1682,10 +1693,6 @@ function createParticipantRelay({
   timeoutMs = PARTICIPANT_RELAY_TIMEOUT_MS,
 }) {
   const origin = participantCentralOrigin(centralOrigin);
-  // One session-cookie bridge for the life of the relay: it holds the freshest
-  // session the upstream has issued so the enroll -> mint sequence carries that
-  // session even before the WKWebView jar commits its Set-Cookie (owner-reported
-  // first-sign-in AUTH_REQUIRED, 2026-08-11).
   const sessionCookieBridge = createParticipantSessionCookieBridge();
   return Object.freeze({
     enabled: origin !== null,
@@ -1701,86 +1708,108 @@ function createParticipantRelay({
       if (!route.methods.includes(request.method)) {
         throw fixedRelayError("central_participant_method_not_allowed");
       }
-      const body = await boundedParticipantRelayBody(request);
-      const headers = {
-        Accept: "application/json",
-        Origin: origin,
-      };
-      if (body !== null) headers["Content-Type"] = "application/json";
-      const jarCookie = participantSessionCookie(request.headers.cookie);
-      // Session-authenticated routes (session, logout, /me/* including the
-      // device-pairing mint) take the bridge's freshest captured session so the
-      // enroll -> mint sequence never races the WKWebView jar commit. Identity
-      // handoff and enrollment routes keep exactly the jar's own cookie.
-      const cookie = participantRelayPathUsesSessionCookie(path)
-        ? sessionCookieBridge.cookieForRequest(jarCookie)
-        : jarCookie;
-      if (cookie !== null) headers.Cookie = cookie;
-      const csrf = request.headers["x-usage-monitor-csrf"];
-      if (csrf !== undefined) {
-        if (typeof csrf !== "string" || !CSRF_VALUE.test(csrf)) {
-          throw fixedRelayError("central_participant_csrf_invalid");
-        }
-        headers["X-Usage-Monitor-CSRF"] = csrf;
-      }
-      const authorization = request.headers.authorization;
-      if (authorization !== undefined) {
-        throw fixedRelayError("central_participant_authorization_invalid");
-      }
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-      timeout.unref?.();
-      let upstream;
+      // The shared HTTP boundary has authenticated this launch capability.
+      // The additional continuation authorizes only the cookie-commit race
+      // immediately following this caller's successful enrollment ceremony.
+      const caller = request.headers["x-tibotattle-local-capability"];
+      const ceremony = path === "/api/v1/enroll"
+        ? sessionCookieBridge.beginEnrollment(caller) : null;
+      if (path === "/api/v1/logout") sessionCookieBridge.clear(caller);
       try {
-        upstream = await fetchImpl(`${origin}${path}`, {
+        const jarCookie = participantSessionCookie(request.headers.cookie);
+        const cookie = sessionCookieBridge.cookieForRequest(jarCookie, {
+          caller,
+          continuation: request.headers["x-tibotattle-enrollment-continuation"],
           method: request.method,
-          headers,
-          body,
-          redirect: "error",
-          signal: controller.signal,
+          path,
         });
-      } catch {
-        throw fixedRelayError("central_participant_service_unavailable");
-      } finally {
-        clearTimeout(timeout);
-      }
-      const contentType = upstream.headers.get("content-type")
-        ?.split(";", 1)[0]?.trim();
-      if (contentType !== "application/json") {
-        throw fixedRelayError("central_participant_response_invalid");
-      }
-      const responseBody = await boundedParticipantRelayResponse(
-        upstream,
-        MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
-      );
-      try {
-        JSON.parse(responseBody.toString("utf8"));
-      } catch {
-        throw fixedRelayError("central_participant_response_invalid");
-      }
-      const responseHeaders = {};
-      const setCookie = upstream.headers.get("set-cookie");
-      if (setCookie !== null) {
-        if (setCookie.length > 1_024 || !SET_COOKIE_VALUE.test(setCookie)) {
+        const body = await boundedParticipantRelayBody(request);
+        const headers = {
+          Accept: "application/json",
+          Origin: origin,
+        };
+        if (body !== null) headers["Content-Type"] = "application/json";
+        if (cookie !== null) headers.Cookie = cookie;
+        const csrf = request.headers["x-usage-monitor-csrf"];
+        if (csrf !== undefined) {
+          if (typeof csrf !== "string" || !CSRF_VALUE.test(csrf)) {
+            throw fixedRelayError("central_participant_csrf_invalid");
+          }
+          headers["X-Usage-Monitor-CSRF"] = csrf;
+        }
+        const authorization = request.headers.authorization;
+        if (authorization !== undefined) {
+          throw fixedRelayError("central_participant_authorization_invalid");
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        timeout.unref?.();
+        let upstream;
+        try {
+          upstream = await fetchImpl(`${origin}${path}`, {
+            method: request.method,
+            headers,
+            body,
+            redirect: "error",
+            signal: controller.signal,
+          });
+        } catch {
+          throw fixedRelayError("central_participant_service_unavailable");
+        } finally {
+          clearTimeout(timeout);
+        }
+        const contentType = upstream.headers.get("content-type")
+          ?.split(";", 1)[0]?.trim();
+        if (contentType !== "application/json") {
           throw fixedRelayError("central_participant_response_invalid");
         }
-        responseHeaders["Set-Cookie"] = setCookie;
-        // Capture the session the worker just issued so the very next relay
-        // request (the ceremony's device-pairing mint) presents it regardless
-        // of whether the WKWebView jar has committed this Set-Cookie yet.
-        sessionCookieBridge.observeUpstreamSetCookie(setCookie);
+        const responseBody = await boundedParticipantRelayResponse(
+          upstream,
+          MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
+        );
+        try {
+          JSON.parse(responseBody.toString("utf8"));
+        } catch {
+          throw fixedRelayError("central_participant_response_invalid");
+        }
+        const responseHeaders = {};
+        const setCookie = upstream.headers.get("set-cookie");
+        if (setCookie !== null) {
+          if (setCookie.length > 1_024 || !SET_COOKIE_VALUE.test(setCookie)) {
+            throw fixedRelayError("central_participant_response_invalid");
+          }
+          responseHeaders["Set-Cookie"] = setCookie;
+          sessionCookieBridge.observeUpstreamSetCookie(caller, setCookie);
+        }
+        if (upstream.headers.get("idempotency-replayed") === "true") {
+          responseHeaders["Idempotency-Replayed"] = "true";
+        }
+        if (upstream.headers.get("vary") === "Cookie") {
+          responseHeaders.Vary = "Cookie";
+        }
+        if (ceremony !== null) {
+          const continuation = upstream.status >= 200 && upstream.status < 300
+            ? sessionCookieBridge.completeEnrollment(caller, ceremony, setCookie)
+            : null;
+          if (continuation !== null) {
+            responseHeaders["X-TiboTattle-Enrollment-Continuation"] = continuation;
+          } else {
+            sessionCookieBridge.cancelEnrollment(caller, ceremony);
+          }
+        }
+        return {
+          status: upstream.status,
+          body: responseBody,
+          headers: responseHeaders,
+        };
+      } catch (error) {
+        if (ceremony !== null) sessionCookieBridge.cancelEnrollment(caller, ceremony);
+        sessionCookieBridge.discardContinuation(
+          caller,
+          request.headers["x-tibotattle-enrollment-continuation"],
+        );
+        throw error;
       }
-      if (upstream.headers.get("idempotency-replayed") === "true") {
-        responseHeaders["Idempotency-Replayed"] = "true";
-      }
-      if (upstream.headers.get("vary") === "Cookie") {
-        responseHeaders.Vary = "Cookie";
-      }
-      return {
-        status: upstream.status,
-        body: responseBody,
-        headers: responseHeaders,
-      };
     },
   });
 }
@@ -3271,6 +3300,7 @@ export function createLocalCompanionServer(options = {}) {
 }
 
 function createPreparedLocalCompanionServer({
+  localCapability,
   environment,
   accountlessChannel = process,
   accountlessProductionProfile = false,
@@ -4869,6 +4899,32 @@ function createPreparedLocalCompanionServer({
   });
   let workUsageShutdown = null;
   const closeWorkUsage = () => workUsageShutdown ??= workUsage.close();
+  const localAuthorization = createLocalCallerAuthorization({ capability: localCapability });
+  let browserAuthorizationBootstrap = null;
+  let browserAuthorizationOperation = Promise.resolve();
+  const createBrowserAuthorizationBootstrap = () => {
+    const operation = browserAuthorizationOperation.then(async () => {
+      await browserAuthorizationBootstrap?.dispose();
+      if (!server.listening) throw new Error("local authorization bootstrap unavailable");
+      const bootstrap = await writeLocalAuthorizationBootstrap({
+        stateRoot,
+        origin: `http://${LOOPBACK_HOST}:${actualPort(server)}`,
+        capability: localAuthorization.headers()[LOCAL_CAPABILITY_HEADER],
+      });
+      if (!server.listening) {
+        await bootstrap?.dispose();
+        return null;
+      }
+      browserAuthorizationBootstrap = bootstrap;
+      return bootstrap;
+    });
+    browserAuthorizationOperation = operation.catch(() => {});
+    return operation;
+  };
+  const closeBrowserAuthorization = async () => {
+    await browserAuthorizationOperation;
+    await browserAuthorizationBootstrap?.dispose();
+  };
   const server = createServer(async (request, response) => {
     try {
       if (!isLoopbackPeer(request)) {
@@ -4903,6 +4959,65 @@ function createPreparedLocalCompanionServer({
       if (accountlessProductionProfile
           && isAccountlessProductionClosedLocalRoute(path)) {
         sendError(response, 404, "not_found");
+        return;
+      }
+      // Loopback, Host, Origin and the historic constant local header constrain
+      // transport; none identifies a caller. Guard every dynamic route before
+      // snapshot reads, body parsing, relay work or any other side effect.
+      const privateRoute = path.startsWith("/api/") || Object.hasOwn(REPORT_ROUTES, path);
+      if (privateRoute && !localAuthorization.authorize(
+        request.headers[LOCAL_CAPABILITY_HEADER.toLowerCase()],
+      )) {
+        sendError(response, 403, "local_caller_not_authorized");
+        return;
+      }
+      if (path === "/api/local/authorization") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!sameOrigin(request)) {
+          sendError(response, 403, "local_operation_not_authorized");
+          return;
+        }
+        try {
+          const value = await readBoundedJsonObject(request);
+          if (Object.keys(value).length !== 2
+              || !Object.hasOwn(value, "method") || !Object.hasOwn(value, "path")
+              || !(API_ROUTES.has(value.path) || centralProxy.handles(value.path)
+                || participantRelay.handles(value.path))
+              || (accountlessProductionProfile && isAccountlessProductionClosedLocalRoute(value.path))) {
+            sendError(response, 400, "invalid_request");
+            return;
+          }
+          const authorization = localAuthorization.issue(value.method, value.path);
+          if (authorization === null) {
+            sendError(response, 403, "local_operation_not_authorized");
+            return;
+          }
+          send(response, 200, { authorization });
+        } catch (error) {
+          sendError(response, boundedRequestStatus(error), error.code ?? "invalid_request");
+        }
+        return;
+      }
+      if (path.startsWith("/api/") && localMethodRequiresOperation(request.method)
+          && !localAuthorization.consume(
+            request.headers[LOCAL_OPERATION_HEADER.toLowerCase()], request.method, path,
+          )) {
+        sendError(response, 403, "local_operation_not_authorized");
+        return;
+      }
+      if (path === "/api/local/authorization/browser-bootstrap") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(request, response, "local_operation_not_authorized", {
+          allowFixedUserRequest: false,
+        })) return;
+        const bootstrap = await createBrowserAuthorizationBootstrap();
+        send(response, 200, { available: bootstrap !== null });
         return;
       }
       if (centralProxy.handles(path)) {
@@ -6255,12 +6370,17 @@ function createPreparedLocalCompanionServer({
   });
 
   server.on("close", () => {
+    localAuthorization.revoke();
+    void closeBrowserAuthorization();
     void closeWorkUsage().catch(() => onError("work_usage_shutdown_failed"));
     void Promise.resolve(sharedProjectionReader.close?.()).catch(() => onError("local_projection_shutdown_failed"));
   });
 
   return {
     server,
+    localAuthorizationHeaders: (request) => localAuthorization.headers(request),
+    createBrowserAuthorizationBootstrap,
+    closeBrowserAuthorization,
     dataStore,
     refresh,
     centralOutbound,
@@ -6353,6 +6473,7 @@ export async function startLocalCompanionServer({
       await Promise.all([
         app.closeModelPerformance(),
         app.closeWorkUsage(),
+        app.closeBrowserAuthorization(),
         app.shutdownContributionRuntime(),
       ]);
     },
@@ -6370,10 +6491,13 @@ if (process.argv[1]
     }
   } else {
     const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
+    const inheritedCapability = await readInheritedLocalCapability();
     const app = await startLocalCompanionServer({
       port: requestedPort,
       terminateProcessOnParentDeath: true,
+      localCapability: inheritedCapability,
     });
+    if (inheritedCapability === undefined) await app.createBrowserAuthorizationBootstrap();
     process.stdout.write(`USAGE_MONITOR_READY http://${app.host}:${app.port}/\n`);
     let closing = false;
     const close = () => {

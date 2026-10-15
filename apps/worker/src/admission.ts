@@ -44,6 +44,8 @@ type AttemptPurpose =
   | "accountless_ownership"
   | "accountless_renewal";
 type RateLimitPurpose = AttemptPurpose
+  | "public_probe_health"
+  | "public_probe_ready"
   | "public_aggregate_read"
   | "upload_authorization"
   | "upload_ingress";
@@ -189,6 +191,54 @@ export async function assertPublicAggregateReadAllowed(
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw admissionRateLimitUnavailable();
+  }
+}
+
+/** Independent, per-route probe budgets never consume participant allowance. */
+export async function assertPublicProbeAllowed(
+  request: Request,
+  env: Env,
+  route: "health" | "ready",
+): Promise<void> {
+  const coarse = env.PUBLIC_PROBE_RATE_LIMIT;
+  const client = env.PUBLIC_PROBE_CLIENT_RATE_LIMIT;
+  assertLimiterConfigured(coarse);
+  assertLimiterConfigured(client);
+  await applyOperationalRateLimit(coarse, `usage-monitor:public_probe:${route}:global`);
+  await applyOperationalRateLimit(client,
+    `usage-monitor:public_probe:${route}:client:${await clientRateLimitKey(
+      request, env, `public_probe_${route}`,
+    )}`);
+}
+
+/**
+ * Cloudflare rate counters are local and permissive; this is a cheap coarse
+ * breaker, not the appcast guard's authoritative concurrent-request budget.
+ */
+export async function assertAppcastGuardRequestAllowed(env: Env): Promise<void> {
+  const limiter = env.SPARKLE_APPCAST_GUARD_RATE_LIMIT;
+  assertLimiterConfigured(limiter);
+  await applyOperationalRateLimit(limiter, "usage-monitor:appcast_guard:global");
+}
+
+async function applyOperationalRateLimit(limiter: RateLimit, key: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      limiter.limit({ key }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(admissionRateLimitUnavailable()), 1_000);
+      }),
+    ]);
+    if (typeof result?.success !== "boolean") throw admissionRateLimitUnavailable();
+    if (!result.success) throw new ApiError(429, "ATTEMPT_LIMIT_REACHED", {
+      responseHeaders: { "retry-after": "60" },
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw admissionRateLimitUnavailable();
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

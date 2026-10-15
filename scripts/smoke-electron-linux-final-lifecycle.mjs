@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { linuxProcessCommandLineFacts as linuxFinalProcessCommandLineFacts } from './lib/linux-successor-evidence.mjs';
 // Exact public predecessor -> final candidate, ordinary FUSE launcher only.
+import distribution from "../config/electron-production-distribution.cjs";
 import { spawn, spawnSync } from 'node:child_process';
 import { constants, createReadStream } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, readlink, rename, rm, unlink } from 'node:fs/promises';
@@ -8,14 +10,18 @@ import { lookup } from 'node:dns/promises';
 import { basename, dirname, join, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { pipeline } from 'node:stream/promises';
 import { assertContainerContract, isLinuxSandboxEnvironmentClean, freeTcpPort, terminateLinuxSmokeChild, runSmoke,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES } from './smoke-electron-linux.mjs';
 import { createLinuxStartupDiagnostics,
   validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
 import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment, runOneNormalApp, normalPackagedSmokeFailureStageCode,
   persistLinuxNormalPackagedRestartPreferences, verifyLinuxNormalPackagedRestartPreferences } from './smoke-electron-linux-packaged.mjs';
-import { prepareLinuxUpdaterDownload, realUpdaterFeed, isLinuxUpdaterSettingsURL,
-  connectPage as connectUpdaterPage, processHealth as updaterProcessHealth, waitFor as waitForUpdater } from './smoke-electron-linux-real-appimage-updater.mjs';
+import { prepareLinuxUpdaterDownload, isLinuxUpdaterSettingsURL,
+  connectPage as connectUpdaterPage, waitFor as waitForUpdater } from './smoke-electron-linux-real-appimage-updater.mjs';
+import { captureLinuxStartupBaseline, waitForLinuxSuccessorStartup,
+  assertLinuxCdpEndpointOwned, assertLinuxCdpPortUnused } from './lib/linux-successor-evidence.mjs';
+import { validateLinuxQualificationFeed, createLinuxQualificationCorruptStream } from './lib/linux-qualification-feed.mjs';
 import { proveLinuxSecretServiceContainerIsolation, startLinuxSecretServiceDaemon } from './qualify-linux-secret-service.mjs';
 import { readLocalCollectorCheckpoint } from '../src/local-collector-state.js';
 import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-lifecycle.mjs';
@@ -100,42 +106,7 @@ export function selectLinuxFinalFuseMount({ executable, mountinfo, environment, 
   }
   return { mount, type: selected.type };
 }
-/** Chromium can expose one space-joined process title instead of NUL argv.
- * This parser only excludes child roles and checks renderer sandbox flags;
- * it never admits a browser without the separate exact launch and artifact proof. */
-export function linuxFinalProcessCommandLineFacts({ commandLine, executable }, observeRefusal = null) {
-  const refuse = code => { observeRefusal?.(code); return null; };
-  if (typeof commandLine !== 'string') return refuse('PROCESS_COMMAND_LINE_TYPE_INVALID');
-  if (commandLine.length > 65536) return refuse('PROCESS_COMMAND_LINE_TOO_LONG');
-  if (!commandLine.endsWith('\0')) return refuse('PROCESS_COMMAND_LINE_TERMINATOR_MISSING');
-  if (typeof executable !== 'string' || executable.length === 0 || /[\s\0]/u.test(executable)) return refuse('PROCESS_EXECUTABLE_FORM_INVALID');
-  const fields = commandLine.slice(0, -1).split('\0');
-  let encodedArguments, boundary;
-  if (fields.length > 1 || fields[0] === executable) {
-    if (fields[0] !== executable) return refuse('PROCESS_ARGV_ZERO_MISMATCH');
-    const invalidField = fields.find(field => field.length === 0 || /\s/u.test(field));
-    if (invalidField !== undefined) return refuse(invalidField.length === 0 ? 'PROCESS_ARGV_EMPTY_FIELD' : 'PROCESS_ARGV_WHITESPACE');
-    encodedArguments = fields.slice(1).join('\0'); boundary = '\\0';
-  } else {
-    if (!fields[0].startsWith(`${executable} `)) return refuse('PROCESS_TITLE_PREFIX_MISMATCH');
-    encodedArguments = fields[0].slice(executable.length + 1); boundary = ' ';
-    if (encodedArguments.length === 0 || /[^\S ]/u.test(encodedArguments)
-      || encodedArguments.startsWith(' ') || encodedArguments.endsWith(' ') || encodedArguments.includes('  ')) return refuse('PROCESS_TITLE_SPACING_INVALID');
-  }
-  const roles = [...encodedArguments.matchAll(new RegExp(`(?:^|${boundary})--type=([^${boundary}]*)(?=${boundary}|$)`, 'gu'))];
-  if (roles.length > 1) return refuse('PROCESS_ROLE_MULTIPLE');
-  // Chromium 150 sandbox_linux.cc rewrites forked broker titles to these
-  // exact child roles. They may exclude a browser candidate only after the
-  // complete grammar below; they never satisfy the exact renderer predicate.
-  if (roles.length === 1 && !['renderer', 'zygote', 'gpu-process', 'utility',
-    'broker', 'renderer-broker', 'zygote-broker', 'gpu-process-broker', 'utility-broker'].includes(roles[0][1])) {
-    if (roles[0][1] === '') return refuse('PROCESS_ROLE_EMPTY');
-    return refuse('PROCESS_ROLE_UNKNOWN');
-  }
-  if (new RegExp(`(?:^|${boundary})--type(?=${boundary}|$)`, 'u').test(encodedArguments)) return refuse('PROCESS_ROLE_BARE');
-  const sandboxBypass = new RegExp(`(?:^|${boundary})--(?:no-sandbox|disable-setuid-sandbox)(?:=|${boundary}|$)`, 'u').test(encodedArguments);
-  return { role: roles[0]?.[1] ?? null, sandboxBypass };
-}
+export { linuxProcessCommandLineFacts as linuxFinalProcessCommandLineFacts } from './lib/linux-successor-evidence.mjs';
 export function linuxFinalSandboxStatus({ commandLine, executable, status }) {
   const facts = linuxFinalProcessCommandLineFacts({ commandLine, executable });
   return facts?.role === 'renderer' && !facts.sandboxBypass && /^NoNewPrivs:\s+1$/mu.test(status)
@@ -153,28 +124,36 @@ export async function readLinuxFinalAppProcessIdentity(pid, expected, temporary,
   if (args.some(arg => arg.startsWith('--type='))) return null;
   const executable = await link(`/proc/${pid}/exe`); // No argv fallback in this lane.
   if (!executable.startsWith(`${temporary}/.mount_`) || basename(executable) !== 'tibotattle') return null;
-  const status = await read(`/proc/${pid}/status`, 'utf8');
-  if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_UID_INVALID');
-  const entries = (await read(`/proc/${pid}/environ`, 'utf8')).split('\0');
-  const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN|ELECTRON_RUN_AS_NODE)=/u.test(item)).map(item => {
-    const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
-  }));
-  // The ordinary companion uses this same executable in Node mode. Its closed
-  // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
-  if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
-  if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_NODE_MODE_INVALID');
-  let roleFailure = 'PROCESS_ROLE_INVALID';
-  const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable }, code => { roleFailure = code; });
-  if (facts === null) fail(roleFailure);
-  if (facts.role !== null) return null;
-  const commandLine = args.join('\0');
-  if (!linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments })) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
-  const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await read(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary, commandLine, expectedArguments });
-  if (await hash(executable) !== expected.executableSha256
-    || await hash(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
-  if (await hash(IMAGE) !== expected.sha256) fail('INSTALLED_BYTES_INVALID');
-  if (startTime(await read(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
-  return { pid, startTime: startTime(stat), mount: mounted.mount, executable };
+  try {
+    const status = await read(`/proc/${pid}/status`, 'utf8');
+    if (!/^Uid:\s+1000\s+1000\s+1000\s+1000$/mu.test(status)) fail('PROCESS_UID_INVALID');
+    const entries = (await read(`/proc/${pid}/environ`, 'utf8')).split('\0');
+    const environment = Object.fromEntries(entries.filter(item => /^(APPIMAGE|APPDIR|APPIMAGE_EXTRACT_AND_RUN|ELECTRON_RUN_AS_NODE)=/u.test(item)).map(item => {
+      const split = item.indexOf('='); return [item.slice(0, split), item.slice(split + 1)];
+    }));
+    // The ordinary companion uses this same executable in Node mode. Its closed
+    // environment omits APPIMAGE/APPDIR; it remains part of browser descendants.
+    if (environment.ELECTRON_RUN_AS_NODE === '1') return null;
+    if (environment.ELECTRON_RUN_AS_NODE !== undefined) fail('PROCESS_NODE_MODE_INVALID');
+    let roleFailure = 'PROCESS_ROLE_INVALID';
+    const facts = linuxFinalProcessCommandLineFacts({ commandLine: args.join('\0'), executable }, code => { roleFailure = code; });
+    if (facts === null) fail(roleFailure);
+    if (facts.role !== null) return null;
+    const commandLine = args.join('\0');
+    if (!linuxFinalBrowserCommandLineMatches({ commandLine, executable, expectedArguments })) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+    const mounted = selectLinuxFinalFuseMount({ executable, mountinfo: await read(`/proc/${pid}/mountinfo`, 'utf8'), environment, temporary, commandLine, expectedArguments });
+    if (await hash(executable) !== expected.executableSha256
+      || await hash(join(mounted.mount, 'resources/app.asar')) !== expected.asarSha256) return null;
+    if (await hash(IMAGE) !== expected.sha256) fail('INSTALLED_BYTES_INVALID');
+    if (await link(`/proc/${pid}/exe`) !== executable
+      || await read(`/proc/${pid}/cmdline`, 'utf8') !== commandLine
+      || startTime(await read(`/proc/${pid}/stat`, 'utf8')) !== startTime(stat)) fail('PROCESS_BYTES_CHANGED');
+    return { pid, startTime: startTime(stat), mount: mounted.mount, executable };
+  } catch (error) {
+    if (error?.code?.startsWith('LINUX_FINAL_LIFECYCLE_')) throw error;
+    if (['ENOENT', 'ESRCH'].includes(error?.code)) return null;
+    fail('PROCESS_IDENTITY_UNAVAILABLE');
+  }
 }
 export async function readLinuxFinalKnownAppProcessIdentity(pid, expected, temporary, argumentVectors, io = {}) {
   if (!Array.isArray(argumentVectors) || argumentVectors.length < 1 || argumentVectors.length > 4) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
@@ -191,15 +170,17 @@ export async function readLinuxFinalKnownAppProcessIdentity(pid, expected, tempo
   }
   throw mismatch;
 }
-async function ownedApps(expected, temporary, argumentVectors) {
+export async function findLinuxFinalOwnedApps(expected, temporary, argumentVectors,
+  { list = readdir, readIdentity = readLinuxFinalKnownAppProcessIdentity } = {}) {
   const found = [];
-  for (const name of await readdir('/proc')) {
+  for (const name of await list('/proc')) {
     if (!/^[0-9]+$/u.test(name)) continue;
-    try { const identity = await readLinuxFinalKnownAppProcessIdentity(Number(name), expected, temporary, argumentVectors); if (identity) found.push(identity); }
+    try { const identity = await readIdentity(Number(name), expected, temporary, argumentVectors); if (identity) found.push(identity); }
     catch (error) { if (error.code?.startsWith('LINUX_FINAL_LIFECYCLE_')) throw error; /* Exited or unrelated. */ }
   }
   return found;
 }
+const ownedApps = findLinuxFinalOwnedApps;
 export async function currentLinuxFinalApp(expected, temporary, expectedArguments, argumentVectors, { find = ownedApps, waiter = wait } = {}) {
   const argumentIndex = argumentVectors.indexOf(expectedArguments);
   if (argumentIndex < 0) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
@@ -207,6 +188,31 @@ export async function currentLinuxFinalApp(expected, temporary, expectedArgument
     const found = await find(expected, temporary, argumentVectors); if (found.length > 1) fail('MULTIPLE_APPS');
     return found[0]?.argumentIndex === argumentIndex ? found[0].identity : null;
   }, 60000);
+}
+/** Bind a single controlled launch before any debugger request. A later process
+ * or listener can never replace the first admitted launch inside this closure. */
+export function createLinuxFinalCdpAuthority({ port, readCurrentIdentity, readIdentity,
+  assertEndpoint = assertLinuxCdpEndpointOwned, waiter = wait } = {}) {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535
+    || ![readCurrentIdentity, readIdentity, assertEndpoint, waiter].every(value => typeof value === 'function')) fail('CDP_AUTHORITY_INVALID');
+  let identityPromise = null, refused = false;
+  const socketBinding = {};
+  return async ({ port: requestedPort } = {}) => {
+    if (refused || requestedPort !== port) { refused = true; fail('CDP_AUTHORITY_UNPROVEN'); }
+    try {
+      identityPromise ??= Promise.resolve().then(readCurrentIdentity);
+      const identity = await identityPromise;
+      const admitted = await waiter(async () => {
+        try { return await assertEndpoint({ identity, readIdentity: () => readIdentity(identity), port, binding: socketBinding }) === true; }
+        catch (error) {
+          if (error?.code === 'LINUX_SUCCESSOR_CDP_NOT_READY') return false;
+          throw error;
+        }
+      }, 60000);
+      if (admitted !== true) fail('CDP_AUTHORITY_UNPROVEN');
+      return true;
+    } catch { refused = true; fail('CDP_AUTHORITY_UNPROVEN'); }
+  };
 }
 async function alive(identity) {
   try { return startTime(await readFile(`/proc/${identity.pid}/stat`, 'utf8')) === identity.startTime; }
@@ -350,11 +356,11 @@ async function checkedCheckpoint(fixture) {
   if (scope?.status !== 'available' || scope.version !== 'openai-account-v1' || !/^openai-account:v1:[A-Za-z0-9_-]{43}$/u.test(scope.scopeId ?? '')) fail('CREDENTIAL_ACCESS_UNPROVEN');
   return scope;
 }
-async function proveNoUpdate(cdp, origin, port) {
+async function proveNoUpdate(cdp, origin, port, assertCdpAuthority) {
   await cdp.evaluate('globalThis.tibotattleDesktop.openSettings()');
   // The port is captured from the exact admitted normal launch vector.
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) fail('DEBUGGER_IDENTITY_INVALID');
-  const settings = await connectUpdaterPage(port, url => isLinuxUpdaterSettingsURL(url, origin));
+  const settings = await connectUpdaterPage(port, url => isLinuxUpdaterSettingsURL(url, origin), { assertCdpAuthority });
   try {
     await wait(() => settings.evaluate("document.querySelector('#settings-tab-about') !== null"));
     await settings.evaluate("document.querySelector('#settings-tab-about').click()");
@@ -367,13 +373,52 @@ async function proveNoUpdate(cdp, origin, port) {
     }, 30000);
   } finally { settings.close(); }
 }
-export function linuxFinalFeedRequestPath(requestUrl) {
+export function linuxFinalFeedRequestPath(requestUrl, artifactRequestPath) {
   const url = new URL(requestUrl, LINUX_FINAL_FEED);
   if (url.origin !== `https://${HOST}` || url.username || url.password || url.hash) return null;
   const feed = '/electron/stable/linux-x64/latest-linux.yml';
   if (url.pathname === feed && (url.search === '' || /^\?noCache=[0-9a-v]{1,20}$/u.test(url.search))) return 'feed';
-  if (url.pathname === '/electron/stable/linux-x64/next.AppImage' && url.search === '') return 'image';
+  if (/^\/electron\/stable\/linux-x64\/TiboTattle-(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})-linux-x86_64\.AppImage$/u.test(artifactRequestPath ?? '')
+    && url.pathname === artifactRequestPath && url.search === '') return 'image';
   return null;
+}
+/** All phases share the exact admitted metadata. Only the negative download
+ * stream changes, and completion requires both its original-byte hash and the
+ * completed HTTP response. The stored artifact is never modified. */
+export function createLinuxFinalQualificationFeed({ admission, image, openImage }) {
+  if (typeof openImage !== 'function' || admission?.manifest?.version !== image?.version
+    || admission.manifest.size !== image.bytes || admission.manifest.sha256 !== image.sha256
+    || linuxFinalFeedRequestPath(admission.artifactRequestPath, admission.artifactRequestPath) !== 'image') fail('SIGNED_FEED_INVALID');
+  let phase = 'clean', feedRequests = 0, imageRequests = 0, completedRejectedTransfers = 0, unexpectedRequests = 0, transferFailures = 0, activeTransfers = 0;
+  return {
+    beginCorruption() { if (phase !== 'clean') fail('CHECKSUM_REFUSAL_UNPROVEN'); phase = 'corrupt'; },
+    endCorruption() {
+      if (phase !== 'corrupt' || completedRejectedTransfers < 1 || transferFailures !== 0 || activeTransfers !== 0) fail('CHECKSUM_REFUSAL_UNPROVEN');
+      phase = 'accepted';
+    },
+    counts() { return { feedRequests, imageRequests, completedRejectedTransfers, unexpectedRequests, transferFailures }; },
+    handle(request, response) {
+      let route; try { route = linuxFinalFeedRequestPath(request.url, admission.artifactRequestPath); } catch { route = null; }
+      if (request.method !== 'GET' || request.headers.host !== HOST || route === null) { unexpectedRequests++; response.writeHead(404).end(); return; }
+      if (route === 'feed') {
+        feedRequests++; response.writeHead(200, { 'content-type': 'application/yaml' }).end(admission.feedBytes); return;
+      }
+      imageRequests++; activeTransfers++; const corrupted = phase === 'corrupt';
+      response.writeHead(200, { 'content-length': image.bytes, 'content-type': 'application/octet-stream' });
+      try {
+        const source = openImage();
+        const streams = corrupted ? [source, createLinuxQualificationCorruptStream({ expectedBytes: image.bytes, expectedSha256: image.sha256 }), response]
+          : [source, response];
+        pipeline(...streams).then(() => {
+          activeTransfers--;
+          if (!response.writableFinished) { transferFailures++; return; }
+          if (corrupted) completedRejectedTransfers++;
+        }, () => {
+          activeTransfers--; transferFailures++; response.destroy();
+        });
+      } catch { activeTransfers--; transferFailures++; response.destroy(); }
+    },
+  };
 }
 export function assertLinuxFinalChecksumRejection({ update, installedSha256, expectedSha256, completedTransfers }) {
   if (update?.status !== 'error' || update.error !== 'download_failed' || update.canInstall !== false
@@ -395,8 +440,8 @@ async function uninstallImage(expected, preservedFixture, temporary) {
 }
 /** Keep predecessor startup failures content-free without changing its CDP
  * target, readiness condition, waits or the caller's connection ownership. */
-export async function connectLinuxFinalPredecessorDashboard(port, { connect = connectUpdaterPage } = {}) {
-  try { return await connect(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url)); }
+export async function connectLinuxFinalPredecessorDashboard(port, { connect = connectUpdaterPage, assertCdpAuthority = null } = {}) {
+  try { return await connect(port, url => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url), { assertCdpAuthority }); }
   catch { fail('PREDECESSOR_DASHBOARD_CONNECT_FAILED'); }
 }
 export async function waitForLinuxFinalPredecessorDashboard(dashboard, { waiter = wait } = {}) {
@@ -453,7 +498,7 @@ const IDENTITY_HOOK_FAILURES = new Map([
   'PROCESS_COMMAND_LINE_TERMINATOR_MISSING', 'PROCESS_EXECUTABLE_FORM_INVALID', 'PROCESS_ARGV_ZERO_MISMATCH',
   'PROCESS_ARGV_EMPTY_FIELD', 'PROCESS_ARGV_WHITESPACE', 'PROCESS_TITLE_PREFIX_MISMATCH', 'PROCESS_TITLE_SPACING_INVALID',
   'PROCESS_ROLE_MULTIPLE', 'PROCESS_ROLE_EMPTY', 'PROCESS_ROLE_SANDBOX_BROKER_UNSUPPORTED', 'PROCESS_ROLE_UNKNOWN', 'PROCESS_ROLE_BARE',
-  'FILE_UNSAFE', 'FILE_CHANGED', 'PROCESS_LAUNCH_ARGUMENTS_INVALID', 'INSTALLED_BYTES_INVALID',
+  'FILE_UNSAFE', 'FILE_CHANGED', 'PROCESS_LAUNCH_ARGUMENTS_INVALID', 'INSTALLED_BYTES_INVALID', 'PROCESS_IDENTITY_UNAVAILABLE',
 ].map(code => [`LINUX_FINAL_LIFECYCLE_${code}`, `NORMAL_APP_IDENTITY_${code}`]));
 IDENTITY_HOOK_FAILURES.set('LINUX_REAL_APPIMAGE_TIMEOUT', 'NORMAL_APP_IDENTITY_TIMEOUT');
 const SANDBOX_HOOK_FAILURES = new Map([...new Set([...RENDERER_OBSERVATION_PROGRESS.keys(), ...RENDERER_MIXED_OBSERVATIONS])]
@@ -495,6 +540,7 @@ export async function runLinuxFinalNormalJourney({ run, readIdentity, assertSand
   return identity;
 }
 export async function runLinuxFinalLifecycle() {
+  if (distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS.length === 0) fail("UPDATE_TRUST_UNPROVISIONED");
   const contract = assertContainerContract();
   const nonce = process.env.TIBOTATTLE_LINUX_FINAL_NONCE, temporary = linuxFinalTemporary(nonce);
   const sampleLinuxStartupFuseMount = () => sampleLinuxMountProbeFacts(temporary);
@@ -514,30 +560,20 @@ export async function runLinuxFinalLifecycle() {
     const file = await fingerprintLinuxFinalFile(join(inputs, pair.images[role].file));
     if (file.sha256 !== pair.images[role].sha256 || file.bytes !== pair.images[role].bytes) fail('INPUT_CHANGED');
   }
+  const feedFile = await fingerprintLinuxFinalFile(join(inputs, 'latest-linux.yml'), 64 * 1024, true);
+  const signedFeed = await validateLinuxQualificationFeed({ feedBytes: feedFile.contents,
+    descriptor: pair.intake.signedFeed, image: pair.images.next });
+  if (signedFeed.updateAvailable !== false) fail('SIGNED_FEED_INVALID');
   if (startLinuxSecretServiceDaemon().status !== 'started') fail('SECRET_SERVICE_UNAVAILABLE');
   await mkdir(TEMP_ROOT, { mode: 0o700 });
   await mkdir(temporary, { mode: 0o700 });
   const key = join(LINUX_FINAL_EXEC, 'loopback.key'), cert = join(LINUX_FINAL_EXEC, 'loopback.crt');
   command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', `/CN=${HOST}`,
     '-addext', `subjectAltName=DNS:${HOST}`, '-keyout', key, '-out', cert]);
-  let feedRequests = 0, imageRequests = 0, completedRejectedTransfers = 0, rejectChecksum = true, unexpectedRequests = 0, stage = 'loopback_tls';
-  const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
-    const route = linuxFinalFeedRequestPath(request.url);
-    if (request.method !== 'GET' || request.headers.host !== HOST || route === null) { unexpectedRequests++; response.writeHead(404).end(); return; }
-    if (route === 'feed') {
-      feedRequests++;
-      const selected = rejectChecksum ? { images: { next: { ...pair.images.next, sha512: Buffer.alloc(64).toString('base64') } } } : pair;
-      response.writeHead(200, { 'content-type': 'application/yaml' }).end(realUpdaterFeed(selected)); return;
-    }
-    if (route === 'image') {
-      imageRequests++;
-      const rejectedTransfer = rejectChecksum;
-      response.once('finish', () => { if (rejectedTransfer) completedRejectedTransfers++; });
-      response.writeHead(200, { 'content-length': pair.images.next.bytes, 'content-type': 'application/octet-stream' });
-      createReadStream(join(inputs, 'next.AppImage')).on('error', () => response.destroy()).pipe(response); return;
-    }
-    unexpectedRequests++; response.writeHead(404).end();
-  });
+  let stage = 'loopback_tls';
+  const feedServer = createLinuxFinalQualificationFeed({ admission: signedFeed, image: pair.images.next,
+    openImage: () => createReadStream(join(inputs, 'next.AppImage')) });
+  const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, feedServer.handle);
   const release = resolveLinuxFinalRelease(pair.intake);
   const receipt = { schemaVersion: release.lifecycleSchema,
     sourceRevision: pair.intake.sourceRevision, workflowRunnerRevision: pair.intake.runnerRevision,
@@ -546,6 +582,7 @@ export async function runLinuxFinalLifecycle() {
     target: 'linux-x64', images: { current: pair.images.current.sha256, next: pair.images.next.sha256 },
     runtime: 'native_x64_Xvfb_FUSE_ordinary_AppImage_launcher', physicalDesktop: 'not_qualified',
     network: 'loopback_only_network_none', feed: 'fixed_production_URL_simulated_locally',
+    signedFeed: pair.intake.signedFeed, packagedAuthority: pair.packagedAuthority,
     credentialScope: 'disposable_Secret_Service', rebuilt: false, published: false };
   let child = null, dashboard = null, settings = null, upgradeFixture = null;
   let startupDiagnostic = null, predecessorStartupDiagnostics = null;
@@ -557,28 +594,46 @@ export async function runLinuxFinalLifecycle() {
     await trustFixture(clean, cert); await installImage(join(inputs, 'next.AppImage'), pair.images.next);
     const identity = { sourceRevision: pair.intake.runnerRevision, artifactSha256: pair.images.next.asarSha256 };
     const runNormal = (fixture, preferences, preserveState = null) => {
-      let launch = null;
+      let launch = null, assertCdpAuthority = null;
       return runLinuxFinalNormalJourney({
         run: beforeQuit => runOneNormalApp(identity, {
           appPath: IMAGE, environment: launchEnvironment(fixture, cert, temporary), fixture,
           preserveFixtureAfterCleanQuit: true, service: 'available', beforeQuit,
           run: options => runSmoke({ ...options, sampleStartupMount: sampleLinuxStartupFuseMount,
-            launchArguments: context => {
+            launchArguments: async context => {
               if (launch !== null) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
               const args = rememberLaunchArguments(argumentVectors, options.launchArguments(context));
               if (!Number.isSafeInteger(context.port) || context.port < 1 || context.port > 65535
                 || !args.includes(`--remote-debugging-port=${context.port}`)) fail('DEBUGGER_IDENTITY_INVALID');
-              launch = { args, port: context.port }; return args;
+              await assertLinuxCdpPortUnused({ port: context.port });
+              launch = { args, port: context.port };
+              assertCdpAuthority = createLinuxFinalCdpAuthority({ port: launch.port,
+                readCurrentIdentity: async () => {
+                  const browser = await currentLinuxFinalApp(pair.images.next, temporary, launch.args, argumentVectors);
+                  verifiedApps.push(browser); return browser;
+                },
+                readIdentity: browser => readLinuxFinalAppProcessIdentity(browser.pid, pair.images.next, temporary, { expectedArguments: launch.args }),
+              });
+              return args;
+            },
+            assertCdpAuthority: context => {
+              if (assertCdpAuthority === null) fail('CDP_AUTHORITY_UNPROVEN');
+              return assertCdpAuthority(context);
             },
             onStartupDiagnostic: value => { startupDiagnostic = validateLinuxStartupDiagnostic(value); } }),
         }),
         readIdentity: async () => {
           if (launch === null) fail('PROCESS_LAUNCH_ARGUMENTS_INVALID');
+          await assertCdpAuthority({ port: launch.port });
           const browser = await currentLinuxFinalApp(pair.images.next, temporary, launch.args, argumentVectors);
           verifiedApps.push(browser); return browser;
         },
         assertSandbox: assertLinuxFinalRendererSandbox, preferences,
-        noUpdate: context => proveNoUpdate(context.cdp, context.dashboardOrigin, launch.port), preserveState,
+        noUpdate: async context => {
+          await assertCdpAuthority({ port: launch.port });
+          await proveNoUpdate(context.cdp, context.dashboardOrigin, launch.port, () => assertCdpAuthority({ port: launch.port }));
+          await assertCdpAuthority({ port: launch.port });
+        }, preserveState,
       });
     };
     const cleanIdentity = await runNormal(clean, persistLinuxNormalPackagedRestartPreferences);
@@ -589,6 +644,9 @@ export async function runLinuxFinalLifecycle() {
     receipt.chromiumRendererSandboxVerified = true;
     await uninstallImage(pair.images.next, clean, temporary);
     receipt.cleanUninstallPreservedLocalState = true;
+    // The historical predecessor may download automatically immediately after
+    // launch, so enable byte corruption before that process is started.
+    feedServer.beginCorruption();
     stage = 'public_predecessor_install';
     upgradeFixture = await fixtureWithDefaultProfile(); owned.push(upgradeFixture);
     await trustFixture(upgradeFixture, cert); await installImage(join(inputs, 'current.AppImage'), pair.images.current);
@@ -596,14 +654,20 @@ export async function runLinuxFinalLifecycle() {
     const port = await freeTcpPort();
     const predecessorArguments = rememberLaunchArguments(argumentVectors,
       [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1', '--disable-gpu']);
+    await assertLinuxCdpPortUnused({ port });
     child = spawn(IMAGE, predecessorArguments, { env: environment, shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
     child.on('error', () => {});
     predecessorStartupDiagnostics = createLinuxStartupDiagnostics({ child, sampleMount: sampleLinuxStartupFuseMount });
     child.stderr.on('data', predecessorStartupDiagnostics.feed);
-    dashboard = await connectLinuxFinalPredecessorDashboard(port);
-    await waitForLinuxFinalPredecessorDashboard(dashboard);
     const previous = await currentLinuxFinalApp(pair.images.current, temporary, predecessorArguments, argumentVectors);
-    verifiedApps.push(previous); await assertLinuxFinalRendererSandbox(previous);
+    verifiedApps.push(previous);
+    const predecessorAuthority = createLinuxFinalCdpAuthority({ port, readCurrentIdentity: async () => previous,
+      readIdentity: browser => readLinuxFinalAppProcessIdentity(browser.pid, pair.images.current, temporary, { expectedArguments: predecessorArguments }) });
+    await predecessorAuthority({ port });
+    dashboard = await connectLinuxFinalPredecessorDashboard(port, { assertCdpAuthority: () => predecessorAuthority({ port }) });
+    await predecessorAuthority({ port });
+    await waitForLinuxFinalPredecessorDashboard(dashboard);
+    await assertLinuxFinalRendererSandbox(previous);
     await predecessorStartupDiagnostics.stop(); predecessorStartupDiagnostics = null;
     await persistLinuxNormalPackagedRestartPreferences({ cdp: dashboard });
     // Ordinary startup refresh must have reached the persisted keyed observation.
@@ -612,7 +676,7 @@ export async function runLinuxFinalLifecycle() {
     const rawBefore = await digest(rawFixture);
     await dashboard.evaluate('globalThis.tibotattleDesktop.openSettings()');
     const origin = await dashboard.evaluate('location.origin');
-    settings = await connectUpdaterPage(port, url => isLinuxUpdaterSettingsURL(url, origin));
+    settings = await connectUpdaterPage(port, url => isLinuxUpdaterSettingsURL(url, origin), { assertCdpAuthority: () => predecessorAuthority({ port }) });
     await wait(() => settings.evaluate("document.querySelector('#settings-tab-about') !== null"));
     const before = await settings.evaluate('globalThis.tibotattleDesktop.getSettings()');
     if (before.about.version !== pair.images.current.version) fail('PREDECESSOR_VERSION_INVALID');
@@ -630,9 +694,9 @@ export async function runLinuxFinalLifecycle() {
       return state.status === 'error' ? state : null;
     }, 120000);
     assertLinuxFinalChecksumRejection({ update: refused, installedSha256: await digest(IMAGE),
-      expectedSha256: pair.images.current.sha256, completedTransfers: completedRejectedTransfers });
-    receipt.mismatchedFeedChecksumRefusedWithoutReplacement = true;
-    rejectChecksum = false;
+      expectedSha256: pair.images.current.sha256, completedTransfers: feedServer.counts().completedRejectedTransfers });
+    receipt.corruptUpdateArtifactRefusedWithoutReplacement = true;
+    feedServer.endCorruption();
     stage = 'settings_download';
     receipt.updateInitiation = await prepareLinuxUpdaterDownload({
       readUpdate: async () => (await settings.evaluate('globalThis.tibotattleDesktop.getSettings()')).about.update,
@@ -640,7 +704,7 @@ export async function runLinuxFinalLifecycle() {
       click: action => settings.evaluate(action === 'check' ? "document.querySelector('#settings-check-for-updates').click()" : "document.querySelector('#settings-download-update').click()"),
     });
     // Automatic download may precede Settings; require the overall actual transfer.
-    if (imageRequests < 1) fail('UPDATE_TRANSFER_MISSING');
+    if (feedServer.counts().imageRequests < 1) fail('UPDATE_TRANSFER_MISSING');
     await wait(() => settings.evaluate("(() => { const b=document.querySelector('#settings-install-update'); return b && !b.disabled && !b.hidden; })()"));
     stage = 'settings_install';
     const previousTree = await descendants(previous);
@@ -648,13 +712,21 @@ export async function runLinuxFinalLifecycle() {
     // Pinned electron-updater 6.8.9 AppImageUpdater spawns the successor with [].
     // Register before the click so a restart during an error remains owned.
     const successorArguments = rememberLaunchArguments(argumentVectors, []);
+    const startupBaseline = await captureLinuxStartupBaseline({ userData: upgradeFixture.userData });
+    const successorNotBefore = Date.now();
     await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
     await wait(async () => { try { return await digest(IMAGE) === pair.images.next.sha256; } catch { return false; } }, 60000);
     stage = 'automatic_restart';
     const successor = await currentLinuxFinalApp(pair.images.next, temporary, successorArguments, argumentVectors);
     verifiedApps.push(successor);
     if (successor.pid === previous.pid && successor.startTime === previous.startTime) fail('RESTART_IDENTITY_INVALID');
-    await wait(() => updaterProcessHealth(successor.pid), 60000);
+    const successorStartup = await waitForLinuxSuccessorStartup({ identity: successor,
+      readIdentity: () => readLinuxFinalAppProcessIdentity(successor.pid, pair.images.next, temporary, { expectedArguments: successorArguments }),
+      userData: upgradeFixture.userData, baseline: startupBaseline, version: pair.images.next.version,
+      notBefore: successorNotBefore, timeoutMs: 60000 });
+    if (!isDeepStrictEqual(successorStartup, { outcome: 'ready', attribution: 'dedicated_profile_generation' })) fail('SUCCESSOR_STARTUP_UNPROVEN');
+    receipt.automaticSuccessorStartup = 'verified_profile_generation';
+    receipt.automaticSuccessorApiHealth = 'not_observed';
     await assertLinuxFinalProcessTreeGone(previousTree);
     await assertLinuxFinalRendererSandbox(successor);
     if (await digest(rawFixture) !== rawBefore) fail('SOURCE_STATE_CHANGED');
@@ -671,6 +743,7 @@ export async function runLinuxFinalLifecycle() {
     });
     await assertNoOwnedMounts(temporary);
     receipt.coldRestartSettingsAndOptOutVerified = true;
+    receipt.controlledColdRestartAuthorizedHealth = true;
     receipt.credentialAndSourceStatePreserved = true; receipt.noUpdateVerified = true;
     stage = 'owned_uninstall';
     await uninstallImage(pair.images.next, upgradeFixture, temporary);
@@ -678,7 +751,8 @@ export async function runLinuxFinalLifecycle() {
     owned.length = 0;
     receipt.ownedUninstallAndAppCleanupVerified = true;
     receipt.artifactIntegrityVerified = await digest(join(inputs, 'next.AppImage')) === pair.images.next.sha256;
-    if (!receipt.artifactIntegrityVerified || unexpectedRequests !== 0) fail('UNEXPECTED_UPDATE_REQUEST');
+    const { feedRequests, imageRequests, unexpectedRequests, transferFailures } = feedServer.counts();
+    if (!receipt.artifactIntegrityVerified || unexpectedRequests !== 0 || transferFailures !== 0) fail('UNEXPECTED_UPDATE_REQUEST');
     receipt.status = 'passed'; receipt.feedRequests = feedRequests; receipt.imageRequests = imageRequests;
     return receipt;
   } catch (error) {

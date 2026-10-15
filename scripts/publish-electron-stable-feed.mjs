@@ -17,6 +17,7 @@ import { createProductionDeploymentLock } from '../apps/worker/scripts/productio
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SHA = /^[a-f0-9]{64}$/u;
 const MAX = 2 * 1024 ** 3;
+const R2_TRANSPORTS = new WeakSet();
 const fail = code => { throw Object.assign(new Error(`ELECTRON_STABLE_WRITER_${code}`), { code: `ELECTRON_STABLE_WRITER_${code}` }); };
 const same = (actual, expected) => expected === null ? actual === null : actual !== null && actual.sha256 === expected.sha256 && actual.bytes === expected.bytes;
 const closedError = error => /^ELECTRON_STABLE_(?:WRITER|PUBLICATION)_[A-Z_]+$/u.test(error?.code ?? '') ? error.code : 'ELECTRON_STABLE_WRITER_OPERATION_FAILED';
@@ -42,7 +43,7 @@ export function createElectronStableR2Transport({ temporaryDirectory, spawn = sp
     return target;
   };
   let count = 0;
-  return {
+  const transport = {
     async get(bucket, key) {
       targetForKey(bucket, key);
       const path = join(temporaryDirectory, `get-${count++}`);
@@ -69,33 +70,61 @@ export function createElectronStableR2Transport({ temporaryDirectory, spawn = sp
       if (result.error || result.status !== 0) fail('R2_WRITE_UNKNOWN');
     },
   };
+  R2_TRANSPORTS.add(transport);
+  return transport;
 }
 
 /** The exact prepared journal must already exist. There is no automatic retry,
  * lock acquisition/stealing, or release after uncertain remote work. */
 export async function publishElectronStableFeed({ artifactRoot, proposal, operationDirectory, approvedPlanSha256,
-  coordinationOwner, phase = 'publish', coordination, transport, readPublicObject = readElectronStablePublicObject, repositoryRoot = ROOT } = {}) {
+  coordinationOwner, phase = 'publish', coordination, transport, readPublicObject = readElectronStablePublicObject,
+  repositoryRoot = ROOT, linuxUpdateVerification } = {}) {
   if (!['publish', 'rollback'].includes(phase) || !SHA.test(approvedPlanSha256 ?? '')
       || !/^[a-f0-9]{40}$/u.test(coordinationOwner ?? '') || typeof coordination?.assertOwned !== 'function') fail('APPROVAL_INVALID');
-  const plan = await prepareElectronStablePublication({ artifactRoot, proposal });
-  if (identityDigest(plan) !== approvedPlanSha256) fail('APPROVED_PLAN_CHANGED');
-  if (phase === 'publish') {
-    const documentation = await checkReleaseNotes({ rootDirectory: repositoryRoot });
-    if (!documentation.ok || !documentation.stableTagVersions.includes(plan.version)) fail('RELEASE_DOCUMENTATION_INVALID');
-  }
-  const root = await realpath(resolve(artifactRoot));
-  const operation = await openOperation({ directory: operationDirectory, kind: 'publication', resume: true,
-    binding: { schema: plan.schemaVersion, proposal: plan.proposalSha256 } });
-  let temporaryDirectory, state;
+  // Synthetic authority/clock injection is confined to a wholly injected test
+  // transport. CLI and the real R2 adapter always use source-embedded roots.
+  if (linuxUpdateVerification !== undefined && (!transport || R2_TRANSPORTS.has(transport)
+      || readPublicObject === readElectronStablePublicObject
+      || !['get', 'put', 'delete'].every(key => typeof transport[key] === 'function')
+      || typeof readPublicObject !== 'function'
+      || !linuxUpdateVerification || Object.getPrototypeOf(linuxUpdateVerification) !== Object.prototype
+      || Object.keys(linuxUpdateVerification ?? {}).some(key => !['keys', 'now'].includes(key)))) fail('TEST_VERIFICATION_REQUIRES_ISOLATED_TRANSPORT');
+  const verificationClock = linuxUpdateVerification?.now ?? Date.now;
+  if (typeof verificationClock !== 'function') fail('VERIFICATION_TIME_INVALID');
+  let operation, temporaryDirectory, state;
   const owned = async () => { await coordination.assertOwned(coordinationOwner); };
   const save = async () => { await operation.save({ ...operation.record.state, writer: state }); };
+  const validPrior = prior => prior && ['completed', 'failed_known'].includes(prior.status)
+    && prior.phase === 'publish' && prior.intent === null && prior.approvedPlanSha256 === approvedPlanSha256
+    && prior.coordinationOwner === coordinationOwner && Number.isSafeInteger(prior.publisherVerifiedAt)
+    && prior.publisherVerifiedAt > 0;
   try {
+    let publisherVerifiedAt = verificationClock();
+    if (!Number.isSafeInteger(publisherVerifiedAt) || publisherVerifiedAt < 1) fail('VERIFICATION_TIME_INVALID');
+    if (phase === 'rollback') {
+      operation = await openOperation({ directory: operationDirectory, kind: 'publication', resume: true,
+        binding: { schema: 'tibotattle-electron-stable-publication-plan-v1', proposal: identityDigest(proposal) } });
+      const prior = operation.record.state.writer;
+      if (!validPrior(prior) || identityDigest(operation.record.state.plan) !== approvedPlanSha256) fail('RECONCILIATION_REQUIRED');
+      // Revalidate the exact approved bytes/signature at the recorded successful
+      // publication check. Expiry must not block withdrawal of an owned feed.
+      // The rollback path still restores only its journaled exact predecessors.
+      publisherVerifiedAt = prior.publisherVerifiedAt;
+    }
+    const plan = await prepareElectronStablePublication({ artifactRoot, proposal, now: () => publisherVerifiedAt,
+      ...(linuxUpdateVerification === undefined ? {} : { linuxUpdateKeys: linuxUpdateVerification.keys }) });
+    if (identityDigest(plan) !== approvedPlanSha256) fail('APPROVED_PLAN_CHANGED');
+    if (phase === 'publish') {
+      const documentation = await checkReleaseNotes({ rootDirectory: repositoryRoot });
+      if (!documentation.ok || !documentation.stableTagVersions.includes(plan.version)) fail('RELEASE_DOCUMENTATION_INVALID');
+    }
+    const root = await realpath(resolve(artifactRoot));
+    operation ??= await openOperation({ directory: operationDirectory, kind: 'publication', resume: true,
+      binding: { schema: plan.schemaVersion, proposal: plan.proposalSha256 } });
     const prior = operation.record.state.writer;
-    if (phase === 'publish' ? prior !== undefined : !prior || !['completed', 'failed_known'].includes(prior.status)
-        || prior.phase !== 'publish' || prior.intent !== null || prior.approvedPlanSha256 !== approvedPlanSha256
-        || prior.coordinationOwner !== coordinationOwner) fail('RECONCILIATION_REQUIRED');
+    if (phase === 'publish' ? prior !== undefined : !validPrior(prior)) fail('RECONCILIATION_REQUIRED');
     await owned();
-    state = { phase, status: 'running', approvedPlanSha256, coordinationOwner, intent: null, completed: [],
+    state = { phase, status: 'running', approvedPlanSha256, coordinationOwner, publisherVerifiedAt, intent: null, completed: [],
       ...(phase === 'rollback' ? { priorPublication: prior } : {}) };
     await save();
     temporaryDirectory = await mkdtemp(join(operation.directory, 'stable-write-'));
@@ -129,16 +158,28 @@ export async function publishElectronStableFeed({ artifactRoot, proposal, operat
       if (path !== null) await rm(path);
     };
     if (phase === 'publish') {
+      const renewal = plan.targets.some(target => target.feedAction === 'renew_linux_metadata');
       for (const target of plan.targets) await requireState(target.feed, target.predecessor);
       for (const target of plan.targets) for (const object of target.artifacts) {
         const before = await get(object);
         if (before !== null && !same(before, object)) fail('IMMUTABLE_CONFLICT');
+        if (renewal && before === null) fail('RENEWAL_IMMUTABLE_MISSING');
         if (before === null) await write(object, null, object);
       }
       // Re-read every immutable object before any feed changes, including reused
       // objects; public consumer verification remains a separate final readback.
       for (const target of plan.targets) for (const object of target.artifacts) await requireState(object, object);
-      for (const target of plan.targets) await write(target.feed, target.predecessor, target.feed);
+      for (const target of plan.targets) {
+        if (target.feedAction === 'preserve_exact_feed') {
+          await requireState(target.feed, target.feed);
+          continue;
+        }
+        if (target.publisherAuthentication) {
+          const checkedAt = verificationClock();
+          if (!Number.isSafeInteger(checkedAt) || target.publisherAuthentication.expiresAt <= checkedAt) fail('LINUX_PUBLISHER_METADATA_EXPIRED');
+        }
+        await write(target.feed, target.predecessor, target.feed);
+      }
     } else {
       // Matching bytes alone do not establish ownership: a failed preflight may
       // have encountered another operation's exact release. Restore only feeds
@@ -164,7 +205,7 @@ export async function publishElectronStableFeed({ artifactRoot, proposal, operat
   } finally {
     // Keep exact upload snapshots after unknown work for owner reconciliation.
     if (temporaryDirectory && state?.status !== 'unknown') await rm(temporaryDirectory, { recursive: true, force: true });
-    operation.close();
+    operation?.close();
   }
 }
 

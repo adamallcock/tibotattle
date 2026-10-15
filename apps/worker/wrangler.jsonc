@@ -88,6 +88,21 @@
       "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
       "namespace_id": "1008",
       "simple": { "limit": 1000, "period": 60 }
+    },
+    {
+      "name": "PUBLIC_PROBE_RATE_LIMIT",
+      "namespace_id": "1009",
+      "simple": { "limit": 10000, "period": 60 }
+    },
+    {
+      "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+      "namespace_id": "1010",
+      "simple": { "limit": 10000, "period": 60 }
+    },
+    {
+      "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+      "namespace_id": "1011",
+      "simple": { "limit": 10000, "period": 60 }
     }
   ],
   "durable_objects": {
@@ -222,6 +237,21 @@
           "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
           "namespace_id": "2008",
           "simple": { "limit": 20, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROBE_RATE_LIMIT",
+          "namespace_id": "2009",
+          "simple": { "limit": 60, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+          "namespace_id": "2010",
+          "simple": { "limit": 12, "period": 60 }
+        },
+        {
+          "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+          "namespace_id": "2011",
+          "simple": { "limit": 60, "period": 60 }
         }
       ],
       "durable_objects": {
@@ -436,6 +466,21 @@
           "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
           "namespace_id": "3008",
           "simple": { "limit": 3000, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROBE_RATE_LIMIT",
+          "namespace_id": "3009",
+          "simple": { "limit": 60, "period": 60 }
+        },
+        {
+          "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+          "namespace_id": "3010",
+          "simple": { "limit": 12, "period": 60 }
+        },
+        {
+          "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+          "namespace_id": "3011",
+          "simple": { "limit": 60, "period": 60 }
         }
       ],
       "durable_objects": {

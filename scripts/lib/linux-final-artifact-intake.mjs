@@ -5,16 +5,17 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { productionElectronCandidatePlan } from '../package-electron-production.mjs';
+import { LINUX_QUALIFICATION_AUTHORITY_FILES } from './linux-qualification-feed.mjs';
 
 export const LINUX_FINAL_CONFIRMATION = 'RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE';
-export const LINUX_FINAL_SCHEMA = 'tibotattle-linux-final-lifecycle-intake-v1';
-export const LINUX_FINAL_SCHEMA_V2 = 'tibotattle-linux-final-lifecycle-intake-v2';
+export const LINUX_FINAL_SCHEMA_V3 = 'tibotattle-linux-final-lifecycle-intake-v3';
+export const LINUX_FINAL_SCHEMA_V4 = 'tibotattle-linux-final-lifecycle-intake-v4';
 const FINAL_RELEASES = Object.freeze({
-  [LINUX_FINAL_SCHEMA]: Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
-    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v1',
+  [LINUX_FINAL_SCHEMA_V3]: Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v3',
     publicPredecessorUpdate: 'exact_published_0.1.26_to_final_0.1.27' }),
-  [LINUX_FINAL_SCHEMA_V2]: Object.freeze({ version: '0.1.28', buildNumber: '2026100901',
-    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v2',
+  [LINUX_FINAL_SCHEMA_V4]: Object.freeze({ version: '0.1.28', buildNumber: '2026100901',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v4',
     publicPredecessorUpdate: 'exact_published_0.1.26_to_final_0.1.28' }),
 });
 export const LINUX_FINAL_INPUT = '.release-build/linux-final-qualification';
@@ -32,23 +33,40 @@ export const exactKeys = (value, keys) => value !== null && typeof value === 'ob
   && Object.keys(value).sort().join() === [...keys].sort().join();
 export const sha256 = value => createHash('sha256').update(value).digest('hex');
 
-/** Each intake and lifecycle schema retains its original release meaning. */
+/** Intakes retain their release identity; new qualification requires separate
+ * automatic-startup and authenticated controlled-restart evidence. */
 export function resolveLinuxFinalRelease({ schemaVersion, version, buildNumber } = {}) {
   const release = typeof schemaVersion === 'string' && Object.hasOwn(FINAL_RELEASES, schemaVersion)
     ? FINAL_RELEASES[schemaVersion] : null;
   if (!release || version !== release.version || buildNumber !== release.buildNumber) fail('INTAKE_INVALID');
   return release;
 }
-export function validateLinuxFinalIntake(value) {
+export function validLinuxFinalSignedFeedDescriptor(value) {
+  return exactKeys(value, ['file', 'bytes', 'sha256']) && value.file === 'latest-linux.yml'
+    && Number.isSafeInteger(value.bytes) && value.bytes > 0 && value.bytes <= 64 * 1024
+    && typeof value.sha256 === 'string' && HASH.test(value.sha256);
+}
+export function decodeLinuxFinalSignedFeed(value) {
+  if (!exactKeys(value, ['file', 'bytes', 'sha256', 'base64']) || typeof value.base64 !== 'string'
+    || value.base64.length > 87384 || value.base64.length === 0) fail('SIGNED_FEED_INVALID');
+  const { base64, ...descriptor } = value;
+  const bytes = Buffer.from(base64, 'base64');
+  if (!validLinuxFinalSignedFeedDescriptor(descriptor) || bytes.toString('base64') !== base64
+    || bytes.length !== value.bytes || sha256(bytes) !== value.sha256) fail('SIGNED_FEED_INVALID');
+  return bytes;
+}
+function validateIntake(value, withFeedPayload) {
   const keys = ['schemaVersion', 'runnerRevision', 'sourceRevision', 'version', 'buildNumber',
     'packageRunId', 'packageRunnerRevision', 'sourceCandidateSha256', 'packageReceiptSha256',
-    'artifactSha256', 'artifactBytes', 'asarSha256', 'executableSha256', 'sourceCandidate'];
+    'artifactSha256', 'artifactBytes', 'asarSha256', 'executableSha256', 'sourceCandidate', 'signedFeed'];
   if (!exactKeys(value, keys)
     || !['runnerRevision', 'sourceRevision', 'packageRunnerRevision'].every(k => SHA.test(value[k] ?? ''))
     || !['sourceCandidateSha256', 'packageReceiptSha256', 'artifactSha256', 'asarSha256', 'executableSha256'].every(k => HASH.test(value[k] ?? ''))
     || typeof value.packageRunId !== 'string' || !/^[1-9][0-9]{0,14}$/u.test(value.packageRunId)
     || !Number.isSafeInteger(value.artifactBytes) || value.artifactBytes < 4096 || value.artifactBytes > 1024 ** 3) fail('INTAKE_INVALID');
   const release = resolveLinuxFinalRelease(value);
+  if (withFeedPayload) decodeLinuxFinalSignedFeed(value.signedFeed);
+  else if (!validLinuxFinalSignedFeedDescriptor(value.signedFeed)) fail('SIGNED_FEED_INVALID');
   const plan = productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision: value.sourceRevision,
     buildNumber: value.buildNumber, hostPlatform: 'linux', hostArchitecture: 'x64' });
   // The closed historical route must not inherit the running checkout's newer
@@ -59,6 +77,17 @@ export function validateLinuxFinalIntake(value) {
     status: 'production_source_staged',
     stagedManifest: 'app/package.json', runtimeManifest: 'app/electron-runtime-manifest.json' })) fail('SOURCE_CANDIDATE_INVALID');
   return value;
+}
+export const validateLinuxFinalIntake = value => validateIntake(value, true);
+export function linuxFinalPreparedIntake(value) {
+  validateLinuxFinalIntake(value);
+  const { base64, ...signedFeed } = value.signedFeed;
+  return { ...value, signedFeed };
+}
+export function assertLinuxFinalPreparedIntakeMatches(pair, intake) {
+  validateLinuxFinalPair(pair, intake?.runnerRevision);
+  if (!isDeepStrictEqual(pair.intake, linuxFinalPreparedIntake(intake))) fail('INPUT_CHANGED');
+  return true;
 }
 export function parseLinuxFinalIntake(serialized) {
   if (typeof serialized !== 'string' || Buffer.byteLength(serialized) > 64 * 1024) fail('INTAKE_INVALID');
@@ -108,12 +137,23 @@ export function validateLinuxFinalPackageReceipt(value, intake, sourceBytes) {
     || !/^[A-Za-z0-9+/]{86}==$/u.test(value.artifact.sha512 ?? '')) fail('PACKAGE_RECEIPT_INVALID');
   return value;
 }
+export function validateLinuxFinalPackagedAuthority(authority) {
+  if (!exactKeys(authority, ['schemaVersion', 'status', 'files'])
+    || authority.schemaVersion !== 'tibotattle-linux-qualification-authority-v1'
+    || authority.status !== 'packaged_source_matches_reviewed_authority'
+    || !Array.isArray(authority.files) || authority.files.length !== LINUX_QUALIFICATION_AUTHORITY_FILES.length
+    || !authority.files.every((row, index) => exactKeys(row, ['file', 'bytes', 'sha256'])
+      && row.file === LINUX_QUALIFICATION_AUTHORITY_FILES[index] && Number.isSafeInteger(row.bytes)
+      && row.bytes > 0 && row.bytes <= 1024 ** 2 && typeof row.sha256 === 'string' && HASH.test(row.sha256))) fail('PAIR_INVALID');
+  return authority;
+}
 export function validateLinuxFinalPair(value, runnerRevision) {
-  if (!exactKeys(value, ['schemaVersion', 'intake', 'predecessorManifestSha256', 'images'])
-    || value.schemaVersion !== 'tibotattle-linux-final-artifact-pair-v1'
+  if (!exactKeys(value, ['schemaVersion', 'intake', 'predecessorManifestSha256', 'images', 'packagedAuthority'])
+    || value.schemaVersion !== 'tibotattle-linux-final-artifact-pair-v2'
     || value.predecessorManifestSha256 !== LINUX_FINAL_PREDECESSOR.manifestSha256
     || !exactKeys(value.images, ['current', 'next'])) fail('PAIR_INVALID');
-  const intake = validateLinuxFinalIntake(value.intake);
+  const intake = validateIntake(value.intake, false);
+  validateLinuxFinalPackagedAuthority(value.packagedAuthority);
   if (intake.runnerRevision !== runnerRevision) fail('RUNNER_INVALID');
   for (const role of ['current', 'next']) {
     const row = value.images[role];

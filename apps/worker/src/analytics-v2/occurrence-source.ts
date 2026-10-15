@@ -895,9 +895,11 @@ function v12CandidatesSql(s: string): string {
  * for each 200-id batch (about 1.7 s a batch for a 300,000-record owner: a
  * read quadratic in owner size). Here the participant's ready manifests are
  * fenced first, each is probed once on its (manifest_id, stream,
- * occurrence_id) key for the batch's ids, and each matched record is then
- * checked against the same joins in a fenced LATERAL (OFFSET 0 keeps it per
- * record). The manifest filter is implied by the joins it precedes
+ * occurrence_id) key for the batch's ids. Eligibility depends only on each
+ * matched record's (chunk_id, manifest_id), so the same fenced LATERAL runs
+ * once per distinct matched pair. Its full row multiplicity is retained and
+ * joined back on both record keys before grouping. The manifest filter is
+ * implied by the joins it precedes
  * (manifest.participant_id = chunk.participant_id =
  * generation.participant_id = $1, state ready), so the rows, their
  * multiplicity and the grouping below are unchanged.
@@ -910,7 +912,8 @@ function v12OccurrencesSql(s: string): string {
       SELECT owned.id FROM ${s}.telemetry_v12_day_manifests owned
        WHERE owned.participant_id=$1 AND owned.state='ready'
     ), matched AS MATERIALIZED (
-      SELECT probe.id,wanted.sub_batch FROM owner_manifests owned
+      SELECT probe.id,wanted.sub_batch,matched_record.chunk_id,matched_record.manifest_id
+        FROM owner_manifests owned
         CROSS JOIN LATERAL (
           SELECT r.id FROM ${s}.telemetry_v12_typed_records r
            WHERE r.manifest_id=owned.id AND r.stream=$2
@@ -920,14 +923,15 @@ function v12OccurrencesSql(s: string): string {
       JOIN requested wanted ON wanted.occurrence_id=matched_record.occurrence_id
     ), retained_auth AS MATERIALIZED (
       ${v12RetainedAuthorizationScopeSql(s, "$3::timestamptz", "reader")}
-    ), eligible AS MATERIALIZED (
-      SELECT matched.sub_batch,r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
-        FROM matched
-        JOIN ${s}.telemetry_v12_typed_records r ON r.id=matched.id
+    ), matched_pairs AS MATERIALIZED (
+      SELECT DISTINCT chunk_id,manifest_id FROM matched
+    ), eligible_pairs AS MATERIALIZED (
+      SELECT pair.chunk_id,pair.manifest_id,scope.source_device_id
+        FROM matched_pairs pair
         CROSS JOIN LATERAL (
           SELECT generation.device_id AS source_device_id
             FROM ${s}.telemetry_v12_chunks chunk
-            JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=r.manifest_id
+            JOIN ${s}.telemetry_v12_day_manifests manifest ON manifest.id=pair.manifest_id
              AND manifest.participant_id=chunk.participant_id AND manifest.device_id=chunk.device_id
              AND manifest.state='ready'
             JOIN ${s}.telemetry_v12_domain_days domain_day ON domain_day.manifest_id=manifest.id
@@ -936,12 +940,17 @@ function v12OccurrencesSql(s: string): string {
              AND generation.participant_id=chunk.participant_id AND generation.device_id=chunk.device_id
             JOIN retained_auth ON retained_auth.participant_id=generation.participant_id
              AND retained_auth.device_id=generation.device_id
-           WHERE chunk.id=r.chunk_id AND chunk.manifest_id=r.manifest_id AND chunk.stream=$2
+           WHERE chunk.id=pair.chunk_id AND chunk.manifest_id=pair.manifest_id AND chunk.stream=$2
              AND chunk.record_count=(SELECT count(*) FROM ${s}.telemetry_v12_typed_records complete
                WHERE complete.chunk_id=chunk.id)
              AND generation.participant_id=$1
           OFFSET 0
         ) scope
+    ), eligible AS MATERIALIZED (
+      SELECT matched.sub_batch,r.id,r.occurrence_id,r.observed_at_ms,r.canonical_digest,scope.source_device_id
+        FROM matched
+        JOIN ${s}.telemetry_v12_typed_records r ON r.id=matched.id
+        JOIN eligible_pairs scope ON scope.chunk_id=r.chunk_id AND scope.manifest_id=r.manifest_id
     ), grouped AS MATERIALIZED (
       SELECT min(id) AS id,sub_batch FROM eligible
        GROUP BY sub_batch,source_device_id,occurrence_id,observed_at_ms,canonical_digest

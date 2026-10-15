@@ -16,6 +16,7 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
+import { localRequest } from "./local-request.js";
 import {
   codexCacheReasoningConfiguration,
   REVIEWED_CODEX_MODEL_IDS,
@@ -6648,7 +6649,7 @@ export function normalizeBackendReadiness(payload) {
 }
 
 export class LocalCompanionClient {
-  constructor({ fetchImpl = globalThis.fetch } = {}) {
+  constructor({ fetchImpl = localRequest } = {}) {
     // Browser-native fetch is receiver-sensitive: invoked as a property of
     // this client it throws "Illegal invocation" (WebKit: "Can only call
     // Window.fetch on instances of Window") before any request leaves the
@@ -7142,13 +7143,22 @@ export class LocalCompanionClient {
 }
 
 export class CommunityClient {
+  #enrollmentContinuation = null;
+  #enrollmentGeneration = 0;
+
   constructor({
-    fetchImpl = globalThis.fetch,
+    fetchImpl = localRequest,
     getCsrfToken = () => null
   } = {}) {
     // Detached for the same reason as LocalCompanionClient: browser-native
     // fetch throws when invoked with this client as its receiver.
-    this.fetchImpl = (...args) => fetchImpl(...args);
+    this.fetchImpl = (...args) => {
+      if (![`${CENTRAL_ROOT}/enroll`, `${CENTRAL_ROOT}/me/device-pairings`].includes(args[0])) {
+        this.#enrollmentContinuation = null;
+        this.#enrollmentGeneration += 1;
+      }
+      return fetchImpl(...args);
+    };
     this.getCsrfToken = getCsrfToken;
   }
 
@@ -7183,6 +7193,8 @@ export class CommunityClient {
     contributionSchemaVersion = "telemetry-contribution-v0.1",
     { deviceBootstrap = false, identity = null } = {}
   ) {
+    this.#enrollmentContinuation = null;
+    const generation = ++this.#enrollmentGeneration;
     if (typeof deviceBootstrap !== "boolean") {
       throw new TypeError("Enrollment device bootstrap selection is invalid.");
     }
@@ -7212,12 +7224,24 @@ export class CommunityClient {
       };
     }
     if (typeof inviteCode === "string" && inviteCode.length > 0) body.inviteCode = inviteCode;
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/enroll`, {
+    let continuation = null;
+    const payload = await fetchJson(async (...args) => {
+      const response = await this.fetchImpl(...args);
+      const candidate = response.headers?.get?.("X-TiboTattle-Enrollment-Continuation");
+      if (response.ok && typeof candidate === "string" && /^[A-Za-z0-9_-]{43}$/u.test(candidate)) {
+        continuation = candidate;
+      }
+      return response;
+    }, `${CENTRAL_ROOT}/enroll`, {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
+    if (continuation !== null && generation === this.#enrollmentGeneration) {
+      this.#enrollmentContinuation = { token: continuation, expiresAt: Date.now() + 30_000 };
+    }
+    return payload;
   }
 
   /**
@@ -7247,9 +7271,16 @@ export class CommunityClient {
   }
 
   createDevicePairing(accountScoped = false) {
+    const continuation = this.#enrollmentContinuation;
+    this.#enrollmentContinuation = null;
+    this.#enrollmentGeneration += 1;
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-pairings`, this.mutationOptions({
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(continuation !== null && continuation.expiresAt > Date.now()
+          ? { "X-TiboTattle-Enrollment-Continuation": continuation.token } : {}),
+      },
       body: JSON.stringify({
         // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's
         // pairing requests the v1.0 incremental consent identifier. The

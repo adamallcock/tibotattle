@@ -1079,6 +1079,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
   for (const forbiddenAsset of [
     "app.js",
     "data-client.js",
+    "local-request.js",
     "lib.js",
     "work-usage-view.js",
     "navigation.js",
@@ -1341,6 +1342,7 @@ test("checked-in public source satisfies the complete release contract", async (
   for (const privateModule of [
     "app.js",
     "data-client.js",
+    "local-request.js",
     "lib.js",
     "work-usage-view.js",
     "navigation.js",
@@ -1400,6 +1402,28 @@ test("release-site build rejects an unreviewed script reference", async (t) => {
   await assert.rejects(
     buildFixtureSite(releaseArgs(value)),
     /Public HTML may load only community\.js/u,
+  );
+});
+
+test("release-site build rejects private local paths before staging public assets", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  await writeFile(
+    join(value.source, "community.html"),
+    `${sourceHtml()}<!-- /Users/synthetic-canary/receipt.json -->\n`,
+  );
+
+  await assert.rejects(buildFixtureSite(releaseArgs(value)), (error) => {
+    assert.match(
+      error.message,
+      /Public release source community\.html:\d+: private local paths and file URLs are forbidden/u,
+    );
+    assert.doesNotMatch(error.message, /synthetic-canary/u);
+    return true;
+  });
+  await assert.rejects(
+    readFile(join(value.output, "release-site-manifest.json")),
+    { code: "ENOENT" },
   );
 });
 

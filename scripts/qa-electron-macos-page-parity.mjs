@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { fetchRendererJson } from "./lib/authorized-renderer-fetch.mjs";
 
 const APP_NAME = "TiboTattle Dev";
 const RECEIPT_SCHEMA_VERSION = "tibotattle-electron-macos-page-parity-qa-v2";
@@ -402,7 +403,7 @@ async function freeLoopbackPort() {
   return port;
 }
 
-async function jsonFetch(url, reason, stage) {
+async function debugJsonFetch(url, reason, stage) {
   return withTimeout(fetch(url, { cache: "no-store" }).then(async (response) => {
     if (!response.ok) throw fixedError(reason, stage);
     return response.json();
@@ -717,8 +718,10 @@ async function inspectPage(cdp, spec, screenshots, outputDirectory, refreshState
   });
 }
 
-async function refreshPresentationState(origin) {
-  const status = await jsonFetch(new URL("/api/local/refresh", origin), "page_render_invalid", "pages");
+async function refreshPresentationState(cdp, origin) {
+  const status = await fetchRendererJson(cdp, new URL("/api/local/refresh", origin), {
+    timeoutMs: OPERATION_TIMEOUT_MS,
+  }).catch(() => { throw fixedError("page_render_invalid", "pages"); });
   const value = status?.refresh?.status;
   if (value === "succeeded") return "fresh";
   if (value === "running" || value === "cancelling") return "initial_refresh";
@@ -784,7 +787,7 @@ async function openSettings(cdp, port, origin, smoke) {
   })()`);
   if (clicked !== true) throw fixedError("settings_target_unavailable", "settings");
   const target = await waitFor(async () => {
-    const targets = await jsonFetch(`http://127.0.0.1:${port}/json`, "settings_target_unavailable", "settings");
+    const targets = await debugJsonFetch(`http://127.0.0.1:${port}/json`, "settings_target_unavailable", "settings");
     return smoke.selectMacSettingsTarget(targets, origin, port);
   }, STARTUP_TIMEOUT_MS, "settings_target_unavailable", "settings");
   const settings = await connectCdp(target);
@@ -1071,9 +1074,9 @@ async function runNativeCuaHandoff(args) {
     });
     child.on("error", () => {});
     if (!child.pid) throw fixedError("launch_failed", "launch");
-    await waitFor(() => jsonFetch(`http://127.0.0.1:${port}/json/version`, "remote_debugging_unavailable", "launch"), STARTUP_TIMEOUT_MS, "remote_debugging_unavailable", "launch");
+    await waitFor(() => debugJsonFetch(`http://127.0.0.1:${port}/json/version`, "remote_debugging_unavailable", "launch"), STARTUP_TIMEOUT_MS, "remote_debugging_unavailable", "launch");
     const target = await waitFor(async () => smoke.selectMacDashboardTarget(
-      await jsonFetch(`http://127.0.0.1:${port}/json`, "dashboard_target_unavailable", "dashboard"), port,
+      await debugJsonFetch(`http://127.0.0.1:${port}/json`, "dashboard_target_unavailable", "dashboard"), port,
     ), STARTUP_TIMEOUT_MS, "dashboard_target_unavailable", "dashboard");
     const origin = new URL(target.url).origin;
     cdp = await connectCdp(target);
@@ -1181,9 +1184,9 @@ async function runPageParity(args) {
     });
     child.on("error", () => {});
     if (!child.pid) throw fixedError("launch_failed", "launch");
-    await waitFor(() => jsonFetch(`http://127.0.0.1:${port}/json/version`, "remote_debugging_unavailable", "launch"), STARTUP_TIMEOUT_MS, "remote_debugging_unavailable", "launch");
+    await waitFor(() => debugJsonFetch(`http://127.0.0.1:${port}/json/version`, "remote_debugging_unavailable", "launch"), STARTUP_TIMEOUT_MS, "remote_debugging_unavailable", "launch");
     const target = await waitFor(async () => smoke.selectMacDashboardTarget(
-      await jsonFetch(`http://127.0.0.1:${port}/json`, "dashboard_target_unavailable", "dashboard"), port,
+      await debugJsonFetch(`http://127.0.0.1:${port}/json`, "dashboard_target_unavailable", "dashboard"), port,
     ), STARTUP_TIMEOUT_MS, "dashboard_target_unavailable", "dashboard");
     const origin = new URL(target.url).origin;
     cdp = await connectCdp(target);
@@ -1204,10 +1207,10 @@ async function runPageParity(args) {
       && document.title === "TiboTattle" && (document.querySelector("#overview-title")?.textContent?.trim().length ?? 0) > 0)()`), STARTUP_TIMEOUT_MS, "dashboard_unavailable", "dashboard");
 
     const { pages, screenshots } = progress;
-    pages.overview = await inspectPage(cdp, { key: "overview", nav: "overview", page: "#overview", heading: "#overview-title", primary: "#quota-cards", secondary: "#setup-card", surface: { chart: "data", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(origin));
-    pages.allowance = await inspectPage(cdp, { key: "allowance", nav: "weekly", page: "#weekly", heading: "#weekly-title", primary: "#weekly-chart", secondary: "#weekly-empty", surface: { chart: "chart", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(origin));
-    pages.trends = await inspectPage(cdp, { key: "trends", nav: "trends", page: "#timeline", heading: "#timeline-title", primary: "#timeline-chart", secondary: "#timeline-empty", surface: { chart: "chart", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(origin));
-    await waitFor(async () => (await refreshPresentationState(origin)) === "fresh", STARTUP_TIMEOUT_MS, "page_render_invalid", "pages");
+    pages.overview = await inspectPage(cdp, { key: "overview", nav: "overview", page: "#overview", heading: "#overview-title", primary: "#quota-cards", secondary: "#setup-card", surface: { chart: "data", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(cdp, origin));
+    pages.allowance = await inspectPage(cdp, { key: "allowance", nav: "weekly", page: "#weekly", heading: "#weekly-title", primary: "#weekly-chart", secondary: "#weekly-empty", surface: { chart: "chart", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(cdp, origin));
+    pages.trends = await inspectPage(cdp, { key: "trends", nav: "trends", page: "#timeline", heading: "#timeline-title", primary: "#timeline-chart", secondary: "#timeline-empty", surface: { chart: "chart", empty: "empty" } }, screenshots, args.screenshotsDirectory, await refreshPresentationState(cdp, origin));
+    await waitFor(async () => (await refreshPresentationState(cdp, origin)) === "fresh", STARTUP_TIMEOUT_MS, "page_render_invalid", "pages");
     pages.usage = await inspectPage(cdp, { key: "usage", nav: "method", page: "#accounting", heading: "#accounting-title", primary: "#cache-reuse-outcome", secondary: "#cache-switch-details", surface: { chart: "data", empty: "empty" } }, screenshots, args.screenshotsDirectory, "fresh");
 
     progress.cacheLinks = await inspectPackagedCacheLinks(cdp);

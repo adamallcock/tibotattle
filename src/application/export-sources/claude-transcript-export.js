@@ -32,14 +32,13 @@ const CLAUDE_TRANSCRIPT_PLAN_CHECKPOINT_VERSION = "claude-transcript-plan-checkp
 
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const MAXIMUM_SESSION_ID_BYTES = 4096;
-// A line over the line limit can matter only if it can become a usage row:
-// rowIdentity keeps assistant records whose message carries `usage`. JSON
-// escapes every quote inside a string, so the unescaped `"usage"` token
-// appears only as a key (or a bare "usage" value). A line without it cannot
-// produce a row; the bounded reader skips it and the resource guard counts it
-// as an oversized irrelevant line instead of failing the whole export. A line
-// that may carry usage still fails closed at the limit.
-const OVERSIZED_RELEVANCE_NEEDLES = Object.freeze(['"usage"']);
+// rowIdentity keeps assistant records whose message carries `usage`. A JSON
+// spelling of that key contains either the literal token or a Unicode escape.
+// Treat every Unicode escape as potentially relevant, including escapes inside
+// unrelated values, rather than dropping an escaped usage key. Only complete
+// lines containing neither needle can be skipped and counted as oversized
+// irrelevant lines; potentially relevant lines still fail at the same limit.
+const OVERSIZED_RELEVANCE_NEEDLES = Object.freeze(['"usage"', "\\u"]);
 const SAFE_CODES = new Set([
   "configuration", "root_unsafe", "source_unsafe", "source_changed", "source_prefix",
   "source_bound", "plan_invalid", "cursor_invalid", "record_invalid",
@@ -140,6 +139,7 @@ async function completeLinePrefixBytes(handle, size, maximumLineBytes, resourceG
     scanned += bytesRead;
     const newline = buffer.lastIndexOf(0x0a);
     if (newline !== -1) return start + newline + 1;
+    if (scanned > maximumLineBytes) throw new ExportResourceLimitError("line_bytes");
     end = start;
   }
   return 0;

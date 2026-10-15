@@ -393,6 +393,54 @@ test("Claude transcript export skips and counts oversized lines that cannot carr
   }
 });
 
+test("Claude transcript escaped usage keys obey the exact line limit in planning and scanning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-transcript-escaped-usage-boundary-"));
+  const path = join(root, "records.jsonl");
+  try {
+    for (const escapedKey of ['"\\u0075sage"', '"u\\u0073age"', '"\\u0075\\u0073\\u0061\\u0067\\u0065"']) {
+      const record = JSON.stringify(assistant("2026-07-24T12:10:00.000Z"))
+        .replace('"usage"', escapedKey);
+      assert.equal(record.includes('"usage"'), false);
+      assert.deepEqual(JSON.parse(record).message.usage, assistant("2026-07-24T12:10:00.000Z").message.usage);
+      for (const ending of ["\n", "\r\n"]) {
+        const maximumLineBytes = Buffer.byteLength(record) + ending.length - 1;
+        await writeFile(path, `${record}${ending}`, { mode: 0o600 });
+        const planGuard = guard({ maximumLineBytes });
+        const plan = await createClaudeTranscriptExportSourcePlan({
+          projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET,
+          resourceGuard: planGuard,
+        });
+        assert.equal(plan.sources[0].selectedMessages, 1);
+        assert.equal(planGuard.snapshot().counters.oversizedIrrelevantLines, 0);
+        const scanned = await scanClaudeTranscriptExportSource(plan, plan.sources[0].sourceKey, {
+          secret: SECRET, maximumCandidateRecords: 10, resourceGuard: guard({ maximumLineBytes }),
+        });
+        assert.equal(scanned.complete, true);
+        assert.equal(scanned.candidates.length, 1);
+        assert.equal(scanned.candidates[0].components.outputCombinedTokens, 19);
+        await writeFile(path, `${record} ${ending}`, { mode: 0o600 });
+        await assert.rejects(
+          createClaudeTranscriptExportSourcePlan({
+            projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET,
+            resourceGuard: guard({ maximumLineBytes }),
+          }),
+          (error) => error.code === "export_resource_line_bytes",
+        );
+        await writeFile(path, `${record}${ending}`, { mode: 0o600 });
+        await assert.rejects(
+          scanClaudeTranscriptExportSource(plan, plan.sources[0].sourceKey, {
+            secret: SECRET, maximumCandidateRecords: 10,
+            resourceGuard: guard({ maximumLineBytes: maximumLineBytes - 1 }),
+          }),
+          (error) => error.code === "export_resource_line_bytes",
+        );
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Claude transcript planning rejects hard links and oversized unterminated structured lines", async () => {
   const linked = await fixture();
   try {
@@ -417,6 +465,99 @@ test("Claude transcript planning rejects hard links and oversized unterminated s
       }),
       (error) => error.code === "export_resource_line_bytes",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude transcript planning enforces the exact unfinished line limit without a preceding newline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-transcript-tail-boundary-"));
+  const maximumLineBytes = 128;
+  const path = join(root, "records.jsonl");
+  const createPlan = () => createClaudeTranscriptExportSourcePlan({
+    projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET,
+    resourceGuard: guard({ maximumLineBytes }),
+  });
+  try {
+    for (const bytes of [0, maximumLineBytes]) {
+      await writeFile(path, bytes === 0 ? "" : `{${"x".repeat(bytes - 1)}`, { mode: 0o600 });
+      const plan = await createPlan();
+      assert.equal(plan.sourceCount, 1);
+      assert.equal(plan.totalBytes, 0);
+      assert.equal(plan.sources[0].prefixBytes, 0);
+      assert.equal(plan.sources[0].prefixLineCount, 0);
+      assert.equal(plan.sources[0].selectedMessages, 0);
+    }
+    for (const bytes of [maximumLineBytes + 1, maximumLineBytes + 2]) {
+      await writeFile(path, `{${"x".repeat(bytes - 1)}`, { mode: 0o600 });
+      await assert.rejects(createPlan(), (error) => error.code === "export_resource_line_bytes");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude transcript tail admission preserves the frozen complete prefix at the exact line limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-transcript-frozen-tail-boundary-"));
+  const completePrefix = `${JSON.stringify(assistant("2026-07-24T12:10:00.000Z"))}\n`;
+  const maximumLineBytes = Buffer.byteLength(completePrefix);
+  const path = join(root, "records.jsonl");
+  const createPlan = () => createClaudeTranscriptExportSourcePlan({
+    projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET,
+    resourceGuard: guard({ maximumLineBytes }),
+  });
+  try {
+    await writeFile(path, completePrefix, { mode: 0o600 });
+    const frozen = await createPlan();
+    assert.equal(frozen.sources[0].selectedMessages, 1);
+    await appendFile(path, `{${"x".repeat(maximumLineBytes - 1)}`);
+    const withTail = await createPlan();
+    assert.equal(withTail.planSha256, frozen.planSha256);
+    assert.equal(withTail.sources[0].prefixBytes, frozen.sources[0].prefixBytes);
+    assert.equal(withTail.sources[0].prefixLineCount, frozen.sources[0].prefixLineCount);
+    assert.equal(withTail.sources[0].prefixSha256, frozen.sources[0].prefixSha256);
+    assert.equal(withTail.sources[0].selectedMessages, 1);
+    await appendFile(path, "x");
+    await assert.rejects(createPlan(), (error) => error.code === "export_resource_line_bytes");
+    const verified = await verifyClaudeTranscriptExportSource(frozen, frozen.sources[0].sourceKey, {
+      secret: SECRET, resourceGuard: guard({ maximumLineBytes }),
+    });
+    assert.equal(verified.complete, true);
+    assert.equal(verified.cursor.nextByte, Buffer.byteLength(completePrefix));
+    assert.equal(verified.cursor.nextLineOrdinal, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude transcript complete line admission counts CR bytes at the exact line limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-transcript-complete-line-boundary-"));
+  const maximumLineBytes = 128;
+  const path = join(root, "records.jsonl");
+  const emptyRecord = JSON.stringify({ type: "user", message: { usage: null }, padding: "" });
+  const createPlan = () => createClaudeTranscriptExportSourcePlan({
+    projectsDirectory: root, startAt: START_AT, endAt: END_AT, secret: SECRET,
+    resourceGuard: guard({ maximumLineBytes }),
+  });
+  try {
+    for (const ending of ["\n", "\r\n"]) {
+      for (const extraBytes of [0, 1]) {
+        const record = JSON.stringify({
+          type: "user",
+          message: { usage: null },
+          padding: "x".repeat(maximumLineBytes - Buffer.byteLength(emptyRecord) - (ending.length - 1) + extraBytes),
+        });
+        await writeFile(path, `${record}${ending}`, { mode: 0o600 });
+        if (extraBytes === 1) {
+          await assert.rejects(createPlan(), (error) => error.code === "export_resource_line_bytes");
+        } else {
+          const plan = await createPlan();
+          assert.equal(plan.sources[0].prefixBytes, maximumLineBytes + 1);
+          assert.equal(plan.sources[0].prefixLineCount, 1);
+          assert.equal(plan.sources[0].selectedMessages, 0);
+        }
+      }
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

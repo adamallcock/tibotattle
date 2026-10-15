@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { PassThrough } from "node:stream";
 
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import { DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION } from "../desktop-first-run.js";
@@ -62,6 +63,7 @@ class FakeChild extends EventEmitter {
     super();
     this.stdout = new EventEmitter();
     this.stderr = new EventEmitter();
+    this.stdio = [null, this.stdout, this.stderr, null, null, new PassThrough()];
   }
 
   kill() {
@@ -116,9 +118,19 @@ class FakeApp extends EventEmitter {
 }
 
 class FakeWebContents extends EventEmitter {
+  static nextId = 1;
+
   constructor() {
     super();
-    this.session = {};
+    this.id = FakeWebContents.nextId++;
+    this.session = {
+      webRequest: {
+        onBeforeSendHeaders: (filter, listener) => {
+          this.requestHeadersFilter = filter;
+          this.requestHeadersListener = listener;
+        },
+      },
+    };
     this.mainFrame = { isMainFrame: true, parent: null };
     this.commands = [];
     this.url = "";
@@ -392,6 +404,7 @@ async function launchFixture({
   app: suppliedApp,
   runtimeOverrides = {},
   lifecycleOptions = {},
+  supervisorOptions = {},
   accountlessLaboratory,
   accountlessProduction,
   accountlessHostedRehearsal,
@@ -459,6 +472,7 @@ async function launchFixture({
     sharingInstallationState,
     ...(isolatedRehearsal ? {} : { settingsBackend: backend }),
     supervisorOptions: {
+      ...supervisorOptions,
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
         onSpawn({ args: [...args], options });
@@ -495,7 +509,7 @@ test("normal desktop cannot enable accountless uploads through environment varia
   } });
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"]);
   assert.equal(productionUpdaterLoads, 0, "ordinary desktop startup never loads the production updater");
   await fixture.desktop.lifecycle.requestQuit();
 });
@@ -547,7 +561,7 @@ test("compiled hosted rehearsal owns every history, state and private scheduler 
   const environment = fixture.spawnCalls[0].options.env;
   const root = join(profile, "accountless-hosted-rehearsal-v1");
   const syntheticHome = join(root, "synthetic-home");
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   assert.equal(environment.HOME, syntheticHome);
   assert.equal(environment.USERPROFILE, syntheticHome);
   assert.equal(environment.CODEX_HOME, join(syntheticHome, ".codex"));
@@ -885,7 +899,7 @@ test("macOS production runtime connects updater controls to protected preference
   assert.equal(app.quitCalls, 0);
 });
 
-test("Linux production runtime loads electron-updater instead of a native-shaped updater", async (t) => {
+test("Linux production runtime retains its pinned adapter but closes unprovisioned update trust", async (t) => {
   const profile = await mkdtemp(join(tmpdir(), "linux-production-updater-runtime-"));
   const app = new FakeApp();
   app.isPackaged = true;
@@ -896,9 +910,9 @@ test("Linux production runtime loads electron-updater instead of a native-shaped
   nativeAutoUpdater.checkForUpdates = () => {};
   nativeAutoUpdater.quitAndInstall = () => {};
   const updater = new EventEmitter();
-  updater.checkForUpdates = async () => null;
-  updater.downloadUpdate = async () => [];
-  updater.quitAndInstall = () => {};
+  updater.checkForUpdates = async () => { assert.fail("unprovisioned trust must not contact a feed"); };
+  updater.downloadUpdate = async () => { assert.fail("unprovisioned trust must not download"); };
+  updater.quitAndInstall = () => { assert.fail("unprovisioned trust must not install"); };
   let updaterLoads = 0;
   let fixture;
   t.after(async () => {
@@ -1127,7 +1141,7 @@ test("handover rehearsal keeps the packaged updater but omits the FD3 accountles
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(checks >= 1);
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"]);
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, undefined);
 });
@@ -1548,7 +1562,7 @@ test("Windows native accountless recovery remains FD3-only and never initializes
     childFactory: () => new FakeIpcChild(),
   });
   assert.equal(factoryCalls, 1);
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   assert.equal(Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_KEYCHAIN_BROKER_FD"), false);
   assert.equal(Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_WINDOWS_ACCOUNTLESS_CREDENTIAL"), false);
   fixture.children[0].emit("message", {
@@ -1677,7 +1691,7 @@ test("Linux production accountless startup uses only FD3 and never initializes s
     ownedCompanionScript: fileURLToPath(new URL("../../../test/fixtures/accountless-runtime-child.mjs", import.meta.url)),
   });
   assert.equal(factoryCalls, 1);
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   assert.equal(
     Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_KEYCHAIN_BROKER_FD"),
     false,
@@ -1778,7 +1792,7 @@ process.once("SIGTERM", async () => { await scheduler.stop(); bridge.dispose(); 
     },
     ownedCompanionScript: recoveryChild,
   });
-  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   assert.ok(["present", "unavailable"].includes(await legacyCredentialProbe()));
   const deadline = Date.now() + 5_000;
   let transportStatus;
@@ -1893,7 +1907,7 @@ for (const production of [false, true]) test(`desktop ${production ? "production
   };
   const first = await launchFixture(options);
   launched.push(first);
-  assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   if (production) {
     await waitFor(async () =>
       (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
@@ -2020,7 +2034,7 @@ test("compiled hosted rehearsal keeps the real private scheduler default-on, ret
   try {
     const first = await launchFixture(options);
     launched.push(first);
-    assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+    assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
     assert.equal(first.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN,
       DEPLOYMENT_ENDPOINTS.staging.origin);
     assert.equal(first.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, "rehearsal-v1");
@@ -2401,11 +2415,37 @@ test("runtime rejects a root path written in the wrong host grammar before spawn
 
 test("runtime wires safe browser, diagnostics, and local-data actions", async () => {
   const external = [];
+  const browserPreparation = [];
+  const operationAuthorization = "A".repeat(43);
   const revealed = [];
   const copied = [];
   const dialogs = [];
   const fixture = await launchFixture({
     load: async () => null,
+    supervisorOptions: {
+      async fetchImpl(url, options) {
+        const selected = new URL(url);
+        assert.equal(selected.origin, "http://127.0.0.1:4811");
+        assert.equal(options.method, "POST");
+        assert.equal(options.redirect, "error");
+        assert.match(options.headers["X-TiboTattle-Local-Capability"], /^[A-Za-z0-9_-]{43}$/u);
+        assert.equal(options.headers.Origin, selected.origin);
+        if (selected.pathname === "/api/local/authorization") {
+          assert.deepEqual(JSON.parse(options.body), {
+            method: "POST", path: "/api/local/authorization/browser-bootstrap",
+          });
+          assert.equal(options.headers["X-TiboTattle-Operation-Authorization"], undefined);
+          browserPreparation.push("grant");
+          return Response.json({ authorization: operationAuthorization });
+        }
+        assert.equal(selected.pathname, "/api/local/authorization/browser-bootstrap");
+        assert.deepEqual(browserPreparation, ["grant"]);
+        assert.equal(options.headers["X-TiboTattle-Operation-Authorization"], operationAuthorization);
+        assert.deepEqual(JSON.parse(options.body), {});
+        browserPreparation.push("bootstrap");
+        return Response.json({ available: true });
+      },
+    },
     runtimeOverrides: {
       dialog: {
         showMessageBox: async (options) => {
@@ -2414,7 +2454,10 @@ test("runtime wires safe browser, diagnostics, and local-data actions", async ()
         },
       },
       shell: {
-        openExternal: async (url) => external.push(url),
+        openExternal: async (url) => {
+          assert.deepEqual(browserPreparation, ["grant", "bootstrap"]);
+          external.push(url);
+        },
         showItemInFolder: (path) => revealed.push(path),
       },
       clipboard: {
@@ -2423,6 +2466,7 @@ test("runtime wires safe browser, diagnostics, and local-data actions", async ()
     },
   });
 
+  assert.deepEqual(browserPreparation, [], "startup never requests a browser bootstrap");
   assert.equal(await fixture.desktop.controller.handlers.openDashboardInBrowser({}), true);
   assert.deepEqual(external, ["http://127.0.0.1:4811/"]);
 

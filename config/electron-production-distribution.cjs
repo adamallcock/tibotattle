@@ -17,6 +17,10 @@ const PRODUCTION_ELECTRON_APP_ID = "com.usagemonitor.local";
 const PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID =
   "FDA705D7-5644-50E8-8CD2-3005D51B98C5";
 const PRODUCTION_ELECTRON_CHANNEL = "stable";
+// Linux updater trust is independent of feed/TLS/checksum authority. Provision
+// reviewed Ed25519 public keys here in source, never through the feed or env.
+// Empty means unavailable: there is no production publisher root yet.
+const PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS = Object.freeze([]);
 // Public verification key retained from the signed native stable predecessor.
 // Sparkle checks its preservation while installing an incoming upgrade, even
 // when the archive and Developer ID signatures are valid. This passive plist
@@ -388,6 +392,7 @@ function productionElectronMacOSBundleShortVersionForTarget({ target, version } 
 }
 
 module.exports = Object.freeze({
+  PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS,
   PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY,
   ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
   ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,

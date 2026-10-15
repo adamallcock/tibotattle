@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -40,6 +41,22 @@ const localCompanionEntry = resolve(
   "local",
   "server.js",
 );
+const companionCapabilities = new WeakMap();
+
+function discardCompanionAuthorization(child) {
+  if (!child) return;
+  companionCapabilities.delete(child);
+  child.stdio?.[5]?.destroy();
+  child.stdout?.destroy();
+}
+
+function companionCapabilityFor(origin, child) {
+  const authority = companionCapabilities.get(child);
+  if (!authority || origin !== authority.origin || !authority.ready) {
+    throw new Error("The local companion private launch authorization was unavailable");
+  }
+  return authority.capability;
+}
 
 async function assertPortAvailable(port) {
   await new Promise((resolvePromise, rejectPromise) => {
@@ -122,17 +139,74 @@ function startWorker(port, stateDirectory, ownerFixture, { visible = false } = {
   return child;
 }
 
-function startLocalCompanion(port, centralOrigin, stateRoot) {
-  return spawn(node, [localCompanionEntry], {
+export function startLocalCompanion(port, centralOrigin, stateRoot, {
+  spawnProcess = spawn,
+  reportReady = () => process.stdout.write(`USAGE_MONITOR_READY http://127.0.0.1:${port}/\n`),
+} = {}) {
+  const capability = randomBytes(32).toString("base64url");
+  const child = spawnProcess(node, [localCompanionEntry], {
     cwd: repositoryRoot,
-    env: localCompanionEnvironment({
-      environment: process.env,
-      port,
-      centralOrigin,
-      stateRoot,
-    }),
-    stdio: "inherit",
+    env: {
+      ...localCompanionEnvironment({
+        environment: process.env,
+        port,
+        centralOrigin,
+        stateRoot,
+      }),
+      USAGE_MONITOR_LOCAL_AUTH_FD: "5",
+    },
+    stdio: ["inherit", "pipe", "inherit", "ignore", "ignore", "pipe"],
   });
+  const pipe = child.stdio?.[5];
+  if (!pipe || typeof pipe.end !== "function" || typeof pipe.destroy !== "function"
+      || !child.stdout || typeof child.stdout.on !== "function") {
+    child.kill("SIGTERM");
+    throw new Error("The local companion private launch pipe was unavailable");
+  }
+  const authority = { capability, origin: `http://127.0.0.1:${port}`, ready: false };
+  companionCapabilities.set(child, authority);
+  child.once("error", () => discardCompanionAuthorization(child));
+  child.once("exit", () => discardCompanionAuthorization(child));
+  const rejectReadiness = () => {
+    discardCompanionAuthorization(child);
+    if (!childExited(child)) child.kill("SIGTERM");
+  };
+  let readinessLine = "";
+  const expectedReadiness = `USAGE_MONITOR_READY ${authority.origin}/`;
+  child.stdout.on("data", (chunk) => {
+    if (authority.ready) return;
+    for (const byte of chunk) {
+      if (byte === 10) {
+        const line = readinessLine.endsWith("\r") ? readinessLine.slice(0, -1) : readinessLine;
+        readinessLine = "";
+        if (line === expectedReadiness) {
+          authority.ready = true;
+          reportReady();
+          return;
+        }
+        if (line.startsWith("USAGE_MONITOR_READY")) { rejectReadiness(); return; }
+      } else {
+        if (readinessLine.length >= 4096) { rejectReadiness(); return; }
+        readinessLine += String.fromCharCode(byte);
+      }
+    }
+  });
+  child.stdout.once("error", rejectReadiness);
+  child.stdout.once("end", () => { if (!authority.ready) rejectReadiness(); });
+  pipe.once("error", () => {
+    discardCompanionAuthorization(child);
+    if (!childExited(child)) child.kill("SIGTERM");
+  });
+  const bytes = Buffer.from(`${capability}\n`, "ascii");
+  try {
+    pipe.end(bytes, () => bytes.fill(0));
+  } catch {
+    bytes.fill(0);
+    discardCompanionAuthorization(child);
+    child.kill("SIGTERM");
+    throw new Error("The local companion private launch pipe failed");
+  }
+  return child;
 }
 
 function childExited(child) {
@@ -164,14 +238,28 @@ async function waitForHealth(origin, child) {
   throw new Error("The local Worker did not become healthy within 30 seconds");
 }
 
-async function waitForLocalCompanion(origin, child) {
-  const deadline = Date.now() + 30_000;
+export async function waitForLocalCompanion(origin, child, { fetchResponse = fetch, timeoutMs = 30_000 } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+    throw new Error("The local companion readiness deadline was invalid");
+  }
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (childExited(child)) {
       throw new Error("The local companion exited before becoming ready");
     }
+    const authority = companionCapabilities.get(child);
+    if (!authority || origin !== authority.origin) {
+      throw new Error("The local companion private launch authorization was unavailable");
+    }
+    if (!authority.ready) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(200, Math.max(1, deadline - Date.now()))));
+      continue;
+    }
+    const capability = companionCapabilityFor(origin, child);
     try {
-      const response = await fetch(`${origin}/api/local/health`, {
+      const response = await fetchResponse(`${origin}/api/local/health`, {
+        headers: { "X-TiboTattle-Local-Capability": capability },
+        redirect: "error",
         signal: AbortSignal.timeout(1_000),
       });
       const body = await response.json();
@@ -188,6 +276,60 @@ async function waitForLocalCompanion(origin, child) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 200));
   }
   throw new Error("The local companion did not become healthy within 30 seconds");
+}
+
+async function readCompanionAuthorizationResponse(response) {
+  if (!response.ok || !response.body) {
+    void response.body?.cancel().catch(() => {});
+    throw new Error("The local companion browser authorization bootstrap was unavailable");
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 1024) throw new Error("bounded response exceeded");
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+}
+
+export async function publishLocalCompanionBrowserBootstrap(origin, child, { fetchResponse = fetch } = {}) {
+  const capability = companionCapabilityFor(origin, child);
+  const bootstrapPath = "/api/local/authorization/browser-bootstrap";
+  const headers = {
+    "X-TiboTattle-Local-Capability": capability,
+    Origin: origin,
+    "X-Usage-Monitor-Local": "1",
+    "Content-Type": "application/json",
+  };
+  const signal = AbortSignal.timeout(5_000);
+  try {
+    const grant = await readCompanionAuthorizationResponse(await fetchResponse(`${origin}/api/local/authorization`, {
+      method: "POST", headers, redirect: "error", signal,
+      body: JSON.stringify({ method: "POST", path: bootstrapPath }),
+    }));
+    if (!grant || typeof grant !== "object" || Object.keys(grant).length !== 1
+        || typeof grant.authorization !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(grant.authorization)) {
+      throw new Error("invalid authorization response");
+    }
+    const result = await readCompanionAuthorizationResponse(await fetchResponse(`${origin}${bootstrapPath}`, {
+      method: "POST",
+      headers: { ...headers, "X-TiboTattle-Operation-Authorization": grant.authorization },
+      body: "{}", redirect: "error", signal,
+    }));
+    if (!result || typeof result !== "object" || Object.keys(result).length !== 1
+        || typeof result.available !== "boolean") throw new Error("invalid bootstrap response");
+    return result.available;
+  } catch {
+    throw new Error("The local companion browser authorization bootstrap was unavailable");
+  }
 }
 
 async function inspectLocalR2ObjectCount(origin) {
@@ -226,7 +368,8 @@ async function stopWorker(child) {
   }
 }
 
-async function stopLocalCompanion(child) {
+export async function stopLocalCompanion(child) {
+  discardCompanionAuthorization(child);
   if (!child || childExited(child)) return;
   child.kill("SIGINT");
   await Promise.race([
@@ -314,294 +457,303 @@ async function probePersistedParticipant(origin, participantAccessFile) {
   };
 }
 
-await checkLocalWorkspacePackages();
-const options = parseLocalBackendLabArguments(process.argv.slice(2));
-const port = options.port;
-const companionPort = options.companionPort;
-const exitAfterReceipt = options.exitAfterReceipt;
-const smokeSourceArguments = backendSmokeSourceArguments(options.source);
-await assertPortAvailable(port);
-if (options.startCompanion) await assertPortAvailable(companionPort);
-const labDirectory = createLabDirectory(options.stateDirectory);
-const stateDirectory = join(labDirectory, "state");
-const companionStateDirectory = join(labDirectory, "companion-state");
-const invitationDirectory = join(labDirectory, "redeemed-invitations");
-const lifecycleStateDirectory = join(labDirectory, "lifecycle-state");
-const lifecycleInvitationDirectory = join(
-  labDirectory,
-  "lifecycle-redeemed-invitations",
-);
-const participantAccessFile = join(labDirectory, "participant-access.json");
-const receiptFile = join(labDirectory, "lab-receipt.json");
-mkdirSync(companionStateDirectory, { mode: 0o700 });
-const lifecycleInvitationFiles = prepareState(
-  lifecycleStateDirectory,
-  lifecycleInvitationDirectory,
-);
-const invitationFiles = prepareState(stateDirectory, invitationDirectory);
+async function runLocalBackendLab() {
+  await checkLocalWorkspacePackages();
+  const options = parseLocalBackendLabArguments(process.argv.slice(2));
+  const port = options.port;
+  const companionPort = options.companionPort;
+  const exitAfterReceipt = options.exitAfterReceipt;
+  const smokeSourceArguments = backendSmokeSourceArguments(options.source);
+  await assertPortAvailable(port);
+  if (options.startCompanion) await assertPortAvailable(companionPort);
+  const labDirectory = createLabDirectory(options.stateDirectory);
+  const stateDirectory = join(labDirectory, "state");
+  const companionStateDirectory = join(labDirectory, "companion-state");
+  const invitationDirectory = join(labDirectory, "redeemed-invitations");
+  const lifecycleStateDirectory = join(labDirectory, "lifecycle-state");
+  const lifecycleInvitationDirectory = join(
+    labDirectory,
+    "lifecycle-redeemed-invitations",
+  );
+  const participantAccessFile = join(labDirectory, "participant-access.json");
+  const receiptFile = join(labDirectory, "lab-receipt.json");
+  mkdirSync(companionStateDirectory, { mode: 0o700 });
+  const lifecycleInvitationFiles = prepareState(
+    lifecycleStateDirectory,
+    lifecycleInvitationDirectory,
+  );
+  const invitationFiles = prepareState(stateDirectory, invitationDirectory);
 
-const origin = `http://127.0.0.1:${port}`;
-const lifecycleOwnerFixture = createLocalOwnerFixture({
-  origin,
-  persistTo: lifecycleStateDirectory,
-  directory: join(labDirectory, "lifecycle-owner-fixture"),
-  workerDirectory,
-});
-const ownerFixture = createLocalOwnerFixture({
-  origin,
-  persistTo: stateDirectory,
-  directory: join(labDirectory, "owner-fixture"),
-  workerDirectory,
-});
-const companionOrigin = options.startCompanion
-  ? `http://127.0.0.1:${companionPort}`
-  : null;
-let worker = startWorker(port, lifecycleStateDirectory, lifecycleOwnerFixture);
-let companion = null;
-let stopping = false;
+  const origin = `http://127.0.0.1:${port}`;
+  const lifecycleOwnerFixture = createLocalOwnerFixture({
+    origin,
+    persistTo: lifecycleStateDirectory,
+    directory: join(labDirectory, "lifecycle-owner-fixture"),
+    workerDirectory,
+  });
+  const ownerFixture = createLocalOwnerFixture({
+    origin,
+    persistTo: stateDirectory,
+    directory: join(labDirectory, "owner-fixture"),
+    workerDirectory,
+  });
+  const companionOrigin = options.startCompanion
+    ? `http://127.0.0.1:${companionPort}`
+    : null;
+  let worker = startWorker(port, lifecycleStateDirectory, lifecycleOwnerFixture);
+  let companion = null;
+  let companionBrowserBootstrapAvailable = false;
+  let stopping = false;
 
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  await stopLocalCompanion(companion);
-  await stopWorker(worker);
-  const stopped = options.source.mode === "prepared_contribution"
-    ? {
-        status: "stopped",
-        signal,
-        dataDeleted: false,
-        privateWorkspaceRetained: true,
-      }
-    : {
-        status: "stopped",
-        signal,
+  async function shutdown(signal) {
+    if (stopping) return;
+    stopping = true;
+    await stopLocalCompanion(companion);
+    await stopWorker(worker);
+    const stopped = options.source.mode === "prepared_contribution"
+      ? {
+          status: "stopped",
+          signal,
+          dataDeleted: false,
+          privateWorkspaceRetained: true,
+        }
+      : {
+          status: "stopped",
+          signal,
+          stateDirectory: labDirectory,
+          dataDeleted: false,
+        };
+    process.stdout.write(`${JSON.stringify(stopped)}\n`);
+    process.exit(0);
+  }
+
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+
+  try {
+    await waitForHealth(origin, worker);
+    const lifecycleSmokeOutput = run(node, [
+      resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
+      "--origin",
+      origin,
+      "--owner-access-file",
+      lifecycleOwnerFixture.accessFile,
+      ...smokeSourceArguments,
+      ...lifecycleInvitationFiles.flatMap((path) => ["--invite-file", path]),
+    ], "Owner-erasure lifecycle HTTP acceptance", { capture: true });
+    const lifecycleSmoke = JSON.parse(lifecycleSmokeOutput);
+    if (lifecycleSmoke.participantsErasedByOwner !== lifecycleSmoke.participants
+        || lifecycleSmoke.selfServiceDeletionRefused !== true
+        || lifecycleSmoke.participantStateUnchangedAfterRefusal !== true
+        || lifecycleSmoke.ownerAuthAndCsrfRequired !== true) {
+      throw new Error("The owner-erasure HTTP smoke did not prove every acceptance boundary.");
+    }
+    const lifecycleOwner = await createLocalOwnerEraser({ origin, ownerAccessFile: lifecycleOwnerFixture.accessFile });
+    await lifecycleOwner.eraseOwnerFixture();
+    const lifecycleR2ObjectCount = await inspectLocalR2ObjectCount(origin);
+    await stopWorker(worker);
+    const lifecycleStorage = inspectLocalBackendState({
+      persistTo: lifecycleStateDirectory,
+      workerDirectory,
+    });
+    const lifecycleSnapshotPrivacy = assertOwnerErasureLifecycle(lifecycleStorage, lifecycleR2ObjectCount);
+
+    worker = startWorker(port, stateDirectory, ownerFixture);
+    await waitForHealth(origin, worker);
+    const smokeOutput = run(node, [
+      resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
+      "--origin",
+      origin,
+      "--owner-access-file",
+      ownerFixture.accessFile,
+      ...smokeSourceArguments,
+      "--retain-inspection-state",
+      "--participant-access-file",
+      participantAccessFile,
+      ...invitationFiles.flatMap((path) => ["--invite-file", path]),
+    ], "Inspectable HTTP seed", { capture: true });
+    const smoke = JSON.parse(smokeOutput);
+    const r2ObjectCount = await inspectLocalR2ObjectCount(origin);
+    await stopWorker(worker);
+    const storage = inspectLocalBackendState({
+      persistTo: stateDirectory,
+      workerDirectory,
+    });
+    if (r2ObjectCount !== storage.database.retainedQuarantineReferences) {
+      throw new Error(
+        "The retained R2 object count did not match canonical retention state",
+      );
+    }
+    worker = startWorker(port, stateDirectory, ownerFixture, { visible: !exitAfterReceipt });
+    const health = await waitForHealth(origin, worker);
+    const restartedR2ObjectCount = await inspectLocalR2ObjectCount(origin);
+    if (restartedR2ObjectCount !== r2ObjectCount) {
+      throw new Error("The retained R2 object count changed across restart");
+    }
+    const persistedRestart = await probePersistedParticipant(
+      origin,
+      participantAccessFile,
+    );
+    if (options.startCompanion) {
+      companion = startLocalCompanion(
+        companionPort,
+        origin,
+        companionStateDirectory,
+      );
+      await waitForLocalCompanion(companionOrigin, companion);
+      companionBrowserBootstrapAvailable = await publishLocalCompanionBrowserBootstrap(companionOrigin, companion);
+    }
+    const receipt = projectLocalBackendLabReceipt({
+      receipt: {
+        schemaVersion: "local-backend-lab-receipt-v0.4",
+        status: "ready",
+        createdAt: new Date().toISOString(),
+        origin,
+        backendOrigin: origin,
+        portalUrl: companionOrigin === null || !companionBrowserBootstrapAvailable ? null : `${companionOrigin}/`,
+        localCompanion: companionOrigin === null
+          ? {
+              status: "not_started",
+              reason: exitAfterReceipt ? "exit_after_receipt" : "backend_only",
+            }
+          : {
+              status: "ready",
+              origin: companionOrigin,
+              realLocalDataApi: true,
+              centralBackendRelay: true,
+              browserPortalAvailable: companionBrowserBootstrapAvailable,
+            },
+        smoke: {
+          participants: smoke.participants,
+          acceptedRecordsPerParticipant: smoke.acceptedRecordsPerParticipant,
+          idempotentReplay: smoke.idempotentReplay,
+          uploadScopeConflictRejected: smoke.uploadScopeConflictRejected,
+          privacyCanaryRejected: smoke.privacyCanaryRejected,
+          invalidSchemaRejected: smoke.invalidSchemaRejected,
+          oversizedRequestRejected: smoke.oversizedRequestRejected,
+          overCountRejected: smoke.overCountRejected,
+          outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
+          serverValidation: smoke.serverValidation,
+          canonicalServerRepricing: smoke.canonicalServerRepricing,
+          atomicEnrollmentPairing: smoke.devicePairingAndUpload,
+          deviceRevocation: smoke.deviceRevocation,
+          communityDailyVerified: smoke.communityDailyVerified,
+          participantExportVerified: smoke.participantExportVerified,
+          selfServiceDeletionRefused: smoke.selfServiceDeletionRefused,
+          participantStateUnchangedAfterRefusal: smoke.participantStateUnchangedAfterRefusal,
+          ownerAuthAndCsrfRequired: smoke.ownerAuthAndCsrfRequired,
+        },
+        ownerErasureLifecycle: {
+          workloadParticipantsErasedByOwner: lifecycleSmoke.participantsErasedByOwner,
+          fullOwnerErasure:
+            lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
+          ownerFixtureErasedSeparately: true,
+          ownerErasureRetryVerified: lifecycleSmoke.ownerErasureRetryVerified,
+          snapshotPrivacy: lifecycleSnapshotPrivacy,
+          d1: lifecycleStorage.database,
+          deletionLedger: lifecycleStorage.deletionLedger,
+          directLocalR2ObjectCount: lifecycleR2ObjectCount,
+        },
+        persistedRestart: {
+          workerRestartedAgainstSameStateDirectory: true,
+          r2ObjectCountBeforeRestart: r2ObjectCount,
+          r2ObjectCountAfterRestart: restartedR2ObjectCount,
+          ...persistedRestart,
+        },
+        storage: storage.database,
+        encryptedQuarantine: {
+          directLocalR2ObjectCount: r2ObjectCount,
+          canonicalRetainedReferenceCount:
+            storage.database.retainedQuarantineReferences,
+          lifecycleMayDeleteAcceptedObjectsBeforeInspection: true,
+          explorerResponseIncludedObjectKeys: false,
+        },
+        deletionLedger: storage.deletionLedger,
+        localOwnerFixture: {
+          separateFromWorkloadParticipants: true,
+          retainedForLocalOwnerOperations: true,
+          grantsOrdinaryParticipantsAdminAccess: false,
+          envelopeKeysIsolatedFromWorkspace: true,
+        },
+        health: {
+          database: health.checks.database,
+          deletionLedger: health.checks.deletionLedger,
+          encryptedQuarantine: health.checks.encryptedObjectStore,
+          enrollmentMode: health.enrollmentMode,
+          participantDeletion: health.capabilities.participantDeletion,
+          deletionSafeRestoreReplay: health.capabilities.deletionSafeRestoreReplay,
+        },
+        acceptance: {
+          safeFileAcceptance: true,
+          forbiddenContentRejected: smoke.privacyCanaryRejected,
+          invalidSchemaRejected: smoke.invalidSchemaRejected,
+          oversizedRequestRejected: smoke.oversizedRequestRejected,
+          overCountRejected: smoke.overCountRejected,
+          outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
+          idempotentDeduplication: smoke.idempotentReplay,
+          conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
+          canonicalServerRepricing: smoke.canonicalServerRepricing,
+          atomicEnrollmentPairingVerified: smoke.devicePairingAndUpload,
+          deviceRevocationVerified: smoke.deviceRevocation,
+          d1LifecycleVerified: true,
+          r2LifecycleVerified: lifecycleR2ObjectCount === 0
+            && restartedR2ObjectCount === r2ObjectCount,
+          communityDailyVerified: smoke.communityDailyVerified,
+          participantExportVerified: smoke.participantExportVerified,
+          selfServiceDeletionRefusalVerified: lifecycleSmoke.selfServiceDeletionRefused,
+          participantStateUnchangedAfterRefusal: lifecycleSmoke.participantStateUnchangedAfterRefusal,
+          ownerErasureVerified:
+            lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
+          persistedRestartVerified:
+            persistedRestart.participantSessionRestored
+            && persistedRestart.participantExportRestored,
+        },
+      },
+      sourceMode: options.source.mode,
+      locations: {
         stateDirectory: labDirectory,
-        dataDeleted: false,
-      };
-  process.stdout.write(`${JSON.stringify(stopped)}\n`);
-  process.exit(0);
+        participantAccessFile,
+        ownerAccessFile: ownerFixture.accessFile,
+        redeemedInvitationDirectory: invitationDirectory,
+        redeemedInvitationFilesRetained: invitationFiles.length,
+      },
+    });
+    writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    const publicOutput = options.source.mode === "prepared_contribution"
+      ? receipt
+      : {
+          ...receipt,
+          receiptFile,
+          note: "Participant and dedicated local owner capabilities are in separate owner-only access files. Do not share them.",
+    };
+    process.stdout.write(`${JSON.stringify(publicOutput, null, 2)}\n`);
+    if (exitAfterReceipt) {
+      await stopWorker(worker);
+    } else {
+      worker.once("exit", () => {
+        if (!stopping) void shutdown("backend_exit");
+      });
+      if (childExited(worker) && !stopping) void shutdown("backend_exit");
+    }
+  } catch (error) {
+    await stopLocalCompanion(companion);
+    await stopWorker(worker);
+    process.stderr.write("The inspectable backend laboratory failed at a bounded setup or verification step.\n");
+    const detail = error instanceof Error
+      ? error.message
+        .replace(/um_[A-Za-z0-9._-]+/gu, "[redacted-authority]")
+        .slice(0, 1_000)
+      : "unknown failure";
+    process.stderr.write(`${detail}\n`);
+    process.stderr.write(`State retained for inspection: ${labDirectory}\n`);
+    process.exitCode = 1;
+  }
 }
 
-process.once("SIGINT", () => void shutdown("SIGINT"));
-process.once("SIGTERM", () => void shutdown("SIGTERM"));
-
-try {
-  await waitForHealth(origin, worker);
-  const lifecycleSmokeOutput = run(node, [
-    resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
-    "--origin",
-    origin,
-    "--owner-access-file",
-    lifecycleOwnerFixture.accessFile,
-    ...smokeSourceArguments,
-    ...lifecycleInvitationFiles.flatMap((path) => ["--invite-file", path]),
-  ], "Owner-erasure lifecycle HTTP acceptance", { capture: true });
-  const lifecycleSmoke = JSON.parse(lifecycleSmokeOutput);
-  if (lifecycleSmoke.participantsErasedByOwner !== lifecycleSmoke.participants
-      || lifecycleSmoke.selfServiceDeletionRefused !== true
-      || lifecycleSmoke.participantStateUnchangedAfterRefusal !== true
-      || lifecycleSmoke.ownerAuthAndCsrfRequired !== true) {
-    throw new Error("The owner-erasure HTTP smoke did not prove every acceptance boundary.");
-  }
-  const lifecycleOwner = await createLocalOwnerEraser({ origin, ownerAccessFile: lifecycleOwnerFixture.accessFile });
-  await lifecycleOwner.eraseOwnerFixture();
-  const lifecycleR2ObjectCount = await inspectLocalR2ObjectCount(origin);
-  await stopWorker(worker);
-  const lifecycleStorage = inspectLocalBackendState({
-    persistTo: lifecycleStateDirectory,
-    workerDirectory,
-  });
-  const lifecycleSnapshotPrivacy = assertOwnerErasureLifecycle(lifecycleStorage, lifecycleR2ObjectCount);
-
-  worker = startWorker(port, stateDirectory, ownerFixture);
-  await waitForHealth(origin, worker);
-  const smokeOutput = run(node, [
-    resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
-    "--origin",
-    origin,
-    "--owner-access-file",
-    ownerFixture.accessFile,
-    ...smokeSourceArguments,
-    "--retain-inspection-state",
-    "--participant-access-file",
-    participantAccessFile,
-    ...invitationFiles.flatMap((path) => ["--invite-file", path]),
-  ], "Inspectable HTTP seed", { capture: true });
-  const smoke = JSON.parse(smokeOutput);
-  const r2ObjectCount = await inspectLocalR2ObjectCount(origin);
-  await stopWorker(worker);
-  const storage = inspectLocalBackendState({
-    persistTo: stateDirectory,
-    workerDirectory,
-  });
-  if (r2ObjectCount !== storage.database.retainedQuarantineReferences) {
-    throw new Error(
-      "The retained R2 object count did not match canonical retention state",
-    );
-  }
-  worker = startWorker(port, stateDirectory, ownerFixture, { visible: !exitAfterReceipt });
-  const health = await waitForHealth(origin, worker);
-  const restartedR2ObjectCount = await inspectLocalR2ObjectCount(origin);
-  if (restartedR2ObjectCount !== r2ObjectCount) {
-    throw new Error("The retained R2 object count changed across restart");
-  }
-  const persistedRestart = await probePersistedParticipant(
-    origin,
-    participantAccessFile,
-  );
-  if (options.startCompanion) {
-    companion = startLocalCompanion(
-      companionPort,
-      origin,
-      companionStateDirectory,
-    );
-    await waitForLocalCompanion(companionOrigin, companion);
-  }
-  const receipt = projectLocalBackendLabReceipt({
-    receipt: {
-      schemaVersion: "local-backend-lab-receipt-v0.4",
-      status: "ready",
-      createdAt: new Date().toISOString(),
-      origin,
-      backendOrigin: origin,
-      portalUrl: companionOrigin === null ? null : `${companionOrigin}/`,
-      localCompanion: companionOrigin === null
-        ? {
-            status: "not_started",
-            reason: exitAfterReceipt ? "exit_after_receipt" : "backend_only",
-          }
-        : {
-            status: "ready",
-            origin: companionOrigin,
-            realLocalDataApi: true,
-            centralBackendRelay: true,
-          },
-      smoke: {
-        participants: smoke.participants,
-        acceptedRecordsPerParticipant: smoke.acceptedRecordsPerParticipant,
-        idempotentReplay: smoke.idempotentReplay,
-        uploadScopeConflictRejected: smoke.uploadScopeConflictRejected,
-        privacyCanaryRejected: smoke.privacyCanaryRejected,
-        invalidSchemaRejected: smoke.invalidSchemaRejected,
-        oversizedRequestRejected: smoke.oversizedRequestRejected,
-        overCountRejected: smoke.overCountRejected,
-        outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
-        serverValidation: smoke.serverValidation,
-        canonicalServerRepricing: smoke.canonicalServerRepricing,
-        atomicEnrollmentPairing: smoke.devicePairingAndUpload,
-        deviceRevocation: smoke.deviceRevocation,
-        communityDailyVerified: smoke.communityDailyVerified,
-        participantExportVerified: smoke.participantExportVerified,
-        selfServiceDeletionRefused: smoke.selfServiceDeletionRefused,
-        participantStateUnchangedAfterRefusal: smoke.participantStateUnchangedAfterRefusal,
-        ownerAuthAndCsrfRequired: smoke.ownerAuthAndCsrfRequired,
-      },
-      ownerErasureLifecycle: {
-        workloadParticipantsErasedByOwner: lifecycleSmoke.participantsErasedByOwner,
-        fullOwnerErasure:
-          lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
-        ownerFixtureErasedSeparately: true,
-        ownerErasureRetryVerified: lifecycleSmoke.ownerErasureRetryVerified,
-        snapshotPrivacy: lifecycleSnapshotPrivacy,
-        d1: lifecycleStorage.database,
-        deletionLedger: lifecycleStorage.deletionLedger,
-        directLocalR2ObjectCount: lifecycleR2ObjectCount,
-      },
-      persistedRestart: {
-        workerRestartedAgainstSameStateDirectory: true,
-        r2ObjectCountBeforeRestart: r2ObjectCount,
-        r2ObjectCountAfterRestart: restartedR2ObjectCount,
-        ...persistedRestart,
-      },
-      storage: storage.database,
-      encryptedQuarantine: {
-        directLocalR2ObjectCount: r2ObjectCount,
-        canonicalRetainedReferenceCount:
-          storage.database.retainedQuarantineReferences,
-        lifecycleMayDeleteAcceptedObjectsBeforeInspection: true,
-        explorerResponseIncludedObjectKeys: false,
-      },
-      deletionLedger: storage.deletionLedger,
-      localOwnerFixture: {
-        separateFromWorkloadParticipants: true,
-        retainedForLocalOwnerOperations: true,
-        grantsOrdinaryParticipantsAdminAccess: false,
-        envelopeKeysIsolatedFromWorkspace: true,
-      },
-      health: {
-        database: health.checks.database,
-        deletionLedger: health.checks.deletionLedger,
-        encryptedQuarantine: health.checks.encryptedObjectStore,
-        enrollmentMode: health.enrollmentMode,
-        participantDeletion: health.capabilities.participantDeletion,
-        deletionSafeRestoreReplay: health.capabilities.deletionSafeRestoreReplay,
-      },
-      acceptance: {
-        safeFileAcceptance: true,
-        forbiddenContentRejected: smoke.privacyCanaryRejected,
-        invalidSchemaRejected: smoke.invalidSchemaRejected,
-        oversizedRequestRejected: smoke.oversizedRequestRejected,
-        overCountRejected: smoke.overCountRejected,
-        outOfRangeTimestampRejected: smoke.outOfRangeTimestampRejected,
-        idempotentDeduplication: smoke.idempotentReplay,
-        conflictSafeCanonicalState: smoke.uploadScopeConflictRejected,
-        canonicalServerRepricing: smoke.canonicalServerRepricing,
-        atomicEnrollmentPairingVerified: smoke.devicePairingAndUpload,
-        deviceRevocationVerified: smoke.deviceRevocation,
-        d1LifecycleVerified: true,
-        r2LifecycleVerified: lifecycleR2ObjectCount === 0
-          && restartedR2ObjectCount === r2ObjectCount,
-        communityDailyVerified: smoke.communityDailyVerified,
-        participantExportVerified: smoke.participantExportVerified,
-        selfServiceDeletionRefusalVerified: lifecycleSmoke.selfServiceDeletionRefused,
-        participantStateUnchangedAfterRefusal: lifecycleSmoke.participantStateUnchangedAfterRefusal,
-        ownerErasureVerified:
-          lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
-        persistedRestartVerified:
-          persistedRestart.participantSessionRestored
-          && persistedRestart.participantExportRestored,
-      },
-    },
-    sourceMode: options.source.mode,
-    locations: {
-      stateDirectory: labDirectory,
-      participantAccessFile,
-      ownerAccessFile: ownerFixture.accessFile,
-      redeemedInvitationDirectory: invitationDirectory,
-      redeemedInvitationFilesRetained: invitationFiles.length,
-    },
-  });
-  writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-  });
-  const publicOutput = options.source.mode === "prepared_contribution"
-    ? receipt
-    : {
-        ...receipt,
-        receiptFile,
-        note: "Participant and dedicated local owner capabilities are in separate owner-only access files. Do not share them.",
-  };
-  process.stdout.write(`${JSON.stringify(publicOutput, null, 2)}\n`);
-  if (exitAfterReceipt) {
-    await stopWorker(worker);
-  } else {
-    worker.once("exit", () => {
-      if (!stopping) void shutdown("backend_exit");
-    });
-    if (childExited(worker) && !stopping) void shutdown("backend_exit");
-  }
-} catch (error) {
-  await stopLocalCompanion(companion);
-  await stopWorker(worker);
-  process.stderr.write("The inspectable backend laboratory failed at a bounded setup or verification step.\n");
-  const detail = error instanceof Error
-    ? error.message
-      .replace(/um_[A-Za-z0-9._-]+/gu, "[redacted-authority]")
-      .slice(0, 1_000)
-    : "unknown failure";
-  process.stderr.write(`${detail}\n`);
-  process.stderr.write(`State retained for inspection: ${labDirectory}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await runLocalBackendLab();
 }

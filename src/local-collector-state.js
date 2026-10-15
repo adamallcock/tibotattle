@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import fsPromises, {
   chmod,
   lstat,
@@ -567,11 +567,61 @@ async function syncStateFile(stateFile) {
 
 async function ensureDatabase(stateFile) {
   const exists = await prepareStateFile(stateFile);
+  let existing = null;
   let database;
+  let descriptor;
+  let reserved = null;
   try {
-    database = openDatabase(stateFile, { readOnly: false, create: !exists });
+    if (!exists) {
+      // Like the unified index, reserve the final target owner-only before
+      // SQLite can create/write it using the process umask. Keep reservation
+      // and schema initialization synchronous: yielding between them would
+      // expose an empty, incompatible database to another in-process reader.
+      try {
+        descriptor = openSync(stateFile, constants.O_WRONLY | constants.O_CREAT
+          | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+        reserved = fstatSync(descriptor, { bigint: true });
+        if (!ownerOnlyRegularFile(reserved) || reserved.size !== 0n) {
+          throw fixedError("local_collector_state_unavailable");
+        }
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        // Another creator may have finished after our missing-file check.
+        // Revalidate and open that winner without schema initialization.
+        // Empty, incompatible or unsafe winners still fail closed.
+        existing = lstatSync(stateFile, { bigint: true });
+      }
+    }
+    const before = lstatSync(stateFile, { bigint: true });
+    const expected = reserved ?? existing ?? before;
+    if (!ownerOnlyRegularFile(before) || !sameFileIdentity(before, expected)) {
+      throw fixedError("local_collector_state_unavailable");
+    }
+    database = openDatabase(stateFile, { readOnly: false, create: reserved !== null });
+    const after = lstatSync(stateFile, { bigint: true });
+    if (!ownerOnlyRegularFile(after) || !sameFileIdentity(after, expected)) {
+      throw fixedError("local_collector_state_unavailable");
+    }
+  } catch (error) {
+    // A concurrent creator wins without being opened as a new database. Only
+    // an untouched reservation from this call can be removed on failure; keep
+    // nonempty state for explicit diagnosis/recovery and never unlink a
+    // replacement, linked target, or another creator's database.
+    if (reserved !== null) {
+      try {
+        const current = lstatSync(stateFile, { bigint: true });
+        if (ownerOnlyRegularFile(current) && current.size === 0n
+            && sameFileIdentity(current, reserved)) unlinkSync(stateFile);
+      } catch { /* Preserve the original bounded creation failure. */ }
+    }
+    if (error?.code?.startsWith("local_collector_state_")) throw error;
+    throw fixedError("local_collector_state_unavailable");
   } finally {
-    database?.close();
+    try {
+      database?.close();
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
+    }
   }
   await chmod(stateFile, 0o600);
   await syncStateFile(stateFile);

@@ -114,7 +114,15 @@ building the app:
 npm run product:local
 ```
 
-then open <http://localhost:8787>. Electron is the main app and uses this same
+then open <http://127.0.0.1:8787>. On macOS/Linux, select the owner-only
+`private/dashboard-access.json` file in the configured local state directory
+when the dashboard asks to unlock. This launch file expires after fifteen
+minutes; restart the development companion to issue a new file. Its contents
+stay in browser memory and are never put in the URL or browser storage. The
+Windows external-browser development path remains unavailable until its
+bootstrap file has a qualified owner-only ACL writer. Electron uses a private
+inherited pipe and requires no file selection on any platform.
+Electron is the main app and uses this same
 dashboard for local collection, Settings and accountless community sharing. A
 useful headline usually appears within seconds; the first deep pass over a
 large history is bounded, cancellable, and resumable.

@@ -362,14 +362,26 @@ async function createExportSourcePlanBundle({
 }
 
 /** Verify and expand a private frozen bundle without source rediscovery. */
-async function resolveExportSourcePlanBundle(bundle, {
+async function resolveExportSourcePlanBundle(inputBundle, {
   startAt,
   endAt,
   secret,
   resourceGuard,
 } = {}) {
   if (!secret || !resourceGuard?.limits) fail("configuration");
+  assertBundleEnvelope(inputBundle);
+  const commitment = inputBundle.sourcePlanBundleSha256;
+  // Single-source views share their selections with the full plan. Own that
+  // plan before awaiting verification so callers cannot change the checked
+  // metadata between sources or while workspace projections are constructed.
+  let bundle;
+  try {
+    bundle = structuredClone(inputBundle);
+  } catch {
+    fail("configuration");
+  }
   assertBundleEnvelope(bundle);
+  if (bundle.sourcePlanBundleSha256 !== commitment) fail("integrity");
   const bounds = normalizeExportBounds(startAt, endAt);
   if (bundle.startAt !== bounds.startAt || bundle.endAt !== bounds.endAt) fail("interval");
   for (const plan of [
@@ -397,8 +409,11 @@ async function resolveExportSourcePlanBundle(bundle, {
     }
     if (bundle.claudeTranscriptPlan !== null) {
       source = "claude_transcript";
-      for (const transcriptSource of bundle.claudeTranscriptPlan.sources) {
-        await verifyClaudeTranscriptExportSource(bundle.claudeTranscriptPlan, transcriptSource.sourceKey, {
+      // Validate the complete plan once, then retain each source's metadata and
+      // frozen-prefix checks without revalidating every other source per file.
+      const transcriptPlans = sliceClaudeTranscriptExportSourcePlans(bundle.claudeTranscriptPlan, { secret });
+      for (const transcriptPlan of transcriptPlans) {
+        await verifyClaudeTranscriptExportSource(transcriptPlan, transcriptPlan.sources[0].sourceKey, {
           secret,
           resourceGuard: verificationGuard,
         });
@@ -413,6 +428,8 @@ async function resolveExportSourcePlanBundle(bundle, {
     const derivedBytes = bundle.codexPlan.sources.reduce((sum, source) => sum + source.prefixBytes, 0)
       + supplementalSummary.sourceBytes;
     if (derivedFiles !== totals.sourceFiles || derivedBytes !== totals.sourceBytes) fail("integrity");
+    if (inputBundle.sourcePlanBundleSha256 !== commitment) fail("integrity");
+    assertBundleEnvelope(inputBundle);
     resourceGuard.observeSourcePlan(totals.sourceFiles, totals.sourceBytes);
     return {
       // The controller annotates rolloutInfo with a workspace-local ordinal.

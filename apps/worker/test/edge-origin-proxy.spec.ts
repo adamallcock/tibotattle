@@ -40,11 +40,17 @@ import {
 import type {
   EdgeOriginProxy,
   EdgeOriginProxyOptions,
+  EdgePublicProbeEnv,
   EdgeRequestClass,
 } from "../src/edge-origin-proxy";
 import { contributionRequestPreflight, handleRequest } from "../src/index";
 import { MAX_REQUEST_BYTES } from "../src/constants";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry";
+import {
+  PUBLIC_PROBE_BUDGET_POLICY,
+  PUBLIC_PROBE_MAXIMUM_MILLISECONDS,
+  publicProbeBudgetObjectName,
+} from "../src/public-probe-admission";
 import type { WorkerRouteDefinition } from "../src/route-registry";
 
 // ---------------------------------------------------------------------------
@@ -234,6 +240,45 @@ function recordingLimiters(
   return { calls, limiters };
 }
 
+const PROBE_LEASE_ID = "11111111-1111-4111-8111-111111111111";
+
+function recordingPublicProbes(
+  answer: (callNumber: number) => LimiterAnswer = () => true,
+  leaseAllowed = true,
+) {
+  const calls: LimiterCall[] = [];
+  const names: string[] = [];
+  const acquired: unknown[] = [];
+  const released: string[] = [];
+  const limiter = (binding: string): RateLimit => ({
+    async limit({ key }) {
+      calls.push({ binding, key });
+      const result = answer(calls.length);
+      if (result === "throw") throw new Error("synthetic probe limiter failure");
+      return { success: result };
+    },
+  });
+  const env = {
+    ENVIRONMENT: "production",
+    IDENTITY_LINK_SECRET: CLIENT_KEY_SECRET,
+    PUBLIC_PROBE_RATE_LIMIT: limiter("PUBLIC_PROBE_RATE_LIMIT"),
+    PUBLIC_PROBE_CLIENT_RATE_LIMIT: limiter("PUBLIC_PROBE_CLIENT_RATE_LIMIT"),
+    UPLOAD_INGRESS_BUDGET: {
+      getByName(name: string) {
+        names.push(name);
+        return {
+          async acquire(policy: unknown) {
+            acquired.push(policy);
+            return { allowed: leaseAllowed, leaseId: leaseAllowed ? PROBE_LEASE_ID : null, retryAfterSeconds: 0 };
+          },
+          async release(leaseId: string) { released.push(leaseId); },
+        };
+      },
+    },
+  } as unknown as EdgePublicProbeEnv;
+  return { env, calls, names, acquired, released };
+}
+
 type Fetcher = (request: Request) => Promise<Response>;
 
 interface HarnessOptions {
@@ -244,6 +289,8 @@ interface HarnessOptions {
   readonly clock?: () => number;
   readonly handle?: (request: Request, env: Env) => Promise<Response>;
   readonly config?: EdgeOriginConfiguration;
+  readonly publicProbes?: ReturnType<typeof recordingPublicProbes>;
+  readonly publicProbeEnv?: EdgePublicProbeEnv | null;
 }
 
 interface Harness {
@@ -253,6 +300,7 @@ interface Harness {
   readonly limiterCalls: LimiterCall[];
   readonly logs: string[];
   readonly handled: Env[];
+  readonly publicProbes: ReturnType<typeof recordingPublicProbes>;
 }
 
 function markedResponse(body: BodyInit | null = "{\"ok\":true}", init: ResponseInit = {}): Response {
@@ -268,6 +316,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const handled: Env[] = [];
   let tokens = 0;
   const { calls, limiters } = recordingLimiters(options.limiterAnswer);
+  const publicProbes = options.publicProbes ?? recordingPublicProbes();
   const record = (line: string) => {
     logs.push(line);
     ALL_LOG_LINES.push(line);
@@ -288,6 +337,7 @@ function harness(options: HarnessOptions = {}): Harness {
     },
     clientKeySecret: CLIENT_KEY_SECRET,
     limiters,
+    publicProbeEnv: options.publicProbeEnv === undefined ? publicProbes.env : options.publicProbeEnv ?? undefined,
     distribution: options.distribution ?? null,
     fetcher: async (request) => {
       fetched.push(request);
@@ -296,7 +346,7 @@ function harness(options: HarnessOptions = {}): Harness {
     logger: { warn: record, error: record },
     clock: options.clock ?? (() => NOW),
   });
-  return { proxy, fetched, tokenCalls: () => tokens, limiterCalls: calls, logs, handled };
+  return { proxy, fetched, tokenCalls: () => tokens, limiterCalls: calls, logs, handled, publicProbes };
 }
 
 function upstreamOnly(h: Harness): Request[] {
@@ -405,6 +455,8 @@ function expectNoUpstreamCalls(h: Harness): void {
   expect(h.fetched).toHaveLength(0);
   expect(h.tokenCalls()).toBe(0);
   expect(h.limiterCalls).toHaveLength(0);
+  expect(h.publicProbes.calls).toHaveLength(0);
+  expect(h.publicProbes.acquired).toHaveLength(0);
 }
 
 afterEach(() => {
@@ -495,6 +547,7 @@ describe("createEdgeOriginProxy options", () => {
       idTokenSource: { getToken: async () => ID_TOKEN },
       clientKeySecret: CLIENT_KEY_SECRET,
       limiters: {},
+      publicProbeEnv: recordingPublicProbes().env,
       distribution: null,
       ...overrides,
     } as unknown as EdgeOriginProxyOptions;
@@ -930,7 +983,7 @@ describe("admission", () => {
     });
   }
 
-  it("sends no admission header and touches no limiter for every other forwarded route", async () => {
+  it("sends no admission header and touches no participant limiter for every other forwarded route", async () => {
     const owner = await accessJwt();
     const checked: string[] = [];
     for (const route of WORKER_ROUTE_POLICY) {
@@ -945,6 +998,18 @@ describe("admission", () => {
       const upstream = onlyUpstream(h);
       expect(upstream.headers.has(EDGE_HEADERS.admission), route.id).toBe(false);
       expect(h.limiterCalls, route.id).toStrictEqual([]);
+      if (route.id === "health" || route.id === "ready") {
+        expect(h.publicProbes.calls, route.id).toStrictEqual([
+          { binding: "PUBLIC_PROBE_RATE_LIMIT", key: `usage-monitor:public_probe:${route.id}:global` },
+          { binding: "PUBLIC_PROBE_CLIENT_RATE_LIMIT", key: `usage-monitor:public_probe:${route.id}:client:${await clientSubjectKey(`public_probe_${route.id}`)}` },
+        ]);
+        expect(h.publicProbes.names).toStrictEqual([publicProbeBudgetObjectName(route.id)]);
+        expect(h.publicProbes.acquired).toStrictEqual([PUBLIC_PROBE_BUDGET_POLICY]);
+        expect(h.publicProbes.released).toStrictEqual([PROBE_LEASE_ID]);
+      } else {
+        expect(h.publicProbes.calls, route.id).toStrictEqual([]);
+        expect(h.publicProbes.acquired, route.id).toStrictEqual([]);
+      }
       checked.push(route.id);
     }
     expect(checked).toContain("device_upload_authorization");
@@ -952,6 +1017,154 @@ describe("admission", () => {
     expect(checked).toContain("admin_action");
     expect(checked).toHaveLength(WORKER_ROUTE_POLICY.length - 24 - 2);
   });
+});
+
+describe("edge-local public probe admission", () => {
+  for (const routeId of ["health", "ready"] as const) {
+    const request = () => requestFor(PUBLIC_ORIGIN, exactRoute(routeId));
+
+    async function expectRefusal(h: Harness, response: Response, status: number, code: string) {
+      expect(response.status).toBe(status);
+      expect(response.headers.get("cache-control")).toContain("no-store");
+      const body = await envelope(response) as { error: { code: string; requestId: string } };
+      expect(body.error.code).toBe(code);
+      expect(isEdgeRequestId(body.error.requestId)).toBe(true);
+      expect(h.fetched).toStrictEqual([]);
+      expect(h.tokenCalls()).toBe(0);
+      expect(h.limiterCalls).toStrictEqual([]);
+    }
+
+    it(`${routeId} admits both rate budgets and a lease before token or network work`, async () => {
+      const probes = recordingPublicProbes();
+      const h = harness({
+        publicProbes: probes,
+        getToken: async () => {
+          expect(probes.calls).toHaveLength(2);
+          expect(probes.acquired).toStrictEqual([PUBLIC_PROBE_BUDGET_POLICY]);
+          expect(probes.released).toStrictEqual([]);
+          return ID_TOKEN;
+        },
+        fetcher: async () => {
+          expect(probes.acquired).toStrictEqual([PUBLIC_PROBE_BUDGET_POLICY]);
+          expect(probes.released).toStrictEqual([]);
+          return markedResponse();
+        },
+      });
+      expect((await h.proxy(request(), localEnv(), guardEnv())).status).toBe(200);
+      expect(h.tokenCalls()).toBe(1);
+      expect(onlyUpstream(h).headers.has(EDGE_HEADERS.admission)).toBe(false);
+      expect(probes.names).toStrictEqual([publicProbeBudgetObjectName(routeId)]);
+      expect(probes.released).toStrictEqual([PROBE_LEASE_ID]);
+      expect(h.limiterCalls).toStrictEqual([]);
+    });
+
+    it(`${routeId} refuses absent and malformed capability without any upstream work`, async () => {
+      const probes = recordingPublicProbes();
+      const malformed: unknown[] = [
+        null,
+        {},
+        { ...probes.env, ENVIRONMENT: "test" },
+        { ...probes.env, IDENTITY_LINK_SECRET: undefined },
+        { ...probes.env, IDENTITY_LINK_SECRET: "a-different-synthetic-secret-00000000000" },
+        { ...probes.env, PUBLIC_PROBE_RATE_LIMIT: undefined },
+        { ...probes.env, PUBLIC_PROBE_RATE_LIMIT: {} },
+        { ...probes.env, PUBLIC_PROBE_CLIENT_RATE_LIMIT: undefined },
+        { ...probes.env, PUBLIC_PROBE_CLIENT_RATE_LIMIT: {} },
+        { ...probes.env, UPLOAD_INGRESS_BUDGET: undefined },
+        { ...probes.env, UPLOAD_INGRESS_BUDGET: {} },
+      ];
+      for (const capability of malformed) {
+        const h = harness({ publicProbeEnv: capability as EdgePublicProbeEnv | null });
+        await expectRefusal(h, await h.proxy(request(), localEnv(), guardEnv()), 503, "ADMISSION_CONFIGURATION_INVALID");
+      }
+      expect(probes.calls).toStrictEqual([]);
+      expect(probes.acquired).toStrictEqual([]);
+    });
+
+    for (const deniedCall of [1, 2]) {
+      it(`${routeId} refuses rate budget ${deniedCall} locally`, async () => {
+        const probes = recordingPublicProbes((call) => call !== deniedCall);
+        const h = harness({ publicProbes: probes });
+        const response = await h.proxy(request(), localEnv(), guardEnv());
+        await expectRefusal(h, response, 429, "ATTEMPT_LIMIT_REACHED");
+        expect(response.headers.get("retry-after")).toBe("60");
+        expect(probes.calls).toHaveLength(deniedCall);
+        expect(probes.acquired).toStrictEqual([]);
+        expect(probes.released).toStrictEqual([]);
+      });
+
+      it(`${routeId} fails closed when rate budget ${deniedCall} is unavailable`, async () => {
+        const probes = recordingPublicProbes((call) => call === deniedCall ? "throw" : true);
+        const h = harness({ publicProbes: probes });
+        const response = await h.proxy(request(), localEnv(), guardEnv());
+        await expectRefusal(h, response, 503, "ADMISSION_RATE_LIMIT_UNAVAILABLE");
+        expect(response.headers.get("retry-after")).toBe("60");
+        expect(probes.calls).toHaveLength(deniedCall);
+        expect(probes.acquired).toStrictEqual([]);
+      });
+    }
+
+    it(`${routeId} refuses a denied global lease before token work`, async () => {
+      const probes = recordingPublicProbes(() => true, false);
+      const h = harness({ publicProbes: probes });
+      await expectRefusal(h, await h.proxy(request(), localEnv(), guardEnv()), 429, "ATTEMPT_LIMIT_REACHED");
+      expect(probes.calls).toHaveLength(2);
+      expect(probes.names).toStrictEqual([publicProbeBudgetObjectName(routeId)]);
+      expect(probes.acquired).toStrictEqual([PUBLIC_PROBE_BUDGET_POLICY]);
+      expect(probes.released).toStrictEqual([]);
+    });
+
+    it(`${routeId} retains its lease at the deadline and never forwards a late token`, async () => {
+      vi.useFakeTimers();
+      let resolveToken!: (token: string) => void;
+      let started!: () => void;
+      const tokenStarted = new Promise<void>((resolve) => { started = resolve; });
+      const h = harness({
+        getToken: () => new Promise<string>((resolve) => { resolveToken = resolve; started(); }),
+      });
+      const pending = h.proxy(request(), localEnv(), guardEnv());
+      await tokenStarted;
+      await vi.advanceTimersByTimeAsync(PUBLIC_PROBE_MAXIMUM_MILLISECONDS - 1);
+      expect(h.publicProbes.released).toStrictEqual([]);
+      expect(h.fetched).toStrictEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("60");
+      expect(await envelope(response)).toMatchObject({ error: { code: "ADMISSION_RATE_LIMIT_UNAVAILABLE" } });
+      expect(h.tokenCalls()).toBe(1);
+      expect(h.publicProbes.released).toStrictEqual([]);
+      resolveToken(ID_TOKEN);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.fetched).toStrictEqual([]);
+      expect(h.publicProbes.released).toStrictEqual([PROBE_LEASE_ID]);
+      expect(h.logs).toStrictEqual([]);
+    });
+
+    it(`${routeId} retains its lease until late upstream headers settle and cancels their body`, async () => {
+      vi.useFakeTimers();
+      let resolveFetch!: (response: Response) => void;
+      let started!: () => void;
+      let cancelled = false;
+      const fetchStarted = new Promise<void>((resolve) => { started = resolve; });
+      const h = harness({
+        fetcher: () => new Promise<Response>((resolve) => { resolveFetch = resolve; started(); }),
+      });
+      const pending = h.proxy(request(), localEnv(), guardEnv());
+      await fetchStarted;
+      await vi.advanceTimersByTimeAsync(PUBLIC_PROBE_MAXIMUM_MILLISECONDS);
+      const response = await pending;
+      expect(response.status).toBe(503);
+      expect(await envelope(response)).toMatchObject({ error: { code: "ADMISSION_RATE_LIMIT_UNAVAILABLE" } });
+      expect(h.publicProbes.released).toStrictEqual([]);
+      resolveFetch(markedResponse(new ReadableStream({ cancel() { cancelled = true; } })));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancelled).toBe(true);
+      expect(h.publicProbes.released).toStrictEqual([PROBE_LEASE_ID]);
+      expect(h.fetched).toHaveLength(1);
+      expect(h.logs).toStrictEqual([]);
+    });
+  }
 });
 
 describe("request bodies", () => {
@@ -1467,6 +1680,7 @@ describe("upstream failure mapping", () => {
     h: Harness,
     response: Response,
     code: string,
+    routeClass = "health",
   ): Promise<void> {
     expect(response.status).toBe(503);
     expect(Object.fromEntries(response.headers)).toStrictEqual({
@@ -1488,7 +1702,7 @@ describe("upstream failure mapping", () => {
       event: "edge_upstream_unavailable",
       requestId: body.error.requestId,
       method: "GET",
-      routeClass: "health",
+      routeClass,
       code,
     });
   }
@@ -1505,7 +1719,7 @@ describe("upstream failure mapping", () => {
     expect(h.fetched).toHaveLength(0);
   });
 
-  it("maps a headers timeout and aborts the subrequest", async () => {
+  it("maps a non-probe headers timeout and aborts the subrequest", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let started!: () => void;
     const fetchStarted = new Promise<void>((resolve) => { started = resolve; });
@@ -1517,13 +1731,13 @@ describe("upstream failure mapping", () => {
         started();
       }),
     });
-    const pending = h.proxy(health(), localEnv(), guardEnv());
+    const pending = h.proxy(requestFor(PUBLIC_ORIGIN, exactRoute("session")), localEnv(), guardEnv());
     await fetchStarted;
     await vi.advanceTimersByTimeAsync(CONFIG.upstreamHeadersTimeoutSeconds * 1_000 - 1);
     expect(seen.signal?.aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(seen.signal?.aborted).toBe(true);
-    await expectUnavailable(h, await pending, "EDGE_UPSTREAM_TIMEOUT");
+    await expectUnavailable(h, await pending, "EDGE_UPSTREAM_TIMEOUT", "session");
   });
 
   it("never cuts a streaming body once headers have arrived", async () => {

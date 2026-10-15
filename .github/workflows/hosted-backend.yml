@@ -10,21 +10,21 @@ name: Hosted backend
 # private 0700 socket directory. The PGDG apt fallback documented there is not
 # in use.
 #
-# Node.js: every job runs the repository toolchain, 26.2.0. The
-# postgres-17-suite job also installs Node.js 22.16.0, the Cloud Run image
-# runtime, and names it to the suite as EDGE_E2E_NODE, because the edge
-# end-to-end spec runs the Cloud Run origin under the image runtime. It installs
+# Node.js: every execution job runs the repository toolchain, 26.2.0. The
+# postgres-17-suite shards also install Node.js 22.16.0, the Cloud Run image
+# runtime, and name it to the suite as EDGE_E2E_NODE, because the edge
+# end-to-end spec runs the Cloud Run origin under the image runtime. Each installs
 # 22.16.0 first and 26.2.0 last, so `node` on PATH, the suite itself and the
 # spec's seeding rehearsal (its importers need the newer node:sqlite) stay on
 # 26.2.0. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
 # workflow only.
 #
-# Dependencies: all three jobs install the root, Worker and Cloud Run lockfiles.
+# Dependencies: every execution job installs the root, Worker and Cloud Run lockfiles.
 # The Worker gate's gcp:fastpath:scripts-check imports apps/worker/cloud-run
 # modules, which need @google-cloud/cloud-sql-connector.
 #
 # Skip enforcement is machine-checked only for apps/worker/postgres-test: the
-# postgres-17-suite job fails on any skipped or todo test there, and on an
+# postgres-17-suite shards fail on any skipped or todo test there, and on an
 # environment gap such as a missing EDGE_E2E_NODE or EDGE_E2E_GOLDEN. The Worker
 # gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
@@ -38,7 +38,8 @@ name: Hosted backend
 # cutover seal check reads pinned commits as git objects; it fails, and never
 # skips, when they are absent. The postgres-17-suite job checks out full history
 # too, because the READ-EXPANSION specs archive their pinned base commit. The
-# Worker gate stays at depth 1. The PostgreSQL-backed part of
+# Worker gate needs full history for the vendor-kernel checks' pinned c766
+# facade and the d43c8f92 ancestry regression. The PostgreSQL-backed part of
 # that command, postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs, runs in the
 # postgres-17-suite job.
@@ -100,11 +101,25 @@ jobs:
     env:
       WRANGLER_SEND_METRICS: "false"
     steps:
+      # vendor:kernels:check reads the pinned c766 historical facade and
+      # d43c8f92~25; the selected revision alone cannot satisfy these checks.
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
+
+      # The production-shape checks execute real zsh cleanup and process probes.
+      - name: Install Worker process-check prerequisites
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh time procps
+          test -x /usr/bin/time
+          test -x /bin/ps
+          test -x /usr/bin/pgrep
+          zsh -ec 'zmodload zsh/datetime'
 
       - name: Install pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -137,7 +152,10 @@ jobs:
         run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
 
       - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
-        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+        run: node --test test/hosted-backend-workflow.test.js test/hosted-backend-process-sampler.test.js test/hosted-backend-resource-sampler.check.mjs test/worker-graph-thread-diagnostic.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+
+      - name: Check Linux process and measurement tooling early
+        run: npm --prefix apps/worker run gcp:fastpath:prod-shape:check
 
       # deploy:dry and staging:check stage production assets from a generated
       # public release site. Build one locally from the checked-out source with a
@@ -179,8 +197,37 @@ jobs:
             --support-url https://tibotattle.com/docs.html \
             --social-image "$social_card" > /dev/null
 
+      # Run the unchanged complete graph file before the longer gate. The
+      # launcher's fixed 240s cap does not alter any test timeout. This diagnostic
+      # must succeed, and never substitutes for the complete Worker gate below.
+      - name: Diagnose the complete Worker graph file early
+        run: node scripts/worker-graph-thread-diagnostic.mjs
+
       - name: Run the Worker gate
-        run: npm --prefix apps/worker run check
+        # The first vmstat report is since boot; subsequent reports cover 30s.
+        # Aggregate resource diagnostics do not establish readiness.
+        # Process samples are bounded, racy descendant observations, not causes.
+        run: |
+          set -euo pipefail
+          vmstat -w -t 30 &
+          resource_sampler_pid=$!
+          node scripts/hosted-backend-process-sampler.mjs --parent-pid "$$" &
+          process_sampler_pid=$!
+          cleanup_resource_sampler() {
+            worker_status=$?
+            trap - EXIT
+            kill "$process_sampler_pid" 2>/dev/null || true
+            kill "$resource_sampler_pid" 2>/dev/null || true
+            wait "$process_sampler_pid" 2>/dev/null || true
+            wait "$resource_sampler_pid" 2>/dev/null || true
+            exit "$worker_status"
+          }
+          trap cleanup_resource_sampler EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          npm --prefix apps/worker run check
+          kill -0 "$process_sampler_pid"
+          kill -0 "$resource_sampler_pid"
 
       - name: Stop PostgreSQL 17
         if: always()
@@ -254,9 +301,19 @@ jobs:
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
 
   postgres-17-suite:
-    name: PostgreSQL 17 suite
+    name: PostgreSQL 17 shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Each shard validates the complete canonical plan before selecting its
+    # closed partition. Separate clusters preserve the serial profile contract.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - vitest
+          - node-1
+          - node-2
+          - edge-e2e
     # The fast-path cloud-target specs also dial the server over loopback TCP:
     # the container's published 127.0.0.1 port (ciPostgresTcpProfile), which
     # differs from the socket's PG_TEST_PORT. The suite passes this pair to its
@@ -264,6 +321,7 @@ jobs:
     env:
       PG_TEST_TCP_HOST: "127.0.0.1"
       PG_TEST_TCP_PORT: "55432"
+      PG_SUITE_SHARD: ${{ matrix.shard }}
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -342,9 +400,22 @@ jobs:
       - name: Build the Cloud Run bundles the suite runs
         run: node apps/worker/cloud-run/build.mjs
 
-      - name: Run every PostgreSQL spec in its routed profile with zero skips
-        run: node apps/worker/scripts/ci-postgres-suite.mjs
+      - name: Run the canonical PostgreSQL shard in its routed profiles with zero skips
+        run: node apps/worker/scripts/ci-postgres-suite.mjs --shard "$PG_SUITE_SHARD"
 
       - name: Stop PostgreSQL 17
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  postgres-17-complete:
+    name: PostgreSQL 17 suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: always()
+    needs:
+      - postgres-17-suite
+    env:
+      PG_SUITE_RESULT: ${{ needs.postgres-17-suite.result }}
+    steps:
+      - name: Require every canonical PostgreSQL shard to pass
+        run: test "$PG_SUITE_RESULT" = success

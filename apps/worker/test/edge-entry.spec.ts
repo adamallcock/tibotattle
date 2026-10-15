@@ -101,7 +101,6 @@ const FORBIDDEN_ENV_NAMES = Object.freeze([
   "ANALYTICS_DB",
   "DELETION_LEDGER",
   "QUARANTINE",
-  "UPLOAD_INGRESS_BUDGET",
   "IDENTITY_LINK_SECRET",
   "APPLE_PRIVATE_KEY",
   "GOOGLE_OIDC_CLIENT_SECRET",
@@ -245,6 +244,8 @@ const syntheticAssets = {
 
 function guardSettings(): Record<string, unknown> {
   return {
+    SPARKLE_APPCAST_GUARD_RATE_LIMIT: runtime.SPARKLE_APPCAST_GUARD_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: runtime.UPLOAD_INGRESS_BUDGET,
     SPARKLE_RELEASES: runtime.QUARANTINE,
     SPARKLE_APPCAST_GUARD_MODE: "enabled",
     SPARKLE_APPCAST_GUARD_CHANNEL: SPARKLE_APPCAST_GUARD_CHANNEL,
@@ -286,6 +287,8 @@ function gcpValues(overrides: Record<string, unknown> = {}): Record<string, unkn
     EDGE_INVOKER_KEY_JSON: invokerKeyJson(),
     EDGE_CLIENT_KEY_SECRET: CLIENT_KEY_SECRET,
     RELEASE_GUARD_DB: runtime.STORAGE_INGESTION_B,
+    PUBLIC_PROBE_RATE_LIMIT: runtime.PUBLIC_PROBE_RATE_LIMIT,
+    PUBLIC_PROBE_CLIENT_RATE_LIMIT: runtime.PUBLIC_PROBE_CLIENT_RATE_LIMIT,
     ...limiterBindings(),
     ...overrides,
   };
@@ -322,7 +325,6 @@ function guardedEnv(values: Record<string, unknown>): GuardedEnv {
     ANALYTICS_DB: runtime.STORAGE_INGESTION_A,
     DELETION_LEDGER: runtime.DELETION_LEDGER,
     QUARANTINE: runtime.QUARANTINE,
-    UPLOAD_INGRESS_BUDGET: runtime.UPLOAD_INGRESS_BUDGET,
     ENVELOPE_PRIVATE_JWK: "synthetic-envelope-private-jwk",
     ENVELOPE_PUBLIC_JWK: "synthetic-envelope-public-jwk",
     IDENTITY_LINK_SECRET: "synthetic-identity-link-secret-000000000000",
@@ -373,6 +375,10 @@ const GCP_ENV_READS: ReadonlySet<string> = new Set([
   "EDGE_INVOKER_KEY_JSON",
   "EDGE_CLIENT_KEY_SECRET",
   "RELEASE_GUARD_DB",
+  "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+  "PUBLIC_PROBE_RATE_LIMIT",
+  "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+  "UPLOAD_INGRESS_BUDGET",
   ...EDGE_ADMISSION_BINDINGS,
   "DISTRIBUTION_ANALYTICS_ZONE_ID",
   "DISTRIBUTION_ANALYTICS_API_TOKEN",
@@ -708,6 +714,10 @@ describe("edge entry module surface", () => {
       "EDGE_UPSTREAM_MODE",
       "ENVIRONMENT",
       "RELEASE_GUARD_DB",
+      "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+      "PUBLIC_PROBE_RATE_LIMIT",
+      "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+      "UPLOAD_INGRESS_BUDGET",
     ].sort());
     // The two reviewed dynamic reads: the named-key copy and the contract's
     // own configuration getter.
@@ -797,16 +807,26 @@ describe("named-key env builders", () => {
     expect(Object.keys(sparse)).toEqual(["PUBLIC_ORIGIN"]);
   });
 
-  it("builds the guard env from the named keys plus the nonce-only facade", () => {
+  it("builds the guard env from named keys, explicit admission and the nonce-only facade", () => {
     const local = buildEdgeLocalEnv(gcpEnv());
-    const guard = buildEdgeGuardEnv(local, runtime.STORAGE_INGESTION_B);
+    const admission = {
+      SPARKLE_APPCAST_GUARD_RATE_LIMIT: runtime.SPARKLE_APPCAST_GUARD_RATE_LIMIT,
+      UPLOAD_INGRESS_BUDGET: runtime.UPLOAD_INGRESS_BUDGET,
+    };
+    const guardKeys = [...EDGE_LOCAL_ENV_KEYS, "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+      "UPLOAD_INGRESS_BUDGET", "USAGE_MONITOR_DB"];
+    const guard = buildEdgeGuardEnv(local, runtime.STORAGE_INGESTION_B, admission);
     expect(Object.isFrozen(guard)).toBe(true);
-    expect(Object.keys(guard)).toEqual([...EDGE_LOCAL_ENV_KEYS, "USAGE_MONITOR_DB"]);
+    expect(Object.keys(guard)).toEqual(guardKeys);
+    expect(guard.SPARKLE_APPCAST_GUARD_RATE_LIMIT).toBe(admission.SPARKLE_APPCAST_GUARD_RATE_LIMIT);
+    expect(guard.UPLOAD_INGRESS_BUDGET).toBe(admission.UPLOAD_INGRESS_BUDGET);
+    expect(Object.hasOwn(local, "UPLOAD_INGRESS_BUDGET")).toBe(false);
+    expect(Object.hasOwn(local, "SPARKLE_APPCAST_GUARD_RATE_LIMIT")).toBe(false);
     expect(guard.USAGE_MONITOR_DB).not.toBe(runtime.STORAGE_INGESTION_B);
     expect(() => guard.USAGE_MONITOR_DB.prepare("SELECT 1")).toThrow(EDGE_GUARD_DB_STATEMENT_REFUSED);
     // Handed a whole Worker env by mistake, it still copies named keys only.
-    const fromRaw = buildEdgeGuardEnv(gcpEnv(), runtime.STORAGE_INGESTION_B);
-    expect(Object.keys(fromRaw)).toEqual([...EDGE_LOCAL_ENV_KEYS, "USAGE_MONITOR_DB"]);
+    const fromRaw = buildEdgeGuardEnv(gcpEnv(), runtime.STORAGE_INGESTION_B, admission);
+    expect(Object.keys(fromRaw)).toEqual(guardKeys);
   });
 });
 
@@ -854,6 +874,12 @@ describe("worker mode", () => {
       expect(call?.[1], label).toBe(workerModeEnv);
       expect(call?.[2], label).toBe(ctx);
     }
+    // The parity comparisons legitimately consumed the two-start probe burst.
+    // Restore the synthetic environment before checking fresh-request statuses.
+    await reset();
+    await applyD1Migrations(runtime.USAGE_MONITOR_DB, runtime.TEST_MIGRATIONS);
+    await applyD1Migrations(runtime.DELETION_LEDGER, runtime.TEST_DELETION_LEDGER_MIGRATIONS);
+    await applyReleaseGuardMigration(runtime.STORAGE_INGESTION_B);
     const statuses = await Promise.all(samples.map(async ([, request]) =>
       (await edgeFetch(request(), workerModeEnv)).status));
     expect(statuses).toEqual([308, 200, 200, 200, 404, 405, 503, 404]);
@@ -1039,6 +1065,13 @@ describe("unconfigured modes", () => {
       { label: "RELEASE_GUARD_DB not a database", overrides: { RELEASE_GUARD_DB: { prepare: "SELECT 1" } } },
       ...EDGE_ADMISSION_BINDINGS.map((name) => ({ label: `${name} absent`, overrides: { [name]: undefined } })),
       ...EDGE_ADMISSION_BINDINGS.map((name) => ({ label: `${name} without limit()`, overrides: { [name]: {} } })),
+      ...["SPARKLE_APPCAST_GUARD_RATE_LIMIT", "PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT"]
+        .flatMap((name) => [
+          { label: `${name} absent`, overrides: { [name]: undefined } },
+          { label: `${name} without limit()`, overrides: { [name]: {} } },
+        ]),
+      { label: "UPLOAD_INGRESS_BUDGET absent", overrides: { UPLOAD_INGRESS_BUDGET: undefined } },
+      { label: "UPLOAD_INGRESS_BUDGET without getByName()", overrides: { UPLOAD_INGRESS_BUDGET: {} } },
       { label: "PUBLIC_ORIGIN absent", overrides: { PUBLIC_ORIGIN: undefined }, wwwRecognised: false },
       { label: "PUBLIC_ORIGIN not canonical", overrides: { PUBLIC_ORIGIN: `${PUBLIC_ORIGIN}/` }, wwwRecognised: false },
     ];
@@ -1163,15 +1196,15 @@ describe("gcp mode", () => {
     const pkcs8Imports = () => importKey.mock.calls.filter((call) => call[0] === "pkcs8").length;
 
     const first = gcpEnv();
-    expect((await edgeFetch(get(`${PUBLIC_ORIGIN}/api/health`), first)).status).toBe(200);
+    expect((await edgeFetch(get(`${PUBLIC_ORIGIN}/api/v1/community/daily`), first)).status).toBe(200);
     expect(pkcs8Imports()).toBe(1);
-    expect((await edgeFetch(get(`${PUBLIC_ORIGIN}/api/health`), first)).status).toBe(200);
+    expect((await edgeFetch(get(`${PUBLIC_ORIGIN}/api/v1/community/daily`), first)).status).toBe(200);
     expect((await edgeFetch(get(`${PUBLIC_ORIGIN}/api/v1/community/daily`), first)).status).toBe(200);
     expect(pkcs8Imports()).toBe(1);
     // Concurrent first requests on a fresh env share one construction.
     const concurrent = gcpEnv();
     const statuses = await Promise.all([1, 2, 3].map(async () =>
-      (await edgeFetch(get(`${PUBLIC_ORIGIN}/api/health`), concurrent)).status));
+      (await edgeFetch(get(`${PUBLIC_ORIGIN}/api/v1/community/daily`), concurrent)).status));
     expect(statuses).toEqual([200, 200, 200]);
     expect(pkcs8Imports()).toBe(2);
 
@@ -1236,6 +1269,60 @@ describe("gcp mode", () => {
 });
 
 describe("release guard in gcp mode", () => {
+  it("refuses appcast admission before body reads, nonce writes or upstream work", async () => {
+    const network = stubNetwork();
+    const rateCalls: string[] = [];
+    let budgetCalls = 0;
+    let bodyReads = 0;
+    const denied = await signedGuardRequest(await guardBody(), "gcp-admission-nonce-01");
+    const request = new Request(denied, {
+      body: new ReadableStream<Uint8Array>({ pull() { bodyReads += 1; } }, { highWaterMark: 0 }),
+    });
+    const result = await edgeFetch(request, gcpEnv({
+      SPARKLE_APPCAST_GUARD_RATE_LIMIT: {
+        limit: async ({ key }: { key: string }) => { rateCalls.push(key); return { success: false }; },
+      },
+      UPLOAD_INGRESS_BUDGET: { getByName() { budgetCalls += 1; throw new Error("must not acquire"); } },
+    }));
+    expect(result.status).toBe(429);
+    expect(result.headers.get("retry-after")).toBe("60");
+    expect(await result.json()).toMatchObject({ error: { code: "ATTEMPT_LIMIT_REACHED" } });
+    expect(rateCalls).toEqual(["usage-monitor:appcast_guard:global"]);
+    expect(budgetCalls).toBe(0);
+    expect(bodyReads).toBe(0);
+    expect(await nonceRows(runtime.STORAGE_INGESTION_B)).toEqual([]);
+    expect(network.requests).toHaveLength(0);
+  });
+
+  it("uses the separate appcast lease and preserves global-budget refusal", async () => {
+    const network = stubNetwork();
+    const names: string[] = [];
+    const policies: unknown[] = [];
+    const result = await edgeFetch(
+      await signedGuardRequest(await guardBody(), "gcp-budget-nonce-0001"),
+      gcpEnv({
+        SPARKLE_APPCAST_GUARD_RATE_LIMIT: { limit: async () => ({ success: true }) },
+        UPLOAD_INGRESS_BUDGET: {
+          getByName(name: string) {
+            names.push(name);
+            return { acquire: async (policy: unknown) => {
+              policies.push(policy);
+              return { allowed: false, leaseId: null, retryAfterSeconds: 7 };
+            } };
+          },
+        },
+      }),
+    );
+    expect(result.status).toBe(429);
+    expect(result.headers.get("retry-after")).toBe("7");
+    expect(names).toEqual(["appcast-guard-body-budget-v1"]);
+    expect(policies).toEqual([{
+      maximumConcurrent: 4, maximumStartsPerMinute: 12, burst: 4, leaseMilliseconds: 30_000,
+    }]);
+    expect(await nonceRows(runtime.STORAGE_INGESTION_B)).toEqual([]);
+    expect(network.requests).toHaveLength(0);
+  });
+
   it("writes only nonce rows to the release guard D1 and refuses a replay as worker mode does", async () => {
     const network = stubNetwork();
     await installArtifact("1");

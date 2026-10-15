@@ -1,0 +1,23 @@
+name: Prepare unprivileged Windows build dependencies
+description: Refuse signing authority before installing or executing build dependencies
+runs:
+  using: composite
+  steps:
+    - name: Refuse OIDC authority in build and qualification jobs
+      shell: pwsh
+      run: |
+        if ($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN -or $env:ACTIONS_ID_TOKEN_REQUEST_URL) { throw 'WINDOWS_BUILD_MUST_NOT_HAVE_OIDC' }
+    - name: Admit exact Node and pnpm archives before execution
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        node scripts/prepare-windows-build-bootstrap.mjs --output-root .release-build/windows-build-bootstrap
+        if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BUILD_BOOTSTRAP_FAILED' }
+        & ./scripts/expand-windows-build-bootstrap.ps1 -BootstrapRoot .release-build/windows-build-bootstrap
+        $nodeRoot = (Resolve-Path '.release-build/windows-build-bootstrap/node/node-v26.2.0-win-x64').Path
+        $node = Join-Path $nodeRoot 'node.exe'
+        if ((& $node --version) -cne 'v26.2.0' -or $LASTEXITCODE -ne 0) { throw 'WINDOWS_BUILD_NODE_VERSION_MISMATCH' }
+        $nodeRoot | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        $env:PATH = "$nodeRoot;$env:PATH"
+        & $node .release-build/windows-build-bootstrap/pnpm/package/bin/pnpm.mjs install --frozen-lockfile --ignore-scripts
+        if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }

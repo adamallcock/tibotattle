@@ -33,3 +33,6 @@
 !.release-build/electron-linux-updater-rehearsal/current/*.AppImage
 !.release-build/electron-linux-updater-rehearsal/next/
 !.release-build/electron-linux-updater-rehearsal/next/*.AppImage
+!.release-build/electron-linux-updater-rehearsal/qualification/
+!.release-build/electron-linux-updater-rehearsal/qualification/qualification.json
+!.release-build/electron-linux-updater-rehearsal/qualification/latest-linux.yml

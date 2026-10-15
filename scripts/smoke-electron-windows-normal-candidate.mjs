@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 import { dirname, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createAuthorizedRendererFetch } from "./lib/authorized-renderer-fetch.mjs";
 
 import {
   createWindowsFilesystemAdapter,
@@ -3045,6 +3046,10 @@ export function classifyWindowsNormalCandidateModelPerformance(value) {
 }
 
 async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
+  // Injected fetch is the existing synthetic harness seam. Real qualification
+  // reads and operation grants stay inside the authenticated renderer.
+  fetchImpl = fetchImpl === globalThis.fetch
+    ? createAuthorizedRendererFetch(cdp, { timeoutMs: OPERATION_TIMEOUT_MS }) : fetchImpl;
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
   const observer = localNetworkObserver(cdp, dashboard.origin);

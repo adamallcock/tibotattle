@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -85,10 +86,10 @@ function waitForReady(child, output, timeoutMs = 30_000) {
   });
 }
 
-async function waitForOverview(origin, timeoutMs = 30_000) {
+async function waitForOverview(origin, headers, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const response = await fetch(`${origin}/api/local/overview`);
+    const response = await fetch(`${origin}/api/local/overview`, { headers });
     if (response.status === 200) return response.json();
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
@@ -98,6 +99,7 @@ async function waitForOverview(origin, timeoutMs = 30_000) {
 test("local companion runs as a private synthetic child process and shuts down", async () => {
   const files = await fixture();
   const output = { stdout: "", stderr: "" };
+  const localCapability = randomBytes(32).toString("base64url");
   const environment = {
     ...process.env,
     HOME: files.profile,
@@ -107,24 +109,28 @@ test("local companion runs as a private synthetic child process and shuts down",
     USAGE_MONITOR_RESOURCE_ROOT: REPOSITORY_ROOT,
     USAGE_MONITOR_STATE_ROOT: files.stateRoot,
     USAGE_MONITOR_PORT: "0",
+    USAGE_MONITOR_LOCAL_AUTH_FD: "5",
   };
   delete environment.USAGE_MONITOR_CENTRAL_ORIGIN;
   const child = spawn(process.execPath, ["apps/local/server.js"], {
     cwd: REPOSITORY_ROOT,
     env: environment,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"],
     windowsHide: true,
   });
+  child.stdio[5].end(`${localCapability}\n`);
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk) => { output.stdout += chunk; });
   child.stderr.on("data", (chunk) => { output.stderr += chunk; });
   try {
     const origin = await waitForReady(child, output);
-    const health = await fetch(`${origin}/api/local/health`).then((response) => response.json());
-    const onboarding = await fetch(`${origin}/api/local/onboarding`).then((response) => response.json());
-    const overview = await waitForOverview(origin);
-    const refresh = await fetch(`${origin}/api/local/refresh`).then((response) => response.json());
+    const headers = { "X-TiboTattle-Local-Capability": localCapability };
+    assert.equal((await fetch(`${origin}/api/local/health`)).status, 403);
+    const health = await fetch(`${origin}/api/local/health`, { headers }).then((response) => response.json());
+    const onboarding = await fetch(`${origin}/api/local/onboarding`, { headers }).then((response) => response.json());
+    const overview = await waitForOverview(origin, headers);
+    const refresh = await fetch(`${origin}/api/local/refresh`, { headers }).then((response) => response.json());
     const page = await fetch(`${origin}/`);
     assert.equal(page.status, 200);
     assert.equal(health.capabilities.localDashboard, true);
@@ -137,6 +143,9 @@ test("local companion runs as a private synthetic child process and shuts down",
     const publicEvidence = JSON.stringify({ health, onboarding, overview, refresh });
     assert.equal(publicEvidence.includes(PRIVATE_CANARY), false);
     assert.equal(publicEvidence.includes(files.root), false);
+    // An inherited desktop credential must stay in the private pipe/process;
+    // only an explicit standalone browser launch publishes an access file.
+    await assert.rejects(lstat(join(files.stateRoot, "private", "dashboard-access.json")), { code: "ENOENT" });
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGTERM");
@@ -156,6 +165,7 @@ test("local companion runs as a private synthetic child process and shuts down",
       });
     }
     assert.equal(`${output.stdout}\n${output.stderr}`.includes(PRIVATE_CANARY), false);
+    assert.equal(`${output.stdout}\n${output.stderr}`.includes(localCapability), false);
     await rm(files.root, { recursive: true, force: true });
   }
 });

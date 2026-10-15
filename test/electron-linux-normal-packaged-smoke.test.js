@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { PassThrough } from "node:stream";
@@ -8,6 +9,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
 import {
   assertSyntheticCodexFixture,
   classifyLinuxNormalPackagedObservation,
@@ -322,7 +324,10 @@ function productionMetadata(sourceRevision = SOURCE_REVISION) {
   });
 }
 
-function sourceCandidate({ sourceRevision = SOURCE_REVISION, version = "0.1.0" } = {}) {
+function sourceCandidate({ sourceRevision = SOURCE_REVISION, version = "0.1.0",
+  updaterEnabled = productionElectronCandidatePlan({ target: "linux-x64", sourceRevision,
+    buildNumber: "12345", hostPlatform: "linux", hostArchitecture: "x64" }).updaterEnabled,
+} = {}) {
   return {
     status: "production_source_staged",
     target: "linux-x64",
@@ -330,7 +335,7 @@ function sourceCandidate({ sourceRevision = SOURCE_REVISION, version = "0.1.0" }
     version,
     stagingDirectory: ".release-build/electron-production/linux-x64/app",
     builderConfiguration: "apps/electron/electron-builder.production.config.cjs",
-    updaterEnabled: true,
+    updaterEnabled,
     signingRequired: false,
     signingPerformed: false,
     publishingPerformed: false,
@@ -459,6 +464,39 @@ test("normal packaged Linux smoke binds staged and archived stable metadata to t
     sourceCandidate: { ...sourceCandidate(), target: "darwin-arm64" },
     stagedManifest: manifest, archiveManifest: manifest, sourceRevision: SOURCE_REVISION,
   }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_CANDIDATE_INVALID" });
+});
+
+test("normal packaged Linux updater availability follows valid embedded policy and keeps binary signing separate", () => {
+  const { publicKey } = generateKeyPairSync("ed25519");
+  const rooted = [{ id: "synthetic-packaged-availability",
+    publicKey: publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("base64"),
+    minimumSequence: 1, maximumSequence: 10 }];
+  const manifest = { version: "0.1.0", tibotattleDistribution: productionMetadata() };
+  const metadataInput = candidate => ({ sourceCandidate: candidate,
+    stagedManifest: manifest, archiveManifest: structuredClone(manifest), sourceRevision: SOURCE_REVISION });
+  const failure = { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_CANDIDATE_INVALID" };
+  for (const [linuxUpdateKeys, updaterEnabled] of [[[], false], [rooted, true]]) {
+    const candidate = sourceCandidate({ updaterEnabled });
+    assert.equal(validateLinuxNormalPackagedSmokeMetadata(metadataInput(candidate), { linuxUpdateKeys }).target, "linux-x64");
+    for (const mismatch of [!updaterEnabled, null, "true", 1]) {
+      assert.throws(() => validateLinuxNormalPackagedSmokeMetadata(metadataInput({ ...candidate, updaterEnabled: mismatch }), { linuxUpdateKeys }), failure);
+    }
+    for (const mutation of [{ signingRequired: true }, { signingPerformed: true }, { publishingPerformed: true }]) {
+      assert.throws(() => validateLinuxNormalPackagedSmokeMetadata(metadataInput({ ...candidate, ...mutation }), { linuxUpdateKeys }), failure);
+    }
+  }
+  for (const linuxUpdateKeys of [null, {}, [{ ...rooted[0], publicKey: "malformed" }],
+    [{ ...rooted[0], minimumSequence: 0 }], [{ ...rooted[0], maximumSequence: 0 }],
+    [{ ...rooted[0], replacementFeed: "https://untrusted.example" }], [rooted[0], rooted[0]]]) {
+    for (const updaterEnabled of [false, true]) {
+      assert.throws(() => validateLinuxNormalPackagedSmokeMetadata(metadataInput(sourceCandidate({ updaterEnabled })), { linuxUpdateKeys }), failure);
+    }
+  }
+  const reviewed = sourceCandidate();
+  assert.doesNotThrow(() => validateLinuxNormalPackagedSmokeMetadata(metadataInput(reviewed)));
+  assert.throws(() => validateLinuxNormalPackagedSmokeMetadata(metadataInput({ ...reviewed,
+    updaterEnabled: !reviewed.updaterEnabled, linuxUpdateKeys: rooted })), failure,
+  "candidate-supplied roots cannot override the reviewed production policy");
 });
 
 test("normal packaged Linux smoke verifies the exact source, ASAR, executable, and native pair before launch", async () => {

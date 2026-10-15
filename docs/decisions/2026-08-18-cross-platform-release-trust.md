@@ -172,7 +172,10 @@ runner isolation and input-boundary evidence.
 2. Finish native Windows x64 qualification, select one installer, add
    Authenticode/timestamp evidence, and verify clean install, upgrade, and
    uninstall.
-3. Qualify a native Linux x86_64 AppImage and its update/no-update boundary.
+3. Qualify a native Linux x86_64 AppImage and its update/no-update boundary,
+   including the [independent publisher signature and replay contract](./2026-10-12-linux-update-publisher-authentication.md).
+   Current source has no provisioned Linux root and fails closed for in-app
+   updates and authenticated feed publication.
 4. Add Store channels and additional architectures only as separate subjects
    after their native gates pass.
 5. Add GitHub artifact attestations and trusted workflow constraints to each

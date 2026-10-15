@@ -86,7 +86,7 @@ Remaining scheduled evidence:
 4. Confirm allocation and first-walk costs with the corpus mix; measure combined parent/child dense-workers heap peaks against unchanged budgets.
 5. After measured local savings, project with the program's model factor 2.51 and labelled owner/total-work bounds. No cloud saving is inferred from these micro measurements.
 
-Raw content-free logs and aggregate reports are archived under `/Users/adamallcock/Documents/Coding/tibotattle-gcp-parity/receipts/perf-model-residue-2026-10-03/codex-model-residue-20261003/` with directory mode 700. `validation-summary.json` distinguishes qualified final gates from failed or unqualified history.
+Raw content-free logs and aggregate reports are archived under `<owner-only model-residue evidence directory>` with directory mode 700. `validation-summary.json` distinguishes qualified final gates from failed or unqualified history.
 
 No private PostgreSQL cluster was created, so none required teardown. Validation worktrees are local throwaway copies; the implementation branch is preserved. No corpus disk footprint or private session data was created.
 

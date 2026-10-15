@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { posix } from "node:path";
 
 import {
@@ -9,6 +10,10 @@ import {
 } from "../../src/platform/index.js";
 import { shellError } from "./errors.js";
 import { createCompanionReadyLineParser } from "./ready-line.js";
+import {
+  isPrivateCompanionURL,
+  prepareDesktopBrowserAuthorization,
+} from "./desktop-local-authorization.js";
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
@@ -151,6 +156,9 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
   selected.ELECTRON_RUN_AS_NODE = "1";
   selected.USAGE_MONITOR_PORT = "0";
   selected.USAGE_MONITOR_PARENT_PID = String(parentPid);
+  // The descriptor number is public configuration; its bytes are sent only
+  // through a separate inherited pipe, never argv, environment, or stdout.
+  selected.USAGE_MONITOR_LOCAL_AUTH_FD = "5";
   // Only an explicitly composed parent broker can announce this descriptor.
   // An inherited native-app FD is never accepted from the launch environment.
   if (credentialBrokerKind === "macos_keychain") {
@@ -193,8 +201,10 @@ export function createCompanionSupervisor({
   attachLinuxSecretServiceBroker,
   attachWindowsAccountObservationBroker,
   attachLinuxAccountObservationBroker,
+  fetchImpl = globalThis.fetch,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
+  if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl is required");
   if (typeof command !== "string" || command.length === 0) {
     throw new TypeError("command is required");
   }
@@ -242,6 +252,7 @@ export function createCompanionSupervisor({
   let state = "stopped";
   let child = null;
   let ready = null;
+  let localCapability = null;
   let startPromise = null;
   let stopPromise = null;
   let generation = 0;
@@ -313,6 +324,8 @@ export function createCompanionSupervisor({
     if (state === "stopping") return Promise.reject(shellError("companion_busy"));
 
     const currentGeneration = ++generation;
+    const currentCapability = randomBytes(32).toString("base64url");
+    localCapability = null;
     state = "starting";
     startPromise = new Promise((resolveStart, rejectStart) => {
       let settled = false;
@@ -366,6 +379,7 @@ export function createCompanionSupervisor({
           state = "stopped";
           child = null;
           ready = null;
+          localCapability = null;
         }
         terminateStartupChild(
           currentChild,
@@ -393,6 +407,7 @@ export function createCompanionSupervisor({
         state = "ready";
         child = currentChild;
         ready = value;
+        localCapability = currentCapability;
         observeChildReady(currentChildLifecycleObservation);
         resolveStart(value);
       };
@@ -423,6 +438,7 @@ export function createCompanionSupervisor({
         if (currentGeneration !== generation || child !== currentChild) return;
         child = null;
         ready = null;
+        localCapability = null;
         state = "stopped";
         try {
           unexpectedExitHandler?.(Object.freeze({ kind: "companion_exit" }));
@@ -441,10 +457,8 @@ export function createCompanionSupervisor({
           // Fixed Windows/Linux observation and accountless messages share
           // one inherited Node IPC channel with distinct closed schemas.
           // macOS and legacy Linux qualification retain their FD4 pipes.
-          stdio: selectedCredentialBroker
-            ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
-            : (attachPrivateChannel || selectedAccountObservationBroker)
-              ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
+          stdio: ["ignore", "pipe", "pipe", requiresNodeIpc ? "ipc" : "ignore",
+            selectedCredentialBroker ? "pipe" : "ignore", "pipe"],
           windowsHide: true,
         });
       } catch {
@@ -490,6 +504,19 @@ export function createCompanionSupervisor({
       currentChild.stdout.on("data", onStdout);
       currentChild.once("exit", onExit);
       currentChild.on?.("error", onError);
+      const authorizationPipe = currentChild.stdio?.[5];
+      if (typeof authorizationPipe?.end !== "function") {
+        fail(shellError("companion_spawn_failed"));
+        return;
+      }
+      authorizationPipe.on?.("error", () => {
+        if (currentGeneration !== generation) return;
+        localCapability = null;
+        if (!settled) fail(shellError("companion_spawn_failed"));
+        else killChild(currentChild, "SIGKILL");
+      });
+      try { authorizationPipe.end(`${currentCapability}\n`); }
+      catch { fail(shellError("companion_spawn_failed")); return; }
       startupTimer = setTimer(() => {
         fail(shellError("companion_start_timeout"));
       }, startupTimeoutMs);
@@ -500,6 +527,7 @@ export function createCompanionSupervisor({
   }
 
   function stop() {
+    localCapability = null;
     if (stopPromise !== null) return stopPromise;
     if (child === null) {
       if (state === "starting") return Promise.reject(shellError("companion_busy"));
@@ -548,9 +576,34 @@ export function createCompanionSupervisor({
     return stopPromise;
   }
 
+  // Main-process composition only. Never include this capability in a
+  // ready/status DTO or expose this method through preload/IPC.
+  function requestAuthorizationHeaders(url) {
+      if (state !== "ready" || localCapability === null
+          || !isPrivateCompanionURL(url, ready?.origin)) {
+        throw shellError("companion_not_running");
+      }
+      return Object.freeze({ "X-TiboTattle-Local-Capability": localCapability });
+  }
+
   return Object.freeze({
     start,
     stop,
+    requestAuthorizationHeaders,
+    async prepareBrowserAuthorization(origin) {
+      const selectedGeneration = generation;
+      const assertCurrent = () => {
+        if (state !== "ready" || generation !== selectedGeneration || ready?.origin !== origin) {
+          throw shellError("desktop_dashboard_browser_unavailable");
+        }
+      };
+      assertCurrent();
+      await prepareDesktopBrowserAuthorization({ origin, fetchImpl,
+        requestAuthorizationHeaders(url) { assertCurrent(); return requestAuthorizationHeaders(url); },
+      });
+      assertCurrent();
+      return true;
+    },
     invalidatePrivateChannel() { return privateChannel?.invalidate(); },
     setUnexpectedExitHandler(handler) {
       if (handler !== undefined && typeof handler !== "function") {

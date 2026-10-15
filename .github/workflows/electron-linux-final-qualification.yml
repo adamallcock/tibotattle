@@ -10,7 +10,7 @@ on:
         default: plan
         required: true
       intake:
-        description: Closed intake v1 (027) or v2 (028), with original sourceCandidate and exact successful package run and byte identities
+        description: Signed-feed intake v3 (027) or v4 (028), with original sourceCandidate, exact package identities and owner-signed feed bytes
         type: string
         required: true
       confirmation:
@@ -74,6 +74,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/qualify-electron-linux-installed-lifecycle.mjs --acquire
+      - name: Build minimal extraction boundary before inspecting downloaded executables
+        if: inputs.mode == 'execute'
+        env:
+          QUALIFICATION_RUNNER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build --platform=linux/amd64 --network=none --file containers/electron-linux-extraction/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$QUALIFICATION_RUNNER" \
+            --tag tibotattle-electron-linux-extraction:test .
+          TIBOTATTLE_LINUX_EXTRACTION_SMOKE=1 node --test test/electron-linux-extraction.test.js
       - name: Inspect final bytes without rebuilding application source
         if: inputs.mode == 'execute'
         run: node scripts/qualify-electron-linux-installed-lifecycle.mjs --prepare
@@ -96,6 +106,9 @@ jobs:
       - name: Remove only recorded owned runtime, trace instances and profiles after interruption
         if: always() && inputs.mode == 'execute'
         run: timeout --signal=TERM --kill-after=15s 90s node scripts/run-electron-linux-final-lifecycle.mjs --cleanup
+      - name: Remove only recorded owned extraction containers after interruption
+        if: always() && inputs.mode == 'execute'
+        run: timeout 60s node scripts/qualify-electron-linux-installed-lifecycle.mjs --cleanup-extraction
       - name: Retain content-free exact-byte evidence
         if: always() && inputs.mode == 'execute'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

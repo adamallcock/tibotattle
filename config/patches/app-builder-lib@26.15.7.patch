@@ -1,34 +1,73 @@
 diff --git a/out/codeSign/windowsSignAzureManager.js b/out/codeSign/windowsSignAzureManager.js
-index 988ab7f..c6a451d 100644
+index 988ab7fd60c48aeae08884de09de94d120fe6bef..b910e5a59a00b04b55a3915fd2cc6696c62c9ebb 100644
 --- a/out/codeSign/windowsSignAzureManager.js
 +++ b/out/codeSign/windowsSignAzureManager.js
-@@ -35,7 +35,7 @@ class WindowsSignAzureManager {
-             // Logging to debug just in case users run into this. If NuGet isn't present, Install-Module -Name TrustedSigning will fail, so we'll get the logs at that point
-             builder_util_1.log.debug({ message: error.message || error.stack }, "unable to install PackageProvider Nuget. Might be a false alarm though as some systems already have it installed");
-         }
--        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-Module -Name TrustedSigning -MinimumVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser"]);
-+        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser"]);
-         // If signing has been misconfigured it, the error from the TrustedSigning module should be descriptive enough to help them fix their configuration.
-         // Options: https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition
+@@ -24,48 +24,24 @@ class WindowsSignAzureManager {
+         this.platformSpecificBuildOptions = packager.platformSpecificBuildOptions;
      }
-@@ -59,8 +59,11 @@ class WindowsSignAzureManager {
-             Files: vm.toVmFile(options.path),
-         };
-         const paramsString = Object.entries(params)
+     async initialize() {
+-        const vm = await this.packager.vm.value;
+-        const ps = await vm.powershellCommand.value;
+-        builder_util_1.log.info(null, "installing required module (TrustedSigning) with scope CurrentUser");
+-        try {
+-            await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser"]);
++        const hook = this.platformSpecificBuildOptions.windowsSigningTransferHook;
++        const stage = this.platformSpecificBuildOptions.windowsSigningTransferStage;
++        if (typeof hook !== "string" || !require("path").isAbsolute(hook)
++            || !["application", "uninstaller"].includes(stage)) {
++            throw new builder_util_1.InvalidConfigurationError("Windows builder signing requires an unprivileged transfer hook");
+         }
+-        catch (error) {
+-            // Might not be needed, seems GH runners already have NuGet set up.
+-            // Logging to debug just in case users run into this. If NuGet isn't present, Install-Module -Name TrustedSigning will fail, so we'll get the logs at that point
+-            builder_util_1.log.debug({ message: error.message || error.stack }, "unable to install PackageProvider Nuget. Might be a false alarm though as some systems already have it installed");
+-        }
+-        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", "Install-Module -Name TrustedSigning -MinimumVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser"]);
+-        // If signing has been misconfigured it, the error from the TrustedSigning module should be descriptive enough to help them fix their configuration.
+-        // Options: https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition
++        this.transfer = require(hook);
++        this.transfer.assertUnprivileged();
+     }
+     computePublisherName() {
+         return Promise.resolve(this.packager.platformSpecificBuildOptions.azureSignOptions.publisherName);
+     }
+-    // prerequisite: requires `initializeProviderModules` to already have been executed
++    // Builder only records immutable subjects. Signing credentials and the
++    // signer executable live in a separate workflow job with no builder code.
+     async signFile(options) {
+-        const vm = await this.packager.vm.value;
+-        const ps = await vm.powershellCommand.value;
+-        const { publisherName: _publisher, // extract from `extraSigningArgs`
+-        endpoint, certificateProfileName, codeSigningAccountName, fileDigest, timestampRfc3161, timestampDigest, ...extraSigningArgs } = options.options.azureSignOptions;
+-        const params = {
+-            ...extraSigningArgs,
+-            Endpoint: endpoint,
+-            CertificateProfileName: certificateProfileName,
+-            CodeSigningAccountName: codeSigningAccountName,
+-            TimestampRfc3161: timestampRfc3161 || "http://timestamp.acs.microsoft.com",
+-            TimestampDigest: timestampDigest || "SHA256",
+-            FileDigest: fileDigest || "SHA256",
+-            Files: vm.toVmFile(options.path),
+-        };
+-        const paramsString = Object.entries(params)
 -            .filter(([_, value]) => value != null)
-+            .filter(([_, value]) => value != null && value !== false)
-             .reduce((res, [field, value]) => {
-+            if (value === true) {
-+                return [...res, `-${field}`];
-+            }
-             const escapedValue = String(value).replace(/'/g, "''");
-             return [...res, `-${field}`, `'${escapedValue}'`];
-         }, [])
+-            .reduce((res, [field, value]) => {
+-            const escapedValue = String(value).replace(/'/g, "''");
+-            return [...res, `-${field}`, `'${escapedValue}'`];
+-        }, [])
+-            .join(" ");
+-        await vm.exec(ps, ["-NoProfile", "-NonInteractive", "-Command", `Invoke-TrustedSigning ${paramsString}`]);
++        if (!this.transfer) throw new builder_util_1.InvalidConfigurationError("Windows signing transfer is not initialized");
++        this.transfer.assertUnprivileged();
++        await this.transfer.recordSubject(options.path, this.platformSpecificBuildOptions.windowsSigningTransferStage);
+         return true;
+     }
+ }
 diff --git a/out/options/winOptions.d.ts b/out/options/winOptions.d.ts
-index d891297..b32d458 100644
+index d891297253f80a7855653cb025431ac234a610e9..15d71d14ab56dafcb127d5f805592b23f4253f9e 100644
 --- a/out/options/winOptions.d.ts
 +++ b/out/options/winOptions.d.ts
-@@ -68,6 +68,14 @@ export interface WindowsConfiguration extends PlatformSpecificBuildOptions {
+@@ -68,6 +68,18 @@ export interface WindowsConfiguration extends PlatformSpecificBuildOptions {
       * @default null
       */
      readonly signExts?: string[] | null;
@@ -36,6 +75,10 @@ index d891297..b32d458 100644
 +     * @private Internal evidence root for a reviewed Windows signing operation ledger.
 +     */
 +    readonly windowsSigningOperationEvidenceRoot?: string | null;
++    /** @private Unprivileged signing transfer adapter. */
++    readonly windowsSigningTransferHook?: string | null;
++    /** @private Closed packaging stage. */
++    readonly windowsSigningTransferStage?: "application" | "uninstaller" | null;
 +    /**
 +     * @private Internal fixed ledger filename for Windows signing operations.
 +     */
@@ -43,12 +86,54 @@ index d891297..b32d458 100644
  }
  export type RequestedExecutionLevel = "asInvoker" | "highestAvailable" | "requireAdministrator";
  export interface WindowsSigntoolConfiguration {
-@@ -160,5 +168,5 @@ export interface WindowsAzureSigningConfiguration {
-      * Allow other CLI parameters (verbatim case-sensitive) to `Invoke-TrustedSigning`
-      * Note: Key-Value pairs with `undefined`/`null` value are filtered out of the command.
+@@ -118,47 +130,7 @@ export interface WindowsSigntoolConfiguration {
       */
+     readonly publisherName?: string | Array<string> | null;
+ }
++/** Publisher metadata only. Authenticated signing is a separate workflow job. */
+ export interface WindowsAzureSigningConfiguration {
+-    /**
+-     * [The publisher name](https://github.com/electron-userland/electron-builder/issues/1187#issuecomment-278972073), exactly as in your code signed certificate. Several names can be provided.
+-     */
+     readonly publisherName: string;
+-    /**
+-     * The Trusted Signing Account endpoint. The URI value must have a URI that aligns to the
+-     * region your Trusted Signing Account and Certificate Profile you are specifying were created
+-     * in during the setup of these resources.
+-     *
+-     * Translates to field: Endpoint
+-     *
+-     * Requires one of environment variable configurations for authenticating to Microsoft Entra ID per [Microsoft's documentation](https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition)
+-     */
+-    readonly endpoint: string;
+-    /**
+-     * The Certificate Profile name. Translates to field: CertificateProfileName
+-     */
+-    readonly certificateProfileName: string;
+-    /**
+-     * The Code Signing Signing Account name. Translates to field: CodeSigningAccountName
+-     */
+-    readonly codeSigningAccountName: string;
+-    /**
+-     * The File Digest for signing each file. Translates to field: FileDigest
+-     * @default SHA256
+-     */
+-    readonly fileDigest?: string;
+-    /**
+-     * The Timestamp rfc3161 server. Translates to field: TimestampRfc3161
+-     * @default http://timestamp.acs.microsoft.com
+-     */
+-    readonly timestampRfc3161?: string;
+-    /**
+-     * The Timestamp Digest. Translates to field: TimestampDigest
+-     * @default SHA256
+-     */
+-    readonly timestampDigest?: string;
+-    /**
+-     * Allow other CLI parameters (verbatim case-sensitive) to `Invoke-TrustedSigning`
+-     * Note: Key-Value pairs with `undefined`/`null` value are filtered out of the command.
+-     */
 -    [k: string]: string | Nullish;
-+    [k: string]: string | boolean | Nullish;
  }
 diff --git a/out/packager.js b/out/packager.js
 --- a/out/packager.js
@@ -382,21 +467,76 @@ index 2e68fb5..f6ef00b 100644
 \ No newline at end of file
 +//# sourceMappingURL=winPackager.js.map
 diff --git a/scheme.json b/scheme.json
-index bee12b6..244353d 100644
+index bee12b64d777332cb095efcc700cdec0b64cb0c0..575715cd64719600c0902745ff5126c3a935a4ad 100644
 --- a/scheme.json
 +++ b/scheme.json
-@@ -8347,6 +8347,7 @@
-       "additionalProperties": {
-         "type": [
-           "null",
-+          "boolean",
-           "string"
-         ]
+@@ -8344,51 +8344,14 @@
+       "type": "object"
+     },
+     "WindowsAzureSigningConfiguration": {
+-      "additionalProperties": {
+-        "type": [
+-          "null",
+-          "string"
+-        ]
+-      },
++      "additionalProperties": false,
+       "properties": {
+-        "certificateProfileName": {
+-          "description": "The Certificate Profile name. Translates to field: CertificateProfileName",
+-          "type": "string"
+-        },
+-        "codeSigningAccountName": {
+-          "description": "The Code Signing Signing Account name. Translates to field: CodeSigningAccountName",
+-          "type": "string"
+-        },
+-        "endpoint": {
+-          "description": "The Trusted Signing Account endpoint. The URI value must have a URI that aligns to the\nregion your Trusted Signing Account and Certificate Profile you are specifying were created\nin during the setup of these resources.\n\nTranslates to field: Endpoint\n\nRequires one of environment variable configurations for authenticating to Microsoft Entra ID per [Microsoft's documentation](https://learn.microsoft.com/en-us/dotnet/api/azure.identity.environmentcredential?view=azure-dotnet#definition)",
+-          "type": "string"
+-        },
+-        "fileDigest": {
+-          "default": "SHA256",
+-          "description": "The File Digest for signing each file. Translates to field: FileDigest",
+-          "type": "string"
+-        },
+         "publisherName": {
+-          "description": "[The publisher name](https://github.com/electron-userland/electron-builder/issues/1187#issuecomment-278972073), exactly as in your code signed certificate. Several names can be provided.",
+-          "type": "string"
+-        },
+-        "timestampDigest": {
+-          "default": "SHA256",
+-          "description": "The Timestamp Digest. Translates to field: TimestampDigest",
+-          "type": "string"
+-        },
+-        "timestampRfc3161": {
+-          "default": "http://timestamp.acs.microsoft.com",
+-          "description": "The Timestamp rfc3161 server. Translates to field: TimestampRfc3161",
++          "description": "Publisher metadata for the unprivileged signing transfer.",
+           "type": "string"
+         }
        },
-@@ -8793,6 +8794,20 @@
+-      "required": [
+-        "certificateProfileName",
+-        "codeSigningAccountName",
+-        "endpoint",
+-        "publisherName"
+-      ],
++      "required": ["publisherName"],
+       "type": "object"
+     },
+     "WindowsConfiguration": {
+@@ -8793,6 +8756,28 @@
            "default": true,
            "description": "Whether to verify the signature of an available update before installation.\nThe [publisher name](#publisherName) will be used for the signature verification.",
            "type": "boolean"
++        },
++        "windowsSigningTransferHook": {
++          "description": "Internal unprivileged Windows signing transfer adapter.",
++          "type": ["null", "string"]
++        },
++        "windowsSigningTransferStage": {
++          "description": "Internal Windows signing transfer stage.",
++          "enum": [null, "application", "uninstaller"]
 +        },
 +        "windowsSigningOperationEvidenceRoot": {
 +          "description": "Internal root for the reviewed Windows signing operation ledger.",
@@ -414,13 +554,6 @@ index bee12b6..244353d 100644
          }
        },
        "type": "object"
-@@ -9890,4 +9905,4 @@
-     }
-   },
-   "type": "object"
--}
-\ No newline at end of file
-+}
 diff --git a/out/util/electronGet.js b/out/util/electronGet.js
 --- a/out/util/electronGet.js
 +++ b/out/util/electronGet.js
@@ -585,3 +718,26 @@ new file mode 100644
 +
 +exports.downloadArtifact = downloadArtifact;
 +exports.shouldRetryDownloadError = shouldRetryDownloadError;
+diff --git a/out/targets/nsis/NsisTarget.js b/out/targets/nsis/NsisTarget.js
+index ee7be54871dab98646e0bc5a918d4240e241512e..f98fdaf38191328bd18f5565a161151cdc26996e 100644
+--- a/out/targets/nsis/NsisTarget.js
++++ b/out/targets/nsis/NsisTarget.js
+@@ -558,6 +558,18 @@ class NsisTarget extends core_1.Target {
+             await ensureNotBusy(commands["OutFile"].replace(/"/g, ""));
+         }
+         const makensis = await (0, windows_1.getMakeNsisPath)((_a = this.packager.config.toolsets) === null || _a === void 0 ? void 0 : _a.nsis, this.options.customNsisBinary);
++        // Transfer the exact final compiler invocation after generating the
++        // uninstaller. The generated helper ran only in this unprivileged job.
++        if (this.packager.platformSpecificBuildOptions.windowsSigningTransferStage === "uninstaller"
++            && !("BUILD_UNINSTALLER" in defines)) {
++            const transfer = require(this.packager.platformSpecificBuildOptions.windowsSigningTransferHook);
++            await transfer.checkpointMakensis({
++                command: makensis.path, args, script, cwd: nsisUtil_1.nsisTemplatesDir,
++                environment: makensis.env || {},
++                temporaryRoot: await this.packager.info.tempDirManager.rootTempDir,
++                uninstaller: defines.UNINSTALLER_OUT_FILE,
++            });
++        }
+         const { stdout, stderr } = await (0, builder_util_1.spawnAndWriteWithOutput)(makensis.path, args, script, {
+             env: { ...process.env, ...((_b = makensis.env) !== null && _b !== void 0 ? _b : {}) },
+             cwd: nsisUtil_1.nsisTemplatesDir,

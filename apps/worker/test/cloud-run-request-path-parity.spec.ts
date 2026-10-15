@@ -17,6 +17,7 @@ import {
   validatePostgresReadinessBody,
   type PostgresReadinessState,
 } from "../src/postgres-readiness";
+import { PUBLIC_PROBE_BUDGET_POLICY, publicProbeBudgetObjectName } from "../src/public-probe-admission";
 import { WORKER_ROUTE_POLICY } from "../src/route-registry";
 import { initializeTypedV11Admission } from "../src/typed-v11-admission";
 import { initializeTypedV1Admission } from "../src/typed-v1-admission";
@@ -98,6 +99,11 @@ const CONTESTED: readonly string[] = productionRegistry.OD_CR_1_CONTESTED_ROUTE_
 function workerEnv(overrides: Record<string, unknown> = {}): Env {
   // A synthetic PUBLIC_ORIGIN the generated Env literal union does not list.
   return { ...b, PUBLIC_ORIGIN, PUBLIC_ANALYTICS_MODE: "enabled", ...overrides } as unknown as Env;
+}
+
+async function expectProbeLeaseReleased(route: "health" | "ready"): Promise<void> {
+  const budget = b.UPLOAD_INGRESS_BUDGET.getByName(publicProbeBudgetObjectName(route));
+  expect((await budget.status(PUBLIC_PROBE_BUDGET_POLICY)).activeLeases).toBe(0);
 }
 
 interface Origin {
@@ -443,49 +449,57 @@ function releaseValidReadyBody(body: Record<string, unknown>, status: number): b
 }
 
 describe("(B) RD-2 /api/ready DTO parity in typed storage mode", () => {
-  it("equals the Worker's handleReady body and status in every lifecycle state", async () => {
+  interface CaseClock {
+    readonly at: (offset: number) => string;
+    readonly cycle: string;
+    readonly fresh: string;
+  }
+  const cases: readonly [string, (clock: CaseClock) => LifecycleSeed | null, number][] = [
+    ["never_run (fresh database)", () => null, 503],
+    ["ready", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }), 200],
+    ["stale (older than 7200000 ms)", ({ at, cycle }) => ({ lastCompletedAt: at(-3 * 60 * 60_000), maintenanceRunAt: cycle,
+      reconciliationRunAt: cycle }), 503],
+    ["completed in the future", ({ at, cycle }) => ({ lastCompletedAt: at(60 * 60_000), maintenanceRunAt: cycle,
+      reconciliationRunAt: cycle }), 503],
+    ["completed without a completion time", ({ cycle }) => ({ lastCompletedAt: null, maintenanceRunAt: cycle,
+      reconciliationRunAt: cycle }), 503],
+    ["incomplete quarantine retention", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle,
+      reconciliationRunAt: cycle, quarantineRetentionComplete: 0 }), 503],
+    ["incomplete restore replay", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle,
+      reconciliationRunAt: cycle, restoreReplayComplete: 0 }), 503],
+    ["running", ({ fresh, cycle }) => ({ state: "running", lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }), 503],
+    ["failed", ({ fresh, cycle }) => ({ state: "failed", lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }), 503],
+    ["cycle mismatch", ({ at, fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: at(-20 * 60_000) }), 503],
+    ["no maintenance markers", ({ fresh }) => ({ lastCompletedAt: fresh, maintenanceRunAt: null, reconciliationRunAt: null }), 503],
+    ["reconciliation running", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
+      reconciliation: "running", reconciliationComplete: 0 }), 503],
+    ["reconciliation failed", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
+      reconciliation: "failed", reconciliationComplete: 0 }), 503],
+    ["reconciliation incomplete", ({ fresh, cycle }) => ({ lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
+      reconciliationComplete: 0 }), 503],
+  ];
+
+  // Each DTO row has its own beforeEach reset and still traverses real probe
+  // admission. Unrelated lifecycle scenarios must not consume one shared burst.
+  it.each(cases)("equals the Worker's handleReady body and status: %s", async (label, makeSeed, expectedStatus) => {
     const settings = await prepareTyped();
     const now = Date.now();
     const at = (offset: number) => new Date(now + offset).toISOString();
     const cycle = at(-30 * 60_000);
     const fresh = at(-60 * 60_000);
-    const cases: readonly [string, LifecycleSeed | null, number][] = [
-      ["never_run (fresh database)", null, 503],
-      ["ready", { lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }, 200],
-      ["stale (older than 7200000 ms)", { lastCompletedAt: at(-3 * 60 * 60_000), maintenanceRunAt: cycle,
-        reconciliationRunAt: cycle }, 503],
-      ["completed in the future", { lastCompletedAt: at(60 * 60_000), maintenanceRunAt: cycle,
-        reconciliationRunAt: cycle }, 503],
-      ["completed without a completion time", { lastCompletedAt: null, maintenanceRunAt: cycle,
-        reconciliationRunAt: cycle }, 503],
-      ["incomplete quarantine retention", { lastCompletedAt: fresh, maintenanceRunAt: cycle,
-        reconciliationRunAt: cycle, quarantineRetentionComplete: 0 }, 503],
-      ["incomplete restore replay", { lastCompletedAt: fresh, maintenanceRunAt: cycle,
-        reconciliationRunAt: cycle, restoreReplayComplete: 0 }, 503],
-      ["running", { state: "running", lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }, 503],
-      ["failed", { state: "failed", lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle }, 503],
-      ["cycle mismatch", { lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: at(-20 * 60_000) }, 503],
-      ["no maintenance markers", { lastCompletedAt: fresh, maintenanceRunAt: null, reconciliationRunAt: null }, 503],
-      ["reconciliation running", { lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
-        reconciliation: "running", reconciliationComplete: 0 }, 503],
-      ["reconciliation failed", { lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
-        reconciliation: "failed", reconciliationComplete: 0 }, 503],
-      ["reconciliation incomplete", { lastCompletedAt: fresh, maintenanceRunAt: cycle, reconciliationRunAt: cycle,
-        reconciliationComplete: 0 }, 503],
-    ];
-    for (const [label, seed, expectedStatus] of cases) {
-      if (seed !== null) await seedLifecycle(typed(), seed);
-      const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/ready`), settings);
-      const workerBody = await response.json<Record<string, unknown>>();
-      const built = buildPostgresReadinessBody(await readinessStateOf(typed()), Date.now(), { semantics: "worker-exact" });
-      expect(response.status, label).toBe(expectedStatus);
-      expect(built.httpStatus, label).toBe(response.status);
-      expect(JSON.parse(JSON.stringify(built.body)), label).toStrictEqual(workerBody);
-      expect(Object.keys(built.body.checks), label).toStrictEqual(Object.keys(workerBody.checks as object));
-      expect(validatePostgresReadinessBody(workerBody, response.status), label).toStrictEqual([]);
-      expect(releaseValidReadyBody(workerBody, response.status), label).toBe(true);
-      expect(releaseValidReadyBody(JSON.parse(JSON.stringify(built.body)), built.httpStatus), label).toBe(true);
-    }
+    const seed = makeSeed({ at, cycle, fresh });
+    if (seed !== null) await seedLifecycle(typed(), seed);
+    const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/ready`), settings);
+    await expectProbeLeaseReleased("ready");
+    const workerBody = await response.json<Record<string, unknown>>();
+    const built = buildPostgresReadinessBody(await readinessStateOf(typed()), Date.now(), { semantics: "worker-exact" });
+    expect(response.status, label).toBe(expectedStatus);
+    expect(built.httpStatus, label).toBe(response.status);
+    expect(JSON.parse(JSON.stringify(built.body)), label).toStrictEqual(workerBody);
+    expect(Object.keys(built.body.checks), label).toStrictEqual(Object.keys(workerBody.checks as object));
+    expect(validatePostgresReadinessBody(workerBody, response.status), label).toStrictEqual([]);
+    expect(releaseValidReadyBody(workerBody, response.status), label).toBe(true);
+    expect(releaseValidReadyBody(JSON.parse(JSON.stringify(built.body)), built.httpStatus), label).toBe(true);
   });
 
   it("refuses an undecided OD-CR-4 semantics and the Worker's json-mode body", async () => {
@@ -520,51 +534,50 @@ function withoutOmittedKeys(body: Record<string, unknown>): Record<string, unkno
 describe("(B) RD-3 /api/health DTO parity", () => {
   const WORKER_FLAGS: PostgresHealthCapabilityFlags = { participantExport: true, coordinatedSignInAdmission: true };
 
-  it("equals the Worker body minus the two ledger keys, in operational, degraded and contained states", async () => {
-    const cases: readonly [string, "operational" | "degraded" | "contained", readonly [number, number, number, number],
-      Record<string, unknown>][] = [
-      ["operational", "operational", [1, 1, 1, 1], {}],
-      ["operational, publication not configured", "operational", [1, 1, 1, 1], { PUBLIC_ANALYTICS_MODE: "disabled" }],
-      ["degraded, publication off", "degraded", [1, 1, 1, 0], {}],
-      ["degraded, uploads off", "degraded", [1, 0, 1, 1], { INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized" }],
-      ["contained", "contained", [0, 0, 0, 0], { ENROLLMENT_MODE: "disabled" }],
-      ["operational, enrollment mode disabled", "operational", [1, 1, 1, 1], { ENROLLMENT_MODE: "disabled" }],
-      ["operational, invite-only enrollment", "operational", [1, 1, 1, 1], { ENROLLMENT_MODE: "invite_only" }],
-      ["local preview contract", "operational", [1, 1, 1, 1], { ACCOUNT_SCOPED_INGEST_MODE: "local_preview",
-        ENVIRONMENT: "synthetic-development", ENROLLMENT_MODE: "local_open" }],
-    ];
-    for (const [label, state, flags, overrides] of cases) {
-      await seedControls(state, flags);
-      await b.USAGE_MONITOR_DB.prepare(`UPDATE retention_state SET state = 'completed',
+  const cases: readonly [string, "operational" | "degraded" | "contained", readonly [number, number, number, number],
+    Record<string, unknown>][] = [
+    ["operational", "operational", [1, 1, 1, 1], {}],
+    ["operational, publication not configured", "operational", [1, 1, 1, 1], { PUBLIC_ANALYTICS_MODE: "disabled" }],
+    ["degraded, publication off", "degraded", [1, 1, 1, 0], {}],
+    ["degraded, uploads off", "degraded", [1, 0, 1, 1], { INCREMENTAL_EXTERNAL_PARTICIPANTS: "authorized" }],
+    ["contained", "contained", [0, 0, 0, 0], { ENROLLMENT_MODE: "disabled" }],
+    ["operational, enrollment mode disabled", "operational", [1, 1, 1, 1], { ENROLLMENT_MODE: "disabled" }],
+    ["operational, invite-only enrollment", "operational", [1, 1, 1, 1], { ENROLLMENT_MODE: "invite_only" }],
+    ["local preview contract", "operational", [1, 1, 1, 1], { ACCOUNT_SCOPED_INGEST_MODE: "local_preview",
+      ENVIRONMENT: "synthetic-development", ENROLLMENT_MODE: "local_open" }],
+  ];
+  it.each(cases)("equals the Worker body minus the two ledger keys: %s", async (label, state, flags, overrides) => {
+    await seedControls(state, flags);
+    await b.USAGE_MONITOR_DB.prepare(`UPDATE retention_state SET state = 'completed',
           quarantine_retention_complete = 1, restore_replay_complete = 1 WHERE singleton = 1`).run();
-      const settings = workerEnv({ DEPLOYMENT_SOURCE_COMMIT: COMMIT, ...overrides });
-      const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/health`), settings);
-      expect(response.status, label).toBe(200);
-      const workerBody = await response.json<Record<string, unknown>>();
-      const controls = await b.USAGE_MONITOR_DB.prepare(`SELECT control_state, enrollment_enabled,
+    const settings = workerEnv({ DEPLOYMENT_SOURCE_COMMIT: COMMIT, ...overrides });
+    const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/health`), settings);
+    await expectProbeLeaseReleased("health");
+    expect(response.status, label).toBe(200);
+    const workerBody = await response.json<Record<string, unknown>>();
+    const controls = await b.USAGE_MONITOR_DB.prepare(`SELECT control_state, enrollment_enabled,
           upload_registration_enabled, processing_enabled, publication_enabled FROM collection_controls`)
-        .first<Record<string, string | number>>();
-      const built = buildPostgresHealthBody({
-        env: settings,
-        enrollmentMode: settings.ENROLLMENT_MODE as "local_open" | "open" | "invite_only" | "disabled",
-        controls: {
-          state: controls!.control_state as "operational" | "degraded" | "contained",
-          enrollment: controls!.enrollment_enabled === 1,
-          uploadRegistration: controls!.upload_registration_enabled === 1,
-          processing: controls!.processing_enabled === 1,
-          publication: controls!.publication_enabled === 1,
-        },
-        retention: { state: "completed", quarantineRetentionComplete: true, restoreReplayComplete: true },
-        sourceCommit: postgresDeploymentSourceCommit(settings),
-        capabilityFlags: WORKER_FLAGS,
-      });
-      const expected = withoutOmittedKeys(workerBody);
-      expect(JSON.parse(JSON.stringify(built)), label).toStrictEqual(expected);
-      expect(JSON.stringify(built), label).toBe(JSON.stringify(expected));
-      expect(validatePostgresHealthBody(built), label).toStrictEqual([]);
-      // The Worker's own body is not the GCP contract: it still carries the ledger keys.
-      expect(validatePostgresHealthBody(workerBody).length, label).toBeGreaterThan(0);
-    }
+      .first<Record<string, string | number>>();
+    const built = buildPostgresHealthBody({
+      env: settings,
+      enrollmentMode: settings.ENROLLMENT_MODE as "local_open" | "open" | "invite_only" | "disabled",
+      controls: {
+        state: controls!.control_state as "operational" | "degraded" | "contained",
+        enrollment: controls!.enrollment_enabled === 1,
+        uploadRegistration: controls!.upload_registration_enabled === 1,
+        processing: controls!.processing_enabled === 1,
+        publication: controls!.publication_enabled === 1,
+      },
+      retention: { state: "completed", quarantineRetentionComplete: true, restoreReplayComplete: true },
+      sourceCommit: postgresDeploymentSourceCommit(settings),
+      capabilityFlags: WORKER_FLAGS,
+    });
+    const expected = withoutOmittedKeys(workerBody);
+    expect(JSON.parse(JSON.stringify(built)), label).toStrictEqual(expected);
+    expect(JSON.stringify(built), label).toBe(JSON.stringify(expected));
+    expect(validatePostgresHealthBody(built), label).toStrictEqual([]);
+    // The Worker's own body is not the GCP contract: it still carries the ledger keys.
+    expect(validatePostgresHealthBody(workerBody).length, label).toBeGreaterThan(0);
   });
 
   it("OD-CR-5 flags change exactly their two capabilities; undecided flags are refused", () => {
@@ -589,16 +602,18 @@ describe("(B) RD-3 /api/health DTO parity", () => {
     }
   });
 
-  it("the source commit port: absent omits deployment, malformed is the Worker's 503", async () => {
+  it.each(["", "XYZ", "abc", "g".repeat(40), 7])("the source commit port: malformed %j is the Worker's 503", async (value) => {
+    const settings = workerEnv({ DEPLOYMENT_SOURCE_COMMIT: value });
+    expect(() => postgresDeploymentSourceCommit(settings)).toThrow("DEPLOYMENT_SOURCE_COMMIT_INVALID");
+    const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/health`), settings);
+    await expectProbeLeaseReleased("health");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "DEPLOYMENT_SOURCE_COMMIT_INVALID" } });
+  });
+
+  it("the source commit port: accepts the exact commit and absent omits deployment", () => {
     expect(postgresDeploymentSourceCommit(workerEnv())).toBeNull();
     expect(postgresDeploymentSourceCommit(workerEnv({ DEPLOYMENT_SOURCE_COMMIT: COMMIT }))).toBe(COMMIT);
-    for (const value of ["", "XYZ", "abc", "g".repeat(40), 7]) {
-      const settings = workerEnv({ DEPLOYMENT_SOURCE_COMMIT: value });
-      expect(() => postgresDeploymentSourceCommit(settings)).toThrow("DEPLOYMENT_SOURCE_COMMIT_INVALID");
-      const response = await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/health`), settings);
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({ error: { code: "DEPLOYMENT_SOURCE_COMMIT_INVALID" } });
-    }
     const withoutCommit = buildPostgresHealthBody({
       env: workerEnv(), enrollmentMode: "open",
       controls: { state: "operational", enrollment: true, uploadRegistration: true, processing: true, publication: true },

@@ -25,11 +25,13 @@
  * Outside worker mode the Worker code never sees the deployed env. It sees a
  * frozen env built from named keys (buildEdgeLocalEnv), never a spread of the
  * deployed env, so the storage bindings (USAGE_MONITOR_DB, ANALYTICS_DB,
- * DELETION_LEDGER, QUARANTINE), the rate-limit bindings, the Durable Object,
+ * DELETION_LEDGER, QUARANTINE), the general rate-limit bindings,
  * the EDGE_* secrets and every other Worker secret stay out of its reach. The
  * Sparkle guard alone also gets USAGE_MONITOR_DB, as a facade over the
  * dedicated RELEASE_GUARD_DB that accepts only SQL naming the nonce table
- * (createReleaseGuardDatabase).
+ * (createReleaseGuardDatabase), its appcast rate limiter and the named
+ * operational lease capability. Forwarded probes receive only their two
+ * limiters, edge-only client-key secret and that same lease capability.
  *
  * Logging is one content-free warn line per EDGE_NOT_CONFIGURED response,
  * naming only the code: never which setting failed, a URL, a host or a value.
@@ -53,6 +55,7 @@ import { adminHostname, canonicalPublicOrigin, isAdminSurfacePath } from "./admi
 import { JSON_HEADERS } from "./constants";
 import type { EdgeAdmissionBinding, EdgeAdmissionLimiters } from "./edge-admission-policy";
 import { buildEdgeGuardEnv, buildEdgeLocalEnv } from "./edge-entry-env";
+import type { EdgeGuardAdmissionBindings } from "./edge-entry-env";
 import { createGoogleIdTokenSource } from "./edge-google-id-token";
 import {
   EDGE_FENCE_RETRY_AFTER_SECONDS,
@@ -64,7 +67,7 @@ import {
 } from "./edge-origin-contract";
 import type { EdgeOriginConfiguration } from "./edge-origin-contract";
 import { classifyEdgeRequest, createEdgeOriginProxy } from "./edge-origin-proxy";
-import type { EdgeDistributionConfiguration, EdgeOriginProxy } from "./edge-origin-proxy";
+import type { EdgeDistributionConfiguration, EdgeOriginProxy, EdgePublicProbeEnv } from "./edge-origin-proxy";
 import worker, { contributionRequestPreflight, handleRequest } from "./index";
 import { mutationBarrierBlocksDynamicRequest } from "./mutation-barrier";
 import { matchWorkerRoute } from "./route-registry";
@@ -135,6 +138,8 @@ interface EdgeGcpSettings {
   readonly clientKeySecret: string;
   readonly releaseGuardDb: D1Database;
   readonly limiters: EdgeAdmissionLimiters;
+  readonly guardAdmission: EdgeGuardAdmissionBindings;
+  readonly publicProbeEnv: EdgePublicProbeEnv;
   readonly distribution: EdgeDistributionConfiguration | null;
 }
 
@@ -209,12 +214,32 @@ function readGcpSettings(env: Env, localEnv: Readonly<Env>): EdgeGcpSettings | n
   if (!isD1Database(releaseGuardDb)) return null;
   const limiters = readAdmissionLimiters(env);
   if (limiters === null) return null;
+  const appcastLimiter: unknown = Reflect.get(env, "SPARKLE_APPCAST_GUARD_RATE_LIMIT");
+  const probeLimiter: unknown = Reflect.get(env, "PUBLIC_PROBE_RATE_LIMIT");
+  const probeClientLimiter: unknown = Reflect.get(env, "PUBLIC_PROBE_CLIENT_RATE_LIMIT");
+  const operationalBudget: unknown = Reflect.get(env, "UPLOAD_INGRESS_BUDGET");
+  if (!isRateLimit(appcastLimiter) || !isRateLimit(probeLimiter)
+      || !isRateLimit(probeClientLimiter) || typeof operationalBudget !== "object"
+      || operationalBudget === null
+      || typeof Reflect.get(operationalBudget, "getByName") !== "function") return null;
+  const budget = operationalBudget as Env["UPLOAD_INGRESS_BUDGET"];
   return {
     config,
     invokerKeyJson,
     clientKeySecret,
     releaseGuardDb,
     limiters,
+    guardAdmission: Object.freeze({
+      SPARKLE_APPCAST_GUARD_RATE_LIMIT: appcastLimiter,
+      UPLOAD_INGRESS_BUDGET: budget,
+    }),
+    publicProbeEnv: Object.freeze({
+      ENVIRONMENT: "production",
+      IDENTITY_LINK_SECRET: clientKeySecret,
+      PUBLIC_PROBE_RATE_LIMIT: probeLimiter,
+      PUBLIC_PROBE_CLIENT_RATE_LIMIT: probeClientLimiter,
+      UPLOAD_INGRESS_BUDGET: budget,
+    }),
     distribution: readDistribution(env),
   };
 }
@@ -233,6 +258,7 @@ async function constructEdgeProxy(settings: EdgeGcpSettings): Promise<EdgeOrigin
     idTokenSource,
     clientKeySecret: settings.clientKeySecret,
     limiters: settings.limiters,
+    publicProbeEnv: settings.publicProbeEnv,
     distribution: settings.distribution,
   });
 }
@@ -264,7 +290,8 @@ async function gcpFetch(request: Request, env: Env): Promise<Response> {
   if (settings === null) return notConfiguredFetch(request, localEnv);
   const proxy = await isolateProxy(env, settings);
   if (proxy === null) return notConfiguredFetch(request, localEnv);
-  return proxy(request, localEnv, buildEdgeGuardEnv(localEnv, settings.releaseGuardDb));
+  return proxy(request, localEnv,
+    buildEdgeGuardEnv(localEnv, settings.releaseGuardDb, settings.guardAdmission));
 }
 
 // ---------------------------------------------------------------------------

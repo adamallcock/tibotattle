@@ -1,4 +1,8 @@
 import distribution from "../../config/electron-production-distribution.cjs";
+import {
+  createProductionLinuxUpdateVerifier,
+  isLinuxUpdateVerifier,
+} from "./linux-update-authenticity.js";
 
 export const PRODUCTION_ELECTRON_APP_ID = distribution.PRODUCTION_ELECTRON_APP_ID;
 export const PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN =
@@ -326,6 +330,7 @@ function unrefTimer(timer) {
 export function createProductionDesktopUpdater({
   app,
   autoUpdater,
+  linuxUpdateVerifier,
   distributionMetadata,
   platform = process.platform,
   architecture = process.arch,
@@ -353,6 +358,7 @@ export function createProductionDesktopUpdater({
   const packaged = app.isPackaged === true;
   let updater = null;
   let metadata = null;
+  let linuxVerifier = null;
   if (packaged) {
     if (target === null) throw new TypeError("production updater target is unsupported");
     metadata = validateProductionDistributionMetadata(distributionMetadata, {
@@ -360,7 +366,20 @@ export function createProductionDesktopUpdater({
       architecture,
     });
     updater = assertUpdater(autoUpdater);
+    if (platform === "linux") {
+      if (linuxUpdateVerifier === undefined) {
+        try { linuxVerifier = createProductionLinuxUpdateVerifier(app); } catch {
+          // Bad or unavailable trust configuration closes only updating, never
+          // ordinary offline startup or local evidence access.
+          linuxVerifier = null;
+        }
+      } else linuxVerifier = linuxUpdateVerifier;
+      if (linuxVerifier !== null && !isLinuxUpdateVerifier(linuxVerifier)) {
+        throw new TypeError("Linux update verifier is invalid");
+      }
+    }
   }
+  const usable = packaged && (platform !== "linux" || linuxVerifier !== null);
   const handoverRehearsal = metadata?.channel
     === PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
   const requestUserAgent = packaged ? updateUserAgent(app, metadata) : null;
@@ -420,6 +439,9 @@ export function createProductionDesktopUpdater({
     });
     on("update-available", (updateInfo) => {
       if (disposed) return;
+      // Linux availability is published only after signed metadata and durable
+      // rollback protection complete inside checkForUpdates().
+      if (linuxVerifier !== null) return;
       if (handoverRehearsal
           && (permittedRehearsalUpdateVersion === null
             || updateInfo?.version !== permittedRehearsalUpdateVersion)) {
@@ -434,6 +456,7 @@ export function createProductionDesktopUpdater({
       publishWith({ state: "available", progress: null, error: "none" });
     });
     on("update-not-available", () => {
+      if (linuxVerifier !== null) return;
       if (!disposed) {
         rehearsalUpdateAvailable = false;
         publishWith({ state: "current", progress: null, error: "none" });
@@ -447,6 +470,9 @@ export function createProductionDesktopUpdater({
       });
     });
     on("update-downloaded", () => {
+      // The library emits this for full, differential and restored-cache
+      // downloads before returning paths. None establishes publisher trust.
+      if (linuxVerifier !== null) return;
       if (!disposed && (!handoverRehearsal || rehearsalUpdateAvailable)) {
         publishWith({ state: "downloaded", progress: 100, error: "none" });
       }
@@ -472,7 +498,13 @@ export function createProductionDesktopUpdater({
     if (disposed) fail("disposed");
     if (started) return status;
     started = true;
-    if (!packaged) return status;
+    if (!usable) {
+      if (updater !== null) {
+        updater.autoDownload = false;
+        updater.autoInstallOnAppQuit = false;
+      }
+      return status;
+    }
 
     let saved;
     try {
@@ -490,7 +522,7 @@ export function createProductionDesktopUpdater({
     try {
       // Never delegate quit-time installation to electron-updater. A human
       // action reaches installAndRestart(), which first stops our child.
-      updater.autoDownload = automaticDownload;
+      updater.autoDownload = linuxVerifier === null && automaticDownload;
       updater.autoInstallOnAppQuit = false;
       // Generic feeds remain fixed by electron-builder. The isolated handover
       // lane deliberately uses an ordered prerelease pair, so preserve the
@@ -594,6 +626,21 @@ export function createProductionDesktopUpdater({
       publishWith({ state: "checking", progress: null, error: "none" });
       try {
         const result = await updater.checkForUpdates();
+        if (linuxVerifier !== null) {
+          if (typeof result?.isUpdateAvailable !== "boolean") fail("check_failed");
+          // Even an apparent no-update response is feed-controlled. Authenticate
+          // it before calling this installation current or accepting a replay.
+          const authorized = await linuxVerifier.authorize(result.updateInfo);
+          if (disposed) return status;
+          if (result.isUpdateAvailable !== authorized.updateAvailable) fail("check_failed");
+          if (result.isUpdateAvailable) {
+            publishWith({ state: "available", progress: null, error: "none" });
+            if (status.automaticDownload) await performDownload();
+          } else {
+            publishWith({ state: "current", progress: null, error: "none" });
+          }
+          return status;
+        }
         if (status.state === "checking"
             && (result === null || result?.updateInfo === null)) {
           // electron-updater emits update-available/update-not-available for
@@ -619,18 +666,22 @@ export function createProductionDesktopUpdater({
         || (handoverRehearsal && !rehearsalUpdateAvailable)) {
       fail("download_unavailable");
     }
-    return runOperation("download", async () => {
-      publishWith({ state: "downloading", progress: 0, error: "none" });
-      try {
-        await updater.downloadUpdate();
-        if (status.state === "downloading") {
-          publishWith({ state: "downloaded", progress: 100, error: "none" });
-        }
-        return status;
-      } catch {
-        return publishWith({ state: "error", progress: null, error: "download_failed" });
+    return runOperation("download", performDownload);
+  }
+
+  async function performDownload() {
+    publishWith({ state: "downloading", progress: 0, error: "none" });
+    try {
+      const paths = await updater.downloadUpdate();
+      if (disposed) return status;
+      if (linuxVerifier !== null) linuxVerifier.verifyDownloaded(paths, updater.installerPath);
+      if (status.state === "downloading") {
+        publishWith({ state: "downloaded", progress: 100, error: "none" });
       }
-    });
+      return status;
+    } catch {
+      return publishWith({ state: "error", progress: null, error: "download_failed" });
+    }
   }
 
   async function setAutomaticDownload(enabled) {
@@ -647,7 +698,7 @@ export function createProductionDesktopUpdater({
           error: "preferences_unavailable",
         });
       }
-      updater.autoDownload = enabled;
+      updater.autoDownload = linuxVerifier === null && enabled;
       return publishWith({ automaticDownload: enabled, error: "none" });
     } catch {
       fail("preferences_unavailable");
@@ -694,6 +745,7 @@ export function createProductionDesktopUpdater({
       preparedForInstall = true;
       if (installFailureRequested) return recoverFailedInstallation();
       try {
+        if (linuxVerifier !== null) linuxVerifier.verifyBeforeInstall(updater.installerPath);
         // electron-updater owns the native installer hand-off. Do not call
         // app.quit here: its quit path is intentionally sequenced by the
         // updater after the owned companion has stopped.

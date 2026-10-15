@@ -10,7 +10,8 @@ import {
   createLocalAccountlessContribution,
   selectLocalAccountlessProductionProfile,
 } from "./accountless-contribution.js";
-import { createLocalCompanionServer, startLocalCompanionServer } from "./server.js";
+import { createLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 
 const ORIGIN = "https://tibotattle.com";
 

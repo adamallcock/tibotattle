@@ -13,6 +13,7 @@ export const R7_WORKER_MAXIMUM_TIMEOUT_MS = 10 * 60 * 1_000;
 
 export const R7_WORKER_WATCHDOG_OUTCOMES = Object.freeze([
   "completed",
+  "aborted",
   "spawn_failed",
   "worker_failed",
   "timed_out",
@@ -36,6 +37,7 @@ export const R7_WORKER_TERMINATIONS = Object.freeze([
   "stderr_limit_exceeded",
   "rss_limit_exceeded",
   "worker_failed",
+  "aborted",
 ]);
 
 export const R7_WORKER_RSS_SAMPLE_OUTCOMES = Object.freeze([
@@ -130,6 +132,9 @@ function normalizeRequest(request, hardMaximumRssBytes) {
   if (request.consumeStdout !== undefined && typeof request.consumeStdout !== "function") {
     throw new TypeError("consumeStdout must be a function when provided");
   }
+  if (request.signal !== undefined && !(request.signal instanceof AbortSignal)) {
+    throw new TypeError("signal must be an AbortSignal when provided");
+  }
   if (request.requireLifetimePeakRss !== undefined
       && typeof request.requireLifetimePeakRss !== "boolean") {
     throw new TypeError("requireLifetimePeakRss must be a boolean when provided");
@@ -155,6 +160,7 @@ function normalizeRequest(request, hardMaximumRssBytes) {
     timeoutMs,
     maximumRssBytes: request.maximumRssBytes,
     consumeStdout: request.consumeStdout,
+    signal: request.signal,
     requireLifetimePeakRss: request.requireLifetimePeakRss === true,
   };
 }
@@ -245,9 +251,9 @@ export async function runR7WorkerWatchdog(request, {
   const normalized = normalizeRequest(request, hardMaximumRssBytes);
   const startedAtNs = monotonicNow();
   if (typeof startedAtNs !== "bigint") throw new TypeError("monotonicNow must return nanoseconds as bigint");
-  if (platform !== "darwin" || architecture !== "arm64") {
+  if (normalized.signal?.aborted || platform !== "darwin" || architecture !== "arm64") {
     return fixedResult({
-      outcome: "unsupported_platform",
+      outcome: normalized.signal?.aborted ? "aborted" : "unsupported_platform",
       termination: "not_started",
       startedAtNs,
       nowNs: monotonicNow(),
@@ -332,6 +338,9 @@ export async function runR7WorkerWatchdog(request, {
       settled = true;
       clearScheduledWork();
       if (sampleInFlight) await sampleInFlight;
+      // A close can arrive before an outstanding sample drains. Cancellation
+      // during that drain must still discard output and cannot yield success.
+      if (outcome === "completed" && normalized.signal?.aborted) outcome = "aborted";
       if (outcome === "completed" && monotonicNow() >= deadlineNs) {
         outcome = "timed_out";
       }
@@ -352,7 +361,9 @@ export async function runR7WorkerWatchdog(request, {
       if (outcome === "completed" && peakRssBytes > normalized.maximumRssBytes) {
         outcome = "rss_limit_exceeded";
       }
+      if (outcome === "completed" && normalized.signal?.aborted) outcome = "aborted";
       stdoutChunks = [];
+      normalized.signal?.removeEventListener("abort", onAbort);
       child.stdin.destroy();
       child.stdout.destroy();
       child.stderr.destroy();
@@ -373,19 +384,28 @@ export async function runR7WorkerWatchdog(request, {
       if (settled || forcedOutcome !== null) return;
       forcedOutcome = outcome;
       stdoutChunks = [];
+      if (deadlineHandle !== null) {
+        cancelTimeout(deadlineHandle);
+        deadlineHandle = null;
+      }
       if (sampleHandle !== null) {
         cancelInterval(sampleHandle);
         sampleHandle = null;
-      }
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Settlement is still bounded by the termination confirmation timer.
       }
       terminationHandle = scheduleTimeout(() => {
         try { child.kill("SIGKILL"); } catch { /* fixed outcome below */ }
         void finish("termination_unconfirmed", outcome);
       }, R7_WORKER_TERMINATION_GRACE_MS);
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Settlement is still bounded by the termination confirmation timer.
+      }
+    };
+
+    const onAbort = () => {
+      stdoutChunks = [];
+      forceTermination("aborted");
     };
 
     const armDeadline = () => {
@@ -405,7 +425,9 @@ export async function runR7WorkerWatchdog(request, {
       if (settled) return;
       const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
       stdoutBytes = saturatedAdd(stdoutBytes, chunk.length);
-      if (stdoutBytes <= R7_WORKER_MAXIMUM_STDOUT_BYTES) stdoutChunks.push(chunk);
+      if (stdoutBytes <= R7_WORKER_MAXIMUM_STDOUT_BYTES) {
+        if (forcedOutcome === null) stdoutChunks.push(chunk);
+      }
       else forceTermination("stdout_limit_exceeded");
     });
     child.stderr.on("data", (value) => {
@@ -429,6 +451,13 @@ export async function runR7WorkerWatchdog(request, {
       void finish(forcedOutcome ?? (deadlineExceeded ? "timed_out" : clean ? "completed" : "worker_failed"), termination);
     });
 
+    normalized.signal?.addEventListener("abort", onAbort, { once: true });
+    // Spawning is synchronous, but an injected adapter can abort during spawn.
+    // Recheck after all child handlers exist so that termination is observed.
+    if (normalized.signal?.aborted) {
+      onAbort();
+      return;
+    }
     observeRss();
     sampleHandle = scheduleInterval(observeRss, R7_WORKER_RSS_SAMPLE_INTERVAL_MS);
     armDeadline();

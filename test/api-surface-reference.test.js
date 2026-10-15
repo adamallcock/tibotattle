@@ -145,10 +145,15 @@ function localRoutePolicy(source) {
     /if \((path === "\/api\/local\/[^"]+"(?:\s*\|\|\s*path === "\/api\/local\/[^"]+")*)\) \{/gu,
   )];
   const entries = [];
-  for (const [index, handler] of handlers.entries()) {
+  for (const handler of handlers) {
+    // Route handlers can precede generic relay dispatch. End at this handler's
+    // matching dispatcher-level closing brace, not the next literal route,
+    // so relay method checks cannot be mistaken for route methods.
+    const end = apiDispatcher.indexOf("\n      }", handler.index);
+    assert.notEqual(end, -1, "local route handler has no closing boundary");
     const block = apiDispatcher.slice(
       handler.index,
-      handlers[index + 1]?.index ?? apiDispatcher.length,
+      end,
     );
     const paths = [...handler[1].matchAll(/"(\/api\/local\/[^"?]+)"/gu)]
       .map((match) => match[1]);
@@ -234,7 +239,7 @@ test("both maintained API references cover every registered HTTP boundary", asyn
   const participantPolicy = participantRelayPolicy(participant);
 
   assert.equal(workerPolicy.length, 51, "review Worker route-count changes");
-  assert.equal(localPolicy.length, 33, "review local route-count changes");
+  assert.equal(localPolicy.length, 35, "review local route-count changes");
   assert.equal(reportPolicy.length, 4, "review fixed report-count changes");
   assert.equal(centralPolicy.length, 1, "review central relay-count changes");
   assert.equal(

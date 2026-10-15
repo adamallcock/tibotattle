@@ -1,4 +1,5 @@
 import { readAdminDatabaseHealth } from "./admin-database-health";
+import { runPublicProbe } from "./public-probe-admission";
 import { isPostgresWorkerRequestPathSupported } from "./backend-composition";
 export { isPostgresWorkerRequestPathSupported } from "./backend-composition";
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
@@ -10,6 +11,7 @@ import {
   assertAdmissionBindings,
   assertAttemptAllowed,
   assertPublicAggregateReadAllowed,
+  assertPublicProbeAllowed,
   assertUploadAuthorizationBindings,
   assertUploadAuthorizationAllowed,
   assertUploadIngressRateLimitBindings,
@@ -4187,6 +4189,7 @@ function lifecycleReadiness(
 async function handleReady(
   request: Request,
   env: Env,
+  assertActive: () => void,
   nowEpoch = Date.now(),
 ): Promise<Response> {
   if (request.method !== "GET") methodNotAllowed(["GET"]);
@@ -4195,27 +4198,34 @@ async function handleReady(
   assertUploadIngressRateLimitBindings(env);
   assertUploadIngressConfiguration(env);
   assertSignInStartAdmissionConfiguration(env);
+  assertActive();
   await probeUploadIngressBudget(env);
+  assertActive();
   const retention = await env.USAGE_MONITOR_DB.prepare(
     `SELECT state, last_completed_at, maintenance_run_at,
             quarantine_retention_complete, restore_replay_complete
        FROM retention_state
       WHERE singleton = 1`,
   ).first<RetentionReadinessRow>();
+  assertActive();
   if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   const lifecycle = lifecycleReadiness(retention, nowEpoch);
   const reconciliation = await readQuarantineReconciliationStatus(
     env.USAGE_MONITOR_DB,
   );
+  assertActive();
   const delegated = parseTelemetryStorageMode(env).kind === "typed";
   if (delegated) {
     await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB,env,"v1");
+    assertActive();
     await resolveTelemetryStorageMode(env.USAGE_MONITOR_DB,env,"v11");
+    assertActive();
   }
   // This endpoint qualifies ingestion. The separate analytics progress route
   // qualifies publication; an offline analytics database cannot make uploads
   // unavailable. False remains unconfirmed, never a claim that backfill passed.
   const rebuildComplete = !delegated && await aggregateRebuildComplete(env.USAGE_MONITOR_DB);
+  assertActive();
   const maintenanceCycleMatched =
     retention.maintenance_run_at !== null
     && reconciliation.maintenanceRunAt === retention.maintenance_run_at;
@@ -4475,6 +4485,9 @@ export async function handleRequest(
       // branch, but no undocumented method can reach one of them.
       assertWorkerRouteMethod(request, route);
     }
+    if (route.id === "health" || route.id === "ready") {
+      await assertPublicProbeAllowed(request, env, route.id);
+    }
     if (route.id === "community_daily" && !publicAnalyticsEnabled(env)) {
       return noStore(errorResponse(
         new ApiError(503, "PUBLICATION_DISABLED"),
@@ -4482,110 +4495,121 @@ export async function handleRequest(
       ));
     }
     if (route.id === "ready") {
-      return noStore(await handleReady(request, env));
+      return noStore(await runPublicProbe(env, "ready", async (assertActive) => {
+        return handleReady(request, env, assertActive);
+      }));
     }
     if (route.id === "health") {
-      if (request.method !== "GET") methodNotAllowed(["GET"]);
-      const enrollmentMode = configuredEnrollmentMode(env);
-      assertAdmissionBindings(env);
-      assertUploadAuthorizationBindings(env);
-      assertUploadIngressRateLimitBindings(env);
-      assertUploadIngressConfiguration(env);
-      assertSignInStartAdmissionConfiguration(env);
-      await probeUploadIngressBudget(env);
-      const collectionControls = await readCollectionControls(
-        env.USAGE_MONITOR_DB,
-      );
-      const publicAnalyticsConfigured = publicAnalyticsEnabled(env);
-      const publicAnalyticsAvailable = publicAnalyticsConfigured
-        && collectionControls.publication;
-      const publicCollectionState = !publicAnalyticsConfigured
-          && collectionControls.state === "operational"
-        ? "degraded"
-        : collectionControls.state;
-      const retention = await env.USAGE_MONITOR_DB.prepare(
-        `SELECT state, quarantine_retention_complete, restore_replay_complete
-           FROM retention_state WHERE singleton = 1`,
-      ).first<{
-        state: "never_run" | "running" | "completed" | "failed";
-        quarantine_retention_complete: number;
-        restore_replay_complete: number;
-      }>();
-      if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-      if (!env.QUARANTINE
-          || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
-          || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
-          || typeof Reflect.get(env.QUARANTINE, "delete") !== "function") {
-        throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-      }
-      await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
-      await env.DELETION_LEDGER.prepare(
-        "SELECT schema_version FROM deletion_tombstones LIMIT 1",
-      ).first();
-      await env.QUARANTINE.head("__usage_monitor_health_probe__");
-      const deploymentSourceCommit = configuredDeploymentSourceCommit(env);
-      return noStore(jsonResponse({
-        status: "ok",
-        mode: "synthetic-and-private-telemetry",
-        enrollmentMode,
-        ...(deploymentSourceCommit === null
-          ? {}
-          : { deployment: { sourceCommit: deploymentSourceCommit } }),
-        collectionControls: {
-          state: publicCollectionState,
-          enrollment: collectionControls.enrollment
-            && enrollmentMode !== "disabled",
-          uploadRegistration: collectionControls.uploadRegistration,
-          processing: collectionControls.processing,
-          publication: publicAnalyticsAvailable,
-        },
-        checks: {
-          database: "ok",
-          deletionLedger: "ok",
-          encryptedObjectStore: "reachable",
-          lifecycle: retention.state,
-          quarantineRetentionComplete:
-            retention.quarantine_retention_complete === 1,
-          restoreReplayComplete: retention.restore_replay_complete === 1,
-        },
-        contracts: {
-          acceptedContribution: "telemetry-contribution-v0.1",
-          accountScopedContribution: {
-            schemaVersion: "telemetry-contribution-v0.2",
-            status: configuredAccountScopedIngestMode(env) === "local_preview"
-              ? "local_preview_loopback_only"
-              : "implementation_disabled",
-            externalParticipantsAuthorized: false,
+      return noStore(await runPublicProbe(env, "health", async (assertActive) => {
+        if (request.method !== "GET") methodNotAllowed(["GET"]);
+        const enrollmentMode = configuredEnrollmentMode(env);
+        assertAdmissionBindings(env);
+        assertUploadAuthorizationBindings(env);
+        assertUploadIngressRateLimitBindings(env);
+        assertUploadIngressConfiguration(env);
+        assertSignInStartAdmissionConfiguration(env);
+        assertActive();
+        await probeUploadIngressBudget(env);
+        assertActive();
+        const collectionControls = await readCollectionControls(
+          env.USAGE_MONITOR_DB,
+        );
+        assertActive();
+        const publicAnalyticsConfigured = publicAnalyticsEnabled(env);
+        const publicAnalyticsAvailable = publicAnalyticsConfigured
+          && collectionControls.publication;
+        const publicCollectionState = !publicAnalyticsConfigured
+            && collectionControls.state === "operational"
+          ? "degraded"
+          : collectionControls.state;
+        const retention = await env.USAGE_MONITOR_DB.prepare(
+          `SELECT state, quarantine_retention_complete, restore_replay_complete
+             FROM retention_state WHERE singleton = 1`,
+        ).first<{
+          state: "never_run" | "running" | "completed" | "failed";
+          quarantine_retention_complete: number;
+          restore_replay_complete: number;
+        }>();
+        assertActive();
+        if (!retention) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+        if (!env.QUARANTINE
+            || typeof Reflect.get(env.QUARANTINE, "head") !== "function"
+            || typeof Reflect.get(env.QUARANTINE, "put") !== "function"
+            || typeof Reflect.get(env.QUARANTINE, "delete") !== "function") {
+          throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
+        }
+        await env.USAGE_MONITOR_DB.prepare("SELECT 1").first();
+        assertActive();
+        await env.DELETION_LEDGER.prepare(
+          "SELECT schema_version FROM deletion_tombstones LIMIT 1",
+        ).first();
+        assertActive();
+        await env.QUARANTINE.head("__usage_monitor_health_probe__");
+        assertActive();
+        const deploymentSourceCommit = configuredDeploymentSourceCommit(env);
+        return jsonResponse({
+          status: "ok",
+          mode: "synthetic-and-private-telemetry",
+          enrollmentMode,
+          ...(deploymentSourceCommit === null
+            ? {}
+            : { deployment: { sourceCommit: deploymentSourceCommit } }),
+          collectionControls: {
+            state: publicCollectionState,
+            enrollment: collectionControls.enrollment
+              && enrollmentMode !== "disabled",
+            uploadRegistration: collectionControls.uploadRegistration,
+            processing: collectionControls.processing,
+            publication: publicAnalyticsAvailable,
           },
-          incrementalContribution: {
-            schemaVersion: "telemetry-contribution-v1.0",
-            status: "implementation_ready",
-            // Owner decision 2026-08-21: external participants ARE authorized
-            // on the production deployment — enrollment was already open at
-            // the pairing layer, and this declaration now matches that
-            // reality instead of contradicting it. Env-driven rather than a
-            // literal so staging and synthetic keep declaring false and their
-            // containment checks (deploy-disabled-staging) stay meaningful.
-            // The v0.2 account-scoped declaration above stays false: that
-            // path is implementation_disabled and authorizes no one.
-            externalParticipantsAuthorized:
-              Reflect.get(env, "INCREMENTAL_EXTERNAL_PARTICIPANTS")
-                === "authorized",
+          checks: {
+            database: "ok",
+            deletionLedger: "ok",
+            encryptedObjectStore: "reachable",
+            lifecycle: retention.state,
+            quarantineRetentionComplete:
+              retention.quarantine_retention_complete === 1,
+            restoreReplayComplete: retention.restore_replay_complete === 1,
           },
-        },
-        capabilities: {
-          encryptedUpload: collectionControls.processing,
-          serverValidation: true,
-          idempotentDeduplication: true,
-          communityDaily: publicAnalyticsAvailable,
-          participantExport: true,
-          participantDeletion: false,
-          boundedQuarantineRetention: true,
-          deletionSafeRestoreReplay: true,
-          ongoingDeviceUploadRegistration:
-            collectionControls.uploadRegistration,
-          coordinatedSignInAdmission: true,
-        },
+          contracts: {
+            acceptedContribution: "telemetry-contribution-v0.1",
+            accountScopedContribution: {
+              schemaVersion: "telemetry-contribution-v0.2",
+              status: configuredAccountScopedIngestMode(env) === "local_preview"
+                ? "local_preview_loopback_only"
+                : "implementation_disabled",
+              externalParticipantsAuthorized: false,
+            },
+            incrementalContribution: {
+              schemaVersion: "telemetry-contribution-v1.0",
+              status: "implementation_ready",
+              // Owner decision 2026-08-21: external participants ARE authorized
+              // on the production deployment — enrollment was already open at
+              // the pairing layer, and this declaration now matches that
+              // reality instead of contradicting it. Env-driven rather than a
+              // literal so staging and synthetic keep declaring false and their
+              // containment checks (deploy-disabled-staging) stay meaningful.
+              // The v0.2 account-scoped declaration above stays false: that
+              // path is implementation_disabled and authorizes no one.
+              externalParticipantsAuthorized:
+                Reflect.get(env, "INCREMENTAL_EXTERNAL_PARTICIPANTS")
+                  === "authorized",
+            },
+          },
+          capabilities: {
+            encryptedUpload: collectionControls.processing,
+            serverValidation: true,
+            idempotentDeduplication: true,
+            communityDaily: publicAnalyticsAvailable,
+            participantExport: true,
+            participantDeletion: false,
+            boundedQuarantineRetention: true,
+            deletionSafeRestoreReplay: true,
+            ongoingDeviceUploadRegistration:
+              collectionControls.uploadRegistration,
+            coordinatedSignInAdmission: true,
+          },
+        });
       }));
     }
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
@@ -4679,13 +4703,22 @@ export async function handleRequest(
     };
     if (log.level === "error") console.error(JSON.stringify(log));
     else console.warn(JSON.stringify(log));
-    await recordDiagnosticError(
-      env.USAGE_MONITOR_DB,
-      requestId,
-      route.routeClass,
-      apiError.code,
-      apiError.status,
-    );
+    // Public probes must not start diagnostic writes after their bounded probe
+    // operation has settled and released its lease. Structured logs above retain
+    // failure visibility without extending the probe's backend work.
+    const publicProbe = route.id === "health" || route.id === "ready";
+    const operationalAdmissionRefused = route.id === "sparkle_appcast_guard"
+      && ["ADMISSION_CONFIGURATION_INVALID", "ADMISSION_RATE_LIMIT_UNAVAILABLE",
+        "ATTEMPT_LIMIT_REACHED"].includes(apiError.code);
+    if (!publicProbe && !operationalAdmissionRefused) {
+      await recordDiagnosticError(
+        env.USAGE_MONITOR_DB,
+        requestId,
+        route.routeClass,
+        apiError.code,
+        apiError.status,
+      );
+    }
     const response = errorResponse(apiError, requestId);
     const allow = allowedHeader(apiError);
     if (!allow) return noStore(response);

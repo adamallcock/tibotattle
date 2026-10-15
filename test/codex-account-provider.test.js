@@ -354,7 +354,7 @@ test("older servers get one parameter-free retry and subsequent polls stay compa
 });
 
 test("rate-limit fallback never retries unrelated errors or loops after a legacy rejection", async () => {
-  for (const code of [-32000, -32603, "-32602", undefined]) {
+  for (const code of [-32000, -32603, "-32602", 2_147_483_648, -2_147_483_649, undefined]) {
     await withRateLimitServer(() => ({ error: { code, message: "Synthetic failure" } }), async (client, requests) => {
       await assert.rejects(client.readRateLimits({ excludeResetCreditDetails: true }), { code: "request_failed" });
       assert.equal(requests.length, 1);
@@ -363,6 +363,74 @@ test("rate-limit fallback never retries unrelated errors or loops after a legacy
   await withRateLimitServer(() => ({ error: { code: -32602, message: "Unsupported params" } }), async (client, requests) => {
     await assert.rejects(client.readRateLimits({ excludeResetCreditDetails: true }), { code: "request_failed" });
     assert.equal(requests.length, 2);
+  });
+});
+
+test("provider error details never enter the local error, cause, stack, or bounded RPC code", async () => {
+  const privateText = "synthetic prompt and /private/session/path token-canary";
+  const controlText = `before\u001b[2Jmiddle\u001b]8;;https://example.invalid\u0007link`;
+  const oversizedText = `${"x".repeat(128 * 1024)}private-tail-canary`;
+  const messages = [
+    privateText,
+    controlText,
+    oversizedText,
+    { prompt: privateText, nested: { path: privateText } },
+    null,
+  ];
+
+  for (const providerMessage of messages) {
+    await withRateLimitServer(() => ({ error: { code: -32000, message: providerMessage } }), async (client) => {
+      let captured;
+      await assert.rejects(client.readRateLimits(), (error) => {
+        captured = error;
+        return error.code === "request_failed";
+      });
+      assert.equal(captured.message, "Codex app-server request failed");
+      assert.equal(captured.rpcCode, -32000);
+      assert.equal(captured.cause, undefined);
+      assert.equal(captured.stack.includes(privateText), false, "private provider text escaped in stack");
+      assert.equal(captured.stack.includes(controlText), false, "terminal controls escaped in stack");
+      assert.equal(captured.stack.includes("private-tail-canary"), false, "oversized provider text escaped in stack");
+    });
+  }
+
+  for (const invalidCode of [
+    "-32602",
+    1.25,
+    Number.MAX_SAFE_INTEGER,
+    Number.MIN_SAFE_INTEGER,
+    2_147_483_648,
+    -2_147_483_649,
+    {},
+    null,
+  ]) {
+    await withRateLimitServer(() => ({ error: { code: invalidCode, message: privateText } }), async (client) => {
+      let captured;
+      await assert.rejects(client.readRateLimits(), (error) => {
+        captured = error;
+        return error.code === "request_failed";
+      });
+      assert.equal(captured.rpcCode, null, "invalid or unbounded RPC code was retained");
+      assert.equal(captured.message, "Codex app-server request failed");
+      assert.equal(captured.cause, undefined);
+      assert.equal(captured.stack.includes(privateText), false, "private provider text escaped in stack");
+    });
+  }
+
+  for (const boundaryCode of [-2_147_483_648, 2_147_483_647]) {
+    await withRateLimitServer(() => ({ error: { code: boundaryCode, message: privateText } }), async (client) => {
+      await assert.rejects(client.readRateLimits(), { code: "request_failed", rpcCode: boundaryCode });
+    });
+  }
+});
+
+test("an explicit null JSON-RPC error does not resolve as a successful result", async () => {
+  await withRateLimitServer(() => ({ error: null, result: { account: "must-not-resolve" } }), async (client) => {
+    await assert.rejects(client.readRateLimits(), {
+      code: "request_failed",
+      rpcCode: null,
+      message: "Codex app-server request failed",
+    });
   });
 });
 

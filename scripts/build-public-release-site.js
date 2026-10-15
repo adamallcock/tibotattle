@@ -49,6 +49,7 @@ import {
   createPublicReleaseSourceProvenance,
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
 } from "./public-release-provenance.js";
+import { privateLocalPathLines } from "./lib/private-local-paths.mjs";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_SOURCE = join(REPOSITORY_ROOT, "apps", "web", "public");
@@ -58,6 +59,7 @@ const SITEMAP_FILENAME = "sitemap.xml";
 const PUBLIC_COMMUNITY_ROUTE_FILENAME = "community.html";
 const PUBLIC_FALLBACK_ROUTE_FILENAME = "404.html";
 const SITE_ENTRY_MODULE_BASENAME = "community.js";
+const PUBLIC_TEXT_ASSET = /\.(?:css|html|js|json|txt|xml|svg)$/iu;
 /**
  * The public site is built from the community entry, not from the dashboard
  * entry. The dashboard is the Mac app's own interface: every control in it
@@ -94,6 +96,7 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "work-usage-view.js",
   "reporting-period.js",
   "data-client.js",
+  "local-request.js",
   "index.html",
   "lib.js",
   "navigation.js",
@@ -138,6 +141,10 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "/data-client.js",
   '"data-client.js"',
   "'data-client.js'",
+  "./local-request.js",
+  "/local-request.js",
+  '"local-request.js"',
+  "'local-request.js'",
   "./navigation.js",
   "/navigation.js",
   '"navigation.js"',
@@ -1175,6 +1182,15 @@ function assertNoForbiddenPublicReferences(contents, label, errorType = Error) {
   }
 }
 
+function assertNoPrivateLocalPaths(contents, label, errorType = Error) {
+  const [line] = privateLocalPathLines(contents);
+  if (line !== undefined) {
+    throw new errorType(
+      `${label}:${line}: private local paths and file URLs are forbidden in public assets`,
+    );
+  }
+}
+
 /**
  * Select the exact public closure, rather than copying the mixed web source
  * directory. HTML and CSS references are constrained locally; JavaScript is
@@ -1561,13 +1577,20 @@ export async function buildPublicReleaseSite(rawArgs, {
   const canonicalPageUrls = [...canonicalUrlBySourceBasename.values()];
   assertPublicClosureHasNoDashboardSource(options.source, publicSourceFiles);
   for (const sourceFile of publicSourceFiles) {
+    if (!PUBLIC_TEXT_ASSET.test(sourceFile)) continue;
     const extension = extname(sourceFile).toLowerCase();
+    const contents = await readFile(sourceFile, "utf8");
+    assertNoPrivateLocalPaths(
+      contents,
+      `Public release source ${relativePublicSourceName(options.source, sourceFile)}`,
+      TypeError,
+    );
     if (extension === ".css"
         || ![".html", ".js", ".json", ".txt"].includes(extension)) {
       continue;
     }
     assertNoForbiddenPublicReferences(
-      await readFile(sourceFile, "utf8"),
+      contents,
       `Public release source ${relativePublicSourceName(options.source, sourceFile)}`,
       TypeError,
     );
@@ -1575,6 +1598,11 @@ export async function buildPublicReleaseSite(rawArgs, {
   // Check the selected source before any release metadata or output writes.
   // This catches a dashboard shell/control accidentally added to the public
   // entry even when it does not have a recognizable app-only filename.
+  assertNoPrivateLocalPaths(
+    sourceHtml,
+    `Public release source ${SITE_INDEX_SOURCE_BASENAME}`,
+    TypeError,
+  );
   assertNoForbiddenPublicReferences(
     sourceHtml,
     `Public release source ${SITE_INDEX_SOURCE_BASENAME}`,
@@ -1812,9 +1840,9 @@ export async function buildPublicReleaseSite(rawArgs, {
       );
     }
   }
-  for (const { path } of files.filter(({ path }) =>
-    /\.(?:css|html|js|json|txt)$/u.test(path))) {
+  for (const { path } of files.filter(({ path }) => PUBLIC_TEXT_ASSET.test(path))) {
     const contents = await readFile(join(options.output, path), "utf8");
+    assertNoPrivateLocalPaths(contents, `Release output asset ${path}`);
     // The shared stylesheet deliberately retains selectors used only by the
     // loopback dashboard; selectors are not served/imported dashboard source
     // and must not make the public community CSS fail closed. Markup and
@@ -1901,9 +1929,14 @@ export async function buildPublicReleaseSite(rawArgs, {
     } : {}),
     files,
   };
+  const manifestContents = `${JSON.stringify(manifest, null, 2)}\n`;
+  assertNoPrivateLocalPaths(
+    manifestContents,
+    "Release output asset release-site-manifest.json",
+  );
   await writeFile(
     join(options.output, "release-site-manifest.json"),
-    `${JSON.stringify(manifest, null, 2)}\n`,
+    manifestContents,
     { encoding: "utf8", mode: 0o644 },
   );
 

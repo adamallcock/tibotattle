@@ -21,7 +21,8 @@ import { isDevelopmentEnvironment } from "./admission";
  * The only deployed env keys the edge hands to handleRequest outside worker
  * mode: the public origin and environment, the publication switch, the
  * static assets, the admin Access settings, the deployment identity, and the
- * Sparkle guard's settings, token and release bucket. Frozen and sorted.
+ * Sparkle guard's settings, token and release bucket. Operational admission
+ * capabilities are supplied separately only to their owning routes. Frozen and sorted.
  */
 export const EDGE_LOCAL_ENV_KEYS = Object.freeze([
   "ACCESS_ADMIN_EMAIL",
@@ -78,15 +79,22 @@ export function buildEdgeLocalEnv(env: Env): Readonly<Env> {
 }
 
 /**
- * The Sparkle guard's env: the same named keys, re-read from `localEnv`, plus
- * USAGE_MONITOR_DB as the nonce-only facade over the release guard D1.
+ * The Sparkle guard's env: the same named keys, re-read from `localEnv`, its
+ * two explicit admission capabilities, and USAGE_MONITOR_DB as the nonce-only
+ * facade over the release guard D1. No participant storage reaches the guard.
  */
+export type EdgeGuardAdmissionBindings = Readonly<Pick<Env,
+  "SPARKLE_APPCAST_GUARD_RATE_LIMIT" | "UPLOAD_INGRESS_BUDGET">>;
+
 export function buildEdgeGuardEnv(
   localEnv: Readonly<Env>,
   releaseGuardDb: D1Database,
+  admission: EdgeGuardAdmissionBindings,
 ): Readonly<Env> {
   return Object.freeze({
     ...namedEnvValues(localEnv),
+    SPARKLE_APPCAST_GUARD_RATE_LIMIT: admission.SPARKLE_APPCAST_GUARD_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: admission.UPLOAD_INGRESS_BUDGET,
     USAGE_MONITOR_DB: createReleaseGuardDatabase(releaseGuardDb),
   }) as unknown as Readonly<Env>;
 }

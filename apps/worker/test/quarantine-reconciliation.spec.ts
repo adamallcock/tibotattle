@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { applyD1Migrations, reset } from "cloudflare:test";
+import { applyD1Migrations, reset, runInDurableObject } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -18,6 +18,7 @@ import {
   type QuarantineObjectKind,
 } from "../src/quarantine-reconciliation";
 import { runBackendLifecycle } from "../src/retention";
+import { publicProbeBudgetObjectName } from "../src/public-probe-admission";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -44,6 +45,8 @@ function bindings(overrides: Partial<Env> = {}): Env {
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
+    PUBLIC_PROBE_RATE_LIMIT: runtime.PUBLIC_PROBE_RATE_LIMIT,
+    PUBLIC_PROBE_CLIENT_RATE_LIMIT: runtime.PUBLIC_PROBE_CLIENT_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
     UPLOAD_AUTHORIZATION_RATE_LIMIT: runtime.UPLOAD_AUTHORIZATION_RATE_LIMIT,
     UPLOAD_PRINCIPAL_RATE_LIMIT: runtime.UPLOAD_PRINCIPAL_RATE_LIMIT,
@@ -349,6 +352,10 @@ async function markLifecycleAndReconciliationComplete(
 }
 
 async function ready(): Promise<Response> {
+  // Each call below observes an independently arranged lifecycle state. Keep
+  // real admission enabled without exhausting its burst across those cases.
+  const budget = bindings().UPLOAD_INGRESS_BUDGET.getByName(publicProbeBudgetObjectName("ready"));
+  await runInDurableObject(budget, async (_instance, state) => { await state.storage.deleteAll(); });
   return handleRequest(
     new Request("https://example.test/api/ready"),
     bindings(),

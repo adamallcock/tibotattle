@@ -352,6 +352,15 @@ test("exports the frozen production constants", () => {
     "ENROLLMENT", "RECOVERY", "CLIENT_ATTEMPT", "PUBLIC_READ",
     "UPLOAD_INGRESS_REQUEST", "UPLOAD_INGRESS_CLIENT",
   ]);
+  assert.deepEqual(configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS, [
+    "PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+  ]);
+  assert.equal(configuration.EDGE_TIER_RATE_LIMIT_BINDINGS.length, 6);
+  assert.equal(configuration.PRODUCTION_WORKER_BINDING_NAMES.length, 9);
+  for (const binding of configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS) {
+    assert.ok(!configuration.EDGE_TIER_RATE_LIMIT_BINDINGS.includes(binding), binding);
+    assert.ok(!configuration.PRODUCTION_WORKER_BINDING_NAMES.includes(binding), binding);
+  }
   assert.deepEqual(configuration.ORIGIN_TIER_RATE_LIMITS, {
     UPLOAD_AUTHORIZATION: { binding: "UPLOAD_AUTHORIZATION_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
     UPLOAD_PRINCIPAL: { binding: "UPLOAD_PRINCIPAL_RATE_LIMIT", limit: 3_000, periodSeconds: 60 },
@@ -1174,6 +1183,17 @@ test("processEnv TELEMETRY_STORAGE_MODE=json keeps the pinned 'typed' in every p
     });
     assert.equal(workerEnv.TELEMETRY_STORAGE_MODE, "typed", profile);
     assert.equal(workerEnv.PERFORMANCE_TELEMETRY_STORAGE_MODE, "enabled", profile);
+  }
+});
+
+test("edge-only operational limiters cannot be injected into either origin service plane", () => {
+  for (const [profile, processEnv] of [["production", productionEnv()], ["staging", stagingEnv()]]) {
+    const config = expectAccepted(processEnv, profile);
+    for (const binding of configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS) {
+      expectCode(() => createProductionWorkerEnv(config, {
+        bindings: { ...serviceBindings(config.rateLimits.originTier), [binding]: limiter() },
+      }), "PRODUCTION_BINDING_UNEXPECTED");
+    }
   }
 });
 

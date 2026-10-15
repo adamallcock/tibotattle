@@ -228,6 +228,8 @@ test("enabled Sparkle guard requires reviewed bindings and the nonce schema", ()
       binding: "USAGE_MONITOR_DB",
       migrations_dir: "migrations",
     }],
+    ratelimits: [{ name: "SPARKLE_APPCAST_GUARD_RATE_LIMIT", namespace_id: "3011", simple: { limit: 60, period: 60 } }],
+    durable_objects: { bindings: [{ name: "UPLOAD_INGRESS_BUDGET", class_name: "UploadIngressBudget" }] },
   };
   const migration = `
     CREATE TABLE IF NOT EXISTS sparkle_appcast_guard_nonces (
@@ -241,6 +243,21 @@ test("enabled Sparkle guard requires reviewed bindings and the nonce schema", ()
     configuration,
     migration,
   ));
+  for (const change of [
+    (value) => { delete value.ratelimits; },
+    (value) => { value.ratelimits[0].simple.limit = 61; },
+    (value) => { value.ratelimits[0].simple.period = 10; },
+    (value) => { value.ratelimits.push({ name: "PUBLIC_READ_RATE_LIMIT", namespace_id: "3011", simple: { limit: 120, period: 60 } }); },
+    (value) => { delete value.durable_objects; },
+    (value) => { value.durable_objects.bindings[0].class_name = "OtherBudget"; },
+    (value) => { value.durable_objects.bindings[0].script_name = "other-worker"; },
+  ]) {
+    const invalid = structuredClone(configuration);
+    change(invalid);
+    assert.throws(() => validateWorkerSparkleAppcastGuard(invalid, migration), {
+      code: "DEPLOYMENT_ENDPOINTS_MISMATCH",
+    });
+  }
   configuration.r2_buckets[0].bucket_name = "wrong-reviewed-bucket";
   assert.throws(
     () => validateWorkerSparkleAppcastGuard(configuration, migration),

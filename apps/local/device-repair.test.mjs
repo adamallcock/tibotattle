@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { LOCAL_COMPANION_SCHEMA_VERSION } from "../../src/local-companion-data.js";
 import { ensureContributionDeviceCapability } from "../../src/contribution-device-capability.js";
 import { writeContributionDeviceRenewalState } from "../../src/contribution-device-renewal.js";
-import { startLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 
 const ORIGIN = "https://usage.example";
 const PAIRING_CODE = `um_pair_11111111-1111-4111-8111-111111111111.${"A".repeat(43)}`;

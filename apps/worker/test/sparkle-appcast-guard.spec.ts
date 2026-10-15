@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
-import { applyD1Migrations, reset } from "cloudflare:test";
+import { applyD1Migrations, reset, runInDurableObject } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { APPCAST_GUARD_BUDGET_OBJECT_NAME, APPCAST_GUARD_BODY_POLICY, APPCAST_GUARD_BUDGET_POLICY } from "../src/appcast-guard-admission";
 
 import {
   handleSparkleAppcastGuard,
@@ -212,6 +213,8 @@ function bindings(bucket: FakeR2Bucket | null, overrides: Record<string, unknown
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: runtime.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: runtime.PUBLIC_READ_RATE_LIMIT,
+    SPARKLE_APPCAST_GUARD_RATE_LIMIT: runtime.SPARKLE_APPCAST_GUARD_RATE_LIMIT,
+    UPLOAD_INGRESS_BUDGET: runtime.UPLOAD_INGRESS_BUDGET,
     RECOVERY_RATE_LIMIT: runtime.RECOVERY_RATE_LIMIT,
     USAGE_MONITOR_DB: runtime.USAGE_MONITOR_DB,
     SPARKLE_RELEASES: bucket,
@@ -228,6 +231,11 @@ function bindings(bucket: FakeR2Bucket | null, overrides: Record<string, unknown
     [SPARKLE_APPCAST_GUARD_PUBLIC_KEY_SHA256_ENV]: sparklePublicEdKeySha256,
     ...overrides,
   } as unknown as Env;
+}
+
+async function resetGuardBudget(): Promise<void> {
+  const budget = env.UPLOAD_INGRESS_BUDGET.getByName(APPCAST_GUARD_BUDGET_OBJECT_NAME);
+  await runInDurableObject(budget, async (_instance, state) => { await state.storage.deleteAll(); });
 }
 
 async function signedRequest(
@@ -420,6 +428,180 @@ beforeEach(async () => {
 });
 
 describe("Sparkle appcast atomic guard", () => {
+  it("rejects concurrent preauthentication bodies and releases all leases on stream failure", async () => {
+    const signed = await signedRequest({});
+    const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const requests = Array.from({ length: 4 }, () => new Request(signed.url, {
+      method: "POST", headers: signed.headers,
+      body: new ReadableStream<Uint8Array>({ start(controller) { controllers.push(controller); } }),
+    }));
+    const bucket = new FakeR2Bucket();
+    const pending = requests.map((request) => invoke(request, bindings(bucket)));
+    const budget = env.UPLOAD_INGRESS_BUDGET.getByName(APPCAST_GUARD_BUDGET_OBJECT_NAME);
+    try {
+      await vi.waitFor(() => expect(requests.every((request) => request.body!.locked)).toBe(true));
+      const rejected = await signedRequest({});
+      const read = vi.spyOn(rejected.body!, "getReader");
+      expect((await invoke(rejected, bindings(bucket))).status).toBe(429);
+      expect(read).not.toHaveBeenCalled();
+      expect((await budget.status(APPCAST_GUARD_BUDGET_POLICY)).activeLeases).toBe(4);
+    } finally {
+      for (const controller of controllers) controller.error(new Error("synthetic peer disconnected"));
+      const outcomes = await Promise.all(pending);
+      expect(outcomes.map((response) => response.status)).toEqual([400, 400, 400, 400]);
+    }
+    expect((await budget.status(APPCAST_GUARD_BUDGET_POLICY)).activeLeases).toBe(0);
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("rejects absent, malformed and stale authentication before touching a body or admission", async () => {
+    const headerCases: Record<string, string>[] = [
+      {},
+      { "x-usage-monitor-release-timestamp": String(NOW / 1000), "x-usage-monitor-release-nonce": "valid-looking-nonce-0001", "x-usage-monitor-release-signature": "!".repeat(43) },
+      { "x-usage-monitor-release-timestamp": "1", "x-usage-monitor-release-nonce": "valid-looking-nonce-0001", "x-usage-monitor-release-signature": "A".repeat(43) },
+    ];
+    for (const headers of headerCases) {
+      const request = new Request(`https://example.test${SPARKLE_APPCAST_GUARD_ROUTE}`, {
+        method: "POST", headers: { "content-type": "application/json", ...headers },
+        body: new ReadableStream<Uint8Array>({ start() {} }),
+      });
+      const read = vi.spyOn(request.body!, "getReader");
+      const limit = vi.fn(async () => ({ success: true }));
+      const bucket = new FakeR2Bucket();
+      const response = await invoke(request, bindings(bucket, { SPARKLE_APPCAST_GUARD_RATE_LIMIT: { limit } }));
+      expect(response.status).toBe(401);
+      expect(read).not.toHaveBeenCalled();
+      expect(limit).not.toHaveBeenCalled();
+      expect(bucket.putCalls).toBe(0);
+    }
+  });
+
+  it("rejects missing or denied admission without reading body or acquiring a lease", async () => {
+    for (const limiter of [undefined, { limit: async () => ({ success: false }) }, { limit: async () => { throw new Error("unavailable"); } }]) {
+      const request = await signedRequest({});
+      const read = vi.spyOn(request.body!, "getReader");
+      const acquire = vi.fn();
+      const bucket = new FakeR2Bucket();
+      const response = await invoke(request, bindings(bucket, {
+        SPARKLE_APPCAST_GUARD_RATE_LIMIT: limiter,
+        UPLOAD_INGRESS_BUDGET: { getByName: () => ({ acquire }) },
+      }));
+      expect([429, 503]).toContain(response.status);
+      expect(read).not.toHaveBeenCalled();
+      expect(acquire).not.toHaveBeenCalled();
+      expect(bucket.putCalls).toBe(0);
+    }
+  });
+
+  it("includes admission waiting in the final timestamp freshness check", async () => {
+    const request = await signedRequest({}, TOKEN, Math.floor(NOW / 1000) - 300);
+    const release = vi.fn(async () => {});
+    vi.useFakeTimers();
+    try {
+      const response = invoke(request, bindings(new FakeR2Bucket(), {
+        SPARKLE_APPCAST_GUARD_RATE_LIMIT: { limit: () => new Promise((resolve) => {
+          setTimeout(() => resolve({ success: true }), 900);
+        }) },
+        UPLOAD_INGRESS_BUDGET: { getByName: () => ({
+          acquire: () => new Promise((resolve) => {
+            setTimeout(() => resolve({ allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }), 900);
+          }), release,
+        }) },
+      }));
+      await vi.advanceTimersByTimeAsync(1_801);
+      expect((await response).status).toBe(401);
+      expect(release).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("cancels an idle body and releases its lease even when cancellation never settles", async () => {
+    const signed = await signedRequest({});
+    let cancelled = false;
+    const request = new Request(signed.url, {
+      method: "POST", headers: signed.headers,
+      body: new ReadableStream<Uint8Array>({ cancel() { cancelled = true; return new Promise<void>(() => {}); } }),
+    });
+    const release = vi.fn(async () => {});
+    const budget = { acquire: async () => ({ allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }), release };
+    vi.useFakeTimers();
+    try {
+      const response = invoke(request, bindings(new FakeR2Bucket(), {
+        SPARKLE_APPCAST_GUARD_RATE_LIMIT: { limit: async () => ({ success: true }) },
+        UPLOAD_INGRESS_BUDGET: { getByName: () => budget },
+      }));
+      await vi.advanceTimersByTimeAsync(APPCAST_GUARD_BODY_POLICY.maximumIdleMilliseconds + 1);
+      expect((await response).status).toBe(408);
+      expect(cancelled).toBe(true);
+      expect(release).toHaveBeenCalledExactlyOnceWith("11111111-1111-4111-8111-111111111111");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("enforces a total body deadline while chunks keep arriving inside the idle limit", async () => {
+    const signed = await signedRequest({});
+    let timer: ReturnType<typeof setInterval>;
+    let cancelled = false;
+    const release = vi.fn(async () => {});
+    vi.useFakeTimers();
+    try {
+      const request = new Request(signed.url, {
+        method: "POST", headers: signed.headers,
+        body: new ReadableStream<Uint8Array>({
+          start(controller) { timer = setInterval(() => controller.enqueue(encoder.encode(" ")), 1_000); },
+          cancel() { clearInterval(timer); cancelled = true; },
+        }),
+      });
+      const response = invoke(request, bindings(new FakeR2Bucket(), {
+        SPARKLE_APPCAST_GUARD_RATE_LIMIT: { limit: async () => ({ success: true }) },
+        UPLOAD_INGRESS_BUDGET: { getByName: () => ({
+          acquire: async () => ({ allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }), release,
+        }) },
+      }));
+      await vi.advanceTimersByTimeAsync(APPCAST_GUARD_BODY_POLICY.maximumTotalMilliseconds + 1);
+      expect((await response).status).toBe(408);
+      expect(cancelled).toBe(true);
+      expect(release).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("rejects oversize streaming bytes without waiting for cancellation and releases the lease", async () => {
+    const signed = await signedRequest({});
+    const release = vi.fn(async () => {});
+    let cancelled = false;
+    const request = new Request(signed.url, {
+      method: "POST", headers: signed.headers,
+      body: new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array(2 * 1024 * 1024 + 1)); },
+        cancel() { cancelled = true; return new Promise<void>(() => {}); },
+      }),
+    });
+    const response = await invoke(request, bindings(new FakeR2Bucket(), {
+      UPLOAD_INGRESS_BUDGET: { getByName: () => ({
+        acquire: async () => ({ allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }), release,
+      }) },
+    }));
+    expect(response.status).toBe(413);
+    expect(cancelled).toBe(true);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the body lease after failed HMAC, invalid payload, and successful publication", async () => {
+    for (const outcome of ["hmac", "payload", "success"]) {
+      const bucket = new FakeR2Bucket();
+      await installArtifact(bucket, "1");
+      const release = vi.fn(async () => {});
+      const request = await signedRequest(outcome === "payload" ? {} : await payload(),
+        outcome === "hmac" ? "wrong-authentication-token" : TOKEN,
+        NOW / 1000, `release-lease-${outcome}-nonce`);
+      const response = await invoke(request, bindings(bucket, {
+        UPLOAD_INGRESS_BUDGET: { getByName: () => ({
+          acquire: async () => ({ allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }), release,
+        }) },
+      }));
+      expect(response.status).toBe(outcome === "hmac" ? 401 : outcome === "payload" ? 400 : 200);
+      expect(release).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it("is disabled and indistinguishable from an unregistered route by default", async () => {
     const bucket = new FakeR2Bucket();
     const disabled = bindings(bucket, { SPARKLE_APPCAST_GUARD_MODE: undefined });
@@ -573,6 +755,21 @@ describe("Sparkle appcast atomic guard", () => {
     expect(bucket.putCalls).toBe(1);
   });
 
+  it("retains a future-dated nonce until its entire timestamp acceptance window ends", async () => {
+    const bucket = new FakeR2Bucket();
+    await installArtifact(bucket, "1");
+    const body = await payload();
+    const timestamp = Math.floor(NOW / 1000) + 300;
+    const first = await invoke(await signedRequest(body, TOKEN, timestamp), bindings(bucket), NOW);
+    expect(first.status).toBe(200);
+    // The old 301-second TTL allowed replay while this future timestamp was
+    // still valid. Keep the nonce through the full +600-second boundary.
+    const replay = await invoke(await signedRequest(body, TOKEN, timestamp), bindings(bucket), NOW + 301_000);
+    expect(replay.status).toBe(401);
+    expect((await jsonResponse(replay)).error).toEqual({ code: "SPARKLE_APPCAST_GUARD_REPLAY_INVALID" });
+    expect(bucket.putCalls).toBe(1);
+  });
+
   it("rejects arbitrary valid-looking XML without a canonical enclosure", async () => {
     const bucket = new FakeR2Bucket();
     const candidate = encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
@@ -602,6 +799,9 @@ describe("Sparkle appcast atomic guard", () => {
       ),
     ];
     for (const [index, candidateText] of candidates.entries()) {
+      // Independent parser cases must reach parsing, not exhaust the separate
+      // rate budget. Dedicated admission tests below cover that budget.
+      await resetGuardBudget();
       const bucket = new FakeR2Bucket();
       const response = await invoke(
         await signedRequest(
@@ -1182,6 +1382,7 @@ describe("Intel Sparkle publication isolation", () => {
       (value: string) => value.replace("<enclosure", "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements><enclosure"),
     ];
     for (const [index, mutatePrefix] of mutations.entries()) {
+      await resetGuardBudget();
       const candidate = await officialSignedAppcastBytes("1026", ARTIFACT_BYTES,
         { architecture: "x64", mutatePrefix });
       const response = await invoke(await signedRequest(await payload({ candidate, key: "intel/appcast.xml" }), TOKEN,

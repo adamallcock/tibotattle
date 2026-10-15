@@ -1,7 +1,12 @@
 // Unit checks for the GCP fast-path parity compare (Q-2). Synthetic,
 // content-free inputs only; no database, no network.
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, test } from "node:test";
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   ANALYTICS_V2_DECLARED_MODEL_METADATA,
   ANALYTICS_V2_PARITY_FAMILIES,
@@ -12,6 +17,116 @@ import {
   withheldModelDatesOf,
 } from "./analytics-v2-parity-compare.mjs";
 import { comparePerDate } from "./gcp-fastpath-dense-oracle/per-date-compare.mjs";
+import { ANALYTICS_V2_Q1_CURRENT_CONTRACT, currentQ1ComparisonInputs, currentQ1PerDateExpected, loadQ1CurrentContract } from "./analytics-v2-parity-current-contract.mjs";
+
+let currentQ1FixturePromise;
+function currentQ1Fixture() {
+  currentQ1FixturePromise ??= (async () => {
+    const goldenDirectory = fileURLToPath(new URL("../analytics-v2-test/golden", import.meta.url));
+    const perDateExpectedPath = fileURLToPath(new URL("../analytics-v2-test/golden-q1-node/per-date-expected.json", import.meta.url));
+    const read = async (url) => JSON.parse(await readFile(url, "utf8"));
+    const [currentContract, golden, goldenPreview, perDateExpected, manifest] = await Promise.all([
+      loadQ1CurrentContract({ goldenDirectory, perDateExpectedPath }),
+      read(new URL("../analytics-v2-test/golden/community-daily-response.json", import.meta.url)),
+      read(new URL("../analytics-v2-test/golden/preview.json", import.meta.url)), read(perDateExpectedPath),
+      read(new URL("../analytics-v2-test/golden/manifest.json", import.meta.url)),
+    ]);
+    const actual = structuredClone(currentContract.expected.golden);
+    actual.allowanceBreakdowns = structuredClone(currentContract.expected.perDateExpected.allowanceBreakdowns);
+    return { golden, goldenPreview, perDateExpected, currentContract, actual,
+      actualPreview: structuredClone(currentContract.expected.perDateExpected.preview),
+      withheldModelDates: withheldModelDatesOf(manifest) };
+  })();
+  return currentQ1FixturePromise;
+}
+
+test("the named current Q-1 contract preserves strict legacy rejection and exact current comparisons", async () => {
+  const fixture = await currentQ1Fixture();
+  const before = JSON.stringify([fixture.actual, fixture.actualPreview]);
+  const report = compareAnalyticsV2Parity(fixture);
+  assert.equal(report.unexpectedDiffs, 0);
+  assert.deepEqual(report.currentContract, { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: true });
+  const perDate = comparePerDate({ expected: fixture.perDateExpected, response: fixture.actual,
+    preview: fixture.actualPreview, currentContract: fixture.currentContract });
+  assert.equal(perDate.equal, true);
+  assert.deepEqual(perDate.currentContract, report.currentContract);
+  const legacy = compareAnalyticsV2Parity({ ...fixture, currentContract: null });
+  assert.equal(legacy.unexpectedDiffs, 558, "the historical lane retains the independently observed regression signature");
+  assert.equal(Object.hasOwn(legacy, "currentContract"), false);
+  assert.equal(comparePerDate({ expected: fixture.perDateExpected, response: fixture.actual,
+    preview: fixture.actualPreview }).equal, false);
+  assert.equal(JSON.stringify([fixture.actual, fixture.actualPreview]), before, "actual inputs are never rewritten");
+});
+
+test("the current Q-1 lane rejects changes in historical values and every new declared contract", async (t) => {
+  const original = await currentQ1Fixture();
+  const cases = [
+    ["cost", (f) => { f.actual.days[0].payload.apiEquivalentSpend.knownCostUsd += 1; }],
+    ["coverage", (f) => { f.actual.days[0].payload.apiEquivalentSpend.coverage = "other"; }],
+    ...["usageEvents", "fullyPricedUsageEvents", "partiallyPricedUsageEvents", "unpricedUsageEvents"].map((key) =>
+      [`spend ${key}`, (f) => { f.actual.days[0].payload.apiEquivalentSpend[key] += 1; }]),
+    ["price method", (f) => { f.actual.days[0].payload.apiEquivalentSpend.pricingMethodVersion = "server-api-price-equivalent-v0.5"; }],
+    ["price registry", (f) => { f.actual.days[0].payload.apiEquivalentSpend.registrySha256 = "0".repeat(64); }],
+    ["extra spend key", (f) => { f.actual.days[0].payload.apiEquivalentSpend.extra = 0; }],
+    ["missing spend key", (f) => { delete f.actual.days[0].payload.apiEquivalentSpend.currency; }],
+    ["missing daily row", (f) => { f.actual.days.pop(); }],
+    ["duplicate daily row", (f) => { f.actual.days.push(structuredClone(f.actual.days[0])); }],
+    ["extra daily row", (f) => { f.actual.days.push({ ...structuredClone(f.actual.days[0]), day: "2026-01-01" }); }],
+    ["daily totals", (f) => { f.actual.days[0].payload.totals.usageEvents += 1; }],
+    ["common plan", (f) => { f.actual.allowanceBreakdowns.days[0].byPlanType.pro.participantCount += 1; }],
+    ["combined amount", (f) => { f.actual.allowanceBreakdowns.days[0].combined.centralUsd = 123; }],
+    ["preview coverage", (f) => { f.actualPreview.coverage.extra = 1; }],
+    ["preview basis", (f) => { f.actualPreview.basis = "other"; }],
+    ["preview schema", (f) => { f.actualPreview.schemaVersion = "admin-community-allowance-preview-v0.4"; }],
+    ["public schema", (f) => { f.actual.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.4"; }],
+    ...["basis", "normalization", "modelBasis", "modelGate", "referencePlanType"].map((key) =>
+      [`public ${key}`, (f) => { f.actual.allowanceBreakdowns[key] = "other"; }]),
+    ["missing plan", (f) => { f.actualPreview.plans.pop(); }],
+    ["extra plan", (f) => { f.actualPreview.plans.push({ planType: "other", label: "Other", multiplier: 1 }); }],
+    ["duplicate plan", (f) => { f.actualPreview.plans.push(structuredClone(f.actualPreview.plans[0])); }],
+    ["reordered plans", (f) => { f.actualPreview.plans.reverse(); }],
+    ["plan multiplier", (f) => { f.actualPreview.plans[2].multiplier = 1; }],
+    ...["centralUsd", "participantCount", "fitCount", "band80Usd"].flatMap((key) => [
+      [`public Pro Max ${key}`, (f) => { f.actual.allowanceBreakdowns.days[0].byPlanType.promax[key] = 1; }],
+      [`preview Pro Max ${key}`, (f) => { f.actualPreview.days[0].byPlanType.promax[key] = 1; }],
+    ]),
+    ["missing Pro Max", (f) => { delete f.actual.allowanceBreakdowns.days[0].byPlanType.promax; }],
+    ["extra Pro Max key", (f) => { f.actualPreview.days[0].byPlanType.promax.extra = 0; }],
+    ["missing public day", (f) => { f.actual.allowanceBreakdowns.days.pop(); }],
+    ["duplicate public day", (f) => { f.actual.allowanceBreakdowns.days.push(structuredClone(f.actual.allowanceBreakdowns.days[0])); }],
+    ["extra preview field", (f) => { f.actualPreview.extra = 0; }],
+    ["model basis", (f) => { f.actualPreview.models.basis = "other"; }],
+    ["catalog stamp", (f) => { f.actualPreview.models.days[0].catalogVersion = "other"; }],
+    ["missing model day", (f) => { f.actualPreview.models.days.pop(); }],
+    ["duplicate model day", (f) => { f.actualPreview.models.days.push(structuredClone(f.actualPreview.models.days[0])); }],
+    ["model count", (f) => { f.actualPreview.models.days[0].refusedParticipantCount += 1; }],
+    ["public model value", (f) => { f.actual.allowanceBreakdowns.days.find((day) => day.models.length > 0).models[0][1] += 1; }],
+    ["missing admin metadata", (f) => { f.actualPreview.models.modelConfig.pop(); }],
+    ["changed admin metadata", (f) => { f.actualPreview.models.modelConfig[0].label = "other"; }],
+    ["reordered admin metadata", (f) => { f.actualPreview.models.modelConfig.reverse(); }],
+    ["extra public metadata", (f) => { f.actual.allowanceBreakdowns.modelConfig.push(structuredClone(f.actual.allowanceBreakdowns.modelConfig[0])); }],
+    ["changed public metadata", (f) => { f.actual.allowanceBreakdowns.modelConfig[0].label = "other"; }],
+    ["reordered public metadata", (f) => { f.actual.allowanceBreakdowns.modelConfig.reverse(); }],
+    ["public key order", (f) => { const { modelConfig, ...rest } = f.actual.allowanceBreakdowns;
+      f.actual.allowanceBreakdowns = { modelConfig, ...rest }; }],
+    ["metadata entry key order", (f) => { const entry = f.actual.allowanceBreakdowns.modelConfig[0];
+      f.actual.allowanceBreakdowns.modelConfig[0] = Object.fromEntries(Object.entries(entry).reverse()); }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const fixture = { ...original, actual: structuredClone(original.actual), actualPreview: structuredClone(original.actualPreview) };
+      mutate(fixture);
+      const report = compareAnalyticsV2Parity(fixture);
+      assert.ok(report.unexpectedDiffs > 0);
+      assert.equal(report.currentContract.accepted, false);
+      if (!name.startsWith("spend ") && !["cost", "coverage", "price method", "price registry", "extra spend key",
+        "missing spend key", "missing daily row", "duplicate daily row", "extra daily row", "daily totals"].includes(name)) {
+        assert.equal(comparePerDate({ expected: fixture.perDateExpected, response: fixture.actual,
+          preview: fixture.actualPreview, currentContract: fixture.currentContract }).equal, false);
+      }
+    });
+  }
+});
 
 function servedDay(day, revision, overrides = {}) {
   const releasedAt = `2026-10-0${revision}T12:00:00.000Z`;
@@ -375,3 +490,214 @@ test("the per-date compare holds the reduced v1.1 block and the declared block",
   assert.equal(comparePerDate({ expected, response: wrongValue, preview: { p: 1 } }).equal, false);
   assert.equal(declaredBreakdownsV13(null).served, false);
 });
+
+// Hash-bound expected-input admission checks share this registered owning suite.
+{
+const FIXTURES = fileURLToPath(new URL("../analytics-v2-test/", import.meta.url));
+const OPTIONS = { goldenDirectory: join(FIXTURES, "golden"),
+  perDateExpectedPath: join(FIXTURES, "golden-q1-node/per-date-expected.json") };
+const PUBLIC_KEYS = ["schemaVersion", "basis", "referencePlanType", "normalization", "modelBasis",
+  "modelGate", "generatedAt", "days", "modelConfig"];
+const PLAN_KEYS = ["pro", "prolite", "promax", "plus"];
+const EMPTY = { centralUsd: null, participantCount: 0, fitCount: 0, band80Usd: null };
+const CURRENT_BASIS = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25";
+const CURRENT_MODEL_BASIS = "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
+let contract, original;
+
+const readJson = async (path) => JSON.parse(await readFile(path, "utf8"));
+const equal = (actual, expected, message) => assert.equal(isDeepStrictEqual(actual, expected), true, message);
+before(async () => {
+  contract = await loadQ1CurrentContract(OPTIONS);
+  original = { golden: await readJson(join(OPTIONS.goldenDirectory, "community-daily-response.json")),
+    goldenPreview: await readJson(join(OPTIONS.goldenDirectory, "preview.json")),
+    perDateExpected: await readJson(OPTIONS.perDateExpectedPath) };
+});
+
+function frozenTree(value) {
+  return value === null || typeof value !== "object"
+    || (Object.isFrozen(value) && Object.values(value).every(frozenTree));
+}
+
+function checkPublic(value) {
+  equal(Object.keys(value), PUBLIC_KEYS, "current public wire order");
+  equal(Object.keys(value.modelConfig[0]), ["id", "label", "family", "order"], "public metadata key order");
+  assert.equal(value.schemaVersion, "community-allowance-breakdowns-v1.5");
+  assert.equal(value.basis, CURRENT_BASIS);
+  assert.equal(value.referencePlanType, "pro");
+  assert.equal(value.normalization, "pro_x1_prolite_x4_promax_x0_8_plus_x20");
+  assert.equal(value.modelBasis, CURRENT_MODEL_BASIS);
+  assert.equal(value.modelGate, "shared_composition_kernel_identification");
+  assert.equal(value.days.length, 69);
+  assert.equal(value.modelConfig.length, 7);
+  for (const day of value.days) {
+    equal(Object.keys(day.byPlanType), PLAN_KEYS, "current public plan order");
+    equal(Object.keys(day.byPlanType.promax), Object.keys(EMPTY), "public empty summary shape");
+    equal(day.byPlanType.promax, EMPTY, "public Pro Max remains empty");
+  }
+}
+
+function checkPreview(value, expectedModelDays) {
+  assert.equal(value.schemaVersion, "admin-community-allowance-preview-v0.5");
+  assert.equal(value.basis, `${CURRENT_BASIS}_preview`);
+  assert.equal(value.referencePlanType, "pro");
+  equal(value.plans, [
+    { planType: "pro", label: "Pro 20x", multiplier: 1 },
+    { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+    { planType: "promax", label: "Pro Max 25x", multiplier: 0.8 },
+    { planType: "plus", label: "Plus", multiplier: 20 },
+  ], "literal current plan labels and ratios");
+  assert.equal(value.days.length, 70);
+  for (const day of value.days) {
+    equal(Object.keys(day.byPlanType), PLAN_KEYS, "current preview plan order");
+    equal(Object.keys(day.byPlanType.promax), ["fitCount", "participantCount", "centralUsd", "band80Usd"],
+      "preview empty summary shape");
+    equal(day.byPlanType.promax, EMPTY, "preview Pro Max remains empty");
+  }
+  assert.equal(value.models.basis, CURRENT_MODEL_BASIS);
+  assert.equal(value.models.gate, "shared_composition_kernel_identification");
+  assert.equal(value.models.modelConfig.length, 43);
+  assert.equal(value.models.days.length, expectedModelDays);
+  for (const day of value.models.days) assert.equal(day.catalogVersion, "reviewed-model-catalog-2026-09-29.1");
+}
+
+test("the explicitly selected Q1 contract has fixed provenance and deeply frozen expected copies", () => {
+  assert.equal(ANALYTICS_V2_Q1_CURRENT_CONTRACT, "q1-pro20-four-plan-v1");
+  assert.equal(contract.id, ANALYTICS_V2_Q1_CURRENT_CONTRACT);
+  assert.equal(contract.sourceCommit, "d43c8f92a059d9c577776f7eca8a331eb305b8a6");
+  assert.equal(contract.corpusSha256, "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e");
+  assert.equal(contract.nowMs, 1790856000000);
+  assert.equal(frozenTree(contract), true);
+  assert.equal(currentQ1ComparisonInputs(contract, original), contract.expected);
+  assert.equal(currentQ1PerDateExpected(contract, original.perDateExpected), contract.expected.perDateExpected);
+  assert.notEqual(contract.expected.golden, original.golden);
+  assert.throws(() => { contract.expected.golden.allowanceBreakdowns.days[0].byPlanType.promax.fitCount = 1; }, TypeError);
+});
+
+test("all added headers, empty summaries, metadata and catalog stamps have the declared current shape", async () => {
+  const expected = currentQ1ComparisonInputs(contract, original);
+  checkPublic(expected.golden.allowanceBreakdowns);
+  checkPublic(expected.perDateExpected.allowanceBreakdowns);
+  checkPreview(expected.goldenPreview, 56);
+  checkPreview(expected.perDateExpected.preview, 70);
+  assert.equal(expected.perDateExpected.days.length, 70);
+  for (const day of expected.perDateExpected.days) assert.equal(day.payload.catalogVersion, "reviewed-model-catalog-2026-09-29.1");
+  const admin = await readJson(join(FIXTURES, "fixtures/allowance-preview-v04.json"));
+  const publicFixture = await readJson(join(FIXTURES, "fixtures/allowance-breakdowns-v14-expected.json"));
+  equal(expected.goldenPreview.models.modelConfig, admin.models.modelConfig, "pinned admin metadata only");
+  equal(expected.golden.allowanceBreakdowns.modelConfig, publicFixture.modelConfig, "pinned public metadata only");
+  equal(expected.goldenPreview.models.modelConfig.slice(0, 42), original.goldenPreview.models.modelConfig,
+    "all historical roster metadata remain exact");
+  for (const day of expected.golden.days) {
+    assert.equal(day.payload.apiEquivalentSpend.pricingMethodVersion, "server-api-price-equivalent-v0.6");
+    assert.equal(day.payload.apiEquivalentSpend.registrySha256,
+      "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d");
+  }
+});
+
+function restoreBreakdowns(value, old) {
+  for (const key of ["schemaVersion", "basis", "normalization", "modelBasis"]) value[key] = old[key];
+  delete value.modelConfig;
+  for (const day of value.days) delete day.byPlanType.promax;
+}
+
+function restorePreview(value, old) {
+  value.schemaVersion = old.schemaVersion;
+  value.basis = old.basis;
+  value.plans = structuredClone(old.plans);
+  value.models.basis = old.models.basis;
+  value.models.modelConfig = structuredClone(old.models.modelConfig);
+  for (const day of value.days) delete day.byPlanType.promax;
+  for (const day of value.models.days) day.catalogVersion = "reviewed-model-catalog-2026-09-23.1";
+}
+
+test("undoing only the declared additions leaves every common numeric and nonnumeric field unchanged", () => {
+  const copy = structuredClone(contract.expected);
+  for (const day of copy.golden.days) {
+    day.payload.apiEquivalentSpend.pricingMethodVersion = "server-api-price-equivalent-v0.5";
+    day.payload.apiEquivalentSpend.registrySha256 = "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9";
+  }
+  restoreBreakdowns(copy.golden.allowanceBreakdowns, original.golden.allowanceBreakdowns);
+  restoreBreakdowns(copy.perDateExpected.allowanceBreakdowns, original.perDateExpected.allowanceBreakdowns);
+  restorePreview(copy.goldenPreview, original.goldenPreview);
+  restorePreview(copy.perDateExpected.preview, original.perDateExpected.preview);
+  for (const day of copy.perDateExpected.days) day.payload.catalogVersion = "reviewed-model-catalog-2026-09-23.1";
+  equal(copy, original, "all common fields, including all eight other spend fields, must remain exact");
+});
+
+test("forged contracts, missing inputs, an actual input and already-current inputs cannot select this lane", () => {
+  for (const forged of [null, {}, { ...contract }, structuredClone(contract)]) {
+    assert.throws(() => currentQ1ComparisonInputs(forged, original), /CONTRACT_INVALID/u);
+    assert.throws(() => currentQ1PerDateExpected(forged, original.perDateExpected), /CONTRACT_INVALID/u);
+  }
+  for (const key of Object.keys(original)) {
+    const incomplete = { ...original }; delete incomplete[key];
+    assert.throws(() => currentQ1ComparisonInputs(contract, incomplete), /COMPARISON_INPUT_INVALID/u);
+  }
+  assert.throws(() => currentQ1ComparisonInputs(contract, { ...original, actual: original.golden }), /COMPARISON_INPUT_INVALID/u);
+  assert.throws(() => currentQ1ComparisonInputs(contract, contract.expected), /COMPARISON_INPUT_INVALID/u);
+  assert.throws(() => currentQ1PerDateExpected(contract, contract.expected.perDateExpected), /PER_DATE_INPUT_INVALID/u);
+});
+
+test("wrong, missing or extra historical fields cannot be erased by the expected-only transform", () => {
+  const changes = [
+    (input) => { input.golden.days[0].payload.apiEquivalentSpend.knownCostUsd += 1; },
+    (input) => { delete input.golden.days[0].payload.apiEquivalentSpend.coverage; },
+    (input) => { input.golden.days[0].payload.apiEquivalentSpend.extra = 0; },
+    (input) => { input.golden.days[0].payload.apiEquivalentSpend.pricingMethodVersion = "server-api-price-equivalent-v0.6"; },
+    (input) => { input.golden.allowanceBreakdowns.days[0].byPlanType.promax = EMPTY; },
+    (input) => { input.goldenPreview.models.modelConfig[0].label = "changed"; },
+    (input) => { input.perDateExpected.preview.models.days[0].catalogVersion = "reviewed-model-catalog-2026-09-29.1"; },
+    (input) => { input.perDateExpected.nowMs += 1; },
+    (input) => { input.perDateExpected.unresolved.push({}); },
+  ];
+  for (const change of changes) {
+    const altered = structuredClone(original); change(altered);
+    assert.throws(() => currentQ1ComparisonInputs(contract, altered), /COMPARISON_INPUT_INVALID/u);
+    if (!isDeepStrictEqual(altered.perDateExpected, original.perDateExpected)) {
+      assert.throws(() => currentQ1PerDateExpected(contract, altered.perDateExpected), /PER_DATE_INPUT_INVALID/u);
+    }
+  }
+});
+
+async function filesUnder(directory, prefix = "") {
+  const paths = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.isDirectory()) paths.push(...await filesUnder(join(directory, entry.name), `${prefix}${entry.name}/`));
+    else paths.push(`${prefix}${entry.name}`);
+  }
+  return paths.sort();
+}
+
+test("every complete Q1 source-data file and per-date provenance is independently hash-bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "q1-current-contract-"));
+  try {
+    const options = { goldenDirectory: join(root, "golden"), perDateExpectedPath: join(root, "per-date/per-date-expected.json") };
+    await cp(OPTIONS.goldenDirectory, options.goldenDirectory, { recursive: true });
+    await cp(dirname(OPTIONS.perDateExpectedPath), dirname(options.perDateExpectedPath), { recursive: true });
+    const files = (await filesUnder(options.goldenDirectory)).map((path) => join(options.goldenDirectory, path));
+    assert.equal(files.length, 12);
+    files.push(options.perDateExpectedPath, join(dirname(options.perDateExpectedPath), "SOURCE.json"));
+    for (const path of files) {
+      const bytes = await readFile(path);
+      await writeFile(path, Buffer.concat([bytes, Buffer.from("\n")]));
+      await assert.rejects(loadQ1CurrentContract(options), /INPUT_HASH_MISMATCH/u);
+      await writeFile(path, bytes);
+    }
+    await rm(join(options.goldenDirectory, "dump/usage-monitor-db.json"));
+    await assert.rejects(loadQ1CurrentContract(options), /INPUT_UNAVAILABLE/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("wrong lanes and incomplete loader options fail instead of falling back to historical parity", async () => {
+  await assert.rejects(loadQ1CurrentContract({}), /ARGUMENT_INVALID/u);
+  await assert.rejects(loadQ1CurrentContract({ goldenDirectory: OPTIONS.goldenDirectory }), /ARGUMENT_INVALID/u);
+  await assert.rejects(loadQ1CurrentContract({ ...OPTIONS, actual: {} }), /ARGUMENT_INVALID/u);
+  await assert.rejects(loadQ1CurrentContract({ ...OPTIONS, goldenDirectory: join(FIXTURES, "golden-dense") }),
+    /INPUT_HASH_MISMATCH|INPUT_UNAVAILABLE/u);
+  await assert.rejects(loadQ1CurrentContract({ ...OPTIONS, perDateExpectedPath: join(FIXTURES, "golden-dense/per-date-expected.json") }),
+    /INPUT_HASH_MISMATCH/u);
+});
+
+}

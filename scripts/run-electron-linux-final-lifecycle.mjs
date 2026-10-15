@@ -10,7 +10,8 @@ import { fingerprintLinuxFinalFile } from './qualify-electron-linux-installed-li
 import { cleanupLinuxMountDiagnosis, runLinuxNativeAppArmorComparison } from './diagnose-electron-linux-appimage-mount.mjs';
 import { validateLinuxStartupDiagnostic } from './lib/linux-startup-diagnostics.mjs';
 import { LINUX_FINAL_INPUT, exactKeys, preflightLinuxFinalIntake, validateLinuxFinalPair,
-  linuxFinalFailure as fail, resolveLinuxFinalRelease, sha256 } from './lib/linux-final-artifact-intake.mjs';
+  linuxFinalFailure as fail, resolveLinuxFinalRelease, sha256, validLinuxFinalSignedFeedDescriptor,
+  validateLinuxFinalPackagedAuthority, assertLinuxFinalPreparedIntakeMatches } from './lib/linux-final-artifact-intake.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const INPUT = join(ROOT, LINUX_FINAL_INPUT), RECEIPTS = join(INPUT, 'receipts');
@@ -21,8 +22,8 @@ const validRun = value => /^[1-9][0-9]{0,14}$/u.test(value ?? '');
 const validRevision = value => /^[a-f0-9]{40}$/u.test(value ?? '');
 const labels = { run: 'io.tibotattle.final-lifecycle.run', runner: 'io.tibotattle.final-lifecycle.runner' };
 const lifecycleFlags = ['cleanInstallSmokePassed', 'localRefreshAndCredentialAccess', 'chromiumRendererSandboxVerified',
-  'cleanUninstallPreservedLocalState', 'mismatchedFeedChecksumRefusedWithoutReplacement',
-  'replacementAndAutomaticRestartVerified', 'coldRestartSettingsAndOptOutVerified',
+  'cleanUninstallPreservedLocalState', 'corruptUpdateArtifactRefusedWithoutReplacement',
+  'replacementAndAutomaticRestartVerified', 'coldRestartSettingsAndOptOutVerified', 'controlledColdRestartAuthorizedHealth',
   'credentialAndSourceStatePreserved', 'noUpdateVerified', 'ownedUninstallAndAppCleanupVerified', 'artifactIntegrityVerified'];
 const lifecycleStages = new Set(['loopback_tls', 'fresh_final_install', 'public_predecessor_install', 'checksum_refusal',
   'settings_download', 'settings_install', 'automatic_restart', 'cold_restart_no_update', 'owned_uninstall']);
@@ -61,7 +62,12 @@ export function linuxFinalHostCleanupArguments({ id, inspected }, owner) {
 /** Admit only the runtime schema bound to this release, preserving original bytes.
  * Host/comparison closure is separate; it cannot fill missing runtime flags. */
 export function validateLinuxFinalLifecycleReceipt(value, pair) {
-  let release; try { release = resolveLinuxFinalRelease(pair?.intake); } catch { return null; }
+  let release;
+  try {
+    release = resolveLinuxFinalRelease(pair?.intake);
+    if (!validLinuxFinalSignedFeedDescriptor(pair.intake.signedFeed)) return null;
+    validateLinuxFinalPackagedAuthority(pair.packagedAuthority);
+  } catch { return null; }
   const required = { schemaVersion: release.lifecycleSchema,
     sourceRevision: pair.intake.sourceRevision, workflowRunnerRevision: pair.intake.runnerRevision,
     sourceCandidateSha256: pair.intake.sourceCandidateSha256, packageReceiptSha256: pair.intake.packageReceiptSha256,
@@ -69,15 +75,18 @@ export function validateLinuxFinalLifecycleReceipt(value, pair) {
     target: 'linux-x64', images: { current: pair.images.current.sha256, next: pair.images.next.sha256 },
     runtime: 'native_x64_Xvfb_FUSE_ordinary_AppImage_launcher', physicalDesktop: 'not_qualified',
     network: 'loopback_only_network_none', feed: 'fixed_production_URL_simulated_locally',
+    signedFeed: pair.intake.signedFeed, packagedAuthority: pair.packagedAuthority,
     credentialScope: 'disposable_Secret_Service', rebuilt: false, published: false };
   const optional = [...lifecycleFlags, 'publicPredecessorUpdate', 'updateInitiation', 'feedRequests', 'imageRequests',
-    'status', 'stage', 'errorCode', 'startupDiagnostic'];
+    'automaticSuccessorStartup', 'automaticSuccessorApiHealth', 'status', 'stage', 'errorCode', 'startupDiagnostic'];
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).some(key => !Object.hasOwn(required, key) && !optional.includes(key))
     || !Object.entries(required).every(([key, expected]) => isDeepStrictEqual(value[key], expected))
     || !['passed', 'failed'].includes(value.status)
     || lifecycleFlags.some(key => Object.hasOwn(value, key) && typeof value[key] !== 'boolean')) return null;
   if (Object.hasOwn(value, 'publicPredecessorUpdate') && value.publicPredecessorUpdate !== release.publicPredecessorUpdate) return null;
+  if (Object.hasOwn(value, 'automaticSuccessorStartup') && value.automaticSuccessorStartup !== 'verified_profile_generation'
+    || Object.hasOwn(value, 'automaticSuccessorApiHealth') && value.automaticSuccessorApiHealth !== 'not_observed') return null;
   if (Object.hasOwn(value, 'updateInitiation') && (!exactKeys(value.updateInitiation, ['check', 'download'])
     || !Object.values(value.updateInitiation).every(item => ['automatic', 'settings_button'].includes(item)))) return null;
   if (['feedRequests', 'imageRequests'].some(key => Object.hasOwn(value, key)
@@ -85,6 +94,8 @@ export function validateLinuxFinalLifecycleReceipt(value, pair) {
   if (Object.hasOwn(value, 'startupDiagnostic') && validateLinuxStartupDiagnostic(value.startupDiagnostic) === null) return null;
   if (value.status === 'passed') {
     if (!lifecycleFlags.every(key => value[key] === true) || !value.updateInitiation
+      || value.automaticSuccessorStartup !== 'verified_profile_generation'
+      || value.automaticSuccessorApiHealth !== 'not_observed'
       || value.publicPredecessorUpdate !== release.publicPredecessorUpdate
       || !(value.feedRequests >= 1) || !(value.imageRequests >= 2)
       || ['stage', 'errorCode', 'startupDiagnostic'].some(key => Object.hasOwn(value, key))) return null;
@@ -223,7 +234,7 @@ async function execute() {
   if (process.env.SELECTED_MODE !== 'execute' || !validRun(process.env.GITHUB_RUN_ID)) fail('CONFIRMATION_INVALID');
   const pairFile = await fingerprintLinuxFinalFile(join(INPUT, 'pair.json'), 131072, true);
   const pair = validateLinuxFinalPair(JSON.parse(pairFile.contents), intake.runnerRevision);
-  if (!isDeepStrictEqual(pair.intake, intake)) fail('INPUT_CHANGED');
+  assertLinuxFinalPreparedIntakeMatches(pair, intake);
   await mkdir(RECEIPTS, { mode: 0o700 });
   let interrupted = false;
   const cancel = () => { interrupted = true; };

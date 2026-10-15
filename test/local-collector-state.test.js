@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import fsSync from "node:fs";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -73,6 +76,247 @@ async function fixture() {
     stateFile: defaultLocalCollectorStatePath(root),
   };
 }
+
+test("new collector state is owner-only before SQLite writes and immediately usable by a queued reader", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const value = await fixture();
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalChmod = fsPromises.chmod;
+  const originalUmask = process.umask(0o022);
+  let firstSqliteOpen = false;
+  let chmodBoundary = false;
+  let concurrentRead;
+  t.mock.method(DatabaseSync.prototype, "exec", function (sql) {
+    if (!firstSqliteOpen) {
+      firstSqliteOpen = true;
+      const before = fsSync.lstatSync(value.stateFile);
+      assert.equal(before.mode & 0o777, 0o600, "first visible SQLite target is private under umask 022");
+      assert.equal(before.size, 0, "privacy exists before the first SQLite content write");
+      concurrentRead = readLocalCollectorState({ stateFile: value.stateFile });
+    }
+    return originalExec.call(this, sql);
+  });
+  t.mock.method(fsPromises, "chmod", async (path, mode) => {
+    if (path === value.stateFile && !chmodBoundary) {
+      chmodBoundary = true;
+      assert.equal((await stat(path)).mode & 0o777, 0o600,
+        "post-creation chmod is never the privacy boundary");
+      assert.equal((await readLocalCollectorState({ stateFile: path })).status, "available");
+    }
+    return originalChmod(path, mode);
+  });
+  syncBuiltinESMExports();
+  try {
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint(), records: [record("private-first-byte")] });
+    assert.equal(firstSqliteOpen, true);
+    assert.equal(chmodBoundary, true);
+    assert.equal((await concurrentRead).status, "available");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    process.umask(originalUmask);
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("collector creation reuses a validated winning database after an exclusive-create race", async (t) => {
+  const value = await fixture();
+  const winner = await fixture();
+  const originalOpen = fsSync.openSync;
+  const expected = checkpoint();
+  let raced = false;
+  try {
+    await commitLocalCollectorState({ stateFile: winner.stateFile, checkpoint: expected, records: [record("winning-creator")] });
+    t.mock.method(fsSync, "openSync", (path, flags, mode) => {
+      if (path === value.stateFile && (flags & fsSync.constants.O_EXCL) !== 0 && !raced) {
+        raced = true;
+        fsSync.copyFileSync(winner.stateFile, value.stateFile, fsSync.constants.COPYFILE_EXCL);
+      }
+      return originalOpen(path, flags, mode);
+    });
+    syncBuiltinESMExports();
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: expected,
+      records: [record("race-reuse")] });
+    assert.equal(raced, true);
+    assert.deepEqual((await readLocalCollectorState({ stateFile: value.stateFile })).records,
+      [record("winning-creator"), record("race-reuse")], "winning state is retained");
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: expected, records: [record("later-reuse")] });
+    assert.deepEqual((await readLocalCollectorState({ stateFile: value.stateFile })).records,
+      [record("winning-creator"), record("race-reuse"), record("later-reuse")]);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(value.root, { recursive: true, force: true });
+    await rm(winner.root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent first collector writers both reuse the same initialized state", { timeout: 10_000 }, async (t) => {
+  const value = await fixture();
+  const originalLstat = fsPromises.lstat;
+  let missingObservations = 0;
+  let release;
+  const bothMissing = new Promise((resolve) => { release = resolve; });
+  t.mock.method(fsPromises, "lstat", async (path, options) => {
+    try { return await originalLstat(path, options); }
+    catch (error) {
+      if (path === value.stateFile && error.code === "ENOENT") {
+        missingObservations += 1;
+        if (missingObservations === 2) release();
+        await bothMissing;
+      }
+      throw error;
+    }
+  });
+  syncBuiltinESMExports();
+  try {
+    const receipts = await Promise.all([
+      recordLocalCollectorLegacyRefreshAttempt({ stateFile: value.stateFile }),
+      recordLocalCollectorLegacyRefreshAttempt({ stateFile: value.stateFile }),
+    ]);
+    assert.equal(missingObservations, 2);
+    assert.deepEqual(receipts.map((receipt) => receipt.attempts).sort(), [1, 2]);
+    assert.equal((await readLocalCollectorLegacyRefreshUse({ stateFile: value.stateFile })).receipt.attempts, 2);
+  } finally {
+    release();
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("the first real collector transaction keeps its DELETE rollback journal owner-only", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const value = await fixture();
+  const originalExec = DatabaseSync.prototype.exec;
+  const originalUmask = process.umask(0o022);
+  let observed = false;
+  t.mock.method(DatabaseSync.prototype, "exec", function (sql) {
+    if (sql === "COMMIT" && !observed) {
+      observed = true;
+      assert.equal(this.prepare("PRAGMA journal_mode").get().journal_mode, "delete");
+      for (const path of [value.stateFile, `${value.stateFile}-journal`]) {
+        const metadata = fsSync.lstatSync(path);
+        assert.equal(metadata.isFile(), true);
+        assert.equal(metadata.isSymbolicLink(), false);
+        assert.equal(metadata.nlink, 1);
+        assert.equal(metadata.mode & 0o777, 0o600);
+      }
+      assert.equal(fsSync.existsSync(`${value.stateFile}-wal`), false);
+      assert.equal(fsSync.existsSync(`${value.stateFile}-shm`), false);
+    }
+    return originalExec.call(this, sql);
+  });
+  try {
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint(), records: [record("private-journal")] });
+    assert.equal(observed, true);
+    assert.equal(fsSync.existsSync(`${value.stateFile}-journal`), false);
+  } finally {
+    t.mock.restoreAll();
+    process.umask(originalUmask);
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("collector creation never initializes or removes an empty competing reservation", async (t) => {
+  const value = await fixture();
+  const originalOpen = fsSync.openSync;
+  let raced = false;
+  t.mock.method(fsSync, "openSync", (path, flags, mode) => {
+    if (path === value.stateFile && (flags & fsSync.constants.O_EXCL) !== 0 && !raced) {
+      raced = true;
+      const winner = originalOpen(path, flags, mode);
+      fsSync.closeSync(winner);
+    }
+    return originalOpen(path, flags, mode);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() }),
+      { code: "local_collector_state_unavailable" });
+    assert.equal(raced, true);
+    assert.equal((await stat(value.stateFile)).size, 0);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("collector reservation identity checks preserve a substituted target before SQLite opens it", async (t) => {
+  const value = await fixture();
+  const originalStat = fsSync.lstatSync;
+  let replaced = false;
+  t.mock.method(fsSync, "lstatSync", (path, options) => {
+    if (path === value.stateFile && !replaced) {
+      replaced = true;
+      fsSync.renameSync(path, `${path}.reserved`);
+      fsSync.writeFileSync(path, "synthetic replacement", { mode: 0o600, flag: "wx" });
+    }
+    return originalStat(path, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() }),
+      { code: "local_collector_state_unavailable" });
+    assert.equal(replaced, true);
+    assert.equal(await readFile(value.stateFile, "utf8"), "synthetic replacement");
+    assert.equal((await stat(`${value.stateFile}.reserved`)).size, 0);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("failed collector initialization removes only its own untouched reservation", async (t) => {
+  const value = await fixture();
+  const originalExec = DatabaseSync.prototype.exec;
+  let fail = true;
+  t.mock.method(DatabaseSync.prototype, "exec", function (sql) {
+    if (fail) { fail = false; throw new Error("synthetic initial open failure"); }
+    return originalExec.call(this, sql);
+  });
+  try {
+    await assert.rejects(commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() }),
+      { code: "local_collector_state_unavailable" });
+    await assert.rejects(stat(value.stateFile), { code: "ENOENT" });
+    t.mock.restoreAll();
+    await commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() });
+    assert.equal((await readLocalCollectorState({ stateFile: value.stateFile })).status, "available");
+  } finally {
+    t.mock.restoreAll();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("failed collector initialization preserves nonempty partial state for diagnosis", async (t) => {
+  const value = await fixture();
+  const originalExec = DatabaseSync.prototype.exec;
+  t.mock.method(DatabaseSync.prototype, "exec", function (sql) {
+    const result = originalExec.call(this, sql);
+    if (sql.includes("CREATE TABLE IF NOT EXISTS meta")) throw new Error("synthetic schema completion failure");
+    return result;
+  });
+  try {
+    await assert.rejects(commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() }),
+      { code: "local_collector_state_unavailable" });
+    const before = await readFile(value.stateFile);
+    assert.ok(before.byteLength > 0);
+    if (process.platform !== "win32") assert.equal((await stat(value.stateFile)).mode & 0o777, 0o600);
+    t.mock.restoreAll();
+    await assert.rejects(commitLocalCollectorState({ stateFile: value.stateFile, checkpoint: checkpoint() }),
+      { code: "local_collector_state_schema_invalid" });
+    assert.deepEqual(await readFile(value.stateFile), before);
+  } finally {
+    t.mock.restoreAll();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
 
 test("accounting caches use compact JSON while old caches and canonical collector bytes remain compatible", async () => {
   const value = await fixture();

@@ -11,6 +11,7 @@ export const R7_FILESYSTEM_SAMPLE_INTERVAL_MS = 100;
 
 export const R7_FILESYSTEM_HIGH_WATER_OUTCOMES = Object.freeze([
   "completed",
+  "aborted",
   "root_unsafe",
   "root_replaced",
   "symlink_rejected",
@@ -427,6 +428,8 @@ export async function measureR7FilesystemRoot(binding, {
  * The operation's return value and any thrown error are discarded. Sampling
  * uses a fixed 100 ms interval and a bigint monotonic deadline; the deadline is
  * classification-only because this module does not own or kill worker state.
+ * An optional signal stops new measurements and drains any in-flight sample;
+ * callers must still await their operation's own termination confirmation.
  */
 export async function runR7FilesystemHighWaterSampler({
   root,
@@ -435,6 +438,7 @@ export async function runR7FilesystemHighWaterSampler({
   maximumDirectoryEntries = DEFAULT_EXPORT_RESOURCE_LIMITS.maximumDirectoryEntries,
   allowedTransientSymlinkNames = [],
   allowTransientOwnedHardlinks = false,
+  signal,
 }, overrides = {}) {
   if (typeof operation !== "function") throw new TypeError("R7 filesystem operation must be a function");
   if (!Number.isSafeInteger(maximumElapsedMs) || maximumElapsedMs < 1
@@ -446,8 +450,12 @@ export async function runR7FilesystemHighWaterSampler({
   if (typeof allowTransientOwnedHardlinks !== "boolean") {
     throw new TypeError("R7 transient hardlink option must be boolean");
   }
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new TypeError("signal must be an AbortSignal when provided");
+  }
   const deps = dependencies(overrides);
   const startedAtNs = monotonic(deps);
+  if (signal?.aborted) return fixedResult({ outcome: "aborted" });
   const deadlineNs = startedAtNs + (BigInt(maximumElapsedMs) * NANOSECONDS_PER_MILLISECOND);
   let binding;
   let before;
@@ -465,6 +473,14 @@ export async function runR7FilesystemHighWaterSampler({
     });
   }
   const afterBeforeNs = monotonic(deps);
+  if (signal?.aborted) {
+    return fixedResult({
+      outcome: "aborted",
+      measurements: { before, highWater: before, after: null },
+      sampleCount: 1,
+      elapsedMs: elapsedMilliseconds(startedAtNs, afterBeforeNs),
+    });
+  }
   if (afterBeforeNs >= deadlineNs) {
     return fixedResult({
       outcome: "deadline_exceeded",
@@ -501,6 +517,18 @@ export async function runR7FilesystemHighWaterSampler({
   };
 
   let intervalHandle;
+  const stopSampling = () => {
+    stopped = true;
+    if (intervalHandle !== undefined) {
+      try {
+        deps.cancelInterval(intervalHandle);
+      } catch {
+        samplingFailure ??= "sampling_failed";
+      }
+      intervalHandle = undefined;
+    }
+  };
+  signal?.addEventListener("abort", stopSampling, { once: true });
   try {
     intervalHandle = deps.scheduleInterval(() => {
       if (sampleInFlight !== null) return sampleInFlight;
@@ -519,35 +547,34 @@ export async function runR7FilesystemHighWaterSampler({
 
   let operationFailed = false;
   try {
-    await operation();
+    if (!signal?.aborted) await operation();
   } catch {
     operationFailed = true;
   }
-  stopped = true;
-  if (intervalHandle !== undefined) {
-    try {
-      deps.cancelInterval(intervalHandle);
-    } catch {
-      samplingFailure ??= "sampling_failed";
-    }
-  }
+  stopSampling();
   if (sampleInFlight !== null) await sampleInFlight;
 
   try {
-    after = await measureR7FilesystemRoot(binding, {
-      maximumDirectoryEntries,
-      allowedTransientSymlinkNames,
-      allowTransientOwnedHardlinks,
-    }, deps);
-    highWater = preferredHighWater(highWater, after);
-    sampleCount += 1;
+    if (!signal?.aborted) {
+      after = await measureR7FilesystemRoot(binding, {
+        maximumDirectoryEntries,
+        allowedTransientSymlinkNames,
+        allowTransientOwnedHardlinks,
+      }, deps);
+      highWater = preferredHighWater(highWater, after);
+      sampleCount += 1;
+    }
   } catch (error) {
     samplingFailure ??= classify(error);
+  } finally {
+    signal?.removeEventListener("abort", stopSampling);
   }
 
   const finishedAtNs = monotonic(deps);
   if (finishedAtNs >= deadlineNs) deadlineExceeded = true;
-  const outcome = samplingFailure
+  if (signal?.aborted) after = null;
+  const outcome = (signal?.aborted ? "aborted" : null)
+    ?? samplingFailure
     ?? (deadlineExceeded ? "deadline_exceeded" : null)
     ?? (operationFailed ? "operation_failed" : "completed");
   return fixedResult({

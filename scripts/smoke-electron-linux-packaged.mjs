@@ -21,6 +21,8 @@ import {
   validateDesktopFirstRunReceipt,
 } from "../apps/electron/desktop-first-run.js";
 import { validateProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { createLinuxUpdateVerifier } from "../apps/electron/linux-update-authenticity.js";
+import distribution from "../config/electron-production-distribution.cjs";
 import {
   ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
@@ -387,13 +389,23 @@ export function parseLinuxNormalPackagedSmokeArguments(argv) {
   return Object.freeze(result);
 }
 
-function validateSourceCandidate(value, sourceRevision) {
+function validateSourceCandidate(value, sourceRevision, linuxUpdateKeys) {
+  if (!Array.isArray(linuxUpdateKeys)) fail("SOURCE_CANDIDATE_INVALID");
+  const updaterEnabled = linuxUpdateKeys.length > 0;
+  if (updaterEnabled) {
+    try {
+      // Match the reviewed production plan's rooted-Linux availability, while
+      // refusing malformed policy through the actual runtime key validator.
+      createLinuxUpdateVerifier({ keys: linuxUpdateKeys, currentVersion: "0.0.0",
+        backend: { load: async () => null, save: async () => {} } });
+    } catch { fail("SOURCE_CANDIDATE_INVALID"); }
+  }
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "production_source_staged" || value.target !== TARGET
       || value.sourceRevision !== sourceRevision
       || value.stagingDirectory !== ".release-build/electron-production/linux-x64/app"
       || value.builderConfiguration !== "apps/electron/electron-builder.production.config.cjs"
-      || value.updaterEnabled !== true || value.signingRequired !== false
+      || value.updaterEnabled !== updaterEnabled || value.signingRequired !== false
       || value.signingPerformed !== false || value.publishingPerformed !== false) {
     fail("SOURCE_CANDIDATE_INVALID");
   }
@@ -420,9 +432,13 @@ export function validateLinuxNormalPackagedSmokeMetadata({
   stagedManifest,
   archiveManifest,
   sourceRevision,
+} = {}, {
+  // Synthetic-test seam only. Production callers use embedded source authority;
+  // no CLI, environment or candidate field can supply replacement roots.
+  linuxUpdateKeys = distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS,
 } = {}) {
   if (!SHA.test(sourceRevision ?? "")) fail("ARGUMENT_INVALID");
-  const candidate = validateSourceCandidate(sourceCandidate, sourceRevision);
+  const candidate = validateSourceCandidate(sourceCandidate, sourceRevision, linuxUpdateKeys);
   const staged = stableMetadata(stagedManifest?.tibotattleDistribution, sourceRevision);
   const archived = stableMetadata(archiveManifest?.tibotattleDistribution, sourceRevision);
   if (JSON.stringify(staged) !== JSON.stringify(archived)

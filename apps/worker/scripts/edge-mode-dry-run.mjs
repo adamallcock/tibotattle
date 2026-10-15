@@ -158,14 +158,16 @@ const EDGE_RATE_LIMIT_BINDINGS = Object.freeze([
   "CLIENT_ATTEMPT_RATE_LIMIT", "ENROLLMENT_RATE_LIMIT", "PUBLIC_READ_RATE_LIMIT", "RECOVERY_RATE_LIMIT",
   "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
 ]);
+const OPERATIONAL_RATE_LIMIT_BINDINGS = Object.freeze([
+  "PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+]);
 /**
- * d43c8f92's index.ts exports default, handleRequest, runScheduledMaintenance
- * and the UploadIngressBudget Durable Object class; the edge port adds the
- * export keyword to contributionRequestPreflight. workerd refuses a main
- * module whose named exports are not functions or handlers.
+ * The edge entry preserves index.ts's handler exports and the Cloudflare
+ * UploadIngressBudget Durable Object class. workerd refuses a main module
+ * whose named exports are not functions or handlers.
  */
 export const MAIN_MODULE_EXPORTS = Object.freeze(["UploadIngressBudget", "contributionRequestPreflight", "default",
-  "handleRequest", "runScheduledMaintenance"]);
+  "handleRequest", "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"]);
 
 /** The properties each candidate must have; returns the violations. */
 export function dryRunViolations(results) {
@@ -178,6 +180,9 @@ export function dryRunViolations(results) {
     }
     if (EDGE_RATE_LIMIT_BINDINGS.some((name) => !result.ratelimits.includes(name))) {
       violations.push(`${result.mode}: an edge rate-limit binding is missing`);
+    }
+    if (OPERATIONAL_RATE_LIMIT_BINDINGS.some((name) => !result.ratelimits.includes(name))) {
+      violations.push(`${result.mode}: an operational rate-limit binding is missing`);
     }
     if (!result.durableObjects.includes("UPLOAD_INGRESS_BUDGET")) {
       violations.push(`${result.mode}: the Durable Object binding is missing`);

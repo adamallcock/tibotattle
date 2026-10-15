@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -104,18 +104,13 @@ async function releaseConfigEnvironment(overrides = {}) {
   const source = await fsPromises.readFile(RELEASE_CONFIG_PATH, "utf8");
   return {
     TIBOTATTLE_ELECTRON_TARGET: "win32-x64",
-    TIBOTATTLE_ELECTRON_SIGNING_MODE: "azure-trusted-signing",
+    TIBOTATTLE_ELECTRON_SIGNING_MODE: "staged-transfer",
+    TIBOTATTLE_WINDOWS_SIGNING_TRANSFER_STAGE: "application",
     TIBOTATTLE_ELECTRON_VERSION: PACKAGE_VERSION,
     TIBOTATTLE_ELECTRON_SOURCE_REVISION: RELEASE_SOURCE_REVISION,
     TIBOTATTLE_ELECTRON_BUILD_NUMBER: RELEASE_BUILD_NUMBER,
     TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME:
       readReleaseConfigConstant(source, "AZURE_EXPECTED_PUBLISHER"),
-    TIBOTATTLE_ELECTRON_AZURE_ENDPOINT:
-      readReleaseConfigConstant(source, "AZURE_EXPECTED_ENDPOINT"),
-    TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME:
-      readReleaseConfigConstant(source, "AZURE_EXPECTED_ACCOUNT"),
-    TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME:
-      readReleaseConfigConstant(source, "AZURE_EXPECTED_PROFILE"),
     ...overrides,
   };
 }
@@ -191,6 +186,8 @@ function loadReleaseConfig(environment) {
     "  icon: config.win.icon,",
     "  ledgerLeaf: config.win.windowsSigningOperationLedgerLeaf,",
     "  ledgerRoot: config.win.windowsSigningOperationEvidenceRoot,",
+    "  signingTransferHook: config.win.windowsSigningTransferHook,",
+    "  signingTransferStage: config.win.windowsSigningTransferStage,",
     "  azureSignOptions: config.win.azureSignOptions,",
     "}));",
   ].join("\n");
@@ -268,31 +265,52 @@ test("Windows release config requires the patched signing runtime contract", asy
     assert.ok(config.files[0].filter.includes(await staticallyImportedMacOSCredentialContract()));
     assert.equal(config.files[0].filter.includes("native/macos-keychain.node"), false);
     assert.deepEqual(config.signExts, [".dll", "!.node"]);
-    assert.equal(config.ledgerLeaf, "windows-signing-operation-ledger.json");
-    assert.equal(basename(config.ledgerRoot), "evidence");
-    assert.equal(config.azureSignOptions.ExcludeAzureCliCredential, undefined);
-    for (const name of [
-      "ExcludeEnvironmentCredential",
-      "ExcludeWorkloadIdentityCredential",
-      "ExcludeManagedIdentityCredential",
-      "ExcludeSharedTokenCacheCredential",
-      "ExcludeVisualStudioCredential",
-      "ExcludeVisualStudioCodeCredential",
-      "ExcludeAzurePowerShellCredential",
-      "ExcludeAzureDeveloperCliCredential",
-      "ExcludeInteractiveBrowserCredential",
+    assert.equal(config.ledgerLeaf, undefined);
+    assert.equal(config.ledgerRoot, undefined);
+    assert.equal(config.signingTransferHook, resolve("scripts/lib/windows-signing-transfer.cjs"));
+    assert.equal(config.signingTransferStage, "application");
+    assert.deepEqual(config.azureSignOptions, { publisherName: "Adam Allcock" });
+    for (const [name, value] of [
+      ["CSC_IDENTITY_AUTO_DISCOVERY", "false"],
+      ["ACTIONS_ID_TOKEN_REQUEST_URL", "https://example.invalid"],
+      ["ACTIONS_ID_TOKEN_REQUEST_TOKEN", "synthetic-token"],
+      ["ACTIONS_RUNTIME_TOKEN", ""],
+      ["AZURE_CONFIG_DIR", "synthetic-cache"],
+      ["AZURE_FUTURE_CREDENTIAL", "synthetic-token"],
+      ["ARM_CLIENT_ID", "synthetic-id"],
+      ["GITHUB_TOKEN", "synthetic-token"],
+      ["GH_TOKEN", "synthetic-token"],
+      ["GH_ENTERPRISE_TOKEN", "synthetic-token"],
+      ["GITHUB_ENTERPRISE_TOKEN", "synthetic-token"],
     ]) {
-      assert.equal(config.azureSignOptions[name], true, name);
+      const forbidden = loadReleaseConfig({ ...environment, [name]: value });
+      assert.notEqual(forbidden.status, 0, name);
+      assert.match(forbidden.stderr, /windows_release_builder_config_invalid/u);
+      assert.doesNotMatch(forbidden.stderr, /synthetic-token|synthetic-cache|synthetic-id/u);
     }
-    const validated = validateReleaseConfig(environment);
-    assert.equal(validated.status, 0, validated.stderr);
-    assert.equal(validated.stdout, "WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\n");
 
-    const forbidden = loadReleaseConfig({
+    for (const signingTransferStage of [undefined, "", "installer", "application "]) {
+      const invalidStageEnvironment = { ...environment };
+      if (signingTransferStage === undefined) delete invalidStageEnvironment.TIBOTATTLE_WINDOWS_SIGNING_TRANSFER_STAGE;
+      else invalidStageEnvironment.TIBOTATTLE_WINDOWS_SIGNING_TRANSFER_STAGE = signingTransferStage;
+      assert.notEqual(loadReleaseConfig(invalidStageEnvironment).status, 0);
+    }
+    const uninstaller = loadReleaseConfig({
       ...environment,
-      CSC_IDENTITY_AUTO_DISCOVERY: "false",
+      TIBOTATTLE_WINDOWS_SIGNING_TRANSFER_STAGE: "uninstaller",
     });
-    assert.notEqual(forbidden.status, 0);
+    assert.equal(uninstaller.status, 0, uninstaller.stderr);
+    assert.equal(JSON.parse(uninstaller.stdout).signingTransferStage, "uninstaller");
+    for (const value of ["azure-trusted-signing", "", "staged-transfer "]) {
+      assert.notEqual(loadReleaseConfig({
+        ...environment,
+        TIBOTATTLE_ELECTRON_SIGNING_MODE: value,
+      }).status, 0);
+    }
+    assert.notEqual(loadReleaseConfig({
+      ...environment,
+      TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: "Unreviewed publisher",
+    }).status, 0);
 
     const mismatchedReceiptDigest = loadReleaseConfig({
       ...environment,
@@ -305,10 +323,14 @@ test("Windows release config requires the patched signing runtime contract", asy
       TIBOTATTLE_ELECTRON_TARGET: "win32",
     });
     assert.notEqual(wrongTarget.status, 0);
+
+    const validated = validateReleaseConfig(environment);
+    assert.equal(validated.status, 0, validated.stderr);
+    assert.equal(validated.stdout, "WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\n");
   });
 });
 
-test("patched Azure signer serializes credential exclusions as switches and pins the module", async () => {
+test("patched Azure manager rejects signing without a transfer hook before executing tools", async () => {
   const invocations = [];
   const vm = {
     powershellCommand: { value: Promise.resolve("powershell.exe") },
@@ -322,33 +344,15 @@ test("patched Azure signer serializes credential exclusions as switches and pins
     vm: { value: Promise.resolve(vm) },
   });
 
-  await manager.initialize();
-  assert.equal(invocations.length, 2);
-  assert.equal(
-    invocations[1].arguments_.at(-1),
-    "Install-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser",
+  await assert.rejects(manager.initialize(), /requires an unprivileged transfer hook/u);
+  assert.equal(invocations.length, 0);
+  const source = await fsPromises.readFile(
+    appBuilderRequire.resolve("./out/codeSign/windowsSignAzureManager"),
+    "utf8",
   );
-
-  await manager.signFile({
-    path: "C:\\candidate.exe",
-    options: {
-      azureSignOptions: {
-        publisherName: "TiboTattle",
-        endpoint: "https://example.codesigning.azure.net/",
-        certificateProfileName: "profile",
-        codeSigningAccountName: "account",
-        fileDigest: "SHA256",
-        timestampRfc3161: "http://timestamp.example.invalid",
-        timestampDigest: "SHA256",
-        ExcludeEnvironmentCredential: true,
-        ExcludeAzureCliCredential: false,
-      },
-    },
-  });
-  const command = invocations.at(-1).arguments_.at(-1);
-  assert.match(command, /(?:^|\s)-ExcludeEnvironmentCredential(?:\s|$)/u);
-  assert.doesNotMatch(command, /ExcludeEnvironmentCredential\s+'true'/u);
-  assert.doesNotMatch(command, /ExcludeAzureCliCredential/u);
+  assert.doesNotMatch(source, /Install-Module|Invoke-TrustedSigning|Install-PackageProvider/u);
+  assert.match(source, /windowsSigningTransferHook/u);
+  assert.match(source, /recordSubject/u);
 });
 
 test("patched Windows runtime rejects builder .node signing and emits one content-free ledger", async () => {

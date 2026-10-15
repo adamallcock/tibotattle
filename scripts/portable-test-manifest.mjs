@@ -38,6 +38,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/account-observation-secret.test.js",
     "test/account-scope.test.js",
     "test/codex-account-provider.test.js",
+    "test/cli-provider-error-privacy.test.js",
     "test/codex-config-service-tier-privacy.test.js",
     "test/codex-fingerprint-sidecar-privacy.test.js",
     "test/codex-interleaved-usage-streams.test.js",
@@ -58,6 +59,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "test/telemetry-schema-mirror.test.js",
   ]),
   storageAndCompanion: Object.freeze([
+    "apps/electron/test/desktop-local-authorization.test.mjs",
     "test/contribution-device-cli.test.js",
     "test/contribution-device-sync.test.js",
     "test/contribution-sync-queue.test.js",
@@ -111,6 +113,7 @@ export const PORTABLE_TEST_GROUPS = Object.freeze({
     "apps/web/test/community-site.test.mjs",
     "apps/web/test/i18n-browser-parity.test.mjs",
     "apps/web/test/lib.test.mjs",
+    "apps/web/test/local-request.test.mjs",
     "apps/web/test/localization-copy.test.mjs",
     "apps/web/test/navigation.test.mjs",
     "apps/web/test/plan-type-data-client.test.mjs",

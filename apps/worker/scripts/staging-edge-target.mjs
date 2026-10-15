@@ -54,6 +54,15 @@ export const STAGING_EDGE_REFUSED_WORKER_NAMES = Object.freeze([
 /** The genesis snapshot's version id: no live version exists before the first deploy. */
 export const STAGING_EDGE_GENESIS_VERSION_ID = "00000000-0000-4000-8000-000000000000";
 const GENESIS_NAMESPACE_ID = "staging-edge-genesis-namespace";
+const STAGING_RATE_LIMIT_BINDINGS = Object.freeze([
+  "ENROLLMENT_RATE_LIMIT", "RECOVERY_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT", "PUBLIC_READ_RATE_LIMIT",
+  "UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+  "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+  "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+]);
+const OPERATIONAL_RATE_LIMITS = Object.freeze({
+  PUBLIC_PROBE_RATE_LIMIT: 60, PUBLIC_PROBE_CLIENT_RATE_LIMIT: 12, SPARKLE_APPCAST_GUARD_RATE_LIMIT: 60,
+});
 
 /** The two migration ledgers a staging D1 can carry: Wrangler's and the d1-storage runner's. */
 export const STAGING_EDGE_WRANGLER_LEDGER = "d1_migrations";
@@ -483,11 +492,14 @@ export async function readStagingEdgeTrackedConfigs(workerDirectory = STAGING_ED
 
 function templateProfile(template, name) {
   const profile = template?.rateLimitProfiles?.[name];
-  if (!Array.isArray(profile) || profile.length !== 8
+  if (!Array.isArray(profile) || profile.length !== STAGING_RATE_LIMIT_BINDINGS.length
       || profile.some((entry) => !object(entry) || typeof entry.name !== "string"
         || typeof entry.namespace_id !== "string" || !object(entry.simple))
-      || new Set(profile.map((entry) => entry.name)).size !== 8
-      || new Set(profile.map((entry) => entry.namespace_id)).size !== 8) {
+      || new Set(profile.map((entry) => entry.name)).size !== STAGING_RATE_LIMIT_BINDINGS.length
+      || new Set(profile.map((entry) => entry.namespace_id)).size !== STAGING_RATE_LIMIT_BINDINGS.length
+      || STAGING_RATE_LIMIT_BINDINGS.some((name) => !profile.some((entry) => entry.name === name))
+      || profile.some((entry) => Object.hasOwn(OPERATIONAL_RATE_LIMITS, entry.name)
+        && (entry.simple.limit !== OPERATIONAL_RATE_LIMITS[entry.name] || entry.simple.period !== 60))) {
     fail("TEMPLATE_INVALID");
   }
   return profile;

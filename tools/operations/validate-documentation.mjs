@@ -16,6 +16,10 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  containsPrivateLocalPath,
+  privateLocalPathLines,
+} from "../../scripts/lib/private-local-paths.mjs";
 
 const execFile = promisify(execFileCallback);
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -620,6 +624,7 @@ export async function validateDocumentation({
   const failures = [];
   const contentsByPath = new Map();
   const anchorsByPath = new Map();
+  const privatePathLinesByPath = new Map();
 
   for (const path of markdownPaths) {
     const selected = resolve(selectedRoot, path);
@@ -642,8 +647,33 @@ export async function validateDocumentation({
   }
 
   for (const [path, contents] of contentsByPath) {
+    const privateLines = new Set(privateLocalPathLines(contents));
+    for (const line of privateLines) {
+      addFailure(
+        failures,
+        path,
+        line,
+        "private absolute paths and local file URLs are forbidden in documentation",
+      );
+    }
+    privatePathLinesByPath.set(path, privateLines);
+  }
+
+  for (const [path, contents] of contentsByPath) {
     const sourceFile = resolve(selectedRoot, path);
     for (const link of markdownLinks(contents)) {
+      const privateLines = privatePathLinesByPath.get(path);
+      if (privateLines?.has(link.line)) continue;
+      if (containsPrivateLocalPath(link.target)) {
+        privateLines?.add(link.line);
+        addFailure(
+          failures,
+          path,
+          link.line,
+          "private absolute paths and local file URLs are forbidden in documentation",
+        );
+        continue;
+      }
       if (link.target === "" || EXTERNAL_TARGET.test(link.target)) continue;
       let parts;
       let selected;
@@ -804,7 +834,8 @@ function usage() {
   console.log(`Usage: node tools/operations/validate-documentation.mjs [--links-only]
 
 Checks every tracked or unignored Markdown file. Local link targets and Markdown
-anchors must exist. The full check also validates dated-record frontmatter and
+anchors must exist; private absolute paths and local file URLs are rejected.
+The full check also validates dated-record frontmatter and
 the current-authority section in docs/README.md.`);
 }
 

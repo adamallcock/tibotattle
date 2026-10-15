@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
-import { startLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), "model-performance-route-"));

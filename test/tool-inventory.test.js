@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 172 records / 173 executable paths: release-documentation, Codex contract,
+  // 186 records / 185 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -340,9 +340,18 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // mount-only diagnostic each have an explicit owner; neither qualifies a release.
   // The controlled AppArmor comparison helper owns exact-profile generation and
   // cleanup; the final host owns the same-profile installed lifecycle handoff.
-  assert.equal(result.records, 173);
-  assert.equal(result.candidates.length, 174);
+  // Security remediation adds closed Windows signing stages and egress policy,
+  // Linux extraction and signing, private qualification transports, and a shared
+  // redacted-path guard. The Linux successor helper separates profile-generation
+  // proof from process-owned authenticated health. These are tooling boundaries,
+  // never product APIs.
   // Integration also retains the reviewed GCP operation tools.
+  // The hosted Worker sampler is an owned passive Linux CI diagnostic;
+  // its content-free process aggregates do not qualify performance or release.
+  // The fixed graph launcher separately owns its bounded thread diagnostic
+  // and reuses the sampler's reviewed helpers through an explicit caller entry.
+  assert.equal(result.records, 191);
+  assert.equal(result.candidates.length, 190);
   assert.ok(result.aliases >= 25);
 });
 

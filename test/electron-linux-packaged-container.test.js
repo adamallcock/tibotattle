@@ -31,16 +31,46 @@ test("Linux GUI qualification uses bounded isolated shared memory through reload
   const commands = [...linux.replaceAll(/\\\n\s*/gu, " ").matchAll(/(?:timeout \d+s )?docker run [^\n]*/gu)]
     .map(([command]) => command);
   const gui = commands.filter(command => command.includes("--entrypoint xvfb-run"));
-  assert.equal(gui.length, 2, "normal application and genuine updater both exercise Chromium");
-  for (const command of gui) {
+  assert.equal(gui.length, 1, "the unsigned workflow qualifies only the normal application");
+  assert.match(gui[0], /node scripts\/smoke-electron-linux-packaged\.mjs /u);
+  assert.doesNotMatch(linux, /smoke-electron-linux-real-appimage-updater\.mjs|real-appimage-updater-smoke\.json/u);
+  assert.match(linux, /Signed native updater qualification was not performed/u);
+
+  const runbook = await read("docs/runbooks/2026-08-18-cross-platform-release-publication.md");
+  const shellBlocks = [...runbook.matchAll(/```sh\n([\s\S]*?)\n```/gu)]
+    .map(([, block]) => block.replaceAll(/\\\n\s*/gu, " "));
+  const ownerCommands = shellBlocks.flatMap(block => [...block.matchAll(/(?:timeout \d+s )?docker run [^\n]*/gu)]
+    .map(([command]) => command))
+    .filter(command => command.includes("node scripts/smoke-electron-linux-real-appimage-updater.mjs"));
+  assert.equal(ownerCommands.length, 1, "the signed owner route retains the genuine updater qualification");
+  const ownerCommand = ownerCommands[0];
+  const preparation = shellBlocks.find(block => block.includes("node scripts/prepare-linux-updater-qualification.mjs"));
+  assert.ok(preparation, "the owner prepares the frozen pair using separately signed metadata");
+  assert.match(preparation, /node scripts\/prepare-linux-updater-qualification\.mjs\s+--signed-feed \/absolute\/owner-signed\/latest-linux\.yml/u);
+  assert.ok(runbook.indexOf("node scripts/prepare-linux-updater-qualification.mjs")
+    < runbook.indexOf("node scripts/smoke-electron-linux-real-appimage-updater.mjs"));
+
+  for (const command of [...gui, ownerCommand]) {
     assert.equal((command.match(/--shm-size=512m/gu) ?? []).length, 1);
-    assert.match(command, /--network none/u);
-    assert.match(command, /--cap-add=SYS_ADMIN/u);
+    assert.deepEqual(command.match(/--network(?:=| )\S+/gu), ["--network none"]);
+    assert.deepEqual(command.match(/--cap-add(?:=| )\S+/gu), ["--cap-add=SYS_ADMIN"]);
+    assert.match(command, /docker run --rm --init --platform=linux\/amd64 /u);
+    assert.match(command, /--entrypoint xvfb-run tibotattle-electron-linux-packaged:test /u);
+    assert.match(command, /--auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp'/u);
+    assert.match(command, /--env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1/u);
+    assert.match(command, /--env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none/u);
     assert.doesNotMatch(command, /--ipc(?:=| )host|--(?:privileged|disable-dev-shm-usage|no-sandbox|volume|mount)(?:=|\s)|\s-v\s/u);
     assert.doesNotMatch(command, /--tmpfs \/dev\/shm/u);
   }
-  assert.ok(gui.some(command => command.includes("scripts/smoke-electron-linux-packaged.mjs")));
-  assert.ok(gui.some(command => command.includes("scripts/smoke-electron-linux-real-appimage-updater.mjs")));
+  assert.match(ownerCommand, /^timeout 420s docker run /u);
+  assert.deepEqual(ownerCommand.match(/--add-host(?:=| )\S+/gu), ["--add-host updates.tibotattle.com:127.0.0.1"]);
+  assert.match(ownerCommand, /--sysctl net\.ipv4\.ip_unprivileged_port_start=0/u);
+  assert.deepEqual(ownerCommand.match(/--tmpfs (?:"[^"]+"|\S+)/gu), [
+    '--tmpfs "$container_home:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700"',
+    "--tmpfs /run/user/1000:rw,noexec,nosuid,size=1024m,uid=1000,gid=1000,mode=0700",
+    "--tmpfs /opt/tibotattle-updater-exec:rw,exec,nosuid,size=2048m,uid=1000,gid=1000,mode=0700",
+  ]);
+  assert.match(ownerCommand, / > "\$qualification_receipt"$/u);
 });
 
 test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exit skips", async () => {
@@ -85,7 +115,7 @@ test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exi
 test("packaged Linux image admits only the chosen app and verifier inputs", async () => {
   const dockerfile = await read("containers/electron-linux-packaged/Dockerfile");
   const copies = dockerfile.split("\n").filter((line) => line.startsWith("COPY "));
-  assert.equal(copies.length, 14);
+  assert.equal(copies.length, 12);
   assert.ok(copies.every((line) => !line.includes("--chown")));
   assert.equal(copies.filter((line) => line.startsWith("COPY scripts ")).length, 1);
   assert.equal(copies.filter((line) => line.startsWith("COPY .release-build/electron-dev/linux-x64/app ")).length, 1);
@@ -104,10 +134,8 @@ test("packaged Linux image admits only the chosen app and verifier inputs", asyn
   )), [
     "COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/build/qualification ./native/linux-credential-mutex/build/qualification",
   ]);
-  assert.deepEqual(copies.filter((line) => line.startsWith("COPY .release-build/electron-linux-updater-rehearsal/")), [
-    "COPY .release-build/electron-linux-updater-rehearsal/pair.json ./.release-build/electron-linux-updater-rehearsal/pair.json",
-    "COPY .release-build/electron-linux-updater-rehearsal/current/*.AppImage ./.release-build/electron-linux-updater-rehearsal/current/",
-    "COPY .release-build/electron-linux-updater-rehearsal/next/*.AppImage ./.release-build/electron-linux-updater-rehearsal/next/",
+  assert.deepEqual(copies.filter((line) => line.startsWith("COPY .release-build/electron-linux-updater-rehearsal")), [
+    "COPY .release-build/electron-linux-updater-rehearsal ./.release-build/electron-linux-updater-rehearsal",
   ]);
   const generated = copies.filter((line) => line.startsWith("COPY .release-build/electron-candidates/"));
   assert.equal(generated.length, 2);
@@ -137,6 +165,17 @@ test("packaged Linux image admits only the chosen app and verifier inputs", asyn
     "!test/fixtures/", "!test/fixtures/linux-packaged-codex/",
     "!test/fixtures/linux-packaged-codex/codex",
   ]);
+  assert.deepEqual(exceptions.filter((line) => line.startsWith("!.release-build/electron-linux-updater-rehearsal")), [
+    "!.release-build/electron-linux-updater-rehearsal/",
+    "!.release-build/electron-linux-updater-rehearsal/pair.json",
+    "!.release-build/electron-linux-updater-rehearsal/current/",
+    "!.release-build/electron-linux-updater-rehearsal/current/*.AppImage",
+    "!.release-build/electron-linux-updater-rehearsal/next/",
+    "!.release-build/electron-linux-updater-rehearsal/next/*.AppImage",
+    "!.release-build/electron-linux-updater-rehearsal/qualification/",
+    "!.release-build/electron-linux-updater-rehearsal/qualification/qualification.json",
+    "!.release-build/electron-linux-updater-rehearsal/qualification/latest-linux.yml",
+  ], "only the frozen pair and two optional signed admission files enter the container");
   assert.ok(exceptions.every((line) => !/profile|\.git|\.usage-monitor|\.release-deps|darwin|win32/u.test(line)));
 });
 

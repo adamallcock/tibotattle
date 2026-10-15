@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
+import { EventEmitter, getEventListeners } from "node:events";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { PassThrough } from "node:stream";
 import {
   R7_WORKER_DEFAULT_MAXIMUM_STDIN_BYTES,
@@ -492,4 +497,197 @@ test("spawn and worker process failures use fixed content-free classifications",
     assert.equal(result.termination, "sigkill");
     assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
   });
+});
+
+test("pre-aborted watchdog never spawns or schedules work and discards arbitrary reasons", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("PRIVATE_ABORT_REASON"));
+  const scheduler = manualScheduler();
+  let spawned = false;
+  const result = await runR7WorkerWatchdog(request({ signal: controller.signal }),
+    dependencies(null, scheduler, { spawnProcess() { spawned = true; } }));
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.termination, "not_started");
+  assert.equal(spawned, false);
+  assert.equal(scheduler.timeouts.length, 0);
+  assert.equal(scheduler.intervals.length, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(JSON.stringify(result).includes("PRIVATE_ABORT_REASON"), false);
+  await assert.rejects(runR7WorkerWatchdog(request({ signal: {} })), /signal must be an AbortSignal/);
+});
+
+test("active abort waits for owned child close and drains RSS before discarding output", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  let releaseSample;
+  let consumed = false;
+  let resolved = false;
+  const promise = runR7WorkerWatchdog(request({
+    signal: controller.signal,
+    consumeStdout() { consumed = true; },
+  }), dependencies(child, scheduler, {
+    sampleRss: () => new Promise((resolve) => { releaseSample = resolve; }),
+  })).then((result) => { resolved = true; return result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  child.stdout.write("PRIVATE_PARTIAL_OUTPUT");
+  controller.abort({ private: "PRIVATE_ABORT_REASON" });
+  child.stdout.write("PRIVATE_LATE_OUTPUT");
+  assert.deepEqual(child.kills, ["SIGKILL"]);
+  assert.equal(resolved, false);
+  child.emit("close", null, "SIGKILL");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resolved, false);
+  releaseSample({ status: "sampled", rssBytes: 42 });
+  const result = await promise;
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.termination, "sigkill");
+  assert.equal(result.peakRssBytes, 42);
+  assert.equal(consumed, false);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+  assert.equal(scheduler.timeouts.every((handle) => handle.cancelled), true);
+  assert.equal(scheduler.intervals.every((handle) => handle.cancelled), true);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("abort during post-close RSS drain cannot consume stdout or report completion", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  let releaseSample;
+  let consumed = false;
+  const promise = runR7WorkerWatchdog(request({
+    signal: controller.signal,
+    consumeStdout() { consumed = true; },
+  }), dependencies(child, scheduler, {
+    sampleRss: () => new Promise((resolve) => { releaseSample = resolve; }),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  child.stdout.write("PRIVATE_COMPLETE_OUTPUT");
+  child.emit("close", 0, null);
+  controller.abort("PRIVATE_ABORT_REASON");
+  releaseSample({ status: "sampled", rssBytes: 42 });
+  const result = await promise;
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.termination, "clean");
+  assert.equal(consumed, false);
+  assert.deepEqual(child.kills, []);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("abort during spawn and synchronous close during kill leave no scheduled handles", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  child.kill = (signal) => { child.kills.push(signal); child.emit("close", null, signal); return true; };
+  const scheduler = manualScheduler();
+  const result = await runR7WorkerWatchdog(request({ signal: controller.signal }),
+    dependencies(child, scheduler, {
+      spawnProcess() { controller.abort("PRIVATE_ABORT_REASON"); return child; },
+    }));
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.termination, "sigkill");
+  assert.deepEqual(child.kills, ["SIGKILL"]);
+  assert.equal(scheduler.timeouts.every((handle) => handle.cancelled), true);
+  assert.equal(scheduler.intervals.length, 0);
+  assert.equal(child.stdin.read(), null);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("unconfirmed abort preserves its fixed classification and removes owned listeners", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  const promise = runR7WorkerWatchdog(request({ signal: controller.signal }), dependencies(child, scheduler));
+  controller.abort("PRIVATE_ABORT_REASON");
+  scheduler.fire(scheduler.timeouts.at(-1));
+  const result = await promise;
+  assert.equal(result.outcome, "termination_unconfirmed");
+  assert.equal(result.termination, "aborted");
+  assert.deepEqual(child.kills, ["SIGKILL", "SIGKILL"]);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(scheduler.timeouts.every((handle) => handle.cancelled), true);
+  assert.equal(scheduler.intervals.every((handle) => handle.cancelled), true);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+});
+
+test("normal completion removes its abort listener without terminating the child", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  const promise = runR7WorkerWatchdog(request({ signal: controller.signal }), dependencies(child, scheduler));
+  child.emit("close", 0, null);
+  assert.equal((await promise).outcome, "completed");
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  controller.abort();
+  assert.deepEqual(child.kills, []);
+  assert.equal(scheduler.timeouts.every((handle) => handle.cancelled), true);
+  assert.equal(scheduler.intervals.every((handle) => handle.cancelled), true);
+});
+
+test("real node:test timeout cancels and closes its owned watchdog worker", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "r7-watchdog-cancellation-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workerPath = join(root, "worker.mjs");
+  const testPath = join(root, "timeout.test.mjs");
+  await writeFile(workerPath, "setInterval(() => {}, 1_000);\n", { mode: 0o600 });
+  await writeFile(testPath, `
+import test from "node:test";
+import { spawn } from "node:child_process";
+import { runR7WorkerWatchdog } from ${JSON.stringify(new URL("../src/r7-worker-watchdog.js", import.meta.url).href)};
+let ownedChild;
+process.once("SIGTERM", () => { ownedChild?.kill("SIGKILL"); process.exitCode = 1; });
+test("synthetic timeout", { timeout: 30 }, async (t) => {
+  let child;
+  const result = await runR7WorkerWatchdog({
+    runtimeExecutable: process.execPath,
+    workerPath: ${JSON.stringify(workerPath)},
+    cwd: ${JSON.stringify(root)},
+    input: "{}",
+    maximumRssBytes: 1024 * 1024,
+    signal: t.signal,
+  }, {
+    platform: "darwin",
+    architecture: "arm64",
+    spawnProcess(...args) { child = spawn(...args); ownedChild = child; return child; },
+    sampleRss: async () => ({ status: "sampled", rssBytes: 1 }),
+  });
+  console.log("CANCELLATION_RESULT=" + JSON.stringify({
+    outcome: result.outcome,
+    termination: result.termination,
+    closed: child.signalCode === "SIGKILL",
+  }));
+});
+`, { mode: 0o600 });
+  let failure;
+  try {
+    await promisify(execFile)(process.execPath, ["--test", "--test-reporter=tap", testPath], {
+      timeout: 5_000,
+      maxBuffer: 32 * 1024,
+      env: { LANG: "C", LC_ALL: "C", TZ: "UTC" },
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.equal(failure.code, 1);
+  assert.equal(failure.killed, false);
+  assert.match(failure.stdout, /testTimeoutFailure/);
+  assert.match(failure.stdout, /CANCELLATION_RESULT=\{"outcome":"aborted","termination":"sigkill","closed":true\}/);
+});
+
+test("abort from a synchronous stdout consumer cannot yield a completed outcome", async () => {
+  const controller = new AbortController();
+  const child = fakeChild();
+  const scheduler = manualScheduler();
+  const promise = runR7WorkerWatchdog(request({
+    signal: controller.signal,
+    consumeStdout() { controller.abort("PRIVATE_ABORT_REASON"); },
+  }), dependencies(child, scheduler));
+  child.stdout.write("synthetic");
+  child.emit("close", 0, null);
+  const result = await promise;
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.termination, "clean");
+  assert.deepEqual(child.kills, []);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 });

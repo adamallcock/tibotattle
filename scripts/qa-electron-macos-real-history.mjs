@@ -35,6 +35,7 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
+import { fetchRendererJson, fetchRendererJsonResponse } from "./lib/authorized-renderer-fetch.mjs";
 
 const REQUIRED_APP_NAME = "TiboTattle Dev";
 // v3 binds the receipt to the exact source revision and verified packaged
@@ -544,13 +545,12 @@ async function freeTcpPort() {
   return port;
 }
 
-async function fetchJson(url, timeoutMs = REAL_HISTORY_QA_TIMEOUTS.operationMs) {
+async function debugJsonFetch(url, timeoutMs = REAL_HISTORY_QA_TIMEOUTS.operationMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
       cache: "no-store",
-      headers: { "X-Usage-Monitor-Local": "1" },
       signal: controller.signal,
     });
     if (!response.ok) return null;
@@ -1043,14 +1043,14 @@ async function launchSession({
   if (!child.pid) fail("REAL_HISTORY_QA_LAUNCH_FAILED", "launch", "launch_failed");
   try {
     const version = await waitForLaunchGate(
-      () => fetchJson(`http://127.0.0.1:${debugPort}/json/version`),
+      () => debugJsonFetch(`http://127.0.0.1:${debugPort}/json/version`),
       REAL_HISTORY_QA_TIMEOUTS.startupMs,
       "Electron remote debugging",
       REAL_HISTORY_LAUNCH_GATE,
     );
     if (!version) fail("REAL_HISTORY_QA_LAUNCH_FAILED", "launch", "launch_failed");
     const target = await waitForLaunchGate(async () => {
-      const targets = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
+      const targets = await debugJsonFetch(`http://127.0.0.1:${debugPort}/json/list`);
       return Array.isArray(targets)
         ? targets.find((candidate) => isExactDashboardTarget(candidate, debugPort)) ?? null
         : null;
@@ -1173,21 +1173,21 @@ async function closeSession(session, { signal = "SIGUSR2" } = {}) {
 async function dashboardHealth(session, required = true) {
   const healthUrl = new URL("/api/local/health", session.dashboardUrl);
   const health = await waitFor(
-    () => fetchJson(healthUrl, REAL_HISTORY_QA_TIMEOUTS.healthMs),
+    () => fetchRendererJson(session.cdp, healthUrl, { timeoutMs: REAL_HISTORY_QA_TIMEOUTS.healthMs }),
     REAL_HISTORY_QA_TIMEOUTS.healthMs,
     "local companion health",
   ).catch(() => null);
   if (required && health?.status !== "ready") {
     fail("REAL_HISTORY_QA_HEALTH_UNAVAILABLE", "health", "health_unavailable");
   }
-  // The local companion's fixed /api/health relay is a bounded, unauthenticated
-  // GET to the configured central service. It does not send contribution data
-  // or mutate pairing/consent state. Use only its fixed public liveness status;
+  // The local companion's fixed /api/health relay is a bounded GET from the
+  // authenticated dashboard to the configured public central health service.
+  // It does not send contribution data or mutate pairing/consent state. Use only its fixed public liveness status;
   // keep the configured capability and live reachability as separate facts.
   let serviceHealth = null;
   if (health?.capabilities?.centralServiceProxy === true) {
     serviceHealth = await waitFor(
-      () => fetchJson(new URL("/api/health", session.dashboardUrl), REAL_HISTORY_QA_TIMEOUTS.healthMs),
+      () => fetchRendererJson(session.cdp, new URL("/api/health", session.dashboardUrl), { timeoutMs: REAL_HISTORY_QA_TIMEOUTS.healthMs }),
       REAL_HISTORY_QA_TIMEOUTS.healthMs,
       "contribution service health",
     ).catch(() => null);
@@ -1203,30 +1203,27 @@ async function dashboardHealth(session, required = true) {
 }
 
 async function refreshStatus(session, timeoutMs = REAL_HISTORY_QA_TIMEOUTS.healthMs) {
-  return fetchJson(
+  return fetchRendererJson(session.cdp,
     new URL("/api/local/refresh", session.dashboardUrl),
-    timeoutMs,
-  );
+    { timeoutMs },
+  ).catch(() => null);
 }
 
-export async function fetchJsonMeasured(url, timeoutMs) {
+export async function fetchJsonMeasured(cdp, url, timeoutMs) {
+  // Include the authenticated renderer round trip in the existing latency gate.
   const startedAtMonotonicMs = monotonicNowMs();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let status = null;
   let body = null;
   try {
-    const response = await fetch(url, {
-      cache: "no-store",
-      headers: { "X-Usage-Monitor-Local": "1" },
-      signal: controller.signal,
-    });
+    const response = await fetchRendererJsonResponse(cdp, url, { timeoutMs });
     status = response.status;
-    if (response.ok) body = await response.json();
-  } catch {
-    // The bounded result below intentionally retains no transport/error text.
-  } finally {
-    clearTimeout(timer);
+    body = response.body;
+  } catch (error) {
+    // Retain an observed HTTP status even if its JSON body is invalid; never
+    // retain transport error text or response content from a failed read.
+    if (Number.isInteger(error?.status) && error.status >= 200 && error.status <= 599) {
+      status = error.status;
+    }
   }
   return Object.freeze({
     status,
@@ -1671,8 +1668,8 @@ async function sampleControlPlaneStatus(
         : "control_plane_unresponsive");
     }
     const [health, status] = await Promise.all([
-      fetchJsonMeasured(healthUrl, requestTimeoutMs),
-      fetchJsonMeasured(refreshUrl, requestTimeoutMs),
+      fetchJsonMeasured(session.cdp, healthUrl, requestTimeoutMs),
+      fetchJsonMeasured(session.cdp, refreshUrl, requestTimeoutMs),
     ]);
     samples.sampleCount += 1;
     samples.healthLatencies.push(health.latencyMs);

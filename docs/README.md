@@ -50,6 +50,7 @@ an informal archive.
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
+| Linux update trust | [Linux publisher authentication](./decisions/2026-10-12-linux-update-publisher-authentication.md) | Embedded publisher roots, signed final-byte metadata, replay protection and the unprovisioned updater gate |
 | Build downloader dependencies | [Remove the legacy downloader chains](./decisions/2026-10-09-build-downloader-dependency-remediation.md) | Stable-builder transport backport, recursive dependency-absence guard and unsuppressed scanner; earlier artifact exceptions do not authorize replacement builds |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
 | macOS release | [macOS Electron release and native upgrade feeds](./runbooks/macos-stable-release-runbook.md) | Installed transition qualification, both retained Sparkle feeds and exact-byte publication gates |

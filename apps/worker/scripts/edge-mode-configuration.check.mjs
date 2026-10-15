@@ -18,6 +18,7 @@ import {
   applyEdgeModeStagingSnapshotDelta,
   assertEdgeModeTransition,
   edgeModeOverlaySha256,
+  edgeModeStagingProductionReferences,
   liveEdgeMode,
   normalizeEdgeModePlan,
   serializeEdgeModeConfig,
@@ -824,6 +825,25 @@ test("the staging variant rehearses every mode on a workers.dev-only staging Wor
   }).ok, true);
 });
 
+test("the staging reference API refuses another Worker, account, or incomplete production identity", () => {
+  const productionSnapshot = fixture();
+  const options = { productionSnapshot, productionPlan: null, trackedConfig: tracked(), stagingAccountId: productionSnapshot.accountId };
+  const references = edgeModeStagingProductionReferences(options);
+  assert.ok(references.databaseIds.has(ANALYTICS_ID));
+  assert.ok(references.workerNames.has(productionSnapshot.workerName));
+  for (const override of [
+    { stagingAccountId: undefined },
+    { stagingAccountId: "0b".repeat(16) },
+    { trackedConfig: undefined },
+    { productionPlan: undefined },
+    { productionSnapshot: stagingRename(productionSnapshot, "another-worker") },
+    { productionBaselineSnapshot: stagingRename(productionSnapshot, "another-worker") },
+    { productionBaselineSnapshot: resnapshot(productionSnapshot, { accountId: "0b".repeat(16) }) },
+  ]) {
+    throwsCode(() => edgeModeStagingProductionReferences({ ...options, ...override }), "EDGE_MODE_STAGING_INPUT_INVALID");
+  }
+});
+
 test("the staging variant refuses every production reference and no other", () => {
   const production = fixture();
   const trackedConfig = tracked();
@@ -925,7 +945,11 @@ test("the staging variant refuses every production reference and no other", () =
   // environment, var text, and a tracked name.
   const asProduction = stagingRename(staging, "app-usagemonitor");
   refused(asProduction, { renderedConfig: render(asProduction, sourceCommit, { ...stagingTracked(), name: "app-usagemonitor" }) });
-  refused(replace("UPLOAD_INGRESS_BUDGET", "script_name", "app-usagemonitor"));
+  const foreignBudget = replace("UPLOAD_INGRESS_BUDGET", "script_name", "app-usagemonitor");
+  throwsCode(() => render(foreignBudget, sourceCommit, stagingTracked()), "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_INVALID");
+  const foreignBudgetConfig = render(staging, sourceCommit, stagingTracked());
+  foreignBudgetConfig.durable_objects.bindings[0].script_name = "app-usagemonitor";
+  refused(foreignBudget, { renderedConfig: foreignBudgetConfig });
   refused(setText(staging, "ENVIRONMENT", "app-usagemonitor"));
   refusedRender((config) => { config.durable_objects.bindings[0].script_name = "app-usagemonitor"; });
   refusedRender((config) => { config.name = "app-usagemonitor"; });

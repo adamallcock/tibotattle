@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   createServer as createHttpServer,
@@ -13,6 +14,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   symlink,
@@ -83,8 +85,12 @@ import {
   LOCAL_STARTUP_DIAGNOSTIC_STEPS,
   localCompanionRefreshTimeoutForUnifiedIndex,
   resolveClaudeDesktopShadowConfiguration,
-  startLocalCompanionServer,
 } from "./server.js";
+import {
+  fetch,
+  localAuthorizationHeaders,
+  startLocalCompanionServer,
+} from "../../test/helpers/local-authorized-client.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -828,7 +834,8 @@ function fakeStore() {
 }
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "local-companion-server-"));
+  // Standalone authorization bootstrap intentionally refuses aliased roots.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "local-companion-server-")));
   const resourceRoot = join(root, "resources");
   const stateRoot = join(root, "state");
   const codexHome = join(root, "home", ".codex");
@@ -967,7 +974,7 @@ function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
       port,
       path,
       method,
-      headers,
+      headers: { ...localAuthorizationHeaders({ port, path, method }), ...headers },
     }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
@@ -4892,6 +4899,7 @@ test("no provider redirect can land on the loopback companion", async () => {
 
 test("CLI port zero prints its actual ready URL and honors explicit roots", async () => {
   const files = await fixture();
+  const localCapability = randomBytes(32).toString("base64url");
   const childEnvironment = {
     ...process.env,
     USAGE_MONITOR_PORT: "0",
@@ -4899,14 +4907,16 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
     USAGE_MONITOR_STATE_ROOT: files.stateRoot,
     HOME: join(files.root, "home"),
     CODEX_HOME: files.codexHome,
+    USAGE_MONITOR_LOCAL_AUTH_FD: "5",
   };
   delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
   delete childEnvironment.USAGE_MONITOR_PARENT_PID;
   const child = spawn(process.execPath, [resolve("apps/local/server.js")], {
     cwd: files.root,
     env: childEnvironment,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"],
   });
+  child.stdio[5].end(`${localCapability}\n`);
   let output = "";
   child.stdout.on("data", (chunk) => {
     output += chunk.toString("utf8");
@@ -4918,13 +4928,17 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
     )?.[1];
     assert.ok(url);
     assert.notEqual(new URL(url).port, "0");
-    const health = await fetch(new URL("/api/local/health", url));
+    const headers = { "X-TiboTattle-Local-Capability": localCapability };
+    const health = await fetch(new URL("/api/local/health", url), { headers });
     assert.equal(health.status, 200);
     const onboarding = await fetch(
       new URL("/api/local/onboarding", url),
+      { headers },
     ).then((response) => response.json());
     assert.equal(onboarding.status, "ready");
     assert.equal(JSON.stringify(onboarding).includes(files.root), false);
+    assert.equal(output.includes(localCapability), false);
+    assert.equal((await globalThis.fetch(new URL("/api/local/health", url))).status, 403);
     child.kill("SIGINT");
     const [code, signal] = await Promise.race([
       once(child, "exit"),

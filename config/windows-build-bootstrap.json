@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "tibotattle-windows-build-bootstrap-v1",
+  "node": {
+    "version": "26.2.0",
+    "archiveUrl": "https://nodejs.org/dist/v26.2.0/node-v26.2.0-win-x64.zip",
+    "archiveSha256": "371071a4f7e2c8a5dd280730049c685911feecc59f50ebc488d675dc1087c69c",
+    "archiveBytes": 39038614,
+    "archiveRoot": "node-v26.2.0-win-x64"
+  },
+  "pnpm": {
+    "name": "pnpm",
+    "version": "11.9.0",
+    "archiveUrl": "https://registry.npmjs.org/pnpm/-/pnpm-11.9.0.tgz",
+    "archiveBytes": 4603130,
+    "integrity": "sha512-vWgtXQP+Ul73yf1ngMaITR51asTJyf4AxTh4KCQxDc+Q493E9Tg18G3669UIXkGFXgvLs7YN4qxburieUDbwOw==",
+    "fileCount": 450,
+    "unpackedBytes": 18742792,
+    "entrypoint": "package/bin/pnpm.mjs",
+    "signature": {
+      "keyId": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+      "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g==",
+      "signature": "MEUCIAKaXOQO+Yb1TVOdmAMRNmI5iFE1wFscO5ZjuYGo4whJAiEApE0vf6Q/Y/RapqbDWVQLtLEUJRyBAGzI4nH4/AadTCk="
+    }
+  }
+}

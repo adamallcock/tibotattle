@@ -100,8 +100,9 @@ On 2026-09-05, a clean local measurement candidate
 `721171e9541802c1bc9363a8a4c73393b921de8da30797b8eb61a11b799d94e4`.
 The local unsigned app bundle was bound to `app.asar` SHA-256
 `e66c0adeacc88886a9f35b33885f20ca834256cc64528b5a699174cb2339b937`.
-The [content-free durable result receipt](file:///Users/adamallcock/Documents/Coding/app-usagemonitor/.release-build/electron-unified-0.1.18-builds/81cadfc873-real-history-measurement/real-history-control-plane-result.json)
-and its adjacent provenance/package receipts record those bindings. Its private
+The content-free durable result receipt and adjacent provenance/package receipts
+preserve those bindings in private maintainer evidence outside the repository.
+The private
 profile was a fresh SQLite-backup-and-device-salt copy. The local-only
 cancel-mode run passed without central origin or contribution capability.
 
@@ -126,8 +127,8 @@ The first v2 candidate, source
 patch digest `46b92f5ddbc83617a9d1aa79329f06bac5ccc814dcf81941c8e095c754292f29`
 and bound to `app.asar` SHA-256
 `8913efb00d34a360d2a5f2ab8526abcbc6eb40d3f91eddac18d114ac09eaa7d3`.
-Its [content-free QA receipt](file:///Users/adamallcock/Documents/Coding/app-usagemonitor/.release-build/electron-unified-0.1.18-builds/9bb98fe3deed-prequick-sequencing-failure/real-history-receipt.json)
-is retained because it observed valid v2 coverage: warm-up was 2/0 pre/post
+The content-free QA receipt was retained in private maintainer evidence outside
+the repository because it observed valid v2 coverage: warm-up was 2/0 pre/post
 quick, active was 3/17, and both active endpoint p95 values were 179 ms with a
 481 ms maximum.
 
@@ -147,9 +148,9 @@ performance/QA patch digest
 `8c66e6175cfeb9e2b4dc9f952f5d48297337271b6222e6a7053e7bc49e3d767e`.
 The unsigned directory app was artifact-verified and bound to `app.asar`
 SHA-256 `8913efb00d34a360d2a5f2ab8526abcbc6eb40d3f91eddac18d114ac09eaa7d3`.
-The [durable content-free QA receipt](file:///Users/adamallcock/Documents/Coding/app-usagemonitor/.release-build/electron-unified-0.1.18-builds/07e639d386a5-prequick-performance/real-history-receipt.json),
-[result summary](file:///Users/adamallcock/Documents/Coding/app-usagemonitor/.release-build/electron-unified-0.1.18-builds/07e639d386a5-prequick-performance/real-history-control-plane-result.json),
-and adjacent hash-indexed package/provenance receipts preserve those bindings.
+The optimized run recorded its durable content-free QA receipt and result
+summary in private maintainer evidence outside the repository, with adjacent
+hash-indexed package/provenance receipts preserving those bindings.
 
 The fresh profile was an SQLite-backup-and-device-salt copy. It had no central
 origin and contribution was disabled. The cancel-mode run passed its source

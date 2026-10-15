@@ -140,7 +140,7 @@ test("both rate-limit profiles use their own namespaces; load raises only the in
   const taken = new Set(TRACKED.flatMap((config) => [config, ...Object.values(config.env ?? {})])
     .flatMap((environment) => environment.ratelimits ?? []).map((entry) => String(entry.namespace_id)));
   for (const profile of [rehearsal, load]) {
-    assert.deepEqual(profile.map((entry) => entry.namespace_id), ["4001", "4002", "4003", "4004", "4005", "4006", "4007", "4008"]);
+    assert.deepEqual(profile.map((entry) => entry.namespace_id), ["4001", "4002", "4003", "4004", "4005", "4006", "4007", "4008", "4009", "4010", "4012"]);
     assert.ok(profile.every((entry) => !taken.has(entry.namespace_id)));
   }
   const production = new Map(TRACKED[0].env.production.ratelimits.map((entry) => [entry.name, entry.simple]));
@@ -160,7 +160,7 @@ test("the example inputs render a complete staging target with no placeholder le
   assert.equal(environment.vars.PUBLIC_ORIGIN, `https://${RAW_INPUTS.publicHostname}`);
   assert.deepEqual(environment.routes.map((route) => route.pattern),
     [RAW_INPUTS.publicHostname, `admin.${RAW_INPUTS.publicHostname}`]);
-  assert.equal(environment.ratelimits.length, 8);
+  assert.equal(environment.ratelimits.length, 11);
   assert.ok(isAbsolute(rendered.standIn.main) && existsSync(rendered.standIn.main));
   assert.equal(rendered.standIn.d1_databases.length, 1);
   assert.deepEqual(rendered.standIn.triggers.crons, [RAW_INPUTS.standInCron]);
@@ -178,6 +178,27 @@ test("the example inputs render a complete staging target with no placeholder le
   const load = renderStagingEdgeTemplate({ template: template(), inputs: raw((value) => ({ ...value, rateLimitProfile: "load" })) });
   assert.equal(load.edgeTracked.env.production.ratelimits.find((entry) => entry.name === "UPLOAD_INGRESS_CLIENT_RATE_LIMIT")
     .simple.limit, 12000);
+});
+
+test("both staging profiles require each operational guard at its unchanged cap", () => {
+  const operational = { PUBLIC_PROBE_RATE_LIMIT: 60, PUBLIC_PROBE_CLIENT_RATE_LIMIT: 12, SPARKLE_APPCAST_GUARD_RATE_LIMIT: 60 };
+  for (const profileName of ["rehearsal", "load"]) {
+    for (const [name, limit] of Object.entries(operational)) {
+      assert.deepEqual(template().rateLimitProfiles[profileName].find((binding) => binding.name === name).simple,
+        { limit, period: 60 });
+      for (const mutate of [
+        (profile) => profile.filter((binding) => binding.name !== name),
+        (profile) => profile.map((binding) => binding.name === name ? { ...binding, name: "UNREVIEWED_RATE_LIMIT" } : binding),
+        (profile) => profile.map((binding) => binding.name === name ? { ...binding, namespace_id: "4001" } : binding),
+        (profile) => profile.map((binding) => binding.name === name ? { ...binding, simple: { limit: limit + 1, period: 60 } } : binding),
+        (profile) => profile.map((binding) => binding.name === name ? { ...binding, simple: { limit, period: 10 } } : binding),
+      ]) {
+        const invalid = template();
+        invalid.rateLimitProfiles[profileName] = mutate(invalid.rateLimitProfiles[profileName]);
+        refused(() => parseStagingEdgeTemplate(JSON.stringify(invalid)), "STAGING_EDGE_TEMPLATE_INVALID");
+      }
+    }
+  }
 });
 
 test("the genesis snapshot is exactly what the rendered config declares", () => {

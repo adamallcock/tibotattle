@@ -131,13 +131,13 @@ test("platform services use only native-picker paths and fixed open targets", as
       canInstall: false,
       progress: null,
       error: "unavailable",
-      detail: "Update checks are unavailable in this development build.",
+      detail: "Update checks are unavailable in this build.",
     },
     automaticUpdates: {
       enabled: false,
       available: false,
       canSet: false,
-      detail: "Automatic updates are unavailable in this development build.",
+      detail: "Automatic updates are unavailable in this build.",
     },
   });
   assert.equal(services.setLocale("es"), true);

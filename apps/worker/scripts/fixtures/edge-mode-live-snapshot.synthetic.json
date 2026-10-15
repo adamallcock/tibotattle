@@ -134,6 +134,24 @@
       "text": "https://tibotattle.com"
     },
     {
+      "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+      "type": "ratelimit",
+      "namespace_id": "9010",
+      "simple": {
+        "limit": 12,
+        "period": 60
+      }
+    },
+    {
+      "name": "PUBLIC_PROBE_RATE_LIMIT",
+      "type": "ratelimit",
+      "namespace_id": "9009",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
       "name": "PUBLIC_READ_RATE_LIMIT",
       "type": "ratelimit",
       "namespace_id": "9004",
@@ -165,6 +183,15 @@
       "name": "SPARKLE_APPCAST_GUARD_MODE",
       "type": "plain_text",
       "text": "enabled"
+    },
+    {
+      "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+      "type": "ratelimit",
+      "namespace_id": "9011",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
     },
     {
       "name": "SPARKLE_APPCAST_GUARD_TOKEN",
@@ -273,5 +300,5 @@
     }
   ],
   "sourceCommit": "5555555555555555555555555555555555555555",
-  "fingerprint": "3ec1ec623448e5dc1647f7ee0e4f30469509c0bbe41977f22d89c74e27d9d48f"
+  "fingerprint": "d631af58a607f1d6977a39143712c3c0c72d639b48ed717fbf0e573ff5a38f82"
 }

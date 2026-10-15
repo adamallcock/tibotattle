@@ -1525,18 +1525,30 @@ const PRODUCTION_EDGE_BARRIER_HEALTH_MODE = "migration-mutation-barrier";
  * gcp must not be barrier health and must report the expected source commit:
  * the edge's for worker, the origin commit the pre-gcp verifier read for
  * gcp. The fast-path test origin's health (no deployment.sourceCommit) fails.
+ * The dedicated staging driver supplies its validated origin; ordinary
+ * production callers keep the canonical production origin by default.
  */
 export async function recheckProductionEdgeHealth({
   fetchImpl = globalThis.fetch,
   timeoutMs = 10_000,
   mode,
   expectedSourceCommit,
+  origin = DEPLOYMENT_ENDPOINTS.public.origin,
 } = {}) {
   if (!["worker", "fenced", "gcp"].includes(mode)
       || !PRODUCTION_SOURCE_COMMIT_PATTERN.test(expectedSourceCommit ?? "")) {
     return localFailure("PRODUCTION_EDGE_HEALTH_INPUT_INVALID");
   }
-  const healthURL = new URL("/api/health", DEPLOYMENT_ENDPOINTS.public.origin).href;
+  let healthURL;
+  try {
+    const parsed = new URL(origin);
+    if (typeof origin !== "string" || parsed.protocol !== "https:" || parsed.origin !== origin) {
+      return localFailure("PRODUCTION_EDGE_HEALTH_INPUT_INVALID");
+    }
+    healthURL = new URL("/api/health", parsed).href;
+  } catch {
+    return localFailure("PRODUCTION_EDGE_HEALTH_INPUT_INVALID");
+  }
   let response;
   try {
     response = await fetchImpl(healthURL, {

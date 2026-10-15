@@ -170,6 +170,7 @@
         "apps/worker/scripts/typed-forward-migration.mjs",
         "scripts/lib/macos-qualification-artifact-publication.mjs",
         "test/macos-qualification-artifact-publication.test.js",
+        "test/helpers/linux-update-publication-fixture.js",
         "apps/worker/scripts/cloudflare-writer-fence.mjs",
         "apps/worker/scripts/edge-mode-configuration.mjs",
         "apps/worker/scripts/production-edge-mode.mjs",
@@ -661,7 +662,7 @@
       "callers": [],
       "decision": "retain_as_internal_tooling_support",
       "provenance": null,
-      "provenanceReason": "Reads the running companion and the installed bundle and prints; it writes no artifact.",
+      "provenanceReason": "Reads the explicitly owner-authorized standalone companion and installed bundle; no listener discovery, mutation, or artifact writes.",
       "legacyPaths": []
     },
     {
@@ -1653,6 +1654,23 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/hosted-backend-process-sampler.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal passive Linux diagnostic invoked by the hosted Worker CI gate; not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/hosted-backend.yml",
+        "scripts/worker-graph-thread-diagnostic.mjs",
+        "test/hosted-backend-process-sampler.test.js"
+      ],
+      "decision": "retain_as_internal_ci_diagnostic",
+      "provenance": null,
+      "provenanceReason": "The read-only workflow diagnostic reads bounded descendant process metadata and emits content-free aggregates; its maintained contracts are the hosted workflow and focused sampler tests. It does not establish performance causality or readiness.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "release_evidence",
       "canonicalPath": "scripts/generate-release-evidence.js",
       "stableAlias": "release:evidence:generate",
@@ -2166,7 +2184,8 @@
         "scripts/smoke-electron-linux-final-lifecycle.mjs",
         "test/electron-linux-startup-diagnostics.test.mjs",
         "test/electron-linux-packaged-container.test.js",
-        "scripts/diagnose-electron-linux-appimage-mount.mjs"
+        "scripts/diagnose-electron-linux-appimage-mount.mjs",
+        "test/authorized-qualification-requests.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2322,7 +2341,8 @@
         "test/electron-linux-final-appimage.test.js",
         "scripts/lib/linux-final-artifact-intake.mjs",
         "test/electron-linux-installed-lifecycle.test.js",
-        "test/electron-linux-installed-files.test.mjs"
+        "test/electron-linux-installed-files.test.mjs",
+        "test/electron-linux-normal-packaged-smoke.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2401,12 +2421,12 @@
       "owner": "electron_packaging",
       "canonicalPath": "scripts/finalize-electron-windows-signing.mjs",
       "stableAlias": null,
-      "stableAliasReason": "Validate one canonical Windows source candidate without writes, then require explicit Azure-signing confirmation for the non-publishing builder pass.",
+      "stableAliasReason": "Read-only canonical Windows source-candidate validation; legacy builder signing and module-preparation modes are retired before side effects.",
       "additionalAliases": [],
       "callers": [
         "test/electron-windows-production-signing.test.js",
         "scripts/rebind-electron-windows-native-modules.mjs",
-        ".github/workflows/electron-windows-signing.yml"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2438,6 +2458,7 @@
       "stableAliasReason": "Inspect or journal one exact Windows candidate, then explicitly rebind verified signed native bytes without changing runtime qualification.",
       "additionalAliases": [],
       "callers": [
+        "scripts/prepare-electron-windows-signing-stage.mjs",
         "test/electron-windows-native-rebinding.test.js",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
         ".github/workflows/electron-windows-signing.yml"
@@ -2485,7 +2506,9 @@
         ".github/workflows/electron-linux-production-package.yml",
         "scripts/qualify-electron-linux-final-appimage.mjs",
         "test/electron-linux-final-appimage.test.js",
-        "scripts/qualify-electron-linux-installed-lifecycle.mjs"
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/prepare-linux-updater-qualification.mjs",
+        "test/electron-linux-updater-qualification.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2502,7 +2525,9 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-real-appimage-updater.test.js",
-        "scripts/smoke-electron-linux-final-lifecycle.mjs"
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/authorized-qualification-requests.test.js",
+        "scripts/prepare-linux-updater-qualification.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2554,6 +2579,7 @@
       "stableAliasReason": "Read-only final installer and updater metadata binding; does not publish or exercise replacement.",
       "additionalAliases": [],
       "callers": [
+        "scripts/sign-electron-linux-update.mjs",
         "scripts/smoke-electron-windows-signed-installed.mjs",
         "test/electron-windows-update-artifacts.test.js",
         ".github/workflows/electron-linux-production-package.yml",
@@ -2997,6 +3023,23 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-final-extraction.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "No-network downloaded AppImage extraction with fixed bounded output and owned-container cleanup; internal qualification support only.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "test/electron-linux-extraction.test.js",
+        "scripts/prepare-linux-updater-qualification.mjs"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/qualify-electron-linux-installed-lifecycle.mjs",
       "stableAlias": null,
       "stableAliasReason": "Manual final-artifact acquisition and preparation with a closed intake; never rebuilds or publishes an application.",
@@ -3124,6 +3167,287 @@
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": ".github/workflows/electron-linux-final-qualification.yml",
       "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/sign-electron-linux-update.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit owner-authorized local Linux publisher signing; no key provisioning or publication.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-linux-update-signing.test.js",
+        "docs/decisions/2026-10-12-linux-update-publisher-authentication.md",
+        "test/helpers/linux-update-publication-fixture.js",
+        "test/electron-linux-qualification-feed.test.js"
+      ],
+      "decision": "retain_as_explicit_linux_update_signing_entrypoint",
+      "provenance": "docs/decisions/2026-10-12-linux-update-publisher-authentication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-successor-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bounded owner-only startup generation and exact-process debugger socket evidence for the two Linux updater qualification entrypoints; no production capability or native launch.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "test/electron-linux-successor-evidence.test.js",
+        "test/electron-linux-installed-lifecycle.test.js"
+      ],
+      "decision": "retain_as_linux_successor_qualification_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/authorized-renderer-fetch.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private bounded qualification requests execute in an already selected authenticated Electron renderer; no credential is exposed to debugger results.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qa-electron-macos-page-parity.mjs",
+        "scripts/qa-electron-macos-real-history.mjs",
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "scripts/smoke-electron-linux.mjs",
+        "scripts/smoke-electron-macos.mjs",
+        "scripts/smoke-electron-windows-normal-candidate.mjs",
+        "test/authorized-qualification-requests.test.js"
+      ],
+      "decision": "retain_as_authenticated_qualification_support",
+      "provenance": "SECURITY.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/owner-authorized-local-read.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private bounded reader for an explicitly selected owner-only standalone dashboard authorization file; never discovers listeners or exposes credentials.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/inspect-dashboard-state.mjs",
+        "test/authorized-qualification-requests.test.js"
+      ],
+      "decision": "retain_as_authenticated_inspection_support",
+      "provenance": "SECURITY.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/private-local-paths.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Shared local-path classifier imported by documentation governance and the generated public-site gate; it is not a command entry point.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-public-release-site.js",
+        "tools/operations/validate-documentation.mjs"
+      ],
+      "decision": "retain_as_internal_tooling_support",
+      "provenance": null,
+      "provenanceReason": "The path policy is exercised by documentation governance and public-site build tests; it has no standalone output artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/windows-signing-subjects.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/windows-signing-toolchain.mjs",
+        "scripts/prepare-electron-windows-signing-stage.mjs",
+        "scripts/sign-electron-windows-subjects.mjs",
+        "test/windows-isolated-signing.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/windows-signing-toolchain.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/sign-electron-windows-subjects.mjs",
+        "test/windows-isolated-signing.test.js",
+        "test/electron-windows-signing-workflow.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/windows-signing-transfer.cjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/prepare-electron-windows-signing-stage.mjs",
+        "apps/electron/electron-builder.release.config.cjs",
+        "config/patches/app-builder-lib@26.15.7.patch",
+        "test/electron-windows-signing-stage.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-electron-windows-signing-stage.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-windows-signing.yml",
+        "test/electron-windows-signing-stage.test.js",
+        "test/electron-windows-signing-workflow.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/sign-electron-windows-subjects.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-windows-signing.yml",
+        ".github/workflows/electron-windows-sign-subjects.yml",
+        "test/windows-isolated-signing.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/windows-signing-egress.ps1",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows signing isolation support; protected signing is separated from unprivileged build and installed qualification.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-windows-sign-subjects.yml",
+        "test/electron-windows-signing-workflow.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-windows-build-bootstrap.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows archive bootstrap; digest admission precedes execution in unprivileged build jobs.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/actions/windows-unprivileged-build/action.yml",
+        "test/windows-build-bootstrap.test.js",
+        "test/electron-windows-signing-workflow.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/expand-windows-build-bootstrap.ps1",
+      "stableAlias": null,
+      "stableAliasReason": "Private source-bound Windows archive bootstrap; digest admission precedes execution in unprivileged build jobs.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/actions/windows-unprivileged-build/action.yml",
+        "test/electron-windows-signing-workflow.test.js"
+      ],
+      "decision": "retain_as_isolated_windows_signing_support",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/linux-qualification-feed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only signed feed and exact packaged source authority admission; transient corruption changes only the explicit negative response stream.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/linux-final-artifact-intake.mjs",
+        "scripts/qualify-electron-linux-installed-lifecycle.mjs",
+        "scripts/prepare-linux-updater-qualification.mjs",
+        "scripts/smoke-electron-linux-final-lifecycle.mjs",
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "test/electron-linux-final-host.test.mjs",
+        "test/electron-linux-qualification-feed.test.js",
+        "test/electron-linux-updater-qualification.test.js",
+        "test/electron-linux-installed-lifecycle.test.js"
+      ],
+      "decision": "retain_as_presigned_linux_qualification_admission",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-linux-updater-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Consumes an existing immutable private AppImage pair and separately owner-signed feed; never signs, rebuilds, or publishes.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-linux-real-appimage-updater.mjs",
+        "test/electron-linux-updater-qualification.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_explicit_postbuild_linux_qualification_preparation",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/worker-graph-thread-diagnostic.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal Linux CI launcher for the fixed Worker graph diagnostic; not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/hosted-backend.yml",
+        "test/worker-graph-thread-diagnostic.test.js"
+      ],
+      "decision": "retain_as_internal_ci_diagnostic",
+      "provenance": null,
+      "provenanceReason": "The fixed launcher runs the complete graph test file and emits bounded content-free aggregates from its owned descendant threads. Its maintained contracts are the hosted workflow and focused launcher tests; these observations do not establish performance causality or release readiness.",
       "legacyPaths": []
     }
   ]

@@ -108,6 +108,7 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
 const WEB_RELEASE_TOOLING_PATHS = new Set([
   "package.json",
   "scripts/build-public-release-site.js",
+  "scripts/lib/private-local-paths.mjs",
   "scripts/lib/electron-public-site.mjs",
   "test/electron-public-site.test.js",
   "packages/i18n/index.js",

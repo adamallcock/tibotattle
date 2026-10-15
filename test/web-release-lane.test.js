@@ -163,6 +163,7 @@ test("web-only scope accepts only committed public source and release controls",
   assert.equal(isAllowedWebReleasePath("apps/web/test/fixtures/unreviewed.js"), false);
   assert.equal(isAllowedWebReleasePath("apps/web/public/unreviewed.js"), false);
   assert.equal(isAllowedWebReleasePath("scripts/preview-public-release-site.js"), true);
+  assert.equal(isAllowedWebReleasePath("scripts/lib/private-local-paths.mjs"), true);
   assert.equal(
     isAllowedWebReleasePath("docs/runbooks/2026-08-17-public-site-local-preview.md"),
     true,

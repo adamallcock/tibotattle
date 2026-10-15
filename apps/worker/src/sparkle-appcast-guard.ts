@@ -1,4 +1,7 @@
 import { ApiError, jsonResponse } from "./errors";
+import { readBoundedRequestBody } from "./bounded-body";
+import { assertAppcastGuardRequestAllowed } from "./admission";
+import { acquireAppcastGuardBodyLease, APPCAST_GUARD_BODY_POLICY } from "./appcast-guard-admission";
 import { sha256, sha256Hex } from "./crypto";
 import stableSparkleReleaseContract from "./sparkle-release-contract.json";
 
@@ -45,7 +48,7 @@ export const SPARKLE_APPCAST_GUARD_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 export const SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS = 300;
 export const SPARKLE_APPCAST_GUARD_NONCE_RETENTION_SECONDS =
-  SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS + 1;
+  (2 * SPARKLE_APPCAST_GUARD_TIMESTAMP_SKEW_SECONDS) + 1;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const NONCE_PATTERN = /^[A-Za-z0-9._~-]{16,128}$/u;
@@ -242,7 +245,7 @@ function base64UrlDecode(value: string): Uint8Array {
   return bytes;
 }
 
-async function readBoundedRequestBody(request: Request): Promise<Uint8Array> {
+function assertRequestBodyHeaders(request: Request): void {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
   if (contentType !== "application/json") invalidRequest();
   const declaredLength = request.headers.get("content-length");
@@ -254,30 +257,6 @@ async function readBoundedRequestBody(request: Request): Promise<Uint8Array> {
     }
   }
   if (!request.body) invalidRequest();
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > SPARKLE_APPCAST_GUARD_MAX_REQUEST_BYTES) {
-        await reader.cancel();
-        throw new ApiError(413, "SPARKLE_APPCAST_GUARD_BODY_TOO_LARGE");
-      }
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
@@ -738,19 +717,16 @@ function canonicalRequest(
   );
 }
 
-async function authenticateRequest(
-  request: Request,
-  body: Uint8Array,
-  token: string,
-  nowEpoch: number,
-  contract: SparkleAppcastGuardContract,
-): Promise<{ nonce: string }> {
+function authenticationHeaders(request: Request, nowEpoch: number): {
+  timestamp: string; nonce: string; signatureBytes: Uint8Array;
+} {
   const timestamp = request.headers.get("x-usage-monitor-release-timestamp");
   const nonce = request.headers.get("x-usage-monitor-release-nonce");
   const signature = request.headers.get("x-usage-monitor-release-signature");
   if (timestamp === null || nonce === null || signature === null
       || !/^\d{1,12}$/u.test(timestamp)
-      || !NONCE_PATTERN.test(nonce)) invalidAuth();
+      || !NONCE_PATTERN.test(nonce)
+      || !/^[A-Za-z0-9_-]{43}$/u.test(signature)) invalidAuth();
   const timestampSeconds = Number(timestamp);
   if (!Number.isSafeInteger(timestampSeconds)
       || Math.abs(Math.floor(nowEpoch / 1000) - timestampSeconds)
@@ -764,6 +740,17 @@ async function authenticateRequest(
     invalidAuth();
   }
   if (signatureBytes.byteLength !== 32) invalidAuth();
+  return { timestamp, nonce, signatureBytes };
+}
+
+async function authenticateRequest(
+  request: Request,
+  body: Uint8Array,
+  token: string,
+  nowEpoch: number,
+  contract: SparkleAppcastGuardContract,
+): Promise<{ nonce: string }> {
+  const { timestamp, nonce, signatureBytes } = authenticationHeaders(request, nowEpoch);
   const bodySha256 = await sha256Hex(body);
   let key: CryptoKey;
   try {
@@ -792,7 +779,9 @@ async function authenticateRequest(
  * Consume the signed nonce before touching R2. D1's unique constraint makes
  * concurrent duplicate requests deterministic; the short TTL keeps this
  * coordination table bounded without introducing a global Durable Object. The
- * extra second retains a nonce through the exact accepted timestamp boundary.
+ * A timestamp can start one skew window in the future and remain acceptable
+ * for another window afterward. Retain the nonce through that entire span,
+ * including its exact final second, rather than only one skew window.
  */
 export async function consumeSparkleAppcastGuardNonce(
   db: D1Database,
@@ -972,6 +961,7 @@ export async function handleSparkleAppcastGuardForContract(
   contract: SparkleAppcastGuardContract,
   nowEpoch = Date.now(),
 ): Promise<Response> {
+  const requestStartedAt = Date.now();
   const requestUrl = new URL(request.url);
   if (requestUrl.pathname !== contract.guardRoute
       || requestUrl.search || requestUrl.hash) {
@@ -989,17 +979,37 @@ export async function handleSparkleAppcastGuardForContract(
       responseHeaders: { allow: "POST" },
     });
   }
-  const body = await readBoundedRequestBody(request);
-  const authentication = await authenticateRequest(
-    request,
-    body,
-    configuration.token,
-    nowEpoch,
-    contract,
-  );
+  // Header screening is cheap and does not authenticate a request. The HMAC
+  // must still cover every body byte before nonce consumption or R2 access.
+  authenticationHeaders(request, nowEpoch);
+  assertRequestBodyHeaders(request);
+  await assertAppcastGuardRequestAllowed(env);
+  const releaseBodyLease = await acquireAppcastGuardBodyLease(env);
+  let body: Uint8Array;
+  let authentication: { nonce: string };
+  try {
+    try {
+      body = await readBoundedRequestBody(
+        request, SPARKLE_APPCAST_GUARD_MAX_REQUEST_BYTES, APPCAST_GUARD_BODY_POLICY,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "BODY_TOO_LARGE") {
+        throw new ApiError(413, "SPARKLE_APPCAST_GUARD_BODY_TOO_LARGE");
+      }
+      throw error;
+    }
+    authentication = await authenticateRequest(
+      request, body, configuration.token,
+      nowEpoch + Math.max(0, Date.now() - requestStartedAt), contract,
+    );
+  } finally {
+    await releaseBodyLease();
+  }
   const db = configuration.nonceDatabase;
   try {
-    await consumeSparkleAppcastGuardNonce(db, authentication.nonce, nowEpoch);
+    await consumeSparkleAppcastGuardNonce(
+      db, authentication.nonce, nowEpoch + Math.max(0, Date.now() - requestStartedAt),
+    );
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");

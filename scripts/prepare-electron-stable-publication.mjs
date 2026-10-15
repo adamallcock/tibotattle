@@ -11,6 +11,7 @@ import { DEPLOYMENT_ENDPOINTS } from '../config/deployment-endpoints.js';
 import { productionElectronCandidatePlan } from './package-electron-production.mjs';
 import { parseWindowsUpdaterYaml, validateWindowsUpdateArtifactMetadata } from './verify-electron-windows-update-artifacts.mjs';
 import { identityDigest, openOperation } from './lib/release-operation.mjs';
+import { createLinuxUpdateVerifier } from '../apps/electron/linux-update-authenticity.js';
 
 export const STABLE_TARGETS = Object.freeze(Object.keys(distribution.PRODUCTION_ELECTRON_TARGETS));
 const HASH = /^[a-f0-9]{64}$/u;
@@ -71,7 +72,11 @@ function validateManifest(manifest, version, artifacts, target) {
   if (!primary?.name.endsWith(extension) || manifest.sha512 !== primary.sha512) fail('MANIFEST_PRIMARY_INVALID');
 }
 
-export async function prepareElectronStablePublication({ artifactRoot, proposal }) {
+// Only this read-only planner accepts an injected authority/clock. Production
+// entrypoints below always use the trust roots embedded in the application.
+export async function prepareElectronStablePublication({ artifactRoot, proposal,
+  linuxUpdateKeys = distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS, now = Date.now }) {
+  if (typeof now !== 'function') fail('ARGUMENT_INVALID');
   const root = await realpath(resolve(artifactRoot));
   if (!exact(proposal, ['schemaVersion', 'sourceRevision', 'version', 'buildNumber', 'targets'])
       || proposal.schemaVersion !== 'tibotattle-electron-stable-publication-v1'
@@ -79,6 +84,7 @@ export async function prepareElectronStablePublication({ artifactRoot, proposal 
       || !Array.isArray(proposal.targets) || proposal.targets.length !== 4
       || proposal.targets.map(t => t.target).sort().join() !== [...STABLE_TARGETS].sort().join()) fail('PROPOSAL_INVALID');
   const targets = [];
+  let sameVersionPredecessors = 0;
   for (const input of proposal.targets) {
     if (!exact(input, ['target', 'sourceCandidate', 'appUpdate', 'manifest', 'artifacts', 'predecessor', 'evidence'])
         || !Array.isArray(input.artifacts) || input.artifacts.length < 1 || input.artifacts.length > 4
@@ -110,27 +116,74 @@ export async function prepareElectronStablePublication({ artifactRoot, proposal 
     const primaryArtifacts = artifacts.filter(a => !a.name.endsWith('.blockmap'));
     validateManifest(manifest, proposal.version, primaryArtifacts, input.target);
     if (input.target === 'win32-x64') validateWindowsUpdateArtifactMetadata({ manifest, appUpdate, installer: primaryArtifacts[0], version: proposal.version });
+    let publisherAuthentication;
+    if (input.target === 'linux-x64') {
+      try {
+        const signed = manifest.tibotattleLinuxUpdate?.manifest;
+        await createLinuxUpdateVerifier({ keys: linuxUpdateKeys, currentVersion: proposal.version,
+          backend: { load: async () => null, save: async () => {} }, now }).authorize(manifest);
+        const primary = primaryArtifacts.find(artifact => artifact.name === manifest.path);
+        if (signed.sha256 !== primary.sha256 || signed.size !== primary.bytes) fail('LINUX_SIGNED_BYTES_MISMATCH');
+        publisherAuthentication = { status: 'signature_verified', keyId: signed.keyId,
+          sequence: signed.sequence, sha256: signed.sha256, bytes: signed.size, expiresAt: signed.expiresAt };
+      } catch (error) {
+        if (error?.code === 'ELECTRON_STABLE_PUBLICATION_LINUX_SIGNED_BYTES_MISMATCH') throw error;
+        fail('LINUX_PUBLISHER_AUTHENTICATION_FAILED');
+      }
+    }
     const evidence = [];
     for (const spec of input.evidence) { const bound = await file(root, spec, 1024 * 1024); evidence.push({ sha256: bound.sha256, bytes: bound.bytes }); }
-    let predecessor = null;
+    let predecessor = null, feedAction = 'replace_feed';
     if (input.predecessor !== null) {
       const old = await file(root, input.predecessor, SMALL, true);
       const parsed = parseWindowsUpdaterYaml(old.contents);
-      if (!distribution.PRODUCTION_ELECTRON_RELEASE_VERSION_PATTERN.test(parsed.version ?? '') || !older(parsed.version, proposal.version)
+      if (!distribution.PRODUCTION_ELECTRON_RELEASE_VERSION_PATTERN.test(parsed.version ?? '')
+          || (parsed.version !== proposal.version && !older(parsed.version, proposal.version))
           || !Array.isArray(parsed.files) || parsed.files.length < 1 || parsed.files.some(f => !leaf(f?.url) || !/^[A-Za-z0-9+/]{86}==$/u.test(f?.sha512 ?? '')) || !leaf(parsed.path)
           || parsed.sha512 !== parsed.files.find(f => f.url === parsed.path)?.sha512 || Object.hasOwn(parsed, 'packages')) fail('PREDECESSOR_INVALID');
       const previousNames = input.target.startsWith('darwin-')
         ? ['zip', 'dmg'].map(ext => `TiboTattle-${parsed.version}-mac-${input.target.slice(7)}.${ext}`)
         : [input.target === 'win32-x64' ? `TiboTattle-${parsed.version}-Windows-x64.exe` : `TiboTattle-${parsed.version}-linux-x86_64.AppImage`];
       if (parsed.path !== previousNames[0] || parsed.files.map(f => f.url).sort().join() !== [...previousNames].sort().join()) fail('PREDECESSOR_INVALID');
+      if (parsed.version === proposal.version) {
+        sameVersionPredecessors += 1;
+        if (input.target === 'linux-x64') {
+          try {
+            const previousSigned = parsed.tibotattleLinuxUpdate?.manifest;
+            const checkedAt = now();
+            if (!Number.isSafeInteger(checkedAt) || checkedAt < 1
+                || !Number.isSafeInteger(previousSigned?.expiresAt) || previousSigned.expiresAt < 2) fail('LINUX_RENEWAL_PREDECESSOR_INVALID');
+            // Exact currently published predecessor bytes are independently
+            // authenticated at their last valid millisecond if already expired.
+            // This is confined to renewal preimages; the new feed must be fresh.
+            const historicalTime = Math.min(checkedAt, previousSigned.expiresAt - 1);
+            await createLinuxUpdateVerifier({ keys: linuxUpdateKeys, currentVersion: proposal.version,
+              backend: { load: async () => null, save: async () => {} }, now: () => historicalTime }).authorize(parsed);
+            validateManifest(parsed, proposal.version, primaryArtifacts, input.target);
+            if (previousSigned.sha256 !== publisherAuthentication.sha256
+                || previousSigned.size !== publisherAuthentication.bytes
+                || previousSigned.sequence >= publisherAuthentication.sequence
+                || previousSigned.expiresAt >= publisherAuthentication.expiresAt
+                || !isDeepStrictEqual(parsed.files, manifest.files)) fail('LINUX_RENEWAL_PREDECESSOR_INVALID');
+            feedAction = 'renew_linux_metadata';
+          } catch { fail('LINUX_RENEWAL_PREDECESSOR_INVALID'); }
+        } else {
+          if (old.sha256 !== manifestFile.sha256 || old.bytes !== manifestFile.bytes) fail('SAME_VERSION_FEED_CHANGED');
+          feedAction = 'preserve_exact_feed';
+        }
+      }
       predecessor = { sha256: old.sha256, bytes: old.bytes, localPath: input.predecessor.path };
     }
     const prefix = new URL(feedURL).pathname.slice(1);
     const object = (a, path) => ({ objectKey: `${prefix}/${a.name}`, localPath: path, sha256: a.sha256, bytes: a.bytes, contentType: mime(a.name), cacheControl: cache(a.name) });
     targets.push({ target: input.target, feedURL, evidence, artifacts: artifacts.map((a, i) => object(a, input.artifacts[i].path)),
-      feed: object(manifestFile, input.manifest.path), predecessor,
+      feed: object(manifestFile, input.manifest.path), predecessor, feedAction,
+      ...(publisherAuthentication ? { publisherAuthentication } : {}),
       rollback: predecessor === null ? 'remove_exact_new_feed_only' : 'restore_exact_predecessor_feed_only' });
   }
+  if (sameVersionPredecessors !== 0 && (sameVersionPredecessors !== 4
+      || targets.find(target => target.target === 'linux-x64').feedAction !== 'renew_linux_metadata'
+      || targets.filter(target => target.target !== 'linux-x64').some(target => target.feedAction !== 'preserve_exact_feed'))) fail('RENEWAL_TARGET_SET_INVALID');
   return { schemaVersion: 'tibotattle-electron-stable-publication-plan-v1', proposalSha256: identityDigest(proposal),
     sourceRevision: proposal.sourceRevision, version: proposal.version, buildNumber: proposal.buildNumber,
     bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket, origin: distribution.PRODUCTION_ELECTRON_UPDATE_ORIGIN,

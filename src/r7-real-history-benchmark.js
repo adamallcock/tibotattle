@@ -73,6 +73,30 @@ const EXECUTED_OPERATIONS = Object.freeze([
   "export_set_verify",
   "complete_set_delete",
 ]);
+
+export class R7RealHistoryLifecycleError extends Error {
+  constructor({ operation, runtimeClass, pass, failureCode } = {}) {
+    if (!EXECUTED_OPERATIONS.includes(operation)
+        || !["pinned_candidate", "compatibility_crosscheck"].includes(runtimeClass)
+        || ![1, 2].includes(pass)) {
+      throw new TypeError("R7 real-history lifecycle failure context is invalid");
+    }
+    const safeFailureCode = typeof failureCode === "string"
+      && /^(?:source_integrity|operation_failed|(?:bundle_verification|claude_callback_lifecycle|export|internal|storage|system)_[a-z0-9_]+)$/u
+        .test(failureCode)
+      ? failureCode
+      : "invalid_worker_failure_code";
+    super(`R7 real-history lifecycle operation failed: operation=${operation}`
+      + ` runtime=${runtimeClass} pass=${pass} reason=${safeFailureCode}`);
+    this.name = "R7RealHistoryLifecycleError";
+    this.code = "r7_real_history_lifecycle";
+    this.operation = operation;
+    this.runtimeClass = runtimeClass;
+    this.pass = pass;
+    this.failureCode = safeFailureCode;
+  }
+}
+
 const ZERO_OPERATION_METRICS = Object.freeze({
   runCount: 0,
   parentElapsedMs: 0,
@@ -210,14 +234,9 @@ export function assertR7RealHistorySourcePlanEligibility(summary) {
   return summary;
 }
 
-function requireCompleted(operation) {
+function requireCompleted(operation, context) {
   if (operation?.status !== "completed") {
-    const failureCode = typeof operation?.failureCode === "string"
-      && /^(?:source_integrity|operation_failed|(?:bundle_verification|claude_callback_lifecycle|export|internal|storage|system)_[a-z0-9_]+)$/u
-        .test(operation.failureCode)
-      ? operation.failureCode
-      : "invalid_worker_failure_code";
-    throw new Error(`R7 real-history lifecycle operation failed: ${failureCode}`);
+    throw new R7RealHistoryLifecycleError({ ...context, failureCode: operation?.failureCode });
   }
   return operation;
 }
@@ -262,6 +281,8 @@ function aggregateMeasuredOperation(operation, filesystem) {
 
 async function runMeasuredWorker(root, config, {
   runtimeExecutable,
+  runtimeClass,
+  pass,
   timeoutMs,
   sourceScan = false,
 }) {
@@ -297,7 +318,12 @@ async function runMeasuredWorker(root, config, {
         + (operationError === null ? "" : `: ${operationError.message}`),
     );
   }
-  return aggregateMeasuredOperation(requireCompleted(operation), filesystem);
+  // Use parent-selected labels, never child-provided operation or runtime text.
+  return aggregateMeasuredOperation(requireCompleted(operation, {
+    operation: config.operation,
+    runtimeClass,
+    pass,
+  }), filesystem);
 }
 
 function deterministicProjection(operation) {
@@ -520,14 +546,14 @@ export async function runR7RealHistoryEvidence({
         sourcePlanBundle,
         secretHex,
         interval,
-        { runtimeExecutable, timeoutMs },
+        { runtimeExecutable, timeoutMs, runtimeClass: provenance.runtimeClass, pass: 1 },
       );
       const second = await runLifecyclePass(
         join(runtimeRoot, "pass-2"),
         sourcePlanBundle,
         secretHex,
         interval,
-        { runtimeExecutable, timeoutMs },
+        { runtimeExecutable, timeoutMs, runtimeClass: provenance.runtimeClass, pass: 2 },
       );
       runtimeEvidence.push({
         provenance,

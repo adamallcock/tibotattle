@@ -785,6 +785,19 @@ function stagingReferences({ productionSnapshot, productionBaselineSnapshot, pro
   return references;
 }
 
+/** The staging driver's production reference set, bound to the shared account and production Worker. */
+export function edgeModeStagingProductionReferences({
+  productionSnapshot, productionBaselineSnapshot, productionPlan, trackedConfig, stagingAccountId,
+} = {}) {
+  trackedDataDatabases(trackedConfig, "STAGING_INPUT_INVALID");
+  const snapshots = productionSnapshots({ productionSnapshot, productionBaselineSnapshot });
+  if (snapshots.some((snapshot) => snapshot.workerName !== EDGE_MODE_PRODUCTION_WORKER_NAME
+      || snapshot.accountId !== stagingAccountId)) fail("STAGING_INPUT_INVALID");
+  return stagingReferences({
+    productionSnapshot: snapshots[0], productionBaselineSnapshot: snapshots[1], productionPlan, trackedConfig,
+  });
+}
+
 function assertStagingIsolation({ snapshot, environment, plan, references }) {
   const refuse = () => fail("STAGING_PRODUCTION_REFERENCE");
   const names = [snapshot.workerName];

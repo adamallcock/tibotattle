@@ -27,6 +27,8 @@ const VOLATILE_RESET_CREDIT_INVENTORY = Symbol(
 const MAX_RESET_CREDIT_DETAILS = 1_024;
 const MAX_RESET_CREDIT_COUNT = 1_000_000;
 const SAFE_RESET_CREDIT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const MIN_RPC_ERROR_CODE = -2_147_483_648;
+const MAX_RPC_ERROR_CODE = 2_147_483_647;
 const RESET_CREDIT_FINGERPRINT_DOMAIN =
   "app-usagemonitor/reset-credit-fingerprint/v1\u0000";
 // The app's Keychain broker announcement names a descriptor in *this*
@@ -176,6 +178,14 @@ function classifyAppServerFailure(error, stderr = "") {
   return "temporary_disconnect";
 }
 
+function boundedRpcErrorCode(value) {
+  return Number.isSafeInteger(value)
+    && value >= MIN_RPC_ERROR_CODE
+    && value <= MAX_RPC_ERROR_CODE
+    ? value
+    : null;
+}
+
 export class CodexAppServerClient extends EventEmitter {
   constructor({ timeoutMs = DEFAULT_TIMEOUT_MS, spawnProcess = spawn } = {}) {
     super();
@@ -239,9 +249,15 @@ export class CodexAppServerClient extends EventEmitter {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) {
-        const error = new CodexAppServerError("request_failed", message.error.message ?? "Codex app-server request failed");
-        error.rpcCode = Number.isInteger(message.error.code) ? message.error.code : null;
+      if (Object.hasOwn(message, "error")) {
+        // Provider error data is untrusted and can contain private session
+        // content, paths, terminal controls, or arbitrarily large strings.
+        // Keep only the bounded numeric code used for one compatibility retry.
+        const error = new CodexAppServerError("request_failed", "Codex app-server request failed");
+        const rpcError = message.error && typeof message.error === "object" && !Array.isArray(message.error)
+          ? message.error
+          : null;
+        error.rpcCode = boundedRpcErrorCode(rpcError?.code);
         pending.reject(error);
       } else pending.resolve(message.result);
       return;

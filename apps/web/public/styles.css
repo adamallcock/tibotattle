@@ -5838,3 +5838,18 @@ html[data-theme="dark"] .quota-tank.stale { --tank-fluid: #8c9a8d; --tank-glow: 
 }
 
 .quota-tank.has-liquid-tank .quota-tank-bottom { margin-top: auto; }
+.local-authorization-dialog {
+  box-sizing: border-box;
+  width: min(32rem, calc(100vw - 2rem));
+  padding: 1.5rem;
+  border: 1px solid #c6c1b8;
+  border-radius: 0.75rem;
+  color: #282620;
+  background: #f5f1e8;
+  font: inherit;
+  line-height: 1.5;
+}
+.local-authorization-dialog::backdrop { background: rgb(0 0 0 / 55%); }
+.local-authorization-dialog h2 { margin-top: 0; font-size: 1.4rem; }
+.local-authorization-dialog button { min-height: 2.75rem; padding: 0.5rem 0.9rem; }
+.local-authorization-dialog [role="status"] { min-height: 1.5em; margin-bottom: 0; }

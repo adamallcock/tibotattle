@@ -25,8 +25,9 @@
  *     divergence, not an observed live override, so the live-settings
  *     receipt never records it;
  *   - every PRODUCTION_VARS key is in wrangler.jsonc or declared origin-only;
- *   - the eight rate limits split into the six edge-tier names and the two
- *     origin-tier limits, whose values must match;
+ *   - the eleven rate limits split into six edge-tier replay names, three
+ *     edge-only operational names, and two origin-tier limits whose values
+ *     must match;
  *   - the Worker's required secrets are the origin's, the edge's or a
  *     round-12 retired sign-in secret (RETIRED_SOCIAL_SIGN_IN_SECRET_NAMES,
  *     never an origin secret), every origin-required secret is the
@@ -221,7 +222,8 @@ function rateLimitFindings(ratelimits) {
       findings.push(`RATE_LIMIT_INVALID:${binding}`);
       continue;
     }
-    if (configuration.EDGE_TIER_RATE_LIMIT_BINDINGS.includes(binding)) continue;
+    if (configuration.EDGE_TIER_RATE_LIMIT_BINDINGS.includes(binding)
+      || configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS.includes(binding)) continue;
     const origin = originByBinding.get(binding);
     if (origin === undefined) {
       findings.push(`RATE_LIMIT_UNCLASSIFIED:${binding}`);
@@ -231,6 +233,9 @@ function rateLimitFindings(ratelimits) {
   }
   for (const binding of configuration.EDGE_TIER_RATE_LIMIT_BINDINGS) {
     if (!seen.has(binding)) findings.push(`EDGE_TIER_RATE_LIMIT_MISSING:${binding}`);
+  }
+  for (const binding of configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS) {
+    if (!seen.has(binding)) findings.push(`EDGE_ONLY_RATE_LIMIT_MISSING:${binding}`);
   }
   for (const binding of originByBinding.keys()) {
     if (!seen.has(binding)) findings.push(`ORIGIN_TIER_RATE_LIMIT_MISSING:${binding}`);
@@ -408,6 +413,12 @@ function doctorReceipt(mutate) {
   return `${JSON.stringify(receipt, null, 2)}\n`;
 }
 
+function doctorProductionRateLimits(mutate) {
+  const wrangler = parse(WRANGLER_TEXT);
+  mutate(wrangler.env.production.ratelimits);
+  return `${JSON.stringify(wrangler, null, 2)}\n`;
+}
+
 const UPLOAD_AUTHORIZATION_LIMIT = [
   "\"name\": \"UPLOAD_AUTHORIZATION_RATE_LIMIT\",",
   "          \"namespace_id\": \"3005\",",
@@ -524,6 +535,50 @@ test("a malformed or repeated rate limit fails, even an edge-tier one", async ()
       "\"name\": \"PUBLIC_READ_RATE_LIMIT\",", "\"name\": 4,"),
   }), ["EDGE_TIER_RATE_LIMIT_MISSING:PUBLIC_READ_RATE_LIMIT", "RATE_LIMIT_INVALID"]);
 });
+
+for (const binding of configuration.EDGE_ONLY_RATE_LIMIT_BINDINGS) {
+  test(`the edge-only ${binding} cannot be removed`, async () => {
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProductionRateLimits((limits) => {
+        const index = limits.findIndex((entry) => entry.name === binding);
+        assert.ok(index >= 0);
+        limits.splice(index, 1);
+      }),
+    }), [`EDGE_ONLY_RATE_LIMIT_MISSING:${binding}`]);
+  });
+
+  test(`the edge-only ${binding} cannot be renamed to an unclassified binding`, async () => {
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProductionRateLimits((limits) => {
+        const entry = limits.find((candidate) => candidate.name === binding);
+        assert.ok(entry);
+        entry.name = `${binding}_V2`;
+      }),
+    }), [`EDGE_ONLY_RATE_LIMIT_MISSING:${binding}`, `RATE_LIMIT_UNCLASSIFIED:${binding}_V2`]);
+  });
+
+  test(`the edge-only ${binding} must have a valid limit and period`, async () => {
+    for (const simple of [{ limit: "60", period: 60 }, { limit: 60, period: 0 }, {}]) {
+      assert.deepEqual(await driftOfTempCopy({
+        wranglerText: doctorProductionRateLimits((limits) => {
+          const entry = limits.find((candidate) => candidate.name === binding);
+          assert.ok(entry);
+          entry.simple = simple;
+        }),
+      }), [`RATE_LIMIT_INVALID:${binding}`]);
+    }
+  });
+
+  test(`the edge-only ${binding} cannot be duplicated`, async () => {
+    assert.deepEqual(await driftOfTempCopy({
+      wranglerText: doctorProductionRateLimits((limits) => {
+        const entry = limits.find((candidate) => candidate.name === binding);
+        assert.ok(entry);
+        limits.push(structuredClone(entry));
+      }),
+    }), [`RATE_LIMIT_DUPLICATE:${binding}`]);
+  });
+}
 
 test("the staging plane's closed posture matches the staging Worker's", async () => {
   assert.deepEqual(await driftOfTempCopy({

@@ -188,7 +188,7 @@ const NOTIFICATION_PERMISSION_MESSAGE_KEYS = Object.freeze({
 });
 
 const UPDATE_STATUS_LABELS = Object.freeze({
-  unavailable: "Update checks are unavailable in this development build.",
+  unavailable: "Update checks are unavailable in this build.",
   ready: "Updates are ready to check.",
   checking: "Checking the signed update feed…",
   available: "A signed update is available.",

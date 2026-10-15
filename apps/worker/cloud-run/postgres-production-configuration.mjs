@@ -193,6 +193,16 @@ export const EDGE_TIER_RATE_LIMIT_BINDINGS = Object.freeze(
   EDGE_TIER_RATE_LIMIT_NAMES.map((name) => `${name}_RATE_LIMIT`),
 );
 
+/**
+ * Operational admission enforced only at the edge. These limits are neither
+ * replayed through the admission wire contract nor injected into the origin.
+ */
+export const EDGE_ONLY_RATE_LIMIT_BINDINGS = Object.freeze([
+  "PUBLIC_PROBE_RATE_LIMIT",
+  "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+  "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+]);
+
 /** Identity-keyed limits the origin enforces in PostgreSQL. */
 export const ORIGIN_TIER_RATE_LIMITS = Object.freeze({
   UPLOAD_AUTHORIZATION: Object.freeze({

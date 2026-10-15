@@ -119,7 +119,10 @@
       { "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT", "namespace_id": "4005", "simple": { "limit": 3000, "period": 60 } },
       { "name": "UPLOAD_PRINCIPAL_RATE_LIMIT", "namespace_id": "4006", "simple": { "limit": 3000, "period": 60 } },
       { "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", "namespace_id": "4007", "simple": { "limit": 3000, "period": 60 } },
-      { "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "namespace_id": "4008", "simple": { "limit": 3000, "period": 60 } }
+      { "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "namespace_id": "4008", "simple": { "limit": 3000, "period": 60 } },
+      { "name": "PUBLIC_PROBE_RATE_LIMIT", "namespace_id": "4009", "simple": { "limit": 60, "period": 60 } },
+      { "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "namespace_id": "4010", "simple": { "limit": 12, "period": 60 } },
+      { "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT", "namespace_id": "4012", "simple": { "limit": 60, "period": 60 } }
     ],
     "load": [
       { "name": "ENROLLMENT_RATE_LIMIT", "namespace_id": "4001", "simple": { "limit": 20, "period": 60 } },
@@ -129,7 +132,10 @@
       { "name": "UPLOAD_AUTHORIZATION_RATE_LIMIT", "namespace_id": "4005", "simple": { "limit": 3000, "period": 60 } },
       { "name": "UPLOAD_PRINCIPAL_RATE_LIMIT", "namespace_id": "4006", "simple": { "limit": 3000, "period": 60 } },
       { "name": "UPLOAD_INGRESS_REQUEST_RATE_LIMIT", "namespace_id": "4007", "simple": { "limit": 12000, "period": 60 } },
-      { "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "namespace_id": "4008", "simple": { "limit": 12000, "period": 60 } }
+      { "name": "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "namespace_id": "4008", "simple": { "limit": 12000, "period": 60 } },
+      { "name": "PUBLIC_PROBE_RATE_LIMIT", "namespace_id": "4009", "simple": { "limit": 60, "period": 60 } },
+      { "name": "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "namespace_id": "4010", "simple": { "limit": 12, "period": 60 } },
+      { "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT", "namespace_id": "4012", "simple": { "limit": 60, "period": 60 } }
     ]
   }
 }

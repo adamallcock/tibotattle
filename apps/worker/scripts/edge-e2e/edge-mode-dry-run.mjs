@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { parse } from "jsonc-parser";
 import { bundleExportNames, EDGE_E2E_WORKER_ROOT, wranglerEnvironment } from "./edge-bundle.mjs";
+import { EDGE_TIER_BINDINGS, OPERATIONAL_BINDINGS } from "./edge-instances.mjs";
 import {
   applyEdgeModeOverlay,
   applyEdgeModeSnapshotDelta,
@@ -137,6 +138,15 @@ export function dryRunViolations(results) {
     if (result.modeVar !== result.mode) violations.push(`${result.mode}: mode var ${result.modeVar}`);
     if (JSON.stringify(result.exports) !== JSON.stringify(MAIN_MODULE_EXPORTS)) {
       violations.push(`${result.mode}: main-module exports ${result.exports.join(",")}`);
+    }
+    if (EDGE_TIER_BINDINGS.some((name) => !result.ratelimits.includes(name))) {
+      violations.push(`${result.mode}: an edge rate-limit binding is missing`);
+    }
+    if (OPERATIONAL_BINDINGS.some((name) => !result.ratelimits.includes(name))) {
+      violations.push(`${result.mode}: an operational rate-limit binding is missing`);
+    }
+    if (!result.durableObjects.includes("UPLOAD_INGRESS_BUDGET")) {
+      violations.push(`${result.mode}: the Durable Object binding is missing`);
     }
     const storage = [...result.d1, ...result.r2];
     if (result.mode === "gcp") {

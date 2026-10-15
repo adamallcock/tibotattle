@@ -23,7 +23,7 @@ worker/parent metadata from `state_5.sqlite`. For a `guardian_review` row only,
 it reads the first bounded `session_meta` header from the selected,
 owner-controlled session to verify that row's explicit parent UUID. It never
 reads prompt-bearing `threads.title`, first messages, or source transcripts.
-The endpoint requires the local custom header, refuses foreign origins and
+The endpoint requires the private launch capability and local custom marker, refuses foreign origins and
 query strings, returns `no-store`, and does not persist its response or modify
 the source databases. Missing metadata does not fail an accounting refresh. See the
 [accepted local-link boundary](../../docs/decisions/2026-08-30-local-cache-drop-thread-links.md).
@@ -377,17 +377,48 @@ delivery paused.
 
 The complete route-by-route inventory lives in the maintained
 [TiboTattle API surface reference](../../docs/reference/api-surface.md).
-It covers all local companion paths, fixed report routes, the credential-free
+It covers all local companion paths, fixed report routes, the public-data
 central relay, and the separately allowlisted participant relay. A source-parity
 test fails if an exact route allowlist changes without the reference changing
 with it.
 
-Local mutations require the exact same origin and
-`X-Usage-Monitor-Local: 1`; handlers with bodies additionally enforce closed
-JSON contracts. Detailed reports and browser assets use fixed allowlists.
+Every private API and fixed report requires an unguessable per-launch caller
+capability. Electron retains it in the main process, supplies the companion
+through inherited FD5, and attaches it only to requests from its trusted local
+windows. The standalone macOS/Linux development dashboard uses an explicitly
+selected owner-only `private/dashboard-access.json` launch file from the local
+state directory; it expires after fifteen minutes and is removed on orderly
+shutdown. The capability stays in memory, outside URLs, markup and browser
+storage. Windows standalone file bootstrap is unavailable until owner-only ACL
+creation is qualified; Electron's private pipe remains supported.
+
+Mutations additionally use a fifteen-second, one-use authorization bound to
+their exact method and path, obtained from `POST /api/local/authorization` by
+the authenticated caller. The exact same origin, existing
+`X-Usage-Monitor-Local: 1` markers and closed JSON/body limits remain enforced.
+Detailed reports and browser assets use fixed allowlists.
 Every API response is `no-store`, and no CORS permission is emitted. The
 companion's `/api/local/contribution/sync-next` operation is `POST`; use the
 canonical reference rather than retaining a partial route list here.
+
+The standalone operator diagnostic command likewise requires explicit owner
+bootstrap:
+
+```sh
+pnpm diagnose:dashboard -- --authorization-file <owner-selected-state-root>/private/dashboard-access.json
+```
+
+It does not scan
+ports or treat a configured origin as authorization. Electron qualification
+tools use the already authenticated trusted renderer; an unavailable renderer
+is an unobserved readiness result, never a passing health check. Fixed report
+pages also require an authenticated request; direct unauthenticated report
+navigation returns 403.
+
+This boundary excludes other browser origins and callers without the private
+credential. It does not isolate arbitrary unsandboxed same-user code that can
+read the owner's files or trusted process memory. Native or installed-client
+qualification is distinct from source and synthetic loopback tests.
 
 ## Development identity override
 

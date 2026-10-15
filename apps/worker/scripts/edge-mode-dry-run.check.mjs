@@ -12,6 +12,7 @@ const RATE_LIMITS = Object.freeze([
   "CLIENT_ATTEMPT_RATE_LIMIT", "ENROLLMENT_RATE_LIMIT", "PUBLIC_READ_RATE_LIMIT", "RECOVERY_RATE_LIMIT",
   "UPLOAD_AUTHORIZATION_RATE_LIMIT", "UPLOAD_INGRESS_CLIENT_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
   "UPLOAD_PRINCIPAL_RATE_LIMIT",
+  "PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
 ]);
 
 function passingResults() {
@@ -37,6 +38,7 @@ test("the three candidates follow the overlay along worker -> fenced -> gcp", as
     const production = config.env.production;
     assert.equal(production.main, "src/edge-entry.ts", mode);
     assert.equal(production.vars.EDGE_UPSTREAM_MODE, mode, mode);
+    assert.deepEqual(production.ratelimits.map((limit) => limit.name).sort(), [...RATE_LIMITS].sort(), mode);
   }
   const bindings = (config) => (config.env.production.d1_databases ?? []).map((database) => database.binding).sort();
   assert.deepEqual(bindings(candidates.worker), ["ANALYTICS_DB", "DELETION_LEDGER", "USAGE_MONITOR_DB"]);
@@ -46,7 +48,7 @@ test("the three candidates follow the overlay along worker -> fenced -> gcp", as
 
 test("the checked-in main is unchanged: only the typed overlay names the edge entry", async () => {
   const candidates = await edgeModeCandidates();
-  for (const config of Object.values(candidates)) assert.equal(config.main, "src/index.ts");
+  for (const config of Object.values(candidates)) assert.equal(config.main, "src/cloudflare-entry.ts");
 });
 
 test("a passing result set has no violation", () => {
@@ -73,6 +75,16 @@ test("each broken property is reported", () => {
     const results = passingResults();
     mutate(results);
     assert.ok(dryRunViolations(results).includes(expected), expected);
+  }
+});
+
+test("every mode requires each operational rate-limit binding separately from the six edge purposes", () => {
+  for (const index of [0, 1, 2]) {
+    for (const name of ["PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT"]) {
+      const results = passingResults();
+      results[index].ratelimits = results[index].ratelimits.filter((binding) => binding !== name);
+      assert.deepEqual(dryRunViolations(results), [`${results[index].mode}: an operational rate-limit binding is missing`], name);
+    }
   }
 });
 

@@ -27,6 +27,21 @@
     "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY": "ITd8MScUmLiMB0ulDrDdAn4ofHp0e6UxTkXbpK8DSvQ=",
     "SPARKLE_APPCAST_GUARD_PUBLIC_ED_KEY_SHA256": "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2"
   },
+  "ratelimits": [
+    {
+      "name": "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+      "namespace_id": "4011",
+      "simple": { "limit": 60, "period": 60 }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "UPLOAD_INGRESS_BUDGET", "class_name": "UploadIngressBudget" }
+    ]
+  },
+  "migrations": [
+    { "tag": "appcast-guard-body-budget-v1", "new_sqlite_classes": ["UploadIngressBudget"] }
+  ],
   "r2_buckets": [
     {
       "binding": "SPARKLE_RELEASES",

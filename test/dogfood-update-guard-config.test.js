@@ -35,6 +35,17 @@ test("dogfood guard deployment matches the reviewed release channel", async () =
 
   assert.equal(config.main, "src/dogfood-update-guard.ts");
   assert.equal(config.workers_dev, false);
+  assert.deepEqual(config.ratelimits, [{
+    name: "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+    namespace_id: "4011",
+    simple: { limit: 60, period: 60 },
+  }]);
+  assert.deepEqual(config.durable_objects.bindings, [{
+    name: "UPLOAD_INGRESS_BUDGET", class_name: "UploadIngressBudget",
+  }]);
+  assert.deepEqual(config.migrations, [{
+    tag: "appcast-guard-body-budget-v1", new_sqlite_classes: ["UploadIngressBudget"],
+  }]);
   assert.deepEqual(config.routes, [{
     pattern: new URL(channel.sparkle.atomicGuardURL).hostname,
     custom_domain: true,

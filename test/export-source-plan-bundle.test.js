@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFile, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isProxy } from "node:util/types";
@@ -64,9 +64,25 @@ function rehashBundle(bundle) {
   return bundle;
 }
 
-async function frozenFixture() {
+async function frozenFixture({ claudeSourceCount = 1 } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-frozen-bundle-private-")));
   const fixture = await createR7StructuralFixture(root);
+  if (claudeSourceCount > 1) {
+    const records = (await readFile(join(fixture.paths.claudeProjectsDirectory, "session.jsonl"), "utf8"))
+      .trimEnd().split("\n").map((line) => JSON.parse(line));
+    for (let sourceIndex = 1; sourceIndex < claudeSourceCount; sourceIndex += 1) {
+      const additionalRecords = records.map((record, messageIndex) => ({
+        ...record,
+        sessionId: `r7-bundle-source-${sourceIndex}`,
+        message: { ...record.message, id: `r7-bundle-source-${sourceIndex}-message-${messageIndex}` },
+      }));
+      await writeFile(
+        join(fixture.paths.claudeProjectsDirectory, `session-${sourceIndex}.jsonl`),
+        `${additionalRecords.map((record) => JSON.stringify(record)).join("\n")}\n`,
+        { mode: 0o600 },
+      );
+    }
+  }
   const planningGuard = guard();
   const bundle = await createExportSourcePlanBundle({
     startAt: R7_FIXTURE_START_AT,
@@ -198,6 +214,180 @@ test("bundle final verification still rejects a mutated prefix after successful 
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }
+});
+
+test("bundle validates the complete Claude plan before using independently verified source views", async (t) => {
+  const value = await frozenFixture({ claudeSourceCount: 3 });
+  try {
+    for (const [name, mutate] of [
+      ["source count", (plan) => { plan.sourceCount += 1; }],
+      ["total bytes", (plan) => { plan.totalBytes += 1; }],
+      ["global plan digest", (plan) => { plan.planSha256 = "0".repeat(64); }],
+      ["later source selection digest", (plan) => { plan.sources.at(-1).selectionSha256 = "0".repeat(64); }],
+    ]) {
+      await t.test(name, async () => {
+        const bundle = structuredClone(value.bundle);
+        mutate(bundle.claudeTranscriptPlan);
+        rehashBundle(bundle);
+        await assert.rejects(resolveExportSourcePlanBundle(bundle, planningOptions(value.paths)), (error) => {
+          assert.equal(error.code, "export_source_plan_bundle_integrity");
+          assert.deepEqual(exportSourcePlanBundleFailureContext(error), {
+            operation: "verify", source: "claude_transcript", reason: "claude_transcript_export_plan_invalid",
+          });
+          assert.equal(error.message.includes(value.root), false);
+          return true;
+        });
+      });
+    }
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("bundle still verifies every later Claude source frozen prefix", async () => {
+  const value = await frozenFixture({ claudeSourceCount: 3 });
+  try {
+    const sources = value.bundle.claudeTranscriptPlan.sources;
+    const visited = [];
+    const context = isolatedBundleContext({
+      claudeTranscriptExport: {
+        async verifyClaudeTranscriptExportSource(plan, sourceKey, options) {
+          visited.push(sourceKey);
+          return pipeline.claudeTranscriptExport.verifyClaudeTranscriptExportSource(plan, sourceKey, options);
+        },
+      },
+    });
+    const handle = await open(sources.at(-1).path, "r+");
+    try { await handle.write(Buffer.from("X"), 0, 1, 0); } finally { await handle.close(); }
+    await assert.rejects(context.resolveExportSourcePlanBundle(value.bundle, planningOptions(value.paths)), (error) => {
+      assert.equal(error.code, "export_source_plan_bundle_integrity");
+      assert.deepEqual(context.exportSourcePlanBundleFailureContext(error), {
+        operation: "verify", source: "claude_transcript", reason: "claude_transcript_export_source_changed",
+      });
+      assert.equal(error.message.includes(value.root), false);
+      return true;
+    });
+    assert.deepEqual(visited, sources.map((source) => source.sourceKey));
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("bundle verifies an owned snapshot and refuses rehashed caller mutations during an await", async (t) => {
+  for (const mutation of ["replace full plan", "mutate nested selection in place"]) {
+    await t.test(mutation, async () => {
+      const value = await frozenFixture({ claudeSourceCount: 3 });
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      let pending;
+      try {
+        const originalSourceKeys = value.bundle.claudeTranscriptPlan.sources.map((source) => source.sourceKey);
+        const originalCommitment = value.bundle.sourcePlanBundleSha256;
+        const verified = [];
+        const context = isolatedBundleContext({
+          claudeTranscriptExport: {
+            async verifyClaudeTranscriptExportSource(plan, sourceKey, options) {
+              if (verified.length === 0) {
+                entered.resolve();
+                await resume.promise;
+              }
+              const result = await pipeline.claudeTranscriptExport.verifyClaudeTranscriptExportSource(plan, sourceKey, options);
+              verified.push(sourceKey);
+              return result;
+            },
+          },
+        });
+        const resourceGuard = guard();
+        pending = context.resolveExportSourcePlanBundle(value.bundle, planningOptions(value.paths, resourceGuard));
+        await Promise.race([
+          entered.promise,
+          pending.then(() => assert.fail("verification returned before reaching the Claude source boundary")),
+        ]);
+        if (mutation === "replace full plan") {
+          value.bundle.claudeTranscriptPlan = pipeline.claudeTranscriptExport.sliceClaudeTranscriptExportSourcePlan(
+            value.bundle.claudeTranscriptPlan,
+            originalSourceKeys.at(-1),
+            { secret: R7_FIXTURE_SECRET },
+          );
+        } else {
+          // A shallow source view would retain this selection object and fail
+          // before finishing the remaining real prefix verifications.
+          value.bundle.claudeTranscriptPlan.sources.at(-1).selections[0].costEventCount += 1;
+        }
+        rehashBundle(value.bundle);
+        assert.notEqual(value.bundle.sourcePlanBundleSha256, originalCommitment);
+        resume.resolve();
+        await assert.rejects(pending, (error) => {
+          assert.equal(error.code, "export_source_plan_bundle_integrity");
+          assert.equal(error.message, "Local export source-plan bundle failed (integrity)");
+          return true;
+        });
+        assert.deepEqual(verified, originalSourceKeys, "caller changes must not alter the owned verification pass");
+        assert.equal(resourceGuard.snapshot().counters.sourceFiles, 0, "refused bundles must not charge accepted source totals");
+        assert.equal(resourceGuard.snapshot().counters.sourceBytes, 0);
+      } finally {
+        resume.resolve();
+        await pending?.catch(() => {});
+        await rm(value.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("bundle Claude validation metadata work grows linearly and preserves output and source accounting", async () => {
+  async function measuredResolve(sourceCount) {
+    const value = await frozenFixture({ claudeSourceCount: sourceCount });
+    try {
+      const sourceKeys = value.bundle.claudeTranscriptPlan.sources.map((source) => source.sourceKey);
+      const selections = value.bundle.claudeTranscriptPlan.sources.reduce((sum, source) => sum + source.selections.length, 0);
+      assert.equal(sourceKeys.length, sourceCount);
+      assert.equal(selections, sourceCount * 2, "each synthetic source must exercise selection validation");
+      let metadataEntries = 0;
+      const verified = [];
+      const observeMetadata = (plan) => {
+        metadataEntries += plan.sources.length
+          + plan.sources.reduce((sum, source) => sum + source.selections.length, 0);
+      };
+      const context = isolatedBundleContext({
+        claudeTranscriptExport: {
+          sliceClaudeTranscriptExportSourcePlans(plan, options) {
+            observeMetadata(plan);
+            return pipeline.claudeTranscriptExport.sliceClaudeTranscriptExportSourcePlans(plan, options);
+          },
+          async verifyClaudeTranscriptExportSource(plan, sourceKey, options) {
+            observeMetadata(plan);
+            const result = await pipeline.claudeTranscriptExport.verifyClaudeTranscriptExportSource(plan, sourceKey, options);
+            verified.push(sourceKey);
+            return result;
+          },
+        },
+      });
+      const resourceGuard = guard();
+      const observedPlans = [];
+      const observeSourcePlan = resourceGuard.observeSourcePlan.bind(resourceGuard);
+      resourceGuard.observeSourcePlan = (sourceFiles, sourceBytes) => {
+        observedPlans.push({ sourceFiles, sourceBytes });
+        observeSourcePlan(sourceFiles, sourceBytes);
+      };
+      const expected = await resolveExportSourcePlanBundle(value.bundle, planningOptions(value.paths));
+      const actual = await context.resolveExportSourcePlanBundle(value.bundle, planningOptions(value.paths, resourceGuard));
+      assert.deepEqual(actual, expected);
+      assert.deepEqual(verified, sourceKeys, "every frozen source must pass the real prefix verifier exactly once");
+      assert.deepEqual(observedPlans, [{
+        sourceFiles: value.planningUsage.counters.sourceFiles,
+        sourceBytes: value.planningUsage.counters.sourceBytes,
+      }]);
+      assert.equal(resourceGuard.snapshot().counters.sourceFiles, value.planningUsage.counters.sourceFiles);
+      assert.equal(resourceGuard.snapshot().counters.sourceBytes, value.planningUsage.counters.sourceBytes);
+      assert.ok(metadataEntries <= 4 * (sourceCount + selections), "full-plan metadata must not be revalidated per source");
+      return metadataEntries;
+    } finally {
+      await rm(value.root, { recursive: true, force: true });
+    }
+  }
+  const smaller = await measuredResolve(4);
+  const larger = await measuredResolve(8);
+  assert.equal(larger, smaller * 2, "doubling sources and selections must exactly double validation metadata work");
 });
 
 test("bundle create and verify contexts identify the actual owning catch stage", async (t) => {

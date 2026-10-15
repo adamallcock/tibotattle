@@ -305,7 +305,8 @@ export function productionElectronCandidatePlan({
         TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: rehearsalNextVersion,
       }),
     }),
-    updaterEnabled: !accountlessSignedStagingRehearsal,
+    updaterEnabled: !accountlessSignedStagingRehearsal
+      && (targetSpec.platform !== "linux" || distribution.PRODUCTION_ELECTRON_LINUX_UPDATE_KEYS.length > 0),
     signingRequired: targetSpec.platform !== "linux",
     signingPerformed: false,
     publishingPerformed: false,

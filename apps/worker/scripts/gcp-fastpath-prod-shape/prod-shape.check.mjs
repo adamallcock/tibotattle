@@ -26,6 +26,12 @@ const stubPricer = (event) => ({ coverageStatus: "fully_priced",
   costNanousd: 1 + event.components.inputUncachedTokens + event.components.outputTextTokens });
 const owner = (key) => PROD_SHAPE_ROSTER.find((entry) => entry.key === key);
 
+function requireZsh() {
+  const probe = spawnSync("zsh", ["-c", "zmodload zsh/datetime"], { encoding: "utf8" });
+  assert.ifError(probe.error);
+  assert.equal(probe.status, 0, "production-tier checks require zsh with zsh/datetime");
+}
+
 test("the roster reproduces OWN-3: 54 eligible owners, the routing mix and every window threshold", () => {
   const summary = prodShapeSummary(1);
   assert.equal(PROD_SHAPE_ROSTER.length, OWN3_COUNTS.eligibleOwners);
@@ -258,7 +264,8 @@ test("the cloud measurement script reaches the cloud only through the deploy wra
   assert.match(code, /if \[\[ ! -f "\$OUT\/refresh\/refresh\.json" \]\]; then/u);
   assert.match(code, /if \[\[ "\$OUTCOME" == "LOCK_HELD" \]\]; then/u);
   const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
-  if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
+  assert.ifError(zsh.error);
+  assert.equal(zsh.status, 0, zsh.stderr);
 });
 
 // The production-tier measurement (MEAS-SYNTH, K-CORE-A round): its own
@@ -322,7 +329,8 @@ test("the production-tier script reaches only its measurement instance, through 
   assert.match(code, /^print -r -- \$\$ > "\$OUT\/pid"$/mu);
   assert.doesNotMatch(code, /pkill/u);
   const zsh = spawnSync("zsh", ["-n", path], { encoding: "utf8" });
-  if (zsh.error?.code !== "ENOENT") assert.equal(zsh.status, 0, zsh.stderr);
+  assert.ifError(zsh.error);
+  assert.equal(zsh.status, 0, zsh.stderr);
 });
 
 // MEAS-SYNTH review (2026-10-03): zsh runs a trap only once a FOREGROUND
@@ -330,8 +338,8 @@ test("the production-tier script reaches only its measurement instance, through 
 // 48 h cap) left the instance running until the child ended. The script's own
 // child/tree/stop functions, run here around a stand-in step that holds a
 // grandchild, must tear down at once and leave no process behind.
-test("the production-tier script's signal handling tears down at once and leaves no child running", async (t) => {
-  if (spawnSync("zsh", ["-c", "true"]).error?.code === "ENOENT") return t.skip("zsh is not installed");
+test("the production-tier script's signal handling tears down at once and leaves no child running", async () => {
+  requireZsh();
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
   const definition = (name) => {
     const lines = source.split("\n");
@@ -369,15 +377,18 @@ test("the production-tier script's signal handling tears down at once and leaves
 ` +
     `  fi; print -r -- "$found"; }`;
   const finishingHarness = sampledHarness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`, "D() { /bin/sleep 0.5; }");
+  // Node's captured stdio is not a reopenable /dev/stdout or /dev/stderr
+  // file on Linux. Duplicate it before child() redirects to its regular log;
+  // descendants retain fds 3/4, so the output-pipe closure check remains real.
   const rootResistantHarness = harness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`,
     `D() { trap '' TERM; /bin/sh "${join(dir, "resistant.sh")}"; }`)
-    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr D x");
+    .replace(`child "${join(dir, "step.log")}" - D x`, `child "${join(dir, "step.log")}" - D x 3>&1 4>&2`);
   const descendantResistantHarness = rootResistantHarness.replace("D() { trap '' TERM;", "D() {");
   const resistantCompletionHarness = finishingHarness.replace(
     `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "owned.sh")}"; }`,
-    `pgstat() { touch '${samplerFile}'; child /dev/stdout /dev/stderr /bin/sh "${join(dir, "resistant.sh")}"; }`);
+    `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "resistant.sh")}" 3>&1 4>&2; }`);
   const captureFailureHarness = harness.replace("trap teardown EXIT", "pgrep() { return 2; }\ntrap teardown EXIT")
-    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr /bin/sleep 30");
+    .replace(`child "${join(dir, "step.log")}" - D x`, `child "${join(dir, "step.log")}" - /bin/sleep 30 3>&1 4>&2`);
   const captureCompletionFailureHarness = finishingHarness
     .replace(definition("sampler"), "sampler() { exec /bin/sleep 30; }")
     .replace("SAMPLER=$!", `SAMPLER=$!; print -r -- $SAMPLER >> '${ownedFile}'`)
@@ -394,10 +405,12 @@ test("the production-tier script's signal handling tears down at once and leaves
   const unrelated = spawn("/bin/sleep", ["30"], { detached: true, stdio: "ignore" });
   const unrelatedExit = new Promise(resolveExit => unrelated.on("exit", resolveExit));
   try {
-    for (const [signal, script] of [["SIGTERM", harness], ["SIGINT", harness], ["SIGHUP", harness],
-      ["SIGTERM", sampledHarness], ["SIGTERM", racingHarness], [null, finishingHarness],
-      ["SIGTERM", rootResistantHarness], ["SIGTERM", descendantResistantHarness], [null, resistantCompletionHarness],
-      ["SIGTERM", captureFailureHarness], [null, captureCompletionFailureHarness]]) {
+    for (const [variant, signal, script] of [["step-term", "SIGTERM", harness], ["step-int", "SIGINT", harness],
+      ["step-hup", "SIGHUP", harness], ["active-sampler", "SIGTERM", sampledHarness],
+      ["racing-sampler", "SIGTERM", racingHarness], ["step-completion", null, finishingHarness],
+      ["root-term-resistant", "SIGTERM", rootResistantHarness], ["descendant-term-resistant", "SIGTERM", descendantResistantHarness],
+      ["resistant-sampler-completion", null, resistantCompletionHarness],
+      ["capture-failure-signal", "SIGTERM", captureFailureHarness], ["capture-failure-completion", null, captureCompletionFailureHarness]]) {
       rmSync(ownedFile, { force: true });
       rmSync(samplerFile, { force: true });
       const shell = spawn("zsh", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -407,44 +420,44 @@ test("the production-tier script's signal handling tears down at once and leaves
       const closed = new Promise((resolveClose) => shell.on("close", resolveClose));
       const exited = new Promise((resolveExit) => shell.on("exit", (code) => resolveExit(code)));
       try {
-        assert.equal(running(unrelated.pid), true, "unrelated owned sentinel is visible");
+        assert.equal(running(unrelated.pid), true, `${variant}: unrelated owned sentinel is visible`);
         const started = Date.now();
         const captureFailed = script === captureFailureHarness || script === captureCompletionFailureHarness;
         const minimumPids = script === captureFailureHarness ? 1 : script === captureCompletionFailureHarness ? 2 : 3;
         while (ownedPids().length < minimumPids && Date.now() - started < 5_000) await delay();
-        assert.equal(ownedPids().length >= minimumPids, true, "the exact owned step started");
+        assert.equal(ownedPids().length >= minimumPids, true, `${variant}: the exact owned step started`);
         if (script === sampledHarness) {
           while (ownedPids().length < 6 && Date.now() - started < 5_000) await delay();
-          assert.equal(ownedPids().length >= 6, true, "the exact owned sampler started");
+          assert.equal(ownedPids().length >= 6, true, `${variant}: the exact owned sampler started`);
         }
         // A refused ps read must fail this gate, never look like successful
         // cleanup. Prove visibility and group ownership while children live.
         for (const pid of ownedPids()) {
-          assert.equal(running(pid), true, "exact owned child is visible before cleanup");
+          assert.equal(running(pid), true, `${variant}: exact owned child is visible before cleanup`);
           const group = spawnSync("ps", ["-p", String(pid), "-o", "pgid="], { encoding: "utf8" });
-          assert.equal(group.status, 0, "owned process group is readable");
-          assert.equal(Number(group.stdout.trim()), shell.pid, "owned child belongs to the isolated harness group");
+          assert.equal(group.status, 0, `${variant}: owned process group is readable`);
+          assert.equal(Number(group.stdout.trim()), shell.pid, `${variant}: owned child belongs to the isolated harness group`);
         }
         const signalled = Date.now();
         if (signal !== null) shell.kill(signal);
         const code = await Promise.race([exited, new Promise((_, reject) => {
-          const timer = setTimeout(() => reject(new Error(`${signal}: teardown exceeded 5 seconds`)), 5_000);
+          const timer = setTimeout(() => reject(new Error(`${variant}: teardown exceeded 5 seconds`)), 5_000);
           timer.unref();
         })]);
-        assert.ok(Date.now() - signalled < 5_000, `${signal}: the shell exited at once`);
-        assert.equal(code, script === captureCompletionFailureHarness ? 1 : signal === null ? 0 : 130, signal);
+        assert.ok(Date.now() - signalled < 5_000, `${variant}: the shell exited at once`);
+        assert.equal(code, script === captureCompletionFailureHarness ? 1 : signal === null ? 0 : 130, `${variant}: expected cancellation or completion status`);
         assert.match(output, script === captureCompletionFailureHarness ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nMEAS_LOCAL_PROCESS_CLEANUP_FAILED\nteardown \d+\.\d\n$/u
           : captureFailed ? /^MEAS_LOCAL_PROCESS_CAPTURE_FAILED\nteardown \d+\.\d\n$/u
           : signal === null ? /^finished\nteardown \d+\.\d\n$/u : /^teardown \d+\.\d\n$/u,
-          `${signal}: teardown ran with the expected step outcome`);
+          `${variant}: teardown ran with the expected step outcome`);
         await Promise.race([closed, new Promise((_, reject) => {
-          const timer = setTimeout(() => reject(new Error("owned descendants retained output pipes")), 5_000);
+          const timer = setTimeout(() => reject(new Error(`${variant}: owned descendants retained output pipes`)), 5_000);
           timer.unref();
         })]);
-        assert.ok(Date.now() - signalled < 5_000, "exit and held output pipes close within the existing teardown bound");
+        assert.ok(Date.now() - signalled < 5_000, `${variant}: exit and held output pipes close within the existing teardown bound`);
         await new Promise((wake) => setTimeout(wake, 300));
-        assert.deepEqual(ownedPids().filter(running), [], `${signal} ${script === racingHarness ? "racing sampler" : script === sampledHarness ? "active sampler" : "step"}: no orphaned exact-owned step or sampler`);
-        assert.equal(running(unrelated.pid), true, "cleanup preserves an unrelated process group");
+        assert.deepEqual(ownedPids().filter(running), [], `${variant}: no orphaned exact-owned step or sampler`);
+        assert.equal(running(unrelated.pid), true, `${variant}: cleanup preserves an unrelated process group`);
       } finally {
         // detached:true gives this one harness its own process group. Cleanup
         // targets only that exact group, including escaped descendants, never
@@ -576,6 +589,56 @@ test("matrix adapter shares effective settings with guard and all profiler proje
     "--worker-profile-source", "a".repeat(40)]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
 });
 
+test("native time adapters select explicit BSD or GNU measurement and refuse unsupported platforms", async () => {
+  const { measurementTimeArguments, parseMeasurementTime } = await import("./measure-local.mjs");
+  assert.deepEqual(measurementTimeArguments("darwin"), ["-l"]);
+  assert.deepEqual(measurementTimeArguments("linux"), ["-f",
+    "MEAS_SYNTH_TIME_V1 rss_kib=%M real_seconds=%e user_seconds=%U sys_seconds=%S"]);
+  for (const platform of ["win32", "freebsd", "unknown"]) {
+    assert.throws(() => measurementTimeArguments(platform), { code: "MEAS_SYNTH_PLATFORM_UNSUPPORTED" });
+    assert.throws(() => parseMeasurementTime("", platform), { code: "MEAS_SYNTH_PLATFORM_UNSUPPORTED" });
+  }
+});
+
+test("native time adapters preserve BSD bytes and convert GNU peak RSS KiB to bytes", async () => {
+  const { parseMeasurementTime } = await import("./measure-local.mjs");
+  assert.deepEqual(parseMeasurementTime("child diagnostic\n        1.25 real         0.50 user         0.12 sys\n"
+    + "             2097152  maximum resident set size\n             3145728  peak memory footprint\n", "darwin"),
+  { maxResidentSetBytes: 2097152, peakMemoryFootprintBytes: 3145728, realSeconds: 1.25, userSeconds: 0.5, sysSeconds: 0.12 });
+  assert.deepEqual(parseMeasurementTime("child diagnostic\nMEAS_SYNTH_TIME_V1 rss_kib=2048 real_seconds=1.25 user_seconds=0.50 sys_seconds=0.12\n", "linux"),
+    { maxResidentSetBytes: 2097152, peakMemoryFootprintBytes: null, realSeconds: 1.25, userSeconds: 0.5, sysSeconds: 0.12 });
+  for (const platform of ["darwin", "linux"]) {
+    const zero = platform === "darwin" ? "0 real 0 user 0 sys\n0 maximum resident set size\n"
+      : "MEAS_SYNTH_TIME_V1 rss_kib=0 real_seconds=0 user_seconds=0 sys_seconds=0\n";
+    assert.deepEqual(parseMeasurementTime(zero, platform),
+      { maxResidentSetBytes: 0, peakMemoryFootprintBytes: null, realSeconds: 0, userSeconds: 0, sysSeconds: 0 });
+  }
+});
+
+test("native time adapters keep absent, ambiguous, invalid and unsafe measurements unavailable", async () => {
+  const { parseMeasurementTime } = await import("./measure-local.mjs");
+  const unavailable = { maxResidentSetBytes: null, peakMemoryFootprintBytes: null,
+    realSeconds: null, userSeconds: null, sysSeconds: null };
+  for (const platform of ["darwin", "linux"]) {
+    for (const text of ["", "diagnostic only", "1048576 maximum resident set size suffix"]) {
+      assert.deepEqual(parseMeasurementTime(text, platform), unavailable);
+    }
+    for (const value of ["-1", "NaN", "Infinity", "1.2.3", "1e3", "9".repeat(400)]) {
+      const text = platform === "darwin"
+        ? `${value} real ${value} user ${value} sys\n${value} maximum resident set size\n${value} peak memory footprint\n`
+        : `MEAS_SYNTH_TIME_V1 rss_kib=${value} real_seconds=${value} user_seconds=${value} sys_seconds=${value}\n`;
+      assert.deepEqual(parseMeasurementTime(text, platform), unavailable);
+    }
+    const valid = platform === "darwin" ? "1 real 1 user 1 sys\n1024 maximum resident set size\n2048 peak memory footprint\n"
+      : "MEAS_SYNTH_TIME_V1 rss_kib=1 real_seconds=1 user_seconds=1 sys_seconds=1\n";
+    assert.deepEqual(parseMeasurementTime(valid + valid, platform), unavailable);
+  }
+  assert.equal(parseMeasurementTime("9007199254740992 maximum resident set size\n", "darwin").maxResidentSetBytes, null);
+  assert.equal(parseMeasurementTime("MEAS_SYNTH_TIME_V1 rss_kib=8796093022208 real_seconds=0 user_seconds=0 sys_seconds=0\n", "linux").maxResidentSetBytes, null);
+  assert.equal(parseMeasurementTime("MEAS_SYNTH_TIME_V1 rss_kib=8796093022207 real_seconds=0 user_seconds=0 sys_seconds=0\n", "linux").maxResidentSetBytes,
+    8796093022207 * 1024);
+});
+
 test("matrix adapter actual refresh and guard children receive identical matrix settings and resource env", async () => {
   const { parseArguments, runRefresh, guardProbe, refreshMeasurementIdentity } = await import("./measure-local.mjs");
   const dir = mkdtempSync(join(tmpdir(), "matrix-launch-test-"));
@@ -594,6 +657,11 @@ nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
     const refresh = await runRefresh({ ...common, outDir: dir, label: "synthetic-refresh" });
     const guard = await guardProbe({ ...common, waitMs: 5_000 });
     assert.equal(refresh.exitCode, 0, readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"));
+    assert.ok(Number.isSafeInteger(refresh.time.maxResidentSetBytes) && refresh.time.maxResidentSetBytes > 0);
+    for (const field of ["realSeconds", "userSeconds", "sysSeconds"]) {
+      assert.ok(Number.isFinite(refresh.time[field]) && refresh.time[field] >= 0, field);
+    }
+    if (process.platform === "linux") assert.equal(refresh.time.peakMemoryFootprintBytes, null);
     assert.equal(guard.exitCode, 0);
     assert.equal(guard.outcome, "exited");
     assert.deepEqual(refresh.receipt, guard.receipt);
@@ -737,6 +805,7 @@ test("local Worker profiling projection is explicit and paired with exact source
 // receipts must not turn failed local cleanup into a successful measurement;
 // ordinary refresh refusal codes must still remain data.
 test("real production-tier callers abort cleanup failures independently of refresh receipt outcomes", async () => {
+  requireZsh();
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "run-prodtier-measurement.sh"), "utf8");
   const definition = name => {
     const lines = source.split("\n"), start = lines.findIndex(line => line.startsWith(`${name}() {`));

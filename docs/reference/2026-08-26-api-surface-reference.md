@@ -39,7 +39,7 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 33 paths, 35 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 35 paths, 37 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 11 paths, 11 method/path operations |
@@ -142,9 +142,17 @@ fixed report mapping in
 The packaged companion binds only to `127.0.0.1` on an ephemeral port. It
 rejects non-loopback peers, unexpected `Host` values, unknown API paths, and
 unexpected query strings. Responses are `no-store`; the server emits no CORS
-permission. Non-`GET` local mutations require the same origin and the fixed
-`X-Usage-Monitor-Local: 1` header; handlers that accept bodies additionally
-enforce their closed JSON shape and byte ceiling.
+permission. Every private API/report request requires a random per-launch
+`X-TiboTattle-Local-Capability` credential supplied by the trusted host.
+Non-`GET` local mutations also require a fifteen-second one-use method/path
+authorization, the same origin and the fixed `X-Usage-Monitor-Local: 1` header;
+handlers that accept bodies additionally enforce their closed JSON shape and
+byte ceiling. Static assets never contain a capability. Electron keeps it in
+the main process and an inherited pipe. The macOS/Linux standalone development
+browser requires explicit selection of an owner-only, fifteen-minute launch
+file, whose contents stay in memory. Windows external-browser bootstrap is
+unavailable pending qualified ACL creation. Unsandboxed same-user code that can
+already read owner files or trusted process memory is outside this boundary.
 
 `GET /api/local/timeline/window-breakdown` accepts only `from` and `to` as
 bounded base-ten safe integers. `GET /api/local/model-performance` requires
@@ -159,6 +167,8 @@ Codex accounting snapshot.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `POST` | `/api/local/authorization` | Authenticated same-origin caller obtains a bounded, one-use authorization for an exact mutation method/path |
+| `POST` | `/api/local/authorization/browser-bootstrap` | Explicit trusted browser-open action creates a short-lived owner-only unlock file on macOS/Linux; no credential in the response |
 | `GET` | `/api/local/health` | Companion readiness, refresh state, schema versions, and configured capabilities |
 | `GET` | `/api/local/desktop-status` | Closed lifecycle plus a current direct display allowance from bounded published-overview metadata; strict v2 notification evidence remains receipt-only. Available before the first snapshot and without account identifiers or filesystem paths. |
 | `GET` | `/api/local/diagnostics/contribution` | Closed, path-free contribution support diagnostics for the native shell |
@@ -293,6 +303,13 @@ It forwards only the allowlisted cookie and CSRF headers and rejects incoming
 design; provider callbacks go directly to the hosted Worker and are never
 relayed through loopback.
 
+All relayed calls require the private local launch capability, and mutations
+also require the local operation authorization. Session-authenticated routes
+normally forward only the caller's actual cookie. Successful enrollment can
+return an opaque thirty-second, one-use continuation for that same authorized
+caller and ceremony's exact next device-pairing POST. It never overrides an
+existing cookie or authenticates session reads, consent or logout.
+
 | Method | Path | Relay role |
 |---|---|---|
 | `POST` | `/api/v1/enroll` | Consume a short-lived identity proof and establish participation |
@@ -353,8 +370,8 @@ Authority vocabulary:
 
 | Method | Path | Authority | Purpose |
 |---|---|---|---|
-| `GET` | `/api/health` | Public | Service posture and declared capabilities; not dependency readiness |
-| `GET` | `/api/ready` | Public | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
+| `GET` | `/api/health` | Public, dedicated probe admission | Service posture and declared capabilities; not lifecycle readiness |
+| `GET` | `/api/ready` | Public, dedicated probe admission | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
 | `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the separately configured enrollment gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
 | `POST` | `/api/v1/accountless/ownership` | Accountless ownership | Prove the active enrolled device secret, then atomically create one installation owner, credential and versioned v1.1 upload authorization, or return the same existing receipt when accountless ownership is enabled; reject ambient sessions and revoked/expired enrollment without creating social consent or public-fit eligibility |
@@ -471,8 +488,8 @@ sequenceDiagram
   UI->>Local: POST /api/v1/enroll
   Local->>Worker: Establish hardened web session
   Worker-->>Local: Session cookie and bounded projection
-  Local-->>UI: Loopback session bridge
-  UI->>Local: POST /api/v1/me/device-pairings
+  Local-->>UI: One-use enrollment continuation
+  UI->>Local: POST /api/v1/me/device-pairings + continuation
   Local->>Worker: Fixed session relay
   Worker-->>Local: One-use pairing code
   Local-->>UI: Closed relay response
@@ -508,8 +525,8 @@ no Cloudflare resource credential is exposed to the Worker for these calls.
 | `DELETION_LEDGER` (D1) | Separate deletion/audit ledger | Segregated deletion evidence |
 | `QUARANTINE` (R2) | Encrypted contribution object quarantine and reconciliation | Payload objects; production and non-production buckets are distinct |
 | `SPARKLE_RELEASES` (R2, production) | Exact appcast and signed update artifacts | Release objects; guarded writer only |
-| `UPLOAD_INGRESS_BUDGET` (Durable Object) | Global token-bucket and concurrent-upload leases | Stores opaque short-lived lease IDs and content-free denial counters |
-| Eight rate-limit bindings | Enrollment, recovery, per-client, public reads, upload authorization/principal/request/client | Route-class abuse controls |
+| `UPLOAD_INGRESS_BUDGET` (Durable Object namespace) | Separate named upload, appcast-body, health and ready token/lease budgets | Stores opaque short-lived lease IDs and content-free denial counters; budgets never share state |
+| Eleven rate-limit bindings | Enrollment, recovery, per-client, public reads, upload authorization/principal/request/client, public probe coarse/client, appcast coarse | Route-class abuse controls |
 | `ASSETS` via `ASSETS.fetch(request)` | Manifest-verified public/admin static output | Non-API fallback after exact route classification |
 | `scheduled(controller, env, ctx)` | Minute cron for optional GitHub release snapshots, hourly admin metrics, identity/device/deletion purges, retention, object reconciliation, and community aggregate rebuilds | Background runtime entrypoint, not an HTTP route |
 
@@ -518,6 +535,14 @@ The exact production rate-limit binding names are:
 - Identity and public reads: `ENROLLMENT_RATE_LIMIT`,
   `RECOVERY_RATE_LIMIT`, `CLIENT_ATTEMPT_RATE_LIMIT`, and
   `PUBLIC_READ_RATE_LIMIT`.
+- Operational reads: `PUBLIC_PROBE_RATE_LIMIT` and
+  `PUBLIC_PROBE_CLIENT_RATE_LIMIT`, using separate health/readiness keys before
+  any backend probe, followed by separate globally coordinated health/ready
+  budgets (two concurrent chains each, 15-second response deadline); denied
+  requests and admitted probe failures do not persist D1 diagnostics.
+- Release writes: `SPARKLE_APPCAST_GUARD_RATE_LIMIT`, before the dedicated
+  Durable Object body lease and bounded reader (2 MiB, 5 seconds idle,
+  15 seconds total). HMAC, nonce and conditional-write controls still apply.
 - Upload issuance and ingress: `UPLOAD_AUTHORIZATION_RATE_LIMIT`,
   `UPLOAD_PRINCIPAL_RATE_LIMIT`, `UPLOAD_INGRESS_REQUEST_RATE_LIMIT`, and
   `UPLOAD_INGRESS_CLIENT_RATE_LIMIT`.
@@ -536,7 +561,8 @@ participant capability.
 
 The separate dogfood Worker exposes only the guarded
 `POST /api/v1/internal/release/appcast` contract on its configured guard host,
-with its own D1 replay ledger and R2 bucket. It does not inherit the participant
+with its own D1 replay ledger, R2 bucket, coarse rate limiter and body-budget
+Durable Object namespace. It does not inherit the participant
 or community route registry.
 
 ## 5. Native, browser, and child-process APIs

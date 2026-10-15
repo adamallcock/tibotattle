@@ -38,7 +38,9 @@ import {
   EDGE_MODE_ADMISSION_BINDINGS,
   EDGE_ORIGIN_CONTRACT_PATH,
   EDGE_PRIVACY_TOPOLOGY_MARKER,
+  PRODUCTION_EDGE_MODE_OVERLAY,
   PRODUCTION_EDGE_MODE_PIN_SCHEMA,
+  createEdgeModeConfigTools,
   createFenceHistorySource,
   createGcloudIdentityTokenSource,
   createProductionDeploymentHistoryReader,
@@ -682,6 +684,36 @@ function prepareInput({ repository, workerDirectory, baseline, mode, sourceCommi
   };
 }
 
+test("edge config tools retain the production overlay and reject malformed adapters before preparation", async () => {
+  const trackedConfig = tracked();
+  const snapshot = workerLive();
+  const base = {
+    createSnapshot: createProductionLiveConfigSnapshot,
+    render: renderProductionLiveConfig,
+    verify: verifyProductionLiveConfig,
+  };
+  const tools = createEdgeModeConfigTools({ mode: "worker", trackedConfig, base });
+  const candidateConfig = tools.render({ trackedConfig, snapshot, sourceCommit: SOURCE });
+  assert.equal(PRODUCTION_EDGE_MODE_OVERLAY.target, "production");
+  assert.deepEqual(tools.expectedSnapshot(snapshot), applyEdgeModeSnapshotDelta({ snapshot, mode: "worker", trackedConfig }));
+  assert.equal(tools.verify({ snapshot, candidateConfig, sourceCommit: SOURCE }).ok, true);
+  assert.throws(() => tools.render({ trackedConfig: { ...trackedConfig, name: "other" }, snapshot, sourceCommit: SOURCE }),
+    (error) => error.code === "EDGE_MODE_INPUT_INVALID");
+  for (const overlay of [null, {}, { ...PRODUCTION_EDGE_MODE_OVERLAY, target: "other" },
+    { ...PRODUCTION_EDGE_MODE_OVERLAY, config: null }, { ...PRODUCTION_EDGE_MODE_OVERLAY, expected: null }]) {
+    assert.throws(() => createEdgeModeConfigTools({ mode: "worker", trackedConfig, base, overlay }),
+      (error) => error.code === "EDGE_MODE_INPUT_INVALID");
+    assert.deepEqual(await prepareEdgeModeDeployment({ edgeMode: "worker", overlay }),
+      { ok: false, code: "EDGE_MODE_INPUT_INVALID" });
+  }
+  for (const renderTrackedConfig of [null, [], "invalid"]) {
+    assert.throws(() => createEdgeModeConfigTools({ mode: "worker", trackedConfig, base, renderTrackedConfig }),
+      (error) => error.code === "EDGE_MODE_INPUT_INVALID");
+    assert.deepEqual(await prepareEdgeModeDeployment({ edgeMode: "worker", renderTrackedConfig }),
+      { ok: false, code: "EDGE_MODE_INPUT_INVALID" });
+  }
+});
+
 test("an edge deploy's source must descend from the live DEPLOYMENT_SOURCE_COMMIT (local git)", async () => {
   const repository = await syntheticRepository();
   const workerDirectory = await trackedCheckout();
@@ -923,6 +955,44 @@ test("gcp refuses a live baseline missing any of the six edge-tier Rate Limiting
     assertNotStarted(result, harness, "EDGE_MODE_ADMISSION_BINDING_MISSING");
     assert.equal(harness.calls.snapshots, 0, name);
     assert.deepEqual(harness.calls.origin, [], name);
+  }
+});
+
+test("gcp refuses missing operational admission before obtaining origin credentials", async () => {
+  for (const name of ["PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT", "UPLOAD_INGRESS_BUDGET"]) {
+    let credentials = 0;
+    const harness = await gcpHarness({
+      baseline: dropBindings(fencedLive(), [name]),
+      overrides: { obtainOriginIdentityToken: async () => { credentials += 1; return SYNTHETIC_TOKEN; } },
+    });
+    assertNotStarted(await observeDeployment(harness), harness, "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_NOT_PROVISIONED");
+    assert.equal(credentials, 0, name);
+    assert.equal(harness.calls.snapshots, 0, name);
+    assert.deepEqual(harness.calls.origin, [], name);
+  }
+});
+
+test("gcp refuses operational admission drift before obtaining origin credentials", async () => {
+  for (const mutate of [
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT").simple.limit = 61; },
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_CLIENT_RATE_LIMIT").simple.limit = 13; },
+    (rows) => { rows.find((entry) => entry.name === "SPARKLE_APPCAST_GUARD_RATE_LIMIT").simple.period = 10; },
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT").namespace_id = "9004"; },
+    (rows) => { rows.find((entry) => entry.name === "UPLOAD_INGRESS_BUDGET").script_name = "foreign-worker"; },
+    (rows) => { rows.find((entry) => entry.name === "UPLOAD_INGRESS_BUDGET").environment = "production"; },
+  ]) {
+    let credentials = 0;
+    const live = fencedLive();
+    const bindings = structuredClone(live.bindings);
+    mutate(bindings);
+    const harness = await gcpHarness({
+      baseline: resnapshot(live, { bindings }),
+      overrides: { obtainOriginIdentityToken: async () => { credentials += 1; return SYNTHETIC_TOKEN; } },
+    });
+    assertNotStarted(await observeDeployment(harness), harness, "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_INVALID");
+    assert.equal(credentials, 0);
+    assert.equal(harness.calls.snapshots, 0);
+    assert.deepEqual(harness.calls.origin, []);
   }
 });
 

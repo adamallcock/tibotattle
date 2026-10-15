@@ -232,15 +232,13 @@ test("measured control-plane fetch ignores a backward wall-clock correction", as
       wallClockMs -= 10_000;
       return value;
     };
-    globalThis.fetch = async () => {
+    globalThis.fetch = async () => { throw new Error("Node fetch is not authorized"); };
+    const cdp = { evaluate: async () => {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
-      return {
-        status: 200,
-        ok: true,
-        json: async () => ({ status: "ready" }),
-      };
-    };
+      return { status: 200, body: JSON.stringify({ status: "ready" }) };
+    } };
     const measured = await fetchJsonMeasured(
+      cdp,
       new URL("http://127.0.0.1:1/api/local/health"),
       100,
     );
@@ -255,6 +253,33 @@ test("measured control-plane fetch ignores a backward wall-clock correction", as
     Date.now = originalDateNow;
     globalThis.fetch = originalFetch;
   }
+});
+
+test("measured control-plane fetch preserves refusal status and never returns refused response content", async () => {
+  const measured = await fetchJsonMeasured(
+    { evaluate: async () => ({ status: 403, body: JSON.stringify({ error: "private-refusal-canary" }) }) },
+    new URL("http://127.0.0.1:1/api/local/health"),
+    100,
+  );
+  assert.equal(measured.status, 403);
+  assert.equal(measured.body, null);
+  assert.ok(!JSON.stringify(measured).includes("private-refusal-canary"));
+  const malformed = await fetchJsonMeasured(
+    { evaluate: async () => ({ status: 200, body: "private-invalid-json-canary" }) },
+    new URL("http://127.0.0.1:1/api/local/health"),
+    100,
+  );
+  assert.equal(malformed.status, 200);
+  assert.equal(malformed.body, null);
+  assert.ok(!JSON.stringify(malformed).includes("private-invalid-json-canary"));
+  const disconnected = await fetchJsonMeasured(
+    { evaluate: async () => { throw new Error("private-transport-canary"); } },
+    new URL("http://127.0.0.1:1/api/local/refresh"),
+    100,
+  );
+  assert.equal(disconnected.status, null);
+  assert.equal(disconnected.body, null);
+  assert.ok(!JSON.stringify(disconnected).includes("private-transport-canary"));
 });
 
 test("real-history launch gates classify raw timeout and setup errors without exposing them", async () => {
@@ -1868,8 +1893,10 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /The profile is private and persistent/u);
   assert.match(source, /no teardown removes it/u);
   assert.match(source, /AbortController/u);
-  assert.match(source, /X-Usage-Monitor-Local/u);
-  assert.match(source, /fetchJson\(healthUrl, REAL_HISTORY_QA_TIMEOUTS\.healthMs\)/u);
+  assert.match(source, /fetchRendererJson, fetchRendererJsonResponse.*authorized-renderer-fetch/u);
+  assert.match(source, /fetchRendererJson\(session\.cdp, healthUrl, \{ timeoutMs: REAL_HISTORY_QA_TIMEOUTS\.healthMs \}\)/u);
+  assert.match(source, /fetchJsonMeasured\(session\.cdp, healthUrl, requestTimeoutMs\)/u);
+  assert.match(source, /fetchJsonMeasured\(session\.cdp, refreshUrl, requestTimeoutMs\)/u);
   assert.match(source, /refreshIdChanged: true/u);
   assert.match(source, /refreshId,/u);
   assert.match(source, /profileIsolated: true/u);

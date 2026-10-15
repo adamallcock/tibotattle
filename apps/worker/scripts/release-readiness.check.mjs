@@ -346,6 +346,29 @@ test("a 404 appcast is explicitly not published and never ready", async () => {
   assert.equal(JSON.stringify(result).includes(SECRET), false);
 });
 
+test("probe throttling is distinct from backend failure and does not trigger immediate retries", async () => {
+  const calls = [];
+  const result = await verifyReleaseReadiness({
+    endpointConsumerCheck,
+    probePublic: true,
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      if (String(url).endsWith("/api/health") || String(url).endsWith("/api/ready")) {
+        return jsonResponse({ error: { code: "ATTEMPT_LIMIT_REACHED" } }, 429);
+      }
+      return appcastResponse();
+    },
+    clock: fixedClock(),
+  });
+  assert.equal(result.status, "not_ready");
+  assert.equal(result.public.health.code, "HEALTH_PROBE_THROTTLED");
+  assert.equal(result.public.ready.code, "READY_PROBE_THROTTLED");
+  assert.equal(result.public.health.retryAfterSeconds, 60);
+  assert.equal(result.public.ready.retryAfterSeconds, 60);
+  assert.equal(calls.filter((url) => url.endsWith("/api/health")).length, 1);
+  assert.equal(calls.filter((url) => url.endsWith("/api/ready")).length, 1);
+});
+
 test("a structurally valid 503 ready response is reported as not ready", async () => {
   const result = await verifyReleaseReadiness({
     endpointConsumerCheck,

@@ -340,6 +340,25 @@ reconciliation. Opt-out stops future uploads and retains accepted history.
 The loopback companion is not a general proxy. It forwards only fixed routes
 and bounded headers listed in [`api-surface.md`](./api-surface.md).
 
+All private local API/report reads require a random per-launch caller
+capability. Electron keeps that credential in its main process and inherited
+companion pipe; the macOS/Linux standalone development dashboard explicitly
+reads a short-lived owner-only launch file into memory. No credential enters
+URLs, markup, browser storage or diagnostics. Same-origin and one-use
+method/path authorization also protect mutations. This does not isolate
+unsandboxed code already able to read the same user's protected files or trusted
+process memory. Windows external-browser bootstrap remains unavailable pending
+qualified ACL creation; its Electron private-pipe path remains available.
+
+The retained participant relay never lends a session to an ordinary caller
+without that caller's session cookie. Only successful enrollment can issue a
+short-lived, one-use continuation for that same authorized caller's next
+device-pairing operation. The cookie stays inside the companion.
+
+Codex app-server failures use fixed local error categories; raw provider error
+text is omitted from CLI diagnostics, with only bounded numeric compatibility
+codes retained transiently.
+
 ## Hosted lifetimes and deletion behavior
 
 These current source constants describe credential/control windows, not a

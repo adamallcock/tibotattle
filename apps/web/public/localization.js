@@ -120,6 +120,7 @@ export const WEB_MESSAGES = Object.freeze({
       || key === "community.allowance.planOwnWeekChartDescription"
       || key === "community.allowance.basisTransition"
       || key.startsWith("allowance.")
+      || key.startsWith("localAuthorization.")
       || key.startsWith("trends.")
       || key.startsWith("contribution.")
       || key.startsWith("continuityConsent.")

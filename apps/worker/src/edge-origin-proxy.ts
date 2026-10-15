@@ -15,8 +15,8 @@
  *    paths on the apex, a method outside the route registry, community/daily
  *    while PUBLIC_ANALYTICS_MODE is not 'enabled'), serves the Sparkle guard
  *    with guardEnv, or forwards it. Local classes and the guard go to the
- *    unchanged handleRequest and never touch a limiter, the token source or
- *    the upstream.
+ *    unchanged handleRequest and never touch the token source or the upstream.
+ *    The Sparkle guard spends its own edge-local admission budgets.
  * 2. A forwarded admin-host request first passes the same Access chokepoint
  *    handleRequest runs (verifyAdminAccessAssertion, then authorizeAdminEmail).
  *    A refusal is rendered as handleRequest's catch renders it, without the
@@ -31,8 +31,11 @@
  *    whose body is forwarded is refused locally with 413 BODY_TOO_LARGE before
  *    any budget is spent. Anything else about the header is the origin's to
  *    judge. A body is never buffered.
- * 5. Address-keyed admission runs here (evaluateEdgeAdmission); only its
- *    purpose and outcome travel to the origin.
+ * 5. Health and readiness spend their own edge-local coarse/client and
+ *    concurrent-work budgets before token or forwarding work. Their deadline
+ *    fences prevent a late token from starting a request. Other address-keyed
+ *    admission runs here (evaluateEdgeAdmission); only its purpose and outcome
+ *    travel to the origin. Probe admission creates no wire admission purpose.
  * 6. The upstream request carries only the contract's allowlisted client
  *    headers, the contract headers, the edge-minted ID token and x-real-ip
  *    set to the constant EDGE_SUBREQUEST_REAL_IP. This module never sets a
@@ -52,6 +55,7 @@
  */
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { adminHostname, canonicalPublicRedirectUrl } from "./admin-ui";
+import { assertPublicProbeAllowed } from "./admission";
 import { JSON_HEADERS } from "./constants";
 import {
   cloudflareDistributionFromSegments,
@@ -80,6 +84,7 @@ import {
 import type { EdgeHostKind, EdgeOriginConfiguration } from "./edge-origin-contract";
 import { ApiError, errorResponse } from "./errors";
 import { publicAnalyticsEnabled } from "./public-analytics-gate";
+import { runPublicProbe } from "./public-probe-admission";
 import { matchWorkerRoute } from "./route-registry";
 import type {
   ExactWorkerRouteId,
@@ -211,6 +216,14 @@ export interface EdgeProxyLogger {
  */
 export type EdgeProxyFetcher = (request: Request) => Promise<Response>;
 
+/** Only the edge-local authority needed for public operational probes. */
+export type EdgePublicProbeEnv = Readonly<Pick<Env,
+  "PUBLIC_PROBE_RATE_LIMIT" | "PUBLIC_PROBE_CLIENT_RATE_LIMIT" | "UPLOAD_INGRESS_BUDGET"
+> & {
+  ENVIRONMENT: "production";
+  IDENTITY_LINK_SECRET: string;
+}>;
+
 export interface EdgeOriginProxyOptions {
   /** From parseEdgeOriginConfiguration; re-validated here. */
   readonly config: EdgeOriginConfiguration;
@@ -227,6 +240,8 @@ export interface EdgeOriginProxyOptions {
   readonly clientKeySecret: string;
   /** Read by binding name only, through evaluateEdgeAdmission. */
   readonly limiters: EdgeAdmissionLimiters;
+  /** Absent or malformed capability fails closed on health/readiness only. */
+  readonly publicProbeEnv?: EdgePublicProbeEnv;
   /** The Cloudflare analytics zone and token, or null outside production. */
   readonly distribution: EdgeDistributionConfiguration | null;
   /** Defaults to the global fetch, resolved at call time and called unbound. */
@@ -688,12 +703,47 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
     hostKind: EdgeHostKind,
   ): Promise<Response> {
     const requestId = crypto.randomUUID();
-    const url = new URL(request.url);
-
     if (hostKind === "admin") {
       const refusal = await adminChokepointRefusal(request, localEnv, requestId, routeId);
       if (refusal !== null) return refusal;
     }
+
+    if (routeId === "health" || routeId === "ready") {
+      try {
+        const probeEnv = options.publicProbeEnv;
+        if (!probeEnv || probeEnv.ENVIRONMENT !== "production"
+            || probeEnv.IDENTITY_LINK_SECRET !== clientKeySecret
+            || typeof probeEnv.PUBLIC_PROBE_RATE_LIMIT?.limit !== "function"
+            || typeof probeEnv.PUBLIC_PROBE_CLIENT_RATE_LIMIT?.limit !== "function"
+            || typeof probeEnv.UPLOAD_INGRESS_BUDGET?.getByName !== "function") {
+          throw new ApiError(503, "ADMISSION_CONFIGURATION_INVALID");
+        }
+        // These existing helpers accept Env, but use only this validated,
+        // narrow capability. No origin identity, storage or account authority
+        // is added to the edge-local probe environment.
+        const env = probeEnv as Env;
+        await assertPublicProbeAllowed(request, env, routeId);
+        return await runPublicProbe(env, routeId, (assertActive) =>
+          forwardAdmitted(request, routeId, hostKind, requestId, assertActive));
+      } catch (error) {
+        return noStore(errorResponse(
+          error instanceof ApiError ? error : new ApiError(500, "INTERNAL_ERROR"),
+          requestId,
+        ));
+      }
+    }
+    return forwardAdmitted(request, routeId, hostKind, requestId);
+  }
+
+  async function forwardAdmitted(
+    request: Request,
+    routeId: ExactWorkerRouteId,
+    hostKind: EdgeHostKind,
+    requestId: string,
+    assertActive?: () => void,
+  ): Promise<Response> {
+    assertActive?.();
+    const url = new URL(request.url);
 
     // The Worker refuses these before its limiter from the request alone, so
     // the edge answers them before it spends any budget (d43c8f92 order).
@@ -718,6 +768,7 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       clientKeySecret,
     });
 
+    assertActive?.();
     let segments: Promise<SegmentsResult> | null = null;
     if (distribution !== null && hostKind === "admin"
         && routeId === "admin_overview" && request.method === "GET") {
@@ -774,12 +825,17 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       upstreamUrl.search = url.search;
     }
 
+    assertActive?.();
+    let token: string;
     try {
-      const token = await idTokenSource.getToken();
-      upstreamHeaders.set(EDGE_HEADERS.invokerToken, `Bearer ${token}`);
+      token = await idTokenSource.getToken();
     } catch {
       return upstreamUnavailable(request, requestId, routeId, "EDGE_TOKEN_UNAVAILABLE");
     }
+    // Token acquisition can outlive the public probe's deadline. It must not
+    // start a subrequest after the caller has already received a refusal.
+    assertActive?.();
+    upstreamHeaders.set(EDGE_HEADERS.invokerToken, `Bearer ${token}`);
 
     const controller = new AbortController();
     let timedOut = false;
@@ -818,6 +874,12 @@ export function createEdgeOriginProxy(options: EdgeOriginProxyOptions): EdgeOrig
       clearTimeout(timer);
     }
 
+    try {
+      assertActive?.();
+    } catch (error) {
+      cancelBody(response);
+      throw error;
+    }
     if (response.headers.get(EDGE_HEADERS.originMarker) !== "1") {
       cancelBody(response);
       return upstreamUnavailable(request, requestId, routeId, "EDGE_UPSTREAM_UNMARKED");

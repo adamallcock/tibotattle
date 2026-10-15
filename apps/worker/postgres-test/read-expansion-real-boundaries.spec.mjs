@@ -90,20 +90,20 @@ for (const family of ["legacy", "v12"]) {
                 return result;
               } };
               const context = { pool, client: observed, schema, nowMs: NOW_MS };
-              if (count === 40000) {
-                await compareExpansionRead(readers, context, input);
-                for (const reader of [readers.base, readers.candidate]) {
-                  const output = await reader.occurrences.readOwnerOccurrences(context, input);
+              const assertedReaders = [];
+              await compareExpansionRead(readers, context, input, (name, outcome, retained) => {
+                assertedReaders.push(name);
+                if (count === 40000) {
+                  assert.equal(outcome.error, undefined, `${name} accepts the exact boundary`);
+                  const output = retained.value;
                   assert.equal(output.get(D1).length, 200);
                   assert.ok(output.get(D1).every((row) => row.status === "compatible" && row.sourceCount === 200));
+                } else {
+                  assert.equal(outcome.value, undefined, `${name} refuses the extra variant`);
+                  assert.equal(retained.code, "ANALYTICS_V2_SOURCE_LIMIT");
                 }
-              } else {
-                for (const reader of [readers.base, readers.candidate]) {
-                  await assert.rejects(reader.occurrences.readOwnerOccurrences(context, input),
-                    (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
-                }
-                await compareExpansionRead(readers, context, input);
-              }
+              });
+              assert.deepEqual(assertedReaders, ["base", "candidate"]);
               assert.ok(returnedCounts.length >= 2, "both independent bundled readers executed real expansion SQL");
             } finally {
               await client.query("ROLLBACK");

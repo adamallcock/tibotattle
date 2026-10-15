@@ -840,8 +840,11 @@ test("the edge health recheck takes a staging origin and refuses a non-canonical
     origin: "https://staging.synthetic-edge.example" });
   assert.equal(staging.code, "PRODUCTION_EDGE_HEALTH_UNREACHABLE");
   assert.deepEqual(seen, ["https://staging.synthetic-edge.example/api/health"]);
-  for (const origin of ["http://staging.synthetic-edge.example", "https://staging.synthetic-edge.example/path", "not a url"]) {
+  for (const origin of ["http://staging.synthetic-edge.example", "https://staging.synthetic-edge.example/path", "not a url",
+    "https://staging.synthetic-edge.example/", "https://staging.synthetic-edge.example?query=1",
+    "https://staging.synthetic-edge.example#fragment", "https://user:password@staging.synthetic-edge.example"]) {
     assert.equal((await recheckProductionEdgeHealth({ fetchImpl, mode: "worker", expectedSourceCommit: "a".repeat(40), origin })).code,
       "PRODUCTION_EDGE_HEALTH_INPUT_INVALID", origin);
   }
+  assert.deepEqual(seen, ["https://staging.synthetic-edge.example/api/health"]);
 });

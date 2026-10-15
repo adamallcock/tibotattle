@@ -288,7 +288,8 @@ async function checkHealth({
     return {
       checked: true,
       status: "unavailable",
-      code: "HEALTH_HTTP_STATUS",
+      code: response.status === 429 ? "HEALTH_PROBE_THROTTLED" : "HEALTH_HTTP_STATUS",
+      ...(response.status === 429 ? { retryAfterSeconds: 60 } : {}),
       httpStatus: response.status,
     };
   }
@@ -387,7 +388,8 @@ async function checkReady({
     return {
       checked: true,
       status: "unavailable",
-      code: "READY_HTTP_STATUS",
+      code: response.status === 429 ? "READY_PROBE_THROTTLED" : "READY_HTTP_STATUS",
+      ...(response.status === 429 ? { retryAfterSeconds: 60 } : {}),
       httpStatus: response.status,
     };
   }

@@ -1,3 +1,4 @@
+import { mountLocalAuthorization } from "./local-request.js";
 import {
   createObservationFreshnessClock,
   observationRecency,
@@ -12293,6 +12294,7 @@ mountDashboardNavigation({
 });
 
 async function bootstrapDashboard() {
+  await localAuthorization.authorize();
   renderSharedInstallerJourney(document, {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
@@ -12303,4 +12305,8 @@ async function bootstrapDashboard() {
   scheduleReturningUserRefresh();
 }
 
+const localAuthorization = mountLocalAuthorization({ t });
+window.addEventListener("tibotattle:local-authorization-required", () => {
+  void localAuthorization.authorize().then(() => loadLocalDashboard());
+});
 bootstrapDashboard();

@@ -458,7 +458,7 @@ describe("typed accountless upload to isolated projection", () => {
       .first()).toEqual({ revision: 0, day_records: 0 });
   });
 
-  it("rechecks owner authority after all grouped reads and isolates a successor generation", async () => {
+  it("rechecks owner authority after all grouped reads", async () => {
     const withdrawn = await fixture(1_200);
     const withdrawnInput = await lookupV11StorageSource(source(), withdrawn.event);
     if (withdrawnInput.disposition !== "generation") throw new Error("synthetic generation missing");
@@ -481,16 +481,9 @@ describe("typed accountless upload to isolated projection", () => {
       .toMatchObject({ state: "discarded", sequence: withdrawn.event.sequence, recordsRead: 1_000 });
     expect(withdrew).toBe(true);
     expect(await target().prepare("SELECT COUNT(*) n FROM analytics_v11_value_pages").first<number>("n")).toBe(0);
+  });
 
-    await reset();
-    await applyD1Migrations(source(), b.TEST_MIGRATIONS);
-    await applyD1Migrations(source(), b.TEST_TYPED_INGESTION_MIGRATIONS);
-    await applyD1Migrations(source(), b.TEST_INGESTION_BRIDGE_MIGRATIONS);
-    await applyD1Migrations(source(), b.TEST_TYPED_V11_ADMISSION_MIGRATIONS);
-    await applyD1Migrations(target(), b.TEST_ANALYTICS_MIGRATIONS);
-    await initializeStorageSource(source(), sourceId);
-    await initializeTypedV11Admission(source(), namespace);
-    await source().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE schema_version='telemetry-contribution-v1.1'").run();
+  it("isolates a successor generation activated during grouped reads", async () => {
     const original = await fixture(1_200);
     const originalInput = await lookupV11StorageSource(source(), original.event);
     if (originalInput.disposition !== "generation") throw new Error("synthetic generation missing");

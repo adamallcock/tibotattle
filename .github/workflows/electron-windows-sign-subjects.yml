@@ -1,0 +1,87 @@
+name: Isolated Windows subject signer
+on:
+  workflow_call:
+    inputs:
+      source-revision:
+        required: true
+        type: string
+      candidate-sha256:
+        required: true
+        type: string
+      manifest-sha256:
+        required: true
+        type: string
+      stage:
+        required: true
+        type: string
+      input-artifact:
+        required: true
+        type: string
+    outputs:
+      receipt-sha256:
+        value: ${{ jobs.sign.outputs.receipt-sha256 }}
+permissions:
+  contents: read
+jobs:
+  sign:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment:
+      name: windows-production-signing
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      receipt-sha256: ${{ steps.sign.outputs.receipt_sha256 }}
+    env:
+      SOURCE_REVISION: ${{ inputs.source-revision }}
+      CANDIDATE_SHA256: ${{ inputs.candidate-sha256 }}
+      MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
+      SIGNING_STAGE: ${{ inputs.stage }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Bind the reviewed signer source
+        shell: pwsh
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          if ($env:SOURCE_REVISION -notmatch '^[0-9a-f]{40}$' -or $env:SOURCE_REVISION -cne $env:DISPATCH_SHA -or (git rev-parse HEAD).Trim() -cne $env:DISPATCH_SHA) { throw 'WINDOWS_SIGNER_SOURCE_MISMATCH' }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.input-artifact }}
+          path: .release-build/electron-production/win32-x64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-signing-tools-${{ github.run_id }}
+          path: .release-build/windows-signing-tools
+      - name: Sign admitted fixed subjects without a package manager or candidate execution
+        id: sign
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $manifest = Join-Path $candidateRoot "signing-transfer/$env:SIGNING_STAGE-subjects.json"
+          try {
+            & ./scripts/windows-signing-egress.ps1 -Mode restrict
+            node scripts/sign-electron-windows-subjects.mjs sign --input-root $candidateRoot --output-root .release-build/windows-signed-subjects --toolchain-root .release-build/windows-signing-tools --manifest $manifest --manifest-sha256 $env:MANIFEST_SHA256 --source-revision $env:SOURCE_REVISION --candidate-sha256 $env:CANDIDATE_SHA256 --stage $env:SIGNING_STAGE
+            if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ISOLATED_SIGNER_FAILED' }
+          } finally {
+            & ./scripts/windows-signing-egress.ps1 -Mode restore
+          }
+      - name: Restore isolated runner egress after interruption
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/windows-signing-egress.ps1 -Mode restore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-signed-${{ inputs.stage }}-${{ github.run_id }}
+          path: .release-build/windows-signed-subjects
+          if-no-files-found: error
+          retention-days: 14

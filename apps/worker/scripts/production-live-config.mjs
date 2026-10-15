@@ -74,6 +74,11 @@ const UNSUPPORTED_CONFIG_RESOURCE_KEYS = Object.freeze([
   "workflows",
 ]);
 const UNSUPPORTED_CONFIG_KEYS = Object.freeze(["annotations", "tags", "usage_model"]);
+const OPERATIONAL_ADMISSION_LIMITS = Object.freeze({
+  PUBLIC_PROBE_RATE_LIMIT: 60,
+  PUBLIC_PROBE_CLIENT_RATE_LIMIT: 12,
+  SPARKLE_APPCAST_GUARD_RATE_LIMIT: 60,
+});
 /**
  * The only D1 `migrations_dir` a candidate config may carry, by binding. The
  * directory is config-only (Wrangler reads it for `d1 migrations`; the live
@@ -87,6 +92,25 @@ export const PRODUCTION_LIVE_CONFIG_D1_MIGRATIONS_DIRS = Object.freeze({
 
 function fail(code) {
   throw operationError(`PRODUCTION_LIVE_CONFIG_${code}`);
+}
+
+export function assertOperationalAdmissionBindings(bindings, missingCode, invalidCode) {
+  if (!Array.isArray(bindings)) fail(invalidCode);
+  const rateLimits = bindings.filter((binding) => binding.type === "ratelimit");
+  const namespaceIds = rateLimits.map((binding) => binding.namespace_id);
+  if (namespaceIds.some((id) => typeof id !== "string" || !/^[1-9][0-9]{0,9}$/u.test(id))
+      || new Set(namespaceIds).size !== namespaceIds.length) fail(invalidCode);
+  for (const [name, limit] of Object.entries(OPERATIONAL_ADMISSION_LIMITS)) {
+    const binding = bindings.find((entry) => entry.name === name);
+    if (binding === undefined) fail(missingCode);
+    if (binding.type !== "ratelimit" || binding.simple?.limit !== limit
+        || binding.simple?.period !== 60) fail(invalidCode);
+  }
+  const budgets = bindings.filter((binding) => binding.type === "durable_object_namespace");
+  if (!bindings.some((binding) => binding.name === "UPLOAD_INGRESS_BUDGET")) fail(missingCode);
+  if (budgets.length !== 1 || budgets[0].name !== "UPLOAD_INGRESS_BUDGET"
+      || budgets[0].class_name !== "UploadIngressBudget"
+      || budgets[0].script_name !== undefined || budgets[0].environment !== undefined) fail(invalidCode);
 }
 
 function object(value) {
@@ -734,6 +758,8 @@ function candidateComparable({ config, snapshot }) {
     fail("CONFIG_MIGRATIONS_INVALID");
   }
   const candidateBindings = normalizeConfigBindings(environment);
+  assertOperationalAdmissionBindings(candidateBindings,
+    "CONFIG_ADMISSION_BINDINGS_INVALID", "CONFIG_ADMISSION_BINDINGS_INVALID");
   const expectedBindings = comparableBindings(snapshot.bindings, { omitSource: true });
   const actualBindings = comparableBindings(candidateBindings, { omitSource: true });
   const actualVars = new Map(candidateBindings
@@ -915,6 +941,10 @@ export function renderProductionLiveConfig({ trackedConfig, snapshot, sourceComm
     }
     : snapshot);
   if (!SHA.test(sourceCommit)) fail("SOURCE_INVALID");
+  // Rendering preserves the captured inventory; it must not silently invent
+  // new remote bindings or deploy code whose mandatory admission is absent.
+  assertOperationalAdmissionBindings(normalized.bindings,
+    "ADMISSION_BINDINGS_NOT_PROVISIONED", "ADMISSION_BINDINGS_INVALID");
   requiredObject(trackedConfig, "CONFIG_INVALID");
   const original = configEnvironment(trackedConfig);
   checkUnsupportedResources(original);
@@ -1010,6 +1040,8 @@ export function verifyProductionLiveConfig({ snapshot, candidateConfig, sourceCo
     const normalized = snapshot?.schema === PRODUCTION_LIVE_CONFIG_SCHEMA
       ? snapshot
       : createProductionLiveConfigSnapshot(snapshot);
+    assertOperationalAdmissionBindings(normalized.bindings,
+      "ADMISSION_BINDINGS_NOT_PROVISIONED", "ADMISSION_BINDINGS_INVALID");
     const environment = configEnvironment(candidateConfig);
     checkUnsupportedResources(environment);
     const candidate = candidateComparable({ config: candidateConfig, snapshot: normalized });

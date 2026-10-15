@@ -33,8 +33,8 @@ actions.
 | Pairing code | Short-lived claim code created by an authenticated participant session. |
 | Admin | Cloudflare Access assertion, configured owner identity, and revision/CSRF controls where applicable. |
 | Operator | Separate owner-held release credential; never exposed to the public app. |
-| Loopback read | Loopback peer, exact Host header, fixed path, and no arbitrary proxying. |
-| Loopback mutation | Loopback read controls plus same-origin and route-specific token/review checks. |
+| Loopback read | Loopback peer, exact Host header, private per-launch capability, fixed path, and no arbitrary proxying. |
+| Loopback mutation | Loopback read controls plus same-origin, one-use method/path authorization and route-specific token/review checks. |
 
 ## Hosted Worker route inventory
 
@@ -353,12 +353,18 @@ defines the exact audit domain and preserved pipeline/restore requirements.
 ## Local route inventory
 
 The local companion binds to loopback and checks the peer address and exact
-Host header. Unknown API paths are 404. Mutations also require a same-origin
-request and their route-specific authorization; contribution upload delivery
-is never an arbitrary local proxy.
+Host header. Every `/api/` route and fixed `/reports/` route additionally
+requires `X-TiboTattle-Local-Capability`, a fresh 256-bit launch credential.
+Unauthenticated private requests fail before reads, body parsing or side
+effects. An authorized caller receives 404 for unknown API paths. Mutations
+also require a same-origin request, one-use method/path authorization and their
+route-specific authorization; contribution upload delivery is never an
+arbitrary local proxy. Static assets contain no credential.
 
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
+| `POST` | `/api/local/authorization` | Authorized local client | Launch capability plus same-origin | Issues a fifteen-second, one-use method/path credential for a fixed API route; no business mutation. | Local companion |
+| `POST` | `/api/local/authorization/browser-bootstrap` | Explicit trusted browser-open action | Loopback mutation | Creates a fifteen-minute owner-only standalone unlock file on macOS/Linux; no credential appears in the response. Windows reports unavailable pending qualified ACL creation. | Local companion |
 | `GET` | `/api/local/health` | Dashboard/native shell | Loopback read | Reports companion/snapshot readiness and enabled local capabilities. | Local companion |
 | `GET` | `/api/local/desktop-status` | Electron shell | Loopback read | Projects closed lifecycle, schema-v2 current display lanes with observation/reset times from bounded published-overview metadata, and receipt-only strict v2 notification evidence; no account identifiers or filesystem paths. Available before the first snapshot. | Local companion |
 | `GET` | `/api/local/diagnostics/contribution` | Dashboard/native shell | Loopback read | Reads a content-free local support projection. | Diagnostics |
@@ -366,8 +372,8 @@ is never an arbitrary local proxy.
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Dashboard/native shell | Loopback mutation | Inspects, stores, or clears the bounded local OAuth restart handle. | Hosted identity |
 | `GET` | `/api/local/onboarding` | Dashboard | Loopback read | Projects source readiness without exposing filesystem paths. | Local companion |
 | `GET` | `/api/local/overview` | Dashboard | Loopback read | Reads the current derived overview snapshot. | Local companion |
-| `GET` | `/api/local/cache-drop-thread-links` | Local dashboard only | Same-origin custom-header read | Ephemeral, generation-bound names and Codex thread IDs for recent cache-drop rows; no query parameters, persistence, or export. | Local companion |
-| `POST` | `/api/local/work-usage/query` | Local dashboard only | Same-origin custom-header read; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export. During revalidation an available saved reply has `retained`, `refreshing`, `namesAvailable` and a separate `refreshSnapshotId`; saved figures retain their original bounds and have no paging cursor. Names survive document reload only in process memory; durable snapshots contain anonymous usage figures. | Local reporting |
+| `GET` | `/api/local/cache-drop-thread-links` | Local dashboard only | Private launch capability, same-origin and local marker | Ephemeral, generation-bound names and Codex thread IDs for recent cache-drop rows; no query parameters, persistence, or export. | Local companion |
+| `POST` | `/api/local/work-usage/query` | Local dashboard only | Private launch capability, one-use operation, same-origin and local marker; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; optional canonical ISO `endAt` pins the selected period and rejects older snapshot substitution; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export. During revalidation an available saved reply has `retained`, `refreshing`, `namesAvailable` and a separate `refreshSnapshotId`; saved figures retain their original bounds and have no paging cursor. Names survive document reload only in process memory; durable snapshots contain anonymous usage figures. | Local reporting |
 | `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `1`, `7`, `30`, or `all`; optional canonical ISO `endAt` pins exact rolling bounds (never a future instant); optional `speedMode=standard|fast|ultrafast` (default `standard`) filters before aggregation; returns schema-5/method-5 bounded local timing aggregates, with the selected `speedMode` and period-scoped `excludedUnknownTurns`, including tool-free fallback estimates in Output speed with one sample per turn, restores validated saved measurements before starting work, and renews an independent background scan lease. No accounting or network effect. | Local timing |
 | `GET` | `/api/local/gradient` | Dashboard | Loopback read | Reads the derived cost/quota gradient. | Local analysis |
 | `GET` | `/api/local/weekly` | Dashboard | Loopback read | Reads derived weekly capacity and pace evidence. | Local analysis |
@@ -435,6 +441,12 @@ The participant relay forwards only the exact method/path pairs in
 `apps/local/transport/participant-relay-routes.js`. It preserves the bounded
 session/CSRF/upload headers required by those routes, never chooses an upstream
 from request data, and keeps provider callbacks off loopback.
+
+Every relay request first passes local launch/operation authorization. Ordinary
+session reads and mutations forward only the caller's own cookie. A successful
+enrollment may return an opaque thirty-second, one-use continuation, bound to
+that caller and ceremony and usable only for the next device-pairing POST. It
+bridges delayed cookie commitment without lending a process-wide session.
 
 | Method | Path |
 | --- | --- |

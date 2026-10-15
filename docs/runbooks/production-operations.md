@@ -394,6 +394,12 @@ directly. Run these gates with a Node.js release that strips types by default:
 22.18.0. On Node.js 22.16.0, `npm run scripts:check` fails with
 `ERR_UNKNOWN_FILE_EXTENSION`.
 
+The real process and cleanup checks also require `zsh` with `zsh/datetime`,
+`/usr/bin/time`, `ps`, and `pgrep`. Ubuntu CI installs `zsh`, `time`, and `procps`
+explicitly. Native timing selects BSD time on macOS or GNU time on Linux;
+platform-specific metrics that are unavailable remain explicit. Passing these
+synthetic checks does not replace a full measurement receipt for that platform.
+
 The production deploy wrapper itself rechecks endpoint configuration (including
 the edge public surface: apex and `www` public route hosts and a separate admin
 host), workspace package copies, generated assets, release preflight, source
@@ -878,6 +884,40 @@ lane's window, so graph work slows during a catch-up. Setting
 `STORAGE_DELIVERY_CATCH_UP` to `disabled` on that Worker returns delivery to
 its fixed slice.
 
+### Operational admission binding activation
+
+The security admission source requires three additional rate-limit bindings
+before activation: `PUBLIC_PROBE_RATE_LIMIT` at 60/minute,
+`PUBLIC_PROBE_CLIENT_RATE_LIMIT` at 12/minute, and
+`SPARKLE_APPCAST_GUARD_RATE_LIMIT` at 60/minute. All periods are 60 seconds and
+namespace IDs must be distinct from other bindings. The production candidate
+renderer preserves captured live bindings; checked-in `wrangler.jsonc` entries
+alone cannot add missing bindings to that captured inventory. Candidate
+preparation fails with
+`PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_NOT_PROVISIONED` when the required
+live inventory is missing, or
+`PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_INVALID` for policy/namespace drift.
+
+Provisioning is a protected, separately authorized environment change. After
+that authorization, provision the three bindings, capture a fresh read-only
+live inventory, and pass the existing production configuration/preflight gates
+against it before preparing and deploying the candidate. Preserve the existing
+`UPLOAD_INGRESS_BUDGET` namespace and class lineage: upload, appcast-body,
+health and readiness work use different fixed object names with independent
+budgets. The primary Worker needs no new Durable Object class migration. The
+separate dogfood guard needs its own checked-in
+`appcast-guard-body-budget-v1` class migration and appcast coarse limiter; its
+deployment and migration require separate authorization.
+
+After an authorized activation, check ordinary health/readiness once through
+the established read-only checks. A `429 ATTEMPT_LIMIT_REACHED` is throttling,
+not evidence of broken storage: honor `Retry-After` (edge limit: 60 seconds;
+coordinated probe capacity: 1–30 seconds). Release-readiness reports distinct
+`HEALTH_PROBE_THROTTLED` / `READY_PROBE_THROTTLED` codes with a conservative
+60-second retry floor and no immediate retry loop. Do not run live exhaustion
+tests. Local concurrency/deadline tests and dry deployment bundles do not prove
+that bindings, code, a dogfood class migration, or appcast writes are live.
+
 ### Guarded deployment wrapper
 
 On this line every production deploy uses the pinned typed path below. It
@@ -1162,11 +1202,11 @@ The session transport is available only when a fresh owner Access session has
 already been exported into a mode-0600 owner-private JSON file. The file is
 validated for exact admin origin, `CF_Authorization` cookie, owner-only mode,
 regular-file identity, and no hard links. It is never copied into the journal,
-receipt, shell arguments, or output. The owner-local credential helper example
-for the Cloudflare provider is:
+receipt, shell arguments, or output. With the owner-local secret helper
+available on PATH, the Cloudflare provider command is:
 
 ```sh
-/Users/adamallcock/.codex/bin/secret run cloudflare \
+secret run cloudflare \
   --service cloudflare.api_token \
   --env CLOUDFLARE_API_TOKEN -- \
   node apps/worker/scripts/production-collection-control.mjs \
@@ -1181,7 +1221,7 @@ For a post-deploy successor capture, use the same owner-local helper without an
 admin session export when the read-only canonical provider path is sufficient:
 
 ```sh
-/Users/adamallcock/.codex/bin/secret run cloudflare \
+secret run cloudflare \
   --service cloudflare.api_token \
   --env CLOUDFLARE_API_TOKEN -- \
   node apps/worker/scripts/production-collection-control.mjs \

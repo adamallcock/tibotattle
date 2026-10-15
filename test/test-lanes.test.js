@@ -33,6 +33,8 @@ test("portable manifest is explicit, unique, and excludes native release gates",
   assert.equal(PORTABLE_TEST_FILES.includes("apps/local/server.test.mjs"), true);
   assert.equal(PORTABLE_TEST_FILES.includes("apps/web/test/lib.test.mjs"), true);
   assert.equal(PORTABLE_TEST_FILES.includes("test/accounting-package-parity.test.js"), true);
+  assert.equal(PORTABLE_TEST_FILES.includes("apps/electron/test/desktop-local-authorization.test.mjs"), true);
+  assert.equal(PORTABLE_TEST_FILES.includes("apps/web/test/local-request.test.mjs"), true);
   for (const path of PORTABLE_TEST_FILES) {
     assert.doesNotMatch(path, /(?:^|\/)macos-|sparkle|release-site/u);
   }

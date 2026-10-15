@@ -1,6 +1,8 @@
 import {
   COMMUNITY_ALLOWANCE_BASIS,
-  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
+  COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
@@ -141,8 +143,8 @@ function projectDailyAllowance(value: unknown): RecordValue | null {
   const allowance = object(value);
   if (!allowance || !exactKeys(allowance, DAILY_ALLOWANCE_KEYS)
       || allowance.basis !== COMMUNITY_ALLOWANCE_BASIS
-      || allowance.limitId !== "codex" || allowance.referencePlanType !== "pro"
-      || allowance.normalization !== "pro_x1_prolite_x4_plus_x20"
+      || allowance.limitId !== "codex" || allowance.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE
+      || allowance.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
       || allowance.qualification !== COMMUNITY_ALLOWANCE_QUALIFICATION
       || allowance.windowDurationMinutes !== SEVEN_DAY_WINDOW_MINUTES
       || allowance.trailingDays !== COMMUNITY_ALLOWANCE_TRAILING_DAYS
@@ -476,7 +478,7 @@ export async function readPostgresPublishedCommunityDaily(
             AND cache.collection_revision = controls.revision
             AND controls.control_state = 'operational' AND controls.publication_enabled
           LIMIT 1`,
-        [identity.sourceId, identity.sourceNamespace, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+        [identity.sourceId, identity.sourceNamespace, COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION,
           MAX_DAILY_PAYLOAD_BYTES],
       );
       const cache = cacheResult.rows[0];

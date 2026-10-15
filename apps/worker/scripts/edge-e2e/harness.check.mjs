@@ -26,6 +26,10 @@ import {
   EDGE_E2E_STRANGER,
   EDGE_E2E_UPSTREAM_ORIGIN,
   EDGE_E2E_VERIFIER,
+  EDGE_TIER_BINDINGS,
+  GENEROUS_LIMITS,
+  OPERATIONAL_BINDINGS,
+  ORIGIN_TIER_BINDINGS,
   readCheckedInProductionLimits,
 } from "./edge-instances.mjs";
 import {
@@ -243,7 +247,16 @@ test("S4's production limits are the checked-in env.production values", async ()
     ENROLLMENT_RATE_LIMIT: 20, RECOVERY_RATE_LIMIT: 20, CLIENT_ATTEMPT_RATE_LIMIT: 5, PUBLIC_READ_RATE_LIMIT: 120,
     UPLOAD_AUTHORIZATION_RATE_LIMIT: 3000, UPLOAD_PRINCIPAL_RATE_LIMIT: 3000,
     UPLOAD_INGRESS_REQUEST_RATE_LIMIT: 3000, UPLOAD_INGRESS_CLIENT_RATE_LIMIT: 3000,
+    PUBLIC_PROBE_RATE_LIMIT: 60, PUBLIC_PROBE_CLIENT_RATE_LIMIT: 12, SPARKLE_APPCAST_GUARD_RATE_LIMIT: 60,
   });
+});
+
+test("operational harness limits remain separate from the six-purpose edge admission contract", () => {
+  assert.deepEqual(EDGE_TIER_BINDINGS, policy.EDGE_ADMISSION_BINDINGS);
+  assert.deepEqual(OPERATIONAL_BINDINGS, ["PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT"]);
+  assert.deepEqual(Object.keys(GENEROUS_LIMITS).sort(), [...EDGE_TIER_BINDINGS, ...ORIGIN_TIER_BINDINGS, ...OPERATIONAL_BINDINGS].sort());
+  assert.equal(Object.keys(GENEROUS_LIMITS).length, 11);
+  assert.ok(Object.values(GENEROUS_LIMITS).every((limit) => limit === 10_000));
 });
 
 test("the edge-mode dry run fails a gcp candidate that keeps storage or a main module with other exports", async () => {
@@ -251,14 +264,22 @@ test("the edge-mode dry run fails a gcp candidate that keeps storage or a main m
   const exports = ["UploadIngressBudget", "contributionRequestPreflight", "default", "handleRequest",
     "isPostgresWorkerRequestPathSupported", "runScheduledMaintenance"];
   const storage = { d1: ["ANALYTICS_DB", "DELETION_LEDGER", "USAGE_MONITOR_DB"], r2: ["QUARANTINE", "SPARKLE_RELEASES"] };
+  const admission = { ratelimits: Object.keys(GENEROUS_LIMITS), durableObjects: ["UPLOAD_INGRESS_BUDGET"] };
   const good = [
-    { mode: "worker", main: "src/edge-entry.ts", modeVar: "worker", exports, ...storage },
-    { mode: "fenced", main: "src/edge-entry.ts", modeVar: "fenced", exports, ...storage },
-    { mode: "gcp", main: "src/edge-entry.ts", modeVar: "gcp", exports, d1: ["RELEASE_GUARD_DB"], r2: ["SPARKLE_RELEASES"] },
+    { mode: "worker", main: "src/edge-entry.ts", modeVar: "worker", exports, ...storage, ...admission },
+    { mode: "fenced", main: "src/edge-entry.ts", modeVar: "fenced", exports, ...storage, ...admission },
+    { mode: "gcp", main: "src/edge-entry.ts", modeVar: "gcp", exports, d1: ["RELEASE_GUARD_DB"], r2: ["SPARKLE_RELEASES"], ...admission },
   ];
   assert.deepEqual(dryRunViolations(good), []);
   assert.deepEqual(dryRunViolations([good[0], good[1], { ...good[2], d1: ["RELEASE_GUARD_DB", "USAGE_MONITOR_DB"] }]),
     ["gcp: a data binding survives"]);
   assert.deepEqual(dryRunViolations([{ ...good[0], exports: [...exports, "EDGE_LOCAL_ENV_KEYS"] }, good[1], good[2]]),
     [`worker: main-module exports ${[...exports, "EDGE_LOCAL_ENV_KEYS"].join(",")}`]);
+  for (const name of OPERATIONAL_BINDINGS) {
+    assert.deepEqual(dryRunViolations([good[0], good[1], {
+      ...good[2], ratelimits: good[2].ratelimits.filter((binding) => binding !== name),
+    }]), ["gcp: an operational rate-limit binding is missing"], name);
+  }
+  assert.deepEqual(dryRunViolations([good[0], good[1], { ...good[2], durableObjects: [] }]),
+    ["gcp: the Durable Object binding is missing"]);
 });

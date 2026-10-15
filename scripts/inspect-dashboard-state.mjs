@@ -11,47 +11,21 @@
 //
 // It reads. It never writes, never refreshes, and never mutates state.
 
-import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { createOwnerAuthorizedLocalReader } from "./lib/owner-authorized-local-read.mjs";
 
-/**
- * The companion binds an ephemeral port chosen by the OS, so a fixed default
- * finds nothing. Ask lsof which local ports the running TiboTattle (or a
- * repo-run companion) is listening on and probe each for the health route.
- */
-async function discoverOrigin() {
-  if (process.env.TIBOTATTLE_ORIGIN) return process.env.TIBOTATTLE_ORIGIN;
-  let listing = "";
-  try {
-    listing = execFileSync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], {
-      encoding: "utf8",
-      maxBuffer: 4 * 1024 * 1024,
-    });
-  } catch {
-    return "http://127.0.0.1:8787";
+// Standalone inspection uses only the explicitly owner-selected bootstrap.
+// Electron access stays in its trusted renderer; port discovery is not authority.
+const args = process.argv.slice(2);
+let access;
+async function authorizedAccess() {
+  if (args.length !== 2 || args[0] !== "--authorization-file" || !args[1]) {
+    throw new Error("Use --authorization-file with the owner's standalone dashboard access file.");
   }
-  const ports = [...new Set([...listing.matchAll(/127\.0\.0\.1:(\d+) \(LISTEN\)/g)]
-    .map((match) => Number(match[1])))];
-  for (const port of ports) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/local/health`, {
-        signal: AbortSignal.timeout(1_500),
-      });
-      if (!response.ok) continue;
-      const body = await response.json();
-      if (typeof body?.schemaVersion === "string"
-          && body.schemaVersion.startsWith("local-companion")) {
-        return `http://127.0.0.1:${port}`;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return "http://127.0.0.1:8787";
+  access ??= await createOwnerAuthorizedLocalReader(args[1], { expectedOrigin: process.env.TIBOTATTLE_ORIGIN });
+  return access;
 }
-
-const ORIGIN = await discoverOrigin();
 const BUNDLE = process.env.TIBOTATTLE_APP
   ?? "/Applications/TiboTattle.app/Contents/Resources/app";
 const REPO = new URL("../", import.meta.url).pathname;
@@ -60,11 +34,7 @@ const out = [];
 const say = (line = "") => out.push(line);
 
 async function json(path) {
-  const response = await fetch(`${ORIGIN}${path}`, {
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) throw new Error(`${path} -> HTTP ${response.status}`);
-  return response.json();
+  return (await authorizedAccess()).read(path);
 }
 
 function ageOf(iso) {
@@ -112,7 +82,7 @@ try {
   const freshness = overview.freshness ?? {};
 
   say("COMPANION");
-  say(`  origin                ${ORIGIN}`);
+  say(`  origin                ${access.origin}`);
   say(`  status                ${health.status}`);
   say(`  snapshot              ${JSON.stringify(health.snapshot ?? null)}`);
   say("");
@@ -174,7 +144,7 @@ try {
 } catch (error) {
   say("COMPANION UNREACHABLE");
   say(`  ${error.message}`);
-  say("  Start the app, or set TIBOTATTLE_ORIGIN.");
+  say("  Select the unexpired standalone dashboard access file; Electron inspection requires its trusted renderer.");
 }
 
 say("");

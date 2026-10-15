@@ -29,7 +29,7 @@
 //     flags. Dense inline uses heap12288MiB and semi-space64MiB; both profiles
 //     use ANALYTICS_V2_MEMORY_BUDGET_MIB=10752;
 //     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; a24h task timeout),
-//     wrapped in /usr/bin/time -l for the
+//     wrapped in native /usr/bin/time (BSD -l or GNU -f) for the
 //     process's peak resident set, while the process's resident set and CPU
 //     time are sampled every 5 s (ps) for the utilisation of its threads;
 //  4. records the job's receipt (phase timings, read ledger, memory summary,
@@ -215,17 +215,42 @@ const poolFor = (endpoint, database, max = 6) => {
   return pool;
 };
 
-/** /usr/bin/time -l's peak resident set (bytes) and CPU seconds, from its stderr tail. */
-function parseTimeL(stderr) {
+const GNU_TIME_FORMAT = "MEAS_SYNTH_TIME_V1 rss_kib=%M real_seconds=%e user_seconds=%U sys_seconds=%S";
+
+/** Use the native time implementation explicitly; GNU %M is KiB, BSD -l is bytes. */
+export function measurementTimeArguments(platform = process.platform) {
+  if (platform === "darwin") return ["-l"];
+  if (platform === "linux") return ["-f", GNU_TIME_FORMAT];
+  fail("MEAS_SYNTH_PLATFORM_UNSUPPORTED");
+}
+
+/** Keep unavailable or invalid measurements null, never a fabricated zero. */
+export function parseMeasurementTime(stderr, platform = process.platform) {
+  measurementTimeArguments(platform);
   const text = String(stderr);
-  const number = (pattern) => {
-    const match = text.match(pattern);
-    return match ? Number(match[1]) : null;
+  const onlyMatch = (pattern) => {
+    const matches = [...text.matchAll(pattern)];
+    return matches.length === 1 ? matches[0] : null;
   };
-  return { maxResidentSetBytes: number(/(\d+)\s+maximum resident set size/u),
-    peakMemoryFootprintBytes: number(/(\d+)\s+peak memory footprint/u),
-    realSeconds: number(/([\d.]+)\s+real/u), userSeconds: number(/([\d.]+)\s+user/u),
-    sysSeconds: number(/([\d.]+)\s+sys/u) };
+  const bytes = (raw, multiplier = 1) => {
+    if (!/^\d+$/u.test(raw ?? "")) return null;
+    const value = Number(raw) * multiplier;
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  };
+  const seconds = (raw) => {
+    if (!/^\d+(?:\.\d+)?$/u.test(raw ?? "")) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  if (platform === "linux") {
+    const row = onlyMatch(/^MEAS_SYNTH_TIME_V1 rss_kib=(\S+) real_seconds=(\S+) user_seconds=(\S+) sys_seconds=(\S+)$/gmu);
+    return { maxResidentSetBytes: bytes(row?.[1], 1024), peakMemoryFootprintBytes: null,
+      realSeconds: seconds(row?.[2]), userSeconds: seconds(row?.[3]), sysSeconds: seconds(row?.[4]) };
+  }
+  const cpu = onlyMatch(/^[ \t]*(\S+)[ \t]+real[ \t]+(\S+)[ \t]+user[ \t]+(\S+)[ \t]+sys[ \t]*$/gmu);
+  return { maxResidentSetBytes: bytes(onlyMatch(/^[ \t]*(\S+)[ \t]+maximum resident set size[ \t]*$/gmu)?.[1]),
+    peakMemoryFootprintBytes: bytes(onlyMatch(/^[ \t]*(\S+)[ \t]+peak memory footprint[ \t]*$/gmu)?.[1]),
+    realSeconds: seconds(cpu?.[1]), userSeconds: seconds(cpu?.[2]), sysSeconds: seconds(cpu?.[3]) };
 }
 
 function lastJson(text) {
@@ -366,12 +391,13 @@ export function workerProfileEnv({ workerProfileDir = null, workerProfileSource 
     ...(memoryProfile ? { ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY: "1" } : {}) };
 }
 
-/** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
+/** One full refresh under native /usr/bin/time, measured to the end, its process sampled. */
 export async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, matrixRequested = {}, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
+  const timeArguments = measurementTimeArguments();
   let started, sampler = null, stdout = "", stderr = "";
   const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
     started = performance.now();
-    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema, matrixRequested)], {
+    const child = spawn("/usr/bin/time", [...timeArguments, node22, ...refreshArguments(profile, schema, matrixRequested)], {
       cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile) }),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -403,7 +429,7 @@ export async function runRefresh({ node22, endpoint, database, schema, outDir, l
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
     measurementIdentity: refreshMeasurementIdentity(profile, matrixRequested),
-    time: parseTimeL(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
+    time: parseMeasurementTime(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 

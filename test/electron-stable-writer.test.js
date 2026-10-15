@@ -6,14 +6,16 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { productionElectronCandidatePlan } from '../scripts/package-electron-production.mjs';
-import { prepareElectronStablePublication, recordElectronStablePreparation, STABLE_TARGETS } from '../scripts/prepare-electron-stable-publication.mjs';
+import { prepareElectronStablePublication as prepareProductionPublication, STABLE_TARGETS } from '../scripts/prepare-electron-stable-publication.mjs';
 import { publishElectronStableFeed, createElectronStableR2Transport } from '../scripts/publish-electron-stable-feed.mjs';
 import { identityDigest } from '../scripts/lib/release-operation.mjs';
 import distribution from '../config/electron-production-distribution.cjs';
 import { RELEASE_VERSION } from '../config/release-manifest.js';
+import { linuxPlannerOptions, linuxUpdateVerification, linuxUpdateNow, signSyntheticLinuxFeed, recordSyntheticStablePreparation, prepareSyntheticSameVersionRenewal, resignSyntheticLinuxManifest } from './helpers/linux-update-publication-fixture.js';
+const prepareElectronStablePublication = options => prepareProductionPublication({ ...linuxPlannerOptions, ...options });
 const digest = (value, alg = 'sha256') => createHash(alg).update(value).digest(alg === 'sha512' ? 'base64' : 'hex');
 const fingerprint = bytes => ({ sha256: digest(bytes), bytes: bytes.length });
-async function fixture(run, { predecessors = false } = {}) {
+async function fixture(run, { predecessors = false, renewal = false } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'stable-writer-')));
   const proposal = { schemaVersion: 'tibotattle-electron-stable-publication-v1', sourceRevision: 'a'.repeat(40), version: RELEASE_VERSION, buildNumber: '2026091001', targets: [] };
   const put = async (path, value) => { const bytes = Buffer.from(value); await writeFile(join(root, path), bytes); return { path, ...fingerprint(bytes) }; };
@@ -35,25 +37,30 @@ async function fixture(run, { predecessors = false } = {}) {
       const artifacts = []; for (const name of names) artifacts.push(await put(`${target}/${name}`, name));
       const files = names.filter(name => !name.endsWith('.blockmap')).map(name => ({ url: name, sha512: digest(name, 'sha512'), size: Buffer.byteLength(name) }));
       const manifestName = target.startsWith('darwin-') ? 'latest-mac.yml' : target === 'win32-x64' ? 'latest.yml' : 'latest-linux.yml';
+      const plainFeed = Buffer.from(JSON.stringify({ version: RELEASE_VERSION, files, path: files[0].url, sha512: files[0].sha512 }));
+      const manifestBytes = target === 'linux-x64' ? await signSyntheticLinuxFeed(join(root, artifacts[0].path), plainFeed) : plainFeed;
       proposal.targets.push({ target, sourceCandidate: await put(`${target}/source.json`, JSON.stringify(receipt)),
         appUpdate: await put(`${target}/app-update.yml`, JSON.stringify({ provider: 'generic', url: spec.feedURL, updaterCacheDirName: 'cache', ...(target === 'win32-x64' ? { publisherName: 'Adam Allcock' } : {}) })),
-        manifest: await put(`${target}/${manifestName}`, JSON.stringify({ version: RELEASE_VERSION, files, path: files[0].url, sha512: files[0].sha512 })), artifacts,
+        manifest: await put(`${target}/${manifestName}`, manifestBytes), artifacts,
         predecessor: null, evidence: [await put(`${target}/evidence.json`, '{"synthetic":true}')] });
     }
     if (predecessors) for (const target of proposal.targets) {
       const parsed = JSON.parse(await readFile(join(root, target.manifest.path)));
       parsed.version = '0.1.0';
+      delete parsed.tibotattleLinuxUpdate; // Exact checksum-only predecessor discovery is retained, never authenticated installation.
       parsed.files = parsed.files.map(file => ({ ...file, url: file.url.replace(RELEASE_VERSION, '0.1.0') }));
       parsed.path = parsed.path.replace(RELEASE_VERSION, '0.1.0');
       target.predecessor = await put(`${target.target}/previous.yml`, JSON.stringify(parsed));
     }
+    if (renewal) await prepareSyntheticSameVersionRenewal({ root, proposal, put });
     const operationDirectory = join(root, 'operation');
-    await recordElectronStablePreparation({ artifactRoot: root, proposal, operationDirectory });
     const plan = await prepareElectronStablePublication({ artifactRoot: root, proposal });
+    await recordSyntheticStablePreparation(plan, operationDirectory);
     const objects = new Map(), calls = [], owner = 'b'.repeat(40);
-    if (predecessors) for (const target of plan.targets) objects.set(target.feed.objectKey, { ...target.feed, bytes: await readFile(join(root, target.predecessor.localPath)) });
+    if (predecessors || renewal) for (const target of plan.targets) objects.set(target.feed.objectKey, { ...target.feed, bytes: await readFile(join(root, target.predecessor.localPath)) });
+    if (renewal) for (const object of plan.targets.flatMap(target => target.artifacts)) objects.set(object.objectKey, { ...object, bytes: await readFile(join(root, object.localPath)) });
     let ownership = true;
-    const options = { artifactRoot: root, proposal, operationDirectory, approvedPlanSha256: identityDigest(plan), coordinationOwner: owner, repositoryRoot: root,
+    const options = { linuxUpdateVerification, artifactRoot: root, proposal, operationDirectory, approvedPlanSha256: identityDigest(plan), coordinationOwner: owner, repositoryRoot: root,
       coordination: { assertOwned: value => { assert.equal(value, owner); if (!ownership) throw new Error('ownership lost'); } },
       transport: {
         get: async (bucket, key) => { calls.push(['get', key]); return objects.has(key) ? fingerprint(objects.get(key).bytes) : null; },
@@ -161,3 +168,129 @@ test('pinned CLI adapter refuses native namespace and installer deletion before 
   await assert.rejects(remote.get('tibotattle-updates', 'electron/stable/win32-x64/latest.yml'), /R2_READ_FAILED/);
   assert.equal(calls, 1);
 }));
+
+test('production trust roots and test isolation refuse before remote I/O or journal mutation', async () => fixture(async ({ root, options, calls, readJournal }) => {
+  await assert.rejects(publishElectronStableFeed({ ...options, linuxUpdateVerification: undefined }), /LINUX_PUBLISHER_AUTHENTICATION_FAILED/);
+  await assert.rejects(publishElectronStableFeed({ ...options, transport: undefined }), /TEST_VERIFICATION_REQUIRES_ISOLATED_TRANSPORT/);
+  await assert.rejects(publishElectronStableFeed({ ...options, readPublicObject: undefined }), /TEST_VERIFICATION_REQUIRES_ISOLATED_TRANSPORT/);
+  const realAdapter = createElectronStableR2Transport({ temporaryDirectory: root, spawn: () => assert.fail('no CLI dispatch') });
+  await assert.rejects(publishElectronStableFeed({ ...options, transport: realAdapter }), /TEST_VERIFICATION_REQUIRES_ISOLATED_TRANSPORT/);
+  assert.deepEqual(calls, []);
+  assert.equal((await readJournal()).state.writer, undefined);
+}));
+
+test('tampered or expired Linux signature blocks publication before any remote operation', async () => fixture(async ({ root, options, calls, readJournal }) => {
+  await assert.rejects(publishElectronStableFeed({ ...options, linuxUpdateVerification: {
+    ...linuxUpdateVerification, now: () => linuxUpdateNow + 2 * 24 * 60 * 60_000,
+  } }), /LINUX_PUBLISHER_AUTHENTICATION_FAILED/);
+  const target = options.proposal.targets.find(value => value.target === 'linux-x64');
+  const manifest = JSON.parse(await readFile(join(root, target.manifest.path)));
+  manifest.tibotattleLinuxUpdate.signature = Buffer.alloc(64).toString('base64');
+  const bytes = Buffer.from(JSON.stringify(manifest));
+  await writeFile(join(root, target.manifest.path), bytes);
+  target.manifest = { ...target.manifest, ...fingerprint(bytes) };
+  await assert.rejects(publishElectronStableFeed(options), /LINUX_PUBLISHER_AUTHENTICATION_FAILED/);
+  assert.deepEqual(calls, []);
+  assert.equal((await readJournal()).state.writer, undefined);
+}));
+
+test('owned rollback verifies at recorded publication time after Linux signature expiry', async () => fixture(async ({ options, plan, objects, readJournal }) => {
+  const previous = new Map(plan.targets.map(target => [target.feed.objectKey, Buffer.from(objects.get(target.feed.objectKey).bytes)]));
+  await publishElectronStableFeed(options);
+  assert.equal((await readJournal()).state.writer.publisherVerifiedAt, linuxUpdateNow);
+  await publishElectronStableFeed({ ...options, phase: 'rollback', linuxUpdateVerification: {
+    ...linuxUpdateVerification, now: () => linuxUpdateNow + 2 * 24 * 60 * 60_000,
+  } });
+  for (const [key, bytes] of previous) assert.deepEqual(objects.get(key).bytes, bytes);
+  assert.equal((await readJournal()).state.writer.status, 'completed');
+}, { predecessors: true }));
+
+test('metadata expiry during artifact writes stops the Linux feed and preserves owned recovery', async () => fixture(async ({ options, calls, readJournal }) => {
+  let now = linuxUpdateNow;
+  const originalPut = options.transport.put;
+  options.transport.put = async (...args) => {
+    await originalPut(...args);
+    if (args[1].objectKey.endsWith('.AppImage')) now += 2 * 24 * 60 * 60_000;
+  };
+  const expiredOptions = { ...options, linuxUpdateVerification: { ...linuxUpdateVerification, now: () => now } };
+  await assert.rejects(publishElectronStableFeed(expiredOptions), /LINUX_PUBLISHER_METADATA_EXPIRED/);
+  assert.equal(calls.some(([kind, key]) => kind === 'put' && key.endsWith('latest-linux.yml')), false);
+  assert.equal((await readJournal()).state.writer.status, 'failed_known');
+  assert.equal((await publishElectronStableFeed({ ...expiredOptions, phase: 'rollback' })).status, 'completed');
+}));
+
+test('expired rollback cannot borrow an unbound prior plan or absent successful verification time', async () => {
+  for (const mutate of [journal => { journal.state.plan.version = '99.0.0'; },
+    journal => { delete journal.state.writer.publisherVerifiedAt; }]) await fixture(async ({ root, options, calls, readJournal }) => {
+    await publishElectronStableFeed(options);
+    const journal = await readJournal(); mutate(journal);
+    await writeFile(join(root, 'operation', 'operation.json'), JSON.stringify(journal));
+    calls.length = 0;
+    await assert.rejects(publishElectronStableFeed({ ...options, phase: 'rollback', linuxUpdateVerification: {
+      ...linuxUpdateVerification, now: () => linuxUpdateNow + 2 * 24 * 60 * 60_000,
+    } }), /RECONCILIATION_REQUIRED/);
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('four-target same-version renewal writes only Linux metadata, verifies all targets, and rolls back its exact expired predecessor', async () => fixture(async ({ options, plan, objects, calls, readJournal }) => {
+  const before = new Map([...objects].map(([key, value]) => [key, Buffer.from(value.bytes)]));
+  const linux = plan.targets.find(target => target.target === 'linux-x64');
+  assert.equal((await publishElectronStableFeed(options)).status, 'completed');
+  assert.deepEqual(calls.filter(([kind]) => kind === 'put'), [['put', linux.feed.objectKey]]);
+  assert.equal((await readJournal()).state.writer.readback.objects.length, 14);
+  assert.equal((await readJournal()).state.writer.completed.length, 1);
+  for (const [key, bytes] of before) if (key !== linux.feed.objectKey) assert.deepEqual(objects.get(key).bytes, bytes);
+  assert.notDeepEqual(objects.get(linux.feed.objectKey).bytes, before.get(linux.feed.objectKey));
+  calls.length = 0;
+  assert.equal((await publishElectronStableFeed({ ...options, phase: 'rollback', linuxUpdateVerification: {
+    ...linuxUpdateVerification, now: () => linuxUpdateNow + 2 * 24 * 60 * 60_000,
+  } })).status, 'completed');
+  assert.deepEqual(calls.filter(([kind]) => kind === 'put'), [['put', linux.feed.objectKey]]);
+  assert.equal((await readJournal()).state.writer.readback.objects.length, 4);
+  for (const [key, bytes] of before) assert.deepEqual(objects.get(key).bytes, bytes);
+}, { renewal: true }));
+
+test('renewal requires all immutable remote objects already present and exact before any write', async () => {
+  for (const missing of [true, false]) await fixture(async ({ options, plan, objects, calls, readJournal }) => {
+    const artifact = plan.targets.at(-1).artifacts[0];
+    if (missing) objects.delete(artifact.objectKey);
+    else objects.set(artifact.objectKey, { bytes: Buffer.from('synthetic collision') });
+    await assert.rejects(publishElectronStableFeed(options), missing ? /RENEWAL_IMMUTABLE_MISSING/ : /IMMUTABLE_CONFLICT/);
+    assert.equal(calls.some(([kind]) => kind === 'put' || kind === 'delete'), false);
+    assert.equal((await readJournal()).state.writer.completed.length, 0);
+  }, { renewal: true });
+});
+
+test('invalid same-version renewal preimages refuse before remote calls', async () => {
+  for (const mutation of ['sequence', 'artifact', 'mac', 'windows']) await fixture(async ({ root, options, calls, readJournal }) => {
+    const platform = mutation === 'mac' ? 'darwin-arm64' : mutation === 'windows' ? 'win32-x64' : 'linux-x64';
+    const target = options.proposal.targets.find(value => value.target === platform);
+    let bytes = await readFile(join(root, target.predecessor.path));
+    if (platform === 'linux-x64') {
+      const old = JSON.parse(bytes);
+      if (mutation === 'sequence') old.tibotattleLinuxUpdate.manifest.sequence = 2;
+      else old.tibotattleLinuxUpdate.manifest.sha256 = 'f'.repeat(64);
+      bytes = Buffer.from(JSON.stringify(resignSyntheticLinuxManifest(old)));
+    } else bytes = Buffer.concat([bytes, Buffer.from('\n')]);
+    await writeFile(join(root, target.predecessor.path), bytes);
+    target.predecessor = { ...target.predecessor, ...fingerprint(bytes) };
+    await assert.rejects(publishElectronStableFeed(options), platform === 'linux-x64' ? /LINUX_RENEWAL_PREDECESSOR_INVALID/ : /SAME_VERSION_FEED_CHANGED/);
+    assert.deepEqual(calls, []);
+    assert.equal((await readJournal()).state.writer, undefined);
+  }, { renewal: true });
+});
+
+test('failed renewal readback owns only its confirmed Linux write for exact rollback', async () => fixture(async ({ options, plan, objects, calls, readJournal }) => {
+  const linux = plan.targets.find(target => target.target === 'linux-x64');
+  const previous = Buffer.from(objects.get(linux.feed.objectKey).bytes), originalReadback = options.readPublicObject;
+  options.readPublicObject = async () => ({ status: 403 });
+  await assert.rejects(publishElectronStableFeed(options), /READBACK_STATUS_INVALID/);
+  const journal = await readJournal();
+  assert.equal(journal.state.writer.status, 'failed_known');
+  assert.deepEqual(journal.state.writer.completed.map(action => action.objectKey), [linux.feed.objectKey]);
+  options.readPublicObject = originalReadback; calls.length = 0;
+  await publishElectronStableFeed({ ...options, phase: 'rollback' });
+  assert.deepEqual(calls.filter(([kind]) => kind === 'put'), [['put', linux.feed.objectKey]]);
+  assert.deepEqual(objects.get(linux.feed.objectKey).bytes, previous);
+}, { renewal: true }));

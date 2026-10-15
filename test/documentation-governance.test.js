@@ -103,6 +103,77 @@ test("link parser ignores examples and finds inline and reference targets", () =
   ]);
 });
 
+test("private local paths and file URLs are rejected without echoing matched values", async () => {
+  const selected = await fixture({
+    "docs/paths.md": [
+      "[Private](/Users/alice/Library/Application%20Support/app/receipt.json)",
+      "file:///home/bob/.local/share/app/receipt.json",
+      "C:\\Users\\carol\\AppData\\Local\\app\\receipt.json",
+      "/Volumes/Backup/Users/dana/Library/app/receipt.json",
+      "/private/var/folders/abc123/T/result.json",
+      "[Encoded](file:%2F%2F%2FUsers%2Fsynthetic-canary%2Freceipt.json)",
+      "[EncodedScheme](file%3A%2F%2F%2FUsers%2Fscheme-canary%2Freceipt.json)",
+      "/root/root-canary/receipt.json",
+      "[EncodedPosix](/%55sers%2Fencoded-canary%2Freceipt.json)",
+      "[EncodedWindows](C%3A%5CUsers%5Cwindows-canary%5Creceipt.json)",
+      "[EncodedTemp](%2Fprivate%2Fvar%2Ffolders%2Ftemp-canary%2FT%2Freceipt.json)",
+      "[MalformedEncoded](/%55sers/malformed-canary/receipt%2)",
+      "[NamedHome](~synthetic-canary/.config/receipt.json)",
+      "[MountedLinux](/mnt/drive/home/mnt-canary/receipt.json)",
+    ].join("\n"),
+  });
+
+  const result = await validateDocumentation({
+    root: selected.root,
+    files: selected.files,
+    linksOnly: true,
+  });
+
+  assert.deepEqual(result.failures, [
+    "docs/paths.md:1: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:2: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:3: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:4: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:5: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:6: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:7: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:8: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:9: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:10: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:11: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:12: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:13: private absolute paths and local file URLs are forbidden in documentation",
+    "docs/paths.md:14: private absolute paths and local file URLs are forbidden in documentation",
+  ]);
+  assert.doesNotMatch(
+    result.failures.join("\n"),
+    /alice|bob|carol|dana|abc123|synthetic-canary|scheme-canary|root-canary|encoded-canary|windows-canary|temp-canary|malformed-canary|mnt-canary/u,
+  );
+});
+
+test("private path validation ignores portable placeholders and ordinary path-like prose", async () => {
+  const selected = await fixture({
+    "docs/guide.md": [
+      "Use secret from PATH; another machine may configure $HOME/.local/bin/secret.",
+      "The fields index/home/secret and root/home/loss are ordinary prose.",
+      "A file: an unexpired owner-only regular file is a valid description.",
+      "A remote route may contain https://example.test//Users/alice without becoming a local path.",
+      "[Remote](https://example.test/%2FUsers/alice/receipt.json)",
+      "Performance estimates: ~123 ms each, ~10 claims, and ~75% completion.",
+      "Use ~/relative/path as a portable example; named local homes are excluded.",
+      "See [the local guide](./guide.md).",
+      "A synthetic placeholder can be written as <private-home>/relative/file.",
+    ].join("\n"),
+  });
+
+  const result = await validateDocumentation({
+    root: selected.root,
+    files: selected.files,
+    linksOnly: true,
+  });
+  assert.deepEqual(result.failures, []);
+});
+
 test("heading anchors match GitHub duplicate and explicit-anchor behavior", () => {
   const anchors = markdownAnchors(`# Café & usage
 ## Repeat

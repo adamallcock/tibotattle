@@ -18,7 +18,10 @@ import {
 import {
   buildTelemetryContributionsFromBundle,
 } from "../src/telemetry-contribution-builder.js";
-import { startLocalCompanionServer } from "../apps/local/server.js";
+import {
+  fetch,
+  startLocalCompanionServer,
+} from "./helpers/local-authorized-client.js";
 
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
@@ -376,9 +379,9 @@ test("the dashboard's origin-less same-origin GET can read the recovery handle",
   // or CORS-tainted requests, so the dashboard's own same-origin GET arrives
   // with NO Origin header. The packaged 0.1.13 (1011) build refused exactly
   // that read (403), which silently disabled restart recovery: the page's
-  // resume saw "unavailable" and returned. The custom header remains the
-  // cross-origin boundary — a foreign page cannot attach it without a CORS
-  // preflight this server never grants.
+  // resume saw "unavailable" and returned. The launch capability authenticates
+  // this caller; the custom header and Origin checks remain additional
+  // cross-origin restrictions even for an authorized caller.
   const files = await fixture();
   const state = "s".repeat(64);
   const verifier = "v".repeat(64);

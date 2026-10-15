@@ -30,6 +30,73 @@ latest verified external state.
   [`config/deployment-endpoints.js`](../../config/deployment-endpoints.js) and
   are checked against `wrangler.jsonc`.
 
+## Public probes and release-guard admission
+
+`GET /api/health` and `GET /api/ready` retain their existing public, no-store
+response contracts. Before D1, R2, or upload-budget probes, each route consumes
+its own `PUBLIC_PROBE_RATE_LIMIT` coarse key and
+`PUBLIC_PROBE_CLIENT_RATE_LIMIT` pseudonymous client key. Staging and production
+allow 60 requests per route per minute per Cloudflare location, with a 12-request
+per-client ceiling. Separate health and ready Durable Object instances admit
+at most two concurrent probe chains and 60 starts/minute (burst two) each.
+Responses have a 15-second deadline; late chains cannot start later probe
+groups, and their leases are held until completion or the 30-second crash
+expiry. These are separate from participant uploads and public
+aggregate reads. Refusal is `429 ATTEMPT_LIMIT_REACHED`: edge refusal uses
+`Retry-After: 60`; the coordinated budget returns its bounded 1–30 second
+wait.
+release-readiness records `HEALTH_PROBE_THROTTLED` or `READY_PROBE_THROTTLED`
+and a conservative 60-second retry floor, without immediate automatic retries.
+Missing or failed admission returns a content-free 503. Public probes use
+bounded structured logs and never persist D1 diagnostics, including backend
+failures after a probe lease is released. Successful admission still exposes real backend failures and
+stale readiness; no success cache conceals them. The migration barrier's
+storage-free health response remains before admission.
+
+In GCP edge mode, the edge applies these same probe limits and named leases
+before requesting an origin token or forwarding health/readiness. Probe deadlines
+also fence delayed token completion so an expired request cannot start an origin
+fetch. The ordinary local handler environment remains free of participant storage
+and admission capabilities. Only the probe path receives its two limiters and
+lease namespace; only the appcast guard receives its coarse limiter, lease
+namespace and nonce-only release-guard database facade. The client key stays at
+the edge and never enters the forwarding contract.
+
+Enabled stable and dogfood appcast guards reject missing, malformed or stale
+HMAC header shapes before reading a body. The complete body-bound HMAC remains
+mandatory. `SPARKLE_APPCAST_GUARD_RATE_LIMIT` first limits coarse attempts to
+60/minute per Cloudflare location, then a separate named instance in `UPLOAD_INGRESS_BUDGET` uses the
+reviewed `UploadIngressBudget` class with independent state: four concurrent
+preauthentication bodies, a burst of four, and 12 starts/minute globally for
+that guard. The 2 MiB reader stops after 5 seconds idle or 15 seconds total,
+without awaiting untrusted stream cancellation. Body/HMAC leases release in
+`finally` on every outcome and expire after 30 seconds if the Worker or release
+RPC fails. Authenticated signature, target and conditional-write checks remain unchanged.
+Nonce retention is 601 seconds, covering both sides of the permitted 300-second
+timestamp skew so a future-dated signature cannot outlive its replay record. The edge limiter is an abuse breaker, not globally exact
+accounting; the Durable Object coordinates the body slots.
+
+Before activating this source, separately authorize provisioning and readback
+of the three new rate bindings: `PUBLIC_PROBE_RATE_LIMIT` (60/minute),
+`PUBLIC_PROBE_CLIENT_RATE_LIMIT` (12/minute), and
+`SPARKLE_APPCAST_GUARD_RATE_LIMIT` (60/minute), with distinct namespaces and
+60-second periods. The protected production renderer preserves captured live
+bindings, so missing or altered bindings block candidate preparation; checked-in
+Wrangler declarations alone do not provision that captured configuration.
+After provisioning, capture a fresh live inventory and pass deployment preflight
+before activating code. No provisioning or deployment is implied by local
+validation. Deploy code together with the verified bindings. The primary Worker reuses
+its existing Durable Object namespace and class and needs no new class migration. The separate
+dogfood Worker exports that class and has its own
+`appcast-guard-body-budget-v1` SQLite class migration. Synthetic Wrangler
+configuration raises only edge limiter ceilings for test/lab cohorts; the
+appcast body and global lease bounds remain the same. Run
+`npm run product:worker:check` before any separately authorized deployment;
+then verify ordinary health/ready responses and one intended signed publication
+through the existing release workflow. Local tests do not qualify deployed
+bindings, a class migration, or published appcast state. Do not load-test the
+live service as part of these checks.
+
 ## Privacy and authorization invariants
 
 - Uploads accept only closed, versioned, content-free telemetry envelopes.
@@ -364,6 +431,11 @@ Complete Worker gate from the repository root:
 ```bash
 npm run product:worker:check
 ```
+
+The process checks require `zsh` with its `zsh/datetime` module, `/usr/bin/time`,
+`ps`, and `pgrep`. The Ubuntu CI job explicitly installs `zsh`, `time`, and
+`procps`; missing prerequisites must fail the gate. Native timing uses BSD time
+on macOS and GNU time on Linux, with measurements normalized to the same units.
 
 That gate checks guarded workspace-package copies, endpoint parity, generated
 types, TypeScript, operational scripts, Vitest, production asset staging, dry

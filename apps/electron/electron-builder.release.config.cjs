@@ -12,50 +12,32 @@ const RELEASE_MODE_ENV = "TIBOTATTLE_ELECTRON_SIGNING_MODE";
 const RELEASE_VERSION_ENV = "TIBOTATTLE_ELECTRON_VERSION";
 const RELEASE_SOURCE_REVISION_ENV = "TIBOTATTLE_ELECTRON_SOURCE_REVISION";
 const RELEASE_BUILD_NUMBER_ENV = "TIBOTATTLE_ELECTRON_BUILD_NUMBER";
-const RELEASE_SIGNING_MODE = "azure-trusted-signing";
+const RELEASE_SIGNING_MODE = "staged-transfer";
+const SIGNING_TRANSFER_STAGE_ENV = "TIBOTATTLE_WINDOWS_SIGNING_TRANSFER_STAGE";
 const SOURCE_CANDIDATE_RECEIPT_ENV =
   "TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_RECEIPT";
 const SOURCE_CANDIDATE_SHA256_ENV =
   "TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_SHA256";
 const AZURE_PUBLISHER_ENV = "TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME";
-const AZURE_ENDPOINT_ENV = "TIBOTATTLE_ELECTRON_AZURE_ENDPOINT";
-const AZURE_ACCOUNT_ENV = "TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME";
-const AZURE_PROFILE_ENV = "TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME";
-// These values are supplied by the reviewed Azure Artifact Signing handoff.
-// Keep them closed here: a syntactically valid but different resource must
-// never silently redirect a production-shaped build to another signer.
+// The publisher identifies the expected signed application. The builder has
+// no signing endpoint, credential source, or access to a signing identity.
 const AZURE_EXPECTED_PUBLISHER = "Adam Allcock";
-const AZURE_EXPECTED_ENDPOINT = "https://eus.codesigning.azure.net/";
-const AZURE_EXPECTED_ACCOUNT = "tibotattlesigning";
-const AZURE_EXPECTED_PROFILE = "tibotattle-windows-public";
-const AZURE_EXPECTED_TIMESTAMP = "http://timestamp.acs.microsoft.com";
-const WINDOWS_SIGNING_OPERATION_LEDGER_LEAF = "windows-signing-operation-ledger.json";
 const CANDIDATE_SCHEMA = "tibotattle-electron-production-source-candidate-v1";
 const MAX_CANDIDATE_RECEIPT_BYTES = 128 * 1024;
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const BUILD_NUMBER_PATTERN = /^[1-9][0-9]{0,9}$/u;
 const SHA256_HEX = /^[0-9a-f]{64}$/u;
-// TrustedSigning 0.5.0 uses DefaultAzureCredential.  Azure/login supplies
-// the approved service-principal session through the Azure CLI cache; every
-// other credential source is disabled explicitly.  ExcludeAzureCliCredential
-// is intentionally absent so the two signing paths share one credential mode.
-const TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS = Object.freeze({
-  ExcludeEnvironmentCredential: true,
-  ExcludeWorkloadIdentityCredential: true,
-  ExcludeManagedIdentityCredential: true,
-  ExcludeSharedTokenCacheCredential: true,
-  ExcludeVisualStudioCredential: true,
-  ExcludeVisualStudioCodeCredential: true,
-  ExcludeAzurePowerShellCredential: true,
-  ExcludeAzureDeveloperCliCredential: true,
-  ExcludeInteractiveBrowserCredential: true,
-});
-// Keep this list in lockstep with the protected finalizer policy.  These
-// names must not be present in the builder process even when a developer or
-// runner has them in its ambient environment.  The four TIBOTATTLE_ELECTRON_*
-// resource variables below are the only Azure values intentionally passed to
-// electron-builder.
+// Keep the builder outside the credential-bearing signer. Presence, including
+// an empty value, is rejected so ambient runner authentication cannot silently
+// become part of the packaging contract.
 const LEGACY_SIGNING_ENV_NAMES = new Set([
+  "ACTIONS_ID_TOKEN_REQUEST_URL",
+  "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+  "ACTIONS_RUNTIME_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
   "CSC_LINK",
   "WIN_CSC_LINK",
   "CSC_KEY_PASSWORD",
@@ -77,6 +59,9 @@ const LEGACY_SIGNING_ENV_NAMES = new Set([
   "AZURE_USERNAME",
   "AZURE_PASSWORD",
   "AZURE_FEDERATED_TOKEN_FILE",
+  "AZURE_CONFIG_DIR",
+  "AZURE_AUTH_LOCATION",
+  "AZURE_ACCESS_TOKEN",
   "AZURE_CODE_SIGNING_ACCOUNT_NAME",
   "AZURE_CODE_SIGNING_PROFILE_NAME",
   "AZURE_CODE_SIGNING_ENDPOINT",
@@ -94,14 +79,13 @@ const LEGACY_SIGNING_ENV_NAMES = new Set([
   "TIBOTATTLE_WINDOWS_PFX_PATH",
 ]);
 const FORBIDDEN_SIGNING_ENVIRONMENT_PATTERNS = Object.freeze([
+  /^(?:AZURE_|ARM_|CSC_|WIN_CSC_)/u,
   /(?:^|_)(?:WIN_)?CSC(?:_|$)/u,
   /(?:^|_)(?:PFX|P12)(?:_|$)/u,
   /(?:^|_)(?:AZURE|ARM)_(?:CLIENT_SECRET|CLIENT_CERTIFICATE|FEDERATED_TOKEN)(?:_|$)/u,
 ]);
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
-const RESOURCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const PUBLISHER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .,&()=+_-]{0,255}$/u;
-const ENDPOINT_HOST_PATTERN = /^[a-z0-9-]+\.codesigning\.azure\.net$/u;
 
 class WindowsReleaseBuilderConfigError extends Error {
   constructor() {
@@ -164,42 +148,9 @@ function requireSafeEnvironmentValue(name, pattern) {
   return value;
 }
 
-function requireAzureEndpoint() {
-  const value = process.env[AZURE_ENDPOINT_ENV];
-  if (!hasEnvironmentVariable(AZURE_ENDPOINT_ENV)
-      || typeof value !== "string"
-      || value.length === 0
-      || value.length > 256) {
-    fail();
-  }
-  try {
-    const endpoint = new URL(value);
-    if (endpoint.protocol !== "https:"
-        || endpoint.username !== ""
-        || endpoint.password !== ""
-        || endpoint.port !== ""
-        || endpoint.pathname !== "/"
-        || endpoint.search !== ""
-        || endpoint.hash !== ""
-        || !ENDPOINT_HOST_PATTERN.test(endpoint.hostname)) {
-      fail();
-    }
-  } catch (error) {
-    if (error instanceof WindowsReleaseBuilderConfigError) throw error;
-    fail();
-  }
-  return value;
-}
-
 function requireExactAzureResource(name, expected, pattern) {
   const value = requireSafeEnvironmentValue(name, pattern);
   if (value !== expected) fail();
-  return value;
-}
-
-function requireExactAzureEndpoint() {
-  const value = requireAzureEndpoint();
-  if (value !== AZURE_EXPECTED_ENDPOINT) fail();
   return value;
 }
 
@@ -358,6 +309,8 @@ function readReleaseInputs() {
   if (hasForbiddenSigningEnvironment()) fail();
   requireExactEnvironmentValue(RELEASE_TARGET_ENV, "win32-x64");
   requireExactEnvironmentValue(RELEASE_MODE_ENV, RELEASE_SIGNING_MODE);
+  const signingTransferStage = process.env[SIGNING_TRANSFER_STAGE_ENV];
+  if (signingTransferStage !== "application" && signingTransferStage !== "uninstaller") fail();
 
   const packageVersion = readPackageVersion();
   requireExactEnvironmentValue(RELEASE_VERSION_ENV, packageVersion);
@@ -374,21 +327,11 @@ function readReleaseInputs() {
     candidate,
     packageVersion,
     sourceRevision,
+    signingTransferStage,
     publisherName: requireExactAzureResource(
       AZURE_PUBLISHER_ENV,
       AZURE_EXPECTED_PUBLISHER,
       PUBLISHER_NAME_PATTERN,
-    ),
-    endpoint: requireExactAzureEndpoint(),
-    codeSigningAccountName: requireExactAzureResource(
-      AZURE_ACCOUNT_ENV,
-      AZURE_EXPECTED_ACCOUNT,
-      RESOURCE_NAME_PATTERN,
-    ),
-    certificateProfileName: requireExactAzureResource(
-      AZURE_PROFILE_ENV,
-      AZURE_EXPECTED_PROFILE,
-      RESOURCE_NAME_PATTERN,
     ),
   });
 }
@@ -426,10 +369,6 @@ function readExactStagedManifest() {
 }
 
 const STAGED_DISTRIBUTION = readExactStagedManifest();
-const WINDOWS_SIGNING_OPERATION_EVIDENCE_ROOT = path.join(
-  path.dirname(RELEASE_INPUTS.candidate.stagingDirectory),
-  "evidence",
-);
 
 // Keep this closure deliberately explicit and target-specific. The unsigned
 // development configuration is a separate lane; importing and mutating it
@@ -540,31 +479,18 @@ module.exports = {
     target: [{ target: "nsis", arch: ["x64"] }],
     signAndEditExecutable: true,
     signExecutable: true,
-    // Foundation state: electron-builder is the only signer today. The
-    // production finalizer must pre-sign and hash both native modules, then
-    // remove `.node` here before it may mint an authority manifest; otherwise
-    // this pass would mutate those recorded bytes a second time.
     // Native .node files are signed by the finalizer's fixed pre-sign pass.
     // electron-builder's negative extension rule keeps this packaging pass
     // from mutating the bytes that the authority manifest records.
     signExts: [".dll", "!.node"],
     requestedExecutionLevel: "asInvoker",
     verifyUpdateCodeSignature: true,
-    // The pinned app-builder-lib patch emits one content-free, no-clobber
-    // operation ledger here after the complete packaging/signing pass. Its
-    // JSON contains only fixed extension classes and counts; the protected
-    // finalizer binds it to this exact production output before promotion.
-    windowsSigningOperationEvidenceRoot: WINDOWS_SIGNING_OPERATION_EVIDENCE_ROOT,
-    windowsSigningOperationLedgerLeaf: WINDOWS_SIGNING_OPERATION_LEDGER_LEAF,
+    // The patched manager records subjects for a separate signer. A deferred
+    // request is not a signature and must never emit a signing receipt here.
+    windowsSigningTransferHook: path.join(REPOSITORY_ROOT, "scripts/lib/windows-signing-transfer.cjs"),
+    windowsSigningTransferStage: RELEASE_INPUTS.signingTransferStage,
     azureSignOptions: {
       publisherName: RELEASE_INPUTS.publisherName,
-      endpoint: RELEASE_INPUTS.endpoint,
-      certificateProfileName: RELEASE_INPUTS.certificateProfileName,
-      codeSigningAccountName: RELEASE_INPUTS.codeSigningAccountName,
-      fileDigest: "SHA256",
-      timestampRfc3161: AZURE_EXPECTED_TIMESTAMP,
-      timestampDigest: "SHA256",
-      ...TRUSTEDSIGNING_AZURE_CLI_ONLY_EXCLUSIONS,
     },
   },
   nsis: {

@@ -1,3 +1,4 @@
+import { localRequest } from "./local-request.js";
 import { compareModelPresentation, modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   formatNumber,
@@ -189,7 +190,7 @@ export function mountWorkUsageView(options = {}) {
     root,
     t,
     windowRef = window,
-    fetchRef = (input, init) => windowRef.fetch(input, init),
+    fetchRef = localRequest,
   } = options;
   const documentRef = root.ownerDocument;
   let sharedReporting = options.sharedReporting === true || Object.hasOwn(options, "reportingWindow");

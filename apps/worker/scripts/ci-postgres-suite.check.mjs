@@ -35,10 +35,13 @@ import {
   parseDomainCheckRegistration,
   parseExtraRegistrationScript,
   parseNodeTap,
+  parsePostgresSuiteArguments,
   parseVitestInclude,
   parseVitestReport,
   passEnvironment,
+  partitionPostgresSuite,
   planPostgresSuite,
+  POSTGRES_SUITE_SHARDS,
   probeEdgeE2eEnvironment,
   PROFILE_EDGE_E2E,
   readSocketProfileInput,
@@ -90,6 +93,57 @@ async function editJson(path, edit) {
 }
 
 const codes = (failures) => failures.map(({ code }) => code);
+
+test("the four closed shards are a deterministic, disjoint union of the complete canonical plan", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const partitions = partitionPostgresSuite(plan);
+  assert.deepEqual(Object.keys(partitions), ["vitest", "node-1", "node-2", "edge-e2e"]);
+  assert.deepEqual(Object.keys(partitions), POSTGRES_SUITE_SHARDS);
+  const names = (entries) => entries.map(({ file }) => file);
+  const all = Object.values(partitions).flat();
+  assert.equal(new Set(names(all)).size, plan.files.length, "no file is duplicated between shards");
+  assert.deepEqual(names(all).sort(), names(plan.files).sort(), "no canonical file is missing or added");
+  assert.deepEqual(partitions.vitest, plan.files.filter(({ runner }) => runner.startsWith("vitest:")));
+  assert.deepEqual(names(partitions["edge-e2e"]), [EDGE_SPEC]);
+  const nodeFiles = names(plan.files.filter(({ runner }) => runner === "node")).sort();
+  for (const [index, shard] of ["node-1", "node-2"].entries()) {
+    assert.deepEqual(names(partitions[shard]).sort(), nodeFiles.filter((_, position) => position % 2 === index));
+  }
+  const reversed = partitionPostgresSuite({ ...plan, files: [...plan.files].reverse() });
+  for (const shard of POSTGRES_SUITE_SHARDS) {
+    assert.ok(partitions[shard].length > 0);
+    assert.deepEqual(names(reversed[shard]).sort(), names(partitions[shard]).sort(), "membership ignores registration order");
+    assert.deepEqual(partitions[shard], plan.files.filter((entry) => partitions[shard].includes(entry)),
+      "each shard retains the canonical execution order");
+  }
+});
+
+test("sharding rejects invalid full plans, duplicate files, unknown execution profiles and empty groups", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  for (const invalid of [
+    { ...plan, failures: [{ code: "UNREGISTERED_POSTGRES_SPEC" }] },
+    { ...plan, files: [...plan.files, plan.files[0]] },
+    { ...plan, files: [...plan.files, { file: "postgres-test/unknown.spec.mjs", runner: "unknown", profile: "SOCKET" }] },
+    { ...plan, files: plan.files.map((entry, index) => index === 0 ? { ...entry, profile: "UNKNOWN" } : entry) },
+    { ...plan, files: plan.files.filter(({ file }) => file !== EDGE_SPEC) },
+  ]) {
+    assert.throws(() => partitionPostgresSuite(invalid), /CI_SUITE_SHARD_PLAN_INVALID/u);
+  }
+});
+
+test("the CLI accepts only the reviewed shard names and keeps the default full-suite selection", () => {
+  assert.deepEqual(parsePostgresSuiteArguments([]), { planOnly: false, shard: null });
+  assert.deepEqual(parsePostgresSuiteArguments(["--plan"]), { planOnly: true, shard: null });
+  for (const shard of POSTGRES_SUITE_SHARDS) {
+    assert.deepEqual(parsePostgresSuiteArguments(["--shard", shard]), { planOnly: false, shard });
+    assert.deepEqual(parsePostgresSuiteArguments(["--plan", "--shard", shard]), { planOnly: true, shard });
+    assert.deepEqual(parsePostgresSuiteArguments(["--shard", shard, "--plan"]), { planOnly: true, shard });
+  }
+  for (const argv of [
+    ["--shard"], ["--shard", "all"], ["--shard", "0"], ["--shard", "vitest", "--shard", "node-1"],
+    ["--plan", "--plan"], ["--files", EDGE_SPEC], ["--shard=vitest"],
+  ]) assert.throws(() => parsePostgresSuiteArguments(argv), /CI_SUITE_USAGE/u);
+});
 
 // ---------------------------------------------------------------------------
 // Profile routing
@@ -646,10 +700,12 @@ test("parent", async (t) => { await t.test("child", () => {}); });
 function vitestReport(entries) {
   return {
     numTotalTests: 0,
-    testResults: entries.map(({ file, status = "passed", message = "", assertions }) => ({
+    testResults: entries.map(({ file, status = "passed", message = "", assertions, startTime = 100, endTime = 105 }) => ({
       name: join(WORKER_ROOT, file),
       status,
       message,
+      startTime,
+      endTime,
       assertionResults: assertions.map(([ancestors, title, assertionStatus, failureMessages = []]) => ({
         ancestorTitles: ancestors,
         fullName: [...ancestors, title].join(" "),
@@ -724,6 +780,21 @@ test("vitest JSON: a disabled test is a skip and an unknown status is a failure,
     ["FAILED", "suite > from a newer vitest"],
     ["FAILED", "suite > no status"],
   ]);
+  assert.equal(summary.passedByPass.SOCKET, 0);
+});
+
+test("vitest JSON refuses duplicate file results instead of replacing a failed result with a pass", () => {
+  const file = "postgres-test/a.spec.mjs";
+  const parsed = parseVitestReport(vitestReport([
+    { file, assertions: [[[], "first result", "failed", ["synthetic assertion"]]] },
+    { file, assertions: [[[], "second result", "passed"]] },
+  ]), { workerRoot: WORKER_ROOT });
+  assert.deepEqual(parsed.parseFailures, ["VITEST_REPORT_DUPLICATE"]);
+  const summary = evaluatePostgresSuite({
+    plan: { files: [{ file, profile: "SOCKET" }] }, records: [vitestRecord(parsed)],
+  });
+  assert.equal(summary.status, "failed");
+  assert.deepEqual(codes(summary.failures), ["VITEST_REPORT_DUPLICATE", "FAILED"]);
   assert.equal(summary.passedByPass.SOCKET, 0);
 });
 
@@ -830,11 +901,13 @@ const edgeAvailable = async () => ({ available: true, node: EDGE_NODE });
 test("the runner sends each file to its routed profile and never sets PG_TEST_PASSWORD", async () => {
   const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
   const { run, calls } = fakeSuiteRunner({ plan });
+  const progress = [];
   const summary = await runPostgresSuite({
     workerRoot: WORKER_ROOT,
     environment: { PATH: "/usr/bin", PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432", PGPASSWORD_UNRELATED: "x" },
     run,
     onOutput: () => {},
+    onProgress: (event) => progress.push(event),
     plan,
     probeEdgeE2e: edgeAvailable,
   });
@@ -842,6 +915,7 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
   assert.deepEqual(summary.skipped, []);
   assert.equal(summary.files, plan.files.length);
   assert.equal(summary.tests, plan.files.length);
+  assert.equal(summary.scope, undefined, "the default result still represents the complete suite");
   assert.equal(summary.passedByPass.HOST, EXPECTED_HOST_PROFILE_FILES.length);
 
   const vitestCalls = calls.filter(({ args }) => args.includes("run"));
@@ -891,6 +965,122 @@ test("the runner sends each file to its routed profile and never sets PG_TEST_PA
   }
   assert.equal(summary.passedByPass.EDGE_E2E, 1);
   assert.deepEqual(summary.environmentGaps, []);
+  const phaseEvents = progress.filter(({ phase }) => phase !== "vitest-file");
+  assert.equal(phaseEvents.length, calls.length * 2, "each process has start and completion timing");
+  for (let index = 0; index < phaseEvents.length; index += 2) {
+    const { state, ...started } = phaseEvents[index];
+    const { state: completedState, elapsedMs, exitCode, ...completed } = phaseEvents[index + 1];
+    assert.equal(state, "started");
+    assert.equal(completedState, "completed");
+    assert.deepEqual(started, completed);
+    assert.ok(Number.isInteger(elapsedMs) && elapsedMs >= 0);
+    assert.equal(exitCode, 0);
+  }
+  const vitestFiles = progress.filter(({ phase }) => phase === "vitest-file");
+  assert.deepEqual(vitestFiles.map(({ file }) => file),
+    plan.files.filter(({ runner }) => runner.startsWith("vitest:")).map(({ file }) => file));
+  assert.ok(vitestFiles.every(({ state, elapsedMs }) => state === "reported" && elapsedMs === 5));
+  for (const event of progress) {
+    assert.ok(Object.keys(event).every((key) => ["phase", "file", "profile", "runtime", "state", "elapsedMs", "exitCode"].includes(key)));
+    assert.ok(!event.file.startsWith("/"), "progress contains only reviewed repository-relative identities");
+    assert.ok(["repository", "image"].includes(event.runtime), "runtime paths are never emitted");
+  }
+  assert.doesNotMatch(JSON.stringify(progress), /PGPASSWORD_UNRELATED|synthetic\/node|private\/tmp|synthetic assertion/u);
+});
+
+test("all closed shard runs retain exact coverage, serial profiles and explicitly partial summaries", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const partitions = partitionPostgresSuite(plan);
+  const executed = [];
+  for (const shard of POSTGRES_SUITE_SHARDS) {
+    const { run, calls } = fakeSuiteRunner({ plan });
+    const progress = [];
+    const summary = await runPostgresSuite({
+      workerRoot: WORKER_ROOT, shard,
+      environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+      run, onOutput: () => {}, onProgress: (event) => progress.push(event), probeEdgeE2e: edgeAvailable,
+    });
+    const selected = partitions[shard].map(({ file }) => file);
+    assert.equal(summary.status, "passed", JSON.stringify(summary.failures));
+    assert.deepEqual(summary.scope, {
+      kind: "shard", shard, canonicalFiles: plan.files.length, selectedFiles: selected,
+      requiredShards: POSTGRES_SUITE_SHARDS,
+    });
+    assert.equal(summary.files, selected.length);
+    assert.equal(summary.tests, selected.length);
+    assert.deepEqual([summary.skipped, summary.environmentGaps], [[], []]);
+    const reported = progress.filter(({ phase, state }) => phase === "vitest-file"
+      || (phase === "node-test" && state === "completed")).map(({ file }) => file);
+    assert.deepEqual([...reported].sort(), [...selected].sort());
+    executed.push(...reported);
+    const nodeCalls = calls.filter(({ args }) => args.includes("--test"));
+    assert.ok(nodeCalls.every(({ args }) => args.includes("--test-concurrency=1")));
+    const hostIndex = nodeCalls.findIndex(({ env }) => env.PG_TEST_HOST !== undefined);
+    if (hostIndex !== -1) {
+      assert.ok(hostIndex > nodeCalls.findLastIndex(({ env }) => env.PG_TEST_SOCKET !== undefined));
+    }
+  }
+  assert.equal(new Set(executed).size, plan.files.length);
+  assert.deepEqual(executed.sort(), plan.files.map(({ file }) => file).sort());
+});
+
+test("shards refuse caller-supplied subsets and validate defects outside their selected group before execution", async () => {
+  const noRun = async () => { assert.fail("an invalid complete plan must never start a process"); };
+  const options = { environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" }, run: noRun };
+  await assert.rejects(runPostgresSuite({ ...options, shard: "unknown" }), /CI_SUITE_USAGE/u);
+  await assert.rejects(runPostgresSuite({ ...options, shard: "vitest", plan: { files: [], failures: [] } }),
+    /CI_SUITE_SHARD_PLAN_INVALID/u);
+  await withWorkerCopy(async (workerRoot) => {
+    await writeFile(join(workerRoot, "postgres-test/unregistered-node.spec.mjs"),
+      'import test from "node:test";\ntest("synthetic", () => {});\n');
+    const summary = await runPostgresSuite({ ...options, workerRoot, shard: "vitest" });
+    assert.equal(summary.status, "failed");
+    assert.ok(codes(summary.failures).includes("UNREGISTERED_POSTGRES_SPEC"));
+    assert.equal(summary.tests, 0);
+  });
+});
+
+test("shard selection preserves refusal of skipped, missing, duplicate and unplanned results", async () => {
+  const plan = await planPostgresSuite({ workerRoot: WORKER_ROOT });
+  const mutations = [
+    ["SILENTLY_SKIPPED", (report) => { report.testResults[0].assertionResults[0].status = "skipped"; }],
+    ["EMPTY_SPEC_FILE", (report) => { report.testResults.shift(); }],
+    ["VITEST_REPORT_DUPLICATE", (report) => { report.testResults.push(structuredClone(report.testResults[0])); }],
+    ["UNPLANNED_SPEC_RESULT", (report) => {
+      report.testResults.push({ ...report.testResults[0], name: join(WORKER_ROOT, EDGE_SPEC) });
+    }],
+  ];
+  for (const [expectedCode, mutate] of mutations) {
+    const fake = fakeSuiteRunner({ plan });
+    const summary = await runPostgresSuite({
+      workerRoot: WORKER_ROOT, shard: "vitest",
+      environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+      onOutput: () => {}, onProgress: () => {},
+      run: async (command, args, options) => {
+        const result = await fake.run(command, args, options);
+        const output = args.find((arg) => arg.startsWith("--outputFile=")).slice("--outputFile=".length);
+        const report = JSON.parse(await readFile(output, "utf8"));
+        mutate(report);
+        await writeFile(output, JSON.stringify(report));
+        return result;
+      },
+    });
+    assert.equal(summary.status, "failed", expectedCode);
+    assert.ok(codes(summary.failures).includes(expectedCode), expectedCode);
+  }
+});
+
+test("process-error timing exposes no exception content, environment or executable paths", async () => {
+  const progress = [];
+  await assert.rejects(runPostgresSuite({
+    workerRoot: WORKER_ROOT, shard: "node-1",
+    environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
+    onProgress: (event) => progress.push(event),
+    run: async () => { throw new Error("synthetic-private-error-content"); },
+  }), /synthetic-private-error-content/u);
+  assert.deepEqual(progress.map(({ state }) => state), ["started", "failed"]);
+  assert.ok(Number.isInteger(progress[1].elapsedMs) && progress[1].elapsedMs >= 0);
+  assert.doesNotMatch(JSON.stringify(progress), /synthetic-private-error-content|PG_TEST_SOCKET|private\/tmp/u);
 });
 
 test("a skip inside the routed pass fails the whole run", async () => {
@@ -901,6 +1091,7 @@ test("a skip inside the routed pass fails the whole run", async () => {
     environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
     run,
     onOutput: () => {},
+    onProgress: () => {},
     plan,
   });
   assert.equal(summary.status, "failed");
@@ -927,6 +1118,7 @@ test("a static plan failure fails the run before any spec process starts", async
       return { exitCode: 0, stdout: "" };
     },
     onOutput: () => {},
+    onProgress: () => {},
     plan: { ...plan, failures: [unregistered] },
   });
   assert.equal(summary.status, "failed");
@@ -1102,6 +1294,7 @@ test("without the EDGE_E2E runtime the spec is a named environment gap: never ru
     environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
     run,
     onOutput: () => {},
+    onProgress: () => {},
     plan,
   });
   assert.equal(summary.status, "incomplete");
@@ -1150,6 +1343,7 @@ test("a failing EDGE_E2E prerequisite fails the run and the spec does not start"
     environment: { PG_TEST_SOCKET: SOCKET, PG_TEST_PORT: "5432" },
     run,
     onOutput: () => {},
+    onProgress: () => {},
     plan,
     probeEdgeE2e: edgeAvailable,
   });

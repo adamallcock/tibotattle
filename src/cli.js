@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
 import {
+  CodexAppServerError,
   inspectCodexBinary,
   readCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
@@ -219,6 +220,26 @@ function usage() {
   usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--output PATH] [--report-file PATH]
   usage-monitor migrate-corrections [--observations PATH] [--transitions PATH] [--corrections PATH] [--output PATH] [--report-file PATH]
 `);
+}
+
+const CODEX_APP_SERVER_ERROR_MESSAGES = Object.freeze({
+  app_server_unavailable: "Unable to start the Codex app-server",
+  authentication_failure: "Codex app-server authentication failed",
+  malformed_output: "Codex app-server returned malformed output",
+  request_failed: "Codex app-server request failed",
+  request_timeout: "Codex app-server request timed out",
+  temporary_disconnect: "Codex app-server disconnected",
+});
+
+export function formatCliError(error) {
+  if (error instanceof CodexAppServerError) {
+    const code = typeof error.code === "string" ? error.code : "";
+    return Object.hasOwn(CODEX_APP_SERVER_ERROR_MESSAGES, code)
+      ? CODEX_APP_SERVER_ERROR_MESSAGES[code]
+      : "Codex app-server operation failed";
+  }
+  if (error instanceof Error) return error.message;
+  return "Unknown error";
 }
 
 function readOptionValue(argv, index, option) {
@@ -1634,7 +1655,7 @@ export async function run(
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   run().catch((error) => {
-    console.error(`usage-monitor: ${error.message}`);
+    console.error(`usage-monitor: ${formatCliError(error)}`);
     process.exitCode = 1;
   });
 }

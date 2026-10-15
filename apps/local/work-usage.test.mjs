@@ -9,7 +9,7 @@ import {
   WORK_USAGE_SCHEMA,
   createWorkUsageAccumulator,
 } from "../../src/reporting/index.js";
-import { startLocalCompanionServer } from "./server.js";
+import { startLocalCompanionServer, localAuthorizationHeaders } from "../../test/helpers/local-authorized-client.js";
 
 function event({ project, tokens, thread = `thread-${project}` }) {
   return {
@@ -58,7 +58,7 @@ function rawRequest({
   body = "",
 }) {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: "127.0.0.1", port, path, method, headers: { Host: host, ...headers } }, (response) => {
+    const request = httpRequest({ host: "127.0.0.1", port, path, method, headers: { ...localAuthorizationHeaders({ port, path, method }), Host: host, ...headers } }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => resolve({

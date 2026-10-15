@@ -5,6 +5,7 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { init, parse } from "es-module-lexer";
+import { POSTGRES_SUITE_SHARDS } from "../apps/worker/scripts/ci-postgres-suite.mjs";
 
 import {
   checkReleaseWorkflowPolicy,
@@ -34,11 +35,22 @@ const EXPECTED_PATHS = Object.freeze([
 const START_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile";
 const STOP_POSTGRES = "node apps/worker/scripts/ci-postgres-container.mjs --stop";
 const SUITE_SCRIPT = "apps/worker/scripts/ci-postgres-suite.mjs";
+const SHARD_COMMAND = `node ${SUITE_SCRIPT} --shard "$PG_SUITE_SHARD"`;
+const AGGREGATE_JOB = "postgres-17-complete";
+const AGGREGATE_CONTRACT = Object.freeze({
+  name: "PostgreSQL 17 suite",
+  "runs-on": "ubuntu-24.04",
+  "timeout-minutes": 45,
+  if: "always()",
+  needs: ["postgres-17-suite"],
+  env: { PG_SUITE_RESULT: "${{ needs.postgres-17-suite.result }}" },
+  steps: [{ name: "Require every canonical PostgreSQL shard to pass", run: 'test "$PG_SUITE_RESULT" = success' }],
+});
 const EDGE_SPEC = "apps/worker/postgres-test/edge-origin-e2e.spec.mjs";
 const TRANSFER_SPEC = "apps/worker/postgres-test/postgres-v12-transfer.spec.mjs";
 const TOOLCHAIN_NODE = "26.2.0";
 const IMAGE_NODE = "22.16.0";
-// Every job runs the repository toolchain. Only the PostgreSQL 17 suite also
+// Every execution job runs the repository toolchain. Only the PostgreSQL shards also
 // installs the Cloud Run image runtime, first, so the toolchain stays first on
 // PATH. The Cloud Run image runtime is allowed in this workflow only; see
 // scripts/check-release-workflow-policy.mjs.
@@ -47,14 +59,33 @@ const NODE_PLAN = Object.freeze({
   "cloud-run-check": Object.freeze([TOOLCHAIN_NODE]),
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
 });
-// The Worker gate checks out depth 1. The Cloud Run check runs the cutover
+// The Worker gate's vendor-kernel check reads the pinned c766 facade and
+// d43c8f92~25 ancestry regression. The Cloud Run check runs the cutover
 // seal check, which reads pinned commits (the restore-base generator commit
 // and the Cloudflare production line) as git objects and fails as an
 // environment gap without them. The PostgreSQL 17 suite runs the
 // READ-EXPANSION specs, which `git archive` their pinned base commit
-// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). Both need full history.
-const FETCH_DEPTH = Object.freeze({ "worker-gate": 1, "cloud-run-check": 0, "postgres-17-suite": 0 });
+// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). All need full history.
+const FETCH_DEPTH = Object.freeze({ "worker-gate": 0, "cloud-run-check": 0, "postgres-17-suite": 0 });
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
+const WORKER_PROCESS_PREREQUISITES = Object.freeze({
+  name: "Install Worker process-check prerequisites",
+  "timeout-minutes": 5,
+  run: [
+    "set -euo pipefail",
+    "sudo apt-get update",
+    "sudo apt-get install --yes --no-install-recommends zsh time procps",
+    "test -x /usr/bin/time",
+    "test -x /bin/ps",
+    "test -x /usr/bin/pgrep",
+    "zsh -ec 'zmodload zsh/datetime'",
+    "",
+  ].join("\n"),
+});
+const WORKER_GRAPH_DIAGNOSTIC = Object.freeze({
+  name: "Diagnose the complete Worker graph file early",
+  run: "node scripts/worker-graph-thread-diagnostic.mjs",
+});
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
 // the PostgreSQL 17 suite. The rest run in the Cloud Run job, one step each.
@@ -67,6 +98,28 @@ const OFFLINE_PRODUCTION_TOOLING = Object.freeze([
 ]);
 const LOCAL_CHECK = "gcp:production-tooling:local-check";
 const workerNpm = (script) => `npm --prefix apps/worker run ${script}`;
+const WORKER_GATE_RUN = [
+  "set -euo pipefail",
+  "vmstat -w -t 30 &",
+  "resource_sampler_pid=$!",
+  'node scripts/hosted-backend-process-sampler.mjs --parent-pid "$$" &',
+  "process_sampler_pid=$!",
+  "cleanup_resource_sampler() {",
+  "  worker_status=$?",
+  "  trap - EXIT",
+  '  kill "$process_sampler_pid" 2>/dev/null || true',
+  '  kill "$resource_sampler_pid" 2>/dev/null || true',
+  '  wait "$process_sampler_pid" 2>/dev/null || true',
+  '  wait "$resource_sampler_pid" 2>/dev/null || true',
+  '  exit "$worker_status"',
+  "}",
+  "trap cleanup_resource_sampler EXIT",
+  "trap 'exit 130' INT",
+  "trap 'exit 143' TERM",
+  workerNpm("check"),
+  'kill -0 "$process_sampler_pid"',
+  'kill -0 "$resource_sampler_pid"',
+].join("\n");
 
 // ---------------------------------------------------------------------------
 // A line-wise reader for the block YAML subset this workflow uses: mappings,
@@ -187,6 +240,60 @@ async function loadWorkflow() {
 
 const runs = (job) => job.steps.filter((step) => typeof step.run === "string").map((step) => step.run.trim());
 
+function workerHistoryFailures(workflow) {
+  const checkouts = workflow.jobs["worker-gate"].steps.filter(({ uses }) => uses === CHECKOUT);
+  return checkouts.length === 1
+    && checkouts[0].with?.["fetch-depth"] === 0
+    && checkouts[0].with?.["persist-credentials"] === false
+    ? [] : ["Worker vendor-kernel regressions require full history without persisted credentials"];
+}
+
+function workerProcessPrerequisiteFailures(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const prerequisites = steps.filter(({ name }) => name === WORKER_PROCESS_PREREQUISITES.name);
+  const install = steps.findIndex(({ run }) => run?.includes("pnpm install"));
+  const gate = steps.findIndex(({ run }) => run?.trim() === WORKER_GATE_RUN);
+  return prerequisites.length === 1
+    && JSON.stringify(prerequisites[0]) === JSON.stringify(WORKER_PROCESS_PREREQUISITES)
+    && steps.indexOf(prerequisites[0]) < install && install < gate
+    ? [] : ["Worker real cleanup callers require bounded, mandatory process prerequisites before dependencies and tests"];
+}
+
+function workerGraphDiagnosticFailures(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const diagnostics = steps.filter(({ name }) => name === WORKER_GRAPH_DIAGNOSTIC.name);
+  const postgres = steps.findIndex(({ run }) => run?.trim() === START_POSTGRES);
+  const site = steps.findIndex(({ run }) => run?.includes("node scripts/build-public-release-site.js"));
+  const gate = steps.findIndex(({ run }) => run?.trim() === WORKER_GATE_RUN);
+  return diagnostics.length === 1
+    && steps.filter(({ run }) => run?.trim() === WORKER_GRAPH_DIAGNOSTIC.run).length === 1
+    && JSON.stringify(diagnostics[0]) === JSON.stringify(WORKER_GRAPH_DIAGNOSTIC)
+    && postgres >= 0 && site > postgres
+    && steps.indexOf(diagnostics[0]) > site && steps.indexOf(diagnostics[0]) < gate
+    ? [] : ["Worker graph diagnostic must be mandatory, after setup and before the unchanged complete gate"];
+}
+
+function postgresShardFailures(workflow) {
+  const failures = [];
+  const job = workflow.jobs["postgres-17-suite"];
+  const expectedStrategy = { "fail-fast": false, matrix: { shard: [...POSTGRES_SUITE_SHARDS] } };
+  if (JSON.stringify(job?.strategy) !== JSON.stringify(expectedStrategy)) {
+    failures.push("PostgreSQL shards must cover the four canonical groups exactly once without fail-fast");
+  }
+  if (job?.name !== "PostgreSQL 17 shard (${{ matrix.shard }})"
+      || job?.env?.PG_SUITE_SHARD !== "${{ matrix.shard }}"
+      || job?.if !== undefined || job?.["continue-on-error"] !== undefined
+      || !Array.isArray(job?.steps)
+      || job.steps.some((step) => step["continue-on-error"] !== undefined)
+      || runs(job).filter((command) => command === SHARD_COMMAND).length !== 1) {
+    failures.push("PostgreSQL shards must run the closed selector without conditional or tolerated failures");
+  }
+  if (JSON.stringify(workflow.jobs[AGGREGATE_JOB]) !== JSON.stringify(AGGREGATE_CONTRACT)) {
+    failures.push("PostgreSQL suite must always require the successful result of every shard");
+  }
+  return failures;
+}
+
 // ---------------------------------------------------------------------------
 // Workflow contract
 // ---------------------------------------------------------------------------
@@ -227,6 +334,10 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
   for (const [id, job] of Object.entries(workflow.jobs)) {
     assert.equal(job.permissions, undefined, `${id} inherits contents: read`);
     assert.equal(job.environment, undefined, `${id} has no environment`);
+    if (id === AGGREGATE_JOB) {
+      assert.deepEqual(job, AGGREGATE_CONTRACT, "the aggregate runs only a shell result check, with no checkout or actions");
+      continue;
+    }
     for (const step of job.steps) {
       if (step.uses === CHECKOUT) {
         assert.deepEqual(step.with, { "fetch-depth": FETCH_DEPTH[id], "persist-credentials": false },
@@ -260,7 +371,55 @@ test("every job that runs the cutover seal check checks out full history", async
   }
 });
 
-test("no run block interpolates GitHub expressions into a shell", async () => {
+test("the Worker vendor-kernel historical regressions require a complete checkout", async () => {
+  const { workflow } = await loadWorkflow();
+  const worker = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
+  const vendorCheck = await readFile(join(REPOSITORY_ROOT, "apps/worker/scripts/vendor-analytics-kernels.check.mjs"), "utf8");
+  assert.ok(worker.scripts.check.split(" && ").includes("npm run vendor:kernels:check"));
+  assert.ok(worker.scripts["vendor:kernels:check"].split(" && ").includes("node ./scripts/vendor-analytics-kernels.check.mjs"));
+  assert.match(vendorCheck, /const HISTORICAL_FACADE_COMMIT = "c766235a0345bf4e3474559a9aee69b4dfb0e34d";/u);
+  assert.ok(vendorCheck.includes('git(["show", `${HISTORICAL_FACADE_COMMIT}:apps/worker/${STABLE_VENDOR_RELATIVE}/${file}`])'));
+  assert.ok(vendorCheck.includes('git(["rev-parse", "--verify", `${COMMIT}~25`])'));
+  assert.deepEqual(workerHistoryFailures(workflow), []);
+  for (const depth of [undefined, 1, 25, "0"]) {
+    const changed = structuredClone(workflow);
+    const checkout = changed.jobs["worker-gate"].steps.find(({ uses }) => uses === CHECKOUT);
+    if (depth === undefined) delete checkout.with["fetch-depth"];
+    else checkout.with["fetch-depth"] = depth;
+    assert.deepEqual(workerHistoryFailures(changed),
+      ["Worker vendor-kernel regressions require full history without persisted credentials"]);
+  }
+});
+
+test("the Worker real cleanup callers have mandatory process prerequisites before tests", async () => {
+  const { workflow } = await loadWorkflow();
+  const worker = JSON.parse(await readFile(join(REPOSITORY_ROOT, "apps/worker/package.json"), "utf8"));
+  const callers = await readFile(join(REPOSITORY_ROOT, "apps/worker/scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"), "utf8");
+  assert.ok(worker.scripts.check.split(" && ").includes("npm run gcp:fastpath:scripts-check"));
+  assert.equal(worker.scripts["gcp:fastpath:scripts-check"].split(" && ").at(-1), "npm run gcp:fastpath:prod-shape:check",
+    "the complete Worker gate retains its later production-shape checks");
+  assert.ok(worker.scripts["gcp:fastpath:prod-shape:check"].includes("./scripts/gcp-fastpath-prod-shape/prod-shape.check.mjs"));
+  assert.ok(callers.includes('spawn("zsh", ["-c", script]'), "the checks execute real shell callers");
+  assert.ok(callers.includes("zmodload zsh/datetime"), "the signal check needs the zsh datetime module");
+  assert.deepEqual(workerProcessPrerequisiteFailures(workflow), []);
+  for (const mutate of [
+    (steps, index) => steps.splice(index, 1),
+    (steps, index) => steps.push(steps.splice(index, 1)[0]),
+    (steps, index) => steps.push(structuredClone(steps[index])),
+    (steps, index) => { steps[index].if = "false"; },
+    (steps, index) => { steps[index]["continue-on-error"] = true; },
+    (steps, index) => { delete steps[index]["timeout-minutes"]; },
+    (steps, index) => { steps[index].run = steps[index].run.replace("--no-install-recommends zsh time procps", "--no-install-recommends bash"); },
+    (steps, index) => { steps[index].run = steps[index].run.replace("zsh -ec 'zmodload zsh/datetime'\n", ""); },
+  ]) {
+    const changed = structuredClone(workflow);
+    const steps = changed.jobs["worker-gate"].steps;
+    mutate(steps, steps.findIndex(({ name }) => name === WORKER_PROCESS_PREREQUISITES.name));
+    assert.ok(workerProcessPrerequisiteFailures(changed).length > 0);
+  }
+});
+
+test("no run block interpolates GitHub expressions into a shell; only closed shard routing and results enter env", async () => {
   const { text, workflow } = await loadWorkflow();
   assert.doesNotMatch(text, /\$\{\{\s*github\.event/u);
   for (const [id, job] of Object.entries(workflow.jobs)) {
@@ -270,21 +429,30 @@ test("no run block interpolates GitHub expressions into a shell", async () => {
     for (const step of job.steps) assert.equal(step.env, undefined, `${id} steps take no expression env`);
     for (const [name, value] of Object.entries(job.env ?? {})) {
       assert.equal(typeof value, "string", `${id} env ${name} is a quoted literal`);
+      if (id === "postgres-17-suite" && name === "PG_SUITE_SHARD") {
+        assert.equal(value, "${{ matrix.shard }}");
+        continue;
+      }
+      if (id === AGGREGATE_JOB && name === "PG_SUITE_RESULT") {
+        assert.equal(value, "${{ needs.postgres-17-suite.result }}");
+        continue;
+      }
       assert.doesNotMatch(value, /\$\{\{/u, `${id} env ${name} is static`);
     }
   }
 });
 
-test("three jobs run the Worker gate, the Cloud Run check and the routed PostgreSQL 17 suite", async () => {
+test("three execution jobs run the unchanged Worker and Cloud Run gates and all routed PostgreSQL shards", async () => {
   const { workflow } = await loadWorkflow();
-  assert.deepEqual(Object.keys(workflow.jobs), ["worker-gate", "cloud-run-check", "postgres-17-suite"]);
+  assert.deepEqual(Object.keys(workflow.jobs), ["worker-gate", "cloud-run-check", "postgres-17-suite", AGGREGATE_JOB]);
   const timeouts = { "worker-gate": 60, "cloud-run-check": 30, "postgres-17-suite": 45 };
   const gates = {
-    "worker-gate": "npm --prefix apps/worker run check",
+    "worker-gate": WORKER_GATE_RUN,
     "cloud-run-check": "npm --prefix apps/worker/cloud-run run check",
-    "postgres-17-suite": "node apps/worker/scripts/ci-postgres-suite.mjs",
+    "postgres-17-suite": SHARD_COMMAND,
   };
   for (const [id, job] of Object.entries(workflow.jobs)) {
+    if (id === AGGREGATE_JOB) continue; // Pinned independently as an always-running, fail-closed aggregate.
     assert.equal(job["runs-on"], "ubuntu-24.04", id);
     assert.equal(job["timeout-minutes"], timeouts[id], id);
     assert.equal(job.services, undefined, `${id} starts PostgreSQL through the reviewed script`);
@@ -315,14 +483,84 @@ test("three jobs run the Worker gate, the Cloud Run check and the routed Postgre
   const guard = worker.indexOf([
     "node --test",
     "test/hosted-backend-workflow.test.js",
+    "test/hosted-backend-process-sampler.test.js",
+    "test/hosted-backend-resource-sampler.check.mjs",
+    "test/worker-graph-thread-diagnostic.test.js",
     "apps/worker/scripts/migration-numbering.check.mjs",
     "apps/worker/scripts/ci-postgres-suite.check.mjs",
   ].join(" "));
+  const guardStep = workflow.jobs["worker-gate"].steps.find(({ run }) => run?.trim() === worker[guard]);
+  assert.equal(guardStep?.if, undefined, "the Linux resource sampler harness is mandatory");
+  assert.equal(guardStep?.["continue-on-error"], undefined, "shell harness failures fail the workflow");
+  const earlyCommand = workerNpm("gcp:fastpath:prod-shape:check");
+  const early = worker.indexOf(earlyCommand);
+  assert.equal(worker.filter((command) => command === earlyCommand).length, 1, "run the complete early check once without filters");
+  assert.deepEqual(workflow.jobs["worker-gate"].steps.find(({ name }) => name === "Check Linux process and measurement tooling early"),
+    { name: "Check Linux process and measurement tooling early", run: earlyCommand }, "the early gate has no condition or tolerated failure");
+  const installed = worker.findIndex((command) => command.includes("pnpm install"));
   const site = worker.findIndex((command) => command.includes("node scripts/build-public-release-site.js"));
-  assert.ok(guard >= 0 && site > guard && worker.indexOf(gates["worker-gate"]) > site);
+  assert.ok(installed >= 0 && guard > installed && early === guard + 1 && site > early && worker.indexOf(gates["worker-gate"]) > site,
+    "the full early process check follows locked dependencies and contract checks, before the complete Worker gate");
   assert.match(worker[site], /--output "\$GITHUB_WORKSPACE\/\.release-build\/public-release-site"/u);
   assert.match(worker[site], /--social-image "\$social_card"/u);
   assert.deepEqual(workflow.jobs["worker-gate"].env, { WRANGLER_SEND_METRICS: "false" });
+});
+
+test("the complete Worker graph diagnostic is additive, mandatory and runs after setup", async () => {
+  const { workflow } = await loadWorkflow();
+  assert.deepEqual(workerGraphDiagnosticFailures(workflow), []);
+  for (const mutate of [
+    (steps, index) => steps.splice(index, 1),
+    (steps, index) => steps.push(structuredClone(steps[index])),
+    (steps, index) => steps.push({ ...steps[index], name: "Duplicate graph diagnostic" }),
+    (steps, index) => steps.push(steps.splice(index, 1)[0]),
+    (steps, index) => steps.unshift(steps.splice(index, 1)[0]),
+    (steps, index) => { steps[index].if = "false"; },
+    (steps, index) => { steps[index]["continue-on-error"] = true; },
+    (steps, index) => { steps[index].run += " || true"; },
+    (steps, index) => { steps[index].run += " --testNamePattern graph"; },
+  ]) {
+    const changed = structuredClone(workflow);
+    const steps = changed.jobs["worker-gate"].steps;
+    mutate(steps, steps.findIndex(({ name }) => name === WORKER_GRAPH_DIAGNOSTIC.name));
+    assert.ok(workerGraphDiagnosticFailures(changed).length > 0);
+  }
+});
+
+test("Worker resource sampling wraps the full gate with two owned samplers and explicit status-preserving cleanup", async () => {
+  const { workflow } = await loadWorkflow();
+  const step = workflow.jobs["worker-gate"].steps.find(({ name }) => name === "Run the Worker gate");
+  assert.deepEqual(step, { name: "Run the Worker gate", run: `${WORKER_GATE_RUN}\n` });
+  assert.equal(step.run.split("\n").filter((line) => line === workerNpm("check")).length, 1);
+});
+
+test("all four canonical PostgreSQL shards and the fail-closed aggregate are mandatory", async () => {
+  const { workflow } = await loadWorkflow();
+  assert.deepEqual(POSTGRES_SUITE_SHARDS, ["vitest", "node-1", "node-2", "edge-e2e"]);
+  assert.deepEqual(postgresShardFailures(workflow), []);
+  for (const mutate of [
+    (copy) => copy.jobs["postgres-17-suite"].strategy.matrix.shard.pop(),
+    (copy) => copy.jobs["postgres-17-suite"].strategy.matrix.shard.push("node-1"),
+    (copy) => { copy.jobs["postgres-17-suite"].strategy.matrix.shard[0] = "unknown"; },
+    (copy) => { copy.jobs["postgres-17-suite"].strategy["fail-fast"] = true; },
+    (copy) => { copy.jobs["postgres-17-suite"]["continue-on-error"] = true; },
+    (copy) => { copy.jobs["postgres-17-suite"].if = "false"; },
+    (copy) => { copy.jobs["postgres-17-suite"].env.PG_SUITE_SHARD = "vitest"; },
+    (copy) => { delete copy.jobs[AGGREGATE_JOB]; },
+    (copy) => { delete copy.jobs[AGGREGATE_JOB].if; },
+    (copy) => { copy.jobs[AGGREGATE_JOB].needs = []; },
+    (copy) => { copy.jobs[AGGREGATE_JOB].env.PG_SUITE_RESULT = "success"; },
+    (copy) => { copy.jobs[AGGREGATE_JOB].steps[0].run = "true"; },
+    (copy) => { copy.jobs[AGGREGATE_JOB].steps[0]["continue-on-error"] = true; },
+  ]) {
+    const copy = structuredClone(workflow);
+    mutate(copy);
+    assert.ok(postgresShardFailures(copy).length > 0);
+  }
+  // The sole admitted aggregate predicate rejects every non-success outcome,
+  // including an absent matrix result, cancellation and skipped execution.
+  const aggregate = workflow.jobs[AGGREGATE_JOB];
+  assert.equal(aggregate.steps[0].run, 'test "$PG_SUITE_RESULT" = success');
 });
 
 test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only that job does", async () => {
@@ -335,6 +573,7 @@ test("the PostgreSQL 17 suite gets the container's loopback TCP pair, and only t
   assert.deepEqual(workflow.jobs["postgres-17-suite"].env, {
     PG_TEST_TCP_HOST: "127.0.0.1",
     PG_TEST_TCP_PORT: publish[0][1],
+    PG_SUITE_SHARD: "${{ matrix.shard }}",
   });
   for (const id of ["worker-gate", "cloud-run-check"]) {
     assert.equal(Object.keys(workflow.jobs[id].env ?? {}).some((name) => name.startsWith("PG_TEST_")), false,
@@ -530,10 +769,14 @@ const stepAt = (job, predicate) => job.steps.findIndex((step) => predicate(step)
 const isSetupNode = (version) => (step) => step.uses === SETUP_NODE && step.with?.["node-version"] === version;
 const runMatches = (pattern) => (step) => typeof step.run === "string" && pattern.test(step.run);
 
-/** Every job installs all three lockfiles and ends with the repository toolchain active. */
+/** Every execution job installs all three lockfiles and ends with the repository toolchain active. */
 function toolchainFailures(workflow) {
   const failures = [];
   for (const [id, job] of Object.entries(workflow.jobs)) {
+    if (id === AGGREGATE_JOB) {
+      if (JSON.stringify(job) !== JSON.stringify(AGGREGATE_CONTRACT)) failures.push("unreviewed PostgreSQL aggregate");
+      continue;
+    }
     const plan = NODE_PLAN[id];
     if (plan === undefined) {
       failures.push(`${id} is not a reviewed job`);
@@ -641,7 +884,7 @@ function edgeRuntimeFailures(workflow, { suite, spec, transferSpec, goldenFiles 
     const name = stepAt(job, runMatches(/EDGE_E2E_NODE=/u));
     const toolchain = stepAt(job, isSetupNode(TOOLCHAIN_NODE));
     const rehearsal = stepAt(job, runMatches(/EDGE_E2E_REHEARSAL_NODE=/u));
-    const gate = stepAt(job, (step) => step.run?.trim() === `node ${SUITE_SCRIPT}`);
+    const gate = stepAt(job, (step) => step.run?.trim() === SHARD_COMMAND);
     if (!(image >= 0 && image < name && name < toolchain && toolchain < rehearsal && rehearsal < gate)) {
       failures.push("the image runtime, its naming step, the toolchain, the rehearsal runtime and the suite are out of order");
     }
@@ -708,7 +951,7 @@ async function loadContractInputs() {
   };
 }
 
-test("every job installs the root, Worker and Cloud Run lockfiles under the repository toolchain", async () => {
+test("every execution job installs the root, Worker and Cloud Run lockfiles under the repository toolchain", async () => {
   const { workflow } = await loadWorkflow();
   assert.deepEqual(toolchainFailures(workflow), []);
 });
@@ -769,9 +1012,9 @@ test("the PostgreSQL 17 suite runs the edge end-to-end spec under Node.js 22.16.
   const job = workflow.jobs["postgres-17-suite"];
   assert.deepEqual(job.steps.filter(({ uses }) => uses === SETUP_NODE).map((step) => step.with["node-version"]),
     [IMAGE_NODE, TOOLCHAIN_NODE]);
-  // Still the suite's single gate, still no skips: the suite is not given an
-  // opt-out for the edge spec.
-  assert.equal(runs(job).filter((command) => command === `node ${SUITE_SCRIPT}`).length, 1);
+  // Every closed partition runs through the same zero-skip gate; the mandatory
+  // matrix includes the edge spec's partition exactly once.
+  assert.equal(runs(job).filter((command) => command === SHARD_COMMAND).length, 1);
   assert.equal(job.env.EDGE_E2E_NODE, undefined);
 });
 
@@ -898,7 +1141,7 @@ test("hosted CI contract: an edge runtime that is unnamed, misplaced, drifted or
     job.steps.splice(stepAt(job, isSetupNode(IMAGE_NODE)), 0, tool);
   }).some((failure) => failure.includes("out of order")));
   assert.ok(mutate((job) => {
-    const [gate] = job.steps.splice(stepAt(job, (step) => step.run?.trim() === `node ${SUITE_SCRIPT}`), 1);
+    const [gate] = job.steps.splice(stepAt(job, (step) => step.run?.trim() === SHARD_COMMAND), 1);
     job.steps.splice(stepAt(job, isSetupNode(IMAGE_NODE)), 0, gate);
   }).some((failure) => failure.includes("out of order")), "suite before runtimes");
 

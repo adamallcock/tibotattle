@@ -143,7 +143,7 @@ test("the development workflow builds each target on a static native runner with
   assert.doesNotMatch(workflow, /Add the (?:Windows|Linux) development launch handoff/u,
     "handoff assembly belongs to the common local/CI packaging command");
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 6);
-  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 7);
+  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 8);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
   assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
   assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
@@ -228,7 +228,7 @@ test("the Linux normal candidate stays on the runner and executes only in the is
   assert.match(linux, /export TIBOTATTLE_ELECTRON_BUILD_NUMBER="\$GITHUB_RUN_NUMBER"/u);
   assert.match(linux, /--linux dir --x64 --publish never/u);
   const execution = linux.slice(linux.indexOf("- name: Exercise normal packaged Linux startup"),
-    linux.indexOf("- name: Exercise a genuine AppImage update and automatic restart in isolation"));
+    linux.indexOf("- name: Record the unsigned private-pair qualification boundary"));
   assert.match(execution, /--cap-add=SYS_ADMIN --network none/u);
   assert.match(execution, /--entrypoint xvfb-run/u);
   assert.match(execution, /-nolisten tcp/u);

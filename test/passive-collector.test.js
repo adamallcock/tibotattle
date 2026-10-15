@@ -2168,6 +2168,39 @@ test("run-once distinguishes an app-server authentication failure without losing
   }
 });
 
+test("provider error messages stay out of collector diagnostics and persisted state", async () => {
+  const fixture = await collectorFixture();
+  const providerCanary = "synthetic provider prompt /private/session/path token-canary";
+  class FailingClient {
+    async start() {}
+    async readAccount() { return null; }
+    async readRateLimits() {
+      throw new CodexAppServerError("request_failed", providerCanary, {
+        cause: new Error(providerCanary),
+      });
+    }
+    close() {}
+  }
+
+  try {
+    const result = await runCollectorOnce({
+      ...fixture,
+      staleAfterMs: 0,
+      skipRolloutIngestion: true,
+      appServerFactory: () => new FailingClient(),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+    });
+    const persistedCheckpoint = await readFile(fixture.checkpointFile, "utf8");
+
+    assert.equal(result.refresh.errorCode, "request_failed");
+    assert.equal(result.diagnostics.appServerErrorCounts.request_failed, 1);
+    assert.equal(JSON.stringify(result.diagnostics).includes(providerCanary), false);
+    assert.equal(persistedCheckpoint.includes(providerCanary), false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
 test("a first-ever unified pass records a failed quota read instead of failing forever", async () => {
   const fixture = await collectorFixture();
   class UnavailableClient {

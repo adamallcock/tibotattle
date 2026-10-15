@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -818,4 +819,134 @@ test("a symlink supplied as the task root is rejected before the operation runs"
   assert.equal(ran, false);
   assert.deepEqual(result.measurements, { before: null, highWater: null, after: null });
   assert.equal(JSON.stringify(result).includes(alias), false);
+});
+
+test("pre-aborted sampler performs no filesystem work or operation", async () => {
+  const controller = new AbortController();
+  controller.abort("PRIVATE_ABORT_REASON");
+  let touched = false;
+  const result = await runR7FilesystemHighWaterSampler({
+    root: "/synthetic/not-created",
+    signal: controller.signal,
+    async operation() { touched = true; },
+  }, {
+    async lstatPath() { touched = true; throw new Error("must not read"); },
+    monotonicNow: () => 0n,
+  });
+  assert.equal(result.outcome, "aborted");
+  assert.deepEqual(result.measurements, { before: null, highWater: null, after: null });
+  assert.equal(result.sampleCount, 0);
+  assert.equal(touched, false);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("sampler abort drains the active sample and operation without a final measurement", async (t) => {
+  const { root } = await fixture(t);
+  const controller = new AbortController();
+  const scheduler = manualScheduler();
+  let reads = 0;
+  let releaseSample;
+  const sampleHold = new Promise((resolve) => { releaseSample = resolve; });
+  let sampleStarted;
+  const sampled = new Promise((resolve) => { sampleStarted = resolve; });
+  let releaseOperation;
+  const operationHold = new Promise((resolve) => { releaseOperation = resolve; });
+  let operationStarted;
+  const started = new Promise((resolve) => { operationStarted = resolve; });
+  let resolved = false;
+  const promise = runR7FilesystemHighWaterSampler({
+    root,
+    signal: controller.signal,
+    async operation() { operationStarted(); await operationHold; },
+  }, {
+    monotonicNow: () => 0n,
+    scheduleInterval: scheduler.scheduleInterval,
+    cancelInterval: scheduler.cancelInterval,
+    async readDirectoryEntries() {
+      reads += 1;
+      if (reads === 2) { sampleStarted(); await sampleHold; }
+      return [];
+    },
+  }).then((result) => { resolved = true; return result; });
+  await started;
+  const tick = scheduler.fire(scheduler.intervals[0]);
+  await sampled;
+  controller.abort({ private: "PRIVATE_ABORT_REASON" });
+  assert.equal(scheduler.intervals[0].cancelled, true);
+  assert.equal(scheduler.fire(scheduler.intervals[0]), undefined);
+  releaseOperation();
+  await flushSampling();
+  assert.equal(resolved, false);
+  releaseSample();
+  await tick;
+  const result = await promise;
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.measurements.after, null);
+  assert.equal(reads, 2);
+  assert.equal(result.sampleCount, 2);
+  assert.equal(result.periodicSampleCount, 1);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
+});
+
+test("sampler abort during initial measurement prevents operation and final scan", async (t) => {
+  const { root } = await fixture(t);
+  const controller = new AbortController();
+  const scheduler = manualScheduler();
+  let operationRan = false;
+  let reads = 0;
+  const result = await runR7FilesystemHighWaterSampler({
+    root,
+    signal: controller.signal,
+    async operation() { operationRan = true; },
+  }, {
+    scheduleInterval: scheduler.scheduleInterval,
+    cancelInterval: scheduler.cancelInterval,
+    async readDirectoryEntries() { reads += 1; controller.abort(); return []; },
+  });
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.measurements.after, null);
+  assert.equal(operationRan, false);
+  assert.equal(reads, 1);
+  assert.equal(scheduler.intervals.length, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("sampler normal completion removes its optional cancellation listener", async (t) => {
+  const { root } = await fixture(t);
+  const controller = new AbortController();
+  const result = await runR7FilesystemHighWaterSampler({
+    root,
+    signal: controller.signal,
+    async operation() {},
+  });
+  assert.equal(result.outcome, "completed");
+  assert.notEqual(result.measurements.after, null);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  await assert.rejects(runR7FilesystemHighWaterSampler({
+    root, signal: {}, async operation() {},
+  }), /signal must be an AbortSignal/);
+});
+
+test("abort during final filesystem scan cannot return completed measurements", async (t) => {
+  const { root } = await fixture(t);
+  const controller = new AbortController();
+  let reads = 0;
+  const result = await runR7FilesystemHighWaterSampler({
+    root,
+    signal: controller.signal,
+    async operation() {},
+  }, {
+    async readDirectoryEntries() {
+      reads += 1;
+      if (reads === 2) controller.abort("PRIVATE_ABORT_REASON");
+      return [];
+    },
+  });
+  assert.equal(result.outcome, "aborted");
+  assert.equal(result.measurements.after, null);
+  assert.equal(reads, 2);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  assert.equal(JSON.stringify(result).includes("PRIVATE"), false);
 });

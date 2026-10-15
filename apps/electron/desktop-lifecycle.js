@@ -29,6 +29,10 @@ import {
 } from "./desktop-owned-downloads.js";
 import { createDesktopStatusMonitor } from "./desktop-status-monitor.js";
 import {
+  createAuthorizedCompanionFetch,
+  installDesktopLocalAuthorization,
+} from "./desktop-local-authorization.js";
+import {
   createDesktopTrayStatusReducer,
   DESKTOP_TRAY_INITIAL_STATUS,
 } from "./desktop-tray-status.js";
@@ -192,6 +196,8 @@ export function createDesktopLifecycle({
   let dashboardReady = false;
   let ready = null;
   let policyInstallation = null;
+  let localAuthorizationInstallation = null;
+  let settingsLocalAuthorizationInstallation = null;
   let downloadHandlerInstallation = null;
   let settingsPolicyInstallation = null;
   let windowListenerCleanup = null;
@@ -360,6 +366,12 @@ export function createDesktopLifecycle({
 
   const desktopStatusMonitor = createDesktopStatusMonitor({
     ...desktopStatusMonitorOptions,
+    ...(typeof supervisor.requestAuthorizationHeaders === "function" ? {
+      fetchImpl: createAuthorizedCompanionFetch({
+        fetchImpl: desktopStatusMonitorOptions.fetchImpl ?? globalThis.fetch,
+        requestAuthorizationHeaders: supervisor.requestAuthorizationHeaders,
+      }),
+    } : {}),
     onStatus: handleDesktopStatus,
   });
 
@@ -575,11 +587,25 @@ export function createDesktopLifecycle({
 
   async function openDashboardInBrowser() {
     if (!isExactLoopbackOrigin(ready?.origin)
-        || typeof openDashboardExternal !== "function") {
+        || typeof openDashboardExternal !== "function"
+        // The inherited pipe authenticates Electron only. Windows external
+        // browser access needs a separately qualified owner-only bootstrap;
+        // Unix mode bits cannot establish that Windows file boundary.
+        || (platform === "win32" && typeof supervisor.requestAuthorizationHeaders === "function")) {
       throw shellError("desktop_dashboard_browser_unavailable");
     }
-    const target = `${ready.origin}/`;
+    const selectedReady = ready;
+    const selectedEpoch = lifecycleEpoch;
+    const target = `${selectedReady.origin}/`;
     try {
+      if (typeof supervisor.requestAuthorizationHeaders === "function") {
+        if (typeof supervisor.prepareBrowserAuthorization !== "function") {
+          throw new Error("browser authorization unavailable");
+        }
+        await supervisor.prepareBrowserAuthorization(selectedReady.origin);
+      }
+      if (!lifecycleActive || quitting || updatePreparing || ready !== selectedReady
+          || lifecycleEpoch !== selectedEpoch) throw new Error("browser authorization superseded");
       const opened = await openDashboardExternal(target);
       if (opened === false) throw new Error("dashboard browser open was rejected");
     } catch {
@@ -777,6 +803,7 @@ export function createDesktopLifecycle({
         platform,
         model: currentTrayPopoverModel(),
         onAction: invokeTrayPopoverAction,
+        requestAuthorizationHeaders: supervisor.requestAuthorizationHeaders,
         windowOptions: trayPopoverWindowOptions,
       });
     } catch {
@@ -840,6 +867,8 @@ export function createDesktopLifecycle({
     windowListenerCleanup = null;
     policyInstallation?.remove?.();
     policyInstallation = null;
+    localAuthorizationInstallation?.remove();
+    localAuthorizationInstallation = null;
     if (window && !window.isDestroyed?.()) window.destroy?.();
     window = null;
     if (hadDashboardWindow) {
@@ -861,6 +890,8 @@ export function createDesktopLifecycle({
     settingsWindowListenerCleanup = null;
     settingsPolicyInstallation?.remove?.();
     settingsPolicyInstallation = null;
+    settingsLocalAuthorizationInstallation?.remove();
+    settingsLocalAuthorizationInstallation = null;
     const candidate = settingsWindow;
     settingsWindow = null;
     settingsLoadedURL = null;
@@ -1009,6 +1040,12 @@ export function createDesktopLifecycle({
       policy,
       allowBlobDownloads: true,
     });
+    if (typeof supervisor.requestAuthorizationHeaders === "function") {
+      localAuthorizationInstallation = installDesktopLocalAuthorization({
+        session, webContents, origin: ready.origin,
+        requestAuthorizationHeaders: supervisor.requestAuthorizationHeaders,
+      });
+    }
     if (ownedDownloadsRegistry !== null) {
       downloadHandlerInstallation = installDesktopOwnedDownloadHandler({
         session,
@@ -1139,6 +1176,12 @@ export function createDesktopLifecycle({
       policy,
       allowNotificationPermission: true,
     });
+    if (typeof supervisor.requestAuthorizationHeaders === "function") {
+      settingsLocalAuthorizationInstallation = installDesktopLocalAuthorization({
+        session, webContents, origin: ready.origin,
+        requestAuthorizationHeaders: supervisor.requestAuthorizationHeaders,
+      });
+    }
     const settingsState = {
       candidate,
       failed: false,
@@ -1188,6 +1231,8 @@ export function createDesktopLifecycle({
       settingsWindowListenerCleanup = null;
       settingsPolicyInstallation?.remove?.();
       settingsPolicyInstallation = null;
+      settingsLocalAuthorizationInstallation?.remove();
+      settingsLocalAuthorizationInstallation = null;
       settingsState.requestedVisible = false;
       settingsWindow = null;
       settingsLoadedURL = null;

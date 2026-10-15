@@ -348,7 +348,10 @@ PG_TEST_SOCKET=<local PostgreSQL 17 socket> PG_TEST_PORT=<port> \
   --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json
 ```
 
-(`npm run gcp:fastpath:rehearsal` in `apps/worker` runs the same. The
+(`npm run gcp:fastpath:rehearsal` in `apps/worker` ran the same command at
+this checkpoint. The current alias explicitly selects the versioned Q-1
+expectation contract described in the maintained
+[edge runbook](../runbooks/production-edge-modes.md). The
 per-date expectation was added on 2026-10-02: under OD-12 the rehearsal
 accepts the fast path's publication of the oracle's withheld model dates
 only with exactly the values the oracle's per-date expectation holds, and
@@ -607,7 +610,7 @@ production.
 
 | Copy | Location and state | Identity |
 |---|---|---|
-| Release owner's working copy | `/Users/adamallcock/.codex/worktrees/bdc9/app-usagemonitor/docs/plans/2026-09-29-openai-release-update-plan.md`, read only. Untracked in a Codex worktree whose `HEAD` is `30c0feb0`. Front matter `status: in-progress`; last modified 2026-09-29 | 596 lines; SHA-256 `fde291926240989d202ec95da6e82a7fa22fd03e8e0c23b49c3197629fe98f66` |
+| Release owner's working copy | `docs/plans/2026-09-29-openai-release-update-plan.md`, read only. Untracked in a Codex worktree whose `HEAD` is `30c0feb0`. Front matter `status: in-progress`; last modified 2026-09-29 | 596 lines; SHA-256 `fde291926240989d202ec95da6e82a7fa22fd03e8e0c23b49c3197629fe98f66` |
 | Committed copy | `docs/plans/2026-09-29-openai-release-update-plan.md` on GitHub `main` at `f0067d0f`, unchanged at `396204d3` (the local `origin/main` ref as last fetched). Not on this branch | 711 lines; SHA-256 `83ff24cb8464ccf0f5c85293fa57b68465ed805b7202d84e71fc3922141582a5` |
 
 - The two copies differ only in the scope sentence (working-copy lines 14-15)

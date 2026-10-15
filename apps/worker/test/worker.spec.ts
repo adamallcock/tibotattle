@@ -1,11 +1,17 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 // @ts-expect-error The browser helper is intentionally framework-free JavaScript.
 import { createSyntheticEnvelope } from "../../web/public/lib.js";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { hashInviteGrantSecret } from "../src/admission";
+import {
+  publicProbeBudgetObjectName,
+  PUBLIC_PROBE_BUDGET_POLICY,
+  PUBLIC_PROBE_MAXIMUM_MILLISECONDS,
+} from "../src/public-probe-admission";
+import { UPLOAD_INGRESS_BUDGET_OBJECT_NAME } from "../src/upload-ingress-admission";
 import worker, { handleRequest, runScheduledMaintenance } from "../src/index";
 import {
   createSessionMaterial,
@@ -106,6 +112,8 @@ function testBindings(
     ACCOUNT_SCOPED_INGEST_MODE: "disabled",
     QUARANTINE: bindings.QUARANTINE,
     PUBLIC_READ_RATE_LIMIT: bindings.PUBLIC_READ_RATE_LIMIT,
+    PUBLIC_PROBE_RATE_LIMIT: bindings.PUBLIC_PROBE_RATE_LIMIT,
+    PUBLIC_PROBE_CLIENT_RATE_LIMIT: bindings.PUBLIC_PROBE_CLIENT_RATE_LIMIT,
     RECOVERY_RATE_LIMIT: bindings.RECOVERY_RATE_LIMIT,
     UPLOAD_AUTHORIZATION_RATE_LIMIT: bindings.UPLOAD_AUTHORIZATION_RATE_LIMIT,
     UPLOAD_PRINCIPAL_RATE_LIMIT: bindings.UPLOAD_PRINCIPAL_RATE_LIMIT,
@@ -2020,6 +2028,244 @@ describe("synthetic usage monitor service", () => {
       error: { code: "UPLOAD_INGRESS_UNAVAILABLE" },
     });
   });
+
+  it.each(["health", "ready"] as const)(
+    "refuses %s probes before storage when their dedicated admission is unavailable or denied",
+    async (route) => {
+      const allowed = {
+        async limit() { return { success: true }; },
+      } satisfies RateLimit;
+      const denied = {
+        async limit() { return { success: false }; },
+      } satisfies RateLimit;
+      const unavailable = {
+        async limit(): Promise<{ success: boolean }> {
+          throw new Error("synthetic probe limiter unavailable");
+        },
+      } satisfies RateLimit;
+      const cases = [
+        { limiter: undefined, status: 503, code: "ADMISSION_CONFIGURATION_INVALID", retryAfter: null },
+        { limiter: denied, status: 429, code: "ATTEMPT_LIMIT_REACHED", retryAfter: "60" },
+        { limiter: unavailable, status: 503, code: "ADMISSION_RATE_LIMIT_UNAVAILABLE", retryAfter: "60" },
+      ] as const;
+      const downstream = new Set([
+        "USAGE_MONITOR_DB", "DELETION_LEDGER", "QUARANTINE", "UPLOAD_INGRESS_BUDGET",
+        "ENROLLMENT_RATE_LIMIT", "RECOVERY_RATE_LIMIT", "CLIENT_ATTEMPT_RATE_LIMIT",
+        "PUBLIC_READ_RATE_LIMIT", "UPLOAD_AUTHORIZATION_RATE_LIMIT",
+        "UPLOAD_PRINCIPAL_RATE_LIMIT", "UPLOAD_INGRESS_REQUEST_RATE_LIMIT",
+        "UPLOAD_INGRESS_CLIENT_RATE_LIMIT",
+      ]);
+      for (const binding of ["PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT"] as const) {
+        for (const failure of cases) {
+          const accessed: string[] = [];
+          const runtime = new Proxy(testBindings({
+            PUBLIC_PROBE_RATE_LIMIT: allowed,
+            PUBLIC_PROBE_CLIENT_RATE_LIMIT: allowed,
+            [binding]: failure.limiter,
+          }), {
+            get(target, property, receiver) {
+              if (downstream.has(String(property))) {
+                accessed.push(String(property));
+                throw new Error("unadmitted probe accessed a downstream binding");
+              }
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          const response = await api(`/api/${route}`, {}, runtime);
+          expect(response.status).toBe(failure.status);
+          expect(response.headers.get("retry-after")).toBe(failure.retryAfter);
+          expect(response.headers.get("cache-control")).toBe("no-store");
+          await expect(response.json()).resolves.toMatchObject({
+            error: { code: failure.code },
+          });
+          expect(accessed).toEqual([]);
+        }
+      }
+    },
+  );
+
+  it.each(["health", "ready"] as const)(
+    "rejects unsupported %s probe methods before admission",
+    async (route) => {
+      let limiterCalls = 0;
+      const limiter = {
+        async limit() {
+          limiterCalls += 1;
+          return { success: true };
+        },
+      } satisfies RateLimit;
+      const response = await api(`/api/${route}`, { method: "POST" }, testBindings({
+        PUBLIC_PROBE_RATE_LIMIT: limiter,
+        PUBLIC_PROBE_CLIENT_RATE_LIMIT: limiter,
+      }));
+      expect(response.status).toBe(405);
+      expect(response.headers.get("allow")).toBe("GET");
+      expect(limiterCalls).toBe(0);
+    },
+  );
+
+  it.each(["health", "ready"] as const)(
+    "limits concurrent %s probe chains before downstream work and releases completed leases",
+    async (route) => {
+      const namespace = testBindings().UPLOAD_INGRESS_BUDGET;
+      const budget = namespace.getByName(publicProbeBudgetObjectName(route));
+      let finishFirstProbe!: () => void;
+      const blocked = new Promise<void>((resolve) => { finishFirstProbe = resolve; });
+      let firstProbeCalls = 0;
+      let databaseCalls = 0;
+      const database = testBindings().USAGE_MONITOR_DB;
+      const runtime = testBindings({
+        UPLOAD_INGRESS_BUDGET: {
+          getByName(name: string) {
+            if (name !== UPLOAD_INGRESS_BUDGET_OBJECT_NAME) return namespace.getByName(name);
+            return { async probe() { firstProbeCalls += 1; await blocked; return true; } };
+          },
+        } as unknown as Env["UPLOAD_INGRESS_BUDGET"],
+        USAGE_MONITOR_DB: d1PrepareProxy(database, (query) => {
+          databaseCalls += 1;
+          return database.prepare(query);
+        }),
+      });
+      const pending = [api(`/api/${route}`, {}, runtime), api(`/api/${route}`, {}, runtime)];
+      try {
+        await vi.waitFor(() => expect(firstProbeCalls).toBe(2));
+        const refused = await api(`/api/${route}`, {}, runtime);
+        expect(refused.status).toBe(429);
+        expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(1);
+        expect(firstProbeCalls).toBe(2);
+        expect(databaseCalls).toBe(0);
+        expect((await budget.status(PUBLIC_PROBE_BUDGET_POLICY)).activeLeases).toBe(2);
+      } finally {
+        finishFirstProbe();
+        const responses = await Promise.all(pending);
+        expect(responses.map((response) => response.status)).toEqual(route === "health" ? [200, 200] : [503, 503]);
+      }
+      expect((await budget.status(PUBLIC_PROBE_BUDGET_POLICY)).activeLeases).toBe(0);
+    },
+  );
+
+  it.each(["health", "ready"] as const)(
+    "bounds a stalled %s response and prevents later probes after its deadline",
+    async (route) => {
+      let finishFirstProbe!: () => void;
+      const blocked = new Promise<void>((resolve) => { finishFirstProbe = resolve; });
+      let firstProbeCalls = 0;
+      let laterProbeCalls = 0;
+      const release = vi.fn(async () => {});
+      const allowed = { async limit() { return { success: true }; } } satisfies RateLimit;
+      const runtime = testBindings({
+        PUBLIC_PROBE_RATE_LIMIT: allowed,
+        PUBLIC_PROBE_CLIENT_RATE_LIMIT: allowed,
+        UPLOAD_INGRESS_BUDGET: {
+          getByName(name: string) {
+            if (name === UPLOAD_INGRESS_BUDGET_OBJECT_NAME) {
+              return { async probe() { firstProbeCalls += 1; await blocked; return true; } };
+            }
+            expect(name).toBe(publicProbeBudgetObjectName(route));
+            return {
+              async acquire() { return { allowed: true, leaseId: "11111111-1111-4111-8111-111111111111", retryAfterSeconds: 0 }; },
+              release,
+            };
+          },
+        } as unknown as Env["UPLOAD_INGRESS_BUDGET"],
+        USAGE_MONITOR_DB: d1PrepareProxy(testBindings().USAGE_MONITOR_DB, () => {
+          laterProbeCalls += 1;
+          throw new Error("expired public probe accessed the database");
+        }),
+      });
+      vi.useFakeTimers();
+      try {
+        const pending = api(`/api/${route}`, {}, runtime);
+        await vi.waitFor(() => expect(firstProbeCalls).toBe(1));
+        await vi.advanceTimersByTimeAsync(PUBLIC_PROBE_MAXIMUM_MILLISECONDS + 1);
+        const response = await pending;
+        expect(response.status).toBe(503);
+        expect(response.headers.get("retry-after")).toBe("60");
+        await expect(response.json()).resolves.toMatchObject({ error: { code: "ADMISSION_RATE_LIMIT_UNAVAILABLE" } });
+        expect(release).not.toHaveBeenCalled();
+        expect(laterProbeCalls).toBe(0);
+        finishFirstProbe();
+        await vi.waitFor(() => expect(release).toHaveBeenCalledTimes(1));
+        expect(laterProbeCalls).toBe(0);
+      } finally {
+        finishFirstProbe();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["health", "ready"] as const)(
+    "returns failed %s probes without waiting for sampled diagnostic writes",
+    async (route) => {
+      const requestId = "11111111-1111-4111-8111-111111111100";
+      const randomUUID = vi.spyOn(crypto, "randomUUID").mockReturnValue(requestId);
+      const diagnosticWrites = vi.fn(() => new Promise<D1Result>(() => {}));
+      const stalledDiagnostic = {
+        bind() { return this; },
+        run: diagnosticWrites,
+      } as unknown as D1PreparedStatement;
+      const diagnosticPrepares = vi.fn(() => stalledDiagnostic);
+      const limiter = { async limit() { return { success: true }; } } satisfies RateLimit;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const response = await Promise.race([
+          api(`/api/${route}`, {}, testBindings({
+            PUBLIC_PROBE_RATE_LIMIT: limiter,
+            PUBLIC_PROBE_CLIENT_RATE_LIMIT: limiter,
+            USAGE_MONITOR_DB: d1PrepareProxy(testBindings().USAGE_MONITOR_DB, (query) => {
+              if (/INSERT INTO diagnostic_error_events/u.test(query)) return diagnosticPrepares();
+              throw new Error("synthetic backend unavailable");
+            }),
+          })),
+          new Promise<null>((resolve) => { deadline = setTimeout(() => resolve(null), 3_000); }),
+        ]);
+        expect(response, "failed probes must finish without awaiting diagnostic storage").not.toBeNull();
+        expect(response!.status).toBe(route === "health" ? 503 : 500);
+        expect(response!.headers.get("cache-control")).toBe("no-store");
+        await expect(response!.json()).resolves.toMatchObject({
+          error: {
+            code: route === "health" ? "COLLECTION_CONTROL_UNAVAILABLE" : "INTERNAL_ERROR",
+            requestId,
+          },
+        });
+        expect(diagnosticPrepares).not.toHaveBeenCalled();
+        expect(diagnosticWrites).not.toHaveBeenCalled();
+        const budget = testBindings().UPLOAD_INGRESS_BUDGET.getByName(publicProbeBudgetObjectName(route));
+        expect((await budget.status(PUBLIC_PROBE_BUDGET_POLICY)).activeLeases).toBe(0);
+      } finally {
+        clearTimeout(deadline);
+        randomUUID.mockRestore();
+      }
+    },
+  );
+
+  it.each(["health", "ready"] as const)(
+    "keeps admitted %s probes unavailable when backend reads fail",
+    async (route) => {
+      let limiterCalls = 0;
+      const limiter = {
+        async limit() {
+          limiterCalls += 1;
+          return { success: true };
+        },
+      } satisfies RateLimit;
+      const response = await api(`/api/${route}`, {}, testBindings({
+        PUBLIC_PROBE_RATE_LIMIT: limiter,
+        PUBLIC_PROBE_CLIENT_RATE_LIMIT: limiter,
+        USAGE_MONITOR_DB: d1PrepareProxy(testBindings().USAGE_MONITOR_DB, () => {
+          throw new Error("synthetic backend unavailable");
+        }),
+      }));
+      expect(response.status).toBe(route === "health" ? 503 : 500);
+      expect(limiterCalls).toBe(2);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: route === "health" ? "COLLECTION_CONTROL_UNAVAILABLE" : "INTERNAL_ERROR" },
+      });
+      const budget = testBindings().UPLOAD_INGRESS_BUDGET.getByName(publicProbeBudgetObjectName(route));
+      expect((await budget.status(PUBLIC_PROBE_BUDGET_POLICY)).activeLeases).toBe(0);
+    },
+  );
 
   it("fails health closed if Queue ingress is enabled before its protocol is implemented", async () => {
     const response = await api("/api/health", {}, testBindings({

@@ -10,7 +10,7 @@ import { buildTelemetryContributionsFromBundle } from "../../src/contribution/in
 import { localCompanionStatePaths } from "../../src/local-installation-diagnostics.js";
 import { beginUnifiedIndexGeneration, openLocalUnifiedIndex } from "../../src/local-unified-index.js";
 import { CommunityClient, LocalCompanionClient } from "../web/public/data-client.js";
-import { startLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 import {
   ATTRIBUTION_FIXTURE_BINDING as binding, ATTRIBUTION_FIXTURE_START as start,
   writeAttributionFixture,

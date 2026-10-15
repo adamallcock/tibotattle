@@ -4,11 +4,25 @@ import { open } from "node:fs/promises";
 import { platform } from "node:os";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import { minimizeClaudeTranscriptCanonicalOccurrence } from "./claude-transcript-export-source.js";
 import { readBoundedUtf8LineEntries } from "./bounded-jsonl.js";
 
 export const CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION =
-  "claude-desktop-incremental-canonicalizer-v0.2";
+  "claude-desktop-incremental-canonicalizer-v0.3";
+
+const LEGACY_CANONICALIZER_VERSION = "claude-desktop-incremental-canonicalizer-v0.2";
+const SCHEMA_VERSION_GUARDS = Object.freeze({
+  canonical_schema_version_insert_guard: `CREATE TRIGGER canonical_schema_version_insert_guard
+    BEFORE INSERT ON canonical_meta
+    WHEN NEW.key = 'schema_version' AND NEW.value <> '${CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION}'
+    BEGIN SELECT RAISE(ABORT, 'claude_desktop_incremental_schema_version'); END`,
+  canonical_schema_version_update_guard: `CREATE TRIGGER canonical_schema_version_update_guard
+    BEFORE UPDATE OF key, value ON canonical_meta
+    WHEN (OLD.key = 'schema_version' AND NEW.key <> 'schema_version')
+      OR (NEW.key = 'schema_version' AND NEW.value <> '${CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION}')
+    BEGIN SELECT RAISE(ABORT, 'claude_desktop_incremental_schema_version'); END`,
+});
 
 const MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const MAXIMUM_SOURCE_BYTES = 32 * 1024 * 1024 * 1024;
@@ -103,6 +117,7 @@ async function completePrefixBytes(handle, size) {
     scanned += bytesRead;
     const newline = buffer.lastIndexOf(0x0a);
     if (newline !== -1) return start + newline + 1;
+    if (scanned > MAXIMUM_LINE_BYTES) fail("line_bytes");
     end = start;
   }
   return 0;
@@ -133,65 +148,150 @@ function selectedAfter(left, right) {
   return left.lineOrdinal > right.selected_line_ordinal;
 }
 
-function configure(database) {
-  database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS canonical_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    ) STRICT, WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS canonical_source (
-      source_key TEXT PRIMARY KEY,
-      device INTEGER NOT NULL,
-      inode INTEGER NOT NULL,
-      birthtime_ms INTEGER NOT NULL,
-      prefix_bytes INTEGER NOT NULL CHECK(prefix_bytes >= 0),
-      prefix_sha256 TEXT NOT NULL,
-      prefix_lines INTEGER NOT NULL CHECK(prefix_lines >= 0),
-      mtime_ms INTEGER NOT NULL CHECK(mtime_ms >= 0),
-      generation INTEGER NOT NULL CHECK(generation >= 1),
-      status TEXT NOT NULL CHECK(status IN ('present', 'missing_suspected')),
-      updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
-    ) STRICT, WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS canonical_group (
-      message_key TEXT PRIMARY KEY,
-      invariant_sha256 TEXT NOT NULL,
-      top_level_invariant_sha256 TEXT,
-      iteration_invariant_sha256 TEXT,
-      selected_timestamp TEXT NOT NULL,
-      selected_output_tokens INTEGER NOT NULL CHECK(selected_output_tokens >= 0),
-      selected_cost_output_tokens INTEGER NOT NULL CHECK(selected_cost_output_tokens >= 0),
-      selected_has_iteration INTEGER NOT NULL CHECK(selected_has_iteration IN (0, 1)),
-      selected_source_key TEXT NOT NULL,
-      selected_source_generation INTEGER NOT NULL CHECK(selected_source_generation >= 1),
-      selected_line_ordinal INTEGER NOT NULL CHECK(selected_line_ordinal >= 1),
-      selected_cost_event_count INTEGER NOT NULL CHECK(selected_cost_event_count >= 1),
-      selected_cost_structure_sha256 TEXT NOT NULL,
-      selected_candidates_json TEXT NOT NULL,
-      revision INTEGER NOT NULL CHECK(revision >= 1)
-    ) STRICT, WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS canonical_tool (
-      message_key TEXT NOT NULL,
-      tool_key TEXT NOT NULL,
-      category TEXT NOT NULL,
-      PRIMARY KEY(message_key, tool_key),
-      FOREIGN KEY(message_key) REFERENCES canonical_group(message_key)
-    ) STRICT, WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS dirty_group (
-      message_key TEXT PRIMARY KEY,
-      FOREIGN KEY(message_key) REFERENCES canonical_group(message_key)
-    ) STRICT, WITHOUT ROWID;
-  `);
-  const groupColumns = new Set(database.prepare("PRAGMA table_info(canonical_group)")
-    .all().map((row) => row.name));
-  if (!groupColumns.has("selected_source_generation")) {
-    database.exec(`
-      ALTER TABLE canonical_group ADD COLUMN selected_source_generation INTEGER
-        NOT NULL DEFAULT 1 CHECK(selected_source_generation >= 1)
-    `);
+function inspectSchema(database, verifier) {
+  const objects = database.prepare(
+    "SELECT name, type, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+  ).all();
+  if (objects.length === 0) {
+    if (database.prepare("PRAGMA user_version").get().user_version !== 0
+        || database.prepare("PRAGMA application_id").get().application_id !== 0) fail("schema_version");
+    return null;
   }
-  database.prepare("INSERT OR REPLACE INTO canonical_meta(key, value) VALUES ('schema_version', ?)")
-    .run(CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION);
+  const tables = objects.filter((row) => row.type === "table").map((row) => row.name);
+  if (!tables.includes("canonical_meta")) fail("schema_version");
+  const version = database.prepare(
+    "SELECT value FROM canonical_meta WHERE key = 'schema_version'",
+  ).get()?.value;
+  if (version !== LEGACY_CANONICALIZER_VERSION
+      && version !== CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION) fail("schema_version");
+  const expectedTables = [
+    "canonical_meta", "canonical_source", "canonical_group", "canonical_tool", "dirty_group",
+  ];
+  const guards = version === CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION
+    ? Object.entries(SCHEMA_VERSION_GUARDS) : [];
+  if (objects.length !== expectedTables.length + guards.length || tables.length !== expectedTables.length
+      || expectedTables.some((name) => !tables.includes(name))) fail("schema_version");
+  for (const [name, sql] of guards) {
+    if (!objects.some((row) => row.type === "trigger" && row.name === name && row.sql === sql)) {
+      fail("schema_version");
+    }
+  }
+  const expectedColumns = {
+    canonical_meta: ["key:TEXT", "value:TEXT"],
+    canonical_source: [
+      "source_key:TEXT", "device:INTEGER", "inode:INTEGER", "birthtime_ms:INTEGER",
+      "prefix_bytes:INTEGER", "prefix_sha256:TEXT", "prefix_lines:INTEGER", "mtime_ms:INTEGER",
+      "generation:INTEGER", "status:TEXT", "updated_at_ms:INTEGER",
+      ...(version === CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION ? ["mtime_ms_precise:REAL"] : []),
+    ],
+    canonical_group: [
+      "message_key:TEXT", "invariant_sha256:TEXT", "top_level_invariant_sha256:TEXT",
+      "iteration_invariant_sha256:TEXT", "selected_timestamp:TEXT", "selected_output_tokens:INTEGER",
+      "selected_cost_output_tokens:INTEGER", "selected_has_iteration:INTEGER", "selected_source_key:TEXT",
+      "selected_source_generation:INTEGER", "selected_line_ordinal:INTEGER", "selected_cost_event_count:INTEGER",
+      "selected_cost_structure_sha256:TEXT", "selected_candidates_json:TEXT", "revision:INTEGER",
+    ],
+    canonical_tool: ["message_key:TEXT", "tool_key:TEXT", "category:TEXT"],
+    dirty_group: ["message_key:TEXT"],
+  };
+  for (const [table, expected] of Object.entries(expectedColumns)) {
+    const columns = database.prepare(`PRAGMA table_info(${table})`).all();
+    const actual = columns.map((row) => `${row.name}:${row.type}`).sort();
+    const supportedColumns = version === LEGACY_CANONICALIZER_VERSION && table === "canonical_group"
+      && !actual.includes("selected_source_generation:INTEGER")
+      ? expected.filter((column) => column !== "selected_source_generation:INTEGER") : expected;
+    if (stableJson(actual) !== stableJson(supportedColumns.toSorted())) fail("schema_version");
+    const preciseColumn = columns.find((row) => row.name === "mtime_ms_precise");
+    if (preciseColumn && preciseColumn.notnull !== 0) fail("schema_version");
+  }
+  const storedVerifier = database.prepare(
+    "SELECT value FROM canonical_meta WHERE key = 'secret_verifier'",
+  ).get()?.value;
+  if (storedVerifier !== verifier) fail("secret_mismatch");
+  return version;
+}
+
+function configure(database, version, verifier) {
+  database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;");
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    if (version === null) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS canonical_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS canonical_source (
+          source_key TEXT PRIMARY KEY,
+          device INTEGER NOT NULL,
+          inode INTEGER NOT NULL,
+          birthtime_ms INTEGER NOT NULL,
+          prefix_bytes INTEGER NOT NULL CHECK(prefix_bytes >= 0),
+          prefix_sha256 TEXT NOT NULL,
+          prefix_lines INTEGER NOT NULL CHECK(prefix_lines >= 0),
+          mtime_ms INTEGER NOT NULL CHECK(mtime_ms >= 0),
+          mtime_ms_precise REAL CHECK(mtime_ms_precise >= 0),
+          generation INTEGER NOT NULL CHECK(generation >= 1),
+          status TEXT NOT NULL CHECK(status IN ('present', 'missing_suspected')),
+          updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+        ) STRICT, WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS canonical_group (
+          message_key TEXT PRIMARY KEY,
+          invariant_sha256 TEXT NOT NULL,
+          top_level_invariant_sha256 TEXT,
+          iteration_invariant_sha256 TEXT,
+          selected_timestamp TEXT NOT NULL,
+          selected_output_tokens INTEGER NOT NULL CHECK(selected_output_tokens >= 0),
+          selected_cost_output_tokens INTEGER NOT NULL CHECK(selected_cost_output_tokens >= 0),
+          selected_has_iteration INTEGER NOT NULL CHECK(selected_has_iteration IN (0, 1)),
+          selected_source_key TEXT NOT NULL,
+          selected_source_generation INTEGER NOT NULL CHECK(selected_source_generation >= 1),
+          selected_line_ordinal INTEGER NOT NULL CHECK(selected_line_ordinal >= 1),
+          selected_cost_event_count INTEGER NOT NULL CHECK(selected_cost_event_count >= 1),
+          selected_cost_structure_sha256 TEXT NOT NULL,
+          selected_candidates_json TEXT NOT NULL,
+          revision INTEGER NOT NULL CHECK(revision >= 1)
+        ) STRICT, WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS canonical_tool (
+          message_key TEXT NOT NULL,
+          tool_key TEXT NOT NULL,
+          category TEXT NOT NULL,
+          PRIMARY KEY(message_key, tool_key),
+          FOREIGN KEY(message_key) REFERENCES canonical_group(message_key)
+        ) STRICT, WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS dirty_group (
+          message_key TEXT PRIMARY KEY,
+          FOREIGN KEY(message_key) REFERENCES canonical_group(message_key)
+        ) STRICT, WITHOUT ROWID;
+      `);
+      database.prepare("INSERT INTO canonical_meta(key, value) VALUES ('schema_version', ?)")
+        .run(CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION);
+      database.prepare("INSERT INTO canonical_meta(key, value) VALUES ('secret_verifier', ?)")
+        .run(verifier);
+    } else if (version === LEGACY_CANONICALIZER_VERSION) {
+      const groupColumns = database.prepare("PRAGMA table_info(canonical_group)").all();
+      if (!groupColumns.some((row) => row.name === "selected_source_generation")) {
+        database.exec(`
+          ALTER TABLE canonical_group ADD COLUMN selected_source_generation INTEGER
+            NOT NULL DEFAULT 1 CHECK(selected_source_generation >= 1)
+        `);
+      }
+      database.exec(`
+        ALTER TABLE canonical_source ADD COLUMN mtime_ms_precise REAL CHECK(mtime_ms_precise >= 0)
+      `);
+      database.prepare("UPDATE canonical_meta SET value = ? WHERE key = 'schema_version'")
+        .run(CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION);
+    }
+    if (version !== CLAUDE_DESKTOP_INCREMENTAL_CANONICALIZER_VERSION) {
+      // v0.2 writers blindly replace the version row. Fence that write before
+      // they can refresh this store; future migrations replace guards atomically.
+      for (const sql of Object.values(SCHEMA_VERSION_GUARDS)) database.exec(sql);
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function secretVerifier(secret) {
@@ -207,22 +307,41 @@ function emptyToolCounts() {
 export function openClaudeDesktopIncrementalCanonicalizer(path, { secret } = {}) {
   if (typeof path !== "string" || path.length === 0 || path.includes("\0")) fail("configuration");
   const key = normalizeSecret(secret);
-  const database = new DatabaseSync(path);
+  let database;
   try {
+    const verifier = secretVerifier(key);
+    if (existsSync(path)) {
+      const before = lstatSync(path);
+      const sidecars = ["-wal", "-shm", "-journal"].map((suffix) => `${path}${suffix}`);
+      const immutable = sidecars.every((sidecar) => !existsSync(sidecar));
+      // A read-only SQLite connection can create WAL coordination files. A closed
+      // store without sidecars uses immutable mode solely for schema admission.
+      const reader = new DatabaseSync(
+        immutable ? `${pathToFileURL(path).href}?mode=ro&immutable=1` : path,
+        { readOnly: true },
+      );
+      try {
+        inspectSchema(reader, verifier);
+      } finally {
+        reader.close();
+      }
+      if (immutable) {
+        const after = lstatSync(path);
+        if (!sameFile(before, after) || before.size !== after.size
+            || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
+            || sidecars.some((sidecar) => existsSync(sidecar))) fail("source_changed");
+      }
+    }
+    database = new DatabaseSync(path);
+    // Recheck after reopening before permissions, journal mode, or schema can change.
+    const version = inspectSchema(database, verifier);
     chmodSync(path, 0o600);
-    configure(database);
+    configure(database, version, verifier);
     for (const sidecar of [`${path}-wal`, `${path}-shm`]) {
       if (existsSync(sidecar)) chmodSync(sidecar, 0o600);
     }
-    const verifier = secretVerifier(key);
-    const storedVerifier = database.prepare(
-      "SELECT value FROM canonical_meta WHERE key = 'secret_verifier'",
-    ).get();
-    if (storedVerifier && storedVerifier.value !== verifier) fail("secret_mismatch");
-    database.prepare("INSERT OR IGNORE INTO canonical_meta(key, value) VALUES ('secret_verifier', ?)")
-      .run(verifier);
   } catch (error) {
-    database.close();
+    database?.close();
     key.fill(0);
     throw error;
   }
@@ -411,7 +530,7 @@ export function openClaudeDesktopIncrementalCanonicalizer(path, { secret } = {})
         if (!sameFile(opened, before)) fail("source_changed");
         const prefixBytes = await completePrefixBytes(handle, opened.size);
         const sameMetadata = prior && prior.prefix_bytes === prefixBytes
-          && prior.mtime_ms === Math.trunc(opened.mtimeMs);
+          && prior.mtime_ms_precise !== null && prior.mtime_ms_precise === opened.mtimeMs;
         if (sameMetadata) {
           presentSources.push({ sourceKey: keyValue, sourceGeneration: Number(prior.generation) });
           const after = await handle.stat();
@@ -469,13 +588,14 @@ export function openClaudeDesktopIncrementalCanonicalizer(path, { secret } = {})
           database.prepare(`
             INSERT INTO canonical_source(
               source_key, device, inode, birthtime_ms, prefix_bytes, prefix_sha256,
-              prefix_lines, mtime_ms, generation, status, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?)
+              prefix_lines, mtime_ms, mtime_ms_precise, generation, status, updated_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?)
             ON CONFLICT(source_key) DO UPDATE SET
               prefix_bytes = excluded.prefix_bytes,
               prefix_sha256 = excluded.prefix_sha256,
               prefix_lines = excluded.prefix_lines,
               mtime_ms = excluded.mtime_ms,
+              mtime_ms_precise = excluded.mtime_ms_precise,
               generation = excluded.generation,
               status = 'present',
               updated_at_ms = excluded.updated_at_ms
@@ -488,6 +608,7 @@ export function openClaudeDesktopIncrementalCanonicalizer(path, { secret } = {})
             prefixSha256,
             lastLine,
             Math.trunc(opened.mtimeMs),
+            opened.mtimeMs,
             generation,
             observedAtMs,
           );

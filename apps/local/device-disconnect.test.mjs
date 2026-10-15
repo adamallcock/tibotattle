@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { createIncrementalContributionSyncController } from "../../src/incremental-contribution.js";
 import { LOCAL_COMPANION_SCHEMA_VERSION } from "../../src/local-companion-data.js";
-import { startLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const PAIRING_CODE = `um_pair_${DEVICE_ID}.${"A".repeat(43)}`;

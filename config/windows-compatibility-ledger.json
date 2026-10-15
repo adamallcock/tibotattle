@@ -70,9 +70,9 @@
     },
     {
       "file": "test/local-collector-state.test.js",
-      "win32BranchCount": 2,
+      "win32BranchCount": 5,
       "classification": "windows-equivalent-needed",
-      "followUp": "Add a native Windows abrupt-process-termination SQLite recovery fixture."
+      "followUp": "Qualify native Windows owner ACL protection before the first database write, for the first transaction's rollback journal, and for nonempty partial state after initialization failure; add a native Windows abrupt-process-termination SQLite recovery fixture."
     },
     {
       "file": "test/local-companion-data.test.js",

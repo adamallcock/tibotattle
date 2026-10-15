@@ -13,6 +13,7 @@ import { DESKTOP_TRAY_UPGRADE_DEFAULTS, validateDesktopTrayPreferences } from ".
 import { existsSync } from "node:fs";
 
 import { desktopText } from "./desktop-copy.js";
+import { installDesktopLocalAuthorization } from "./desktop-local-authorization.js";
 import {
   isAllowedCompanionURL,
   isExactLoopbackOrigin,
@@ -369,6 +370,7 @@ export function createDesktopTrayPopover({
   platform = process.platform,
   model,
   onAction,
+  requestAuthorizationHeaders,
   windowOptions = {},
 } = {}) {
   if (typeof BrowserWindow !== "function") throw new TypeError("BrowserWindow is required");
@@ -377,9 +379,14 @@ export function createDesktopTrayPopover({
   }
   const selectedPageURL = assertTrayPopoverPageURL(pageURL, origin);
   if (typeof onAction !== "function") throw new TypeError("onAction is required");
+  if (requestAuthorizationHeaders !== undefined
+      && typeof requestAuthorizationHeaders !== "function") {
+    throw new TypeError("requestAuthorizationHeaders is invalid");
+  }
   let currentModel = freezeModel(model ?? createDesktopTrayPopoverModel());
   let window = null;
   let policy = null;
+  let localAuthorization = null;
   let loaded = false;
   let pendingShow = false;
   let destroyed = false;
@@ -541,7 +548,19 @@ export function createDesktopTrayPopover({
           }
         },
       });
+      if (requestAuthorizationHeaders !== undefined) {
+        localAuthorization = installDesktopLocalAuthorization({
+          session: candidateContents.session,
+          webContents: candidateContents,
+          origin,
+          requestAuthorizationHeaders,
+        });
+      }
     } catch {
+      policy?.remove?.();
+      policy = null;
+      localAuthorization?.remove();
+      localAuthorization = null;
       candidate.destroy?.();
       window = null;
       return false;
@@ -576,6 +595,8 @@ export function createDesktopTrayPopover({
       candidateContents?.off?.("before-input-event", onBeforeInputEvent);
       policy?.remove?.();
       policy = null;
+      localAuthorization?.remove();
+      localAuthorization = null;
     };
     const discardFailedLoad = () => {
       if (window !== candidate) return;

@@ -26,6 +26,7 @@ import {
   verifyEdgeModeLiveSnapshot,
 } from "./edge-mode-configuration.mjs";
 import { readMaintenanceFile } from "./production-maintenance.mjs";
+import { assertOperationalAdmissionBindings } from "./production-live-config.mjs";
 
 /**
  * Edge-mode support for the typed production deploy and its reconcilers
@@ -54,6 +55,13 @@ import { readMaintenanceFile } from "./production-maintenance.mjs";
  */
 
 export const PRODUCTION_EDGE_MODE_PIN_SCHEMA = "production-edge-mode-pin-v1";
+
+/** The production overlay is the default; staging supplies its bound isolation adapter. */
+export const PRODUCTION_EDGE_MODE_OVERLAY = Object.freeze({
+  target: "production",
+  config: (input) => applyEdgeModeOverlay(input).config,
+  expected: applyEdgeModeSnapshotDelta,
+});
 
 /**
  * The six Workers Rate Limiting bindings evaluated at the edge. This mirrors
@@ -109,6 +117,14 @@ function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function edgeModeOverlay(overlay) {
+  if (!object(overlay) || !["production", "staging"].includes(overlay.target)
+      || typeof overlay.config !== "function" || typeof overlay.expected !== "function") {
+    fail("EDGE_MODE_INPUT_INVALID");
+  }
+  return overlay;
+}
+
 function edgeCode(error, fallback) {
   const code = error?.code;
   return typeof code === "string"
@@ -148,26 +164,31 @@ export function edgeModeIdentity(liveMode, mode) {
  * post-deploy capture; the deploy's post-deploy fingerprint check against the
  * pinned expected snapshot keeps an unapplied overlay from passing.
  */
-export function createEdgeModeConfigTools({ mode, plan, trackedConfig, base } = {}) {
+export function createEdgeModeConfigTools({
+  mode, plan, trackedConfig, base, overlay = PRODUCTION_EDGE_MODE_OVERLAY, renderTrackedConfig = trackedConfig,
+} = {}) {
   if (parseEdgeUpstreamMode(mode) === null || !object(trackedConfig)
+      || !object(renderTrackedConfig)
       || typeof base?.createSnapshot !== "function" || typeof base?.render !== "function"
       || typeof base?.verify !== "function") {
     fail("EDGE_MODE_INPUT_INVALID");
   }
-  const trackedText = JSON.stringify(trackedConfig);
-  const expectedSnapshot = (snapshot) => applyEdgeModeSnapshotDelta({ snapshot, mode, plan, trackedConfig });
+  const selectedOverlay = edgeModeOverlay(overlay);
+  const trackedText = JSON.stringify(renderTrackedConfig);
+  const expectedSnapshot = (snapshot) => selectedOverlay.expected({ snapshot, mode, plan, trackedConfig });
   return Object.freeze({
     createSnapshot: base.createSnapshot,
     render({ trackedConfig: rendered, snapshot, sourceCommit } = {}) {
-      // The render's tracked config is the source snapshot's wrangler.jsonc;
-      // the overlay's is the checked-out one. Both come from one commit.
+      // Production renders its tracked config; staging renders its validated
+      // template while retaining the production config for isolation checks.
       if (JSON.stringify(rendered) !== trackedText) fail("EDGE_MODE_INPUT_INVALID");
-      return applyEdgeModeOverlay({
+      return selectedOverlay.config({
         renderedConfig: base.render({ trackedConfig: rendered, snapshot, sourceCommit }),
+        snapshot,
         mode,
         plan,
         trackedConfig,
-      }).config;
+      });
     },
     verify({ snapshot, candidateConfig, sourceCommit } = {}) {
       let expected;
@@ -500,8 +521,12 @@ export async function prepareEdgeModeDeployment({
   readBlob = defaultBlobReader(workerDirectory),
   isAncestor = defaultAncestorCheck(workerDirectory),
   verifyOrigin = verifyEdgeOriginBeforeGcp,
+  overlay = PRODUCTION_EDGE_MODE_OVERLAY,
+  renderTrackedConfig,
 } = {}) {
   try {
+    const selectedOverlay = edgeModeOverlay(overlay);
+    if (renderTrackedConfig !== undefined && !object(renderTrackedConfig)) fail("EDGE_MODE_INPUT_INVALID");
     const { mode, plan, overlaySha256 } = resolveEdgeModeRequest({ edgeMode, edgePlan });
     if (mode !== "gcp" && (originCommit !== undefined || obtainOriginIdentityToken !== undefined)) {
       fail("EDGE_MODE_INPUT_INVALID");
@@ -535,12 +560,13 @@ export async function prepareEdgeModeDeployment({
     // an unknown live storage binding, a missing edge secret
     // (EDGE_MODE_SECRET_MISSING), a missing SPARKLE_RELEASES or a guard D1
     // that is another database.
-    const expected = applyEdgeModeSnapshotDelta({ snapshot: baseline, mode, plan, trackedConfig });
+    const expected = selectedOverlay.expected({ snapshot: baseline, mode, plan, trackedConfig });
 
     let verifiedOriginCommit = null;
     if (mode === "gcp") {
       if (candidatePublicManifestSha256 === null && !gcpEra) fail("EDGE_PRIVACY_PAGE_NOT_CUTOVER");
       assertEdgeAdmissionBindings(baseline);
+      assertOperationalAdmissionBindings(baseline.bindings, "ADMISSION_BINDINGS_NOT_PROVISIONED", "ADMISSION_BINDINGS_INVALID");
       if (!SHA.test(originCommit ?? "")) fail("EDGE_ORIGIN_COMMIT_REQUIRED");
       if (typeof obtainOriginIdentityToken !== "function") fail("EDGE_ORIGIN_IDENTITY_TOKEN_UNAVAILABLE");
       let identityToken;
@@ -557,7 +583,9 @@ export async function prepareEdgeModeDeployment({
       verifiedOriginCommit = originCommit;
     }
 
-    const configTools = createEdgeModeConfigTools({ mode, plan, trackedConfig, base: baseConfigTools });
+    const configTools = createEdgeModeConfigTools({
+      mode, plan, trackedConfig, base: baseConfigTools, overlay: selectedOverlay, renderTrackedConfig,
+    });
     const pin = createEdgeModePin({
       mode, liveMode, overlaySha256, expected, contractBlobSha, originCommit: verifiedOriginCommit,
     });

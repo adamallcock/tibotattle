@@ -29,10 +29,11 @@ COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/lin
 COPY .release-build/electron-production/linux-x64/app ./.release-build/electron-production/linux-x64/app
 COPY .release-build/electron-production/linux-x64/production-source-candidate.json ./.release-build/electron-production/linux-x64/production-source-candidate.json
 COPY .release-build/electron-production/linux-x64/artifacts/linux-unpacked ./.release-build/electron-production/linux-x64/artifacts/linux-unpacked
-# Genuine updater pair: copy only final immutable AppImages and their receipt.
-COPY .release-build/electron-linux-updater-rehearsal/pair.json ./.release-build/electron-linux-updater-rehearsal/pair.json
-COPY .release-build/electron-linux-updater-rehearsal/current/*.AppImage ./.release-build/electron-linux-updater-rehearsal/current/
-COPY .release-build/electron-linux-updater-rehearsal/next/*.AppImage ./.release-build/electron-linux-updater-rehearsal/next/
+# The exact Docker ignore allowlist admits the immutable pair and, when prepared
+# separately, only its signed feed and admission. Inspection outputs stay out.
+# Missing authorization does not prevent unrelated packaged checks; the updater
+# entrypoint explicitly refuses an absent signed qualification admission.
+COPY .release-build/electron-linux-updater-rehearsal ./.release-build/electron-linux-updater-rehearsal
 # Only the static synthetic CLI is executable; private runtime/profile mounts
 # remain noexec. The ordinary app reaches this fixture through its normal PATH.
 COPY test/fixtures/linux-packaged-codex/codex /opt/tibotattle-linux-packaged-smoke/bin/codex

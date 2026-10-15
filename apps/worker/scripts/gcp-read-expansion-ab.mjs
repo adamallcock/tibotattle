@@ -57,14 +57,45 @@ export async function loadExpansionReaders({ base = DEFAULT_BASE, candidateSourc
   }
 }
 
-export async function compareExpansionRead(readers, context, options) {
+/** Optional fixture assertions inspect retained outcomes without rereading SQL.
+ * They run outside normalization and receive the actual returned value or
+ * original refusal code separately; receipts contain only outcome digests. */
+export async function compareExpansionRead(readers, context, options, assertOccurrenceOutcome) {
+  const retained = new WeakMap();
   const outcome = async (reader, method, input) => {
-    try { return { value: JSON.stringify([...await reader.occurrences[method](context, input)]) }; }
-    catch (error) { return { error: { name: error?.constructor?.name, code: error?.code ?? error?.reason ?? null } }; }
+    let value;
+    let fulfilled = false;
+    try {
+      value = await reader.occurrences[method](context, input);
+      fulfilled = true;
+      const result = Object.freeze({ value: JSON.stringify([...value]) });
+      if (assertOccurrenceOutcome !== undefined && method === "readOwnerOccurrences") {
+        retained.set(result, Object.freeze({ value }));
+      }
+      return result;
+    }
+    catch (error) {
+      const code = error?.code;
+      const failure = Object.freeze({ error: Object.freeze({ name: error?.constructor?.name,
+        code: code ?? error?.reason ?? null }) });
+      if (assertOccurrenceOutcome !== undefined && method === "readOwnerOccurrences") {
+        retained.set(failure, Object.freeze(fulfilled ? { value } : { code }));
+      }
+      return failure;
+    }
   };
   const old = await outcome(readers.base, "readOwnerOccurrences", options);
   const next = await outcome(readers.candidate, "readOwnerOccurrences", options);
   assert.equal(sha(JSON.stringify(next)), sha(JSON.stringify(old)), "reader output/refusal bytes differ");
+  if (assertOccurrenceOutcome !== undefined) {
+    try {
+      await assertOccurrenceOutcome("base", old, retained.get(old));
+      await assertOccurrenceOutcome("candidate", next, retained.get(next));
+    } finally {
+      retained.delete(old);
+      retained.delete(next);
+    }
+  }
   const { stream: _stream, ...range } = options;
   const oldFingerprints = await outcome(readers.base, "readOwnerDayFingerprints", range);
   const nextFingerprints = await outcome(readers.candidate, "readOwnerDayFingerprints", range);

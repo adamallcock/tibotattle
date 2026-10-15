@@ -14,7 +14,7 @@ import { ingestLocalUnifiedIndexOffMain } from "../src/local-unified-index-off-m
 import { refreshReplaySafeAccountingCache } from "../src/replay-safe-accounting-cache.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 
-import { startLocalCompanionServer } from "../apps/local/server.js";
+import { fetch, startLocalCompanionServer } from "./helpers/local-authorized-client.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
 import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";

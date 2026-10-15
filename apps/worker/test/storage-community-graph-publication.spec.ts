@@ -107,11 +107,12 @@ function evidence(){
 
 
 const bindings=()=>({source:typed(),target:b.STORAGE_ANALYTICS_DB,sourceId:namespace,sourceNamespace:namespace});
-async function fixture(id=participantId){
- const f=await createV11DeviceFixture(typed(),{participantId:id,grant:true});
- await activate(typed(),f,await makeV11Day(day(),evidence()),true);
- for(let n=0;n<32;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
- await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
+async function fixture(id=participantId,options:{publishDaily?:boolean;deferAnalytics?:boolean;uploadDatabase?:D1Database}={}){
+ const db=options.uploadDatabase??typed();
+ const f=await createV11DeviceFixture(db,{participantId:id,grant:true});
+ await activate(db,f,await makeV11Day(day(),evidence()),true);
+ if(!options.deferAnalytics)for(let n=0;n<32;n++){if((await advanceStorageAnalytics(bindings())).state==='idle')break;}
+ if(options.publishDaily!==false)await advanceStorageCommunityDaily({...bindings(),day:day()});return f;
 }
 async function modelFixture(){
  const f=await createV11DeviceFixture(typed(),{participantId,grant:true});
@@ -219,6 +220,49 @@ function capturedQueries(){
   const value=Reflect.get(db,key);return typeof value==='function'?value.bind(db):value;
  }});
  return {database,queries};
+}
+function graphBudgetDiagnostics(){
+ const startedAt=performance.now();let lastBoundaryAt=startedAt;
+ const stats={roundTrips:0,statements:0,settledRoundTrips:0,settledCallMs:0,maxSettledCallMs:0};
+ const originals=new WeakMap<D1PreparedStatement,D1PreparedStatement>();
+ const observe=<T>(statementCount:number,invoke:()=>Promise<T>):Promise<T>=>{
+  const started=performance.now();stats.roundTrips++;stats.statements+=statementCount;
+  const result=invoke();
+  const settled=()=>{const elapsed=performance.now()-started;stats.settledRoundTrips++;
+   stats.settledCallMs+=elapsed;stats.maxSettledCallMs=Math.max(stats.maxSettledCallMs,elapsed);};
+  // Observe settlement without replacing the original promise, result or error.
+  void result.then(settled,settled);return result;
+ };
+ const statement=(value:D1PreparedStatement):D1PreparedStatement=>{
+  const wrapped=new Proxy(value,{get(target,property){
+   if(property==='bind')return(...values:unknown[])=>statement(target.bind(...values));
+   if(['first','all','run','raw'].includes(String(property)))return(...values:unknown[])=>
+    observe(1,()=>Reflect.apply(Reflect.get(target,property),target,values) as Promise<unknown>);
+   const member:unknown=Reflect.get(target,property);return typeof member==='function'?member.bind(target):member;
+  }});
+  originals.set(wrapped,value);return wrapped;
+ };
+ const wrap=<T extends D1Database|D1DatabaseSession>(database:T):T=>new Proxy(database,{get(target,property){
+  if(property==='prepare')return(sql:string)=>statement(target.prepare(sql));
+  if(property==='batch')return(statements:D1PreparedStatement[])=>
+   observe(statements.length,()=>target.batch(statements.map(value=>originals.get(value)??value)));
+  if(property==='withSession'&&'withSession'in target)return(constraint?:D1SessionBookmark|D1SessionConstraint)=>
+   wrap(target.withSession(constraint));
+  const member:unknown=Reflect.get(target,property);return typeof member==='function'?member.bind(target):member;
+ }});
+ type Phase='body-start'|'uploads-progress'|'journal-proved'|'daily-cohort-ready'|'kernels-progress'|'model-published'|'assertions-complete';
+ const boundary=(phase:Phase,uploads:number,kernels:number)=>{
+  const now=performance.now();
+  // This file uses real timers. Elapsed time starts inside the test body and
+  // excludes beforeEach; settled-call time is a sum, not exclusive CPU time.
+  // Fixed boundaries survive buffered CI output without a timeout catch/timer.
+  console.info('[storage-graph-budget-diagnostic]',JSON.stringify({phase,uploads,kernels,
+   elapsedMs:Math.round(now-startedAt),phaseElapsedMs:Math.round(now-lastBoundaryAt),
+   roundTrips:stats.roundTrips,statements:stats.statements,settledRoundTrips:stats.settledRoundTrips,
+   settledCallMs:Math.round(stats.settledCallMs),maxSettledCallMs:Math.round(stats.maxSettledCallMs)}));
+  lastBoundaryAt=now;
+ };
+ return {wrap,boundary};
 }
 async function compute(metric:'fits'|'model',date=metric==='fits'?today():day(),ownerIndex=0){
  const owner=(await readStorageCommunityOwnerPage(typed()))[ownerIndex]!;
@@ -398,12 +442,45 @@ describe('isolated allowance graph publication',()=>{
   expect(stored.day).toBe(day());expect(await publishStorageCommunityModelDay(bindings(),{day:day()})).toMatchObject({state:'unchanged'});
  });
  it('measures both full 16-owner publications with the actual shared statement meter',async()=>{
-  for(let i=0;i<16;i++)await fixture(`participant:budget-${i.toString().padStart(2,'0')}`);
-  for(let i=0;i<16;i++){await compute('fits',today(),i);await compute('model',day(),i);}
+  const diagnostic=graphBudgetDiagnostics(),source=diagnostic.wrap(typed()),target=diagnostic.wrap(b.STORAGE_ANALYTICS_DB);
+  const observedBindings={...bindings(),source,target};let uploads=0,kernels=0;
+  diagnostic.boundary('body-start',uploads,kernels);
+  const participantIds=Array.from({length:16},(_,i)=>`participant:budget-${i.toString().padStart(2,'0')}`);
+  for(const id of participantIds){
+   await fixture(id,{publishDaily:false,deferAnalytics:true,uploadDatabase:source});
+   uploads++;if(uploads%8===0)diagnostic.boundary('uploads-progress',uploads,kernels);
+  }
+  // Drain the same ordered journal once after all distinct owners upload,
+  // avoiding an empty admission after every growing intermediate cohort.
+  for(let n=0;n<64;n++){if((await advanceStorageAnalytics(observedBindings)).state==='idle')break;}
+  expect(await advanceStorageAnalytics(observedBindings)).toMatchObject({state:'idle'});
+  const sourceEvents=(await source.prepare('SELECT ? AS source_id,* FROM storage_ingestion_changes ORDER BY sequence LIMIT 17')
+   .bind(namespace).all()).results;
+  expect(sourceEvents).toHaveLength(16);
+  expect((await target.prepare('SELECT * FROM analytics_applied_events WHERE source_id=? ORDER BY sequence LIMIT 17')
+   .bind(namespace).all()).results).toEqual(sourceEvents);
+  diagnostic.boundary('journal-proved',uploads,kernels);
+  // Build the complete cohort once; each pass retains the default four-owner
+  // bound instead of publishing every growing intermediate cohort.
+  for(let pass=0;pass<4;pass++)expect(await advanceStorageCommunityDaily({...observedBindings,day:day()}))
+   .toMatchObject({state:pass===3?'published':'progress',ownersAdvanced:4});
+  const owners=await readStorageCommunityOwnerPage(source);expect(owners).toHaveLength(16);
+  expect(owners.map(owner=>owner.participantId)).toEqual(participantIds);
+  diagnostic.boundary('daily-cohort-ready',uploads,kernels);
+  // The source cohort is now stable; reuse only its real metadata roster.
+  // Both kernels still capture and validate a fresh scope for every owner.
+  for(const owner of owners){
+   const fits=await captureStorageGraphScope(source,{owner,day:today(),metric:'fits',sourceId:namespace,sourceNamespace:namespace});
+   expect(await computeStorageGraphResult(observedBindings,fits)).toMatchObject({state:'complete'});
+   const model=await captureStorageGraphScope(source,{owner,day:day(),metric:'model',sourceId:namespace,sourceNamespace:namespace});
+   expect(await computeStorageGraphResult(observedBindings,model)).toMatchObject({state:'complete'});
+   kernels+=2;if(kernels%8===0)diagnostic.boundary('kernels-progress',uploads,kernels);
+  }
   const modelMeter=createD1InvocationBudget(900),previewMeter=createD1InvocationBudget(900);
-  expect(await publishStorageCommunityModelDay({...bindings(),source:modelMeter.wrap(typed()),target:modelMeter.wrap(b.STORAGE_ANALYTICS_DB)},
+  expect(await publishStorageCommunityModelDay({...observedBindings,source:modelMeter.wrap(source),target:modelMeter.wrap(target)},
    {day:day()})).toMatchObject({state:'published',memberCount:16});
-  expect(await publishStorageCommunityGraphPreview({...bindings(),source:previewMeter.wrap(typed()),target:previewMeter.wrap(b.STORAGE_ANALYTICS_DB)}))
+  diagnostic.boundary('model-published',uploads,kernels);
+  expect(await publishStorageCommunityGraphPreview({...observedBindings,source:previewMeter.wrap(source),target:previewMeter.wrap(target)}))
    .toMatchObject({state:'published',memberCount:16});
   expect({owners:16,modelQueries:modelMeter.queriesUsed,previewQueries:previewMeter.queriesUsed}).toMatchInlineSnapshot(`
     {
@@ -413,6 +490,7 @@ describe('isolated allowance graph publication',()=>{
     }
   `);
   expect(modelMeter.queriesUsed).toBeLessThanOrEqual(250);expect(previewMeter.queriesUsed).toBeLessThanOrEqual(250);
+  diagnostic.boundary('assertions-complete',uploads,kernels);
  });
  it('bounds publication statements across one thousand controlled owner metadata and cache fixtures',async()=>{
   // The preceding test qualifies actual uploaded owners and kernel results.

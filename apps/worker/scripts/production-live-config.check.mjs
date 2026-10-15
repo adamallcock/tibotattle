@@ -39,6 +39,9 @@ function bindings(source = SOURCE) {
     { name: "QUARANTINE", type: "r2_bucket", bucket_name: "synthetic-quarantine" },
     { name: "UPLOAD_INGRESS_BUDGET", type: "durable_object_namespace", namespace_id: DO_NAMESPACE, class_name: "UploadIngressBudget" },
     { name: "PUBLIC_READ_RATE_LIMIT", type: "ratelimit", namespace_id: "3004", simple: { limit: 120, period: 60 } },
+    { name: "PUBLIC_PROBE_RATE_LIMIT", type: "ratelimit", namespace_id: "3009", simple: { limit: 60, period: 60 } },
+    { name: "PUBLIC_PROBE_CLIENT_RATE_LIMIT", type: "ratelimit", namespace_id: "3010", simple: { limit: 12, period: 60 } },
+    { name: "SPARKLE_APPCAST_GUARD_RATE_LIMIT", type: "ratelimit", namespace_id: "3011", simple: { limit: 60, period: 60 } },
     { name: "ASSETS", type: "assets" },
     { name: "PUBLIC_ORIGIN", type: "plain_text", text: "https://synthetic.example" },
     { name: "DEPLOYMENT_SOURCE_COMMIT", type: "plain_text", text: source },
@@ -135,7 +138,7 @@ test("snapshot and effective config preserve typed bindings, runtime, routes and
   const snapshot = baseline();
   const candidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
   const production = candidate.env.production;
-  assert.equal(snapshot.bindings.length, 10);
+  assert.equal(snapshot.bindings.length, 13);
   assert.equal(candidate.account_id, ACCOUNT);
   assert.equal(production.account_id, ACCOUNT);
   assert.equal(production.d1_databases.length, 3);
@@ -160,6 +163,62 @@ test("snapshot and effective config preserve typed bindings, runtime, routes and
     actualFingerprint: snapshot.fingerprint,
   });
   assert.equal(candidate.env.staging.name, "synthetic-staging");
+});
+
+test("legacy live inventories remain inspectable but cannot render or verify deployment without admission", () => {
+  const validCandidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot: baseline(), sourceCommit: NEXT_SOURCE });
+  for (const missing of ["PUBLIC_PROBE_RATE_LIMIT", "PUBLIC_PROBE_CLIENT_RATE_LIMIT", "SPARKLE_APPCAST_GUARD_RATE_LIMIT", "UPLOAD_INGRESS_BUDGET"]) {
+    const value = inventory();
+    value.version.resources.bindings = value.version.resources.bindings.filter((binding) => binding.name !== missing);
+    value.settings.bindings = structuredClone(value.version.resources.bindings);
+    const snapshot = createProductionLiveConfigSnapshot(value);
+    assert.throws(() => renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE }), {
+      code: "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_NOT_PROVISIONED",
+    });
+    assert.deepEqual(verifyProductionLiveConfig({ snapshot, candidateConfig: validCandidate, sourceCommit: NEXT_SOURCE }), {
+      ok: false, code: "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_NOT_PROVISIONED",
+    });
+  }
+});
+
+test("live admission policy drift and shared rate-limit namespaces fail closed", () => {
+  const changes = [
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT").simple.limit = 61; },
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_CLIENT_RATE_LIMIT").simple.limit = 13; },
+    (rows) => { rows.find((entry) => entry.name === "SPARKLE_APPCAST_GUARD_RATE_LIMIT").simple.period = 10; },
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT").namespace_id = "3004"; },
+    (rows) => { rows.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT").namespace_id = "invalid-namespace"; },
+    (rows) => { rows.find((entry) => entry.name === "UPLOAD_INGRESS_BUDGET").environment = "production"; },
+  ];
+  for (const change of changes) {
+    const value = inventory();
+    change(value.version.resources.bindings);
+    value.settings.bindings = structuredClone(value.version.resources.bindings);
+    const snapshot = createProductionLiveConfigSnapshot(value);
+    assert.throws(() => renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE }), {
+      code: "PRODUCTION_LIVE_CONFIG_ADMISSION_BINDINGS_INVALID",
+    });
+  }
+});
+
+test("render preserves provisioned limiter namespaces and verification rejects their replacement", () => {
+  const value = inventory();
+  const provisioned = value.version.resources.bindings.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT");
+  provisioned.namespace_id = "9309";
+  value.settings.bindings = structuredClone(value.version.resources.bindings);
+  const snapshot = createProductionLiveConfigSnapshot(value);
+  const candidate = renderProductionLiveConfig({ trackedConfig: trackedConfig(), snapshot, sourceCommit: NEXT_SOURCE });
+  const limiter = candidate.env.production.ratelimits.find((entry) => entry.name === "PUBLIC_PROBE_RATE_LIMIT");
+  assert.deepEqual(limiter, { name: "PUBLIC_PROBE_RATE_LIMIT", namespace_id: "9309", simple: { limit: 60, period: 60 } });
+  assert.equal(verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE }).ok, true);
+  limiter.namespace_id = "9310";
+  assert.deepEqual(verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE }), {
+    ok: false, code: "PRODUCTION_LIVE_CONFIG_CONFIG_BINDING_DRIFT",
+  });
+  candidate.env.production.ratelimits = candidate.env.production.ratelimits.filter((entry) => entry.name !== "PUBLIC_PROBE_RATE_LIMIT");
+  assert.deepEqual(verifyProductionLiveConfig({ snapshot, candidateConfig: candidate, sourceCommit: NEXT_SOURCE }), {
+    ok: false, code: "PRODUCTION_LIVE_CONFIG_CONFIG_ADMISSION_BINDINGS_INVALID",
+  });
 });
 
 test("a source-only version change does not change the deployment fingerprint", () => {

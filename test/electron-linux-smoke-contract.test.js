@@ -32,6 +32,7 @@ import {
   observeLocalRefreshRequests,
   probeRendererReadinessPrimaryApis,
   reserveLinuxInspectablePageTargets,
+  runLinuxCdpAuthorityOperation,
   runSmoke,
   selectLinuxDashboardTarget,
   startupRefreshTimeoutDiagnostic,
@@ -1011,6 +1012,159 @@ test("Linux smoke refuses an invalid container before resolving its default Elec
   }), /invalid test container/u);
   assert.equal(resolverCalls, 0);
   assert.equal(fixtureCalls, 0);
+});
+
+function assertLinuxCdpAuthorityFailure(error) {
+  assert.equal(error.message, "Linux debugger authority unavailable");
+  assert.equal(error.code, "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE");
+  assert.equal(Object.hasOwn(error, "cause"), false);
+  assert.doesNotMatch(String(error.stack), /SYNTHETIC_AUTHORITY_CANARY/u);
+  return true;
+}
+
+test("Linux debugger authority surrounds each operation with asynchronous checks bound to its port and phase", async () => {
+  for (const phase of ["debugger_http", "debugger_connect", "authenticated_health"]) {
+    const events = [];
+    const result = { accepted: true };
+    const actual = await runLinuxCdpAuthorityOperation({
+      port: 45678,
+      phase,
+      assertCdpAuthority: async (context) => {
+        await Promise.resolve();
+        assert.deepEqual(context, { port: 45678, phase: `${phase}_${events.length === 0 ? "before" : "after"}` });
+        events.push(context.phase);
+        return true;
+      },
+      operation: async () => {
+        assert.deepEqual(events, [`${phase}_before`]);
+        events.push("operation");
+        return result;
+      },
+    });
+    assert.equal(actual, result);
+    assert.deepEqual(events, [`${phase}_before`, "operation", `${phase}_after`]);
+  }
+});
+
+test("Linux debugger authority remains optional for existing smoke callers", async () => {
+  for (const options of [{}, { assertCdpAuthority: null }]) {
+    let operations = 0;
+    const result = { accepted: true };
+    assert.equal(await runLinuxCdpAuthorityOperation({
+      ...options,
+      port: 45678,
+      phase: "debugger_http",
+      operation: async () => { operations += 1; return result; },
+    }), result);
+    assert.equal(operations, 1);
+  }
+});
+
+test("Linux debugger authority requires literal true before HTTP, connection or authenticated health work", async () => {
+  for (const phase of ["debugger_http", "debugger_connect", "authenticated_health"]) {
+    for (const answer of [false, undefined, null, 0, 1, "true", {}]) {
+      let checks = 0;
+      let operations = 0;
+      await assert.rejects(runLinuxCdpAuthorityOperation({
+        port: 45678,
+        phase,
+        assertCdpAuthority: async (context) => {
+          checks += 1;
+          assert.deepEqual(context, { port: 45678, phase: `${phase}_before` });
+          return answer;
+        },
+        operation: async () => { operations += 1; return {}; },
+      }), assertLinuxCdpAuthorityFailure);
+      assert.equal(checks, 1);
+      assert.equal(operations, 0);
+    }
+  }
+});
+
+test("Linux debugger authority rechecks after an operation and refuses its result if ownership changed", async () => {
+  for (const phase of ["debugger_http", "debugger_connect", "authenticated_health"]) {
+    const events = [];
+    let releasedResult = false;
+    await assert.rejects(async () => {
+      await runLinuxCdpAuthorityOperation({
+        port: 45678,
+        phase,
+        assertCdpAuthority: async ({ phase: actualPhase }) => {
+          events.push(actualPhase);
+          return actualPhase.endsWith("_before");
+        },
+        operation: async () => { events.push("operation"); return { accepted: true }; },
+      });
+      releasedResult = true;
+    }, assertLinuxCdpAuthorityFailure);
+    assert.equal(releasedResult, false);
+    assert.deepEqual(events, [`${phase}_before`, "operation", `${phase}_after`]);
+  }
+});
+
+test("Linux debugger authority redacts synchronous throws and asynchronous rejections at both boundaries", async () => {
+  for (const rejectedBoundary of ["before", "after"]) {
+    for (const rejection of [
+      () => { throw new Error("SYNTHETIC_AUTHORITY_CANARY"); },
+      async () => { throw new Error("SYNTHETIC_AUTHORITY_CANARY"); },
+    ]) {
+      let operations = 0;
+      await assert.rejects(runLinuxCdpAuthorityOperation({
+        port: 45678,
+        phase: "debugger_connect",
+        assertCdpAuthority: ({ phase }) => phase.endsWith(`_${rejectedBoundary}`) ? rejection() : true,
+        operation: async () => { operations += 1; return {}; },
+      }), assertLinuxCdpAuthorityFailure);
+      assert.equal(operations, rejectedBoundary === "before" ? 0 : 1);
+    }
+  }
+});
+
+test("Linux debugger polling propagates authority refusal without another attempt", async () => {
+  let checks = 0;
+  let operations = 0;
+  await assert.rejects(waitFor(() => runLinuxCdpAuthorityOperation({
+    port: 45678,
+    phase: "debugger_http",
+    assertCdpAuthority: async () => { checks += 1; return false; },
+    operation: async () => { operations += 1; return {}; },
+  }), 1_000, "synthetic debugger endpoint"), assertLinuxCdpAuthorityFailure);
+  assert.equal(checks, 1);
+  assert.equal(operations, 0);
+});
+
+test("Linux smoke rejects malformed authority hooks before container or fixture preparation", async () => {
+  for (const assertCdpAuthority of [false, true, "true", {}, []]) {
+    const calls = [];
+    await assert.rejects(runSmoke({
+      assertCdpAuthority,
+      readContainerContract: () => { calls.push("container"); throw new Error("must not run"); },
+      binaryResolver: () => { calls.push("binary"); return "/synthetic/unused-electron"; },
+      fixtureFactory: async () => { calls.push("fixture"); throw new Error("must not run"); },
+    }), /Electron Linux smoke runner options are invalid/u);
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("Linux smoke gates both debugger endpoints, retains a rejected connection for cleanup and has no unauthenticated health fallback", () => {
+  const source = runSmoke.toString();
+  assert.match(source, /runLinuxCdpAuthorityOperation\(\{ assertCdpAuthority, port, phase, operation \}\)/u);
+  assert.equal([...source.matchAll(/\bjsonFetch\(/gu)].length, 2);
+  assert.equal([...source.matchAll(/withCdpAuthority\("debugger_http", \(\) => jsonFetch\(/gu)].length, 2);
+  assert.match(source, /withCdpAuthority\("debugger_http", \(\) => jsonFetch\(`http:\/\/127\.0\.0\.1:\$\{port\}\/json\/version`\)\)/u);
+  assert.match(source, /withCdpAuthority\("debugger_http", \(\) => jsonFetch\(`http:\/\/127\.0\.0\.1:\$\{port\}\/json`\)\)/u);
+  assert.equal([...source.matchAll(/\bconnectCdp\(/gu)].length, 1);
+  const connection = source.slice(
+    source.indexOf("await Promise.all(inspectablePages.map"),
+    source.indexOf("const target = selectLinuxDashboardTarget"),
+  );
+  assert.match(connection, /await withCdpAuthority\("debugger_connect", async \(\) => \{\s+pageCdp = await connectCdp\(target\);\s+return pageCdp;\s+\}\)/u);
+  assert.match(connection, /catch \(error\) \{\s+pageRendererReadinessDiagnostics\?\.dispose\?\.\(\);\s+pageRefreshObserver\?\.dispose\?\.\(\);\s+pageCdp\?\.close\?\.\(\);\s+if \(error\?\.code === "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE"\) throw error;/u);
+  assert.match(source, /if \(cdpAuthorityFailed\) failFixed\("ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE"\)/u);
+  assert.match(source, /if \(error\?\.code === "ELECTRON_LINUX_SMOKE_CDP_AUTHORITY_UNAVAILABLE"\) cdpAuthorityFailed = true/u);
+  assert.match(source, /fetchImpl: \(\.\.\.args\) => withCdpAuthority\("authenticated_health", \(\) => authorizedHealthFetch\(\.\.\.args\)\)/u);
+  assert.match(source, /withCdpAuthority\("authenticated_health", \(\) => fetchRendererJson\(cdp, new URL\("\/api\/local\/health"/u);
+  assert.doesNotMatch(source, /\bfetch\(/u);
 });
 
 test("Linux Electron smoke refuses an unbounded host checkout", () => {

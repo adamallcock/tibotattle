@@ -228,6 +228,22 @@ export function validateWorkerSparkleAppcastGuard(
     if (!hasNonceDatabase) {
       fail(`${label} enabled Sparkle appcast guard requires the nonce D1 binding`);
     }
+    const rateLimits = bindingEntries(environment, "ratelimits");
+    const guardRateLimits = rateLimits.filter((binding) => binding?.name === "SPARKLE_APPCAST_GUARD_RATE_LIMIT");
+    const namespaceIds = rateLimits.map((binding) => binding?.namespace_id);
+    if (guardRateLimits.length !== 1
+        || guardRateLimits[0].simple?.limit !== 60
+        || guardRateLimits[0].simple?.period !== 60
+        || namespaceIds.some((id) => typeof id !== "string" || !/^[1-9][0-9]{0,9}$/u.test(id))
+        || new Set(namespaceIds).size !== namespaceIds.length) {
+      fail(`${label} enabled Sparkle appcast guard requires its independent 60-per-minute limiter`);
+    }
+    const budgets = bindingEntries(environment?.durable_objects, "bindings")
+      .filter((binding) => binding?.name === "UPLOAD_INGRESS_BUDGET");
+    if (budgets.length !== 1 || budgets[0].class_name !== "UploadIngressBudget"
+        || budgets[0].script_name !== undefined || budgets[0].environment !== undefined) {
+      fail(`${label} enabled Sparkle appcast guard requires the existing local lease namespace`);
+    }
   }
   return Object.freeze({
     nonceTable: "sparkle_appcast_guard_nonces",

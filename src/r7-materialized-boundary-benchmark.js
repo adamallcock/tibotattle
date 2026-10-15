@@ -65,32 +65,55 @@ export function parseR7MaterializedBoundaryWorkerResult(bytes) {
   throw new TypeError("Invalid R7 materialized boundary result");
 }
 
-async function runPass(root, fixturePaths, timeoutMs) {
+function assertNotAborted(signal) {
+  if (signal?.aborted) throw new Error("R7 materialized boundary benchmark aborted");
+}
+
+async function runPass(root, fixturePaths, timeoutMs, signal, state, runWorkerWatchdog) {
+  assertNotAborted(signal);
   await mkdir(root, { mode: 0o700 });
   let parsed = null;
   let workerFailureCode = null;
   let watchdog = null;
+  const stopSampling = new AbortController();
+  const samplingSignal = signal
+    ? AbortSignal.any([signal, stopSampling.signal]) : stopSampling.signal;
   const filesystem = await runR7FilesystemHighWaterSampler({
     root,
+    signal: samplingSignal,
     maximumElapsedMs: timeoutMs,
     allowedTransientSymlinkNames: [".app-usagemonitor-export.lock"],
     allowTransientOwnedHardlinks: true,
     async operation() {
-      watchdog = await runR7WorkerWatchdog({
-        runtimeExecutable: process.execPath,
-        workerPath: WORKER.pathname,
-        cwd: process.cwd(),
-        input: JSON.stringify({ temporaryRoot: root, fixturePaths }),
-        timeoutMs,
-        maximumRssBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumRssBytes,
-        consumeStdout(bytes) {
-          const value = parseR7MaterializedBoundaryWorkerResult(bytes);
-          parsed = value.evidence;
-          workerFailureCode = value.failureCode;
-        },
-      });
+      assertNotAborted(signal);
+      // Until the watchdog confirms settlement, this tree may still be written
+      // by its child. Neither final measurement nor destructive cleanup is safe.
+      state.cleanupPermitted = false;
+      try {
+        watchdog = await runWorkerWatchdog({
+          runtimeExecutable: process.execPath,
+          workerPath: WORKER.pathname,
+          cwd: process.cwd(),
+          input: JSON.stringify({ temporaryRoot: root, fixturePaths }),
+          timeoutMs,
+          signal,
+          maximumRssBytes: DEFAULT_EXPORT_RESOURCE_LIMITS.maximumRssBytes,
+          consumeStdout(bytes) {
+            const value = parseR7MaterializedBoundaryWorkerResult(bytes);
+            parsed = value.evidence;
+            workerFailureCode = value.failureCode;
+          },
+        });
+        state.cleanupPermitted = watchdog.outcome !== "termination_unconfirmed";
+      } finally {
+        if (!state.cleanupPermitted) stopSampling.abort();
+      }
     },
   });
+  if (!state.cleanupPermitted) {
+    throw new Error("R7 materialized boundary worker termination unconfirmed; temporary tree preserved");
+  }
+  assertNotAborted(signal);
   if (filesystem.outcome === "completed" && watchdog?.outcome === "completed"
       && workerFailureCode !== null) {
     throw new Error(`R7 materialized boundary worker stopped: ${workerFailureCode}`);
@@ -284,7 +307,15 @@ function assertContentFree(value) {
 export async function runR7MaterializedBoundaryBenchmark({
   temporaryRoot = tmpdir(),
   timeoutMs = 10 * 60 * 1_000,
+  signal,
+} = {}, {
+  runWorkerWatchdog = runR7WorkerWatchdog,
+  cleanupOwnedTree = cleanupR7OwnedTree,
 } = {}) {
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new TypeError("signal must be an AbortSignal when provided");
+  }
+  assertNotAborted(signal);
   const rawRoot = await mkdtemp(join(temporaryRoot, "usage-monitor-r7-materialized-"));
   await chmod(rawRoot, 0o700);
   const root = await realpath(rawRoot);
@@ -293,11 +324,14 @@ export async function runR7MaterializedBoundaryBenchmark({
     throw new Error("R7 materialized benchmark root was unsafe");
   }
   const rootIdentity = { dev: rootStats.dev, ino: rootStats.ino };
+  const state = { cleanupPermitted: true };
   let receipt;
   try {
+    assertNotAborted(signal);
     const sourceRoot = join(root, "source");
     await mkdir(sourceRoot, { mode: 0o700 });
     const fixture = await createR7StructuralFixture(sourceRoot);
+    assertNotAborted(signal);
     await writeFile(
       join(
         fixture.paths.codexHome,
@@ -311,8 +345,13 @@ export async function runR7MaterializedBoundaryBenchmark({
       })}\n`,
       { mode: 0o600 },
     );
-    const first = await runPass(join(root, "pass-1"), fixture.paths, timeoutMs);
-    const second = await runPass(join(root, "pass-2"), fixture.paths, timeoutMs);
+    const first = await runPass(
+      join(root, "pass-1"), fixture.paths, timeoutMs, signal, state, runWorkerWatchdog,
+    );
+    const second = await runPass(
+      join(root, "pass-2"), fixture.paths, timeoutMs, signal, state, runWorkerWatchdog,
+    );
+    assertNotAborted(signal);
     if (first.projectionSha256 !== second.projectionSha256) {
       throw new Error("R7 materialized boundary deterministic projections differed");
     }
@@ -405,8 +444,13 @@ export async function runR7MaterializedBoundaryBenchmark({
     receipt.receiptSha256 = computeR7ReleaseEvidenceReceiptSha256(receipt);
     receipt = assertValidR7ReleaseEvidenceReceipt(receipt);
   } finally {
-    const inventory = await inventoryR7OwnedTree(root);
-    await cleanupR7OwnedTree(root, inventory, rootIdentity);
+    if (state.cleanupPermitted) {
+      const options = signal?.aborted
+        ? { allowedTransientSymlinkNames: [".app-usagemonitor-export.lock"] } : {};
+      const inventory = await inventoryR7OwnedTree(root, options);
+      await cleanupOwnedTree(root, inventory, rootIdentity, options);
+    }
   }
+  assertNotAborted(signal);
   return receipt;
 }

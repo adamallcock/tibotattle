@@ -88,8 +88,14 @@ Missing or unsafe native access preserves
 anonymous fallback labels. A saved, unambiguous Codex repository origin may
 supply project grouping when Git is absent from the app's executable search
 path; a current Git rejection is not overridden by that historical observation.
-The new POST query route requires the local header and existing Origin/Host
-checks. Interactive reports are bounded process-local snapshots;
+The POST query route requires the private per-launch capability, one-use
+method/path authorization, local marker and existing Origin/Host checks. Every
+private API/report read requires the launch capability as well. Electron keeps
+the credential in its main process and inherited companion pipe; standalone
+macOS/Linux development uses an explicitly selected owner-only launch file.
+This excludes callers without that authority but cannot isolate unsandboxed
+same-user code able to read trusted process memory or owner files.
+Interactive reports are bounded process-local snapshots;
 publication/scope/filter identity and opaque cursors prevent mixing totals across
 reads. A separate owner-only saved snapshot retains usage figures with anonymous,
 snapshot-local aliases. It excludes names, raw thread IDs, source paths and

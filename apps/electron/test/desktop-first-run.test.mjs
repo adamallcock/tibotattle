@@ -155,14 +155,14 @@ test("first-run native copy resolves the system and explicit desktop languages",
   });
 });
 
-test("production disclosure describes automatic sharing and available updates in every desktop language", async () => {
+test("production disclosure describes automatic sharing and qualified update availability in every desktop language", async () => {
   for (const [locale, sharing, updates, unavailable] of [
     ["en", /Fresh installations share automatically.*three notices.*Turn sharing off.*earlier explicit opt-out stays off/su,
-      /Update checks are available in About/u, /Uploads are not available|development build/u],
+      /Where available, check for updates in About and manage automatic downloads in Settings/u, /Uploads are not available|development build/u],
     ["zh-Hans", /新安装会自动共享.*三次提示.*关闭共享.*以前明确关闭的选择会保留/su,
-      /“关于”中检查更新/u, /暂不支持上传|开发版本/u],
+      /如果此版本支持更新.*“关于”中检查更新/u, /暂不支持上传|开发版本/u],
     ["es", /instalaciones nuevas comparten automáticamente.*tres avisos.*desactivar la compartición.*desactivación explícita anterior se conserva/su,
-      /buscar actualizaciones en Acerca de/u, /cargas no están disponibles|compilación de desarrollo/u],
+      /Cuando estén disponibles, busca actualizaciones en Acerca de/u, /cargas no están disponibles|compilación de desarrollo/u],
   ]) {
     const dialog = fakeDialog([0]);
     const backend = fakeBackend();

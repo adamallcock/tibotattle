@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   assertR7RealHistorySourcePlanEligibility,
   R7RealHistoryEligibilityError,
+  R7RealHistoryLifecycleError,
   R7_REAL_HISTORY_MAXIMUM_SOURCE_PLAN_BUNDLE_BYTES,
   runR7RealHistoryBenchmark,
 } from "../src/r7-real-history-benchmark.js";
@@ -41,6 +42,83 @@ test("real-history private-plan eligibility fails before worker handoff with a f
       return true;
     },
   );
+});
+
+test("real-history lifecycle failures retain only closed operation, runtime, and pass context", () => {
+  for (const operation of [
+    "source_scan", "export_set_materialize", "export_set_verify", "complete_set_delete",
+  ]) {
+    for (const runtimeClass of ["pinned_candidate", "compatibility_crosscheck"]) {
+      for (const pass of [1, 2]) {
+        const error = new R7RealHistoryLifecycleError({
+          operation, runtimeClass, pass, failureCode: "export_resource_elapsed_time",
+        });
+        assert.equal(error.code, "r7_real_history_lifecycle");
+        assert.equal(error.operation, operation);
+        assert.equal(error.runtimeClass, runtimeClass);
+        assert.equal(error.pass, pass);
+        assert.equal(error.failureCode, "export_resource_elapsed_time");
+        assert.equal(error.message, "R7 real-history lifecycle operation failed: "
+          + `operation=${operation} runtime=${runtimeClass} pass=${pass}`
+          + " reason=export_resource_elapsed_time");
+      }
+    }
+  }
+  const context = { operation: "source_scan", runtimeClass: "pinned_candidate", pass: 1 };
+  const canary = "SYNTHETIC_PRIVATE_DIAGNOSTIC_CANARY";
+  for (const failureCode of [undefined, null, {}, canary, `/private/${canary}`,
+    `export_resource_elapsed_time\n${canary}`]) {
+    const error = new R7RealHistoryLifecycleError({ ...context, failureCode });
+    assert.equal(error.failureCode, "invalid_worker_failure_code");
+    assert.equal(`${error.message}${JSON.stringify(error)}`.includes(canary), false);
+    assert.equal(Object.hasOwn(error, "cause"), false);
+  }
+  for (const invalidContext of [
+    { operation: canary }, { runtimeClass: canary }, { pass: canary },
+    { operation: "capability_preflight" }, { runtimeClass: "node" },
+    { pass: 0 }, { pass: 3 }, { pass: "1" },
+  ]) {
+    assert.throws(
+      () => new R7RealHistoryLifecycleError({ ...context, ...invalidContext }),
+      { name: "TypeError", message: "R7 real-history lifecycle failure context is invalid" },
+    );
+  }
+});
+
+test("real-history lifecycle failure retains safe context after owned cleanup", {
+  timeout: 60_000,
+}, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-r7-failure-test-")));
+  try {
+    const fixture = await createR7StructuralFixture(root);
+    await assert.rejects(runR7RealHistoryBenchmark({
+      startAt: R7_FIXTURE_START_AT,
+      endAt: R7_FIXTURE_END_AT,
+      runtimeExecutables: [process.execPath],
+      temporaryRoot: root,
+      timeoutMs: 60_000,
+      ...fixture.paths,
+      async afterSourcePlanFreeze() {
+        await writeFile(fixture.paths.collectorPath, "", { mode: 0o600 });
+      },
+    }), (error) => {
+      assert.ok(error instanceof R7RealHistoryLifecycleError);
+      assert.equal(error.operation, "source_scan");
+      assert.equal(error.runtimeClass,
+        process.versions.node.startsWith("24.") ? "pinned_candidate" : "compatibility_crosscheck");
+      assert.equal(error.pass, 1);
+      assert.equal(error.failureCode, "source_integrity");
+      for (const privateValue of [root, ...Object.values(fixture.paths)]) {
+        assert.equal(`${error.message}${JSON.stringify(error)}`.includes(privateValue), false);
+      }
+      return true;
+    });
+    assert.equal((await readdir(root)).some(
+      (name) => name.startsWith("usage-monitor-r7-real-history-"),
+    ), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("one frozen real-history plan drives two content-free passes on the exact child runtime", {

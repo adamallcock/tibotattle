@@ -8,6 +8,7 @@
 // - createEdgeInstance: the thin edge in one EDGE_UPSTREAM_MODE (gcp, fenced,
 //   absent or invalid), with exactly the bindings the EP-9 gcp overlay keeps
 //   (the edge settings, the edge secrets, the six edge-tier rate limits, the
+//   three separate operational rate limits, the
 //   release-guard D1, the Sparkle bucket, ASSETS, the Access and Sparkle
 //   settings) plus decoy USAGE_MONITOR_DB and QUARANTINE bindings that a
 //   gcp-mode edge must never touch.
@@ -16,7 +17,7 @@
 //   built with the same settings, with full Worker storage: USAGE_MONITOR_DB
 //   and DELETION_LEDGER migrated from ./migrations and
 //   ./deletion-ledger-migrations, QUARANTINE and SPARKLE_RELEASES, the
-//   UploadIngressBudget Durable Object, all eight rate limits, and the
+//   UploadIngressBudget Durable Object, all eleven rate limits, and the
 //   checked-in env.production vars with every identifier replaced by a
 //   synthetic one.
 //
@@ -61,7 +62,13 @@ export const ORIGIN_TIER_BINDINGS = Object.freeze([
   "UPLOAD_AUTHORIZATION_RATE_LIMIT",
   "UPLOAD_PRINCIPAL_RATE_LIMIT",
 ]);
-const ALL_BINDINGS = Object.freeze([...EDGE_TIER_BINDINGS, ...ORIGIN_TIER_BINDINGS]);
+/** Local operational guards are not additional purposes in the edge admission wire contract. */
+export const OPERATIONAL_BINDINGS = Object.freeze([
+  "PUBLIC_PROBE_RATE_LIMIT",
+  "PUBLIC_PROBE_CLIENT_RATE_LIMIT",
+  "SPARKLE_APPCAST_GUARD_RATE_LIMIT",
+]);
+const ALL_BINDINGS = Object.freeze([...EDGE_TIER_BINDINGS, ...ORIGIN_TIER_BINDINGS, ...OPERATIONAL_BINDINGS]);
 
 /** 10000 per 60 s on every binding: no stage except S4 is limited by accident. */
 export const GENEROUS_LIMITS = Object.freeze(Object.fromEntries(ALL_BINDINGS.map((name) => [name, 10_000])));
@@ -386,7 +393,8 @@ export async function createEdgeInstance({
     if (value === undefined) delete bindings[name];
     else bindings[name] = value;
   }
-  const edgeTierLimits = Object.fromEntries(EDGE_TIER_BINDINGS.map((name) => [name, limits[name]]));
+  const edgeTierLimits = Object.fromEntries([...EDGE_TIER_BINDINGS, ...OPERATIONAL_BINDINGS]
+    .map((name) => [name, limits[name]]));
   for (const name of omitLimits) delete edgeTierLimits[name];
   const refusals = [];
   const outbound = frontEnd === null

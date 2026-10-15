@@ -4,7 +4,7 @@ import { copyFile, mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startLocalCompanionServer } from "./server.js";
+import { fetch, startLocalCompanionServer } from "../../test/helpers/local-authorized-client.js";
 import {
   RUNTIME_WEB_MODULE_ENTRYPOINTS,
 } from "../../scripts/lib/runtime-closure.mjs";

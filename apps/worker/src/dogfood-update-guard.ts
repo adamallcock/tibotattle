@@ -17,3 +17,4 @@ export default {
     }
   },
 };
+export { UploadIngressBudget } from "./ingress-budget";

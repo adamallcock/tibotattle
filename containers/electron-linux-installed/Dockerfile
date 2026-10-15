@@ -15,6 +15,7 @@ COPY scripts ./scripts
 COPY .release-build/linux-final-qualification/pair.json ./.release-build/linux-final-qualification/pair.json
 COPY .release-build/linux-final-qualification/current.AppImage ./.release-build/linux-final-qualification/current.AppImage
 COPY .release-build/linux-final-qualification/next.AppImage ./.release-build/linux-final-qualification/next.AppImage
+COPY .release-build/linux-final-qualification/latest-linux.yml ./.release-build/linux-final-qualification/latest-linux.yml
 COPY test/fixtures/linux-packaged-codex/codex /opt/tibotattle-linux-packaged-smoke/bin/codex
 RUN chmod 0755 /workspace/.release-build /workspace/.release-build/linux-final-qualification \
   && chmod 0444 /workspace/.release-build/linux-final-qualification/* \

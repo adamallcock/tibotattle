@@ -32,7 +32,10 @@ import {
   removeContributionDeviceCapability,
   rotateContributionDeviceCredential,
 } from "../src/contribution-device-capability.js";
-import { startLocalCompanionServer } from "../apps/local/server.js";
+import {
+  fetch,
+  startLocalCompanionServer,
+} from "./helpers/local-authorized-client.js";
 
 const LEGACY_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
 const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;

@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import vm from "node:vm";
 
@@ -350,6 +351,7 @@ class FakeChild extends EventEmitter {
     super();
     this.stdout = new EventEmitter();
     this.stderr = new EventEmitter();
+    this.stdio = [null, this.stdout, this.stderr, null, null, new PassThrough()];
     this.kills = [];
   }
 
@@ -392,8 +394,11 @@ class FakeApp extends EventEmitter {
 }
 
 class FakeWebContents extends EventEmitter {
+  static nextId = 1;
+
   constructor() {
     super();
+    this.id = FakeWebContents.nextId++;
     this.mainFrame = { isMainFrame: true, parent: null };
     this.sent = [];
     this.session = {
@@ -407,6 +412,10 @@ class FakeWebContents extends EventEmitter {
         onBeforeRequest: (filter, listener) => {
           this.requestFilter = filter;
           this.requestListener = listener;
+        },
+        onBeforeSendHeaders: (filter, listener) => {
+          this.requestHeadersFilter = filter;
+          this.requestHeadersListener = listener;
         },
       },
     };
@@ -466,6 +475,7 @@ function downloadSession() {
   session.setPermissionCheckHandler = () => {};
   session.webRequest = {
     onBeforeRequest() {},
+    onBeforeSendHeaders() {},
   };
   return session;
 }
@@ -1129,7 +1139,7 @@ for (const [platformName, factoryName, markerKey, markerValue, otherMarkerKey] o
       const started = supervisor.start();
       child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
       await started;
-      assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+      assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
       assert.equal(selected.env[markerKey], markerValue);
       assert.equal(selected.env[otherMarkerKey], undefined);
       assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
@@ -1202,7 +1212,7 @@ test("companion supervisor accepts FD4-only macOS and Linux brokers without Node
     child.connected = false;
     child.exitCode = null;
     child.signalCode = null;
-    child.stdio = [null, child.stdout, child.stderr, null, fd4];
+    child.stdio[4] = fd4;
     let selected;
     let attached = null;
     let disposed = false;
@@ -1217,7 +1227,7 @@ test("companion supervisor accepts FD4-only macOS and Linux brokers without Node
     child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
     await started;
     assert.equal(attached, fd4);
-    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ignore", "pipe"]);
+    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ignore", "pipe", "pipe"]);
     assert.equal(selected.env[marker], "4");
     const stopped = supervisor.stop();
     child.emit("exit", 0, null);
@@ -1248,7 +1258,7 @@ test("companion supervisor starts a live plain child without Node IPC", async (t
 
   const ready = await supervisor.start();
   assert.equal(child?.connected, false);
-  assert.deepEqual(selected?.stdio, ["ignore", "pipe", "pipe"]);
+  assert.deepEqual(selected?.stdio, ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"]);
   assert.equal(ready.origin, "http://127.0.0.1:4546");
   await supervisor.stop();
   assert.equal(supervisor.state.state, "stopped");
@@ -1282,7 +1292,7 @@ test("companion supervisor rejects competing credential factories and ambient ch
   assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
   assert.equal(selected.env[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV], undefined);
   assert.equal(selected.env[LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV], undefined);
-  assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe"]);
+  assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ignore", "ignore", "pipe"]);
   const stopped = supervisor.stop();
   child.emit("exit", 0, null);
   await stopped;
@@ -2813,6 +2823,155 @@ test("desktop lifecycle opens only its current validated dashboard origin", asyn
   await lifecycle.requestQuit();
 });
 
+for (const platform of ["win32", "darwin", "linux"]) {
+  test(`authenticated desktop external browser access respects the ${platform} bootstrap boundary`, async (t) => {
+    const opened = [];
+    const preparation = [];
+    const origin = "http://127.0.0.1:61002";
+    const supervisor = {
+      setUnexpectedExitHandler() {},
+      async start() { return { origin }; },
+      async stop() {},
+      requestAuthorizationHeaders() {
+        return { "X-TiboTattle-Local-Capability": "synthetic-local-capability" };
+      },
+      async prepareBrowserAuthorization(selectedOrigin) {
+        assert.equal(selectedOrigin, origin);
+        preparation.push("requested");
+        await Promise.resolve();
+        preparation.push("completed");
+        return true;
+      },
+    };
+    const lifecycle = createDesktopLifecycle({
+      app: new FakeApp(),
+      platform,
+      BrowserWindow: FakeWindow,
+      Tray: FakeTray,
+      Menu: { buildFromTemplate: (template) => ({ template }) },
+      icon: "empty-icon",
+      preloadPath: "/private/preload.cjs",
+      supervisor,
+      openDashboardExternal: async (url) => {
+        assert.deepEqual(preparation, ["requested", "completed"]);
+        opened.push(url);
+        return true;
+      },
+    });
+    t.after(() => lifecycle.dispose());
+    assert.deepEqual(await lifecycle.start(), { status: "ready", origin });
+    if (platform === "win32") {
+      await assert.rejects(
+        lifecycle.openDashboardInBrowser(),
+        errorCode("desktop_dashboard_browser_unavailable"),
+      );
+      assert.deepEqual(opened, []);
+      assert.deepEqual(preparation, []);
+    } else {
+      assert.equal(await lifecycle.openDashboardInBrowser(), true);
+      assert.deepEqual(opened, [`${origin}/`]);
+    }
+  });
+}
+
+for (const preparation of ["missing", "rejected"]) {
+  test(`authenticated browser open fails closed when preparation is ${preparation}`, async (t) => {
+    const opened = [];
+    const origin = "http://127.0.0.1:61003";
+    let preparationCalls = 0;
+    const supervisor = {
+      setUnexpectedExitHandler() {},
+      async start() { return { origin }; },
+      async stop() {},
+      requestAuthorizationHeaders() {
+        return { "X-TiboTattle-Local-Capability": "synthetic-local-capability" };
+      },
+      ...(preparation === "rejected" ? {
+        async prepareBrowserAuthorization() {
+          preparationCalls += 1;
+          throw new Error("synthetic preparation failure");
+        },
+      } : {}),
+    };
+    const lifecycle = createDesktopLifecycle({
+      app: new FakeApp(),
+      platform: "darwin",
+      BrowserWindow: FakeWindow,
+      Tray: FakeTray,
+      Menu: { buildFromTemplate: (template) => ({ template }) },
+      icon: "empty-icon",
+      preloadPath: "/private/preload.cjs",
+      supervisor,
+      openDashboardExternal: async (url) => { opened.push(url); return true; },
+    });
+    t.after(() => lifecycle.dispose());
+    assert.deepEqual(await lifecycle.start(), { status: "ready", origin });
+    await assert.rejects(
+      lifecycle.openDashboardInBrowser(),
+      errorCode("desktop_dashboard_browser_unavailable"),
+    );
+    assert.equal(preparationCalls, preparation === "rejected" ? 1 : 0);
+    assert.deepEqual(opened, []);
+  });
+}
+
+for (const interruption of ["quit", "retry"]) {
+  test(`authenticated browser preparation cannot outlive lifecycle ${interruption}`, async (t) => {
+    const opened = [];
+    let resolvePreparation;
+    const preparation = new Promise((resolve) => { resolvePreparation = resolve; });
+    let preparationCalls = 0;
+    let starts = 0;
+    const supervisor = {
+      setUnexpectedExitHandler() {},
+      async start() {
+        starts += 1;
+        return { origin: `http://127.0.0.1:${61003 + starts}` };
+      },
+      async stop() {},
+      requestAuthorizationHeaders() {
+        return { "X-TiboTattle-Local-Capability": "synthetic-local-capability" };
+      },
+      async prepareBrowserAuthorization() {
+        preparationCalls += 1;
+        await preparation;
+        return true;
+      },
+    };
+    const lifecycle = createDesktopLifecycle({
+      app: new FakeApp(),
+      platform: "darwin",
+      BrowserWindow: FakeWindow,
+      Tray: FakeTray,
+      Menu: { buildFromTemplate: (template) => ({ template }) },
+      icon: "empty-icon",
+      preloadPath: "/private/preload.cjs",
+      supervisor,
+      openDashboardExternal: async (url) => { opened.push(url); return true; },
+    });
+    t.after(() => lifecycle.dispose());
+    assert.deepEqual(await lifecycle.start(), {
+      status: "ready", origin: "http://127.0.0.1:61004",
+    });
+    const denied = assert.rejects(
+      lifecycle.openDashboardInBrowser(),
+      errorCode("desktop_dashboard_browser_unavailable"),
+    );
+    assert.equal(preparationCalls, 1);
+    assert.deepEqual(opened, []);
+    if (interruption === "quit") {
+      await lifecycle.requestQuit();
+    } else {
+      assert.deepEqual(await lifecycle.retry(), {
+        status: "ready", origin: "http://127.0.0.1:61005",
+      });
+    }
+    resolvePreparation();
+    await denied;
+    assert.deepEqual(opened, []);
+  });
+}
+
 test("desktop lifecycle restores the macOS application before reopening a hidden dashboard", async () => {
   const app = new FakeApp();
   const windows = [];
@@ -4046,6 +4205,113 @@ test("closing Settings retains the dashboard's shared-session loopback filtering
   assert.equal(sharedSession.webRequest.listener, null);
 });
 
+test("shared-session authorization retires closed Settings before a companion retry", async (t) => {
+  const windows = [];
+  const capabilityHeader = "X-TiboTattle-Local-Capability";
+  const operationHeader = "X-TiboTattle-Operation-Authorization";
+  const sharedSession = {
+    setPermissionRequestHandler() {},
+    setPermissionCheckHandler() {},
+    webRequest: {
+      onBeforeRequest() {},
+      onBeforeSendHeaders(_filter, listener) {
+        this.headersListener = listener;
+      },
+    },
+  };
+  let starts = 0;
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      starts += 1;
+      return { origin: `http://127.0.0.1:${4760 + starts}` };
+    },
+    async stop() {},
+    requestAuthorizationHeaders() {
+      return { [capabilityHeader]: `synthetic-capability-${starts}` };
+    },
+  };
+  class SharedAuthorizationWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      this.webContents.session = sharedSession;
+      this.webContents.getURL = () => this.loaded.at(-1) ?? "";
+      this.webContents.isDestroyed = () => this.destroyed;
+      Object.defineProperty(this.webContents.mainFrame, "url", {
+        get: () => this.webContents.getURL(),
+      });
+      windows.push(this);
+    }
+  }
+  const lifecycle = createDesktopLifecycle({
+    app: new FakeApp(),
+    BrowserWindow: SharedAuthorizationWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+  t.after(() => lifecycle.dispose());
+  function requestFrom(candidate, origin, handler = sharedSession.webRequest.headersListener) {
+    let result;
+    handler({
+      url: `${origin}/api/local/overview`,
+      webContentsId: candidate.webContents.id,
+      webContents: candidate.webContents,
+      frame: candidate.webContents.mainFrame,
+      requestHeaders: { [capabilityHeader]: "forged", [operationHeader]: "forged-operation" },
+    }, (decision) => { result = decision; });
+    return result;
+  }
+  function assertAuthorized(candidate, origin) {
+    assert.deepEqual(requestFrom(candidate, origin), {
+      requestHeaders: {
+        [capabilityHeader]: `synthetic-capability-${starts}`,
+        [operationHeader]: "forged-operation",
+      },
+    });
+  }
+  function assertRetired(candidate, origin, handler) {
+    assert.deepEqual(requestFrom(candidate, origin, handler), { requestHeaders: {} });
+  }
+
+  const firstOrigin = "http://127.0.0.1:4761";
+  assert.deepEqual(await lifecycle.start(), { status: "ready", origin: firstOrigin });
+  const firstDashboard = windows.at(-1);
+  assertAuthorized(firstDashboard, firstOrigin);
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const firstSettings = windows.at(-1);
+  assertAuthorized(firstSettings, firstOrigin);
+  firstSettings.destroy();
+  firstSettings.emit("closed");
+  assert.equal(lifecycle.state.hasSettingsWindow, false);
+  assertRetired(firstSettings, firstOrigin);
+  assertAuthorized(firstDashboard, firstOrigin);
+
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const reopenedSettings = windows.at(-1);
+  assert.notEqual(reopenedSettings, firstSettings);
+  assertAuthorized(reopenedSettings, firstOrigin);
+  const firstHandler = sharedSession.webRequest.headersListener;
+  const nextOrigin = "http://127.0.0.1:4762";
+  assert.deepEqual(await lifecycle.retry(), { status: "ready", origin: nextOrigin });
+  assert.equal(lifecycle.state.hasRecoveryWindow, false);
+  const nextDashboard = windows.at(-1);
+  assertAuthorized(nextDashboard, nextOrigin);
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const nextSettings = windows.at(-1);
+  assertAuthorized(nextSettings, nextOrigin);
+  for (const retired of [firstDashboard, firstSettings, reopenedSettings]) {
+    assert.equal(retired.destroyed, true);
+    assertRetired(retired, nextOrigin);
+    assertRetired(retired, firstOrigin, firstHandler);
+  }
+
+  await lifecycle.dispose();
+  assert.equal(sharedSession.webRequest.headersListener, null);
+});
+
 test("desktop lifecycle cancels an in-flight retry before quit and serializes shutdown", async () => {
   const app = new FakeApp();
   let resolveStop;
@@ -4383,7 +4649,7 @@ test(process.platform === "win32"
   assert.ok(fixture.events.indexOf("setPath:sessionData") < nativeFactoryEvent);
   assert.ok(fixture.events.indexOf("setPath:userData") < fixture.events.indexOf("whenReady"));
   assert.ok(fixture.events.indexOf("setPath:sessionData") < fixture.events.indexOf("whenReady"));
-  assert.deepEqual(spawnCalls[0].stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.deepEqual(spawnCalls[0].stdio, ["ignore", "pipe", "pipe", "ipc", "ignore", "pipe"]);
   const childEnvironment = spawnCalls[0].env;
   assert.equal(childEnvironment.HOME, join(
     fixture.signedStagingUserData,

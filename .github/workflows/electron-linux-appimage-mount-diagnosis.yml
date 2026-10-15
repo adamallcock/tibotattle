@@ -81,6 +81,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/diagnose-electron-linux-appimage-mount.mjs --acquire
+      - name: Build minimal extraction boundary before inspecting downloaded executables
+        if: inputs.mode == 'execute'
+        env:
+          QUALIFICATION_RUNNER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build --platform=linux/amd64 --network=none --file containers/electron-linux-extraction/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$QUALIFICATION_RUNNER" \
+            --tag tibotattle-electron-linux-extraction:test .
+          TIBOTATTLE_LINUX_EXTRACTION_SMOKE=1 node --test test/electron-linux-extraction.test.js
       - name: Inspect final bytes without rebuilding application source
         if: inputs.mode == 'execute'
         run: node scripts/diagnose-electron-linux-appimage-mount.mjs --prepare
@@ -109,6 +119,9 @@ jobs:
       - name: Remove only recorded owned diagnostic containers and profiles after interruption
         if: always() && inputs.mode == 'execute'
         run: timeout 60s node scripts/diagnose-electron-linux-appimage-mount.mjs --cleanup
+      - name: Remove only recorded owned extraction containers after interruption
+        if: always() && inputs.mode == 'execute'
+        run: timeout 60s node scripts/qualify-electron-linux-installed-lifecycle.mjs --cleanup-extraction
       - name: Retain only closed diagnostic evidence
         if: always() && inputs.mode == 'execute'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

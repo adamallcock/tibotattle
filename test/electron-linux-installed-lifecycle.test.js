@@ -1,36 +1,46 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { PassThrough, Readable, Writable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import test from 'node:test';
 import { productionElectronCandidatePlan } from '../scripts/package-electron-production.mjs';
-import { LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
-  validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
+import { LINUX_FINAL_SCHEMA_V3, LINUX_FINAL_SCHEMA_V4, LINUX_FINAL_PREDECESSOR, validateLinuxFinalIntake, parseLinuxFinalIntake,
+  validateLinuxFinalPackageRun, validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName,
+  decodeLinuxFinalSignedFeed, linuxFinalPreparedIntake, assertLinuxFinalPreparedIntakeMatches } from '../scripts/lib/linux-final-artifact-intake.mjs';
+import { LINUX_QUALIFICATION_AUTHORITY_FILES } from '../scripts/lib/linux-qualification-feed.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
   linuxFinalTemporary, assertLinuxFinalOwnedPolicy, linuxFinalFailureDetails, runLinuxFinalNormalJourney,
   connectLinuxFinalPredecessorDashboard, waitForLinuxFinalPredecessorDashboard,
   readLinuxFinalAppProcessIdentity, linuxFinalBrowserCommandLineMatches, readLinuxFinalKnownAppProcessIdentity,
-  currentLinuxFinalApp, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox, linuxFinalProcessCommandLineFacts } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+  currentLinuxFinalApp, findLinuxFinalOwnedApps, stopLinuxFinalOwnedApp, assertLinuxFinalRendererSandbox, linuxFinalProcessCommandLineFacts,
+  createLinuxFinalCdpAuthority, createLinuxFinalQualificationFeed } from '../scripts/smoke-electron-linux-final-lifecycle.mjs';
+import { assertLinuxCdpEndpointOwned } from '../scripts/lib/linux-successor-evidence.mjs';
 import { runOneNormalApp } from '../scripts/smoke-electron-linux-packaged.mjs';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const revision = 'a'.repeat(40), runner = 'b'.repeat(40), packageRunner = 'c'.repeat(40);
-function fixture({ schemaVersion = LINUX_FINAL_SCHEMA, version = '0.1.27', buildNumber = '2026100301' } = {}) {
+function fixture({ schemaVersion = LINUX_FINAL_SCHEMA_V3, version = '0.1.27', buildNumber = '2026100301' } = {}) {
   const plan = productionElectronCandidatePlan({ target: 'linux-x64', sourceRevision: revision,
     buildNumber, hostPlatform: 'linux', hostArchitecture: 'x64' });
   const source = { ...plan, version,
     builderEnvironment: { ...plan.builderEnvironment, TIBOTATTLE_ELECTRON_VERSION: version },
     status: 'production_source_staged', stagedManifest: 'app/package.json', runtimeManifest: 'app/electron-runtime-manifest.json' };
   const sourceBytes = Buffer.from(JSON.stringify(source) + '\n');
+  const feedBytes = Buffer.from('synthetic feed payload; signature admission is a separate gate');
   const intake = { schemaVersion, runnerRevision: runner, sourceRevision: revision,
     packageRunId: '12345', packageRunnerRevision: packageRunner, version, buildNumber,
     sourceCandidate: source, sourceCandidateSha256: hash(sourceBytes), packageReceiptSha256: 'd'.repeat(64),
-    artifactSha256: 'e'.repeat(64), artifactBytes: 8192, asarSha256: 'f'.repeat(64), executableSha256: '1'.repeat(64) };
+    artifactSha256: 'e'.repeat(64), artifactBytes: 8192, asarSha256: 'f'.repeat(64), executableSha256: '1'.repeat(64),
+    signedFeed: { file: 'latest-linux.yml', bytes: feedBytes.length, sha256: hash(feedBytes), base64: feedBytes.toString('base64') } };
   const artifact = { file: `TiboTattle-${version}-linux-x86_64.AppImage`, bytes: 8192,
     sha256: intake.artifactSha256, sha512: Buffer.alloc(64, 1).toString('base64') };
   const receipt = { schemaVersion: 'tibotattle-linux-production-package-v1', workflowRunnerRevision: packageRunner,
     sourceRevision: revision, version, buildNumber, target: 'linux-x64',
     sourceCandidateSha256: intake.sourceCandidateSha256, appUpdate: {}, artifact, manifest: {},
     signingRequired: false, published: false, nativeRuntimeQualification: 'separate_evidence_required' };
-  const pair = { schemaVersion: 'tibotattle-linux-final-artifact-pair-v1', intake,
+  const pair = { schemaVersion: 'tibotattle-linux-final-artifact-pair-v2', intake: linuxFinalPreparedIntake(intake),
+    packagedAuthority: { schemaVersion: 'tibotattle-linux-qualification-authority-v1', status: 'packaged_source_matches_reviewed_authority',
+      files: LINUX_QUALIFICATION_AUTHORITY_FILES.map(file => ({ file, bytes: 10, sha256: 'a'.repeat(64) })) },
     predecessorManifestSha256: LINUX_FINAL_PREDECESSOR.manifestSha256,
     images: { current: { file: 'current.AppImage', ...Object.fromEntries(['version', 'sourceRevision', 'bytes', 'sha256'].map(k => [k, LINUX_FINAL_PREDECESSOR[k]])),
       sha512: artifact.sha512, asarSha256: '2'.repeat(64), executableSha256: '3'.repeat(64) },
@@ -52,23 +62,53 @@ test('final-artifact intake binds an unchanged production source candidate and a
   ]) { const changed = structuredClone(intake); alter(changed); assert.throws(() => validateLinuxFinalIntake(changed)); }
   assert.throws(() => parseLinuxFinalIntake(' '.repeat(65537)));
 });
-test('replacement intake v2 binds only 028 and never relabels historical source or package evidence', () => {
-  const current = fixture({ schemaVersion: LINUX_FINAL_SCHEMA_V2, version: '0.1.28', buildNumber: '2026100901' });
+test('replacement signed intake v4 binds only 028 and never relabels historical source or package evidence', () => {
+  const current = fixture({ schemaVersion: LINUX_FINAL_SCHEMA_V4, version: '0.1.28', buildNumber: '2026100901' });
   const historical = fixture();
   assert.equal(validateLinuxFinalIntake(current.intake), current.intake);
   validateLinuxFinalPackageReceipt(current.receipt, current.intake, current.sourceBytes);
   validateLinuxFinalPair(current.pair, runner);
-  for (const patch of [{ schemaVersion: LINUX_FINAL_SCHEMA }, { schemaVersion: 'toString' },
-    { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v3' }, { version: '0.1.27' },
+  for (const patch of [{ schemaVersion: LINUX_FINAL_SCHEMA_V3 }, { schemaVersion: 'toString' },
+    { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v1' }, { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v2' }, { version: '0.1.27' },
     { version: '0.1.29' }, { buildNumber: '2026100301' }, { buildNumber: '2026100902' },
     { sourceCandidate: historical.intake.sourceCandidate }]) {
     assert.throws(() => validateLinuxFinalIntake({ ...current.intake, ...patch }));
   }
-  assert.throws(() => validateLinuxFinalIntake({ ...historical.intake, schemaVersion: LINUX_FINAL_SCHEMA_V2 }));
+  assert.throws(() => validateLinuxFinalIntake({ ...historical.intake, schemaVersion: LINUX_FINAL_SCHEMA_V4 }));
   assert.throws(() => validateLinuxFinalPackageReceipt(historical.receipt, current.intake, historical.sourceBytes));
   const changed = structuredClone(current.pair); changed.images.next.version = '0.1.27';
   assert.throws(() => validateLinuxFinalPair(changed, runner));
   assert.equal(validateLinuxFinalIntake(historical.intake), historical.intake);
+});
+
+test('signed feed transport is canonical, bounded, digest-bound and absent from prepared pair payloads', () => {
+  const { intake, pair } = fixture();
+  assert.deepEqual(decodeLinuxFinalSignedFeed(intake.signedFeed), Buffer.from(intake.signedFeed.base64, 'base64'));
+  assert.equal(Object.hasOwn(pair.intake.signedFeed, 'base64'), false);
+  for (const alter of [v => { delete v.signedFeed; }, v => { v.signedFeed.file = '../latest-linux.yml'; },
+    v => { v.signedFeed.base64 += '\n'; }, v => { v.signedFeed.bytes++; }, v => { v.signedFeed.sha256 = '0'.repeat(64); },
+    v => { v.signedFeed.base64 = 'A'.repeat(87385); }, v => { v.signedFeed.key = 'untrusted'; },
+    v => { v.schemaVersion = 'tibotattle-linux-final-lifecycle-intake-v1'; }]) {
+    const changed = structuredClone(intake); alter(changed); assert.throws(() => validateLinuxFinalIntake(changed));
+  }
+  for (const alter of [v => { v.schemaVersion = 'tibotattle-linux-final-artifact-pair-v1'; },
+    v => { v.intake.signedFeed.base64 = intake.signedFeed.base64; }, v => { delete v.packagedAuthority; },
+    v => { v.packagedAuthority.files.pop(); }, v => { v.packagedAuthority.files.reverse(); },
+    v => { v.packagedAuthority.files[0].sha256 = 'invalid'; }, v => { v.packagedAuthority.files[0].bytes = 0; },
+    v => { v.intake.signedFeed.sha256 = [v.intake.signedFeed.sha256]; }, v => { v.intake.signedFeed.sha256 = 123; },
+    v => { v.packagedAuthority.files[0].sha256 = [v.packagedAuthority.files[0].sha256]; },
+    v => { v.packagedAuthority.files[0].sha256 = 123; }]) {
+    const changed = structuredClone(pair); alter(changed); assert.throws(() => validateLinuxFinalPair(changed, runner));
+  }
+});
+test('host admission compares the validated feed descriptor projection and still rejects substitutions', () => {
+  const { intake, pair } = fixture();
+  assert.equal(assertLinuxFinalPreparedIntakeMatches(pair, intake), true);
+  for (const alter of [v => { v.intake.signedFeed.sha256 = '0'.repeat(64); }, v => { v.intake.signedFeed.bytes++; },
+    v => { v.intake.packageRunId = '54321'; }, v => { v.intake.signedFeed.base64 = intake.signedFeed.base64; }]) {
+    const changed = structuredClone(pair); alter(changed); assert.throws(() => assertLinuxFinalPreparedIntakeMatches(changed, intake));
+  }
+  assert.throws(() => assertLinuxFinalPreparedIntakeMatches(pair, { ...intake, signedFeed: pair.intake.signedFeed }));
 });
 
 test('only the exact successful same-repository manual packaging workflow is admitted', () => {
@@ -246,6 +286,171 @@ test('browser identity keeps all three pinned digests, stable process identity a
   }), error => error === failure);
   const malformed = appProcess(); malformed.files.stat = malformed.files.stat.replace(/100$/u, 'invalid');
   await assert.rejects(readLinuxFinalAppProcessIdentity(malformed.pid, malformed.expected, temporary, malformed.io), /PROCESS_START_TIME_INVALID/u);
+});
+
+test('recognized browser status and environment read failures refuse identity with only a fixed redacted error', async () => {
+  for (const file of ['status', 'environ']) {
+    for (const code of ['EACCES', 'EIO']) {
+      const value = appProcess();
+      const failure = Object.assign(new Error('PRIVATE_SYNTHETIC_IDENTITY_DETAIL'), {
+        code, path: '/synthetic/private-identity-evidence', cause: 'PRIVATE_SYNTHETIC_IDENTITY_DETAIL',
+      });
+      await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+        ...value.io,
+        read: async path => {
+          if (path === `/proc/${value.pid}/${file}`) throw failure;
+          return value.io.read(path);
+        },
+      }), error => {
+        assert.notEqual(error, failure);
+        assert.equal(error.code, 'LINUX_FINAL_LIFECYCLE_PROCESS_IDENTITY_UNAVAILABLE');
+        assert.equal(error.message, error.code);
+        assert.deepEqual(Object.keys(error), ['code']);
+        assert.equal(Object.hasOwn(error, 'cause'), false);
+        assert.doesNotMatch(`${error.stack}\n${JSON.stringify(error)}`, /PRIVATE_SYNTHETIC_IDENTITY_DETAIL|private-identity-evidence|EACCES|EIO/u);
+        return true;
+      });
+      assert.ok(value.reads.includes('exe'), 'the rejected candidate was already recognized as mounted');
+      assert.deepEqual(value.hashes, [], 'unreadable ownership evidence cannot proceed to byte qualification');
+    }
+  }
+});
+
+test('recognized browser denial at any of its three pinned hashes cannot be treated as an unrelated process', async () => {
+  for (const deniedIndex of [0, 1, 2]) {
+    for (const code of ['EACCES', 'EIO']) {
+      const value = appProcess(), paths = [value.value.executable, `${mount}/resources/app.asar`, installedImage];
+      const failure = Object.assign(new Error('PRIVATE_SYNTHETIC_IDENTITY_DETAIL'), {
+        code, path: paths[deniedIndex], cause: 'PRIVATE_SYNTHETIC_IDENTITY_DETAIL',
+      });
+      await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+        ...value.io,
+        hash: async path => {
+          const digest = await value.io.hash(path);
+          if (path === paths[deniedIndex]) throw failure;
+          return digest;
+        },
+      }), error => {
+        assert.notEqual(error, failure);
+        assert.equal(error.code, 'LINUX_FINAL_LIFECYCLE_PROCESS_IDENTITY_UNAVAILABLE');
+        assert.equal(error.message, error.code);
+        assert.deepEqual(Object.keys(error), ['code']);
+        assert.equal(Object.hasOwn(error, 'cause'), false);
+        assert.doesNotMatch(`${error.stack}\n${JSON.stringify(error)}`, /PRIVATE_SYNTHETIC_IDENTITY_DETAIL|\.mount_|EACCES|EIO/u);
+        return true;
+      });
+      assert.deepEqual(value.hashes, paths.slice(0, deniedIndex + 1));
+    }
+  }
+});
+
+test('recognized browser disappearance remains absence while denied ownership evidence remains an error', async () => {
+  for (const code of ['ENOENT', 'ESRCH']) {
+    for (const operation of ['status', 'environ', 'hash']) {
+      const value = appProcess(), failure = Object.assign(new Error('PRIVATE_SYNTHETIC_IDENTITY_DETAIL'), { code });
+      const result = await readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+        ...value.io,
+        read: async path => {
+          if (path === `/proc/${value.pid}/${operation}`) throw failure;
+          return value.io.read(path);
+        },
+        hash: async path => {
+          if (operation === 'hash') throw failure;
+          return value.io.hash(path);
+        },
+      });
+      assert.equal(result, null);
+      assert.ok(value.reads.includes('exe'));
+    }
+  }
+});
+
+test('browser executable changes during hashing invalidate identity even when PID and start time are unchanged', async () => {
+  for (const changedIndex of [0, 1, 2]) {
+    const value = appProcess(), originalStat = value.files.stat;
+    const paths = [value.value.executable, `${mount}/resources/app.asar`, installedImage];
+    let changed = false, linkReads = 0;
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+      ...value.io,
+      link: async path => {
+        linkReads += 1;
+        const original = await value.io.link(path);
+        return changed ? `${temporary}/.mount_TiboTa654321/tibotattle` : original;
+      },
+      hash: async path => {
+        const digest = await value.io.hash(path);
+        if (path === paths[changedIndex]) changed = true;
+        return digest;
+      },
+    }), { code: 'LINUX_FINAL_LIFECYCLE_PROCESS_BYTES_CHANGED' });
+    assert.equal(changed, true);
+    assert.equal(linkReads, 2, 'the kernel executable link is read again after hashing');
+    assert.equal(value.files.stat, originalStat);
+    assert.deepEqual(value.hashes, paths);
+  }
+});
+
+test('browser command line changes during hashing invalidate identity even when executable, PID and start time are unchanged', async () => {
+  for (const changedIndex of [0, 1, 2]) {
+    const value = appProcess(), originalStat = value.files.stat;
+    const paths = [value.value.executable, `${mount}/resources/app.asar`, installedImage];
+    await assert.rejects(readLinuxFinalAppProcessIdentity(value.pid, value.expected, temporary, {
+      ...value.io,
+      hash: async path => {
+        const digest = await value.io.hash(path);
+        if (path === paths[changedIndex]) value.files.cmdline = `${value.value.executable}\0--remote-debugging-port=54321\0`;
+        return digest;
+      },
+    }), { code: 'LINUX_FINAL_LIFECYCLE_PROCESS_BYTES_CHANGED' });
+    assert.equal(value.files.stat, originalStat);
+    assert.equal(value.reads.filter(name => name === 'exe').length, 2);
+    assert.equal(value.reads.filter(name => name === 'cmdline').length, 2, 'the command line is read again after hashing');
+    assert.deepEqual(value.hashes, paths);
+  }
+});
+
+test('a second unreadable owned candidate prevents unique-browser admission in either enumeration order', async () => {
+  for (const order of [[50, 52], [52, 50]]) {
+    for (const [operation, code] of [['status', 'EACCES'], ['hash', 'EIO']]) {
+      const readable = appProcess(), unreadable = appProcess();
+      const vectors = [readable.io.expectedArguments], visited = [];
+      const failure = Object.assign(new Error('PRIVATE_SYNTHETIC_IDENTITY_DETAIL'), { code });
+      const find = (expected, actualTemporary, argumentVectors) => findLinuxFinalOwnedApps(expected, actualTemporary, argumentVectors, {
+        list: async path => { assert.equal(path, '/proc'); return ['self', 'net', ...order.map(String)]; },
+        readIdentity: async (pid, actualExpected, observedTemporary, actualVectors) => {
+          visited.push(pid);
+          const value = pid === 50 ? readable : unreadable;
+          assert.equal(actualExpected, readable.expected);
+          assert.equal(observedTemporary, temporary);
+          assert.equal(actualVectors, vectors);
+          const fixturePath = path => path.replace(`/proc/${pid}/`, `/proc/${value.pid}/`);
+          return readLinuxFinalKnownAppProcessIdentity(pid, actualExpected, observedTemporary, actualVectors, {
+            ...value.io,
+            read: async path => {
+              if (pid === 52 && path === `/proc/${pid}/${operation}`) throw failure;
+              const text = await value.io.read(fixturePath(path));
+              return path.endsWith('/stat') ? text.replace(/^50 /u, `${pid} `) : text;
+            },
+            link: path => value.io.link(fixturePath(path)),
+            hash: async path => {
+              if (pid === 52 && operation === 'hash') throw failure;
+              return value.io.hash(path);
+            },
+          });
+        },
+      });
+      await assert.rejects(currentLinuxFinalApp(readable.expected, temporary, vectors[0], vectors, {
+        find, waiter: oneProcessPoll,
+      }), error => {
+        assert.equal(error.code, 'LINUX_FINAL_LIFECYCLE_PROCESS_IDENTITY_UNAVAILABLE');
+        assert.equal(error.message, error.code);
+        assert.deepEqual(Object.keys(error), ['code']);
+        assert.doesNotMatch(`${error.stack}\n${JSON.stringify(error)}`, /PRIVATE_SYNTHETIC_IDENTITY_DETAIL|EACCES|EIO/u);
+        return true;
+      });
+      assert.deepEqual(visited, order.slice(0, order.indexOf(52) + 1));
+    }
+  }
 });
 
 test('a native renderer must retain Chromium sandbox kernel controls', () => {
@@ -804,7 +1009,10 @@ test('the exact nonce and enforced profile retain FUSE privileges without granti
 
 test('the loopback feed accepts only the pinned updater cache-busting query', () => {
   assert.equal(linuxFinalFeedRequestPath('/electron/stable/linux-x64/latest-linux.yml?noCache=1j2abcd'), 'feed');
-  assert.equal(linuxFinalFeedRequestPath('/electron/stable/linux-x64/next.AppImage'), 'image');
+  const artifact = '/electron/stable/linux-x64/TiboTattle-0.1.28-linux-x86_64.AppImage';
+  assert.equal(linuxFinalFeedRequestPath(artifact, artifact), 'image');
+  assert.equal(linuxFinalFeedRequestPath('/electron/stable/linux-x64/next.AppImage', artifact), null);
+  assert.equal(linuxFinalFeedRequestPath(artifact), null);
   for (const url of ['/electron/stable/linux-x64/latest-linux.yml?arbitrary=1', '/electron/stable/linux-x64/next.AppImage?noCache=a', '/other', '/electron/stable/linux-x64/latest-linux.yml?noCache=a&extra=1']) assert.equal(linuxFinalFeedRequestPath(url), null);
 });
 
@@ -833,8 +1041,10 @@ test('predecessor startup retains the exact dashboard target, readiness expressi
     assert.equal(expression, "document.documentElement?.dataset?.localDashboardReady === 'true'");
     events.push('evaluate'); return values.shift();
   }, close: () => { events.push('close'); } };
-  const connected = await connectLinuxFinalPredecessorDashboard(12345, { connect: async (port, predicate) => {
+  const authority = async () => true;
+  const connected = await connectLinuxFinalPredecessorDashboard(12345, { assertCdpAuthority: authority, connect: async (port, predicate, options) => {
     assert.equal(port, 12345); events.push('connect');
+    assert.equal(options.assertCdpAuthority, authority);
     assert.equal(predicate('http://127.0.0.1:54321/'), true);
     for (const url of ['http://localhost:54321/', 'https://127.0.0.1:54321/',
       'http://127.0.0.1:54321/electron-settings.html', 'http://127.0.0.1:54321/?extra=1',
@@ -1150,4 +1360,238 @@ test('identity diagnostics refuse unknown, private or oversized codes and do not
   };
   await assert.rejects(runLinuxFinalNormalJourney(value.options), { code: 'LINUX_FINAL_LIFECYCLE_NORMAL_RENDERER_SANDBOX_FAILED' });
   assert.deepEqual(value.events, ['identity', 'cleanup']);
+});
+
+test('controlled final launch admits only its locked process and sole debugger listener', async () => {
+  const identity = { pid: 12345, startTime: '100', executable: '/synthetic/.mount_final/tibotattle' };
+  const port = 43123, hexPort = port.toString(16).toUpperCase();
+  const header = 'sl local_address rem_address st tx_queue rx_queue tr tm_when retrnsmt uid timeout inode\n';
+  let current = identity, socketInode = '123', fdInode = '123', selections = 0, identityReads = 0;
+  const authority = createLinuxFinalCdpAuthority({ port,
+    readCurrentIdentity: async () => { selections++; return identity; },
+    readIdentity: async selected => { assert.equal(selected, identity); identityReads++; return current; },
+    assertEndpoint: options => assertLinuxCdpEndpointOwned({ ...options,
+      read: async path => path.endsWith('/tcp6') ? header
+        : header + `0: 0100007F:${hexPort} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${process.getuid()} 0 ${socketInode}\n`,
+      list: async path => { assert.equal(path, '/proc/12345/fd'); return ['4']; },
+      link: async path => { assert.equal(path, '/proc/12345/fd/4'); return `socket:[${fdInode}]`; },
+    }),
+    waiter: predicate => predicate(),
+  });
+  assert.deepEqual(await Promise.all([authority({ port }), authority({ port })]), [true, true]);
+  assert.equal(selections, 1);
+  assert.ok(identityReads >= 4);
+  socketInode = '456'; fdInode = socketInode;
+  // Even the same process reopening the same port is a different listener.
+  await assert.rejects(authority({ port }), { code: 'LINUX_FINAL_LIFECYCLE_CDP_AUTHORITY_UNPROVEN' });
+  fdInode = socketInode;
+  const readsAfterRefusal = identityReads;
+  await assert.rejects(authority({ port }), { code: 'LINUX_FINAL_LIFECYCLE_CDP_AUTHORITY_UNPROVEN' });
+  assert.equal(identityReads, readsAfterRefusal, 'revoked authority must stay revoked');
+});
+
+test('controlled final debugger admission retries only absent listeners and refuses identity substitutions', async () => {
+  const identity = { pid: 12345, startTime: '100', executable: '/synthetic/.mount_final/tibotattle' };
+  for (const change of [{ pid: 12346 }, { startTime: '101' }, { executable: '/synthetic/.mount_other/tibotattle' }]) {
+    let observed = identity, polls = 0;
+    const authority = createLinuxFinalCdpAuthority({ port: 43123,
+      readCurrentIdentity: async () => identity, readIdentity: async () => observed,
+      assertEndpoint: async ({ identity: bound, readIdentity }) => {
+        const value = await readIdentity();
+        if (value.pid !== bound.pid || value.startTime !== bound.startTime || value.executable !== bound.executable) {
+          throw Object.assign(new Error('PRIVATE_PROCESS_DETAIL'), { code: 'LINUX_SUCCESSOR_IDENTITY_CHANGED' });
+        }
+        return true;
+      }, waiter: async predicate => { polls++; return predicate(); },
+    });
+    assert.equal(await authority({ port: 43123 }), true);
+    observed = { ...identity, ...change };
+    await assert.rejects(authority({ port: 43123 }), error => {
+      assert.equal(error.code, 'LINUX_FINAL_LIFECYCLE_CDP_AUTHORITY_UNPROVEN');
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_PROCESS_DETAIL/u); return true;
+    });
+    assert.equal(polls, 2);
+  }
+  let calls = 0;
+  const authority = createLinuxFinalCdpAuthority({ port: 43123, readCurrentIdentity: async () => identity,
+    readIdentity: async () => identity,
+    assertEndpoint: async () => {
+      if (++calls === 1) throw Object.assign(new Error('not ready'), { code: 'LINUX_SUCCESSOR_CDP_NOT_READY' });
+      return true;
+    },
+    waiter: async predicate => { assert.equal(await predicate(), false); return predicate(); },
+  });
+  assert.equal(await authority({ port: 43123 }), true);
+  assert.equal(calls, 2);
+  await assert.rejects(authority({ port: 43124 }), { code: 'LINUX_FINAL_LIFECYCLE_CDP_AUTHORITY_UNPROVEN' });
+});
+
+test('final lifecycle keeps automatic startup separate from controlled authenticated health', async () => {
+  const source = await readFile('scripts/smoke-electron-linux-final-lifecycle.mjs', 'utf8');
+  const baseline = source.indexOf('const startupBaseline = await captureLinuxStartupBaseline');
+  const click = source.indexOf('await settings.evaluate("setTimeout(() => document.querySelector');
+  const startup = source.indexOf('const successorStartup = await waitForLinuxSuccessorStartup');
+  const coldRestart = source.indexOf("stage = 'cold_restart_no_update'");
+  const authorizedHealth = source.indexOf('receipt.controlledColdRestartAuthorizedHealth = true');
+  assert.ok(baseline >= 0 && baseline < click && click < startup && startup < coldRestart && coldRestart < authorizedHealth);
+  assert.match(source, /successorArguments = rememberLaunchArguments\(argumentVectors, \[\]\)/u);
+  assert.match(source, /automaticSuccessorStartup = 'verified_profile_generation'/u);
+  assert.match(source, /automaticSuccessorApiHealth = 'not_observed'/u);
+  assert.doesNotMatch(source, /updaterProcessHealth|processHealth\(successor/u);
+  assert.match(source, /launchArguments: async context =>[\s\S]*await assertLinuxCdpPortUnused\(\{ port: context\.port \}\)/u);
+  assert.match(source, /assertCdpAuthority: context =>/u);
+  assert.match(source, /readIdentity: browser => readLinuxFinalAppProcessIdentity\(browser\.pid, pair\.images\.next, temporary, \{ expectedArguments: launch\.args \}\)/u);
+});
+
+function finalFeedFixture(openImage) {
+  const payload = Buffer.from('synthetic fixed AppImage payload for qualification');
+  const feedBytes = Buffer.from('synthetic previously admitted publisher feed\n');
+  const chunks = [payload.subarray(0, 1), payload.subarray(1, 11), payload.subarray(11)];
+  const image = { version: '0.1.28', bytes: payload.length, sha256: hash(payload) };
+  // Signature admission itself is exercised by the helper's cryptographic tests.
+  // This fixture represents that helper's immutable, already admitted output.
+  const admission = Object.freeze({
+    manifest: Object.freeze({ version: image.version, size: image.bytes, sha256: image.sha256 }),
+    artifactRequestPath: '/electron/stable/linux-x64/TiboTattle-0.1.28-linux-x86_64.AppImage',
+    get feedBytes() { return Buffer.from(feedBytes); },
+  });
+  const server = createLinuxFinalQualificationFeed({ admission, image,
+    openImage: openImage ?? (() => Readable.from(chunks)) });
+  return { server, admission, payload, feedBytes, chunks, image };
+}
+
+function finalFeedResponse({ holdFinish = false } = {}) {
+  const chunks = [];
+  let releaseFinish, enteredFinal;
+  const finalStarted = new Promise(resolve => { enteredFinal = resolve; });
+  const response = new Writable({
+    write(chunk, _encoding, done) { chunks.push(Buffer.from(chunk)); done(); },
+    final(done) { releaseFinish = done; enteredFinal(); if (!holdFinish) done(); },
+  });
+  response.writeHead = (status, headers = {}) => {
+    response.statusCode = status; response.headers = headers; return response;
+  };
+  const settled = finished(response, { cleanup: true }).then(() => null, error => error);
+  return { response, finalStarted, bytes: () => Buffer.concat(chunks),
+    release: () => releaseFinish(),
+    async settle() {
+      const error = await settled;
+      // The server records completion in pipeline's continuation after finish.
+      await new Promise(resolve => setImmediate(resolve));
+      return error;
+    },
+  };
+}
+
+function finalFeedRequest(server, url, options) {
+  const output = finalFeedResponse(options);
+  server.handle({ method: 'GET', headers: { host: 'updates.tibotattle.com' }, url }, output.response);
+  return output;
+}
+
+test('final qualification feed keeps metadata exact while only the completed negative artifact changes one byte', async () => {
+  const value = finalFeedFixture(), originalPayload = Buffer.from(value.payload);
+  const originalChunks = value.chunks.map(chunk => Buffer.from(chunk));
+  const feedPath = '/electron/stable/linux-x64/latest-linux.yml';
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  for (const phase of ['clean', 'corrupt', 'accepted']) {
+    if (phase === 'corrupt') {
+      value.server.beginCorruption();
+      assert.throws(() => value.server.beginCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+      assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+    }
+    if (phase === 'accepted') value.server.endCorruption();
+    const metadata = finalFeedRequest(value.server, feedPath);
+    assert.equal(await metadata.settle(), null);
+    assert.equal(metadata.response.statusCode, 200);
+    assert.deepEqual(metadata.bytes(), value.feedBytes);
+    const artifact = finalFeedRequest(value.server, value.admission.artifactRequestPath);
+    assert.equal(await artifact.settle(), null);
+    assert.equal(artifact.response.statusCode, 200);
+    assert.equal(artifact.response.headers['content-length'], value.payload.length);
+    assert.equal(artifact.bytes().length, value.payload.length);
+    if (phase === 'corrupt') {
+      assert.equal(artifact.bytes()[0], value.payload[0] ^ 1);
+      assert.deepEqual(artifact.bytes().subarray(1), value.payload.subarray(1));
+      assert.equal(value.server.counts().completedRejectedTransfers, 1);
+    } else assert.deepEqual(artifact.bytes(), value.payload);
+    assert.deepEqual(value.payload, originalPayload);
+    assert.deepEqual(value.chunks, originalChunks);
+  }
+  assert.deepEqual(value.server.counts(), { feedRequests: 3, imageRequests: 3,
+    completedRejectedTransfers: 1, unexpectedRequests: 0, transferFailures: 0 });
+  assert.throws(() => value.server.beginCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+});
+
+test('final qualification feed requires source completion and response finish before accepting its negative transfer', async () => {
+  const source = new PassThrough(), value = finalFeedFixture(() => source);
+  value.server.beginCorruption();
+  const output = finalFeedRequest(value.server, value.admission.artifactRequestPath, { holdFinish: true });
+  source.write(value.payload);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(output.bytes().length, value.payload.length);
+  assert.equal(value.server.counts().completedRejectedTransfers, 0);
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  source.end();
+  await output.finalStarted;
+  assert.equal(output.response.writableFinished, false);
+  assert.equal(value.server.counts().completedRejectedTransfers, 0);
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  output.release();
+  assert.equal(await output.settle(), null);
+  assert.equal(output.response.writableFinished, true);
+  assert.equal(value.server.counts().completedRejectedTransfers, 1);
+  value.server.endCorruption();
+});
+
+test('final qualification feed refuses a truncated or hash-mismatched negative source without counting completion', async () => {
+  for (const kind of ['truncated', 'hash_mismatch']) {
+    let emitted;
+    const value = finalFeedFixture(() => Readable.from([emitted]));
+    emitted = kind === 'truncated' ? value.payload.subarray(0, -1) : Buffer.from(value.payload);
+    if (kind === 'hash_mismatch') emitted[emitted.length - 1] ^= 1;
+    value.server.beginCorruption();
+    const output = finalFeedRequest(value.server, value.admission.artifactRequestPath);
+    assert.equal((await output.settle()).code, 'LINUX_QUALIFICATION_STREAM_INVALID');
+    assert.equal(output.response.writableFinished, false);
+    assert.deepEqual(value.server.counts(), { feedRequests: 0, imageRequests: 1,
+      completedRejectedTransfers: 0, unexpectedRequests: 0, transferFailures: 1 });
+    assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  }
+});
+
+test('final qualification feed refuses a response aborted after all negative bytes but before finish', async () => {
+  const value = finalFeedFixture(); value.server.beginCorruption();
+  const completed = finalFeedRequest(value.server, value.admission.artifactRequestPath);
+  assert.equal(await completed.settle(), null);
+  assert.equal(value.server.counts().completedRejectedTransfers, 1);
+  const output = finalFeedRequest(value.server, value.admission.artifactRequestPath, { holdFinish: true });
+  await output.finalStarted;
+  assert.equal(output.bytes().length, value.payload.length);
+  output.response.destroy();
+  await output.settle();
+  assert.equal(output.response.writableFinished, false);
+  assert.equal(value.server.counts().completedRejectedTransfers, 1, 'an unfinished response cannot add a completed transfer');
+  assert.equal(value.server.counts().transferFailures, 1);
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+});
+
+test('final qualification feed waits for every active negative transfer before entering its accepted phase', async () => {
+  const value = finalFeedFixture(); value.server.beginCorruption();
+  const first = finalFeedRequest(value.server, value.admission.artifactRequestPath);
+  assert.equal(await first.settle(), null);
+  assert.equal(value.server.counts().completedRejectedTransfers, 1);
+  const pending = finalFeedRequest(value.server, value.admission.artifactRequestPath, { holdFinish: true });
+  await pending.finalStarted;
+  assert.equal(pending.response.writableFinished, false);
+  assert.throws(() => value.server.endCorruption(), /CHECKSUM_REFUSAL_UNPROVEN/u);
+  pending.release();
+  assert.equal(await pending.settle(), null);
+  assert.equal(value.server.counts().completedRejectedTransfers, 2);
+  assert.equal(value.server.counts().transferFailures, 0);
+  value.server.endCorruption();
+  const accepted = finalFeedRequest(value.server, value.admission.artifactRequestPath);
+  assert.equal(await accepted.settle(), null);
+  assert.deepEqual(accepted.bytes(), value.payload);
 });

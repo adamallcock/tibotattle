@@ -39,6 +39,7 @@ import {
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
+import { fetchRendererJson } from "./lib/authorized-renderer-fetch.mjs";
 
 import {
   DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
@@ -714,7 +715,7 @@ export async function createSyntheticFixture() {
   }
 }
 
-function jsonFetch(url) {
+function debugJsonFetch(url) {
   return withTimeout(fetch(url), MAX_OPERATION_MS, "JSON request")
     .then((response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1039,6 +1040,7 @@ export function classifyAutomaticStartupRefreshReceipt({
 }
 
 async function assertAutomaticStartupRefresh({
+  cdp,
   child,
   dashboardUrl,
   refreshObserver,
@@ -1054,7 +1056,7 @@ async function assertAutomaticStartupRefresh({
     }
     const requests = refreshObserver.snapshot();
     if (requests.length === 0) return null;
-    const status = await jsonFetch(refreshUrl);
+    const status = await fetchRendererJson(cdp, refreshUrl, { timeoutMs: MAX_OPERATION_MS });
     const decision = classifyAutomaticStartupRefreshReceipt({
       phase: "acceptance",
       requestCount: requests.length,
@@ -1081,7 +1083,7 @@ async function assertAutomaticStartupRefresh({
       if (decision.status === "failed") fail(decision.errorCode, "startup_refresh");
       return false;
     }
-    const status = await jsonFetch(refreshUrl);
+    const status = await fetchRendererJson(cdp, refreshUrl, { timeoutMs: MAX_OPERATION_MS });
     const decision = classifyAutomaticStartupRefreshReceipt({
       phase: "completion",
       requestCount: requests.length,
@@ -1981,7 +1983,7 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
   let popup = null;
   try {
     const target = await waitFor(async () => {
-      const targets = await jsonFetch(`http://127.0.0.1:${port}/json/list`);
+      const targets = await debugJsonFetch(`http://127.0.0.1:${port}/json/list`);
       return Array.isArray(targets) && targets.length <= 16
         ? targets.find((candidate) => isMacTrayPopoverTarget(candidate, dashboardOrigin, port))
         : null;
@@ -2083,7 +2085,7 @@ async function assertShareFlow(cdp) {
 }
 
 async function findSettingsTarget(port, dashboardOrigin) {
-  const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
+  const targets = await debugJsonFetch(`http://127.0.0.1:${port}/json`);
   return selectMacSettingsTarget(targets, dashboardOrigin, port);
 }
 
@@ -2255,7 +2257,7 @@ async function assertTrayProcessRelaunch({ executable, appPath, environment, fix
     const target = await runRelaunchPhase(
       "dashboard_target",
       () => waitFor(async () => selectMacDashboardTarget(
-        await jsonFetch(`http://127.0.0.1:${port}/json`), port,
+        await debugJsonFetch(`http://127.0.0.1:${port}/json`), port,
       ), MAX_STARTUP_MS, "relaunch dashboard target"),
     );
     dashboard = await runRelaunchPhase("dashboard_target", () => connectCdp(target));
@@ -3288,7 +3290,7 @@ async function runSmoke(appPath, progress = {}, {
     let version;
     try {
       version = await waitFor(
-        () => jsonFetch(`http://127.0.0.1:${port}/json/version`),
+        () => debugJsonFetch(`http://127.0.0.1:${port}/json/version`),
         MAX_STARTUP_MS,
         "Electron remote debugging endpoint",
       );
@@ -3298,7 +3300,7 @@ async function runSmoke(appPath, progress = {}, {
     let target;
     try {
       target = await waitFor(async () => {
-        const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
+        const targets = await debugJsonFetch(`http://127.0.0.1:${port}/json`);
         return selectMacDashboardTarget(targets, port);
       }, MAX_STARTUP_MS, "Electron dashboard target");
     } catch {
@@ -3374,12 +3376,13 @@ async function runSmoke(appPath, progress = {}, {
     if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
       fail("ELECTRON_MACOS_SMOKE_DASHBOARD_ORIGIN_INVALID", "dashboard");
     }
-    const health = await jsonFetch(new URL("/api/local/health", dashboardUrl));
+    const health = await fetchRendererJson(cdp, new URL("/api/local/health", dashboardUrl), { timeoutMs: MAX_OPERATION_MS });
     if (health.status !== "ready") fail("ELECTRON_MACOS_SMOKE_COMPANION_NOT_READY", "dashboard");
     dashboardReceipt = await assertDashboardShell(cdp);
     recordSmokeProgress(progressRecord, "dashboard", dashboardReceipt);
     stage = "startup_refresh";
     startupReceipt = await assertAutomaticStartupRefresh({
+      cdp,
       child,
       dashboardUrl,
       refreshObserver,
@@ -3395,7 +3398,7 @@ async function runSmoke(appPath, progress = {}, {
       ...(await assertDashboardData(cdp)),
     });
     recordSmokeProgress(progressRecord, "dashboard", dashboardReceipt);
-    const postRefreshHealth = await jsonFetch(new URL("/api/local/health", dashboardUrl));
+    const postRefreshHealth = await fetchRendererJson(cdp, new URL("/api/local/health", dashboardUrl), { timeoutMs: MAX_OPERATION_MS });
     stage = "parity";
     parityReceipt = await assertDashboardParitySurfaces(
       cdp,

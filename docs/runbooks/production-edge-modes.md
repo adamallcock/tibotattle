@@ -745,7 +745,18 @@ the `node` on PATH). The golden's withheld model dates are held to the
 oracle's per-date expectation, as in `npm run gcp:fastpath:rehearsal`:
 `EDGE_E2E_PER_DATE_EXPECTED`, which defaults to
 `analytics-v2-test/golden-q1-node/per-date-expected.json` for the committed
-Q-1 golden. `EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
+Q-1 golden. The committed Q-1 stage and the named rehearsal command explicitly
+select `--comparison-contract q1-pro20-four-plan-v1`. This contract admits only
+the complete hash-pinned historical Q-1 inputs, then builds expected current
+v0.5/v1.5 four-plan values from the unchanged historical quantities and fixed
+current metadata. It checks the empty Pro Max values, current catalog and price
+provenance affirmatively; actual output is never reduced or rewritten. The
+report identifies the selected contract and retains the zero-unexpected-diffs
+and whole per-date equality gates. Custom goldens and the generic rehearsal CLI
+retain the legacy comparison default; the current Q-1 option refuses dense
+inputs, dump overrides and schema reuse.
+
+`EDGE_E2E_EDGE_TREE=<edge-port worktree>/apps/worker`
 builds the edge from that tree and refuses unless its
 `src/edge-origin-contract.ts` is byte-identical. With it, S0 holds worker
 mode to that tree's own `wrangler.jsonc` main and compatibility settings,

@@ -62,7 +62,7 @@ import {
   readStorageCommunitySourceTerminalEpoch, type StorageCommunityAuthority,
 } from './storage-community-authority';
 import { advanceNextStorageCommunityDaily, readPublishedStorageCommunityDaily } from './storage-community-daily';
-import { STORAGE_GRAPH_METHOD } from './storage-community-graph';
+import { STORAGE_GRAPH_PROJECTION_METHOD } from './storage-community-graph';
 import { advanceStorageCommunityGraphWork } from './storage-community-graph-work';
 import {
   publishStorageCommunityGraphPreview, publishStorageCommunityModelDay, readPublishedStorageCommunityGraph,
@@ -355,7 +355,7 @@ async function modelDayRows(input: StorageAnalyticsBindings, window: readonly st
   Promise<StorageModelPublicationValue[]> {
   return (await input.target.prepare(`SELECT day,authority_json,payload_json,payload_sha256
     FROM analytics_community_model_publications WHERE source_id=? AND method=? AND day BETWEEN ? AND ?
-    ORDER BY day`).bind(input.sourceId, STORAGE_GRAPH_METHOD, window[0], window.at(-1))
+    ORDER BY day`).bind(input.sourceId, STORAGE_GRAPH_PROJECTION_METHOD, window[0], window.at(-1))
     .all<StorageModelPublicationValue>()).results;
 }
 
@@ -377,8 +377,8 @@ async function visibleModelDays(input: StorageAnalyticsBindings, pinnedNowMs: nu
 /**
  * What the HX import may carry: per day the MAX revision, and only when the
  * Worker's own public reader would serve it (never an older revision); the
- * STORAGE_GRAPH_METHOD model days the graph lane treats as complete inside the
- * window; and the preview the Worker's own reader serves. Heads are listed in
+ * STORAGE_GRAPH_PROJECTION_METHOD model days the graph lane treats as complete
+ * inside the window; and the preview the Worker's own reader serves. Heads are listed in
  * full, because they are imported whatever their latest revision's state.
  * Hashes are normalized (H10) so they compare with recomputed values.
  */
