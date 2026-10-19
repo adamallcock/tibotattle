@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { normalizeModelPerformance, performanceSegments, performanceDomain, performanceYScale, performanceDateTicks, performanceHoverBin, mountModelPerformance } from '../public/model-performance.js';
 import { LocalCompanionClient } from '../public/data-client.js';
 import { translate, SUPPORTED_LOCALES } from '../public/localization.js';
+import { normalizeCommunityPerformanceDisplay } from '../public/model-performance.js';
+import { normalizeCommunityModelPerformance } from '../public/community-data.js';
+import { CATALOGS } from '../../../packages/i18n/index.js';
 const DAY = 86400000;
 const point = (at = 2 * DAY, n = 5) => ({ at, n,
   p10: n < 5 ? null : 30, p25: n < 5 ? null : 40, median: 50,
@@ -134,7 +137,7 @@ test('client requests only an enum period, is abortable, and reports endpoint fa
 });
 test('every supported locale preserves coverage and measurement meaning', () => {
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'combinedSpeedSummary', 'combinedSpeedMethodology', 'combinedSpeedEmpty', 'combinedMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale', 'mode', 'standard', 'fast', 'standardNote', 'fastNote', 'unknownMode', 'modeEmpty']) {
+    for (const key of ['title', 'speedEmpty', 'ttftEmpty', 'methodology', 'variance', 'speedSummary', 'latencySummary', 'combinedSpeedSummary', 'combinedSpeedMethodology', 'combinedSpeedEmpty', 'combinedMethodology', 'outerBand', 'innerBand', 'medianP50', 'percentileValues', 'percentilesUnavailable', 'buildingHistory', 'unavailable', 'stale', 'mode', 'standard', 'fast', 'ultrafast', 'standardNote', 'fastNote', 'ultrafastNote', 'unknownMode', 'modeEmpty']) {
       const value = translate(`performance.${key}`, {}, locale);
       assert.notEqual(value, `performance.${key}`);
     }
@@ -989,6 +992,34 @@ test('Standard is the initial mode and Fast empty results show unknown exclusion
   controller.destroy();
 });
 
+test('Ultrafast clears other modes while pending and retains its own empty result and exclusions', async () => {
+  const dom = focusHarness(), ultrafast = Promise.withResolvers();
+  const { calls, client } = performanceClient((period, { speedMode }) => speedMode === 'ultrafast'
+    ? period === 'all' ? ultrafast.promise : modePayload(period, speedMode, { models: [] })
+    : modePayload(period, speedMode));
+  const controller = mountModelPerformance({ ...dom, client, t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh(); await settle();
+  dom.find('mode-fast').listeners.click(); await settle();
+  assert.equal(hasPanel(dom), true);
+  assert.equal(dom.find('mode-ultrafast').attributes['aria-pressed'], 'false');
+  dom.find('mode-ultrafast').focus(); dom.find('mode-ultrafast').listeners.click();
+  assert.equal(hasPanel(dom), false);
+  assert.equal(dom.documentRef.activeElement, dom.find('mode-ultrafast'));
+  assert.equal(calls.at(-1).options.speedMode, 'ultrafast');
+  ultrafast.resolve(modePayload('all', 'ultrafast', { models: [], excludedUnknownTurns: 17 }));
+  await settle(); await settle();
+  assert.equal(hasPanel(dom), false);
+  assert.ok(dom.root.all().some(node => node.textContent?.includes('No Ultrafast mode measurements')));
+  assert.ok(dom.root.all().some(node => node.textContent?.includes('Only Ultrafast mode measurements')));
+  assert.ok(dom.root.all().some(node => node.textContent?.includes('Excluded turns (unknown or mixed speed mode): 17.')));
+  dom.find('mode-standard').listeners.click();
+  assert.equal(hasPanel(dom), true);
+  dom.find('mode-ultrafast').listeners.click();
+  assert.equal(hasPanel(dom), false);
+  assert.equal(dom.find('mode-ultrafast').attributes['aria-pressed'], 'true');
+  controller.destroy();
+});
+
 test('one Fast observation shows its own coverage, hollow points and no percentile bands', async () => {
   const dom = focusHarness();
   const { client } = performanceClient((period, { speedMode }) => {
@@ -1098,7 +1129,7 @@ test('shared reporting keeps its exact bound and selected speed mode through mod
   controller.destroy();
 });
 
-test('shared preload prepares every period and both speed modes at one exact end bound', async () => {
+test('shared preload prepares twelve period and speed-mode pairs at one exact end bound', async () => {
   const dom = focusHarness(), end = 60 * DAY;
   const endAt = new Date(end).toISOString();
   const pending = Promise.withResolvers();
@@ -1115,10 +1146,10 @@ test('shared preload prepares every period and both speed modes at one exact end
     t: (key, values) => translate(key, values, 'en-US') });
   try {
     await controller.preload();
-    assert.equal(calls.length, 8);
+    assert.equal(calls.length, 12);
     assert.deepEqual(new Set(calls.map(call => `${call.period}:${call.options.speedMode}`)), new Set([
-      '1:standard', '1:fast', '7:standard', '7:fast',
-      '30:standard', '30:fast', 'all:standard', 'all:fast',
+      '1:standard', '1:fast', '1:ultrafast', '7:standard', '7:fast', '7:ultrafast',
+      '30:standard', '30:fast', '30:ultrafast', 'all:standard', 'all:fast', 'all:ultrafast',
     ]));
     assert.ok(calls.every(call => call.options.endAt === endAt));
     revalidating = true;
@@ -1129,6 +1160,9 @@ test('shared preload prepares every period and both speed modes at one exact end
     controller.setReportingWindow(windowAt('30d'));
     assert.ok(dom.root.all().some(node => node.className === 'performance-empty'),
       'a different period displays its prepared Fast result immediately');
+    dom.find('mode-ultrafast').listeners.click();
+    assert.ok(dom.root.all().some(node => node.className === 'performance-empty'),
+      'Ultrafast retains its own prepared result while revalidation is pending');
   } finally {
     controller.destroy();
     pending.resolve(null);
@@ -1153,4 +1187,438 @@ test('client rejects unsupported modes, preserves endAt, and page rejects a wron
   assert.equal(hasPanel(dom), false);
   assert.ok(dom.find('retry'));
   controller.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Community display variant. The fixtures are plain literals (the normalized
+// output of community-data.js) so the edge line can copy them verbatim.
+function communityPublished() {
+  return {
+    state: 'published', schemaVersion: 'community-model-performance-v1',
+    methodVersion: 'performance-histogram-pool-type7-bounds-v1', population: 'reported_samples',
+    approximate: true, revision: 3, generatedAt: '2026-10-11T03:05:00.000Z',
+    period: '7', interval: 'day', start: '2026-10-04', end: '2026-10-10', speedMode: 'standard',
+    excludedUnknownTurns: 2, contributors: 4, devices: 5, reports: 9,
+    models: [{
+      provider: 'openai_codex', modelId: 'gpt-5.6-sol',
+      turns: 15, speedTurns: 14, ttftTurns: 13, timedResponses: 20, toolFreeTurns: 1,
+      contributors: 3, devices: 4,
+      speed: { unit: 'tokens_per_second', points: [
+        { day: '2026-10-04', n: 11, unresolved: 2,
+          p10: { estimate: 40, lower: 35, upper: 45 }, p25: { estimate: 50, lower: 46, upper: 55 },
+          median: { estimate: 62, lower: 58, upper: 66 }, p75: { estimate: 70, lower: 66, upper: 80 },
+          p90: { estimate: 90, lower: 80, upper: 130 } },
+        { day: '2026-10-06', n: 3, unresolved: 0,
+          p10: null, p25: null, median: { estimate: 55, lower: 48, upper: 61 }, p75: null, p90: null },
+      ] },
+      ttft: { unit: 'milliseconds', points: [
+        { day: '2026-10-04', n: 10, unresolved: 0,
+          p10: { estimate: 800, lower: 700, upper: 900 }, p25: { estimate: 1000, lower: 900, upper: 1100 },
+          median: { estimate: 1200, lower: 1100, upper: 1400 }, p75: { estimate: 1600, lower: 1400, upper: 1800 },
+          p90: { estimate: 2400, lower: 1800, upper: 3000 } },
+        { day: '2026-10-06', n: 3, unresolved: 0,
+          p10: null, p25: null, median: { estimate: 1500, lower: 1300, upper: 1900 }, p75: null, p90: null },
+      ] },
+      label: 'GPT-5.6 Sol',
+    }],
+    omittedModels: { models: 1, turns: 6 },
+  };
+}
+// One closed UTC day: the window starts and ends on the same completed day.
+function communityLatestDay() {
+  return {
+    state: 'published', schemaVersion: 'community-model-performance-v1',
+    methodVersion: 'performance-histogram-pool-type7-bounds-v1', population: 'reported_samples',
+    approximate: true, revision: 3, generatedAt: '2026-10-11T03:05:00.000Z',
+    period: '1', interval: 'day', start: '2026-10-10', end: '2026-10-10', speedMode: 'standard',
+    excludedUnknownTurns: 0, contributors: 1, devices: 1, reports: 1,
+    models: [{
+      provider: 'openai_codex', modelId: 'gpt-5.6-sol',
+      turns: 2, speedTurns: 2, ttftTurns: 0, timedResponses: 0, toolFreeTurns: 0,
+      contributors: 1, devices: 1,
+      speed: { unit: 'tokens_per_second', points: [
+        { day: '2026-10-10', n: 2, unresolved: 0,
+          p10: null, p25: null, median: { estimate: 64, lower: 60, upper: 71 }, p75: null, p90: null },
+      ] },
+      ttft: { unit: 'milliseconds', points: [] },
+      label: 'GPT-5.6 Sol',
+    }],
+    omittedModels: { models: 0, turns: 0 },
+  };
+}
+// The raw wire body that community-data.js normalizes into communityPublished().
+function communityWireBody() {
+  const { state, omittedModels, ...body } = communityPublished();
+  body.models = body.models.map(({ label, ...model }) => model);
+  body.models.push({ provider: 'openai_codex', modelId: 'gpt-synthetic-unlisted', turns: 6, speedTurns: 0,
+    ttftTurns: 0, timedResponses: 0, toolFreeTurns: 0, contributors: 1, devices: 1,
+    speed: { unit: 'tokens_per_second', points: [] }, ttft: { unit: 'milliseconds', points: [] } });
+  return body;
+}
+const communitySlot = (period, speedMode = 'standard') => {
+  if (period === '1') return { ...communityLatestDay(), speedMode };
+  const start = { '7': '2026-10-04', '30': '2026-09-11', all: '2026-09-01' }[period];
+  return { ...communityPublished(), period, start, speedMode };
+};
+const communityClient = (handler = (period, options) => communitySlot(period, options.speedMode)) => {
+  const calls = [];
+  return { calls, client: { modelPerformance: async (period, options) => { calls.push({ period, speedMode: options.speedMode, signal: options.signal }); return handler(period, options); } } };
+};
+const en = (key, values) => translate(key, values, 'en-US');
+const textOf = (dom, className) => dom.root.all().filter(node => node.className === className).map(node => node.textContent);
+const evidenceOf = dom => Object.fromEntries(dom.root.all().filter(node => node.className === 'performance-evidence-row')
+  .map(row => [row.dataset.evidence, row.children[1].textContent]));
+const communityStatus = dom => dom.root.all().find(node => node.className === 'performance-status');
+
+test('community display adapter consumes the normalized reader output with bounds, seconds and UTC epochs', () => {
+  const normalized = normalizeCommunityModelPerformance(communityWireBody(), { period: '7', speedMode: 'standard' });
+  assert.deepEqual(normalized, communityPublished(), 'the fixture is exactly what the public reader produces');
+  const display = normalizeCommunityPerformanceDisplay(normalized);
+  assert.equal(display.start, Date.UTC(2026, 9, 4));
+  assert.equal(display.end, Date.UTC(2026, 9, 11) - 1, 'the window ends at the end of its last UTC day');
+  assert.deepEqual(display.models.map(model => [model.id, model.label, model.contributors, model.devices, model.unresolved]),
+    [['gpt-5.6-sol', 'GPT-5.6 Sol', 3, 4, 2]]);
+  const [model] = display.models;
+  assert.deepEqual(model.speed.map(point => point.at), [Date.UTC(2026, 9, 4), Date.UTC(2026, 9, 6)]);
+  assert.deepEqual(model.speed[0].median, { estimate: 62, lower: 58, upper: 66 });
+  assert.deepEqual(model.speed[1], { at: Date.UTC(2026, 9, 6), n: 3, unresolved: 0, p10: null, p25: null,
+    median: { estimate: 55, lower: 48, upper: 61 }, p75: null, p90: null });
+  assert.deepEqual(model.ttft[0].median, { estimate: 1.2, lower: 1.1, upper: 1.4 }, 'TTFT is shown in seconds');
+  assert.deepEqual(model.ttft[0].p90, { estimate: 2.4, lower: 1.8, upper: 3 });
+  assert.deepEqual(display.evidence, { contributors: 4, devices: 5, reports: 9, samples: 21, revision: 3,
+    generatedAt: '2026-10-11T03:05:00.000Z', omittedModels: { models: 1, turns: 6 } });
+  assert.deepEqual(display.omittedModels, { models: 1, turns: 6 });
+  assert.equal(display.excludedUnknownTurns, 2);
+});
+
+test('community display adapter maps Monday week bins and refuses every non-published or malformed shape', () => {
+  const weekly = communityPublished();
+  Object.assign(weekly, { period: 'all', interval: 'week', start: '2026-09-29' });
+  weekly.models[0].speed.points[0].day = '2026-09-28';
+  weekly.models[0].speed.points[1].day = '2026-10-05';
+  weekly.models[0].ttft.points[0].day = '2026-09-28';
+  weekly.models[0].ttft.points[1].day = '2026-10-05';
+  const display = normalizeCommunityPerformanceDisplay(weekly);
+  assert.deepEqual(display.models[0].speed.map(point => point.at), [Date.UTC(2026, 8, 28), Date.UTC(2026, 9, 5)],
+    'a week bin is named by its Monday and may begin before the window');
+  for (const state of ['none_published', 'unsupported_schema', 'service_unavailable']) {
+    assert.equal(normalizeCommunityPerformanceDisplay({ state, period: '7', speedMode: 'standard', models: [], omittedModels: null }), null);
+  }
+  assert.equal(normalizeCommunityPerformanceDisplay(communityWireBody()), null, 'a raw body never renders');
+  assert.equal(normalizeCommunityPerformanceDisplay(payload()), null, 'a local DTO never enters the community path');
+  assert.equal(normalizeModelPerformance(communityPublished()), null, 'a community slot never enters the local DTO');
+  for (const mutate of [
+    x => { x.privatePath = '/synthetic/private'; }, x => { x.approximate = false; }, x => { x.revision = 0; },
+    x => { x.schemaVersion = 'community-model-performance-v2'; }, x => { x.period = '14'; },
+    x => { x.interval = 'week'; }, x => { x.end = '2026-10-11'; }, x => { x.reports = 1; },
+    x => { x.omittedModels = null; }, x => { x.models[0].label = ''; }, x => { delete x.models[0].label; },
+    x => { x.models[0].speed.points[0].median.lower = 63; },
+    x => { x.models[0].speed.points[1].p10 = { estimate: 50, lower: 40, upper: 52 }; },
+    x => { x.models[0].speed.points[0].p25 = null; },
+    x => { x.models[0].ttft.points[0].unresolved = 1; },
+    x => { x.models[0].speed.points[0].n = 12; },
+    x => { x.models[0].speed.points[0].day = '2026-10-03'; },
+    x => { x.models[0].speed.points.reverse(); },
+    x => { x.models[0].contributors = 5; },
+    x => { x.models.push(structuredClone(x.models[0])); },
+  ]) { const value = communityPublished(); mutate(value); assert.equal(normalizeCommunityPerformanceDisplay(value), null); }
+  const notMonday = structuredClone(weekly); notMonday.models[0].speed.points[0].day = '2026-09-29';
+  assert.equal(normalizeCommunityPerformanceDisplay(notMonday), null);
+});
+
+test('community variant renders bound estimates, the under-five rule, unresolved notes and evidence rows', async () => {
+  const dom = focusHarness();
+  const { client } = communityClient(() => communitySlot('7'));
+  const controller = mountModelPerformance({ ...dom, source: 'community', period: '7', client, t: en });
+  try {
+    dom.show(); await controller.refresh();
+    assert.equal(dom.root.dataset.performanceSource, 'community');
+    assert.equal(communityStatus(dom).dataset.state, 'ready');
+    const plots = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
+    assert.equal(plots.length, 2);
+    const labels = plots.map(svg => svg.all().filter(node => node.className === 'performance-point').map(node => node.attributes['aria-label']));
+    assert.deepEqual(labels[0], [
+      'Oct 4, 2026 · Output speed · P50 62 (58-66) tokens/s · P10 40 (35-45) tokens/s · P25 50 (46-55) tokens/s · P75 70 (66-80) tokens/s · P90 90 (80-130) tokens/s · 11 reported samples · 2 above 120 tokens/s without an exact speed',
+      'Oct 6, 2026 · Output speed · P50 55 (48-61) tokens/s · 3 reported samples',
+    ]);
+    assert.deepEqual(labels[1], [
+      'Oct 4, 2026 · First-token latency · P50 1.2 (1.1-1.4) s · P10 0.8 (0.7-0.9) s · P25 1 (0.9-1.1) s · P75 1.6 (1.4-1.8) s · P90 2.4 (1.8-3) s · 10 reported samples',
+      'Oct 6, 2026 · First-token latency · P50 1.5 (1.3-1.9) s · 3 reported samples',
+    ]);
+    for (const svg of plots) {
+      assert.equal(svg.all().filter(node => node.className === 'performance-bound-whisker').length, 2, 'every point, sparse or banded, shows its median bounds');
+      assert.equal(svg.all().filter(node => node.className === 'performance-percentile-range').length, 1, 'only the banded point draws P10-P90');
+      assert.equal(svg.all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
+    }
+    // Endpoint labels have no room for bounds, so each marks its estimate approximate.
+    assert.deepEqual(plots.map(svg => svg.all().filter(node => node.className?.startsWith('performance-endpoint-label')).map(node => node.textContent)), [
+      ['P90 ≈90 tokens/s', 'P75 ≈70 tokens/s', 'P50 ≈62 tokens/s', 'P25 ≈50 tokens/s', 'P10 ≈40 tokens/s'],
+      ['P90 ≈2.4 s', 'P75 ≈1.6 s', 'P50 ≈1.2 s', 'P25 ≈1 s', 'P10 ≈0.8 s'],
+    ]);
+    const hollow = plots[0].all().filter(node => node.className === 'performance-point')[1].children[1];
+    assert.equal(hollow.attributes.fill, 'var(--surface-raised)', 'a point below five samples is hollow');
+    // Tooltip and readout for the sparse day: only its median, with bounds.
+    plots[0].listeners.pointermove({ clientX: 52 + 656 * 2 / 7, clientY: 100 });
+    const readouts = dom.root.all().filter(node => node.className === 'sr-only performance-readout');
+    assert.equal(readouts[0].textContent, 'Oct 6, 2026 · Output speed · P50 55 (48-61) tokens/s · 3 reported samples');
+    const tooltip = dom.root.all().find(node => node.className?.startsWith('performance-tooltip performance-tooltip-'));
+    assert.ok(tooltip.all().some(node => node.textContent === 'P50 55 (48-61) tokens/s'));
+    assert.ok(tooltip.all().some(node => node.textContent === en('performance.community.percentilesUnavailable')));
+    plots[0].listeners.pointermove({ clientX: 52, clientY: 100 });
+    const banded = dom.root.all().find(node => node.className === 'performance-tooltip-percentiles');
+    assert.deepEqual(banded.children.map(node => node.textContent), ['P90', '90 (80-130) tokens/s', 'P75', '70 (66-80) tokens/s', 'P25', '50 (46-55) tokens/s', 'P10', '40 (35-45) tokens/s']);
+    assert.ok(dom.root.all().some(node => node.textContent === '2 above 120 tokens/s without an exact speed'));
+    plots[0].listeners.pointerleave();
+    assert.ok(readouts.every(node => node.textContent === ''));
+    assert.deepEqual(textOf(dom, 'performance-method-note performance-unresolved-note'),
+      ['2 reported samples were above 120 tokens/s without an exact speed. They are counted, and the bounds widen to cover them.']);
+    assert.deepEqual(textOf(dom, 'performance-unit'), [
+      'tokens/s · Higher is faster · 14 of 15 reported samples · 1 full-turn estimates',
+      'seconds · Lower is faster · 13 of 15 reported samples · 20 timed responses',
+    ]);
+    assert.deepEqual(textOf(dom, 'performance-unit performance-model-sources'), ['3 contributors · 4 installations']);
+    const updated = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date('2026-10-11T03:05:00.000Z'));
+    assert.deepEqual(evidenceOf(dom), {
+      period: '7d · Oct 4, 2026 to Oct 10, 2026', contributors: '4', installations: '5', reports: '9',
+      samples: '21', revision: '3', updated, omitted: '1 · 6 reported samples',
+    });
+    assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-evidence-row').map(row => row.children[0].textContent),
+      ['Reporting period', 'Contributors', 'Installations', 'Reports', 'Reported samples', 'Revision', 'Updated', 'Models not shown']);
+    assert.ok(dom.root.all().some(node => node.textContent === 'Excluded reported samples (unknown, mixed or other speed mode): 2. Clients 0.1.24–0.1.26 report Ultrafast samples as other, so Ultrafast is undercounted.'));
+    assert.ok(dom.root.all().some(node => node.tagName === 'button' && node.attributes['aria-label'] === 'GPT-5.6 Sol' && node.all().some(child => child.textContent === 'GPT-5.6 Sol')));
+    assert.ok(dom.root.all().some(node => node.className === 'performance-legend-item' && node.children[1].textContent === 'Median bounds'));
+    // The copy scope swaps only the community wording.
+    assert.deepEqual(textOf(dom, 'performance-provider'), [en('performance.community.provider')]);
+    assert.deepEqual(textOf(dom, 'page-description'), [en('performance.community.subtitle')]);
+    const about = dom.root.all().find(node => node.className === 'performance-details');
+    assert.deepEqual(about.children.slice(1).map(node => node.textContent), [en('performance.community.methodology'), en('performance.community.variance')]);
+    assert.equal(dom.root.all().some(node => node.textContent === en('performance.provider')), false);
+  } finally { controller.destroy(); }
+});
+
+test('community period controls offer Latest UTC day, 7d, 30d and All time and request only the selected slot', async () => {
+  const dom = focusHarness();
+  const { calls, client } = communityClient();
+  const controller = mountModelPerformance({ ...dom, source: 'community', client, t: en });
+  try {
+    dom.show(); await controller.refresh(); await settle(); await settle();
+    const periods = dom.root.all().filter(node => node.dataset.performanceFocus?.startsWith('period-'));
+    assert.deepEqual(periods.map(node => [node.dataset.performanceFocus, node.textContent]),
+      [['period-1', 'Latest UTC day'], ['period-7', '7d'], ['period-30', '30d'], ['period-all', 'All time']]);
+    assert.deepEqual(calls.map(call => [call.period, call.speedMode]), [['all', 'standard']], 'no other period is warmed');
+    await dom.find('period-1').listeners.click(); await settle(); await settle();
+    assert.deepEqual(calls.map(call => call.period), ['all', '1']);
+    assert.equal(dom.find('period-1').attributes['aria-pressed'], 'true');
+    assert.deepEqual(textOf(dom, 'performance-mode-note performance-period-note'),
+      ['Latest UTC day is the most recent completed UTC calendar day, not a rolling 24 hours.']);
+    assert.equal(evidenceOf(dom).period, 'Latest UTC day · Oct 10, 2026');
+    const speed = dom.root.all().find(node => node.tagName === 'svg' && node.listeners.pointermove);
+    assert.deepEqual(speed.all().filter(node => node.className === 'performance-point').map(node => node.attributes['aria-label']),
+      ['Oct 10, 2026 · Output speed · P50 64 (60-71) tokens/s · 2 reported samples']);
+    assert.equal(speed.all().find(node => node.className === 'performance-point').children[1].attributes.cx, '380',
+      'the single closed day is centred, not drawn as a rolling edge');
+    assert.ok(dom.root.all().some(node => node.textContent === en('performance.ttftEmpty')));
+    await dom.find('mode-fast').listeners.click(); await settle(); await settle();
+    assert.deepEqual(calls.at(-1), { period: '1', speedMode: 'fast', signal: calls.at(-1).signal });
+    assert.equal(calls.length, 3, 'a mode switch requests its own slot only');
+  } finally { controller.destroy(); }
+});
+
+test('community refresh runs every 300 s for the selected slot, reuses fresh slots and never preloads', async () => {
+  const dom = focusHarness();
+  const { calls, client } = communityClient();
+  const controller = mountModelPerformance({ ...dom, source: 'community', client, t: en });
+  try {
+    assert.equal(calls.length, 0, 'hidden mounts do not request');
+    assert.equal(await controller.preload(), false);
+    assert.equal(calls.length, 0, 'preload never warms community periods');
+    assert.equal(controller.setReportingWindow({ period: '7d', startAt: null, endAt: '2026-10-10T00:00:00.000Z' }), false);
+    dom.show(); await controller.refresh(); await settle();
+    assert.deepEqual(dom.timerIds().map(id => dom.timerDelay(id)), [300_000]);
+    dom.runTimer(dom.timerIds()[0]); await settle(); await settle();
+    assert.deepEqual(calls.map(call => call.period), ['all', 'all'], 'the cadence revalidates only the shown slot');
+    assert.deepEqual(dom.timerIds().map(id => dom.timerDelay(id)), [300_000]);
+    await dom.find('period-7').listeners.click(); await settle(); await settle();
+    await dom.find('period-all').listeners.click(); await settle(); await settle();
+    assert.deepEqual(calls.map(call => call.period), ['all', 'all', '7'], 'a fresh cached slot is shown without a request');
+    assert.equal(dom.timerIds().length, 1);
+    assert.ok(dom.timerDelay(dom.timerIds()[0]) <= 300_000);
+    dom.navigate(false);
+    assert.deepEqual(dom.timerIds(), [], 'an inactive page stops polling');
+    dom.navigate(true); await settle();
+    assert.equal(calls.length, 3, 'returning within the interval reuses the fresh slot');
+    assert.equal(dom.timerIds().length, 1);
+  } finally { controller.destroy(); }
+  const custom = focusHarness();
+  const second = communityClient();
+  const tuned = mountModelPerformance({ ...custom, source: 'community', client: second.client, t: en, refreshIntervalMs: 60_000 });
+  try {
+    custom.show(); await tuned.refresh(); await settle();
+    assert.deepEqual(custom.timerIds().map(id => custom.timerDelay(id)), [60_000]);
+  } finally { tuned.destroy(); }
+  assert.throws(() => mountModelPerformance({ ...focusHarness(), source: 'community', client: second.client, t: en, refreshIntervalMs: 0 }), RangeError);
+  assert.throws(() => mountModelPerformance({ ...focusHarness(), source: 'community', client: second.client, t: en, sharedReporting: true }), TypeError);
+});
+
+test('community states stay distinct: unpublished, unreadable, unavailable and mismatched slots', async () => {
+  const dom = focusHarness();
+  let answer = { state: 'none_published', period: 'all', speedMode: 'standard', models: [], omittedModels: null };
+  const { client } = communityClient(() => typeof answer === 'function' ? answer() : answer);
+  const controller = mountModelPerformance({ ...dom, source: 'community', client, t: en });
+  const panel = () => dom.root.all().find(node => node.id === 'performance-model-panel');
+  try {
+    dom.show(); await controller.refresh();
+    assert.equal(communityStatus(dom).dataset.state, 'none');
+    assert.equal(communityStatus(dom).textContent, 'No community measurements are published for this period yet.');
+    assert.equal(panel(), undefined); assert.equal(dom.find('retry'), undefined);
+    answer = communitySlot('all'); await controller.refresh();
+    assert.ok(panel());
+    answer = () => { throw new Error('synthetic failure'); }; await controller.refresh();
+    assert.equal(communityStatus(dom).dataset.state, 'error');
+    assert.ok(panel(), 'a transient failure keeps the published slot visible');
+    assert.ok(dom.find('retry'));
+    answer = { state: 'service_unavailable', period: 'all', speedMode: 'standard', models: [], omittedModels: null };
+    await controller.refresh();
+    assert.equal(communityStatus(dom).textContent, en('performance.community.failed'));
+    assert.ok(panel());
+    answer = { state: 'unsupported_schema', period: 'all', speedMode: 'standard', models: [], omittedModels: null };
+    await controller.refresh();
+    assert.equal(communityStatus(dom).dataset.state, 'unsupported');
+    assert.equal(panel(), undefined, 'an unreadable publication withdraws the chart');
+    assert.equal(dom.root.all().some(node => node.className?.startsWith('performance-evidence')), false);
+    answer = communitySlot('7'); await controller.refresh();
+    assert.equal(communityStatus(dom).dataset.state, 'unsupported', 'another slot is never rendered under the requested one');
+    answer = communityWireBody(); await controller.refresh();
+    assert.equal(communityStatus(dom).dataset.state, 'unsupported', 'an unnormalized body is refused');
+    answer = { ...communitySlot('all'), models: [], omittedModels: { models: 2, turns: 9 } };
+    await controller.refresh();
+    assert.ok(dom.root.all().some(node => node.dataset.state === 'empty' && node.textContent === 'No Standard mode reported samples in this period. Try a longer period or another mode.'));
+    assert.equal(evidenceOf(dom).omitted, '2 · 9 reported samples', 'models the catalog cannot name are counted, not hidden');
+  } finally { controller.destroy(); }
+});
+
+test('local Model performance keeps its DTO path when the source is explicit and refuses unknown sources', async () => {
+  const dom = focusHarness();
+  const controller = mountModelPerformance({ ...dom, source: 'local', client: { modelPerformance: async () => payload() }, t: en });
+  try {
+    dom.show(); await controller.refresh();
+    assert.equal(dom.root.dataset.performanceSource, undefined);
+    assert.deepEqual(dom.root.all().filter(node => node.dataset.performanceFocus?.startsWith('period-')).map(node => node.dataset.performanceFocus),
+      ['period-7', 'period-30', 'period-all']);
+    assert.deepEqual(textOf(dom, 'performance-provider'), [en('performance.provider')]);
+    assert.equal(dom.root.all().some(node => node.className === 'performance-bound-whisker'), false);
+  } finally { controller.destroy(); }
+  assert.throws(() => mountModelPerformance({ ...focusHarness(), source: 'hosted', client: {}, t: en }), RangeError);
+});
+
+test('every locale carries the community performance copy with its placeholders', () => {
+  const prefix = 'performance.community.';
+  const keys = Object.keys(CATALOGS['en-US']).filter(key => key.startsWith(prefix));
+  assert.ok(keys.length >= 28);
+  for (const locale of SUPPORTED_LOCALES) {
+    assert.deepEqual(Object.keys(CATALOGS[locale]).filter(key => key.startsWith(prefix)), keys, locale);
+    const values = { date: 'D', method: 'M', values: 'V', count: '7', label: 'P50', value: 'X', estimate: '62', lower: '58', upper: '66',
+      unit: 'U', measured: '3', total: '4', estimates: '1', responses: '2', contributors: '5', devices: '6', models: '1', samples: '9', mode: 'Fast' };
+    for (const key of keys) {
+      const copy = translate(key, values, locale);
+      assert.notEqual(copy, key, `${locale}: ${key}`);
+      assert.doesNotMatch(copy, /\{/u, `${locale}: ${key}`);
+    }
+    assert.equal(translate('performance.community.estimateValue', values, locale), '62 (58-66) U');
+  }
+});
+
+// Shared keys whose local text describes this device's measured turns or saved
+// results. Community mode scopes each one to its reported-sample variant.
+const LOCAL_ONLY_PERFORMANCE_KEYS = Object.freeze(['standardNote', 'fastNote', 'ultrafastNote', 'unknownMode', 'modeEmpty', 'combinedSpeedEmpty', 'cancelled']);
+const PERFORMANCE_MODES = Object.freeze(['standard', 'fast', 'ultrafast']);
+const renderedCopy = dom => dom.root.all().flatMap(node => [node.textContent, node.attributes?.['aria-label']])
+  .filter(text => typeof text === 'string' && text.length > 0);
+const placeholderNames = message => [...message.matchAll(/\{([A-Za-z]+)\}/gu)].map(match => match[1]).sort();
+// Every rendering of a key the view can produce: integer counts format as "2" in each supported locale.
+const filledCopy = (t, key, mode = 'standard') => t(key, { count: '2', mode: t(`performance.${mode}`) });
+
+test('community mode never renders the local measured-turn or saved-result copy in any locale', async () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    const t = (key, values) => translate(key, values, locale);
+    for (const key of LOCAL_ONLY_PERFORMANCE_KEYS) {
+      assert.deepEqual(placeholderNames(CATALOGS[locale][`performance.community.${key}`]), placeholderNames(CATALOGS[locale][`performance.${key}`]), `${locale}: ${key}`);
+      assert.notEqual(filledCopy(t, `performance.community.${key}`), filledCopy(t, `performance.${key}`), `${locale}: ${key}`);
+    }
+    const local = LOCAL_ONLY_PERFORMANCE_KEYS.flatMap(key => PERFORMANCE_MODES.map(mode => filledCopy(t, `performance.${key}`, mode)));
+    const dom = focusHarness(), ultrafast = Promise.withResolvers();
+    const { client } = communityClient((period, { speedMode }) => {
+      if (speedMode === 'ultrafast') return ultrafast.promise;
+      if (speedMode === 'fast') return { ...communitySlot(period, 'fast'), models: [], omittedModels: { models: 0, turns: 0 } };
+      const slot = communitySlot(period);
+      Object.assign(slot.models[0], { speedTurns: 0, toolFreeTurns: 0, speed: { unit: 'tokens_per_second', points: [] } });
+      return slot;
+    });
+    const controller = mountModelPerformance({ ...dom, source: 'community', client, t });
+    const seen = [];
+    try {
+      dom.show(); await controller.refresh(); await settle();
+      let copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['standardNote', 'unknownMode', 'combinedSpeedEmpty'])
+        assert.ok(copy.includes(filledCopy(t, `performance.community.${key}`)), `${locale}: ${key}`);
+      dom.find('mode-fast').listeners.click(); await settle(); await settle();
+      copy = renderedCopy(dom); seen.push(...copy);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.fastNote')), locale);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.unknownMode')), locale);
+      assert.ok(dom.root.all().some(node => node.dataset.state === 'empty' && node.textContent === filledCopy(t, 'performance.community.modeEmpty', 'fast')), locale);
+      dom.find('mode-ultrafast').listeners.click(); await settle();
+      dom.find('cancel').listeners.click();
+      copy = renderedCopy(dom); seen.push(...copy);
+      assert.equal(communityStatus(dom).dataset.state, 'cancelled');
+      assert.equal(communityStatus(dom).textContent, filledCopy(t, 'performance.community.cancelled'), locale);
+      assert.ok(copy.includes(filledCopy(t, 'performance.community.ultrafastNote')), locale);
+      for (const text of seen) for (const phrase of local)
+        assert.equal(text.includes(phrase), false, `${locale}: community copy "${text}" reuses local "${phrase}"`);
+      if (locale === 'en-US') for (const text of seen)
+        assert.doesNotMatch(text, /measured turns|turns measured|Excluded turns|Saved results|single-response turn/u);
+    } finally { controller.destroy(); ultrafast.resolve(null); }
+  }
+});
+
+test('local mode keeps its measured-turn and saved-result copy byte for byte', async () => {
+  // Literal pins: scoping community copy must not change the local view's text.
+  const pinned = {
+    standardNote: 'Only Standard mode measurements.',
+    fastNote: 'Only Fast mode measurements. Coverage may be sparse; hollow points have fewer than 5 measured turns.',
+    ultrafastNote: 'Only Ultrafast mode measurements. Coverage may be sparse; hollow points have fewer than 5 measured turns.',
+    unknownMode: 'Excluded turns (unknown or mixed speed mode): 2.',
+    modeEmpty: 'No Fast mode measurements in this period. Try a longer period or another mode.',
+    combinedSpeedEmpty: 'No output-speed measurement for this model in this period. Compatible response timing or a complete single-response turn without tools is required.',
+    cancelled: 'Measurement update cancelled. Saved results remain visible when available.',
+  };
+  for (const locale of SUPPORTED_LOCALES) {
+    const t = (key, values) => translate(key, values, locale);
+    const expected = Object.fromEntries(LOCAL_ONLY_PERFORMANCE_KEYS.map(key => [key, filledCopy(t, `performance.${key}`, key === 'modeEmpty' ? 'fast' : 'standard')]));
+    if (locale === 'en-US') assert.deepEqual(expected, pinned);
+    const community = LOCAL_ONLY_PERFORMANCE_KEYS.flatMap(key => PERFORMANCE_MODES.map(mode => filledCopy(t, `performance.community.${key}`, mode)));
+    const dom = focusHarness(), ultrafast = Promise.withResolvers();
+    const { client } = performanceClient((period, { speedMode }) => {
+      if (speedMode === 'ultrafast') return ultrafast.promise;
+      if (speedMode === 'fast') return modePayload(period, speedMode, { models: [], excludedUnknownTurns: 2 });
+      const data = modePayload(period, speedMode, { excludedUnknownTurns: 2 });
+      Object.assign(data.models[0], { speedTurns: 0, speed: [] });
+      return data;
+    });
+    const controller = mountModelPerformance({ ...dom, client, t });
+    const seen = [];
+    try {
+      dom.show(); await controller.refresh(); await settle();
+      let copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['standardNote', 'unknownMode', 'combinedSpeedEmpty']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      dom.find('mode-fast').listeners.click(); await settle(); await settle();
+      copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['fastNote', 'unknownMode', 'modeEmpty']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      dom.find('mode-ultrafast').listeners.click(); await settle();
+      controller.cancel();
+      copy = renderedCopy(dom); seen.push(...copy);
+      for (const key of ['ultrafastNote', 'cancelled']) assert.ok(copy.includes(expected[key]), `${locale}: ${key}`);
+      for (const text of seen) for (const phrase of community)
+        assert.equal(text.includes(phrase), false, `${locale}: local copy "${text}" borrows community "${phrase}"`);
+    } finally { controller.destroy(); ultrafast.resolve(null); }
+  }
 });

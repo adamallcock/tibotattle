@@ -1,4 +1,4 @@
-import { mountExampleInsights } from "./feature-insights.js";
+import { createHostedSpeedLoader, mountExampleInsights } from "./feature-insights.js";
 import { mountExampleWeek } from "./feature-week.js";
 // Entry point for the public website.
 //
@@ -697,11 +697,14 @@ if (typeof document !== "undefined") {
   wirePaceDemo(document, t);
   // The tour's cache section shows the illustration first and swaps in the
   // measured curve if the hosted lane has published one. The read is the same
-  // public daily endpoint the rest of the page already uses.
+  // public daily endpoint the rest of the page already uses. The model-speed
+  // section does the same with the community model-performance publication,
+  // through the same client: one probe of the all-time Standard slot, then one
+  // slot per reader selection at the view's own refresh cadence.
   mountExampleInsights(document, t, async () => {
     const payload = await communityClient.communityDaily({ nowMs: Date.now() });
     return payload?.cacheRetention ?? null;
-  });
+  }, createHostedSpeedLoader(communityClient));
   mountExampleWeek(document.querySelector("#week-demo"), t);
   renderPublicInstallerJourney();
   wirePublicPlatformSelector();
