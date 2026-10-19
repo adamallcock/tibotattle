@@ -85,7 +85,7 @@ What follows from the decision:
 | Schema reviewed | `migrate` | The migrations are expand-compatible or reviewed in `CONTRACT_MIGRATIONS`, and the append-only residue migration is present (`PRODUCTION_SIMP_RESIDUE_MISSING` until it lands) |
 | Jobs quiescent | `migrate`, `roll` | Every Cloud Scheduler trigger of a Cloud Run job in the location is paused, and nothing is running (`ROLLOUT_JOBS_NOT_PAUSED`, `ROLLOUT_JOBS_RUNNING`) |
 | Lifecycle pass | `roll` | Whenever the live edge is not in `gcp` mode, `roll` checks the served commit through the verifier path, which needs `/api/ready` to read `ready`, and readiness needs a completed maintenance pass under 2 hours old. `roll` runs that pass itself: one execution of the target's maintenance job after it moves and reads back the service and jobs and before it checks the served commit (`ROLLOUT_MAINTENANCE_PASS_FAILED` unless exactly one execution succeeds; D-CRB). A target without a maintenance job (staging, which cannot deploy it yet) is refused before any write outside `gcp` mode (`ROLLOUT_MAINTENANCE_JOB_REQUIRED`). This covers every pre-switch rollout, the pre-staging one included, and every rollout while the edge is braked to `fenced` |
-| Reprice Job present | `preflight` | The reprice Job (`jobs.analytics-reprice`) is in the committed desired state and the rollout target, so the clean-estate readback refuses until an owner-applied OPS-2 plan has created it with a bootstrap image that carries `dist/analytics-reprice.mjs` ([infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice)). Create it before the first migrate or roll from a commit that declares it |
+| Reprice Job present | `preflight` | The reprice Job (`jobs.analytics-reprice`) is in the committed desired state and the rollout target, so the clean-estate readback refuses until an owner-applied OPS-2 plan has created it with a bootstrap image that carries `dist/analytics-reprice.mjs` ([infrastructure README](../../apps/worker/cloud-run/infra/README.md#reprice-job-ops-reprice)). Create it before the first migrate or roll from a commit that declares it, as the last write before the preflight that gates that `migrate`: from the apply until `migrate`, every rollout from a line that does not declare it is refused ([apply window and back-out](#reprice-job-apply-window-and-back-out-2026-10-19)) |
 | Edge capture | `roll` | A verified capture of the live edge, at most 15 minutes old, for this environment |
 | Contract blob | `roll` | If the live edge is in gcp mode, `apps/worker/src/edge-origin-contract.ts` has the same Git blob at `--commit` and at the live edge's commit (`EDGE_CONTRACT_DRIFT`), and the edge points at this service |
 | Lock | Every mutating verb | The environment's own coordination lock is free. Production takes the shared production deployment lock, `refs/heads/codex/production-deployment-lock`; staging takes only `refs/heads/codex/staging-deployment-lock` and never the production lock (owner decision 2026-10-02, round 9). The mapping is closed, and a dry run prints the exact ref as `lockRef` |
@@ -482,16 +482,22 @@ Owner order, after the general preconditions:
    its `REGISTRY_PINS` line. `node cloud-run/build.mjs --check` must resolve the commit's closure
    to that entry before the build (`CLOUD_RUN_BUILD_KERNEL_UNREGISTERED`
    otherwise).
-2. **Build, migrate and roll** the integration commit through steps 4 to 9 of
-   the [sequence](#sequence). `owner`. Keep the migrate receipt: its
-   `migrations.historySha256` is the deployment digest the activation request
-   names.
+2. **Build, create the reprice Job, migrate and roll** the integration commit
+   through steps 4 to 9 of the [sequence](#sequence). `owner`. Create the
+   reprice Job after step 6 (triggers paused and drained) and immediately
+   before step 7, then run step 3's preflight. Preflight cannot pass before
+   the Job exists, because its readback refuses
+   ([apply window and back-out](#reprice-job-apply-window-and-back-out-2026-10-19)).
+   Keep the migrate receipt: its `migrations.historySha256` is the deployment
+   digest the activation request names.
 3. **Reprice under kernel 20, then resume the triggers,** under steps 9 to 11
    of the sequence. `owner`. The maintenance trigger resumes within the
    2-hour readiness window that step 9 describes. The analytics-refresh
    trigger stays paused until the step 10 reprice completes. The reprice Job
-   must exist before the roll: an owner-applied infrastructure plan creates
-   it ([preconditions](#preconditions), "Reprice Job present").
+   must exist before `migrate`, not only before the roll: `migrate` runs
+   preflight under the lock, and the preflight readback reads the estate clean
+   only once the Job exists. Step 2 above creates it
+   ([preconditions](#preconditions), "Reprice Job present").
 
    The reprice matters because the public read accepts a stored price
    equivalence only for the serving kernel (`reprice-read.ts` matches
@@ -568,6 +574,78 @@ counter row. Local measurement at concurrency 24 and 64 on the production pool
 sizes counted every refusal, with refused polls at about twice read latency
 (p50 35–99 ms). Only a locked or unavailable counter table adds up to 1 second
 of tail latency per refusal. This is not a probe signal and needs no brake.
+
+### Reprice Job: apply window and back-out (2026-10-19)
+
+The live production desired state (at `308304c7f`, read on 2026-10-19) does
+not declare the reprice Job. Production is a dedicated project, so readback
+lists every Job in the region. Once the Job exists, a readback from a line
+that does not declare it plans `run-job:delete:tibotattle-analytics-reprice`
+and reads the estate unclean
+(`REFUSED:run-job:delete:tibotattle-analytics-reprice`). That line's `apply`
+refuses (`APPLY_DELETE_REFUSED`), and its `preflight`, `migrate` and `roll`
+refuse (`ROLLOUT_INFRA_NOT_CLEAN`). So from the apply that creates the Job
+until this rollout's `migrate` applies 0079, every rollout from such a line,
+a hotfix included, is blocked. The production deployment lock does not cover
+this gap: `gcp-infra.mjs apply` takes no lock, and each rollout verb holds the
+lock only while it runs. After 0079 applies, that line's images refuse the
+schema anyway (`MIGRATION_STATE_NEWER_THAN_IMAGE`), and the way on is this
+rollout's `roll`.
+
+Keep the gap short:
+
+1. First do everything that does not need the Job: the backup audit
+   (step 2), the build (step 4), the dry runs (step 5), and recording,
+   pausing and draining the triggers (step 6).
+2. Read the estate (read-only):
+   `node scripts/gcp-infra.mjs readback --require-clean --environment=<env>`
+   exits 2 with exactly one reason,
+   `DEFERRED:run-job:create:analytics-reprice:BOOTSTRAP_IMAGE_REQUIRED`. Any
+   other reason is a stop, before any write.
+3. Plan with the build's digest, then apply:
+
+   ```bash
+   node scripts/gcp-infra.mjs plan --environment=<env> \
+     --bootstrap-image-digest=<digest hex> --bootstrap-source-commit=<commit>
+   node scripts/gcp-infra.mjs apply --environment=<env> --authorize=<planDigest> \
+     --bootstrap-image-digest=<digest hex> --bootstrap-source-commit=<commit>
+   ```
+
+   The plan must hold exactly one executable operation,
+   `run-job:create:analytics-reprice`. Its only deferred operations may be the
+   `scheduler:resume:<job>` entries (`SCHEDULER_TRIGGER_RESUME_PENDING`) for
+   the triggers paused in step 1. Nothing may be refused, and there must be no
+   blocker or finding. Stop on anything else. Then `readback --require-clean`
+   exits 0.
+4. Run preflight (step 3) at once and confirm that it reports quiescent. Take
+   the edge capture, then run `migrate` (step 7) and `roll` (step 8) without a
+   pause.
+
+**Back-out before `migrate`.** The rollout may be abandoned after the apply
+and before 0079 applies: a gate fails, the migration's 5-second lock timeout
+keeps recurring, or the owner holds it. Then delete the Job before any
+rollout from a line that does not declare it. The tooling cannot do this,
+because apply never deletes. The delete is a separate, owner-authorized
+destructive operation with this one target
+([if something must be undone](./gcp-production-apply.md#if-something-must-be-undone)).
+For production:
+
+```bash
+gcloud run jobs executions list --job=tibotattle-analytics-reprice --region=us-east1 --project=tibotattle-prod
+gcloud run jobs delete tibotattle-analytics-reprice --region=us-east1 --project=tibotattle-prod
+```
+
+The list must be empty, because nothing in this procedure executes the Job
+before the roll. If it lists an execution, stop and keep that execution for
+the owner: deleting the Job deletes its executions. The Job has no trigger and
+no IAM binding, so nothing else is deleted with it. The other line's
+`readback --require-clean` then reads the estate as it did before the apply,
+with the paused triggers as clean resume deferrals. Resume them from the
+step 6 record under
+[GCP scheduler resume](./gcp-scheduler-resume.md#resume-after-a-rollout). A
+later attempt re-creates the Job from a fresh plan. Once 0079 may have
+applied, do not delete the Job. Roll forward instead
+([when something fails](#when-something-fails)).
 
 ### Refresh with future-dated v1.2 events
 

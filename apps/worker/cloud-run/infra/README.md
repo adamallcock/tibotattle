@@ -208,10 +208,16 @@ plan creates the job. It is deferred with `BOOTSTRAP_IMAGE_REQUIRED` until
 plan and apply get `--bootstrap-image-digest` and
 `--bootstrap-source-commit`. Use an image that contains
 `dist/analytics-reprice.mjs` and whose database holds migration 0077, for
-example the digest built for the next roll. Apply it before that roll's
-preflight, because `readback --require-clean` reads the missing job as
-unclean. Applying infrastructure and executing the job are separate owner
-operations. Neither is part of a dry run or of the offline checks.
+example the digest built for the next roll. Apply it as the last write
+before the preflight that gates that rollout's `migrate`, because
+`readback --require-clean` reads the missing job as unclean. Once the job
+exists, a line whose desired state does not declare it reads the estate as
+unclean too: its plan holds a delete that apply refuses. Every rollout from
+that line is then blocked until this rollout migrates or the owner deletes
+the job by hand. The order and the back-out are in
+`docs/runbooks/gcp-rollout.md` (Migration 0079, "Reprice Job: apply window
+and back-out"). Applying infrastructure and executing the job are separate
+owner operations. Neither is part of a dry run or of the offline checks.
 
 ## Build-source bucket (BUILD-SOURCE)
 

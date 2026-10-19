@@ -466,6 +466,13 @@ commit, and the kernel-17 entry above was dropped before any deployment.
   Live's entries 1 to 19 stay byte-identical.
 - **Migration number.** The live primary chain still ends at 0078, so
   `0079_performance_telemetry.sql` keeps its number and its sha256.
+- **Reprice Job timing.** Live's desired state does not declare the reprice
+  Job, so once it exists every rollout from a line without it is refused. The
+  owner infrastructure apply that creates it therefore comes before `migrate`,
+  not only before the roll, as the last write before that preflight. If the
+  rollout is abandoned between the apply and `migrate`, the owner deletes the
+  Job by hand
+  ([apply window and back-out](../runbooks/gcp-rollout.md#reprice-job-apply-window-and-back-out-2026-10-19)).
 - **Client.** Unchanged. The client keeps emitting `…2026-09-29.1` with v1
   buckets.
 
