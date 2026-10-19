@@ -448,6 +448,30 @@ above; the decisions stand.
 This amendment is source documentation. It records no release, deployment,
 migration or activation.
 
+## Re-based deploy candidate amendment (2026-10-19)
+
+Production moved after the amendment above. On 2026-10-19 the live origin
+served `308304c7f` (analytics kernels through 19, primary migrations through
+0078). Its kernel 19 is the era-isolated model composition, which changed the
+vendored kernels' manifest. The deploy candidate was therefore rebuilt on that
+commit, and the kernel-17 entry above was dropped before any deployment.
+
+- **Kernel 20 replaces kernel 17: one kernel bump, so one reprice.** One new
+  registry entry, kernel 20, holds the performance stage and the v1.2
+  future-day refresh clamp on top of live's kernel 19. Its
+  `computeClosureSha256` is `1811d4ac…bf23`, over 229 closure inputs (kernel
+  17's 228 plus `model-era-composition.ts`). Its `REGISTRY_PINS` line is
+  `981fbd1a…b97e`. Its `vendorManifestSha256` is kernel 19's `58f9530c…cda6`:
+  this work changes no vendored file. Prices and the pricer are unchanged.
+  Live's entries 1 to 19 stay byte-identical.
+- **Migration number.** The live primary chain still ends at 0078, so
+  `0079_performance_telemetry.sql` keeps its number and its sha256.
+- **Client.** Unchanged. The client keeps emitting `…2026-09-29.1` with v1
+  buckets.
+
+This amendment is source documentation. It records no release, deployment,
+migration or activation.
+
 ## Not covered
 
 This record does not authorize remote migrations, route deployment, runtime

@@ -174,6 +174,22 @@ unchanged, and the
 [community model speed decision](./2026-10-10-community-model-speed.md#live-based-deploy-candidate-amendment-2026-10-12)
 records the same entry.
 
+## Re-based kernel amendment (2026-10-19)
+
+On 2026-10-19 the live production origin served `308304c7f`, with analytics
+kernels through 19 (19 is the era-isolated model composition). The deploy
+candidate was rebuilt on that commit before any deployment. The combined entry
+above, kernel 17, was dropped and replaced by kernel 20. Kernel 20 is again one
+entry for this future-day refresh clamp and the community model speed
+performance stage, on top of live's kernel 19: one kernel bump, so one
+reprice. Its `computeClosureSha256` is `1811d4ac…bf23` (229 closure inputs),
+its `REGISTRY_PINS` line is `981fbd1a…b97e`, and its vendored manifest is
+kernel 19's. Where this record says kernel 18 or kernel 17, read kernel 20 for
+this candidate. The reasoning in [Analytics kernel](#analytics-kernel) is
+unchanged, and the
+[community model speed decision](./2026-10-10-community-model-speed.md#re-based-deploy-candidate-amendment-2026-10-19)
+records the same entry.
+
 ## Persistent-skew hold accepted (2026-10-12)
 
 On 2026-10-12 the owner accepted the recommendation to keep this policy with

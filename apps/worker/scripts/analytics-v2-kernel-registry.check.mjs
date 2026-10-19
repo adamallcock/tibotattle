@@ -107,6 +107,18 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 19: era-isolated model composition on the production hotfix line.
   // Existing single-era math is unchanged; each owner votes once per model.
   "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
+  // Kernel 20: one entry for three closure changes on the live origin's
+  // kernel 19, so one reprice. Kernel 19's era-isolated model composition and
+  // its vendored manifest are kept as they are. The community model speed
+  // port (performance-histogram-v2, dictionary adapters, community
+  // performance shape) reaches the closure through the telemetry-contract
+  // barrel, with the performance reader and fold as closure roots. The v1.2
+  // future-day bound (decision 2026-10-12) makes the refresh plan through its
+  // own UTC day and defers later queued days as blocked. errors.ts gains
+  // COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED, ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE
+  // and TELEMETRY_DAY_NOT_YET_ADMISSIBLE. Vendor, prices and the pricer are
+  // unchanged from kernel 19; this source is not deployed.
+  "981fbd1a86e62732b725a922f8c31cffec2f5f184d2721d6fb4001b2b0eeb97e",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];
