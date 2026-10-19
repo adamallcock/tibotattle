@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 4,
+  "generatedAt": "2026-10-11T07:30:00.000Z",
+  "pipeline": {
+    "ingestion": { "journalHead": 12, "latestRecordedAt": "2026-10-11T07:20:00.000Z", "v12Heads": 2, "v12Days": 4, "pendingActivations": 1 },
+    "delivery": { "appliedSequence": 10, "pendingChanges": 2, "pendingOwnerActivations": 1, "current": { "status": "unavailable" } },
+    "daily": { "queuedDays": 2, "oldestQueuedDay": "2026-10-09", "newestQueuedDay": "2026-10-10", "lastReleasedAt": "2026-10-11T07:00:00.000Z", "releasedLastHour": 1 }
+  },
+  "publication": { "publishedDays": 3, "latestEvidenceDay": "2026-10-10", "preview": { "state": "recorded", "computedAt": "2026-10-11T07:00:00.000Z" } },
+  "work": {
+    "currentState": "unavailable",
+    "lastRun": { "state": "complete", "startedAt": "2026-10-11T03:00:00.000Z", "finishedAt": "2026-10-11T07:00:00.000Z", "kernelId": 16, "owners": 2, "ownerDays": 4 },
+    "nextScheduledAt": "2026-10-12T03:00:00.000Z",
+    "scheduleState": "unavailable"
+  },
+  "history": { "status": "unavailable" },
+  "graph": { "status": "unavailable" }
+}

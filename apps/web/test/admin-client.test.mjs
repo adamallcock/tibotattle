@@ -1,8 +1,12 @@
+import { createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload, createAdminPro20PromaxAllowancePreviewPayload, withSeptember29AdminHistory, SERVER_V05_ADMIN_ALLOWANCE_PREVIEW, serverV05AdminAllowancePreview } from "./fixtures/admin-allowance.js";
+import { SERVER_V15_COMMUNITY_DAILY, serverV15CommunityDailyBody } from "./fixtures/public-allowance.js";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   ADMIN_MODEL_CONFIG, LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
 } from "../public/telemetry-shared.generated.js";
 import {
   AdminResponseError,
@@ -27,6 +31,60 @@ const fixture = async (name) => JSON.parse(await readFile(
 ));
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+
+test("full-refresh progress preserves recorded evidence and unavailable counters", async () => {
+  const body = await fixture("admin-reconstruction-full-refresh-valid.json");
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.work.lastRun.state = "failed";
+  body.work.lastRun.kernelId = null;
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.pipeline.delivery.appliedSequence = null;
+  body.pipeline.delivery.pendingChanges = null;
+  body.pipeline.delivery.pendingOwnerActivations = null;
+  body.pipeline.daily.queuedDays = null;
+  body.pipeline.daily.oldestQueuedDay = null;
+  body.pipeline.daily.newestQueuedDay = null;
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+  body.work.lastRun = null;
+  body.pipeline.ingestion.journalHead = null;
+  body.pipeline.ingestion.latestRecordedAt = null;
+  body.publication.preview = { state: "not_recorded", computedAt: null };
+  assert.deepEqual(projectAdminReconstructionProgress(body), body);
+});
+
+test("full-refresh projection rejects extra keys, guessed execution and contradictory evidence", async () => {
+  const original = await fixture("admin-reconstruction-full-refresh-valid.json");
+  const edits = [
+    body => { body.ownerId = "synthetic"; },
+    body => { body.graph.owners = 0; },
+    body => { body.history.status = "idle"; },
+    body => { body.work.currentState = "running"; },
+    body => { body.work.scheduleState = "enabled"; },
+    body => { body.work.lastRun.state = "running"; },
+    body => { body.work.lastRun.startedAt = null; },
+    body => { body.work.lastRun.finishedAt = "2026-10-10T00:00:00.000Z"; },
+    body => { body.work.lastRun.kernelId = 0; },
+    body => { body.work.lastRun.runId = "synthetic"; },
+    body => { body.work.nextScheduledAt = body.generatedAt; },
+    body => { body.generatedAt = null; },
+    body => { body.pipeline.ingestion.journalHead = null; },
+    body => { body.pipeline.delivery.appliedSequence = 13; },
+    body => { body.pipeline.delivery.appliedSequence = null; },
+    body => { body.pipeline.delivery.pendingChanges = null; },
+    body => { body.pipeline.delivery.pendingOwnerActivations = 3; },
+    body => { body.pipeline.delivery.current = null; },
+    body => { body.pipeline.daily.queuedDays = 0; },
+    body => { body.pipeline.daily.queuedDays = null; },
+    body => { body.pipeline.daily.oldestQueuedDay = "2026-10-11"; },
+    body => { body.publication.publishedDays = 0; },
+    body => { body.publication.preview.state = "not_recorded"; },
+  ];
+  for (const edit of edits) {
+    const body = structuredClone(original);
+    edit(body);
+    assert.throws(() => projectAdminReconstructionProgress(body), { code: "ADMIN_RECONSTRUCTION_PROGRESS_INVALID" });
+  }
+});
 
 test("admin read lanes are independent, single-flight, and reuse a pending request", async () => {
   let completeSlow;
@@ -1708,4 +1766,184 @@ test("performance intake accepts exact unavailable blocks and nothing looser", a
     "telemetry-performance-registry-2027-01-01.1");
   unlisted.grants.activeByDictionary[0].fieldDictionaryVersion = "registry-2027";
   assert.throws(() => projectAdminPerformanceIntake(unlisted), PERFORMANCE_INTAKE_INVALID);
+});
+
+test("admin preview exact v0.3/v0.4 dispatch preserves reference amounts, dates and model metadata", () => {
+  for (const [payload, factors] of [
+    [createAdminAllowancePreviewPayload(), [["pro", 1], ["prolite", 4], ["plus", 20]]],
+    [createAdminPro10AllowancePreviewPayload(), [["pro", 1], ["prolite", 2], ["promax", 0.4], ["plus", 10]]],
+  ]) {
+    const projected = projectAdminAllowancePreview(payload);
+    assert.equal(projected.schemaVersion, payload.schemaVersion);
+    assert.equal(projected.basis, payload.basis);
+    assert.equal(projected.models.basis, payload.models.basis);
+    assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.multiplier]), factors);
+    assert.deepEqual(projected.days, payload.days, "published reference values and bands are never rescaled");
+    assert.equal(projected.models.days.at(-1).day, payload.models.days.at(-1).day);
+    assert.equal(projected.models.days.at(-1).byModel["gpt-5.6-sol"].capacityUsd, payload.models.days.at(-1).values[0][1]);
+    assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
+    if (payload.schemaVersion.endsWith("v0.4")) assert.equal(projected.spanFloorPp, 25);
+  }
+});
+
+test("admin preview refuses crossed v0.3/v0.4 claims, plan sets, factors and mandatory model metadata", () => {
+  const old = createAdminAllowancePreviewPayload();
+  const current = createAdminPro10AllowancePreviewPayload();
+  for (const source of [old, current]) {
+    const other = source === old ? current : old;
+    for (const mutate of [
+      value => { value.schemaVersion = other.schemaVersion; },
+      value => { value.schemaVersion = "admin-community-allowance-preview-v0.6"; },
+      value => { value.basis = other.basis; },
+      value => { value.models.basis = other.models.basis; },
+      value => { value.models.gate = "unknown"; },
+      value => { value.plans = structuredClone(other.plans); },
+      value => { value.plans[1].multiplier = other.plans[1].multiplier; },
+      value => { value.plans[0].label = other.plans[0].label; },
+      value => { value.spanFloorPp = 40; },
+      value => { value.qualification = "unknown"; },
+      value => { delete value.days.at(-1).byPlanType.plus; },
+      value => { value.days.at(-1).byPlanType.unknown = structuredClone(value.days.at(-1).combined); },
+      value => { delete value.models; },
+      value => { delete value.models.modelConfig; },
+      value => { value.models.modelConfig[0].allowanceTrack = "unknown"; },
+    ]) {
+      const invalid = structuredClone(source); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+  const missingProMax = structuredClone(current); delete missingProMax.days[0].byPlanType.promax;
+  assert.throws(() => projectAdminAllowancePreview(missingProMax), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+});
+
+test("every admin preview basis reads the exact live 43-model catalog without relabeling or dropping values", () => {
+  for (const build of [createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload,
+    createAdminPro20PromaxAllowancePreviewPayload]) {
+    const input = withSeptember29AdminHistory(build());
+    const result = projectAdminAllowancePreview(input);
+    assert.equal(result.schemaVersion, input.schemaVersion);
+    assert.equal(result.basis, input.basis);
+    assert.equal(result.models.modelConfig.length, 43);
+    assert.deepEqual(result.days, input.days);
+    assert.equal(result.models.days.at(-1).catalogVersion, "reviewed-model-catalog-2026-09-29.1");
+    assert.deepEqual(result.models.days.at(-1).byModel["gpt-6.1-sol"], { capacityUsd: 1234.5, participantCount: 1 });
+    for (const mutate of [
+      p => { p.models.modelConfig = p.models.modelConfig.slice(0, 42); },
+      p => { p.models.modelConfig = p.models.modelConfig.slice(1); },
+      p => { p.models.modelConfig = [...p.models.modelConfig, p.models.modelConfig[42]]; },
+      p => { p.models.modelConfig = p.models.modelConfig.map((m, i) => i === 42 ? { ...m, modelId: "unknown-model" } : m); },
+      p => { p.models.modelConfig = p.models.modelConfig.map((m, i) => i === 42 ? { ...m, allowanceTrack: "spark" } : m); },
+      p => { p.models.modelConfig = p.models.modelConfig.map((m, i) => i === 42 ? { ...m, pricingStatus: "unpriced" } : m); },
+      p => { p.models.days[0].catalogVersion = "reviewed-model-catalog-2026-10-01.1"; },
+      p => { p.models.days[0].values.push(["gpt-6.1-sol", 1234.5, 1]); },
+      p => { p.models.days[0].v1ParticipantCount = 0; },
+      p => { p.models.basis = "unknown"; },
+    ]) {
+      const invalid = structuredClone(input); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+    }
+  }
+});
+
+
+test("admin preview v0.5 (Pro 20x, Pro Max x0.8) dispatches exactly and refuses crossed v0.3/v0.4 claims", () => {
+  const payload = createAdminPro20PromaxAllowancePreviewPayload();
+  const projected = projectAdminAllowancePreview(payload);
+  assert.equal(projected.schemaVersion, "admin-community-allowance-preview-v0.5");
+  assert.equal(projected.basis, payload.basis);
+  assert.equal(projected.models.basis, payload.models.basis);
+  assert.equal(projected.spanFloorPp, 25);
+  assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.label, plan.multiplier]),
+    [["pro", "Pro 20x", 1], ["prolite", "Pro 5x", 4], ["promax", "Pro Max 25x", 0.8], ["plus", "Plus", 20]]);
+  assert.deepEqual(projected.days, payload.days, "published reference values are never rescaled");
+  for (const other of [createAdminAllowancePreviewPayload(), createAdminPro10AllowancePreviewPayload()]) {
+    for (const mutate of [
+      value => { value.schemaVersion = other.schemaVersion; },
+      value => { value.basis = other.basis; },
+      value => { value.models.basis = other.models.basis; },
+      value => { value.plans = structuredClone(other.plans); },
+    ]) {
+      const invalid = createAdminPro20PromaxAllowancePreviewPayload(); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+  for (const mutate of [
+    value => { value.plans[2].multiplier = 0.4; },
+    value => { value.plans[3].multiplier = 10; },
+    value => { value.plans[0].label = "Pro 10x"; },
+    value => { value.plans = value.plans.filter(plan => plan.planType !== "promax"); },
+    value => { value.plans = [value.plans[0], value.plans[1], value.plans[3], value.plans[2]]; },
+    value => { delete value.days[0].byPlanType.promax; },
+    value => { value.days.at(-1).byPlanType.unknown = structuredClone(value.days.at(-1).combined); },
+    value => { value.schemaVersion = "admin-community-allowance-preview-v0.6"; },
+    value => { value.spanFloorPp = 40; },
+    value => { value.qualification = "unknown"; },
+    value => { value.models.gate = "unknown"; },
+    value => { delete value.models; },
+  ]) {
+    const invalid = createAdminPro20PromaxAllowancePreviewPayload(); mutate(invalid);
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+  }
+  // Nor can a v0.3 or v0.4 envelope carry any part of the v0.5 claim.
+  for (const build of [createAdminAllowancePreviewPayload, createAdminPro10AllowancePreviewPayload]) {
+    for (const mutate of [
+      value => { value.basis = payload.basis; },
+      value => { value.models.basis = payload.models.basis; },
+      value => { value.plans = structuredClone(payload.plans); },
+    ]) {
+      const invalid = build(); mutate(invalid);
+      assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, mutate.toString());
+    }
+  }
+});
+
+test("the R1 server's v0.5 admin preview projects under its exact contract with every value unchanged", () => {
+  const input = serverV05AdminAllowancePreview();
+  const text = JSON.stringify(input);
+  assert.equal(Buffer.byteLength(text), SERVER_V05_ADMIN_ALLOWANCE_PREVIEW.bytes);
+  assert.equal(createHash("sha256").update(text).digest("hex"), SERVER_V05_ADMIN_ALLOWANCE_PREVIEW.sha256,
+    "the fixture is the server's read, unedited");
+  // The premise of the empty Pro Max assertions: the server published no Pro Max fit.
+  assert.ok(input.days.every(day => day.byPlanType.promax.centralUsd === null && day.byPlanType.promax.fitCount === 0));
+  const projected = projectAdminAllowancePreview(serverV05AdminAllowancePreview());
+  assert.equal(projected.schemaVersion, "admin-community-allowance-preview-v0.5");
+  assert.equal(projected.generatedAt, input.generatedAt);
+  assert.equal(projected.basis, "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview");
+  assert.equal(projected.models.basis, "seven_day_codex_pro20x_equivalent_per_model_composition_promax25");
+  assert.equal(projected.models.gate, input.models.gate);
+  assert.equal(projected.spanFloorPp, 25);
+  assert.deepEqual(projected.plans.map(plan => [plan.planType, plan.label, plan.multiplier]),
+    [["pro", "Pro 20x", 1], ["prolite", "Pro 5x", 4], ["promax", "Pro Max 25x", 0.8], ["plus", "Plus", 20]]);
+  assert.deepEqual([projected.from, projected.to], [input.from, input.to]);
+  assert.deepEqual(projected.days, input.days, "every served reference value is kept, never rescaled");
+  assert.ok(projected.days.every(day => day.byPlanType.promax.centralUsd === null && day.byPlanType.promax.band80Usd === null),
+    "Pro Max stays an explicit no-estimate, never zero");
+  assert.deepEqual(projected.coverage, input.coverage);
+  assert.deepEqual(projected.models.modelConfig, SEPTEMBER29_ADMIN_MODEL_CONFIG);
+  assert.equal(projected.models.days.length, input.models.days.length);
+  for (const [index, day] of input.models.days.entries()) {
+    const read = projected.models.days[index];
+    assert.equal(read.catalogVersion, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION);
+    for (const key of ["day", "values", "fittedParticipantCount", "unstableParticipantCount", "staleParticipantCount",
+      "refusedParticipantCount", "v1ParticipantCount", "unsupportedSourceParticipantCount"]) {
+      assert.deepEqual(read[key], day[key], `${day.day} ${key}`);
+    }
+    for (const [modelId, capacityUsd, participantCount] of day.values) {
+      assert.deepEqual(read.byModel[modelId], { capacityUsd, participantCount }, `${day.day} ${modelId}`);
+    }
+  }
+  // The public v1.5 fixture body was served from this stored preview: the
+  // origin's public projection kept every plan summary and model tuple.
+  assert.equal(SERVER_V05_ADMIN_ALLOWANCE_PREVIEW.publicBodySha256, SERVER_V15_COMMUNITY_DAILY.bodySha256);
+  const served = serverV15CommunityDailyBody().allowanceBreakdowns;
+  assert.equal(served.generatedAt, projected.generatedAt);
+  assert.ok(served.days.length > 0);
+  for (const day of served.days) {
+    const preview = projected.days.find(entry => entry.day === day.day);
+    assert.deepEqual(preview.combined, day.combined, `${day.day} combined`);
+    for (const plan of ["pro", "prolite", "promax", "plus"]) {
+      assert.deepEqual(preview.byPlanType[plan], day.byPlanType[plan], `${day.day} ${plan}`);
+    }
+    assert.deepEqual(projected.models.days.find(entry => entry.day === day.day).values, day.models, `${day.day} models`);
+  }
 });

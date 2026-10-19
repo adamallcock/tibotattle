@@ -4052,6 +4052,7 @@ footer p { margin: 0; }
   color: var(--allowance-color, var(--ink));
 }
 .allowance-panel .community-allowance-chart { margin: 0; }
+.allowance-panel-empty-note { margin: 0; font-size: .72rem; color: var(--muted); }
 .allowance-panel .allowance-series-legend { display: none; }
 .community-site .community-allowance-chart [data-muted="true"] { opacity: .07; }
 

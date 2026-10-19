@@ -279,9 +279,10 @@ export function communityDailyWindow(nowMs = Date.now()) {
 
 // The allowance block is additive on community-daily-aggregate-v1.0. Only the
 // exact merged methodology is interpreted: supported personal-plan fits are
-// normalized into one Pro 20x-equivalent summary before the median and range
-// are calculated. Old Pro-only blocks and any future methodology are per-day
-// absent, never silently relabelled under the merged copy.
+// normalized into their declared reference summary before the median and range
+// are calculated. Only the exact Pro 20x, Pro 10x and Pro 20x-with-Pro-Max
+// claims below are accepted; their values retain their original basis,
+// including in stored copies.
 export const COMMUNITY_ALLOWANCE_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
 export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
@@ -290,12 +291,31 @@ export const COMMUNITY_ALLOWANCE_NORMALIZATION =
 
 // Inverse of the validated reference-plan display basis, not a pricing model
 // or a new allowance fit. Convert the unrounded estimate before formatting.
+export const COMMUNITY_ALLOWANCE_PRO10_BASIS =
+  "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25";
+export const COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION =
+  "pro_x1_prolite_x2_promax_x0_4_plus_x10";
+// Owner option B (2026-10-10): every plan in units of the Pro 20x week,
+// including Pro Max 25x at x0.8. A new identity: never the three-plan
+// v1.0-v1.3 claim and never the v1.4 Pro 10x one.
+export const COMMUNITY_ALLOWANCE_PRO20_PROMAX_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25";
+export const COMMUNITY_ALLOWANCE_PRO20_PROMAX_NORMALIZATION =
+  "pro_x1_prolite_x4_promax_x0_8_plus_x20";
 const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, plus: 20 });
-export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
+const PRO10_PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 2, promax: 0.4, plus: 10 });
+const PRO20_PROMAX_PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, promax: 0.8, plus: 20 });
+const PLAN_REFERENCE_MULTIPLIERS_BY_NORMALIZATION = new Map([
+  [COMMUNITY_ALLOWANCE_NORMALIZATION, PLAN_REFERENCE_MULTIPLIERS],
+  [COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION, PRO10_PLAN_REFERENCE_MULTIPLIERS],
+  [COMMUNITY_ALLOWANCE_PRO20_PROMAX_NORMALIZATION, PRO20_PROMAX_PLAN_REFERENCE_MULTIPLIERS],
+]);
+export function planWeeklyApiEquivalentUsd(referenceUsd, planType, normalization = COMMUNITY_ALLOWANCE_NORMALIZATION) {
+  const multipliers = PLAN_REFERENCE_MULTIPLIERS_BY_NORMALIZATION.get(normalization) ?? null;
   if (typeof referenceUsd !== "number" || !Number.isFinite(referenceUsd) || referenceUsd < 0
       || typeof planType !== "string"
-      || !Object.prototype.hasOwnProperty.call(PLAN_REFERENCE_MULTIPLIERS, planType)) return null;
-  return referenceUsd / PLAN_REFERENCE_MULTIPLIERS[planType];
+      || (multipliers === null || !Object.prototype.hasOwnProperty.call(multipliers, planType))) return null;
+  return referenceUsd / multipliers[planType];
 }
 
 // The page's own selected roster, in display order: the models it leads with.
@@ -365,6 +385,7 @@ export function publicAllowanceModels(catalog = REVIEWED_MODEL_CATALOG) {
 const PUBLIC_ALLOWANCE_MODELS = publicAllowanceModels();
 export const PUBLIC_ALLOWANCE_MODEL_CONFIG = PUBLIC_ALLOWANCE_MODELS.charted;
 const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
+const PUBLIC_ALLOWANCE_FOUR_PLAN_IDS = Object.freeze(["pro", "prolite", "promax", "plus"]);
 
 // An allowance-breakdown day carries one tuple per identified model. A server
 // that knows a newer model than this page does is expected, so the tuple count
@@ -461,18 +482,17 @@ export function chartedModelsWith(published = []) {
 // rebuild the exact wire shape it accepted, and a second spelling of a claim
 // is a second thing that can drift.
 //
-// v1.3 is v1.1's meaning (the Pro 20x basis, with `combined`) plus the closed
-// model-metadata block, so it is read on the same basis as v1.1. The block is a
-// required member of v1.3 (the KM-V13 producer always appends it), and only
-// v1.3 may carry it: a v1.3 envelope without one, or a v1.0 or v1.1 envelope
-// with one, is outside its own contract and is refused whole, as d43c8f92
-// refuses the second. Any other version,
-// v1.2 and v1.4 included, is refused whole until this reader is changed to
-// understand it.
+// v1.3 retains v1.1's Pro 20x meaning and adds a required model-metadata
+// wrapper. v1.4 uses the genuine four-plan Pro 10x basis with that same wrapper.
+// v1.5 uses the four-plan Pro 20x basis (Pro Max 25x at x0.8), same wrapper.
+// Version, basis, normalization and plan set are dispatched together; crossed
+// claims are refused rather than rescaling published estimates.
 export const COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS = Object.freeze([
   "community-allowance-breakdowns-v1.0",
   "community-allowance-breakdowns-v1.1",
   "community-allowance-breakdowns-v1.3",
+  "community-allowance-breakdowns-v1.4",
+  "community-allowance-breakdowns-v1.5",
 ]);
 const COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION =
   "community-allowance-breakdowns-v1.1";
@@ -480,8 +500,26 @@ const COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION =
   "community-allowance-breakdowns-v1.3";
 const COMMUNITY_ALLOWANCE_MODEL_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS =
+  "seven_day_codex_pro10x_equivalent_per_model_composition";
+const COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION = "community-allowance-breakdowns-v1.4";
+const COMMUNITY_ALLOWANCE_PRO20_PROMAX_MODEL_BASIS =
+  "seven_day_codex_pro20x_equivalent_per_model_composition_promax25";
+const COMMUNITY_ALLOWANCE_PRO20_PROMAX_METADATA_VERSION = "community-allowance-breakdowns-v1.5";
 const COMMUNITY_ALLOWANCE_MODEL_GATE =
   "shared_composition_kernel_identification";
+// Declared four-plan contracts. Version, basis, normalization, model basis and
+// plan set are one closed claim; the reader carries them on its result and the
+// cache rebuilds the same version from them. v1.0-v1.3 keep the bare historical
+// Pro 20x shape and are not in this table.
+const DECLARED_BREAKDOWN_CONTRACTS = new Map([
+  [COMMUNITY_ALLOWANCE_PRO10_METADATA_VERSION, Object.freeze({
+    basis: COMMUNITY_ALLOWANCE_PRO10_BASIS, normalization: COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+    modelBasis: COMMUNITY_ALLOWANCE_PRO10_MODEL_BASIS, planIds: PUBLIC_ALLOWANCE_FOUR_PLAN_IDS })],
+  [COMMUNITY_ALLOWANCE_PRO20_PROMAX_METADATA_VERSION, Object.freeze({
+    basis: COMMUNITY_ALLOWANCE_PRO20_PROMAX_BASIS, normalization: COMMUNITY_ALLOWANCE_PRO20_PROMAX_NORMALIZATION,
+    modelBasis: COMMUNITY_ALLOWANCE_PRO20_PROMAX_MODEL_BASIS, planIds: PUBLIC_ALLOWANCE_FOUR_PLAN_IDS })],
+]);
 
 const PUBLIC_BREAKDOWN_ENVELOPE_KEYS = Object.freeze(["schemaVersion", "basis",
   "referencePlanType", "normalization", "modelBasis", "modelGate", "generatedAt", "days"]);
@@ -511,7 +549,7 @@ function retainedUnrecognizedCounts(value) {
  * kept off the primary comparison (a separate allowance track, or another
  * provider) are producer faults that refuse the block, exactly as for a known
  * id. The tuple's numbers must still be valid, the id is never retained or
- * rendered, and every other part of the contract stays closed. On v1.3, a
+ * rendered, and every other part of the contract stays closed. On v1.3/v1.4, a
  * roster model held back until publication is known only if a valid block
  * names it; otherwise, a rejected block included, its tuple is skipped and
  * counted the same way.
@@ -522,11 +560,13 @@ function retainedUnrecognizedCounts(value) {
  * payload carrying that key is not on the wire contract and is refused. */
 export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now(), { retained = false } = {}) {
   const isRecord = value !== null && typeof value === "object" && !Array.isArray(value);
-  // The block is a required member of v1.3 and a member of v1.3 only. On any
-  // other version the key is an unknown member, so the closed envelope check
-  // below refuses the payload; a v1.3 envelope without it is refused there too.
-  const isMetadataVersion = isRecord
-    && value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION;
+  const declared = isRecord ? DECLARED_BREAKDOWN_CONTRACTS.get(value.schemaVersion) ?? null : null;
+  const isMetadataVersion = isRecord && (declared !== null
+    || value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION);
+  const basis = declared?.basis ?? COMMUNITY_ALLOWANCE_BASIS;
+  const normalization = declared?.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION;
+  const modelBasis = declared?.modelBasis ?? COMMUNITY_ALLOWANCE_MODEL_BASIS;
+  const planIds = declared?.planIds ?? PUBLIC_ALLOWANCE_PLAN_IDS;
   const hasMetadataBlock = isMetadataVersion
     && Object.prototype.hasOwnProperty.call(value, "modelConfig");
   const hasRetainedCounts = retained && isRecord
@@ -540,9 +580,9 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   ])
       || !COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS.includes(value.schemaVersion)
       || isMetadataVersion !== hasMetadataBlock
-      || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
-      || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
-      || value.modelBasis !== COMMUNITY_ALLOWANCE_MODEL_BASIS
+      || value.basis !== basis || value.referencePlanType !== "pro"
+      || value.normalization !== normalization
+      || value.modelBasis !== modelBasis
       || value.modelGate !== COMMUNITY_ALLOWANCE_MODEL_GATE
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
       || !Array.isArray(value.days) || value.days.length > PUBLIC_BREAKDOWN_DAYS_MAX) return null;
@@ -558,7 +598,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   const allowedDays = new Set(publishedDays);
   const days = [];
   const hasCombined = value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-    || value.schemaVersion === COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION;
+    || isMetadataVersion;
   // A malformed block is ignored whole and reported, never partly trusted: the
   // page then draws only this build's own list, minus any held-back model.
   const metadata = hasMetadataBlock ? publicModelMetadata(value.modelConfig) : null;
@@ -566,7 +606,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   const modelConfig = chartedModelsWith([...(metadata ?? [])].map(
     ([modelId, entry]) => ({ modelId, ...entry })));
   const knownModelIds = new Set([...PUBLIC_ALLOWANCE_MODELS.known, ...modelConfig.map(model => model.modelId)]);
-  // On v1.3 the block is the served catalog's public roster, and the only
+  // On v1.3-v1.5 the block is the served catalog's public roster, and the only
   // authority that can name a held-back roster model. A model a valid block
   // does not name is one the served catalog has not added, and a rejected block
   // names nothing, so in both cases its tuples are not this page's to draw.
@@ -581,10 +621,10 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
     if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
         || (days.length > 0 && row.day <= days.at(-1).day)
-        || !exactObject(row.byPlanType, PUBLIC_ALLOWANCE_PLAN_IDS)
+        || !exactObject(row.byPlanType, planIds)
         || !Array.isArray(row.models) || row.models.length > PUBLIC_BREAKDOWN_MODELS_PER_DAY_MAX) return null;
     const byPlanType = {};
-    for (const id of PUBLIC_ALLOWANCE_PLAN_IDS) {
+    for (const id of planIds) {
       const summary = publicAllowanceSummary(row.byPlanType[id]);
       if (summary === null) return null;
       byPlanType[id] = summary;
@@ -621,6 +661,7 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
   if (carried !== null && unrecognizedModelTuples > 0) return null;
   return {
     generatedAt: value.generatedAt, hasCombined, modelConfig, days,
+    ...(declared !== null ? { basis, normalization, planIds, modelBasis } : {}),
     // Counts only. An unrecognized id is dropped before it reaches this value.
     unrecognizedModelTuples: unrecognizedModelTuples + (carried?.tuples ?? 0),
     unrecognizedModelCount: unrecognizedModelIds.size + (carried?.models ?? 0),
@@ -632,11 +673,17 @@ function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
   }
-  if (candidate.basis !== COMMUNITY_ALLOWANCE_BASIS
-      || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE
-      || candidate.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION) {
+  const legacy = candidate.basis === COMMUNITY_ALLOWANCE_BASIS
+    && candidate.normalization === COMMUNITY_ALLOWANCE_NORMALIZATION;
+  // A declared four-plan basis is accepted only with its own normalization,
+  // and the pair is carried so the day is never read under another basis.
+  const declared = [...DECLARED_BREAKDOWN_CONTRACTS.values()].some(contract =>
+    candidate.basis === contract.basis && candidate.normalization === contract.normalization);
+  if ((!legacy && !declared)
+      || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE) {
     return null;
   }
+  const declaredBasis = declared ? { basis: candidate.basis, normalization: candidate.normalization } : {};
   const fitCount = finite(candidate.fitCount, null);
   const participantCount = finite(candidate.participantCount, null);
   if (!Number.isSafeInteger(fitCount)
@@ -650,7 +697,7 @@ function normalizedDailyAllowance(candidate) {
     if (candidate.centralUsd !== null || candidate.band80Usd !== null) {
       return null;
     }
-    return { fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
+    return { ...declaredBasis, fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
   }
   const centralUsd = finite(candidate.centralUsd, null);
   if (centralUsd === null || centralUsd <= 0) return null;
@@ -668,7 +715,7 @@ function normalizedDailyAllowance(candidate) {
     }
     band80Usd = { lowerUsd, upperUsd };
   }
-  return { fitCount, participantCount, centralUsd, band80Usd };
+  return { ...declaredBasis, fitCount, participantCount, centralUsd, band80Usd };
 }
 
 function normalizedDailyTotals(candidate) {
@@ -970,6 +1017,10 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
   COMMUNITY_DAILY_POLICY_VERSION,
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ALLOWANCE_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PRO10_BASIS,
+  COMMUNITY_ALLOWANCE_PRO10_NORMALIZATION,
+  COMMUNITY_ALLOWANCE_PRO20_PROMAX_BASIS,
+  COMMUNITY_ALLOWANCE_PRO20_PROMAX_NORMALIZATION,
   COMMUNITY_DAILY_SPEND_BASIS,
   ...COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS,
 ].join("|");
@@ -977,9 +1028,9 @@ export const COMMUNITY_DAILY_CACHE_SCHEMA_IDENTITY = [
 function cachedAllowanceBlock(allowance) {
   if (allowance === null) return null;
   return {
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+    basis: allowance.basis ?? COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+    normalization: allowance.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION,
     fitCount: allowance.fitCount,
     participantCount: allowance.participantCount,
     centralUsd: allowance.centralUsd,
@@ -990,21 +1041,22 @@ function cachedAllowanceBlock(allowance) {
 }
 
 function cachedBreakdowns(breakdowns) {
+  // A declared contract (v1.4 Pro 10x, v1.5 Pro 20x with Pro Max) is rebuilt
+  // under its own version, even when its metadata was rejected. Historical
+  // Pro 20x copies keep the prior projection: applied metadata uses v1.3;
+  // rejected metadata uses v1.1 with omitted tuples counted.
+  const [declaredVersion, declared] = [...DECLARED_BREAKDOWN_CONTRACTS]
+    .find(([, contract]) => contract.normalization === breakdowns.normalization) ?? [null, null];
   return {
-    // A copy that keeps an applied metadata block is stored as v1.3, the only
-    // version allowed to carry one, and the version that requires one. A v1.3
-    // read whose block was rejected keeps only v1.1's members (any held-back
-    // model's tuples already left out and counted below), so it is stored
-    // under v1.1.
-    schemaVersion: breakdowns.modelMetadata === "applied"
+    schemaVersion: declaredVersion ?? (breakdowns.modelMetadata === "applied"
       ? COMMUNITY_ALLOWANCE_BREAKDOWN_MODEL_METADATA_VERSION
       : breakdowns.hasCombined
         ? COMMUNITY_ALLOWANCE_BREAKDOWN_COMBINED_VERSION
-        : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0],
-    basis: COMMUNITY_ALLOWANCE_BASIS,
+        : COMMUNITY_ALLOWANCE_BREAKDOWN_SCHEMA_VERSIONS[0]),
+    basis: declared?.basis ?? COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
-    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
-    modelBasis: COMMUNITY_ALLOWANCE_MODEL_BASIS,
+    normalization: declared?.normalization ?? COMMUNITY_ALLOWANCE_NORMALIZATION,
+    modelBasis: declared?.modelBasis ?? COMMUNITY_ALLOWANCE_MODEL_BASIS,
     modelGate: COMMUNITY_ALLOWANCE_MODEL_GATE,
     generatedAt: breakdowns.generatedAt,
     // This build's reviewed catalog is not published data, so it is never
@@ -1012,6 +1064,9 @@ function cachedBreakdowns(breakdowns) {
     // metadata block IS data the stored tuples depend on (a model only it
     // names would otherwise be dropped on the way back in), so exactly the
     // entries it supplied are rebuilt, in the closed wire shape.
+    // v1.4/v1.5 cannot be relabelled as the Pro 20x v1.1 cache shape. A rejected
+    // metadata block remains explicitly rejected under its original contract.
+    ...(declared !== null && breakdowns.modelMetadata !== "applied" ? { modelConfig: null } : {}),
     ...(breakdowns.modelMetadata === "applied" ? {
       modelConfig: breakdowns.modelConfig.filter(model => model.order !== undefined)
         .map(model => ({ id: model.modelId, label: model.label, family: model.family, order: model.order })),

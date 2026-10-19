@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   projectAdminModelHistoryDay, expandAdminModelHistoryDay,
 } from "@app-usagemonitor/telemetry-contract";
@@ -70,4 +71,33 @@ test("70 complete catalog days remain bounded even at maximum count/number seria
   const days = Array.from({ length: 70 }, () => projectAdminModelHistoryDay(day));
   // Leave a separately tested 64 KiB allowance for the outer blended preview.
   assert.ok(Buffer.byteLength(JSON.stringify({ modelConfig: ADMIN_MODEL_CONFIG, days })) < 192 * 1024);
+});
+
+test("known September 29 admin history preserves its catalog and 43rd model without changing uploads", () => {
+  assert.equal(ADMIN_MODEL_CONFIG.length, 42);
+  assert.equal(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "reviewed-model-catalog-2026-09-23.1");
+  assert.equal(SEPTEMBER29_ADMIN_MODEL_CONFIG.length, 43);
+  assert.deepEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42), ADMIN_MODEL_CONFIG);
+  const wire = { ...current(), catalogVersion: SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values: [["gpt-6.1-sol", 1234.5, 1], ["gpt-6-astra", 2000, 2]] };
+  const result = expandAdminModelHistoryDay(wire);
+  assert.equal(result.catalogVersion, wire.catalogVersion);
+  assert.deepEqual(result.byModel["gpt-6.1-sol"], { capacityUsd: 1234.5, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(wire), result);
+  const empty = expandAdminModelHistoryDay({ ...wire, values: [] });
+  assert.deepEqual(empty.byModel["gpt-6.1-sol"], { capacityUsd: null, participantCount: 0 });
+  assert.equal("gpt-6.1-sol" in expandAdminModelHistoryDay(current()).byModel, false);
+  for (const invalid of [
+    { ...wire, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION },
+    { ...wire, catalogVersion: "reviewed-model-catalog-2026-10-01.1" },
+    { ...wire, privatePath: "private-canary" },
+    { ...wire, values: [["gpt-6.1-sol", 1, 3]] },
+    { ...wire, values: [["gpt-6.1-sol", Infinity, 1]] },
+    { ...wire, values: [["gpt-6.1-sol", 1, 1], ["gpt-6.1-sol", 2, 1]] },
+    { ...wire, values: [["unreviewed-model", 1, 1]] },
+    { ...wire, v1ParticipantCount: 0 },
+  ]) {
+    assert.equal(projectAdminModelHistoryDay(invalid), null);
+    assert.equal(browser.projectAdminModelHistoryDay(invalid), null);
+  }
 });

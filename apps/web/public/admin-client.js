@@ -1,5 +1,6 @@
 import {
   ADMIN_MODEL_CONFIG,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG,
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
@@ -47,6 +48,35 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
+const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
+  [ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION]: Object.freeze({
+    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    plans: ADMIN_ALLOWANCE_PREVIEW_PLANS,
+    modelBasis: ADMIN_ALLOWANCE_MODELS_BASIS,
+  }),
+  "admin-community-allowance-preview-v0.4": Object.freeze({
+    basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 10x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 2 }),
+      Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.4 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
+    ]),
+    modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  }),
+  // Owner option B (2026-10-10): every plan in Pro 20x-week units, with Pro
+  // Max 25x at x0.8. A new identity; v0.3 and v0.4 keep their exact contracts.
+  "admin-community-allowance-preview-v0.5": Object.freeze({
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+      Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.8 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+    ]),
+    modelBasis: "seven_day_codex_pro20x_equivalent_per_model_composition_promax25",
+  }),
+});
 const ADMIN_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
@@ -668,6 +698,7 @@ export function projectAdminReconstructionProgress(value) {
   const nullableCount = value => value === null ? null : count(value, code);
   const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
   const candidate = record(value, code);
+  if (candidate.schemaVersion === 4) return projectFullRefreshProgress(candidate, code, closed, nullableTime);
   if (![1, 2, 3].includes(candidate.schemaVersion)) invalid(code);
   // v3 keeps every v2 key and adds `graph`; `preparation` becomes optional
   // there, so a v2 payload relabelled as v3 still fails the closed-key check.
@@ -747,6 +778,68 @@ export function projectAdminReconstructionProgress(value) {
       : {}),
     ...(hasPipeline ? { pipeline: projectPipeline(progress.pipeline, code, closed, nullableTime) } : {}),
   });
+}
+
+/** Full-refresh origin evidence. Unobserved execution and incremental counters
+ * have closed unavailable states; missing cursors and bounded totals are null. */
+function projectFullRefreshProgress(candidate, code, closed, nullableTime) {
+  const nullableCount = value => value === null ? null : count(value, code);
+  const nullableDay = value => value === null ? null : calendarDay(value, code);
+  const unavailable = value => {
+    if (closed(value, ["status"]).status !== "unavailable") invalid(code);
+    return Object.freeze({ status: "unavailable" });
+  };
+  const progress = closed(candidate, ["schemaVersion", "generatedAt", "pipeline", "publication", "work", "history", "graph"]);
+  const pipeline = closed(progress.pipeline, ["ingestion", "delivery", "daily"]);
+  const ingestion = closed(pipeline.ingestion, ["journalHead", "latestRecordedAt", "v12Heads", "v12Days", "pendingActivations"]);
+  const delivery = closed(pipeline.delivery, ["appliedSequence", "pendingChanges", "pendingOwnerActivations", "current"]);
+  const daily = closed(pipeline.daily, ["queuedDays", "oldestQueuedDay", "newestQueuedDay", "lastReleasedAt", "releasedLastHour"]);
+  const publication = closed(progress.publication, ["publishedDays", "latestEvidenceDay", "preview"]);
+  const preview = closed(publication.preview, ["state", "computedAt"]);
+  const work = closed(progress.work, ["currentState", "lastRun", "nextScheduledAt", "scheduleState"]);
+  if (work.currentState !== "unavailable" || work.scheduleState !== "unavailable") invalid(code);
+  let lastRun = null;
+  if (work.lastRun !== null) {
+    const run = closed(work.lastRun, ["state", "startedAt", "finishedAt", "kernelId", "owners", "ownerDays"]);
+    lastRun = Object.freeze({
+      state: enumValue(run.state, new Set(["complete", "failed"]), code),
+      startedAt: nullableTime(run.startedAt), finishedAt: nullableTime(run.finishedAt),
+      kernelId: run.kernelId === null ? null : positiveInteger(run.kernelId, code),
+      owners: count(run.owners, code), ownerDays: count(run.ownerDays, code),
+    });
+    if (lastRun.startedAt === null || lastRun.finishedAt === null || lastRun.finishedAt < lastRun.startedAt) invalid(code);
+  }
+  const projected = Object.freeze({
+    schemaVersion: 4, generatedAt: nullableTime(progress.generatedAt),
+    pipeline: Object.freeze({
+      ingestion: Object.freeze({ journalHead: nullableCount(ingestion.journalHead), latestRecordedAt: nullableTime(ingestion.latestRecordedAt),
+        v12Heads: nullableCount(ingestion.v12Heads), v12Days: nullableCount(ingestion.v12Days), pendingActivations: nullableCount(ingestion.pendingActivations) }),
+      delivery: Object.freeze({ appliedSequence: nullableCount(delivery.appliedSequence), pendingChanges: nullableCount(delivery.pendingChanges),
+        pendingOwnerActivations: nullableCount(delivery.pendingOwnerActivations), current: unavailable(delivery.current) }),
+      daily: Object.freeze({ queuedDays: nullableCount(daily.queuedDays), oldestQueuedDay: nullableDay(daily.oldestQueuedDay),
+        newestQueuedDay: nullableDay(daily.newestQueuedDay), lastReleasedAt: nullableTime(daily.lastReleasedAt), releasedLastHour: count(daily.releasedLastHour, code) }),
+    }),
+    publication: Object.freeze({ publishedDays: count(publication.publishedDays, code), latestEvidenceDay: nullableDay(publication.latestEvidenceDay),
+      preview: Object.freeze({ state: enumValue(preview.state, new Set(["recorded", "unavailable", "not_recorded"]), code), computedAt: nullableTime(preview.computedAt) }) }),
+    work: Object.freeze({ currentState: "unavailable", lastRun, nextScheduledAt: nullableTime(work.nextScheduledAt), scheduleState: "unavailable" }),
+    history: unavailable(progress.history), graph: unavailable(progress.graph),
+  });
+  const { ingestion: head, delivery: sent, daily: queue } = projected.pipeline;
+  const previewRead = projected.publication.preview;
+  if (projected.generatedAt === null || projected.work.nextScheduledAt === null
+      || projected.work.nextScheduledAt <= projected.generatedAt
+      || (head.journalHead === null) !== (head.latestRecordedAt === null)
+      || (sent.appliedSequence !== null && sent.appliedSequence > (head.journalHead ?? 0))
+      || (sent.appliedSequence === null && (sent.pendingChanges !== null || queue.queuedDays !== null))
+      || (sent.pendingChanges === null) !== (sent.pendingOwnerActivations === null)
+      || (sent.pendingChanges === null && queue.queuedDays !== null)
+      || (sent.pendingChanges !== null && sent.pendingOwnerActivations > sent.pendingChanges)
+      || ((queue.queuedDays === null || queue.queuedDays === 0) !== (queue.oldestQueuedDay === null))
+      || (queue.oldestQueuedDay === null) !== (queue.newestQueuedDay === null)
+      || (queue.oldestQueuedDay !== null && queue.oldestQueuedDay > queue.newestQueuedDay)
+      || (projected.publication.publishedDays === 0) !== (projected.publication.latestEvidenceDay === null)
+      || (previewRead.state === "not_recorded") !== (previewRead.computedAt === null)) invalid(code);
+  return projected;
 }
 
 /** Where analytics processing stands, as counts, UTC days and instants only.
@@ -1016,16 +1109,19 @@ function projectAllowancePreviewSummary(value) {
   });
 }
 
-function projectAllowanceModels(value, latestAllowedDay) {
+function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const models = record(value, code);
-  if (models.basis !== ADMIN_ALLOWANCE_MODELS_BASIS
+  if (models.basis !== modelBasis
       || models.gate !== ADMIN_ALLOWANCE_MODELS_GATE) {
     invalid(code);
   }
-  const modelConfig = array(models.modelConfig, code).map((entry, index) => {
+  const suppliedModels = array(models.modelConfig, code);
+  const expectedModels = suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
+    ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_ALLOWANCE_PREVIEW_MODELS;
+  const modelConfig = suppliedModels.map((entry, index) => {
     const model = record(entry, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
+    const expected = expectedModels[index];
     if (!expected
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
@@ -1037,7 +1133,7 @@ function projectAllowanceModels(value, latestAllowedDay) {
     // catalog label without discarding otherwise compatible results.
     return expected;
   });
-  if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
+  if (modelConfig.length !== expectedModels.length) invalid(code);
   let previousDay = "";
   const days = boundedArray(models.days, ADMIN_ALLOWANCE_PREVIEW_DAYS, code).map((entry) => {
     const day = record(entry, code);
@@ -1046,27 +1142,30 @@ function projectAllowanceModels(value, latestAllowedDay) {
     previousDay = dayValue;
     if (day.catalogVersion === undefined) invalid(code);
     const projected = expandAdminModelHistoryDay(day);
-    if (projected === null) invalid(code);
+    if (projected === null
+        || projected.values.some(([modelId]) => !modelConfig.some(model => model.modelId === modelId))) invalid(code);
     return projected;
   });
   if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);
   return Object.freeze({
     modelConfig: Object.freeze(modelConfig),
-    basis: ADMIN_ALLOWANCE_MODELS_BASIS,
+    basis: modelBasis,
     gate: ADMIN_ALLOWANCE_MODELS_GATE,
     days: Object.freeze(days),
   });
 }
 
 /**
- * Fail-closed projection for the owner-only merge trial. The public client does
- * not understand this schema and remains pinned to the published Pro cohort.
+ * Fail-closed projection for the owner-only preview. Version and declared
+ * basis select one exact plan/model contract; published amounts are preserved.
  */
 export function projectAdminAllowancePreview(value) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const preview = record(value, code);
-  if (preview.schemaVersion !== ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION
-      || preview.basis !== ADMIN_ALLOWANCE_PREVIEW_BASIS
+  const contract = Object.hasOwn(ADMIN_ALLOWANCE_PREVIEW_CONTRACTS, preview.schemaVersion)
+    ? ADMIN_ALLOWANCE_PREVIEW_CONTRACTS[preview.schemaVersion] : null;
+  if (contract === null
+      || preview.basis !== contract.basis
       || preview.referencePlanType !== "pro"
       || preview.trailingDays !== 30
       || preview.qualification !== "shared_reset_fit_gates_25pp_span_floor"
@@ -1077,7 +1176,7 @@ export function projectAdminAllowancePreview(value) {
   const to = calendarDay(preview.to, code);
   const plans = array(preview.plans, code).map((value, index) => {
     const plan = record(value, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_PLANS[index];
+    const expected = contract.plans[index];
     if (!expected
         || plan.planType !== expected.planType
         || plan.label !== expected.label
@@ -1086,8 +1185,8 @@ export function projectAdminAllowancePreview(value) {
     }
     return expected;
   });
-  if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
-  const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
+  if (plans.length !== contract.plans.length) invalid(code);
+  const expectedPlanKeys = contract.plans
     .map((plan) => plan.planType)
     .sort();
   const days = array(preview.days, code).map((value, index) => {
@@ -1105,7 +1204,7 @@ export function projectAdminAllowancePreview(value) {
       day: dayValue,
       combined: projectAllowancePreviewSummary(day.combined),
       byPlanType: Object.freeze(Object.fromEntries(
-        ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
+        contract.plans.map((plan) => [
           plan.planType,
           projectAllowancePreviewSummary(byPlanType[plan.planType]),
         ]),
@@ -1118,19 +1217,19 @@ export function projectAdminAllowancePreview(value) {
     invalid(code);
   }
   return Object.freeze({
-    schemaVersion: ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+    schemaVersion: preview.schemaVersion,
     generatedAt: string(preview.generatedAt, code),
     from,
     to,
-    basis: ADMIN_ALLOWANCE_PREVIEW_BASIS,
+    basis: contract.basis,
     referencePlanType: "pro",
     trailingDays: 30,
     qualification: preview.qualification,
-    spanFloorPp: 40,
+    spanFloorPp: preview.schemaVersion === ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION ? 40 : preview.spanFloorPp,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
-    models: projectAllowanceModels(preview.models, to),
+    models: projectAllowanceModels(preview.models, to, contract.modelBasis),
   });
 }
 

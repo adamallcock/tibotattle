@@ -158,6 +158,13 @@ export const ADMIN_MODEL_CONFIG: readonly Readonly<{
   allowanceTrack: "primary" | "spark";
   pricingStatus: "published" | "assumed_alias" | "unpriced";
 }>[];
+export const SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "reviewed-model-catalog-2026-09-29.1";
+export const SEPTEMBER29_ADMIN_MODEL_CONFIG: readonly Readonly<{
+  modelId: (typeof ADMIN_MODEL_CONFIG)[number]["modelId"] | "gpt-6.1-sol";
+  label: string;
+  allowanceTrack: "primary" | "spark";
+  pricingStatus: "published" | "assumed_alias" | "unpriced";
+}>[];
 export const ADMIN_MODEL_HISTORY_CATALOG_VERSION: typeof REVIEWED_MODEL_CATALOG_VERSION;
 export const LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "admin-model-roster-v0.2";
 export function projectAdminModelHistoryDay(value: unknown): AdminModelHistoryDay | null;

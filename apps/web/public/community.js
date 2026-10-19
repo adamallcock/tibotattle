@@ -467,6 +467,8 @@ function renderCommunityAllowanceResult(payload, cache = lastCommunityAllowanceC
     documentRef: document,
     container,
     sourceContainer: $("#community-allowance-source-summary"),
+    headingNode: $("#community-allowance-heading"),
+    heroNode: $("[data-i18n=\"community.allowance.heroCopy\"], [data-i18n=\"community.allowance.pro10.heroCopy\"]"),
     stateNode: $("#community-allowance-state"),
     payload,
     rangeDays: allowanceRangeDays,
