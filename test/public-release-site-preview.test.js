@@ -5,7 +5,11 @@ import { access } from "node:fs/promises";
 import {
   extractPublicReleaseMetadata,
   parsePublicReleaseSitePreviewArgs,
+  safeModelPerformanceQuery,
   startPublicReleaseSitePreview,
+  syntheticCommunityModelPerformance,
+  SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER,
+  SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_LABEL,
 } from "../scripts/preview-public-release-site.js";
 
 const SHA256 = "a".repeat(64);
@@ -33,6 +37,21 @@ const DAILY_PAYLOAD = Object.freeze({
   to: "2026-08-17",
 });
 
+const MODEL_PERFORMANCE_PATH = "/api/v1/community/model-performance";
+const PERIODS = ["1", "7", "30", "all"];
+const SPEED_MODES = ["standard", "fast", "ultrafast"];
+// A minimal published slot as the upstream would return it; the preview passes
+// the bytes through and never interprets them.
+const PERFORMANCE_PAYLOAD = Object.freeze({
+  schemaVersion: "community-model-performance-v1",
+  period: "7",
+  speedMode: "fast",
+  models: [],
+});
+const UNPUBLISHED_PAYLOAD = Object.freeze({
+  error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED" },
+});
+
 const INTEL_META = [
   '<meta name="usage-monitor-intel-installer-url" content="https://downloads.tibotattle.com/TiboTattle-1.2.3-macOS-x64.dmg">',
   '<meta name="usage-monitor-intel-installer-version" content="1.2.3">',
@@ -54,6 +73,29 @@ function publishedFetch(requests) {
     }
     if (url.pathname === "/api/v1/community/daily") {
       return new Response(JSON.stringify(DAILY_PAYLOAD), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+    if (url.pathname === MODEL_PERFORMANCE_PATH) {
+      const speedMode = url.searchParams.get("speedMode");
+      if (speedMode === "ultrafast") {
+        return new Response(JSON.stringify(UNPUBLISHED_PAYLOAD), {
+          headers: { "content-type": "application/json; charset=utf-8" },
+          status: 404,
+        });
+      }
+      if (speedMode === "standard" && url.searchParams.get("period") === "1") {
+        return new Response("<html>not json</html>", {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      if (speedMode === "standard" && url.searchParams.get("period") === "30") {
+        return new Response(JSON.stringify({ error: { code: "BACKEND_STORAGE_UNAVAILABLE" } }), {
+          headers: { "content-type": "application/json; charset=utf-8" },
+          status: 503,
+        });
+      }
+      return new Response(JSON.stringify(PERFORMANCE_PAYLOAD), {
         headers: { "content-type": "application/json; charset=utf-8" },
       });
     }
@@ -237,4 +279,239 @@ test("offline preview neither reads public metadata nor proxies public data", as
   assert.equal(daily.status, 503);
   assert.deepEqual(await daily.json(), { error: { code: "PREVIEW_OFFLINE" } });
   assert.equal(calls, 0);
+});
+
+function previewUrl(base, search) {
+  return new URL(`${MODEL_PERFORMANCE_PATH}${search}`, base);
+}
+
+test("model-performance query admits exactly one canonical enum slot", () => {
+  const query = (search) => safeModelPerformanceQuery(new URL(`http://preview.local/x${search}`));
+  for (const period of PERIODS) {
+    for (const speedMode of SPEED_MODES) {
+      assert.deepEqual(query(`?period=${period}&speedMode=${speedMode}`), { period, speedMode });
+      assert.deepEqual(query(`?speedMode=${speedMode}&period=${period}`), { period, speedMode });
+    }
+  }
+  for (const search of [
+    "",
+    "?period=7",
+    "?speedMode=fast",
+    "?period=7&speedMode=fast&extra=1",
+    "?period=7&period=7&speedMode=fast",
+    "?period=7&speedMode=fast&speedMode=fast",
+    "?period=07&speedMode=fast",
+    "?period=14&speedMode=fast",
+    "?period=ALL&speedMode=fast",
+    "?period=7&speedMode=Fast",
+    "?period=7&speedMode=priority",
+    "?period=7&speed_mode=fast",
+    "?period=7%20&speedMode=fast",
+    "?period=&speedMode=fast",
+  ]) assert.equal(query(search), null, search);
+});
+
+test("live preview forwards only the canonical model-performance slot", async (t) => {
+  const requests = [];
+  const preview = await startPublicReleaseSitePreview({
+    fetchImpl: publishedFetch(requests),
+    upstream: "https://tibotattle.com",
+  });
+  t.after(() => preview.close());
+
+  const published = await fetch(previewUrl(preview.url, "?speedMode=fast&period=7"));
+  assert.equal(published.status, 200);
+  assert.equal(published.headers.get("cache-control"), "no-store");
+  assert.equal(
+    published.headers.get("x-tibotattle-preview"),
+    "generated-source-with-live-public-data",
+  );
+  assert.equal(published.headers.get(SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER), null);
+  assert.deepEqual(await published.json(), PERFORMANCE_PAYLOAD);
+  const forwarded = requests.at(-1);
+  // Rebuilt in canonical order, whatever order the page used.
+  assert.equal(
+    forwarded.url.href,
+    "https://tibotattle.com/api/v1/community/model-performance?period=7&speedMode=fast",
+  );
+  assert.equal(forwarded.options.method, "GET");
+  assert.equal(forwarded.options.redirect, "error");
+  assert.deepEqual(Object.keys(forwarded.options.headers), ["Accept"]);
+  assert.equal(forwarded.options.headers.Accept, "application/json");
+
+  // An explicit unpublished slot reaches the page as the upstream said it.
+  const unpublished = await fetch(previewUrl(preview.url, "?period=all&speedMode=ultrafast"));
+  assert.equal(unpublished.status, 404);
+  assert.deepEqual(await unpublished.json(), UNPUBLISHED_PAYLOAD);
+
+  // Any other upstream failure or a non-JSON answer is a bounded local 502.
+  for (const search of ["?period=30&speedMode=standard", "?period=1&speedMode=standard"]) {
+    const failed = await fetch(previewUrl(preview.url, search));
+    assert.equal(failed.status, 502, search);
+    assert.deepEqual(await failed.json(), { error: { code: "PREVIEW_UPSTREAM_UNAVAILABLE" } });
+  }
+
+  const forwardedCount = requests.length;
+  for (const search of [
+    "",
+    "?period=7",
+    "?period=7&speedMode=fast&extra=1",
+    "?period=7&period=7&speedMode=fast",
+    "?period=14&speedMode=fast",
+    "?period=7&speedMode=Fast",
+  ]) {
+    const rejected = await fetch(previewUrl(preview.url, search));
+    assert.equal(rejected.status, 400, search);
+    assert.deepEqual(await rejected.json(), { error: { code: "INVALID_PREVIEW_QUERY" } });
+  }
+  const rejectedPost = await fetch(previewUrl(preview.url, "?period=7&speedMode=fast"), {
+    method: "POST",
+  });
+  assert.equal(rejectedPost.status, 405);
+  // Sibling paths are not proxied; they fall through to the closed asset map.
+  for (const path of [
+    `${MODEL_PERFORMANCE_PATH}/`,
+    `${MODEL_PERFORMANCE_PATH}s?period=7&speedMode=fast`,
+    "/api/v1/community/model-history?period=7",
+    "/api/v1/admin/performance-intake",
+  ]) {
+    const sibling = await fetch(new URL(path, preview.url));
+    assert.equal(sibling.status, 404, path);
+  }
+  assert.equal(requests.length, forwardedCount);
+});
+
+test("offline preview answers model performance with the labelled synthetic fixture", async (t) => {
+  let calls = 0;
+  const preview = await startPublicReleaseSitePreview({
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("offline preview must not fetch");
+    },
+    offline: true,
+  });
+  t.after(() => preview.close());
+
+  for (const period of PERIODS) {
+    for (const speedMode of SPEED_MODES) {
+      const response = await fetch(
+        previewUrl(preview.url, `?period=${period}&speedMode=${speedMode}`),
+      );
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-tibotattle-preview"), "generated-source-offline");
+      assert.equal(
+        response.headers.get(SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER),
+        SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_LABEL,
+      );
+      assert.deepEqual(
+        await response.json(),
+        syntheticCommunityModelPerformance({ period, speedMode }),
+      );
+    }
+  }
+  const rejected = await fetch(previewUrl(preview.url, "?period=7&speedMode=fast&from=x"));
+  assert.equal(rejected.status, 400);
+  assert.deepEqual(await rejected.json(), { error: { code: "INVALID_PREVIEW_QUERY" } });
+  const head = await fetch(previewUrl(preview.url, "?period=7&speedMode=fast"), {
+    method: "HEAD",
+  });
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), "");
+  // The daily series stays visibly unavailable offline; only model performance
+  // has a synthetic stand-in.
+  const daily = await fetch(
+    new URL("/api/v1/community/daily?from=2026-08-01&to=2026-08-17", preview.url),
+  );
+  assert.equal(daily.status, 503);
+  assert.equal(daily.headers.get(SYNTHETIC_MODEL_PERFORMANCE_FIXTURE_HEADER), null);
+  assert.equal(calls, 0);
+});
+
+const DAY_MS = 86_400_000;
+const SLOT_KEYS = [
+  "schemaVersion", "methodVersion", "population", "approximate", "revision",
+  "generatedAt", "period", "interval", "start", "end", "speedMode",
+  "excludedUnknownTurns", "contributors", "devices", "reports", "models",
+].sort();
+const MODEL_KEYS = [
+  "provider", "modelId", "turns", "speedTurns", "ttftTurns", "timedResponses",
+  "toolFreeTurns", "contributors", "devices", "speed", "ttft",
+].sort();
+const POINT_KEYS = ["day", "n", "unresolved", "p10", "p25", "median", "p75", "p90"].sort();
+const PERCENTILES = ["p10", "p25", "median", "p75", "p90"];
+
+test("synthetic fixture keeps the closed community-model-performance-v1 shape", () => {
+  // This line carries no community contract module, so the closed shape is
+  // restated here; the fixture was checked against parseCommunityModelPerformance
+  // on the client line when it was written.
+  for (const period of PERIODS) {
+    for (const speedMode of SPEED_MODES) {
+      const slot = syntheticCommunityModelPerformance({ period, speedMode });
+      assert.deepEqual(Object.keys(slot).sort(), SLOT_KEYS);
+      assert.equal(slot.schemaVersion, "community-model-performance-v1");
+      assert.equal(slot.methodVersion, "performance-histogram-pool-type7-bounds-v1");
+      assert.equal(slot.population, "reported_samples");
+      assert.equal(slot.approximate, true);
+      assert.equal(slot.period, period);
+      assert.equal(slot.speedMode, speedMode);
+      assert.equal(slot.interval, period === "all" ? "week" : "day");
+      const start = Date.parse(`${slot.start}T00:00:00.000Z`);
+      const end = Date.parse(`${slot.end}T00:00:00.000Z`);
+      if (period !== "all") assert.equal(end - start, (Number(period) - 1) * DAY_MS);
+      assert.ok(slot.devices >= slot.contributors && slot.reports >= slot.devices);
+      assert.ok(slot.models.length > 0);
+      for (const model of slot.models) {
+        assert.deepEqual(Object.keys(model).sort(), MODEL_KEYS);
+        assert.equal(model.provider, "openai_codex");
+        assert.ok(model.contributors <= slot.contributors && model.devices <= slot.devices);
+        assert.ok(model.devices >= model.contributors);
+        assert.ok(model.speedTurns <= model.turns && model.ttftTurns <= model.turns);
+        assert.ok(model.toolFreeTurns <= model.speedTurns);
+        for (const [metric, unit, total] of [
+          ["speed", "tokens_per_second", model.speedTurns],
+          ["ttft", "milliseconds", model.ttftTurns],
+        ]) {
+          const series = model[metric];
+          assert.equal(series.unit, unit);
+          let sum = 0;
+          let previous = -Infinity;
+          for (const point of series.points) {
+            assert.deepEqual(Object.keys(point).sort(), POINT_KEYS);
+            const epoch = Date.parse(`${point.day}T00:00:00.000Z`);
+            assert.ok(epoch > previous && epoch <= end && epoch >= start);
+            if (slot.interval === "week") assert.equal(new Date(epoch).getUTCDay(), 1);
+            previous = epoch;
+            assert.ok(point.n >= 1 && point.unresolved >= 0 && point.unresolved <= point.n);
+            if (metric === "ttft") assert.equal(point.unresolved, 0);
+            let prior = null;
+            for (const name of PERCENTILES) {
+              const quantile = point[name];
+              if (point.n < 5 && name !== "median") {
+                assert.equal(quantile, null);
+                continue;
+              }
+              assert.ok(quantile.lower <= quantile.estimate);
+              assert.ok(quantile.estimate <= quantile.upper);
+              if (prior) {
+                assert.ok(quantile.lower >= prior.lower && quantile.upper >= prior.upper);
+              }
+              prior = quantile;
+            }
+            sum += point.n;
+          }
+          assert.equal(sum, total);
+        }
+      }
+      // Content-free: no identifier-shaped field anywhere in the fixture.
+      assert.doesNotMatch(
+        JSON.stringify(slot),
+        /owner|participant|device_?id|account|session|prompt|path/iu,
+      );
+    }
+  }
+  assert.throws(
+    () => syntheticCommunityModelPerformance({ period: "14", speedMode: "fast" }),
+    /reviewed period/u,
+  );
 });
