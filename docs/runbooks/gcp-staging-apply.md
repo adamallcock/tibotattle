@@ -105,7 +105,8 @@ bucket is absent, the plan instead creates it and defers the binding (finding
 It existed on 2026-10-03, when the staging build staged there. Deferred: the
 service and its two
 invoker bindings (`SERVICE_RENDER_BUCKET_PROOF_UNPINNED`; the owner's Access
-AUD is committed), the three jobs and the scheduler's executor bindings
+AUD is committed), the four jobs (migration, refresh, maintenance and the
+manual reprice job) and the scheduler's executor bindings
 (`BOOTSTRAP_IMAGE_REQUIRED`), the refresh trigger (`SCHEDULER_CADENCE_UNSET`)
 and the maintenance trigger (`BUCKET_PROOF_UNPINNED`). The verifier grant is
 not deferred.
@@ -306,7 +307,7 @@ entries that do not name a staging resource are `custom-role:create` for
 
 Expected plan: exit 0, no findings or blockers, `summary.refused` 0. With
 the secrets and bucket already made, the first plan has 28 executable
-operations and 9 deferred (round 12 retired the Google and Apple sign-in
+operations and 10 deferred (round 12 retired the Google and Apple sign-in
 secrets from CR-3, and with them their two accessor bindings).
 
 - Executable: the accounts, roles, repository, accessor bindings, Cloud SQL,
@@ -314,8 +315,9 @@ secrets from CR-3, and with them their two accessor bindings).
   `roles/storage.objectViewer` on `gs://tibotattle_cloudbuild` (BUILD-SOURCE),
   and the maintenance trigger's create and pause (D-OPS4: apply creates a
   trigger and pauses it in the same apply).
-- Deferred: the service and its two invoker bindings, the three jobs, and
-  the scheduler's executor bindings on both jobs, all on
+- Deferred: the service and its two invoker bindings, the four jobs, and
+  the scheduler's executor bindings on both scheduled jobs (the reprice job
+  has none), all on
   `BOOTSTRAP_IMAGE_REQUIRED`; the refresh trigger on
   `SCHEDULER_CADENCE_UNSET`.
 
@@ -324,7 +326,7 @@ from the `stagingOrigin` block, as the service does (STAGING-MAINT-RENDER),
 so it is no longer an environment deferral. The in-memory rehearsal of this
 pass is the last test of `scripts/gcp-ops-infra-staging-service.check.mjs`:
 its pass 1 binds the builder's read on the existing `tibotattle_cloudbuild`,
-its pass 2 creates the service and its two invoker bindings, the three jobs
+its pass 2 creates the service and its two invoker bindings, the four jobs
 and the scheduler's executor binding on the maintenance job, and the plan
 after it is clean.
 

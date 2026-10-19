@@ -186,12 +186,17 @@ const legacyDispositions = Object.entries(LEGACY_TRANSFER_DISPOSITIONS).map(([ta
   entry("ingestion", table, item.token, item.stage, "runner"));
 
 /**
- * The performance tables: no PostgreSQL target (PF-1 is unpromoted). Round 12
- * retires the performance device and consent routes and answers accountless
- * performance authorization with a definite 4xx, so the owner flag
- * 'performance-routes-retired' is the recorded decision that lets a non-empty
- * sealed table be left behind with its count and digest. Two of them are
- * PT-3's IDENTITY_AUTHORITY_TARGET_MISSING tables, which PT-3 does not receipt.
+ * The D1 performance tables: never transferred. This disposition was recorded
+ * when round 12 retired the performance routes and PostgreSQL had no target.
+ * The owner decision of 2026-10-10 restores accountless performance intake on
+ * PostgreSQL (primary 0079_performance_telemetry.sql), but the D1 rows still
+ * stay behind: D1 held zero performance reports on 2026-10-02, and PostgreSQL
+ * starts its own performance evidence. The 'target-missing' token, the waiver
+ * reason and the owner flag 'performance-routes-retired' are kept unchanged as
+ * the recorded decision that lets a non-empty sealed table be left behind
+ * with its count and digest, so the dispositions and policy digests do not
+ * move. Two of them are PT-3's IDENTITY_AUTHORITY_TARGET_MISSING tables, which
+ * PT-3 does not receipt.
  */
 export const PERFORMANCE_TABLES = Object.freeze([
   "telemetry_performance_runtime", "telemetry_performance_buckets", "telemetry_performance_cohorts",

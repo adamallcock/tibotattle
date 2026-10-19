@@ -73,7 +73,9 @@ export const SEEDED_SINGLETONS = Object.freeze([
   // RD-1 lifecycle-state singleton, seeded never_run.
   seeded("quarantine_reconciliation_state"),
   seeded("retention_state"),
-  // PF-1 migration (number assigned in plan-v5) runtime row, seeded 'staged'.
+  // Primary 0079: the three immutable field dictionaries, and the runtime row
+  // seeded 'staged'.
+  seeded("telemetry_performance_field_dictionaries", 3),
   seeded("telemetry_performance_runtime"),
   seeded("telemetry_transport_formats", 5),
   seeded("telemetry_v12_runtime"),

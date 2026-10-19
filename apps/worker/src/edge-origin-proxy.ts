@@ -13,7 +13,8 @@
  * 1. classifyEdgeRequest decides, without I/O, whether the edge answers the
  *    request itself (www, assets, unknown API paths, the Apple path, admin API
  *    paths on the apex, a method outside the route registry, community/daily
- *    while PUBLIC_ANALYTICS_MODE is not 'enabled'), serves the Sparkle guard
+ *    and community/model-performance while PUBLIC_ANALYTICS_MODE is not
+ *    'enabled'), serves the Sparkle guard
  *    with guardEnv, or forwards it. Local classes and the guard go to the
  *    unchanged handleRequest and never touch a limiter, the token source or
  *    the upstream.
@@ -124,7 +125,7 @@ export type EdgeDistributionMergeSkipReason =
 export const EDGE_PROXY_OPTIONS_INVALID = "EDGE_PROXY_OPTIONS_INVALID";
 
 /**
- * The six admin API route ids. handleRequest answers them 404 on any host but
+ * The seven admin API route ids. handleRequest answers them 404 on any host but
  * the admin host and runs them behind the Access chokepoint there
  * (index.ts handleRequest, admin hostname branch).
  */
@@ -135,6 +136,7 @@ export const EDGE_ADMIN_API_ROUTE_IDS = Object.freeze([
   "admin_database_health",
   "admin_reconstruction_progress",
   "admin_action",
+  "admin_performance_intake",
 ] as const satisfies readonly ExactWorkerRouteId[]);
 
 /**
@@ -248,6 +250,12 @@ export type EdgeOriginProxy = (
 
 const ADMIN_API_ROUTE_ID_SET: ReadonlySet<string> = new Set(EDGE_ADMIN_API_ROUTE_IDS);
 
+/** The public reads handleRequest gates on PUBLIC_ANALYTICS_MODE. */
+const PUBLIC_ANALYTICS_GATED_ROUTE_ID_SET: ReadonlySet<string> = new Set([
+  "community_daily",
+  "community_model_performance",
+] as const satisfies readonly ExactWorkerRouteId[]);
+
 function local(reason: EdgeLocalReason, routeId: WorkerRouteMatch["id"]): EdgeRequestClass {
   return Object.freeze({ kind: "local", reason, routeId });
 }
@@ -278,8 +286,9 @@ export function classifyEdgeRequest(request: Request, localEnv: Env): EdgeReques
     return local("method_not_allowed", route.id);
   }
   // handleRequest answers this before dispatch and without a limiter; the
-  // origin route does not read PUBLIC_ANALYTICS_MODE.
-  if (route.id === "community_daily" && !publicAnalyticsEnabled(localEnv)) {
+  // origin routes do not read PUBLIC_ANALYTICS_MODE.
+  if (PUBLIC_ANALYTICS_GATED_ROUTE_ID_SET.has(route.id)
+      && !publicAnalyticsEnabled(localEnv)) {
     return local("publication_mode_disabled", route.id);
   }
   if (route.id === "sparkle_appcast_guard") {

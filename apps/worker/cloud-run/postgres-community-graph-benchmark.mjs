@@ -80,9 +80,9 @@ export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES = Object.freeze({
   }),
 });
 
-const MIGRATION_COUNT = 78;
-const MIGRATION_PREFIX_TAIL = "0077_analytics_v2_reprice.sql";
-const MIGRATION_TAIL = "0078_classification_link_lookup_indexes.sql";
+const MIGRATION_COUNT = 79;
+const MIGRATION_PREFIX_TAIL = "0078_classification_link_lookup_indexes.sql";
+const MIGRATION_TAIL = "0079_performance_telemetry.sql";
 export const POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT =
   "/app/apps/worker/postgres/migrations";
 const MIGRATION_HISTORY_TABLE = "_tibotattle_migration_history";

@@ -578,7 +578,8 @@
       "required": [
         "production-migrate",
         "analytics-refresh",
-        "maintenance"
+        "maintenance",
+        "analytics-reprice"
       ],
       "properties": {
         "production-migrate": {
@@ -635,6 +636,26 @@
               "type": "integer",
               "minimum": 2,
               "maximum": 50
+            }
+          }
+        },
+        "analytics-reprice": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "maxConnections"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,47}[a-z0-9])?$"
+            },
+            "maxConnections": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 50,
+              "description": "At least the reprice CLI's own pool (ANALYTICS_REPRICE_POOL_MAX); the job is manual and has no trigger"
             }
           }
         }

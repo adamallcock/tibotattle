@@ -41,6 +41,20 @@ import {
   type AnalyticsV2RunResources,
 } from "./contract";
 import { ANALYTICS_V2_NO_EXCLUSIONS_SHA256 } from "./exclusions";
+import { parseCommunityModelPerformance } from "@app-usagemonitor/telemetry-contract";
+import {
+  ANALYTICS_V2_PERFORMANCE_PERIODS,
+  ANALYTICS_V2_PERFORMANCE_PLACEHOLDER_REVISION,
+  ANALYTICS_V2_PERFORMANCE_SLOTS,
+  ANALYTICS_V2_PERFORMANCE_SPEED_MODES,
+  ANALYTICS_V2_PERFORMANCE_WITHHELD_CODES,
+  analyticsV2PerformanceContentSha256,
+  analyticsV2PerformanceSlotKey,
+  type AnalyticsV2PerformanceCandidate,
+  type AnalyticsV2PerformanceStoreErrorCode,
+  type AnalyticsV2PerformanceSummary,
+  type AnalyticsV2PerformanceWithheld,
+} from "./performance-publication-contract";
 import { INTERIM_PUBLIC_READ_ROW_ID, INTERIM_PUBLIC_READ_TABLE } from "./interim-public-read";
 import { validAnalyticsV2KernelEntry, type AnalyticsV2RunStamp } from "./kernel";
 import {
@@ -50,6 +64,7 @@ import {
   ANALYTICS_V2_PRICE_PROJECTION_VERSION,
 } from "./price-attribution";
 import type { AnalyticsV2PriceTransitionProof } from "./price-transition";
+import { analyticsV2OutputRowBytes } from "./resources";
 
 /**
  * REV-SEED's revision-floor tables (primary migration
@@ -159,7 +174,9 @@ export type AnalyticsV2StoreErrorCode =
   | "ANALYTICS_V2_PRICE_TRANSITION_STALE"
   | "ANALYTICS_V2_PRICE_STATE_INVALID"
   // E-OWNERSET (store-owner-sets.ts).
-  | "ANALYTICS_V2_OWNER_SET_CHANGED";
+  | "ANALYTICS_V2_OWNER_SET_CHANGED"
+  // The community model performance heads (performance-publication-contract.ts).
+  | AnalyticsV2PerformanceStoreErrorCode;
 
 /** Safe store failure: a closed code, an optional field path and SQLSTATE. */
 export class AnalyticsV2StoreError extends Error {
@@ -346,6 +363,20 @@ export interface PreparedOutputs {
   readonly lastSequence: number | null;
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
   readonly resources: AnalyticsV2RunResources | null;
+  /** The run's performance publication, validated; null when the run carries none (store.ts writes nothing). */
+  readonly performance: PreparedPerformance | null;
+}
+
+/**
+ * A run's validated performance outputs: the candidates in slot order (all
+ * twelve, or none when the fold withheld), the fold's summary and withhold
+ * code, and the bytes the candidates charged to the run's output account.
+ */
+export interface PreparedPerformance {
+  readonly candidates: readonly AnalyticsV2PerformanceCandidate[];
+  readonly summary: AnalyticsV2PerformanceSummary;
+  readonly withheld: AnalyticsV2PerformanceWithheld | null;
+  readonly chargedBytes: number;
 }
 
 function refusalKey(refusal: AnalyticsV2Refusal): string {
@@ -667,6 +698,9 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
   const lastSequence = outputs.journal.lastSequence === null
     ? null
     : assertNonNegativeSafeInteger(outputs.journal.lastSequence, "journal.lastSequence");
+  const timings = validTimings(outputs.timings, "timings");
+  const resources = validResources(outputs.resources, effective, refusedOwners);
+  const performance = await validPerformance(outputs.performance, nowMs, resources);
 
   return {
     mode: outputs.mode,
@@ -679,9 +713,120 @@ export async function prepareOutputs(outputs: AnalyticsV2RunOutputs, horizon: An
     ownerSets,
     refusals,
     lastSequence,
-    timings: validTimings(outputs.timings, "timings"),
-    resources: validResources(outputs.resources, effective, refusedOwners),
+    timings,
+    resources: chargedResources(resources, performance),
+    performance,
   };
+}
+
+/**
+ * The resource record the run row stores: compute's, with the performance
+ * candidates' bytes added to the output account. validPerformance is their
+ * one charge (the Job runs the fold without an account) and checked that the
+ * account had room for them; this records the same bytes once, so
+ * timings.account.accountBytes is everything the run held until its write.
+ * Unchanged without performance outputs (or with a withheld fold, which
+ * charges nothing).
+ */
+function chargedResources(resources: AnalyticsV2RunResources | null,
+  performance: PreparedPerformance | null): AnalyticsV2RunResources | null {
+  if (resources === null || performance === null || performance.chargedBytes === 0) return resources;
+  return Object.freeze({ ...resources, account: Object.freeze({ ...resources.account,
+    accountBytes: resources.account.accountBytes + performance.chargedBytes }) });
+}
+
+const PERFORMANCE_KEYS = "candidates,summary,withheld";
+const PERFORMANCE_CANDIDATE_KEYS = "payload,payloadSha256,period,speedMode";
+const PERFORMANCE_SUMMARY_COUNTS = Object.freeze(["reports", "cohorts", "includedRecords", "excludedRecords",
+  "excludedUnknownTurns", "deferredFutureDays"] as const);
+const PERFORMANCE_SUMMARY_KEYS = [...PERFORMANCE_SUMMARY_COUNTS, "end"].sort().join(",");
+
+function invalidPerformance(field: string): never {
+  fail("ANALYTICS_V2_PERFORMANCE_OUTPUTS_INVALID", field);
+}
+
+/**
+ * The run's performance outputs (performance-publication-contract.ts
+ * AnalyticsV2PerformanceOutputs), closed: exactly the twelve unique slots
+ * when the fold published, none when it withheld (a closed withhold code);
+ * every payload names its slot, ends on the summary's end (the latest
+ * completed UTC day before nowMs), carries the placeholder revision and
+ * generatedAt the fold writes, parses as community-model-performance-v1 and
+ * digests to its payloadSha256 (refused, never re-derived). Each candidate is
+ * charged to the run's output account (resources.ts analyticsV2OutputRowBytes),
+ * which must stay within its budget; this is the candidates' only charge
+ * (chargedResources records it in the run row). A run without a resource
+ * record has no account to charge. Absent outputs (a pipeline without the
+ * performance stage) are null.
+ */
+async function validPerformance(value: unknown, nowMs: number,
+  resources: AnalyticsV2RunResources | null): Promise<PreparedPerformance | null> {
+  if (value === undefined) return null;
+  if (!plainObject(value) || Object.keys(value).sort().join(",") !== PERFORMANCE_KEYS) invalidPerformance("performance");
+  const withheld = value.withheld;
+  if (withheld !== null && !(ANALYTICS_V2_PERFORMANCE_WITHHELD_CODES as readonly unknown[]).includes(withheld)) {
+    invalidPerformance("performance.withheld");
+  }
+  const summary = value.summary;
+  if (!plainObject(summary) || Object.keys(summary).sort().join(",") !== PERFORMANCE_SUMMARY_KEYS) {
+    invalidPerformance("performance.summary");
+  }
+  for (const name of PERFORMANCE_SUMMARY_COUNTS) {
+    const count = summary[name];
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) invalidPerformance(`performance.summary.${name}`);
+  }
+  const end = analyticsV2UtcDay(nowMs - MILLISECONDS_PER_DAY);
+  if (summary.end !== end) invalidPerformance("performance.summary.end");
+  if (!Array.isArray(value.candidates)) invalidPerformance("performance.candidates");
+  const expected = withheld === null ? ANALYTICS_V2_PERFORMANCE_SLOTS.length : 0;
+  if (value.candidates.length !== expected) invalidPerformance("performance.candidates");
+  const generatedAt = new Date(nowMs).toISOString();
+  const bySlot = new Map<string, AnalyticsV2PerformanceCandidate>();
+  let chargedBytes = 0;
+  for (const candidate of value.candidates as readonly unknown[]) {
+    if (!plainObject(candidate) || Object.keys(candidate).sort().join(",") !== PERFORMANCE_CANDIDATE_KEYS
+        || !(ANALYTICS_V2_PERFORMANCE_PERIODS as readonly unknown[]).includes(candidate.period)
+        || !(ANALYTICS_V2_PERFORMANCE_SPEED_MODES as readonly unknown[]).includes(candidate.speedMode)) {
+      invalidPerformance("performance.candidates");
+    }
+    const slot = analyticsV2PerformanceSlotKey(candidate as unknown as AnalyticsV2PerformanceCandidate);
+    if (bySlot.has(slot)) invalidPerformance("performance.candidates");
+    const payload = candidate.payload;
+    if (!plainObject(payload)) invalidPerformance("performance.candidates.payload");
+    assertJsonValue(payload, "performance.candidates.payload");
+    if (payload.period !== candidate.period || payload.speedMode !== candidate.speedMode || payload.end !== end
+        || payload.revision !== ANALYTICS_V2_PERFORMANCE_PLACEHOLDER_REVISION || payload.generatedAt !== generatedAt) {
+      invalidPerformance("performance.candidates.payload");
+    }
+    try {
+      parseCommunityModelPerformance(payload);
+    } catch {
+      invalidPerformance("performance.candidates.payload");
+    }
+    if (typeof candidate.payloadSha256 !== "string" || !ANALYTICS_V2_SHA256_PATTERN.test(candidate.payloadSha256)) {
+      invalidPerformance("performance.candidates.payloadSha256");
+    }
+    if (await analyticsV2PerformanceContentSha256(payload) !== candidate.payloadSha256) {
+      fail("ANALYTICS_V2_PERFORMANCE_DIGEST_MISMATCH", "performance.candidates.payloadSha256");
+    }
+    chargedBytes += analyticsV2OutputRowBytes(candidate);
+    bySlot.set(slot, Object.freeze({ period: candidate.period as AnalyticsV2PerformanceCandidate["period"],
+      speedMode: candidate.speedMode as AnalyticsV2PerformanceCandidate["speedMode"], payload,
+      payloadSha256: candidate.payloadSha256 }));
+  }
+  if (resources !== null && (!Number.isSafeInteger(resources.account.accountBytes + chargedBytes)
+      || resources.account.accountBytes + chargedBytes > resources.account.outputBudgetBytes)) {
+    fail("ANALYTICS_V2_OUTPUTS_CAPACITY_EXCEEDED", "performance.candidates");
+  }
+  const candidates = ANALYTICS_V2_PERFORMANCE_SLOTS
+    .map((slot) => bySlot.get(analyticsV2PerformanceSlotKey(slot)))
+    .filter((candidate): candidate is AnalyticsV2PerformanceCandidate => candidate !== undefined);
+  return Object.freeze({
+    candidates: Object.freeze(candidates),
+    summary: Object.freeze({ ...(summary as unknown as AnalyticsV2PerformanceSummary) }),
+    withheld: withheld as AnalyticsV2PerformanceWithheld | null,
+    chargedBytes,
+  });
 }
 
 const MEMBER_KEYS = "devices,origin,ownerDigest,savedVersion,values";
@@ -871,13 +1016,22 @@ export interface AnalyticsV2WriteReceipt {
   /** Owners with stored owner-scoped rows this run did not compute; their rows are retained. */
   readonly retainedOwners: number;
   readonly refusals: number;
-  readonly publication: AnalyticsV2PublicationSummary;
+  /** The day heads' summary, plus the performance block when the run carried performance outputs. */
+  readonly publication: AnalyticsV2RunPublicationSummary;
   /** The journal cursor after the run, as a decimal string, or null when absent. */
   readonly cursor: string | null;
   readonly timings: Readonly<Partial<Record<AnalyticsV2Phase, number>>>;
   /** K-PERCARD: the run kernel's cards, the new cards and bases, the price rows and the transitions recorded. */
   readonly prices: AnalyticsV2PriceWriteSummary;
 }
+
+/**
+ * The run row's publication summary: contract.ts AnalyticsV2PublicationSummary,
+ * whose optional performance block (content-free) is present only when the
+ * run carried performance outputs (0059's CHECK accepts extra keys). Kept as
+ * a name for the store's callers.
+ */
+export type AnalyticsV2RunPublicationSummary = AnalyticsV2PublicationSummary;
 
 export interface StoredHeadRow {
   readonly day: string;
@@ -995,7 +1149,7 @@ export async function advanceAnalyticsV2Cursor(client: PostgresClient, schema: s
 export async function insertAnalyticsV2RunRow(client: PostgresClient, schema: string, row: {
   readonly runId: string; readonly startedAtMs: number; readonly finishedAtMs: number;
   readonly mode: AnalyticsV2Mode; readonly owners: number; readonly ownerDays: number;
-  readonly refusals: readonly AnalyticsV2Refusal[]; readonly publication: AnalyticsV2PublicationSummary;
+  readonly refusals: readonly AnalyticsV2Refusal[]; readonly publication: AnalyticsV2RunPublicationSummary;
   readonly timings: Readonly<Record<string, unknown>>;
   readonly stamp: AnalyticsV2RunStamp; readonly compatibilitySha256: string | null;
   readonly exclusionsSha256: string;

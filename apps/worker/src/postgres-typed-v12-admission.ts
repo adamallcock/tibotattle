@@ -32,6 +32,10 @@ import {
   postgresTelemetryV12StorageFailure,
 } from "./postgres-telemetry-v12-storage-refusal";
 import {
+  TELEMETRY_V12_FUTURE_DAY_REFUSAL,
+  telemetryV12FutureDayRetryAfterSeconds,
+} from "./telemetry-v12-day-bound";
+import {
   decodeTelemetryV12Record,
   encodeTelemetryV12Record,
   type TelemetryV12TypedAttribution,
@@ -195,6 +199,16 @@ function currentTime(epoch: number): Date {
     throw new ApiError(400, "CHUNK_INVALID");
   }
   return new Date(epoch);
+}
+
+// The future-day bound: 429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE, paced by
+// retry-after until the day is admissible, with no detail.
+function assertDayAdmissible(day: string, now: Date): void {
+  const retryAfter = telemetryV12FutureDayRetryAfterSeconds(day, now.getTime());
+  if (retryAfter === null) return;
+  throw new ApiError(TELEMETRY_V12_FUTURE_DAY_REFUSAL.status, TELEMETRY_V12_FUTURE_DAY_REFUSAL.code, {
+    responseHeaders: { "retry-after": String(retryAfter) },
+  });
 }
 
 // Classify the raw driver failure inside the transaction helper, before it is
@@ -396,6 +410,10 @@ export async function registerPostgresTypedV12DayManifest(
   try {
     return await withPostgresMutation(pool, async (client) => {
       await assertWriteAllowed(client, schema, principal, now);
+      // The future-day bound (decision 2026-10-12), after the device's own
+      // authority and before any manifest row is read or written; a replay of
+      // a manifest stored before the bound is refused the same way.
+      assertDayAdmissible(manifest.day, now);
       async function registeredCandidate(row: ManifestRow): Promise<PostgresTypedV12DayCandidate> {
         if (row.manifest_json !== canonical || row.parser_version !== manifest.parserVersion
             || integer(row.expected_chunk_count, 0, MAX_TELEMETRY_V12_DAY_CHUNKS) !== manifest.chunks.length) {
@@ -926,6 +944,9 @@ export async function persistPostgresTypedV12StagedChunk(
   try {
     return await withPostgresMutation(pool, async (client) => {
       await assertWriteAllowed(client, schema, principal, now);
+      // The future-day bound; the origin's handler applies it before the
+      // object write too, so this guards every other caller.
+      assertDayAdmissible(day, now);
       const manifestResult = await client.query<ManifestRow>(
         `SELECT id, chunk_day, manifest_digest, expected_chunk_count, parser_version, state, manifest_json, ready_at
            FROM ${table(schema, "telemetry_v12_day_manifests")}

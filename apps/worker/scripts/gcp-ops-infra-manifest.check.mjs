@@ -24,6 +24,7 @@ import {
   parseAnalyticsRefreshArguments,
   readAnalyticsRefreshProductionTarget,
 } from "../cloud-run/analytics-refresh.mjs";
+import { ANALYTICS_REPRICE_POOL_MAX, parseAnalyticsRepriceArguments } from "../cloud-run/analytics-reprice.mjs";
 import * as probeContract from "../cloud-run/ops-probe-contract.mjs";
 import * as maintenanceContract from "../cloud-run/postgres-maintenance-job-contract.mjs";
 import * as configuration from "../cloud-run/postgres-production-configuration.mjs";
@@ -73,6 +74,7 @@ function stagingNames(value) {
   value.jobs["production-migrate"].name = "synthetic-staging-migrate";
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
   value.jobs.maintenance.name = "synthetic-staging-maintenance";
+  value.jobs["analytics-reprice"].name = "synthetic-staging-reprice";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
   value.scheduler.maintenance.name = "synthetic-staging-maintenance-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
@@ -148,8 +150,8 @@ test("the synthetic fixture validates closed, frozen and marked synthetic", () =
   assert.equal(manifest.readDesiredStateFile(FIXTURE_PATH).project, "synthetic-ops-project");
 });
 
-test("the fast path renders exactly three jobs: one owner-cadenced trigger and one pinned to the Worker cron", () => {
-  assert.deepEqual([...manifest.JOB_NAMES], ["production-migrate", "analytics-refresh", "maintenance"]);
+test("the fast path renders exactly four jobs: one owner-cadenced trigger, one pinned to the Worker cron, two manual", () => {
+  assert.deepEqual([...manifest.JOB_NAMES], ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
   assert.deepEqual([...manifest.SCHEDULED_JOB_NAMES], ["analytics-refresh", "maintenance"]);
   assert.deepEqual(Object.keys(manifest.JOB_DEFINITIONS), [...manifest.JOB_NAMES]);
   // The OPS-4 probe jobs (cloud-run/ops-probe-contract.mjs OPS_PROBE_JOBS) are
@@ -163,7 +165,12 @@ test("the fast path renders exactly three jobs: one owner-cadenced trigger and o
     "JOB_NAMES_MISMATCH");
   refused((value) => { delete value.jobs["production-migrate"]; }, "JOB_NAMES_MISMATCH");
   refused((value) => { delete value.jobs.maintenance; }, "JOB_NAMES_MISMATCH");
+  refused((value) => { delete value.jobs["analytics-reprice"]; }, "JOB_NAMES_MISMATCH");
   refused((value) => { delete value.scheduler.maintenance; }, "SCHEDULER_JOBS_MISMATCH");
+  // The reprice job is manual: a trigger for it is refused like any unknown trigger.
+  refused((value) => {
+    value.scheduler["analytics-reprice"] = { name: "synthetic-reprice-trigger", schedule: null, state: "PAUSED" };
+  }, "SCHEDULER_JOBS_MISMATCH");
   refused((value) => {
     value.scheduler["production-migrate"] = { name: "synthetic-migrate-trigger", schedule: null, state: "PAUSED" };
   }, "SCHEDULER_JOBS_MISMATCH");
@@ -263,7 +270,8 @@ test("the trigger state is closed: PAUSED until OPS-3 resumes it, and never ENAB
 test("the analytics-refresh job renders the production refresh-job contract in the dense-workers profile", async () => {
   // The deferral is lifted: every job deploys, and OPS-10 moves each of them.
   assert.deepEqual({ ...manifest.DEFERRED_JOBS }, {});
-  assert.deepEqual([...manifest.deployedJobNames()], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.deepEqual([...manifest.deployedJobNames()],
+    ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
   assert.deepEqual({ ...manifest.ANALYTICS_REFRESH_TASK_PROFILE }, { name: "dense-workers", cpu: "4", memory: "16Gi",
     heapMiB: null, semiSpaceMiB: null, memoryBudgetMiB: 10_752, workers: 4, timeoutSeconds: 86_400 });
   // It is the dense-workers measurement profile, field for field, including
@@ -518,8 +526,10 @@ test("the maintenance job renders C-MAINT's job contract, and CR-3's maintenance
   assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), "STAGING_ORIGIN_UNASSIGNED");
   assert.throws(() => manifest.renderJob(staging, "maintenance", IMAGE), { code: "STAGING_ORIGIN_UNASSIGNED" });
   assert.equal(manifest.jobRenderBlocker(staging, "analytics-refresh"), null, "the refresh reads no plane value");
-  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh", "maintenance"]);
-  assert.deepEqual([...manifest.deployedJobNames(pinned)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.deepEqual([...manifest.deployedJobNames(staging)],
+    ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
+  assert.deepEqual([...manifest.deployedJobNames(pinned)],
+    ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
   // Production keeps its own definition: the staging one is never production's.
   assert.equal(manifest.jobDefinition(pinned, "maintenance"), manifest.JOB_DEFINITIONS.maintenance);
   assert.equal(manifest.jobDefinition(staging, "maintenance"), manifest.STAGING_JOB_DEFINITIONS.maintenance);
@@ -615,17 +625,22 @@ test("the OPS-4 probe contract is consistent with the estate it would be registe
 test("the connection budget is for one instance with no ledger pool and refuses overflow", () => {
   assert.deepEqual(configuration.PRODUCTION_POOL_CONNECTIONS_PER_INSTANCE, { primary: 8 });
   const desired = manifest.validateDesiredState(fixture());
-  // (4 + 4) x 8 + (4 + 2) + 1 + 3 + 10 = 84: the scheduled jobs are the
-  // refresh (4) and the maintenance pass (2); the migration runs alone (1).
+  // (4 + 4) x 8 + (4 + 2) + 1 + 2 + 3 + 10 = 86: the scheduled jobs are the
+  // refresh (4) and the maintenance pass (2); the migration runs alone (1);
+  // the manual reprice job (2) connects before it takes the refresh lock, so
+  // it is budgeted beside them.
   assert.deepEqual({ ...desired.connectionBudget }, {
-    perInstance: 8, instances: 8, serviceConnections: 64, jobBudget: 6, migration: 1,
-    superuserReserved: 3, headroom: 10, total: 84, maxConnections: 100, fits: true,
+    perInstance: 8, instances: 8, serviceConnections: 64, jobBudget: 6, migration: 1, reprice: 2,
+    superuserReserved: 3, headroom: 10, total: 86, maxConnections: 100, fits: true,
   });
-  assert.equal(manifest.validateDesiredState(fixture((value) => { value.cloudSql.maxConnections = 84; }))
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.cloudSql.maxConnections = 86; }))
     .connectionBudget.fits, true);
-  refused((value) => { value.cloudSql.maxConnections = 83; }, "CONNECTION_BUDGET_EXCEEDED");
-  refused((value) => { value.jobs.maintenance.maxConnections = 19; }, "CONNECTION_BUDGET_EXCEEDED");
-  assert.equal(manifest.validateDesiredState(fixture((value) => { value.jobs.maintenance.maxConnections = 18; }))
+  refused((value) => { value.cloudSql.maxConnections = 85; }, "CONNECTION_BUDGET_EXCEEDED");
+  refused((value) => { value.jobs.maintenance.maxConnections = 17; }, "CONNECTION_BUDGET_EXCEEDED");
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.jobs.maintenance.maxConnections = 16; }))
+    .connectionBudget.fits, true);
+  refused((value) => { value.jobs["analytics-reprice"].maxConnections = 17; }, "CONNECTION_BUDGET_EXCEEDED");
+  assert.equal(manifest.validateDesiredState(fixture((value) => { value.jobs["analytics-reprice"].maxConnections = 16; }))
     .connectionBudget.fits, true);
   refused((value) => { value.service.maxInstances = 6; value.service.rolloutOverlapInstances = 6; },
     "CONNECTION_BUDGET_EXCEEDED");
@@ -638,6 +653,112 @@ test("the connection budget is for one instance with no ledger pool and refuses 
     "JOB_POOL_MAX_UNDERDECLARED:analytics-refresh");
   assert.throws(() => manifest.analyticsRefreshPoolMax({ readSource: () => "const POOL_MAX = maybe;" }),
     { code: "ANALYTICS_REFRESH_POOL_MAX_UNRESOLVED" });
+  // The reprice job declares at least its own pool (cloud-run/analytics-reprice.mjs), read from source.
+  assert.equal(manifest.analyticsRepricePoolMax(), ANALYTICS_REPRICE_POOL_MAX);
+  assert.equal(ANALYTICS_REPRICE_POOL_MAX, 2);
+  refused((value) => { value.jobs["analytics-reprice"].maxConnections = 1; },
+    "JOB_POOL_MAX_UNDERDECLARED:analytics-reprice");
+  for (const source of ["export const ANALYTICS_REPRICE_POOL_MAX = maybe;", "",
+    "export const ANALYTICS_REPRICE_POOL_MAX = 2;\nexport const ANALYTICS_REPRICE_POOL_MAX = 3;"]) {
+    assert.throws(() => manifest.analyticsRepricePoolMax({ readSource: () => source }),
+      { code: "ANALYTICS_REPRICE_POOL_MAX_UNRESOLVED" });
+  }
+});
+
+test("the manual reprice job renders the refresh job's identity and closed env, and runs nothing without explicit arguments", () => {
+  const contract = manifest.ANALYTICS_REPRICE_JOB_CONTRACT;
+  const definition = manifest.JOB_DEFINITIONS["analytics-reprice"];
+  assert.deepEqual({ ...definition, args: [...definition.args], env: [...definition.env] }, {
+    account: "runtime",
+    args: ["dist/analytics-reprice.mjs"],
+    timeoutSeconds: 3_600,
+    cpu: "2",
+    memory: "4Gi",
+    env: [...ANALYTICS_REFRESH_PRODUCTION_ENV, "DEPLOYMENT_SOURCE_COMMIT"],
+  });
+  // Same account, same database user and same closed configuration as the
+  // refresh job, and no secret: the CLI reads the refresh job's production target.
+  assert.equal(definition.account, manifest.JOB_DEFINITIONS["analytics-refresh"].account);
+  assert.deepEqual([...contract.configurationEnv], [...manifest.ANALYTICS_REFRESH_JOB_CONTRACT.configurationEnv]);
+  assert.equal(Object.hasOwn(definition, "secrets"), false);
+  assert.equal(manifest.SCHEDULED_JOB_NAMES.includes("analytics-reprice"), false);
+  assert.deepEqual([...contract.modes], ["plan", "execute"]);
+  assert.equal(manifest.ANALYTICS_REPRICE_JOB_KEY, "analytics-reprice");
+  for (const value of [unmarked(), unmarked(stagingNames)]) {
+    const desired = manifest.validateDesiredState(value);
+    assert.equal(manifest.jobRenderBlocker(desired, "analytics-reprice"), null);
+    assert.deepEqual(manifest.jobSecretNames(desired, "analytics-reprice"), []);
+    const job = manifest.renderJob(desired, "analytics-reprice", IMAGE);
+    const outer = job.spec.template.spec;
+    const task = outer.template.spec;
+    const container = task.containers[0];
+    assert.equal(job.metadata.name, desired.jobs["analytics-reprice"].name);
+    assert.equal(outer.taskCount, 1);
+    assert.equal(outer.parallelism, 1);
+    assert.equal(task.maxRetries, 0);
+    assert.equal(task.timeoutSeconds, "3600");
+    assert.equal(task.serviceAccountName, desired.serviceAccounts.runtime.email);
+    assert.deepEqual(container.command, ["node"]);
+    assert.deepEqual(container.args, ["dist/analytics-reprice.mjs"]);
+    assert.deepEqual(container.resources, { limits: { cpu: "2", memory: "4Gi" } });
+    assert.equal(container.image, `${desired.artifactRegistry.imageRepository}@sha256:${IMAGE.imageDigest}`);
+    const env = Object.fromEntries(container.env.map((entry) => [entry.name, entry.value]));
+    const refresh = manifest.renderJob(desired, "analytics-refresh", IMAGE).spec.template.spec.template.spec.containers[0];
+    // Byte-for-byte the refresh job's env: the same target, connection, schema, IAM user and budget.
+    assert.deepEqual(container.env, refresh.env);
+    assert.equal(container.env.some((entry) => Object.hasOwn(entry, "valueFrom")), false);
+    for (const refusedName of contract.refusedEnv) assert.equal(Object.hasOwn(env, refusedName), false, refusedName);
+    // Without the operator verb's explicit override the entry refuses before
+    // any configuration or connection: there is no default mode.
+    assert.throws(() => parseAnalyticsRepriceArguments(container.args.slice(1), env),
+      { code: "ANALYTICS_V2_REPRICE_ARGUMENT_INVALID" });
+    // An explicit override parses under the rendered env, reads the schema
+    // from PRIMARY_SCHEMA and pins no clock; schema and clock overrides refuse.
+    const bounds = ["--from-day=2026-01-01", "--through-day=2026-01-02", "--max-days=2", "--max-members=4",
+      "--max-input-bytes=1024"];
+    const plan = parseAnalyticsRepriceArguments(["--mode=plan", ...bounds], env);
+    assert.equal(plan.schema, desired.cloudSql.schema);
+    assert.equal(plan.nowMs, null);
+    for (const flag of contract.refusedArguments) {
+      assert.throws(() => parseAnalyticsRepriceArguments(["--mode=plan", ...bounds, `${flag}=x`], env),
+        { code: "ANALYTICS_V2_REPRICE_ARGUMENT_FORBIDDEN" }, flag);
+    }
+  }
+});
+
+test("analyticsRepriceTarget gives the reprice verb its closed target from the committed desired state only", async () => {
+  const files = new Map([
+    [manifest.committedDesiredStatePath("production"), JSON.stringify(unmarked())],
+    [manifest.committedDesiredStatePath("staging"), JSON.stringify(unmarked(stagingNames))],
+  ]);
+  const readFile = (target) => {
+    if (!files.has(target)) throw new Error("synthetic: unexpected read");
+    return files.get(target);
+  };
+  const target = manifest.analyticsRepriceTarget("production", { readFile });
+  assert.deepEqual(Object.keys(target), [...manifest.ANALYTICS_REPRICE_TARGET_KEYS]);
+  assert.deepEqual({ ...target }, {
+    environment: "production",
+    project: UNMARKED_PROJECT,
+    region: "us-east1",
+    job: "synthetic-analytics-reprice",
+    refreshJob: "synthetic-analytics-refresh",
+    migrationJob: "synthetic-production-migrate",
+    imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
+    entry: "dist/analytics-reprice.mjs",
+  });
+  assert.equal(Object.isFrozen(target), true);
+  const staging = manifest.analyticsRepriceTarget("staging", { readFile });
+  assert.equal(staging.job, "synthetic-staging-reprice");
+  assert.equal(staging.refreshJob, "synthetic-staging-refresh");
+  assert.throws(() => manifest.analyticsRepriceTarget("test", { readFile }), { code: "GCP_INFRA_ENVIRONMENT_INVALID" });
+  files.set(manifest.committedDesiredStatePath("production"), JSON.stringify(FIXTURE));
+  assert.throws(() => manifest.analyticsRepriceTarget("production", { readFile }), { code: "COMMITTED_DESIRED_STATE_SYNTHETIC" });
+  assert.throws(() => manifest.analyticsRepriceTargetFromDesiredState(manifest.validateDesiredState(fixture())),
+    { code: "ANALYTICS_REPRICE_TARGET_SYNTHETIC_REFUSED" });
+  // The committed files name the plane's own reprice job.
+  assert.equal(manifest.analyticsRepriceTarget("production").job, "tibotattle-analytics-reprice");
+  assert.equal(manifest.analyticsRepriceTarget("staging").job, "tibotattle-staging-analytics-reprice");
 });
 
 test("one Cloud SQL instance: a second instance, a replica or HA is refused", () => {
@@ -1154,8 +1275,11 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
     region: "us-east1",
     service: "synthetic-origin",
     migrationJob: "synthetic-production-migrate",
-    // Every job deploys, so the rollout moves each of them, the maintenance pass included.
-    jobNames: ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance"],
+    // Every job deploys, so the rollout moves each of them, the maintenance
+    // pass and the manual reprice job included (the reprice must run the
+    // rolled kernel).
+    jobNames: ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance",
+      "synthetic-analytics-reprice"],
     primaryInstance: "synthetic-primary",
     imageRepository: `us-east1-docker.pkg.dev/${UNMARKED_PROJECT}/synthetic-images/synthetic-host`,
     builderServiceAccount: `synthetic-builder@${UNMARKED_PROJECT}.iam.gserviceaccount.com`,
@@ -1177,7 +1301,8 @@ test("rolloutTarget gives OPS-10 its closed target from the environment's commit
   const staging = manifest.rolloutTarget("staging", { readFile });
   assert.equal(staging.service, "synthetic-staging-origin");
   assert.deepEqual([...staging.jobNames],
-    ["synthetic-staging-migrate", "synthetic-staging-refresh", "synthetic-staging-maintenance"]);
+    ["synthetic-staging-migrate", "synthetic-staging-refresh", "synthetic-staging-maintenance",
+      "synthetic-staging-reprice"]);
   assert.equal(staging.maintenanceJob, "synthetic-staging-maintenance");
   assert.deepEqual(rollout.validateRolloutTarget(staging, "staging"), staging);
   // Every validated desired state carries the maintenance entry (the job
@@ -1400,7 +1525,8 @@ test("the committed staging desired state loads: a new plane in the shared GCP t
     assert.equal(manifest.jobRenderBlocker(desired, job), null, job);
     assert.equal(manifest.renderJob(desired, job, IMAGE).kind, "Job");
   }
-  assert.deepEqual([...manifest.deployedJobNames(desired)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.deepEqual([...manifest.deployedJobNames(desired)],
+    ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
   assert.deepEqual(desired.scheduler.maintenance, {
     name: "tibotattle-staging-maintenance-trigger", schedule: "* * * * *", state: "PAUSED" });
   // Its refresh job is the entry's production job, and the entry accepts its staging names.

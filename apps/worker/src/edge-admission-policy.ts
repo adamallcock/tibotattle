@@ -153,6 +153,14 @@ const POLICY_ENTRIES = {
     coarseBinding: null,
     clientBinding: "PUBLIC_READ_RATE_LIMIT",
   }),
+  // handleCommunityModelPerformance: the same per-client binding and purpose
+  // as community_daily, so both public reads share one budget.
+  community_model_performance: Object.freeze({
+    helper: "public_read",
+    purpose: "public_aggregate_read",
+    coarseBinding: null,
+    clientBinding: "PUBLIC_READ_RATE_LIMIT",
+  }),
 } as const satisfies EdgeAdmissionPolicy;
 
 /**

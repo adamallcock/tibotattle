@@ -201,6 +201,13 @@ the migration initializes the successor runtime as staged. Reader and production
 composition qualification is tracked in the
 [v1.2 plan](../plans/2026-09-20-turn-boundary-telemetry-plan.md).
 
+The GCP origin bounds v1.2 days against its own clock: a day manifest or chunk
+later than the server's UTC day plus one is refused with
+`429 TELEMETRY_DAY_NOT_YET_ADMISSIBLE` and a `retry-after` until it is
+admissible, and the analytics refresh never plans or publishes a day after its
+UTC day. Past days stay unbounded. See the
+[future-day bound decision](../decisions/2026-10-12-v12-future-day-bound.md).
+
 Parser v17 repairs the existing exact totals while preserving parser v16's
 cache-write assumption. Ingestion-isolation migration
 `0007_usage_correction_admission.sql` preserves the predecessor, completeness,
@@ -239,7 +246,7 @@ calculation requires a separate decision after sufficient collected history.
 day, provider, model, reasoning effort, speed method, speed mode/evidence source
 and API tier. Its independent TPS, TTFT and full-completion histograms retain
 eligible sample counts, conservative integer extrema and speed token/duration
-sums. Completion is positive integer milliseconds; measured zero TTFT is valid. `performance-histogram-v1` fixes the bucket
+sums. Completion is positive integer milliseconds; measured zero TTFT is valid. Each bucket scheme (`performance-histogram-v1`, `performance-histogram-v2`) fixes the bucket
 edges for every contributor/client and includes explicit tails. Counts and integer units remain bounded by
 JavaScript's safe-integer range. Typed storage retains only populated bucket
 indexes/counts, typed cohort dimensions and the bounded integer summaries.
@@ -261,7 +268,94 @@ Timing SQLite schemas advance from 2/3 to 4/5 while parser methods remain 2/3.
 Older writers refuse the upgraded stores. Old rows retain existing TPS/TTFT
 with unavailable new fields. Receipt timing
 wins when qualified; tool-free timing is a single-sample fallback, never a
-second speed sample for the same turn. The field dictionary is `telemetry-performance-registry-2026-09-21.1`.
+second speed sample for the same turn. Clients emit field dictionary `telemetry-performance-registry-2026-09-29.1`.
+
+Readers accept every dictionary in `PERFORMANCE_FIELD_DICTIONARIES`:
+- `…2026-09-21.1` (0.1.24–0.1.26, no Ultrafast; their Ultrafast turns are `other`);
+- `…2026-09-29.1` (0.1.27 onward);
+- `…2026-10-10.1`, which intake accepts although no client emits it. The owner
+  decided on 2026-10-12 against a new client release, so community data stays
+  on the two released dictionaries with v1 buckets
+  ([no new client amendment](../decisions/2026-10-10-community-model-speed.md#no-new-client-amendment-2026-10-12)).
+
+`accepted` means intake accepts a dictionary; transport never advertises a
+dictionary the device did not declare. `PERFORMANCE_EMITTED_BUCKET_SCHEME_VERSION`
+is the bucket scheme of the emitted dictionary. The legacy Cloudflare Worker's
+D1 performance path is pinned to the dictionary its schema admits and does not
+follow the emitted default.
+
+`adaptTelemetryPerformanceRecord` validates a record under its own dictionary
+and returns it in the latest vocabulary by identity.
+
+`performance-histogram-v2`, paired with `…2026-10-10.1`, keeps every v1 edge.
+It resolves speed above 120 tokens/second through about 3,228 tokens/second;
+millisecond bins are unchanged. A record and its three histograms always share
+one scheme. Same-scheme histograms merge exactly. `poolPerformanceHistograms`
+combines v1 and v2 evidence, carrying v1 speed overflow as unresolved mass that
+widens bounds to the observed maximum.
+
+`community-model-performance-v1` is the closed publication shape. It mirrors the
+desktop view per model and speed mode, and each percentile carries an estimate
+plus conservative lower and upper bounds. Per-point sample and unresolved
+counts and contributor, device and report counts are always present; there is
+no contributor minimum. The
+[community model speed decision](../decisions/2026-10-10-community-model-speed.md)
+records these choices.
+
+### Google Cloud origin storage and contracts
+
+On the Google Cloud origin line, primary migration
+`0079_performance_telemetry.sql` (provisional number) implements hosted intake
+and publication in PostgreSQL. It is source only: no live database holds it.
+
+| Object | Contract |
+|---|---|
+| `telemetry_performance_field_dictionaries` | The three accepted dictionaries and their bucket schemes, immutable once seeded. Composite foreign keys carry the pairing to grants, capabilities, reports, cohorts and buckets. A new dictionary needs a migration that lifts the guard trigger around its own insert, plus the matching contract registry row |
+| `telemetry_performance_runtime` | Singleton seeded `staged` at revision 1; moves only to `active` at the next revision, inside the owner activation transaction with its own fresh audit row |
+| Grants and capabilities | Append-only rows; a grant stores its dictionary and `dictionary_basis` (`v12_parser_inference`, `default_no_manifest` pinned to `…2026-09-29.1`, or `client_declared` for v2 grants). The capability echoes the stored dictionary |
+| Reports, cohorts, buckets, receipts | One current report per device and day; replacements supersede, receipts are `accepted` or `replaced`. Speed buckets 0–60 (v1) or 0–95 (v2), TTFT 0–57, turn duration 1–57. `…2026-09-21.1` keeps `turn_context_service_tier`; only its Ultrafast labels are refused. Admission, not the table, bounds `report_day` to the server's UTC day minus 10 through plus 1 (see below) |
+| `telemetry_performance_refusal_counts` | Content-free counters by UTC day, route, closed code and status. A `409 TELEMETRY_RECORD_INVALID` is counted with its closed parser detail appended, for example `TELEMETRY_RECORD_INVALID_REPORT_DAY_OUT_OF_WINDOW` |
+| `analytics_v2_published_performance` | One forward-only head per slot (period 1, 7, 30 or all × Standard, Fast or Ultrafast), holding a verified `community-model-performance-v1` payload and its content digest. The fast-path output digest policy treats its run stamps and release instant as provenance and its slot, revision, payload and digest as semantic (`OUTPUT_DIGEST_POLICY_SHA256` `0634a309…cb5b`) |
+
+Participant-owned rows cascade from `participants` in the offline owner purge.
+The refusal counters and publication heads carry no participant, so they are
+recomputed rather than purged.
+
+**Report-day window.** Origin admission accepts a new report or a
+replacement only when its `day` lies from 10 days before through 1 day after
+the server's UTC day, inclusive
+(`POSTGRES_TELEMETRY_PERFORMANCE_REPORT_DAY_PAST_DAYS` and
+`…_FUTURE_DAYS` in `src/postgres-telemetry-performance-reports.ts`, computed
+from the request clock). Outside it the answer is
+`409 TELEMETRY_RECORD_INVALID` with the closed detail
+`REPORT_DAY_OUT_OF_WINDOW`, which only the refusal counter sees, and nothing
+is written. An exact replay of a stored revision is still idempotent. The
+window covers the client's 7-day backfill (the current day and the last 7
+completed days) plus 2–3 days of skew and offline delay. Widening the client
+backfill requires widening this window first.
+
+Three wire and DTO contracts sit on top:
+
+- **Grant v2.** `accountless-performance-owner-v2` adds
+  `fieldDictionaryVersion` to the v1 body; the origin echoes the exact body.
+  The origin accepts v1 and v2, and the legacy D1 Worker accepts v1 only.
+  Released clients send only v1, and no client release will send v2.
+- **Public read.** `GET /api/v1/community/model-performance` returns one
+  stored slot as `community-model-performance-v1`, re-verified against the
+  head's digest, revision, instant and slot before it is served.
+- **Admin view.** `admin-performance-intake-v0.1` is a closed, content-free
+  DTO of counts, days, instants and closed codes. It requires the run row's
+  performance block to have exactly the keys `deferredEmpty`, `published`,
+  `unchanged` and `withheld`, and answers 503 otherwise, so a change to that
+  block must move the reader and its test together.
+
+The analytics-refresh receipt gains a closed `performance` block (`reports`,
+`cohorts`, `excludedUnknownTurns`, `deferredFutureDays`, `published`,
+`unchanged`, `withheld`, `deferredEmpty`) only on runs that carry the stage.
+`deferredFutureDays` counts distinct days after the window's end that hold a
+current, non-empty report, not reports. The runtime probe's two performance
+gauges are described in [GCP ops probes](../runbooks/gcp-ops-probes.md#performance-intake-and-publication-signals).
+
 The [performance specification](../design/2026-09-20-performance-telemetry-contract.md)
 records the measurement, overlap, policy, delivery, erasure, restore and UI requirements.
 Those gates must not delay continuity collection or alter cache calculations.

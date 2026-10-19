@@ -111,7 +111,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   }
   assert.deepEqual(ids.filter((id) => id.startsWith("scheduler:")), []);
   for (const name of KEPT_SECRETS) assert.ok(ids.includes(`secret:create:${name}`), name);
-  assert.equal(deferred(first).length, 11);
+  assert.equal(deferred(first).length, 12);
   assert.deepEqual(deferred(first), [
     `${BUILD_SOURCE_READER}:BUILD_SOURCE_BUCKET_ABSENT`,
     "run-service:create:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
@@ -120,6 +120,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     "run-job:create:production-migrate:BOOTSTRAP_IMAGE_REQUIRED",
     "run-job:create:analytics-refresh:BOOTSTRAP_IMAGE_REQUIRED",
     "run-job:create:maintenance:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
+    "run-job:create:analytics-reprice:BOOTSTRAP_IMAGE_REQUIRED",
     "scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET",
     `${EXECUTOR}:BOOTSTRAP_IMAGE_REQUIRED`,
     "scheduler:create:maintenance:TELEMETRY_STORAGE_NAMESPACE_UNASSIGNED",
@@ -141,7 +142,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   const applied = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
   // The bucket now exists, so the re-plan apply reports holds its binding as executable.
-  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 1, deferred: 10, refused: 0 });
+  assert.deepEqual(applied.remaining, { planDigest: applied.remaining.planDigest, executable: 1, deferred: 11, refused: 0 });
   const sourceBucket = world.buckets.find((bucket) => bucket.name === BUILD_SOURCE_BUCKET);
   assert.deepEqual([sourceBucket.location, sourceBucket.projectNumber, sourceBucket.iamConfiguration], ["US-EAST1",
     "874229235044", { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: "enforced" }]);
@@ -170,7 +171,8 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-edge-invoker@tibotattle-prod.iam.gserviceaccount.com|",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-verifier@tibotattle-prod.iam.gserviceaccount.com|",
     "run-job:create:production-migrate", "run-job:create:analytics-refresh",
-    "run-job:create:maintenance", "scheduler:create:maintenance", "scheduler:pause:maintenance", MAINTENANCE_EXECUTOR]);
+    "run-job:create:maintenance", "run-job:create:analytics-reprice", "scheduler:create:maintenance",
+    "scheduler:pause:maintenance", MAINTENANCE_EXECUTOR]);
   assert.deepEqual(deferred(second).filter((entry) => entry.endsWith(":SCHEDULER_CADENCE_UNSET")), [
     "scheduler:create:analytics-refresh:SCHEDULER_CADENCE_UNSET", `${EXECUTOR}:SCHEDULER_CADENCE_UNSET`]);
   operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: second.planDigest, bootstrap: IMAGE,
@@ -192,7 +194,7 @@ test("the production apply rehearsal (in memory): birth, pass 1, pins and pass 2
   assert.deepEqual(world.schedulerJobs.map((job) => [job.name.split("/").at(-1), job.state, job.httpTarget.headers]),
     [[MAINTENANCE_TRIGGER, "PAUSED", INJECTED_SCHEDULER_HEADERS]]);
   assert.deepEqual([executorOn(world, "tibotattle-analytics-refresh"), executorOn(world, "tibotattle-maintenance"),
-    executorOn(world, "tibotattle-migrate")], [false, true, false]);
+    executorOn(world, "tibotattle-migrate"), executorOn(world, "tibotattle-analytics-reprice")], [false, true, false, false]);
   // The default maintenance job syncs public GitHub inventory without a token.
   const maintenanceJob = world.jobs.find((job) => job.metadata.name === "tibotattle-maintenance");
   assert.deepEqual(maintenanceJob.spec.template.spec.template.spec.containers[0].env
@@ -221,22 +223,22 @@ test("BUILD-SOURCE: when tibotattle-prod_cloudbuild already exists, pass 1 binds
   withCloudBuildBucket(world, { project: desired.project, projectNumber: desired.projectNumber });
   const plan = (options = {}) => operations.planInfrastructure(desired,
     operations.readbackInfrastructure(desired, { runner: gcloud.runner }), options);
-  // Step 3 (before the birth) and step 5 (pass 1): 30 executable, 10 deferred, no BUILD_SOURCE finding.
+  // Step 3 (before the birth) and step 5 (pass 1): 30 executable, 11 deferred, no BUILD_SOURCE finding.
   const before = plan();
   assert.deepEqual([before.findings, executable(before).length, deferred(before).length],
-    [["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"], 30, 10]);
+    [["BUCKET_ABSENT", "BUCKET_PROOF_UNPINNED"], 30, 11]);
   world.buckets.push(bornBucket({ name: desired.bucket.name, location: desired.bucket.location,
     generation: PROOF.bucketGeneration, extra: { projectNumber: desired.projectNumber } }));
   desired = production((value) => { value.bucket.proof = { ...PROOF }; });
   const first = plan();
   assert.deepEqual([first.findings, first.blockers, executable(first).length, deferred(first).length],
-    [[], [], 30, 10]);
+    [[], [], 30, 11]);
   assert.ok(executable(first).includes(BUILD_SOURCE_READER));
   assert.equal(first.operations.some((entry) => entry.id === "build-source-bucket:create"), false);
   const applied = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: first.planDigest,
     createSpecWriter: () => writer.create() });
   // Step 5's remaining executable is 0, so there is no pass 1b (approval 4b) to run.
-  assert.deepEqual({ ...applied.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 10, refused: 0 });
+  assert.deepEqual({ ...applied.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 11, refused: 0 });
   assert.deepEqual(world.bucketPolicies[BUILD_SOURCE_BUCKET].bindings.filter((binding) =>
     binding.role === "roles/storage.objectViewer"), [{ role: "roles/storage.objectViewer",
     members: ["serviceAccount:tibotattle-builder@tibotattle-prod.iam.gserviceaccount.com"] }]);
@@ -266,7 +268,7 @@ test("a cadence the owner commits later (synthetic here) is created paused after
 
   // Pass 1 with no cadence creates no trigger (the production-scale measurement comes first).
   const first = plan();
-  assert.deepEqual([executable(first).length, deferred(first).length], [30, 11]);
+  assert.deepEqual([executable(first).length, deferred(first).length], [30, 12]);
   apply(first.planDigest);
   assert.deepEqual(world.schedulerJobs, []);
 
@@ -278,7 +280,7 @@ test("a cadence the owner commits later (synthetic here) is created paused after
   desired = production(pinned(null));
   const second = plan({ bootstrap: IMAGE });
   apply(second.planDigest, { bootstrap: IMAGE });
-  assert.deepEqual([refreshTriggers().length, world.jobs.length, granted()], [0, 3, false]);
+  assert.deepEqual([refreshTriggers().length, world.jobs.length, granted()], [0, 4, false]);
 
   // After the measurement the owner commits a cadence. A later plan has a new digest and creates the
   // trigger, pauses it at once, and only then grants the account run.jobsExecutor: the order that

@@ -13,7 +13,10 @@
   ],
   "properties": {
     "schemaVersion": {
-      "const": "performance-histogram-v1"
+      "enum": [
+        "performance-histogram-v1",
+        "performance-histogram-v2"
+      ]
     },
     "metric": {
       "enum": [
@@ -77,11 +80,6 @@
       },
       "then": {
         "properties": {
-          "buckets": {
-            "propertyNames": {
-              "pattern": "^(?:0|[1-9]|[1-5]\\d|60)$"
-            }
-          },
           "min": {
             "anyOf": [
               {
@@ -105,6 +103,48 @@
                 "maximum": 9007199254740991
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {
+            "const": "performance-histogram-v1"
+          },
+          "metric": {
+            "const": "speed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "propertyNames": {
+              "pattern": "^(?:0|[1-9]|[1-5]\\d|60)$"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schemaVersion": {
+            "const": "performance-histogram-v2"
+          },
+          "metric": {
+            "const": "speed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "buckets": {
+            "propertyNames": {
+              "pattern": "^(?:0|[1-9]|[1-8]\\d|9[0-5])$"
+            }
           }
         }
       }
@@ -238,5 +278,5 @@
       }
     }
   ],
-  "$comment": "Speed bins are half-open [0,2), [2,4), through [118,120), with overflow >=120 tokens/second; TTFT has [0,1ms), [1,500ms), logarithmic upper-exclusive bins through the final edge, and overflow at or above that edge; turnDuration uses the same positive millisecond bins and never occupies bucket 0. Runtime additionally requires sparse bucket counts to sum to sampleCount, non-empty extrema to be ordered and occupied-bin compatible, singleton TTFT extrema to be equal, singleton speed extrema to differ by at most one centi-TPS, and metric-specific units to match the selected bucket scheme."
+  "$comment": "performance-histogram-v1 speed bins are half-open [0,2), [2,4), through [118,120), with overflow >=120 tokens/second; performance-histogram-v2 keeps those 60 bins, adds 10 tokens/second bins through 300 and bins with upper edges ceil(30000*1.15^k) centi-tokens/second for k=1..17 (through 322838), with overflow at the final edge; both schemes share every millisecond bin. TTFT has [0,1ms), [1,500ms), logarithmic upper-exclusive bins through the final edge, and overflow at or above that edge; turnDuration uses the same positive millisecond bins and never occupies bucket 0. Runtime additionally requires sparse bucket counts to sum to sampleCount, non-empty extrema to be ordered and occupied-bin compatible, singleton TTFT extrema to be equal, singleton speed extrema to differ by at most one centi-TPS, and metric-specific units to match the selected bucket scheme."
 }

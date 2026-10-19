@@ -25,9 +25,16 @@
 // run_maintenance over C-MAINT's lifecycle pass (the ADMIN-R12 path) answers
 // and audits a refused or skipped pass as the Worker does, never as 200; and
 // the admin run_maintenance task reports and audits the lifecycle pass's
-// folded purges under the Worker's keys (MAINT-PURGE); and the retired
-// accountless performance authorization answers d43c8f92's sequence (owner
-// round 19) for a really enrolled accountless device, then its definite 403.
+// folded purges under the Worker's keys (MAINT-PURGE); and the restored
+// performance intake (owner decision 2026-10-10, decision 1) answers the
+// Worker's sequence for a really enrolled accountless device: 403
+// TELEMETRY_TRANSPORT_BLOCKED on the grant, capabilities and report upload
+// while the runtime is staged (counted, never granted, never a 5xx), then,
+// after the owner-only activation task (SPD-G5) runs through the admin
+// action, a 201 grant and a 200 capability; and (FIX-FUTURE-V12) the
+// released desktop client meets a v1.2 day after the server's UTC day plus
+// one as a paced 429 that its scheduler waits out without pausing, then
+// resumes from its kept journal once the day is admissible.
 import assert from "node:assert/strict";
 import { after, mock, test } from "node:test";
 import { createHash, randomBytes, randomUUID, webcrypto } from "node:crypto";
@@ -40,6 +47,14 @@ import pg from "pg";
 import { createServer } from "vite";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { verifyEdgeOriginBeforeGcp } from "../scripts/production-edge-mode.mjs";
+import {
+  canonicalTelemetryV12Json,
+  telemetryV12DayManifestDigestInput,
+  telemetryV12RequiredConsent,
+} from "@app-usagemonitor/telemetry-contract";
+import { runTelemetryV12Sync } from "../test/helpers/contribution-v12-runner.js";
+import { createTelemetryV12Envelope } from "../../../src/platform/telemetry-v12-envelope.js";
+import { createAccountlessContributionScheduler } from "../../../src/application/accountless-contribution-scheduler.js";
 
 const PG_TEST_SOCKET = process.env.PG_TEST_SOCKET;
 const PG_TEST_PORT = Number(process.env.PG_TEST_PORT ?? "55432");
@@ -270,8 +285,8 @@ function base64UrlJson(value) {
 }
 
 /** A signed-shape synthetic ID token; Cloud Run's front end replaces the signature. */
-function identityToken(email) {
-  const now = Math.floor(Date.now() / 1000);
+function identityToken(email, nowMs = Date.now()) {
+  const now = Math.floor(nowMs / 1000);
   return [
     base64UrlJson({ alg: "RS256", kid: "0".repeat(40), typ: "JWT" }),
     base64UrlJson({ aud: AUDIENCE, azp: "100000000000000000000", email, email_verified: true, exp: now + 3_000,
@@ -287,9 +302,10 @@ function frontEndToken(bearer) {
   return `${scheme} ${header}.${payload}.SIGNATURE_REMOVED_BY_GOOGLE`;
 }
 
-function edgeHeaders({ email = INVOKER, hostKind = "apex", admission = null, requestId = randomUUID() } = {}) {
+function edgeHeaders({ email = INVOKER, hostKind = "apex", admission = null, requestId = randomUUID(),
+  tokenNowMs = Date.now() } = {}) {
   return {
-    "x-serverless-authorization": frontEndToken(`Bearer ${identityToken(email)}`),
+    "x-serverless-authorization": frontEndToken(`Bearer ${identityToken(email, tokenNowMs)}`),
     "x-tibotattle-edge-host": hostKind,
     "x-tibotattle-edge-request-id": requestId,
     ...(admission === null ? {} : { "x-tibotattle-edge-admission": admission }),
@@ -436,7 +452,7 @@ test("the storage gate rereads the receipt on every request: drift and a newer s
   await refusedNow("newer schema");
 }));
 
-test("round 12: retired routes are the closed 503, the performance authorization never the uniform 503, the admin host open", {
+test("round 12: retired routes are the closed 503, the performance intake served (decision 1), the admin host open", {
   skip: SKIP, timeout: 300_000,
 }, () => withProductionHost(async ({ port }) => {
   for (const [label, method, path, hostKind, extra] of [
@@ -445,10 +461,7 @@ test("round 12: retired routes are the closed 503, the performance authorization
     ["Apple sign-in start", "POST", "/api/v1/identity/apple/start", "apex", { "content-type": "application/json" }],
     ["legacy enroll", "POST", "/api/v1/enroll", "apex", { "content-type": "application/json" }],
     ["security reset", "POST", "/api/v1/me/security-reset", "apex", { "content-type": "application/json" }],
-    ["performance capabilities", "GET", "/api/v1/device/telemetry/performance/capabilities", "apex", {}],
     ["performance consent", "POST", "/api/v1/me/device-telemetry-performance-consents", "apex",
-      { "content-type": "application/json" }],
-    ["performance reports", "POST", "/api/v1/device/telemetry/performance/reports", "apex",
       { "content-type": "application/json" }],
   ]) {
     const requestId = randomUUID();
@@ -459,27 +472,60 @@ test("round 12: retired routes are the closed 503, the performance authorization
     assert.equal(answer.headers["retry-after"], undefined, `${label}: no retry-after (OD-CR-6 iv)`);
     assertNoStoreMarked(answer, label);
   }
-  // The accountless performance authorization: never the uniform 503. An unknown
-  // bearer stops at production's device-bearer step (round 19; the whole
+  // The restored performance intake (decision 1): never the uniform 503. An
+  // unknown bearer is the Worker's 401 DEVICE_AUTH_INVALID on all three
+  // routes (S4 parity: no storage or runtime 5xx comes first; the whole
   // sequence is the next test).
+  for (const [method, path, admission] of [
+    ["POST", "/api/v1/accountless/telemetry-performance-authorization", "v1;accountless_ownership;allowed"],
+    ["GET", "/api/v1/device/telemetry/performance/capabilities", "v1;device_sync;allowed"],
+    ["GET", "/api/v1/device/telemetry/performance/reports", "v1;device_sync;allowed"],
+    ["POST", "/api/v1/device/telemetry/performance/reports", "v1;device_sync;allowed"],
+  ]) {
+    const requestId = randomUUID();
+    const answer = await send(port, { method, path, ...(method === "POST" ? { body: "{}" } : {}),
+      headers: { ...edgeHeaders({ requestId, admission }),
+        ...(method === "POST" ? { "content-type": "application/json" } : {}),
+        authorization: "Device um_device_synthetic.unknown" } });
+    assert.equal(answer.status, 401, `${method} ${path}: ${answer.text}`);
+    assert.deepEqual(JSON.parse(answer.text), { error: { code: "DEVICE_AUTH_INVALID", requestId } }, path);
+    assert.equal(answer.headers["retry-after"], undefined, path);
+    assertNoStoreMarked(answer, `${method} ${path}`);
+  }
+  // The owner-decided public read (2026-10-10): before the first
+  // publication every slot is the Worker's 404, no-store, never a 5xx.
+  for (const query of ["?period=7&speedMode=fast", "?speedMode=ultrafast&period=all"]) {
+    const requestId = randomUUID();
+    const answer = await send(port, { method: "GET", path: `/api/v1/community/model-performance${query}`,
+      headers: edgeHeaders({ requestId, admission: "v1;public_aggregate_read;allowed" }) });
+    assert.equal(answer.status, 404, `${query}: ${answer.text}`);
+    assert.deepEqual(JSON.parse(answer.text),
+      { error: { code: "COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED", requestId } }, query);
+    assertNoStoreMarked(answer, `model-performance ${query}`);
+  }
   {
     const requestId = randomUUID();
-    const answer = await send(port, { method: "POST", path: "/api/v1/accountless/telemetry-performance-authorization",
-      body: "{}", headers: { ...edgeHeaders({ requestId, admission: "v1;accountless_ownership;allowed" }),
-        "content-type": "application/json", authorization: "Device um_device_synthetic.unknown" } });
-    assert.equal(answer.status, 401, answer.text);
-    assert.deepEqual(JSON.parse(answer.text), { error: { code: "DEVICE_AUTH_INVALID", requestId } });
-    assert.equal(answer.headers["retry-after"], undefined);
-    assertNoStoreMarked(answer, "performance authorization");
+    const refused = await send(port, { method: "GET", path: "/api/v1/community/model-performance?period=14",
+      headers: edgeHeaders({ requestId, admission: "v1;public_aggregate_read;allowed" }) });
+    assert.equal(refused.status, 400, refused.text);
+    assert.deepEqual(JSON.parse(refused.text), { error: { code: "BODY_INVALID", requestId } });
+    assertNoStoreMarked(refused, "model-performance bad slot");
   }
   // ADMIN-R12: the admin host runs the Access chokepoint; a forged assertion is the Worker's 403.
-  {
+  for (const path of ["/api/v1/admin/overview", "/api/v1/admin/performance-intake"]) {
     const requestId = randomUUID();
-    const answer = await send(port, { method: "GET", path: "/api/v1/admin/overview",
+    const answer = await send(port, { method: "GET", path,
       headers: { ...edgeHeaders({ hostKind: "admin", requestId }), "cf-access-jwt-assertion": "synthetic.access.assertion" } });
     assert.equal(answer.status, 403, answer.text);
     assert.equal(JSON.parse(answer.text).error.code, "ACCESS_REQUIRED");
-    assertNoStoreMarked(answer, "admin host");
+    assertNoStoreMarked(answer, `admin host ${path}`);
+  }
+  // The admin view is never served on the apex.
+  {
+    const answer = await send(port, { method: "GET", path: "/api/v1/admin/performance-intake",
+      headers: edgeHeaders({ requestId: randomUUID() }) });
+    assert.equal(answer.status, 404, answer.text);
+    assert.equal(JSON.parse(answer.text).error.code, "NOT_FOUND");
   }
   // OD-CR-6 (ii), accepted: a query string on a v1.2 POST route or on the
   // upload-authorization route is refused, where the Worker ignores it; (i)
@@ -517,10 +563,12 @@ function deviceSecretHash(deviceId, secret) {
   return createHash("sha256").update(`app-usagemonitor/device/v1\0${deviceId}\0`).update(secret).digest();
 }
 
-test("round 19: the performance authorization answers d43c8f92's sequence for a real accountless device, then 403", {
+test("decision 1: the performance intake answers the Worker's sequence for a real accountless device, 403 while staged", {
   skip: SKIP, timeout: 300_000,
-}, () => withProductionHost(async ({ base, t, port }) => {
+}, () => withProductionHost(async ({ m, base, t, port, primarySchema, objectStore }) => {
   const PATH = "/api/v1/accountless/telemetry-performance-authorization";
+  const CAPABILITIES = "/api/v1/device/telemetry/performance/capabilities";
+  const REPORTS = "/api/v1/device/telemetry/performance/reports";
   const validBody = JSON.stringify({ schemaVersion: "accountless-performance-owner-v1",
     policyVersion: "accountless-telemetry-performance-policy-v1", authorizationBasis: "accountless-performance-policy-v1" });
   // A shipped accountless installation enrolls and binds its owner through
@@ -543,18 +591,27 @@ test("round 19: the performance authorization answers d43c8f92's sequence for a 
   const usedBefore = (await base.query(`SELECT last_used_at FROM ${t("device_credentials")} WHERE id = $1`,
     [deviceId])).rows[0].last_used_at;
 
-  const ask = async ({ admission = "v1;accountless_ownership;allowed", authorization = bearer, cookie,
-    contentType = "application/json", body = validBody } = {}) => {
+  const exchange = async ({ method = "POST", path = PATH, admission = "v1;accountless_ownership;allowed",
+    authorization = bearer, cookie, contentType = "application/json", body = validBody } = {}) => {
     const requestId = randomUUID();
-    const answer = await send(port, { method: "POST", path: PATH, body,
+    const answer = await send(port, { method, path, ...(method === "POST" ? { body } : {}),
       headers: { ...edgeHeaders({ requestId, admission }), ...(authorization === null ? {} : { authorization }),
-        ...(cookie === undefined ? {} : { cookie }), ...(contentType === null ? {} : { "content-type": contentType }) } });
+        ...(cookie === undefined ? {} : { cookie }),
+        ...(contentType === null || method !== "POST" ? {} : { "content-type": contentType }) } });
     assertNoStoreMarked(answer, `${answer.status} ${answer.text}`);
+    return { answer, requestId };
+  };
+  const ask = async (options) => {
+    const { answer, requestId } = await exchange(options);
     assert.equal(JSON.parse(answer.text).error.requestId, requestId);
     return { status: answer.status, code: errorOf(answer)?.code, retryAfter: answer.headers["retry-after"] ?? null };
   };
-  // Every check passes: production's terminal answer, no retry-after.
-  assert.deepEqual(await ask(), { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", retryAfter: null });
+  const device = (method, path, options = {}) => ask({ method, path, admission: "v1;device_sync;allowed",
+    ...(method === "POST" ? {} : { body: undefined }), ...options });
+  const blocked = { status: 403, code: "TELEMETRY_TRANSPORT_BLOCKED", retryAfter: null };
+  // Every check passes while the runtime is staged (0079's seed): G2's staged
+  // answer, no retry-after, nothing written.
+  assert.deepEqual(await ask(), blocked);
   // Like the Worker's authenticateDevice, the accepted bearer was used.
   const usedAfter = (await base.query(`SELECT last_used_at FROM ${t("device_credentials")} WHERE id = $1`,
     [deviceId])).rows[0].last_used_at;
@@ -573,7 +630,7 @@ test("round 19: the performance authorization answers d43c8f92's sequence for a 
     assert.deepEqual(await ask({ authorization, contentType: "text/plain", body: "x" }),
       { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null }, String(authorization));
   }
-  // Step 8: the body.
+  // Steps 10 and 11: the body, after authentication.
   assert.deepEqual(await ask({ contentType: "text/plain" }), { status: 415, code: "CONTENT_TYPE_INVALID", retryAfter: null });
   for (const body of ["{}", "{", JSON.stringify({ ...JSON.parse(validBody), extra: true })]) {
     assert.deepEqual(await ask({ body }), { status: 400, code: "BODY_INVALID", retryAfter: null }, body);
@@ -587,15 +644,141 @@ test("round 19: the performance authorization answers d43c8f92's sequence for a 
   await base.query(`UPDATE ${t("collection_controls")}
       SET revision = revision + 1, control_state = 'operational', upload_registration_enabled = true, updated_at = $1
     WHERE singleton = 1`, [new Date().toISOString()]);
-  // Step 7 again: a revoked device is the neutral 401, as the Worker answers it.
+  // The device routes for the same device while staged: capabilities 403,
+  // the report read 200 (nothing stored), a well-formed report upload 403
+  // before any decryption, a cookie or an unknown bearer the neutral 401.
+  assert.deepEqual(await device("GET", CAPABILITIES), blocked);
+  {
+    const { answer } = await exchange({ method: "GET", path: REPORTS, admission: "v1;device_sync;allowed" });
+    assert.equal(answer.status, 200, answer.text);
+    assert.deepEqual(JSON.parse(answer.text), { schemaVersion: "telemetry-performance-read-v1",
+      population: "reported_samples", reports: [] });
+  }
+  const envelope = JSON.stringify({ schemaVersion: "telemetry-performance-envelope-v1", synthetic: false, keyId: KEY_ID,
+    wrappedKey: "A".repeat(342), iv: "A".repeat(16), ciphertext: "A".repeat(32) });
+  assert.deepEqual(await device("POST", REPORTS, { body: envelope }), blocked);
+  assert.deepEqual(await device("POST", REPORTS, { body: "{}" }), { status: 400, code: "ENVELOPE_INVALID", retryAfter: null });
+  assert.deepEqual(await device("GET", CAPABILITIES, { cookie: "theme=dark" }),
+    { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
+  assert.deepEqual(await device("GET", CAPABILITIES, { authorization: "Device not-a-bearer" }),
+    { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
+  // Nothing was granted. Primary 0079 created the performance intake tables
+  // and publication heads; the runtime is still staged at its seeded
+  // revision, and no grant, capability, report or receipt names this device.
+  const performanceTables = await base.query(`SELECT table_name FROM information_schema.tables
+    WHERE table_schema = $1 AND table_name LIKE '%performance%'`, [primarySchema]);
+  assert.deepEqual(performanceTables.rows.map((row) => row.table_name).sort(), [
+    "accountless_telemetry_performance_authorizations",
+    "analytics_v2_published_performance",
+    "telemetry_performance_buckets",
+    "telemetry_performance_cohorts",
+    "telemetry_performance_device_capabilities",
+    "telemetry_performance_field_dictionaries",
+    "telemetry_performance_receipts",
+    "telemetry_performance_refusal_counts",
+    "telemetry_performance_reports",
+    "telemetry_performance_runtime",
+  ]);
+  assert.deepEqual((await base.query(`SELECT state, policy_revision FROM ${t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "staged", policy_revision: 1 }]);
+  for (const table of ["accountless_telemetry_performance_authorizations", "telemetry_performance_device_capabilities",
+    "telemetry_performance_reports", "telemetry_performance_receipts", "analytics_v2_published_performance"]) {
+    assert.equal((await base.query(`SELECT count(*)::int AS n FROM ${t(table)}`)).rows[0].n, 0, table);
+  }
+  // Every refusal after authentication is counted (content-free: day, route,
+  // code, status); none before it (the cookie, limiter, control and bearer).
+  const counts = (await base.query(`SELECT route_id, code, status, refusals::int AS refusals
+      FROM ${t("telemetry_performance_refusal_counts")} ORDER BY route_id, code, status`)).rows;
+  assert.deepEqual(counts, [
+    { route_id: "accountless_telemetry_performance_authorization", code: "BODY_INVALID", status: 400, refusals: 3 },
+    { route_id: "accountless_telemetry_performance_authorization", code: "CONTENT_TYPE_INVALID", status: 415, refusals: 1 },
+    { route_id: "accountless_telemetry_performance_authorization", code: "TELEMETRY_TRANSPORT_BLOCKED", status: 403,
+      refusals: 1 },
+    { route_id: "telemetry_performance_capabilities", code: "TELEMETRY_TRANSPORT_BLOCKED", status: 403, refusals: 1 },
+    { route_id: "telemetry_performance_reports", code: "ENVELOPE_INVALID", status: 400, refusals: 1 },
+    { route_id: "telemetry_performance_reports", code: "TELEMETRY_TRANSPORT_BLOCKED", status: 403, refusals: 1 },
+  ]);
+
+  // The owner-only activation (decision 2) through the composed admin task
+  // (createPostgresOwnerMaintenance: SPD-G5 with this image's commit and the
+  // runtime migration manifest), then the same device is granted.
+  const schemaModule = await vite.ssrLoadModule("/src/postgres-runtime-schema.ts");
+  const activationModule = await vite.ssrLoadModule("/src/postgres-telemetry-runtime-activation.ts");
+  const historySha256 = await activationModule.postgresRuntimeMigrationHistorySha256(
+    schemaModule.POSTGRES_RUNTIME_MIGRATIONS.primary);
+  const adminOrigin = "https://admin.synthetic.example";
+  const contexts = new WeakMap();
+  const handlers = m.adminConsole.createAdminConsoleHandlers({
+    requestContext: (request) => contexts.get(request),
+    env: Object.freeze({ ENVIRONMENT: "production", TELEMETRY_STORAGE_NAMESPACE: NAMESPACE }),
+    pools: { primary: base },
+    schemaOptions: { primarySchema },
+    maintenance: m.host.createPostgresOwnerMaintenance({ pool: base, objectStore, primarySchema, sourceCommit: COMMIT }),
+  });
+  const activation = new Request(`${adminOrigin}/api/v1/admin/action`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: adminOrigin, "sec-fetch-site": "same-origin",
+      "x-usage-monitor-admin": "1" },
+    body: JSON.stringify({ action: "run_maintenance", telemetryRuntimeActivation: {
+      confirmation: "activate_telemetry_performance_runtime",
+      deployment: { historySha256, sourceCommit: COMMIT },
+      expectedRevision: 1,
+      idempotencyKey: randomUUID(),
+      target: "performance",
+    } }),
+  });
+  contexts.set(activation, Object.freeze({ requestId: randomUUID(), routeId: "admin_action",
+    adminIdentityKey: "owner@synthetic.example" }));
+  const activated = await handlers.get("admin_action")(activation);
+  const activatedBody = await activated.json();
+  assert.equal(activated.status, 200, JSON.stringify(activatedBody));
+  assert.equal(activatedBody.result.state, "active");
+  assert.deepEqual((await base.query(`SELECT state, policy_revision FROM ${t("telemetry_performance_runtime")}`)).rows,
+    [{ state: "active", policy_revision: 2 }]);
+  // The composed read-only admin view (owner decision 2026-10-10, GATE-Q 4
+  // and 23) reads the same runtime over the primary pool, with this image's
+  // migration history and the performance routes' classes.
+  {
+    const intake = new Request(`${adminOrigin}/api/v1/admin/performance-intake`);
+    contexts.set(intake, Object.freeze({ requestId: randomUUID(), routeId: "admin_performance_intake",
+      adminIdentityKey: "owner@synthetic.example" }));
+    const answer = await handlers.get("admin_performance_intake")(intake);
+    const body = await answer.json();
+    assert.equal(answer.status, 200, JSON.stringify(body));
+    assert.equal(answer.headers.get("cache-control"), "no-store");
+    assert.equal(body.schemaVersion, "admin-performance-intake-v0.1");
+    assert.equal(body.runtime.state, "active");
+    assert.equal(body.runtime.policyRevision, 2);
+    assert.deepEqual(body.deployment, { sourceCommit: null, historySha256 });
+    assert.deepEqual(body.routes, [
+      { routeId: "accountless_telemetry_performance_authorization", routeClass: "performance" },
+      { routeId: "admin_performance_intake", routeClass: "admin" },
+      { routeId: "community_model_performance", routeClass: "performance" },
+      { routeId: "telemetry_performance_capabilities", routeClass: "performance" },
+      { routeId: "telemetry_performance_consent", routeClass: "retired" },
+      { routeId: "telemetry_performance_reports", routeClass: "performance" },
+    ]);
+  }
+  // The grant now writes and echoes the exact body (201); the capability
+  // reads back with the default dictionary (no v1.2 manifest: GATE-Q 1).
+  {
+    const { answer } = await exchange();
+    assert.equal(answer.status, 201, answer.text);
+    assert.equal(answer.text, validBody);
+  }
+  {
+    const { answer } = await exchange({ method: "GET", path: CAPABILITIES, admission: "v1;device_sync;allowed" });
+    assert.equal(answer.status, 200, answer.text);
+    assert.equal(JSON.parse(answer.text).requiredConsent.fieldDictionaryVersion,
+      "telemetry-performance-registry-2026-09-29.1");
+  }
+  assert.equal((await base.query(`SELECT count(*)::int AS n FROM ${t("accountless_telemetry_performance_authorizations")}`))
+    .rows[0].n, 1);
+  // A revoked device is the neutral 401 on the grant and the device routes.
   await base.query(`UPDATE ${t("device_credentials")} SET state = 'revoked', revoked_at = $2 WHERE id = $1`,
     [deviceId, new Date().toISOString()]);
   assert.deepEqual(await ask(), { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
-  // Nothing was granted anywhere: the origin has no performance authorization
-  // table, and no row names this device outside its enrollment graph.
-  const performanceTables = await base.query(`SELECT table_name FROM information_schema.tables
-    WHERE table_schema = current_schema() AND table_name LIKE '%performance%'`);
-  assert.deepEqual(performanceTables.rows, []);
+  assert.deepEqual(await device("GET", CAPABILITIES), { status: 401, code: "DEVICE_AUTH_INVALID", retryAfter: null });
 }));
 
 test("contributions take an ingress lease and release it on a refused body", {
@@ -940,4 +1123,204 @@ test("admin run_maintenance reports and audits the folded purges under the Worke
   assert.equal(next.details.expiredIdentityHandoffsPurged, 0);
   assert.deepEqual(await countRows(), { apple: 0, google: 0, windows: 0, unused: 0 });
   assert.doesNotMatch(JSON.stringify([first, repeat, next]), /synthetic-admin-maint|owner@/u, "content-free");
+}));
+
+// FIX-FUTURE-V12 (owner decision 2026-10-12, no new client): the released
+// desktop client's own transport and accountless scheduler (origin/main =
+// v0.1.28) against the composed origin. A day later than the server's UTC day
+// plus one is the paced 429; the client classifies it as a retryable
+// service_unavailable that honours retry-after, keeps its resumable day journal
+// and the earlier staged days, and the scheduler waits instead of pausing.
+// Once the day is admissible the same journal resumes and activates.
+const DAY_MS = 86_400_000;
+const ACCOUNTLESS_V12_AUTHORIZATION = Object.freeze({
+  schemaVersion: "accountless-upload-owner-v1.2",
+  policyVersion: "accountless-telemetry-v1.2-policy-v1",
+  authorizationBasis: "accountless-policy-v1.2",
+  telemetrySchemaVersion: "telemetry-contribution-v1.2",
+});
+const PUBLIC_ORIGIN = "https://tibotattle.com";
+
+const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
+const utcDay = (epoch) => new Date(epoch).toISOString().slice(0, 10);
+
+/** One deterministic local v1.2 day in the client's wire form (edge-origin-e2e makeV12Day). */
+function releasedClientDay(day, count, parserVersion) {
+  const consent = telemetryV12RequiredConsent();
+  const records = Array.from({ length: count }, (_, index) => ({
+    schemaVersion: "usage-event-v1.2",
+    eventId: `event:v2:${sha256Hex(`future-day-bound:${parserVersion}:${day}:${index}`)}`,
+    eventTime: `${day}T12:${String(10 + index).padStart(2, "0")}:00.000Z`,
+    sessionUuid: "0a49f9db-8b2d-4c3e-9a6f-2f4f1c7d9e0b", provider: "openai_codex", modelId: "gpt-5.6-sol",
+    speedMode: "standard", apiServiceTier: "default", surface: "local_interactive_unclassified",
+    billingSurface: "chatgpt_subscription", reasoningEffort: "high", agentScope: "root", outcome: "completed",
+    totalInputContextTokens: 1000,
+    components: { inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
+      outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: 75 },
+    accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null, planBasis: "same_source_occurrence",
+      planType: "pro", planEraId: null },
+    boundaryFlags: null, tieOrder: null, cacheWriteTtl: null,
+  }));
+  const chunks = count === 0 ? [] : [{
+    schemaVersion: "telemetry-contribution-v1.2", manifestDigest: "0".repeat(64), chunkId: `usage:${day}:0`,
+    chunkRevision: 1, chunkDigest: sha256Hex(canonicalTelemetryV12Json(records)), parserVersion, consent, records,
+  }];
+  const manifest = {
+    schemaVersion: "telemetry-day-manifest-v1.2", day, parserVersion, consent,
+    chunks: chunks.map((chunk) => ({ chunkId: chunk.chunkId, chunkDigest: chunk.chunkDigest,
+      recordCount: chunk.records.length })),
+    excluded: { quota: 0, session: 0, usage: 0 }, manifestDigest: "0".repeat(64),
+  };
+  manifest.manifestDigest = sha256Hex(telemetryV12DayManifestDigestInput(manifest));
+  for (const chunk of chunks) chunk.manifestDigest = manifest.manifestDigest;
+  return { manifest, chunks };
+}
+
+/**
+ * The released client's fetch, delivered as the edge forwards it: the public
+ * origin to the local listener under the run.app Host, with the edge's
+ * admission outcome for the route's purpose (src/edge-admission-policy.ts)
+ * and an ID token minted at `tokenClock()`.
+ */
+function releasedClientFetch(port, log, tokenClock) {
+  const admissionFor = (path) => {
+    if (path === "/api/v1/contributions") return "v1;upload_ingress;allowed";
+    if (path === "/api/v1/accountless/telemetry-v1.2-authorization") return "v1;accountless_ownership;allowed";
+    if (["/api/v1/device/upload-authorizations", "/api/v1/envelope-key"].includes(path)) return null;
+    return "v1;device_sync;allowed";
+  };
+  return async (url, init = {}) => {
+    const target = new URL(url);
+    assert.equal(target.origin, PUBLIC_ORIGIN);
+    const headers = Object.fromEntries(new Headers(init.headers ?? {}));
+    const body = init.body === undefined ? undefined : String(init.body);
+    const answer = await send(port, { method: init.method ?? "GET", path: target.pathname + target.search, body,
+      headers: { ...headers, ...edgeHeaders({ admission: admissionFor(target.pathname), tokenNowMs: tokenClock() }),
+        ...(body === undefined ? {} : { "content-length": String(Buffer.byteLength(body)) }) } });
+    log.push({ path: target.pathname, status: answer.status });
+    return new Response([204, 205, 304].includes(answer.status) ? null : answer.text, {
+      status: answer.status,
+      headers: Object.entries(answer.headers).flatMap(([name, value]) =>
+        (Array.isArray(value) ? value : [value]).map((item) => [name, item])),
+    });
+  };
+}
+
+test("FIX-FUTURE-V12: the released client meets a future day as a paced 429, keeps its journal and resumes once admissible", {
+  skip: SKIP, timeout: 300_000,
+}, () => withProductionHost(async ({ base, t, port }) => {
+  const realNow = Date.now();
+  await base.query(`UPDATE ${t("telemetry_v12_runtime")} SET state='active', changed_at=$1 WHERE id=1`,
+    [new Date(realNow).toISOString()]);
+  await base.query(`UPDATE ${t("telemetry_v12_typed_runtime")} SET state='active', changed_at=$1 WHERE id=1`,
+    [new Date(realNow).toISOString()]);
+  // An accountless installation enrolls, binds its owner and takes the v1.2 grant, as Electron does.
+  const log = [];
+  // The edge mints its ID token on the real clock: EP-6 verifies it on the
+  // clock the origin captured at start, which the Date mock below leaves real.
+  const realClock = Date.now;
+  const fetchImpl = releasedClientFetch(port, log, realClock);
+  const deviceId = randomUUID();
+  const secret = randomBytes(32);
+  const deviceAuthorization = `Device um_device_${deviceId}.${secret.toString("base64url")}`;
+  const post = (path, value, headers = {}) => fetchImpl(new URL(path, PUBLIC_ORIGIN), { method: "POST",
+    headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(value) });
+  const enrolled = await send(port, { method: "POST", path: "/api/v1/accountless/enrollment",
+    headers: { ...edgeHeaders({ admission: "v1;enrollment;allowed" }), "content-type": "application/json" },
+    body: JSON.stringify({ schemaVersion: "accountless-enrollment-v0.1", deviceId,
+      deviceSecretHash: deviceSecretHash(deviceId, secret).toString("hex"),
+      policyVersion: "accountless-opt-out-v1", authorizationBasis: "accountless-policy-v1" }) });
+  assert.equal(enrolled.status, 201, enrolled.text);
+  const owned = await send(port, { method: "POST", path: "/api/v1/accountless/ownership",
+    headers: { ...edgeHeaders({ admission: "v1;accountless_ownership;allowed" }), "content-type": "application/json",
+      authorization: deviceAuthorization },
+    body: JSON.stringify({ schemaVersion: "accountless-upload-owner-v0.1", policyVersion: "accountless-opt-out-v1",
+      authorizationBasis: "accountless-policy-v1", telemetrySchemaVersion: "telemetry-contribution-v1.1" }) });
+  assert.equal(owned.status, 201, owned.text);
+  const granted = await post("/api/v1/accountless/telemetry-v1.2-authorization", ACCOUNTLESS_V12_AUTHORIZATION,
+    { authorization: deviceAuthorization });
+  assert.equal(granted.status, 201, await granted.clone().text());
+  const participantId = (await base.query(`SELECT participant_id FROM ${t("accountless_upload_owners")}
+    WHERE enrollment_device_id = $1`, [deviceId])).rows[0].participant_id;
+
+  // The local index holds yesterday, today and a day two days ahead of the server.
+  const today = utcDay(realNow);
+  const dayAt = (offset) => utcDay(Date.parse(`${today}T00:00:00.000Z`) + offset * DAY_MS);
+  const records = new Map([[dayAt(-1), 2], [dayAt(0), 1], [dayAt(2), 3]]);
+  const parserVersion = "synthetic-future-day-bound";
+  const readDay = (day) => releasedClientDay(day, records.get(day) ?? 0, parserVersion);
+  let saved = null;
+  const progressStore = { read: async () => saved, write: async (value) => { saved = value; } };
+  let envelopeKey;
+  const createEnvelope = async (chunk) => {
+    envelopeKey ??= await (await fetchImpl(new URL("/api/v1/envelope-key", PUBLIC_ORIGIN),
+      { headers: { accept: "application/json" } })).json();
+    return createTelemetryV12Envelope({ chunk, publicJwk: envelopeKey.publicJwk, keyId: envelopeKey.keyId,
+      cryptoImpl: webcrypto });
+  };
+  const sync = (clock) => runTelemetryV12Sync({
+    serverBaseUrl: PUBLIC_ORIGIN, deviceAuthorization, authorization: ACCOUNTLESS_V12_AUTHORIZATION,
+    production: true, days: [...records.keys()].sort(), readDay, createEnvelope, fetchImpl, clock,
+    progressStore, sourcePublication: { fingerprint: "synthetic-future-day-bound", parserVersion },
+    maxDurationMs: 240_000,
+  });
+  const v12State = async () => (await base.query(`SELECT
+      (SELECT COALESCE(jsonb_agg(to_char(chunk_day, 'YYYY-MM-DD') ORDER BY chunk_day), '[]'::jsonb)
+         FROM ${t("telemetry_v12_day_manifests")} WHERE participant_id = $1) AS manifests,
+      (SELECT count(*)::int FROM ${t("telemetry_v12_chunks")} WHERE participant_id = $1) AS chunks,
+      (SELECT count(*)::int FROM ${t("telemetry_v12_domains")} WHERE participant_id = $1) AS domains`,
+  [participantId])).rows[0];
+
+  // First pass on the real clock: every day through tomorrow is staged, the
+  // day two days ahead is refused, nothing activates.
+  const first = await sync(() => Date.now());
+  assert.equal(first.status, "failed", JSON.stringify(first));
+  assert.equal(first.failure.code, "service_unavailable");
+  assert.equal(first.failure.retryable, true);
+  assert.equal(first.failure.deviceUnavailable, false);
+  const admissibleAt = Date.parse(`${dayAt(1)}T00:00:00.000Z`);
+  assert.ok(Number.isSafeInteger(first.failure.retryAfterMilliseconds));
+  assert.ok(first.failure.retryAfterMilliseconds >= admissibleAt - Date.now() - 2_000
+    && first.failure.retryAfterMilliseconds <= admissibleAt - realNow + 1_000,
+  "retry-after names the instant the day becomes admissible");
+  assert.equal(first.stagedDays, 3);
+  assert.equal(first.chunksUploaded, 2);
+  assert.equal(first.domainGenerationId, null);
+  const refusal = log.filter((entry) => entry.path === "/api/v1/device/telemetry/v1.2/day-manifests"
+    && entry.status === 429);
+  assert.equal(refusal.length, 1, "one manifest refusal, and no chunk of the refused day was sent");
+  assert.deepEqual(await v12State(), { manifests: [dayAt(-1), dayAt(0), dayAt(1)], chunks: 2, domains: 0 });
+  assert.equal(saved?.days?.length, 3, "the resumable journal keeps the three staged days");
+
+  // The released accountless scheduler waits for the retry-after: no pause.
+  let scheduled = null;
+  const scheduler = createAccountlessContributionScheduler({
+    origin: PUBLIC_ORIGIN,
+    readPreference: async () => ({ available: true, current: true, enabled: true,
+      policyVersion: "accountless-opt-out-v1", destinationOrigin: PUBLIC_ORIGIN }),
+    runner: async () => first,
+    setTimer: (callback, delay) => { scheduled = delay; return { unref() {} }; },
+    clearTimer: () => {},
+  });
+  scheduler.start();
+  const waiting = await scheduler.runNow();
+  assert.equal(waiting.state, "retry_wait", "the released scheduler waits; it does not pause sharing");
+  assert.ok(scheduled >= first.failure.retryAfterMilliseconds);
+  assert.equal(scheduler.inspectDiagnostics().lastFailureCode, "transient_failure");
+  await scheduler.stop();
+
+  // Once the server's UTC day is tomorrow, the day is admissible: the same
+  // journal resumes, only the new day's chunk is uploaded, and the domain activates.
+  mock.timers.enable({ apis: ["Date"], now: admissibleAt + 30_000 });
+  try {
+    const resumed = await sync(() => Date.now());
+    assert.equal(resumed.status, "complete", JSON.stringify(resumed.failure));
+    assert.equal(resumed.chunksUploaded, 1);
+    assert.equal(resumed.acknowledgedThroughDay, dayAt(2));
+    assert.ok(resumed.domainGenerationId);
+  } finally {
+    mock.timers.reset();
+  }
+  assert.deepEqual(await v12State(),
+    { manifests: [dayAt(-1), dayAt(0), dayAt(1), dayAt(2)], chunks: 3, domains: 1 });
 }));

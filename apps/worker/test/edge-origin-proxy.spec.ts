@@ -415,12 +415,14 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("classifyEdgeRequest", () => {
-  it("names the six admin API ids exactly as the registry's admin authority", () => {
+  it("names the seven admin API ids exactly as the registry's admin authority", () => {
     expect([...EDGE_ADMIN_API_ROUTE_IDS].sort()).toStrictEqual(
       WORKER_ROUTE_POLICY.filter((route) => route.authority === "admin")
         .map((route) => route.id).sort(),
     );
     expect(Object.isFrozen(EDGE_ADMIN_API_ROUTE_IDS)).toBe(true);
+    expect(EDGE_ADMIN_API_ROUTE_IDS).toHaveLength(7);
+    expect(EDGE_ADMIN_API_ROUTE_IDS).toContain("admin_performance_intake");
     expect(EDGE_PROXY_UPSTREAM_FAILURE_CODES).toStrictEqual([
       "EDGE_TOKEN_UNAVAILABLE",
       "EDGE_UPSTREAM_TIMEOUT",
@@ -650,6 +652,24 @@ describe("edge-local classes", () => {
         expect(response.headers).toContainEqual(["cache-control", "no-store"]);
         expect(response.body).toContain("\"PUBLICATION_DISABLED\"");
       },
+    },
+    {
+      name: "community/model-performance on the apex while publication is disabled",
+      request: () => new Request(`${PUBLIC_ORIGIN}/api/v1/community/model-performance?period=7&speedMode=fast`),
+      env: () => localEnv({ PUBLIC_ANALYTICS_MODE: "disabled" }),
+      reason: "publication_mode_disabled",
+      status: 503,
+      expect: (response) => {
+        expect(response.headers).toContainEqual(["cache-control", "no-store"]);
+        expect(response.body).toContain("\"PUBLICATION_DISABLED\"");
+      },
+    },
+    {
+      name: "community/model-performance on the apex while publication is unset",
+      request: () => new Request(`${PUBLIC_ORIGIN}/api/v1/community/model-performance`),
+      env: () => localEnv({ PUBLIC_ANALYTICS_MODE: undefined }),
+      reason: "publication_mode_disabled",
+      status: 503,
     },
     {
       name: "community/daily on the apex while publication is unset",
@@ -894,8 +914,9 @@ describe("admission", () => {
     { name: "throwing limiter", answer: () => "throw", outcome: "unavailable" },
   ];
 
-  it("covers all 24 EP-1 policy routes", () => {
-    expect(policyRoutes).toHaveLength(24);
+  it("covers all 25 EP-1 policy routes", () => {
+    expect(policyRoutes).toHaveLength(25);
+    expect(policyRoutes).toContain("community_model_performance");
   });
 
   for (const scenario of scenarios) {
@@ -950,7 +971,8 @@ describe("admission", () => {
     expect(checked).toContain("device_upload_authorization");
     expect(checked).toContain("health");
     expect(checked).toContain("admin_action");
-    expect(checked).toHaveLength(WORKER_ROUTE_POLICY.length - 24 - 2);
+    expect(checked).toContain("admin_performance_intake");
+    expect(checked).toHaveLength(WORKER_ROUTE_POLICY.length - 25 - 2);
   });
 });
 

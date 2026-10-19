@@ -118,6 +118,9 @@ export const ANALYTICS_V2_STATEMENT_FAMILIES = Object.freeze([
   "owner_sets.read",
   "owner_sets.values",
   "owner_sets.frozen",
+  // SPD-P2a (performance-source.ts): the current performance reports and their cohorts.
+  "performance.reports",
+  "performance.cohorts",
 ] as const);
 export type AnalyticsV2StatementFamily = (typeof ANALYTICS_V2_STATEMENT_FAMILIES)[number];
 

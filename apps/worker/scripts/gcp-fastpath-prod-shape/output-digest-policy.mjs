@@ -24,6 +24,10 @@ export const OUTPUT_DIGEST_POLICY = Object.freeze(Object.fromEntries(Object.entr
   analytics_v2_pricing_classes: ["registered_at", "first_kernel_id"],
   analytics_v2_kernel_pricing_classes: ["registered_at", "kernel_id"],
   analytics_v2_transition_proofs: [],
+  // The community model performance heads (primary 0079): the run's stamps and
+  // release instant are provenance; period, speed mode, revision, payload and
+  // digest stay semantic.
+  analytics_v2_published_performance: [...stamp, "released_at"],
 }).map(([table, keys]) => [table, Object.freeze(keys)])));
 export const PRICING_CLASS_SCHEMA = Object.freeze({
   analytics_v2_pricing_classes: ["pricing_class_id", "class_sha256", "pricer_sha256", "pricing_method_version", "projection_version", "cards_sha256", "first_kernel_id", "registered_at"],

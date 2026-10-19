@@ -89,6 +89,10 @@
     "maintenance": {
       "name": "tibotattle-staging-maintenance",
       "maxConnections": 2
+    },
+    "analytics-reprice": {
+      "name": "tibotattle-staging-analytics-reprice",
+      "maxConnections": 2
     }
   },
   "scheduler": {

@@ -12,8 +12,12 @@
 //     online erasure), every deletion-ledger table (the ledger contributes
 //     only its digest projection) and the accountless_public_history_*
 //     retention markers (the landed retention importer owns them while OA-2
-//     keeps the OD-3 parity view). The two performance-consent tables have no
-//     PostgreSQL target at the promoted level and are recorded target-missing.
+//     keeps the OD-3 parity view). The two sealed D1 performance tables are
+//     recorded target-missing and never imported. That disposition dates from
+//     when PostgreSQL had no performance target; primary 0079 now creates both
+//     tables (the 2026-10-10 owner decision), but the D1 rows still stay behind
+//     and PostgreSQL starts its own performance evidence, so the disposition,
+//     its error code and the pinned receipts are unchanged.
 //   * Collection controls are recorded and degraded (PT-1), never copied; the
 //     public-source bootstrap singleton replaces the seeded row after
 //     policy_version 'community-public-sources-v1' and completed = 1 are
@@ -384,7 +388,11 @@ export const IDENTITY_AUTHORITY_EXCLUDED_TABLES = Object.freeze({
   accountless_public_history_retention: "claimed-by:accountless-retention while OA-2 keeps the OD-3 parity view",
 });
 
-/** Sealed identity tables with no PostgreSQL target at the promoted level. */
+/**
+ * Sealed identity tables this stage records target-missing and never imports.
+ * The name predates primary 0079, which now creates both tables; the D1 rows
+ * still stay behind (see the header), so the list and its receipt are unchanged.
+ */
 export const IDENTITY_AUTHORITY_TARGET_MISSING = Object.freeze([
   "accountless_telemetry_performance_authorizations",
   "telemetry_performance_device_capabilities",

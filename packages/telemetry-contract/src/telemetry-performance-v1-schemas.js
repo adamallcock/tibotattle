@@ -6,6 +6,7 @@ import {
   MAX_PERFORMANCE_TTFT_MILLISECONDS,
   PERFORMANCE_API_SERVICE_TIERS,
   PERFORMANCE_BUCKET_SCHEME_VERSION,
+  PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
   PERFORMANCE_HISTOGRAM_SCHEMA_VERSION,
   PERFORMANCE_MEASUREMENT_VERSION,
   PERFORMANCE_REASONING_EFFORTS,
@@ -55,7 +56,7 @@ const HISTOGRAM_SCHEMA = {
   additionalProperties: false,
   required: ["schemaVersion", "metric", "sampleCount", "buckets", "min", "max"],
   properties: {
-    schemaVersion: { const: PERFORMANCE_HISTOGRAM_SCHEMA_VERSION },
+    schemaVersion: { enum: [PERFORMANCE_HISTOGRAM_SCHEMA_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION_V2] },
     metric: { enum: ["speed", "ttft", "turnDuration"] },
     sampleCount: COUNT,
     buckets: HISTOGRAM_BUCKET,
@@ -67,11 +68,6 @@ const HISTOGRAM_SCHEMA = {
       if: { properties: { metric: { const: "speed" } } },
       then: {
         properties: {
-          buckets: {
-            propertyNames: {
-              pattern: "^(?:0|[1-9]|[1-5]\\d|60)$",
-            },
-          },
           min: {
             anyOf: [{ type: "null" }, {
               type: "integer", minimum: 0,
@@ -84,6 +80,32 @@ const HISTOGRAM_SCHEMA = {
               maximum: MAX_PERFORMANCE_SPEED_CENTI_TOKENS_PER_SECOND,
             }],
           },
+        },
+      },
+    },
+    {
+      if: {
+        properties: {
+          schemaVersion: { const: PERFORMANCE_HISTOGRAM_SCHEMA_VERSION },
+          metric: { const: "speed" },
+        },
+      },
+      then: {
+        properties: {
+          buckets: { propertyNames: { pattern: "^(?:0|[1-9]|[1-5]\\d|60)$" } },
+        },
+      },
+    },
+    {
+      if: {
+        properties: {
+          schemaVersion: { const: PERFORMANCE_BUCKET_SCHEME_VERSION_V2 },
+          metric: { const: "speed" },
+        },
+      },
+      then: {
+        properties: {
+          buckets: { propertyNames: { pattern: "^(?:0|[1-9]|[1-8]\\d|9[0-5])$" } },
         },
       },
     },
@@ -156,7 +178,7 @@ const HISTOGRAM_SCHEMA = {
       },
     },
   ],
-  $comment: "Speed bins are half-open [0,2), [2,4), through [118,120), with overflow >=120 tokens/second; TTFT has [0,1ms), [1,500ms), logarithmic upper-exclusive bins through the final edge, and overflow at or above that edge; turnDuration uses the same positive millisecond bins and never occupies bucket 0. Runtime additionally requires sparse bucket counts to sum to sampleCount, non-empty extrema to be ordered and occupied-bin compatible, singleton TTFT extrema to be equal, singleton speed extrema to differ by at most one centi-TPS, and metric-specific units to match the selected bucket scheme.",
+  $comment: "performance-histogram-v1 speed bins are half-open [0,2), [2,4), through [118,120), with overflow >=120 tokens/second; performance-histogram-v2 keeps those 60 bins, adds 10 tokens/second bins through 300 and bins with upper edges ceil(30000*1.15^k) centi-tokens/second for k=1..17 (through 322838), with overflow at the final edge; both schemes share every millisecond bin. TTFT has [0,1ms), [1,500ms), logarithmic upper-exclusive bins through the final edge, and overflow at or above that edge; turnDuration uses the same positive millisecond bins and never occupies bucket 0. Runtime additionally requires sparse bucket counts to sum to sampleCount, non-empty extrema to be ordered and occupied-bin compatible, singleton TTFT extrema to be equal, singleton speed extrema to differ by at most one centi-TPS, and metric-specific units to match the selected bucket scheme.",
 };
 
 const RECORD_SCHEMA = {
@@ -180,7 +202,7 @@ const RECORD_SCHEMA = {
     speedModeSource: { enum: PERFORMANCE_SPEED_MODE_SOURCES },
     apiServiceTier: { enum: PERFORMANCE_API_SERVICE_TIERS },
     measurementVersion: { const: PERFORMANCE_MEASUREMENT_VERSION },
-    bucketSchemeVersion: { const: PERFORMANCE_BUCKET_SCHEME_VERSION },
+    bucketSchemeVersion: { enum: [PERFORMANCE_BUCKET_SCHEME_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION_V2] },
     turns: POSITIVE_COUNT,
     speedTurns: COUNT,
     ttftTurns: COUNT,
@@ -208,6 +230,16 @@ const RECORD_SCHEMA = {
     },
   },
   allOf: [
+    ...[PERFORMANCE_BUCKET_SCHEME_VERSION, PERFORMANCE_BUCKET_SCHEME_VERSION_V2].map((scheme) => ({
+      if: { properties: { bucketSchemeVersion: { const: scheme } } },
+      then: {
+        properties: {
+          speedHistogram: { properties: { schemaVersion: { const: scheme } } },
+          ttftHistogram: { properties: { schemaVersion: { const: scheme } } },
+          completionHistogram: { properties: { schemaVersion: { const: scheme } } },
+        },
+      },
+    })),
     ...[...PERFORMANCE_MODELS_BY_PROVIDER].map(([provider, modelIds]) => ({
       if: { properties: { provider: { const: provider } } },
       then: { properties: { modelId: { enum: modelIds } } },
@@ -268,7 +300,7 @@ const RECORD_SCHEMA = {
       },
     },
   ],
-  $comment: "Provider and model IDs come from the reviewed catalog and its exact provider pairing. Runtime additionally requires speedTurns, ttftTurns, and completionTurns to be no greater than positive turns; receipt/legacy/tool_free cohorts to have speedTurns equal turns; unavailable speed cohorts to have zero speed sums and an empty speed histogram; timedResponses to be at least speedTurns; speed, TTFT, and completion histogram counts to match their eligible counts; completion observations to be positive integer milliseconds; and the ratio of summed speedTokens to speedDurationMs to lie within conservative speed extrema. Speed mode evidence and API service tier are independent dimensions.",
+  $comment: "Provider and model IDs come from the reviewed catalog and its exact provider pairing. The report's field dictionary selects the accepted subset: 2026-09-21.1 has no ultrafast and uses performance-histogram-v1, 2026-09-29.1 adds ultrafast with performance-histogram-v1, and 2026-10-10.1 uses performance-histogram-v2. Every histogram uses the record's bucket scheme. Runtime additionally requires speedTurns, ttftTurns, and completionTurns to be no greater than positive turns; receipt/legacy/tool_free cohorts to have speedTurns equal turns; unavailable speed cohorts to have zero speed sums and an empty speed histogram; timedResponses to be at least speedTurns; speed, TTFT, and completion histogram counts to match their eligible counts; completion observations to be positive integer milliseconds; and the ratio of summed speedTokens to speedDurationMs to lie within conservative speed extrema. Speed mode evidence and API service tier are independent dimensions.",
 };
 
 /** Canonical JSON Schema sources; package and root mirrors are generated. */
@@ -286,4 +318,5 @@ export function telemetryPerformanceJsonSchemas() {
 export const TELEMETRY_PERFORMANCE_SCHEMA_LIMITS = Object.freeze({
   maxSerializedBytes: MAX_PERFORMANCE_RECORD_CANONICAL_BYTES,
   maxHistogramBuckets: 61,
+  maxHistogramBucketsV2: 96,
 });

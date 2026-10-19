@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   canonicalTelemetryPerformanceJson,
   buildPerformanceHistogram,
+  parseTelemetryPerformanceRecord,
+  PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29,
+  PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10,
 } from "@app-usagemonitor/telemetry-contract";
 import { canonicalJson } from "../src/canonical-json";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
@@ -35,12 +40,19 @@ interface Bindings extends Env {
   TEST_TYPED_V11_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_TYPED_V1_ADMISSION_MIGRATIONS: D1Migration[];
   TEST_INGESTION_ISOLATION_MIGRATIONS: D1Migration[];
+  TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[];
 }
 
 const bindings = env as Bindings;
 const db = () => bindings.USAGE_MONITOR_DB;
 const DAY = "2026-09-21";
 const NOW = Date.parse("2026-09-21T12:00:00.000Z");
+// The legacy Worker on this line is pinned to the dictionary its D1 schema
+// admits; canonical bytes below name it explicitly instead of following the
+// contract's moving emitted default.
+const LEGACY_DICTIONARY = PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_21;
+const EMITTED_DICTIONARY = PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_09_29;
+const NEXT_DICTIONARY = PERFORMANCE_FIELD_DICTIONARY_VERSION_2026_10_10;
 const AUTHORIZATION = {
   schemaVersion: "telemetry-performance-authorization-v1" as const,
   capabilityRevision: 1,
@@ -86,6 +98,22 @@ function record(modelId = "gpt-5.6-luna") {
   };
 }
 
+// A record that is valid under 2026-10-10.1 (v2 buckets) and nothing older.
+function v2Record(modelId = "gpt-5.6-luna") {
+  return {
+    ...record(modelId),
+    bucketSchemeVersion: PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
+    speedHistogram: buildPerformanceHistogram("speed", [100], PERFORMANCE_BUCKET_SCHEME_VERSION_V2),
+    ttftHistogram: buildPerformanceHistogram("ttft", [100], PERFORMANCE_BUCKET_SCHEME_VERSION_V2),
+    completionHistogram: buildPerformanceHistogram("turnDuration", [1_000], PERFORMANCE_BUCKET_SCHEME_VERSION_V2),
+  };
+}
+
+async function relabelledReport(base: Awaited<ReturnType<typeof report>>, overrides: Record<string, unknown>) {
+  const { reportRevision: _previous, ...body } = { ...base, ...overrides };
+  return { ...body, reportRevision: await sha256Hex(canonicalJson(body)) };
+}
+
 function denseRecords(day = DAY) {
   const efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
   const modes = [
@@ -115,7 +143,7 @@ function denseRecords(day = DAY) {
     }
   }
   records.sort((left, right) =>
-    canonicalTelemetryPerformanceJson(left).localeCompare(canonicalTelemetryPerformanceJson(right)));
+    canonicalTelemetryPerformanceJson(left, LEGACY_DICTIONARY).localeCompare(canonicalTelemetryPerformanceJson(right, LEGACY_DICTIONARY)));
   return records;
 }
 
@@ -373,7 +401,7 @@ describe("independent performance report repository", () => {
       completionHistogram: buildPerformanceHistogram("turnDuration", [2_000]),
     };
     const records = [left, right].sort((a, b) =>
-      canonicalTelemetryPerformanceJson(a).localeCompare(canonicalTelemetryPerformanceJson(b)));
+      canonicalTelemetryPerformanceJson(a, LEGACY_DICTIONARY).localeCompare(canonicalTelemetryPerformanceJson(b, LEGACY_DICTIONARY)));
     const value = await report("gpt-5.6-luna", records);
     let thrown: unknown;
     try {
@@ -581,6 +609,91 @@ describe("independent performance report repository", () => {
       .bind(fixture.participantId, fixture.deviceId).all();
     expect(capabilities.results).toHaveLength(2);
     expect(capabilities.results[1]).toMatchObject({ capability_revision: 2, authority_epoch: 1 });
+  });
+
+  it("refuses a 2026-10-10.1 report with v2 buckets because the legacy Worker is pinned to 2026-09-21.1", async () => {
+    const fixture = await createV11DeviceFixture(db());
+    await activatePerformance(fixture);
+    // The records are valid under the newer dictionary, so the refusal below is
+    // the legacy pin, not a malformed record.
+    const records = [v2Record()];
+    expect(parseTelemetryPerformanceRecord(records[0], NEXT_DICTIONARY)).toBe(records[0]);
+    const base = await report("gpt-5.6-luna", records);
+    const candidates = [
+      await relabelledReport(base, {
+        fieldDictionaryVersion: NEXT_DICTIONARY, bucketSchemeVersion: PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
+      }),
+      // A v2 report that claims the legacy dictionary is refused by its records.
+      await relabelledReport(base, { fieldDictionaryVersion: LEGACY_DICTIONARY }),
+      await relabelledReport(base, {
+        fieldDictionaryVersion: LEGACY_DICTIONARY, bucketSchemeVersion: PERFORMANCE_BUCKET_SCHEME_VERSION_V2,
+      }),
+      // Legacy v1 records under a newer dictionary label are refused too,
+      // including the client's current emitted dictionary.
+      await relabelledReport(await report(), { fieldDictionaryVersion: EMITTED_DICTIONARY }),
+      await relabelledReport(await report(), { fieldDictionaryVersion: NEXT_DICTIONARY }),
+    ];
+    for (const [index, candidate] of candidates.entries()) {
+      let thrown: unknown;
+      try {
+        parseTelemetryPerformanceReport(candidate);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({ status: 409, code: "TELEMETRY_RECORD_INVALID" });
+      await expect(admitTelemetryPerformanceReport(
+        db(), fixture, candidate, AUTHORIZATION, String(index).repeat(64), NOW,
+      )).rejects.toMatchObject({ status: 409, code: "TELEMETRY_RECORD_INVALID" });
+    }
+    expect(await db().prepare("SELECT COUNT(*) AS count FROM telemetry_performance_reports").first())
+      .toEqual({ count: 0 });
+    await expect(admitTelemetryPerformanceReport(
+      db(), fixture, await report(), AUTHORIZATION, "e".repeat(64), NOW,
+    )).resolves.toMatchObject({ status: "accepted" });
+  });
+
+  it("refuses a four-key grant v2 body over HTTP with 400 BODY_INVALID and writes no grant", async () => {
+    // The HTTP grant route consults the deletion ledger before reading the body.
+    await applyD1Migrations(bindings.DELETION_LEDGER, bindings.TEST_DELETION_LEDGER_MIGRATIONS);
+    const fixture = await createAccountlessPerformanceFixture();
+    await db().prepare("UPDATE telemetry_performance_runtime SET state='active' WHERE id=1").run();
+    const grant = (body: object) => handleRequest(new Request(
+      "https://performance.example.test/api/v1/accountless/telemetry-performance-authorization",
+      { method: "POST", headers: { origin: "https://performance.example.test", "content-type": "application/json", authorization: fixture.authorization }, body: JSON.stringify(body) },
+    ), {
+      ...bindings, ENVIRONMENT: "synthetic-development", ACCOUNT_SCOPED_INGEST_MODE: "disabled",
+      ACCOUNTLESS_ENROLLMENT_MODE: "enabled", ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+      TELEMETRY_STORAGE_MODE: "typed", TELEMETRY_STORAGE_NAMESPACE: "synthetic-performance-storage",
+    } as unknown as Env);
+    const v1 = {
+      schemaVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_SCHEMA_VERSION,
+      policyVersion: ACCOUNTLESS_TELEMETRY_PERFORMANCE_POLICY_VERSION,
+      authorizationBasis: ACCOUNTLESS_TELEMETRY_PERFORMANCE_AUTHORIZATION_BASIS,
+    };
+    const grantCount = async () => db().prepare(
+      "SELECT COUNT(*) AS count FROM accountless_telemetry_performance_authorizations",
+    ).first<{ count: number }>();
+    for (const body of [
+      { ...v1, schemaVersion: "accountless-performance-owner-v2", fieldDictionaryVersion: NEXT_DICTIONARY },
+      { ...v1, schemaVersion: "accountless-performance-owner-v2", fieldDictionaryVersion: LEGACY_DICTIONARY },
+      { ...v1, fieldDictionaryVersion: NEXT_DICTIONARY },
+    ]) {
+      const response = await grant(body);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: "BODY_INVALID" } });
+      await expect(grantTelemetryPerformanceAccountlessAuthorization(
+        db(), fixture, body as unknown as typeof v1, NOW,
+      )).rejects.toMatchObject({ status: 403, code: "TELEMETRY_CONSENT_INVALID" });
+    }
+    expect(await grantCount()).toEqual({ count: 0 });
+    // The unchanged v1 body still grants, so the refusals above are the body shape.
+    const accepted = await grant(v1);
+    expect(accepted.status).toBe(201);
+    expect(await accepted.json()).toEqual(v1);
+    expect(await grantCount()).toEqual({ count: 1 });
+    expect(await db().prepare(
+      "SELECT field_dictionary_version FROM accountless_telemetry_performance_authorizations",
+    ).first()).toEqual({ field_dictionary_version: LEGACY_DICTIONARY });
   });
 
   it("keeps a normal 31-day small-report range readable", async () => {

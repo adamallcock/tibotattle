@@ -1,6 +1,8 @@
 /**
- * The six admin console routes on the PostgreSQL origin (GCP, C-ADMIN), as
- * one family for the composition root to register (D-CRB). The production
+ * The seven admin console routes on the PostgreSQL origin (GCP): C-ADMIN's
+ * six and the owner-decided read-only performance-intake view (2026-10-10,
+ * gate answers 4 and 23: routes/admin-performance-intake.mjs, no activation
+ * control), as one family for the composition root to register (D-CRB). The production
  * host registers it only when its admin-host policy is 'chokepoint'
  * (OD-CR-3), which it is since ADMIN-R12: the owner answered OWN-17 in round
  * 12 (open with what is ported; sections without a GCP source say
@@ -13,12 +15,12 @@
  *    built once over the frozen env). Its ApiError (403 ACCESS_REQUIRED,
  *    403 ADMIN_REQUIRED, 503 ADMIN_NOT_CONFIGURED) is the answer, rendered
  *    with no-store and no Allow, for every path on the admin host.
- * 2. For the six ids, the root registers {requestId, routeId,
+ * 2. For the seven ids, the root registers {requestId, routeId,
  *    adminIdentityKey} on the exact Request (postgres-request-context.mjs)
  *    and calls the handler from createAdminConsoleHandlers. The registry
  *    method envelope must NOT run first for these ids: the handler answers
  *    its own 405, after the identity check, as the Worker does.
- * 3. On the apex host the six ids are 404 NOT_FOUND (the edge already answers
+ * 3. On the apex host the seven ids are 404 NOT_FOUND (the edge already answers
  *    them locally; the root keeps the Worker's answer as defense in depth).
  *
  * Defaults: every PostgreSQL reader and writer is bound here from the primary
@@ -30,7 +32,15 @@
  * unavailable incremental graph counters and current execution state.
  * The database-health analytics role defaults to the primary pool, because
  * primary migration 0059 places the analytics_v2 tables in that database.
+ * The performance-intake reader is bound to the primary pool too (the
+ * telemetry_performance_* tables of primary 0079), with closed inputs: the
+ * performance routes' classes from PRODUCTION_ROUTE_TABLE, the deployment
+ * (env DEPLOYMENT_SOURCE_COMMIT or null, and the history digest of this
+ * image's POSTGRES_RUNTIME_MIGRATIONS.primary) and the contract's
+ * PERFORMANCE_FIELD_DICTIONARIES.
  */
+
+import { PERFORMANCE_FIELD_DICTIONARIES } from "@app-usagemonitor/telemetry-contract";
 
 import { beginPostgresAdminOperation, finishPostgresAdminOperation,
   finishPostgresAdminOperationBestEffort } from "../../src/postgres-admin-audit.ts";
@@ -38,7 +48,10 @@ import { readPostgresAdminAllowancePreview } from "../../src/postgres-admin-allo
 import { setPostgresCollectionControls } from "../../src/postgres-admin-collection-controls.ts";
 import { readPostgresAdminDatabaseHealth } from "../../src/postgres-admin-database-health.ts";
 import { readPostgresAdminOverview } from "../../src/postgres-admin-overview.ts";
+import { readPostgresAdminPerformanceIntake } from "../../src/postgres-admin-performance-intake.ts";
 import { readPostgresAdminReconstructionProgress } from "../../src/postgres-admin-reconstruction-progress.ts";
+import { POSTGRES_RUNTIME_MIGRATIONS } from "../../src/postgres-runtime-schema.ts";
+import { postgresRuntimeMigrationHistorySha256 } from "../../src/postgres-telemetry-runtime-activation.ts";
 import { assertFrozenPathnames } from "../postgres-family-contract.mjs";
 import { ADMIN_ACTION_PATHNAMES, createAdminActionDispatch } from "./admin-action.mjs";
 import {
@@ -49,10 +62,15 @@ import { ADMIN_DATABASE_HEALTH_PATHNAMES, createAdminDatabaseHealthDispatch } fr
 import { ADMIN_METRICS_HISTORY_PATHNAMES, createAdminMetricsHistoryDispatch } from "./admin-metrics-history.mjs";
 import { ADMIN_OVERVIEW_PATHNAMES, createAdminOverviewDispatch } from "./admin-overview.mjs";
 import {
+  ADMIN_PERFORMANCE_INTAKE_PATHNAMES,
+  createAdminPerformanceIntakeDispatch,
+} from "./admin-performance-intake.mjs";
+import {
   ADMIN_RECONSTRUCTION_PROGRESS_PATHNAMES,
   createAdminReconstructionProgressDispatch,
 } from "./admin-reconstruction-progress.mjs";
 import { adminRouteConfigurationError, assertAdminFamilyDeps } from "./admin-route-support.mjs";
+import { PRODUCTION_ROUTE_TABLE } from "../postgres-production-registry.mjs";
 
 /** Route id -> pathname, in WORKER_ROUTE_POLICY order (route-registry.ts). */
 export const ADMIN_CONSOLE_ROUTES = Object.freeze([
@@ -70,6 +88,11 @@ export const ADMIN_CONSOLE_ROUTES = Object.freeze([
     method: "GET",
   }),
   Object.freeze({ id: "admin_action", pathname: ADMIN_ACTION_PATHNAMES[0], method: "POST" }),
+  Object.freeze({
+    id: "admin_performance_intake",
+    pathname: ADMIN_PERFORMANCE_INTAKE_PATHNAMES[0],
+    method: "GET",
+  }),
 ]);
 
 export const ADMIN_CONSOLE_ROUTE_IDS = Object.freeze(ADMIN_CONSOLE_ROUTES.map((route) => route.id));
@@ -86,6 +109,15 @@ const OVERVIEW_SOURCE_KEYS = Object.freeze(["syntheticContributions", "historica
  */
 const POOL_KEYS = Object.freeze(["primary", "analytics"]);
 const SCHEMA_OPTION_KEYS = Object.freeze(["primarySchema"]);
+
+/**
+ * The performance-intake view's route classes: every performance route of
+ * PRODUCTION_ROUTE_TABLE (the intake, the public read, the retired signed-in
+ * consent route and this admin view) with its class, as data.
+ */
+export const ADMIN_PERFORMANCE_INTAKE_ROUTE_CLASSES = Object.freeze(Object.fromEntries(PRODUCTION_ROUTE_TABLE
+  .filter((route) => route.id.includes("performance"))
+  .map((route) => [route.id, route.routeClass])));
 
 function closedKeys(value, allowed) {
   return value !== null && typeof value === "object" && Object.keys(value).every((key) => allowed.includes(key));
@@ -145,6 +177,12 @@ export function createAdminConsoleAdapters(deps) {
   }
   const overviewSources = Object.freeze({ ...injected });
   const clock = deps.clock ?? Date.now;
+  const sourceCommit = env.DEPLOYMENT_SOURCE_COMMIT ?? null;
+  let historySha256 = null;
+  const deploymentHistorySha256 = () => {
+    historySha256 ??= postgresRuntimeMigrationHistorySha256(POSTGRES_RUNTIME_MIGRATIONS.primary);
+    return historySha256;
+  };
   return Object.freeze({
     readOverview: ({ nowEpoch, diagnosticReference }) => readPostgresAdminOverview({
       pool: pools.primary, schema, env, nowEpoch, diagnosticReference, sources: overviewSources,
@@ -152,6 +190,13 @@ export function createAdminConsoleAdapters(deps) {
     readAllowancePreview: ({ nowEpoch }) => readPostgresAdminAllowancePreview(pools.primary, schema, nowEpoch),
     readDatabaseHealth: () => readPostgresAdminDatabaseHealth({
       env, clock, pools: { primary: pools.primary, analytics: analyticsPool },
+    }),
+    readPerformanceIntake: async ({ nowEpoch }) => readPostgresAdminPerformanceIntake(pools.primary, {
+      schema: { primarySchema: schema },
+      nowEpoch,
+      routeClasses: ADMIN_PERFORMANCE_INTAKE_ROUTE_CLASSES,
+      deployment: { sourceCommit, historySha256: await deploymentHistorySha256() },
+      contractDictionaries: PERFORMANCE_FIELD_DICTIONARIES,
     }),
     ...(deps.readMetricsHistory === undefined ? {} : { readMetricsHistory: deps.readMetricsHistory }),
     readReconstructionProgress: deps.readReconstructionProgress === undefined
@@ -168,7 +213,7 @@ export function createAdminConsoleAdapters(deps) {
 }
 
 /**
- * The six handlers keyed by route id, each async (request) => Response. A
+ * The seven handlers keyed by route id, each async (request) => Response. A
  * root that passes deps.admin uses those adapters instead of the defaults
  * (tests and the edge-test origin).
  */
@@ -183,6 +228,7 @@ export function createAdminConsoleHandlers(deps) {
     ["admin_database_health", createAdminDatabaseHealthDispatch(familyDeps)],
     ["admin_reconstruction_progress", createAdminReconstructionProgressDispatch(familyDeps)],
     ["admin_action", createAdminActionDispatch(familyDeps)],
+    ["admin_performance_intake", createAdminPerformanceIntakeDispatch(familyDeps)],
   ]);
 }
 

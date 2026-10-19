@@ -28,6 +28,18 @@
  *     rows counted up to OPS_BACKLOG_CAP (10001, exact below it) and the age
  *     of the oldest undelivered row;
  *   - v1.2 delivery: age of the newest ready manifest;
+ *   - accountless performance intake (primary 0079): age of the newest
+ *     admitted report, read as max(created_at) over
+ *     telemetry_performance_receipts, one entry of its created_at index (a
+ *     receipt is written once per admitted report, accepted or replaced; an
+ *     idempotent replay writes none). While the runtime is staged, or before
+ *     the first report, there is no receipt and the signal is NO_DATA;
+ *   - community model performance: whole UTC days from the newest payload
+ *     `end` day over analytics_v2_published_performance (at most 12 heads) to
+ *     today. NO_DATA until the first publication; after it every refresh
+ *     republishes all 12 slots, so a withheld or failed refresh shows as a
+ *     growing age. A head whose `end` is not a YYYY-MM-DD day is
+ *     UNEXPECTED_RESULT, never skipped;
  *   - the database: size, transaction-id and multixact age, the cumulative
  *     deadlock and conflict counts (the probe keeps no state, so a consumer
  *     differences two lines);
@@ -261,6 +273,51 @@ function v12ManifestGroup(schema) {
   };
 }
 
+function performanceIntakeGroup(schema) {
+  const s = quoteSchema(schema);
+  return {
+    slots: [{ probe: "performance_newest_accepted_report_age_seconds" }],
+    async read(client) {
+      // max(created_at) is the last key of telemetry_performance_receipts_accepted_at:
+      // a backward index scan of one entry, never a scan of the receipts.
+      const rows = await one(client, `SELECT floor(EXTRACT(EPOCH FROM (clock_timestamp() - max(created_at))))::bigint::text AS age
+  FROM ${s}."telemetry_performance_receipts"`);
+      return [integerLine("performance_newest_accepted_report_age_seconds", rows[0]?.age,
+        { noRow: rows.length === 0, age: true })];
+    },
+  };
+}
+
+/** The `end` day a community-model-performance-v1 payload carries. */
+const PAYLOAD_END_DAY = "'^[0-9]{4}-[0-9]{2}-[0-9]{2}$'";
+
+function communityModelPerformanceGroup(schema) {
+  const s = quoteSchema(schema);
+  const probe = "community_model_performance_head_age_days";
+  return {
+    slots: [{ probe }],
+    async read(client) {
+      // At most 12 heads (period x speed mode). The cast runs only on an `end`
+      // that has the day shape; any other head is counted and refused below.
+      // A day-shaped but impossible date fails the cast (SQLSTATE class 22),
+      // which is QUERY_FAILED: closed either way, never a value.
+      const rows = await one(client, `SELECT count(*)::text AS heads,
+       count(*) FILTER (WHERE payload ->> 'end' ~ ${PAYLOAD_END_DAY})::text AS dated,
+       ((now() AT TIME ZONE 'UTC')::date
+         - max(CASE WHEN payload ->> 'end' ~ ${PAYLOAD_END_DAY} THEN (payload ->> 'end')::date END))::text AS age
+  FROM ${s}."analytics_v2_published_performance"`);
+      if (rows.length === 0) return [noData(probe)];
+      const heads = safeInteger(rows[0].heads);
+      const dated = safeInteger(rows[0].dated);
+      if (heads === null || dated === null) return [unreadable(probe, "UNEXPECTED_RESULT")];
+      if (heads === 0) return [noData(probe)];
+      // A head without a readable end day is a fault, not a head to leave out.
+      if (dated !== heads) return [unreadable(probe, "UNEXPECTED_RESULT")];
+      return [integerLine(probe, rows[0].age, { age: true })];
+    },
+  };
+}
+
 function journalHeadGroup(schema) {
   const s = quoteSchema(schema);
   return {
@@ -426,6 +483,7 @@ function activityGroup() {
 function collectGroups(schema) {
   return [
     maintenanceGroup(schema), analyticsGroup(schema), communityDailyGroup(schema), v12ManifestGroup(schema),
+    performanceIntakeGroup(schema), communityModelPerformanceGroup(schema),
     journalHeadGroup(schema), journalBacklogGroup(schema), databaseGroup(), databaseStatsGroup(), activityGroup(),
   ];
 }

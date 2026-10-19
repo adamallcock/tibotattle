@@ -304,7 +304,9 @@ export const PRODUCTION_IDENTITY_LINK_ROTATION_LABELS = Object.freeze({
   retiredKeyVersions: PRODUCTION_RETIRED_IDENTITY_LINK_VERSIONS,
 });
 /**
- * Every route a production registry may port (the classes it admits); the
+ * Every route a production registry may port (the classes it admits: scope,
+ * od-cr-1, admin and, since owner decision 2026-10-10, performance: 41
+ * routes, the two owner-decided routes of 2026-10-10 included); the
  * P8-R consumer refusal checks the identity-link consumers against it. Every
  * consumer is retired (round 12), and this set excludes the retired classes
  * by construction, so on the CLI path the refusal reduces to the registry
@@ -316,8 +318,7 @@ export const PRODUCTION_IDENTITY_LINK_ROTATION_LABELS = Object.freeze({
  * set; the CLI never does.
  */
 export const PRODUCTION_ADMISSIBLE_PORTED_ROUTE_IDS = Object.freeze(PRODUCTION_ROUTE_TABLE
-  .filter(route => ![PRODUCTION_ROUTE_CLASSES.RETIRED, PRODUCTION_ROUTE_CLASSES.RETIRED_DEFINITE,
-    PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
+  .filter(route => ![PRODUCTION_ROUTE_CLASSES.RETIRED, PRODUCTION_ROUTE_CLASSES.ROOT].includes(route.routeClass))
   .map(route => route.id));
 /** The finalize order (design sections 1 and 8). */
 export const FINALIZE_ORDER = Object.freeze([

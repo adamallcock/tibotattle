@@ -10,6 +10,18 @@ import { applyStockAndStagedMigrations, defaultAnalyticsV2FixtureStamps, listSta
 import { OPS_ACTIVITY_CLASSES, OPS_BACKLOG_CAP, OPS_PROBE_NAMES, OPS_PROBES, opsProbeNamesForJob, serializeOpsProbeLine }
   from "../cloud-run/ops-probe-contract.mjs";
 import { collectOpsRuntimeSignals, runLogRedactionProbe, runOpsRuntimeProbe } from "../cloud-run/ops-runtime-probe-job.mjs";
+import {
+  PERFORMANCE_DICTIONARY_2026_10_10,
+  PERFORMANCE_PUBLICATION_PERIODS,
+  PERFORMANCE_PUBLICATION_SPEED_MODES,
+  activatePerformanceRuntime,
+  insertPerformanceGrant,
+  insertPerformancePublicationHead,
+  insertPerformanceReport,
+  seedPerformanceAccountlessOwner,
+  syntheticCommunityModelPerformancePayload,
+  syntheticPerformanceRecord,
+} from "./fixtures/performance-telemetry.mjs";
 
 /*
  * PostgreSQL 17 qualification for the OPS-4 runtime liveness probe
@@ -24,6 +36,11 @@ import { collectOpsRuntimeSignals, runLogRedactionProbe, runOpsRuntimeProbe } fr
  * lifecycle guards belong to the writers under test elsewhere; here they only
  * need to leave a row for the probe to read) and remove them afterwards. Roles
  * are prefixed d_ops4_ and dropped. Every row and name is synthetic.
+ *
+ * The performance signals (primary 0079) are seeded through SPD-G1's shared
+ * fixtures (postgres-test/fixtures/performance-telemetry.mjs): the runtime is
+ * activated once through its audit path, and reports with their receipts and
+ * publication heads go in through the live guards.
  *
  * The primary chain is the stock set plus the one staged index this probe's
  * v1.2 manifest read depends on (found by its name suffix, staged or, once the
@@ -43,6 +60,9 @@ const SCHEMA = "d_ops4_primary";
 const OWNER_SENTINEL = "d0".repeat(32);
 const READY_AT_INDEX_SUFFIX = "_v12_ready_manifest_ready_at_index.sql";
 const READY_AT_INDEX = "telemetry_v12_manifests_ready_at";
+const RECEIPT_INDEX = "telemetry_performance_receipts_accepted_at";
+const RECEIPT_AGE = "performance_newest_accepted_report_age_seconds";
+const HEAD_AGE = "community_model_performance_head_age_days";
 
 /** The partial ready_at index migration: exactly one, staged or promoted. */
 async function readyAtIndexMigration() {
@@ -190,6 +210,9 @@ test("an empty migrated schema reports what it cannot know as unavailable, never
   assert.equal(unavailable(map, "analytics_refresh_completed_age_seconds"), "NO_DATA");
   assert.equal(unavailable(map, "community_daily_head_age_days"), "NO_DATA");
   assert.equal(unavailable(map, "v12_newest_ready_manifest_age_seconds"), "NO_DATA");
+  // The runtime is staged: no receipt, and no community model-performance head published yet.
+  assert.equal(unavailable(map, RECEIPT_AGE), "NO_DATA");
+  assert.equal(unavailable(map, HEAD_AGE), "NO_DATA");
   // No source row, so no journal: head, lag, pending and age all say NO_DATA.
   for (const name of ["ingestion_journal_head_sequence", "ingestion_journal_head_age_seconds", "analytics_journal_lag_sequences",
     "analytics_journal_pending_events", "analytics_journal_oldest_undelivered_age_seconds"]) {
@@ -529,6 +552,202 @@ test("the v1.2 manifest read walks the partial ready_at index: no scan of the ma
   }
 });
 
+let performanceRuntime;
+/** The performance runtime, activated once for the file through the fixture's audit path. */
+function activePerformanceRuntime() {
+  performanceRuntime ??= activatePerformanceRuntime(pool, { schema: SCHEMA, nowEpoch: Date.now() - 60 * 60_000 });
+  return performanceRuntime;
+}
+
+async function resetPerformanceSignals() {
+  // The receipts' delete guard and the heads' forward-only trigger refuse a DELETE; the seeding
+  // session (replica) bypasses them in this throwaway database only.
+  await seeding(async (client) => {
+    await client.query(`DELETE FROM ${table("telemetry_performance_receipts")}`);
+    await client.query(`DELETE FROM ${table("analytics_v2_published_performance")}`);
+  });
+}
+
+test("the performance receipt age is the newest admitted report, accepted or replaced", { skip: SKIP, timeout: 120_000 }, async () => {
+  await environment();
+  try {
+    await activePerformanceRuntime();
+    const owner = await seedPerformanceAccountlessOwner(pool, { schema: SCHEMA, issuedAtEpoch: Date.now() - 2 * 60 * 60_000 });
+    const grant = await insertPerformanceGrant(pool, { schema: SCHEMA, owner, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_10_10,
+      dictionaryBasis: "client_declared", nowEpoch: Date.now() - 30 * 60_000 });
+    const day = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    const record = (turns) => syntheticPerformanceRecord({ day, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_10_10, turns });
+    // A first report admitted 10 minutes ago.
+    const first = await insertPerformanceReport(pool, { schema: SCHEMA, owner, grant, reportDay: day, sourceRevision: 1,
+      records: [record(2)], nowEpoch: Date.now() - 10 * 60_000 });
+    assert.equal(first.outcome, "accepted");
+    let age = measured(await withClient((client) => probeLines(client)), RECEIPT_AGE);
+    assert.ok(age >= 600 && age < 620, `the one receipt, 10 minutes old: ${age}`);
+    // Its replacement 90 seconds ago is the newest admission: a replaced outcome counts too.
+    const replaced = await insertPerformanceReport(pool, { schema: SCHEMA, owner, grant, reportDay: day, sourceRevision: 2,
+      records: [record(3)], nowEpoch: Date.now() - 90_000 });
+    assert.equal(replaced.outcome, "replaced");
+    age = measured(await withClient((client) => probeLines(client)), RECEIPT_AGE);
+    assert.ok(age >= 90 && age < 110, `the replacement, 90 seconds old: ${age}`);
+    // A receipt stamped ahead of the database clock reads 0, never negative.
+    await insertPerformanceReport(pool, { schema: SCHEMA, owner, grant, reportDay: day, sourceRevision: 3,
+      records: [record(4)], nowEpoch: Date.now() + 60 * 60_000 });
+    assert.equal(measured(await withClient((client) => probeLines(client)), RECEIPT_AGE), 0);
+    // The relation absent (a schema before 0079): unavailable, not 0.
+    await pool.query(`ALTER TABLE ${table("telemetry_performance_receipts")} RENAME TO d_ops4_hidden_receipts`);
+    try {
+      assert.equal(unavailable(await withClient((client) => probeLines(client)), RECEIPT_AGE), "RELATION_ABSENT:42");
+    } finally {
+      await pool.query(`ALTER TABLE "${SCHEMA}"."d_ops4_hidden_receipts" RENAME TO telemetry_performance_receipts`);
+    }
+  } finally {
+    await resetPerformanceSignals();
+  }
+  assert.equal(unavailable(await withClient((client) => probeLines(client)), RECEIPT_AGE), "NO_DATA",
+    "with every receipt gone the signal is NO_DATA again, not 0");
+});
+
+test("the receipt read is one entry of the created_at index: no scan of the receipts", { skip: SKIP, timeout: 240_000 }, async () => {
+  await environment();
+  try {
+    await seeding(async (client) => {
+      // 20,000 synthetic receipts over a year (triggers and foreign keys off in this seeding session:
+      // only the instant matters to the probe). The newest is n = 1, one minute old.
+      await client.query(`INSERT INTO ${table("telemetry_performance_receipts")}
+        (id, participant_id, device_id, report_id, report_day, report_revision, envelope_digest, outcome, created_at)
+        SELECT gen_random_uuid()::text, 'd-ops4-receipt-p-' || (n % 50), 'd-ops4-receipt-d-' || n, gen_random_uuid()::text,
+               current_date - (n % 365), md5('r-a' || n::text) || md5('r-b' || n::text),
+               md5('e-a' || n::text) || md5('e-b' || n::text),
+               CASE WHEN n % 4 = 0 THEN 'replaced' ELSE 'accepted' END, now() - (n || ' minutes')::interval
+          FROM generate_series(1, 20000) AS n`);
+    });
+    await pool.query(`ANALYZE ${table("telemetry_performance_receipts")}`);
+    const issued = [];
+    await withClient(async (real) => {
+      const recording = { query: (text, values) => { issued.push({ text, values }); return real.query(text, values); } };
+      const lines = await collectOpsRuntimeSignals({ client: recording, schema: SCHEMA });
+      const age = new Map(lines.map((line) => [line.probe, line])).get(RECEIPT_AGE);
+      assert.equal(age.state, "ok");
+      assert.ok(age.value >= 60 && age.value < 90, `the newest receipt is one minute old: ${age.value}`);
+    });
+    const reads = issued.filter((entry) => entry.text.includes('"telemetry_performance_receipts"'));
+    assert.equal(reads.length, 1, "the receipt age is one statement");
+    const receiptScans = (plan) => planNodes(plan).filter((node) => node["Relation Name"] === "telemetry_performance_receipts");
+    const scansOf = async (explain, client = pool) => receiptScans((await client.query(`${explain} ${reads[0].text}`, reads[0].values)).rows[0]["QUERY PLAN"]);
+    const planned = await scansOf("EXPLAIN (FORMAT JSON)");
+    assert.ok(planned.length > 0, "the plan reads the receipts");
+    for (const node of planned) {
+      assert.match(node["Node Type"], /^Index (Only )?Scan$/u, `no sequential scan of the receipts: ${node["Node Type"]}`);
+      assert.equal(node["Index Name"], RECEIPT_INDEX);
+      assert.equal(node["Scan Direction"], "Backward", "the newest created_at is the last key of the index");
+    }
+    const analyzed = await scansOf("EXPLAIN (ANALYZE, FORMAT JSON)");
+    for (const node of analyzed) assert.ok(node["Actual Rows"] <= 1, `the scan returns one row: ${node["Actual Rows"]}`);
+    // The control: without the index the same statement reads every receipt (a table scan, or a full
+    // walk of the owner index), so the one-entry assertions above fail for an unindexed read. DROP INDEX
+    // is transactional and rolled back.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DROP INDEX ${table(RECEIPT_INDEX)}`);
+      const without = await scansOf("EXPLAIN (ANALYZE, FORMAT JSON)", client);
+      assert.ok(without.length > 0);
+      assert.equal(without.some((node) => node["Index Name"] === RECEIPT_INDEX), false);
+      assert.ok(without.some((node) => node["Actual Rows"] >= 20_000),
+        `without the index the read visits every receipt: ${without.map((node) => `${node["Node Type"]}:${node["Actual Rows"]}`)}`);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+    const indexed = await pool.query(`SELECT pg_get_indexdef(index_class.oid) AS definition
+      FROM pg_class index_class WHERE index_class.relname = $1 AND index_class.relnamespace = $2::regnamespace`, [RECEIPT_INDEX, `"${SCHEMA}"`]);
+    assert.equal(indexed.rowCount, 1, "the rolled-back control left the index in place");
+    assert.match(indexed.rows[0].definition, /\(created_at\)$/u);
+  } finally {
+    await resetPerformanceSignals();
+  }
+});
+
+test("the community model-performance head age is whole UTC days since the newest payload end day", { skip: SKIP, timeout: 120_000 }, async () => {
+  await environment();
+  // The UTC days the database reads, as text, so no client time zone enters the expectation.
+  const days = new Map((await pool.query(`SELECT offset_days, to_char((now() AT TIME ZONE 'UTC')::date + offset_days, 'YYYY-MM-DD') AS day
+    FROM unnest(ARRAY[-60, -2, -1, 3]) AS offset_days`)).rows.map((row) => [row.offset_days, row.day]));
+  const utcDay = (offset) => days.get(offset);
+  const head = (period, speedMode, end, revision = 1, overrides = {}) => insertPerformancePublicationHead(pool, {
+    schema: SCHEMA,
+    payload: syntheticCommunityModelPerformancePayload({ period, speedMode, end, revision,
+      ...(period === "all" ? { start: utcDay(-60) } : {}), ...overrides }),
+  });
+  try {
+    // All 12 slots of a run that published through the day before yesterday, then one slot a day newer.
+    for (const period of PERFORMANCE_PUBLICATION_PERIODS) {
+      for (const speedMode of PERFORMANCE_PUBLICATION_SPEED_MODES) await head(period, speedMode, utcDay(-2));
+    }
+    assert.equal(measured(await withClient((client) => probeLines(client)), HEAD_AGE), 2);
+    await seeding((client) => client.query(`UPDATE ${table("analytics_v2_published_performance")}
+      SET revision = 2, payload = jsonb_set(jsonb_set(jsonb_set(payload, '{revision}', '2'), '{end}', to_jsonb($1::text)),
+            '{start}', to_jsonb($1::text)), payload_sha256 = md5('r2') || md5('r2b')
+      WHERE period = '1' AND speed_mode = 'standard'`, [utcDay(-1)]));
+    assert.equal(measured(await withClient((client) => probeLines(client)), HEAD_AGE), 1, "the newest end day of the 12 heads");
+    // An end day ahead of the UTC date reads 0, never negative.
+    await seeding((client) => client.query(`UPDATE ${table("analytics_v2_published_performance")}
+      SET payload = jsonb_set(payload, '{end}', to_jsonb($1::text)) WHERE period = '7' AND speed_mode = 'fast'`, [utcDay(3)]));
+    assert.equal(measured(await withClient((client) => probeLines(client)), HEAD_AGE), 0);
+    // A head whose end is not a day is a fault, never skipped in favour of the others.
+    await seeding((client) => client.query(`UPDATE ${table("analytics_v2_published_performance")}
+      SET payload = jsonb_set(payload, '{end}', '"not-a-day"') WHERE period = '7' AND speed_mode = 'fast'`));
+    assert.equal(unavailable(await withClient((client) => probeLines(client)), HEAD_AGE), "UNEXPECTED_RESULT");
+    await seeding((client) => client.query(`UPDATE ${table("analytics_v2_published_performance")}
+      SET payload = payload - 'end' WHERE period = '7' AND speed_mode = 'fast'`));
+    assert.equal(unavailable(await withClient((client) => probeLines(client)), HEAD_AGE), "UNEXPECTED_RESULT");
+    // The relation absent (a schema before 0079): unavailable, not 0.
+    await pool.query(`ALTER TABLE ${table("analytics_v2_published_performance")} RENAME TO d_ops4_hidden_heads`);
+    try {
+      assert.equal(unavailable(await withClient((client) => probeLines(client)), HEAD_AGE), "RELATION_ABSENT:42");
+    } finally {
+      await pool.query(`ALTER TABLE "${SCHEMA}"."d_ops4_hidden_heads" RENAME TO analytics_v2_published_performance`);
+    }
+  } finally {
+    await resetPerformanceSignals();
+  }
+  assert.equal(unavailable(await withClient((client) => probeLines(client)), HEAD_AGE), "NO_DATA",
+    "with no head published the signal is NO_DATA, not 0");
+});
+
+test("a performance read that outlasts 2000 ms is STATEMENT_TIMEOUT, and a held lock is LOCK_TIMEOUT", { skip: SKIP, timeout: 120_000 }, async () => {
+  await environment();
+  const slow = "d_ops4_slow_performance";
+  await pool.query(`CREATE SCHEMA "${slow}"`);
+  try {
+    await pool.query(`CREATE VIEW "${slow}".telemetry_performance_receipts AS SELECT now() AS created_at FROM pg_sleep(3)`);
+    await pool.query(`CREATE VIEW "${slow}".analytics_v2_published_performance AS SELECT '{"end":"2026-10-10"}'::jsonb AS payload FROM pg_sleep(3)`);
+    const started = Date.now();
+    const map = await withClient((client) => probeLines(client, slow));
+    assert.equal(unavailable(map, RECEIPT_AGE), "STATEMENT_TIMEOUT:57");
+    assert.equal(unavailable(map, HEAD_AGE), "STATEMENT_TIMEOUT:57");
+    assert.ok(Date.now() - started < 10_000, "each read ends at its own 2000 ms bound");
+    assert.equal(measured(map, "database_size_bytes") > 0, true);
+  } finally {
+    await pool.query(`DROP SCHEMA "${slow}" CASCADE`);
+  }
+  const holder = await pool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query(`LOCK TABLE ${table("analytics_v2_published_performance")} IN ACCESS EXCLUSIVE MODE`);
+    await holder.query(`LOCK TABLE ${table("telemetry_performance_receipts")} IN ACCESS EXCLUSIVE MODE`);
+    const started = Date.now();
+    const map = await withClient((client) => probeLines(client));
+    assert.equal(unavailable(map, RECEIPT_AGE), "LOCK_TIMEOUT:55");
+    assert.equal(unavailable(map, HEAD_AGE), "LOCK_TIMEOUT:55");
+    assert.ok(Date.now() - started < 5_000, "the bound, not the holder, ends the wait");
+    assert.equal(unavailable(map, "community_daily_head_age_days"), "NO_DATA", "the neighbours still answer");
+  } finally {
+    await holder.query("ROLLBACK");
+    holder.release();
+  }
+});
+
 test("every probe transaction is read only, with the two bounds, on a real session", { skip: SKIP, timeout: 120_000 }, async () => {
   await environment();
   await withClient(async (real) => {
@@ -549,8 +768,8 @@ test("every probe transaction is read only, with the two bounds, on a real sessi
     };
     const lines = await collectOpsRuntimeSignals({ client: guarded, schema: SCHEMA });
     assert.ok(lines.length > 20);
-    assert.equal(checked.begins, 9);
-    assert.ok(checked.selects >= 9);
+    assert.equal(checked.begins, 11);
+    assert.ok(checked.selects >= 11);
     // Outside its transactions the session is back to its own defaults: nothing leaked.
     assert.equal((await real.query("SHOW statement_timeout")).rows[0].statement_timeout, "0");
     assert.equal((await real.query("SHOW transaction_read_only")).rows[0].transaction_read_only, "off");

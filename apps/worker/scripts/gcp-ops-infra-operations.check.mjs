@@ -205,12 +205,15 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
   assert.equal(result.synthetic, true);
   assert.deepEqual(result.blockers, []);
   assert.deepEqual(result.findings, []);
-  // The fixture's three jobs and the maintenance trigger (created, paused, then
-  // granted) add four; the refresh trigger's create and the scheduler's
-  // executor grant on the refresh job wait for the owner's cadence.
+  // The fixture's four jobs and the maintenance trigger (created, paused, then
+  // granted) add five; the refresh trigger's create and the scheduler's
+  // executor grant on the refresh job wait for the owner's cadence. The
+  // manual reprice job (OPS-REPRICE) has no trigger and no executor grant.
   // Round 12 retired the two sign-in secrets, so the fixture holds five containers.
   // BUILD-SOURCE adds the builder's read binding on the project's default Cloud Build bucket.
-  assert.deepEqual(result.summary, { executable: 37, deferred: 2, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 38, deferred: 2, refused: 0 });
+  assert.deepEqual(ops(result, (entry) => entry.id.includes("analytics-reprice")).map((entry) => entry.id),
+    ["run-job:create:analytics-reprice"]);
   const byId = new Map(result.operations.map((entry) => [entry.id, entry]));
   // The operator's token-creator grant on the verifier account alone.
   assert.deepEqual(byId.get("verifier-iam:bind:roles/iam.serviceAccountTokenCreator|group:synthetic-operators@example.com|")
@@ -247,11 +250,20 @@ test("the plan for the synthetic fixture holds the whole estate and no bucket ch
     `${desired.artifactRegistry.imageRepository}@sha256:${BOOTSTRAP.imageDigest}`);
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-service-iam:bind:")).map((entry) => entry.argv.at(-1)),
     ["--role=roles/run.invoker", "--role=roles/run.invoker"]);
-  // Exactly the three fast-path jobs, all created; only the refresh trigger
+  // Exactly the four fast-path jobs, all created; only the refresh trigger
   // waits, for the owner's cadence, and with it the scheduler's executor grant
   // on the refresh job. The maintenance trigger has its own: every minute.
   assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => entry.id),
-    ["run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance"]);
+    ["run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance",
+      "run-job:create:analytics-reprice"]);
+  // The manual reprice job: the entry alone, as the runtime account, with the
+  // refresh job's env and no secret; executions supply their own arguments.
+  const repriceJob = JSON.parse(byId.get("run-job:create:analytics-reprice").file.content);
+  const repriceTask = repriceJob.spec.template.spec.template.spec;
+  assert.deepEqual(repriceTask.containers[0].args, ["dist/analytics-reprice.mjs"]);
+  assert.equal(repriceTask.serviceAccountName, desired.serviceAccounts.runtime.email);
+  assert.equal(repriceTask.maxRetries, 0);
+  assert.equal(repriceTask.containers[0].env.some((entry) => entry.valueFrom !== undefined), false);
   const maintenance = JSON.parse(byId.get("run-job:create:maintenance").file.content);
   assert.deepEqual(maintenance.spec.template.spec.template.spec.containers[0].args,
     ["dist/postgres-maintenance-job.mjs", "--profile=maintenance-job"]);
@@ -430,7 +442,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP, ...UNDEFERRED });
-  assert.deepEqual(result.summary, { executable: 40, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
   gcloud.calls.length = 0;
   const receipt = operations.applyInfrastructure(desired, { runner: gcloud.runner, authorize: result.planDigest,
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create(), ...UNDEFERRED });
@@ -443,7 +455,7 @@ test("apply runs only the authorized plan, mutating only after its reads, and co
   const firstMutation = sequence.indexOf("mutate");
   const lastMutation = sequence.lastIndexOf("mutate");
   assert.ok(firstMutation > 0 && sequence.slice(0, firstMutation).every((kind) => kind === "read"));
-  assert.equal(sequence.filter((kind) => kind === "mutate").length, 40);
+  assert.equal(sequence.filter((kind) => kind === "mutate").length, 41);
   assert.ok(sequence.slice(lastMutation + 1).every((kind) => kind === "read"));
   // Both triggers were created and then paused; apply never resumes either.
   assert.equal(trigger(world).state, "PAUSED");
@@ -465,7 +477,7 @@ test("by default the analytics-refresh job deploys, and its trigger is created a
   const world = bornWorld(desired);
   const gcloud = fake(desired, world);
   const result = plan(desired, gcloud.runner, { bootstrap: BOOTSTRAP });
-  assert.deepEqual(result.summary, { executable: 40, deferred: 0, refused: 0 });
+  assert.deepEqual(result.summary, { executable: 41, deferred: 0, refused: 0 });
   // Create, then pause at once, then (only then) the scheduler's run.jobsExecutor, for each trigger in turn.
   const executor = `run-job-iam:analytics-refresh:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
   const maintenanceExecutor = `run-job-iam:maintenance:bind:roles/run.jobsExecutor|${desired.serviceAccounts.scheduler.member}|`;
@@ -476,7 +488,10 @@ test("by default the analytics-refresh job deploys, and its trigger is created a
     bootstrap: BOOTSTRAP, createSpecWriter: () => gcloud.writer.create() });
   assert.deepEqual({ ...receipt.remaining, planDigest: null }, { planDigest: null, executable: 0, deferred: 0, refused: 0 });
   assert.deepEqual(world.jobs.map((job) => job.metadata.name),
-    ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance"]);
+    ["synthetic-production-migrate", "synthetic-analytics-refresh", "synthetic-maintenance",
+      "synthetic-analytics-reprice"]);
+  // The manual reprice job carries no scheduler executor grant: only the operator executes it.
+  assert.equal(JSON.stringify(world.jobPolicies["synthetic-analytics-reprice"] ?? {}).includes("roles/run.jobsExecutor"), false);
   assert.equal(trigger(world).state, "PAUSED");
   assert.equal(maintenanceTrigger(world).state, "PAUSED");
   const after = plan(desired, gcloud.runner);
@@ -553,7 +568,7 @@ test("the scheduler's executor grant follows its trigger: withheld while the cad
   assert.deepEqual(ops(first, (entry) => entry.deferred !== undefined).map((entry) => [entry.id, entry.deferred]),
     [[create, "SCHEDULER_CADENCE_UNSET"], [EXECUTOR(unset), "SCHEDULER_CADENCE_UNSET"]]);
   apply(unset, gcloud, first, { bootstrap: BOOTSTRAP });
-  assert.deepEqual([granted(world), trigger(world), world.schedulerJobs.length, world.jobs.length], [false, undefined, 1, 3]);
+  assert.deepEqual([granted(world), trigger(world), world.schedulerJobs.length, world.jobs.length], [false, undefined, 1, 4]);
   assert.equal(operations.infrastructureCleanliness(plan(unset, gcloud.runner, UNDEFERRED)).clean, true);
 
   // The owner commits a cadence: the next plan creates, pauses, and only then grants.
@@ -753,12 +768,14 @@ test("apply never changes a live image or source commit, and refuses an unneeded
 test("first creates wait for a bootstrap image and the owner's pinned, enabled secret versions", () => {
   const desired = desiredState({ synthetic: false });
   const noImage = plan(desired, fake(desired, bornWorld(desired)).runner);
-  // The service, its two invoker binds and the three jobs wait for an image; the
+  // The service, its two invoker binds and the four jobs wait for an image; the
   // refresh trigger for its cadence, and the scheduler's grant for each scheduled job
   // (the maintenance trigger itself is created, paused, with no image to wait for).
   assert.deepEqual(noImage.operations.filter((entry) => entry.deferred !== undefined).map((entry) => entry.deferred),
-    [...Array(6).fill("BOOTSTRAP_IMAGE_REQUIRED"), "SCHEDULER_CADENCE_UNSET", "BOOTSTRAP_IMAGE_REQUIRED",
+    [...Array(7).fill("BOOTSTRAP_IMAGE_REQUIRED"), "SCHEDULER_CADENCE_UNSET", "BOOTSTRAP_IMAGE_REQUIRED",
       "BOOTSTRAP_IMAGE_REQUIRED"]);
+  assert.equal(noImage.operations.find((entry) => entry.id === "run-job:create:analytics-reprice").deferred,
+    "BOOTSTRAP_IMAGE_REQUIRED");
   assert.equal(operations.infrastructureCleanliness(noImage).clean, false);
   const noValues = plan(desired, fake(desired, bornWorld(desired, { secrets: false })).runner, { bootstrap: BOOTSTRAP });
   assert.equal(noValues.operations.find((entry) => entry.id === "run-service:create").deferred,
@@ -1009,6 +1026,7 @@ function sharedStaging(value) {
   value.jobs["production-migrate"].name = "synthetic-staging-migrate";
   value.jobs["analytics-refresh"].name = "synthetic-staging-refresh";
   value.jobs.maintenance.name = "synthetic-staging-maintenance";
+  value.jobs["analytics-reprice"].name = "synthetic-staging-reprice";
   value.scheduler["analytics-refresh"].name = "synthetic-staging-trigger";
   value.scheduler.maintenance.name = "synthetic-staging-maintenance-trigger";
   for (const [name, secret] of Object.entries(value.secrets)) {
@@ -1050,7 +1068,8 @@ test("a shared project's co-tenants and project-wide settings are never read int
     `DEFERRED:run-job-iam:maintenance:bind:roles/run.jobsExecutor|${shared.serviceAccounts.scheduler.member}|:STAGING_ORIGIN_UNASSIGNED`,
   ]);
   assert.deepEqual(world.jobs.filter((job) => /staging/u.test(job.metadata.name)).map((job) => job.metadata.name),
-    ["synthetic-staging-migrate", "synthetic-staging-refresh"], "no staging maintenance job exists");
+    ["synthetic-staging-migrate", "synthetic-staging-refresh", "synthetic-staging-reprice"],
+    "no staging maintenance job exists (the reprice job reads no stagingOrigin value)");
   assert.equal(world.schedulerJobs.some((job) => job.name.endsWith("synthetic-staging-maintenance-trigger")), false);
   for (const [key, value] of Object.entries(before)) {
     const now = key === "auditConfigs" ? world.projectPolicy.auditConfigs
@@ -1212,7 +1231,7 @@ test("the maintenance job and its trigger wait for what only the desired state a
     // Every other job still renders and is created.
     assert.deepEqual(ops(result, (entry) => entry.id.startsWith("run-job:")).map((entry) => [entry.id, entry.deferred]),
       [["run-job:create:production-migrate", undefined], ["run-job:create:analytics-refresh", undefined],
-        ["run-job:create:maintenance", reason]]);
+        ["run-job:create:maintenance", reason], ["run-job:create:analytics-reprice", undefined]]);
     assert.ok(operations.infrastructureCleanliness(result).reasons.includes(`DEFERRED:run-job:create:maintenance:${reason}`));
     assert.equal(ops(result, (entry) => entry.id === "scheduler:pause:maintenance").length, 0);
   }

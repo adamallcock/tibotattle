@@ -219,9 +219,19 @@ test("the closure holds every module that decides a stored value and no I/O plum
     "apps/worker/cloud-run/analytics-refresh-worker.mjs", "packages/telemetry-contract/index.js",
     // K-PERCARD: the price attribution decides analytics_v2_owner_day_price, the transition proof the stale sets.
     "apps/worker/src/analytics-v2/price-attribution.ts", "apps/worker/src/analytics-v2/price-transition.ts",
+    // SPD-P3: the performance reader and fold decide analytics_v2_published_performance;
+    // contract.ts names the optional run field they fill.
+    "apps/worker/src/analytics-v2/performance-source.ts", "apps/worker/src/analytics-v2/compute-performance.ts",
+    "apps/worker/src/analytics-v2/contract.ts",
   ]) {
     assert.ok(names.has(decides), `${decides} decides stored values and is in the closure`);
   }
+  // The performance publication's store-side contract is plumbing: contract.ts
+  // and the fold import it type-only (erased), so naming a table, a store code
+  // or the store's digest there mints no compute class. A runtime import from
+  // a closure module would put it here and fail.
+  assert.equal(names.has("apps/worker/src/analytics-v2/performance-publication-contract.ts"), false,
+    "performance-publication-contract.ts is no closure input");
   assert.ok(report.names.some((name) => name.startsWith("apps/worker/vendor/analytics-d43c8f92/")));
   for (const plumbing of ANALYTICS_KERNEL_CLOSURE_PLUMBING) {
     assert.equal(names.has(plumbing), false, `${plumbing} is I/O plumbing`);
@@ -272,7 +282,9 @@ test("the allowance projection decides the stored preview: compute class changes
 
 test("a change to the community fold, the occurrence reader or the owner-set reader is a closure no entry names, and the build refuses it", async () => {
   const value = await registry();
-  for (const module of ["compute-community.ts", "occurrence-source.ts", "owners.ts", "owner-sets.ts"]) {
+  for (const module of ["compute-community.ts", "occurrence-source.ts", "owners.ts", "owner-sets.ts",
+    // SPD-P3: the performance fold and its reader.
+    "compute-performance.ts", "performance-source.ts"]) {
     const target = join(WORKER_ROOT, "src", "analytics-v2", module);
     const mutated = await identityWith(async (path, ...rest) => {
       const bytes = await readFile(path, ...rest);

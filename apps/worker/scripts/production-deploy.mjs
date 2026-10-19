@@ -80,6 +80,8 @@ export const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/api/v1/admin/community/allowance-preview",
   "/api/v1/admin/reconstruction-progress",
   "/api/v1/admin/database-health",
+  // Owner-decided 2026-10-10: the read-only performance-intake view.
+  "/api/v1/admin/performance-intake",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',

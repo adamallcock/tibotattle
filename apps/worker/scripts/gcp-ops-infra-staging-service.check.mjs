@@ -262,7 +262,10 @@ test("STAGING-MAINT-RENDER: the staging maintenance job reads stagingOrigin as t
   assert.throws(() => manifest.renderJob(desired((value) => { value.bucket.proof = null; }), "maintenance", IMAGE),
     { code: "JOB_RENDER_BUCKET_PROOF_UNPINNED" });
   assert.equal(manifest.jobRenderBlocker(staging, "maintenance"), null);
-  assert.deepEqual([...manifest.deployedJobNames(staging)], ["production-migrate", "analytics-refresh", "maintenance"]);
+  assert.deepEqual([...manifest.deployedJobNames(staging)],
+    ["production-migrate", "analytics-refresh", "maintenance", "analytics-reprice"]);
+  // The manual reprice job reads no plane value, so it renders whatever the stagingOrigin block holds.
+  assert.equal(manifest.jobRenderBlocker(desired((value) => { value.stagingOrigin = null; }), "analytics-reprice"), null);
   // The committed staging file renders it as it stands.
   const committed = manifest.loadCommittedDesiredState("staging");
   const committedEnv = Object.fromEntries(jobContainer(manifest.renderJob(committed, "maintenance", IMAGE)).env
@@ -517,7 +520,7 @@ test("the live staging path (in memory): pass 1 applied before BUILD-SOURCE, the
   // Pass 2 (the bootstrap image) then holds no build-source operation and converges.
   const second = plan({ bootstrap: IMAGE });
   assert.equal(second.operations.some((entry) => entry.id.startsWith("build-source-bucket")), false);
-  assert.equal(second.summary.executable, 7);
+  assert.equal(second.summary.executable, 8);
   apply(second, { bootstrap: IMAGE });
   assert.deepEqual(operations.infrastructureCleanliness(plan()), { clean: true, reasons: [] });
 });
@@ -567,6 +570,7 @@ test("the staging apply rehearsal (in memory): pass 1 builds the plane, pass 2 t
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-invoker@tibotattle.iam.gserviceaccount.com|",
     "run-service-iam:bind:roles/run.invoker|serviceAccount:tibotattle-staging-verifier@tibotattle.iam.gserviceaccount.com|",
     "run-job:create:production-migrate", "run-job:create:analytics-refresh", "run-job:create:maintenance",
+    "run-job:create:analytics-reprice",
     "run-job-iam:maintenance:bind:roles/run.jobsExecutor|serviceAccount:tibotattle-staging-scheduler@tibotattle.iam.gserviceaccount.com|",
   ]);
   assert.ok(deferred(second).includes(

@@ -161,6 +161,13 @@ export const ANALYTICS_KERNEL_CLOSURE_ROOTS = Object.freeze([
   "apps/worker/src/analytics-v2/reprice-store.ts",
   // The writer binds archived pricing inputs to exact contribution versions.
   "apps/worker/src/analytics-v2/store-owner-sets.ts",
+  // SPD-P3: the community model performance stage. The A-1 performance
+  // reader (its decode and record rebuild) and the fold that decides
+  // analytics_v2_published_performance. Its store-side contract
+  // (performance-publication-contract.ts) reaches the closure only as
+  // erased type imports, so it is no input (the registry check asserts it).
+  "apps/worker/src/analytics-v2/performance-source.ts",
+  "apps/worker/src/analytics-v2/compute-performance.ts",
 ]);
 /**
  * I/O plumbing (repository paths): never in the closure and never walked
