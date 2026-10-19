@@ -44,12 +44,6 @@ dependency update, or Wrangler configuration change.
   can serve.
 - The generator, provenance/staging/deployment guards, their focused tests, and
   the release-lane runbooks.
-- The named focused public-site tests, for example
-  `apps/web/test/community-site.test.mjs`,
-  `apps/web/test/feature-insights.test.mjs` and
-  `apps/web/test/model-performance.test.mjs`, which cover the public
-  community model-performance reader and view. The test list is exact: a new
-  test or fixture file under `apps/web/test/` is refused until the lane names it.
 - The canonical message catalogue `packages/i18n/index.js`, paired with its
   regenerated browser mirror `apps/web/public/i18n.generated.js`.
 - The canonical model catalogue `packages/telemetry-contract/src/model-catalog.js`,
@@ -221,12 +215,7 @@ the candidate diff.
 The final `git status` must print nothing; generated `.release-build` output is
 ignored. Inspect the generated page with the normal local preview workflow and
 confirm the installer version, download URL, canonical/social metadata, and
-the changed public interaction. For a model-performance change, use the
-preview's `--offline` mode to review the view against its labelled synthetic
-slot. The default mode only shows what the public origin answers on
-`/api/v1/community/model-performance`; a `404` there means the route or slot is
-not live, not that the candidate is broken. Admitting the route's site files to
-this lane deploys no origin or edge route. Do not treat a generated manifest from another
+the changed public interaction. Do not treat a generated manifest from another
 checkout or a previously built directory as evidence for this candidate.
 
 ## 4. Deploy only after explicit production authorization

@@ -140,7 +140,6 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "apps/web/test/community-cache-retention.test.mjs",
   "apps/web/test/cache-reuse-matrix.test.mjs",
   "apps/web/test/feature-insights.test.mjs",
-  "apps/web/test/model-performance.test.mjs",
   "docs/runbooks/2026-08-17-web-only-release.md",
   "docs/runbooks/2026-08-17-public-site-local-preview.md",
   "docs/runbooks/macos-stable-release-runbook.md",

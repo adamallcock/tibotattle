@@ -156,7 +156,6 @@ test("web-only scope accepts only committed public source and release controls",
   ]) assert.equal(isAllowedWebReleasePath(`apps/web/public/${asset}`), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/cache-reuse-matrix.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/feature-insights.test.mjs"), true);
-  assert.equal(isAllowedWebReleasePath("apps/web/test/model-performance.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/test/feature-tour.test.mjs"), true);
   assert.equal(isAllowedWebReleasePath("apps/web/public/feature-tour-private.js"), false);
   // Still an exact allowlist, not a prefix: a sibling nobody named stays out.
@@ -169,41 +168,6 @@ test("web-only scope accepts only committed public source and release controls",
     true,
   );
   assert.equal(isAllowedWebReleasePath("apps/macos/Sources/UsageMonitorApp.swift"), false);
-});
-
-test("web-only scope admits the community model-performance closure and nothing beside it", () => {
-  // The public reader, its view and their focused tests move as one site change.
-  for (const path of [
-    "apps/web/public/model-performance.js",
-    "apps/web/public/model-performance.css",
-    "apps/web/public/community-data.js",
-    "apps/web/public/feature-insights.js",
-    "apps/web/public/community.js",
-    "apps/web/test/model-performance.test.mjs",
-    "apps/web/test/feature-insights.test.mjs",
-    "apps/web/test/community-site.test.mjs",
-    "scripts/preview-public-release-site.js",
-    "test/public-release-site-preview.test.js",
-  ]) assert.equal(isAllowedWebReleasePath(path), true, path);
-  // The contract, the desktop client and the Worker route stay outside the lane,
-  // and no new web test, fixture or nested public module is admitted by proximity.
-  for (const path of [
-    "packages/telemetry-contract/src/telemetry-performance-v1.js",
-    "packages/telemetry-contract/src/telemetry-v1.1.js",
-    "packages/telemetry-contract/index.js",
-    "packages/telemetry-contract/index.d.ts",
-    "apps/electron/main.js",
-    "apps/electron/desktop-copy.js",
-    "apps/worker/src/index.ts",
-    "apps/worker/src/route-registry.ts",
-    "apps/worker/src/analytics-v2/community-model-performance-route.ts",
-    "apps/worker/test/community-model-performance-endpoint.spec.ts",
-    "apps/web/public/telemetry-shared.generated.js.map",
-    "apps/web/public/dashboard-ui.js",
-    "apps/web/public/model-performance/index.js",
-    "apps/web/test/model-performance-community.test.mjs",
-    "apps/web/test/fixtures/community-model-performance.json",
-  ]) assert.equal(isAllowedWebReleasePath(path), false, path);
 });
 
 test("web-only scope rejects a client change even when a public site change is present", async (t) => {

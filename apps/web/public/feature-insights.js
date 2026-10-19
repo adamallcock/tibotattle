@@ -1,11 +1,8 @@
 import { createCacheReuseMatrix } from './cache-reuse-matrix.js';
-import { mountModelPerformance, normalizeCommunityPerformanceDisplay } from './model-performance.js';
-import { normalizeCommunityModelPerformance } from './community-data.js';
+import { mountModelPerformance } from './model-performance.js';
 import { formatModelName } from './ui-format.js';
 
-// Isolated, deterministic illustration inputs. The module itself makes no
-// companion or hosted request: measured evidence arrives only through the
-// loaders the public page injects into mountExampleInsights.
+// Isolated, deterministic illustration inputs. No companion or hosted requests.
 export function exampleCacheImpact() {
   // The same ten buckets the hosted lane measures, so the illustration cannot
   // show a shape the real curve is incapable of producing.
@@ -35,13 +32,11 @@ export function exampleModelSpeeds(period='all', speedMode='standard') {
   const activity=[42,67,31,85,56,12,7,49,104,73,38,61,19,9,54,88,126,46,72,14,5,65,97,43,112,58,21,8,76,51];
   const speeds=[62,58,71,47,53,79,66,60,39,51,68,57,74,82,63,48,44,59,70,76,64,55,41,67,50,61,78,69,56,65];
   const latency=[1.4,2.1,1.1,3.8,1.7,.9,1.6,2.3,4.9,2.6,1.3,1.8,1.2,.8,2.7,1.9,3.4,1.5,2.2,1.1,1.8,3.1,2.4,1.2,4.2,1.7,.9,1.4,2.8,1.6];
-  if (!['standard','fast','ultrafast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
+  if (!['standard','fast'].includes(speedMode)) throw new RangeError('Unsupported speed mode');
   return {schemaVersion:5,method:5,speedMode,excludedUnknownTurns:0,status:'ready',collecting:false,stale:false,updatedAt:new Date(end+86400000-1).toISOString(),period,interval:'day',start,end,historyProgress:null,
-    // The public page's pinned comparison, in Standard only: Fast and Ultrafast
-    // have no illustrative rows, so those modes render their empty state rather
-    // than an error. GPT-6.1 Sol is left out: the public page names it only once
-    // the served catalog adds it (owner rounds 5 and 11).
-    models:speedMode!=='standard'?[]:[
+    // The public page's pinned comparison. GPT-6.1 Sol is left out: the public
+    // page names it only once the served catalog adds it (owner rounds 5 and 11).
+    models:speedMode==='fast'?[]:[
       ['gpt-6-astra','Astra'],['gpt-6-sol','GPT-6 Sol'],['gpt-6-luna','GPT-6 Luna'],
       ['gpt-5.6-terra','Terra'],['gpt-5.6-sol','Sol'],['gpt-5.6-luna','Luna'],
     ].map(([id,label],index)=>{
@@ -61,49 +56,7 @@ export function exampleModelSpeeds(period='all', speedMode='standard') {
       return {id,label,toolFreeTurns:0,toolFree:[],turns:speedTurns+days*2,speedTurns,ttftTurns,timedResponses:ttftTurns,speed:[{method:'speed',points:history.map(p=>p.speed)}],ttft:history.map(p=>p.ttft)};
     })};
 }
-// A demo label that becomes a measurement keeps its key, not just its text, so
-// the localizer's next pass translates the new label instead of restoring the
-// "Synthetic demonstration" text the markup started with.
-function relabelMeasured(label,t,key){
-  if(!label)return;
-  label.setAttribute('data-i18n',key);
-  label.textContent=t(key);
-}
-// The slot the tour probes before it swaps anything: the widest window in the
-// default mode, which is also the slot the measured view opens on.
-export const HOSTED_SPEED_PROBE=Object.freeze({period:'all',speedMode:'standard'});
-/**
- * True only for a published community slot that the display adapter accepts
- * and that names at least one model. The reader has already dropped models
- * the public catalog cannot name, so an empty list here means nothing the
- * page could label was measured -- the demonstration stays.
- */
-export function hostedSpeedPublicationUsable(result,slot=HOSTED_SPEED_PROBE){
-  if(!result||typeof result!=='object'||result.state!=='published')return false;
-  if(result.period!==slot.period||result.speedMode!==slot.speedMode)return false;
-  const display=normalizeCommunityPerformanceDisplay(result);
-  return display!==null&&display.models.length>0;
-}
-/**
- * The hosted speeds loader the tour mounts: one request per call, for one
- * closed slot, through the shared public client. Every answer is the public
- * reader's normalized state. A failure becomes `none_published` (an
- * unpublished slot, or a route not deployed yet) or `service_unavailable`;
- * a cancelled request still rejects, so the view can tell it from a failure.
- */
-export function createHostedSpeedLoader(client){
-  if(!client||typeof client.communityModelPerformance!=='function')throw new TypeError('A public community client is required');
-  return async (period,{signal,speedMode}={})=>{
-    try{
-      const payload=await client.communityModelPerformance({period,speedMode,signal});
-      return normalizeCommunityModelPerformance(payload,{period,speedMode});
-    }catch(failure){
-      if(signal?.aborted)throw failure;
-      return normalizeCommunityModelPerformance(null,{period,speedMode,failure:failure??{}});
-    }
-  };
-}
-export function mountExampleInsights(doc,t,loadHostedCurve,loadHostedSpeeds) {
+export function mountExampleInsights(doc,t,loadHostedCurve) {
   const locale=()=>doc.documentElement.lang||'en-US';
   const container=doc.querySelector('[data-cache-demo]');
   const matrix=createCacheReuseMatrix({container,t,formatNumber:n=>new Intl.NumberFormat(locale()).format(n),formatPercent:n=>new Intl.NumberFormat(locale(),{maximumFractionDigits:1}).format(n)+'%',formatModelName});
@@ -123,7 +76,7 @@ export function mountExampleInsights(doc,t,loadHostedCurve,loadHostedSpeeds) {
       const measured=windowFor(period);
       if(!measured||measured.comparableReturns===0)return;
       impact=measured;
-      relabelMeasured(label,t,'site.features.insightMeasured');
+      if(label)label.textContent=t('site.features.insightMeasured');
       matrix.render({impact});
       // The period control only appears once measured data is in hand. On the
       // illustration it would be a filter over nothing.
@@ -160,32 +113,7 @@ export function mountExampleInsights(doc,t,loadHostedCurve,loadHostedSpeeds) {
   }
   const win=doc.defaultView;
   const localWindow={MutationObserver:win.MutationObserver,setTimeout:win.setTimeout.bind(win),clearTimeout:win.clearTimeout.bind(win),localStorage:{getItem:()=>null,setItem:()=>{}}};
-  const speedRoot=doc.querySelector('[data-speeds-demo]');
-  const speedLabel=doc.querySelector('#speeds-demo')?.querySelector('.insight-demo-label');
-  // The synthetic speeds mount first, so the section is never blank. It is
-  // replaced only by a valid publication that names at least one model; an
-  // unpublished slot, an unreadable body, an outage or a thrown error all
-  // leave the labelled demonstration exactly as it was.
-  let speed=mountModelPerformance({root:speedRoot,client:{modelPerformance:async (period,{speedMode})=>exampleModelSpeeds(period,speedMode)},t,locale,windowRef:localWindow});
-  if(typeof loadHostedSpeeds==='function'&&speedRoot){
-    const probe=HOSTED_SPEED_PROBE;
-    Promise.resolve().then(()=>loadHostedSpeeds(probe.period,{speedMode:probe.speedMode})).then(result=>{
-      if(!hostedSpeedPublicationUsable(result,probe))return;
-      // The probe answer is the measured view's first slot, so the swap costs
-      // no second request. Every other period and mode is requested only
-      // when a reader selects it, and the view's own 300 s cadence governs
-      // every refresh after that.
-      let seed=result;
-      const client={modelPerformance:(period,{signal,speedMode}={})=>{
-        const first=seed;seed=null;
-        if(first&&period===probe.period&&speedMode===probe.speedMode)return Promise.resolve(first);
-        return loadHostedSpeeds(period,{signal,speedMode});
-      }};
-      speed.destroy?.();
-      speed=mountModelPerformance({root:speedRoot,source:'community',period:probe.period,speedMode:probe.speedMode,client,t,locale,windowRef:localWindow});
-      relabelMeasured(speedLabel,t,'site.features.speedMeasured');
-    }).catch(()=>{});
-  }
+  const speed=mountModelPerformance({root:doc.querySelector('[data-speeds-demo]'),client:{modelPerformance:async (period,{speedMode})=>exampleModelSpeeds(period,speedMode)},t,locale,windowRef:localWindow});
   win.addEventListener('tibotattle:locale-change',()=>{matrix.render({impact});speed.render();});
 }
 
