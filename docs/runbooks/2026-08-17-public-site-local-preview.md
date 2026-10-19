@@ -38,31 +38,12 @@ reviewed production public origin from `config/deployment-endpoints.js`:
    the proposed generated page can display the current real download card.
 2. `GET /api/v1/community/daily?from=…&to=…` when the page asks for the
    released aggregate community series.
-3. `GET /api/v1/community/model-performance?period=…&speedMode=…` when the
-   page asks for one community model-performance slot.
 
-The proxy forwards only those two aggregate `GET` paths, and only to the
-configured public HTTPS origin:
-
-- The daily series needs exactly one canonical `from` and one `to` day.
-- Model performance needs exactly one `period` (`1`, `7`, `30` or `all`) and
-  one `speedMode` (`standard`, `fast` or `ultrafast`). The proxy rebuilds that
-  query in canonical order before forwarding it. A missing, duplicate,
-  unknown or differently spelled parameter is answered locally with `400` and
-  is never forwarded. An upstream `404` JSON answer, for example a slot that is
-  not published yet, reaches the page unchanged. Any other upstream failure
-  becomes a local `502`.
-
-It does not forward browser cookies, authorization, request headers, local
-dashboard data, or any `/api/local/` request. Sibling paths, such as other
-community or admin routes, are not proxied and answer `404`. Every local
-response is `no-store` and labels its mode with the `X-TiboTattle-Preview`
-response header.
-
-The public model-performance route is served by the hosted origin and edge,
-not by this preview. Until it is live there, the default mode shows whatever
-the public origin answers for it, normally a `404`. That is a fact about the
-live site, not a preview fault.
+The proxy accepts only that exact aggregate `GET`, only canonical `from` and
+`to` day parameters, and only from the configured public HTTPS origin. It does
+not forward browser cookies, authorization, request headers, local dashboard
+data, or any `/api/local/` request. Every local response is `no-store` and
+labels its mode with the `X-TiboTattle-Preview` response header.
 
 ## Offline, generator-only review
 
@@ -75,20 +56,9 @@ npm run product:release-site:preview -- --offline
 
 Offline mode makes no network request. It deliberately has no published
 installer metadata, so the download CTA remains unavailable and the aggregate
-daily community endpoint responds with a visible unavailable state (`503
-PREVIEW_OFFLINE`). That is expected: it prevents a local preview from silently
-inventing release metadata or daily community figures.
-
-The one exception is the model-performance view. Offline, a canonical
-`period`/`speedMode` request gets a deterministic synthetic
-`community-model-performance-v1` slot, so the chart, bands and the under-five
-rule can be reviewed without a live origin. The fixture names only reviewed
-public-catalogue models, carries no contributor or device identity, and is
-labelled on every response with
-`X-TiboTattle-Preview-Fixture: synthetic-community-model-performance`. Its
-figures are invented. Never quote them, screenshot them as community data, or
-treat them as evidence about published performance. Non-canonical queries still
-answer `400` offline.
+community endpoint responds with a visible unavailable state. That is expected:
+it prevents a local preview from silently inventing release metadata or sample
+community data.
 
 ## Preview another reviewed public origin
 
@@ -113,9 +83,7 @@ release metadata and aggregate series.
 
 It does **not** prove that a candidate DMG is signed, notarized, available at
 the shown URL, or matches its displayed digest; it does not deploy or upload
-anything; it does not prove that the hosted origin or edge serves the
-model-performance route; and it does not prove the live website has the
-checked-out source.
+anything; and it does not prove the live website has the checked-out source.
 Those remain separate release and deployed-site checks. Treat the remote
 metadata and aggregate response as display inputs for visual review only.
 
@@ -126,8 +94,7 @@ metadata and aggregate response as display inputs for visual review only.
   `--offline` while the release metadata issue is investigated.
 - If the aggregate chart says the preview upstream is unavailable, the layout
   is still generated correctly; the proxy intentionally returns a bounded
-  error instead of falling back to mock data. Only offline mode serves the
-  labelled model-performance fixture; the default mode never substitutes it.
+  error instead of falling back to mock data.
 - If a selected fixed port is in use, omit `--port` or choose another port.
 - Verify the preview contract after changing its server, generator integration,
   or metadata parsing:
@@ -139,6 +106,4 @@ metadata and aggregate response as display inputs for visual review only.
 
 The test fixture uses no live network data. It verifies source generation,
 metadata validation, loopback-only asset serving, the narrowly scoped aggregate
-proxies (including the canonical model-performance query and its local `400`
-refusals), offline behavior with the labelled synthetic model-performance
-slot, and cleanup of the temporary output.
+proxy, offline behavior, and cleanup of the temporary output.
