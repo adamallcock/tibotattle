@@ -1350,6 +1350,11 @@ test('community variant renders bound estimates, the under-five rule, unresolved
       assert.equal(svg.all().filter(node => node.className === 'performance-percentile-range').length, 1, 'only the banded point draws P10-P90');
       assert.equal(svg.all().filter(node => node.className?.startsWith('performance-endpoint-label')).length, 5);
     }
+    // Endpoint labels have no room for bounds, so each marks its estimate approximate.
+    assert.deepEqual(plots.map(svg => svg.all().filter(node => node.className?.startsWith('performance-endpoint-label')).map(node => node.textContent)), [
+      ['P90 ≈90 tokens/s', 'P75 ≈70 tokens/s', 'P50 ≈62 tokens/s', 'P25 ≈50 tokens/s', 'P10 ≈40 tokens/s'],
+      ['P90 ≈2.4 s', 'P75 ≈1.6 s', 'P50 ≈1.2 s', 'P25 ≈1 s', 'P10 ≈0.8 s'],
+    ]);
     const hollow = plots[0].all().filter(node => node.className === 'performance-point')[1].children[1];
     assert.equal(hollow.attributes.fill, 'var(--surface-raised)', 'a point below five samples is hollow');
     // Tooltip and readout for the sparse day: only its median, with bounds.
@@ -1379,7 +1384,7 @@ test('community variant renders bound estimates, the under-five rule, unresolved
     });
     assert.deepEqual(dom.root.all().filter(node => node.className === 'performance-evidence-row').map(row => row.children[0].textContent),
       ['Reporting period', 'Contributors', 'Installations', 'Reports', 'Reported samples', 'Revision', 'Updated', 'Models not shown']);
-    assert.ok(dom.root.all().some(node => node.textContent === 'Excluded reported samples (unknown or mixed speed mode): 2.'));
+    assert.ok(dom.root.all().some(node => node.textContent === 'Excluded reported samples (unknown, mixed or other speed mode): 2. Clients 0.1.24–0.1.26 report Ultrafast samples as other, so Ultrafast is undercounted.'));
     assert.ok(dom.root.all().some(node => node.tagName === 'button' && node.attributes['aria-label'] === 'GPT-5.6 Sol' && node.all().some(child => child.textContent === 'GPT-5.6 Sol')));
     assert.ok(dom.root.all().some(node => node.className === 'performance-legend-item' && node.children[1].textContent === 'Median bounds'));
     // The copy scope swaps only the community wording.

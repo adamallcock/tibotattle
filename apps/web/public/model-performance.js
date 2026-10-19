@@ -1236,7 +1236,11 @@ function mountCommunityModelPerformance(options) {
     estimate: metricNumber(quantile.estimate, metric), lower: metricNumber(quantile.lower, metric),
     upper: metricNumber(quantile.upper, metric), unit: unitFor(metric),
   });
-  // Every estimate is shown with its bounds, for example "P50 62 (58-66) tokens/s".
+  // Tooltips, readouts and point labels show every estimate with its bounds,
+  // for example "P50 62 (58-66) tokens/s", and whiskers draw the median's.
+  // The endpoint labels beside the chart have no room for bounds, so they
+  // mark each estimate approximate instead: "P50 ≈62 tokens/s". No estimate
+  // is presented as exact.
   const estimateText = (label, quantile, metric) => translate("community.estimate", { label, value: estimateValue(quantile, metric) });
   const PERCENTILE_LABELS = [["median", "P50"], ["p10", "P10"], ["p25", "P25"], ["p75", "P75"], ["p90", "P90"]];
   const pointValues = (point, metric) => PERCENTILE_LABELS
@@ -1366,7 +1370,7 @@ function mountCommunityModelPerformance(options) {
       for (const label of labels) {
         svg.append(svgElement("line", { x1: x(latest.at) + 3, y1: label.actualY, x2: 717, y2: label.labelY, stroke: color, class: "performance-endpoint-leader", "aria-hidden": "true" }),
           svgElement("circle", { cx: x(latest.at), cy: label.actualY, r: label.key === "median" ? 3.2 : 2.4, fill: color, class: "performance-endpoint-dot", "aria-hidden": "true" }),
-          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ${metricNumber(estimate(latest, label.key), metric)} ${unit}`));
+          svgElement("text", { x: 721, y: label.labelY + 4, fill: color, class: `performance-endpoint-label${label.key === "median" ? " performance-endpoint-label-median" : ""}`, "aria-hidden": "true" }, `${label.label} ≈${metricNumber(estimate(latest, label.key), metric)} ${unit}`));
       }
     }
     const highlight = svgElement("circle", { r: 8, fill: "none", stroke: color, "stroke-width": 2.5, visibility: "hidden", class: "performance-highlight" });
