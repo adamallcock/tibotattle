@@ -193,8 +193,10 @@ that changes the analytics kernel) and the production carrier below.
 
 Status: `built`, offline only. The Job and the verb are tested with synthetic
 data and a stubbed `gcloud`. No infrastructure apply, Job execution or log read
-has happened in any project. The first live run is a staging run that the owner
-authorizes.
+has happened in any project. On 2026-10-19 the owner chose to skip staging for
+the community speed rollout, so the first live run is the owner-authorized
+production run. It uses a read-only `plan` first, then `execute` of that plan's
+digest only ([decision](../decisions/2026-10-10-community-model-speed.md#re-based-deploy-candidate-amendment-2026-10-19)).
 
 **The Job.** `jobs.analytics-reprice` in both committed desired states
 (`tibotattle-analytics-reprice` in production, `tibotattle-staging-analytics-reprice`

@@ -475,6 +475,15 @@ commit, and the kernel-17 entry above was dropped before any deployment.
   ([apply window and back-out](../runbooks/gcp-rollout.md#reprice-job-apply-window-and-back-out-2026-10-19)).
 - **Client.** Unchanged. The client keeps emitting `…2026-09-29.1` with v1
   buckets.
+- **Kernel-id race, owner decision 2026-10-19.** Other undeployed lines also
+  append entries 20 to 22 after live's 19. The owner chose to deploy this
+  candidate first, so it keeps kernel 20. The other lines re-append their
+  entries after 20, with new pins, before they deploy.
+- **No staging rehearsal, owner decision 2026-10-19.** The staging plane is
+  far behind production, and production has been rolled directly. This
+  rollout goes straight to production. The reprice Job's first live run is
+  therefore production's. Its safeguard is the read-only plan, after which
+  only that plan's digest may execute.
 
 This amendment is source documentation. It records no release, deployment,
 migration or activation.
