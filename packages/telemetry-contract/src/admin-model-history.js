@@ -19,6 +19,60 @@ export const ADMIN_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
     pricingStatus: model.pricingStatus,
   })));
 
+// Freeze the exact September 29 publication before extending the current
+// catalog. Historical coverage and labels cannot inherit later identities.
+export const SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-09-29.1";
+export const SEPTEMBER29_ADMIN_MODEL_CONFIG = Object.freeze([
+  ["codex-auto-review", "Codex Auto-review", "primary", "assumed_alias"],
+  ["gpt-4-turbo-2024-04-09", "GPT-4 Turbo (2024-04-09)", "primary", "published"],
+  ["gpt-4.1", "GPT-4.1", "primary", "published"],
+  ["gpt-4.1-mini", "GPT-4.1 Mini", "primary", "published"],
+  ["gpt-4.1-nano", "GPT-4.1 Nano", "primary", "published"],
+  ["gpt-4o", "GPT-4o", "primary", "published"],
+  ["gpt-4o-2024-05-13", "GPT-4o (2024-05-13)", "primary", "published"],
+  ["gpt-4o-mini", "GPT-4o Mini", "primary", "published"],
+  ["gpt-5", "GPT-5", "primary", "published"],
+  ["gpt-5-codex", "GPT-5 Codex", "primary", "published"],
+  ["gpt-5-mini", "GPT-5 Mini", "primary", "published"],
+  ["gpt-5-nano", "GPT-5 Nano", "primary", "published"],
+  ["gpt-5-pro", "GPT-5 Pro", "primary", "published"],
+  ["gpt-5.1", "GPT-5.1", "primary", "published"],
+  ["gpt-5.1-codex", "GPT-5.1 Codex", "primary", "published"],
+  ["gpt-5.1-codex-mini", "GPT-5.1 Codex Mini", "primary", "published"],
+  ["gpt-5.2", "GPT-5.2", "primary", "published"],
+  ["gpt-5.2-codex", "GPT-5.2 Codex", "primary", "published"],
+  ["gpt-5.2-pro", "GPT-5.2 Pro", "primary", "published"],
+  ["gpt-5.3-codex", "GPT-5.3 Codex", "primary", "published"],
+  ["gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", "spark", "unpriced"],
+  ["gpt-5.4", "GPT-5.4", "primary", "published"],
+  ["gpt-5.4-mini", "GPT-5.4 Mini", "primary", "published"],
+  ["gpt-5.4-nano", "GPT-5.4 Nano", "primary", "published"],
+  ["gpt-5.4-pro", "GPT-5.4 Pro", "primary", "published"],
+  ["gpt-5.5", "GPT-5.5", "primary", "published"],
+  ["gpt-5.5-codex", "GPT-5.5 Codex", "primary", "assumed_alias"],
+  ["gpt-5.5-pro", "GPT-5.5 Pro", "primary", "published"],
+  ["gpt-5.6-luna", "GPT-5.6 Luna", "primary", "published"],
+  ["gpt-5.6-sol", "GPT-5.6 Sol", "primary", "published"],
+  ["gpt-5.6-sol-wm", "GPT-5.6 Sol Work Mode", "primary", "assumed_alias"],
+  ["gpt-5.6-terra", "GPT-5.6 Terra", "primary", "published"],
+  ["gpt-6-astra", "GPT-6 Astra", "primary", "published"],
+  ["o1", "o1", "primary", "published"],
+  ["o1-pro", "o1 Pro", "primary", "published"],
+  ["o3", "o3", "primary", "published"],
+  ["o3-mini", "o3 Mini", "primary", "published"],
+  ["o3-pro", "o3 Pro", "primary", "published"],
+  ["o4-mini", "o4 Mini", "primary", "published"],
+  ["gpt-6-sol", "GPT-6 Sol", "primary", "published"],
+  ["gpt-6-luna", "GPT-6 Luna", "primary", "published"],
+  ["gpt-6.1-astra", "GPT-6.1 Astra (forecast)", "primary", "unpriced"],
+  ["gpt-6.1-sol", "GPT-6.1 Sol", "primary", "published"],
+].map(([modelId, label, allowanceTrack, pricingStatus]) => Object.freeze({
+  modelId, label, allowanceTrack, pricingStatus,
+})));
+const adminHistorySeptember29Ids = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG
+  .filter((model) => model.allowanceTrack === "primary")
+  .map((model) => model.modelId));
+
 const adminHistoryLegacyIds = Object.freeze([
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
 ]);
@@ -122,12 +176,14 @@ export function projectAdminModelHistoryDay(value) {
     ? adminHistoryCurrentIds
     : catalogVersion === adminHistorySeptember23Version
       ? adminHistorySeptember23Ids
+    : catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+      ? adminHistorySeptember29Ids
       : catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-      ? adminHistoryPreviousIds
-      : catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-        ? adminHistoryOlderIds
-        : catalogVersion === LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-          ? adminHistoryLegacyIds : null;
+        ? adminHistoryPreviousIds
+        : catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+          ? adminHistoryOlderIds
+          : catalogVersion === LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+            ? adminHistoryLegacyIds : null;
   if (!ids || !Array.isArray(values) || values.length > ids.length) return null;
   const allowed = new Set(ids);
   const seen = new Set();
@@ -156,14 +212,18 @@ export function expandAdminModelHistoryDay(value) {
     ? adminHistoryCurrentIds
     : day.catalogVersion === adminHistorySeptember23Version
       ? adminHistorySeptember23Ids
+    : day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+      ? adminHistorySeptember29Ids
       : day.catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-      ? adminHistoryPreviousIds
-      : day.catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-        ? adminHistoryOlderIds : adminHistoryLegacyIds);
+        ? adminHistoryPreviousIds
+        : day.catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+          ? adminHistoryOlderIds : adminHistoryLegacyIds);
   const identified = new Map(day.values.map(([id, capacityUsd, participantCount]) => [
     id, Object.freeze({ capacityUsd, participantCount }),
   ]));
-  const byModel = Object.freeze(Object.fromEntries(ADMIN_MODEL_CONFIG.map(({ modelId }) => [
+  const modelConfig = day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+    ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_MODEL_CONFIG;
+  const byModel = Object.freeze(Object.fromEntries(modelConfig.map(({ modelId }) => [
     modelId,
     identified.get(modelId) ?? Object.freeze({
       capacityUsd: null,
