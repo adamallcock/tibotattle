@@ -4,9 +4,9 @@
     "repository": "openai/codex",
     "branch": "main",
     "path": "codex-rs/protocol/src/auth.rs",
-    "reviewedRevision": "b68acc4d4b56fdfa1d5b6a2c36102c66876e0c46",
-    "reviewedOn": "2026-08-26",
-    "sourceSha256": "c7293c4b592e7429b6aeb969b15ba0cfe056729f33b09583912fec250b00c756"
+    "reviewedRevision": "fea1d7f7d163521a868c344527da79ba0efc146d",
+    "reviewedOn": "2026-10-26",
+    "sourceSha256": "dcae6a282263f505572575703849ce71ae8ab3faef4f909ac57d5aee113ca6ea"
   },
   "binaryChannels": [
     {
@@ -51,13 +51,13 @@
     },
     {
       "rawValue": "pro",
-      "displayName": "Pro",
+      "displayName": "Pro (More)",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
     },
     {
       "rawValue": "prolite",
-      "displayName": "Pro Lite",
+      "displayName": "Pro",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
     },
