@@ -36,6 +36,26 @@ function price(value: TelemetryV1UsageEvent) {
 }
 
 describe("admitted chunk usage pricing evidence boundaries", () => {
+  it("prices admitted Terra stored records at Standard, Batch, Flex and Fast while retaining the launch boundary", () => {
+    const cases = [
+      { speedMode: "standard", apiServiceTier: "unknown", billingSurface: "chatgpt_subscription", expected: [600_000, 600_750_000] },
+      { speedMode: "fast", apiServiceTier: "unknown", billingSurface: "chatgpt_subscription", expected: [1_200_000, 1_201_500_000] },
+      { speedMode: "standard", apiServiceTier: "standard", billingSurface: "openai_api", expected: [600_000, 600_750_000] },
+      { speedMode: "standard", apiServiceTier: "batch", billingSurface: "openai_api", expected: [300_000, 300_375_000] },
+      { speedMode: "standard", apiServiceTier: "flex", billingSurface: "openai_api", expected: [300_000, 300_375_000] },
+      { speedMode: "standard", apiServiceTier: "priority", billingSurface: "openai_api", expected: [1_200_000, 1_201_500_000] },
+    ] as const;
+    for (const { expected, ...selection } of cases) for (const [index, totalInputContextTokens] of [100, 300_000].entries()) {
+      const value = record({ ...selection, modelId: "gpt-6.1-terra", eventTime: "2026-10-26T00:00:00.000Z",
+        totalInputContextTokens, components: { ...record().components, inputUncachedTokens: totalInputContextTokens } });
+      expect(price(value)).toEqual({ costNanousd: expected[index], pricingStatus: "fully_priced", modelId: value.modelId });
+      expect(price({ ...value, totalInputContextTokens: null })).toEqual(price(value));
+      for (const unavailable of [{ ...value, eventTime: "2026-10-25T23:59:59.999Z" },
+        { ...value, speedMode: "ultrafast", apiServiceTier: "ultrafast" }])
+        expect(price(unavailable)).toEqual({ costNanousd: 0, pricingStatus: "unpriced", modelId: value.modelId });
+    }
+  });
+
   it("fences public allowance readiness against prior v0.4 pricing without rewriting the singleton", () => {
     const state = { publication_state: "ready" as const, expected_basis: COMMUNITY_ALLOWANCE_BASIS,
       attribution_method_version: COMMUNITY_ATTRIBUTION_METHOD_VERSION,

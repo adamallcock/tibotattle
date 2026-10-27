@@ -1,5 +1,8 @@
 import {
   ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG,
+  SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
@@ -45,6 +48,7 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
+const SEPTEMBER23_ADMIN_MODEL_CONFIG = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42));
 const ADMIN_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
@@ -62,6 +66,18 @@ const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
       Object.freeze({ planType: "plus", label: "Plus", multiplier: 10 }),
     ]),
     modelBasis: "seven_day_codex_pro10x_equivalent_per_model_composition",
+  }),
+  // Owner option B (2026-10-10): every plan in Pro 20x-week units, with Pro
+  // Max 25x at x0.8. A new identity; v0.3 and v0.4 keep their exact contracts.
+  "admin-community-allowance-preview-v0.5": Object.freeze({
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25_preview",
+    plans: Object.freeze([
+      Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+      Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+      Object.freeze({ planType: "promax", label: "Pro Max 25x", multiplier: 0.8 }),
+      Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+    ]),
+    modelBasis: "seven_day_codex_pro20x_equivalent_per_model_composition_promax25",
   }),
 });
 const ADMIN_ALLOWANCE_MODELS_GATE =
@@ -712,12 +728,21 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
       || models.gate !== ADMIN_ALLOWANCE_MODELS_GATE) {
     invalid(code);
   }
-  const modelConfig = array(models.modelConfig, code).map((entry, index) => {
+  const suppliedModels = array(models.modelConfig, code);
+  const expectedModels = suppliedModels.length === ADMIN_ALLOWANCE_PREVIEW_MODELS.length
+    ? ADMIN_ALLOWANCE_PREVIEW_MODELS : suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
+      ? SEPTEMBER29_ADMIN_MODEL_CONFIG : suppliedModels.length === SEPTEMBER23_ADMIN_MODEL_CONFIG.length
+        ? SEPTEMBER23_ADMIN_MODEL_CONFIG : null;
+  if (expectedModels === null) invalid(code);
+  const september23Catalog = expectedModels === SEPTEMBER23_ADMIN_MODEL_CONFIG;
+  const historicalCatalog = expectedModels !== ADMIN_ALLOWANCE_PREVIEW_MODELS;
+  const modelConfig = suppliedModels.map((entry, index) => {
     const model = record(entry, code);
-    const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
+    const expected = expectedModels[index];
     if (!expected
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
+        || (september23Catalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
@@ -726,16 +751,19 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
     // catalog label without discarding otherwise compatible results.
     return expected;
   });
-  if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
+  if (modelConfig.length !== expectedModels.length) invalid(code);
   let previousDay = "";
   const days = boundedArray(models.days, ADMIN_ALLOWANCE_PREVIEW_DAYS, code).map((entry) => {
     const day = record(entry, code);
     const dayValue = calendarDay(day.day, code);
     if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
     previousDay = dayValue;
-    if (day.catalogVersion === undefined) invalid(code);
+    if (day.catalogVersion === undefined
+        || (historicalCatalog && day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)
+        || (september23Catalog && day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION)) invalid(code);
     const projected = expandAdminModelHistoryDay(day);
-    if (projected === null) invalid(code);
+    if (projected === null
+        || projected.values.some(([modelId]) => !modelConfig.some(model => model.modelId === modelId))) invalid(code);
     return projected;
   });
   if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);

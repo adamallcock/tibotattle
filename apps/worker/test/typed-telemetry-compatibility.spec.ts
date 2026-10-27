@@ -4,6 +4,7 @@ import { canonicalTelemetryV11Json, type TelemetryV11Attribution, type Telemetry
 import { encodeTypedTelemetryId, encodeTypedTelemetryRecord, type TypedTelemetryFormat } from "../src/typed-telemetry-codec";
 import { persistTypedTelemetryBatch, type TypedTelemetrySourceRecord } from "../src/typed-telemetry-repository";
 import { telemetryV11LegacyProjection } from "../src/telemetry-v11-repository";
+import { priceChunkUsageRecord } from "../src/quota-analysis-v1";
 import {
   readTypedTelemetryCompatibilityPage, readTypedTelemetryRowsByStorageIds,
   TYPED_TELEMETRY_COMPATIBILITY_COLUMNS, TYPED_TELEMETRY_COMPATIBILITY_PAGE_SQL,
@@ -67,6 +68,46 @@ function expectExact(actual: TypedTelemetryCompatibilityRecord, expected: TypedT
 beforeEach(async () => { await reset(); await applyD1Migrations(db(), migrations()); });
 
 describe("typed raw SQL compatibility and exact bounded JSON reader", () => {
+  it("stores Terra through the existing model dictionary in both formats and reprices exact recovered bytes", async () => {
+    const eventTime = "2026-10-26T00:00:00.000Z";
+    const rows = (["v1", "v11"] as const).map((format) => source(format, 1, {
+      ...usage(format), provider: "openai_codex", modelId: "gpt-6.1-terra", speedMode: "fast",
+      apiServiceTier: "priority", billingSurface: "chatgpt_subscription", eventTime,
+      totalInputContextTokens: 100, components: { inputUncachedTokens: 100,
+        inputCacheReadTokens: 0, inputCacheWriteTokens: 0, outputTextTokens: 100,
+        outputReasoningTokens: 0, outputCombinedTokens: null },
+    }, { chunkDay: eventTime.slice(0, 10), observedDay: eventTime.slice(0, 10) }));
+    await persistTypedTelemetryBatch(db(), rows);
+    const result = await readTypedTelemetryCompatibilityPage(db(), options("usage"));
+    expect(result.records).toHaveLength(2);
+    for (const actual of result.records) {
+      expectExact(actual, rows.find((row) => row.format === actual.format)!);
+      expect(actual.model_id).toBe("gpt-6.1-terra");
+      expect(priceChunkUsageRecord(actual.record_json, eventTime)).toEqual({
+        costNanousd: 1_200_000, pricingStatus: "fully_priced", modelId: "gpt-6.1-terra",
+      });
+    }
+    expect(await db().prepare("SELECT count(*) AS count FROM typed_telemetry_dictionary WHERE value = ?")
+      .bind("gpt-6.1-terra").first<number>("count")).toBe(1);
+  });
+
+  it("round-trips scientific quota and attribution evidence through the existing dictionary", async () => {
+    const rows = (["sci", "sci_plus"] as const).map((planType, index) => source("v11", index + 1, {
+      ...quota("v11", `quota:scientific:${index}`), planType,
+      accountPlanAttribution: { ...attribution, planType },
+    }));
+    await persistTypedTelemetryBatch(db(), rows);
+    const result = await readTypedTelemetryCompatibilityPage(db(), options("quota"));
+    expect(result.records).toHaveLength(2);
+    result.records.forEach((actual, index) => {
+      expectExact(actual, rows[index]!);
+      expect(actual.plan_type).toBe(["sci", "sci_plus"][index]);
+      expect(actual.attribution_plan_type).toBe(actual.plan_type);
+    });
+    expect(await db().prepare("SELECT count(*) AS count FROM typed_telemetry_dictionary WHERE value IN (?, ?)")
+      .bind("sci", "sci_plus").first<number>("count")).toBe(2);
+  });
+
   it("reconstructs authority-selected physical rows in requested order across streams", async () => {
     const rows = [source("v11", 17, usage("v11")), source("v11", 41, quota("v11")), source("v11", 90, session("v11"))];
     await persistTypedTelemetryBatch(db(), rows);

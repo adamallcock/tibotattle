@@ -105,13 +105,13 @@ describe("baseline projection (manifest version 1)", () => {
     expect(await webCryptoSha256Hex(JSON.stringify(committedBaseline))).toBe(CATALOG_BASELINE_DIGEST);
   });
 
-  it("reproduces the historical v0.8 registry SHA without relabeling current v0.9", async () => {
+  it("reproduces the historical v0.8 registry SHA without relabeling current v0.10", async () => {
     const manifest = await validateCatalogManifest(clone(committedBaseline), webCryptoSha256Hex);
     expect(manifest.compat.registrySha256).toBe("48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
     expect(await webCryptoSha256Hex(JSON.stringify(activeCatalogPriceCards(manifest))))
       .toBe(manifest.compat.registrySha256);
     expect(manifest.compat.registryVersion).toBe("app-official-api-prices-v0.8");
-    expect(APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.9");
+    expect(APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.10");
     expect(APP_PRICE_REGISTRY_MANIFEST.sha256).not.toBe(manifest.compat.registrySha256);
     assertCatalogCompiledAssertions(manifest, COMPILED_CATALOG_INPUTS);
   });
@@ -132,6 +132,7 @@ describe("baseline projection (manifest version 1)", () => {
     });
     expect(current.compat.registrySha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
     expect(current.models.some((model) => model.id === "gpt-6.1-sol")).toBe(true);
+    expect(current.models.some((model) => model.id === "gpt-6.1-terra")).toBe(true);
     expect(current.plans.some((plan) => plan.id === "promax")).toBe(true);
     const signer = await syntheticSigner();
     const { envelopeText } = await signer.sign(current);

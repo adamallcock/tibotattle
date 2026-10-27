@@ -53,7 +53,9 @@
         "edu",
         "edu_plus",
         "edu_pro",
-        "unknown"
+        "unknown",
+        "sci",
+        "sci_plus"
       ]
     },
     "planVariant": {
@@ -481,6 +483,48 @@
             "properties": {
               "planType": {
                 "const": "unknown"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "sci"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "sci"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "sci_plus"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "sci_plus"
               }
             }
           }

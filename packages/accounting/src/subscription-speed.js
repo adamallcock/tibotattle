@@ -24,7 +24,7 @@ export const FAST_MODE_MULTIPLIER_SOURCE = Object.freeze({
   basis: "published_api_speed_price_ratio_relative_to_standard",
   statement:
     "Published Fast/Priority and Ultrafast API ratios are derived for exact registered models and reviewed aliases, then checked against the event's context and price epoch. Fast without an eligible Priority card retains its disclosed assumed 2x. Ultrafast without an eligible card remains unweighted. These API-equivalent comparisons do not measure included subscription allowance consumption.",
-  recordedAt: "2026-09-29",
+  recordedAt: "2026-10-26",
   priceRegistryVersion: APP_PRICE_REGISTRY_VERSION,
   appliesTo: "api_price_equivalent_only",
   observability: "rollout_thread_settings_and_supported_turn_context",

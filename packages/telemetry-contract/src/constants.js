@@ -39,6 +39,31 @@ export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "edu_plus",
   "edu_pro",
   "unknown",
+  // Append reviewed identities without reindexing the existing vocabulary.
+  "sci",
+  "sci_plus",
+]);
+
+// Frozen contribution-v0.2 vocabulary. Later reviewed plans remain unknown
+// when projected into this predecessor; its wire schemas must not expand.
+export const TELEMETRY_V02_PLAN_TYPES = Object.freeze([
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
+  "team",
+  "self_serve_business_prolite",
+  "self_serve_business_usage_based",
+  "business",
+  "ent26",
+  "enterprise_cbp_automation",
+  "enterprise_cbp_usage_based",
+  "enterprise",
+  "edu",
+  "edu_plus",
+  "edu_pro",
+  "unknown",
 ]);
 
 // Human-readable names mirror Codex's KnownPlan::display_name() values. Keep
@@ -62,6 +87,8 @@ export const TELEMETRY_PLAN_DISPLAY_NAMES = Object.freeze({
   edu: "Edu",
   edu_plus: "Edu Plus",
   edu_pro: "Edu Pro",
+  sci: "Academic Researchers",
+  sci_plus: "Academic Researchers Plus",
 });
 
 export const TELEMETRY_TOOL_CLASSES = Object.freeze([

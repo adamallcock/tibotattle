@@ -203,29 +203,37 @@ export const SOURCE_PATCHES = Object.freeze([
   }
   for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {`,
         replace: `  if (!Array.isArray(models.modelConfig)) return false;
-  // The reviewed September 23 catalog is the exact 42-row predecessor of
-  // September 29: only GPT-6.1 Sol was appended. This is one known historical
-  // publication shape, never permission to accept an arbitrary roster prefix.
-  const historicalCatalog = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
+  // Only the reviewed append-only September 29 and October 26 catalogs may
+  // admit these exact retained headers. A later catalog must review its own
+  // predecessor shapes instead of accepting an arbitrary roster prefix.
+  const september29Current = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
     && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 43
+    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol";
+  const october26Current = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-10-26.1"
+    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 44
     && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol"
-    && models.modelConfig.length === 42;
+    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[43]?.modelId) === "gpt-6.1-terra";
+  const september23Catalog = (september29Current || october26Current) && models.modelConfig.length === 42;
+  const september29Catalog = october26Current && models.modelConfig.length === 43;
+  const historicalCatalog = september23Catalog || september29Catalog;
   const expectedModels = historicalCatalog
-    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, 42)
+    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, models.modelConfig.length)
     : ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
   if (models.modelConfig.length !== expectedModels.length) return false;
   for (const [index, expected] of expectedModels.entries()) {` },
       { find: `        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
         || model.allowanceTrack !== expected.allowanceTrack`,
         replace: `        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
-        || (historicalCatalog && model.label !== expected.label)
+        || (september23Catalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack` },
       { find: `    if (!validModelCompositionDay(candidate)) return false;
     if (candidate.day <= previousDay`,
         replace: `    if (!validModelCompositionDay(candidate)
-        // A predecessor roster cannot claim the appended model was observed.
-        // The shared reader still admits only its exact frozen older catalogs.
-        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)) return false;
+        // A retained header cannot claim a newer catalog, even when its
+        // sparse values omit the appended model. The shared reader validates
+        // each older day's exact frozen identity set independently.
+        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)
+        || (september23Catalog && candidate.catalogVersion === "reviewed-model-catalog-2026-09-29.1")) return false;
     if (candidate.day <= previousDay` },
       { find: `  return { ...parsed, models: { ...parsed.models, modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG } };`,
         replace: `  return { ...parsed, models: { ...parsed.models,

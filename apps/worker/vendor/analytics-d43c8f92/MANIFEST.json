@@ -1,6 +1,6 @@
 {
   "schemaVersion": "analytics-kernel-vendor-manifest-v1",
-  "sourceCommit": "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a",
+  "sourceCommit": "76179fd4f21816693e958e436d3c84fd8555da60",
   "generator": "apps/worker/scripts/vendor-analytics-kernels.mjs",
   "check": "apps/worker/scripts/vendor-analytics-kernels.check.mjs",
   "authoredFiles": [
@@ -86,7 +86,7 @@
       "path": "apps/worker/src/admin-community-allowance.ts",
       "id": "historical-preview-catalog-compatibility",
       "hunks": 4,
-      "sha256": "934d6837a8420c6f85d001e0b906726834783156e9bfed610e2bfffa00621fbe"
+      "sha256": "67e143fa82f1b1ec20bf5306ebd8eef3c375f5d822be8ae3087f2d5ca9f89eda"
     },
     {
       "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
@@ -163,7 +163,7 @@
     {
       "path": "apps/worker/src/admin-community-allowance.ts",
       "blob": "c836c294112eda15e11bb9f9a81f24bbafcb135c",
-      "sha256": "ae4f2216a79e430efbff045afdb3b71515ad66676f3d9aefdbc8e8a9b992d00b",
+      "sha256": "de3ad0521f597ded542ab861dae87c35cf755e3c7b2b2152861a3f3ccdea7ec9",
       "patch": "source",
       "reach": "kernel"
     },
@@ -785,8 +785,8 @@
     },
     {
       "path": "packages/accounting/index.d.ts",
-      "blob": "cb486dd9d4d07b06e99b0d983175b0ee5f02d79d",
-      "sha256": "a1c8147aeee56d800e67a563775464455e36f211b3bc3d54e38c9270a43a1b64",
+      "blob": "0e7c40e0046dbbd27cc51f4e3a61be48d6f77748",
+      "sha256": "d53abafef4f46db61c23519a1292592a3073c92f8b01fb2b53a78ade85365267",
       "patch": "none",
       "reach": "package"
     },
@@ -820,15 +820,15 @@
     },
     {
       "path": "packages/accounting/src/price-registry.js",
-      "blob": "ed67a606e891b499ed6c277f194fd41dc80ca7d8",
-      "sha256": "1ece8c78fb798c55811524844f7092119853c403fd685031614e929a29606ab3",
+      "blob": "7db4d51eeff204449c421c5f9387684e7faef590",
+      "sha256": "66b0902330cc6e416ddaee44ed6472b9f6919bf796bfbf7221c20b6790d3ffb7",
       "patch": "none",
       "reach": "package"
     },
     {
       "path": "packages/accounting/src/subscription-speed.js",
-      "blob": "de15913d204871d6694b9d9cf3624b5b96af33f3",
-      "sha256": "17bfb154ef61043f4eb17f5a2bc670588757c2764f7b363624b26665ddc2cd38",
+      "blob": "2484ef616c41442057294692b8dacec9c0977963",
+      "sha256": "d2281868d2bf7913471db733a1aa549e826a3e0ff5216e27dad7cf4a90a1f21e",
       "patch": "none",
       "reach": "package"
     },
@@ -911,15 +911,15 @@
     },
     {
       "path": "packages/telemetry-contract/index.d.ts",
-      "blob": "1d8e3cf7c7c896e632dea23315bc16f1127eb712",
-      "sha256": "8c88bb42d6ce84db0c95ca4050896b0fe13330c454a7980e7b946c5c478b74da",
+      "blob": "8837793de6a1b0ac00181dfd82f4bfecc04c3487",
+      "sha256": "689119a1241631eb1a33a73f20c85a102f7fd5f12de2e721658f3da1f068fda5",
       "patch": "none",
       "reach": "package"
     },
     {
       "path": "packages/telemetry-contract/index.js",
-      "blob": "e9fcb569c38e20f851eeb2c697819392d5e4f8bd",
-      "sha256": "24f2cc26c301ac484745dc9af63f6a59c7249a5c3b1842fc06d5dc950fec3b57",
+      "blob": "67fbc2efe90a93749f22f808aef9bf96ab8c5e79",
+      "sha256": "8fe6a839b74df4fece1285c7f7c43dde02dee3b4b3fe8c4900f2b84f45b03da2",
       "patch": "none",
       "reach": "package"
     },
@@ -932,8 +932,8 @@
     },
     {
       "path": "packages/telemetry-contract/src/admin-model-history.js",
-      "blob": "5d9d63ef45719192db95563b4583066dc7eaa583",
-      "sha256": "72bbae3810fc55a427f6b1ea2fa0e40b634f622ad29208e34cdd965594d3960f",
+      "blob": "648b27e130b8e94b17abfff93bf088a5731ea2f7",
+      "sha256": "87eea5f4436ad5a8e8bb386862398913a0538be203f8ba5e6969ebe54e2337c9",
       "patch": "none",
       "reach": "package"
     },
@@ -967,8 +967,8 @@
     },
     {
       "path": "packages/telemetry-contract/src/model-catalog.js",
-      "blob": "11a4b12f9e589325a2feb0beeb93afdbeb475a17",
-      "sha256": "4543ccfcf32ad3f4062ca3500e684fcf80e0a743e5e2bb39dafe2bf31a665250",
+      "blob": "82ab6bd5ad691ad57022845ed926c308076b1ee3",
+      "sha256": "2702c5c59bdbc486aa1d9730702e6582acb74672641a76cb2ae5a9ed18138256",
       "patch": "none",
       "reach": "package"
     },

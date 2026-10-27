@@ -3,8 +3,8 @@ import {
   REVIEWED_CLAUDE_MODEL_IDS,
 } from "@app-usagemonitor/telemetry-contract";
 
-export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-09-29.1";
-export const TELEMETRY_V01_REVIEWED_AT = "2026-09-29";
+export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-10-26.2";
+export const TELEMETRY_V01_REVIEWED_AT = "2026-10-26";
 
 export const OPENAI_CODEX_MODEL_IDS = REVIEWED_CODEX_MODEL_IDS;
 

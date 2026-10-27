@@ -9,7 +9,8 @@ import { buildAdminCommunityAllowancePreview, buildCommunityModelCompositionDay,
 import { normalizeCommunityModelCompositionForDay, validRetainedPro10AdminCommunityAllowancePreview,
   type AdminCommunityAllowanceSummary } from "../src/admin-community-allowance";
 import { COMMUNITY_ALLOWANCE_PROJECTION_METHOD_VERSION, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
-  COMMUNITY_ALLOWANCE_NORMALIZATION } from "../src/community-allowance";
+  COMMUNITY_ALLOWANCE_NORMALIZATION, COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
+  summarizeCommunityAllowanceDay } from "../src/community-allowance";
 import { projectRetainedPro10PublicAllowanceGraph } from "../src/public-allowance-breakdowns";
 import { buildAdminCommunityAllowancePreview as buildLegacyPreview,
   projectPublicAllowanceGraph as projectLegacyGraph, type CommunityModelComposition } from "../vendor/analytics-d43c8f92/entry";
@@ -177,6 +178,19 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
     expect(normalizeCommunityModelCompositionForDay(stale.composition, DAY)).toEqual({ state: "stale" });
   });
 
+  it.each(["sci", "sci_plus"])("keeps %s outside personal-plan normalization without inventing a factor", (planType) => {
+    const scientificFit = { ...fits[0]!, planType };
+    expect(COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG.find((plan) => String(plan.planType) === planType)).toBeUndefined();
+    expect(summarizeCommunityAllowanceDay([scientificFit], DAY)).toMatchObject(EMPTY);
+    expect(normalizeCommunityModelCompositionForDay(composition(planType).composition, DAY)).toEqual({ state: "unstable" });
+    expect(buildCommunityModelCompositionDay({ compositions: [composition(planType)], v1ParticipantCount: 1,
+      refusedParticipantCount: 0, unsupportedSourceParticipantCount: 0 }, DAY).values).toEqual([]);
+    const preview = buildAdminCommunityAllowancePreview([scientificFit], NOW);
+    expect(preview.plans).toEqual(B_PRIME.plans);
+    expect(preview.days.at(-1)!.combined).toEqual(EMPTY);
+    expect(preview.coverage).toMatchObject({ mergeEligibleParticipantCount: 0, unsupportedPlanParticipantCount: 1 });
+  });
+
   it("converts a Pro Max 25x fit to the Pro 20x reference at x0.8 and keeps its own week invertible", () => {
     const promax = [{ participantId: "synthetic-promax", planType: "promax", capacityNanousd: 1_750_000_000_000,
       lastObservedAt: `${DAY}T12:00:00.000Z` }];
@@ -222,7 +236,7 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
     const currentMetadata = buildCurrentPublicModelMetadata();
     expect(currentMetadata.map(entry => entry.id)).toEqual([
       "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
-      "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
+      "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
     ]);
     expect(currentMetadata[1]).toEqual({ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 });
     const raw = composition("pro"); raw.composition.fit.capacityUsdByModel = { "gpt-6.1-sol": 123.45 };
@@ -268,7 +282,13 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
     expect(validReadableAdminCommunityAllowancePreview(value, value.generatedAt, inputs.nowMs)).toBe(true);
     const goldenOptions = { publishedDays: goldenPublishedDays(value), nowMs: inputs.nowMs };
     const graph = projectPublicAllowanceGraphForGcp(goldenRow, goldenOptions, inputs.metadata)!;
-    expect(JSON.stringify(graph.breakdowns)).toBe(expected);
+    // Current route presentation may add a reviewed model. Replacing only
+    // that display roster must recover every byte of the retained oracle.
+    expect(JSON.stringify({ ...graph.breakdowns, modelConfig: JSON.parse(expected).modelConfig })).toBe(expected);
+    expect(graph.breakdowns.modelConfig.map(({ id }) => id)).toEqual([
+      "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
+      "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
+    ]);
     expect(graph.breakdowns.days.some((day) => day.byPlanType.promax.fitCount > 0)).toBe(true);
     const base = projectRetainedPro10PublicAllowanceGraph(goldenRow, goldenOptions)!.breakdowns;
     expect(base.schemaVersion).toBe("community-allowance-breakdowns-v1.2");

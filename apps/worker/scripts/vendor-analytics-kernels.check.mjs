@@ -72,7 +72,7 @@ const PINNED_PATCH_SPECS = [
  */
 const PINNED_SOURCE_PATCHES = [
   ["apps/worker/src/admin-community-allowance.ts", "historical-preview-catalog-compatibility", 4,
-    "934d6837a8420c6f85d001e0b906726834783156e9bfed610e2bfffa00621fbe"],
+    "67e143fa82f1b1ec20bf5306ebd8eef3c375f5d822be8ae3087f2d5ca9f89eda"],
   ["apps/worker/src/telemetry-usage-reconciliation.ts", "internal-analytics-json-replay", 9,
     "6120ad25ec598168134ac9d22806bd9655c9f6992b1c930e1b44da74e7ea552f"],
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "internal-analytics-json-composition", 3,

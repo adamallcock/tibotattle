@@ -2,7 +2,7 @@
 // (SPD-G3): dictionary-aware performance report admission and the bounded
 // device-scoped read, on the promoted primary chain (0079).
 //
-// Two tests need no database: the closed parser's refusal details, and the
+// Parser tests need no database, as does the
 // error mapping against a scripted fake pool (trigger P1005 messages, the
 // unique-race re-read and driver failures). Every other test builds its own
 // schema through the production migration runner (prefix g3_perf_) and writes
@@ -305,6 +305,28 @@ function denseRecords(day) {
 
 // ---------------------------------------------------------- no database --
 
+test("parser: Terra retains canonical records across all three accepted performance dictionaries", async () => {
+  await loadModules();
+  for (const dictionary of [PERFORMANCE_DICTIONARY_2026_09_21, PERFORMANCE_DICTIONARY_2026_09_29,
+    PERFORMANCE_DICTIONARY_2026_10_10]) {
+    const records = ["standard", "fast"].map((speedMode) => syntheticPerformanceRecord({
+      day: DAY, fieldDictionaryVersion: dictionary, modelId: "gpt-6.1-terra", speedMode,
+      apiServiceTier: speedMode === "fast" ? "priority" : "standard",
+      speedBucket: dictionary === PERFORMANCE_DICTIONARY_2026_10_10 ? 80 : 30,
+    }));
+    const report = buildReport({ dictionary, records, parserVersion: "unified-rollout-typed-v21" });
+    const parsed = reports.parsePostgresTelemetryPerformanceReport(report);
+    assert.equal(parsed.fieldDictionaryVersion, dictionary);
+    assert.equal(parsed.bucketSchemeVersion, PERFORMANCE_DICTIONARY_REGISTRY[dictionary].bucketSchemeVersion);
+    assert.equal(canonicalJson(parsed), canonicalJson(report));
+    for (const record of records) {
+      rejectsParse(buildReport({ dictionary, records: [{ ...record, modelId: "gpt-6.1-terra-unreviewed" }] }),
+        "MODEL_UNREVIEWED");
+      rejectsParse(buildReport({ dictionary, records: [{ ...record, provider: "anthropic" }] }), "MODEL_UNREVIEWED");
+    }
+  }
+});
+
 test("parser: every accepted dictionary parses with its scheme; each invalid class has its closed detail", async () => {
   await loadModules();
   const parse = reports.parsePostgresTelemetryPerformanceReport;
@@ -507,6 +529,48 @@ test("error mapping: trigger P1005 messages, unique races and driver failures (s
 });
 
 // -------------------------------------------------------------- database --
+
+test("admission: Terra Standard and Fast survive migration79 admission, replay and exact cohort readback", {
+  skip, timeout: 180_000,
+}, async () => {
+  const schema = await promotedSchema("terra");
+  await activatePerformanceRuntime(pool, { schema });
+  for (const dictionary of [PERFORMANCE_DICTIONARY_2026_09_21, PERFORMANCE_DICTIONARY_2026_09_29,
+    PERFORMANCE_DICTIONARY_2026_10_10]) {
+    const { owner, grant } = await owned(schema, { fieldDictionaryVersion: dictionary });
+    const report = buildReport({ dictionary, parserVersion: "unified-rollout-typed-v21", records:
+      ["standard", "fast"].map((speedMode) => syntheticPerformanceRecord({
+        day: DAY, fieldDictionaryVersion: dictionary, modelId: "gpt-6.1-terra", speedMode,
+        apiServiceTier: speedMode === "fast" ? "priority" : "standard",
+        speedBucket: dictionary === PERFORMANCE_DICTIONARY_2026_10_10 ? 80 : 30,
+      })) });
+    const accepted = await admit(schema, owner, grant, report);
+    assert.equal(accepted.status, "accepted");
+    const before = await ownerRows(schema, owner);
+    assert.deepEqual(before, { reports: 1, receipts: 1, cohorts: 2 });
+    assert.deepEqual(await admit(schema, owner, grant, report), { status: "idempotent", reportId: accepted.reportId,
+      day: DAY, reportRevision: report.reportRevision });
+    assert.deepEqual(await ownerRows(schema, owner), before);
+    const current = await read(schema, owner);
+    assert.equal(current.reports.length, 1);
+    const stored = current.reports[0];
+    assert.equal(stored.fieldDictionaryVersion, dictionary);
+    const stamp = (await pool.query(`SELECT bucket_scheme_version, parser_version
+      FROM ${performanceTable(schema, "telemetry_performance_reports")} WHERE id = $1`, [accepted.reportId])).rows[0];
+    assert.deepEqual(stamp, { bucket_scheme_version: report.bucketSchemeVersion,
+      parser_version: "unified-rollout-typed-v21" });
+    const expected = report.records.map(({ schemaVersion, day, measurementVersion, bucketSchemeVersion, ...record }) => {
+      for (const key of ["speedHistogram", "ttftHistogram", "completionHistogram"]) {
+        const { metric, min, max, buckets } = record[key];
+        record[key] = { metric, min, max, buckets: Object.entries(buckets)
+          .map(([index, count]) => ({ index: Number(index), count })).sort((a, b) => a.index - b.index) };
+      }
+      return record;
+    });
+    const bySpeed = (records) => [...records].sort((left, right) => left.speedMode.localeCompare(right.speedMode));
+    assert.deepEqual(bySpeed(stored.cohorts), bySpeed(expected));
+  }
+});
 
 test("admission: accepted, idempotent replay and replaced by a newer sourceRevision", {
   skip, timeout: 180_000,

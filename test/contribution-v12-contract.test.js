@@ -23,6 +23,7 @@ import {
   validateTelemetryV12Envelope,
 } from "../packages/telemetry-contract/index.js";
 import * as canonical from "../packages/telemetry-contract/index.js";
+import { telemetryV11JsonSchemas } from "../packages/telemetry-contract/src/telemetry-v1.1-schemas.js";
 import { telemetryV12JsonSchemas } from "../packages/telemetry-contract/src/telemetry-v1.2-schemas.js";
 import * as browser from "../apps/web/public/telemetry-shared.generated.js";
 
@@ -145,6 +146,47 @@ test("v1.2 exports stay in lockstep with the generated browser mirror", () => {
   const usageChunk = chunk(record);
   assert.deepEqual(browser.parseTelemetryV12Record("usage", record), parseTelemetryV12Record("usage", record));
   assert.deepEqual(browser.parseTelemetryV12Attribution(record.accountPlanAttribution), parseTelemetryV12Attribution(record.accountPlanAttribution));
+});
+
+test("reviewed Pro Max and scientific plans preserve exact evidence through both staged closed contracts", () => {
+  for (const [version, parse, schemasFor] of [
+    ["v1.1", parseTelemetryV11Record, telemetryV11JsonSchemas],
+    ["v1.2", parseTelemetryV12Record, telemetryV12JsonSchemas],
+  ]) {
+    const schemas = schemasFor();
+    const ajv = new Ajv({ allErrors: true, strict: true, validateFormats: false });
+    for (const schema of Object.values(schemas)) ajv.addSchema(schema);
+    const validate = ajv.getSchema(schemas["quota-observation.schema.json"].$id);
+    const validateUsage = ajv.getSchema(schemas["usage-event.schema.json"].$id);
+    for (const planType of ["promax", "sci", "sci_plus"]) {
+      const accountPlanAttribution = { ...ATTRIBUTION, planBasis: "same_source_occurrence", planType };
+      const value = { ...quota(), schemaVersion: `quota-observation-${version}`, planType, accountPlanAttribution };
+      assert.equal(parse("quota", value).planType, planType);
+      assert.equal(validate(value), true, JSON.stringify(validate.errors));
+      assert.equal(value.planVariant, "unknown");
+      assert.equal(value.windowDurationMinutes, null);
+      const usageValue = usage({ schemaVersion: `usage-event-${version}`, accountPlanAttribution });
+      if (version === "v1.1") {
+        delete usageValue.boundaryFlags;
+        delete usageValue.tieOrder;
+        delete usageValue.cacheWriteTtl;
+      }
+      assert.equal(parse("usage", usageValue), usageValue);
+      assert.equal(validateUsage(usageValue), true, JSON.stringify(validateUsage.errors));
+      for (const invalid of [{ ...value, planType: "sci-plus" },
+        { ...value, accountPlanAttribution: { ...accountPlanAttribution, planType: "pro" } },
+        { ...value, accountPlanAttribution: { ...accountPlanAttribution, planBasis: "unavailable" } }]) {
+        assert.throws(() => parse("quota", invalid));
+        assert.equal(validate(invalid), false);
+      }
+      for (const attribution of [{ ...accountPlanAttribution, planType: "scientific_future" },
+        { ...accountPlanAttribution, planBasis: "unavailable" }]) {
+        const invalidUsage = { ...usageValue, accountPlanAttribution: attribution };
+        assert.throws(() => parse("usage", invalidUsage));
+        assert.equal(validateUsage(invalidUsage), false);
+      }
+    }
+  }
 });
 
 test("v1.2 validates the complete record, chunk, day, domain, and envelope family", () => {

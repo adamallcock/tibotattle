@@ -52,10 +52,12 @@ const MODEL_DATES = 70;
 const ACTIVE_DAYS_BACK = [0, 1, 2, 9, 20, 45, 80];
 /** sha256 of JSON.stringify of the composed envelope and preview for this corpus. */
 const HISTORICAL_RESPONSE_SHA256 = "2737d60661d0392b19ccc368b62bdb7ba3c8f14ead2241a28d30d6914ee84390";
-const COMPOSED_RESPONSE_SHA256 = "1428371ee626e14f63e2d57720712fdad8dd7221f81888e521ce356e61963d80";
+const SEPTEMBER29_RESPONSE_SHA256 = "1428371ee626e14f63e2d57720712fdad8dd7221f81888e521ce356e61963d80";
 const HISTORICAL_REGISTRY_SHA256 = "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9";
 const HISTORICAL_PREVIEW_SHA256 = "f04259f71d4e2a34bddaa92f306687d051fd8c3ac082f012dcec80e8fd7af6d2";
-const COMPOSED_PREVIEW_SHA256 = "188d462a76d1f909d0d875ba62e12aceb88e5505f2e990ff42c5cedea82f7913";
+const SEPTEMBER29_PREVIEW_SHA256 = "188d462a76d1f909d0d875ba62e12aceb88e5505f2e990ff42c5cedea82f7913";
+const COMPOSED_RESPONSE_SHA256 = "16ae12463cca066348fddeb897fb3526f5f98e6ed88cdffeeaec29edfe93928e";
+const COMPOSED_PREVIEW_SHA256 = "74757d4f173c3585f1818165e426a2f596d9d09d148fd8faac80e2f85aafc454";
 const stamp = (at: number) => new Date(at).toISOString();
 const label = (at: number) => stamp(at).slice(0, 10);
 const dayMs = (day: string) => Date.parse(`${day}T00:00:00.000Z`);
@@ -279,25 +281,38 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     for (const day of historicalIdentity.days) {
       const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       expect(spend.pricingMethodVersion).toBe("server-api-price-equivalent-v0.6");
-      expect(spend.registrySha256).toBe("d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d");
+      expect(spend.registrySha256).toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
       spend.pricingMethodVersion = "server-api-price-equivalent-v0.5";
       spend.registrySha256 = HISTORICAL_REGISTRY_SHA256;
     }
     expect(digest(historicalIdentity)).toBe(HISTORICAL_RESPONSE_SHA256);
-    expect(digest(response)).toBe(COMPOSED_RESPONSE_SHA256);
-    // The same reviewed re-vendor appended Sol to the model catalog. Restoring
-    // only the exact old 42-model prefix/catalog stamp must preserve every
-    // original estimate, supporting count, date and plan normalization byte.
-    expect(preview.models.modelConfig).toHaveLength(43);
+    const september29Identity = structuredClone(response);
+    for (const day of september29Identity.days) {
+      (day.payload.apiEquivalentSpend as Record<string, unknown>).registrySha256 =
+        "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
+    }
+    expect(digest(september29Identity)).toBe(SEPTEMBER29_RESPONSE_SHA256);
+    // Sol and then Terra were appended to the model catalog. Restoring only
+    // each exact predecessor prefix/catalog stamp must preserve every original
+    // estimate, supporting count, date and plan normalization byte.
+    expect(preview.models.modelConfig).toHaveLength(44);
     expect(preview.models.modelConfig[42]!.modelId).toBe("gpt-6.1-sol");
-    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-09-29.1"
-      && day.values.every(([modelId]) => modelId !== "gpt-6.1-sol"))).toBe(true);
+    expect(preview.models.modelConfig[43]!.modelId).toBe("gpt-6.1-terra");
+    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-10-26.1"
+      && day.values.every(([modelId]) => modelId !== "gpt-6.1-sol" && modelId !== "gpt-6.1-terra"))).toBe(true);
     const historicalCatalog = { ...preview, models: { ...preview.models,
       modelConfig: preview.models.modelConfig.slice(0, 42),
       days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-23.1" })),
     } };
     expect(validCachedAdminCommunityAllowancePreview(historicalCatalog, preview.generatedAt, NOW_MS)).toBe(true);
     expect(digest(historicalCatalog)).toBe(HISTORICAL_PREVIEW_SHA256);
+    const september29Catalog = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 43),
+      days: preview.models.days.map(day => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-29.1" })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(september29Catalog, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(digest(september29Catalog)).toBe(SEPTEMBER29_PREVIEW_SHA256);
+    expect(digest(response)).toBe(COMPOSED_RESPONSE_SHA256);
     expect(digest(preview)).toBe(COMPOSED_PREVIEW_SHA256);
     console.log(JSON.stringify({ composeProof: { responseSha256: digest(response), previewSha256: digest(preview),
       responseBytes: JSON.stringify(response).length } }));

@@ -284,6 +284,49 @@ describe("server pricing", () => {
     }
   });
 
+  it("admits Terra 6.1 and prices its four supported tiers without inferring Ultrafast or pre-launch prices", () => {
+    const expected = {
+      standard: ["0.694999", "0.695", "1.140002"],
+      batch: ["0.3474995", "0.3475", "0.570001"],
+      flex: ["0.3474995", "0.3475", "0.570001"],
+      priority: ["1.389998", "1.39", "2.280004"],
+    } as const;
+    for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+      const baseline = fixture({ modelId: "gpt-6.1-terra", eventTime: "2026-10-26T00:00:00.000Z",
+        totalInputContextTokens, speedMode: "standard", components: { ...fixture().components,
+          inputUncachedTokens: totalInputContextTokens - 172_000, inputCacheReadTokens: 100_000,
+          inputCacheWriteTokens: 72_000, outputTextTokens: 40_000, outputReasoningTokens: 60_000,
+          outputCombinedTokens: null,
+        } });
+      for (const apiServiceTier of ["standard", "batch", "flex", "priority"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface: "openai_api", apiServiceTier });
+        const worker = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({ model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components }, { apiServiceTier, priceEpochBasis: "event_time" });
+        expect(worker).toMatchObject({ exactCostUsd: expected[apiServiceTier][index], coverageStatus: "fully_priced",
+          coveragePercent: 100, unknownBillableUnits: 0, apiServiceTier, tierBasis: "observed_api_service_tier" });
+        expect(worker.exactCostUsd).toBe(local.totalUsd);
+        expect(worker.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+        expect(worker.selectedPriceCardIds.every(id => id.includes("gpt-6.1-terra"))).toBe(true);
+        expect(worker.registrySha256).toBe(local.registry?.sha256);
+        expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-10-25T23:59:59.999Z" }).coverageStatus).toBe("unpriced");
+        expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null }).coverageStatus).toBe("unpriced");
+      }
+      for (const speedMode of ["standard", "fast"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface: "chatgpt_subscription",
+          apiServiceTier: "unknown", speedMode });
+        expect(priceTelemetryUsageEvent(event)).toMatchObject({
+          exactCostUsd: expected[speedMode === "fast" ? "priority" : "standard"][index],
+          speedMultiplier: speedMode === "fast" ? 2 : null, coverageStatus: "fully_priced",
+        });
+      }
+      for (const billingSurface of ["chatgpt_subscription", "openai_api"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface, speedMode: "ultrafast", apiServiceTier: "ultrafast" });
+        expect(priceTelemetryUsageEvent(event)).toMatchObject({ costNanousd: 0, coverageStatus: "unpriced", priceBasis: "unpriced" });
+      }
+    }
+  });
+
   it("prices Astra Ultrafast once at the exact API card for API and subscription surfaces", () => {
     const expected = ["41.99994", "42", "69.00012"];
     for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
@@ -383,6 +426,7 @@ describe("server pricing", () => {
   it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
     let checked = 0;
     let checkedAstra = 0;
+    let checkedTerra = 0;
     for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
       (entry) => entry.provider === "openai" && entry.service_tier === "priority",
     )) {
@@ -418,11 +462,13 @@ describe("server pricing", () => {
         expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(localWeighted.usd);
         checked += 1;
         if (card.model === "gpt-6-astra") checkedAstra += 1;
+        if (card.model === "gpt-6.1-terra") checkedTerra += 1;
       }
     }
     expect(checkedAstra).toBe(2);
-    expect(checked - checkedAstra).toBe(32);
-    expect(checked).toBe(34);
+    expect(checkedTerra).toBe(2);
+    expect(checked - checkedAstra - checkedTerra).toBe(32);
+    expect(checked).toBe(36);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });

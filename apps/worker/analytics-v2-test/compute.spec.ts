@@ -206,8 +206,27 @@ describe("computeAnalyticsV2 (A-2)", () => {
       expect(day.byPlanType.promax).toEqual({ fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null });
     }
     expect(preview.days.filter((day) => day.combined.fitCount > 0).length).toBeGreaterThan(0);
-    expect(sha(JSON.stringify(response))).toBe("51a7d0cb490c82b92e88783d5d14ea01bbe6a44dd636522ce40e4b3cce2e3a9a");
-    expect(sha(JSON.stringify(preview))).toBe("7e69cbb790b249ef40fef152b28dfc2c786d99e30102f0551ebe0fe5ba284ba9");
+    // Terra changes only the reviewed price stamp and catalog in this corpus.
+    // Restore precisely those predecessor fields to keep the old whole-byte
+    // pins proving every amount, count, date and normalization is unchanged.
+    const september29Response = structuredClone(response);
+    for (const day of september29Response.days) {
+      const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
+      expect(spend.registrySha256).toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      spend.registrySha256 = "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
+    }
+    expect(sha(JSON.stringify(september29Response))).toBe("51a7d0cb490c82b92e88783d5d14ea01bbe6a44dd636522ce40e4b3cce2e3a9a");
+    expect(preview.models.modelConfig).toHaveLength(44);
+    expect(preview.models.modelConfig[43]!.modelId).toBe("gpt-6.1-terra");
+    expect(preview.models.days.every(day => day.catalogVersion === "reviewed-model-catalog-2026-10-26.1"
+      && day.values.every(([modelId]) => modelId !== "gpt-6.1-terra"))).toBe(true);
+    const september29Preview = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 43),
+      days: preview.models.days.map(day => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-29.1" })),
+    } };
+    expect(sha(JSON.stringify(september29Preview))).toBe("7e69cbb790b249ef40fef152b28dfc2c786d99e30102f0551ebe0fe5ba284ba9");
+    expect(sha(JSON.stringify(response))).toBe("3e88e6570ec207cf6f87648a4601a12804b4fb45fcdeb857e41f92c0ccd2119b");
+    expect(sha(JSON.stringify(preview))).toBe("5b2e42a75a0f733cc2a4c84e9b0e7b302b932b875ed0b5393f5091b25a958d5a");
 
     // Content identity excludes only the revision stamp; a restamp keeps it.
     const first = outputs.dailyCandidates[0]!;

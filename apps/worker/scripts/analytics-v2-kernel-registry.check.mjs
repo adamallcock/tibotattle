@@ -119,6 +119,10 @@ const REGISTRY_PINS = Object.freeze([
   // and TELEMETRY_DAY_NOT_YET_ADMISSIBLE. Vendor, prices and the pricer are
   // unchanged from kernel 19; this source is not deployed.
   "981fbd1a86e62732b725a922f8c31cffec2f5f184d2721d6fb4001b2b0eeb97e",
+  // Kernel 21: reviewed Terra catalog/prices and exact retained admin catalogs,
+  // plus current scientific-plan recognition with unknown allowance. The live
+  // performance/era implementation and all predecessor identities are retained.
+  "00de5d3dd296f79a2d7bb90361f126621d4155593787045baec137454775705e",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

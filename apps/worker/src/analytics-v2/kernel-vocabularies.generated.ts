@@ -10,7 +10,7 @@
 // Schema: analytics-kernel-vocabularies-v1.
 
 /** The production commit the vocabularies were derived from (MANIFEST.json sourceCommit). */
-export const KERNEL_VOCABULARIES_SOURCE_COMMIT = "62ad218f1991e1b4fd36cd1938491ae4b5e1ce8a" as const;
+export const KERNEL_VOCABULARIES_SOURCE_COMMIT = "76179fd4f21816693e958e436d3c84fd8555da60" as const;
 
 /** Model history dates in the allowance preview: admin-community-allowance.ts ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS. */
 export const KERNEL_MODEL_DATES = 70 as const;

@@ -5,6 +5,7 @@ import Ajv from "ajv";
 
 import {
   TelemetryContractError,
+  TELEMETRY_V02_PLAN_TYPES,
   canonicalTelemetryContributionV01,
   inspectTelemetryContributionDatasetV02,
   inspectTelemetryContributionV02,
@@ -67,6 +68,27 @@ test("strict package accepts and preserves the frozen golden contracts", () => {
     valid: true,
     errors: [],
   });
+});
+
+test("frozen v0.2 runtime and schemas reject later plans while current local records retain them", async () => {
+  const { schemas, validate } = await compiledV02Schema();
+  for (const schema of schemas.slice(1, 3)) {
+    assert.deepEqual(schema.properties.planType.enum, TELEMETRY_V02_PLAN_TYPES);
+  }
+  for (const planType of ["promax", "sci", "sci_plus"]) {
+    const current = telemetryV01Golden();
+    current.quotaSnapshots[0].planType = planType;
+    current.activityMarkers[0].planType = planType;
+    assert.equal(parseTelemetryContribution(current), current);
+    for (const field of ["quotaSnapshots", "activityMarkers"]) {
+      const legacy = telemetryV02Golden();
+      legacy[field][0].planType = planType;
+      assert.equal(validate(legacy), false);
+      assert.equal(inspectTelemetryContributionV02(legacy).valid, false);
+      assert.throws(() => parseTelemetryContributionV02(legacy), TelemetryContractError);
+      assert.throws(() => canonicalTelemetryContributionV01(legacy), TelemetryContractError);
+    }
+  }
 });
 
 test("mixed event price bases are represented at batch level without relabeling rows", async () => {
