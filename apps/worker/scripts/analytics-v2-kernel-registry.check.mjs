@@ -127,6 +127,9 @@ const REGISTRY_PINS = Object.freeze([
   // correction-source family. Live performance/era behavior, vendor and prices
   // are unchanged; this is the server branch successor to its kernel 21.
   "93113d9c87614c9e01b29dbe0a01e8480031175dddc31648bf07f20302b4d1f8",
+  // Kernel 23: exact daily-state key matching and the primitive-zero decimal
+  // shortcut preserve historical acceptance, arithmetic and refusal behavior.
+  "340b9dab35a63d6c7baaf25b3f5ecde8d5ef683bedf3db2c30c423146a3b6273",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

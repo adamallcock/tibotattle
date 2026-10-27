@@ -1,6 +1,7 @@
 // Synthetic, content-free regression cases for the GCP model-era composition
 // fallback. The input covers one complete closed 101-day model window.
 import { describe, expect, it } from "vitest";
+import { loadProductionModelEraEvaluator } from "./fixtures/model-era-production-runtime.mjs";
 import { canonicalJson } from "../src/canonical-json";
 import {
   evaluateAnalyticsV2ModelDate,
@@ -38,6 +39,10 @@ import {
   usage,
   TODAY,
 } from "./fixtures/synthetic-occurrences.mjs";
+
+// Only module compilation/import occurs during setup; fixture creation and
+// the complete evaluator call stay inside each unchanged 5000 ms test.
+const productionModelEra = await loadProductionModelEraEvaluator();
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 60 * 60 * 1_000;
@@ -647,7 +652,7 @@ describe("GCP model-era composition fallback", () => {
     const rows = input.days.map((day) => ({ day: day.day,
       usageRows: day.day === TARGET_DAY ? longSessionRows : [] }));
     const startedAt = performance.now();
-    const result = await evaluateAnalyticsV2PlanEraComposition({
+    const result = await productionModelEra.evaluate({
       pin: input.pin,
       nowMs: Date.parse(modelHistoryWindow(input.day).fixedNow),
       quotaAcquisition,
@@ -675,7 +680,7 @@ describe("GCP model-era composition fallback", () => {
     }));
     const rows = input.days.map((day) => ({ day: day.day,
       usageRows: day.day === TARGET_DAY ? sessionRows : [] }));
-    const result = await evaluateAnalyticsV2PlanEraComposition({
+    const result = await productionModelEra.evaluate({
       pin: input.pin,
       nowMs: Date.parse(modelHistoryWindow(input.day).fixedNow),
       quotaAcquisition,
@@ -683,5 +688,52 @@ describe("GCP model-era composition fallback", () => {
     });
 
     expect(result).toMatchObject({ status: "not_testable", reason: "session_interval_scope_limit_exceeded" });
+  });
+
+  it("rejects a model-era bundle whose production fast-pricer binding is missing", async () => {
+    await expect(loadProductionModelEraEvaluator({ omitFastPricer: true }))
+      .rejects.toMatchObject({ code: "ANALYTICS_FAST_PRICER_BINDING_MISSING" });
+  });
+
+  it("preserves complete generic results and failures through the production model-era graph", async () => {
+    const input = await preparedTransitionWindow();
+    const quotaAcquisition = completedAcquisition(input);
+    const freshInput = (change?: (row: UsageRow) => void) => {
+      const days = input.days.map(day => ({ day: day.day, usageRows: day.usageRows.map(row => ({ ...row })) }));
+      const row = days.find(day => day.day === TARGET_DAY)!.usageRows[4]!;
+      change?.(row);
+      return { pin: input.pin, nowMs: Date.parse(modelHistoryWindow(input.day).fixedNow), quotaAcquisition, days };
+    };
+    const outcome = async (evaluate: typeof evaluateAnalyticsV2PlanEraComposition, change?: (row: UsageRow) => void) => {
+      try { return { result: await evaluate(freshInput(change)) }; }
+      catch (error) { return { error: { name: (error as Error).name, message: (error as Error).message } }; }
+    };
+    const compare = async (change?: (row: UsageRow) => void) => {
+      const expected = await outcome(evaluateAnalyticsV2PlanEraComposition, change);
+      expect(await outcome(productionModelEra.evaluate, change)).toEqual(expected);
+      return expected;
+    };
+    const ordinary = await compare();
+    expect(ordinary.result).toMatchObject({ status: "partitioned" });
+    expect(partitioned(ordinary.result!).candidates.every(candidate => candidate.composition.status === "ready")).toBe(true);
+    // Unknown models and Ultrafast both keep the reviewed oracle fallback;
+    // unknown token observations remain unavailable rather than becoming zero.
+    for (const overrides of [
+      { modelId: "synthetic-unlisted-model" },
+      { modelId: "gpt-5.6-sol", speedMode: "ultrafast" },
+      { components: { inputUncachedTokens: null, inputCacheReadTokens: null, inputCacheWriteTokens: null,
+        outputTextTokens: null, outputReasoningTokens: null, outputCombinedTokens: null } },
+    ]) {
+      const result = await compare(row => { row.record_json = JSON.stringify({ ...JSON.parse(row.record_json), ...overrides }); });
+      expect(result.result).toMatchObject({ status: "partitioned" });
+    }
+    const malformed = await compare(row => { row.record_json = "{"; });
+    expect(malformed.result).toMatchObject({ status: "not_testable", reason: "invalid_attribution_record" });
+    const invalidQuantity = await compare(row => {
+      const record = JSON.parse(row.record_json);
+      record.components.inputUncachedTokens = -1;
+      row.record_json = JSON.stringify(record);
+    });
+    expect(invalidQuantity.error).toMatchObject({ name: "TypeError" });
   });
 });

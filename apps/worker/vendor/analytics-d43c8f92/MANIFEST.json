@@ -114,6 +114,18 @@
     },
     {
       "path": "apps/worker/src/v11-daily-projection-values.ts",
+      "id": "daily-values-closed-shape",
+      "hunks": 1,
+      "sha256": "d0b7d48588a03c16a09dceefdb760d63f258896306c3702e1f8c0232c872b199"
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection-values.ts",
+      "id": "daily-values-decimal-zero",
+      "hunks": 1,
+      "sha256": "2ba788600c5542ea98d6b82be764cac8ef3eef7ad7ffae5f03e4d7abda3ab533"
+    },
+    {
+      "path": "apps/worker/src/v11-daily-projection-values.ts",
       "id": "daily-fold-trusted-state",
       "hunks": 5,
       "sha256": "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"
@@ -133,7 +145,7 @@
     "package": 40,
     "exportPatched": 8,
     "exportPatchedFiles": 4,
-    "sourcePatched": 7,
+    "sourcePatched": 9,
     "sourcePatchedFiles": 6,
     "typeStubs": 3,
     "parityTests": 10
@@ -765,7 +777,7 @@
     {
       "path": "apps/worker/src/v11-daily-projection-values.ts",
       "blob": "d8630374eebdbc5615c964cce3deb61a1ac9755d",
-      "sha256": "5be2b53dfd5b4b83485db1f74ff46659f46d8828a814e023fdf892d520be7bf8",
+      "sha256": "479fde54936cb0cd4adc0b5efce76d017f59558447ca35d40b3d1bcb26438656",
       "patch": "source",
       "reach": "kernel"
     },
