@@ -210,10 +210,12 @@ test("admin model order and themes match the public presentation, including cata
   const preview = allowancePreviewWithModels();
   preview.models.modelConfig.push({ modelId: "gpt-6-astra", label: "GPT-6 Astra" });
   preview.models.modelConfig.push({ modelId: "gpt-5.4-mini", label: "GPT-5.4 mini" });
+  preview.models.modelConfig.push({ modelId: "gpt-6.1-terra", label: "GPT-6.1 Terra" });
   const model = adminAllowanceChartModel(preview, { mode: "models" });
   assert.deepEqual(model.legendSeries.map(({ key, theme, className }) => [key, theme, className]), [
     ["gpt-6-astra", "astra", "allowance-model-astra"],
     ["gpt-5.6-sol", "sol", "allowance-model-sol"],
+    ["gpt-6.1-terra", "terra", "allowance-model-terra"],
     ["gpt-5.6-terra", "terra", "allowance-model-terra"],
     ["gpt-5.6-luna", "luna", "allowance-model-luna"],
     ["gpt-5.5", "classic", "allowance-model-classic"],

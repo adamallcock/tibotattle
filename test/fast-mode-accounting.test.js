@@ -66,6 +66,8 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     "gpt-6-astra": 2,
     "gpt-6-sol": 2,
     "gpt-6-luna": 2,
+    "gpt-6.1-sol": 2,
+    "gpt-6.1-terra": 2,
   });
   assert.equal(Object.isFrozen(FAST_MODE_QUOTA_MULTIPLIERS), true);
   // The map is derived from the price registry and re-deriving it is exact.

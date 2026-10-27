@@ -52,7 +52,10 @@
         "edu",
         "edu_plus",
         "edu_pro",
-        "unknown"
+        "unknown",
+        "promax",
+        "sci",
+        "sci_plus"
       ]
     },
     "planVariant": {
@@ -120,12 +123,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "free"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -142,12 +145,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "go"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -164,12 +167,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "plus"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -186,12 +189,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "pro"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -208,12 +211,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "prolite"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -230,12 +233,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "team"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -252,12 +255,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "self_serve_business_prolite"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -274,12 +277,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "self_serve_business_usage_based"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -296,12 +299,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "business"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -318,12 +321,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "ent26"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -340,12 +343,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise_cbp_automation"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -362,12 +365,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise_cbp_usage_based"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -384,12 +387,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "enterprise"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -406,12 +409,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -428,12 +431,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu_plus"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -450,12 +453,12 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "edu_pro"
               }
-            },
-            "type": "object"
+            }
           }
         }
       }
@@ -472,12 +475,78 @@
       "then": {
         "properties": {
           "accountPlanAttribution": {
+            "type": "object",
             "properties": {
               "planType": {
                 "const": "unknown"
               }
-            },
-            "type": "object"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "promax",
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "promax"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "sci",
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "sci"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "sci_plus",
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "type": "object",
+            "properties": {
+              "planType": {
+                "const": "sci_plus"
+              }
+            }
           }
         }
       }

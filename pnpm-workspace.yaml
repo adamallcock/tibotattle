@@ -1,6 +1,16 @@
 packages:
   - packages/*
 
+overrides:
+  app-builder-lib@26.15.7>@electron/get: 5.1.0
+  '@electron/get@5.1.0>undici': 7.30.1
+  brace-expansion@1.1.18: 1.1.21
+  brace-expansion@2.1.4: 2.1.7
+  brace-expansion@5.0.9: 5.0.12
+  fast-uri: 3.1.9
+  undici@6.28.0: 6.29.1
+  undici@7.29.0: 7.30.1
+
 allowBuilds:
   '@github/keytar': false
   electron-winstaller: false

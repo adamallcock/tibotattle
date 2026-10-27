@@ -234,6 +234,7 @@ describe("server pricing", () => {
   it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
     let checked = 0;
     let checkedAstra = 0;
+    let checkedTerra = 0;
     for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
       (entry) => entry.provider === "openai" && entry.service_tier === "priority",
     )) {
@@ -269,11 +270,13 @@ describe("server pricing", () => {
         expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(localWeighted.usd);
         checked += 1;
         if (card.model === "gpt-6-astra") checkedAstra += 1;
+        if (card.model === "gpt-6.1-terra") checkedTerra += 1;
       }
     }
     expect(checkedAstra).toBe(2);
-    expect(checked - checkedAstra).toBe(30);
-    expect(checked).toBe(32);
+    expect(checkedTerra).toBe(2);
+    expect(checked - checkedAstra - checkedTerra).toBe(32);
+    expect(checked).toBe(36);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });

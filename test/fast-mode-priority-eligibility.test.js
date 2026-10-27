@@ -62,17 +62,18 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
       checked += 1;
     }
   }
-  assert.equal(checked, 32);
-  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 19);
+  assert.equal(checked, 36);
+  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 21);
   assert.equal(Math.max(...Object.values(FAST_MODE_QUOTA_MULTIPLIERS)), 2.5);
 });
 
-test("Sol and Luna Priority ratios require launch-time evidence and the matching context card", () => {
-  for (const model of ["gpt-6-sol", "gpt-6-luna"]) {
+test("Sol, Luna and Terra Priority ratios require launch-time evidence and the matching context card", () => {
+  for (const [model, launchDay] of [["gpt-6-sol", "2026-09-22"], ["gpt-6-luna", "2026-09-22"],
+    ["gpt-6.1-sol", "2026-09-29"], ["gpt-6.1-terra", "2026-10-26"]]) {
     assert.ok(FAST_MODE_MODEL_FAMILY_KEYS.includes(model));
     assert.equal(FAST_MODE_QUOTA_MULTIPLIERS[model], 2);
     for (const totalInputContextTokens of [272_000, 272_001]) {
-      const evidence = { eventTime: "2026-09-22T00:00:00.000Z", totalInputContextTokens };
+      const evidence = { eventTime: `${launchDay}T00:00:00.000Z`, totalInputContextTokens };
       const band = totalInputContextTokens === 272_000 ? "short" : "long";
       const standard = APP_OFFICIAL_PRICE_CARDS.find((card) => card.model === model
         && card.service_tier === "standard" && card.metadata.total_input_context_band === band);
@@ -81,7 +82,7 @@ test("Sol and Luna Priority ratios require launch-time evidence and the matching
         && card.service_tier === "standard" && card.metadata.total_input_context_band !== band);
       assert.equal(fastModeQuotaMultiplier(model, { ...evidence, standardPriceCardIds: [wrongBand.id] }), null);
       assert.equal(fastModeQuotaMultiplier(model, {
-        ...evidence, eventTime: "2026-09-21T23:59:59.999Z",
+        ...evidence, eventTime: new Date(Date.parse(evidence.eventTime) - 1).toISOString(),
       }), null);
       assert.equal(fastModeQuotaMultiplier(`${model}-wm`, evidence), null);
       assert.equal(fastModeQuotaMultiplier(`${model}-preview`, evidence), null);

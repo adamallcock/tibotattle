@@ -1196,7 +1196,7 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   assert.match(verifyRelease, /### Linux AppImage/u);
   assert.match(verifyRelease, /Mac App Store/u);
   assert.match(verifyRelease, /does not prove safety/u);
-  assert.match(privacy, /<title>TiboTattle Privacy Overview<\/title>/u);
+  assert.match(privacy, /<title data-i18n="privacy.page.title">TiboTattle Privacy Overview<\/title>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.match(privacy, /fresh installations enable sharing\s+automatically/u);
   assert.match(privacy, /No social sign-in is required/u);
@@ -1216,7 +1216,7 @@ test("the public guidance pages are useful stubs without app-only controls", asy
     assert.match(page, /href="\.\/community\.html#download"/u);
     assert.match(
       page,
-      /<span class="header-download-label">Download<\/span>/u,
+      /<span class="header-download-label"(?: data-i18n="privacy.page.download")?>Download<\/span>/u,
       "resource-page download labels must collapse without clipping on narrow headers",
     );
     assert.match(page, /href="\.\/docs\.html"/u);

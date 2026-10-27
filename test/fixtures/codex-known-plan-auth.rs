@@ -7,8 +7,8 @@ impl KnownPlan {
             Self::Free => "Free",
             Self::Go => "Go",
             Self::Plus => "Plus",
-            Self::Pro => "Pro",
-            Self::ProLite => "Pro Lite",
+            Self::Pro => "Pro (More)",
+            Self::ProLite => "Pro",
             Self::Team => "Team",
             Self::SelfServeBusinessProLite => "Self Serve Business ProLite",
             Self::SelfServeBusinessUsageBased => "Self Serve Business Usage Based",
@@ -20,6 +20,9 @@ impl KnownPlan {
             Self::Edu => "Edu",
             Self::EduPlus => "Edu Plus",
             Self::EduPro => "Edu Pro",
+            Self::ProMax => "Pro (Max)",
+            Self::Sci => "Academic Researchers",
+            Self::SciPlus => "Academic Researchers Plus",
         }
     }
 
@@ -41,6 +44,9 @@ impl KnownPlan {
             Self::Edu => "edu",
             Self::EduPlus => "edu_plus",
             Self::EduPro => "edu_pro",
+            Self::ProMax => "promax",
+            Self::Sci => "sci",
+            Self::SciPlus => "sci_plus",
         }
     }
 }

@@ -8,6 +8,8 @@ import {
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
   COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL,
+  PREVIEW_CACHE_JSON_LIMIT_BYTES,
+  validCachedAdminCommunityAllowancePreview,
   buildAdminCommunityAllowancePreview,
   buildAdminCommunityAllowancePreviewFromSource,
   readCachedAdminCommunityAllowancePreview,
@@ -317,6 +319,58 @@ describe("admin community allowance preview", () => {
     const cached = previewCacheDatabase({ generated_at: preview.generatedAt, payload_json: payload });
     await expect(readCachedAdminCommunityAllowancePreview(cached.database, now)).resolves.toEqual(preview);
     expect(cached.statements).toHaveLength(1);
+  });
+
+  it("bounds the complete three-plan producer with safe-integer counts and rejects byte overflow", async () => {
+    const now = Date.parse("2026-09-03T12:00:00.000Z");
+    const base = buildAdminCommunityAllowancePreview([], now);
+    const maximum = Number.MAX_SAFE_INTEGER;
+    const quarter = Math.floor(maximum / 4);
+    const recent = maximum - 2 * quarter;
+    const eligible = Math.floor(recent / 2);
+    const summary = (fitCount: number, participantCount: number) => ({
+      fitCount, participantCount, centralUsd: Number.MAX_VALUE,
+      band80Usd: { lowerUsd: Number.MAX_VALUE, upperUsd: Number.MAX_VALUE },
+    });
+    const preview = { ...base,
+      coverage: { uploadingParticipantCount: maximum, cachedParticipantCount: maximum,
+        recentFittedParticipantCount: recent, mergeEligibleParticipantCount: eligible,
+        noQualifyingFitParticipantCount: quarter, noRecentFitParticipantCount: quarter,
+        unsupportedPlanParticipantCount: recent - eligible },
+      days: base.days.map(({ day }) => ({ day,
+        combined: summary(quarter * base.plans.length, eligible),
+        byPlanType: Object.fromEntries(base.plans.map(({ planType }) => [planType, summary(quarter, quarter)])),
+      })),
+      models: { ...base.models, days: base.days.map(({ day }) => {
+        const projected = projectAdminModelHistoryDay({ day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+          values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
+            .map((model) => [model.modelId, Number.MAX_VALUE, quarter]),
+          fittedParticipantCount: quarter, unstableParticipantCount: quarter,
+          staleParticipantCount: quarter, refusedParticipantCount: maximum - 3 * quarter,
+          v1ParticipantCount: maximum, unsupportedSourceParticipantCount: maximum });
+        expect(projected).not.toBeNull();
+        return projected!;
+      }) },
+    };
+    expect(base.plans).toHaveLength(3);
+    expect(ADMIN_MODEL_CONFIG).toHaveLength(44);
+    expect(validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, now)).toBe(true);
+    const payload = JSON.stringify(preview);
+    expect(new TextEncoder().encode(payload).byteLength).toBeLessThan(PREVIEW_CACHE_JSON_LIMIT_BYTES);
+    await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase({
+      generated_at: preview.generatedAt, payload_json: payload,
+    }).database, now)).resolves.toEqual(preview);
+    // Stored labels are bounded by characters, while storage is bounded by
+    // bytes. A structurally valid oversized row still fails the cache boundary.
+    const oversized = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.map((model) => ({ ...model, label: "長".repeat(80) })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(oversized, oversized.generatedAt, now)).toBe(true);
+    const oversizedPayload = JSON.stringify(oversized);
+    expect(new TextEncoder().encode(oversizedPayload).byteLength).toBeGreaterThan(PREVIEW_CACHE_JSON_LIMIT_BYTES);
+    await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase({
+      generated_at: oversized.generatedAt, payload_json: oversizedPayload,
+    }).database, now)).rejects.toMatchObject({ status: 503, code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" });
   });
 
   it("normalizes eligible fits before merging and deduplicates participants", () => {
