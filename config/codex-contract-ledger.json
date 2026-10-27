@@ -146,6 +146,20 @@
       "firstReviewedOn": "2026-08-25",
       "lifecycle": "active",
       "rawValue": "edu_pro"
+    },
+    {
+      "displayName": "Academic Researchers",
+      "firstReviewedOn": "2026-10-26",
+      "lifecycle": "active",
+      "note": "Raw value and display name are verified in official openai/codex commit fea1d7f7d163521a868c344527da79ba0efc146d and installed ChatGPT-bundled codex-cli 0.164.0-alpha.11.1. Provider allowance capacity, multipliers and window semantics remain unverified; no personal-plan normalization is assigned.",
+      "rawValue": "sci"
+    },
+    {
+      "displayName": "Academic Researchers Plus",
+      "firstReviewedOn": "2026-10-26",
+      "lifecycle": "active",
+      "note": "Raw value and display name are verified in official openai/codex commit fea1d7f7d163521a868c344527da79ba0efc146d and installed ChatGPT-bundled codex-cli 0.164.0-alpha.11.1. Provider allowance capacity, multipliers and window semantics remain unverified; no personal-plan normalization is assigned.",
+      "rawValue": "sci_plus"
     }
   ],
   "schemaVersion": "codex-contract-ledger-v0.1",
@@ -163,9 +177,9 @@
     "branch": "main",
     "path": "codex-rs/protocol/src/auth.rs",
     "repository": "openai/codex",
-    "reviewedOn": "2026-10-04",
-    "reviewedRevision": "550eb50545a78468a09ce86b82426338640ef22d",
-    "sourceSha256": "0ab901e92eaaa9ac87d1aa5ba94c1bdc72696e922062f318e2c8e308462a3856"
+    "reviewedOn": "2026-10-26",
+    "reviewedRevision": "fea1d7f7d163521a868c344527da79ba0efc146d",
+    "sourceSha256": "dcae6a282263f505572575703849ce71ae8ab3faef4f909ac57d5aee113ca6ea"
   },
   "verifiedContracts": [
     {
@@ -191,6 +205,12 @@
       "planTypesSha256": "e38cfbb49d6aebb3ff41369320c11d2975b0597078f8290236a460351a0350f7",
       "verifiedOn": "2026-10-04",
       "version": "codex-cli 0.160.0"
+    },
+    {
+      "channel": "chatgpt_bundled",
+      "planTypesSha256": "0d0382ec52c0294de5017d4e22b0f5a31393806d3c3fdb7aa5661e3bf7d43608",
+      "verifiedOn": "2026-10-26",
+      "version": "codex-cli 0.164.0-alpha.11.1"
     }
   ]
 }
