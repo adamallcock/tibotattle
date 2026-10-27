@@ -2,13 +2,22 @@
 // resolution. Synthetic files only; no database, no network, no refresh.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseArguments, resolveRehearsalDump, syntheticRehearsalFloorDays } from "./gcp-fastpath-rehearsal.mjs";
+import { declaredAllowanceContractPassed, parseArguments, resolveRehearsalDump, syntheticRehearsalFloorDays } from "./gcp-fastpath-rehearsal.mjs";
+import { ANALYTICS_V2_Q1_CURRENT_CONTRACT } from "./analytics-v2-parity-current-contract.mjs";
 
 const refused = (code) => (error) => error?.code === code;
+
+test("the named Q-1 rehearsal explicitly selects its pinned current expectation contract", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(manifest.scripts["gcp:fastpath:rehearsal"],
+    "node ./scripts/gcp-fastpath-rehearsal.mjs --golden ./analytics-v2-test/golden "
+    + "--per-date-expected ./analytics-v2-test/golden-q1-node/per-date-expected.json "
+    + "--comparison-contract q1-pro20-four-plan-v1");
+});
 
 test("--dense holds the golden to its own per-date expectation and owner references", () => {
   const options = parseArguments(["--golden", "/g/golden-dense", "--dense", "--dump", "/d/usage-monitor-db.json"]);
@@ -27,6 +36,38 @@ test("the Q-1 rehearsal takes optional per-date and owner references", () => {
     "--owner-reference", "/n"]);
   assert.deepEqual([options.dense, options.perDateExpected, options.ownerReference, options.dump],
     [false, "/n/per-date-expected.json", "/n", null]);
+});
+
+test("the current Q-1 comparison is explicit, closed, and requires its complete historical inputs", () => {
+  const base = ["--golden", "/g/golden", "--per-date-expected", "/g/per-date-expected.json"];
+  assert.equal(parseArguments(base).comparisonContract, null);
+  assert.equal(parseArguments([...base, "--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT]).comparisonContract,
+    ANALYTICS_V2_Q1_CURRENT_CONTRACT);
+  for (const extra of [["--comparison-contract", "unknown"],
+    ["--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT, "--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT],
+    ["--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT, "--dense"],
+    ["--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT, "--dump", "/g/other.json"],
+    ["--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT, "--reuse-schema", "typed_legacy_transfer_rehearsal_target_fastpath_0a1b2c3d"]]) {
+    assert.throws(() => parseArguments([...base, ...extra]), refused("REHEARSAL_ARGUMENT_INVALID"));
+  }
+  assert.throws(() => parseArguments(["--golden", "/g", "--comparison-contract", ANALYTICS_V2_Q1_CURRENT_CONTRACT]),
+    refused("REHEARSAL_ARGUMENT_INVALID"));
+});
+
+test("the rehearsal declared-contract gate never substitutes current acceptance for the legacy gate", () => {
+  const current = { currentContract: { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: true }, unexpectedDiffs: 0 };
+  const legacy = { breakdownsV13: { accepted: true }, unexpectedDiffs: 0 };
+  assert.equal(declaredAllowanceContractPassed(legacy), true);
+  assert.equal(declaredAllowanceContractPassed(current), false);
+  assert.equal(declaredAllowanceContractPassed(current, ANALYTICS_V2_Q1_CURRENT_CONTRACT), true);
+  assert.equal(declaredAllowanceContractPassed(legacy, ANALYTICS_V2_Q1_CURRENT_CONTRACT), false);
+  for (const changed of [{ ...current, unexpectedDiffs: 1 },
+    { ...current, currentContract: { id: "other", accepted: true } },
+    { ...current, currentContract: { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: false } },
+    { ...current, currentContract: { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: 1 } }]) {
+    assert.equal(declaredAllowanceContractPassed(changed, ANALYTICS_V2_Q1_CURRENT_CONTRACT), false);
+  }
+  assert.equal(declaredAllowanceContractPassed(current, "other"), false);
 });
 
 test("K-CORE-A: staged primary migrations and compute Workers are opt-in and bounded", () => {

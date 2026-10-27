@@ -137,6 +137,13 @@ async function occurrences(runtime, ownerDigest, stream, fromDay = D1, throughDa
     { ownerDigest, stream, fromDay, throughDay });
 }
 
+// The correction_sources ledger also includes classification proof reads.
+// Expansion probes must target usage-total facts without changing those proofs.
+function isCorrectionFactExpansion(statement) {
+  return statement.startsWith("/* analytics_v2:occurrences.correction_sources */ ")
+    && statement.includes(".telemetry_usage_correction_facts ");
+}
+
 test("(d)(e) the roster follows production eligibility and source routing at both runtime states",
   { skip: SKIP, timeout: 120_000 }, async () => {
     const expectations = {
@@ -872,12 +879,15 @@ test("READ-EXPANSION: empty families skip only with same-snapshot proofs and set
   await modules.owners.withAnalyticsV2ReadSnapshot(context("active"), async (snapshot) => {
     await snapshot.client.query("SELECT set_config('jit','on',true),set_config('work_mem','8MB',true)");
     const seen = [];
+    const classificationProofs = [];
     const client = { query: async (...args) => {
       const statement = typeof args[0] === "string" ? args[0] : args[0].text;
       if (/analytics_v2:occurrences\.(legacy_sources|v12_sources|correction_sources)/u.test(statement)) {
         const settings = (await snapshot.client.query("SELECT current_setting('jit') AS jit,current_setting('work_mem') AS mem")).rows[0];
         assert.deepEqual(settings, { jit: "off", mem: "64MB" });
-        seen.push(statement.match(/analytics_v2:occurrences\.([a-z_]+)/u)[1]);
+        const family = statement.match(/analytics_v2:occurrences\.([a-z_]+)/u)[1];
+        if (family === "correction_sources" && !isCorrectionFactExpansion(statement)) classificationProofs.push(statement);
+        else seen.push(family);
       }
       return snapshot.client.query(...args);
     } };
@@ -887,6 +897,10 @@ test("READ-EXPANSION: empty families skip only with same-snapshot proofs and set
     assert.ok(seen.includes("legacy_sources"));
     assert.equal(seen.includes("v12_sources"), false);
     assert.equal(seen.includes("correction_sources"), false);
+    assert.ok(classificationProofs.some((statement) => statement.includes("typed_telemetry_records")),
+      "original classification records remain verified when usage-total facts are absent");
+    assert.ok(classificationProofs.some((statement) => statement.includes("telemetry_classification_correction_links")),
+      "classification links remain checked when usage-total facts are absent");
     seen.length = 0;
     await modules.occurrences.readOwnerOccurrences({ ...snapshot, client }, {
       ownerDigest: fixtures.active.owners.bravo.ownerDigest, stream: "usage", fromDay: D1, throughDay: D3,
@@ -976,7 +990,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
           return { ...result, rows: result.rows.map((row) => Buffer.from(row.occurrence_id).toString("hex") === encodedId(id)
             ? { ...row, canonical_digest: Buffer.alloc(32, 255) } : row) };
         }
-        if (sql.includes("occurrences.correction_sources")) {
+        if (isCorrectionFactExpansion(sql)) {
           const id = target(scenario.limit);
           const ordinal = binds[1].indexOf(encodedId(id));
           if (ordinal >= 0) {
@@ -1015,7 +1029,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
         }
         if (sql.includes("occurrences.scope")) return { ...result,
           rows: result.rows.map((row) => ({ ...row, correction_facts_present: true })) };
-        if (sql.includes("occurrences.correction_sources")) return { ...result,
+        if (isCorrectionFactExpansion(sql)) return { ...result,
           rows: [{ ...factSamples[0], sub_batch: 0, record_digest: Buffer.alloc(32, 255) }] };
         return result;
       } };
@@ -1034,7 +1048,7 @@ test("READ-EXPANSION: base/candidate Maps and fingerprints match on one snapshot
         const boundaryClient = { query: async (...args) => {
           const result = await client.query(...args);
           const sql = typeof args[0] === "string" ? args[0] : args[0].text;
-          if (sql.includes(`occurrences.${family}`)) {
+          if (sql.includes(`occurrences.${family}`) && (family !== "correction_sources" || isCorrectionFactExpansion(sql))) {
             assert.ok(result.rows.length > 0);
             const grouped = sql.includes("WITH ORDINALITY");
             if (family === "correction_sources") {

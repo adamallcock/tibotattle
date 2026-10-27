@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
+  TELEMETRY_V02_PLAN_TYPES,
   inspectTelemetryContributionDatasetV02,
   inspectTelemetryContributionV02,
 } from "@app-usagemonitor/telemetry-contract";
@@ -143,6 +144,8 @@ function transformQuota(record, localScope, participantId) {
   return {
     schemaVersion: "quota-snapshot-v0.2",
     ...safe,
+    // Preserve the frozen wire vocabulary; later reviewed plans stay unknown.
+    planType: TELEMETRY_V02_PLAN_TYPES.includes(record.planType) ? record.planType : "unknown",
     accountTrackId: deriveTelemetryAccountTrackId(
       localScope,
       participantId,
@@ -157,6 +160,8 @@ function transformActivity(record, localScope, participantId) {
   return {
     schemaVersion: "activity-marker-v0.2",
     ...safe,
+    // Preserve the frozen wire vocabulary; later reviewed plans stay unknown.
+    planType: TELEMETRY_V02_PLAN_TYPES.includes(record.planType) ? record.planType : "unknown",
     provider,
     accountTrackId: deriveTelemetryAccountTrackId(
       localScope,

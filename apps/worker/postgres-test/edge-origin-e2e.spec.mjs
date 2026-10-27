@@ -84,6 +84,10 @@ import {
   perDateExpectationFor,
   withheldModelDatesOf,
 } from "../scripts/analytics-v2-parity-compare.mjs";
+import {
+  ANALYTICS_V2_Q1_CURRENT_CONTRACT,
+  loadQ1CurrentContract,
+} from "../scripts/analytics-v2-parity-current-contract.mjs";
 import { applyPostgresMigrations } from "../scripts/postgres-migrations.mjs";
 import { buildEdgeBundle, readCompatibility } from "../scripts/edge-e2e/edge-bundle.mjs";
 import {
@@ -2413,6 +2417,10 @@ const PER_DATE_EXPECTED = process.env.EDGE_E2E_PER_DATE_EXPECTED
   : GOLDEN === join(WORKER_ROOT, "analytics-v2-test", "golden")
     ? join(WORKER_ROOT, "analytics-v2-test", "golden-q1-node", "per-date-expected.json")
     : null;
+// Only the committed Q-1 lane opts into its separately pinned current contract.
+// Custom golden inputs retain the historical comparison unless separately reviewed.
+const COMPARISON_CONTRACT = GOLDEN === join(WORKER_ROOT, "analytics-v2-test", "golden")
+  ? ANALYTICS_V2_Q1_CURRENT_CONTRACT : null;
 
 function familyTable(report) {
   return Object.fromEntries(report.families.map((entry) => [entry.family,
@@ -2442,6 +2450,7 @@ async function seededRehearsal() {
     await execFileAsync(node,
       [join(WORKER_ROOT, "scripts", "gcp-fastpath-rehearsal.mjs"), "--golden", GOLDEN, "--keep-schema", "--out", out,
         ...(PER_DATE_EXPECTED === null ? [] : ["--per-date-expected", PER_DATE_EXPECTED]),
+        ...(COMPARISON_CONTRACT === null ? [] : ["--comparison-contract", COMPARISON_CONTRACT]),
         ...staged.flatMap((name) => ["--staged-primary", name])], {
         cwd: WORKER_ROOT, maxBuffer: 256 * 1024 * 1024, timeout: 40 * 60_000,
         env: { PATH: process.env.PATH, HOME: process.env.HOME, PG_TEST_SOCKET: process.env.PG_TEST_SOCKET,
@@ -2463,6 +2472,9 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
   const golden = JSON.parse(await readFile(join(GOLDEN, "community-daily-response.json"), "utf8"));
   const goldenPreview = JSON.parse(await readFile(join(GOLDEN, "preview.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(GOLDEN, "manifest.json"), "utf8"));
+  const currentContract = COMPARISON_CONTRACT === null ? null : await loadQ1CurrentContract({
+    goldenDirectory: GOLDEN, perDateExpectedPath: PER_DATE_EXPECTED,
+  });
   const rehearsal = await seededRehearsal();
   const kept = Array.isArray(rehearsal.keptSchemas) ? rehearsal.keptSchemas : [];
   let origin = null;
@@ -2509,11 +2521,20 @@ test("S9 golden: the community/daily read is byte-equal through the edge and rep
     const perDateExpected = PER_DATE_EXPECTED === null ? null
       : perDateExpectationFor(JSON.parse(await readFile(PER_DATE_EXPECTED, "utf8")), manifest);
     const parity = compareAnalyticsV2Parity({ golden, actual: JSON.parse(answer.text), goldenPreview, actualPreview,
-      withheldModelDates: withheldModelDatesOf(manifest), perDateExpected });
+      withheldModelDates: withheldModelDatesOf(manifest), perDateExpected, currentContract });
     assert.deepEqual(familyTable(parity), familyTable(rehearsal.parity),
       "the edge read reproduces the rehearsal's parity table on this commit");
     if (perDateExpected !== null) {
-      assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation");
+      // Fixed comparator families and counters only; never include leaf paths or values.
+      assert.equal(parity.unexpectedDiffs, 0, "the edge read equals the golden and its per-date expectation: "
+        + JSON.stringify({ families: familyTable(parity) }));
+    }
+    if (currentContract !== null) {
+      assert.deepEqual(parity.currentContract, { id: COMPARISON_CONTRACT, accepted: true });
+      assert.equal(rehearsal.comparisonContract, COMPARISON_CONTRACT);
+      assert.equal(rehearsal.gates.currentQ1ContractDeclared, true);
+      assert.equal(rehearsal.gates.perDateEqual, true);
+      assert.equal(rehearsal.status, "pass", "the current Q-1 rehearsal passes every declared gate");
     }
     f.rows.push({ stage: "S9", id: "golden", bytes: answer.body.length,
       sha256: createHash("sha256").update(answer.body).digest("hex"), cacheControl: answer.header("cache-control"),

@@ -5,7 +5,8 @@
 //
 //   PG_TEST_SOCKET=/private/tmp/tibotattle-pg-.../socket PG_TEST_PORT=55433 \
 //     node apps/worker/scripts/gcp-fastpath-rehearsal.mjs --golden apps/worker/analytics-v2-test/golden \
-//     --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json
+//     --per-date-expected apps/worker/analytics-v2-test/golden-q1-node/per-date-expected.json \
+//     --comparison-contract q1-pro20-four-plan-v1
 //
 // (npm run gcp:fastpath:rehearsal in apps/worker runs exactly this.)
 //
@@ -31,11 +32,12 @@
 //     the oracle's per-date expectation holds: per-date model publication is
 //     the owner's decision of 2026-10-01 (fast-path plan OD-12, decision D7).
 //     Without --per-date-expected such a publication cannot be verified and
-//     fails the parity gate. The route serves allowance breakdowns v1.3 (owner
-//     decision round 7): the compare accepts exactly the declared relabel and
-//     catalog-baseline model-metadata block and holds the v1.3 block's v1.1
-//     reduction to the oracle, and the breakdownsV13Declared gate requires that
-//     a served breakdown is that declared v1.3;
+//     fails the parity gate. The named Q-1 command explicitly selects the
+//     hash-bound current contract: expected v0.5/v1.5 four-plan values are built
+//     from immutable historical values and independently pinned metadata;
+//     currentQ1ContractDeclared requires exact current-contract equality.
+//     Without that option, the legacy v1.3 reduction and its
+//     breakdownsV13Declared gate remain unchanged;
 //  8. runs analytics-refresh again and checks it creates no new revision;
 //  9. drops every schema it created (unless --keep-schema).
 //
@@ -51,6 +53,11 @@
 //                               served allowanceBreakdowns are also compared with it
 //                               whole (perDateEqual). For the Q-1 golden it is
 //                               analytics-v2-test/golden-q1-node/per-date-expected.json
+//   --comparison-contract q1-pro20-four-plan-v1
+//                               explicit current expectations for the complete,
+//                               hash-pinned Q-1 golden and per-date inputs only;
+//                               refuses dense, dump overrides and schema reuse.
+//                               Omit for the generic legacy comparison contract
 //   --owner-reference <dir>     also hold every owner's stored fits, model dates,
 //                               owner-day values, cache bands and refusals to an
 //                               oracle's direct native references (owner-results.json
@@ -114,6 +121,10 @@ import {
   readAnalyticsV2OwnerRows,
 } from "./analytics-v2-owner-parity-compare.mjs";
 import { comparePerDate } from "./gcp-fastpath-dense-oracle/per-date-compare.mjs";
+import {
+  ANALYTICS_V2_Q1_CURRENT_CONTRACT,
+  loadQ1CurrentContract,
+} from "./analytics-v2-parity-current-contract.mjs";
 import {
   CUTOVER_REVISION_FLOOR_SCHEMA,
   loadRevisionFloorInTransaction,
@@ -199,7 +210,7 @@ function fail(code, details) {
 export function parseArguments(argv) {
   const options = {
     golden: null, keepSchema: false, out: null, node22: process.env.GCP_FASTPATH_NODE22 || DEFAULT_NODE22,
-    dump: null, perDateExpected: null, ownerReference: null, dense: false,
+    dump: null, perDateExpected: null, ownerReference: null, dense: false, comparisonContract: null,
     refreshTimeoutMinutes: DEFAULT_REFRESH_TIMEOUT_MINUTES, reuseSchema: null, stagedPrimary: [],
     refreshWorkers: 1, refreshModelBlockSize: 10, refreshModelFanOut: "auto", syntheticRevisionFloor: false,
   };
@@ -220,6 +231,13 @@ export function parseArguments(argv) {
     else if (argument === "--node22") options.node22 = valueOf(++index, argument);
     else if (argument === "--dump") options.dump = valueOf(++index, argument);
     else if (argument === "--per-date-expected") options.perDateExpected = valueOf(++index, argument);
+    else if (argument === "--comparison-contract") {
+      const contract = valueOf(++index, argument);
+      if (options.comparisonContract !== null || contract !== ANALYTICS_V2_Q1_CURRENT_CONTRACT) {
+        fail("REHEARSAL_ARGUMENT_INVALID", { argument });
+      }
+      options.comparisonContract = contract;
+    }
     else if (argument === "--owner-reference") options.ownerReference = valueOf(++index, argument);
     else if (argument === "--reuse-schema") options.reuseSchema = valueOf(++index, argument);
     else if (argument === "--staged-primary") {
@@ -262,6 +280,12 @@ export function parseArguments(argv) {
     options.perDateExpected = join(options.golden, "per-date-expected.json");
     options.ownerReference = options.golden;
   }
+  // This profile admits the complete immutable Q-1 source, never a reused
+  // schema, replacement dump, dense corpus, or absent per-date expectation.
+  if (options.comparisonContract !== null && (options.dense || options.dump !== null
+      || options.reuseSchema !== null || options.perDateExpected === null)) {
+    fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--comparison-contract" });
+  }
   // A floor is loadable only before the first publication: never on a reused schema.
   if (options.syntheticRevisionFloor && options.reuseSchema !== null) {
     fail("REHEARSAL_ARGUMENT_INVALID", { argument: "--synthetic-revision-floor" });
@@ -273,6 +297,13 @@ export function parseArguments(argv) {
     fastpathRehearsalSchemas(options.reuseSchema.slice(POSTGRES_FASTPATH_REHEARSAL_TARGET_SCHEMA_PREFIX.length));
   }
   return options;
+}
+
+export function declaredAllowanceContractPassed(parity, comparisonContract = null) {
+  if (comparisonContract === null) return parity?.breakdownsV13?.accepted === true;
+  return comparisonContract === ANALYTICS_V2_Q1_CURRENT_CONTRACT
+    && parity?.currentContract?.id === ANALYTICS_V2_Q1_CURRENT_CONTRACT
+    && parity.currentContract.accepted === true && parity.unexpectedDiffs === 0;
 }
 
 async function sha256OfFile(path) {
@@ -835,6 +866,9 @@ async function main() {
       fail("REHEARSAL_PER_DATE_INVALID");
     }
   }
+  const currentContract = options.comparisonContract === null ? null : await loadQ1CurrentContract({
+    goldenDirectory: options.golden, perDateExpectedPath: options.perDateExpected,
+  });
   const ownerReference = options.ownerReference === null ? null : {
     ownerResults: JSON.parse(await readFile(join(options.ownerReference, "owner-results.json"), "utf8")),
     cacheReference: JSON.parse(await readFile(join(options.ownerReference, "cache-reference.json"), "utf8")),
@@ -870,6 +904,7 @@ async function main() {
     schema,
     reusedSchema: options.reuseSchema !== null,
     refreshWorkers: options.refreshWorkers,
+    ...(options.comparisonContract === null ? {} : { comparisonContract: options.comparisonContract }),
     steps: {},
     gates: {},
     timingsMs: timings,
@@ -981,9 +1016,10 @@ async function main() {
         golden: { ...golden, ...PUBLISHED_ALLOWANCE_STATE, allowanceBreakdowns: perDateExpected.allowanceBreakdowns },
         actual, goldenPreview: perDateExpected.preview, actualPreview,
       })
-      : compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview, withheldModelDates, perDateExpected })));
+      : compareAnalyticsV2Parity({ golden, actual, goldenPreview, actualPreview, withheldModelDates, perDateExpected,
+        currentContract })));
     if (perDateExpected !== null) {
-      report.perDate = comparePerDate({ expected: perDateExpected, response: actual, preview: actualPreview });
+      report.perDate = comparePerDate({ expected: perDateExpected, response: actual, preview: actualPreview, currentContract });
     }
     if (ownerReference !== null) {
       const rows = await timed(timings, "owner-rows", async () => readAnalyticsV2OwnerRows(pool, schema));
@@ -1022,7 +1058,8 @@ async function main() {
       secondRunZeroNewRevisions: second.exitCode === 0 && second.receipt?.state === "complete" && changed.length === 0,
       parityZeroUnexpected: report.parity.unexpectedDiffs === 0,
       ...(actual.allowanceBreakdowns === undefined ? {}
-        : { breakdownsV13Declared: report.parity.breakdownsV13.accepted === true }),
+        : { [options.comparisonContract === null ? "breakdownsV13Declared" : "currentQ1ContractDeclared"]:
+          declaredAllowanceContractPassed(report.parity, options.comparisonContract) }),
       ...(report.perDate === undefined ? {} : { perDateEqual: report.perDate.equal === true }),
       ...(report.ownerParity === undefined ? {} : { ownerParityZeroUnexpected: report.ownerParity.unexpectedDiffs === 0 }),
       ...(syntheticFloor === null ? {} : { revisionFloorRespected: report.steps.revisionFloor.offFloorDays === 0

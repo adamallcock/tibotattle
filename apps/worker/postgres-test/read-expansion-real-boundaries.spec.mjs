@@ -16,6 +16,21 @@ const host = process.env.PG_TEST_HOST;
 const skip = !socket && !host;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+function observeOccurrenceReads(readers, occurrenceReads) {
+  return Object.fromEntries(["base", "candidate"].map((readerName) => {
+    const reader = readers[readerName];
+    const occurrences = reader.occurrences;
+    return [readerName, { ...reader, occurrences: { ...occurrences,
+      readOwnerOccurrences(...args) {
+        const promise = Reflect.apply(occurrences.readOwnerOccurrences, occurrences, args);
+        occurrenceReads.push({ readerName, promise });
+        return promise;
+      },
+      readOwnerDayFingerprints: occurrences.readOwnerDayFingerprints.bind(occurrences),
+    } }];
+  }));
+}
+
 // No altered driver rows, lowered bounds, trigger bypasses or dropped constraints:
 // these tests count the rows actually returned by each production SQL statement.
 for (const family of ["legacy", "v12"]) {
@@ -90,19 +105,20 @@ for (const family of ["legacy", "v12"]) {
                 return result;
               } };
               const context = { pool, client: observed, schema, nowMs: NOW_MS };
-              if (count === 40000) {
-                await compareExpansionRead(readers, context, input);
-                for (const reader of [readers.base, readers.candidate]) {
-                  const output = await reader.occurrences.readOwnerOccurrences(context, input);
+              // Compare and assert the same real reads; do not execute the
+              // expensive expansion again solely to inspect its result.
+              const occurrenceReads = [];
+              await compareExpansionRead(observeOccurrenceReads(readers, occurrenceReads), context, input);
+              assert.deepEqual(occurrenceReads.map(({ readerName }) => readerName), ["base", "candidate"]);
+              for (const { promise } of occurrenceReads) {
+                if (count === 40000) {
+                  const output = await promise;
                   assert.equal(output.get(D1).length, 200);
                   assert.ok(output.get(D1).every((row) => row.status === "compatible" && row.sourceCount === 200));
-                }
-              } else {
-                for (const reader of [readers.base, readers.candidate]) {
-                  await assert.rejects(reader.occurrences.readOwnerOccurrences(context, input),
+                } else {
+                  await assert.rejects(promise,
                     (error) => error?.code === "ANALYTICS_V2_SOURCE_LIMIT");
                 }
-                await compareExpansionRead(readers, context, input);
               }
               assert.ok(returnedCounts.length >= 2, "both independent bundled readers executed real expansion SQL");
             } finally {

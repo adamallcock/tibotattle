@@ -72,7 +72,7 @@ const PINNED_PATCH_SPECS = [
  */
 const PINNED_SOURCE_PATCHES = [
   ["apps/worker/src/admin-community-allowance.ts", "historical-preview-catalog-compatibility", 4,
-    "934d6837a8420c6f85d001e0b906726834783156e9bfed610e2bfffa00621fbe"],
+    "67e143fa82f1b1ec20bf5306ebd8eef3c375f5d822be8ae3087f2d5ca9f89eda"],
   ["apps/worker/src/telemetry-usage-reconciliation.ts", "internal-analytics-json-replay", 9,
     "6120ad25ec598168134ac9d22806bd9655c9f6992b1c930e1b44da74e7ea552f"],
   ["apps/worker/src/telemetry-usage-effective-reader.ts", "internal-analytics-json-composition", 3,
@@ -81,6 +81,10 @@ const PINNED_SOURCE_PATCHES = [
     "1abf1f05fae29ce856a82adcd7538205ff6f4ad194466350c17a0096d15f1df3"],
   ["apps/worker/src/quota-analysis-v11.ts", "reduction-payload-bytes", 3,
     "72b182330015387e75cbebfe1cdd70371d34d2a8b968c2f9adc6a78226544a8e"],
+  ["apps/worker/src/v11-daily-projection-values.ts", "daily-values-closed-shape", 1,
+    "d0b7d48588a03c16a09dceefdb760d63f258896306c3702e1f8c0232c872b199"],
+  ["apps/worker/src/v11-daily-projection-values.ts", "daily-values-decimal-zero", 1,
+    "2ba788600c5542ea98d6b82be764cac8ef3eef7ad7ffae5f03e4d7abda3ab533"],
   ["apps/worker/src/v11-daily-projection-values.ts", "daily-fold-trusted-state", 5,
     "50451d4c3f13fb38e6a007c1f2fb6a5b1b365256c188c321109fc2ccfb5c4441"],
   ["apps/worker/src/analytics-shared-reducers.ts", "daily-fold-trusted-state", 2,

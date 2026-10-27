@@ -31,7 +31,7 @@ beforeEach(async () => {
   await initializeTypedV11Admission(database(), SOURCE_NAMESPACE);
 });
 
-async function stageAndActivate(count = 9) {
+async function stageAndActivate(count = 9, predecessorNow?: number) {
   const fixture = await createV11DeviceFixture(database(), { participantId: PARTICIPANT, grant: true });
   const attribution = { accountBasis: "same_source" as const, accountTrackId: ACCOUNT,
     planBasis: "same_source_occurrence" as const, planType: "pro" as const, planEraId: null };
@@ -58,12 +58,25 @@ async function stageAndActivate(count = 9) {
     });
   }
   const candidate = await registerTelemetryV11DayManifest(database(), fixture, prepared.manifest);
-  const predecessor = await createTelemetryV11DomainPredecessor(database(), fixture);
+  const predecessor = await createTelemetryV11DomainPredecessor(database(), fixture, predecessorNow);
+  // The predecessor can cross UTC midnight while this page fixture is staged.
+  // Close its full range with explicit empty-day manifests, retaining every
+  // original quota row on the prepared fixture day.
+  const fromDay = DAY < predecessor.fromDay ? DAY : predecessor.fromDay;
+  const throughDay = DAY > predecessor.throughDay ? DAY : predecessor.throughDay;
+  const days: TelemetryV11DomainManifest["days"] = [];
+  for (let epoch = Date.parse(fromDay); epoch <= Date.parse(throughDay); epoch += 86_400_000) {
+    const day = new Date(epoch).toISOString().slice(0, 10);
+    const dayCandidate = day === DAY ? candidate : await registerTelemetryV11DayManifest(
+      database(), fixture, (await makeV11Day(day, {})).manifest,
+    );
+    days.push({ day, manifestId: dayCandidate.manifestId, manifestDigest: dayCandidate.manifestDigest });
+  }
   const manifest: TelemetryV11DomainManifest = {
-    schemaVersion: "telemetry-domain-manifest-v1.1", fromDay: DAY, throughDay: DAY,
+    schemaVersion: "telemetry-domain-manifest-v1.1", fromDay, throughDay,
     predecessor: { token: predecessor.token, previousGenerationId: predecessor.previousGenerationId,
       legacyFingerprint: predecessor.legacyFingerprint },
-    days: [{ day: DAY, manifestId: candidate.manifestId, manifestDigest: candidate.manifestDigest }],
+    days,
     manifestDigest: "0".repeat(64),
   };
   manifest.manifestDigest = await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
@@ -90,7 +103,10 @@ describe("typed v1.1 quota physical reader", () => {
   }, 60_000);
 
   it("keeps a whole physical page bounded across the next physical cursor", async () => {
-    const pin = await stageAndActivate(TYPED_V11_QUOTA_PAGE_SIZE * 2);
+    const nextDayEpoch = START + 86_400_000 + 1_000;
+    const pin = await stageAndActivate(TYPED_V11_QUOTA_PAGE_SIZE * 2, nextDayEpoch);
+    expect(pin.fromDay).toBe(DAY);
+    expect(pin.throughDay).toBe(new Date(nextDayEpoch).toISOString().slice(0, 10));
     const reader = await createTypedV11QuotaPageReader(database(), {
       sourceNamespace: SOURCE_NAMESPACE, pin, fromObservedAtMs: START, beforeObservedAtMs: START + 86_400_000,
     });

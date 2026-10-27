@@ -29,13 +29,17 @@ export interface V11DailyProjectionValues {
 }
 function fail(): never { throw new Error('V11_DAILY_PROJECTION_VALUES_INVALID'); }
 function closed(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).sort().join('\0') !== [...keys].sort().join('\0')) fail();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail();
+  const actual = Object.keys(value);
+  if (actual.length === keys.length && actual.every(key => keys.includes(key))) return;
+  if (actual.sort().join('\0') !== [...keys].sort().join('\0')) fail();
 }
 function count(value: unknown, max = MAX_V11_DAILY_VALUES_RECORDS): asserts value is number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > max) fail();
 }
 function decimal(value: unknown): bigint {
+  // The canonical zero string is already a validated immutable decimal.
+  if (value === '0') return 0n;
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]{0,24})$/.test(value)) fail();
   return BigInt(value);
 }

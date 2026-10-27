@@ -3,7 +3,7 @@
 // The published identities match the accounting package's reviewed text-model
 // cards; synthetic provider-tool cards are deliberately excluded. Explicit
 // aliases retain their own identity even when a caller shares a price card.
-export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-09-29.1";
+export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-10-26.1";
 
 const reviewedOpenAiModelRows = [
   ["codex-auto-review", "Codex Auto-review", "assumed_alias", "gpt-5.4"],
@@ -80,6 +80,10 @@ export const REVIEWED_MODEL_CATALOG = Object.freeze([
     id: "gpt-6.1-sol", label: "GPT-6.1 Sol", provider: "openai_codex",
     allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.1-sol",
   }),
+  Object.freeze({
+    id: "gpt-6.1-terra", label: "GPT-6.1 Terra", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.1-terra",
+  }),
 ]);
 
 export const REVIEWED_CODEX_MODEL_IDS = Object.freeze(
@@ -108,7 +112,9 @@ export function codexRequestReasoningEffort(modelId, effort) {
   if (effort !== "ultra") return effort;
   const model = reviewedModelIdentity(modelId);
   if (model?.provider !== "openai_codex") return effort;
-  if (model.id === "gpt-6.1-astra") return effort;
+  // Terra supports max API effort, but no reviewed Codex Ultra mapping is
+  // established for it. Recognition alone must not claim cache equivalence.
+  if (model.id === "gpt-6.1-astra" || model.id === "gpt-6.1-terra") return effort;
   return model.id === "gpt-6-astra" ? "xhigh" : "max";
 }
 

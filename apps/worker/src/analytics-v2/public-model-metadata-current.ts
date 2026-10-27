@@ -15,10 +15,10 @@ export class CurrentPublicModelMetadataError extends Error {
 
 // Current presentation is independently bound to the current preview catalog.
 // Manifest 1 and the retained v1.3 presentation remain immutable.
-export const CURRENT_PUBLIC_MODEL_METADATA_CATALOG_VERSION = "reviewed-model-catalog-2026-09-29.1" as const;
+export const CURRENT_PUBLIC_MODEL_METADATA_CATALOG_VERSION = "reviewed-model-catalog-2026-10-26.1" as const;
 const CURRENT_PUBLIC_MODELS = Object.freeze([
   ["gpt-6-astra", "astra"], ["gpt-6.1-sol", "sol"], ["gpt-6-sol", "sol"],
-  ["gpt-6-luna", "luna"], ["gpt-5.6-terra", "terra"],
+  ["gpt-6-luna", "luna"], ["gpt-6.1-terra", "terra"], ["gpt-5.6-terra", "terra"],
   ["gpt-5.6-sol", "sol"], ["gpt-5.6-luna", "luna"],
 ] as const);
 

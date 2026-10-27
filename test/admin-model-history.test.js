@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   projectAdminModelHistoryDay, expandAdminModelHistoryDay,
 } from "@app-usagemonitor/telemetry-contract";
@@ -59,6 +60,22 @@ test("admin model history fails closed on extra fields, raw IDs, invalid tuples 
     assert.equal(projectAdminModelHistoryDay(value), null);
     assert.equal(browser.projectAdminModelHistoryDay(value), null);
   }
+});
+
+test("GPT-6.1 Sol preserves prior catalog coverage and stays separate from GPT-6 Sol", () => {
+  const prior = { ...current(), catalogVersion: "reviewed-model-catalog-2026-09-23.1",
+    values: [["gpt-6-sol", 1_000, 2]] };
+  const old = expandAdminModelHistoryDay(prior);
+  assert.equal(old.catalogVersion, prior.catalogVersion);
+  assert.deepEqual(old.byModel["gpt-6-sol"], { capacityUsd: 1_000, participantCount: 2 });
+  assert.deepEqual(old.byModel["gpt-6.1-astra"], { capacityUsd: null, participantCount: 0 });
+  assert.deepEqual(old.byModel["gpt-6.1-sol"], { capacityUsd: null, participantCount: null });
+  assert.equal(projectAdminModelHistoryDay({ ...prior, values: [["gpt-6.1-sol", 1_000, 1]] }), null);
+  const fresh = expandAdminModelHistoryDay({ ...current(),
+    values: [["gpt-6-sol", 1_000, 2], ["gpt-6.1-sol", 1_200, 1]] });
+  assert.deepEqual(fresh.byModel["gpt-6-sol"], { capacityUsd: 1_000, participantCount: 2 });
+  assert.deepEqual(fresh.byModel["gpt-6.1-sol"], { capacityUsd: 1_200, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(prior), old);
 });
 
 // ---- The admin preview's storage ceiling ---------------------------------
@@ -241,4 +258,44 @@ test("70 complete catalog days plus the whole preview stay under the storage cei
     + "compact the wire (see the receipt) or raise the guard and the CHECK together by migration");
   assert.ok(modelBytes < total, "the model history is a part of the preview, never all of it");
   assert.ok(absolute > total, "wider counts must cost bytes, or the two measurements are not measuring width");
+});
+
+test("September 29 admin history freezes its 43-model roster before the Terra catalog", () => {
+  assert.equal(ADMIN_MODEL_CONFIG.length, 44);
+  assert.equal(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "reviewed-model-catalog-2026-10-26.1");
+  assert.equal(SEPTEMBER29_ADMIN_MODEL_CONFIG.length, 43);
+  assert.deepEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG, ADMIN_MODEL_CONFIG.slice(0, -1));
+  assert.equal(SEPTEMBER29_ADMIN_MODEL_CONFIG.some(({ modelId }) => modelId === "gpt-6.1-terra"), false);
+  assert.equal(new Set(SEPTEMBER29_ADMIN_MODEL_CONFIG.map(model => model.modelId)).size, 43);
+  const wire = { ...current(), catalogVersion: SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values: [["gpt-6.1-sol", 1234.5, 1], ["gpt-6-astra", 2000, 2]] };
+  const result = expandAdminModelHistoryDay(wire);
+  assert.equal(result.catalogVersion, wire.catalogVersion);
+  assert.equal(Object.hasOwn(result.byModel, "gpt-6.1-terra"), false);
+  const currentTerraWire = { ...wire, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values: [["gpt-6.1-terra", 500, 1]] };
+  const currentTerra = expandAdminModelHistoryDay(currentTerraWire);
+  assert.deepEqual(currentTerra.byModel["gpt-6.1-terra"], { capacityUsd: 500, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(currentTerraWire), currentTerra);
+  assert.deepEqual(result.byModel["gpt-6.1-sol"], { capacityUsd: 1234.5, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(wire), result);
+  const empty = expandAdminModelHistoryDay({ ...wire, values: [] });
+  assert.deepEqual(empty.byModel["gpt-6.1-sol"], { capacityUsd: null, participantCount: 0 });
+  const previous = { ...wire, catalogVersion: "reviewed-model-catalog-2026-09-23.1", values: [] };
+  assert.deepEqual(expandAdminModelHistoryDay(previous).byModel["gpt-6.1-sol"],
+    { capacityUsd: null, participantCount: null });
+  for (const invalid of [
+    { ...wire, catalogVersion: previous.catalogVersion },
+    { ...wire, catalogVersion: "reviewed-model-catalog-2026-10-01.1" },
+    { ...wire, privatePath: "private-canary" },
+    { ...wire, values: [["gpt-6.1-sol", 1, 3]] },
+    { ...wire, values: [["gpt-6.1-sol", Infinity, 1]] },
+    { ...wire, values: [["gpt-6.1-sol", 1, 1], ["gpt-6.1-sol", 2, 1]] },
+    { ...wire, values: [["unreviewed-model", 1, 1]] },
+    { ...wire, values: [["gpt-6.1-terra", 500, 1]] },
+    { ...wire, v1ParticipantCount: 0 },
+  ]) {
+    assert.equal(projectAdminModelHistoryDay(invalid), null);
+    assert.equal(browser.projectAdminModelHistoryDay(invalid), null);
+  }
 });

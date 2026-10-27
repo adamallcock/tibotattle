@@ -5,27 +5,30 @@ name: Hosted backend
 # activation-producer PostgreSQL qualification, and every
 # apps/worker/postgres-test spec against PostgreSQL 17 in its routed
 # environment profile, including the edge end-to-end spec.
+# The canonical Worker check is partitioned into two native whole-file Vitest
+# shards, analytics (with its vendor prerequisite), and all remaining commands
+# in their canonical order. Worker gate requires every partition to pass.
 #
 # PostgreSQL 17 is the official postgres image pinned by digest in
 # apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
 # private 0700 socket directory. The PGDG apt fallback documented there is not
 # in use.
 #
-# Node.js: every job runs the repository toolchain, 26.2.0. The
-# postgres-17-suite job also installs Node.js 22.16.0, the Cloud Run image
-# runtime, and names it to the suite as EDGE_E2E_NODE, because the edge
-# end-to-end spec runs the Cloud Run origin under the image runtime. It installs
+# Node.js: every execution job runs the repository toolchain, 26.2.0. The
+# postgres-17-suite shards also install Node.js 22.16.0, the Cloud Run image
+# runtime, and name it to the suite as EDGE_E2E_NODE, because the edge
+# end-to-end spec runs the Cloud Run origin under the image runtime. Each installs
 # 22.16.0 first and 26.2.0 last, so `node` on PATH, the suite itself and the
 # spec's seeding rehearsal (its importers need the newer node:sqlite) stay on
 # 26.2.0. scripts/check-release-workflow-policy.mjs allows 22.16.0 in this
 # workflow only.
 #
-# Dependencies: all four jobs install the root, Worker and Cloud Run lockfiles.
+# Dependencies: every execution job installs the root, Worker and Cloud Run lockfiles.
 # The Worker gate's gcp:fastpath:scripts-check imports apps/worker/cloud-run
 # modules, which need @google-cloud/cloud-sql-connector.
 #
 # Skip enforcement is machine-checked only for apps/worker/postgres-test: the
-# postgres-17-suite job fails on any skipped or todo test there, and on an
+# postgres-17-suite shards fail on any skipped or todo test there, and on an
 # environment gap such as a missing EDGE_E2E_NODE or EDGE_E2E_GOLDEN. The Worker
 # gate and the Cloud Run check run their own PostgreSQL-gated checks (for example
 # apps/worker/scripts/postgres-*.check.mjs and apps/worker/cloud-run/*.check.mjs)
@@ -41,7 +44,8 @@ name: Hosted backend
 # cutover seal check reads pinned commits as git objects; it fails, and never
 # skips, when they are absent. The postgres-17-suite job checks out full history
 # too, because the READ-EXPANSION specs archive their pinned base commit. The
-# Worker gate stays at depth 1. The PostgreSQL-backed part of
+# Worker gate also needs full history for pinned vendored source and facade
+# objects. The PostgreSQL-backed part of
 # that command, postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs, runs in the
 # postgres-17-suite job.
@@ -97,16 +101,25 @@ concurrency:
 
 jobs:
   worker-gate:
-    name: Worker gate
+    name: Worker shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - vitest-1
+          - vitest-2
+          - analytics
+          - checks
     env:
       WRANGLER_SEND_METRICS: "false"
+      WORKER_SUITE_SHARD: "${{ matrix.shard }}"
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js
@@ -115,6 +128,16 @@ jobs:
           node-version: 26.2.0
           check-latest: false
           package-manager-cache: false
+
+      # gcp:fastpath:scripts-check executes the maintained production-tier
+      # caller's zsh functions, including its signal and cleanup behavior.
+      - name: Install zsh for the production-tier caller checks
+        if: matrix.shard == 'checks'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh
+          zsh --version
 
       # gcp:fastpath:scripts-check, run by the Worker gate, imports Cloud Run host
       # modules, so this job needs the Cloud Run lockfile as well.
@@ -139,8 +162,8 @@ jobs:
       - name: Start PostgreSQL 17 and export the SOCKET profile
         run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
 
-      - name: Check this workflow's contract, migration numbering and PostgreSQL suite routing
-        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs
+      - name: Check this workflow's contract, migration numbering and suite routing
+        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs apps/worker/scripts/ci-worker-suite.check.mjs
 
       # deploy:dry and staging:check stage production assets from a generated
       # public release site. Build one locally from the checked-out source with a
@@ -182,12 +205,25 @@ jobs:
             --support-url https://tibotattle.com/docs.html \
             --social-image "$social_card" > /dev/null
 
-      - name: Run the Worker gate
-        run: npm --prefix apps/worker run check
+      - name: Run the canonical Worker partition
+        run: node apps/worker/scripts/ci-worker-suite.mjs --shard "$WORKER_SUITE_SHARD"
 
       - name: Stop PostgreSQL 17
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  worker-complete:
+    name: Worker gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: always()
+    needs:
+      - worker-gate
+    env:
+      WORKER_SUITE_RESULT: "${{ needs.worker-gate.result }}"
+    steps:
+      - name: Require every canonical Worker partition to pass
+        run: test "$WORKER_SUITE_RESULT" = success
 
   cloud-run-check:
     name: Cloud Run check
@@ -257,9 +293,19 @@ jobs:
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
 
   postgres-17-suite:
-    name: PostgreSQL 17 suite
+    name: PostgreSQL 17 shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Each shard validates the complete canonical plan before selecting its
+    # closed partition. Separate clusters preserve the serial profile contract.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - vitest
+          - node-1
+          - node-2
+          - edge-e2e
     # The fast-path cloud-target specs also dial the server over loopback TCP:
     # the container's published 127.0.0.1 port (ciPostgresTcpProfile), which
     # differs from the socket's PG_TEST_PORT. The suite passes this pair to its
@@ -267,6 +313,7 @@ jobs:
     env:
       PG_TEST_TCP_HOST: "127.0.0.1"
       PG_TEST_TCP_PORT: "55432"
+      PG_SUITE_SHARD: ${{ matrix.shard }}
     steps:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -345,12 +392,25 @@ jobs:
       - name: Build the Cloud Run bundles the suite runs
         run: node apps/worker/cloud-run/build.mjs
 
-      - name: Run every PostgreSQL spec in its routed profile with zero skips
-        run: node apps/worker/scripts/ci-postgres-suite.mjs
+      - name: Run the canonical PostgreSQL shard in its routed profiles with zero skips
+        run: node apps/worker/scripts/ci-postgres-suite.mjs --shard "$PG_SUITE_SHARD"
 
       - name: Stop PostgreSQL 17
         if: always()
         run: node apps/worker/scripts/ci-postgres-container.mjs --stop
+
+  postgres-17-complete:
+    name: PostgreSQL 17 suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: always()
+    needs:
+      - postgres-17-suite
+    env:
+      PG_SUITE_RESULT: ${{ needs.postgres-17-suite.result }}
+    steps:
+      - name: Require every canonical PostgreSQL shard to pass
+        run: test "$PG_SUITE_RESULT" = success
 
   activation-producer-postgres-17:
     name: PostgreSQL 17 activation producer qualification

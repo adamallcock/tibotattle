@@ -207,6 +207,12 @@ export const D1_READER_FILES = Object.freeze(ALLOWED.filter(({ role }) => role =
  * preview validator, the public graph projection) from admin-community-
  * allowance.ts and community-allowance.ts, never a reader; the bundle proof
  * shows the origin ships no column-naming text from either D1 reader.
+ * Re-reviewed for the deployed B' v1.5 wrapper on 2026-10-12: its imports
+ * from the same two facades are only COMMUNITY_ALLOWANCE_BASIS,
+ * COMMUNITY_ALLOWANCE_NORMALIZATION, ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS
+ * and ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE. It validates metadata and never
+ * calls a reader. The allowance and metadata callers also reach this wrapper;
+ * the source scan and shipped-reader proof remain mandatory and unchanged.
  * A new edge into this graph is a decision, not a fix: route the new code
  * through stored quantities and the current registry instead.
  */
@@ -218,10 +224,12 @@ export const D1_REACH = Object.freeze({
     "cloud-run/server.mjs": ["cloud-run/postgres-production-host.mjs", "src/analytics-v2/community-daily-route.ts"],
     "src/admin-community-allowance.ts": ["src/community-allowance.ts", "src/community-publication.ts"],
     "src/analytics-v2/allowance-projection.ts": ["src/admin-community-allowance.ts", "src/analytics-v2/public-allowance-breakdowns-v14.ts",
-      "src/public-allowance-breakdowns.ts"],
+      "src/analytics-v2/public-allowance-breakdowns-v15.ts", "src/public-allowance-breakdowns.ts"],
     "src/analytics-v2/community-daily-route.ts": ["src/analytics-v2/allowance-projection.ts", "src/analytics-v2/public-model-metadata-current.ts"],
     "src/analytics-v2/public-allowance-breakdowns-v14.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts"],
-    "src/analytics-v2/public-model-metadata-current.ts": ["src/admin-community-allowance.ts", "src/analytics-v2/public-allowance-breakdowns-v14.ts"],
+    "src/analytics-v2/public-allowance-breakdowns-v15.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts"],
+    "src/analytics-v2/public-model-metadata-current.ts": ["src/admin-community-allowance.ts", "src/analytics-v2/public-allowance-breakdowns-v14.ts",
+      "src/analytics-v2/public-allowance-breakdowns-v15.ts"],
     "src/community-allowance.ts": ["src/quota-analysis.ts"],
     "src/community-daily-aggregates.ts": ["src/admin-community-allowance.ts", "src/community-allowance.ts", "src/community-publication.ts", "src/community-refresh-lanes.ts"],
     "src/community-publication.ts": ["src/community-allowance.ts"],

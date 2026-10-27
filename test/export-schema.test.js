@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fc from "fast-check";
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import { exportRegistrySnapshot } from "../src/export/index.js";
 import { exportSchemas, validateExportRecord } from "../src/export-schema.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
@@ -135,6 +136,19 @@ test("allowlist schema accepts a valid usage event and rejects unknown nested fi
   assert.equal(JSON.stringify(result.errors).includes("private"), false);
 });
 
+test("local quota and activity schemas preserve every reviewed plan and reject unreviewed names", () => {
+  for (const [kind, makeRecord] of [["quotaSnapshot", quotaSnapshot], ["activityMarker", activityMarker]]) {
+    for (const planType of TELEMETRY_PLAN_TYPES) {
+      const value = { ...makeRecord(), planType };
+      assert.equal(validateExportRecord(kind, value).valid, true, `${kind}: ${planType}`);
+      assert.equal(value.planVariant, "unknown");
+    }
+    for (const planType of ["sci-plus", "academic_researchers", "future_plan"]) {
+      assert.equal(validateExportRecord(kind, { ...makeRecord(), planType }).valid, false);
+    }
+  }
+});
+
 test("date-time fields reject calendar normalization and invalid UTC components", () => {
   for (const invalid of [
     "2026-02-29T12:00:00.000Z",
@@ -177,12 +191,13 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
     // Claude enum positions survive the addition of another Codex model.
     [
       "unknown",
-      ...registry.providers.openai_codex.modelIds.filter((model) => model !== "gpt-6.1-sol"),
+      ...registry.providers.openai_codex.modelIds.filter((model) => !["gpt-6.1-sol", "gpt-6.1-terra"].includes(model)),
       ...registry.providers.anthropic_claude_code.modelIds,
-      "gpt-6.1-sol",
+      "gpt-6.1-sol", "gpt-6.1-terra",
     ],
   );
   assert.ok(registry.providers.openai_codex.modelIds.includes("gpt-6.1-sol"));
+  assert.ok(registry.providers.openai_codex.modelIds.includes("gpt-6.1-terra"));
   assert.deepEqual(
     exportSchemas.quotaSnapshot.properties.limitId.enum,
     ["unknown", ...registry.providers.openai_codex.limitIds],
@@ -191,6 +206,15 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
     exportSchemas.bundle.properties.diagnostics.properties.codes.items.properties.code.enum,
     registry.diagnosticCodes,
   );
+});
+
+test("new reviewed Codex identities pass every recognized export schema branch", () => {
+  for (const modelId of ["gpt-6.1-sol", "gpt-6.1-terra"]) {
+    const candidate = { ...usageEvent(), modelId };
+    assert.equal(validateExportRecord("usageEvent", candidate).valid, true, modelId);
+    assert.equal(validateExportRecord("usageEvent", { ...candidate, provider: "anthropic_claude_code" }).valid, false);
+    assert.equal(validateExportRecord("usageEvent", { ...candidate, modelId: modelId + "-preview" }).valid, false);
+  }
 });
 
 test("unreviewed models, provider-incompatible models, limits, and diagnostics fail closed", () => {

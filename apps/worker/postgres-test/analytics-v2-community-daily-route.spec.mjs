@@ -556,12 +556,11 @@ function expectedAllowanceBreakdowns() {
 }
 
 /**
- * The current public model metadata v1.4 and v1.5 responses carry (b89f5fc56):
- * the reviewed current catalog (reviewed-model-catalog-2026-09-29.1), written
- * out so the route is held to an expectation rather than to its own builder.
- * v1.3 keeps manifest-0001's.
+ * Retain b89f5fc56's seven-row presentation independently of the current
+ * catalog. The expected predecessor HTTP bytes below keep every value and
+ * ordering; only v1.4/v1.5's presentation block advances. v1.3 keeps manifest 1.
  */
-const CURRENT_MODEL_CONFIG = Object.freeze([
+const SEPTEMBER29_MODEL_CONFIG = Object.freeze([
   { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 },
   { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 },
   { id: "gpt-6-sol", label: "GPT-6 Sol", family: "sol", order: 2 },
@@ -569,6 +568,18 @@ const CURRENT_MODEL_CONFIG = Object.freeze([
   { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "terra", order: 4 },
   { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 5 },
   { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 6 },
+]);
+
+// Current presentation is literal, never derived from the route's builder.
+const CURRENT_MODEL_CONFIG = Object.freeze([
+  { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 },
+  { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 },
+  { id: "gpt-6-sol", label: "GPT-6 Sol", family: "sol", order: 2 },
+  { id: "gpt-6-luna", label: "GPT-6 Luna", family: "luna", order: 3 },
+  { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "terra", order: 4 },
+  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "terra", order: 5 },
+  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 6 },
+  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 7 },
 ]);
 
 /** Hand-derived retained Pro 10x contract; the legacy expected HTTP bytes stay frozen. */
@@ -590,7 +601,7 @@ function expectedRetainedPro10AllowanceBreakdowns() {
         plus: index === 0 ? EMPTY_SUMMARY : { ...day.byPlanType.plus, centralUsd: 600 },
       },
     })),
-    modelConfig: CURRENT_MODEL_CONFIG,
+    modelConfig: SEPTEMBER29_MODEL_CONFIG,
   };
 }
 
@@ -608,7 +619,7 @@ function expectedCurrentAllowanceBreakdowns() {
       byPlanType: { pro: day.byPlanType.pro, prolite: day.byPlanType.prolite, promax: EMPTY_SUMMARY,
         plus: day.byPlanType.plus },
     })),
-    modelConfig: CURRENT_MODEL_CONFIG,
+    modelConfig: SEPTEMBER29_MODEL_CONFIG,
   };
 }
 
@@ -766,8 +777,14 @@ test("breakdowns v1.4: a retained Pro 10x preview keeps its plan amounts and eve
   const { response, text } = await get(`?from=${FROM}&to=${TO}`);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("cache-control"), "public, max-age=300");
-  const expected = { ...expectedResponse(), allowanceBreakdowns: expectedRetainedPro10AllowanceBreakdowns() };
+  const predecessorExpected = { ...expectedResponse(), allowanceBreakdowns: expectedRetainedPro10AllowanceBreakdowns() };
+  const expected = { ...predecessorExpected,
+    allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: CURRENT_MODEL_CONFIG } };
   assert.equal(text, JSON.stringify(expected));
+  const predecessor = JSON.parse(text);
+  predecessor.allowanceBreakdowns.modelConfig = SEPTEMBER29_MODEL_CONFIG;
+  assert.equal(JSON.stringify(predecessor), JSON.stringify(predecessorExpected),
+    "restoring only model metadata preserves every retained Pro 10x HTTP value and byte order");
   const { base, metadata } = modules.v14.reducePublicAllowanceBreakdownsV14(JSON.parse(text).allowanceBreakdowns);
   assert.deepEqual(metadata, CURRENT_MODEL_CONFIG);
   assert.equal(base.schemaVersion, "community-allowance-breakdowns-v1.2");
@@ -784,8 +801,14 @@ test("breakdowns v1.5: the current B' preview serves the Pro 20x amounts with Pr
   const { response, text } = await get(`?from=${FROM}&to=${TO}`);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("cache-control"), "public, max-age=300");
-  const expected = { ...expectedResponse(), allowanceBreakdowns: expectedCurrentAllowanceBreakdowns() };
+  const predecessorExpected = { ...expectedResponse(), allowanceBreakdowns: expectedCurrentAllowanceBreakdowns() };
+  const expected = { ...predecessorExpected,
+    allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: CURRENT_MODEL_CONFIG } };
   assert.equal(text, JSON.stringify(expected));
+  const predecessor = JSON.parse(text);
+  predecessor.allowanceBreakdowns.modelConfig = SEPTEMBER29_MODEL_CONFIG;
+  assert.equal(JSON.stringify(predecessor), JSON.stringify(predecessorExpected),
+    "restoring only model metadata preserves every Pro 20x HTTP value and byte order");
   const served = JSON.parse(text).allowanceBreakdowns;
   const { base, metadata } = modules.v15.reducePublicAllowanceBreakdownsV15(served);
   assert.deepEqual(metadata, CURRENT_MODEL_CONFIG);

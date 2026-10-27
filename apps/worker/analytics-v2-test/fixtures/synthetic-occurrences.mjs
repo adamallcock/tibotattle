@@ -82,9 +82,9 @@ export function occurrence(owner, stream, at, occurrenceId, record) {
 }
 const attribution = (owner) => ({ accountBasis: "same_source", accountTrackId: owner.account,
   planBasis: "same_source_occurrence", planType: owner.plan, planEraId: null });
-export function usage(owner, index, at) {
+export function usage(owner, index, at, overrides = {}) {
   const record = usageRecord(label(at), { eventId: id("event", owner.n, index), eventTime: stamp(at),
-    sessionUuid: `synthetic-session-${owner.n}`, accountPlanAttribution: attribution(owner) });
+    sessionUuid: `synthetic-session-${owner.n}`, accountPlanAttribution: attribution(owner), ...overrides });
   return occurrence(owner, "usage", at, record.eventId, record);
 }
 export function quota(owner, index, at, usedPercent, resetsAt) {

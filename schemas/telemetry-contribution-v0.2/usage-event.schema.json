@@ -95,7 +95,8 @@
         "claude-opus-5-5",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
-        "gpt-6.1-sol"
+        "gpt-6.1-sol",
+        "gpt-6.1-terra"
       ]
     },
     "modelRecognition": {

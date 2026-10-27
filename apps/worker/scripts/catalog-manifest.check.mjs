@@ -85,7 +85,8 @@ test("the immutable d43c8f92 baseline stays distinct from current compiled input
   const parsed = JSON.parse(committed);
   assert.equal(parsed.compat.registryVersion, "app-official-api-prices-v0.8");
   assert.equal(await webCryptoSha256Hex(JSON.stringify(parsed.priceCards)), receipt.registrySha256);
-  assert.equal(VENDORED_COMPILED_INPUTS.registryVersion, "app-official-api-prices-v0.9");
+  assert.equal(VENDORED_COMPILED_INPUTS.registryVersion, "app-official-api-prices-v0.10");
+  assert.equal(VENDORED_COMPILED_INPUTS.registrySha256, "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
   assert.notEqual(VENDORED_COMPILED_INPUTS.registrySha256, receipt.registrySha256);
 });
 

@@ -43,7 +43,7 @@
  *   REGISTRATION_DUPLICATE, REGISTRATION_PARSE_FAILED,
  *   PROFILE_ROUTING_AMBIGUOUS, PROFILE_ROUTING_DRIFT, UNPLANNED_SPEC_RESULT,
  *   SUITE_PROCESS_FAILED, PREREQUISITE_FAILED, TAP_INCOMPLETE,
- *   TAP_PARSE_MISMATCH, VITEST_REPORT_INVALID.
+ *   TAP_PARSE_MISMATCH, VITEST_REPORT_INVALID, VITEST_REPORT_DUPLICATE.
  * Environment gaps (reported apart from failures): ENVIRONMENT_GAP.
  *
  * An ENV_PROFILE_CONFLICT belongs to the family that owns the named spec. This
@@ -56,6 +56,11 @@
  *   PG_TEST_TCP_HOST=127.0.0.1 PG_TEST_TCP_PORT=55432 \
  *     node scripts/ci-postgres-suite.mjs
  *   node scripts/ci-postgres-suite.mjs --plan    # static checks only, no database
+ *   node scripts/ci-postgres-suite.mjs --shard node-1
+ *
+ * Hosted shards are four closed partitions of the fully validated plan. A
+ * shard result names its scope; only all four successful jobs prove the suite.
+ * Omitting --shard retains the complete local run.
  */
 
 import { spawn } from "node:child_process";
@@ -79,6 +84,7 @@ export const PROFILE_SOCKET = "SOCKET";
 export const PROFILE_HOST = "HOST";
 export const PROFILE_EDGE_E2E = "EDGE_E2E";
 export const NODE_RUNNER = "node";
+export const POSTGRES_SUITE_SHARDS = Object.freeze(["vitest", "node-1", "node-2", "edge-e2e"]);
 
 /**
  * package.json scripts beyond postgres:domain:check whose ./postgres-test/
@@ -674,6 +680,59 @@ export async function planPostgresSuite({
 }
 
 // ---------------------------------------------------------------------------
+// Closed hosted partitions
+// ---------------------------------------------------------------------------
+
+/** Derive a disjoint, exhaustive partition; never accept a caller's file filter. */
+export function partitionPostgresSuite(plan) {
+  if (plan.failures.length > 0) {
+    throw new CiPostgresSuiteError("CI_SUITE_SHARD_PLAN_INVALID", "the complete plan must pass before sharding");
+  }
+  const seen = new Set();
+  const assignments = new Map();
+  const nodeFiles = [];
+  for (const entry of plan.files) {
+    if (seen.has(entry.file)) {
+      throw new CiPostgresSuiteError("CI_SUITE_SHARD_PLAN_INVALID", "duplicate planned file");
+    }
+    seen.add(entry.file);
+    if (VITEST_REGISTRATION_CONFIGS.some((config) => entry.runner === `vitest:${config}`)
+        && entry.profile === PROFILE_SOCKET) {
+      assignments.set(entry.file, "vitest");
+    } else if (entry.runner === NODE_RUNNER
+        && [PROFILE_SOCKET, PROFILE_HOST].includes(entry.profile)) {
+      nodeFiles.push(entry.file);
+    } else if (entry.runner === scriptRunner("edge:e2e") && entry.profile === PROFILE_EDGE_E2E) {
+      assignments.set(entry.file, "edge-e2e");
+    } else {
+      throw new CiPostgresSuiteError("CI_SUITE_SHARD_PLAN_INVALID", "unclassified runner or profile");
+    }
+  }
+  // Stable file ordering determines membership; execution keeps the original
+  // plan order and the existing serial SOCKET, HOST and EDGE_E2E profiles.
+  nodeFiles.sort().forEach((file, index) => assignments.set(file, `node-${index % 2 + 1}`));
+  const partitions = Object.fromEntries(POSTGRES_SUITE_SHARDS.map((shard) => [
+    shard, Object.freeze(plan.files.filter(({ file }) => assignments.get(file) === shard)),
+  ]));
+  if (POSTGRES_SUITE_SHARDS.some((shard) => partitions[shard].length === 0)) {
+    throw new CiPostgresSuiteError("CI_SUITE_SHARD_PLAN_INVALID", "every reviewed shard must contain a planned file");
+  }
+  return Object.freeze(partitions);
+}
+
+export function parsePostgresSuiteArguments(argv) {
+  let planOnly = false;
+  let shard = null;
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--plan" && !planOnly) planOnly = true;
+    else if (argv[index] === "--shard" && shard === null
+        && POSTGRES_SUITE_SHARDS.includes(argv[index + 1])) shard = argv[++index];
+    else throw new CiPostgresSuiteError("CI_SUITE_USAGE", "expected --plan and/or one reviewed --shard name");
+  }
+  return Object.freeze({ planOnly, shard });
+}
+
+// ---------------------------------------------------------------------------
 // Result parsing
 // ---------------------------------------------------------------------------
 
@@ -834,6 +893,10 @@ export function parseVitestReport(report, { workerRoot }) {
       continue;
     }
     const file = toPosix(relative(workerRoot, result.name));
+    if (files.has(file)) {
+      parseFailures.push("VITEST_REPORT_DUPLICATE");
+      continue;
+    }
     const tests = result.assertionResults.map((assertion) => ({
       name: [...(assertion.ancestorTitles ?? []), assertion.title].join(" > "),
       status: VITEST_STATUS.get(assertion.status) ?? "failed",
@@ -1043,6 +1106,10 @@ function reportFailingOutput({ file, text, result }) {
   if (failing) process.stderr.write(`\n--- ${file} ---\n${text}\n`);
 }
 
+function reportProgress(progress) {
+  process.stderr.write(`${JSON.stringify({ event: "postgres_suite_progress", ...progress })}\n`);
+}
+
 /**
  * The EDGE_E2E runtime, or the named reasons it is unavailable here: the
  * image's Node (EDGE_E2E_NODE, an absolute path reporting v22.16.0), workerd
@@ -1083,22 +1150,47 @@ export async function runPostgresSuite({
   environment = process.env,
   run = spawnProcess,
   onOutput = reportFailingOutput,
+  onProgress = reportProgress,
   plan: suppliedPlan = null,
   probeEdgeE2e = probeEdgeE2eEnvironment,
+  shard = null,
 } = {}) {
+  if (shard !== null && !POSTGRES_SUITE_SHARDS.includes(shard)) {
+    throw new CiPostgresSuiteError("CI_SUITE_USAGE", "unknown shard");
+  }
+  if (shard !== null && suppliedPlan !== null) {
+    throw new CiPostgresSuiteError("CI_SUITE_SHARD_PLAN_INVALID", "shards require the complete canonical plan");
+  }
   const profile = readSocketProfileInput(environment);
-  const plan = suppliedPlan ?? await planPostgresSuite({ workerRoot });
-  if (plan.failures.length > 0) {
+  const canonicalPlan = suppliedPlan ?? await planPostgresSuite({ workerRoot });
+  if (canonicalPlan.failures.length > 0) {
     return Object.freeze({
       status: "failed",
-      files: plan.files.length,
+      files: canonicalPlan.files.length,
       tests: 0,
       passedByPass: Object.freeze({ [PROFILE_SOCKET]: 0, [PROFILE_HOST]: 0, [PROFILE_EDGE_E2E]: 0 }),
       skipped: Object.freeze([]),
-      failures: plan.failures,
+      failures: canonicalPlan.failures,
       environmentGaps: Object.freeze([]),
     });
   }
+  const plan = shard === null ? canonicalPlan : Object.freeze({
+    ...canonicalPlan, files: partitionPostgresSuite(canonicalPlan)[shard],
+  });
+  const timedRun = async (phase, file, pass, runtime, command, args, options) => {
+    const start = performance.now();
+    const identity = { phase, file, profile: pass, runtime };
+    onProgress({ ...identity, state: "started" });
+    try {
+      const result = await run(command, args, options);
+      onProgress({ ...identity, state: "completed", elapsedMs: Math.round(performance.now() - start),
+        exitCode: result.exitCode });
+      return result;
+    } catch (error) {
+      onProgress({ ...identity, state: "failed", elapsedMs: Math.round(performance.now() - start) });
+      throw error;
+    }
+  };
   const records = [];
   const environmentGaps = [];
   const reportDirectory = await mkdtemp(join(tmpdir(), "tibotattle-pg-suite-"));
@@ -1108,7 +1200,7 @@ export async function runPostgresSuite({
       const planned = plan.files.filter(({ runner }) => runner === `vitest:${config}`);
       if (planned.length === 0) continue;
       const outputFile = join(reportDirectory, `${config}.json`);
-      const { exitCode } = await run(process.execPath, [
+      const { exitCode } = await timedRun("vitest-config", config, PROFILE_SOCKET, "repository", process.execPath, [
         join(workerRoot, "node_modules", "vitest", "vitest.mjs"),
         "run",
         "--config",
@@ -1124,6 +1216,14 @@ export async function runPostgresSuite({
       }
       const parsed = parseVitestReport(report, { workerRoot });
       for (const [file, result] of parsed.files) {
+        if (planned.some((entry) => entry.file === file)) {
+          const reported = report.testResults.find((entry) => typeof entry?.name === "string"
+            && toPosix(relative(workerRoot, entry.name)) === file);
+          const elapsedMs = Number.isFinite(reported.startTime) && Number.isFinite(reported.endTime)
+            && reported.endTime >= reported.startTime ? reported.endTime - reported.startTime : null;
+          onProgress({ phase: "vitest-file", file, profile: PROFILE_SOCKET, runtime: "repository",
+            state: "reported", elapsedMs });
+        }
         if (result.tests.some(({ status }) => status !== "passed") || result.fileFailure) {
           const details = result.tests.filter(({ status }) => status === "failed")
             .map(({ name, detail }) => `${name}\n${detail}`);
@@ -1145,7 +1245,7 @@ export async function runPostgresSuite({
       for (const entry of plan.files) {
         if (entry.runner !== NODE_RUNNER || entry.profile !== pass) continue;
         const absoluteFile = join(workerRoot, entry.file);
-        const { exitCode, stdout } = await run(process.execPath, [
+        const { exitCode, stdout } = await timedRun("node-test", entry.file, pass, "repository", process.execPath, [
           "--test",
           "--test-concurrency=1",
           "--test-reporter=tap",
@@ -1182,7 +1282,8 @@ export async function runPostgresSuite({
       let prerequisiteFailed = false;
       for (const command of entry.prerequisites ?? []) {
         if (prepared.has(command)) continue;
-        const { exitCode } = await run(runtime.node, command.split(" ").slice(1),
+        const { exitCode } = await timedRun("prerequisite", entry.file, PROFILE_EDGE_E2E, "image",
+          runtime.node, command.split(" ").slice(1),
           { cwd: workerRoot, env: passEnv, captureStdout: false });
         if (exitCode !== 0) {
           prerequisiteFailed = true;
@@ -1200,7 +1301,7 @@ export async function runPostgresSuite({
       }
       if (prerequisiteFailed) continue;
       const absoluteFile = join(workerRoot, entry.file);
-      const { exitCode, stdout } = await run(runtime.node, [
+      const { exitCode, stdout } = await timedRun("node-test", entry.file, PROFILE_EDGE_E2E, "image", runtime.node, [
         ...EDGE_E2E_NODE_FLAGS,
         "--test",
         ...(entry.testFlags ?? []).filter((flag) => !flag.startsWith("--test-reporter")),
@@ -1221,7 +1322,12 @@ export async function runPostgresSuite({
   } finally {
     await rm(reportDirectory, { recursive: true, force: true });
   }
-  return evaluatePostgresSuite({ plan, records, environmentGaps });
+  const summary = evaluatePostgresSuite({ plan, records, environmentGaps });
+  return shard === null ? summary : Object.freeze({ ...summary, scope: Object.freeze({
+    kind: "shard", shard, canonicalFiles: canonicalPlan.files.length,
+    selectedFiles: Object.freeze(plan.files.map(({ file }) => file)),
+    requiredShards: POSTGRES_SUITE_SHARDS,
+  }) });
 }
 
 function printFailures(failures) {
@@ -1235,13 +1341,10 @@ function printFailures(failures) {
 }
 
 async function main(argv) {
-  const known = new Set(["--plan"]);
-  const unknown = argv.filter((argument) => !known.has(argument));
-  if (unknown.length > 0) {
-    throw new CiPostgresSuiteError("CI_SUITE_USAGE", `unknown argument ${unknown[0]}`);
-  }
-  if (argv.includes("--plan")) {
+  const { planOnly, shard } = parsePostgresSuiteArguments(argv);
+  if (planOnly) {
     const plan = await planPostgresSuite();
+    const partitions = shard !== null && plan.failures.length === 0 ? partitionPostgresSuite(plan) : null;
     process.stdout.write(`${JSON.stringify({
       status: plan.failures.length === 0 ? "planned" : "failed",
       files: plan.files.map(({ file, runner, profile }) => ({ file, runner, profile })),
@@ -1250,6 +1353,7 @@ async function main(argv) {
         .map(({ file, runner, profile }) => ({ file, runner, profile })),
       unregisteredAllowlist: UNREGISTERED_ALLOWLIST,
       failures: plan.failures,
+      ...(shard === null ? {} : { shard, selectedFiles: partitions?.[shard].map(({ file }) => file) ?? [] }),
     }, null, 2)}\n`);
     if (plan.failures.length > 0) {
       printFailures(plan.failures);
@@ -1257,7 +1361,7 @@ async function main(argv) {
     }
     return;
   }
-  const summary = await runPostgresSuite();
+  const summary = await runPostgresSuite({ shard });
   process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
   if (summary.status !== "passed") {
     printFailures(summary.failures);

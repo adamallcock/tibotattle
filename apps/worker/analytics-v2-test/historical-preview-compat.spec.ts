@@ -136,8 +136,17 @@ describe("retained Pro 10x (v0.4) preview compatibility", () => {
     const published = projectPublicAllowanceGraphForGcp({ generated_at: preview.generatedAt, payload_json: text },
       { nowMs, publishedDays: goldenPublishedDays(preview) }, goldenAllowanceInputs().metadata);
     expect(published?.breakdowns.schemaVersion).toBe("community-allowance-breakdowns-v1.4");
-    expect(JSON.stringify(withCurrentPublicModelMetadata(published)?.breakdowns))
+    // Retained numbers and contract bytes keep their frozen presentation
+    // oracle; the route's current display roster is asserted separately.
+    const retainedMetadata = JSON.parse(fixture("allowance-breakdowns-v14-expected.json")).modelConfig;
+    expect(JSON.stringify({ ...published?.breakdowns, modelConfig: retainedMetadata }))
       .toBe(fixture("allowance-breakdowns-v14-expected.json"));
+    const current = withCurrentPublicModelMetadata(published)!.breakdowns;
+    expect(current.modelConfig.map(({ id }) => id)).toEqual([
+      "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
+      "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
+    ]);
+    expect({ ...current, modelConfig: published!.breakdowns.modelConfig }).toEqual(published!.breakdowns);
     expect(published?.breakdowns).toMatchObject({
       basis: "seven_day_codex_pro10x_equivalent_personal_plans_trailing_30d_promax25",
       normalization: "pro_x1_prolite_x2_promax_x0_4_plus_x10",

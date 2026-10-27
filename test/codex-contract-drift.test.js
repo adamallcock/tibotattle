@@ -48,6 +48,15 @@ const CHECKER_FILE = resolve(
   "scripts/check-codex-contract-drift.mjs",
 );
 
+// Retained binary evidence must not change when the current registry grows.
+const CODEX_0160_PLAN_TYPES = Object.freeze([
+  "free", "go", "plus", "pro", "prolite", "promax", "team",
+  "self_serve_business_prolite", "self_serve_business_usage_based", "business",
+  "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise",
+  "edu", "edu_plus", "edu_pro", "unknown",
+]);
+const CODEX_0150_PLAN_TYPES = CODEX_0160_PLAN_TYPES.filter((plan) => plan !== "promax");
+
 async function fixtureText(path) {
   return readFile(path, "utf8");
 }
@@ -133,7 +142,30 @@ test("Pro Max vocabulary is binary-verified while allowance semantics remain unv
     const contract = ledger.verifiedContracts.find((entry) => (
       entry.channel === channel && entry.version === "codex-cli 0.160.0"
     ));
-    assert.equal(contract.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES));
+    assert.equal(contract.planTypesSha256, planTypesSha256(CODEX_0160_PLAN_TYPES));
+  }
+});
+
+test("scientific plans are source and binary verified without assigning allowance capacity", async () => {
+  const ledger = validateCodexContractLedger(await fixtureLedger());
+  assert.deepEqual(TELEMETRY_PLAN_TYPES.slice(0, CODEX_0160_PLAN_TYPES.length), CODEX_0160_PLAN_TYPES);
+  assert.equal(ledger.source.reviewedRevision, "fea1d7f7d163521a868c344527da79ba0efc146d");
+  assert.equal(ledger.source.sourceSha256, "dcae6a282263f505572575703849ce71ae8ab3faef4f909ac57d5aee113ca6ea");
+  for (const [rawValue, displayName] of [["sci", "Academic Researchers"], ["sci_plus", "Academic Researchers Plus"]]) {
+    const plan = ledger.plans.find((entry) => entry.rawValue === rawValue);
+    assert.equal(plan.lifecycle, "active");
+    assert.equal(plan.displayName, displayName);
+    assert.match(plan.note, /allowance capacity, multipliers and window semantics remain unverified/u);
+    assert.match(plan.note, /no personal-plan normalization is assigned/u);
+    assert.equal(ledger.seatMappings.some((entry) => entry.wirePlanType === rawValue), false);
+  }
+  const current = ledger.verifiedContracts.find((entry) => entry.channel === "chatgpt_bundled"
+    && entry.version === "codex-cli 0.164.0-alpha.11.1");
+  assert.equal(current.planTypesSha256, "0d0382ec52c0294de5017d4e22b0f5a31393806d3c3fdb7aa5661e3bf7d43608");
+  assert.equal(current.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES));
+  for (const entry of ledger.verifiedContracts.filter((entry) => entry.version.startsWith("codex-cli 0.14")
+    || entry.version.startsWith("codex-cli 0.150."))) {
+    assert.equal(entry.planTypesSha256, planTypesSha256(CODEX_0150_PLAN_TYPES));
   }
 });
 
@@ -238,7 +270,9 @@ test("source observation does not activate a provisional plan", async () => {
 
 test("generated PlanType parser accepts only a literal union", async () => {
   const parsed = parsePlanTypeScript(await fixtureText(PLAN_TYPE_FIXTURE));
-  assert.deepEqual(parsed, TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax"));
+  assert.deepEqual(parsed, CODEX_0150_PLAN_TYPES);
+  assert.deepEqual(parsePlanTypeScript('export type PlanType = "sci" | "sci_plus" | "unknown";'),
+    ["sci", "sci_plus", "unknown"]);
   assert.throws(
     () => parsePlanTypeScript("export type PlanType = string;\n"),
     { code: "CODEX_SCHEMA_INVALID" },
@@ -284,7 +318,7 @@ test("binary inspector supports stable generation and the older experimental fal
   });
   assert.equal(stable.generatorMode, "stable");
   assert.equal(stable.version, "codex-cli 1.2.3");
-  assert.equal(stable.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "promax")));
+  assert.equal(stable.planTypesSha256, planTypesSha256(CODEX_0150_PLAN_TYPES));
   assert.equal(stableCalls.some((args) => args.includes("--experimental")), false);
 
   const fallback = await inspectCodexBinaryContract({
