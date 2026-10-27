@@ -123,6 +123,10 @@ const REGISTRY_PINS = Object.freeze([
   // plus current scientific-plan recognition with unknown allowance. The live
   // performance/era implementation and all predecessor identities are retained.
   "00de5d3dd296f79a2d7bb90361f126621d4155593787045baec137454775705e",
+  // Kernel 22: restore classification proof-read attribution in the existing
+  // correction-source family. Live performance/era behavior, vendor and prices
+  // are unchanged; this is the server branch successor to its kernel 21.
+  "93113d9c87614c9e01b29dbe0a01e8480031175dddc31648bf07f20302b4d1f8",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

@@ -1340,11 +1340,21 @@ function pushSource<T>(target: Map<string, T[]>, id: string, value: T): void {
   if (group) group.push(value); else target.set(id, [value]);
 }
 
+/** Attribute the shared classification helpers' proof reads in this A-1 context. */
+function classificationStatementClient(client: PostgresClient): PostgresClient {
+  return {
+    query: <Row extends object = Record<string, unknown>>(text: string, values?: unknown[]) =>
+      client.query<Row>(analyticsV2Statement("occurrences.correction_sources", text), values),
+    release: (discard?: boolean) => client.release(discard),
+  };
+}
+
 /** Fetch exact physical variants in bounded pages. Archived total facts can
  * outlive their original row; absence preserves their existing evidence. */
 async function classificationVariants(client: PostgresClient, s: string, participantId: string,
   stream: "usage" | "session", format: 10 | 11 | 12, ids: readonly string[], retained = false):
   Promise<Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>> {
+  client = classificationStatementClient(client);
   const output = new Map<string, { original: PostgresClassificationRecord; analytical: PostgresClassificationRecord }>();
   for (const page of chunks([...new Set(ids)], EXPANSION_BATCH)) {
     let selected = page;
@@ -1980,7 +1990,7 @@ export async function readOwnerDayFingerprints(
           if (facts.length > MAX_BATCH_SOURCE_ROWS) sourceFail("ANALYTICS_V2_SOURCE_LIMIT");
           for (const row of facts) keyed(row.occurrence_id).facts.push(canonicalRow(row));
           const classification = stream === "quota" ? null : await postgresClassificationEvidenceIdentities(
-            client, s, scope.participantId, stream, raw.ids);
+            classificationStatementClient(client), s, scope.participantId, stream, raw.ids);
           for (const [id, sources] of byOccurrence) {
             const evidence: unknown[] = [sources.legacy, sources.v12, sources.facts];
             // Preserve unchanged identities where this occurrence has no links.

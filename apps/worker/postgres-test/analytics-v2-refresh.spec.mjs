@@ -945,8 +945,11 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 77,
-      "the 77-migration primary chain including immutable repricing proofs and input associations");
+    assert.equal(stock.length + stagedCount, 79,
+      "the 79-migration primary chain including repricing, classification links and performance telemetry");
+    assert.deepEqual(stock.slice(-3).map(({ name }) => name), [
+      "0077_analytics_v2_reprice.sql", "0078_classification_link_lookup_indexes.sql", "0079_performance_telemetry.sql",
+    ], "the deployed primary migration tail remains intact");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");
 
@@ -3685,6 +3688,48 @@ test("PG17 EXCL-DEPARTED: real exclusions keep a disconnected saved member hidde
     assert.equal(final.revision, overlapHead.revision + 1);
     assert.deepEqual(await savedRows(), savedBefore);
     assert.equal(JSON.stringify(revoked).includes(echo.participantId), false);
+  });
+});
+
+// The full-refresh matrix below reads classification variants. Fingerprints
+// have a separate proof-reader path, so qualify its tags on the same real
+// snapshot pool and keep its complete values equal to direct A-1 reads.
+test("PG17 K-PGSTAT: fingerprint proof reads retain their values and carry their statement family", {
+  skip: PG_SKIP,
+  timeout: 180_000,
+}, async () => {
+  await withDatabase("fingerprint-families", async ({ pool, createSchema }) => {
+    const { schema } = await createSchema();
+    await seedFixture.seedAnalyticsV2Fixture({ pool, schema, modules: seedModules, correctionRuntime: "active" });
+    const context = { pool, schema, nowMs: seedFixture.NOW_MS };
+    const owners = (await a1.owners.listAnalyticsV2Owners(context)).owners
+      .filter((owner) => owner.source === "effective");
+    assert.ok(owners.length > 1, "the fixture exercises distinct source owners");
+    const exporter = await pool.connect();
+    let readPool;
+    try {
+      await exporter.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const snapshot = (await exporter.query("SELECT pg_export_snapshot() AS snapshot")).rows[0].snapshot;
+      const ledger = job.createAnalyticsRefreshStatementLedger();
+      readPool = job.createSnapshotReadPool(pool, snapshot, { ledger });
+      let fingerprintDays = 0;
+      for (const { ownerDigest } of owners) {
+        const range = { ownerDigest, fromDay: seedFixture.D1, throughDay: seedFixture.D3 };
+        const direct = await a1.occurrences.readOwnerDayFingerprints(context, range);
+        const observed = await a1.occurrences.readOwnerDayFingerprints({ ...context, pool: readPool }, range);
+        assert.deepEqual([...observed], [...direct], "tagged snapshot reads preserve every fingerprint byte");
+        fingerprintDays += observed.size;
+      }
+      assert.ok(fingerprintDays > 0, "the proof compares populated fingerprints");
+      const summary = ledger.summary();
+      assert.ok(summary.families["occurrences.correction_sources"].calls > 0,
+        "the classification evidence-identity queries are included");
+      assert.equal(summary.families.untagged, undefined, "every fingerprint reader statement carries its family");
+    } finally {
+      await readPool?.close();
+      try { await exporter.query("ROLLBACK"); }
+      finally { exporter.release(); }
+    }
   });
 });
 
