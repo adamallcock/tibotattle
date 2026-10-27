@@ -347,7 +347,10 @@ test("the production-tier script's signal handling tears down at once and leaves
   const own = `printf '%s\\n' $$ >> '${ownedFile}'; /bin/sleep 30 & printf '%s\\n' $! >> '${ownedFile}'; wait`;
   writeFileSync(join(dir, "owned.sh"), own);
   writeFileSync(join(dir, "resistant.sh"), `trap '' TERM; ${own}`);
-  const harness = ["set -u", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0", "SAMPLER=0",
+  // Every descendant retains the parent's output pipes through inherited
+  // descriptors, even when child() redirects its stdout/stderr to a file.
+  // Reopening /dev/stdout fails on Linux when Node's pipe is socket-backed.
+  const harness = ["set -u", "exec 3>&1 4>&2", "zmodload zsh/datetime", "T0=$EPOCHREALTIME", "TORN=0", "CHILD=0", "SAMPLER=0",
     definition("child").replace("CHILD=$!; wait", `CHILD=$!; print -r -- $CHILD >> '${ownedFile}'; wait`),
     definition("tree"), definition("terminate"), definition("stop"),
     "teardown() { [[ $TORN == 1 ]] && return; TORN=1; printf 'teardown %.1f\\n' $(( EPOCHREALTIME - T0 )); }",
@@ -370,14 +373,13 @@ test("the production-tier script's signal handling tears down at once and leaves
     `  fi; print -r -- "$found"; }`;
   const finishingHarness = sampledHarness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`, "D() { /bin/sleep 0.5; }");
   const rootResistantHarness = harness.replace(`D() { /bin/sh "${join(dir, "owned.sh")}"; }`,
-    `D() { trap '' TERM; /bin/sh "${join(dir, "resistant.sh")}"; }`)
-    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr D x");
+    `D() { trap '' TERM; /bin/sh "${join(dir, "resistant.sh")}"; }`);
   const descendantResistantHarness = rootResistantHarness.replace("D() { trap '' TERM;", "D() {");
   const resistantCompletionHarness = finishingHarness.replace(
     `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "owned.sh")}"; }`,
-    `pgstat() { touch '${samplerFile}'; child /dev/stdout /dev/stderr /bin/sh "${join(dir, "resistant.sh")}"; }`);
+    `pgstat() { touch '${samplerFile}'; child /dev/null - /bin/sh "${join(dir, "resistant.sh")}"; }`);
   const captureFailureHarness = harness.replace("trap teardown EXIT", "pgrep() { return 2; }\ntrap teardown EXIT")
-    .replace(`child "${join(dir, "step.log")}" - D x`, "child /dev/stdout /dev/stderr /bin/sleep 30");
+    .replace(`child "${join(dir, "step.log")}" - D x`, `child "${join(dir, "step.log")}" - /bin/sleep 30`);
   const captureCompletionFailureHarness = finishingHarness
     .replace(definition("sampler"), "sampler() { exec /bin/sleep 30; }")
     .replace("SAMPLER=$!", `SAMPLER=$!; print -r -- $SAMPLER >> '${ownedFile}'`)
