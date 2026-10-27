@@ -166,6 +166,8 @@ test("the reach proof: the origin's import graph into the D1 readers equals the 
   const origin = shipped.reachByFile.get("server.mjs");
   assert.deepEqual(origin["src/postgres-legacy-contribution-admission.ts"], ["src/telemetry-repository.ts"]);
   assert.deepEqual(origin["src/telemetry-repository.ts"], ["src/quota-analysis.ts"]);
+  assert.deepEqual(origin["src/analytics-v2/public-allowance-breakdowns-v15.ts"],
+    ["src/admin-community-allowance.ts", "src/community-allowance.ts"]);
   assert.deepEqual(origin["cloud-run/server.mjs"], ["cloud-run/postgres-production-host.mjs", "src/analytics-v2/community-daily-route.ts"]);
   assert.deepEqual(origin["cloud-run/postgres-production-host.mjs"], ["cloud-run/routes/admin-console.mjs",
     "src/analytics-v2/community-daily-route.ts", "src/postgres-community-daily.ts", "src/postgres-legacy-contribution-admission.ts"]);
@@ -709,6 +711,6 @@ test("the command line lists the readers and exits 0 on the real tree", () => {
   assert.equal(listed.status, 0, listed.stderr);
   assert.match(listed.stdout, /^admission +\d+ +src\/postgres-legacy-contribution-admission\.ts +\[\d+ write\] \d+ column\(s\)$/mu);
   assert.match(listed.stdout, /^ships analytics-refresh\.mjs: none$/mu);
-  assert.match(listed.stdout, /^reach server\.mjs: 18 module\(s\), 32 import\(s\) lead to src\/quota-analysis\.ts, src\/telemetry-repository\.ts$/mu);
+  assert.match(listed.stdout, /^reach server\.mjs: 19 module\(s\), 36 import\(s\) lead to src\/quota-analysis\.ts, src\/telemetry-repository\.ts$/mu);
   assert.match(listed.stdout, /^ships server\.mjs: .*src\/postgres-legacy-contribution-admission\.ts/mu);
 });
