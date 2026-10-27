@@ -19,7 +19,11 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { declaredBreakdownsV13 } from "../analytics-v2-parity-compare.mjs";
+import { declaredBreakdownsV13, hasQ1CurrentBreakdownsShape } from "../analytics-v2-parity-compare.mjs";
+import {
+  ANALYTICS_V2_Q1_CURRENT_CONTRACT,
+  currentQ1PerDateExpected,
+} from "../analytics-v2-parity-current-contract.mjs";
 
 const sorted = (value) => Array.isArray(value) ? value.map(sorted)
   : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sorted(value[key])]))
@@ -42,25 +46,34 @@ export function perDateDiffs(expected, actual, path = "$", out = [], limit = 20)
   return out;
 }
 
-export function comparePerDate({ expected, response, preview, declaredModelMetadata }) {
+export function comparePerDate({ expected, response, preview, declaredModelMetadata, currentContract = null }) {
+  if (currentContract !== null) expected = currentQ1PerDateExpected(currentContract, expected);
   const declared = declaredBreakdownsV13(response?.allowanceBreakdowns ?? null,
     ...(declaredModelMetadata === undefined ? [] : [declaredModelMetadata]));
+  const currentWireValid = currentContract === null
+    || hasQ1CurrentBreakdownsShape(response?.allowanceBreakdowns, expected.allowanceBreakdowns);
   const families = {
     preview: { expected: expected.preview, actual: preview },
-    allowanceBreakdowns: { expected: expected.allowanceBreakdowns, actual: declared.base ?? null },
+    allowanceBreakdowns: { expected: expected.allowanceBreakdowns,
+      actual: (currentContract === null ? declared.base : response?.allowanceBreakdowns) ?? null },
   };
-  const report = { schemaVersion: "gcp-fastpath-per-date-compare-v2", decision: expected.decision,
+  const report = { schemaVersion: currentContract === null ? "gcp-fastpath-per-date-compare-v2" : "gcp-fastpath-per-date-compare-v3",
+    decision: expected.decision,
     breakdownsV13: { served: declared.served, accepted: declared.served && declared.valid && declared.metadataEqual === true },
     families: {} };
   for (const [name, { expected: want, actual: got }] of Object.entries(families)) {
-    const declaredFault = name === "allowanceBreakdowns" && declared.served
-      && !(declared.valid && declared.metadataEqual === true);
+    const declaredFault = name === "allowanceBreakdowns" && (currentContract === null
+      ? declared.served && !(declared.valid && declared.metadataEqual === true) : !currentWireValid);
     const equal = !declaredFault && JSON.stringify(sorted(want)) === JSON.stringify(sorted(got));
     report.families[name] = { equal, diffs: equal ? [] : declaredFault
-      ? [{ path: "$.modelConfig", expected: "<declared v1.3 shape and block>", actual: "<other>" }]
+      ? [{ path: "$.modelConfig", expected: currentContract === null
+        ? "<declared v1.3 shape and block>" : "<declared current wire shape>", actual: "<other>" }]
       : perDateDiffs(sorted(want), sorted(got)) };
   }
   report.equal = Object.values(report.families).every((family) => family.equal);
+  if (currentContract !== null) {
+    report.currentContract = { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: currentWireValid && report.equal };
+  }
   return report;
 }
 

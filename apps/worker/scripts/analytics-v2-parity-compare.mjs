@@ -89,6 +89,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  ANALYTICS_V2_Q1_CURRENT_CONTRACT,
+  currentQ1ComparisonInputs,
+} from "./analytics-v2-parity-current-contract.mjs";
 
 export const ANALYTICS_V2_PARITY_REPORT_VERSION = "analytics-v2-parity-report-v4";
 export const ANALYTICS_V2_PARITY_FAMILIES = Object.freeze([
@@ -152,6 +156,22 @@ export function declaredBreakdownsV13(value, declaredModelMetadata = ANALYTICS_V
     base: { ...rest, schemaVersion: V11_SCHEMA_VERSION }, served: true, valid: true,
     metadata: modelConfig, metadataEqual,
   };
+}
+
+/** Keep the current public wire's closed key order as well as its exact values. */
+export function hasQ1CurrentBreakdownsShape(value, expected) {
+  if (!isObject(value) || value.schemaVersion !== "community-allowance-breakdowns-v1.5"
+      || !Array.isArray(value.modelConfig) || !Array.isArray(expected?.modelConfig)) return false;
+  const expectedKeys = [...V11_KEYS, "modelConfig"];
+  const keys = Object.keys(value);
+  const entryKeys = (block) => block.map((entry) => (isObject(entry) ? Object.keys(entry) : null));
+  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index])
+    && JSON.stringify(entryKeys(value.modelConfig)) === JSON.stringify(entryKeys(expected.modelConfig));
+}
+
+function uniqueDayRows(value) {
+  return Array.isArray(value) && value.every((entry) => isObject(entry) && typeof entry.day === "string")
+    && new Set(value.map((entry) => entry.day)).size === value.length;
 }
 
 /** Drop only the publication-schedule fields from one served day. */
@@ -326,12 +346,25 @@ function acceptPerDate(families, published, unverified, key, day, actual, expect
 export function compareAnalyticsV2Parity({
   golden, actual, goldenPreview = null, actualPreview = null, withheldModelDates = [], perDateExpected = null,
   declaredModelMetadata = ANALYTICS_V2_DECLARED_MODEL_METADATA,
+  currentContract = null,
 }) {
+  // The opt-in lane moves only independently pinned expectations forward.
+  // Actual data and the historical comparator's default behavior are unchanged.
+  if (currentContract !== null) {
+    ({ golden, goldenPreview, perDateExpected } = currentQ1ComparisonInputs(currentContract,
+      { golden, goldenPreview, perDateExpected }));
+  }
   const withheld = new Set(withheldModelDatesOf({ modelPublications: { missing: withheldModelDates } }));
   if (perDateExpected !== null && !isObject(perDateExpected)) throw new TypeError("ANALYTICS_V2_PARITY_PER_DATE_INVALID");
   const publishedWithheld = new Set();
   const unverifiedWithheld = new Set();
   const families = Object.fromEntries(ANALYTICS_V2_PARITY_FAMILIES.map((name) => [name, family(name)]));
+  if (currentContract !== null) {
+    for (const [name, rows] of [["daily-days", actual?.days],
+      ["allowance-breakdowns", actual?.allowanceBreakdowns?.days], ["model-days", actualPreview?.models?.days]]) {
+      if (!uniqueDayRows(rows)) record(families[name], "$", "<unique current day rows>", "<other>");
+    }
+  }
   const envelopeKeys = ["schemaVersion", "from", "to", "allowanceState", "allowanceReadState"];
   record(families.envelope, "$", pick(golden, envelopeKeys), pick(actual, envelopeKeys));
 
@@ -359,8 +392,12 @@ export function compareAnalyticsV2Parity({
   // The declared v1.3 difference is accepted only in its exact shape and with
   // the declared block; the reduced v1.1 block is then held to the oracle.
   const declared = declaredBreakdownsV13(actual?.allowanceBreakdowns, declaredModelMetadata);
-  const aAllowance = declared.base;
-  if (declared.served) {
+  const aAllowance = currentContract === null ? declared.base : actual?.allowanceBreakdowns;
+  const currentWireValid = currentContract === null || hasQ1CurrentBreakdownsShape(aAllowance, gAllowance);
+  if (!currentWireValid) {
+    record(families["allowance-breakdowns"], "$.allowanceBreakdowns", "<declared current wire shape>", "<other>");
+  }
+  if (currentContract === null && declared.served) {
     const target = families["breakdowns-v13-metadata"];
     if (!declared.valid) {
       record(families["allowance-breakdowns"], "$.allowanceBreakdowns", "<declared v1.3 shape>",
@@ -430,7 +467,10 @@ export function compareAnalyticsV2Parity({
   const list = ANALYTICS_V2_PARITY_FAMILIES.map((name) => families[name]);
   const unexpected = list.filter((entry) => !entry.expected && entry.diffCount > 0);
   return Object.freeze({
-    schemaVersion: ANALYTICS_V2_PARITY_REPORT_VERSION,
+    schemaVersion: currentContract === null ? ANALYTICS_V2_PARITY_REPORT_VERSION : "analytics-v2-parity-report-v5",
+    ...(currentContract === null ? {} : {
+      currentContract: { id: ANALYTICS_V2_Q1_CURRENT_CONTRACT, accepted: currentWireValid && unexpected.length === 0 },
+    }),
     normalized: ["days[].revision", "days[].releasedAt", "payload.revision", "payload.releasedAt",
       "payload.aggregateId :r<revision> suffix"],
     days: { golden: goldenDays.size, actual: actualDays.size, missingInActual: missing, extraInActual: extra },
