@@ -29,7 +29,7 @@
 //     flags. Dense inline uses heap12288MiB and semi-space64MiB; both profiles
 //     use ANALYTICS_V2_MEMORY_BUDGET_MIB=10752;
 //     gcp-fastpath-test-deploy.mjs REFRESH_JOB_PROFILES; a24h task timeout),
-//     wrapped in /usr/bin/time -l for the
+//     wrapped in BSD /usr/bin/time -l on macOS or GNU /usr/bin/time on Linux for the
 //     process's peak resident set, while the process's resident set and CPU
 //     time are sampled every 5 s (ps) for the utilisation of its threads;
 //  4. records the job's receipt (phase timings, read ledger, memory summary,
@@ -215,17 +215,33 @@ const poolFor = (endpoint, database, max = 6) => {
   return pool;
 };
 
-/** /usr/bin/time -l's peak resident set (bytes) and CPU seconds, from its stderr tail. */
-function parseTimeL(stderr) {
+/** Keep the native resource utility; GNU time reports maximum RSS in KiB, BSD in bytes. */
+export function timeArguments(platform = process.platform) {
+  if (platform === "darwin") return ["-l"];
+  if (platform === "linux") {
+    return ["-f", "%M maximum resident set size (KiB)\n%e real\n%U user\n%S sys"];
+  }
+  fail("MEAS_SYNTH_PLATFORM_UNSUPPORTED");
+}
+
+/** Native time's peak resident set (bytes) and CPU seconds; unavailable evidence stays null. */
+export function parseTimeReport(stderr, platform = process.platform) {
+  timeArguments(platform);
   const text = String(stderr);
   const number = (pattern) => {
     const match = text.match(pattern);
-    return match ? Number(match[1]) : null;
+    const value = match ? Number(match[1]) : NaN;
+    return Number.isFinite(value) ? value : null;
   };
-  return { maxResidentSetBytes: number(/(\d+)\s+maximum resident set size/u),
-    peakMemoryFootprintBytes: number(/(\d+)\s+peak memory footprint/u),
-    realSeconds: number(/([\d.]+)\s+real/u), userSeconds: number(/([\d.]+)\s+user/u),
-    sysSeconds: number(/([\d.]+)\s+sys/u) };
+  const rss = number(platform === "linux"
+    ? /^\s*(\d+)[\t ]+maximum resident set size \(KiB\)[\t ]*$/mu
+    : /^\s*(\d+)[\t ]+maximum resident set size[\t ]*$/mu);
+  const rssBytes = rss === null ? null : rss * (platform === "linux" ? 1024 : 1);
+  return { maxResidentSetBytes: Number.isSafeInteger(rssBytes) ? rssBytes : null,
+    peakMemoryFootprintBytes: platform === "darwin" ? number(/^\s*(\d+)[\t ]+peak memory footprint[\t ]*$/mu) : null,
+    realSeconds: number(/(?:^|\s)(\d+(?:\.\d+)?)\s+real(?:\s|$)/u),
+    userSeconds: number(/(?:^|\s)(\d+(?:\.\d+)?)\s+user(?:\s|$)/u),
+    sysSeconds: number(/(?:^|\s)(\d+(?:\.\d+)?)\s+sys(?:\s|$)/u) };
 }
 
 function lastJson(text) {
@@ -366,12 +382,13 @@ export function workerProfileEnv({ workerProfileDir = null, workerProfileSource 
     ...(memoryProfile ? { ANALYTICS_V2_LOCAL_WORKER_PROFILE_MEMORY: "1" } : {}) };
 }
 
-/** One full refresh under /usr/bin/time -l, measured to the end, its process sampled. */
+/** One full refresh under the native /usr/bin/time, measured to the end, its process sampled. */
 export async function runRefresh({ node22, endpoint, database, schema, outDir, label, profile, matrixRequested = {}, cpuProfile = {}, pgStat = null, workerProfile = {} }) {
+  const timeFlags = timeArguments();
   let started, sampler = null, stdout = "", stderr = "";
   const measured = await refreshPgStatLifecycle({ ...pgStat, run: async () => {
     started = performance.now();
-    const child = spawn("/usr/bin/time", ["-l", node22, ...refreshArguments(profile, schema, matrixRequested)], {
+    const child = spawn("/usr/bin/time", [...timeFlags, node22, ...refreshArguments(profile, schema, matrixRequested)], {
       cwd: CLOUD_RUN_ROOT, env: refreshEnv(endpoint, database, profile, { ...cpuProfileEnv(cpuProfile), ...workerProfileEnv(workerProfile) }),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -403,7 +420,7 @@ export async function runRefresh({ node22, endpoint, database, schema, outDir, l
   await writeFile(join(outDir, `${label}.samples.json`), `${JSON.stringify(samples)}\n`);
   return { exitCode, wallMs, receipt: lastJson(stdout), error: exitCode === 0 ? null : lastJson(stderr),
     measurementIdentity: refreshMeasurementIdentity(profile, matrixRequested),
-    time: parseTimeL(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
+    time: parseTimeReport(stderr), profileLines: profileLines(stderr), pgStat: measured.evidence,
     utilisation: utilisationSummary(samples, { cores: profile.cpu }) };
 }
 
@@ -506,6 +523,7 @@ export async function runRecord(pool, schema) {
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
+  if (!options.importOnly) timeArguments();
   if (!existsSync(options.node22)) fail("MEAS_SYNTH_NODE22_MISSING");
   const node22Version = (await execFileAsync(options.node22, ["--version"])).stdout.trim();
   if (!/^v22\./u.test(node22Version)) fail("MEAS_SYNTH_NODE22_MISSING");

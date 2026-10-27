@@ -41,7 +41,8 @@ name: Hosted backend
 # cutover seal check reads pinned commits as git objects; it fails, and never
 # skips, when they are absent. The postgres-17-suite job checks out full history
 # too, because the READ-EXPANSION specs archive their pinned base commit. The
-# Worker gate stays at depth 1. The PostgreSQL-backed part of
+# Worker gate also needs full history for pinned vendored source and facade
+# objects. The PostgreSQL-backed part of
 # that command, postgres-production-migrations.spec.mjs and
 # github-distribution-manifest-visibility.spec.mjs, runs in the
 # postgres-17-suite job.
@@ -106,7 +107,7 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js
@@ -115,6 +116,15 @@ jobs:
           node-version: 26.2.0
           check-latest: false
           package-manager-cache: false
+
+      # gcp:fastpath:scripts-check executes the maintained production-tier
+      # caller's zsh functions, including its signal and cleanup behavior.
+      - name: Install zsh for the production-tier caller checks
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh
+          zsh --version
 
       # gcp:fastpath:scripts-check, run by the Worker gate, imports Cloud Run host
       # modules, so this job needs the Cloud Run lockfile as well.

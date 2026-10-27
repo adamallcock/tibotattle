@@ -576,6 +576,43 @@ test("matrix adapter shares effective settings with guard and all profiler proje
     "--worker-profile-source", "a".repeat(40)]), { code: "MEAS_SYNTH_ARGUMENT_INVALID" });
 });
 
+test("native timing selects BSD or GNU flags and converts Linux RSS without inventing a memory footprint", async () => {
+  const { timeArguments, parseTimeReport } = await import("./measure-local.mjs");
+  assert.deepEqual(timeArguments("darwin"), ["-l"]);
+  assert.deepEqual(timeArguments("linux"), ["-f", "%M maximum resident set size (KiB)\n%e real\n%U user\n%S sys"]);
+  const seconds = { realSeconds: 1.25, userSeconds: 0.5, sysSeconds: 0.1 };
+  const bsd = "  1.25 real  0.50 user  0.10 sys\n  4096 maximum resident set size\n  8192 peak memory footprint\n";
+  const gnu = "4 maximum resident set size (KiB)\n1.25 real\n0.50 user\n0.10 sys\n";
+  assert.deepEqual(parseTimeReport(bsd, "darwin"), { maxResidentSetBytes: 4096, peakMemoryFootprintBytes: 8192, ...seconds });
+  assert.deepEqual(parseTimeReport(gnu, "linux"), { maxResidentSetBytes: 4096, peakMemoryFootprintBytes: null, ...seconds });
+  assert.equal(parseTimeReport(bsd, "linux").maxResidentSetBytes, null, "BSD bytes cannot be read as GNU KiB");
+  assert.equal(parseTimeReport(gnu, "darwin").maxResidentSetBytes, null, "GNU KiB cannot be read as BSD bytes");
+  for (const platform of ["darwin", "linux"]) {
+    const absent = { maxResidentSetBytes: null, peakMemoryFootprintBytes: null, realSeconds: null, userSeconds: null, sysSeconds: null };
+    assert.deepEqual(parseTimeReport("", platform), absent);
+    assert.deepEqual(parseTimeReport("-1 maximum resident set size\n-1 maximum resident set size (KiB)\n-1 real\nNaN user\nInfinity sys", platform), absent);
+  }
+  assert.equal(parseTimeReport("9007199254740991 maximum resident set size (KiB)", "linux").maxResidentSetBytes, null);
+  for (const platform of ["win32", "freebsd", "unknown"]) {
+    assert.throws(() => timeArguments(platform), { code: "MEAS_SYNTH_PLATFORM_UNSUPPORTED" });
+    assert.throws(() => parseTimeReport("", platform), { code: "MEAS_SYNTH_PLATFORM_UNSUPPORTED" });
+  }
+});
+
+test("the real native timing utility preserves a failed child's exit and records available resource metrics", async () => {
+  const { timeArguments, parseTimeReport } = await import("./measure-local.mjs");
+  const result = spawnSync("/usr/bin/time", [...timeArguments(), process.execPath, "-e", "process.exitCode = 7"], {
+    encoding: "utf8", env: { PATH: process.env.PATH, LC_ALL: "C" },
+  });
+  assert.equal(result.status, 7, result.stderr);
+  const metrics = parseTimeReport(result.stderr);
+  assert.ok(metrics.maxResidentSetBytes > 0);
+  for (const key of ["realSeconds", "userSeconds", "sysSeconds"]) {
+    assert.ok(Number.isFinite(metrics[key]) && metrics[key] >= 0, key);
+  }
+  if (process.platform === "linux") assert.equal(metrics.peakMemoryFootprintBytes, null);
+});
+
 test("matrix adapter actual refresh and guard children receive identical matrix settings and resource env", async () => {
   const { parseArguments, runRefresh, guardProbe, refreshMeasurementIdentity } = await import("./measure-local.mjs");
   const dir = mkdtempSync(join(tmpdir(), "matrix-launch-test-"));
@@ -594,6 +631,11 @@ nodeOptions:process.env.NODE_OPTIONS??null}));`, { mode: 0o700 });
     const refresh = await runRefresh({ ...common, outDir: dir, label: "synthetic-refresh" });
     const guard = await guardProbe({ ...common, waitMs: 5_000 });
     assert.equal(refresh.exitCode, 0, readFileSync(join(dir, "synthetic-refresh.stderr.txt"), "utf8"));
+    assert.ok(refresh.time.maxResidentSetBytes > 0);
+    for (const key of ["realSeconds", "userSeconds", "sysSeconds"]) {
+      assert.ok(Number.isFinite(refresh.time[key]) && refresh.time[key] >= 0, key);
+    }
+    if (process.platform === "linux") assert.equal(refresh.time.peakMemoryFootprintBytes, null);
     assert.equal(guard.exitCode, 0);
     assert.equal(guard.outcome, "exited");
     assert.deepEqual(refresh.receipt, guard.receipt);

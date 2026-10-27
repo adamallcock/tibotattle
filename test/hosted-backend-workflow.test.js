@@ -55,18 +55,30 @@ const NODE_PLAN = Object.freeze({
   "postgres-17-suite": Object.freeze([IMAGE_NODE, TOOLCHAIN_NODE]),
   "activation-producer-postgres-17": Object.freeze([TOOLCHAIN_NODE]),
 });
-// The Worker gate checks out depth 1. The Cloud Run check runs the cutover
+// The Worker gate reads pinned vendored source and facade commits. The Cloud
+// Run check runs the cutover
 // seal check, which reads pinned commits (the restore-base generator commit
 // and the Cloudflare production line) as git objects and fails as an
 // environment gap without them. The PostgreSQL 17 suite runs the
 // READ-EXPANSION specs, which `git archive` their pinned base commit
-// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). Both need full history.
+// (scripts/gcp-read-expansion-ab.mjs DEFAULT_BASE). All three need full history.
 const FETCH_DEPTH = Object.freeze({
-  "worker-gate": 1,
+  "worker-gate": 0,
   "cloud-run-check": 0,
   "postgres-17-suite": 0,
   "activation-producer-postgres-17": 1,
 });
+const WORKER_ZSH_STEP = Object.freeze({
+  name: "Install zsh for the production-tier caller checks",
+  run: "set -euo pipefail\nsudo apt-get update\nsudo apt-get install --yes --no-install-recommends zsh\nzsh --version\n",
+});
+const isWorkerZshStep = (step) => JSON.stringify(step) === JSON.stringify(WORKER_ZSH_STEP);
+function workerZshReady(workflow) {
+  const steps = workflow.jobs["worker-gate"].steps;
+  const prerequisites = steps.filter(isWorkerZshStep);
+  return prerequisites.length === 1
+    && steps.indexOf(prerequisites[0]) < steps.findIndex((step) => step.run === "npm --prefix apps/worker run check");
+}
 const INSTALL_COMMANDS = Object.freeze(["npm --prefix apps/worker ci", "npm --prefix apps/worker/cloud-run ci"]);
 // The components of gcp:production-tooling:local-check. The first is split: its
 // offline half runs inside the Cloud Run check and its PostgreSQL-backed spec in
@@ -259,6 +271,27 @@ test("hosted-backend is read-only: contents read, no secrets, no environments, p
       NODE_PLAN[id],
       `${id} installs exactly its reviewed Node.js versions, in order`,
     );
+  }
+});
+
+test("the Worker gate requires a working zsh before its production-tier caller tests", async () => {
+  const { workflow } = await loadWorkflow();
+  assert.equal(workerZshReady(workflow), true);
+  for (const mutate of [
+    (steps, index) => steps.splice(index, 1),
+    (steps, index) => steps.push(structuredClone(steps[index])),
+    (steps, index) => { steps[index].if = "false"; },
+    (steps, index) => { steps[index]["continue-on-error"] = true; },
+    (steps, index) => { steps[index].run = steps[index].run.replace("set -euo pipefail\n", ""); },
+    (steps, index) => { steps[index].run = steps[index].run.replace("sudo apt-get update\n", ""); },
+    (steps, index) => { steps[index].run = steps[index].run.replace(" zsh\n", " zsh || true\n"); },
+    (steps, index) => { steps[index].run = steps[index].run.replace("zsh --version\n", ""); },
+    (steps, index) => steps.push(...steps.splice(index, 1)),
+  ]) {
+    const copy = structuredClone(workflow);
+    const steps = copy.jobs["worker-gate"].steps;
+    mutate(steps, steps.findIndex(isWorkerZshStep));
+    assert.equal(workerZshReady(copy), false);
   }
 });
 
