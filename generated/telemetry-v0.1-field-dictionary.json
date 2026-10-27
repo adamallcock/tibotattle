@@ -14,7 +14,7 @@
     {
       "schemaName": "activity-marker.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/activity-marker.schema.json",
-      "schemaSha256": "3e6db5204d174d0cc01cade736ea3243535c31514d54f0a521e6920f9f6ba20c",
+      "schemaSha256": "85397d2fd1d1532c698708a7a02b21041c7d93131a5500eb29d57c7521e3e21e",
       "propertyCount": 9
     },
     {
@@ -38,13 +38,13 @@
     {
       "schemaName": "quota-snapshot.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/quota-snapshot.schema.json",
-      "schemaSha256": "2d426427ae33087cb52f1f7aa12497200ee758d24f7974e20329a90c2199246b",
+      "schemaSha256": "a0c14c1e3f20f85ceb50f0f0d0353a7a5bf16e0ce0c06d7e36c1bedd9a79f31a",
       "propertyCount": 18
     },
     {
       "schemaName": "usage-event.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
-      "schemaSha256": "43693e9cbce396e451d918e129c54de91e0059250e937c5a533b898b7b21aed0",
+      "schemaSha256": "f00097c435535ffedc78247549e4532a3f6b313c7421acdd8c520ec6688a07ea",
       "propertyCount": 40
     }
   ],

@@ -29,6 +29,20 @@ describe("shared telemetry contract adapter parity", () => {
     )).toEqual(v01);
   });
 
+  it("accepts current reviewed plan names while the frozen v0.2 adapter rejects them", () => {
+    for (const planType of ["promax", "sci", "sci_plus"]) {
+      const current = telemetryV01Golden();
+      (current.quotaSnapshots as Array<Record<string, unknown>>)[0]!.planType = planType;
+      (current.activityMarkers as Array<Record<string, unknown>>)[0]!.planType = planType;
+      expect(validateTelemetryContribution(current)).toBe(current);
+      for (const field of ["quotaSnapshots", "activityMarkers"] as const) {
+        const frozen = telemetryV02Golden();
+        (frozen[field] as Array<Record<string, unknown>>)[0]!.planType = planType;
+        expect(() => validateTelemetryContributionV02(frozen)).toThrow(ApiError);
+      }
+    }
+  });
+
   it("preserves legacy 43-character telemetry IDs through the shared package", () => {
     const legacy = telemetryV02LegacyIdGolden();
     const validated = validateTelemetryContributionV02(legacy);

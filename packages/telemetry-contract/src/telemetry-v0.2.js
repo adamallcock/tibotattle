@@ -2,6 +2,7 @@ import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   MAX_TELEMETRY_BROWSER_BYTES,
+  TELEMETRY_V02_PLAN_TYPES,
 } from "./constants.js";
 import {
   isTelemetryContractError,
@@ -213,6 +214,13 @@ function canonicalTelemetryContributionV01Validated(
     activityMarkers: value.activityMarkers.map(stripV02Activity),
     accounting,
   };
+  // The current local validator may recognize plans added after v0.2 froze.
+  // Enforce the predecessor vocabulary at the existing canonical-validation
+  // boundary so invalid-plan diagnostics keep their historical classification.
+  if (canonical.quotaSnapshots.some((row) => !isTelemetryMember(row.planType, TELEMETRY_V02_PLAN_TYPES))
+      || canonical.activityMarkers.some((row) => !isTelemetryMember(row.planType, TELEMETRY_V02_PLAN_TYPES))) {
+    telemetryContractFailure("TELEMETRY_RECORD_INVALID", "canonical_v01_invalid");
+  }
   parseTelemetryContribution(canonical, options);
   return canonical;
 }

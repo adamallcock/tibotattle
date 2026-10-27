@@ -20,6 +20,9 @@ impl KnownPlan {
             Self::Edu => "Edu",
             Self::EduPlus => "Edu Plus",
             Self::EduPro => "Edu Pro",
+            Self::ProMax => "Pro (Max)",
+            Self::Sci => "Academic Researchers",
+            Self::SciPlus => "Academic Researchers Plus",
         }
     }
 
@@ -41,6 +44,9 @@ impl KnownPlan {
             Self::Edu => "edu",
             Self::EduPlus => "edu_plus",
             Self::EduPro => "edu_pro",
+            Self::ProMax => "promax",
+            Self::Sci => "sci",
+            Self::SciPlus => "sci_plus",
         }
     }
 }

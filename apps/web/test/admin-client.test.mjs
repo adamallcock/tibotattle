@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
-  ADMIN_MODEL_CONFIG, LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION, LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
 } from "../public/telemetry-shared.generated.js";
 import {
@@ -1706,6 +1706,34 @@ test("every admin preview basis reads the exact live 43-model catalog without re
   }
 });
 
+
+test("current Terra catalog and both frozen predecessor headers keep their own coverage", () => {
+  const catalogs = [
+    [SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42), "reviewed-model-catalog-2026-09-23.1"],
+    [SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION],
+    [ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION],
+  ];
+  for (const [index, [models, version]] of catalogs.entries()) {
+    const input = createAdminPro20PromaxAllowancePreviewPayload();
+    input.models.modelConfig = models;
+    for (const day of input.models.days) day.catalogVersion = version;
+    const before = JSON.stringify(input), projected = projectAdminAllowancePreview(input);
+    assert.equal(projected.models.modelConfig.length, 42 + index);
+    assert.deepEqual(projected.models.modelConfig, models);
+    assert.deepEqual(projected.days, input.days);
+    assert.equal(projected.models.days[0].catalogVersion, version);
+    if (index === 1) assert.equal("gpt-6.1-terra" in projected.models.days[0].byModel, false);
+    for (const [, newerVersion] of catalogs.slice(index + 1)) {
+      const crossed = structuredClone(input); crossed.models.days[0].catalogVersion = newerVersion;
+      assert.throws(() => projectAdminAllowancePreview(crossed), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+    }
+    assert.equal(JSON.stringify(input), before);
+  }
+  const current = createAdminPro20PromaxAllowancePreviewPayload();
+  current.models.days[0].values.push(["gpt-6.1-terra", 123.45, 1]);
+  assert.deepEqual(projectAdminAllowancePreview(current).models.days[0].byModel["gpt-6.1-terra"],
+    { capacityUsd: 123.45, participantCount: 1 });
+});
 
 test("admin preview v0.5 (Pro 20x, Pro Max x0.8) dispatches exactly and refuses crossed v0.3/v0.4 claims", () => {
   const payload = createAdminPro20PromaxAllowancePreviewPayload();

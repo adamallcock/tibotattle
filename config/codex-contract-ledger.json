@@ -126,6 +126,27 @@
       "displayName": "Edu Pro",
       "lifecycle": "active",
       "firstReviewedOn": "2026-08-25"
+    },
+    {
+      "displayName": "Pro (Max)",
+      "firstReviewedOn": "2026-09-24",
+      "lifecycle": "active",
+      "note": "The raw value and display name are verified in official openai/codex commit fea1d7f7d163521a868c344527da79ba0efc146d. Reviewed ChatGPT-bundled and PATH codex-cli 0.160.0 generate promax in PlanType. This Edge line retains its existing three-plan allowance policy; no promax normalization is assigned.",
+      "rawValue": "promax"
+    },
+    {
+      "displayName": "Academic Researchers",
+      "firstReviewedOn": "2026-10-26",
+      "lifecycle": "active",
+      "note": "Raw value and display name are verified in official openai/codex commit fea1d7f7d163521a868c344527da79ba0efc146d and installed ChatGPT-bundled codex-cli 0.164.0-alpha.11.1. Provider allowance capacity, multipliers and window semantics remain unverified; no personal-plan normalization is assigned.",
+      "rawValue": "sci"
+    },
+    {
+      "displayName": "Academic Researchers Plus",
+      "firstReviewedOn": "2026-10-26",
+      "lifecycle": "active",
+      "note": "Raw value and display name are verified in official openai/codex commit fea1d7f7d163521a868c344527da79ba0efc146d and installed ChatGPT-bundled codex-cli 0.164.0-alpha.11.1. Provider allowance capacity, multipliers and window semantics remain unverified; no personal-plan normalization is assigned.",
+      "rawValue": "sci_plus"
     }
   ],
   "marketingSeats": [

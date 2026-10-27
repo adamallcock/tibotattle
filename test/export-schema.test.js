@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fc from "fast-check";
+import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import { exportRegistrySnapshot } from "../src/export/index.js";
 import { exportSchemas, validateExportRecord } from "../src/export-schema.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
@@ -133,6 +134,19 @@ test("allowlist schema accepts a valid usage event and rejects unknown nested fi
   assert.equal(result.valid, false);
   assert.ok(result.errors.some((error) => error.keyword === "additionalProperties"));
   assert.equal(JSON.stringify(result.errors).includes("private"), false);
+});
+
+test("local quota and activity schemas preserve every reviewed plan and reject unreviewed names", () => {
+  for (const [kind, makeRecord] of [["quotaSnapshot", quotaSnapshot], ["activityMarker", activityMarker]]) {
+    for (const planType of TELEMETRY_PLAN_TYPES) {
+      const value = { ...makeRecord(), planType };
+      assert.equal(validateExportRecord(kind, value).valid, true, `${kind}: ${planType}`);
+      assert.equal(value.planVariant, "unknown");
+    }
+    for (const planType of ["sci-plus", "academic_researchers", "future_plan"]) {
+      assert.equal(validateExportRecord(kind, { ...makeRecord(), planType }).valid, false);
+    }
+  }
 });
 
 test("date-time fields reject calendar normalization and invalid UTC components", () => {

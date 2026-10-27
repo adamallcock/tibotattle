@@ -1054,6 +1054,13 @@ test("installer-only receipts regenerate complete bundles and repeat all publica
   execFileSync("/usr/bin/git", ["clone", "--quiet", "--no-hardlinks", repository, checkout]);
   git(checkout, ["config", "user.email", "test@example.invalid"]);
   git(checkout, ["config", "user.name", "Installer proof test"]);
+  // The receipt predecessor is a synthetic web-only change. The repository's
+  // current HEAD may be an integration, desktop or backend commit and must not
+  // decide whether this isolated installer-only proof fixture is admissible.
+  const predecessorPage = join(checkout, "apps/web/public/community.html");
+  await writeFile(predecessorPage, `${await readFile(predecessorPage, "utf8")}\n<!-- synthetic predecessor -->\n`);
+  git(checkout, ["add", "apps/web/public/community.html"]);
+  git(checkout, ["commit", "--quiet", "-m", "Synthetic web-only predecessor"]);
   const baseCommit = git(checkout, ["rev-parse", "HEAD"]);
   const controls = ["scripts/web-release-lane.js", "scripts/prepare-web-release.js", "test/web-release-lane.test.js",
     "docs/runbooks/2026-08-17-web-only-release.md"];

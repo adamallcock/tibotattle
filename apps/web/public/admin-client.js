@@ -1,6 +1,8 @@
 import {
   ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG,
+  SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   expandAdminModelHistoryDay,
 } from "./telemetry-shared.generated.js";
 
@@ -46,6 +48,7 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
 ]);
 const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
+const SEPTEMBER23_ADMIN_MODEL_CONFIG = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42));
 const ADMIN_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const ADMIN_ALLOWANCE_PREVIEW_CONTRACTS = Object.freeze({
@@ -726,14 +729,20 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
     invalid(code);
   }
   const suppliedModels = array(models.modelConfig, code);
-  const expectedModels = suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
-    ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_ALLOWANCE_PREVIEW_MODELS;
+  const expectedModels = suppliedModels.length === ADMIN_ALLOWANCE_PREVIEW_MODELS.length
+    ? ADMIN_ALLOWANCE_PREVIEW_MODELS : suppliedModels.length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length
+      ? SEPTEMBER29_ADMIN_MODEL_CONFIG : suppliedModels.length === SEPTEMBER23_ADMIN_MODEL_CONFIG.length
+        ? SEPTEMBER23_ADMIN_MODEL_CONFIG : null;
+  if (expectedModels === null) invalid(code);
+  const september23Catalog = expectedModels === SEPTEMBER23_ADMIN_MODEL_CONFIG;
+  const historicalCatalog = expectedModels !== ADMIN_ALLOWANCE_PREVIEW_MODELS;
   const modelConfig = suppliedModels.map((entry, index) => {
     const model = record(entry, code);
     const expected = expectedModels[index];
     if (!expected
         || model.modelId !== expected.modelId
         || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
+        || (september23Catalog && model.label !== expected.label)
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
@@ -749,7 +758,9 @@ function projectAllowanceModels(value, latestAllowedDay, modelBasis) {
     const dayValue = calendarDay(day.day, code);
     if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
     previousDay = dayValue;
-    if (day.catalogVersion === undefined) invalid(code);
+    if (day.catalogVersion === undefined
+        || (historicalCatalog && day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)
+        || (september23Catalog && day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION)) invalid(code);
     const projected = expandAdminModelHistoryDay(day);
     if (projected === null
         || projected.values.some(([modelId]) => !modelConfig.some(model => model.modelId === modelId))) invalid(code);
