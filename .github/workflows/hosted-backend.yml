@@ -7,10 +7,7 @@ name: Hosted backend
 # environment profile, including the edge end-to-end spec.
 # The canonical Worker check is partitioned into two native whole-file Vitest
 # shards, analytics (with its vendor prerequisite), and all remaining commands
-# in their canonical order. Cloud Run, PostgreSQL and the focused producer finish
-# before the Worker partitions; analytics runs after those partitions. These
-# phase barriers preserve every command and budget, and can lengthen the run.
-# Worker gate requires every partition to pass.
+# in their canonical order. Worker gate requires every partition to pass.
 #
 # PostgreSQL 17 is the official postgres image pinned by digest in
 # apps/worker/scripts/ci-postgres-container.mjs, run as the runner uid with a
@@ -107,137 +104,14 @@ jobs:
     name: Worker shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # Start Worker partitions after the other backend execution jobs finish.
-    # Upstream failures still collect coverage; cancellation stops later phases.
-    if: always() && !cancelled()
-    needs:
-      - cloud-run-check
-      - postgres-17-suite
-      - activation-producer-postgres-17
     strategy:
       fail-fast: false
       matrix:
         shard:
           - vitest-1
           - vitest-2
-          - checks
-    env:
-      WRANGLER_SEND_METRICS: "false"
-      WORKER_SUITE_SHARD: "${{ matrix.shard }}"
-    steps:
-      - name: Check out the selected revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install pinned Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 26.2.0
-          check-latest: false
-          package-manager-cache: false
-
-      # gcp:fastpath:scripts-check executes the maintained production-tier
-      # caller's zsh functions, including its signal and cleanup behavior.
-      - name: Install zsh for the production-tier caller checks
-        if: matrix.shard == 'checks'
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends zsh
-          zsh --version
-
-      # gcp:fastpath:scripts-check, run by the Worker gate, imports Cloud Run host
-      # modules, so this job needs the Cloud Run lockfile as well.
-      - name: Install locked root, Worker and Cloud Run dependencies
-        run: |
-          set -euo pipefail
-          npm install --global corepack@0.34.0 --force --ignore-scripts
-          corepack enable
-          corepack prepare pnpm@11.9.0 --activate
-          test "$(node --version)" = "v26.2.0"
-          test "$(pnpm --version)" = "11.9.0"
-          pnpm install --frozen-lockfile --ignore-scripts
-          npm --prefix apps/worker ci
-          npm --prefix apps/worker/cloud-run ci
-
-      - name: Create the private PostgreSQL socket root
-        run: |
-          set -euo pipefail
-          sudo mkdir -p /private/tmp
-          sudo chmod 1777 /private/tmp
-
-      - name: Start PostgreSQL 17 and export the SOCKET profile
-        run: node apps/worker/scripts/ci-postgres-container.mjs --export-socket-profile
-
-      - name: Check this workflow's contract, migration numbering and suite routing
-        run: node --test test/hosted-backend-workflow.test.js apps/worker/scripts/migration-numbering.check.mjs apps/worker/scripts/ci-postgres-suite.check.mjs apps/worker/scripts/ci-worker-suite.check.mjs
-
-      # deploy:dry and staging:check stage production assets from a generated
-      # public release site. Build one locally from the checked-out source with a
-      # synthetic 1200x630 card; it is bundled by the dry run and never published.
-      - name: Build a synthetic public release site for the dry-run asset stage
-        run: |
-          set -euo pipefail
-          social_card="$RUNNER_TEMP/hosted-backend-social-card.png"
-          node --input-type=module --eval '
-            import { crc32, deflateSync } from "node:zlib";
-            import { writeFileSync } from "node:fs";
-            function chunk(type, data) {
-              const length = Buffer.alloc(4);
-              length.writeUInt32BE(data.length);
-              const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
-              const crc = Buffer.alloc(4);
-              crc.writeUInt32BE(crc32(body) >>> 0);
-              return Buffer.concat([length, body, crc]);
-            }
-            const width = 1200;
-            const height = 630;
-            const header = Buffer.alloc(13);
-            header.writeUInt32BE(width, 0);
-            header.writeUInt32BE(height, 4);
-            header[8] = 8;
-            writeFileSync(process.argv[1], Buffer.concat([
-              Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-              chunk("IHDR", header),
-              chunk("IDAT", deflateSync(Buffer.alloc((width + 1) * height))),
-              chunk("IEND", Buffer.alloc(0)),
-            ]));
-          ' "$social_card"
-          node scripts/build-public-release-site.js \
-            --output "$GITHUB_WORKSPACE/.release-build/public-release-site" \
-            --site-url https://tibotattle.com/ \
-            --release-notes-url https://tibotattle.com/docs.html \
-            --privacy-url https://tibotattle.com/privacy.html \
-            --security-url https://tibotattle.com/docs.html \
-            --support-url https://tibotattle.com/docs.html \
-            --social-image "$social_card" > /dev/null
-
-      - name: Run the canonical Worker partition
-        run: node apps/worker/scripts/ci-worker-suite.mjs --shard "$WORKER_SUITE_SHARD"
-
-      - name: Stop PostgreSQL 17
-        if: always()
-        run: node apps/worker/scripts/ci-postgres-container.mjs --stop
-
-  worker-analytics:
-    name: Worker shard (${{ matrix.shard }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    # Run this phase after the other backend execution jobs, including failures.
-    # Cancellation still stops it; commands, setup and limits stay unchanged.
-    if: always() && !cancelled()
-    needs:
-      - worker-gate
-      - cloud-run-check
-      - postgres-17-suite
-      - activation-producer-postgres-17
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
           - analytics
+          - checks
     env:
       WRANGLER_SEND_METRICS: "false"
       WORKER_SUITE_SHARD: "${{ matrix.shard }}"
@@ -345,13 +219,11 @@ jobs:
     if: always()
     needs:
       - worker-gate
-      - worker-analytics
     env:
       WORKER_SUITE_RESULT: "${{ needs.worker-gate.result }}"
-      WORKER_ANALYTICS_RESULT: "${{ needs.worker-analytics.result }}"
     steps:
       - name: Require every canonical Worker partition to pass
-        run: test "$WORKER_SUITE_RESULT" = success && test "$WORKER_ANALYTICS_RESULT" = success
+        run: test "$WORKER_SUITE_RESULT" = success
 
   cloud-run-check:
     name: Cloud Run check
