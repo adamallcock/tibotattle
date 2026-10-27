@@ -160,9 +160,7 @@ function makeUsage(owner: ReturnType<typeof syntheticOwner>, index: number, at: 
 
 function makeUnknownScopeUsage(owner: ReturnType<typeof syntheticOwner>, index: number, at: number,
   provider: string, modelId: string, sessionUuid: string): EffectiveTelemetryOccurrence {
-  const base = usage(owner, index, at) as EffectiveTelemetryOccurrence;
-  const record = {
-    ...JSON.parse(base.recordJson!),
+  return usage(owner, index, at, {
     provider,
     modelId,
     sessionUuid,
@@ -173,8 +171,7 @@ function makeUnknownScopeUsage(owner: ReturnType<typeof syntheticOwner>, index: 
       planType: "unknown",
       planEraId: null,
     },
-  };
-  return occurrence(owner, "usage", at, base.occurrenceId, record) as EffectiveTelemetryOccurrence;
+  }) as EffectiveTelemetryOccurrence;
 }
 
 function makeQuota(owner: ReturnType<typeof syntheticOwner>, index: number, at: number, usedPercent: number,
