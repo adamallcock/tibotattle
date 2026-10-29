@@ -2091,7 +2091,8 @@
         "test/electron-windows-normal-candidate.test.js",
         "scripts/smoke-electron-windows-signed-installed.mjs",
         "scripts/smoke-electron-windows-final-upgrade.mjs",
-        "test/electron-windows-normal-candidate-archive.test.mjs"
+        "test/electron-windows-normal-candidate-archive.test.mjs",
+        "test/electron-windows-final-upgrade.test.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
