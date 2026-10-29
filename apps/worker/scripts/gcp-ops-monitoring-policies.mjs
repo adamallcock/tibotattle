@@ -48,10 +48,11 @@
  *                                  is the larger of the two: about 25 h for a
  *                                  daily trigger. DECIDED: the owner accepted
  *                                  that delay for a daily trigger, with no
- *                                  probe job (round 11, 2026-10-02). One
- *                                  condition per trigger; a trigger that has
- *                                  no cadence yet or is committed PAUSED drops
- *                                  only its own condition (deferredConditions).
+ *                                  probe job (round 11, 2026-10-02). Per-trigger
+ *                                  expressions share one PromQL condition; a
+ *                                  trigger with no cadence yet or committed
+ *                                  PAUSED drops only its own expression
+ *                                  (deferredConditions).
  *                                  The operator's exact check stays
  *                                  `gcp-infra.mjs scheduler-probe`.
  *   origin-lock            page    an unauthenticated uptime check of the
