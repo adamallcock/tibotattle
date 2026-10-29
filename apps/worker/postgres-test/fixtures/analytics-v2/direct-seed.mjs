@@ -198,7 +198,8 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     if (!/^[a-z_][a-z0-9_]{0,62}$/u.test(name)) throw new Error("fixture_table_invalid");
     return `${quoted}."${name}"`;
   };
-  const q = (text, values = []) => pool.query(text, values);
+  let boundaryClient = null;
+  const q = (text, values = []) => (boundaryClient ?? pool).query(text, values);
   let nextId = 1_000;
   const id = () => ++nextId;
 
@@ -612,7 +613,7 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
    * staged, then the manifest is made ready. `head` makes it the participant's
    * head, which fires the 0055 owner bridge (owner link, receipt, journal row).
    */
-  async function v12Generation({ participantId, deviceId, name, days, head }) {
+  async function v12Generation({ participantId, deviceId, name, days, head, batchUsage = false }) {
     const generationId = uuid(`v12-generation:${name}`);
     const fingerprint = digest(`v12-fingerprint:${name}`);
     const token = digest(`v12-token:${name}`);
@@ -651,16 +652,28 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
           VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,'synthetic-analytics-v2',$11,$12,$13,$14)`,
         [chunk.rowId, manifestId, participantId, deviceId, chunk.stream, entry.day, index, chunk.chunkId,
           chunk.chunkDigest, upload.envelope, chunk.declaredCount, upload.objectKey, upload.authorizationId, ISSUED]);
+        // The real expansion boundary uses production's <=200-parent INSERT,
+        // followed by the separate usage-child INSERT. Retain the existing
+        // values and allocation order; all row admission guards still run.
+        if (batchUsage && (chunk.stream !== "usage" || chunk.records.length < 1 || chunk.records.length > 200)) {
+          throw new Error("fixture_boundary_chunk_invalid");
+        }
+        const parentRows = [];
+        const usageRows = [];
+        const insert = async (rows, text, values) => {
+          if (batchUsage) rows.push({ text, values });
+          else await q(text, values);
+        };
         for (const [recordIndex, fields] of chunk.records.entries()) {
           const recordId = id();
-          await q(`INSERT INTO ${table("telemetry_v12_typed_records")}(
+          await insert(parentRows, `INSERT INTO ${table("telemetry_v12_typed_records")}(
               id,chunk_id,manifest_id,stream,record_index,occurrence_id,observed_at_ms,observed_day,provider_id,
               canonical_digest) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [recordId, chunk.rowId, manifestId, chunk.stream, recordIndex, Buffer.from(fields.occurrenceId),
             fields.observedAtMs, fields.observedDay, await dict(fields.provider), Buffer.from(fields.canonicalDigest)]);
           if (chunk.stream === "usage") {
             const usage = fields.usage;
-            await q(`INSERT INTO ${table("telemetry_v12_typed_usage")}(
+            await insert(usageRows, `INSERT INTO ${table("telemetry_v12_typed_usage")}(
                 record_id,session_id,model_id,speed_mode_id,api_service_tier_id,surface_id,billing_surface_id,
                 reasoning_effort_id,agent_scope_id,outcome_id,attribution_id,total_input_context_tokens,
                 input_uncached_tokens,input_cache_read_tokens,input_cache_write_tokens,output_text_tokens,
@@ -687,6 +700,19 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
               await q(`INSERT INTO ${table("telemetry_v12_typed_session_tools")}(record_id,tool_class_id,count)
                 VALUES ($1,$2,$3)`, [recordId, await dict(tool), count]);
             }
+          }
+        }
+        if (batchUsage) {
+          for (const rows of [parentRows, usageRows]) {
+            const { text, values } = rows[0];
+            const split = text.indexOf("VALUES ");
+            if (split < 0 || rows.some((row) => row.text !== text || row.values.length !== values.length)) {
+              throw new Error("fixture_boundary_insert_invalid");
+            }
+            const tuple = text.slice(split + "VALUES ".length);
+            await q(text.slice(0, split) + "VALUES " + rows.map((_, rowIndex) =>
+              tuple.replace(/\$(\d+)/gu, (_, ordinal) => `$${rowIndex * values.length + Number(ordinal)}`)).join(","),
+            rows.flatMap((row) => row.values));
           }
         }
       }
@@ -1043,7 +1069,8 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
     const records = Array.from({ length: 200 }, (_, index) => usageRecord(format,
       `event:v2:${digest(`occurrence:${name}:${index}`)}`,
       new Date(Date.parse(`${D1}T00:00:00.000Z`) + 1000 + index).toISOString()));
-    async function addSource(index) {
+    let boundaryFailed = false;
+    async function addSourceRows(index) {
       const deviceName = `${name}-${index}`;
       const deviceId = await socialDevice(participantId, deviceName, { v12: format === "v12" });
       const batch = index === 200 ? records.slice(0, 1) : records;
@@ -1051,9 +1078,47 @@ export async function seedAnalyticsV2Fixture({ pool, schema, modules, correction
         await v1Chunk({ participantId, deviceId, ownerDigest, stream: "usage", day: D1, records: batch });
       } else {
         await v12Generation({ participantId, deviceId, name: deviceName,
-          days: [{ day: D1, chunks: [{ stream: "usage", records: batch }] }], head: index === 0 });
+          days: [{ day: D1, chunks: [{ stream: "usage", records: batch }] }], head: index === 0,
+          batchUsage: true });
       }
       return deviceId;
+    }
+    async function addSource(index) {
+      if (format !== "v12") return addSourceRows(index);
+      if (boundaryFailed) throw new Error("fixture_boundary_failed");
+      const client = await pool.connect();
+      let committed = false;
+      let discard = true;
+      let operationFailed = false;
+      try {
+        boundaryClient = client;
+        // This fixture source has exactly one chunk. Keep its complete
+        // admission and publication on one connection, as production does.
+        await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+        discard = false;
+        const result = await addSourceRows(index);
+        discard = true;
+        await client.query("COMMIT");
+        committed = true;
+        discard = false;
+        return result;
+      } catch (error) {
+        operationFailed = true;
+        // Failed fixture allocation maps must never be reused by a retry.
+        boundaryFailed = true;
+        if (!committed) {
+          try { await client.query("ROLLBACK"); }
+          catch { discard = true; }
+        }
+        throw error;
+      } finally {
+        boundaryClient = null;
+        try { client.release(discard); }
+        catch (error) {
+          boundaryFailed = true;
+          if (!operationFailed) throw error;
+        }
+      }
     }
     for (let index = 0; index < 200; index += 1) await addSource(index);
     let enabled = false;

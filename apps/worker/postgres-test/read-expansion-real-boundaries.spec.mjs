@@ -141,6 +141,18 @@ for (const family of ["legacy", "v12"]) {
       const diagnostics = boundaryDiagnostics(family);
       const poolQuery = pool.query;
       pool.query = (...args) => diagnostics.query(pool, poolQuery, args);
+      // The boundary fixture checks out one transaction client per source.
+      // Meter it here; the reader's client retains its explicit meter below.
+      const seedPool = {
+        query: (...args) => pool.query(...args),
+        connect: async () => {
+          const client = await pool.connect();
+          return {
+            query: (...args) => diagnostics.query(client, client.query, args),
+            release: (...args) => client.release(...args),
+          };
+        },
+      };
       const schema = `readexp_boundary_${randomBytes(6).toString("hex")}`;
       let vite;
       let readers;
@@ -163,7 +175,7 @@ for (const family of ["legacy", "v12"]) {
             sha256Hex: (await vite.ssrLoadModule("/src/crypto.ts")).sha256Hex,
           };
         });
-        const { boundary } = await diagnostics.stage("seed", () => seedAnalyticsV2Fixture({ pool, schema, modules,
+        const { boundary } = await diagnostics.stage("seed", () => seedAnalyticsV2Fixture({ pool: seedPool, schema, modules,
           correctionRuntime: "staged", expansionBoundary: family }));
         assert.equal(boundary.occurrenceIds.length, 200);
         await diagnostics.stage("analyze", async () => {
@@ -237,3 +249,124 @@ for (const family of ["legacy", "v12"]) {
       }
     });
 }
+
+// This pool models transaction ownership/failure only. The two tests above
+// retain the real PostgreSQL guards, codecs, populations and 600-second limit.
+test("v12 boundary fixture batches sources and refuses reuse after transaction failure", { timeout: 30_000 }, async () => {
+  const vite = await createServer({ root, configFile: false, plugins: config.plugins, resolve: config.resolve,
+    logLevel: "error", server: { middlewareMode: true, hmr: false, watch: null }, appType: "custom" });
+  try {
+    const v12codec = await vite.ssrLoadModule("/src/telemetry-v12-typed-codec.ts");
+    const encoded = new Map();
+    const modules = {
+      codec: await vite.ssrLoadModule("/src/typed-telemetry-codec.ts"),
+      v12codec: { ...v12codec, async encodeTelemetryV12Record(stream, record, hash) {
+        // The same 200 synthetic records recur across independent devices.
+        // Codec execution itself is covered by the real PostgreSQL tests.
+        const key = JSON.stringify([stream, record]);
+        if (!encoded.has(key)) encoded.set(key, await v12codec.encodeTelemetryV12Record(stream, record, hash));
+        return encoded.get(key);
+      } },
+      reconciliation: await vite.ssrLoadModule("/src/telemetry-usage-reconciliation.ts"),
+      sha256Hex: (await vite.ssrLoadModule("/src/crypto.ts")).sha256Hex,
+    };
+    function harness(fault = {}) {
+      const transactions = [];
+      const primaryError = new Error("synthetic admission failure");
+      const releaseError = new Error("synthetic release failure");
+      let active = null;
+      let calls = 0;
+      const query = async (client, text, values = []) => {
+        calls += 1;
+        if (active !== null) assert.equal(client, active, "all fixture writes use the transaction's client");
+        if (text.startsWith("BEGIN")) {
+          assert.equal(text, "BEGIN ISOLATION LEVEL READ COMMITTED");
+          active = client;
+          client.transaction = { events: ["begin"], parentIds: [], releases: [] };
+          transactions.push(client.transaction);
+        }
+        const current = client?.transaction;
+        if (active !== null && text.startsWith("INSERT INTO ") && text.includes('."telemetry_v12_typed_records"')) {
+          if (fault.parent) throw primaryError;
+          const rows = values.length / 10;
+          assert.ok(Number.isInteger(rows) && rows >= 1 && rows <= 200);
+          const placeholders = [...text.slice(text.indexOf("VALUES ")).matchAll(/\$(\d+)/gu)].map((match) => Number(match[1]));
+          assert.deepEqual(placeholders, Array.from({ length: values.length }, (_, index) => index + 1));
+          assert.deepEqual(Array.from({ length: rows }, (_, index) => values[index * 10 + 4]),
+            Array.from({ length: rows }, (_, index) => index));
+          current.parentIds = Array.from({ length: rows }, (_, index) => values[index * 10]);
+          current.events.push("parents");
+        }
+        if (active !== null && text.startsWith("INSERT INTO ") && text.includes('."telemetry_v12_typed_usage"')) {
+          assert.equal(current.events.at(-1), "parents");
+          assert.deepEqual([...text.slice(text.indexOf("VALUES ")).matchAll(/\$(\d+)/gu)].map((match) => Number(match[1])),
+            Array.from({ length: values.length }, (_, index) => index + 1));
+          assert.deepEqual(Array.from({ length: values.length / 22 }, (_, index) => values[index * 22]), current.parentIds);
+          current.events.push("children");
+        }
+        if (active !== null && text.startsWith("UPDATE ") && text.includes('."telemetry_v12_day_manifests"')) {
+          assert.equal(current.events.at(-1), "children");
+          current.events.push("ready");
+        }
+        if (text === "COMMIT") {
+          if (fault.commit) throw primaryError;
+          assert.equal(current.events.at(-1), "ready");
+          current.events.push("commit");
+          active = null;
+        }
+        if (text === "ROLLBACK") {
+          current.events.push("rollback");
+          if (fault.rollback) throw new Error("synthetic rollback failure");
+          active = null;
+        }
+        if (text.includes("storage_journal_append") || text.includes("COALESCE(max(sequence)")) return { rows: [{ sequence: "1" }] };
+        if (text.includes("SELECT revision::text")) return { rows: [{ revision: "1", epoch: "0" }] };
+        return { rows: [] };
+      };
+      const pool = {
+        query: (...args) => query(null, ...args),
+        async connect() {
+          const client = { transaction: null, query: (...args) => query(client, ...args), release(discard) {
+            if (!client.transaction) return;
+            client.transaction.releases.push(Boolean(discard));
+            if (fault.release) throw releaseError;
+          } };
+          return client;
+        },
+      };
+      return { pool, transactions, primaryError, releaseError, get calls() { return calls; } };
+    }
+    const seed = (state) => seedAnalyticsV2Fixture({ pool: state.pool, schema: "fixture_contract", modules,
+      correctionRuntime: "staged", expansionBoundary: "v12" });
+    const complete = harness();
+    const fixture = await seed(complete);
+    await fixture.boundary.enableExtraSource();
+    assert.equal(complete.transactions.length, 201);
+    assert.deepEqual(complete.transactions.map((entry) => entry.parentIds.length), [...Array(200).fill(200), 1]);
+    for (const entry of complete.transactions) {
+      assert.deepEqual(entry.events, ["begin", "parents", "children", "ready", "commit"]);
+      assert.deepEqual(entry.releases, [false]);
+    }
+    const failure = {};
+    const released = harness(failure);
+    const failedExtra = await seed(released);
+    failure.release = true;
+    await assert.rejects(failedExtra.boundary.enableExtraSource(), (error) => error === released.releaseError);
+    const callsAfterFailure = released.calls;
+    await assert.rejects(failedExtra.boundary.enableExtraSource(), /fixture_boundary_failed/u);
+    assert.equal(released.calls, callsAfterFailure, "a committed source with failed release cannot be retried");
+    assert.deepEqual(released.transactions.at(-1).releases, [false]);
+    const uncertainCommit = harness({ commit: true });
+    await assert.rejects(seed(uncertainCommit), (error) => error === uncertainCommit.primaryError);
+    assert.deepEqual(uncertainCommit.transactions.at(-1).events, ["begin", "parents", "children", "ready", "rollback"]);
+    assert.deepEqual(uncertainCommit.transactions.at(-1).releases, [true]);
+    for (const rollback of [false, true]) {
+      const failed = harness({ parent: true, rollback, release: true });
+      await assert.rejects(seed(failed), (error) => error === failed.primaryError);
+      assert.deepEqual(failed.transactions.at(-1).events, ["begin", "rollback"]);
+      assert.deepEqual(failed.transactions.at(-1).releases, [rollback]);
+    }
+  } finally {
+    await vite.close();
+  }
+});
