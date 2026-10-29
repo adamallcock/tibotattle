@@ -11,6 +11,8 @@ import {
   validateWindowsFinalUpgradePredecessorManifest, snapshotWindowsFinalUpgradeProfile,
   runWindowsFinalUpgradeContinuity, runWindowsFinalUpgrade,
 } from '../scripts/smoke-electron-windows-final-upgrade.mjs';
+import { WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS as performanceContracts }
+  from '../scripts/smoke-electron-windows-normal-candidate.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const oldRevision = predecessor.sourceRevision, newRevision = 'a'.repeat(40);
@@ -21,23 +23,28 @@ const newIdentity = { ...oldIdentity, sourceRevision: newRevision, artifactSha25
 const expectedJourney = { dashboardRendered: true, localRefreshObserved: true,
   localRefreshTerminal: 'succeeded', syntheticIngestionVerified: true,
   projectsAndThreadsVerified: true, sharingOptOutRetained: true, settingsPersisted: true, cleanQuit: true };
-function fixture(overrides = {}) {
-  const calls = [], profile = { root: String.raw`C:\owned\profile` }, seed = {};
+function fixture(overrides = {}, { selectedPredecessor = predecessor,
+  version = '0.1.27', buildNumber = '2026100301' } = {}) {
+  const calls = [], contracts = [], profile = { root: String.raw`C:\owned\profile` }, seed = {};
   let replaced = false, snapshots = 0;
   const candidateState = { quiescent: true, tracked: null };
-  const previous = { sourceRevision: oldRevision, expectedAsarSha256: oldIdentity.artifactSha256,
+  const selectedOldIdentity = selectedPredecessor === predecessor ? oldIdentity
+    : { ...oldIdentity, sourceRevision: selectedPredecessor.sourceRevision };
+  const previous = { sourceRevision: selectedPredecessor.sourceRevision, version: selectedPredecessor.version,
+    installerSha256: selectedPredecessor.installerSha256, expectedAsarSha256: oldIdentity.artifactSha256,
     expectedExecutableSha256: oldIdentity.executableSha256 };
-  const candidate = { sourceRevision: newRevision, expectedAsarSha256: newIdentity.artifactSha256,
+  const candidate = { sourceRevision: newRevision, version, buildNumber, expectedAsarSha256: newIdentity.artifactSha256,
     expectedExecutableSha256: newIdentity.executableSha256 };
   const deps = {
     verifyPackage: async options => {
-      calls.push(`verify:${options.sourceRevision === oldRevision ? 'old' : 'new'}`);
-      assert.equal(options.sourceRevision, replaced ? newRevision : oldRevision);
-      return replaced ? newIdentity : oldIdentity;
+      calls.push(`verify:${options.sourceRevision === selectedPredecessor.sourceRevision ? 'old' : 'new'}`);
+      assert.equal(options.sourceRevision, replaced ? newRevision : selectedPredecessor.sourceRevision);
+      return replaced ? newIdentity : selectedOldIdentity;
     },
     launchJourney: async options => {
       assert.equal(options.profile, profile);
       calls.push(`launch:${options.changeSettings ? 'seed' : 'retained'}`);
+      contracts.push(options.performanceContract);
       candidateState.quiescent = true;
       candidateState.tracked = [{ pid: replaced ? 201 : 101, creation: 'old-main' },
         { pid: replaced ? 202 : 102, creation: 'old-companion' }];
@@ -54,8 +61,9 @@ function fixture(overrides = {}) {
     },
     ...overrides,
   };
-  return { calls, candidateState, deps, snapshots: () => snapshots,
-    input: { previous, candidate, appPath: String.raw`C:\owned\app\TiboTattle.exe`, profile, seed,
+  return { calls, contracts, candidateState, deps, snapshots: () => snapshots,
+    input: { previous, candidate, predecessorIntake: selectedPredecessor,
+      appPath: String.raw`C:\owned\app\TiboTattle.exe`, profile, seed,
       environment: {}, candidateState, replaceInstaller: async () => {
         assert.equal(candidateState.quiescent, true); calls.push('replace'); replaced = true;
       } } };
@@ -147,6 +155,41 @@ test('one profile spans old rendered state, exact replacement and two new runtim
   assert.equal(receipt.predecessorIdentity, oldIdentity);
   assert.equal(receipt.successorIdentity, newIdentity);
   assert.doesNotMatch(JSON.stringify(receipt), /C:|"pid"|"creation"|old-main|old-companion/u);
+});
+
+test('authenticated release pairs select historical and current timing contracts for every launch', async () => {
+  for (const [selectedPredecessor, version, buildNumber, successorContract] of [
+    [predecessor, '0.1.27', '2026100301', performanceContracts.historical],
+    [predecessor, '0.1.28', '2026100901', performanceContracts.historical],
+    [currentPredecessor, '0.1.29', '2026102601', performanceContracts.current],
+  ]) {
+    const f = fixture({}, { selectedPredecessor, version, buildNumber });
+    await runWindowsFinalUpgradeContinuity(f.input, f.deps);
+    assert.deepEqual(f.contracts, [performanceContracts.historical, successorContract, successorContract]);
+    assert.ok(f.calls.indexOf('launch:seed') < f.calls.indexOf('replace'));
+    assert.ok(f.calls.indexOf('replace') < f.calls.indexOf('launch:retained'));
+  }
+});
+
+test('missing, unadmitted or mismatched release identity cannot select a historical timing contract', async () => {
+  for (const mutate of [
+    input => { delete input.predecessorIntake; },
+    input => { input.predecessorIntake = { ...predecessor, version: '0.1.25' }; },
+    input => { input.predecessorIntake = { ...predecessor, extra: true }; },
+    input => { input.predecessorIntake = currentPredecessor; },
+    input => { input.previous = null; },
+    input => { input.previous.version = '0.1.28'; },
+    input => { input.previous.sourceRevision = '9'.repeat(40); },
+    input => { input.previous.installerSha256 = '9'.repeat(64); },
+    input => { input.candidate.version = '0.1.29'; input.candidate.buildNumber = '2026102601'; },
+    input => { input.candidate.version = '0.1.30'; },
+    input => { input.candidate.buildNumber = '2026102601'; },
+  ]) {
+    const f = fixture(); mutate(f.input);
+    await assert.rejects(runWindowsFinalUpgradeContinuity(f.input, f.deps),
+      /ELECTRON_WINDOWS_FINAL_UPGRADE_(?:PREDECESSOR_INTAKE_INVALID|SUCCESSOR_INTAKE_INVALID|PAIR_INVALID)/u);
+    assert.deepEqual(f.calls, [], 'refuse before verifying, launching or replacing any package');
+  }
 });
 
 test('live predecessor descendants refuse replacement before the installer runs', async () => {
