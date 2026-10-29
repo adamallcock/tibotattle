@@ -1069,7 +1069,7 @@ test("public static routes keep root, community, docs, privacy, and fallback out
   assert.match(root, /id="installer-unavailable-action"[\s\S]*disabled/u);
   assert.match(root, /Public download coming soon\./u);
   assert.equal(community, root, "the community route must use the public entry alias");
-  assert.match(privacy, /<h1>Your dashboard belongs on your device\.<\/h1>/u);
+  assert.match(privacy, /<h1 data-i18n="privacy.page.heading">Your dashboard belongs on your device\.<\/h1>/u);
   assert.match(privacy, /This website cannot read local Codex files\./u);
   assert.doesNotMatch(privacy, /<script\b/iu);
   assert.match(docs, /<h1>TiboTattle, from download to dashboard\.<\/h1>/u);

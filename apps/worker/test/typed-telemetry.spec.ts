@@ -91,6 +91,18 @@ describe("lossless typed telemetry codec", () => {
     expect(() => decodeTypedTelemetryId(new Uint8Array([0, ...new TextEncoder().encode(uuid)]))).toThrow("TYPED_TELEMETRY_INVALID");
     expect(() => encodeTypedTelemetryId("raw private path /x")).toThrow("TYPED_TELEMETRY_INVALID");
   });
+  it("round-trips later reviewed plan strings without reindexing stored dictionary values", async () => {
+    const rows = (["v1", "v11"] as const).flatMap((format) =>
+      (["promax", "sci", "sci_plus"] as const).map((planType, index) => {
+        const record = { ...quota(format, `quota-occurrence:v1:${String(index + 1).padStart(64, "0")}`), planType,
+          ...(format === "v11" ? { accountPlanAttribution: { ...attribution, planType } } : {}) };
+        expect(() => encodeTypedTelemetryRecord(format, { ...record, planType: "scientific_future" }))
+          .toThrow("TYPED_TELEMETRY_INVALID");
+        return source(format, index + 1, record);
+      }));
+    await assertRoundtrip(rows);
+  });
+
   it("preserves millisecond dates, pre-epoch days and all six record shapes", () => {
     for (const original of ["0000-01-01", "1960-02-29", day, "9999-12-31"]) {
       expect(typedTelemetryDayString(typedTelemetryDayNumber(original))).toBe(original);

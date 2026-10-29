@@ -9082,6 +9082,10 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel("plus"), "Plus");
   assert.equal(shareCardPlanLabel("edu_plus"), "Edu Plus");
   assert.equal(shareCardPlanLabel("edu_pro"), "Edu Pro");
+  assert.equal(shareCardPlanLabel("sci"), "Academic Researchers");
+  assert.equal(shareCardPlanLabel("sci_plus"), "Academic Researchers Plus");
+  assert.doesNotMatch(shareCardPlanLabel("sci"), /[0-9×]/u);
+  assert.doesNotMatch(shareCardPlanLabel("sci_plus"), /[0-9×]/u);
   assert.equal(
     shareCardPlanLabel("self_serve_business_prolite"),
     "Business · Pro Lite (5×)",

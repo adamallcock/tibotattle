@@ -55,7 +55,10 @@
         "edu",
         "edu_plus",
         "edu_pro",
-        "unknown"
+        "unknown",
+        "promax",
+        "sci",
+        "sci_plus"
       ]
     },
     "planEraId": {
@@ -135,7 +138,10 @@
               "enterprise",
               "edu",
               "edu_plus",
-              "edu_pro"
+              "edu_pro",
+              "promax",
+              "sci",
+              "sci_plus"
             ]
           }
         }

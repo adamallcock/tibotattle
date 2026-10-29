@@ -60,7 +60,7 @@ const quota = {
   }),
   allOf: TELEMETRY_PLAN_TYPES.map((plan) => ({
     if: { properties: { planType: { const: plan } } },
-    then: { properties: { accountPlanAttribution: { properties: { planType: { const: plan } } } } },
+    then: { properties: { accountPlanAttribution: { type: "object", properties: { planType: { const: plan } } } } },
   })),
 };
 const session = closed({
