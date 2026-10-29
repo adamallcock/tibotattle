@@ -29,6 +29,13 @@ import {
   TELEMETRY_PLAN_TYPES,
 } from "@app-usagemonitor/telemetry-contract";
 
+// Recorded 0.150.0 binary fixture: later reviewed names do not rewrite it.
+const CODEX_0150_PLAN_TYPES = Object.freeze([
+  "free", "go", "plus", "pro", "prolite", "team", "self_serve_business_prolite",
+  "self_serve_business_usage_based", "business", "ent26", "enterprise_cbp_automation",
+  "enterprise_cbp_usage_based", "enterprise", "edu", "edu_plus", "edu_pro", "unknown",
+]);
+
 const execFile = promisify(execFileCallback);
 const REPOSITORY_ROOT = resolve(import.meta.dirname, "..");
 const LEDGER_FILE = resolve(REPOSITORY_ROOT, "config/codex-contract-ledger.json");
@@ -135,7 +142,7 @@ test("deprecated historical values may disappear without weakening telemetry acc
 
 test("generated PlanType parser accepts only a literal union", async () => {
   const parsed = parsePlanTypeScript(await fixtureText(PLAN_TYPE_FIXTURE));
-  assert.deepEqual(parsed, TELEMETRY_PLAN_TYPES);
+  assert.deepEqual(parsed, CODEX_0150_PLAN_TYPES);
   assert.throws(
     () => parsePlanTypeScript("export type PlanType = string;\n"),
     { code: "CODEX_SCHEMA_INVALID" },
@@ -181,7 +188,7 @@ test("binary inspector supports stable generation and the older experimental fal
   });
   assert.equal(stable.generatorMode, "stable");
   assert.equal(stable.version, "codex-cli 1.2.3");
-  assert.equal(stable.planTypesSha256, planTypesSha256(TELEMETRY_PLAN_TYPES));
+  assert.equal(stable.planTypesSha256, planTypesSha256(CODEX_0150_PLAN_TYPES));
   assert.equal(stableCalls.some((args) => args.includes("--experimental")), false);
 
   const fallback = await inspectCodexBinaryContract({

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import Ajv from "ajv";
-import { APP_OFFICIAL_PRICE_CARDS } from "@app-usagemonitor/accounting";
+import { APP_OFFICIAL_PRICE_CARDS, priceUsageEvent } from "@app-usagemonitor/accounting";
 import {
   REVIEWED_MODEL_CATALOG, REVIEWED_CODEX_MODEL_IDS, TELEMETRY_MODEL_IDS,
   REVIEWED_MODEL_CATALOG_VERSION, assertReviewedModelCatalogCompleteness,
@@ -12,15 +12,16 @@ import {
 import * as browser from "../apps/web/public/telemetry-shared.generated.js";
 import { recognizedCodexModelId, codexModelPricingStatus, codexModelAllowanceTrack } from "../src/export/registries.js";
 import { telemetryV01Golden } from "./fixtures/telemetry-contract-vectors.mjs";
+import { sha256Json } from "./helpers/pricing-hash.js";
 
 test("reviewed identity catalog covers priced OpenAI models and explicit aliases, never provider tools", () => {
   const models = REVIEWED_MODEL_CATALOG.filter((entry) => entry.provider === "openai_codex");
   const priced = new Set(APP_OFFICIAL_PRICE_CARDS.filter((card) => card.provider === "openai"
     && card.model !== "openai-provider-tools").flatMap((card) => [card.model, ...(card.aliases ?? [])]));
   assert.deepEqual(models.filter((entry) => entry.pricingStatus !== "unpriced").map((entry) => entry.id).sort(), [...priced].sort());
-  assert.deepEqual(models.filter((entry) => entry.pricingStatus === "unpriced").map((entry) => entry.id), ["gpt-5.3-codex-spark"]);
-  assert.equal(models.length, 41);
-  for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+  assert.deepEqual(models.filter((entry) => entry.pricingStatus === "unpriced").map((entry) => entry.id), ["gpt-5.3-codex-spark", "gpt-6.1-astra"]);
+  assert.equal(models.length, 44);
+  for (const id of ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
     assert.equal(reviewedModelIdentity(id).priceModelId, id);
     assert.equal(reviewedModelIdentity(id).pricingStatus, "published");
   }
@@ -35,7 +36,7 @@ test("reviewed identity catalog covers priced OpenAI models and explicit aliases
   assert.notEqual(reviewedModelIdentity("gpt-5.5-codex"), reviewedModelIdentity("gpt-5.5"));
   assert.equal(reviewedModelIdentity("gpt-5.5-codex").pricingStatus, "assumed_alias");
   assert.equal(reviewedModelIdentity("gpt-5.3-codex-spark").priceModelId, null);
-  for (const value of ["gpt-6t", "gpt-6-astra-private", "gpt-6-sol-private", "gpt-6-luna-wm", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
+  for (const value of ["gpt-6t", "gpt-6-astra-private", "gpt-6.1-sol-private", "gpt-6.1-terra-private", "gpt-6.1-terra-wm", "gpt-6-sol-private", "gpt-6-luna-wm", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
     assert.equal(reviewedModelIdentity(value), null);
     assert.equal(recognizedCodexModelId(value), null);
   }
@@ -51,7 +52,13 @@ test("package, browser and closed upload schemas preserve all reviewed models an
     "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
     "claude-sonnet-4-6", "claude-sonnet-5",
   ]);
-  assert.deepEqual(TELEMETRY_MODEL_IDS.slice(-2), ["gpt-6-sol", "gpt-6-luna"]);
+  assert.deepEqual(TELEMETRY_MODEL_IDS.slice(-8), [
+    "gpt-6-luna",
+    "gpt-6.1-astra", "claude-fable-5-1", "claude-mythos-5-1",
+    "claude-opus-5", "claude-opus-5-5", "gpt-6.1-sol", "gpt-6.1-terra",
+  ]);
+  assert.equal(sha256Json(TELEMETRY_MODEL_IDS.slice(0, -1)),
+    "2bb1478e6c69369c55e19ee7f299fa5111b8cd1cd8d30394d1d5066f9a92b8ab");
   const schema = JSON.parse(await readFile(new URL("../packages/telemetry-contract/schemas/v0.2/usage-event.schema.json", import.meta.url), "utf8"));
   assert.deepEqual([...schema.properties.modelId.enum].sort(), [...TELEMETRY_MODEL_IDS].sort());
   const validateId = new Ajv().compile(schema.properties.modelId);
@@ -73,6 +80,7 @@ test("requested effort mapping is model-specific and does not assert cache or ef
     ["gpt-6-astra", "xhigh", "xhigh"], ["gpt-5.6-sol", "ultra", "max"],
     ["gpt-6t", "ultra", "ultra"], ["claude-sonnet-5", "ultra", "ultra"],
     ["gpt-6-astra", "custom-private", null],
+    ["gpt-6.1-terra", "ultra", "ultra"], ["gpt-6.1-terra", "max", "max"],
   ]) {
     assert.equal(codexRequestReasoningEffort(model, effort), expected);
     assert.equal(browser.codexRequestReasoningEffort(model, effort), expected);
@@ -82,6 +90,7 @@ test("requested effort mapping is model-specific and does not assert cache or ef
   assert.equal(codexCacheReasoningConfiguration("gpt-6-astra", "max"), "max");
   assert.equal(codexCacheReasoningConfiguration("gpt-5.6-sol", "ultra"), "max");
   assert.equal(codexCacheReasoningConfiguration("gpt-6t", "ultra"), "ultra");
+  assert.equal(codexCacheReasoningConfiguration("gpt-6.1-terra", "ultra"), "ultra");
   assert.equal(codexCacheReasoningConfiguration("gpt-6-astra", "unreviewed"), null);
   assert.equal(browser.codexCacheReasoningConfiguration("gpt-6-astra", "ultra"), "ultra");
 });
@@ -129,4 +138,24 @@ test("the exported vocabulary contract accepts the shipped catalog and refuses b
   refuses([entry({ priceModelId: "gpt-absent" })], /prices against an unreviewed/u);
   refuses([{ ...entry() }], /is not frozen/u);
   refuses([Object.freeze({ ...entry(), extra: 1 })], /does not carry exactly/u);
+});
+
+test("reviewed forecast Astra remains explicitly unpriced and never gains zero-valued component prices", () => {
+  const identity = reviewedModelIdentity("gpt-6.1-astra");
+  assert.equal(identity.pricingStatus, "unpriced");
+  assert.equal(identity.priceModelId, null);
+  assert.equal(codexModelPricingStatus(identity.id), "known_unpriced");
+  assert.equal(APP_OFFICIAL_PRICE_CARDS.some(card => card.model === identity.id), false);
+  const result = priceUsageEvent({ provider: "openai", model: identity.id,
+    components: { inputUncachedTokens: "1000000", outputTextTokens: "1000000" } },
+  { priceCards: APP_OFFICIAL_PRICE_CARDS });
+  assert.equal(result.coverageStatus, "unpriced");
+  assert.equal(result.components.length, 2);
+  for (const component of result.components) {
+    assert.equal(component.pricingStatus, "unpriced");
+    assert.equal(component.unitPriceUsd, null);
+    assert.equal(component.costUsd, null);
+    assert.equal(component.priceCardId, null);
+  }
+  assert.ok(result.warnings.coverage.length > 0);
 });

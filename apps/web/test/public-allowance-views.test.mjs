@@ -189,9 +189,9 @@ test("the closed public wire survives normalization into all three chart views",
   // GPT-6.1 Sol keeps its roster slot but is held back: it is never pinned, so
   // it has no card until a served publication carries an estimate for it.
   assert.deepEqual(normalized.breakdowns.modelConfig.map(model => model.modelId),
-    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6.1-terra"]);
   assert.deepEqual(normalized.breakdowns.modelConfig.filter(model => !model.pinned).map(model => model.modelId),
-    ["gpt-6.1-sol"]);
+    ["gpt-6.1-sol", "gpt-6.1-terra"]);
   assert.ok(normalized.breakdowns.modelConfig.every(model => model.modelId !== "gpt-5.3-codex-spark"));
   for (const view of ["aggregate", "plans", "models"]) {
     assert.ok(buildCommunityAllowanceChartModel(normalized, { view }).dots.length > 0);
@@ -910,12 +910,13 @@ test("the stored copy keeps an applied v1.3 block under v1.3 and never stores a 
 });
 
 test("a later catalog's primary model is charted without a page edit, while hidden and off-track ones are not", () => {
-  // The shipped catalog adds nothing beyond the roster (asserted above); a
-  // regenerated one may. Synthetic catalog rows, the reviewed shape.
+  // Keep the shipped catalog additions while introducing one future primary
+  // identity. Every fixture row uses the reviewed content-free shape.
   const row = (id, label, provider = "openai_codex", allowanceTrack = "primary") => ({ id, label, provider, allowanceTrack });
   const { charted, known } = publicAllowanceModels([
     row("gpt-5.5", "GPT-5.5"),
     row("gpt-6-astra", "GPT-6 Astra (catalog label)"),
+    row("gpt-6.1-terra", "GPT-6.1 Terra"),
     row("gpt-7-nova", "GPT-7 Nova"),
     row("gpt-7-spark", "GPT-7 Spark", "openai_codex", "spark"),
     row("claude-opus-9", "Claude Opus 9", "anthropic_claude_code"),
