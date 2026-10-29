@@ -179,9 +179,9 @@ export function selectMacTransitionApplicationProcess(rows, executable) {
 }
 export const findMacTransitionApplicationProcess = executable => selectMacTransitionApplicationProcess(processes(), executable);
 const appProcess = findMacTransitionApplicationProcess;
-async function until(check, timeout, stage) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) { const result = await check(); if (result) return result; await sleep(500); }
+async function until(check, timeout, stage, { now = Date.now, wait = sleep } = {}) {
+  const deadline = now() + timeout;
+  while (now() < deadline) { const result = await check(); if (result) return result; await wait(500); }
   fail(stage);
 }
 
@@ -346,27 +346,123 @@ export function captureMacTransitionProcesses(appPath, verifiedPid, registry, op
   if (observation.pending) fail('process_identity');
   return observation.owned;
 }
-export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcesses, verifyApp }) {
+const CLEANUP_DIAGNOSTIC_SCHEMA = 'tibotattle-macos-transition-cleanup-diagnostics-v1';
+const CLEANUP_PHASES = ['inspect_application', 'verify_application', 'capture_owned', 'request_quit',
+  'signal_term', 'wait_term', 'signal_kill', 'wait_kill', 'verify_absence', 'complete'];
+const CLEANUP_REFUSALS = ['process_inventory', 'process_identity', 'multiple_owned_apps',
+  'owned_processes_remaining', 'untracked_transition_process', 'native_cleanup_identity',
+  'code_directory', 'asar_digest', 'candidate_archive_mismatch', 'package_metadata',
+  'distribution', 'architecture', 'candidate_identity', 'unsafe_file', 'changed_file',
+  'cleanup_operation_refused'];
+const CLEANUP_COUNT_KEYS = ['owned', 'unresolved', 'applicationExecutable', 'applicationHelper',
+  'sparkleHelper', 'otherDescendant'];
+const CLEANUP_COUNT_LIMIT = 512;
+const cleanupRefusal = error => CLEANUP_REFUSALS.includes(error?.transitionStage)
+  ? error.transitionStage : 'cleanup_operation_refused';
+
+// This is a closed projection of the same inventory used for ownership. It
+// never adds a process read, exposes an identity, or supplies signaling authority.
+function cleanupObservation(appPath, observation, unresolvedPids) {
   const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
-  const current = appProcess(executable);
-  if (current) {
-    // A Sparkle-created successor is admitted only after checking its actual signed bytes.
-    await verifyApp(appPath);
-    captureMacTransitionProcesses(appPath, current.pid, knownProcesses);
-    try { ui(executable, current.pid, 'quit'); } catch { /* Controlled owned-process cleanup follows. */ }
-  } else captureMacTransitionProcesses(appPath, null, knownProcesses);
-  const remaining = () => captureMacTransitionProcesses(appPath, null, knownProcesses);
-  for (const signal of ['SIGTERM', 'SIGKILL']) {
-    for (const row of remaining()) {
-      try { process.kill(row.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    }
-    try { await until(() => remaining().length === 0, 10000, 'owned_processes_remaining'); break; }
-    catch { if (signal === 'SIGKILL') fail('owned_processes_remaining'); }
+  const counts = Object.fromEntries(CLEANUP_COUNT_KEYS.map(key => [key, 0]));
+  counts.owned = observation.owned.length; counts.unresolved = unresolvedPids.size;
+  for (const row of observation.owned) {
+    const category = row.command === executable ? 'applicationExecutable'
+      : row.command.includes('/Sparkle.framework/') ? 'sparkleHelper'
+        : row.command.startsWith(appPath + '/') ? 'applicationHelper' : 'otherDescendant';
+    counts[category] += 1;
   }
-  // Never equate the vanished predecessor PID with a stopped replacement/helper.
-  if (appProcess(executable) || processes().some((row) => row.command.startsWith(appPath + '/')
-    || /\/(?:TiboTattle[^/]*\.app|Sparkle\.framework)\//u.test(row.command))) fail('untracked_transition_process');
-  return true;
+  const truncated = Object.values(counts).some(count => count > CLEANUP_COUNT_LIMIT);
+  return { status: 'observed', counts: Object.fromEntries(Object.entries(counts)
+    .map(([key, count]) => [key, Math.min(count, CLEANUP_COUNT_LIMIT)])), truncated };
+}
+export function parseMacTransitionCleanupDiagnostics(output) {
+  const invalid = () => { throw new TypeError('Invalid Mac cleanup diagnostic'); };
+  if (typeof output !== 'string' || Buffer.byteLength(output) > 4096) invalid();
+  let value;
+  try { value = JSON.parse(output); } catch { invalid(); }
+  const exact = (object, keys) => object !== null && typeof object === 'object' && !Array.isArray(object)
+    && Object.keys(object).sort().join('\n') === [...keys].sort().join('\n');
+  const refusal = code => code === null || CLEANUP_REFUSALS.includes(code);
+  if (!exact(value, ['schemaVersion', 'status', 'phase', 'refusalCode', 'pollRefusals', 'observations'])
+    || value.schemaVersion !== CLEANUP_DIAGNOSTIC_SCHEMA || !['passed', 'failed'].includes(value.status)
+    || !CLEANUP_PHASES.includes(value.phase) || !refusal(value.refusalCode)
+    || (value.status === 'passed' ? value.phase !== 'complete' || value.refusalCode !== null
+      : value.phase === 'complete' || value.refusalCode === null)
+    || !exact(value.pollRefusals, ['term', 'kill']) || !Object.values(value.pollRefusals).every(refusal)
+    || !exact(value.observations, ['initial', 'term', 'kill'])) invalid();
+  for (const observation of Object.values(value.observations)) {
+    if (observation === null) continue;
+    if (!exact(observation, ['status', 'counts', 'truncated'])
+      || !['observed', 'unavailable'].includes(observation.status)
+      || typeof observation.truncated !== 'boolean') invalid();
+    if (observation.status === 'unavailable') {
+      if (observation.counts !== null || observation.truncated) invalid();
+    } else if (!exact(observation.counts, CLEANUP_COUNT_KEYS)
+      || !Object.values(observation.counts).every(count => Number.isSafeInteger(count)
+        && count >= 0 && count <= CLEANUP_COUNT_LIMIT)) invalid();
+  }
+  return value;
+}
+export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcesses, verifyApp, onDiagnostics }, {
+  readProcesses = processes, signal = (pid, name) => process.kill(pid, name), interact = ui,
+  now = Date.now, wait = sleep,
+} = {}) {
+  const executable = join(appPath, 'Contents', 'MacOS', 'TiboTattle');
+  const diagnostic = { schemaVersion: CLEANUP_DIAGNOSTIC_SCHEMA, status: 'failed',
+    phase: 'inspect_application', refusalCode: null, pollRefusals: { term: null, kill: null },
+    observations: { initial: null, term: null, kill: null } };
+  const currentApplication = () => selectMacTransitionApplicationProcess(readProcesses(), executable);
+  const capture = (verifiedPid, slot) => {
+    const unresolvedPids = new Set();
+    let observation;
+    try { observation = observeMacTransitionProcesses(appPath, verifiedPid, knownProcesses, { readProcesses, unresolvedPids }); }
+    catch (error) {
+      diagnostic.observations[slot] = { status: 'unavailable', counts: null, truncated: false };
+      throw error;
+    }
+    diagnostic.observations[slot] = cleanupObservation(appPath, observation, unresolvedPids);
+    if (observation.pending) fail('process_identity');
+    return observation.owned;
+  };
+  try {
+    const current = currentApplication();
+    if (current) {
+      // A Sparkle-created successor is admitted only after checking its actual signed bytes.
+      diagnostic.phase = 'verify_application'; await verifyApp(appPath);
+      diagnostic.phase = 'capture_owned'; capture(current.pid, 'initial');
+      diagnostic.phase = 'request_quit';
+      try { interact(executable, current.pid, 'quit'); } catch { /* Controlled owned-process cleanup follows. */ }
+    } else {
+      diagnostic.phase = 'capture_owned'; capture(null, 'initial');
+    }
+    for (const name of ['SIGTERM', 'SIGKILL']) {
+      const slot = name === 'SIGTERM' ? 'term' : 'kill';
+      diagnostic.phase = 'signal_' + slot;
+      for (const row of capture(null, slot)) {
+        try { signal(row.pid, name); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
+      diagnostic.phase = 'wait_' + slot;
+      try { await until(() => capture(null, slot).length === 0, 10000, 'owned_processes_remaining', { now, wait }); break; }
+      catch (error) {
+        diagnostic.pollRefusals[slot] = cleanupRefusal(error);
+        // Preserve the actual refusal. Identity/inventory failures must not be
+        // relabeled as an exhausted deadline; escalation and limits stay intact.
+        if (name === 'SIGKILL') throw error;
+      }
+    }
+    diagnostic.phase = 'verify_absence';
+    // Never equate the vanished predecessor PID with a stopped replacement/helper.
+    if (currentApplication() || readProcesses().some((row) => row.command.startsWith(appPath + '/')
+      || /\/(?:TiboTattle[^/]*\.app|Sparkle\.framework)\//u.test(row.command))) fail('untracked_transition_process');
+    diagnostic.status = 'passed'; diagnostic.phase = 'complete';
+    return true;
+  } catch (error) {
+    diagnostic.refusalCode = cleanupRefusal(error);
+    throw error;
+  } finally {
+    if (onDiagnostics) onDiagnostics(parseMacTransitionCleanupDiagnostics(JSON.stringify(diagnostic)));
+  }
 }
 
 function codeDirectoryHash(app) {
@@ -475,7 +571,8 @@ export async function runSparkleTransition(options) {
     installUpdateClicked: false, updaterRelaunchedCandidate: false, candidateCopiedByRunner: false,
     migrationCompleted: false, retainedRowsPreserved: false, saltPreserved: false,
     preferencesPreserved: false, optOutPreserved: false, restartNoDuplicates: false,
-    sourceUntouched: false, ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null, migrationDiagnostics: null };
+    sourceUntouched: false, ownedProcessesStopped: false, existingCredentialFixture: false, failureStage: null, migrationDiagnostics: null,
+    cleanupDiagnostics: { initial: null, final: null } };
   let active, installedExecutable, ownedPid, installedApp, selectedInput, selectedHome, stage = 'intake';
   const knownProcesses = new Map();
   try {
@@ -589,7 +686,8 @@ export async function runSparkleTransition(options) {
     await absent(join(profile, 'companion-state', 'accountless-device-binding-v1.json'));
     proof.migrationCompleted = true; proof.nativeSparkleUpdateCompleted = true;
     await stopVerifiedMacTransitionProcesses({ appPath: installedApp, knownProcesses,
-      verifyApp: (path) => verifyCandidate(input, path) }); ownedPid = null;
+      verifyApp: (path) => verifyCandidate(input, path),
+      onDiagnostics: value => { proof.cleanupDiagnostics.initial = value; } }); ownedPid = null;
     const temporary = join(input.directory, 'runtime'); await mkdir(temporary, { mode: 0o700 });
     const environment = signedMacTransitionEnvironment({ target: input.target, home, temporaryDirectory: temporary });
     const verified = await verifyCandidate(input, installedApp);
@@ -637,6 +735,7 @@ export async function runSparkleTransition(options) {
     if (installedApp && selectedInput && knownProcesses.size) {
       try {
         proof.ownedProcessesStopped = await stopVerifiedMacTransitionProcesses({ appPath: installedApp, knownProcesses,
+          onDiagnostics: value => { proof.cleanupDiagnostics.final = value; },
           verifyApp: async (path) => {
             if (plist(path).CFBundleShortVersionString === '0.1.18') {
               command('/usr/bin/codesign', macOSCredentialApplicationVerificationArguments(path));

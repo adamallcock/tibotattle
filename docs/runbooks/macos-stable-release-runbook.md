@@ -60,6 +60,14 @@ compatibility value; it does not run a second updater.
    install Electron and preserve rows, settings, device salt and recorded
    opt-out across relaunch and restart. The workflow's test-feed override is
    confined to its disposable account. An ARM receipt does not qualify Intel.
+   The runner retains separate initial and final cleanup diagnostics. They use a
+   closed schema with fixed refusal/phase names and capped counts of owned or
+   unresolved process categories, never process IDs, commands, paths or text.
+   Missing inventory remains unavailable. A later successful cleanup cannot
+   replace a failed first cleanup or qualify the unexecuted restart checks.
+   Poll identity/inventory refusals retain their original code; only an exhausted
+   deadline is `owned_processes_remaining`. The existing ten-second signal
+   waits and 180-second relaunch limit remain unchanged.
 5. Attach both passing, exact-byte receipts to the
    `tibotattle-electron-sparkle-transition-v1` publisher receipt. Revalidate
    the signed mounted DMGs, predecessor manifests, source tag and incoming key

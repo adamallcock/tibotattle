@@ -203,6 +203,145 @@ test('passive uncertainty resolves only through a complete proven identity or ab
     error => error.transitionStage === 'process_identity');
 });
 
+function cleanupHarness(rows, { known = new Map(rows.map(row => [row.pid, runner.macTransitionProcessFingerprint(row)])),
+  onRead, onSignal } = {}) {
+  const state = { rows, reads: 0, elapsed: 0, signals: [], diagnostics: [], verified: [], ui: [] };
+  state.run = () => runner.stopVerifiedMacTransitionProcesses({ appPath: processApp, knownProcesses: known,
+    verifyApp: async path => { state.verified.push(path); },
+    onDiagnostics: value => { state.diagnostics.push(value); },
+  }, {
+    readProcesses: () => { state.reads++; return onRead ? onRead(state) : state.rows; },
+    signal: (pid, name) => { state.signals.push({ pid, name }); if (onSignal) onSignal(state, pid, name); },
+    interact: (executable, pid, action) => { state.ui.push({ executable, pid, action }); return 'clicked'; },
+    now: () => state.elapsed,
+    wait: async milliseconds => { assert.equal(milliseconds, 500); state.elapsed += milliseconds; },
+  });
+  return state;
+}
+
+test('cleanup preserves underlying poll refusals and a later final cleanup cannot overwrite the failed observation', async () => {
+  const helper = processRow(31, 1, '/synthetic/private-helper');
+  const state = cleanupHarness([helper], { onRead(current) {
+    if (current.reads === 4) return [{ ...helper, startedAt: null }];
+    if (current.reads === 6) throw new Error('PRIVATE_PROCESS_CONTENT');
+    return current.rows;
+  } });
+  await assert.rejects(state.run(), error => error.transitionStage === 'process_inventory'
+    && error.message === 'SIGNED_SPARKLE_TRANSITION_REFUSED');
+  assert.deepEqual(state.signals, [{ pid: 31, name: 'SIGTERM' }, { pid: 31, name: 'SIGKILL' }]);
+  assert.equal(state.elapsed, 0, 'an identity/inventory refusal is not deadline exhaustion');
+  const initial = structuredClone(state.diagnostics[0]);
+  assert.equal(initial.status, 'failed'); assert.equal(initial.phase, 'wait_kill');
+  assert.equal(initial.refusalCode, 'process_inventory');
+  assert.deepEqual(initial.pollRefusals, { term: 'process_identity', kill: 'process_inventory' });
+  assert.equal(initial.observations.term.counts.unresolved, 1);
+  assert.deepEqual(initial.observations.kill, { status: 'unavailable', counts: null, truncated: false });
+  assert.doesNotMatch(JSON.stringify(initial), /PRIVATE_PROCESS_CONTENT|private-helper|synthetic|"pid"|"command"|"path"/u);
+  state.rows = [];
+  assert.equal(await state.run(), true);
+  assert.deepEqual(state.diagnostics[0], initial);
+  assert.equal(state.diagnostics[1].status, 'passed');
+  assert.equal(state.diagnostics[1].refusalCode, null);
+});
+
+test('genuinely surviving owned processes still exhaust both unchanged ten-second waits and fail', async () => {
+  const state = cleanupHarness([processRow(31, 1, '/synthetic/helper')]);
+  await assert.rejects(state.run(), error => error.transitionStage === 'owned_processes_remaining');
+  assert.equal(state.elapsed, 20000);
+  assert.deepEqual(state.signals.map(row => row.name), ['SIGTERM', 'SIGKILL']);
+  const diagnostic = state.diagnostics[0];
+  assert.equal(diagnostic.phase, 'wait_kill');
+  assert.deepEqual(diagnostic.pollRefusals, { term: 'owned_processes_remaining', kill: 'owned_processes_remaining' });
+  assert.equal(diagnostic.observations.kill.counts.owned, 1);
+});
+
+test('cleanup refuses unknown live identity before signaling and does not replace it with absent evidence', async () => {
+  const helper = processRow(31, 1, '/synthetic/helper');
+  const known = new Map([[31, runner.macTransitionProcessFingerprint(helper)]]);
+  const state = cleanupHarness([{ ...helper, startedAt: null }], { known });
+  await assert.rejects(state.run(), error => error.transitionStage === 'process_identity');
+  assert.deepEqual(state.signals, []); assert.deepEqual(state.ui, []);
+  const diagnostic = state.diagnostics[0];
+  assert.equal(diagnostic.phase, 'capture_owned'); assert.equal(diagnostic.refusalCode, 'process_identity');
+  assert.equal(diagnostic.observations.initial.counts.owned, 0);
+  assert.equal(diagnostic.observations.initial.counts.unresolved, 1);
+  assert.equal(known.get(31), runner.macTransitionProcessFingerprint(helper));
+});
+
+test('cleanup records only closed categories from the same proven inventory, then verifies absence', async () => {
+  const rows = [processRow(30, 1), processRow(31, 30, processApp + '/Contents/Frameworks/Helper'),
+    processRow(32, 30, processApp + '/Contents/Frameworks/Sparkle.framework/Updater'),
+    processRow(33, 30, '/synthetic/PRIVATE_DESCENDANT')];
+  const state = cleanupHarness(rows, { known: new Map(), onSignal: current => { current.rows = []; } });
+  assert.equal(await state.run(), true);
+  assert.deepEqual(state.verified, [processApp]);
+  assert.deepEqual(state.ui, [{ executable: processExecutable, pid: 30, action: 'quit' }]);
+  assert.equal(state.signals.length, 4); assert.ok(state.signals.every(row => row.name === 'SIGTERM'));
+  const diagnostic = state.diagnostics[0];
+  assert.deepEqual(diagnostic.observations.initial, { status: 'observed', truncated: false,
+    counts: { owned: 4, unresolved: 0, applicationExecutable: 1, applicationHelper: 1, sparkleHelper: 1, otherDescendant: 1 } });
+  assert.equal(diagnostic.status, 'passed'); assert.equal(diagnostic.phase, 'complete');
+  assert.equal(diagnostic.observations.term.counts.owned, 0);
+  assert.equal(diagnostic.observations.kill, null);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_DESCENDANT|synthetic|"pid"|"command"|"path"/u);
+});
+
+test('ESRCH alone cannot prove exit, and reused unrelated PIDs never gain signaling authority', async () => {
+  const helper = processRow(31, 1, '/synthetic/helper');
+  for (const exited of [false, true]) {
+    const state = cleanupHarness([helper], { onSignal(current) {
+      if (exited) current.rows = [];
+      throw Object.assign(new Error('PRIVATE_SIGNAL_DETAIL'), { code: 'ESRCH' });
+    } });
+    if (exited) assert.equal(await state.run(), true);
+    else await assert.rejects(state.run(), error => error.transitionStage === 'owned_processes_remaining');
+    assert.equal(state.diagnostics[0].status, exited ? 'passed' : 'failed');
+    assert.doesNotMatch(JSON.stringify(state.diagnostics), /PRIVATE_SIGNAL_DETAIL/u);
+  }
+  const known = new Map([[31, runner.macTransitionProcessFingerprint(helper)]]), before = new Map(known);
+  const state = cleanupHarness([processRow(31, 1, '/synthetic/unrelated', 'Sun Oct 4 03:00:00 2026')], { known });
+  assert.equal(await state.run(), true); assert.deepEqual(state.signals, []); assert.deepEqual(known, before);
+});
+
+test('cleanup diagnostic counts are capped and unavailable inventories remain explicit', async () => {
+  const rows = Array.from({ length: 513 }, (_, index) => processRow(100 + index, 1, '/synthetic/helper'));
+  const state = cleanupHarness(rows, { onSignal: current => { current.rows = []; } });
+  assert.equal(await state.run(), true);
+  const observation = state.diagnostics[0].observations.initial;
+  assert.equal(observation.counts.owned, 512); assert.equal(observation.counts.otherDescendant, 512);
+  assert.equal(observation.truncated, true);
+  const unavailable = cleanupHarness([], { onRead(current) {
+    if (current.reads === 2) throw new Error('PRIVATE_INVENTORY');
+    return [];
+  } });
+  await assert.rejects(unavailable.run(), error => error.transitionStage === 'process_inventory');
+  assert.deepEqual(unavailable.diagnostics[0].observations.initial,
+    { status: 'unavailable', counts: null, truncated: false });
+  assert.deepEqual(unavailable.signals, []);
+});
+
+test('cleanup diagnostic parsing rejects unknown fields, text, impossible status and unbounded counts', async () => {
+  const state = cleanupHarness([]); assert.equal(await state.run(), true);
+  const value = state.diagnostics[0], parse = candidate => runner.parseMacTransitionCleanupDiagnostics(JSON.stringify(candidate));
+  assert.deepEqual(parse(value), value);
+  for (const mutate of [
+    candidate => { candidate.privateText = 'PRIVATE'; },
+    candidate => { candidate.phase = 'PRIVATE'; },
+    candidate => { candidate.refusalCode = 'PRIVATE'; },
+    candidate => { candidate.status = 'failed'; },
+    candidate => { candidate.pollRefusals.term = 'PRIVATE'; },
+    candidate => { candidate.observations.initial.counts.path = 'PRIVATE'; },
+    candidate => { candidate.observations.initial.counts.owned = -1; },
+    candidate => { candidate.observations.initial.counts.owned = 513; },
+    candidate => { candidate.observations.initial.counts.owned = 0.5; },
+    candidate => { candidate.observations.initial.status = 'unavailable'; },
+    candidate => { candidate.observations.initial.truncated = 'true'; },
+  ]) { const candidate = structuredClone(value); mutate(candidate); assert.throws(() => parse(candidate), /Invalid Mac cleanup diagnostic/u); }
+  for (const candidate of [null, {}, 'not json', ' '.repeat(4097)]) {
+    assert.throws(() => runner.parseMacTransitionCleanupDiagnostics(candidate), /Invalid Mac cleanup diagnostic/u);
+  }
+});
+
 test('intake binds the architecture, exact native predecessor and closed feed scope', () => {
   for (const target of Object.keys(nativeDigests)) for (const scope of ['isolated_test_feed', 'production_feed']) {
     const value = intake(target, scope), result = runner.validateSparkleTransitionIntake(value);
