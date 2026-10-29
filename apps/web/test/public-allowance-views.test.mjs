@@ -81,8 +81,8 @@ test("each plan's own-week chart gets a rounded positive floor", () => {
 
 test("public model order is exact across cards, legend and same-day inspection", () => {
   const data = series();
-  const preferred = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
-    "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"];
+  const preferred = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"];
   const ids = ["gpt-5.4", ...preferred.toReversed()];
   data.breakdowns.modelConfig = ids.map(modelId => ({ modelId, label: modelId }));
   data.breakdowns.days.at(-1).models = [...ids, "gpt-5.5"].map(id => [id, 1500, 1]);
@@ -92,7 +92,7 @@ test("public model order is exact across cards, legend and same-day inspection",
   assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), preferred);
   assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), preferred);
   assert.deepEqual(model.legendSeries.map(item => item.theme),
-    ["astra", "sol", "luna", "terra", "sol", "luna"]);
+    ["astra", "sol", "sol", "luna", "terra", "terra", "sol", "luna"]);
   assert.deepEqual(data.breakdowns.modelConfig.map(item => item.modelId), ids, "catalog is never reordered in place");
 });
 
@@ -186,10 +186,10 @@ test("the closed public wire survives normalization into all three chart views",
   assert.equal(normalized.state, "published");
   assert.equal(normalized.breakdowns.days.length, 35);
   assert.ok(normalized.breakdowns.modelConfig.some(model => model.modelId === "gpt-6-astra"));
-  // GPT-6.1 Sol keeps its roster slot but is held back: it is never pinned, so
-  // it has no card until a served publication carries an estimate for it.
+  // New release-line models keep roster slots but remain held back until
+  // a served publication carries an estimate or valid current metadata.
   assert.deepEqual(normalized.breakdowns.modelConfig.map(model => model.modelId),
-    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6.1-terra"]);
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
   assert.deepEqual(normalized.breakdowns.modelConfig.filter(model => !model.pinned).map(model => model.modelId),
     ["gpt-6.1-sol", "gpt-6.1-terra"]);
   assert.ok(normalized.breakdowns.modelConfig.every(model => model.modelId !== "gpt-5.3-codex-spark"));
@@ -1114,6 +1114,11 @@ const CURRENT_SEVEN_MODEL_BLOCK = [
   SIX_MODEL_BLOCK[0], { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 },
   ...SIX_MODEL_BLOCK.slice(1).map(model => ({ ...model, order: model.order + 1 })),
 ];
+const TERRA_MODEL_BLOCK = [
+  ...CURRENT_SEVEN_MODEL_BLOCK.slice(0, 4),
+  { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "terra", order: 4 },
+  ...CURRENT_SEVEN_MODEL_BLOCK.slice(4).map(model => ({ ...model, order: model.order + 1 })),
+];
 function currentSevenMetadataFixture() {
   const payload = v14Fixture();
   payload.allowanceBreakdowns.modelConfig = structuredClone(CURRENT_SEVEN_MODEL_BLOCK);
@@ -1165,6 +1170,55 @@ test("empty GPT-6.1 Sol card requires valid current metadata, retains cache valu
     v14Fixture([{ ...CURRENT_SEVEN_MODEL_BLOCK[1], order: -1 }]), v14Fixture(null)]) {
     assert.doesNotMatch(renderView(refused).text, /GPT-6\.1 Sol/u);
   }
+});
+
+test("current metadata keeps GPT-6.1 Terra distinct and empty until it has a published estimate", () => {
+  for (const fixture of [v14Fixture, v15Fixture]) {
+    const payload = fixture(TERRA_MODEL_BLOCK);
+    const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+    const chart = buildCommunityAllowanceChartModel(normalized, { view: "models" });
+    assert.deepEqual(chart.cardSeries.map(item => item.key), TERRA_MODEL_BLOCK.map(model => model.id));
+    const terra = chart.cardSeries.find(item => item.key === "gpt-6.1-terra");
+    assert.equal(terra.latest, null);
+    assert.equal(terra.theme, "terra");
+    assert.equal(chart.dots.some(dot => dot.seriesKey === "gpt-6.1-terra"), false);
+    assert.equal(chart.legendSeries.some(item => item.key === "gpt-6.1-terra"), false);
+    const rendered = renderView(payload);
+    const card = rendered.cards.find(item => item.label === "GPT-6.1 Terra");
+    assert.equal(card.value, "—");
+    assert.match(card.text, /No published estimate yet/u);
+    assert.match(card.className, /allowance-model-terra/u);
+    assert.deepEqual(rendered.cards.filter(item => item.label !== "GPT-6.1 Terra"),
+      renderView(fixture(CURRENT_SEVEN_MODEL_BLOCK)).cards);
+    const retained = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+    assert.deepEqual(retained.allowanceBreakdowns.modelConfig, TERRA_MODEL_BLOCK);
+    assert.deepEqual(renderView(retained, { cache: RETAINED }).cards, rendered.cards);
+  }
+});
+
+test("GPT-6.1 Terra publication preserves its own values and legacy metadata gates", () => {
+  for (const fixture of [v14Fixture, v15Fixture]) {
+    const payload = addTuples(fixture(TERRA_MODEL_BLOCK), "gpt-6.1-terra", 3, 123.45, 2);
+    const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+    assert.equal(normalized.breakdowns.unrecognizedModelTuples, 0);
+    assert.deepEqual(normalized.breakdowns.days.at(-1).models.find(([id]) => id === "gpt-6.1-terra"),
+      ["gpt-6.1-terra", 123.45, 2]);
+    const chart = buildCommunityAllowanceChartModel(normalized, { view: "models" });
+    assert.equal(chart.legendSeries.find(item => item.key === "gpt-6.1-terra").theme, "terra");
+    assert.deepEqual(chart.dots.filter(dot => dot.seriesKey === "gpt-6.1-terra").map(dot => dot.centralUsd),
+      [123.45, 123.45, 123.45]);
+    const retained = projectCommunityDailyPayloadForCache(payload, { nowMs: NOW });
+    assert.deepEqual(normalizeCommunityDailySeries(retained, { nowMs: NOW, retained: true }).breakdowns.days,
+      normalized.breakdowns.days);
+  }
+  for (const payload of [v13Fixture(TERRA_MODEL_BLOCK), v11Fixture(), v14Fixture(),
+    v14Fixture([{ ...TERRA_MODEL_BLOCK[4], order: -1 }]), v14Fixture(null)]) {
+    assert.doesNotMatch(renderView(payload).text, /GPT-6\.1 Terra/u);
+  }
+  const unnamed = addTuples(v15Fixture(CURRENT_SEVEN_MODEL_BLOCK), "gpt-6.1-terra", 1);
+  assert.equal(normalizeCommunityDailySeries(unnamed, { nowMs: NOW }).breakdowns.unrecognizedModelTuples, 1);
+  assert.doesNotMatch(renderView(unnamed).text, /GPT-6\.1 Terra/u);
+  assert.match(renderView(addTuples(v11Fixture(), "gpt-6.1-terra", 1)).text, /GPT-6\.1 Terra/u);
 });
 
 function v14WithoutProMax() {
